@@ -2085,7 +2085,7 @@ rec {
     # still flushing); an expired-but-referenced execution's row
     # survives until the attempt-ledger GC releases it, and a row never
     # outruns its artifacts (noOrphanLogChunks).
-    # r[verify store.log.sweep-ownership+1]
+    # r[verify store.log.sweep-ownership+2]
     quint-log-service-sweep = mkQuintCheck {
       name = "log-service-sweep";
       spec = "logService";
@@ -2414,7 +2414,7 @@ rec {
     # bug_047's close-then-sweep liveness on the production red's exact
     # shape (a never-reporting MATERIALIZATION execution: close stamps,
     # row ages, ledger releases, gcExecRow reclaims).
-    # r[verify store.log.sweep-ownership+1]
+    # r[verify store.log.sweep-ownership+2]
     # r[verify sched.db.exec-stamp-on-close]
     quint-log-service-runs-sweep = mkQuintRunCheck {
       name = "log-service-runs-sweep";

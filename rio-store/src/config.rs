@@ -265,10 +265,30 @@ pub struct Config {
     /// two deleters derive from one source and cannot drift. Operators
     /// outside that chain must keep any bucket lifecycle at or above
     /// this value plus slack (an undercutting lifecycle hard-deletes
-    /// chunks the read path still references). Default 30. Env:
+    /// chunks the read path still references). Floor: 2 days —
+    /// validation refuses any value whose retention does not exceed
+    /// the scheduler's 24 h build deadline cap, because a near-cap
+    /// build at minimum retention would still be streaming when the
+    /// hourly sweep fires (merged_bug_071). Default 30. Env:
     /// `RIO_LOG_RETENTION_DAYS`.
     pub log_retention_days: u32,
 }
+
+/// rio-scheduler's `actor::floor::DEADLINE_CAP_SECS` (24 h — the hard
+/// cap every build deadline is clamped to), MIRRORED: the import form
+/// is structurally unavailable — the const is `pub(super)` in the
+/// scheduler's actor module and PD-13 forbids rio-store linking
+/// rio-scheduler at all; no shared crate carries it. The mirror is
+/// load-bearing for the `log_retention_days` validation floor
+/// (merged_bug_071): retention must exceed the longest a build can
+/// legally stream. Drift risk priced and disclosed: a scheduler-side
+/// cap RAISE without this mirror moving re-opens the zero-margin
+/// boundary — this site names its source
+/// (`rio-scheduler/src/actor/floor.rs::DEADLINE_CAP_SECS`); the
+/// sweep's structural liveness exclusion (sweep.rs) is the
+/// independent second guard that holds even under drift, and the
+/// floor errs loudly at config load, never silently.
+const SCHEDULER_DEADLINE_CAP_SECS: u64 = 86_400;
 
 impl Default for Config {
     fn default() -> Self {
@@ -594,13 +614,24 @@ impl rio_common::config::ValidateConfig for Config {
             self.log_ingest_byte_cap,
             self.log_cut_threshold_bytes
         );
-        // 0 → the sweep deletes every log on its first tick. The
-        // scheduler's equivalent knob has carried the same guard since
-        // it shipped; a store that retains nothing is always a
-        // misconfiguration.
+        // The retention-vs-deadline floor (merged_bug_071, R29's
+        // boundary clause): a build may legally run the scheduler's
+        // full deadline cap, so retention at or under it admits the
+        // boundary where a live near-cap stream's logs expire
+        // mid-session — the hourly sweep then kills it, recurring
+        // hourly. Validation refuses the collapse outright; the
+        // sweep's structural liveness exclusion is the second,
+        // independent guard. (Subsumes the old >= 1 floor: zero
+        // retention deleted every log on the first tick.)
         anyhow::ensure!(
-            self.log_retention_days >= 1,
-            "log_retention_days must be >= 1; set RIO_LOG_RETENTION_DAYS"
+            u64::from(self.log_retention_days) * 86_400 > SCHEDULER_DEADLINE_CAP_SECS,
+            "log_retention_days ({} d = {} s) must exceed the scheduler's \
+             build deadline cap (DEADLINE_CAP_SECS = {} s): a near-cap build \
+             at this retention is still streaming when the hourly sweep \
+             fires; set RIO_LOG_RETENTION_DAYS to at least 2",
+            self.log_retention_days,
+            u64::from(self.log_retention_days) * 86_400,
+            SCHEDULER_DEADLINE_CAP_SECS
         );
         // Empty disables the cross-replica proxy (fail-closed). A
         // non-empty template without `{pod}` resolves every peer to
@@ -1151,6 +1182,39 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("log_retention_days"), "got: {err}");
+    }
+
+    /// W11-N's validation half (merged_bug_071, R29's boundary
+    /// clause): the floor refuses the retention values that collapse
+    /// the retention-vs-deadline separation. retention = 1 day equals
+    /// the scheduler's deadline cap EXACTLY (the zero-margin boundary
+    /// the pre-fix `>= 1` guard admitted — validation-legal, and a
+    /// near-cap build was mid-stream when the hourly sweep fired);
+    /// 2 days is the smallest day-granular value above the cap. The
+    /// error names the cross-crate inequality.
+    #[test]
+    fn validate_refuses_retention_at_or_under_the_deadline_cap() {
+        for days in [1u32, 0] {
+            let cfg = Config {
+                database_url: "postgres://x".into(),
+                log_retention_days: days,
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("deadline cap") && err.contains("DEADLINE_CAP_SECS"),
+                "left (pre-fix): retention == the deadline cap is \
+                 validation-legal — the zero-margin boundary ships / right: \
+                 the floor names the inequality and refuses, got: {err}"
+            );
+        }
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            log_retention_days: 2,
+            ..Default::default()
+        };
+        cfg.validate()
+            .expect("2 days clears the cap: the floor is the boundary, not a tax");
     }
 
     /// A peer URL template without `{pod}` resolves every peer to the

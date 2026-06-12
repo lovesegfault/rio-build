@@ -771,7 +771,7 @@ impl DagActor {
         // aged out in that same pass. Conjunction documented at
         // rio_retry_kernel::exec_row_sweep_eligible; the SQL twin is
         // SchedulerDb::gc_exec_rows.
-        // r[impl store.log.sweep-ownership+1]
+        // r[impl store.log.sweep-ownership+2]
         let retention_secs = f64::from(self.exec_retention_days) * 86_400.0;
         match self
             .db

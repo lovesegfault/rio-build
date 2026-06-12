@@ -1264,7 +1264,7 @@ async fn insert_aged_execution(
     Ok(())
 }
 
-// r[verify store.log.sweep-ownership+1]
+// r[verify store.log.sweep-ownership+2]
 /// The four-conjunct guard against real rows, one fixture per conjunct:
 /// (A) non-terminal + aged → KEPT (may still report; live idempotency
 /// key); (B) terminal + aged + ACTIVE assignment → KEPT (E4 shape);
@@ -1331,7 +1331,7 @@ async fn test_gc_exec_rows_spares_referenced_and_live() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify store.log.sweep-ownership+1]
+// r[verify store.log.sweep-ownership+2]
 /// merged_bug_007: artifact-before-row ordering is data-structural, not
 /// schedule-dependent. An exec row with surviving log artifacts — a
 /// `drv_log_chunks` row (F) or a live `log_ingest_sessions` row (G) —
@@ -1391,7 +1391,7 @@ async fn test_gc_exec_rows_waits_for_log_artifacts() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify store.log.sweep-ownership+1]
+// r[verify store.log.sweep-ownership+2]
 /// bug_234: conjunct 5 is a LIVENESS check, not an existence check —
 /// the doc, the kernel twin (`has_live_ingest_session`), and the
 /// sessions module's own staleness law all promise it. A session row

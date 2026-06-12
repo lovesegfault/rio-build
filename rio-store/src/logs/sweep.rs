@@ -11,6 +11,17 @@
 //! 2. the chunk objects those rows pointed at,
 //! 3. and any stale `log_ingest_sessions` row.
 //!
+//! The victim predicate carries its exclusions structurally
+//! (merged_bug_071): only TERMINAL executions (a non-terminal row is
+//! an open attempt that may legally stream until the scheduler's
+//! deadline cap) with NO ingest-session row inside the reap grace
+//! (the sibling reap's 10× discipline) are sweepable — and config
+//! validation refuses retention values that collapse the
+//! retention-vs-deadline separation, so a live near-cap build can
+//! never be mid-stream when its logs expire. The candidate SELECT
+//! takes `FOR UPDATE SKIP LOCKED` (the drain idiom) so concurrent
+//! replicas sweep disjoint batches (bug_104).
+//!
 //! The `drv_executions` row itself is deliberately NOT deleted here
 //! (`store.log.sweep-ownership`): it is the scheduler-owned execution
 //! lifecycle row — terminality, active assignments, and retry-ledger
@@ -76,41 +87,78 @@ pub async fn sweep_expired_logs(
 ) -> Result<SweepStats, sqlx::Error> {
     let mut stats = SweepStats::default();
     loop {
-        // The inner SELECT rides `drv_executions_started_at`; no ORDER
-        // BY because any `batch` expired rows are equally good to
-        // sweep. `make_interval` binds the retention directly so the
-        // SQL cannot drift from the config value. The EXISTS
-        // disjunction is load-bearing now that the execution row
-        // itself survives the sweep (`store.log.sweep-ownership`):
-        // without it, an already-stripped expired execution would be
-        // re-selected on every pass — the loop would never observe an
-        // empty batch once more than `batch` expired executions exist,
-        // and the swept count would inflate without bound.
-        let expired: Vec<Uuid> = sqlx::query_scalar(
+        // One transaction per batch: the candidate SELECT takes
+        // `FOR UPDATE OF e SKIP LOCKED` (the drain.rs idiom — two
+        // destructive-lane coordination idioms collapse to one,
+        // bug_104) so concurrent replicas claim DISJOINT batches, and
+        // the row locks span only the two PG DELETEs below (the
+        // object deletes run post-commit). The locked rows are
+        // terminal executions the scheduler no longer updates, so the
+        // lock window contends with nothing hot.
+        let mut tx = pool.begin().await?;
+
+        // The victim predicate (merged_bug_071): age alone is NOT a
+        // liveness proof — destructive sweeps carry their exclusions
+        // STRUCTURALLY, never by assumed magnitude ordering between
+        // independently tunable constants. A victim must be (a) past
+        // retention, (b) TERMINAL — a non-terminal row is an open
+        // attempt whose stream may still legally run up to the
+        // scheduler's deadline cap (config validation refuses
+        // retention values at or under that cap, the other half of
+        // this close), and (c) free of any ingest-session row inside
+        // the reap grace — the sibling sweep_stale_sessions'
+        // discipline: a session row younger than 10× the staleness
+        // bound might belong to a live stream, and the sweep is
+        // structurally incapable of racing one. The EXISTS
+        // disjunction is load-bearing as before: a stripped expired
+        // execution never re-selects, so the loop terminates and the
+        // counters cannot inflate.
+        let live_grace = rio_migrations::sql::live_ingest_session_sql("s.heartbeat_at", "$4");
+        let sql = format!(
             "SELECT exec_id FROM drv_executions e \
              WHERE e.started_at < now() - make_interval(secs => $1) \
+               AND e.status = ANY($3) \
+               AND NOT EXISTS (SELECT 1 FROM log_ingest_sessions s \
+                               WHERE s.exec_id = e.exec_id AND {live_grace}) \
                AND (EXISTS (SELECT 1 FROM drv_log_chunks c \
                             WHERE c.exec_id = e.exec_id) \
-                 OR EXISTS (SELECT 1 FROM log_ingest_sessions s \
-                            WHERE s.exec_id = e.exec_id)) \
-             LIMIT $2",
-        )
-        .bind(retention.as_secs_f64())
-        .bind(batch)
-        .fetch_all(pool)
-        .await?;
+                 OR EXISTS (SELECT 1 FROM log_ingest_sessions s2 \
+                            WHERE s2.exec_id = e.exec_id)) \
+             LIMIT $2 \
+             FOR UPDATE OF e SKIP LOCKED"
+        );
+        // AssertSqlSafe: const-fragment composition, no runtime data.
+        let expired: Vec<Uuid> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(retention.as_secs_f64())
+            .bind(batch)
+            .bind(rio_migrations::schema::EXEC_STATUS_TERMINAL)
+            .bind(SESSION_REAP_GRACE_SECS)
+            .fetch_all(&mut *tx)
+            .await?;
         if expired.is_empty() {
             break;
         }
 
         // Manifest rows first (RETURNING the keys we then delete from
-        // the backend). See the module doc for the ordering argument.
+        // the backend, post-commit). See the module doc for the
+        // ordering argument.
         let keys: Vec<String> = sqlx::query_scalar(
             "DELETE FROM drv_log_chunks WHERE exec_id = ANY($1) RETURNING s3_key",
         )
         .bind(&expired)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
+
+        // Session rows of the swept executions: the victim predicate
+        // proved none is inside the reap grace, so these are dead rows
+        // that would otherwise dangle until this TTL.
+        sqlx::query("DELETE FROM log_ingest_sessions WHERE exec_id = ANY($1)")
+            .bind(&expired)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
         stats.chunks += keys.len() as u64;
         metrics::counter!("rio_store_log_sweep_chunks_deleted_total").increment(keys.len() as u64);
 
@@ -137,21 +185,17 @@ pub async fn sweep_expired_logs(
             }
         }
 
-        // A live ingest session for an expired execution should not
-        // exist (retention is days, a session is minutes) but a stale
-        // row costs nothing to clear and would otherwise dangle
-        // forever.
-        sqlx::query("DELETE FROM log_ingest_sessions WHERE exec_id = ANY($1)")
-            .bind(&expired)
-            .execute(pool)
-            .await?;
-
-        // r[impl store.log.sweep-ownership+1]
+        // r[impl store.log.sweep-ownership+2]
         // The drv_executions row is NOT deleted: scheduler-owned
-        // lifecycle state (see the module doc). The candidate SELECT's
-        // EXISTS disjunction keeps a stripped row out of every later
-        // pass, so this count is exact (each expired execution is
-        // swept once).
+        // lifecycle state (see the module doc). This count derives
+        // from the DB's partitioning primitive (bug_104): the
+        // candidate SELECT held `FOR UPDATE SKIP LOCKED` row locks
+        // through the deletes, so concurrent replicas' batches are
+        // disjoint and each expired execution is counted by exactly
+        // one replica's pass — the predecessor's bare SELECT let
+        // overlapping ticks double-accumulate this field (the chunk
+        // and object counters were always RETURNING-derived and
+        // exact).
         stats.executions_swept += expired.len() as u64;
 
         if expired.len() < batch as usize {
@@ -284,12 +328,20 @@ mod tests {
         .await
         .unwrap();
         let session_id = Uuid::now_v7();
+        // The session row is DEAD (past the reap grace): its owner
+        // crashed long ago. (The pre-fix helper seeded a fresh
+        // heartbeat — the liveness-blind sweep never noticed; the
+        // structural exclusion does.)
         sqlx::query(
-            "INSERT INTO log_ingest_sessions (exec_id, session_id, replica_pod) \
-             VALUES ($1, $2, 'store-test')",
+            "INSERT INTO log_ingest_sessions \
+                 (exec_id, session_id, replica_pod, started_at, heartbeat_at) \
+             VALUES ($1, $2, 'store-test', \
+                     now() - make_interval(secs => $3), \
+                     now() - make_interval(secs => $3))",
         )
         .bind(exec_id)
         .bind(session_id)
+        .bind(SESSION_REAP_GRACE_SECS + 60.0)
         .execute(pool)
         .await
         .unwrap();
@@ -338,7 +390,188 @@ mod tests {
         (execs, chunks, sessions)
     }
 
-    // r[verify store.log.sweep-ownership+1]
+    /// W11-N (merged_bug_071). Proposition: **a live session is
+    /// structurally unsweepable** — at the bug's own configuration:
+    /// minimum legal retention with a near-deadline-cap build still
+    /// streaming. Pre-fix the victim SELECT filtered on started_at age
+    /// alone; with log_retention_days = 1 (86,400 s == the scheduler's
+    /// deadline cap exactly — zero margin), a near-cap build was
+    /// mid-stream when the hourly sweep fired: permanent interior log
+    /// loss plus a mid-session Lost-latch lease kill, recurring
+    /// hourly. The exclusion is structural — NOT(open attempt ∨
+    /// session-within-grace) — never an assumed magnitude ordering
+    /// between independently tunable constants; the config-validation
+    /// floor (config.rs) refuses the zero-margin retention outright as
+    /// the other half of the close.
+    #[tokio::test]
+    async fn live_near_cap_session_is_structurally_unsweepable() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+
+        // A RUNNING execution 1.5 days old (legal under the 1-day
+        // deadline-cap clock skewed by queue time; past the
+        // retention=1d horizon) with a LIVE session actively cutting.
+        let exec = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO drv_executions \
+                 (exec_id, drv_hash, executor_id, started_at, status) \
+             VALUES ($1, $2, 'builder-0', now() - make_interval(secs => $3), NULL)",
+        )
+        .bind(exec)
+        .bind(DRV_HASH_32)
+        .bind(1.5 * 86_400.0)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let session = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO log_ingest_sessions (exec_id, session_id, replica_pod) \
+             VALUES ($1, $2, 'store-live')",
+        )
+        .bind(exec)
+        .bind(session)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let key = log_chunk_key(DRV_HASH_32, &exec, &session, 0);
+        store.put(&key, b"mid-stream chunk".to_vec()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO drv_log_chunks \
+                 (exec_id, session_id, chunk_seq, first_line, line_count, byte_size, s3_key) \
+             VALUES ($1, $2, 0, 0, 5, 16, $3)",
+        )
+        .bind(exec)
+        .bind(session)
+        .bind(&key)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // The hourly sweep fires at retention = 1 day.
+        let stats = sweep_expired_logs(&db.pool, &store, Duration::from_secs(86_400), SWEEP_BATCH)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (stats.executions_swept, counts(&db.pool, exec).await),
+            (0, (1, 1, 1)),
+            "left (pre-fix): the age-only victim SELECT deletes the live \
+             stream's chunk rows, objects, and lease row mid-session — \
+             permanent interior log loss + a Lost-latch kill, recurring \
+             hourly / right: an open attempt with a live session is \
+             structurally outside the victim predicate"
+        );
+        assert_eq!(store.len(), 1, "the chunk object survives");
+
+        // The terminal-but-graced cell: a finished execution whose
+        // session row is still inside the reap grace (the stream
+        // closed seconds ago) is also protected — the sibling reap's
+        // discipline, not a special case.
+        sqlx::query("UPDATE drv_executions SET status = 'succeeded' WHERE exec_id = $1")
+            .bind(exec)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let stats = sweep_expired_logs(&db.pool, &store, Duration::from_secs(86_400), SWEEP_BATCH)
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.executions_swept, 0,
+            "a session row inside the grace still shields its execution"
+        );
+
+        // The convergence cell: once the session row ages past the
+        // grace, the same execution sweeps normally — the exclusion is
+        // a grace, not immortality (the exit edge is the sibling
+        // reap's own clock).
+        sqlx::query(
+            "UPDATE log_ingest_sessions \
+             SET heartbeat_at = now() - make_interval(secs => $2) \
+             WHERE exec_id = $1",
+        )
+        .bind(exec)
+        .bind(SESSION_REAP_GRACE_SECS + 60.0)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let stats = sweep_expired_logs(&db.pool, &store, Duration::from_secs(86_400), SWEEP_BATCH)
+            .await
+            .unwrap();
+        assert_eq!(
+            (stats.executions_swept, counts(&db.pool, exec).await),
+            (1, (1, 0, 0)),
+            "past the grace the sweep proceeds — bounded exclusion, not a leak"
+        );
+    }
+
+    /// W11-O (bug_104). Proposition: **executions_swept is exact under
+    /// replica overlap** — the count derives from the DB's
+    /// partitioning primitive (FOR UPDATE SKIP LOCKED, the drain
+    /// idiom), not from selection-side reasoning that only holds for
+    /// sequential passes. The test plays replica A by holding FOR
+    /// UPDATE locks on the candidate rows in an open transaction, then
+    /// runs the production sweep as replica B: pre-fix B's bare SELECT
+    /// ignored A's locks, double-selected the same batch, and both
+    /// replicas accumulated it (the :149 comment claimed "exact" with
+    /// nothing enforcing it); post-fix B skips A's rows entirely and
+    /// a later pass (after A releases) sweeps exactly once.
+    #[tokio::test]
+    async fn overlapping_replicas_sweep_disjoint_batches() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let exec = Uuid::now_v7();
+        seed_aged_execution(&db.pool, &store, exec, 31.0, 2).await;
+
+        // Replica A: mid-pass, holding the candidate row locks.
+        let mut replica_a = db.pool.begin().await.unwrap();
+        let locked: Vec<Uuid> =
+            sqlx::query_scalar("SELECT exec_id FROM drv_executions WHERE exec_id = $1 FOR UPDATE")
+                .bind(exec)
+                .fetch_all(&mut *replica_a)
+                .await
+                .unwrap();
+        assert_eq!(locked.len(), 1);
+
+        // Replica B: the production sweep, concurrent with A.
+        let stats = sweep_expired_logs(
+            &db.pool,
+            &store,
+            Duration::from_secs(30 * 86_400),
+            SWEEP_BATCH,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stats.executions_swept, 0,
+            "left (pre-fix): the bare candidate SELECT ignores replica A's \
+             locks — both replicas select, delete, and count the same batch \
+             (executions_swept double-accumulates across the fleet) / \
+             right: SKIP LOCKED partitions the candidates; B claims nothing \
+             A holds"
+        );
+
+        // A releases; the next pass sweeps exactly once.
+        replica_a.rollback().await.unwrap();
+        let stats = sweep_expired_logs(
+            &db.pool,
+            &store,
+            Duration::from_secs(30 * 86_400),
+            SWEEP_BATCH,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stats,
+            SweepStats {
+                executions_swept: 1,
+                chunks: 2,
+                objects: 2,
+            },
+            "each expired execution is swept and counted exactly once"
+        );
+    }
+
+    // r[verify store.log.sweep-ownership+2]
     /// merged_bug_086 (red-first): the log TTL sweep owns store-side
     /// log artifacts ONLY — chunks, objects, stale session rows.
     /// `drv_executions` is the scheduler-owned execution lifecycle row:

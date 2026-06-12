@@ -2590,11 +2590,16 @@ a compromised builder holding a valid token could exhaust the replica's
 memory, and without the monotone gate it could corrupt the manifest's line
 arithmetic for its own execution.
 
-#r("store.log.sweep-ownership+1")[
-  The store's log TTL sweep owns log artifacts ONLY: it deletes
-  `drv_log_chunks` rows, their backing objects, and stale
-  `log_ingest_sessions` rows for executions past `log_retention_days`,
-  and MUST NOT delete `drv_executions` rows. The execution lifecycle row
+#r("store.log.sweep-ownership+2")[
+  The store's log TTL sweep owns log artifacts ONLY, and its victims
+  carry their exclusions structurally: it deletes `drv_log_chunks`
+  rows, their backing objects, and dead `log_ingest_sessions` rows for
+  executions past `log_retention_days` that are TERMINAL and have no
+  ingest-session row inside the reap grace --- never by age alone ---
+  selecting candidates with `FOR UPDATE SKIP LOCKED` so concurrent
+  replicas sweep disjoint batches; config validation MUST refuse
+  retention values that do not exceed the scheduler's build deadline
+  cap; and the sweep MUST NOT delete `drv_executions` rows. The execution lifecycle row
   is collected by the scheduler's execution-row GC, and only when the
   row is terminal, has no active assignment, is referenced by no
   `drv_attempts` row, has no surviving `drv_log_chunks` row and no
@@ -2608,7 +2613,16 @@ arithmetic for its own execution.
 The store-side sweep selected victims by age alone; `drv_executions` is
 scheduler-owned cross-service state (terminality, report idempotency,
 attempt-kind resolution), and deleting it by age destroyed the kind context
-of still-referenced ledger rows behind the scheduler's back.
+of still-referenced ledger rows behind the scheduler's back. Age alone is
+also not a liveness proof (merged_bug_071): "retention is days, a session
+is minutes" was an unvalidated cross-crate inequality between independently
+tunable constants with zero margin at the floor --- a near-deadline-cap
+build at minimum retention was still streaming when the hourly sweep fired,
+permanent interior log loss recurring hourly. The exclusion is the sibling
+stale-session reap's own grace discipline, the validation floor refuses the
+boundary collapse (R29), and the exactness of the swept counter derives
+from the locking primitive, never from sequential-pass reasoning
+(bug_104).
 
 #r("store.log.write-read-bound+2")[
   The chunk payload ceiling is ONE shared constant consumed by both halves

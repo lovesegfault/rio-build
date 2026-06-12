@@ -617,7 +617,7 @@ impl SchedulerDb {
     /// argument as [`Self::gc_attempt_ledger`] below; subselect-LIMIT
     /// per the same precedent. Deliberately stronger than
     /// "not-in-suffix" — see the kernel doc.
-    // r[impl store.log.sweep-ownership+1]
+    // r[impl store.log.sweep-ownership+2]
     pub(crate) async fn gc_exec_rows(
         &self,
         retention_secs: f64,

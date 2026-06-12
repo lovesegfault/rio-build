@@ -2171,7 +2171,7 @@ fn admit_bounded_uncharged<Id>(
 /// The SQL twin is `gc_exec_rows` in rio-scheduler `db/attempts.rs`
 /// (liveness per `rio_migrations::sql::SESSION_STALE_AFTER_SECS`);
 /// its DB tests pin all six conjuncts against real rows.
-// r[impl store.log.sweep-ownership+1]
+// r[impl store.log.sweep-ownership+2]
 pub fn exec_row_sweep_eligible(
     terminal: bool,
     has_active_assignment: bool,
@@ -4315,7 +4315,7 @@ mod proofs {
         }
     }
 
-    // r[verify store.log.sweep-ownership+1]
+    // r[verify store.log.sweep-ownership+2]
     /// [`exec_row_sweep_eligible`] is exactly the six-conjunct guard:
     /// eligibility implies every safety conjunct (terminal, no active
     /// assignment, no ledger reference, no surviving log chunks, no
