@@ -1479,7 +1479,10 @@ mod tests {
     /// and THE verify body (mints nothing) — plus three DISCLOSED
     /// test fixtures that hand-roll tampered/legacy tokens to drive
     /// verify's rejects. A new raw-MAC site anywhere in the crate
-    /// fails this census until filed. Out-of-crate raw mints are
+    /// fails this census until filed — where "anywhere" binds to the
+    /// RECURSIVE universe walk, quantifier: census(mac_census_universe_matches_live_tree)
+    /// (WO-S8-5: the depth-1 walk this replaced made the word
+    /// quantify over the flat layer only). Out-of-crate raw mints are
     /// outside this census's jurisdiction by construction (the key
     /// loader and the claims types live here; consumers sign through
     /// this module) — disclosed, not silently claimed.
@@ -1518,10 +1521,52 @@ mod tests {
         );
     }
 
+    /// Recursive census-universe walk (WO-S8-5, merged_bug_122):
+    /// RELATIVE paths (`sub/mod.rs` form) of every `.rs` FILE under
+    /// `root`, recursing into subdirectories and asserting every
+    /// entry's type — a directory's `.rs` content JOINS the universe
+    /// (so a flat embedded list fails the equality with the nested
+    /// path NAMED), and a non-file/non-dir entry panics. The
+    /// completeness witness FAILS CLOSED on population-SHAPE change:
+    /// a subdirectory appearing is a census red, never a silent
+    /// exclusion. The depth-1 `read_dir` + name-filter form this
+    /// replaced silently dropped directory entries, so a future
+    /// `src/<subdir>/foo.rs` raw mint evaded BOTH the scan and the
+    /// parity pin, voiding the "anywhere in the crate" guarantee the
+    /// CONFIRM_FENCE_GC_SECS derivation leans on.
+    fn walk_rs_files(root: &std::path::Path, prefix: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(root).expect("readable census dir") {
+            let e = e.expect("entry");
+            let ft = e.file_type().expect("entry file type");
+            let name = e
+                .file_name()
+                .to_str()
+                .expect("source file names are utf-8")
+                .to_owned();
+            if ft.is_dir() {
+                out.extend(walk_rs_files(&e.path(), &format!("{prefix}{name}/")));
+            } else {
+                assert!(
+                    ft.is_file(),
+                    "census walk: refusing non-file non-dir entry {prefix}{name} \
+                     (fail-closed: the universe must classify every entry)"
+                );
+                if name.ends_with(".rs") {
+                    out.push(format!("{prefix}{name}"));
+                }
+            }
+        }
+        out
+    }
+
     /// The (wwwww) dual obligation: the embedded census universe
     /// equals the live `src/` tree exactly (both directions); in the
     /// nix sandbox (no source dir) the embedded scan is the same
-    /// commit's content — skip disclosed, never silent.
+    /// commit's content — skip disclosed, never silent. "Every src
+    /// file" quantifies over the RECURSIVE walk (WO-S8-5) — a nested
+    /// `src/<subdir>/*.rs` appears in `live` and fails this equality
+    /// by name until embedded.
     #[test]
     fn mac_census_universe_matches_live_tree() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1529,21 +1574,57 @@ mod tests {
             eprintln!("src/ not on disk (nix sandbox): universe pinned by the dev-tree run");
             return;
         }
-        let mut live: Vec<String> = std::fs::read_dir(&root)
-            .expect("readable src dir")
-            .map(|e| {
-                e.expect("entry")
-                    .file_name()
-                    .to_str()
-                    .expect("source file names are utf-8")
-                    .to_owned()
-            })
-            .filter(|n| n.ends_with(".rs"))
-            .collect();
+        let mut live = walk_rs_files(&root, "");
         live.sort();
         let mut embedded: Vec<String> = embedded_sources().iter().map(|(f, _)| f.clone()).collect();
         embedded.sort();
         assert_eq!(embedded, live, "embed every src file in embedded_sources()");
+    }
+
+    /// W11-BX (merged_bug_122): the population-growth mode the
+    /// universe pin exists for — a SUBDIRECTORY appearing in the
+    /// crate. The recursive walk must return the nested file (so the
+    /// embedded-equality pin goes red NAMING it), while the depth-1
+    /// strawman — the exact pre-fix form, kept as the disclosed
+    /// reversal red — silently drops the directory entry and reports
+    /// the flat file only. If the walk ever regresses to depth-1,
+    /// the first assertion here is the red.
+    #[test]
+    fn mac_census_walk_fails_closed_on_crate_shape_change() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::write(td.path().join("a.rs"), "// flat").unwrap();
+        std::fs::create_dir(td.path().join("sub")).unwrap();
+        std::fs::write(td.path().join("sub").join("b.rs"), "// nested").unwrap();
+
+        let mut walked = walk_rs_files(td.path(), "");
+        walked.sort();
+        assert_eq!(
+            walked,
+            vec!["a.rs".to_string(), "sub/b.rs".to_string()],
+            "left (pre-fix): the depth-1 walk returns [\"a.rs\"] — the nested \
+             census member is silently excluded / right: the recursive walk \
+             carries the population-shape change into the universe"
+        );
+
+        // The strawman (the pre-fix depth-1 form, verbatim shape):
+        // directory entries fail the name filter and vanish.
+        let mut strawman: Vec<String> = std::fs::read_dir(td.path())
+            .expect("readable dir")
+            .map(|e| {
+                e.expect("entry")
+                    .file_name()
+                    .to_str()
+                    .expect("utf-8")
+                    .to_owned()
+            })
+            .filter(|n| n.ends_with(".rs"))
+            .collect();
+        strawman.sort();
+        assert_eq!(
+            strawman,
+            vec!["a.rs".to_string()],
+            "the disclosed reversal red: the old depth-1 form cannot see sub/b.rs"
+        );
     }
 
     fn embedded_sources() -> Vec<(String, String)> {
