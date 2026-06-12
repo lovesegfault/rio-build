@@ -187,7 +187,6 @@ closing that gap would take (paging the walk, not raising the cap).
 
 - *S3 key schema:* `chunks/{first-2-hex-chars}/{full-blake3-hex}`
   (prefix-partitioned to avoid S3 hotspots)
-- Chunks are stored uncompressed in S3 to maximize dedup across packages
 - Dedup during `PutPath` uses a `refcount == 1` heuristic: after the refcount
   UPSERT, chunks whose refcount is exactly 1 were newly inserted by this upload
   and need to go to S3; chunks with refcount > 1 already existed. This has a
@@ -199,6 +198,26 @@ closing that gap would take (paging the walk, not raising the cap).
 - *S3 backend requirements:* Strong read-after-write consistency is required.
   AWS S3 provides this natively. Non-AWS S3-compatible backends (MinIO, Ceph
   RADOS GW) must be validated for consistency.
+
+#r("store.cas.zstd-at-rest")[
+  Chunk objects MUST be zstd-compressed at rest on write; chunk digests MUST
+  remain the BLAKE3 of the UNCOMPRESSED bytes (the digest space never
+  re-keys); reads MUST sniff the zstd frame magic (`0x28B52FFD`,
+  little-endian) to distinguish compressed objects from legacy raw chunks,
+  decompress under a `CHUNK_MAX` output bound, and verify BLAKE3 over the
+  decompressed result --- falling back to raw verification when the sniffed
+  decode does not produce bytes matching the digest; a stored object that
+  verifies under neither form MUST surface as a corruption error naming the
+  digest, never a decoder panic or unbounded allocation.
+]
+
+Migration rule (ADR-024 P2): legacy uncompressed chunks age out naturally
+via GC --- there is no backfill job. The raw-verify fallback also makes the
+magic sniff correctness-free for legacy chunks whose *content* begins with
+the zstd magic (any sub-`CHUNK_MAX` `.zst` file stored as one chunk, plus
+the \~2⁻³² accidental-prefix case). Dedup is unaffected: identical
+uncompressed content compresses to the identical stored object under the
+same digest key.
 
 #r("store.backend.filesystem")[
   For dev/single-node deployments, `FilesystemChunkBackend` stores chunks on

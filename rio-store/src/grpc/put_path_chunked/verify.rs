@@ -120,8 +120,12 @@ impl UploadPipeline {
         self.submitted.insert(digest);
         let backend = Arc::clone(&self.backend);
         self.in_flight.spawn(async move {
+            // zstd-at-rest: `body` was digest-verified as plaintext by
+            // recv_novel_chunk; the STORED form is compressed (digest
+            // space unchanged — r[store.cas.zstd-at-rest]).
+            let stored = cas::compress_chunk(&body);
             let result = backend
-                .put(&digest, body)
+                .put(&digest, stored)
                 .await
                 .map_err(|e| format!("chunk upload failed: {e:#}"));
             (digest, result)

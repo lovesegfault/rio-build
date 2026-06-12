@@ -20988,6 +20988,10 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
         }
       ],
       "devDependencies": [
@@ -29630,18 +29634,6 @@
         {
           "name": "zeroize",
           "packageId": "zeroize"
-        },
-        {
-          "name": "zstd",
-          "packageId": "zstd"
-        },
-        {
-          "name": "zstd-safe",
-          "packageId": "zstd-safe"
-        },
-        {
-          "name": "zstd-sys",
-          "packageId": "zstd-sys"
         }
       ],
       "buildDependencies": [
@@ -30217,18 +30209,6 @@
         {
           "name": "zeroize",
           "packageId": "zeroize"
-        },
-        {
-          "name": "zstd",
-          "packageId": "zstd"
-        },
-        {
-          "name": "zstd-safe",
-          "packageId": "zstd-safe"
-        },
-        {
-          "name": "zstd-sys",
-          "packageId": "zstd-sys"
         }
       ],
       "libCrateTypes": [

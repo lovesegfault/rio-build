@@ -6564,6 +6564,7 @@ dependencies = [
  "tracing-test",
  "uuid",
  "workspace-hack",
+ "zstd",
 ]
 
 [[package]]
@@ -9241,9 +9242,6 @@ dependencies = [
  "winnow",
  "zerocopy",
  "zeroize",
- "zstd",
- "zstd-safe",
- "zstd-sys",
 ]
 
 [[package]]

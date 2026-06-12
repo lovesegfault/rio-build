@@ -587,7 +587,11 @@ async fn do_upload(
     stream::iter(to_upload)
         .map(|(hash, range)| {
             // Owned copy deferred to here: ≤ max_concurrent in flight.
-            let data = Bytes::copy_from_slice(&nar_data[range]);
+            // The owned form is the zstd-at-rest STORED form (the
+            // digest stays over the uncompressed slice); compressing
+            // at the same deferred point keeps the in-flight bound at
+            // ≤ max_concurrent × ~CHUNK_MAX of owned bytes.
+            let data = compress_chunk(&nar_data[range]);
             let backend = Arc::clone(backend);
             let hb = hb.clone();
             async move {
@@ -681,6 +685,79 @@ mod parsed_nar_tests {
             "trailing bytes after the NAR root node must be rejected"
         );
     }
+}
+
+// ============================================================================
+// At-rest chunk compression (zstd) — ADR-024 P2
+// ============================================================================
+
+/// zstd frame magic number, little-endian on the wire (`0xFD2FB528`).
+/// Reads sniff this prefix to distinguish compressed objects from
+/// legacy raw chunks written before zstd-at-rest landed.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// At-rest compression level: zstd default (3) — the same level the
+/// serve-time NAR encoder uses (substitute.rs's `ZstdEncoder::new`,
+/// async-compression's default). Chunks are ≤256 KiB and compressed
+/// once per unique digest; default-level is the measured sweet spot
+/// for the skeleton/inputSrcs ratios ADR-024 budgets against.
+const ZSTD_AT_REST_LEVEL: i32 = zstd::DEFAULT_COMPRESSION_LEVEL;
+
+/// Compress a chunk body for storage.
+///
+/// The DIGEST SPACE IS UNCHANGED: chunks stay keyed by the BLAKE3 of
+/// their UNCOMPRESSED bytes (compressing must never re-key the dedup
+/// namespace), only the stored object bytes are zstd-framed. Callers
+/// pass the verified plaintext; the matching read-side decode is
+/// [`decode_stored_chunk`].
+// r[impl store.cas.zstd-at-rest]
+pub fn compress_chunk(data: &[u8]) -> Bytes {
+    // encode_all over a slice cannot fail (no I/O): the only error
+    // source is the Write impl, and Vec's never errors.
+    Bytes::from(zstd::encode_all(data, ZSTD_AT_REST_LEVEL).expect("zstd encode to Vec cannot fail"))
+}
+
+/// Decode + BLAKE3-verify a chunk object as read from the backend.
+///
+/// Migration rule (ADR-024 P2): compressed and legacy-raw objects
+/// coexist; legacy chunks age out via GC, there is no backfill job.
+/// The stored form is sniffed by the zstd magic:
+///
+/// - No magic → legacy raw chunk: verify BLAKE3 over the bytes as-is.
+/// - Magic → bounded decompress, then verify BLAKE3 over the
+///   DECOMPRESSED bytes (the digest space rule — digests are always
+///   over uncompressed content).
+/// - Magic but decompression fails OR the decompressed bytes do not
+///   hash to the digest → fall back to raw verification. This makes
+///   the sniff correctness-free: a LEGACY chunk whose first 4 bytes
+///   happen to be the zstd magic (≈2⁻³² by chance, but also any
+///   legacy chunk whose CONTENT is itself a zstd file ≤256 KiB —
+///   FastCDC emits sub-CHUNK_MAX files as one chunk verbatim) decodes
+///   to the wrong bytes or fails to decode, and the raw fallback
+///   verifies it exactly as before.
+///
+/// A corrupted compressed object fails BOTH branches and surfaces as
+/// [`ChunkError::Corrupt`] naming the digest — zstd decoder errors are
+/// never propagated as panics or I/O errors. Decompression is bounded
+/// by `chunker::CHUNK_MAX`: every honestly-stored chunk is ≤256 KiB
+/// uncompressed (FastCDC max; `validate_begin` enforces the same bound
+/// on client-claimed sizes), so a frame claiming more is by definition
+/// not a chunk this store wrote — bomb-safe by construction.
+// r[impl store.cas.zstd-at-rest]
+pub fn decode_stored_chunk(expected: &[u8; 32], stored: Bytes) -> Result<Bytes, ChunkError> {
+    if stored.len() >= ZSTD_MAGIC.len() && stored[..ZSTD_MAGIC.len()] == ZSTD_MAGIC {
+        // `bulk::decompress` errors when the output would exceed the
+        // capacity — that caps decompression work and memory at
+        // CHUNK_MAX regardless of what the frame header claims.
+        if let Ok(plain) = zstd::bulk::decompress(&stored, chunker::CHUNK_MAX)
+            && *blake3::hash(&plain).as_bytes() == *expected
+        {
+            return Ok(Bytes::from(plain));
+        }
+        // Fall through: legacy magic-collision chunk (raw verify will
+        // pass) or corruption (raw verify will name the digest).
+    }
+    ChunkCache::verify(expected, stored)
 }
 
 // ============================================================================
@@ -856,11 +933,16 @@ impl ChunkCache {
         // next call). Propagate as data-loss error.
         let bytes = fetched.ok_or(ChunkError::NotFound(*hash))?;
 
-        // --- Layer 3: Verify BEFORE cache insert ---
-        // If this fails, the corrupt bytes never enter the cache. The
-        // next call retries from the backend (which might have recovered
-        // — S3 bitrot is sometimes transient, sometimes not).
-        let verified = Self::verify(hash, bytes)?;
+        // --- Layer 3: Decode + verify BEFORE cache insert ---
+        // Backend bytes are the STORED form (zstd-framed or legacy
+        // raw); decode_stored_chunk sniffs, maybe decompresses, and
+        // verifies BLAKE3 over the uncompressed result. If this fails,
+        // the corrupt bytes never enter the cache. The next call
+        // retries from the backend (which might have recovered — S3
+        // bitrot is sometimes transient, sometimes not). The LRU only
+        // ever holds UNCOMPRESSED bytes, which is why the layer-1 hit
+        // path above verifies raw without sniffing.
+        let verified = decode_stored_chunk(hash, bytes)?;
 
         // --- Layer 4: Cache insert ---
         // moka's insert is async (eviction runs concurrently). Bytes is
@@ -1432,5 +1514,183 @@ mod upload_tests {
             1,
             "max_concurrent=1 must serialize uploads"
         );
+    }
+}
+
+// r[verify store.cas.zstd-at-rest]
+#[cfg(test)]
+mod zstd_at_rest_tests {
+    use super::*;
+    use crate::test_helpers::mem_backend;
+
+    fn hash_of(data: &[u8]) -> [u8; 32] {
+        *blake3::hash(data).as_bytes()
+    }
+
+    fn cache_over(backend: &Arc<crate::backend::MemoryChunkBackend>) -> ChunkCache {
+        ChunkCache::with_capacity(
+            Arc::clone(backend) as Arc<dyn crate::backend::ChunkBackend>,
+            1024 * 1024,
+        )
+    }
+
+    /// Write path stores the zstd form; read path serves the original
+    /// plaintext. The digest is over the UNCOMPRESSED bytes — proven
+    /// by keying the stored compressed object under blake3(plaintext).
+    #[tokio::test]
+    async fn round_trip_compressed_chunk() {
+        let backend = mem_backend();
+        let cache = cache_over(&backend);
+        // Compressible content so stored != plaintext is meaningful.
+        let plain = Bytes::from(vec![0x42u8; 8192]);
+        let hash = hash_of(&plain);
+
+        let stored = compress_chunk(&plain);
+        assert_eq!(&stored[..4], &ZSTD_MAGIC, "stored form is zstd-framed");
+        assert_ne!(stored, plain);
+        assert!(stored.len() < plain.len(), "0x42-run must compress");
+        backend.put(&hash, stored).await.unwrap();
+
+        let got = cache.get_verified(&hash).await.unwrap();
+        assert_eq!(got, plain, "read serves UNCOMPRESSED bytes");
+    }
+
+    /// Migration rule: a chunk written before zstd-at-rest (raw bytes,
+    /// no magic) keeps reading verbatim. No backfill job exists, so
+    /// this path stays live until legacy chunks age out via GC.
+    #[tokio::test]
+    async fn legacy_raw_chunk_still_served() {
+        let backend = mem_backend();
+        let cache = cache_over(&backend);
+        let plain = Bytes::from_static(b"legacy chunk written before zstd-at-rest");
+        let hash = hash_of(&plain);
+        backend.put(&hash, plain.clone()).await.unwrap();
+
+        let got = cache.get_verified(&hash).await.unwrap();
+        assert_eq!(got, plain);
+    }
+
+    /// THE sniff-ambiguity case: a LEGACY chunk whose content IS a
+    /// valid zstd frame (e.g. a sub-CHUNK_MAX `.zst` file emitted as
+    /// one chunk verbatim). The sniff sees the magic, decompression
+    /// succeeds, but the inner bytes don't hash to the digest — the
+    /// raw fallback must serve the chunk exactly as stored.
+    #[tokio::test]
+    async fn magic_collision_legacy_falls_back_to_raw() {
+        let backend = mem_backend();
+        let cache = cache_over(&backend);
+        // The chunk's CONTENT is itself a zstd frame.
+        let plain = compress_chunk(b"inner payload that is not the chunk");
+        assert_eq!(
+            &plain[..4],
+            &ZSTD_MAGIC,
+            "precondition: content sniffs as zstd"
+        );
+        let hash = hash_of(&plain);
+        backend.put(&hash, plain.clone()).await.unwrap();
+
+        let got = cache.get_verified(&hash).await.unwrap();
+        assert_eq!(got, plain, "raw fallback serves the legacy bytes verbatim");
+    }
+
+    /// A corrupted compressed object must surface as Corrupt naming
+    /// the digest — never a decoder panic or an I/O error. Covers both
+    /// shapes: a torn frame (decoder error) and a valid frame holding
+    /// the wrong content (digest mismatch after decompression).
+    #[tokio::test]
+    async fn corrupt_compressed_object_is_corruption_not_panic() {
+        let backend = mem_backend();
+        let cache = cache_over(&backend);
+        let plain = Bytes::from(vec![0x37u8; 4096]);
+        let hash = hash_of(&plain);
+
+        // Shape 1: torn frame — flip a byte past the magic.
+        let mut torn = compress_chunk(&plain).to_vec();
+        let mid = torn.len() / 2;
+        torn[mid] ^= 0xFF;
+        backend.put(&hash, Bytes::from(torn)).await.unwrap();
+        match cache.get_verified(&hash).await {
+            Err(ChunkError::Corrupt { expected, .. }) => assert_eq!(expected, hash),
+            other => panic!("torn zstd frame must be Corrupt, got {other:?}"),
+        }
+
+        // Shape 2: valid frame, wrong content.
+        backend
+            .put(&hash, compress_chunk(b"entirely different content"))
+            .await
+            .unwrap();
+        match cache.get_verified(&hash).await {
+            Err(ChunkError::Corrupt { expected, .. }) => assert_eq!(expected, hash),
+            other => panic!("wrong-content frame must be Corrupt, got {other:?}"),
+        }
+    }
+
+    /// Decompression is bounded by CHUNK_MAX: a frame expanding past
+    /// the bound (no honestly-stored chunk does) is treated as
+    /// corruption via the raw fallback, not decompressed into memory.
+    #[tokio::test]
+    async fn oversized_frame_bounded_not_decompressed() {
+        let backend = mem_backend();
+        let cache = cache_over(&backend);
+        // 4 × CHUNK_MAX of zeros compresses to a tiny frame whose
+        // decompressed size exceeds the bound.
+        let bomb_plain = vec![0u8; chunker::CHUNK_MAX * 4];
+        let bomb = compress_chunk(&bomb_plain);
+        assert!(bomb.len() < 4096, "precondition: the frame itself is tiny");
+        let hash = hash_of(&bomb_plain);
+        backend.put(&hash, bomb).await.unwrap();
+
+        match cache.get_verified(&hash).await {
+            Err(ChunkError::Corrupt { expected, .. }) => assert_eq!(expected, hash),
+            other => panic!("over-bound frame must be Corrupt, got {other:?}"),
+        }
+    }
+
+    /// Mixed manifest: one chunk predates zstd-at-rest (raw in the
+    /// backend), the other is written by today's do_upload (compressed).
+    /// Both read back through the same cache; the new write sniffs as
+    /// zstd in the backend, the legacy one does not.
+    #[tokio::test]
+    async fn mixed_legacy_and_compressed_chunks_read_back() {
+        let backend = mem_backend();
+        let backend_dyn: Arc<dyn crate::backend::ChunkBackend> = Arc::clone(&backend) as _;
+
+        // One buffer, two chunks (do_upload computes offsets within it).
+        let nar_data: Vec<u8> = [vec![0xAAu8; 4096], vec![0xBBu8; 4096]].concat();
+        let (a, b) = nar_data.split_at(4096);
+        let (hash_a, hash_b) = (hash_of(a), hash_of(b));
+
+        // Chunk A is LEGACY: raw bytes already in the backend.
+        backend
+            .put(&hash_a, Bytes::copy_from_slice(a))
+            .await
+            .unwrap();
+
+        // Chunk B is uploaded by today's writer.
+        let chunks = vec![
+            chunker::Chunk {
+                hash: hash_a,
+                data: a,
+            },
+            chunker::Chunk {
+                hash: hash_b,
+                data: b,
+            },
+        ];
+        let needs: std::collections::HashSet<Vec<u8>> = std::iter::once(hash_b.to_vec()).collect();
+        do_upload(None, &backend_dyn, &nar_data, &chunks, &needs, 4)
+            .await
+            .unwrap();
+
+        // Stored forms differ: A raw, B zstd-framed.
+        let stored_a = backend.get(&hash_a).await.unwrap().unwrap();
+        let stored_b = backend.get(&hash_b).await.unwrap().unwrap();
+        assert_ne!(&stored_a[..4], &ZSTD_MAGIC);
+        assert_eq!(&stored_b[..4], &ZSTD_MAGIC);
+
+        // Both verify and round-trip through the read path.
+        let cache = cache_over(&backend);
+        assert_eq!(cache.get_verified(&hash_a).await.unwrap().as_ref(), a);
+        assert_eq!(cache.get_verified(&hash_b).await.unwrap().as_ref(), b);
     }
 }
