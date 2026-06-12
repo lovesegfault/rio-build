@@ -1365,6 +1365,42 @@ impl CoverageMap {
             _ => 0,
         }
     }
+
+    /// THE producer of durable-ack values (merged_bug_005): the
+    /// highest line `v` such that EVERY line `<= v` is durably
+    /// covered, or `None` when line 0 is not covered (no value is a
+    /// true prefix claim then — the producer refuses rather than
+    /// rounding).
+    ///
+    /// `durable_through_line` is denominated in the CONSUMER'S
+    /// ordering domain: the builder's retransmit `trim()` prefix-pops
+    /// every frame at-or-below the ack, so the wire value is a
+    /// contiguous-prefix claim, and per-span containment does not
+    /// entail it — a hole-spanning ack destroys the builder's only
+    /// retransmit copy of the hole-filling lines. Every ack producer
+    /// derives its value through this one fn (one quantity, one
+    /// producer); no producer may emit a value above it.
+    pub fn contiguous_durable_frontier(&self) -> Option<u64> {
+        self.contiguous_prefix_end().checked_sub(1)
+    }
+
+    /// Merge one committed `(first_line, line_count)` interval into
+    /// the map — the live-map maintenance arm: a session that commits
+    /// a chunk extends its durable coverage with it, so the frontier
+    /// consulted by later acks reflects every commit, not just the
+    /// open-time manifest read. Delegates to [`Self::from_intervals`]
+    /// (the ONE span normalizer) rather than minting a second merge.
+    pub fn insert(&mut self, first_line: u64, line_count: u64) {
+        if line_count == 0 {
+            return;
+        }
+        *self = Self::from_intervals(
+            self.spans
+                .iter()
+                .map(|&(start, end)| (start, end - start))
+                .chain([(first_line, line_count)]),
+        );
+    }
 }
 
 #[cfg(kani)]

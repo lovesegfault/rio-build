@@ -751,9 +751,15 @@ impl MbtSystem {
         // The covered-replay drop (merged_bug_002's write-path arm):
         // nothing was buffered or charged, and the driver acks the
         // batch from the manifest truth (`service.rs`'s CoveredReplay
-        // arm) — the uploader's trim consumes it like any ack.
-        if let AcceptOutcome::CoveredReplay { durable_through } = outcome {
-            h.acked_below = h.acked_below.max(durable_through + 1);
+        // arm) — the uploader's trim consumes it like any ack. The
+        // value arrives clamped to the contiguous durable frontier
+        // (merged_bug_005); `None` means no ack was sent, so the
+        // mirror's acked-below watermark stays put.
+        if let AcceptOutcome::CoveredReplay {
+            durable_through: Some(v),
+        } = outcome
+        {
+            h.acked_below = h.acked_below.max(v + 1);
         }
         Ok(())
     }

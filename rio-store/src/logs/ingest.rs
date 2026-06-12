@@ -154,23 +154,45 @@ pub enum AcceptOutcome {
     /// orders of magnitude below the bound.
     RejectedOversizedBatch,
     /// Every line in the batch is already DURABLY covered by the
-    /// execution's committed manifest (the gate's open-time coverage
-    /// read): a reconnect replay of committed content. Dropped
-    /// uncharged and un-written — it can mint no objects, manifest
-    /// rows, or raw charge (merged_bug_002's write-path arm) — but
-    /// unlike the `Rejected*` family this is GOOD news the driver
-    /// acks immediately: `durable_through` is the batch's last line,
-    /// durable per the manifest, so a legacy (non-trimming) builder's
-    /// retransmit buffer still trims instead of waiting for a cut
-    /// that will never carry these lines. Honest partial overlaps are
-    /// NOT consulted here — a straddling batch is accepted whole and
-    /// charges raw in full (every durable write charges the raw
+    /// execution's committed coverage (the gate's open-time read plus
+    /// this session's own commits): a reconnect replay of committed
+    /// content. Dropped uncharged and un-written — it can mint no
+    /// objects, manifest rows, or raw charge (merged_bug_002's
+    /// write-path arm) — but unlike the `Rejected*` family this is
+    /// GOOD news the driver acks immediately. Honest partial overlaps
+    /// are NOT consulted here — a straddling batch is accepted whole
+    /// and charges raw in full (every durable write charges the raw
     /// axis), with forgiveness applied on the merged axis at the next
     /// open's seed.
     CoveredReplay {
-        /// The batch's last line — durable per the committed manifest.
-        durable_through: u64,
+        /// The ack value: the batch's last line CLAMPED to the
+        /// contiguous durable frontier (merged_bug_005). The wire's
+        /// `durable_through_line` is a contiguous-prefix claim — the
+        /// builder's `trim()` prefix-pops every frame at-or-below it
+        /// — and this consult fires precisely in holey-coverage
+        /// states (post-floor containment is impossible under a
+        /// single contiguous prefix), where the batch's own end spans
+        /// the hole. `None` when line 0 is not durably covered: no
+        /// value is a sound prefix claim, so no ack is sent and the
+        /// builder keeps its retransmit copies.
+        durable_through: Option<u64>,
     },
+}
+
+/// A successful chunk commit, as reported by [`IngestSession::cut`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CutCommit {
+    /// The ack to send for this commit: the drained run's last line
+    /// CLAMPED to the contiguous durable frontier (merged_bug_005).
+    /// `None` = the run committed but nothing is contiguously durable
+    /// from line 0 (the run sits past a hole), so no value is a sound
+    /// prefix claim and no ack is sent — the builder keeps its
+    /// retransmit copies until the hole fills and a later ack (or the
+    /// next open-time watermark) covers them. Distinct from the
+    /// caller's "nothing to cut": a commit without an ack still
+    /// counts as progress (failure counters reset, the drain
+    /// continues).
+    pub durable_ack: Option<u64>,
 }
 
 /// Why [`IngestSession::should_abort`] wants the stream torn down.
@@ -424,14 +446,19 @@ pub struct IngestSession {
     /// (`GateOk::seed`), grown per accepted batch, never decremented
     /// on cut. Compared against [`IngestConfig::per_exec_byte_cap`].
     accepted_bytes: u64,
-    /// The execution's durable covered line ranges at open time (the
-    /// gate's coverage read). The covered-replay consult
-    /// (merged_bug_002): a batch FULLY inside these ranges is already
-    /// durable — it is dropped uncharged and un-written, and the
-    /// driver acks it straight from the manifest truth. Open-time
-    /// snapshot by design: ranges only grow during the session (our
-    /// own cuts), and content this session cut is fenced by the
-    /// monotone floor anyway.
+    /// The execution's LIVE durable covered line ranges: the gate's
+    /// open-time coverage read, extended by every chunk this session
+    /// commits ([`Self::cut`] inserts the committed run on success).
+    /// Two consumers: the covered-replay consult (merged_bug_002 — a
+    /// batch FULLY inside these ranges is already durable, dropped
+    /// uncharged and un-written) and the contiguous durable frontier
+    /// (merged_bug_005 — the single producer every durable-ack value
+    /// is clamped through, [`Self::clamped_durable_ack`]). Keeping
+    /// the map live is what lets the cut-leg ack consult the same
+    /// truth as the consult: session-committed runs sit below the
+    /// high-water mark, so growing the map never widens the consult's
+    /// verdict population (batches reaching it are at-or-above the
+    /// high-water mark by the monotone gate).
     covered: rio_log_kernel::CoverageMap,
     /// The session's durable floor (bug_032): one past the highest
     /// line of the CONTIGUOUS committed coverage at open —
@@ -537,6 +564,32 @@ impl IngestSession {
         self.session_floor
     }
 
+    /// The contiguous durable frontier of the LIVE coverage map —
+    /// [`rio_log_kernel::CoverageMap::contiguous_durable_frontier`],
+    /// the one producer of durable-ack values (merged_bug_005). At
+    /// driver start (before any accept or cut) this equals
+    /// `open_coverage_next_line() - 1`, which is how the open-time
+    /// coverage ack derives its `durable_through_line`.
+    pub fn durable_frontier(&self) -> Option<u64> {
+        self.covered.contiguous_durable_frontier()
+    }
+
+    /// Clamp a natural ack value (a batch's or drained run's last
+    /// line) to the contiguous durable frontier: no producer may emit
+    /// a `durable_through_line` above it (merged_bug_005 — the wire
+    /// value is a contiguous-prefix claim; the builder's `trim()`
+    /// prefix-pops everything at-or-below it). `None` = nothing is
+    /// contiguously durable from line 0, so NO value is a sound
+    /// prefix claim and no ack may be sent. Every ack producer in
+    /// this module routes through here; outside holey states the
+    /// clamp is the identity (the natural value IS at-or-below the
+    /// frontier), so honest contiguous traffic acks exactly what it
+    /// always did.
+    fn clamped_durable_ack(&self, natural_last_line: u64) -> Option<u64> {
+        self.durable_frontier()
+            .map(|frontier| natural_last_line.min(frontier))
+    }
+
     /// The shared buffer + subscriber-list handle. The `TailLog` path
     /// clones this to [`IngestShared::subscribe`] under the same lock
     /// the cutter drains under.
@@ -634,8 +687,14 @@ impl IngestSession {
                     session_floor = self.session_floor,
                     "dropped below-floor replay batch: already durable per the manifest"
                 );
+                // The clamp is the identity here by construction:
+                // `last < session_floor` and the floor is the open-time
+                // contiguous prefix end, so `last <= frontier` always —
+                // this arm was the sound denomination from birth
+                // (bug_032), and it routes through the one producer for
+                // the same reason every other ack does.
                 return Ok(AcceptOutcome::CoveredReplay {
-                    durable_through: last,
+                    durable_through: self.clamped_durable_ack(last),
                 });
             }
             let cut = (self.session_floor - batch.first_line_number) as usize;
@@ -766,8 +825,13 @@ impl IngestSession {
         // content the manifest already holds. Writing it again would
         // mint a new object + manifest row and charge the raw axis for
         // bytes the execution already paid for — so it is dropped
-        // before accounting, buffering, or fan-out, and the driver
-        // acks `durable_through` straight from the manifest truth.
+        // before accounting, buffering, or fan-out. The ack is the
+        // batch's last line CLAMPED to the contiguous durable frontier
+        // (merged_bug_005): this arm sits post-floor and post-monotone,
+        // so it is reachable ONLY when the covering span lies past a
+        // hole in the prefix — exactly the states where the batch's
+        // own end is a hole-spanning prefix claim that would trim the
+        // builder's only copy of the hole-filling lines.
         // Partial overlaps fall through whole (accepted, raw-charged):
         // splitting would break the fan-out batch's contiguity, and
         // their forgiveness lives on the merged axis at the next seed.
@@ -783,7 +847,7 @@ impl IngestSession {
                 "dropped covered replay batch: already durable per the manifest"
             );
             return Ok(AcceptOutcome::CoveredReplay {
-                durable_through: end - 1,
+                durable_through: self.clamped_durable_ack(end - 1),
             });
         }
 
@@ -934,7 +998,7 @@ impl IngestSession {
         &mut self,
         store: &dyn LogChunkStore,
         pool: &PgPool,
-    ) -> Result<Option<u64>, CutError> {
+    ) -> Result<Option<CutCommit>, CutError> {
         // Stage the contiguous prefix into `in_flight` under the lock;
         // do the slow work outside it. The lines stay in the shared
         // struct so a subscriber registering mid-commit still sees them.
@@ -1012,7 +1076,21 @@ impl IngestSession {
                 drop(shared);
                 self.consecutive_cut_failures = 0;
                 metrics::counter!("rio_store_log_chunks_written_total").increment(1);
-                Ok(Some(last_line))
+                // The committed run joins the LIVE coverage map, THEN
+                // the ack derives through the one frontier producer
+                // (merged_bug_005): a run that extends the contiguous
+                // prefix acks its own last line (the clamp is the
+                // identity — the common, hole-free case), while a run
+                // committed past a silently-rejected gap acks at most
+                // the frontier below the gap. The Rejected* arms keep
+                // the stream open WITHOUT acking, so the builder still
+                // holds its only copy of the rejected lines; an ack at
+                // this run's end would launder them as durable and the
+                // builder's prefix-pop trim would destroy them.
+                self.covered.insert(first_line, line_count);
+                Ok(Some(CutCommit {
+                    durable_ack: self.clamped_durable_ack(last_line),
+                }))
             }
             Err(e) => {
                 // Fold the staged run back onto the front of the buffer:
@@ -1503,7 +1581,11 @@ mod tests {
             other => panic!("expected Accepted, got {other:?}"),
         }
 
-        let acked = session.cut(&store, &db.pool).await.unwrap();
+        let acked = session
+            .cut(&store, &db.pool)
+            .await
+            .unwrap()
+            .and_then(|c| c.durable_ack);
         assert_eq!(acked, Some(29), "30 lines 0..=29 were drained");
         assert_eq!(store.len(), 1, "exactly one chunk object");
         assert_eq!(
@@ -1603,7 +1685,11 @@ mod tests {
 
         session.accept(batch(0, 100)).unwrap();
         assert_eq!(
-            session.cut(&store, &db.pool).await.unwrap(),
+            session
+                .cut(&store, &db.pool)
+                .await
+                .unwrap()
+                .and_then(|c| c.durable_ack),
             Some(99),
             "the ack is the last drained line number"
         );
@@ -1661,7 +1747,11 @@ mod tests {
         session.accept(batch(150, 50)).unwrap();
 
         assert_eq!(
-            session.cut(&store, &db.pool).await.unwrap(),
+            session
+                .cut(&store, &db.pool)
+                .await
+                .unwrap()
+                .and_then(|c| c.durable_ack),
             Some(99),
             "the first cut drains only the contiguous prefix [0, 100)"
         );
@@ -1671,9 +1761,16 @@ mod tests {
             "the post-gap lines stay buffered"
         );
         assert_eq!(
-            session.cut(&store, &db.pool).await.unwrap(),
-            Some(199),
-            "the second cut drains the post-gap run [150, 200)"
+            session
+                .cut(&store, &db.pool)
+                .await
+                .unwrap()
+                .and_then(|c| c.durable_ack),
+            Some(99),
+            "the second cut drains the post-gap run [150, 200) but acks at \
+             the contiguous durable frontier (merged_bug_005): lines \
+             100..150 are not durable, so 199 would be a hole-spanning \
+             prefix claim"
         );
 
         let rows = manifest_rows(&db.pool, exec).await;
@@ -1737,7 +1834,14 @@ mod tests {
 
         session.accept(batch(0, 100)).unwrap();
         assert!(session.cut(&store, &db.pool).await.is_err());
-        assert_eq!(session.cut(&store, &db.pool).await.unwrap(), Some(99));
+        assert_eq!(
+            session
+                .cut(&store, &db.pool)
+                .await
+                .unwrap()
+                .and_then(|c| c.durable_ack),
+            Some(99)
+        );
 
         let keys = store.inner.keys();
         assert_eq!(keys.len(), 1, "exactly one object was committed");
@@ -1764,7 +1868,14 @@ mod tests {
         // More lines arrive while the failed cut's lines sit restored at
         // the front of the buffer.
         session.accept(batch(100, 50)).unwrap();
-        assert_eq!(session.cut(&store, &db.pool).await.unwrap(), Some(149));
+        assert_eq!(
+            session
+                .cut(&store, &db.pool)
+                .await
+                .unwrap()
+                .and_then(|c| c.durable_ack),
+            Some(149)
+        );
 
         let keys = store.inner.keys();
         assert_eq!(keys.len(), 1);
@@ -1938,7 +2049,7 @@ mod tests {
         // Let the PUT complete and the cut succeed.
         store.release.add_permits(1);
         let (session, acked) = cut.await.unwrap();
-        assert_eq!(acked.unwrap(), Some(99));
+        assert_eq!(acked.unwrap().and_then(|c| c.durable_ack), Some(99));
         assert!(
             session.shared().lock().unwrap().in_flight.is_empty(),
             "a committed cut clears the staging area"
@@ -2058,10 +2169,26 @@ mod tests {
         // run; the next run is already waiting).
         session.accept(batch(0, 3)).unwrap();
         session.accept(batch(5, 3)).unwrap();
-        assert_eq!(session.cut(&store, &db.pool).await.unwrap(), Some(2));
+        assert_eq!(
+            session
+                .cut(&store, &db.pool)
+                .await
+                .unwrap()
+                .and_then(|c| c.durable_ack),
+            Some(2)
+        );
         tokio::time::sleep(Duration::from_millis(1100)).await;
         session.accept(batch(10, 3)).unwrap();
-        assert_eq!(session.cut(&store, &db.pool).await.unwrap(), Some(7));
+        // The post-gap run [5,8) commits but acks at the frontier
+        // (merged_bug_005): lines 3..5 are not durable.
+        assert_eq!(
+            session
+                .cut(&store, &db.pool)
+                .await
+                .unwrap()
+                .and_then(|c| c.durable_ack),
+            Some(2)
+        );
         tokio::time::sleep(Duration::from_millis(1100)).await;
 
         // ONE transient failure on the busy stream (the S3 blip).
@@ -2149,5 +2276,168 @@ mod tests {
             shared.restore_in_flight();
             assert_eq!(shared.buffer.len(), 5, "the abandoned run folded back");
         }
+    }
+
+    /// A session born over an execution with the given committed
+    /// coverage intervals (`(first_line, line_count)` pairs), as after
+    /// a reconnect. Mirrors [`new_session_with_seed`] but populates the
+    /// coverage map — the consult population the frontier law ranges
+    /// over.
+    fn new_session_with_coverage(
+        config: IngestConfig,
+        intervals: impl IntoIterator<Item = (u64, u64)>,
+    ) -> IngestSession {
+        IngestSession::new(
+            &super::super::gate::GateOk {
+                drv_hash: "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm".to_string(),
+                exec_id: Uuid::now_v7(),
+                final_line_count: None,
+                seed: super::super::gate::LogSeed {
+                    merged_bytes: 0,
+                    merged_chunks: 0,
+                    raw_bytes: 0,
+                    raw_rows: 0,
+                },
+                covered: rio_log_kernel::CoverageMap::from_intervals(intervals),
+            },
+            Uuid::now_v7(),
+            config,
+        )
+    }
+
+    /// W12-A (merged_bug_005, red-first): no ack may exceed the
+    /// contiguous durable frontier. The covered-replay consult is
+    /// reachable ONLY in holey-map states (a single contiguous prefix
+    /// makes post-floor containment impossible), so its entire live
+    /// input domain is the population of this test: coverage
+    /// `{[0,5), [10,20)}` (hole at `[5,10)`), replay of `[10,15)` —
+    /// fully covered, so it is dropped as a covered replay. The ack it
+    /// carries is consumed by the builder's `trim()` as a
+    /// contiguous-prefix claim (every line <= ack is durable); any ack
+    /// past line 4 destroys the builder's only retransmit copy of the
+    /// hole-filling lines 5..=9 still absent from durable storage.
+    #[test]
+    fn covered_replay_ack_never_exceeds_the_contiguous_frontier() {
+        let mut session = new_session_with_coverage(test_config(), [(0, 5), (10, 10)]);
+
+        match session.accept(batch(10, 5)).unwrap() {
+            AcceptOutcome::CoveredReplay { durable_through } => {
+                // The frontier: coverage {[0,5), [10,20)} has
+                // contiguous-from-zero prefix [0,5), so line 4 is the
+                // highest line every line at-or-below which is durable.
+                // Pre-fix RED (verbatim): "hole-spanning ack:
+                // durable_through=14 claims the un-durable hole [5,10)
+                // as durable (frontier is 4)".
+                assert_eq!(
+                    durable_through,
+                    Some(4),
+                    "the covered-replay ack must pin to the contiguous durable \
+                     frontier, never the containment end"
+                );
+            }
+            other => panic!("expected CoveredReplay for a fully-covered batch, got {other:?}"),
+        }
+    }
+
+    /// W12-B (merged_bug_005's no-regression face): outside holey
+    /// states the frontier clamp is the IDENTITY — contiguous-prefix
+    /// replays still ack at their full end (the below-floor arm's
+    /// behavior is byte-stable, bug_032), and a cut extending the
+    /// contiguous prefix still acks its drained run's last line. The
+    /// honest builder's forgiveness path is untouched by the clamp.
+    #[tokio::test]
+    async fn clamp_is_invisible_outside_holes() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        // Contiguous committed coverage [0,20): floor and frontier
+        // agree (frontier 19).
+        let mut session = new_session_with_coverage(test_config(), [(0, 20)]);
+
+        // A below-floor replay acks its own full end, exactly as the
+        // sound bug_032 arm always did.
+        match session.accept(batch(5, 5)).unwrap() {
+            AcceptOutcome::CoveredReplay { durable_through } => {
+                assert_eq!(
+                    durable_through,
+                    Some(9),
+                    "below-floor replays ack at full end (byte-stable)"
+                );
+            }
+            other => panic!("expected CoveredReplay below the floor, got {other:?}"),
+        }
+
+        // Fresh lines extending the contiguous prefix ack their own
+        // last line: insert-then-clamp leaves the natural value.
+        match session.accept(batch(20, 5)).unwrap() {
+            AcceptOutcome::Accepted { .. } => {}
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+        let ack = session
+            .cut(&store, &db.pool)
+            .await
+            .unwrap()
+            .and_then(|c| c.durable_ack);
+        assert_eq!(
+            ack,
+            Some(24),
+            "a prefix-extending cut acks its drained run's last line"
+        );
+    }
+
+    /// W12-A2 (merged_bug_005, red-first — the cut-leg orbit): a cut
+    /// whose drained run sits ABOVE silently-rejected lines must ack
+    /// at-or-below the last line of the contiguous durable prefix,
+    /// never the drained run's own end. The silent-Rejected* arms keep
+    /// the stream open without an ack, so the builder still holds its
+    /// only copy of the rejected lines; an ack at the post-gap run's
+    /// end launders them as durable and the trim destroys them.
+    #[tokio::test]
+    async fn cut_ack_never_launders_rejected_lines() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let mut session = new_session(test_config());
+
+        // Accept [0,5).
+        match session.accept(batch(0, 5)).unwrap() {
+            AcceptOutcome::Accepted { .. } => {}
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+        // [3,8) is REJECTED (non-monotone: first below the high-water
+        // mark) — the stream stays open, no ack, and the builder keeps
+        // its only copy of the un-durable tail lines 5..=7.
+        match session.accept(batch(3, 5)).unwrap() {
+            AcceptOutcome::RejectedNonMonotone => {}
+            other => panic!("expected RejectedNonMonotone, got {other:?}"),
+        }
+        // [10,15) is monotone (high-water is 5) and accepted: the
+        // buffer now holds runs [0,5) and [10,15) with the hole [5,10).
+        match session.accept(batch(10, 5)).unwrap() {
+            AcceptOutcome::Accepted { .. } => {}
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+
+        // Cut 1 drains the contiguous run [0,5): ack 4 is sound.
+        let first = session
+            .cut(&store, &db.pool)
+            .await
+            .unwrap()
+            .and_then(|c| c.durable_ack);
+        assert_eq!(first, Some(4), "the prefix run [0,5) acks its own end");
+
+        // Cut 2 drains [10,15). Durable coverage is now
+        // {[0,5), [10,15)}: the contiguous durable frontier is still 4.
+        // Pre-fix RED (verbatim): "cut-leg launder: ack 14 claims the
+        // never-accepted lines [5,10) as durable (frontier is 4)".
+        let second = session
+            .cut(&store, &db.pool)
+            .await
+            .unwrap()
+            .expect("the post-gap run [10,15) was staged and must commit");
+        assert_eq!(
+            second.durable_ack,
+            Some(4),
+            "the cut ack must pin to the contiguous durable frontier, never \
+             the drained run's own end"
+        );
     }
 }

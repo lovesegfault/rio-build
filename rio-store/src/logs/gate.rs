@@ -1425,8 +1425,23 @@ mod tests {
                 outcome,
                 super::super::ingest::AcceptOutcome::Accepted { .. }
             ) {
-                let ack = session.cut(store, pool).await.expect("cut commits");
-                assert_eq!(ack, Some(first + n_lines - 1), "the run cuts durably");
+                let commit = session
+                    .cut(store, pool)
+                    .await
+                    .expect("cut commits")
+                    .expect("the accepted run is staged, so the cut commits it");
+                // The COMMIT is what these attacks mint — the manifest
+                // row and object land regardless of the ack. The ack
+                // itself is frontier-clamped (merged_bug_005): the
+                // row-orbit's deliberate gap at line 0 means NO prefix
+                // ack ever exists there, while the byte-orbit's
+                // contiguous-from-zero replays ack at their run end.
+                // Either way it never exceeds the run's own end.
+                assert!(
+                    commit.durable_ack.is_none_or(|a| a <= first + n_lines - 1),
+                    "a cut ack never exceeds the drained run's end: {:?}",
+                    commit.durable_ack
+                );
             }
             outcomes.push(outcome);
         }
@@ -1493,7 +1508,9 @@ mod tests {
                 );
                 assert_eq!(
                     outcomes,
-                    vec![super::super::ingest::AcceptOutcome::CoveredReplay { durable_through: 3 }],
+                    vec![super::super::ingest::AcceptOutcome::CoveredReplay {
+                        durable_through: Some(3)
+                    }],
                     "the covered replay is dropped at the write path"
                 );
             }
@@ -1738,7 +1755,13 @@ mod tests {
             executor_id: String::new(),
         })
         .unwrap();
-        assert_eq!(s1.cut(&store, &db.pool).await.unwrap(), Some(9));
+        assert_eq!(
+            s1.cut(&store, &db.pool)
+                .await
+                .unwrap()
+                .and_then(|c| c.durable_ack),
+            Some(9)
+        );
         drop(s1); // disconnect
 
         // Session 2: the reconnect. The gate seeds the merged account
@@ -1771,7 +1794,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             outcome,
-            super::super::ingest::AcceptOutcome::CoveredReplay { durable_through: 9 },
+            super::super::ingest::AcceptOutcome::CoveredReplay {
+                durable_through: Some(9)
+            },
             "a fully-covered replay is dropped with the manifest-truth ack"
         );
         assert_eq!(
@@ -1797,7 +1822,13 @@ mod tests {
             ),
             "the uncovered resume is accepted, got {outcome:?}"
         );
-        assert_eq!(s2.cut(&store, &db.pool).await.unwrap(), Some(19));
+        assert_eq!(
+            s2.cut(&store, &db.pool)
+                .await
+                .unwrap()
+                .and_then(|c| c.durable_ack),
+            Some(19)
+        );
 
         // The account after the resume: disjoint coverage, zero
         // duplicate rows — merged == raw on both quantities, and the
@@ -1878,7 +1909,13 @@ mod tests {
             executor_id: String::new(),
         })
         .unwrap();
-        assert_eq!(s1.cut(&store, &db.pool).await.unwrap(), Some(9));
+        assert_eq!(
+            s1.cut(&store, &db.pool)
+                .await
+                .unwrap()
+                .and_then(|c| c.durable_ack),
+            Some(9)
+        );
         drop(s1);
 
         // Session 2: the reconnect replays the un-acked frame [0,12) —
@@ -1915,7 +1952,10 @@ mod tests {
             "the straddling frame's tail is accepted, got {outcome:?}"
         );
         assert_eq!(
-            s2.cut(&store, &db.pool).await.unwrap(),
+            s2.cut(&store, &db.pool)
+                .await
+                .unwrap()
+                .and_then(|c| c.durable_ack),
             Some(11),
             "the new tail cuts durably"
         );

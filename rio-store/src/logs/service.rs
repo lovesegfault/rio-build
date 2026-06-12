@@ -56,7 +56,8 @@ use rio_proto::store::{
 use super::chunks::LogChunkStore;
 use super::gate::{self, OpenCaps};
 use super::ingest::{
-    AbortReason, AcceptOutcome, CutError, FanBatch, IngestConfig, IngestSession, IngestShared,
+    AbortReason, AcceptOutcome, CutCommit, CutError, FanBatch, IngestConfig, IngestSession,
+    IngestShared,
 };
 use super::sessions::{self, Acquire};
 use super::tail::{self, LineCursor};
@@ -1205,19 +1206,21 @@ impl AppendDriver {
         // replaying — without the letter, the only trim signal is
         // per-chunk acks, and a reconnect replays committed-but-
         // unacked content the session then has to drop server-side.
-        // `durable_through_line = watermark - 1` keeps the message a
+        // `durable_through_line` is the contiguous durable frontier —
+        // consulted through the ONE producer (merged_bug_005), which
+        // at this point (before any accept or cut) equals
+        // `open_coverage_next_line() - 1` — keeping the message a
         // true durability statement even for clients that predate the
         // watermark field (they consume it as a plain chunk ack and
         // trim to the same point). try_send into the just-created
         // queue cannot fail on capacity; a torn-down receiver makes
         // the drop harmless (the stream is dying anyway).
-        let watermark = self.session.open_coverage_next_line();
-        if watermark > 0 {
+        if let Some(frontier) = self.session.durable_frontier() {
             ack_try_send(
                 &ack_tx,
                 Ok(AppendLogAck {
-                    durable_through_line: watermark - 1,
-                    open_coverage_next_line: Some(watermark),
+                    durable_through_line: frontier,
+                    open_coverage_next_line: Some(self.session.open_coverage_next_line()),
                 }),
             );
         }
@@ -1437,16 +1440,23 @@ impl AppendDriver {
                             // the lines ARE durable — ack them so the
                             // builder's retransmit buffer trims instead
                             // of waiting for a cut that will never carry
-                            // them. try_send: a missed ack just means
+                            // them. The ack value arrives pre-clamped to
+                            // the contiguous durable frontier
+                            // (merged_bug_005); `None` = no sound prefix
+                            // claim exists (line 0 is not durable), so
+                            // nothing is sent and the builder keeps its
+                            // copies. try_send: a missed ack just means
                             // the next replay re-answers.
                             Ok(AcceptOutcome::CoveredReplay { durable_through }) => {
-                                ack_try_send(
-                                    ack_tx,
-                                    Ok(AppendLogAck {
-                                        durable_through_line: durable_through,
-                                        open_coverage_next_line: None,
-                                    }),
-                                );
+                                if let Some(durable_through_line) = durable_through {
+                                    ack_try_send(
+                                        ack_tx,
+                                        Ok(AppendLogAck {
+                                            durable_through_line,
+                                            open_coverage_next_line: None,
+                                        }),
+                                    );
+                                }
                             }
                             // Stream-fatal (the per-execution byte
                             // cap — accept()'s ONLY Err construction,
@@ -1666,7 +1676,7 @@ impl AppendDriver {
     /// restore_in_flight. Used by BOTH the periodic cut path and the
     /// final drain — the drain used to call the cut raw, so a wedged
     /// blob backend could hang stream teardown forever.
-    async fn cut_bounded(&mut self) -> Option<Result<Option<u64>, CutError>> {
+    async fn cut_bounded(&mut self) -> Option<Result<Option<CutCommit>, CutError>> {
         match tokio::time::timeout(
             self.session_cut_interval(),
             self.session.cut(self.chunk_store.as_ref(), &self.pool),
@@ -1719,7 +1729,15 @@ impl AppendDriver {
         match self.cut_bounded().await {
             None => CutStep::Failed,
             Some(Ok(None)) => CutStep::Empty,
-            Some(Ok(Some(durable_through_line))) => {
+            Some(Ok(Some(commit))) => {
+                // A commit may carry no ack (merged_bug_005: the run
+                // sits past a hole, so no value is a sound contiguous-
+                // prefix claim). It is still progress — Committed, the
+                // failure counter already reset — there is just
+                // nothing true to tell the builder yet.
+                let Some(durable_through_line) = commit.durable_ack else {
+                    return CutStep::Committed;
+                };
                 let delivered = send_ack_bounded(
                     ack_tx,
                     Ok(AppendLogAck {
@@ -1783,16 +1801,22 @@ impl AppendDriver {
                 // raw cut here used to await unbounded).
                 None => return Err(DrainStop::CutFailed),
                 Some(Ok(None)) => return Ok(()),
-                Some(Ok(Some(durable_through_line))) => {
+                Some(Ok(Some(commit))) => {
                     // Best-effort: the builder may already be gone (or
-                    // not reading); the drain never waits on it.
-                    ack_try_send(
-                        ack_tx,
-                        Ok(AppendLogAck {
-                            durable_through_line,
-                            open_coverage_next_line: None,
-                        }),
-                    );
+                    // not reading); the drain never waits on it. A
+                    // commit past a hole carries no ack
+                    // (merged_bug_005) — the drain keeps cutting; the
+                    // builder's copies of the hole lines replay on
+                    // reconnect.
+                    if let Some(durable_through_line) = commit.durable_ack {
+                        ack_try_send(
+                            ack_tx,
+                            Ok(AppendLogAck {
+                                durable_through_line,
+                                open_coverage_next_line: None,
+                            }),
+                        );
+                    }
                 }
                 Some(Err(e)) => {
                     warn!(
@@ -3489,7 +3513,8 @@ mod tests {
         let committed = session
             .cut(&store, &db.pool)
             .await
-            .expect("the retried cut commits the restored run");
+            .expect("the retried cut commits the restored run")
+            .and_then(|c| c.durable_ack);
         assert_eq!(committed, Some(0), "line 0 is durable through the retry");
         assert!(
             session.no_pending_lines(),
