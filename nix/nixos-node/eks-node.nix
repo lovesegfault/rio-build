@@ -790,6 +790,18 @@ in
         # NixOS does not). The other half of the kubelet wiring.
         "f /etc/projects 0644 root root -"
         "f /etc/projid 0644 root root -"
+        # live_060-d (empirically derived in the kubelet-projquota
+        # witness): kubelet's quota applier SHELLS OUT at fixed FHS
+        # paths — quotaCmds = {/sbin,/usr/sbin,/bin}/xfs_quota and
+        # lsattrCmd = /usr/bin/lsattr (k8s pkg/volume/util/fsquota/
+        # common/quota_common_linux_impl.go) — none of which exist on
+        # NixOS, so assignment fails AFTER every other precondition
+        # holds: the third silent-decline mode, invisible without the
+        # witness. AL2023 ships both; these shims are the NixOS
+        # equivalent.
+        "d /sbin 0755 root root -"
+        "L+ /sbin/xfs_quota - - - - ${pkgs.xfsprogs}/bin/xfs_quota"
+        "L+ /usr/bin/lsattr - - - - ${pkgs.e2fsprogs}/bin/lsattr"
       ];
     };
   };

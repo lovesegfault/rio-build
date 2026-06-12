@@ -148,6 +148,10 @@ pkgs.testers.runNixOSTest {
         assert gate["featureGates"]["LocalStorageCapacityIsolationFSQuotaMonitoring"] is True, gate
         node.succeed("test -f /etc/projects")
         node.succeed("test -f /etc/projid")
+        # The FHS shims kubelet's quota applier execs at fixed paths
+        # (live_060-d: the witness-derived third silent-decline mode).
+        node.succeed("test -x /sbin/xfs_quota")
+        node.succeed("test -x /usr/bin/lsattr")
 
     # T7f: pick-base-runtime-spec ExecStartPre symlinks the -kvm spec
     # iff /dev/kvm is a chardev. The CI runner has KVM (nested), so

@@ -40,6 +40,7 @@ let
 
   protocol = import ./scenarios/protocol.nix;
   quota-probe = import ./scenarios/quota-probe.nix;
+  kubelet-projquota = import ./scenarios/kubelet-projquota.nix;
   scheduling = import ./scenarios/scheduling.nix;
   # security exports { standalone, privileged-hardening-e2e } — two
   # scenario functions sharing the same file. standalone uses the
@@ -715,6 +716,21 @@ in
   # r[verify builder.disk.satisfiable-letter]
   # r[verify builder.disk.quota-classified+2]
   vm-quota-probe-standalone = quota-probe {
+    inherit pkgs common;
+  };
+
+  # The kubelet-half END-TO-END witness (live_060-d, WO-S8-16): the
+  # peak_disk_bytes producer chain from the node config the fleet
+  # boots — prjquota volume (the WO-S8-15 provisioning shape) + the
+  # kubelet featureGate + projid registry → a REAL hostUsers:false
+  # emptyDir pod scheduled BY KUBELET → the production reader
+  # (quota_probe) returns Some. ZERO manual projid assignment (the
+  # discrimination quota-probe-standalone structurally lacks — it
+  # witnesses the kernel half; this witnesses the kubelet half). The
+  # un-provisioned twin node reproduces today's fleet (None) so the
+  # red stays red.
+  # r[verify infra.node.kubelet-prjquota]
+  vm-kubelet-projquota-standalone = kubelet-projquota {
     inherit pkgs common;
   };
 

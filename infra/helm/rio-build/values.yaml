@@ -641,11 +641,29 @@ scheduler:
     # Sized for DENSITY with the ladder as the recovery path: a
     # too-small default self-heals in ≤2 doubled attempts; a too-large
     # default taxes EVERY warm pod's placement forever.
-    # ORDER-PIN (live_057-c): this flip is valid ONLY in a tree where
-    # the disk ladder is live end-to-end (worker ENOSPC/quota
-    # classification → DISK_FULL → scheduler floor bump, the W10-CM
-    # cross-crate witness); flipping first retry-poisons every pname
-    # whose true overlay need lands in (25, 100] GiB.
+    # ORDER-PIN (live_057-c, RE-DERIVED at live_060): this flip is
+    # valid ONLY when the disk ladder is live end-to-end (bind[48-quota-volume-pin.sh]) — and the
+    # ladder's quantifier is the DEPLOYED FLEET PRECONDITION, not
+    # tree state: live_060 proved both ladders dead for months on a
+    # tree where every in-tree witness was green, because the
+    # builder pools' storage class (EBS-only, no prjquota) was never
+    # part of any check's population. The pin now binds on the
+    # values surface the fleet deploys: every EBS-only
+    # builder-hosting EC2NodeClass declares the kubelet quota volume
+    # (karpenter.quotaVolume*), machine-checked by helm fragment
+    # 48-quota-volume-pin.sh (a no-quota builder pool declaration
+    # reds the render); the kubelet half rides the AMI
+    # (rio-ebs-quota-mount + the fsquota drop-in, pinned by
+    # vm-nixos-node), and the chain end-to-end is
+    # vm-kubelet-projquota-standalone's witness. The residual
+    # fleet-drift face (a live pool diverging from the deployed
+    # values) is the live_060 readback: peak_disk_bytes Some-rate on
+    # EBS nodes — a named post-rollout line, never silent green.
+    # Tree-state half (still true, still necessary): worker
+    # ENOSPC/quota classification → DISK_FULL → scheduler floor
+    # bump, the W10-CM cross-crate witness; flipping first
+    # retry-poisons every pname whose true overlay need lands in
+    # (25, 100] GiB.
     # Density derivation (bind[14-disk-ceiling.sh] — the W10-CP table
     # asserts these rows against pod_ephemeral_request's mirrored
     # constants and the live values; touching ANY input re-derives
