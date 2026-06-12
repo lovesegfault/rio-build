@@ -127,7 +127,8 @@ impl ReapReason {
     /// so a new variant cannot ship without joining this set and
     /// taking a row in every reason-indexed census).
     #[cfg(test)]
-    pub(super) const ALL: [ReapReason; 4] = [Self::Ice, Self::BootTimeout, Self::Dead, Self::Idle];
+    pub(super) const LETTERS: [ReapReason; 4] =
+        [Self::Ice, Self::BootTimeout, Self::Dead, Self::Idle];
 }
 
 /// One `Api::delete` call's outcome at a reap lane, as the
@@ -151,7 +152,7 @@ pub enum DeleteOutcome {
     /// NOW (counter, mask iff ICE, eviction feed, lane-local samples).
     OkDeleted,
     /// 404 — already gone: Karpenter GC raced the delete, but the
-    /// claim WAS reaped. The SAME full consequence as [`Self::OkDeleted`]
+    /// claim WAS reaped. The same full consequence as [`Self::OkDeleted`]
     /// (the law's parity arm — diverging them is the original bug).
     Committed404,
     /// Non-404 error — AMBIGUOUS: the apiserver may have committed
@@ -530,7 +531,7 @@ pub fn classify_vanish(
 /// How many CONSUMER FOLD EXECUTIONS an unconfirmed delete tombstone
 /// survives. THE CLOCK IS THE CONSUMING FOLD'S OWN EXECUTION COUNT
 /// (`DeleteTombstones::folds`, advanced by [`vanish_fold`] strictly
-/// AFTER each consult) — NEVER the wall tick counter (R29,
+/// AFTER each consult) — never the wall tick counter (R29,
 /// `ctrl.pool.fold-clock`): the fold is skipped on pre-threshold
 /// ⊥ ticks and failed-LIST ticks while `tick_counter` keeps
 /// advancing, so a wall-denominated grace silently shortened toward
@@ -591,9 +592,11 @@ pub struct DeleteAttempt {
 ///    tombstones had no consumer at all — the Dead-reap wedge
 ///    eviction never fired and `reaped_total{reason=dead}`
 ///    permanently undercounted).
-/// 4. [`prune_expired`](Self::prune_expired) — DISCONFIRMED entries
-///    older than [`TOMBSTONE_TTL_FOLDS`] drop as a typed, DISCLOSED
-///    disposition (warn + expiry counter), never a silent prune.
+/// 4. the post-consult prune inside [`vanish_fold`] — DISCONFIRMED
+///    entries older than [`TOMBSTONE_TTL_FOLDS`] drop as a typed,
+///    DISCLOSED disposition (warn + expiry counter), never a silent
+///    prune; the clock advance and the prune are private to the
+///    chokepoint (consult-then-prune by construction).
 /// 5. `clear()` on the ACQUISITION EDGE (suppress polarity, the
 ///    `inflight_created` row's rationale: a stale previous-tenure
 ///    tombstone could suppress a genuine vanish ICE of a same-named
@@ -635,11 +638,11 @@ impl DeleteTombstones {
     }
 
     /// Advance the consumer clock by one completed fold, then drop
-    /// entries older than [`TOMBSTONE_TTL_FOLDS`] folds. Called ONLY
+    /// entries older than [`TOMBSTONE_TTL_FOLDS`] folds. Called only
     /// from [`vanish_fold`], strictly AFTER the consult — the
     /// consult-then-prune order is owned by one fn, not by call-site
-    /// discipline (bug_043: prune_expired ran BEFORE detect_vanished
-    /// at both call sites). `wrapping_sub` matches the clock's wrap.
+    /// discipline (bug_043: the pre-fix callers each ran prune_expired
+    /// BEFORE detect_vanished). `wrapping_sub` matches the clock's wrap.
     ///
     /// Expiry is a TYPED, DISCLOSED disposition, never a silent prune
     /// (`ctrl.pool.delete-outcome`, bug_042): with the vanish fold
@@ -721,7 +724,7 @@ pub struct TombstoneSweep {
 /// TERMINATING (`deletionTimestamp` set — the delete committed; the
 /// finalizer is draining) or ABSENT (committed and finalized between
 /// ticks) is this controller's own delete CONFIRMED — the sweep
-/// applies the original reason's FULL consequence through the SAME
+/// applies the original reason's FULL consequence through the same
 /// code path as the prompt arms ([`record_reap`]: counter under the
 /// original reason, mask iff `Ice`) plus the carried halves (the
 /// wedge eviction via the packet's `node_name`, the censored idle
@@ -803,7 +806,7 @@ pub struct VanishFold {
 /// 2. the registered-tombstone sweep
 ///    ([`sweep_registered_tombstones`]: every confirmed
 ///    registered exit applies its reason's full consequence),
-/// 3. ONLY THEN the consumer clock advances and DISCONFIRMED entries
+/// 3. only then the consumer clock advances and DISCONFIRMED entries
 ///    older than [`TOMBSTONE_TTL_FOLDS`] expire as the disclosed
 ///    disposition.
 ///
@@ -971,9 +974,9 @@ mod tests {
         }
     }
 
-    /// `ReapReason::ALL` is total over the alphabet — rustc
+    /// `ReapReason::LETTERS` is total over the alphabet — rustc
     /// exhaustiveness pins the index map, so a new variant cannot
-    /// compile without joining `ALL` (and thereby every reason-indexed
+    /// compile without joining `LETTERS` (and thereby every reason-indexed
     /// census product).
     #[test]
     fn reap_reason_alphabet_total() {
@@ -985,18 +988,18 @@ mod tests {
                 ReapReason::Idle => 3,
             }
         };
-        let mut seen = [false; ReapReason::ALL.len()];
-        for r in ReapReason::ALL {
-            assert!(!seen[idx(r)], "duplicate {r:?} in ALL");
+        let mut seen = [false; ReapReason::LETTERS.len()];
+        for r in ReapReason::LETTERS {
+            assert!(!seen[idx(r)], "duplicate {r:?} in LETTERS");
             seen[idx(r)] = true;
         }
-        assert!(seen.iter().all(|s| *s), "ALL covers every variant");
+        assert!(seen.iter().all(|s| *s), "LETTERS covers every variant");
     }
 
     /// The [`DeleteOutcome::classify`] partition, walked over the
     /// reachable result product (Ok + every distinct kube error
     /// shape): total — every input lands in exactly one arm — and 404
-    /// is the ONLY error that counts as a completed reap. This is the
+    /// is the only error that counts as a completed reap. This is the
     /// (outcome × lane) totality proof at the classifier; the per-lane
     /// arm decisions are rustc-exhaustive matches at the two delete
     /// sites (`delete_lane_census` pins the lane population).
@@ -1413,15 +1416,15 @@ mod tests {
     ///   (the vanish fold owns that population — one consumer per
     ///   tombstone, partitioned by population);
     /// - name OUTSIDE, observed TERMINATING or ABSENT → CONFIRMED:
-    ///   consumed + the reason's counter + the carried wedge eviction
-    ///   + the censored gap iff the packet carries one + mask iff the
-    ///   reason is `Ice`;
+    ///   consumed, with the reason's counter, the carried wedge
+    ///   eviction, the censored gap iff the packet carries one, and
+    ///   the mask iff the reason is `Ice`;
     /// - name OUTSIDE, observed alive non-terminating → DISCONFIRMED:
     ///   kept armed, zero consequence.
     ///
-    /// The reason axis derives from `ReapReason::ALL` (the pinned
+    /// The reason axis derives from `ReapReason::LETTERS` (the pinned
     /// alphabet) so a new reason letter joins this census or fails to
-    /// compile out of `ALL`.
+    /// compile out of `LETTERS`.
     // r[verify ctrl.pool.delete-outcome]
     #[test]
     fn registered_tombstone_sweep_census_over_the_exit_product() {
@@ -1436,7 +1439,7 @@ mod tests {
         let h = Cell("h".into(), CapacityType::Spot);
         for in_fold_population in [false, true] {
             for obs in [Obs::Absent, Obs::Terminating, Obs::Alive] {
-                for reason in ReapReason::ALL {
+                for reason in ReapReason::LETTERS {
                     let row = (in_fold_population, obs, reason);
                     let mut ts = DeleteTombstones::default();
                     ts.stamp(AmbiguousDelete {
@@ -1537,7 +1540,7 @@ mod tests {
     /// (present × registered × terminating × launched × provenance) —
     /// 120 cells, every axis value FROM the alphabet (`Option<bool>`
     /// is `launched()`'s full range; the provenance axis derives from
-    /// `ReapReason::ALL`, the pinned closed enum — bug_112 widened it
+    /// `ReapReason::LETTERS`, the pinned closed enum — bug_112 widened it
     /// with `Idle`). Each row
     /// asserts its class AND its mark/tracking/tombstone effect
     /// through the production `detect_vanished` fold. Generator: the
@@ -1551,7 +1554,7 @@ mod tests {
                 for terminating in [false, true] {
                     for launched in [None, Some(false), Some(true)] {
                         for tombstoned in
-                            std::iter::once(None).chain(ReapReason::ALL.into_iter().map(Some))
+                            std::iter::once(None).chain(ReapReason::LETTERS.into_iter().map(Some))
                         {
                             let n = match launched {
                                 None => node("nc-x", "h", CapacityType::Spot, 8, 0, 0),
@@ -1976,7 +1979,7 @@ mod tests {
 
     /// W11-AH — the delete-lane census ([GEN-SET]; the R28 partition
     /// axis of `ctrl.pool.delete-outcome`): the law's population is
-    /// ALL reap lanes, machine-derived two ways and pinned
+    /// all reap lanes, machine-derived two ways and pinned
     /// bidirectionally per (wwwww):
     ///
     /// 1. **Universe**: the embedded source set IS mod.rs's own

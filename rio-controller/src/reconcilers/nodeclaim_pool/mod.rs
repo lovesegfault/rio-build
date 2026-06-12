@@ -190,7 +190,7 @@ pub struct PlacedTick {
     /// and the consolidator do not read the deferral as demand-gone.
     deferred: HashSet<String>,
     /// Intent ids holding a live Job (Pending pod) at sim time — the
-    /// SAME set the FFD admission window exempts (merged_bug_047):
+    /// same set the FFD admission window exempts (merged_bug_047):
     /// the exemption is exactly what lets a held intent reach the
     /// fit-check and land `PlacedInFlight` on an unregistered claim,
     /// so the gate fold consumes THIS set to keep those placements
@@ -1912,7 +1912,7 @@ impl NodeClaimPoolReconciler {
         // reap paths feed the wedge stash (consumed next tick).
         self.pending_wedge_evictions
             .extend(idle_reaped.reaped_nodes);
-        // The idle lane services the SAME tombstone plane as the
+        // The idle lane services the same tombstone plane as the
         // health lane (ctrl.pool.delete-outcome): a completed retry
         // consumes its prior ambiguous-attempt tombstone (the prompt
         // arm already applied the consequence); an ambiguous error

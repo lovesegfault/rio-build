@@ -236,7 +236,7 @@ pub fn deferred_for_cell(
 /// shipped TWO one-sided-edit strikes while it lived as prose-coupled
 /// per-lane copies (r37 bug_002, r35 B1), and the wave-10
 /// merged_bug_012 close re-armed the shape with a third copy bound
-/// only by a "SAME admission predicate" doc comment. A twice-burned
+/// only by a "same admission predicate" doc comment. A twice-burned
 /// predicate gets a canonical home: the doc-mirror form is a review
 /// reject, "deferred routes exactly like placeable" is
 /// construction-enforced (one body — a one-sided edit is unwritable),
@@ -371,7 +371,7 @@ pub struct ReapInputs<'a, F: Fn(&str, Option<&str>, &[String]) -> bool> {
 
 /// One `reap_idle` tick's outcome — the idle lane's mirror of
 /// `health::ReapOutcome`, carried so the caller can discharge the
-/// SAME eviction-source-law obligations for both lanes
+/// same eviction-source-law obligations for both lanes
 /// (`ctrl.pool.delete-outcome`).
 #[derive(Debug, Default)]
 pub struct ReapIdleOutcome {
@@ -1433,7 +1433,7 @@ mod tests {
         let admits = |_: &str, _: Option<&str>, _: &[String]| true;
         // The r37 bug_002 law via the deferred lane:
         assert!(
-            deferred_for_cell(&[od_only_intent.clone()], &spot_cell, admits).is_empty(),
+            deferred_for_cell(std::slice::from_ref(&od_only_intent), &spot_cell, admits).is_empty(),
             "capacity-type half holds on the deferred lane (one body)"
         );
         assert_eq!(

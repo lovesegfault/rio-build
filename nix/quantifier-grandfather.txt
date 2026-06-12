@@ -333,7 +333,6 @@ rio-controller/src/reconcilers/node_informer.rs	/// the server's ONLY FailedPrec
 rio-controller/src/reconcilers/nodeclaim_pool/consolidate.rs	// r37 bug_009: hold-open and non-hold-open read the SAME
 rio-controller/src/reconcilers/nodeclaim_pool/consolidate.rs	// timestamp — the node has been idle since. NEVER seed
 rio-controller/src/reconcilers/nodeclaim_pool/consolidate.rs	// — both arms read the SAME `ctx.na_threshold`, so hold-open ≥
-rio-controller/src/reconcilers/nodeclaim_pool/consolidate.rs	/// (round-10 merged_bug_012): the SAME (intent, cell) admission
 rio-controller/src/reconcilers/nodeclaim_pool/consolidate.rs	/// cell. The ONLY call into `consolidate_after` from `reap_idle` —
 rio-controller/src/reconcilers/nodeclaim_pool/consolidate.rs	/// filter is the SAME predicate FFD's `hw_admits` uses, NOT a
 rio-controller/src/reconcilers/nodeclaim_pool/consolidate.rs	/// nodes ~5× low. The filter is the SAME predicate FFD's `simulate`

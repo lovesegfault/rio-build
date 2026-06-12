@@ -1030,7 +1030,7 @@ fn tombstone_survives_foldless_list_failure_window_to_first_consult() {
 
     // Ticks 2-4: the apiserver outage continues — every Pools LIST
     // fails, the tick body warns and returns, and the vanish fold
-    // NEVER RUNS. The wall tick counter keeps advancing: this is the
+    // never runs. The wall tick counter keeps advancing: this is the
     // ≥TTL foldless window.
     for t in [210u64, 220, 230] {
         rt.block_on(lab.tick(
@@ -1075,7 +1075,7 @@ fn tombstone_survives_foldless_list_failure_window_to_first_consult() {
                 && key
                     .labels()
                     .any(|l| l.key() == "reason" && l.value() == reason))
-            .then(|| match v {
+            .then_some(match v {
                 DebugValue::Counter(c) => *c,
                 _ => 0,
             })
@@ -1459,7 +1459,7 @@ fn err_committed_dead_reap_consequence_fires_within_finalizer_window() {
     // Tick 3: the commit materialized — the claim is observed
     // REGISTERED + terminating (the ~60-90s finalizer). classify
     // skips terminating claims and the vanish fold never consults
-    // registered names: ONLY the registered-tombstone sweep can
+    // registered names: only the registered-tombstone sweep can
     // adjudicate this observation.
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();

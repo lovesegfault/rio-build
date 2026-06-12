@@ -361,7 +361,7 @@ module nodeclaimLifecycle {
   /// ambiguous-choice sets collapse to empty and the reachable state
   /// space is unchanged.
   ///
-  /// MODEL-DIVERGENCE(law=ctrl.pool.delete-outcome; tree=rio-controller/src/reconcilers/nodeclaim_pool/health.rs:record_reap): the model certifies the outcome PARTITION (completed vs ambiguous -- its single completed arm IS the Ok/404 parity law) and the tombstone consume-or-disclosed-expiry protocol -- NOT the consequence payload (counters, the wedge-eviction feed, censored NA samples; the wedge plane is consumed-input, out of model) -- retarget-by: modeling the wedge admission plane or any change to the consequence-packet law.
+  /// MODEL-DIVERGENCE(law=ctrl.pool.delete-outcome; tree=rio-controller/src/reconcilers/nodeclaim_pool/health.rs:record_reap): the model certifies the outcome PARTITION (completed vs ambiguous; its single completed arm IS the Ok/404 parity law) and the tombstone consume-or-disclosed-expiry protocol, NOT the consequence payload (counters, the wedge-eviction feed, censored NA samples; the wedge plane is consumed-input, out of model) — retarget-by: modeling the wedge admission plane or any change to the consequence-packet law.
   const ENABLE_TOMBSTONE_MACHINERY: bool
   const ENABLE_FOLD_CLOCK: bool
 
@@ -383,11 +383,16 @@ module nodeclaimLifecycle {
   /// BOT_THRESHOLD).
   pure val TOMBSTONE_TTL: int = 2
 
-  /// Round-11: the per-tick ambiguous-outcome / commit choice sets.
-  /// Off-machinery the only choice is the empty set (state space
-  /// unchanged for every pre-round-11 regime).
+  /// Round-11: the per-tick ambiguous-outcome choice set — empty or a
+  /// SINGLETON (one ambiguous delete per tick; simultaneous ambiguity
+  /// on both claims adds branching without adding law surface — the
+  /// per-claim tombstone plane is independent). Off-machinery the
+  /// only choice is the empty set (state space unchanged for every
+  /// pre-round-11 regime).
   pure val tombChoices: Set[Set[ClaimId]] =
-    if (ENABLE_TOMBSTONE_MACHINERY) CLAIMS.powerset() else Set(Set())
+    if (ENABLE_TOMBSTONE_MACHINERY)
+      Set(Set()).union(CLAIMS.map(k => Set(k)))
+    else Set(Set())
 
   pure def claimRank(k: ClaimId): int = if (k == "c1") 1 else 2
 
@@ -850,10 +855,14 @@ module nodeclaimLifecycle {
       val claimsAfter = CLAIMS.mapBy(k =>
         val c = tombs.get(k)
         if (completedReaped.contains(k))
+          // ourCommit machinery-gated: with the plane off the field
+          // is constant false and the reachable state space is
+          // byte-identical to the pre-round-11 regimes.
           { ...c, phase: CTerminating, stuck: false, spell: SNotIdle,
             busyTickSeen: false, boot: BRecorded, pIdle: INotTracked,
             inflightTracked: false, ctrlReaped: true,
-            tomb: false, tombAge: 0, ourCommit: true }
+            tomb: false, tombAge: 0,
+            ourCommit: ENABLE_TOMBSTONE_MACHINERY }
         else if (ambReaped.contains(k))
           // The AmbiguousErr arm: NO consequence yet; the tombstone is
           // (re-)stamped; whether the delete committed is the
@@ -944,8 +953,11 @@ module nodeclaimLifecycle {
   action tickConsolidateOnly = {
     nondet pgLoadFails = boolChoices(ENABLE_LEASE_FAULT).oneOf()
     nondet ambChoice = tombChoices.oneOf()
-    nondet commitChoice = tombChoices.oneOf()
-    tickConsolidateOnlyWith(pgLoadFails, ambChoice, commitChoice)
+    // Commit is all-or-none of the chosen attempt (the commit bit is
+    // per-ATTEMPT; with singleton ambiguity this is exactly one bit).
+    nondet commitAll = boolChoices(ENABLE_TOMBSTONE_MACHINERY).oneOf()
+    tickConsolidateOnlyWith(
+      pgLoadFails, ambChoice, if (commitAll) ambChoice else Set())
   }
 
   /// The full reconcile_once tick (scheduler reachable). Parameterized
@@ -1165,10 +1177,14 @@ module nodeclaimLifecycle {
       val claimsAfter = CLAIMS.mapBy(k =>
         val c = tombs.get(k)
         if (completedReaped.contains(k))
+          // ourCommit machinery-gated: with the plane off the field
+          // is constant false and the reachable state space is
+          // byte-identical to the pre-round-11 regimes.
           { ...c, phase: CTerminating, stuck: false, spell: SNotIdle,
             busyTickSeen: false, boot: BRecorded, pIdle: INotTracked,
             inflightTracked: false, ctrlReaped: true,
-            tomb: false, tombAge: 0, ourCommit: true }
+            tomb: false, tombAge: 0,
+            ourCommit: ENABLE_TOMBSTONE_MACHINERY }
         else if (ambReaped.contains(k))
           // The AmbiguousErr arm: NO consequence yet; the tombstone is
           // (re-)stamped; whether the delete committed is the
@@ -1331,10 +1347,10 @@ module nodeclaimLifecycle {
     nondet reservedChoice = CLAIMS.powerset().oneOf()
     nondet deferredChoice = deferChoices.oneOf()
     nondet ambChoice = tombChoices.oneOf()
-    nondet commitChoice = tombChoices.oneOf()
+    nondet commitAll = boolChoices(ENABLE_TOMBSTONE_MACHINERY).oneOf()
     tickFullWith(
       pgLoadFails, ackFails, createFails, demandA, demandB, reservedChoice,
-      deferredChoice, ambChoice, commitChoice)
+      deferredChoice, ambChoice, if (commitAll) ambChoice else Set())
   }
 
   // ------------------------------------------------------------------
@@ -2077,7 +2093,13 @@ module nodeclaimLifecycleTombstone {
   import nodeclaimLifecycle(
     MAX_FLEET_CORES = 2,
     CLASS_CAP_A = 1,
-    BOT_THRESHOLD = 3,
+    // 2, not the falsifier's 3: under the FIXED law the grace clock
+    // is skip-invariant by construction (foldless ticks do not move
+    // it), so the hold needs skip paths to EXIST, not a window
+    // longer than the grace — that face is the as-built falsifier's.
+    // The smaller streak domain keeps this exhaustive check inside
+    // the fault-karpenter-class budget.
+    BOT_THRESHOLD = 2,
     ENABLE_RPC_FAULT = true,
     ENABLE_LEASE_FAULT = false,
     ENABLE_KARPENTER_FAULT = true,
@@ -2095,16 +2117,19 @@ module nodeclaimLifecycleTombstone {
     ENABLE_FOLD_CLOCK = true
   ).*
 
-  /// The same W11-AI prefix under the fixed law: the tombstone
-  /// SURVIVES the foldless window (the fold clock never moved), the
-  /// first fold consults and confirms it, and neither violation
-  /// fires — the deterministic green twin of the as-built red run.
+  /// The W11-AI shape under the fixed law (scaled to this regime's
+  /// BOT_THRESHOLD=2: ONE foldless ⊥ tick before consolidate-only —
+  /// the clock-invariance being certified is per-skip, so one skip
+  /// witnesses it): the tombstone SURVIVES the foldless window (the
+  /// fold clock never moved), the first fold consults and confirms
+  /// it, and neither violation fires — the deterministic green twin
+  /// of the as-built red run (which keeps THRESHOLD=3 and the full
+  /// window-exceeds-grace trace).
   run w11aiFoldlessWindowSurvivesGreen = {
     init
       .then(tickFullWith(false, false, false, 1, 0, Set(), Set(), Set(), Set()))
       .then(claimLaunchStuck("c1"))
       .then(tickFullWith(false, false, false, 0, 0, Set(), Set(), Set("c1"), Set("c1")))
-      .then(tickBotEarlyWith(false))
       .then(tickBotEarlyWith(false))
       .then(finalizerCompletes("c1"))
       .then(tickConsolidateOnlyWith(false, Set(), Set()))

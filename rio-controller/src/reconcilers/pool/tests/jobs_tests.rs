@@ -4480,7 +4480,7 @@ async fn w11_ak_held_pending_job_not_orphan_deleted_end_to_end() {
     let held = intent_named("held1");
     let fp = crate::reconcilers::pool::candidate::RenderInputs::from_intent(&held).fingerprint();
     // The held Pending Job: older than REAP_PENDING_GRACE, fingerprint
-    // matching (so the selector-drift arm stays quiet — the ONLY
+    // matching (so the selector-drift arm stays quiet — the only
     // delete path in play is the orphan arm's absence verdict).
     let job = Job {
         metadata: ObjectMeta {

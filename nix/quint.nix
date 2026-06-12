@@ -7547,21 +7547,35 @@ rec {
     # committed delete (iceMarkSoundness AND
     # tombstoneConsequenceApplied both expected violated — the model
     # also pins the deterministic w11aiFoldlessWindowDropRed run).
+    # SIM form (the materialization-witness precedent): these are
+    # deep-trace REACHABILITY witnesses — the violating run is ~7
+    # specific steps (stamp → foldless ⊥ window → finalizer →
+    # prune-before-consult) inside a faulted regime whose per-depth
+    # fan-out TLC must fully exhaust; measured at the wave window, TLC
+    # ground ~10k distinct states in 1800 s without reaching it, while
+    # the simulator finds it 6/6 at 20k samples in <1 s (seeds in the
+    # invariant map; the deterministic w11aiFoldlessWindowDropRed run
+    # in the module pins the exact trace as a named reproducer).
+    # 200k samples = 10x margin over the measured discovery rate.
     # r[verify ctrl.pool.delete-outcome]
     # r[verify ctrl.pool.fold-clock]
-    quint-nodeclaim-falsify-tombstone-asbuilt-mark = mkQuintWitnessCheck {
+    quint-nodeclaim-falsify-tombstone-asbuilt-mark = mkQuintSimWitnessCheck {
       name = "nodeclaim-falsify-tombstone-asbuilt-mark";
       spec = "nodeclaimLifecycle";
       main = "nodeclaimLifecycleTombstoneAsBuilt";
       witness = "iceMarkSoundness";
+      maxSamples = 200000;
+      maxSteps = 14;
     };
     # r[verify ctrl.pool.delete-outcome]
     # r[verify ctrl.pool.fold-clock]
-    quint-nodeclaim-falsify-tombstone-asbuilt-dropped = mkQuintWitnessCheck {
+    quint-nodeclaim-falsify-tombstone-asbuilt-dropped = mkQuintSimWitnessCheck {
       name = "nodeclaim-falsify-tombstone-asbuilt-dropped";
       spec = "nodeclaimLifecycle";
       main = "nodeclaimLifecycleTombstoneAsBuilt";
       witness = "tombstoneConsequenceApplied";
+      maxSamples = 200000;
+      maxSteps = 14;
     };
     # HOLD half: with the fold-clock law the tombstone survives every
     # foldless window to its first consult, the late consequence
@@ -7597,17 +7611,23 @@ rec {
         "tombstoneConsequenceApplied"
       ];
     };
-    quint-nodeclaim-witness-reap-ambiguous = mkQuintWitnessCheck {
+    # Non-vacuity witnesses in the SIM form (same rationale as the
+    # as-built pair above; measured <1 s at 2-20k samples).
+    quint-nodeclaim-witness-reap-ambiguous = mkQuintSimWitnessCheck {
       name = "nodeclaim-witness-reap-ambiguous";
       spec = "nodeclaimLifecycle";
       main = "nodeclaimLifecycleTombstone";
       witness = "canReachReapAmbiguous";
+      maxSamples = 200000;
+      maxSteps = 14;
     };
-    quint-nodeclaim-witness-tombstone-confirmed = mkQuintWitnessCheck {
+    quint-nodeclaim-witness-tombstone-confirmed = mkQuintSimWitnessCheck {
       name = "nodeclaim-witness-tombstone-confirmed";
       spec = "nodeclaimLifecycle";
       main = "nodeclaimLifecycleTombstone";
       witness = "canReachTombstoneConfirmed";
+      maxSamples = 200000;
+      maxSteps = 14;
     };
 
     # ------------------------------------------------------------------

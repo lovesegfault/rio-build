@@ -366,7 +366,7 @@ module spawnCoherence {
   /// bind both false -- the in-flight choice collapses to empty and
   /// the reachable state space is unchanged.
   ///
-  /// MODEL-DIVERGENCE(law=ctrl.pool.window-visibility; tree=rio-controller/src/reconcilers/pool/jobs.rs:apply_placeable_gate): the model certifies the demand-visibility law at the want/orphan plane (held in-flight placements never read as demand-gone) -- NOT the witnessed-page API (PageNarrowing threading/degradation is the rust battery's W11-AK belt) nor the queued-count arithmetic -- retarget-by: modeling the excess-pending bound consumer or any change to the page-narrowing law.
+  /// MODEL-DIVERGENCE(law=ctrl.pool.window-visibility; tree=rio-controller/src/reconcilers/pool/jobs.rs:apply_placeable_gate): the model certifies the demand-visibility law at the want/orphan plane (held in-flight placements never read as demand-gone), NOT the witnessed-page API (PageNarrowing threading/degradation is the rust battery's W11-AK belt) nor the queued-count arithmetic — retarget-by: modeling the excess-pending bound consumer or any change to the page-narrowing law.
   const ENABLE_HELD_MACHINERY: bool
   const ENABLE_HELD_VISIBILITY: bool
 
