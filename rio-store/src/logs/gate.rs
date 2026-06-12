@@ -116,20 +116,72 @@ pub(super) fn replica_capacity_status(msg: &'static str) -> Status {
     Status::resource_exhausted(msg)
 }
 
-/// The execution's durable log account: committed chunk count and
-/// accounted-byte sum over MERGED COVERAGE, not raw rows (bug_139).
-/// ONE query, run at every open (the gate side) — the only reader of
-/// `drv_log_chunks.accounted_bytes` besides the cut that writes it.
+/// The execution's durable log account, measured on BOTH algebras of
+/// the caps law (merged_bug_002): the MERGED COVERAGE projection
+/// (idempotent union — what an honest retry may re-send without
+/// double-charge) and the RAW MONOTONE totals (Σ over ALL committed
+/// rows — what was actually durably written; no reconnect, replay, or
+/// dedup ever decreases them). The two quantities have opposite
+/// algebras, and a containment budget for an untrusted at-least-once
+/// writer must consult BOTH: seeding from the idempotent projection
+/// alone hands the budget delta to whoever controls duplication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LogSeed {
+    /// Accounted bytes over merged coverage (idempotent union):
+    /// contained/identical-interval duplicate rows charge zero.
+    pub merged_bytes: u64,
+    /// Committed chunk count over merged coverage — one survivor per
+    /// covered interval.
+    pub merged_chunks: u32,
+    /// Accounted bytes over ALL rows (monotone sum): every durable
+    /// write counts, duplicates included.
+    pub raw_bytes: u64,
+    /// Manifest row count over ALL rows (monotone sum) — the durable
+    /// object-count quantity the chunk ceiling bounds.
+    pub raw_rows: u64,
+}
+
+impl LogSeed {
+    /// The merged pair `(bytes, chunks)` — the forgiveness-axis values
+    /// the session counters are seeded from.
+    pub fn merged_pair(self) -> (u64, u32) {
+        (self.merged_bytes, self.merged_chunks)
+    }
+}
+
+/// How many times the per-execution caps an execution's RAW durable
+/// totals may reach before the open gate refuses outright
+/// (merged_bug_002): `raw_bytes < REPLAY_ALLOWANCE × per_exec_byte_cap`
+/// and `raw_rows < REPLAY_ALLOWANCE × max_chunks_per_exec` are open
+/// preconditions.
 ///
-/// Why merged: a manifest INSERT that commits server-side but
-/// surfaces as an error (lost response, or a watchdog-abandoned cut
-/// dropped post-commit) is re-cut under a freshly burned chunk_seq,
-/// so the write path is at-least-once with per-attempt rekeying —
-/// duplicate rows covering overlapping
+/// Derivation (k = 2): the honest worst case is ONE full replay of a
+/// session whose every ack was lost — the builder's retransmit buffer
+/// re-sends committed-but-unacked content once per reconnect, so an
+/// honest execution's raw total is bounded by 2× its merged content
+/// (≤ 2× the cap). Consecutive total-ack-loss cycles beyond that are
+/// indistinguishable from the adversarial replay loop — which is the
+/// point: the ceiling must bound what the merged seed cannot see.
+/// Honest steady state converges to ~1× once the open-time coverage
+/// watermark lands (the builder trims committed content before
+/// replaying); k is the operational tuning surface for the first soak
+/// window.
+pub(super) const REPLAY_ALLOWANCE: u64 = 2;
+
+/// The execution's durable log account: [`LogSeed`] — merged coverage
+/// AND raw totals, ONE query, run at every open (the gate side); the
+/// only reader of `drv_log_chunks.accounted_bytes` besides the cut
+/// that writes it.
+///
+/// Why merged (the forgiveness pair): a manifest INSERT that commits
+/// server-side but surfaces as an error (lost response, or a
+/// watchdog-abandoned cut dropped post-commit) is re-cut under a
+/// freshly burned chunk_seq, so the write path is at-least-once with
+/// per-attempt rekeying — duplicate rows covering overlapping
 /// `[first_line, first_line + line_count)` are a NORMAL artifact of
 /// that retry shape, and a bare count+sum charges the same lines
 /// once per attempt against the permanent FAILED_PRECONDITION cap
-/// class. The account prunes every row CONTAINED in another row's
+/// class. The merged pair prunes every row CONTAINED in another row's
 /// interval (deterministic tiebreak on identical intervals), which
 /// is exact merged coverage for every overlap shape the write path
 /// can produce: a failed run is restored to the FRONT of the buffer,
@@ -140,16 +192,20 @@ pub(super) fn replica_capacity_status(msg: &'static str) -> Status {
 /// unproducible by the write path; if one ever lands, both rows
 /// count (a bounded over-count on the overlap tail — conservative
 /// for a cap, never an under-count).
-pub(super) async fn log_seed(pool: &PgPool, exec_id: Uuid) -> Result<(u64, u32), Status> {
+///
+/// Why raw (the containment pair): the merged projection is
+/// IDEMPOTENT — identical-interval replay rows witness zero — so it
+/// structurally cannot bound total durable writes for a writer that
+/// controls duplication. The raw aggregates are unconditioned over
+/// the same `exec_id` scan (no second query): every committed row
+/// counts once, forever.
+pub(super) async fn log_seed(pool: &PgPool, exec_id: Uuid) -> Result<LogSeed, Status> {
     // Store-owned table → runtime query. A row is REDUNDANT iff some
     // other row covers its interval AND is either strictly wider or
     // (identical interval) orders after it — so exactly one row per
-    // covered interval survives.
-    let row: (i64, i64) = sqlx::query_as(
-        "SELECT count(*), COALESCE(sum(accounted_bytes), 0)::BIGINT \
-           FROM drv_log_chunks r \
-          WHERE r.exec_id = $1 \
-            AND NOT EXISTS ( \
+    // covered interval survives the merged FILTER; the raw pair
+    // aggregates the same scan unconditioned.
+    const NOT_REDUNDANT: &str = "NOT EXISTS ( \
               SELECT 1 FROM drv_log_chunks o \
                WHERE o.exec_id = r.exec_id \
                  AND (o.session_id, o.chunk_seq) <> (r.session_id, r.chunk_seq) \
@@ -157,16 +213,28 @@ pub(super) async fn log_seed(pool: &PgPool, exec_id: Uuid) -> Result<(u64, u32),
                  AND o.first_line + o.line_count >= r.first_line + r.line_count \
                  AND (   o.first_line < r.first_line \
                       OR o.first_line + o.line_count > r.first_line + r.line_count \
-                      OR (o.session_id, o.chunk_seq) > (r.session_id, r.chunk_seq)))",
-    )
-    .bind(exec_id)
-    .fetch_one(pool)
-    .await
-    .status_internal("AppendLog gate: durable cap seed")?;
-    Ok((
-        row.1.max(0) as u64,
-        row.0.clamp(0, i64::from(u32::MAX)) as u32,
-    ))
+                      OR (o.session_id, o.chunk_seq) > (r.session_id, r.chunk_seq)))";
+    let sql = format!(
+        "SELECT count(*) FILTER (WHERE {NOT_REDUNDANT}), \
+                COALESCE(sum(accounted_bytes) FILTER (WHERE {NOT_REDUNDANT}), 0)::BIGINT, \
+                count(*), \
+                COALESCE(sum(accounted_bytes), 0)::BIGINT \
+           FROM drv_log_chunks r \
+          WHERE r.exec_id = $1"
+    );
+    // AssertSqlSafe: composed exclusively from const fragments — no
+    // runtime data enters the text.
+    let row: (i64, i64, i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(exec_id)
+        .fetch_one(pool)
+        .await
+        .status_internal("AppendLog gate: durable cap seed")?;
+    Ok(LogSeed {
+        merged_bytes: row.1.max(0) as u64,
+        merged_chunks: row.0.clamp(0, i64::from(u32::MAX)) as u32,
+        raw_bytes: row.3.max(0) as u64,
+        raw_rows: row.2.max(0) as u64,
+    })
 }
 
 // r[impl store.log.append-auth+2]
@@ -357,7 +425,8 @@ pub(super) async fn finish_open(
     // deliberately NOT used here — that code is reserved for
     // per-replica capacity (retry elsewhere can succeed; these caps
     // travel with the execution).
-    let (prior_accounted_bytes, prior_chunks) = log_seed(pool, exec_id).await?;
+    let seed = log_seed(pool, exec_id).await?;
+    let (prior_accounted_bytes, prior_chunks) = seed.merged_pair();
     if prior_accounted_bytes >= caps.per_exec_byte_cap {
         metrics::counter!("rio_store_log_ingest_rejected_total", "reason" => "byte_cap")
             .increment(1);
@@ -377,6 +446,44 @@ pub(super) async fn finish_open(
             format!(
                 "AppendLog: execution exceeded the {}-chunk cap",
                 caps.max_chunks_per_exec
+            ),
+        ));
+    }
+
+    // -- The raw monotone ceilings (merged_bug_002). The merged checks
+    // above measure the IDEMPOTENT coverage projection — what an honest
+    // retry may re-send without double-charge — which structurally
+    // cannot bound total durable writes for a writer that controls
+    // duplication: identical-interval replay rows witness zero there
+    // while every cycle durably mints new objects and manifest rows.
+    // These two arms bound the MONOTONE quantities (Σ raw
+    // accounted_bytes, raw row count over ALL committed rows), which no
+    // reconnect resets BY ALGEBRA: cycle-cumulative containment on both
+    // cap quantities. Same permanent class as the merged trips — the
+    // ceiling travels with the execution. `saturating_mul`: a test-tier
+    // `u64::MAX` cap must read as "no ceiling", not overflow.
+    if seed.raw_bytes >= REPLAY_ALLOWANCE.saturating_mul(caps.per_exec_byte_cap) {
+        metrics::counter!("rio_store_log_ingest_rejected_total", "reason" => "byte_cap")
+            .increment(1);
+        return Err(cap_rejection(
+            "cap",
+            format!(
+                "AppendLog: execution exceeded the raw durable byte ceiling \
+                 ({} bytes stored >= {}x the {}-byte cap); no reconnect resets it",
+                seed.raw_bytes, REPLAY_ALLOWANCE, caps.per_exec_byte_cap
+            ),
+        ));
+    }
+    if seed.raw_rows >= REPLAY_ALLOWANCE.saturating_mul(u64::from(caps.max_chunks_per_exec)) {
+        metrics::counter!("rio_store_log_ingest_rejected_total", "reason" => "chunk_cap")
+            .increment(1);
+        return Err(cap_rejection(
+            "cap",
+            format!(
+                "AppendLog: execution exceeded the raw durable chunk-row ceiling \
+                 ({} manifest rows stored >= {}x the {}-chunk cap); no reconnect \
+                 resets it",
+                seed.raw_rows, REPLAY_ALLOWANCE, caps.max_chunks_per_exec
             ),
         ));
     }
@@ -1201,13 +1308,274 @@ mod tests {
         insert(sess_a, 5, 500, 20, 2_000).await;
         insert(sess_a, 6, 500, 20, 2_000).await;
 
-        let (bytes, chunks) = log_seed(&db.pool, exec).await.unwrap();
+        let (bytes, chunks) = log_seed(&db.pool, exec).await.unwrap().merged_pair();
         assert_eq!(
             (bytes, chunks),
             (10_000 + 9_000 + 9_500 + 2_000, 4),
             "left: the bare count+sum seed inflated by every contained \
              duplicate (36000+16500 bytes over 8 rows) / right: the seed \
              equals merged coverage — one survivor per covered interval"
+        );
+    }
+
+    // -- the raw monotone ceilings (merged_bug_002) -----------------------
+
+    use super::super::chunks::MemoryLogChunkStore;
+    use super::super::ingest::{IngestConfig, IngestSession};
+    use rio_proto::types::BuildLogBatch;
+    use std::time::Duration;
+
+    /// One adversarial open→replay→cut→reconnect cycle: open through the
+    /// production gate, seed a session from the GateOk, replay the SAME
+    /// line interval `[0, n_lines)` with cycle-tagged content (identical
+    /// intervals, varied bytes — a dedup-shaped wrong fix cannot green
+    /// this), cut one durable chunk, drop the session. Returns the gate
+    /// refusal, if the open was refused.
+    async fn replay_cycle(
+        pool: &PgPool,
+        store: &MemoryLogChunkStore,
+        exec: Uuid,
+        caps: OpenCaps,
+        n_lines: u64,
+        content_len: usize,
+        cycle: usize,
+    ) -> Result<GateOk, Status> {
+        let gate_ok =
+            finish_open(pool, "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm".into(), exec, caps).await?;
+        let mut session = IngestSession::new(
+            &gate_ok,
+            Uuid::now_v7(),
+            IngestConfig {
+                per_exec_byte_cap: caps.per_exec_byte_cap,
+                cut_threshold_bytes: u64::MAX, // manual cuts only
+                cut_interval: Duration::from_secs(60),
+            },
+        );
+        let lines: Vec<Vec<u8>> = (0..n_lines)
+            .map(|i| {
+                let mut l = vec![b'x'; content_len];
+                // Cycle-tagged content: same length (identical accounted
+                // bytes and intervals), different bytes every cycle.
+                let tag = format!("c{cycle}l{i}");
+                let tag = tag.as_bytes();
+                l[..tag.len().min(content_len)].copy_from_slice(&tag[..tag.len().min(content_len)]);
+                l
+            })
+            .collect();
+        let outcome = session
+            .accept(BuildLogBatch {
+                derivation_path: DRV_PATH.to_string(),
+                lines,
+                first_line_number: 0,
+                executor_id: "builder-0".to_string(),
+            })
+            .expect("the replay batch stays under the session byte cap");
+        assert!(
+            matches!(
+                outcome,
+                super::super::ingest::AcceptOutcome::Accepted { .. }
+            ),
+            "the replay batch must be accepted, got {outcome:?}"
+        );
+        let ack = session.cut(store, pool).await.expect("cut commits");
+        assert_eq!(ack, Some(n_lines - 1), "the full run cuts durably");
+        Ok(gate_ok)
+    }
+
+    /// The execution's raw durable account, straight off the manifest:
+    /// `(rows, accounted-byte sum)` over ALL `drv_log_chunks` rows —
+    /// the monotone quantity the ceiling law bounds.
+    async fn raw_account(pool: &PgPool, exec: Uuid) -> (i64, i64) {
+        sqlx::query_as(
+            "SELECT count(*), COALESCE(sum(accounted_bytes), 0)::BIGINT \
+             FROM drv_log_chunks WHERE exec_id = $1",
+        )
+        .bind(exec)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// W11-A (merged_bug_002 HIGH). Proposition: **total durable
+    /// accounted bytes per execution ≤ REPLAY_ALLOWANCE ×
+    /// per_exec_byte_cap under adversarial identical-interval replay**
+    /// — cumulative across reconnect cycles, the law's own quantifier.
+    /// The negation is the live attack: each open seeds from MERGED
+    /// coverage (idempotent union), so identical-interval replay rows
+    /// witness zero at the seed and an untrusted builder durably mints
+    /// new S3 objects + manifest rows every open→replay→cut→reconnect
+    /// cycle while the seed never grows. The red asserts the FROZEN
+    /// MEASURE — Σ raw accounted_bytes over ALL rows (object-count
+    /// growth is the sibling chunk quantity, owned by W11-A2). The
+    /// post-fix refusal is pinned at the BYTE-ceiling face (the
+    /// message names the byte quantity), not the typed class alone:
+    /// both cap trips share `cap_rejection("cap", …)`.
+    ///
+    /// Population includes the TWO-EXEC partition cell: a sibling
+    /// execution with seeded coverage rows — when the attacker trips
+    /// the raw ceiling, the sibling's seed is unchanged AND its open
+    /// still admits (the measure's per-exec denominator, R28).
+    #[tokio::test]
+    async fn raw_byte_ceiling_bounds_adversarial_replay_cycles() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let exec = Uuid::now_v7();
+        let caps = OpenCaps {
+            per_exec_byte_cap: 4096,
+            max_chunks_per_exec: 100_000,
+        };
+        // The sibling exec: independent coverage, must be untouched by
+        // the attacker exec's ceiling trip.
+        let sibling = Uuid::now_v7();
+        seed_chunk(&db.pool, sibling, 0, 0, 5).await;
+        let sibling_seed_before = log_seed(&db.pool, sibling).await.unwrap();
+
+        // 4 lines × 480 content bytes = 4 × 512 accounted = 2048 per
+        // cycle (half the cap: maximizes the per-cycle mint the merged
+        // seed cannot see).
+        let mut refusal: Option<(usize, Status)> = None;
+        for cycle in 0..6 {
+            match replay_cycle(&db.pool, &store, exec, caps, 4, 480, cycle).await {
+                Ok(gate_ok) => {
+                    if cycle >= 1 {
+                        // The swapped-measure face: the merged seed is
+                        // FLAT while raw storage grows.
+                        assert_eq!(
+                            gate_ok.prior_accounted_bytes, 2048,
+                            "the merged seed stays flat under identical-interval replay"
+                        );
+                    }
+                }
+                Err(status) => {
+                    refusal = Some((cycle, status));
+                    break;
+                }
+            }
+        }
+
+        let (raw_rows, raw_bytes) = raw_account(&db.pool, exec).await;
+        assert!(
+            raw_bytes <= 2 * 4096,
+            "left (pre-fix): the identical-interval replay loop durably minted \
+             {raw_bytes} raw accounted bytes ({raw_rows} manifest rows) across \
+             open→replay→cut→reconnect cycles with the merged seed flat at 2048 \
+             — uncharged attacker-mintable storage / right: cumulative raw \
+             accounted bytes per exec stay ≤ REPLAY_ALLOWANCE×cap = 8192 \
+             because the open refuses at the raw byte ceiling"
+        );
+        let (cycle, status) = refusal.expect(
+            "left (pre-fix): every open admits — the seed never grows, no \
+             ceiling exists / right: the open refuses once raw bytes reach \
+             the ceiling",
+        );
+        assert_eq!(cycle, 4, "cycles 0-3 mint 2048 each (raw 8192 = ceiling)");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+        assert_eq!(
+            status
+                .metadata()
+                .get(rio_proto::LOG_REJECT_METADATA_KEY)
+                .unwrap(),
+            "cap",
+            "the raw ceiling shares the permanent cap class"
+        );
+        // The measure face: the refusal names the BYTE ceiling (the two
+        // cap trips are class-indistinguishable; the byte arm must be
+        // the one that fired).
+        assert!(
+            status.message().contains("byte"),
+            "the refusal names the byte quantity: {:?}",
+            status.message()
+        );
+
+        // The partition cell: the sibling exec's seed is unchanged and
+        // its open still admits — the ceiling's denominator is per-exec.
+        assert_eq!(
+            log_seed(&db.pool, sibling).await.unwrap(),
+            sibling_seed_before,
+            "the attacker exec's ceiling trip must not move the sibling's seed"
+        );
+        finish_open(
+            &db.pool,
+            "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm".into(),
+            sibling,
+            caps,
+        )
+        .await
+        .expect("the sibling exec's open admits: its budget is unconsumed");
+    }
+
+    /// W11-A2 (merged_bug_002, the chunk-axis orbit). Proposition:
+    /// **total durable manifest rows per execution ≤ REPLAY_ALLOWANCE ×
+    /// max_chunks_per_exec under adversarial small-chunk replay** — the
+    /// sibling quantity's own red. A SMALL-CHUNK loop (one tiny line
+    /// per cycle ≈ minimal accounted bytes) stays far under every byte
+    /// quantity while minting one object + one manifest row per cycle
+    /// with merged chunks flat at 1; the byte ceiling structurally
+    /// cannot catch it. Post-fix the open refuses BY THE CHUNK CEILING
+    /// (raw rows ≥ k×max_chunks_per_exec; the message names the row
+    /// quantity).
+    #[tokio::test]
+    async fn raw_row_ceiling_bounds_small_chunk_replay_orbit() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let exec = Uuid::now_v7();
+        let caps = OpenCaps {
+            per_exec_byte_cap: 1024 * 1024 * 1024,
+            max_chunks_per_exec: 3,
+        };
+
+        // One 8-content-byte line per cycle: 40 accounted bytes — the
+        // orbit the byte axis cannot see (40 × cycles ≪ 1 GiB).
+        let mut refusal: Option<(usize, Status)> = None;
+        for cycle in 0..9 {
+            match replay_cycle(&db.pool, &store, exec, caps, 1, 8, cycle).await {
+                Ok(gate_ok) => {
+                    if cycle >= 1 {
+                        assert_eq!(
+                            gate_ok.prior_chunks, 1,
+                            "merged chunks stay flat under identical-interval replay"
+                        );
+                    }
+                }
+                Err(status) => {
+                    refusal = Some((cycle, status));
+                    break;
+                }
+            }
+        }
+
+        let (raw_rows, _raw_bytes) = raw_account(&db.pool, exec).await;
+        assert!(
+            raw_rows <= 2 * 3,
+            "left (pre-fix): the small-chunk replay orbit durably minted \
+             {raw_rows} manifest rows / objects with merged chunks flat at 1 \
+             — unbounded object-count mint below every byte quantity / right: \
+             cumulative raw rows per exec stay ≤ REPLAY_ALLOWANCE×max_chunks \
+             = 6 because the open refuses at the raw row ceiling"
+        );
+        let (cycle, status) = refusal.expect(
+            "left (pre-fix): every open admits (merged chunks = 1 < 3 forever) \
+             / right: the open refuses once raw rows reach the ceiling",
+        );
+        assert_eq!(cycle, 6, "cycles 0-5 mint one row each (raw 6 = ceiling)");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+        assert_eq!(
+            status
+                .metadata()
+                .get(rio_proto::LOG_REJECT_METADATA_KEY)
+                .unwrap(),
+            "cap"
+        );
+        // The measure face: the CHUNK ceiling fired (not the byte arm).
+        assert!(
+            status.message().contains("chunk"),
+            "the refusal names the row/chunk quantity: {:?}",
+            status.message()
+        );
+        assert_eq!(
+            store.len(),
+            6,
+            "one object per admitted cycle; the refused open mints none"
         );
     }
 }
