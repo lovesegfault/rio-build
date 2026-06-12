@@ -1175,18 +1175,29 @@ fn render_phase3(phase3: &Phase3Render, dry_run: bool, stats: &GcStats) -> Strin
 /// so a ~5min transient S3 outage leaked the object with no retry
 /// path and turned the reap qual's NOT-EXISTS conjunct into a
 /// permanent veto on the chunk tombstone's hard-delete.
-/// `last_error` is intentionally retained across the reset as
-/// forensic context until the next attempt overwrites it. The
-/// conflict target names migration 024's partial unique index
-/// (`blake3_hash WHERE blake3_hash IS NOT NULL`); rows enqueued here
-/// always carry a hash.
+/// THE RESET CARRIES THE FRESH DECISION WHOLE (merged_bug_117, R30
+/// hardened): a reset arm implementing "a fresh decision restarts the
+/// row" carries EVERY column the fresh decision recomputed. The
+/// decision-derived column audit (the R4 line, per column):
+/// `s3_key` (carries `EXCLUDED.s3_key`) — fixed-here (the wave-11 arm kept the
+/// stale key; after a backend key-layout migration the drain then
+/// deleted a ghost at the old key and the real object leaked silently
+/// past the reap conjunct); `attempts = 0`, `enqueued_at = now()` —
+/// verified (carried since bug_111); `blake3_hash` — n/a (the
+/// conflict key itself); `last_error` — verified-by-design
+/// (intentionally retained as forensic context until the next attempt
+/// overwrites it). The conflict target names migration 024's partial
+/// unique index (`blake3_hash WHERE blake3_hash IS NOT NULL`); rows
+/// enqueued here always carry a hash.
 ///
 /// Skips hashes that fail `try_from` to `[u8; 32]` (can't-happen — the
 /// `chunks` PK is BYTEA but every writer inserts exactly 32 bytes;
 /// `warn!` + skip rather than panic so one corrupt row doesn't kill
-/// the collect batch). Returns the number of keys attempted
-/// (in-budget duplicates are no-ops; actual insert count may be
-/// lower).
+/// the collect batch). Returns `rows_affected()` — rows INSERTED or
+/// RESET (in-budget duplicates are WHERE-false no-ops and do NOT
+/// count, so the enqueued-total counter measures what its HELP
+/// claims; the pre-fix `keys.len()` return counted the swallowed
+/// dups).
 ///
 /// No-op if `backend` is None (inline-only store has no S3 keys).
 ///
@@ -1236,11 +1247,11 @@ pub(super) async fn enqueue_chunk_deletes(
     if keys.is_empty() {
         return Ok(0);
     }
-    sqlx::query(
+    let result = sqlx::query(
         "INSERT INTO pending_s3_deletes (s3_key, blake3_hash) \
          SELECT * FROM unnest($1::text[], $2::bytea[]) \
          ON CONFLICT (blake3_hash) WHERE blake3_hash IS NOT NULL \
-         DO UPDATE SET attempts = 0, enqueued_at = now() \
+         DO UPDATE SET (attempts, enqueued_at, s3_key) = (0, now(), EXCLUDED.s3_key) \
          WHERE pending_s3_deletes.attempts >= $3",
     )
     .bind(&keys)
@@ -1248,7 +1259,7 @@ pub(super) async fn enqueue_chunk_deletes(
     .bind(crate::gc::drain::MAX_ATTEMPTS)
     .execute(&mut **tx)
     .await?;
-    Ok(keys.len() as u64)
+    Ok(result.rows_affected())
 }
 
 /// Deserialize a manifest's `chunk_list` and return its dedup'd chunk
@@ -1342,7 +1353,7 @@ mod tests {
         n
     }
 
-    // r[verify store.gc.outbox-reset]
+    // r[verify store.gc.outbox-reset+2]
     /// W11-AP (bug_111, R30): from the EXHAUSTED outbox state, a fresh
     /// producer decision reaches execution — the exit edge of the
     /// absorbing state, witnessed at the outbox's own lattice.
@@ -1469,7 +1480,7 @@ mod tests {
         );
     }
 
-    // r[verify store.gc.outbox-reset]
+    // r[verify store.gc.outbox-reset+2]
     /// W11-AP latch-face cell — see
     /// [`fresh_collect_decision_resets_exhausted_outbox_row`]'s doc:
     /// the non-exhausted half of the IFF.
@@ -2129,6 +2140,242 @@ mod tests {
             .unwrap();
             assert!(exists, "Q's narinfo must survive sweep");
         }
+    }
+    /// A string-keyed backend whose key layout can migrate (v1 -> v2)
+    /// and whose deletes can fail (the exhaustion injection): the
+    /// W12-R fixture. Deletes of missing keys succeed (S3 semantics —
+    /// the idempotency the stale-key leak rides).
+    #[derive(Default)]
+    struct LayoutBackend {
+        store: std::sync::Mutex<std::collections::HashMap<String, bytes::Bytes>>,
+        v2: std::sync::atomic::AtomicBool,
+        healthy: std::sync::atomic::AtomicBool,
+    }
+
+    impl LayoutBackend {
+        fn key_v1(hash: &[u8; 32]) -> String {
+            format!("v1/{}", hex::encode(hash))
+        }
+        fn key_v2(hash: &[u8; 32]) -> String {
+            format!("v2/{}", hex::encode(hash))
+        }
+        /// The operator key-layout migration: the object moves to the
+        /// v2 key and key_for renders v2 from now on.
+        fn migrate(&self, hash: &[u8; 32]) {
+            let mut store = self.store.lock().unwrap();
+            if let Some(data) = store.remove(&Self::key_v1(hash)) {
+                store.insert(Self::key_v2(hash), data);
+            }
+            self.v2.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn contains(&self, key: &str) -> bool {
+            self.store.lock().unwrap().contains_key(key)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::backend::ChunkBackend for LayoutBackend {
+        async fn put(&self, h: &[u8; 32], d: bytes::Bytes) -> anyhow::Result<()> {
+            self.store.lock().unwrap().insert(self.key_for(h), d);
+            Ok(())
+        }
+        async fn get(&self, h: &[u8; 32]) -> anyhow::Result<Option<bytes::Bytes>> {
+            Ok(self.store.lock().unwrap().get(&self.key_for(h)).cloned())
+        }
+        async fn exists_batch(&self, hs: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
+            let store = self.store.lock().unwrap();
+            Ok(hs
+                .iter()
+                .map(|h| store.contains_key(&self.key_for(h)))
+                .collect())
+        }
+        fn key_for(&self, h: &[u8; 32]) -> String {
+            if self.v2.load(std::sync::atomic::Ordering::SeqCst) {
+                Self::key_v2(h)
+            } else {
+                Self::key_v1(h)
+            }
+        }
+        async fn delete_by_key(&self, k: &str) -> anyhow::Result<()> {
+            if !self.healthy.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("injected S3 outage: transient delete failure")
+            }
+            // S3 semantics: delete-of-missing succeeds silently.
+            self.store.lock().unwrap().remove(k);
+            Ok(())
+        }
+    }
+
+    // r[verify store.gc.outbox-reset+2]
+    /// W12-R (merged_bug_117, R30-hardened): the reset edge carries
+    /// the FRESH DECISION WHOLE — every decision-derived column, not
+    /// just the budget fields. Pre-fix the DO UPDATE arm reset
+    /// attempts/enqueued_at but kept the STALE s3_key the original
+    /// enqueue computed; after a backend key-layout migration the
+    /// drain then deletes at the stale key (idempotent success on a
+    /// missing object), the row leaves the outbox, the tombstone
+    /// reap's NOT-EXISTS conjunct unblocks — and the object at the
+    /// NEW key leaks silently, forever. The wave-11 exit edge
+    /// converted a parked-but-VISIBLE posture (_stuck gauge) into a
+    /// silent permanent leak.
+    #[tokio::test]
+    async fn outbox_reset_carries_the_recomputed_key() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let layout = std::sync::Arc::new(LayoutBackend::default());
+        let backend: Arc<dyn crate::backend::ChunkBackend> =
+            std::sync::Arc::clone(&layout) as Arc<dyn crate::backend::ChunkBackend>;
+
+        // Chunk X: tombstoned, object at the v1 key, outbox row
+        // enqueued via PRODUCTION while the v1 layout is live.
+        let hash_x = [0xC4u8; 32];
+        backend
+            .put(&hash_x, bytes::Bytes::from_static(b"layout-migration-prey"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chunks (blake3_hash, size, deleted, deleted_at) \
+             VALUES ($1, 21, true, now() - interval '2 days')",
+        )
+        .bind(hash_x.as_slice())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            enqueue_via_production(&db.pool, &backend, &[hash_x]).await,
+            1
+        );
+
+        // The outage exhausts the row through the production drain.
+        for _ in 0..crate::gc::drain::MAX_ATTEMPTS {
+            let (deleted, failed) = crate::gc::drain::drain_once(
+                &db.pool,
+                &backend,
+                &mut crate::test_helpers::gc_clearance(&db.pool).await,
+            )
+            .await
+            .unwrap();
+            assert_eq!((deleted, failed), (0, 1));
+        }
+
+        // The key-layout migration lands between enqueue and reset:
+        // the object now lives at v2; key_for renders v2.
+        layout.migrate(&hash_x);
+        layout
+            .healthy
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // The fresh collect decision resets the exhausted row — and
+        // MUST carry the recomputed key with it.
+        enqueue_via_production(&db.pool, &backend, &[hash_x]).await;
+        let row_key: String =
+            sqlx::query_scalar("SELECT s3_key FROM pending_s3_deletes WHERE blake3_hash = $1")
+                .bind(hash_x.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row_key,
+            LayoutBackend::key_v2(&hash_x),
+            "left: the reset arm kept the stale pre-migration key (the \
+             drain will delete a ghost and the real object leaks) / \
+             right: the exit edge carries every decision-derived column"
+        );
+
+        // The drain executes the carried decision: the REAL object
+        // dies; the row leaves; the reap conjunct unblocks with no
+        // leak behind it.
+        let (deleted, failed) = crate::gc::drain::drain_once(
+            &db.pool,
+            &backend,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
+        assert_eq!((deleted, failed), (1, 0));
+        assert!(
+            !layout.contains(&LayoutBackend::key_v2(&hash_x)),
+            "the object at the recomputed key is deleted — no silent leak"
+        );
+        let outbox_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pending_s3_deletes WHERE blake3_hash = $1")
+                .bind(hash_x.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            outbox_rows, 0,
+            "the outbox row leaves after the real delete"
+        );
+    }
+
+    // r[verify store.gc.outbox-reset+2]
+    /// W12-R2 (merged_bug_117, the accounting face): the enqueue
+    /// count is `rows_affected()` — inserted or reset rows only —
+    /// so `rio_store_gc_s3_key_enqueued_total` measures what its
+    /// HELP claims. Pre-fix the fn returned `keys.len()`, counting
+    /// DO-UPDATE-WHERE-false no-ops (in-budget dups) as enqueues.
+    #[tokio::test]
+    async fn enqueue_count_is_rows_affected_not_keys_attempted() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let outage = std::sync::Arc::new(OutageBackend {
+            inner: mem_backend(),
+            healthy: std::sync::atomic::AtomicBool::new(false),
+        });
+        let backend: Arc<dyn crate::backend::ChunkBackend> =
+            std::sync::Arc::clone(&outage) as Arc<dyn crate::backend::ChunkBackend>;
+
+        // B: an IN-BUDGET in-flight row (attempts = 3 < MAX).
+        let hash_b = [0xC5u8; 32];
+        backend
+            .put(&hash_b, bytes::Bytes::from_static(b"in-budget-dup"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chunks (blake3_hash, size, deleted, deleted_at) \
+             VALUES ($1, 13, true, now() - interval '2 days')",
+        )
+        .bind(hash_b.as_slice())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            enqueue_via_production(&db.pool, &backend, &[hash_b]).await,
+            1,
+            "the fresh insert counts"
+        );
+        for _ in 0..3 {
+            let (_, failed) = crate::gc::drain::drain_once(
+                &db.pool,
+                &backend,
+                &mut crate::test_helpers::gc_clearance(&db.pool).await,
+            )
+            .await
+            .unwrap();
+            assert_eq!(failed, 1);
+        }
+
+        // A: a fresh chunk. The batch [A, B]: A inserts, B is the
+        // designed swallow (in-budget dup, DO UPDATE WHERE false).
+        let hash_a = [0xC3u8; 32];
+        backend
+            .put(&hash_a, bytes::Bytes::from_static(b"fresh-insert"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chunks (blake3_hash, size, deleted, deleted_at) \
+             VALUES ($1, 12, true, now() - interval '2 days')",
+        )
+        .bind(hash_a.as_slice())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let counted = enqueue_via_production(&db.pool, &backend, &[hash_a, hash_b]).await;
+        assert_eq!(
+            counted, 1,
+            "left: keys-attempted counted the swallowed dup as an enqueue \
+             (the HELP lies) / right: rows_affected — the insert counts, \
+             the no-op does not"
+        );
     }
 }
 

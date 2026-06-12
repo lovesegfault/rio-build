@@ -213,7 +213,7 @@
   "rio_store_gc_orphan_reap_failed_total": "Per-row reap_one failures during the orphan scanner's loop (e.g. a transient DB error against one placeholder row). The scan continues; sustained nonzero = a poison row needs manual intervention.",
   "rio_store_gc_path_resurrected_total": "Paths skipped by sweep because a new referrer appeared between mark and sweep (race window)",
   "rio_store_gc_path_swept_total": "Paths deleted by GC sweep (narinfo + CASCADE). Monotonic over store lifetime.",
-  "rio_store_gc_s3_key_enqueued_total": "S3 keys enqueued to pending_s3_deletes by the chunk-collect cycle's batches (soft-deleted chunks awaiting backend deletion).",
+  "rio_store_gc_s3_key_enqueued_total": "pending_s3_deletes rows inserted or budget-reset by the chunk-collect cycle's batches (rows_affected of the outbox enqueue: fresh enqueues plus exhausted-row resets; in-budget duplicate decisions are swallowed and not counted).",
   "rio_store_gc_sweep_paths_remaining": "Paths not yet processed by the in-progress GC sweep. Ticks down per batch commit; 0 between sweeps. Long-tail = sweep stalled or PG slow.",
   "rio_store_get_path_active": "GetPath body-stream tasks currently writing (drives SIGTERM stream-drain)",
   "rio_store_get_path_bytes_total": "Bytes served via GetPath (nar_size on stream start)",

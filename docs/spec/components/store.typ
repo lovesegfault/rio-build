@@ -2270,15 +2270,21 @@ GC redesign must preserve.
 + Rows exceeding max retry count (default: 10) remain in the table for alerting
   (#(refs.metric)("rio_store_s3_deletes_stuck") gauge).
 
-#r("store.gc.outbox-reset")[
-  Outbox exhaustion MUST NOT be absorbing: a fresh collect decision for an
-  object whose `pending_s3_deletes` row has exhausted its retry budget
-  (`attempts >= MAX_ATTEMPTS`) MUST reset that row's budget
-  (`attempts = 0`, `enqueued_at = now()`) so the drain retries it, while a
+#r("store.gc.outbox-reset+2")[
+  Outbox exhaustion MUST NOT be absorbing, and the reset edge MUST carry
+  the fresh decision WHOLE: a fresh collect decision for an object whose
+  `pending_s3_deletes` row has exhausted its retry budget
+  (`attempts >= MAX_ATTEMPTS`) MUST reset EVERY decision-derived column
+  (`attempts = 0`, `enqueued_at = now()`, and `s3_key` carrying the
+  recomputed `EXCLUDED` value --- the fresh backend key; an edge that
+  re-activates the row while
+  keeping a stale key converts the parked-but-visible posture into a
+  silent permanent object leak after a key-layout migration), while a
   duplicate decision against a row whose budget remains MUST stay swallowed
-  (the dedup the partial unique index exists for). The reap predicate's
-  NOT-EXISTS conjunct over `pending_s3_deletes` is thereby a finite wait,
-  never a permanent veto on the tombstone hard-delete.
+  (the dedup the partial unique index exists for). Enqueue accounting MUST
+  be `rows_affected()`-based --- inserted or reset rows only, never
+  keys-attempted --- so the enqueued-total counter measures what its HELP
+  claims.
 ]
 The exit edge rides the enqueue's conflict arm (the guarded
 `DO UPDATE ... WHERE attempts >= MAX`): the one event that logically

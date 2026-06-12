@@ -278,8 +278,10 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_gc_s3_key_enqueued_total",
-        "S3 keys enqueued to pending_s3_deletes by the chunk-collect cycle's \
-         batches (soft-deleted chunks awaiting backend deletion)."
+        "pending_s3_deletes rows inserted or budget-reset by the chunk-collect \
+         cycle's batches (rows_affected of the outbox enqueue: fresh enqueues \
+         plus exhausted-row resets; in-budget duplicate decisions are swallowed \
+         and not counted)."
     );
     describe_counter!(
         "rio_store_gc_orphan_reap_failed_total",
