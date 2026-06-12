@@ -95,6 +95,27 @@ spec:
         throughput: {{ $k.dataVolumeThroughputMiBps }}
         deleteOnTermination: true
         encrypted: true
+  {{- if ne $nc.name "rio-nvme" }}
+    # live_060-a: the dedicated kubelet QUOTA volume for EBS-only
+    # classes. The AMI's rio-ebs-quota-mount finds the bare second
+    # EBS volume, formats it xfs and mounts it `-o prjquota` at
+    # /var/lib/kubelet — the node precondition of the only
+    # peak_disk_bytes producer (rio-builder quota.rs). rio-nvme is
+    # excluded: instance-store RAID0 already owns /var/lib/kubelet
+    # with prjquota via rio-nvme-mount. Sizing: kubelet's
+    # ephemeral-storage allocatable derives from the fs hosting
+    # /var/lib/kubelet, so the pod_ephemeral_request inequality
+    # (see karpenter.dataVolumeSize) binds on THIS volume for these
+    # classes — quotaVolumeSize carries the 500Gi derivation.
+    - deviceName: /dev/xvdb
+      ebs:
+        volumeSize: {{ $k.quotaVolumeSize }}
+        volumeType: gp3
+        iops: {{ $k.quotaVolumeIops }}
+        throughput: {{ $k.quotaVolumeThroughputMiBps }}
+        deleteOnTermination: true
+        encrypted: true
+  {{- end }}
   {{- if eq $nc.name "rio-nvme" }}
   instanceStorePolicy: RAID0
   {{- end }}

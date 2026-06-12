@@ -98,6 +98,19 @@ in
         they're GC roots only. See r[infra.node.prebake-layer-warm].
       '';
     };
+
+    quotaVolumeGlobs = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol*" ];
+      description = ''
+        Device globs rio-ebs-quota-mount enumerates to find the
+        dedicated kubelet quota volume on EBS-only nodes (live_060:
+        the karpenter EC2NodeClass attaches it as the second EBS
+        mapping). The root disk is excluded by partition-table
+        presence; exactly one bare candidate must remain. VM tests
+        point this at their virtio disk.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -163,6 +176,24 @@ in
         apiVersion = "kubelet.config.k8s.io/v1beta1";
         kind = "KubeletConfiguration";
         resolvConf = "/run/systemd/resolve/resolv.conf";
+      };
+      # live_060-a, the KUBELET HALF of the project-quota chain — the
+      # half nothing set before: with this gate on AND /var/lib/
+      # kubelet on a prjquota filesystem, kubelet assigns a project
+      # ID to every emptyDir of a user-namespaced pod (hostUsers:
+      # false — the builder pods' standing posture per
+      # sec.pod.host-users-false) and the kernel tracks usage O(1);
+      # rio-builder's quota.rs then reads it via FS_IOC_FSGETXATTR +
+      # quotactl_fd. Derived at kubernetes 1.36 (the deployed
+      # kubelet): the gate exists and quota assignment is
+      # userns-conditioned (kubelet refuses SupportsQuotas for
+      # host-user pods); UserNamespacesSupport is on by default.
+      # Without the gate kubelet falls back to ~60s du walks and
+      # peak_disk_bytes is None forever — the live_060 silence.
+      "kubernetes/kubelet/config.json.d/30-rio-fsquota.conf".text = builtins.toJSON {
+        apiVersion = "kubelet.config.k8s.io/v1beta1";
+        kind = "KubeletConfiguration";
+        featureGates.LocalStorageCapacityIsolationFSQuotaMonitoring = true;
       };
     };
 
@@ -437,6 +468,112 @@ in
           };
         };
 
+        # ── rio-ebs-quota-mount: oneshot, EARLY boot (live_060-a) ────
+        # The disk-sizing producer's node precondition, PROVISIONED:
+        # rio-builder's quota.rs reads kubelet-assigned XFS project
+        # quotas, but the EBS-only builder pools (rio-default/
+        # rio-metal — 159/160 of the live fleet) booted ext4-root
+        # with NO prjquota anywhere, so the only peak_disk_bytes
+        # producer never produced (2022/2022 completions None,
+        # silently) and BOTH disk-sizing ladders were dead. This unit
+        # mirrors rio-nvme-mount minus the NVMe condition: it runs
+        # exactly when the node has NO instance store (the negated
+        # glob), finds the dedicated quota EBS volume the karpenter
+        # EC2NodeClass attaches (second mapping, /dev/xvdb), and
+        # mounts it xfs `-o prjquota` at /var/lib/kubelet. Same
+        # ordering contract as the NVMe unit (before tmpfiles-setup +
+        # nodeadm-init + kubelet); kubelet Requires= it, so an
+        # EBS-only node without its quota volume stays NotReady LOUD
+        # instead of Ready-with-a-dead-producer (the live_060 mode).
+        # EBS persists across stop/start: an existing XFS signature
+        # mounts as-is; a foreign signature REFUSES (fail-closed);
+        # only a bare volume is formatted.
+        # r[impl infra.node.kubelet-prjquota]
+        rio-ebs-quota-mount = {
+          description = "Mount the dedicated EBS quota volume at /var/lib/kubelet (prjquota)";
+          wantedBy = [ "sysinit.target" ];
+          before = [
+            "systemd-tmpfiles-setup.service"
+            "nodeadm-init.service"
+            "kubelet.service"
+          ];
+          after = [ "local-fs.target" ];
+          unitConfig = {
+            DefaultDependencies = false;
+            # The mirror-minus-NVMe condition: instance-store nodes
+            # are rio-nvme-mount's jurisdiction.
+            ConditionPathExistsGlob = "!/dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage*";
+          };
+          path = [
+            pkgs.xfsprogs
+            pkgs.util-linux
+            pkgs.systemd # udevadm
+          ];
+          script = ''
+            set -euo pipefail
+            udevadm settle
+            # Enumerate candidates from the configured globs; resolve
+            # symlinks and dedup (EBS exposes two by-id links per
+            # volume on some udev versions).
+            declare -A seen
+            cands=()
+            for g in ${lib.escapeShellArgs cfg.quotaVolumeGlobs}; do
+              for l in $g; do
+                [ -e "$l" ] || continue
+                d=$(readlink -f "$l")
+                if [ -z "''${seen[$d]:-}" ]; then
+                  seen[$d]=1
+                  cands+=("$d")
+                fi
+              done
+            done
+            # Exclude the root/boot disk: anything carrying a
+            # partition table (lsblk children) or hosting a mounted
+            # filesystem is not the bare quota volume.
+            quota_dev=""
+            n_bare=0
+            for d in "''${cands[@]:-}"; do
+              [ -n "$d" ] || continue
+              if [ -n "$(lsblk -nro NAME "$d" | tail -n +2)" ]; then
+                continue # has partitions: the root disk
+              fi
+              if [ -n "$(lsblk -nro MOUNTPOINTS "$d" | tr -d '[:space:]')" ]; then
+                continue # already mounted somewhere
+              fi
+              quota_dev="$d"
+              n_bare=$((n_bare + 1))
+            done
+            if [ "$n_bare" -eq 0 ]; then
+              echo "rio-ebs-quota-mount: NO bare quota volume found — the" >&2
+              echo "EC2NodeClass must attach the second EBS mapping (live_060:" >&2
+              echo "an EBS-only builder node without prjquota has a dead disk" >&2
+              echo "producer; refusing to let kubelet start on the root fs)" >&2
+              exit 1
+            fi
+            if [ "$n_bare" -gt 1 ]; then
+              echo "rio-ebs-quota-mount: $n_bare bare candidate volumes — ambiguous; refusing" >&2
+              exit 1
+            fi
+            sig=$(blkid -o value -s TYPE "$quota_dev" || true)
+            case "$sig" in
+              xfs) ;; # persisted volume from a previous boot: mount as-is
+              "")
+                mkfs.xfs -f "$quota_dev"
+                ;;
+              *)
+                echo "rio-ebs-quota-mount: $quota_dev carries a foreign '$sig' filesystem — refusing to clobber" >&2
+                exit 1
+                ;;
+            esac
+            mkdir -p /var/lib/kubelet
+            mount -o prjquota,noatime "$quota_dev" /var/lib/kubelet
+          '';
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+          };
+        };
+
         # ── nodeadm-init: oneshot, before kubelet ─────────────────────
         # `init --skip run --daemon kubelet`: write kubelet config only, don't
         # systemctl-start it (nodeadm assumes AL2023 unit names; ours
@@ -571,6 +708,12 @@ in
             # is satisfied (job result `condition`), so EBS-only
             # NodeClasses (rio-default/rio-metal) are unaffected.
             "rio-nvme-mount.service"
+            # The EBS twin (live_060-a): same fail-HARD rationale in
+            # the other direction — an EBS-only node whose quota
+            # volume is missing must stay NotReady loud, never Ready
+            # with a dead disk producer. Condition-skipped (satisfied)
+            # on instance-store nodes.
+            "rio-ebs-quota-mount.service"
           ];
           path = [
             # kubeconfig exec-auth (nodeadm.nix patches the template to
@@ -641,6 +784,12 @@ in
         "d /etc/cni/net.d 0755 root root -"
         "d /opt/cni/bin 0755 root root -"
         "d /var/lib/kubelet 0755 root root -"
+        # live_060-a: kubelet's fsquota project registry — pkg/volume/
+        # util/fsquota locks BOTH files and silently reports quotas
+        # unsupported when either is missing (AL2023 ships them;
+        # NixOS does not). The other half of the kubelet wiring.
+        "f /etc/projects 0644 root root -"
+        "f /etc/projid 0644 root root -"
       ];
     };
   };

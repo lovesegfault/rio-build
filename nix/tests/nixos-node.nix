@@ -73,7 +73,18 @@ pkgs.testers.runNixOSTest {
         # NodeAllocatable check ("reservation > capacity") and kubelet
         # exits 1. 4096 matches common.nix's worker default.
         diskSize = 4096;
+        # live_060-a: the quota volume rio-ebs-quota-mount provisions
+        # (the VM stand-in for the karpenter second EBS mapping) —
+        # kubelet now Requires= the mount, so the existing
+        # kubelet-starts assertion is the integration proof. 4096:
+        # the ephemeral-storage reservation check moves to THIS fs
+        # (it hosts /var/lib/kubelet).
+        emptyDiskImages = [ 4096 ];
       };
+
+      # The VM's bare virtio disk is the quota volume (no EBS by-id
+      # links under QEMU).
+      services.rio.eksNode.quotaVolumeGlobs = [ "/dev/vdb" ];
 
       # ── mock IMDS ─────────────────────────────────────────────────────
       systemd.services.mock-imds = {
@@ -120,6 +131,23 @@ pkgs.testers.runNixOSTest {
 
     with subtest("containerd up"):
         node.wait_for_unit("containerd.service")
+
+    # live_060-a: the EBS-quota provisioning half, asserted from the
+    # node config the fleet boots (the end-to-end kubelet-projid
+    # witness is the dedicated k3s scenario; this pins the AMI side).
+    with subtest("quota volume mounted prjquota at the kubelet root"):
+        node.wait_for_unit("rio-ebs-quota-mount.service")
+        out = node.succeed("findmnt -no FSTYPE,OPTIONS /var/lib/kubelet")
+        assert "xfs" in out and "prjquota" in out, f"kubelet root not prjquota-xfs: {out!r}"
+
+    with subtest("kubelet fsquota half present (gate + projid registry)"):
+        import json
+        gate = json.loads(node.succeed(
+            "cat /etc/kubernetes/kubelet/config.json.d/30-rio-fsquota.conf"
+        ))
+        assert gate["featureGates"]["LocalStorageCapacityIsolationFSQuotaMonitoring"] is True, gate
+        node.succeed("test -f /etc/projects")
+        node.succeed("test -f /etc/projid")
 
     # T7f: pick-base-runtime-spec ExecStartPre symlinks the -kvm spec
     # iff /dev/kvm is a chardev. The CI runner has KVM (nested), so

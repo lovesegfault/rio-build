@@ -1408,6 +1408,23 @@ karpenter:
   # (L-B3A130E6) lands.
   dataVolumeIops: 16000
   dataVolumeThroughputMiBps: 1000
+  # live_060-a: the dedicated kubelet quota volume (second EBS
+  # mapping, /dev/xvdb) for the EBS-only classes (rio-default/
+  # rio-metal). Mounted xfs `-o prjquota` at /var/lib/kubelet by the
+  # AMI's rio-ebs-quota-mount, so kubelet assigns project IDs to
+  # emptyDirs and rio-builder's quota.rs produces peak_disk_bytes —
+  # the fleet precondition that was never true (159/160 EBS-only
+  # nodes, 2022/2022 completions None). With /var/lib/kubelet on
+  # THIS volume, the pod_ephemeral_request inequality documented at
+  # dataVolumeSize binds here for EBS classes: 500×0.9 = 450 ≥ 441.
+  # The root volume keeps its size for the image cache + system; its
+  # scratch headroom is now redundant on EBS classes — resizing it
+  # is a post-soak optimization, recorded in the live_060 readback,
+  # not taken here. IOPS/throughput mirror the data volume: the
+  # build scratch is the IOPS-bound surface and it lives here now.
+  quotaVolumeSize: 500Gi
+  quotaVolumeIops: 16000
+  quotaVolumeThroughputMiBps: 1000
 
   # AWS bare-metal instance-size suffixes, c/m/r gen6+. Single source
   # for the metal/virtualized partition (I-205). New `metal-*` size →
