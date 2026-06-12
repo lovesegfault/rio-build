@@ -843,6 +843,63 @@ pub fn class_budget(
     global_remaining.min(class_remaining)
 }
 
+/// merged_bug_053: build the window's [`super::ffd::WindowMintability`]
+/// view at tick start, through the SAME [`class_budget`] seam the mint
+/// loop consumes (`class_created = 0` — nothing minted yet when the
+/// window is cut), so the window's denomination and the mint's
+/// refusal law cannot drift. `masked` is the pre-sim mask snapshot
+/// (the scheduler's acked view ∪ marks already buffered at tick
+/// start) — a conservative SUBSET of the mask `cover_deficit` later
+/// consumes (this tick's fresh vanish marks land after the sim), so
+/// the skip stays sound: it can only under-skip, never deny a
+/// mintable head.
+pub fn window_mintability(
+    all_cells: &[Cell],
+    masked: &HashSet<Cell>,
+    live: &[super::ffd::LiveNode],
+    global_remaining: u32,
+    fleet_cap_for: impl Fn(&str) -> Option<u32>,
+) -> super::ffd::WindowMintability {
+    use std::collections::HashMap;
+    // Per-class (configured cells, masked cells) — a class is
+    // fully-masked iff every configured cell of it is masked.
+    let mut cells_of: HashMap<&str, (u32, u32)> = HashMap::new();
+    for c in all_cells {
+        let e = cells_of.entry(c.0.as_str()).or_default();
+        e.0 += 1;
+        if masked.contains(c) {
+            e.1 += 1;
+        }
+    }
+    let fully_masked: HashSet<String> = cells_of
+        .iter()
+        .filter(|(_, (total, m))| total == m && *total > 0)
+        .map(|(h, _)| (*h).to_owned())
+        .collect();
+    let all_known_masked = !all_cells.is_empty() && all_cells.iter().all(|c| masked.contains(c));
+    let class_budget_by: HashMap<String, u32> = cells_of
+        .keys()
+        .map(|h| {
+            (
+                (*h).to_owned(),
+                class_budget(global_remaining, fleet_cap_for(h), live, h, 0),
+            )
+        })
+        .collect();
+    let live_free_cores: u64 = live
+        .iter()
+        .filter(|n| n.cell.is_some() && !n.terminating())
+        .map(|n| u64::from(n.free().0))
+        .sum();
+    super::ffd::WindowMintability {
+        fully_masked,
+        class_budget: class_budget_by,
+        global_budget: global_remaining,
+        live_free_cores,
+        all_known_masked,
+    }
+}
+
 /// 3-axis `⌈Σ/max⌉` lower bound on `n` — the fewest claims such that
 /// no per-claim request exceeds `max_node_*`. NOT a packing guarantee
 /// (bin-packing's `Σ/cap` is a lower bound only); [`sizing`] iterates

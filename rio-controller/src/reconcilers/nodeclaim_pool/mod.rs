@@ -1558,12 +1558,27 @@ impl NodeClaimPoolReconciler {
             .filter(|n| n.cell.is_some() && !n.terminating())
             .map(|n| u64::from(n.free().0))
             .sum();
-        let budget_remaining_cores = u64::from(
-            self.cfg
-                .max_fleet_cores
-                .saturating_sub(live.iter().map(|n| n.allocatable.0).sum()),
-        );
+        let global_remaining_cores = self
+            .cfg
+            .max_fleet_cores
+            .saturating_sub(live.iter().map(|n| n.allocatable.0).sum());
+        let budget_remaining_cores = u64::from(global_remaining_cores);
         let window_cores = ffd::sim_window_cores(live_free_cores, budget_remaining_cores);
+        // merged_bug_053: the mask is decoded ONCE per tick, here at
+        // its earliest consumer (the window's mintability view); the
+        // post-reap mask extension below re-reads the evidence buffer
+        // so cover_deficit additionally sees THIS tick's fresh vanish
+        // marks (the window's snapshot is the conservative pre-sim
+        // subset — it can only under-skip).
+        let mut masked: HashSet<Cell> = Self::decode_mask_entries(&intents.ice_masked_cells);
+        masked.extend(self.pending_evidence.ice_cells().cloned());
+        let mintability = cover::window_mintability(
+            &self.cfg.all_cells(&self.hw_config),
+            &masked,
+            &live,
+            global_remaining_cores,
+            |h| self.hw_config.fleet_cap_for(h),
+        );
         let sim = ffd::simulate_windowed(
             &intents.intents,
             &live,
@@ -1577,6 +1592,7 @@ impl NodeClaimPoolReconciler {
             self.cfg.fuse_cache_bytes,
             window_cores,
             self.tick_counter,
+            &mintability,
             |h, a, f| {
                 self.hw_config.matches_arch(h, a)
                     && rio_common::k8s::features_compatible(f, &self.hw_config.provides_for(h))
@@ -1773,17 +1789,21 @@ impl NodeClaimPoolReconciler {
         // received must still keep cover_deficit out of the cell —
         // pre-fix only the local tick's cells masked, so the tick
         // after a failed Ack re-minted into a cell that just ICE'd.
-        // bug_050: wire entries are decoded ONCE at this seam with a
-        // LOUD per-entry refusal (warn + counter); local cells extend
-        // TYPED -- no string round-trip, so codec drift cannot poison
-        // the local lane (a compile-level close). Residual (disclosed,
-        // also in the counter HELP): a refused entry's cell stays
-        // unmaskable this tick -- bounded by per-cell maxFleetCores
-        // caps and ICE re-marking; the rejected fail-closed
-        // alternative (skip the tick on any undecodable entry, the
-        // `global_ceilings` precedent) would let ONE skewed string
-        // halt all provisioning indefinitely.
-        let mut masked: HashSet<Cell> = Self::decode_mask_entries(&intents.ice_masked_cells);
+        // bug_050: wire entries are decoded ONCE per tick with a
+        // LOUD per-entry refusal (warn + counter) — the decode now
+        // runs at the pre-sim window-view seam above (merged_bug_053:
+        // one decode, two consumers, so the refusal counters stay
+        // count-exact); local cells extend TYPED -- no string
+        // round-trip, so codec drift cannot poison the local lane (a
+        // compile-level close). Residual (disclosed, also in the
+        // counter HELP): a refused entry's cell stays unmaskable this
+        // tick -- bounded by per-cell maxFleetCores caps and ICE
+        // re-marking; the rejected fail-closed alternative (skip the
+        // tick on any undecodable entry, the `global_ceilings`
+        // precedent) would let ONE skewed string halt all
+        // provisioning indefinitely. The re-extend below picks up
+        // THIS tick's fresh vanish marks buffered since the pre-sim
+        // snapshot.
         masked.extend(self.pending_evidence.ice_cells().cloned());
 
         let cover = self

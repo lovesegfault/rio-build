@@ -295,6 +295,93 @@ pub type Placement = (SpawnIntent, String, bool);
 /// deficit-equivalence witness ever needs more headroom.
 pub const SIM_WINDOW_SLACK: u64 = 2;
 
+/// merged_bug_053: the window's MINTABILITY view — window admission is
+/// denominated in the quantity downstream minting evaluates (mask ×
+/// per-class budget × live free capacity), not in cores alone, so
+/// [`admit_window`] can classify PROVABLY-unmintable bucket heads out
+/// of window accounting exactly as the cores>window skip does (they
+/// defer typed, re-seen when capacity grows, and the bucket
+/// CONTINUES). Pre-fix a head with `class budget < cores ≤ window`
+/// admitted, blocked every sibling bucket on its rotation-first
+/// ticks, and minted zero — net-zero ticks at 1/K frequency,
+/// persistent under the cores-desc sort.
+///
+/// Constructed by `cover::window_mintability` (the
+/// `cover::class_budget` seam — the SAME budget law the mint
+/// consumes, evaluated at tick start with zero created cores; the
+/// mask snapshot is the pre-sim subset, conservative by
+/// construction). The skip is sound-conservative: it never classifies
+/// out a head that could place OR mint this tick.
+pub struct WindowMintability {
+    /// Classes whose EVERY configured cell is ICE-masked
+    /// (mint-impossible this tick).
+    pub fully_masked: HashSet<String>,
+    /// Per-known-class mint budget (`cover::class_budget` at tick
+    /// start, `class_created = 0`).
+    pub class_budget: HashMap<String, u32>,
+    /// The global remaining fleet budget — the bound for hw-agnostic
+    /// heads and for declared classes without a per-class cap row.
+    pub global_budget: u32,
+    /// Σ free cores over live placeable (cell-bearing,
+    /// non-terminating) nodes — the placement bound: a head above it
+    /// cannot place anywhere regardless of class.
+    pub live_free_cores: u64,
+    /// Every known cell masked — the hw-agnostic all-masked arm.
+    pub all_known_masked: bool,
+}
+
+impl WindowMintability {
+    /// The PERMISSIVE view: skips nothing. Test-only — unit harnesses
+    /// exercising window mechanics other than mintability, and the
+    /// W11-AE negative control (the permissive view IS the pre-fix
+    /// window). Production always constructs through
+    /// `cover::window_mintability`.
+    #[cfg(test)]
+    #[must_use]
+    pub fn permissive() -> Self {
+        Self {
+            fully_masked: HashSet::new(),
+            class_budget: HashMap::new(),
+            global_budget: u32::MAX,
+            live_free_cores: u64::MAX,
+            all_known_masked: false,
+        }
+    }
+
+    /// PROVABLY unmintable this tick: the head can neither PLACE
+    /// (`cores > Σ live free` — placement onto live capacity ignores
+    /// ICE masks, so the placement conjunct rides BOTH arms) nor MINT
+    /// (every declared class fully masked, or `cores` above every
+    /// declared class's budget; hw-agnostic: all known cells masked,
+    /// or `cores > global budget`). Unknown declared classes default
+    /// to the global budget (permissive-leaning — the unknown-class
+    /// lane has its own typed outcome downstream and is not this
+    /// skip's population).
+    #[must_use]
+    pub fn head_unmintable(&self, i: &SpawnIntent) -> bool {
+        let cores = u64::from(i.cores);
+        if cores <= self.live_free_cores {
+            return false; // placeable on live capacity — never skip.
+        }
+        if i.hw_class_names.is_empty() {
+            self.all_known_masked || cores > u64::from(self.global_budget)
+        } else {
+            let budget_of = |h: &String| {
+                u64::from(
+                    self.class_budget
+                        .get(h.as_str())
+                        .copied()
+                        .unwrap_or(self.global_budget),
+                )
+            };
+            i.hw_class_names
+                .iter()
+                .all(|h| self.fully_masked.contains(h.as_str()))
+                || i.hw_class_names.iter().all(|h| cores > budget_of(h))
+        }
+    }
+}
+
 /// Yield quantum for [`simulate_windowed`]: the walk yields to the
 /// runtime every `FFD_YIELD_QUANTUM` simulated intents so a large tick
 /// cannot starve the reconciler's executor (Banner A-1 on the
@@ -341,10 +428,22 @@ pub struct SimOutcome {
 /// derived from FLEET CAPACITY in the budget-brake's own terms:
 /// `(live free + budget remaining) × slack`. Window ≥ the mint law's
 /// per-tick consumption (`ctrl.nodeclaim.mint-deficit-proportional`'s
-/// budget term is ≤ `budget_remaining_cores`), so supply is never
-/// window-starved: every intent the brake could mint for this tick is
-/// inside the window, and the windowed unplaced residual saturates the
-/// budget whenever the full set would.
+/// budget term is ≤ `budget_remaining_cores`), so every intent the
+/// brake could mint for this tick is inside the window.
+///
+/// merged_bug_053 re-derivation of the old "supply is never
+/// window-starved" claim: the SIZE of the window is necessary but not
+/// sufficient — window SHARE is also consumed, and a head the mint
+/// law will provably refuse (mask × per-class budget × live free,
+/// the [`WindowMintability`] view) used to consume a whole rotation
+/// while minting nothing, starving mintable siblings at 1/K
+/// frequency. The window-starvation guarantee therefore holds at the
+/// PAIR: this capacity-derived size PLUS [`admit_window`]'s
+/// mintability skip — the windowed unplaced residual saturates the
+/// budget whenever the full set would, because everything occupying
+/// the window is either placeable or mintable
+/// (`window_admits_mintable_siblings_every_tick` is the
+/// multi-class mint-comparison witness).
 // r[impl ctrl.nodeclaim.sim-window]
 pub fn sim_window_cores(live_free_cores: u64, budget_remaining_cores: u64) -> u64 {
     live_free_cores
@@ -383,6 +482,19 @@ pub fn sim_window_cores(live_free_cores: u64, budget_remaining_cores: u64) -> u6
 ///   that would fit a fresh window but not the remaining budget still
 ///   blocks its bucket (priority order within a bucket is never
 ///   skipped past).
+///
+/// Bughunt-11 merged_bug_053 amendment — **provably-unmintable head
+/// skip** (the same defer-without-blocking arm): a head that fits the
+/// window by cores but that downstream minting will PROVABLY refuse
+/// this tick ([`WindowMintability::head_unmintable`] — cannot place on
+/// live capacity AND cannot mint under mask × per-class budget)
+/// classifies out of window accounting exactly like the cores>window
+/// skip. Pre-fix such a head admitted, consumed the rotation-first
+/// window share, blocked every sibling bucket, and minted zero —
+/// net-zero ticks at 1/K frequency. The skip engages only under
+/// window contention (the fast path admits everything when total
+/// demand fits — no share to starve); skipped heads defer typed into
+/// the remainder, re-seen when budget/mask/live capacity changes.
 // r[impl ctrl.nodeclaim.sim-window]
 pub fn admit_window(
     sorted: Vec<SpawnIntent>,
@@ -390,6 +502,7 @@ pub fn admit_window(
     job_held: &HashSet<String>,
     window_cores: u64,
     tick: u64,
+    mint: &WindowMintability,
 ) -> (Vec<SpawnIntent>, Vec<SpawnIntent>) {
     let exempt =
         |i: &SpawnIntent| bound.contains_key(&i.intent_id) || job_held.contains(&i.intent_id);
@@ -432,11 +545,12 @@ pub fn admit_window(
             }
             let q = buckets.get_mut(key).expect("bucket exists");
             // Can-never-fit heads defer without blocking the bucket
-            // (they go to the remainder via non-admission).
-            while q
-                .front()
-                .is_some_and(|&idx| u64::from(sorted[idx].cores) > window_cores)
-            {
+            // (they go to the remainder via non-admission) — both the
+            // cores>window form and the merged_bug_053
+            // provably-unmintable form (mask × budget × live free).
+            while q.front().is_some_and(|&idx| {
+                u64::from(sorted[idx].cores) > window_cores || mint.head_unmintable(&sorted[idx])
+            }) {
                 q.pop_front();
                 progressed = true;
             }
@@ -575,11 +689,12 @@ pub async fn simulate_windowed(
     fuse_cache_bytes: u64,
     window_cores: u64,
     tick: u64,
+    mint: &WindowMintability,
     hw_admits: impl Fn(&str, Option<&str>, &[String]) -> bool,
 ) -> SimOutcome {
     let mut sorted: Vec<SpawnIntent> = intents.to_vec();
     sort_ffd(&mut sorted);
-    let (admitted, deferred) = admit_window(sorted, bound, job_held, window_cores, tick);
+    let (admitted, deferred) = admit_window(sorted, bound, job_held, window_cores, tick, mint);
     let rem = SimRemainder {
         intents: deferred.len(),
         cores: deferred.iter().map(|i| u64::from(i.cores)).sum(),
@@ -2158,6 +2273,7 @@ pub(crate) mod tests {
             0,
             u64::MAX, // capacity-unbounded: this test pins yielding, not the window
             0,
+            &WindowMintability::permissive(),
             any_admit,
         )
         .await;
@@ -2239,6 +2355,7 @@ pub(crate) mod tests {
                 0,
                 u64::MAX,
                 0,
+                &WindowMintability::permissive(),
                 any_admit,
             )
             .await;
@@ -2292,8 +2409,14 @@ pub(crate) mod tests {
         for tick in 0..4u64 {
             let mut sorted = intents.clone();
             sort_ffd(&mut sorted);
-            let (admitted, remainder) =
-                admit_window(sorted, &HashMap::new(), &HashSet::new(), 32, tick);
+            let (admitted, remainder) = admit_window(
+                sorted,
+                &HashMap::new(),
+                &HashSet::new(),
+                32,
+                tick,
+                &WindowMintability::permissive(),
+            );
             let a_adm = admitted
                 .iter()
                 .filter(|i| i.intent_id.starts_with("a-s"))
@@ -2346,6 +2469,7 @@ pub(crate) mod tests {
             0,
             8,
             0,
+            &WindowMintability::permissive(),
             |_, _, _| true,
         )
         .await;
@@ -2392,7 +2516,14 @@ pub(crate) mod tests {
         let bound: HashMap<String, String> = [("zbound".to_string(), "node-n".to_string())].into();
         let mut sorted = intents.clone();
         sort_ffd(&mut sorted);
-        let (admitted, remainder) = admit_window(sorted, &bound, &HashSet::new(), 32, 0);
+        let (admitted, remainder) = admit_window(
+            sorted,
+            &bound,
+            &HashSet::new(),
+            32,
+            0,
+            &WindowMintability::permissive(),
+        );
         let a_adm = admitted
             .iter()
             .filter(|i| i.intent_id.starts_with('a'))
@@ -2490,6 +2621,7 @@ pub(crate) mod tests {
             0,
             window,
             0,
+            &WindowMintability::permissive(),
             any_admit,
         ));
         assert!(
@@ -2501,6 +2633,147 @@ pub(crate) mod tests {
             windowed_mint, full_mint,
             "the windowed deficit mints exactly what the full set would \
              (window ≥ the mint law's per-tick consumption)"
+        );
+    }
+
+    // r[verify ctrl.nodeclaim.sim-window]
+    /// **W11-AE (merged_bug_053)** — *proposition: a provably-
+    /// unmintable head never consumes a window rotation — mintable
+    /// sibling cores are admitted AND MINTED every tick; population:
+    /// the mask/budget/geometry product on a multi-class window under
+    /// contention, BOTH rotation phases (the head's rotation-first
+    /// tick and the sibling-first tick), with the mint comparison run
+    /// through the production `assign_to_cells` + `sizing` pipeline
+    /// at each class's own budget.*
+    ///
+    /// The pre-fix shape is pinned as a PERMANENT NEGATIVE CONTROL
+    /// (the falsify twin): [`WindowMintability::permissive`] IS the
+    /// pre-fix window (no mintability axis), and under it the 24c
+    /// head — whose class budget (8) the mint law will provably
+    /// refuse (`budget < chunk`, cover.rs) — admits on its
+    /// rotation-first tick, eats the 31-core window, blocks the
+    /// sibling bucket entirely, and mints zero: the NET-ZERO tick at
+    /// 1/K frequency, persistent under the cores-desc sort. The
+    /// sizing doc's old "supply is never window-starved" claim was
+    /// quantitatively false on exactly this cell;
+    /// `window_never_starves_supply` is single-class and
+    /// `window_admits_capacity_fairly_and_types_remainder` never ran
+    /// the mint comparison — this is the missing witness.
+    #[test]
+    fn window_admits_mintable_siblings_every_tick() {
+        use super::super::cover;
+        // Two classes; no live nodes (live free = 0); window 31
+        // forces contention (Σ unbound = 40 > 31).
+        // "hi": one 24c head, class budget 8 — provably unmintable
+        //       (24 > budget 8 AND 24 > live free 0).
+        // "lo": two 8c intents, class budget 64 — mintable.
+        let intents = vec![
+            intent("h0", 24, GI, &[("hi", CapacityType::Spot)]),
+            intent("l0", 8, GI, &[("lo", CapacityType::Spot)]),
+            intent("l1", 8, GI, &[("lo", CapacityType::Spot)]),
+        ];
+        let view = WindowMintability {
+            fully_masked: HashSet::new(),
+            class_budget: [("hi".to_string(), 8u32), ("lo".to_string(), 64u32)].into(),
+            global_budget: 64,
+            live_free_cores: 0,
+            all_known_masked: false,
+        };
+        let sketches = CellSketches::default();
+        // The MINT comparison: the admitted set through the
+        // production assignment + sizing pipeline, each class at its
+        // own budget — cores actually claimable this tick.
+        let mint_cores = |set: &[SpawnIntent]| -> u32 {
+            let none = HashSet::new();
+            let known: HashSet<Cell> = [
+                Cell("hi".into(), CapacityType::Spot),
+                Cell("lo".into(), CapacityType::Spot),
+            ]
+            .into();
+            let (by_cell, _) =
+                cover::assign_to_cells(set, &sketches, &none, &known, cover::cell_rank, |_, _| {
+                    None
+                });
+            by_cell
+                .iter()
+                .map(|(cell, u)| {
+                    let budget = if cell.0 == "hi" { 8 } else { 64 };
+                    cover::sizing(
+                        cell,
+                        u,
+                        &cover::SizingCfg {
+                            max_node_cores: 64,
+                            max_node_mem: 256 * GI,
+                            max_node_disk: 450 * GI,
+                            budget,
+                            fuse_cache_bytes: 0,
+                        },
+                    )
+                    .claims
+                    .iter()
+                    .map(|c| c.0)
+                    .sum::<u32>()
+                })
+                .sum()
+        };
+        let lo_cores = |set: &[SpawnIntent]| -> u32 {
+            set.iter()
+                .filter(|i| i.hw_class_names.first().map(String::as_str) == Some("lo"))
+                .map(|i| i.cores)
+                .sum()
+        };
+        // BOTH rotation phases (K = 2 buckets): the head-first tick
+        // (tick 0 — BTreeMap key order ["hi", "lo"], offset 0) and
+        // the sibling-first tick.
+        for tick in 0..2 {
+            let mut sorted = intents.clone();
+            sort_ffd(&mut sorted);
+            let (admitted, deferred) =
+                admit_window(sorted, &HashMap::new(), &HashSet::new(), 31, tick, &view);
+            assert_eq!(
+                lo_cores(&admitted),
+                16,
+                "tick {tick}: mintable sibling cores admitted in full — an \
+                 unmintable head consumed the rotation"
+            );
+            assert!(
+                deferred.iter().any(|i| i.intent_id == "h0"),
+                "tick {tick}: the unmintable head defers typed (re-seen when \
+                 budget/mask/live capacity changes), never silently dropped"
+            );
+            assert_eq!(
+                mint_cores(&admitted),
+                16,
+                "tick {tick}: the admitted set MINTS the sibling cores \
+                 (assign+sizing at per-class budgets)"
+            );
+        }
+        // The pinned pre-fix shape (the falsify twin — dies through
+        // ITS conjunct: the permissive view has no mintability axis,
+        // exactly the pre-fix window).
+        let mut sorted = intents.clone();
+        sort_ffd(&mut sorted);
+        let (admitted, _) = admit_window(
+            sorted,
+            &HashMap::new(),
+            &HashSet::new(),
+            31,
+            0,
+            &WindowMintability::permissive(),
+        );
+        assert_eq!(
+            lo_cores(&admitted),
+            0,
+            "negative control: under the pre-fix (permissive) window the \
+             head's rotation-first tick starves the sibling bucket"
+        );
+        assert_eq!(
+            mint_cores(&admitted),
+            0,
+            "negative control: the net-zero tick — zero cores minted \
+             across ALL classes while 16 mintable sibling cores sat \
+             deferred behind a provably-unmintable head (1/K frequency, \
+             persistent under the cores-desc sort)"
         );
     }
 }
