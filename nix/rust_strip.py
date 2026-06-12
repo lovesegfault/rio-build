@@ -980,13 +980,36 @@ def extract_canonical(lint_rs_text: str) -> str:
     )
 
 
+# ((vvvvv)) — THE STAGING-HAZARD MARKER, definition site (WO-S8-2,
+# merged_bug_008; the triage refutation is binding: the marker is
+# INTENTIONAL, never a paste artifact — do not delete occurrences).
+#
+# (vvvvv) is the wave-log hazard letter for the staging discipline:
+# a nix check validating the EXISTENCE or content of repo paths must
+# STAGE the surface it quantifies over — a check whose fileset omits
+# the surface goes green vacuously while resolving locally (the
+# round-8 wave-close incident; full text at the wave-log anchor).
+# A comment or diagnostic tagged `((vvvvv))` marks a refusal arm or
+# fileset whose verdict depends on staging completeness: the arm
+# fires exactly when the staged tree lacks a surface the check needs
+# (the occurrences across nix/misc-checks.nix `Full-tree staging`
+# fileset notes and scanner refusal arms, incl. the cfg-pruner-parity
+# check's own, are this cross-reference). Grep for `(vvvvv)` to find
+# every staged-surface dependency; this block is the greppable
+# definition the idiom previously lacked.
 def parity_scan(root, lint_rel="xtask/src/lint.rs"):
     """The cfg-pruner parity gate (WO-S8-2): over every cfg attribute
     in rio-*/src + xtask/src, the flat spelling table (axis 2) and the
     ported canonical predicate (axis 1) must agree, and no attribute
     may be outside the table (the fourth-spelling tripwire); plus the
-    canonical-source pin must match xtask's live text. Returns a
-    failure list."""
+    canonical-source pin must match xtask's live text.
+
+    ONE result shape (merged_bug_008): EVERY arm — the early refusal
+    arms included — returns `(fails, n_attrs)`; the refusal arms
+    previously returned a bare 1-element list and the caller's
+    2-tuple unpack died as ValueError exactly when the staging
+    regression the diagnostics guard against occurred (the crafted
+    remediation text was unreachable)."""
     import pathlib
 
     root = pathlib.Path(root)
@@ -994,10 +1017,10 @@ def parity_scan(root, lint_rel="xtask/src/lint.rs"):
     pin_path = root / CANONICAL_PIN
     lint_path = root / lint_rel
     if not lint_path.is_file():
-        return [f"{lint_rel} missing — the canonical surface is not staged ((vvvvv))"]
+        return [f"{lint_rel} missing — the canonical surface is not staged ((vvvvv))"], 0
     live_canonical = extract_canonical(lint_path.read_text())
     if not pin_path.is_file():
-        return [f"{CANONICAL_PIN} missing — mint it: rust_strip.py --extract-canonical {lint_rel}"]
+        return [f"{CANONICAL_PIN} missing — mint it: rust_strip.py --extract-canonical {lint_rel}"], 0
     if pin_path.read_text().strip() != live_canonical:
         fails.append(
             f"{lint_rel}: cfg_pred_gates_test drifted from {CANONICAL_PIN} — "
@@ -1434,6 +1457,49 @@ def selftest() -> str | None:
     doctored = " ".join("fn cfg_pred_gates_test(ts: T) -> bool { DOCTORED }".split())
     if pinned == doctored:
         return "W11-BU (b): the pin comparator cannot see a doctored canonical"
+    # --- WO-S8-2 (merged_bug_008, W12-AZ): every parity_scan arm
+    # returns the caller's (fails, n_attrs) shape, and every refusal
+    # arm is selftest-driven THROUGH that unpack — pre-fix the two
+    # early arms returned a bare list and this exact unpack died as
+    # `ValueError: not enough values to unpack (expected 2, got 1)`,
+    # losing the crafted staging diagnostics at the moment they were
+    # needed (selftest had zero parity_scan coverage).
+    import pathlib as _pl
+    import tempfile as _tf
+
+    with _tf.TemporaryDirectory() as _td:
+        _root = _pl.Path(_td)
+        # Arm 1: the canonical surface not staged ((vvvvv)).
+        fails, n = parity_scan(_root)
+        if n != 0 or len(fails) != 1 or "not staged ((vvvvv))" not in fails[0]:
+            return f"W12-AZ (missing-lint arm): {fails!r}, {n}"
+        # Arm 2: the pin not minted.
+        (_root / "xtask" / "src").mkdir(parents=True)
+        (_root / "xtask" / "src" / "lint.rs").write_text(
+            "fn cfg_pred_gates_test(p: &str) -> bool { false }\n"
+        )
+        fails, n = parity_scan(_root)
+        if n != 0 or len(fails) != 1 or "--extract-canonical" not in fails[0]:
+            return f"W12-AZ (missing-pin arm): {fails!r}, {n}"
+        # Arm 3: canonical drift — the pin disagrees with the live fn;
+        # the scan still runs and counts attributes (one staged here).
+        (_root / CANONICAL_PIN).parent.mkdir(parents=True, exist_ok=True)
+        (_root / CANONICAL_PIN).write_text("fn cfg_pred_gates_test(OLD) { }\n")
+        (_root / "rio-x" / "src").mkdir(parents=True)
+        (_root / "rio-x" / "src" / "lib.rs").write_text(
+            "#[cfg(test)]\nmod t { }\nfn keep() {}\n"
+        )
+        fails, n = parity_scan(_root)
+        if n != 1 or len(fails) != 1 or "drifted" not in fails[0]:
+            return f"W12-AZ (pin-drift arm): {fails!r}, {n}"
+        # Arm 4: the vacuous-population refusal (zero cfg attributes).
+        (_root / CANONICAL_PIN).write_text(
+            " ".join((_root / "xtask" / "src" / "lint.rs").read_text().split()) + "\n"
+        )
+        (_root / "rio-x" / "src" / "lib.rs").write_text("fn keep() {}\n")
+        fails, n = parity_scan(_root)
+        if n != 0 or len(fails) != 1 or "vacuous" not in fails[0]:
+            return f"W12-AZ (vacuous-population arm): {fails!r}, {n}"
     return None
 
 
