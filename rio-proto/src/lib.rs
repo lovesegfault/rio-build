@@ -307,6 +307,18 @@ pub mod drv {
     tonic::include_proto!("rio.drv.v1");
 }
 
+/// Worker-channel frames for the `rio build` coordinator ↔ eval-parent
+/// IPC (ADR-024). `CoordinatorFrame` flows downstream (work items, IFD
+/// completions, ack feedback, shutdown); `WorkerFrame` flows upstream
+/// (skeleton/result batches, IFD requests, recycle notices, errors).
+/// Length-delimited over a socketpair — the framing lives in
+/// rio-build-cli's `framing` module, not tonic. The payloads reuse
+/// [`types::DerivationNode`] / [`types::DrvBlob`] so worker-reported
+/// skeletons reach `SubmitBuild` / `PutDrvBlobs` without re-encoding.
+pub mod evaljob {
+    tonic::include_proto!("rio.evaljob");
+}
+
 /// Binary `FileDescriptorSet` covering every `.proto` file compiled by
 /// `build.rs` (all six services + shared `rio.types`, with transitive
 /// imports — `prost_build` always passes `--include_imports`).

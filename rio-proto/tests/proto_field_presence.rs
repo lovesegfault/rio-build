@@ -160,6 +160,7 @@ field_snapshot_tests! {
     castore_fields_frozen,     regenerate_castore     => "castore";
     dag_fields_frozen,         regenerate_dag         => "dag";
     derivation_fields_frozen,  regenerate_derivation  => "derivation";
+    evaljob_fields_frozen,     regenerate_evaljob     => "evaljob";
     scheduler_fields_frozen,   regenerate_scheduler   => "scheduler";
     store_fields_frozen,       regenerate_store       => "store";
     types_fields_frozen,       regenerate_types       => "types";
