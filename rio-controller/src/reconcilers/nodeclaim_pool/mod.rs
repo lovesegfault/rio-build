@@ -875,10 +875,15 @@ pub struct NodeClaimPoolReconciler {
     /// merged_bug_007: scheduler-bound evidence produced by kube-only
     /// observation on ticks that cannot ship it (⊥ pre-threshold +
     /// consolidate-only). The producing edges are CONSUME-ONCE
-    /// (`recorded_boot` marks the node; the edge never re-fires), so
-    /// `#[must_use]` + this buffer make the discard unrepresentable:
-    /// every `kube_only_observations` return is either drained into a
-    /// healthy tick's Ack or merged here. Polarity: SUPPRESS — cleared
+    /// (`recorded_boot` marks the node; the edge never re-fires), and
+    /// the enforcement is STRUCTURAL (bug_127): a non-empty
+    /// `TickEvidence` reaching `Drop` panics under debug_assertions
+    /// (the evidence.rs guard — `#[must_use]` alone cannot enforce
+    /// this: `let _ =` silences it and a bound-then-dropped value
+    /// never lints), so every `kube_only_observations` return is
+    /// either drained into a healthy tick's Ack or merged here, or
+    /// the next dev/test run names the lost planes. Polarity:
+    /// SUPPRESS — cleared
     /// on the lease-acquire edge (a stale buffered ICE-clear from a
     /// previous tenure could mask a genuinely ICE'd cell).
     pending_evidence: PendingSchedulerEvidence,

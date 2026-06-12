@@ -53,13 +53,21 @@ use super::sketch::Cell;
 /// directly at the production site via
 /// [`PendingSchedulerEvidence::buffer_marks`] (consume-once
 /// producers; bug_082). The producer edges here are consume-once
-/// too, so a value of this type must never be dropped —
-/// `#[must_use]` turns a `let _ =` discard into a deny-warnings
-/// error; ticks that cannot ship it merge it into the reconciler's
+/// too, so a value of this type must never be dropped un-merged.
+/// bug_127: the REAL mechanisms, stated honestly — `#[must_use]`
+/// warns on an UNUSED result only (`let _ =` is exactly the idiom
+/// that silences it, and a bound-then-dropped value never lints), so
+/// the machine enforcement is the debug-assertions [`Drop`] guard
+/// below: a non-empty `TickEvidence` reaching `Drop` panics in every
+/// dev/test build, naming the lost planes. The retired doc claimed
+/// the attribute made the discard a deny-warnings error — folklore
+/// that demoted the consume-once law to review enforcement; claims
+/// about compiler semantics are themselves bind-or-demote surfaces.
+/// Ticks that cannot ship the value merge it into the reconciler's
 /// buffer instead. Epochs are NOT minted here: they identify buffer
 /// events (the unit of redelivery), so
 /// [`PendingSchedulerEvidence::merge`] mints at buffer entry.
-#[must_use = "kube-only evidence is consume-once: merge it into pending_evidence (shipped from the buffer, cleared only on Ack-Ok)"]
+#[must_use = "kube-only evidence is consume-once: merge it into pending_evidence (shipped from the buffer, cleared only on Ack-Ok); a non-empty value reaching Drop panics under debug_assertions (bug_127)"]
 #[derive(Debug, Default)]
 pub(crate) struct TickEvidence {
     /// Cells whose NodeClaim reached `Registered=True` (the ICE-clear
@@ -85,6 +93,48 @@ impl TickEvidence {
         types: impl IntoIterator<Item = rio_proto::types::ObservedInstanceType>,
     ) {
         self.observed_types.extend(types);
+    }
+
+    /// Consume the tick's planes for the merge (bug_127): takes every
+    /// field and leaves `self` EMPTY, so the [`Drop`] guard sees a
+    /// consumed value. The by-ref destructure is the compile pin a
+    /// `Drop` type cannot express by-value: a plane added to
+    /// [`TickEvidence`] without a take here does not compile.
+    fn into_parts(mut self) -> (BTreeSet<Cell>, Vec<rio_proto::types::ObservedInstanceType>) {
+        let Self {
+            registered_cells,
+            observed_types,
+        } = &mut self;
+        (
+            std::mem::take(registered_cells),
+            std::mem::take(observed_types),
+        )
+    }
+}
+
+/// bug_127: the consume-once law, MACHINE-ENFORCED — a non-empty
+/// `TickEvidence` reaching `Drop` is a producer that observed
+/// evidence and lost it (the edges never re-fire), and panics in
+/// every debug/test build naming the lost planes. `#[must_use]`
+/// cannot do this (`let _ =` silences it; a bound-then-dropped value
+/// never lints); review cannot do it reliably. Release builds keep
+/// the warn so a production discard is loud, never fatal.
+impl Drop for TickEvidence {
+    fn drop(&mut self) {
+        if !self.registered_cells.is_empty() || !self.observed_types.is_empty() {
+            #[cfg(debug_assertions)]
+            panic!(
+                "TickEvidence dropped un-merged: {} clear(s), {} observed type(s) lost                  (consume-once: merge into pending_evidence — bug_127)",
+                self.registered_cells.len(),
+                self.observed_types.len(),
+            );
+            #[cfg(not(debug_assertions))]
+            tracing::warn!(
+                clears = self.registered_cells.len(),
+                observed = self.observed_types.len(),
+                "TickEvidence dropped un-merged; kube-only evidence lost this tick                  (consume-once violation — bug_127)"
+            );
+        }
     }
 }
 
@@ -292,13 +342,13 @@ impl PendingSchedulerEvidence {
     /// chronology for every real call site — and the ordered per-cell
     /// law keeps BOTH polarities when the order is clear-then-mark,
     /// so no information is lost either way. The exhaustive
-    /// destructure consumes every tick plane: a plane added to
-    /// [`TickEvidence`] without a merge arm does not compile.
+    /// by-ref destructure inside [`TickEvidence::into_parts`]
+    /// consumes every tick plane: a plane added to
+    /// [`TickEvidence`] without a take there does not compile
+    /// (bug_127: `Drop` types cannot destructure by value, so the
+    /// pin moved into the consuming constructor).
     pub(crate) fn merge(&mut self, tick: TickEvidence) {
-        let TickEvidence {
-            registered_cells,
-            observed_types,
-        } = tick;
+        let (registered_cells, observed_types) = tick.into_parts();
         for c in registered_cells {
             self.buffer_clear_event(c);
         }
@@ -510,5 +560,33 @@ mod tests {
             "same-tick clear-then-mark ships both planes"
         );
         assert!(p.clear.unwrap() < p.mark.unwrap());
+    }
+    /// W11-BP (bug_127): the strawman non-merging producer — a tick
+    /// that observed evidence and dropped it — trips the debug Drop
+    /// guard. This is the machine enforcement the retired folklore
+    /// doc ascribed to `#[must_use]` (`let _ =` silences that
+    /// attribute; a bound-then-dropped value never lints at all).
+    /// Stated per R16 at its real tier: debug-guard (every dev/test
+    /// build), not compile.
+    #[test]
+    #[should_panic(expected = "TickEvidence dropped un-merged")]
+    fn unmerged_tick_evidence_trips_the_drop_guard() {
+        let mut tick = TickEvidence::default();
+        tick.buffer_clears([cell()]);
+        // The silencing idiom the folklore claimed was an error:
+        let _ = tick;
+        // (the panic fires at the drop above)
+    }
+
+    /// W11-BP companion: the lawful paths stay silent — a merged tick
+    /// and an empty tick both drop clean.
+    #[test]
+    fn merged_and_empty_ticks_drop_clean() {
+        let mut pending = PendingSchedulerEvidence::default();
+        let mut tick = TickEvidence::default();
+        tick.buffer_clears([cell()]);
+        pending.merge(tick); // consumed: into_parts empties before drop
+        let empty = TickEvidence::default();
+        drop(empty); // nothing observed, nothing owed
     }
 }
