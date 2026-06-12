@@ -19936,6 +19936,10 @@
           "packageId": "blake3"
         },
         {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
           "name": "hex",
           "packageId": "hex"
         },
@@ -19944,8 +19948,20 @@
           "packageId": "libc"
         },
         {
+          "name": "prost",
+          "packageId": "prost"
+        },
+        {
           "name": "rio-nix",
           "packageId": "rio-nix"
+        },
+        {
+          "name": "rio-packstore",
+          "packageId": "rio-packstore"
+        },
+        {
+          "name": "rio-proto",
+          "packageId": "rio-proto"
         },
         {
           "name": "serde",

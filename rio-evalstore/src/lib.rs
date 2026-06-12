@@ -19,6 +19,7 @@
 //!   and refuses to proceed on mismatch, printing both paths.
 
 pub mod cas;
+pub mod dirblob;
 pub mod ffi;
 pub mod stats;
 pub mod store;
