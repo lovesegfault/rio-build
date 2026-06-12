@@ -184,7 +184,11 @@ pub fn describe_metrics() {
          census-derived lane (gc-drain-task|gc-orphan-scanner|\
          gc-collect-backstop|log-ttl-sweep|run_gc) or the demand-driven \
          claim-reap face; cause = held (active global hold) | \
-         consult_error (holds table unreadable; fail closed). Nonzero \
+         consult_error (holds table unreadable; fail closed) | \
+         mid_pass_stop (run_gc suspended at a batch boundary mid-pass: \
+         a hold landed or the clearance aged out between batches — \
+         committed batches stand, phase 3 never starts, the next run \
+         finishes). Nonzero \
          held counts during an incident freeze are the protocol WORKING; \
          sustained consult_error means PG trouble on a destructive \
          subsystem."

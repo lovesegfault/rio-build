@@ -120,7 +120,6 @@ docs/spec/components/store.typ	merge writes ONLY this table). On match, sweep MU
 docs/spec/components/store.typ	migration 103): an active global-scope hold suspends EVERY destructive
 docs/spec/components/store.typ	mutated ONLY by the success-witness commit of a fully-processed
 docs/spec/components/store.typ	passing to downstream ANY() statements. A single defensive retry on 40P01
-docs/spec/components/store.typ	population totality: the author-enumerated four-lane list this close first
 docs/spec/components/store.typ	reservation) bounds in-flight NAR bytes across ALL concurrent `PutPath` AND
 docs/spec/components/store.typ	row state it collects against can never disagree about an in-flight upload.
 docs/spec/components/store.typ	scan order feeding the sorted `= ANY` soft-delete and the outbox enqueue);
@@ -1907,7 +1906,6 @@ rio-store/src/logs/service.rs	/// One chunk cut, watchdog-bounded at one cut int
 rio-store/src/logs/service.rs	/// byte-cap rejection is accept()'s ONLY `Err` construction. The
 rio-store/src/logs/service.rs	/// never retransmits), so the tail of EVERY cap-crossing log was
 rio-store/src/logs/sessions.rs	/// Where is `exec_id`'s live ingest stream, if anywhere?
-rio-store/src/logs/sweep.rs	// its totality; the clearance param lands on the gc-plane sinks).
 rio-store/src/logs/sweep.rs	/// Executions per batch. Each batch is one indexed SELECT, two `= ANY`
 rio-store/src/logs/sweep.rs	/// grace exists so this reap can never race a heartbeat).
 rio-store/src/logs/sweep.rs	/// log artifacts ONLY — chunks, objects, stale session rows.

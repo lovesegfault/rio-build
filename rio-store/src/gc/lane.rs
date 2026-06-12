@@ -164,7 +164,7 @@ impl DestructiveLane {
 /// since bug_084/merged_bug_006 (the R32 form): at most one
 /// committed-transaction batch is mid-flight when a hold lands —
 /// that batch completes-or-aborts, and the next batch (not just the
-/// next tick) refuses, because EVERY multi-batch destructive body
+/// next tick) refuses, because EVERY multi-batch destructive body — quantifier: census(test: destructive_body_census) —
 /// re-authorizes at each batch boundary — the boundary consult mints
 /// a per-batch `BatchAuthority` the destructive sinks demand BY
 /// VALUE, so a batch outside an authorized boundary does not compile
@@ -1847,7 +1847,7 @@ async fn neighbor_sweep(pool: &PgPool) -> Result<(), sqlx::Error> {
     /// anything outside it REFUSES — a new table must classify, never
     /// silently pass):
     /// - VICTIM tables hold the evidence the gc-hold law protects —
-    ///   ANY delete over them is a sink regardless of predicate shape
+    ///   any delete over them is a sink regardless of predicate shape
     ///   (the path sweep deletes per-path by `= $1`, and those are
     ///   exactly the deletes the emergency stop must stop);
     /// - DUAL tables carry both owner-lifecycle and gc deleters
@@ -2400,11 +2400,11 @@ async fn neighbor_sweep(pool: &PgPool) -> Result<(), sqlx::Error> {
     /// (3) GRAMMAR-REFUSAL plant — a dynamic DELETE target the
     /// grammar cannot attribute ERRORS naming the site, never greens.
     /// Plus the empty-walk plant (census riders (a)): a vacuous
-    /// corpus refuses through the SAME walk path.
+    /// corpus refuses through the same walk path.
     #[test]
     fn body_census_plants() {
         // (1a) The rogue: an until-short committed DELETE loop, no
-        // authority anywhere on the path.
+        // authority present on the path.
         let rogue = r#"
 async fn rogue_reaper(pool: &PgPool) -> Result<(), sqlx::Error> {
     loop {
@@ -2510,7 +2510,7 @@ async fn dynamic_deleter(pool: &PgPool, table: &str) -> Result<(), sqlx::Error> 
             "the refusal names the evading site: {err:#?}"
         );
 
-        // (a) The empty-walk plant, through the SAME walk path.
+        // (a) The empty-walk plant, through the same walk path.
         let err = derive_destructive_bodies(&[])
             .expect_err("a vacuous walk must refuse (population non-vacuity)");
         assert!(

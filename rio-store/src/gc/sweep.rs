@@ -583,7 +583,7 @@ pub async fn sweep(
         // Retry-once-on-40P01 (defense-in-depth: the batch takes only
         // manifest-row and narinfo locks now, but PG can still 40P01
         // under index-page-split contention). The `?` propagates
-        // SweepAbort::Db on the second failure. The retry is the SAME
+        // SweepAbort::Db on the second failure. The retry is the same
         // batch re-executed (the deadlock aborted the whole tx, so
         // nothing committed) — it re-authorizes rather than re-spend
         // a consumed token: a hold landing between the attempt and

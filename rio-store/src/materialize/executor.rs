@@ -407,7 +407,7 @@ async fn execute_job_inner(
     // content disagreement (mirrors trust_refused one axis over).
     let mut content_mismatched = rio_evidence_kernel::outcome::GenStampedCells::new();
     // bug_140: the walked reference edges (parent -> children),
-    // recorded at EVERY encounter — not just first-enqueue — so
+    // recorded at every encounter — not just first-enqueue — so
     // closure diamonds keep all their rootage. The fold below is the
     // last point with rootage (the wire carries none: refs_missing is
     // bare non-emptiness BY DESIGN), so the fold owns the
@@ -609,7 +609,7 @@ async fn execute_job_inner(
                         // commit below — late ticks are zombies.
                         window_progress.retire(&path);
                         verified_tenants_by_path.insert(path.clone(), vt);
-                        // bug_140: rootage is recorded at EVERY edge
+                        // bug_140: rootage is recorded at every edge
                         // encounter (the enqueue below dedups; this
                         // must not — a diamond's second parent still
                         // roots the shared child).

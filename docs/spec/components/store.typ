@@ -1925,7 +1925,8 @@ sibling lanes kept deleting during the freeze --- and the held `run_gc`
 starving `last_live_cycle_at` GUARANTEED the backstop fired (merged_bug_050,
 HIGH). The lane census (`gc/lane.rs`, committed at
 `rio-store/tests/gensets/destructive-lane-census.txt`) is the load-bearing
-spawn-layer totality: the author-enumerated four-lane list this close first
+spawn-layer totality // quantifier: census(destructive_lane_census)
+--- the author-enumerated four-lane list this close first
 carried was the round-6 closure-set defect recurring inside a high close ---
 the gc-orphan-scanner (the fifth lane) hid from it; a sixth cannot hide from
 the family scan. The same defect then recurred one layer down (bug_084,
@@ -1935,7 +1936,8 @@ bodies --- run_gc's phase-2 path sweep and the log TTL sweep shipped
 unwired, so a global hold could not stop either mid-pass. The BODY census
 (`gc/lane.rs`, committed at
 `rio-store/tests/gensets/destructive-body-census.txt`) is the body-layer
-totality: it derives every destructive loop from the idiom and refuses any
+totality // quantifier: census(destructive_body_census)
+--- it derives every destructive loop from the idiom and refuses any
 member without the per-batch demand. Enforcement tiers, stated honestly
 (R24/R28-as-amended-by-R31): the clearance type compile-seals the named
 sinks and the per-batch token compile-seals the batches (reachability); the
@@ -1953,7 +1955,7 @@ the token is what makes the bound true.
   authorization unconditionally --- with no active hold in `gc_holds`,
   where a bare re-consult would authorize --- and within a destructive
   cadence no re-consult resurrects it (the owning tick ends; the next tick
-  re-gates at the lane wrapper). The ONLY lawful window restart is the
+  re-gates at the lane wrapper). The ONLY lawful window restart is the // quantifier: census(aged_clearance_refuses_with_no_hold_present)
   declared phase-seam consult (#rref("store.gc.consult-aged-clearance")):
   a consult opportunity between non-destructive phases, which refuses
   under a hold and yields no batch authority.
@@ -1976,7 +1978,7 @@ collect report) --- never inferred from logs.
   destructive batch is reachable without a boundary authorization. A
   refused boundary (`Held`/`Expired`) structurally yields no token: the
   body stops, committed batches stand, and a global hold landing mid-pass
-  binds at the NEXT batch boundary of EVERY body --- never "the next run".
+  binds at the NEXT batch boundary of EVERY body --- never "the next run". // quantifier: census(destructive_body_census)
 ]
 The wave-11 form of this law quantified over "multi-batch tick bodies" but
 enforced by hand enumeration: the verdict's `Authorized` arm was a unit
@@ -2336,7 +2338,7 @@ GC redesign must preserve.
   Outbox exhaustion MUST NOT be absorbing, and the reset edge MUST carry
   the fresh decision WHOLE: a fresh collect decision for an object whose
   `pending_s3_deletes` row has exhausted its retry budget
-  (`attempts >= MAX_ATTEMPTS`) MUST reset EVERY decision-derived column
+  (`attempts >= MAX_ATTEMPTS`) MUST reset EVERY decision-derived column // quantifier: census(outbox_reset_carries_the_recomputed_key)
   (`attempts = 0`, `enqueued_at = now()`, and `s3_key` carrying the
   recomputed `EXCLUDED` value --- the fresh backend key; an edge that
   re-activates the row while

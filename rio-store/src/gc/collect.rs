@@ -5537,7 +5537,7 @@ mod tests {
     /// stands in for it; `consulted_at` is a tokio Instant, virtual
     /// under paused test time by design) reaches the live loop aged
     /// far past the bound. Pre-fix: batch-1 `Expired`, zero batches,
-    /// EVERY cycle — permanent zero chunk-collect progress; "next
+    /// every cycle — permanent zero chunk-collect progress; "next
     /// tick re-gates" re-mints into the same structure. Post-fix:
     /// the pre-drain consult seam restarts the window and the cycle
     /// progresses fully under the same hold-free conditions.
@@ -5595,7 +5595,7 @@ mod tests {
     // r[verify store.gc.consult-aged-clearance]
     // r[verify store.gc.batch-authority]
     /// W12-Q composition pin (the WO-S3-1 interlock): the seam
-    /// restarts the window but NEVER bypasses the per-batch law — a
+    /// restarts the window but NEVER bypasses the per-batch law — quantifier: census(test: aged_seam_never_bypasses_the_per_batch_law) — a
     /// hold landing between two committed batches of a seam-refreshed
     /// cycle still stops the next batch at its boundary.
     #[tokio::test]

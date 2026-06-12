@@ -216,7 +216,7 @@ pub mod hold {
 
     /// Authority for exactly ONE destructive batch (bug_084 +
     /// merged_bug_006, the R32 form): a linear token minted SOLELY by
-    /// [`HoldClearance::authorize_batch`]'s `Authorized` arm — private
+    /// `HoldClearance::authorize_batch`'s `Authorized` arm — private
     /// field, non-`Clone`/non-`Copy`, passed BY VALUE into the
     /// destructive sinks (`sweep_one_batch`, `enqueue_chunk_deletes`,
     /// `drain_one_row`, `reap_one`, the log-sweep batch), so one
@@ -313,7 +313,7 @@ pub mod hold {
         /// opportunity: this consult restarts the window on clear,
         /// refuses under a hold, and fails closed on error. It
         /// returns NO [`BatchAuthority`] (R32: tokens only from
-        /// `authorize_batch`) and is lawful ONLY at phase seams —
+        /// `authorize_batch`) and is lawful only at phase seams —
         /// destructive cadences re-authorize per batch, where an
         /// aged clearance still refuses unconditionally.
         // r[impl store.gc.consult-aged-clearance]
@@ -347,7 +347,7 @@ pub mod hold {
         }
     }
 
-    /// A phase-seam consult verdict — see [`HoldClearance::regate`].
+    /// A phase-seam consult verdict — see `HoldClearance::regate`.
     /// Closed alphabet; no wildcard consumers. Carries NO
     /// [`BatchAuthority`]: a seam consult cannot authorize a batch.
     #[must_use = "an unconsumed seam verdict bypasses the hold consult"]
@@ -405,7 +405,7 @@ pub mod hold {
 }
 
 /// The outbox veto's TYPED liveness letter (bug_116, R30-hardened:
-/// two modules narrated the SAME row population with OPPOSITE
+/// two modules narrated the same row population with OPPOSITE
 /// liveness — collect.rs justified the reap's NOT-EXISTS conjunct as
 /// "a FINITE wait, never a permanent veto" via a reset edge whose
 /// sole production feeder is gated `deleted = FALSE`, structurally
@@ -1236,7 +1236,7 @@ fn render_phase3(phase3: &Phase3Render, dry_run: bool, stats: &GcStats) -> Strin
 /// permanent veto on the chunk tombstone's hard-delete.
 /// THE RESET CARRIES THE FRESH DECISION WHOLE (merged_bug_117, R30
 /// hardened): a reset arm implementing "a fresh decision restarts the
-/// row" carries EVERY column the fresh decision recomputed. The
+/// row" carries EVERY column the fresh decision recomputed — quantifier: census(test: outbox_reset_carries_the_recomputed_key). The
 /// decision-derived column audit (the R4 line, per column):
 /// `s3_key` (carries `EXCLUDED.s3_key`) — fixed-here (the wave-11 arm kept the
 /// stale key; after a backend key-layout migration the drain then
@@ -2702,7 +2702,7 @@ mod registration_evidence_tests {
     /// stops the sweep at the NEXT batch boundary and suspends the
     /// rest of the run (phase 3 never starts). The operator's
     /// emergency stop binds within one batch, not one run: pre-fix,
-    /// the entry consult was the sweep's ONLY hold consult, so the
+    /// the entry consult was the sweep's only hold consult, so the
     /// remaining batches ("thousands × ~100ms" at scale) kept
     /// deleting paths unrecoverably through the freeze.
     ///

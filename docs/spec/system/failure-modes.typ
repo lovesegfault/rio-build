@@ -348,7 +348,7 @@ or terminal event, and the reachability witness — under the doctrine above
 - *GC delete outbox (store)*: a `pending_s3_deletes` row that exhausts its
   retry budget (`attempts >= MAX_ATTEMPTS`) is parked outside the drain's
   partial index --- a latch with no in-band retry. Exit edge: the next fresh
-  collect decision for the same object resets the budget --- carrying EVERY
+  collect decision for the same object resets the budget --- carrying EVERY // quantifier: census(outbox_reset_carries_the_recomputed_key)
   decision-derived column, including the recomputed backend key --- through
   the enqueue's guarded conflict arm (#rref("store.gc.outbox-reset")). The
   edge's reachability is FEEDER-SCOPED (the round-12 correction of this

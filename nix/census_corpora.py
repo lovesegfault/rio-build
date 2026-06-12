@@ -748,6 +748,18 @@ EXIT_EDGE_ROWS = {
         "re-decision resets the budget: the guarded ON CONFLICT DO UPDATE rewrites attempts/enqueued_at",
         "W11-AP incl. the WS-2 latch-face cell (duplicate-enqueue swallow red under unguarded DO UPDATE; S5 c3)",
     ),
+    # The outbox-veto liveness letter (WO-S3-4, the H3-quad record):
+    # OutboxVetoLiveness::classify reads the exhaustion latch
+    # (attempts >= MAX_ATTEMPTS); the edge claim is FEEDER-SCOPED
+    # (bug_116) — the deleted=FALSE collect feeder's re-decision
+    # resets live-chunk rows (carrying the recomputed key,
+    # merged_bug_117), while the tombstoned population has NO
+    # production reset and is TYPED parked-operator (the _stuck
+    # gauge is its alarm; operator action is the honest letter).
+    ("rio-store/src/gc/mod.rs", "give-up-pred", "MAX_ATTEMPTS"): (
+        "feeder-scoped reset: the deleted=FALSE collect re-decision resets live-chunk rows through the guarded conflict arm; tombstoned rows are TYPED parked-operator (no production reset — by design)",
+        "W12-S feeder-witnessed both faces (parked left parked by a full production cycle; finite face end-to-end candidate-scan->reset->drain) + W12-R carried-key chain (S3 c4-c5)",
+    ),
 }
 
 # The R14 typed-construction seeds OUTSIDE the grep grammar (CE-3:

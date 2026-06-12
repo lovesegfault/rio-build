@@ -1039,7 +1039,7 @@ mod tests {
     /// the lawful path to a batch runs authorize → token → sink, and
     /// the refusal arms structurally CANNOT yield a token — this
     /// match is the type-level proof (a `Held`/`Expired` arm has no
-    /// `BatchAuthority` to produce; the compiler enforces what the
+    /// `BatchAuthority` to produce — quantifier: census(test: refusal_arms_cannot_mint_batch_authority) — the type seals what the
     /// wave-11 unit variant left advisory). The population face — no
     /// destructive loop ships WITHOUT the demand — is the commit-2
     /// census's claim, not this test's.

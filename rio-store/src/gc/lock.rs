@@ -317,7 +317,7 @@ mod tests {
     /// auto-joined by the LIVE derivation (the jurisdiction face: the
     /// universe is the declaration list, so a new sibling cannot hide
     /// from it), and the coverage predicate goes red for it against
-    /// the committed array. Driven through the SAME parse path as
+    /// the committed array. Driven through the same parse path as
     /// production.
     #[test]
     fn census_universe_plant_red() {
