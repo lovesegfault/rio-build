@@ -828,20 +828,25 @@ mod summary {
     /// (merged_bug_041: `He said "stop." Next` cuts after the quote);
     /// the whole collapsed string when no real boundary exists.
     /// Intra-doc links `[foo]` are kept as-is — typst renders square
-    /// brackets literally. Backtick PARITY is respected
-    /// (merged_bug_149): a terminal inside an open `` ` ``-delimited
-    /// code span is code, not prose — cutting there would emit a
-    /// first sentence with an unbalanced span.
+    /// brackets literally. Code-span state derives from the
+    /// CommonMark RUN-LENGTH delimiter grammar (merged_bug_149 +
+    /// WO-S8-12/bug_161): a span opens with a run of N backticks and
+    /// closes at the next run of exactly N; an unmatched opener run
+    /// is literal backticks. A terminal inside a span is code, not
+    /// prose — cutting there would emit a first sentence with an
+    /// unbalanced span. (The former width-1 parity projection cut
+    /// double-backtick spans mid-span and let one stray backtick
+    /// suppress every later boundary.)
     pub(super) fn first_sentence(desc: &str) -> String {
         let collapsed = desc.split_whitespace().collect::<Vec<_>>().join(" ");
         let bytes = collapsed.as_bytes();
+        let in_span = code_span_mask(bytes);
         for i in 0..bytes.len() {
             if !SENTENCE_TERMINALS.contains(&bytes[i]) {
                 continue;
             }
-            // Backtick parity (merged_bug_149): odd count before the
-            // terminal == inside a code span; never a boundary.
-            if bytes[..i].iter().filter(|&&b| b == b'`').count() % 2 == 1 {
+            // Inside a run-length code span: never a boundary.
+            if in_span[i] {
                 continue;
             }
             // Closer run after the terminal (all closers are ASCII,
@@ -859,6 +864,54 @@ mod summary {
             }
         }
         collapsed
+    }
+
+    /// The CommonMark run-length code-span automaton (WO-S8-12,
+    /// bug_161): per byte, whether it sits inside a `` ` ``-delimited
+    /// code span. A span opens with a run of N backticks and closes
+    /// at the NEXT run of exactly N (shorter/longer runs are span
+    /// interior); an opener run with no matching closer is literal
+    /// backticks — never an open-forever span. The mask covers
+    /// delimiter runs themselves (a terminal cannot cut between a
+    /// span's backticks). ~20 lines, replacing the width-1 parity
+    /// projection whose total claim the run-length cells falsified.
+    fn code_span_mask(bytes: &[u8]) -> Vec<bool> {
+        let mut mask = vec![false; bytes.len()];
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'`' {
+                i += 1;
+                continue;
+            }
+            let open_start = i;
+            while i < bytes.len() && bytes[i] == b'`' {
+                i += 1;
+            }
+            let n = i - open_start;
+            let mut j = i;
+            let mut close_end = None;
+            while j < bytes.len() {
+                if bytes[j] != b'`' {
+                    j += 1;
+                    continue;
+                }
+                let run_start = j;
+                while j < bytes.len() && bytes[j] == b'`' {
+                    j += 1;
+                }
+                if j - run_start == n {
+                    close_end = Some(j);
+                    break;
+                }
+            }
+            if let Some(end) = close_end {
+                mask[open_start..end].iter_mut().for_each(|b| *b = true);
+                i = end;
+            }
+            // No closer: the opener run is literal; scanning resumes
+            // after it (i already points past the run).
+        }
+        mask
     }
 
     /// A [`SENTENCE_TERMINALS`] member optionally followed by a
@@ -1523,6 +1576,45 @@ mod tests {
             super::summary::first_sentence("Plain `code` here. Next sentence."),
             "Plain `code` here.",
             "a boundary after the span closes cuts normally"
+        );
+    }
+
+    /// WO-S8-12 (bug_161, W12-BJ): span-state derives from the
+    /// CommonMark run-length delimiter grammar, not width-1 parity —
+    /// the run-length × parity cells the scalar projection got wrong.
+    /// Red pre-fix: the double-backtick span cut MID-SPAN (parity saw
+    /// two backticks as closed); one stray odd backtick suppressed
+    /// every LATER boundary (parity stayed odd forever); the
+    /// 5-backtick 2+1+2 idiom both. An unmatched opener run is
+    /// literal backticks per CommonMark, never an open-forever span.
+    #[test]
+    fn code_span_run_length_grammar() {
+        assert_eq!(
+            super::summary::first_sentence("Reads ``a.b. Then`` from the row. Details follow."),
+            "Reads ``a.b. Then`` from the row.",
+            "a terminal inside a DOUBLE-backtick span is code (red \
+             pre-fix: parity cut mid-span after `a.b.`)"
+        );
+        assert_eq!(
+            super::summary::first_sentence("A stray ` backtick sits here. Next sentence follows."),
+            "A stray ` backtick sits here.",
+            "one unmatched backtick is literal per CommonMark (red \
+             pre-fix: parity suppressed every later boundary and \
+             shipped the whole paragraph)"
+        );
+        assert_eq!(
+            super::summary::first_sentence("The ``v. 2`` form parses. Trailing prose here."),
+            "The ``v. 2`` form parses.",
+            "the 2+1+2-adjacent family: a double-backtick span with an \
+             interior terminal, closed, then a real boundary"
+        );
+        assert_eq!(
+            super::summary::first_sentence("Use `` `lit` `` quoting. Second sentence."),
+            "Use `` `lit` `` quoting.",
+            "the 5-backtick 2+1+2 idiom: a single backtick INSIDE a \
+             double-backtick span is span interior, and the span \
+             closes at the next double run (red pre-fix: odd total \
+             suppressed the real boundary)"
         );
     }
 
