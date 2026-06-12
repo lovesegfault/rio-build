@@ -1011,7 +1011,7 @@ async fn ack_skewed_arm_echo_refused_not_truncated() {
 /// rebuild for the snapshot).
 ///
 /// REDELIVERY cell: apply→refuse→redeliver→apply ×2 converges to the
-/// SAME observable state as a single clean apply of the valid planes
+/// same observable state as a single clean apply of the valid planes
 /// (ice step, cost menu, binding, dispatched_cells) — state EQUALITY,
 /// not just non-blocking. The verdict plane is asserted OUT of the
 /// redelivery loop (level-triggered controller-side: rejected ships
@@ -1123,7 +1123,7 @@ async fn w11_bf_poisoned_plane_refuses_alone_siblings_apply() {
 }
 
 /// **W11-BF state-equality cell:** the triple-delivery subject from
-/// the poisoned loop converges to the SAME observable state as one
+/// the poisoned loop converges to the same observable state as one
 /// clean apply of the valid planes on a fresh actor — asserted on the
 /// named observables (ice step, cost menu, binding, dispatched_cells,
 /// no-host counters), with the verdict plane delivered exactly once

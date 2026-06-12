@@ -4782,16 +4782,13 @@ rec {
       name = "respawn-giveup";
       spec = "nodeclaimLifecycle";
       main = "respawnGiveUp";
-      invariants = [
-        "freshEpochServed"
-        "giveUpBoundsOK"
-      ];
-      vacuityExempt = {
-        giveUpBoundsOK = {
-          class = "boundsOK";
-          reason = "state-bounds conjunct (deaths/cycle ranges); the behavioral leaf freshEpochServed carries the falsify twin";
-        };
-      };
+      # ONE wired leaf (P7 single-proposition form): freshEpochServed,
+      # twinned by quint-respawn-giveup-asbuilt below. The model's
+      # giveUpBoundsOK val stays UNWIRED documentation — the bounds
+      # are structural (saturating tick arithmetic over a finite
+      # alphabet), and wiring the 6-conjunct bundle would ship an
+      # opaque leaf the twin engine refuses to expand.
+      invariants = [ "freshEpochServed" ];
     };
     # The falsify twin: the pre-fix encoding (no decay arm) starves the
     # resubmission forever — freshEpochServed violated.

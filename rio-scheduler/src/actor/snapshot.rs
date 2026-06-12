@@ -1232,11 +1232,11 @@ impl DagActor {
     // r[impl sched.sla.hw-class.ice-mask]
     /// merged_bug_005 + bug_094, re-scoped by bug_142 (R30 + OQ-15):
     /// returns the poisons from the applied planes PLUS the apply
-    /// verdict the drain relays to the gRPC layer — `Ok` when EVERY
+    /// verdict the drain relays to the gRPC layer — `Ok` when every
     /// plane landed; `Err(PlanesRefused)` names each refused plane
     /// (first offending entry per plane, wire-field order), and every
     /// plane NOT named LANDED. The pre-bug_142 contract ("`Ok` only
-    /// when EVERY plane landed, and `Err` only when NO plane landed")
+    /// when every plane landed, and `Err` only when no plane landed")
     /// is retired: under whole-request refusal one poisoned durable
     /// row — a Job annotation re-derived every tick by
     /// `assemble_re_acks` — wedged every evidence plane in its
@@ -1244,7 +1244,7 @@ impl DagActor {
     /// blast radius to the poisoned plane; the redelivery loop then
     /// converges instead of wedging.
     ///
-    /// The refusal unit is the PLANE: a refused plane withholds ALL
+    /// The refusal unit is the PLANE: a refused plane withholds all
     /// its evidence (the spawned plane's arm decodes AND its
     /// spawn-ack witnesses are one unit), and every refusal is still
     /// computed by [`AckApplyPlan::validate`] before the first state
@@ -1611,7 +1611,7 @@ impl SupplyRevalidation {
 
 /// One validated `AckSpawnedIntents` application (bug_094 —
 /// validate-then-commit; bug_142 — PER-PLANE refusal granularity).
-/// [`Self::validate`] computes EVERY refusal
+/// [`Self::validate`] computes every refusal
 /// over the RAW wire planes (a refused plane's slot empties and its
 /// leaf error joins the returned refusal list — the plane is the
 /// refusal unit, so the plan always carries exactly the planes that

@@ -2325,7 +2325,7 @@ fn fresh_demand_epoch_decays_gave_up_latch() {
         );
     }
 
-    // The SAME submission keeps presenting on healthy infra: withheld
+    // The same submission keeps presenting on healthy infra: withheld
     // every tick --- the latch's designed safety face (the latched
     // demand epoch never decays its own record).
     for n in 0..5u64 {
@@ -2349,7 +2349,7 @@ fn fresh_demand_epoch_decays_gave_up_latch() {
     // The RESUBMISSION presents (the scheduler recomputed the intent:
     // resubmit_cycle=1) on healthy infra. R30: the exit edge must be
     // mintable from inside the latched state --- the decay fires at
-    // the demand seam and the intent spawns THE SAME TICK.
+    // the demand seam and the intent spawns the same tick.
     let resubmitted = SpawnIntent {
         intent_id: "drv-giveup".into(),
         resubmit_cycle: 1,

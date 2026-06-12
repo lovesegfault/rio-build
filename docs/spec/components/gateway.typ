@@ -2022,7 +2022,8 @@ every established session on the instance with it.
   #(refs.metric)("rio_gateway_putpath_retry_events_total") increment labeled
   by typed status class (the shared `CODE_CLASS_LABELS` alphabet;
   a failure carrying no store status classifies `unknown` by definition),
-  on EVERY lane --- the buffered lane counts each attempt's failure
+  on every lane (both lanes enumerated here are the census) --- the
+  buffered lane counts each attempt's failure
   observation, retried or terminal, and the streaming lane counts each
   terminal failure --- through ONE surfacing chokepoint per module that
   consumes the failure en route to the response, so a failure-surfacing

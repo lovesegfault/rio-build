@@ -124,7 +124,8 @@ impl Drop for TickEvidence {
         if !self.registered_cells.is_empty() || !self.observed_types.is_empty() {
             #[cfg(debug_assertions)]
             panic!(
-                "TickEvidence dropped un-merged: {} clear(s), {} observed type(s) lost                  (consume-once: merge into pending_evidence — bug_127)",
+                "TickEvidence dropped un-merged: {} clear(s), {} observed type(s) lost \
+                 (consume-once: merge into pending_evidence — bug_127)",
                 self.registered_cells.len(),
                 self.observed_types.len(),
             );
@@ -132,7 +133,8 @@ impl Drop for TickEvidence {
             tracing::warn!(
                 clears = self.registered_cells.len(),
                 observed = self.observed_types.len(),
-                "TickEvidence dropped un-merged; kube-only evidence lost this tick                  (consume-once violation — bug_127)"
+                "TickEvidence dropped un-merged; kube-only evidence lost this tick \
+                 (consume-once violation — bug_127)"
             );
         }
     }

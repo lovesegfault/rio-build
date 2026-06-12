@@ -4934,7 +4934,7 @@ fully-hostable unpinned chains only).
   `AckSpawnedIntents` application MUST be validate-then-commit at PER-PLANE
   granularity: every refusal --- undecodable plane entry, length-skewed
   arming echo --- MUST be computed before the first state mutation; a
-  refused plane MUST withhold ALL of its own evidence (the plane is the
+  refused plane MUST withhold all of its own evidence (the plane is the
   refusal unit --- the spawned plane's arm decodes and its spawn-ack
   witnesses withhold together) while sibling planes apply, so one poisoned
   durable row cannot black out any other plane's evidence; the reply MUST

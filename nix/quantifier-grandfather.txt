@@ -667,7 +667,6 @@ rio-gateway/src/server/session_jwt.rs	/// `SessionJwt::token()` is the ONLY publ
 rio-gateway/src/server/session_jwt.rs	/// access; second access returns the SAME (now-fresh) string with
 rio-gateway/src/session.rs	// a bare `?` past a totality comment that said "ALL six". The
 rio-gateway/src/session.rs	// cancel-on-disconnect holds for ALL six session-exit
-rio-gateway/src/session.rs	// the SAME poll, but ChannelSession::Drop fires cancel() then
 rio-gateway/src/session.rs	/// `r[gw.conn.cancel-on-disconnect]` holds on EVERY path out of the
 rio-gateway/src/session.rs	/// failure that falsified the old 'ALL six exits' enumeration, and
 rio-gateway/src/session.rs	/// per-arm and documented "ALL six exits" — while the post-opcode
@@ -691,13 +690,11 @@ rio-lease/src/lib.rs	// Same-epoch keep: a lose + re-acquire at the SAME count w
 rio-lease/src/lib.rs	// bug_002 + bug_143: EVERY completed act-failed
 rio-lease/src/lib.rs	// nobody stole in between) is the SAME leadership epoch — the
 rio-lease/src/lib.rs	// nothing to consume — the SAME facts the
-rio-lease/src/lib.rs	// of a lease we hold — the SAME facts the
 rio-lease/src/lib.rs	// proxy for the blind clock's stamped anchor ONLY because this
 rio-lease/src/lib.rs	// request armed for the next believing tick of the SAME tenure
 rio-lease/src/lib.rs	// routes through the SAME
 rio-lease/src/lib.rs	// script; both faces ride the SAME tail reconcile (the
 rio-lease/src/lib.rs	// the SAME transition count — a NEW tenure instance, which
-rio-lease/src/lib.rs	// through the SAME observe-completed-read
 rio-lease/src/lib.rs	/// At the law's quantifier: holder-naming evidence NEVER clears
 rio-lease/src/lib.rs	/// Mint an anchor from the injected fence clock. Call ONLY before
 rio-lease/src/lib.rs	/// NEVER held the lease should not "step down" — it has nothing
@@ -799,7 +796,6 @@ rio-retry-kernel/src/lib.rs	/// review findings PP-4/BC-2): for ANY history, int
 rio-retry-kernel/src/lib.rs	/// sched.db.attempts-gc, exhaustively: over ALL histories of length
 rio-scheduler/src/actor/build.rs	// here. ALWAYS-ON — never flag-gated (PD-B17): flag-on-era pins
 rio-scheduler/src/actor/build.rs	/// reads the SAME `SettledBuild`, never live state (merged_bug_097).
-rio-scheduler/src/actor/command.rs	/// consume-once buffer on Ack-Ok ("the ONLY clear"). The refusal
 rio-scheduler/src/actor/completion.rs	// CA-shaped late reports reach the SAME gated
 rio-scheduler/src/actor/completion.rs	// I-127: "concurrent PutPath" is NEVER counted toward the
 rio-scheduler/src/actor/completion.rs	// I-199: bump resource_floor ONLY on the worker-reported
@@ -963,10 +959,8 @@ rio-scheduler/src/actor/snapshot.rs	/// filters and the backoff gate, from the S
 rio-scheduler/src/actor/snapshot.rs	/// forecast loop so every drv in one poll sees the SAME notion of
 rio-scheduler/src/actor/snapshot.rs	/// pattern on the SAME metric family is the in-tree precedent);
 rio-scheduler/src/actor/snapshot.rs	/// rejected plane (ANY reason — OverCap included). The
-rio-scheduler/src/actor/snapshot.rs	/// relays to the gRPC layer — `Ok` only when EVERY plane landed,
 rio-scheduler/src/actor/snapshot.rs	/// spawns and the scheduler accepts the SAME shape.
 rio-scheduler/src/actor/snapshot.rs	/// strict decode's SAME-COMMIT precondition: `validate_shape`
-rio-scheduler/src/actor/snapshot.rs	/// validate-then-commit). [`Self::validate`] computes EVERY refusal
 rio-scheduler/src/actor/tests/completion.rs	// CITE-ONLY surface: `bool_or(pt.tenant_id = $2) AS owned`,
 rio-scheduler/src/actor/tests/completion.rs	// Disable distinct-worker poison so we test ONLY max_retries.
 rio-scheduler/src/actor/tests/completion.rs	// Two distinct store paths, SAME name segment `ambig-pkg`.
@@ -1109,11 +1103,8 @@ rio-scheduler/src/actor/tests/sla_contract.rs	/// Pre-fix the `disclose_once` LR
 rio-scheduler/src/actor/tests/sla_contract.rs	/// `[spot, on-demand]` rung config NEVER lands on a spot rung* —
 rio-scheduler/src/actor/tests/sla_contract.rs	/// after the overlay: floor above EVERY class ceiling => Unhostable
 rio-scheduler/src/actor/tests/sla_contract.rs	/// and missing-requirement axes ONLY; this red certifies the duplicate
-rio-scheduler/src/actor/tests/sla_contract.rs	/// and the fn returned `Ok(())` against its own "Ok only when EVERY
-rio-scheduler/src/actor/tests/sla_contract.rs	/// bug_094 red: an undecodable entry in ANY plane refuses the WHOLE
 rio-scheduler/src/actor/tests/sla_contract.rs	/// can NEVER produce `LambdaGate | CLoExceedsCap`, so `all(λ-adjacent)`
 rio-scheduler/src/actor/tests/sla_contract.rs	/// cap-blind reference resolve: PinGated mints ONLY when a
-rio-scheduler/src/actor/tests/sla_contract.rs	/// consume-once buffer ("the ONLY clear"), so the dropped entry was
 rio-scheduler/src/actor/tests/sla_contract.rs	/// elements) and EVERY ε_h draw is infeasible. Tick once → record
 rio-scheduler/src/actor/tests/sla_contract.rs	/// flattened `solve_infeasible: bool` — true for EVERY BestEffort
 rio-scheduler/src/actor/tests/sla_contract.rs	/// pnames through the SAME wiring [`DagActor::maybe_refresh_estimator`]

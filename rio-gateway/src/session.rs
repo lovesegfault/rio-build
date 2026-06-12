@@ -268,14 +268,14 @@ where
     // merged_bug_117: attribution that depends on which select arm won
     // computes from the AUTHORITATIVE SIGNAL — the token state — ABOVE
     // the arm dispatch. `biased` selects prefer the token arm when
-    // both are Ready on the SAME poll, but ChannelSession::Drop fires
+    // both are Ready on the same poll, but ChannelSession::Drop fires
     // cancel() then breaks the pipe — if those land between the
     // token-poll and a synchronous I/O error within ONE poll cycle,
     // the error exit carries a stale attribution. The retired per-arm
     // re-check guarded only HandlerError, and the commit that added it
     // minted the unguarded FlushError sibling in the same diff —
     // per-arm guards do not survive their own evolution. Hoisted, the
-    // race window is one cell for EVERY variant, present and future:
+    // race window is one cell for every variant, present and future:
     // a new exit arm inherits the guard by construction.
     // r[impl gw.session.exit-attribution]
     let reason = if shutdown.is_cancelled() {

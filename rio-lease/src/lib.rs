@@ -1288,8 +1288,8 @@ fn consume_own_commit_evidence<H: LeaseHooks>(
         );
     } else {
         // Still believing: a completed read of a lease we hold — the
-        // SAME facts a Leading renew round consumes, routed through
-        // the SAME observe-completed-read body (a foreign term that
+        // same facts a Leading renew round consumes, routed through
+        // the same observe-completed-read body (a foreign term that
         // completed inside the observation gap rebounds here exactly
         // as on a Completed round).
         observe_held_while_believing(
@@ -1880,7 +1880,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                     // EvidenceResolve on: the (Us, Moved, Armed) cell
                     // was unreachable from the commit-before-GET
                     // schedule and the replica stayed fenced extra
-                    // rounds. Consult the SAME total routing law against
+                    // rounds. Consult the same total routing law against
                     // the OLD baseline and consume BEFORE re-baselining;
                     // every other routed action keeps its existing home
                     // (the conflict deferral machinery above, the

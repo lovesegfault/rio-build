@@ -136,7 +136,7 @@ impl Dns1123Label {
                 raw,
                 "no usable identity in raw hostname; using a random-salted dev identity"
             );
-            // bug_005 (R28 secondary-input axis): EVERY input axis of
+            // bug_005 (R28 secondary-input axis): every input axis of
             // a by-construction newtype routes through the seal — the
             // composed fallback RE-ENTERS sanitize, so a
             // non-conforming caller-supplied stem (uppercase,

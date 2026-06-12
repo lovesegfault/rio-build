@@ -524,7 +524,7 @@ impl Drop for PendingGapCell {
         // sends (both-or-neither). Two independent try_sends made the
         // partial-failure lattice reachable: a consumer recv landing
         // between them could yield the withheld span with the hole
-        // NEVER disclosed (marker-fails/withheld-lands), a partial
+        // never disclosed (marker-fails/withheld-lands), a partial
         // disclosure the whole-drop residual above never priced. With
         // the reservation pair, the residual IS whole-drop — exactly
         // the priced case. The two-message vocabulary readers parse
@@ -2967,7 +2967,7 @@ mod tests {
     /// reachable: at the lattice's own cell (exactly one slot free)
     /// the marker landed and the withheld chunk vanished — and under
     /// a consumer recv between the two sends, the inverse split
-    /// (withheld-without-marker: the hole NEVER disclosed) landed.
+    /// (withheld-without-marker: the hole never disclosed) landed.
     /// Post-fix the cell yields NEITHER (the whole-drop residual the
     /// doc already prices) and two free slots yield BOTH.
     ///

@@ -507,7 +507,7 @@ impl VerdictWitness {
 }
 
 /// bug_151 (R30 --- liveness duals): the typed receipt of a gave-up
-/// decay, minted ONLY by [`PoolStreaks::note_demand_epoch`] when a
+/// decay, minted only by [`PoolStreaks::note_demand_epoch`] when a
 /// gave-up record observes a strictly newer demand epoch than the one
 /// it latched under. Evidence-carrying like every [`VerdictWitness`]
 /// sibling, but its evidence is DEMAND-EPOCH, not pod: the
@@ -1139,7 +1139,7 @@ impl PoolStreaks {
 
     /// bug_151 (R30 exit edge): observe one wanted intent's demand
     /// epoch at the demand seam --- the pass the spawn fold runs over
-    /// EVERY wanted intent BEFORE any latch consult. Three cases,
+    /// every wanted intent BEFORE any latch consult. Three cases,
     /// stated against the record's own observation history:
     ///
     ///   - no record: no-op (demand alone never mints evidence ---

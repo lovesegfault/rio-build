@@ -690,7 +690,7 @@ pub(super) fn evaluate_spawn_gate(
 ) -> SpawnGateOutcome {
     // bug_151 (R30 exit edge): the demand seam --- observe every
     // wanted intent's resubmit_cycle BEFORE any latch consult, on
-    // EVERY universe arm (the latch gates spawning, never the
+    // every universe arm (the latch gates spawning, never the
     // observation of demand, so this lane stays mintable from inside
     // the gave-up state). A gave-up record observing a strictly
     // newer epoch than it latched under decays here and the intent
