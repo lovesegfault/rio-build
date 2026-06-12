@@ -1614,6 +1614,41 @@ module nodeclaimLifecycle {
     violations' = Set(),
   }
 
+  /// Round-11 L1 regime step — the tombstone HOLD check's dedicated
+  /// transition relation: the law's OWN axes are explored
+  /// exhaustively (the delete-outcome nondets, the full tick family
+  /// with its skip paths, the claim lifecycle environment, the mask
+  /// cycle) while the axes the law does not quantify over are PINNED
+  /// (ackFails/createFails/pgLoadFails = false; demandA ∈ {0,1},
+  /// demandB = 0; reserved = ∅; deferred = ∅; no lease/config
+  /// faults). Each pinned axis keeps its own exhaustive green regime
+  /// elsewhere (fault-rpc, fault-lease, defer, epoch, …) — P7 regime
+  /// design: the exhaustive tier is PRESERVED for the tombstone law
+  /// itself, with per-full-tick branching cut ~72× vs the default
+  /// step under the same consts.
+  action stepTombstoneHold = {
+    nondet k = CLAIMS.oneOf()
+    nondet cell = CELLS.oneOf()
+    nondet ambChoice = tombChoices.oneOf()
+    nondet commitAll = boolChoices(ENABLE_TOMBSTONE_MACHINERY).oneOf()
+    nondet demandA = Set(0, 1).oneOf()
+    any {
+      tickFullWith(false, false, false, demandA, 0, Set(), Set(),
+        ambChoice, if (commitAll) ambChoice else Set()),
+      tickBotEarlyWith(false),
+      tickConsolidateOnlyWith(false, ambChoice,
+        if (commitAll) ambChoice else Set()),
+      claimRegisters(k),
+      claimGoesBusy(k),
+      claimGoesIdle(k),
+      claimLaunchStuck(k),
+      karpenterGC(k),
+      karpenterTerminationEdge(k),
+      finalizerCompletes(k),
+      iceClears(cell),
+    }
+  }
+
   action step = {
     nondet k = CLAIMS.oneOf()
     nondet cell = CELLS.oneOf()

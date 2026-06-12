@@ -7584,6 +7584,19 @@ rec {
     # late-confirm path are exercised in this regime.
     # r[verify ctrl.pool.delete-outcome]
     # r[verify ctrl.pool.fold-clock]
+    # The L1 regime form (measured): under the default step this
+    # exhaustive check diverged — 57.7M generated / 47.6k distinct at
+    # a HEALTHY ~2.2M states/min with the queue at 30,868 and GROWING
+    # at the 1800s budget (depth 12) — genuine state-space size, so a
+    # timeout bump was rejected by the curve. The dedicated
+    # stepTombstoneHold pins the axes the tombstone law does not
+    # quantify over (ack/create/pgLoad faults, demand×reserved
+    # branching, lease/config faults — each holding its own green
+    # exhaustive regime elsewhere) and keeps the law's own axes
+    # exhaustive: the delete-outcome nondets, the full tick family
+    # with its skip paths, the claim lifecycle, the mask cycle. The
+    # invariant list narrows to the plane this regime exercises; the
+    # cover/ack/lease invariants stay enforced by their own regimes.
     quint-nodeclaim-tombstone-consequence = mkQuintCheck {
       name = "nodeclaim-tombstone-consequence";
       # quint-policy P1 exemption (the standing boundsOK form):
@@ -7595,19 +7608,11 @@ rec {
       };
       spec = "nodeclaimLifecycle";
       main = "nodeclaimLifecycleTombstone";
+      step = "stepTombstoneHold";
       invariants = [
         "boundsOK"
         "idleReapSafety"
         "iceMarkSoundness"
-        "bootSampleNotLost"
-        "noMassClearAfterFailover"
-        "reloadLatchRespected"
-        "singleEffectiveProvisioner"
-        "gateProducerGuarantee"
-        "provisioningBudget"
-        "deficitFullyMinted"
-        "coverRespectsMask"
-        "degradedCoverPolarity"
         "tombstoneConsequenceApplied"
       ];
     };
