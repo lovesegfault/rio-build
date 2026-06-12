@@ -180,9 +180,9 @@ pub mod hold {
     ///
     /// TEMPORAL SCOPE (merged_bug_067 — the R28 time axis the
     /// reachability seal left bare): a clearance is authority for at
-    /// most [`crate::gc::lane::DESTRUCTIVE_BATCH_DRAIN_BOUND`] past
+    /// most `gc::lane::DESTRUCTIVE_BATCH_DRAIN_BOUND` past
     /// its last successful consult. Multi-batch tick bodies demand
-    /// [`Self::authorize_batch`] at each committed-transaction
+    /// `Self::authorize_batch` at each committed-transaction
     /// boundary: the call refuses on an aged clearance (expiry — no
     /// re-consult can resurrect it; the next tick re-gates), refuses
     /// under a hold landed mid-body (the re-consult), and otherwise
@@ -207,7 +207,7 @@ pub mod hold {
     }
 
     /// One batch-boundary authorization verdict — see
-    /// [`HoldClearance::authorize_batch`]. Closed alphabet; every
+    /// `HoldClearance::authorize_batch`. Closed alphabet; every
     /// consumer matches it exhaustively (no wildcard arms).
     #[must_use = "an unconsumed verdict is an unauthorized batch"]
     #[derive(Debug)]

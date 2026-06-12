@@ -165,7 +165,7 @@ pub struct NarBudget {
 impl NarBudget {
     /// A fresh pool of `permits` byte-permits with its own (empty)
     /// tenant ledger. The chunk lane is carved per the derivation on
-    /// [`Self::chunk_lane`]; the two faces sum to `permits`.
+    /// the `chunk_lane` field; the two faces sum to `permits`.
     pub fn new(permits: usize) -> Self {
         let max_nar = rio_common::semaphore_permits(MAX_NAR_SIZE);
         let lane = (permits / 8).min(permits.saturating_sub(max_nar));
