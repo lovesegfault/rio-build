@@ -1263,7 +1263,7 @@ pub const M_067: () = ();
 /// `manifests` UPDATE.
 pub const M_068: () = ();
 
-// BURNED NUMBERS — 069 and 070 (next free migration: 071):
+// BURNED NUMBERS — 069 and 070 (next free migration: 073):
 //
 // - 069/070 were rio_app role/grant migrations that ARE applied on
 //   the persistent DB (recorded rows in `_sqlx_migrations`) and were

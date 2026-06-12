@@ -92,6 +92,9 @@ pub struct GcStats {
     /// per-path re-check catches these and skips the delete.
     /// Metric for alerting if this is frequent.
     pub paths_resurrected: u64,
+    /// Drv blobs deleted by the ADR-024 drv sweep (unpinned, past
+    /// grace). PG-only — drv bodies have no S3 objects.
+    pub drv_blobs_deleted: u64,
 }
 
 /// Parameters for [`run_gc`]. Struct (not positional) so the
@@ -251,7 +254,7 @@ pub async fn run_gc(
     // Shutdown token threaded through: sweep checks it between
     // batches (not mid-transaction — a partial batch ROLLBACKs
     // cleanly via tx drop). Returns SweepAbort::Shutdown if fired.
-    let stats = match sweep::sweep(
+    let mut stats = match sweep::sweep(
         pool,
         chunk_backend.as_ref(),
         unreachable,
@@ -274,6 +277,23 @@ pub async fn run_gc(
         }
     };
 
+    // --- Drv-blob sweep (ADR-024 P2) ---
+    // Same advisory lock, same grace/dry_run semantics; runs after the
+    // path sweep so a path-pinning change in this run can't race it.
+    // Failure is non-fatal for the run: path GC already committed, and
+    // leaked drv blobs (a few KB each) are reclaimed by the next run.
+    match sweep_unpinned_drv_blobs(
+        pool,
+        params.grace_hours,
+        &params.extra_roots,
+        params.dry_run,
+    )
+    .await
+    {
+        Ok(n) => stats.drv_blobs_deleted = n,
+        Err(e) => warn!(error = %e, "GC: drv-blob sweep failed (non-fatal)"),
+    }
+
     // Final progress: complete with stats. paths_scanned echoes the
     // mid-progress `found_unreachable` so it never goes backward;
     // resurrections surface in the `current_path` summary string
@@ -287,17 +307,19 @@ pub async fn run_gc(
             is_complete: true,
             current_path: if params.dry_run {
                 format!(
-                    "dry run: would delete {} paths, {} chunks, free {} bytes, {} resurrected",
+                    "dry run: would delete {} paths, {} chunks, {} drv blobs, free {} bytes, {} resurrected",
                     stats.paths_deleted,
                     stats.chunks_deleted,
+                    stats.drv_blobs_deleted,
                     stats.bytes_freed,
                     stats.paths_resurrected
                 )
             } else {
                 format!(
-                    "complete: {} paths deleted, {} chunks, {} S3 keys enqueued, {} bytes freed, {} resurrected",
+                    "complete: {} paths deleted, {} chunks, {} drv blobs, {} S3 keys enqueued, {} bytes freed, {} resurrected",
                     stats.paths_deleted,
                     stats.chunks_deleted,
+                    stats.drv_blobs_deleted,
                     stats.s3_keys_enqueued,
                     stats.bytes_freed,
                     stats.paths_resurrected
@@ -328,6 +350,62 @@ async fn gc_unlock(
     {
         warn!(error = %e, "GC: advisory unlock failed");
     }
+}
+
+/// Drv-blob sweep (ADR-024 P2): delete drv blobs that are past the
+/// grace window and not referenced by any live build.
+///
+/// Build pinning reuses the EXACT mechanism the path mark phase uses
+/// — no parallel pin table:
+///
+/// - `scheduler_live_pins`: the scheduler pins store paths (keyed
+///   `sha256(path)`, see `pin_live_inputs`) for non-terminal builds
+///   and unpins on terminal status. A drv blob whose `drv_path_hash`
+///   matches a pin survives. The skeleton-submission flow pins the
+///   `.drv` paths of live builds through the same call.
+/// - `extra_roots`: the TriggerGC caller's live-build path list,
+///   matched on `drv_path` text like mark's seed (d).
+/// - grace (`created_at`): same clamp as mark; a re-put refreshes
+///   `created_at` (see `PutDrvBlobs`), so the cluster's minimum
+///   unpinned-blob lifetime — the client-side ack-TTL bound from
+///   ADR-024 — is exactly this grace window.
+///
+/// No reference walk: drv blobs reference each other through
+/// `input_drvs`, but a live build pins its whole drv closure at
+/// submit time (the skeleton lists every node), so per-blob pins are
+/// the complete root set. Bodies are PG-only — DELETE is the whole
+/// sweep, no two-phase S3 dance. `drv_blob_tenants` rows CASCADE.
+// r[impl store.drv.gc-build-pinned]
+pub(super) async fn sweep_unpinned_drv_blobs(
+    pool: &PgPool,
+    grace_hours: u32,
+    extra_roots: &[String],
+    dry_run: bool,
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // NOT EXISTS over unnest (not `<> ALL`) for NULL-safety, same
+    // reasoning as mark's NOT EXISTS (T1).
+    let deleted = sqlx::query(
+        r#"
+        DELETE FROM drv_blobs d
+         WHERE d.created_at < now() - make_interval(hours => $1::int)
+           AND NOT EXISTS (SELECT 1 FROM scheduler_live_pins p
+                            WHERE p.store_path_hash = d.drv_path_hash)
+           AND NOT EXISTS (SELECT 1 FROM unnest($2::text[]) AS r(path)
+                            WHERE r.path = d.drv_path)
+        "#,
+    )
+    .bind(grace_hours.min(GRACE_HOURS_CAP) as i32)
+    .bind(extra_roots)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if dry_run {
+        tx.rollback().await?;
+    } else {
+        tx.commit().await?;
+    }
+    Ok(deleted)
 }
 
 /// Result of [`decrement_and_enqueue`]: stats for the chunks touched by
@@ -920,6 +998,180 @@ mod tests {
             err.to_string().contains("chunks_refcount_nonneg"),
             "expected CHECK constraint violation, got: {err}"
         );
+    }
+
+    /// Seed a drv blob `hours_ago` old. `digest = [tag; 32]`,
+    /// `drv_path_hash = sha256(drv_path)` — the production keying
+    /// (`PutDrvBlobs` computes the same).
+    async fn seed_drv_blob(pool: &PgPool, tag: u8, drv_path: &str, hours_ago: i32) -> Vec<u8> {
+        use sha2::Digest as _;
+        let digest = vec![tag; 32];
+        sqlx::query(
+            "INSERT INTO drv_blobs (digest, drv_path, drv_path_hash, body, created_at) \
+             VALUES ($1, $2, $3, $4, now() - make_interval(hours => $5::int))",
+        )
+        .bind(&digest)
+        .bind(drv_path)
+        .bind(sha2::Sha256::digest(drv_path.as_bytes()).to_vec())
+        .bind(b"body".as_slice())
+        .bind(hours_ago)
+        .execute(pool)
+        .await
+        .unwrap();
+        digest
+    }
+
+    async fn drv_blob_digests(pool: &PgPool) -> Vec<Vec<u8>> {
+        sqlx::query_scalar("SELECT digest FROM drv_blobs ORDER BY digest")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    // r[verify store.drv.gc-build-pinned]
+    /// Unpinned drv blobs past grace are collected; recent ones are
+    /// protected by the grace window; tenant junction rows CASCADE.
+    #[tokio::test]
+    async fn drv_sweep_collects_unpinned_past_grace() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let old = seed_drv_blob(
+            &db.pool,
+            1,
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-old.drv",
+            48,
+        )
+        .await;
+        let recent = seed_drv_blob(
+            &db.pool,
+            2,
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-new.drv",
+            1,
+        )
+        .await;
+        // Tenant binding on the old blob — must CASCADE away.
+        let tenant = crate::test_helpers::seed_tenant(&db.pool, "drv-sweep").await;
+        sqlx::query("INSERT INTO drv_blob_tenants (digest, tenant_id) VALUES ($1, $2)")
+            .bind(&old)
+            .bind(tenant)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let n = sweep_unpinned_drv_blobs(&db.pool, 2, &[], false)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "exactly the old unpinned blob is collected");
+        assert_eq!(drv_blob_digests(&db.pool).await, vec![recent]);
+        let junctions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM drv_blob_tenants")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(junctions, 0, "tenant junction rows CASCADE with the blob");
+    }
+
+    // r[verify store.drv.gc-build-pinned]
+    /// A drv blob whose drv_path is pinned via `scheduler_live_pins`
+    /// (the live-build pin mechanism, keyed sha256(path)) survives the
+    /// sweep; once unpinned it is collected.
+    #[tokio::test]
+    async fn drv_sweep_build_pin_protects_until_unpin() {
+        use sha2::Digest as _;
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let drv_path = "/nix/store/cccccccccccccccccccccccccccccccc-pinned.drv";
+        let digest = seed_drv_blob(&db.pool, 3, drv_path, 48).await;
+        sqlx::query(
+            "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash) VALUES ($1, 'live-drv')",
+        )
+        .bind(sha2::Sha256::digest(drv_path.as_bytes()).to_vec())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let n = sweep_unpinned_drv_blobs(&db.pool, 2, &[], false)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "pinned drv blob must survive");
+        assert_eq!(drv_blob_digests(&db.pool).await, vec![digest]);
+
+        // Build goes terminal → scheduler unpins → next sweep collects.
+        sqlx::query("DELETE FROM scheduler_live_pins WHERE drv_hash = 'live-drv'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let n = sweep_unpinned_drv_blobs(&db.pool, 2, &[], false)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "unpinned drv blob is collected on the next run");
+        assert!(drv_blob_digests(&db.pool).await.is_empty());
+    }
+
+    // r[verify store.drv.gc-build-pinned]
+    /// `extra_roots` (the TriggerGC caller's live-build path list)
+    /// protects by drv_path text, and dry_run rolls the delete back.
+    #[tokio::test]
+    async fn drv_sweep_extra_roots_and_dry_run() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let drv_path = "/nix/store/dddddddddddddddddddddddddddddddd-rooted.drv";
+        let digest = seed_drv_blob(&db.pool, 4, drv_path, 48).await;
+
+        let n = sweep_unpinned_drv_blobs(&db.pool, 2, &[drv_path.to_string()], false)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "extra_roots entry must protect the drv blob");
+
+        // Dry run: reports the would-be delete, changes nothing.
+        let n = sweep_unpinned_drv_blobs(&db.pool, 2, &[], true)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "dry run reports the candidate");
+        assert_eq!(
+            drv_blob_digests(&db.pool).await,
+            vec![digest],
+            "dry run must not delete"
+        );
+    }
+
+    // r[verify store.drv.gc-build-pinned]
+    /// run_gc wires the drv sweep: stats and the summary line carry
+    /// the count.
+    #[tokio::test]
+    async fn run_gc_sweeps_drv_blobs() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        seed_drv_blob(
+            &db.pool,
+            5,
+            "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gc.drv",
+            48,
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let stats = run_gc(
+            &db.pool,
+            None,
+            GcParams {
+                dry_run: false,
+                grace_hours: 2,
+                extra_roots: vec![],
+            },
+            tx,
+            &rio_common::signal::Token::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stats.drv_blobs_deleted, 1);
+        let mut last = None;
+        while let Some(m) = rx.recv().await {
+            last = Some(m.unwrap());
+        }
+        let fin = last.expect("final progress");
+        assert!(
+            fin.current_path.contains("1 drv blobs"),
+            "summary carries the drv sweep count: {}",
+            fin.current_path
+        );
+        assert!(drv_blob_digests(&db.pool).await.is_empty());
     }
 
     /// bug_304: final `GcProgress.paths_scanned` MUST equal the

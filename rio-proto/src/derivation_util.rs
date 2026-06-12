@@ -216,8 +216,11 @@ pub enum DrvBlobError {
     NotADrvPath(String),
     #[error("drv path mismatch: claimed {claimed}, recomputed {computed}")]
     DrvPathMismatch { claimed: String, computed: String },
+    // `recorded` is debug-escaped: it comes straight from the decoded
+    // blob (attacker-chosen bytes) and this message lands in tonic
+    // Status messages and log lines, same reasoning as `show`.
     #[error(
-        "fixed-output path mismatch for output {name:?}: recorded {recorded}, recomputed {computed}"
+        "fixed-output path mismatch for output {name:?}: recorded {recorded:?}, recomputed {computed}"
     )]
     FodPathMismatch {
         name: String,

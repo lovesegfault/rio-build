@@ -237,8 +237,9 @@ service DrvBlobService {
   // output-path recompute. Any failure rejects the WHOLE batch with
   // INVALID_ARGUMENT naming the failing blob — non-canonical bytes
   // are never stored. Storage is an unconditional idempotent
-  // overwrite-equivalent (INSERT .. ON CONFLICT DO NOTHING on a
-  // content-addressed key): no present/absent timing oracle, same
+  // overwrite-equivalent on a content-addressed key (a re-put of an
+  // existing digest refreshes the GC grace clock, never the bytes):
+  // no present/absent timing oracle, same
   // discipline as chunk puts. `created[i]` reports whether THIS
   // tenant's visibility binding was new — it never discloses another
   // tenant's prior upload.
