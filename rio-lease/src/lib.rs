@@ -1221,6 +1221,88 @@ pub async fn run_lease_loop_with<H: LeaseHooks>(
 /// (`sched.lease.marks-verify`). Equal counts stay a silent no-op (a
 /// log every 5s would be noisy).
 // r[impl sched.lease.rebound+4]
+/// merged_bug_051: the own-commit evidence consumption leg — ONE body
+/// for its TWO routing sites: the act-failed `EvidenceResolve` arm and
+/// the Conflict round whose completed GET already observed the
+/// movement (commit-before-GET). Evidence consumption and baseline
+/// advancement are one atomic operation: both sites consume BEFORE
+/// their re-baseline, so an armed ledger can never be silently
+/// re-baselined past (pre-fix the Conflict arm advanced the baseline
+/// unconditionally, making the `(Us, Moved, Armed)` cell unreachable
+/// from the commit-before-GET schedule and leaving the replica fenced
+/// extra rounds on its own committed write). Semantics byte-preserved
+/// from the act-failed leg (merged_bug_122/164/180): the stamp is
+/// unconditional, the acquire is fence-gated, and both belief states
+/// route through the observe-held funnel.
+#[allow(clippy::too_many_arguments)]
+fn consume_own_commit_evidence<H: LeaseHooks>(
+    led: UnconfirmedPut,
+    f: &election::FetchFacts,
+    blind: &mut BlindClock,
+    now: Duration,
+    state: &LeaderState,
+    standing: &mut LeaseStanding,
+    marks_dirty: &DirtyGen,
+    hooks: &H,
+    holder_id: &str,
+) {
+    blind.stamp(led.anchor);
+    // merged_bug_122: the stamp is unconditional (the evidence is
+    // real and the ledger is consumed) but the ACQUIRE is
+    // fence-gated. A ledger anchor already past SELF_FENCE_AFTER at
+    // consumption time makes the acquire provably futile — the
+    // trailing maybe_self_fence in the same arm would re-fence it
+    // before the next await, churning hooks/marks/recovery once per
+    // round of a slow-commit brownout.
+    let anchor_age = blind.blind_for(now);
+    if anchor_age > SELF_FENCE_AFTER {
+        info!(
+            ?anchor_age,
+            "own-commit evidence consumed, but its anchor is already \
+             past the fence deadline — staying fenced (an acquire \
+             here would be re-fenced this same arm)"
+        );
+    } else if !standing.believes() {
+        // A self-fence inside the mid-band window already ran the
+        // lose edge; the evidence proves the apiserver still (or
+        // again) names us holder, so re-enter through the ordinary
+        // acquire edge with the FETCHED transition count — the
+        // same-count case is the documented same-epoch re-acquire
+        // (generation fetch_max no-op, in-flight work survives).
+        let new_gen = state.on_acquire(f.transitions);
+        info!(
+            generation = new_gen,
+            holder = %holder_id,
+            "own-commit evidence (holder=us, renewTime moved) restored \
+             leadership belief after an abandoned write"
+        );
+        marks_dirty.mark();
+        hooks.on_acquire();
+        observe_held_while_believing(
+            state,
+            standing,
+            marks_dirty,
+            hooks,
+            holder_id,
+            f.transitions,
+        );
+    } else {
+        // Still believing: a completed read of a lease we hold — the
+        // SAME facts a Leading renew round consumes, routed through
+        // the SAME observe-completed-read body (a foreign term that
+        // completed inside the observation gap rebounds here exactly
+        // as on a Completed round).
+        observe_held_while_believing(
+            state,
+            standing,
+            marks_dirty,
+            hooks,
+            holder_id,
+            f.transitions,
+        );
+    }
+}
+
 fn observe_held_while_believing<H: LeaseHooks>(
     state: &LeaderState,
     standing: &mut LeaseStanding,
@@ -1786,6 +1868,57 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                     if !is_conflict {
                         unconfirmed = None;
                     }
+                    // merged_bug_051: evidence consumption and baseline
+                    // advancement are ONE ATOMIC OPERATION. A Conflict
+                    // round's completed GET may itself carry the
+                    // own-commit evidence (holder=us, renewTime moved vs
+                    // the PRE-conflict baseline) while the ledger is
+                    // armed — the foreign rv-mover that bounced our PUT
+                    // does not un-commit our zombie write. Pre-fix this
+                    // arm re-baselined unconditionally, destroying the
+                    // movement evidence the act-failed law routes
+                    // EvidenceResolve on: the (Us, Moved, Armed) cell
+                    // was unreachable from the commit-before-GET
+                    // schedule and the replica stayed fenced extra
+                    // rounds. Consult the SAME total routing law against
+                    // the OLD baseline and consume BEFORE re-baselining;
+                    // every other routed action keeps its existing home
+                    // (the conflict deferral machinery above, the
+                    // act-failed arm, the fence law) — only the
+                    // evidence cell is consumed here, where it would
+                    // otherwise be destroyed.
+                    // r[impl sched.lease.cancelled-write+2]
+                    if is_conflict
+                        && matches!(
+                            route_act_failed_read(
+                                standing.believes(),
+                                HolderCell::of_read(facts.as_ref()),
+                                ContentCell::of_read(&content_baseline, facts.as_ref()),
+                                LedgerCell::of(&unconfirmed),
+                            ),
+                            ActFailedAction::EvidenceResolve
+                        )
+                    {
+                        let f = facts.as_ref().expect(
+                            "EvidenceResolve is routed only for present reads \
+                             (the absence partition; census + kani pinned)",
+                        );
+                        let led = unconfirmed.take().expect(
+                            "EvidenceResolve is routed only for an armed ledger \
+                             (route_act_failed_read is total; census + kani pinned)",
+                        );
+                        consume_own_commit_evidence(
+                            led,
+                            f,
+                            &mut blind,
+                            fence_now(),
+                            &state,
+                            &mut standing,
+                            &marks_dirty,
+                            &hooks,
+                            &cfg.holder_id,
+                        );
+                    }
                     content_baseline = match facts {
                         Some(f) => ContentBaseline::Present {
                             renew_time: f.renew_time,
@@ -2085,86 +2218,22 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                     "EvidenceResolve is routed only for an armed ledger \
                              (route_act_failed_read is total; census + kani pinned)",
                                 );
-                                blind.stamp(led.anchor);
-                                // merged_bug_122: the stamp is unconditional
-                                // (the evidence is real and the ledger is
-                                // consumed) but the ACQUIRE is fence-gated. A
-                                // ledger anchor already past SELF_FENCE_AFTER
-                                // at consumption time makes the acquire
-                                // provably futile — the trailing
-                                // maybe_self_fence in this same arm would
-                                // re-fence it before the next await, churning
-                                // hooks/marks/recovery once per round of a
-                                // slow-commit brownout.
-                                let anchor_age = blind.blind_for(fence_now());
-                                if anchor_age > SELF_FENCE_AFTER {
-                                    info!(
-                                        ?anchor_age,
-                                        "own-commit evidence consumed, but its anchor is already \
-                                 past the fence deadline — staying fenced (an acquire \
-                                 here would be re-fenced this same arm)"
-                                    );
-                                } else if !standing.believes() {
-                                    // A self-fence inside the mid-band window
-                                    // already ran the lose edge; the evidence
-                                    // proves the apiserver still (or again)
-                                    // names us holder, so re-enter through the
-                                    // ordinary acquire edge with the FETCHED
-                                    // transition count — the same-count case is
-                                    // the documented same-epoch re-acquire
-                                    // (generation fetch_max no-op, in-flight
-                                    // work survives). The bump-confirmation is
-                                    // deliberately NOT run here: confirmation
-                                    // stays a completed-round property
-                                    // (sched.recovery.bump-confirm), and
-                                    // pre-fix this regime fenced outright —
-                                    // strictly worse than a gated recovery.
-                                    let new_gen = state.on_acquire(f.transitions);
-                                    info!(
-                                        generation = new_gen,
-                                        holder = %cfg.holder_id,
-                                        "own-commit evidence (holder=us, renewTime moved) restored \
-                                         leadership belief after an abandoned write"
-                                    );
-                                    marks_dirty.mark();
-                                    hooks.on_acquire();
-                                    // Counts as a Leading observation: the read
-                                    // is apiserver-authoritative about the hold.
-                                    // Routed THROUGH the funnel (merged_bug_114)
-                                    // — the rebound comparison no-ops on the
-                                    // just-recorded count, and the ObservedHeld
-                                    // witness keeps a funnel-skipping sibling
-                                    // consumer untypeable.
-                                    observe_held_while_believing(
-                                        &state,
-                                        &mut standing,
-                                        &marks_dirty,
-                                        &hooks,
-                                        &cfg.holder_id,
-                                        f.transitions,
-                                    );
-                                } else {
-                                    // Still believing: this is a completed read
-                                    // of a lease we hold — the SAME facts the
-                                    // Leading renew round consumes, so it routes
-                                    // through the SAME observe-completed-read
-                                    // body. A foreign term that completed inside
-                                    // the observation gap (moved count) rebounds
-                                    // here exactly as it would on a Completed
-                                    // round; pre-fix this leg skipped the
-                                    // comparison and the term was never repaired
-                                    // (no round Completes in the reads-complete/
-                                    // acts-fail regime, and the evidence
-                                    // re-stamps defeat the self-fence).
-                                    observe_held_while_believing(
-                                        &state,
-                                        &mut standing,
-                                        &marks_dirty,
-                                        &hooks,
-                                        &cfg.holder_id,
-                                        f.transitions,
-                                    );
-                                }
+                                // merged_bug_051: the consumption leg is
+                                // shared with the Conflict arm — one
+                                // body, two routing sites, so the two
+                                // cannot drift (see
+                                // consume_own_commit_evidence).
+                                consume_own_commit_evidence(
+                                    led,
+                                    f,
+                                    &mut blind,
+                                    fence_now(),
+                                    &state,
+                                    &mut standing,
+                                    &marks_dirty,
+                                    &hooks,
+                                    &cfg.holder_id,
+                                );
                                 ContentBaseline::Present {
                                     renew_time: f.renew_time.clone(),
                                 }
@@ -2864,6 +2933,21 @@ mod lease_standing_proofs {
         };
 
         let action = route_act_failed_read(believes, holder, content, ledger);
+        // merged_bug_051 (the conflict-gate premise, both directions):
+        // EvidenceResolve is EXACTLY the (Us, Moved, Armed) product in
+        // BOTH belief states — the Conflict arm's consume-before-
+        // rebaseline gate fires on precisely the own-commit evidence
+        // cell, never more (no foreign/frozen/empty cell can consume)
+        // and never less (the cell is reachable from either belief
+        // state; pre-fix the commit-before-GET schedule made it
+        // unreachable by destroying Moved at the re-baseline).
+        assert!(
+            (action == ActFailedAction::EvidenceResolve)
+                == (matches!(holder, HolderCell::Us)
+                    && matches!(content, ContentCell::Moved)
+                    && matches!(ledger, LedgerCell::Armed)),
+            "EvidenceResolve == the own-commit evidence cell, exactly"
+        );
         // The absence partition (bug_143): absence actions route
         // exactly the Absent cells — discharges the executor's
         // facts-presence expects in both directions.
@@ -5956,6 +6040,133 @@ mod tests {
         loop_task.await.expect("lease loop exits");
     }
 
+    /// W11-BM (merged_bug_051): the MISSING interleaving — the zombie
+    /// commits BEFORE the conflict round's GET (commit-before-GET; the
+    /// in-tree sibling above pins only commit-after-GET). The round-3
+    /// GET serves the post-zombie renewTime (holder=us, MOVED vs our
+    /// baseline) and the PUT bounces on a foreign rv-mover inside the
+    /// sub-second GET→PUT window. Pre-fix the Conflict arm
+    /// re-baselined unconditionally PAST the armed ledger — evidence
+    /// observed but deliberately not adjudicated, then destroyed —
+    /// so the (Us, Moved, Armed)→EvidenceResolve cell was unreachable
+    /// from this schedule: the blind window stayed anchored at round
+    /// 1, the t=15s fence fired, and round 4's read (Frozen against
+    /// the advanced baseline) routed a no-consume action — the
+    /// replica stayed fenced on its own committed write.
+    ///
+    /// Post-fix: evidence consumption and baseline advancement are
+    /// ONE ATOMIC OPERATION — the Conflict arm consults the armed
+    /// ledger against the PRE-conflict baseline through the same
+    /// total routing law and consumes own-commit evidence BEFORE
+    /// re-baselining: the blind window re-anchors at the ledger's
+    /// t=5s anchor, the t=15s fence never fires, belief holds
+    /// end-to-end with zero loses.
+    ///
+    /// Pre-fix red, verbatim: `the conflict round must consume the
+    /// pre-observed movement evidence (atomic with its re-baseline);
+    /// pre-fix: re-baselined past the armed ledger, fenced at t=15s`.
+    // r[verify sched.lease.cancelled-write+2]
+    #[tokio::test(start_paused = true)]
+    async fn conflict_round_consumes_pre_observed_movement_evidence() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1 (t=0, healthy): acquire; settle the marks PATCH.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 2 (t=5s, the zombie): the renew PUT is transmitted
+        // and dropped — it commits server-side. The ledger arms at
+        // t=5s; nothing stamps the blind window.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+        assert!(state.is_leader(), "an act failure alone never loses");
+
+        // Round 3 (t=10s, commit-BEFORE-GET): the GET already serves
+        // the zombie's renewTime 12 (holder=us, MOVED vs baseline 11
+        // — own-commit evidence in hand, ledger armed); the PUT
+        // bounces on a foreign rv-mover (metadata patch) inside the
+        // GET→PUT window.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 12));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+        assert!(state.is_leader(), "the 409 itself must not lose");
+
+        // Round 4 (t=15s): post-fix the round-3 conflict CONSUMED the
+        // evidence (blind re-anchored at the t=5s ledger anchor →
+        // 10s blind < the 11s fence), so no fence fires; the read is
+        // Frozen with the ledger consumed and the deferral resolves
+        // through the funnel. Pre-fix: blind still anchored at t=0 →
+        // 15s > 11s → fenced, and the advanced baseline left nothing
+        // to consume — the replica lost leadership on its own write.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 12));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+
+        assert!(
+            state.is_leader(),
+            "the conflict round must consume the pre-observed movement \
+             evidence (atomic with its re-baseline); pre-fix: \
+             re-baselined past the armed ledger, fenced at t=15s"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            0,
+            "zero loses: the same-tick consumption keeps the fence schedule \
+             anchored at the committed write"
+        );
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires lock").len(),
+            1,
+            "no re-acquire needed — belief never broke"
+        );
+
+        shutdown.cancel();
+        for _ in 0..4 {
+            if let Some(req) = park.try_next().await {
+                if req.path.contains("/pods/us") {
+                    req.respond_ok(pod_ok("us"));
+                } else {
+                    req.respond_status(404, "NotFound", "gone");
+                }
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
     /// merged_bug_122 (acquire-before-fence): consuming own-commit
     /// evidence whose ledger anchor is ALREADY past the self-fence
     /// deadline must not take the acquire edge — the very next
@@ -8530,14 +8741,20 @@ mod tests {
             live.is_empty(),
             "producer-output dispatch violations in lib.rs:\n{live:?}"
         );
-        // Exactly one production dispatch, fed by the full producer
-        // output (the loop's single call site; the needle is split so
-        // this line does not count itself).
+        // Exactly two production dispatches, each fed by the full
+        // producer output (the needle is split so this line does not
+        // count itself): the act-failed arm's routing dispatch, and
+        // the merged_bug_051 Conflict-arm evidence gate (the same
+        // total law consulted against the PRE-conflict baseline so
+        // consumption is atomic with the re-baseline). Both sit under
+        // the no-prefilter scan above — a narrowed dispatch at either
+        // site is a violation regardless of this count.
         let dispatch_needle = concat!("HolderCell::", "of_read(facts.as_ref())");
         assert_eq!(
             include_str!("lib.rs").matches(dispatch_needle).count(),
-            1,
-            "the loop dispatch is the one production of_read(facts.as_ref()) site"
+            2,
+            "the two production of_read(facts.as_ref()) dispatch sites \
+             (act-failed routing + the merged_bug_051 conflict gate)"
         );
 
         // R22′ plants — the strawman shapes red at the raw-source
