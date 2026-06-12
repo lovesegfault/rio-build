@@ -94,6 +94,18 @@ pub use rio_migrations::MIGRATOR;
 const SUBSTITUTE_DURATION_BUCKETS: &[f64] =
     &[0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0];
 
+/// Histogram bucket boundaries for `rio_store_tiered_get_duration_seconds`.
+///
+/// The whole point is resolving the Express-vs-S3-standard TTFB gap:
+/// Express GETs cluster in single-digit ms, S3 standard in tens of ms.
+/// The global `[0.005..10.0]` default has only two boundaries below
+/// 25ms — both modes would smear into the same buckets. Sub-ms low end
+/// catches warmed-connection Express reads; the 0.25–1.0s tail is
+/// SDK-retry/throttle territory, not normal serving.
+#[cfg(feature = "server")]
+const TIERED_GET_DURATION_BUCKETS: &[f64] =
+    &[0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
+
 /// Per-crate histogram bucket overrides, passed to
 /// `rio_common::server::bootstrap` → `init_metrics`. Every
 /// `describe_histogram!` in this crate must have an entry here OR be in
@@ -111,6 +123,10 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         // 429-retry sleeps).
         "rio_store_check_available_duration_seconds",
         SUBSTITUTE_DURATION_BUCKETS,
+    ),
+    (
+        "rio_store_tiered_get_duration_seconds",
+        TIERED_GET_DURATION_BUCKETS,
     ),
     (
         // Digest-list length, not seconds: 1 (single probe) to the
@@ -208,6 +224,14 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_tiered_writethrough_errors_total",
         "Tiered backend Express write-through failures (chunk served from S3 standard but Express not warmed)"
+    );
+    describe_histogram!(
+        "rio_store_tiered_get_duration_seconds",
+        "Tiered backend chunk GET latency, labeled by serving tier \
+         (tier=express|standard). Each arm times only its own tier's \
+         read — the standard arm excludes the failed Express probe — \
+         so the two series directly measure the Express-vs-S3-standard \
+         TTFB gap the cache tier exists to buy."
     );
     // Spec'd in observability.typ ahead of P0585 (Express eviction
     // sweeper); register HELP text now so the metrics_registered

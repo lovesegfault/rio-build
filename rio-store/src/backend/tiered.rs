@@ -29,10 +29,24 @@
 //! `init_chunk_backend` in `config.rs`) so a throttling Express bucket
 //! fails fast instead of eating the full backoff budget on every read.
 
+use std::time::Instant;
+
 use bytes::Bytes;
 use tracing::{debug, warn};
 
 use super::{ChunkBackend, S3ChunkBackend};
+
+/// Record one served chunk read into the per-tier latency histogram.
+///
+/// The hit/miss counters prove WHERE reads are served from but not how
+/// fast; this is the direct measurement of the Express-vs-S3-standard
+/// TTFB gap the tier exists to buy. Each arm times only its own tier's
+/// GET (the `standard` arm excludes the preceding Express probe and the
+/// write-through), so the two series compare raw per-tier read latency.
+fn record_get_duration(tier: &'static str, start: Instant) {
+    metrics::histogram!("rio_store_tiered_get_duration_seconds", "tier" => tier)
+        .record(start.elapsed().as_secs_f64());
+}
 
 pub struct TieredChunkBackend {
     /// Per-AZ S3 Express directory bucket. `None` = pass-through.
@@ -44,6 +58,19 @@ pub struct TieredChunkBackend {
 impl TieredChunkBackend {
     pub fn new(local: Option<S3ChunkBackend>, remote: S3ChunkBackend) -> Self {
         Self { local, remote }
+    }
+
+    /// Remote (S3-standard) GET with per-tier latency recording.
+    /// Records only when bytes are served — a `NotFound` latency would
+    /// pollute the distribution with non-serves, and the miss/error
+    /// counters already cover those outcomes.
+    async fn remote_get_recorded(&self, hash: &[u8; 32]) -> anyhow::Result<Option<Bytes>> {
+        let start = Instant::now();
+        let got = self.remote.get(hash).await?;
+        if got.is_some() {
+            record_get_duration("standard", start);
+        }
+        Ok(got)
     }
 }
 
@@ -57,12 +84,14 @@ impl ChunkBackend for TieredChunkBackend {
     // r[impl store.backend.tiered-get-fallback]
     async fn get(&self, hash: &[u8; 32]) -> anyhow::Result<Option<Bytes>> {
         let Some(local) = &self.local else {
-            return self.remote.get(hash).await;
+            return self.remote_get_recorded(hash).await;
         };
 
+        let local_start = Instant::now();
         match local.get(hash).await {
             Ok(Some(data)) => {
                 metrics::counter!("rio_store_tiered_local_hits_total").increment(1);
+                record_get_duration("express", local_start);
                 return Ok(Some(data));
             }
             Ok(None) => {
@@ -83,7 +112,7 @@ impl ChunkBackend for TieredChunkBackend {
             }
         }
 
-        let Some(data) = self.remote.get(hash).await? else {
+        let Some(data) = self.remote_get_recorded(hash).await? else {
             return Ok(None);
         };
 
@@ -196,6 +225,36 @@ mod tests {
         GetObjectError::NoSuchKey(NoSuchKey::builder().build())
     }
 
+    const GET_HISTOGRAM: &str = "rio_store_tiered_get_duration_seconds";
+
+    /// Rendered recorder key for one tier arm of the latency histogram.
+    fn tier_key(tier: &str) -> String {
+        format!("{GET_HISTOGRAM}{{tier={tier}}}")
+    }
+
+    /// Assert the latency histogram was recorded under exactly `tier`
+    /// and NOT the other arm. Guards both failure modes of the metric:
+    /// emission never wired (nothing recorded) and the wrong label arm
+    /// (hit counted as standard or vice versa).
+    fn assert_recorded_tier(rec: &rio_test_support::metrics::CountingRecorder, tier: &str) {
+        assert!(
+            rec.histogram_key_touched(&tier_key(tier)),
+            "expected {} recorded, saw {:?}",
+            tier_key(tier),
+            rec.histogram_keys()
+        );
+        let other = if tier == "express" {
+            "standard"
+        } else {
+            "express"
+        };
+        assert!(
+            !rec.histogram_key_touched(&tier_key(other)),
+            "latency must not be recorded under tier={other}, saw {:?}",
+            rec.histogram_keys()
+        );
+    }
+
     // r[verify store.backend.tiered-put-remote-first]
     #[tokio::test]
     async fn put_remote_only() -> anyhow::Result<()> {
@@ -210,15 +269,20 @@ mod tests {
     // r[verify store.backend.tiered-get-fallback]
     #[tokio::test]
     async fn get_local_hit_short_circuits() -> anyhow::Result<()> {
+        let recorder = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let hit = mock!(Client::get_object).then_output(body(b"hot"));
         let backend = TieredChunkBackend::new(Some(s3("express", &[&hit])), must_not_touch("std"));
         assert_eq!(backend.get(&HASH).await?.unwrap().as_ref(), b"hot");
+        assert_recorded_tier(&recorder, "express");
         Ok(())
     }
 
     // r[verify store.backend.tiered-get-fallback]
     #[tokio::test]
     async fn get_local_miss_falls_back_and_fills() -> anyhow::Result<()> {
+        let recorder = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let local_miss = mock!(Client::get_object).then_error(no_such_key);
         let local_fill =
             mock!(Client::put_object).then_output(|| PutObjectOutput::builder().build());
@@ -229,6 +293,7 @@ mod tests {
         );
         assert_eq!(backend.get(&HASH).await?.unwrap().as_ref(), b"cold");
         assert_eq!(local_fill.num_calls(), 1, "write-through filled Express");
+        assert_recorded_tier(&recorder, "standard");
         Ok(())
     }
 
@@ -236,6 +301,8 @@ mod tests {
     // r[verify store.backend.tiered-get-fallback]
     #[tokio::test]
     async fn get_local_error_falls_back() -> anyhow::Result<()> {
+        let recorder = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let local_err = mock!(Client::get_object).then_error(|| {
             GetObjectError::generic(ErrorMetadata::builder().code("InternalError").build())
         });
@@ -248,6 +315,9 @@ mod tests {
             s3("std", &[&remote_get]),
         );
         assert_eq!(backend.get(&HASH).await?.unwrap().as_ref(), b"cold");
+        // Express errored, never served — latency lands on the
+        // standard arm only.
+        assert_recorded_tier(&recorder, "standard");
         Ok(())
     }
 
@@ -272,6 +342,8 @@ mod tests {
     /// Both tiers miss → `None`. Caller treats this as data loss.
     #[tokio::test]
     async fn get_both_miss_none() -> anyhow::Result<()> {
+        let recorder = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let local_miss = mock!(Client::get_object).then_error(no_such_key);
         let remote_miss = mock!(Client::get_object).then_error(no_such_key);
         let backend = TieredChunkBackend::new(
@@ -279,15 +351,26 @@ mod tests {
             s3("std", &[&remote_miss]),
         );
         assert!(backend.get(&HASH).await?.is_none());
+        // No bytes served → no latency observation on either arm; a
+        // NotFound timing would pollute the serve-latency distribution.
+        assert!(
+            !recorder.histogram_touched(GET_HISTOGRAM),
+            "no serve must record no latency, saw {:?}",
+            recorder.histogram_keys()
+        );
         Ok(())
     }
 
     // r[verify store.backend.tiered-get-fallback]
     #[tokio::test]
     async fn local_none_passes_through() -> anyhow::Result<()> {
+        let recorder = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let remote_get = mock!(Client::get_object).then_output(body(b"data"));
         let backend = TieredChunkBackend::new(None, s3("std", &[&remote_get]));
         assert_eq!(backend.get(&HASH).await?.unwrap().as_ref(), b"data");
+        // Pass-through reads ARE S3-standard serves — same arm.
+        assert_recorded_tier(&recorder, "standard");
         Ok(())
     }
 

@@ -227,6 +227,7 @@
     "rio_store_substitute_skipped_total",
     "rio_store_substitute_stale_reclaimed_total",
     "rio_store_substitute_total",
+    "rio_store_tiered_get_duration_seconds",
     "rio_store_tiered_local_errors_total",
     "rio_store_tiered_local_hits_total",
     "rio_store_tiered_local_misses_total",
@@ -1380,6 +1381,11 @@
         "name": "rio_store_substitute_total",
         "kind": "counter",
         "help": "Upstream substitution attempts, labeled by result (hit/miss/error) and tenant (UUID). Per-upstream debugging detail is in the debug!/warn! log lines (which carry upstream=<url>); the metric label is bounded by tenant count, not by tenant-supplied URL."
+      },
+      {
+        "name": "rio_store_tiered_get_duration_seconds",
+        "kind": "histogram",
+        "help": "Tiered backend chunk GET latency, labeled by serving tier (tier=express|standard). Each arm times only its own tier's read — the standard arm excludes the failed Express probe — so the two series directly measure the Express-vs-S3-standard TTFB gap the cache tier exists to buy."
       },
       {
         "name": "rio_store_tiered_local_errors_total",
