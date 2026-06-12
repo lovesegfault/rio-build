@@ -838,6 +838,20 @@ async fn resolve_maybe_minted<T: PullTransport>(
         };
         let failure = match tokio::time::timeout(SIGTERM_FINAL_ATTEMPT, transport.pull(req)).await {
             Ok(Ok(resp)) => break resp,
+            // bug_153: the fatal arm the two sibling loops always had
+            // — a permanent rejection is adjudicated ONCE (the
+            // authority-derived set, `is_fatal_rejection`); retrying a
+            // byte-identical request under the idle envelope only
+            // delays the same nonzero exit and mis-signals the logs.
+            // UNRESOLVED posture is unchanged: the caller exits
+            // nonzero and the establishment sweep reaps the open
+            // attempt against a Failed pod.
+            Ok(Err(status)) if is_fatal_rejection(status.code()) => {
+                tracing::error!(code = ?status.code(), msg = status.message(),
+                    "maybe-minted confirm pull permanently rejected; exiting \
+                     nonzero (establishment sweep remains the backstop)");
+                return false;
+            }
             Ok(Err(status)) => format!("failed: {:?} {}", status.code(), status.message()),
             Err(_elapsed) => "unanswered".to_owned(),
         };
@@ -1935,6 +1949,198 @@ mod tests {
                 "a permanent rejection must not burn the retry budget ({code:?})"
             );
         }
+    }
+
+    /// **W12-N (bug_153)** — *proposition: a permanent rejection is
+    /// adjudicated once, identically, in EVERY consulting loop — the
+    /// maybe-minted resolve included; population: the [GEN-SET]
+    /// transport-loop census below.* Pre-fix the Ok(Err) arm never
+    /// consulted `is_fatal_rejection`, so permanent rejections
+    /// (Unauthenticated/PermissionDenied/Unimplemented/
+    /// InvalidArgument) were re-presented byte-identically up to the
+    /// idle budget (3) with "retrying" warns while both siblings
+    /// fast-exit on the same authority. Bounded impact (identical
+    /// terminal disposition, ~2 extra envelope sleeps, mis-signaled
+    /// logs) — the close is the sibling-identical fatal arm + the
+    /// loop-set census (the full transport-seam hoist recorded
+    /// REJECTED for this round: a transport-layer refactor out of
+    /// proportion to a low; the census closes the class).
+    // r[verify builder.pull.retry-loop+2]
+    #[tokio::test(start_paused = true)]
+    async fn maybe_minted_fatal_rejection_resolves_after_one_call() {
+        for status in [
+            tonic::Status::permission_denied("token bound to a different intent"),
+            tonic::Status::unauthenticated("executor token expired"),
+            tonic::Status::unimplemented("PullAssignment not served"),
+            tonic::Status::invalid_argument("intent_id is required"),
+        ] {
+            let code = status.code();
+            let mut t = ScriptedTransport::new(vec![Err(status)], vec![]);
+            let shutdown = token();
+            let resolved =
+                resolve_maybe_minted(&mut t, "intent-a", "tok", &shutdown, ConfirmRegime::Idle)
+                    .await;
+            assert!(
+                !resolved,
+                "a permanently rejected confirm is UNRESOLVED (nonzero \
+                 exit; the establishment sweep reaps against a Failed \
+                 pod) for {code:?}"
+            );
+            assert_eq!(
+                t.pull_calls, 1,
+                "left (pre-fix): the maybe-minted loop re-presented the \
+                 permanent rejection byte-identically under the idle \
+                 envelope (3 calls, retry warns) / right: adjudicated \
+                 ONCE, sibling-identical with pull_until_resolved and \
+                 report_until_acked ({code:?})"
+            );
+        }
+    }
+
+    /// W12-N's census ([GEN-SET], the bug_153 class-closer): the SET
+    /// of transport-consuming retry loops is DERIVED from this file
+    /// (the `PullTransport` trait is `pub(super)` — every consumer is
+    /// structurally in-file; widening the trait is a reviewable
+    /// event), and EVERY derived member must consult the fatal
+    /// authority — a fourth loop born without the consult reds here
+    /// (per-call-site opt-in was the enumeration trap; the fatal SET
+    /// itself is authority-derived and pinned by
+    /// `fatal_set_agrees_with_the_authority`).
+    ///
+    /// POPULATION face (census riders (a)): the universe is the
+    /// compile-embedded self (resolve face compile-discharged), the
+    /// floor is the three expected members VERIFIED in the derived
+    /// set, and the walk's non-vacuity is asserted. Plant battery
+    /// (riders (b)): the strawman below drives an unconsulting loop
+    /// through the SAME walk (enrollment face); the walk derives
+    /// membership from the transport-call grammar, not a name list
+    /// (jurisdiction face is the file = the trait's whole scope);
+    /// aliased transport bindings still contain the dotted call text
+    /// (the receiver name is not anchored — overscan posture).
+    #[test]
+    fn transport_retry_loop_census_consults_the_fatal_authority() {
+        const SELF_SRC: &str = include_str!("pull.rs");
+        let members = derive_transport_loops(SELF_SRC);
+        assert!(
+            members.len() >= 3,
+            "VACUOUS WALK: expected at least the three known loops, \
+             derived {}",
+            members.len()
+        );
+        for expected in [
+            "pull_until_resolved",
+            "report_until_acked",
+            "resolve_maybe_minted",
+        ] {
+            assert!(
+                members.iter().any(|(name, _)| name == expected),
+                "expected member {expected} missing from the derived \
+                 loop set (the walk grammar broke)"
+            );
+        }
+        for (name, body) in &members {
+            assert!(
+                body.contains(concat!("is_fatal_", "rejection(")),
+                "transport loop `{name}` never consults the fatal \
+                 authority — the bug_153 shape (adjudicate the \
+                 rejection once, identically, in every loop)"
+            );
+        }
+    }
+
+    /// The census's planted red (enrollment face): a NEW
+    /// transport-consuming loop WITHOUT the fatal consult, driven
+    /// through the SAME walk, MUST be derived and MUST fail the
+    /// consult law NAMING the loop.
+    #[test]
+    fn loop_census_plants_red_on_unconsulting_loop() {
+        let strawman = format!(
+            "async fn rogue_confirm<T: PullTransport>(t: &mut T) {{\n\
+             loop {{\n\
+             let _ = t{}(req).await;\n\
+             }}\n\
+             }}\n",
+            ".pull"
+        );
+        // The walk needs the transport-call grammar: receiver-dotted
+        // pull/report calls. Use the production grammar form.
+        let planted = format!(
+            "async fn rogue_confirm<T: PullTransport>(t: &mut T) {{\n\
+             loop {{\n\
+             let _ = transport{}(req).await;\n\
+             }}\n\
+             }}\n",
+            ".pull"
+        );
+        let _ = strawman;
+        let members = derive_transport_loops(&planted);
+        assert_eq!(
+            members.len(),
+            1,
+            "plant premise: the walk derives the rogue loop"
+        );
+        let (name, body) = &members[0];
+        assert_eq!(name, "rogue_confirm");
+        assert!(
+            !body.contains(concat!("is_fatal_", "rejection(")),
+            "plant premise: the rogue loop never consults"
+        );
+        // The production law (the same predicate the census asserts)
+        // refuses this member.
+        let consults = body.contains(concat!("is_fatal_", "rejection("));
+        assert!(!consults, "the plant is the state the census refuses");
+        // Empty-walk red (rider (a)): the same walk on an empty
+        // universe derives nothing — the floor's refused state.
+        assert!(derive_transport_loops("").is_empty());
+    }
+
+    /// The walk: column-0 `async fn` heads (pub or private); a body
+    /// ends at the first column-0 `}` (rust item close), so test-
+    /// module text never attributes to the last production fn.
+    /// Membership = the body consumes the transport (a dotted
+    /// `.pull(`/`.report(` call on any receiver — overscan: aliasing
+    /// the transport binding does not change the call text).
+    fn derive_transport_loops(src: &str) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut current: Option<(String, String)> = None;
+        for line in src.lines() {
+            let head = line
+                .strip_prefix("pub(super) async fn ")
+                .or_else(|| line.strip_prefix("pub async fn "))
+                .or_else(|| line.strip_prefix("async fn "));
+            if let Some(rest) = head {
+                if let Some((name, body)) = current.take() {
+                    out.push((name, body));
+                }
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                current = Some((name, String::new()));
+                continue;
+            }
+            if line == "}" {
+                if let Some((name, body)) = current.take() {
+                    out.push((name, body));
+                }
+                continue;
+            }
+            if let Some((_, body)) = current.as_mut() {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+        if let Some((name, body)) = current.take() {
+            out.push((name, body));
+        }
+        out.into_iter()
+            .filter(|(_, body)| {
+                body.contains(concat!("transport", ".pull("))
+                    || body.contains(concat!("transport", ".report("))
+                    || body.contains(concat!(".pull", "(req)"))
+                    || body.contains(concat!(".report", "(req)"))
+            })
+            .collect()
     }
 
     /// The production transport presents the executor identity token as
