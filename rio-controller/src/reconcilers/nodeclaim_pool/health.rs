@@ -592,7 +592,7 @@ pub struct DeleteAttempt {
 ///    eviction never fired and `reaped_total{reason=dead}`
 ///    permanently undercounted).
 /// 4. [`prune_expired`](Self::prune_expired) — DISCONFIRMED entries
-///    older than [`TOMBSTONE_TTL_TICKS`] drop as a typed, DISCLOSED
+///    older than [`TOMBSTONE_TTL_FOLDS`] drop as a typed, DISCLOSED
 ///    disposition (warn + expiry counter), never a silent prune.
 /// 5. `clear()` on the ACQUISITION EDGE (suppress polarity, the
 ///    `inflight_created` row's rationale: a stale previous-tenure
@@ -730,7 +730,7 @@ pub struct TombstoneSweep {
 /// reap lane retries while its conditions persist, and a completed
 /// retry consumes via the callers' `reaped_claims` loop).
 ///
-/// Mis-attribution bound: within [`TOMBSTONE_TTL_TICKS`] of OUR
+/// Mis-attribution bound: within [`TOMBSTONE_TTL_FOLDS`] of OUR
 /// delete attempt, an independent foreign teardown of the same claim
 /// would be counted as ours — the same bounded suppression window the
 /// TTL derivation prices for the vanish fold, and the consequence is
