@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
-use rio_evalstore::store::ProvidedInfo;
+use rio_evalstore::store::{EntryKind, PathStat, ProvidedInfo};
 use rio_evalstore::{CaMethod, DumpMethod, EvalStore, EvalStoreError};
 use rio_nix::hash::{HashAlgo, NixHash};
 use rio_nix::nar::{self, NarEntry, NarNode};
@@ -96,27 +96,35 @@ fn add_from_dump_roundtrip_and_readback() -> anyhow::Result<()> {
     assert_eq!(info.nar_hash, hex::encode(Sha256::digest(&dump)));
     assert_eq!(info.ca.as_deref().map(|c| &c[..8]), Some("fixed:r:"));
 
-    // NAR regeneration is byte-identical (framing from DAG).
+    // NAR regeneration is byte-identical (framing from the dir blobs).
     let mut regen = Vec::new();
     store.nar_from_path(basename, &mut regen)?;
     assert_eq!(regen, dump, "regenerated NAR must be byte-identical");
 
     // Read-back ops.
     let root = store.lstat(basename, "")?.expect("root exists");
-    assert!(matches!(
-        root,
-        rio_evalstore::cas::DagNode::Directory { .. }
-    ));
+    assert_eq!(root, PathStat::Directory);
     let dirents = store.read_directory(basename, "")?;
     assert_eq!(
-        dirents.keys().collect::<Vec<_>>(),
-        vec!["bin", "data.txt", "link"]
+        dirents,
+        vec![
+            (b"bin".to_vec(), EntryKind::Directory),
+            (b"data.txt".to_vec(), EntryKind::Regular),
+            (b"link".to_vec(), EntryKind::Symlink),
+        ]
     );
     let mut content = Vec::new();
     store.read_file(basename, "bin/tool", &mut content)?;
     assert_eq!(content, b"#!/bin/sh\necho hi\n");
-    assert_eq!(store.read_link(basename, "link")?, "data.txt");
+    assert_eq!(store.read_link(basename, "link")?, b"data.txt");
     assert_eq!(store.lstat(basename, "missing")?, None);
+    assert_eq!(
+        store.lstat(basename, "bin/tool")?,
+        Some(PathStat::Regular {
+            size: 18,
+            executable: true
+        })
+    );
 
     // queryPathFromHashPart finds it.
     let hash_part = &basename[..32];
@@ -124,6 +132,39 @@ fn add_from_dump_roundtrip_and_readback() -> anyhow::Result<()> {
         store.query_path_from_hash_part(hash_part)?,
         Some(expected.to_string())
     );
+    Ok(())
+}
+
+/// Everything survives a close + reopen: the pack store is flushed on
+/// drop, and a fresh process serves the same bytes (streamed content
+/// comes from FETCHED records, not from any origin tree).
+#[test]
+fn streamed_ingest_persists_across_reopen() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let dump = nar_bytes(&sample_tree());
+    let path = {
+        let store = open_store(&dir);
+        store
+            .add_from_dump(
+                "sample",
+                DumpMethod::NixArchive,
+                CaMethod::NixArchive,
+                &[],
+                &mut Cursor::new(&dump),
+                &mut |h| Ok(nix_path_recursive("sample", h)),
+            )?
+            .path
+    };
+    let basename = path.strip_prefix("/nix/store/").unwrap();
+
+    let store = open_store(&dir);
+    assert!(store.is_valid_path(basename), "path lost across reopen");
+    let mut regen = Vec::new();
+    store.nar_from_path(basename, &mut regen)?;
+    assert_eq!(regen, dump);
+    let mut content = Vec::new();
+    store.read_file(basename, "data.txt", &mut content)?;
+    assert_eq!(content, b"payload\n");
     Ok(())
 }
 
@@ -250,39 +291,67 @@ fn expected_drv_path(name: &str, aterm: &str) -> StorePath {
     .unwrap()
 }
 
+/// Drvs are memory-only (ADR-024): served from the in-process map for
+/// the lifetime of the store, never written to the pack store, gone
+/// after close.
 #[test]
-fn write_derivation_cross_checks_and_stores_json() -> anyhow::Result<()> {
+fn write_derivation_is_memory_only() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let store = open_store(&dir);
     let nix_path = expected_drv_path("leaf.drv", DRV_ATERM);
-    let drv_json = br#"{"name":"leaf","version":4}"#;
 
-    let path = store.write_derivation(
-        "leaf.drv",
-        DRV_ATERM.as_bytes(),
-        drv_json,
-        nix_path.as_str(),
-    )?;
+    let path = store.write_derivation("leaf.drv", DRV_ATERM.as_bytes(), nix_path.as_str())?;
     assert_eq!(path, nix_path.as_str());
 
     let basename = nix_path.basename();
     assert!(store.is_valid_path(basename));
 
-    // The drv JSON blob is captured (the canonical stored form).
-    assert_eq!(
-        store.read_drv_json(basename)?.as_deref(),
-        Some(&drv_json[..])
-    );
-
-    // The path's content is the original ATerm bytes.
+    // The path's content is the original ATerm bytes (readDerivation).
     let mut aterm_back = Vec::new();
     store.read_file(basename, "", &mut aterm_back)?;
     assert_eq!(aterm_back, DRV_ATERM.as_bytes());
 
+    // lstat + NAR regeneration agree with a plain regular-file node.
+    assert_eq!(
+        store.lstat(basename, "")?,
+        Some(PathStat::Regular {
+            size: DRV_ATERM.len() as u64,
+            executable: false
+        })
+    );
+    let mut regen = Vec::new();
+    store.nar_from_path(basename, &mut regen)?;
+    let expected_nar = nar_bytes(&NarNode::Regular {
+        executable: false,
+        contents: DRV_ATERM.as_bytes().to_vec(),
+    });
+    assert_eq!(regen, expected_nar);
+
     // Info carries text CA + both references.
-    let info = store.query_path_info(basename)?.expect("indexed");
+    let info = store.query_path_info(basename)?.expect("known");
     assert_eq!(info.references.len(), 2);
-    assert!(info.drv_json_blob.is_some());
+    assert_eq!(info.ca.as_deref().map(|c| &c[..5]), Some("text:"));
+
+    // No drv write reached the pack store: zero records were written by
+    // this whole test...
+    for op in ["dirblob_write", "fetched_write", "meta_write"] {
+        assert_eq!(store.stats().count(op), 0, "{op} after write_derivation");
+    }
+    drop(store);
+    // ...and a fresh process does not know the path (memory-only).
+    let reopened = open_store(&dir);
+    assert!(
+        !reopened.is_valid_path(basename),
+        "drv path must die with the process"
+    );
+    // Belt and braces: no ATerm bytes anywhere in the CAS directory.
+    for entry in walk_files(&dir.path().join("cas")) {
+        let data = std::fs::read(&entry)?;
+        assert!(
+            !data.windows(7).any(|w| w == b"Derive("),
+            "drv bytes leaked into {entry:?}"
+        );
+    }
     Ok(())
 }
 
@@ -292,7 +361,7 @@ fn write_derivation_mismatch_prints_both_paths() -> anyhow::Result<()> {
     let store = open_store(&dir);
     let wrong = "/nix/store/00000000000000000000000000000000-leaf.drv";
     let err = store
-        .write_derivation("leaf.drv", DRV_ATERM.as_bytes(), b"{}", wrong)
+        .write_derivation("leaf.drv", DRV_ATERM.as_bytes(), wrong)
         .expect_err("must fail");
     let rust_path = expected_drv_path("leaf.drv", DRV_ATERM);
     let msg = err.to_string();
@@ -378,8 +447,11 @@ fn foreign_path_errors_name_m1() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Warm re-ingest of identical content writes zero new pack records —
+/// content addressing dedups files, directory blobs, and the path-meta
+/// record alike.
 #[test]
-fn repeat_ingest_writes_no_new_blobs() -> anyhow::Result<()> {
+fn repeat_ingest_writes_no_new_records() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let store = open_store(&dir);
     let dump = nar_bytes(&sample_tree());
@@ -394,20 +466,25 @@ fn repeat_ingest_writes_no_new_blobs() -> anyhow::Result<()> {
         )
     };
     ingest()?;
-    let count_blobs = |root: &std::path::Path| -> usize { walkdir_count(&root.join("blobs")) };
-    let cas_root = dir.path().join("cas");
-    let before = count_blobs(&cas_root);
+    let writes = |op: &str| store.stats().count(op);
+    let before = (
+        writes("fetched_write"),
+        writes("dirblob_write"),
+        writes("meta_write"),
+    );
+    assert!(before.0 > 0 && before.1 > 0 && before.2 > 0, "{before:?}");
     ingest()?;
-    assert_eq!(
-        count_blobs(&cas_root),
-        before,
-        "warm re-ingest must dedup all blobs"
+    let after = (
+        writes("fetched_write"),
+        writes("dirblob_write"),
+        writes("meta_write"),
+    );
+    assert_eq!(before, after, "warm re-ingest must dedup every record");
+    assert!(
+        writes("fetched_dedup") > 0 && writes("dirblob_dedup") > 0,
+        "dedup counters must show the warm hits"
     );
     Ok(())
-}
-
-fn walkdir_count(dir: &std::path::Path) -> usize {
-    walk_files(dir).count()
 }
 
 fn walk_files(dir: &std::path::Path) -> impl Iterator<Item = std::path::PathBuf> {
@@ -426,79 +503,92 @@ fn walk_files(dir: &std::path::Path) -> impl Iterator<Item = std::path::PathBuf>
     files.into_iter()
 }
 
-/// Ingest is the integrity boundary: the blob key is derived by hashing
-/// the ingested bytes, so what enters the CAS is correct by construction.
-/// Local reads trust the disk (ADR-024 integrity model) — this pins the
-/// key/content agreement at the ingest edge.
+/// Reads must bump the path's root last-use clock — the LRU the pack
+/// store GC evicts by. Touches are batched in-process and persisted at
+/// flush (ADR-024: batched index records, not per-read appends).
 #[test]
-fn ingest_derives_blob_keys_from_content() -> anyhow::Result<()> {
+fn access_touches_root_lru_clock() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let store = open_store(&dir);
-    store.add_from_dump(
-        "sample",
-        DumpMethod::NixArchive,
-        CaMethod::NixArchive,
-        &[],
-        &mut Cursor::new(nar_bytes(&sample_tree())),
-        &mut |h| Ok(nix_path_recursive("sample", h)),
-    )?;
+    let cas = dir.path().join("cas");
+    let dump = nar_bytes(&sample_tree());
+    let basename = {
+        let store = open_store(&dir);
+        let result = store.add_from_dump(
+            "sample",
+            DumpMethod::NixArchive,
+            CaMethod::NixArchive,
+            &[],
+            &mut Cursor::new(&dump),
+            &mut |h| Ok(nix_path_recursive("sample", h)),
+        )?;
+        result.path.strip_prefix("/nix/store/").unwrap().to_string()
+    };
 
-    // Every stored blob's filename equals the BLAKE3 of its contents.
-    for blob in walk_files(&dir.path().join("cas").join("blobs")) {
-        let name = blob.file_name().unwrap().to_str().unwrap().to_owned();
-        let actual = blake3::hash(&std::fs::read(&blob)?).to_hex();
-        assert_eq!(name, actual.as_str(), "blob key must match content hash");
+    // Backdate the root's clock directly in the pack store.
+    {
+        let mut pack = rio_packstore::PackStore::open(&cas, rio_packstore::Options::default())?;
+        let digests = pack.root_digests(&basename).expect("root exists");
+        pack.add_root_at(&basename, &digests, 1_000)?;
+        pack.flush()?;
     }
+
+    // An accessor read through a fresh store + flush-on-drop...
+    {
+        let store = open_store(&dir);
+        let _ = store.lstat(&basename, "data.txt")?;
+    }
+
+    // ...must have advanced the clock past the backdated value.
+    let pack = rio_packstore::PackStore::open(&cas, rio_packstore::Options::default())?;
+    let last_use = pack.root_last_use(&basename).expect("root exists");
+    assert!(
+        last_use > 1_000,
+        "read must touch the LRU clock: {last_use}"
+    );
     Ok(())
 }
 
-/// Accesses must bump the path entry's mtime — the explicit LRU clock the
-/// future CAS GC sweep evicts by (ADR-024). Kernel atime is not trusted.
+/// Root digest-list order is a write-side convention, never a readback
+/// contract: the pack store re-encodes root lists on GC/touch, so a
+/// reordered (or future deduped) list must still resolve the path-meta
+/// record — readback finds it by record kind, not position.
 #[test]
-fn access_touches_entry_lru_clock() -> anyhow::Result<()> {
+fn readback_survives_reordered_root_digest_list() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let store = open_store(&dir);
+    let cas = dir.path().join("cas");
     let dump = nar_bytes(&sample_tree());
-    let result = store.add_from_dump(
-        "sample",
-        DumpMethod::NixArchive,
-        CaMethod::NixArchive,
-        &[],
-        &mut Cursor::new(&dump),
-        &mut |h| Ok(nix_path_recursive("sample", h)),
-    )?;
-    let basename = result.path.strip_prefix("/nix/store/").unwrap();
-    let entry = dir
-        .path()
-        .join("cas")
-        .join("index")
-        .join(format!("{basename}.json"));
-
-    // Backdate the entry, then access through each read surface and
-    // assert the clock advanced again.
-    let backdate = || -> anyhow::Result<std::time::SystemTime> {
-        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
-        let f = std::fs::OpenOptions::new().write(true).open(&entry)?;
-        f.set_times(std::fs::FileTimes::new().set_modified(old))?;
-        Ok(old)
+    let basename = {
+        let store = open_store(&dir);
+        let result = store.add_from_dump(
+            "sample",
+            DumpMethod::NixArchive,
+            CaMethod::NixArchive,
+            &[],
+            &mut Cursor::new(&dump),
+            &mut |h| Ok(nix_path_recursive("sample", h)),
+        )?;
+        result.path.strip_prefix("/nix/store/").unwrap().to_string()
     };
-    let mtime = || std::fs::metadata(&entry).unwrap().modified().unwrap();
 
-    let old = backdate()?;
-    assert!(store.is_valid_path(basename));
-    assert!(mtime() > old, "isValidPath hit must touch the entry");
+    // Adversarial rewrite: re-record the root with its digest list
+    // reversed (meta record now LAST).
+    {
+        let mut pack = rio_packstore::PackStore::open(&cas, rio_packstore::Options::default())?;
+        let mut digests = pack.root_digests(&basename).expect("root exists");
+        digests.reverse();
+        pack.add_root(&basename, &digests)?;
+        pack.flush()?;
+    }
 
-    let old = backdate()?;
-    let _ = store.lstat(basename, "data.txt")?;
-    assert!(mtime() > old, "accessor read must touch the entry");
-
-    let old = backdate()?;
-    let mut sink = Vec::new();
-    store.nar_from_path(basename, &mut sink)?;
-    assert!(mtime() > old, "narFromPath must touch the entry");
-
-    // Blobs stay timestamp-free from the store's perspective: reads do
-    // not touch them (reachability, not recency, will decide blobs).
+    let store = open_store(&dir);
+    assert!(store.is_valid_path(&basename));
+    let info = store
+        .query_path_info(&basename)?
+        .expect("meta must resolve from a reordered root list");
+    assert_eq!(info.nar_size, dump.len() as u64);
+    let mut regen = Vec::new();
+    store.nar_from_path(&basename, &mut regen)?;
+    assert_eq!(regen, dump);
     Ok(())
 }
 
@@ -507,7 +597,8 @@ fn access_touches_entry_lru_clock() -> anyhow::Result<()> {
 /// clock slack of the file's mtime).
 fn backdate(path: &std::path::Path) -> anyhow::Result<()> {
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-    let f = std::fs::OpenOptions::new().write(true).open(path)?;
+    // Read-only open: works for directories too (we own the files).
+    let f = std::fs::OpenOptions::new().read(true).open(path)?;
     f.set_times(std::fs::FileTimes::new().set_modified(old))?;
     Ok(())
 }
@@ -517,7 +608,7 @@ fn fingerprint_hit_and_invalidation() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let store = open_store(&dir);
 
-    // Ingest a file so the index entry exists.
+    // Ingest a file so the CAS entry exists.
     let contents = b"source file".to_vec();
     let result = store.add_from_dump(
         "src.txt",
@@ -601,6 +692,288 @@ fn fingerprint_distrusts_record_within_mtime_slack() -> anyhow::Result<()> {
         store.fingerprint_lookup(fs_path_str, &key)?,
         Some(result.path),
         "backdated file must hit"
+    );
+    Ok(())
+}
+
+/// Fingerprint records survive a store close: the single-file table is
+/// the persistent asset a second invocation skips hashing with.
+#[test]
+fn fingerprints_persist_across_reopen() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let contents = b"persisted".to_vec();
+    let fs_path = dir.path().join("p.txt");
+    std::fs::write(&fs_path, &contents)?;
+    backdate(&fs_path)?;
+    let key = EvalStore::method_key("p.txt", CaMethod::NixArchive, &[]);
+    let fs_path_str = fs_path.to_str().unwrap();
+
+    let path = {
+        let store = open_store(&dir);
+        let result = store.add_from_dump(
+            "p.txt",
+            DumpMethod::Flat,
+            CaMethod::NixArchive,
+            &[],
+            &mut Cursor::new(&contents),
+            &mut |h| Ok(nix_path_recursive("p.txt", h)),
+        )?;
+        store.fingerprint_record(fs_path_str, &key, &result.path)?;
+        result.path
+    };
+
+    let store = open_store(&dir);
+    assert_eq!(
+        store.fingerprint_lookup(fs_path_str, &key)?,
+        Some(path),
+        "record lost across reopen"
+    );
+    assert_eq!(store.stats().count("fingerprint_hit"), 1);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Local source trees (add_source_tree): the not-a-mirror rule.
+// ---------------------------------------------------------------------------
+
+/// Build a small on-disk source tree and return its root.
+fn write_source_tree(root: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(root.join("bin"))?;
+    std::fs::create_dir_all(root.join("src"))?;
+    std::fs::write(root.join("bin/tool"), b"#!/bin/sh\necho hi\n")?;
+    std::fs::set_permissions(
+        root.join("bin/tool"),
+        std::fs::Permissions::from_mode(0o755),
+    )?;
+    std::fs::write(root.join("src/lib.rs"), b"pub fn answer() -> u32 { 42 }\n")?;
+    std::fs::write(root.join("README"), b"docs\n")?;
+    std::os::unix::fs::symlink("bin/tool", root.join("latest"))?;
+    Ok(())
+}
+
+/// The nix-side path computation for add_source_tree cross-checks.
+fn nix_path_for_tree(
+    name: &'static str,
+) -> impl FnMut(&rio_evalstore::store::AddHashes) -> Result<String, EvalStoreError> {
+    move |h| Ok(nix_path_recursive(name, h))
+}
+
+#[test]
+fn add_source_tree_serves_reads_from_the_origin() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = open_store(&dir);
+    let tree = dir.path().join("tree");
+    write_source_tree(&tree)?;
+
+    let result = store.add_source_tree(
+        tree.to_str().unwrap(),
+        "tree",
+        &[],
+        &mut nix_path_for_tree("tree"),
+    )?;
+
+    // Identity parity with rio-nix's own dump of the same tree.
+    let mut dump = Vec::new();
+    nar::dump_path_streaming(&tree, &mut dump)?;
+    assert_eq!(result.nar_sha256, hex::encode(Sha256::digest(&dump)));
+    let nar_hash = NixHash::new(HashAlgo::SHA256, Sha256::digest(&dump).to_vec())?;
+    let expected = StorePath::make_fixed_output("tree", &nar_hash, true, &[])?;
+    assert_eq!(result.path, expected.as_str());
+    let basename = expected.basename();
+
+    // Read-back walks the dir blobs; file contents come from the origin.
+    assert_eq!(store.lstat(basename, "")?, Some(PathStat::Directory));
+    let mut content = Vec::new();
+    store.read_file(basename, "src/lib.rs", &mut content)?;
+    assert_eq!(content, b"pub fn answer() -> u32 { 42 }\n");
+    assert_eq!(store.read_link(basename, "latest")?, b"bin/tool");
+
+    // NAR regeneration (origin splice) is byte-identical to the dump.
+    let mut regen = Vec::new();
+    store.nar_from_path(basename, &mut regen)?;
+    assert_eq!(regen, dump);
+    Ok(())
+}
+
+/// Not-a-mirror: local tree file CONTENT must not be copied into the
+/// CAS; chunk lists (FILE_CHUNK_META) must.
+#[test]
+fn add_source_tree_stores_no_file_content() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = dir.path().join("tree");
+    write_source_tree(&tree)?;
+    {
+        let store = open_store(&dir);
+        store.add_source_tree(
+            tree.to_str().unwrap(),
+            "tree",
+            &[],
+            &mut nix_path_for_tree("tree"),
+        )?;
+        assert_eq!(store.stats().count("fetched_write"), 0);
+        assert!(store.stats().count("chunkmeta_write") > 0);
+    }
+
+    // Inspect the packs directly: no record keyed by any file's blake3
+    // (content would be), but the chunk-meta record for each file (one
+    // whole-file chunk at this size: digest ‖ digest ‖ 0u64 ‖ len) IS
+    // present.
+    let pack =
+        rio_packstore::PackStore::open(dir.path().join("cas"), rio_packstore::Options::default())?;
+    for rel in ["bin/tool", "src/lib.rs", "README"] {
+        let data = std::fs::read(tree.join(rel))?;
+        let file_digest = rio_packstore::Digest::of(&data);
+        assert!(
+            !pack.contains(&file_digest),
+            "{rel}: file content leaked into the CAS"
+        );
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&file_digest.0);
+        payload.extend_from_slice(&file_digest.0);
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        assert!(
+            pack.contains(&rio_packstore::Digest::of(&payload)),
+            "{rel}: chunk-meta record missing"
+        );
+    }
+    Ok(())
+}
+
+/// The not-a-mirror rule's read side: a mutated origin file fails the
+/// digest verify with a named error instead of serving stale or wrong
+/// bytes.
+#[test]
+fn mutated_origin_is_a_named_error() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = open_store(&dir);
+    let tree = dir.path().join("tree");
+    write_source_tree(&tree)?;
+    let result = store.add_source_tree(
+        tree.to_str().unwrap(),
+        "tree",
+        &[],
+        &mut nix_path_for_tree("tree"),
+    )?;
+    let basename = result.path.strip_prefix("/nix/store/").unwrap();
+
+    std::fs::write(tree.join("README"), b"mutated!\n")?;
+    let mut sink = Vec::new();
+    let err = store
+        .read_file(basename, "README", &mut sink)
+        .expect_err("mutated origin must fail");
+    assert!(
+        matches!(err, EvalStoreError::OriginChanged { .. }),
+        "got: {err}"
+    );
+
+    // A deleted origin is its own named error.
+    std::fs::remove_file(tree.join("README"))?;
+    let err = store
+        .read_file(basename, "README", &mut sink)
+        .expect_err("deleted origin must fail");
+    assert!(
+        matches!(err, EvalStoreError::OriginUnreadable { .. }),
+        "got: {err}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The 92×-pathology gate: warm reads decode each directory blob at most
+// once and fingerprint hits re-hash nothing.
+// ---------------------------------------------------------------------------
+
+/// Recursively walk every member of a store path through the public
+/// read surface (the ops nix's accessor issues during eval).
+fn full_walk(store: &EvalStore, basename: &str, rel: &str) -> anyhow::Result<()> {
+    for (name, kind) in store.read_directory(basename, rel)? {
+        let name = String::from_utf8(name)?;
+        let child = if rel.is_empty() {
+            name
+        } else {
+            format!("{rel}/{name}")
+        };
+        assert!(store.lstat(basename, &child)?.is_some());
+        match kind {
+            EntryKind::Directory => full_walk(store, basename, &child)?,
+            EntryKind::Regular => {
+                let mut sink = Vec::new();
+                store.read_file(basename, &child, &mut sink)?;
+            }
+            EntryKind::Symlink => {
+                store.read_link(basename, &child)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Structural proof that the warm path cannot re-create the measured
+/// 92× pathology: after first touch, repeated full walks of an
+/// ingested tree perform ZERO additional directory-blob decodes (pure
+/// cache hits), and a fingerprint hit performs zero re-hashing /
+/// re-ingest work.
+#[test]
+fn warm_walks_decode_each_directory_once() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = open_store(&dir);
+    let tree = dir.path().join("tree");
+    write_source_tree(&tree)?;
+    // Three distinct directories: root, bin, src.
+    let result = store.add_source_tree(
+        tree.to_str().unwrap(),
+        "tree",
+        &[],
+        &mut nix_path_for_tree("tree"),
+    )?;
+    let basename = result.path.strip_prefix("/nix/store/").unwrap().to_string();
+
+    full_walk(&store, &basename, "")?;
+    let decodes_after_first = store.stats().count("dir_decode");
+    assert_eq!(
+        decodes_after_first, 3,
+        "first walk decodes each distinct directory exactly once"
+    );
+
+    for _ in 0..10 {
+        full_walk(&store, &basename, "")?;
+        let mut nar = Vec::new();
+        store.nar_from_path(&basename, &mut nar)?;
+    }
+    assert_eq!(
+        store.stats().count("dir_decode"),
+        decodes_after_first,
+        "warm walks must be pure cache hits — zero decodes beyond first touch"
+    );
+    assert!(store.stats().count("dir_cache_hit") > 0);
+
+    // Fingerprint hit path: zero re-hash, zero re-ingest, zero writes.
+    backdate(&tree)?;
+    let key = EvalStore::method_key("tree", CaMethod::NixArchive, &[]);
+    store.fingerprint_record(tree.to_str().unwrap(), &key, &result.path)?;
+    let writes_before = (
+        store.stats().count("dirblob_write"),
+        store.stats().count("chunkmeta_write"),
+        store.stats().count("meta_write"),
+        store.stats().count("add_source_tree"),
+    );
+    assert_eq!(
+        store.fingerprint_lookup(tree.to_str().unwrap(), &key)?,
+        Some(result.path.clone()),
+        "fingerprint must hit"
+    );
+    assert_eq!(store.stats().count("fingerprint_hit"), 1);
+    let writes_after = (
+        store.stats().count("dirblob_write"),
+        store.stats().count("chunkmeta_write"),
+        store.stats().count("meta_write"),
+        store.stats().count("add_source_tree"),
+    );
+    assert_eq!(
+        writes_before, writes_after,
+        "a fingerprint hit must not ingest, hash, or write anything"
     );
     Ok(())
 }
@@ -734,6 +1107,21 @@ mod ffi_smoke {
         let info: BTreeMap<String, serde_json::Value> =
             serde_json::from_str(&take_string(info_json).expect("info"))?;
         assert_eq!(info["nar_size"].as_u64(), Some(dump.len() as u64));
+
+        // readDirectory through FFI: names + kinds as JSON.
+        let rel = CString::new("")?;
+        let mut dir_json: *mut c_char = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                rio_read_directory(store, cbase.as_ptr(), rel.as_ptr(), &mut dir_json, &mut err)
+            },
+            RIO_OK
+        );
+        let dirents: BTreeMap<String, String> =
+            serde_json::from_str(&take_string(dir_json).expect("dir json"))?;
+        assert_eq!(dirents["bin"], "directory");
+        assert_eq!(dirents["data.txt"], "regular");
+        assert_eq!(dirents["link"], "symlink");
 
         // NAR regeneration through FFI is byte-identical.
         let mut regen: Vec<u8> = Vec::new();

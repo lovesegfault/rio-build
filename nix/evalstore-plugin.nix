@@ -82,9 +82,9 @@ let
         nix --extra-experimental-features nix-command \
           --plugin-files ${pluginSo} \
           store info --store "rio://?cas=$TMPDIR/cas" | tee info.txt
-        # The rust core created the CAS layout on open.
-        test -d $TMPDIR/cas/index
-        test -d $TMPDIR/cas/blobs
+        # The rust core created the CAS v2 layout (pack store) on open.
+        test -d $TMPDIR/cas/packs
+        test -f $TMPDIR/cas/gc.lock
         mv info.txt $out
       '';
 
@@ -132,27 +132,27 @@ let
         echo "== drvPath parity"
         diff stock.json rio.json
 
-        echo "== CAS contains the derivations (index + canonical drv JSON blob)"
-        for attr in plain structured; do
-          drv=$(jq -r ".$attr" rio.json)
-          base=''${drv#/nix/store/}
-          test -f "$TMPDIR/cas/index/$base.json" || { echo "missing index entry $base"; exit 1; }
-          blob=$(jq -r .drv_json_blob "$TMPDIR/cas/index/$base.json")
-          test "$blob" != "null" || { echo "no drv json blob for $base"; exit 1; }
-          test -f "$TMPDIR/cas/blobs/''${blob:0:2}/$blob" || { echo "missing drv json blob $blob"; exit 1; }
-          # The blob is nix's derivation JSON for this drv.
-          jq -e .outputs "$TMPDIR/cas/blobs/''${blob:0:2}/$blob" > /dev/null
-        done
+        echo "== derivations are memory-only: no drv bytes in the client CAS"
+        # The CAS v2 layout is append-pack segments; an ATerm leak would
+        # appear verbatim ('Derive(' prefix) inside a pack record.
+        if grep -rqa "Derive(" $TMPDIR/cas; then
+          echo "drv bytes leaked into the client CAS — drvs must be memory-only"
+          exit 1
+        fi
+        test -d $TMPDIR/cas/packs
+        test -f $TMPDIR/cas/index.bin
 
-        echo "== CAS contains the copied source dir + toFile text path"
-        for attr in source toFile; do
-          p=$(jq -r ".$attr" rio.json)
-          base=''${p#/nix/store/}
-          test -f "$TMPDIR/cas/index/$base.json" || { echo "missing index entry $base"; exit 1; }
-          test -f "$TMPDIR/cas/paths/$base.json" || { echo "missing DAG for $base"; exit 1; }
-        done
+        echo "== readback: real nix serves source + toFile from the pack store"
+        src=$(jq -r .source rio.json)
+        nix $flags --plugin-files ${pluginSo} \
+          store cat --store "rio://?cas=$TMPDIR/cas" "$src/data.txt" > data.txt
+        diff data.txt $TMPDIR/work/src-dir/data.txt
+        tofile=$(jq -r .toFile rio.json)
+        nix $flags --plugin-files ${pluginSo} \
+          store cat --store "rio://?cas=$TMPDIR/cas" "$tofile" > builder.txt
+        grep -q "echo hello" builder.txt
 
-        echo "== warm re-eval: CAS dedup means zero new blob writes"
+        echo "== warm re-eval: CAS dedup means zero new pack records"
         RIO_EVALSTORE_STATS=1 nix $flags --plugin-files ${pluginSo} \
           --store "local?root=$TMPDIR/main" \
           eval --eval-store "rio://?cas=$TMPDIR/cas" \
@@ -160,8 +160,8 @@ let
         diff rio.json rio2.json
         cat stats.txt
         grep -q "rio-evalstore op stats" stats.txt || { echo "stats dump missing"; exit 1; }
-        if grep -q "blob_write" stats.txt; then
-          echo "warm re-eval wrote new blobs — CAS dedup regressed"
+        if grep -Eq "dirblob_write|fetched_write|meta_write|chunkmeta_write" stats.txt; then
+          echo "warm re-eval wrote new pack records — CAS dedup regressed"
           exit 1
         fi
 

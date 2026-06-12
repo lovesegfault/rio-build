@@ -673,11 +673,6 @@
   ],
   "rio-evalstore": [
     {
-      "path": "cas.rs",
-      "depth": 0,
-      "doc": "On-disk content-addressed store layout + flat-file index."
-    },
-    {
       "path": "dirblob.rs",
       "depth": 0,
       "doc": "Bottom-up canonicalization of an in-memory source tree into"
@@ -691,6 +686,11 @@
       "path": "ffi.rs",
       "depth": 0,
       "doc": "`extern \"C\"` surface for the C++ shim (`shim/shim.cc`)."
+    },
+    {
+      "path": "fingerprint.rs",
+      "depth": 0,
+      "doc": "Stat-fingerprint table: one file in the CAS root, not per-path"
     },
     {
       "path": "ingest/",

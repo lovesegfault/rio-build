@@ -17,8 +17,9 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io::{self, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use crate::cas::DagNode;
-use crate::store::{AddHashes, CaMethod, DumpMethod, EvalStore, EvalStoreError, ProvidedInfo};
+use crate::store::{
+    AddHashes, CaMethod, DumpMethod, EntryKind, EvalStore, EvalStoreError, PathStat, ProvidedInfo,
+};
 
 pub const RIO_OK: c_int = 0;
 pub const RIO_ERR: c_int = 1;
@@ -123,6 +124,17 @@ unsafe fn byte_slice<'a>(p: *const u8, len: usize) -> &'a [u8] {
         // SAFETY: caller contract.
         unsafe { std::slice::from_raw_parts(p, len) }
     }
+}
+
+/// Raw-byte names/targets cross this boundary as JSON strings or C
+/// strings, so non-UTF-8 is a clean error here — never lossy mangling
+/// (a wrong name is worse than a refusal).
+fn utf8_name(bytes: Vec<u8>, what: &str) -> Result<String, EvalStoreError> {
+    String::from_utf8(bytes).map_err(|e| {
+        EvalStoreError::Unsupported(format!(
+            "non-UTF-8 {what} cannot cross the FFI boundary: {e}"
+        ))
+    })
 }
 
 fn parse_refs_json(json: &str) -> Result<Vec<String>, EvalStoreError> {
@@ -417,9 +429,10 @@ pub unsafe extern "C" fn rio_add_nar(
 }
 
 /// Capture a derivation. `name` is the store-path name (`foo-1.2.drv`),
-/// `aterm` the canonical bytes nix hashed, `drv_json` nix's derivation
-/// JSON, `nix_drv_path` nix's computed path (cross-checked). On success
-/// `*out_path` is the (identical) drv path.
+/// `aterm` the canonical bytes nix hashed, `nix_drv_path` nix's computed
+/// path (cross-checked). On success `*out_path` is the (identical) drv
+/// path. `drv_json` is accepted for ABI stability but unused: drvs are
+/// memory-only ATerm bytes (ADR-024); the canonical proto form is P2.
 ///
 /// # Safety
 /// Standard contract; `aterm`/`drv_json` valid for their lengths.
@@ -429,8 +442,8 @@ pub unsafe extern "C" fn rio_write_derivation(
     name: *const c_char,
     aterm: *const u8,
     aterm_len: usize,
-    drv_json: *const u8,
-    drv_json_len: usize,
+    _drv_json: *const u8,
+    _drv_json_len: usize,
     nix_drv_path: *const c_char,
     out_path: *mut *mut c_char,
     err: *mut *mut c_char,
@@ -442,9 +455,7 @@ pub unsafe extern "C" fn rio_write_derivation(
         let nix_path = unsafe { req_str(nix_drv_path) }?;
         // SAFETY: caller contract.
         let aterm = unsafe { byte_slice(aterm, aterm_len) };
-        // SAFETY: caller contract.
-        let drv_json = unsafe { byte_slice(drv_json, drv_json_len) };
-        let path = store_ref(store).write_derivation(name, aterm, drv_json, nix_path)?;
+        let path = store_ref(store).write_derivation(name, aterm, nix_path)?;
         set_out_string(out_path, Some(path));
         Ok(())
     })
@@ -470,18 +481,18 @@ pub unsafe extern "C" fn rio_lstat(
         let basename = unsafe { req_str(basename) }?;
         // SAFETY: caller contract.
         let rel = unsafe { req_str(rel) }?;
-        let json = store_ref(store).lstat(basename, rel)?.map(|node| {
-            match node {
-                DagNode::Regular {
-                    size, executable, ..
-                } => serde_json::json!({"type": "regular", "size": size, "executable": executable}),
-                DagNode::Symlink { target } => {
-                    serde_json::json!({"type": "symlink", "target": target})
-                }
-                DagNode::Directory { .. } => serde_json::json!({"type": "directory"}),
+        let json = match store_ref(store).lstat(basename, rel)? {
+            None => None,
+            Some(PathStat::Regular { size, executable }) => Some(
+                serde_json::json!({"type": "regular", "size": size, "executable": executable})
+                    .to_string(),
+            ),
+            Some(PathStat::Symlink { target }) => {
+                let target = utf8_name(target, "symlink target")?;
+                Some(serde_json::json!({"type": "symlink", "target": target}).to_string())
             }
-            .to_string()
-        });
+            Some(PathStat::Directory) => Some(serde_json::json!({"type": "directory"}).to_string()),
+        };
         set_out_string(out_json, json);
         Ok(())
     })
@@ -506,17 +517,18 @@ pub unsafe extern "C" fn rio_read_directory(
         // SAFETY: caller contract.
         let rel = unsafe { req_str(rel) }?;
         let entries = store_ref(store).read_directory(basename, rel)?;
-        let map: serde_json::Map<String, serde_json::Value> = entries
-            .into_iter()
-            .map(|(name, node)| {
-                let kind = match node {
-                    DagNode::Regular { .. } => "regular",
-                    DagNode::Symlink { .. } => "symlink",
-                    DagNode::Directory { .. } => "directory",
-                };
-                (name, serde_json::Value::String(kind.to_string()))
-            })
-            .collect();
+        let mut map = serde_json::Map::new();
+        for (name, kind) in entries {
+            let kind = match kind {
+                EntryKind::Regular => "regular",
+                EntryKind::Symlink => "symlink",
+                EntryKind::Directory => "directory",
+            };
+            map.insert(
+                utf8_name(name, "directory entry name")?,
+                serde_json::Value::String(kind.to_string()),
+            );
+        }
         set_out_string(out_json, Some(serde_json::Value::Object(map).to_string()));
         Ok(())
     })
@@ -564,7 +576,8 @@ pub unsafe extern "C" fn rio_read_link(
         let basename = unsafe { req_str(basename) }?;
         // SAFETY: caller contract.
         let rel = unsafe { req_str(rel) }?;
-        set_out_string(out_target, Some(store_ref(store).read_link(basename, rel)?));
+        let target = utf8_name(store_ref(store).read_link(basename, rel)?, "symlink target")?;
+        set_out_string(out_target, Some(target));
         Ok(())
     })
 }

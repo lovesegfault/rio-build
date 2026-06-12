@@ -278,6 +278,17 @@ impl PackStore {
         self.own.contains_key(digest) || self.view.borrow().blobs.contains_key(digest)
     }
 
+    /// The record kind this process's view has for `digest`, if any.
+    /// A digest's kind never changes (records are content-addressed and
+    /// immutable), so a stale view still answers correctly for any
+    /// digest it knows. Never touches the disk.
+    pub fn kind_of(&self, digest: &Digest) -> Option<Kind> {
+        if let Some(loc) = self.own.get(digest) {
+            return Some(loc.kind);
+        }
+        self.view.borrow().blobs.get(digest).map(|loc| loc.kind)
+    }
+
     /// Record (or replace) a root: a store path and the digests it
     /// pins. Roots are the GC mark sources and the LRU eviction unit.
     pub fn add_root(&mut self, store_path: &str, digests: &[Digest]) -> Result<()> {
@@ -341,6 +352,13 @@ impl PackStore {
             return Some(entry.last_use);
         }
         self.view.borrow().roots.get(store_path).map(|e| e.last_use)
+    }
+
+    /// Whether a root exists, without cloning its digest list (the
+    /// hot-path presence probe — `is_valid_path` runs once per eval
+    /// store-path mention).
+    pub fn has_root(&self, store_path: &str) -> bool {
+        self.own_roots.contains_key(store_path) || self.view.borrow().roots.contains_key(store_path)
     }
 
     /// The digests a root pins, if the root exists.

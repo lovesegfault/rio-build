@@ -34,4 +34,20 @@ fn root_names_and_last_use_span_own_and_loaded_views() {
 
     // root_names dedups a root present in both views.
     assert_eq!(store.root_names().len(), 3);
+
+    // has_root spans both views without cloning digest lists.
+    assert!(store.has_root("aaaa-old"));
+    assert!(store.has_root("cccc-own"));
+    assert!(!store.has_root("cccc-missing"));
+
+    // kind_of answers from the loaded view and the own overlay alike.
+    let a = store.root_digests("aaaa-old").unwrap()[0];
+    assert_eq!(store.kind_of(&a), Some(Kind(0)));
+    assert_eq!(store.kind_of(&c), Some(Kind(0)));
+    let d = store.put(Kind(2), b"blob-d").unwrap();
+    assert_eq!(store.kind_of(&d), Some(Kind(2)));
+    assert_eq!(
+        store.kind_of(&rio_packstore::Digest::of(b"never-stored")),
+        None
+    );
 }
