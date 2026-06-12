@@ -607,7 +607,8 @@ async fn ack_unknown_class_grows_nothing() {
             None,
             &[],
         )
-        .1.expect("membership skew is per-entry, never a whole-request refusal");
+        .1
+        .expect("membership skew is per-entry, never a whole-request refusal");
 
     let ct = actor.cost_table.read();
     assert!(
