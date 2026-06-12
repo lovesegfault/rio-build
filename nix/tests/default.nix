@@ -1026,7 +1026,7 @@ in
   vm-lifecycle-autoscale-k3s = lifecycleMod.mkTest {
     name = "autoscale";
     subtests = [
-      # r[verify ctrl.pool.ephemeral+1]
+      # r[verify ctrl.pool.ephemeral+2]
       # r[verify ctrl.ephemeral.intent-deadline]
       # r[verify ctrl.crd.host-users-network-exclusive]
       # ~180s: two builds × (reconcile tick + pod schedule + FUSE +

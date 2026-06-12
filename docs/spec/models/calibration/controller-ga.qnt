@@ -1,7 +1,7 @@
 // -*- mode: Bluespec; -*-
 //
 // Stage-C calibration overrides, family G-A: spawn<->reap<->queued
-// coherence within one tick (controller-invariant-map.md, calibration
+// coherence within one tick (controller-records.md, calibration
 // table; controller-formal design §3.4). Each module instantiates the
 // as-built spawnCoherence model (Model J), replaces the tick action with
 // a local PRE-FIX variant (the behavior the named historical fix

@@ -458,7 +458,7 @@ impl HwSampledCache {
     }
 }
 
-// r[impl ctrl.pool.ephemeral+1]
+// r[impl ctrl.pool.ephemeral+2]
 /// Reconcile a Pool: count active Jobs, poll spawn intents, spawn
 /// Jobs if work is waiting.
 ///
@@ -2835,7 +2835,7 @@ pub(super) async fn reap_stale_for_intents(
 ///   - `ttlSecondsAfterFinished: 600` — K8s TTL controller reaps.
 ///   - `activeDeadlineSeconds` — backstop for hung builds + wrong-
 ///     pool spawns.
-// r[impl ctrl.pool.ephemeral+1]
+// r[impl ctrl.pool.ephemeral+2]
 // r[impl ctrl.ephemeral.intent-deadline]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_job(
@@ -3416,7 +3416,7 @@ mod tests {
     ///   - ttlSecondsAfterFinished missing → completed Jobs
     ///     accumulate forever
     ///   - ownerReference missing → Pool delete leaves orphan Jobs
-    // r[verify ctrl.pool.ephemeral+1]
+    // r[verify ctrl.pool.ephemeral+2]
     #[test]
     fn job_spec_load_bearing_fields() {
         let pool = test_pool("eph-pool", ExecutorKind::Builder);

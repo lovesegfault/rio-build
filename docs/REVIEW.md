@@ -852,7 +852,8 @@ against `ExecutorClaims`' "worker is NOT trusted" doc 50 lines away.
 
 **Close:** new worker-supplied fields default to "untrusted; route from
 controller". The controller already has the kube-authoritative
-`intent_id → spec.nodeName` binding via `PodRequestedCache`; ship that
+`intent_id → spec.nodeName` binding via the per-tick Pod LIST (formerly
+`PodRequestedCache`); ship that
 in `AckSpawnedIntents` instead of trusting the worker. Done-gate: `rg
 <new-field> rio-auth/src/hmac.rs` — if it's not in claims, the
 reviewer asks "what destructive action reads this?"

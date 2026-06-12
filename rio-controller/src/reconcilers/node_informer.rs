@@ -3139,6 +3139,11 @@ mod tests {
     /// is TYPED (the silent debug!-skip shape no longer exists; the
     /// recorded pre-fix red: a 404'd node's sample was skipped even
     /// though the 60 s flush had just observed its hw_class).
+    ///
+    /// bug_363 disposition (none-sensible at the model, relocated
+    /// from the retired controller invariant map): a quint axis would
+    /// re-state this same finite 6-cell resolution table with no
+    /// environment dynamics; this exhaustive census is the record.
     #[test]
     fn interrupt_resolution_classifies_every_cell() {
         use super::{SampleDropReason, classify_interrupt_resolution};

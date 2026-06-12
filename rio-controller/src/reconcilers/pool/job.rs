@@ -691,6 +691,15 @@ impl MintedPullIdentity {
 /// `reap_stale_for_intents`, the live-pod recheck in
 /// `reap_excess_pending`, the busy bridge in the orphan reap, and the
 /// four-conjunct cancel binding (`ctrl.job.cancel-close-cause+2`).
+///
+/// m298 disposition (n/a-with-reason at the model, relocated from the
+/// retired controller invariant map): Model J keys Jobs by intent (one
+/// Job per intent), so the m298 class — TWO Jobs for one intent across
+/// a respawn boundary, the synthesized close resolved against the
+/// wrong executor's attempt — is BELOW model granularity. This
+/// chokepoint carries the binding instead: an owner-less synthesized
+/// close does not typecheck, and the red-first pair
+/// (left: "exec-a" / right: "exec-b") pins it.
 pub(super) enum AttemptOwner<'a> {
     /// Job-delete arms: the attempt must be the build pull for the
     /// Job's OWN intent — the find pins intent equality, the

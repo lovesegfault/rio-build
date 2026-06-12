@@ -4308,6 +4308,12 @@ mod tests {
     /// succeeds (persist gated); a re-acquire mid-Err-loop is a NEW
     /// epoch (re-fires once). There is no boolean to wrongly consume
     /// on Err or wrongly re-read on every tick.
+    ///
+    /// Axes-not-composed residual (007/346, relocated from the
+    /// retired controller invariant map): the qnt models do not
+    /// compose the buffer axis with the lease-fault axis; this pin
+    /// and `pending_evidence_cleared_on_acquire_edge` carry the
+    /// re-acquisition suppress-clear edge.
     // r[verify ctrl.nodeclaim.acquire-edge-token+1]
     #[test]
     fn acquire_epoch_token_semantics() {

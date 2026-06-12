@@ -129,6 +129,20 @@
 // regime to the scheduler-restart window (the busy-but-never-registered
 // residual stays a documented bound either way, because the executor
 // map IS the scheduler's own view).
+//
+// TODO: two obligations carried out of the retired controller
+// invariant map's cross-campaign entries (1c'/1d, archived in
+// docs/spec/models/controller-records.md): (1) re-base the default
+// regimes onto the pull-only posture — the stream-era
+// executors-present arm and the 3-arm orphan gate are still the
+// base-regime encoding; the pull-era as-built reap is carried as the
+// C2/221 axis (ENABLE_YOUNG_LEADER_REAP) with its falsify/hold pair,
+// and production re-added the leader-age freshness law
+// (ctrl.job.orphan-leader-age, merged_bug_221), so the modeled
+// leader-age arm matches as-built again; what remains is making
+// pull-only the base and retiring the executors-present arm. (2) the
+// Stage-C calibration-table re-validation against the pull-only
+// mechanism set stays scheduled (no entry has executed it).
 module spawnCoherence {
   // ------------------------------------------------------------------
   // 1. Types
@@ -606,6 +620,16 @@ module spawnCoherence {
   /// attempt minted in the decide→land window. Falsified as-built
   /// (newest-open-wins intent resolution); holds with
   /// ENABLE_EXEC_PINNED (the scheduler refuses instead).
+  /// Accepted residual (135 mode-2, relocated from the retired
+  /// controller invariant map): a Build-success report racing the
+  /// disruption watcher's decide→land window can still lose to the
+  /// synthesized close by at most ONE admin-RPC round-trip — the
+  /// close is exec-pinned, so the race is bounded to the observed
+  /// attempt itself (never a successor; this law is the pin). The
+  /// alternative (a scheduler-side compare-and-swap on report arrival
+  /// order) re-introduces the cross-component ordering oracle the
+  /// wave removed; the charge-free idempotent close + requeue make
+  /// the worst case a redundant rebuild.
   val closeTargetsIssuedAttempt = not(violations.contains(VStaleClose))
 
   // C2 reachability witnesses (each wired as an expected-violation
@@ -1059,6 +1083,18 @@ module spawnCoherence {
       or (listExecFails and (orphanReaped.size() > 0 or cancelSelected.size() > 0))
       or (ackFails and ackHappens)
     // GateFailClosed, split per configuration (C1/C2 adjudications).
+    // C1/C2 adjudication record (relocated from the retired controller
+    // invariant map's Stage-A contradiction rows): C1 — in a
+    // crd-absent cluster gate_armed=false keeps queued_known=None
+    // every tick, so reap_excess_pending NEVER runs; deliberate (an
+    // ungated queued count is not safe to reap against — the
+    // Job-status-lag / job-tracking-finalizer race), made explicit by
+    // ctrl.nodeclaim.placeable-gate+5 (spawn fail-open, excess-reap
+    // fail-closed). C2 — a Fetcher pool with the CRD present never
+    // consults the gate's armed state: its queued is the raw scheduler
+    // count and needs no FFD gate to be authoritative; +5 scopes the
+    // unarmed-fail-closed sentence to Builder pools. Both
+    // adjudications: code correct, spec amended (no code change).
     val builderGated = CRD_PRESENT and IS_BUILDER
     val vGateV =
       // (a) present ∧ unarmed: zero Builder spawns, zero excess-reaps.

@@ -152,8 +152,8 @@
 //   rewritten as passing runs (idlePruneAcrossBotRun,
 //   bootRecordedAcrossBotRun). The expected-as-built-falsifications
 //   list is now EMPTY — the empty-remainder claim holds
-//   unconditionally (controller-invariant-map.md records the executed
-//   flip and the fix commit).
+//   unconditionally (flip executed 2026-06-02; the fix commit is in
+//   the introducing commit history).
 //
 // WITNESSES (must be VIOLATED — wired as expect-violation checks)
 //   canReachIdleReap, canReachVanishMark, canReachClearAfterMark,

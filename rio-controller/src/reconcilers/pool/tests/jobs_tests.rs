@@ -44,7 +44,7 @@ fn want_complete(intents: &[SpawnIntent], pool: &str, kind: ExecutorKind) -> Wan
     )
 }
 
-// r[verify ctrl.pool.ephemeral+1]
+// r[verify ctrl.pool.ephemeral+2]
 #[test]
 fn ephemeral_spawn_fail_still_patches_status() {
     // STRUCTURAL GUARD: the spawn block (between `---- Spawn decision
@@ -3076,6 +3076,16 @@ fn respawn_record_survives_terminal_unreaped_window() {
 /// Witness-strength: certifies REFRESH-LANE COVERAGE per phase
 /// through production calls only (note_job_alive / step /
 /// note_verdict_free_death), not a parallel table.
+///
+/// merged_bug_080 disposition (n/a-with-reason at quint AND kani,
+/// relocated from the retired controller invariant map): the
+/// respawn-record law is single-key with no interleaving content
+/// beyond what this typed unit census drives, and the load-bearing
+/// time relation is structural (refresh-by-observed-artifact per
+/// cycle phase), not numeric. This census witness + the structural
+/// note_job_alive refresh lane + the typed VerdictWitness reset lane
+/// are the discharging artifacts; a quint axis would re-encode this
+/// census without adding interleaving content.
 #[test]
 fn cycle_phase_census_refreshes_every_observable_phase() {
     use crate::reconcilers::pool::candidate::PoolStreaks;

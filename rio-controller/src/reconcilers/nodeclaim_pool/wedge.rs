@@ -1801,6 +1801,16 @@ mod tests {
 /// from the raw trajectory alone: which (node, drv) anchors are live
 /// in each tick's window (first-observation anchored, eviction- and
 /// drain-aware), and from that the expected verdict populations.
+///
+/// Pull-mode wedge VM fixture escape hatch (relocated from the
+/// retired controller invariant map): the wedge two-axis verdict's
+/// end-to-end VM exercise needs a solve-deadline small enough to
+/// expire inside a VM test budget; the floor-180 render + the
+/// establishment slack floor put the minimum observable expiry past
+/// the scenario budget. The recorded pin is the sqlx boundary test
+/// (mint_persists_dispatched_deadline_and_view_returns_it) plus this
+/// proptest plane — NOT a VM subtest. Revisit only if the slack
+/// floor drops.
 // r[verify ctrl.nodeclaim.wedge-two-axis+6]
 #[cfg(test)]
 mod proptests {

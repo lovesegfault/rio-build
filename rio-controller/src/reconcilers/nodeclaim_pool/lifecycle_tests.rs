@@ -1907,6 +1907,12 @@ async fn bot_tick_registered_edge_survives_to_recovery_ack() {
 /// The buffer is cleared on the lease-acquire edge (suppress
 /// polarity): evidence captured under a previous tenure must not ship
 /// a stale ICE-clear after re-acquisition.
+///
+/// Axes-not-composed residual (007/346, relocated from the retired
+/// controller invariant map): the qnt models do not compose the
+/// evidence-buffer axis with the lease-fault axis, so the
+/// suppress-clear on re-acquisition is out of model; this pin and
+/// `acquire_epoch_token_semantics` carry that edge.
 #[tokio::test]
 async fn pending_evidence_cleared_on_acquire_edge() {
     let mut lab = Lab::new().await;

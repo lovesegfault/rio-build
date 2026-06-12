@@ -51,12 +51,13 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
 
 == Job lifecycle
 
-#r("ctrl.pool.ephemeral+1")[
-  The reconciler polls `AdminService.ClusterStatus` each requeue tick (10s) and
-  spawns K8s Jobs when `queued_derivations > 0` and active Jobs <
-  `spec.maxConcurrent` (or unconditionally when `maxConcurrent` is unset). Each
-  Job runs one rio-builder pod whose main loop exits after one
-  `CompletionReport` → pod terminates → Job goes Complete →
+#r("ctrl.pool.ephemeral+2")[
+  The reconciler polls `AdminService.GetSpawnIntents` each requeue tick (10s)
+  and spawns one K8s Job per returned intent (#rref("ctrl.pool.reconcile")),
+  subject to active Jobs < `spec.maxConcurrent` (no Job-count ceiling when
+  `maxConcurrent` is unset). Each Job runs one rio-builder pod whose main loop
+  exits after one pulled assignment's outcome report (`PullAssignment` → build
+  → `ReportOutcome`) → pod terminates → Job goes Complete →
   `ttlSecondsAfterFinished: 600` reaps (10min postmortem window for `kubectl
   logs` on failed builders). Job settings: `backoffLimit: 0` (scheduler owns
   retry), `restartPolicy: Never`, `parallelism: 1`. `spec.maxConcurrent` is an
@@ -81,10 +82,11 @@ before the Job is spawned. Nodes outlive pods (@karpenter consolidation policy),
 so the node-level FSx cache survives pod churn --- the cold-start cost is pod
 overhead, not refetching the @closure.
 
-*Dispatch path:* the scheduler sees a Job pod heartbeat in, dispatches one
-derivation, receives `CompletionReport`, then the pod disconnects. The active
-mechanism is ClusterStatus polling; a push-mode RPC was considered and rejected
-(see `ephemeral.rs` § Why not a Scheduler→Controller RPC).
+*Dispatch path:* the Job pod's builder pulls one assignment
+(`PullAssignment`), builds it, reports the outcome (`ReportOutcome`), then
+exits. The controller's active mechanism is `GetSpawnIntents` polling; a
+push-mode Scheduler→Controller RPC was considered and rejected (rationale
+preserved in git history with the retired `ephemeral.rs`).
 
 *RBAC:* the controller's ClusterRole grants `batch/jobs` verbs `[get, list,
 watch, create, delete]`. `delete` is required for the excess-Pending reap
