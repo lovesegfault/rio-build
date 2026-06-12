@@ -2259,6 +2259,39 @@ kernel input, the disclosure bit is the product on every exit cell
 consumable only through `discharge` --- both exit paths route through
 one epilogue.
 
+#r("gw.tail.two-face-truncation")[
+  The truncation disclosure's TEXT is denominated in the store's own
+  verdict. The marker fires exactly when the store's completeness claim
+  was never observed true --- a preimage with two faces the wire's
+  1-bit `is_complete` cannot distinguish: cut-mid-replay durable
+  residue (sealed and manifest-covered; retrievable from the store) and
+  a never-uploaded tail (no sealed count, or manifest holes ---
+  "genuine storage loss"). The client-visible text MUST state both
+  faces or neither and MUST NOT assert unconditional durability ---
+  absence of the completeness confirmation is never narrated as
+  positive durability (R26). The confirmed face (`is_complete`
+  observed true) owes no marker at all.
+]
+
+The round-12 repair (bug_018, the round's one R26 instance): the
+pre-fix marker asserted "the full log is durable in the store"
+unconditionally --- emitted exactly when the store DECLINED to confirm
+durability, a state that includes genuine permanent loss (builder
+Detached/DeadlineExpired un-acked tails; manifest holes), so the
+disclosure claimed durability in precisely the loss subset where a user
+following it finds the tail absent. The store-side claim
+(`FinalClaim`'s mint) receives the durability conjuncts and the kernel
+doc now decomposes the `false` preimage; the wire carries only the
+collapsed bit (`TailLogChunk.is_complete`), so the relay-side text is
+the honest two-face form with the durable face's actionable pointer
+kept conditional ("a stored remainder is retrievable from the store").
+The thread-the-distinction-to-the-client arm is bounded by the wire:
+distinguishing the faces client-side needs a second wire bit, and this
+wave carries zero unconditional wire changes --- recorded as a possible
+future read-side-first field, NOT commissioned (the hedge-only
+alternative --- weakening to an unconditional retrievability claim ---
+is recorded REJECTED: it re-states a face the evidence does not carry).
+
 #r("gw.tail.disclosure-linear")[
   The withheld-disclosure obligation is LINEAR: from the moment a relay
   withholds fetched lines (a pending gap) until the send that delivers

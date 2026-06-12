@@ -1628,18 +1628,33 @@ async fn reconcile_backfill(
     armed.send_lines(last_relayed).await
 }
 
-/// The synthesized disclosure for an accepted durable gap (owner
-/// decision Q8: one marker line in client-visible build output, never
-/// repeated for the same span).
-/// bug_121: the truncation disclosure for the hard grace exit — the
+/// bug_121: the truncation disclosure for a cut exit — the
 /// gap-vocabulary form with the un-served tail open-ended (the relay
-/// cannot know the durable extent it never fetched). The full log
-/// stays durable and retrievable from the store.
+/// cannot know the extent it never fetched), one marker line in
+/// client-visible build output (the owner-decision Q8 vocabulary).
+///
+/// bug_018 (R26 — absence is not evidence): the text is denominated
+/// in the verdict the relay actually holds. The marker fires exactly
+/// when `served_complete` was never observed true — the store's
+/// completeness predicate DECLINED to confirm — and that preimage has
+/// two faces the 1-bit wire claim cannot distinguish: cut-mid-replay
+/// durable residue (retrievable from the store) and a never-uploaded
+/// tail (builder Detached/DeadlineExpired un-acked loss; manifest
+/// holes are "genuine storage loss" store-side). The pre-fix text
+/// asserted "the full log is durable in the store" unconditionally —
+/// narrating the ABSENCE of the completeness confirmation as positive
+/// durability, in precisely the loss subset where a user following it
+/// finds nothing. The text now states both faces, keeping the
+/// durable face's actionable pointer conditional; the confirmed face
+/// (`served_complete == true`) stays the honest no-marker exit.
 // r[impl gw.tail.truncation-disclosed+2]
+// r[impl gw.tail.two-face-truncation]
 fn truncation_marker(from: u64) -> Vec<u8> {
     format!(
-        "*** rio: lines {from}- not served before the post-terminal grace \
-expired (live tail truncated; the full log is durable in the store) ***"
+        "*** rio: lines {from}- not served before the live tail closed \
+(the store did not confirm the log complete: a stored remainder is \
+retrievable from the store; a tail never uploaded by the builder is \
+lost) ***"
     )
     .into_bytes()
 }
@@ -2351,7 +2366,7 @@ mod tests {
         );
         let text = String::from_utf8(marker.lines[0].clone()).expect("marker is UTF-8");
         assert!(
-            text.contains("rio:") && text.contains("grace"),
+            text.contains("rio:") && text.contains("not served"),
             "gap-vocabulary truncation marker; got {text:?}"
         );
 
@@ -2454,7 +2469,7 @@ mod tests {
         let only = h.out_rx.try_recv().expect("the truncation disclosure");
         let text = String::from_utf8(only.lines[0].clone()).expect("marker is UTF-8");
         assert!(
-            text.contains("rio:") && text.contains("grace"),
+            text.contains("rio:") && text.contains("not served"),
             "the one write is the truncation marker; got {text:?}"
         );
         assert!(
@@ -3591,6 +3606,74 @@ mod tests {
         assert!(
             text.contains("rio:") && marker.first_line_number == 2,
             "the truncation disclosure names the first unserved line; got {text:?}"
+        );
+
+        h.set.abort_all();
+    }
+    /// W12-AV (bug_018, the R26 instance repaired): the truncation
+    /// disclosure is denominated in the store's own verdict. It fires
+    /// exactly when the store DECLINED to confirm the served log
+    /// complete (`is_complete` never observed true) --- a preimage
+    /// with two faces the 1-bit wire claim cannot distinguish:
+    /// cut-mid-replay durable residue (retrievable from the store)
+    /// and a never-uploaded tail (builder died un-acked; manifest
+    /// holes are "genuine storage loss" --- nothing to retrieve). The
+    /// marker text MUST NOT pick a face: the pre-fix text asserted
+    /// "the full log is durable in the store" unconditionally --- a
+    /// user following it on the loss face finds the tail absent.
+    ///
+    /// This fixture drives the NEVER-DURABLE face: the builder dies
+    /// mid-build (stream cut, no final claim ever), the derivation
+    /// goes terminal, the grace expires. Pre-fix red:
+    ///   `the truncation marker must not claim unconditional
+    ///   durability on the never-durable face (got "*** rio: lines
+    ///   2- not served before the post-terminal grace expired (live
+    ///   tail truncated; the full log is durable in the store) ***")`
+    /// The durable face's actionable pointer survives CONDITIONALLY
+    /// (the "stored remainder" clause); the served-complete exit
+    /// (`grace_exit_with_complete_serve_stays_silent`) remains the
+    /// honest treatment of the confirmed face: no marker at all.
+    // r[verify gw.tail.two-face-truncation]
+    #[tokio::test]
+    async fn truncation_marker_states_both_faces_never_claiming_durability() {
+        let mut h = harness().await;
+        // Two lines, then the stream holds forever with no
+        // completeness claim: an un-acked tail (the builder died
+        // before uploading the rest -- the store has nothing more).
+        h.mock.push_script(vec![chunk(0, 2)], SessionEnd::Hold);
+
+        h.set.on_started(DRV, EXEC_A);
+        let _ = recv_lines(&mut h.out_rx, 2).await;
+        h.set.on_terminal(DRV);
+
+        let handle = h
+            .set
+            .tasks
+            .get(DRV)
+            .expect("the subscription is still tracked")
+            .task
+            .abort_handle();
+        wait_for("the subscription task to exit at the grace cap", || {
+            handle.is_finished()
+        })
+        .await;
+
+        let marker = tokio::time::timeout(Duration::from_secs(2), h.out_rx.recv())
+            .await
+            .expect("the grace exit must disclose the truncation")
+            .expect("output channel open");
+        assert_eq!(marker.first_line_number, 2);
+        let text = String::from_utf8(marker.lines[0].clone()).expect("marker is UTF-8");
+        assert!(
+            !text.contains("the full log is durable in the store"),
+            "the truncation marker must not claim unconditional durability \
+             on the never-durable face (got {text:?})"
+        );
+        assert!(
+            text.contains("did not confirm")
+                && text.contains("stored remainder")
+                && text.contains("never uploaded"),
+            "the marker states both faces of the unconfirmed verdict; got {text:?}"
         );
 
         h.set.abort_all();

@@ -794,6 +794,22 @@ impl FinalClaim {
     /// reached it, AND no advance of that cursor ever crossed a gap
     /// (every line below the watermark was actually served to THIS
     /// reader).
+    ///
+    /// bug_018 — the `false` preimage has TWO faces and a consumer of
+    /// the collapsed bit MUST NOT pick one: (a) UNSERVED-DURABLE —
+    /// the durability conjuncts hold (sealed AND covered) but the
+    /// serve-progress conjuncts failed (cursor short of the seal, or
+    /// a crossed gap): everything recorded IS in the store and a
+    /// reader can retrieve it; (b) NEVER-DURABLE — the durability
+    /// conjuncts themselves failed (no sealed count: the execution
+    /// never reported its end, e.g. a Detached/DeadlineExpired
+    /// builder with un-acked tail lines; or the manifest does not
+    /// cover the sealed span: genuine storage loss): the remainder
+    /// exists nowhere to retrieve. The wire's `is_complete` carries
+    /// only this collapsed bit, so any downstream narration of
+    /// `false` must state both faces or neither — never positive
+    /// durability (absence of the confirmation is not evidence of
+    /// it).
     pub fn complete(&self) -> bool {
         self.complete
     }
