@@ -2237,6 +2237,39 @@ rejected alternative (a biased select / no-progress grace) is recorded
 REJECTED --- it would amend the spec'd finiteness law, where the
 disclosure arm composes without re-deriving it.
 
+#r("gw.tail.disclosure-linear")[
+  The withheld-disclosure obligation is LINEAR: from the moment a relay
+  withholds fetched lines (a pending gap) until the send that delivers
+  the last of them completes, the obligation MUST reside in Drop-armed
+  state --- the recorded cell while pending, a disclosure-on-drop guard
+  while a consume is in flight --- and each completed send MUST defuse
+  exactly the part it delivered. A cooperative consume MUST NOT hold
+  withheld lines or an undisclosed hole outside Drop-armed state across
+  an await point.
+]
+
+The round-12 close of the taken-window residency (bug_122, the R32
+banner instance): the wave-11 Drop backstop was only as total as the
+state's residency in the guarded cell, and all three cooperative
+consumes (exit flush, divergent backfill, full heal) took the state
+into a plain local across awaited sends --- a terminus `abort_all`
+landing at a parked send destroyed the lines while the cell's Drop saw
+`None`, worst case with the gap marker already delivered (the marker
+lands, the lines silently die). The take is now armed by construction:
+the gap state lives behind a module boundary whose only take returns
+the guard, every async wait is a permit reservation with the payload
+still armed, and the payload leaves the guard only in the synchronous
+permit-send that follows --- async cancellation lands only at awaits,
+so taken-but-unsent is not a reachable residency. This instantiates
+the wave's linear-obligation doctrine (`sys.obligation.linear-discharge`,
+failure-modes); the priced residuals carry unchanged (drop-time channel
+full/closed, a regular serve send in flight at the abort) plus the
+named-but-unwritten `mem::forget`. The alternative peek-send-clear
+shape (state never leaves the cell) is recorded REJECTED: it holds the
+cell's `&mut` borrow across every consume's awaits, serializing the
+three consumes against the borrow instead of localizing each
+obligation with its consume.
+
 - The gateway does not own durable state. All persistent data lives in the
   scheduler (PostgreSQL) and the store.
 - Consider using a non-standard SSH port (e.g., 2222) to avoid conflicts with

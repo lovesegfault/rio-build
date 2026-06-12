@@ -505,3 +505,17 @@ under this rule.
   fires whole post-fix), the four lane-by-mode freshness pins, and
   the quint disposition twins (the as-built consume face falsifies;
   the typed face confirms through the sweep).
+
+- *Withheld-line disclosure (gateway log tail)*: the relay's
+  fetched-but-undisclosed pending-gap lines and their hole marker. Carrier:
+  the recorded cell plus the disclosure-on-drop guard every take returns
+  (`ArmedGap`) --- the obligation travels WITH the lines through all three
+  cooperative consumes, each completed send defuses exactly the part it
+  delivered, and an abort parked at any await finds the undelivered
+  remainder still Drop-armed (#rref("gw.tail.disclosure-linear")). The
+  pre-close shape held taken state in plain locals across awaited sends:
+  the Drop backstop's totality claim was bounded by cell residency, worst
+  case marker-delivered-lines-gone. Discharge forms: delivery (the sends),
+  prior-disclosure suppression (the accepted-gap floor), supersession
+  discard (the typed disposition); priced residuals: drop-time channel
+  full/closed, in-flight never-withheld serve sends.

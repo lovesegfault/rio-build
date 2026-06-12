@@ -367,11 +367,18 @@ impl LogTailSet {
     }
 
     /// Build terminus: hard-cancel everything still running. Every
-    /// aborted task's [`PendingGapCell`] Drop-discloses its withheld
-    /// gap into the output channel (merged_bug_111) — the returned
-    /// `JoinHandle`s let the terminus bound-join so those disclosures
-    /// land BEFORE its final channel drain. Chunks already delivered
-    /// to the output channel are unaffected.
+    /// aborted task's pending-gap disclosure lands in the output
+    /// channel regardless of residency (merged_bug_111; bug_122): the
+    /// [`PendingGapCell`] Drop covers recorded state, and the
+    /// [`ArmedGap`] guard covers a consume the abort caught
+    /// mid-flight (taken state stays Drop-armed across every send) —
+    /// the returned `JoinHandle`s let the terminus bound-join so
+    /// those disclosures land BEFORE its final channel drain. Chunks
+    /// already delivered to the output channel are unaffected. Priced
+    /// residuals (disclosed at the gap module's law): a drop-time
+    /// channel without enough free slots, a closed channel, and a
+    /// regular serve send in flight at the abort (never-withheld
+    /// content outside the gap obligation).
     pub(super) fn abort_all(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
         self.tasks
             .drain()
@@ -418,230 +425,414 @@ enum DriveEnd {
     OutputClosed,
 }
 
-/// A forward jump awaiting its one re-open chance, WITH the lines that
-/// arrived past it (merged_bug_150). The pre-fix shape kept only
-/// `gap_from` and dropped the chunk — so any exit between the first
-/// sighting and the second (grace edge, orphan, terminal-complete)
-/// lost both the fetched lines AND the marker. The state lives in a
-/// [`PendingGapCell`] (merged_bug_023): the only operations are
-/// record / same-span merge / heal / flush — a plain assignment that
-/// destroys fetched-but-undisclosed lines is unrepresentable.
-struct PendingGap {
-    /// First missing line (== the relay floor at sighting time).
-    gap_from: u64,
-    /// One past the last missing line (the withheld chunk's first).
-    gap_until: u64,
-    /// The already-sliced lines past the gap, ready to relay.
-    withheld: TaggedLogChunk,
-    /// The relay watermark to adopt once the withheld lines flush.
-    next_line: u64,
-}
-
-/// What a `GapThenServe` sighting means against the cell's state.
-enum Sighting {
-    /// Nothing pending: this is the hole's first observation.
-    First,
-    /// The store re-served the SAME split — the hole is durable.
-    SameSpan,
-    /// The store's view changed across the re-open (a different
-    /// split): the OLD pending must flush before the chunk is
-    /// re-examined against the advanced floor.
-    Divergent,
-}
-
-/// How a `Serve` interacted with a pending hole.
-enum ServeHeal {
-    /// No pending, or the serve did not reach into the hole.
-    Untouched,
-    /// Partial heal: the hole shrank (`gap_from` advanced); the
-    /// withheld lines stay for the eventual flush.
-    Shrunk,
-    /// The hole fully healed — no marker is owed. The payload is the
-    /// withheld CONTINUATION to relay (trimmed of any prefix the
-    /// serve already covered) with the watermark to adopt; `None`
-    /// when the serve covered the entire withheld span too (true
-    /// duplicates, nothing lost).
-    Healed(Option<(TaggedLogChunk, u64)>),
-}
-
 // r[impl store.log.tail-grace-drain+2]
-/// merged_bug_023: the linear withheld-gap cell. The pre-fix code
-/// mutated `Option<PendingGap>` directly at two in-stream transitions
-/// — the second-sighting accept REPLACED the pending (destroying the
-/// first sighting's withheld lines and widening the marker over
-/// content the relay held in hand), and the serve-arm void fired on
-/// PARTIAL heals (`next_line > gap_from` instead of `>= gap_until`),
-/// discarding withheld lines while the hole persisted. The field is
-/// private; every consuming path either relays the lines (flush,
-/// heal-continuation) or proves them duplicates (over-heal trim,
-/// same-span merge keeping max coverage) — destruction has no API.
-/// merged_bug_111: the cell carries its own disclosure channel so the
-/// no-destruction law survives NON-COOPERATIVE terminations too. The
-/// cooperative paths (flush, heal, backfill reconcile) `take()` the
-/// state and relay through the async sends; any termination that
-/// destroys the `run_tail` future with the state still recorded — the
-/// re-dispatch/terminus `JoinHandle::abort()`, or any future abort
-/// site — reaches [`Drop`], which `try_send`s the marker and the
-/// withheld lines into the output channel. Drop cannot await; the
-/// channel is a bounded mpsc, so reserved-permit sends are the
-/// strongest sends available there (bug_123: BOTH permits are
-/// reserved before either message sends — both-or-neither, so the
-/// partial-disclosure lattice is unrepresentable). Honest residual,
-/// sanctioned and now exact: a channel without two free slots drops
-/// the WHOLE disclosure (256 slots of backlog mean the consumer is
-/// the bottleneck), and a CLOSED channel means no consumer remains —
-/// the law's vacuous case.
-struct PendingGapCell {
-    state: Option<PendingGap>,
-    out_tx: mpsc::Sender<TaggedLogChunk>,
-    /// The owner-set abort disposition this Drop consults
-    /// (`sys.epilogue.supersession`): disclose at terminus, discard at
-    /// supersession.
-    disposition: RelayDisposition,
-}
+// r[impl gw.tail.disclosure-linear]
+/// The linear withheld-gap home (merged_bug_023; bug_122/R32 made the
+/// linearity a MODULE BOUNDARY). Recorded state lives in
+/// [`PendingGapCell`]; taken-in-flight state lives in [`ArmedGap`],
+/// the disclosure-on-drop guard every take returns. Both are
+/// Drop-armed with ONE disclosure implementation (the guard's), and
+/// the state fields are private to this module — so a consume that
+/// would hold withheld lines or an undisclosed hole in a bare local
+/// across an await has no API to write: `take` without arming does
+/// not exist, and each completed send defuses exactly the part it
+/// delivered (no await sits between a payload leaving the guard and
+/// the defuse — async cancellation lands only at awaits, so
+/// taken-but-unsent is not a reachable residency).
+///
+/// merged_bug_111 carried: any termination that destroys a relay
+/// future — the re-dispatch/terminus `JoinHandle::abort()`, or any
+/// future abort site — reaches a Drop (cell or guard) that
+/// `try_reserve`-sends the disclosure into the output channel.
+/// bug_123 carried: a two-message disclosure reserves BOTH permits
+/// before either message sends (both-or-neither). Honest residuals,
+/// priced: a drop-time channel without enough free slots drops the
+/// WHOLE disclosure (256 slots of backlog mean the consumer is the
+/// bottleneck); a CLOSED channel means no consumer remains; a regular
+/// serve send already in flight at abort time is outside the gap
+/// obligation (it was never withheld); and `mem::forget` of a guard
+/// is representable but unwritten.
+mod gap {
+    use tokio::sync::mpsc;
 
-impl Drop for PendingGapCell {
-    fn drop(&mut self) {
-        let Some(p) = self.state.take() else {
-            return;
-        };
-        if self.disposition.must_discard() {
-            // Superseded (bug_168): the successor relay owns the
-            // output channel now. The dead execution's withheld lines
-            // are stale content and its hole is not a hole in the NEW
-            // execution's log — relaying either would splice into the
-            // retry's client-visible stream. No try_send, no marker.
-            return;
-        }
-        // The pending's span is unmarked by invariant: a recorded
-        // pending is exactly a hole whose disclosure has not flushed
-        // (every accepted/flushed span empties the cell and raises
-        // the accepted floor before a new pending can record at or
-        // above it), so no dedup consultation is needed here.
-        //
-        // bug_123 (R27 lens): the two-message disclosure is
-        // TRANSACTIONAL — both permits reserved before either message
-        // sends (both-or-neither). Two independent try_sends made the
-        // partial-failure lattice reachable: a consumer recv landing
-        // between them could yield the withheld span with the hole
-        // never disclosed (marker-fails/withheld-lands), a partial
-        // disclosure the whole-drop residual above never priced. With
-        // the reservation pair, the residual IS whole-drop — exactly
-        // the priced case. The two-message vocabulary readers parse
-        // is preserved (the concat-chunk alternative was recorded and
-        // rejected for that reason).
-        let marker = gap_marker(p.gap_from, p.gap_until);
-        let marker_chunk = TaggedLogChunk {
-            derivation_path: p.withheld.derivation_path.clone(),
-            first_line_number: p.gap_from,
-            lines: vec![marker],
-        };
-        if p.withheld.lines.is_empty() {
-            if let Ok(permit) = self.out_tx.try_reserve() {
-                permit.send(marker_chunk);
+    use super::{RelayDisposition, TaggedLogChunk, gap_marker};
+
+    /// A forward jump awaiting its one re-open chance, WITH the lines
+    /// that arrived past it (merged_bug_150). The pre-fix shape kept
+    /// only `gap_from` and dropped the chunk — so any exit between the
+    /// first sighting and the second (grace edge, orphan,
+    /// terminal-complete) lost both the fetched lines AND the marker.
+    /// This is the cell's INPUT record; once recorded, the state is
+    /// reachable only through the cell's typed operations.
+    pub(super) struct PendingGap {
+        /// First missing line (== the relay floor at sighting time).
+        pub(super) gap_from: u64,
+        /// One past the last missing line (the withheld chunk's first).
+        pub(super) gap_until: u64,
+        /// The already-sliced lines past the gap, ready to relay.
+        pub(super) withheld: TaggedLogChunk,
+        /// The relay watermark to adopt once the withheld lines flush.
+        pub(super) next_line: u64,
+    }
+
+    /// What a `GapThenServe` sighting means against the cell's state.
+    pub(super) enum Sighting {
+        /// Nothing pending: this is the hole's first observation.
+        First,
+        /// The store re-served the SAME split — the hole is durable.
+        SameSpan,
+        /// The store's view changed across the re-open (a different
+        /// split): the OLD pending must flush before the chunk is
+        /// re-examined against the advanced floor.
+        Divergent,
+    }
+
+    /// How a `Serve` interacted with a pending hole.
+    pub(super) enum ServeHeal {
+        /// No pending, or the serve did not reach into the hole.
+        Untouched,
+        /// Partial heal: the hole shrank (`gap_from` advanced); the
+        /// withheld lines stay recorded for the eventual flush.
+        Shrunk,
+        /// The hole fully healed — the serve chunk now in flight
+        /// covers it. The payload is the ARMED remainder: the hole
+        /// stays marker-armed (if the serve send aborts, the client
+        /// never received the covering lines and the hole must still
+        /// be disclosed) plus the full withheld lines. After the
+        /// serve send completes the caller calls
+        /// [`ArmedGap::note_delivered`], which defuses the hole and
+        /// trims the duplicate prefix, then [`ArmedGap::send_lines`]
+        /// relays the true continuation (a no-op for the
+        /// all-duplicates case).
+        Healed(ArmedGap),
+    }
+
+    /// merged_bug_023: the linear withheld-gap cell. The recorded
+    /// state's only operations are record / same-span merge / heal /
+    /// armed-take — a plain assignment that destroys
+    /// fetched-but-undisclosed lines is unrepresentable, and (bug_122)
+    /// so is a take that strips the disclosure obligation off the
+    /// lines: [`Self::take_armed`] is the only take and it returns the
+    /// Drop-armed [`ArmedGap`].
+    pub(super) struct PendingGapCell {
+        state: Option<PendingGap>,
+        out_tx: mpsc::Sender<TaggedLogChunk>,
+        /// The owner-set abort disposition the Drops consult
+        /// (`sys.epilogue.supersession`): disclose at terminus,
+        /// discard at supersession.
+        disposition: RelayDisposition,
+    }
+
+    impl Drop for PendingGapCell {
+        fn drop(&mut self) {
+            // One disclosure implementation: arm the recorded state
+            // and let the guard's Drop disclose it. The pending's
+            // span is unmarked by invariant: a recorded pending is
+            // exactly a hole whose disclosure has not flushed (every
+            // accepted/flushed span empties the cell and raises the
+            // accepted floor before a new pending can record at or
+            // above it), so no dedup consultation is needed here.
+            if let Some(p) = self.state.take() {
+                drop(self.arm(p));
             }
-        } else if let (Ok(marker_permit), Ok(withheld_permit)) =
-            (self.out_tx.try_reserve(), self.out_tx.try_reserve())
-        {
-            // Order preserved: marker first, withheld second (permits
-            // send in acquisition order on the same channel).
-            marker_permit.send(marker_chunk);
-            withheld_permit.send(p.withheld);
-        }
-    }
-}
-
-impl PendingGapCell {
-    fn new(out_tx: mpsc::Sender<TaggedLogChunk>, disposition: RelayDisposition) -> Self {
-        Self {
-            state: None,
-            out_tx,
-            disposition,
         }
     }
 
-    fn gap_from(&self) -> Option<u64> {
-        self.state.as_ref().map(|p| p.gap_from)
-    }
-
-    /// The pending hole's withheld-start (`gap_until`) — the
-    /// divergent-backfill discriminant (merged_bug_020): a fresh
-    /// sighting beginning below it carries lines that HEAL part of
-    /// the recorded hole.
-    fn pending_until(&self) -> Option<u64> {
-        self.state.as_ref().map(|p| p.gap_until)
-    }
-
-    /// Divergent-backfill consume (merged_bug_020): the taken pending
-    /// goes to [`reconcile_backfill`], whose contract relays every
-    /// withheld line or proves it a duplicate of relayed coverage —
-    /// the cell's no-destruction law holds through this path too.
-    fn take_for_backfill(&mut self) -> Option<PendingGap> {
-        self.state.take()
-    }
-
-    fn classify(&self, gap_from: u64, gap_until: u64) -> Sighting {
-        match &self.state {
-            None => Sighting::First,
-            Some(p) if p.gap_from == gap_from && p.gap_until == gap_until => Sighting::SameSpan,
-            Some(_) => Sighting::Divergent,
+    impl PendingGapCell {
+        pub(super) fn new(
+            out_tx: mpsc::Sender<TaggedLogChunk>,
+            disposition: RelayDisposition,
+        ) -> Self {
+            Self {
+                state: None,
+                out_tx,
+                disposition,
+            }
         }
-    }
 
-    /// First sighting: record the hole and its withheld lines.
-    fn record_first(&mut self, fresh: PendingGap) {
-        debug_assert!(self.state.is_none(), "record_first on a non-empty cell");
-        self.state = Some(fresh);
-    }
+        pub(super) fn gap_from(&self) -> Option<u64> {
+            self.state.as_ref().map(|p| p.gap_from)
+        }
 
-    /// Same-span second sighting: keep whichever copy covers MORE
-    /// (the chunks carry identical numbering, so the longer one is a
-    /// superset — replacing with a shorter fresh copy would drop the
-    /// old tail).
-    fn merge_same_span(&mut self, fresh: PendingGap) {
-        match self.state.as_mut() {
-            None => self.state = Some(fresh),
-            Some(old) => {
-                if fresh.next_line > old.next_line {
-                    *old = fresh;
+        /// The pending hole's withheld-start (`gap_until`) — the
+        /// divergent-backfill discriminant (merged_bug_020): a fresh
+        /// sighting beginning below it carries lines that HEAL part
+        /// of the recorded hole.
+        pub(super) fn pending_until(&self) -> Option<u64> {
+            self.state.as_ref().map(|p| p.gap_until)
+        }
+
+        /// THE take (bug_122): every consume of recorded state leaves
+        /// through here and receives the obligation ARMED — the
+        /// returned guard Drop-discloses whatever part of the hole
+        /// and the withheld lines has not been delivered or defused
+        /// by the time it is destroyed.
+        pub(super) fn take_armed(&mut self) -> Option<ArmedGap> {
+            self.state.take().map(|p| self.arm(p))
+        }
+
+        fn arm(&self, p: PendingGap) -> ArmedGap {
+            ArmedGap {
+                hole: Some((p.gap_from, p.gap_until)),
+                lines_from: p.withheld.first_line_number,
+                lines: p.withheld.lines,
+                derivation_path: p.withheld.derivation_path,
+                next_line: p.next_line,
+                out_tx: self.out_tx.clone(),
+                disposition: self.disposition.clone(),
+            }
+        }
+
+        pub(super) fn classify(&self, gap_from: u64, gap_until: u64) -> Sighting {
+            match &self.state {
+                None => Sighting::First,
+                Some(p) if p.gap_from == gap_from && p.gap_until == gap_until => Sighting::SameSpan,
+                Some(_) => Sighting::Divergent,
+            }
+        }
+
+        /// First sighting: record the hole and its withheld lines.
+        pub(super) fn record_first(&mut self, fresh: PendingGap) {
+            debug_assert!(self.state.is_none(), "record_first on a non-empty cell");
+            self.state = Some(fresh);
+        }
+
+        /// Same-span second sighting: keep whichever copy covers MORE
+        /// (the chunks carry identical numbering, so the longer one is
+        /// a superset — replacing with a shorter fresh copy would drop
+        /// the old tail).
+        pub(super) fn merge_same_span(&mut self, fresh: PendingGap) {
+            match self.state.as_mut() {
+                None => self.state = Some(fresh),
+                Some(old) => {
+                    if fresh.next_line > old.next_line {
+                        *old = fresh;
+                    }
                 }
             }
         }
+
+        /// A `Serve` advanced the floor to `next_line`: shrink, keep,
+        /// or heal the pending hole. Healing returns the ARMED
+        /// remainder (see [`ServeHeal::Healed`]) — never a bare chunk
+        /// a parked send could silently destroy.
+        pub(super) fn on_serve(&mut self, next_line: u64) -> ServeHeal {
+            let Some(p) = self.state.as_mut() else {
+                return ServeHeal::Untouched;
+            };
+            if next_line <= p.gap_from {
+                return ServeHeal::Untouched;
+            }
+            if next_line < p.gap_until {
+                // Partial heal: the served prefix [gap_from,
+                // next_line) cannot duplicate the withheld lines
+                // (they start at gap_until); only the residual hole
+                // remains. (A serve send aborted mid-flight here is
+                // the priced in-flight residual — the recorded state
+                // keeps covering the shrunk hole and the lines.)
+                p.gap_from = next_line;
+                return ServeHeal::Shrunk;
+            }
+            // Full heal: the serve covers [.., next_line) ⊇ the hole.
+            let p = self.state.take().expect("checked above");
+            ServeHeal::Healed(self.arm(p))
+        }
     }
 
-    /// A `Serve` advanced the floor to `next_line`: shrink, keep, or
-    /// heal the pending hole. Healing returns the withheld
-    /// continuation to relay — never silently drops it.
-    fn on_serve(&mut self, next_line: u64) -> ServeHeal {
-        let Some(p) = self.state.as_mut() else {
-            return ServeHeal::Untouched;
-        };
-        if next_line <= p.gap_from {
-            return ServeHeal::Untouched;
+    /// The disclosure-on-drop guard (bug_122, the R32 banner
+    /// instance): the taken-in-flight residency of a pending gap. The
+    /// obligation travels WITH the lines — a consume holds this guard
+    /// (never bare lines) across its awaits, defusing each part as
+    /// the matching send completes:
+    ///
+    /// - [`Self::disclose_hole_until`] sends a marker for a hole
+    ///   prefix and shrinks the armed hole past it;
+    /// - [`Self::note_delivered`] defuses what a CALLER-sent chunk
+    ///   delivered (hole coverage and duplicate line prefixes);
+    /// - [`Self::send_lines`] relays the remaining withheld lines and
+    ///   leaves the guard fully defused;
+    /// - [`Self::suppress_hole`]/[`Self::suppress_hole_until`] defuse
+    ///   a marker the accepted-gap floor proves ALREADY disclosed by
+    ///   an earlier flush (typed discharge-by-prior-disclosure, never
+    ///   a silent drop).
+    ///
+    /// Every async wait is a `reserve().await` with the payload still
+    /// armed; the payload leaves the guard only in the synchronous
+    /// permit-send that follows, and the defuse is the next statement
+    /// — an abort at ANY await point therefore finds the undelivered
+    /// remainder still armed, and [`Drop`] discloses it (marker
+    /// and/or lines, both-permits law) subject to the supersession
+    /// disposition and the priced channel-full/closed residuals.
+    pub(super) struct ArmedGap {
+        /// The still-undisclosed, still-undelivered hole
+        /// `[from, until)`. `None` once disclosed, delivered, or
+        /// floor-suppressed.
+        hole: Option<(u64, u64)>,
+        /// First line number of `lines`.
+        lines_from: u64,
+        /// The withheld lines not yet relayed (trimmed as coverage
+        /// lands; empty once relayed).
+        lines: Vec<Vec<u8>>,
+        derivation_path: String,
+        /// The relay watermark to adopt when the lines land.
+        next_line: u64,
+        out_tx: mpsc::Sender<TaggedLogChunk>,
+        disposition: RelayDisposition,
+    }
+
+    impl ArmedGap {
+        /// The armed hole, if any remains.
+        pub(super) fn hole(&self) -> Option<(u64, u64)> {
+            self.hole
         }
-        if next_line < p.gap_until {
-            // Partial heal: the served prefix [gap_from, next_line)
-            // cannot duplicate the withheld lines (they start at
-            // gap_until); only the residual hole remains.
-            p.gap_from = next_line;
-            return ServeHeal::Shrunk;
+
+        /// Typed marker discharge WITHOUT a send: the accepted-gap
+        /// floor proves the whole span was already disclosed by an
+        /// earlier flush (markers are never repeated for a span).
+        pub(super) fn suppress_hole(&mut self) {
+            self.hole = None;
         }
-        // Full heal: the serve covered [.., next_line) ⊇ the hole.
-        let p = self.state.take().expect("checked above");
-        let skip = usize::try_from(next_line - p.gap_until).unwrap_or(usize::MAX);
-        if skip >= p.withheld.lines.len() {
-            // The serve also covered every withheld line — true
-            // duplicates; the floor is already past them.
-            return ServeHeal::Healed(None);
+
+        /// Prefix form of [`Self::suppress_hole`]: the span below
+        /// `until` was already disclosed; the remainder stays armed.
+        pub(super) fn suppress_hole_until(&mut self, until: u64) {
+            if let Some((from, hole_until)) = self.hole {
+                self.hole = if until >= hole_until {
+                    None
+                } else {
+                    Some((from.max(until), hole_until))
+                };
+            }
         }
-        let suffix = TaggedLogChunk {
-            derivation_path: p.withheld.derivation_path.clone(),
-            first_line_number: next_line,
-            lines: p.withheld.lines[skip..].to_vec(),
-        };
-        ServeHeal::Healed(Some((suffix, p.next_line.saturating_sub(1))))
+
+        /// Disclose the armed hole up to `until` (clamped to the
+        /// hole): one marker send, then the hole shrinks past it. The
+        /// await is the permit reservation — the hole stays armed
+        /// through it. Returns `false` iff the channel is closed.
+        pub(super) async fn disclose_hole_until(&mut self, until: u64) -> bool {
+            let Some((from, hole_until)) = self.hole else {
+                return true;
+            };
+            let until = until.min(hole_until);
+            if until <= from {
+                return true;
+            }
+            let Ok(permit) = self.out_tx.reserve().await else {
+                return false;
+            };
+            permit.send(TaggedLogChunk {
+                derivation_path: self.derivation_path.clone(),
+                first_line_number: from,
+                lines: vec![gap_marker(from, until)],
+            });
+            self.hole = if until < hole_until {
+                Some((until, hole_until))
+            } else {
+                None
+            };
+            true
+        }
+
+        /// A caller-sent chunk delivered everything below `next`:
+        /// defuse the covered hole prefix and trim the now-duplicate
+        /// withheld prefix. Synchronous — called immediately after
+        /// the caller's send completes.
+        pub(super) fn note_delivered(&mut self, next: u64) {
+            if let Some((from, until)) = self.hole {
+                self.hole = if next >= until {
+                    None
+                } else {
+                    Some((from.max(next), until))
+                };
+            }
+            if next > self.lines_from {
+                let skip = usize::try_from(next - self.lines_from).unwrap_or(usize::MAX);
+                if skip >= self.lines.len() {
+                    self.lines.clear();
+                } else {
+                    self.lines.drain(..skip);
+                }
+                self.lines_from = next;
+            }
+        }
+
+        /// Relay the remaining withheld lines as one chunk and adopt
+        /// the watermark; a no-op when nothing remains (the
+        /// all-duplicates heal). The lines leave the guard only in
+        /// the synchronous permit-send after the reservation
+        /// resolves. Returns `false` iff the channel is closed.
+        pub(super) async fn send_lines(&mut self, last_relayed: &mut Option<u64>) -> bool {
+            if self.lines.is_empty() {
+                return true;
+            }
+            let Ok(permit) = self.out_tx.reserve().await else {
+                return false;
+            };
+            let lines = std::mem::take(&mut self.lines);
+            permit.send(TaggedLogChunk {
+                derivation_path: self.derivation_path.clone(),
+                first_line_number: self.lines_from,
+                lines,
+            });
+            *last_relayed = Some(self.next_line.saturating_sub(1));
+            true
+        }
+    }
+
+    impl Drop for ArmedGap {
+        fn drop(&mut self) {
+            let marker = self.hole.take();
+            let lines = std::mem::take(&mut self.lines);
+            if marker.is_none() && lines.is_empty() {
+                // Defused: every part was delivered, disclosed, or
+                // floor-suppressed.
+                return;
+            }
+            if self.disposition.must_discard() {
+                // Superseded (bug_168): the successor relay owns the
+                // output channel now. The dead execution's withheld
+                // lines are stale content and its hole is not a hole
+                // in the NEW execution's log — relaying either would
+                // splice into the retry's client-visible stream. No
+                // try_send, no marker.
+                return;
+            }
+            // bug_123 (R27 lens), carried: a two-message disclosure
+            // is TRANSACTIONAL — both permits reserved before either
+            // message sends (both-or-neither; permits send in
+            // acquisition order on the same channel). The whole-drop
+            // channel-full case remains the priced residual.
+            let marker_chunk = marker.map(|(from, until)| TaggedLogChunk {
+                derivation_path: self.derivation_path.clone(),
+                first_line_number: from,
+                lines: vec![gap_marker(from, until)],
+            });
+            let lines_chunk = (!lines.is_empty()).then(|| TaggedLogChunk {
+                derivation_path: self.derivation_path.clone(),
+                first_line_number: self.lines_from,
+                lines,
+            });
+            match (marker_chunk, lines_chunk) {
+                (Some(only), None) | (None, Some(only)) => {
+                    if let Ok(permit) = self.out_tx.try_reserve() {
+                        permit.send(only);
+                    }
+                }
+                (Some(marker_chunk), Some(lines_chunk)) => {
+                    if let (Ok(marker_permit), Ok(lines_permit)) =
+                        (self.out_tx.try_reserve(), self.out_tx.try_reserve())
+                    {
+                        marker_permit.send(marker_chunk);
+                        lines_permit.send(lines_chunk);
+                    }
+                }
+                (None, None) => unreachable!("the defused case returned above"),
+            }
+        }
     }
 }
+
+use gap::{ArmedGap, PendingGap, PendingGapCell, ServeHeal, Sighting};
 
 // r[impl store.log.tail-reconnect]
 // r[impl store.log.tail-grace-drain+2]
@@ -720,13 +911,7 @@ async fn run_tail(
             // fails harmlessly if the consumer is truly gone, but an
             // orphaned WATCH with a live OUTPUT channel must not eat
             // the withheld lines.
-            flush_pending_gap(
-                &mut pending_gap,
-                &out_tx,
-                &mut last_relayed,
-                &mut accepted_gap_floor,
-            )
-            .await;
+            flush_pending_gap(&mut pending_gap, &mut last_relayed, &mut accepted_gap_floor).await;
             return;
         }
         arm_grace(&mut grace_deadline, &drain, config.terminal_grace);
@@ -875,13 +1060,8 @@ async fn run_tail(
                 // accept it now, marker plus withheld lines, through
                 // the same path the in-stream accept uses. Exiting
                 // with fetched-but-undisclosed lines is unrepresentable.
-                flush_pending_gap(
-                    &mut pending_gap,
-                    &out_tx,
-                    &mut last_relayed,
-                    &mut accepted_gap_floor,
-                )
-                .await;
+                flush_pending_gap(&mut pending_gap, &mut last_relayed, &mut accepted_gap_floor)
+                    .await;
                 // bug_121: disclosure totality quantifies over the
                 // LOSS surface, not the fetch surface — the kernel's
                 // verdict carries the obligation typed: the hard
@@ -1055,6 +1235,13 @@ async fn drive_stream(
                             // no hole remains. The pre-fix void fired
                             // on any next_line > gap_from, destroying
                             // withheld lines on partial heals.
+                            // The heal verdict is ARMED (bug_122/R32):
+                            // on a full heal the hole and the withheld
+                            // continuation ride a disclosure-on-drop
+                            // guard ACROSS the serve send below — an
+                            // abort parked there finds them still
+                            // armed and Drop discloses; the completed
+                            // send defuses exactly what it delivered.
                             let heal = pending_gap.on_serve(next_line);
                             let tagged =
                                 slice_chunk(chunk, derivation_path, yield_from, yield_until);
@@ -1070,11 +1257,11 @@ async fn drive_stream(
                             if out_tx.send(tagged).await.is_err() {
                                 return DriveEnd::OutputClosed;
                             }
-                            if let ServeHeal::Healed(Some((suffix, watermark))) = heal {
-                                if out_tx.send(suffix).await.is_err() {
+                            if let ServeHeal::Healed(mut armed) = heal {
+                                armed.note_delivered(next_line);
+                                if !armed.send_lines(last_relayed).await {
                                     return DriveEnd::OutputClosed;
                                 }
-                                *last_relayed = Some(watermark);
                             }
                             break;
                         }
@@ -1102,8 +1289,8 @@ async fn drive_stream(
                                         pending_gap.pending_until()
                                         && first < pending_until
                                     {
-                                        let pending = pending_gap
-                                            .take_for_backfill()
+                                        let armed = pending_gap
+                                            .take_armed()
                                             .expect("pending_until implies pending");
                                         let fresh = slice_chunk(
                                             chunk,
@@ -1112,9 +1299,8 @@ async fn drive_stream(
                                             yield_until,
                                         );
                                         if !reconcile_backfill(
-                                            pending,
+                                            armed,
                                             fresh,
-                                            gap_from,
                                             next_line,
                                             out_tx,
                                             last_relayed,
@@ -1140,7 +1326,6 @@ async fn drive_stream(
                                     // re-examination.
                                     if !flush_pending_gap(
                                         pending_gap,
-                                        out_tx,
                                         last_relayed,
                                         accepted_gap_floor,
                                     )
@@ -1173,7 +1358,6 @@ async fn drive_stream(
                                     });
                                     if !flush_pending_gap(
                                         pending_gap,
-                                        out_tx,
                                         last_relayed,
                                         accepted_gap_floor,
                                     )
@@ -1211,7 +1395,6 @@ async fn drive_stream(
                                     if no_budget_for_retry {
                                         if !flush_pending_gap(
                                             pending_gap,
-                                            out_tx,
                                             last_relayed,
                                             accepted_gap_floor,
                                         )
@@ -1293,40 +1476,32 @@ async fn drive_stream(
 /// second sighting, the budget-edge immediate accept, and BOTH
 /// `run_tail` exit paths — flushes through here, so "exit with
 /// fetched-but-undisclosed lines" is not a state the loop can be in.
-/// Returns false iff the output channel is closed (nothing left to
-/// disclose to).
+/// The consume rides the armed take (bug_122/R32): the marker and the
+/// lines stay Drop-armed across both sends, and each completed send
+/// defuses its part — an abort parked at EITHER send still discloses
+/// the remainder. Returns false iff the output channel is closed
+/// (nothing left to disclose to).
 async fn flush_pending_gap(
     pending_gap: &mut PendingGapCell,
-    out_tx: &mpsc::Sender<TaggedLogChunk>,
     last_relayed: &mut Option<u64>,
     accepted_gap_floor: &mut Option<u64>,
 ) -> bool {
-    let Some(pending) = pending_gap.state.take() else {
+    let Some(mut armed) = pending_gap.take_armed() else {
         return true;
     };
-    if accepted_gap_floor.is_none_or(|f| pending.gap_from >= f) {
-        *accepted_gap_floor = Some(pending.gap_until);
-        let marker = gap_marker(pending.gap_from, pending.gap_until);
-        if out_tx
-            .send(TaggedLogChunk {
-                derivation_path: pending.withheld.derivation_path.clone(),
-                first_line_number: pending.gap_from,
-                lines: vec![marker],
-            })
-            .await
-            .is_err()
-        {
-            return false;
+    if let Some((from, until)) = armed.hole() {
+        if accepted_gap_floor.is_none_or(|f| from >= f) {
+            *accepted_gap_floor = Some(until);
+            if !armed.disclose_hole_until(until).await {
+                return false;
+            }
+        } else {
+            // Below the accepted floor: an earlier flush already
+            // disclosed this span — typed discharge, never a re-mark.
+            armed.suppress_hole();
         }
     }
-    let advanced = pending.next_line.saturating_sub(1);
-    if !pending.withheld.lines.is_empty() {
-        if out_tx.send(pending.withheld).await.is_err() {
-            return false;
-        }
-        *last_relayed = Some(advanced);
-    }
-    true
+    armed.send_lines(last_relayed).await
 }
 
 /// merged_bug_020: the divergent-backfill reconcile. The fresh
@@ -1348,85 +1523,64 @@ async fn flush_pending_gap(
 ///
 /// Every fresh/withheld line is relayed exactly once or proven a
 /// duplicate of relayed coverage; destruction has no path (the
-/// PendingGapCell law, extended over this consume). Returns false iff
-/// the output channel closed.
+/// PendingGapCell law, extended over this consume — bug_122/R32: the
+/// pending arrives ARMED, every marker/line stays Drop-armed until
+/// the send that delivers it completes, and the fresh chunk's landing
+/// defuses exactly the coverage it delivered). Returns false iff the
+/// output channel closed.
 async fn reconcile_backfill(
-    pending: PendingGap,
+    mut armed: ArmedGap,
     fresh: TaggedLogChunk,
-    gap_from: u64,
     fresh_next: u64,
     out_tx: &mpsc::Sender<TaggedLogChunk>,
     last_relayed: &mut Option<u64>,
     accepted_gap_floor: &mut Option<u64>,
 ) -> bool {
     let fresh_first = fresh.first_line_number;
+    let Some((gap_from, _)) = armed.hole() else {
+        debug_assert!(false, "a backfill reconcile starts with an armed hole");
+        return armed.send_lines(last_relayed).await;
+    };
     // 1. Residual prefix hole, if any survives the marker dedup.
-    if fresh_first > gap_from && accepted_gap_floor.is_none_or(|f| gap_from >= f) {
-        *accepted_gap_floor = Some(fresh_first);
-        let marker = gap_marker(gap_from, fresh_first);
-        if out_tx
-            .send(TaggedLogChunk {
-                derivation_path: fresh.derivation_path.clone(),
-                first_line_number: gap_from,
-                lines: vec![marker],
-            })
-            .await
-            .is_err()
-        {
-            return false;
+    if fresh_first > gap_from {
+        if accepted_gap_floor.is_none_or(|f| gap_from >= f) {
+            *accepted_gap_floor = Some(fresh_first);
+            if !armed.disclose_hole_until(fresh_first).await {
+                return false;
+            }
+        } else {
+            // Already disclosed by an earlier flush — typed
+            // discharge of the prefix, never a re-mark.
+            armed.suppress_hole_until(fresh_first);
         }
     }
     // 2. The healing lines themselves — BEFORE any floor advancement
-    // could hide them.
-    let derivation_path = fresh.derivation_path.clone();
+    // could hide them. (The armed remainder covers the hole and the
+    // withheld lines if this send aborts mid-flight.)
     if !fresh.lines.is_empty() {
         if out_tx.send(fresh).await.is_err() {
             return false;
         }
         *last_relayed = Some(fresh_next.saturating_sub(1));
     }
-    if fresh_next >= pending.gap_until {
-        // 3a. The fresh serve covered the rest of the hole and
-        // possibly a withheld prefix: relay the non-duplicate suffix.
-        let skip = usize::try_from(fresh_next - pending.gap_until).unwrap_or(usize::MAX);
-        if skip < pending.withheld.lines.len() {
-            let suffix = TaggedLogChunk {
-                derivation_path,
-                first_line_number: fresh_next,
-                lines: pending.withheld.lines[skip..].to_vec(),
-            };
-            if out_tx.send(suffix).await.is_err() {
+    // The fresh coverage landed: defuse the hole span it delivered
+    // and trim any withheld prefix it duplicated (3a's skip).
+    armed.note_delivered(fresh_next);
+    // 3b. The fresh stopped short of the withheld start: a second
+    // residual hole remains. Disclose it, then the withheld whole —
+    // the retry budget for this hole is spent.
+    if let Some((from, until)) = armed.hole() {
+        if accepted_gap_floor.is_none_or(|f| from >= f) {
+            *accepted_gap_floor = Some(until);
+            if !armed.disclose_hole_until(until).await {
                 return false;
             }
-            *last_relayed = Some(pending.next_line.saturating_sub(1));
-        }
-    } else {
-        // 3b. The fresh stopped short of the withheld start: a second
-        // residual hole remains. Disclose it, then flush the withheld
-        // whole — the retry budget for this hole is spent.
-        if accepted_gap_floor.is_none_or(|f| fresh_next >= f) {
-            *accepted_gap_floor = Some(pending.gap_until);
-            let marker = gap_marker(fresh_next, pending.gap_until);
-            if out_tx
-                .send(TaggedLogChunk {
-                    derivation_path,
-                    first_line_number: fresh_next,
-                    lines: vec![marker],
-                })
-                .await
-                .is_err()
-            {
-                return false;
-            }
-        }
-        if !pending.withheld.lines.is_empty() {
-            if out_tx.send(pending.withheld).await.is_err() {
-                return false;
-            }
-            *last_relayed = Some(pending.next_line.saturating_sub(1));
+        } else {
+            armed.suppress_hole();
         }
     }
-    true
+    // 3a/3b tail: the non-duplicate withheld remainder.
+    armed.send_lines(last_relayed).await
 }
 
 /// The synthesized disclosure for an accepted durable gap (owner
@@ -2999,7 +3153,7 @@ mod tests {
             .expect("fill to one-slot-free");
         let mut cell =
             super::PendingGapCell::new(out_tx.clone(), super::RelayDisposition::disclose_at_drop());
-        cell.state = Some(pending());
+        cell.record_first(pending());
         drop(cell);
         drop(out_tx);
         let mut got = Vec::new();
@@ -3019,7 +3173,7 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::channel(2);
         let mut cell =
             super::PendingGapCell::new(out_tx.clone(), super::RelayDisposition::disclose_at_drop());
-        cell.state = Some(pending());
+        cell.record_first(pending());
         drop(cell);
         drop(out_tx);
         let marker = out_rx.recv().await.expect("the marker");
@@ -3040,11 +3194,242 @@ mod tests {
             super::PendingGapCell::new(out_tx.clone(), super::RelayDisposition::disclose_at_drop());
         let mut p = pending();
         p.withheld.lines.clear();
-        cell.state = Some(p);
+        cell.record_first(p);
         drop(cell);
         drop(out_tx);
         let marker = out_rx.recv().await.expect("the lone marker");
         assert_eq!(marker.first_line_number, 5);
         assert!(out_rx.recv().await.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // W12-AT (bug_122, R32 banner): the taken-in-flight residency
+    // ------------------------------------------------------------------
+
+    /// Drive `fut` exactly one `poll` with a no-op waker: the future
+    /// advances to its first pending await and STOPS — the
+    /// deterministic stand-in for "a terminus `abort_all` lands while
+    /// the consume is parked at this send". Dropping the future after
+    /// a single poll IS the cancellation (tokio aborts by dropping the
+    /// task's future at a yield point).
+    fn poll_once<F: std::future::Future>(fut: &mut std::pin::Pin<Box<F>>) {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "the consume must park at the choreographed send"
+        );
+    }
+
+    fn taken_window_pending(lines: &[&str]) -> super::PendingGap {
+        super::PendingGap {
+            gap_from: 5,
+            gap_until: 8,
+            withheld: super::TaggedLogChunk {
+                derivation_path: DRV.to_string(),
+                first_line_number: 8,
+                lines: lines.iter().map(|l| l.as_bytes().to_vec()).collect(),
+            },
+            next_line: 8 + lines.len() as u64,
+        }
+    }
+
+    /// W12-AT window 1 — the flush consume, aborted at the WITHHELD
+    /// send (the worst case: marker delivered, lines gone).
+    /// Proposition: no abort window exists in which withheld lines die
+    /// undisclosed — the disclosure obligation travels WITH the lines
+    /// (in-cell before the take, Drop-armed while taken-in-flight).
+    ///
+    /// Choreography (fully deterministic, no runtime races): a 1-slot
+    /// channel parks the flush at its second send with the marker
+    /// already delivered; the test then frees the slot WITHOUT polling
+    /// the consume again and drops the parked future — exactly what a
+    /// terminus `abort_all` does to the relay task.
+    ///
+    /// Pre-fix red (the wave-12 W12-AT capture): the taken
+    /// `PendingGap` is a plain local of the dropped future and
+    /// `PendingGapCell::drop` sees `None` —
+    ///   `marker-delivered-lines-gone: the withheld lines must survive
+    ///   an abort parked at the withheld send (got [])`.
+    // r[verify gw.tail.disclosure-linear]
+    #[tokio::test]
+    async fn flush_abort_at_withheld_send_still_discloses_lines() {
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let mut cell =
+            super::PendingGapCell::new(out_tx.clone(), super::RelayDisposition::disclose_at_drop());
+        cell.record_first(taken_window_pending(&["line-8", "line-9"]));
+        let mut last_relayed: Option<u64> = None;
+        let mut floor: Option<u64> = None;
+        {
+            let mut fut = Box::pin(super::flush_pending_gap(
+                &mut cell,
+                &mut last_relayed,
+                &mut floor,
+            ));
+            // One poll: the marker send completes synchronously (one
+            // slot free), the withheld send parks (channel full).
+            poll_once(&mut fut);
+            // Free the slot, then "abort": drop the parked consume.
+            let marker = out_rx.try_recv().expect("the marker landed first");
+            assert!(
+                String::from_utf8(marker.lines[0].clone())
+                    .expect("utf8")
+                    .contains("missing"),
+                "the first write is the gap marker"
+            );
+        }
+        // The cell survived the abort (it lives in `run_tail`, not the
+        // consume) — at terminus it drops too.
+        drop(cell);
+        drop(out_tx);
+        let mut got = Vec::new();
+        while let Some(c) = out_rx.recv().await {
+            got.extend(
+                c.lines
+                    .iter()
+                    .map(|l| String::from_utf8(l.clone()).expect("test lines are UTF-8")),
+            );
+        }
+        assert_eq!(
+            got,
+            vec!["line-8".to_string(), "line-9".to_string()],
+            "marker-delivered-lines-gone: the withheld lines must survive an \
+             abort parked at the withheld send (got {got:?})"
+        );
+    }
+
+    /// W12-AT window 2 — the divergent-backfill consume, aborted
+    /// mid-choreography (after the residual marker and the healing
+    /// lines, parked at the withheld continuation). Same proposition,
+    /// at the four-send consume's deepest window.
+    ///
+    /// Pre-fix red: `reconcile_backfill` owns the pending BY VALUE —
+    /// dropping the parked future destroys the withheld lines and the
+    /// un-disclosed second residual; the channel drains to the two
+    /// delivered messages only.
+    // r[verify gw.tail.disclosure-linear]
+    #[tokio::test]
+    async fn backfill_abort_at_withheld_send_still_discloses_remainder() {
+        // Pending hole [5, 8) with withheld [8, 10); a divergent fresh
+        // sighting serves [6, 7) — partial backfill: marker [5, 6),
+        // fresh line 6, then (parked) the second residual [7, 8) and
+        // the withheld lines.
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        let mut cell =
+            super::PendingGapCell::new(out_tx.clone(), super::RelayDisposition::disclose_at_drop());
+        cell.record_first(taken_window_pending(&["line-8", "line-9"]));
+        let armed = cell.take_armed().expect("recorded");
+        let fresh = super::TaggedLogChunk {
+            derivation_path: DRV.to_string(),
+            first_line_number: 6,
+            lines: vec![b"line-6".to_vec()],
+        };
+        let mut last_relayed: Option<u64> = None;
+        let mut floor: Option<u64> = None;
+        {
+            let mut fut = Box::pin(super::reconcile_backfill(
+                armed,
+                fresh,
+                7,
+                &out_tx,
+                &mut last_relayed,
+                &mut floor,
+            ));
+            // One poll: residual marker [5,6) and the healing line
+            // fill both slots; the consume parks at the second
+            // residual marker send.
+            poll_once(&mut fut);
+            let m1 = out_rx.try_recv().expect("residual prefix marker");
+            assert_eq!(m1.first_line_number, 5);
+            let healing = out_rx.try_recv().expect("the healing line");
+            assert_eq!(healing.first_line_number, 6);
+        }
+        drop(cell);
+        drop(out_tx);
+        let mut got = Vec::new();
+        while let Some(c) = out_rx.recv().await {
+            for l in &c.lines {
+                got.push(String::from_utf8(l.clone()).expect("test lines are UTF-8"));
+            }
+        }
+        assert!(
+            got.iter().any(|l| l.contains("lines 7-7 missing"))
+                && got.iter().any(|l| l == "line-8")
+                && got.iter().any(|l| l == "line-9"),
+            "an abort parked mid-backfill must still disclose the residual \
+             hole and the withheld lines (got {got:?})"
+        );
+    }
+
+    /// W12-AT window 3 — the full-heal consume: `on_serve` takes the
+    /// pending and hands the withheld continuation to the caller, who
+    /// holds it across the serve-chunk send. An abort parked there
+    /// destroyed the continuation while the cell's Drop saw `None`.
+    ///
+    /// Pre-fix red: the heal returns the suffix as a BARE chunk; the
+    /// simulated abort (dropping it) leaves nothing armed —
+    ///   `the heal continuation must survive an abort at the serve
+    ///   send (got [])`.
+    // r[verify gw.tail.disclosure-linear]
+    #[tokio::test]
+    async fn heal_abort_at_serve_send_still_discloses_continuation() {
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let mut cell =
+            super::PendingGapCell::new(out_tx.clone(), super::RelayDisposition::disclose_at_drop());
+        cell.record_first(taken_window_pending(&["line-8", "line-9"]));
+        // A serve advances the floor to 9: covers the hole [5,8) and
+        // the first withheld line — the continuation is line-9.
+        let heal = cell.on_serve(9);
+        match heal {
+            super::ServeHeal::Healed(taken) => {
+                // The simulated abort: the caller's local (the taken
+                // continuation) is destroyed at the parked serve send.
+                drop(taken);
+            }
+            _ => panic!("a floor at 9 fully heals the [5,8) hole"),
+        }
+        drop(cell);
+        drop(out_tx);
+        let mut got = Vec::new();
+        while let Some(c) = out_rx.recv().await {
+            for l in &c.lines {
+                got.push(String::from_utf8(l.clone()).expect("test lines are UTF-8"));
+            }
+        }
+        assert!(
+            got.iter().any(|l| l == "line-9"),
+            "the heal continuation must survive an abort at the serve send \
+             (got {got:?})"
+        );
+    }
+
+    /// W12-AT2 — the defuse arm: a consume that runs to COMPLETION
+    /// fires no disclosure from any Drop (the guard is not a blanket
+    /// downgrade; each send defuses exactly the part it delivered).
+    // r[verify gw.tail.disclosure-linear]
+    #[tokio::test]
+    async fn completed_flush_fires_no_drop_disclosure() {
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let mut cell =
+            super::PendingGapCell::new(out_tx.clone(), super::RelayDisposition::disclose_at_drop());
+        cell.record_first(taken_window_pending(&["line-8"]));
+        let mut last_relayed: Option<u64> = None;
+        let mut floor: Option<u64> = None;
+        assert!(
+            super::flush_pending_gap(&mut cell, &mut last_relayed, &mut floor).await,
+            "roomy channel: the flush completes"
+        );
+        assert_eq!(last_relayed, Some(8));
+        drop(cell);
+        drop(out_tx);
+        let mut msgs = 0;
+        while out_rx.recv().await.is_some() {
+            msgs += 1;
+        }
+        assert_eq!(
+            msgs, 2,
+            "exactly the marker and the lines — a completed consume leaves \
+             nothing armed, so no Drop re-discloses"
+        );
     }
 }
