@@ -22,6 +22,7 @@
     "rio_builder_log_lines_suppressed_total",
     "rio_builder_memory_fraction",
     "rio_builder_overlay_teardown_failures_total",
+    "rio_builder_quota_evidence_absent_total",
     "rio_builder_stale_assignments_rejected_total",
     "rio_builder_upload_bytes_total",
     "rio_builder_upload_references_count",
@@ -380,6 +381,11 @@
         "name": "rio_builder_overlay_teardown_failures_total",
         "kind": "counter",
         "help": "Overlay unmount failures (leaked mount); alert if rate > 0"
+      },
+      {
+        "name": "rio_builder_quota_evidence_absent_total",
+        "kind": "counter",
+        "help": "Completions whose project-quota disk evidence was ABSENT (live060-b: quota::status returned None at the completion seam — the node lacks the prjquota precondition, so peak_disk_bytes is None and the disk sizer cannot learn from this pod). One increment per completion; a once-per-pod WARN names the precondition. Expect this rate to trend to ZERO as prjquota provisioning (live060-a) rolls out; a nonzero steady-state rate means builder nodes are running without the disk-evidence producer."
       },
       {
         "name": "rio_builder_stale_assignments_rejected_total",

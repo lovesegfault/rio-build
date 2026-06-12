@@ -110,6 +110,18 @@ pub fn describe_metrics() {
         "rio_builder_builds_total",
         "Total builds executed (labeled by outcome: success/failure/cancelled/timed_out/log_limit/infra_failure)"
     );
+    describe_counter!(
+        "rio_builder_quota_evidence_absent_total",
+        "Completions whose project-quota disk evidence was ABSENT \
+         (live060-b: quota::status returned None at the completion \
+         seam — the node lacks the prjquota precondition, so \
+         peak_disk_bytes is None and the disk sizer cannot learn from \
+         this pod). One increment per completion; a once-per-pod WARN \
+         names the precondition. Expect this rate to trend to ZERO as \
+         prjquota provisioning (live060-a) rolls out; a nonzero \
+         steady-state rate means builder nodes are running without \
+         the disk-evidence producer."
+    );
     describe_gauge!(
         "rio_builder_builds_active",
         "Currently running builds on this worker"

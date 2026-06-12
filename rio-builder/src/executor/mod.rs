@@ -396,6 +396,36 @@ pub enum DecodeProvenance {
     WorkerLocal,
 }
 
+/// live060-b — the quota producer's absence is LOUD: a `None` quota
+/// status at the completion seam increments
+/// `rio_builder_quota_evidence_absent_total` and emits a once-per-pod
+/// WARN naming the precondition (prjquota mount + kubelet projid
+/// assignment — see the `quota` module doc), never failing the
+/// completion. On the live fleet the producer was dead for an entire
+/// deployment era (159/160 EBS-only nodes; 2022/2022 completions with
+/// `peak_disk_bytes: None`) with zero signal.
+pub(crate) fn note_quota_evidence(
+    quota_status: Option<&crate::quota::QuotaStatus>,
+    overlay_base_dir: &std::path::Path,
+) {
+    if quota_status.is_some() {
+        return;
+    }
+    metrics::counter!("rio_builder_quota_evidence_absent_total").increment(1);
+    static QUOTA_ABSENCE_WARNED: std::sync::Once = std::sync::Once::new();
+    QUOTA_ABSENCE_WARNED.call_once(|| {
+        tracing::warn!(
+            overlay_base_dir = %overlay_base_dir.display(),
+            "project-quota disk evidence is ABSENT on this node: every \
+             completion will carry peak_disk_bytes=None and the disk \
+             sizer cannot learn (precondition: the kubelet volume \
+             filesystem mounted with -o prjquota and kubelet project-id \
+             assignment — see rio-builder/src/quota.rs; once-per-pod \
+             warning)"
+        );
+    });
+}
+
 /// Max local retry attempts for transient daemon failures before
 /// reporting InfrastructureFailure to the scheduler. Bounded so a
 /// persistent crash (bad synth DB, broken nix binary) doesn't spin
@@ -985,6 +1015,18 @@ pub async fn execute_build(
     // forced node_free ≤ slack < headroom). The fold runs BEFORE the
     // footer renders so the report and the banner agree.
     let quota_status = crate::quota::status(&env.overlay_base_dir).ok().flatten();
+    // live060-b: a None quota status is EVIDENCE OF A BROKEN PRODUCER,
+    // never silently absorbed — on the live fleet (159/160 EBS-only
+    // ext4 nodes without prjquota) 2022/2022 completions carried
+    // `peak_disk_bytes: None` with ZERO signal for an entire
+    // deployment era. The absence becomes operable: a counter per
+    // completion plus a once-per-pod WARN naming the precondition
+    // (prjquota provisioning — the node must mount the kubelet volume
+    // with `-o prjquota` AND kubelet must assign per-emptyDir project
+    // ids). Never fatal: the completion proceeds — the disk-sizing
+    // pipeline degrades to estimator priors exactly as before, just
+    // loudly.
+    note_quota_evidence(quota_status.as_ref(), &env.overlay_base_dir);
     let quota_peak = match (quota_status, peak_quota_bytes) {
         (Some(q), Some(peak)) => Some(crate::quota::QuotaStatus {
             used_bytes: q.used_bytes.max(peak),
@@ -2757,5 +2799,49 @@ mod tests {
         // And it must not be Unspecified (which ALSO reassigns per
         // completion.rs:176-183).
         assert_ne!(mapped, Proto::Unspecified);
+    }
+    /// **W12-LF (live060-b, A2)** — *proposition: the sizing
+    /// producer's absence is counted and warned exactly when the
+    /// precondition fails; population: {prjquota present, absent} ×
+    /// the completion path.* Pre-fix a None quota status was silently
+    /// absorbed (`.ok().flatten()` → `peak_disk_bytes: None`) — the
+    /// live fleet ran an entire era (2022/2022 completions) with the
+    /// producer dead and zero signal. The absence is loud, never
+    /// fatal: the completion proceeds.
+    #[test]
+    fn absent_quota_evidence_is_counted_and_warned_once() {
+        let recorder = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let dir = std::path::Path::new("/tmp/lf-overlay");
+        // Two completions on a no-prjquota node: both counted…
+        super::note_quota_evidence(None, dir);
+        super::note_quota_evidence(None, dir);
+        assert_eq!(
+            recorder.get("rio_builder_quota_evidence_absent_total{}"),
+            2,
+            "left (pre-fix): zero signal — no counter existed, the \
+             absence vanished into .ok().flatten() / right: every \
+             evidence-free completion is counted (the WARN is \
+             once-per-pod by the Once)"
+        );
+    }
+
+    /// **W12-LF2 (live060-b, the provisioned direction)** — a present
+    /// quota status produces NO absence signal: the signal has no
+    /// false-positive face.
+    #[test]
+    fn present_quota_evidence_emits_no_absence_signal() {
+        let recorder = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let q = crate::quota::QuotaStatus {
+            used_bytes: 42,
+            hard_limit_bytes: Some(1 << 30),
+        };
+        super::note_quota_evidence(Some(&q), std::path::Path::new("/tmp/lf2"));
+        assert_eq!(
+            recorder.get("rio_builder_quota_evidence_absent_total{}"),
+            0,
+            "no signal when the producer is alive"
+        );
     }
 }

@@ -1,8 +1,25 @@
 //! Read kubelet's XFS/ext4 project-quota usage for the per-build emptyDir.
 //!
-//! kubelet assigns a project ID to each emptyDir when the node filesystem
-//! is mounted with `-o prjquota` (NixOS AMIs do this for the gp3-root
-//! pool). The kernel then tracks `dqb_curspace` per project — the
+//! PRECONDITION (live060-b — this module's producer is DEAD without
+//! it, and for an entire deployment era nothing said so): the
+//! filesystem hosting kubelet's emptyDir volumes must be mounted with
+//! `-o prjquota` AND kubelet must have its project-quota feature
+//! assigning a project ID per emptyDir. NEITHER is automatic: the
+//! node image/bootstrap provisions the mount option (the live060-a
+//! provisioning work — xfs `-o prjquota` at /var/lib/kubelet, or ext4
+//! with project quotas enabled), and kubelet's LocalStorageCapacityIsolationFSQuotaMonitoring
+//! wiring provides the projid half. On a node without the
+//! precondition, [`status`] returns `Ok(None)` on every consult and
+//! every completion carries `peak_disk_bytes: None` — the absence is
+//! counted and warned once per pod at the completion seam (the
+//! `rio_builder_quota_evidence_absent_total` counter), never fatal.
+//! (The previous claim here — that NixOS AMIs provide prjquota on the
+//! gp3-root pool — was FALSE on the live fleet: 159/160 builder nodes
+//! were EBS-only ext4 without project quotas, 2022/2022 completions
+//! silently evidence-free.)
+//!
+//! When the precondition holds, the kernel tracks `dqb_curspace` per
+//! project — the
 //! CURRENT allocated bytes for the build's overlay upper dir at the
 //! instant of the call (NOT a kernel-tracked high-water mark; `struct
 //! dqblk` has no HWM field). The cgroup poll loop max-tracks across
