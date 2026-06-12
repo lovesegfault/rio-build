@@ -785,6 +785,26 @@ halves: chunks drain at bounded latency through their own face; the head
 keeps its position. Pools at or under one reservation (tests, dev
 profiles) carry no lane and keep the single-face semantics.
 
+#r("store.budget.lane-floor")[
+  A carved sub-pool consumed via `acquire_many` MUST carry a structural
+  relation to the largest unit request it can lawfully receive: the chunk
+  lane's derived capacity is FLOORED at the largest lawful chunk charge
+  (the gRPC message cap; charge is identity above the 256-byte minimum)
+  --- `lane = 0` below one lawful charge (the pool keeps the legacy
+  single-face semantics), else the derived size. The value axis is total
+  over its three bands {zero, band, in-band}; no admitted configuration
+  may mint a lane smaller than a charge the wire admits.
+]
+A lane in `(0, max-charge)` is an anti-progress device, strictly worse
+than no lane: a lawful max-size chunk's lane arm parks UNSATISFIABLE at
+the fair-FIFO head (charge exceeds capacity even at full idle), hoarding
+released permits while every smaller acquire behind it sheds at grace and
+re-wedges on retry --- client-controllable chunk sizes made the band an
+ingest-plane DoS in a validation-admitted configuration (merged_bug_133:
+the wave-11 seal enumerated the capacity axis as {zero, positive} and its
+witness measured only the in-band cell). `validate()` names the band at
+its admitting floor; the derivation owns the repair --- no new rejection.
+
 #r("store.put.placeholder-claim+2")[
   `insert_manifest_uploading` generates a fresh `claim_id UUID` per placeholder
   and returns it to the caller. Every owner-side mutation ---

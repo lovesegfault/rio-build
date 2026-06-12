@@ -480,6 +480,15 @@ impl rio_common::config::ValidateConfig for Config {
         // the former MIN_NAR_CHUNK_CHARGE floor (PutPath's per-chunk
         // Pending-forever hang at < 256). There is no "unlimited"
         // sentinel; unset for the 32 GiB default.
+        //
+        // THE LANE BAND (merged_bug_133, named here because this floor
+        // admits it): pools in (MAX_NAR_SIZE, MAX_NAR_SIZE + the gRPC
+        // message cap) pass this check but would derive a chunk lane
+        // SMALLER than one lawful chunk charge — the same fair-FIFO
+        // wedge one face over. No new rejection: the lane derivation
+        // itself floors at the largest lawful charge (NarBudget::new,
+        // store.budget.lane-floor), so band pools mint NO lane and
+        // keep the safe single-face semantics.
         anyhow::ensure!(
             self.nar_buffer_budget_bytes
                 .is_none_or(|b| b >= rio_common::limits::MAX_NAR_SIZE),

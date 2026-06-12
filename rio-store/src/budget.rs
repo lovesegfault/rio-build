@@ -140,7 +140,11 @@ pub struct NarBudget {
     /// the total in-flight NAR-bytes bound is unchanged.
     ///
     /// SIZE DERIVATION (recorded per R5): `min(pool/8,
-    /// pool - MAX_NAR_SIZE)`, zero at or under one whole-NAR
+    /// pool - MAX_NAR_SIZE)`, FLOORED at the largest lawful chunk
+    /// charge (the gRPC message cap — merged_bug_133: the value axis
+    /// is total over {zero, band, in-band}; a lane smaller than one
+    /// lawful charge is an anti-progress fair-FIFO trap and mints as
+    /// 0 instead), zero at or under one whole-NAR
     /// reservation. The first term is the fraction hypothesis (an
     /// eighth of the default 32 GiB pool = 4 GiB — orders of
     /// magnitude above the largest lawful chunk charge, so chunk
@@ -166,9 +170,25 @@ impl NarBudget {
     /// A fresh pool of `permits` byte-permits with its own (empty)
     /// tenant ledger. The chunk lane is carved per the derivation on
     /// the `chunk_lane` field; the two faces sum to `permits`.
+    // r[impl store.budget.lane-floor]
     pub fn new(permits: usize) -> Self {
         let max_nar = rio_common::semaphore_permits(MAX_NAR_SIZE);
-        let lane = (permits / 8).min(permits.saturating_sub(max_nar));
+        let derived = (permits / 8).min(permits.saturating_sub(max_nar));
+        // THE VALUE-AXIS FLOOR (merged_bug_133): a carved sub-pool
+        // consumed via acquire_many carries a STRUCTURAL relation to
+        // the largest unit request it can lawfully receive — the gRPC
+        // message cap bounds any single chunk's charge (charge is
+        // identity above the 256-byte floor), read from the same
+        // source the server caps read at startup. A lane in
+        // (0, max_charge) is an anti-progress device: a lawful
+        // max-size chunk's lane arm parks UNSATISFIABLE at the
+        // fair-FIFO head forever (charge > capacity even at full
+        // idle), hoarding released permits while smaller acquires
+        // shed at grace — strictly worse than no lane. Below one
+        // lawful charge the lane is 0 and the pool keeps the legacy
+        // single-face semantics (the zero-arm machinery).
+        let max_charge = rio_common::grpc::max_message_size();
+        let lane = if derived < max_charge { 0 } else { derived };
         Self {
             semaphore: Arc::new(Semaphore::new(permits - lane)),
             chunk_lane: Arc::new(Semaphore::new(lane)),
@@ -528,5 +548,64 @@ mod tests {
         let _ok = DeclaredCharge::new(&budget, t, TENANT_RESERVATION_CAP, MAX_NAR_SIZE - 1, || {})
             .await
             .expect("no charge leaked by the size refusal");
+    }
+
+    // r[verify store.budget.lane-floor]
+    /// W12-T (merged_bug_133): the value axis is TOTAL over the three
+    /// bands — {zero, band, in-band} — and no admitted config mints an
+    /// anti-progress lane. A lane in (0, largest-lawful-charge) is a
+    /// trap, strictly worse than no lane: a lawful max-size chunk's
+    /// lane arm parks UNSATISFIABLE at the fair-FIFO head (charge >
+    /// capacity, forever, even at full lane idle), hoarding released
+    /// permits while every smaller acquire behind it sheds at grace
+    /// and re-wedges on retry — client-controllable chunk sizes make
+    /// the band an ingest-plane DoS in a validation-admitted config.
+    /// The floor: lane == 0 below one lawful charge (the legacy
+    /// single-face arm the zero case already takes), else >= the
+    /// charge.
+    #[test]
+    fn lane_floor_kills_the_anti_progress_band() {
+        let max_charge = rio_common::grpc::max_message_size();
+
+        // Band 1 (zero): pools at or under one whole-NAR reservation
+        // carry no lane (the wave-10 semantics, unchanged).
+        let zero = NarBudget::new(MAX_NAR_SIZE as usize);
+        assert_eq!(zero.chunk_lane_capacity, 0, "zero band: no lane");
+
+        // Band 2 (THE BAND): (MAX_NAR_SIZE, MAX_NAR_SIZE + max_charge)
+        // — the derivation min(P/8, P − MAX) lands strictly inside
+        // (0, max_charge). The value-axis law: such a lane must not
+        // exist (lane == 0; the single-face arm serves the pool).
+        for off in [1usize, max_charge / 2, max_charge - 1] {
+            let pool = MAX_NAR_SIZE as usize + off;
+            let band = NarBudget::new(pool);
+            assert!(
+                band.chunk_lane_capacity == 0 || band.chunk_lane_capacity >= max_charge,
+                "left: a validation-admitted pool ({pool}) minted a lane \
+                 ({}) smaller than the largest lawful chunk charge \
+                 ({max_charge}) — an anti-progress fair-FIFO head / right: \
+                 lane == 0 below one lawful charge",
+                band.chunk_lane_capacity
+            );
+        }
+
+        // Band 3 (in-band): a pool whose derivation clears the charge
+        // keeps its lane (the W11-AS bypass it exists for).
+        let pool = (MAX_NAR_SIZE as usize) + (1usize << 30);
+        let inband = NarBudget::new(pool);
+        assert!(
+            inband.chunk_lane_capacity >= max_charge,
+            "in-band: the lane stands (capacity {} >= charge {max_charge})",
+            inband.chunk_lane_capacity
+        );
+
+        // The two-face capacity identity holds in every band: the
+        // faces sum to the pool (the budget law is band-independent).
+        assert_eq!(zero.available_permits(), MAX_NAR_SIZE as usize);
+        assert_eq!(
+            NarBudget::new(MAX_NAR_SIZE as usize + 7).available_permits(),
+            MAX_NAR_SIZE as usize + 7
+        );
+        assert_eq!(inband.available_permits(), pool);
     }
 }
