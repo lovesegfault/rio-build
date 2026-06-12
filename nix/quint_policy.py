@@ -61,8 +61,28 @@ Rules:
      this pass over the conversion-time corpus, frozen; burn-down
      owned by round-7; new entries require a wave ruling).
 
-Exit nonzero on any P1/P2/P4/P5/P6/P7 violation. --census-only prints
-findings without failing (the phase-0 artifact)."""
+  P8 action-binding totality (round-12 WO-S9-9iii, live_061's
+     matmodel-gap class): every action a WIRED regime's step alphabet
+     applies (applications inside the step declaration that resolve to
+     action declarations through the import graph) carries a binding
+     comment in the contiguous comment block directly above its
+     declaration — `// Mirrors: <repo-file>:<symbol>` (the production
+     transition the action abstracts; the file must exist under the
+     staged mirrors root and contain the symbol token — unresolvable =
+     red) or `// Environment: <justification>` (the world's move, a
+     frame, or a plane outside the model's subject). The class this
+     kills: a modeled transition with ZERO production writers shipping
+     invisible for the system's whole life — materializationJob.qnt's
+     obsoleteOnProduced was wired into step and verified for months
+     while no production arm produced its post-state (live_061; the
+     letter resolved under 'cancelled'). A binding line is the
+     load-bearing pointer a reviewer and a conformance author follow;
+     an unresolvable pointer is exactly as dead as no pointer.
+     Grandfather: P8_GRANDFATHER (module census at the conversion,
+     frozen; shrink-only; new modules enforced from birth).
+
+Exit nonzero on any P1/P2/P4/P5/P6/P7/P8 violation. --census-only
+prints findings without failing (the phase-0 artifact)."""
 
 import argparse
 import json
@@ -72,6 +92,438 @@ from collections import defaultdict
 from pathlib import Path
 
 EXEMPT_CLASSES = {"boundsOK", "scope-bound", "pre-r2-untwinned"}
+
+# P8 grandfather allowlist — GENERATED, FROZEN at the round-12 WO-S9-9iii
+# conversion (banner rule 1: membership is the module census of
+# docs/spec/models/**/*.qnt at the conversion tree minus the founding
+# enforced module, never author-typed). Generator:
+#   grep -rhE '^\\s*module\\s+\\w+' docs/spec/models --include='*.qnt' \\
+#     | sed -E 's/^\\s*module\\s+(\\w+).*/\\1/' | sort -u \\
+#     | grep -v '^materializationJob$'
+# Shrink-only: annotating a module's step alphabet deletes its row; a
+# NEW module (born after the conversion) is enforced from birth — it
+# never enters this set. Adding a row requires a wave ruling.
+P8_GRANDFATHER: frozenset = frozenset(
+    {
+        "authz",
+        "authzCalib064String",
+        "authzCalib122DeadLeg",
+        "authzCalib213Phase",
+        "authzCalib237ForeignKnob",
+        "chunkCollect",
+        "chunkCollectBase",
+        "chunkCollectContend",
+        "chunkCollectCorrupt",
+        "chunkCollectCrash",
+        "chunkCollectLateMarkGuarded",
+        "chunkCollectLateMarkUnguarded",
+        "chunkCollectNoTouch",
+        "chunkCollectParseSkip",
+        "chunkCollectReapEpqOuterOnly",
+        "chunkCollectShadowEquivalence",
+        "chunkCollectShadowNoExclusion",
+        "chunkCollectThresholdOrder",
+        "chunkCollectWriterBounded",
+        "chunkCollectWriterOverrun",
+        "chunkLiveness",
+        "chunkLivenessBase",
+        "chunkLivenessContend",
+        "chunkLivenessCorrupt",
+        "chunkLivenessCrash",
+        "chunkLivenessThresholdOrder",
+        "closureCalibA17Unfenced",
+        "closureCalibC3NoReprobe",
+        "closureCalibF10RecoveryVouchUnscoped",
+        "closureCalibF13UnprobedDispatch",
+        "closureCalibF14RecoveryKeepsSubstituting",
+        "closureCalibF1SkipStoreRecheck",
+        "closureCalibF1StaleProduced",
+        "closureCalibF2SeedOnlyWalk",
+        "closureCalibF3IndetFailFast",
+        "closureCalibF3SubstitutableDemoted",
+        "closureCalibF4DemandDrop",
+        "closureCalibF4VacuousPrune",
+        "closureCalibF5WantedOverwrite",
+        "closureCalibF6LatchOutlivesChain",
+        "closureCalibF7ClearUnbuiltChildren",
+        "closureCalibF8DispatchNoEvidence",
+        "closureCalibF9PoisonClearNoStamp",
+        "closureEvidence",
+        "closureEvidenceAdversarialStore",
+        "closureEvidenceAdversarialStoreEx",
+        "closureEvidenceBase",
+        "closureEvidenceBaseEx",
+        "closureEvidenceC3Duo",
+        "closureEvidenceCornerFailoverDuo",
+        "closureEvidenceDuo",
+        "closureEvidenceFailover",
+        "closureEvidenceFailoverDuo",
+        "closureEvidenceFailoverEx",
+        "closureEvidenceFaultPersist",
+        "closureEvidenceFaultPersistEx",
+        "closureEvidenceReapTruncate",
+        "closureEvidenceSlice",
+        "closureEvidenceStaleDuo",
+        "closureEvidenceStaleTenure",
+        "closureEvidenceSurvivors",
+        "closureEvidenceSurvivorsFailover",
+        "controller028TruncatedPrune",
+        "controller073Burst",
+        "controller075FailopenSpawnClobber",
+        "controllerCalib113RespawnCancel",
+        "controllerCalib113RespawnCancelHold",
+        "costLatch",
+        "costLatchBase",
+        "costlatchCalib212AcquireOnly",
+        "ctrlCalib282BackoffIgnored",
+        "executorCalibF4PullEstablishEarly",
+        "executorSession",
+        "executorSessionBase",
+        "executorSessionFaultLeader",
+        "fenceCalib011AbsoluteReplay",
+        "fenceCalib155ServeAfterFailedRecovery",
+        "fenceCalib231UnfencedClose",
+        "fenceCalib261UnguardedUpsert",
+        "fenceCalib273PlainFloorSet",
+        "fenceCalib338AtomicReread",
+        "fenceCalib393TerminalRefusal",
+        "fenceCalibFloorBlind",
+        "fencedWrites",
+        "fencedWritesT1",
+        "ffdCalibNoClassClamp",
+        "gaCalibCrdAbsentArmed",
+        "gaCalibNoLiveRecheck",
+        "gaCalibOrphanGateEmptyOk",
+        "gbCalibAckAttempted",
+        "gbCalibAckOnlyNew",
+        "gcCadence",
+        "gcCadenceCalibHourlyRetry",
+        "gcCadenceCalibReleaseFailsCommit",
+        "gcCadenceCalibSharedClockAnchor",
+        "gcCadenceCalibTickBeforeCommit",
+        "gcCadenceCalibZeroRowsClaimsForeign",
+        "gcCadenceMain",
+        "gcCollectState",
+        "gcCollectStateCalibSimBasis",
+        "gcCollectStateMain",
+        "gcCoordination",
+        "gcCoordinationLocalTimers",
+        "gcCoordinationMain",
+        "gcDrainPass",
+        "gcDrainPassCalibResumeAnchors",
+        "gcDrainPassMain",
+        "ggCalibTerminatingPending",
+        "gwBuildResync",
+        "gwCalibF10AcceptErrorFatal",
+        "gwCalibF10AsBuilt",
+        "gwCalibF1AsBuilt",
+        "gwCalibF1AsBuiltCap1",
+        "gwCalibF1AsBuiltSpread",
+        "gwCalibF1AuthRejectSkipsGate",
+        "gwCalibF1NoGlobalSessionCap",
+        "gwCalibF1PerConnCapRefusals",
+        "gwCalibF1ServerSideKeepsGuard",
+        "gwCalibF2AsBuilt",
+        "gwCalibF2NoHandshakeDeadline",
+        "gwCalibF2OpenDisarmsGrace",
+        "gwCalibF3AsBuilt",
+        "gwCalibF3DecideWithoutArm",
+        "gwCalibF4AsBuilt",
+        "gwCalibF4AsBuiltChanCap1",
+        "gwCalibF4BoundOnSessionsMap",
+        "gwCalibF4ForgedCloseDecrements",
+        "gwCalibF4RefusePolitely",
+        "gwCalibF5AsBuilt",
+        "gwCalibF5BudgetIgnoresPeerClass",
+        "gwCalibF5NoSendBudget",
+        "gwCalibF5ReleaseAfterCloseOut",
+        "gwCalibF5UnwindowedSend",
+        "gwCalibF6AbortWinsOverCancel",
+        "gwCalibF6AsBuilt",
+        "gwCalibF6CloseOutSkipsExitStatus",
+        "gwCalibF6ConnDropLeaksGauge",
+        "gwCalibF6ExitEdgeSkipsCancel",
+        "gwCalibF6FinishSkipsPumpReap",
+        "gwCalibF6WireErrorRemovesTracked",
+        "gwCalibF7AcceptStopKillsEstablished",
+        "gwCalibF7AsBuilt",
+        "gwCalibF7DrainExpiryNoCancel",
+        "gwCalibF7SigtermSkipsStages",
+        "gwCalibF9AsBuilt",
+        "gwCalibF9RpcWaitNoDeadline",
+        "gwConnLifecycle",
+        "gwConnLifecycleBase",
+        "gwConnLifecycleBaseSlim",
+        "gwConnLifecycleCap",
+        "gwConnLifecycleFamAdmission",
+        "gwConnLifecycleFamCap",
+        "gwConnLifecycleFamDegraded",
+        "gwConnLifecycleFamDrain",
+        "gwConnLifecycleFamHostile",
+        "gwConnLifecycleFamPreauth",
+        "gwConnLifecycleFamUpstream",
+        "gwConnLifecycleFamWedge",
+        "gwConnLifecycleFaultDegraded",
+        "gwConnLifecycleFaultDrain",
+        "gwConnLifecycleFaultOccupancy",
+        "gwConnLifecycleFaultTransport",
+        "gwConnLifecycleFaultUpstream",
+        "gwResyncCalibConsumeWhileOwed",
+        "gwResyncCalibResetOnSnapshot",
+        "gwResyncKindBlind",
+        "gwResyncNoPgFallback",
+        "gwResyncNoSignal",
+        "gwResyncTwoMap",
+        "iceCalibApplyBeforeRefuse",
+        "iceCalibLatestWinsEviction",
+        "iceCalibNoEpochGate",
+        "iceEvidenceAck",
+        "iceEvidenceAckBase",
+        "leaderElection",
+        "leaderElectionAsymmetric",
+        "leaderElectionBase",
+        "leaderElectionDeletion",
+        "leaderElectionDroppedWrite",
+        "leaderElectionForeignRv",
+        "leaderElectionHolderEvidence",
+        "leaderElectionPgFaults",
+        "leaderElectionShutdown",
+        "leaderElectionStepDown",
+        "leaderElectionSuspend",
+        "leaderMarks",
+        "leaderMarksBase",
+        "leaseCalib002ActFailedFrozenNoClear",
+        "leaseCalib002StaleDeferral",
+        "leaseCalib085BlindConflictLose",
+        "leaseCalib096ResponseAnchor",
+        "leaseCalib128CountKeyedStepDown",
+        "leaseCalib138EdgeOnly",
+        "leaseCalib180RvKeyed",
+        "leaseCalib181BoolClear",
+        "leaseCalib303BlindTimeout",
+        "leaseCalib387BeliefGate",
+        "logIngestCalibQuietChurn",
+        "logIngestCalibSilentAttach",
+        "logIngestLiveness",
+        "logIngestLivenessLive",
+        "logService",
+        "logServiceBase",
+        "logServiceCalibCloseNoStamp",
+        "logServiceCalibDropWakeLost",
+        "logServiceCalibExecSplice",
+        "logServiceCalibGateRow",
+        "logServiceCalibGcRowIgnoresArtifacts",
+        "logServiceCalibLatestOnly",
+        "logServiceCalibLossEscape",
+        "logServiceCalibOversized",
+        "logServiceCalibProducerBlind",
+        "logServiceCalibReaderAdvance",
+        "logServiceCalibRecoveryUngated",
+        "logServiceCalibResumePastGap",
+        "logServiceCalibSessionCaps",
+        "logServiceCalibStampSkips",
+        "logServiceCalibSweepAgeOnly",
+        "logServiceExecAxis",
+        "logServiceFlood",
+        "logServiceKindMix",
+        "logServiceProducerLoss",
+        "logServiceRedispatch",
+        "logServiceResend",
+        "logServiceServed",
+        "logServiceSweep",
+        "logServiceWorkerGap",
+        "m1CalibAcquireClearOkOnly",
+        "m1CalibReapBusyGuardProbe",
+        "m2CalibInflightDropOnSight",
+        "m2CalibNoConsolidatePrune",
+        "m34CalibLatchClearOnAttempt",
+        "m34CalibNoRecencyGate",
+        "matCalib133DiscardedOutcome",
+        "matCalib146ControllerCrossKindClose",
+        "matCalib233UnattributedPin",
+        "matCalib266KindblindRecoveryHolder",
+        "matCalib276DagAbsentCancel",
+        "matCalib318RequeueForcesReady",
+        "matCalibAbortCharges",
+        "matCalibB1ClaimRefusesMarked",
+        "matCalibB2NoPinAtIngest",
+        "matCalibB3NoRedial",
+        "matCalibB4NoBackfill",
+        "matCalibB5aRefeedOverwrite",
+        "matCalibCe17SkipCoverage",
+        "matCalibChainResetDropsCarrier",
+        "matCalibChainResetDropsCarrierEx",
+        "matCalibChargeOnCancel",
+        "matCalibCollidingIdentity",
+        "matCalibDedupRemoved",
+        "matCalibEstablishNeverParks",
+        "matCalibExistsgateForallstamp",
+        "matCalibF10bSwallowedRebuild",
+        "matCalibF10FailoverViewDrop",
+        "matCalibF11UnfencedResolve",
+        "matCalibF1NoPresenceRecheck",
+        "matCalibF2bEstablishAdopt",
+        "matCalibF3InfraAsUnobtainable",
+        "matCalibF3ParkFailFast",
+        "matCalibF3pUnsoundReport",
+        "matCalibF4DeadUnion",
+        "matCalibF5WantedOverwrite",
+        "matCalibF7UnkeyedResolve",
+        "matCalibF8PullIgnoresJob",
+        "matCalibF9DivergentEvidence",
+        "matCalibFailoverDropsRows",
+        "matCalibHeadStarvation",
+        "matCalibInloopReturn",
+        "matCalibLeafParkForever",
+        "matCalibPp4EstablishBuildCharge",
+        "matCalibPp4EstablishUncharged",
+        "matCalibProbeCharged",
+        "matCalibRefsFolded",
+        "matCalibSplitRearm",
+        "matCalibTenantblindPresent",
+        "matCalibTransientAsInfra",
+        "matCalibUnionDropped",
+        "matCalibUnscopedCount",
+        "matCalibVacuousSuccess",
+        "matCalibWholesetProjection",
+        "matDistCalibDeadHeadPinsWindow",
+        "matDistCalibEagerSteal",
+        "matDistCalibNoStealOrphan",
+        "matDistCalibOwnerServeSkew",
+        "matDistCalibSharedHeadConvoy",
+        "matDistCalibWedgedPoller",
+        "materializationDistribution",
+        "materializationDistributionBase",
+        "materializationDistributionDead",
+        "materializationDistributionWedge",
+        "materializationJobAdversarialStore",
+        "materializationJobAdversarialStoreEx",
+        "materializationJobBase",
+        "materializationJobBaseEx",
+        "materializationJobCrashLoop",
+        "materializationJobCrashLoopEx",
+        "materializationJobFailover",
+        "materializationJobFailoverEx",
+        "materializationJobResolveFaults",
+        "materializationJobStaleTenure",
+        "materializationJobStaleTenureEx",
+        "materializationJobWalkFold",
+        "materializationJobWorkerAbort",
+        "nCalibRetiredCap",
+        "nodeclaimLifecycle",
+        "nodeclaimLifecycleAckLatchAsBuilt",
+        "nodeclaimLifecycleBase",
+        "nodeclaimLifecycleClearBuffer",
+        "nodeclaimLifecycleClearBufferAsBuilt",
+        "nodeclaimLifecycleDefer",
+        "nodeclaimLifecycleDeferAsBuilt",
+        "nodeclaimLifecycleEpoch",
+        "nodeclaimLifecycleEpochAsBuilt",
+        "nodeclaimLifecycleFaultKarpenter",
+        "nodeclaimLifecycleFaultLease",
+        "nodeclaimLifecycleFaultRpc",
+        "nodeclaimLifecycleSnapshot",
+        "nodeclaimLifecycleSnapshotAsBuilt",
+        "nodeclaimLifecycleTombstone",
+        "nodeclaimLifecycleTombstoneAsBuilt",
+        "openAttempts",
+        "openAttemptsAckOnFailedClose",
+        "openAttemptsBudget",
+        "openAttemptsChargeBlind",
+        "openAttemptsClobberedCredential",
+        "openAttemptsMintingConfirm",
+        "openAttemptsNoFallbackRelease",
+        "openAttemptsNoncelessMint",
+        "openAttemptsOutboxDropped",
+        "openAttemptsOvermint",
+        "openAttemptsRefusalAsLost",
+        "openAttemptsRotationSkew",
+        "openAttemptsUnfencedGone",
+        "placeholderClaim",
+        "placeholderClaimMain",
+        "placeholderClaimNoLiveness",
+        "placeholderClaimNoPhase",
+        "placeholderClaimSubHeartbeatWindow",
+        "refcountCalibG1CompletionUnclaimGated",
+        "refcountCalibG1ReapPathMatched",
+        "refcountCalibG1RollbackPreToken",
+        "refcountCalibG2ReapInlineOnly",
+        "refcountCalibG2SweepCollapsedCount",
+        "refcountCalibG3CounterAsPresence",
+        "refcountCalibG3JointStaleSkip",
+        "refcountCalibG4aDrainNoRecheck",
+        "refcountCalibG5NoHeartbeat",
+        "refcountCalibG5NoHotpathReclaim",
+        "refcountCollectG1CompletionUnclaimGated",
+        "refcountCollectG4aDrainNoRecheck",
+        "refcountCollectG5Baseline",
+        "refcountCollectG5NoHeartbeat",
+        "respawnGiveUp",
+        "respawnGiveUpAsBuilt",
+        "respawnGiveUpCore",
+        "retryCalibForkedRun",
+        "retryCalibGuardVacuous",
+        "retryCalibSdAsInfra",
+        "retryCalibUnboundedDegraded",
+        "retryPolicy",
+        "retryPolicyPull",
+        "retryPolicyPullMat",
+        "retryPolicyPullStoreDegraded",
+        "spawnCoherence",
+        "spawnCoherenceBase",
+        "spawnCoherenceCancelAsBuilt",
+        "spawnCoherenceCancelCause",
+        "spawnCoherenceCancelGenAsBuilt",
+        "spawnCoherenceCancelGeneration",
+        "spawnCoherenceCrdAbsent",
+        "spawnCoherenceExhaustAsBuilt",
+        "spawnCoherenceExhaustPersist",
+        "spawnCoherenceFailopenWithhold",
+        "spawnCoherenceFaultLease",
+        "spawnCoherenceFaultRpc",
+        "spawnCoherenceFaultStale",
+        "spawnCoherenceFetcher",
+        "spawnCoherenceHeld",
+        "spawnCoherenceHeldAsBuilt",
+        "spawnCoherenceMatJobs",
+        "spawnCoherenceMultiPool",
+        "spawnCoherenceMultiPoolAsBuilt",
+        "spawnCoherenceReapYoungLeader",
+        "spawnCoherenceRenderedDeadline",
+        "spawnCoherenceRetryBackoff",
+        "spawnCoherenceStreakCadence",
+        "spawnCoherenceSynthCloseAsBuilt",
+        "spawnCoherenceSynthClosePinned",
+        "tailReaderCalibOrphanHotloop",
+        "tailReaderCalibResetOnReceipt",
+        "tailReaderLoop",
+        "walkFanout",
+        "walkFanoutArrivalPick",
+        "walkFanoutDupFrontier",
+        "walkFanoutProgress",
+        "walkFanoutProgressBaseCapture",
+        "walkFanoutSpawnAfterAbort",
+        "walkFanoutSpawnUnbounded",
+        "wedge023DowngradeSkipsClose",
+        "wedge023DowngradeSkipsCloseHold",
+        "wedgeCalib009SplitPopulation",
+        "wedgeCalib016SuppressedDrain",
+        "wedgeCalib023OpenRelease",
+        "wedgeCalib024GhostAdmission",
+        "wedgeCalib034Instantaneous",
+        "wedgeCalib163PartialDrain",
+        "wedgeCalib176EarlyReturn",
+        "wedgeCluster",
+        "wedgeClusterAdmission",
+        "wedgeClusterDwellArm",
+        "wedgeClusterEpilogue",
+        "wedgeClusterLatch",
+        "wedgeClusterMain",
+        "wedgeClusterNoEviction",
+        "wedgeClusterTrajectory",
+    }
+)
+
 HOLDS_KINDS = {"holds", "holds-sim"}
 
 # P7 grandfather allowlist — GENERATED, FROZEN at the round-6 WO-S8-4
@@ -413,8 +865,46 @@ class Corpus:
     def module_action_names(self, mod):
         return [n for n, d in self.mod_decls.get(mod, {}).items() if d.get("qualifier") == "action"]
 
+    def action_binding(self, mod, action, models_dir):
+        """The P8 binding of `action` as declared in `mod`'s file:
+        ("mirrors", [(file, symbol), ...]), ("environment", text), or
+        None. Text-plane declared configuration (the latches-directive
+        precedent): the binding lives in the contiguous comment block
+        directly above the action declaration."""
+        rel = self.mod_file.get(mod)
+        if rel is None:
+            return None
+        if not hasattr(self, "_file_lines"):
+            self._file_lines = {}
+        if rel not in self._file_lines:
+            self._file_lines[rel] = (models_dir / rel).read_text().splitlines()
+        lines = self._file_lines[rel]
+        decl_re = re.compile(rf"^\s*action\s+{re.escape(action)}\b")
+        mirrors_re = re.compile(r"^\s*//+\s*Mirrors:\s*(\S+?):([A-Za-z_][A-Za-z0-9_]*)\s*$")
+        env_re = re.compile(r"^\s*//+\s*Environment:\s*(\S.*)$")
+        comment_re = re.compile(r"^\s*//")
+        for i, line in enumerate(lines):
+            if not decl_re.match(line):
+                continue
+            mirrors, env = [], None
+            j = i - 1
+            while j >= 0 and comment_re.match(lines[j]):
+                m = mirrors_re.match(lines[j])
+                if m:
+                    mirrors.append((m.group(1), m.group(2)))
+                e = env_re.match(lines[j])
+                if e and env is None:
+                    env = e.group(1)
+                j -= 1
+            if mirrors:
+                return ("mirrors", list(reversed(mirrors)))
+            if env is not None:
+                return ("environment", env)
+            return None
+        return None
 
-def run_policy(manifest, corpus, assume_latches=""):
+
+def run_policy(manifest, corpus, assume_latches="", models_dir=None, mirrors_root=None):
     """The P1–P6 rule engine over a parsed corpus → (violations, census).
 
     Pure in/out (no I/O beyond the corpus already parsed) so the
@@ -656,6 +1146,76 @@ def run_policy(manifest, corpus, assume_latches=""):
                 if any(t == var and not ident for (t, ident) in own_writes):
                     violations.append(f"P5 {cmod}: calibration declaration non-identity-assigns latch '{lmod}.{var}' (oracle must live in the shared live module)")
                     census["P5-calib-latch-write"].append(f"{cmod}:{var}")
+
+    # ---- P8: action bindings over wired step alphabets
+    p8_checked = set()
+    p8_grandfathered_mods = set()
+    for cname, meta in sorted(manifest.items()):
+        if not meta or meta.get("main") not in corpus.mod_decls:
+            continue
+        main_mod = meta["main"]
+        step_name = meta.get("step") or "step"
+        smod, sdecl = corpus.visible_decl(main_mod, step_name)
+        if sdecl is None or sdecl.get("qualifier") != "action":
+            continue  # legacy step-less module (hazard (nn)) — P4's fallback domain
+        refs = set()
+        corpus._names_in(sdecl.get("expr"), refs)
+        for nm in sorted(refs):
+            # The scheduler dispatcher is the alphabet's frame, never a
+            # transition: skip the regime's own step AND the live
+            # module's `step` when a calibration step composes over it
+            # (the calibStep `any { step, override }` shape) — its
+            # alphabet is exactly what this walk enforces.
+            if nm == step_name or nm == "step":
+                continue
+            amod, adecl = corpus.visible_decl(smod, nm)
+            if adecl is None or adecl.get("qualifier") != "action":
+                continue
+            if (amod, nm) in p8_checked:
+                continue
+            p8_checked.add((amod, nm))
+            if amod in P8_GRANDFATHER:
+                p8_grandfathered_mods.add(amod)
+                continue
+            if models_dir is None:
+                continue  # census-less invocation (unit shims)
+            binding = corpus.action_binding(amod, nm, models_dir)
+            if binding is None:
+                violations.append(
+                    f"P8 {cname}: step action '{nm}' ({amod}) carries no binding — add "
+                    f"`// Mirrors: <repo-file>:<symbol>` (the production transition it "
+                    f"abstracts) or `// Environment: <justification>` in the comment "
+                    f"block above its declaration (the live_061 class: a modeled "
+                    f"transition with zero production writers ships invisible)"
+                )
+                census["P8-unbound-action"].append(f"{amod}.{nm}")
+                continue
+            kind, payload = binding
+            if kind == "environment":
+                census["P8-environment"].append(f"{amod}.{nm}")
+                continue
+            for (mfile, msym) in payload:
+                target = None if mirrors_root is None else (mirrors_root / mfile)
+                if target is None or not target.is_file():
+                    violations.append(
+                        f"P8 {cname}: action '{nm}' ({amod}) mirrors '{mfile}:{msym}' but "
+                        f"the file does not resolve under the staged mirrors root — a "
+                        f"dead pointer is exactly as dead as no pointer"
+                    )
+                    census["P8-unresolvable-mirror"].append(f"{amod}.{nm}:{mfile}")
+                    continue
+                text = target.read_text()
+                if not re.search(rf"\b{re.escape(msym)}\b", text):
+                    violations.append(
+                        f"P8 {cname}: action '{nm}' ({amod}) mirrors '{mfile}:{msym}' but "
+                        f"the symbol is absent from that file — the production anchor "
+                        f"moved or never existed; re-derive the binding"
+                    )
+                    census["P8-unresolvable-mirror"].append(f"{amod}.{nm}:{msym}")
+                else:
+                    census["P8-mirrors"].append(f"{amod}.{nm}")
+    for m in sorted(p8_grandfathered_mods):
+        census["P8-grandfathered-module"].append(m)
 
     # ---- P3 pairing census (no enforcement beyond reporting)
     holds_by_livemod = defaultdict(list)
@@ -954,6 +1514,116 @@ def selftest():
     }
     expect("p7-green", p7_green_files, p7_green_manifest, [])
 
+    # P8 planted reds (round-12 WO-S9-9iii): one per arm — the unbound
+    # step action, the dead-file mirror, the dead-symbol mirror — plus
+    # the green corpus (resolving Mirrors + Environment) and the
+    # grandfather census lane. Each runs the same engine the live gate
+    # runs, with a real staged mirrors root.
+    def expect_p8(tag, files, manifest, mirrors_files, expected_prefixes, grandfather=frozenset()):
+        global P8_GRANDFATHER
+        saved = P8_GRANDFATHER
+        P8_GRANDFATHER = grandfather
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                corpus = build(tmp, files)
+                models = Path(tmp) / "models"
+                mirrors = Path(tmp) / "mirrors"
+                for rel, text in mirrors_files.items():
+                    fp = mirrors / rel
+                    fp.parent.mkdir(parents=True, exist_ok=True)
+                    fp.write_text(text)
+                violations, census = run_policy(
+                    manifest, corpus, models_dir=models, mirrors_root=mirrors
+                )
+        finally:
+            P8_GRANDFATHER = saved
+        unmatched = list(expected_prefixes)
+        extra = []
+        for v in violations:
+            for i, pre in enumerate(unmatched):
+                if v.startswith(pre):
+                    unmatched.pop(i)
+                    break
+            else:
+                extra.append(v)
+        if unmatched or extra:
+            fail(
+                f"self-test[{tag}]: expectation mismatch\n"
+                f"  missing: {unmatched}\n  extra: {extra}\n  got: {violations}"
+            )
+        return census
+
+    p8_live = (
+        "module liveP8 {\n  var x: int\n  action init = x' = 0\n"
+        "  action unbound = x' = x + 1\n"
+        "  // Mirrors: rio-x/src/dead_file.rs:some_fn\n"
+        "  action deadFile = x' = x + 1\n"
+        "  // Mirrors: rio-x/src/lib.rs:ghost_symbol\n"
+        "  action deadSymbol = x' = x + 1\n"
+        "  // Mirrors: rio-x/src/lib.rs:real_fn\n"
+        "  action mirrored = x' = x + 1\n"
+        "  // Environment: the world's move (planted)\n"
+        "  action env = x' = x\n"
+        "  action step = any { unbound, deadFile, deadSymbol, mirrored, env }\n"
+        "  val invX = x >= 0\n}\n"
+    )
+    p8_files = {"live_p8.qnt": p8_live}
+    p8_manifest = {
+        "p8Holds": {"kind": "holds", "main": "liveP8", "invariants": ["invX"]},
+    }
+    p8_mirrors = {"rio-x/src/lib.rs": "pub fn real_fn() {}\n"}
+    census = expect_p8(
+        "p8-arms",
+        p8_files,
+        p8_manifest,
+        p8_mirrors,
+        [
+            "P8 p8Holds: step action 'unbound' (liveP8) carries no binding",
+            "P8 p8Holds: action 'deadFile' (liveP8) mirrors 'rio-x/src/dead_file.rs:some_fn' but the file does not resolve",
+            "P8 p8Holds: action 'deadSymbol' (liveP8) mirrors 'rio-x/src/lib.rs:ghost_symbol' but the symbol is absent",
+            # the P1/P4 arms fire on this corpus too (no twin, no
+            # writer for the untwinned leaf is not at issue here) —
+            # match them so the P8 assertions stay exact:
+            "P1 p8Holds: invariant leaf 'invX'",
+        ],
+    )
+    if not census.get("P8-mirrors") or not census.get("P8-environment"):
+        fail("self-test[p8-arms]: the resolving Mirrors / Environment census lanes are empty")
+
+    # P8 green: every step action bound and resolvable.
+    p8_green = (
+        "module liveP8g {\n  var y: int\n  action init = y' = 0\n"
+        "  // Mirrors: rio-x/src/lib.rs:real_fn\n"
+        "  action a = y' = y + 1\n"
+        "  // Environment: frame (planted)\n"
+        "  action b = y' = y\n"
+        "  action step = any { a, b }\n  val invY = y >= 0\n}\n"
+        "module liveP8gTwin {\n  import liveP8g.* from \"./live_p8g\"\n  val w = y < 0\n}\n"
+    )
+    expect_p8(
+        "p8-green",
+        {"live_p8g.qnt": p8_green},
+        {
+            "p8gHolds": {"kind": "holds", "main": "liveP8g", "invariants": ["invY"]},
+            "p8gTwin": {"kind": "witness", "main": "liveP8gTwin", "witness": "w"},
+        },
+        p8_mirrors,
+        [],
+    )
+
+    # P8 grandfather: the module's whole alphabet is censused, never
+    # red — and the census names the module for the burn-down.
+    census = expect_p8(
+        "p8-grandfather",
+        p8_files,
+        p8_manifest,
+        p8_mirrors,
+        ["P1 p8Holds: invariant leaf 'invX'"],
+        grandfather=frozenset({"liveP8"}),
+    )
+    if census.get("P8-grandfathered-module") != ["liveP8"]:
+        fail("self-test[p8-grandfather]: grandfathered module not censused")
+
     # P7 grandfather mechanism: a frozen generator-output entry lands
     # in the census bucket, never the violation list (P1 still fires —
     # grandfathering P7 does not absolve the twin debt).
@@ -979,6 +1649,10 @@ def main():
     ap.add_argument("--ir-dir")
     ap.add_argument("--models-dir")
     ap.add_argument("--census-only", action="store_true")
+    ap.add_argument(
+        "--mirrors-root",
+        help="staged repo root the P8 Mirrors bindings resolve against (the (vvvvv) staging)",
+    )
     ap.add_argument("--assume-latches", default="", help="module:var,var;module:var — provisional P5 domain for census")
     ap.add_argument(
         "--self-test",
@@ -998,7 +1672,13 @@ def main():
     canary(ir_dir)
     manifest = json.loads(Path(args.manifest).read_text())
     corpus = Corpus(ir_dir, models_dir)
-    violations, census = run_policy(manifest, corpus, args.assume_latches)
+    violations, census = run_policy(
+        manifest,
+        corpus,
+        args.assume_latches,
+        models_dir=models_dir,
+        mirrors_root=Path(args.mirrors_root) if args.mirrors_root else None,
+    )
 
     # ---- census print (P6, the owner burn-down artifact)
     print("== quint-policy census ==")

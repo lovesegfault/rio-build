@@ -896,6 +896,33 @@ let
       manifest = pkgs.writeText "quint-policy-manifest.json" (
         builtins.toJSON (lib.mapAttrs (_: c: c.meta.quintPolicy or null) corpus)
       );
+      # P8 mirrors staging (hazard (vvvvv): a check validating the
+      # existence of repo paths MUST stage the surface it quantifies
+      # over): the `// Mirrors: <file>:<symbol>` binding targets are
+      # extracted from the model sources AT EVAL and staged as a
+      # narrow fileset — the check re-runs when a bound production
+      # file changes (the symbol could have moved) and is untouched by
+      # edits elsewhere. A binding naming a nonexistent path fails the
+      # fileset coercion loudly at eval.
+      modelFiles = builtins.filter (f: lib.hasSuffix ".qnt" (toString f)) (
+        lib.filesystem.listFilesRecursive modelsDir
+      );
+      mirrorsTargets = lib.unique (
+        lib.concatMap (
+          f:
+          lib.concatMap (
+            line:
+            let
+              m = builtins.match "[[:space:]]*//+[[:space:]]*Mirrors:[[:space:]]*([^:]+):[A-Za-z_][A-Za-z0-9_]*[[:space:]]*" line;
+            in
+            if m == null then [ ] else [ (builtins.head m) ]
+          ) (lib.splitString "\n" (builtins.readFile f))
+        ) modelFiles
+      );
+      mirrorsRoot = lib.fileset.toSource {
+        root = unfilteredRoot;
+        fileset = lib.fileset.unions (map (rel: unfilteredRoot + "/${rel}") mirrorsTargets);
+      };
     in
     pkgs.runCommand "quint-policy"
       {
@@ -909,7 +936,7 @@ let
           root = modelsDir;
           fileset = modelsDir;
         };
-        inherit manifest;
+        inherit manifest mirrorsRoot;
         policyScript = ./quint_policy.py;
       }
       ''
@@ -941,7 +968,8 @@ let
         python3 "$policyScript" \
           --manifest "$manifest" \
           --ir-dir ir \
-          --models-dir "$src" | tee "$out"
+          --models-dir "$src" \
+          --mirrors-root "$mirrorsRoot" | tee "$out"
       '';
 
 in

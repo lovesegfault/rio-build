@@ -1349,6 +1349,7 @@ module materializationJob {
   /// The WHOLE walk plane (both sub-planes) unchanged — the machine
   /// branches' frame; every deterministic run steps the machine under
   /// this.
+  // Environment: composition frame — the machine branches freeze the walk plane; no transition
   action walkUnchanged = all {
     walkSubPlaneUnchanged,
     stampSubPlaneUnchanged,
@@ -1531,6 +1532,7 @@ module materializationJob {
   /// marker for the pair (the merge is what backfills a re-merging
   /// build). Both `wanted` and the per-build write history move
   /// together (crossBuildWantedIsolation's two sides).
+  // Mirrors: rio-scheduler/src/db/wanted.rs:record_wanted_in_tx
   action recordWantedRelation(b: str, d: str, outs: Set[str]): bool = all {
     buildLive.get(b),
     outs != Set(),
@@ -1558,6 +1560,7 @@ module materializationJob {
   /// Delta 2b: a pre-relation-era build's in-memory interest surfaces —
   /// live interest with NO wanted rows (the FP-4(b) transition-window
   /// shape). Bounded by MAX_LEGACY.
+  // Environment: the pre-relation-era build population (delta 2b) — in-memory interest with no wanted rows; no production transition mints it, the FP-4(b) window carries it
   action legacyBuildArrives(b: str, d: str): bool = all {
     legacyBudget > 0,
     buildLive.get(b),
@@ -1586,6 +1589,7 @@ module materializationJob {
   /// The creation-time presence re-check (`not covered`) is the §2.1
   /// classification's local store re-check (the F1-permissiveness kept
   /// guard, data source re-pointed to the relation/mem union).
+  // Mirrors: rio-scheduler/src/actor/materialize.rs:create_materialization_job
   action createJob(d: str, origin: JobOrigin, tenant: str): bool = all {
     BUILDS.contains(tenant),
     buildLive.get(tenant),
@@ -1672,6 +1676,7 @@ module materializationJob {
   /// for legacy interest that arrived after creation). The view write
   /// is a no-op here BECAUSE the view is already faithful; the B5a
   /// override replaces this action with the pre-fix overwrite.
+  // Mirrors: rio-scheduler/src/actor/materialize.rs:create_materialization_job
   action dedupRefeed(d: str): bool = all {
     hasUnresolvedJob(d),
     // fire only when the backfill half has work (economy: the pure
@@ -1702,6 +1707,7 @@ module materializationJob {
   /// batch wrote its wanted rows; node not locally covered) minus the
   /// no-unresolved-job guard this action inverts; fires only when it
   /// changes state (an already-pruned job needs no upgrade — economy).
+  // Mirrors: rio-scheduler/src/db/materialization.rs:create_materialization_job_fenced
   action dedupPrunedUpgrade(d: str, tenant: str): bool = all {
     BUILDS.contains(tenant),
     buildLive.get(tenant),
@@ -1726,6 +1732,7 @@ module materializationJob {
   /// must_substitute conjunct — the claim IS the substitution (B1);
   /// the marked-node claim is ENABLED (canReachMarkedClaim).
   /// Delta 2a: blocked while the replica's channel is stale.
+  // Mirrors: rio-scheduler/src/actor/pull.rs:handle_pull_assignment
   action claimJob(d: str, replica: str): bool = all {
     REPLICAS.contains(replica),
     execsMinted < MAX_EXECS,
@@ -1778,6 +1785,7 @@ module materializationJob {
   /// §2.2 item 3 / §5: the claiming replica ingests one
   /// upstream-available live-wanted path and PINS IT AT INGEST
   /// (store-internal — no scheduler channel involved).
+  // Mirrors: rio-store/src/materialize/executor.rs:execute_job
   action executeStep(d: str, o: str): bool = all {
     OUTPUTS.contains(o),
     match attempts.get(d) {
@@ -1799,6 +1807,7 @@ module materializationJob {
   /// channel — delta 2a gates on the holder's channel). Covered =>
   /// resolved_success + node Completed + the §4 clear-mirror (delta
   /// 1); else (interest grew) the job re-arms.
+  // Mirrors: rio-scheduler/src/actor/materialize.rs:consume_materialization_outcome
   action consumeSuccess(d: str): bool = all {
     match attempts.get(d) {
       | NoAttempt => false
@@ -1854,6 +1863,7 @@ module materializationJob {
   /// count_materialization_rows_in_history — NOT the per-job count).
   /// The report precondition (missing paths verified absent AND
   /// unavailable) is the evidence the fsReportSound latch records.
+  // Mirrors: rio-scheduler/src/actor/materialize.rs:consume_materialization_outcome
   action consumeUnobtainable(d: str, missing: Set[str], refsMissing: bool): bool = all {
     // A4 (merged_bug_193): the report splits the miss cells — wanted
     // misses (`missing`, ⊆ OUTPUTS) and confirmed reference-closure
@@ -1991,6 +2001,7 @@ module materializationJob {
   /// transition), else it re-arms. Never fail-fasts, never routes
   /// from-source (B3). The budget counter survives the park cycle
   /// (ceiling MAT_BUDGET+2 bounds the model).
+  // Mirrors: rio-scheduler/src/actor/materialize.rs:charge_materialization_infra
   action reportInfra(d: str): bool = all {
     match attempts.get(d) {
       | NoAttempt => false
@@ -2050,6 +2061,7 @@ module materializationJob {
   /// never read it — a 429 wave cannot walk a healthy job toward the
   /// from-source settlement. (A failover rebuilds the view without the
   /// deferral — the job loses at most one uncharged wait window.)
+  // Mirrors: rio-scheduler/src/actor/materialize.rs:consume_materialization_outcome
   action reportTransient(d: str): bool = all {
     match attempts.get(d) {
       | NoAttempt => false
@@ -2086,6 +2098,7 @@ module materializationJob {
   /// A4: the deferral window lapses — the job is claimable again.
   /// (Production: defer_until is a timestamp the admission read
   /// compares to now(); the model's bool flips back.)
+  // Environment: wall-clock lapse — production re-admits at the read (defer_until vs now()); no transition fires
   action deferExpires(d: str): bool = all {
     deferUntil.get(d),
     deferUntil' = deferUntil.put(d, false),
@@ -2110,6 +2123,7 @@ module materializationJob {
   /// Scheduler-internal — no channel gate. The pre-reversal
   /// never-parks behavior is preserved ONLY as the
   /// mat-establish-never-parks calibration.
+  // Mirrors: rio-scheduler/src/actor/housekeeping.rs:tick_sweep_open_pull_attempts
   action establishCrashedAttempt(d: str): bool = all {
     ENABLE_CRASH,
     attempts.get(d) != NoAttempt,
@@ -2198,6 +2212,7 @@ module materializationJob {
   /// charge ever follows the cancellation (the calibration's split
   /// cancel leaves the attempt open and the establishment converts
   /// the leak into a charge).
+  // Mirrors: rio-scheduler/src/actor/materialize.rs:tick_cancel_zero_interest_materialization
   action cancelOnZeroInterest(d: str): bool = all {
     hasUnresolvedJob(d),
     memInterest(d) == Set(),
@@ -2225,11 +2240,13 @@ module materializationJob {
   ///     disposition gates every companion); both are observational
   ///     stutters here. The mat-133-discarded-outcome override
   ///     replaces them with the pre-fix view discard.
+  // Mirrors: rio-scheduler/src/db/materialization.rs:resolve_materialization_job_fenced
   action resolveApplied(d: str): bool = all {
     ENABLE_RESOLVE_FAULTS,
     cancelOnZeroInterest(d),
   }
 
+  // Mirrors: rio-scheduler/src/db/materialization.rs:resolve_materialization_job_fenced
   action resolveFenced(d: str): bool = all {
     ENABLE_RESOLVE_FAULTS,
     hasUnresolvedJob(d),
@@ -2238,6 +2255,7 @@ module materializationJob {
     tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
+  // Mirrors: rio-scheduler/src/db/materialization.rs:resolve_materialization_job_fenced
   action resolveErr(d: str): bool = all {
     ENABLE_RESOLVE_FAULTS,
     hasUnresolvedJob(d),
@@ -2250,6 +2268,7 @@ module materializationJob {
   /// obsolete. Obsolescence resolves the row, so the pruned fact ends
   /// with it (delta 1 — the same structural clear as every other
   /// resolution arm).
+  // Mirrors: rio-scheduler/src/actor/materialize.rs:sweep_moot_class
   action obsoleteOnProduced(d: str): bool = all {
     hasUnresolvedJob(d),
     nodeStatus.get(d) == NCompleted,
@@ -2275,8 +2294,7 @@ module materializationJob {
   /// A2/318 release contract over the claimOrigin witness), and the
   /// LEDGER UNTOUCHED: no materialization_infra row, no budget fold
   /// event, the 085 window unmoved.
-  // Mirrors: scheduler Aborted intake (charge-free close + rearm,
-  //          landed B1-s1) -> rio-scheduler release_claim (A3).
+  // Mirrors: rio-scheduler/src/actor/materialize.rs:release_claim
   action workerAborted(d: str): bool = all {
     ENABLE_WORKER_ABORTED,
     match attempts.get(d) {
@@ -2322,6 +2340,7 @@ module materializationJob {
   /// exec — resolutionExec stays 0), clears any stale mark, and
   /// requeues the node. Broken-evidence jobs are NOT touched (they are
   /// the stalled population; their armed action is the backoff expiry).
+  // Mirrors: rio-scheduler/src/actor/materialize.rs:tick_reevaluate_parked_materialization_jobs
   action parkReevaluate(d: str): bool = all {
     match jobs.get(d) {
       | NoJob => false
@@ -2379,6 +2398,7 @@ module materializationJob {
   /// Enabled for any evidence (as built the expiry races the
   /// re-evaluation tick for Vouched/Pending parks; Broken parks have
   /// ONLY this arm).
+  // Environment: wall-clock lapse — park_until passes and the admission read observes it; no transition fires
   action parkBackoffExpires(d: str): bool = all {
     match jobs.get(d) {
       | NoJob => false
@@ -2398,6 +2418,7 @@ module materializationJob {
   /// A build reaches a terminal state: it leaves the live set; its
   /// wanted rows drop out of the §6 join atomically (the live-join —
   /// no stored-union residue, the C5 by-construction).
+  // Mirrors: rio-scheduler/src/actor/build.rs:transition_build
   action buildTerminal(b: str): bool = all {
     buildLive.get(b),
     buildLive' = buildLive.put(b, false),
@@ -2414,6 +2435,7 @@ module materializationJob {
   /// implies an unresolved-or-parked job implies a non-None view —
   /// the delta-6 equivalence in the header; the kernel arm died in
   /// Waves D4.1/D5.2).
+  // Mirrors: rio-scheduler/src/actor/pull.rs:handle_pull_assignment
   action builderPull(d: str, builder: str): bool = all {
     BUILDERS.contains(builder),
     execsMinted < MAX_EXECS,
@@ -2433,6 +2455,7 @@ module materializationJob {
 
   /// The from-source dispatch completes: the node completes, outputs
   /// become present with build pins.
+  // Environment: the builder-side execute-and-complete cycle, compressed to one step (builder conformance is out of this plane)
   action dispatchFromSource(d: str): bool = all {
     match attempts.get(d) {
       | NoAttempt => false
@@ -2458,6 +2481,7 @@ module materializationJob {
   /// live-wanted outputs are all present completes without any
   /// attempt. Job-carrying nodes that complete this way are closed by
   /// obsoleteOnProduced (the produced-by-other-means closer).
+  // Mirrors: rio-scheduler/src/actor/dispatch.rs:complete_ready_from_store_batch
   action completeReadyFromStore(d: str): bool = all {
     nodeStatus.get(d) == NQueued or nodeStatus.get(d) == NReady,
     attempts.get(d) == NoAttempt,
@@ -2476,6 +2500,7 @@ module materializationJob {
   /// holders and park expiries mirrored, so the rebuilt view equals
   /// the faithful projection. Every executor channel goes STALE (the
   /// kube-proxy ClusterIP pinned to the deposed replica — finding 18).
+  // Mirrors: rio-scheduler/src/actor/recovery.rs:handle_leader_acquired
   action failover = all {
     ENABLE_FAILOVER,
     leaseGen < MAX_GEN,
@@ -2504,6 +2529,7 @@ module materializationJob {
   /// Without this action (the pre-B3 calibration) every post-failover
   /// claim/report is blocked forever — canReachPostFailoverClaim goes
   /// unreachable.
+  // Mirrors: rio-store/src/materialize/client.rs:abandon_connection
   action redialChannel(replica: str): bool = all {
     REPLICAS.contains(replica),
     channelStale.get(replica),
@@ -2522,6 +2548,7 @@ module materializationJob {
   /// write covers job-table and wanted-relation writes; the unfenced
   /// override applies the write instead and latches
   /// staleJobWriteApplied).
+  // Mirrors: rio-scheduler/src/db/materialization.rs:resolve_materialization_job_fenced
   action staleTenureWriteDiscarded(d: str): bool = all {
     ENABLE_STALE_TENURE,
     leaseGen > 0,
@@ -2554,6 +2581,7 @@ module materializationJob {
   /// only — interest arriving after a legitimate release+GC is the
   /// stale_reset re-materialization lane (T-1.6), not a pin hole (the
   /// baseline-protocol catch recorded in the C-prime stage record).
+  // Mirrors: rio-scheduler/src/actor/materialize.rs:release_materialization_pins_best_effort
   action releasePins(d: str): bool = all {
     not(hasUnresolvedJob(d)),
     memInterest(d) == Set(),
@@ -2569,6 +2597,7 @@ module materializationJob {
 
   /// Store GC visits a (derivation, output) path: deletion is blocked
   /// by pins of either kind (§5).
+  // Environment: the store gc plane collects an unpinned path (rio-store side; the pin laws are its own batteries)
   action storeGc(d: str, o: str): bool = all {
     ENABLE_GC,
     OUTPUTS.contains(o),
@@ -2581,6 +2610,7 @@ module materializationJob {
   }
 
   /// The upstream world changes (bounded).
+  // Environment: upstream cache availability flips (the external world the probes observe)
   action upstreamChange(d: str, o: str): bool = all {
     upstreamFlipsLeft > 0,
     OUTPUTS.contains(o),
@@ -2593,6 +2623,7 @@ module materializationJob {
 
   /// The durable declared-relation classification changes (deps
   /// produced by other builds, children declared).
+  // Environment: the declared-relation classification shifts with upstream closure state (the classifier input, not a scheduler transition)
   action durableRelationChange(d: str, r: DurableRelation): bool = all {
     durableRel.get(d) != r,
     durableRel' = durableRel.put(d, r),
@@ -2672,6 +2703,7 @@ module materializationJob {
 
   /// The full machine frozen (the plane branches' frame): the plane
   /// reads nothing from and writes nothing to the job machine.
+  // Environment: composition frame — the plane branches freeze the job machine; no transition
   action machineFrame = all {
     jobCoreUnchanged,
     relUnchanged,
@@ -2752,6 +2784,7 @@ module materializationJob {
   }
 
   /// One curated evaluation.
+  // Environment: the store walk's observation cells arrive (slot-10 plane; store-side evidence intake)
   action walkObserveAny = {
     nondet cells = WALK_MATRICES.oneOf()
     walkObserve(cells)
@@ -2801,6 +2834,7 @@ module materializationJob {
   }
 
   /// The LIVE fold: decisions derived lawfully from the armed cells.
+  // Environment: the store-side walk-fold evaluation (the mat-299 calibration family is its conformance teeth)
   action walkFold = all {
     walkFoldApply(
       or { walkCells.served != Set(), armedLocalVisible },
@@ -2875,6 +2909,7 @@ module materializationJob {
   }
 
   /// One curated evidence arming.
+  // Environment: the stamp-provenance evidence arrives (store-side intake)
   action stampObserveAny = {
     nondet ev = STAMP_MATRICES.oneOf()
     stampObserve(ev)
@@ -2899,6 +2934,7 @@ module materializationJob {
   /// The LIVE stamp: pairs derived lawfully from the armed evidence
   /// (the production funnel — `upsert_path_tenants` derives the pair
   /// set FROM the provenance witness).
+  // Environment: the store-side stamp fold (the mat-139 calibration family is its conformance teeth)
   action stampFold = all {
     stampApply(lawfulStampPairs),
   }
