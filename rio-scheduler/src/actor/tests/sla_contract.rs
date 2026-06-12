@@ -6649,7 +6649,7 @@ async fn memo_arm_floor_bump_is_classified_not_silent_empty() {
 /// red — the .any() over the surviving siblings forwarded the FULL
 /// cells vector, the converging chokepoint recomputed the identical
 /// eff_mem and deterministically stripped intel-6 with the
-/// un-debounced "classify-coverage bug" warn EVERY poll (the warn's
+/// un-debounced "classify-coverage bug" warn every poll (the warn's
 /// own "re-routed upstream on BOTH arms" premise falsified; the
 /// channel the merged_bug_002 close declared load-bearing
 /// desensitized). Post-fix the dead cell never leaves the memo arm:
@@ -6661,7 +6661,7 @@ async fn w12_ag_memo_band_cell_forwards_only_the_image() {
     let db = TestDb::new(&MIGRATOR).await;
     crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
-    // Wide cost deadband so ALL THREE classes enter the admissible set
+    // Wide cost deadband so all three classes enter the admissible set
     // (the band shape needs a surviving sibling BESIDE the dead cell).
     actor.sla_config.hw_cost_tolerance = 10.0;
     // intel-6 hosts 64 GiB containers; siblings host 128 GiB.

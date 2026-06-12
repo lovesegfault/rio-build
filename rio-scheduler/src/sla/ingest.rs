@@ -762,7 +762,7 @@ fn aggregate_disk_p90(rows: &[BuildSampleRow], fit_w: &[f64]) -> Option<DiskByte
     let (vals, ws) = axis_samples(rows, fit_w, |r| r.peak_disk_bytes.map(|b| b as f64));
     // live060-c: the population gate + the shrink floor live INSIDE
     // the one producer (R33 — the gate's home is the warm fit's sole
-    // mint, so EVERY consumer — the envelope's `fitted`, the
+    // mint, so every consumer — the envelope's `fitted`, the
     // `exceeds_ceiling` reject gates, the explore lanes — is
     // witnessed by construction; gating in `DiskFitEnvelope::derive`
     // instead would leave `exceeds_ceiling` consuming the un-gated
@@ -810,7 +810,7 @@ const DISK_SHRINK_HEADROOM: f64 = 1.2;
 /// ring seat (`cpu_limit_cores.is_some()`, in row order) carries its
 /// ring weight from `fit_w` (the same law plus the anchor floor,
 /// computed once in `refit`); a row without a seat (legacy
-/// no-cpu_limit history) derives the SAME law from the shared
+/// no-cpu_limit history) derives the same law from the shared
 /// completed_at ordering — the slice index IS its ordinal (the
 /// pre-fix "they carry no ordinal" premise was FALSE: the slice is
 /// completed_at-ascending) — with vdist floored at 0. `fit_w` empty
@@ -965,7 +965,7 @@ mod tests {
     /// **W12-AJ (bug_014)** — *the avg-cores domain restriction is
     /// decided ONCE, in the single producer; population: both consult
     /// sites.* A positive-cpu/zero-wall row (manual-SQL/fixture-only:
-    /// the production writer gate held in EVERY era — the triage
+    /// the production writer gate held in every era — the triage
     /// correction; pure defensive-parity): pre-fix
     /// `derive_explore_state` computed `secs / 0.0 / lim = +inf > 0.4`
     /// inline and spuriously marked the key saturated, while sibling
@@ -2015,7 +2015,7 @@ mod disk_axis_tests {
     /// verify marker above attested coverage that did not exist —
     /// vacuous from birth.
     ///
-    /// This fixture has ZERO c-axis rows (the arm's ONLY entry
+    /// This fixture has ZERO c-axis rows (the arm's only entry
     /// condition) and asserts the arm structurally: probe_only's
     /// distinctive `n_eff_ring == 0.0 ∧ sum_w == 0.0` signature — the
     /// full-fit path computes a Kish n_eff over a non-empty ring and
@@ -2029,7 +2029,7 @@ mod disk_axis_tests {
     fn w12_ah_probe_only_disk_aggregate_pinned_at_its_own_arm() {
         const GI: i64 = 1 << 30;
         let rows = vec![
-            // Peaked legacy rows — no c-axis seat anywhere in the ring.
+            // Peaked legacy rows — no c-axis seat in this fixture's ring.
             disk_row(None, 100.0, Some(2 * GI)),
             disk_row(None, 101.0, Some(3 * GI)),
             disk_row(None, 102.0, Some(3 * GI)),
@@ -2082,7 +2082,7 @@ mod disk_axis_tests {
     /// sparse-first-observations regime that activation (live060-a's
     /// prjquota provisioning) creates.* Pre-fix red (transcript in the
     /// commit body): `DiskFitEnvelope::derive` retired the prior the
-    /// moment ANY warm p90 existed — the FIRST observation after
+    /// moment any warm p90 existed — the FIRST observation after
     /// provisioning, a single unrepresentative 2 GiB build, collapsed
     /// the 100 GiB prior to 2 GiB fleet-wide. Post-fix the prior
     /// stands until DISK_WITNESS_MIN_PEAKS observations exist, and the
@@ -2275,7 +2275,7 @@ mod disk_axis_tests {
     }
 
     /// Extract the production `axis_samples` body (the one weight-law
-    /// producer seam) for the totality pin.
+    /// producer seam) for the law-consult pin.
     fn axis_samples_body(ingest_src: &str) -> &str {
         let prod = strip_test_mod(ingest_src);
         let start = prod.find("fn axis_samples").expect("producer present");
@@ -2291,7 +2291,7 @@ mod disk_axis_tests {
     /// site; the WO-named EXPECTED members verified (fit.rs: the
     /// definition and the IRLS pinball baseline; ingest.rs:
     /// observed_p_bar and the mem and disk chokepoints; everything else
-    /// zero). A new fold site anywhere in the sla tree drifts a count
+    /// zero). A new fold site in the derived module universe drifts a count
     /// — re-derive the expectation consciously, never widen silently.
     #[test]
     fn w12_ad_weight_census() {
@@ -2323,7 +2323,7 @@ mod disk_axis_tests {
                  weight law (re-derive, never hand-wave)"
             );
         }
-        // Totality pin: the producer body consults the law and carries
+        // Law-consult pin: the producer body consults the law and carries
         // NO exempt flat-weight default.
         let body = axis_samples_body(include_str!("ingest.rs"));
         assert!(
@@ -2338,7 +2338,7 @@ mod disk_axis_tests {
     }
 
     /// **Weight-census planted reds (riders (b)): each face's oracle
-    /// driven through the SAME walk path as production.**
+    /// driven through the same walk path as production.**
     #[test]
     fn w12_ad_weight_census_planted_reds() {
         // (1) ENROLLMENT plant: an in-grammar uncensused fold member —
@@ -2368,7 +2368,7 @@ mod disk_axis_tests {
             "alias evasion refused"
         );
         // (4) EXEMPT-DEFAULT plant (the WO's strawman arm): a producer
-        // body re-growing a flat weight REDs the totality pin.
+        // body re-growing a flat weight REDs the law-consult pin.
         let exempt = "fn axis_samples(rows: &[Row]) -> Vec<f64> {\n    let w = if seated { ring } else { 1.0 };\n}\nfn next() {}\n";
         let body = axis_samples_body(exempt);
         assert!(

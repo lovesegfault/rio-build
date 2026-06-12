@@ -503,7 +503,7 @@ pub fn fit_memory(
     // `ln(0) = -∞` and `wls_loglinear` has no NaN handling — `-∞ - (-∞)
     // = NaN` collapses an entire key from `Coupled` to `Independent`.
     // `ln(1) = 0` is a benign low outlier IRLS down-weights. The
-    // percentile-doesn't-drag rationale survives as an INVARIANT of
+    // percentile-doesn't-drag rationale survives as a property of
     // the arm, not of this local `ms`: every `Independent` fallback
     // aggregates RAW un-floored bytes — the degenerate arm below
     // returns the CALLER-provided `fallback_p90` (refit's one mem

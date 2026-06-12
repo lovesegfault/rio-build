@@ -2913,7 +2913,7 @@ impl DagActor {
                 // (cm − pad, cm] band cell of a smaller class rode a
                 // surviving sibling into the emission and the
                 // converging chokepoint deterministically stripped it
-                // EVERY poll with the un-debounced "classify-coverage
+                // every poll with the un-debounced "classify-coverage
                 // bug" warn — falsifying that warn's own "re-routed
                 // upstream on BOTH arms" premise and desensitizing the
                 // channel the merged_bug_002 close declared

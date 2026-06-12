@@ -460,7 +460,7 @@ pub struct CostTable {
     /// bug_120: `load()` refused at least one row for a non-finite
     /// stored stamp — the repair obligation. Discharged by the next
     /// leader-owned [`Self::persist_rows`] (durable writes live in the
-    /// sealed rows ONLY — W10-BB), which resets the poisoned stamps to
+    /// sealed rows only — the W10-BB census is the bind), which resets the poisoned stamps to
     /// epoch 0 (maximally stale; values stay). Cleared naturally: the
     /// next clean load rebuilds the table with the flag down.
     repair_nonfinite: bool,
@@ -1058,7 +1058,7 @@ impl CostTable {
         if cursor_rows == 0 {
             // Typed, counted refusal — never an error: the stored
             // cursor is ahead, so this body's whole window view is
-            // stale and landing ANY row of the unit would split it.
+            // stale and landing any row of the unit would split it.
             // The surfaces outside the unit (price rows above,
             // sla_observed_instance_types below) proceed under their
             // own per-surface fences.
@@ -1344,7 +1344,7 @@ impl CostTable {
         }
         // ── Capture the NEXT generation: L FIRST, THEN the snapshot's
         // in-progress xid list (the load-bearing order — see
-        // [`SeqGeneration`]). The ordering proof is denominated ONLY
+        // [`SeqGeneration`]). The ordering proof is denominated only
         // in what the await graph guarantees (bug_097): the two reads
         // are SEQUENTIALLY AWAITED on independent pool checkouts — NO
         // session affinity exists or is needed, because

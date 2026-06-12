@@ -91,7 +91,6 @@ docs/spec/components/scheduler.typ	status; the ONLY lane that may warn and count
 docs/spec/components/scheduler.typ	through park-expiry re-claim, so the armed-action totality above is
 docs/spec/components/scheduler.typ	two replicas that both believe they lead can never have acquired at the same
 docs/spec/components/scheduler.typ	widen-only establishment window governs the deadline/reap axis ONLY
-docs/spec/components/sla-sizing.typ	@alg-estimate, and the clamped request by construction can never trip it;
 docs/spec/components/sla-sizing.typ	`requiredSystemFeatures` is a subset of `features` --- i.e., derivations
 docs/spec/components/sla-sizing.typ	demanded, keyed to the attempt's first classification); EVERY other
 docs/spec/components/store.typ	- In-process LRU chunk cache (configurable, default 2GB) to avoid repeated S3
@@ -1600,7 +1599,6 @@ rio-scheduler/src/sla/config.rs	/// on ANY membership drift — closure tomorrow
 rio-scheduler/src/sla/config.rs	/// path, leg-B codec). No order enforcement anywhere: membership
 rio-scheduler/src/sla/config.rs	/// strips ANY cell whose class can't host `(cores, mem)`,
 rio-scheduler/src/sla/cost.rs	// Snapshot → refresh_lambda → write back λ ONLY (don't clobber
-rio-scheduler/src/sla/cost.rs	// deposed writer's stale cursor can never rewind consumption).
 rio-scheduler/src/sla/cost.rs	/// (merged_bug_146): the ONLY path to `sla_ema_state` /
 rio-scheduler/src/sla/cost.rs	/// NEVER from `spawned` (Pending ack) — that's the wrong edge and
 rio-scheduler/src/sla/cost.rs	/// expiry is still the SAME observation — `left: step 0→1 (the
@@ -1611,8 +1609,6 @@ rio-scheduler/src/sla/cost.rs	/// window at the SAME rung instead of climbing. T
 rio-scheduler/src/sla/explore.rs	/// `Ceilings` matching `cfg()`'s configured `Some(64, 256GiB)` so
 rio-scheduler/src/sla/explore.rs	/// pool was always a subset of `h_all\in_a\{cheapest}`; the caller's
 rio-scheduler/src/sla/explore.rs	/// the warm path can never request past the operator bound.
-rio-scheduler/src/sla/fit.rs	///   blend toward the chart constant (a 100 GiB blend would never
-rio-scheduler/src/sla/fit.rs	/// - `fitted` = the per-pname observed p90 when ANY disk observation
 rio-scheduler/src/sla/fit.rs	/// This envelope is the SOLE constructor for EVERY dispatch lane's
 rio-scheduler/src/sla/fit.rs	/// alpha-filter so the four can never drift: the algorithm's
 rio-scheduler/src/sla/fit.rs	/// derive-then-request. The ONLY public mint of [`DiskRequest`].
@@ -1622,9 +1618,7 @@ rio-scheduler/src/sla/hw.rs	// merged_bug_001 coupling: before claims-derived te
 rio-scheduler/src/sla/hw.rs	/// (vertex), so this is the worst-case `min_factor(α)` over ALL
 rio-scheduler/src/sla/hw.rs	/// See [`FleetMedian::tenants_with_dim`]. Populated ONLY by
 rio-scheduler/src/sla/ingest.rs	// factor-3 hw observing the SAME ref_t residual: wall_t=5/3≈1.67
-rio-scheduler/src/sla/ingest.rs	/// ("warm pname on default") holds at tree ONLY for populations
 rio-scheduler/src/sla/ingest.rs	/// Cold rows (zero peaks anywhere) stay None — no evidence is no
-rio-scheduler/src/sla/ingest.rs	/// commit body): `disk_p90 == None` — `probe_only` read ONLY
 rio-scheduler/src/sla/ingest.rs	/// live_049 L2: the disk p90 over EVERY row carrying a peak, unit
 rio-scheduler/src/sla/ingest.rs	/// p90 of 1 (the 5 GiB estimate shipped; the 1 GiB envelope floor
 rio-scheduler/src/sla/ingest.rs	/// probe_only arm read ONLY the last row (a serial pname with five

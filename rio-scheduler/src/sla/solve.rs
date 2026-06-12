@@ -3633,7 +3633,7 @@ mod tests {
     #[test]
     fn w12_ag_solve_emission_equals_its_chokepoint_image() {
         let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
-        // Wide cost deadband: ALL THREE classes enter the admissible
+        // Wide cost deadband: all three classes enter the admissible
         // set (the band shape needs the dead cell BESIDE survivors —
         // with the default deadband only the fastest class admits and
         // the assertions would be vacuous).
@@ -3899,7 +3899,7 @@ mod tests {
     // r[verify sched.sla.gate-inventory]
     /// **The gate-inventory census (CE-1 riders: jurisdiction +
     /// population + membership).** A bare class-axis mem compare
-    /// anywhere in the three sizing trees is a RED; the consult
+    /// in the three derived sizing trees is a RED; the consult
     /// population floor and the WO-named expected members
     /// (solve admission ×2, memo survival, all_candidates fallback,
     /// chokepoint gates) are pinned by the committed counts.
@@ -3952,7 +3952,7 @@ mod tests {
     }
 
     /// **Gate-inventory planted reds (riders (b)) — each face's oracle
-    /// driven through the SAME scan path.**
+    /// driven through the same scan path.**
     #[test]
     fn w12_ag_gate_inventory_planted_reds() {
         // (1) ENROLLMENT plant: an in-grammar bare gate is FOUND and

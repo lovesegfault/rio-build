@@ -196,7 +196,7 @@ prior stands, and a flat default is a cold-start prior that a WITNESSED
 population MUST retire, never a steady state.
 
 live060-c (the activation-safety amendment): the live builder fleet
-(EBS-only ext4, no prjquota) has NEVER produced a disk observation — every
+(EBS-only ext4, no prjquota) has never produced a disk observation — every
 completion records a NULL peak — so the pre-fix "any observation retires
 the prior" law was vacuously safe and would have become a single-sample
 fleet-wide collapse hazard the moment provisioning (live060-a) landed: the

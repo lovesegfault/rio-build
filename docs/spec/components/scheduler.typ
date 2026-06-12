@@ -5337,7 +5337,7 @@ reads outside the chokepoints drift its committed counts.
   ($w_i = 0.5^("ordinal_age" slash 20) dot 0.5^"vdist"$ ---
   #rref("sched.sla.hw-class.sample-weight-ordinal")) --- seated rows carry
   their ring weight (the law plus the anchor floor), unseated rows derive
-  the SAME law from the shared completed_at ordering (the slice index IS
+  the same law from the shared completed_at ordering (the slice index IS
   the ordinal; vdist floored at 0). Exempt defaults are unrepresentable:
   no weight enters a quantile fold except through the law.
 ]
@@ -5392,12 +5392,12 @@ monotone position with no second fencing axis --- verified, no edit.
 ]
 
 bug_036: the wave-11 footprint seal froze a census of two gate-equality
-oracles against a law that quantifies over EVERY mem-feasibility
+oracles against a law that quantifies over every mem-feasibility
 predicate --- solve admission and the shared-c* re-filter stayed bare,
 so a (cm − pad, cm] band cell entered the memo, failed per-cell
 survival, rode a surviving sibling through the `.any()` forward, and
 the converging chokepoint deterministically stripped it with the
-un-debounced "classify-coverage bug" warn EVERY poll --- falsifying the
+un-debounced "classify-coverage bug" warn every poll --- falsifying the
 warn's own "re-routed upstream on BOTH arms" premise and desensitizing
 the channel the merged_bug_002 close declared load-bearing. The
 inventory census (`w12_ag_gate_inventory_census`) derives the file
