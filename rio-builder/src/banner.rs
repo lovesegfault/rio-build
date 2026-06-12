@@ -63,17 +63,23 @@ pub(crate) fn header_lines(
         Some(hw) => format!("{system}/{hw}"),
         None => system.to_string(),
     };
-    // live_058-d: value-preserving at the reader's granularity — a
-    // present non-zero assignment can never render "0 GiB" (the live
-    // incident's 45-69 MB raw-stamps read as "no memory assigned"
-    // during diagnosis; the header doc above forbids claiming a
-    // precision the banner doesn't have, and rounding sub-GiB to
-    // zero is the inverse violation). ≥1 GiB renders in GiB
-    // (unchanged); sub-GiB renders in MiB; absent stays "? GiB".
+    // live_058-d + merged_bug_004: the law is the VIOLATION CLASS,
+    // total over the input domain — a present NON-ZERO size never
+    // renders as zero at ANY unit (the live incident's 45-69 MB
+    // raw-stamps read as "no memory assigned" during diagnosis; the
+    // header doc above forbids claiming a precision the banner
+    // doesn't have, and rounding a present value to zero is the
+    // inverse violation — at every rung, not just the GiB one the
+    // incident happened to hit). The unit ladder descends to the
+    // first rung that preserves a non-zero magnitude and bottoms out
+    // at bytes; absent stays "? GiB". Pinned by the
+    // `present_nonzero_never_renders_zero_at_any_unit` property.
     let fmt_size = |b: Option<u64>| match b {
         None => "? GiB".to_string(),
         Some(n) if n >= 1 << 30 => format!("{} GiB", n >> 30),
-        Some(n) => format!("{} MiB", n >> 20),
+        Some(n) if n >= 1 << 20 => format!("{} MiB", n >> 20),
+        Some(n) if n >= 1 << 10 => format!("{} KiB", n >> 10),
+        Some(n) => format!("{n} B"),
     };
     let cores_str = cores.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
     let now = format_rfc3339_secs(std::time::SystemTime::now());
@@ -237,6 +243,69 @@ mod tests {
                 .unwrap()
                 .contains("(?c, ? GiB, ? GiB)")
         );
+    }
+
+    /// W11-Y (merged_bug_004): the formatter's law is the VIOLATION
+    /// CLASS, total over the input domain — a present non-zero size
+    /// NEVER renders as zero at ANY unit. The live_058-d fix closed
+    /// the truncation-to-zero at the GiB rung and the W10-CL matrix
+    /// pinned three cells; the fallthrough still rendered `n >> 20`,
+    /// so any present value in [1, 1 MiB) printed "0 MiB" — the
+    /// identical shape one granularity down (and "0 KiB" would be
+    /// one below that). The population that reaches this banner is
+    /// by definition the mis-scaled anomalous one the fix exists to
+    /// stay honest for.
+    #[test]
+    fn present_nonzero_never_renders_zero_at_any_unit() {
+        use proptest::prelude::*;
+        // The example red (pre-fix, verbatim in the owning commit):
+        // 512 KiB rendered "0 MiB".
+        let lines = header_lines(
+            "01976e8b-w11y",
+            "x86_64-linux",
+            None,
+            Some(2),
+            Some(512 << 10),
+            Some(25 << 30),
+        );
+        let builder_line = str::from_utf8(&lines[1]).unwrap();
+        assert!(
+            !builder_line.contains("0 MiB"),
+            "left: a present 512 KiB stamp renders '0 MiB' — the \
+             live_058-d truncation-to-zero relocated one rung down / \
+             right: the smallest rung floors, never zero: {builder_line}"
+        );
+        assert!(
+            builder_line.contains("(2c, 512 KiB, 25 GiB)"),
+            "sub-MiB renders value-preserving in KiB: {builder_line}"
+        );
+        // Sub-KiB falls to bytes.
+        let lines = header_lines("x", "x86_64-linux", None, Some(1), Some(37), Some(1));
+        let builder_line = str::from_utf8(&lines[1]).unwrap();
+        assert!(
+            builder_line.contains("(1c, 37 B, 1 B)"),
+            "sub-KiB renders in bytes: {builder_line}"
+        );
+
+        // The property at the formatter's own domain quantifier:
+        // nonzero in ⇒ never `0 <unit>` out, domain-wide.
+        proptest!(|(n in 1u64..=u64::MAX)| {
+            let lines = header_lines("x", "s", None, None, Some(n), None);
+            let line = String::from_utf8(lines[1].clone()).unwrap();
+            // The mem token is the second comma-field inside the
+            // parens — token-exact so "12260528520 GiB" (which merely
+            // ENDS in a 0) never false-trips the zero check.
+            let inner = line
+                .split('(')
+                .nth(1)
+                .and_then(|t| t.split(')').next())
+                .unwrap_or("");
+            let mem_token = inner.split(", ").nth(1).unwrap_or("");
+            prop_assert!(
+                !mem_token.starts_with("0 "),
+                "present non-zero {} rendered as zero: {}", n, line
+            );
+        });
     }
 
     #[test]
