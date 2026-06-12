@@ -157,6 +157,62 @@ const PROXY_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 /// the structural ingest-session-lease gates stay).
 const INBOUND_IDLE_BOUND: std::time::Duration = rio_common::liveness::INBOUND_IDLE_ABORT;
 
+/// Most inbound frames the housekeeping arm drains before consulting
+/// the idle predicate (bug_020). One fresh arrival is all the gate
+/// needs; the cap keeps a flooding peer from parking the housekeeping
+/// arm (the next select iteration keeps reading normally).
+const INBOUND_DRAIN_CAP: u32 = 64;
+
+/// The inbound-idle gate's enforcement clocks (bug_020,
+/// `store.log.arrival-clock`). Two axes, both stamped by the drive
+/// loop:
+///
+/// - `last_drained_arrival` — the peer's conduct: stamped when an
+///   inbound frame is DRAINED (the select's inbound arm or the
+///   housekeeping arm's pre-predicate drain). Drain-time, not
+///   read-progress: a frame queued behind a slow in-arm cut counts
+///   the moment the gate looks, which is what makes the evidence the
+///   peer's and not the enforcer's.
+/// - `last_self_activity` — the enforcer's own occupancy: stamped
+///   when an in-arm or periodic cut attempt completes. The conjunct
+///   only ever DELAYS a trip; it exists so the enforcer's own cut
+///   stall (legally up to one watchdog bound plus a bounded ack
+///   send) cannot masquerade as peer silence.
+struct IdleClocks {
+    last_drained_arrival: tokio::time::Instant,
+    last_self_activity: tokio::time::Instant,
+}
+
+impl IdleClocks {
+    fn start() -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            last_drained_arrival: now,
+            last_self_activity: now,
+        }
+    }
+}
+
+// r[impl store.log.arrival-clock]
+/// The inbound-idle trip predicate (bug_020): fires only with nothing
+/// pending AND both gate clocks past [`INBOUND_IDLE_BOUND`] —
+/// equivalently, `max(last-drained-arrival, last-self-activity)`
+/// elapsed at least the bound. The TRUE bound this states (the
+/// disclosed delay budget): under a slow-cut-then-silence schedule
+/// the trip is delayed by up to one cut occupancy (one watchdog bound
+/// plus a bounded ack send) past last arrival plus the idle bound —
+/// never earlier, and a genuinely silent peer with an idle enforcer
+/// still trips at exactly the bound.
+fn idle_trip_due(
+    no_pending: bool,
+    arrival_elapsed: std::time::Duration,
+    self_activity_elapsed: std::time::Duration,
+) -> bool {
+    no_pending
+        && arrival_elapsed >= INBOUND_IDLE_BOUND
+        && self_activity_elapsed >= INBOUND_IDLE_BOUND
+}
+
 /// Turns the owning replica's self-identity (the
 /// `log_ingest_sessions.replica_pod` value it registered at
 /// `sessions::acquire` time) into a URI the cross-replica `TailLog`
@@ -1414,88 +1470,23 @@ impl AppendDriver {
         let mut housekeeping_interval = tokio::time::interval(sessions::HEARTBEAT_INTERVAL);
         housekeeping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         housekeeping_interval.tick().await;
-        let mut last_inbound = tokio::time::Instant::now();
+        let mut clocks = IdleClocks::start();
 
         loop {
             tokio::select! {
-                msg = inbound.message() => match msg {
-                    Ok(Some(AppendLogRequest { msg: Some(append_log_request::Msg::Batch(b)) })) => {
-                        last_inbound = tokio::time::Instant::now();
-                        match self.session.accept(b) {
-                            Ok(AcceptOutcome::Accepted { cut_due }) => {
-                                if cut_due
-                                    && let Some(exit) = self.cut_while_due(ack_tx).await
-                                {
-                                    return exit;
-                                }
-                            }
-                            // Per-batch rejections: counted inside
-                            // `accept`, the stream stays open.
-                            Ok(AcceptOutcome::RejectedNonMonotone)
-                            | Ok(AcceptOutcome::RejectedOverflow)
-                            | Ok(AcceptOutcome::RejectedPastFinal)
-                            | Ok(AcceptOutcome::RejectedOversizedBatch) => {}
-                            // A replay of content the committed manifest
-                            // already covers (merged_bug_002's write-path
-                            // arm): nothing was buffered or charged, but
-                            // the lines ARE durable — ack them so the
-                            // builder's retransmit buffer trims instead
-                            // of waiting for a cut that will never carry
-                            // them. The ack value arrives pre-clamped to
-                            // the contiguous durable frontier
-                            // (merged_bug_005); `None` = no sound prefix
-                            // claim exists (line 0 is not durable), so
-                            // nothing is sent and the builder keeps its
-                            // copies. try_send: a missed ack just means
-                            // the next replay re-answers.
-                            // durable-ack: bind
-                            Ok(AcceptOutcome::CoveredReplay { durable_through }) => {
-                                // durable-ack: bind
-                                if let Some(durable_through_line) = durable_through {
-                                    ack_try_send(
-                                        ack_tx,
-                                        Ok(AppendLogAck {
-                                            // durable-ack: forward
-                                            durable_through_line,
-                                            open_coverage_next_line: None,
-                                        }),
-                                    );
-                                }
-                            }
-                            // Stream-fatal (the per-execution byte
-                            // cap — accept()'s ONLY Err construction,
-                            // census-pinned). A REFUSAL on a healthy
-                            // replica: the accepted under-cap tail
-                            // drains before this trailer.
-                            Err(status) => return LoopExit::AbortRefusesInput(status),
-                        }
+                msg = inbound.message() => {
+                    if let Some(exit) = self.on_inbound(msg, ack_tx, &mut clocks).await {
+                        return exit;
                     }
-                    Ok(Some(AppendLogRequest { msg: Some(append_log_request::Msg::Header(_)) })) => {
-                        // A protocol violation, refused while the
-                        // replica is healthy: accepted lines drain.
-                        return LoopExit::AbortRefusesInput(Status::invalid_argument(
-                            "AppendLog: duplicate header (the stream's identity is set once)",
-                        ));
-                    }
-                    // An empty oneof: a client bug or a future field this
-                    // version doesn't know. Ignore rather than abort —
-                    // forward compatibility for a new request variant.
-                    // It IS inbound traffic, though: liveness evidence
-                    // for the idle-abort law, same as any frame.
-                    Ok(Some(AppendLogRequest { msg: None })) => {
-                        last_inbound = tokio::time::Instant::now();
-                    }
-                    // Clean half-close: the builder is done.
-                    Ok(None) => return LoopExit::ClientFinished,
-                    // Transport error: the builder is gone (or the
-                    // connection broke). Nothing to tell it.
-                    Err(status) => {
-                        debug!(error = %status, "AppendLog: inbound stream error");
-                        return LoopExit::ClientFinished;
-                    }
-                },
+                }
                 _ = cut_interval.tick() => {
-                    if let Some(exit) = self.cut_once_if_nonempty(ack_tx).await {
+                    let outcome = self.cut_once_if_nonempty(ack_tx).await;
+                    // The cut attempt occupied this loop regardless of
+                    // outcome: stamp self-activity so the idle gate
+                    // never blames the peer for a window the enforcer
+                    // spent on its own work (bug_020).
+                    clocks.last_self_activity = tokio::time::Instant::now();
+                    if let Some(exit) = outcome {
                         return exit;
                     }
                     // A wedged cut future is abandoned (and counted) by
@@ -1558,6 +1549,36 @@ impl AppendDriver {
                     }
                 }
                 _ = housekeeping_interval.tick() => {
+                    // Drain ready inbound frames BEFORE the idle
+                    // predicate is consulted (bug_020): the predicate's
+                    // evidence is the peer's CONDUCT, and frames the
+                    // peer already sent — queued unread while this loop
+                    // sat inside a slow in-arm cut — are arrival
+                    // evidence the abort decision must see. Bounded
+                    // (the gate needs one fresh arrival, not a full
+                    // catch-up; the next loop iteration keeps reading),
+                    // and each drained frame runs the SAME handler the
+                    // inbound arm runs, exits included.
+                    // r[impl store.log.arrival-clock]
+                    let mut drained = 0u32;
+                    while drained < INBOUND_DRAIN_CAP {
+                        match tokio::time::timeout(
+                            std::time::Duration::ZERO,
+                            inbound.message(),
+                        )
+                        .await
+                        {
+                            Ok(msg) => {
+                                drained += 1;
+                                if let Some(exit) =
+                                    self.on_inbound(msg, ack_tx, &mut clocks).await
+                                {
+                                    return exit;
+                                }
+                            }
+                            Err(_not_ready) => break,
+                        }
+                    }
                     // A silently-vanished builder (the pod was SIGKILLed,
                     // a netsplit ate the FIN) leaves this stream mute
                     // forever while the lease heartbeats keep renewing
@@ -1569,24 +1590,31 @@ impl AppendDriver {
                     // committable lines staged with zero buffer bytes,
                     // and aborting then would destroy what the next
                     // cut's restore_in_flight retries; merged_bug_144)
-                    // and inbound silence past four heartbeats, abort:
-                    // nothing accepted can be lost, and a CONFORMANT
-                    // peer cannot trip this arm — the bilateral
-                    // contract (rio_common::liveness) obliges any
-                    // client parked on an open, nothing-pending session
-                    // to emit keepalive batches well inside the bound
-                    // (the builder uploader's empty-batch arm; the
-                    // dashboard test's grpcurl writer is its own
-                    // producer). No transport-layer input reaches this
-                    // arm — h2 PINGs vouch for the CONNECTION, not the
-                    // stream's producer, which is exactly why the law
-                    // needs an application-layer producer side. The
+                    // and BOTH gate clocks stale past four heartbeats
+                    // (arrival AND self-activity — `idle_trip_due`
+                    // names the denomination), abort: nothing accepted
+                    // can be lost, and a CONFORMANT peer cannot trip
+                    // this arm — the bilateral contract
+                    // (rio_common::liveness) obliges any client parked
+                    // on an open, nothing-pending session to emit
+                    // keepalive batches well inside the bound (the
+                    // builder uploader's empty-batch arm; the dashboard
+                    // test's grpcurl writer is its own producer), the
+                    // drain above makes queued keepalives visible, and
+                    // the self-activity conjunct keeps the enforcer's
+                    // own cut stall from masquerading as peer silence.
+                    // No transport-layer input reaches this arm — h2
+                    // PINGs vouch for the CONNECTION, not the stream's
+                    // producer, which is exactly why the law needs an
+                    // application-layer producer side. The
                     // pending-lines case is covered by the bounded ack
                     // send on the cut path, not this arm.
                     // r[impl store.log.ingest-idle-abort+2]
-                    if self.session.no_pending_lines()
-                        && last_inbound.elapsed() >= INBOUND_IDLE_BOUND
-                    {
+                    if idle_trip_due(
+                        self.session.no_pending_lines(),
+                        clocks.last_drained_arrival.elapsed(),
+                        clocks.last_self_activity.elapsed(),
+                    ) {
                         metrics::counter!(
                             "rio_store_log_ingest_streams_aborted_total",
                             "reason" => "inbound_idle"
@@ -1623,6 +1651,114 @@ impl AppendDriver {
                         self.session.set_final_line_count(n.max(0) as u64);
                     }
                 }
+            }
+        }
+    }
+
+    /// One inbound stream item, exactly as the drive loop's inbound
+    /// arm consumes it — factored so the housekeeping arm's pre-
+    /// predicate drain (bug_020) treats a queued frame IDENTICALLY to
+    /// a selected one: same accept pipeline, same acks, same exits,
+    /// same clock stamps. `Some(exit)` ends the stream.
+    ///
+    /// Clock duties: every drained frame (batch or empty oneof)
+    /// stamps `last_drained_arrival` — the peer's conduct, made
+    /// visible at the moment this loop actually drains it; a cut
+    /// performed inside the batch arm stamps `last_self_activity`
+    /// when it completes — the enforcer's own occupancy, which the
+    /// idle gate must never bill to the peer.
+    async fn on_inbound(
+        &mut self,
+        msg: Result<Option<AppendLogRequest>, Status>,
+        ack_tx: &mpsc::Sender<Result<AppendLogAck, Status>>,
+        clocks: &mut IdleClocks,
+    ) -> Option<LoopExit> {
+        match msg {
+            Ok(Some(AppendLogRequest {
+                msg: Some(append_log_request::Msg::Batch(b)),
+            })) => {
+                clocks.last_drained_arrival = tokio::time::Instant::now();
+                match self.session.accept(b) {
+                    Ok(AcceptOutcome::Accepted { cut_due }) => {
+                        if cut_due {
+                            let exit = self.cut_while_due(ack_tx).await;
+                            // The in-arm cut occupied this loop for up
+                            // to one watchdog bound plus a bounded ack
+                            // send: self-activity, never peer silence
+                            // (bug_020).
+                            clocks.last_self_activity = tokio::time::Instant::now();
+                            if let Some(exit) = exit {
+                                return Some(exit);
+                            }
+                        }
+                    }
+                    // Per-batch rejections: counted inside
+                    // `accept`, the stream stays open.
+                    Ok(AcceptOutcome::RejectedNonMonotone)
+                    | Ok(AcceptOutcome::RejectedOverflow)
+                    | Ok(AcceptOutcome::RejectedPastFinal)
+                    | Ok(AcceptOutcome::RejectedOversizedBatch) => {}
+                    // A replay of content the committed manifest
+                    // already covers (merged_bug_002's write-path
+                    // arm): nothing was buffered or charged, but
+                    // the lines ARE durable — ack them so the
+                    // builder's retransmit buffer trims instead
+                    // of waiting for a cut that will never carry
+                    // them. The ack value arrives pre-clamped to
+                    // the contiguous durable frontier
+                    // (merged_bug_005); `None` = no sound prefix
+                    // claim exists (line 0 is not durable), so
+                    // nothing is sent and the builder keeps its
+                    // copies. try_send: a missed ack just means
+                    // the next replay re-answers.
+                    // durable-ack: bind
+                    Ok(AcceptOutcome::CoveredReplay { durable_through }) => {
+                        // durable-ack: bind
+                        if let Some(durable_through_line) = durable_through {
+                            ack_try_send(
+                                ack_tx,
+                                Ok(AppendLogAck {
+                                    // durable-ack: forward
+                                    durable_through_line,
+                                    open_coverage_next_line: None,
+                                }),
+                            );
+                        }
+                    }
+                    // Stream-fatal (the per-execution byte
+                    // cap — accept()'s ONLY Err construction,
+                    // census-pinned). A REFUSAL on a healthy
+                    // replica: the accepted under-cap tail
+                    // drains before this trailer.
+                    Err(status) => return Some(LoopExit::AbortRefusesInput(status)),
+                }
+                None
+            }
+            Ok(Some(AppendLogRequest {
+                msg: Some(append_log_request::Msg::Header(_)),
+            })) => {
+                // A protocol violation, refused while the
+                // replica is healthy: accepted lines drain.
+                Some(LoopExit::AbortRefusesInput(Status::invalid_argument(
+                    "AppendLog: duplicate header (the stream's identity is set once)",
+                )))
+            }
+            // An empty oneof: a client bug or a future field this
+            // version doesn't know. Ignore rather than abort —
+            // forward compatibility for a new request variant.
+            // It IS inbound traffic, though: liveness evidence
+            // for the idle-abort law, same as any frame.
+            Ok(Some(AppendLogRequest { msg: None })) => {
+                clocks.last_drained_arrival = tokio::time::Instant::now();
+                None
+            }
+            // Clean half-close: the builder is done.
+            Ok(None) => Some(LoopExit::ClientFinished),
+            // Transport error: the builder is gone (or the
+            // connection broke). Nothing to tell it.
+            Err(status) => {
+                debug!(error = %status, "AppendLog: inbound stream error");
+                Some(LoopExit::ClientFinished)
             }
         }
     }
@@ -3045,6 +3181,28 @@ mod tests {
             !liveness_census_violations(&planted2).is_empty(),
             "the census must refuse a second spawn_heartbeat site"
         );
+
+        // The arrival-clock ordering pin (bug_020,
+        // store.log.arrival-clock): the housekeeping arm DRAINS ready
+        // inbound before the idle predicate is consulted — queued
+        // keepalives are arrival evidence the abort decision must
+        // see. Needles built at runtime; the order is positional in
+        // the stripped production text (drain strictly before the
+        // predicate consult).
+        let drain_needle = format!("Duration::ZERO,inbound.{}()", "message");
+        let predicate_needle = format!("{}(self.session.no_pending_lines()", "idle_trip_due");
+        let drain_at = src
+            .find(&drain_needle)
+            .expect("the housekeeping pre-predicate drain exists");
+        let predicate_at = src
+            .find(&predicate_needle)
+            .expect("the two-clock idle predicate consult exists");
+        assert!(
+            drain_at < predicate_at,
+            "the inbound drain must precede the idle predicate in the \
+             housekeeping arm (drain at {drain_at}, predicate at \
+             {predicate_at})"
+        );
     }
 
     /// The abort-disposition census predicate (merged_bug_144): every
@@ -3205,6 +3363,64 @@ mod tests {
         assert_eq!(INBOUND_IDLE_BOUND, sessions::HEARTBEAT_INTERVAL * 4);
     }
 
+    // r[verify store.log.arrival-clock]
+    /// W12-D/W12-D2 at the predicate tier (bug_020): the trip demands
+    /// BOTH clocks stale. The strawman single-axis predicate (the
+    /// pre-fix `last_inbound.elapsed() >= BOUND` — read-progress
+    /// standing in for arrival) trips on the exact cell the law
+    /// protects: arrival stale only because the enforcer's own cut
+    /// occupied the loop, self-activity fresh at the cut's
+    /// completion. The end-to-end wiring face is
+    /// `idle_gate_reads_arrival_not_read_progress` (ignored, real
+    /// time); the drain-before-predicate ordering is census-pinned in
+    /// `drive_loop_liveness_census`.
+    #[test]
+    fn idle_trip_demands_both_clocks_stale() {
+        let bound = INBOUND_IDLE_BOUND;
+        let fresh = std::time::Duration::from_secs(1);
+        let stale = bound + std::time::Duration::from_secs(1);
+
+        // The protected cell (W12-D): the enforcer just finished its
+        // own cut — self-activity fresh — so the trip must refuse no
+        // matter how stale arrival looks. The strawman single-axis
+        // predicate (`arrival >= bound` alone) fires here: that IS
+        // the recorded e2e red ("aborted 42ms after its last queued
+        // keepalive").
+        assert!(
+            !idle_trip_due(true, stale, fresh),
+            "a fresh self-activity stamp must veto the trip (the enforcer's \
+             own stall is not peer silence)"
+        );
+        assert!(
+            stale >= bound,
+            "strawman: the single-axis read-progress predicate trips on this \
+             cell — the pre-fix shape"
+        );
+
+        // The true positive (W12-D2): both axes stale trips at the
+        // bound — the gate is not weakened beyond the disclosed
+        // budget.
+        assert!(
+            idle_trip_due(true, stale, stale),
+            "a genuinely silent peer with an idle enforcer must trip"
+        );
+        assert!(
+            idle_trip_due(true, bound, bound),
+            "the trip fires at exactly the bound (closed boundary)"
+        );
+
+        // Pending lines always defer (merged_bug_144's face, carried).
+        assert!(
+            !idle_trip_due(false, stale, stale),
+            "pending lines defer the abort regardless of the clocks"
+        );
+        // Fresh arrival defers regardless of self-activity age.
+        assert!(
+            !idle_trip_due(true, fresh, stale),
+            "fresh arrival evidence must veto the trip"
+        );
+    }
+
     /// A chunk store whose `put` parks until the test releases it: the
     /// healthy-but-slow S3 PUT face (bug_148). `get`/`delete_batch`
     /// pass through. Permits are added by the test to release parked
@@ -3273,6 +3489,141 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("session row exists")
+    }
+
+    // r[verify store.log.arrival-clock]
+    /// W12-D + W12-D2 (bug_020), the end-to-end face: the inbound-idle
+    /// gate is denominated in ARRIVAL evidence for the abort decision,
+    /// gated by the enforcer's self-activity stamp — a slow-but-
+    /// successful cut must never get a healthy stream aborted while
+    /// the peer's keepalives sit queued unread (W12-D), and a
+    /// genuinely silent peer still trips at `INBOUND_IDLE_BOUND` from
+    /// `max(last-drained-arrival, last-self-activity)` — within the
+    /// disclosed delay budget of one cut occupancy past last arrival
+    /// (W12-D2: the gate is not weakened beyond that budget).
+    ///
+    /// Schedule: the batch at t0 parks the cut (gated PUT, watchdog
+    /// far above); keepalives at ~t0+20/40/60 sit QUEUED while the
+    /// driver is inside the arm; release at ~t0+65. Pre-fix RED: the
+    /// first housekeeping tick after release reads
+    /// `last_inbound = t0` (read-time, 65 s stale > 60 s bound),
+    /// no-pending holds post-ack, and the healthy conformant stream
+    /// aborts `inbound_idle` with three keepalives in the channel.
+    /// Post-fix: the tick drains the queued keepalives (arrival
+    /// refreshed) and the cut completion stamped self-activity — the
+    /// stream survives; then TOTAL silence trips the abort at the
+    /// stated two-clock bound, asserted to arrive only after a full
+    /// `INBOUND_IDLE_BOUND` past the last drained keepalive.
+    ///
+    /// `#[ignore]`: ~2.5 min of real time (`INBOUND_IDLE_BOUND` is a
+    /// const; the W10-BC precedent). Run manually:
+    /// `cargo nextest run -p rio-store -E 'test(idle_gate_reads_arrival)' \
+    ///  --run-ignored all`. The gate-time enforcement of the same law
+    /// is structural: `idle_trip_due`'s unit cells plus the
+    /// drain-before-predicate census needle in
+    /// `drive_loop_liveness_census`.
+    #[tokio::test]
+    #[ignore = "~2.5min real time (INBOUND_IDLE_BOUND is a const); run with --run-ignored all"]
+    async fn idle_gate_reads_arrival_not_read_progress() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let chunk_store = Arc::new(GatedChunkStore::new());
+        let exec = seed_assignment(&db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+
+        let svc = LogServiceImpl::new(
+            db.pool.clone(),
+            Arc::clone(&chunk_store) as Arc<dyn LogChunkStore>,
+            "test-pod".to_string(),
+        )
+        .with_hmac_verifier(Arc::new(HmacVerifier::from_key(TEST_KEY.to_vec())))
+        .with_ingest_config(IngestConfig {
+            // A few hundred bytes trip the size-triggered cut.
+            cut_threshold_bytes: 64,
+            // The cut watchdog: far above the parked window so the
+            // slow-but-healthy PUT is never abandoned.
+            cut_interval: std::time::Duration::from_secs(300),
+            ..IngestConfig::default()
+        });
+        let router = Server::builder().add_service(LogServiceServer::new(svc));
+        let (addr, server) = spawn_grpc_server(router).await;
+        let mut client = LogServiceClient::connect(format!("http://{addr}"))
+            .await
+            .expect("connect");
+
+        let (tx, mut acks) = open_append(&mut client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open");
+
+        // t0: the batch crosses the cut threshold; the driver enters
+        // its in-arm cut and parks inside the gated PUT.
+        let t0 = std::time::Instant::now();
+        tx.send(batch_msg(0, &["x".repeat(80).as_str()]))
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            if chunk_store.parked_now() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(chunk_store.parked_now(), 1, "the cut's PUT is parked");
+
+        // The conformant peer keeps speaking: three empty keepalive
+        // batches while the driver is parked inside the arm — they sit
+        // queued unread (the exact starvation population).
+        for _ in 0..3 {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            tx.send(batch_msg(1, &[])).await.unwrap();
+        }
+        // ~t0+65: release the PUT; the cut commits and acks.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert!(
+            t0.elapsed() > INBOUND_IDLE_BOUND,
+            "the park outlasted the idle bound (the read-time clock is stale)"
+        );
+        chunk_store.release_one();
+        let last_keepalive = std::time::Instant::now();
+
+        // The cut ack proves the slow PUT was healthy. After it, the
+        // stream must SURVIVE the post-release housekeeping ticks
+        // (pre-fix RED: the next tick aborts `inbound_idle` despite
+        // the queued keepalives), then trip on genuine silence no
+        // earlier than a full bound past the last drained keepalive.
+        let mut aborted_at: Option<std::time::Duration>;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
+        loop {
+            let next =
+                tokio::time::timeout(std::time::Duration::from_secs(5), acks.message()).await;
+            match next {
+                Ok(Ok(Some(_ack))) => continue, // the cut ack (and any duplicates)
+                Ok(Ok(None)) => panic!("the server half-closed without a status"),
+                Ok(Err(status)) => {
+                    assert_eq!(status.code(), tonic::Code::Aborted, "{status:?}");
+                    assert!(
+                        status.message().contains("no inbound traffic"),
+                        "the trip must be the idle abort, got: {status:?}"
+                    );
+                    aborted_at = Some(last_keepalive.elapsed());
+                    break;
+                }
+                Err(_elapsed) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "no idle abort within 150 s of silence — the true-positive \
+                         face is lost (W12-D2)"
+                    );
+                }
+            }
+        }
+        let aborted_at = aborted_at.unwrap();
+        assert!(
+            aborted_at >= INBOUND_IDLE_BOUND,
+            "W12-D red: the healthy conformant stream was aborted {aborted_at:?} \
+             after its last queued keepalive — inside the idle bound \
+             ({INBOUND_IDLE_BOUND:?}): the gate read the enforcer's own read \
+             progress, not arrival evidence"
+        );
+        server.abort();
     }
 
     /// W10-BC (bug_148), the end-to-end face: a HEALTHY chunk PUT that

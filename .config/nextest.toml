@@ -103,6 +103,17 @@ test-group = 'postgres'
 slow-timeout = { period = "900s", terminate-after = 8 }
 
 [[profile.default.overrides]]
+# The idle-gate arrival-clock e2e (bug_020) spans a >60s parked cut,
+# a queued-keepalive drain, and a full INBOUND_IDLE_BOUND of genuine
+# silence by design (~4min). It is #[ignore]d (only runs via
+# --run-ignored) and PG-backed, so it needs the postgres group plus a
+# timeout above the regular budget. Listed before the generic
+# rio-store override so the longer timeout wins.
+filter = 'package(rio-store) and test(/idle_gate_reads_arrival/)'
+test-group = 'postgres'
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+[[profile.default.overrides]]
 # binary(grpc) alone missed ~109 lib unit tests (gc::, metadata::,
 # cache_server::, signing::, content_index::, realisations::,
 # grpc::put_path::, grpc::admin::) that also use TestDb. Those ran in

@@ -2817,6 +2817,32 @@ replay (merged_bug_007). The R29 form: the envelope is denominated in
 the consumer's execution domain --- the abort predicate consumes
 "progress stalled", so the clock must measure progress.
 
+#r("store.log.arrival-clock")[
+  Liveness gates on peer conduct MUST read arrival evidence for the
+  abort decision --- frames the peer has already sent, drained and
+  stamped at the gate's own consult, never the enforcer's read
+  progress standing in for it. An explicit self-activity conjunct that
+  only DELAYS a trip (masking the enforcer's own stall so it cannot
+  masquerade as peer silence) is PERMITTED and MUST be named in the
+  gate's documentation together with the resulting delay budget.
+]
+
+The inbound-idle gate (bug_020) is the founding instance: `last_inbound`
+stamped only at application reads while each in-arm cut legally occupies
+up to one watchdog bound plus a bounded ack send, so a slow-but-
+successful cut starved reads past the bound with a conformant builder's
+keepalives sitting queued unread --- the documented "a CONFORMANT peer
+cannot trip this arm" was falsified by the enforcer's own occupancy. The
+post-fix clock is honestly two-axis, `max(last-drained-arrival,
+last-self-activity)`: the housekeeping arm drains ready inbound before
+the predicate (arrival truth made visible) and cut completions stamp
+self-activity. The disclosed delay budget: under slow-cut-then-silence
+the trip lands at most one cut occupancy past last arrival plus the idle
+bound --- never earlier, and a genuinely silent peer with an idle
+enforcer trips at exactly the bound. A wave-10 fix had diagnosed this
+same cut-latency starvation and relocated only the lease heartbeat ---
+the cured-one-consumer shape this rule's census face exists to refuse.
+
 #r("store.log.ingest-idle-abort+2")[
   The log-ingest liveness law is bilateral. An AppendLog client whose
   session is open with an empty buffer MUST emit an empty keepalive
