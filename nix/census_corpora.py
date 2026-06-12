@@ -660,9 +660,14 @@ def check_duration_census(src_root, mint=False):
         )
     for crate_src in crate_roots:
         n_before = len(files)
+        # WO-S8-6 (bug_152): test-code membership decided ONCE by the
+        # shared module-graph resolver -- per-scanner path conventions
+        # are dead (a sibling-file test module gated at the parent
+        # `mod` declaration is excluded BY DERIVATION).
+        test_files = rust_strip.cfg_test_reachable_files(crate_src)
         for f in sorted(crate_src.rglob("*.rs")):
             rel = str(f.relative_to(src_root))
-            if "/tests/" in rel or rel.endswith("test_helpers.rs"):
+            if f.relative_to(crate_src).as_posix() in test_files:
                 continue
             files.append((rel, f.read_text()))
         if len(files) == n_before:
@@ -948,9 +953,11 @@ def check_exit_edge_census(src_root, mint=False):
             )
             continue
         n_before = len(files)
+        # WO-S8-6 (bug_152): the shared resolver decides membership.
+        test_files = rust_strip.cfg_test_reachable_files(croot)
         for f in sorted(croot.rglob("*.rs")):
             rel = str(f.relative_to(src_root))
-            if "/tests/" in rel or rel.endswith("test_helpers.rs"):
+            if f.relative_to(croot).as_posix() in test_files:
                 continue
             files.append((rel, f.read_text()))
         if len(files) == n_before:
@@ -1550,6 +1557,33 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+    # W12-BD (WO-S8-6): a sibling-file test module gated at the PARENT
+    # mod declaration is excluded from the census population BY
+    # DERIVATION (red pre-fix: the path conventions enrolled it and
+    # its constants sat undischargeable in the shrink-only ledger).
+    with tempfile.TemporaryDirectory() as td:
+        straw_root = pathlib.Path(td)
+        (straw_root / "rio-straw" / "src").mkdir(parents=True)
+        (straw_root / "rio-straw" / "Cargo.toml").write_text("[package]\n")
+        (straw_root / "rio-straw" / "src" / "lib.rs").write_text(
+            "#[cfg(test)]\nmod mbt_tests;\npub fn live() {}\n"
+        )
+        (straw_root / "rio-straw" / "src" / "mbt_tests.rs").write_text(
+            "const MODEL_TTL_SECS: u64 = 9;\n"
+        )
+        f_bd = check_duration_census(straw_root)
+        if any("MODEL_TTL_SECS" in x for x in f_bd):
+            print(f"FAIL: W12-BD — a parent-gated sibling test module enrolled as production: {f_bd}", file=sys.stderr)
+            return 1
+        # … and the UNGATED sibling stays production (the boundary's
+        # other side): the same const in a plain module is a red.
+        (straw_root / "rio-straw" / "src" / "lib.rs").write_text(
+            "mod mbt_tests;\npub fn live() {}\n"
+        )
+        f_bd = check_duration_census(straw_root)
+        if not any("MODEL_TTL_SECS" in x and "no census row" in x for x in f_bd):
+            print(f"FAIL: W12-BD — the ungated sibling did not stay production: {f_bd}", file=sys.stderr)
+            return 1
     # … a cfg(test)-gated constant stays OUT of the census population.
     gated = "#[cfg(test)]\nconst FAKE_TTL_SECS: u64 = 1;\nfn live() {}\n"
     if duration_finder([("planted/gated.rs", gated)]):
@@ -1687,14 +1721,17 @@ def main() -> int:
         if not any(x.startswith("mint refused:") for x in f_floor):
             print(f"FAIL: W12-BA — the exit-edge mint guard accepted a vacuous population: {f_floor}", file=sys.stderr)
             return 1
-        # … and a crate dir with zero production files (not merely a
-        # missing dir) trips the per-root file floor.
-        (empty_root / "rio-onlytests" / "src" / "tests").mkdir(parents=True)
-        (empty_root / "rio-onlytests" / "Cargo.toml").write_text("[package]\n")
-        (empty_root / "rio-onlytests" / "src" / "tests" / "t.rs").write_text("fn t() {}\n")
+        # … and a crate dir that stages src/ with zero .rs files (not
+        # merely a missing dir) trips the per-root file floor. (Under
+        # the WO-S8-6 resolver an UNDECLARED .rs file is production —
+        # fail-closed — so the old tests-only-subdir shape no longer
+        # vacates a crate; zero-.rs staging is the vacuity face.)
+        (empty_root / "rio-onlyassets" / "src").mkdir(parents=True)
+        (empty_root / "rio-onlyassets" / "Cargo.toml").write_text("[package]\n")
+        (empty_root / "rio-onlyassets" / "src" / "data.txt").write_text("x\n")
         f_floor = check_duration_census(empty_root)
         if not any("zero production .rs" in x for x in f_floor):
-            print(f"FAIL: W12-BA — a tests-only crate did not trip the file floor: {f_floor}", file=sys.stderr)
+            print(f"FAIL: W12-BA — a zero-rs crate did not trip the file floor: {f_floor}", file=sys.stderr)
             return 1
     # --- W12-BB (WO-S8-4): the census population equals the stated
     # jurisdiction BY DERIVATION. The strawman hand-list (the wave-9
@@ -1810,16 +1847,16 @@ def main() -> int:
             )
             continue
         n_before = len(refusal_files)
+        # Production folds only: test FILES are excluded by the shared
+        # module-graph resolver (WO-S8-6 -- one membership decision
+        # for every census; the old path conventions missed
+        # parent-gated sibling files); in-file cfg(test) items are
+        # pruned ATTRIBUTE-POSITION inside scan_refusal_folds
+        # (rust_strip.strip_cfg_test, merged_bug_009).
+        test_files = rust_strip.cfg_test_reachable_files(croot)
         for f in sorted(croot.rglob("*.rs")):
             rel = str(f.relative_to(src_root))
-            # Production folds only: test dirs and in-file test mods
-            # assert specific codes lawfully (the adjudication law
-            # governs production classification sites). In-file
-            # cfg(test) items are pruned ATTRIBUTE-POSITION inside
-            # scan_refusal_folds (rust_strip.strip_cfg_test) — the
-            # old truncate-at-first-marker walk left everything after
-            # an early test module unswept (merged_bug_009).
-            if "/tests/" in rel or rel.endswith("test_helpers.rs"):
+            if f.relative_to(croot).as_posix() in test_files:
                 continue
             refusal_files.append((rel, f.read_text()))
         if len(refusal_files) == n_before:

@@ -7,7 +7,6 @@ rio-builder/src/fuse/circuit.rs	DEFAULT_AUTO_CLOSE
 rio-builder/src/fuse/circuit.rs	DEFAULT_WALL_CLOCK_TRIP
 rio-builder/src/fuse/fetch/mod.rs	WAIT_SLICE
 rio-builder/src/fuse/fetch/mod.rs	WAIT_SLOP
-rio-builder/src/fuse/fetch/tests.rs	TEST_FETCH_TIMEOUT
 rio-builder/src/hw_bench.rs	IOSEQ_TARGET_SECS
 rio-builder/src/hw_bench.rs	REF_ALU_SECS
 rio-builder/src/hw_class.rs	POLL_BOUND
@@ -104,8 +103,6 @@ rio-lease/src/lib.rs	RENEW_SLOP
 rio-lease/src/lib.rs	SELF_FENCE_AFTER
 rio-lease/src/lib.rs	SHUTDOWN_EPILOGUE_BUDGET
 rio-lease/src/lib.rs	STEAL_AFTER
-rio-lease/src/mbt_tests.rs	MODEL_DEADLINE_TICKS
-rio-lease/src/mbt_tests.rs	TICK
 rio-migrations/src/migrate.rs	POLL_INTERVAL
 rio-nix/src/nar/fs.rs	CANON_MTIME_SECS
 rio-proto/src/client/balance.rs	DEFAULT_PROBE_INTERVAL
@@ -169,7 +166,6 @@ rio-store/src/grpc/put_path/common.rs	BUDGET_WAIT_GRACE
 rio-store/src/ingest.rs	PLACEHOLDER_HEARTBEAT_INTERVAL
 rio-store/src/ingest.rs	PLACEHOLDER_HEARTBEAT_TICK
 rio-store/src/logs/ingest.rs	DEFAULT_CUT_INTERVAL
-rio-store/src/logs/mbt_tests.rs	RETENTION
 rio-store/src/logs/service.rs	INBOUND_IDLE_BOUND
 rio-store/src/logs/service.rs	PROXY_CONNECT_TIMEOUT
 rio-store/src/logs/service.rs	PROXY_OPEN_TIMEOUT

@@ -960,6 +960,109 @@ def cfg_test_attr_spans(text: str, source: str = "<input>"):
     ]
 
 
+# --- the cfg(test)-reachability resolver (WO-S8-6, bug_152, OQ-13) ----
+#
+# Test-code FILE membership is decided ONCE, from the module graph --
+# never re-decided per scanner by path convention. The old per-scanner
+# filename lists (`/tests/` dirs, `test_helpers.rs`, `tests.rs`,
+# `*_tests.rs`) could not see a sibling-file test module whose
+# `#[cfg(test)]` lives on the PARENT `mod` declaration (per-file
+# strip_cfg_test cannot either -- the gate is in the parent file), so
+# `mbt_tests.rs`-class files enrolled as production rows and sat
+# undischargeable in shrink-only grandfathers. The derivation: per
+# crate-src tree, parse every file's `mod NAME;` declarations from the
+# LEXED text; a declaration blanked by strip_cfg_test is test-gated
+# (one classification source -- the pruner itself); a file named by a
+# gated declaration, or declared FROM a test-reachable file, is
+# test-reachable (transitive). RECORDED HOME: this module -- the
+# shared exact lexer every scanner already imports (one grammar, one
+# place; OQ-13's "the slot RECORDS which" duty).
+_MOD_DECL = re.compile(r"(?:^|[;{}\n])\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;")
+
+
+def _mod_decl_dir(rel: str) -> str:
+    """Directory (POSIX rel, '' = crate-src root) a file's `mod x;`
+    declarations resolve in: mod.rs/lib.rs/main.rs declare siblings;
+    a 2018-style `foo.rs` declares into `foo/`."""
+    parts = rel.split("/")
+    name = parts[-1]
+    if name in ("mod.rs", "lib.rs", "main.rs"):
+        return "/".join(parts[:-1])
+    return "/".join(parts[:-1] + [name[: -len(".rs")]])
+
+
+_RESOLVER_CACHE: dict = {}
+
+
+def cfg_test_reachable_files(crate_src):
+    """The ONE resolver (bug_152): the set of .rs files (POSIX paths
+    relative to `crate_src`) reachable only through cfg(test)-gated
+    `mod` declarations. Files the graph never names stay PRODUCTION
+    (scanning more is the bans' fail-closed direction; a duration or
+    exit-edge row in such a file is honest debt, not a false
+    enrollment).
+
+    Memoized per (path, stat-signature): the three census walks
+    resolve the same crates in one process; the signature keeps the
+    cache honest under selftest fixtures that rewrite a path."""
+    import pathlib
+
+    crate_src = pathlib.Path(crate_src)
+    sig = (
+        str(crate_src.resolve()),
+        tuple(
+            (f.relative_to(crate_src).as_posix(), st.st_size, st.st_mtime_ns)
+            for f in sorted(crate_src.rglob("*.rs"))
+            for st in (f.stat(),)
+        ),
+    )
+    cached = _RESOLVER_CACHE.get(sig)
+    if cached is not None:
+        return cached
+    decls = {}  # parent rel -> [(child rel, gated)]
+    rels = []
+    for f in sorted(crate_src.rglob("*.rs")):
+        rels.append(f.relative_to(crate_src).as_posix())
+    rel_set = set(rels)
+    for rel in rels:
+        text = (crate_src / rel).read_text(encoding="utf-8")
+        lexed, _ = lex(text, blank_string_bodies=True)
+        try:
+            pruned_text = strip_cfg_test(text, source=rel)
+        except StripError:
+            # The pruner's consumers fail closed on their own scans;
+            # for the graph an unclassifiable file contributes no
+            # gated edges (its own membership is its parents' call).
+            pruned = lexed
+        else:
+            pruned, _ = lex(pruned_text, blank_string_bodies=True)
+        live = {m.group(1) for m in _MOD_DECL.finditer(pruned)}
+        edges = []
+        d = _mod_decl_dir(rel)
+        for m in _MOD_DECL.finditer(lexed):
+            name = m.group(1)
+            for cand in (
+                f"{d}/{name}.rs" if d else f"{name}.rs",
+                f"{d}/{name}/mod.rs" if d else f"{name}/mod.rs",
+            ):
+                if cand in rel_set:
+                    edges.append((cand, name not in live))
+                    break
+        decls[rel] = edges
+    test_set = set()
+    changed = True
+    while changed:
+        changed = False
+        for parent, edges in decls.items():
+            parent_test = parent in test_set
+            for child, gated in edges:
+                if (gated or parent_test) and child not in test_set:
+                    test_set.add(child)
+                    changed = True
+    _RESOLVER_CACHE[sig] = test_set
+    return test_set
+
+
 CANONICAL_PIN = "nix/cfg-pruner-canonical.pin"
 
 
@@ -1453,6 +1556,31 @@ def selftest() -> str | None:
     port = cfg_pred_gates_test("any(all(test, unix), kani)")
     if table is not None or port is not True:
         return f"W11-BU (a): the one-sided spelling did not split the axes (table={table}, port={port})"
+    import pathlib as _pl
+    import tempfile as _tf
+
+    # --- WO-S8-6 (bug_152, W12-BD): the module-graph resolver -------
+    # The parent-mod plant vector: a sibling FILE whose #[cfg(test)]
+    # lives on the parent `mod` declaration is excluded BY DERIVATION
+    # (red pre-fix: path conventions enrolled it as production); an
+    # ungated sibling stays production; gating propagates through the
+    # graph (a file declared from a test file is test code).
+    with _tf.TemporaryDirectory() as _td:
+        _c = _pl.Path(_td) / "src"
+        (_c / "logs").mkdir(parents=True)
+        (_c / "lib.rs").write_text(
+            "mod logs;\n#[cfg(test)]\nmod mbt_tests;\nfn live() {}\n"
+        )
+        (_c / "mbt_tests.rs").write_text(
+            "mod helper_grid;\nconst FAKE_TTL_SECS: u64 = 1;\n"
+        )
+        (_c / "mbt_tests").mkdir()
+        (_c / "mbt_tests" / "helper_grid.rs").write_text("pub fn h() {}\n")
+        (_c / "logs" / "mod.rs").write_text("pub mod sweep;\n")
+        (_c / "logs" / "sweep.rs").write_text("pub fn s() {}\n")
+        got = cfg_test_reachable_files(_c)
+        if got != {"mbt_tests.rs", "mbt_tests/helper_grid.rs"}:
+            return f"W12-BD: resolver derivation wrong: {sorted(got)}"
     pinned = " ".join("fn cfg_pred_gates_test(ts: T) -> bool { real }".split())
     doctored = " ".join("fn cfg_pred_gates_test(ts: T) -> bool { DOCTORED }".split())
     if pinned == doctored:
@@ -1464,9 +1592,6 @@ def selftest() -> str | None:
     # `ValueError: not enough values to unpack (expected 2, got 1)`,
     # losing the crafted staging diagnostics at the moment they were
     # needed (selftest had zero parity_scan coverage).
-    import pathlib as _pl
-    import tempfile as _tf
-
     with _tf.TemporaryDirectory() as _td:
         _root = _pl.Path(_td)
         # Arm 1: the canonical surface not staged ((vvvvv)).

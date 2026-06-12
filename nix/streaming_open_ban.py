@@ -97,9 +97,12 @@ def strip_cfg_test_mods(stripped: str, source: str = "<input>") -> str:
     """Remove inline `#[cfg(test)] mod … { … }` blocks by brace
     matching (on already-string/comment-blanked text, so braces are
     real). `#[cfg(test)] mod x;` REFERENCES are left alone — the
-    referenced files are excluded by the /tests/ and naming rules; the
-    old scanner's fatal mistake was treating that reference as "test
-    code starts here" and truncating the rest of the file.
+    referenced files are excluded by the shared module-graph resolver
+    (rust_strip.cfg_test_reachable_files, WO-S8-6; the former naming
+    rules codified an assumption the parent-gated sibling-module face
+    falsified); the old scanner's fatal mistake was treating that
+    reference as "test code starts here" and truncating the rest of
+    the file.
 
     The attr recognizer is the SHARED spelling-aware one (WO-S8-2):
     every test-gating spelling shields its mod, and a file-scope
@@ -301,15 +304,15 @@ def main() -> int:
         croot = src_root / crate / "src"
         if not croot.is_dir():
             continue  # already a floor failure above
+        # WO-S8-6 (bug_152): test-code membership decided ONCE by the
+        # shared module-graph resolver (rust_strip) -- the old naming
+        # conventions (tests.rs / *_tests.rs / /tests/ dirs /
+        # test_helpers.rs) codified an assumption the parent-gated
+        # sibling-module face falsified; the resolver derives it.
+        test_files = rust_strip.cfg_test_reachable_files(croot)
         for f in sorted(croot.rglob("*.rs")):
             rel = str(f.relative_to(src_root))
-            # Test code is out of scope: /tests/ submodule dirs and
-            # test_helpers.rs are cfg(test)-compiled.
-            # merged_bug_110: cfg(test)-gated module FILES match
-            # neither exclusion above — tests.rs / *_tests.rs (the
-            # naming convention backing `#[cfg(test)] mod tests;` /
-            # `mod mbt_tests;` declarations) are test code.
-            if "/tests/" in rel or rel.endswith("test_helpers.rs") or f.name == "tests.rs" or f.name.endswith("_tests.rs"):
+            if f.relative_to(croot).as_posix() in test_files:
                 continue
             scanned += 1
             try:

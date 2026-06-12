@@ -39,12 +39,10 @@ rio-scheduler/src/sla/cost.rs	on-conflict-do-update	sla_observed_instance_types
 rio-scheduler/src/sla/mod.rs	on-conflict-do-nothing	sla_config_epoch
 rio-store/src/gc/collect.rs	on-conflict-do-nothing	shadow_swept
 rio-store/src/gc/drain.rs	const-family	MAX_ATTEMPTS
-rio-store/src/gc/mark_scan_bench.rs	on-conflict-do-nothing	live_chunks
 rio-store/src/grpc/mod.rs	const-family	DEFAULT_NAR_BUDGET
 rio-store/src/grpc/mod.rs	on-conflict-do-update	hw_perf_samples
 rio-store/src/grpc/put_path/common.rs	on-conflict-do-nothing	path_tenants
 rio-store/src/logs/ingest.rs	on-conflict-do-nothing	drv_log_chunks
-rio-store/src/logs/mbt_tests.rs	on-conflict-do-update	derivations
 rio-store/src/logs/sessions.rs	on-conflict-do-update	log_ingest_sessions
 rio-store/src/materialize/mod.rs	const-family	REPORT_RETRY_BUDGET
 rio-store/src/metadata/chunked.rs	on-conflict-do-update	chunks
