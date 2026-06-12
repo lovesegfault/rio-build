@@ -2275,7 +2275,7 @@ rec {
     # (acceptedTotal hits CAP via the at-least-once replay's
     # double-charge) — the cap conjuncts in the gate and the accept
     # guard are exercised, not vacuous.
-    # r[verify store.log.caps-durable]
+    # r[verify store.log.caps-durable+2]
     quint-log-service-witness-cap-boundary = mkQuintWitnessCheck {
       name = "log-service-witness-cap-boundary";
       spec = "logService";

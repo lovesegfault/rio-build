@@ -1132,6 +1132,171 @@ pub fn bounded_contiguous_prefix_len(
     len
 }
 
+// ============================================================================
+// The durable log account (merged_bug_002): two quantities, two algebras
+// ============================================================================
+
+/// One committed `drv_log_chunks` row as the account algebra sees it:
+/// the covered half-open interval `[first_line, first_line +
+/// line_count)`, its accounted bytes, and the `(session_id, chunk_seq)`
+/// tiebreak key (the uuid mapped to its big-endian `u128`, which orders
+/// exactly like PostgreSQL's uuid comparison).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountRow {
+    /// First covered line.
+    pub first_line: u64,
+    /// Covered line count (the interval is `[first_line, first_line +
+    /// line_count)`).
+    pub line_count: u64,
+    /// The row's accounted byte charge (`drv_log_chunks.accounted_bytes`).
+    pub accounted_bytes: u64,
+    /// `(session_id as u128, chunk_seq)` — the identical-interval
+    /// tiebreak: exactly one of two identical intervals survives, the
+    /// greater key.
+    pub key: (u128, u32),
+}
+
+impl AccountRow {
+    /// One past the last covered line.
+    fn end(&self) -> u64 {
+        self.first_line.saturating_add(self.line_count)
+    }
+}
+
+/// The four measured quantities of the durable caps law, one per
+/// (quantity × algebra) cell — the kernel-owned definition of what the
+/// gate's seed query measures (the R28 measure freeze: rio-store's
+/// `gate::log_seed` is differentially pinned against [`log_account`],
+/// and the kani proofs below pin the algebra laws).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogAccount {
+    /// Accounted bytes over MERGED coverage — idempotent union:
+    /// re-observing a covered interval adds zero.
+    pub merged_bytes: u64,
+    /// Row count over MERGED coverage — one survivor per covered
+    /// interval.
+    pub merged_chunks: u64,
+    /// Accounted bytes over ALL rows — monotone sum: every committed
+    /// row adds, forever.
+    pub raw_bytes: u64,
+    /// Row count over ALL rows — monotone sum.
+    pub raw_rows: u64,
+}
+
+/// The dual-axis account fold over a set of committed rows — the PURE
+/// mirror of the gate's seed SQL (`rio-store::logs::gate::log_seed`),
+/// total over every input.
+///
+/// A row is REDUNDANT (excluded from the merged pair) iff some OTHER
+/// row covers its interval AND is either strictly wider or (identical
+/// interval) orders after it by key — so exactly one row per covered
+/// interval survives. The raw pair is unconditioned: `Σ
+/// accounted_bytes` and the row count over the whole set.
+///
+/// Deliberately the direct O(n²) predicate, not a sweep: this fold is
+/// the differential-test oracle and the kani proof subject, never the
+/// production read (the gate's SQL is), so being obviously
+/// term-for-term equivalent to the SQL's `NOT EXISTS` beats being
+/// fast.
+pub fn log_account(rows: &[AccountRow]) -> LogAccount {
+    let mut acct = LogAccount {
+        merged_bytes: 0,
+        merged_chunks: 0,
+        raw_bytes: 0,
+        raw_rows: 0,
+    };
+    for (i, r) in rows.iter().enumerate() {
+        acct.raw_bytes = acct.raw_bytes.saturating_add(r.accounted_bytes);
+        acct.raw_rows = acct.raw_rows.saturating_add(1);
+        let redundant = rows.iter().enumerate().any(|(j, o)| {
+            j != i
+                && o.key != r.key
+                && o.first_line <= r.first_line
+                && o.end() >= r.end()
+                && (o.first_line < r.first_line || o.end() > r.end() || o.key > r.key)
+        });
+        if !redundant {
+            acct.merged_bytes = acct.merged_bytes.saturating_add(r.accounted_bytes);
+            acct.merged_chunks = acct.merged_chunks.saturating_add(1);
+        }
+    }
+    acct
+}
+
+/// The execution's durable covered line ranges, normalized: sorted,
+/// disjoint, adjacent-merged half-open spans. Built from the raw
+/// manifest intervals at stream open (the union over ALL rows equals
+/// the union over merged-surviving rows — pruned rows are contained —
+/// so the builder needs no dedup query).
+///
+/// Consumed by the ingest session's covered-replay consult
+/// (merged_bug_002's write-path arm: a batch FULLY inside durable
+/// coverage is dropped uncharged and un-written — it cannot mint
+/// objects, rows, or raw charge) and by the open-time coverage
+/// watermark (the contiguous prefix end).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoverageMap {
+    /// Sorted, disjoint, non-adjacent `[start, end)` spans.
+    spans: Vec<(u64, u64)>,
+}
+
+impl CoverageMap {
+    /// Normalize raw `(first_line, line_count)` intervals (any order,
+    /// overlaps and duplicates welcome) into the canonical span set.
+    /// Zero-length intervals contribute nothing.
+    pub fn from_intervals(intervals: impl IntoIterator<Item = (u64, u64)>) -> Self {
+        let mut raw: Vec<(u64, u64)> = intervals
+            .into_iter()
+            .filter(|&(_, count)| count > 0)
+            .map(|(first, count)| (first, first.saturating_add(count)))
+            .collect();
+        raw.sort_unstable();
+        let mut spans: Vec<(u64, u64)> = Vec::with_capacity(raw.len());
+        for (start, end) in raw {
+            match spans.last_mut() {
+                // Overlapping or exactly adjacent: extend.
+                Some((_, prev_end)) if start <= *prev_end => {
+                    *prev_end = (*prev_end).max(end);
+                }
+                _ => spans.push((start, end)),
+            }
+        }
+        Self { spans }
+    }
+
+    /// No durable coverage at all.
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    /// Is the whole half-open `[first, end)` durably covered? Spans are
+    /// disjoint and non-adjacent, so a covered contiguous range lies
+    /// inside exactly one span. Empty ranges (`first >= end`) are not
+    /// covered — there is nothing durable about zero lines.
+    pub fn covers_range(&self, first: u64, end: u64) -> bool {
+        if first >= end {
+            return false;
+        }
+        match self.spans.partition_point(|&(start, _)| start <= first) {
+            0 => false,
+            i => self.spans[i - 1].1 >= end,
+        }
+    }
+
+    /// One past the last line of the contiguous-from-zero covered
+    /// prefix: `0` when line 0 is not covered. The open-time coverage
+    /// watermark — everything below it is durably stored, so a session
+    /// floor seeded here can never double-charge a committed-but-
+    /// unacked replay, and trimming a replay below it can never drop
+    /// an un-durable line.
+    pub fn contiguous_prefix_end(&self) -> u64 {
+        match self.spans.first() {
+            Some(&(0, end)) => end,
+            _ => 0,
+        }
+    }
+}
+
 #[cfg(kani)]
 mod proofs {
     use super::*;
@@ -1633,6 +1798,117 @@ mod proofs {
             assert!(w[0].0.checked_add(1) == Some(w[1].0));
         }
     }
+
+    /// W11-C, raw half (merged_bug_002): **replay cannot decrease
+    /// raw_bytes OR raw_rows** — appending ANY row to the account adds
+    /// exactly its bytes and exactly one row to the raw pair, for every
+    /// base set. The monotone-sum algebra of the containment axis, on
+    /// both cap quantities, over a bounded base (3 rows exercises
+    /// disjoint/contained/identical shapes; the fold is row-pointwise,
+    /// so the property is shape-independent).
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn check_account_raw_monotone_on_both_quantities() {
+        const B: u64 = 6;
+        let mut rows: [AccountRow; 4] = kani::any();
+        for r in &mut rows {
+            kani::assume(r.first_line <= B && r.line_count <= B && r.accounted_bytes <= B);
+        }
+        // Distinct keys: AccountRow models drv_log_chunks rows, whose
+        // (session, seq) is the primary key.
+        kani::assume(
+            rows[0].key != rows[1].key
+                && rows[0].key != rows[2].key
+                && rows[0].key != rows[3].key
+                && rows[1].key != rows[2].key
+                && rows[1].key != rows[3].key
+                && rows[2].key != rows[3].key,
+        );
+        let base = log_account(&rows[..3]);
+        let grown = log_account(&rows);
+        let replay = rows[3];
+        assert!(grown.raw_bytes == base.raw_bytes + replay.accounted_bytes);
+        assert!(grown.raw_rows == base.raw_rows + 1);
+    }
+
+    /// W11-C, merged half (merged_bug_002): **honest dedup cannot
+    /// increase merged_bytes OR merged_chunks** — appending a replay
+    /// row that an existing row covers (strictly contained, or
+    /// identical-interval with a smaller key: exactly the duplicate
+    /// shapes the at-least-once write path mints) leaves the merged
+    /// pair EXACTLY unchanged, for every base set. The idempotent-union
+    /// algebra of the forgiveness axis, on both cap quantities.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn check_account_covered_replay_merged_flat_on_both_quantities() {
+        const B: u64 = 6;
+        let mut rows: [AccountRow; 3] = kani::any();
+        for r in &mut rows {
+            kani::assume(r.first_line <= B && r.line_count <= B && r.accounted_bytes <= B);
+        }
+        kani::assume(
+            rows[0].key != rows[1].key && rows[0].key != rows[2].key && rows[1].key != rows[2].key,
+        );
+        // The replay row is covered by base row 0: strictly contained,
+        // or identical with a smaller key (the SQL tiebreak's losing
+        // side). Its byte charge is UNCONSTRAINED — a covered replay
+        // must witness zero merged growth no matter what it carries.
+        let host = rows[0];
+        let replay = rows[2];
+        kani::assume(
+            host.first_line <= replay.first_line
+                && replay.end() <= host.end()
+                && (host.first_line < replay.first_line
+                    || replay.end() < host.end()
+                    || replay.key < host.key),
+        );
+        let base = log_account(&rows[..2]);
+        let grown = log_account(&rows);
+        assert!(grown.merged_bytes == base.merged_bytes);
+        assert!(grown.merged_chunks == base.merged_chunks);
+        // And the raw pair still grew — the two algebras diverge on
+        // exactly this input, which is the whole point of measuring
+        // both.
+        assert!(grown.raw_bytes == base.raw_bytes + replay.accounted_bytes);
+        assert!(grown.raw_rows == base.raw_rows + 1);
+    }
+
+    /// [`CoverageMap`] correctness: `covers_range` agrees with per-line
+    /// reachability over the raw intervals — a range is covered iff
+    /// every line in it is inside some interval — over every 3-interval
+    /// input on a small domain. (The normalization sort/merge and the
+    /// binary-search lookup are proven together against the
+    /// independent pointwise oracle.)
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn check_coverage_map_covers_range_exact() {
+        const B: u64 = 6;
+        let intervals: [(u64, u64); 3] = kani::any();
+        for &(f, c) in &intervals {
+            kani::assume(f <= B && c <= B);
+        }
+        let map = CoverageMap::from_intervals(intervals);
+        let first: u64 = kani::any();
+        let end: u64 = kani::any();
+        kani::assume(first <= B + B && end <= B + B);
+
+        let claimed = map.covers_range(first, end);
+        // Independent oracle: non-empty, and every line individually
+        // covered by some raw interval.
+        let mut oracle = first < end;
+        let mut line = first;
+        while line < end {
+            let hit = intervals
+                .iter()
+                .any(|&(f, c)| f <= line && line < f.saturating_add(c));
+            if !hit {
+                oracle = false;
+                break;
+            }
+            line += 1;
+        }
+        assert!(claimed == oracle);
+    }
 }
 
 #[cfg(test)]
@@ -2124,5 +2400,94 @@ mod tests {
             accept_verdict(0, Some(5), 7, MAX_BATCH_LINES + 1),
             RejectedOversizedBatch
         );
+    }
+
+    // -- the durable log account (merged_bug_002) -------------------------
+
+    fn row(first: u64, count: u64, bytes: u64, key: (u128, u32)) -> AccountRow {
+        AccountRow {
+            first_line: first,
+            line_count: count,
+            accounted_bytes: bytes,
+            key,
+        }
+    }
+
+    /// The two algebras diverge on exactly the duplicate shapes the
+    /// write path mints: contained chains, cross-session wides,
+    /// identical-interval pairs. Merged = one survivor per covered
+    /// interval; raw = everything.
+    #[test]
+    fn log_account_measures_both_algebras() {
+        let rows = [
+            // Same-session re-cut chain: [100,150) ⊂ [100,180) ⊂ [100,200).
+            row(100, 50, 5_000, (1, 0)),
+            row(100, 80, 8_000, (1, 1)),
+            row(100, 100, 10_000, (1, 2)),
+            // Disjoint committed chunk.
+            row(0, 100, 9_000, (1, 3)),
+            // Cross-session wide over an orphan: [300,400) ⊆ [300,440).
+            row(300, 100, 7_000, (1, 4)),
+            row(300, 140, 9_500, (2, 0)),
+            // Identical intervals: the greater key survives.
+            row(500, 20, 2_000, (1, 5)),
+            row(500, 20, 2_000, (1, 6)),
+        ];
+        assert_eq!(
+            log_account(&rows),
+            LogAccount {
+                merged_bytes: 10_000 + 9_000 + 9_500 + 2_000,
+                merged_chunks: 4,
+                raw_bytes: 52_500,
+                raw_rows: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn log_account_empty_is_zero() {
+        assert_eq!(
+            log_account(&[]),
+            LogAccount {
+                merged_bytes: 0,
+                merged_chunks: 0,
+                raw_bytes: 0,
+                raw_rows: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn coverage_map_normalizes_and_answers_range_queries() {
+        // Overlap, adjacency, duplicate, zero-length — one canonical set.
+        let map = CoverageMap::from_intervals([(10, 5), (12, 8), (20, 5), (40, 0), (50, 5)]);
+        // [10,20) ∪ [20,25) merge (adjacent); [50,55) separate.
+        assert!(map.covers_range(10, 25));
+        assert!(map.covers_range(12, 13));
+        assert!(map.covers_range(50, 55));
+        assert!(!map.covers_range(10, 26), "one past the span end");
+        assert!(!map.covers_range(9, 12), "starts before the span");
+        assert!(!map.covers_range(25, 50), "the hole between spans");
+        assert!(!map.covers_range(30, 30), "empty ranges are not covered");
+        assert!(
+            !map.covers_range(40, 41),
+            "zero-length intervals add nothing"
+        );
+        assert_eq!(
+            map.contiguous_prefix_end(),
+            0,
+            "line 0 uncovered ⇒ no contiguous prefix"
+        );
+    }
+
+    #[test]
+    fn coverage_map_contiguous_prefix_end() {
+        assert_eq!(CoverageMap::default().contiguous_prefix_end(), 0);
+        let map = CoverageMap::from_intervals([(0, 10), (5, 10), (15, 5), (30, 4)]);
+        // [0,10) ∪ [5,15) ∪ [15,20) merge into [0,20); [30,34) is past
+        // the hole and contributes nothing to the prefix.
+        assert_eq!(map.contiguous_prefix_end(), 20);
+        assert!(map.covers_range(0, 20));
+        assert!(!map.covers_range(0, 21));
     }
 }

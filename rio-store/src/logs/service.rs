@@ -1306,6 +1306,22 @@ impl AppendDriver {
                             | Ok(AcceptOutcome::RejectedOverflow)
                             | Ok(AcceptOutcome::RejectedPastFinal)
                             | Ok(AcceptOutcome::RejectedOversizedBatch) => {}
+                            // A replay of content the committed manifest
+                            // already covers (merged_bug_002's write-path
+                            // arm): nothing was buffered or charged, but
+                            // the lines ARE durable — ack them so the
+                            // builder's retransmit buffer trims instead
+                            // of waiting for a cut that will never carry
+                            // them. try_send: a missed ack just means
+                            // the next replay re-answers.
+                            Ok(AcceptOutcome::CoveredReplay { durable_through }) => {
+                                ack_try_send(
+                                    ack_tx,
+                                    Ok(AppendLogAck {
+                                        durable_through_line: durable_through,
+                                    }),
+                                );
+                            }
                             // Stream-fatal (the per-execution byte
                             // cap — accept()'s ONLY Err construction,
                             // census-pinned). A REFUSAL on a healthy
@@ -3232,8 +3248,13 @@ mod tests {
             drv_hash: rio_nix::store_path::drv_log_hash(DRV_PATH),
             exec_id: exec,
             final_line_count: None,
-            prior_accounted_bytes: 0,
-            prior_chunks: 0,
+            seed: gate::LogSeed {
+                merged_bytes: 0,
+                merged_chunks: 0,
+                raw_bytes: 0,
+                raw_rows: 0,
+            },
+            covered: Default::default(),
         };
         let mut session = IngestSession::new(&gate_ok, Uuid::now_v7(), IngestConfig::default());
         session

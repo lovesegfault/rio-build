@@ -2252,15 +2252,19 @@ fabricated `derivation_path` cannot pollute another execution's log, and a
 late batch from a timed-out executor cannot be attributed to the next
 execution.
 
-#r("store.log.caps-durable")[
+#r("store.log.caps-durable+2")[
   The per-execution log byte cap and chunk cap MUST be enforced against
   durable per-execution aggregates: every `AppendLog` open MUST seed the
   session's accepted-byte and chunk-attempt counters from the execution's
-  committed chunk manifest, an open for an execution at or over either cap
-  MUST be rejected with `FAILED_PRECONDITION` and the `x-rio-log-reject`
-  metadata naming the `cap` class, and a mid-stream cap trip MUST use the
-  same code and metadata. `RESOURCE_EXHAUSTED` is reserved for per-replica
-  capacity conditions that a retry on another replica can satisfy.
+  committed chunk manifest's MERGED coverage account (the idempotent
+  union --- an honest retry's re-send of committed content is never
+  double-charged, and a batch fully inside durable coverage MUST be
+  dropped uncharged and un-written, acknowledged from the manifest), an
+  open for an execution at or over either cap MUST be rejected with
+  `FAILED_PRECONDITION` and the `x-rio-log-reject` metadata naming the
+  `cap` class, and a mid-stream cap trip MUST use the same code and
+  metadata. `RESOURCE_EXHAUSTED` is reserved for per-replica capacity
+  conditions that a retry on another replica can satisfy.
 ]
 
 A reconnect used to zero both caps (they compared session-local counters),
@@ -2271,7 +2275,37 @@ charges) is persisted per chunk (`drv_log_chunks.accounted_bytes`,
 migration 089) and summed at open. The status-code split is what lets the
 builder classify correctly: cap exhaustion travels with the execution
 (permanent --- give up and disclose), replica capacity does not (retry
-elsewhere).
+elsewhere). The merged account is one axis of a dual-axis law:
+forgiveness. Its algebra is idempotent --- which is exactly why it cannot
+be the only measure (the rule below).
+
+#r("store.log.raw-ceiling")[
+  Every durable log write MUST be charged against a monotone
+  per-execution ceiling that no reconnect resets: the `AppendLog` open
+  gate MUST refuse an execution whose raw durable totals --- accounted
+  bytes, and manifest rows, each summed over ALL committed chunk rows
+  --- have reached the documented replay allowance times the
+  corresponding per-execution cap, with the same permanent rejection
+  class as the cap trips. Both quantities MUST carry the ceiling: bytes
+  and rows.
+]
+
+The measure-swap lesson (merged_bug_002): coverage and consumption have
+opposite algebras. The merged account is an idempotent union ---
+identical-interval replay rows witness zero there --- so seeding a
+containment budget for an untrusted at-least-once writer from it alone
+hands the budget delta to whoever controls duplication: an attacker loops
+open, replay, cut, reconnect, durably minting objects and manifest rows
+every cycle while the seed never grows. The raw totals are monotone sums:
+every committed row counts, forever, so the ceiling is cycle-cumulative by
+algebra. The quantity-neutral form is load-bearing --- a byte-only ceiling
+leaves the small-chunk orbit open (cover-then-prune row blocks mint
+unbounded manifest rows below every byte quantity). The four measures
+(merged and raw, bytes and rows) and their algebras are frozen with the
+seal: the kernel's `log_account` defines them, kani pins the algebra laws,
+and the gate's seed SQL is differentially pinned against the kernel fold
+--- swapping any witnessed quantity re-derives the seal, never edits
+inside it.
 
 #r("store.log.read-authority")[
   Resolving a derivation to an execution for log access MUST consider only

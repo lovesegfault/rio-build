@@ -153,6 +153,24 @@ pub enum AcceptOutcome {
     /// the stream stays open. Honest builders flush at 64 lines, four
     /// orders of magnitude below the bound.
     RejectedOversizedBatch,
+    /// Every line in the batch is already DURABLY covered by the
+    /// execution's committed manifest (the gate's open-time coverage
+    /// read): a reconnect replay of committed content. Dropped
+    /// uncharged and un-written — it can mint no objects, manifest
+    /// rows, or raw charge (merged_bug_002's write-path arm) — but
+    /// unlike the `Rejected*` family this is GOOD news the driver
+    /// acks immediately: `durable_through` is the batch's last line,
+    /// durable per the manifest, so a legacy (non-trimming) builder's
+    /// retransmit buffer still trims instead of waiting for a cut
+    /// that will never carry these lines. Honest partial overlaps are
+    /// NOT consulted here — a straddling batch is accepted whole and
+    /// charges raw in full (every durable write charges the raw
+    /// axis), with forgiveness applied on the merged axis at the next
+    /// open's seed.
+    CoveredReplay {
+        /// The batch's last line — durable per the committed manifest.
+        durable_through: u64,
+    },
 }
 
 /// Why [`IngestSession::should_abort`] wants the stream torn down.
@@ -392,16 +410,24 @@ pub struct IngestSession {
     /// ceiling applies.
     final_line_count: Option<u64>,
     /// Total accounted bytes accepted over the EXECUTION's lifetime:
-    /// seeded from the durable manifest at open
-    /// (`GateOk::prior_accounted_bytes`), grown per accepted batch,
-    /// never decremented on cut. Compared against
-    /// [`IngestConfig::per_exec_byte_cap`].
+    /// seeded from the durable manifest's MERGED account at open
+    /// (`GateOk::seed`), grown per accepted batch, never decremented
+    /// on cut. Compared against [`IngestConfig::per_exec_byte_cap`].
     accepted_bytes: u64,
+    /// The execution's durable covered line ranges at open time (the
+    /// gate's coverage read). The covered-replay consult
+    /// (merged_bug_002): a batch FULLY inside these ranges is already
+    /// durable — it is dropped uncharged and un-written, and the
+    /// driver acks it straight from the manifest truth. Open-time
+    /// snapshot by design: ranges only grow during the session (our
+    /// own cuts), and content this session cut is fenced by the
+    /// monotone floor anyway.
+    covered: rio_log_kernel::CoverageMap,
     consecutive_cut_failures: u8,
 }
 
 impl IngestSession {
-    // r[impl store.log.caps-durable]
+    // r[impl store.log.caps-durable+2]
     /// The ONLY constructor, and it takes a `GateOk`: a session
     /// cannot exist without the gate's durable-account read, so the
     /// per-execution caps are seeded from the committed manifest —
@@ -411,6 +437,7 @@ impl IngestSession {
     /// rides separately in `prior_chunks` and is added back by
     /// [`Self::chunk_attempts`].
     pub fn new(gate_ok: &super::gate::GateOk, session_id: Uuid, config: IngestConfig) -> Self {
+        let (merged_bytes, merged_chunks) = gate_ok.seed.merged_pair();
         let mut s = Self {
             exec_id: gate_ok.exec_id,
             session_id,
@@ -426,10 +453,11 @@ impl IngestSession {
             })),
             config,
             next_seq: 0,
-            prior_chunks: gate_ok.prior_chunks,
+            prior_chunks: merged_chunks,
             high_water_line: 0,
             final_line_count: None,
-            accepted_bytes: gate_ok.prior_accounted_bytes,
+            accepted_bytes: merged_bytes,
+            covered: gate_ok.covered.clone(),
             consecutive_cut_failures: 0,
         };
         if let Some(n) = gate_ok.final_line_count {
@@ -655,6 +683,32 @@ impl IngestSession {
             );
         }
 
+        // -- The covered-replay consult (merged_bug_002): a batch FULLY
+        // inside the durable covered ranges is a reconnect replay of
+        // content the manifest already holds. Writing it again would
+        // mint a new object + manifest row and charge the raw axis for
+        // bytes the execution already paid for — so it is dropped
+        // before accounting, buffering, or fan-out, and the driver
+        // acks `durable_through` straight from the manifest truth.
+        // Partial overlaps fall through whole (accepted, raw-charged):
+        // splitting would break the fan-out batch's contiguity, and
+        // their forgiveness lives on the merged axis at the next seed.
+        // The high-water mark still advances — these lines are
+        // accounted for, and the next batch must come after them.
+        // r[impl store.log.caps-durable+2]
+        if self.covered.covers_range(batch.first_line_number, end) {
+            self.high_water_line = end;
+            tracing::debug!(
+                exec_id = %self.exec_id,
+                first_line_number = batch.first_line_number,
+                end,
+                "dropped covered replay batch: already durable per the manifest"
+            );
+            return Ok(AcceptOutcome::CoveredReplay {
+                durable_through: end - 1,
+            });
+        }
+
         // -- Truncation BEFORE byte accounting, so an oversized line
         // cannot defeat the byte cap (the scheduler's gate has the same
         // ordering for the same reason).
@@ -685,7 +739,7 @@ impl IngestSession {
         // -- The per-execution accepted-bytes cap. Stream-fatal: the
         // builder gets FAILED_PRECONDITION and gives up on the log
         // (the build itself is unaffected).
-        // r[impl store.log.caps-durable]
+        // r[impl store.log.caps-durable+2]
         // Same status code + metadata class as the gate's open-time
         // check: the cap travels with the EXECUTION, so a retry on
         // another replica cannot succeed — FAILED_PRECONDITION (the
@@ -1032,7 +1086,9 @@ mod tests {
 
     /// A session born from a synthetic `GateOk` carrying a durable
     /// seed, as after a reconnect to an execution with committed
-    /// chunks.
+    /// chunks. The merged pair only; the raw pair and the coverage map
+    /// are open-gate concerns the session never reads (the gate tests
+    /// drive those through `finish_open`).
     fn new_session_with_seed(
         config: IngestConfig,
         prior_accounted_bytes: u64,
@@ -1043,8 +1099,13 @@ mod tests {
                 drv_hash: "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm".to_string(),
                 exec_id: Uuid::now_v7(),
                 final_line_count: None,
-                prior_accounted_bytes,
-                prior_chunks,
+                seed: super::super::gate::LogSeed {
+                    merged_bytes: prior_accounted_bytes,
+                    merged_chunks: prior_chunks,
+                    raw_bytes: prior_accounted_bytes,
+                    raw_rows: u64::from(prior_chunks),
+                },
+                covered: Default::default(),
             },
             Uuid::now_v7(),
             config,
@@ -1299,7 +1360,7 @@ mod tests {
     /// `store.log.caps-durable`: a session born from a GateOk carrying
     /// a durable seed resumes the byte account where the previous
     /// session left it — the cap cannot be reset by reconnecting.
-    // r[verify store.log.caps-durable]
+    // r[verify store.log.caps-durable+2]
     #[test]
     fn byte_cap_resumes_from_durable_seed() {
         let mut session = new_session_with_seed(
