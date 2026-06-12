@@ -447,16 +447,46 @@ pub struct FilesystemLogChunkStore {
 }
 
 impl FilesystemLogChunkStore {
-    /// Create the root directory (and parents) if absent, and fsync it
-    /// so the dirent chain of every later `durable_put` ends at a
-    /// durable directory.
+    /// Create the root directory (and parents) if absent, and make the
+    /// CREATION durable (merged_bug_033): the chain law's fixpoint is
+    /// "end at the deepest pre-existing directory", and whoever
+    /// creates the anchor discharges that base case — `fsync_chain`
+    /// hard-stops at the root by design, so on a fresh volume the
+    /// root's own dirent is the one link no put ever makes durable.
+    /// `new()` therefore fsyncs every level `create_dir_all` actually
+    /// created PLUS the deepest pre-existing ancestor (whose data
+    /// block now names the topmost created level), child-to-root —
+    /// after which the per-put chain genuinely ends at durable ground.
+    /// A pre-existing root keeps the old single-fsync behavior.
     // r[impl store.log.chunk-dirent-durable+2]
     pub fn new(root: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
         let root = root.into();
+        // Pre-scan BEFORE creating: which levels will be new?
+        let mut created = Vec::new();
+        let mut cursor = root.clone();
+        loop {
+            if cursor.exists() {
+                break;
+            }
+            created.push(cursor.clone());
+            match cursor.parent() {
+                Some(p) => cursor = p.to_path_buf(),
+                None => break,
+            }
+        }
+        let deepest_preexisting = cursor;
         std::fs::create_dir_all(&root)?;
-        #[cfg(test)]
-        fsync_recorder::record(&root);
-        std::fs::File::open(&root)?.sync_all()?;
+        if created.is_empty() {
+            // Nothing created: fsync the root's contents, as ever.
+            fsync_dir_sync(&root)?;
+        } else {
+            // Child-to-root over the created levels (the root is
+            // `created[0]` whenever it was new), then the base case.
+            for dir in &created {
+                fsync_dir_sync(dir)?;
+            }
+            fsync_dir_sync(&deepest_preexisting)?;
+        }
         Ok(Self { root })
     }
 
@@ -491,6 +521,17 @@ async fn fsync_dir(dir: &std::path::Path) -> std::io::Result<()> {
     f.sync_all().await
 }
 
+/// Synchronous twin of [`fsync_dir`] for construction-time use
+/// (`new()` is sync): same recorder, same semantics. `pub(crate)` so
+/// the CAS backend's construction (`crate::backend`) discharges its
+/// base case through the SAME recorded chokepoint instead of minting
+/// a second unwitnessed fsync path.
+pub(crate) fn fsync_dir_sync(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    fsync_recorder::record(dir);
+    std::fs::File::open(dir)?.sync_all()
+}
+
 /// Test-only fsync_dir call recorder (sequence assertions).
 #[cfg(test)]
 pub(crate) mod fsync_recorder {
@@ -503,7 +544,19 @@ pub(crate) mod fsync_recorder {
         LOG.lock().unwrap().push(dir.to_path_buf());
     }
 
-    /// All recorded dir fsyncs under `root`, in call order.
+    /// EVERY recorded dir fsync, in call order — the LAW'S domain
+    /// (merged_bug_033): the chain law obligates fsyncs up to and
+    /// including the deepest pre-existing directory, which sits
+    /// OUTSIDE the store root, so a witness scoped `under(root)` is
+    /// structurally incapable of observing the base case. Base-case
+    /// witnesses consume this; subtree-scoped assertions may still
+    /// use [`under`] when the law they pin ends at the root.
+    pub(crate) fn all() -> Vec<PathBuf> {
+        LOG.lock().unwrap().clone()
+    }
+
+    /// All recorded dir fsyncs under `root`, in call order. A QUERY
+    /// scope, not the law's domain — see [`all`].
     pub(crate) fn under(root: &Path) -> Vec<PathBuf> {
         LOG.lock()
             .unwrap()
@@ -700,6 +753,93 @@ impl LogChunkStore for MemoryLogChunkStore {
 
 #[cfg(test)]
 mod tests {
+    // r[verify store.log.chunk-dirent-durable+2]
+    /// W12-I (merged_bug_033, red-first): the chain law's BASE CASE is
+    /// discharged by whoever CREATES the anchor. On a fresh volume
+    /// `new()` creates the root (and possibly ancestors); the root's
+    /// own dirent then lives in a directory `fsync_chain` never
+    /// touches (it hard-stops at root), and the frozen witness
+    /// `fsync_recorder::under(root)` was STRUCTURALLY incapable of
+    /// observing the parent fsync (`starts_with(root)` filters it out
+    /// — the measure could not entail the law at the base case). The
+    /// re-scoped query (`all()`, the law's domain: every fsync the
+    /// law obligates) makes the gap observable; pre-fix RED: with the
+    /// recorder able to see, `new()` records NOTHING above the root —
+    /// a crash after put() loses the whole store's dirent while
+    /// manifest rows claim durable coverage.
+    #[tokio::test]
+    async fn new_discharges_the_dirent_chain_base_case() {
+        use super::fsync_recorder;
+        let tmp = tempfile::tempdir().unwrap();
+        // A multi-level fresh-volume shape: every level below the
+        // tempdir is created by new().
+        let root = tmp.path().join("a").join("b").join("store");
+        let baseline = fsync_recorder::all().len();
+        let _store = super::FilesystemLogChunkStore::new(&root).unwrap();
+        let recorded = fsync_recorder::all()[baseline..].to_vec();
+
+        // The created levels, child-to-root, then the deepest
+        // PRE-EXISTING directory (the tempdir — the one whose data
+        // block now names "a/"). Pre-fix the record held only the
+        // root's own contents fsync.
+        assert_eq!(
+            recorded,
+            vec![
+                root.clone(),
+                tmp.path().join("a").join("b"),
+                tmp.path().join("a"),
+                tmp.path().to_path_buf(),
+            ],
+            "new() must fsync every level it created plus the deepest \
+             pre-existing ancestor (the base case the per-put chain \
+             law assumes)"
+        );
+
+        // The no-creation cell: a pre-existing root keeps the old
+        // single-fsync behavior byte-stable.
+        let baseline = fsync_recorder::all().len();
+        let _store2 = super::FilesystemLogChunkStore::new(&root).unwrap();
+        let recorded = fsync_recorder::all()[baseline..].to_vec();
+        assert_eq!(
+            recorded,
+            vec![root.clone()],
+            "a pre-existing root is fsynced once, exactly as before"
+        );
+    }
+
+    // r[verify store.log.chunk-dirent-durable+2]
+    /// The backend sibling (merged_bug_033's sweep face): the chunk
+    /// CAS backend creates `chunks/` plus 256 subdirectories with —
+    /// pre-fix — ZERO directory fsyncs; `put()` syncs only the
+    /// `{aa}/` parent. The same base-case discipline applies: `new()`
+    /// fsyncs every created level (the `chunks/` listing covers all
+    /// 256 subdir dirents) plus the deepest pre-existing ancestor.
+    #[tokio::test]
+    async fn backend_new_discharges_the_dirent_chain_base_case() {
+        use super::fsync_recorder;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("data");
+        let baseline = fsync_recorder::all().len();
+        let _backend = crate::backend::FilesystemChunkBackend::new(&base).unwrap();
+        let recorded = fsync_recorder::all()[baseline..].to_vec();
+        // 256 subdir fsyncs (their contents are empty but their
+        // creation is what the chunks/ fsync makes durable), then the
+        // created levels child-to-root (chunks/, data/), then the
+        // pre-existing tempdir.
+        assert!(
+            recorded.contains(&base.join("chunks")),
+            "the chunks/ listing (256 subdir dirents) must be fsynced: {recorded:?}"
+        );
+        assert!(
+            recorded.contains(&base),
+            "the created data/ level must be fsynced"
+        );
+        assert!(
+            recorded.contains(&tmp.path().to_path_buf()),
+            "the deepest pre-existing ancestor must be fsynced (the base case)"
+        );
+    }
+
     // r[verify store.log.chunk-dirent-durable+2]
     #[tokio::test]
     async fn filesystem_put_fsyncs_new_ancestors_child_to_root() {

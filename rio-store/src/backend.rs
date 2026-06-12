@@ -333,13 +333,48 @@ impl FilesystemChunkBackend {
     /// Create a new filesystem backend. Creates `{base_dir}/chunks/` and
     /// all 256 `{aa}/` subdirectories eagerly — small upfront cost (256
     /// mkdir calls, ~1ms) so `put()` never has to check-then-mkdir on
-    /// the hot path.
+    /// the hot path — and makes the CREATION durable (merged_bug_033,
+    /// the same base-case discipline as the log chunk store): every
+    /// created level is fsynced child-to-root plus the deepest
+    /// pre-existing ancestor; the `chunks/` fsync covers all 256
+    /// subdir dirents at once (they live in its listing), after which
+    /// `put()`'s `{aa}/` parent fsync genuinely ends at durable
+    /// ground. Pre-fix the whole tree was created with ZERO dir
+    /// fsyncs: a crash after a put lost dirents while manifest rows
+    /// claimed durable coverage (first-boot window on the dev/
+    /// standalone-VM backends; production is S3).
     pub fn new(base_dir: impl Into<PathBuf>) -> std::io::Result<Self> {
-        let base_dir = base_dir.into().join("chunks");
+        let base = base_dir.into();
+        let base_dir = base.join("chunks");
+        // Pre-scan BEFORE creating: which levels will be new?
+        let mut created = Vec::new();
+        let mut cursor = base_dir.clone();
+        loop {
+            if cursor.exists() {
+                break;
+            }
+            created.push(cursor.clone());
+            match cursor.parent() {
+                Some(p) => cursor = p.to_path_buf(),
+                None => break,
+            }
+        }
+        let deepest_preexisting = cursor;
         std::fs::create_dir_all(&base_dir)?;
         // Precreate all 256 two-char-hex subdirectories.
         for b in 0u8..=255 {
             std::fs::create_dir_all(base_dir.join(format!("{b:02x}")))?;
+        }
+        // The base case, through the same recorded chokepoint as the
+        // log store (one witnessed fsync path, not two): chunks/'s
+        // own contents (the 256 dirents), every created ancestor, and
+        // the deepest pre-existing directory.
+        crate::logs::chunks::fsync_dir_sync(&base_dir)?;
+        for dir in created.iter().filter(|d| **d != base_dir) {
+            crate::logs::chunks::fsync_dir_sync(dir)?;
+        }
+        if !created.is_empty() {
+            crate::logs::chunks::fsync_dir_sync(&deepest_preexisting)?;
         }
         Ok(Self { base_dir })
     }
