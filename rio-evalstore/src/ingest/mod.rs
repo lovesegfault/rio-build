@@ -17,9 +17,10 @@
 //! readdir-bound, and a single read-ahead issuer floors ~4× worse than
 //! parallel readers regardless of window size. One sha256 spine consumes
 //! file buffers strictly in NAR order; W chunk workers run FastCDC+blake3;
-//! a single byte-budget semaphore is simultaneously the prefetch window
-//! and the tee bound. An oversized file (> budget) is admitted alone when
-//! the budget is fully free.
+//! a single byte budget (owned by the work-deque mutex — see the
+//! pipeline module docs) is simultaneously the prefetch window and the
+//! tee bound. An oversized file (> budget) is admitted alone when the
+//! budget is fully free.
 //!
 //! **Fork safety (hard rule):** zero threads exist at construction. All
 //! pipeline threads are spawned inside [`ingest_tree`] via
@@ -52,7 +53,7 @@ pub struct IngestConfig {
     /// FastCDC+blake3 chunk workers. Simulated utilization never exceeded
     /// 0.27 at W=4 — plane 2 finishes inside the read shadow at W=2.
     pub chunk_workers: usize,
-    /// Byte-budget semaphore: combined prefetch window and tee bound.
+    /// Byte budget: combined prefetch window and tee bound.
     /// Sized so the largest common single file passes without streaming
     /// (32 MiB ≥ nixpkgs' 16.6 MiB hackage-packages.nix); a larger file is
     /// admitted alone when the budget is fully free. A quarter of the

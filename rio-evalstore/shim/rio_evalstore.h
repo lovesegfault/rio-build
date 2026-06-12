@@ -19,6 +19,7 @@
 #define RIO_EVALSTORE_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,6 +32,24 @@ enum {
     RIO_ERR = 1,
     RIO_UNSUPPORTED = 2,
 };
+
+/* Node kinds for rio_lstat / rio_read_directory entries. 0 doubles as
+ * "no such path" in RioStat so a zeroed struct reads as missing. */
+enum {
+    RIO_NODE_MISSING = 0,
+    RIO_NODE_REGULAR = 1,
+    RIO_NODE_SYMLINK = 2,
+    RIO_NODE_DIRECTORY = 3,
+};
+
+/* lstat result. Hot-path op (hundreds of thousands of calls per warm
+ * eval): a plain out-struct, no allocation, no JSON. The symlink target
+ * is NOT part of lstat — readLink is its own op. */
+typedef struct RioStat {
+    uint8_t kind; /* RIO_NODE_* */
+    uint8_t executable;
+    uint64_t size;
+} RioStat;
 
 /* dump methods */
 enum {
@@ -61,6 +80,10 @@ typedef int (*rio_path_cb)(void * ctx, const char * hashes_json, char * out_path
 int rio_store_open(const char * cas_dir /* nullable */, RioEvalStore ** out_store, char ** err);
 void rio_store_free(RioEvalStore * store);
 void rio_string_free(char * s);
+
+/* Free a byte buffer returned by rio_read_directory. len must be the
+ * value the call returned. */
+void rio_bytes_free(unsigned char * p, size_t len);
 
 int rio_is_valid_path(RioEvalStore * store, const char * basename, int * out_valid, char ** err);
 
@@ -121,14 +144,23 @@ int rio_write_derivation(
     char ** out_path,
     char ** err);
 
-/* *out_json: {"type":"regular","size":n,"executable":b} |
- * {"type":"symlink","target":…} | {"type":"directory"} | null. */
+/* lstat within a store object. rel may be empty (object root). On rc 0,
+ * *out is filled; kind RIO_NODE_MISSING means no such path. */
 int rio_lstat(
-    RioEvalStore * store, const char * basename, const char * rel, char ** out_json, char ** err);
+    RioEvalStore * store, const char * basename, const char * rel, RioStat * out, char ** err);
 
-/* *out_json: {entry name: "regular"|"symlink"|"directory", …}. */
+/* Read a directory as a flat byte buffer (hot path — the shim walks it,
+ * no parse). Layout, little-endian, unaligned:
+ *   u32 count, then per entry: u8 kind (RIO_NODE_*), u32 name_len,
+ *   name bytes (raw, not NUL-terminated — entry names may be any bytes).
+ * Free *out_buf with rio_bytes_free(*out_buf, *out_len). */
 int rio_read_directory(
-    RioEvalStore * store, const char * basename, const char * rel, char ** out_json, char ** err);
+    RioEvalStore * store,
+    const char * basename,
+    const char * rel,
+    unsigned char ** out_buf,
+    size_t * out_len,
+    char ** err);
 
 int rio_read_file(
     RioEvalStore * store,

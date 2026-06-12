@@ -1113,20 +1113,75 @@ mod ffi_smoke {
             serde_json::from_str(&take_string(info_json).expect("info"))?;
         assert_eq!(info["nar_size"].as_u64(), Some(dump.len() as u64));
 
-        // readDirectory through FFI: names + kinds as JSON.
+        // readDirectory through FFI: flat buffer — u32 count, then per
+        // entry u8 kind, u32 name_len, raw name bytes (little-endian).
         let rel = CString::new("")?;
-        let mut dir_json: *mut c_char = std::ptr::null_mut();
+        let mut dir_buf: *mut u8 = std::ptr::null_mut();
+        let mut dir_len: usize = 0;
         assert_eq!(
             unsafe {
-                rio_read_directory(store, cbase.as_ptr(), rel.as_ptr(), &mut dir_json, &mut err)
+                rio_read_directory(
+                    store,
+                    cbase.as_ptr(),
+                    rel.as_ptr(),
+                    &mut dir_buf,
+                    &mut dir_len,
+                    &mut err,
+                )
             },
             RIO_OK
         );
-        let dirents: BTreeMap<String, String> =
-            serde_json::from_str(&take_string(dir_json).expect("dir json"))?;
-        assert_eq!(dirents["bin"], "directory");
-        assert_eq!(dirents["data.txt"], "regular");
-        assert_eq!(dirents["link"], "symlink");
+        let buf = unsafe { std::slice::from_raw_parts(dir_buf, dir_len) };
+        let mut dirents: BTreeMap<String, u8> = BTreeMap::new();
+        let mut pos = 0usize;
+        let rd32 = |buf: &[u8], pos: &mut usize| {
+            let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap());
+            *pos += 4;
+            v
+        };
+        let count = rd32(buf, &mut pos);
+        for _ in 0..count {
+            let kind = buf[pos];
+            pos += 1;
+            let name_len = rd32(buf, &mut pos) as usize;
+            let name = String::from_utf8(buf[pos..pos + name_len].to_vec())?;
+            pos += name_len;
+            dirents.insert(name, kind);
+        }
+        assert_eq!(pos, dir_len, "buffer fully consumed");
+        unsafe { rio_bytes_free(dir_buf, dir_len) };
+        assert_eq!(dirents["bin"], RIO_NODE_DIRECTORY);
+        assert_eq!(dirents["data.txt"], RIO_NODE_REGULAR);
+        assert_eq!(dirents["link"], RIO_NODE_SYMLINK);
+
+        // lstat through FFI: flat out-struct, kind 0 = missing.
+        let mut st = RioStat {
+            kind: 99,
+            executable: 99,
+            size: 99,
+        };
+        let rel_file = CString::new("data.txt")?;
+        assert_eq!(
+            unsafe { rio_lstat(store, cbase.as_ptr(), rel_file.as_ptr(), &mut st, &mut err) },
+            RIO_OK
+        );
+        assert_eq!(st.kind, RIO_NODE_REGULAR);
+        assert_eq!(st.executable, 0);
+        assert_eq!(st.size, b"payload\n".len() as u64);
+        let rel_missing = CString::new("no-such-entry")?;
+        assert_eq!(
+            unsafe {
+                rio_lstat(
+                    store,
+                    cbase.as_ptr(),
+                    rel_missing.as_ptr(),
+                    &mut st,
+                    &mut err,
+                )
+            },
+            RIO_OK
+        );
+        assert_eq!(st.kind, RIO_NODE_MISSING);
 
         // NAR regeneration through FFI is byte-identical.
         let mut regen: Vec<u8> = Vec::new();
@@ -1169,11 +1224,20 @@ mod ffi_smoke {
     /// and reads file bytes back from the origin.
     #[test]
     fn add_source_tree_through_ffi() -> anyhow::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir()?;
         let cas = CString::new(dir.path().join("cas").to_str().unwrap())?;
         let tree = dir.path().join("tree");
         std::fs::create_dir_all(&tree)?;
         std::fs::write(tree.join("data.txt"), b"tree payload\n")?;
+        // Non-UTF-8 entry name: only local-tree ingest can produce one
+        // (the NAR dump path goes through rio-nix's UTF-8 NarNode), and
+        // the flat readDirectory buffer must hand it back byte-exact.
+        let weird_name: &[u8] = b"w\xff\xfeird";
+        std::fs::write(
+            tree.join(std::ffi::OsStr::from_bytes(weird_name)),
+            b"bytes\n",
+        )?;
 
         let mut store: *mut EvalStore = std::ptr::null_mut();
         let mut err: *mut c_char = std::ptr::null_mut();
@@ -1205,9 +1269,30 @@ mod ffi_smoke {
             serde_json::from_str(&take_string(out_json).expect("result json"))?;
         let path = result["path"].as_str().unwrap().to_string();
 
-        // Independent recomputation from rio-nix's own dump.
+        // Independent recomputation from rio-nix's own dump. The fs
+        // dumper requires UTF-8 names, so hash the canonical token
+        // stream assembled by hand for this two-entry tree instead.
         let mut dump = Vec::new();
-        nar::dump_path_streaming(&tree, &mut dump)?;
+        {
+            use rio_nix::nar::frame;
+            let w = &mut dump;
+            frame::magic(w)?;
+            frame::node_open(w)?;
+            frame::directory_open(w)?;
+            for (name, contents) in [
+                (&b"data.txt"[..], &b"tree payload\n"[..]),
+                (weird_name, &b"bytes\n"[..]),
+            ] {
+                frame::entry_open(w, name)?;
+                frame::node_open(w)?;
+                frame::regular_header(w, false, contents.len() as u64)?;
+                w.extend_from_slice(contents);
+                frame::contents_padding(w, contents.len() as u64)?;
+                frame::node_close(w)?;
+                frame::entry_close(w)?;
+            }
+            frame::node_close(w)?;
+        }
         let h = NixHash::new(HashAlgo::SHA256, Sha256::digest(&dump).to_vec())?;
         assert_eq!(
             path,
@@ -1233,6 +1318,43 @@ mod ffi_smoke {
             RIO_OK
         );
         assert_eq!(content, b"tree payload\n");
+
+        // The non-UTF-8 name round-trips through the flat readDirectory
+        // buffer as raw bytes (no lossy mangling, no refusal).
+        let rel_root = CString::new("")?;
+        let mut dir_buf: *mut u8 = std::ptr::null_mut();
+        let mut dir_len: usize = 0;
+        assert_eq!(
+            unsafe {
+                rio_read_directory(
+                    store,
+                    cbase.as_ptr(),
+                    rel_root.as_ptr(),
+                    &mut dir_buf,
+                    &mut dir_len,
+                    &mut err,
+                )
+            },
+            RIO_OK,
+            "{:?}",
+            take_string(err)
+        );
+        let buf = unsafe { std::slice::from_raw_parts(dir_buf, dir_len) };
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        let mut pos = 0usize;
+        let count = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        for _ in 0..count {
+            assert_eq!(buf[pos], RIO_NODE_REGULAR);
+            pos += 1;
+            let name_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            names.push(buf[pos..pos + name_len].to_vec());
+            pos += name_len;
+        }
+        assert_eq!(pos, dir_len, "buffer fully consumed");
+        unsafe { rio_bytes_free(dir_buf, dir_len) };
+        assert_eq!(names, vec![b"data.txt".to_vec(), weird_name.to_vec()]);
 
         unsafe { rio_store_free(store) };
         Ok(())

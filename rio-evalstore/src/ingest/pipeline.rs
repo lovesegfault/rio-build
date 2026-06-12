@@ -856,8 +856,9 @@ fn spine_wait_file(shared: &Arc<Shared>, node: &Arc<Node>) -> Result<Arc<FileBuf
                 };
                 if !graced && shared.reader_could_charge(size) {
                     // Give the readers one chance to fund and claim this
-                    // file before stealing (see STEAL_GRACE). A claim
-                    // wakes us via the node condvar; on timeout we steal.
+                    // file before stealing (see STEAL_GRACE). A reader
+                    // that claims wakes us when its read resolves; on
+                    // timeout with the node still Pending we steal.
                     graced = true;
                     let (g, _) = node.cond.wait_timeout(st, STEAL_GRACE).expect("node lock");
                     st = g;
