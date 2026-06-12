@@ -1156,6 +1156,34 @@
       "doc": ""
     },
     {
+      "enum": "Error",
+      "name": "Corrupt",
+      "crate": "rio-packstore",
+      "msg": "corrupt pack store: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "Error",
+      "name": "Io",
+      "crate": "rio-packstore",
+      "msg": "i/o: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "Error",
+      "name": "ReservedKind",
+      "crate": "rio-packstore",
+      "msg": "kind {0:#04x} is reserved for store-internal records",
+      "doc": ""
+    },
+    {
+      "enum": "Error",
+      "name": "TooLarge",
+      "crate": "rio-packstore",
+      "msg": "record payload too large: {0} bytes (max 4 GiB)",
+      "doc": ""
+    },
+    {
       "enum": "DirectoryError",
       "name": "BadDigestLen",
       "crate": "rio-proto",
@@ -1816,6 +1844,11 @@
     {
       "name": "WireError",
       "crate": "rio-nix",
+      "doc": ""
+    },
+    {
+      "name": "Error",
+      "crate": "rio-packstore",
       "doc": ""
     },
     {

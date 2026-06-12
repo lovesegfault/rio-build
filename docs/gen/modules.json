@@ -951,6 +951,38 @@
       "doc": "Nix store path types, parsing, and nixbase32 encoding."
     }
   ],
+  "rio-packstore": [
+    {
+      "path": "gc.rs",
+      "depth": 0,
+      "doc": "GC = mark + repack, one mechanism."
+    },
+    {
+      "path": "index.rs",
+      "depth": 0,
+      "doc": "The single index file: `digest → (pack, offset, len, kind)` plus"
+    },
+    {
+      "path": "lib.rs",
+      "depth": 0,
+      "doc": "Client-side pack store for the rio:// eval store (ADR-024 P1)."
+    },
+    {
+      "path": "lock.rs",
+      "depth": 0,
+      "doc": "flock(2) helpers."
+    },
+    {
+      "path": "record.rs",
+      "depth": 0,
+      "doc": "Self-describing, resyncable pack records."
+    },
+    {
+      "path": "segment.rs",
+      "depth": 0,
+      "doc": "Writer-owned segment packs."
+    }
+  ],
   "rio-proto": [
     {
       "path": "castore_util.rs",

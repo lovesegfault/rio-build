@@ -6404,6 +6404,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-packstore"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "libc",
+ "tempfile",
+ "thiserror",
+ "workspace-hack",
+]
+
+[[package]]
 name = "rio-proto"
 version = "0.1.0"
 dependencies = [

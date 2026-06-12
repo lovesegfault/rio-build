@@ -13,6 +13,7 @@
     "rio-lease": "rio-lease",
     "rio-migrations": "rio-migrations",
     "rio-nix": "rio-nix",
+    "rio-packstore": "rio-packstore",
     "rio-proto": "rio-proto",
     "rio-scheduler": "rio-scheduler",
     "rio-store": "rio-store",
@@ -20354,6 +20355,49 @@
       ],
       "resolvedDefaultFeatures": [
         "test-oracle"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
+    "rio-packstore": {
+      "crateName": "rio-packstore",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-packstore"
+      },
+      "dependencies": [
+        {
+          "name": "blake3",
+          "packageId": "blake3"
+        },
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
+        }
+      ],
+      "devDependencies": [
+        {
+          "name": "tempfile",
+          "packageId": "tempfile"
+        }
       ],
       "libCrateTypes": [
         "lib"

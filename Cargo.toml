@@ -9,6 +9,7 @@ members = [
   "rio-lease",
   "rio-migrations",
   "rio-nix",
+  "rio-packstore",
   "rio-proto",
   "rio-scheduler",
   "rio-store",

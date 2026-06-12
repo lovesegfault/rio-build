@@ -10,6 +10,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,14 +38,26 @@ impl Segment {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
             let name = format!("seg-{nanos:x}-{pid}-{attempt}{PACK_SUFFIX}");
+            // 0600: segments hold fetched private source trees; tight
+            // even if the 0700 store directory is later loosened.
             match OpenOptions::new()
                 .create_new(true)
                 .append(true)
                 .read(true)
+                .mode(0o600)
                 .open(packs_dir.join(&name))
             {
                 Ok(file) => {
                     lock::lock_shared(&file)?;
+                    // Make the new pack's dirent durable before any
+                    // index rewrite can reference the pack: sync()
+                    // covers the record bytes and index::write covers
+                    // the index, but without this directory fsync a
+                    // crash can erase the whole pack file while the
+                    // durable index points at it — after a repack
+                    // (sources already unlinked) that is data loss,
+                    // not a stale cache entry.
+                    File::open(packs_dir)?.sync_data()?;
                     return Ok(Segment { file, name, len: 0 });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,

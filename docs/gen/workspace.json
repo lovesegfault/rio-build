@@ -37,6 +37,10 @@
       "description": "Nix protocol types and wire format"
     },
     {
+      "name": "rio-packstore",
+      "description": "Client-side append-only pack store for the rio:// eval store (ADR-024 P1)"
+    },
+    {
       "name": "rio-proto",
       "description": "Protobuf/gRPC service definitions for rio-build"
     },
@@ -161,6 +165,11 @@
       ]
     },
     "rio-nix": {
+      "prod": [],
+      "optional": [],
+      "dev": []
+    },
+    "rio-packstore": {
       "prod": [],
       "optional": [],
       "dev": []
