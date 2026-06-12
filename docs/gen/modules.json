@@ -700,7 +700,7 @@
     {
       "path": "ingest/pipeline.rs",
       "depth": 1,
-      "doc": "Pipeline internals: shared work deque, byte-budget semaphore, reader"
+      "doc": "Pipeline internals: shared work deque, byte-budget accounting, reader"
     },
     {
       "path": "lib.rs",

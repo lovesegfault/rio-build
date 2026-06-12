@@ -55,8 +55,25 @@ pub struct IngestConfig {
     /// Byte-budget semaphore: combined prefetch window and tee bound.
     /// Sized so the largest common single file passes without streaming
     /// (32 MiB ≥ nixpkgs' 16.6 MiB hackage-packages.nix); a larger file is
-    /// admitted alone when the budget is fully free.
+    /// admitted alone when the budget is fully free. A quarter of the
+    /// budget is reserved while any directory listing is in flight (see
+    /// the pipeline module docs: the head reserve is what prevents the
+    /// steal-lock degraded mode the P1 profiling campaign measured).
     pub byte_budget: u64,
+    /// Test-only latency injection (cold-device / slow-spine simulation
+    /// for the steal-regime regression test).
+    #[cfg(test)]
+    pub(crate) test_delays: TestDelays,
+}
+
+/// Test-only injected latencies: `read` is added after every file read
+/// (readers and spine steals alike — a cold device is slow for both);
+/// `spine` is added after the spine consumes each file's contents.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TestDelays {
+    pub read: Option<std::time::Duration>,
+    pub spine: Option<std::time::Duration>,
 }
 
 impl Default for IngestConfig {
@@ -65,8 +82,23 @@ impl Default for IngestConfig {
             reader_threads: 8,
             chunk_workers: 2,
             byte_budget: 32 * 1024 * 1024,
+            #[cfg(test)]
+            test_delays: TestDelays::default(),
         }
     }
+}
+
+/// Per-run pipeline counters: who performed the file reads. The spine
+/// reading more than a small fraction is the signature of the steal-lock
+/// degraded mode (every steal is a QD1 serial read on the eval critical
+/// path), so tests and benches assert on the split structurally instead
+/// of on wall clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestRunStats {
+    /// Files read by the parallel reader pool.
+    pub reader_file_reads: u64,
+    /// Files read inline by the spine via the steal escape hatch.
+    pub spine_file_reads: u64,
 }
 
 /// One ingested source tree: the nix-facing identity (NAR sha256/size)
@@ -236,5 +268,15 @@ pub enum IngestError {
 /// only place threads exist), runs the NAR-sha256 spine on the calling
 /// thread, and joins everything — success or error — before returning.
 pub fn ingest_tree(root: &Path, config: &IngestConfig) -> Result<IngestResult, IngestError> {
+    ingest_tree_with_stats(root, config).map(|(result, _)| result)
+}
+
+/// [`ingest_tree`] plus the per-run reader/spine read split — the
+/// structural surface the steal-regime regression test and the P1 bench
+/// harness assert on.
+pub fn ingest_tree_with_stats(
+    root: &Path,
+    config: &IngestConfig,
+) -> Result<(IngestResult, IngestRunStats), IngestError> {
     pipeline::run(root, config)
 }
