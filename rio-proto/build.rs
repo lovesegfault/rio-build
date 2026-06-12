@@ -46,6 +46,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "rio.types.SchedulerMessage.msg",
         "#[allow(clippy::large_enum_variant)]",
     );
+    // ResultFrame (skeleton batch, Vec headers) dwarfs RecycleNotice.
+    // Same rationale: generated code, frames are transient.
+    b = b.type_attribute(
+        "rio.evaljob.WorkerFrame.msg",
+        "#[allow(clippy::large_enum_variant)]",
+    );
 
     // Derive `serde::Serialize` on the admin-facing response types so
     // rio-cli can `serde_json::to_string_pretty(&resp)` directly instead
@@ -121,6 +127,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "proto/admin_types.proto",
             // Castore Directory DAG (own package, no service).
             "proto/castore.proto",
+            // Worker-channel frames for rio-build-cli ↔ eval parent
+            // (own package, no service — length-delimited over a
+            // socketpair, never tonic).
+            "proto/evaljob.proto",
             // Canonical Derivation message (own package, no service).
             "proto/derivation.proto",
             // Service definition files (each a distinct package).

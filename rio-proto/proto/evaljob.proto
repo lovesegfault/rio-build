@@ -1,0 +1,154 @@
+syntax = "proto3";
+package rio.evaljob;
+
+// Worker-channel frames for the `rio build` coordinator ↔ eval-parent
+// IPC (ADR-024 "IPC"): each edge is one socketpair(AF_UNIX,
+// SOCK_STREAM); frames are length-delimited proto on the stream (a
+// 4-byte big-endian length prefix, then the encoded message — the
+// framing lives client-side in `rio-build-cli::framing`, NOT in tonic:
+// this channel is a pipe between two local processes, not an RPC
+// surface).
+//
+// Proto not because the channel needs it but because the payloads
+// already ARE proto: skeleton `rio.types.DerivationNode`s and canonical
+// `rio.drv.v1.Derivation` bytes cross from worker memory to rio-store
+// blob without re-encoding — byte-stability by construction.
+//
+// Direction conventions:
+//   - `CoordinatorFrame` flows coordinator → eval parent (downstream).
+//   - `WorkerFrame` flows eval parent → coordinator (upstream).
+// The eval parent multiplexes its fork-workers onto this single pair;
+// the coordinator never sees individual workers.
+
+import "dag.proto";   // ResultFrame.nodes → rio.types.DerivationNode
+import "types.proto"; // ResultFrame.drv_blobs → rio.types.DrvBlob
+
+// ───────────────────────────────────────────────────────────────────────────
+// Downstream: coordinator → eval parent
+// ───────────────────────────────────────────────────────────────────────────
+
+message CoordinatorFrame {
+  oneof msg {
+    WorkItem work = 1;
+    IfdCompletion ifd_completion = 2;
+    AckFeedback ack_feedback = 3;
+    Shutdown shutdown = 4;
+  }
+}
+
+// One attribute to evaluate (e.g. "nixosConfigurations.foo" or a flake
+// installable). The parent queues it onto a fork-worker.
+message WorkItem {
+  string attr = 1;
+}
+
+// Terminal answer to an `IfdRequest`: the import-from-derivation build
+// finished (outputs fetched into the client CAS) or failed. The worker
+// blocked on the import resumes on receipt.
+message IfdCompletion {
+  // Echoes IfdRequest.node.drv_path — the correlation key (a worker
+  // blocks on exactly one import at a time, but the parent may have
+  // several workers blocked on distinct drvs).
+  string drv_path = 1;
+  // Realized output store paths, materialized into the client CAS
+  // before this frame is sent. Empty on failure.
+  repeated string output_paths = 2;
+  // Non-empty = the IFD build failed; the worker fails its attr with
+  // this message.
+  string error = 3;
+}
+
+// Digests the cluster has acked (uploaded-or-present). The parent
+// folds these into the claim table it pre-warms re-forked workers
+// with, and drops retained drv bytes for acked digests (ADR-024:
+// "bytes are dropped on ack").
+message AckFeedback {
+  repeated bytes digests = 1; // 32-byte blake3, any object kind
+}
+
+// No more work. The parent drains in-flight attrs, reaps workers, and
+// exits; the coordinator treats subsequent EOF on the channel as clean.
+message Shutdown {}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Upstream: eval parent → coordinator
+// ───────────────────────────────────────────────────────────────────────────
+
+message WorkerFrame {
+  oneof msg {
+    ResultFrame result = 1;
+    IfdRequest ifd_request = 2;
+    RecycleNotice recycle = 3;
+    WorkerError error = 4;
+  }
+}
+
+// A batch of eval results for one attr. Workers stream batches as they
+// assemble skeleton subgraphs — the coordinator folds each batch
+// immediately (eval and upload overlap; nothing waits for "eval
+// finished"). The batch carrying a non-empty `root_drv_digest` is the
+// FINAL batch for the attr: the attr's transitive skeleton is complete
+// once every digest reachable from that root has been folded.
+message ResultFrame {
+  string attr = 1;
+  // Skeleton nodes with the ADR-024 digest fields populated
+  // (drv_digest, input_drv_digests) — the exact shape SubmitBuild
+  // takes, so the coordinator submits without re-deriving anything.
+  repeated rio.types.DerivationNode nodes = 2;
+  // Canonical drv bytes keyed by digest (worker-side assembly: drv
+  // bytes die with the worker, so they MUST ride the frame that
+  // introduces their skeleton node). The coordinator retains a body
+  // only until the cluster acks its digest.
+  repeated rio.types.DrvBlob drv_blobs = 3;
+  // Source trees the attr's inputSrcs reference (build-referenced
+  // only — never every tree eval touched).
+  repeated SourceRoot source_roots = 4;
+  // Empty on intermediate batches; the attr's root drv digest on the
+  // final batch (the coordinator's per-root submit gate keys on this).
+  bytes root_drv_digest = 5;
+}
+
+// One ingested source tree the coordinator may need to upload. The
+// client CAS holds the per-directory metadata blobs; the byte store is
+// the ORIGIN tree (ADR-024 "not stored: chunk copies of local working
+// trees") — upload-on-miss re-reads `origin`, re-chunks, and verifies
+// `dir_digest` still matches before uploading.
+message SourceRoot {
+  // Store path the tree dumped to (NAR sha256 identity).
+  string store_path = 1;
+  // blake3 of the root castore Directory blob (negotiation key).
+  bytes dir_digest = 2;
+  // SHA-256 of the canonical NAR serialization, 32 raw bytes. Claimed
+  // on upload (PutPathChunked recomputes server-side).
+  bytes nar_hash = 3;
+  uint64 nar_size = 4;
+  // Local filesystem path of the origin tree.
+  string origin = 5;
+}
+
+// A worker hit import-from-derivation and is blocked mid-eval. The
+// frame carries everything the coordinator needs for an immediate
+// mini-submission: the skeleton node AND the canonical drv bytes (the
+// drv's input closure was reported in earlier ResultFrames — workers
+// assemble bottom-up).
+message IfdRequest {
+  rio.types.DerivationNode node = 1;
+  rio.types.DrvBlob blob = 2;
+}
+
+// A fork-worker was recycled (attr quota or RSS threshold — process
+// exit IS the GC). Informational: the parent already re-queued any
+// incomplete attr; the coordinator surfaces it in the UI only.
+message RecycleNotice {
+  uint32 generation = 1;
+}
+
+// An attr failed to evaluate (or the parent hit a non-attr fault).
+// `fatal=false`: the named attr is lost but other attrs proceed.
+// `fatal=true`: the eval parent is going down; the coordinator fails
+// the invocation after draining already-complete roots.
+message WorkerError {
+  string attr = 1;
+  string message = 2;
+  bool fatal = 3;
+}
