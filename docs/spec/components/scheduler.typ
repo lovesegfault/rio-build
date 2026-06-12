@@ -1648,7 +1648,7 @@ claim-plane laws in `openAttempts.qnt` (`noCredentialClobber`,
 _Amendment note, 2026-06-08_ (bughunt-4 S5a, recorded at this anchor per the
 same R3 precedent): the bug_119 disposition above is NARROWED on the resume
 arm (merged_bug_074) --- only MINT-DISPROVING refusals
-(InvalidArgument/Unimplemented: the request shape can never mint) resolve
+(InvalidArgument/Unimplemented: the request shape cannot mint) resolve
 the ledger entry; auth-layer codes (PermissionDenied/Unauthenticated --- the
 scheduler's rotation-skew trace, emitted without consulting attempt state)
 file as Unanswered, because a RESUME entry exists precisely where the
@@ -1679,7 +1679,7 @@ proves a credential matched), the kinded unit table
 token; `colliding_identity_fresh_claim_gets_not_yet_ready` extended ---
 nonce agreement never overrides the one-winner refusal), the failover
 re-delivery test (`flag_on_recovery_rebuilds_job_view_and_jobs_survive`:
-wrong-nonce refused; right-nonce tokenless re-pull re-delivers the SAME
+wrong-nonce refused; right-nonce tokenless re-pull re-delivers the same
 attempt across failover --- the #(refs.migration)("096_assignments_claim_nonce")
 persistence pin), the store
 client battery (`timeout_then_resume_recovers_lost_response`,
