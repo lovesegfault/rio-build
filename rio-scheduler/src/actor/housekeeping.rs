@@ -1786,23 +1786,27 @@ impl DagActor {
         // promotion surface (I-199) cannot re-form on either axis
         // (population or rate).
         if let Some(mark) = witnessed {
-            match super::floor::witnessed_disposition(mark.reason) {
-                super::floor::WitnessedDisposition::PromoteMemFloor => {
+            // bug_102 (PD-2): the third production caller presents its
+            // witness via the witnessed-disposition constructor — the
+            // scheduler-anchored `sched.attempt.witnessed-terminal`
+            // mark (kubelet per-container attribution, establishment
+            // `won`-flag deduped) the worker cannot mint. The
+            // constructor returns a witness for exactly the
+            // PromoteMemFloor row; every other letter is classify-only
+            // (None — the no-bump arm: establish + requeue only).
+            match super::floor::CorroborationWitness::witnessed(
+                super::floor::witnessed_disposition(mark.reason),
+            ) {
+                Some(witness) => {
                     // The establishment charge was already decided
                     // (append+decide above): the bump is sizing
                     // evidence for the NEXT dispatch, not a
                     // retry-budget exemption — FloorOutcome's
                     // promoted/at_cap bits drive the worker-reported
                     // arms' counter logic, which has no analogue here.
-                    let _ = self
-                        .bump_resource_floor(
-                            &drv_hash,
-                            rio_proto::types::TerminationReason::OomKilled,
-                            "witnessed_oom",
-                        )
-                        .await;
+                    let _ = self.bump_resource_floor(&drv_hash, witness).await;
                 }
-                super::floor::WitnessedDisposition::ClassifyOnly => {
+                None => {
                     // The no-bump row: establish + requeue only.
                 }
             }

@@ -1159,25 +1159,33 @@ mod registration_writer_census {
     /// HELP's "the callers are the alphabet" sentences cite THIS census
     /// instead of restating a list that goes stale (the restated-
     /// sentence arm is struck: an alphabet/ONLY claim takes the machine
-    /// bind). Current population: the three worker-reported lanes
-    /// (completion.rs — `cgroup_oom`, `disk_full` [the live_057
-    /// prjquota-attributed DiskFull lane, WO-S6-9], `timeout`) and the
-    /// establishment sweep's witnessed-OomKilled disposition row
-    /// (housekeeping.rs — `witnessed_oom`, live_058-b). A new caller
-    /// reds here until it
-    /// files its row, its label, and the lib.rs HELP; rides the same
-    /// embedded-source universe as every census in this module (the
-    /// dev-tree completeness pin is `census_universe_matches_live_tree`;
-    /// the raw-layer plant is `worker_report_taint_sinks_pinned`'s
-    /// strawman, which proves `assert_census` rejects and NAMES
-    /// unlisted rows).
+    /// bind). Current population (bug_102: every caller presents a
+    /// typed `CorroborationWitness` — the demand sits inside the
+    /// mutation, so the label alphabet `{cgroup_oom, disk_full,
+    /// timeout, witnessed_oom}` derives from the witness, one
+    /// producer): the corroborated-sizing chokepoint
+    /// (completion.rs `bump_floor_on_corroborated_claim` — one call
+    /// site carrying both `cgroup_oom` and `disk_full` via the
+    /// witness), the corroborated-timeout lane (completion.rs
+    /// `handle_timeout_failure` — `timeout`, the attempt-age anchor),
+    /// and the establishment sweep's witnessed-OomKilled disposition
+    /// row (housekeeping.rs — `witnessed_oom`, live_058-b, via the
+    /// witnessed-disposition constructor). A new caller reds here
+    /// until it files its row, its witness constructor, and the
+    /// lib.rs HELP; rides the same embedded-source universe as every
+    /// census in this module (the dev-tree completeness pin is
+    /// `census_universe_matches_live_tree`; the raw-layer plant is
+    /// `worker_report_taint_sinks_pinned`'s strawman, which proves
+    /// `assert_census` rejects and NAMES unlisted rows).
     #[test]
     fn bump_resource_floor_caller_census() {
         let hits = census(&[".bump_resource", "_floor("]);
         let expected: BTreeMap<String, usize> = [
-            // 3 = cgroup_oom + timeout + disk_full (the live_057
-            // worker quota lane, WO-S6-9 c10 — the H2″-4 growth).
-            ("actor/completion.rs".to_string(), 3),
+            // 2 = the corroborated-sizing chokepoint (cgroup_oom +
+            // disk_full ride ONE witness-driven call) + the
+            // corroborated-timeout lane (bug_102 — was 3 when the
+            // sizing arms each restated the (reason, label) pair).
+            ("actor/completion.rs".to_string(), 2),
             ("actor/housekeeping.rs".to_string(), 1),
         ]
         .into();

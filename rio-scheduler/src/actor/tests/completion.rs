@@ -1470,6 +1470,14 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         d0 > 0 && d0 * 4 < 86_400,
         "ladder headroom under the 24h cap"
     );
+    // bug_102: the genuine-timeout anchor — the attempt demonstrably
+    // ran its assigned deadline (running_since backdated), so the
+    // corroboration witness mints and the floor heals as designed.
+    assert!(
+        handle
+            .debug_backdate_running(drv_hash, u64::from(d0))
+            .await?
+    );
     pull_report_exec(
         &handle,
         exec,
@@ -1525,6 +1533,11 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         .as_ref()
         .expect("re-mint re-stamps")
         .deadline_secs;
+    assert!(
+        handle
+            .debug_backdate_running(drv_hash, u64::from(d1))
+            .await?
+    );
     pull_report_exec(
         &handle,
         exec,
@@ -1564,6 +1577,11 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         .as_ref()
         .expect("re-mint re-stamps")
         .deadline_secs;
+    assert!(
+        handle
+            .debug_backdate_running(drv_hash, u64::from(d2))
+            .await?
+    );
     pull_report_exec(
         &handle,
         exec,
@@ -5421,6 +5439,13 @@ async fn carried_at_cap_deadline_exceeded_is_counted_not_exempt() -> TestResult 
         .as_ref()
         .expect("the mint stamps the dispatch shape")
         .deadline_secs;
+    // bug_102: the genuine anchor — the attempt ran its full carried
+    // 24h deadline before the controller's kill (backdated).
+    assert!(
+        handle
+            .debug_backdate_running(drv_hash, u64::from(crate::actor::floor::DEADLINE_CAP_SECS))
+            .await?
+    );
     pull_report_exec(
         &handle,
         exec,
@@ -6633,5 +6658,136 @@ async fn tenanted_evidence_backed_ca_realisation_lands_exactly_as_today() -> Tes
     );
     let info = expect_drv(&handle, "ca-evidence-realisation").await;
     assert_eq!(info.status, DerivationStatus::Completed);
+    Ok(())
+}
+
+/// **W12-L (bug_102)** — *proposition: no worker-supplied signal
+/// moves a persisted cross-tenant floor without a scheduler-anchored
+/// corroboration witness, quantified over floor MUTATIONS — the
+/// status-borne `TimedOut` lane included; the negation is the live
+/// ratchet: a hostile builder's zero-age TimedOut reports double
+/// `resource_floor.deadline_secs` per report toward the 24h cap into
+/// the GREATEST() ratchet that never heals downward.*
+///
+/// The wave-11 corroboration gate covered only CgroupOom/DiskFull
+/// riding `failure_classification`; TimedOut rides STATUS, bypassing
+/// SizingClaim entirely — no attempt-age-vs-assigned-deadline anchor
+/// consulted, and the standing census quantified over FailureClass
+/// CARRIERS, leaving the status lane structurally outside its corpus.
+/// Post-fix `bump_resource_floor` itself demands the typed
+/// `CorroborationWitness`; the timeout axis corroborates on
+/// attempt-open-duration >= assigned_deadline/2 (the scheduler's own
+/// `running_since` stamp — an anchor the worker cannot mint).
+///
+/// Forged half via `r13-allow(forged-report)` (zero-age TimedOut
+/// reports through the production pull path); the verdict flow is
+/// asserted UNTOUCHED (timeouts still charge `timeout_count` — the
+/// close is classify-only on the floor axis, never a retry change).
+// r[verify sched.trust.report-corroboration+2]
+#[tokio::test]
+async fn forged_timeout_reports_never_move_the_deadline_floor() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (_db, handle, _task) = setup().await;
+
+    let drv = "forged-timeout-drv";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+
+    // Five forged TimedOut reports (max_timeout_retries=4 requeues,
+    // the fifth takes the terminal Cancel verdict) with ~zero attempt
+    // age — dispatch then report immediately, the ratchet shape a
+    // hostile builder can drive for free.
+    for i in 0..5 {
+        let exec = open_pull_exec(&handle, drv).await;
+        pull_report_exec(
+            &handle,
+            exec,
+            drv,
+            pull_payload(rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::TimedOut.into(),
+                error_msg: format!("forged timeout {i} (zero attempt age)"),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        barrier(&handle).await;
+    }
+
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.sched.resource_floor.deadline_secs, 0,
+        "left (pre-fix): five zero-age TimedOut reports RATCHETED the \
+         deadline floor (doubling per report toward DEADLINE_CAP_SECS \
+         into the GREATEST() ratchet) with no corroboration anchor \
+         consulted / right: uncorroborated timeout claims are \
+         classify-only — the floor never moves"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_uncorroborated_sizing_claim_total{class=timed_out}"),
+        5,
+        "every refused timeout claim is a COUNTED letter on the \
+         standing refusal counter (the typed-claim siblings' alphabet \
+         gains the timed_out label)"
+    );
+    // The verdict flow is untouched: four timeouts charged the
+    // timeout budget (max_timeout_retries=4) and the fifth took the
+    // terminal Cancelled verdict — classify-only means the FLOOR is
+    // inert, never the retry accounting.
+    assert_eq!(
+        s.status,
+        DerivationStatus::Cancelled,
+        "the timeout budget verdict is unchanged by the floor refusal"
+    );
+    Ok(())
+}
+
+/// **W12-L2 (bug_102, the true-positive arm)** — *proposition: the
+/// genuine-timeout path still heals capacity — an attempt that
+/// demonstrably ran at least half its assigned deadline (the
+/// scheduler's own `running_since` clock vs the reconciled
+/// `last_intent.deadline_secs`) corroborates, and the floor doubles
+/// exactly as the wave-11 behavior intended for honest slow builds.*
+// r[verify sched.trust.report-corroboration+2]
+#[tokio::test]
+async fn corroborated_slow_build_timeout_still_heals_the_deadline_floor() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (_db, handle, _task) = setup().await;
+
+    let drv = "honest-slow-drv";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    let exec = open_pull_exec(&handle, drv).await;
+    // The scheduler-side anchor: this attempt RAN for 1800s of its
+    // 3600s assigned deadline (running_since backdated through the
+    // debug seam — the same stamp the Running transition mints;
+    // production constructors end-to-end otherwise).
+    assert!(handle.debug_backdate_running(drv, 1800).await?);
+    handle
+        .debug_seed_sched_hint(drv, None, None, Some(3600), None)
+        .await?;
+    pull_report_exec(
+        &handle,
+        exec,
+        drv,
+        pull_payload(rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::TimedOut.into(),
+            error_msg: "honest timeout after a real slow run".into(),
+            ..Default::default()
+        }),
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.sched.resource_floor.deadline_secs, 7200,
+        "corroborated (open 1800s >= 3600/2): the floor doubles from \
+         the assigned deadline — honest slow builds still heal"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_uncorroborated_sizing_claim_total{class=timed_out}"),
+        0,
+        "zero refusal letters on the corroborated path"
+    );
     Ok(())
 }

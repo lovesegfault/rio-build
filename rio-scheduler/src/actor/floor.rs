@@ -142,6 +142,158 @@ pub fn bump_floor_or_count(
     }
 }
 
+// r[impl sched.trust.report-corroboration+2]
+/// bug_102 — the typed corroboration witness `bump_resource_floor`
+/// DEMANDS: trust is gated at the CONSEQUENCE (the floor mutation),
+/// not re-derived per carrier at each call site. The wave-11 gate
+/// covered only the `failure_classification`-carried claims
+/// (CgroupOom/DiskFull); `TimedOut` rides STATUS and bypassed it —
+/// `handle_timeout_failure` bumped the deadline floor unconditionally
+/// and pre-verdict, so a hostile builder ratcheted a cross-tenant 24h
+/// deadline floor in ~5 cheap reports (the GREATEST() ratchet never
+/// heals downward). With the demand INSIDE the mutation, an ungated
+/// axis is unrepresentable: no caller can compile a bump without
+/// presenting a witness, and every witness is minted by a verifying
+/// constructor against a scheduler-owned anchor the worker cannot
+/// choose.
+///
+/// The axis is PRIVATE (the inner enum is not visible outside this
+/// module), so the constructors below are the ONLY mints:
+/// - [`Self::corroborated_sizing`] — the mem/disk bands vs the
+///   assigned shape (the wave-11 bands, moved here so the band law
+///   and the witness mint are one site);
+/// - [`Self::corroborated_timeout`] — attempt-open-duration >=
+///   assigned_deadline/2 (the scheduler's own `running_since` stamp
+///   vs the reconciled `last_intent.deadline_secs`);
+/// - [`Self::witnessed`] — the establishment sweep's
+///   controller-witnessed OomKilled disposition row (the
+///   `sched.attempt.witnessed-terminal` mark; kubelet per-container
+///   attribution, deduped by the establishment `won` flag).
+///
+/// The `(TerminationReason, label)` pair DERIVES from the witness
+/// ([`Self::reason`]/[`Self::label`]) — one producer for the mapping
+/// the four call sites previously each restated.
+pub(super) struct CorroborationWitness {
+    axis: WitnessAxis,
+}
+
+/// Private: only the verifying constructors mint witnesses.
+#[derive(Debug, Clone, Copy)]
+enum WitnessAxis {
+    /// Typed wire claim, band-corroborated (CgroupOom or DiskFull).
+    Sizing(rio_proto::types::FailureClass),
+    /// Worker TimedOut, anchored on the attempt's own open duration.
+    Timeout,
+    /// Controller-witnessed OomKilled at establishment.
+    WitnessedOom,
+}
+
+impl CorroborationWitness {
+    /// The wave-11 acceptance bands (CONSUMER-owned tolerances —
+    /// deliberately looser than the producer's classification
+    /// predicate; they only bound forgery and live in exactly one
+    /// place, here):
+    ///
+    /// * CGROUP_OOM: `peak_memory_bytes >= assigned_mem / 2` —
+    ///   memory.peak saturates at memory.max under a real oom kill.
+    /// * DISK_FULL: `hard_limit in [assigned_disk/2, assigned_disk*4]`
+    ///   AND `peak_used >= hard_limit / 2`.
+    ///
+    /// No assigned shape (cold start) => `None`: nothing to
+    /// corroborate against.
+    pub(super) fn corroborated_sizing(
+        claim: &super::report_ctx::SizingClaim,
+        assigned_mem: u64,
+        assigned_disk: u64,
+    ) -> Option<Self> {
+        use rio_proto::types::FailureClass;
+        let corroborated = match claim.class {
+            FailureClass::Unspecified => false, // unreachable: never constructed
+            FailureClass::CgroupOom => {
+                assigned_mem > 0 && claim.peak_memory_bytes >= assigned_mem / 2
+            }
+            FailureClass::DiskFull => claim.quota.is_some_and(|q| {
+                assigned_disk > 0
+                    && q.hard_limit_bytes >= assigned_disk / 2
+                    && q.hard_limit_bytes <= assigned_disk.saturating_mul(4)
+                    && q.peak_used_bytes >= q.hard_limit_bytes / 2
+            }),
+        };
+        corroborated.then_some(Self {
+            axis: WitnessAxis::Sizing(claim.class),
+        })
+    }
+
+    /// The timeout axis (bug_102's unsealed face): the attempt must
+    /// have demonstrably RUN at least half its assigned deadline —
+    /// `attempt_open` is the scheduler's own `running_since` elapsed
+    /// (stamped at the Running transition; a worker cannot mint it),
+    /// `assigned_deadline_secs` the reconciled dispatch deadline
+    /// (`last_intent` — bug_027's `max(resolved, carried)`).
+    ///
+    /// `None` anchors refuse: no `running_since` (failover-recovered
+    /// node — the lossy-Instant conservative default; the NEXT
+    /// attempt re-corroborates) or no assigned deadline (cold start)
+    /// mean there is nothing to corroborate against — classify-only,
+    /// the conservative direction (a floor never moves on absent
+    /// evidence).
+    pub(super) fn corroborated_timeout(
+        attempt_open: Option<std::time::Duration>,
+        assigned_deadline_secs: u32,
+    ) -> Option<Self> {
+        let open = attempt_open?;
+        if assigned_deadline_secs == 0 {
+            return None;
+        }
+        (open.as_secs() >= u64::from(assigned_deadline_secs) / 2).then_some(Self {
+            axis: WitnessAxis::Timeout,
+        })
+    }
+
+    /// The controller-witnessed lane: exactly the
+    /// [`WitnessedDisposition::PromoteMemFloor`] row (witnessed
+    /// OomKilled — the one structurally unambiguous kubelet
+    /// attribution); every other disposition is classify-only and
+    /// mints nothing.
+    pub(super) fn witnessed(disposition: WitnessedDisposition) -> Option<Self> {
+        match disposition {
+            WitnessedDisposition::PromoteMemFloor => Some(Self {
+                axis: WitnessAxis::WitnessedOom,
+            }),
+            WitnessedDisposition::ClassifyOnly => None,
+        }
+    }
+
+    /// The floor dimension this witness authorizes (consumed by
+    /// `bump_floor_or_count` via the caller).
+    pub(super) fn reason(&self) -> rio_proto::types::TerminationReason {
+        use rio_proto::types::{FailureClass, TerminationReason as R};
+        match self.axis {
+            WitnessAxis::Sizing(FailureClass::CgroupOom) => R::OomKilled,
+            WitnessAxis::Sizing(FailureClass::DiskFull) => R::EvictedDiskPressure,
+            // Unreachable: corroborated_sizing never mints it.
+            WitnessAxis::Sizing(FailureClass::Unspecified) => R::Unknown,
+            WitnessAxis::Timeout => R::DeadlineExceeded,
+            WitnessAxis::WitnessedOom => R::OomKilled,
+        }
+    }
+
+    /// The metric/log label — the caller-census alphabet
+    /// (`{cgroup_oom, disk_full, timeout, witnessed_oom}`, lib.rs
+    /// HELP in lockstep), derived from the witness instead of
+    /// restated per call site.
+    pub(super) fn label(&self) -> &'static str {
+        use rio_proto::types::FailureClass;
+        match self.axis {
+            WitnessAxis::Sizing(FailureClass::CgroupOom) => "cgroup_oom",
+            WitnessAxis::Sizing(FailureClass::DiskFull) => "disk_full",
+            WitnessAxis::Sizing(FailureClass::Unspecified) => "unspecified",
+            WitnessAxis::Timeout => "timeout",
+            WitnessAxis::WitnessedOom => "witnessed_oom",
+        }
+    }
+}
+
 /// live_058-b: establish-time disposition of a controller-WITNESSED
 /// terminal letter (the witnessed-terminal mark's reason). Consumed by
 /// the establishment sweep's charge arm — the dispatch over the

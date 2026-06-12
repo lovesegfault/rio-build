@@ -1241,22 +1241,27 @@ impl DagActor {
     /// persist.
     ///
     /// Called ONLY from explicit per-attempt resource-exhaustion
-    /// signals — the caller set is MACHINE-PINNED by the
+    /// signals, every one presenting a typed
+    /// [`super::floor::CorroborationWitness`] (bug_102 — the demand
+    /// sits inside the mutation; the witness constructors are the
+    /// only mints) — the caller set is MACHINE-PINNED by the
     /// `bump_resource_floor_caller_census` ([GEN-SET], db/live_pins.rs;
     /// a new caller reds the census until it files its row AND the
     /// lib.rs HELP):
-    /// - `handle_infrastructure_failure` (worker-reported `CgroupOom`
-    ///   — build child hit cgroup memory.max while pod survived) —
-    ///   label `cgroup_oom`
-    /// - `handle_infrastructure_failure` (worker-reported `DiskFull` —
-    ///   the live_057 prjquota-attributed classification,
-    ///   `apply_disk_override`; the same believed-store suppression
-    ///   gate as the OOM twin) — label `disk_full`
-    /// - `handle_timeout_failure` (worker-reported `TimedOut`) —
-    ///   label `timeout`
+    /// - `bump_floor_on_corroborated_claim` (worker-reported typed
+    ///   `CgroupOom`/`DiskFull` claims via
+    ///   `handle_infrastructure_failure`; band-corroborated by
+    ///   `CorroborationWitness::corroborated_sizing`) — labels
+    ///   `cgroup_oom` / `disk_full` (the live_057 prjquota-attributed
+    ///   classification, `apply_disk_override`)
+    /// - `handle_timeout_failure` (worker-reported `TimedOut`,
+    ///   corroborated on attempt-open-duration >= assigned_deadline/2
+    ///   by `CorroborationWitness::corroborated_timeout` — the
+    ///   scheduler's own `running_since` anchor) — label `timeout`
     /// - the establishment sweep's witnessed-OomKilled disposition row
     ///   (live_058-b, housekeeping.rs — the controller-witnessed
-    ///   per-container kubelet attribution, promoted exactly once per
+    ///   per-container kubelet attribution via
+    ///   `CorroborationWitness::witnessed`, promoted exactly once per
     ///   attempt via the establishment transaction's append+decide
     ///   `won` flag) — label `witnessed_oom`
     ///
@@ -1294,25 +1299,14 @@ impl DagActor {
     /// cannot choose: each ladder step must claim exhaustion AT the
     /// previously-assigned size, from a real scheduled attempt).
     ///
-    /// Acceptance bands (CONSUMER-owned tolerances — deliberately
-    /// looser than the producer's classification predicate, which
-    /// stays authoritative for honest builders; these bands only
-    /// bound forgery and live in exactly one place, here):
-    ///
-    /// * CGROUP_OOM: `peak_memory_bytes ≥ assigned_mem / 2` —
-    ///   memory.peak saturates at memory.max (= the assigned shape)
-    ///   under a real oom kill; a claim with a peak far below the
-    ///   assignment is refused.
-    /// * DISK_FULL: `hard_limit ∈ [assigned_disk/2, assigned_disk×4]`
-    ///   (the kubelet derives the project quota from the assigned
-    ///   ephemeral-storage shape — a forged tiny- or absurd-limit
-    ///   exhaustion is refused) AND `peak_used ≥ hard_limit / 2`
-    ///   (the build genuinely consumed its quota).
-    ///
-    /// No assigned shape (cold start, never dispatched by this
-    /// leader) ⇒ refuse: there is nothing to corroborate against,
-    /// and `bump_floor_or_count` would no-op on a zero base anyway.
-    /// Refusals are TYPED letters: counted
+    /// Acceptance bands: the band law lives WITH the witness mint —
+    /// [`super::floor::CorroborationWitness::corroborated_sizing`]
+    /// (bug_102: one site for the bands and the only constructor that
+    /// can authorize the sizing axes; this fn keeps the refusal
+    /// letters). No assigned shape (cold start, never dispatched by
+    /// this leader) ⇒ refuse: there is nothing to corroborate
+    /// against, and `bump_floor_or_count` would no-op on a zero base
+    /// anyway. Refusals are TYPED letters: counted
     /// (`rio_scheduler_uncorroborated_sizing_claim_total`),
     /// attributed, classify-only (the report's retry/charge flow is
     /// unaffected).
@@ -1322,7 +1316,6 @@ impl DagActor {
         drv_hash: &DrvHash,
         claim: super::report_ctx::SizingClaim,
     ) -> super::floor::FloorOutcome {
-        use rio_proto::types::FailureClass;
         let Some(intent) = self
             .dag
             .node(drv_hash)
@@ -1342,19 +1335,14 @@ impl DagActor {
             return super::floor::FloorOutcome::default();
         };
         let (assigned_mem, assigned_disk) = intent;
-        let corroborated = match claim.class {
-            FailureClass::Unspecified => false, // unreachable: never constructed
-            FailureClass::CgroupOom => {
-                assigned_mem > 0 && claim.peak_memory_bytes >= assigned_mem / 2
-            }
-            FailureClass::DiskFull => claim.quota.is_some_and(|q| {
-                assigned_disk > 0
-                    && q.hard_limit_bytes >= assigned_disk / 2
-                    && q.hard_limit_bytes <= assigned_disk.saturating_mul(4)
-                    && q.peak_used_bytes >= q.hard_limit_bytes / 2
-            }),
-        };
-        if !corroborated {
+        // bug_102: the bands live in the witness constructor — the
+        // mint and the band law are ONE site (actor/floor.rs); this
+        // fn keeps the refusal letters (count + warn, classify-only).
+        let Some(witness) = super::floor::CorroborationWitness::corroborated_sizing(
+            &claim,
+            assigned_mem,
+            assigned_disk,
+        ) else {
             warn!(
                 drv_hash = %drv_hash, class = ?claim.class,
                 peak_memory = claim.peak_memory_bytes,
@@ -1369,34 +1357,28 @@ impl DagActor {
             )
             .increment(1);
             return super::floor::FloorOutcome::default();
-        }
-        match claim.class {
-            FailureClass::Unspecified => super::floor::FloorOutcome::default(),
-            FailureClass::CgroupOom => {
-                self.bump_resource_floor(
-                    drv_hash,
-                    rio_proto::types::TerminationReason::OomKilled,
-                    "cgroup_oom",
-                )
-                .await
-            }
-            FailureClass::DiskFull => {
-                self.bump_resource_floor(
-                    drv_hash,
-                    rio_proto::types::TerminationReason::EvictedDiskPressure,
-                    "disk_full",
-                )
-                .await
-            }
-        }
+        };
+        // Unspecified can never mint a witness (the constructor's
+        // false arm), so the wire-default structurally cannot bump.
+        self.bump_resource_floor(drv_hash, witness).await
     }
 
+    // r[impl sched.trust.report-corroboration+2]
+    /// bug_102 — the corroboration chokepoint: the demand sits INSIDE
+    /// the floor mutation. Every caller presents a typed
+    /// [`super::floor::CorroborationWitness`] minted by a verifying
+    /// constructor (the worker cannot mint one), so an ungated axis is
+    /// UNREPRESENTABLE — the pre-fix shape (the status-borne TimedOut
+    /// lane bumping unconditionally while the typed-claim gate covered
+    /// only the FailureClass carriers) cannot compile. The
+    /// `(reason, label)` pair derives from the witness — one producer.
     pub(super) async fn bump_resource_floor(
         &mut self,
         drv_hash: &DrvHash,
-        reason: rio_proto::types::TerminationReason,
-        reason_label: &'static str,
+        witness: super::floor::CorroborationWitness,
     ) -> super::floor::FloorOutcome {
+        let reason = witness.reason();
+        let reason_label = witness.label();
         let mut new_floor = None;
         let outcome = if let Some(state) = self.dag.node_mut(drv_hash) {
             let o = super::floor::bump_floor_or_count(state, reason, &self.sla_ceilings);
@@ -4863,13 +4845,50 @@ impl DagActor {
         // inadequate, so an explicit resubmit starts at the doubled
         // floor instead of replaying the timeout. Same shape as
         // I-199's handle_infrastructure_failure prologue.
-        let floor_outcome = self
-            .bump_resource_floor(
-                drv_hash,
-                rio_proto::types::TerminationReason::DeadlineExceeded,
-                "timeout",
+        //
+        // bug_102 — the status-borne axis joins the corroboration law:
+        // TimedOut rides BuildResultStatus (no FailureClassification),
+        // so the wave-11 typed-claim gate never saw it and this bump
+        // was unconditional — a hostile builder ratcheted the
+        // cross-tenant 24h deadline floor in ~5 cheap zero-age
+        // reports. The witness anchors on the scheduler's OWN clock:
+        // the attempt demonstrably RAN at least half its assigned
+        // deadline (`running_since` elapsed vs the reconciled
+        // `last_intent.deadline_secs` — neither mintable by the
+        // worker). Uncorroborated => classify-only: the refusal is a
+        // typed counted letter and the verdict flow below is
+        // untouched (timeouts still charge `timeout_count`).
+        let timeout_witness = {
+            let state = self.dag.node(drv_hash);
+            let attempt_open = state
+                .and_then(|s| s.running_since)
+                .map(|since| since.elapsed());
+            let assigned_deadline = state
+                .and_then(|s| s.sched.last_intent.as_ref())
+                .map(|i| i.deadline_secs)
+                .unwrap_or(0);
+            super::floor::CorroborationWitness::corroborated_timeout(
+                attempt_open,
+                assigned_deadline,
             )
-            .await;
+        };
+        let floor_outcome = match timeout_witness {
+            Some(witness) => self.bump_resource_floor(drv_hash, witness).await,
+            None => {
+                warn!(
+                    drv_hash = %drv_hash, executor_id = %executor_id,
+                    "refusing uncorroborated timeout claim (attempt-open \
+                     duration below half the assigned deadline, or no \
+                     scheduler-side anchor); classify-only"
+                );
+                metrics::counter!(
+                    "rio_scheduler_uncorroborated_sizing_claim_total",
+                    "class" => "timed_out"
+                )
+                .increment(1);
+                super::floor::FloorOutcome::default()
+            }
+        };
         if let Some(row) = attempt_row.as_mut() {
             row.floor_promoted = floor_outcome.promoted;
             row.floor_at_cap = floor_outcome.at_cap;
