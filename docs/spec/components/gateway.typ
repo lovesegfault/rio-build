@@ -2289,3 +2289,17 @@ A network partition between gateway and scheduler causes the gateway's
 `STDERR_ERROR` to the Nix client, which retries (standard Nix behavior). Builds
 already submitted continue in the scheduler; the gateway re-attaches via
 `WatchBuild` after reconnection (#rref("gw.reconnect.backoff")).
+
+#r("gw.session.exit-attribution")[
+  The session-exit cancel reason MUST be computed from the shutdown
+  token's state ABOVE the exit-variant dispatch: a cancelled token
+  attributes `channel_close` regardless of which exit arm the race
+  surfaced through (`ChannelSession::Drop` fires cancel() then breaks
+  the pipe, and the break can land as a read, handler, or flush error
+  within one poll cycle), so every present and future exit variant
+  inherits the guard by construction. Per-arm re-checks are not a
+  conforming implementation --- the round-11 corpus measured the form
+  failing its own evolution: the commit that added the lone
+  `HandlerError` re-check minted the unguarded `FlushError` sibling in
+  the same diff.
+]

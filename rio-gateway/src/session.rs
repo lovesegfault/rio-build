@@ -265,23 +265,32 @@ where
     W: AsyncWrite + Unpin,
 {
     let exit = protocol_loop_inner(reader, writer, ctx, &shutdown).await;
-    let reason = match &exit {
-        SessionExit::ChannelClose => "channel_close",
-        SessionExit::IdleTimeout => "idle_timeout",
-        // `biased` selects prefer the token arm when both are Ready on
-        // the SAME poll, but ChannelSession::Drop fires cancel() then
-        // breaks the pipe — if those land between the token-poll and
-        // the handler's synchronous BrokenPipe within ONE poll cycle,
-        // the handler-Err exit carries a stale attribution. Re-check
-        // here so the reason string stays accurate regardless of which
-        // arm raced ahead.
-        SessionExit::HandlerError(_) if shutdown.is_cancelled() => "channel_close",
-        SessionExit::Clean
-        | SessionExit::HandshakeFailed(_)
-        | SessionExit::ClientEof
-        | SessionExit::ReadError(_)
-        | SessionExit::HandlerError(_)
-        | SessionExit::FlushError(_) => "client_disconnect",
+    // merged_bug_117: attribution that depends on which select arm won
+    // computes from the AUTHORITATIVE SIGNAL — the token state — ABOVE
+    // the arm dispatch. `biased` selects prefer the token arm when
+    // both are Ready on the SAME poll, but ChannelSession::Drop fires
+    // cancel() then breaks the pipe — if those land between the
+    // token-poll and a synchronous I/O error within ONE poll cycle,
+    // the error exit carries a stale attribution. The retired per-arm
+    // re-check guarded only HandlerError, and the commit that added it
+    // minted the unguarded FlushError sibling in the same diff —
+    // per-arm guards do not survive their own evolution. Hoisted, the
+    // race window is one cell for EVERY variant, present and future:
+    // a new exit arm inherits the guard by construction.
+    // r[impl gw.session.exit-attribution]
+    let reason = if shutdown.is_cancelled() {
+        "channel_close"
+    } else {
+        match &exit {
+            SessionExit::ChannelClose => "channel_close",
+            SessionExit::IdleTimeout => "idle_timeout",
+            SessionExit::Clean
+            | SessionExit::HandshakeFailed(_)
+            | SessionExit::ClientEof
+            | SessionExit::ReadError(_)
+            | SessionExit::HandlerError(_)
+            | SessionExit::FlushError(_) => "client_disconnect",
+        }
     };
     // Unconditional: cheap on an empty map, and the Clean/handshake
     // variants are exactly the defense-in-depth sweeps the old

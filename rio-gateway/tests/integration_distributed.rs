@@ -621,3 +621,215 @@ async fn test_post_opcode_flush_error_cancels_active_builds() -> anyhow::Result<
     sched_handle.abort();
     Ok(())
 }
+
+// r[verify gw.session.exit-attribution]
+/// W11-BL (merged_bug_117): attribution computes from the
+/// AUTHORITATIVE SIGNAL (token state) ABOVE the arm dispatch.
+/// `ChannelSession::Drop` fires `cancel()` then breaks the pipe; if
+/// both land between the biased token-poll and a synchronous I/O
+/// error within ONE poll cycle, the error arm carries the exit. The
+/// pre-fix per-arm re-check guarded ONLY `HandlerError` — the same
+/// commit that added it minted the unguarded `FlushError` sibling,
+/// and `ReadError` was never guarded: both persisted
+/// `client_disconnect` (via CancelBuildRequest.reason) on what was a
+/// deploy/channel close. The fixtures CANCEL the token inside their
+/// own error poll — deterministically landing the cancel after the
+/// token-poll and before the arm resolves, the exact race.
+///
+/// Pre-fix red, verbatim:
+///   assertion `left == right` failed: a cancel-then-pipe-break read
+///   error must attribute channel_close (the token is the authority)
+///     left: "client_disconnect"
+///    right: "channel_close"
+///
+/// Population: ALL exit arms x the race window — the hoist guards
+/// ReadError (cell 1 here), FlushError (cell 2), and HandlerError
+/// (the previously-guarded arm, now the same code path by
+/// construction: new variants inherit the hoist).
+#[tokio::test(flavor = "current_thread")]
+async fn test_cancel_race_attributes_channel_close_on_every_arm() -> anyhow::Result<()> {
+    use rio_gateway::handler::SessionContext;
+    use rio_gateway::session::run_protocol_loop;
+    use rio_test_support::grpc::spawn_mock_store;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    common::init_test_logging();
+
+    let (_store, store_addr, store_handle) = spawn_mock_store().await?;
+    let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
+
+    /// Reader: handshake bytes, then CANCELS the token and returns
+    /// ConnectionReset in the same poll (Drop's cancel-then-break).
+    struct CancelThenReset {
+        bytes: Vec<u8>,
+        token: rio_common::signal::Token,
+    }
+    impl AsyncRead for CancelThenReset {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.bytes.is_empty() {
+                self.token.cancel();
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "simulated RST after cancel",
+                )));
+            }
+            let n = buf.remaining().min(self.bytes.len());
+            buf.put_slice(&self.bytes[..n]);
+            self.bytes.drain(..n);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn hs(extra: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        wire::write_u64(&mut bytes, WORKER_MAGIC_1).await?;
+        wire::write_u64(&mut bytes, 0x123).await?; // 1.35
+        wire::write_u64(&mut bytes, 0).await?; // cpu_affinity
+        wire::write_u64(&mut bytes, 0).await?; // reserve_space
+        bytes.extend_from_slice(extra);
+        Ok(bytes)
+    }
+
+    // ---- Cell 1: ReadError under the cancel race ----
+    let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let log_client: rio_proto::LogServiceClient<_> =
+        rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
+    let mut ctx = SessionContext::new(
+        store_client,
+        log_client,
+        scheduler_client,
+        None,
+        rio_gateway::handler::SessionJwt::none(),
+        None,
+        rio_gateway::TenantLimiter::disabled(),
+        rio_gateway::QuotaCache::new(),
+    );
+    ctx.active_build_ids.insert("raced-read-err".to_string());
+    let shutdown = rio_common::signal::Token::new();
+    let mut reader = CancelThenReset {
+        bytes: hs(&[]).await?,
+        token: shutdown.clone(),
+    };
+    let mut writer = tokio::io::sink();
+    let result =
+        run_protocol_loop(&mut reader, &mut writer, &mut ctx, shutdown.child_token()).await;
+    assert!(result.is_err(), "the read error still propagates");
+    let cancels = sched.cancel_calls.read().unwrap().clone();
+    assert_eq!(cancels.len(), 1, "one cancel; got {cancels:?}");
+    assert_eq!(cancels[0].0, "raced-read-err");
+    assert_eq!(
+        cancels[0].1, "channel_close",
+        "a cancel-then-pipe-break read error must attribute channel_close \
+         (the token is the authority)"
+    );
+
+    // ---- Cell 2: FlushError under the cancel race ----
+    /// Writer: fails the `fail_at`-th flush, cancelling the token in
+    /// the same poll first.
+    struct CancelThenFlushFail {
+        flushes: usize,
+        fail_at: usize,
+        token: rio_common::signal::Token,
+    }
+    impl AsyncWrite for CancelThenFlushFail {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.flushes += 1;
+            if self.flushes == self.fail_at {
+                self.token.cancel();
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated client drop at response flush after cancel",
+                )));
+            }
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    struct ThenPark2 {
+        bytes: Vec<u8>,
+    }
+    impl AsyncRead for ThenPark2 {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.bytes.is_empty() {
+                return Poll::Pending;
+            }
+            let n = buf.remaining().min(self.bytes.len());
+            buf.put_slice(&self.bytes[..n]);
+            self.bytes.drain(..n);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let log_client: rio_proto::LogServiceClient<_> =
+        rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
+    let mut ctx = SessionContext::new(
+        store_client,
+        log_client,
+        scheduler_client,
+        None,
+        rio_gateway::handler::SessionJwt::none(),
+        None,
+        rio_gateway::TenantLimiter::disabled(),
+        rio_gateway::QuotaCache::new(),
+    );
+    ctx.active_build_ids.insert("raced-flush-err".to_string());
+    let mut setopts = Vec::new();
+    wire::write_u64(&mut setopts, 19).await?; // wopSetOptions
+    for _ in 0..12 {
+        wire::write_u64(&mut setopts, 0).await?;
+    }
+    wire::write_u64(&mut setopts, 0).await?; // overrides: empty
+    let shutdown = rio_common::signal::Token::new();
+    let mut reader = ThenPark2 {
+        bytes: hs(&setopts).await?,
+    };
+    let mut writer = CancelThenFlushFail {
+        flushes: 0,
+        fail_at: 5,
+        token: shutdown.clone(),
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run_protocol_loop(&mut reader, &mut writer, &mut ctx, shutdown.child_token()),
+    )
+    .await
+    .expect("the flush error must exit the loop");
+    assert!(result.is_err(), "the flush error still propagates");
+    let cancels = sched.cancel_calls.read().unwrap().clone();
+    assert_eq!(cancels.len(), 2, "second cancel; got {cancels:?}");
+    assert_eq!(cancels[1].0, "raced-flush-err");
+    assert_eq!(
+        cancels[1].1, "channel_close",
+        "a cancel-then-pipe-break flush error must attribute channel_close \
+         (the previously-unguarded sibling)"
+    );
+
+    store_handle.abort();
+    sched_handle.abort();
+    Ok(())
+}
