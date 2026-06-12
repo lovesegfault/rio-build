@@ -289,8 +289,15 @@ impl StoreServiceImpl {
         }
         let claim = claim.expect("claim populated in IA pre-ingest or CA post-ingest arm");
 
-        self.finalize_single(info, claim, nar_data, auth.tenant_id, hold)
-            .await?;
+        self.finalize_single(
+            info,
+            claim,
+            nar_data,
+            auth.tenant_id,
+            auth.registration_tenant(),
+            hold,
+        )
+        .await?;
         if let Some(g) = placeholder_guard {
             g.defuse();
         }

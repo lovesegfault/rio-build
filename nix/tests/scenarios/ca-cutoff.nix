@@ -46,6 +46,37 @@ pkgs.testers.runNixOSTest {
 
     store_url = "ssh-ng://${gatewayHost}"
 
+    # ── bug_155 fixture half (the landed-law update) ──────────────────
+    # Floating-CA realisations now demand store-recorded production
+    # evidence at the GLOBAL table's own scope, and the evidence rows
+    # (path_tenants, stamped by the store's ingest lane at upload) are
+    # TENANT-keyed — the bootstrap's empty-comment key is the
+    # NULL-tenant anon face, whose realisation inserts now lawfully
+    # REFUSE (empty cohort => empty evidence set => refuse all; the
+    # bug_155 close's disclosed delta). The cutoff chain needs the
+    # realisation rows for B/C's resolve, so this scenario runs the
+    # chain TENANTED: seed the tenant row, re-key the client with the
+    # tenant-name comment (r[gw.auth.tenant-from-key-comment]), and
+    # let the production evidence chain run end-to-end — dispatch
+    # mints claims for the build's cohort, the worker's PutPath
+    # stamps (path, tenant), the consult finds the evidence, and the
+    # realisation lands exactly as the law demands.
+    ${gatewayHost}.succeed(
+        "psql -h 127.0.0.1 -U postgres -d rio -c \"INSERT INTO tenants "
+        "(tenant_id, tenant_name) VALUES "
+        "('c07f0f00-0000-4000-8000-000000000001', 'cutoff-tenant') "
+        "ON CONFLICT (tenant_id) DO NOTHING\""
+    )
+    client.succeed(
+        "rm -f /root/.ssh/id_ed25519 /root/.ssh/id_ed25519.pub && "
+        "ssh-keygen -t ed25519 -N ''' -C 'cutoff-tenant' -f /root/.ssh/id_ed25519"
+    )
+    pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
+    ${gatewayHost}.succeed(f"echo '{pubkey}' > /var/lib/rio/gateway/authorized_keys")
+    ${gatewayHost}.succeed("systemctl restart rio-gateway.service")
+    ${gatewayHost}.wait_for_unit("rio-gateway.service")
+    ${gatewayHost}.wait_for_open_port(2222)
+
     def build_ca_chain(marker, ia_levels=0, sleep_secs=8):
         """Build the floating-CA A→B→C chain. marker goes into the
         ATerm env (distinct drv hashes across calls) but NOT into

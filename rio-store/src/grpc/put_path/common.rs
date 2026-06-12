@@ -327,6 +327,41 @@ impl PutAuth {
     pub(in crate::grpc) fn builder_claims(&self) -> Option<&rio_auth::hmac::AssignmentClaims> {
         self.authority.builder_claims()
     }
+
+    /// bug_155 (the evidence-producer half): the tenant the ingest
+    /// REGISTRATION stamp records — the per-session JWT tenant (the
+    /// wire/client lane) or, on the builder lane, the SIGNED
+    /// `AssignmentClaims.tenant` (scheduler-minted at dispatch from
+    /// the build's attributed cohort; the same trust rule as
+    /// `hw_perf_samples.submitting_tenant` and the declared-mode
+    /// charge bucket: attribution from CLAIMS, never the request
+    /// body — a compromised worker cannot choose the tenant it
+    /// stamps). Builder uploads previously stamped NOTHING (the stamp
+    /// consumed only the JWT tenant, which builders never carry), so
+    /// no worker-built floating-CA path ever acquired the
+    /// store-recorded production evidence the scheduler's
+    /// realisation/visibility consult demands — the consult refused
+    /// the HONEST tenanted flow end-to-end. A malformed signed tenant
+    /// fails CLOSED on this axis (warn + no stamp: evidence is a
+    /// grant, never defaulted; the upload itself still succeeds and
+    /// the registration grace covers a lawful re-stamp).
+    pub(in crate::grpc) fn registration_tenant(&self) -> Option<uuid::Uuid> {
+        if let Some(t) = self.tenant_id {
+            return Some(t);
+        }
+        let signed = self.builder_claims().and_then(|c| c.tenant.as_deref())?;
+        match uuid::Uuid::parse_str(signed) {
+            Ok(u) => Some(u),
+            Err(e) => {
+                tracing::warn!(
+                    tenant = %signed,
+                    error = %e,
+                    "ingest registration: malformed signed tenant attribution;                      skipping the stamp (re-stamp covered by the registration                      grace)"
+                );
+                None
+            }
+        }
+    }
 }
 
 /// Validate a raw PathInfo message for PutPath/PutPathBatch.
@@ -1016,7 +1051,13 @@ impl StoreServiceImpl {
         mut info: ValidatedPathInfo,
         claim: uuid::Uuid,
         nar_data: Vec<u8>,
+        // JWT/session tenant: signing-key selection ONLY (builders
+        // carry none; the wire lane's session tenant signs narinfo).
         tenant_id: Option<uuid::Uuid>,
+        // bug_155: the REGISTRATION tenant ([`PutAuth::registration_tenant`]
+        // — JWT or the signed claims attribution); drives the ingest
+        // evidence stamp, never signing.
+        registration_tenant: Option<uuid::Uuid>,
         hold: Option<NarIngestHold<'_>>,
     ) -> Result<(), Status> {
         // BY VALUE (bug_094): this fn owns the hold's tail so the
@@ -1079,7 +1120,7 @@ impl StoreServiceImpl {
         // deadline, never pin the budget on a best-effort stamp.
         // Elapse degrades exactly like a failed stamp (skip + warn;
         // the registration grace covers the re-stamp).
-        let stamping = stamp_ingest_tenant(&self.pool, &info.store_path_hash, tenant_id);
+        let stamping = stamp_ingest_tenant(&self.pool, &info.store_path_hash, registration_tenant);
         if tokio::time::timeout(envelope.remaining(), stamping)
             .await
             .is_err()
@@ -1652,6 +1693,71 @@ mod declared_budget_tests {
             .expect("released charge restores tenant headroom");
     }
 
+    /// bug_155 (the evidence-producer half): the registration-tenant
+    /// derivation is total over the authority × session matrix — the
+    /// JWT/session tenant wins when present (the wire lane); the
+    /// builder lane falls back to the SIGNED claims attribution (the
+    /// scheduler-minted cohort — previously the builder lane stamped
+    /// NOTHING and no worker-built floating-CA path ever acquired
+    /// evidence); malformed signed tenants fail CLOSED (no stamp —
+    /// evidence is a grant, never defaulted); dev/service authorities
+    /// without a session tenant stamp nothing.
+    #[test]
+    fn registration_tenant_derivation_is_total() {
+        let claims = |tenant: Option<&str>| rio_auth::hmac::AssignmentClaims {
+            executor_id: "w".into(),
+            drv_hash: "d".into(),
+            expected_outputs: vec![],
+            is_ca: true,
+            expiry_unix: 0,
+            tenant: tenant.map(|t| t.to_string()),
+        };
+        let t_jwt = uuid::Uuid::from_u128(11);
+        let t_claims = uuid::Uuid::from_u128(7);
+
+        // Builder lane, signed cohort: the claims tenant stamps.
+        let auth = PutAuth {
+            authority: IngestAuthority::Builder(claims(Some(&t_claims.to_string()))),
+            tenant_id: None,
+        };
+        assert_eq!(
+            auth.registration_tenant(),
+            Some(t_claims),
+            "left (pre-fix): builder uploads stamped NOTHING — the \
+             consult refused the honest tenanted flow / right: the \
+             signed claims attribution is the evidence producer"
+        );
+
+        // Session tenant wins when present (the wire lane).
+        let auth = PutAuth {
+            authority: IngestAuthority::Builder(claims(Some(&t_claims.to_string()))),
+            tenant_id: Some(t_jwt),
+        };
+        assert_eq!(auth.registration_tenant(), Some(t_jwt));
+
+        // Malformed signed tenant: fail closed, no stamp.
+        let auth = PutAuth {
+            authority: IngestAuthority::Builder(claims(Some("not-a-uuid"))),
+            tenant_id: None,
+        };
+        assert_eq!(auth.registration_tenant(), None);
+
+        // Tenant-less claims / dev / service: nothing to stamp.
+        for authority in [
+            IngestAuthority::Builder(claims(None)),
+            IngestAuthority::ServiceBypass {
+                caller: "gw".into(),
+            },
+            IngestAuthority::DevMode,
+        ] {
+            let auth = PutAuth {
+                authority,
+                tenant_id: None,
+            };
+            assert_eq!(auth.registration_tenant(), None);
+        }
+    }
+
     /// The unattributed-bucket derivation (the cost axis is total
     /// over authorities): no claims, tenant-less claims, and
     /// malformed signed tenants all charge the capped nil bucket;
@@ -1883,7 +1989,7 @@ mod drop_before_abort_tests {
             .unwrap();
         let tx_cell = std::cell::RefCell::new(Some(tx));
 
-        let fin = svc.finalize_single(info.clone(), claim, nar.clone(), None, Some(hold));
+        let fin = svc.finalize_single(info.clone(), claim, nar.clone(), None, None, Some(hold));
         let probe = async {
             // The witness: the budget restores to FULL while the
             // abort still cannot finish (the row lock is ours).

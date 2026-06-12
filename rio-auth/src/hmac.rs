@@ -103,11 +103,20 @@ pub struct AssignmentClaims {
     pub expiry_unix: u64,
     /// Attributing tenant UUID (hyphenated). When set, the store
     /// writes it to `hw_perf_samples.submitting_tenant`
-    /// (`r[sched.sla.threat.hw-median-of-medians]`). The store derives
+    /// (`r[sched.sla.threat.hw-median-of-medians]`), charges the
+    /// declared-mode NAR budget to this tenant's bucket, and — bug_155
+    /// — stamps the ingest REGISTRATION rows (`path_tenants`) for the
+    /// builder lane's uploads: this signed attribution is how a
+    /// worker-built floating-CA output acquires the store-recorded
+    /// production evidence the scheduler's realisation/visibility
+    /// consult demands (builders carry no per-session tenant JWT; the
+    /// claims are the cohort's signed carrier). The store derives
     /// tenant from CLAIMS (signed) — never from the request body — so
     /// a compromised worker cannot fabricate tenant identities to
-    /// defeat the median-of-medians defence. `None` for orphaned/
-    /// recovered nodes (no live owning build).
+    /// defeat the median-of-medians defence, choose a foreign charge
+    /// bucket, or mint evidence for a cohort the scheduler never
+    /// attributed. `None` for orphaned/recovered nodes (no live owning
+    /// build).
     ///
     /// **Wire-compat (bug_011).** This struct carries
     /// `#[serde(deny_unknown_fields)]`, so adding a field is a wire

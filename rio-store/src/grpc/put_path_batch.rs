@@ -233,7 +233,11 @@ impl StoreServiceImpl {
         };
 
         // --- Phase 3: ONE transaction, N completions, one commit ---
-        let committing = self.commit_batch(&mut outputs, resolved_signer.as_ref(), auth.tenant_id);
+        let committing = self.commit_batch(
+            &mut outputs,
+            resolved_signer.as_ref(),
+            auth.registration_tenant(),
+        );
         let committed = match &hold {
             Some(h) => match h.bounded("PutPathBatch commit", committing).await {
                 Ok(r) => r,
@@ -438,6 +442,9 @@ impl StoreServiceImpl {
         &self,
         outputs: &mut BTreeMap<u32, OutputAccum>,
         resolved_signer: Option<&(crate::signing::Signer, bool)>,
+        // bug_155: the REGISTRATION tenant (JWT or the signed claims
+        // attribution) — drives the in-tx ingest evidence stamp; the
+        // signer was resolved from the JWT/session tenant upstream.
         tenant_id: Option<uuid::Uuid>,
     ) -> Result<Vec<bool>, Status> {
         let mut tx = self
