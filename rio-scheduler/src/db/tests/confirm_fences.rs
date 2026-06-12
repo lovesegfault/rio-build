@@ -90,7 +90,9 @@ async fn insert_confirm_fence_below_floor_writes_nothing() -> anyhow::Result<()>
 }
 
 /// The TTL rider deletes only rows past the horizon: a zero horizon
-/// sweeps the fence, a 24h horizon keeps a fresh one.
+/// sweeps the fence, the shipped credential-derived horizon
+/// (`CONFIRM_FENCE_GC_SECS` = `MAX_HMAC_LIFETIME_SECS` + slack)
+/// keeps a fresh one.
 #[tokio::test]
 async fn fence_gc_respects_horizon() -> anyhow::Result<()> {
     let (_pg, db) = setup().await;
@@ -102,7 +104,10 @@ async fn fence_gc_respects_horizon() -> anyhow::Result<()> {
     let kept = db
         .gc_confirm_fences(crate::db::confirm_fences::CONFIRM_FENCE_GC_SECS, 100)
         .await?;
-    assert_eq!(kept, 0, "a fresh fence survives the 24h horizon");
+    assert_eq!(
+        kept, 0,
+        "a fresh fence survives the credential-derived horizon"
+    );
     assert!(db.confirm_fence_exists(&hash).await?.is_some());
 
     let swept = db.gc_confirm_fences(0.0, 100).await?;

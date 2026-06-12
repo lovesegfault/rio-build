@@ -198,9 +198,11 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
         RetentionPolicy::SweptBy {
             symbol: "gc_confirm_fences",
             note: "the attempt-ledger housekeeping tick's fence rider \
-                   (merged_bug_145): rows older than 24h — any straggler \
-                   pull has long since timed out; one row per \
-                   confirm-exited pod, so volume tracks pod churn",
+                   (merged_bug_145): rows older than the credential-derived \
+                   horizon CONFIRM_FENCE_GC_SECS (MAX_HMAC_LIFETIME_SECS + \
+                   slack — the fence outlives every token the family signer \
+                   can mint); one row per confirm-exited pod, so volume \
+                   tracks pod churn",
         },
     ),
     (

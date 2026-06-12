@@ -480,6 +480,45 @@ def scan_wire_secs_seams(files):
     return fails
 
 
+# --- the retention-registry numeric-claim arm (WO-S8-7) ---------------
+#
+# merged_bug_081: the retention registry lints SYMBOL linkage (xtask
+# RetentionTruth) while its free-prose note fields rot — the 24h
+# fence-horizon claim survived two re-derivations of the constant it
+# narrated. Numeric duration figures are BANNED in the registry's
+# string fields (derived-or-banned: the describe scrape is
+# literal-only, so figures cannot interpolate — prose cites the
+# deriving SYMBOL instead and the figure lives once, at the const).
+RETENTION_REGISTRY = "rio-migrations/src/retention.rs"
+DURATION_FIGURE = re.compile(
+    r"\b\d+(?:\.\d+)?\s*(?:h|hr|hrs|hour|hours|d|day|days|min|mins|"
+    r"minute|minutes|s|sec|secs|second|seconds|ms)\b"
+)
+
+
+def scan_retention_notes(src_root):
+    """Duration figures inside ANY string literal of the retention
+    registry are reds (the lexer's string spans — comments are
+    commentary, code symbols carry no figures)."""
+    f = src_root / RETENTION_REGISTRY
+    if not f.is_file():
+        return [f"{RETENTION_REGISTRY} missing — the retention registry moved; re-anchor this arm"]
+    text = f.read_text()
+    _, spans, _ = rust_strip.lex_full(text, blank_string_bodies=False)
+    fails = []
+    for a, b, _raw in spans:
+        m = DURATION_FIGURE.search(text[a:b])
+        if m:
+            lineno = text.count("\n", 0, a + m.start()) + 1
+            fails.append(
+                f"{RETENTION_REGISTRY}:{lineno}: numeric duration figure "
+                f"`{m.group(0)}` in a registry string — registry figures rot "
+                f"(the 24h fence-horizon lesson, merged_bug_081); cite the "
+                f"deriving symbol and keep the figure at its const"
+            )
+    return fails
+
+
 REFUSAL_SCAN_CRATES = ["rio-builder", "rio-store", "rio-gateway", "rio-scheduler", "rio-controller"]
 
 
@@ -668,6 +707,24 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+    # W11-BZ (WO-S8-7): a planted stale figure in a retention-registry
+    # note field is a census red — and a figure-free symbol-citing
+    # note passes.
+    with tempfile.TemporaryDirectory() as td:
+        straw_root = pathlib.Path(td)
+        (straw_root / "rio-migrations" / "src").mkdir(parents=True)
+        reg = straw_root / RETENTION_REGISTRY
+        reg.write_text('const N: &str = "rows older than 24h are swept";\n')
+        f_z = scan_retention_notes(straw_root)
+        if len(f_z) != 1 or "24h" not in f_z[0]:
+            print(f"FAIL: W11-BZ — the planted 24h note figure did not red: {f_z}", file=sys.stderr)
+            return 1
+        reg.write_text(
+            'const N: &str = "rows older than the credential-derived horizon CONFIRM_FENCE_GC_SECS";\n'
+        )
+        if scan_retention_notes(straw_root):
+            print("FAIL: W11-BZ — the symbol-citing figure-free note flagged", file=sys.stderr)
+            return 1
     # Arm F-allow: the allow grammar admits a documented exception.
     allowed_ws = "// wire-secs-census: allow(test fixture builds its own clock)\n" + WIRE_SECS_GRAMMAR[0][1]
     if scan_wire_secs_seams([("planted/allowed.rs", allowed_ws)]):
@@ -736,6 +793,8 @@ def main() -> int:
     # `optional … *_seconds` proto field may exist while the grammar
     # excludes the prost-getter read form.
     fails += scan_proto_optional_seconds(src_root)
+    # The retention-registry numeric-claim arm (WO-S8-7).
+    fails += scan_retention_notes(src_root)
 
     gaps = sorted(f"{name}:{ax}" for name, _, _, _, g, _ in REGISTRY for ax in g)
     derived = sum(1 for *_, d in REGISTRY if d is not None)

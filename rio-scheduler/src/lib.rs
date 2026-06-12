@@ -306,8 +306,10 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_confirm_fences_gc_deleted_total",
         "executor_confirm_fences rows deleted by the housekeeping TTL rider \
-         (merged_bug_145): confirm-exit fence rows older than 24h — any \
-         straggler pull has long since timed out"
+         (merged_bug_145): confirm-exit fence rows older than the \
+         credential-derived horizon CONFIRM_FENCE_GC_SECS \
+         (MAX_HMAC_LIFETIME_SECS + slack — the fence outlives every token \
+         the family signer can mint, asserted at its const)"
     );
     describe_counter!(
         "rio_scheduler_resource_floor_bumps_total",

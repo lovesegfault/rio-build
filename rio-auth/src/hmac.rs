@@ -1336,7 +1336,8 @@ mod tests {
 
     /// merged_bug_079: two mints over EQUAL claims must produce
     /// byte-distinct tokens. The confirm fence keys durable rows on
-    /// `sha256(token bytes)` (`executor_confirm_fences`, 24h GC), so a
+    /// `sha256(token bytes)` (`executor_confirm_fences`, GC'd past the
+    /// credential-derived `CONFIRM_FENCE_GC_SECS` horizon), so a
     /// deterministic re-mint across controller ticks hands a
     /// replacement forecast pod its predecessor's fence identity — the
     /// DeliverNew screen answers the NEW pod `Gone` for an exit the OLD

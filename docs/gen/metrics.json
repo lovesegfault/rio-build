@@ -837,7 +837,7 @@
       {
         "name": "rio_scheduler_confirm_fences_gc_deleted_total",
         "kind": "counter",
-        "help": "executor_confirm_fences rows deleted by the housekeeping TTL rider (merged_bug_145): confirm-exit fence rows older than 24h — any straggler pull has long since timed out"
+        "help": "executor_confirm_fences rows deleted by the housekeeping TTL rider (merged_bug_145): confirm-exit fence rows older than the credential-derived horizon CONFIRM_FENCE_GC_SECS (MAX_HMAC_LIFETIME_SECS + slack — the fence outlives every token the family signer can mint, asserted at its const)"
       },
       {
         "name": "rio_scheduler_critical_path_accuracy",
