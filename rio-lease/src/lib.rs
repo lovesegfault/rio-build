@@ -1841,9 +1841,20 @@ enum BaselineEdge {
     /// The read completed with facts: re-baseline to its
     /// holder-authored content.
     FromRead,
-    /// No read facts (the 404→Create path): the next read
-    /// re-baselines.
+    /// No read facts and the Create WON (Leading): the POST left no
+    /// read facts, and Leading answered the ledger wholesale — the
+    /// next read re-baselines. (The pre-POST 404 is stale the instant
+    /// the Create succeeds: OUR write superseded it.)
     NoCompletedRead,
+    /// No read facts and the act committed nothing of ours
+    /// (merged_bug_064 — the bounced/raced Create): the round's GET
+    /// DID observe 404, and the act's shape cannot wipe the read's
+    /// evidence — the same separation the act-failed siblings
+    /// implement (AbsenceLose/AbsenceObserve both record Absent).
+    /// Recording it keeps the next holder=us read MOVED against the
+    /// Absent baseline, so the fence-gated self-heal (EvidenceResolve)
+    /// stays reachable from the create-raced brownout schedule.
+    ReadObservedAbsent,
 }
 
 /// The derived plan for one Completed round: every decision the old
@@ -2044,13 +2055,22 @@ fn complete_round(facts: ReadFacts, outcome: ActCell, standing: StandingCells) -
         edge,
         attempt_stamp: !matches!(edge, RoundEdge::Defer),
         clear_ledger_wholesale: !is_conflict,
-        baseline: match facts.holder {
-            // Completed with no read facts (the 404→Create path): the
-            // POST left no read facts, and Leading already answered
-            // the ledger wholesale — the next read re-baselines. (The
-            // pre-POST 404 is stale the instant the Create succeeds.)
-            HolderCell::Absent => BaselineEdge::NoCompletedRead,
-            HolderCell::Us | HolderCell::Other => BaselineEdge::FromRead,
+        // What the completed READ observed is recorded separately
+        // from what the ACT returned (merged_bug_064): the act's shape
+        // supersedes the read's observation ONLY when the act itself
+        // committed a write of ours (Leading). facts:None conflated
+        // two opposite-epistemic Create outcomes — POST won (baseline
+        // genuinely stale) and POST bounced (the 404 is the round's
+        // only and correct observation).
+        baseline: match (facts.holder, outcome) {
+            (HolderCell::Absent, ActCell::Leading) => BaselineEdge::NoCompletedRead,
+            (HolderCell::Absent, ActCell::Standby | ActCell::Conflict) => {
+                BaselineEdge::ReadObservedAbsent
+            }
+            (
+                HolderCell::Us | HolderCell::Other,
+                ActCell::Leading | ActCell::Standby | ActCell::Conflict,
+            ) => BaselineEdge::FromRead,
         },
         confirm: matches!(outcome, ActCell::Leading),
         read_refusal,
@@ -2379,11 +2399,17 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                 renew_time: f.renew_time,
                             }
                         }
-                        // Completed Create: the POST left no read facts,
-                        // and Leading just answered the ledger wholesale —
-                        // the next read re-baselines. (The pre-POST 404 is
-                        // stale the instant the Create succeeds.)
+                        // Completed Create that WON: the POST left no read
+                        // facts, and Leading just answered the ledger
+                        // wholesale — the next read re-baselines. (The
+                        // pre-POST 404 is stale the instant the Create
+                        // succeeds.)
                         BaselineEdge::NoCompletedRead => ContentBaseline::NoCompletedRead,
+                        // Completed Create that BOUNCED (merged_bug_064):
+                        // the GET's 404 is the round's only and correct
+                        // observation — record it (what lets the next
+                        // holder=us read prove the zombie committed).
+                        BaselineEdge::ReadObservedAbsent => ContentBaseline::Absent,
                     };
 
                     // ---- 6. The standing edge ----
@@ -7246,6 +7272,132 @@ mod tests {
         loop_task.await.expect("lease loop exits");
     }
 
+    /// W12-Z (merged_bug_064): the read's evidence survives the act's
+    /// shape — a Completed Create that BOUNCED records the GET's 404
+    /// as the Absent baseline, keeping the fence-gated self-heal
+    /// reachable from the create-raced brownout schedule.
+    ///
+    /// The schedule: the lease is deleted; round 2's re-create POST is
+    /// transmitted and dropped (the zombie — belief exits through the
+    /// absence lose, the ledger arms); round 3's GET still observes
+    /// 404 and its POST bounces 409 because the round-2 zombie
+    /// committed in the GET→POST window — Completed{Conflict,
+    /// facts: None}; round 4's GET then shows holder=us with the
+    /// zombie's renewTime while the write brownout continues
+    /// (act-failed). Post-fix round 3 records Absent (the round's only
+    /// and correct observation), so round 4 routes (Us, Moved vs
+    /// Absent, Armed) → EvidenceResolve and the fence-gated restore
+    /// lands — leadership heals one round after the zombie surfaces.
+    ///
+    /// Pre-fix round 3 mapped facts:None to NoCompletedRead for BOTH
+    /// Create results, wiping the 404 evidence; round 4 read Frozen
+    /// (NoCompletedRead proves nothing), routed ObserveOnly, and the
+    /// replica stayed leaderless toward the full 19s steal while its
+    /// own committed write named it holder.
+    ///
+    /// Pre-fix red, verbatim: `a bounced create must record the GET's
+    /// 404 so the next holder=us read proves the zombie committed;
+    /// pre-fix: NoCompletedRead wiped the read's evidence and the
+    /// self-heal never fired`.
+    // r[verify sched.lease.cancelled-write+2]
+    #[tokio::test(start_paused = true)]
+    async fn read_observation_survives_create_outcome_for_the_self_heal() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1 (t=0): acquire; settle the marks PATCH.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 10, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json_rt(Some("us"), 3, 11, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 2 (t=5s): deleted lease; the re-create POST is
+        // transmitted and DROPPED (the zombie). Belief exits through
+        // the act-failed absence lose; the ledger arms at t=5s.
+        let get = park.next().await;
+        get.respond_status(404, "NotFound", "lease deleted");
+        let post = park.next().await;
+        drop(post);
+        settle().await;
+        assert!(!state.is_leader(), "the absence read exits belief");
+
+        // Answer the lose-edge marks PATCH.
+        if let Some(req) = park.try_next().await {
+            assert!(req.path.contains("/pods/us"), "marks PATCH expected");
+            req.respond_ok(pod_ok("us"));
+            settle().await;
+        }
+
+        // Round 3 (t=10s): the GET still observes 404; our re-create
+        // POST bounces 409 — the round-2 zombie committed between this
+        // round's GET and POST. Completed{Conflict, facts: None}: the
+        // round's only and correct observation is ABSENCE.
+        let get = park.next().await;
+        get.respond_status(404, "NotFound", "still no lease at the GET");
+        let post = park.next().await;
+        post.respond_status(409, "AlreadyExists", "the zombie committed first");
+        settle().await;
+
+        // Round 4 (t=15s): the zombie surfaces — holder=us, renewTime
+        // moved (vs the Absent baseline), ledger armed (anchor age
+        // 10s, inside the acquire gate); the PUT drops (the write
+        // brownout continues). The evidence leg must restore belief.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 12, 12));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+
+        assert!(
+            state.is_leader(),
+            "a bounced create must record the GET's 404 so the next \
+             holder=us read proves the zombie committed; pre-fix: \
+             NoCompletedRead wiped the read's evidence and the self-heal \
+             never fired"
+        );
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires lock").len(),
+            2,
+            "the fence-gated evidence restore is a real acquire edge"
+        );
+
+        shutdown.cancel();
+        for _ in 0..6 {
+            if let Some(req) = park.try_next().await {
+                if req.path.contains("/pods/us") {
+                    req.respond_ok(pod_ok("us"));
+                } else {
+                    req.respond_status(404, "NotFound", "gone");
+                }
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
     /// merged_bug_122 (acquire-before-fence): consuming own-commit
     /// evidence whose ledger anchor is ALREADY past the self-fence
     /// deadline must not take the acquire edge — the very next
@@ -10119,9 +10271,18 @@ mod tests {
             "only a Conflict leaves the ledger armed: {cell}"
         );
         assert_eq!(
-            plan.baseline == BaselineEdge::NoCompletedRead,
-            holder == HolderCell::Absent,
-            "facts-absent rounds re-baseline to NoCompletedRead: {cell}"
+            plan.baseline,
+            match (holder, act) {
+                (HolderCell::Absent, ActCell::Leading) => BaselineEdge::NoCompletedRead,
+                (HolderCell::Absent, ActCell::Standby | ActCell::Conflict) =>
+                    BaselineEdge::ReadObservedAbsent,
+                (
+                    HolderCell::Us | HolderCell::Other,
+                    ActCell::Leading | ActCell::Standby | ActCell::Conflict,
+                ) => BaselineEdge::FromRead,
+            },
+            "the read's observation survives the act's shape \
+             (merged_bug_064): {cell}"
         );
         assert_eq!(plan.confirm, matches!(act, ActCell::Leading), "{cell}");
 
