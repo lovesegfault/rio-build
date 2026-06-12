@@ -125,6 +125,18 @@ spec:
 # ADR-023 §13b shim — Karpenter sees this NodePool, never provisions
 # from it (cpu:0). rio-controller's `nodeclaim_pool` reconciler creates
 # NodeClaims directly with `karpenter.sh/nodepool: rio-nodeclaim-shim`.
+#
+# Known-benign log noise: while a builder pod waits for its
+# controller-minted NodeClaim's node to boot, Karpenter's provisioner
+# simulates the pending pod against this pool and ERROR-logs
+# `label "rio.build/hw-band" does not have known values ... all
+# available instance types exceed limits (NodePool=rio-nodeclaim-shim)`.
+# Both causes are by design: hw-band is stamped on NodeClaims by the
+# controller (not a pool requirement), and cpu:0 blocks provisioning
+# regardless. Declaring hw-band values here would only swap the first
+# cause for the second — the error line stays. Don't chase it when
+# debugging stuck builder pods; check the node's /var/rio and the
+# NodeClaim lifecycle instead.
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
