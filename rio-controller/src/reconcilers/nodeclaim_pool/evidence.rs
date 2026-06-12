@@ -569,7 +569,15 @@ mod tests {
     /// doc ascribed to `#[must_use]` (`let _ =` silences that
     /// attribute; a bound-then-dropped value never lints at all).
     /// Stated per R16 at its real tier: debug-guard (every dev/test
-    /// build), not compile.
+    /// build), not compile — and the test is cfg-gated to that SAME
+    /// tier: the CI nextest binaries build release
+    /// (`debug_assertions` off, the guard's warn arm), where a
+    /// should_panic on the compiled-out panic arm fails by
+    /// construction. The dev-profile run (`nix develop -c cargo
+    /// nextest run`, the per-commit boundary check) exercises it on
+    /// every boundary; the release tier's warn arm is covered by the
+    /// companion clean-drop test compiling/running in BOTH profiles.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "TickEvidence dropped un-merged")]
     fn unmerged_tick_evidence_trips_the_drop_guard() {
