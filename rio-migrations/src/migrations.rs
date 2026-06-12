@@ -1304,6 +1304,44 @@ pub const M_068: () = ();
 /// for a failed half-built INVALID index follow 022 verbatim.
 pub const M_071: () = ();
 
+/// 072 — drv blobs as a castore object kind + tenant-scoped chunk presence
+/// (ADR-024 P2).
+///
+/// `drv_blobs` stores the canonical proto `Derivation` bytes keyed by
+/// `digest = blake3(received bytes)` — the negotiation key of ADR-024's
+/// build plan. The store verifies every put server-side
+/// (`rio_proto::derivation_util::verify_drv_blob`: digest recompute,
+/// decode, structural validation, canonical re-encode byte-compare,
+/// drv_path recompute) so non-canonical bytes are never stored; `body`
+/// is therefore byte-identical to what the client sent AND to the
+/// canonical encoding. Bodies live in PG like `directories.body` — drv
+/// blobs are a few KB (3.4 KB mean), the same size class as Directory
+/// bodies, and far below the chunked-CAS minimum.
+///
+/// `drv_path_hash = sha256(drv_path)` is denormalized at insert so the
+/// GC drv sweep joins `scheduler_live_pins.store_path_hash` (the same
+/// keying `pin_live_inputs` writes) without computing digests in SQL —
+/// a drv blob referenced by a live build survives GC through the
+/// existing pin mechanism, no parallel pin table.
+///
+/// `drv_blob_tenants` follows the `path_tenants` junction pattern:
+/// presence (`HasDrvs`) and reads (`GetDrvBlob`) are tenant-scoped,
+/// storage is digest-keyed global (dedup at rest unaffected).
+///
+/// `chunk_tenants` re-creates migration 018's table (dropped as dead in
+/// 035 when the global-namespace HasChunks shipped): ADR-024 settles
+/// presence as tenant-scoped for ALL object kinds, so `HasChunks` now
+/// answers present only for chunks the calling tenant has seen — a row
+/// is written for every chunk of a manifest when that manifest
+/// completes for a tenant. Migration honesty: chunks ingested before
+/// this migration have no tenant rows, so presence answers false and
+/// the next upload re-sends them — the write-through idempotent put
+/// (S3 PutObject overwrite of identical content) binds visibility
+/// without any backfill. No `(tenant_id, …)` secondary index this
+/// time: the only reader is `HasChunks`' `(blake3_hash = ANY, tenant_id
+/// =)` probe, which the PK serves.
+pub const M_072: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

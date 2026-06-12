@@ -286,8 +286,9 @@ fn migration_checksums_frozen() {
         // that flag on, the reverse check below ("PINNED lists
         // migration v but migrations/ has no such file") is the ONLY
         // guard against renumbering an applied migration into a
-        // silent re-apply. Next free migration number: 072.
+        // silent re-apply. Next free migration number: 073.
         (71, "bfcddc6f3a994e2f6467162ddb95d6ff41e8a2e2f7dab0f87e84c20bbedd8ed000e7182db0fb26c9da0e5766559d7e30"),
+        (72, "b2054c16396b78930c134581423174fefb8583e2834a8e4be11104d2590798baece42ee162ce27c4b90c68e2717b5d95"),
     ];
 
     let pinned: std::collections::HashMap<i64, &str> = PINNED.iter().copied().collect();
