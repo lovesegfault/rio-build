@@ -88,7 +88,17 @@ async fn main() -> anyhow::Result<()> {
             .await?;
             let store = rio_proto::StoreServiceClient::wrap(store_ch.clone());
             let drv_blob = rio_proto::DrvBlobServiceClient::wrap(store_ch);
-            let (sched, guard) = rio_proto::client::connect(&cfg.scheduler).await?;
+            let (sched, guard) = rio_proto::client::connect::<
+                rio_proto::SchedulerServiceClient<tonic::transport::Channel>,
+            >(&cfg.scheduler)
+            .await?;
+            // ADR-024: compress SubmitBuild (skeletons zstd ~4x) and
+            // accept compressed BuildEvent streams. Requires a
+            // scheduler that accepts zstd - guaranteed by the
+            // scheduler-first deploy order.
+            let sched = sched
+                .send_compressed(tonic::codec::CompressionEncoding::Zstd)
+                .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
             anyhow::Ok((store, drv_blob, sched, guard))
         })
         .await

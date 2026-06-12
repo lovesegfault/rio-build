@@ -13,6 +13,7 @@
 pub(crate) mod actor_guards;
 mod digest_submit;
 mod executor_service;
+mod paginate;
 mod scheduler_service;
 
 use std::sync::Arc;
@@ -83,6 +84,12 @@ pub struct SchedulerGrpc {
     /// [`Self::require_executor`] rejects `BuildExecution` /
     /// `Heartbeat` without a valid `x-rio-executor-token`.
     pub(super) hmac_key: Option<Arc<HmacKey>>,
+    /// ADR-024 paginated SubmitBuild: pages staged by
+    /// `(tenant, submission_id)` until the final page assembles them.
+    /// `Arc` because `SchedulerGrpc` is cloned per connection and all
+    /// clones must see the same staging area; `std::sync::Mutex` —
+    /// every critical section is a short map operation, no awaits.
+    pub(super) staged_pages: Arc<std::sync::Mutex<paginate::StagedPages>>,
 }
 
 impl SchedulerGrpc {
@@ -103,6 +110,7 @@ impl SchedulerGrpc {
             generation: Arc::new(AtomicU64::new(1)),
             jwt_mode: false,
             hmac_key: None,
+            staged_pages: Arc::default(),
         }
     }
 
@@ -118,6 +126,7 @@ impl SchedulerGrpc {
             generation: Arc::new(AtomicU64::new(1)),
             jwt_mode: false,
             hmac_key: None,
+            staged_pages: Arc::default(),
         }
     }
 
@@ -148,6 +157,7 @@ impl SchedulerGrpc {
             generation,
             jwt_mode,
             hmac_key,
+            staged_pages: Arc::default(),
         }
     }
 

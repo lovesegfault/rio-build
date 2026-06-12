@@ -1242,6 +1242,11 @@
       "doc": "Per-derivation state + poison tracking — `derivations` table."
     },
     {
+      "path": "db/drv_blobs.rs",
+      "depth": 1,
+      "doc": "drv_blobs lookups — ADR-024 digest-bearing submission verification."
+    },
+    {
       "path": "db/history.rs",
       "depth": 1,
       "doc": "`build_samples` retention + `sla_overrides` CRUD."
@@ -1282,9 +1287,19 @@
       "doc": "Shared actor-liveness and leader guards for gRPC handlers."
     },
     {
+      "path": "grpc/digest_submit.rs",
+      "depth": 1,
+      "doc": "Digest-bearing `SubmitBuild` handling (ADR-024 P2a)."
+    },
+    {
       "path": "grpc/executor_service.rs",
       "depth": 1,
       "doc": "`ExecutorService` gRPC implementation for [`SchedulerGrpc`]."
+    },
+    {
+      "path": "grpc/paginate.rs",
+      "depth": 1,
+      "doc": "Paginated `SubmitBuild` assembly (ADR-024 P2a)."
     },
     {
       "path": "grpc/scheduler_service.rs",

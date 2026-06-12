@@ -1082,6 +1082,11 @@ pub fn build_submit_request(
         build_timeout: 0,
         build_cores: 0,
         keep_going: false,
+        // Unpaged: the gateway submits one (zstd-compressed) message.
+        // ssh-ng DAGs are bounded by MAX_DAG_NODES and the gRPC
+        // message cap; client-side paging is the native client's job.
+        submission_id: String::new(),
+        final_page: false,
     }
 }
 

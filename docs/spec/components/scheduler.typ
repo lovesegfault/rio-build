@@ -798,6 +798,25 @@ a live build and drops (warn-skip) when it is not.
   rejected --- never accepted unverified.
 ]
 
+#r("sched.submit.paginate")[
+  `SubmitBuild` MUST support paginated submissions above the single-message
+  budget (~50k skeleton nodes at the measured 334B/node against the 16MB
+  budget): pages share a client-chosen `submission_id`, are staged keyed by
+  `(attested tenant, submission_id)`, and non-final pages are acknowledged
+  with an empty, immediately-closed event stream. The final page assembles
+  every staged page plus itself into one submission that flows through the
+  SAME validation, digest classification, and bulk-verify as an unpaged
+  request --- pagination changes transport framing, never acceptance
+  semantics. Staged pages MUST be bounded (global node cap) and expire when
+  no final page arrives.
+]
+
+The scheduler additionally accepts and sends zstd-compressed messages on
+`SchedulerService` (skeletons compress at a measured 0.235 ratio);
+compression is negotiated per gRPC `grpc-accept-encoding`, so legacy
+clients are unaffected, and the scheduler-first deploy order guarantees the
+server accepts zstd before any client sends it.
+
 #r("sched.merge.dedup")[
   The scheduler maintains a single global DAG across all concurrent build
   requests. When a new derivation DAG arrives from the gateway, it is merged

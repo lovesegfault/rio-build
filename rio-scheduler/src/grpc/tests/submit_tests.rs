@@ -924,14 +924,8 @@ async fn test_digest_submission_unknown_digests_reject_lists_all() {
     });
     let s = grpc.submit_build(req).await.unwrap_err();
     assert_eq!(s.code(), tonic::Code::FailedPrecondition);
-    let hex42: String = vec![0x42u8; 32]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let hex99: String = vec![0x99u8; 32]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let hex42: String = [0x42u8; 32].iter().map(|b| format!("{b:02x}")).collect();
+    let hex99: String = [0x99u8; 32].iter().map(|b| format!("{b:02x}")).collect();
     assert!(
         s.message().contains(&hex42) && s.message().contains(&hex99),
         "reject must list every missing digest, got: {}",
@@ -979,7 +973,7 @@ async fn test_digest_submission_known_external_digest_accepted() {
     // External input known to the store but not part of this submission.
     seed_drv_blob(
         &db.pool,
-        &vec![0x62u8; 32],
+        &[0x62u8; 32],
         "/nix/store/cccccccccccccccccccccccccccccccc-external.drv",
     )
     .await;
@@ -993,4 +987,219 @@ async fn test_digest_submission_known_external_digest_accepted() {
         .expect("known external digest must be accepted");
     let st = statuses(&db.pool, &["ext-parent"]).await;
     assert_eq!(st["ext-parent"], "ready");
+}
+
+// r[verify sched.submit.digest-verify]
+/// Digest visibility is tenant-scoped via `drv_blob_tenants`, joined
+/// on the ATTESTED tenant (`claims.sub`) — exactly like the store's
+/// `HasDrvs`. A digest another tenant uploaded resolves as MISSING for
+/// the caller (same answer as "doesn't exist"), while the owning
+/// tenant resolves it.
+#[tokio::test]
+async fn test_digest_submission_cross_tenant_digest_is_missing() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    let tenant_a = uuid::Uuid::from_u128(0xA024);
+    let tenant_b = uuid::Uuid::from_u128(0xB024);
+    for (t, name) in [(tenant_a, "xt-tenant-a"), (tenant_b, "xt-tenant-b")] {
+        sqlx::query(
+            "INSERT INTO tenants (tenant_id, tenant_name) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(t)
+        .bind(name)
+        .execute(&db.pool)
+        .await
+        .expect("seed tenant");
+    }
+    let node = digest_node("xt-node", 0x71, &[]);
+    seed_drv_blob(&db.pool, &node.drv_digest, &node.drv_path).await;
+    // Visibility junction for tenant A ONLY.
+    sqlx::query("INSERT INTO drv_blob_tenants (digest, tenant_id) VALUES ($1, $2)")
+        .bind(&node.drv_digest)
+        .bind(tenant_a)
+        .execute(&db.pool)
+        .await
+        .expect("seed drv_blob_tenants");
+
+    let submit_as = |sub: uuid::Uuid, node: rio_proto::types::DerivationNode| {
+        let mut req = Request::new(rio_proto::types::SubmitBuildRequest {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        });
+        // Attach claims exactly as the interceptor would — claims.sub
+        // is the attested tenant the bulk-verify joins on.
+        req.extensions_mut().insert(rio_auth::jwt::TenantClaims {
+            sub,
+            iat: 1_700_000_000,
+            exp: 9_999_999_999,
+            jti: format!("xt-{sub}"),
+        });
+        req
+    };
+
+    // Tenant B: the digest exists in drv_blobs but has no junction row
+    // for B — must reject as missing, not leak A's blob.
+    let s = grpc
+        .submit_build(submit_as(tenant_b, node.clone()))
+        .await
+        .expect_err("cross-tenant digest must be invisible");
+    assert_eq!(s.code(), tonic::Code::FailedPrecondition);
+    let hex71: String = [0x71u8; 32].iter().map(|b| format!("{b:02x}")).collect();
+    assert!(
+        s.message().contains(&hex71),
+        "reject must name the unresolved digest, got: {}",
+        s.message()
+    );
+
+    // Positive control: the owning tenant resolves the same digest.
+    grpc.submit_build(submit_as(tenant_a, node))
+        .await
+        .expect("owning tenant must resolve its own digest");
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// ADR-024 P2a: paginated SubmitBuild (submission_id / final_page)
+// ───────────────────────────────────────────────────────────────────────
+
+fn page_req(
+    id: &str,
+    nodes: Vec<rio_proto::types::DerivationNode>,
+    edges: Vec<rio_proto::types::DerivationEdge>,
+    final_page: bool,
+) -> Request<rio_proto::types::SubmitBuildRequest> {
+    Request::new(rio_proto::types::SubmitBuildRequest {
+        nodes,
+        edges,
+        submission_id: id.into(),
+        final_page,
+        ..Default::default()
+    })
+}
+
+// r[verify sched.submit.paginate]
+/// Acceptance for the ADR's ">50k nodes paginates" requirement: a
+/// synthetic 50k+ node submission split across three pages round-trips
+/// — staged pages ack with an empty stream, the final page assembles
+/// and merges everything as ONE build, with cross-page edges intact.
+#[tokio::test]
+async fn test_paginated_submission_round_trips_over_50k_nodes() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+
+    const TOTAL: usize = 50_001;
+    let mut all: Vec<rio_proto::types::DerivationNode> =
+        (0..TOTAL).map(|i| make_node(&format!("pg-{i}"))).collect();
+    let tail = all.split_off(40_000);
+    let mid = all.split_off(20_000);
+    let head = all;
+
+    // Page 1 + 2: staged, empty stream that closes with zero events.
+    let resp = grpc
+        .submit_build(page_req("big-1", head, vec![], false))
+        .await
+        .expect("page 1 staged");
+    assert_eq!(
+        resp.metadata()
+            .get("x-rio-staged-nodes")
+            .and_then(|v| v.to_str().ok()),
+        Some("20000")
+    );
+    let mut stream = resp.into_inner();
+    assert!(
+        tokio_stream::StreamExt::next(&mut stream).await.is_none(),
+        "staged ack stream must close immediately with zero events"
+    );
+    grpc.submit_build(page_req("big-1", mid, vec![], false))
+        .await
+        .expect("page 2 staged");
+
+    // No build exists yet — staging is not acceptance.
+    let builds: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM builds")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(builds, 0, "staged pages must not create a build");
+
+    // Final page: remainder + one cross-page edge (parent on the final
+    // page depends on a node from page 1) — proves the assembled set
+    // is what the merge sees.
+    let edge = crate::actor::tests::make_test_edge("pg-50000", "pg-7");
+    grpc.submit_build(page_req("big-1", tail, vec![edge], true))
+        .await
+        .expect("final page assembles and merges");
+
+    let derivations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM derivations")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(derivations as usize, TOTAL, "all pages merged as one DAG");
+    let builds: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM builds")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(builds, 1, "exactly one build for the whole submission");
+    let st = statuses(&db.pool, &["pg-50000", "pg-7"]).await;
+    assert_eq!(st["pg-7"], "ready", "cross-page edge child is a leaf");
+    assert_eq!(
+        st["pg-50000"], "queued",
+        "cross-page edge must gate the parent — the pages merged as one graph"
+    );
+}
+
+// r[verify sched.submit.paginate]
+/// The assembled submission flows through the SAME validation as an
+/// unpaged one: a duplicate drv_hash split across two pages is
+/// rejected at the final page.
+#[tokio::test]
+async fn test_paginated_submission_validates_assembled_set() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    grpc.submit_build(page_req("dup-1", vec![make_node("pg-dup")], vec![], false))
+        .await
+        .expect("page staged");
+    let s = grpc
+        .submit_build(page_req("dup-1", vec![make_node("pg-dup")], vec![], true))
+        .await
+        .unwrap_err();
+    assert_eq!(s.code(), tonic::Code::InvalidArgument);
+    assert!(
+        s.message().contains("duplicate drv_hash"),
+        "assembled-set validation must catch the cross-page duplicate: {}",
+        s.message()
+    );
+    let builds: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM builds")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(builds, 0);
+}
+
+// r[verify sched.submit.paginate]
+/// Distinct submission_ids stage independently; an unpaged submission
+/// (empty submission_id) is unaffected by staged pages.
+#[tokio::test]
+async fn test_paginated_submissions_are_isolated() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    grpc.submit_build(page_req("iso-a", vec![make_node("iso-a-1")], vec![], false))
+        .await
+        .expect("staged");
+    // Unpaged submission while iso-a is staged: merges alone.
+    grpc.submit_build(Request::new(rio_proto::types::SubmitBuildRequest {
+        nodes: vec![make_node("iso-plain")],
+        ..Default::default()
+    }))
+    .await
+    .expect("unpaged submission unaffected by staged pages");
+    let derivations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM derivations")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(derivations, 1, "only the unpaged node merged");
+    // iso-a finishes independently.
+    grpc.submit_build(page_req("iso-a", vec![make_node("iso-a-2")], vec![], true))
+        .await
+        .expect("iso-a final page");
+    let derivations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM derivations")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(derivations, 3);
 }

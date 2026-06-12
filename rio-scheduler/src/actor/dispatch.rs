@@ -1420,6 +1420,12 @@ impl DagActor {
                 self.dispatch_dirty = true;
             }
             DerivationStatus::DependencyFailed => {
+                // Terminal: release the merge-time drv pin
+                // (r[store.drv.gc-build-pinned]) for the trigger node —
+                // the epilogue's cascade only unpins the ANCESTORS it
+                // transitions, mirroring the unpin-then-epilogue order
+                // of the completion.rs failure handlers.
+                self.unpin_best_effort(drv_hash).await;
                 // Cascade + per-build completion-check so the interested
                 // build terminates instead of hanging Active.
                 self.terminal_failure_epilogue(
@@ -2289,6 +2295,22 @@ impl DagActor {
         self.persist_status(drv_hash, DerivationStatus::Ready, None)
             .await;
         self.unpin_best_effort(drv_hash).await;
+        // unpin_live_inputs deletes by drv_hash, which also removed the
+        // merge-time drv-path pin (r[store.drv.gc-build-pinned]). The
+        // build is still live and this node re-dispatches later, so
+        // re-pin the .drv path — only the dispatch-time input pins are
+        // being rolled back here. Best-effort like every live-pin write.
+        if let Some(state) = self.dag.node(drv_hash) {
+            let drv_path = state.drv_path().to_string();
+            if let Err(e) = self
+                .db
+                .pin_drv_paths(&[(drv_hash.as_str(), drv_path.as_str())])
+                .await
+            {
+                warn!(drv_hash = %drv_hash, error = %e,
+                      "failed to re-pin drv path after try_send rollback (best-effort)");
+            }
+        }
         if let Some(state) = self.dag.node(drv_hash)
             && let Some(db_id) = state.db_id
             && let Err(e) = self.db.delete_latest_assignment(db_id).await

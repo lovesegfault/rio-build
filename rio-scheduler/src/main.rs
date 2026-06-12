@@ -611,7 +611,16 @@ async fn main() -> anyhow::Result<()> {
         .add_service(
             SchedulerServiceServer::new(grpc_service.clone())
                 .max_decoding_message_size(max_message_size)
-                .max_encoding_message_size(max_message_size),
+                .max_encoding_message_size(max_message_size)
+                // ADR-024: SubmitBuild skeletons compress ~4x. accept_
+                // covers compressed requests from new gateways/clients;
+                // send_ compresses responses only when the client
+                // advertised zstd (grpc-accept-encoding), so old
+                // clients are unaffected. Scheduler deploys before the
+                // gateway (documented deploy order), so the server
+                // accepts zstd before any client sends it.
+                .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
+                .send_compressed(tonic::codec::CompressionEncoding::Zstd),
         )
         .add_service(
             ExecutorServiceServer::new(grpc_service)

@@ -16809,6 +16809,10 @@
         {
           "name": "tracing",
           "packageId": "tracing"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -16817,7 +16821,8 @@
         "default",
         "router",
         "server",
-        "transport"
+        "transport",
+        "zstd"
       ],
       "libCrateTypes": [
         "lib"

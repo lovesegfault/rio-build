@@ -84,6 +84,31 @@ impl SchedulerService for SchedulerGrpc {
             ));
         }
 
+        // ADR-024 paginated submission: non-final pages are staged
+        // keyed by (attested tenant, submission_id) and acked with an
+        // empty, immediately-closed event stream; the final page
+        // assembles every staged page plus itself and falls through to
+        // the SAME validation + digest bulk-verify as an unpaged
+        // request. Unpaged requests (empty submission_id) pass through
+        // untouched.
+        // r[impl sched.submit.paginate]
+        let req = match super::paginate::stage_or_assemble(&self.staged_pages, caller_tenant, req)?
+        {
+            super::paginate::PageOutcome::Staged { total_nodes } => {
+                let (_tx, rx) = tokio::sync::mpsc::channel(1);
+                let mut resp = Response::new(ReceiverStream::new(rx));
+                resp.metadata_mut().insert(
+                    "x-rio-staged-nodes",
+                    total_nodes
+                        .to_string()
+                        .parse()
+                        .expect("usize decimal string is always valid ASCII metadata"),
+                );
+                return Ok(resp);
+            }
+            super::paginate::PageOutcome::Ready(assembled) => *assembled,
+        };
+
         // Validate DAG nodes before passing to the actor. Proto types have
         // all-public fields with no validation; an empty drv_hash would
         // become a DAG primary key, empty drv_path breaks the reverse
@@ -225,6 +250,14 @@ impl SchedulerService for SchedulerGrpc {
                 let external_edges = super::digest_submit::verify_resolved(&d, &resolved)?;
                 let mut edges = d.edges;
                 edges.extend(external_edges);
+                // classify_and_derive_edges bounded the IN-submission
+                // edges; re-check now that store-resolved external
+                // references were appended.
+                rio_common::grpc::check_bound(
+                    "edges",
+                    edges.len(),
+                    rio_common::limits::MAX_DAG_EDGES,
+                )?;
                 edges
             }
         };

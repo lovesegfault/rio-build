@@ -13134,6 +13134,10 @@
         {
           "name": "tracing",
           "packageId": "tracing"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -13142,7 +13146,8 @@
         "default",
         "router",
         "server",
-        "transport"
+        "transport",
+        "zstd"
       ],
       "libCrateTypes": [
         "lib"
@@ -16954,6 +16959,91 @@
       ],
       "authors": [
         "David Tolnay <dtolnay@gmail.com>"
+      ]
+    },
+    "zstd": {
+      "crateName": "zstd",
+      "version": "0.13.3",
+      "edition": "2018",
+      "sha256": "12n0h4w9l526li7jl972rxpyf012jw3nwmji2qbjghv9ll8y67p9",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "zstd-safe",
+          "packageId": "zstd-safe"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "arrays",
+        "default",
+        "legacy",
+        "zdict_builder"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Alexandre Bury <alexandre.bury@gmail.com>"
+      ]
+    },
+    "zstd-safe": {
+      "crateName": "zstd-safe",
+      "version": "7.2.4",
+      "edition": "2018",
+      "sha256": "179vxmkzhpz6cq6mfzvgwc99bpgllkr6lwxq7ylh5dmby3aw8jcg",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "zstd-sys",
+          "packageId": "zstd-sys"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "arrays",
+        "legacy",
+        "std",
+        "zdict_builder"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Alexandre Bury <alexandre.bury@gmail.com>"
+      ]
+    },
+    "zstd-sys": {
+      "crateName": "zstd-sys",
+      "version": "2.0.16+zstd.1.5.7",
+      "edition": "2018",
+      "sha256": "0j1pd2iaqpvaxlgqmmijj68wma7xwdv9grrr63j873yw5ay9xqci",
+      "source": {
+        "type": "crates-io"
+      },
+      "buildDependencies": [
+        {
+          "name": "cc",
+          "packageId": "cc"
+        },
+        {
+          "name": "pkg-config",
+          "packageId": "pkg-config"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "legacy",
+        "std",
+        "zdict_builder"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "links": "zstd",
+      "authors": [
+        "Alexandre Bury <alexandre.bury@gmail.com>"
       ]
     }
   }

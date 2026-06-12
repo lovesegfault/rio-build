@@ -232,6 +232,12 @@ impl DagActor {
         if !depfailed.is_empty() {
             self.persist_status_batch(&depfailed, DerivationStatus::DependencyFailed)
                 .await;
+            // Terminal without dispatch: these sole-interest nodes were
+            // never assigned, so the worker-completion unpin never runs
+            // for them — release the merge-time drv pin
+            // (r[store.drv.gc-build-pinned]) here, their only terminal
+            // transition.
+            self.unpin_best_effort_batch(&depfailed).await;
         }
 
         // Remove build interest from derivations
