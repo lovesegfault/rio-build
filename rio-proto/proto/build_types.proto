@@ -348,7 +348,10 @@ message CompletionReport {
 // Result of building a single derivation.
 message BuildResult {
   BuildResultStatus status = 1;
-  string error_msg = 2;                    // Non-empty on failure
+  string error_msg = 2;                    // Non-empty on failure. DISPLAY/NARRATION ONLY
+                                           // (bug_090): no scheduler decision may dispatch on
+                                           // this text — sizing classifications ride the typed
+                                           // failure_classification field below.
   reserved 3;                              // was times_built (repeat builds; scheduler never read it)
   google.protobuf.Timestamp start_time = 4;
   google.protobuf.Timestamp stop_time = 5;
@@ -360,6 +363,62 @@ message BuildResult {
   // proto3 bool: absence is indistinguishable from false BY DESIGN —
   // an old builder simply never claims the exemption (safe default).
   bool store_degraded = 7;
+  // bug_090: the TYPED failure-classification + corroboration family
+  // — the wire half of the corroborated-floor law
+  // (sched.trust.report-corroboration). Worker-supplied free text
+  // (error_msg) previously drove bump_resource_floor by substring
+  // match: a drv_hash-keyed (cross-tenant), GREATEST()-ratcheted,
+  // never-healed-downward persisted sizing decision moved on an
+  // unattested display string. This field is the only channel a
+  // sizing classification may cross the worker→scheduler boundary
+  // on, and it carries the telemetry the scheduler corroborates
+  // against its own assigned shape before any floor moves.
+  //
+  // Additive READ-SIDE-FIRST (Q6, --wipe posture): ABSENT = legacy =
+  // no sizing classification — the scheduler treats the report as
+  // classify-only (the substring channel is retired to
+  // display/narration; persisted floors never move on it).
+  FailureClassification failure_classification = 8;
+}
+
+// bug_090: the sizing class a builder attributes a failure to, with
+// the worker-side telemetry that must corroborate it. The scheduler
+// REFUSES the floor bump unless (a) the class is typed here, (b) the
+// telemetry is consistent with the class AND with the shape the
+// scheduler itself assigned (the dispatch intent — a forged report
+// must claim exhaustion AT the assigned size, not a fabricated one),
+// and (c) the per-drv growth cap admits another doubling (at most one
+// per corroborated incident identity (drv_hash, exec_id) — the report
+// admission fold's durable once-per-exec dedup is the identity law).
+message FailureClassification {
+  // The class. UNSPECIFIED = no sizing claim (the safe default an
+  // old builder's absent field also decodes to).
+  FailureClass class = 1;
+  // DISK_FULL corroboration: the during-build project-quota peak,
+  // the enforced hard limit, and the decoupled node headroom — the
+  // satisfiable-letter inputs (builder.disk.satisfiable-letter), as
+  // sampled by the producing seam. Unset for CGROUP_OOM (its
+  // corroboration is CompletionReport.peak_memory_bytes against the
+  // assigned memory shape).
+  QuotaTelemetry quota = 2;
+}
+
+// bug_090: the closed sizing-class alphabet. One letter per
+// resource-floor axis with a worker-reported producer; the
+// controller-witnessed lanes (kubelet OOMKilled) keep their own
+// channel and never ride this field.
+enum FailureClass {
+  FAILURE_CLASS_UNSPECIFIED = 0;
+  FAILURE_CLASS_CGROUP_OOM = 1;
+  FAILURE_CLASS_DISK_FULL = 2;
+}
+
+// bug_090: the disk-exhaustion corroboration triple (see
+// FailureClassification.quota).
+message QuotaTelemetry {
+  uint64 peak_used_bytes = 1;   // during-build dqb_curspace peak
+  uint64 hard_limit_bytes = 2;  // enforced project hard limit
+  uint64 node_free_bytes = 3;   // decoupled node headroom sample
 }
 
 // A single realized output from a build.
