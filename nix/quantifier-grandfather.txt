@@ -1282,7 +1282,6 @@ rio-scheduler/src/sla/config.rs	/// intents; an empty `provides_features` accept
 rio-scheduler/src/sla/config.rs	/// iterates EVERY parsed shipped `sla.hwClasses` row × EVERY
 rio-scheduler/src/sla/config.rs	/// must pick a metal class; a non-kvm intent must NEVER pick metal.
 rio-scheduler/src/sla/config.rs	/// on ANY membership drift — closure tomorrow, not completeness
-rio-scheduler/src/sla/config.rs	/// predicate on ANY axis (size / arch / features) is skipped
 rio-scheduler/src/sla/config.rs	/// strips ANY cell whose class can't host `(cores, mem)`,
 rio-scheduler/src/sla/cost.rs	// Snapshot → refresh_lambda → write back λ ONLY (don't clobber
 rio-scheduler/src/sla/cost.rs	/// (merged_bug_146): the ONLY path to `sla_ema_state` /

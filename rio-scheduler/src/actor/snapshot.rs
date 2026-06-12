@@ -2779,7 +2779,7 @@ impl DagActor {
                 // merged_bug_016: the global mem pin is the
                 // SOLVE-domain cap (`mem_solve_cap`) and the per-class
                 // survival compare is the constructed container
-                // quantity — the SAME formulas the chokepoint applies
+                // quantity — the same formulas the chokepoint applies
                 // (the merged_bug_002 same-formulas law, carried onto
                 // the padded footprint).
                 let eff_mem = memo

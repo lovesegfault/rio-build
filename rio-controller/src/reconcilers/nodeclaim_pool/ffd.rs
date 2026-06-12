@@ -307,13 +307,13 @@ pub const SIM_WINDOW_SLACK: u64 = 2;
 /// persistent under the cores-desc sort.
 ///
 /// Constructed by `cover::window_mintability` (the
-/// `cover::class_budget` seam — the SAME budget law the mint
+/// `cover::class_budget` seam — the same budget law the mint
 /// consumes, evaluated at tick start with zero created cores; the
 /// mask snapshot is the pre-sim subset, conservative by
 /// construction). The skip is sound-conservative: it never classifies
 /// out a head that could place OR mint this tick.
 pub struct WindowMintability {
-    /// Classes whose EVERY configured cell is ICE-masked
+    /// Classes with every configured cell ICE-masked
     /// (mint-impossible this tick).
     pub fully_masked: HashSet<String>,
     /// Per-known-class mint budget (`cover::class_budget` at tick

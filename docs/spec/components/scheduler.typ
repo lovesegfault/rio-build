@@ -4813,7 +4813,7 @@ classes, so a reload is observable without a side channel).
 
 #r("sched.sla.ladder-transit")[
   The ladder closure walk MUST separate REACHABILITY from ADMISSION:
-  the worklist transits EVERY declared ladder edge of a walked class
+  the worklist transits every declared ladder edge of a walked class
   --- whether or not that class minted any cell for THIS demand ---
   and per-rung cell admission (the hosting predicate, the
   capacity-pin filter) gates only which CELLS join the closure, never

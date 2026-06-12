@@ -844,7 +844,7 @@ pub fn class_budget(
 }
 
 /// merged_bug_053: build the window's [`super::ffd::WindowMintability`]
-/// view at tick start, through the SAME [`class_budget`] seam the mint
+/// view at tick start, through the same [`class_budget`] seam the mint
 /// loop consumes (`class_created = 0` — nothing minted yet when the
 /// window is cut), so the window's denomination and the mint's
 /// refusal law cannot drift. `masked` is the pre-sim mask snapshot

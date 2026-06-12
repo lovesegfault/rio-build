@@ -890,7 +890,7 @@ impl SlaConfig {
     ///   nodeSelector deleted r33 bug_002). (mb_012, r34 mb_004)
     /// - **size** — `cores ≤ class_ceilings(h).0 ∧
     ///   container_mem_bytes(mem) ≤ class_ceilings(h).1` ⟺ pod
-    ///   requests ≤ Node allocatable. The shipped margins, ALL of
+    ///   requests ≤ Node allocatable. The shipped margins, all of
     ///   them (the pre-merged_bug_016 text here claimed "mem is
     ///   unmargined … never pinned to the ceiling, so the gap is
     ///   unhittable" — falsified on both halves: the gap was the
@@ -971,7 +971,7 @@ impl SlaConfig {
             // merged_bug_016 (the dead-band close): the mem axis
             // compares the CONSTRUCTED container quantity —
             // `rio_common::footprint::container_mem_bytes(solve)` —
-            // against the ceiling, the SAME quantity the controller's
+            // against the ceiling, the SAME quantity the controller's quantifier: census(retain_hosting_gate_equals_shared_law_oracle)
             // provisioning partition (`cover::sizing` via
             // `intent_pod_footprint`) and its `fallback_cell`
             // admission predicate compare. The pre-fix raw `mem <= cm`
@@ -1079,7 +1079,7 @@ impl SlaConfig {
         // r[impl sched.sla.ladder-transit]
         // merged_bug_101 + merged_bug_015: the derivation is a
         // WORKLIST FIXPOINT over TWO SEPARATED relations.
-        // REACHABILITY: the walk transits EVERY declared ladder edge
+        // REACHABILITY: the walk transits EVERY declared ladder edge quantifier: census(ladder_transits_declared_edges_independent_of_rung_admission)
         // of a walked class — a walked rung enqueues once (walked-set
         // cycle guard) whether or not it minted any cell for THIS
         // demand. ADMISSION: the pin filter and the `hosts` predicate
@@ -3173,7 +3173,7 @@ mod tests {
     /// shape, 64 GiB, and a sub-floor non-hosting ceiling, × the
     /// generated boundary cells of each.* The controller-side twin
     /// (`fallback_and_sizing_equal_shared_law_oracle`,
-    /// nodeclaim_pool) quantifies the SAME generated population
+    /// nodeclaim_pool) quantifies the same generated population
     /// through its real gates; both sides equal to one oracle ⟹
     /// provisioning admits ⊇ placement admits (in fact equality on
     /// the mem axis). STRAWMAN RED (the per-side-constant
@@ -3619,7 +3619,7 @@ mod tests {
     }
 
     /// Kill-isolation for the closure: a rung that fails the hosting
-    /// predicate on ANY axis (size / arch / features) mints no CELLS
+    /// predicate on any axis (size / arch / features) mints no CELLS
     /// — its declared EDGES still transit (transit-without-mint,
     /// `sched.sla.ladder-transit`). The closure can never admit a
     /// cell the producer strip would refuse.

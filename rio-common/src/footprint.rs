@@ -18,8 +18,10 @@
 //!
 //! The law (`ctrl.pool.gate-superset`): a numeric pad straddling a
 //! process boundary is not in-process-sealable — both processes MUST
-//! consume the SAME shared constant and compare the SAME constructed
-//! quantity. This module is that shared home: a leaf-crate constant
+//! consume the same shared constant and compare the same constructed
+//! quantity (enforced by `adjunction_forward_inverse` + the W11-AA
+//! gate-vs-law oracle pair). This module is that shared home: a
+//! leaf-crate constant
 //! pair plus the forward map (solve → container) and its inverse
 //! (ceiling → max hostable solve), related by the adjunction pinned
 //! in [`tests::adjunction_forward_inverse`]. The scheduler's
@@ -71,7 +73,7 @@ pub const CONTAINER_MEM_MIN_BYTES: u64 = 512 << 20;
 /// that solve will actually request. This is the constructed quantity
 /// of the merged_bug_016 law —
 /// `max(solved + WORKER_MEM_OVERHEAD_BYTES, CONTAINER_MEM_MIN_BYTES)`
-/// — and EVERY predicate that decides mem feasibility against a class
+/// — and EVERY predicate that decides mem feasibility against a class quantifier: census(retain_hosting_gate_equals_shared_law_oracle + fallback_and_sizing_equal_shared_law_oracle)
 /// ceiling compares `container_mem_bytes(solve) <= ceiling`, never
 /// the bare solve. Monotone and total; saturates at `u64::MAX`.
 #[must_use]
@@ -117,7 +119,7 @@ pub const fn max_hostable_solve_mem(ceiling_bytes: u64) -> Option<u64> {
 /// The band-boundary population for the cross-process gate contract
 /// tests — [GEN-SET]: rendered from the shared maps (never hand-typed
 /// per side), so the scheduler-side and controller-side
-/// gate-equals-law witnesses quantify over the SAME cells. For a
+/// gate-equals-law witnesses quantify over the same cells. For a
 /// hosting ceiling the knife edge is `cap' = max_hostable_solve_mem`
 /// (the largest admissible solve) and `cap' + 1` (the first refused
 /// one); the pre-merged_bug_016 dead band was exactly

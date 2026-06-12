@@ -3867,7 +3867,7 @@ mod tests {
     ///
     /// Pre-fix RED (the live shape): a solve in `(cm − pad, cm]`
     /// admitted at the raw gate (`i.mem_bytes <= cls_m`) and stranded
-    /// at provisioning — across 3 reconcile cycles the SAME intent
+    /// at provisioning — across 3 reconcile cycles the same intent
     /// was re-admitted by `fallback_cell` and dropped by `sizing`
     /// every cycle with ZERO claims minted and no typed terminal
     /// (`fallback_cell` returns `Some`, so the `no_hosting_class`
@@ -3907,7 +3907,7 @@ mod tests {
         );
         let scfg = cover::SizingCfg {
             max_node_cores: 128,
-            max_node_mem: cm, // the SAME mirrored ceiling
+            max_node_mem: cm, // the same mirrored ceiling
             max_node_disk: 450 * GI,
             budget: u32::MAX,
             fuse_cache_bytes: 50 * GI,
@@ -3943,7 +3943,7 @@ mod tests {
         }
         // The strand signature, rendered structurally: the funnel-pin
         // cell (mem == cm) across 3 reconcile cycles. Whatever the
-        // per-cycle disposition, it must be the SAME typed disposition
+        // per-cycle disposition, it must be the same typed disposition
         // on both gates each cycle — pre-fix this loop minted zero
         // claims while fallback kept re-admitting (admitted ∧ ¬fits ∧
         // no terminal), cycle after cycle.
