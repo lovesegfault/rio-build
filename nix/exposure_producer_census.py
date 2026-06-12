@@ -47,11 +47,17 @@ SNAKE = re.compile(r"^[a-z][a-z_]*$")
 DISPOSITIONS = {"emitted", "never-emitted", "defaulted"}
 
 
-def strip_comments(text: str) -> str:
-    # Shared exact lexer (merged_bug_009): comments AND string bodies
-    # blanked — a constructor named in prose or inside a string cannot
-    # satisfy an `emitted` row. Newline-preserving.
-    out, _ = rust_strip.lex(text, blank_string_bodies=True)
+def strip_comments(text: str, source: str = "<input>") -> str:
+    # Shared exact lexer (merged_bug_009) + the attribute-position
+    # cfg(test) pruner (WO-S8-9, merged_bug_150): the sibling
+    # production-population definition — SERVER_FILE carries in-file
+    # #[cfg(test)] modules, so a test-lane Status constructor could
+    # launder an emitted row or false-red the load-bearing
+    # never-emitted row. Comments AND string bodies blanked — a
+    # constructor named in prose or inside a string cannot satisfy an
+    # `emitted` row. Newline-preserving.
+    pruned = rust_strip.strip_cfg_test(text, source=source)
+    out, _ = rust_strip.lex(pruned, blank_string_bodies=True)
     return out
 
 
@@ -60,9 +66,39 @@ def parse_rows(classifier_text: str):
     return ROW.findall(classifier_text)
 
 
-def emitted_codes(server_text: str) -> set:
-    """Status constructors in the COMMENT-STRIPPED server module."""
-    return set(re.findall(r"Status::([a-z_]+)\s*\(", strip_comments(server_text)))
+_CAMEL = re.compile(r"(?<!^)(?=[A-Z])")
+
+
+def emitted_codes(server_text: str, source: str = "<input>"):
+    """(codes, refusals) — Status constructors in the production
+    (cfg(test)-pruned, comment-stripped) server module.
+
+    WO-S8-9 (merged_bug_150): the constructor IDIOM axis is closed
+    FAIL-CLOSED — `Status::new(Code::X, …)` maps to snake(X) (the
+    idiom live in the adjacent admin/gc.rs; a mint migration to it
+    previously kept never-emitted rows green while the rationale
+    rotted), and any `Status::new(` whose code argument the needle
+    cannot map (dynamic codes, locals) REFUSES with a named row
+    rather than capturing the useless token `new`."""
+    stripped = strip_comments(server_text, source)
+    codes = {
+        c for c in re.findall(r"Status::([a-z_]+)\s*\(", stripped) if c != "new"
+    }
+    refusals = []
+    for m in re.finditer(r"Status::new\s*\(", stripped):
+        tail = stripped[m.end() : m.end() + 200]
+        cm = re.match(r"\s*(?:tonic::)?Code::([A-Za-z][A-Za-z0-9]*)", tail)
+        if cm:
+            codes.add(_CAMEL.sub("_", cm.group(1)).lower())
+        else:
+            lineno = stripped[: m.start()].count("\n") + 1
+            refusals.append(
+                f"{source}:{lineno}: Status::new( with a code argument the "
+                f"census cannot map (dynamic/local code) — refusing "
+                f"(fail-closed; a producer the census cannot see makes "
+                f"every never-emitted row unfalsifiable)"
+            )
+    return codes, refusals
 
 
 def check(rows, emitted: set):
@@ -102,12 +138,14 @@ def main() -> int:
     gates_iv_only = 'fn append(){ return Err(Status::invalid_argument("kind")); }'
     # Arm A: the shipped defect verbatim — out_of_range cited as
     # emitted against gates that mint invalid_argument only.
-    f_a = check([("out_of_range", "emitted")], emitted_codes(gates_iv_only))
+    codes_a, _r = emitted_codes(gates_iv_only)
+    f_a = check([("out_of_range", "emitted")], codes_a)
     if len(f_a) != 1 or "FALSE PRODUCER CITE" not in f_a[0]:
         print(f"FAIL: self-test arm A (shipped false cite) expected 1 false-cite failure, got {f_a}", file=sys.stderr)
         return 1
     # Arm B: emitter-set drift — never-emitted vs an emitting source.
-    f_b = check([("out_of_range", "never-emitted")], emitted_codes('Err(Status::out_of_range("v"))'))
+    codes_b, _r = emitted_codes('Err(Status::out_of_range("v"))')
+    f_b = check([("out_of_range", "never-emitted")], codes_b)
     if len(f_b) != 1 or "EMITTER-SET DRIFT" not in f_b[0]:
         print(f"FAIL: self-test arm B (emitter-set drift) expected 1 drift failure, got {f_b}", file=sys.stderr)
         return 1
@@ -118,17 +156,48 @@ def main() -> int:
         return 1
     # Comment-lane pin: a constructor named only in prose must not
     # satisfy an emitted row.
-    f_d = check([("out_of_range", "emitted")], emitted_codes("// Status::out_of_range( in prose only"))
+    codes_d, _r = emitted_codes("// Status::out_of_range( in prose only")
+    f_d = check([("out_of_range", "emitted")], codes_d)
     if len(f_d) != 1:
         print(f"FAIL: self-test arm D (comment-lane) expected the prose mention ignored, got {f_d}", file=sys.stderr)
+        return 1
+    # --- W12-BG (WO-S8-9, merged_bug_150): the plant pair + refusal --
+    # (a) a cfg(test)-lane constructor stays OUT of the production
+    # emitted set (it could launder an emitted row or false-red the
+    # load-bearing never-emitted row — red pre-fix).
+    test_lane = (
+        "fn live() {}\n#[cfg(test)]\nmod tests {\n"
+        '    fn t() { let _ = Status::out_of_range("v"); }\n}\n'
+    )
+    codes_t, _r = emitted_codes(test_lane, "planted/test_lane.rs")
+    if "out_of_range" in codes_t:
+        print("FAIL: W12-BG (a) — a cfg(test)-lane constructor entered the emitted set", file=sys.stderr)
+        return 1
+    f_t = check([("out_of_range", "never-emitted")], codes_t)
+    if f_t:
+        print(f"FAIL: W12-BG (a) — the never-emitted row false-red against test-lane code: {f_t}", file=sys.stderr)
+        return 1
+    # (b) the Status::new(Code::X) idiom maps IN (red pre-fix: the
+    # needle captured `new` and the never-emitted row stayed green
+    # through a mint migration).
+    codes_n, refusals_n = emitted_codes('Err(Status::new(tonic::Code::OutOfRange, msg))')
+    if codes_n != {"out_of_range"} or refusals_n:
+        print(f"FAIL: W12-BG (b) — Status::new(Code::X) did not map: {codes_n}, {refusals_n}", file=sys.stderr)
+        return 1
+    # (c) a dynamic-code Status::new REFUSES, never captures `new`
+    # (the triage's live-specimen note: adjacent gc.rs uses dynamic
+    # codes — the refusal covers them honestly).
+    codes_dy, refusals_dy = emitted_codes("Err(Status::new(code_for(e), msg))", "planted/dyn.rs")
+    if "new" in codes_dy or len(refusals_dy) != 1 or "cannot map" not in refusals_dy[0]:
+        print(f"FAIL: W12-BG (c) — the dynamic-code constructor did not refuse: {codes_dy}, {refusals_dy}", file=sys.stderr)
         return 1
 
     # --- the real scan --------------------------------------------------
     classifier = (src_root / CLASSIFIER_FILE).read_text()
     server = (src_root / SERVER_FILE).read_text()
     rows = parse_rows(classifier)
-    emitted = emitted_codes(server)
-    fails = check(rows, emitted)
+    emitted, refusals = emitted_codes(server, SERVER_FILE)
+    fails = refusals + check(rows, emitted)
     print(
         f"exposure-producer-census: {len(rows)} classifier rows checked against "
         f"{len(emitted)} distinct Status constructors in {SERVER_FILE}"
