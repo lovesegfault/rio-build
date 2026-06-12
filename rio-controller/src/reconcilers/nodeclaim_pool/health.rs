@@ -378,7 +378,12 @@ pub fn detect_vanished(
     let mut ice = Vec::new();
     inflight.retain(|name, cell| {
         let observed = live_by_name.get(name.as_str()).copied();
-        let Some(class) = classify_vanish(observed, tombstones.reason(name)) else {
+        // merged_bug_050 freshness gate (R29′): the provenance axis
+        // is consultable only by a fold whose LIST post-dates the
+        // stamp — a same-tick stamp's pre-delete LIST structurally
+        // cannot carry the delete's evidence (three of the four
+        // lane-by-mode stamp cells are stamp-before-fold).
+        let Some(class) = classify_vanish(observed, tombstones.consultable_reason(name)) else {
             // Still in-flight: KEEP. classify's reason short-circuit
             // and ice_timeout don't cover the GC'd-between-
             // observations window for slow-ICE cells. A tombstone (if
@@ -445,12 +450,64 @@ pub fn detect_vanished(
                 ice.push(cell.clone());
             }
         }
-        // Every exit consumes the name's provenance — the tracking
-        // story is over; a later same-name claim is fresh evidence.
-        tombstones.remove(name);
+        // merged_bug_050 (R32, the `sys.obligation.linear-discharge`
+        // doctrine): tombstone disposition is a TYPED per-exit
+        // property, not a uniform epilogue — an exit cannot drop a
+        // tombstone untyped. Only an exit that FIRED the packet may
+        // consume; every other exit with a live tombstone HANDS it
+        // to the registered-population sweep (the name leaves
+        // `inflight` here, so the sweep owns it from the next
+        // statement of the chokepoint on: disconfirm-keeps,
+        // confirm-fires-the-packet, expiry-is-disclosed). Pre-fix
+        // the uniform `remove` consumed the RegisteredHandoff exit's
+        // tombstone on disconfirmed-only evidence — the committed
+        // delete's consequence packet (counter, Ice mask, wedge
+        // eviction) was silently lost while the sweep kept identical
+        // evidence armed one population over.
+        match tombstone_disposition(class) {
+            TombstoneDisposition::ConsumedWithPacket => tombstones.remove(name),
+            TombstoneDisposition::HandedToSweep => {}
+        }
         false
     });
     ice
+}
+
+/// The typed per-exit tombstone discharge (merged_bug_050, R32 — an
+/// instance of the `sys.obligation.linear-discharge` doctrine): every
+/// [`VanishClass`] exit names what happens to the name's delete
+/// tombstone, and the only consuming arm is the one that fired the
+/// packet. The match below is TOTAL over the exit alphabet — a new
+/// exit class cannot compile without declaring its disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TombstoneDisposition {
+    /// The exit applied the tombstone's own consequence packet
+    /// ([`VanishClass::SelfReap`] — reachable only through the
+    /// freshness-gated provenance consult): the obligation
+    /// discharges by consumption.
+    ConsumedWithPacket,
+    /// The exit did NOT fire the packet: a live tombstone (if any)
+    /// stays armed and the registered-population sweep owns it —
+    /// the name leaves the vanish fold's population at this exit, so
+    /// the sweep's partition takes over (disconfirm keeps, confirm
+    /// fires the packet through `record_reap`, expiry is the typed
+    /// disclosed disposition). Covers the disconfirmed
+    /// RegisteredHandoff cell AND the freshness-gated same-tick
+    /// cells uniformly; for the no-tombstone exits the hand-off is
+    /// vacuous.
+    HandedToSweep,
+}
+
+// r[impl ctrl.pool.delete-outcome]
+pub fn tombstone_disposition(class: VanishClass) -> TombstoneDisposition {
+    match class {
+        VanishClass::SelfReap(_) => TombstoneDisposition::ConsumedWithPacket,
+        VanishClass::RegisteredHandoff
+        | VanishClass::DeliberateTeardown
+        | VanishClass::BootFailureTeardown
+        | VanishClass::LaunchFailureTeardown
+        | VanishClass::GcVanish => TombstoneDisposition::HandedToSweep,
+    }
 }
 
 /// The closed exit alphabet at the vanish seam (live_050(b), widened
@@ -514,9 +571,13 @@ pub fn classify_vanish(
         // classification already adjudicated those).
         (None, Some(r)) => Some(VanishClass::SelfReap(r)),
         (Some(n), Some(r)) if n.terminating() => Some(VanishClass::SelfReap(r)),
-        // Observation rows (tombstone absent, or present but
-        // DISCONFIRMED — the claim is alive and not terminating, so
-        // the attempted delete provably has not committed yet).
+        // Observation rows (tombstone absent, not yet consultable
+        // under the freshness gate, or present but DISCONFIRMED —
+        // the claim is alive and not terminating ON THIS LIST, which
+        // may pre-date the stamp: disconfirmation is
+        // evidence-so-far, never proof of non-commit, which is why
+        // these exits' tombstone discharge is HandedToSweep, never
+        // consumption — merged_bug_050).
         (Some(n), _) if n.registered && n.terminating() => Some(VanishClass::DeliberateTeardown),
         (Some(n), _) if n.registered => Some(VanishClass::RegisteredHandoff),
         (Some(n), _) if n.terminating() => match n.launched() {
@@ -616,18 +677,40 @@ impl DeleteTombstones {
     /// Record an ambiguous delete attempt at the CURRENT fold count
     /// (re-stamping an existing name refreshes its grace and
     /// consequence packet — a repeated `Err` is a fresh ambiguous
-    /// attempt). A stamp between folds F and F+1 is first consulted
-    /// by fold F+1 and cannot expire before fold F+`TTL`+1 — a fresh
-    /// stamp is never pruned by its own tick BY CONSTRUCTION (the
-    /// pre-R29 callers carried that as an ordering comment).
+    /// attempt). A stamp made while the count reads F is first
+    /// CONSUMABLE by the fold that completes count F+1 (the R29′
+    /// freshness gate, merged_bug_050: the same-window fold's LIST
+    /// may pre-date the delete) and cannot expire before the count
+    /// reads F+`TTL`+1 — a fresh stamp is never pruned by its own
+    /// tick BY CONSTRUCTION, and every stamp gets ≥3 consultable
+    /// folds before expiry whichever lane-by-mode cell stamped it.
     pub fn stamp(&mut self, seed: AmbiguousDelete) {
         let stamped_fold = self.folds;
         self.entries
             .insert(seed.name.clone(), DeleteAttempt { seed, stamped_fold });
     }
 
-    /// The tombstoned reason for `name`, if any — the provenance axis
-    /// [`classify_vanish`] consumes.
+    /// The tombstoned reason for `name`, IF its stamp is consultable
+    /// by the current fold — the provenance axis [`classify_vanish`]
+    /// consumes. R29′ freshness (merged_bug_050): a stamp made while
+    /// the fold count reads F is first consultable by the fold that
+    /// COMPLETES count F+1 (i.e. `stamped_fold < folds` at consult
+    /// time) — the same-window fold's LIST may pre-date the delete
+    /// and structurally cannot carry its evidence. For post-fold
+    /// stamps (the idle × reconcile_once cell) this is one fold
+    /// conservative — the safe direction: grace only lengthens, and
+    /// the TTL still guarantees ≥3 consultable folds per stamp.
+    pub fn consultable_reason(&self, name: &str) -> Option<ReapReason> {
+        self.entries
+            .get(name)
+            .filter(|a| self.folds.wrapping_sub(a.stamped_fold) >= 1)
+            .map(|a| a.seed.reason)
+    }
+
+    /// The RAW tombstoned reason for `name` — test assertions only
+    /// (no freshness gating); every PRODUCTION provenance consult
+    /// goes through [`Self::consultable_reason`].
+    #[cfg(test)]
     pub fn reason(&self, name: &str) -> Option<ReapReason> {
         self.entries.get(name).map(|a| a.seed.reason)
     }
@@ -738,7 +821,10 @@ pub struct TombstoneSweep {
 /// would be counted as ours — the same bounded suppression window the
 /// TTL derivation prices for the vanish fold, and the consequence is
 /// safe under it (a terminating node's evidence is evicted exactly
-/// like fleet absence would evict it one window later).
+/// like fleet absence would evict it one window later). The R29′
+/// freshness gate (merged_bug_050) NARROWS the window's front edge:
+/// an observation on a LIST pre-dating the stamp is never consumed
+/// as ours — the same-tick fold keeps the entry armed.
 // r[impl ctrl.pool.delete-outcome]
 pub fn sweep_registered_tombstones(
     tombstones: &mut DeleteTombstones,
@@ -748,10 +834,19 @@ pub fn sweep_registered_tombstones(
     let live_by_name: HashMap<&str, &LiveNode> =
         live.iter().map(|n| (n.name.as_str(), n)).collect();
     let mut out = TombstoneSweep::default();
+    let current_fold = tombstones.folds;
     tombstones.entries.retain(|name, a| {
         if inflight.contains_key(name) {
             // The vanish fold's population — its exits consume these
             // (one consumer per tombstone, partitioned by population).
+            return true;
+        }
+        if current_fold.wrapping_sub(a.stamped_fold) == 0 {
+            // R29′ freshness (merged_bug_050): a same-window stamp's
+            // LIST may pre-date the delete — adjudicating it here
+            // would consume (and fire the packet for) an observation
+            // that structurally cannot carry the delete's evidence.
+            // Keep armed; the next fold's LIST post-dates the stamp.
             return true;
         }
         let confirmed = match live_by_name.get(name.as_str()) {
@@ -1304,6 +1399,9 @@ mod tests {
         let mut inflight: HashMap<String, Cell> = [("nc-bt".to_string(), h.clone())].into();
         let mut ts = DeleteTombstones::default();
         ts.stamp(ts_seed("nc-bt", ReapReason::BootTimeout));
+        // R29′ freshness (merged_bug_050): a stamp is consultable
+        // only from the next fold — model that fold boundary.
+        ts.advance_fold_and_prune();
         let mut n = with_conds(
             node("nc-bt", "h", CapacityType::Spot, 8, 0, 0),
             &[("Launched", "True", 1001.0)],
@@ -1325,6 +1423,7 @@ mod tests {
         let mut inflight: HashMap<String, Cell> = [("nc-ice".to_string(), h.clone())].into();
         let mut ts = DeleteTombstones::default();
         ts.stamp(ts_seed("nc-ice", ReapReason::Ice));
+        ts.advance_fold_and_prune();
         let rec = DebuggingRecorder::new();
         let _g = ::metrics::set_default_local_recorder(&rec);
         let ice = detect_vanished(&mut inflight, &mut ts, &[]);
@@ -1354,9 +1453,11 @@ mod tests {
         ts.stamp(ts_seed("nc-x", ReapReason::BootTimeout));
 
         // Disconfirmed: present ∧ !terminating → KEEP both, for
-        // exactly TOMBSTONE_TTL_FOLDS consulting folds (the stamp is
-        // not aged by clock time it was never consulted across —
-        // only by executions of THIS fold).
+        // exactly TOMBSTONE_TTL_FOLDS folds (the first is the
+        // same-window fold the R29′ gate keeps un-consumable; the
+        // rest consult and disconfirm — the stamp is not aged by
+        // clock time it was never consulted across, only by
+        // executions of THIS fold).
         let mut alive = node("nc-x", "h", CapacityType::Spot, 8, 0, 0);
         alive.registered = false;
         for fold_n in 0..TOMBSTONE_TTL_FOLDS {
@@ -1407,6 +1508,139 @@ mod tests {
         );
     }
 
+    // r[verify ctrl.pool.delete-outcome]
+    /// W12-AN — proposition: no committed delete's consequence packet
+    /// is lost, per-exit TYPED; population: the 4 lane-by-mode stamp
+    /// cells (health/idle × reconcile_once/consolidate_only — three
+    /// stamp-before-fold, one stamp-after-fold; the freshness pins
+    /// below cover both shapes).
+    ///
+    /// The merged_bug_050 trace: an in-flight tracked claim is
+    /// ambiguous-reaped (non-404 error; the delete may have
+    /// committed) and the SAME tick's fold consults a LIST fetched
+    /// BEFORE the delete — which still shows the claim alive and
+    /// REGISTERED (registration raced the reap). Pre-fix the
+    /// RegisteredHandoff exit CONSUMED the tombstone on that
+    /// disconfirmed-only evidence; when the delete's commit surfaced
+    /// one LIST later the claim read DeliberateTeardown (registered
+    /// teardown, no tombstone) and the consequence packet —
+    /// reaped_total under the original reason, the Ice mask, the
+    /// wedge eviction — was silently lost, with
+    /// sweep_registered_tombstones KEEPING disconfirmed tombstones
+    /// armed on identical evidence one population over. Post-fix the
+    /// exit HANDS the tombstone to the registered-population sweep
+    /// (typed disposition) and the next fold's fresh LIST confirms:
+    /// the packet fires.
+    #[test]
+    fn w12_an_registered_handoff_hands_tombstone_to_sweep() {
+        use super::super::ffd::tests::set_terminating;
+        let h = Cell("h".into(), CapacityType::Spot);
+        let mut inflight: HashMap<String, Cell> = [("nc-race".to_string(), h.clone())].into();
+        let mut ts = DeleteTombstones::default();
+        // The ambiguous delete's full consequence packet (Ice reason
+        // + the backing node for the wedge feed).
+        ts.stamp(AmbiguousDelete {
+            name: "nc-race".into(),
+            reason: ReapReason::Ice,
+            cell: h.clone(),
+            node_name: Some("node-race".into()),
+            idle_gap_secs: None,
+        });
+
+        // Fold 1 — the same tick's fold over the PRE-delete LIST:
+        // the claim shows alive AND registered (the race).
+        let mut reg = node("nc-race", "h", CapacityType::Spot, 8, 0, 0);
+        reg.registered = true;
+        let f1 = vanish_fold(&mut inflight, &mut ts, std::slice::from_ref(&reg));
+        assert!(
+            f1.ice_cells.is_empty() && f1.evicted_nodes.is_empty(),
+            "no consequence on disconfirmed evidence"
+        );
+        assert!(
+            !inflight.contains_key("nc-race"),
+            "the handoff itself stands: observe_registered/FFD own the claim"
+        );
+        assert!(
+            ts.contains("nc-race"),
+            "the RegisteredHandoff exit HANDS the tombstone to the \
+             registered-population sweep — it must not consume on \
+             disconfirmed-only evidence (the sweep keeps identical \
+             evidence armed one population over)"
+        );
+
+        // Fold 2 — the delete's commit surfaces on a fresh LIST
+        // (terminating): the sweep confirms and the ORIGINAL
+        // consequence packet fires whole.
+        let mut term = node("nc-race", "h", CapacityType::Spot, 8, 0, 0);
+        term.registered = true;
+        let term = set_terminating(term);
+        let f2 = vanish_fold(&mut inflight, &mut ts, std::slice::from_ref(&term));
+        assert_eq!(
+            f2.ice_cells,
+            vec![h],
+            "the Ice half of the consequence packet fires on confirm"
+        );
+        assert_eq!(
+            f2.evicted_nodes,
+            vec!["node-race".to_string()],
+            "the wedge-eviction half fires on confirm"
+        );
+        assert!(!ts.contains("nc-race"), "confirmed ⇒ consumed");
+    }
+
+    /// The R29′ freshness gate on tombstone consumption
+    /// (`ctrl.pool.delete-outcome`): a stamp is CONSUMABLE only by a
+    /// fold whose LIST post-dates it — the fold clock is the
+    /// denominator. Three of the four lane-by-mode stamp cells are
+    /// stamp-BEFORE-fold (health × both modes, idle ×
+    /// consolidate_only): their same-tick fold consults a pre-delete
+    /// LIST that structurally cannot carry the delete's evidence.
+    /// The gate makes that consult a no-op for the provenance axis:
+    /// same-fold = not yet consultable; the NEXT fold adjudicates.
+    /// (The fourth cell — idle × reconcile_once, stamp-after-fold —
+    /// pays one conservative extra fold: the safe direction, grace
+    /// only lengthens.)
+    #[test]
+    fn same_tick_stamp_is_not_consumable_by_its_own_fold() {
+        use super::super::ffd::tests::set_terminating;
+        let h = Cell("h".into(), CapacityType::Spot);
+        let mut inflight: HashMap<String, Cell> = HashMap::new();
+        let mut ts = DeleteTombstones::default();
+        ts.stamp(AmbiguousDelete {
+            name: "nc-fresh".into(),
+            reason: ReapReason::Dead,
+            cell: h.clone(),
+            node_name: Some("node-f".into()),
+            idle_gap_secs: None,
+        });
+
+        // The same tick's fold: the claim shows terminating on the
+        // PRE-delete LIST (it was already dying before our delete —
+        // foreign teardown, or our commit racing ahead). The stamp
+        // is NOT consultable: consuming here would attribute a
+        // pre-stamp observation to the stamp's delete.
+        let mut term = node("nc-fresh", "h", CapacityType::Spot, 8, 0, 0);
+        term.registered = true;
+        let term = set_terminating(term);
+        let f1 = vanish_fold(&mut inflight, &mut ts, std::slice::from_ref(&term));
+        assert!(
+            f1.evicted_nodes.is_empty(),
+            "a same-tick stamp is not consumable by its own fold \
+             (the LIST pre-dates the delete)"
+        );
+        assert!(ts.contains("nc-fresh"), "kept armed for the next fold");
+
+        // The next fold's LIST post-dates the stamp: consumable —
+        // confirm fires the packet.
+        let f2 = vanish_fold(&mut inflight, &mut ts, std::slice::from_ref(&term));
+        assert_eq!(
+            f2.evicted_nodes,
+            vec!["node-f".to_string()],
+            "first post-stamp fold adjudicates and confirms"
+        );
+        assert!(!ts.contains("nc-fresh"));
+    }
+
     /// W11-AG unit face — the tombstone consumer census (R25: every
     /// tombstone is consumed by an arm applying its reason's full
     /// consequence, or expires disclosed — never a silent prune), as
@@ -1449,6 +1683,8 @@ mod tests {
                         node_name: Some("node-x".into()),
                         idle_gap_secs: (reason == ReapReason::Idle).then_some(7.5),
                     });
+                    // R29′ freshness: consultable from the next fold.
+                    ts.advance_fold_and_prune();
                     let inflight: HashMap<String, Cell> = if in_fold_population {
                         [("nc-x".to_string(), h.clone())].into()
                     } else {
@@ -1594,6 +1830,8 @@ mod tests {
                             let mut ts = DeleteTombstones::default();
                             if let Some(r) = tombstoned {
                                 ts.stamp(ts_seed("nc-x", r));
+                                // R29′: consultable from the next fold.
+                                ts.advance_fold_and_prune();
                             }
                             let live = if present { vec![n] } else { vec![] };
                             let ice = detect_vanished(&mut inflight, &mut ts, &live);
@@ -1611,11 +1849,16 @@ mod tests {
                                 want.is_none(),
                                 "tracking effect for {row:?}"
                             );
-                            // Tombstone consumption: every EXIT eats
-                            // the provenance; a KEEP retains it.
+                            // Tombstone disposition (merged_bug_050,
+                            // R32 — typed per exit): only the exit
+                            // that FIRED the packet (SelfReap)
+                            // consumes; every other exit hands the
+                            // tombstone to the registered-population
+                            // sweep, and a KEEP retains it.
                             assert_eq!(
                                 ts.contains("nc-x"),
-                                tombstoned.is_some() && want.is_none(),
+                                tombstoned.is_some()
+                                    && !matches!(want, Some(VanishClass::SelfReap(_))),
                                 "tombstone effect for {row:?}"
                             );
                         }

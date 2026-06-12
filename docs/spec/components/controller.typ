@@ -1977,7 +1977,19 @@ so a committed-but-errored Dead reap's wedge eviction never fired and
 `reaped_total{reason=dead}` permanently undercounted. The typed total
 makes a one-armed lane unwritable (rustc exhaustiveness), and the
 consumer census makes an unconsumed tombstone a structural
-impossibility rather than a per-site promise.
+impossibility rather than a per-site promise. The round-12 instance
+(merged_bug_050) closed the per-EXIT face the consumer census did not
+quantify: the vanish fold's uniform exit epilogue consumed tombstones
+on disconfirmed-only evidence at the RegisteredHandoff exit (the same
+tick's fold consults a pre-delete LIST), silently losing a committed
+delete's consequence packet; tombstone disposition is now a TYPED
+per-exit property --- only the packet-firing exit consumes, every
+other exit hands the obligation to the registered-population sweep,
+and consumption is freshness-gated on the fold clock (a stamp is
+consumable only by a fold whose LIST post-dates it). The wave-11
+vanish_class census froze classification totality; the typed
+disposition closes per-exit discharge --- the axis the seal never
+enumerated.
 
 #r("ctrl.pool.fold-clock")[
   The delete-tombstone grace MUST be denominated in CONSUMER FOLD

@@ -474,3 +474,28 @@ under this rule.
   linearity proof (exactly one of consume/read-lose/refusal per
   conflict round, over the full cell product). The behavior red is the
   deleted-lease create-race schedule (belief exits at the round).
+
+- *NodeClaim delete-tombstone disposition (controller)*: the vanish
+  fold's uniform exit epilogue consumed the delete tombstone on every
+  exit --- including the RegisteredHandoff exit's disconfirmed-only
+  evidence (the same tick's fold consults a LIST fetched BEFORE the
+  delete), so an ambiguous-but-committed delete of a registered
+  inflight claim deterministically lost its consequence packet (the
+  reap counter under the original reason, the Ice mask, the wedge
+  eviction) with zero disclosure --- while
+  `sweep_registered_tombstones` KEPT disconfirmed tombstones armed on
+  identical evidence one population over (merged_bug_050). Typed
+  discharge: the disposition is a TYPED per-exit property
+  (`TombstoneDisposition`) --- only the exit that FIRED the packet
+  consumes (`ConsumedWithPacket`, the SelfReap arm); every other exit
+  hands the obligation to the registered-population sweep
+  (`HandedToSweep`: disconfirm keeps, confirm fires the packet whole,
+  expiry is the typed disclosed disposition) --- and consumption is
+  gated on observation FRESHNESS (a stamp is consumable only by a
+  fold whose LIST post-dates it; the fold clock denominates,
+  #rref("ctrl.pool.fold-clock")). An exit structurally cannot drop a
+  tombstone untyped (#rref("ctrl.pool.delete-outcome")). Witnessed by
+  the W12-AN red (the racing-registration trace: packet lost pre-fix,
+  fires whole post-fix), the four lane-by-mode freshness pins, and
+  the quint disposition twins (the as-built consume face falsifies;
+  the typed face confirms through the sweep).

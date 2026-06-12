@@ -7788,6 +7788,35 @@ rec {
       maxSteps = 14;
     };
 
+    # Round-12 merged_bug_050 (tombstone disposition typed per vanish
+    # exit — the sys.obligation.linear-discharge instance). FALSIFY
+    # half: under the as-built uniform consume-on-every-exit
+    # epilogue, an ambiguous-reaped in-flight claim whose
+    # registration races the delete loses its COMMITTED consequence
+    # packet at the RegisteredHandoff exit's disconfirmed-only
+    # consume — the deterministic w12anRegisteredHandoffConsumeRed
+    # trace reaches VTombstoneDropped (the third drop path beside the
+    # round-11 prune pair).
+    # r[verify ctrl.pool.delete-outcome]
+    quint-nodeclaim-tombstone-disposition-asbuilt = mkQuintRunCheck {
+      name = "nodeclaim-tombstone-disposition-asbuilt";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleTombstoneDispositionAsBuilt";
+      match = "w12anRegisteredHandoffConsumeRed";
+    };
+    # HOLD half: the typed disposition HANDS the tombstone to the
+    # registered-population sweep (the only consuming exit is the one
+    # that fired the packet); the lagged commit surfaces and the
+    # first post-stamp fold fires the packet whole —
+    # ETombstoneConfirmed with no VTombstoneDropped, the green twin.
+    # r[verify ctrl.pool.delete-outcome]
+    quint-nodeclaim-tombstone-disposition-typed = mkQuintRunCheck {
+      name = "nodeclaim-tombstone-disposition-typed";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleTombstoneDisposition";
+      match = "w12anHandoffHandsToSweepGreen";
+    };
+
     # ------------------------------------------------------------------
     # ICE evidence/ack pipeline (bughunt-5 slot 5: bug_094 +
     # merged_bug_134/008/003) — the cross-component contract

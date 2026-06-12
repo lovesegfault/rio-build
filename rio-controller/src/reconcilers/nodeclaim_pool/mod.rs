@@ -1818,7 +1818,9 @@ impl NodeClaimPoolReconciler {
         // bug_094: ambiguous (non-404 Err) deletes tombstone their
         // provenance for the vanish fold (stamped at the consumer's
         // own fold clock — a fresh stamp cannot expire before its
-        // first consult by construction, R29).
+        // first consult by construction, R29; and per merged_bug_050
+        // the SAME tick's fold below cannot consume it — its LIST
+        // pre-dates these stamps, the R29′ freshness gate).
         for seed in delete_attempted {
             self.delete_tombstones.stamp(seed);
         }
@@ -1927,10 +1929,13 @@ impl NodeClaimPoolReconciler {
         // health lane (ctrl.pool.delete-outcome): a completed retry
         // consumes its prior ambiguous-attempt tombstone (the prompt
         // arm already applied the consequence); an ambiguous error
-        // stamps its consequence packet. Stamps here land AFTER this
-        // tick's vanish fold ran above — they are first consultable
-        // at the next fold, exactly like the health lane's
-        // stamp-then-fold-next-tick shape.
+        // stamps its consequence packet. merged_bug_050: stamp/fold
+        // ORDER varies by lane-by-mode cell (this cell stamps after
+        // the fold; the health lane in both modes and the idle lane
+        // in consolidate_only stamp BEFORE their fold) — the
+        // uniformity lives in the R29′ freshness gate, not in
+        // ordering: a stamp is CONSUMABLE only by a fold whose LIST
+        // post-dates it, whichever side of the fold it landed on.
         for name in &idle_reaped.reaped_claims {
             self.delete_tombstones.remove(name);
         }

@@ -361,9 +361,22 @@ module nodeclaimLifecycle {
   /// ambiguous-choice sets collapse to empty and the reachable state
   /// space is unchanged.
   ///
-  /// MODEL-DIVERGENCE(law=ctrl.pool.delete-outcome; tree=rio-controller/src/reconcilers/nodeclaim_pool/health.rs:record_reap): the model certifies the outcome PARTITION (completed vs ambiguous; its single completed arm IS the Ok/404 parity law) and the tombstone consume-or-disclosed-expiry protocol, NOT the consequence payload (counters, the wedge-eviction feed, censored NA samples; the wedge plane is consumed-input, out of model) — retarget-by: modeling the wedge admission plane or any change to the consequence-packet law.
+  /// MODEL-DIVERGENCE(law=ctrl.pool.delete-outcome; tree=rio-controller/src/reconcilers/nodeclaim_pool/health.rs:record_reap): the model certifies the outcome PARTITION (completed vs ambiguous; its single completed arm IS the Ok/404 parity law), the tombstone consume-or-disclosed-expiry protocol, and (round-12, merged_bug_050) the TYPED per-exit disposition — the registered-handoff exits hand the tombstone to the sweep (ENABLE_TYPED_TOMBSTONE_DISPOSITION; the as-built consume face is the disposition twins' red) — NOT the consequence payload (counters, the wedge-eviction feed, censored NA samples; the wedge plane is consumed-input, out of model) — retarget-by: modeling the wedge admission plane or any change to the consequence-packet law.
   const ENABLE_TOMBSTONE_MACHINERY: bool
   const ENABLE_FOLD_CLOCK: bool
+  /// merged_bug_050 (round-12): the ambiguous-delete commit LAGS the
+  /// LIST — commitChoice sets the ground truth (ourCommit) without
+  /// moving the observed phase; the commit surfaces later via the
+  /// ambiguousCommitSurfaces env action (a committed delete shows
+  /// terminating only on a post-commit LIST). Off = the round-11
+  /// regimes' immediate-surfacing shape (state spaces unchanged).
+  const ENABLE_LAGGED_COMMIT_OBSERVATION: bool
+  /// merged_bug_050 (round-12): tombstone disposition is TYPED per
+  /// vanish exit — only the packet-firing exit (SelfReap/confirm)
+  /// consumes; the registered-handoff exits HAND the tombstone to
+  /// the registered-population sweep. Off = the as-built uniform
+  /// consume-on-every-exit epilogue (the defect face).
+  const ENABLE_TYPED_TOMBSTONE_DISPOSITION: bool
 
   pure val CLAIMS: Set[ClaimId] = Set("c1", "c2")
   pure val CELLS: Set[Cell] = Set("cellA", "cellB")
@@ -869,8 +882,10 @@ module nodeclaimLifecycle {
           // environment's truth — a committed delete surfaces as
           // terminating at the next LIST.
           { ...c,
-            phase: if (commitChoice.contains(k)) CTerminating else c.phase,
-            stuck: if (commitChoice.contains(k)) false else c.stuck,
+            phase: if (commitChoice.contains(k) and not(ENABLE_LAGGED_COMMIT_OBSERVATION))
+                     CTerminating else c.phase,
+            stuck: if (commitChoice.contains(k) and not(ENABLE_LAGGED_COMMIT_OBSERVATION))
+                     false else c.stuck,
             tomb: true, tombAge: 0,
             ourCommit: c.ourCommit or commitChoice.contains(k) }
         else if (tombConfirmed.contains(k))
@@ -881,11 +896,19 @@ module nodeclaimLifecycle {
         else if (vanished.contains(k)) { ...c, inflightTracked: false }
         else if (c.phase == CRegistered and c.spell == SNotIdle and c.inflightTracked)
           // detect_vanished drops registered/terminating entries too.
-          { ...c, inflightTracked: false }
+          // merged_bug_050: typed disposition — the handoff exits
+          // keep the tombstone for the sweep; as-built consumed it.
+          { ...c, inflightTracked: false,
+            tomb: if (ENABLE_TYPED_TOMBSTONE_DISPOSITION) c.tomb else false,
+            tombAge: if (ENABLE_TYPED_TOMBSTONE_DISPOSITION) c.tombAge else 0 }
         else if (c.phase == CRegistered and c.inflightTracked)
-          { ...c, inflightTracked: false }
+          { ...c, inflightTracked: false,
+            tomb: if (ENABLE_TYPED_TOMBSTONE_DISPOSITION) c.tomb else false,
+            tombAge: if (ENABLE_TYPED_TOMBSTONE_DISPOSITION) c.tombAge else 0 }
         else if (c.phase == CTerminating and c.inflightTracked)
-          { ...c, inflightTracked: false }
+          { ...c, inflightTracked: false,
+            tomb: if (ENABLE_TYPED_TOMBSTONE_DISPOSITION) c.tomb else false,
+            tombAge: if (ENABLE_TYPED_TOMBSTONE_DISPOSITION) c.tombAge else 0 }
         else c)
       // Fixed law: the post-consult fold-clock advance + prune — ages
       // move only on fold executions, AFTER the consult; a same-tick
@@ -905,9 +928,20 @@ module nodeclaimLifecycle {
       // The consumer law's violation: a tombstone dropped while its
       // delete had COMMITTED — the consequence can no longer fire
       // (bug_042's unconsumed expiry / bug_043's pruned-unconsulted).
+      // merged_bug_050 (round-12): the as-built uniform epilogue
+      // consumes the tombstone at the registered-handoff exit on
+      // disconfirmed-only evidence — a committed delete's packet is
+      // lost at that consume (the third drop path beside the two
+      // prune paths below).
+      val handoffDropped = CLAIMS.filter(k =>
+        val c = tombs.get(k)
+        ENABLE_TOMBSTONE_MACHINERY and not(ENABLE_TYPED_TOMBSTONE_DISPOSITION)
+        and c.inflightTracked and c.tomb and c.ourCommit
+        and c.phase == CRegistered)
       val vTombDropped = ENABLE_TOMBSTONE_MACHINERY and (
         prePruneDropped.filter(k => preAged.get(k).ourCommit).size() > 0
-        or foldExpired.filter(k => claimsAfter.get(k).ourCommit).size() > 0)
+        or foldExpired.filter(k => claimsAfter.get(k).ourCommit).size() > 0
+        or handoffDropped.size() > 0)
       all {
         claims' = claimsAfterTomb,
         edgeClearDone' = if (ENABLE_EPOCH_MACHINERY) true else edgeClearDone,
@@ -1191,8 +1225,10 @@ module nodeclaimLifecycle {
           // environment's truth — a committed delete surfaces as
           // terminating at the next LIST.
           { ...c,
-            phase: if (commitChoice.contains(k)) CTerminating else c.phase,
-            stuck: if (commitChoice.contains(k)) false else c.stuck,
+            phase: if (commitChoice.contains(k) and not(ENABLE_LAGGED_COMMIT_OBSERVATION))
+                     CTerminating else c.phase,
+            stuck: if (commitChoice.contains(k) and not(ENABLE_LAGGED_COMMIT_OBSERVATION))
+                     false else c.stuck,
             tomb: true, tombAge: 0,
             ourCommit: c.ourCommit or commitChoice.contains(k) }
         else if (tombConfirmed.contains(k))
@@ -1212,8 +1248,14 @@ module nodeclaimLifecycle {
             inflightCell: "cellB", pIdle: INotTracked, ctrlReaped: false,
             tomb: false, tombAge: 0, ourCommit: false }
         else if (c.inflightTracked and (c.phase == CRegistered or c.phase == CTerminating))
-          // detect_vanished drops entries for registered/terminating claims.
-          { ...c, inflightTracked: false }
+          // detect_vanished drops entries for registered/terminating
+          // claims. merged_bug_050: the as-built uniform epilogue
+          // ALSO consumed the tombstone at these exits — on
+          // disconfirmed-only evidence; typed disposition hands it
+          // to the registered-population sweep instead.
+          { ...c, inflightTracked: false,
+            tomb: if (ENABLE_TYPED_TOMBSTONE_DISPOSITION) c.tomb else false,
+            tombAge: if (ENABLE_TYPED_TOMBSTONE_DISPOSITION) c.tombAge else 0 }
         else c)
       // Fixed law: the post-consult fold-clock advance + prune (see
       // the consolidate-only twin for the derivation).
@@ -1228,9 +1270,20 @@ module nodeclaimLifecycle {
                  and not(ambReaped.contains(k)))
           { ...c, tombAge: c.tombAge + 1 }
         else c)
+      // merged_bug_050 (round-12): the as-built uniform epilogue
+      // consumes the tombstone at the registered-handoff exit on
+      // disconfirmed-only evidence — a committed delete's packet is
+      // lost at that consume (the third drop path beside the two
+      // prune paths below).
+      val handoffDropped = CLAIMS.filter(k =>
+        val c = tombs.get(k)
+        ENABLE_TOMBSTONE_MACHINERY and not(ENABLE_TYPED_TOMBSTONE_DISPOSITION)
+        and c.inflightTracked and c.tomb and c.ourCommit
+        and c.phase == CRegistered)
       val vTombDropped = ENABLE_TOMBSTONE_MACHINERY and (
         prePruneDropped.filter(k => preAged.get(k).ourCommit).size() > 0
-        or foldExpired.filter(k => claimsAfter.get(k).ourCommit).size() > 0)
+        or foldExpired.filter(k => claimsAfter.get(k).ourCommit).size() > 0
+        or handoffDropped.size() > 0)
       // ---- budget violation checks (post-hoc, against the rule) -----------
       val totalAfter = CLAIMS.filter(k => claimsAfter.get(k).phase != CAbsent).size()
       val cellAAfter = CLAIMS.filter(k =>
@@ -1384,6 +1437,35 @@ module nodeclaimLifecycle {
     claims' = claims.set(k, { ...claims.get(k),
       phase: CRegistered, spell: SYoungUnseen, busyTickSeen: false,
       boot: if (isLeader) BFreshTenure else BFreshOther }),
+    envFrame,
+  }
+
+  /// merged_bug_050 env: an in-flight claim whose ambiguous delete
+  /// is pending REGISTERS — the racing registration the as-built
+  /// RegisteredHandoff exit consumes the tombstone on. Distinct from
+  /// claimRegisters: the production in-flight reap (the controller's
+  /// own ICE timeout) fires WITHOUT a terminal Karpenter condition,
+  /// so its claim can register late; the `stuck` flag stands for the
+  /// reap trigger, not a terminal fault, on this lane.
+  action claimRegistersLate(k: ClaimId): bool = all {
+    ENABLE_LAGGED_COMMIT_OBSERVATION,
+    claims.get(k).phase == CInFlight,
+    claims.get(k).tomb,
+    claims' = claims.set(k, { ...claims.get(k),
+      phase: CRegistered, spell: SYoungUnseen, busyTickSeen: false,
+      boot: if (isLeader) BFreshTenure else BFreshOther }),
+    envFrame,
+  }
+
+  /// merged_bug_050 env: the lagged ambiguous-delete commit surfaces
+  /// on the next LIST (deletionTimestamp visible — the finalizer is
+  /// draining).
+  action ambiguousCommitSurfaces(k: ClaimId): bool = all {
+    ENABLE_LAGGED_COMMIT_OBSERVATION,
+    claims.get(k).ourCommit,
+    claims.get(k).phase == CRegistered,
+    claims' = claims.set(k,
+      { ...claims.get(k), phase: CTerminating, stuck: false }),
     envFrame,
   }
 
@@ -1701,7 +1783,9 @@ module nodeclaimLifecycleBase {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).*
 }
 
@@ -1728,7 +1812,9 @@ module nodeclaimLifecycleFaultRpc {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).*
 
   /// The conflation trace, post-fix: the claim is observed idle, goes
@@ -1785,7 +1871,9 @@ module nodeclaimLifecycleFaultLease {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).*
 }
 
@@ -1811,7 +1899,9 @@ module nodeclaimLifecycleFaultKarpenter {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).*
 }
 
@@ -1838,7 +1928,9 @@ module nodeclaimLifecycleEpochAsBuilt {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).*
 }
 
@@ -1865,7 +1957,9 @@ module nodeclaimLifecycleEpoch {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).*
 }
 
@@ -1891,7 +1985,9 @@ module nodeclaimLifecycleClearBufferAsBuilt {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).*
 }
 
@@ -1917,7 +2013,9 @@ module nodeclaimLifecycleClearBuffer {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).*
 }
 
@@ -1945,7 +2043,9 @@ module nodeclaimLifecycleAckLatchAsBuilt {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).*
 }
 
@@ -1972,7 +2072,9 @@ module nodeclaimLifecycleSnapshotAsBuilt {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).*
 }
 
@@ -1999,7 +2101,9 @@ module nodeclaimLifecycleSnapshot {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).*
 }
 
@@ -2028,7 +2132,9 @@ module nodeclaimLifecycleDeferAsBuilt {
     ENABLE_DEFER_MACHINERY = true,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).*
 }
 
@@ -2056,7 +2162,9 @@ module nodeclaimLifecycleDefer {
     ENABLE_DEFER_MACHINERY = true,
     ENABLE_DEFER_DEMAND = true,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).*
 }
 
@@ -2091,7 +2199,9 @@ module nodeclaimLifecycleTombstoneAsBuilt {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = true,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).*
 
   /// Deterministic W11-AI reproducer (the foldless-window
@@ -2149,7 +2259,9 @@ module nodeclaimLifecycleTombstone {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = true,
-    ENABLE_FOLD_CLOCK = true
+    ENABLE_FOLD_CLOCK = true,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).*
 
   /// The W11-AI shape under the fixed law (scaled to this regime's
@@ -2174,6 +2286,103 @@ module nodeclaimLifecycleTombstone {
   }
 }
 
+
+/// Round-12 merged_bug_050 AS-BUILT face: the uniform vanish-exit
+/// epilogue consumes the delete tombstone on EVERY exit — including
+/// the RegisteredHandoff exit's disconfirmed-only evidence. The
+/// deterministic red: an in-flight claim is ambiguous-reaped (the
+/// delete COMMITS but the LIST lags), its racing registration
+/// surfaces, and the next fold's handoff exit eats the tombstone —
+/// the committed delete's consequence packet is unrecoverably lost
+/// (VTombstoneDropped), while the registered-population sweep would
+/// have kept identical evidence armed one population over.
+module nodeclaimLifecycleTombstoneDispositionAsBuilt {
+  import nodeclaimLifecycle(
+    MAX_FLEET_CORES = 2,
+    CLASS_CAP_A = 1,
+    BOT_THRESHOLD = 3,
+    ENABLE_RPC_FAULT = true,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_KARPENTER_FAULT = true,
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = true,
+    ENABLE_FOLD_CLOCK = true,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = true,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = false
+  ).*
+
+  /// The merged_bug_050 reproducer, pinned as a named deterministic
+  /// run: mint → launch-stuck → ambiguous reap (commit lags the
+  /// LIST) → the registration races in → the handoff fold consumes
+  /// the tombstone on disconfirmed evidence → the committed packet
+  /// is lost.
+  run w12anRegisteredHandoffConsumeRed = {
+    init
+      .then(tickFullWith(false, false, false, 1, 0, Set(), Set(), Set(), Set()))
+      .then(claimLaunchStuck("c1"))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set(), Set("c1"), Set("c1")))
+      .then(claimRegistersLate("c1"))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set(), Set(), Set()))
+      .expect(violations.contains(VTombstoneDropped))
+  }
+}
+
+/// Round-12 merged_bug_050 FIXED face (typed per-exit disposition,
+/// `sys.obligation.linear-discharge` instance): the handoff exits
+/// HAND the tombstone to the registered-population sweep; when the
+/// lagged commit surfaces, the sweep confirms on a post-stamp LIST
+/// and the ORIGINAL consequence packet fires (ETombstoneConfirmed) —
+/// no drop, no foreign attribution.
+module nodeclaimLifecycleTombstoneDisposition {
+  import nodeclaimLifecycle(
+    MAX_FLEET_CORES = 2,
+    CLASS_CAP_A = 1,
+    BOT_THRESHOLD = 3,
+    ENABLE_RPC_FAULT = true,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_KARPENTER_FAULT = true,
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = true,
+    ENABLE_FOLD_CLOCK = true,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = true,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+  ).*
+
+  /// The same trace under the typed law, extended to the confirm:
+  /// the handoff keeps the tombstone, the commit surfaces, and the
+  /// first post-stamp fold fires the packet whole — the green twin
+  /// of w12anRegisteredHandoffConsumeRed.
+  run w12anHandoffHandsToSweepGreen = {
+    init
+      .then(tickFullWith(false, false, false, 1, 0, Set(), Set(), Set(), Set()))
+      .then(claimLaunchStuck("c1"))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set(), Set("c1"), Set("c1")))
+      .then(claimRegistersLate("c1"))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set(), Set(), Set()))
+      .then(ambiguousCommitSurfaces("c1"))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set(), Set(), Set()))
+      .expect(effects.contains(ETombstoneConfirmed)
+        and not(violations.contains(VTombstoneDropped)))
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // WO-S7-1 (bug_151, R30 banner): the verdict-free-respawn GIVE-UP
