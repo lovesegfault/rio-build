@@ -2548,7 +2548,7 @@ rec {
     # MAX_LINE (the oversized arm provably dead in the bounded domain);
     # re-measured at introduction.
     # r[verify store.log.gap-provenance]
-    # r[verify store.log.served-claim]
+    # r[verify store.log.served-claim+2]
     quint-log-service-worker-gap = mkQuintCheck {
       name = "log-service-worker-gap";
       spec = "logService";

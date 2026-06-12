@@ -1918,7 +1918,7 @@ async fn serve_tail(
         // History-only. The final (possibly empty) message carries the
         // computed completeness so the CLI/dashboard can render their
         // "(log incomplete)" notice.
-        let claim = gate::final_claim_for(&pool, exec_id, cursor.next_line()).await?;
+        let claim = gate::final_claim_for(&pool, exec_id, &cursor).await?;
         send_final(tx, &exec_str, claim).await?;
         return Ok(());
     };
@@ -1930,7 +1930,7 @@ async fn serve_tail(
     serve_view_runs(tx, &exec_str, &mut cursor, snapshot).await?;
 
     if !follow {
-        let claim = gate::final_claim_for(&pool, exec_id, cursor.next_line()).await?;
+        let claim = gate::final_claim_for(&pool, exec_id, &cursor).await?;
         send_final(tx, &exec_str, claim).await?;
         return Ok(());
     }
@@ -2064,7 +2064,7 @@ async fn serve_tail(
                     // contract take over. Advancing across the span,
                     // the old shape, silently disowned the lines
                     // (merged_bug_205).
-                    let claim = gate::final_claim_for(&pool, exec_id, cursor.next_line()).await?;
+                    let claim = gate::final_claim_for(&pool, exec_id, &cursor).await?;
                     send_final(tx, &exec_str, claim).await?;
                     return Ok(());
                 }
@@ -2128,7 +2128,7 @@ async fn serve_tail(
     // contract takes it from here. The claim is minted against the
     // SERVED cursor — a seal+cut that committed mid-serve yields
     // complete=false and the reconnect heals.
-    let claim = gate::final_claim_for(&pool, exec_id, cursor.next_line()).await?;
+    let claim = gate::final_claim_for(&pool, exec_id, &cursor).await?;
     send_final(tx, &exec_str, claim).await?;
     Ok(())
 }

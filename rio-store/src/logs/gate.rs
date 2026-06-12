@@ -567,15 +567,19 @@ pub(super) async fn log_is_complete(pool: &PgPool, exec_id: Uuid) -> Result<bool
 /// The serve path's ONLY completeness source: fetch the sealed witness
 /// and the manifest fold, then mint the kernel
 /// [`FinalClaim`](rio_log_kernel::FinalClaim)
-/// correlated with the SERVED cursor. The cursor-blind
-/// `log_is_complete` above is demoted to the ingest/test side — a
-/// `TailLog` final message cannot be stamped from it (merged_bug_063:
-/// `send_final` takes the claim, not a bool).
-// r[impl store.log.served-claim]
+/// correlated with the SERVED cursor — its watermark AND its latched
+/// gap fact (bug_048: covers-now + cursor-reached is not delivery
+/// evidence; a gap-crossing serve whose hole a late replay backfilled
+/// must not stamp complete). The cursor-blind `log_is_complete` above
+/// is demoted to the ingest/test side — a `TailLog` final message
+/// cannot be stamped from it (merged_bug_063: `send_final` takes the
+/// claim, not a bool).
+// r[impl store.log.served-claim+2]
+// r[impl store.log.final-served]
 pub(super) async fn final_claim_for(
     pool: &PgPool,
     exec_id: Uuid,
-    cursor_next: u64,
+    cursor: &super::tail::LineCursor,
 ) -> Result<rio_log_kernel::FinalClaim, Status> {
     let sealed = sealed_final_line_count(pool, exec_id).await?;
     let covers = match sealed {
@@ -583,9 +587,10 @@ pub(super) async fn final_claim_for(
         None => false,
     };
     Ok(rio_log_kernel::final_claim(
-        cursor_next,
+        cursor.next_line(),
         sealed.map(|n| n as u64),
         covers,
+        cursor.gap_crossed(),
     ))
 }
 

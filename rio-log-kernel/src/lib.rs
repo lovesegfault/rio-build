@@ -116,29 +116,46 @@ impl ChunkVisit {
     /// can move its watermark exclusively to a post-visit position the
     /// kernel computed. The open-coded `filter(>= cursor)` +
     /// `advance_to(end + 1)` shape — which silently absorbed residual
-    /// gaps — no longer typechecks.
+    /// gaps — no longer typechecks. The advance also carries the GAP
+    /// FACT (bug_048): a [`ChunkVisit::GapThenServe`] advance moved
+    /// the watermark past lines this reader never received, and the
+    /// final-claim law needs that fact at claim time — riding it
+    /// INSIDE the sealed advance means no serve seam can move a
+    /// cursor across a gap without declaring it.
     pub fn advance(&self) -> CursorAdvance {
         CursorAdvance {
             to: self.next_line(),
+            gap_crossed: matches!(self, ChunkVisit::GapThenServe { .. }),
         }
     }
 }
 
 /// A sealed watermark movement: produced only by
 /// [`ChunkVisit::advance`] (and therefore only from a kernel verdict).
-/// The field is private — a caller cannot fabricate an advance past
+/// The fields are private — a caller cannot fabricate an advance past
 /// lines no verdict served (merged_bug_205: the silent residual-gap
-/// absorption class).
+/// absorption class), and cannot strip the gap fact from a
+/// gap-crossing advance (bug_048: served-contiguity travels inside
+/// the movement that breaks it).
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CursorAdvance {
     to: u64,
+    gap_crossed: bool,
 }
 
 impl CursorAdvance {
     /// The verdict-computed post-visit watermark.
     pub fn to(&self) -> u64 {
         self.to
+    }
+
+    /// Did this advance move the watermark across a span the verdict
+    /// did NOT serve (a [`ChunkVisit::GapThenServe`])? Consumers latch
+    /// this: one gap-crossing advance makes the whole served stream
+    /// non-contiguous.
+    pub fn gap_crossed(&self) -> bool {
+        self.gap_crossed
     }
 }
 
@@ -687,22 +704,30 @@ pub fn visit_fanout_batch(
 /// A served-stream completeness claim: the ONLY way to say
 /// `is_complete = true` on a `TailLog` final message. Private fields —
 /// constructible solely through [`final_claim`], which correlates the
-/// claim with the SERVED cursor, not just the durable state
-/// (merged_bug_063: a seal + manifest commit landing mid-serve made
-/// the old uncorrelated predicate stamp `complete = true` on a stream
-/// that had served half the lines; the reconnect heal never fired).
+/// claim with the SERVED cursor AND the served-contiguity fact, not
+/// just the durable state (merged_bug_063: a seal + manifest commit
+/// landing mid-serve made the old uncorrelated predicate stamp
+/// `complete = true` on a stream that had served half the lines;
+/// bug_048: a gap-crossing serve plus a late replay that backfills
+/// the hole made covers-now + cursor-reached stamp `complete = true`
+/// on a stream that never delivered the span — covers-now and
+/// cursor-reached are NOT delivery evidence; the gap fact must travel
+/// inside the claim).
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FinalClaim {
     complete: bool,
     cursor_next: u64,
+    gap_crossed: bool,
 }
 
 impl FinalClaim {
     /// Did the served stream deliver everything the sealed witness
     /// recorded? `true` only when the sealed final line count exists,
-    /// the manifest covers it contiguously, AND the served cursor has
-    /// reached it.
+    /// the manifest covers it contiguously, the served cursor has
+    /// reached it, AND no advance of that cursor ever crossed a gap
+    /// (every line below the watermark was actually served to THIS
+    /// reader).
     pub fn complete(&self) -> bool {
         self.complete
     }
@@ -713,35 +738,56 @@ impl FinalClaim {
     pub fn cursor_next(&self) -> u64 {
         self.cursor_next
     }
+
+    /// Did the served stream cross a gap on its way to the watermark
+    /// (bug_048)? `true` poisons completeness even when the manifest
+    /// covers contiguously at claim time — a late replay backfilling
+    /// the hole does not retroactively deliver it to this reader.
+    pub fn gap_crossed(&self) -> bool {
+        self.gap_crossed
+    }
 }
 
-/// Mint the final-message completeness claim
-/// (`docs/spec/models/logService.qnt::readerStamp`):
+/// Mint the final-message completeness claim:
 /// **complete ⇔ sealed = Some(n) ∧ cursor_next ≥ n ∧
-/// manifest_covers_sealed.**
+/// manifest_covers_sealed ∧ ¬gap_crossed.**
 ///
 /// `sealed_final_line_count` is the lifecycle row's recorded end (only
 /// when terminal); `manifest_covers_sealed` is the contiguity fold up
 /// to that count; `cursor_next` is the watermark actually served to
-/// THIS reader. A mid-serve commit+seal yields `complete = false` and
-/// the client's reconnect contract heals the difference.
+/// THIS reader; `gap_crossed` is the reader's latched gap fact — did
+/// any cursor advance cross a span no verdict served (bug_048)? A
+/// mid-serve commit+seal yields `complete = false` and the client's
+/// reconnect contract heals the difference; so does a gap-crossing
+/// serve whose hole a late replay backfilled after the reader passed.
+///
+/// Refines `docs/spec/models/logService.qnt::readerStamp`'s `covered`
+/// conjunct (every held line served): cursor-reached ∧ ¬gap_crossed
+/// is exactly the implementable witness of it — the cursor only
+/// advances over served or gap-declared spans, so a gap-free walk to
+/// the seal IS the served-set proof.
 #[cfg_attr(kani, kani::ensures(|r: &FinalClaim| {
     r.cursor_next == cursor_next
+        && r.gap_crossed == gap_crossed
         && (r.complete
-            == matches!(sealed_final_line_count,
-                        Some(n) if cursor_next >= n && manifest_covers_sealed))
+            == (matches!(sealed_final_line_count,
+                        Some(n) if cursor_next >= n && manifest_covers_sealed)
+                && !gap_crossed))
 }))]
-// r[impl store.log.served-claim]
+// r[impl store.log.served-claim+2]
 pub fn final_claim(
     cursor_next: u64,
     sealed_final_line_count: Option<u64>,
     manifest_covers_sealed: bool,
+    gap_crossed: bool,
 ) -> FinalClaim {
     let complete = matches!(sealed_final_line_count,
-                            Some(n) if cursor_next >= n && manifest_covers_sealed);
+                            Some(n) if cursor_next >= n && manifest_covers_sealed)
+        && !gap_crossed;
     FinalClaim {
         complete,
         cursor_next,
+        gap_crossed,
     }
 }
 
@@ -1414,7 +1460,7 @@ mod proofs {
         let cursor_next: u64 = kani::any();
         let sealed: Option<u64> = kani::any();
         let covers: bool = kani::any();
-        let _ = final_claim(cursor_next, sealed, covers);
+        let _ = final_claim(cursor_next, sealed, covers, kani::any());
     }
 
     /// Verify [`accept_verdict`] against its `kani::ensures` contracts
@@ -1979,23 +2025,50 @@ mod tests {
         assert_eq!(visit_chunk(5, 2, 1).advance().to(), 5, "skip holds");
         assert_eq!(visit_chunk(5, 5, 3).advance().to(), 8, "serve moves");
         assert_eq!(visit_chunk(5, 8, 2).advance().to(), 10, "gap-serve moves");
+        // bug_048: the gap fact rides inside the sealed advance — the
+        // ONE constructor sets it exactly on GapThenServe, so no serve
+        // seam (catch-up, fan-out, or any future one) can move a
+        // cursor across a gap without declaring it.
+        assert!(
+            !visit_chunk(5, 2, 1).advance().gap_crossed(),
+            "skip: no gap"
+        );
+        assert!(
+            !visit_chunk(5, 5, 3).advance().gap_crossed(),
+            "serve: no gap"
+        );
+        assert!(
+            visit_chunk(5, 8, 2).advance().gap_crossed(),
+            "gap-serve declares the crossing"
+        );
     }
 
     #[test]
     fn final_claim_law() {
         // complete ⇔ sealed ∧ cursor ≥ sealed ∧ covers
-        assert!(!final_claim(10, Some(20), true).complete(), "mid-serve");
         assert!(
-            !final_claim(20, Some(20), false).complete(),
+            !final_claim(10, Some(20), true, false).complete(),
+            "mid-serve"
+        );
+        assert!(
+            !final_claim(20, Some(20), false, false).complete(),
             "gapped manifest"
         );
-        assert!(!final_claim(20, None, true).complete(), "unsealed");
-        assert!(final_claim(20, Some(20), true).complete());
+        assert!(!final_claim(20, None, true, false).complete(), "unsealed");
+        assert!(final_claim(20, Some(20), true, false).complete());
+        // bug_048: a gap-crossing serve poisons completeness even when
+        // the manifest covers contiguously at claim time (the late
+        // replay backfilled the hole AFTER this reader passed it).
         assert!(
-            final_claim(25, Some(20), true).complete(),
+            !final_claim(20, Some(20), true, true).complete(),
+            "covers-now + cursor-reached is not delivery evidence"
+        );
+        assert!(final_claim(20, Some(20), true, true).gap_crossed());
+        assert!(
+            final_claim(25, Some(20), true, false).complete(),
             "served past seal"
         );
-        assert_eq!(final_claim(7, None, false).cursor_next(), 7);
+        assert_eq!(final_claim(7, None, false, false).cursor_next(), 7);
     }
 
     use super::*;

@@ -2452,18 +2452,40 @@ fold's `filter`+`advance` silently absorbed any residual gap
 is number-free by property test, so "(suppressed lines)" can no longer
 be misattributed (merged_bug_275).
 
-#r("store.log.served-claim")[
+#r("store.log.served-claim+2")[
   A `TailLog` final message's `is_complete` MUST be minted as a
   served-stream claim correlated with the reader's served cursor:
   `complete` if and only if the execution's sealed `final_line_count`
-  exists, the manifest covers it contiguously, and the served watermark
-  has reached it. A completeness predicate computed from durable state
-  alone MUST NOT stamp a final message.
+  exists, the manifest covers it contiguously, the served watermark
+  has reached it, and no advance of that watermark ever crossed a gap.
+  A completeness predicate computed from durable state alone MUST NOT
+  stamp a final message.
 ]
 A seal and its covering cut can commit mid-serve; the uncorrelated
 predicate then advertises a complete stream to a reader that was served
 half of it, and the reconnect heal never fires (merged_bug_063). The
 kernel's `final_claim` is the only constructor of the claim.
+
+#r("store.log.final-served")[
+  A final claim MUST assert completeness only over the
+  served-contiguous prefix: the served-contiguity fact travels INSIDE
+  the claim — every cursor movement declares whether it crossed a gap
+  (the sealed advance is the only way to move a cursor), the reader
+  latches the first crossing, and a latched crossing poisons
+  `is_complete` regardless of what the manifest covers at claim time.
+  No serve seam may mint completeness without declaring whether it
+  gap-crossed.
+]
+
+Covers-now plus cursor-reached is not delivery evidence (bug_048, the
+R26 lens on a pre-campaign weak witness): a gap-crossing serve advances
+the watermark past an unserved span, the late-replay gate legitimately
+backfills the hole afterwards, and the claim-time fold then covers
+contiguously --- stamping `is_complete = true` over lines this reader
+never received. The three serve seams (the live fan-out, the manifest
+catch-up, the gateway relay) either advance through the latching
+cursor or consume the wire claim verbatim; none re-derives
+completeness from durable state.
 
 #r("store.log.completeness-gate")[
   An execution's log is complete when its lifecycle row is terminal, its

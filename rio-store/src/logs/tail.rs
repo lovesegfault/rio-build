@@ -130,12 +130,20 @@ fn corrupt_manifest_row(exec_id: &Uuid, value: i64) -> Status {
 #[derive(Debug, Clone, Copy)]
 pub struct LineCursor {
     next_line: u64,
+    /// Latched the first time an advance crosses a gap (bug_048): the
+    /// served stream is no longer contiguous, and no later advance can
+    /// un-cross it — the final claim consumes this so covers-now +
+    /// cursor-reached can never stamp completeness over a span this
+    /// reader skipped (the late-replay backfill made exactly that
+    /// stamp pre-fix).
+    gap_crossed: bool,
 }
 
 impl LineCursor {
     pub fn new(since_line: u64) -> Self {
         Self {
             next_line: since_line,
+            gap_crossed: false,
         }
     }
 
@@ -147,6 +155,12 @@ impl LineCursor {
         self.next_line
     }
 
+    /// Has any advance of this cursor crossed a gap (bug_048)? Feeds
+    /// the final claim's served-contiguity conjunct.
+    pub fn gap_crossed(&self) -> bool {
+        self.gap_crossed
+    }
+
     /// Advance the watermark to a kernel-verdict position. The
     /// argument is sealed (merged_bug_205): only
     /// `ChunkVisit::advance()` can mint a
@@ -156,8 +170,12 @@ impl LineCursor {
     /// `filter(>= cursor)` + `advance_to(end + 1)` shape that silently
     /// absorbed residual gaps no longer typechecks. A backwards
     /// advance is a no-op — the watermark is monotone by definition.
+    /// The advance's gap fact LATCHES here (bug_048): the sealed
+    /// movement is the only way to cross a gap, so the latch is total
+    /// over every serve seam by construction.
     pub fn advance_to(&mut self, adv: rio_log_kernel::CursorAdvance) {
         self.next_line = self.next_line.max(adv.to());
+        self.gap_crossed |= adv.gap_crossed();
     }
 }
 
@@ -1437,7 +1455,7 @@ mod tests {
         // complete=true only once the reader has been served to 20.
         // (The old cursor-blind `log_is_complete` returned true at
         // cursor 10 — the recorded red.)
-        let mid = crate::logs::gate::final_claim_for(&db.pool, exec, 10)
+        let mid = crate::logs::gate::final_claim_for(&db.pool, exec, &LineCursor::new(10))
             .await
             .unwrap();
         assert!(
@@ -1445,10 +1463,111 @@ mod tests {
             "a final stamped with the cursor at 10 (< sealed 20) must not claim complete"
         );
         assert_eq!(mid.cursor_next(), 10);
-        let done = crate::logs::gate::final_claim_for(&db.pool, exec, 20)
+        let done = crate::logs::gate::final_claim_for(&db.pool, exec, &LineCursor::new(20))
             .await
             .unwrap();
         assert!(done.complete(), "served to the seal with full coverage");
+    }
+
+    /// W11-I (bug_048). Proposition: **is_complete entails every line
+    /// below the watermark was SERVED to this reader** — at the claim
+    /// law's own population: the serve seams (this drives the
+    /// catch-up/read seam; the live fan-out advances through the same
+    /// sealed `CursorAdvance` latch, pinned at the kernel; the gateway
+    /// relay consumes the wire bool and mints no claim). The pre-fix
+    /// inputs were (watermark, sealed, covers-at-claim-time): a reader
+    /// that crossed a gap (`GapThenServe` — the cursor advanced past
+    /// an unserved span) and a late replay that backfilled the hole
+    /// afterwards made covers-now ∧ cursor-reached stamp
+    /// `is_complete = true` over lines this reader never received —
+    /// silent omission stamped complete. W11-J rides as the honest
+    /// cell: a gap-free walk over the SAME (now complete) manifest
+    /// still stamps `complete = true` — the bit is not a blanket
+    /// downgrade.
+    // r[verify store.log.final-served]
+    #[tokio::test]
+    async fn gap_crossing_serve_never_stamps_complete() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let exec = Uuid::now_v7();
+        let sess = Uuid::now_v7();
+        // Sealed at 10; the manifest holds [0,5) and [8,10) — a hole
+        // at [5,8) (the span a watchdog-dropped cut lost; its late
+        // replay is still in flight).
+        seed_execution(&db.pool, exec, Some("succeeded"), Some(10)).await;
+        let c0 = lines("a", 0, 5);
+        seed_chunk(&db.pool, &store, exec, sess, 0, 0, &line_refs(&c0)).await;
+        let c1 = lines("b", 8, 2);
+        seed_chunk(&db.pool, &store, exec, sess, 1, 8, &line_refs(&c1)).await;
+
+        // The follow-mode reader attaches and drains what exists:
+        // Serve [0,5), then GapThenServe across [5,8) into [8,10).
+        let refs = read_manifest_range(&db.pool, exec, 0).await.unwrap();
+        let mut cursor = LineCursor::new(0);
+        let mut served: Vec<u64> = Vec::new();
+        for (i, chunk) in refs.iter().enumerate() {
+            let out = read_chunk(&store, Some(&db.pool), chunk, &refs[i + 1..], &mut cursor)
+                .await
+                .unwrap();
+            served.extend(out.iter().map(|(n, _)| *n));
+        }
+        assert_eq!(cursor.next_line(), 10, "the cursor reached the seal");
+        assert_eq!(
+            served,
+            vec![0, 1, 2, 3, 4, 8, 9],
+            "the span [5,8) was never served to this reader"
+        );
+
+        // The late replay backfills the hole AFTER the reader passed.
+        let c2 = lines("late", 5, 3);
+        seed_chunk(
+            &db.pool,
+            &store,
+            exec,
+            Uuid::now_v7(),
+            0,
+            5,
+            &line_refs(&c2),
+        )
+        .await;
+
+        // The claim: sealed ✓, covers-now ✓, cursor-reached ✓ — and
+        // the reader still never got [5,8).
+        let claim = crate::logs::gate::final_claim_for(&db.pool, exec, &cursor)
+            .await
+            .unwrap();
+        assert!(
+            !claim.complete(),
+            "left (pre-fix): covers-now + cursor-reached stamps \
+             is_complete=true while [5,8) was never served to this reader — \
+             a follow-mode reader exits NaturalEnd with silent omission \
+             stamped complete / right: the latched gap fact travels inside \
+             the claim and poisons completeness"
+        );
+        assert!(claim.gap_crossed(), "the claim names why");
+        assert_eq!(claim.cursor_next(), 10);
+
+        // W11-J: the honest cell — a fresh gap-free walk over the now
+        // complete manifest serves every line and stamps complete.
+        let refs = read_manifest_range(&db.pool, exec, 0).await.unwrap();
+        let mut honest = LineCursor::new(0);
+        let mut served: Vec<u64> = Vec::new();
+        for (i, chunk) in refs.iter().enumerate() {
+            let out = read_chunk(&store, Some(&db.pool), chunk, &refs[i + 1..], &mut honest)
+                .await
+                .unwrap();
+            served.extend(out.iter().map(|(n, _)| *n));
+        }
+        assert_eq!(served, (0..10).collect::<Vec<u64>>());
+        let claim = crate::logs::gate::final_claim_for(&db.pool, exec, &honest)
+            .await
+            .unwrap();
+        assert!(
+            claim.complete(),
+            "a gap-free served stream still stamps complete — the bit is \
+             not a blanket downgrade"
+        );
+        assert!(!claim.gap_crossed());
     }
 
     /// RED (bug_233): a SHORT object whose missing span is covered by
