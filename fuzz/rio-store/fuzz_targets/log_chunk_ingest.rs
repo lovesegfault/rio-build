@@ -182,16 +182,23 @@ impl SessionHarness {
             0x2000_0000_0000_0000_0000_0000_0000_0011 + (exec as u128) * 16 + sess as u128,
         );
         // The GateOk a fresh execution's open produces: no committed
-        // chunks yet, no recorded end. The session is constructible
-        // ONLY from a gate verdict (store.log.caps-durable) — the
-        // harness models the post-gate world, so it mints the verdict
-        // a passing gate would have returned.
+        // chunks yet, no recorded end, an all-zero durable account on
+        // both algebras, and empty durable coverage. The session is
+        // constructible ONLY from a gate verdict
+        // (store.log.caps-durable) — the harness models the post-gate
+        // world, so it mints the verdict a passing gate would have
+        // returned.
         let gate_ok = rio_store::logs::gate::GateOk {
             drv_hash: DRV_HASH.to_string(),
             exec_id,
             final_line_count: None,
-            prior_accounted_bytes: 0,
-            prior_chunks: 0,
+            seed: rio_store::logs::gate::LogSeed {
+                merged_bytes: 0,
+                merged_chunks: 0,
+                raw_bytes: 0,
+                raw_rows: 0,
+            },
+            covered: Default::default(),
         };
         Self {
             exec,

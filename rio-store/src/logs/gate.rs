@@ -1954,6 +1954,63 @@ mod tests {
         );
     }
 
+    /// The CoverageMap lookup law, differentially pinned at fuzz
+    /// strength: `covers_range` and `contiguous_prefix_end` agree with
+    /// pointwise reachability over the RAW intervals, for randomized
+    /// interval sets covering overlap, adjacency, containment,
+    /// zero-length, and hole shapes. This is the proptest stand-in for
+    /// the kani harness recorded INFEASIBLE in the kernel (the
+    /// symbolic Vec + sort core of `from_intervals` blows the solver
+    /// at any usable bound — see the measured record beside the
+    /// account proofs); the account-algebra product itself stays
+    /// kani-proven.
+    #[test]
+    fn coverage_map_matches_pointwise_oracle() {
+        use proptest::prelude::*;
+        let mut runner = proptest::test_runner::TestRunner::default();
+        runner
+            .run(
+                &(
+                    proptest::collection::vec((0u64..24, 0u64..12), 0..6),
+                    0u64..40,
+                    0u64..40,
+                ),
+                |(intervals, first, end)| {
+                    let map =
+                        rio_log_kernel::CoverageMap::from_intervals(intervals.iter().copied());
+                    let line_covered = |l: u64| {
+                        intervals
+                            .iter()
+                            .any(|&(f, c)| f <= l && l < f.saturating_add(c))
+                    };
+                    // covers_range == pointwise oracle.
+                    let oracle = first < end && (first..end).all(line_covered);
+                    prop_assert_eq!(
+                        map.covers_range(first, end),
+                        oracle,
+                        "covers_range({}, {}) over {:?}",
+                        first,
+                        end,
+                        &intervals
+                    );
+                    // contiguous_prefix_end == the longest covered
+                    // prefix from zero.
+                    let mut prefix = 0u64;
+                    while line_covered(prefix) {
+                        prefix += 1;
+                    }
+                    prop_assert_eq!(
+                        map.contiguous_prefix_end(),
+                        prefix,
+                        "contiguous_prefix_end over {:?}",
+                        &intervals
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
     /// W11-D (merged_bug_002, the measure-freeze pin). The seed SQL is
     /// DIFFERENTIALLY pinned against the kernel account algebra
     /// ([`rio_log_kernel::log_account`], whose laws are kani-proven):
