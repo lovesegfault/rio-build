@@ -348,15 +348,46 @@ impl WindowMintability {
         }
     }
 
+    /// THE one per-class mintability closure (merged_bug_052, R33):
+    /// can class `h` mint a `cores`-sized head this tick? — not
+    /// fully masked AND within the class's budget (unknown declared
+    /// classes default to the global budget: permissive-leaning, the
+    /// unknown-class lane has its own typed outcome downstream).
+    /// Both the window predicate ([`Self::head_unmintable`]) and the
+    /// mint law agree through THIS closure by import: the mint path
+    /// refuses exactly these classes (`assign_to_cells` skips masked
+    /// cells; `sizing` refuses `budget < chunk` through the same
+    /// `cover::class_budget` seam this view is built from) — the
+    /// quantifier shape cannot drift because there is only one.
+    #[must_use]
+    pub fn class_mintable(&self, h: &str, cores: u64) -> bool {
+        !self.fully_masked.contains(h)
+            && cores
+                <= u64::from(
+                    self.class_budget
+                        .get(h)
+                        .copied()
+                        .unwrap_or(self.global_budget),
+                )
+    }
+
+    /// The hw-agnostic face of the closure: any known cell unmasked
+    /// AND within the global budget.
+    #[must_use]
+    pub fn agnostic_mintable(&self, cores: u64) -> bool {
+        !self.all_known_masked && cores <= u64::from(self.global_budget)
+    }
+
     /// PROVABLY unmintable this tick: the head can neither PLACE
     /// (`cores > Σ live free` — placement onto live capacity ignores
-    /// ICE masks, so the placement conjunct rides BOTH arms) nor MINT
-    /// (every declared class fully masked, or `cores` above every
-    /// declared class's budget; hw-agnostic: all known cells masked,
-    /// or `cores > global budget`). Unknown declared classes default
-    /// to the global budget (permissive-leaning — the unknown-class
-    /// lane has its own typed outcome downstream and is not this
-    /// skip's population).
+    /// ICE masks, so the placement conjunct rides BOTH arms) nor
+    /// MINT — `!any(classes, class_mintable)`, the PER-CLASS
+    /// DISJUNCTION imported from the one closure (merged_bug_052:
+    /// the pre-fix whole-list per-axis form `all(masked) ∨
+    /// all(over-budget)` was strictly weaker — a head whose classes
+    /// split across the refusal arms was admitted, provably minted
+    /// zero, and re-opened the merged_bug_053 net-zero starvation
+    /// one product-cell over).
     #[must_use]
     pub fn head_unmintable(&self, i: &SpawnIntent) -> bool {
         let cores = u64::from(i.cores);
@@ -364,20 +395,11 @@ impl WindowMintability {
             return false; // placeable on live capacity — never skip.
         }
         if i.hw_class_names.is_empty() {
-            self.all_known_masked || cores > u64::from(self.global_budget)
+            !self.agnostic_mintable(cores)
         } else {
-            let budget_of = |h: &String| {
-                u64::from(
-                    self.class_budget
-                        .get(h.as_str())
-                        .copied()
-                        .unwrap_or(self.global_budget),
-                )
-            };
-            i.hw_class_names
+            !i.hw_class_names
                 .iter()
-                .all(|h| self.fully_masked.contains(h.as_str()))
-                || i.hw_class_names.iter().all(|h| cores > budget_of(h))
+                .any(|h| self.class_mintable(h, cores))
         }
     }
 }
@@ -2637,6 +2659,95 @@ pub(crate) mod tests {
     }
 
     // r[verify ctrl.nodeclaim.sim-window]
+    /// **W12-AO (merged_bug_052)** — *proposition: the window admits
+    /// exactly the heads the mint law can mint, PER-CLASS
+    /// DISJUNCTIVE; population: the mixed product cells the
+    /// single-class witness never drove (one class
+    /// masked-but-budgeted × one unmasked-but-over-budget — the
+    /// ICE-storm + saturated-fallback product, the capacity ladder's
+    /// own target scenario).*
+    ///
+    /// Pre-fix `head_unmintable` collapsed the per-class disjunctive
+    /// mint law `all(classes, masked ∨ over-budget)` to whole-list
+    /// per-axis quantifiers `all(masked) ∨ all(over-budget)` —
+    /// strictly weaker: a head whose classes SPLIT across the two
+    /// refusal arms passed both whole-list tests, was ADMITTED,
+    /// provably minted zero (`assign_to_cells` skips masked cells;
+    /// `sizing` refuses `budget < chunk`), consumed rotation-first
+    /// window share, and blocked its bucket on no-fit — the
+    /// merged_bug_053 net-zero starvation re-opened one product-cell
+    /// over. The doc claimed drift impossible "because they share
+    /// class_budget", but the QUANTIFIER SHAPE is part of the law
+    /// and it drifted; the frozen witness
+    /// (`window_admits_mintable_siblings_every_tick`) is
+    /// single-class-per-intent — it entails only the two pure
+    /// corners.
+    #[test]
+    fn w12_ao_mixed_class_head_is_classified_out() {
+        // "hi": fully MASKED but generously budgeted (64).
+        // "lo": unmasked but the 16c head is OVER its budget (8).
+        let view = WindowMintability {
+            fully_masked: ["hi".to_string()].into(),
+            class_budget: [("hi".to_string(), 64u32), ("lo".to_string(), 8u32)].into(),
+            global_budget: 64,
+            live_free_cores: 0,
+            all_known_masked: false,
+        };
+        let mixed = intent(
+            "m0",
+            16,
+            GI,
+            &[("hi", CapacityType::Spot), ("lo", CapacityType::Spot)],
+        );
+        // The law at its own quantifier: NO class can mint (hi
+        // masked; lo over-budget) ⇒ the head is provably unmintable.
+        assert!(
+            view.head_unmintable(&mixed),
+            "a mixed head whose classes split across the refusal arms \
+             mints zero — the per-class disjunction must classify it \
+             out (pre-fix: the whole-list per-axis quantifiers \
+             admitted it)"
+        );
+        // Pure corners keep their truth (the frozen witness's cells).
+        let all_masked = intent("am", 4, GI, &[("hi", CapacityType::Spot)]);
+        assert!(view.head_unmintable(&all_masked), "fully-masked corner");
+        let over_budget = intent("ob", 16, GI, &[("lo", CapacityType::Spot)]);
+        assert!(view.head_unmintable(&over_budget), "over-budget corner");
+        let mintable_one = intent(
+            "mk",
+            4,
+            GI,
+            &[("hi", CapacityType::Spot), ("lo", CapacityType::Spot)],
+        );
+        assert!(
+            !view.head_unmintable(&mintable_one),
+            "one mintable class (lo, 4 ≤ 8) admits the head"
+        );
+
+        // The starvation property at the window (the angle's
+        // verbatim shape): the zero-mint mixed head is classified
+        // out and the mintable sibling is admitted THE SAME TICK —
+        // both rotation phases.
+        let sib = intent("s0", 4, GI, &[("lo", CapacityType::Spot)]);
+        for tick in 0..2 {
+            let mut sorted = vec![mixed.clone(), sib.clone()];
+            sort_ffd(&mut sorted);
+            let (admitted, deferred) =
+                admit_window(sorted, &HashMap::new(), &HashSet::new(), 16, tick, &view);
+            assert!(
+                admitted.iter().any(|i| i.intent_id == "s0"),
+                "tick {tick}: the mintable sibling is admitted (pre-fix \
+                 the admitted zero-mint head consumed the window and \
+                 the sibling starved)"
+            );
+            assert!(
+                deferred.iter().any(|i| i.intent_id == "m0"),
+                "tick {tick}: the mixed head is classified out (typed \
+                 deferral, never an admit)"
+            );
+        }
+    }
+
     /// **W11-AE (merged_bug_053)** — *proposition: a provably-
     /// unmintable head never consumes a window rotation — mintable
     /// sibling cores are admitted AND MINTED every tick; population:

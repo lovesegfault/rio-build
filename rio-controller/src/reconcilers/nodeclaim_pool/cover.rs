@@ -846,8 +846,12 @@ pub fn class_budget(
 /// merged_bug_053: build the window's [`super::ffd::WindowMintability`]
 /// view at tick start, through the same [`class_budget`] seam the mint
 /// loop consumes (`class_created = 0` — nothing minted yet when the
-/// window is cut), so the window's denomination and the mint's
-/// refusal law cannot drift. `masked` is the pre-sim mask snapshot
+/// window is cut). merged_bug_052: sharing the INPUTS was not enough
+/// — the QUANTIFIER SHAPE is part of the law and it drifted
+/// (whole-list per-axis vs the mint's per-class disjunction); the
+/// window now refuses through the ONE per-class closure
+/// (`WindowMintability::class_mintable`), so neither the
+/// denomination nor the quantifier can drift. `masked` is the pre-sim mask snapshot
 /// (the scheduler's acked view ∪ marks already buffered at tick
 /// start) — a conservative SUBSET of the mask `cover_deficit` later
 /// consumes (this tick's fresh vanish marks land after the sim), so
