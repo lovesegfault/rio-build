@@ -6452,9 +6452,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "bytes",
  "hex",
  "libc",
+ "prost",
  "rio-nix",
+ "rio-packstore",
+ "rio-proto",
  "serde",
  "serde_json",
  "sha2 0.11.0",
