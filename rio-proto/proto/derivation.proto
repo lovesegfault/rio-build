@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+// Canonical stored/negotiated form of a Nix derivation (ADR-024,
+// "Identity rules": the canonical derivation form is a rio proto
+// `Derivation` message under the castore canonical-encode rule, NOT
+// nix-emitted JSON — a JSON-keyed digest space is coupled to nix's
+// serializer and a formatting change re-keys every drv).
+//
+// Canonical-encode rule (castore discipline, same as `rio.castore.
+// Directory`):
+//   - fields emitted in ascending field-number order (prost default),
+//   - every repeated field sorted as documented per field (`args` is
+//     the one order-significant exception),
+//   - default values omitted (proto3 default: empty bytes / empty
+//     repeated fields produce zero wire bytes).
+// The negotiation/storage key is blake3(canonical bytes), 32 raw
+// bytes (`rio_proto::derivation_util::derivation_digest`). drv_path
+// and hashDerivationModulo remain Nix's own values, computed from the
+// reconstructed ATerm — ATerm exists only inside those hash
+// computations.
+//
+// Receivers MUST reject (never re-sort) messages that violate the
+// sort/uniqueness rules: silently canonicalizing hostile input would
+// re-key its digest, giving one drv_path unboundedly many digests.
+// The gateway's cross-check is: blake3 over received bytes, decode,
+// validate, canonical re-encode + byte-compare, ATerm reconstruction,
+// drv_path recompute (`derivation_util::verify_drv_blob`).
+//
+// Field typing: `bytes`, not `string` (ADR-024 schema judgment
+// calls). Nix permits arbitrary bytes in env values, args, and paths
+// (ATerm escapes only \\ \" \n \r \t; raw non-UTF-8 passes through).
+// rio-nix currently rejects non-UTF-8 drvs at parse (String-typed
+// model), but the wire form must not bake that restriction into the
+// schema: bytes-typed fields make a future relaxation a converter
+// change, not a digest-space break.
+//
+// No proto3 maps anywhere (ADR-024): map field wire order is
+// serializer-dependent, which the canonical rule prohibits. All
+// map-shaped data is `repeated` message pairs with a documented sort
+// key.
+package rio.drv.v1;
+
+message Derivation {
+  // Sorted by `name`, byte-lexicographic, unique. Nix emits the ATerm
+  // outputs list in std::map order (bytewise-sorted names); canonical
+  // proto preserves that.
+  repeated Output outputs = 1;
+
+  // Sorted by `drv_path`, byte-lexicographic, unique.
+  repeated InputDrv input_drvs = 2;
+
+  // Sorted, unique store paths.
+  repeated bytes input_srcs = 3;
+
+  bytes platform = 4;
+  bytes builder = 5;
+
+  // Order-significant (execv argument vector) — NOT sorted.
+  repeated bytes args = 6;
+
+  // Sorted by `key`, byte-lexicographic, unique. structuredAttrs
+  // travels as the `__json` env entry byte-exactly as in the ATerm —
+  // no hoisting, no JSON re-encoding (hoisting would create a second
+  // canonicalization problem: key order, escaping, float formatting).
+  // Hoisted views are display projections, never the stored form.
+  repeated EnvVar env = 7;
+}
+
+message Output {
+  bytes name = 1;
+
+  // Store path. Empty for floating-CA outputs (`hash_algo` set,
+  // `hash` empty) and for deferred-IA outputs (all three other fields
+  // empty). proto3 omits empty fields and drv semantics never
+  // distinguish empty from absent (the ATerm has no absent), so the
+  // collapse is lossless.
+  bytes path = 2;
+
+  // CA method+algo exactly as in the ATerm field (e.g. "sha256",
+  // "r:sha256"). Empty = input-addressed output. Kept as the raw
+  // string, not a parsed enum: re-encoding method/algo creates
+  // normalization corners (case, SRI, future methods like "git:");
+  // identity rules say preserve bytes. Parsing happens where
+  // semantics are needed (the FOD path check), not in the stored
+  // form.
+  bytes hash_algo = 3;
+
+  // Expected output hash (base16, as in the ATerm) for fixed-output
+  // derivations; empty otherwise. Same preserve-bytes rationale as
+  // `hash_algo`.
+  bytes hash = 4;
+}
+
+message InputDrv {
+  bytes drv_path = 1;
+
+  // Sorted output names, byte-lexicographic, unique (the output
+  // selection on this edge).
+  repeated bytes outputs = 2;
+}
+
+message EnvVar {
+  bytes key = 1;
+  bytes value = 2;
+}

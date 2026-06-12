@@ -126,6 +126,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "proto/admin_types.proto",
             // Castore Directory DAG (own package, no service).
             "proto/castore.proto",
+            // Canonical Derivation message (own package, no service).
+            "proto/derivation.proto",
             // Service definition files (each a distinct package).
             "proto/scheduler.proto",
             "proto/builder.proto",
