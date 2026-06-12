@@ -5292,14 +5292,15 @@ with the other process-lifetime table state; unarmed (`None`) admits ---
 the legacy lane for direct test constructions and the pre-construction
 boot window, pinned by the wiring regression test.
 
-#r("sched.sla.one-aggregator")[
+#r("sched.sla.one-aggregator+2")[
   Each c-independent scalar axis of the per-pname fit (memory, disk) MUST
   have exactly ONE aggregation function consumed by every arm (full-fit,
   probe, degenerate fallback): the quantile's evidence universe is an
-  explicit population parameter --- always the full row set, ring-weighted
-  where a row holds a c-axis seat and unit-weighted elsewhere --- never an
-  implicit property of which vector an arm happened to collect. Subset
-  quantiles are census-red, not comment-policed.
+  explicit population parameter --- always the full row set, every row
+  weighted under the one decay law
+  (#rref("sched.sla.one-weight-law")) --- never an implicit property of
+  which vector an arm happened to collect. Subset quantiles are
+  census-red, not comment-policed.
 ]
 
 bug_070/bug_072 were one law violated per axis: the disk fallback's
@@ -5309,6 +5310,30 @@ single-sampled memory from the newest row two lines above the aggregated
 disk --- estimator quality silently depended on which arm a pname landed
 in. The `(axis, arm)` census (W11-BC) is the belt: per-axis evidence
 reads outside the chokepoints drift its committed counts.
+
+#r("sched.sla.one-weight-law")[
+  The aggregation chokepoints' weight law MUST be total over
+  sub-populations: every row's fold weight derives from the ONE producer
+  ($w_i = 0.5^("ordinal_age" slash 20) dot 0.5^"vdist"$ ---
+  #rref("sched.sla.hw-class.sample-weight-ordinal")) --- seated rows carry
+  their ring weight (the law plus the anchor floor), unseated rows derive
+  the SAME law from the shared completed_at ordering (the slice index IS
+  the ordinal; vdist floored at 0). Exempt defaults are unrepresentable:
+  no weight enters a quantile fold except through the law.
+]
+
+merged_bug_022: the wave-11 chokepoint seal enumerated the POPULATION
+axis but exempted the unseated sub-population from BOTH decay axes on
+the false premise "they carry no ordinal" (the slice is
+completed_at-ascending --- an ordinal is trivially available). Flat unit
+weight is the weight of the NEWEST seat row, so in a mixed-age ring the
+oldest evidence structurally outweighed all fresh evidence until ring
+eviction: `disk_p90` pinned at legacy peaks, false `exceeds_ceiling`
+tier rejection, and the degenerate-Independent fallback re-serving the
+stale footprint. The sub-population weight census ([GEN-SET],
+`w12_ad_weight_census`) derives the fold-site universe from the module
+tree and REDs on any exempt arm; W12-AD pins the inverse-population
+direction the wave-11 fixtures never drove.
 
 #r("sched.sla.forecast.one-layer+2")[
   `compute_spawn_intents` walks the Ready frontier AND a forecast frontier of

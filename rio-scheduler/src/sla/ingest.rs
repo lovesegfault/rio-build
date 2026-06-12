@@ -732,7 +732,7 @@ pub(super) fn reassign_tier(
 /// the evidence universe is always the full row set via
 /// [`axis_samples`], so a subset-quantile is unwritable rather than
 /// comment-policed.
-// r[impl sched.sla.one-aggregator]
+// r[impl sched.sla.one-aggregator+2]
 /// THE mem-axis aggregation chokepoint (bug_072 — the disk fn's
 /// structurally identical c-independent sibling): the recency-weighted
 /// p90 the `MemFit::Independent` variant doc promises, over EVERY sample — quantifier: census(test: w11_bc_axis_arm_census) —
@@ -749,34 +749,51 @@ fn aggregate_mem_p90(rows: &[BuildSampleRow], fit_w: &[f64]) -> MemBytes {
     MemBytes(weighted_quantile(&vals, &ws, 0.9) as u64)
 }
 
-// r[impl sched.sla.one-aggregator]
+// r[impl sched.sla.one-aggregator+2]
 fn aggregate_disk_p90(rows: &[BuildSampleRow], fit_w: &[f64]) -> Option<DiskBytes> {
     let (vals, ws) = axis_samples(rows, fit_w, |r| r.peak_disk_bytes.map(|b| b as f64));
     (!vals.is_empty()).then(|| DiskBytes(weighted_quantile(&vals, &ws, 0.9) as u64))
 }
 
+// r[impl sched.sla.one-weight-law]
 /// Shared population law for the per-axis aggregation chokepoints:
-/// the evidence universe is ALWAYS the full row set — quantifier: census(test: w11_bc_axis_arm_census) — a row holding a
-/// c-axis ring seat (`cpu_limit_cores.is_some()`, in row order) takes
-/// its ring weight from `fit_w`; rows without a seat (legacy
-/// no-cpu_limit history) take unit weight (they carry no ordinal —
-/// the live_049 rationale). `fit_w` empty ⇒ every sample unit-weighted
-/// (the probe arm computes no ring).
+/// the evidence universe is ALWAYS the full row set — quantifier: census(test: w11_bc_axis_arm_census) — and EVERY row's
+/// fold weight derives from the ONE decay law
+/// [`sample_weight`]`(ordinal_age, vdist)` — quantifier: census(test: w12_ad_weight_census) —
+/// total over sub-populations (merged_bug_022). A row holding a c-axis
+/// ring seat (`cpu_limit_cores.is_some()`, in row order) carries its
+/// ring weight from `fit_w` (the same law plus the anchor floor,
+/// computed once in `refit`); a row without a seat (legacy
+/// no-cpu_limit history) derives the SAME law from the shared
+/// completed_at ordering — the slice index IS its ordinal (the
+/// pre-fix "they carry no ordinal" premise was FALSE: the slice is
+/// completed_at-ascending) — with vdist floored at 0. `fit_w` empty
+/// (the probe arm computes no ring) ⇒ every row takes the unseated
+/// law. There is NO exempt default: a flat unit weight let the oldest
+/// evidence structurally outweigh all fresh evidence until ring
+/// eviction, pinning disk_p90 at legacy peaks and falsely tripping
+/// `exceeds_ceiling` tier rejection.
 fn axis_samples(
     rows: &[BuildSampleRow],
     fit_w: &[f64],
     value: impl Fn(&BuildSampleRow) -> Option<f64>,
 ) -> (Vec<f64>, Vec<f64>) {
+    let n = rows.len();
+    let unseated = |i: usize| sample_weight((n - 1 - i) as u32, 0);
     let mut seat = 0usize;
     let mut vals = Vec::new();
     let mut ws = Vec::new();
-    for r in rows {
-        let wgt = if r.cpu_limit_cores.is_some() {
-            let x = fit_w.get(seat).copied().unwrap_or(1.0);
+    for (i, r) in rows.iter().enumerate() {
+        let wgt = if r.cpu_limit_cores.is_some() && !fit_w.is_empty() {
+            let x = fit_w.get(seat).copied();
             seat += 1;
-            x
+            // A ring shorter than the seat walk is a refit-construction
+            // bug (both derive from the same fit_rows slice) — fall to
+            // the law, never to an exempt flat weight.
+            debug_assert!(x.is_some(), "fit_w shorter than the seat walk");
+            x.unwrap_or_else(|| unseated(i))
         } else {
-            1.0
+            unseated(i)
         };
         if let Some(v) = value(r) {
             vals.push(v);
@@ -1781,7 +1798,7 @@ mod disk_axis_tests {
         }
     }
 
-    // r[verify sched.sla.one-aggregator]
+    // r[verify sched.sla.one-aggregator+2]
     /// **W11-BC — the [GEN-SET] (axis, arm) census (the
     /// sched.sla.one-aggregator belt).** Generator: scan ingest.rs +
     /// fit.rs production source (test modules stripped) for the
@@ -1964,5 +1981,216 @@ mod disk_axis_tests {
         ];
         let f = refit(&key(), &rows, None, &[], &HwTable::default(), None);
         assert_eq!(f.disk_p90, None);
+    }
+
+    // r[verify sched.sla.one-weight-law]
+    /// **W12-AD (merged_bug_022, red-first)** — *the aggregator's weight
+    /// law is total over sub-populations: BOTH directions of the mixed
+    /// ring.* The INVERSE-population fixture the wave-11 seal never
+    /// drove: 3 STALE legacy peaks (200 GiB, oldest, unseated) ahead of
+    /// 29 fresh seated rows (5 GiB peaks). Pre-fix red: unseated rows
+    /// took flat weight 1.0 — the newest seat row's weight — so the
+    /// stale trio held ~14% of the fold mass, `disk_p90` stayed pinned
+    /// at the 200 GiB legacy peak and `exceeds_ceiling` falsely
+    /// rejected at a 50 GiB ceiling. Post-fix the trio decays under the
+    /// one law (full-slice ordinal ages 29..31 ⇒ ~5% of the mass):
+    /// fresh evidence wins the quantile and the tier rejection clears.
+    /// The legacy-is-truth direction is preserved by W11-BA/BB above —
+    /// both directions of the aggregator are now sealed.
+    #[test]
+    fn w12_ad_inverse_population_fresh_evidence_wins() {
+        const GI: i64 = 1 << 30;
+        let mut rows: Vec<BuildSampleRow> = (0..3)
+            .map(|_| disk_row(None, 100.0, Some(200 * GI)))
+            .collect();
+        rows.extend((0..29).map(|_| disk_row(Some(4.0), 50.0, Some(5 * GI))));
+        let f = refit(&key(), &rows, None, &[], &HwTable::default(), None);
+        let got = f.disk_p90.expect("peaked samples fit");
+        assert!(
+            got.0 <= 10 * GI as u64,
+            "disk_p90 follows the fresh population (~5 GiB) once the \
+             stale trio decays under the one weight law; got {} GiB \
+             (pre-fix: pinned at the 200 GiB legacy peak)",
+            got.0 / (1 << 30)
+        );
+        assert!(
+            !super::super::fit::DiskFitEnvelope::exceeds_ceiling(f.disk_p90, 50 * GI as u64),
+            "the false tier rejection clears once fresh evidence wins"
+        );
+    }
+
+    // ── The sub-population WEIGHT CENSUS (merged_bug_022; [GEN-SET];
+    //    the §2 census riders (a)+(b)) ──────────────────────────────
+    //
+    // Universe DERIVED from `mod.rs` declarations (jurisdiction face);
+    // members = production `weighted_quantile(` fold sites per module.
+    // Committed corpus map below; the completeness assert keeps it
+    // honest against the declared module tree.
+
+    /// The committed corpus: every `pub mod` of `sla/` embedded. The
+    /// jurisdiction face (`weight_census_universe_covers_module_tree`)
+    /// REDs if a new sla module is declared without joining this map.
+    fn weight_census_corpus() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("alpha", include_str!("alpha.rs")),
+            ("bootstrap", include_str!("bootstrap.rs")),
+            ("catalog", include_str!("catalog.rs")),
+            ("config", include_str!("config.rs")),
+            ("cost", include_str!("cost.rs")),
+            ("dip", include_str!("dip.rs")),
+            ("explain", include_str!("explain.rs")),
+            ("explore", include_str!("explore.rs")),
+            ("fit", include_str!("fit.rs")),
+            ("hw", include_str!("hw.rs")),
+            ("ingest", include_str!("ingest.rs")),
+            ("metrics", include_str!("metrics.rs")),
+            ("override", include_str!("override.rs")),
+            ("prior", include_str!("prior.rs")),
+            ("quantile", include_str!("quantile.rs")),
+            ("solve", include_str!("solve.rs")),
+            ("types", include_str!("types.rs")),
+        ]
+    }
+
+    /// `pub mod X;` declarations parsed from a mod.rs source (the
+    /// jurisdiction derivation — never a hand crate-list).
+    fn parse_mod_decls(mod_src: &str) -> Vec<String> {
+        mod_src
+            .lines()
+            .filter_map(|l| {
+                l.trim()
+                    .strip_prefix("pub mod ")
+                    .and_then(|r| r.strip_suffix(';'))
+                    .map(|m| m.trim_start_matches("r#").to_owned())
+            })
+            .collect()
+    }
+
+    fn strip_test_mod(src: &str) -> &str {
+        src.split_once("#[cfg(test)]\nmod").map_or(src, |(p, _)| p)
+    }
+
+    /// Count production `weighted_quantile(` sites per module;
+    /// grammar-refusal: an alias/rename of the fold fn ERRORS (a call
+    /// through `wq(` would evade the count — refuse, never green).
+    fn scan_weight_folds(corpus: &[(&str, &str)]) -> Result<Vec<(String, usize)>, String> {
+        let mut out = Vec::new();
+        for (name, src) in corpus {
+            let prod = strip_test_mod(src);
+            if prod.contains("weighted_quantile as") {
+                return Err(format!(
+                    "{name}: aliased weighted_quantile import — the census \
+                     cannot classify calls through a rename; refused"
+                ));
+            }
+            out.push((
+                (*name).to_owned(),
+                prod.matches("weighted_quantile(").count(),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Extract the production `axis_samples` body (the one weight-law
+    /// producer seam) for the totality pin.
+    fn axis_samples_body(ingest_src: &str) -> &str {
+        let prod = strip_test_mod(ingest_src);
+        let start = prod.find("fn axis_samples").expect("producer present");
+        let rest = &prod[start..];
+        let end = rest[3..].find("\nfn ").map_or(rest.len(), |i| i + 3);
+        &rest[..end]
+    }
+
+    // r[verify sched.sla.one-weight-law]
+    /// **The weight census, jurisdiction + population faces (CE-1).**
+    /// The scan universe derives from `mod.rs` (a hand module-list
+    /// drifts RED here); population floor: the walk derived ≥1 fold
+    /// site; the WO-named EXPECTED members verified (fit.rs: the
+    /// definition and the IRLS pinball baseline; ingest.rs:
+    /// observed_p_bar and the mem and disk chokepoints; everything else
+    /// zero). A new fold site anywhere in the sla tree drifts a count
+    /// — re-derive the expectation consciously, never widen silently.
+    #[test]
+    fn w12_ad_weight_census() {
+        let corpus = weight_census_corpus();
+        // Jurisdiction: every declared module is in the corpus.
+        let declared = parse_mod_decls(include_str!("mod.rs"));
+        assert!(!declared.is_empty(), "population floor: mod.rs parses");
+        for m in &declared {
+            assert!(
+                corpus.iter().any(|(n, _)| n == m),
+                "sla module `{m}` declared in mod.rs but missing from the \
+                 weight-census corpus — jurisdiction gap (add the embed)"
+            );
+        }
+        // Membership: committed per-module fold-site expectation.
+        let got = scan_weight_folds(&corpus).expect("no alias evasion in tree");
+        let total: usize = got.iter().map(|(_, c)| c).sum();
+        assert!(total >= 1, "population floor: ≥1 derived fold site");
+        for (name, count) in &got {
+            let want = match name.as_str() {
+                "fit" => 2,    // the definition + irls_quantile's v_null
+                "ingest" => 3, // observed_p_bar + mem + disk chokepoints
+                _ => 0,
+            };
+            assert_eq!(
+                *count, want,
+                "weighted_quantile( sites in {name}.rs drifted from the \
+                 committed census — a new fold must consume the one \
+                 weight law (re-derive, never hand-wave)"
+            );
+        }
+        // Totality pin: the producer body consults the law and carries
+        // NO exempt flat-weight default.
+        let body = axis_samples_body(include_str!("ingest.rs"));
+        assert!(
+            body.contains("sample_weight("),
+            "axis_samples consults the one decay law"
+        );
+        assert!(
+            !body.contains("1.0"),
+            "axis_samples carries an exempt flat weight — the \
+             merged_bug_022 hole reopened"
+        );
+    }
+
+    /// **Weight-census planted reds (riders (b)): each face's oracle
+    /// driven through the SAME walk path as production.**
+    #[test]
+    fn w12_ad_weight_census_planted_reds() {
+        // (1) ENROLLMENT plant: an in-grammar uncensused fold member —
+        // the count comparison is the oracle (a strawman module with a
+        // private fold drifts its count from the committed 0).
+        let strawman =
+            "fn rogue(p: &[f64], w: &[f64]) -> f64 {\n    weighted_quantile(p, w, 0.9)\n}\n";
+        let got = scan_weight_folds(&[("strawman", strawman)]).unwrap();
+        assert_eq!(got[0].1, 1, "the walk FINDS the planted fold");
+        assert_ne!(got[0].1, 0, "…and it drifts from the committed 0 — RED");
+        // (2) JURISDICTION plant: a module declared outside the
+        // previously-scanned population auto-joins the derived universe;
+        // the corpus-completeness assert is the oracle.
+        let decls = parse_mod_decls("pub mod fit;\npub mod phantom;\n");
+        assert!(decls.contains(&"phantom".to_owned()));
+        let corpus = weight_census_corpus();
+        assert!(
+            !corpus.iter().any(|(n, _)| *n == "phantom"),
+            "the planted module is NOT in the corpus — the live census's \
+             completeness loop REDs on exactly this state"
+        );
+        // (3) GRAMMAR-REFUSAL plant: an aliased import must ERROR, never
+        // silently green.
+        let evader = "use super::fit::weighted_quantile as wq;\nfn f(v: &[f64], w: &[f64]) -> f64 { wq(v, w, 0.9) }\n";
+        assert!(
+            scan_weight_folds(&[("evader", evader)]).is_err(),
+            "alias evasion refused"
+        );
+        // (4) EXEMPT-DEFAULT plant (the WO's strawman arm): a producer
+        // body re-growing a flat weight REDs the totality pin.
+        let exempt = "fn axis_samples(rows: &[Row]) -> Vec<f64> {\n    let w = if seated { ring } else { 1.0 };\n}\nfn next() {}\n";
+        let body = axis_samples_body(exempt);
+        assert!(
+            body.contains("1.0"),
+            "the totality pin REDs on the planted exempt arm"
+        );
     }
 }
