@@ -1294,10 +1294,20 @@ pub(super) fn select_orphan_running<'a>(
     reaped: &HashSet<String>,
     open_attempts: &[rio_proto::types::OpenAttempt],
     min_age: Duration,
+    leader_for_secs: u64,
 ) -> Vec<&'a Job> {
     jobs.iter()
         .filter(|j| {
+            // merged_bug_136 (the W12-AQ2 conjunct): the freshness
+            // gate prices the CANDIDATE's own envelope-derived grace
+            // — a leader younger than it has not observed one full
+            // candidate-grace, so the candidate's attempt-absence is
+            // not yet orphan evidence (its pull may lawfully be up
+            // to ~envelope late). The flat early gate in
+            // `reap_orphan_running` stays as the cheap floor (flat ≤
+            // every effective grace).
             is_running_job(j)
+                && leader_for_secs >= effective_orphan_grace(j, min_age).as_secs()
                 && job_older_than(j, effective_orphan_grace(j, min_age))
                 && !j
                     .metadata
@@ -1391,7 +1401,7 @@ pub(super) async fn reap_orphan_running(
             return 0;
         }
     };
-    // r[impl ctrl.job.orphan-leader-age]
+    // r[impl ctrl.job.orphan-leader-age+2]
     // Freshness gate (merged_bug_221): never-pulled pods have no row
     // by construction, so a freshly-failed-over leader's view cannot
     // distinguish "orphaned" from "about to pull". One full grace
@@ -1408,8 +1418,15 @@ pub(super) async fn reap_orphan_running(
     // bug_080: the pair is minted AT SELECTION — `select_orphan_running`
     // runs against the deciding view; every delete below vetoes
     // against that same view even after a mid-wave refresh.
+    let leader_for_secs = resp.leader_for_secs;
     let mut attempts_view = AttemptsPair::at_selection(AttemptsViewWitness::minted_now(resp));
-    let orphans = select_orphan_running(jobs, reaped, attempts_view.freshest().attempts(), grace);
+    let orphans = select_orphan_running(
+        jobs,
+        reaped,
+        attempts_view.freshest().attempts(),
+        grace,
+        leader_for_secs,
+    );
     if orphans.is_empty() {
         return 0;
     }
@@ -3106,11 +3123,11 @@ mod tests {
         let jobs = vec![job_with("rio-builder-p-stuck", Some(1), Some(0), 600)];
         let reaped: HashSet<String> = ["rio-builder-p-stuck".into()].into();
         assert!(
-            select_orphan_running(&jobs, &reaped, &[], ORPHAN_REAP_GRACE).is_empty(),
+            select_orphan_running(&jobs, &reaped, &[], ORPHAN_REAP_GRACE, u64::MAX).is_empty(),
             "reaped this tick → not re-selected"
         );
         assert_eq!(
-            select_orphan_running(&jobs, &HashSet::new(), &[], ORPHAN_REAP_GRACE).len(),
+            select_orphan_running(&jobs, &HashSet::new(), &[], ORPHAN_REAP_GRACE, u64::MAX).len(),
             1,
             "control: not in `reaped` → selected"
         );
@@ -3169,7 +3186,7 @@ mod tests {
             },
         ];
         let none = HashSet::new();
-        let orphans = select_orphan_running(&jobs, &none, &[], ORPHAN_REAP_GRACE);
+        let orphans = select_orphan_running(&jobs, &none, &[], ORPHAN_REAP_GRACE, u64::MAX);
         let names: Vec<_> = orphans.iter().map(|j| j.name_any()).collect();
         assert_eq!(names, vec!["rio-builder-x86-stuck1"]);
 
@@ -3177,7 +3194,7 @@ mod tests {
         let mut no_ts = job_with("rio-builder-x86-nots01", Some(1), Some(0), 600);
         no_ts.metadata.creation_timestamp = None;
         assert!(
-            select_orphan_running(&[no_ts], &none, &[], ORPHAN_REAP_GRACE).is_empty(),
+            select_orphan_running(&[no_ts], &none, &[], ORPHAN_REAP_GRACE, u64::MAX).is_empty(),
             "no creation_timestamp → not orphan-reapable (conservative)"
         );
     }
@@ -3240,7 +3257,13 @@ mod tests {
         ];
         let attempts = vec![open_attempt(pull_intent)];
 
-        let orphans = select_orphan_running(&jobs, &HashSet::new(), &attempts, ORPHAN_REAP_GRACE);
+        let orphans = select_orphan_running(
+            &jobs,
+            &HashSet::new(),
+            &attempts,
+            ORPHAN_REAP_GRACE,
+            u64::MAX,
+        );
         let names: Vec<_> = orphans.iter().map(|j| j.name_any()).collect();
         assert_eq!(
             names,
@@ -3251,7 +3274,8 @@ mod tests {
 
         // (b) The same Job with NO open attempt: the open-attempt arm
         // must not weaken the I-165 reap — it IS selected again.
-        let orphans = select_orphan_running(&jobs, &HashSet::new(), &[], ORPHAN_REAP_GRACE);
+        let orphans =
+            select_orphan_running(&jobs, &HashSet::new(), &[], ORPHAN_REAP_GRACE, u64::MAX);
         let names: Vec<_> = orphans.iter().map(|j| j.name_any()).collect();
         assert_eq!(
             names,

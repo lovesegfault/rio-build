@@ -346,9 +346,33 @@ pub(super) const EPHEMERAL_DEADLINE_FLOOR_SECS: i64 = 180;
 /// fallback. The [`EPHEMERAL_DEADLINE_FLOOR_SECS`] floor is defensive
 /// only — proto default is 0; a 0s deadline would fail the Job at
 /// creation, and `< 180` would tie the worker's
-/// `daemon_timeout = deadline − 90` against this timer.
-// r[impl ctrl.ephemeral.intent-deadline]
+/// `daemon_timeout = build window − 90` against this timer.
+///
+/// merged_bug_136: the deadline PRICES THE LAWFUL WAIT — k8s's
+/// `activeDeadlineSeconds` clock spans Pending+Running, so a
+/// forecast pod with eta ≳ deadline was DeadlineExceeded-killed
+/// mid-lawful-wait while the token mint and idle bound both
+/// sanctioned the wait. The deadline = the build window
+/// ([`build_window_secs`]) + the intent's wait envelope
+/// ([`pod::wait_envelope`] — the ONE eta-aware producer); the
+/// fires-first contract holds as a relation between the producer's
+/// terms (asserted in-test): the worker's daemon timeout is
+/// denominated in the BUILD window and fires at
+/// `wait + build − 90 ≤ envelope + build − 90 < envelope + build`
+/// for every lawful wait.
+// r[impl ctrl.ephemeral.intent-deadline+2]
+// r[impl ctrl.pool.wait-envelope]
 pub(super) fn ephemeral_deadline(intent: &SpawnIntent) -> i64 {
+    build_window_secs(intent)
+        .saturating_add(i64::try_from(pod::wait_envelope(intent)).unwrap_or(i64::MAX))
+}
+
+/// The BUILD's own window: `intent.deadline_secs` floored at
+/// [`EPHEMERAL_DEADLINE_FLOOR_SECS`] — the worker's daemon-timeout
+/// denominator (the wait envelope is NOT part of the build window;
+/// merged_bug_136's inversion came from deriving the worker timeout
+/// from the padded Job deadline).
+pub(super) fn build_window_secs(intent: &SpawnIntent) -> i64 {
     i64::from(intent.deadline_secs).max(EPHEMERAL_DEADLINE_FLOOR_SECS)
 }
 
@@ -2951,7 +2975,7 @@ pub(super) async fn reap_stale_for_intents(
 ///   - `activeDeadlineSeconds` — backstop for hung builds + wrong-
 ///     pool spawns.
 // r[impl ctrl.pool.ephemeral+2]
-// r[impl ctrl.ephemeral.intent-deadline]
+// r[impl ctrl.ephemeral.intent-deadline+2]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_job(
     pool: &Pool,
@@ -3128,9 +3152,13 @@ pub(super) fn apply_intent_resources(
     // path) carries telemetry and reaches `handle_timeout_failure`'s
     // cap-check; `DeadlineExceeded` stays the wedged-worker backstop
     // per `r[sched.termination.deadline-exceeded+3]`.
-    // `ephemeral_deadline` floors at 180 so `− 90` never underflows
-    // the `.max(60)` clamp into a tie.
-    let worker_timeout = (ephemeral_deadline(i) - WORKER_DEADLINE_SLACK_SECS).max(60);
+    // merged_bug_136: the worker timeout is denominated in the BUILD
+    // window, never the wait-padded Job deadline — deriving it from
+    // `ephemeral_deadline` re-inverts fires-first for any pod that
+    // waited (worker would fire at wait + jobDeadline − 90, AFTER
+    // the Job's own kill). `build_window_secs` floors at 180 so
+    // `− 90` never underflows the `.max(60)` clamp into a tie.
+    let worker_timeout = (build_window_secs(i) - WORKER_DEADLINE_SLACK_SECS).max(60);
     let env = container.env.get_or_insert_with(Vec::new);
     env.push(pod::env(
         "RIO_DAEMON_TIMEOUT_SECS",
@@ -3552,11 +3580,13 @@ mod tests {
             Some(JOB_TTL_SECS),
             "completed Jobs must auto-reap"
         );
-        // r[verify ctrl.ephemeral.intent-deadline]
+        // r[verify ctrl.ephemeral.intent-deadline+2]
         assert_eq!(
             spec.active_deadline_seconds,
-            Some(180),
-            "activeDeadlineSeconds backstop (proto-default 0 → 180s floor)"
+            Some(300),
+            "activeDeadlineSeconds backstop: the 180s build-window \
+             floor (proto-default 0) + the flat 120s wait envelope \
+             (merged_bug_136: the deadline prices the lawful wait)"
         );
 
         let pod_anns = spec
@@ -3607,9 +3637,10 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.ephemeral.intent-deadline]
+    // r[verify ctrl.ephemeral.intent-deadline+2]
     /// D7: `SpawnIntent.deadline_secs` propagates verbatim;
-    /// proto-default 0 floors to 180.
+    /// proto-default 0 floors the BUILD WINDOW to 180; the Job
+    /// deadline adds the wait envelope on top (merged_bug_136).
     #[test]
     fn intent_deadline_propagates_to_job_spec() {
         let i = SpawnIntent {
@@ -3617,8 +3648,70 @@ mod tests {
             deadline_secs: 240,
             ..Default::default()
         };
-        assert_eq!(ephemeral_deadline(&i), 240);
-        assert_eq!(ephemeral_deadline(&intent("abc")), 180, "0 → 180s floor");
+        assert_eq!(build_window_secs(&i), 240);
+        assert_eq!(
+            ephemeral_deadline(&i),
+            240 + 120,
+            "build window + the flat wait envelope"
+        );
+        assert_eq!(
+            build_window_secs(&intent("abc")),
+            180,
+            "0 → 180s build-window floor"
+        );
+        assert_eq!(ephemeral_deadline(&intent("abc")), 180 + 120);
+    }
+
+    // r[verify ctrl.pool.wait-envelope]
+    /// W12-AQ (merged_bug_136) — proposition: every lifetime horizon
+    /// derives from the ONE eta-aware envelope; population: the five
+    /// consumers, each pinned to the producer (idle bound + the
+    /// spawn-stamped annotation pin live in pod.rs/job.rs tests; the
+    /// leader-freshness conjunct is W12-AQ2; the scheduler token
+    /// mint is the CITE-confirmed sanctioning sibling).
+    ///
+    /// The eta ≳ deadline forecast pod: lawful wait = 900+300 =
+    /// 1200s > deadline 600s. Pre-fix `ephemeral_deadline` was
+    /// max(deadline, 180) with NO eta term — k8s's clock spans
+    /// Pending+Running, so the pod was DeadlineExceeded-killed
+    /// mid-lawful-wait while the token mint (deadline+eta+300) and
+    /// idle bound (max(120, eta+300)) BOTH sanctioned the wait; and
+    /// the worker daemon_timeout (derived from the Job deadline)
+    /// inverted fires-first for any pod that waited >90s.
+    #[test]
+    fn w12_aq_job_deadline_prices_the_lawful_wait() {
+        let mut i = intent("fc");
+        i.ready = Some(false);
+        i.eta_seconds = 900.0;
+        i.deadline_secs = 600;
+        let envelope = i64::try_from(pod::wait_envelope(&i)).unwrap();
+        assert_eq!(envelope, 1200, "eta + slack (the forecast face)");
+        // The law: the Job deadline covers the build window PLUS the
+        // full lawful wait (pre-fix: 600 — the kill landed inside
+        // the sanctioned wait).
+        assert!(
+            ephemeral_deadline(&i) >= envelope + build_window_secs(&i),
+            "the Job deadline prices the lawful wait \
+             (pre-fix: max(deadline,180) = {} < envelope {})",
+            i64::from(i.deadline_secs).max(EPHEMERAL_DEADLINE_FLOOR_SECS),
+            envelope
+        );
+        // The fires-first contract as a RELATION between the
+        // producer's terms: for every lawful wait W ≤ envelope, the
+        // worker fires at W + (build − 90) and k8s kills at the Job
+        // deadline — worker strictly first, with the 90s margin.
+        let worker_fires_latest = envelope + (build_window_secs(&i) - WORKER_DEADLINE_SLACK_SECS);
+        assert!(
+            worker_fires_latest < ephemeral_deadline(&i),
+            "daemon_timeout fires before the Job deadline at every \
+             lawful wait (the inverted contract restored)"
+        );
+        // The idle consumer imports the same producer.
+        assert_eq!(
+            pod::idle_exit_secs(&i),
+            pod::wait_envelope(&i),
+            "the idle bound IS the envelope (one producer)"
+        );
     }
 
     /// §Simulator-shares-accounting: the `(c,m,d)` triple

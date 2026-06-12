@@ -1032,6 +1032,57 @@ fn running_job_for_intent(name: &str, intent_id: &str) -> Job {
     j
 }
 
+// r[verify ctrl.job.orphan-leader-age+2]
+/// W12-AQ2 (merged_bug_136) — the orphan freshness gate prices the
+/// CANDIDATE's own wait envelope: a lawfully-waiting forecast
+/// candidate inside its effective grace is NOT reap-eligible at a
+/// new-leader age that only covers the flat grace. Pre-fix the gate
+/// compared `leader_for_secs` against the flat global grace, so a
+/// forecast pod whose rendered envelope (eta+slack, stamped at
+/// spawn) exceeds the flat 300s was exposed to foreground delete at
+/// new-leader age in [300s, bound+60s) — its pull may lawfully be up
+/// to ~envelope late, and a younger leader's empty view is not
+/// absence evidence for it. No DELETE is issued (a wrongly-attempted
+/// DELETE would hang against the un-driven verifier).
+#[tokio::test]
+async fn w12_aq2_orphan_gate_prices_per_candidate_grace() {
+    use crate::reconcilers::pool::job::reap_orphan_running;
+    use crate::reconcilers::pool::jobs::IDLE_EXIT_SECS_ANNOTATION;
+
+    let (client, _verifier) = ApiServerVerifier::new();
+    let (ctx, mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+    // The new leader is past the FLAT grace (300s) but inside the
+    // candidate's own envelope-derived grace (900+60s).
+    mock.open_attempts.write().unwrap().leader_for_secs = 400;
+
+    // A forecast Running Job: rendered idle bound 900s stamped at
+    // spawn (the production annotation), aged past its own grace's
+    // job-age conjunct, no covering attempt.
+    let mut job = running_job_for_intent("rio-builder-p-fc9", "drv-fc9");
+    // Age the Job past its own envelope-derived grace (the age
+    // conjunct already prices per-candidate — the leader conjunct is
+    // the one under test).
+    job.metadata.creation_timestamp = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+        k8s_openapi::jiff::Timestamp::now()
+            .checked_sub(k8s_openapi::jiff::SignedDuration::from_secs(2000))
+            .unwrap(),
+    ));
+    if let Some(spec) = job.spec.as_mut()
+        && let Some(meta) = spec.template.metadata.as_mut()
+        && let Some(anns) = meta.annotations.as_mut()
+    {
+        anns.insert(IDLE_EXIT_SECS_ANNOTATION.to_string(), "900".to_string());
+    }
+    let reaped = reap_orphan_running(&jobs_api, &[job], &HashSet::new(), &ctx, "p", &pkey()).await;
+    assert_eq!(
+        reaped, 0,
+        "a leader younger than the candidate's OWN effective grace \
+         must not read its attempt-absence as orphan evidence (the \
+         per-candidate freshness conjunct)"
+    );
+}
+
 /// One open BUILD pull-mode attempt exactly as the production mint
 /// persists it and the pull-filtered `ListOpenAttempts` view returns
 /// it: `executor_id` IS the attested intent id (`ExecutorId::from(
@@ -1901,7 +1952,7 @@ async fn reap_orphan_running_fail_closed_on_view_error() {
 
 // r[verify ctrl.ephemeral.reap-orphan-running+6]
 // r[verify ctrl.job.busy-from-open-attempts+2]
-// r[verify ctrl.job.orphan-leader-age]
+// r[verify ctrl.job.orphan-leader-age+2]
 /// Positive control for the fail-closed test above, and the busy-view
 /// re-key: with a readable (empty) open-attempt view served by a
 /// leader past the grace, the aged uncovered Job IS reaped — absence
@@ -4142,7 +4193,7 @@ fn cancel_arm_call_site_is_wired() {
     );
 }
 
-// r[verify ctrl.job.orphan-leader-age]
+// r[verify ctrl.job.orphan-leader-age+2]
 /// merged_bug_221's recorded red, kept as the regression pin: a
 /// freshly-failed-over leader (leader_for_secs = 0, the mock default)
 /// must NOT reap an aged uncovered Running Job — never-pulled pods

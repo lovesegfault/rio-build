@@ -84,6 +84,32 @@ pub(super) const FORECAST_IDLE_ETA_SLACK_SECS: u64 = 300;
 /// eta≈0 keeps today's patience; the slack still covers the
 /// dep-completion jitter that made it overdue).
 pub(super) fn idle_exit_secs(intent: &rio_proto::types::SpawnIntent) -> u64 {
+    wait_envelope(intent)
+}
+
+// r[impl ctrl.pool.wait-envelope]
+/// THE one eta-aware lawful-wait producer (merged_bug_136, R33): the
+/// intent's wait envelope — how long its pod may LAWFULLY sit before
+/// the build starts. Forecast intents (`ready == Some(false)`) wait
+/// for their dependency eta plus the propagation slack, floored at
+/// the flat idle bound; ready intents wait at most the flat bound.
+///
+/// ONE quantity, ONE producer, FIVE consumers — each imports, never
+/// re-derives: (1) the pod idle bound ([`idle_exit_secs`], rendered
+/// as `RIO_IDLE_SECS` and stamped as the idle-exit annotation);
+/// (2) the Job deadline (`jobs::ephemeral_deadline` = the build
+/// window + THIS envelope — k8s's `activeDeadlineSeconds` clock
+/// spans Pending+Running, so the deadline must price the wait);
+/// (3) the orphan-reap grace (`job::effective_orphan_grace` reads
+/// the spawn-stamped annotation + 60s slack); (4) the orphan
+/// leader-freshness gate (the per-candidate conjunct in
+/// `job::select_orphan_running`); (5) the scheduler's token expiry
+/// (CITE-confirm: `deadline + eta + 300` — the mint already carries
+/// the eta term and SANCTIONS the wait; cross-crate, it stays the
+/// sanctioning sibling rather than an importer). Each hand-written
+/// copy was an independent miss opportunity and two had hit
+/// (the eta-blind Job deadline and the flat leader gate).
+pub(super) fn wait_envelope(intent: &rio_proto::types::SpawnIntent) -> u64 {
     if intent.ready == Some(false) {
         let eta = intent.eta_seconds.max(0.0).ceil() as u64;
         POOL_IDLE_EXIT_SECS.max(eta.saturating_add(FORECAST_IDLE_ETA_SLACK_SECS))

@@ -6829,14 +6829,14 @@ rec {
     # the never-pulled cohort gets one full grace against a NEW leader.
     # The HOLD half rides the existing fault-lease regime (the gate
     # forbids exactly the falsified trace there).
-    # r[verify ctrl.job.orphan-leader-age]
+    # r[verify ctrl.job.orphan-leader-age+2]
     quint-spawn-coherence-falsify-young-leader-reap = mkQuintWitnessCheck {
       name = "spawn-coherence-falsify-young-leader-reap";
       spec = "spawnCoherence";
       main = "spawnCoherenceReapYoungLeader";
       witness = "noReapOfNeverPulledBeforeLeaderAged";
     };
-    # r[verify ctrl.job.orphan-leader-age]
+    # r[verify ctrl.job.orphan-leader-age+2]
     # r[verify ctrl.ephemeral.reap-orphan-running+6]
     quint-spawn-coherence-leader-age-hold = mkQuintCheck {
       name = "spawn-coherence-leader-age-hold";

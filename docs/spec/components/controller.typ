@@ -141,17 +141,25 @@ pool-delete cleanup.
   leader is older than the grace (#rref("ctrl.job.orphan-leader-age")).
 ]
 
-#r("ctrl.job.orphan-leader-age")[
+#r("ctrl.job.orphan-leader-age+2")[
   The orphan-Running reap MUST NOT act on the absence of an open attempt
-  while the serving leader's own age (`leader_for_secs` on the
-  `ListOpenAttempts` response) is below the orphan grace. A never-pulled pod
-  has no attempt row by construction (the builder retries pull transport
-  errors indefinitely; a row exists only after a successful mint), so a
-  freshly-failed-over leader's view is durably, truthfully empty of rows for
-  pods that are about to pull --- reaping on that emptiness would mass-delete
-  the entire waiting cohort after a scheduler outage. Every such pod gets one
-  full grace measured against the NEW leader before absence becomes
-  evidence.
+  for any CANDIDATE while the serving leader's own age (`leader_for_secs`
+  on the `ListOpenAttempts` response) is below that candidate's OWN
+  effective orphan grace (the per-candidate wait envelope + slack ---
+  #rref("ctrl.pool.wait-envelope")), with the flat global grace as the
+  cheap whole-tick floor. A never-pulled pod has no attempt row by
+  construction (the builder retries pull transport errors indefinitely;
+  a row exists only after a successful mint), so a freshly-failed-over
+  leader's view is durably, truthfully empty of rows for pods that are
+  about to pull --- and a forecast pod's pull may lawfully be up to its
+  envelope late, so a leader younger than the candidate's envelope has
+  not yet observed one full candidate-grace and its empty view is not
+  absence evidence for that candidate (merged_bug_136: the flat
+  comparison exposed lawfully-waiting forecast pods to foreground
+  delete at any new-leader age past the flat grace but inside the
+  candidate's envelope+slack bound). Every pod gets
+  one full grace OF ITS OWN measured against the NEW leader before
+  absence becomes evidence.
 ]
 The gate is per-tick and self-clearing: once `leader_for_secs` crosses the
 grace the reap proceeds with no state to reconcile --- the cost of the gate
@@ -162,21 +170,31 @@ after a failover (accepted; `activeDeadlineSeconds` still bounds it).
 finish their one build naturally; ownerRef GC removes them after the pool is
 gone.
 
-#r("ctrl.ephemeral.intent-deadline")[
-  Jobs MUST set `spec.activeDeadlineSeconds` to `SpawnIntent.deadline_secs`
-  verbatim (floored at 180 as defense against the proto default). The scheduler
-  computes `deadline_secs` per-derivation (D7): for fitted keys, `wall_p99 * 5`
-  at the solved core count; for unfitted (probe/explore),
-  `[sla].probe.deadline_secs`; both clamped `[resource_floor.deadline_secs,
-  86400]`. `SlaConfig::validate` enforces `probe.deadline_secs >= 180`, so the
-  intent value is always positive --- the controller has no per-kind fallback.
-  A `DeadlineExceeded` kill triggers #rref("ctrl.terminated.deadline-exceeded")
-  → `bump_floor_or_count` doubles `floor.deadline_secs` → the next intent gets
-  a longer `activeDeadlineSeconds`. The 5× headroom is scheduler-side; the
-  controller adds no multiplier or margin. Backstop purpose: a wrong-pool spawn
-  (executor heartbeats in, never matches dispatch) would hang indefinitely
-  without it; K8s kills at deadline, `backoffLimit: 0` marks Failed,
-  `ttlSecondsAfterFinished` reaps.
+#r("ctrl.ephemeral.intent-deadline+2")[
+  Jobs MUST set `spec.activeDeadlineSeconds` to the BUILD WINDOW
+  (`SpawnIntent.deadline_secs`, floored at 180 as defense against the
+  proto default) PLUS the intent's wait envelope
+  (#rref("ctrl.pool.wait-envelope")) --- the k8s deadline clock spans
+  Pending AND Running, so the deadline MUST price the lawful wait; an
+  eta-blind deadline kills a forecast pod mid-lawful-wait
+  (merged_bug_136). The scheduler computes `deadline_secs`
+  per-derivation (D7): for fitted keys, `wall_p99 * 5` at the solved
+  core count; for unfitted (probe/explore), `[sla].probe.deadline_secs`;
+  both clamped `[resource_floor.deadline_secs, 86400]`.
+  `SlaConfig::validate` enforces `probe.deadline_secs >= 180`, so the
+  intent value is always positive --- the controller has no per-kind
+  fallback, and the only controller-side additions are the floor and
+  the envelope term. The worker's `daemon_timeout` MUST be denominated
+  in the BUILD WINDOW alone (window − 90, never the wait-padded Job
+  deadline), so the fires-first contract holds for every lawful wait:
+  the worker fires at `wait + window − 90 < window + envelope`. A
+  `DeadlineExceeded` kill triggers
+  #rref("ctrl.terminated.deadline-exceeded") → `bump_floor_or_count`
+  doubles `floor.deadline_secs` → the next intent gets a longer
+  `activeDeadlineSeconds`. The 5× headroom is scheduler-side. Backstop
+  purpose: a wrong-pool spawn (executor heartbeats in, never matches
+  dispatch) would hang indefinitely without it; K8s kills at deadline,
+  `backoffLimit: 0` marks Failed, `ttlSecondsAfterFinished` reaps.
 ]
 
 #r("ctrl.terminated.deadline-exceeded+3")[
@@ -430,6 +448,31 @@ the system acts. The reader census is split-form: the in-crate
 emission lanes are walked and tagged in the controller; the
 scheduler-side `dispatched_cells` writer sites are expected members
 of the round-12 registry's workspace-union row.
+
+#r("ctrl.pool.wait-envelope")[
+  An intent's lawful-wait envelope is ONE quantity with ONE eta-aware
+  producer, and every lifetime horizon MUST derive from it by import,
+  never by re-derivation: the Job deadline (the build window plus the
+  envelope), the pod idle bound, the spawn-stamped idle-exit
+  annotation, the orphan-reap grace, and the orphan leader-freshness
+  gate (per-candidate) all consume the one producer; the scheduler's
+  token expiry is the cross-crate sanctioning sibling (it already
+  carries the eta term and MUST keep sanctioning every wait the
+  envelope permits).
+]
+
+The round-12 instance (merged_bug_136) is the sibling-axis miss
+hitting the same mechanism twice: the wave-10 bug_078 close
+discharged the token and idle axes but left the Job-deadline horizon
+and the freshness gate's leader-age conjunct eta-blind --- a forecast
+pod with eta ≳ deadline was DeadlineExceeded-killed mid-lawful-wait
+(k8s's clock spans Pending+Running) while two siblings sanctioned the
+wait, and the `daemon_timeout = jobDeadline − 90` fires-first
+contract inverted for any pod that waited >90s. Five hand-written
+copies of one quantity were five independent miss opportunities; two
+had hit. The producer is `pod::wait_envelope`; the worker timeout is
+denominated in the build window alone so fires-first holds at every
+lawful wait.
 
 #r("ctrl.pool.container-overhead+2")[
   The container memory limit binds the WHOLE container --- the worker
