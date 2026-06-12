@@ -512,6 +512,16 @@ pub struct ResumeLedger {
     /// outcome of EVERY pass — gated passes drive the streak,
     /// un-gated ones the heal).
     wedge: WedgeLatch,
+    /// live061-R3 — jobs whose entry was resolved by a NON-DELIVERY
+    /// answer (Gone / mint-disproving rejection / fresh-lane auth
+    /// rejection), barred from fresh re-mints until the stamped
+    /// instant. The pacing dual of the surviving-credential skip:
+    /// resolving answers leave no entry to pace the next pass, so
+    /// they pace HERE. Pruned opportunistically at the mint gate;
+    /// growth is bounded by the mint rate (≤ allowance per pass) ×
+    /// the cooldown window. Delivered claims never enter (delivery
+    /// removes the job from the listing server-side).
+    remint_cooldowns: std::collections::HashMap<Uuid, tokio::time::Instant>,
 }
 
 /// One claim whose lifecycle is not settled: everything the resume
@@ -642,6 +652,44 @@ const _: () = assert!(
     RESUME_PRESENTATIONS_PER_PASS >= 1 + STEAL_SPECULATION_ALLOWANCE + 2,
     "the pass bound must fund the claiming lane plus two probe slots at slots=1"
 );
+
+/// live061-R3 (R17, violable + testable) — the re-mint cooldown after
+/// an entry-RESOLVING non-delivery answer (Gone, a mint-disproving
+/// rejection, a fresh-lane auth rejection): the job may not be
+/// fresh-minted again for this window.
+///
+/// THE ASYMMETRY THIS CLOSES: NotYetReady pays a SURVIVING credential
+/// — the entry stays in the ledger, so the next listing pass SKIPS the
+/// job at the mint gate (one nonce per job lifecycle) and the resume
+/// lane paces it through the structural queue. A resolving answer
+/// left NOTHING behind: the entry vanished, the job re-listed (the
+/// scheduler's durable row outlived the answer — live_061's zombies),
+/// and the next pass re-minted the SAME head, burning the per-pass
+/// allowance (`slots + STEAL_SPECULATION_ALLOWANCE` = 2 at production
+/// slots=1) on the same rows every pass: the fleet converted ~0.5% of
+/// claim attempts for hours. The cooldown is the symmetric pacing the
+/// resolving answers were missing.
+///
+/// Quantified bound (the starvation-proof window): K stuck rows in a
+/// worker's slice absorb at most `ceil(K/allowance)` passes' worth of
+/// fresh mints ONCE per cooldown window — `K` mints per
+/// [`RESOLVED_ANSWER_REMINT_COOLDOWN`] per worker, vs 100% of every
+/// pass pre-fix. With the live_061 shape (K=44 fleet-wide, the
+/// rendezvous partition giving ~1 zombie per worker slice) the
+/// fleet-wide absorption is < 1 mint/s against an ~18 mint/s fleet
+/// budget — a bounded stuck set can no longer absorb the mint budget.
+/// Witness: `stuck_head_cannot_absorb_the_fresh_mint_budget`.
+///
+/// Value derivation: ≥ the scheduler's moot-sweep cadence (1s tick)
+/// + the listing snapshot TTL (1s) with two orders of headroom for
+/// the congested-tick regime (live_053's 134.65s tick) — a healthy
+/// scheduler resolves a Gone-answering row within ~2s, so a job
+/// STILL listed after 60s is either a brand-new job under the same
+/// hash (different job_id — the cooldown keys on job_id, so it is
+/// never barred) or persistent skew the cooldown correctly paces.
+/// Liveness: a cooled job re-mints on the first pass after expiry.
+// r[impl store.materialize.remint-cooldown]
+const RESOLVED_ANSWER_REMINT_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// merged_bug_005 — what a pass may still do with fresh mints (the
 /// [`ResumeLedger::fresh_mint_headroom`] answer): the typed reason a
@@ -774,10 +822,28 @@ impl ResumeLedger {
     fn apply_standing(&mut self, job_id: Uuid, effect: StandingEffect) {
         match effect {
             StandingEffect::Resolve => self.resolve(job_id),
+            StandingEffect::ResolveCooled => {
+                self.resolve(job_id);
+                self.remint_cooldowns.insert(
+                    job_id,
+                    tokio::time::Instant::now() + RESOLVED_ANSWER_REMINT_COOLDOWN,
+                );
+            }
             StandingEffect::Refund => self.note_answered_not_ready(job_id),
             StandingEffect::Recharge => self.note_unanswered_presentation(job_id),
             StandingEffect::Keep => {}
         }
+    }
+
+    /// live061-R3 — whether a fresh mint for `job_id` is barred by the
+    /// re-mint cooldown (an entry-resolving non-delivery answer within
+    /// [`RESOLVED_ANSWER_REMINT_COOLDOWN`]). Prunes expired stamps
+    /// opportunistically — the map's population is bounded by the mint
+    /// rate (≤ allowance per pass) × the cooldown window.
+    fn remint_barred(&mut self, job_id: Uuid) -> bool {
+        let now = tokio::time::Instant::now();
+        self.remint_cooldowns.retain(|_, until| *until > now);
+        self.remint_cooldowns.contains_key(&job_id)
     }
 
     /// The claim-slot charge count — what the pass budget reads
@@ -987,12 +1053,20 @@ impl ResumeLedger {
     }
 
     /// Settle one presentation: apply the [`standing_effect`] verdict
-    /// to the popped entry — resolutions DROP it, every surviving
-    /// entry recycles to the BACK (presented entries queue behind
-    /// the un-presented remainder; overtaking is unrepresentable).
+    /// to the popped entry — resolutions DROP it (a non-delivery
+    /// resolution also stamps the re-mint cooldown — live061-R3),
+    /// every surviving entry recycles to the BACK (presented entries
+    /// queue behind the un-presented remainder; overtaking is
+    /// unrepresentable).
     fn finish_presentation(&mut self, mut entry: ResumeEntry, effect: StandingEffect) {
         match effect {
             StandingEffect::Resolve => {}
+            StandingEffect::ResolveCooled => {
+                self.remint_cooldowns.insert(
+                    entry.job_id,
+                    tokio::time::Instant::now() + RESOLVED_ANSWER_REMINT_COOLDOWN,
+                );
+            }
             StandingEffect::Refund => {
                 entry.standing = SlotStanding::CredentialOnly;
                 self.entries.push_back(entry);
@@ -1096,8 +1170,18 @@ enum PresentationLane {
 /// [`ResumeLedger::apply_standing`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StandingEffect {
-    /// Authoritative settle: the entry leaves the ledger.
+    /// Authoritative settle by DELIVERY: the entry leaves the ledger
+    /// (the claim is the worker's to execute; the job leaves the
+    /// listing server-side, so nothing remains to pace).
     Resolve,
+    /// live061-R3 — authoritative settle WITHOUT a delivery (Gone /
+    /// mint-disproving rejection / fresh-lane auth rejection): the
+    /// entry leaves the ledger AND the job enters the re-mint
+    /// cooldown. A resolving non-delivery answer leaves no surviving
+    /// credential to pace the next pass — pre-fix a still-listed job
+    /// (the live_061 zombie) was re-minted every pass, burning the
+    /// whole allowance on the same refused head.
+    ResolveCooled,
     /// Answered non-holdership: `Charged` → `CredentialOnly`.
     Refund,
     /// A claiming presentation went unanswered: → `Charged`.
@@ -1120,34 +1204,41 @@ enum StandingEffect {
 ///     if a prior answer had refunded it) and the payload is
 ///     DISCARDED (the probe is a standing oracle, never an execution
 ///     source; the next claiming presentation re-delivers);
-///   - `Gone` resolves everywhere (the job settled without us);
+///   - `Gone` resolves everywhere WITH the re-mint cooldown
+///     (live061-R3: the job settled without us — and if the listing
+///     still advertises it, re-minting before the cooldown elapses
+///     burns the allowance on a head only the scheduler can fix);
 ///   - `NotYetReady` refunds everywhere — screened (the confirm
 ///     screen converting a would-be mint) or genuine, both prove
 ///     non-holdership for this presentation;
 ///   - `Unanswered` re-charges CLAIMING lanes (a mint may have
 ///     committed behind the lost response); a probe's loss proves
 ///     nothing either way (the screen blocks probe mints) — Keep;
-///   - `RejectedDisproving` resolves everywhere (the request shape
-///     can never mint — nothing is pending behind it);
-///   - `RejectedAuth` resolves only the FRESH lane (its gates run
-///     pre-mint, so THIS pull was the only one that could have
-///     minted — merged_bug_074); on resume/probe it judges the
-///     PRESENTATION, not the original mint — Keep;
+///   - `RejectedDisproving` resolves everywhere with the cooldown
+///     (the request shape can never mint — nothing is pending behind
+///     it, and re-presenting the same shape next pass re-fails);
+///   - `RejectedAuth` resolves only the FRESH lane, with the cooldown
+///     (its gates run pre-mint, so THIS pull was the only one that
+///     could have minted — merged_bug_074; a rotation-skew window
+///     re-fails until rotation completes, so pace it); on
+///     resume/probe it judges the PRESENTATION, not the original
+///     mint — Keep;
 ///   - `Shutdown` keeps (the pass is abandoned unobserved).
+// r[impl store.materialize.remint-cooldown]
 fn standing_effect(lane: PresentationLane, answer: &PullAnswer) -> StandingEffect {
     match (lane, answer) {
         (PresentationLane::Fresh | PresentationLane::ResumeClaiming, PullAnswer::Deliver(_)) => {
             StandingEffect::Resolve
         }
         (PresentationLane::Probe, PullAnswer::Deliver(_)) => StandingEffect::Recharge,
-        (_, PullAnswer::Gone) => StandingEffect::Resolve,
+        (_, PullAnswer::Gone) => StandingEffect::ResolveCooled,
         (_, PullAnswer::NotYetReady { .. }) => StandingEffect::Refund,
         (PresentationLane::Fresh | PresentationLane::ResumeClaiming, PullAnswer::Unanswered) => {
             StandingEffect::Recharge
         }
         (PresentationLane::Probe, PullAnswer::Unanswered) => StandingEffect::Keep,
-        (_, PullAnswer::RejectedDisproving) => StandingEffect::Resolve,
-        (PresentationLane::Fresh, PullAnswer::RejectedAuth) => StandingEffect::Resolve,
+        (_, PullAnswer::RejectedDisproving) => StandingEffect::ResolveCooled,
+        (PresentationLane::Fresh, PullAnswer::RejectedAuth) => StandingEffect::ResolveCooled,
         (PresentationLane::ResumeClaiming | PresentationLane::Probe, PullAnswer::RejectedAuth) => {
             StandingEffect::Keep
         }
@@ -1443,7 +1534,15 @@ impl PassConversion {
         match disposition {
             DescriptorDisposition::Minted => {}
             DescriptorDisposition::RefusedBadId => self.refused_pre_pull += 1,
-            DescriptorDisposition::SkippedLiveEntry => self.skipped_live += 1,
+            // Both skip lanes are standing-pacing skips ("a prior
+            // answer already paces this job"): the surviving
+            // credential (one nonce per job lifecycle) and the
+            // live061-R3 re-mint cooldown fold into ONE count — the
+            // ListedNoAction `skipped` field's membership widened
+            // with the alphabet, shape unchanged.
+            DescriptorDisposition::SkippedLiveEntry | DescriptorDisposition::SkippedCooldown => {
+                self.skipped_live += 1
+            }
         }
     }
 }
@@ -1462,6 +1561,12 @@ enum DescriptorDisposition {
     /// (merged_bug_096; the gate-precluded at-cap refusal arm folds
     /// here too — production slots sit far below the cap).
     SkippedLiveEntry,
+    /// Skipped: the job's last answer was an entry-resolving
+    /// non-delivery (Gone / disproving / fresh-auth) within the
+    /// re-mint cooldown (live061-R3). Folds into the same
+    /// standing-pacing `skipped` count as the live-entry skip — both
+    /// are "a prior answer already paces this job".
+    SkippedCooldown,
 }
 
 /// merged_bug_005 — the futility classification of ONE fresh-lane
@@ -2077,6 +2182,20 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
                 continue;
             }
         };
+        // live061-R3: an entry-resolving non-delivery answer (Gone /
+        // disproving / fresh-auth) bars re-minting the same job for
+        // the cooldown window — the pacing dual of the live-entry
+        // skip below. Pre-fix a Gone-answering head was re-minted
+        // every pass (the resolved entry left nothing behind while
+        // the listing kept advertising the job), burning the whole
+        // per-pass allowance on rows no claim could convert.
+        if ledger.remint_barred(job_id) {
+            debug!(drv_hash = %descriptor.drv_hash, job_id = %job_id,
+                   "fresh mint skipped: the job's last resolving answer is \
+                    inside the re-mint cooldown");
+            pass.fold_disposition(DescriptorDisposition::SkippedCooldown);
+            continue;
+        }
         // bug_251 (rule-4b): mint the claim nonce and record it in the
         // resume ledger BEFORE the pull rides the wire. If the answer
         // never arrives, the scheduler may still have committed the
@@ -2983,6 +3102,150 @@ mod tests {
                 },
             )),
         }
+    }
+
+    /// live061-R3 — answers BY INTENT: stuck jobs answer `Gone`
+    /// forever; eligible jobs deliver and leave the listing. The
+    /// deterministic K-stuck-head world for the starvation bound.
+    struct StuckHeadTransport {
+        stuck: Vec<rio_proto::types::MaterializationJobDescriptor>,
+        eligible: VecDeque<rio_proto::types::MaterializationJobDescriptor>,
+        deliveries: u32,
+    }
+
+    impl MaterializeTransport for StuckHeadTransport {
+        async fn list_jobs(
+            &mut self,
+            _req: ListMaterializationJobsRequest,
+        ) -> Result<ListMaterializationJobsResponse, tonic::Status> {
+            // The stuck set ALWAYS lists first (the oldest-first head);
+            // undelivered eligible jobs queue behind it.
+            let mut jobs = self.stuck.clone();
+            jobs.extend(self.eligible.iter().cloned());
+            Ok(ListMaterializationJobsResponse { jobs })
+        }
+
+        async fn pull(
+            &mut self,
+            req: PullAssignmentRequest,
+        ) -> Result<PullAssignmentResponse, tonic::Status> {
+            if self.stuck.iter().any(|d| d.drv_hash == req.intent_id) {
+                return Ok(gone());
+            }
+            if let Some(pos) = self
+                .eligible
+                .iter()
+                .position(|d| d.drv_hash == req.intent_id)
+            {
+                let d = self.eligible.remove(pos).expect("position just found");
+                self.deliveries += 1;
+                let exec = format!("exec-{}", self.deliveries);
+                return Ok(deliver_for_job(
+                    &exec,
+                    &format!("/nix/store/{}.drv", d.drv_hash),
+                    Uuid::parse_str(&d.job_id).expect("descriptor job id"),
+                ));
+            }
+            Err(tonic::Status::not_found("unknown intent"))
+        }
+
+        async fn report(&mut self, _req: ReportOutcomeRequest) -> Result<(), tonic::Status> {
+            Ok(())
+        }
+
+        async fn report_progress(
+            &mut self,
+            _req: ReportMaterializationProgressRequest,
+        ) -> Result<(), tonic::Status> {
+            Ok(())
+        }
+    }
+
+    /// **W12-S9E (live061-R3)** — *a bounded stuck set cannot absorb
+    /// the fresh-mint budget*. K=4 rows pinned at the listing head
+    /// answer `Gone` on every claim (the live_061 zombie shape:
+    /// terminal-node rows the pre-c1 listing kept advertising — here
+    /// the transport plays the unfixed scheduler); E=4 eligible rows
+    /// queue behind them. slots=1 ⇒ the per-pass fresh-mint allowance
+    /// is 2 (`slots + STEAL_SPECULATION_ALLOWANCE`).
+    ///
+    /// THE BOUND (stated at [`RESOLVED_ANSWER_REMINT_COOLDOWN`]): the
+    /// stuck set absorbs at most ceil(K/allowance) = 2 passes' worth
+    /// of mints once per cooldown window, so N=6 passes deliver
+    /// exactly (N − ceil(K/allowance)) × slots = 4 eligible claims.
+    ///
+    /// PRE-FIX (red, captured verbatim in the introducing commit): a
+    /// Gone answer resolved the ledger entry and left NOTHING to pace
+    /// the next pass — every pass re-minted stuck[0], stuck[1],
+    /// exhausted the allowance, and never reached an eligible row:
+    /// 0 deliveries of a 6-delivery capacity, the fleet-shape that
+    /// converted ~0.5% of claim attempts for hours (21,337 refusals /
+    /// 78s; 10,876 Gone answers).
+    // r[verify store.materialize.remint-cooldown]
+    #[tokio::test(start_paused = true)]
+    async fn stuck_head_cannot_absorb_the_fresh_mint_budget() {
+        let stuck: Vec<_> = (0..4).map(descriptor).collect();
+        let eligible: VecDeque<_> = (10..14).map(descriptor).collect();
+        let mut t = StuckHeadTransport {
+            stuck,
+            eligible,
+            deliveries: 0,
+        };
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("stuck-head-w");
+
+        let mut delivered: Vec<String> = Vec::new();
+        for pass in 0..6 {
+            let claimed =
+                poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+            for job in claimed {
+                delivered.push(job.drv_hash.clone());
+            }
+            // The futility latch never engages: Gone counts as
+            // conversion evidence (the latch is not this law's
+            // pacing), so every pass lists. Keep the pacing clock
+            // INSIDE the cooldown window across all six passes — the
+            // bound under test is the cooldown's, not expiry's.
+            assert!(
+                !fut.is_withholding(),
+                "pass {pass}: the futility latch must not be the mechanism"
+            );
+        }
+        assert_eq!(
+            delivered.len(),
+            4,
+            "6 passes at slots=1 with a 4-row stuck head must deliver exactly \
+             (6 - ceil(4/2)) x 1 = 4 eligible claims — 0 is the live_061 \
+             starvation (the stuck head absorbed every pass's allowance); \
+             delivered={delivered:?}"
+        );
+        assert_eq!(
+            delivered,
+            vec![
+                "drv-claim-10",
+                "drv-claim-11",
+                "drv-claim-12",
+                "drv-claim-13"
+            ],
+            "eligible rows convert in listing order once the stuck head is cooled"
+        );
+
+        // Liveness: past the cooldown the stuck rows are re-mintable —
+        // a job STILL listed then is the scheduler re-advertising it,
+        // and exactly one pass's allowance re-probes it.
+        tokio::time::advance(RESOLVED_ANSWER_REMINT_COOLDOWN + Duration::from_secs(1)).await;
+        let before = t.deliveries;
+        let _ = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert_eq!(t.deliveries, before, "no eligible rows remain");
+        assert!(
+            ledger.remint_cooldowns.len() <= 4,
+            "the cooldown map re-stamps the re-probed stuck rows and prunes \
+             expired entries (bounded by the mint rate x window): {}",
+            ledger.remint_cooldowns.len()
+        );
     }
 
     /// (a) The happy path: 2 listed jobs, both claims deliver → 2
@@ -3920,10 +4183,13 @@ mod tests {
                     (L::ResumeClaiming, E::Resolve),
                     (L::Probe, E::Recharge),
                 ],
+                // Gone: authoritative settle WITHOUT delivery — the
+                // entry resolves AND the job enters the re-mint
+                // cooldown (live061-R3).
                 1 => [
-                    (L::Fresh, E::Resolve),
-                    (L::ResumeClaiming, E::Resolve),
-                    (L::Probe, E::Resolve),
+                    (L::Fresh, E::ResolveCooled),
+                    (L::ResumeClaiming, E::ResolveCooled),
+                    (L::Probe, E::ResolveCooled),
                 ],
                 2 => [
                     (L::Fresh, E::Refund),
@@ -3940,13 +4206,18 @@ mod tests {
                     (L::ResumeClaiming, E::Recharge),
                     (L::Probe, E::Keep),
                 ],
+                // Disproving: nothing can be pending behind the shape,
+                // and re-presenting it next pass re-fails — cooled.
                 5 => [
-                    (L::Fresh, E::Resolve),
-                    (L::ResumeClaiming, E::Resolve),
-                    (L::Probe, E::Resolve),
+                    (L::Fresh, E::ResolveCooled),
+                    (L::ResumeClaiming, E::ResolveCooled),
+                    (L::Probe, E::ResolveCooled),
                 ],
+                // Fresh auth rejection: pre-mint gates — this pull was
+                // the only possible mint; rotation skew re-fails until
+                // it completes — cooled (live061-R3).
                 6 => [
-                    (L::Fresh, E::Resolve),
+                    (L::Fresh, E::ResolveCooled),
                     (L::ResumeClaiming, E::Keep),
                     (L::Probe, E::Keep),
                 ],
@@ -5047,8 +5318,17 @@ mod tests {
     /// existing FS-4 battery staying green).
     #[tokio::test]
     async fn futile_conversion_streak_backs_off_listing() {
+        // live061-R3 interaction: a single futile row would now be
+        // paced by the re-mint cooldown after its FIRST disproving
+        // answer (no second mint to feed the streak) — the latch's
+        // target class is an ongoing SUPPLY of doomed work, so each
+        // pass lists a fresh futile row.
         let mut t = MockTransport::new(
-            vec![Ok(listing(vec![descriptor(7)]))],
+            vec![
+                Ok(listing(vec![descriptor(7)])),
+                Ok(listing(vec![descriptor(8)])),
+                Ok(listing(vec![descriptor(9)])),
+            ],
             vec![Err(tonic::Status::invalid_argument(
                 "request shape can never mint",
             ))],
@@ -6098,7 +6378,11 @@ mod tests {
     /// rejection) arm the withhold and open the episode.
     ///
     /// Scripted pulls consumed per pass: seed = [NYR(d0)]; each
-    /// futile pass = [NYR(d0 resume), InvalidArgument(mint)].
+    /// futile pass = [NYR(d0 resume), InvalidArgument(mint)]. The
+    /// caller's listings supply a FRESH futile descriptor per pass
+    /// (live061-R3: the re-mint cooldown bars repeating a disproven
+    /// row, so the streak rides an ongoing doomed-supply — exactly
+    /// the class the latch exists for).
     async fn engage_futility_with_credential(
         t: &mut MockTransport,
         ledger: &mut ResumeLedger,
@@ -6139,12 +6423,17 @@ mod tests {
     async fn gated_resume_delivery_resets_the_futility_withhold() {
         let d0 = descriptor(10);
         let d1 = descriptor(11);
+        let d2 = descriptor(12);
+        let d3 = descriptor(13);
         let mut t = MockTransport::new(
             vec![
                 Ok(listing(vec![d0.clone()])),
+                // Fresh futile supply per pass (live061-R3: a repeated
+                // row would be cooldown-skipped after its first
+                // disproving answer).
                 Ok(listing(vec![d1.clone()])),
-                Ok(listing(vec![d1.clone()])),
-                Ok(listing(vec![d1.clone()])),
+                Ok(listing(vec![d2.clone()])),
+                Ok(listing(vec![d3.clone()])),
             ],
             vec![
                 Ok(not_yet_ready()),
@@ -6198,9 +6487,20 @@ mod tests {
     /// proposition is the transition).
     #[tokio::test(start_paused = true)]
     async fn second_futility_episode_warns_after_deliveryless_recovery() {
-        let d1 = descriptor(21);
+        // Fresh futile supply for every minting pass (live061-R3: the
+        // cooldown bars re-minting a disproven/Gone'd row, so the
+        // latch's streak is fed by NEW doomed rows — its target
+        // class).
         let mut t = MockTransport::new(
-            vec![Ok(listing(vec![d1.clone()]))],
+            vec![
+                Ok(listing(vec![descriptor(21)])),
+                Ok(listing(vec![descriptor(22)])),
+                Ok(listing(vec![descriptor(23)])),
+                Ok(listing(vec![descriptor(24)])),
+                Ok(listing(vec![descriptor(25)])),
+                Ok(listing(vec![descriptor(26)])),
+                Ok(listing(vec![descriptor(27)])),
+            ],
             vec![
                 Err(tonic::Status::invalid_argument("shape can never mint")),
                 Err(tonic::Status::invalid_argument("shape can never mint")),
@@ -6268,8 +6568,16 @@ mod tests {
     async fn withhold_countdown_advances_on_gated_passes() {
         let d0 = descriptor(30);
         let d1 = descriptor(31);
+        let d2 = descriptor(32);
+        let d3 = descriptor(33);
         let mut t = MockTransport::new(
-            vec![Ok(listing(vec![d0.clone()])), Ok(listing(vec![d1.clone()]))],
+            // Fresh futile supply per engagement pass (live061-R3).
+            vec![
+                Ok(listing(vec![d0.clone()])),
+                Ok(listing(vec![d1.clone()])),
+                Ok(listing(vec![d2.clone()])),
+                Ok(listing(vec![d3.clone()])),
+            ],
             vec![
                 Ok(not_yet_ready()),
                 Ok(not_yet_ready()),
@@ -6337,12 +6645,15 @@ mod tests {
     async fn probe_deliver_does_not_reset_the_futility_withhold() {
         let d0 = descriptor(70);
         let d1 = descriptor(71);
+        let d2 = descriptor(72);
+        let d3 = descriptor(73);
         let mut t = MockTransport::new(
             vec![
                 Ok(listing(vec![d0.clone()])),
+                // Fresh futile supply per pass (live061-R3).
                 Ok(listing(vec![d1.clone()])),
-                Ok(listing(vec![d1.clone()])),
-                Ok(listing(vec![d1.clone()])),
+                Ok(listing(vec![d2.clone()])),
+                Ok(listing(vec![d3.clone()])),
             ],
             vec![
                 Ok(not_yet_ready()),

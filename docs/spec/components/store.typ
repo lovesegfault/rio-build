@@ -1786,6 +1786,33 @@ every other shape (zero-action listing, empty, gated-wedged,
 list-failed) paces at the beat. Withhold reasons are typed
 (`WedgeKind`), never a boolean that shadows delivery.
 
+#r("store.materialize.remint-cooldown")[
+  Every answered claim outcome MUST pace the job's next fresh
+  presentation: an answer that leaves a surviving credential
+  (NotYetReady) paces through the one-nonce-per-job-lifecycle mint
+  gate, and an answer that RESOLVES the ledger entry without a
+  delivery (Gone, a mint-disproving rejection, a fresh-lane auth
+  rejection) MUST bar fresh re-mints of the same job for a typed
+  cooldown window --- so a bounded stuck set of K listed rows absorbs
+  at most ceil(K / mint allowance) passes' worth of fresh mints once
+  per cooldown window, never the whole pass budget.
+]
+live_061's starvation mechanics (2026-06-12): the pacing law above
+was HALF-built --- NotYetReady's surviving credential made contested
+rows self-pacing (the next pass skips them at the mint gate and the
+resume lane carries them through the structural queue), but Gone
+resolved the entry and left NOTHING behind, so a still-listed
+Gone-answering row (a zombie the scheduler kept advertising) was
+re-minted every pass. At production slots=1 the per-pass allowance is
+2: a 2-row stuck prefix absorbed 100% of every pass's mints, and the
+fleet converted ~0.5% of claim attempts for hours. The asymmetry ---
+not the refusal volume --- was the defect; the cooldown is its
+symmetric completion. Delivered claims never enter the cooldown (a
+delivery removes the job from the listing server-side), and a job
+re-listed past the cooldown re-mints on the first pass after expiry
+(a NEW job row under the same derivation carries a new job_id and is
+never barred --- the cooldown keys on job_id).
+
 = Two-Phase Garbage Collection
 
 #r("store.gc.two-phase+2")[

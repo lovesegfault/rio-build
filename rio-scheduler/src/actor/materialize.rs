@@ -1899,8 +1899,10 @@ impl DagActor {
             // view must never answer `None` — a build pull would fall
             // into the kernel's None→DeliverNew cell and race a job we
             // cannot see, and a materialization claim would get `Gone`
-            // (the store treats Gone as resolved and never claims
-            // again — the stranded-armed-action class).
+            // (the store treats Gone as authoritative: it resolves the
+            // claim credential and bars re-mints for its remint
+            // cooldown — a degraded-term Gone strands the armed
+            // action for at least that window, per pass, fleet-wide).
             // `Pending { parked: true }` maps EVERY kind to
             // NotYetReady while keeping the kernel's token/fence
             // rejections dominant (check order is load-bearing).
@@ -2069,9 +2071,11 @@ impl DagActor {
     /// recovery. Without this, a failed-over leader's empty view
     /// answers `JobView::None` to every materialization claim → the
     /// kernel's kinded table answers `Gone` → the store executor
-    /// (which treats Gone as "job resolved, skip") never claims again
-    /// and the armed action is stranded until a dispatch-probe tick
-    /// happens to lazily re-feed the view (the F10/L1 class).
+    /// (which treats Gone as authoritative — the credential resolves
+    /// and the job enters the remint cooldown) re-claims at the
+    /// earliest one cooldown later, and the armed action is stranded
+    /// until a dispatch-probe tick happens to lazily re-feed the view
+    /// (the F10/L1 class).
     ///
     /// The rebuild mirrors ALL unresolved state: claim holders (so the
     /// open attempt re-delivers to its holder and refuses everyone
