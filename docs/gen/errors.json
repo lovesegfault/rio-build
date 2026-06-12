@@ -610,6 +610,62 @@
       "doc": ""
     },
     {
+      "enum": "IngestError",
+      "name": "ReadDir",
+      "crate": "rio-evalstore",
+      "msg": "failed to read directory {path:?}",
+      "doc": "`readdir` of a directory failed."
+    },
+    {
+      "enum": "IngestError",
+      "name": "ReadFile",
+      "crate": "rio-evalstore",
+      "msg": "failed to read file {path:?}",
+      "doc": "`open`/`read` of a regular file failed."
+    },
+    {
+      "enum": "IngestError",
+      "name": "ReadLink",
+      "crate": "rio-evalstore",
+      "msg": "failed to read symlink target of {path:?}",
+      "doc": "`readlink` of a symlink failed."
+    },
+    {
+      "enum": "IngestError",
+      "name": "SizeChanged",
+      "crate": "rio-evalstore",
+      "msg": "file {path:?} changed size during ingest: stat said {expected}, read {actual} bytes",
+      "doc": "A file's content length changed between the discovery `lstat` and the read. The NAR length prefix is written from the stat size, so a mutating source tree would corrupt the archive — fail loud instead (same stance as rio-nix's dump truncation check)."
+    },
+    {
+      "enum": "IngestError",
+      "name": "Stat",
+      "crate": "rio-evalstore",
+      "msg": "failed to stat {path:?}",
+      "doc": "`lstat` of a tree entry failed."
+    },
+    {
+      "enum": "IngestError",
+      "name": "TooDeep",
+      "crate": "rio-evalstore",
+      "msg": "{path:?}: directory nesting depth {depth} exceeds {max}",
+      "doc": "Directory nesting exceeds [`rio_nix::nar::MAX_NAR_DEPTH`] — the same producer-side bound as rio-nix's dump (a NAR every consumer rejects must not be emitted), and what keeps the spine's recursion stack bounded."
+    },
+    {
+      "enum": "IngestError",
+      "name": "TooManyEntries",
+      "crate": "rio-evalstore",
+      "msg": "{path:?} has {count} entries, exceeding the maximum of {max}",
+      "doc": "A directory has at least [`rio_nix::nar::MAX_DIRECTORY_ENTRIES`] entries — the same producer-side bound as rio-nix's dump (a NAR every consumer rejects must not be emitted)."
+    },
+    {
+      "enum": "IngestError",
+      "name": "UnsupportedFileType",
+      "crate": "rio-evalstore",
+      "msg": "{path:?} has an unsupported file type (not regular/directory/symlink)",
+      "doc": "Entry is not a regular file, directory, or symlink (FIFO, socket, device node). NAR cannot represent it; matches nix `dumpPath`."
+    },
+    {
       "enum": "GatewayError",
       "name": "ClientReported",
       "crate": "rio-gateway",
@@ -1861,6 +1917,11 @@
       "name": "EvalStoreError",
       "crate": "rio-evalstore",
       "doc": ""
+    },
+    {
+      "name": "IngestError",
+      "crate": "rio-evalstore",
+      "doc": "Ingest failures. Every variant names the path that failed; the first failure aborts the whole ingest (all threads join, partial results are discarded)."
     },
     {
       "name": "GatewayError",

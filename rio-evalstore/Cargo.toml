@@ -16,9 +16,11 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 blake3 = { workspace = true }
 bytes = { workspace = true }
+fastcdc = { workspace = true }
 hex = { workspace = true }
 libc = { workspace = true }
 prost = { workspace = true }
+rio-common = { workspace = true }
 rio-nix = { workspace = true }
 rio-packstore = { workspace = true }
 rio-proto = { workspace = true }

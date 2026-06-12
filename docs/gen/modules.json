@@ -693,6 +693,16 @@
       "doc": "`extern \"C\"` surface for the C++ shim (`shim/shim.cc`)."
     },
     {
+      "path": "ingest/",
+      "depth": 0,
+      "doc": "Parallel source-tree ingest: one read per file, two hash planes."
+    },
+    {
+      "path": "ingest/pipeline.rs",
+      "depth": 1,
+      "doc": "Pipeline internals: shared work deque, byte-budget semaphore, reader"
+    },
+    {
       "path": "lib.rs",
       "depth": 0,
       "doc": "Client-side eval store: a persistent content-addressed cache (CAS) that"
