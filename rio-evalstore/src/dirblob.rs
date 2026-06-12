@@ -24,6 +24,7 @@ use std::collections::HashSet;
 
 use bytes::Bytes;
 use prost::Message;
+use rio_nix::nar::MAX_NAR_DEPTH;
 use rio_packstore::Digest;
 use rio_proto::castore::{Directory, DirectoryEntry, FileEntry, SymlinkEntry};
 use rio_proto::castore_util::{self, DirectoryError};
@@ -88,6 +89,13 @@ pub enum DirBlobError {
     /// must never be encoded, digested, or persisted.
     #[error("invalid directory body: {0}")]
     Invalid(#[from] DirectoryError),
+    /// Nesting deeper than the NAR reader's [`MAX_NAR_DEPTH`]. The same
+    /// bound for the same reason: a deeper tree can never be regenerated
+    /// as a NAR the reader accepts, so committing it would create an
+    /// unservable path. It also keeps the fold recursion bounded —
+    /// stack depth is capped regardless of caller-supplied input.
+    #[error("directory nesting depth {0} exceeds maximum {MAX_NAR_DEPTH}")]
+    TooDeep(usize),
 }
 
 impl BuiltDir {
@@ -112,7 +120,7 @@ impl BuiltDir {
     pub fn fold(&self) -> Result<FoldedTree, DirBlobError> {
         let mut blobs = Vec::new();
         let mut seen = HashSet::new();
-        let (root_digest, _size) = fold_dir(self, &mut blobs, &mut seen)?;
+        let (root_digest, _size) = fold_dir(self, 0, &mut blobs, &mut seen)?;
         Ok(FoldedTree { root_digest, blobs })
     }
 }
@@ -120,11 +128,19 @@ impl BuiltDir {
 /// Returns the directory's digest and its proto `size` (immediate
 /// children plus the sum of every child directory's `size` — the
 /// recursive descendant count `DirectoryEntry.size` carries).
+///
+/// `depth` mirrors the NAR reader's accounting exactly (root at 0,
+/// reject `> MAX_NAR_DEPTH`) so the fold accepts precisely the trees
+/// the reader can re-parse.
 fn fold_dir(
     dir: &BuiltDir,
+    depth: usize,
     blobs: &mut Vec<(Digest, Bytes)>,
     seen: &mut HashSet<Digest>,
 ) -> Result<(Digest, u64), DirBlobError> {
+    if depth > MAX_NAR_DEPTH {
+        return Err(DirBlobError::TooDeep(depth));
+    }
     let mut directories = Vec::new();
     let mut files = Vec::new();
     let mut symlinks = Vec::new();
@@ -133,7 +149,7 @@ fn fold_dir(
     for (name, entry) in &dir.entries {
         match entry {
             BuiltEntry::Dir(child) => {
-                let (digest, size) = fold_dir(child, blobs, seen)?;
+                let (digest, size) = fold_dir(child, depth + 1, blobs, seen)?;
                 descendants += size;
                 directories.push(DirectoryEntry {
                     name: name.clone(),
@@ -277,6 +293,53 @@ mod tests {
         // leaf (shared) + root, not leaf + leaf + root.
         assert_eq!(folded.blobs.len(), 2);
         assert_eq!(folded.digests().len(), 2);
+    }
+
+    /// `DirectoryEntry.size` parity with rio-store: the exact tree of
+    /// `rio_store::castore::tests::directory_size_recursive`
+    /// (root/a/b/c — three nested dirs, one file at the bottom). That
+    /// test pins size(b) = 1 and size(a) = 2: the recursive descendant
+    /// count, not blob bytes and not a self-inclusive count. A
+    /// divergence here digests identically (size lives in the PARENT's
+    /// encoded entry) but fails the store's reachability walk on
+    /// upload.
+    #[test]
+    fn directory_entry_size_matches_rio_store() {
+        let mut b = BuiltDir::new();
+        b.push(&b"c"[..], file(1, 1, false));
+        let mut a = BuiltDir::new();
+        a.push(&b"b"[..], BuiltEntry::Dir(b));
+        let mut root = BuiltDir::new();
+        root.push(&b"a"[..], BuiltEntry::Dir(a));
+
+        let folded = root.fold().unwrap();
+        // Bottom-up emission: blobs = [b, a, root].
+        let a_body = Directory::decode(folded.blobs[1].1.as_ref()).unwrap();
+        assert_eq!(a_body.directories[0].size, 1, "size(b)");
+        let root_body = Directory::decode(folded.blobs[2].1.as_ref()).unwrap();
+        assert_eq!(root_body.directories[0].size, 2, "size(a)");
+    }
+
+    /// The fold accepts exactly the nesting the NAR reader accepts
+    /// (root at depth 0, reject > MAX_NAR_DEPTH) and therefore cannot
+    /// recurse deeper than that bound on any input.
+    #[test]
+    fn fold_depth_limit_matches_nar_reader() {
+        fn chain(depth: usize) -> BuiltDir {
+            let mut cur = BuiltDir::new();
+            cur.push(&b"f"[..], file(1, 1, false));
+            for _ in 0..depth {
+                let mut parent = BuiltDir::new();
+                parent.push(&b"d"[..], BuiltEntry::Dir(cur));
+                cur = parent;
+            }
+            cur
+        }
+        assert!(chain(MAX_NAR_DEPTH).fold().is_ok());
+        assert!(matches!(
+            chain(MAX_NAR_DEPTH + 1).fold(),
+            Err(DirBlobError::TooDeep(_))
+        ));
     }
 
     #[test]
