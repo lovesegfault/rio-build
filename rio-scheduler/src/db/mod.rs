@@ -23,6 +23,7 @@ mod batch;
 mod builds;
 mod closure;
 mod derivations;
+mod drv_blobs;
 mod history;
 mod live_pins;
 mod recovery;

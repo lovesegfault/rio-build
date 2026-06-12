@@ -764,6 +764,40 @@ as infra-failed if the path never materializes.
 
 = Multi-Build DAG Merging
 
+== Digest-Bearing Submissions (ADR-024 P2a)
+
+#r("sched.submit.digest-edges")[
+  When every node of a `SubmitBuild` submission carries `drv_digest`
+  (`blake3` of the canonical proto drv bytes), dependency edges MUST be
+  derived from each node's `input_drv_digests` and the request's `edges`
+  list MUST be ignored. A mixed submission --- some nodes with `drv_digest`,
+  some without (including a digest-less node that carries
+  `input_drv_digests`) --- MUST be rejected with `INVALID_ARGUMENT`; there
+  are no silent half-modes. A submission with no digest fields at all keeps
+  the legacy `edges` semantics unchanged.
+]
+
+Rationale: edges are ignored in digest mode, so a node admitted without
+digest references would silently lose all its dependency edges and dispatch
+concurrently with its inputs --- the C13 silent mis-build window, not a
+reject. Input digests resolve against the submission's own nodes first;
+a digest that instead resolves in the store's `drv_blobs` yields an edge to
+the stored `drv_path`, which the merge keeps when that derivation is part of
+a live build and drops (warn-skip) when it is not.
+
+#r("sched.submit.digest-verify")[
+  Before a digest-bearing submission is accepted, the scheduler MUST verify
+  that every referenced digest --- each node's own `drv_digest` and every
+  `input_drv_digests` entry not matched in-submission --- exists in the
+  store's `drv_blobs`, tenant-scoped exactly like `HasDrvs`. The reject MUST
+  list ALL missing digests (`FAILED_PRECONDITION`), not first-fail, so the
+  client's stale-ack recovery can re-`Has` exactly that list, re-upload, and
+  resubmit. A node whose own digest resolves to a different stored
+  `drv_path` than the skeleton claims MUST be rejected. If verification
+  cannot be performed (database unavailable), the submission MUST be
+  rejected --- never accepted unverified.
+]
+
 #r("sched.merge.dedup")[
   The scheduler maintains a single global DAG across all concurrent build
   requests. When a new derivation DAG arrives from the gateway, it is merged

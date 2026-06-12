@@ -11,6 +11,7 @@
 //! changes no longer conflict with heartbeat/stream-dispatch changes.
 
 pub(crate) mod actor_guards;
+mod digest_submit;
 mod executor_service;
 mod scheduler_service;
 
