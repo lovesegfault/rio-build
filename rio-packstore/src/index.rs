@@ -20,6 +20,7 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::{Digest, Error, Kind, Result};
 
@@ -30,10 +31,12 @@ const INDEX_VERSION: u32 = 1;
 
 /// Where one blob's payload lives. `offset`/`len` address the payload
 /// bytes directly (header excluded), so a read is one pread + one
-/// digest check.
+/// digest check. `pack` is `Arc<str>` because one pack name is shared
+/// by thousands of 140B-record locations — cloning a `BlobLoc` (per
+/// put, per get, per index load) must not allocate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BlobLoc {
-    pub pack: String,
+    pub pack: Arc<str>,
     pub offset: u64,
     pub len: u32,
     pub kind: Kind,
@@ -112,10 +115,10 @@ fn parse(data: &[u8]) -> Option<IndexView> {
 
     let mut cur = Cur { d: body };
     let npacks = cur.u32()? as usize;
-    let mut packs = Vec::with_capacity(npacks);
+    let mut packs: Vec<Arc<str>> = Vec::with_capacity(npacks);
     for _ in 0..npacks {
         let len = cur.u16()? as usize;
-        packs.push(std::str::from_utf8(cur.take(len)?).ok()?.to_string());
+        packs.push(Arc::from(std::str::from_utf8(cur.take(len)?).ok()?));
     }
     let nblobs = cur.u64()?;
     let mut blobs = HashMap::with_capacity(usize::try_from(nblobs).ok()?);
@@ -161,7 +164,7 @@ fn parse(data: &[u8]) -> Option<IndexView> {
 
 fn serialize(view: &IndexView) -> Result<Vec<u8>> {
     // Sorted iteration: byte-stable output for identical views.
-    let mut pack_names: Vec<&str> = view.blobs.values().map(|l| l.pack.as_str()).collect();
+    let mut pack_names: Vec<&str> = view.blobs.values().map(|l| &*l.pack).collect();
     pack_names.sort_unstable();
     pack_names.dedup();
     let pack_idx: HashMap<&str, u32> = pack_names
@@ -187,7 +190,7 @@ fn serialize(view: &IndexView) -> Result<Vec<u8>> {
     for (digest, loc) in blobs {
         body.extend_from_slice(&digest.0);
         body.push(loc.kind.0);
-        body.extend_from_slice(&pack_idx[loc.pack.as_str()].to_le_bytes());
+        body.extend_from_slice(&pack_idx[&*loc.pack].to_le_bytes());
         body.extend_from_slice(&loc.offset.to_le_bytes());
         body.extend_from_slice(&loc.len.to_le_bytes());
     }

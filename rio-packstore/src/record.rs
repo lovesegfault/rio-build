@@ -17,18 +17,27 @@ pub(crate) const MAGIC: [u8; 4] = *b"RPK1";
 // (the digest is over uncompressed bytes, so an unknown encoding
 // cannot be verified — dropping the record is the safe answer).
 
-/// Encode one record. The digest must be `blake3(payload)` — callers
-/// compute it anyway for the index, so we don't rehash here.
-pub(crate) fn encode(kind: Kind, payload: &[u8], digest: &Digest) -> Result<Vec<u8>> {
+/// Encode one record into `buf` (cleared first). The digest must be
+/// `blake3(payload)` — callers compute it anyway for the index, so we
+/// don't rehash here. Takes a caller-owned buffer so the put hot path
+/// reuses one allocation across records (140B mean payloads — a fresh
+/// Vec per record is measurable churn).
+pub(crate) fn encode_into(
+    buf: &mut Vec<u8>,
+    kind: Kind,
+    payload: &[u8],
+    digest: &Digest,
+) -> Result<()> {
     let len = u32::try_from(payload.len()).map_err(|_| Error::TooLarge(payload.len() as u64))?;
-    let mut buf = Vec::with_capacity(RECORD_HEADER_LEN + payload.len());
+    buf.clear();
+    buf.reserve(RECORD_HEADER_LEN + payload.len());
     buf.extend_from_slice(&MAGIC);
     buf.push(kind.0);
     buf.push(0); // flags: no compression yet, see TODO above
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(&digest.0);
     buf.extend_from_slice(payload);
-    Ok(buf)
+    Ok(())
 }
 
 /// One verified record found by [`scan`]. Offsets are relative to the
@@ -124,7 +133,9 @@ mod tests {
     use super::*;
 
     fn rec(kind: u8, payload: &[u8]) -> Vec<u8> {
-        encode(Kind(kind), payload, &Digest::of(payload)).unwrap()
+        let mut buf = Vec::new();
+        encode_into(&mut buf, Kind(kind), payload, &Digest::of(payload)).unwrap();
+        buf
     }
 
     #[test]
