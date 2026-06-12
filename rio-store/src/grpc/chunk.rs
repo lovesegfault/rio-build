@@ -10,13 +10,16 @@
 //! reads and streams chunks back in completion order).
 //!
 //! Every RPC requires an authenticated caller (see
-//! [`ChunkServiceImpl::require_caller_identity`]). The chunk namespace
-//! is global (dedup by design), so the gate is identity-only — no
-//! tenant scoping — but none of it is anonymous: `HasChunks` answers
-//! a presence bit the caller could not compute themselves, and the
-//! retrieval RPCs hand out the bytes for any digest that leaks
-//! (manifests, `StatBlob` chunk lists, logs travel separately from
-//! the content they name).
+//! [`ChunkServiceImpl::require_caller_identity`]). Chunk *storage* is
+//! global (dedup at rest by design) and the retrieval RPCs
+//! (`GetChunk`/`GetChunks`) stay identity-gated but unscoped — knowing
+//! a 32-byte BLAKE3 digest is the read capability, and digests travel
+//! separately from the content they name (manifests, `StatBlob` chunk
+//! lists, logs), so none of it may be anonymous. Chunk *presence*
+//! (`HasChunks`) is tenant-scoped since ADR-024 P2: the probe answers
+//! only for chunks the calling tenant has seen, closing the
+//! cross-tenant build-activity oracle that the previous
+//! global-namespace answer accepted as a trade-off.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,19 +126,18 @@ impl ChunkServiceImpl {
         })
     }
 
-    /// Caller-identity gate for every ChunkService RPC: a JWT (gateway
-    /// path) or a verified HMAC assignment token (builder path). The
-    /// *answer* is deliberately cross-tenant — chunk dedup is global by
-    /// design — but no request may be anonymous. For `HasChunks`,
-    /// presence is one bit the caller could not compute themselves
-    /// ("someone, somewhere, has uploaded content with exactly these
-    /// bytes"), which for a sub-`FASTCDC_MIN_BYTES` file is a
-    /// whole-file content-existence oracle over candidate guesses. For
-    /// `GetChunk`/`GetChunks` the stakes are higher: digests travel
-    /// separately from the bytes they name (chunk manifests, `StatBlob`
-    /// chunk lists, debug logs), so serving retrieval anonymously turns
-    /// any leaked digest into the plaintext — an anonymous cross-tenant
-    /// read oracle (the zot CVE-2024-39897 shape).
+    /// Caller-identity gate for the retrieval RPCs (`GetChunk`/
+    /// `GetChunks`): a JWT (gateway path) or a verified HMAC
+    /// assignment token (builder path). Retrieval stays unscoped —
+    /// chunk dedup at rest is global by design and knowing the digest
+    /// is the read capability — but no request may be anonymous:
+    /// digests travel separately from the bytes they name (chunk
+    /// manifests, `StatBlob` chunk lists, debug logs), so serving
+    /// retrieval anonymously turns any leaked digest into the
+    /// plaintext — an anonymous cross-tenant read oracle (the zot
+    /// CVE-2024-39897 shape). `HasChunks` no longer uses this gate —
+    /// it resolves a full tenant (ADR-024 P2 tenant-scoped presence,
+    /// see `has_chunks`).
     // r[impl store.chunk.has-chunks-authenticated+1]
     fn require_caller_identity<T>(&self, request: &Request<T>) -> Result<(), Status> {
         // The verified identity is discarded: the chunk namespace is
@@ -364,20 +366,34 @@ impl ChunkService for ChunkServiceImpl {
     /// on the same novel chunk both upload; the second S3 PutObject is
     /// an idempotent overwrite of identical content.
     ///
+    /// Tenant-scoped (ADR-024 P2, `r[store.chunk.has-chunks-tenant]`):
+    /// the bit additionally requires a `chunk_tenants` row for the
+    /// calling tenant — written when one of the tenant's manifests
+    /// completes (`insert_chunk_tenants_in_conn`). Presence means
+    /// "this tenant has seen this chunk", never "someone has".
+    /// Storage stays digest-keyed global, so the only cost of a false
+    /// negative is a re-upload that lands as an idempotent overwrite:
+    /// chunks ingested before the junction existed (or adopted via an
+    /// idempotent path skip, or substituted with no tenant context)
+    /// answer absent and re-bind on the tenant's next completed
+    /// upload.
+    ///
     /// No cache requirement: the probe is a pure PG read (an
-    /// inline-only store correctly answers "nothing is durable"). The
-    /// answer is not tenant-scoped — chunk dedup is global by design,
-    /// and that cross-tenant presence disclosure to *authenticated
-    /// builders* is an accepted trade-off — but the caller must prove
-    /// an identity (see `Self::require_caller_identity`).
+    /// inline-only store correctly answers "nothing is durable").
     // r[impl store.chunk.has-chunks-durable]
+    // r[impl store.chunk.has-chunks-tenant]
     #[instrument(skip(self, request), fields(rpc = "HasChunks"))]
     async fn has_chunks(
         &self,
         request: Request<HasChunksRequest>,
     ) -> Result<Response<HasBitmap>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        self.require_caller_identity(&request)?;
+        let tenant = super::directory::resolve_castore_tenant(
+            &request,
+            self.hmac_verifier.as_ref(),
+            "HasChunks requires a tenant: send a JWT or an HMAC \
+             assignment token",
+        )?;
         let raw = request.into_inner().digests;
         // Bound BEFORE the per-digest parse: the per-manifest chunk cap
         // is the natural ceiling on how many digests one upload's probe
@@ -392,14 +408,19 @@ impl ChunkService for ChunkServiceImpl {
         }
 
         // The partial index `chunks_present_idx (blake3_hash) WHERE
-        // durable AND NOT deleted` covers exactly this predicate.
-        // `raw` is byte-identical to `digests` (the parse only checks
-        // lengths), so bind it directly instead of re-allocating.
+        // durable AND NOT deleted` covers the durable predicate; the
+        // `chunk_tenants` PK `(blake3_hash, tenant_id)` covers the
+        // visibility join. `raw` is byte-identical to `digests` (the
+        // parse only checks lengths), so bind it directly instead of
+        // re-allocating.
         let rows: Vec<Vec<u8>> = sqlx::query_scalar(
-            "SELECT blake3_hash FROM chunks \
-             WHERE blake3_hash = ANY($1) AND durable AND NOT deleted",
+            "SELECT c.blake3_hash FROM chunks c \
+               JOIN chunk_tenants ct ON ct.blake3_hash = c.blake3_hash \
+              WHERE c.blake3_hash = ANY($1) AND c.durable AND NOT c.deleted \
+                AND ct.tenant_id = $2",
         )
         .bind(&raw)
+        .bind(tenant)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| {

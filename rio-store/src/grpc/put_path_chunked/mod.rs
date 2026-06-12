@@ -139,7 +139,7 @@ impl StoreServiceImpl {
         let validated = validate_begin(&begin, &claims)?;
         let n_outputs = validated.outputs.len();
 
-        // r[impl store.castore.tenant-scope+2]
+        // r[impl store.castore.tenant-scope+3]
         // r[impl store.put.tenant-junction]
         // Tenant for the `path_tenants` junction writes. The production
         // caller is the builder, which authenticates with the HMAC
@@ -276,7 +276,7 @@ impl StoreServiceImpl {
         // junctions still have to be written — the prior commit may
         // have been another tenant's, and without a `path_tenants` row
         // this caller can neither read the path's castore
-        // (`r[store.castore.tenant-scope+2]`) nor pin it against the
+        // (`r[store.castore.tenant-scope+3]`) nor pin it against the
         // other tenant's GC retention window lapsing.
         if skipped.iter().all(|s| *s) {
             drain_stream("PutPathChunked", &mut stream).await;
@@ -395,7 +395,7 @@ impl StoreServiceImpl {
     /// junction for idempotent-skipped outputs too (the prior commit
     /// may belong to another tenant or predate tenancy). Idempotent; a
     /// `None` tenant writes nothing.
-    // r[impl store.castore.tenant-scope+2]
+    // r[impl store.castore.tenant-scope+3]
     // r[impl store.put.tenant-junction]
     async fn insert_path_tenants_for_all(
         &self,
@@ -658,7 +658,7 @@ impl StoreServiceImpl {
         let mut infos: Vec<Option<ValidatedPathInfo>> = Vec::with_capacity(validated.outputs.len());
         for (i, out) in validated.outputs.iter().enumerate() {
             if skipped[i] {
-                // r[impl store.castore.tenant-scope+2]
+                // r[impl store.castore.tenant-scope+3]
                 // Tolerant variant: a tenant deleted while the build
                 // was in flight skips the junction write (warned + no
                 // row) instead of aborting the other outputs' commit.

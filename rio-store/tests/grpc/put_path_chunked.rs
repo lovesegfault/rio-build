@@ -717,7 +717,7 @@ async fn hmac_token_gates_the_upload() -> TestResult {
     Ok(())
 }
 
-// r[verify store.castore.tenant-scope+2]
+// r[verify store.castore.tenant-scope+3]
 /// The builder authenticates with the HMAC assignment token only (no
 /// gateway JWT), so the `path_tenants` junction MUST be written from
 /// the token's `tenant` claim — both by the commit transaction and by

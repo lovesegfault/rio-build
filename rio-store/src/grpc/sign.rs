@@ -197,7 +197,7 @@ impl StoreServiceImpl {
         // ownership/sig checks as outputs. Exempting them made a
         // cross-tenant `.drv` *valid but unreadable* — the client
         // skipped the upload, then the builder's castore-FUSE read
-        // (strict `path_tenants` join, `r[store.castore.tenant-scope+2]`)
+        // (strict `path_tenants` join, `r[store.castore.tenant-scope+3]`)
         // got NotFound → EIO → infra-retries exhausted. Reporting it
         // invalid instead makes the client re-upload, and the
         // idempotent-skip junction write (`r[store.put.tenant-junction]`)

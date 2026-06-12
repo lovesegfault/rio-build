@@ -378,9 +378,11 @@ pub(crate) async fn complete_manifest_in_conn(
             store_path: info.store_path.to_string(),
         });
     }
-    if inline_blob.is_none() {
-        mark_manifest_chunks_durable(conn, info).await?;
-    }
+    let chunk_hashes = if inline_blob.is_none() {
+        mark_manifest_chunks_durable(conn, info).await?
+    } else {
+        Vec::new()
+    };
     // Eager castore index: nar_index + directories + directory_paths +
     // file_blobs (blob offsets), atomic with the visibility flip — a
     // `'complete'` path always has its index, and GetPath's framing
@@ -400,12 +402,23 @@ pub(crate) async fn complete_manifest_in_conn(
         )
         .await?;
     }
-    // Tenant junction, atomic with the visibility flip
+    // Tenant junctions, atomic with the visibility flip
     // (r[store.put.tenant-junction]): a complete path with a known
     // uploader tenant is always readable-back by that tenant through
-    // the castore surface. Deleted-tenant FK violations are skipped,
-    // not fatal (the savepoint keeps the surrounding tx usable).
-    chunked::insert_path_tenant_skipping_deleted_in_tx(conn, &info.store_path_hash, tenant).await?;
+    // the castore surface, and every chunk of its manifest becomes
+    // tenant-visible to `HasChunks` (`r[store.chunk.has-chunks-tenant]`
+    // — presence is tenant-scoped since ADR-024 P2; this is the single
+    // choke point that records "tenant has seen this chunk" for
+    // PutPath, PutPathBatch, PutPathChunked, and substitution alike).
+    // Deleted-tenant FK violations are skipped, not fatal (the
+    // savepoint keeps the surrounding tx usable).
+    chunked::insert_tenant_junctions_skipping_deleted_in_tx(
+        conn,
+        &info.store_path_hash,
+        &chunk_hashes,
+        tenant,
+    )
+    .await?;
     Ok(())
 }
 
@@ -424,18 +437,23 @@ pub(crate) async fn complete_manifest_in_conn(
 /// them. `AND NOT durable` keeps the UPDATE from re-locking rows a
 /// prior manifest already flipped (a shared chunk is flipped once, by
 /// whichever referencing manifest completes first).
+///
+/// Returns the manifest's deduped, ascending-sorted chunk hashes so
+/// the caller can bind the tenant's `chunk_tenants` visibility rows in
+/// the same transaction (`r[store.chunk.has-chunks-tenant]`) without
+/// re-reading `manifest_data`.
 // r[impl store.chunk.durable-flag]
 async fn mark_manifest_chunks_durable(
     conn: &mut sqlx::PgConnection,
     info: &ValidatedPathInfo,
-) -> Result<()> {
+) -> Result<Vec<Vec<u8>>> {
     let chunk_list: Option<Vec<u8>> =
         sqlx::query_scalar("SELECT chunk_list FROM manifest_data WHERE store_path_hash = $1")
             .bind(&info.store_path_hash)
             .fetch_optional(&mut *conn)
             .await?;
     let Some(chunk_list) = chunk_list else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let manifest = crate::manifest::Manifest::deserialize(&chunk_list).map_err(|e| {
         // The row was written by `upgrade_manifest_to_chunked` from a
@@ -496,7 +514,7 @@ async fn mark_manifest_chunks_durable(
             .execute(&mut *conn)
             .await?;
     }
-    Ok(())
+    Ok(hashes)
 }
 
 #[cfg(test)]

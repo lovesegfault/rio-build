@@ -278,9 +278,13 @@ fn first_occurrence_digests(targets: &[WalkedTarget]) -> Vec<[u8; 32]> {
 /// Best-effort: any error treats the remaining digests as novel — the
 /// store accepts already-durable chunks in `novel` (membership is
 /// trusted, durability is not), so the only cost is re-streamed bytes.
-/// The probe requires a caller identity; in dev mode (empty assignment
-/// token, no JWT) the store rejects it and every chunk streams as
-/// novel, which is exactly the pre-dedup behavior.
+/// Presence is tenant-scoped (ADR-024 P2): the store answers from the
+/// `chunk_tenants` junction rows of the tenant resolved from the
+/// assignment token's `tenant` claim, so "durable" means "this tenant
+/// has seen this chunk", never "someone has". In dev mode (empty
+/// token, no JWT, or a token without a tenant claim) the store rejects
+/// the probe and every chunk streams as novel, which is exactly the
+/// pre-dedup behavior.
 async fn probe_durable_chunks(
     chunk_client: &ChunkServiceClient<Channel>,
     digests: &[[u8; 32]],
