@@ -173,7 +173,7 @@ pub fn refit(
         .collect();
 
     if fit_rows.is_empty() {
-        return probe_only(key, rows.last(), aggregate_disk_p90(rows));
+        return probe_only(key, rows.last(), aggregate_disk_p90(rows, &[]));
     }
 
     let versions: Vec<_> = fit_rows.iter().map(|r| r.version.clone()).collect();
@@ -355,28 +355,17 @@ pub fn refit(
         prov
     });
 
-    let disk: Vec<f64> = fit_rows
-        .iter()
-        .filter_map(|r| r.peak_disk_bytes.map(|b| b as f64))
-        .collect();
-    let disk_w: Vec<f64> = fit_rows
-        .iter()
-        .zip(&w)
-        .filter(|(r, _)| r.peak_disk_bytes.is_some())
-        .map(|(_, &wi)| wi)
-        .collect();
     // r[impl sched.sla.disk-reaches-ephemeral-storage+1]
-    // live_049 L2: disk is a c-INDEPENDENT scalar (sched.sla.disk-
-    // scalar) — its evidence universe is every peaked sample, not the
-    // c-axis subset the duration fit needs. Recency-weighted over the
-    // ring when the c-axis rows carry peaks (unchanged); when they
-    // carry NONE, recover the evidence from the full row set (unit
-    // weights) instead of falling back to the 100 GiB chart prior —
-    // pre-fix, peaked rows without a cpu_limit seat were silently
-    // dropped here and by the probe_only arm's last-row read.
-    let disk_p90 = (!disk.is_empty())
-        .then(|| DiskBytes(weighted_quantile(&disk, &disk_w, 0.9) as u64))
-        .or_else(|| aggregate_disk_p90(rows));
+    // live_049 L2 as repaired by bug_070: disk is a c-INDEPENDENT
+    // scalar (sched.sla.disk-scalar) — its evidence universe is EVERY
+    // peaked sample, never an implicit property of which Vec an arm
+    // collected. The previous emptiness-gated fallback engaged only
+    // when the c-axis subset carried ZERO peaks, so one peaked c-axis
+    // row silently dropped every peaked legacy row (p90 of N+1
+    // collapsed to 1). The one chokepoint now folds BOTH populations
+    // always: ring weights where the row holds a c-axis seat, unit
+    // weights elsewhere.
+    let disk_p90 = aggregate_disk_p90(rows, &w);
 
     let log_residuals: Vec<f64> = if matches!(fit, DurationFit::Probe) {
         Vec::new()
@@ -735,18 +724,45 @@ pub(super) fn reassign_tier(
 /// probe_only arm read ONLY the last row (a serial pname with five
 /// observed peaks whose newest row lacked one fell back to the 100 GiB
 /// chart default forever — the un-fitted population the live ramp
-/// measured at ~189-201 GiB/pod). Unit weights: the full-fit path's
-/// recency weighting needs the ring's ordinal ages, which the
-/// probe-only arm doesn't compute; a uniform p90 over the available
-/// peaks is strictly better evidence than one row or none, and the
-/// full fit takes over (weighted) as soon as c-diversity exists.
-fn aggregate_disk_p90(rows: &[BuildSampleRow]) -> Option<DiskBytes> {
-    let disk: Vec<f64> = rows
-        .iter()
-        .filter_map(|r| r.peak_disk_bytes.map(|b| b as f64))
-        .collect();
-    let w = vec![1.0; disk.len()];
-    (!disk.is_empty()).then(|| DiskBytes(weighted_quantile(&disk, &w, 0.9) as u64))
+/// measured at ~189-201 GiB/pod). bug_070: this fn is now THE
+/// disk-axis chokepoint for every arm (full-fit and probe alike) —
+/// the evidence universe is always the full row set via
+/// [`axis_samples`], so a subset-quantile is unwritable rather than
+/// comment-policed.
+fn aggregate_disk_p90(rows: &[BuildSampleRow], fit_w: &[f64]) -> Option<DiskBytes> {
+    let (vals, ws) = axis_samples(rows, fit_w, |r| r.peak_disk_bytes.map(|b| b as f64));
+    (!vals.is_empty()).then(|| DiskBytes(weighted_quantile(&vals, &ws, 0.9) as u64))
+}
+
+/// Shared population law for the per-axis aggregation chokepoints:
+/// the evidence universe is ALWAYS the full row set — a row holding a
+/// c-axis ring seat (`cpu_limit_cores.is_some()`, in row order) takes
+/// its ring weight from `fit_w`; rows without a seat (legacy
+/// no-cpu_limit history) take unit weight (they carry no ordinal —
+/// the live_049 rationale). `fit_w` empty ⇒ every sample unit-weighted
+/// (the probe arm computes no ring).
+fn axis_samples(
+    rows: &[BuildSampleRow],
+    fit_w: &[f64],
+    value: impl Fn(&BuildSampleRow) -> Option<f64>,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut seat = 0usize;
+    let mut vals = Vec::new();
+    let mut ws = Vec::new();
+    for r in rows {
+        let wgt = if r.cpu_limit_cores.is_some() {
+            let x = fit_w.get(seat).copied().unwrap_or(1.0);
+            seat += 1;
+            x
+        } else {
+            1.0
+        };
+        if let Some(v) = value(r) {
+            vals.push(v);
+            ws.push(wgt);
+        }
+    }
+    (vals, ws)
 }
 
 /// No usable c-axis samples → emit a Probe placeholder so the explore
@@ -1738,6 +1754,39 @@ mod disk_axis_tests {
             completed_at: now_epoch(),
             ..Default::default()
         }
+    }
+
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    /// **W11-BA (bug_070, red-first)** — *the disk quantile's evidence
+    /// universe is every peaked sample regardless of axis mix.* One
+    /// peaked c-axis row (5 GiB, a cache-warm rebuild) + nine peaked
+    /// legacy rows (~200 GiB serial history): pre-fix the
+    /// emptiness-gated fallback saw a NON-empty c-axis peak set and
+    /// silently dropped every legacy peak — p90 of N+1 collapsed to
+    /// p90 of 1 (the 5 GiB estimate shipped; the 1 GiB envelope floor
+    /// passes it; recovery costs the reactive bump ladder). Post-fix
+    /// the one chokepoint folds both populations always.
+    #[test]
+    fn w11_ba_disk_quantile_folds_every_peaked_sample_across_axis_mix() {
+        const GI: i64 = 1 << 30;
+        let mut rows: Vec<BuildSampleRow> = (0..9)
+            .map(|i| disk_row(None, 100.0, Some((200 + i) * GI)))
+            .collect();
+        rows.push(disk_row(Some(4.0), 50.0, Some(5 * GI)));
+        let f = refit(
+            &key(),
+            &rows,
+            None,
+            &[],
+            &super::super::hw::HwTable::default(),
+            None,
+        );
+        let got = f.disk_p90.expect("peaked samples must fit").0;
+        assert!(
+            got >= 190 * (GI as u64),
+            "p90 over ALL 10 peaked samples (~200 GiB), never p90-of-1              (5 GiB): got {} GiB",
+            got / (1 << 30)
+        );
     }
 
     // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
