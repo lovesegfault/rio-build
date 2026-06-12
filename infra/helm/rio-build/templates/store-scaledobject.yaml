@@ -177,7 +177,7 @@ spec:
     # Demand-side scale-down INHIBITOR (live_056-c, the D2 dual law):
     # client-plane retry pressure against the store. EMIT-LAW BIND
     # (merged_bug_038): the trigger consumes
-    # rio_gateway_putpath_retry_events_total — EVERY failure
+    # rio_gateway_putpath_retry_events_total — EVERY failure  quantifier: census(gw.putpath.emit-law — W11-BI pins 1 emit site + 4 streaming terminal arms, zero unsurfaced)
     # observation at the gateway PutPath chokepoint, labeled by typed
     # status class (the rio_common CODE_CLASS_LABELS closed alphabet;
     # label values aborted / unavailable / deadline_exceeded /

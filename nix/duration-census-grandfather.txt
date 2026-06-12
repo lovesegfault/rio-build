@@ -188,6 +188,7 @@ rio-store/src/substitute.rs	CHECK_AVAILABLE_DEFAULT_BUDGET
 rio-store/src/substitute.rs	DEFAULT_SUBSTITUTE_STALL_WINDOW
 rio-store/src/substitute.rs	FLOOR
 rio-store/src/substitute.rs	RACED_PARK_FALLBACK_POLL
+rio-store/src/substitute.rs	SUBSTITUTE_PROBE_429_MAX_PASSES
 rio-store/src/substitute.rs	SUBSTITUTE_PROBE_CACHE_TTL
 rio-store/src/substitute.rs	SUBSTITUTE_SMALL_FETCH_TIMEOUT
 rio-store/src/substitute.rs	SUBSTITUTE_STALE_THRESHOLD

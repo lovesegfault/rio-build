@@ -6,7 +6,6 @@ rio-controller/src/reconcilers/node_informer.rs	const-family	EXPOSURE_SHIP_PASS_
 rio-controller/src/reconcilers/nodeclaim_pool/sketch.rs	on-conflict-do-update	nodeclaim_cell_state
 rio-controller/src/reconcilers/pool/candidate.rs	const-family	RESPAWN_GIVE_UP_DEATHS
 rio-controller/src/reconcilers/pool/candidate.rs	give-up-pred	RESPAWN_GIVE_UP_DEATHS
-rio-controller/src/reconcilers/pool/candidate.rs	retain-latch	L946
 rio-controller/src/reconcilers/pool/jobs.rs	const-family	LOG_BUDGET_BYTES
 rio-gateway/src/handler/build.rs	give-up-pred	MAX_RECONNECT
 rio-gateway/src/handler/build.rs	give-up-pred	ZERO_BACKOFF_STREAK
@@ -36,7 +35,6 @@ rio-scheduler/src/sla/mod.rs	on-conflict-do-nothing	sla_config_epoch
 rio-store/src/gc/collect.rs	on-conflict-do-nothing	shadow_swept
 rio-store/src/gc/drain.rs	const-family	MAX_ATTEMPTS
 rio-store/src/gc/mark_scan_bench.rs	on-conflict-do-nothing	live_chunks
-rio-store/src/gc/mod.rs	on-conflict-do-nothing	pending_s3_deletes
 rio-store/src/grpc/mod.rs	const-family	DEFAULT_NAR_BUDGET
 rio-store/src/grpc/mod.rs	on-conflict-do-update	hw_perf_samples
 rio-store/src/grpc/put_path/common.rs	on-conflict-do-nothing	path_tenants

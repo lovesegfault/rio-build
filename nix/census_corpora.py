@@ -524,8 +524,14 @@ DURATION_IDIOM_CELLS = [
     ("duration-ctor", re.compile(r"\bconst\s+(\w+)\s*:\s*(?:std::time::)?Duration\b")),
     (
         "int-units",
+        # FOLDS/PASSES joined at the wave close: S4 renamed
+        # TOMBSTONE_TTL_TICKS -> _FOLDS (the consumer clock made
+        # nominal) and S7 pinned the withhold interval in _PASSES
+        # with a beat conversion witness — the suffix alphabet
+        # follows the landed R29 denomination convention, never a
+        # frozen needle list.
         re.compile(
-            r"\bconst\s+(\w+_(?:SECS|TICKS|MILLIS))\s*:\s*(?:u64|u32|usize|i64|u16|u8)\b"
+            r"\bconst\s+(\w+_(?:SECS|TICKS|MILLIS|FOLDS|PASSES))\s*:\s*(?:u64|u32|usize|i64|u16|u8)\b"
         ),
     ),
     ("f64-secs", re.compile(r"\bconst\s+(\w+_SECS)\s*:\s*f64\b")),
@@ -560,9 +566,21 @@ DURATION_CENSUS_ROWS = {
         "wall-age against DB epoch stamps (the Epoch family's staleness clamp)",
         "WO-S6-2: the family decode-boundary seal",
     ),
-    ("rio-controller/src/reconcilers/nodeclaim_pool/health.rs", "TOMBSTONE_TTL_TICKS"): (
-        "fold-executions (reconciler ticks, not wall time)",
-        "WO-S4-2: the fold-clock conversion shape",
+    ("rio-controller/src/reconcilers/nodeclaim_pool/health.rs", "TOMBSTONE_TTL_FOLDS"): (
+        "fold-executions (the WO-S4-2 close renamed the unit INTO the consumer clock)",
+        "WO-S4-2: the fold-clock conversion made nominal at the landed rename",
+    ),
+    ("rio-store/src/logs/sessions.rs", "SESSION_MARGIN_SLACK"): (
+        "wall (the session-staleness margin term over PG now() age)",
+        "WO-S1-6 (the H1''' const family): compile-certified STALE >= 2*INTERVAL + RPC_BOUND + SLACK, SLACK > 0",
+    ),
+    ("rio-store/src/config.rs", "SCHEDULER_DEADLINE_CAP_SECS"): (
+        "wall (the retention-floor validation against the scheduler deadline cap)",
+        "WO-S1-7: config validation refuses retention <= the cap margin (merged_bug_071, the R29 boundary clause)",
+    ),
+    ("rio-store/src/materialize/client.rs", "FUTILE_RELIST_INTERVAL_PASSES"): (
+        "beats (paced beats via the conversion witness; pass-denominated const)",
+        "WO-S7-8 (H7'''): the (P-32)*0.8 >= 65 derivation + the W11-BN compile-tier pin — passes to worst-case beat time",
     ),
     ("rio-auth/src/hmac.rs", "MAX_HMAC_LIFETIME_SECS"): (
         "wall (unix-epoch seconds at the signer's own sample)",
@@ -696,7 +714,56 @@ EXIT_EDGE_GRANDFATHER = "nix/exit-edge-grandfather.txt"
 # reachability witness). Seeds land with their slots this wave; the
 # integrator enrolls them at the wave-close re-mint from the H-pack
 # records (H3'''/H5'''/H7''' name the landed shapes).
-EXIT_EDGE_ROWS = {}
+EXIT_EDGE_ROWS = {
+    # The gave-up decay (WO-S7-1, the H7''' record): GaveUpReset
+    # receipt minted only by PoolStreaks::note_demand_epoch; exit
+    # edge = strictly-newer SpawnIntent.resubmit_cycle at the
+    # spawn-fold demand seam (evaluate_spawn_gate;
+    # SpawnGateOutcome.decayed; Event RespawnGiveUpReset); re-latch
+    # at full budget.
+    ("rio-controller/src/reconcilers/pool/candidate.rs", "retain-latch", "L1020"): (
+        "demand-epoch decay: a strictly-newer resubmit_cycle mints GaveUpReset (pod-free — reachable from inside the latch)",
+        "W11-BE red + quint-respawn-giveup single-leaf + the decay-reachable witness + the relatch run (S7 c1)",
+    ),
+    # The outbox reset edge (WO-S5-3, the H5''' record): the
+    # guarded DO UPDATE resets attempts/enqueued_at on re-decision
+    # — the exhausted row exits its absorbing state.
+    ("rio-store/src/gc/mod.rs", "on-conflict-do-update", "pending_s3_deletes"): (
+        "re-decision resets the budget: the guarded ON CONFLICT DO UPDATE rewrites attempts/enqueued_at",
+        "W11-AP incl. the WS-2 latch-face cell (duplicate-enqueue swallow red under unguarded DO UPDATE; S5 c3)",
+    ),
+}
+
+# The R14 typed-construction seeds OUTSIDE the grep grammar (CE-3:
+# population = seed list UNION grep): each anchors to its landed
+# construction symbol — a dead anchor is rot (census red), the
+# REGISTRY derived_from discipline one row down.
+EXIT_EDGE_SEED_CONSTRUCTIONS = {
+    "per-plane-refusal (WO-S7-2)": (
+        "rio-scheduler/src/actor/command.rs",
+        r"PlanesRefused",
+        "per-plane apply: refused planes redeliver independently; idempotency discharged per plane (epoch gate / upsert / wholesale rebuild / age-keyed witnesses)",
+        "W11-BF controller+scheduler reds + the apply-refuse-redeliver-apply x2 state-equality cell (PD-5)",
+    ),
+    "expiring-hold-clearance (WO-S5-1)": (
+        "rio-store/src/gc/lane.rs",
+        r"HoldClearance::authorize_batch",
+        "clearance expiry + per-batch re-authorization: a drain-bound-aged clearance refuses with NO hold transition",
+        "W11-AM incl. the WS-3 expiry face (S5 c1)",
+    ),
+    "poison-terminal (WO-S3-1)": (
+        "rio-scheduler/src/actor/snapshot.rs",
+        r"NoHostPoison",
+        "the dead band reaches the DESIGNED bounded poison terminal instead of looping advisory-forever",
+        "S3 gate-superset contract rows + the poison-terminal face (merged_bug_016, the R30 face)",
+    ),
+    "zero-core-heal (WO-S6-1)": (
+        "rio-scheduler/src/sla/metrics.rs",
+        r"zero_resource",
+        "the zero-resource observation REFUSES at the merge seam (typed reason) instead of jamming keep-first-forever",
+        "S6 merge-law reds + the refusal-counter registration ((lllll) verified, both HELP surfaces)",
+    ),
+}
 
 
 def exit_edge_finder(files):
@@ -769,6 +836,16 @@ def check_exit_edge_census(src_root, mint=False):
             )
         if not reset.strip() or not witness.strip():
             fails.append(f"exit-edge row {rel}:{idiom}:{name}: empty reset event or witness")
+    for seed, (rel, anchor, reset, witness) in sorted(EXIT_EDGE_SEED_CONSTRUCTIONS.items()):
+        sf = src_root / rel
+        stext = sf.read_text() if sf.is_file() else ""
+        if not re.search(anchor, stext):
+            fails.append(
+                f"exit-edge seed `{seed}`: anchor /{anchor}/ does not resolve in "
+                f"{rel} — the typed construction moved or rotted (re-derive the row)"
+            )
+        if not reset.strip() or not witness.strip():
+            fails.append(f"exit-edge seed `{seed}`: empty reset event or witness")
     gf_path = src_root / EXIT_EDGE_GRANDFATHER
     unrowed = sorted(
         f"{r}\t{i}\t{n}" for (r, i, n) in found_keys if (r, i, n) not in EXIT_EDGE_ROWS

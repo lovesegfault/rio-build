@@ -161,7 +161,6 @@ infra/helm/rio-build/templates/prometheusrule.yaml	# r41 bug_026: anchor on `ice
 infra/helm/rio-build/templates/prometheusrule.yaml	# signal whenever ANY cell is mid-boot (see the
 infra/helm/rio-build/templates/scheduler.yaml	# All replicas contend for SAME Lease. Presence ENABLES lease mode
 infra/helm/rio-build/templates/store-scaledobject.yaml	# Code::Aborted ONLY — a code a LIVE store mints — so the trigger
-infra/helm/rio-build/templates/store-scaledobject.yaml	# rio_gateway_putpath_retry_events_total — EVERY failure
 infra/helm/rio-build/templates/store.yaml	# SAME origin list the scheduler renders — the contract is
 infra/helm/rio-build/values.yaml	#      pname samples) gets sla.probe (16c/48GiB default) for
 infra/helm/rio-build/values.yaml	# ("ALL CLASSES spot+on-demand — spot if available, else od")
