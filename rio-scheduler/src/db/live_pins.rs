@@ -982,7 +982,7 @@ mod registration_writer_census {
         );
     }
 
-    // r[verify sched.trust.report-membership+2]
+    // r[verify sched.trust.report-membership+3]
     /// bug_138 commit 2 (W10-N) — the TAINT-TO-CONSUMER census, the
     /// per-consumer half of the membership law (RC-2(iii): a priced
     /// residual must name every downstream sink of the tainted field
@@ -1302,6 +1302,286 @@ mod registration_writer_census {
         );
     }
 
+    // r[verify sched.trust.evidence-scope]
+    // r[verify sched.trust.report-membership+3]
+    /// bug_155 commit 2 (W12-K2's home; the R31 founding instance on
+    /// this crate) -- the CA-evidence READER census, [GEN-SET]: the
+    /// reader set of the CA production-evidence consult is DERIVED
+    /// from the embedded whole-crate universe (CENSUS_SOURCES; the
+    /// jurisdiction is rio-scheduler/src, both-direction pinned to
+    /// the live tree by `census_universe_matches_live_tree`), never
+    /// author-listed. TWO readers exist at this tree, each with its
+    /// MEASURE-COMPATIBILITY WITNESS:
+    ///
+    /// 1. the tenant-keyed `path_tenants` stamp (constructions of the
+    ///    evidenced stamp witness): ASSUMES the evidence bounds
+    ///    cohort-scoped visibility -- ENTAILED: the consult derives
+    ///    the set from the cohort's own `path_tenants` rows, and the
+    ///    empty cohort constructs no stamp at all (the cohort-keyed
+    ///    vacuity argument is valid for THIS reader ONLY); the 1:1
+    ///    consult/construction pairing is pinned by
+    ///    `ca_stamp_lanes_consult_production_evidence`.
+    /// 2. the GLOBAL `realisations` insert (constructions of the
+    ///    typed insert witness): ASSUMES the evidence bounds globally
+    ///    keyed durable truth -- entailed ONLY by the non-optional
+    ///    demand: every consult's set reaches the insert (the
+    ///    construction count equals the consult count), the insert
+    ///    signature carries the typed witness (the pre-fix
+    ///    Option-typed signature is grammar-BANNED below), and the
+    ///    fail-closed belt refuses the bounded-face variant on the
+    ///    floating-CA face. Pre-fix this reader's witness was RED on
+    ///    the untenanted face -- the cohort-keyed `None` arm skipped
+    ///    the law for a globally-keyed consumer (the bug_155 HIGH).
+    ///
+    /// POPULATION face (the census riders): non-vacuity asserted per
+    /// derived set (>= 1 member; the expected members below are the
+    /// generator's verification targets, never the enforcement
+    /// population); the empty-walk planted red drives the SAME walk
+    /// on an empty universe and demands the floor fires.
+    #[test]
+    fn ca_evidence_reader_census() {
+        // The derived sets, walked from the embedded universe.
+        let consults = census(&[".ca_production_", "evidence("]);
+        let stamp_readers = census(&["BuiltLocally", "Evidenced("]);
+        let insert_readers = census(&["CaRealisation", "Evidence::Evidenced("]);
+
+        // POPULATION non-vacuity (rider (a)): every derived set has
+        // members -- a vacuous walk is the round's named R22" defeat
+        // ("absence of hits produces absence of evidence").
+        for (name, set) in [
+            ("consults", &consults),
+            ("stamp-readers", &stamp_readers),
+            ("insert-readers", &insert_readers),
+        ] {
+            assert!(
+                !set.is_empty(),
+                "VACUOUS WALK: the {name} census derived zero members \
+                 from a non-empty universe -- the generator or its \
+                 grammar broke"
+            );
+        }
+
+        // EXPECTED members (verification targets for the generator).
+        let expected_consults: BTreeMap<String, usize> =
+            [("actor/completion.rs".to_string(), 2)].into();
+        assert_census(
+            &consults,
+            &expected_consults,
+            "CA-evidence consults (admitted + late-register)",
+        )
+        .expect("the consult sites are census-pinned");
+
+        // The TOTAL ledger: 2 lane conversions + the chokepoint's own
+        // destructuring arm (the consumer inside the insert). ANY new
+        // occurrence (a third construction, an aliased bind) reds
+        // this ledger until classified.
+        let expected_inserts: BTreeMap<String, usize> =
+            [("actor/completion.rs".to_string(), 3)].into();
+        assert_census(
+            &insert_readers,
+            &expected_inserts,
+            "global-insert reader witness occurrences (2 lane \
+             constructions + the chokepoint destructure)",
+        )
+        .expect("the insert-reader occurrences are census-pinned");
+
+        // READER 2's measure-compatibility witness, structural half:
+        // (i) every consult's evidence reaches the insert -- the lane
+        // CONSTRUCTION count (the `=> CaRealisationEvidence::
+        // Evidenced(` conversion arms) EQUALS the consult count in
+        // the trust-boundary file;
+        let conversions = census(&["=> CaRealisation", "Evidence::Evidenced("]);
+        assert_eq!(
+            consults.get("actor/completion.rs"),
+            conversions.get("actor/completion.rs"),
+            "every CA-evidence consult must feed the global insert's \
+             typed witness (a consult whose set never reaches the \
+             insert re-opens the unguarded face)"
+        );
+        // (ii) the chokepoint family demands the typed witness in its
+        // signatures: the insert itself + the bookkeeping pass-through
+        // that threads it (exactly these two, both in the
+        // trust-boundary file);
+        let typed_sig = census(&["ca_evidence: CaRealisation", "Evidence<'_>"]);
+        assert_eq!(
+            typed_sig.get("actor/completion.rs"),
+            Some(&2),
+            "the realisation insert + its bookkeeping pass-through must \
+             demand the non-optional typed evidence witness"
+        );
+        // (iii) the fail-closed belt exists: the bounded-face variant
+        // refuses inside the insert on the floating-CA face;
+        let belt = census(&["Evidence::ExpectedSetBounded", " => {"]);
+        assert_eq!(
+            belt.get("actor/completion.rs"),
+            Some(&1),
+            "the insert must carry the fail-closed ExpectedSetBounded \
+             refusal arm"
+        );
+        // (iv) the pre-fix grammar is BANNED: the Option-typed
+        // evidence parameter (the shape whose None arm skipped the
+        // law) must not exist anywhere in the crate.
+        let banned = census(&["ca_evidence: Option<&std::collections::", "HashSet"]);
+        assert!(
+            banned.is_empty(),
+            "the Option-typed evidence parameter is the bug_155 shape \
+             -- the insert demands the typed witness; found: {banned:?}"
+        );
+
+        // READER 1's pairing half rides
+        // `ca_stamp_lanes_consult_production_evidence` (cited, not
+        // re-asserted -- one census per proposition).
+        let _ = stamp_readers;
+    }
+
+    /// The EMPTY-WALK planted red (rider (a), driven through the SAME
+    /// walk path as production): the non-vacuity floor must FIRE on
+    /// an empty universe -- a generator that returns green on zero
+    /// scanned sources would certify absence-of-evidence as evidence.
+    #[test]
+    fn ca_reader_census_plants_red_on_empty_walk() {
+        let empty: Vec<(String, String)> = Vec::new();
+        let consults = census_over(&empty, &[".ca_production_", "evidence("]);
+        assert!(
+            consults.is_empty(),
+            "plant premise: the empty walk derives nothing"
+        );
+        // The production floor (the same predicate the live census
+        // asserts) must reject this state.
+        let floor_fires = consults.is_empty();
+        assert!(
+            floor_fires,
+            "the empty-walk plant must be the state the floor refuses"
+        );
+    }
+
+    /// W12-K2 -- the ENROLLMENT face (riders (b)(1)): a NEW evidence
+    /// consumer (a rogue lane constructing the insert witness from an
+    /// unenrolled file) MUST go census-red NAMING the file, through
+    /// the derived walk -- enrollment is structural, not editorial.
+    /// Runtime-assembled so this file's static text never matches the
+    /// needles itself.
+    #[test]
+    fn ca_reader_census_plants_red_on_unenrolled_reader() {
+        let strawman = format!(
+            "async fn rogue_realisation_lane(&self) {{\n\
+             let set: std::collections::HashSet<Vec<u8>> = Default::default();\n\
+             let w = CaRealisation{}(&set);\n\
+             self.ca_insert_realisations(&h, &outs, w).await;\n\
+             }}\n",
+            "Evidence::Evidenced"
+        );
+        let mut universe: Vec<(String, String)> = CENSUS_SOURCES
+            .iter()
+            .map(|(f, t)| (f.to_string(), (*t).to_string()))
+            .collect();
+        universe.push(("actor/strawman_reader.rs".to_string(), strawman));
+
+        let insert_readers = census_over(&universe, &["CaRealisation", "Evidence::Evidenced("]);
+        let expected: BTreeMap<String, usize> = [("actor/completion.rs".to_string(), 2)].into();
+        let err = assert_census(
+            &insert_readers,
+            &expected,
+            "plant: global-insert reader witness constructions",
+        )
+        .expect_err("an unenrolled evidence reader MUST go census-red");
+        assert!(
+            err.contains("strawman_reader.rs"),
+            "the red must NAME the unenrolled reader; got: {err}"
+        );
+    }
+
+    /// The JURISDICTION face (riders (b)(2)): the census population
+    /// derives from the declared jurisdiction (the whole-crate embed,
+    /// both-direction pinned by `census_universe_matches_live_tree`)
+    /// -- (i) a consult planted in a module INSIDE the jurisdiction
+    /// auto-joins the fresh walk (presence asserted; the live census
+    /// then reds on the unexpected row); (ii) a STRAWMAN hand-list
+    /// population (one that silently omits the trust-boundary file)
+    /// goes RED against the expected members -- a hand-list cannot
+    /// certify the jurisdiction (the WO-S8-4 registry-diff mechanism
+    /// holds the cross-population half at the wave close).
+    #[test]
+    fn ca_reader_census_jurisdiction_faces() {
+        // (i) auto-join: a new in-jurisdiction module with a consult.
+        let planted = format!(
+            "async fn new_lane(&self) {{ let _e = self.ca_production_{}(a, b, c, d, e).await; }}",
+            "evidence("
+        );
+        let mut universe: Vec<(String, String)> = CENSUS_SOURCES
+            .iter()
+            .map(|(f, t)| (f.to_string(), (*t).to_string()))
+            .collect();
+        universe.push(("actor/new_lane.rs".to_string(), planted));
+        let consults = census_over(&universe, &[".ca_production_", "evidence("]);
+        assert_eq!(
+            consults.get("actor/new_lane.rs"),
+            Some(&1),
+            "the fresh walk must AUTO-JOIN an in-jurisdiction consult \
+             (population derives from the jurisdiction, not a list)"
+        );
+        let expected: BTreeMap<String, usize> = [("actor/completion.rs".to_string(), 2)].into();
+        assert_census(&consults, &expected, "plant: consults")
+            .expect_err("the auto-joined consult must red the census");
+
+        // (ii) the hand-list strawman: a population that omits the
+        // trust-boundary file misses every expected member -- RED.
+        let hand_list: Vec<(String, String)> = CENSUS_SOURCES
+            .iter()
+            .filter(|(f, _)| *f != "actor/completion.rs")
+            .map(|(f, t)| (f.to_string(), (*t).to_string()))
+            .collect();
+        let crippled = census_over(&hand_list, &[".ca_production_", "evidence("]);
+        assert_census(&crippled, &expected, "plant: hand-list population").expect_err(
+            "a hand-list population omitting the trust-boundary file \
+                 must go RED against the expected members (never silently \
+                 green)",
+        );
+    }
+
+    /// The GRAMMAR-REFUSAL face (riders (b)(3)): an evading idiom --
+    /// an ALIASED/UFCS binding of the consult fn that the dotted-call
+    /// needle cannot see -- must overscan-RED, never silently green.
+    /// The accounting walk counts the BARE fn token per file and pins
+    /// the full ledger: any new occurrence anywhere (alias, wrapper,
+    /// re-export, doc) reds the census until the updater classifies
+    /// it as a dotted call (joins the consult pin) or an accounted
+    /// mention (joins this ledger).
+    #[test]
+    fn ca_reader_census_overscan_refuses_aliased_consults() {
+        let bare = census(&["ca_production_", "evidence"]);
+        let expected_bare: BTreeMap<String, usize> = [
+            ("actor/completion.rs".to_string(), 7usize),
+            ("db/live_pins.rs".to_string(), 2usize),
+        ]
+        .into();
+        assert_census(&bare, &expected_bare, "bare-token accounting ledger")
+            .expect("every occurrence of the consult token is classified");
+
+        // The plant: an aliased binding in a fresh file -- zero dotted
+        // calls, one bare occurrence -- must red the accounting.
+        let alias = format!(
+            "fn alias() {{ let f = DagActor::ca_production_{}; }}",
+            "evidence"
+        );
+        let mut universe: Vec<(String, String)> = CENSUS_SOURCES
+            .iter()
+            .map(|(f, t)| (f.to_string(), (*t).to_string()))
+            .collect();
+        universe.push(("actor/alias_lane.rs".to_string(), alias));
+        let planted_bare = census_over(&universe, &["ca_production_", "evidence"]);
+        let err = assert_census(
+            &planted_bare,
+            &expected_bare,
+            "plant: bare-token accounting",
+        )
+        .expect_err("an aliased consult binding MUST overscan-red");
+        assert!(
+            err.contains("alias_lane.rs"),
+            "the overscan red must NAME the aliasing file; got: {err}"
+        );
+    }
+
     // r[verify sched.trust.report-corroboration+2]
     /// bug_090 commit 6 (W11-X, the R22″ derivation-layer form of
     /// W10-N): the worker→scheduler trust census derives PER-BOUNDARY
@@ -1462,7 +1742,7 @@ mod registration_writer_census {
             ("BuildResult.stop_time", "telemetry; duration derivation only"),
             // concat!-split so the taint census's own needle never
             // matches this table's source text.
-            (concat!("BuildResult.", "built_outputs"), "the W10-N taint object — shape/name/membership/evidence-gated per sched.trust.report-membership+2 (the per-consumer census above)"),
+            (concat!("BuildResult.", "built_outputs"), "the W10-N taint object — shape/name/membership/evidence-gated per sched.trust.report-membership+3 (the per-consumer census above)"),
             ("BuildResult.store_degraded", "constructor-gated to the infra arm (C3); corroboration via the two-node sighting law before the uncharged class"),
             ("BuildResult.failure_classification", "the bug_090 TYPED sizing channel — consumed ONLY through the corroboration gate (bump_floor_on_corroborated_claim: telemetry vs the assigned shape; refusals counted classify-only)"),
             // ── FailureClassification ───────────────────────────

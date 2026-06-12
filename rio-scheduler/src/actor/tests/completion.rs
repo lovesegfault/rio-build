@@ -5842,7 +5842,7 @@ async fn cancel_late_report_resubmit_solves_warm_with_identity() -> TestResult {
 /// non-poisoning letter (`rio_scheduler_unexpected_built_output_total`
 /// + the structured WARN; the report's lawful effects are unaffected
 /// — the drv still completes on the admitted lane).
-// r[verify sched.trust.report-membership+2]
+// r[verify sched.trust.report-membership+3]
 #[tokio::test]
 async fn forged_output_path_never_reaches_path_tenants_on_any_lane() -> TestResult {
     use sha2::Digest;
@@ -6334,6 +6334,7 @@ async fn ca_honest_upload_then_report_stamps_as_today() -> TestResult {
 /// tenant-unscoped: the W11-Q end-to-end precedent's global-read
 /// manifestation.
 // r[verify sched.trust.report-corroboration+2]
+// r[verify sched.trust.evidence-scope]
 #[tokio::test]
 async fn untenanted_floating_ca_report_never_mints_global_realisations() -> TestResult {
     use sha2::Digest;

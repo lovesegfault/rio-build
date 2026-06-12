@@ -126,6 +126,7 @@ pub(super) enum LateReportEffect {
     Nothing,
 }
 
+// r[impl sched.trust.evidence-scope]
 /// bug_155 — the NON-OPTIONAL evidence witness
 /// [`DagActor::ca_insert_realisations`] demands. The `realisations`
 /// table is GLOBALLY keyed (PK `(drv_hash = modular_hash,
@@ -1562,7 +1563,7 @@ impl DagActor {
                 // posture (bytes durable, tenant-invisible until
                 // re-stamp), and "" never matches a parsed store
                 // path, so the placeholder can never be forged.
-                // r[impl sched.trust.report-membership+2]
+                // r[impl sched.trust.report-membership+3]
                 // (De Morgan of NOT(is_ca AND NOT is_fo) — the
                 // non-exempt face.)
                 if !*is_ca || *is_fo {
@@ -1755,7 +1756,7 @@ impl DagActor {
     /// registration evidence the upload leaves behind (no upload, no
     /// stamp; machine-bound by the
     /// `ca_stamp_lanes_consult_production_evidence` census).
-    // r[impl sched.trust.report-membership+2]
+    // r[impl sched.trust.report-membership+3]
     pub(super) fn retain_expected_members(
         executor_id: &str,
         drv_key: &str,
@@ -2274,7 +2275,7 @@ impl DagActor {
         // overwrite runs before any assignment exists). Floating-CA
         // is exempt under EXACTLY the claims-mint predicate — see
         // [`Self::retain_expected_members`].
-        // r[impl sched.trust.report-membership+2]
+        // r[impl sched.trust.report-membership+3]
         // (De Morgan of NOT(is_ca AND NOT is_fixed_output) — the
         // non-exempt face.)
         if !state.ca.is_ca || state.is_fixed_output {

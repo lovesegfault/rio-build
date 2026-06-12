@@ -157,7 +157,7 @@ critical-path value).
   #(refs.metric)("rio_scheduler_undeclared_built_output_total").
 ]
 
-#r("sched.trust.report-membership+2")[
+#r("sched.trust.report-membership+3")[
   A worker-supplied `output_path` MUST enter `path_tenants` (or any other
   registration sink) ONLY if it is bounded by a scheduler-verifiable path-value // quantifier: census(forged_output_path_never_reaches_path_tenants_on_any_lane)
   law for that assignment, on EVERY report lane and EVERY face: the // quantifier: census(ca_no_upload_report_never_flips_visibility_on_any_lane)
@@ -169,7 +169,14 @@ critical-path value).
   checked as the resident one); the floating-CA face (`is_ca` and not
   fixed-output, the claims-mint predicate --- no dispatch-time expected set
   exists) checks store-recorded production evidence per the corroboration rule
-  below. Non-membership MUST be a typed refusal --- counted
+  below, on EVERY cohort INCLUDING the empty one: an untenanted report
+  (NULL-tenant anon/dev build, or a late lane whose tenant rows aged out of
+  the cold resolve) consults with the empty cohort, receives the EMPTY
+  evidence set, and the globally-keyed realisation insert refuses every path
+  --- the untenanted face is part of the law's domain, never an exemption
+  (the cohort-keyed vacuity argument discharges only the tenant-keyed stamp
+  reader; see the evidence-scope rule below). Non-membership MUST be a typed
+  refusal --- counted
   (#(refs.metric)("rio_scheduler_unexpected_built_output_total") on the
   expected-set faces,
   #(refs.metric)("rio_scheduler_unevidenced_ca_output_total") on the CA face),
@@ -240,6 +247,33 @@ model already prices. The honest-path residual (a single-output upload whose
 best-effort ingest stamp was skipped under PG pressure) refuses until a
 lawful re-stamp --- availability-class, store-warn-visible; the batch upload
 lane stamps inside its atomic transaction and has no such window.
+
+#r("sched.trust.evidence-scope")[
+  A consult that guards a consumer MUST derive its evidence requirement from
+  THAT consumer's scope, never from the reporting cohort: a cohort-keyed
+  vacuity argument (an empty cohort "has no boundary to guard") discharges
+  only cohort-keyed readers, and a GLOBALLY-keyed reader demands evidence on
+  every face --- the empty cohort yields the EMPTY evidence set (refuse all),
+  never an absent one (skip the law). The consult's READER SET is
+  machine-derived (a generator walks the crate enumerating every consumer of
+  the evidence), and each reader carries a measure-compatibility witness
+  stating what it assumes of the evidence and why the consult's scope
+  entails it; a reader whose assumption the consult's scope does not entail
+  is census-RED, never prose-priced.
+]
+The founding instance (bug 155, round-12 HIGH): the CA production-evidence
+consult has TWO readers --- the tenant-keyed `path_tenants` stamp (the
+cohort-vacuity argument is valid THERE: empty cohort, no stamp, nothing to
+guard) and the globally-keyed `realisations` insert (PK
+`(modular_hash, output_name)`; its consumers `query_batch` /
+`query_prior_realisation` are tenant-unscoped). The wave-11 close guarded
+both behind one cohort-keyed `Option` whose `None` arm was sound for the
+stamp and a forgery channel for the insert: an untenanted floating-CA report
+durably minted a first-writer-wins `modular_hash -> victim_path` row with
+zero corroboration --- the exact cross-tenant flip the close shipped to
+kill, reachable one arm over. The repair derives the requirement from the
+insert's own scope (non-optional typed evidence; empty cohort refuses all)
+and pins both readers in the machine-derived census with their witnesses.
 
 *Retired (1d proto sweep --- the stream-carried BuildPhase surface):*
 `sched.log.phase-binding` and `sched.log.path-length` normed the actor-side
