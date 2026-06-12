@@ -360,8 +360,8 @@ pub fn refit(
 
     // r[impl sched.sla.disk-reaches-ephemeral-storage+1]
     // live_049 L2 as repaired by bug_070: disk is a c-INDEPENDENT
-    // scalar (sched.sla.disk-scalar) — its evidence universe is EVERY
-    // peaked sample, never an implicit property of which Vec an arm
+    // scalar (sched.sla.disk-scalar) — its evidence universe is EVERY peaked sample — quantifier: census(test: w11_bc_axis_arm_census) —
+    // never an implicit property of which Vec an arm
     // collected. The previous emptiness-gated fallback engaged only
     // when the c-axis subset carried ZERO peaks, so one peaked c-axis
     // row silently dropped every peaked legacy row (p90 of N+1
@@ -735,8 +735,8 @@ pub(super) fn reassign_tier(
 // r[impl sched.sla.one-aggregator]
 /// THE mem-axis aggregation chokepoint (bug_072 — the disk fn's
 /// structurally identical c-independent sibling): the recency-weighted
-/// p90 the `MemFit::Independent` variant doc promises, over EVERY
-/// sample (the mem peak column is non-optional, so the all-rows
+/// p90 the `MemFit::Independent` variant doc promises, over EVERY sample — quantifier: census(test: w11_bc_axis_arm_census) —
+/// (the mem peak column is non-optional, so the all-rows
 /// aggregate is always available) — ring weights where the row holds a
 /// c-axis seat, unit weights elsewhere. Consumed by the probe arm AND
 /// the full-fit degenerate-Independent arm (`fit_memory`), so
@@ -756,7 +756,7 @@ fn aggregate_disk_p90(rows: &[BuildSampleRow], fit_w: &[f64]) -> Option<DiskByte
 }
 
 /// Shared population law for the per-axis aggregation chokepoints:
-/// the evidence universe is ALWAYS the full row set — a row holding a
+/// the evidence universe is ALWAYS the full row set — quantifier: census(test: w11_bc_axis_arm_census) — a row holding a
 /// c-axis ring seat (`cpu_limit_cores.is_some()`, in row order) takes
 /// its ring weight from `fit_w`; rows without a seat (legacy
 /// no-cpu_limit history) take unit weight (they carry no ordinal —

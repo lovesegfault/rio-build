@@ -113,7 +113,7 @@ impl InstanceType {
 /// stamp is unrepresentable past the decode boundary and every
 /// comparison/age/fold method operates on finite values only.
 ///
-/// Constructors (the ONLY mints):
+/// Constructors (the ONLY mints — quantifier: census(test: extract_epoch_census)):
 /// - [`Epoch::from_pg_epoch`] — the PG decode boundary:
 ///   finite-or-refuse. Callers on refusal lanes turn `None` into the
 ///   typed, counted letter (`_evidence_refused_total{reason=
@@ -1132,7 +1132,7 @@ impl CostTable {
         // ── Consume `(cursor, settled]` in COMMIT order (every row
         // with an id in the window is committed-and-visible: its
         // allocator either ended before the generation's snapshot or
-        // was waited out by promotion). `MAX(at)` survives ONLY as
+        // was waited out by promotion). `MAX(at)` survives ONLY as — quantifier: census(test: refresh_lambda_value_stamp_from_rows_not_wallclock) —
         // the EMA decay / node-count window stamp (value-time) — it
         // is no longer the consumption cursor, so visibility order vs
         // value order can no longer exclude a late-committing row
@@ -3079,11 +3079,11 @@ mod tests {
     /// node_count; `last_observed` was already sealed via
     /// `clamped::epoch_secs`).* One `'infinity'::timestamptz` row,
     /// pre-fix: (a) `price_updated_at()` folds to `+inf`, so
-    /// `apply_stale_clamp` computes `now − inf = −inf` and NEVER
+    /// `apply_stale_clamp` computes `now − inf = −inf` and never
     /// latches — the clamp, the RioSlaHwCostStale alert, and the
     /// stale fallback counter disarm fleet-wide; (b) one `+inf`
     /// lambda stamp wedges `refresh_lambda`'s global HWM bind
-    /// (`at > 'infinity'` matches nothing), freezing ALL lambda
+    /// (`at > 'infinity'` matches nothing), freezing all lambda
     /// refreshes — healthy siblings included; the wave-10 monotone
     /// upsert qual makes the row un-healable in place. Post-fix: the
     /// poisoned rows are REFUSED at the decode boundary (typed,
@@ -3181,7 +3181,7 @@ mod tests {
     /// absolute-epoch PG reads. Committed expectation (the generator's
     /// output, re-derived on any red):
     ///
-    /// - cost.rs is the family's ONLY home: exactly THREE
+    /// - cost.rs is the family's ONLY home — quantifier: census(test: extract_epoch_census) — exactly THREE
     ///   `EXTRACT(EPOCH FROM …)` query strings (`load`'s
     ///   `sla_ema_state.updated_at`, `load`'s
     ///   `sla_observed_instance_types.last_observed`,
@@ -4183,7 +4183,7 @@ mod tests {
 
     /// The EMA decay stamp is the consumed batch's `MAX(at)`
     /// (value-time), not the scheduler's wall-clock — and since
-    /// merged_bug_063 it is ONLY the decay/window stamp: consumption
+    /// merged_bug_063 it is only the decay/window stamp: consumption
     /// is the two-phase sequence horizon, so a row whose `at` is
     /// behind the current stamp (commit-lag, skew) is still CONSUMED
     /// (id-ordered) while the stamp never rewinds. Pre-063 history:

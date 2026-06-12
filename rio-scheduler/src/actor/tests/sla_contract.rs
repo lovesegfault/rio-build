@@ -563,7 +563,7 @@ async fn ack_observed_instance_types_folds_into_cost_table() {
 /// actor construction (DagActor::new installs the configured set on
 /// BOTH stores from `cfg.sla.hw_classes`): an unknown class arriving
 /// through the FULL ack path grows neither the durable observed-types
-/// menu nor the ICE mask, while configured-class siblings on the SAME
+/// menu nor the ICE mask, while configured-class siblings on the same
 /// request land. This is the regression pin for the wiring itself —
 /// without it, dropping the two construction statements would
 /// silently disarm the seam (membership `None` = legacy-admit).

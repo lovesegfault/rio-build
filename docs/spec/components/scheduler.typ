@@ -5023,7 +5023,7 @@ composition had no such exit edge.
 
 #r("sched.sla.epoch-domain")[
   Absolute PG epochs in the SLA cost plane MUST cross the sqlx boundary
-  through a finite-by-construction typed domain (`Epoch`), minted ONLY at
+  through a finite-by-construction typed domain (`Epoch`), minted only at
   the decode boundary: a non-finite stored epoch
   (`'infinity'::timestamptz`, NaN) is a typed, counted, per-row refusal
   (`_evidence_refused_total{reason="nonfinite_epoch"}`) that skips the row
@@ -5044,7 +5044,7 @@ in the same function; the type seals the family, not the site. The
 poisoned PG row itself is deliberately left in place --- the monotone
 upsert qual refuses rewinds, so the row is read-dead (refused at every
 load) until operator surgery, and the staleness clamp plus
-`RioSlaHwCostStale` arm truthfully the moment the stamp stops decoding.
+#(refs.alert)("RioSlaHwCostStale") arm truthfully the moment the stamp stops decoding.
 
 #r("sched.sla.class-membership")[
   An open-string wire grammar feeding closed-domain SLA stores MUST carry a
@@ -5074,7 +5074,7 @@ boot window, pinned by the wiring regression test.
 
 #r("sched.sla.one-aggregator")[
   Each c-independent scalar axis of the per-pname fit (memory, disk) MUST
-  have exactly ONE aggregation function consumed by EVERY arm (full-fit,
+  have exactly ONE aggregation function consumed by every arm (full-fit,
   probe, degenerate fallback): the quantile's evidence universe is an
   explicit population parameter --- always the full row set, ring-weighted
   where a row holds a c-axis seat and unit-weighted elsewhere --- never an
