@@ -122,14 +122,24 @@ impl TickEvidence {
 impl Drop for TickEvidence {
     fn drop(&mut self) {
         if !self.registered_cells.is_empty() || !self.observed_types.is_empty() {
+            // bug_168 (T4 — enforcement machinery is itself a
+            // correctness surface): a machine witness firing via
+            // panic-in-Drop inherits Drop's never-panic-while-
+            // panicking contract. Without this gate, any panic
+            // unwinding through a populated guard DOUBLE-PANICS into
+            // SIGABRT in exactly the dev/test builds the guard arms
+            // — destroying the original diagnostics the guard exists
+            // to improve. Unwinding drops take the warn fallback;
+            // the clean-drop panic face is unchanged.
             #[cfg(debug_assertions)]
-            panic!(
-                "TickEvidence dropped un-merged: {} clear(s), {} observed type(s) lost \
-                 (consume-once: merge into pending_evidence — bug_127)",
-                self.registered_cells.len(),
-                self.observed_types.len(),
-            );
-            #[cfg(not(debug_assertions))]
+            if !std::thread::panicking() {
+                panic!(
+                    "TickEvidence dropped un-merged: {} clear(s), {} observed type(s) lost \
+                     (consume-once: merge into pending_evidence — bug_127)",
+                    self.registered_cells.len(),
+                    self.observed_types.len(),
+                );
+            }
             tracing::warn!(
                 clears = self.registered_cells.len(),
                 observed = self.observed_types.len(),
@@ -421,6 +431,33 @@ mod tests {
     /// shipping the stale mark would re-mask the healthy cell. This
     /// direction's eviction law is UNCHANGED by merged_bug_003.
     // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
+    #[test]
+    /// W12-AS (bug_168) — proposition: the guard never destroys the
+    /// diagnostics it exists to improve; population: {clean drop,
+    /// unwinding drop} — both arms pinned (the clean-drop
+    /// #[should_panic] face is the sibling test below/existing).
+    #[test]
+    fn w12_as_unwind_through_populated_guard_preserves_the_panic() {
+        // The live trigger surface: a failing assertion (any panic)
+        // unwinding through a populated TickEvidence — exactly the
+        // dev/test builds the guard arms. Pre-fix the Drop panic had
+        // no thread::panicking() gate: double-panic → SIGABRT, and
+        // the guard destroyed the very diagnostics it exists to
+        // improve. Post-fix the warn fallback fires and the ORIGINAL
+        // panic propagates intact.
+        let r = std::panic::catch_unwind(|| {
+            let mut tick = TickEvidence::default();
+            tick.buffer_clears([cell()]);
+            panic!("the original diagnostic");
+        });
+        let e = r.expect_err("the original panic propagates");
+        assert_eq!(
+            e.downcast_ref::<&str>(),
+            Some(&"the original diagnostic"),
+            "the guard must never replace the original panic"
+        );
+    }
+
     #[test]
     fn newer_clear_supersedes_buffered_mark() {
         let mut ev = PendingSchedulerEvidence::default();
