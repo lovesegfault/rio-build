@@ -1310,7 +1310,7 @@ impl DagActor {
     /// (`rio_scheduler_uncorroborated_sizing_claim_total`),
     /// attributed, classify-only (the report's retry/charge flow is
     /// unaffected).
-    // r[impl sched.trust.report-corroboration+2]
+    // r[impl sched.trust.report-corroboration+3]
     pub(super) async fn bump_floor_on_corroborated_claim(
         &mut self,
         drv_hash: &DrvHash,
@@ -1363,7 +1363,7 @@ impl DagActor {
         self.bump_resource_floor(drv_hash, witness).await
     }
 
-    // r[impl sched.trust.report-corroboration+2]
+    // r[impl sched.trust.report-corroboration+3]
     /// bug_102 — the corroboration chokepoint: the demand sits INSIDE
     /// the floor mutation. Every caller presents a typed
     /// [`super::floor::CorroborationWitness`] minted by a verifying
@@ -1806,7 +1806,7 @@ impl DagActor {
     ///
     /// [`SchedulerDb::paths_with_production_evidence`]: crate::db::SchedulerDb::paths_with_production_evidence
     /// [`StampProvenance::BuiltLocallyEvidenced`]: crate::db::live_pins::StampProvenance::BuiltLocallyEvidenced
-    // r[impl sched.trust.report-corroboration+2]
+    // r[impl sched.trust.report-corroboration+3]
     pub(super) async fn ca_production_evidence(
         &self,
         executor_id: &str,

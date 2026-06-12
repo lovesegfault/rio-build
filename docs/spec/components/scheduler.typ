@@ -202,7 +202,7 @@ submitter-controlled attributes (the CA-ness of one's own drv) convert
 per-face residuals into adversary-chosen bypasses; the CA face therefore
 joins the law's domain with its own evidence base rather than an exemption.
 
-#r("sched.trust.report-corroboration+2")[
+#r("sched.trust.report-corroboration+3")[
   A worker report's claim MUST NOT move scheduler-persisted state without
   corroboration the scheduler can verify against evidence it (or the store)
   owns. Two faces:
@@ -219,11 +219,21 @@ joins the law's domain with its own evidence base rather than an exemption.
   durable, tenant-invisible until a lawful re-stamp); an evidence-consult
   error MUST fail closed.
   (2) *Sizing floors:* a persisted resource-floor bump on a worker-reported
-  failure MUST consume the TYPED `failure_classification` wire field ---
-  never `error_msg` text --- with telemetry consistent with the shape the
-  scheduler itself assigned at dispatch (the corroboration anchor a forger
-  cannot choose); untyped or uncorroborated claims are classify-only,
-  counted
+  failure MUST present a typed corroboration witness verified against
+  evidence the scheduler owns, on EVERY axis the floor struct carries ---
+  the carrier is irrelevant to the obligation: claims riding the TYPED
+  `failure_classification` wire field (never `error_msg` text) corroborate
+  with telemetry consistent with the shape the scheduler itself assigned at
+  dispatch (the corroboration anchor a forger cannot choose), and the
+  STATUS-borne deadline axis (`TimedOut`) corroborates against the
+  scheduler's own attempt clock (attempt-open duration at least half the
+  assigned deadline --- `running_since` vs the reconciled dispatch deadline,
+  neither mintable by a worker). The demand is enforced INSIDE the floor
+  mutation (the witness parameter --- an ungated axis cannot compile) and
+  the writer population is MACHINE-DERIVED (the floor-mutation census
+  quantifies over mutation sites, never over one wire enum --- the
+  carrier-keyed census was the wave-11 evasion's door). Untyped or
+  uncorroborated claims are classify-only, counted
   (#(refs.metric)("rio_scheduler_uncorroborated_sizing_claim_total")), and
   never move a floor. The depth bound is POPULATION-denominated: at most one
   doubling per corroborated incident identity (drv_hash, exec_id) --- the

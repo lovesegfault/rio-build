@@ -142,7 +142,7 @@ pub fn bump_floor_or_count(
     }
 }
 
-// r[impl sched.trust.report-corroboration+2]
+// r[impl sched.trust.report-corroboration+3]
 /// bug_102 — the typed corroboration witness `bump_resource_floor`
 /// DEMANDS: trust is gated at the CONSEQUENCE (the floor mutation),
 /// not re-derived per carrier at each call site. The wave-11 gate

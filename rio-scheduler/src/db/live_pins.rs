@@ -283,7 +283,7 @@ impl SchedulerDb {
     /// output) carries no confidentiality flip and is
     /// integrity-equivalent to a compromised builder uploading
     /// arbitrary CA content, which the threat model already prices.
-    // r[impl sched.trust.report-corroboration+2]
+    // r[impl sched.trust.report-corroboration+3]
     pub(crate) async fn paths_with_production_evidence(
         &self,
         output_paths: &[String],
@@ -1193,7 +1193,7 @@ mod registration_writer_census {
             .expect("the floor-promotion caller alphabet is census-pinned");
     }
 
-    // r[verify sched.trust.report-corroboration+2]
+    // r[verify sched.trust.report-corroboration+3]
     /// bug_132 commit 2 (W11-S, the R22″ machine-bind): the CA-face
     /// residual pricing is BOUND to the compensating control's firing
     /// predicate instead of self-reported prose. Two pinned needles
@@ -1590,7 +1590,136 @@ mod registration_writer_census {
         );
     }
 
-    // r[verify sched.trust.report-corroboration+2]
+    // r[verify sched.trust.report-corroboration+3]
+    /// bug_102 commit 4 (W12-L3's home; R31) -- the FLOOR-MUTATION
+    /// census, [GEN-SET]: quantified over `resource_floor` MUTATION
+    /// SITES derived from the embedded whole-crate universe, never
+    /// over one wire enum (the carrier-keyed census --
+    /// typed_classification_bumps_only_with_corroboration quantifies
+    /// FailureClass carriers -- was exactly the door the status-borne
+    /// TimedOut lane walked through). Two derived write-grammar
+    /// families plus the demand pin:
+    ///
+    /// - whole-struct assignments (the field-assignment grammar,
+    ///   receiver-independent -- the OVERSCAN form: an aliased
+    ///   receiver evades a path-anchored needle but not the field
+    ///   assignment itself):
+    ///   exactly the cfg(test) debug seed (actor/debug.rs is
+    ///   `#![cfg(test)]` -- recorded EXCLUDED from the production
+    ///   population).
+    /// - `&mut` borrows of the field through the state path: the
+    ///   I-208/live_051(d) hydrate max-merge (actor/merge.rs --
+    ///   typed WITNESS-EXEMPT: a LOAD lane re-importing previously
+    ///   promoted persisted floors, raising-only and clamped; it
+    ///   imports prior verdicts, never mints new ones) and the
+    ///   chokepoint's own interior (actor/floor.rs
+    ///   `bump_floor_or_count` -- reachable only through
+    ///   `bump_resource_floor`, whose witness demand is compile-
+    ///   enforced and whose caller alphabet is pinned by
+    ///   `bump_resource_floor_caller_census` -- the standing
+    ///   live_058-b caller census COMPOSES with this mutation census:
+    ///   callers there, write heads here, zero needle churn at the
+    ///   bug_102 hoist).
+    /// - the demand pin: exactly ONE floor-bump signature carries the
+    ///   typed `CorroborationWitness` parameter -- the chokepoint.
+    ///
+    /// POPULATION face (census riders (a)): non-vacuity per derived
+    /// family + the WO-named EXPECTED members verified (merge.rs
+    /// hydrate, floor.rs interior, debug.rs cfg(test) seed -- the
+    /// expected members are the generator's verification targets,
+    /// never the enforcement population); the empty-walk red below.
+    #[test]
+    fn floor_mutation_census() {
+        // Family A: whole-struct assignments, any receiver.
+        let assigns = census(&[".resource_floor", " = "]);
+        let expected_assigns: BTreeMap<String, usize> = [("actor/debug.rs".to_string(), 1)].into();
+        assert_census(
+            &assigns,
+            &expected_assigns,
+            "resource_floor whole-struct assignments",
+        )
+        .expect("the assignment write-heads are census-pinned");
+
+        // Family B: &mut borrows through the state path.
+        let borrows = census(&["&mut state.sched.", "resource_floor"]);
+        let expected_borrows: BTreeMap<String, usize> = [
+            ("actor/merge.rs".to_string(), 1),
+            ("actor/floor.rs".to_string(), 1),
+        ]
+        .into();
+        assert_census(
+            &borrows,
+            &expected_borrows,
+            "resource_floor &mut write-heads",
+        )
+        .expect("the borrow write-heads are census-pinned");
+
+        // Non-vacuity (rider (a)): every derived family has members.
+        for (name, set) in [("assignments", &assigns), ("borrows", &borrows)] {
+            assert!(
+                !set.is_empty(),
+                "VACUOUS WALK: the {name} family derived zero members"
+            );
+        }
+
+        // The demand pin: ONE witness-demanding bump signature.
+        let demand = census(&["witness: super::floor::Corroboration", "Witness"]);
+        assert_eq!(
+            demand.get("actor/completion.rs"),
+            Some(&1),
+            "exactly one floor-bump chokepoint demands the typed \
+             corroboration witness"
+        );
+    }
+
+    /// W12-L3 -- the floor census's ENROLLMENT/COMPLETENESS-face
+    /// plant (riders (b)(1)+(3) in one strawman): a NEW unwitnessed
+    /// writer -- including the ALIASED-receiver idiom a
+    /// path-anchored needle cannot see -- MUST red the assignment
+    /// family NAMING the file. Runtime-assembled so this file's
+    /// static text never matches the needles itself.
+    #[test]
+    fn floor_census_plants_red_on_unwitnessed_writer() {
+        // The aliased-receiver evasion: the state path is bound to a
+        // local first, so the path-anchored borrow form never
+        // appears in the strawman -- the receiver-independent
+        // assignment needle catches it anyway (overscan discipline).
+        let strawman = format!(
+            "fn rogue_floor_writer(state: &mut DerivationState) {{\n\
+             let sc = &mut state.sched;\n\
+             sc.resource_floor{}ResourceFloor::default();\n\
+             }}\n",
+            " = "
+        );
+        let mut universe: Vec<(String, String)> = CENSUS_SOURCES
+            .iter()
+            .map(|(f, t)| (f.to_string(), (*t).to_string()))
+            .collect();
+        universe.push(("actor/rogue_floor.rs".to_string(), strawman));
+
+        let assigns = census_over(&universe, &[".resource_floor", " = "]);
+        let expected: BTreeMap<String, usize> = [("actor/debug.rs".to_string(), 1)].into();
+        let err = assert_census(
+            &assigns,
+            &expected,
+            "plant: resource_floor whole-struct assignments",
+        )
+        .expect_err("an unwitnessed floor writer MUST go census-red");
+        assert!(
+            err.contains("rogue_floor.rs"),
+            "the red must NAME the unwitnessed writer; got: {err}"
+        );
+
+        // The empty-walk red (rider (a)): the same walk on an empty
+        // universe derives nothing -- the state the floor refuses.
+        let empty: Vec<(String, String)> = Vec::new();
+        assert!(
+            census_over(&empty, &[".resource_floor", " = "]).is_empty(),
+            "plant premise: the empty walk derives nothing"
+        );
+    }
+
+    // r[verify sched.trust.report-corroboration+3]
     /// bug_090 commit 6 (W11-X, the R22″ derivation-layer form of
     /// W10-N): the worker→scheduler trust census derives PER-BOUNDARY
     /// from the PROTO SCHEMA — the field universe of the completion
