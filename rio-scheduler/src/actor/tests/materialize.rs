@@ -11425,6 +11425,305 @@ async fn listing_excludes_in_memory_terminal_nodes() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.materialize.obsolescence]
+/// **W12-S9B (live061-R1)** — *a pending job whose node COMPLETED by
+/// other means resolves under the alphabet's own letter: `obsolete`,
+/// not `cancelled`*. `JobState::Obsolete` ("the node produced by
+/// other means while the job was open" — 078's CHECK has carried the
+/// literal since birth) had NO WRITER for the system's entire life:
+/// the zero-interest sweep folded the by-other-means face into
+/// `cancelled` ("no live DAG-interested build remains" — FALSE here:
+/// the interested build is live), so
+/// `resolved_total{outcome="obsolete"}` was zero-forever and the
+/// live_061 zombie class was forensically invisible. The model
+/// (materializationJob.qnt `obsoleteOnProduced`) has demanded the
+/// obsolete resolution all along — this is the conformance gap's
+/// production half. Also pins: idempotent re-sweep (no double count,
+/// at-most-once edge), and the attempt-close riding the same fenced
+/// sweep.
+#[tokio::test]
+async fn node_completed_by_other_means_resolves_obsolete() -> TestResult {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    use crate::sla::metrics::counter_map_by;
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    rec.install().expect("install global debugging recorder");
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+    let generation = actor.serving_generation();
+
+    // One pending job; its node is injected LIVE-INTERESTED and then
+    // completes by other means (the store-probe shape: outputs found
+    // locally while the job sat unclaimed).
+    let drv = insert_test_derivation_local(&db.pool, "obsolete-fold").await?;
+    let created = sdb(&db.pool)
+        .create_materialization_job_fenced(
+            drv,
+            "obsolete-fold",
+            None,
+            JobOrigin::CacheOpportunity,
+            None,
+            generation,
+        )
+        .await?;
+    let crate::db::materialization::FencedJobCreate::Applied { job_id, .. } = created else {
+        anyhow::bail!("job create must apply");
+    };
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        derivation_id: drv,
+        ..crate::db::RecoveryDerivationRow::test_default("obsolete-fold", "x86_64-linux")
+    });
+    // A LIVE interested build: the pre-fix sweep cancelled this row
+    // through its node-terminal disjunct even though interest was
+    // alive — the letter was wrong, not just late.
+    let build_id = Uuid::new_v4();
+    actor
+        .dag
+        .node_mut("obsolete-fold")
+        .expect("just injected")
+        .interested_builds
+        .insert(build_id);
+    actor
+        .dag
+        .node_mut("obsolete-fold")
+        .expect("just injected")
+        .set_status_for_test(DerivationStatus::Completed);
+    actor.materialization_jobs.insert(
+        DrvHash::from("obsolete-fold"),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(job_id, None),
+    );
+
+    let authority = actor
+        .dag_authority()
+        .expect("direct-setup actor is authoritative");
+    actor
+        .tick_cancel_zero_interest_materialization(&authority)
+        .await;
+
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        state, "obsolete",
+        "a pending job whose node COMPLETED by other means must resolve under \
+         its own letter (the 078 alphabet's 'obsolete'; the model's \
+         obsoleteOnProduced post-state) — 'cancelled' is the live_061 \
+         conflation: interest is alive, nothing was cancelled"
+    );
+    assert_eq!(
+        actor.materialization_jobs.iter().count(),
+        0,
+        "the view entry folds on the settled disposition"
+    );
+
+    // Idempotent re-entry: nothing pending, nothing re-counted.
+    actor
+        .tick_cancel_zero_interest_materialization(&authority)
+        .await;
+
+    // (ppppp): snapshot exactly once, at the end — both metrics fold
+    // from the one drained snapshot.
+    let snapshot = snap.snapshot();
+    let by_outcome = {
+        use metrics_util::debugging::DebugValue;
+        let mut m = std::collections::BTreeMap::new();
+        for (ck, _, _, v) in snapshot.into_vec() {
+            let DebugValue::Counter(c) = v else { continue };
+            let k = ck.key();
+            let label = |which: &str| {
+                k.labels()
+                    .find(|l| l.key() == which)
+                    .map(|l| l.value().to_owned())
+                    .unwrap_or_default()
+            };
+            match k.name() {
+                "rio_scheduler_materialization_jobs_resolved_total" => {
+                    *m.entry(format!("resolved:{}", label("outcome")))
+                        .or_insert(0u64) += c;
+                }
+                "rio_scheduler_materialization_view_node_skew_total" => {
+                    *m.entry(format!("skew:{}", label("polarity")))
+                        .or_insert(0u64) += c;
+                }
+                _ => {}
+            }
+        }
+        m
+    };
+    assert_eq!(
+        by_outcome.get("resolved:obsolete").copied().unwrap_or(0),
+        1,
+        "exactly one obsolete resolution counted (at-most-once; the idempotent \
+         re-sweep adds nothing): {by_outcome:?}"
+    );
+    assert_eq!(
+        by_outcome.get("resolved:cancelled").copied().unwrap_or(0),
+        0,
+        "the by-other-means face no longer launders into 'cancelled': {by_outcome:?}"
+    );
+    let _ = counter_map_by; // counter_map_by snapshots internally; unused here by (ppppp).
+    Ok(())
+}
+
+// r[verify sched.materialize.obsolescence]
+/// **W12-S9C (live061-R2, the detector half)** — *the view/node skew
+/// detector FIRES on the planted zombie*. The metric was registered
+/// (lib.rs) and emitted (housekeeping.rs) all along — live_061's
+/// "never fired" was a DEAD DETECTION EDGE: both existing polarities
+/// (split_release, claimed_no_attempt) quantify over Assigned/Running
+/// nodes, and the zombie face (terminal node + pending job) had no
+/// arm. The third polarity counts at sweep OBSERVATION, so a sustained
+/// nonzero rate is the live_061 signature (a terminal edge minting
+/// zombies) even when every row also resolves.
+#[tokio::test]
+async fn skew_detector_fires_on_terminal_node_pending_job() -> TestResult {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    rec.install().expect("install global debugging recorder");
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+    let generation = actor.serving_generation();
+
+    let drv = insert_test_derivation_local(&db.pool, "skew-plant").await?;
+    let created = sdb(&db.pool)
+        .create_materialization_job_fenced(
+            drv,
+            "skew-plant",
+            None,
+            JobOrigin::CacheOpportunity,
+            None,
+            generation,
+        )
+        .await?;
+    let crate::db::materialization::FencedJobCreate::Applied { job_id, .. } = created else {
+        anyhow::bail!("job create must apply");
+    };
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        derivation_id: drv,
+        ..crate::db::RecoveryDerivationRow::test_default("skew-plant", "x86_64-linux")
+    });
+    actor
+        .dag
+        .node_mut("skew-plant")
+        .expect("just injected")
+        .set_status_for_test(DerivationStatus::Completed);
+    actor.materialization_jobs.insert(
+        DrvHash::from("skew-plant"),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(job_id, None),
+    );
+
+    let authority = actor
+        .dag_authority()
+        .expect("direct-setup actor is authoritative");
+    actor
+        .tick_cancel_zero_interest_materialization(&authority)
+        .await;
+
+    // (ppppp): one snapshot.
+    let polarities = crate::sla::metrics::counter_map_by(
+        &snap,
+        "rio_scheduler_materialization_view_node_skew_total",
+        Some("polarity"),
+    );
+    assert_eq!(
+        polarities.get("node_terminal_job_pending").copied(),
+        Some(1),
+        "the planted zombie (terminal node + pending job) must fire the skew \
+         detector's third polarity — pre-fix the detector had no arm for this \
+         face and stayed silent through the whole live_061 window: {polarities:?}"
+    );
+    Ok(())
+}
+
+/// **W12-S9B2** — *the moot sweep is bounded per tick (R17:
+/// `MOOT_SWEEP_TICK_BOUND`, violable + testable)*: seeding BOUND+1
+/// zero-interest rows resolves exactly BOUND on the first pass and the
+/// remainder on the next (level-triggered; view entries leave only on
+/// settled dispositions).
+#[tokio::test]
+async fn moot_sweep_is_bounded_per_tick() -> TestResult {
+    use crate::actor::materialize::MOOT_SWEEP_TICK_BOUND;
+    let n = MOOT_SWEEP_TICK_BOUND + 1;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+    let generation = actor.serving_generation();
+
+    // N pending jobs in ONE batched tx (no derivations rows needed —
+    // the moot closer keys on job state alone; the empty DAG routes
+    // every row through the node-absent cancelled class).
+    let drv_ids: Vec<Uuid> = (0..n).map(|_| Uuid::new_v4()).collect();
+    let hashes: Vec<String> = (0..n).map(|i| format!("moot-bound-{i:05}")).collect();
+    let rows: Vec<crate::db::materialization::NewJobRow<'_>> = drv_ids
+        .iter()
+        .zip(&hashes)
+        .map(|(drv, hash)| crate::db::materialization::NewJobRow {
+            derivation_id: *drv,
+            drv_hash: hash,
+            tenant_id: None,
+            origin: JobOrigin::CacheOpportunity,
+            carried_realized_paths: None,
+        })
+        .collect();
+    let mut tx = db.pool.begin().await?;
+    let created = crate::db::SchedulerDb::create_materialization_jobs_in_tx(
+        &mut tx,
+        &rows,
+        generation.as_i64(),
+    )
+    .await?;
+    tx.commit().await?;
+    for (hash, jc) in hashes.iter().zip(&created) {
+        actor.materialization_jobs.insert(
+            DrvHash::from(hash.as_str()),
+            crate::actor::materialize::JobViewEntry::new_unclaimed(jc.job_id, None),
+        );
+    }
+
+    let authority = actor
+        .dag_authority()
+        .expect("direct-setup actor is authoritative");
+    actor
+        .tick_cancel_zero_interest_materialization(&authority)
+        .await;
+    let after_first: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM materialization_jobs WHERE state = 'cancelled'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        after_first as usize, MOOT_SWEEP_TICK_BOUND,
+        "the first pass resolves exactly the bound"
+    );
+    assert_eq!(
+        actor.materialization_jobs.iter().count(),
+        1,
+        "the truncated remainder keeps its view entry for the next pass"
+    );
+    actor
+        .tick_cancel_zero_interest_materialization(&authority)
+        .await;
+    let after_second: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM materialization_jobs WHERE state = 'cancelled'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        after_second as usize, n,
+        "the second pass drains the remainder (level-triggered)"
+    );
+    assert_eq!(actor.materialization_jobs.iter().count(), 0);
+    Ok(())
+}
+
 /// Local single-derivation insert (the db/tests helper is `pub(super)`
 /// to db::tests — this mirrors it for the actor battery).
 async fn insert_test_derivation_local(pool: &sqlx::PgPool, hash: &str) -> anyhow::Result<Uuid> {

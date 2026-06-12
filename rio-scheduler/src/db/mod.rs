@@ -547,8 +547,10 @@ pub enum FencedCommit {
 pub(crate) enum AssignmentCloseStatus {
     Completed,
     Failed,
-    /// The zero-interest cancel path's status
-    /// ([`SchedulerDb::cancel_jobs_and_close_attempts_fenced`]).
+    /// The moot-sweep path's status — the attempt close is
+    /// `cancelled` for BOTH moot letters: the attempt itself never
+    /// completed, whichever letter the job row took
+    /// ([`SchedulerDb::resolve_moot_jobs_and_close_attempts_fenced`]).
     Cancelled,
 }
 

@@ -1907,6 +1907,39 @@ the discipline is compile-borne, not reviewed-in. Model-level verification:
 mat-133-discarded-outcome / mat-276-dag-absent-cancel calibration pins as
 the falsifiability pair.
 
+#r("sched.materialize.obsolescence")[
+  Every pending materialization job is an OBLIGATION whose discharge
+  set MUST be total over the moot faces, each under its own alphabet
+  letter: a pending job whose derivation reached terminal status by
+  other means MUST be resolved `obsolete` before the next listing
+  beat serves it (the listing's node-face exclusion makes the row
+  unservable from the same actor turn; the per-tick moot sweep is the
+  durable discharge), and a pending job with zero live interest — node
+  gone, node doomed-terminal, or every interested build terminal —
+  MUST be resolved `cancelled`. The sweep MUST be idempotent
+  (at-most-once lifecycle counting on the APPLIED edge), bounded per
+  tick by a typed batch size, and MUST close any open
+  materialization-kind attempt in the same fenced transaction. The
+  sweep's observation of a terminal-node pending job MUST feed the
+  view/node skew detector under its own polarity — a detection
+  alphabet quantified only over non-terminal node states is the
+  live_061 dead edge.
+]
+live_061 (2026-06-12) is this rule's incident record:
+`JobState::Obsolete` sat in the 078 CHECK alphabet with NO WRITER for
+the system's entire life — the zero-interest sweep folded the
+by-other-means face into `cancelled`, so
+`resolved_total{outcome="obsolete"}` was zero-forever, the
+purpose-built skew detector (whose polarities all quantified over
+Assigned/Running nodes) never fired, and ~44 zombie rows pinned the
+claim plane for hours. The model
+(`materializationJob.qnt` `obsoleteOnProduced`) demanded the obsolete
+resolution all along: the gap was conformance, not design — the
+production discharge arm now exists (the moot sweep's
+Completed-classified class), and the model-binding program (the
+wired non-vacuity witnesses + the materialization MBT) makes the
+arm's absence a red check rather than a review-time judgment.
+
 #r("sched.materialize.ack-law")[
   The report intake's answer for one materialization consumption MUST be a
   pure function of the close write's disposition: settled

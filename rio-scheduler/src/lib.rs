@@ -593,8 +593,12 @@ pub fn describe_metrics() {
          was materialized from upstream; from_source = the job released the node \
          to normal from-source dispatch (durable Vouched/Pending evidence or the \
          PD-20 park re-evaluation); unobtainable = the fail-fast settlement; \
-         cancelled = zero live interest remained. A high infra-failure or \
-         unobtainable rate is the upstream-health signal."
+         cancelled = zero live interest remained (node gone/doomed or every \
+         interested build terminal); obsolete = the node COMPLETED by other \
+         means while the job was open (store probe, sibling production, CA \
+         cutoff — live_061: pre-fix this face laundered into cancelled and the \
+         label was zero-forever). A high infra-failure or unobtainable rate is \
+         the upstream-health signal."
     );
     describe_counter!(
         "rio_scheduler_materialization_converted_total",
@@ -610,7 +614,20 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_materialization_view_node_skew_total",
-        "Split-release wedge tripwire (merged_bug_307 rider): a pending-unclaimed materialization job whose node is still Assigned/Running with no open assignment — release_claim should have requeued the node in the same step that dropped the claim. Always zero in a healthy fleet; any increment is a re-introduced split release (fatal under debug builds)."
+        "View/node coherence tripwires, labeled by polarity. \
+         polarity=split_release: a pending-unclaimed job whose node is still \
+         Assigned/Running with no open assignment (release_claim should have \
+         requeued the node in the step that dropped the claim) — always zero in \
+         a healthy fleet. polarity=claimed_no_attempt: a claim held in the view \
+         with no backing assignment two sweeps running — always zero in a \
+         healthy fleet. polarity=node_terminal_job_pending: the moot sweep \
+         observed a pending job on a COMPLETED node (the by-other-means face \
+         it resolves obsolete) — bounded noise during cache-racing builds; a \
+         SUSTAINED rate is the live_061 zombie signature (a terminal edge \
+         minting unresolvable pending rows faster than they drain). live_061's \
+         lesson: the detector's alphabet quantified only over Assigned/Running \
+         nodes, so the terminal-node face never fired — the polarity set is \
+         now total over the skew faces the sweep can observe."
     );
     describe_counter!(
         "rio_scheduler_materialization_carrier_dropped_total",

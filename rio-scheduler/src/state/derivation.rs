@@ -774,6 +774,28 @@ db_str_enum! {
     /// migration 078). "Claimed" is deliberately NOT a job state: a
     /// claim is an open attempt (assignments + drv_executions rows);
     /// the job row is untouched until consumption resolves it.
+    ///
+    /// **The obligation/discharge totality (R32, live_061 — the
+    /// linearity record).** A `pending` row is a LINEAR OBLIGATION:
+    /// the claim plane advertises it until exactly one discharge arm
+    /// resolves it, and every terminal letter has exactly one
+    /// producing arm (one quantity, one producer):
+    ///
+    /// | letter | sole producing arm |
+    /// |---|---|
+    /// | `resolved_success` | consumption companion #1 (`complete_materialization_for_live_interest`) |
+    /// | `resolved_from_source` | consumption companion #3 (`companion_resolve_from_source`) + the PD-20 park re-evaluation (both through the one exec-keyed resolver) |
+    /// | `resolved_unobtainable` | consumption companion #4 (`companion_fail_fast`) |
+    /// | `obsolete` | the moot sweep's node-Completed class (`sweep_moot_class`) |
+    /// | `cancelled` | the moot sweep's zero-interest/absent/doomed class |
+    ///
+    /// live_061's defect was a MISSING arm: `Obsolete` sat in the 078
+    /// CHECK alphabet with no writer, the by-other-means face
+    /// laundered into `cancelled`, and the discharge set was silently
+    /// partial — the unresolved rows pinned the claimable listing as
+    /// permanently-refusing heads. `sched.materialize.obsolescence`
+    /// states the totality; the moot sweep + the listing's node-face
+    /// exclusion enforce it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum JobState {
         /// Unresolved: claimable by the store executor (unless parked).
@@ -786,9 +808,14 @@ db_str_enum! {
         /// Consumption routed the node from-source (the Vouched/Pending
         /// arms of the four-arm routing).
         ResolvedFromSource = "resolved_from_source",
-        /// The node produced by other means while the job was open.
+        /// The node produced by other means while the job was open
+        /// (store probe found the outputs, a sibling build realized
+        /// them, CA cutoff). Writer: the moot sweep's
+        /// node-Completed class — live_061 closed the
+        /// no-writer gap.
         Obsolete = "obsolete",
-        /// No live DAG-interested build remains.
+        /// No live DAG-interested build remains (node gone, node
+        /// doomed-terminal, or every interested build terminal).
         Cancelled = "cancelled",
     }
     parse_err(_s) = &'static str:

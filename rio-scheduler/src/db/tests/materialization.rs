@@ -534,7 +534,8 @@ async fn parked_job_excluded_until_backoff_expires() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// (f) `cancel_jobs_and_close_attempts_fenced`: ONE fenced sweep
+/// (f) `resolve_moot_jobs_and_close_attempts_fenced` (Cancelled
+/// letter): ONE fenced sweep
 /// cancels every pending job in the set (pending → cancelled) and
 /// closes their open materialization-kind assignments in the SAME
 /// transaction (the zero-live-interest closer, total over the
@@ -585,9 +586,16 @@ async fn job_cancellation_sweep_marks_cancelled_and_closes_attempts() -> anyhow:
     }
 
     let swept = db
-        .cancel_jobs_and_close_attempts_fenced(&job_ids, ServingGeneration::stamp_from_claim(1))
+        .resolve_moot_jobs_and_close_attempts_fenced(
+            &job_ids,
+            JobState::Cancelled,
+            ServingGeneration::stamp_from_claim(1),
+        )
         .await?;
-    let FencedCancelSweep::Applied { cancelled } = swept else {
+    let FencedCancelSweep::Applied {
+        resolved: cancelled,
+    } = swept
+    else {
         anyhow::bail!("sweep must apply, got {swept:?}");
     };
     assert_eq!(
@@ -629,12 +637,16 @@ async fn job_cancellation_sweep_marks_cancelled_and_closes_attempts() -> anyhow:
     // Sweeping again (nothing pending): idempotent re-entry — the
     // sweep applies with an EMPTY cancelled set.
     let again = db
-        .cancel_jobs_and_close_attempts_fenced(&job_ids, ServingGeneration::stamp_from_claim(1))
+        .resolve_moot_jobs_and_close_attempts_fenced(
+            &job_ids,
+            JobState::Cancelled,
+            ServingGeneration::stamp_from_claim(1),
+        )
         .await?;
     assert_eq!(
         again,
         FencedCancelSweep::Applied {
-            cancelled: std::collections::HashSet::new()
+            resolved: std::collections::HashSet::new()
         },
         "already-terminal members are absent from the cancelled set"
     );
@@ -657,12 +669,16 @@ async fn job_cancellation_sweep_marks_cancelled_and_closes_attempts() -> anyhow:
     };
     let mixed_ids: Vec<uuid::Uuid> = job_ids.iter().copied().chain([job_c]).collect();
     let mixed = db
-        .cancel_jobs_and_close_attempts_fenced(&mixed_ids, ServingGeneration::stamp_from_claim(1))
+        .resolve_moot_jobs_and_close_attempts_fenced(
+            &mixed_ids,
+            JobState::Cancelled,
+            ServingGeneration::stamp_from_claim(1),
+        )
         .await?;
     assert_eq!(
         mixed,
         FencedCancelSweep::Applied {
-            cancelled: [job_c].into_iter().collect()
+            resolved: [job_c].into_iter().collect()
         },
         "a mixed sweep reports exactly the rows that flipped"
     );
@@ -672,7 +688,11 @@ async fn job_cancellation_sweep_marks_cancelled_and_closes_attempts() -> anyhow:
         .execute(&test_db.pool)
         .await?;
     let fenced = db
-        .cancel_jobs_and_close_attempts_fenced(&job_ids, ServingGeneration::stamp_from_claim(1))
+        .resolve_moot_jobs_and_close_attempts_fenced(
+            &job_ids,
+            JobState::Cancelled,
+            ServingGeneration::stamp_from_claim(1),
+        )
         .await?;
     assert_eq!(fenced, FencedCancelSweep::Fenced);
     Ok(())

@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::db::materialization::FencedJobCreate;
-use crate::state::{DrvHash, ExecutorId, JobOrigin};
+use crate::state::{DerivationStatus, DrvHash, ExecutorId, JobOrigin};
 
 use super::DagActor;
 
@@ -110,6 +110,24 @@ pub(super) const LISTING_SNAPSHOT_TTL: std::time::Duration = std::time::Duration
 /// the same superset (recorded delta — same per-poll view filter,
 /// same fail-closed arms).
 const LISTING_HEAD_WINDOW: i64 = 512;
+
+/// live061-R1 (R17, violable + testable) — per-class row bound of one
+/// moot-sweep tick. The sweep is one fenced transaction per class
+/// regardless of N (the live_053 batching lesson — the bound is NOT a
+/// round-trip cap); what it bounds is the single transaction's UPDATE
+/// row count / RETURNING set and the actor-side disposition fold, so
+/// one pathological tick cannot hold the fence transaction open over
+/// an unbounded row set. Derivation: 8× the claimable head-window
+/// (512) and within 1 tick of clearing most observed bursts — the
+/// live_053 mass-cancel population (5,258, the largest moot burst on
+/// record) drains in 2 ticks; the claim plane is already clean after
+/// ZERO ticks regardless, because the listing predicate
+/// (`sched.materialize.claimability-projection+1`) excludes every
+/// moot row independent of sweep progress. The truncated remainder
+/// re-collects next tick (level-triggered; view entries leave only
+/// on settled dispositions). Witness:
+/// `moot_sweep_is_bounded_per_tick`.
+pub(super) const MOOT_SWEEP_TICK_BOUND: usize = 4096;
 
 /// bug_045 (R17) — always-on operation counters for the listing
 /// chokepoint's cost envelope. The complexity claims are structural
@@ -3728,85 +3746,168 @@ impl DagActor {
         }
     }
 
-    /// The flag-gated housekeeping backstop: cancel jobs for
-    /// derivations whose live interest dropped to zero (node gone,
-    /// node terminal, or every interested build terminal), closing any
-    /// open materialization attempt charge-free — BC-2's no-controller
-    /// closer. Phase B's build-terminal hooks will call the batch
+    /// The flag-gated housekeeping backstop — the MOOT sweep: resolve
+    /// jobs whose node can never consume them, each face under its
+    /// own alphabet letter (live_061 — `JobState::Obsolete` finally
+    /// has its writer):
+    ///
+    ///   - **Obsolete**: the node COMPLETED by other means while the
+    ///     job was open (store probe found the outputs, a sibling
+    ///     build produced them, CA cutoff) — the enum's exact letter.
+    ///     Every claim against the completed node answers `Gone`, so
+    ///     pre-fix these rows were the zombie heads that pinned the
+    ///     oldest-first listing window — and they resolved under the
+    ///     WRONG letter (`cancelled`), leaving
+    ///     `resolved_total{outcome="obsolete"}` zero-forever and the
+    ///     by-other-means class forensically invisible.
+    ///   - **Cancelled**: zero live interest remains — node gone,
+    ///     node doomed-terminal (failed/poisoned/dep-failed/
+    ///     cancelled/skipped), or every interested build terminal —
+    ///     BC-2's no-controller closer, semantics unchanged. The
+    ///     doomed-terminal faces stay under `cancelled` BY DERIVATION:
+    ///     "produced by other means" is false for them, and their
+    ///     interest dies in the same cascade that doomed the node.
+    ///
+    /// The partition is disjoint by construction (Completed takes the
+    /// obsolete arm; every other moot face takes cancelled). Each
+    /// class is bounded per tick by [`MOOT_SWEEP_TICK_BOUND`] —
+    /// level-triggered: the truncated remainder is re-collected next
+    /// tick. Phase B's build-terminal hooks will call the batch
     /// closer directly; in Phase A it is reached through this tick
     /// backstop. census[test: zero_interest_cancel_closes_attempt_without_dag_node]
     ///
-    /// ONE fenced sweep for the whole zero-interest set (the
-    /// `cancel_build_derivations` batched-persist precedent —
-    /// `build.rs` documents the N+1 actor stall this avoids).
-    /// live_053 measured the per-job form: 5,258 sequential fenced
-    /// cancels at 3.16ms each = 16.6s inside a single 134.65s Tick,
-    /// head-of-line blocking every queued RPC. The sweep resolves the
-    /// job rows AND closes the kind-guarded assignment rows keyed
-    /// entirely on durable state: the close is TOTAL over the
-    /// DAG-absent arm (its own trigger — the `None => true` filter —
-    /// guarantees the node may be gone, so no in-memory exec_id is
-    /// ever read). Per-job view removal gates on the folded
-    /// disposition; a Fenced or Failed sweep keeps every entry and
-    /// re-attempts next tick (level-triggered).
+    /// ONE fenced sweep per class (the `cancel_build_derivations`
+    /// batched-persist precedent — `build.rs` documents the N+1 actor
+    /// stall this avoids). live_053 measured the per-job form: 5,258
+    /// sequential fenced cancels at 3.16ms each = 16.6s inside a
+    /// single 134.65s Tick, head-of-line blocking every queued RPC.
+    /// The sweep resolves the job rows AND closes the kind-guarded
+    /// assignment rows keyed entirely on durable state: the close is
+    /// TOTAL over the DAG-absent arm (its own trigger — the
+    /// `None => cancelled` arm — guarantees the node may be gone, so
+    /// no in-memory exec_id is ever read). Per-job view removal gates
+    /// on the folded disposition; a Fenced or Failed sweep keeps
+    /// every entry and re-attempts next tick (level-triggered).
+    ///
+    /// (The fn keeps its wired name: the housekeeping call site and
+    /// its phase label are outside this close's surface — this doc
+    /// carries the widened law.)
     // r[impl sched.materialize.settlement]
     // r[impl sched.materialize.job+2]
     // r[impl sched.materialize.view-settlement]
+    // r[impl sched.materialize.obsolescence]
     // r[impl sched.admission.work-per-turn]
     pub(super) async fn tick_cancel_zero_interest_materialization(
         &mut self,
         _authority: &super::DagAuthority,
     ) {
         use crate::state::BuildStateExt;
-        let zero_interest: Vec<(DrvHash, Uuid)> = self
-            .materialization_jobs
-            .iter()
-            .filter(|(h, _)| match self.dag.node(h.as_str()) {
-                None => true,
+        let mut obsolete: Vec<(DrvHash, Uuid)> = Vec::new();
+        let mut zero_interest: Vec<(DrvHash, Uuid)> = Vec::new();
+        for (h, entry) in self.materialization_jobs.iter() {
+            match self.dag.node(h.as_str()) {
+                None => zero_interest.push((h.clone(), entry.job_id)),
+                Some(state) if state.status() == DerivationStatus::Completed => {
+                    // The dead detection edge live_061 exposed, now an
+                    // edge: the skew detector quantified only over
+                    // Assigned/Running nodes (split_release,
+                    // claimed_no_attempt) while the zombie face —
+                    // terminal node, pending job — had no polarity and
+                    // never fired through the whole incident. Counted
+                    // at OBSERVATION (this sweep SAW the skew); the
+                    // lifecycle counter below counts at the APPLIED
+                    // resolve, so the two stay independently honest.
+                    // No two-strike insurance needed: node-Completed
+                    // and job-pending are both read in this same actor
+                    // turn and neither can revert.
+                    metrics::counter!(
+                        "rio_scheduler_materialization_view_node_skew_total",
+                        "polarity" => "node_terminal_job_pending"
+                    )
+                    .increment(1);
+                    obsolete.push((h.clone(), entry.job_id));
+                }
                 Some(state) => {
-                    state.status().is_terminal()
+                    if state.status().is_terminal()
                         || !state.interested_builds.iter().any(|bid| {
                             self.builds
                                 .get(bid)
                                 .is_some_and(|b| !b.state().is_terminal())
                         })
+                    {
+                        zero_interest.push((h.clone(), entry.job_id));
+                    }
                 }
-            })
-            .map(|(h, entry)| (h.clone(), entry.job_id))
-            .collect();
-        if zero_interest.is_empty() {
-            return;
+            }
         }
-        let job_ids: Vec<Uuid> = zero_interest.iter().map(|(_, job_id)| *job_id).collect();
+        // R17 per-tick bound, per class: the truncated tail keeps its
+        // view entries (removal gates on settled dispositions), so the
+        // next tick re-collects it — level-triggered.
+        obsolete.truncate(MOOT_SWEEP_TICK_BOUND);
+        zero_interest.truncate(MOOT_SWEEP_TICK_BOUND);
+        let mut settled = 0usize;
+        settled += self
+            .sweep_moot_class(obsolete, crate::state::JobState::Obsolete)
+            .await;
+        settled += self
+            .sweep_moot_class(zero_interest, crate::state::JobState::Cancelled)
+            .await;
+        if settled > 0 {
+            // r[impl sched.materialize.pinning]
+            // §5.3 release site: the sweep resolves jobs, so pins may
+            // be releasable (self-scoping no-op when live interest
+            // remains elsewhere). ONCE per tick over both classes: the
+            // release is a global resolved-jobs query, so the per-job
+            // form ran N identical statements for one effect.
+            self.release_materialization_pins_best_effort("job moot sweep")
+                .await;
+        }
+    }
+
+    /// One moot class through the batched fenced closer: resolve the
+    /// rows to `to_state`, fold per-job dispositions (the T-6.2
+    /// lifecycle counter on each APPLIED row), settle the view.
+    /// Returns the settled count; the caller runs the pin release
+    /// once over both classes.
+    // r[impl sched.materialize.obsolescence]
+    async fn sweep_moot_class(
+        &mut self,
+        class: Vec<(DrvHash, Uuid)>,
+        to_state: crate::state::JobState,
+    ) -> usize {
+        if class.is_empty() {
+            return 0;
+        }
+        let job_ids: Vec<Uuid> = class.iter().map(|(_, job_id)| *job_id).collect();
         let serving_generation = self.serving_generation();
-        let cancelled = match self
+        let resolved = match self
             .db
-            .cancel_jobs_and_close_attempts_fenced(&job_ids, serving_generation)
+            .resolve_moot_jobs_and_close_attempts_fenced(&job_ids, to_state, serving_generation)
             .await
         {
-            Ok(crate::db::materialization::FencedCancelSweep::Applied { cancelled }) => cancelled,
+            Ok(crate::db::materialization::FencedCancelSweep::Applied { resolved }) => resolved,
             Ok(crate::db::materialization::FencedCancelSweep::Fenced) => {
                 // Sweep-level fence: every view entry survives (the
                 // durable rows are a successor's to settle); one note
                 // per sweep, not per job.
-                self.note_fenced_evidence_write("materialization job cancel");
-                return;
+                self.note_fenced_evidence_write("materialization job moot sweep");
+                return 0;
             }
             Err(e) => {
-                warn!(jobs = job_ids.len(), error = %e,
-                      "zero-interest materialization cancel sweep failed; retried next tick");
-                return;
+                warn!(jobs = job_ids.len(), to_state = to_state.as_str(), error = %e,
+                      "materialization moot sweep failed; retried next tick");
+                return 0;
             }
         };
         let mut settled = 0usize;
-        for (drv_hash, job_id) in zero_interest {
-            let d = if cancelled.contains(&job_id) {
+        for (drv_hash, job_id) in class {
+            let d = if resolved.contains(&job_id) {
                 // The at-most-once edge: the same lifecycle counter the
                 // exec-keyed resolver increments (T-6.2) — once per
                 // APPLIED row, exactly as the per-job form counted.
                 metrics::counter!(
                     "rio_scheduler_materialization_jobs_resolved_total",
-                    "outcome" => Self::resolution_outcome_label(crate::state::JobState::Cancelled)
+                    "outcome" => Self::resolution_outcome_label(to_state)
                 )
                 .increment(1);
                 WriteDisposition::Applied
@@ -3815,23 +3916,24 @@ impl DagActor {
             };
             if self.materialization_jobs.remove_settled(&drv_hash, d) {
                 settled += 1;
-                tracing::info!(
-                    drv_hash = %drv_hash,
-                    %job_id,
-                    "materialization job cancelled: no live interested build remains \
-                     (attempt closed in the same fenced sweep)"
-                );
+                if to_state == crate::state::JobState::Obsolete {
+                    tracing::info!(
+                        drv_hash = %drv_hash,
+                        %job_id,
+                        "materialization job obsolete: the node completed by other \
+                         means while the job was open (attempt closed in the same \
+                         fenced sweep; the row leaves the claimable plane)"
+                    );
+                } else {
+                    tracing::info!(
+                        drv_hash = %drv_hash,
+                        %job_id,
+                        "materialization job cancelled: no live interested build remains \
+                         (attempt closed in the same fenced sweep)"
+                    );
+                }
             }
         }
-        if settled > 0 {
-            // r[impl sched.materialize.pinning]
-            // §5.3 release site: cancellation resolves jobs, so pins
-            // may be releasable (self-scoping no-op when live interest
-            // remains elsewhere). ONCE per sweep: the release is a
-            // global resolved-jobs query, so the per-job form ran N
-            // identical statements for one effect.
-            self.release_materialization_pins_best_effort("job cancellation")
-                .await;
-        }
+        settled
     }
 }
