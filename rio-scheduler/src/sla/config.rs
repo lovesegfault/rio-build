@@ -3556,12 +3556,15 @@ mod tests {
             ]);
             cfg
         };
-        let rows: &[(
-            &str,
-            &dyn Fn(&mut HwClassDef),
+        // One product-table row: (axis label, the g7 perturbation,
+        // the capacity pin, the demand).
+        type Row<'a> = (
+            &'a str,
+            &'a dyn Fn(&mut HwClassDef),
             Option<CapacityType>,
             (u32, u64),
-        )] = &[
+        );
+        let rows: &[Row<'_>] = &[
             // Pin axis: g7 is spot-only; the demand carries an od pin
             // — the pin filter admits zero g7 cells.
             (
