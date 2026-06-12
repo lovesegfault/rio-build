@@ -8301,6 +8301,97 @@ rec {
       witness = "canReachWedgedPastHorizonOwner";
     };
 
+    # Round-12 WO-S9-8 (live_061, the dead-head face): the death axis
+    # in the LIVE law — the node-face exclusion
+    # (sched.materialize.claimability-projection's node quantifier)
+    # removes a DEAD job (node completed by other means; every claim
+    # answers Gone) from the servable plane at the listing itself, so
+    # the dead head pins nothing and the convertible remainder keeps
+    # draining. THIRD main (the wedge main's bounded-census precedent
+    # on the job axis): the axis is unreachable in the base and wedge
+    # mains (DEAD_AXIS_ENABLED=false freezes deadAt — their censuses
+    # are unchanged), and the dead main explores it over ONE designated
+    # deadable job (DEADABLE = j0) at the same constants, bounding the
+    # exhaustive tier's cost by the dead states of one job
+    # (MAX_TIME + 2). All eight invariants asserted: the new exclusion
+    # leaf PLUS the seven siblings (regression over the axis).
+    # r[verify sched.materialize.claimability-projection+1]
+    # r[verify sched.materialize.listing-distribution]
+    quint-matdist-dead-recovery = mkQuintCheck {
+      name = "matdist-dead-recovery";
+      spec = "materializationDistribution";
+      main = "materializationDistributionDead";
+      invariants = [
+        "servedJobsConvertibleWithinHorizon"
+        "ownerMapPartitionsClaimable"
+        "serveSliceDisjointWhenFresh"
+        "serveSliceCoversFreshOwned"
+        "stealOnlyAfterOwnerStaleness"
+        "noJobUnlistedForever"
+        "stealRecoversOrphanedRemainder"
+        "wedgedOwnerSliceRecovered"
+      ];
+    };
+
+    # The dead-head falsify twin (round-12 WO-S9-8): no node-face
+    # exclusion (DEAD_HEAD_SERVED — the as-built pre-fix world where
+    # the listing carried node-terminal jobs) — the dead head stays
+    # served past the steal-horizon grace and can never convert:
+    # servedJobsConvertibleWithinHorizon dies. The live_061 pinned
+    # window, as a model kill.
+    # r[verify sched.materialize.claimability-projection+1]
+    quint-matdist-falsify-dead-head = mkQuintSimWitnessCheck {
+      name = "matdist-falsify-dead-head";
+      spec = "calibration/matdist-dead-head-pins-window";
+      main = "matDistCalibDeadHeadPinsWindow";
+      extraSpecs = [ "materializationDistribution" ];
+      witness = "servedJobsConvertibleWithinHorizon";
+      maxSamples = 200000;
+      maxSteps = 12;
+    };
+
+    # Kill-isolation holds (R16): the dead-head twin's kill goes
+    # through the exclusion leaf ALONE — all six sibling invariants
+    # survive the DEAD_HEAD_SERVED lane (under the defect the servable
+    # plane IS the raw claimable set — exactly the base model's plane —
+    # and the convertibility guard only restricts claims, so every
+    # sibling's reachable projection stays inside the base census).
+    # Exhaustive on the twin module.
+    # r[verify sched.materialize.listing-distribution]
+    quint-matdist-dead-siblings-intact = mkQuintCheck {
+      name = "matdist-dead-siblings-intact";
+      spec = "calibration/matdist-dead-head-pins-window";
+      main = "matDistCalibDeadHeadPinsWindow";
+      extraSpecs = [ "materializationDistribution" ];
+      invariants = [
+        "ownerMapPartitionsClaimable"
+        "serveSliceDisjointWhenFresh"
+        "serveSliceCoversFreshOwned"
+        "stealOnlyAfterOwnerStaleness"
+        "noJobUnlistedForever"
+        "stealRecoversOrphanedRemainder"
+      ];
+    };
+
+    # bug_083: the premise-reachability witness for the dead-head
+    # exclusion law, ON the live dead regime — the SAME instantiation
+    # the holds check runs against. The falsify twin's kill certifies
+    # premise reachability only under DEAD_HEAD_SERVED (the defect
+    # lane's own plane, which the live exclusion forbids — a strictly
+    # weaker proposition). A dieJob guard narrowing or a DEADABLE
+    # shrink would vacuate the exclusion law with the dead checks
+    # green — THIS check goes red instead (expect-violation
+    # semantics: the violation transcript IS the success). Expected
+    # violation at shallow depth: one die + two ticks with any member
+    # listed.
+    # r[verify sched.materialize.claimability-projection+1]
+    quint-matdist-dead-premise-reachable = mkQuintWitnessCheck {
+      name = "matdist-dead-premise-reachable";
+      spec = "materializationDistribution";
+      main = "materializationDistributionDead";
+      witness = "canReachDeadHeadPastHorizon";
+    };
+
     # ------------------------------------------------------------------
     # Gateway connection/session lifecycle campaign (gw-session-formal,
     # round-2 Track B), Phase 0 Stage C: the rio-gateway accept → auth →

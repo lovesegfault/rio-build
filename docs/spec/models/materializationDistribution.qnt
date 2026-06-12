@@ -60,6 +60,28 @@
 //     equally injective) — the world where owning and serving
 //     disagree, the exact production failure the coverage law
 //     exists to forbid.
+//   - DEAD_HEAD_SERVED (round-12 WO-S9-8, live_061 — the dead-head
+//     face, the JOB-side dual of the wedge axis): a DEAD job (its
+//     node completed by other means while the job sat unresolved —
+//     the live_061 zombie: every claim against it answers Gone, so it
+//     can never convert) is STILL SERVED — the as-built pre-fix world
+//     where the listing carried node-terminal jobs (db query
+//     node-blind, serve filter claimability-only). The dead head then
+//     pins every serve set it lands in: claim attempts burn on it
+//     forever and the oldest-first window never drains (live_061's
+//     ~0.5% fleet conversion). Falsifies
+//     servedJobsConvertibleWithinHorizon. The live law (the rust
+//     node-face exclusion, sched.materialize.claimability-projection)
+//     removes a dead job from the convertible plane at the listing
+//     itself; its terminal disposition (the obsolete fold) is the JOB
+//     model's plane (materializationJob.qnt obsoleteOnProduced), not
+//     this model's — the dead axis here pins only the LISTING-plane
+//     exclusion law. The death axis (deadAt + dieJob) is gated on
+//     DEAD_AXIS_ENABLED and explored in the THIRD main
+//     (materializationDistributionDead) over a single designated
+//     deadable job (DEADABLE = j0) — the bounded exhaustive census,
+//     the WEDGEABLE precedent verbatim; the base and wedge mains bind
+//     the axis OFF and keep their censuses (deadAt is frozen there).
 //   - WEDGED_KEEPS_BEATING (round-6 WO-S1-4, merged_bug_005 — the
 //     honest-beat law, store.materialize.honest-beat): a WEDGED
 //     worker (alive, listing, but conversion-incapable — budget
@@ -128,6 +150,15 @@ module materializationDistribution {
   /// pre-fix world where listing recency lies about claim
   /// capability.
   const WEDGED_KEEPS_BEATING: bool
+  /// Death axis master switch (round-12 WO-S9-8): the dieJob action
+  /// exists only when enabled. The base and wedge mains bind false —
+  /// their censuses are unchanged (deadAt is frozen at
+  /// all-convertible).
+  const DEAD_AXIS_ENABLED: bool
+  /// Defect lane (live_061): a dead job is STILL SERVED — no
+  /// node-face exclusion at the listing (the as-built pre-fix world
+  /// where the dead head pins the window).
+  const DEAD_HEAD_SERVED: bool
 
   /// Per-worker composite members (CF-2): {replica}w{worker}.
   val MEMBERS = Set("r0w0", "r0w1", "r1w0", "r1w1")
@@ -148,6 +179,16 @@ module materializationDistribution {
   /// the wedged-owner premise becomes unreachable in the live wedge
   /// regime. The recovery law itself quantifies over ALL owners.
   val WEDGEABLE = Set("r1w0")
+
+  /// The designated deadable job (the bounded death-axis census: one
+  /// job's dead state keeps the third main exhaustively checkable —
+  /// the WEDGEABLE precedent on the job axis). Premise reachability
+  /// is MACHINE-CHECKED, never a verified-at-a-commit note (bug_083):
+  /// the wired expect-violation witness (canReachDeadHeadPastHorizon,
+  /// the quint-matdist-dead-premise-reachable entry) goes red the
+  /// moment the dead-head premise becomes unreachable in the live
+  /// dead regime. The exclusion law itself quantifies over ALL jobs.
+  val DEADABLE = Set("j0")
 
   // --- state ----------------------------------------------------------------
 
@@ -170,11 +211,30 @@ module materializationDistribution {
   /// gate reads it; only [WEDGEABLE] members ever move it (the
   /// bounded census).
   var wedgedAt: str -> int
+  /// Death axis (round-12 WO-S9-8): the beat a job's node completed
+  /// by other means while the job sat unresolved (the live_061
+  /// zombie face), or -1 = convertible. The node-face exclusion
+  /// reads it; only [DEADABLE] jobs ever move it (the bounded
+  /// census).
+  var deadAt: str -> int
 
   // --- pure law ---------------------------------------------------------------
 
   /// Conversion capability: not currently wedged.
   pure def canConvertAt(w: str -> int, m: str): bool = w.get(m) < 0
+
+  /// Job convertibility: the node has not completed by other means
+  /// (a dead job's every claim answers Gone — it can never convert).
+  pure def jobConvertibleAt(da: str -> int, j: str): bool = da.get(j) < 0
+
+  /// THE serve-plane input (the node-face exclusion,
+  /// sched.materialize.claimability-projection): the live law lists
+  /// only convertible claimable jobs — a dead job leaves the plane at
+  /// the listing itself (its terminal disposition is the job model's
+  /// obsolete fold, below this abstraction). The DEAD_HEAD_SERVED
+  /// lane is the as-built world: the listing carries the dead head.
+  pure def servablePlane(deadServed: bool, da: str -> int, cl: Set[str]): Set[str] =
+    if (deadServed) cl else cl.filter(j => jobConvertibleAt(da, j))
 
   pure def jIdx(j: str): int = if (j == "j0") 0 else if (j == "j1") 1 else 2
   pure def mIdx(m: str): int =
@@ -250,6 +310,7 @@ module materializationDistribution {
     now' = now + 1,
     live' = live, lastListed' = lastListed, claimed' = claimed,
     prematureSteal' = prematureSteal, wedgedAt' = wedgedAt,
+    deadAt' = deadAt,
   }
 
   /// An identity-bearing listing call: the caller's contact is
@@ -269,7 +330,7 @@ module materializationDistribution {
     val ms = membersAt(ll1, now, MEMBER_TTL)
     val served = serveSetFor(
       SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, OWNER_SERVE_SKEW, STEAL_HORIZON,
-      m, ms, ll1, now, JOBS.exclude(claimed))
+      m, ms, ll1, now, servablePlane(DEAD_HEAD_SERVED, deadAt, JOBS.exclude(claimed)))
     val stolen = served.filter(j => not(ownersOf(SHARED_HEAD_CONVOY, j, ms).contains(m)))
     all {
       lastListed' = ll1,
@@ -277,7 +338,7 @@ module materializationDistribution {
         stolen.exists(j =>
           ownersOf(SHARED_HEAD_CONVOY, j, ms).exists(o => freshAt(ll1, now, STEAL_HORIZON, o))))),
       now' = now, live' = live, claimed' = claimed,
-      wedgedAt' = wedgedAt,
+      wedgedAt' = wedgedAt, deadAt' = deadAt,
     }
   }
 
@@ -288,14 +349,20 @@ module materializationDistribution {
   action claimJob(m: str, j: str): bool = all {
     live.get(m),
     canConvertAt(wedgedAt, m),
+    // A dead job NEVER converts (every claim answers Gone) — in the
+    // defect lane it stays served and burns attempts; this guard is
+    // what makes the unexcluded dead head a pinned head rather than
+    // a drained one.
+    jobConvertibleAt(deadAt, j),
     not(claimed.contains(j)),
     val ms = membersAt(lastListed, now, MEMBER_TTL)
     serveSetFor(
       SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, OWNER_SERVE_SKEW, STEAL_HORIZON,
-      m, ms, lastListed, now, JOBS.exclude(claimed)).contains(j),
+      m, ms, lastListed, now,
+      servablePlane(DEAD_HEAD_SERVED, deadAt, JOBS.exclude(claimed))).contains(j),
     claimed' = claimed.union(Set(j)),
     now' = now, live' = live, lastListed' = lastListed,
-    prematureSteal' = prematureSteal, wedgedAt' = wedgedAt,
+    prematureSteal' = prematureSteal, wedgedAt' = wedgedAt, deadAt' = deadAt,
   }
 
   /// Replica scale-out: a BATCH join of the replica's workers
@@ -306,6 +373,7 @@ module materializationDistribution {
     live' = MEMBERS.mapBy(m => (live.get(m) or workersOf(r).contains(m))),
     now' = now, lastListed' = lastListed, claimed' = claimed,
     prematureSteal' = prematureSteal, wedgedAt' = wedgedAt,
+    deadAt' = deadAt,
   }
 
   /// Replica scale-in: a BATCH leave (CF-2).
@@ -314,6 +382,7 @@ module materializationDistribution {
     live' = MEMBERS.mapBy(m => (live.get(m) and not(workersOf(r).contains(m)))),
     now' = now, lastListed' = lastListed, claimed' = claimed,
     prematureSteal' = prematureSteal, wedgedAt' = wedgedAt,
+    deadAt' = deadAt,
   }
 
   /// A single worker dies (the per-worker churn axis: its contact
@@ -324,6 +393,7 @@ module materializationDistribution {
     live' = live.set(m, false),
     now' = now, lastListed' = lastListed, claimed' = claimed,
     prematureSteal' = prematureSteal, wedgedAt' = wedgedAt,
+    deadAt' = deadAt,
   }
 
   /// The capability axis (round-6 WO-S1-4): a member becomes
@@ -339,6 +409,7 @@ module materializationDistribution {
     wedgedAt' = wedgedAt.set(m, now),
     now' = now, live' = live, lastListed' = lastListed,
     claimed' = claimed, prematureSteal' = prematureSteal,
+    deadAt' = deadAt,
   }
 
   /// Capability returns (the futility latch's probe converting, the
@@ -349,6 +420,26 @@ module materializationDistribution {
     wedgedAt' = wedgedAt.set(m, -1),
     now' = now, live' = live, lastListed' = lastListed,
     claimed' = claimed, prematureSteal' = prematureSteal,
+    deadAt' = deadAt,
+  }
+
+  /// The death axis (round-12 WO-S9-8, live_061): a job's node
+  /// completes by other means while the job sits unresolved — the
+  /// store probe found the outputs, a sibling build produced them,
+  /// CA cutoff. From this beat every claim against the job answers
+  /// Gone. Only [DEADABLE] jobs die (the bounded census); the job
+  /// model owns the death's terminal disposition (the obsolete
+  /// fold) — here it is an absorbing fact the listing law must
+  /// exclude.
+  action dieJob(j: str): bool = all {
+    DEAD_AXIS_ENABLED,
+    DEADABLE.contains(j),
+    not(claimed.contains(j)),
+    jobConvertibleAt(deadAt, j),
+    deadAt' = deadAt.set(j, now),
+    now' = now, live' = live, lastListed' = lastListed,
+    claimed' = claimed, prematureSteal' = prematureSteal,
+    wedgedAt' = wedgedAt,
   }
 
   // --- harness ------------------------------------------------------------------
@@ -360,6 +451,7 @@ module materializationDistribution {
     claimed' = Set(),
     prematureSteal' = false,
     wedgedAt' = MEMBERS.mapBy(m => -1),
+    deadAt' = JOBS.mapBy(j => -1),
   }
 
   action step = {
@@ -375,6 +467,7 @@ module materializationDistribution {
       crashWorker(m),
       wedgeWorker(m),
       unwedgeWorker(m),
+      dieJob(j),
     }
   }
 
@@ -387,7 +480,7 @@ module materializationDistribution {
   val ownerMapPartitionsClaimable =
     val ms = membersAt(lastListed, now, MEMBER_TTL)
     (ms.size() > 0) implies
-      JOBS.exclude(claimed).forall(j =>
+      servablePlane(DEAD_HEAD_SERVED, deadAt, JOBS.exclude(claimed)).forall(j =>
         ownersOf(SHARED_HEAD_CONVOY, j, ms).size() == 1)
 
   /// LEAF 1 of the listing law, restated over the LAW FUNCTION
@@ -404,7 +497,7 @@ module materializationDistribution {
   /// untouched, ownership intact in the same lane).
   val serveSliceDisjointWhenFresh =
     val ms = membersAt(lastListed, now, MEMBER_TTL)
-    val cl = JOBS.exclude(claimed)
+    val cl = servablePlane(DEAD_HEAD_SERVED, deadAt, JOBS.exclude(claimed))
     val freshOwned = cl.filter(j =>
       ownersOf(SHARED_HEAD_CONVOY, j, ms).forall(o =>
         freshAt(lastListed, now, STEAL_HORIZON, o)))
@@ -430,7 +523,7 @@ module materializationDistribution {
   /// disagree.
   val serveSliceCoversFreshOwned =
     val ms = membersAt(lastListed, now, MEMBER_TTL)
-    val cl = JOBS.exclude(claimed)
+    val cl = servablePlane(DEAD_HEAD_SERVED, deadAt, JOBS.exclude(claimed))
     cl.forall(j =>
       ownersOf(SHARED_HEAD_CONVOY, j, ms).forall(o =>
         freshAt(lastListed, now, STEAL_HORIZON, o) implies
@@ -451,13 +544,14 @@ module materializationDistribution {
   /// gap: the dead owner's slice is nobody's until the TTL re-keys.
   val noJobUnlistedForever =
     val ms = membersAt(lastListed, now, MEMBER_TTL)
+    val plane = servablePlane(DEAD_HEAD_SERVED, deadAt, JOBS.exclude(claimed))
     ms.exists(m => live.get(m)) implies
-      JOBS.exclude(claimed).forall(j =>
+      plane.forall(j =>
         ms.exists(m => and {
           live.get(m),
           serveSetFor(
             SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, OWNER_SERVE_SKEW, STEAL_HORIZON,
-            m, ms, lastListed, now, JOBS.exclude(claimed)).contains(j),
+            m, ms, lastListed, now, plane).contains(j),
         })
         or
         ownersOf(SHARED_HEAD_CONVOY, j, ms).exists(o =>
@@ -478,8 +572,9 @@ module materializationDistribution {
   /// implication chain; no anonymous conjunct bundle).
   val wedgedOwnerSliceRecovered =
     val ms = membersAt(lastListed, now, MEMBER_TTL)
+    val plane = servablePlane(DEAD_HEAD_SERVED, deadAt, JOBS.exclude(claimed))
     ms.exists(m => live.get(m) and canConvertAt(wedgedAt, m)) implies
-      JOBS.exclude(claimed).forall(j =>
+      plane.forall(j =>
         ownersOf(SHARED_HEAD_CONVOY, j, ms).forall(o =>
           (live.get(o) and not(canConvertAt(wedgedAt, o)) and now - wedgedAt.get(o) > STEAL_HORIZON)
             implies
@@ -488,7 +583,7 @@ module materializationDistribution {
             canConvertAt(wedgedAt, m),
             serveSetFor(
               SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, OWNER_SERVE_SKEW, STEAL_HORIZON,
-              m, ms, lastListed, now, JOBS.exclude(claimed)).contains(j),
+              m, ms, lastListed, now, plane).contains(j),
           })))
 
   /// bug_083 (round-8 WO-S2-5) — the premise-reachability witness for
@@ -510,7 +605,7 @@ module materializationDistribution {
   /// green — THIS check goes red instead.
   val canReachWedgedPastHorizonOwner =
     val ms = membersAt(lastListed, now, MEMBER_TTL)
-    not(JOBS.exclude(claimed).exists(j =>
+    not(servablePlane(DEAD_HEAD_SERVED, deadAt, JOBS.exclude(claimed)).exists(j =>
       ownersOf(SHARED_HEAD_CONVOY, j, ms).exists(o => and {
         live.get(o),
         not(canConvertAt(wedgedAt, o)),
@@ -523,15 +618,56 @@ module materializationDistribution {
   /// member's serve set (served broadly, not just to someone).
   val stealRecoversOrphanedRemainder =
     val ms = membersAt(lastListed, now, MEMBER_TTL)
+    val plane = servablePlane(DEAD_HEAD_SERVED, deadAt, JOBS.exclude(claimed))
     (ms.size() > 1) implies
-      JOBS.exclude(claimed).forall(j =>
+      plane.forall(j =>
         ownersOf(SHARED_HEAD_CONVOY, j, ms).forall(o =>
           not(freshAt(lastListed, now, STEAL_HORIZON, o)))
         implies
         ms.forall(m =>
           serveSetFor(
             SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, OWNER_SERVE_SKEW, STEAL_HORIZON,
-            m, ms, lastListed, now, JOBS.exclude(claimed)).contains(j)))
+            m, ms, lastListed, now, plane).contains(j)))
+
+  /// The dead-head exclusion law (round-12 WO-S9-8, live_061;
+  /// verified via the nix/quint.nix dead-regime entries — the markers
+  /// live at the WIRING, not here): every job in any member's serve
+  /// set is CONVERTIBLE, or its death is younger than the
+  /// steal-horizon grace (the bound production promises across the
+  /// beat-cache and persist-lag windows; the live node-face exclusion
+  /// removes a dead job at the very next listing read). Under
+  /// DEAD_HEAD_SERVED the dead head stays served as `now` advances
+  /// past the grace — the falsify twin's kill: the pinned window,
+  /// live_061's claim-attempt burn. P7: a named single-proposition
+  /// leaf (one implication chain; no anonymous conjunct bundle).
+  val servedJobsConvertibleWithinHorizon =
+    val ms = membersAt(lastListed, now, MEMBER_TTL)
+    val plane = servablePlane(DEAD_HEAD_SERVED, deadAt, JOBS.exclude(claimed))
+    ms.forall(m =>
+      serveSetFor(
+        SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, OWNER_SERVE_SKEW, STEAL_HORIZON,
+        m, ms, lastListed, now, plane).forall(j =>
+          jobConvertibleAt(deadAt, j) or now - deadAt.get(j) <= STEAL_HORIZON))
+
+  /// bug_083 — the premise-reachability witness for
+  /// servedJobsConvertibleWithinHorizon, wired as an EXPECT-VIOLATION
+  /// check on the LIVE dead regime (the
+  /// quint-matdist-dead-premise-reachable entry in nix/quint.nix —
+  /// markers live at the wiring, per the header discipline): VIOLATED
+  /// exactly when the law's contended premise — an unclaimed dead job
+  /// past the steal-horizon grace, with a live member in the view —
+  /// is reached WITHOUT the defect lane's DEAD_HEAD_SERVED plane (the
+  /// falsify twin's kill certifies reachability only under that lane,
+  /// a strictly weaker proposition). A dieJob guard narrowing or a
+  /// DEADABLE shrink that closes the corridor vacuates the law with
+  /// the dead-regime holds check still green — THIS check goes red
+  /// instead.
+  val canReachDeadHeadPastHorizon =
+    not(JOBS.exclude(claimed).exists(j => and {
+      not(jobConvertibleAt(deadAt, j)),
+      now - deadAt.get(j) > STEAL_HORIZON,
+      membersAt(lastListed, now, MEMBER_TTL).exists(m => live.get(m)),
+    }))
 }
 
 /// The wired live regime: horizon 1 < ttl 3 < MAX_TIME 6 keeps the
@@ -549,7 +685,9 @@ module materializationDistributionBase {
     EAGER_STEAL = false,
     OWNER_SERVE_SKEW = false,
     WEDGE_AXIS_ENABLED = false,
-    WEDGED_KEEPS_BEATING = false
+    WEDGED_KEEPS_BEATING = false,
+    DEAD_AXIS_ENABLED = false,
+    DEAD_HEAD_SERVED = false
   ).*
 }
 
@@ -568,6 +706,32 @@ module materializationDistributionWedge {
     EAGER_STEAL = false,
     OWNER_SERVE_SKEW = false,
     WEDGE_AXIS_ENABLED = true,
-    WEDGED_KEEPS_BEATING = false
+    WEDGED_KEEPS_BEATING = false,
+    DEAD_AXIS_ENABLED = false,
+    DEAD_HEAD_SERVED = false
+  ).*
+}
+
+/// The THIRD main (round-12 WO-S9-8): the death axis ON in the live
+/// law — the node-face exclusion removes a dead job from the
+/// servable plane at the listing, so the dead head pins nothing and
+/// the convertible remainder keeps draining. Bounded exhaustive
+/// census: one designated deadable job (DEADABLE); every other
+/// parameter as the base regime (the wedge main's tier precedent —
+/// the added axis multiplies the census by the dead states of one
+/// job, bounded by MAX_TIME + 2).
+module materializationDistributionDead {
+  import materializationDistribution(
+    MAX_TIME = 6,
+    STEAL_HORIZON = 1,
+    MEMBER_TTL = 3,
+    SHARED_HEAD_CONVOY = false,
+    STEAL_ENABLED = true,
+    EAGER_STEAL = false,
+    OWNER_SERVE_SKEW = false,
+    WEDGE_AXIS_ENABLED = false,
+    WEDGED_KEEPS_BEATING = false,
+    DEAD_AXIS_ENABLED = true,
+    DEAD_HEAD_SERVED = false
   ).*
 }
