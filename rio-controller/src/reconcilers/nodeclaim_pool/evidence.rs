@@ -430,8 +430,6 @@ mod tests {
     /// resolve to the CLEAR — the registration is strictly newer, and
     /// shipping the stale mark would re-mask the healthy cell. This
     /// direction's eviction law is UNCHANGED by merged_bug_003.
-    // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
-    #[test]
     /// W12-AS (bug_168) — proposition: the guard never destroys the
     /// diagnostics it exists to improve; population: {clean drop,
     /// unwinding drop} — both arms pinned (the clean-drop
@@ -458,6 +456,7 @@ mod tests {
         );
     }
 
+    // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
     #[test]
     fn newer_clear_supersedes_buffered_mark() {
         let mut ev = PendingSchedulerEvidence::default();
