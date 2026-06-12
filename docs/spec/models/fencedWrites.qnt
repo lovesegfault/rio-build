@@ -30,10 +30,11 @@
 // PRICED RESIDUAL (kept reachable, bounded): a fresh INSERT below the
 // floor when NO active conflict row exists to evaluate against. It
 // cannot regress any newer row by construction — activeRowGenMonotonic
-// holds with the residual reachable (the fence-invariant-map.md
-// "fresh-insert window" entry; production bound: the successor's own
-// re-mint conflicts on the partial-unique index and the in-statement
-// guard then governs).
+// holds with the residual reachable (deliberately not excluded).
+// Production bound: the successor's own re-mint conflicts on the
+// partial-unique index, where the in-statement guard governs; the
+// worst case is one transient dual delivery, settled by the
+// report-side fence.
 //
 // BUGHUNT-2 PLANES (slot 2): three axis-gated planes extend the same
 // board — (1) tenure-stamp (merged_bug_338: writes carry the

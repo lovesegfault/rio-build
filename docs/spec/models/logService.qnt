@@ -9,11 +9,12 @@
 // This is the successor to the retired `logBufferLifecycle.qnt` (model A
 // of the deleted in-scheduler log subsystem). The architecture it models
 // has no lease composition (LogService never reads the scheduler's leader
-// election), no reaps, no tenure pins, and no finalizing write — see
-// docs/spec/models/log-invariant-map.md's campaign close-out section for
-// which of the predecessor's nine invariants transfer, which are vacuous,
-// and why. The acceptance test for this model is that document's
-// 22-bug calibration table re-run against the new architecture.
+// election), no reaps, no tenure pins, and no finalizing write — the
+// PREDECESSOR CAMPAIGN TRANSFER block below records which of the
+// predecessor's nine invariants transfer, which are vacuous, and why.
+// The acceptance test for this model is the predecessor's 22-bug
+// calibration table re-run against the new architecture — the MODEL-C
+// ACCEPTANCE TABLE below, satisfied.
 //
 // WHAT IS MODELED:
 //   - the per-execution build + uploader: monotone line production, the
@@ -108,8 +109,7 @@
 //     conformance is carried by the store unit tests
 //     (`follow_recovers_fanout_drops_in_stream` and siblings) and the
 //     dashboard's verbatim case-table mirror; the projection replays
-//     the ingest planes only (documented no-op disposition,
-//     log-invariant-map.md "Bughunt-wave B3" close-out).
+//     the ingest planes only (documented no-op disposition).
 //   - The HMAC layer, the token-vs-header derivation match, and the
 //     executor-identity comparison. The gate's checks collapse to "is
 //     the claimed execution the derivation's latest assignment" for
@@ -150,6 +150,188 @@
 // procedures are documented at their definitions below. Measured state
 // counts, depths, and wall-clocks live in the introducing commits'
 // messages and the CI checks' output transcripts, never in this file.
+//
+// ===========================================================================
+// PREDECESSOR CAMPAIGN TRANSFER (relocated from the retired build-log
+// invariant map's campaign close-out; the full original is in git
+// history). The in-scheduler subsystem the predecessor campaign modeled
+// (rio-scheduler/src/logs/: the per-derivation ring buffer, push_for,
+// the gap-merge fold, the four reaps, the lease-gated flusher, the
+// stored-coverage reconciliation, the drv_logs row) was deleted and
+// replaced by this model's subject. The predecessor campaign found,
+// confirmed, fixed and proved ONE new bug in the old subsystem
+// (calibration entry #0: the gap-merge fold double-counts a re-delivered
+// overlap once the stored-coverage reconcile empties the ring; the
+// accounted_below accept floor was the fix). Its calibration against the
+// 22 historical bugs: 14 re-findable by the invariant set, 2 proven
+// redundant for safety, the rest not-encoded or model-B; model B
+// (cross-replica tenure-pinned finalization) was cancelled outright —
+// its subject does not exist here — and the Phase-6 simplification
+// ledger closed with "the architecture change was the simplification".
+//
+// THE NINE PREDECESSOR INVARIANTS AGAINST THE LOGSERVICE (the rebase
+// audit's transfer table, verbatim):
+// | Invariant | Disposition | Why |
+// |---|---|---|
+// | `noCrossExecContamination` | **Structural** | Storage is keyed by `exec_id` end-to-end (chunk key, manifest PK, the stream bound to one execution at open); a re-dispatch mints a new `exec_id` and a new key namespace. The in-memory carrier a restamp could contaminate does not exist — the ingest session is created per stream and dropped with it. |
+// | `lineSpanExact` | **Gap → fixed** | The per-chunk half is structural (a chunk's recorded count is the physical length of a contiguous run; no gap arithmetic exists to overshoot). The log-level half moved into the completeness gate, whose post-terminal MUST (drop accepted lines at or past `final_line_count`) was specified but unimplemented — the one real protocol finding of the audit, fixed during integration by enforcing the gate on every append rather than only at stream open. |
+// | `bindingGateExcludesForeignExecutors` | **Structural** | Relocated and strengthened: `store.log.append-auth` (HMAC token → derivation match → latest-assignment + builder binding) runs at stream open, and the stream is then bound to one `(exec_id, session_id)` whose chunk keys cannot name any other execution. |
+// | `everyRetainedEntryIsJustified` | **Vacuous** | The four orphan shapes and their three differently-gated reapers are gone. The only retained in-memory state is the per-stream ingest buffer, whose lifetime is the gRPC stream's; the persistent analog (a manifest row) is justified by definition and reaped only by the TTL sweep. |
+// | `noSilentLineLoss` | **Structural** | A line leaves the builder's retransmit buffer only when an ack covers it; an ack is sent only after the manifest INSERT commits; the manifest row is written only after the object PUT. Every remaining loss channel is disclosed (the computed `is_complete = false`, the abandoned-drain counter, the missing-object read error). |
+// | `noStaleSealOnLiveCarrier` | **Vacuous** | No seal latch and no carrier. Completeness is a monotone predicate recomputed from the DB on every open and every read; a seal that outlives the state that justified it is unrepresentable. |
+// | `finalizedRowFrozen` | **Vacuous** | There is no finalized row to freeze: chunks are write-once, the manifest is INSERT-only, `final_line_count` is stamped once at terminal, and no finalizing write consolidates other writers' data. |
+// | `storedCoverageNeverRegresses` | **Vacuous** | Coverage is the union of INSERT-only manifest rows; there is no reconcile that folds a stored row into a new write, so nothing can replace a larger span with a smaller one. Overlapping sessions union at read time. |
+// | `boundsOK` | **Vacuous** | The model's own state-ceiling tripwire (a TLC finite-state-space artifact) has no subject without the model. The implementation bounds it stood beside (the ring byte cap, the periodic flush) are replaced by `store.log.ingest-bounds`. |
+//
+// **Successor.** The continuing campaign re-targets onto the LogService
+//
+// MODEL-C ACCEPTANCE TABLE (the predecessor's 22-bug corpus against
+// THIS model, verbatim from the retired map — the acceptance test the
+// transfer demanded, executed; quint.nix's log-service section points
+// here):
+// `docs/spec/models/logService.qnt` is the successor model: the builder's
+// at-least-once ack-trimmed uploader, the open-time binding + completeness
+// gate, the per-stream ingest session and its accept predicate, the
+// INSERT-only chunk manifest, the read path's ordered-walk dedup over
+// overlapping sessions, the read-time completeness fold, and the TTL sweep.
+// Four exhaustive TLC regimes (`quint-log-service-{base,redispatch,resend,
+// sweep}` in `nix/quint.nix`) assert its invariants over their full
+// reachable state spaces; twelve expect-violation witness checks pin the
+// contended states as reachable. Measured state counts and wall-clocks are
+// in the introducing commit's message and the checks' transcripts.
+//
+// ### The model-C invariants
+//
+// | Invariant | Predecessor | What it checks |
+// |---|---|---|
+// | `noCrossExecContamination` | `noCrossExecContamination` | Execution E's manifest holds only lines E's own bound builder sent. The defense is structural (the chunk key embeds the exec_id the stream was bound to at open); the invariant is the regression guard that the cut keys its chunk by the cutting session's execution. |
+// | `authGateExcludesUnassignedWriters` | `authGateExcludesForeignWriters` (renamed at the bughunt-wave B2 re-keying) | The stream-open predicate admits a claimed execution only while its OWN assignment row exists (the v2 claimed-exec gate, `store.log.append-auth+2`): supersession alone no longer revokes write authority — only the scheduler's in-place row rewrite does. `logServiceCalibGateRow` pins that dropping the row conjunct falsifies it. |
+// | `acceptedWithinCap` | — (new; bughunt-wave B2, merged_bug_207) | The durable accepted footprint (committed chunks ∪ session buffers ∪ fabricated lines) never exceeds the per-execution cap, across reconnects. Measured against durable state, not the accounting ghost, so the pre-fix per-session encoding (`logServiceCalibSessionCaps`: reconnects reset the account and the open gate has no durable check) falsifies it. The boundary is pinned reachable by `quint-log-service-witness-cap-boundary`. |
+// | `noSilentLineLoss` | `noSilentLineLoss` | The four-disjunct disclosed-loss form: every line the build emitted is in the builder's retransmit buffer, in a store-side ingest buffer, covered by a manifest chunk, or the loss is disclosed (the log does not read as complete / the uploader recorded its abandonment). |
+// | `ackImpliesDurable` | — (new) | The honest uploader's load-bearing refinement of the conservation law: every line below the builder's acked watermark is manifest-covered until the TTL sweep removes it. Asserted only in the regimes without the fabricating client (see the val's doc for why a client that mis-numbers its own lines forfeits the per-ack durability claim). |
+// | `servedSpanExact` | `lineSpanExact` | The read path's ordered-walk-with-watermark over the manifest — including overlapping chunks from two sessions — yields exactly the union of the chunks' line ranges, each line exactly once. The fold is encoded as the code's walk, not as the union it is supposed to compute. |
+// | `completeLogServesAllProduced` | — (the conservation law's bite, restated) | A log that reads complete serves every line the build produced. |
+// | `completenessGate` | — (new; the audit's defect #1) | Once a session has learned the execution's recorded `final_line_count`, every line it subsequently accepts is below it. Lines accepted before the mid-stream refresh observed the seal are the disclosed bounded residual. |
+//
+// ### The 22-bug corpus against model C
+//
+// Verdict legend: **CONSTRUCTION** = the state or mechanism the bug lived
+// in does not exist in the new architecture; the model's transition
+// relation cannot represent the harmful write. **CHECKED(inv, regime)** =
+// the equivalent hazard exists at the named site and the named invariant
+// holds over the named regime's full reachable state space, with the
+// contended scenario pinned reachable by the named witness check.
+// **OUTSIDE** = no model footprint then, no model footprint now;
+// conventional tests own it.
+//
+// | Original row | Old fix | Model-C verdict | Where the hazard went |
+// |---|---|---|---|
+// | `3a55474ac` | accounted-floor accept gate | **CHECKED**(`servedSpanExact`, resend) | The re-delivered batch after an ambiguous disconnect lands as a *manifest overlap* (a second session's chunk covering the same line range), not a span overstatement — there is no gap-merge fold to double-count it. The hazard moved to the read path's `(first_line, session_id)` ordered walk and `LineCursor` watermark (`tail.rs`), which must serve each overlapped line exactly once; `quint-log-service-witness-overlap` and `-dedup` pin the overlap and the suppressed duplicate as reachable. The within-one-session re-delivery is rejected by `high_water_line` (the monotone floor — the `accounted_below` fix built in from the start, never reset by the buffer emptying). |
+// | `496e6fb14` | recv-task (executor, drv) binding gate | **CHECKED**(`authGateExcludesUnassignedWriters`, redispatch) | Relocated to `gate.rs::check_append_open`: HMAC token, token-vs-header derivation match, claimed-exec row + builder + kind binding (v2 at the bughunt-wave: the latest-assignment race was merged_bug_101's displacement hole — a materialization mint or re-dispatch silently revoked a terminal-but-incomplete build's late replay; authority now keys on the claimed exec's own row and the rejection moved to the in-place-rewrite arm, pinned by `quint-log-service-witness-superseded-rejected` over the rewritten row). The identity comparisons are pure equality on signed token fields. The content/provenance harm is still erased by the line-as-integer encoding — the same documented price the predecessor paid. |
+// | `496e6fb14` (residual) | legacy `push()`'s `or_default()` unstamped-entry allocation | **CONSTRUCTION** | There is no entry to allocate: a stream that fails the gate never creates a session, and the per-replica stream-count and byte-budget semaphores bound the resource the unstamped entry leaked. Resource bounds, outside the model. |
+// | `7beb1ca00` #1 | gateway `ForwardLogBatch` gated on the accept verdict | **CONSTRUCTION** | The live-tail fan-out happens inside `accept()` after every gate (`ingest.rs`), so a rejected batch is never fanned out. The fan-out sink itself is read-side plumbing outside the model. |
+// | `7beb1ca00` #2 | `FlushRequest.exec_id` stale-drain pin | **CONSTRUCTION** | No finalizing drain exists. A cut drains the cutting session's own buffer into the cutting session's own `(exec, session)` keyspace; there is no request that names an execution other than the one the stream was bound to at open. `noCrossExecContamination` is the regression guard. |
+// | `7beb1ca00` #3 | `LogFlusher` periodic arms leader-gated | **CONSTRUCTION** | No leader, no flusher. The periodic cut is per-stream and INSERT-only; two replicas concurrently cutting for one execution are two sessions whose chunk sets union at read time instead of two writers racing an UPSERT. |
+// | `7ffbf1415` | `BuildPhase` actor-side executor gate | **OUTSIDE** | A sibling message type with no log-subsystem footprint in either architecture. |
+// | `6c26e85f8` | cross-exec restamp clears the retained lines | **CONSTRUCTION** + **CHECKED**(`noCrossExecContamination`, redispatch) | There is no restamp and no in-memory carrier that survives a re-dispatch: the new execution gets a new exec_id, a new session, a new buffer, and a new chunk-key namespace. The contended state — both executions' logs growing concurrently while the superseded session still holds lines — is reachable (`quint-log-service-witness-concurrent-execs`) and the invariant holds over it. |
+// | `699ea1692` | cross-exec restamp clears the seal | **CONSTRUCTION** | No seal latch. Completeness is a predicate computed per read from the execution's own lifecycle row and manifest; a prior execution's completeness cannot mute a live execution's stream because the gate consults the *claimed* execution's state, not a shared per-derivation tombstone. The muting state (`noStaleSealOnLiveCarrier`'s subject) is unrepresentable. |
+// | `2f9a747d0` | same-exec restamp clears the seal + final-pending mark | **CONSTRUCTION** | Same as above for the seal half. The final-pending mark has no analog (no deferred final). A reconnecting builder opens a fresh session whose admission is recomputed from the DB. |
+// | `6aab70b47` | enqueue-failure reap | **CONSTRUCTION** | No flush queue, no enqueue failure, no orphaned entry. The per-stream buffer's lifetime is the gRPC stream's (a panic-safe scopeguard deregisters it on every exit path). |
+// | `463090eb7` | one-shot finalized-elsewhere consult | **CONSTRUCTION** | No finalized-elsewhere state to consult and no retained entry to reap. |
+// | `f8ce10b8e` | recurring refused-UPSERT reap | **CONSTRUCTION** | No UPSERT to refuse. The manifest is INSERT-only with `ON CONFLICT DO NOTHING` on a per-attempt key. |
+// | `81824cfbb` | periodic sealed-empty reap | **CONSTRUCTION** | No sealed entry. |
+// | `84ac79b84` | stale-request guard atomic with the drain | **CONSTRUCTION** | No `flush_final` and no drain of state another actor can restamp. The cut's drain and commit operate on the cutting session's own buffer under its own mutex; the await-granularity window between them is the seam invariant (`buffer`/`in_flight`/manifest), pinned by the `subscribe_during_in_flight_cut_sees_drained_lines` unit test rather than the model (the same whole-action-atomicity boundary the predecessor drew). |
+// | `3ce5d03e4` | deferred-final tenure pin | **CONSTRUCTION** | The harm — a stale writer overwriting the row a fresher writer extended — requires a writer that overwrites. Chunks are write-once, the manifest is INSERT-only, and there is no deferred request that outlives the authority that enqueued it. |
+// | `646022e37` | tenure pin hoisted before the destructive arms | **CONSTRUCTION** | No destructive arms and no tenure to pin against. |
+// | `825cdd478` | atomic tenure-drop reap + post-await re-validation | **CONSTRUCTION** | No tenure-drop reap. |
+// | `2c301438d` | disconnect-time discard gated on an authoritative DAG | **CHECKED**(`noSilentLineLoss`, all four regimes) | The one undisclosed-loss bug of the old design. The new design's disconnect paths either *drain* the buffer (the clean half-close cuts every remaining run) or *drop* it (the abort path) — and every dropped line is still in the builder's ack-trimmed retransmit buffer, because an ack is sent only after the manifest INSERT commits. The four-disjunct conservation law holds over every regime's full state space, including the abort-then-replay and abandon-with-unacked paths (`quint-log-service-witness-abandoned` pins the disclosure channel as exercised). `ackImpliesDurable` is the no-early-ack refinement that keeps disjunct 1 honest. |
+// | `e6c18add2` | acquisition-time stale-buffer sweep | **CONSTRUCTION** | No acquisition and no stale retained buffer to sweep. |
+// | `8e97c2220` | sweep spares only non-terminal DAG entries | **CHECKED**(`noSilentLineLoss` + `ackImpliesDurable`, sweep) | The old sweep's hazard was deleting an entry whose data was still needed. The new TTL sweep's only guard is wall-clock age; the model checks that only an expired execution's chunks are ever deleted, that the deletion is disclosed (the log stops reading complete the moment its manifest or lifecycle row goes), and that the chunks-before-execution-row deletion order's crash window violates nothing. `quint-log-service-witness-swept` pins the deletion as reachable. |
+// | `abfade4d5` | periodic frozen-row UPSERT latch | **CONSTRUCTION** | `is_complete` is not stored; it is computed per read from monotone inputs (a terminal status never un-sets, the manifest only grows until the TTL sweep). A downgrade is unrepresentable in the transition relation — no action removes a chunk or a count except the sweep, whose deletion is the retention policy, not a regression. |
+// | `44905298b` | `flush_final` already-finalized consult | **CHECKED**(`completenessGate`, base) | No finalizing write to race; the one decide-once datum (`final_line_count`) is stamped by a single-threaded actor and a duplicate stamp writes the same value. The closest surviving analog is the open-time seal — a complete log rejects further `AppendLog` opens — checked by `openAdmitted`'s `not(logIsComplete)` conjunct and pinned reachable by `quint-log-service-witness-complete-open-rejected`. |
+// | `d8944727e` | gap-merge fold counts the gap, not the marker | **CHECKED**(`completeLogServesAllProduced`, base) | No gap-merge fold. A forward gap splits the cut into two chunks and is *visible in the manifest* as non-contiguous rows; the completeness fold (`gate.rs::manifest_covers_contiguously`) reports it as incomplete instead of counting it into a span. The gapped manifest is reachable (`quint-log-service-witness-gapped-manifest`) and a log never reads complete across a gap. |
+// | `effefb0a1` | flush span = line-number span, not physical count | **CHECKED**(`servedSpanExact`, base + resend) | A chunk's recorded `line_count` is the physical length of the contiguous run it was cut from, so its line-number span and its physical count are equal by construction — the two quantities the old fix had to reconcile cannot diverge. `servedSpanExact` checks the read path serves exactly the recorded intervals. |
+// | `e1fd179b9` | stored-coverage reconcile folds any non-subsumed row | **CONSTRUCTION** | No reconcile and no fold of a stored row into a new write. Coverage is the union of INSERT-only manifest rows; the interim-leader-extended-row scenario maps to "session B committed chunks while session A was partitioned", which the read path unions instead of overwriting. |
+// | `e10deb9f6` | `req_in_tenure` keyed on the acquire-epoch | **CONSTRUCTION** | No tenure and no deferred request to validate against one. (Model B's calibration entry #1; model B is cancelled.) |
+//
+// **Summary.** Of the 27 calibration rows covering the 22 historical bugs:
+// **18 are closed by construction** — the state they lived in (the shared
+// ring entry, the seal latch, the finalizing write, the four orphan shapes,
+// the lease-coupled flusher) does not exist, and the model's transition
+// relation cannot express the harmful write; **7 are checked by an
+// invariant** over an exhaustive regime whose contended scenario a witness
+// check pins as reachable (the re-delivery overlap, the foreign-writer
+// rejection, the disconnect-time loss, the sweep's deletion scope, the
+// finalize-once seal, the gap accounting, and the span arithmetic); **2
+// are outside the model** in both architectures (display-stream and
+// sibling-message-type gates owned by conventional tests). No row is
+// exposed without a check.
+//
+//
+// BUGHUNT-WAVE B2 ROSTER (all 10 findings, close-out modes, verbatim):
+// | Finding | Mode | Where it closed |
+// |---|---|---|
+// | merged_bug_207 (session-scoped caps) | S+R | `GateOk`-only construction + durable accounts (commit 1); displaced-driver cancel rider; `acceptedWithinCap` + `logServiceCalibSessionCaps` |
+// | merged_bug_101 (latest-assignment displacement) | S | claimed-exec own-row gate v2 + the kind-mix plane above; `logServiceCalibGateRow` + `logServiceCalibLatestOnly` |
+// | merged_bug_111 (unpinned TailLog → latest exec) | S | `latest_build_exec` view (the view half); the query-filter direction is the `log-no-raw-latest-exec` policy check + DB test — none-sensible for the model (a SQL projection, no protocol content) |
+// | merged_bug_360 (loss-counter holes) | S | `AbandonReason` lattice + single `disclose()` chokepoint + `LossGuard`; the loss-conservation plane above |
+// | bug_248 (mid-stream permanent rejections) | S | `SessionEnd::PermanentReject` classification (rides the disclosure lattice) |
+// | bug_098 (write/read bound asymmetry) | S | kernel-owned `MAX_CHUNK_PAYLOAD_BYTES` + `bounded_contiguous_prefix_len` (kani contract + fuzz round-trip; byte domain — none-sensible for the line-integer model, priced in the header) |
+// | merged_bug_086 (unguarded TTL delete) | S | kernel `exec_row_sweep_eligible` + scheduler-owned `gc_exec_rows`; the sweep-ownership plane above |
+// | bug_290 (TailLog unauthenticated) | S+R | per-method `CredentialClass` table + tenant-JWT + ownership (A6); authz topology is tests + golden + VM — none-sensible for this model (trust boundary sits below the modeled writer identity, see the header) |
+// | bug_255 (parent-dir fsync) | R | `durable_put` sequence-spy test; POSIX crash semantics — none-sensible (recorded per directive 2) |
+// | bug_131 (bitmask-as-clamp) | R | `semaphore_permits` saturating helper; pure arithmetic with a unit table — none-sensible |
+//
+//
+// THE UNTIMED AXIS — B1'S OWNING RATIONALE (§4.R8, merged_bug_119,
+// verbatim; this model stays deliberately untimed):
+// The wave-wide ruling (`§4.R8`) and its owning record: **no workstream
+// models the timed axis of the log service in this wave**, and
+// `logService.qnt` stays deliberately UNTIMED — cuts are atomic, there
+// is no drain-deadline clock and no heartbeat-staleness clock in the
+// model's alphabet. Three reasons, priced once here. (1) The defects the
+// timed axis would catch were closed STRUCTURALLY, below the timer:
+// merged_bug_119's StaleBuffer mis-fire was a predicate bug (multi-run
+// buffers conflated; the backstop now gates on `failures > 0`), not a
+// timing bug — its pin is the deterministic test pair
+// `parked_cut_does_not_starve_abort` (a BlockingPutStore park must not
+// starve the abort past ~3-4 cut intervals, heartbeat observed running)
+// + `paced_multirun_drain_never_trips_stale_buffer` (the recorded red:
+// fired on tick 2-3 pre-fix). (2) A timed model re-derives tokio/timer
+// semantics rather than protocol content — the same restatement trap as
+// modeling `bounded()` (B1's transport none-sensible record, retry map).
+// (3) The B3 fork's gate-caught snapshot-ordering race sits BELOW even
+// the cut-atomicity floor — the honest net for sub-atomic interleavings
+// is the unit suite, recorded there. Re-open trigger: if a future
+// defect's mechanism is irreducibly a clock interleaving (not a
+// predicate over observed state), the timed axis graduates from
+// none-sensible to a funded model extension; until then every timer
+// behavior is pinned by deterministic tests with paused time.
+//
+//
+// B3 NONE-SENSIBLE RECORDS (roster legs with no model plane, verbatim):
+// - **merged_bug_051 (peer-URL template)** — deployment topology, not
+//   protocol state: the fail-closed empty default, the `{pod}`
+//   placeholder validation, and the IPv6 bracket rule are pinned by the
+//   config validate unit table and helm fragment 30 (byte-equality
+//   against values.yaml's sole default + null→empty env). A model
+//   dimension for "which URL template the operator rendered" would
+//   restate the fragment.
+// - **merged_bug_306 / bug_311 (dashboard + CLI rendering)** — the
+//   rendering layer is pinned by the vitest battery (the verbatim
+//   case-table mirror in `lineCursor.test.ts`, the follow battery, the
+//   gap-row/banner component tests) and the `vm-dashboard-k3s` live-tail
+//   subtest; the server-side disclosure those renderers consume is what
+//   `logServiceServed` verifies. The model's claim boundary is the wire:
+//   what arrives; the pixels are the frontend suites' jurisdiction.
+//
+// DELIBERATE NON-DELTA (gw-resync workstream order, relocated):
+// logService.qnt gains no builder-vanish / non-reading-client actions —
+// hung awaits are invisible to untimed models; the streaming-open-ban
+// lint, the keepalive chokepoint, and the timed conformance tests are
+// the binding artifacts there (this also keeps the file collision-free
+// with log-serve's extension).
+// ===========================================================================
 module logService {
   // --- 1. types ---------------------------------------------------------
 
@@ -440,7 +622,13 @@ module logService {
   /// NOT disclose (no DiscardLedger; the bounced batches simply
   /// vanish). producerLossCounted falsifies under it -- the bug_241
   /// red (zero counter increments on post-death discards) as a model
-  /// violation.
+  /// violation. House-pattern note (lease campaign rationale (e),
+  /// relocated): the successor brief sketched a separate
+  /// calibration/log-241-producer-blind.qnt override file; this
+  /// model's calibration convention is CALIB_* consts with in-file
+  /// regime modules (22 prior instances), which also avoids
+  /// re-framing 30+ actions in an override file —
+  /// logServiceCalibProducerBlind follows the house pattern.
   const CALIB_PRODUCER_BLIND: bool
 
   // --- 3. pure helpers --------------------------------------------------
@@ -1136,7 +1324,7 @@ module logService {
   val noCloseStampedReclaim = not(wit.closeStampedReclaimed)
 
   /// `NoSilentLineLoss` (the conservation law), the four-disjunct
-  /// disclosed-loss form from log-invariant-map.md's campaign close-out:
+  /// disclosed-loss form (the predecessor campaign's conservation law):
   /// every line the build emitted into its uploader is, at all times,
   ///   (1) in the builder's ack-trimmed retransmit buffer (it will be
   ///       replayed to the next session), or

@@ -3555,9 +3555,19 @@ module leaderElectionPgFaults {
 // boundedDualLeadership HOLDS; with response anchoring (the
 // lease-096-response-anchor calibration override), the post-read
 // believer's fence is fresh, its snapshot is spent, and NO discovery
-// path is armed — boundedDualLeadership is VIOLATED. See
-// docs/spec/models/lease-invariant-map.md for the neverDual exclusion
-// rationale (documented deviation (a)).
+// path is armed — boundedDualLeadership is VIOLATED. The neverDual
+// exclusion rationale (deviation (a), relocated from the retired lease
+// invariant map): a parked believer (a host suspended mid-await holds
+// is_leader frozen — it takes no actions, discovers nothing) plus a
+// thief past its steal threshold is a GENUINE dual-belief state,
+// reachable under EITHER anchoring; what the anchoring decides is
+// BOUNDEDNESS — with attempt-start anchoring the post-read believer is
+// at/past its own fence deadline, discovery disjunct (1) is armed and
+// boundedDualLeadership HOLDS; this calibration shows response
+// anchoring breaks exactly that. The generation fence
+// (sched.lease.generation-fence+3) remains the correctness backstop
+// throughout — the blast radius of every lease-side property here is
+// ops/availability, not execution correctness.
 //
 // Non-vacuity: the noSuspendStraddle witness (expect-violation,
 // quint-leader-election-witness-suspend-straddle) proves the straddle

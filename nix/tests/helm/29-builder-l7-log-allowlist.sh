@@ -11,6 +11,27 @@
 # supported k3s/Cilium configuration (vm-fetcher-split-k3s pinned the
 # regression: FOD upload starves, dispatch never progresses).
 #
+# ACCEPTANCE OF RISK — the L4-only builder->store edge (bug_290
+# network leg, relocated from the retired build-log invariant map):
+# the edges ship as L4 endpoint scoping only (toEndpoints pinned to
+# the rio-store namespace/name pair, toPorts 9002, no rules block on
+# either policy — this fragment asserts both directions: the edge
+# exists AND no L7 block reappears). The compensating control is the
+# per-method credential-class layer: TailLog's class is
+# verified-tenant-JWT (the CredentialClass table in
+# rio-store/src/authz.rs, pinned table-vs-bound-set both ways by the
+# descriptor-walk test), and a worker pod's credential — the
+# assignment token — never produces TenantClaims, so it is
+# STRUCTURALLY incapable of satisfying the gate; that exact arm is
+# pinned by taillog_assignment_token_rejected alongside the
+# tokenless, foreign-tenant, wildcard and tenant-less reds. A removed
+# network-layer defense means the application-layer control must be
+# PINNED BY TEST, not assumed. L7 RE-INTRODUCTION PATH: if the
+# chart's supported Cilium configuration gains a working L7 proxy for
+# this edge, flip this fragment's no-L7 assertion back to the
+# allow-list form and restore the rules block — the assertion failing
+# loudly is the reminder.
+#
 # (documentary — .sh is not tracey-scanned; the normative rule is
 # store.log.method-credential. This fragment is the merge-gate render
 # proof of the chart half: the builder/fetcher → store:9002 edge

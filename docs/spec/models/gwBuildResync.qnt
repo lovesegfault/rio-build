@@ -26,7 +26,20 @@
 //       evidenced recovery, a wall-clock Live tenure exceeding the
 //       backoff cap at the next death — bug_068, pinned by unit
 //       tests at build.rs. This model has no wall clock; within its
-//       frame the only-organic claim stands.) The oracle
+//       frame the only-organic claim stands. Charging offset,
+//       relocated from the retired gw-resync map and re-verified
+//       against the as-built budget: the model charges ONE budget
+//       cycle per heal cycle (reattachOk / reattachFailed); the
+//       implementation also charges the cycle that CONSUMES the
+//       loss signal (note_reattach on the stream error) — same
+//       monotone accounting, off by a constant; the only-organic
+//       property is unaffected. Post-bug_160/merged_bug_083
+//       amendment: the as-built budget is now TWO-AXIS — this
+//       model's resyncStreak is the streak axis; the wall-clock
+//       rate-axis token bucket (organic-immune refill, every death
+//       arm charged through the single next_backoff(cause)
+//       chokepoint) is outside the untimed frame, pinned by the
+//       build.rs ladder unit tests.) The oracle
 //       seat cyclesSinceOrganic counts the same cycles from the live
 //       actions; the invariant pins the gateway's counter to it, so a
 //       "reset on snapshot" implementation diverges immediately;
