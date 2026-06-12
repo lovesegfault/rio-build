@@ -245,8 +245,6 @@ pub async fn connect_raw<C: ProtoClient>(
     match &addrs.balance_host {
         None => {
             tracing::info!(addr = %addrs.addr, service = C::HEALTH_SERVICE, "connecting (single-channel)");
-            // Daemon channels live for the process lifetime — they need
-            // keepalive to detect a dead peer (see connect_channel_keepalive).
             Ok((connect_channel_keepalive(&addrs.addr).await?, None))
         }
         Some(host) => {
