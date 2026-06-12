@@ -60,3 +60,32 @@ pub fn image_tag(repo: &gix::Repository) -> Result<String> {
     };
     Ok(TAG_CACHE.get_or_init(|| tag).clone())
 }
+
+/// True iff `sha` resolves in this repo and is an ancestor of (or
+/// equal to) HEAD.
+///
+/// `sha` comes from an EC2 tag (untrusted input): require it to be a
+/// plain hex object name before it goes anywhere near a git argv — a
+/// validated hex string cannot start with `-`, so no flag smuggling.
+/// Anything else is by definition not a commit in our history →
+/// `false`.
+///
+/// `git merge-base --is-ancestor` exits 0 for an ancestor, 1 for a
+/// known-but-unrelated commit, and 128 for an object this repo has
+/// never seen. The last two both mean "not our history" — a foreign
+/// or rewritten-away commit is exactly what the caller wants to
+/// reject — so any non-zero status maps to `false`.
+pub async fn is_ancestor_of_head(sha: &str) -> Result<bool> {
+    let is_hex_oid = (7..=64).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit());
+    if !is_hex_oid {
+        return Ok(false);
+    }
+    // Shell scoped tight so it isn't held across the await (xshell::
+    // Shell is !Sync) — same shape as ami::ami_tag.
+    let fut = {
+        let sh = shell()?;
+        sh::run_capture(cmd!(sh, "git merge-base --is-ancestor {sha} HEAD"))
+    };
+    let (status, _output) = fut.await?;
+    Ok(status.success())
+}

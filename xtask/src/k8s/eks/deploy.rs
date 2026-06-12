@@ -82,9 +82,36 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     // EC2 is the source of truth for "what's actually registered".
     // assert_registered then confirms BOTH arches exist for that tag —
     // a half-uploaded set (interrupted `up --ami`) wedges Karpenter.
-    let ami_tag = super::ami::resolve_latest_tag(&region).await?;
-    let ami_tag = ami_tag.as_str();
+    let latest_ami = super::ami::resolve_latest(&region).await?;
+    let ami_tag = latest_ami.tag.as_str();
     super::ami::assert_registered(ami_tag, &region).await?;
+
+    // AMI provenance (2026-06-12 /var/rio outage): `ami-latest` is
+    // stamped by whichever worktree last ran `up --ami`. An AMI built
+    // from a stale tree predating the /var/rio provisioning
+    // (rio-{ebs,nvme}-mount + tmpfiles, nix/nixos-node/eks-node.nix)
+    // got resolved here; every builder node it booted joined without
+    // /var/rio, so builder + rio-mountd pods sat in ContainerCreating
+    // on kubelet hostPath type-check failures until the health reaper
+    // replaced the nodes. Require the AMI's source commit to be in the
+    // deploying HEAD's history. The remedy is cheap when the AMI
+    // inputs didn't actually change: the content-addressed tag makes
+    // `up --ami` skip the build/upload and just re-tag.
+    let ami_sha = latest_ami.git_sha.as_deref().with_context(|| {
+        format!(
+            "AMI {} (rio.build/ami={ami_tag}) has no rio.build/git-sha tag — \
+             retag via `cargo xtask k8s -p eks up --ami`",
+            latest_ami.image_id
+        )
+    })?;
+    anyhow::ensure!(
+        git::is_ancestor_of_head(ami_sha).await?,
+        "AMI {} (rio.build/ami={ami_tag}) was built from commit {ami_sha}, which is not an \
+         ancestor of the deploying HEAD — it comes from a foreign or rewritten-away tree and \
+         may lack node provisioning this chart depends on (e.g. the /var/rio units). \
+         Run `cargo xtask k8s -p eks up --ami` from this worktree first.",
+        latest_ami.image_id
+    );
 
     let ecr = tf.get("ecr_registry")?;
     let bucket = tf.get("chunk_bucket_name")?;

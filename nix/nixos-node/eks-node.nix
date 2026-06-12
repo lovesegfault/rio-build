@@ -145,6 +145,32 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # /var/rio provisioning is load-bearing for every build node: the
+    # builder pods and the rio-mountd DaemonSet hostPath-mount
+    # /var/rio/* with type Directory, so a node image without the
+    # rio-{kubelet,ebs}-mount units and the tmpfiles dirs joins the
+    # cluster and then wedges every build pod in ContainerCreating
+    # (kubelet: "hostPath type check failed: /var/rio is not a
+    # directory" — observed live 2026-06-12 when an AMI from a tree
+    # predating this provisioning was deployed). node-ami-eval
+    # instantiates this config in the CI gate, so this assertion turns
+    # "someone refactored the provisioning away" into an eval failure
+    # instead of a shipped AMI.
+    assertions = [
+      {
+        assertion =
+          config.systemd.services ? rio-kubelet-mount
+          && config.systemd.services ? rio-ebs-mount
+          && lib.any (lib.hasPrefix "d /var/rio ") config.systemd.tmpfiles.rules;
+        message = ''
+          EKS node image must provision /var/rio: rio-kubelet-mount +
+          rio-ebs-mount units and the "d /var/rio" tmpfiles rules
+          (builder/mountd hostPath mounts hard-require the directory;
+          see eks-node.nix).
+        '';
+      }
+    ];
+
     # Cilium WireGuard transparent encryption (encryption.type=
     # wireguard in addons.tf). cilium-agent loads this on demand,
     # but having it in initrd avoids a node-Ready delay.

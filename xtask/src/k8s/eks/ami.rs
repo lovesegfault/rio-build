@@ -17,7 +17,7 @@
 //! ~2×4 GB coldsnap uploads. The git SHA stays as a secondary
 //! `rio.build/git-sha` tag for traceability (it changes every commit;
 //! the content tag does not). Deploy resolves the tag back from EC2
-//! via `rio.build/ami-latest=true` (`resolve_latest_tag`) — no
+//! via `rio.build/ami-latest=true` (`resolve_latest`) — no
 //! per-worktree handoff file.
 
 use std::path::Path;
@@ -118,7 +118,7 @@ struct ImageInfo {
 /// changes iff any AMI's content would, including arch-specific
 /// closure changes (e.g. arm firmware) that the x86 drvPath alone
 /// would miss. Called by `up --ami` to find/tag; deploy reads the
-/// tag back from EC2 (`resolve_latest_tag`), not by recomputing.
+/// tag back from EC2 (`resolve_latest`), not by recomputing.
 ///
 /// I-198: was sync `sh::read` — `nix eval` of a NixOS module is
 /// multi-second per arch (×2). `run_read` spawns via tokio::process
@@ -146,7 +146,7 @@ pub async fn ami_tag() -> Result<String> {
 /// `up --ami` phase entry. Computes the content-addressed tag,
 /// short-circuits if every requested arch already has an AMI tagged
 /// with it, otherwise builds + uploads + registers + tags the missing
-/// ones. Deploy reads the tag from EC2 (`resolve_latest_tag`), not a
+/// ones. Deploy reads the tag from EC2 (`resolve_latest`), not a
 /// handoff file.
 pub async fn run_phase(arch: AmiArch) -> Result<()> {
     let repo = git::open()?;
@@ -164,7 +164,7 @@ pub async fn run_phase(arch: AmiArch) -> Result<()> {
     // `ami-latest=true` + runs `untag_prior_latest`. The fast-path
     // returned without re-tagging, so a flake.lock rollback (v1→v2→v1)
     // left v1 AMIs without `ami-latest` (stripped by v2's untag) and
-    // `resolve_latest_tag()` silently kept deploying v2.
+    // `resolve_latest()` silently kept deploying v2.
 
     // join_all (not try_join_all): both arches run to completion even
     // if one fails — don't cancel a ~4 GB coldsnap upload mid-flight
@@ -312,6 +312,20 @@ async fn find_existing(
         .and_then(|i| i.image_id().map(str::to_string)))
 }
 
+/// Latest registered AMI generation, as deploy resolves it: the
+/// content-addressed tag plus the provenance fields deploy validates.
+#[derive(Debug)]
+pub struct LatestAmi {
+    /// `rio.build/ami` — what deploy renders into the EC2NodeClass
+    /// amiSelectorTerms.
+    pub tag: String,
+    /// `rio.build/git-sha` — HEAD of the worktree that ran `up --ami`.
+    /// None on images registered before the tag existed.
+    pub git_sha: Option<String>,
+    /// Image ID, for error messages.
+    pub image_id: String,
+}
+
 /// I-182 read side: resolve the deploy-time `rio.build/ami` tag value
 /// from EC2, not the per-worktree `.rio-ami-tag` file. `tag()` below
 /// stamps every newly-registered AMI with `rio.build/ami-latest=true`
@@ -325,7 +339,10 @@ async fn find_existing(
 /// gitignored file or recomputed a drvPath-hash that pointed at
 /// nothing (the `assert_registered` guard caught the latter, but the
 /// former silently deployed an old AMI).
-pub async fn resolve_latest_tag(region: &str) -> Result<String> {
+///
+/// Also returns `rio.build/git-sha` so deploy can check provenance —
+/// see the 2026-06-12 /var/rio outage note at the deploy callsite.
+pub async fn resolve_latest(region: &str) -> Result<LatestAmi> {
     let conf = crate::aws::config(Some(region)).await;
     let ec2 = aws_sdk_ec2::Client::new(conf);
     let resp = ec2
@@ -334,12 +351,13 @@ pub async fn resolve_latest_tag(region: &str) -> Result<String> {
         .filters(tag_filter("rio.build/ami-latest", "true"))
         .send()
         .await?;
-    latest_ami_tag_of(resp.images())
+    latest_ami_of(resp.images())
 }
 
-/// Pure half of `resolve_latest_tag` — newest image's `rio.build/ami`
-/// tag. Split for unit testing without an EC2 client.
-fn latest_ami_tag_of(images: &[Image]) -> Result<String> {
+/// Pure half of `resolve_latest` — newest image's `rio.build/ami` +
+/// `rio.build/git-sha` tags. Split for unit testing without an EC2
+/// client.
+fn latest_ami_of(images: &[Image]) -> Result<LatestAmi> {
     let newest = images
         .iter()
         .max_by_key(|i| i.creation_date().unwrap_or_default())
@@ -347,19 +365,26 @@ fn latest_ami_tag_of(images: &[Image]) -> Result<String> {
             "no AMI tagged rio.build/ami-latest=true — \
              run `cargo xtask k8s -p eks up --ami` first"
         })?;
-    newest
-        .tags()
-        .iter()
-        .find(|t| t.key() == Some("rio.build/ami"))
-        .and_then(|t| t.value())
-        .map(str::to_string)
-        .with_context(|| {
-            format!(
-                "AMI {} is tagged rio.build/ami-latest=true but has no rio.build/ami tag — \
-                 retag via `cargo xtask k8s -p eks up --ami`",
-                newest.image_id().unwrap_or("?")
-            )
-        })
+    let image_id = newest.image_id().unwrap_or("?").to_string();
+    let get = |key: &str| {
+        newest
+            .tags()
+            .iter()
+            .find(|t| t.key() == Some(key))
+            .and_then(|t| t.value())
+            .map(str::to_string)
+    };
+    let tag = get("rio.build/ami").with_context(|| {
+        format!(
+            "AMI {image_id} is tagged rio.build/ami-latest=true but has no rio.build/ami tag — \
+             retag via `cargo xtask k8s -p eks up --ami`"
+        )
+    })?;
+    Ok(LatestAmi {
+        tag,
+        git_sha: get("rio.build/git-sha"),
+        image_id,
+    })
 }
 
 /// `up --deploy` guard: bail if the resolved amiTag has no registered
@@ -404,7 +429,7 @@ fn image_identity(info: &ImageInfo, ami_tag: &str, attr: &str) -> (String, Strin
 /// `TagSpecification`) and `tag()` (re-stamp existing). The
 /// idempotency key (`rio.build/ami`, what `find_existing` filters on)
 /// and the deploy-resolve key (`rio.build/ami-latest`, what
-/// `resolve_latest_tag` filters on) are BOTH here so they land in the
+/// `resolve_latest` filters on) are BOTH here so they land in the
 /// same API call as the unique Name — an interrupt between register
 /// and a separate create-tags left an AMI invisible to `find_existing`
 /// AND `gc` while blocking re-register via `InvalidAMIName.Duplicate`.
@@ -496,7 +521,7 @@ async fn tag(
 /// leaves the new AMI tagged (deploy still resolves it via
 /// `max(CreationDate)`); idempotent (delete-tags on an absent tag is a
 /// no-op). Without this, every generation accumulates `ami-latest=true`
-/// and `resolve_latest_tag` walks an ever-growing describe-images
+/// and `resolve_latest` walks an ever-growing describe-images
 /// result. Only the `ami-latest` key is removed — `rio.build/ami`
 /// (content tag) and `rio.build/git-sha` stay for rollback pinning.
 async fn untag_prior_latest(ec2: &aws_sdk_ec2::Client, keep_ami: &str, t: &Target) -> Result<()> {
@@ -535,7 +560,7 @@ async fn untag_prior_latest(ec2: &aws_sdk_ec2::Client, keep_ami: &str, t: &Targe
 /// snapshots. "Stale" = tagged `rio.build/ami` (any value), NOT tagged
 /// `rio.build/ami-latest=true`, and `CreationDate` older than
 /// `older_than_days`. The latest tag is what `up --deploy` resolves
-/// (see `resolve_latest_tag`), so anything carrying it is live by
+/// (see `resolve_latest`), so anything carrying it is live by
 /// definition and never collected. `dry_run` (the default) prints the
 /// candidate set without touching AWS.
 ///
@@ -674,7 +699,7 @@ mod tests {
     /// The atomic-register tag set MUST contain both the idempotency
     /// key (`rio.build/ami`, what `find_existing` filters on) and the
     /// deploy-resolve key (`rio.build/ami-latest`, what
-    /// `resolve_latest_tag` filters on). When these were split across
+    /// `resolve_latest` filters on). When these were split across
     /// register-image and a separate create-tags, an interrupt between
     /// the two left an AMI that blocked re-register (Name unique) but
     /// was invisible to find_existing AND gc.
@@ -712,28 +737,57 @@ mod tests {
     }
 
     #[test]
-    fn latest_ami_tag_picks_newest_and_reads_rio_tag() {
+    fn latest_ami_picks_newest_and_reads_rio_tags() {
         // I-182 read side: two generations both tagged ami-latest=true
         // (interrupted untag or pre-untag-step images) — newest
         // CreationDate wins, and the value returned is the
-        // rio.build/ami tag, not the image ID.
-        let img = |id: &str, date: &str, ami: &str| {
-            Image::builder()
+        // rio.build/ami tag, not the image ID. The git-sha rides along
+        // for the deploy provenance check (2026-06-12 /var/rio outage:
+        // an AMI from a foreign tree was deployed; deploy must be able
+        // to see which commit built the image it resolved).
+        let img = |id: &str, date: &str, ami: &str, sha: Option<&str>| {
+            let mut b = Image::builder()
                 .image_id(id)
                 .creation_date(date)
                 .tags(mk_tag("rio.build/ami-latest", "true"))
                 .tags(mk_tag("rio.build/ami", ami))
-                .tags(mk_tag("kubernetes.io/arch", "amd64"))
-                .build()
+                .tags(mk_tag("kubernetes.io/arch", "amd64"));
+            if let Some(sha) = sha {
+                b = b.tags(mk_tag("rio.build/git-sha", sha));
+            }
+            b.build()
         };
         let images = vec![
-            img("ami-old", "2026-03-01T00:00:00.000Z", "aaaaaaaaaaaa"),
-            img("ami-new", "2026-04-01T00:00:00.000Z", "bbbbbbbbbbbb"),
+            img(
+                "ami-old",
+                "2026-03-01T00:00:00.000Z",
+                "aaaaaaaaaaaa",
+                Some("1111111111aa"),
+            ),
+            img(
+                "ami-new",
+                "2026-04-01T00:00:00.000Z",
+                "bbbbbbbbbbbb",
+                Some("2222222222bb"),
+            ),
         ];
-        assert_eq!(latest_ami_tag_of(&images).unwrap(), "bbbbbbbbbbbb");
+        let latest = latest_ami_of(&images).unwrap();
+        assert_eq!(latest.tag, "bbbbbbbbbbbb");
+        assert_eq!(latest.git_sha.as_deref(), Some("2222222222bb"));
+        assert_eq!(latest.image_id, "ami-new");
+
+        // Pre-provenance image without a git-sha tag → None, no error
+        // (deploy decides what to do with it).
+        let untagged = [img(
+            "ami-x",
+            "2026-04-01T00:00:00.000Z",
+            "cccccccccccc",
+            None,
+        )];
+        assert_eq!(latest_ami_of(&untagged).unwrap().git_sha, None);
 
         // No images → actionable error naming the fix.
-        let err = latest_ami_tag_of(&[]).unwrap_err().to_string();
+        let err = latest_ami_of(&[]).unwrap_err().to_string();
         assert!(err.contains("up --ami"), "{err}");
 
         // ami-latest present but rio.build/ami missing → names the AMI.
@@ -742,7 +796,7 @@ mod tests {
             .creation_date("2026-04-01T00:00:00.000Z")
             .tags(mk_tag("rio.build/ami-latest", "true"))
             .build()];
-        let err = latest_ami_tag_of(&broken).unwrap_err().to_string();
+        let err = latest_ami_of(&broken).unwrap_err().to_string();
         assert!(err.contains("ami-broken"), "{err}");
     }
 
