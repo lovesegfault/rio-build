@@ -327,7 +327,7 @@ module logService {
 
   /// CALIBRATION ONLY (`logServiceCalibGcRowIgnoresArtifacts`): the
   /// execution-row GC WITHOUT the artifact-before-row conjuncts
-  /// (merged_bug_007 pre-fix; store.log.sweep-ownership+1) — the row
+  /// (merged_bug_007 pre-fix; store.log.sweep-ownership+2) — the row
   /// deletes while `drv_log_chunks` rows or a live ingest session
   /// still key on it, orphaning the artifacts forever
   /// (`noOrphanLogChunks` falsifies).
@@ -779,7 +779,7 @@ module logService {
       dbFinalCount.get(e) != NoCount,
       not(ledgerReferenced.get(e)),
     },
-    // v3 (store.log.sweep-ownership+1, merged_bug_007): artifact-
+    // v3 (store.log.sweep-ownership+2, merged_bug_007): artifact-
     // before-row is data-structural — the row outlives every log
     // artifact keyed on it (conjuncts 5/6: NOT EXISTS drv_log_chunks /
     // log_ingest_sessions), under ANY retention configuration.
@@ -1123,7 +1123,7 @@ module logService {
       expired.get(e),
     })
 
-  /// Artifact-before-row (store.log.sweep-ownership+1,
+  /// Artifact-before-row (store.log.sweep-ownership+2,
   /// merged_bug_007): a reclaimed lifecycle row never strands
   /// `drv_log_chunks` rows — the execution-row GC refuses rows whose
   /// artifacts survive, so a missing row implies an empty manifest.
