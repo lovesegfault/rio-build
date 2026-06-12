@@ -20398,6 +20398,10 @@
           "packageId": "bytes"
         },
         {
+          "name": "fastcdc",
+          "packageId": "fastcdc"
+        },
+        {
           "name": "hex",
           "packageId": "hex"
         },
@@ -20408,6 +20412,10 @@
         {
           "name": "prost",
           "packageId": "prost"
+        },
+        {
+          "name": "rio-common",
+          "packageId": "rio-common"
         },
         {
           "name": "rio-nix",
