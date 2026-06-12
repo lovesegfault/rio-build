@@ -1826,7 +1826,7 @@
     {
       "path": "k8s/stress.rs",
       "depth": 1,
-      "doc": "`qa --load` implementation: fire N parallel `nix build --store"
+      "doc": "`qa --load` implementation: one Indexed Job in ns `rio-load` whose"
     },
     {
       "path": "k8s/wipe.rs",

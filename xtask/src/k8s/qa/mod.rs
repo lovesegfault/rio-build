@@ -300,14 +300,10 @@ pub async fn run(
                     let load = super::stress::LoadOpts {
                         target: opts.load_target.clone(),
                         parallel: opts.load_parallel,
-                        // base_port 0: each parallel tunnel binds its own
-                        // ephemeral local port — no bind races.
-                        base_port: 0,
                         bench_flake: None,
-                        watch: false,
                         stagger: opts.load_stagger,
                     };
-                    super::stress::cmd_run(p, kind, cfg, &load).await?
+                    super::stress::cmd_run(p, cfg, &load).await?
                 }
                 Stage::Fault => {
                     use super::chaos;
