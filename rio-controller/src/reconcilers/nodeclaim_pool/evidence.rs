@@ -569,7 +569,7 @@ mod tests {
     /// doc ascribed to `#[must_use]` (`let _ =` silences that
     /// attribute; a bound-then-dropped value never lints at all).
     /// Stated per R16 at its real tier: debug-guard (every dev/test
-    /// build), not compile — and the test is cfg-gated to that SAME
+    /// build), not compile — and the test is cfg-gated to that same
     /// tier: the CI nextest binaries build release
     /// (`debug_assertions` off, the guard's warn arm), where a
     /// should_panic on the compiled-out panic arm fails by
