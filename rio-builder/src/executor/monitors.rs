@@ -23,14 +23,21 @@ fn read_cpu_stat(cgroup_path: &Path) -> Option<u64> {
     crate::cgroup::parse_cpu_stat_usage_usec(&content)
 }
 
-/// Handles to the per-build cgroup monitor tasks. `stop()` aborts both
+/// Handles to the per-build cgroup monitor tasks. `stop()` aborts them
 /// and reads their accumulated state; `Drop` aborts as a safety net so
 /// an early `?` in the caller doesn't leak 1Hz pollers.
 pub(super) struct CgroupMonitors {
     cpu_poll: tokio::task::JoinHandle<()>,
     oom_watch: tokio::task::JoinHandle<()>,
+    quota_poll: tokio::task::JoinHandle<()>,
     peak_cpu: Arc<AtomicU64>,
     oom_detected: Arc<AtomicBool>,
+    /// Max-tracked `dqb_curspace` over the build (merged_bug_074: the
+    /// DURING-BUILD peak — `keep-failed` is unset, so the daemon
+    /// deletes a failed build's scratch before any post-build sample;
+    /// `dqb_curspace` is current bytes, not a kernel HWM, hence the
+    /// poll). 0 = never sampled (no prjquota / build exited <1s).
+    peak_quota: Arc<AtomicU64>,
     /// Pod-level cgroup (where `memory.events` lives). Held so
     /// `stop()` can do a final synchronous `read_oom_kill`.
     parent: PathBuf,
@@ -40,8 +47,10 @@ pub(super) struct CgroupMonitors {
 }
 
 impl CgroupMonitors {
-    /// Abort both monitor tasks and return `(peak_cpu_cores, oom_detected)`.
-    /// `abort()` doesn't wait — both tasks are pure read, no cleanup needed.
+    /// Abort the monitor tasks and return
+    /// `(peak_cpu_cores, oom_detected, peak_quota_bytes)`.
+    /// `abort()` doesn't wait — the tasks are pure read, no cleanup
+    /// needed.
     ///
     /// Performs one final synchronous `read_oom_kill` against the stored
     /// baseline: an OOM that lands in the <1s gap between the watcher's
@@ -60,15 +69,22 @@ impl CgroupMonitors {
     /// `|| true` / `make -k` / retry-runner). The caller
     /// (`apply_oom_override`) gates the `CgroupOom` reclassification on
     /// `build_result.is_err()` for that reason.
-    pub(super) fn stop(self) -> (f64, bool) {
+    ///
+    /// `peak_quota_bytes` is `None` when the poller never landed a
+    /// sample (no prjquota on the node, or the build exited before
+    /// the first 1s tick) — the caller falls back to its own one-shot.
+    pub(super) fn stop(self) -> (f64, bool, Option<u64>) {
         self.cpu_poll.abort();
         self.oom_watch.abort();
+        self.quota_poll.abort();
         let final_oom = self
             .baseline
             .is_some_and(|b| crate::cgroup::read_oom_kill(&self.parent).is_some_and(|n| n > b));
+        let peak_quota = self.peak_quota.load(Ordering::Acquire);
         (
             f64::from_bits(self.peak_cpu.load(Ordering::Acquire)),
             self.oom_detected.load(Ordering::SeqCst) || final_oom,
+            (peak_quota > 0).then_some(peak_quota),
         )
     }
 }
@@ -82,6 +98,7 @@ impl Drop for CgroupMonitors {
         // so the explicit `stop()` above is harmless redundancy.
         self.cpu_poll.abort();
         self.oom_watch.abort();
+        self.quota_poll.abort();
     }
 }
 
@@ -97,6 +114,7 @@ impl Drop for CgroupMonitors {
 pub(super) fn spawn_cgroup_monitors(
     build_cgroup: &crate::cgroup::BuildCgroup,
     cgroup_parent: &Path,
+    overlay_base_dir: &Path,
 ) -> CgroupMonitors {
     // CPU polling task: samples `cpu.stat usage_usec` every second,
     // computes instantaneous cores = `delta_usec/elapsed_usec`, tracks
@@ -207,11 +225,38 @@ pub(super) fn spawn_cgroup_monitors(
         })
     };
 
+    // merged_bug_074: the per-build prjquota peak poller. Samples
+    // `dqb_curspace` on the overlay base at 1Hz and max-tracks — the
+    // causally relevant usage window for the disk-exhaustion
+    // classification is DURING the build (the daemon deletes a failed
+    // build's scratch before returning when keep-failed is unset, so
+    // the post-daemon one-shot under-reads exactly the dominant
+    // exhaustion shape). Same blocking-read posture as the CPU poller
+    // (one ioctl + one syscall per tick — negligible); a node without
+    // prjquota degrades to zero samples and the caller's one-shot.
+    let peak_quota = Arc::new(AtomicU64::new(0));
+    let quota_poll = {
+        let dir = overlay_base_dir.to_path_buf();
+        let peak = Arc::clone(&peak_quota);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.tick().await; // skip the immediate fire
+            loop {
+                interval.tick().await;
+                if let Ok(Some(used)) = crate::quota::current_bytes(&dir) {
+                    peak.fetch_max(used, Ordering::Relaxed);
+                }
+            }
+        })
+    };
+
     CgroupMonitors {
         cpu_poll,
         oom_watch,
+        quota_poll,
         peak_cpu,
         oom_detected,
+        peak_quota,
         parent,
         baseline,
     }
@@ -280,8 +325,10 @@ mod tests {
         CgroupMonitors {
             cpu_poll: tokio::spawn(async {}),
             oom_watch: tokio::spawn(async {}),
+            quota_poll: tokio::spawn(async {}),
             peak_cpu: Arc::new(AtomicU64::new(0)),
             oom_detected: Arc::new(AtomicBool::new(false)),
+            peak_quota: Arc::new(AtomicU64::new(0)),
             parent,
             baseline,
         }
@@ -306,7 +353,7 @@ mod tests {
         // OOM lands AFTER the (no-op) watcher was spawned but BEFORE stop().
         // The watcher never observed it (no tick fired); stop() must.
         write_oom_kill(parent.path(), 1);
-        let (_, oom) = monitors.stop();
+        let (_, oom, _) = monitors.stop();
         assert!(oom, "final-sample read must see oom_kill 0→1");
     }
 
@@ -316,7 +363,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         write_oom_kill(parent.path(), 0);
         let monitors = mk_monitors(parent.path().to_path_buf(), Some(0));
-        let (_, oom) = monitors.stop();
+        let (_, oom, _) = monitors.stop();
         assert!(!oom);
     }
 
@@ -328,7 +375,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         write_oom_kill(parent.path(), 5);
         let monitors = mk_monitors(parent.path().to_path_buf(), None);
-        let (_, oom) = monitors.stop();
+        let (_, oom, _) = monitors.stop();
         assert!(!oom, "baseline=None means no OOM watching");
     }
 }

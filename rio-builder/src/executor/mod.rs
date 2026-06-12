@@ -830,6 +830,7 @@ pub async fn execute_build(
         build_result,
         peak_memory_bytes,
         peak_cpu_cores,
+        peak_quota_bytes,
         final_line_count,
     ) = match pre {
         Err(e) => return ExecuteOutcome::pre_cgroup(e, batcher_seed),
@@ -843,6 +844,7 @@ pub async fn execute_build(
                     build_result,
                     peak_memory_bytes,
                     peak_cpu_cores,
+                    peak_quota_bytes,
                     final_line_count,
                 },
         }) => (
@@ -851,6 +853,7 @@ pub async fn execute_build(
             build_result,
             peak_memory_bytes,
             peak_cpu_cores,
+            peak_quota_bytes,
             final_line_count,
         ),
     };
@@ -881,14 +884,35 @@ pub async fn execute_build(
     // peak_disk_bytes. Previously sampled only at line 11 (teardown),
     // which the `?` at build_result skipped.
     // r[impl builder.disk.quota-classified]
-    // live_057-a: the SAME sample feeds the disk-exhaustion
-    // classification — usage + hard limit (the limit-read face) and
-    // the node statvfs headroom, folded through apply_disk_override
-    // BEFORE the footer renders so the report and the banner agree.
+    // merged_bug_074: the classification consumes the DURING-BUILD
+    // usage peak (the 1Hz monitor max-track, folded with this
+    // post-daemon one-shot — keep-failed is unset, so the daemon has
+    // already deleted a failed build's scratch by this line and the
+    // one-shot under-reads exactly the dominant exhaustion shape) and
+    // a node-headroom sample DECOUPLED from the project clamp (under
+    // enforced prjquota + PROJINHERIT the kernel clamps statvfs taken
+    // inside the project view to `limit − used`, which made the old
+    // same-dir conjunct pair kernel-unsatisfiable: quota-at-limit
+    // forced node_free ≤ slack < headroom). The fold runs BEFORE the
+    // footer renders so the report and the banner agree.
     let quota_status = crate::quota::status(&env.overlay_base_dir).ok().flatten();
-    let peak_disk_bytes = quota_status.map(|q| q.used_bytes);
-    let node_free = crate::quota::node_free_bytes(&env.overlay_base_dir);
-    let build_result = apply_disk_override(quota_status, node_free, build_result);
+    let quota_peak = match (quota_status, peak_quota_bytes) {
+        (Some(q), Some(peak)) => Some(crate::quota::QuotaStatus {
+            used_bytes: q.used_bytes.max(peak),
+            hard_limit_bytes: q.hard_limit_bytes,
+        }),
+        (Some(q), None) => Some(q),
+        // No limit read now (quota record gone / fs error) — a bare
+        // usage peak has no exhaustion predicate to feed; the
+        // non-quota lane keeps the report.
+        (None, _) => None,
+    };
+    let peak_disk_bytes = quota_peak.map(|q| q.used_bytes);
+    let node_free = crate::quota::node_free_bytes_decoupled(
+        &env.overlay_base_dir,
+        quota_peak.and_then(|q| q.hard_limit_bytes),
+    );
+    let build_result = apply_disk_override(quota_peak, node_free, build_result);
 
     // H9″ (live_057-d instrument): fuse-cache occupancy, statfs-
     // derived, refreshed once per build completion beside the quota
@@ -1103,6 +1127,11 @@ struct DaemonOutcome {
     build_result: Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
     peak_memory_bytes: u64,
     peak_cpu_cores: f64,
+    /// merged_bug_074: the during-build prjquota usage peak from the
+    /// 1Hz monitor (max-tracked `dqb_curspace`). `None` = no prjquota
+    /// or the build exited before the first tick — the classification
+    /// seam falls back to its post-daemon one-shot.
+    peak_quota_bytes: Option<u64>,
     /// Lines accounted for by the [`LogBatcher`] (the seeded banner
     /// header offset + everything the stderr loop flushed). Read by
     /// [`execute_build`] to set the footer banner's `first_line_number`
@@ -1179,7 +1208,7 @@ async fn run_daemon_lifecycle(
         let _ = std::fs::write(p.join("cgroup.kill"), "1");
     });
 
-    let monitors = spawn_cgroup_monitors(&build_cgroup, &env.cgroup_parent);
+    let monitors = spawn_cgroup_monitors(&build_cgroup, &env.cgroup_parent, &env.overlay_base_dir);
 
     // All daemon I/O is in a helper so we can ALWAYS kill on error.
     // The cgroup setup above (create/add_process)
@@ -1223,7 +1252,7 @@ async fn run_daemon_lifecycle(
     // `monitors` also abort on drop; this explicit stop is the happy-
     // path fast stop (guard fires redundantly after, which is a no-op
     // on an already-aborted handle).
-    let (peak_cpu_cores, oom_detected) = monitors.stop();
+    let (peak_cpu_cores, oom_detected, peak_quota_bytes) = monitors.stop();
     let build_result = apply_oom_override(oom_detected, build_result);
 
     // Read cgroup memory.peak. Kernel-tracked lifetime max of the
@@ -1261,6 +1290,7 @@ async fn run_daemon_lifecycle(
         build_result,
         peak_memory_bytes,
         peak_cpu_cores,
+        peak_quota_bytes,
         final_line_count,
     })
 }
@@ -1286,58 +1316,199 @@ fn apply_oom_override(
     oom_detected: bool,
     build_result: Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
 ) -> Result<rio_nix::protocol::build::BuildResult, ExecutorError> {
-    match (oom_detected, &build_result) {
-        (true, Err(_)) => {
-            metrics::counter!("rio_builder_cgroup_oom_total").increment(1);
-            Err(ExecutorError::CgroupOom)
-        }
-        (true, Ok(_)) => {
-            metrics::counter!("rio_builder_cgroup_oom_total").increment(1);
+    if !oom_detected {
+        return build_result;
+    }
+    metrics::counter!("rio_builder_cgroup_oom_total").increment(1);
+    match &build_result {
+        Ok(_) => {
             tracing::warn!(
                 "oom_kill incremented but build succeeded; keeping Ok(Built) \
                  (script tolerated the OOM-killed child)"
             );
             build_result
         }
-        (false, _) => build_result,
+        // merged_bug_078 (the oom TWIN seam, R28 result-plane axis):
+        // the retired `(true, Err(_))` wildcard rewrote EVERY error
+        // under oom_detected — laundering the cancel law, the
+        // network/store lanes, and the permanent lane into a memory
+        // sizing signal. The typed allow-list decides per shape: the
+        // ordinary daemon failure and the watcher-kill EOF signature
+        // (cgroup.kill → daemon EOF — the designed I-196 chain) are
+        // the oom letter's lawful claims; every Owned shape keeps its
+        // own law.
+        Err(_) => match sizing_rewrite_authority(&build_result) {
+            SizingRewrite::Rewritable | SizingRewrite::OomKillSignature => {
+                Err(ExecutorError::CgroupOom)
+            }
+            SizingRewrite::Owned(law) => {
+                tracing::warn!(
+                    owning_law = law,
+                    "oom_kill incremented but the failure shape is owned \
+                     by another law; classification kept (no memory-floor \
+                     laundering)"
+                );
+                build_result
+            }
+        },
     }
 }
 
-/// Reclassify a FAILED result as `DiskFull` when the post-build quota
-/// sample shows the overlay at/over its prjquota hard limit and the
-/// node fs is not itself exhausted — the [`apply_oom_override`] twin
-/// at the result seam (live_057-a). Precedence and preservation:
+/// R28 (the result-plane axis; merged_bug_078 + the oom twin): the
+/// typed classification-authority allow-list BOTH override seams
+/// consume. For every shape of the bare
+/// `Result<BuildResult, ExecutorError>` between daemon outcome and
+/// report assembly: may a sizing override (disk / oom) REWRITE it?
 ///
-/// - `Ok(Built)` is preserved (a build that succeeded despite
-///   touching its quota is a success; no reclassification).
-/// - `Err(CgroupOom)` is preserved — the OOM watcher's attribution is
-///   the more specific signal and already carries its own floor lane.
-/// - Every other failure shape (the daemon's ordinary failed
-///   `BuildResult` — the live_057 face that previously assembled
-///   PermanentFailure → retry-then-poison — and non-OOM executor
-///   errors) reclassifies to `Err(DiskFull)` iff
-///   [`crate::quota::classify_quota_exhaustion`] holds for the
-///   sampled `(quota, node_free)` pair. No sample / no limit / node
-///   exhausted → the result is kept verbatim (the non-quota lane:
-///   the node's exhaustion is not the build's sizing signal).
+/// The axis this seals: `r[builder.timeout.no-reassign]` (and every
+/// sibling classification law) is censused at the Nix→Proto mapping
+/// seam, but the result plane upstream of the mapping was writable —
+/// an override could rewrite a classification-authoritative status
+/// one seam above the census while the census stayed green
+/// (merged_bug_078's laundering). The allow-list replaces each
+/// override's hand-enumerated exemptions with one exhaustive
+/// authority: NO catch-all arms (R14) — a new status or error variant
+/// fails compilation here until it takes an explicit row, and the
+/// review default for a new row is `Owned`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SizingRewrite {
+    /// The ordinary ENOSPC-consistent daemon-phase failure (the
+    /// daemon's failed BuildResult, or a build-environment write
+    /// failure inside the quota'd overlay): EITHER sizing axis may
+    /// claim it when its own evidence corroborates (the quota
+    /// predicate for disk; `oom_detected` for oom).
+    Rewritable,
+    /// The oom watcher's kill signature ONLY (`cgroup.kill` → daemon
+    /// EOF): the OOM axis claims it — that EOF is the watcher's own
+    /// mechanical consequence (the designed I-196 chain, and the
+    /// reason the override exists at all: it must win before
+    /// `is_daemon_transient` turns the kill into a 3× local OOM
+    /// loop). The DISK axis may NOT claim it: without an oom_kill the
+    /// shape belongs to the daemon-transient retry law.
+    OomKillSignature,
+    /// Another law owns the shape — neither override may rewrite it;
+    /// the str names the owning law for the refusal trace.
+    Owned(&'static str),
+}
+
+fn sizing_rewrite_authority(
+    result: &Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
+) -> SizingRewrite {
+    use rio_nix::protocol::build::BuildStatus as S;
+    use rio_nix::protocol::wire::WireError as W;
+    match result {
+        Ok(r) => match r.status {
+            // Success is never reclassified (a build that succeeded
+            // despite touching its quota / tolerating a child OOM is
+            // a success).
+            S::Built | S::Substituted | S::AlreadyValid | S::ResolvesToAlreadyValid => {
+                SizingRewrite::Owned("success — preserved")
+            }
+            // The sibling sizing/limit laws: each owns its shape end
+            // to end (deadline doubling for TimedOut —
+            // r[builder.timeout.no-reassign]; the log-limit cap).
+            S::TimedOut => SizingRewrite::Owned("timeout law (deadline floor, no-reassign)"),
+            S::LogLimitExceeded => SizingRewrite::Owned("log-limit law"),
+            // The ordinary daemon failures — the live_057 face that
+            // assembled PermanentFailure on in-build ENOSPC.
+            S::PermanentFailure | S::MiscFailure | S::TransientFailure => SizingRewrite::Rewritable,
+            // A cached PRIOR failure carries no evidence about THIS
+            // attempt's resources.
+            S::CachedFailure => SizingRewrite::Owned("cached prior failure"),
+            S::DependencyFailed => SizingRewrite::Owned("dependency law"),
+            S::NotDeterministic => SizingRewrite::Owned("check-mode law"),
+            S::InputRejected | S::OutputRejected => SizingRewrite::Owned("validation law"),
+            S::NoSubstituters => SizingRewrite::Owned("substitution law"),
+        },
+        Err(e) => match e {
+            // Build-environment writes inside the quota'd overlay —
+            // ENOSPC-consistent setup failures.
+            ExecutorError::Overlay(_) => SizingRewrite::Rewritable,
+            ExecutorError::SynthDb(_) => SizingRewrite::Rewritable,
+            ExecutorError::NixConf(_) => SizingRewrite::Rewritable,
+            // The daemon's reported failure (the dominant shape).
+            ExecutorError::BuildFailed(_) => SizingRewrite::Rewritable,
+            // The local daemon-transient retry law owns its shapes:
+            // a rewrite here would skip the local retry
+            // (runtime/mod.rs `is_daemon_transient` consult) AND
+            // misclassify a crash as a sizing signal.
+            ExecutorError::DaemonSpawn(_) => {
+                SizingRewrite::Owned("daemon-transient retry law (spawn)")
+            }
+            ExecutorError::Handshake(_) => {
+                SizingRewrite::Owned("daemon-transient retry law (handshake)")
+            }
+            // The one transient shape the OOM axis lawfully claims:
+            // the watcher's own cgroup.kill → daemon EOF.
+            ExecutorError::Wire(W::Io(io)) if io.kind() == std::io::ErrorKind::UnexpectedEof => {
+                SizingRewrite::OomKillSignature
+            }
+            ExecutorError::Wire(W::Io(_)) => SizingRewrite::Owned("wire i/o law"),
+            ExecutorError::Wire(
+                W::StringTooLong(_)
+                | W::CollectionTooLarge(_)
+                | W::NonZeroPadding(_)
+                | W::InvalidUtf8(_)
+                | W::InvalidNarHash(_)
+                | W::FrameTooLarge(_)
+                | W::FramedStreamTooLarge(_),
+            ) => SizingRewrite::Owned("wire-protocol law"),
+            ExecutorError::OverlayTaskPanic(_) => SizingRewrite::Owned("panic — not a signal"),
+            ExecutorError::DaemonSetup(_) => SizingRewrite::Owned("daemon setup (pre-build)"),
+            ExecutorError::InvalidDerivation(_) => {
+                SizingRewrite::Owned("permanent law (InputRejected)")
+            }
+            // Store / network lanes: their own evidence machinery
+            // (bug_286 store evidence, the breaker) owns attribution.
+            ExecutorError::Upload(_) => SizingRewrite::Owned("upload/store lane"),
+            ExecutorError::Grpc(_) => SizingRewrite::Owned("network lane"),
+            ExecutorError::MetadataFetch { .. } => SizingRewrite::Owned("network lane"),
+            ExecutorError::Cgroup(_) => SizingRewrite::Owned("cgroup mechanics"),
+            // Already sizing letters — idempotent, never re-claimed
+            // by the SIBLING axis (the more specific signal wins).
+            ExecutorError::CgroupOom => SizingRewrite::Owned("already the oom letter"),
+            ExecutorError::DiskFull => SizingRewrite::Owned("already the disk letter"),
+            ExecutorError::WrongKind { .. } => SizingRewrite::Owned("kind misroute (permanent)"),
+            ExecutorError::Cancelled => SizingRewrite::Owned("cancel law"),
+        },
+    }
+}
+
+/// Reclassify a FAILED result as `DiskFull` when the during-build
+/// quota peak shows the overlay at/over its prjquota hard limit and
+/// the node fs is not itself exhausted — the [`apply_oom_override`]
+/// twin at the result seam (live_057-a; merged_bug_074/078 rebuilt).
+/// Precedence and preservation:
+///
+/// - The rewrite is gated on [`sizing_rewrite_authority`] ==
+///   [`SizingRewrite::Rewritable`] (the R28 allow-list BOTH override
+///   seams consume): only the ordinary ENOSPC-consistent daemon
+///   failures may be claimed. Success, TimedOut, LogLimitExceeded,
+///   the daemon-transient shapes, the cancel/network/store/permanent
+///   lanes, and the sibling `CgroupOom` letter all keep their own
+///   laws — the retired form's bare `failed` predicate rewrote every
+///   non-OOM failure, laundering sibling laws into a disk doubling
+///   the moment the producer's predicate became satisfiable.
+/// - The claim then requires
+///   [`crate::quota::classify_quota_exhaustion`] over the during-
+///   build usage peak and the DECOUPLED node-headroom sample. No
+///   sample / no limit / node exhausted / no decoupled vantage → the
+///   result is kept verbatim (the non-quota lane: the node's
+///   exhaustion is not the build's sizing signal).
 fn apply_disk_override(
     quota: Option<crate::quota::QuotaStatus>,
     node_free_bytes: Option<u64>,
     build_result: Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
 ) -> Result<rio_nix::protocol::build::BuildResult, ExecutorError> {
-    let failed = match &build_result {
-        Ok(r) => !r.status.is_success(),
-        // The OOM watcher's attribution wins — its lane already
-        // bumps the memory floor; double-classifying would launder
-        // a memory signal into a disk doubling.
-        Err(ExecutorError::CgroupOom) => false,
-        Err(_) => true,
-    };
-    let quota_attributed = failed
+    let rewritable = matches!(
+        sizing_rewrite_authority(&build_result),
+        SizingRewrite::Rewritable
+    );
+    let quota_attributed = rewritable
         && match (quota, node_free_bytes) {
             (Some(q), Some(free)) => crate::quota::classify_quota_exhaustion(q, free),
-            // No quota sample or no node read → no attribution
-            // (the non-quota lane keeps the report).
+            // No quota sample or no decoupled node read → no
+            // attribution (the non-quota lane keeps the report).
             _ => false,
         };
     if quota_attributed {
@@ -1743,6 +1914,236 @@ mod tests {
         // No sample at all → kept verbatim.
         let none = apply_disk_override(None, None, failed());
         assert!(matches!(none, Ok(ref b) if b.status == BuildStatus::PermanentFailure));
+    }
+
+    /// W11-U (merged_bug_078, the §1.6.4-3 JOINT pair; R28
+    /// result-plane axis): the override seams may NOT launder a
+    /// sibling law's classification into a sizing letter. The
+    /// ARMED-PRODUCER state (quota at limit + decoupled node
+    /// headroom — kernel-possible only after merged_bug_074's
+    /// sampling fix) is constructed at unit level here, never as a
+    /// committed tree state (the JOINT pin: no committed pre-fix
+    /// tree exists where the laundering runs end-to-end — the
+    /// strawman-disclosure form).
+    #[test]
+    fn overrides_never_launder_owned_classifications() {
+        use rio_nix::protocol::build::{BuildResult, BuildStatus};
+        let gib = 1u64 << 30;
+        let at_limit = Some(crate::quota::QuotaStatus {
+            used_bytes: 25 * gib,
+            hard_limit_bytes: Some(25 * gib),
+        });
+        let with_status = |s: BuildStatus| -> Result<BuildResult, ExecutorError> {
+            Ok(BuildResult {
+                status: s,
+                ..Default::default()
+            })
+        };
+
+        // The disk seam, timeout cell: a timed-out build under quota
+        // pressure keeps its OWN law (r[builder.timeout.no-reassign]
+        // owns the shape — deadline doubling, never a disk floor).
+        let got = apply_disk_override(at_limit, Some(50 * gib), with_status(BuildStatus::TimedOut));
+        assert!(
+            matches!(got, Ok(ref b) if b.status == BuildStatus::TimedOut),
+            "left (pre-fix, armed producer): Ok(TimedOut) under quota \
+             pressure rewrites to Err(DiskFull) — the timeout law \
+             bypassed one seam above its census / right: TimedOut \
+             keeps its own law; got {got:?}"
+        );
+
+        // The disk seam, log-limit cell.
+        let got = apply_disk_override(
+            at_limit,
+            Some(50 * gib),
+            with_status(BuildStatus::LogLimitExceeded),
+        );
+        assert!(
+            matches!(got, Ok(ref b) if b.status == BuildStatus::LogLimitExceeded),
+            "the log-limit law owns its shape; got {got:?}"
+        );
+
+        // The disk seam, daemon-transient cell: the local retry law
+        // (runtime/mod.rs is_daemon_transient consult) must see the
+        // ORIGINAL error — a rewrite here would skip the local retry
+        // and misclassify a daemon crash as a disk sizing signal.
+        let transient = || {
+            Err::<BuildResult, _>(ExecutorError::DaemonSpawn(std::io::Error::other(
+                "spawn blip",
+            )))
+        };
+        let got = apply_disk_override(at_limit, Some(50 * gib), transient());
+        assert!(
+            matches!(got, Err(ExecutorError::DaemonSpawn(_))),
+            "the daemon-transient retry law owns its shape; got {got:?}"
+        );
+
+        // The oom TWIN seam (the apply_oom_override wildcard): a
+        // cancelled build coinciding with an oom_kill keeps the
+        // cancel law — pre-fix the `(true, Err(_))` arm rewrote it.
+        let got = apply_oom_override(true, Err(ExecutorError::Cancelled));
+        assert!(
+            matches!(got, Err(ExecutorError::Cancelled)),
+            "left (pre-fix): Err(Cancelled) + oom_kill rewrites to \
+             CgroupOom through the (true, Err(_)) wildcard — the \
+             cancel law laundered into a memory sizing signal / \
+             right: the cancel law owns its shape; got {got:?}"
+        );
+
+        // The oom twin, network cell: a post-build store error with a
+        // tolerated child OOM is a NETWORK failure, not a memory
+        // sizing signal.
+        let got = apply_oom_override(
+            true,
+            Err(ExecutorError::Grpc(tonic::Status::unavailable(
+                "store blip",
+            ))),
+        );
+        assert!(
+            matches!(got, Err(ExecutorError::Grpc(_))),
+            "the network lane owns its shape; got {got:?}"
+        );
+
+        // The oom twin, timeout cell (the book's cell): a timed-out
+        // build coinciding with an oom_kill keeps TimedOut.
+        let got = apply_oom_override(true, with_status(BuildStatus::TimedOut));
+        assert!(
+            matches!(got, Ok(ref b) if b.status == BuildStatus::TimedOut),
+            "a timed-out build coinciding with an oom_kill keeps the \
+             timeout law; got {got:?}"
+        );
+
+        // The oom seam's DESIGNED signals survive: the watcher-kill
+        // EOF signature and the ordinary daemon failure under
+        // oom_detected still classify CgroupOom.
+        let eof = || {
+            Err::<BuildResult, _>(ExecutorError::Wire(rio_nix::protocol::wire::WireError::Io(
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "daemon eof"),
+            )))
+        };
+        let got = apply_oom_override(true, eof());
+        assert!(
+            matches!(got, Err(ExecutorError::CgroupOom)),
+            "the cgroup.kill -> daemon EOF chain is the oom watcher's \
+             own mechanical signal; got {got:?}"
+        );
+        let got = apply_oom_override(
+            true,
+            Err(ExecutorError::BuildFailed("builder exploded".into())),
+        );
+        assert!(
+            matches!(got, Err(ExecutorError::CgroupOom)),
+            "an ordinary daemon failure under oom_detected is the \
+             designed I-196 attribution; got {got:?}"
+        );
+    }
+
+    /// W11-V (R28): allow-list totality — every status and executor
+    /// error shape has an EXPLICIT rewrite-authority row, across BOTH
+    /// override seams. The compiler enforces the alphabet (the
+    /// authority fn has no catch-all arm — R14); this test pins one
+    /// representative cell per authority class so a future row
+    /// flipping silently is a red, not a drift.
+    #[test]
+    fn sizing_rewrite_authority_rows_pinned() {
+        use rio_nix::protocol::build::{BuildResult, BuildStatus};
+        let ok = |s: BuildStatus| -> Result<BuildResult, ExecutorError> {
+            Ok(BuildResult {
+                status: s,
+                ..Default::default()
+            })
+        };
+        // Success class: never rewritable.
+        for s in [
+            BuildStatus::Built,
+            BuildStatus::Substituted,
+            BuildStatus::AlreadyValid,
+            BuildStatus::ResolvesToAlreadyValid,
+        ] {
+            assert!(
+                matches!(sizing_rewrite_authority(&ok(s)), SizingRewrite::Owned(_)),
+                "success status {s:?} must be Owned"
+            );
+        }
+        // Owned failure laws (sizing overrides may not claim).
+        for s in [
+            BuildStatus::TimedOut,
+            BuildStatus::LogLimitExceeded,
+            BuildStatus::CachedFailure,
+            BuildStatus::DependencyFailed,
+            BuildStatus::NotDeterministic,
+            BuildStatus::InputRejected,
+            BuildStatus::OutputRejected,
+            BuildStatus::NoSubstituters,
+        ] {
+            assert!(
+                matches!(sizing_rewrite_authority(&ok(s)), SizingRewrite::Owned(_)),
+                "status {s:?} must be Owned by its own law"
+            );
+        }
+        // The ENOSPC-consistent ordinary failures: rewritable.
+        for s in [
+            BuildStatus::PermanentFailure,
+            BuildStatus::MiscFailure,
+            BuildStatus::TransientFailure,
+        ] {
+            assert!(
+                matches!(sizing_rewrite_authority(&ok(s)), SizingRewrite::Rewritable),
+                "status {s:?} is the ordinary ENOSPC-consistent daemon failure"
+            );
+        }
+        // Executor errors: the ENOSPC-consistent build-env writes.
+        let synth: Result<BuildResult, ExecutorError> =
+            Err(ExecutorError::SynthDb(sqlx::Error::WorkerCrashed));
+        assert!(matches!(
+            sizing_rewrite_authority(&synth),
+            SizingRewrite::Rewritable
+        ));
+        let nixconf: Result<BuildResult, ExecutorError> =
+            Err(ExecutorError::NixConf(std::io::Error::other("enospc")));
+        assert!(matches!(
+            sizing_rewrite_authority(&nixconf),
+            SizingRewrite::Rewritable
+        ));
+        let buildfailed: Result<BuildResult, ExecutorError> =
+            Err(ExecutorError::BuildFailed("x".into()));
+        assert!(matches!(
+            sizing_rewrite_authority(&buildfailed),
+            SizingRewrite::Rewritable
+        ));
+        // The watcher-kill EOF signature: oom-only.
+        let eof: Result<BuildResult, ExecutorError> =
+            Err(ExecutorError::Wire(rio_nix::protocol::wire::WireError::Io(
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof"),
+            )));
+        assert!(matches!(
+            sizing_rewrite_authority(&eof),
+            SizingRewrite::OomKillSignature
+        ));
+        // Owned executor laws.
+        let owned: [(Result<BuildResult, ExecutorError>, &str); 6] = [
+            (Err(ExecutorError::CgroupOom), "already the oom letter"),
+            (Err(ExecutorError::DiskFull), "already the disk letter"),
+            (Err(ExecutorError::Cancelled), "cancel law"),
+            (
+                Err(ExecutorError::DaemonSpawn(std::io::Error::other("x"))),
+                "daemon-transient retry law",
+            ),
+            (
+                Err(ExecutorError::Grpc(tonic::Status::unavailable("x"))),
+                "network lane",
+            ),
+            (
+                Err(ExecutorError::InvalidDerivation("x".into())),
+                "permanent law",
+            ),
+        ];
+        for (r, why) in &owned {
+            assert!(
+                matches!(sizing_rewrite_authority(r), SizingRewrite::Owned(_)),
+                "{why}: {r:?} must be Owned"
+            );
+        }
     }
 
     /// W10-CN: contract pin — rio-scheduler matches

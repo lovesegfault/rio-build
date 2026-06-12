@@ -196,8 +196,94 @@ pub fn status(dir: &Path) -> io::Result<Option<QuotaStatus>> {
 /// Free bytes on the filesystem holding `dir` (statvfs;
 /// `f_bavail × f_frsize` — the unprivileged view, matching what a
 /// build's writes can actually use). `None` on any failure.
+///
+/// merged_bug_074: under enforced prjquota with `PROJINHERIT`, a
+/// statvfs taken INSIDE the project view is CLAMPED by the kernel to
+/// the project (`f_bavail = limit − used`, `f_blocks ≈ limit`) — a
+/// sample from the quota'd dir itself can never witness the NODE's
+/// headroom. Callers needing the node view use
+/// [`node_free_bytes_decoupled`].
 pub fn node_free_bytes(dir: &Path) -> Option<u64> {
     statvfs_of(dir).map(|sv| sv.f_bavail.saturating_mul(sv.f_frsize))
+}
+
+/// The project id assigned to `dir`, or `None` when unreadable /
+/// unassigned (tmpfs, fs without xattr, projid 0). The shared
+/// `FS_IOC_FSGETXATTR` face of [`current_bytes`]/[`status`], exposed
+/// for the decoupled-ancestor walk.
+pub fn project_id(dir: &Path) -> Option<u32> {
+    let f = File::open(dir).ok()?;
+    let mut x = Fsxattr::default();
+    // SAFETY: as in `current_bytes` — the ioctl writes exactly
+    // sizeof(Fsxattr) bytes; `x` is repr(C), zeroed, on our stack.
+    if unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_FSGETXATTR, &mut x as *mut _) } < 0 {
+        return None;
+    }
+    (x.fsx_projid != 0).then_some(x.fsx_projid)
+}
+
+/// Clamp detection (merged_bug_074, the in-tree arm): does this
+/// statvfs look like the PROJECT view rather than the filesystem
+/// view? Under XFS prjquota the kernel reports
+/// `f_blocks ≈ hard_limit / f_frsize` for project-owned inodes, so a
+/// total-capacity within one block of the hard limit is the clamp
+/// signature. Pure over the sampled quantities (unit-testable; the
+/// kernel-coupled end-to-end witness is the prjquota VM probe).
+/// `false` when the limit is 0 (no enforcement → nothing to clamp
+/// to) or `f_frsize` is 0 (degenerate statvfs).
+pub fn statvfs_clamped(f_blocks: u64, f_frsize: u64, hard_limit_bytes: u64) -> bool {
+    if hard_limit_bytes == 0 || f_frsize == 0 {
+        return false;
+    }
+    let total = f_blocks.saturating_mul(f_frsize);
+    total.abs_diff(hard_limit_bytes) <= f_frsize
+}
+
+/// merged_bug_074 — the DECOUPLED node-headroom sample: free bytes of
+/// the filesystem holding `dir`, taken from a vantage the project
+/// clamp cannot reach. Walks same-device ancestors of `dir` and
+/// returns the first statvfs that is neither project-owned
+/// ([`project_id`] = `None`) nor clamp-shaped
+/// ([`statvfs_clamped`] against `hard_limit_bytes`); `PROJINHERIT`
+/// marks the quota'd subtree, so the first unowned ancestor (the
+/// kubelet volume parent, or the mount root) reports the true node
+/// view. `None` when no decoupled vantage exists on the device (every
+/// ancestor project-owned or clamp-shaped, or statvfs fails) — the
+/// caller's non-attribution lane, never a fabricated headroom.
+pub fn node_free_bytes_decoupled(dir: &Path, hard_limit_bytes: Option<u64>) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(dir).ok()?.dev();
+    let mut cur = dir.to_path_buf();
+    // Bounded walk: a store path is never deeper than this, and the
+    // loop must terminate even on a pathological mount layout.
+    for _ in 0..64 {
+        let Some(parent) = cur.parent() else {
+            break; // filesystem root reached
+        };
+        let parent = parent.to_path_buf();
+        let Ok(meta) = std::fs::metadata(&parent) else {
+            break;
+        };
+        if meta.dev() != dev {
+            break; // crossed a mount boundary — different filesystem
+        }
+        cur = parent;
+        if project_id(&cur).is_some() {
+            continue; // still inside a project (PROJINHERIT subtree)
+        }
+        let Some(sv) = statvfs_of(&cur) else {
+            continue;
+        };
+        if let Some(limit) = hard_limit_bytes
+            && statvfs_clamped(sv.f_blocks, sv.f_frsize, limit)
+        {
+            // Belt over the projid test: some configurations clamp
+            // without exposing the inherited projid at this level.
+            continue;
+        }
+        return Some(sv.f_bavail.saturating_mul(sv.f_frsize));
+    }
+    None
 }
 
 /// USED bytes on the filesystem holding `dir`
@@ -280,6 +366,51 @@ mod tests {
         // /tmp exists: both faces answer.
         assert!(node_free_bytes(std::path::Path::new("/tmp")).is_some());
         assert!(fs_used_bytes(std::path::Path::new("/tmp")).is_some());
+    }
+
+    /// merged_bug_074 — the clamp-detection arm's pure cells: a
+    /// statvfs whose total capacity sits within one block of the
+    /// project hard limit is the PROJECT view, not the node view.
+    /// (The kernel-coupled end-to-end witness is the prjquota VM
+    /// probe; these cells pin the detector's algebra.)
+    #[test]
+    fn statvfs_clamp_detection_cells() {
+        let gib = 1u64 << 30;
+        let frsize = 4096u64;
+        let blocks_for = |bytes: u64| bytes / frsize;
+        // Exact clamp: f_blocks * frsize == hard limit.
+        assert!(statvfs_clamped(blocks_for(25 * gib), frsize, 25 * gib));
+        // Off-by-one-block (rounding at the kernel's conversion).
+        assert!(statvfs_clamped(blocks_for(25 * gib) - 1, frsize, 25 * gib));
+        // A real node view: total far above the limit.
+        assert!(!statvfs_clamped(blocks_for(500 * gib), frsize, 25 * gib));
+        // No enforcement → nothing to clamp to.
+        assert!(!statvfs_clamped(blocks_for(25 * gib), frsize, 0));
+        // Degenerate statvfs.
+        assert!(!statvfs_clamped(blocks_for(25 * gib), 0, 25 * gib));
+    }
+
+    /// The decoupled node-headroom walk degrades totally: a
+    /// nonexistent dir is `None`; a real unquota'd dir (its ancestors
+    /// carry no project) answers with the filesystem view; the walk
+    /// never panics and never crosses a mount into a different
+    /// filesystem's numbers (asserted via the device pin inside the
+    /// walk — the /tmp case exercises the same-device path).
+    #[test]
+    fn node_free_decoupled_degrades_totally() {
+        assert!(
+            node_free_bytes_decoupled(std::path::Path::new("/definitely/not/a/path"), None)
+                .is_none()
+        );
+        // /tmp's parent chain has no project quotas on dev nodes —
+        // the first ancestor answers with the plain statvfs view.
+        let got = node_free_bytes_decoupled(std::path::Path::new("/tmp"), None);
+        // On a tmpfs root mount the walk stops at the mount boundary
+        // and may answer None; on a shared root it answers Some.
+        // Either way: no panic, and Some values are plausible bytes.
+        if let Some(free) = got {
+            assert!(free > 0 || node_free_bytes(std::path::Path::new("/tmp")) == Some(0));
+        }
     }
 
     /// tmpfs has no project quotas → `Ok(None)`, not `Err`. Verifies
