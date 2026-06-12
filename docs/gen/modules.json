@@ -354,6 +354,11 @@
       "doc": "DNS-1123 label identity: ONE alphabet, ONE sanitizer, ONE composer (merged_bug_243; the merged_bug_158 identity discipline, made a type)."
     },
     {
+      "path": "footprint.rs",
+      "depth": 0,
+      "doc": "The container-memory footprint law — the ONE constructed quantity every capacity gate on BOTH sides of the scheduler/controller process boundary compares (bughunt-11 merged_bug_016)."
+    },
+    {
       "path": "grpc.rs",
       "depth": 0,
       "doc": "Proto-agnostic gRPC helpers shared across rio binaries."
