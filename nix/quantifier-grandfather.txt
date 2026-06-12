@@ -63,7 +63,6 @@ docs/spec/components/scheduler.typ	set confirms a live-wanted path missing-and-u
 docs/spec/components/scheduler.typ	status; the ONLY lane that may warn and count a refusal), or
 docs/spec/components/scheduler.typ	widen-only establishment window governs the deadline/reap axis ONLY
 docs/spec/components/sla-sizing.typ	demanded, keyed to the attempt's first classification); EVERY other
-docs/spec/components/store.typ	(bug_284). `last_live_cycle_at` is stamped ONLY by a committed live
 docs/spec/components/store.typ	MUST outlive every log artifact keyed on it, under ANY retention
 docs/spec/components/store.typ	NEVER stall-reclaimable --- they stay under the heartbeat-death rule
 docs/spec/components/store.typ	ONLY constructor of per-path progress callbacks. The floor is

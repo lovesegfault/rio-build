@@ -236,13 +236,34 @@ pub(crate) struct CommitProbe {
     /// invisible here: the probe no longer reads the shared column,
     /// so the interposition is untypeable.
     pub(crate) live_since_own_attempt: bool,
+    /// merged_bug_073 (the causal-evidence leg): TRUE iff we hold an
+    /// anchor AND no global hold overlapped the
+    /// stamp_attempt-to-probe span — i.e. the anchor column's
+    /// held-stamp writer class (`stamp_held_cycle`, which writes
+    /// `last_live_cycle_at` with no epoch bump, lawfully, from
+    /// run_gc's Held arm) is PROVEN absent from the span, so a live
+    /// stamp at-or-after our attempt can only have come from a
+    /// live-commit statement (the same-statement epoch writer). A
+    /// hold anywhere in the span makes the temporal anchor
+    /// inadmissible: recognition downgrades to `Unprovable`,
+    /// honestly, instead of reading a held-tick stamp as commit
+    /// evidence. Computed DB-side from `gc_holds` row evidence
+    /// (creation is an INSERT, release is an UPDATE — rows are never
+    /// deleted, so the span evidence is durable).
+    pub(crate) hold_free_anchor_span: bool,
 }
 
 const COMMIT_PROBE_SQL: &str = "SELECT cycle_epoch, cursor, backlog_estimate, \
        last_mark_set_size, last_would_collect, \
        last_live_cycle_at IS NOT NULL AS live_stamped, \
        ($1::timestamptz IS NOT NULL AND last_live_cycle_at IS NOT NULL \
-          AND last_live_cycle_at >= $1::timestamptz) AS live_since_own_attempt \
+          AND last_live_cycle_at >= $1::timestamptz) AS live_since_own_attempt, \
+       ($1::timestamptz IS NOT NULL AND NOT EXISTS \
+          (SELECT 1 FROM gc_holds \
+            WHERE scope = 'global' \
+              AND (released_at IS NULL OR released_at >= $1::timestamptz) \
+              AND (expires_at IS NULL OR expires_at >= $1::timestamptz))) \
+         AS hold_free_anchor_span \
   FROM gc_collect_state WHERE singleton";
 
 /// The 0-row retry classification table (merged_bug_022; recognition
@@ -259,15 +280,25 @@ const COMMIT_PROBE_SQL: &str = "SELECT cycle_epoch, cursor, backlog_estimate, \
 ///   predicate of our SET list — a shadow never writes it). A
 ///   POSITIVE payload contradiction here is the ONLY thing that
 ///   proves the +1 commit was not ours (`ForeignWinner`).
-/// - Live, recognition anchor: `live_since_own_attempt` — the live
-///   stamp at-or-after OUR OWN held attempt stamp
-///   ([`OwnAttemptStamp`], returned by `stamp_attempt`'s RETURNING;
-///   compared DB-side). Its only writers are live commits (in the
-///   quantified event set) and the comparand is a constant WE minted
-///   — a sibling's `stamp_attempt` writes a column the probe no
-///   longer reads. Excludes foreign-SHADOW misrecognition exactly as
-///   the old shared-column conjunct intended: both live paths stamp
-///   the attempt BEFORE the cycle, so a pre-existing stale live stamp
+/// - Live, recognition anchor: `live_since_own_attempt AND
+///   hold_free_anchor_span` — the live stamp at-or-after OUR OWN held
+///   attempt stamp ([`OwnAttemptStamp`], returned by `stamp_attempt`'s
+///   RETURNING; compared DB-side), ADMISSIBLE only when no global
+///   hold overlapped the span (merged_bug_073). The anchor column's
+///   writers are the CENSUS-DERIVED set — the live-commit statement
+///   (`execute_commit`, same-statement epoch bump) and
+///   [`stamp_held_cycle`] (run_gc's Held arm, no epoch bump; the
+///   merged_bug_050 starvation fix NEEDS this writer, so sealing the
+///   column behind one writer would re-open that close) — pinned at
+///   `rio-store/tests/gensets/live-cycle-anchor-writers.txt` by the
+///   lane-census module's writer scan, so the next writer is
+///   census-visible, never doc-claimed. Recognition consumes the
+///   anchor only when the held-stamp writer class is PROVEN absent
+///   from the span via `gc_holds` row evidence; a hold-overlapped
+///   span reads `Unprovable` (commit_indeterminate), honestly.
+///   Excludes foreign-SHADOW misrecognition exactly as the old
+///   shared-column conjunct intended: both live paths stamp the
+///   attempt BEFORE the cycle, so a pre-existing stale live stamp
 ///   predates our stamp and fails the anchor.
 /// - A failed anchor with a MATCHING payload downgrades to
 ///   `Unprovable`, never `ForeignWinner`: distinguishing "foreign
@@ -337,12 +368,16 @@ pub(crate) fn classify_zero_row_retry(
                 // Positive pure-payload contradiction: the +1 commit
                 // provably was not ours.
                 RetryVerdict::ForeignWinner
-            } else if probe.live_since_own_attempt {
+            } else if probe.live_since_own_attempt && probe.hold_free_anchor_span {
                 RetryVerdict::OwnCommitLanded
             } else {
-                // Payload matches but the recognition anchor is stale
-                // or absent: never claim PROVEN foreign on the absence
-                // of a temporal ordering (merged_bug_021).
+                // Payload matches but the recognition anchor is stale,
+                // absent, or INADMISSIBLE (merged_bug_073: a global
+                // hold overlapped the span, so the held-stamp writer
+                // may have forged the live stamp): never claim
+                // recognition on evidence an independent anchor
+                // writer can mint, and never claim PROVEN foreign on
+                // the absence of a temporal ordering (merged_bug_021).
                 RetryVerdict::Unprovable
             }
         }
@@ -389,6 +424,15 @@ pub(crate) async fn commit_foreign_for_test(
 /// catch-up cycle. Does NOT bump `cycle_epoch` (nothing was
 /// collected); a missing singleton row is a no-op (a cluster that
 /// never ran a cycle has no staleness clock to keep).
+///
+/// merged_bug_073: this fn is a DESIGNED writer of the
+/// `last_live_cycle_at` recognition-anchor column outside the
+/// epoch-bumping commit statement — registered in the derived writer
+/// census (`live-cycle-anchor-writers.txt`). The 0-row retry's
+/// recognition defends against it with `gc_holds` span evidence
+/// (`CommitProbe::hold_free_anchor_span`): a stamp this fn writes can
+/// only land while a global hold is active, and a hold anywhere in
+/// the anchor span makes the temporal anchor inadmissible.
 pub(crate) async fn stamp_held_cycle(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE gc_collect_state SET last_live_cycle_at = now(), updated_at = now() \
@@ -551,7 +595,7 @@ impl GcCycleLease {
         Ok(OwnAttemptStamp(stamp))
     }
 
-    // r[impl store.gc.collect-cadence+4]
+    // r[impl store.gc.collect-cadence+5]
     /// Commit a finished cycle to the row (epoch+1, stamps), then
     /// release the lock — three-valued (merged_bug_022): the caller
     /// receives [`CycleCommitResult`] and matches it exhaustively.

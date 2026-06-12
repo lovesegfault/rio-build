@@ -3520,7 +3520,7 @@ rec {
     # recognition) plus the bughunt-6 S6 SIBLING-STAMP axis
     # (merged_bug_021: the own-held-anchor recognition law —
     # siblingStampAttempt + the commit-step interposition nondet;
-    # store.gc.collect-cadence+4). DEDICATED regime per the
+    # store.gc.collect-cadence+5). DEDICATED regime per the
     # gcDrainPass precedent: the time axis must not multiply the
     # other gc regimes.
     # Measured 2026-06-10 (TLC exhaustive, INTERVAL=4 / MAX_TIME=12,
@@ -3532,7 +3532,7 @@ rec {
     # the constant 0 — the F16 byte-identity convention; the earlier
     # bughunt-5 probe record stands: legacy lane 4,347 generated /
     # 1,926 distinct, exactly the pre-extension space).
-    # r[verify store.gc.collect-cadence+4]
+    # r[verify store.gc.collect-cadence+5]
     quint-gc-cadence = mkQuintCheck {
       name = "gc-cadence";
       spec = "gcCadence";
@@ -3548,7 +3548,7 @@ rec {
     # The bug_284 red, deterministically: two checks inside one
     # interval run exactly ONE heavy cycle (the second is throttled by
     # the attempt stamp) and the success stamp stays unwritten.
-    # r[verify store.gc.collect-cadence+4]
+    # r[verify store.gc.collect-cadence+5]
     quint-gc-cadence-runs = mkQuintRunCheck {
       name = "gc-cadence-runs";
       spec = "gcCadence";
@@ -3576,14 +3576,14 @@ rec {
     # RECOGNITION trace and the proven-foreign-winner trace are both
     # reachable — noFalseLost polices paths the regime actually
     # explores. Measured: [violation] in <1s each, TLC.
-    # r[verify store.gc.collect-cadence+4]
+    # r[verify store.gc.collect-cadence+5]
     quint-gc-cadence-witness-response-lost-recognized = mkQuintWitnessCheck {
       name = "gc-cadence-witness-response-lost-recognized";
       spec = "gcCadence";
       main = "gcCadenceMain";
       witness = "noRecognizedResponseLost";
     };
-    # r[verify store.gc.collect-cadence+4]
+    # r[verify store.gc.collect-cadence+5]
     quint-gc-cadence-witness-proven-foreign = mkQuintWitnessCheck {
       name = "gc-cadence-witness-proven-foreign";
       spec = "gcCadence";
@@ -3597,7 +3597,7 @@ rec {
     # explored — noFalseLost's verdict is about a space where the
     # interposition really happens. Measured: [violation] in ~1.1s,
     # TLC (solo-timed 2026-06-10).
-    # r[verify store.gc.collect-cadence+4]
+    # r[verify store.gc.collect-cadence+5]
     quint-gc-cadence-witness-stamp-interposed = mkQuintWitnessCheck {
       name = "gc-cadence-witness-stamp-interposed";
       spec = "gcCadence";
@@ -3617,7 +3617,7 @@ rec {
     # THIS conjunct with the sibling lanes proven intact. Same regime
     # constants as the main regime, axis ON. Measured: [violation] in
     # ~1.3s, TLC (solo-timed 2026-06-10).
-    # r[verify store.gc.collect-cadence+4]
+    # r[verify store.gc.collect-cadence+5]
     quint-gc-cadence-calib-shared-clock-anchor = mkQuintWitnessCheck {
       name = "gc-cadence-calib-shared-clock-anchor";
       spec = "gcCadence";
@@ -3632,7 +3632,7 @@ rec {
     # at expected+1) is reported lost; noFalseLost falsifies. Same
     # regime constants as the main regime. Measured: [violation] in
     # <1s, TLC.
-    # r[verify store.gc.collect-cadence+4]
+    # r[verify store.gc.collect-cadence+5]
     quint-gc-cadence-calib-zero-rows-foreign = mkQuintWitnessCheck {
       name = "gc-cadence-calib-zero-rows-foreign";
       spec = "gcCadence";
@@ -3646,7 +3646,7 @@ rec {
     # whose lock release fails is reported lost; noFalseLost
     # falsifies. Same regime constants as the main regime. Measured:
     # [violation] in <1s, TLC.
-    # r[verify store.gc.collect-cadence+4]
+    # r[verify store.gc.collect-cadence+5]
     quint-gc-cadence-calib-release-fails = mkQuintWitnessCheck {
       name = "gc-cadence-calib-release-fails";
       spec = "gcCadence";
@@ -3747,7 +3747,7 @@ rec {
     # onto one predicate); shadow commits stamp a fresh estimate
     # WITHOUT answering the cadence question; every replica publishes
     # its gauges from a 60s row read (spawn_gc_gauge_publisher).
-    # r[verify store.gc.collect-cadence+4]
+    # r[verify store.gc.collect-cadence+5]
     quint-gc-coordination-main = mkQuintCheck {
       name = "gc-coordination-main";
       spec = "chunkCollect";

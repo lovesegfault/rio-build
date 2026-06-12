@@ -1447,7 +1447,7 @@ async fn run_post_drain_tail(
 /// pre-check race to one lease; the loser skips; the winner re-checks
 /// so a cycle that JUST committed is not repeated). Returns `Ok(None)`
 /// when not due or when another holder has the lease.
-// r[impl store.gc.collect-cadence+4]
+// r[impl store.gc.collect-cadence+5]
 // r[impl store.gc.hold-lanes+1]
 pub(crate) async fn collect_backstop_once(
     pool: &PgPool,
@@ -2617,7 +2617,7 @@ mod tests {
             .unwrap();
     }
 
-    // r[verify store.gc.collect-cadence+4]
+    // r[verify store.gc.collect-cadence+5]
     /// bug_174: the backstop is CLUSTER-cadenced via the durable row.
     /// Two consecutive checks ⇒ the first runs a live cycle (never-ran
     /// cluster: last_live_cycle_at NULL = due) and stamps the row; the
@@ -2687,7 +2687,7 @@ mod tests {
         );
     }
 
-    // r[verify store.gc.collect-cadence+4]
+    // r[verify store.gc.collect-cadence+5]
     /// A live run_gc stamps the durable row, so the backstop\'s next
     /// check skips: GC-schedule runs and the backstop share ONE
     /// cluster cadence.
@@ -2908,7 +2908,7 @@ mod tests {
         assert!(live_set, "the stamp landed via the retry");
     }
 
-    // r[verify store.gc.collect-cadence+4]
+    // r[verify store.gc.collect-cadence+5]
     /// merged_bug_022 red 1 (WO-S7-2): a post-commit lock-release
     /// failure must not alter attribution - execute_commit's Ok IS the
     /// durability point; the release is bookkeeping on an already
@@ -2957,7 +2957,7 @@ mod tests {
         assert!(live_set, "the stamp is present (the commit landed)");
     }
 
-    // r[verify store.gc.collect-cadence+4]
+    // r[verify store.gc.collect-cadence+5]
     /// merged_bug_022 red 2 (WO-S7-2): applied-but-response-lost is
     /// OUR commit. The injected shape EXECUTES the production commit
     /// statement on the lock session (the row lands at expected+1 with
@@ -3013,7 +3013,7 @@ mod tests {
         assert!(live_set, "the stamp is present");
     }
 
-    // r[verify store.gc.collect-cadence+4]
+    // r[verify store.gc.collect-cadence+5]
     /// merged_bug_022 red 3 (WO-S7-2): when neither leg can prove
     /// whether the commit landed (primary refused, retry refused), the
     /// outcome is INDETERMINATE - not the definitive commit_failed the
@@ -3069,7 +3069,7 @@ mod tests {
         assert!(live_null, "no stamp landed");
     }
 
-    // r[verify store.gc.collect-cadence+4]
+    // r[verify store.gc.collect-cadence+5]
     /// merged_bug_022 polarity guard (DISCLOSED, not a behavioral red:
     /// pre-fix this shape also labeled commit_failed, by COLLAPSE
     /// rather than proof — the value here is pinning the post-fix
@@ -3407,7 +3407,7 @@ mod tests {
         );
     }
 
-    // r[verify store.gc.collect-cadence+4]
+    // r[verify store.gc.collect-cadence+5]
     /// merged_bug_021/merged_bug_022: the 0-row retry verdict table as
     /// a GENERATED product census — `{payload} x {anchor} x {epoch}`
     /// cell enums with ALL consts, every cell asserted against an
@@ -3449,11 +3449,21 @@ mod tests {
         }
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         enum AnchorCell {
-            Fresh,
+            /// Live stamp at-or-after our attempt, hold-free span:
+            /// the one admissible recognition cell.
+            FreshHoldFree,
+            /// Live stamp at-or-after our attempt but a global hold
+            /// overlapped the span (merged_bug_073): the held-stamp
+            /// writer may have forged it — inadmissible.
+            FreshHoldOverlapped,
             StaleOrAbsent,
         }
         impl AnchorCell {
-            const ALL: [Self; 2] = [Self::Fresh, Self::StaleOrAbsent];
+            const ALL: [Self; 3] = [
+                Self::FreshHoldFree,
+                Self::FreshHoldOverlapped,
+                Self::StaleOrAbsent,
+            ];
         }
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         enum EpochCell {
@@ -3475,8 +3485,10 @@ mod tests {
                     | PayloadCell::MarkSetMismatch
                     | PayloadCell::LiveStampAbsent => RetryVerdict::ForeignWinner,
                     PayloadCell::Match => match a {
-                        AnchorCell::Fresh => RetryVerdict::OwnCommitLanded,
-                        AnchorCell::StaleOrAbsent => RetryVerdict::Unprovable,
+                        AnchorCell::FreshHoldFree => RetryVerdict::OwnCommitLanded,
+                        AnchorCell::FreshHoldOverlapped | AnchorCell::StaleOrAbsent => {
+                            RetryVerdict::Unprovable
+                        }
                     },
                 },
             }
@@ -3534,7 +3546,14 @@ mod tests {
                         },
                         last_would_collect: None,
                         live_stamped: !matches!(p, PayloadCell::LiveStampAbsent),
-                        live_since_own_attempt: matches!(a, AnchorCell::Fresh),
+                        live_since_own_attempt: matches!(
+                            a,
+                            AnchorCell::FreshHoldFree | AnchorCell::FreshHoldOverlapped
+                        ),
+                        hold_free_anchor_span: matches!(
+                            a,
+                            AnchorCell::FreshHoldFree | AnchorCell::StaleOrAbsent
+                        ),
                     };
                     assert_eq!(
                         classify_zero_row_retry(&live, 0, &probe),
@@ -3575,6 +3594,7 @@ mod tests {
             last_would_collect: Some(would),
             live_stamped: false,
             live_since_own_attempt: false,
+            hold_free_anchor_span: true,
         };
         assert_eq!(
             classify_zero_row_retry(&shadow, 0, &shadow_echo),
@@ -3596,7 +3616,140 @@ mod tests {
         );
     }
 
-    // r[verify store.gc.collect-cadence+4]
+    // r[verify store.gc.collect-cadence+5]
+    /// W11-AQ (merged_bug_073): the triple-coincidence schedule — our
+    /// commit's response lost, a global-hold incident lands a
+    /// HELD-TICK stamp in the stamp_attempt-to-probe span (run_gc's
+    /// Held arm writes `last_live_cycle_at` with NO epoch bump), and
+    /// a payload-coincident foreign SHADOW commit bumps the epoch to
+    /// expected+1. Pre-fix red (verbatim in the commit body): the
+    /// held-tick stamp satisfied `live_since_own_attempt`, upgrading
+    /// honest Unprovable to OwnCommitLanded — false Committed/ok with
+    /// no commit_indeterminate disclosure. Post-fix: the probe's
+    /// `gc_holds` span evidence proves the held-stamp writer class
+    /// was live in the span, the anchor is inadmissible, and the
+    /// verdict is Unprovable (Ambiguous at the caller), honestly.
+    ///
+    /// All interposing writes ride PRODUCTION statements: set_hold /
+    /// release_hold (the operator surface), stamp_held_cycle (the
+    /// run_gc Held-arm statement, called with the hold ACTIVE — its
+    /// semantic precondition asserted), commit_foreign_for_test (the
+    /// execute_commit router).
+    #[tokio::test]
+    async fn gc_held_stamp_in_anchor_span_does_not_forge_recognition() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        seed_collectable_chunks(&db.pool, 3, 100).await;
+
+        // Our lease reads expected_epoch = 0 and stamps (anchor t0).
+        let mut lease = super::super::state::GcCycleLease::try_acquire(&db.pool)
+            .await
+            .unwrap()
+            .expect("lock free");
+        lease.stamp_attempt().await.unwrap();
+
+        // Our LIVE cycle runs (payload minted via production).
+        let ours = collect_cycle(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Live,
+            None,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .expect("live cycle");
+        assert_eq!(ours.outcome, CollectOutcome::Ok);
+        let commit = super::super::state::CycleCommit::Live {
+            disposition: ours
+                .disposition
+                .clone()
+                .expect("live Ok report carries a disposition"),
+            victims_collected: ours.victims_collected,
+            observation: ours.durable.expect("Ok cycle carries an observation"),
+        };
+
+        // INTERPOSITION, all in the anchor span (after t0):
+        // (a) a global-hold incident lands and a sibling's held
+        //     run_gc tick stamps the anchor column (no epoch bump);
+        let hold_id = super::super::hold::set_hold(
+            &db.pool,
+            super::super::hold::GcHoldScope::Global,
+            "w11-aq incident freeze",
+            "w11-aq",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            super::super::hold::active_global_hold(&db.pool)
+                .await
+                .unwrap()
+                .is_some(),
+            "precondition: the held-stamp writer's gate is active"
+        );
+        super::super::state::stamp_held_cycle(&db.pool)
+            .await
+            .expect("held-tick stamp lands");
+        // (b) the incident ends in-span (the row keeps the evidence);
+        assert!(
+            super::super::hold::release_hold(&db.pool, hold_id)
+                .await
+                .unwrap()
+        );
+        // (c) a payload-coincident foreign SHADOW commit bumps the
+        //     epoch to expected+1 (mark size coincides by
+        //     construction: same tree, post-collect).
+        let foreign_shadow = collect_cycle(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Shadow {
+                simulated_swept: Vec::new(),
+            },
+            None,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .expect("foreign shadow cycle");
+        assert_eq!(
+            foreign_shadow.mark_set_size, ours.mark_set_size,
+            "precondition: the payload coincidence (mark size)"
+        );
+        let rows = super::super::state::commit_foreign_for_test(
+            &db.pool,
+            &super::super::state::CycleCommit::Shadow {
+                observation: foreign_shadow
+                    .durable
+                    .expect("shadow carries an observation"),
+            },
+        )
+        .await
+        .expect("foreign shadow commit lands");
+        assert_eq!(rows, 1, "foreign shadow applied (epoch 0 -> 1)");
+
+        // Our primary is refused; the epoch-guarded retry matches 0
+        // rows and probes. The held-stamp forged the temporal anchor;
+        // the hold-span evidence must make it inadmissible.
+        super::super::state::CommitFaultMode::PrimaryRefused.arm();
+        let result = lease.commit_cycle(commit).await;
+        match result {
+            super::super::state::CycleCommitResult::Ambiguous(_) => {}
+            super::super::state::CycleCommitResult::Committed(w) => {
+                w.record_ok_outcome();
+                panic!(
+                    "false recognition: a held-tick stamp plus a coincident \
+                     foreign shadow read as OUR landed commit (Committed/ok \
+                     with no commit_indeterminate disclosure)"
+                );
+            }
+            super::super::state::CycleCommitResult::NotCommitted(_) => {
+                panic!("never PROVEN-foreign here: the payload matches (merged_bug_021)");
+            }
+        }
+    }
+
+    // r[verify store.gc.collect-cadence+5]
     /// merged_bug_021 red: a SIBLING holder's attempt stamp interposed
     /// between our applied-but-response-lost commit and the diagnostic
     /// probe must NOT forge a foreign winner. The dead-session world:

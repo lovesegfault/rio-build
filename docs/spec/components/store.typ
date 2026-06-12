@@ -2024,7 +2024,7 @@ too large, and the backstop cadence paced against the counterfactual
 invariants; its calibration twin re-wires the commit to the simulated
 products and both falsify.
 
-#r("store.gc.collect-cadence+4")[
+#r("store.gc.collect-cadence+5")[
   The collect cycle's cadence, resume cursor, and gauge sources are CLUSTER
   state, durable in the `gc_collect_state` singleton row (migrations 090,
   100), never process state. The backstop MUST run a live cycle only when
@@ -2035,8 +2035,14 @@ products and both falsify.
   BEFORE the cycle runs --- backstop and live `run_gc` phase 3 alike, never
   by a dry run --- so no outcome arm (success, fail-closed abort, database
   error) can yield a faster-than-interval retry of the heavy cycle
-  (bug_284). `last_live_cycle_at` is stamped ONLY by a committed live
-  cycle; the stalled alert keys on it. Per-replica timers are cheap CHECK
+  (bug_284). `last_live_cycle_at` is written by exactly the census-derived
+  writer set (`live-cycle-anchor-writers.txt`): the committed live cycle's
+  same-statement stamp and the held `run_gc` tick's stamp (a held cycle is
+  a live cycle for staleness purposes; merged_bug_050) --- and commit
+  recognition MUST treat the anchor as inadmissible whenever a global hold
+  overlapped the attempt-to-probe span, since the held-tick writer can
+  forge it (merged_bug_073). The stalled alert keys on the column.
+  Per-replica timers are cheap CHECK
   ticks --- N replicas MUST NOT yield more than one live backstop cycle per
   interval. A live cycle commits its stamp, stop cursor, and decremented
   --- or, when no anchor exists, freshly seeded from the cycle's

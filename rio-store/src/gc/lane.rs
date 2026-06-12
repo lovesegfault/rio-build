@@ -1356,6 +1356,203 @@ pub fn spawn_lawful(pool: PgPool, shutdown: Token) {
         );
     }
 
+    /// merged_bug_073: derive the WRITERS of the `last_live_cycle_at`
+    /// recognition-anchor column from COLUMN-WRITE SITES in the SQL
+    /// surface — never from a semantic event alphabet that happens to
+    /// correlate (the epoch-bumping commit set had no held-stamp
+    /// event while the column had a third writer). Token grammar over
+    /// the production halves, FAIL-CLOSED per R22'': every occurrence
+    /// classifies as a WRITE (`=`-assignment under the nearest SET),
+    /// a READ (comparator / IS-test / arithmetic-operand /
+    /// FROM-operand / cast), or REFUSES with the site named (e.g. a
+    /// column-list position, where read-vs-write needs statement
+    /// context this grammar does not carry — extend the grammar at
+    /// review, never skip).
+    fn derive_anchor_writers(corpus: &[(&str, &str)]) -> Result<Vec<String>, Vec<String>> {
+        const COL: &str = "last_live_cycle_at";
+        let mut writers = Vec::new();
+        let mut errors = Vec::new();
+        for (file, src) in corpus {
+            let text: String = code_lines(src).join("\n");
+            let bytes = text.as_bytes();
+            let mut i = 0;
+            while let Some(pos) = text[i..].find(COL) {
+                let at = i + pos;
+                let end = at + COL.len();
+                // Word boundaries.
+                let pre_ident = at > 0
+                    && (bytes[at - 1].is_ascii_alphanumeric()
+                        || bytes[at - 1] == b'_'
+                        || bytes[at - 1] == b'.');
+                let post_ident =
+                    end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
+                if pre_ident || post_ident {
+                    i = end;
+                    continue;
+                }
+                let next = text[end..].trim_start();
+                let prev_char = text[..at].trim_end().chars().next_back();
+                // Enclosing context: the nearest preceding `fn ` or
+                // `const ` identifier (the refusal/genset row label).
+                let ctx = {
+                    let head = &text[..at];
+                    let f = head.rfind("fn ").map(|p| (p, p + 3));
+                    let c = head.rfind("const ").map(|p| (p, p + 6));
+                    let best = match (f, c) {
+                        (Some(a), Some(b)) => Some(if a.0 > b.0 { a } else { b }),
+                        (x, None) => x,
+                        (None, y) => y,
+                    };
+                    best.map(|(_, idstart)| {
+                        head[idstart..]
+                            .chars()
+                            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                            .collect::<String>()
+                    })
+                    .unwrap_or_else(|| "<module>".to_string())
+                };
+                if next.starts_with('=') && !next.starts_with("==") && !next.starts_with("=>") {
+                    // Assignment form: a WRITE only under a SET list;
+                    // an equality under WHERE/SELECT is a comparison.
+                    let head_upper = text[..at].to_uppercase();
+                    let set_pos = head_upper.rfind(" SET ");
+                    let where_pos = head_upper.rfind("WHERE");
+                    let select_pos = head_upper.rfind("SELECT");
+                    let m = [set_pos, where_pos, select_pos].into_iter().flatten().max();
+                    match m {
+                        Some(mp) if Some(mp) == set_pos => {
+                            writers.push(format!("{file}\t{ctx}\twrite"));
+                        }
+                        Some(_) => { /* comparison under WHERE/SELECT: read */ }
+                        None => errors.push(format!(
+                            "{file}: `{COL} =` with no governing SET/WHERE/SELECT \
+                             (cannot classify; refusing fail-closed) in `{ctx}`"
+                        )),
+                    }
+                } else if next.starts_with(">=")
+                    || next.starts_with("<=")
+                    || next.starts_with("<>")
+                    || next.starts_with("!=")
+                    || next.starts_with('>')
+                    || next.starts_with('<')
+                    || next.starts_with("IS ")
+                    || next.starts_with("::")
+                {
+                    // Read forms.
+                } else if next.starts_with(')') || next.starts_with(',') {
+                    // Operand position: arithmetic/FROM operands are
+                    // reads; a column-list position (preceded by `,`
+                    // or `(`) is REFUSED — read-vs-write needs the
+                    // statement head this grammar does not carry.
+                    let head_upper_tail: String = {
+                        let head = text[..at].trim_end();
+                        head[head.len().saturating_sub(8)..].to_uppercase()
+                    };
+                    match prev_char {
+                        Some('-') | Some('+') => { /* arithmetic operand: read */ }
+                        _ if head_upper_tail.ends_with("FROM") => { /* EXTRACT/FROM operand: read */
+                        }
+                        Some(',') | Some('(') => errors.push(format!(
+                            "{file}: `{COL}` in a column-list position \
+                             (read-vs-write ambiguous; refusing fail-closed) in `{ctx}`"
+                        )),
+                        _ => errors.push(format!(
+                            "{file}: `{COL}` followed by `{}` after `{prev_char:?}` \
+                             (cannot classify; refusing fail-closed) in `{ctx}`",
+                            &next[..1]
+                        )),
+                    }
+                } else {
+                    errors.push(format!(
+                        "{file}: `{COL}` followed by `{}…` \
+                         (cannot classify; refusing fail-closed) in `{ctx}`",
+                        next.chars().take(8).collect::<String>()
+                    ));
+                }
+                i = end;
+            }
+        }
+        writers.sort();
+        writers.dedup();
+        if errors.is_empty() {
+            Ok(writers)
+        } else {
+            Err(errors)
+        }
+    }
+
+    // r[verify store.gc.collect-cadence+5]
+    /// W11-AR (merged_bug_073): the anchor-writer census — derived
+    /// from column-write sites, pinned against the committed
+    /// [GEN-SET], with the strawman fourth writer and the
+    /// column-list refusal plant at the SCAN layer.
+    #[test]
+    fn live_cycle_anchor_writer_census() {
+        let writers = derive_anchor_writers(CENSUS_SOURCES).unwrap_or_else(|refusals| {
+            panic!(
+                "anchor-writer census REFUSED (fail-closed): every \
+                 `last_live_cycle_at` occurrence must classify; extend \
+                 the grammar or restructure the statement: {refusals:#?}"
+            )
+        });
+        let committed = include_str!("../../tests/gensets/live-cycle-anchor-writers.txt");
+        let committed: Vec<String> = committed
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            writers, committed,
+            "anchor-writer census drifted — a new writer of the \
+             recognition-anchor column must be reviewed against the \
+             0-row-retry recognition law (state.rs: the hold-span \
+             admissibility defense covers the held-stamp writer; a \
+             NEW writer class needs its own admissibility evidence), \
+             then regenerate \
+             rio-store/tests/gensets/live-cycle-anchor-writers.txt"
+        );
+
+        // The strawman fourth writer is census-visible (planted at
+        // the scan layer).
+        let strawman = r#"
+async fn rogue_stamp(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE gc_collect_state SET last_live_cycle_at = now() WHERE singleton")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+"#;
+        let mut corpus: Vec<(&str, &str)> = CENSUS_SOURCES.to_vec();
+        corpus.push(("plant_rogue_writer.rs", strawman));
+        let with_plant = derive_anchor_writers(&corpus).expect("the strawman classifies");
+        assert!(
+            with_plant.contains(&"plant_rogue_writer.rs\trogue_stamp\twrite".to_string()),
+            "a fourth writer must be census-visible: {with_plant:#?}"
+        );
+        assert_ne!(with_plant, committed, "the plant drifts the pinned set");
+
+        // The column-list position REFUSES (the grammar's own
+        // leniency point, mirrored per R22'').
+        let ambiguous = r#"
+async fn seed_row(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO gc_collect_state (singleton, last_live_cycle_at) VALUES (TRUE, now())")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+"#;
+        let mut corpus2: Vec<(&str, &str)> = CENSUS_SOURCES.to_vec();
+        corpus2.push(("plant_column_list.rs", ambiguous));
+        let refusals = derive_anchor_writers(&corpus2)
+            .expect_err("a column-list position must REFUSE, never guess");
+        assert!(
+            refusals
+                .iter()
+                .any(|e| e.contains("plant_column_list.rs") && e.contains("column-list")),
+            "the refusal names the site: {refusals:#?}"
+        );
+    }
+
     // r[verify store.gc.hold-lanes+1]
     /// W11-AN (bug_085 leniency point 1 — the literal-less silent
     /// skip): a deleting spawn-family lane whose name rides a CONST

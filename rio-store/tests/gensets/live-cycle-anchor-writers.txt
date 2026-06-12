@@ -1,0 +1,16 @@
+# [GEN-SET] last_live_cycle_at anchor-writer census (merged_bug_073).
+# Generator: rio-store/src/gc/lane.rs census::live_cycle_anchor_writer_census
+# — fail-closed token grammar over the production halves of the
+# whole-crate embedded universe: every `last_live_cycle_at` occurrence
+# classifies as write (=-assignment under the nearest SET), read
+# (comparator / IS-test / arithmetic or FROM operand / cast), or
+# REFUSES with the site named (column-list positions refuse).
+# The recognition law (state.rs classify_zero_row_retry) consumes this
+# set: the held-stamp writer (stamp_held_cycle — run_gc's Held arm, no
+# epoch bump) is defended against by gc_holds span evidence
+# (hold_free_anchor_span); the live-commit writer (execute_commit)
+# bumps the epoch in the same statement. A NEW writer row here means a
+# NEW admissibility argument there.
+# Format: file \t enclosing fn/const \t write (sorted).
+gc/state.rs	execute_commit	write
+gc/state.rs	stamp_held_cycle	write
