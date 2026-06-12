@@ -181,23 +181,44 @@ pub(crate) fn validate_begin(
     // from the deriver store path), and the binding that matters —
     // content → path — is enforced by the server-side CA-path
     // recompute at commit time instead.
-    let deriver = StorePath::parse(&begin.deriver).map_err(|e| {
-        Status::invalid_argument(format!("PutPathChunked: invalid deriver path: {e}"))
-    })?;
-    if !deriver.is_derivation() {
-        return Err(Status::invalid_argument(
-            "PutPathChunked: deriver is not a .drv path",
-        ));
-    }
-    if !claims.is_ca && !deriver_matches_drv_hash(&deriver, &claims.drv_hash) {
-        metrics::counter!(
-            "rio_store_hmac_rejected_total",
-            "reason" => "deriver_mismatch"
-        )
-        .increment(1);
-        return Err(Status::permission_denied(
-            "PutPathChunked: deriver does not match the assignment token's drv_hash",
-        ));
+    //
+    // ADR-024 P3: an EMPTY deriver means "no deriver" — a client
+    // source-tree upload (inputSrcs have no producing derivation).
+    // Allowed only when the caller has no deriver-bound identity
+    // (claims.drv_hash empty: dev mode / service-token bypass, where
+    // synthesize_claims derived drv_hash from the deriver itself); a
+    // builder under a real assignment token must always name the
+    // deriver it was dispatched for.
+    if begin.deriver.is_empty() {
+        if !claims.drv_hash.is_empty() {
+            metrics::counter!(
+                "rio_store_hmac_rejected_total",
+                "reason" => "deriver_mismatch"
+            )
+            .increment(1);
+            return Err(Status::permission_denied(
+                "PutPathChunked: deriver required under an assignment token",
+            ));
+        }
+    } else {
+        let deriver = StorePath::parse(&begin.deriver).map_err(|e| {
+            Status::invalid_argument(format!("PutPathChunked: invalid deriver path: {e}"))
+        })?;
+        if !deriver.is_derivation() {
+            return Err(Status::invalid_argument(
+                "PutPathChunked: deriver is not a .drv path",
+            ));
+        }
+        if !claims.is_ca && !deriver_matches_drv_hash(&deriver, &claims.drv_hash) {
+            metrics::counter!(
+                "rio_store_hmac_rejected_total",
+                "reason" => "deriver_mismatch"
+            )
+            .increment(1);
+            return Err(Status::permission_denied(
+                "PutPathChunked: deriver does not match the assignment token's drv_hash",
+            ));
+        }
     }
 
     // ── Directory bodies → recomputed-digest map. ────────────────────
@@ -963,6 +984,30 @@ mod tests {
         let mut c = claims();
         c.drv_hash = "ffffffffffffffffffffffffffffffff".into();
         validate_begin(&begin(), &c).expect("bare hash-part drv_hash format");
+    }
+
+    /// ADR-024 P3: an empty deriver (client source-tree upload — no
+    /// producing derivation) validates ONLY for a caller without a
+    /// deriver-bound identity. A builder under a real assignment token
+    /// (drv_hash set) must always name its deriver.
+    #[test]
+    fn empty_deriver_is_source_upload_dev_mode_only() {
+        let mut b = begin();
+        b.deriver = String::new();
+
+        // Synthesized dev-mode claims for an empty deriver carry an
+        // empty drv_hash (StorePath::parse("") fails) — allowed.
+        let mut dev = claims();
+        dev.drv_hash = String::new();
+        validate_begin(&b, &dev).expect("sourceless deriver in dev mode");
+
+        // Token-bound caller: rejected.
+        expect_code(
+            &b,
+            &claims(),
+            Code::PermissionDenied,
+            "empty deriver under an assignment token",
+        );
     }
 
     /// A non-CA output not in the token's expected_outputs is an
