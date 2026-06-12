@@ -160,20 +160,24 @@ impl DestructiveLane {
 }
 
 /// R17 bound on IN-FLIGHT destructive work at hold-start, enforced
-/// per BATCH since merged_bug_067 (the time axis): at most one
+/// per BATCH since merged_bug_067 (the time axis) and per TOKEN
+/// since bug_084/merged_bug_006 (the R32 form): at most one
 /// committed-transaction batch is mid-flight when a hold lands —
 /// that batch completes-or-aborts, and the next batch (not just the
-/// next tick) refuses, because multi-batch tick bodies re-authorize
-/// the clearance at each batch boundary and the clearance itself
-/// expires this many seconds after its last successful consult
-/// (`hold::HoldClearance::authorize_batch` — expiry refuses even
-/// with an empty `gc_holds`, so a stalled body cannot ride a
-/// tick-start consult for minutes). The wave-10 form consulted once
-/// per tick and asserted the rest by mass ("the other lanes are
-/// lighter") — false for the backstop's full collect cycle (a
-/// 5-minute lock-held budget over 50 committed batches) and the
-/// until-short scan/sweep loops; the per-batch demand replaces that
-/// derivation with structure. VALUE: one drain cadence —
+/// next tick) refuses, because EVERY multi-batch destructive body
+/// re-authorizes at each batch boundary — the boundary consult mints
+/// a per-batch `BatchAuthority` the destructive sinks demand BY
+/// VALUE, so a batch outside an authorized boundary does not compile
+/// — and the clearance itself expires this many seconds after its
+/// last successful consult (`hold::HoldClearance::authorize_batch` —
+/// expiry refuses even with an empty `gc_holds`, so a stalled body
+/// cannot ride a tick-start consult for minutes). The wave-11 form
+/// quantified over "multi-batch tick bodies" but hand-wired four of
+/// six: run_gc's phase-2 path sweep took no clearance and the log
+/// sweep discarded its lane clearance (`move |_clearance|`) — a
+/// global hold could not stop either mid-pass; the token demand
+/// replaces that enumeration with structure (the body census derives
+/// the population). VALUE: one drain cadence —
 /// `DRAIN_BATCH_SIZE` (100) per-key S3 deletes is sized to finish
 /// well inside its own 30s `DRAIN_INTERVAL` (the cadence holds
 /// because it does), so the interval is the authority window.
@@ -284,17 +288,20 @@ mod tests {
     }
 
     fn sweep_body(pool: sqlx::PgPool) -> LaneBody {
-        Box::new(move |_clearance| {
+        Box::new(move |clearance| {
             let pool = pool.clone();
             Box::pin(async move {
-                // The seam-registered lane's body (the sweep itself is
-                // unchanged; suspension rides the wrapper).
+                // The tick clearance threads into the body
+                // (merged_bug_006): the until-short loop re-authorizes
+                // per batch through it — the harness mirrors the
+                // production spawn exactly.
                 let store = crate::logs::chunks::MemoryLogChunkStore::default();
                 let _ = crate::logs::sweep::sweep_expired_logs(
                     &pool,
                     &store,
                     Duration::from_secs(30 * 86_400),
                     100,
+                    clearance,
                 )
                 .await
                 .unwrap();

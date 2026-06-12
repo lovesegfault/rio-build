@@ -81,8 +81,8 @@ pub async fn drain_once(
         // A consult error fails closed through the `?`; the gauge
         // refresh below still runs on a clearance stop (reads are
         // not destructive).
-        match clearance.authorize_batch(pool).await? {
-            crate::gc::hold::BatchAuthorize::Authorized => {}
+        let authority = match clearance.authorize_batch(pool).await? {
+            crate::gc::hold::BatchAuthorize::Authorized(a) => a,
             crate::gc::hold::BatchAuthorize::Held(h) => {
                 debug!(
                     hold_id = %h.hold_id,
@@ -99,8 +99,8 @@ pub async fn drain_once(
                 );
                 break;
             }
-        }
-        match drain_one_row(pool, backend, &seen).await? {
+        };
+        match drain_one_row(pool, backend, &seen, authority).await? {
             None => break,
             Some((id, DrainOutcome::Deleted)) => {
                 seen.push(id);
@@ -169,11 +169,20 @@ enum DrainOutcome {
 /// One per-row drain transaction: SELECT one pending row FOR UPDATE
 /// SKIP LOCKED, re-check `chunks.deleted` FOR UPDATE, S3 delete,
 /// commit. Returns `None` if no eligible row.
+///
+/// Demands the row's [`crate::gc::hold::BatchAuthority`] BY VALUE
+/// (bug_084, R32): each per-row transaction is its own batch, and
+/// this fn is the drain's S3-delete sink — a backend delete outside
+/// an authorized boundary does not compile.
+// r[impl store.gc.batch-authority]
 async fn drain_one_row(
     pool: &PgPool,
     backend: &Arc<dyn ChunkBackend>,
     skip_ids: &[i64],
+    authority: crate::gc::hold::BatchAuthority,
 ) -> Result<Option<(i64, DrainOutcome)>, sqlx::Error> {
+    // The token is spent: one authority, one row-batch, this sink.
+    authority.spend();
     let mut tx = pool.begin().await?;
 
     // SELECT one eligible row. FOR UPDATE SKIP LOCKED: multi-replica

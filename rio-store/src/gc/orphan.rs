@@ -104,33 +104,7 @@ pub async fn scan_once(
     let threshold_secs = STALE_THRESHOLD.as_secs() as i64;
     let mut reaped = 0u64;
     let mut failed = 0u64;
-    loop {
-        // Batch-boundary re-authorization (merged_bug_067): the
-        // until-short loop is a multi-batch destructive body, so a
-        // hold landing mid-scan (or a drain-bound-aged clearance)
-        // stops the next batch instead of riding the tick-start
-        // consult through the whole backlog. A consult error fails
-        // closed through the `?`.
-        match clearance.authorize_batch(pool).await? {
-            crate::gc::hold::BatchAuthorize::Authorized => {}
-            crate::gc::hold::BatchAuthorize::Held(h) => {
-                info!(
-                    hold_id = %h.hold_id,
-                    reaped,
-                    "orphan scan: global hold landed mid-scan; \
-                     stopping at the batch boundary"
-                );
-                break;
-            }
-            crate::gc::hold::BatchAuthorize::Expired => {
-                warn!(
-                    reaped,
-                    "orphan scan: clearance aged past the drain bound; \
-                     stopping at the batch boundary (next tick re-gates)"
-                );
-                break;
-            }
-        }
+    'scan: loop {
         let stale: Vec<(Vec<u8>,)> = sqlx::query_as(
             r#"
             SELECT m.store_path_hash
@@ -155,6 +129,35 @@ pub async fn scan_once(
 
         let mut progressed = 0u64;
         for (store_path_hash,) in stale {
+            // Batch-boundary re-authorization (merged_bug_067; per-ROW
+            // since bug_084 — each reap_one is its own committed
+            // transaction, i.e. its own batch, and the sink demands
+            // the token by value): a hold landing mid-scan (or a
+            // drain-bound-aged clearance) stops the next reap instead
+            // of riding the tick-start consult through the whole
+            // backlog. The candidate SELECT above runs unguarded —
+            // reads are not destructive. A consult error fails closed
+            // through the `?`.
+            let authority = match clearance.authorize_batch(pool).await? {
+                crate::gc::hold::BatchAuthorize::Authorized(a) => a,
+                crate::gc::hold::BatchAuthorize::Held(h) => {
+                    info!(
+                        hold_id = %h.hold_id,
+                        reaped,
+                        "orphan scan: global hold landed mid-scan; \
+                         stopping at the batch boundary"
+                    );
+                    break 'scan;
+                }
+                crate::gc::hold::BatchAuthorize::Expired => {
+                    warn!(
+                        reaped,
+                        "orphan scan: clearance aged past the drain bound; \
+                         stopping at the batch boundary (next tick re-gates)"
+                    );
+                    break 'scan;
+                }
+            };
             // Per-row isolation: a poison row (a row that makes its
             // own delete transaction fail, e.g. an FK surprise from
             // manual surgery) must not wedge the scanner. Log + count;
@@ -166,7 +169,7 @@ pub async fn scan_once(
                 ReapBy::Stale {
                     secs: threshold_secs,
                 },
-                clearance,
+                authority,
             )
             .await
             {
@@ -240,14 +243,24 @@ pub async fn scan_once(
 /// unreferenced are collected by the next collect cycle. This is also
 /// the claim-gated rollback `cas::put_chunked`/`cas::stage_chunked`
 /// use on their failure paths.
+///
+/// Demands the reap's [`crate::gc::hold::BatchAuthority`] BY VALUE
+/// (bug_084, R32): each reap is its own committed transaction — its
+/// own batch — and this fn is the placeholder plane's DB-delete sink.
+/// The wave-10 `_clearance: &HoldClearance` underscore-param was
+/// advisory (a discarded proof, the merged_bug_006 shape one plane
+/// over); the consumed token is not discardable.
 // r[impl store.put.placeholder-claim+2]
 // r[impl store.gc.hold-lanes+1]
+// r[impl store.gc.batch-authority]
 pub(crate) async fn reap_one(
     pool: &PgPool,
     store_path_hash: &[u8],
     by: ReapBy,
-    _clearance: &crate::gc::hold::HoldClearance,
+    authority: crate::gc::hold::BatchAuthority,
 ) -> Result<bool, sqlx::Error> {
+    // The token is spent: one authority, one reap, this sink.
+    authority.spend();
     let mut tx = pool.begin().await?;
 
     // Re-check the predicate INSIDE the tx with FOR UPDATE. Two races
@@ -400,8 +413,45 @@ pub(crate) async fn reap_one_consulted(
     by: ReapBy,
 ) -> Result<bool, sqlx::Error> {
     match crate::gc::hold::gate(pool).await {
-        Ok(crate::gc::hold::HoldGate::Clear(clearance)) => {
-            reap_one(pool, store_path_hash, by, &clearance).await
+        Ok(crate::gc::hold::HoldGate::Clear(mut clearance)) => {
+            // The demand-driven reap is one batch: mint its token at
+            // the fresh consult (bug_084 — the sink demands it by
+            // value). Held/Expired here mirror the gate arms below;
+            // Expired on a just-minted clearance is unreachable but
+            // refuses honestly rather than panicking (closed alphabet,
+            // no wildcard).
+            match clearance.authorize_batch(pool).await? {
+                crate::gc::hold::BatchAuthorize::Authorized(authority) => {
+                    reap_one(pool, store_path_hash, by, authority).await
+                }
+                crate::gc::hold::BatchAuthorize::Held(h) => {
+                    debug!(
+                        store_path_hash = %hex::encode(store_path_hash),
+                        hold_id = %h.hold_id,
+                        "placeholder reap skipped: global hold landed at the \
+                         batch boundary (scanner reaps after release)"
+                    );
+                    metrics::counter!(
+                        "rio_store_gc_hold_lane_skips_total",
+                        "lane" => "claim-reap", "cause" => "held"
+                    )
+                    .increment(1);
+                    Ok(false)
+                }
+                crate::gc::hold::BatchAuthorize::Expired => {
+                    warn!(
+                        store_path_hash = %hex::encode(store_path_hash),
+                        "placeholder reap skipped: clearance expired at mint \
+                         (cannot happen on a fresh consult; refusing closed)"
+                    );
+                    metrics::counter!(
+                        "rio_store_gc_hold_lane_skips_total",
+                        "lane" => "claim-reap", "cause" => "consult_error"
+                    )
+                    .increment(1);
+                    Ok(false)
+                }
+            }
         }
         Ok(crate::gc::hold::HoldGate::Held(h)) => {
             debug!(
@@ -541,7 +591,7 @@ mod tests {
             &db.pool,
             &hash,
             ReapBy::Claim(claim),
-            &crate::test_helpers::gc_clearance(&db.pool).await,
+            crate::test_helpers::gc_batch_authority(&db.pool).await,
         )
         .await
         .unwrap();
@@ -604,9 +654,9 @@ mod tests {
         assert_eq!(n_md, 0, "scanner reap deleted the path rows");
     }
 
-    /// `reap_one(Some(threshold), &crate::test_helpers::gc_clearance(Some(threshold)).await)` skips a fresh placeholder. Same
-    /// guard scan_once relied on; pinned here so a future direct
-    /// caller (substitute) gets the same protection.
+    /// `reap_one(ReapBy::Stale, <batch authority>)` skips a fresh
+    /// placeholder. Same guard scan_once relied on; pinned here so a
+    /// future direct caller (substitute) gets the same protection.
     #[tokio::test]
     async fn reap_one_thresholded_skips_fresh_chunked() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -629,7 +679,7 @@ mod tests {
             &db.pool,
             &hash,
             ReapBy::Stale { secs: 300 },
-            &crate::test_helpers::gc_clearance(&db.pool).await,
+            crate::test_helpers::gc_batch_authority(&db.pool).await,
         )
         .await
         .unwrap();
@@ -659,7 +709,7 @@ mod tests {
     // r[verify store.put.placeholder-claim+2]
     /// bug_235: `ReapBy::Claim(a)` MUST NOT match a fresh placeholder
     /// inserted with claim_b at the same hash. Before M_052 the
-    /// equivalent (`reap_one(threshold=None, &crate::test_helpers::gc_clearance(threshold=None).await)`) filtered
+    /// equivalent (a threshold-less reap) filtered
     /// `status='uploading'` only — A's late drop-guard reaped B's
     /// in-flight placeholder (and with it the manifest_data that keeps
     /// B's chunks out of the collect cycle's eligible set).
@@ -689,7 +739,7 @@ mod tests {
             &db.pool,
             &hash,
             ReapBy::Claim(claim_a),
-            &crate::test_helpers::gc_clearance(&db.pool).await,
+            crate::test_helpers::gc_batch_authority(&db.pool).await,
         )
         .await
         .unwrap();
@@ -713,7 +763,7 @@ mod tests {
             &db.pool,
             &hash,
             ReapBy::Claim(claim_b),
-            &crate::test_helpers::gc_clearance(&db.pool).await,
+            crate::test_helpers::gc_batch_authority(&db.pool).await,
         )
         .await
         .unwrap();
@@ -744,7 +794,7 @@ mod tests {
             &db.pool,
             &hash,
             ReapBy::Claim(claim),
-            &crate::test_helpers::gc_clearance(&db.pool).await,
+            crate::test_helpers::gc_batch_authority(&db.pool).await,
         )
         .await
         .unwrap();

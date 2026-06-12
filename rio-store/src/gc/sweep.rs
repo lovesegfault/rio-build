@@ -289,11 +289,16 @@ async fn delete_swept_path(
 /// Re-check whether `store_path_hash` has any concurrent-writable mark
 /// seed: (i) a `narinfo.references` referrer outside the
 /// `sweep_unreachable` temp table, (ii) a direct `scheduler_live_pins`
-/// entry, or (iii) a `path_tenants` row inside any tenant's retention
+/// entry, (iii) a `path_tenants` row inside any tenant's retention
 /// window OR under an active tenant-scoped GC hold (the round-9 hold
 /// conjunct — a hold set between mark and this path's batch still
-/// protects it). See the call-site comment in [`sweep`] for the
-/// GIN/anti-join rationale.
+/// protects it), or (iv) an active GLOBAL hold (bug_084 — the scope
+/// axis complete: the per-batch `BatchAuthority` demand stops the
+/// NEXT batch at its boundary; this conjunct additionally protects
+/// every path inside the one batch already in flight when the hold
+/// lands, and unlike arm (iii) it does not require a `path_tenants`
+/// row). See the call-site comment in [`sweep`] for the GIN/anti-join
+/// rationale.
 // r[impl store.gc.hold+2]
 async fn recheck_has_live_referrer(
     tx: &mut Transaction<'_, Postgres>,
@@ -326,6 +331,12 @@ async fn recheck_has_live_referrer(
         super::hold::active_hold_predicate!(),
         r#"
                     ))
+          )
+          OR EXISTS (
+            SELECT 1 FROM gc_holds h
+             WHERE h.scope = 'global' AND h."#,
+        super::hold::active_hold_predicate!(),
+        r#"
           )
         "#
     ))
@@ -403,7 +414,23 @@ async fn closure_remove_from_unreachable(
 pub struct SweepOutcome {
     pub stats: GcStats,
     pub swept_paths: Vec<Vec<u8>>,
+    /// `Some` iff the delete loop stopped at a batch boundary on a
+    /// clearance refusal (bug_084): a global hold landed mid-pass, or
+    /// the clearance aged out. Committed batches stand; the caller
+    /// suspends the rest of its run (phase 3 never starts under a
+    /// refusal the sweep just honored).
+    pub clearance_stop: Option<super::hold::ClearanceStop>,
 }
+
+/// Test-only mid-pass hold interposition (W12-O, the bug_084 red):
+/// when set to N > 0, a GLOBAL hold is inserted through the
+/// production `hold::set_hold` statement immediately after the
+/// delete loop commits its Nth batch (and the injection clears) —
+/// the exact "hold lands between two committed path batches"
+/// schedule, which no external caller can time deterministically.
+#[cfg(test)]
+pub(crate) static SWEEP_HOLD_AFTER_BATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 pub async fn sweep(
     pool: &PgPool,
@@ -411,13 +438,19 @@ pub async fn sweep(
     unreachable: Vec<Vec<u8>>,
     dry_run: bool,
     shutdown: &rio_common::signal::Token,
+    clearance: &mut super::hold::HoldClearance,
 ) -> Result<SweepOutcome, SweepAbort> {
     let mut stats = GcStats::default();
     let mut swept_paths: Vec<Vec<u8>> = Vec::new();
+    let mut clearance_stop: Option<super::hold::ClearanceStop> = None;
 
     if unreachable.is_empty() {
         // Skip connection acquire + temp-table setup for no-op sweeps.
-        return Ok(SweepOutcome { stats, swept_paths });
+        return Ok(SweepOutcome {
+            stats,
+            swept_paths,
+            clearance_stop,
+        });
     }
 
     // Reset on ANY exit (Ok, SweepAbort, panic). The gauge contract is
@@ -516,18 +549,76 @@ pub async fn sweep(
             );
             return Err(SweepAbort::Shutdown);
         }
+        // Batch-boundary re-authorization (bug_084 — the per-batch
+        // hold law reaches the path sweep): every delete batch
+        // demands fresh BatchAuthority, so a global hold landing
+        // mid-pass (or a drain-bound-aged clearance) stops the sweep
+        // here instead of riding the entry consult through
+        // "thousands of batches × ~100ms". A consult error fails
+        // closed through the `?` (committed batches stand).
+        let authority = match clearance.authorize_batch(pool).await? {
+            super::hold::BatchAuthorize::Authorized(a) => a,
+            super::hold::BatchAuthorize::Held(h) => {
+                info!(
+                    hold_id = %h.hold_id,
+                    reason = %h.reason,
+                    created_by = %h.created_by,
+                    swept = stats.paths_deleted,
+                    "GC sweep: global hold landed mid-pass; \
+                     stopping at the batch boundary"
+                );
+                clearance_stop = Some(super::hold::ClearanceStop::Held);
+                break;
+            }
+            super::hold::BatchAuthorize::Expired => {
+                warn!(
+                    swept = stats.paths_deleted,
+                    "GC sweep: clearance aged past the drain bound; \
+                     stopping at the batch boundary"
+                );
+                clearance_stop = Some(super::hold::ClearanceStop::Expired);
+                break;
+            }
+        };
         // Retry-once-on-40P01 (defense-in-depth: the batch takes only
         // manifest-row and narinfo locks now, but PG can still 40P01
         // under index-page-split contention). The `?` propagates
-        // SweepAbort::Db on the second failure.
-        let (delta, batch_swept) = match sweep_one_batch(session.conn(), batch, dry_run).await {
-            Err(e) if is_deadlock(&e) => {
-                warn!(error = %e, "sweep: 40P01 on batch tx; retrying once");
-                tokio::time::sleep(crate::metadata::jitter()).await;
-                sweep_one_batch(session.conn(), batch, dry_run).await?
-            }
-            r => r?,
-        };
+        // SweepAbort::Db on the second failure. The retry is the SAME
+        // batch re-executed (the deadlock aborted the whole tx, so
+        // nothing committed) — it re-authorizes rather than re-spend
+        // a consumed token: a hold landing between the attempt and
+        // the retry refuses here like any other boundary.
+        let (delta, batch_swept) =
+            match sweep_one_batch(session.conn(), batch, dry_run, authority).await {
+                Err(e) if is_deadlock(&e) => {
+                    warn!(error = %e, "sweep: 40P01 on batch tx; retrying once");
+                    tokio::time::sleep(crate::metadata::jitter()).await;
+                    let retry_authority = match clearance.authorize_batch(pool).await? {
+                        super::hold::BatchAuthorize::Authorized(a) => a,
+                        super::hold::BatchAuthorize::Held(h) => {
+                            info!(
+                                hold_id = %h.hold_id,
+                                swept = stats.paths_deleted,
+                                "GC sweep: global hold landed before the 40P01 retry; \
+                                 stopping at the batch boundary"
+                            );
+                            clearance_stop = Some(super::hold::ClearanceStop::Held);
+                            break;
+                        }
+                        super::hold::BatchAuthorize::Expired => {
+                            warn!(
+                                swept = stats.paths_deleted,
+                                "GC sweep: clearance aged out before the 40P01 retry; \
+                                 stopping at the batch boundary"
+                            );
+                            clearance_stop = Some(super::hold::ClearanceStop::Expired);
+                            break;
+                        }
+                    };
+                    sweep_one_batch(session.conn(), batch, dry_run, retry_authority).await?
+                }
+                r => r?,
+            };
         swept_paths.extend(batch_swept);
         stats.paths_deleted += delta.paths_deleted;
         stats.paths_resurrected += delta.paths_resurrected;
@@ -544,6 +635,27 @@ pub async fn sweep(
             metrics::counter!("rio_store_gc_path_resurrected_total")
                 .increment(delta.paths_resurrected);
         }
+
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            let hold_after = SWEEP_HOLD_AFTER_BATCHES.load(Ordering::SeqCst);
+            if hold_after > 0 && (i as u64 + 1) >= hold_after {
+                SWEEP_HOLD_AFTER_BATCHES.store(0, Ordering::SeqCst);
+                // The mid-pass hold schedule (W12-O): landed through
+                // the PRODUCTION set_hold statement between two
+                // committed path batches.
+                super::hold::set_hold(
+                    pool,
+                    super::hold::GcHoldScope::Global,
+                    "w12-o mid-pass hold (test interpose)",
+                    "sweep-test-hook",
+                    None,
+                )
+                .await
+                .expect("test interpose: set_hold");
+            }
+        }
     }
 
     info!(
@@ -553,7 +665,11 @@ pub async fn sweep(
         "GC sweep complete (path-level only; chunk collection is the collect cycle's job)"
     );
 
-    Ok(SweepOutcome { stats, swept_paths })
+    Ok(SweepOutcome {
+        stats,
+        swept_paths,
+        clearance_stop,
+    })
 }
 
 /// SQLSTATE 40P01 (deadlock_detected). Same check as
@@ -568,11 +684,19 @@ fn is_deadlock(e: &sqlx::Error) -> bool {
 /// One sweep-batch transaction body. Extracted so [`sweep`] can
 /// retry-once on 40P01 (PG aborts the whole txn on deadlock).
 /// Returns per-batch deltas; caller accumulates.
+///
+/// Demands the batch's [`super::hold::BatchAuthority`] BY VALUE
+/// (bug_084, R32): this fn is the path sweep's DB-delete sink — a
+/// path-delete batch outside an authorized boundary does not compile.
+// r[impl store.gc.batch-authority]
 async fn sweep_one_batch(
     conn: &mut sqlx::PgConnection,
     batch: &[Vec<u8>],
     dry_run: bool,
+    authority: super::hold::BatchAuthority,
 ) -> Result<(GcStats, Vec<Vec<u8>>), sqlx::Error> {
+    // The token is spent: one authority, one batch, this sink.
+    authority.spend();
     let mut delta = GcStats::default();
     let mut swept: Vec<Vec<u8>> = Vec::new();
     let mut tx = conn.begin().await?;
@@ -753,10 +877,17 @@ mod tests {
         .unwrap();
 
         // Sweep the path.
-        let stats = sweep(&db.pool, None, vec![hash.clone()], false, &no_shutdown())
-            .await
-            .unwrap()
-            .stats;
+        let stats = sweep(
+            &db.pool,
+            None,
+            vec![hash.clone()],
+            false,
+            &no_shutdown(),
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap()
+        .stats;
         assert_eq!(stats.paths_deleted, 1);
 
         // narinfo gone (CASCADE took manifests too).
@@ -804,10 +935,17 @@ mod tests {
         let rec = CountingRecorder::default();
         let _g = metrics::set_default_local_recorder(&rec);
 
-        let stats = sweep(&db.pool, None, vec![p_hash], true, &no_shutdown())
-            .await
-            .unwrap()
-            .stats;
+        let stats = sweep(
+            &db.pool,
+            None,
+            vec![p_hash],
+            true,
+            &no_shutdown(),
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap()
+        .stats;
         assert_eq!(stats.paths_resurrected, 1, "P resurrected (stats)");
         assert_eq!(stats.paths_deleted, 0);
 
@@ -836,10 +974,17 @@ mod tests {
         let rec = CountingRecorder::default();
         let _g = metrics::set_default_local_recorder(&rec);
 
-        let stats = sweep(&db.pool, None, vec![h1, h2, h3], false, &no_shutdown())
-            .await
-            .unwrap()
-            .stats;
+        let stats = sweep(
+            &db.pool,
+            None,
+            vec![h1, h2, h3],
+            false,
+            &no_shutdown(),
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap()
+        .stats;
         assert_eq!(stats.paths_deleted, 3);
         assert_eq!(stats.paths_resurrected, 0);
 
@@ -863,10 +1008,17 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let hash = StoreSeed::path("dryrun").seed(&db.pool).await;
 
-        let stats = sweep(&db.pool, None, vec![hash.clone()], true, &no_shutdown())
-            .await
-            .unwrap()
-            .stats;
+        let stats = sweep(
+            &db.pool,
+            None,
+            vec![hash.clone()],
+            true,
+            &no_shutdown(),
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap()
+        .stats;
         // Stats SHOW the path would be deleted.
         assert_eq!(stats.paths_deleted, 1);
 
@@ -899,10 +1051,17 @@ mod tests {
 
         // Sweep with P in the unreachable list. The reference re-check should
         // find Q.references=[P] → skip P → paths_resurrected=1.
-        let stats = sweep(&db.pool, None, vec![p_hash.clone()], false, &no_shutdown())
-            .await
-            .unwrap()
-            .stats;
+        let stats = sweep(
+            &db.pool,
+            None,
+            vec![p_hash.clone()],
+            false,
+            &no_shutdown(),
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap()
+        .stats;
         assert_eq!(
             stats.paths_deleted, 0,
             "P should NOT be deleted — Q references it"
@@ -974,10 +1133,17 @@ mod tests {
 
         // Sweep with Q in unreachable. Re-check must see P's
         // placeholder narinfo.references @> [Q] → resurrect.
-        let stats = sweep(&db.pool, None, vec![q_hash.clone()], false, &no_shutdown())
-            .await
-            .unwrap()
-            .stats;
+        let stats = sweep(
+            &db.pool,
+            None,
+            vec![q_hash.clone()],
+            false,
+            &no_shutdown(),
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap()
+        .stats;
         assert_eq!(
             stats.paths_deleted, 0,
             "Q must NOT be deleted — uploading placeholder P references it"
@@ -1055,10 +1221,17 @@ mod tests {
             }
         };
 
-        let stats = sweep(&db.pool, None, unreachable, false, &no_shutdown())
-            .await
-            .unwrap()
-            .stats;
+        let stats = sweep(
+            &db.pool,
+            None,
+            unreachable,
+            false,
+            &no_shutdown(),
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap()
+        .stats;
         assert_eq!(stats.paths_deleted, expected_deleted);
         assert_eq!(stats.paths_resurrected, 2, "Y resurrected by P; Z by Y");
 
@@ -1105,6 +1278,7 @@ mod tests {
             vec![q_hash.clone(), r_hash.clone()],
             false,
             &no_shutdown(),
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap()
@@ -1151,10 +1325,17 @@ mod tests {
         .unwrap();
 
         // Sweep.
-        let stats = sweep(&db.pool, None, vec![hash.clone()], false, &no_shutdown())
-            .await
-            .unwrap()
-            .stats;
+        let stats = sweep(
+            &db.pool,
+            None,
+            vec![hash.clone()],
+            false,
+            &no_shutdown(),
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap()
+        .stats;
         assert_eq!(stats.paths_deleted, 1);
 
         // path_tenants row ALSO gone (explicit DELETE, not CASCADE).
@@ -1204,6 +1385,7 @@ mod tests {
             vec![hash_a, hash_b, hash_c],
             false,
             &no_shutdown(),
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap()
@@ -1232,10 +1414,17 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let hash = StoreSeed::path("unreferenced").seed(&db.pool).await;
 
-        let stats = sweep(&db.pool, None, vec![hash], false, &no_shutdown())
-            .await
-            .unwrap()
-            .stats;
+        let stats = sweep(
+            &db.pool,
+            None,
+            vec![hash],
+            false,
+            &no_shutdown(),
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap()
+        .stats;
         assert_eq!(stats.paths_deleted, 1);
         assert_eq!(stats.paths_resurrected, 0);
     }
@@ -1300,6 +1489,7 @@ mod tests {
             vec![sp_hash.clone()],
             false,
             &no_shutdown(),
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap()
@@ -1373,7 +1563,15 @@ mod tests {
 
         let shutdown = rio_common::signal::Token::new();
         shutdown.cancel();
-        let r = sweep(&db.pool, None, vec![h1, h2, h3], false, &shutdown).await;
+        let r = sweep(
+            &db.pool,
+            None,
+            vec![h1, h2, h3],
+            false,
+            &shutdown,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await;
         assert!(matches!(r, Err(SweepAbort::Shutdown)));
 
         assert_eq!(
@@ -1430,6 +1628,7 @@ mod tests {
             vec![z_hash.clone(), w_hash, y_hash.clone()],
             true,
             &no_shutdown(),
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap()
@@ -1653,10 +1852,17 @@ mod tests {
 
         // End-to-end: sweep([X]) → X resurrected, NOT deleted; B's
         // fresh attribution row survives.
-        let stats = sweep(&db.pool, None, vec![x_hash.clone()], false, &no_shutdown())
-            .await
-            .unwrap()
-            .stats;
+        let stats = sweep(
+            &db.pool,
+            None,
+            vec![x_hash.clone()],
+            false,
+            &no_shutdown(),
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap()
+        .stats;
         assert_eq!(stats.paths_resurrected, 1);
         assert_eq!(stats.paths_deleted, 0);
 

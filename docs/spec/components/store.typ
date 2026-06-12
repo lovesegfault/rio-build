@@ -1909,6 +1909,30 @@ pathological stalls. Refusal cause is typed end-to-end
 (`BatchAuthorize::{Held, Expired}` at the seam, `ClearanceStop` in the
 collect report) --- never inferred from logs.
 
+#r("store.gc.batch-authority")[
+  Every multi-batch destructive body MUST re-authorize per batch THROUGH
+  THE TOKEN: the batch-boundary consult (`HoldClearance::authorize_batch`)
+  is the sole mint of a per-batch linear `BatchAuthority` --- non-clonable,
+  consumed by value, one batch per token --- and every destructive sink
+  (the path-sweep batch, the log-sweep batch, the outbox enqueue, the
+  per-row drain delete, the placeholder reap) MUST demand it, so no
+  destructive batch is reachable without a boundary authorization. A
+  refused boundary (`Held`/`Expired`) structurally yields no token: the
+  body stops, committed batches stand, and a global hold landing mid-pass
+  binds at the NEXT batch boundary of EVERY body --- never "the next run".
+]
+The wave-11 form of this law quantified over "multi-batch tick bodies" but
+enforced by hand enumeration: the verdict's `Authorized` arm was a unit
+variant --- advisory data a body could match and ignore --- and two of six
+bodies shipped unwired (run_gc's phase-2 path sweep took no clearance; the
+log TTL sweep discarded its lane clearance as `move |_clearance|`), so a
+global hold could not stop thousands of in-flight path-delete batches in
+exactly the suspected-bad-mark scenario the hold exists for, where
+continued deletes are unrecoverable without re-substitution (bug_084,
+merged_bug_006). The token is the R32 repair --- obligations are linear
+resources, not advisory data --- and the body population is DERIVED by the
+destructive-body census (R31), never author-listed.
+
 #r("store.gc.sweep-cycle-reclaim")[
   The sweep-phase reference re-check MUST exclude referrers that are themselves
   in the current unreachable batch. Without this exclusion, mutual-reference

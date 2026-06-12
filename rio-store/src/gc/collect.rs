@@ -659,16 +659,10 @@ impl PassDisposition {
 
 /// Why the live drain stopped at a batch boundary short of its cap
 /// (merged_bug_067) — the typed cause behind
-/// [`CollectReport::clearance_stop`]. Closed alphabet, no wildcard
-/// consumers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClearanceStop {
-    /// The batch-boundary re-consult found an active global hold.
-    Held,
-    /// The clearance aged past `DESTRUCTIVE_BATCH_DRAIN_BOUND` with
-    /// no successful consult — refused with no hold present.
-    Expired,
-}
+/// [`CollectReport::clearance_stop`]. The alphabet's ONE home is the
+/// hold module (bug_084 — the path sweep consumes the same cause);
+/// re-exported here so the report's consumers keep their paths.
+pub(crate) use super::hold::ClearanceStop;
 
 /// Test-only failure injection for the per-batch isolation tests: when
 /// set to N > 0, the live collect loop returns an error after
@@ -1108,8 +1102,8 @@ pub(crate) async fn collect_cycle(
         // cursor on the next un-held cycle — the stop reuses the
         // capped-resume machinery, so suspension never converts into
         // over-collection or lost work.
-        match clearance.authorize_batch(pool).await? {
-            super::hold::BatchAuthorize::Authorized => {}
+        let authority = match clearance.authorize_batch(pool).await? {
+            super::hold::BatchAuthorize::Authorized(a) => a,
             super::hold::BatchAuthorize::Held(h) => {
                 info!(
                     hold_id = %h.hold_id,
@@ -1133,7 +1127,7 @@ pub(crate) async fn collect_cycle(
                 clearance_stop = Some(ClearanceStop::Expired);
                 break;
             }
-        }
+        };
         let this_limit = COLLECT_BATCH_LIMIT.min(remaining) as i64;
 
         // One batch = one transaction: candidate scan, predicate-
@@ -1147,6 +1141,9 @@ pub(crate) async fn collect_cycle(
             .fetch_all(&mut *batch_tx)
             .await?;
         if candidates.is_empty() {
+            // The authority funded an empty batch (the scan ran under
+            // it; nothing destructive followed).
+            authority.spend();
             batch_tx.commit().await?;
             pass_complete = true;
             break;
@@ -1163,7 +1160,8 @@ pub(crate) async fn collect_cycle(
             .fetch_all(&mut *batch_tx)
             .await?;
         let enqueued =
-            super::enqueue_chunk_deletes(&mut batch_tx, &collected, chunk_backend).await?;
+            super::enqueue_chunk_deletes(&mut batch_tx, &collected, chunk_backend, authority)
+                .await?;
         batch_tx.commit().await?;
 
         // Per-batch, post-commit: every increment ↔ exactly one
@@ -1340,8 +1338,8 @@ async fn run_post_drain_tail(
         if remaining == 0 {
             break;
         }
-        match clearance.authorize_batch(pool).await {
-            Ok(super::hold::BatchAuthorize::Authorized) => {}
+        let authority = match clearance.authorize_batch(pool).await {
+            Ok(super::hold::BatchAuthorize::Authorized(a)) => a,
             Ok(super::hold::BatchAuthorize::Held(h)) => {
                 info!(
                     hold_id = %h.hold_id,
@@ -1365,7 +1363,10 @@ async fn run_post_drain_tail(
                 );
                 break;
             }
-        }
+        };
+        // Spent on this reap batch (the inline DELETE below is the
+        // sink; one authority funds exactly this one statement).
+        authority.spend();
         let limit = COLLECT_BATCH_LIMIT.min(remaining) as i64;
         #[cfg(test)]
         let injected: Result<sqlx::postgres::PgQueryResult, sqlx::Error> =

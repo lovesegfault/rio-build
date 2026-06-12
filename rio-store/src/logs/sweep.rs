@@ -83,14 +83,54 @@ pub struct SweepStats {
 /// A PG error aborts the pass (returned to the caller, retried next
 /// tick). A backend object-delete error is logged and the pass
 /// continues — see the module doc for why that is safe.
+///
+/// Every batch demands fresh authority (merged_bug_006): the
+/// until-short loop is a multi-batch destructive body — committed PG
+/// deletes plus irreversible post-commit S3 object deletes — so a
+/// global gc hold landing mid-pass (or a drain-bound-aged clearance)
+/// stops the NEXT batch at its boundary instead of riding the
+/// tick-start consult through the whole backlog. The wave-10 spawn
+/// discarded the lane clearance (`move |_clearance|`) and this loop
+/// never re-authorized — the lone violator of the per-batch law its
+/// own lane registered under.
+// r[impl store.gc.hold-lanes+1]
+// r[impl store.gc.clearance-expiry]
+// r[impl store.gc.batch-authority]
 pub async fn sweep_expired_logs(
     pool: &PgPool,
     store: &dyn LogChunkStore,
     retention: Duration,
     batch: i64,
+    clearance: &mut crate::gc::hold::HoldClearance,
 ) -> Result<SweepStats, sqlx::Error> {
     let mut stats = SweepStats::default();
     loop {
+        let authority = match clearance.authorize_batch(pool).await? {
+            crate::gc::hold::BatchAuthorize::Authorized(a) => a,
+            crate::gc::hold::BatchAuthorize::Held(h) => {
+                info!(
+                    hold_id = %h.hold_id,
+                    reason = %h.reason,
+                    created_by = %h.created_by,
+                    executions_swept = stats.executions_swept,
+                    "log TTL sweep: global hold landed mid-pass; \
+                     stopping at the batch boundary"
+                );
+                break;
+            }
+            crate::gc::hold::BatchAuthorize::Expired => {
+                warn!(
+                    executions_swept = stats.executions_swept,
+                    "log TTL sweep: clearance aged past the drain bound; \
+                     stopping at the batch boundary (next tick re-gates)"
+                );
+                break;
+            }
+        };
+        // Spent on this batch: the two PG DELETEs in the transaction
+        // below plus its post-commit object deletes are the one batch
+        // this token funds.
+        authority.spend();
         // One transaction per batch: the candidate SELECT takes
         // `FOR UPDATE OF e SKIP LOCKED` (the drain.rs idiom — two
         // destructive-lane coordination idioms collapse to one,
@@ -227,12 +267,45 @@ pub async fn sweep_expired_logs(
         // exact).
         stats.executions_swept += expired.len() as u64;
 
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            let hold_after = SWEEP_HOLD_AFTER_BATCHES.load(Ordering::SeqCst);
+            if hold_after > 0 {
+                let fired = SWEEP_HOLD_AFTER_BATCHES.fetch_sub(1, Ordering::SeqCst);
+                if fired == 1 {
+                    // The mid-pass hold schedule (W12-O2): landed
+                    // through the PRODUCTION set_hold statement
+                    // between two committed log-sweep batches.
+                    crate::gc::hold::set_hold(
+                        pool,
+                        crate::gc::hold::GcHoldScope::Global,
+                        "w12-o2 mid-pass hold (test interpose)",
+                        "log-sweep-test-hook",
+                        None,
+                    )
+                    .await
+                    .expect("test interpose: set_hold");
+                }
+            }
+        }
+
         if expired.len() < batch as usize {
             break;
         }
     }
     Ok(stats)
 }
+
+/// Test-only mid-pass hold interposition (W12-O2, the merged_bug_006
+/// red): when set to N > 0, a GLOBAL hold is inserted through the
+/// production `hold::set_hold` statement immediately after the
+/// until-short loop commits its Nth batch — the exact "hold lands
+/// between two committed batches" schedule, which no external caller
+/// can time deterministically.
+#[cfg(test)]
+pub(crate) static SWEEP_HOLD_AFTER_BATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Grace before a dead session row is reaped outright: 10× the
 /// staleness bound. Generous on purpose — liveness consumers
@@ -278,25 +351,30 @@ pub fn spawn_log_sweep(
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
     // r[impl store.gc.hold-lanes+1]
-    // Registered through DestructiveLane (merged_bug_050, the
-    // §1.6.4-16 spawn-seam conversion): the wrapper consults the
-    // gc-hold gate fail-closed each tick and the WHOLE sweep body
-    // (log TTL delete + stale-session reap) runs under the minted
-    // clearance — during an incident freeze, build-log evidence is
-    // exactly what the hold preserves. The sweep/reap bodies are
-    // unchanged: this lane is SEAM-registered (the census carries
-    // its totality; the clearance param lands on the gc-plane sinks).
+    // Registered through DestructiveLane (merged_bug_050): the
+    // wrapper consults the gc-hold gate fail-closed each tick AND the
+    // minted clearance is CONSUMED by the sweep body (merged_bug_006
+    // — the wave-10 `move |_clearance|` discarded it, so the
+    // until-short loop never re-authorized and a hold landing
+    // mid-pass could not stop batches 2..N): `sweep_expired_logs`
+    // demands per-batch authority at every committed-transaction
+    // boundary. During an incident freeze, build-log evidence is
+    // exactly what the hold preserves. The stale-session reap is a
+    // single-statement single-batch body under the same tick
+    // clearance (one batch in flight at hold-land is the R17 bound).
     let lane_pool = pool.clone();
     crate::gc::lane::DestructiveLane::spawn_periodic(
         "log-ttl-sweep",
         SWEEP_INTERVAL,
         pool,
         shutdown,
-        Box::new(move |_clearance| {
+        Box::new(move |clearance| {
             let pool = lane_pool.clone();
             let store = Arc::clone(&store);
             Box::pin(async move {
-                match sweep_expired_logs(&pool, store.as_ref(), retention, SWEEP_BATCH).await {
+                match sweep_expired_logs(&pool, store.as_ref(), retention, SWEEP_BATCH, clearance)
+                    .await
+                {
                     Ok(stats) if stats.executions_swept > 0 => {
                         info!(
                             executions_swept = stats.executions_swept,
@@ -477,9 +555,15 @@ mod tests {
         .unwrap();
 
         // The hourly sweep fires at retention = 1 day.
-        let stats = sweep_expired_logs(&db.pool, &store, Duration::from_secs(86_400), SWEEP_BATCH)
-            .await
-            .unwrap();
+        let stats = sweep_expired_logs(
+            &db.pool,
+            &store,
+            Duration::from_secs(86_400),
+            SWEEP_BATCH,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             (stats.executions_swept, counts(&db.pool, exec).await),
@@ -501,9 +585,15 @@ mod tests {
             .execute(&db.pool)
             .await
             .unwrap();
-        let stats = sweep_expired_logs(&db.pool, &store, Duration::from_secs(86_400), SWEEP_BATCH)
-            .await
-            .unwrap();
+        let stats = sweep_expired_logs(
+            &db.pool,
+            &store,
+            Duration::from_secs(86_400),
+            SWEEP_BATCH,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             stats.executions_swept, 0,
             "a session row inside the grace still shields its execution"
@@ -523,9 +613,15 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        let stats = sweep_expired_logs(&db.pool, &store, Duration::from_secs(86_400), SWEEP_BATCH)
-            .await
-            .unwrap();
+        let stats = sweep_expired_logs(
+            &db.pool,
+            &store,
+            Duration::from_secs(86_400),
+            SWEEP_BATCH,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             (stats.executions_swept, counts(&db.pool, exec).await),
             (1, (1, 0, 0)),
@@ -666,6 +762,7 @@ mod tests {
             &store,
             Duration::from_secs(30 * 86_400),
             SWEEP_BATCH,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap();
@@ -685,6 +782,7 @@ mod tests {
             &store,
             Duration::from_secs(30 * 86_400),
             SWEEP_BATCH,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap();
@@ -720,6 +818,7 @@ mod tests {
             &store,
             Duration::from_secs(30 * 86_400),
             SWEEP_BATCH,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap();
@@ -748,6 +847,7 @@ mod tests {
             &store,
             Duration::from_secs(30 * 86_400),
             SWEEP_BATCH,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap();
@@ -824,6 +924,7 @@ mod tests {
             &store,
             Duration::from_secs(30 * 86_400),
             SWEEP_BATCH,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap();
@@ -839,11 +940,141 @@ mod tests {
         for _ in 0..3 {
             seed_aged_execution(&db.pool, &store, Uuid::now_v7(), 31.0, 1).await;
         }
-        let stats = sweep_expired_logs(&db.pool, &store, Duration::from_secs(30 * 86_400), 2)
-            .await
-            .unwrap();
+        let stats = sweep_expired_logs(
+            &db.pool,
+            &store,
+            Duration::from_secs(30 * 86_400),
+            2,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert_eq!(stats.executions_swept, 3);
         assert_eq!(stats.chunks, 3);
         assert!(store.is_empty());
+    }
+
+    // r[verify store.gc.batch-authority]
+    /// W12-O2 (merged_bug_006): a global hold landing MID-PASS —
+    /// between two committed batches of the log TTL sweep's
+    /// until-short loop — stops the NEXT batch at its boundary. The
+    /// wave-10 spawn discarded the lane clearance
+    /// (`move |_clearance|`), so pre-fix the loop never re-authorized
+    /// and a hold could not stop batches 2..N: committed PG deletes
+    /// plus irreversible post-commit S3 object deletes kept running
+    /// through the freeze — during an incident, build-log evidence
+    /// is exactly what the hold preserves.
+    ///
+    /// Schedule: three expired executions, batch = 1 (three
+    /// batches); the interpose lands a GLOBAL hold through the
+    /// production `set_hold` statement immediately after batch 1
+    /// commits. Post-fix: exactly one execution's artifacts are
+    /// swept; the other two survive (rows AND objects); release +
+    /// rerun drains the remainder.
+    #[tokio::test]
+    async fn mid_pass_hold_stops_log_sweep_at_the_batch_boundary() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let mut execs = Vec::new();
+        for _ in 0..3 {
+            let id = Uuid::now_v7();
+            seed_aged_execution(&db.pool, &store, id, 31.0, 1).await;
+            execs.push(id);
+        }
+
+        SWEEP_HOLD_AFTER_BATCHES.store(1, std::sync::atomic::Ordering::SeqCst);
+        let stats = sweep_expired_logs(
+            &db.pool,
+            &store,
+            Duration::from_secs(30 * 86_400),
+            1,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stats.executions_swept, 1,
+            "left: post-hold batches kept deleting build-log evidence \
+             through the freeze / right: exactly the pre-hold batch is \
+             swept; batch 2 refuses at its boundary"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_log_chunks")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2, "two executions' manifest rows survive the freeze");
+        assert!(
+            !store.is_empty(),
+            "the surviving executions' objects are untouched"
+        );
+
+        // The heal edge: release the hold; the next pass (fresh tick
+        // clearance) drains the remainder.
+        let hold_id: uuid::Uuid = sqlx::query_scalar(
+            "SELECT hold_id FROM gc_holds WHERE created_by = 'log-sweep-test-hook'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            crate::gc::hold::release_hold(&db.pool, hold_id)
+                .await
+                .unwrap()
+        );
+        let stats = sweep_expired_logs(
+            &db.pool,
+            &store,
+            Duration::from_secs(30 * 86_400),
+            1,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.executions_swept, 2, "release ⇒ the remainder sweeps");
+        assert!(store.is_empty(), "all expired objects eventually deleted");
+    }
+
+    // r[verify store.gc.batch-authority]
+    /// W12-P (the R32 named-type witness, stated at its honest tier):
+    /// the lawful path to a batch runs authorize → token → sink, and
+    /// the refusal arms structurally CANNOT yield a token — this
+    /// match is the type-level proof (a `Held`/`Expired` arm has no
+    /// `BatchAuthority` to produce; the compiler enforces what the
+    /// wave-11 unit variant left advisory). The population face — no
+    /// destructive loop ships WITHOUT the demand — is the commit-2
+    /// census's claim, not this test's.
+    #[tokio::test]
+    async fn refusal_arms_cannot_mint_batch_authority() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let mut clearance = crate::test_helpers::gc_clearance(&db.pool).await;
+
+        // Authorized: the one mint flows to the sink and is spent.
+        match clearance.authorize_batch(&db.pool).await.unwrap() {
+            crate::gc::hold::BatchAuthorize::Authorized(authority) => authority.spend(),
+            refused => panic!("fresh clearance refused: {refused:?}"),
+        }
+
+        // Held: no token exists in this arm — the emergency stop's
+        // type-level face (constructing one here would not compile).
+        let hold_id = crate::gc::hold::set_hold(
+            &db.pool,
+            crate::gc::hold::GcHoldScope::Global,
+            "w12-p refusal face",
+            "test",
+            None,
+        )
+        .await
+        .unwrap();
+        match clearance.authorize_batch(&db.pool).await.unwrap() {
+            crate::gc::hold::BatchAuthorize::Held(h) => {
+                assert_eq!(h.created_by, "test");
+            }
+            other => panic!("expected Held under an active global hold, got {other:?}"),
+        }
+        assert!(
+            crate::gc::hold::release_hold(&db.pool, hold_id)
+                .await
+                .unwrap()
+        );
     }
 }

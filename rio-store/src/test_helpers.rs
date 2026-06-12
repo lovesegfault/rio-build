@@ -515,3 +515,21 @@ pub async fn gc_clearance(pool: &sqlx::PgPool) -> crate::gc::hold::HoldClearance
         }
     }
 }
+
+/// Mint one batch's authority through the PRODUCTION boundary consult
+/// (bug_084, R13: no test-only constructor exists —
+/// `BatchAuthority`'s field is private to `gc::hold` and its one mint
+/// site is `authorize_batch`): panics if the test DB carries an
+/// active global hold. Tests that exercise HELD/EXPIRED behavior
+/// drive `authorize_batch` themselves.
+pub async fn gc_batch_authority(pool: &sqlx::PgPool) -> crate::gc::hold::BatchAuthority {
+    match gc_clearance(pool)
+        .await
+        .authorize_batch(pool)
+        .await
+        .expect("boundary consult readable in test db")
+    {
+        crate::gc::hold::BatchAuthorize::Authorized(a) => a,
+        refused => panic!("test db refused a fresh batch authority: {refused:?}"),
+    }
+}

@@ -886,7 +886,7 @@ mod tests {
             &db.pool,
             &sph_a,
             crate::gc::orphan::ReapBy::Claim(claim_a),
-            &crate::test_helpers::gc_clearance(&db.pool).await,
+            crate::test_helpers::gc_batch_authority(&db.pool).await,
         )
         .await
         .unwrap();
@@ -1147,7 +1147,7 @@ mod tests {
             &db.pool,
             &sph,
             crate::gc::orphan::ReapBy::Stale { secs: 0 },
-            &crate::test_helpers::gc_clearance(&db.pool).await,
+            crate::test_helpers::gc_batch_authority(&db.pool).await,
         )
         .await
         .unwrap();
@@ -1173,7 +1173,7 @@ mod tests {
             &db.pool,
             &sph,
             crate::gc::orphan::ReapBy::Claim(claim_a),
-            &crate::test_helpers::gc_clearance(&db.pool).await,
+            crate::test_helpers::gc_batch_authority(&db.pool).await,
         )
         .await
         .unwrap();
@@ -1259,7 +1259,7 @@ mod tests {
                 &db.pool,
                 &sph,
                 crate::gc::orphan::ReapBy::Stale { secs: 0 },
-                &crate::test_helpers::gc_clearance(&db.pool).await,
+                crate::test_helpers::gc_batch_authority(&db.pool).await,
             )
             .await
             .unwrap()
@@ -1281,7 +1281,7 @@ mod tests {
             &db.pool,
             &sph,
             crate::gc::orphan::ReapBy::Claim(claim_a),
-            &crate::test_helpers::gc_clearance(&db.pool).await,
+            crate::test_helpers::gc_batch_authority(&db.pool).await,
         )
         .await
         .unwrap();
@@ -1324,7 +1324,7 @@ mod tests {
                 &db.pool,
                 &sph,
                 crate::gc::orphan::ReapBy::Claim(claim_b),
-                &crate::test_helpers::gc_clearance(&db.pool).await,
+                crate::test_helpers::gc_batch_authority(&db.pool).await,
             )
             .await
             .unwrap(),

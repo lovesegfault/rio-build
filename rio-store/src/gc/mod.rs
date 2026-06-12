@@ -186,15 +186,23 @@ pub mod hold {
     /// boundary: the call refuses on an aged clearance (expiry — no
     /// re-consult can resurrect it; the next tick re-gates), refuses
     /// under a hold landed mid-body (the re-consult), and otherwise
-    /// refreshes the authority window. The axes of the hold law,
-    /// each at its stated tier (R28): reachability — compile-sealed
-    /// (this type at the named sinks, carried from merged_bug_050);
+    /// refreshes the authority window AND mints the batch's
+    /// [`BatchAuthority`] (bug_084/merged_bug_006, R32): the
+    /// destructive sinks demand the token BY VALUE, so a batch
+    /// outside an authorized boundary does not compile — the
+    /// wave-11 unit verdict was advisory data a body could match
+    /// and ignore. The axes of the hold law, each at its stated
+    /// tier (R28-as-amended-by-R31): reachability — compile-sealed
+    /// (this type at the named sinks, carried from merged_bug_050;
+    /// the per-batch token at every sink since bug_084);
     /// time — sealed here (the expiry check precedes the re-consult,
     /// so a stale clearance authorizes nothing even when `gc_holds`
-    /// is empty); population — complemented by the lane census
-    /// (`gc/lane.rs`, the fail-closed scan), stated at census
-    /// strength: a body that never reaches a batch boundary seam is
-    /// the census's problem, not this type's.
+    /// is empty); population — DERIVED by the destructive-body
+    /// census (`gc/lane.rs`: the lane census over spawn sites + the
+    /// body census over until-short destructive loops), never
+    /// author-enumerated — the wave-11 hand list wired four of six
+    /// bodies and the two unwired ones defeated the operator's
+    /// emergency stop.
     // r[impl store.gc.hold-lanes+1]
     // r[impl store.gc.clearance-expiry]
     #[derive(Debug)]
@@ -206,6 +214,32 @@ pub mod hold {
         _proof: (),
     }
 
+    /// Authority for exactly ONE destructive batch (bug_084 +
+    /// merged_bug_006, the R32 form): a linear token minted SOLELY by
+    /// [`HoldClearance::authorize_batch`]'s `Authorized` arm — private
+    /// field, non-`Clone`/non-`Copy`, passed BY VALUE into the
+    /// destructive sinks (`sweep_one_batch`, `enqueue_chunk_deletes`,
+    /// `drain_one_row`, `reap_one`, the log-sweep batch), so one
+    /// authorization cannot be stashed, shared, or re-spent across
+    /// batches. The wave-11 unit `Authorized` variant was advisory
+    /// data a body could match and ignore (`move |_clearance|` —
+    /// merged_bug_006's exact shape); the token makes batch execution
+    /// reachable only through the authority.
+    // r[impl store.gc.batch-authority]
+    #[must_use = "an unconsumed batch authority is an unauthorized batch"]
+    #[derive(Debug)]
+    pub struct BatchAuthority {
+        _proof: (),
+    }
+
+    impl BatchAuthority {
+        /// Spend the token on the one batch it authorizes — the
+        /// explicit consumption every sink performs at its
+        /// destructive statement (a move, so a spent authority
+        /// cannot fund a second batch).
+        pub(crate) fn spend(self) {}
+    }
+
     /// One batch-boundary authorization verdict — see
     /// `HoldClearance::authorize_batch`. Closed alphabet; every
     /// consumer matches it exhaustively (no wildcard arms).
@@ -213,14 +247,31 @@ pub mod hold {
     #[derive(Debug)]
     pub enum BatchAuthorize {
         /// No active hold and the clearance is inside its authority
-        /// window (now refreshed): the next batch may run.
-        Authorized,
+        /// window (now refreshed): the carried token authorizes
+        /// exactly the next batch.
+        Authorized(BatchAuthority),
         /// An active global hold landed since the last consult: the
         /// body MUST stop before its next destructive batch.
         Held(ActiveHold),
         /// The clearance aged past the drain bound with no successful
         /// consult: dead, refuses unconditionally (even with no hold
         /// in `gc_holds`). The body MUST stop; the next tick re-gates.
+        Expired,
+    }
+
+    /// Why a destructive body stopped at a batch boundary short of
+    /// its own completion — the typed cause behind every
+    /// clearance-refused stop (the collect report's
+    /// `clearance_stop`, the path sweep's mid-pass stop). ONE home
+    /// for the alphabet (moved from `gc/collect.rs` when the path
+    /// sweep joined the per-batch law — two near-identical stop
+    /// enums invite drift). Closed; no wildcard consumers.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ClearanceStop {
+        /// The batch-boundary re-consult found an active global hold.
+        Held,
+        /// The clearance aged past `DESTRUCTIVE_BATCH_DRAIN_BOUND`
+        /// with no successful consult — refused with no hold present.
         Expired,
     }
 
@@ -260,7 +311,9 @@ pub mod hold {
                 Some(h) => Ok(BatchAuthorize::Held(h)),
                 None => {
                     self.consulted_at = tokio::time::Instant::now();
-                    Ok(BatchAuthorize::Authorized)
+                    // THE one mint site for [`BatchAuthority`]: one
+                    // successful boundary consult = one batch.
+                    Ok(BatchAuthorize::Authorized(BatchAuthority { _proof: () }))
                 }
             }
         }
@@ -540,16 +593,21 @@ pub async fn run_gc(
     // workaround: an active GLOBAL hold makes the whole collection
     // pass (mark, sweep, chunk-collect) a no-op — consulted once at
     // entry, inside the lease so two racing runs serialize their
-    // verdicts. A hold set mid-run binds the NEXT run (the per-run
-    // quantifier W9-J certifies). Tenant-scoped holds bind inside
-    // mark's seed (f) and the sweep re-check instead.
+    // verdicts. A hold set mid-run stops THIS run at its next batch
+    // boundary (bug_084 — the per-batch law replaced the round-9
+    // "binds the NEXT run" posture: phase-2 path-delete batches and
+    // phase-3 collect batches each demand fresh BatchAuthority, so an
+    // operator's emergency stop binds within one batch, not one run).
+    // Tenant-scoped holds bind inside mark's seed (f) and the sweep
+    // re-check instead — and the re-check carries the global conjunct
+    // too (defense in depth inside an in-flight batch).
     // run_gc is the PINNED member of the destructive-lane census
     // (RPC-spawned per TriggerGC, not spawn-periodic): its entry
     // consult mints the same HoldClearance the lane wrapper does,
-    // and the clearance threads to the phase-3 chunk-collect — the
-    // named sink demands it per batch (store.gc.hold-lanes+1), so a
-    // hold landing mid-pass stops phase 3 at the next batch boundary
-    // and a drain-bound-aged clearance authorizes nothing further
+    // and the clearance threads to BOTH destructive phases — the
+    // phase-2 path sweep and the phase-3 chunk-collect — whose sinks
+    // demand per-batch authority (store.gc.hold-lanes+1), and a
+    // drain-bound-aged clearance authorizes nothing further
     // (store.gc.clearance-expiry).
     let mut hold_clearance = match hold::gate(pool).await {
         Ok(hold::HoldGate::Held(h)) => {
@@ -650,12 +708,17 @@ pub async fn run_gc(
     // Shutdown token threaded through: sweep checks it between
     // batches (not mid-transaction — a partial batch ROLLBACKs
     // cleanly via tx drop). Returns SweepAbort::Shutdown if fired.
+    // The clearance threads through (bug_084): every path-delete
+    // batch demands fresh BatchAuthority, so a global hold landing
+    // mid-pass stops the sweep at the next batch boundary instead of
+    // riding the entry consult through thousands of batches.
     let sweep_outcome = match sweep::sweep(
         pool,
         chunk_backend.as_ref(),
         unreachable,
         params.dry_run,
         shutdown,
+        &mut hold_clearance,
     )
     .await
     {
@@ -675,7 +738,46 @@ pub async fn run_gc(
     let sweep::SweepOutcome {
         mut stats,
         swept_paths,
+        clearance_stop: sweep_stop,
     } = sweep_outcome;
+
+    // A clearance-refused sweep stop suspends the REST of the run too
+    // (bug_084): phase 3 must not start under a hold the sweep just
+    // refused — and an expired clearance authorizes nothing further.
+    // Committed batches stand (their stats report); the next run (or
+    // the released hold's next pass) re-marks and finishes. The same
+    // skip-counter the entry consult uses records the suspension.
+    if let Some(stop) = sweep_stop {
+        let cause = match stop {
+            hold::ClearanceStop::Held => "held",
+            hold::ClearanceStop::Expired => "expired",
+        };
+        info!(
+            cause,
+            paths_deleted = stats.paths_deleted,
+            "GC: path sweep stopped at a batch boundary; \
+             skipping phase 3 (collection suspended mid-pass)"
+        );
+        metrics::counter!(
+            "rio_store_gc_hold_lane_skips_total",
+            "lane" => "run_gc", "cause" => "mid_pass_stop"
+        )
+        .increment(1);
+        let _ = progress_tx
+            .send(Ok(GcProgress {
+                paths_scanned: found_unreachable,
+                paths_collected: stats.paths_deleted,
+                bytes_freed: stats.bytes_freed,
+                is_complete: true,
+                current_path: format!(
+                    "suspended mid-pass at a batch boundary (clearance {cause}); \
+                     committed batches stand, the next run finishes"
+                ),
+            }))
+            .await;
+        let _ = lease.release().await;
+        return Ok(Some(stats));
+    }
 
     // --- Phase 3: chunk-collect cycle (the live collect arm) ---
     // Runs while GC_LOCK_ID is still held: the cycle uses its own
@@ -1003,12 +1105,21 @@ fn render_phase3(phase3: &Phase3Render, dry_run: bool, stats: &GcStats) -> Strin
 /// lower).
 ///
 /// No-op if `backend` is None (inline-only store has no S3 keys).
+///
+/// Demands the batch's [`hold::BatchAuthority`] BY VALUE (bug_084,
+/// R32): the enqueue is the collect batch's outbox sink — the token
+/// minted at that batch's boundary consult is consumed here, so an
+/// enqueue outside an authorized batch does not compile.
 // r[impl store.gc.pending-deletes+2]
+// r[impl store.gc.batch-authority]
 pub(super) async fn enqueue_chunk_deletes(
     tx: &mut Transaction<'_, Postgres>,
     soft_deleted: &[(Vec<u8>, i64)],
     backend: Option<&Arc<dyn ChunkBackend>>,
+    authority: hold::BatchAuthority,
 ) -> Result<u64, sqlx::Error> {
+    // The token is spent: one authority, one batch, this sink.
+    authority.spend();
     let Some(backend) = backend else {
         return Ok(0);
     };
@@ -1135,9 +1246,14 @@ mod tests {
     ) -> u64 {
         let mut tx = pool.begin().await.unwrap();
         let soft: Vec<(Vec<u8>, i64)> = hashes.iter().map(|h| (h.to_vec(), 8)).collect();
-        let n = enqueue_chunk_deletes(&mut tx, &soft, Some(backend))
-            .await
-            .unwrap();
+        let n = enqueue_chunk_deletes(
+            &mut tx,
+            &soft,
+            Some(backend),
+            crate::test_helpers::gc_batch_authority(pool).await,
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
         n
     }
@@ -1382,7 +1498,7 @@ mod tests {
         // window) at the production bound.
         assert!(matches!(
             clearance.authorize_batch(&db.pool).await.unwrap(),
-            hold::BatchAuthorize::Authorized
+            hold::BatchAuthorize::Authorized(_)
         ));
 
         // Age it past a real (test-scaled) bound. No hold lands.
@@ -1503,9 +1619,14 @@ mod tests {
         let bad = vec![0xBBu8; 7];
         let zeroed = vec![(good.clone(), 100i64), (bad, 50i64)];
 
-        let enqueued = enqueue_chunk_deletes(&mut tx, &zeroed, Some(&backend))
-            .await
-            .unwrap();
+        let enqueued = enqueue_chunk_deletes(
+            &mut tx,
+            &zeroed,
+            Some(&backend),
+            crate::test_helpers::gc_batch_authority(&db.pool).await,
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
 
         // Only the well-formed one enqueued.
@@ -1889,6 +2010,7 @@ mod tests {
             unreachable,
             false,
             &rio_common::signal::Token::new(),
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap()
@@ -2182,5 +2304,73 @@ mod registration_evidence_tests {
                 .await
                 .unwrap();
         assert_eq!(gone, 0, "release ⇒ the next sweep proceeds (heal edge)");
+    }
+
+    // r[verify store.gc.batch-authority]
+    /// W12-O (bug_084): a global hold landing MID-PASS — between two
+    /// committed path-delete batches of run_gc's phase-2 sweep —
+    /// stops the sweep at the NEXT batch boundary and suspends the
+    /// rest of the run (phase 3 never starts). The operator's
+    /// emergency stop binds within one batch, not one run: pre-fix,
+    /// the entry consult was the sweep's ONLY hold consult, so the
+    /// remaining batches ("thousands × ~100ms" at scale) kept
+    /// deleting paths unrecoverably through the freeze.
+    ///
+    /// Schedule: six unreachable paths = three test batches
+    /// (SWEEP_BATCH_SIZE = 2 under cfg(test)); the interpose lands a
+    /// GLOBAL hold through the production `set_hold` statement
+    /// immediately after batch 1 commits. Post-fix: exactly the
+    /// pre-hold batch's two paths are deleted; the other four
+    /// survive the freeze; release + rerun drains the remainder (the
+    /// heal edge, resumability witnessed).
+    #[tokio::test]
+    async fn mid_pass_hold_stops_path_sweep_at_the_batch_boundary() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        for i in 0..6u8 {
+            crate::test_helpers::StoreSeed::path(&format!("midpass-{i}"))
+                .created_hours_ago(48)
+                .seed(&db.pool)
+                .await;
+        }
+
+        // The hold lands through the production set_hold statement
+        // immediately after sweep batch 1 commits (the test interpose
+        // — no external caller can time the inter-batch gap).
+        sweep::SWEEP_HOLD_AFTER_BATCHES.store(1, std::sync::atomic::Ordering::SeqCst);
+
+        let stats = run_full_gc(&db.pool)
+            .await
+            .expect("a mid-pass-held run reports its committed progress");
+        assert_eq!(
+            stats.paths_deleted, 2,
+            "left: post-hold batches kept deleting through the freeze \
+             (the emergency stop defeated) / right: exactly the \
+             pre-hold batch is swept; batch 2 refuses at its boundary"
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM narinfo")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining, 4,
+            "the four post-hold paths survive the freeze (the table agrees)"
+        );
+        // Phase 3 never ran under the refused clearance: no chunk
+        // collection happened in this pass.
+        assert_eq!(
+            stats.chunks_deleted, 0,
+            "phase 3 is suspended with the sweep (no collect under the hold)"
+        );
+
+        // The heal edge: release the hold; the next run drains the
+        // remainder — suspension never converts into lost work.
+        let hold_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT hold_id FROM gc_holds WHERE created_by = 'sweep-test-hook'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(hold::release_hold(&db.pool, hold_id).await.unwrap());
+        let stats = run_full_gc(&db.pool).await.expect("post-release run");
+        assert_eq!(stats.paths_deleted, 4, "release ⇒ the remainder sweeps");
     }
 }

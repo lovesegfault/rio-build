@@ -943,9 +943,15 @@ impl MbtSystem {
     /// is unobservable); the `sweepExecRow` step is a no-op whose
     /// post-state comparison checks the pass's combined effect.
     async fn sweep_pass(&mut self) -> Result<()> {
-        sweep::sweep_expired_logs(&self.db.pool, &self.store, RETENTION, sweep::SWEEP_BATCH)
-            .await
-            .context("sweep_expired_logs failed")?;
+        sweep::sweep_expired_logs(
+            &self.db.pool,
+            &self.store,
+            RETENTION,
+            sweep::SWEEP_BATCH,
+            &mut crate::test_helpers::gc_clearance(&self.db.pool).await,
+        )
+        .await
+        .context("sweep_expired_logs failed")?;
         Ok(())
     }
 
