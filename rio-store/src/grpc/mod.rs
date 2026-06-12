@@ -46,6 +46,7 @@ use crate::substitute::{SubstituteError, Substituter};
 mod admin;
 mod chunk;
 mod directory;
+mod drv_blob;
 mod get_path;
 mod put_path;
 mod put_path_batch;
@@ -56,6 +57,7 @@ mod sign;
 pub use admin::{StoreAdminServiceImpl, spawn_store_gauge_tick};
 pub use chunk::{ChunkServiceImpl, GET_CHUNKS_K};
 pub use directory::DirectoryServiceImpl;
+pub use drv_blob::DrvBlobServiceImpl;
 pub use put_path::common::NarIngestEnvelopeCfg;
 
 /// Default cap on paths in a FindMissingPaths request (DoS guard).
@@ -200,7 +202,7 @@ pub(crate) fn putpath_metadata_status(context: &str, e: metadata::MetadataError)
 /// `path_tenants` on exactly the tenant resolved here, so a write side
 /// that resolved the tenant differently (e.g. JWT-only) would commit
 /// paths its own uploader cannot read back.
-// r[impl store.castore.tenant-scope+2]
+// r[impl store.castore.tenant-scope+3]
 fn resolve_tenant_id(
     jwt_sub: Option<uuid::Uuid>,
     hmac_claims: Option<&rio_auth::hmac::AssignmentClaims>,

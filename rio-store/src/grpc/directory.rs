@@ -78,7 +78,7 @@ const GET_DIRECTORY_MAX_RESULTS: usize = 262_144;
 /// Both are single-RPC presence probes — a delta-sync caller batches
 /// at the closure size (~25k files for chromium); larger means a
 /// pathological caller or a bug.
-const HAS_BATCH_MAX: usize = 65_536;
+pub(super) const HAS_BATCH_MAX: usize = 65_536;
 
 /// `ReadBlob` chunk prefetch width. `buffered()`, not `_unordered`:
 /// file bytes must arrive in offset order. Lower than `GetPath`'s 64
@@ -125,27 +125,41 @@ impl DirectoryServiceImpl {
         }
     }
 
-    /// Resolve the caller's tenant: JWT extension (gateway path),
-    /// else HMAC assignment-token `claims.tenant` (builder path), via
-    /// the shared [`super::resolve_tenant_id`] mapping (the write side
-    /// uses the same one, so a path committed by a builder is readable
-    /// by that builder's tenant). No tenant → `UNAUTHENTICATED`; never
-    /// fall back to anonymous.
-    // r[impl store.castore.tenant-scope+2]
+    /// Resolve the caller's tenant via the shared
+    /// [`resolve_castore_tenant`] ladder.
+    // r[impl store.castore.tenant-scope+3]
     fn castore_tenant_id<T>(&self, request: &Request<T>) -> Result<uuid::Uuid, Status> {
-        match caller_identity(
+        resolve_castore_tenant(
             request,
             self.hmac_verifier.as_ref(),
             "DirectoryService requires a tenant: send a JWT or an HMAC \
              assignment token",
-        )? {
-            CallerIdentity::Jwt(sub) => Ok(sub),
-            CallerIdentity::Hmac(claims) => super::resolve_tenant_id(None, Some(&claims))
-                .ok_or_else(|| {
-                    Status::unauthenticated(
-                        "assignment token has no usable tenant claim (missing or not a UUID)",
-                    )
-                }),
+        )
+    }
+}
+
+/// Resolve the caller's tenant: JWT extension (gateway path), else
+/// HMAC assignment-token `claims.tenant` (builder path), via the
+/// shared [`super::resolve_tenant_id`] mapping (the write side uses
+/// the same one, so content committed by a builder is readable by
+/// that builder's tenant). No tenant → `UNAUTHENTICATED`; never fall
+/// back to anonymous. Shared by `DirectoryService`, `ChunkService`
+/// (`HasChunks`), and `DrvBlobService` so the tenant-scoped surfaces
+/// cannot drift on what counts as a tenant.
+// r[impl store.castore.tenant-scope+3]
+pub(super) fn resolve_castore_tenant<T>(
+    request: &Request<T>,
+    verifier: Option<&Arc<rio_auth::hmac::HmacVerifier>>,
+    missing: &'static str,
+) -> Result<uuid::Uuid, Status> {
+    match caller_identity(request, verifier, missing)? {
+        CallerIdentity::Jwt(sub) => Ok(sub),
+        CallerIdentity::Hmac(claims) => {
+            super::resolve_tenant_id(None, Some(&claims)).ok_or_else(|| {
+                Status::unauthenticated(
+                    "assignment token has no usable tenant claim (missing or not a UUID)",
+                )
+            })
         }
     }
 }
@@ -154,7 +168,9 @@ impl DirectoryServiceImpl {
 /// builder's HMAC assignment token. Shared with `ChunkService`
 /// (chunk.rs) so the two auth ladders can't drift on what counts as
 /// "authenticated"; each caller decides what to do with the identity
-/// (DirectoryService resolves a tenant, HasChunks only needs proof).
+/// (the tenant-scoped surfaces resolve a tenant via
+/// [`resolve_castore_tenant`]; the chunk retrieval RPCs only need
+/// proof).
 pub(super) enum CallerIdentity {
     /// `TenantClaims.sub` from the gateway's JWT interceptor.
     Jwt(uuid::Uuid),
@@ -198,7 +214,7 @@ pub(super) fn parse_digest(d: &[u8]) -> Result<[u8; 32], Status> {
         .map_err(|_| Status::invalid_argument(format!("digest must be 32 bytes, got {}", d.len())))
 }
 
-fn parse_digests(ds: &[Vec<u8>]) -> Result<Vec<[u8; 32]>, Status> {
+pub(super) fn parse_digests(ds: &[Vec<u8>]) -> Result<Vec<[u8; 32]>, Status> {
     if ds.len() > HAS_BATCH_MAX {
         return Err(Status::invalid_argument(format!(
             "digest batch too large: {} > {HAS_BATCH_MAX}",
@@ -987,7 +1003,7 @@ const SUBST_ONLY_BLOB_CANDIDATES_SQL: &str = "SELECT f.digest, f.store_path_hash
 /// lookup is a `(digest, store_path_hash)` PK prefix scan, narinfo
 /// verification is a PK `= ANY` fetch inside
 /// [`sign::sig_visible_path_hashes`].
-// r[impl store.castore.tenant-scope+2]
+// r[impl store.castore.tenant-scope+3]
 async fn sig_fallback_digests(
     pool: &PgPool,
     signer: Option<&TenantSigner>,
@@ -1022,7 +1038,7 @@ async fn sig_fallback_digests(
 /// substitution-only path (complete manifest) containing `digest`
 /// that is sig-visible to `tenant`. Lowest `store_path_hash` wins for
 /// determinism. `None` ⇒ the caller's NotFound stands.
-// r[impl store.castore.tenant-scope+2]
+// r[impl store.castore.tenant-scope+3]
 async fn blob_sig_fallback_hash(
     pool: &PgPool,
     signer: Option<&TenantSigner>,

@@ -42,6 +42,7 @@
       "StoreService",
       "DirectoryService",
       "ChunkService",
+      "DrvBlobService",
       "StoreAdminService"
     ],
     "doc": "Store service for NAR storage and path metadata."
