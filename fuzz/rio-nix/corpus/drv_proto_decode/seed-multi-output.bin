@@ -1,0 +1,10 @@
+
+6
+dev//nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dev
+6
+lib//nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-lib
+6
+out//nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-out"x86_64-linux*/bin/sh2-c2echo:
+namemulti:6
+out//nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-out:
+systemx86_64-linux

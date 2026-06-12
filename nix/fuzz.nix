@@ -123,6 +123,7 @@ let
     "wire_primitives"
     "opcode_parsing"
     "derivation_parsing"
+    "drv_proto_decode"
     "nar_parsing"
     "nar_ls"
     "derived_path_parsing"

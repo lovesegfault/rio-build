@@ -1,0 +1,7 @@
+
+7
+out0/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-leaf"x86_64-linux*/bin/sh2-c2
+echo hello:
+nameleaf:7
+out0/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-leaf:
+systemx86_64-linux
