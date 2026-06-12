@@ -1680,7 +1680,8 @@ token; `colliding_identity_fresh_claim_gets_not_yet_ready` extended ---
 nonce agreement never overrides the one-winner refusal), the failover
 re-delivery test (`flag_on_recovery_rebuilds_job_view_and_jobs_survive`:
 wrong-nonce refused; right-nonce tokenless re-pull re-delivers the SAME
-attempt across failover --- the migration-096 persistence pin), the store
+attempt across failover --- the #(refs.migration)("096_assignments_claim_nonce")
+persistence pin), the store
 client battery (`timeout_then_resume_recovers_lost_response`,
 `resume_ledger_lifecycle`), and the `mat-158-colliding-identity` calibration
 (header re-pointed to the credential rule; `atMostOneClaimWinner` still

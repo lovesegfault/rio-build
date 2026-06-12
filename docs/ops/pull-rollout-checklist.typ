@@ -26,8 +26,9 @@ not budgets.
 against the staged-rollout tree, whose levers included the Pool
 `spec.dispatchMode` knob and the per-pod `RIO_DISPATCH_MODE` discriminator.
 That knob was retired end-to-end after the close-out (PR \#46 Track C: the
-CRD field, the controller gates and the chart knob are gone; migration 076
-dropped `drv_executions.dispatch_mode`; the builder always pulls). On any
+CRD field, the controller gates and the chart knob are gone;
+#(refs.migration)("076_drop_dispatch_mode") dropped
+`drv_executions.dispatch_mode`; the builder always pulls). On any
 tree at or past that retirement: D0 collapses to its fresh-fleet arm (deploy
 with pull as the only mode — there is no template to flip), D5 is satisfied
 by its recorded waiver path (the VM demonstration plus the knob retirement
@@ -36,12 +37,14 @@ D1--D4 and D7 are still executed in full — they validate the replacement
 against real load, not against a fleet shape.
 
 *Deliverables that make the checklist executable* (ship with the code): the
-OA1 histogram pair `rio_scheduler_attempt_requeue_seconds` (by cause) /
-`rio_controller_job_terminal_report_seconds` (by reason); the OA5 surface
+OA1 histogram pair #(refs.metric)("rio_scheduler_attempt_requeue_seconds") (by
+cause) / #(refs.metric)("rio_controller_job_terminal_report_seconds") (by
+reason); the OA5 surface
 (`AdminService.ListOpenAttempts`, the re-pointed `ListExecutors` /
-`ClusterStatus`, the `rio_scheduler_open_attempts` gauge, the controller Job
-census); the OA2 wedge clustering (`rio_controller_node_wedge_marked_total`)
-plus the `RioSchedulerAttemptEstablishmentCluster` alert and the
+`ClusterStatus`, the #(refs.metric)("rio_scheduler_open_attempts") gauge, the
+controller Job census); the OA2 wedge clustering
+(#(refs.metric)("rio_controller_node_wedge_marked_total"))
+plus the #(refs.alert)("RioSchedulerAttemptEstablishmentCluster") alert and the
 #cross-link("/ops/hung-node-manual-reap.typ")[hung-node manual-reap runbook];
 the scheduler Config `establishment_report_slack` (env
 `establishment_report_slack_secs`, default 120 s); the deletion-gate
@@ -83,8 +86,9 @@ stream registrations ever existed), and rows D1--D5 are still executed.
 
 == D1 — OA1 baseline + AD5 numeric budget signature
 
-- *Run/observe:* `rio_scheduler_attempt_requeue_seconds` (by cause) and
-  `rio_controller_job_terminal_report_seconds` (by reason) over the
+- *Run/observe:* #(refs.metric)("rio_scheduler_attempt_requeue_seconds") (by
+  cause) and #(refs.metric)("rio_controller_job_terminal_report_seconds")
+  (by reason) over the
   pre-flip window (as-built baseline, if any stream pools run) and the
   post-flip window; sign the AD5 composite cancel/preempt + death→requeue
   budget against that data; re-baseline `establishment_report_slack`
@@ -111,9 +115,9 @@ stream registrations ever existed), and rows D1--D5 are still executed.
 
 == D3 — OA2 node-wedge signal observation
 
-- *Run/observe:* `rio_controller_node_wedge_marked_total` and the
-  wedge-clustered Dead-arm reaps for flipped pools; the
-  `RioSchedulerAttemptEstablishmentCluster` alert + the manual
+- *Run/observe:* #(refs.metric)("rio_controller_node_wedge_marked_total") and
+  the wedge-clustered Dead-arm reaps for flipped pools; the
+  #(refs.alert)("RioSchedulerAttemptEstablishmentCluster") alert + the manual
   NodeClaim-reap runbook over the same window.
 - *Pass:* the clustering feeds `reap_unhealthy` as designed; the alert is
   quiet, or every firing triages per the runbook to a real node wedge.

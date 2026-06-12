@@ -24,7 +24,7 @@ until restart.
 
 = GW-D2 — `channels_active` autoscaling caveat
 
-`rio_gateway_channels_active` (the autoscaling signal) momentarily
+#(refs.metric)("rio_gateway_channels_active") (the autoscaling signal) momentarily
 under-counts winding-down sessions during mass disconnects with an
 unresponsive scheduler — the W2 guard-held divergence, ≤ \~30 s per session
 (the cancel-loop bound; structurally bounded — the diverged proto task can
@@ -47,7 +47,7 @@ uploads).
 
 = GW-D4 — conn-permit occupancy alert
 
-Alert on sustained `rio_gateway_errors_total` `conn_cap` growth.
+Alert on sustained #(refs.metric)("rio_gateway_errors_total") `conn_cap` growth.
 Conn-permit-at-accept is a fixed fact (owner decision B4): probes and
 SYN-flood-with-completion can transiently hold conn permits with no
 auth-level signal, indistinguishable in-process from legitimate load.

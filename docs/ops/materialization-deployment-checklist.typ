@@ -14,13 +14,13 @@ line per row: the final state an operator inherits.
 - *CE-D1 fenced-write metric + leader alert* — SURVIVES, extended:
   job-table and wanted-relation writes share the claims-floor fence and the
   #(refs.metric)("rio_scheduler_evidence_write_fenced_total") counter; the
-  `RioSchedulerEvidenceWriteFenced` alert ships in the chart. On a replica
+  #(refs.alert)("RioSchedulerEvidenceWriteFenced") alert ships in the chart. On a replica
   that just lost the lease, nonzero during failover IS the fence working;
   on the CURRENT leader it must be zero — alert on any sustained nonzero
   leader rate.
 - *CE-D2 failover PG-flap alerts* — SURVIVES unchanged:
-  `rio_scheduler_generation_claim_failed_total` and
-  `rio_scheduler_generation_floor_read_failed_total` sustained nonzero
+  #(refs.metric)("rio_scheduler_generation_claim_failed_total") and
+  #(refs.metric)("rio_scheduler_generation_floor_read_failed_total") sustained nonzero
   means PG is flapping at failover time; the same metrics now also guard
   the job-write floor reads.
 - *CE-D3 merge `FAILED_PRECONDITION` at failover* — SURVIVES unchanged:
@@ -54,24 +54,25 @@ GW-D1 through GW-D5 survive unchanged — see
 - *MD-D1 park alerting + runbook* — SURVIVES, population re-keyed (the Q5
   establishment-park reversal): the
   #(refs.metric)("rio_scheduler_materialization_stalled") gauge, the
-  `RioSchedulerMaterializationStalled` alert (15 m) and the runbook are
+  #(refs.alert)("RioSchedulerMaterializationStalled") alert (15 m) and the runbook are
   intact (same gauge, no new label); the population now INCLUDES
   establishment-only crash-loops (party-blind parking). A parked
   materialization job means UPSTREAM trouble, never build failure: builds
   wait visibly, and every parked job has Broken closure evidence (jobs with
   buildable closures are auto-resolved from-source within one tick).
   Runbook, two arms: (1) the upstream arm — check the tenant's upstream
-  cache config/health (`rio_store_substitute_total` error rate, store
+  cache config/health (#(refs.metric)("rio_store_substitute_total") error rate, store
   logs); (2) the store-replica arm — a parked job whose ledger rows are all
   establishment-written (zero worker reports) with k8s CrashLoopBackOff on
-  a store replica and NO `rio_store_substitute_total` error signal is the
+  a store replica and NO #(refs.metric)("rio_store_substitute_total") error signal is the
   crash-looping-replica case; fix the replica, not the upstream. Builds
   resume on upstream recovery (park-expiry re-claim) or can be cancelled.
   Do NOT restart the scheduler to "fix" a park — the park is durable state
   and survives restarts by design.
 - *MD-D2 / MD-D3 flag rollback / mixed-flag guidance* — RETIRED at D′,
   replaced by the §7.5 deployment-and-rollback posture: binary rollback
-  through D′.1; migration 080 roll-forward only; binaries-first deployment
+  through D′.1; #(refs.migration)("080_drop_walk_evidence") roll-forward only;
+  binaries-first deployment
   order; bounded self-identifying transition residuals.
 - *MD-D4 instance-binding skew posture* — SURVIVES: fail-closed across
   version skew; the binding check is unconditional post-D′.
