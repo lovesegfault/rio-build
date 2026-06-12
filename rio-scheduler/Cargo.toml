@@ -166,3 +166,14 @@ toml.workspace = true
 # lease/election.rs integration tests: ApiServerVerifier scenarios
 # need http::Method for the expected-request shape.
 http = { workspace = true }
+# Model-based testing (src/actor/tests/mbt_materialization.rs): replay
+# traces generated from docs/spec/models/materializationJob.qnt against
+# the real scheduler claim plane, diffing the projected state after
+# every step. Shells out to `quint` at test time — the mbt_* tests are
+# #[ignore]d in the default profile and run by the dedicated
+# mbt-rio-materialization check that puts quint on the PATH.
+quint-connect = { workspace = true }
+# ITF (Informal Trace Format) deserialization for the named-run
+# replays: `quint test --out-itf` emits the model's per-step states;
+# the replay diffs the implementation's projection against them.
+itf = { workspace = true }

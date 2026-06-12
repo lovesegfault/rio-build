@@ -22,6 +22,7 @@ mod integration;
 mod keep_going;
 mod lifecycle_sweep;
 mod materialize;
+mod mbt_materialization;
 mod merge;
 mod misc;
 mod pull;

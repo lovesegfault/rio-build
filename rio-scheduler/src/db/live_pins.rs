@@ -613,6 +613,10 @@ mod registration_writer_census {
             include_str!("../actor/tests/materialize.rs"),
         ),
         (
+            "actor/tests/mbt_materialization.rs",
+            include_str!("../actor/tests/mbt_materialization.rs"),
+        ),
+        (
             "actor/tests/merge.rs",
             include_str!("../actor/tests/merge.rs"),
         ),

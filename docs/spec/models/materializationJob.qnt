@@ -3037,6 +3037,53 @@ module materializationJob {
       })
   }
 
+  /// live_061 (the matmodel-gap repair): the by-other-means trace,
+  /// production-shaped. The executor ingests the wanted output and
+  /// then closes its attempt with an infra failure (one charge, under
+  /// budget — unparked, node released NQueued); the store
+  /// short-circuit then completes the node from local presence with
+  /// NO open attempt, and the still-pending job goes OBSOLETE — the
+  /// enum's exact letter, the resolution arm that had zero production
+  /// writers for the system's entire life. The mbt-rio-materialization
+  /// conformance check replays this run against the real scheduler:
+  /// at the pre-fold tree the moot sweep resolves the row `cancelled`
+  /// and the replay reds at the final step (spec JObsolete vs
+  /// implementation JCancelled — the live_061 conflation, W12-S9B's
+  /// twin observable).
+  run obsoleteOnProducedRun = {
+    init
+      .then(all { recordWantedRelation("b1", "d1", Set("o1")), walkUnchanged })
+      .then(all { createJob("d1", OProbe, "b1"), walkUnchanged })
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
+      .then(all { executeStep("d1", "o1"), walkUnchanged })
+      .then(all { reportInfra("d1"), walkUnchanged })
+      .expect(and {
+        match jobs.get("d1") {
+          | NoJob => false
+          | SomeJob(j) => j.state == JPending and not(j.parked) and j.matInfraCount == 1
+        },
+        nodeStatus.get("d1") == NQueued,
+        attempts.get("d1") == NoAttempt,
+        present.get(("d1", "o1")),
+      })
+      .then(all { completeReadyFromStore("d1"), walkUnchanged })
+      .expect(and {
+        nodeStatus.get("d1") == NCompleted,
+        match jobs.get("d1") { | NoJob => false | SomeJob(j) => j.state == JPending },
+      })
+      .then(all { obsoleteOnProduced("d1"), walkUnchanged })
+      .expect(and {
+        match jobs.get("d1") {
+          | NoJob => false
+          | SomeJob(j) => j.state == JObsolete
+        },
+        nodeStatus.get("d1") == NCompleted,
+        view.get("d1") == VNone,
+        attempts.get("d1") == NoAttempt,
+        not(topdownPruned.get("d1")),
+      })
+  }
+
   /// Delta 3: infra failures park IN the consumption at the budget
   /// (no separate park transition); the Broken-evidence park is the
   /// stalled population; the backoff expiry un-parks WITHOUT resetting

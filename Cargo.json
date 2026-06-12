@@ -20740,6 +20740,10 @@
           "packageId": "http 1.4.0"
         },
         {
+          "name": "itf",
+          "packageId": "itf"
+        },
+        {
           "name": "metrics-util",
           "packageId": "metrics-util"
         },
@@ -20754,6 +20758,10 @@
         {
           "name": "proptest",
           "packageId": "proptest"
+        },
+        {
+          "name": "quint-connect",
+          "packageId": "quint-connect"
         },
         {
           "name": "rio-store",

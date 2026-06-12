@@ -84,14 +84,16 @@
   lib,
   unfilteredRoot,
   # nix/checks.nix's nextest reuse-build helpers and the prebuilt
-  # rio-lease / rio-store test binaries, threaded through flake.nix's
-  # quintChecks binding. Only the mbt-rio-lease and mbt-rio-logservice
-  # conformance checks below consume them — the model checks need
-  # nothing from the Rust build.
+  # rio-lease / rio-store / rio-scheduler test binaries, threaded
+  # through flake.nix's quintChecks binding. Only the mbt-rio-lease,
+  # mbt-rio-logservice and mbt-rio-materialization conformance checks
+  # below consume them — the model checks need nothing from the Rust
+  # build.
   mkNextestRun,
   mkNextestMeta,
   rioLeaseTestBin,
   rioStoreTestBin,
+  rioSchedulerTestBin,
 }:
 let
   modelsDir = unfilteredRoot + "/docs/spec/models";
@@ -204,6 +206,13 @@ let
   logServiceModel = lib.fileset.toSource {
     root = modelsDir;
     fileset = modelsDir + "/logService.qnt";
+  };
+
+  # Same narrowing for the materialization-job model, consumed by the
+  # mbt-rio-materialization conformance check below.
+  matJobModel = lib.fileset.toSource {
+    root = modelsDir;
+    fileset = modelsDir + "/materializationJob.qnt";
   };
 
   # The TLC backend's quint->TLA+ conversion goes through the bundled
@@ -4295,6 +4304,63 @@ rec {
         # check that proved nothing.
         grep -E ' [1-9][0-9]* tests? run:' $out/log > /dev/null || {
           echo "mbt-rio-logservice: the mbt_* filter matched no tests" >&2
+          exit 1
+        }
+      '';
+    };
+
+    # Implementation conformance for the materialization-job model
+    # (live_061, the matmodel-gap repair): rio-scheduler/src/actor/
+    # tests/mbt_materialization.rs replays traces from
+    # materializationJob.qnt against the real scheduler claim plane —
+    # the merge intake, the dispatch probe partition, the kinded pull
+    # mint, the report consumption routing, and the moot sweep —
+    # diffing the projected job/view/node/attempt state after every
+    # step. Two named runs (happyPathRun and obsoleteOnProducedRun —
+    # the by-other-means trace whose final step demands JObsolete; at
+    # the pre-fold ancestor the sweep resolved 'cancelled' and the
+    # replay reds at exactly that step) plus the #[quint_run] seeded
+    # random walk of materializationJobBase. The scoping rationale
+    # (store-side actions as driver bookkeeping, the claimable-pair
+    # normalize, the bail-arm scope ladder) lives in the test module's
+    # header.
+    #
+    # Wiring: the same prebuilt rio-scheduler test binary
+    # nextest-rio-scheduler runs, with quint on PATH, postgres on PATH
+    # (the `member` indirection pulls in rio-scheduler's
+    # runtimeTestInputs — the ephemeral PG the projection reads real
+    # job rows from), and the model staged into the remapped nextest
+    # workspace so a model edit re-runs this check.
+    #
+    # The marker covers what the replayed traces exercise end-to-end:
+    # the obsolete discharge arm (the moot sweep's node-Completed
+    # class) checked against the model's obsoleteOnProduced post-state
+    # through the ITF trace.
+    # r[verify sched.materialize.obsolescence]
+    mbt-rio-materialization = mkNextestRun {
+      name = "mbt-rio-materialization";
+      member = "rio-scheduler";
+      meta = mkNextestMeta { rio-scheduler = rioSchedulerTestBin; };
+      extraRuntimeInputs = [ pkgs.quint ];
+      extraArgs = [
+        "-E"
+        "package(rio-scheduler) and test(/mbt_/)"
+        "--run-ignored"
+        "all"
+      ];
+      preRun = ''
+        export RIO_MBT_SPEC_PATH=$TMPDIR/ws/docs/spec/models/materializationJob.qnt
+      '';
+      postWsSetup = ''
+        mkdir -p $ws/docs/spec/models
+        cp ${matJobModel}/materializationJob.qnt $ws/docs/spec/models/
+      '';
+      postRun = ''
+        # Same no-tests guard as mbt-rio-lease: --no-tests=warn would
+        # otherwise turn a filter that matches nothing into a green
+        # check that proved nothing.
+        grep -E ' [1-9][0-9]* tests? run:' $out/log > /dev/null || {
+          echo "mbt-rio-materialization: the mbt_* filter matched no tests" >&2
           exit 1
         }
       '';
