@@ -491,9 +491,15 @@ pub fn fit_memory(
     // `peak_memory_bytes = 0` as a legitimate sample point, but
     // `ln(0) = -∞` and `wls_loglinear` has no NaN handling — `-∞ - (-∞)
     // = NaN` collapses an entire key from `Coupled` to `Independent`.
-    // `ln(1) = 0` is a benign low outlier IRLS down-weights; the
-    // `Independent` p90 path below still uses raw `ms` so the
-    // percentile-doesn't-drag rationale survives. `cs` is floored
+    // `ln(1) = 0` is a benign low outlier IRLS down-weights. The
+    // percentile-doesn't-drag rationale survives as an INVARIANT of
+    // the arm, not of this local `ms`: every `Independent` fallback
+    // aggregates RAW un-floored bytes — the degenerate arm below
+    // returns the CALLER-provided `fallback_p90` (refit's one mem
+    // aggregator over the full row set, bug_072), which never sees
+    // this floor; the floored values feed only the `lm` regression
+    // inputs. (bug_026: the pre-fix text claimed the path "still uses
+    // raw ms" — dataflow the bug_072 rewire deleted.) `cs` is floored
     // symmetrically (`cpu_limit_cores` is `>= 1` in practice).
     let lc: Vec<f64> = cs.iter().map(|c| c.max(1.0).ln()).collect();
     let lm: Vec<f64> = ms.iter().map(|m| (*m as f64).max(1.0).ln()).collect();

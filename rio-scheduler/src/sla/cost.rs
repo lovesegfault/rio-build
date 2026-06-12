@@ -1215,7 +1215,10 @@ impl CostTable {
         // note at the end of this fn). A generation settles when
         // every co-captured in-progress xid has ended in the CURRENT
         // snapshot (x ∉ xip' ∧ x < xmax'); promotion is
-        // prefix-ordered (field doc on `lambda_pending`).
+        // prefix-ordered (field doc on `lambda_pending`). The
+        // snapshot read is connection-independent — xid end-state is
+        // a cluster fact any checkout observes (the bug_097
+        // same-shape audit: no session affinity claimed or needed).
         let mut settled = self.lambda_cursor;
         if !self.lambda_pending.is_empty() {
             let (xmax, xips): (i64, Vec<i64>) = sqlx::query_as(
@@ -1341,11 +1344,23 @@ impl CostTable {
         }
         // ── Capture the NEXT generation: L FIRST, THEN the snapshot's
         // in-progress xid list (the load-bearing order — see
-        // [`SeqGeneration`]; both statements on the same connection,
-        // sequentially awaited). NULL last_value (sequence never
-        // called) is horizon 0 — nothing to consume. Skip the push
-        // when the horizon has not advanced past the cursor and every
-        // pending capture (a no-op generation would only lengthen the
+        // [`SeqGeneration`]). The ordering proof is denominated ONLY
+        // in what the await graph guarantees (bug_097): the two reads
+        // are SEQUENTIALLY AWAITED on independent pool checkouts — NO
+        // session affinity exists or is needed, because
+        // `pg_sequence_last_value` and `pg_current_snapshot` are
+        // cluster-wide facts any connection observes consistently;
+        // real-time read order is the whole requirement. (The pre-fix
+        // "both statements on the same connection" claim asserted a
+        // stronger mechanism than implemented or needed — a false
+        // premise a future SET LOCAL/REPEATABLE READ edit could
+        // inherit. IF same-session semantics are ever actually
+        // needed, witness them structurally: one `PoolConnection`
+        // threaded `&mut` through both queries — the type then proves
+        // the claim.) NULL last_value (sequence never called) is
+        // horizon 0 — nothing to consume. Skip the push when the
+        // horizon has not advanced past the cursor and every pending
+        // capture (a no-op generation would only lengthen the
         // promotion queue).
         let l: Option<i64> = sqlx::query_scalar(
             "SELECT pg_sequence_last_value('interrupt_samples_id_seq'::regclass)",
