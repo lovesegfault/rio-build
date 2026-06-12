@@ -1512,7 +1512,7 @@ in
         cp "$sharedLexer" rust_strip.py
         cp "$censusLib" census_corpora.py
         cp "$scanScript" obligation_clock_census.py
-        python3 obligation_clock_census.py "$src"
+        python3 obligation_clock_census.py "$src" --verify-landed
         touch $out
       '';
 
@@ -1529,7 +1529,7 @@ in
         cp "$sharedLexer" rust_strip.py
         cp "$censusLib" census_corpora.py
         cp "$scanScript" duplicate_derivation_lint.py
-        python3 duplicate_derivation_lint.py "$src"
+        python3 duplicate_derivation_lint.py "$src" --verify-landed
         touch $out
       '';
 

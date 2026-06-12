@@ -1,6 +1,5 @@
 rio-builder/src/log_stream.rs	gate	L-content-.elapsed() >=
 rio-builder/src/runtime/pull.rs	lossy	* SIGTERM_FINAL_ATTEMPT.as_secs()
-rio-common/src/liveness.rs	lossy	.as_secs() *
 rio-controller/src/reconcilers/componentscaler/mod.rs	gate	L-content-.elapsed() >=
 rio-controller/src/reconcilers/node_informer.rs	gate	L-content-.elapsed() >=
 rio-controller/src/reconcilers/pool/job.rs	gate	L-content-.elapsed() <
@@ -15,5 +14,4 @@ rio-store/src/cas.rs	gate	L-content-.elapsed() >=
 rio-store/src/gc/mod.rs	gate	L-content-.elapsed() >
 rio-store/src/grpc/put_path/common.rs	lossy	.as_secs() *
 rio-store/src/logs/ingest.rs	gate	L-content-.elapsed() >
-rio-store/src/logs/service.rs	gate	L-content-.elapsed() >=
 rio-store/src/logs/sessions.rs	lossy	* HEARTBEAT_INTERVAL.as_secs()

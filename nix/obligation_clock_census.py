@@ -48,14 +48,22 @@ import rust_strip
 # name -> (kind, slot, type token, discharge anchor regex, drop-audit)
 # pending rows carry None anchors; --verify-landed (the wave-close
 # pass) requires every row anchored and resolving.
+# Landed rows carry (state, slot, file, anchor-regex, drop-audit);
+# check_landed resolves every anchor in its file — rot reds. Flipped
+# at the wave-close --verify-landed pass (bw12, dfd3afb2b+19): each
+# anchor grep-verified at the composed tree before the flip; the
+# RetransmitBuffer NAME from the relay pack resolved by CONTENT per
+# (xxxxx) — the landed discharge is `discharge_through(DurableFrontier)`
+# on the upload buffer (log_upload.rs:1059), the witness TYPE is
+# DurableFrontier (ack-borne mints only).
 OBLIGATION_ROWS = {
-    "retransmit-buffer": ("pending", "S1", "RetransmitBuffer", r"discharge_through", "n/a"),
-    "lease-release-guard": ("pending", "S1", "LeaseReleaseGuard", r"disarm|handoff", "panicking-gated"),
-    "batch-authority": ("pending", "S3", "BatchAuthority", r"authorize_batch", "n/a"),
-    "routing-verdict": ("pending", "S4", "RoutingVerdict", r"execute", "n/a"),
-    "tombstone-disposition": ("pending", "S6", "TombstoneDisposition|typed per-exit discharge", r"dispose|discharge", "n/a"),
-    "disclosure-guard": ("pending", "S7", "PendingGapCell|disclosure-on-drop", r"drop|defuse|disclose", "panicking-gated"),
-    "exit-discharge": ("pending", "S7", "Exit", r"closure|discharge", "n/a"),
+    "retransmit-buffer": ("landed", "S1", "rio-builder/src/log_upload.rs", r"fn discharge_through\(&mut self, frontier: DurableFrontier\)", "n/a"),
+    "lease-release-guard": ("landed", "S1", "rio-store/src/logs/service.rs", r"LeaseReleaseGuard", "panicking-gated"),
+    "batch-authority": ("landed", "S3", "rio-store/src/gc/lane.rs", r"BatchAuthority|authorize_batch", "n/a"),
+    "routing-verdict": ("landed", "S4", "rio-lease/src/lib.rs", r"RoutingVerdict", "n/a"),
+    "tombstone-disposition": ("landed", "S6", "rio-controller/src/reconcilers/nodeclaim_pool/health.rs", r"TombstoneDisposition", "n/a"),
+    "disclosure-guard": ("landed", "S7", "rio-gateway/src/handler/log_tail.rs", r"PendingGapCell", "panicking-gated"),
+    "exit-discharge": ("landed", "S7", "rio-log-kernel/src/lib.rs", r"Exit \{", "n/a"),
 }
 TAKE_THEN_AWAIT_CANDIDATE = (
     "lint candidate: `state.take()` followed by `.await` inside an "
@@ -63,14 +71,16 @@ TAKE_THEN_AWAIT_CANDIDATE = (
     "promotion trigger: the first post-wave escape of this shape"
 )
 
+# Landed clock rows: (state, slot, file, anchor-regex) — the clock
+# description lives in the anchor's own doc at the landed site.
 CLOCK_ROWS = {
-    "inbound-idle-arrival": ("pending", "S1", "arrival (not read-progress)"),
-    "session-margin-schedule": ("pending", "S1", "executable schedule (two-attempt)"),
-    "infra-poison-consecutive": ("pending", "S2", "consecutive-failure count (not wall-window)"),
-    "gc-clearance-consult-age": ("pending", "S3", "consult (not mint)"),
-    "lease-futility-next-eval": ("pending", "S4", "next evaluation point"),
-    "scaler-fund-eq-spend": ("pending", "S6", "the witnessed predicate itself"),
-    "gap-witness-lossless": ("pending", "S7", "finest input unit (lossless)"),
+    "inbound-idle-arrival": ("landed", "S1", "rio-store/src/logs/service.rs", r"last_inbound|INBOUND_IDLE"),
+    "session-margin-schedule": ("landed", "S1", "rio-store/src/logs/sessions.rs", r"FAST_RETRY_BUDGET|TICK_BODY_BOUND"),
+    "infra-poison-consecutive": ("landed", "S2", "rio-scheduler/src/retry_policy.rs", r"consecutive|infra"),
+    "gc-clearance-consult-age": ("landed", "S3", "rio-store/src/gc/lane.rs", r"regate|HoldClearance"),
+    "lease-futility-next-eval": ("landed", "S4", "rio-lease/src/lib.rs", r"BlindClock|futility|next_eval"),
+    "scaler-fund-eq-spend": ("landed", "S6", "rio-controller/src/reconcilers/componentscaler/decide.rs", r"fund|streak|sustain"),
+    "gap-witness-lossless": ("landed", "S7", "rio-common/src/liveness.rs", r"admin_verify_worst_emission_gap"),
 }
 
 # The lossy-witness-arithmetic grammar (live from birth): seconds
@@ -137,8 +147,9 @@ def scan_clock_code(files):
 
 
 def check_landed(src_root, rows, kind):
-    """--verify-landed: every row anchored and resolving (the
-    wave-close pass; a pending row here is a red)."""
+    """--verify-landed: every row anchored AND its anchor resolving in
+    its file (rot reds; a pending row here is a red — the wave-close
+    flips it or fails)."""
     fails = []
     for name, row in sorted(rows.items()):
         state = row[0]
@@ -147,6 +158,15 @@ def check_landed(src_root, rows, kind):
                 f"{kind} row `{name}` still pending:{row[1]} at the landed "
                 f"verify — the wave-close flips it with its anchors or the "
                 f"close fails"
+            )
+            continue
+        rel, anchor = row[2], row[3]
+        f = src_root / rel
+        text = f.read_text(encoding="utf-8") if f.is_file() else ""
+        if not re.search(anchor, text):
+            fails.append(
+                f"{kind} row `{name}`: anchor /{anchor}/ does not resolve in "
+                f"{rel} — the landed construction moved or rotted (re-derive)"
             )
     return fails
 

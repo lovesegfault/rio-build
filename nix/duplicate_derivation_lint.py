@@ -52,15 +52,24 @@ import sys
 import census_corpora
 import rust_strip
 
+# Landed rows: (state, slot, file, producer-anchor). Flipped at the
+# wave-close --verify-landed (bw12, dfd3afb2b+19); every anchor
+# grep-verified at the composed tree. The frontier producer landed in
+# rio-log-kernel (the CF-2 delegation: CoverageMap::contiguous_prefix_end
+# is the one formula; store + builder consume). The duplicate-formula
+# grammar per producer is the standing extension surface: a second
+# textual derivation of a registered producer's formula reds at the
+# next census growth (the rows make the producers NAMED; the
+# disk-sizing live arm below is the enforcement exemplar).
 R33_ROWS = {
-    "contiguous-durable-frontier": ("pending", "S1", "contiguous_durable_frontier"),
-    "tick-body-bound": ("pending", "S1", "TICK_BODY_BOUND"),
-    "avg-cores": ("pending", "S5", "avg_cores"),
-    "sample-weight": ("pending", "S5", "sample_weight"),
-    "fence-datum": ("pending", "S5", "fence"),
-    "demand-holding": ("pending", "S6", "demand-holding truth source"),
-    "mintable": ("pending", "S6", "mintable"),
-    "wait-envelope": ("pending", "S6", "wait_envelope"),
+    "contiguous-durable-frontier": ("landed", "S1", "rio-log-kernel/src/lib.rs", r"contiguous_prefix_end|contiguous_durable_frontier"),
+    "tick-body-bound": ("landed", "S1", "rio-store/src/logs/sessions.rs", r"TICK_BODY_BOUND"),
+    "avg-cores": ("landed", "S5", "rio-scheduler/src/sla/ingest.rs", r"fn avg_cores"),
+    "sample-weight": ("landed", "S5", "rio-scheduler/src/sla/ingest.rs", r"sample_weight"),
+    "fence-datum": ("landed", "S5", "rio-scheduler/src/sla/cost.rs", r"fence"),
+    "demand-holding": ("landed", "S6", "rio-controller/src/reconcilers/pool/jobs.rs", r"demand_lane|held_job_demand|HeldThreaded"),
+    "mintable": ("landed", "S6", "rio-controller/src/reconcilers/nodeclaim_pool/cover.rs", r"mintable"),
+    "wait-envelope": ("landed", "S6", "rio-controller/src/reconcilers/pool/pod.rs", r"wait_envelope"),
 }
 # The LIVE row (A2 live060-e): the sizing input is peak_disk_bytes;
 # `disk_used_bytes` (node statvfs — the observability gauge) consulted
@@ -215,6 +224,15 @@ def main() -> int:
                     f"R33 row `{name}` still pending:{row[1]} at the landed "
                     f"verify — the wave-close flips it with the producer's "
                     f"formula signature or the close fails"
+                )
+                continue
+            rel, anchor = row[2], row[3]
+            f = src_root / rel
+            text = f.read_text(encoding="utf-8") if f.is_file() else ""
+            if not re.search(anchor, text):
+                fails.append(
+                    f"R33 row `{name}`: producer anchor /{anchor}/ does not "
+                    f"resolve in {rel} — the producer moved or rotted"
                 )
     n_pending = sum(1 for r in R33_ROWS.values() if r[0] == "pending")
     print(
