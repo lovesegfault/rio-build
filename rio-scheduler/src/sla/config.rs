@@ -888,14 +888,26 @@ impl SlaConfig {
     ///   `nodeAffinity{rio.build/kvm}` (`provides ∋ kvm ⟺ labels ∋
     ///   {rio.build/kvm: true}`, helm-test-pinned; pool-static
     ///   nodeSelector deleted r33 bug_002). (mb_012, r34 mb_004)
-    /// - **size** — `(cores, mem) ≤ class_ceilings(h)` ⟺ pod
-    ///   requests ≤ Node allocatable, modulo the catalog-derived
-    ///   1-core kubelet reserve (`derive_ceilings` emits
-    ///   `instance_cores − 1` so the cores half holds against
-    ///   `Capacity − Overhead`, not raw `Capacity`; mem is
-    ///   unmargined — `cap_m = M(c)` is model output, never pinned
-    ///   to the ceiling, so the gap is unhittable). (r29 bug_019,
-    ///   r40 bug_013)
+    /// - **size** — `cores ≤ class_ceilings(h).0 ∧
+    ///   container_mem_bytes(mem) ≤ class_ceilings(h).1` ⟺ pod
+    ///   requests ≤ Node allocatable. The shipped margins, ALL of
+    ///   them (the pre-merged_bug_016 text here claimed "mem is
+    ///   unmargined … never pinned to the ceiling, so the gap is
+    ///   unhittable" — falsified on both halves: the gap was the
+    ///   dead band): cores — the catalog-derived 1-core kubelet
+    ///   reserve (`derive_ceilings` emits `instance_cores − 1`);
+    ///   mem — the ×0.9 allocatable margin (`derive_ceilings`,
+    ///   catalog.rs: kubeReserved + evictionHard + vmMemoryOverhead)
+    ///   on the ceiling side, AND the worker pad + container floor
+    ///   on the demand side via the shared footprint law
+    ///   (`rio_common::footprint::container_mem_bytes` — the
+    ///   constructed quantity this gate compares). mem IS routinely
+    ///   pinned at its cap: the dispatch clamp, the at-cap floor
+    ///   catch-up, and the StaleSolve re-solve all pin at
+    ///   `max_hostable_solve_mem(ceiling)` (the solve-domain cap),
+    ///   so pinned demand renders a container of exactly the
+    ///   ceiling — inside this gate, never in a band above it.
+    ///   (r29 bug_019, r40 bug_013, bughunt-11 merged_bug_016)
     /// - **capacity-type** — `cap ∈ capacity_types_for(h)` ⟺
     ///   `cells_to_selector_terms` writes `nodeAffinity
     ///   {karpenter.sh/capacity-type In [cap]}`. (mb_033)

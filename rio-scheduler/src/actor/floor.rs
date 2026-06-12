@@ -313,7 +313,13 @@ pub(super) fn clamp_floor_to_live(f: &mut crate::state::ResourceFloor, ceil: &Ce
 /// Per-dimension doubling shared by the three resource arms above.
 ///
 /// `base = max(floor, last)` is what was actually dispatched
-/// (`snapshot.rs` clamps `solve` output at `floor.max(...).min(ceil)`).
+/// (`snapshot.rs` clamps `solve` output at `floor.max(...).min(cap)`,
+/// where the mem dimension's cap is [`mem_solve_cap`] — the
+/// solve-domain projection of the global, merged_bug_016 — and the
+/// disk dimension's cap is the raw `ceil.max_disk`; the caps passed
+/// to this fn by [`bump_floor_or_count`] match those dispatch pins
+/// dimension-for-dimension, which is what makes `base ≥ cap` mean
+/// "the dispatched shape cannot grow").
 /// `at_cap` therefore tests `base`, not bare `floor`: when `floor=0`
 /// and `last == cap` (SLA fit predicted ≥ceiling, clamped at dispatch),
 /// the next dispatch is still `cap` — no growth possible — so callers'
