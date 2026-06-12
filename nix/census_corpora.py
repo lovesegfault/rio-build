@@ -132,6 +132,13 @@ REGISTRY = [
     ("cell-emission-wire-injectivity", "rio-scheduler/src/actor/tests/sla_contract.rs", r"w10z_cell_emission_wire_image_injectivity", {"scope"}, set(), r"classify_cell_emission"),
     ("pool-demand-view-consumers", "rio-controller/src/reconcilers/pool/jobs.rs", r"W10-AH census", {"scope"}, set(), r"iter_page"),
     ("leader-edges-census", "rio-scheduler/src/observability.rs", r"Every LEADER_EDGES row is named and total", {"scope"}, set(), r"LEADER_EDGES"),
+    # bw11 S8 (WO-S8-11(i)): the R29 duration census — population
+    # grammar GENERATED from the duration-idiom product (five cells,
+    # one finder-vector plant each; enrolled seed rows are mandatory
+    # finder vectors), rows carry consumer clock + conversion witness
+    # from the closed R29 alphabet; un-rowed constants grandfathered
+    # shrink-only at nix/duration-census-grandfather.txt.
+    ("duration-census", "nix/census_corpora.py", r"DURATION_IDIOM_CELLS", {"scope", "alias"}, set(), r"DURATION_IDIOM_CELLS = \["),
 ]
 
 MODEL_DIVERGENCE = re.compile(
@@ -480,6 +487,159 @@ def scan_wire_secs_seams(files):
     return fails
 
 
+# --- the R29 duration census (WO-S8-11(i)) -----------------------------
+#
+# Every quantitative envelope (TTL, margin, watermark, pin, backoff
+# bound, retention floor) is DENOMINATED IN THE CONSUMER'S EXECUTION
+# DOMAIN — fold executions not wall ticks, durable-progress clocks
+# not occupancy clocks, committed-stamp age not producer cadence,
+# paced beats not pass counts, commit order not value-timestamp order
+# — or carries an explicit CONVERSION WITNESS (R29). This census
+# makes the duty standing: every duration/envelope CONSTANT the
+# finder locates must carry a row naming its consumer clock (from
+# the closed R29 alphabet) and its conversion witness where
+# producer != consumer domain; un-named rows are census-red,
+# grandfathered at mint (nix/duration-census-grandfather.txt,
+# shrink-only — the standing debt visible, never silent).
+#
+# The FINDER's population grammar is itself R22″-derived, never a
+# needle list (the bug_091 shape would otherwise re-mint at this
+# census's birth): the idiom-product table below over the
+# workspace's duration-constant idioms — Duration-ctor consts,
+# bare-integer *_SECS/*_TICKS/*_MILLIS consts, f64 *_SECS consts
+# (SQL-bind AND arithmetic), serde-duration config fields, and
+# Backoff struct-literal envelope consts (rio-common/backoff.rs's
+# documented convention) — one finder-vector plant per idiom cell,
+# and the ENROLLED SEED ROWS double as MANDATORY FINDER VECTORS:
+# the finder must locate every seed by grammar, not special-case.
+DURATION_IDIOM_CELLS = [
+    ("duration-ctor", re.compile(r"\bconst\s+(\w+)\s*:\s*(?:std::time::)?Duration\b")),
+    (
+        "int-units",
+        re.compile(
+            r"\bconst\s+(\w+_(?:SECS|TICKS|MILLIS))\s*:\s*(?:u64|u32|usize|i64|u16|u8)\b"
+        ),
+    ),
+    ("f64-secs", re.compile(r"\bconst\s+(\w+_SECS)\s*:\s*f64\b")),
+    (
+        "config-field",
+        re.compile(r'#\[serde\([^)\]]*duration[^)\]]*\)\]\s*(?:pub(?:\([^)]*\))?\s+)?(\w+)\s*:'),
+    ),
+    ("backoff-struct", re.compile(r"\bconst\s+(\w+)\s*:\s*Backoff\b")),
+]
+
+# The R29 consumer-clock alphabet (closed; a row's clock must START
+# with one of these tokens).
+R29_CLOCKS = (
+    "fold-executions",
+    "durable-progress",
+    "committed-stamp",
+    "beats",
+    "commit-order",
+    "wall",
+)
+
+# Enrolled rows — (file, name) -> (consumer clock, conversion
+# witness; "same-domain" when producer == consumer). Seeds at the
+# t0 tree; the slot WOs landing this wave enroll their new constants
+# at the wave-close tree (H6'''/H1''' name the resolved sets).
+DURATION_CENSUS_ROWS = {
+    ("rio-migrations/src/sql.rs", "SESSION_STALE_AFTER_SECS"): (
+        "wall (PG now() at the make_interval bind)",
+        "WO-S1-6: the certified margin term STALE >= 2*INTERVAL + RPC_BOUND + SLACK",
+    ),
+    ("rio-scheduler/src/sla/cost.rs", "STALE_CLAMP_AFTER_SECS"): (
+        "wall-age against DB epoch stamps (the Epoch family's staleness clamp)",
+        "WO-S6-2: the family decode-boundary seal",
+    ),
+    ("rio-controller/src/reconcilers/nodeclaim_pool/health.rs", "TOMBSTONE_TTL_TICKS"): (
+        "fold-executions (reconciler ticks, not wall time)",
+        "WO-S4-2: the fold-clock conversion shape",
+    ),
+    ("rio-auth/src/hmac.rs", "MAX_HMAC_LIFETIME_SECS"): (
+        "wall (unix-epoch seconds at the signer's own sample)",
+        "WO-S8-6: the post-call re-sample law pin",
+    ),
+}
+DURATION_GRANDFATHER = "nix/duration-census-grandfather.txt"
+
+
+def duration_finder(files):
+    """(rel, name, cell) for every duration-idiom constant/field in
+    `files` (iterable of (rel, raw)); cfg(test) pruned, comments
+    blanked, STRINGS KEPT (the serde attr cell needs them)."""
+    out = []
+    for rel, raw in files:
+        try:
+            pruned = rust_strip.strip_cfg_test(raw, source=rel)
+        except rust_strip.StripError as e:
+            out.append((rel, f"<refused: {e}>", "refusal"))
+            continue
+        text, _ = rust_strip.lex(pruned, blank_string_bodies=False)
+        for cell, rx in DURATION_IDIOM_CELLS:
+            for m in rx.finditer(text):
+                out.append((rel, m.group(1), cell))
+    return out
+
+
+def check_duration_census(src_root, mint=False):
+    files = []
+    for crate_src in sorted(src_root.glob("rio-*/src")):
+        for f in sorted(crate_src.rglob("*.rs")):
+            rel = str(f.relative_to(src_root))
+            if "/tests/" in rel or rel.endswith("test_helpers.rs"):
+                continue
+            files.append((rel, f.read_text()))
+    found = duration_finder(files)
+    fails = []
+    refusals = [(r, n) for r, n, c in found if c == "refusal"]
+    for r, n in refusals:
+        fails.append(f"{r}: duration finder refused: {n}")
+    found_keys = {(r, n) for r, n, c in found if c != "refusal"}
+    # Row validation: clock from the closed alphabet; row resolves in
+    # the live population (rot otherwise); seeds are MANDATORY finder
+    # vectors — a seed the grammar cannot locate is a finder red.
+    for (rel, name), (clock, witness) in sorted(DURATION_CENSUS_ROWS.items()):
+        if not any(clock.startswith(c) for c in R29_CLOCKS):
+            fails.append(
+                f"duration census row {rel}:{name}: clock `{clock}` outside the "
+                f"closed R29 alphabet {R29_CLOCKS}"
+            )
+        if (rel, name) not in found_keys:
+            fails.append(
+                f"duration census row {rel}:{name}: NOT located by the finder "
+                f"grammar — seed rows are mandatory finder vectors (rot or a "
+                f"finder hole; never special-case the seed)"
+            )
+        if not witness.strip():
+            fails.append(f"duration census row {rel}:{name}: empty conversion witness")
+    gf_path = src_root / DURATION_GRANDFATHER
+    unrowed = sorted(
+        f"{rel}\t{name}" for (rel, name) in found_keys if (rel, name) not in DURATION_CENSUS_ROWS
+    )
+    if mint:
+        gf_path.write_text("".join(k + "\n" for k in unrowed))
+        return [f"minted {len(unrowed)} duration-census grandfather entries"]
+    grandfathered = set()
+    if gf_path.is_file():
+        grandfathered = {x for x in gf_path.read_text().splitlines() if x.strip()}
+    for k in unrowed:
+        if k not in grandfathered:
+            rel, name = k.split("\t")
+            fails.append(
+                f"{rel}: duration constant `{name}` has no census row — name its "
+                f"consumer clock ({'/'.join(R29_CLOCKS)}) and conversion witness "
+                f"in DURATION_CENSUS_ROWS (R29)"
+            )
+    for stale in sorted(grandfathered - set(unrowed)):
+        fails.append(
+            f"{stale.split(chr(9))[0]}: stale duration-census grandfather entry "
+            f"({stale.split(chr(9))[1]} was enrolled, renamed, or removed) — "
+            f"remove it from {DURATION_GRANDFATHER} (shrink-only)"
+        )
+    return fails
+
+
 # --- the retired-knob-phrase arm (WO-S8-9, merged_bug_055) -------------
 #
 # store_pool_cpu_limit's three doc tiers (deploy.rs fn doc, the
@@ -567,7 +727,10 @@ REFUSAL_SCAN_CRATES = ["rio-builder", "rio-store", "rio-gateway", "rio-scheduler
 
 
 def main() -> int:
-    src_root = pathlib.Path(sys.argv[1])
+    args = [a for a in sys.argv[1:]]
+    mint_duration = "--mint-duration-grandfather" in args
+    args = [a for a in args if a != "--mint-duration-grandfather"]
+    src_root = pathlib.Path(args[0])
 
     # A broken shared lexer fails closed before any scan may gate.
     lexer_err = rust_strip.selftest()
@@ -780,6 +943,42 @@ def main() -> int:
         if len(f_k) != 1 or "retired knob phrase" not in f_k[0]:
             print(f"FAIL: the retired-knob-phrase plant did not red: {f_k}", file=sys.stderr)
             return 1
+    # --- the R29 duration census plants (WO-S8-11(i)) -----------------
+    # One finder-vector per idiom cell (the leniency plants: every
+    # population-grammar cell demonstrably catches its form).
+    cell_vectors = {
+        "duration-ctor": "pub const POLL: Duration = Duration::from_secs(5);\n",
+        "int-units": "const RETRY_TTL_TICKS: u32 = 7;\n",
+        "f64-secs": "pub(crate) const DRAIN_SECS: f64 = 1.5;\n",
+        "config-field": '#[serde(with = "duration_secs")]\n    pub poll_interval: Duration,\n',
+        "backoff-struct": "const PUSH_BACKOFF: Backoff = Backoff { base_ms: 50, cap_ms: 1000 };\n",
+    }
+    for cell, _rx in DURATION_IDIOM_CELLS:
+        got = duration_finder([("planted/cell.rs", cell_vectors[cell])])
+        if len(got) != 1 or got[0][2] != cell:
+            print(
+                f"FAIL: duration-census finder vector for cell `{cell}` not located: {got}",
+                file=sys.stderr,
+            )
+            return 1
+    # … a cfg(test)-gated constant stays OUT of the census population.
+    gated = "#[cfg(test)]\nconst FAKE_TTL_SECS: u64 = 1;\nfn live() {}\n"
+    if duration_finder([("planted/gated.rs", gated)]):
+        print("FAIL: a cfg(test) duration const entered the census population", file=sys.stderr)
+        return 1
+    # The strawman violating row: an unrowed, ungrandfathered constant
+    # is a named census red (the new-census plant).
+    with tempfile.TemporaryDirectory() as td:
+        straw_root = pathlib.Path(td)
+        (straw_root / "rio-straw" / "src").mkdir(parents=True)
+        (straw_root / "rio-straw" / "src" / "lib.rs").write_text(
+            "pub const ORPHAN_WINDOW_SECS: u64 = 30;\n"
+        )
+        f_d = check_duration_census(straw_root)
+        named = [x for x in f_d if "ORPHAN_WINDOW_SECS" in x and "no census row" in x]
+        if len(named) != 1:
+            print(f"FAIL: the unrowed duration const did not red: {f_d}", file=sys.stderr)
+            return 1
     # Arm F-allow: the allow grammar admits a documented exception.
     allowed_ws = "// wire-secs-census: allow(test fixture builds its own clock)\n" + WIRE_SECS_GRAMMAR[0][1]
     if scan_wire_secs_seams([("planted/allowed.rs", allowed_ws)]):
@@ -852,6 +1051,12 @@ def main() -> int:
     fails += scan_retention_notes(src_root)
     # The retired-knob-phrase belt (WO-S8-9, merged_bug_055).
     fails += scan_retired_knob_phrases(src_root)
+    # The R29 duration census (WO-S8-11(i)).
+    if mint_duration:
+        for line in check_duration_census(src_root, mint=True):
+            print(line)
+        return 0
+    fails += check_duration_census(src_root)
 
     gaps = sorted(f"{name}:{ax}" for name, _, _, _, g, _ in REGISTRY for ax in g)
     derived = sum(1 for *_, d in REGISTRY if d is not None)
@@ -860,7 +1065,8 @@ def main() -> int:
         f"production anchors; every zero-gap row derived), axes {sorted(AXES)} all exercised, "
         f"{len(gaps)} grandfathered axis gaps (burn-down: {', '.join(gaps)}), "
         f"{md_count} MODEL-DIVERGENCE headers grammar-checked, "
-        f"{len(refusal_files)} files swept by the negative refusal census and the wire-secs pacing-seam census"
+        f"{len(refusal_files)} files swept by the negative refusal census and the wire-secs pacing-seam census, "
+        f"duration census {len(DURATION_CENSUS_ROWS)} rows enrolled"
     )
     if fails:
         print("FAIL: census-corpora violations —", file=sys.stderr)
