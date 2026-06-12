@@ -132,7 +132,7 @@ pub(super) fn replica_capacity_status(msg: &'static str) -> Status {
 /// The execution's durable log account, measured on BOTH algebras of
 /// the caps law (merged_bug_002): the MERGED COVERAGE projection
 /// (idempotent union — what an honest retry may re-send without
-/// double-charge) and the RAW MONOTONE totals (Σ over ALL committed
+/// double-charge) and the RAW MONOTONE totals (Σ over all committed
 /// rows — what was actually durably written; no reconnect, replay, or
 /// dedup ever decreases them). The two quantities have opposite
 /// algebras, and a containment budget for an untrusted at-least-once
@@ -146,10 +146,10 @@ pub struct LogSeed {
     /// Committed chunk count over merged coverage — one survivor per
     /// covered interval.
     pub merged_chunks: u32,
-    /// Accounted bytes over ALL rows (monotone sum): every durable
+    /// Accounted bytes over all rows (monotone sum): every durable
     /// write counts, duplicates included.
     pub raw_bytes: u64,
-    /// Manifest row count over ALL rows (monotone sum) — the durable
+    /// Manifest row count over all rows (monotone sum) — the durable
     /// object-count quantity the chunk ceiling bounds.
     pub raw_rows: u64,
 }
@@ -438,7 +438,7 @@ pub(super) async fn finish_open(
     // honest retry's re-send of committed content is never
     // double-charged (forgiveness — merged_bug_207's "a reconnect can
     // never reset either cap" lives on this axis), and the RAW
-    // monotone totals (Σ over ALL committed rows) bound total durable
+    // monotone totals (Σ over all committed rows) bound total durable
     // writes per execution at REPLAY_ALLOWANCE× the caps (containment
     // — the merged projection structurally cannot bound a writer that
     // controls duplication: identical-interval replays witness zero
@@ -480,7 +480,7 @@ pub(super) async fn finish_open(
     // duplication: identical-interval replay rows witness zero there
     // while every cycle durably mints new objects and manifest rows.
     // These two arms bound the MONOTONE quantities (Σ raw
-    // accounted_bytes, raw row count over ALL committed rows), which no
+    // accounted_bytes, raw row count over all committed rows), which no
     // reconnect resets BY ALGEBRA: cycle-cumulative containment on both
     // cap quantities. Same permanent class as the merged trips — the
     // ceiling travels with the execution. `saturating_mul`: a test-tier
@@ -514,7 +514,7 @@ pub(super) async fn finish_open(
     }
 
     // The durable covered ranges, for the session's covered-replay
-    // consult. A plain ordered scan, no anti-join: the union over ALL
+    // consult. A plain ordered scan, no anti-join: the union over all
     // rows equals the union over merged survivors (pruned rows are
     // contained), so normalization is the kernel's job. Bounded by the
     // raw row ceiling that just admitted this open.
@@ -1434,7 +1434,7 @@ mod tests {
     }
 
     /// The execution's raw durable account, straight off the manifest:
-    /// `(rows, accounted-byte sum)` over ALL `drv_log_chunks` rows —
+    /// `(rows, accounted-byte sum)` over all `drv_log_chunks` rows —
     /// the monotone quantity the ceiling law bounds.
     async fn raw_account(pool: &PgPool, exec: Uuid) -> (i64, i64) {
         sqlx::query_as(
@@ -1451,7 +1451,7 @@ mod tests {
     /// accounted bytes per execution ≤ REPLAY_ALLOWANCE ×
     /// per_exec_byte_cap under adversarial replay** — cumulative across
     /// reconnect cycles, the law's own quantifier; the asserted
-    /// quantity IS the frozen measure (Σ raw accounted_bytes over ALL
+    /// quantity IS the frozen measure (Σ raw accounted_bytes over all
     /// rows; object-count growth is the sibling chunk quantity, owned
     /// by W11-A2). Born red against the pre-ceiling tree on the
     /// identical-interval orbit (12288 raw bytes across 6 cycles with
@@ -1828,7 +1828,7 @@ mod tests {
     /// `FAILED_PRECONDITION` cap below the true cap, abandoning the
     /// tail. Population includes the STRADDLING-CHUNK cell (the
     /// cross-WO composition pin against WO-S1-1's frozen measure): the
-    /// stored chunk and its accounted bytes contain ONLY
+    /// stored chunk and its accounted bytes contain only
     /// above-watermark lines — bytes durably written == bytes raw
     /// charged, never written-but-uncharged.
     #[tokio::test]
@@ -1921,7 +1921,7 @@ mod tests {
         );
 
         // The straddling-chunk composition cell: the stored chunk holds
-        // ONLY the above-watermark lines and charges exactly them.
+        // only the above-watermark lines and charges exactly them.
         let (first_line, line_count, accounted): (i64, i64, i64) = sqlx::query_as(
             "SELECT first_line, line_count, accounted_bytes FROM drv_log_chunks \
              WHERE exec_id = $1 ORDER BY first_line DESC LIMIT 1",

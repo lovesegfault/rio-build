@@ -70,7 +70,6 @@ docs/spec/components/store.typ	MUST outlive every log artifact keyed on it, unde
 docs/spec/components/store.typ	NEVER stall-reclaimable --- they stay under the heartbeat-death rule
 docs/spec/components/store.typ	ONLY constructor of per-path progress callbacks. The floor is
 docs/spec/components/store.typ	Sweep MUST, before deleting each candidate path Q, re-check ALL
-docs/spec/components/store.typ	The store's log TTL sweep owns log artifacts ONLY: it deletes
 docs/spec/components/store.typ	WHERE blake3_hash = ANY($1)`, `INSERT ... ON CONFLICT` with UNNEST over hash
 docs/spec/components/store.typ	acquires row locks in ANY()/UNNEST scan order; unsorted overlapping sets
 docs/spec/components/store.typ	axes, ALL bound: *time* --- the hold envelope armed at grant
@@ -1507,7 +1506,6 @@ rio-store/src/logs/service.rs	// for ANY subscriber, so a burst-end drop is back
 rio-store/src/logs/service.rs	/// One chunk cut, watchdog-bounded at one cut interval — the ONLY
 rio-store/src/logs/service.rs	/// byte-cap rejection is accept()'s ONLY `Err` construction. The
 rio-store/src/logs/service.rs	/// never retransmits), so the tail of EVERY cap-crossing log was
-rio-store/src/logs/sessions.rs	// The cadence path's ONLY await, bounded by the
 rio-store/src/logs/sessions.rs	// dedicated heartbeat task is the ONLY task on the cadence path, and
 rio-store/src/logs/sweep.rs	/// Executions per batch. Each batch is one indexed SELECT, two `= ANY`
 rio-store/src/logs/sweep.rs	/// log artifacts ONLY — chunks, objects, stale session rows.

@@ -1188,6 +1188,7 @@ pub fn bounded_contiguous_prefix_len(
 /// tiebreak key (the uuid mapped to its big-endian `u128`, which orders
 /// exactly like PostgreSQL's uuid comparison).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 pub struct AccountRow {
     /// First covered line.
     pub first_line: u64,
@@ -1222,10 +1223,10 @@ pub struct LogAccount {
     /// Row count over MERGED coverage — one survivor per covered
     /// interval.
     pub merged_chunks: u64,
-    /// Accounted bytes over ALL rows — monotone sum: every committed
+    /// Accounted bytes over all rows — monotone sum: every committed
     /// row adds, forever.
     pub raw_bytes: u64,
-    /// Row count over ALL rows — monotone sum.
+    /// Row count over all rows — monotone sum.
     pub raw_rows: u64,
 }
 
@@ -1271,7 +1272,7 @@ pub fn log_account(rows: &[AccountRow]) -> LogAccount {
 
 /// The execution's durable covered line ranges, normalized: sorted,
 /// disjoint, adjacent-merged half-open spans. Built from the raw
-/// manifest intervals at stream open (the union over ALL rows equals
+/// manifest intervals at stream open (the union over all rows equals
 /// the union over merged-surviving rows — pruned rows are contained —
 /// so the builder needs no dedup query).
 ///
@@ -1846,7 +1847,7 @@ mod proofs {
     }
 
     /// W11-C, raw half (merged_bug_002): **replay cannot decrease
-    /// raw_bytes OR raw_rows** — appending ANY row to the account adds
+    /// raw_bytes OR raw_rows** — appending any row to the account adds
     /// exactly its bytes and exactly one row to the raw pair, for every
     /// base set. The monotone-sum algebra of the containment axis, on
     /// both cap quantities, over a bounded base (3 rows exercises

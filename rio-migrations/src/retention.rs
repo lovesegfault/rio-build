@@ -179,7 +179,7 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
         "drv_executions",
         RetentionPolicy::SweptBy {
             symbol: "gc_exec_rows",
-            note: "the scheduler's execution-row GC — store.log.sweep-ownership+1 \
+            note: "the scheduler's execution-row GC — store.log.sweep-ownership+2 \
                    FORBIDS the store's log TTL sweep from touching these rows \
                    (the prior row credited exactly that sweep); six-conjunct \
                    eligibility incl. artifact-before-row + the close-stamp \

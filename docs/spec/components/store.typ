@@ -2283,7 +2283,7 @@ be the only measure (the rule below).
   Every durable log write MUST be charged against a monotone
   per-execution ceiling that no reconnect resets: the `AppendLog` open
   gate MUST refuse an execution whose raw durable totals --- accounted
-  bytes, and manifest rows, each summed over ALL committed chunk rows
+  bytes, and manifest rows, each summed over all committed chunk rows
   --- have reached the documented replay allowance times the
   corresponding per-execution cap, with the same permanent rejection
   class as the cap trips. Both quantities MUST carry the ceiling: bytes
@@ -2599,7 +2599,7 @@ memory, and without the monotone gate it could corrupt the manifest's line
 arithmetic for its own execution.
 
 #r("store.log.sweep-ownership+2")[
-  The store's log TTL sweep owns log artifacts ONLY, and its victims
+  The store's log TTL sweep owns log artifacts only, and its victims
   carry their exclusions structurally: it deletes `drv_log_chunks`
   rows, their backing objects, and dead `log_ingest_sessions` rows for
   executions past `log_retention_days` that are TERMINAL and have no

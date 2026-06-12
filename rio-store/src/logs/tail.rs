@@ -1481,7 +1481,7 @@ mod tests {
     /// afterwards made covers-now ∧ cursor-reached stamp
     /// `is_complete = true` over lines this reader never received —
     /// silent omission stamped complete. W11-J rides as the honest
-    /// cell: a gap-free walk over the SAME (now complete) manifest
+    /// cell: a gap-free walk over the same (now complete) manifest
     /// still stamps `complete = true` — the bit is not a blanket
     /// downgrade.
     // r[verify store.log.final-served]

@@ -676,7 +676,7 @@ impl LogService for LogServiceImpl {
         // (its lease was stolen by `acquire`'s same-pod arm, or it is
         // mid-teardown) may still hold the registry slot; the
         // ownership-witnessed insert replaces it and cancels its
-        // driver ONLY when the row says we own the lease (bug_010 —
+        // driver only when the row says we own the lease (bug_010 —
         // the awaited acquire above and this insert can invert order
         // across two concurrent same-pod opens; the later PG acquirer
         // owns the row regardless of who registers first).
