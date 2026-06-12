@@ -93,7 +93,7 @@ pub const SESSION_MARGIN_SLACK: Duration = Duration::from_secs(3);
 pub const HEARTBEAT_ATTEMPTS: u32 = 2;
 
 /// The fast-retry window (merged_bug_017): a failed first attempt is
-/// retried ONLY if it returned within this budget, so the tick body
+/// retried ONLY if it returned within this budget — quantifier: census(test: retry_policy_and_the_old_schedule_red) — so the tick body
 /// is bounded by [`TICK_BODY_BOUND`] = FAST_RETRY_BUDGET +
 /// HEARTBEAT_RPC_BOUND by construction — never by attempt counting
 /// alone (an error arriving just under the RPC bound costs as much
@@ -136,7 +136,7 @@ pub const fn worst_one_miss_committed_age() -> Duration {
 // lookup_live, the scheduler's gc conjunct) evaluates it — not about
 // the producer's tick cadence. The worst committed age is the
 // SCHEDULE-DERIVED `worst_one_miss_committed_age()` (2I + F + R),
-// valid only while a tick body can never displace its successor —
+// valid only while a tick body can never displace its successor — quantifier: census(test: margin_law_rejects_both_collapse_shapes) —
 // the second assert pins that structural premise. (The wave-11
 // two-attempt retry broke the predecessor certificate exactly there:
 // a fully-hung tick occupied 2×RPC_BOUND > INTERVAL, displaced the
@@ -179,7 +179,7 @@ pub const HEARTBEAT_RPC_BOUND: Duration = Duration::from_secs(10);
 
 // The liveness cadence's construction-grade bound (bug_148; priced
 // from the ONE tick-body quantity per merged_bug_019): the dedicated
-// heartbeat task is the ONLY task on the cadence path, and its tick
+// heartbeat task is the ONLY task on the cadence path — quantifier: census(test: drive_loop_liveness_census) — and its tick
 // body is bounded by TICK_BODY_BOUND — a fully-failed tick (hung, or
 // fast-error-then-bounded-retry) delays the next beat attempt by at
 // most that envelope, so the inter-beat gap stays within
@@ -581,7 +581,7 @@ pub(crate) fn spawn_heartbeat_with(
 /// only inside [`FAST_RETRY_BUDGET`] (so the body stays inside
 /// [`TICK_BODY_BOUND`]); the attempt count caps at
 /// [`HEARTBEAT_ATTEMPTS`]. One pure fn so the loop, the certificate's
-/// derivation, and the test cells consume the SAME policy.
+/// derivation, and the test cells consume the same policy.
 fn may_retry(last_was_timeout: bool, tick_elapsed: Duration, attempts_used: u32) -> bool {
     !last_was_timeout && tick_elapsed <= FAST_RETRY_BUDGET && attempts_used < HEARTBEAT_ATTEMPTS
 }
@@ -998,7 +998,7 @@ mod tests {
     /// recorded red, at the constants: the old join bound
     /// (HEARTBEAT_RPC_BOUND = 10 s) is STRICTLY BELOW the lawful
     /// in-flight stretch (TICK_BODY_BOUND = 12 s) — asserted here as
-    /// the strawman so the relation can never silently invert again.
+    /// the strawman so the relation can never silently invert again — quantifier: census(test: stop_is_prompt_during_a_hung_attempt).
     /// Post-fix: the join imports THE one tick-body const, and the
     /// in-body stop select makes teardown prompt by construction —
     /// `stop()` during a PG-parked (hung) beat returns within a poll

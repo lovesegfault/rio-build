@@ -833,7 +833,7 @@ impl IngestSession {
         // before accounting, buffering, or fan-out. The ack is the
         // batch's last line CLAMPED to the contiguous durable frontier
         // (merged_bug_005): this arm sits post-floor and post-monotone,
-        // so it is reachable ONLY when the covering span lies past a
+        // so it is reachable only when the covering span lies past a
         // hole in the prefix — exactly the states where the batch's
         // own end is a hole-spanning prefix claim that would trim the
         // builder's only copy of the hole-filling lines.
@@ -2315,7 +2315,7 @@ mod tests {
     // r[verify store.log.frontier-denominated]
     /// W12-A (merged_bug_005, red-first): no ack may exceed the
     /// contiguous durable frontier. The covered-replay consult is
-    /// reachable ONLY in holey-map states (a single contiguous prefix
+    /// reachable only in holey-map states (a single contiguous prefix
     /// makes post-floor containment impossible), so its entire live
     /// input domain is the population of this test: coverage
     /// `{[0,5), [10,20)}` (hole at `[5,10)`), replay of `[10,15)` —

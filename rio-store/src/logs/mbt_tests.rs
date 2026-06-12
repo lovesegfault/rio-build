@@ -881,7 +881,7 @@ impl MbtSystem {
     /// executes it; the phase half stays driver bookkeeping.
     ///
     /// THE RELEASE LAW'S POPULATION (merged_bug_010,
-    /// `store.log.release-totality`): "released on every path except
+    /// `store.log.release-totality` — quantifier: census(test: open_phase_failures_release_the_lease_row)): "released on every path except
     /// a stolen lease" quantifies over every path AFTER A SUCCESSFUL
     /// ACQUIRE — not only the driver's `LoopExit` alphabet this
     /// mirror walks. The OPEN-PHASE family (acquire .. driver spawn:

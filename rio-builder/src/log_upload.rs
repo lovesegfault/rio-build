@@ -608,7 +608,7 @@ enum OpenFailure {
 
 /// A store-witnessed contiguous-prefix durability claim
 /// (merged_bug_005): the wrapped line number asserts every line
-/// at-or-below it is durably stored. The ONLY lawful mints are the
+/// at-or-below it is durably stored. The ONLY lawful mints — quantifier: census(test: retransmit_buffer_destructive_exits_are_typed_discharges) — are the
 /// ack-borne values in the drive loop (`durable_through_line`, or the
 /// open-time watermark minus one) — the type is what keeps the
 /// retransmit buffer's destructive discharge
@@ -1043,7 +1043,7 @@ impl UploadTask {
     /// number of frames popped.
     ///
     /// THE TYPED DISCHARGE (merged_bug_005, R32): the retransmit
-    /// buffer is the builder's ONLY copy of un-acked lines — a linear
+    /// buffer is the builder's ONLY copy — quantifier: census(test: retransmit_buffer_destructive_exits_are_typed_discharges) — of un-acked lines: a linear
     /// resource whose destructive exits are exactly this method (the
     /// ack-driven prefix discharge) and `reject_permanently` (the
     /// disclosed-loss refusal). The argument is the witnessed

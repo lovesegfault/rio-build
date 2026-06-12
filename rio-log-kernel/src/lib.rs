@@ -1368,7 +1368,7 @@ impl CoverageMap {
 
     // r[impl store.log.frontier-denominated]
     /// THE producer of durable-ack values (merged_bug_005): the
-    /// highest line `v` such that EVERY line `<= v` is durably
+    /// highest line `v` such that EVERY line `<= v` — quantifier: census(test: frontier_satisfies_the_prefix_measure) — is durably
     /// covered, or `None` when line 0 is not covered (no value is a
     /// true prefix claim then — the producer refuses rather than
     /// rounding).

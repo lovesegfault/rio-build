@@ -1907,7 +1907,6 @@ rio-store/src/logs/service.rs	// guard, not a post-`drive` statement: a panic an
 rio-store/src/logs/service.rs	/// One chunk cut, watchdog-bounded at one cut interval — the ONLY
 rio-store/src/logs/service.rs	/// byte-cap rejection is accept()'s ONLY `Err` construction. The
 rio-store/src/logs/service.rs	/// never retransmits), so the tail of EVERY cap-crossing log was
-rio-store/src/logs/sessions.rs	// dedicated heartbeat task is the ONLY task on the cadence path, and
 rio-store/src/logs/sessions.rs	/// Where is `exec_id`'s live ingest stream, if anywhere?
 rio-store/src/logs/sweep.rs	// its totality; the clearance param lands on the gc-plane sinks).
 rio-store/src/logs/sweep.rs	/// Executions per batch. Each batch is one indexed SELECT, two `= ANY`

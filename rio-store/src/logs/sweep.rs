@@ -151,7 +151,7 @@ pub async fn sweep_expired_logs(
         // drv_executions — a session admitted between the candidate
         // SELECT and this statement (the just-admitted late replay)
         // would otherwise lose the chunk rows its gate just read as
-        // durable. The predicate is the SAME shared fragment the
+        // durable. The predicate is the same shared fragment the
         // SELECT used (one definition, repeated per statement — the
         // sibling sweep_stale_sessions' house discipline).
         let chunk_delete = format!(

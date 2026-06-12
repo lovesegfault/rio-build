@@ -524,7 +524,7 @@ async fn fsync_dir(dir: &std::path::Path) -> std::io::Result<()> {
 /// Synchronous twin of [`fsync_dir`] for construction-time use
 /// (`new()` is sync): same recorder, same semantics. `pub(crate)` so
 /// the CAS backend's construction (`crate::backend`) discharges its
-/// base case through the SAME recorded chokepoint instead of minting
+/// base case through the same recorded chokepoint instead of minting
 /// a second unwitnessed fsync path.
 pub(crate) fn fsync_dir_sync(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(test)]
@@ -544,7 +544,7 @@ pub(crate) mod fsync_recorder {
         LOG.lock().unwrap().push(dir.to_path_buf());
     }
 
-    /// EVERY recorded dir fsync, in call order — the LAW'S domain
+    /// Every recorded dir fsync, in call order — the law's domain
     /// (merged_bug_033): the chain law obligates fsyncs up to and
     /// including the deepest pre-existing directory, which sits
     /// OUTSIDE the store root, so a witness scoped `under(root)` is

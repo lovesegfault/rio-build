@@ -572,7 +572,15 @@ DURATION_CENSUS_ROWS = {
     ),
     ("rio-store/src/logs/sessions.rs", "SESSION_MARGIN_SLACK"): (
         "wall (the session-staleness margin term over PG now() age)",
-        "WO-S1-6 (the H1''' const family): compile-certified STALE >= 2*INTERVAL + RPC_BOUND + SLACK, SLACK > 0",
+        "bw12 WO-S1-4 (re-derived from the bw11 H1''' family): compile-certified STALE >= worst_one_miss_committed_age() + SLACK, SLACK > 0",
+    ),
+    ("rio-store/src/logs/sessions.rs", "FAST_RETRY_BUDGET"): (
+        "beats (the tick body's own monotonic elapsed - tick_started per tick; the may_retry policy clock)",
+        "bw12 WO-S1-4: the W12-F policy cells (timeout terminal, fast-error window, attempt cap) + the envelope identity FAST_RETRY_BUDGET + HEARTBEAT_RPC_BOUND == TICK_BODY_BOUND",
+    ),
+    ("rio-store/src/logs/sessions.rs", "TICK_BODY_BOUND"): (
+        "beats (the tick-body envelope over the beat task's monotonic clock; one producer, R33)",
+        "bw12 WO-S1-4/-5: compile-certified TICK_BODY_BOUND <= INTERVAL (never-displace) and <= STALE - INTERVAL; imported by the margin formula, the stop() join, and the narration",
     ),
     ("rio-store/src/config.rs", "SCHEDULER_DEADLINE_CAP_SECS"): (
         "wall (the retention-floor validation against the scheduler deadline cap)",
@@ -715,6 +723,14 @@ EXIT_EDGE_GRANDFATHER = "nix/exit-edge-grandfather.txt"
 # integrator enrolls them at the wave-close re-mint from the H-pack
 # records (H3'''/H5'''/H7''' name the landed shapes).
 EXIT_EDGE_ROWS = {
+    # The heartbeat fast-retry budget (bw12 WO-S1-4): a per-tick
+    # window, not a cross-tick latch - the budget re-arms at every
+    # interval tick (tick_started re-stamped), so an exhausted window
+    # is exited by the very next tick of the cadence loop.
+    ("rio-store/src/logs/sessions.rs", "const-family", "FAST_RETRY_BUDGET"): (
+        "per-tick re-arm: tick_started re-stamps at every interval tick, so the retry window cannot absorb across ticks (the cadence loop is the reset event)",
+        "W12-F policy cells + heartbeat_task_beats_on_its_own_cadence (beats keep landing) + the never-displace compile assert (the next tick exists)",
+    ),
     # The gave-up decay (WO-S7-1, the H7''' record): GaveUpReset
     # receipt minted only by PoolStreaks::note_demand_epoch; exit
     # edge = strictly-newer SpawnIntent.resubmit_cycle at the

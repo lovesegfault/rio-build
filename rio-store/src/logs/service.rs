@@ -388,7 +388,7 @@ async fn register_ingest_owner(
 /// receives another line and is never dropped — every future
 /// `TailLog` follower would hang on it. Driver liveness is the
 /// entry's cancel token: the driver's deregister guard cancels it on
-/// EVERY exit (panic included), and a successful displacer cancels it
+/// every exit (panic included), and a successful displacer cancels it
 /// too — either way a cancelled token means "do not resurrect".
 fn restore_displaced(
     registry: &DashMap<Uuid, IngestEntry>,
@@ -419,7 +419,7 @@ fn restore_displaced(
 
 /// The lease-release obligation, made LINEAR (merged_bug_010, R32 —
 /// `sys.obligation.linear-discharge`): minted the moment
-/// `sessions::acquire` reports `Acquired`, disarmed ONLY by handing
+/// `sessions::acquire` reports `Acquired`, disarmed only by handing
 /// the session to the driver task that owns teardown
 /// ([`AppendDriver::run`]'s release). Every fallible await between
 /// the acquire and the spawn — the ownership witness, plus any path
@@ -819,7 +819,7 @@ impl LogService for LogServiceImpl {
         }
 
         // The release obligation is minted HERE, at the Acquired
-        // observation (merged_bug_010, store.log.release-totality):
+        // observation (merged_bug_010, the linear release law):
         // every fallible await below — the ownership witness, plus
         // cancellation of this whole handler future — releases the
         // just-acquired row via the guard's Drop until the driver
@@ -871,7 +871,7 @@ impl LogService for LogServiceImpl {
         };
         // The handoff discharge: from here the spawned driver owns the
         // teardown release on every LoopExit (the guard's only lawful
-        // disarm — store.log.release-totality).
+        // disarm under the linear release law).
         release_guard.disarm_into_driver();
         // Detached task: it exits when the inbound stream ends (client
         // half-close, disconnect, or transport error) or when the
@@ -1678,7 +1678,7 @@ impl AppendDriver {
                     // evidence the abort decision must see. Bounded
                     // (the gate needs one fresh arrival, not a full
                     // catch-up; the next loop iteration keeps reading),
-                    // and each drained frame runs the SAME handler the
+                    // and each drained frame runs the same handler the
                     // inbound arm runs, exits included.
                     // r[impl store.log.arrival-clock]
                     let mut drained = 0u32;
@@ -3493,7 +3493,7 @@ mod tests {
     /// handler's order).
     async fn timeout_pool(db: &TestDb) -> PgPool {
         // `SET` on a pooled connection binds only THAT connection; the
-        // injector needs the timeout on EVERY connection, so it builds
+        // injector needs the timeout on every connection, so it builds
         // its own single-connection pool over the live pool's own
         // connect options with an `after_connect` hook.
         let opts = (*db.pool.connect_options()).clone();

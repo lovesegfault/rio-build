@@ -32,7 +32,7 @@
 //!   crate-side by `frontier_satisfies_the_prefix_measure` (W12-C)
 //!   and builder-side by the commit-3 trim-arm witness. The
 //!   workspace-UNION completeness face ("every consult site across
-//!   ALL crates") is NOT discharged here: it lands at the same-wave
+//!   all crates") is NOT discharged here: it lands at the same-wave
 //!   S8 registry union row, which re-runs this grammar over the
 //!   staged workspace (the in-crate face enforces from this commit).
 //! - the mbt mirror's `acked_below` (test half): assumes a prefix
@@ -324,7 +324,7 @@ mod tests {
 
     /// W12-C2 (the enrollment/completeness plant): an in-grammar but
     /// UNTAGGED carrier construction appended to a copy of the
-    /// universe must red the census — driven through the SAME walk
+    /// universe must red the census — driven through the same walk
     /// path as production (the empty-walk face rides the non-vacuity
     /// floor above).
     #[test]
@@ -365,7 +365,7 @@ mod tests {
 
     /// The jurisdiction plant (in-slot auto-join half): a carrier
     /// site in a module the census previously had no member for
-    /// (sweep.rs is member-free today) is picked up by the SAME live
+    /// (sweep.rs is member-free today) is picked up by the same live
     /// walk — presence in the fresh walk is the oracle; the
     /// registry-diff half binds at the S8 union row.
     #[test]
