@@ -176,7 +176,7 @@ grep -qx 'zzCommentOnlyB' "$T/unconsumed-red3" || {
   exit 1
 }
 
-# ── planted RED 4 (WO-S8-13/bug_169): a SAME-FILE rebind of one $var
+# ── planted RED 4 (WO-S8-13/bug_169): a same-file rebind of one $var
 # to a different .Values subtree must REFUSE, never silently bless
 # the dead twin through a both-subtree join ──
 red4=$TMPDIR/chart-169-samefile

@@ -166,7 +166,6 @@ infra/helm/rio-build/values.yaml	# Bucket-level prefix prepended to ALL rio keys
 infra/helm/rio-build/values.yaml	# Chart default: the MAX_NAR_SIZE floor (4 GiB — one whole-NAR
 infra/helm/rio-build/values.yaml	# Control plane + store drop to restricted — runAsNonRoot, drop-ALL,
 infra/helm/rio-build/values.yaml	# NEVER commit a real value — set via --set or values override file.
-infra/helm/rio-build/values.yaml	# ORDER-PIN (live_057-c): this flip is valid ONLY in a tree where
 infra/helm/rio-build/values.yaml	# SHAPING-ONLY levers (n bounds claimed jobs, F bounds per-job
 infra/helm/rio-build/values.yaml	# Used ONLY when existingSecret is unset (VM tests — airgapped,
 infra/helm/rio-build/values.yaml	# anywhere requests fit). nix/tests/helm/46-store-memory-identity.sh

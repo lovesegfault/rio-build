@@ -203,7 +203,7 @@ def collect_defined(spec_root: Path):
 # Locations tracey's scanner DOES read: PARSED from
 # .config/tracey/config.styx include/test_include/exclude at startup
 # (WO-S8-10, merged_bug_159 — R33 list-mirrors-list: the former
-# hand-abridged suffix approximation treated ALL .rs/.ts as
+# hand-abridged suffix approximation treated all .rs/.ts as
 # tracey-scanned, so an enrollment omission was structurally
 # unvalidatable — post-bump staleness invisible to every validator,
 # coverage greenness masked by duplicate impls in scanned crates;
@@ -228,7 +228,12 @@ def _styx_patterns(styx_text: str):
     inc, exc = [], []
     bucket = None
     for raw in styx_text.splitlines():
-        line = raw.split("//")[0].strip()
+        # Comment tail: `//` at line start or after whitespace only —
+        # a bare interior `//` is content (the source_url line carries
+        # `https://…`; the census-corpora shadow-stripper ban caught
+        # the naive split form and the URL face proves the ban right
+        # even one language over).
+        line = re.sub(r"(?:^|\s)//.*$", "", raw).strip()
         if not line:
             continue
         m = re.match(r"(include|test_include|exclude)\s*\($", line)
