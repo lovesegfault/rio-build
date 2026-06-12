@@ -5218,17 +5218,37 @@ name)`, the newer `last_observed` winning wholesale), so an observation
 folded before the edge reload survives it --- the menu plane needs no
 apply-window gate.
 
-#r("sched.sla.merge-law")[
+#r("sched.sla.merge-law+2")[
   The per-`(cell, instance_type)` menu merge law is newest-wins-WHOLESALE
   and MUST have exactly one in-crate implementation consumed by every Rust
   write leg (the controller-observation fold and the lease-edge carry),
-  with the PG upsert mirroring it under the same STRICT monotonicity qual:
+  with the PG upsert mirroring it under the same STRICT monotonicity qual;
   a strictly newer `last_observed` replaces the whole entry, ties and older
-  observations keep the current holder. The observation intake MUST refuse
-  zero-resource observations as a typed, counted letter
+  observations keep the current holder. The qual MUST be total over the
+  stored stamp's refusal alphabet: a non-finite stored stamp --- the
+  comparison's absorbing maximum --- admits any finite writer, and the
+  decode boundary persist-repairs the rows it refuses, so no stored value
+  can permanently refuse the writer's own range. The observation intake
+  MUST refuse zero-resource observations as a typed, counted letter
   (`_evidence_refused_total{plane="observed_types", reason="zero_resource"}`)
   --- absence of parseable kubelet resources is not a 0-core fact.
 ]
+
+bug_120: composing `WHERE stored < EXCLUDED` with a decode boundary that
+refuses the stored value created a permanent wedge whenever the refused
+value was the comparison's absorbing maximum: the load path reset a
+poisoned `'infinity'` stamp to UNIX_EPOCH in memory and narrated that
+re-observation heals the cell, but the upsert qual compared against the
+STORED infinity, silently refusing every finite write forever (a
+KeepForever table; the stale cores/mem reloaded each restart). The heal
+arm (`OR NOT isfinite(stored)`) and the persisted decode repair land on
+every monotone stamp fence in the plane (`updated_at <=` on
+price/lambda/node_count, `last_observed <` on the menu); W12-AF drives
+the poisoned-then-reobserved schedule and the never-reobserved repair.
+The cursor's value qual keeps its integer-domain semantics: its float
+refusal members surface LOUDLY at the one-fence-axis abort counter
+(never a silent wedge), and auto-zeroing is rejected --- it would
+re-fold full history.
 
 A durable store with a hand-implemented merge law at $N$ write sites has
 $N$ laws: bug_059's observe leg kept-first-with-fresh-timestamp while the

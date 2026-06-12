@@ -63,7 +63,7 @@ pub struct InstanceType {
 }
 
 impl InstanceType {
-    // r[impl sched.sla.merge-law]
+    // r[impl sched.sla.merge-law+2]
     /// THE per-`(cell, name)` menu merge law — newest-wins-WHOLESALE,
     /// the ONE in-crate implementation consumed by every Rust write
     /// leg (the observation fold in
@@ -451,6 +451,13 @@ pub struct CostTable {
     /// from the poller's snapshot-mutate-swap) don't need it threaded
     /// separately.
     cluster: String,
+    /// bug_120: `load()` refused at least one row for a non-finite
+    /// stored stamp — the repair obligation. Discharged by the next
+    /// leader-owned [`Self::persist_rows`] (durable writes live in the
+    /// sealed rows ONLY — W10-BB), which resets the poisoned stamps to
+    /// epoch 0 (maximally stale; values stay). Cleared naturally: the
+    /// next clean load rebuilds the table with the flag down.
+    repair_nonfinite: bool,
     /// `[sla].hw_cost_source` — carried so [`CostTable::price`] /
     /// [`CostTable::load`] / `CostTable::persist_rows` can enforce the
     /// "[`HwCostSource::Static`] = seeds only" contract at the read
@@ -645,6 +652,9 @@ impl CostTable {
             }
             menu.sort_by_key(|t| (t.cores, t.mem_bytes));
         }
+        // bug_120: an undischarged repair obligation rides the swap
+        // (either side may have recorded it).
+        fresh.repair_nonfinite |= self.repair_nonfinite;
         *self = fresh;
     }
 
@@ -829,10 +839,14 @@ impl CostTable {
             // counted refusal letter — the row never enters a map,
             // SIBLINGS are unaffected, and every downstream
             // staleness/watermark consumer runs on finite stamps
-            // only. The PG row itself stays (the monotone upsert
-            // qual rightly never rewinds it) but is read-dead until
-            // operator surgery; with the poisoned stamp refused, the
-            // stale clamp and the RioSlaHwCostStale alert arm
+            // only. bug_120: the refused PG row is REPAIRED below
+            // (stamp reset to epoch 0 = maximally stale) instead of
+            // staying read-dead until operator surgery — the next
+            // load consumes the row's values at full staleness, and
+            // the persist fence's isfinite arm means even an
+            // unrepaired stamp can no longer refuse the writer's own
+            // range. With the poisoned stamp refused this load, the
+            // stale clamp and the RioSlaHwCostStale alert still arm
             // truthfully instead of disarming fleet-wide.
             let Some(at) = Epoch::from_pg_epoch(at) else {
                 tracing::warn!(
@@ -845,6 +859,7 @@ impl CostTable {
                     "reason" => "nonfinite_epoch"
                 )
                 .increment(1);
+                t.repair_nonfinite = true;
                 continue;
             };
             if let Some(rest) = key.strip_prefix("price:")
@@ -895,6 +910,13 @@ impl CostTable {
             let Some(cap) = CapacityType::parse(&cap) else {
                 continue;
             };
+            // ONE decode through the sanctioned constructor (the epoch
+            // census pins the call count); a refusal records the
+            // bug_120 repair obligation discharged at persist_rows.
+            let decoded = rio_common::clamped::epoch_secs(at);
+            if decoded.is_none() {
+                t.repair_nonfinite = true;
+            }
             t.cells.entry((h, cap)).or_default().push(InstanceType {
                 name,
                 cores: cores.max(0) as u32,
@@ -904,9 +926,16 @@ impl CostTable {
                 // constructor carries it undistorted (the age clamp's
                 // 1-year ceiling relocated every real stamp to 1971) and
                 // refuses poisoned rows totally. A refused stamp resets
-                // to UNIX_EPOCH (the sketch re-warm precedent): the cell
-                // reads as maximally stale, which only re-observes it.
-                last_observed: rio_common::clamped::epoch_secs(at).unwrap_or_else(|| {
+                // to UNIX_EPOCH (the sketch re-warm precedent) AND the
+                // reset is PERSISTED below (bug_120): the in-memory
+                // reset alone could never heal the stored row, because
+                // the pre-fix monotone qual compared against the stored
+                // `'infinity'` — the absorbing maximum — and silently
+                // refused every re-observation. The persist fence is
+                // now total over the refusal alphabet (the isfinite
+                // arm) and the repair below heals even rows that are
+                // never re-observed.
+                last_observed: decoded.unwrap_or_else(|| {
                     tracing::warn!(
                         epoch_secs = at,
                         "poisoned last_observed epoch; resetting to UNIX_EPOCH"
@@ -934,6 +963,31 @@ impl CostTable {
     /// In-module tests drive this directly for ROW semantics; the
     /// leadership gate has its own witnesses (W10-BA).
     async fn persist_rows(&self, db: &SchedulerDb) -> anyhow::Result<()> {
+        // bug_120: discharge the decode-repair obligation under the
+        // leader-owned write boundary (load() RECORDS the rows it
+        // refused; the leader repairs them HERE — W10-BB pins that no
+        // durable write lives outside the sealed rows). Stamp → epoch 0
+        // = maximally stale; values stay; keyed on the same isfinite
+        // predicate as the fence arms so load, fence, and repair agree
+        // on the alphabet. Idempotent — re-runs each tick until a clean
+        // reload rebuilds the table with the flag down.
+        if self.repair_nonfinite {
+            sqlx::query(
+                "UPDATE sla_ema_state SET updated_at = to_timestamp(0) \
+                 WHERE cluster = $1 AND NOT isfinite(updated_at)",
+            )
+            .bind(&self.cluster)
+            .execute(db.pool())
+            .await?;
+            sqlx::query(
+                "UPDATE sla_observed_instance_types \
+                 SET last_observed = to_timestamp(0) \
+                 WHERE cluster = $1 AND NOT isfinite(last_observed)",
+            )
+            .bind(&self.cluster)
+            .execute(db.pool())
+            .await?;
+        }
         // Under non-Spot the §Static contract is "seeds only" —
         // skipping the price upsert means leftover Spot-era rows age
         // out instead of being refreshed every 10min by
@@ -948,7 +1002,8 @@ impl CostTable {
                     "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
                      VALUES ($1, $2, $3, to_timestamp($4)) \
                      ON CONFLICT (cluster, key) DO UPDATE SET value = $3, updated_at = to_timestamp($4) \
-                     WHERE sla_ema_state.updated_at <= to_timestamp($4)",
+                     WHERE sla_ema_state.updated_at <= to_timestamp($4) \
+                        OR NOT isfinite(sla_ema_state.updated_at)",
                 )
                 .bind(&self.cluster)
                 .bind(format!("price:{}", cell_label(cell)))
@@ -1012,7 +1067,8 @@ impl CostTable {
                      VALUES ($1, $2, $3, $4, $5, to_timestamp($6)) \
                      ON CONFLICT (cluster, key) DO UPDATE SET \
                        value = $3, numerator = $4, denominator = $5, updated_at = to_timestamp($6) \
-                     WHERE sla_ema_state.updated_at <= to_timestamp($6)",
+                     WHERE sla_ema_state.updated_at <= to_timestamp($6) \
+                        OR NOT isfinite(sla_ema_state.updated_at)",
                 )
                 .bind(&self.cluster)
                 .bind(format!("lambda:{h}"))
@@ -1031,7 +1087,8 @@ impl CostTable {
                     "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
                      VALUES ($1, $2, $3, to_timestamp($4)) \
                      ON CONFLICT (cluster, key) DO UPDATE SET value = $3, updated_at = to_timestamp($4) \
-                     WHERE sla_ema_state.updated_at <= to_timestamp($4)",
+                     WHERE sla_ema_state.updated_at <= to_timestamp($4) \
+                        OR NOT isfinite(sla_ema_state.updated_at)",
                 )
                 .bind(&self.cluster)
                 .bind(format!("node_count:{h}"))
@@ -1060,6 +1117,12 @@ impl CostTable {
                 // the steady-state re-persist of an unchanged menu is
                 // a no-op and a deposed writer's stale snapshot
                 // cannot rewind. Pinned by `merge_law_caller_census`.
+                // bug_120: the fence is TOTAL over the stored datum's
+                // refusal alphabet — a poisoned `'infinity'` stamp is
+                // the comparison's absorbing maximum (greater than
+                // every finite timestamptz), so without the isfinite
+                // arm it refused every future write FOREVER and the
+                // stale cores/mem_bytes reloaded each restart.
                 sqlx::query(
                     "INSERT INTO sla_observed_instance_types \
                      (cluster, hw_class, capacity_type, instance_type, cores, mem_bytes, last_observed) \
@@ -1067,7 +1130,8 @@ impl CostTable {
                      ON CONFLICT (cluster, hw_class, capacity_type, instance_type) DO UPDATE SET \
                      cores = EXCLUDED.cores, mem_bytes = EXCLUDED.mem_bytes, \
                      last_observed = EXCLUDED.last_observed \
-                     WHERE sla_observed_instance_types.last_observed < EXCLUDED.last_observed",
+                     WHERE sla_observed_instance_types.last_observed < EXCLUDED.last_observed \
+                        OR NOT isfinite(sla_observed_instance_types.last_observed)",
                 )
                 .bind(&self.cluster)
                 .bind(h)
@@ -1311,6 +1375,8 @@ impl CostTable {
         self.node_count = from.node_count;
         self.lambda_cursor = from.lambda_cursor;
         self.lambda_pending = from.lambda_pending;
+        // bug_120: an undischarged repair obligation rides the move.
+        self.repair_nonfinite |= from.repair_nonfinite;
     }
 
     /// Fold one round of spot-price observations into the price EMA.
@@ -1415,7 +1481,7 @@ impl CostTable {
     /// `$/vCPU` fold filters `vcpu > 0.0`, so the row could never
     /// price, while winning every monotonicity qual on re-stamp.
     // r[impl sched.sla.cost-instance-type-feedback]
-    // r[impl sched.sla.merge-law]
+    // r[impl sched.sla.merge-law+2]
     pub fn observe_instance_types(
         &mut self,
         obs: impl IntoIterator<Item = (Cell, String, u32, u64)>,
@@ -2879,7 +2945,7 @@ mod tests {
         assert!(t.menu(&cell)[0].last_observed > before);
     }
 
-    // r[verify sched.sla.merge-law]
+    // r[verify sched.sla.merge-law+2]
     /// **W11-AU (bug_059, red-first)** — *a newer complete observation
     /// always becomes the stored truth, at every write leg.* The leg
     /// product: observe (cells A/C here), carry
@@ -2932,7 +2998,7 @@ mod tests {
         );
     }
 
-    // r[verify sched.sla.merge-law]
+    // r[verify sched.sla.merge-law+2]
     /// **W11-AU persist leg** — the PG upsert mirrors the in-crate
     /// merge law: strictly newer `last_observed` wins WHOLESALE; an
     /// older stamp is refused row-by-row (the monotonicity qual — the
@@ -2983,7 +3049,7 @@ mod tests {
         );
     }
 
-    // r[verify sched.sla.merge-law]
+    // r[verify sched.sla.merge-law+2]
     /// **W11-AV (bug_059)** — *zero-resource decode ⇒ typed refusal
     /// letter, never a row.* Absence of parseable kubelet resources is
     /// not a 0-core fact: `parse_resources` defaults missing/malformed
@@ -3284,7 +3350,7 @@ mod tests {
         }
     }
 
-    // r[verify sched.sla.merge-law]
+    // r[verify sched.sla.merge-law+2]
     /// **[GEN-SET] merge-callers census (the sched.sla.merge-law
     /// belt).** Generator: scan THIS file's production source (test
     /// module stripped) for menu-entry write idioms. Committed
@@ -3720,6 +3786,148 @@ mod tests {
             "node_count rides the unit: got {}",
             nc.value
         );
+    }
+
+    // r[verify sched.sla.merge-law+2]
+    /// **W12-AF (bug_120, red-first)** — *no stored value can
+    /// permanently refuse the writer's own range; population: the
+    /// stored stamp's refusal alphabet (infinity the live member, the
+    /// monotone-qual sweep the closure).* A pre-poisoned `'infinity'`
+    /// `last_observed` row (manual SQL — every production writer binds
+    /// finite f64; the poisoned row is the adversarial PRE-EXISTING
+    /// state, not a constructible one) plus a fresh finite observation:
+    /// pre-fix the upsert qual compared against the STORED infinity —
+    /// greater than every finite timestamptz — so the persist silently
+    /// refused forever and the stale cores/mem reloaded every restart
+    /// while the load-path comment narrated a heal that could not
+    /// fire. Post-fix the `OR NOT isfinite(stored)` arm admits the
+    /// finite writer: the row heals, and STAYS healed (an older stamp
+    /// is refused again once the stored stamp is finite — the monotone
+    /// law intact).
+    #[tokio::test]
+    async fn w12_af_poisoned_stamp_heals_at_the_persist_fence() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        sqlx::query(
+            "INSERT INTO sla_observed_instance_types \
+             (cluster, hw_class, capacity_type, instance_type, cores, mem_bytes, last_observed) \
+             VALUES ('c', 'h', 'spot', 'stale.large', 4, 1000000, 'infinity')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        // A fresh, finite observation of the same instance type.
+        let mut t = CostTable::seeded("c", HwCostSource::Spot);
+        t.cells
+            .entry(("h".into(), CapacityType::Spot))
+            .or_default()
+            .push(InstanceType {
+                name: "stale.large".into(),
+                cores: 16,
+                mem_bytes: 32_000_000,
+                price_per_vcpu_hr: 0.01,
+                last_observed: SystemTime::UNIX_EPOCH + Duration::from_secs(7100),
+            });
+        t.persist_rows(&sdb).await.unwrap();
+        let (cores, mem, finite): (i32, i64, bool) = sqlx::query_as(
+            "SELECT cores, mem_bytes, isfinite(last_observed) \
+             FROM sla_observed_instance_types WHERE cluster = 'c' AND instance_type = 'stale.large'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            finite && cores == 16 && mem == 32_000_000,
+            "the poisoned absorbing stamp must heal on the next genuine \
+             observation (got cores={cores} mem={mem} finite={finite} — \
+             pre-fix: the stale 4/1000000 row reloaded forever)"
+        );
+        // Stays healed: an OLDER stamp is refused once the stored stamp
+        // is finite — the strict monotone law is intact.
+        let mut older = CostTable::seeded("c", HwCostSource::Spot);
+        older
+            .cells
+            .entry(("h".into(), CapacityType::Spot))
+            .or_default()
+            .push(InstanceType {
+                name: "stale.large".into(),
+                cores: 2,
+                mem_bytes: 1,
+                price_per_vcpu_hr: 0.01,
+                last_observed: SystemTime::UNIX_EPOCH + Duration::from_secs(100),
+            });
+        older.persist_rows(&sdb).await.unwrap();
+        let (cores2,): (i32,) = sqlx::query_as(
+            "SELECT cores FROM sla_observed_instance_types WHERE cluster = 'c' AND instance_type = 'stale.large'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(cores2, 16, "older stamps stay refused once finite");
+    }
+
+    // r[verify sched.sla.merge-law+2]
+    /// **W12-AF2 (bug_120, the never-reobserved face)** — the
+    /// decode-refusal site repairs the rows it refuses: a poisoned row
+    /// whose instance type never appears again would stay wedged under
+    /// the qual-arm alone; the repair resets the stamp (→ epoch 0 =
+    /// maximally stale) for BOTH tables, keyed on the same isfinite
+    /// predicate as the fence, so load and persist agree on
+    /// the alphabet. The discharge is LEADER-OWNED (W10-BB: durable
+    /// writes live in the sealed rows only — load() RECORDS the
+    /// obligation, the next persist_rows repairs), and the row heals
+    /// into consumable on the following load.
+    #[tokio::test]
+    async fn w12_af2_decode_refusal_persists_the_repair() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        sqlx::query(
+            "INSERT INTO sla_observed_instance_types \
+             (cluster, hw_class, capacity_type, instance_type, cores, mem_bytes, last_observed) \
+             VALUES ('c', 'h', 'spot', 'orphan.large', 8, 2000000, 'infinity')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sla_ema_state (cluster, key, value, numerator, denominator, updated_at) \
+             VALUES ('c', 'lambda:h0', 3.0, 2.0, 800.0, 'infinity')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let t = CostTable::load(&sdb, "c", HwCostSource::Spot)
+            .await
+            .unwrap();
+        assert!(
+            !t.lambda.contains_key("h0"),
+            "first load still refuses the poisoned row at decode"
+        );
+        assert!(t.repair_nonfinite, "load RECORDS the repair obligation");
+        // The leader-owned write boundary discharges it.
+        t.persist_rows(&sdb).await.unwrap();
+        let (fin_obs, fin_ema): (bool, bool) = sqlx::query_as(
+            "SELECT \
+              (SELECT isfinite(last_observed) FROM sla_observed_instance_types \
+                WHERE cluster = 'c' AND instance_type = 'orphan.large'), \
+              (SELECT isfinite(updated_at) FROM sla_ema_state \
+                WHERE cluster = 'c' AND key = 'lambda:h0')",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            fin_obs && fin_ema,
+            "the decode-refusal site persisted the repair (obs={fin_obs} \
+             ema={fin_ema}) — pre-fix both rows stayed read-dead until \
+             operator surgery"
+        );
+        // Second load consumes the repaired EMA row at full staleness.
+        let t2 = CostTable::load(&sdb, "c", HwCostSource::Spot)
+            .await
+            .unwrap();
+        let l = t2.lambda.get("h0").expect("repaired row loads");
+        assert!((l.numerator - 2.0).abs() < 1e-9 && (l.denominator - 800.0).abs() < 1e-9);
     }
 
     /// bug_034: under `hwCostSource: static` the documented contract is
