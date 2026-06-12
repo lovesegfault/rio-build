@@ -47,6 +47,24 @@ pub enum Lint {
     /// is actually RESTRICT — rows growing forever behind a row that
     /// greps to nothing.
     RetentionTruth,
+    /// Every letter of every DB-CHECK alphabet (the `db_str_enum!`
+    /// invocation surface) has at least one EXPRESSION-position
+    /// constructor in production source, and every label value a
+    /// metric HELP string describes has a same-crate string literal
+    /// outside its own registration. Pattern-position arms
+    /// (`Variant =>`, `| Variant`, `matches!` payloads, let-patterns)
+    /// do not count — they consume the letter, they never produce it.
+    ///
+    /// The historical exemplar (live_061): `JobState::Obsolete` sat in
+    /// the 078 CHECK alphabet from birth with exactly the enum
+    /// declaration and a display match arm — zero writers for the
+    /// system's whole life. The by-other-means resolutions laundered
+    /// into `cancelled`, `resolved_total{outcome="obsolete"}` was
+    /// zero-forever, and the unresolvable pending rows pinned the
+    /// claimable listing as permanently-refusing heads. A
+    /// pattern-position-blind census would have shipped that letter
+    /// green; this lint reds it at the first gate.
+    DeadAlphabetLetter,
 }
 
 impl Lint {
@@ -64,6 +82,7 @@ impl Lint {
             Lint::HelmSla,
             Lint::SeccompAllowlist,
             Lint::RetentionTruth,
+            Lint::DeadAlphabetLetter,
         ]
     }
 }
@@ -75,6 +94,7 @@ pub fn run(lint: &Lint) -> Result<()> {
         Lint::HelmSla => helm_sla(),
         Lint::SeccompAllowlist => seccomp_allowlist(),
         Lint::RetentionTruth => retention_truth(),
+        Lint::DeadAlphabetLetter => dead_alphabet_letter(),
     }
 }
 
@@ -1587,6 +1607,684 @@ fn walk_rs(dir: &Path, f: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
     Ok(())
 }
 
+// ======================= dead-alphabet-letter ==========================
+
+/// The dead-alphabet-letter jurisdiction: the crates whose `.rs`
+/// sources the `xtask-lint` flake check stages (the
+/// nix/misc-checks.nix fileset union) — the declared list and the
+/// staging move together (the local `xtask lint` vs nix parity rule
+/// documented at that fileset). Widening = add the crate here AND to
+/// the fileset union. Every entry is existence-asserted (an absent
+/// root is an error, never an empty scan).
+const DEAD_LETTER_CRATES: &[&str] = &["rio-scheduler", "rio-store", "rio-controller"];
+
+/// CHECK-alphabet letters intentionally shipped without a production
+/// constructor. Each entry MUST carry a rationale naming the
+/// constructor-to-be (the schema-liveness ALLOW_DEAD discipline); an
+/// entry whose letter gains a constructor goes stale and must be
+/// removed (the lint reds on unused allowances).
+const ALLOW_UNCONSTRUCTED: &[(&str, &str, &str)] = &[];
+
+/// Alphabets whose production constructor IS the macro-generated
+/// `FromStr` over client-originated strings (the wire or a PG column
+/// written from the wire): no system arm ever spells the variant, the
+/// PARSE mints it. The exemption is enum-wide and carries the data
+/// source as its rationale — a letter of a parse-constructed alphabet
+/// can still die (no client ever sends it), but that is a traffic
+/// fact, not a static one; the lint documents the tier instead of
+/// pretending to decide it.
+const PARSE_CONSTRUCTED: &[(&str, &str)] = &[(
+    "PriorityClass",
+    "client-originated: the gateway submits it as a wire string, merge stores it, \
+     recovery re-parses it (actor/recovery.rs `.parse()`); Default covers the \
+     fallback arm",
+)];
+
+/// One parsed `db_str_enum!` alphabet declaration.
+struct AlphabetDecl {
+    file: std::path::PathBuf,
+    enum_name: String,
+    /// (variant, PG literal) pairs in declaration order.
+    variants: Vec<(String, String)>,
+}
+
+fn dead_alphabet_letter() -> Result<()> {
+    dead_alphabet_letter_at(
+        repo_root(),
+        DEAD_LETTER_CRATES,
+        ALLOW_UNCONSTRUCTED,
+        PARSE_CONSTRUCTED,
+    )
+}
+
+/// The testable core: scan `root`'s `crates` and red on (a) a
+/// db-CHECK alphabet letter with zero expression-position
+/// constructors, (b) a HELP-described label value with zero
+/// same-crate literals outside its registration, (c) a stale
+/// ALLOW_UNCONSTRUCTED row. Pattern positions never count: syn's
+/// typed AST separates `Expr` from `Pat` structurally, and inside
+/// macro token streams (opaque to the typed AST) an occurrence
+/// followed by `=>` or flanked by `|` is a match-arm pattern while
+/// `matches!` bodies are skipped wholesale (a pattern argument by
+/// definition; the conservative direction). Aliased enum imports
+/// (`use JobState as J`) earn no credit — the rename-tightness
+/// refusal the standing censuses use.
+fn dead_alphabet_letter_at(
+    root: &Path,
+    crates: &[&str],
+    allow_unconstructed: &[(&str, &str, &str)],
+    parse_constructed: &[(&str, &str)],
+) -> Result<()> {
+    let mut violations: Vec<String> = Vec::new();
+
+    // ---- per-crate corpora (production-only ASTs) ----
+    let mut corpora: Vec<(String, Vec<(std::path::PathBuf, syn::File)>)> = Vec::new();
+    for krate in crates {
+        let dir = root.join(krate).join("src");
+        ensure!(
+            dir.is_dir(),
+            "dead-alphabet-letter: declared jurisdiction root missing: {} \
+             (the lint never scans an empty default — fix the path or the staging)",
+            dir.display()
+        );
+        let gated = cfg_test_gated_files(&dir)?;
+        let mut files = Vec::new();
+        walk_rs(&dir, &mut |path| {
+            if path.components().any(|c| c.as_os_str() == "tests") || gated.contains(path) {
+                return Ok(());
+            }
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name == "tests.rs" || name.ends_with("_tests.rs") {
+                return Ok(());
+            }
+            let raw =
+                fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+            let mut file: syn::File =
+                syn::parse_file(&raw).with_context(|| format!("syn parse {}", path.display()))?;
+            prune_cfg_test_items(&mut file.items);
+            {
+                use syn::visit_mut::VisitMut;
+                let mut pruner = CfgTestStmtPrune;
+                for item in &mut file.items {
+                    pruner.visit_item_mut(item);
+                }
+            }
+            files.push((path.to_owned(), file));
+            Ok(())
+        })?;
+        ensure!(
+            !files.is_empty(),
+            "dead-alphabet-letter: zero production files under {} — population floor",
+            dir.display()
+        );
+        corpora.push(((*krate).to_string(), files));
+    }
+
+    // ---- half 1: the db-CHECK alphabets (db_str_enum! lives in
+    //      rio-scheduler; the decl census floor pins the surface) ----
+    let mut decls: Vec<AlphabetDecl> = Vec::new();
+    let mut constructed: std::collections::BTreeSet<(String, String)> = Default::default();
+    for (krate, files) in &corpora {
+        if krate != "rio-scheduler" {
+            continue;
+        }
+        for (path, file) in files {
+            collect_db_str_enum_decls(path, file, &mut decls);
+        }
+        // The constructor census runs over the same crate (the
+        // alphabets are crate-internal types).
+        for (_path, file) in files {
+            let mut v = ConstructorCensus {
+                impl_self: Vec::new(),
+                in_pattern: 0,
+                hits: &mut constructed,
+            };
+            syn::visit::Visit::visit_file(&mut v, file);
+        }
+    }
+    ensure!(
+        decls.len() >= 6,
+        "dead-alphabet-letter: only {} db_str_enum! declarations found (floor 6) — \
+         the decl scan or the staging rotted",
+        decls.len()
+    );
+    // SQL-literal production: a value the crate's own SQL text inlines
+    // (`status = 'pending'`) is produced without any Rust constructor —
+    // the single-quote form is the credit key (a bare "pending" string,
+    // e.g. a sibling enum's display arm, earns nothing: that is exactly
+    // the laundering surface the live_061 'obsolete' letter hid behind).
+    let mut sql_quoted: std::collections::BTreeSet<String> = Default::default();
+    for (krate, files) in &corpora {
+        if krate != "rio-scheduler" {
+            continue;
+        }
+        let mut lits: std::collections::BTreeSet<String> = Default::default();
+        for (_path, file) in files {
+            collect_literals_outside_describes(file, &mut lits);
+        }
+        for lit in lits {
+            let bytes = lit.as_bytes();
+            let mut i = 0;
+            while let Some(open) = lit[i..].find('\'') {
+                let s = i + open + 1;
+                if let Some(close) = lit[s..].find('\'') {
+                    let val = &lit[s..s + close];
+                    if !val.is_empty()
+                        && val
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    {
+                        sql_quoted.insert(val.to_string());
+                    }
+                    i = s + close + 1;
+                } else {
+                    break;
+                }
+            }
+            let _ = bytes;
+        }
+    }
+    let mut allowance_used: std::collections::BTreeSet<(String, String)> = Default::default();
+    let mut parse_constructed_used: std::collections::BTreeSet<String> = Default::default();
+    for decl in &decls {
+        if let Some((e, _why)) = PARSE_CONSTRUCTED.iter().find(|(e, _)| e == &decl.enum_name) {
+            parse_constructed_used.insert((*e).to_string());
+            continue;
+        }
+        for (variant, literal) in &decl.variants {
+            let key = (decl.enum_name.clone(), variant.clone());
+            if constructed.contains(&key) || sql_quoted.contains(literal) {
+                continue;
+            }
+            if let Some((e, v, _why)) = allow_unconstructed
+                .iter()
+                .find(|(e, v, _)| e == &decl.enum_name && v == variant)
+            {
+                allowance_used.insert(((*e).to_string(), (*v).to_string()));
+                continue;
+            }
+            violations.push(format!(
+                "{}: CHECK letter `{}::{}` (= '{}') has no expression-position \
+                 constructor in production source — the alphabet admits a value \
+                 nothing can produce (the live_061 'obsolete' shape: decl + display \
+                 arm only, zero writers). Construct it, or enroll it in \
+                 ALLOW_UNCONSTRUCTED with the constructor-to-be named",
+                decl.file.display(),
+                decl.enum_name,
+                variant,
+                literal,
+            ));
+        }
+    }
+    for (e, _why) in parse_constructed {
+        if !parse_constructed_used.contains(*e) {
+            violations.push(format!(
+                "PARSE_CONSTRUCTED row `{e}` names no known db_str_enum alphabet — \
+                 remove or fix the row"
+            ));
+        }
+    }
+    for (e, v, _why) in allow_unconstructed {
+        let key = ((*e).to_string(), (*v).to_string());
+        if constructed.contains(&key) {
+            violations.push(format!(
+                "ALLOW_UNCONSTRUCTED row `{e}::{v}` is stale — the letter has a \
+                 production constructor now; remove the allowance"
+            ));
+        } else if !allowance_used.contains(&key) {
+            violations.push(format!(
+                "ALLOW_UNCONSTRUCTED row `{e}::{v}` names no known alphabet letter — \
+                 remove or fix the row"
+            ));
+        }
+    }
+
+    // ---- half 2: metric HELP vocabularies vs same-crate literals ----
+    let mut describe_count = 0usize;
+    for (krate, files) in &corpora {
+        // (metric, label, value) -> declaring file
+        let mut vocab: Vec<(String, String, String, std::path::PathBuf)> = Vec::new();
+        let mut literals: std::collections::BTreeSet<String> = Default::default();
+        for (path, file) in files {
+            let mut helps: Vec<(String, String)> = Vec::new();
+            collect_describe_helps(file, &mut helps);
+            describe_count += helps.len();
+            for (metric, help) in &helps {
+                for (label, value) in parse_help_vocab(help) {
+                    vocab.push((metric.clone(), label, value, path.clone()));
+                }
+            }
+            collect_literals_outside_describes(file, &mut literals);
+        }
+        for (metric, label, value, path) in vocab {
+            if !literals.contains(&value) {
+                violations.push(format!(
+                    "{}: HELP for `{metric}` describes {label}={value} but the value \
+                     has no string literal anywhere in {krate}'s production source \
+                     outside metric registrations — the vocabulary narrates a cell no \
+                     emission site (or label-producer arm) can mint; fix the HELP or \
+                     the emitter",
+                    path.display(),
+                ));
+            }
+        }
+    }
+    ensure!(
+        describe_count >= 30,
+        "dead-alphabet-letter: only {describe_count} describe_* registrations found \
+         (floor 30) — the registration scan or the staging rotted"
+    );
+
+    ensure!(
+        violations.is_empty(),
+        "dead-alphabet-letter: {} violation(s) —\n  {}",
+        violations.len(),
+        violations.join("\n  ")
+    );
+    tracing::info!(
+        alphabets = decls.len(),
+        letters = decls.iter().map(|d| d.variants.len()).sum::<usize>(),
+        describes = describe_count,
+        "dead-alphabet-letter: every CHECK letter constructed (or enrolled), every \
+         HELP vocabulary value minted"
+    );
+    Ok(())
+}
+
+/// Extract `db_str_enum! { ... enum Name { Variant = "lit", ... } }`
+/// alphabets from a file's macro invocations (the macro_rules!
+/// DEFINITION parses as path `macro_rules` and is skipped — only
+/// invocations carry alphabets).
+fn collect_db_str_enum_decls(path: &Path, file: &syn::File, out: &mut Vec<AlphabetDecl>) {
+    fn from_tokens(path: &Path, tokens: proc_macro2::TokenStream, out: &mut Vec<AlphabetDecl>) {
+        let toks: Vec<proc_macro2::TokenTree> = tokens.into_iter().collect();
+        // find `enum <Name> { ... }`
+        for i in 0..toks.len() {
+            let proc_macro2::TokenTree::Ident(kw) = &toks[i] else {
+                continue;
+            };
+            if kw != "enum" {
+                continue;
+            }
+            let Some(proc_macro2::TokenTree::Ident(name)) = toks.get(i + 1) else {
+                continue;
+            };
+            let Some(proc_macro2::TokenTree::Group(body)) = toks.get(i + 2) else {
+                continue;
+            };
+            let inner: Vec<proc_macro2::TokenTree> = body.stream().into_iter().collect();
+            let mut variants = Vec::new();
+            for j in 0..inner.len() {
+                let proc_macro2::TokenTree::Ident(v) = &inner[j] else {
+                    continue;
+                };
+                let vs = v.to_string();
+                if !vs.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                    continue;
+                }
+                let Some(proc_macro2::TokenTree::Punct(eq)) = inner.get(j + 1) else {
+                    continue;
+                };
+                if eq.as_char() != '=' {
+                    continue;
+                }
+                let Some(proc_macro2::TokenTree::Literal(lit)) = inner.get(j + 2) else {
+                    continue;
+                };
+                let raw = lit.to_string();
+                let Some(pg) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+                    continue;
+                };
+                variants.push((vs, pg.to_string()));
+            }
+            if !variants.is_empty() {
+                out.push(AlphabetDecl {
+                    file: path.to_owned(),
+                    enum_name: name.to_string(),
+                    variants,
+                });
+            }
+        }
+    }
+    fn walk_items(path: &Path, items: &[syn::Item], out: &mut Vec<AlphabetDecl>) {
+        for item in items {
+            match item {
+                syn::Item::Macro(m)
+                    if m.mac
+                        .path
+                        .segments
+                        .last()
+                        .is_some_and(|s| s.ident == "db_str_enum") =>
+                {
+                    from_tokens(path, m.mac.tokens.clone(), out);
+                }
+                syn::Item::Mod(m) => {
+                    if let Some((_, inner)) = &m.content {
+                        walk_items(path, inner, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk_items(path, &file.items, out);
+}
+
+/// The expression-position constructor census. Typed-AST positions
+/// are exact (an `ExprPath` is an expression; a `Pat` is not); macro
+/// token streams get the documented token-tier classification.
+struct ConstructorCensus<'a> {
+    /// Enum-name stack of enclosing `impl <Enum>` blocks, for
+    /// `Self::Variant` constructor credit.
+    impl_self: Vec<String>,
+    /// Pattern-nesting depth: syn 2 stores a unit-variant PATTERN as
+    /// the same `ExprPath` node an expression uses (`Pat::Path`
+    /// carries `ExprPath`), so without this guard a match arm's
+    /// pattern would earn constructor credit — the exact laundering
+    /// the lint exists to refuse.
+    in_pattern: usize,
+    hits: &'a mut std::collections::BTreeSet<(String, String)>,
+}
+
+impl ConstructorCensus<'_> {
+    fn credit_path(&mut self, segs: &[String]) {
+        let n = segs.len();
+        if n < 2 {
+            return;
+        }
+        let (owner, variant) = (&segs[n - 2], &segs[n - 1]);
+        if !variant
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase())
+        {
+            return;
+        }
+        let owner = if owner == "Self" {
+            match self.impl_self.last() {
+                Some(t) => t.clone(),
+                None => return,
+            }
+        } else {
+            owner.clone()
+        };
+        if owner.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            self.hits.insert((owner, variant.clone()));
+        }
+    }
+
+    fn scan_macro_tokens(&mut self, mac: &syn::Macro) {
+        let last = mac
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default();
+        // matches! bodies are pattern arguments by definition; the
+        // alphabet decls and metric registrations are their own
+        // scan surfaces, never constructor credit.
+        if last == "matches" || last == "db_str_enum" || last.starts_with("describe_") {
+            return;
+        }
+        let toks: Vec<proc_macro2::TokenTree> = mac.tokens.clone().into_iter().collect();
+        self.scan_token_slice(&toks);
+    }
+
+    fn scan_token_slice(&mut self, toks: &[proc_macro2::TokenTree]) {
+        use proc_macro2::TokenTree as Tt;
+        let mut i = 0;
+        while i < toks.len() {
+            match &toks[i] {
+                Tt::Group(g) => {
+                    let inner: Vec<Tt> = g.stream().into_iter().collect();
+                    self.scan_token_slice(&inner);
+                    i += 1;
+                }
+                Tt::Ident(a) => {
+                    // Ident :: Ident — the path tail.
+                    let is_path = matches!(
+                        (toks.get(i + 1), toks.get(i + 2)),
+                        (Some(Tt::Punct(p1)), Some(Tt::Punct(p2)))
+                            if p1.as_char() == ':' && p2.as_char() == ':'
+                    );
+                    if is_path && let Some(Tt::Ident(b)) = toks.get(i + 3) {
+                        // pattern-position screens (the brief's two
+                        // forms): `... => ` after, or `|` adjacency.
+                        let followed_by_arrow = matches!(
+                            (toks.get(i + 4), toks.get(i + 5)),
+                            (Some(Tt::Punct(p1)), Some(Tt::Punct(p2)))
+                                if p1.as_char() == '=' && p2.as_char() == '>'
+                        );
+                        let pipe_adjacent = matches!(toks.get(i + 4), Some(Tt::Punct(p)) if p.as_char() == '|')
+                            || (i > 0
+                                && matches!(&toks[i - 1], Tt::Punct(p) if p.as_char() == '|'));
+                        if !followed_by_arrow && !pipe_adjacent {
+                            self.credit_path(&[a.to_string(), b.to_string()]);
+                        }
+                        i += 4;
+                    } else {
+                        i += 1;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for ConstructorCensus<'_> {
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        let pushed = if let syn::Type::Path(tp) = &*node.self_ty {
+            tp.path.segments.last().map(|s| {
+                self.impl_self.push(s.ident.to_string());
+            })
+        } else {
+            None
+        };
+        syn::visit::visit_item_impl(self, node);
+        if pushed.is_some() {
+            self.impl_self.pop();
+        }
+    }
+
+    fn visit_pat(&mut self, node: &'ast syn::Pat) {
+        self.in_pattern += 1;
+        syn::visit::visit_pat(self, node);
+        self.in_pattern -= 1;
+    }
+
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        if self.in_pattern == 0 {
+            let segs: Vec<String> = node
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            self.credit_path(&segs);
+        }
+        syn::visit::visit_expr_path(self, node);
+    }
+
+    // Struct-variant and call-variant constructors arrive as
+    // ExprStruct / ExprCall(ExprPath) — ExprCall's callee is an
+    // ExprPath (covered above); ExprStruct carries the path here.
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        if self.in_pattern == 0 {
+            let segs: Vec<String> = node
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            self.credit_path(&segs);
+        }
+        syn::visit::visit_expr_struct(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        self.scan_macro_tokens(node);
+        syn::visit::visit_macro(self, node);
+    }
+}
+
+/// Collect `(metric name, HELP text)` from describe_counter! /
+/// describe_gauge! / describe_histogram! invocations (the first two
+/// string literals of each call).
+fn collect_describe_helps(file: &syn::File, out: &mut Vec<(String, String)>) {
+    struct V<'a> {
+        out: &'a mut Vec<(String, String)>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for V<'_> {
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            let last = node
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            if last.starts_with("describe_") {
+                let lits: Vec<String> = node
+                    .tokens
+                    .clone()
+                    .into_iter()
+                    .filter_map(|t| match t {
+                        proc_macro2::TokenTree::Literal(l) => {
+                            let s = l.to_string();
+                            syn::parse_str::<syn::LitStr>(&s).ok().map(|ls| ls.value())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if lits.len() >= 2 {
+                    self.out.push((lits[0].clone(), lits[1..].join("")));
+                }
+            }
+            syn::visit::visit_macro(self, node);
+        }
+    }
+    syn::visit::Visit::visit_file(&mut V { out }, file);
+}
+
+/// Parse the two HELP vocabulary grammars:
+///   A: `labeled by <label> (<v1>|<v2>|...)` — the closed pipe-list;
+///   B: `<label>=<value>:` — the per-value definition form (the
+///      colon separates it from `{label=value}` cross-references,
+///      which are excluded by the brace screen).
+fn parse_help_vocab(help: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = help.as_bytes();
+    // Form A.
+    let mut idx = 0;
+    while let Some(at) = help[idx..].find("labeled by ") {
+        let start = idx + at + "labeled by ".len();
+        let rest = &help[start..];
+        let label: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let after = &rest[label.len()..];
+        // only the immediately-following parenthesis group
+        if let Some(open) = after.find('(')
+            && after[..open].trim().is_empty()
+            && let Some(close) = after[open..].find(')')
+        {
+            let body = &after[open + 1..open + close];
+            if body.contains('|')
+                && body
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '|')
+            {
+                for v in body.split('|').filter(|v| !v.is_empty()) {
+                    out.push((label.clone(), v.to_string()));
+                }
+            }
+        }
+        idx = start;
+    }
+    // Form B: label=value: (brace-screened).
+    let re_like = help.char_indices().collect::<Vec<_>>();
+    let mut i = 0;
+    while i < re_like.len() {
+        let (pos, c) = re_like[i];
+        if c == '=' {
+            // value forward to ':'
+            let label_end = pos;
+            let mut ls = label_end;
+            while ls > 0 && {
+                let pc = bytes[ls - 1] as char;
+                pc.is_ascii_alphanumeric() || pc == '_'
+            } {
+                ls -= 1;
+            }
+            let label = &help[ls..label_end];
+            let vstart = pos + 1;
+            let mut ve = vstart;
+            while ve < bytes.len() && {
+                let vc = bytes[ve] as char;
+                vc.is_ascii_alphanumeric() || vc == '_'
+            } {
+                ve += 1;
+            }
+            let value = &help[vstart..ve];
+            let braced = ls > 0 && bytes[ls - 1] as char == '{';
+            let colon = ve < bytes.len() && bytes[ve] as char == ':';
+            if !label.is_empty() && !value.is_empty() && colon && !braced {
+                out.push((label.to_string(), value.to_string()));
+            }
+        }
+        i += 1;
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Every string literal in the file OUTSIDE describe_* macro bodies —
+/// the population a HELP vocabulary value must intersect (an emission
+/// site's label value, or its label-producer's match arm).
+fn collect_literals_outside_describes(
+    file: &syn::File,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    struct V<'a> {
+        out: &'a mut std::collections::BTreeSet<String>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for V<'_> {
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            let last = node
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            if last.starts_with("describe_") {
+                return; // the registration is never its own emission
+            }
+            fn walk(ts: proc_macro2::TokenStream, out: &mut std::collections::BTreeSet<String>) {
+                for t in ts {
+                    match t {
+                        proc_macro2::TokenTree::Literal(l) => {
+                            if let Ok(ls) = syn::parse_str::<syn::LitStr>(&l.to_string()) {
+                                out.insert(ls.value());
+                            }
+                        }
+                        proc_macro2::TokenTree::Group(g) => walk(g.stream(), out),
+                        _ => {}
+                    }
+                }
+            }
+            walk(node.tokens.clone(), self.out);
+            syn::visit::visit_macro(self, node);
+        }
+        fn visit_lit_str(&mut self, node: &'ast syn::LitStr) {
+            self.out.insert(node.value());
+            syn::visit::visit_lit_str(self, node);
+        }
+    }
+    syn::visit::Visit::visit_file(&mut V { out }, file);
+}
+
 // `lint.rs` is in `CORPUS_EXCLUDE`, so the synthetic table names below
 // can't leak into the schema-liveness corpus and mask a real dead table.
 #[cfg(test)]
@@ -2076,5 +2774,171 @@ mod tests {
         )
         .expect_err("None with any production hit must go red");
         assert!(err.to_string().contains("production DELETE FROM"));
+    }
+
+    // ---- dead-alphabet-letter planted reds -------------------------------
+
+    /// Fixture crate skeleton for [`dead_alphabet_letter_at`]: the
+    /// floors demand 6 alphabets and 30 registrations, so the builder
+    /// plants a filler population and each case adds its specimen on
+    /// top. The crate must be named `rio-scheduler` (the db half's
+    /// declared home).
+    fn dead_letter_fixture(extra: &str) -> tempfile::TempDir {
+        let td = tempfile::tempdir().unwrap();
+        let src_dir = td.path().join("rio-scheduler/src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let mut filler = String::from(
+            "macro_rules! db_str_enum { ($($t:tt)*) => {} }\n\
+             macro_rules! describe_counter { ($($t:tt)*) => {} }\n",
+        );
+        for i in 0..6 {
+            filler.push_str(&format!(
+                "db_str_enum! {{ pub enum Filler{i} {{ AlwaysOn = \"always_on_{i}\" }} }}\n\
+                 pub fn mint_filler_{i}() {{ let _ = Filler{i}::AlwaysOn; }}\n"
+            ));
+        }
+        for i in 0..30 {
+            filler.push_str(&format!(
+                "pub fn reg_{i}() {{ describe_counter!(\"rio_x_{i}_total\", \"plain help\"); }}\n"
+            ));
+        }
+        filler.push_str(extra);
+        fs::write(src_dir.join("lib.rs"), filler).unwrap();
+        td
+    }
+
+    /// The live_061 exemplar shape, synthetic: a CHECK letter with
+    /// exactly the declaration and a display match arm — the lint must
+    /// red (pattern positions never count), and the sibling letter
+    /// constructed in expression position must not mask it.
+    #[test]
+    fn dead_letter_reds_on_decl_plus_display_arm_only() {
+        let td = dead_letter_fixture(
+            "db_str_enum! { pub enum SynthState { Live = \"live\", Obsolete = \"obsolete\" } }\n\
+             pub fn writer() -> &'static str {\n\
+                 let s = SynthState::Live;\n\
+                 match s { SynthState::Live => \"live\", SynthState::Obsolete => \"obsolete\" }\n\
+             }\n",
+        );
+        let err = dead_alphabet_letter_at(td.path(), &["rio-scheduler"], &[], &[])
+            .expect_err("the display-arm-only letter must red");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("SynthState::Obsolete"), "got: {msg}");
+        assert!(
+            !msg.contains("SynthState::Live"),
+            "the constructed sibling is green: {msg}"
+        );
+    }
+
+    /// Every pattern position the brief names earns NOTHING: match
+    /// arms, alternations, `matches!` payloads, and let-patterns. Only
+    /// the expression-position constructor flips the letter green.
+    #[test]
+    fn dead_letter_pattern_positions_never_count() {
+        let red = dead_letter_fixture(
+            "db_str_enum! { pub enum P { A = \"a\" } }\n\
+             pub fn consume(p: P) -> bool {\n\
+                 if let P::A = p { return true; }\n\
+                 matches!(p, P::A) || match p { P::A => true }\n\
+             }\n",
+        );
+        let err = dead_alphabet_letter_at(red.path(), &["rio-scheduler"], &[], &[])
+            .expect_err("pattern-only occurrences must red");
+        assert!(format!("{err:#}").contains("P::A"));
+
+        let green = dead_letter_fixture(
+            "db_str_enum! { pub enum P { A = \"a\" } }\n\
+             pub fn produce() -> P { P::A }\n",
+        );
+        dead_alphabet_letter_at(green.path(), &["rio-scheduler"], &[], &[])
+            .expect("the expression-position constructor is the credit");
+    }
+
+    /// SQL-text production credits through the single-quote form only:
+    /// an inline `'pending'` in a query string mints the value; a BARE
+    /// "pending" string (a sibling display arm — the laundering
+    /// surface the live_061 'obsolete' letter hid behind) does not.
+    #[test]
+    fn dead_letter_sql_quote_credits_bare_string_does_not() {
+        let green = dead_letter_fixture(
+            "db_str_enum! { pub enum S { Pending = \"pending\" } }\n\
+             pub const SQL: &str = \"INSERT INTO t (s) VALUES ('pending')\";\n",
+        );
+        dead_alphabet_letter_at(green.path(), &["rio-scheduler"], &[], &[])
+            .expect("the SQL inline literal is a production site");
+
+        let red = dead_letter_fixture(
+            "db_str_enum! { pub enum S { Pending = \"pending\" } }\n\
+             pub fn label() -> &'static str { \"pending\" }\n",
+        );
+        let err = dead_alphabet_letter_at(red.path(), &["rio-scheduler"], &[], &[])
+            .expect_err("a bare string is never a constructor");
+        assert!(format!("{err:#}").contains("S::Pending"));
+    }
+
+    /// The metrics half: a HELP-described label value with no
+    /// same-crate literal outside registrations reds (both vocabulary
+    /// grammars), an emission-site literal greens it, and the
+    /// `{label=value}` cross-reference form is screened out.
+    #[test]
+    fn dead_letter_metric_vocabulary_reds_and_greens() {
+        let red = dead_letter_fixture(
+            "pub fn reg_v() { describe_counter!(\"rio_v_total\", \
+             \"Verdicts, labeled by verdict (kept|dropped). verdict=kept: retained.\"); }\n\
+             pub fn emit() { let _ = \"kept\"; }\n",
+        );
+        let err = dead_alphabet_letter_at(red.path(), &["rio-scheduler"], &[], &[])
+            .expect_err("the dropped cell has no literal");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("verdict=dropped"), "got: {msg}");
+        assert!(!msg.contains("verdict=kept"), "kept is minted: {msg}");
+
+        let green = dead_letter_fixture(
+            "pub fn reg_v() { describe_counter!(\"rio_v_total\", \
+             \"Verdicts, labeled by verdict (kept|dropped); pairs with \
+             sibling_total{verdict=ghost}.\"); }\n\
+             pub fn emit() { let _ = (\"kept\", \"dropped\"); }\n",
+        );
+        dead_alphabet_letter_at(green.path(), &["rio-scheduler"], &[], &[])
+            .expect("both cells minted; the braced cross-reference is screened");
+    }
+
+    /// cfg(test) constructors are pruned from the corpus: a letter
+    /// whose only constructor is test code is still dead in
+    /// production (exactly how 'obsolete' stayed invisible — its
+    /// round-trip tests exercised the letter while no production arm
+    /// ever minted it).
+    #[test]
+    fn dead_letter_test_constructors_earn_nothing() {
+        let td = dead_letter_fixture(
+            "db_str_enum! { pub enum T { OnlyTests = \"only_tests\" } }\n\
+             #[cfg(test)]\nmod tests { use super::*;\n\
+                 pub fn mk() -> T { T::OnlyTests } }\n",
+        );
+        let err = dead_alphabet_letter_at(td.path(), &["rio-scheduler"], &[], &[])
+            .expect_err("test-only constructors are not production writers");
+        assert!(format!("{err:#}").contains("T::OnlyTests"));
+    }
+
+    /// Allowlist hygiene: a stale ALLOW_UNCONSTRUCTED row (the letter
+    /// gained a constructor) and a PARSE_CONSTRUCTED row naming no
+    /// declared alphabet both red — allowances may only shrink-track
+    /// reality, never outlive it.
+    #[test]
+    fn dead_letter_allowlist_hygiene_reds() {
+        let td = dead_letter_fixture(
+            "db_str_enum! { pub enum H { Minted = \"minted\" } }\n\
+             pub fn produce() -> H { H::Minted }\n",
+        );
+        let err = dead_alphabet_letter_at(
+            td.path(),
+            &["rio-scheduler"],
+            &[("H", "Minted", "planted stale allowance")],
+            &[("GhostEnum", "planted ghost parse row")],
+        )
+        .expect_err("both hygiene arms must red");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("`H::Minted` is stale"), "got: {msg}");
+        assert!(msg.contains("`GhostEnum` names no known"), "got: {msg}");
     }
 }
