@@ -141,14 +141,32 @@ impl Dns1123Label {
             // composed fallback RE-ENTERS sanitize, so a
             // non-conforming caller-supplied stem (uppercase,
             // underscores, overlong, empty) is sanitized instead of
-            // embedded verbatim into the validated type. Terminates
-            // structurally: the recursed raw carries the 8-hex nonce
-            // segment, which survives sanitization (non-empty out),
-            // so the empty-raw arm cannot re-fire; the salt-shaped
-            // raw then takes the deterministic-salt arm, keeping the
-            // namespace partition law intact.
+            // embedded verbatim into the validated type.
+            //
+            // bug_157 (W12-AW): termination is STRUCTURAL — the stem
+            // is pre-truncated to budget − 9 chars BEFORE composing,
+            // so the recursed raw is ≤ budget chars and the map's
+            // `.take(budget)` provably keeps the trailing 8-hex
+            // nonce; the nonce is alphanumeric, so it survives the
+            // edge trim and the recursed `out` is non-empty — this
+            // arm structurally cannot re-fire (one warning, and the
+            // caller's stem prefix is never silently replaced). The
+            // pre-fix shape took `.take(budget)` over the UNBOUNDED
+            // composed raw: a stem whose first `budget` chars all
+            // mapped to '-' truncated the nonce off, trimmed to
+            // empty, re-fired this arm (double warn), and terminated
+            // only on the hard-coded depth-2 "rio" stem — the stated
+            // measure was false and the stem was dropped. The "rio"
+            // third argument remains for signature totality; it is
+            // unreachable now (the recursed call's empty arm cannot
+            // fire). The salt-shaped recursed raw then takes the
+            // deterministic-salt arm, keeping the namespace
+            // partition law intact. (`budget >= 10` by the clamp, so
+            // `budget - 9 >= 1` — at least one stem char survives
+            // when the stem has one.)
+            let stem: String = fallback_stem.chars().take(budget - 9).collect();
             return Self::sanitize(
-                &format!("{fallback_stem}-{:08x}", nonce & 0xffff_ffff),
+                &format!("{stem}-{:08x}", nonce & 0xffff_ffff),
                 reserved,
                 "rio",
             );
@@ -375,6 +393,59 @@ mod tests {
         }
     }
 
+    /// W12-AW (bug_157): the empty-raw arm's termination is
+    /// STRUCTURAL — the nonce provably survives sanitization for
+    /// every stem, so the arm fires at most once and the caller's
+    /// stem is never silently replaced by the depth-2 "rio"
+    /// fallback. The adversarial input: a stem whose first
+    /// `budget` chars all map to '-' (underscores here). Pre-fix,
+    /// `.take(budget)` ran BEFORE `trim_matches('-')`, so the
+    /// composed `{stem}-{nonce}` truncated the nonce off, the
+    /// mapped remainder trimmed to empty, and the arm RE-FIRED
+    /// (double warn; the output minted from the hard-coded "rio"
+    /// stem instead of the first recursion's nonce).
+    ///
+    /// Pre-fix red, verbatim:
+    ///   the fallback identity must derive from the first
+    ///   recursion's nonce, not the depth-2 "rio" replacement
+    ///   (re-fire): got Dns1123Label("rio-d79a5570-1b4dd866")
+    #[test]
+    fn empty_raw_arm_fires_once_nonce_survives_hostile_stem() {
+        let stem = "_".repeat(58);
+        let label = Dns1123Label::sanitize("", WORKER_SUFFIX_RESERVED, &stem);
+        assert!(is_dns1123_label(label.as_str()), "got {label}");
+        assert!(
+            !label.as_str().starts_with("rio-"),
+            "the fallback identity must derive from the first recursion's \
+             nonce, not the depth-2 \"rio\" replacement (re-fire): got {label:?}"
+        );
+        // The surviving nonce IS the first segment: 8 lowercase hex
+        // (the hex alphabet cannot spell "rio", so the assertions
+        // are mutually consistent for every random nonce).
+        let first_seg = label.as_str().split('-').next().expect("non-empty");
+        assert!(
+            first_seg.len() == 8
+                && first_seg
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "the first segment is the surviving 8-hex nonce; got {label:?}"
+        );
+    }
+
+    /// W12-AW companion: an alnum stem prefix SURVIVES into the
+    /// fallback identity (the pre-truncation keeps identity chars,
+    /// it does not blank them).
+    #[test]
+    fn empty_raw_arm_keeps_alnum_stem_prefix() {
+        let stem = format!("Stem{}", "_".repeat(60));
+        let label = Dns1123Label::sanitize("", WORKER_SUFFIX_RESERVED, &stem);
+        assert!(is_dns1123_label(label.as_str()));
+        assert!(
+            label.as_str().starts_with("stem-"),
+            "the stem's alnum prefix survives (case-folded); got {label:?}"
+        );
+    }
+
     proptest! {
         // r[verify store.materialize.worker-identity]
         /// Totality over arbitrary raws × worker indices: every
@@ -430,6 +501,41 @@ mod tests {
             prop_assert!(
                 label.as_str().len() <= DNS1123_MAX_LEN - WORKER_SUFFIX_RESERVED,
                 "budget violated: {:?}",
+                label.as_str()
+            );
+        }
+
+        /// W12-AW quantified (bug_157): the empty-raw arm's
+        /// fires-at-most-once law over the WHOLE adversarial stem
+        /// domain — stems drawn from the '-'-mapping alphabet at
+        /// every length (the population whose `budget`-prefix
+        /// pre-fix truncated the nonce off and re-fired the arm).
+        /// The structural witness of a single fire is the surviving
+        /// nonce: the label's first segment is 8 lowercase hex and
+        /// the output never wears the depth-2 "rio" replacement
+        /// (hex cannot spell "rio", so the assertion is total over
+        /// random nonces). Output validity alone — the pre-fix
+        /// pin — is entailed but NOT sufficient: the re-fire also
+        /// produced valid labels, just from the wrong stem.
+        #[test]
+        fn empty_raw_arm_single_fire_over_hostile_stem_domain(
+            stem in "[-._~ !@#]{0,100}",
+        ) {
+            let label = Dns1123Label::sanitize("", WORKER_SUFFIX_RESERVED, &stem);
+            prop_assert!(is_dns1123_label(label.as_str()));
+            prop_assert!(
+                !label.as_str().starts_with("rio-"),
+                "re-fire detected (depth-2 stem replacement): {:?} from stem {:?}",
+                label.as_str(),
+                stem
+            );
+            let first_seg = label.as_str().split('-').next().expect("non-empty");
+            prop_assert!(
+                first_seg.len() == 8
+                    && first_seg
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "the first segment must be the surviving nonce: {:?}",
                 label.as_str()
             );
         }
