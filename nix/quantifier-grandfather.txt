@@ -815,7 +815,6 @@ rio-gateway/src/handler/grpc.rs	// SAME path don't re-collide in lockstep, and t
 rio-gateway/src/handler/grpc.rs	// superset of the shed set BY THE SHARED CONST. The
 rio-gateway/src/handler/log_tail.rs	// EVERY open hangs: the relay gets no stream, ever.
 rio-gateway/src/handler/log_tail.rs	// arrived past the jump ride along (merged_bug_150) so EVERY exit
-rio-gateway/src/handler/log_tail.rs	// bug_121: disclosure totality quantifies over the
 rio-gateway/src/handler/log_tail.rs	// copy of their span anywhere:
 rio-gateway/src/handler/log_tail.rs	// flushes the OLD pending and re-examines the SAME
 rio-gateway/src/handler/log_tail.rs	// store NEVER re-serves the missing span (every later open is
@@ -934,7 +933,6 @@ rio-log-kernel/src/lib.rs	/// Mint the sealed cursor advance for this verdict â€
 rio-log-kernel/src/lib.rs	/// Reopen for EVERY retryable cause/terminal combination â€” the
 rio-log-kernel/src/lib.rs	/// `servedSpanExact` invariant of `docs/spec/models/logService.qnt`
 rio-log-kernel/src/lib.rs	/// bounded by the SAME formula every other byte axis uses.
-rio-log-kernel/src/lib.rs	/// bug_121 (R30-adjacent disclosure totality): the exit is the
 rio-log-kernel/src/lib.rs	/// builder's `LogBatcher` pre-truncates to the SAME constant before
 rio-log-kernel/src/lib.rs	/// by the claim) and an under-length object can never silently shrink
 rio-log-kernel/src/lib.rs	/// can never again be handed a multi-million-line chunk written by

@@ -659,7 +659,7 @@ mod gap {
     /// Every async wait is a `reserve().await` with the payload still
     /// armed; the payload leaves the guard only in the synchronous
     /// permit-send that follows, and the defuse is the next statement
-    /// — an abort at ANY await point therefore finds the undelivered
+    /// — an abort at ANY await point therefore finds the undelivered — quantifier: census(the W12-AT abort-window battery)
     /// remainder still armed, and [`Drop`] discloses it (marker
     /// and/or lines, both-permits law) subject to the supersession
     /// disposition and the priced channel-full/closed residuals.
@@ -1118,7 +1118,7 @@ async fn run_tail(
 /// longer typechecks (the pre-fix orphan fast path matched
 /// `Exit { .. }` and returned without reading `disclose_truncation`).
 ///
-/// bug_121 carried: disclosure totality quantifies over the LOSS
+/// bug_121 carried: the disclosure obligation quantifies over the LOSS — quantifier: census(grace_exit_discloses_store_served_truncation)
 /// surface, not the fetch surface — the verdict carries the
 /// obligation typed; the truncation marker is the FINAL write. The
 /// spec's exit-exactly-at-expiry law is untouched (disclosure rides
@@ -3622,7 +3622,7 @@ mod tests {
     /// "the full log is durable in the store" unconditionally --- a
     /// user following it on the loss face finds the tail absent.
     ///
-    /// This fixture drives the NEVER-DURABLE face: the builder dies
+    /// This fixture drives the never-durable face: the builder dies
     /// mid-build (stream cut, no final claim ever), the derivation
     /// goes terminal, the grace expires. Pre-fix red:
     ///   `the truncation marker must not claim unconditional

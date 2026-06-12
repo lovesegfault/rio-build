@@ -157,7 +157,8 @@ impl Dns1123Label {
             // empty, re-fired this arm (double warn), and terminated
             // only on the hard-coded depth-2 "rio" stem — the stated
             // measure was false and the stem was dropped. The "rio"
-            // third argument remains for signature totality; it is
+            // third argument remains so the signature stays unchanged;
+            // it is
             // unreachable now (the recursed call's empty arm cannot
             // fire). The salt-shaped recursed raw then takes the
             // deterministic-salt arm, keeping the namespace

@@ -383,7 +383,7 @@ pub enum TailNext {
 /// `disclose_truncation` as plain data a call site could match away
 /// (`Exit { .. }`) — one of the relay's two exit paths honored the
 /// field and the other discarded it. The field is now private and the
-/// ONLY exit is [`Self::discharge`]: the caller must route the value
+/// sole exit is [`Self::discharge`]: the caller must route the value
 /// through the closure that performs (or, for a typed reason,
 /// refuses) the disclosure — a return that never reads the obligation
 /// no longer typechecks. Not `Copy`/`Clone`: the obligation is
@@ -796,11 +796,11 @@ impl FinalClaim {
     /// reader).
     ///
     /// bug_018 — the `false` preimage has TWO faces and a consumer of
-    /// the collapsed bit MUST NOT pick one: (a) UNSERVED-DURABLE —
+    /// the collapsed bit MUST NOT pick one: (a) unserved-durable —
     /// the durability conjuncts hold (sealed AND covered) but the
     /// serve-progress conjuncts failed (cursor short of the seal, or
     /// a crossed gap): everything recorded IS in the store and a
-    /// reader can retrieve it; (b) NEVER-DURABLE — the durability
+    /// reader can retrieve it; (b) never-durable — the durability
     /// conjuncts themselves failed (no sealed count: the execution
     /// never reported its end, e.g. a Detached/DeadlineExpired
     /// builder with un-acked tail lines; or the manifest does not

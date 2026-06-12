@@ -514,7 +514,7 @@ under this rule.
   delivered, and an abort parked at any await finds the undelivered
   remainder still Drop-armed (#rref("gw.tail.disclosure-linear")). The
   pre-close shape held taken state in plain locals across awaited sends:
-  the Drop backstop's totality claim was bounded by cell residency, worst
+  the Drop backstop's coverage claim was bounded by cell residency, worst
   case marker-delivered-lines-gone. Discharge forms: delivery (the sends),
   prior-disclosure suppression (the accepted-gap floor), supersession
   discard (the typed disposition); priced residuals: drop-time channel
