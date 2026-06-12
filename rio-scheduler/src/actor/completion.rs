@@ -4602,6 +4602,22 @@ impl DagActor {
                 // failed_builders insert, NO retry_count++, NO backoff —
                 // infra failures are worker-local and requeue
                 // immediately.
+                //
+                // live059-d: every infra requeue is COUNTED with its
+                // charge disposition — the incident's 520 requeues in
+                // 23 minutes were observable only as INFO log lines
+                // (no counter, no SLI, no alarm on the carousel
+                // signature). fund==spend (W12-LD3): `counted`
+                // increments exactly when the fold charged
+                // `infra_count` this event; `exempt` exactly when it
+                // charged `exempt_infra_count` (the uncharged-by-
+                // design lane). The rate alarm/SLI on this counter is
+                // post-wave ops wiring (the §4 live-ops line).
+                metrics::counter!(
+                    "rio_scheduler_infra_requeues_total",
+                    "charge" => if exempt_from_cap { "exempt" } else { "counted" }
+                )
+                .increment(1);
                 let Some(state) = self.dag.node_mut(drv_hash) else {
                     return FailureHandling::Handled;
                 };

@@ -333,6 +333,21 @@ pub fn describe_metrics() {
          Frequent firing for one pname = raise [sla].probe defaults."
     );
     describe_counter!(
+        "rio_scheduler_infra_requeues_total",
+        "Infrastructure-failure requeues by charge disposition \
+         (live059-d; labels: charge = counted|exempt). `counted` \
+         increments exactly when the fold charged `infra_count` for \
+         the event (the consecutive streak toward \
+         max_infra_retries-poison); `exempt` exactly when it charged \
+         `exempt_infra_count` (CONCURRENT_PUTPATH / floor-promoted — \
+         uncharged on the counted budget by design). The live_059 \
+         carousel (520 requeues / 128 drvs / 23 min) was INFO-log \
+         silent; a sustained per-drv `counted` rate IS the carousel \
+         signature — alert on rate (ops wiring post-wave) and expect \
+         poison-at-10 events to follow under the consecutive-streak \
+         law."
+    );
+    describe_counter!(
         "rio_scheduler_uncorroborated_sizing_claim_total",
         "Worker-reported sizing claims refused by the corroboration gate \
          (bug_090 typed claims; bug_102 the status-borne timeout axis; \

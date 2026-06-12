@@ -6793,3 +6793,78 @@ async fn corroborated_slow_build_timeout_still_heals_the_deadline_floor() -> Tes
     );
     Ok(())
 }
+
+/// **W12-LD3 (live059-d, A1)** — *proposition: every infra requeue is
+/// counted under exactly its charge disposition — fund==spend on the
+/// observability axis (the WO-S6-7 form): `charge=counted` increments
+/// iff the fold charged `infra_count` for the event; `charge=exempt`
+/// iff it charged `exempt_infra_count`.* The incident's 520 requeues
+/// in 23 minutes were INFO-log silent — no counter, no SLI, nothing
+/// an operator could alarm on; the carousel signature is now a RATE
+/// on this counter (the alarm itself is the §4 post-wave ops line).
+#[tokio::test]
+async fn infra_requeues_are_counted_with_their_charge_disposition() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (_db, handle, _task) = setup().await;
+
+    let drv = "ld3-requeue-drv";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+
+    // One COUNTED infra failure (no exemption: no promotion, no
+    // CONCURRENT_PUTPATH) — the fold charges infra_count.
+    pull_complete_failure_result(
+        &handle,
+        drv,
+        rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+            error_msg: "fuse mount lost".into(),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.retry.infra_count, 1,
+        "the fold charged the counted budget"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_infra_requeues_total{charge=counted}"),
+        1,
+        "fund==spend: one counted charge, one counted requeue tick"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_infra_requeues_total{charge=exempt}"),
+        0,
+        "no exempt event has occurred"
+    );
+
+    // One EXEMPT infra failure (CONCURRENT_PUTPATH message — the
+    // exemption predicate) — the fold charges exempt_infra_count.
+    pull_complete_failure_result(
+        &handle,
+        drv,
+        rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+            error_msg: format!("upload refused: {}", rio_proto::CONCURRENT_PUTPATH_MSG),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.retry.exempt_infra_count, 1,
+        "the fold charged the exempt budget"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_infra_requeues_total{charge=exempt}"),
+        1,
+        "fund==spend: one exempt charge, one exempt requeue tick"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_infra_requeues_total{charge=counted}"),
+        1,
+        "the counted series is untouched by the exempt event"
+    );
+    Ok(())
+}
