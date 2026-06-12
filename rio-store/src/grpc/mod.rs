@@ -1012,8 +1012,10 @@ impl StoreService for StoreServiceImpl {
             // PutPath* admit the bypass (gateway/scheduler uploads);
             // this RPC's one-rank-in-a-median defense requires pod_id
             // from a scheduler-signed assignment token, so service
-            // callers are rejected outright.
-            put_path::IngestAuthority::ServiceBypass { .. } => {
+            // callers are rejected outright. TenantJwt is
+            // PutPathChunked-only (source uploads), reject too.
+            put_path::IngestAuthority::ServiceBypass { .. }
+            | put_path::IngestAuthority::TenantJwt => {
                 metrics::counter!("rio_store_hmac_rejected_total",
                                   "reason" => "service_caller_not_permitted")
                 .increment(1);

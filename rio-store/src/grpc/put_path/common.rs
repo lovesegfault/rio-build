@@ -313,6 +313,11 @@ pub(in crate::grpc) enum IngestAuthority {
         #[allow(dead_code)] // named for tracing/debug; policy is the variant
         caller: String,
     },
+    /// Tenant-JWT direct upload (`r[store.put.chunked-jwt-source]`):
+    /// no assignment/service token, the gateway's tenant JWT alone
+    /// authorises a SOURCE-only chunked upload (PutPathChunked). The
+    /// allowlist is enforced by the chunked handler (sources only).
+    TenantJwt,
     /// No HMAC verifier configured (dev mode) — accept all.
     DevMode,
 }
@@ -324,7 +329,9 @@ impl IngestAuthority {
     pub(in crate::grpc) fn builder_claims(&self) -> Option<&rio_auth::hmac::AssignmentClaims> {
         match self {
             IngestAuthority::Builder(c) => Some(c),
-            IngestAuthority::ServiceBypass { .. } | IngestAuthority::DevMode => None,
+            IngestAuthority::ServiceBypass { .. }
+            | IngestAuthority::TenantJwt
+            | IngestAuthority::DevMode => None,
         }
     }
 }

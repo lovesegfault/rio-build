@@ -1010,6 +1010,25 @@ mod tests {
         );
     }
 
+    /// The inverse scoping: claims WITHOUT a deriver-bound identity
+    /// (`drv_hash` empty — the JWT source-upload rung's
+    /// `source_upload_claims` shape) cannot name a deriver. A tenant
+    /// JWT may upload sources only; builder provenance requires an
+    /// assignment token.
+    // r[verify store.put.chunked-jwt-source]
+    #[test]
+    fn deriver_bound_upload_requires_deriver_bound_identity() {
+        let mut jwt = claims();
+        jwt.drv_hash = String::new();
+        // begin() carries the non-empty DERIVER.
+        expect_code(
+            &begin(),
+            &jwt,
+            Code::PermissionDenied,
+            "non-empty deriver under deriver-less claims",
+        );
+    }
+
     /// A non-CA output not in the token's expected_outputs is an
     /// authorization failure, not a malformed message.
     #[test]

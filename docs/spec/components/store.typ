@@ -602,6 +602,25 @@ treats the live set as a presence signal: presence remains keyed on
   with no TLS dependency.
 ]
 
+#r("store.put.chunked-jwt-source")[
+  Under an armed assignment-token verifier, a `PutPathChunked` caller that
+  presents no assignment or service token but carries a verified tenant JWT
+  MUST be accepted as a tenant *source* upload: the `Begin` MUST carry an
+  empty deriver (a non-empty deriver under this rung is rejected with
+  `PERMISSION_DENIED` --- deriver-bound builder uploads still require an
+  assignment token, and the `expected_outputs` allowlist posture for HMAC
+  callers is unchanged), every structural and integrity check runs exactly as
+  for a builder upload, and the `path_tenants` junction binds to the JWT
+  tenant. Anonymous callers and invalid tokens remain rejected.
+]
+This is ADR-024 P3's external-door client upload (`rio build` shipping
+inputSrcs): there is no assignment at eval time, so no allowlist semantics
+apply --- the upload is client-claimed content verified by server-side digest
+and NAR-hash recompute, the same trust level the gateway's service-token
+`PutPath` already grants a tenant for `nix copy --to`. A presented token ---
+valid or not --- always takes the builder ladder; the JWT rung never masks a
+bad token.
+
 + *Idempotency check + `'uploading'` placeholder:* If a `'complete'` manifest
   already exists for this path, return success immediately (fast-path no-op).
   Otherwise, insert an `'uploading'` placeholder row in `manifests` as an

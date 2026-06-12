@@ -40,18 +40,22 @@ fn dep_path() -> String {
 }
 
 /// One output's worth of `Begin` material derived from an on-disk tree.
-struct TreeFixture {
-    nar: Vec<u8>,
-    output: ChunkedOutput,
-    directories: Vec<rio_proto::castore::Directory>,
+pub(crate) struct TreeFixture {
+    pub(crate) nar: Vec<u8>,
+    pub(crate) output: ChunkedOutput,
+    pub(crate) directories: Vec<rio_proto::castore::Directory>,
     /// `(digest, body)` for every chunk in `chunk_manifest` order.
-    chunks: Vec<([u8; 32], Vec<u8>)>,
+    pub(crate) chunks: Vec<([u8; 32], Vec<u8>)>,
 }
 
 /// Derive everything `PutPathChunkedBegin` needs from a real tree:
 /// NAR-dump it, index it, chunk each regular file as one whole-file
 /// chunk, and lift the Directory DAG out of the index.
-fn fixture_for_tree(dir: &std::path::Path, store_path: &str, refs: Vec<String>) -> TreeFixture {
+pub(crate) fn fixture_for_tree(
+    dir: &std::path::Path,
+    store_path: &str,
+    refs: Vec<String>,
+) -> TreeFixture {
     let mut nar = Vec::new();
     dump_path_streaming(dir, &mut nar).expect("fixture dump");
     let parsed = ParsedNar::parse(&nar).expect("fixture NAR parses");
@@ -98,7 +102,7 @@ fn fixture_for_tree(dir: &std::path::Path, store_path: &str, refs: Vec<String>) 
 /// Assemble a `Begin` + the `Chunk` frames for a set of outputs.
 /// `novel` is every distinct chunk digest in global first-occurrence
 /// order minus `already_durable`; the chunk frames follow that order.
-fn assemble_begin(
+pub(crate) fn assemble_begin(
     fixtures: &[&TreeFixture],
     input_closure: Vec<String>,
     already_durable: &std::collections::HashSet<[u8; 32]>,
@@ -194,7 +198,7 @@ async fn get_path_bytes(
 /// The standard multi-node fixture tree: a nested dir, an executable,
 /// an empty file, a symlink, and a file whose content embeds the
 /// dependency's store path (so the reference scan finds it).
-fn write_fixture_tree(root: &std::path::Path, embed: &str) {
+pub(crate) fn write_fixture_tree(root: &std::path::Path, embed: &str) {
     std::fs::create_dir(root).unwrap();
     std::fs::write(root.join("data"), format!("points at {embed}\n")).unwrap();
     std::fs::write(root.join("empty"), b"").unwrap();

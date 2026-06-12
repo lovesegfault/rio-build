@@ -638,7 +638,7 @@ async fn fetch_materializes_output_with_narhash_verify() -> TestResult {
     let (nar, nar_hash) = rio_test_support::fixtures::make_nar(&payload);
     let out_path = drvgen::fake_out_path("fetch-out");
     let info = rio_test_support::fixtures::make_path_info(&out_path, &nar, nar_hash);
-    assert!(cluster.put_path_as_tenant(info, nar).await?);
+    assert!(cluster.put_path_as_builder(info, nar).await?);
 
     // The fixture drv's declared output IS that path, so the stub's
     // BuildCompleted carries it.
