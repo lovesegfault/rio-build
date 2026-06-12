@@ -4811,6 +4811,38 @@ never the mechanism. The verdict budget's time envelope is
 resets the count in-band (the verdict detail names the configured
 classes, so a reload is observable without a side channel).
 
+#r("sched.sla.ladder-transit")[
+  The ladder closure walk MUST separate REACHABILITY from ADMISSION:
+  the worklist transits EVERY declared ladder edge of a walked class
+  --- whether or not that class minted any cell for THIS demand ---
+  and per-rung cell admission (the hosting predicate, the
+  capacity-pin filter) gates only which CELLS join the closure, never
+  which declared edges are walked. A mid-chain rung minting zero
+  cells (a spot-only class under an od pin; a smaller-ceiling rung; a
+  wrong-arch rung) MUST NOT sever the declared tail behind it, and
+  any future per-cell filter added to the walk MUST compose against
+  admission only. Seeds remain the RETAINED producer classes --- a
+  stripped producer cell is a regression signal, not a closure seed.
+]
+Rationale (bughunt-11 merged_bug_015; amends the wave-10 transitive
+closure, 7ae2b282f): the worklist enqueued a rung only if it became a
+closure MEMBER (≥1 cell admitted), and both per-cell filters before
+membership were silent --- so a spot-only g7 under an od pin, or a
+small-ceiling g7, severed the operator's declared g8→g7→g6 tail in
+exactly the multi-generation capacity event the ladder exists for
+(the live_050 strand shape, re-created one filter later). Expanding
+the fixpoint over filtered OUTPUTS instead of the declared graph made
+reachability demand-dependent: every new per-cell filter composed
+multiplicatively against the tail. The documented-intent half of the
+old behavior is PRESERVED and now stated precisely: an unhostable
+rung's CELLS are skipped --- its EDGES are not (the closure can still
+never admit a cell the strip would refuse). The walk's "can never
+silently truncate" claim binds to the pin × ceiling × hosting product
+table (`ladder_transits_declared_edges_independent_of_rung_admission`,
+sla/config.rs) --- the zero-cell mid-rung rows are the cells the
+pre-amendment fixpoint test never covered (it quantified over
+fully-hostable unpinned chains only).
+
 #r("scheduler.sla.global.static-requires-some")[
   `hwCostSource=static` boot-fails when `sla.maxCores`/`maxMem` are unset ---
   Static mode has no instance-type catalog to derive from. The check is in

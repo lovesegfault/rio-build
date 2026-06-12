@@ -1076,21 +1076,32 @@ impl SlaConfig {
         // and ICE evidence would have nowhere to advance it (the
         // live_050 hang's structural exposure).
         //
-        // merged_bug_101: the derivation is a WORKLIST FIXPOINT — a
-        // rung class that JOINS the closure enqueues once (walked-set
-        // cycle guard) and its own declared ladder is walked in turn,
-        // so a declared multi-generation chain (g8→g7→g6) can never
-        // silently truncate (pre-fix `parents` was snapshotted before
-        // any rung joined: one level only, and the operator's
-        // declared tail was dead config in exactly the
-        // multi-generation capacity event the ladder exists for —
-        // the §5-S graceful-degradation directive). Seeds are the
-        // RETAINED classes only (a stripped producer cell is already
-        // a regression signal, not a closure seed); an UNHOSTABLE
-        // rung's ladder is NOT walked (it is not a member — the
-        // closure expands over MEMBERS, never over the declared graph
-        // at large). Deterministic append order: breadth-first —
-        // retained-cell order × declared-rung order × the rung's
+        // r[impl sched.sla.ladder-transit]
+        // merged_bug_101 + merged_bug_015: the derivation is a
+        // WORKLIST FIXPOINT over TWO SEPARATED relations.
+        // REACHABILITY: the walk transits EVERY declared ladder edge
+        // of a walked class — a walked rung enqueues once (walked-set
+        // cycle guard) whether or not it minted any cell for THIS
+        // demand. ADMISSION: the pin filter and the `hosts` predicate
+        // gate only which CELLS join `out`, never which edges are
+        // walked — an unhostable or pin-refused rung mints no cells
+        // (kill-isolation preserved: the closure can never admit a
+        // cell the strip would refuse) but its declared tail still
+        // transits. The pre-merged_bug_015 walk enqueued a rung only
+        // if it became a MEMBER (≥1 cell admitted), so a zero-cell
+        // mid-rung — a spot-only class under an od pin, a
+        // smaller-ceiling rung — silently severed the operator's
+        // declared g8→g7→g6 tail in exactly the multi-generation
+        // capacity event the ladder exists for (the §5-S
+        // graceful-degradation directive; the live_050 strand shape).
+        // The "can never silently truncate" claim binds to
+        // `ladder_transits_declared_edges_independent_of_rung_admission`
+        // (the pin × ceiling × hosting product table) — any future
+        // per-cell filter added to this loop composes against
+        // admission only. Seeds are the RETAINED classes only (a
+        // stripped producer cell is already a regression signal, not
+        // a closure seed). Deterministic append order: breadth-first
+        // — retained-cell order × declared-rung order × the rung's
         // capacity_types order; dedup against everything already
         // present.
         let mut walked: HashSet<HwClassName> = HashSet::new();
@@ -1130,12 +1141,14 @@ impl SlaConfig {
                         out.push(cell);
                     }
                 }
-                // The rung class joins the WALK iff it is a closure
-                // MEMBER (≥1 of its cells in `out` — whether pushed
-                // just now or already present from the producer set);
-                // the walked-set makes every class enqueue at most
-                // once, so declared cycles terminate.
-                if out.iter().any(|(h, _)| h == &rung.class) && walked.insert(rung.class.clone()) {
+                // merged_bug_015 (transit-without-mint): the rung
+                // class joins the WALK unconditionally — declared
+                // edges are reachability, independent of whether THIS
+                // demand minted any cell at the rung. The walked-set
+                // makes every class enqueue at most once, so declared
+                // cycles terminate; an undeclared rung class walks
+                // nothing (its ladder lookup is None).
+                if walked.insert(rung.class.clone()) {
                     queue.push(rung.class.clone());
                 }
             }
@@ -3495,10 +3508,121 @@ mod tests {
         );
     }
 
+    // r[verify sched.sla.ladder-transit]
+    /// **W11-AD (merged_bug_015)** — *proposition: every DECLARED
+    /// rung reachable from the head is walked — a mid-chain rung
+    /// minting ZERO cells does not sever the declared tail;
+    /// population: the pin × ceiling × hosting product table, all
+    /// zero-cell mid-rung cells (od-pinned spot-only rung;
+    /// small-ceiling rung; wrong-arch rung), each on a declared
+    /// g8→g7→g6 chain whose g6 tail must mint.* The pre-amendment
+    /// fixpoint test (`ladder_closure_is_a_transitive_fixpoint`)
+    /// quantified over fully-hostable unpinned chains only — these
+    /// rows are the cells it never covered, and the walk's "can
+    /// never silently truncate" claim binds HERE (the lowercase
+    /// modal rode the lexicon's demote arm unbound while its
+    /// machine witness quantified a strictly narrower domain).
+    ///
+    /// Pre-fix RED (the member-only worklist: a rung joined the walk
+    /// iff ≥1 of its cells joined the closure, and both per-cell
+    /// filters before membership were silent): every row severed at
+    /// g7 — `axis=pin: declared tail severed at the zero-cell
+    /// mid-rung — g6's cells missing from {kept:?}`.
+    #[test]
+    fn ladder_transits_declared_edges_independent_of_rung_admission() {
+        let cat = super::super::catalog::CatalogCeilings::new();
+        let rungs_of = |classes: &[&str]| {
+            Some(CapacityLadder {
+                rungs: classes
+                    .iter()
+                    .map(|c| LadderRung { class: (*c).into() })
+                    .collect(),
+            })
+        };
+        // Three zero-cell-mid-rung variants of g7, one per admission
+        // axis the walk must NOT couple to reachability.
+        let mk_chain = |g7_mut: &dyn Fn(&mut HwClassDef)| {
+            let mut g8 = test_def("rio.build/hw-band", "g8");
+            g8.ladder = rungs_of(&["gen-g7"]);
+            let mut g7 = test_def("rio.build/hw-band", "g7");
+            g7.ladder = rungs_of(&["gen-g6"]);
+            g7_mut(&mut g7);
+            let g6 = test_def("rio.build/hw-band", "g6");
+            let mut cfg = base();
+            cfg.hw_classes = HashMap::from([
+                ("gen-g8".into(), g8),
+                ("gen-g7".into(), g7),
+                ("gen-g6".into(), g6),
+            ]);
+            cfg
+        };
+        let rows: &[(
+            &str,
+            &dyn Fn(&mut HwClassDef),
+            Option<CapacityType>,
+            (u32, u64),
+        )] = &[
+            // Pin axis: g7 is spot-only; the demand carries an od pin
+            // — the pin filter admits zero g7 cells.
+            (
+                "pin",
+                &|g7: &mut HwClassDef| g7.capacity_types = vec![CapacityType::Spot],
+                Some(CapacityType::Od),
+                (1, 0),
+            ),
+            // Ceiling axis: g7's cores ceiling is below the demand —
+            // the hosting predicate admits zero g7 cells.
+            (
+                "ceiling",
+                &|g7: &mut HwClassDef| g7.max_cores = Some(4),
+                None,
+                (8, 0),
+            ),
+            // Hosting (arch) axis: g7 is arm-only for an x86 intent.
+            (
+                "arch",
+                &|g7: &mut HwClassDef| {
+                    g7.labels.push(NodeLabelMatch {
+                        key: ARCH_LABEL.into(),
+                        value: "arm64".into(),
+                    })
+                },
+                None,
+                (1, 0),
+            ),
+        ];
+        for (axis, g7_mut, pin, demand) in rows {
+            let cfg = mk_chain(g7_mut);
+            let seed_cap = pin.unwrap_or(CapacityType::Od);
+            let kept = cfg.retain_hosting_cells(
+                vec![("gen-g8".into(), seed_cap)],
+                "x86_64-linux",
+                *demand,
+                &[],
+                &cat,
+                base_global(),
+                *pin,
+            );
+            // The zero-cell mid-rung minted nothing for THIS demand…
+            assert!(
+                !kept.iter().any(|(h, _)| h == "gen-g7"),
+                "axis={axis}: the perturbed g7 rung must mint zero cells \
+                 (admission unchanged) — got {kept:?}"
+            );
+            // …but the declared tail behind it still mints.
+            assert!(
+                kept.iter().any(|(h, _)| h == "gen-g6"),
+                "axis={axis}: declared tail severed at the zero-cell \
+                 mid-rung — g6's cells missing from {kept:?}"
+            );
+        }
+    }
+
     /// Kill-isolation for the closure: a rung that fails the hosting
-    /// predicate on ANY axis (size / arch / features) is skipped
-    /// QUIETLY — an unhostable rung is not a rung. The closure can
-    /// never admit a cell the producer strip would refuse.
+    /// predicate on ANY axis (size / arch / features) mints no CELLS
+    /// — its declared EDGES still transit (transit-without-mint,
+    /// `sched.sla.ladder-transit`). The closure can never admit a
+    /// cell the producer strip would refuse.
     // r[verify ctrl.nodeclaim.capacity-ladder]
     #[test]
     fn ladder_rung_outside_its_envelope_not_added() {
