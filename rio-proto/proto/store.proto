@@ -200,13 +200,56 @@ service ChunkService {
   // a chunk mid-upload by a concurrent builder reads as absent, so
   // both builders send it and the second S3 PutObject is an idempotent
   // overwrite (I-201 stranded-chunk race). The builder calls this to
-  // compute `PutPathChunkedBegin.novel`. Unscoped, like GetChunk:
-  // chunks are content-addressed and tenant-agnostic
-  // (`r[store.castore.tenant-scope]` covers Directory/file reads, not
-  // chunk presence).
+  // compute `PutPathChunkedBegin.novel`.
+  //
+  // Tenant-scoped (ADR-024, reconciling presence policy across all
+  // object kinds): the bit is additionally set only if the calling
+  // tenant has seen the chunk (a `chunk_tenants` row, written when one
+  // of the tenant's manifests completes). Storage stays digest-keyed
+  // global — dedup at rest is unaffected; a tenant-invisible duplicate
+  // upload is an idempotent overwrite of identical content. Chunks
+  // ingested before tenant rows existed answer absent and re-bind on
+  // the next upload. Retrieval (GetChunk/GetChunks) stays
+  // digest-capability gated, see above.
   //
   // r[impl store.chunk.has-chunks-durable]
+  // r[impl store.chunk.has-chunks-tenant]
   rpc HasChunks(rio.types.HasChunksRequest) returns (rio.types.HasBitmap);
+}
+
+// ADR-024: derivations as a first-class castore blob kind. The
+// stored/negotiated form is the canonical rio.drv.v1.Derivation
+// encoding; the negotiation key is blake3(canonical bytes) — the same
+// digest space as chunks and directories, so the bitmap-presence shape
+// is reused verbatim. Tenant-scoped like DirectoryService: presence
+// and reads answer only for blobs the calling tenant has uploaded
+// (drv_blob_tenants junction); storage is digest-keyed global.
+service DrvBlobService {
+  // Write-through idempotent batch put. The store verifies EVERY blob
+  // server-side (rio_proto::derivation_util::verify_drv_blob): digest
+  // recompute over received bytes, proto decode, structural
+  // validation (sorted/unique repeated fields), canonical re-encode
+  // byte-compare, ATerm reconstruction + drv_path recompute, FOD
+  // output-path recompute. Any failure rejects the WHOLE batch with
+  // INVALID_ARGUMENT naming the failing blob — non-canonical bytes
+  // are never stored. Storage is an unconditional idempotent
+  // overwrite-equivalent (INSERT .. ON CONFLICT DO NOTHING on a
+  // content-addressed key): no present/absent timing oracle, same
+  // discipline as chunk puts. `created[i]` reports whether THIS
+  // tenant's visibility binding was new — it never discloses another
+  // tenant's prior upload.
+  rpc PutDrvBlobs(rio.types.PutDrvBlobsRequest) returns (rio.types.PutDrvBlobsResponse);
+
+  // Fetch the canonical bytes by digest. Byte-stable: the response
+  // body is exactly the received-and-verified put payload. NOT_FOUND
+  // unless the calling tenant has a visibility binding.
+  rpc GetDrvBlob(rio.types.GetDrvBlobRequest) returns (rio.types.DrvBlob);
+
+  // Bulk presence probe over drv digests (ADR-024 "one flat bulk Has
+  // over the full closure digest list"). Bitmap semantics identical
+  // to HasBlobs/HasDirectories: bit i set ⇔ digests[i] is present
+  // AND tenant-visible.
+  rpc HasDrvs(rio.types.HasDrvsRequest) returns (rio.types.HasBitmap);
 }
 
 // Store-side administrative operations. The scheduler's AdminService.

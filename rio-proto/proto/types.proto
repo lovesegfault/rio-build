@@ -585,8 +585,48 @@ message ChunkData {
 // one *complete* manifest — not merely refcount ≥ 1. Two builders racing
 // on the same novel chunk both see `false`, both upload, and the second
 // S3 PutObject is an idempotent overwrite of identical content (I-201).
+// Since ADR-024 the bit additionally requires the calling tenant to
+// have seen the chunk (chunk_tenants junction) — see the RPC comment
+// in store.proto for the migration rule.
 message HasChunksRequest {
   repeated bytes digests = 1;  // 32-byte blake3 chunk digests
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Drv blob service types (ADR-024)
+// ───────────────────────────────────────────────────────────────────────────
+
+// One canonical derivation blob. `digest` MUST be blake3(body), 32
+// raw bytes; `body` MUST be the canonical rio.drv.v1.Derivation
+// encoding (sorted repeated fields, defaults omitted); `drv_path` is
+// the `.drv` store path the content recomputes to. The store verifies
+// all three relationships server-side (verify_drv_blob) and rejects
+// the put on any mismatch — see DrvBlobService.PutDrvBlobs.
+message DrvBlob {
+  bytes digest = 1;
+  string drv_path = 2;
+  bytes body = 3;
+}
+
+message PutDrvBlobsRequest {
+  repeated DrvBlob blobs = 1;
+}
+
+message PutDrvBlobsResponse {
+  // Per-blob, request order: true = this put created the calling
+  // tenant's visibility binding; false = the tenant already had it
+  // (idempotency hit). Deliberately says nothing about other tenants.
+  repeated bool created = 1;
+}
+
+message GetDrvBlobRequest {
+  bytes digest = 1;  // 32-byte blake3 of the canonical drv bytes
+}
+
+// Bulk presence probe over drv digests; response reuses HasBitmap
+// with the same LSB-first semantics as HasBlobs/HasDirectories.
+message HasDrvsRequest {
+  repeated bytes digests = 1;  // 32-byte blake3 drv digests
 }
 
 // ───────────────────────────────────────────────────────────────────────────

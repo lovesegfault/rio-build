@@ -339,6 +339,8 @@ pub use scheduler::scheduler_service_client::SchedulerServiceClient;
 pub use scheduler::scheduler_service_server::{SchedulerService, SchedulerServiceServer};
 pub use store::chunk_service_server::{ChunkService, ChunkServiceServer};
 pub use store::directory_service_server::{DirectoryService, DirectoryServiceServer};
+pub use store::drv_blob_service_client::DrvBlobServiceClient;
+pub use store::drv_blob_service_server::{DrvBlobService, DrvBlobServiceServer};
 pub use store::log_service_client::LogServiceClient;
 pub use store::log_service_server::{LogService, LogServiceServer};
 pub use store::store_admin_service_client::StoreAdminServiceClient;
