@@ -94,8 +94,31 @@ pub enum AttemptTerminalKind {
     Unspecified,
     /// The cgroup OOM-killed the build.
     OomKilled,
-    /// Evicted under node disk pressure.
+    /// Evicted under node disk pressure (the node-condition shapes;
+    /// also the FOLDED home of the pod-attributed shapes until the
+    /// wire carrier splits — see [`Self::EvictedEmptyDirSizeLimit`]).
     EvictedDiskPressure,
+    /// live060-f (A2): a POD-ATTRIBUTED emptyDir-sizeLimit eviction —
+    /// kubelet's own per-pod statement that THIS build exceeded ITS
+    /// declared disk (the "Usage of EmptyDir volume … exceeds the
+    /// limit" / "ephemeral local storage" shapes), categorically
+    /// unlike the ambient node-condition shapes above. I-199's
+    /// ClassifyOnly ruling rests on AMBIGUITY ("a node-condition
+    /// eviction says nothing about THIS build's disk use"); this
+    /// sub-shape carries none, so splitting it is a refinement of the
+    /// ruling's own rationale, never a reversal of its conclusion.
+    ///
+    /// UNPRODUCED at this tree (inert): the controller→scheduler
+    /// carrier is the WIRE enum `AttemptTerminalReason`, which has no
+    /// corresponding value — adding one is a `.fields` wire change
+    /// barred by this wave's zero-amendment-wire ledger. The PROMOTE
+    /// path (this letter feeding the disk floor through the
+    /// corroboration chokepoint as a scheduler-verifiable witness) is
+    /// RULED pending the wire ritual; until then every eviction folds
+    /// to [`Self::EvictedDiskPressure`] and stays classify-only. The
+    /// label row below exists so the vocabulary is ready on both
+    /// planes the moment the carrier lands.
+    EvictedEmptyDirSizeLimit,
     /// Evicted for any non-disk reason.
     EvictedOther,
     /// Finished and reported a result.
@@ -124,6 +147,7 @@ pub fn attempt_terminal_reason_label(kind: AttemptTerminalKind) -> &'static str 
         K::Unspecified => "unspecified",
         K::OomKilled => "oom_killed",
         K::EvictedDiskPressure => "evicted_disk_pressure",
+        K::EvictedEmptyDirSizeLimit => "evicted_empty_dir_size_limit",
         K::EvictedOther => "evicted_other",
         K::Completed => "pod_completed",
         K::Error => "pod_error",
@@ -149,6 +173,10 @@ mod label_tests {
             (
                 AttemptTerminalKind::EvictedDiskPressure,
                 "evicted_disk_pressure",
+            ),
+            (
+                AttemptTerminalKind::EvictedEmptyDirSizeLimit,
+                "evicted_empty_dir_size_limit",
             ),
             (AttemptTerminalKind::EvictedOther, "evicted_other"),
             (AttemptTerminalKind::Completed, "pod_completed"),

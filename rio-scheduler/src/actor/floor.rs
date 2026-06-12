@@ -336,14 +336,31 @@ pub(super) fn witnessed_disposition(
         // THE promoting row: per-container kubelet attribution — the
         // pod hit ITS memory limit; nothing ambient about it.
         R::OomKilled => D::PromoteMemFloor,
-        // Classify-only BY RULING: the controller folds node-condition
-        // eviction shapes ("DiskPressure", "ephemeral-storage") AND
-        // pod-attributed shapes ("ephemeral local storage", "EmptyDir
-        // volume") into this ONE letter (pool/job.rs
-        // pod_termination_reason) — promotion here would re-create
-        // the I-199 ambient over-fire on the disk axis. The disk
-        // floor's designed producer is the worker-side
-        // quota-attributed lane (see the parked arm above).
+        // Classify-only BY RULING (I-199), REFINED not reopened
+        // (live060-f): the ruling's rationale is AMBIGUITY — "a
+        // node-condition eviction says nothing about THIS build's
+        // disk use" — and for the node-condition shapes
+        // ("DiskPressure", "ephemeral-storage") it stands untouched.
+        // The controller TODAY folds the pod-attributed shapes
+        // ("ephemeral local storage", "EmptyDir volume" — kubelet's
+        // own per-pod statement that THIS build exceeded ITS declared
+        // limit, carrying NONE of that ambiguity) into the SAME wire
+        // letter (pool/job.rs pod_termination_reason), so this row
+        // must stay classify-only: promoting the folded letter would
+        // re-create the I-199 ambient over-fire on the disk axis.
+        // The SPLIT letter exists in the shared vocabulary
+        // (rio_common::classify::AttemptTerminalKind::
+        // EvictedEmptyDirSizeLimit — inert/unproduced), and its
+        // promote-with-witness arm (through the bug_102 corroboration
+        // chokepoint) is RULED pending the wire carrier: the
+        // controller→scheduler report enum has no pod-attributed
+        // value and adding one is a .fields wire change barred this
+        // wave (zero amendment wire changes). Trigger to revive: the
+        // next eviction-shaped sizing incident, or the owner
+        // commissioning the additive enum value under the .fields
+        // ritual; live060-a's worker quota lane alone also revives
+        // the upward ladder (the designed producer — see the lane
+        // above).
         R::EvictedDiskPressure => D::ClassifyOnly,
         // Ambient by definition (MemoryPressure / PID pressure /
         // node-shutdown): node-cause, never per-pod sizing evidence.
