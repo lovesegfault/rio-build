@@ -421,12 +421,18 @@ pub struct CostTable {
     /// `denominator` = Σ exposure-secs (24h halflife). Read via
     /// [`lambda_hat`], not as a bare ratio.
     lambda: HashMap<HwClassName, RatioEma>,
-    /// Per-h 24h-EMA of live spot-node count. The `n_λ` scaler in
+    /// Per-h 24h node-count estimate. The `n_λ` scaler in
     /// [`lambda_hat`]: keeps the prior's relative weight ~constant at
     /// "one day of fleet exposure" regardless of fleet size. Derived
     /// from `interrupt_samples` exposure rows in
-    /// [`CostTable::refresh_lambda`] as `Σ exposure_secs / Δt`.
-    node_count: HashMap<HwClassName, PriceEma>,
+    /// [`CostTable::refresh_lambda`] in the [`RatioEma`] shape
+    /// (bug_044): decay-summed `Σ exposure_secs / Σ window_secs` PER
+    /// KEY — never an EMA of instantaneous `d/dt` samples, which
+    /// over-weights low-denominator ticks (the hazard RatioEma's own
+    /// doc names): a capture that cut mid-flush-wave folded a full
+    /// wave's exposure over a millisecond window, and one such spike
+    /// pinned `lambda_hat` toward seed for days.
+    node_count: HashMap<HwClassName, RatioEma>,
     /// Per-cell instance-type menu, sorted by `cores` asc. Populated by
     /// controller-observed instance-type feedback
     /// (`r[sched.sla.cost-instance-type-feedback]`): `nodeclaim_pool`
@@ -545,7 +551,11 @@ impl CostTable {
     /// reduces exactly).
     pub fn lambda_for(&self, h: &str) -> f64 {
         let ema = self.lambda.get(h).copied().unwrap_or_default();
-        let nc = self.node_count.get(h).map(|p| p.value).unwrap_or(0.0);
+        let nc = self
+            .node_count
+            .get(h)
+            .map(|p| p.value_or(0.0))
+            .unwrap_or(0.0);
         lambda_hat(ema.numerator, ema.denominator, nc, LAMBDA_SEED)
     }
 
@@ -889,10 +899,15 @@ impl CostTable {
                     },
                 );
             } else if let Some(h) = key.strip_prefix("node_count:") {
+                // bug_044: the RatioEma halves round-trip like λ's.
+                // Legacy value-only rows (NULL halves) reload as the
+                // empty ratio — seed semantics; Q6 (--wipe rollout)
+                // sanctions dropping a bridge for them.
                 t.node_count.insert(
                     h.to_owned(),
-                    PriceEma {
-                        value,
+                    RatioEma {
+                        numerator: num.unwrap_or(0.0),
+                        denominator: den.unwrap_or(0.0),
                         updated_at: at,
                     },
                 );
@@ -1081,18 +1096,23 @@ impl CostTable {
             }
             // node_count rides the same transaction: it is folded from
             // the same consumed window as λ, so a split persist would
-            // double-fold it on replay.
+            // double-fold it on replay. Both ratio halves persist
+            // (bug_044 — the value column carries the projected ratio
+            // for dashboards/legacy readers).
             for (h, nc) in &self.node_count {
                 sqlx::query(
-                    "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
-                     VALUES ($1, $2, $3, to_timestamp($4)) \
-                     ON CONFLICT (cluster, key) DO UPDATE SET value = $3, updated_at = to_timestamp($4) \
-                     WHERE sla_ema_state.updated_at <= to_timestamp($4) \
+                    "INSERT INTO sla_ema_state (cluster, key, value, numerator, denominator, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, to_timestamp($6)) \
+                     ON CONFLICT (cluster, key) DO UPDATE SET \
+                       value = $3, numerator = $4, denominator = $5, updated_at = to_timestamp($6) \
+                     WHERE sla_ema_state.updated_at <= to_timestamp($6) \
                         OR NOT isfinite(sla_ema_state.updated_at)",
                 )
                 .bind(&self.cluster)
                 .bind(format!("node_count:{h}"))
-                .bind(nc.value)
+                .bind(nc.value_or(0.0))
+                .bind(nc.numerator)
+                .bind(nc.denominator)
                 .bind(nc.updated_at.as_secs_f64())
                 .execute(&mut *txn)
                 .await?;
@@ -1286,14 +1306,20 @@ impl CostTable {
                     _ => {}
                 }
             }
-            // Per-h node_count = Σ exposure_secs / Δt over the batch's
-            // VALUE-TIME window (each `kind='exposure'` row is
-            // "node-seconds accrued since last flush", so the sum ÷
-            // window is mean live nodes). Skip when `prev_stamp` is
-            // unset (first batch has no window baseline) or the batch
-            // carries no value-time advance (late-committing rows at
-            // or below the previous stamp — their exposure still
-            // joins the λ EMA above).
+            // Per-h node_count: BOTH halves of the rate fold per key
+            // (bug_044, the RatioEma shape) — `Σ exposure_secs` and
+            // `Σ window_secs` decay-summed, so the estimate is
+            // Σd/Σdt over the consumed history, never an EMA of
+            // instantaneous d/dt samples (a capture that cuts
+            // mid-flush-wave makes dt≈ms while d carries the full
+            // wave; folded as a sample, one such spike pinned the
+            // scaler — and lambda_hat toward seed — for days; folded
+            // as halves, the ms window adds ~nothing to the
+            // denominator AND the wave's exposure stays counted).
+            // Skip only when `prev_stamp` is unset (first batch has
+            // no window baseline); a zero-advance batch folds (d, 0)
+            // — its exposure still counts, exactly as it joins the λ
+            // EMA above.
             let dt = batch_stamp.secs_since(prev_stamp);
             for (h, (n, d)) in per_h {
                 self.lambda.entry(h.clone()).or_default().update(
@@ -1302,9 +1328,10 @@ impl CostTable {
                     batch_stamp,
                     LAMBDA_HALFLIFE_SECS,
                 );
-                if prev_stamp.as_secs_f64() > 0.0 && dt > 0.0 {
+                if prev_stamp.as_secs_f64() > 0.0 {
                     self.node_count.entry(h).or_default().update(
-                        d / dt,
+                        d,
+                        dt,
                         batch_stamp,
                         LAMBDA_HALFLIFE_SECS,
                     );
@@ -1446,8 +1473,9 @@ impl CostTable {
     pub fn set_node_count(&mut self, h: &str, value: f64, updated_at: f64) {
         self.node_count.insert(
             h.to_owned(),
-            PriceEma {
-                value,
+            RatioEma {
+                numerator: value,
+                denominator: 1.0,
                 updated_at: Epoch::from_wall_clock(updated_at),
             },
         );
@@ -3716,7 +3744,7 @@ mod tests {
         assert!((l.denominator - 9000.0).abs() < 1e-9);
         assert!((l.updated_at.as_secs_f64() - 7100.0).abs() < 1.0);
         let nc = r.node_count.get("intel-7").unwrap();
-        assert!((nc.value - 12.5).abs() < 1e-9);
+        assert!((nc.value_or(0.0) - 12.5).abs() < 1e-9);
         assert!((nc.updated_at.as_secs_f64() - 7100.0).abs() < 1.0);
         // λ̂ recomputed identically from the round-tripped state.
         assert!((r.lambda_for("intel-7") - t.lambda_for("intel-7")).abs() < 1e-12);
@@ -3782,9 +3810,9 @@ mod tests {
         );
         let nc = r.node_count.get("h").unwrap();
         assert!(
-            (nc.value - 12.0).abs() < 1e-9,
+            (nc.value_or(0.0) - 12.0).abs() < 1e-9,
             "node_count rides the unit: got {}",
-            nc.value
+            nc.value_or(0.0)
         );
     }
 
@@ -4155,10 +4183,92 @@ mod tests {
         .unwrap();
         t.refresh_lambda(&sdb).await.unwrap();
         t.refresh_lambda(&sdb).await.unwrap();
-        let nc = t.node_count.get("aws-8-nvme-hi").unwrap().value;
+        let nc = t.node_count.get("aws-8-nvme-hi").unwrap().value_or(0.0);
         assert!(
             (nc - 2.0).abs() < 1e-9,
             "120 node-secs / 60s window = 2; got {nc}"
+        );
+    }
+
+    // r[verify sched.sla.one-weight-law]
+    /// **W12-AI (bug_044, red-first; triage-corrected magnitudes)** —
+    /// *per-key rates fold over per-key windows; population: the
+    /// capture-gap compound event + the steady state.* The compound
+    /// (the triage's binding correction: NOT the report's 1000×
+    /// steady-state claim — steady-state error is ±~10%
+    /// alternating-sign, EMA-negligible): a sibling class commits a
+    /// row 1ms before class b's full flush wave, so the GLOBAL
+    /// value-time advance for b's batch is ~1ms while b's exposure
+    /// carries the whole 600s wave. Pre-fix red: d/dt ≈ 1.2e6 folded
+    /// as ONE instantaneous sample at the entry's own ~600s-stale
+    /// stamp weight (~0.005) ⇒ node_count:b pinned ≈ 5.7e3 vs truth 2
+    /// — and `lambda_hat`'s prior scaler with it, toward seed, for
+    /// days (24h halflife). Post-fix the RatioEma halves fold (d, dt)
+    /// per key: the ms window adds ~nothing to the denominator while
+    /// the wave's exposure stays counted — bounded ≈ 2× transient,
+    /// self-correcting. Assertions read the persisted `value` column
+    /// (shape-agnostic: the red ran against the pre-fix PriceEma form
+    /// verbatim).
+    #[tokio::test]
+    async fn w12_ai_node_count_rate_folds_per_key_over_its_own_window() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        let mut t = CostTable::seeded("c", HwCostSource::Static);
+        let ins = |v: f64, h: &'static str, at: f64, pool: sqlx::PgPool| async move {
+            sqlx::query(
+                "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
+                 VALUES ('c', $1, 'exposure', $2, to_timestamp($3))",
+            )
+            .bind(h)
+            .bind(v)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        };
+        let nc_b = |pool: sqlx::PgPool| async move {
+            let (v,): (f64,) = sqlx::query_as(
+                "SELECT value FROM sla_ema_state WHERE cluster='c' AND key='node_count:b'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            v
+        };
+        // Baseline wave + steady wave: node_count:b = 1200/600 = 2.
+        ins(600.0, "b", 1000.0, db.pool.clone()).await;
+        t.refresh_lambda(&sdb).await.unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
+        ins(1200.0, "b", 1600.0, db.pool.clone()).await;
+        t.refresh_lambda(&sdb).await.unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
+        t.persist_rows(&sdb).await.unwrap();
+        let steady = nc_b(db.pool.clone()).await;
+        assert!(
+            (steady - 2.0).abs() <= 0.2,
+            "steady state holds the ±10% band (the triage correction's \
+             own pin — the close does not chase the refuted 1000×): {steady}"
+        );
+        // The compound: a sibling-class row advances the GLOBAL
+        // value-time to 1ms before b's wave commits.
+        ins(0.6, "a", 2199.999, db.pool.clone()).await;
+        t.refresh_lambda(&sdb).await.unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
+        ins(1200.0, "b", 2200.0, db.pool.clone()).await;
+        t.refresh_lambda(&sdb).await.unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
+        t.persist_rows(&sdb).await.unwrap();
+        let after = nc_b(db.pool.clone()).await;
+        assert!(
+            after <= 10.0,
+            "the split-window wave folds BOUNDED (per-key halves), \
+             never as an instantaneous d/dt spike — got {after} \
+             (pre-fix: ≈5.7e3, pinning lambda_hat toward seed for days)"
+        );
+        assert!(
+            after >= 1.5,
+            "the wave's exposure still counts (the dt==0-skip \
+             alternative would silently drop it): {after}"
         );
     }
 
