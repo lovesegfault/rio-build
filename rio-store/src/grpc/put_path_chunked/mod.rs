@@ -44,7 +44,7 @@ use crate::cas;
 use crate::metadata;
 
 use super::put_path::PlaceholderClaim;
-use super::put_path::common::{PlaceholderGuard, drain_stream};
+use super::put_path::common::{PlaceholderGuard, PutAuth, drain_stream};
 use super::{StoreServiceImpl, putpath_metadata_status};
 
 pub(crate) mod validate;
@@ -85,6 +85,30 @@ fn synthesize_claims(begin: &PutPathChunkedBegin) -> AssignmentClaims {
     }
 }
 
+/// Claims for a tenant-JWT caller under an ARMED verifier (ADR-024 P3
+/// source uploads — see [`StoreServiceImpl::authorize_chunked`]).
+///
+/// `drv_hash` is forced empty: [`validate_begin`] then rejects any
+/// non-empty deriver with `PERMISSION_DENIED`, scoping this rung to
+/// deriver-less source uploads — a tenant JWT can never claim builder
+/// provenance, and the HMAC `expected_outputs` allowlist posture for
+/// builder uploads is untouched. The output list echoes the message:
+/// sources have no assignment, hence no allowlist; content stays
+/// client-claimed and digest/NAR-verified downstream like every
+/// upload (the same trust level the gateway's service-token `PutPath`
+/// already grants a tenant for `nix copy`).
+fn source_upload_claims(begin: &PutPathChunkedBegin) -> AssignmentClaims {
+    AssignmentClaims {
+        executor_id: "tenant-jwt".into(),
+        drv_hash: String::new(),
+        expected_outputs: begin.outputs.iter().map(|o| o.store_path.clone()).collect(),
+        is_ca: false,
+        expiry_unix: u64::MAX,
+        tenant: None,
+        input_closure_digest: String::new(),
+    }
+}
+
 /// Per-output placeholder state carried from phase A into the commit.
 struct OutputClaim {
     /// `sha256(store_path)` — the manifests/narinfo PK.
@@ -96,6 +120,51 @@ struct OutputClaim {
 }
 
 impl StoreServiceImpl {
+    /// `PutPathChunked` auth ladder. The builder ladder
+    /// ([`StoreServiceImpl::verify_assignment_token`] via
+    /// [`StoreServiceImpl::authorize`]) runs unchanged, with ONE rung
+    /// added in front of its missing-token reject: an ARMED verifier
+    /// plus a caller that presented no token header at all but did
+    /// authenticate as a tenant (the `jwt_interceptor` rejects
+    /// forged/expired tokens with `UNAUTHENTICATED` before any handler
+    /// runs, so a `TenantClaims` extension IS a verified identity)
+    /// proceeds as a tenant source upload — `rio build` uploading
+    /// inputSrcs through the external castore door (ADR-024 "the
+    /// externally reachable tenant-authenticated gRPC door").
+    ///
+    /// Returns the shared [`PutAuth`] plus whether the JWT rung fired
+    /// (the caller then validates against [`source_upload_claims`],
+    /// which restricts the Begin to deriver-less uploads). A PRESENTED
+    /// assignment or service token — valid or not — always takes the
+    /// builder ladder; the JWT rung never masks a bad token.
+    // r[impl store.put.chunked-jwt-source]
+    fn authorize_chunked<T>(&self, request: &Request<T>) -> Result<(PutAuth, bool), Status> {
+        let no_token_headers = request
+            .metadata()
+            .get(rio_proto::ASSIGNMENT_TOKEN_HEADER)
+            .is_none()
+            && request
+                .metadata()
+                .get(rio_proto::SERVICE_TOKEN_HEADER)
+                .is_none();
+        if self.hmac_verifier.is_some() && no_token_headers {
+            let tenant_id = request
+                .extensions()
+                .get::<rio_auth::jwt::TenantClaims>()
+                .map(|c| c.sub);
+            if tenant_id.is_some() {
+                return Ok((
+                    PutAuth {
+                        hmac_claims: None,
+                        tenant_id,
+                    },
+                    true,
+                ));
+            }
+        }
+        Ok((self.authorize(request)?, false))
+    }
+
     /// ADR-022 §6 chunked output upload: validate → placeholders →
     /// write-ahead chunk rows → sequential receive walk → CA path check →
     /// one commit transaction.
@@ -114,7 +183,7 @@ impl StoreServiceImpl {
                 .record(start.elapsed().as_secs_f64());
         });
 
-        let auth = self.authorize(&request)?;
+        let (auth, jwt_source) = self.authorize_chunked(&request)?;
         let mut stream = request.into_inner();
 
         // First frame MUST be Begin.
@@ -134,6 +203,8 @@ impl StoreServiceImpl {
 
         let claims = match &auth.hmac_claims {
             Some(c) => c.clone(),
+            // r[impl store.put.chunked-jwt-source]
+            None if jwt_source => source_upload_claims(&begin),
             None => synthesize_claims(&begin),
         };
         let validated = validate_begin(&begin, &claims)?;

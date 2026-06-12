@@ -1,9 +1,10 @@
 //! In-process cluster harness: REAL rio-store services (ephemeral
 //! postgres via rio-test-support, memory chunk backend, the production
-//! JWT interceptor) + the purpose-built scheduler stub. The
-//! coordinator under test connects to it exactly like a production
-//! client: tenant JWT on every RPC, negotiation and uploads against
-//! the real castore surface.
+//! JWT interceptor AND an armed HMAC verifier) + the purpose-built
+//! scheduler stub. The coordinator under test connects to it exactly
+//! like a production client: tenant JWT on every RPC, negotiation and
+//! uploads against the real castore surface under the production auth
+//! posture (source uploads ride the PutPathChunked tenant-JWT rung).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -35,6 +36,13 @@ use crate::stub_scheduler::StubScheduler;
 
 /// Server-side ed25519 seed: tokens signed with this key verify.
 const JWT_SEED: [u8; 32] = [0x07; 32];
+
+/// HMAC assignment key — armed on every store service so the cluster
+/// runs the production auth posture: the coordinator's PutPathChunked
+/// goes through the tenant-JWT source-upload rung
+/// (`r[store.put.chunked-jwt-source]`), and builder-posture uploads
+/// (the fetch test's output seed) need a real assignment token.
+const HMAC_KEY: &[u8] = b"e2e-cluster-hmac-key-32-bytes!!!";
 
 fn tenant_jwt(sub: uuid::Uuid) -> String {
     let key = ed25519_dalek::SigningKey::from_bytes(&JWT_SEED);
@@ -87,6 +95,7 @@ impl DrvBlobService for CountingDrvBlob {
 
 pub struct TestCluster {
     pub db: TestDb,
+    pub tenant: uuid::Uuid,
     pub clients: Clients,
     pub sched: StubScheduler,
     pub drv_has_calls: Arc<AtomicUsize>,
@@ -104,17 +113,27 @@ impl TestCluster {
             Arc::clone(&backend) as Arc<dyn ChunkBackend>
         ));
 
-        // NO HMAC verifier: dev-mode `PutPathChunked` (the client has
-        // no assignment token; production client-upload auth is a P2
-        // door follow-up). JWT interceptor IS armed — every other RPC
-        // resolves the tenant from the token like production.
-        let store_service =
-            StoreServiceImpl::new(db.pool.clone()).with_chunk_cache(Arc::clone(&cache));
-        let chunk_service = ChunkServiceImpl::new(db.pool.clone(), Some(Arc::clone(&cache)), None);
-        let directory_service =
-            DirectoryServiceImpl::new(db.pool.clone(), None, Some(Arc::clone(&cache)), None);
+        // Production auth posture everywhere: JWT interceptor + armed
+        // HMAC verifier on every service. The coordinator holds only a
+        // tenant JWT, so its source uploads exercise the
+        // PutPathChunked tenant-JWT rung, not dev mode.
+        let hmac = Arc::new(rio_auth::hmac::HmacVerifier::from_key(HMAC_KEY.to_vec()));
+        let store_service = StoreServiceImpl::new(db.pool.clone())
+            .with_chunk_cache(Arc::clone(&cache))
+            .with_hmac_verifier(Arc::clone(&hmac));
+        let chunk_service = ChunkServiceImpl::new(
+            db.pool.clone(),
+            Some(Arc::clone(&cache)),
+            Some(Arc::clone(&hmac)),
+        );
+        let directory_service = DirectoryServiceImpl::new(
+            db.pool.clone(),
+            Some(Arc::clone(&hmac)),
+            Some(Arc::clone(&cache)),
+            None,
+        );
         let drv_blob = CountingDrvBlob {
-            inner: DrvBlobServiceImpl::new(db.pool.clone(), None),
+            inner: DrvBlobServiceImpl::new(db.pool.clone(), Some(hmac)),
             has_calls: Arc::new(AtomicUsize::new(0)),
             put_calls: Arc::new(AtomicUsize::new(0)),
         };
@@ -166,6 +185,7 @@ impl TestCluster {
 
         Ok(Self {
             db,
+            tenant,
             clients,
             sched,
             drv_has_calls,
@@ -255,17 +275,30 @@ impl TestCluster {
             .await
     }
 
-    /// Upload a path AS THE TEST TENANT (JWT attached) so the
+    /// Upload a path the way a BUILDER would (assignment token signed
+    /// for exactly this path, tenant claim bound) so the
     /// `path_tenants` junction binds and the tenant-scoped read side
     /// (`GetPath` sig-visibility gate) serves it — the same provenance
-    /// a build output has in production.
-    pub async fn put_path_as_tenant(
+    /// a build output has in production. The armed store enforces the
+    /// `expected_outputs` allowlist on this call.
+    pub async fn put_path_as_builder(
         &self,
         info: rio_proto::validated::ValidatedPathInfo,
         nar: Vec<u8>,
     ) -> anyhow::Result<bool> {
         use rio_proto::types::{PutPathMetadata, PutPathRequest, PutPathTrailer, put_path_request};
         let mut info: rio_proto::types::PathInfo = info.into();
+        let token = rio_auth::hmac::HmacSigner::from_key(HMAC_KEY.to_vec()).sign(
+            &rio_auth::hmac::AssignmentClaims {
+                executor_id: "e2e-builder".into(),
+                drv_hash: "00".repeat(32),
+                expected_outputs: vec![info.store_path.clone()],
+                is_ca: false,
+                expiry_unix: u64::MAX,
+                tenant: Some(self.tenant.to_string()),
+                input_closure_digest: String::new(),
+            },
+        );
         let trailer = PutPathTrailer {
             nar_hash: std::mem::take(&mut info.nar_hash),
             nar_size: std::mem::take(&mut info.nar_size),
@@ -284,9 +317,12 @@ impl TestCluster {
             },
         ];
         let mut store = self.clients.store.clone();
-        let resp = store
-            .put_path(self.clients.req(tokio_stream::iter(frames))?)
-            .await?;
+        let mut req = self.clients.req(tokio_stream::iter(frames))?;
+        req.metadata_mut().insert(
+            rio_proto::ASSIGNMENT_TOKEN_HEADER,
+            token.parse().expect("token is ASCII"),
+        );
+        let resp = store.put_path(req).await?;
         Ok(resp.into_inner().created)
     }
 

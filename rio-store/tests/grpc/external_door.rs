@@ -397,6 +397,142 @@ async fn door_rejects_anonymous_on_every_routed_rpc() -> TestResult {
     Ok(())
 }
 
+/// Drive a chunked client stream through the door with ONLY a tenant
+/// JWT attached (no assignment token — the `rio build` posture).
+async fn send_chunked_jwt(
+    client: &mut StoreServiceClient<Channel>,
+    begin: rio_proto::types::PutPathChunkedBegin,
+    frames: Vec<rio_proto::types::ChunkData>,
+    jwt: &str,
+) -> Result<Vec<bool>, tonic::Status> {
+    use rio_proto::types::put_path_chunked_request;
+    let (tx, rx) = mpsc::channel(8);
+    tokio::spawn(async move {
+        let _ = tx
+            .send(PutPathChunkedRequest {
+                msg: Some(put_path_chunked_request::Msg::Begin(begin)),
+            })
+            .await;
+        for f in frames {
+            let _ = tx
+                .send(PutPathChunkedRequest {
+                    msg: Some(put_path_chunked_request::Msg::Chunk(f)),
+                })
+                .await;
+        }
+    });
+    let req = with_jwt(ReceiverStream::new(rx), jwt);
+    client
+        .put_path_chunked(req)
+        .await
+        .map(|r| r.into_inner().created)
+}
+
+/// ADR-024 P3: a tenant-JWT client (no assignment token) uploads a
+/// SOURCE path through the armed door. The upload commits, the
+/// `path_tenants` junction binds to the JWT tenant (the tenant's own
+/// negotiation sees the root Directory afterwards), and the narinfo
+/// records no deriver — the same shape a substituted path has.
+// r[verify store.put.chunked-jwt-source]
+#[tokio::test]
+async fn door_tenant_jwt_uploads_source_path() -> TestResult {
+    let mut s = DoorSession::new().await?;
+    let jwt = s.jwt();
+
+    let dir = tempfile::TempDir::new()?;
+    let root = dir.path().join("src");
+    crate::put_path_chunked::write_fixture_tree(&root, "nothing");
+    let path = "/nix/store/ssssssssssssssssssssssssssssssss-door-src";
+    let fx = crate::put_path_chunked::fixture_for_tree(&root, path, vec![]);
+    let (mut begin, frames) =
+        crate::put_path_chunked::assemble_begin(&[&fx], vec![], &Default::default());
+    begin.deriver = String::new(); // sources have no producing derivation
+
+    let created = send_chunked_jwt(&mut s.store, begin, frames, &jwt).await?;
+    assert_eq!(created, vec![true]);
+
+    // Junction row bound to the JWT tenant, not dangling.
+    let junction: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM path_tenants WHERE store_path_hash = $1 AND tenant_id = $2",
+    )
+    .bind(
+        rio_nix::store_path::StorePath::parse(path)?
+            .sha256_digest()
+            .to_vec(),
+    )
+    .bind(s.tenant)
+    .fetch_one(&s.db.pool)
+    .await?;
+    assert_eq!(junction, 1, "junction binds to the JWT tenant");
+
+    // Deriver-less narinfo (the substituted-path shape).
+    let deriver: Option<String> =
+        sqlx::query_scalar("SELECT deriver FROM narinfo WHERE store_path = $1")
+            .bind(path)
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert_eq!(deriver, None, "source upload records no deriver");
+
+    // Negotiation parity: the tenant's next `rio build` sees the root
+    // Directory as present and skips the re-upload. The negotiation
+    // key is the root Directory digest from the output's RootNode.
+    let Some(rio_proto::castore::root_node::Node::DirDigest(root_digest)) =
+        fx.output.root_node.as_ref().and_then(|r| r.node.clone())
+    else {
+        panic!("fixture root is a directory");
+    };
+    let dirs = s
+        .directory
+        .has_directories(with_jwt(
+            HasDirectoriesRequest {
+                digests: vec![root_digest],
+            },
+            &jwt,
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(
+        dirs.bitmap,
+        vec![0b1],
+        "root Directory present after commit"
+    );
+    Ok(())
+}
+
+/// The JWT rung is scoped to sources: a deriver-bound `Begin` under a
+/// tenant JWT is rejected with PERMISSION_DENIED — builder provenance
+/// (and the expected_outputs allowlist posture that rides with it)
+/// requires an assignment token, so a tenant JWT can never bypass it.
+// r[verify store.put.chunked-jwt-source]
+#[tokio::test]
+async fn door_jwt_cannot_claim_deriver_bound_upload() -> TestResult {
+    let mut s = DoorSession::new().await?;
+    let jwt = s.jwt();
+
+    let dir = tempfile::TempDir::new()?;
+    let root = dir.path().join("src");
+    crate::put_path_chunked::write_fixture_tree(&root, "nothing");
+    let path = "/nix/store/jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj-door-forged";
+    let fx = crate::put_path_chunked::fixture_for_tree(&root, path, vec![]);
+    let (begin, frames) =
+        crate::put_path_chunked::assemble_begin(&[&fx], vec![], &Default::default());
+    // assemble_begin leaves the fixture DERIVER set — a JWT caller
+    // claiming builder provenance.
+    assert!(!begin.deriver.is_empty());
+
+    let err = send_chunked_jwt(&mut s.store, begin, frames, &jwt)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
+
+    let committed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM narinfo WHERE store_path = $1")
+        .bind(path)
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(committed, 0, "nothing committed");
+    Ok(())
+}
+
 /// A token signed with the wrong key, and an expired token signed
 /// with the RIGHT key, are both rejected at the interceptor with
 /// UNAUTHENTICATED — they never reach a handler.
