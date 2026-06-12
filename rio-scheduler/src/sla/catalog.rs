@@ -23,6 +23,16 @@
 //! (`scheduler.sla.ceiling.stale-solve-revalidation`), not this
 //! file's.
 //!
+//! **Category-pin-less classes (merged_bug_134):** the fetch is
+//! UNFILTERED — a class whose `requirements` omit the
+//! `instance-category` pin matches the full regional catalog
+//! (reservation-only u7in-class rows included) with no 0-match warn;
+//! its only phantom protection is the class-wide committed
+//! `unlaunchable_sizes` exclusion (the fetcher `Gt 5` shape —
+//! `fetcher_gt5_class_gets_the_exclusion` pins exactly this
+//! population). Keep operator classes category-pinned, or keep the
+//! exclusion list current.
+//!
 //! ## Why not launch-observed
 //!
 //! The grounding is exclusion-only by design — NEVER a
@@ -337,11 +347,21 @@ pub fn derive_ceilings(
     out
 }
 
-/// Pull the instance-type catalog: `c`/`m`/`r` families, current
-/// generation only (`requirements` already select on generation; the
-/// `current-generation` filter trims previous-gen noise). Best-effort
-/// — on API error return empty (every class falls to global, the
-/// uncatalogued gauge fires per-class, the operator alerts on it).
+/// Pull the instance-type catalog — UNFILTERED (merged_bug_134): a
+/// bare `describe_instance_types` paginator. The FULL regional
+/// catalog enters, reservation-only and previous-generation types
+/// included; there is NO server-side family or generation filter
+/// here (the pre-fix doc promised `c`/`m`/`r` + current-generation —
+/// a universe the body never fetched, and one it MUST NOT fetch: the
+/// metal doctrine's classes and any operator class pinning another
+/// category live outside `c`/`m`/`r`). Phantom protection rests
+/// SOLELY on each class's `requirements` intersected with the
+/// committed `[sla].unlaunchable_sizes` exclusion — the module
+/// header's launchability grounding law; the
+/// `w12_ak_catalog_doc_matches_the_unfiltered_body` pin keeps this
+/// claim equal to the body in BOTH directions. Best-effort — on API
+/// error return empty (every class falls to global, the uncatalogued
+/// gauge fires per-class, the operator alerts on it).
 pub async fn fetch_catalog(ec2: &aws_sdk_ec2::Client) -> Vec<CatalogEntry> {
     let mut out = Vec::new();
     let mut paginator = ec2.describe_instance_types().into_paginator().send();
@@ -911,5 +931,36 @@ mod tests {
         let e = ce("m7i.4xlarge", 16, 64, "amd64", 0);
         assert_eq!(e.labels[label::CATEGORY], "m");
         assert_eq!(e.labels[label::GENERATION], "7");
+    }
+    // r[verify scheduler.sla.ceiling.catalog-derived+4]
+    /// **W12-AK (merged_bug_134; the doc arm, made falsifiable)** —
+    /// *the documented universe equals the fetched universe, or the
+    /// doc says it doesn't and the backstop is pinned.* The pre-fix
+    /// doc promised c/m/r families + a current-generation filter over
+    /// a body with ZERO `.filters()` calls — unfalsifiable by CI, and
+    /// the campaign's launchability-exclusion audit reasoned against
+    /// that false universe. The doc now states the fetch is
+    /// UNFILTERED with requirements ∩ unlaunchable_sizes as the only
+    /// backstop (`fetcher_gt5_class_gets_the_exclusion` pins the
+    /// un-pinned-class population); THIS pin holds the claim equal to
+    /// the body in BOTH directions — landing a server-side filter
+    /// without re-deriving the doc and the grounding header REDs here.
+    #[test]
+    fn w12_ak_catalog_doc_matches_the_unfiltered_body() {
+        let src = include_str!("catalog.rs");
+        let prod = src
+            .split_once("#[cfg(test)]\nmod tests")
+            .map_or(src, |(p, _)| p);
+        assert_eq!(
+            prod.matches(".filters(").count(),
+            0,
+            "fetch_catalog is documented UNFILTERED — a filter landed; \
+             re-derive the doc and the launchability grounding header \
+             with it (merged_bug_134)"
+        );
+        assert!(
+            prod.contains("UNFILTERED (merged_bug_134)"),
+            "the doc carries the truthful universe claim"
+        );
     }
 }
