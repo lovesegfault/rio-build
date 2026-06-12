@@ -43,7 +43,7 @@
 //
 //   - D1: the controller-observed timeout-cap exhaustion (E7) ends
 //     terminal Cancelled, the same verdict as the worker-observed E4.
-//   - D2: an at-cap controller termination (E6) stamps the 300 s window
+//   - D2: an at-cap controller termination (E6) stamps the lastInfraAt
 //     anchor with its infra_count increment.
 //   - D3: a floor-promoted controller termination (E6) charges
 //     exempt_infra_count and poisons at the exempt cap.
@@ -54,7 +54,7 @@
 //     sweep and charges the threshold/exclusion budget, so the no-report
 //     crash loop is bounded.
 //   - Failover: the new leader rebuilds the retry view from the fold over
-//     the durable history — budgets, the window anchor and the placement
+//     the durable history — budgets, the diagnostic anchor and the placement
 //     exclusion survive a leader change (sched.retry.failover-budget);
 //     the selective forgiveness is gone.
 //
@@ -112,9 +112,9 @@
 //     and the admin-clear/TTL-expiry path (PG-first, node removed) --
 //     each is itself a durable ledger reset row, appended atomically with
 //     the site's status persist.
-//   - The abstract clock: the 300 s infra window, the poison TTL and the
+//   - The abstract clock: the poison TTL and the
 //     transient backoff are scaled to small model constants with their
-//     production ordering preserved (POISON_TTL > WINDOW >= backoff
+//     production ordering preserved (POISON_TTL >= backoff
 //     base).
 //
 // WHAT IS NOT MODELED (deliberate scope boundaries, each priced)
@@ -449,8 +449,6 @@ module retryPolicy {
     kind: ObsKind,
     chargedAny: bool,       // some budget counter was charged by this event
     doubleCharge: bool,     // the same budget was charged twice by this event
-    windowReset: bool,      // the I-127 stale-window reset fired
-    exemptFallthrough: bool,// ...and it fired on an exempt under-cap event
     promoted: bool,         // the event's floor outcome
     atCap: bool,
     lateInstallment: bool,  // controller report correlated through an rd entry
@@ -519,7 +517,6 @@ module retryPolicy {
   pure val MAX_INFRA = 2            // .max_infra_retries
   pure val MAX_TIMEOUT = 2          // .max_timeout_retries
   pure val MAX_EXEMPT = 2           // .max_exempt_infra_retries
-  pure val INFRA_WINDOW = 1         // .infra_retry_window_secs
   pure val BACKOFF_BASE = 1         // .backoff_base_secs
   pure val BACKOFF_MULT = 2         // .backoff_multiplier
   pure val BACKOFF_CAP = 2          // .backoff_max_secs
@@ -549,8 +546,8 @@ module retryPolicy {
   }
 
   pure val noObs: LastObs = {
-    kind: ONone, chargedAny: false, doubleCharge: false, windowReset: false,
-    exemptFallthrough: false, promoted: false, atCap: false,
+    kind: ONone, chargedAny: false, doubleCharge: false,
+    promoted: false, atCap: false,
     lateInstallment: false, raceAhead: false, terminal: false, dropped: false,
     exclusionMinted: false,
   }
@@ -592,8 +589,11 @@ module retryPolicy {
   pure def specApply(c0: Counters, ev: FoldEvent, eligible: Set[str]): { c: Counters, v: Verdict } =
     match ev {
       // E1: handle_transient_failure -- record, threshold, fleet, count cap.
+      // live059-c: a different-class outcome is health evidence -- the
+      // consecutive-infra streak breaks at the arm's entry.
       | FTransient(e) =>
         val c1 = { ...c0,
+          infraCount: 0,
           failedBuilders: c0.failedBuilders.union(Set(e.exec)),
           failureCount: c0.failureCount + 1 }
         if (thresholdReached(c1))
@@ -609,27 +609,23 @@ module retryPolicy {
           { c: { ...c1, poisonedAt: At(e.at) }, v: VPoison(RTransientBudget) }
 
       // E2: handle_infrastructure_failure -- exempt block (increment,
-      // cap, NO early return under cap), I-127 window reset, non-exempt
-      // cap check then charge + anchor stamp.
+      // cap, NO early return under cap), non-exempt cap check then
+      // charge + anchor stamp. live059-c: the I-127 wall-window reset
+      // is RETIRED -- infraCount counts CONSECUTIVE failures and only
+      // intervening health evidence (E1/E4/E7 arms) forgives; an
+      // exempt event neither charges nor forgives the streak, and
+      // lastInfraAt is a diagnostic anchor only.
       | FInfra(e) =>
         val cExempt = if (e.exempt) { ...c0, exemptInfraCount: c0.exemptInfraCount + 1 } else c0
         if (e.exempt and cExempt.exemptInfraCount >= MAX_EXEMPT)
           { c: { ...cExempt, poisonedAt: At(e.at) }, v: VPoison(RExemptInfraBudget) }
         else
-          val cReset =
-            if (not(e.atCap) and
-                match cExempt.lastInfraAt {
-                  | NoTime => false
-                  | At(last) => e.at - last > INFRA_WINDOW
-                })
-              { ...cExempt, infraCount: 0 }
-            else cExempt
           if (e.exempt)
-            { c: cReset, v: VRequeue }
-          else if (cReset.infraCount >= MAX_INFRA)
-            { c: { ...cReset, poisonedAt: At(e.at) }, v: VPoison(RInfraBudget) }
+            { c: cExempt, v: VRequeue }
+          else if (cExempt.infraCount >= MAX_INFRA)
+            { c: { ...cExempt, poisonedAt: At(e.at) }, v: VPoison(RInfraBudget) }
           else
-            { c: { ...cReset, infraCount: cReset.infraCount + 1, lastInfraAt: At(e.at) },
+            { c: { ...cExempt, infraCount: cExempt.infraCount + 1, lastInfraAt: At(e.at) },
               v: VRequeue }
 
       // E3: handle_permanent_failure -- poison + diagnostics-only insert.
@@ -640,11 +636,12 @@ module retryPolicy {
           v: VPoison(RPermanent) }
 
       // E4: handle_timeout_failure -- check-then-increment; Cancel at cap.
+      // live059-c: deadline-class outcome breaks the infra streak.
       | FWorkerTimeout(at) =>
         if (c0.timeoutCount < MAX_TIMEOUT)
-          { c: { ...c0, timeoutCount: c0.timeoutCount + 1 }, v: VRequeue }
+          { c: { ...c0, infraCount: 0, timeoutCount: c0.timeoutCount + 1 }, v: VRequeue }
         else
-          { c: c0, v: VCancel }
+          { c: { ...c0, infraCount: 0 }, v: VCancel }
 
       // E5: reassign_derivations -- charges nothing, re-checks the threshold.
       | FDisconnect(at) =>
@@ -654,7 +651,7 @@ module retryPolicy {
           { c: c0, v: VRequeue }
 
       // E6: handle_executor_termination. Post-collapse (T-1b.9): the
-      // at-cap increment stamps the window anchor (D2) and the promoted
+      // at-cap increment stamps the diagnostic anchor (D2) and the promoted
       // arm charges the exemption budget and poisons at its cap (D3).
       | FControllerTermination(e) =>
         if (e.atCap)
@@ -673,11 +670,12 @@ module retryPolicy {
 
       // E7: handle_deadline_exceeded. Post-collapse (T-1b.10): terminal
       // Cancel at the cap (D1), the same verdict as the worker channel.
+      // live059-c: deadline-class -- same streak break as E4.
       | FControllerDeadlineExceeded(at) =>
         if (c0.timeoutCount >= MAX_TIMEOUT)
-          { c: c0, v: VCancel }
+          { c: { ...c0, infraCount: 0 }, v: VCancel }
         else
-          { c: { ...c0, timeoutCount: c0.timeoutCount + 1 }, v: VRequeue }
+          { c: { ...c0, infraCount: 0, timeoutCount: c0.timeoutCount + 1 }, v: VRequeue }
 
       // E8: tick_process_backstop_timeouts -- record + threshold check,
       // decided and persisted at the charging site (T-1b.6).
@@ -899,7 +897,7 @@ module retryPolicy {
     matUnobtainableCount >= 0 and matUnobtainableCount <= MAX_MAT_UNOBTAINABLE,
   }
 
-  /// The model-checked form of sched.retry.counters-refine-history+2:
+  /// The model-checked form of sched.retry.counters-refine-history+3:
   /// the cached counter view equals the reference fold of the observed
   /// history (carried incrementally as `spec`). poisoned_at is excluded
   /// when the poison came from a site outside the fold's event alphabet
@@ -1090,11 +1088,11 @@ module retryPolicy {
   /// Cancelled (the post-collapse D1 shape; the as-built model's
   /// controller-cap POISON witness has no producer any more).
   val noControllerCapCancelled = not(dStatus == DCancelled and last.kind == OE7)
-  /// Violated when the I-127 stale-window reset fires.
-  val noWindowReset = not(last.windowReset)
-  /// Violated when the window reset fires on an exempt under-cap event
-  /// (the as-built E2 fall-through the fold reproduces).
-  val noExemptFallthroughReset = not(last.exemptFallthrough)
+  // live059-c RETIREMENT: the noWindowReset / noExemptFallthroughReset
+  // reachability witnesses retired WITH the I-127 wall-window reset and
+  // its exempt fall-through (the arms no longer exist in the fold; the
+  // consecutive-streak law's reachability is carried by the E1/E4/E7
+  // streak-break arms under countersRefineHistory + verdictMatchesFold).
   /// Violated when a promoted controller termination is processed (D3 shape).
   val noPromotedTermination = not(last.kind == OE6 and last.promoted)
   /// Violated when an at-cap controller termination charges (D2 shape).
@@ -1331,21 +1329,15 @@ module retryPolicy {
   // --- 7c. the shared infra-classification arm ----------------------------
 
   /// E2's body, shared by the three worker-reported infra classes: one
-  /// specApply (the exempt block with its own cap, the I-127 window
-  /// reset and its exempt fall-through, the non-exempt cap check and
-  /// charge with the anchor stamp), acted on per the verdict. The
-  /// windowReset/exemptFallthrough ghost flags are recomputed locally
-  /// for the witnesses; they do not feed the counters.
+  /// specApply (the exempt block with its own cap, the non-exempt cap
+  /// check and charge with the diagnostic anchor stamp -- live059-c:
+  /// the I-127 window reset and its exempt fall-through are retired;
+  /// the streak forgiveness lives on the E1/E4/E7 health-evidence
+  /// arms), acted on per the verdict.
   // Mirrors: completion.rs::handle_infrastructure_failure through
   //          append_and_decide_in_tx + classify().
   action infraArm(w: str, execAfter: ExecRec, fleetAfter: Set[str], exempt: bool, atCap: bool, consumesPromotion: bool): bool = all {
     val applied = specApply(spec, FInfra({ at: now, exempt: exempt, atCap: atCap }), fleetAfter)
-    val exemptCapHit = exempt and (live.exemptInfraCount + 1 >= MAX_EXEMPT)
-    val windowElapsed = and {
-      not(atCap),
-      not(exemptCapHit),
-      match live.lastInfraAt { | NoTime => false | At(t) => now - t > INFRA_WINDOW },
-    }
     all {
       spec' = applied.c,
       specVerdict' = applied.v,
@@ -1362,7 +1354,7 @@ module retryPolicy {
           depStatus' = DepFailed,
           everFailureTerminal' = true,
           last' = { ...noObs, kind: OE2, chargedAny: true, terminal: true,
-            windowReset: windowElapsed, promoted: consumesPromotion, atCap: atCap },
+            promoted: consumesPromotion, atCap: atCap },
         }
         | VRequeue => all {
           dStatus' = DReady,
@@ -1371,8 +1363,7 @@ module retryPolicy {
           pg' = { ...pg, ledger: applied.c },
           depStatus' = depStatus,
           everFailureTerminal' = everFailureTerminal,
-          last' = { ...noObs, kind: OE2, chargedAny: true, windowReset: windowElapsed,
-            exemptFallthrough: windowElapsed and exempt,
+          last' = { ...noObs, kind: OE2, chargedAny: true,
             promoted: consumesPromotion, atCap: atCap },
         }
         | VCancel => all {
@@ -1383,8 +1374,7 @@ module retryPolicy {
           pg' = { ...pg, ledger: applied.c },
           depStatus' = depStatus,
           everFailureTerminal' = everFailureTerminal,
-          last' = { ...noObs, kind: OE2, chargedAny: true, windowReset: windowElapsed,
-            exemptFallthrough: windowElapsed and exempt,
+          last' = { ...noObs, kind: OE2, chargedAny: true,
             promoted: consumesPromotion, atCap: atCap },
         }
       },

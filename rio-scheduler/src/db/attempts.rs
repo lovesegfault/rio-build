@@ -35,10 +35,11 @@ use crate::state::{
 /// Ledger retention floor (decision P8), consulted by the live sweep:
 /// `tick_gc_attempt_ledger` computes its horizon as
 /// `sweep_horizon_secs(decision_budget(), LEDGER_RETENTION_FLOOR) =
-/// max(floor, LIVE configured infra_retry_window_secs, POISON_TTL)` —
-/// an operator-widened infra window > 24 h widens retention with it
-/// (the "re-check against the configured value" clause, honored
-/// through the budget rather than a config knob). The sweep
+/// max(floor, POISON_TTL)` — the retired infra window's term is gone
+/// (live059-c: the consecutive-streak law needs the post-reset
+/// suffix, which the per-lane reset cut bounds independent of wall
+/// age; the 300 s term was floor-dominated, horizon unchanged). The
+/// sweep
 /// ([`SchedulerDb::gc_attempt_ledger`]) deletes only the suffix
 /// complement: attempt-kind rows strictly before their derivation's
 /// last reset row, past the horizon, with no active assignment for

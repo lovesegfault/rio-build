@@ -120,7 +120,6 @@
           "max_retries": 2,
           "max_infra_retries": 10,
           "max_timeout_retries": 4,
-          "infra_retry_window_secs": 300.0,
           "max_exempt_infra_retries": 50,
           "backoff_base_secs": 5.0,
           "backoff_multiplier": 2.0,
@@ -242,12 +241,6 @@
             "format": "uint32",
             "minimum": 0,
             "default": 4
-          },
-          "infra_retry_window_secs": {
-            "description": "Seconds since the LAST infra failure after which the\n`infra_retry_count` is reset to 0. Infra failures are by\ndefinition transient — N quick failures suggests a\nmisclassified permanent error, but N failures spread over\nhours are independent incidents and shouldn't accumulate\ntoward poison. I-127: a leaked PutPath lock caused 4 builders\nin a row to hit \"concurrent PutPath\"; the drv was poisoned at\n99.7% despite being fine. With a window, the counter resets\nonce the cluster self-heals (lock released, store recovered).",
-            "type": "number",
-            "format": "double",
-            "default": 300.0
           },
           "max_exempt_infra_retries": {
             "description": "Maximum number of `exempt_from_cap` infra-retry attempts before\nthe derivation is poisoned. CONCURRENT_PUTPATH and\n`floor_outcome.promoted` skip `infra_count++` entirely, so a\nleaked store-side placeholder lock (the I-125a class) makes\nevery honest worker report the exempt message → infinite pod\nchurn at `info!` level only. This high-water cap is the\nscheduler-side terminal: every other completion status has one\n(`max_retries`, `max_infra_retries`, `max_timeout_retries`,\nsize-tier ladder); without this, the I-127 exemption was the\nsole worker-reportable status with zero scheduler-side bound.",
@@ -371,7 +364,6 @@
       "max_retries": 2,
       "max_infra_retries": 10,
       "max_timeout_retries": 4,
-      "infra_retry_window_secs": 300.0,
       "max_exempt_infra_retries": 50,
       "backoff_base_secs": 5.0,
       "backoff_multiplier": 2.0,

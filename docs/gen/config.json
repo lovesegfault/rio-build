@@ -268,12 +268,6 @@
         "description": "Maximum number of `TimedOut` re-dispatches before the derivation goes terminal (`Cancelled`)."
       },
       {
-        "key": "retry.infra_retry_window_secs",
-        "type": "double",
-        "default": "300.0",
-        "description": "Seconds since the LAST infra failure after which the `infra_retry_count` is reset to 0."
-      },
-      {
         "key": "retry.max_exempt_infra_retries",
         "type": "uint32",
         "default": "50",

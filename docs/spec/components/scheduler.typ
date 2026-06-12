@@ -762,35 +762,44 @@ between counters; the reference fold reproduces each counter's own
 convention and the fencepost unification stays the recorded open question
 (the TODO at the retry kernel's `decide()`).
 
-#r("sched.retry.counters-refine-history+2")[
+#r("sched.retry.counters-refine-history+3")[
   The per-derivation retry counters (`count`, `resubmit_cycles`,
   `infra_count`, `timeout_count`, `last_infra_failure_at`,
   `exempt_infra_count`, `failed_builders`, `failure_count`, `poisoned_at`,
   `backoff_until`) MUST at every point equal the reference fold of the
   derivation's observed failure-event history: each observed event charges
-  the counters its class charges and no others; an infrastructure failure
-  whose own resource-floor outcome is not at the ceiling, observed more
-  than `infra_retry_window_secs` (default 300 s) after the most recent
-  counted infrastructure failure, resets `infra_count` before any charge
-  --- whether or not the failure itself is cap-exempt; a non-exempt
-  infrastructure failure then charges `infra_count` and re-anchors the
-  window; a floor-promoted or CONCURRENT_PUTPATH infrastructure failure
-  charges `exempt_infra_count` instead of `infra_count` and does not move
-  the window anchor; the cache-hit and resubmit resets are themselves
+  the counters its class charges and no others; `infra_count` counts
+  CONSECUTIVE infrastructure failures --- it resets ONLY on intervening
+  health evidence (a different-class attempt outcome of this derivation:
+  a transient build failure or a deadline-class outcome, each proof the
+  infrastructure delivered the build to a non-infra verdict), NEVER on
+  elapsed time (the poison cap is denominated in the evidence's own clock
+  --- the derivation's conduct --- not the enforcer's wall-window); a
+  non-exempt infrastructure failure charges `infra_count` and stamps
+  `last_infra_failure_at` (a diagnostic anchor, driving no reset); a
+  floor-promoted or CONCURRENT_PUTPATH infrastructure failure charges
+  `exempt_infra_count` instead of `infra_count` and neither charges nor
+  forgives the streak; the cache-hit and resubmit resets are themselves
   history events that zero the per-cycle counters; and no code path
   mutates a counter outside the fold's event alphabet.
 ]
-The fold is `rio-scheduler/src/retry_policy.rs` (a pure function with unit
-tests against hand-computed histories); the model-checked form quantifies
-over observation orderings and is deferred to the `retryPolicy.qnt` model.
-The 300 s window appears here because no other rule states it --- it is the
-I-127 forgiveness that distinguishes a burst of misclassified permanent
-failures from sparse independent incidents, and a fold that omits it
-poisons healthy derivations on long builds. The window reset firing on
-cap-exempt observations too is the as-built `handle_infrastructure_failure`
-fall-through (the exempt arm does not return before the reset block); the
-fold reproduces it, so a counter mismatch on that history class reads as a
-code defect rather than a fold gap.
+The fold lives in the dependency-free `rio-retry-kernel` crate (consumed
+through the `rio-scheduler/src/retry_policy.rs` projection shim, whose
+hand-computed-history battery is the equivalence oracle); the
+model-checked form quantifies over observation orderings and is deferred
+to the `retryPolicy.qnt` model. The consecutive denomination appears here
+because no other rule states it --- live059-c retired the I-127 300 s
+wall-window reset, whose forgiveness keyed on the ENFORCER's clock: any
+deterministic failure with cycle time above the window oscillated
+`infra_count` 0↔1 forever (`max_infra_retries` unreachable --- the
+live_059 carousel, 520 requeues across 128 derivations at INFO-level
+silence), while the protection it was minted for (the leaked-PutPath
+burst) is exempt-class today. Sparse GENUINE infra failures remain
+protected through the health-evidence arm: independent incidents are
+separated by the build actually progressing (a different outcome class),
+which is the evidence of independence the wall-clock gap only proxied;
+`timeout_count` carried this no-elapsed-reset form first and is the
+in-tree precedent.
 
 #r("sched.retry.verdict-channel-invariant")[
   For a fixed physical failure history, the budget verdict (requeue,

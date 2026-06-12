@@ -59,7 +59,7 @@
 //! mutation sites and nine cap-check entry points (E1–E9; the
 //! historical entry-point legend in the `docs/spec/models/retryPolicy.qnt`
 //! header) collectively implement:
-//! which event charges which counter, the 300 s sliding-window reset,
+//! which event charges which counter, the consecutive-streak law,
 //! the resource-floor `{promoted, at_cap}` exemption, the cache-hit and
 //! resubmit resets (as explicit history events), the per-executor
 //! exclusion set, and the budget verdicts (requeue / poison / cancel /
@@ -109,7 +109,7 @@
 //! `last_completed` dedup deciding which of them count) is the
 //! environment's nondeterminism; the Stage-B model quantifies over it and
 //! checks that the code's counters equal `reference_fold(observed)`
-//! (`sched.retry.counters-refine-history+2`) and that the verdict is
+//! (`sched.retry.counters-refine-history+3`) and that the verdict is
 //! the same for every observation of one physical history
 //! (`sched.retry.verdict-channel-invariant`).
 //!
@@ -130,7 +130,7 @@
 //! - Time is an abstract monotonic clock in whole seconds ([`AbsTime`]).
 //!   `std::time::Instant` is deliberately not used: the fold must be
 //!   constructible at arbitrary points for hand-computed histories, and
-//!   the only consumers of real time are the 300 s infra window, the 24 h
+//!   the only consumers of real time are the 24 h
 //!   poison TTL, and the backoff deadline.
 //! - The backoff is the deterministic curve `min(base · multᵃ, cap)`
 //!   without the production ±jitter; the model compares `backoff_until`
@@ -416,8 +416,6 @@ pub struct Budget {
     /// `RetryPolicy.max_exempt_infra_retries` — the cap-exemption's own
     /// terminal.
     pub max_exempt_infra_retries: u32,
-    /// `RetryPolicy.infra_retry_window_secs` — the sliding-window reset.
-    pub infra_retry_window_secs: u64,
     /// `RetryPolicy.backoff_base_secs` (whole seconds).
     pub backoff_base_secs: u64,
     /// `RetryPolicy.backoff_multiplier` (integral; the production default
@@ -446,7 +444,6 @@ impl Default for Budget {
             max_infra_retries: 10,
             max_timeout_retries: 4,
             max_exempt_infra_retries: 50,
-            infra_retry_window_secs: 300,
             backoff_base_secs: 5,
             backoff_multiplier: 2,
             backoff_max_secs: 300,
@@ -639,8 +636,9 @@ pub struct Counters<Id> {
     pub infra_count: u32,
     /// Timeout count (`RetryState::timeout_count`).
     pub timeout_count: u32,
-    /// Anchor of the 300 s infra window
-    /// (`RetryState::last_infra_failure_at`).
+    /// Diagnostic anchor of the last counted infra charge
+    /// (`RetryState::last_infra_failure_at`; live059-c: drives no
+    /// reset).
     pub last_infra_failure_at: Option<AbsTime>,
     /// Cap-exempt infrastructure failure count
     /// (`RetryState::exempt_infra_count`).
@@ -764,7 +762,7 @@ pub fn exhausts_fleet<Id: Ord>(failed_builders: &IdSet<Id>, fleet: &FleetView<Id
     fleet.eligible.is_subset(failed_builders)
 }
 
-// r[impl sched.retry.counters-refine-history+2]
+// r[impl sched.retry.counters-refine-history+3]
 // r[impl sched.retry.transient-budget+2]
 // r[impl sched.retry.attempts-bounded+5]
 // r[impl sched.retry.verdict-channel-invariant]
@@ -846,6 +844,14 @@ fn apply<Id: Ord + Clone>(
         // check the per-cycle count cap, and only on the retry arm
         // increment `count` and arm the backoff.
         AttemptEvent::Transient { at, executor } => {
+            // live059-c: a different-class outcome is HEALTH EVIDENCE
+            // — the build demonstrably ran on the infrastructure to a
+            // non-infra verdict, so the consecutive-infra streak
+            // breaks (the only forgiveness the infra cap admits; the
+            // retired I-127 wall-window forgave on the enforcer's
+            // clock and made the cap unreachable for any failure
+            // cycle longer than the window — the live_059 carousel).
+            c.infra_count = 0;
             if let Some(executor) = executor {
                 c.failed_builders.insert(executor.clone());
             }
@@ -885,13 +891,16 @@ fn apply<Id: Ord + Clone>(
         // ── E2: handle_infrastructure_failure ───────────────────────
         // The arm mirrors the handler's own statement order: the exempt
         // block first (increment + its own cap check, with NO early
-        // return on the under-cap path), then the I-127 window reset,
-        // then the non-exempt cap check and charge.
+        // return on the under-cap path), then the non-exempt cap check
+        // and charge (live059-c: the I-127 window reset is retired).
         AttemptEvent::Infra {
             at,
             executor: _,
             exempt,
-            at_cap,
+            // live059-c: the floor outcome no longer gates any reset
+            // (the wall-window died); the flag stays on the event for
+            // the ledger/diagnostic surfaces.
+            at_cap: _,
         } => {
             if *exempt {
                 // r[impl sched.retry.exempt-infra-cap]
@@ -899,31 +908,27 @@ fn apply<Id: Ord + Clone>(
                 // attempt (a different fencepost from the non-exempt arm
                 // below — divergence A10). The under-cap exempt path
                 // does not return here: the as-built handler falls
-                // through to the window reset below.
+                // through past the exempt cap check.
                 c.exempt_infra_count += 1;
                 if c.exempt_infra_count >= budget.max_exempt_infra_retries {
                     c.poisoned_at = Some(*at);
                     return Verdict::Poison(PoisonReason::ExemptInfraBudget);
                 }
             }
-            // The I-127 sliding window: an infra failure more than
-            // `infra_retry_window_secs` after the previous counted one
-            // is a fresh incident — reset the counter before the cap
-            // check. The guard is the event's own floor outcome only:
-            // at-cap resource exhaustion is deterministic, so the
-            // sparse-vs-burst forgiveness does not apply to it. It is
-            // NOT gated on the exemption — an under-cap exempt failure
-            // (CONCURRENT_PUTPATH or floor-promoted) arriving past the
-            // window also zeroes `infra_count`, exactly as the as-built
-            // handler does (its exempt block falls through to the
-            // reset). The exempt event itself still charges only
-            // `exempt_infra_count` and does not move the window anchor.
-            if !*at_cap
-                && let Some(last) = c.last_infra_failure_at
-                && at.saturating_sub(last) > budget.infra_retry_window_secs
-            {
-                c.infra_count = 0;
-            }
+            // live059-c: the I-127 wall-window reset is RETIRED — the
+            // cap is denominated in CONSECUTIVE failures of THIS
+            // derivation (the evidence's own clock), never the
+            // enforcer's elapsed time: a deterministic failure whose
+            // cycle exceeded the window oscillated the counter 0↔1
+            // forever (520 requeues / 128 drvs in the incident).
+            // Forgiveness keys on INTERVENING HEALTH EVIDENCE only —
+            // a different-class outcome (Transient / WorkerTimeout /
+            // ControllerDeadlineExceeded: the build demonstrably ran)
+            // resets the streak at ITS OWN arm. An exempt infra event
+            // is still infra-shaped: it neither charges nor forgives
+            // (the as-built exempt fall-through that could reset the
+            // counted budget dies with the window), and at-cap
+            // semantics are unchanged (at-cap events charge below).
             if *exempt {
                 return Verdict::Requeue;
             }
@@ -956,6 +961,10 @@ fn apply<Id: Ord + Clone>(
         // ── E4: handle_timeout_failure ──────────────────────────────
         // r[impl sched.timeout.promote-on-exceed+3]
         AttemptEvent::WorkerTimeout { at: _, executor: _ } => {
+            // live059-c: deadline-class outcome — the build ran past
+            // its deadline, so the infra streak breaks (health
+            // evidence; see the Transient arm).
+            c.infra_count = 0;
             if c.timeout_count < budget.max_timeout_retries {
                 c.timeout_count += 1;
                 // No backoff: the next dispatch's doubled deadline is
@@ -1038,6 +1047,8 @@ fn apply<Id: Ord + Clone>(
 
         // ── E7: handle_deadline_exceeded ────────────────────────────
         AttemptEvent::ControllerDeadlineExceeded { at: _, executor: _ } => {
+            // live059-c: deadline-class — same health evidence as E4.
+            c.infra_count = 0;
             if c.timeout_count >= budget.max_timeout_retries {
                 // DIVERGENCE D1: the as-built E7 calls
                 // `poison_and_cascade` here (24 h TTL, bounded
@@ -1658,7 +1669,8 @@ fn row_to_event<Id: Clone>(row: &LedgerRow<Id>) -> Option<AttemptEvent<Id>> {
             let exempt = row.outcome_class == OutcomeClass::ExemptInfra;
             if worker_reported {
                 // E2 — the worker-reported arm, including its exempt
-                // fall-through to the stale-window reset.
+                // fall-through (live059-c: charges its own budget;
+                // never forgives the streak).
                 Some(AttemptEvent::Infra {
                     at,
                     executor,
@@ -1851,23 +1863,27 @@ pub fn materialization_counters<Id>(rows: &[LedgerRow<Id>]) -> MatCounters {
 
 /// The retention horizon for the attempt-ledger GC sweep, in seconds:
 /// the largest decision window any fold consumer can look back across,
-/// `max(retention_floor, infra_retry_window, poison_ttl)`.
+/// `max(retention_floor, poison_ttl)`.
 ///
 /// The scheduler passes its `LEDGER_RETENTION_FLOOR` (24 h) as
 /// `retention_floor_secs`; taking the floor as an argument keeps this
 /// crate scheduler-agnostic while making the floor genuinely consulted
-/// by the sweep. The `infra_retry_window_secs` term honors the floor
-/// doc's "re-check against the configured value" clause: an
-/// operator-widened window > 24 h widens the horizon with it. The
+/// by the sweep. live059-c: the retired infra window's term is gone —
+/// the consecutive-streak law consults the post-reset suffix, which
+/// the per-lane reset cut bounds independent of wall age (the 300 s
+/// term was floor-dominated; the horizon value is unchanged). The
 /// `poison_ttl_secs` term is currently dominated by the floor (the
 /// scheduler's compile-time guard asserts floor >= POISON_TTL); it
 /// binds independently only if the TTL ever becomes configurable or
 /// outgrows the floor.
 // r[impl sched.db.attempts-gc]
 pub fn sweep_horizon_secs(budget: &Budget, retention_floor_secs: u64) -> u64 {
-    retention_floor_secs
-        .max(budget.infra_retry_window_secs)
-        .max(budget.poison_ttl_secs)
+    // live059-c: the retired infra window's term is gone (it was
+    // floor-dominated — 300 s vs the >= 24 h retention floor — so the
+    // horizon value is unchanged); the consecutive-streak law needs
+    // the post-reset suffix, which the per-lane reset cut already
+    // bounds independent of wall age.
+    retention_floor_secs.max(budget.poison_ttl_secs)
 }
 
 /// Index where the decision suffix of ONE LANE of `rows` begins: the
@@ -3251,18 +3267,9 @@ mod tests {
     /// "re-check against the configured value" clause.
     // r[verify sched.db.attempts-gc]
     #[test]
-    fn sweep_horizon_dominates_floor_window_and_ttl() {
-        // Production defaults: floor (== TTL, 86_400) dominates the
-        // 300 s window.
+    fn sweep_horizon_dominates_floor_and_ttl() {
+        // Production defaults: floor (== TTL, 86_400).
         assert_eq!(sweep_horizon_secs(&Budget::default(), 86_400), 86_400);
-
-        // Operator-widened infra window > floor → the window widens
-        // retention with it.
-        let wide = Budget {
-            infra_retry_window_secs: 200_000,
-            ..Budget::default()
-        };
-        assert_eq!(sweep_horizon_secs(&wide, 86_400), 200_000);
 
         // A poison TTL outgrowing the floor enters the max (today the
         // scheduler's compile guard keeps floor >= TTL; this pins the
@@ -3492,7 +3499,7 @@ mod proofs {
 
     /// A symbolic instant on the abstract clock, generated as a widened
     /// byte so the high 56 bits are structurally zero: the clock
-    /// arithmetic (window reset, TTL, backoff deadlines) then goes
+    /// arithmetic (TTL, backoff deadlines) then goes
     /// through narrow circuits instead of full 64-bit ones. The bounded
     /// domains never need more than a byte of clock anyway.
     fn small_time(bound: u8) -> AbsTime {
@@ -3613,7 +3620,6 @@ mod proofs {
             max_infra_retries: small_u32(2),
             max_timeout_retries: small_u32(2),
             max_exempt_infra_retries: small_u32(2),
-            infra_retry_window_secs: small_u64(3),
             backoff_base_secs: small_u64(3),
             backoff_multiplier: small_u64(2),
             backoff_max_secs: small_u64(4),

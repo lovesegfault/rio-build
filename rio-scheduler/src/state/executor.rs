@@ -59,16 +59,6 @@ pub struct RetryPolicy {
     /// time-window reset — sparse timeouts over hours are still the
     /// same hung build).
     pub max_timeout_retries: u32,
-    /// Seconds since the LAST infra failure after which the
-    /// `infra_retry_count` is reset to 0. Infra failures are by
-    /// definition transient — N quick failures suggests a
-    /// misclassified permanent error, but N failures spread over
-    /// hours are independent incidents and shouldn't accumulate
-    /// toward poison. I-127: a leaked PutPath lock caused 4 builders
-    /// in a row to hit "concurrent PutPath"; the drv was poisoned at
-    /// 99.7% despite being fine. With a window, the counter resets
-    /// once the cluster self-heals (lock released, store recovered).
-    pub infra_retry_window_secs: f64,
     /// Maximum number of `exempt_from_cap` infra-retry attempts before
     /// the derivation is poisoned. CONCURRENT_PUTPATH and
     /// `floor_outcome.promoted` skip `infra_count++` entirely, so a
@@ -100,15 +90,20 @@ impl Default for RetryPolicy {
             // when an S3 auth failure was reported as infra. The cap
             // converts that into a visible poison.
             //
-            // I-127 raised 5→10 + added the time-window reset below.
-            // 5 was too tight under shallow-1024x: a leaked PutPath
-            // lock made 4 builders in a row report infra → poison at
-            // 99.7% on a perfectly buildable drv. 10 attempts (no
-            // backoff, so still seconds-to-low-minutes for fast
-            // builds) gives the cluster room to self-heal, and the
-            // 5-min window means slow-drip failures don't accumulate.
-            // A true misclassified permanent failure still poisons in
-            // 10 immediate cycles — well under a minute.
+            // I-127 raised 5→10: 5 was too tight under shallow-1024x
+            // (a leaked PutPath lock made 4 builders in a row report
+            // infra → poison at 99.7% on a perfectly buildable drv —
+            // that class is EXEMPT today, charging
+            // `max_exempt_infra_retries` instead). live059-c: the cap
+            // counts CONSECUTIVE infra failures of the derivation —
+            // the I-127 wall-window reset is retired (it made the cap
+            // unreachable for any deterministic failure whose cycle
+            // exceeded 300 s: the live_059 carousel, 520 requeues) —
+            // and forgiveness keys on intervening health evidence (a
+            // different-class outcome of this drv), so a true
+            // misclassified permanent failure poisons in 10 cycles
+            // REGARDLESS of cycle time, while sparse genuine infra
+            // with intervening progress never accumulates.
             max_infra_retries: 10,
             // I-200: 4 = number of promotions to walk a 5-class
             // ladder (tiny→xlarge). After that, terminal Cancelled.
@@ -117,13 +112,6 @@ impl Default for RetryPolicy {
             // bounded by Σ(cutoff_i × 5) ≈ 5× the largest class
             // cutoff — not unbounded.
             max_timeout_retries: 4,
-            // 5min: long enough that a stuck lock (I-125a's leaked
-            // PutPath, ~tens of seconds to recover) or a store
-            // restart doesn't compound across attempts; short enough
-            // that the 9748-dispatch hot-loop scenario above
-            // (146 cycles / 6min ≈ 2.5s/cycle) still hits the cap
-            // before the window resets it.
-            infra_retry_window_secs: 300.0,
             // I-127's observed benign ceiling is 4-in-a-row; 50 gives
             // >10× headroom while still terminating a leaked-lock
             // livelock within minutes (no backoff on the exempt path,

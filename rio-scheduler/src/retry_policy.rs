@@ -305,7 +305,7 @@ pub(crate) fn classify(event: &ObservedFailure<'_>, floor: FloorOutcomeView) -> 
 
 // r[verify sched.retry.transient-budget+2]
 // r[verify sched.retry.attempts-bounded+5]
-// r[verify sched.retry.counters-refine-history+2]
+// r[verify sched.retry.counters-refine-history+3]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,79 +449,146 @@ mod tests {
         assert_eq!(v, Verdict::Poison(PoisonReason::InfraBudget));
     }
 
-    /// The 300 s sliding window: two infra failures, then a third more
-    /// than the window after the second — the counter resets to zero
-    /// before charging, so the third failure leaves `infra_count = 1`. A
-    /// fourth within the window accumulates normally. An at-cap failure
-    /// is never forgiven by the window.
+    /// **W12-LD (live059-c, A1 — R29′ in the wild)** — *proposition:
+    /// the poison cap fires at `max_infra_retries` CONSECUTIVE infra
+    /// failures of THIS derivation regardless of cycle time; the
+    /// negation is the live carousel: the I-127 wall-window reset
+    /// zeroed `infra_count` whenever failure-cycle > 300 s, so
+    /// `max_infra_retries=10` was unreachable for ANY deterministic
+    /// failure whose cycle exceeds the window — a ~340 s cycle
+    /// (dispatch + build-to-failure + report + requeue) oscillated
+    /// the counter 0↔1 forever (the incident's 520 requeues across
+    /// 128 drvs at INFO-level silence).* The cap is denominated in
+    /// the EVIDENCE'S OWN clock (the derivation's conduct: its
+    /// consecutive failure run), never the enforcer's wall-window —
+    /// the `timeout_count` form (state/derivation.rs), which has no
+    /// elapsed-time reset, is the in-tree precedent CITE.
     #[test]
-    fn infra_window_reset_forgives_sparse_failures() {
-        let h = [
-            infra(100, "w1", false, false),
-            infra(150, "w1", false, false),
-            // 301 s after the second — strictly greater than the window.
-            infra(452, "w1", false, false),
-            infra(500, "w1", false, false),
-        ];
-        let (c, _) = fold(&h[..2], 150);
-        assert_eq!(c.infra_count, 2);
+    fn deterministic_infra_carousel_poisons_at_the_cap_regardless_of_cycle_time() {
+        // The incident's shape: a deterministic infra-classified
+        // failure on a ~340 s cycle — strictly past the retired
+        // 300 s window every time.
+        let mut h: Vec<AttemptEvent> = Vec::new();
+        for i in 0..10 {
+            h.push(infra(1_000 + i * 340, "w1", false, false));
+        }
+        let (c, v) = fold(&h, 1_000 + 9 * 340);
+        assert_eq!(
+            c.infra_count, 10,
+            "left (pre-fix): the wall-window reset zeroed the counter \
+             before every charge — infra_count oscillated 0↔1 and the \
+             cap was unreachable (the carousel) / right: ten \
+             consecutive infra failures count ten, regardless of \
+             spacing"
+        );
+        assert_eq!(
+            v,
+            Verdict::Requeue,
+            "the tenth requeues (check-then-increment)"
+        );
 
-        let (c, _) = fold(&h[..3], 452);
-        assert_eq!(c.infra_count, 1, "window elapsed: reset then charge");
-        assert_eq!(c.last_infra_failure_at, Some(452));
-
-        let (c, _) = fold(&h, 500);
-        assert_eq!(c.infra_count, 2, "within the window: accumulate");
-
-        // At-cap failures are exempt from the forgiveness: the same
-        // sparse spacing keeps accumulating.
-        let h_cap = [
-            infra(100, "w1", false, true),
-            infra(452, "w1", false, true),
-            infra(900, "w1", false, true),
-        ];
-        let (c, _) = fold(&h_cap, 900);
-        assert_eq!(c.infra_count, 3, "at-cap failures never reset");
+        // The eleventh consecutive failure poisons — the carousel is
+        // capped at max_infra_retries cycles, full stop.
+        h.push(infra(1_000 + 10 * 340, "w1", false, false));
+        let (_, v) = fold(&h, 1_000 + 10 * 340);
+        assert_eq!(
+            v,
+            Verdict::Poison(PoisonReason::InfraBudget),
+            "left (pre-fix): Requeue forever (520 observed) / right: \
+             the deterministic carousel poisons at the cap"
+        );
     }
 
-    /// The as-built E2 fall-through: the I-127 stale-window reset is
-    /// gated only on the event's own at-cap outcome, not on the
-    /// exemption, so an under-cap exempt infra failure
-    /// (CONCURRENT_PUTPATH or floor-promoted) arriving more than the
-    /// window after the last counted infra failure also resets
-    /// `infra_count` — while itself charging only `exempt_infra_count`
-    /// and leaving the window anchor where the last counted failure put
-    /// it.
+    /// **W12-LD2 (live059-c, the I-127 protection re-keyed)** —
+    /// *proposition: sparse GENUINE infra failures with INTERVENING
+    /// HEALTH EVIDENCE of this derivation never poison — forgiveness
+    /// keys on the evidence that the incidents are independent (a
+    /// different-class attempt outcome: the build demonstrably RAN on
+    /// the infrastructure to a non-infra verdict), never on elapsed
+    /// time alone.* The I-127 protection's true population, correctly
+    /// keyed: the original leaked-PutPath case is exempt-class today
+    /// (CONCURRENT_PUTPATH charges `exempt_infra_count`), and a
+    /// healed cluster either completes the build (fold ends) or
+    /// reaches a different failure class (the streak breaks here).
     #[test]
-    fn exempt_infra_failure_past_the_window_resets_the_counted_budget() {
-        // Counted infra failure (anchor stamped), then an exempt one
-        // 350 s later — strictly past the 300 s window.
+    fn intervening_health_evidence_resets_the_infra_streak() {
+        // infra, infra — then the build RUNS (transient build failure
+        // = the infrastructure delivered) — then infra, infra…: the
+        // streak never reaches the cap because contrary evidence
+        // keeps breaking it.
+        let h = [
+            infra(100, "w1", false, false),
+            infra(500, "w1", false, false),
+            t(900, "w2"),
+            infra(1_300, "w1", false, false),
+        ];
+        let (c, _) = fold(&h[..2], 500);
+        assert_eq!(c.infra_count, 2, "two consecutive infra failures");
+        let (c, _) = fold(&h[..3], 900);
+        assert_eq!(
+            c.infra_count, 0,
+            "the intervening different-class outcome (the build ran) \
+             BREAKS the streak — health evidence, not wall time"
+        );
+        let (c, _) = fold(&h, 1_300);
+        assert_eq!(c.infra_count, 1, "the streak restarts at one");
+
+        // A worker timeout is the same evidence class (the build ran
+        // past its deadline — the infra delivered it).
+        let h2 = [
+            infra(100, "w1", false, false),
+            AttemptEvent::WorkerTimeout {
+                at: 600,
+                executor: Some("w1".into()),
+            },
+            infra(1_000, "w1", false, false),
+        ];
+        let (c, _) = fold(&h2, 1_000);
+        assert_eq!(
+            c.infra_count, 1,
+            "a timeout breaks the streak exactly as a transient does"
+        );
+
+        // An EXEMPT infra failure is still infra-shaped — it neither
+        // charges nor breaks the streak (no health evidence in an
+        // infra-class event; the as-built window fall-through that
+        // let an exempt event FORGIVE the counted budget dies with
+        // the window).
+        let h3 = [
+            infra(100, "w1", false, false),
+            infra(450, "w1", true, false),
+            infra(800, "w1", false, false),
+        ];
+        let (c, _) = fold(&h3, 800);
+        assert_eq!(
+            c.infra_count, 2,
+            "exempt infra neither charges nor forgives the streak"
+        );
+        assert_eq!(c.exempt_infra_count, 1);
+    }
+
+    /// live059-c: the as-built E2 exempt fall-through (an under-cap
+    /// exempt infra failure arriving past the retired window also
+    /// zeroed `infra_count`) DIES WITH THE WINDOW — an exempt event is
+    /// infra-shaped: it charges only `exempt_infra_count` and neither
+    /// charges nor forgives the consecutive streak (no health evidence
+    /// in an infra-class event). Re-derived under the chosen
+    /// health-evidence arm; the streak-break cells live in
+    /// `intervening_health_evidence_resets_the_infra_streak`.
+    #[test]
+    fn exempt_infra_failure_neither_charges_nor_forgives_the_streak() {
         let h = [
             infra(100, "w1", false, false),
             infra(450, "w1", true, false),
         ];
-        let (c, v) = fold(&h, 450);
-        assert_eq!(
-            c.infra_count, 0,
-            "stale-window reset fires on the exempt event"
-        );
-        assert_eq!(c.exempt_infra_count, 1);
+        let (c, _) = fold(&h, 450);
+        assert_eq!(c.infra_count, 1, "the exempt event never forgives");
+        assert_eq!(c.exempt_infra_count, 1, "it charges its own budget");
         assert_eq!(
             c.last_infra_failure_at,
             Some(100),
-            "the exempt event does not move the anchor"
+            "the diagnostic anchor stays where the last counted failure put it"
         );
-        assert_eq!(v, Verdict::Requeue);
-
-        // Within the window the exempt event leaves the counted budget
-        // untouched.
-        let h = [
-            infra(100, "w1", false, false),
-            infra(200, "w1", true, false),
-        ];
-        let (c, _) = fold(&h, 200);
-        assert_eq!(c.infra_count, 1, "within the window: no reset");
-        assert_eq!(c.exempt_infra_count, 1);
     }
 
     /// The exempt arm: a CONCURRENT_PUTPATH or floor-promoted infra
@@ -942,7 +1009,7 @@ mod tests {
     /// check-then-increment with the 300 s window, exactly as the fold's
     /// infra history; exempt rows charge only the exemption budget.
     #[test]
-    fn decide_infra_budget_and_window_match_the_reference_fold() {
+    fn decide_infra_budget_and_streak_match_the_reference_fold() {
         let mut h: Vec<AttemptRecord> = (0..10)
             .map(|i| worker_rec(OutcomeClass::Infra, "w1", 100 + i))
             .collect();
@@ -959,13 +1026,19 @@ mod tests {
         let d = decide_default(&h, 200);
         assert_eq!(d.verdict, Verdict::Poison(PoisonReason::InfraBudget));
 
-        // Sparse failures past the window are forgiven before charging.
+        // live059-c: spacing is IRRELEVANT — consecutive infra
+        // failures accumulate regardless of gap (the retired window
+        // forgave any cycle > 300 s: the carousel); only intervening
+        // health evidence resets (the LD2 battery above).
         let sparse = [
             worker_rec(OutcomeClass::Infra, "w1", 100),
             worker_rec(OutcomeClass::Infra, "w1", 452),
         ];
         let d = decide_default(&sparse, 452);
-        assert_eq!(d.counters.infra_count, 1, "window reset then charge");
+        assert_eq!(
+            d.counters.infra_count, 2,
+            "consecutive failures count regardless of wall spacing"
+        );
     }
 
     /// The worker timeout budget through decide(): four requeues then

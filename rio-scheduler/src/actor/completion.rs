@@ -477,7 +477,6 @@ impl DagActor {
             max_infra_retries: self.retry_policy.max_infra_retries,
             max_timeout_retries: self.retry_policy.max_timeout_retries,
             max_exempt_infra_retries: self.retry_policy.max_exempt_infra_retries,
-            infra_retry_window_secs: self.retry_policy.infra_retry_window_secs as u64,
             backoff_base_secs: self.retry_policy.backoff_base_secs as u64,
             backoff_multiplier: self.retry_policy.backoff_multiplier as u64,
             backoff_max_secs: self.retry_policy.backoff_max_secs as u64,
@@ -4594,10 +4593,12 @@ impl DagActor {
                 .await;
             }
             _ => {
-                // Requeue. The exempt charge, the I-127 stale-window
-                // reset, and the counted-infra increment + window anchor
-                // are all carried by the appended row and the fold (the
-                // refresh above) — nothing is mutated in place here. NO
+                // Requeue. The exempt charge and the counted-infra
+                // increment + diagnostic anchor are all carried by the
+                // appended row and the fold (the refresh above;
+                // live059-c: the streak forgiveness lives on the
+                // different-class arms, never on elapsed time) —
+                // nothing is mutated in place here. NO
                 // failed_builders insert, NO retry_count++, NO backoff —
                 // infra failures are worker-local and requeue
                 // immediately.

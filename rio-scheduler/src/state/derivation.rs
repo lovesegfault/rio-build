@@ -518,26 +518,35 @@ pub struct RetryState {
     /// `max_retries=2` cap was the permanent ceiling and the resubmit
     /// bound never fired (bug_152).
     pub resubmit_cycles: u32,
-    /// Number of InfrastructureFailure re-dispatches so far. Separate
-    /// from `count` because infra failures don't count toward the
-    /// transient-failure budget (they're worker-local, not build-local)
-    /// — but still bounded to prevent a misclassified deterministic
-    /// failure from hot-looping forever.
+    /// Number of CONSECUTIVE InfrastructureFailure re-dispatches.
+    /// Separate from `count` because infra failures don't count toward
+    /// the transient-failure budget (they're worker-local, not
+    /// build-local) — but still bounded to prevent a misclassified
+    /// deterministic failure from hot-looping forever. live059-c: the
+    /// streak resets ONLY on intervening health evidence (a
+    /// different-class outcome of this drv — Transient/timeout-class:
+    /// the build demonstrably ran), NEVER on elapsed time — the
+    /// retired I-127 wall-window reset made the cap unreachable for
+    /// any deterministic failure whose cycle exceeded 300 s (the
+    /// live_059 carousel: 520 requeues / 128 drvs); this is the
+    /// [`Self::timeout_count`] no-elapsed-reset form on the infra
+    /// axis.
     pub infra_count: u32,
     /// Number of `TimedOut` re-dispatches so far (I-200). Separate
-    /// from `count` (timeouts don't eat the transient budget) and from
-    /// `infra_count` (no time-window reset — a build that times out,
-    /// gets promoted, and times out again an hour later on the larger
-    /// class is still the same hung build). Bounded by
+    /// from `count` (timeouts don't eat the transient budget); the
+    /// no-elapsed-reset form — a build that times out, gets promoted,
+    /// and times out again an hour later on the larger class is still
+    /// the same hung build (live059-c took `infra_count` to the same
+    /// denomination). Bounded by
     /// `RetryPolicy::max_timeout_retries`; at the cap,
     /// `handle_timeout_failure` falls through to terminal Cancelled.
     pub timeout_count: u32,
     /// Timestamp of the most recent InfrastructureFailure that
-    /// incremented `infra_count`. Drives the time-window reset
-    /// (I-127): if the last infra failure was longer ago than
-    /// `RetryPolicy::infra_retry_window_secs`, `infra_count` resets to
-    /// 0 before the cap check — sparse failures over a long build
-    /// don't accumulate toward poison.
+    /// incremented `infra_count`. DIAGNOSTIC anchor only (live059-c):
+    /// the I-127 time-window reset it used to drive is retired — no
+    /// reset keys on elapsed time; the fold still stamps it on every
+    /// counted infra charge so operators can read the streak's
+    /// recency.
     pub last_infra_failure_at: Option<crate::state::RecoveredInstant>,
     /// Number of `exempt_from_cap` infra-retry attempts so far
     /// (I-127's CONCURRENT_PUTPATH + D4's `floor_outcome.promoted`).
