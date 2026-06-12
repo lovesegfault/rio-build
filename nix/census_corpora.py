@@ -111,14 +111,19 @@ REGISTRY = [
     # WireSecs pacing-seam census — raw `from_secs` over `*_seconds`
     # proto fields is banned in production code; proto→sleep seams
     # mint through WireSecs::pacing(domain_ceiling) (merged_bug_156).
-    # Plant set DERIVED from the use-grammar table (WIRE_SECS_GRAMMAR
-    # — derived_from: every production planted mechanically, R22').
-    # Gap (burn-down): fold-site — the let-bound production is
-    # window-bounded (30 lines); a binding consumed through a helper
-    # fn or beyond the window is unplanted. Trigger: the next
-    # lint-gap finding on this generator upgrades the corpus in the
-    # same close.
-    ("wire-secs-pacing-seams", "nix/census_corpora.py", r"WIRE_SECS_GRAMMAR", {"alias", "scope"}, {"fold-site"}, r"WIRE_SECS_GRAMMAR = \["),
+    # WO-S8-3 (bug_091): the plant set derives from the GENERATED
+    # idiom×site product (WIRE_SECS_IDIOMS × WIRE_SECS_SITES — the
+    # host language's conversion idioms, not the observed spellings),
+    # so the row's claim is grammar⊇product BY DERIVATION with the
+    # coarse backstop tier as the over-approximation belt. The former
+    # fold-site burn-down gap RETIRED at this close (CE-7): the
+    # backstop is its machine-bound compensating control — whole-file
+    # beyond-window binding consumption + bare `*_seconds`-ident
+    # arguments (the same-file helper-fn face), firing predicate
+    # pinned by WIRE_SECS_BACKSTOP_VECTORS in the self-test.
+    # Cross-file consumption is outside the file-local scanner's
+    # jurisdiction by construction — disclosed, not silently claimed.
+    ("wire-secs-pacing-seams", "nix/census_corpora.py", r"WIRE_SECS_GRAMMAR", {"alias", "scope", "fold-site"}, set(), r"WIRE_SECS_IDIOMS = \["),
     # bw10 wave enrollments (the integrator's close): the round-10
     # slots' new R22'-derived censuses, each row computed from the
     # named in-generator refusal predicate / production table.
@@ -274,31 +279,134 @@ fn is_fatal_rejection(code: tonic::Code) -> bool {
 # (`from_wire` / `.pacing(domain_ceiling)`), never raw
 # `Duration::from_secs` — the clamp law was re-minted-around twice
 # (wave-8 store seam, pre-campaign builder seam) because the forbidden
-# shape still compiled at any new seam. The USE-GRAMMAR below is the
-# derivation source for the plant set: every production is planted
-# mechanically (R22' — all four or none), so the scanner cannot
-# certify coverage it does not have.
-WIRE_SECS_NEEDLE = re.compile(r"from_secs\(\s*(?:u64::from\(\s*)?[\w.()\[\]]*\.\w*_seconds\b")
-WIRE_SECS_LET = re.compile(r"let\s+(\w+)(?::\s*[\w:]+)?\s*=\s*[\w.()\[\]]*\.(\w*_seconds)\s*;")
+# shape still compiled at any new seam.
+#
+# WO-S8-3 (bug_091, R22″): the grammar table is GENERATED from the
+# host language's conversion-idiom product — idioms × consumption
+# sites, never the observed spellings (the old four-production hand
+# table proved plants⊇grammar while the registry row read it as
+# grammar⊇language; conversion-at-binding `u64::from(f)` and
+# cast-at-binding `f as u64` were both invisible). Two tiers:
+#
+#   PRECISE (the grammar): a structural pass — every `from_secs(…)`
+#   call whose paren-matched argument extent mentions a `*_seconds`
+#   field access (any idiom, any qualification), plus every
+#   `let`-binding whose RHS reads a `*_seconds` field (any idiom,
+#   multi-line RHS included) consumed by a `from_secs` whose argument
+#   names the binding within WIRE_SECS_LET_WINDOW lines.
+#
+#   BACKSTOP (coarse, the over-approximation belt): the SAME binding
+#   consumed by a from_secs BEYOND the window — whole-file — and any
+#   from_secs argument naming a BARE `*_seconds`-suffixed ident (the
+#   helper-fn face: a parameter carrying the proto naming convention
+#   into a same-file callee). The backstop is the MACHINE-BOUND
+#   compensating control for the retired fold-site gap row (CE-7):
+#   its firing predicate is pinned by the beyond-window vector in the
+#   self-test below. Cross-FILE consumption is outside a file-local
+#   scanner's jurisdiction by construction — disclosed, not silently
+#   claimed (the mac-census jurisdiction form).
+#
+# WIRE_SECS_GRAMMAR is the generated product (idioms × sites) plus
+# the qualification vector; the completeness meta-pin (W11-BS form)
+# asserts every product cell has a vector and every vector fires —
+# a silently dropped cell (e.g. try-from-at-inline) is a red.
 WIRE_SECS_ALLOW = re.compile(r"wire-secs-census:\s*allow\(")
 WIRE_SECS_LET_WINDOW = 30
+# A *_seconds FIELD READ: the proto naming-convention suffix, NOT
+# followed by `(` — a method call (`span.get_seconds()`, the jiff
+# local-clock idiom at componentscaler/mod.rs:430) is a different
+# grammatical production carrying no wire data. The leniency is
+# PLANTED (method-call-read vector below) and MACHINE-BOUND: prost
+# only mints `*_seconds()` getter reads for `optional` proto fields,
+# and the proto-source trigger arm (scan_proto_optional_seconds)
+# fails the census the moment an `optional … *_seconds` field
+# appears — the getter production must join the grammar in the same
+# close (the named trigger, mechanically watched).
+WIRE_SECS_FIELD = re.compile(r"\.\w*_seconds\b(?!\s*\()")
+WIRE_SECS_BARE_IDENT = re.compile(r"\b(?<!\.)[a-z]\w*_seconds\b(?!\s*\()")
+WIRE_SECS_CALL = re.compile(r"\bfrom_secs\s*\(")
+# Any-idiom binding: `let [mut] NAME [: ty] = <RHS containing a
+# *_seconds field read> ;` — RHS spans lines (DOTALL via [^;]).
+WIRE_SECS_LET_ANY = re.compile(
+    r"\blet\s+(?:mut\s+)?(\w+)\s*(?::[^=;]*)?=\s*([^;]*?\.\w*_seconds\b(?!\s*\()[^;]*?);"
+)
+WIRE_SECS_PROTO_OPTIONAL = re.compile(r"\boptional\s+\w+\s+\w*_seconds\s*=")
 
-# (production, planted snippet) — the snippet IS the production's
-# minimal instance; the self-test iterates this table, so an unplanted
-# production cannot exist while the table names it.
-WIRE_SECS_GRAMMAR = [
-    ("direct", "let d = Duration::from_secs(resp.retry_after_seconds);\n"),
-    ("u64-conversion", "let d = Duration::from_secs(u64::from(resp.retry_after_seconds));\n"),
+
+def scan_proto_optional_seconds(src_root):
+    """The method-call leniency's TRIGGER arm (machine-bound): an
+    `optional … *_seconds` proto field would make prost mint a
+    `*_seconds()` getter — a wire read in the method-call form the
+    field-read grammar excludes. Zero such fields exist; the first
+    one fails the census until the getter production joins the
+    grammar."""
+    fails = []
+    proto_dir = src_root / "rio-proto" / "proto"
+    for f in sorted(proto_dir.glob("*.proto")) if proto_dir.is_dir() else []:
+        for i, line in enumerate(f.read_text().splitlines(), 1):
+            if WIRE_SECS_PROTO_OPTIONAL.search(line):
+                fails.append(
+                    f"rio-proto/proto/{f.name}:{i}: `optional … *_seconds` proto field — "
+                    f"prost mints a `*_seconds()` getter, a wire read in the method-call "
+                    f"form WIRE_SECS_FIELD excludes; add the getter production to the "
+                    f"wire-secs grammar (with its plant) in the same change"
+                )
+    return fails
+
+# The conversion-idiom × consumption-site PRODUCT ([GEN-SET] — the
+# table is generated, the cells are the derivation source for the
+# plant set; the two historical-escape cells are exactly bug_091's
+# named productions).
+WIRE_SECS_IDIOMS = [
+    ("bare", "{f}"),
+    ("from", "u64::from({f})"),
+    ("cast", "{f} as u64"),
+    ("try-from", "u64::try_from({f}).unwrap()"),
+    ("into", "{f}.into()"),
+]
+WIRE_SECS_SITES = [
+    ("inline", "let d = Duration::from_secs({expr});\n"),
     (
-        "let-bound",
-        "let hint = resp.retry_after_seconds;\nlet d = Duration::from_secs(u64::from(hint));\n",
+        "binding",
+        "let hint = {expr};\nlet d = Duration::from_secs(u64::from(hint));\n",
     ),
-    ("qualified", "let d = std::time::Duration::from_secs(resp.retry_after_seconds);\n"),
+]
+
+
+def _wire_secs_product():
+    f = "resp.retry_after_seconds"
+    for iname, itmpl in WIRE_SECS_IDIOMS:
+        for sname, stmpl in WIRE_SECS_SITES:
+            yield (f"{iname}-at-{sname}", stmpl.format(expr=itmpl.format(f=f)))
+
+
+WIRE_SECS_GRAMMAR = list(_wire_secs_product()) + [
+    # The qualification axis of the call itself (one historical
+    # production kept beside the product).
+    ("qualified-call", "let d = std::time::Duration::from_secs(resp.retry_after_seconds);\n"),
+]
+
+# The backstop's own firing-predicate vectors (CE-7: the fold-site
+# bind — the census test asserts the backstop FIRES on these).
+WIRE_SECS_BACKSTOP_VECTORS = [
+    (
+        "beyond-window-binding",
+        "let hint = resp.retry_after_seconds;\n"
+        + "let _pad = 0;\n" * (WIRE_SECS_LET_WINDOW + 5)
+        + "let d = Duration::from_secs(u64::from(hint));\n",
+    ),
+    (
+        "helper-fn-param",
+        "fn pace(retry_after_seconds: u64) -> Duration {\n"
+        "    Duration::from_secs(retry_after_seconds)\n"
+        "}\n",
+    ),
 ]
 
 
 def scan_wire_secs_seams(files):
-    """files: iterable of (rel, text). Returns violation list."""
+    """files: iterable of (rel, text). Returns violation list (both
+    tiers; one report per site, backstop deduped against precise)."""
     fails = []
     for rel, raw in files:
         lines = raw.splitlines()
@@ -312,33 +420,62 @@ def scan_wire_secs_seams(files):
             # R22″ fail-closed (same arm as the refusal census).
             fails.append(f"{e} [wire-secs census: file not classifiable]")
             continue
-        slines = stripped.splitlines()
+
+        seen = set()
 
         def flag(lineno, what):
+            if lineno in seen:
+                return
             window = "\n".join(lines[max(0, lineno - 7) : lineno])
             if WIRE_SECS_ALLOW.search(window):
                 return
+            seen.add(lineno)
             fails.append(
                 f"{rel}:{lineno}: {what} — proto seconds cross the seam through "
                 f"rio_common::clamped::WireSecs (from_wire / .pacing(domain_ceiling)); "
                 f"a documented exception carries `wire-secs-census: allow(<why>)` within 6 lines above"
             )
 
-        for m in WIRE_SECS_NEEDLE.finditer(stripped):
-            flag(
-                stripped[: m.start()].count("\n") + 1,
-                "raw from_secs over a `*_seconds` proto field",
-            )
-        for i, line in enumerate(slines):
-            lm = WIRE_SECS_LET.search(line)
-            if not lm:
-                continue
+        # The from_secs call extents, paren-matched structurally (the
+        # idiom-blind pass: ANY conversion idiom inside the argument
+        # is caught, `::`-qualified or cast or method-chained).
+        calls = []  # (call_lineno, arg_text)
+        for m in WIRE_SECS_CALL.finditer(stripped):
+            po = m.end() - 1
+            pe = rust_strip._match_delim(stripped, po)
+            calls.append((stripped[: m.start()].count("\n") + 1, stripped[po + 1 : pe - 1]))
+        for lineno, arg in calls:
+            if WIRE_SECS_FIELD.search(arg):
+                flag(lineno, "raw from_secs over a `*_seconds` proto field")
+        # The binding arm (precise within the window) + the
+        # beyond-window backstop (whole file).
+        for lm in WIRE_SECS_LET_ANY.finditer(stripped):
             binding = lm.group(1)
-            tail = "\n".join(slines[i + 1 : i + 1 + WIRE_SECS_LET_WINDOW])
-            if re.search(rf"from_secs\([^)]*\b{re.escape(binding)}\b", tail):
+            let_line = stripped[: lm.start()].count("\n") + 1
+            pat = re.compile(rf"\b{re.escape(binding)}\b")
+            for call_line, arg in calls:
+                if call_line >= let_line and pat.search(arg):
+                    if call_line - let_line <= WIRE_SECS_LET_WINDOW:
+                        flag(
+                            let_line,
+                            f"a `*_seconds` read let-bound to `{binding}` then raw from_secs'd",
+                        )
+                    else:
+                        flag(
+                            let_line,
+                            f"a `*_seconds` read let-bound to `{binding}` then raw "
+                            f"from_secs'd beyond the {WIRE_SECS_LET_WINDOW}-line window "
+                            f"(backstop tier)",
+                        )
+        # The helper-fn-face backstop: a from_secs argument naming a
+        # BARE `*_seconds` ident (a parameter/local carrying the proto
+        # naming convention — the same-file helper-fn seam).
+        for lineno, arg in calls:
+            if WIRE_SECS_BARE_IDENT.search(arg):
                 flag(
-                    i + 1,
-                    f"`{lm.group(2)}` let-bound to `{binding}` then raw from_secs'd",
+                    lineno,
+                    "raw from_secs over a bare `*_seconds` ident (backstop tier: "
+                    "a parameter/local carrying the proto seconds convention)",
                 )
     return fails
 
@@ -457,13 +594,77 @@ def main() -> int:
         return 1
 
     # Arm F: the WireSecs pacing-seam plants — DERIVED from the
-    # use-grammar table, one red per production (R22': all four or
-    # the self-test itself fails).
+    # idiom×site PRODUCT (WO-S8-3, R22″): one red per generated cell.
+    # W11-BV red-first: conversion-at-binding (`u64::from(f)` at the
+    # let) and cast-at-binding (`f as u64`) were invisible to the old
+    # hand grammar (0 violations pre-fix, transcripts in the commit);
+    # both are product cells now and must fire like every other.
     for production, snippet in WIRE_SECS_GRAMMAR:
         f_f = scan_wire_secs_seams([(f"planted/{production}.rs", snippet)])
         if len(f_f) != 1:
             print(
                 f"FAIL: self-test arm F (wire-secs plant `{production}`) expected 1 violation, got {f_f}",
+                file=sys.stderr,
+            )
+            return 1
+    # The W11-BS-form completeness META-PIN (WS-8): the grammar table
+    # is the GENERATED product — every idiom×site cell has exactly one
+    # entry (plus the qualification vector); a table that silently
+    # drops a cell (e.g. try-from-at-inline) is red HERE, not at the
+    # next escape.
+    want_cells = {
+        f"{i}-at-{s}" for i, _ in WIRE_SECS_IDIOMS for s, _ in WIRE_SECS_SITES
+    } | {"qualified-call"}
+    got_cells = {name for name, _ in WIRE_SECS_GRAMMAR}
+    if got_cells != want_cells:
+        print(
+            f"FAIL: wire-secs completeness meta-pin — table cells != idiom×site "
+            f"product: missing {sorted(want_cells - got_cells)}, extra "
+            f"{sorted(got_cells - want_cells)}",
+            file=sys.stderr,
+        )
+        return 1
+    # The BACKSTOP's firing predicate (CE-7: the retired fold-site gap
+    # row MACHINE-BINDS here — the compensating control demonstrably
+    # fires on the beyond-window and helper-fn-param classes).
+    for vec_name, snippet in WIRE_SECS_BACKSTOP_VECTORS:
+        f_b = scan_wire_secs_seams([(f"planted/{vec_name}.rs", snippet)])
+        if len(f_b) != 1 or "backstop tier" not in f_b[0]:
+            print(
+                f"FAIL: backstop firing-predicate vector `{vec_name}` expected 1 "
+                f"backstop-tier violation, got {f_b}",
+                file=sys.stderr,
+            )
+            return 1
+    # The method-call LENIENCY plant (one plant per leniency point,
+    # R22″): a `*_seconds()` METHOD call is local-clock arithmetic
+    # (jiff get_seconds — componentscaler/mod.rs:430), not a wire
+    # field read — it must NOT flag; its wire-side trigger is the
+    # proto-source arm below.
+    method_call = (
+        "let secs = span.get_seconds();\n"
+        "let d = Duration::from_secs(secs as u64);\n"
+    )
+    if scan_wire_secs_seams([("planted/method_call.rs", method_call)]):
+        print(
+            "FAIL: the method-call leniency plant flagged — local-clock "
+            "`.get_seconds()` reads are not wire fields",
+            file=sys.stderr,
+        )
+        return 1
+    # … and the trigger arm fires on a strawman optional proto field.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        straw_root = pathlib.Path(td)
+        (straw_root / "rio-proto" / "proto").mkdir(parents=True)
+        (straw_root / "rio-proto" / "proto" / "x.proto").write_text(
+            "message M { optional uint32 retry_after_seconds = 3; }\n"
+        )
+        f_t = scan_proto_optional_seconds(straw_root)
+        if len(f_t) != 1 or "getter production" not in f_t[0]:
+            print(
+                f"FAIL: the optional-*_seconds trigger arm did not fire on the strawman: {f_t}",
                 file=sys.stderr,
             )
             return 1
@@ -531,6 +732,10 @@ def main() -> int:
             refusal_files.append((rel, f.read_text()))
     fails += scan_refusal_folds(refusal_files)
     fails += scan_wire_secs_seams(refusal_files)
+    # The method-call leniency's machine-bound trigger (WO-S8-3): no
+    # `optional … *_seconds` proto field may exist while the grammar
+    # excludes the prost-getter read form.
+    fails += scan_proto_optional_seconds(src_root)
 
     gaps = sorted(f"{name}:{ax}" for name, _, _, _, g, _ in REGISTRY for ax in g)
     derived = sum(1 for *_, d in REGISTRY if d is not None)
