@@ -462,7 +462,7 @@ pub fn intent_for(
     if hints.prefer_local_build == Some(true) {
         // Trivial builders (writeText, runCommand, symlinkJoin) have no
         // pname → never fitted → must NOT fall back to ceil.default_disk
-        // (100 GiB chart default, sized for cold-probe of an unknown
+        // (the `sla.defaultDisk` chart default, sized for cold-probe of an unknown
         // package). Mirror LOCAL_MEM_BYTES with a minimal disk const.
         let disk = fit::DiskFitEnvelope::fit(
             fit.and_then(|f| f.disk_p90),

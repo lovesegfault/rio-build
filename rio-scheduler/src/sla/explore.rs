@@ -290,7 +290,8 @@ pub fn next(
     // r[impl sched.sla.disk-reaches-ephemeral-storage+1]
     // live_049 L2: the warm path's disk request is the typed envelope —
     // the observed per-pname p90 (now aggregated for probe-shaped fits
-    // too) retires the 100 GiB prior; floor/ceiling by construction.
+    // too) retires the `sla.defaultDisk` cold-start prior;
+    // floor/ceiling by construction.
     let disk = super::fit::DiskFitEnvelope::fit(f.disk_p90, cfg.default_disk, ceil.max_disk);
     let st = &f.explore;
     // First sample landed but min/max not yet diverse → treat as cold.
@@ -1117,7 +1118,7 @@ mod disk_axis_tests {
 
     fn cfg_and_ceil() -> (SlaConfig, Ceilings) {
         let cfg = SlaConfig {
-            default_disk: 100 << 30, // the shipped 100 GiB chart default
+            default_disk: 100 << 30, // this fixture's own cold-start prior (cite `sla.defaultDisk` for the shipped value — magnitudes are not restated across tiers, merged_bug_021)
             max_disk: 200 << 30,
             ..SlaConfig::test_default()
         };
@@ -1135,11 +1136,12 @@ mod disk_axis_tests {
     /// the default*: five serial samples with small observed peaks,
     /// the newest peak-less, through the PRODUCTION ingest → explore
     /// pipeline. Structural ratio assert with ≥10× slack (no
-    /// wall-clock): the fitted request collapses from the 100 GiB
-    /// prior to ~p90(2-3 GiB) — the `pod_ephemeral_request` input that
-    /// turned ~189-201 GiB/pod into a fitted footprint (the L2 live
-    /// waste; the consumer arithmetic is byte-identical, fed fitted
-    /// input). Pre-fix red (left): `disk == default_disk` (100 GiB).
+    /// wall-clock): the fitted request collapses from this fixture's
+    /// `default_disk` prior to ~p90(2-3 GiB) — the
+    /// `pod_ephemeral_request` input that turned ~189-201 GiB/pod into
+    /// a fitted footprint (the L2 live waste; the consumer arithmetic
+    /// is byte-identical, fed fitted input). Pre-fix red (left):
+    /// `disk == default_disk` (the fixture prior).
     #[test]
     fn warm_pname_disk_request_is_fitted_not_default() {
         const GI: i64 = 1 << 30;
