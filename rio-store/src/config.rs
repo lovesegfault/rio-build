@@ -424,6 +424,27 @@ pub fn effective_substitute_admission_cap(overridden: Option<usize>, pg_max: u32
 /// rather than floored, because a floored P = 1 = cap silently hands
 /// the executor 100 % of a cap-1 gate, the exact inversion this
 /// derivation exists to prevent.
+///
+/// **The round-6 n=64 rejection premise is RETIRED (live_061-R4, the
+/// fix-adjacent rationale record).** Round 6 rejected raising
+/// `executor_concurrency` past 32 because the executor then drew on
+/// the WHOLE admission gate: full worker occupancy meant whole-gate
+/// occupancy, miss traffic answered RESOURCE_EXHAUSTED, and the
+/// executor self-parked — the rejection was a SAFETY argument. The
+/// structural P = cap/2 split (e77b67e7c, this fn) REMOVED that
+/// premise: the executor's total gate draw is bounded by P whatever
+/// n and F are, so a future n raise is GATE-SAFE by construction.
+/// What remains is POOL arithmetic: at the production values
+/// (pgMaxConnections 20 → cap 64 → P = 32), n = 32 = P — full-fleet
+/// claim-gate occupancy exactly saturates the path-slot pool, and
+/// raising n past P shifts queueing onto the baseline path-slot
+/// acquire (FIFO-fair, watched by
+/// `rio_store_executor_path_slot_baseline_waiters`) instead of onto
+/// the shared gate. Anyone revisiting the live_061 throughput
+/// question: n was NOT the limiter (observed concurrency was 1-3
+/// against the n×fleet ≈ 1,472 design point — the claim plane, not
+/// the walk plane, was starved), and the old whole-gate argument
+/// must not be cited against an n raise.
 pub fn derive_executor_path_slots(effective_cap: usize) -> usize {
     effective_cap / 2
 }

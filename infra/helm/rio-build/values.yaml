@@ -484,6 +484,16 @@ store:
     # per-query claims vs the 20-conn pool is acceptable — the
     # substitute path never holds a connection across an upstream
     # fetch.
+    # History (live_061-R4): the round-6 rejection of n=64 was a
+    # WHOLE-GATE occupancy argument (pre-split, full worker occupancy
+    # saturated the shared admission gate and self-parked on
+    # RESOURCE_EXHAUSTED). The structural P=cap/2 split (e77b67e7c)
+    # retired that premise — a future raise is gate-safe by
+    # construction and only pool-bound: n=32=P here means full-fleet
+    # claim occupancy exactly saturates the path-slot pool; past P,
+    # queueing moves to the FIFO-fair baseline acquire (watch
+    # rio_store_executor_path_slot_baseline_waiters). live_061's 1-3
+    # observed walks were a CLAIM-PLANE starvation, not an n limit.
     executorConcurrency: 32
     # Bounded intra-job substitution fan-out
     # (r[store.materialize.path-fold+1]): per-job path-resolution window
