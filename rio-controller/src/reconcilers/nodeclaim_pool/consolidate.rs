@@ -197,32 +197,16 @@ pub fn placeable_for_cell(
 ) -> Vec<Placement> {
     placeable
         .iter()
-        .filter(|(i, _, _)| {
-            // r37 bug_002 (§Simulator-shares-accounting): the
-            // (intent, cell) membership predicate is `cells_of(i)` —
-            // both the hw_class half AND the capacity-type half.
-            // `hw_class_names`-only matching counted spot-only intents
-            // as demand for the on-demand cell (and vice versa),
-            // inflating `e_fitting_cores`. `cells_of(i)` is what FFD's
-            // `simulate` and cover's `assign_to_cells` use; routing
-            // here through the same fn keeps the consolidator's view of
-            // demand consistent with the placer's.
-            cells_of(i).iter().any(|c| c == cell)
-                || (i.hw_class_names.is_empty() && {
-                    let a = system_to_arch(&i.system);
-                    let f = i.required_features.as_slice();
-                    (a.is_some() || !f.is_empty()) && hw_admits(&cell.0, a, f)
-                })
-        })
+        .filter(|(i, _, _)| cell_admits(i, cell, &hw_admits))
         .cloned()
         .collect()
 }
 
 /// [`placeable_for_cell`]'s sibling over the window-DEFERRED intents
-/// (round-10 merged_bug_012): the SAME (intent, cell) admission
-/// predicate — `cells_of(i)` membership plus the agnostic-fallback
-/// gate — so the consolidator's view of deferred demand routes
-/// exactly like the placer's would have.
+/// (round-10 merged_bug_012): the IDENTICAL [`cell_admits`] body —
+/// structural identity, not a prose promise — so the consolidator's
+/// view of deferred demand routes exactly like the placer's would
+/// have.
 pub fn deferred_for_cell(
     deferred: &[SpawnIntent],
     cell: &Cell,
@@ -230,16 +214,46 @@ pub fn deferred_for_cell(
 ) -> Vec<SpawnIntent> {
     deferred
         .iter()
-        .filter(|i| {
-            cells_of(i).iter().any(|c| c == cell)
-                || (i.hw_class_names.is_empty() && {
-                    let a = system_to_arch(&i.system);
-                    let f = i.required_features.as_slice();
-                    (a.is_some() || !f.is_empty()) && hw_admits(&cell.0, a, f)
-                })
-        })
+        .filter(|i| cell_admits(i, cell, &hw_admits))
         .cloned()
         .collect()
+}
+
+/// THE (intent, cell) admission predicate — ONE `pub fn` body that
+/// every consolidation lane calls (bug_058): `cells_of(i)` membership
+/// (BOTH the hw_class half AND the capacity-type half — r37 bug_002:
+/// `hw_class_names`-only matching counted spot-only intents as demand
+/// for the on-demand cell, inflating `e_fitting_cores`; `cells_of(i)`
+/// is what FFD's `simulate` and cover's `assign_to_cells` use, so the
+/// consolidator's view of demand stays consistent with the placer's)
+/// OR the agnostic-fallback gate (at least one non-trivial constraint
+/// axis, routed through `hw_admits` — r35 B1: `arch=None ∧
+/// features=[fetcher]` is the builtin-FOD case that a bare
+/// `is_some_and` short-circuit dropped, reaping fetcher cells whose
+/// only demand was builtin FODs).
+///
+/// POLICY (the second-strike rule this hoist records): this predicate
+/// shipped TWO one-sided-edit strikes while it lived as prose-coupled
+/// per-lane copies (r37 bug_002, r35 B1), and the wave-10
+/// merged_bug_012 close re-armed the shape with a third copy bound
+/// only by a "SAME admission predicate" doc comment. A twice-burned
+/// predicate gets a canonical home: the doc-mirror form is a review
+/// reject, "deferred routes exactly like placeable" is
+/// construction-enforced (one body — a one-sided edit is unwritable),
+/// and `cell_admits_census` makes a fresh open-coded copy
+/// structurally loud (the R28 partition axis: the law's partition
+/// function is sealed, never mirrored).
+pub fn cell_admits(
+    i: &SpawnIntent,
+    cell: &Cell,
+    hw_admits: &impl Fn(&str, Option<&str>, &[String]) -> bool,
+) -> bool {
+    cells_of(i).iter().any(|c| c == cell)
+        || (i.hw_class_names.is_empty() && {
+            let a = system_to_arch(&i.system);
+            let f = i.required_features.as_slice();
+            (a.is_some() || !f.is_empty()) && hw_admits(&cell.0, a, f)
+        })
 }
 
 /// Append `e` to `cell`'s ring-buffered `idle_gap_events`.
@@ -269,8 +283,9 @@ struct CellCtx {
     /// partition `e_fitting_cores` averages over.
     cell_placeable: Vec<Placement>,
     /// Round-10 merged_bug_012: the per-cell partition of this tick's
-    /// WINDOW-DEFERRED intents (same admission predicate as
-    /// `placeable_for_cell`). Deferred demand is still demand — the
+    /// WINDOW-DEFERRED intents (the same [`cell_admits`] body as
+    /// `placeable_for_cell` — structural, bug_058). Deferred demand is
+    /// still demand — the
     /// NA keep-condition must see it, or the idle node serving a
     /// deferred backlog is reaped at the floor and re-minted next
     /// window rotation (reap-then-re-mint churn).
@@ -1332,6 +1347,113 @@ mod tests {
         );
         // No min: floor=9. max=5 < 9.
         assert_eq!(consolidate_after(&[], 0.0, 8, 18.0, Some(5.0), None), 9.0);
+    }
+
+    /// W11-AJ (bug_058 — the [GEN-SET] predicate-callers census, R28
+    /// partition axis): exactly ONE admission-predicate body exists.
+    /// The population is the (intent, cell) filter sites in this
+    /// file's production half, detected by the predicate's own idiom
+    /// signature (`cells_of(…).iter().any` — the open-coded shape
+    /// both prior strikes shipped through); the pinned counts force a
+    /// fresh copy to either route through [`cell_admits`] or go
+    /// census-red. (wwwww): the universe is the embedded source.
+    // r[verify ctrl.pool.delete-outcome]
+    #[test]
+    fn cell_admits_census() {
+        const SRC: &str = include_str!("consolidate.rs");
+        let prod: String = {
+            let lines: Vec<&str> = SRC.lines().collect();
+            let mut cut = lines.len();
+            for i in 0..lines.len() {
+                if lines[i].trim() == "#[cfg(test)]"
+                    && i + 1 < lines.len()
+                    && lines[i + 1].contains("mod ")
+                    && lines[i + 1].trim_end().ends_with('{')
+                {
+                    cut = i;
+                    break;
+                }
+            }
+            lines[..cut].join("\n")
+        };
+        let bodies = prod.matches("cells_of(i).iter().any").count();
+        assert_eq!(
+            bodies, 1,
+            "exactly one admission-predicate BODY (cell_admits) — an \
+             open-coded copy is the bug_058 one-sided-edit shape; route \
+             through cell_admits instead"
+        );
+        // Both lanes call the canonical body: the def plus two callers.
+        let calls = prod.matches("cell_admits(").count();
+        assert_eq!(
+            calls, 3,
+            "cell_admits = one def + the two lane callers; a new \
+             (intent, cell) filter lane takes a counted census row here"
+        );
+    }
+
+    /// W11-AJ planted red: the strawman one-sided edit — a THIRD
+    /// open-coded copy of the predicate — drives the same detector
+    /// the census runs over production, and the detector flags it.
+    #[test]
+    fn cell_admits_census_strawman_plant() {
+        let strawman = "fn third_copy(i: &SpawnIntent, cell: &Cell) -> bool {\n    cells_of(i).iter().any(|c| c == cell)\n        || (i.hw_class_names.is_empty() && hw_admits(&cell.0, a, f))\n}";
+        let bodies = strawman.matches("cells_of(i).iter().any").count();
+        assert_eq!(
+            bodies, 1,
+            "the detector sees the strawman copy — production plus this \
+             shape would read 2 and the census above goes red"
+        );
+    }
+
+    /// bug_058 structural identity: the hoisted [`cell_admits`] IS the
+    /// admission property table for BOTH lanes — one body, so the r37
+    /// bug_002 capacity-type law and the r35 B1 builtin-FOD law hold
+    /// for `deferred_for_cell` exactly as `placeable_for_cell`'s tests
+    /// pin them. This drives the DEFERRED lane through the same cells
+    /// to make the sharing observable end-to-end (not just by code
+    /// inspection).
+    #[test]
+    fn deferred_lane_shares_the_admission_property_table() {
+        use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm};
+        let od_only_intent = SpawnIntent {
+            cores: 8,
+            hw_class_names: vec!["hi-ebs-x86".into()],
+            node_affinity: vec![NodeSelectorTerm {
+                match_expressions: vec![NodeSelectorRequirement {
+                    key: super::super::ffd::CAPACITY_TYPE_LABEL.into(),
+                    operator: "In".into(),
+                    values: vec!["on-demand".into()],
+                }],
+            }],
+            ..Default::default()
+        };
+        let spot_cell = Cell("hi-ebs-x86".into(), CapacityType::Spot);
+        let od_cell = Cell("hi-ebs-x86".into(), CapacityType::OnDemand);
+        let admits = |_: &str, _: Option<&str>, _: &[String]| true;
+        // The r37 bug_002 law via the deferred lane:
+        assert!(
+            deferred_for_cell(&[od_only_intent.clone()], &spot_cell, admits).is_empty(),
+            "capacity-type half holds on the deferred lane (one body)"
+        );
+        assert_eq!(
+            deferred_for_cell(&[od_only_intent], &od_cell, admits).len(),
+            1
+        );
+        // The r35 B1 law via the deferred lane: builtin FOD
+        // (arch=None, features=[fetcher]) routes through hw_admits.
+        let builtin_fod = SpawnIntent {
+            cores: 1,
+            system: "builtin".into(),
+            required_features: vec!["fetcher".into()],
+            ..Default::default()
+        };
+        let fetcher_cell = Cell("fetcher-x86".into(), CapacityType::Spot);
+        assert_eq!(
+            deferred_for_cell(&[builtin_fod], &fetcher_cell, admits).len(),
+            1,
+            "builtin-FOD agnostic fallback holds on the deferred lane"
+        );
     }
 
     /// r37 bug_002 (§Simulator-shares-accounting): `placeable_for_cell`
