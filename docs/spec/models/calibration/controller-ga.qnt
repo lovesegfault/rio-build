@@ -50,7 +50,9 @@ module gaCalibNoLiveRecheck {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the live pod-phase re-check is
@@ -68,7 +70,7 @@ module gaCalibNoLiveRecheck {
                  else currentQueue
     val schedErr = pollFails
 
-    val gr = gateRetain(CRD_PRESENT, IS_BUILDER, gate, polled)
+    val gr = gateRetain(CRD_PRESENT, IS_BUILDER, gate, polled, Set())
     val gateArmed = gr._1
     val postGate = gr._2
     val q = postGate.size()
@@ -196,7 +198,7 @@ module gaCalibNoLiveRecheck {
         and (spawnedSet.size() > 0 or excessReaped.size() > 0))
       or (builderGated and (match gate {
             | GUnarmed => false
-            | GArmed(s) => spawnedSet.filter(i => not(s.contains(i))).size() > 0
+            | GArmed(sf) => spawnedSet.filter(i => not(sf._1.contains(i))).size() > 0
           }))
       or (not(CRD_PRESENT) and excessReaped.size() > 0)
       or (not(CRD_PRESENT) and postGate != polled)
@@ -310,7 +312,9 @@ module gaCalibOrphanGateEmptyOk {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the orphan-reap decision uses a
@@ -329,7 +333,7 @@ module gaCalibOrphanGateEmptyOk {
                  else currentQueue
     val schedErr = pollFails
 
-    val gr = gateRetain(CRD_PRESENT, IS_BUILDER, gate, polled)
+    val gr = gateRetain(CRD_PRESENT, IS_BUILDER, gate, polled, Set())
     val gateArmed = gr._1
     val postGate = gr._2
     val q = postGate.size()
@@ -462,7 +466,7 @@ module gaCalibOrphanGateEmptyOk {
         and (spawnedSet.size() > 0 or excessReaped.size() > 0))
       or (builderGated and (match gate {
             | GUnarmed => false
-            | GArmed(s) => spawnedSet.filter(i => not(s.contains(i))).size() > 0
+            | GArmed(sf) => spawnedSet.filter(i => not(sf._1.contains(i))).size() > 0
           }))
       or (not(CRD_PRESENT) and excessReaped.size() > 0)
       or (not(CRD_PRESENT) and postGate != polled)
@@ -576,7 +580,9 @@ module gaCalibCrdAbsentArmed {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).* from "../spawnCoherence"
 
   /// PRE-FIX gate retain: the crd-absent arm arms the gate (pass-through
@@ -591,7 +597,7 @@ module gaCalibCrdAbsentArmed {
     else
       match g {
         | GUnarmed => (false, Set())
-        | GArmed(s) => (true, polled.intersect(s))
+        | GArmed(sf) => (true, polled.intersect(sf._1))
       }
 
   /// The as-built tick with ONE change: the gate retain is the pre-fix
@@ -739,7 +745,7 @@ module gaCalibCrdAbsentArmed {
         and (spawnedSet.size() > 0 or excessReaped.size() > 0))
       or (builderGated and (match gate {
             | GUnarmed => false
-            | GArmed(s) => spawnedSet.filter(i => not(s.contains(i))).size() > 0
+            | GArmed(sf) => spawnedSet.filter(i => not(sf._1.contains(i))).size() > 0
           }))
       or (not(CRD_PRESENT) and excessReaped.size() > 0)
       or (not(CRD_PRESENT) and postGate != polled)

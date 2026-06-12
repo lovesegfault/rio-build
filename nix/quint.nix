@@ -4450,6 +4450,44 @@ rec {
       witness = "canReachSuppressedExcess";
     };
 
+    # Round-11 (merged_bug_047, WO-S4-4): the held placed-in-flight
+    # demand-visibility law. FALSIFY half: the as-built gate fold
+    # strips placed-in-flight intents while the transport Complete
+    # witness survives the page mutation — a held intent's still-
+    # wanted Pending Job reads AbsentFromDemand and the orphan arm
+    # foreground-deletes it (heldPlacementDemandVisible expected
+    # violated — the laundered-absence trace, the W11-AK model twin).
+    # r[verify ctrl.pool.window-visibility]
+    quint-spawn-coherence-falsify-held-asbuilt = mkQuintWitnessCheck {
+      name = "spawn-coherence-falsify-held-asbuilt";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceHeldAsBuilt";
+      witness = "heldPlacementDemandVisible";
+    };
+    # HOLD half: the fold THREADS the held set — a placed-in-flight
+    # intent with a live Job stays demand-visible while the spawn lane
+    # still excludes it; canReachHeldKept below keeps it non-vacuous.
+    # r[verify ctrl.pool.window-visibility]
+    quint-spawn-coherence-held-visible = mkQuintCheck {
+      name = "spawn-coherence-held-visible";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceHeld";
+      invariants = [
+        "ceilingRespected"
+        "reapSafety"
+        "orphanRemoved"
+        "ackSoundness"
+        "gateFailClosed"
+        "heldPlacementDemandVisible"
+      ];
+    };
+    quint-spawn-coherence-witness-held-kept = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-held-kept";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceHeld";
+      witness = "canReachHeldKept";
+    };
+
     # ---- Model N: exhaustive regime checks ---------------------------
 
     # Healthy lifecycle, no faults: create -> register -> busy/idle ->

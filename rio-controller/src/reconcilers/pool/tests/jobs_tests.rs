@@ -4356,7 +4356,7 @@ async fn w10_ai_deferred_intent_stays_demand_visible_not_spawnable() {
 
     // FFD tick: "reg" placed-on-registered; "def" window-deferred
     // (holds a Pending Job from an earlier tick).
-    let gate = PlaceableGate::from_tick(PlacedTick::for_test(["reg"], ["def"]));
+    let gate = PlaceableGate::from_tick(PlacedTick::for_test(["reg"], [], ["def"], ["def"]));
     let mut page = IntentPage::for_test(vec![intent_named("reg"), intent_named("def")]);
     let tick = apply_placeable_gate(&mut page, &gate).expect("armed");
 
@@ -4393,6 +4393,186 @@ async fn w10_ai_deferred_intent_stays_demand_visible_not_spawnable() {
     assert_eq!(tick.disposition("reg"), FfdDisposition::PlacedRegistered);
     assert_eq!(tick.disposition("def"), FfdDisposition::Deferred);
     assert_eq!(tick.disposition("ghost"), FfdDisposition::Unplaced);
+}
+
+// r[verify ctrl.pool.window-visibility]
+/// **W11-AK (merged_bug_047 — R26 lens + R25 letter law), the unit
+/// face.** A job_held intent placed IN-FLIGHT (the window exemption
+/// admits held intents to the fit-check; the fit-check can land them
+/// on an unregistered claim) stays DEMAND-VISIBLE through the gate
+/// fold: want-map membership (no orphan delete), queued count (no
+/// excess-pending undercount) — while the spawn lane still excludes
+/// it (PlacedInFlight is not spawnable). A Job-LESS in-flight
+/// placement keeps the pre-round-10 strip (its premise holds). The
+/// for_test constructor now carries the full disposition product —
+/// the triage-named test gap was in_flight hardcoded empty.
+#[tokio::test]
+async fn w11_ak_held_in_flight_placement_stays_demand_visible() {
+    use crate::reconcilers::nodeclaim_pool::{FfdDisposition, PlaceableGate, PlacedTick};
+    use crate::reconcilers::pool::jobs::apply_placeable_gate;
+
+    // FFD tick: "reg" on-registered; "held1" placed-in-flight WITH a
+    // live Job; "fly0" placed-in-flight with NO Job.
+    let gate = PlaceableGate::from_tick(PlacedTick::for_test(
+        ["reg"],
+        ["held1", "fly0"],
+        [],
+        ["held1"],
+    ));
+    let mut page = IntentPage::for_test(vec![
+        intent_named("reg"),
+        intent_named("held1"),
+        intent_named("fly0"),
+    ]);
+    let tick = apply_placeable_gate(&mut page, &gate).expect("armed");
+
+    let ids: Vec<&str> = page.iter_page().map(|i| i.intent_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["reg", "held1"],
+        "held in-flight placement survives the fold; the Job-less one \
+         keeps the strip (its premise holds)"
+    );
+    assert_eq!(
+        page.len_page(),
+        2,
+        "queued counts the held placement (the excess-pending half)"
+    );
+    // Absence lane: the held intent's Job reads Wanted.
+    let want = want_complete(
+        &page.iter_page().cloned().collect::<Vec<_>>(),
+        "p",
+        ExecutorKind::Builder,
+    );
+    let held_job = crate::reconcilers::pool::pod::job_name("p", ExecutorKind::Builder, "held1");
+    assert!(
+        matches!(
+            want.verdict(&held_job),
+            crate::reconcilers::pool::jobs::WantVerdict::Wanted(_)
+        ),
+        "the held placement's Pending Job is WANTED demand"
+    );
+    // Spawn lane: still not spawnable.
+    assert_eq!(tick.disposition("held1"), FfdDisposition::PlacedInFlight);
+    assert!(tick.held("held1") && !tick.held("fly0"));
+}
+
+// r[verify ctrl.pool.window-visibility]
+/// **W11-AK, the end-to-end face (the red's home):** a held Pending
+/// intent re-placed in-window onto an unregistered claim — pre-fix
+/// the gate fold stripped it while the Complete witness survived the
+/// page mutation, so the orphan arm foreground-deleted the
+/// still-wanted Job single-tick at the 10s grace, inside the 50-90s
+/// claim-registration window. Post-fix the Job stays demand-visible
+/// through the registration window: the verifier proves ZERO deletes
+/// go out.
+#[tokio::test]
+async fn w11_ak_held_pending_job_not_orphan_deleted_end_to_end() {
+    use crate::reconcilers::nodeclaim_pool::{PlaceableGate, PlacedTick};
+    use crate::reconcilers::pool::jobs::apply_placeable_gate;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+    use k8s_openapi::jiff::{SignedDuration, Timestamp};
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    let held = intent_named("held1");
+    let fp = crate::reconcilers::pool::candidate::RenderInputs::from_intent(&held).fingerprint();
+    // The held Pending Job: older than REAP_PENDING_GRACE, fingerprint
+    // matching (so the selector-drift arm stays quiet — the ONLY
+    // delete path in play is the orphan arm's absence verdict).
+    let job = Job {
+        metadata: ObjectMeta {
+            name: Some(
+                crate::reconcilers::pool::pod::job_name("p", ExecutorKind::Builder, "held1")
+                    .clone(),
+            ),
+            uid: Some(apiserver_uid()),
+            creation_timestamp: Some(Time(Timestamp::now() - SignedDuration::from_secs(60))),
+            annotations: Some(BTreeMap::from([(
+                INTENT_SELECTOR_ANNOTATION.into(),
+                fp.clone(),
+            )])),
+            ..Default::default()
+        },
+        status: Some(JobStatus {
+            ready: Some(0),
+            succeeded: Some(0),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    // The gate: held1 placed IN-FLIGHT (re-fit onto an unregistered
+    // claim) and job_held (its Pending Job is live); a sibling
+    // placed-on-registered intent keeps the want-map NON-EMPTY, so
+    // the `want.is_empty()` fail-closed early-return is out of play
+    // and the orphan arm actually adjudicates held1's Job (the
+    // production shape: the held intent is stripped while the rest
+    // of the page survives).
+    let gate = PlaceableGate::from_tick(PlacedTick::for_test(["reg"], ["held1"], [], ["held1"]));
+    let mut page = IntentPage::for_test(vec![intent_named("reg"), held]);
+    apply_placeable_gate(&mut page, &gate).expect("armed");
+
+    // The want-map minted from the post-fold page + the transport
+    // Complete letter (the production absence-lane path).
+    let want = WantMap::for_pool(&page, DemandCoverage::Complete, "p", ExecutorKind::Builder);
+
+    // ONE canary scenario: the reap must issue ZERO kube requests
+    // (post-fix), so the first and only request the verifier sees is
+    // the canary GET issued by the test afterwards. Pre-fix the
+    // orphan arm's foreground DELETE arrives first and fails the
+    // strict scenario match — the red.
+    let guard = verifier.run(vec![Scenario::ok(
+        http::Method::GET,
+        "/namespaces/rio/jobs/rio-builder-p-held1",
+        serde_json::to_string(&job).unwrap(),
+    )]);
+    let reaped = reap_stale_for_intents(
+        &jobs_api,
+        std::slice::from_ref(&job),
+        &want,
+        &ctx,
+        &crate::fixtures::test_pool("p", ExecutorKind::Builder),
+        "p",
+        &pkey(),
+    )
+    .await;
+    assert!(
+        reaped.is_empty(),
+        "a wanted Job is never deleted on absence evidence minted \
+         before a policy mutation (merged_bug_047)"
+    );
+    let _ = jobs_api.get("rio-builder-p-held1").await.expect("canary");
+    guard.verified().await;
+}
+
+// r[verify ctrl.pool.window-visibility]
+/// **W11-AK, the witness-degradation belt:** a LOSSY narrowing of a
+/// witnessed page degrades the coverage letter inside the absence
+/// lane's sole constructor — the stripped intent's Job reads
+/// `Unknowable`, never `AbsentFromDemand`, so the destructive arm
+/// suspends. The laundering form (policy strip + untouched Complete
+/// witness) is structurally unwritable: a fold either THREADS the
+/// held set or pays with the witness.
+#[tokio::test]
+async fn w11_ak_lossy_narrowing_degrades_the_absence_witness() {
+    use crate::reconcilers::pool::jobs::PageNarrowing;
+
+    let mut page = IntentPage::for_test(vec![intent_named("x1"), intent_named("x2")]);
+    // A policy fold that strips x2 and DECLARES itself lossy.
+    page.retain_page(|i| i.intent_id == "x1", PageNarrowing::Lossy);
+    let want = WantMap::for_pool(&page, DemandCoverage::Complete, "p", ExecutorKind::Builder);
+    let x2_job = crate::reconcilers::pool::pod::job_name("p", ExecutorKind::Builder, "x2");
+    assert!(
+        matches!(
+            want.verdict(&x2_job),
+            crate::reconcilers::pool::jobs::WantVerdict::Unknowable
+        ),
+        "absence off a lossy-narrowed page is Unknowable — the \
+         transport Complete letter does not survive the mutation"
+    );
 }
 
 // r[verify ctrl.pool.demand-completeness]

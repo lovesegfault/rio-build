@@ -1419,7 +1419,10 @@ impl PoolDemandView {
             complete: !resp.truncated,
             ready_upper,
             forecast_upper,
-            page: IntentPage(resp.intents),
+            page: IntentPage {
+                intents: resp.intents,
+                lossy: false,
+            },
         }
     }
 
@@ -1431,7 +1434,10 @@ impl PoolDemandView {
     /// consulted for a destructive verdict.
     fn failed_poll() -> Self {
         Self {
-            page: IntentPage(Vec::new()),
+            page: IntentPage {
+                intents: Vec::new(),
+                lossy: false,
+            },
             complete: true,
             ready_upper: 0,
             forecast_upper: 0,
@@ -1461,7 +1467,39 @@ impl PoolDemandView {
 /// consumer cannot quantify over the page without naming the
 /// page-scope. Absence judgments live on [`WantMap`]; demand bounds
 /// on [`DemandEvidence`].
-pub(crate) struct IntentPage(Vec<SpawnIntent>);
+pub(crate) struct IntentPage {
+    intents: Vec<SpawnIntent>,
+    /// A LOSSY narrowing happened since the transport mint
+    /// (merged_bug_047): the page no longer supports true-negative
+    /// absence — [`Self::coverage_for_absence`] degrades the
+    /// transport letter to `Incomplete`. The laundering form (policy
+    /// strip after the witness mint, witness untouched) is thereby
+    /// unwritable: a fold either THREADS demand-visibility
+    /// ([`PageNarrowing::HeldThreaded`] — held intents survive by
+    /// construction) or pays with the witness.
+    lossy: bool,
+}
+
+// r[impl ctrl.pool.window-visibility]
+/// What one [`IntentPage::retain_page`] narrowing means for the
+/// absence lane — every retain on a witnessed page type states its
+/// disposition (merged_bug_047: the R26 completeness witness binds to
+/// the view it was minted from; a mutation after the mint either
+/// threads the demand axis through or degrades the letter).
+pub(crate) enum PageNarrowing<'a> {
+    /// The fold THREADS demand-visibility: intents in `job_held`
+    /// (live Job at sim time) survive the narrowing REGARDLESS of the
+    /// per-arm predicate — enforced by the page type, not the caller
+    /// — so absence evidence minted from the narrowed page stays
+    /// true-negative for every Job-backed intent. The coverage letter
+    /// survives.
+    HeldThreaded { job_held: &'a HashSet<String> },
+    /// The fold is lossy w.r.t. demand: the coverage letter degrades
+    /// to `Incomplete` (absence becomes `Unknowable`; the destructive
+    /// absence-keyed arms suspend).
+    #[allow(dead_code)] // the lawful exit for future folds; no production caller today
+    Lossy,
+}
 
 impl IntentPage {
     /// The page-scoped walk: per-held-element consumers only (spawn
@@ -1470,23 +1508,54 @@ impl IntentPage {
     /// the wrong lane — see [`WantMap`] (absence) and the W10-AH
     /// census (totality/continuity).
     pub(crate) fn iter_page(&self) -> std::slice::Iter<'_, SpawnIntent> {
-        self.0.iter()
+        self.intents.iter()
     }
 
-    /// Page-scoped retain (the placeable-gate fold and siblings).
-    pub(crate) fn retain_page(&mut self, f: impl FnMut(&SpawnIntent) -> bool) {
-        self.0.retain(f);
+    /// Page-scoped retain (the placeable-gate fold and siblings) —
+    /// REQUIRES a stated [`PageNarrowing`] disposition: threading
+    /// keeps held intents by construction; lossy pays the witness.
+    pub(crate) fn retain_page(
+        &mut self,
+        mut f: impl FnMut(&SpawnIntent) -> bool,
+        disposition: PageNarrowing<'_>,
+    ) {
+        match disposition {
+            PageNarrowing::HeldThreaded { job_held } => {
+                self.intents
+                    .retain(|i| f(i) || job_held.contains(&i.intent_id));
+            }
+            PageNarrowing::Lossy => {
+                self.lossy = true;
+                self.intents.retain(f);
+            }
+        }
     }
 
-    /// Drop the whole page (the unarmed-gate posture).
+    /// Drop the whole page (the unarmed-gate posture). Lossy by
+    /// definition — belt only: the unarmed arm also reports
+    /// `gate_armed = false`, which fail-closes every count consumer.
     pub(crate) fn clear_page(&mut self) {
-        self.0.clear();
+        self.lossy = true;
+        self.intents.clear();
     }
 
     /// Held-intent count — a PAGE property, not a demand bound
     /// ([`reap_queued_known`] owns the bound law).
     pub(crate) fn len_page(&self) -> usize {
-        self.0.len()
+        self.intents.len()
+    }
+
+    /// The transport coverage letter as the ABSENCE lane may consume
+    /// it: degraded to `Incomplete` if any lossy narrowing happened
+    /// since the mint (the witness binds to the view it was minted
+    /// from — merged_bug_047). Fused inside [`WantMap::for_pool`], so
+    /// no absence consumer can read the un-degraded letter.
+    fn coverage_for_absence(&self, transport: DemandCoverage) -> DemandCoverage {
+        if self.lossy {
+            DemandCoverage::Incomplete
+        } else {
+            transport
+        }
     }
 
     /// Test-only page constructor (unit tests for the page-lane
@@ -1494,7 +1563,10 @@ impl IntentPage {
     /// [`PoolDemandView::from_response`]).
     #[cfg(test)]
     pub(crate) fn for_test(intents: Vec<SpawnIntent>) -> Self {
-        Self(intents)
+        Self {
+            intents,
+            lossy: false,
+        }
     }
 }
 
@@ -1578,6 +1650,11 @@ impl WantMap {
         pool: &str,
         kind: ExecutorKind,
     ) -> Self {
+        // merged_bug_047: the witness is consumed THROUGH the page —
+        // a lossy narrowing since the transport mint degrades it
+        // here, inside the sole absence-lane constructor, so no
+        // caller can pair a mutated page with the un-degraded letter.
+        let coverage = page.coverage_for_absence(coverage);
         let names = page
             .iter_page()
             .map(|i| {
@@ -1656,6 +1733,7 @@ pub(crate) fn reap_queued_known(
 /// clear + `false` when unarmed (no FFD tick yet / standby replica) so
 /// `queued_known = None` keeps `reap_excess_pending` fail-closed.
 // r[impl ctrl.nodeclaim.placeable-gate+5]
+// r[impl ctrl.pool.window-visibility]
 pub(crate) fn apply_placeable_gate(
     page: &mut IntentPage,
     gate: &crate::reconcilers::nodeclaim_pool::PlaceableGate,
@@ -1664,31 +1742,48 @@ pub(crate) fn apply_placeable_gate(
     match gate.snapshot() {
         Some(tick) => {
             // The DEMAND fold (R25: every letter named — no if-let
-            // between the producer's alphabet and this law):
-            page.retain_page(|i| match tick.disposition(&i.intent_id) {
-                // Spawnable AND demand-visible.
-                FfdDisposition::PlacedRegistered => true,
-                // Round-10 merged_bug_012: window-deferred intents
-                // stay DEMAND-VISIBLE (want-map membership, queued
-                // count, re-ack) — the spawn pass filters them via
-                // `PlacedTick::disposition` (not spawnable this
-                // tick); pre-fix they were stripped here and their
-                // still-wanted Pending Jobs orphan-reaped at 10s.
-                FfdDisposition::Deferred => true,
-                // Placed on an in-flight claim: NOT spawnable (the
-                // pod would sit Pending until the claim registers)
-                // and NOT demand-visible — the pre-round-10 posture,
-                // kept deliberately: an in-flight placement normally
-                // has no Job (spawn is gated until Registered), so
-                // demand-visibility buys nothing, and widening it is
-                // not this row's close (named here so the fold's
-                // alphabet is total, not an accidental strip).
-                FfdDisposition::PlacedInFlight => false,
-                // Unplaceable this tick: stripped (cover_deficit owns
-                // provisioning; the node-loss reap/respawn cycle is
-                // the designed recovery).
-                FfdDisposition::Unplaced => false,
-            });
+            // between the producer's alphabet and this law), with
+            // demand-visibility THREADED (merged_bug_047): the
+            // narrowing is HeldThreaded, so a Job-backed intent
+            // survives REGARDLESS of the per-arm value — the
+            // structural belt under the per-arm law below.
+            let job_held = tick.job_held().clone();
+            page.retain_page(
+                |i| match tick.disposition(&i.intent_id) {
+                    // Spawnable AND demand-visible.
+                    FfdDisposition::PlacedRegistered => true,
+                    // Round-10 merged_bug_012: window-deferred intents
+                    // stay DEMAND-VISIBLE (want-map membership, queued
+                    // count, re-ack) — the spawn pass filters them via
+                    // `PlacedTick::disposition` (not spawnable this
+                    // tick); pre-fix they were stripped here and their
+                    // still-wanted Pending Jobs orphan-reaped at 10s.
+                    FfdDisposition::Deferred => true,
+                    // Placed on an in-flight claim: NOT spawnable (the
+                    // pod would sit Pending until the claim registers).
+                    // Demand-visible IFF a live Job holds the intent
+                    // (merged_bug_047): the window exemption admits
+                    // job_held intents to the fit-check, so an
+                    // in-flight placement CAN carry a still-wanted
+                    // Pending Job — the round-10 premise "an in-flight
+                    // placement normally has no Job" was falsified by
+                    // the same commit's own exemption, and the strip
+                    // laundered the held Job into AbsentFromDemand
+                    // (foreground-deleted at 10s, mid-registration).
+                    // A Job-less in-flight placement keeps the
+                    // pre-round-10 strip (the premise holds for it).
+                    FfdDisposition::PlacedInFlight => tick.held(&i.intent_id),
+                    // Unplaceable this tick: stripped for Job-less
+                    // intents (cover_deficit owns provisioning); a
+                    // held intent survives via the threading — demand
+                    // truth outlives the placement gap, and the spawn
+                    // pass still filters it (not spawnable).
+                    FfdDisposition::Unplaced => false,
+                },
+                PageNarrowing::HeldThreaded {
+                    job_held: &job_held,
+                },
+            );
             Some(tick)
         }
         None => {
@@ -4198,7 +4293,11 @@ mod tests {
         ];
         // The production publisher shape: the FULL disposition tick
         // (in-flight ids land in their own set, not on_registered).
-        let tick = crate::reconcilers::nodeclaim_pool::PlacedTick::from_sim(&placeable, &[]);
+        let tick = crate::reconcilers::nodeclaim_pool::PlacedTick::from_sim(
+            &placeable,
+            &[],
+            &std::collections::HashSet::new(),
+        );
         tx.send_replace(Some(std::sync::Arc::new(tick)));
 
         let mut page = IntentPage::for_test(vec![
@@ -4525,7 +4624,7 @@ mod demand_lane_census {
     //! | `HwSampledCache::fetch` fan-out      | page walk     | snapshot-tolerant (per-intent RPC union) |
     //! | spawn-candidate filter (`wanted`)    | page walk     | snapshot-tolerant (per-held-element; AD2 totality is per-held by design) |
     //! | `assemble_re_acks` page index        | continuity    | derives-from-Job-LIST (WO-S4-3: the lane's MEMBERSHIP comes from the controller's own Job LIST — the local complete inventory; the page walk here only builds the on-page full-fidelity echo index) |
-    //! | `apply_placeable_gate` retain/clear  | page mutation | snapshot-tolerant (gate fold) |
+    //! | `apply_placeable_gate` retain/clear  | page mutation | snapshot-tolerant (gate fold; the retain THREADS the held set per `PageNarrowing::HeldThreaded` — merged_bug_047: a narrowing either threads demand or degrades the witness) |
     //! | `queued` count (`len_page`)          | page count    | snapshot-tolerant (bound law owns demand counting) |
     //! | reconcile `WantMap::for_pool` mint   | absence mint  | the R26 accessor's sole production constructor call |
     //! | reap loop `want.verdict(jn)`         | absence       | witness-fused verdict (suspends on `Unknowable`) |

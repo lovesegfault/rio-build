@@ -154,7 +154,11 @@ module spawnCoherence {
   type ExecState = ExecAbsent | ExecIdle | ExecBusy
 
   /// The placeable gate as the consumer sees it (CRD-present runs).
-  type GateState = GUnarmed | GArmed(Set[IntentId])
+  /// GArmed carries (demandVisible, placedInFlight): the second set
+  /// is the round-11 held axis -- ids the FFD tick placed on
+  /// in-flight claims (retained OUT of the spawnable set; their
+  /// demand-visibility is the ENABLE_HELD_VISIBILITY law).
+  type GateState = GUnarmed | GArmed((Set[IntentId], Set[IntentId]))
 
   /// C2/120: the intent's entry in the scheduler's `recently_closed`
   /// window (CCNone = no entry). Single-valued last-writer abstraction
@@ -184,6 +188,7 @@ module spawnCoherence {
     | ESynthClose
     | ESkipFailopenSpawn
     | ESkipWithheld
+    | EHeldKept
 
   /// Violation latches. Each invariant below is `not(contains(...))`;
   /// in a correct model every latch stays unset forever, so these add
@@ -206,6 +211,7 @@ module spawnCoherence {
     | VForeignStreakWipe
     | VPoisonBurst
     | VYoungLeaderReap
+    | VHeldPlacementReaped
     | VStaleClose
     | VSpawnClobberedStreak
 
@@ -346,6 +352,23 @@ module spawnCoherence {
   /// wedge spawn).
   const ENABLE_SKIP_SPAWN_FAILOPEN: bool
   const SKIP_SPAWN_WITHHOLD: bool
+  /// Round-11 (merged_bug_047, WO-S4-4): MACHINERY moves the
+  /// placed-in-flight axis of the published gate (the producer's tick
+  /// carries which retained-out ids were PLACED on in-flight claims);
+  /// HELD_VISIBILITY selects the FIXED law (the gate fold THREADS the
+  /// held set: a placed-in-flight intent whose Job is live stays
+  /// demand-visible -- want-map membership, queued count -- while the
+  /// spawn lane still excludes it) vs the as-built strip (the fold
+  /// drops it from the page while the transport Complete witness
+  /// survives the mutation, so the still-wanted Pending Job reads
+  /// AbsentFromDemand and the orphan arm foreground-deletes it at the
+  /// grace -- the laundered-absence trace). All pre-round-11 regimes
+  /// bind both false -- the in-flight choice collapses to empty and
+  /// the reachable state space is unchanged.
+  ///
+  /// MODEL-DIVERGENCE(law=ctrl.pool.window-visibility; tree=rio-controller/src/reconcilers/pool/jobs.rs:apply_placeable_gate): the model certifies the demand-visibility law at the want/orphan plane (held in-flight placements never read as demand-gone) -- NOT the witnessed-page API (PageNarrowing threading/degradation is the rust battery's W11-AK belt) nor the queued-count arithmetic -- retarget-by: modeling the excess-pending bound consumer or any change to the page-narrowing law.
+  const ENABLE_HELD_MACHINERY: bool
+  const ENABLE_HELD_VISIBILITY: bool
 
   pure val INTENTS: Set[IntentId] = Set("i1", "i2")
 
@@ -484,6 +507,18 @@ module spawnCoherence {
   val ackCoversPending = not(violations.contains(VAckMissedPending))
   val degradedPolarity = not(violations.contains(VDegraded))
   val gateFailClosed = not(violations.contains(VGate))
+  /// Round-11 (merged_bug_047, ctrl.pool.window-visibility): a
+  /// placed-in-flight intent holding a live Job is never orphan-
+  /// reaped while currently queued — demand-visibility is the default
+  /// for Job-backed intents; the gate fold threads, never strips.
+  /// Falsified as-built (spawnCoherenceHeldAsBuilt: the strip + the
+  /// surviving Complete witness = the laundered-absence trace); holds
+  /// with ENABLE_HELD_VISIBILITY.
+  val heldPlacementDemandVisible = not(violations.contains(VHeldPlacementReaped))
+  /// Non-vacuity for the held plane (expected-violation check in the
+  /// hold regime): the fixed law actually kept a held in-flight
+  /// placement demand-visible.
+  val canReachHeldKept = not(effects.contains(EHeldKept))
   /// A3/282: no spawn intent inside the transient-retry backoff
   /// window — the spawn edge's conjunct holds (trivially when the
   /// axis is off; the controller-282 calibration drops the conjunct
@@ -593,7 +628,8 @@ module spawnCoherence {
   /// Placeable-gate retain (jobs.rs gate match + PlaceableGate::retain):
   /// returns (gate_armed, post-gate intent set).
   pure def gateRetain(
-    crdPresent: bool, isBuilder: bool, g: GateState, polled: Set[IntentId]
+    crdPresent: bool, isBuilder: bool, g: GateState, polled: Set[IntentId],
+    heldNow: Set[IntentId]
   ): (bool, Set[IntentId]) =
     if (not(crdPresent))
       // CRD absent: gate_armed = false, intents pass through unfiltered.
@@ -605,7 +641,14 @@ module spawnCoherence {
     else
       match g {
         | GUnarmed => (false, Set())            // retain() cleared the vec
-        | GArmed(s) => (true, polled.intersect(s))
+        | GArmed(sf) =>
+          // Round-11 fixed law: the fold THREADS the held set -- a
+          // placed-in-flight intent with a live Job stays
+          // demand-visible; as-built: the strip (sf._2 dropped).
+          if (ENABLE_HELD_VISIBILITY)
+            (true, polled.intersect(sf._1.union(sf._2.intersect(heldNow))))
+          else
+            (true, polled.intersect(sf._1))
       }
 
   /// The oldest `n` of the pending candidates (oldest-first, id as the
@@ -655,10 +698,15 @@ module spawnCoherence {
     val schedErr = pollFails
 
     // ---- 2. Placeable-gate retain -----------------------------------
-    val gr = gateRetain(CRD_PRESENT, IS_BUILDER, gate, polled)
+    // Round-11: the held set the fold threads is the consumer's own
+    // Job view (a live Pending Job = the intent is held).
+    val heldNow = INTENTS.filter(i => isPending(job.get(i)))
+    val gr = gateRetain(CRD_PRESENT, IS_BUILDER, gate, polled, heldNow)
     val gateArmed = gr._1
     val postGate = gr._2
     val q = postGate.size()
+    // The in-flight-placed axis of the armed gate (empty off-machinery).
+    val gateInFlight = match gate { | GUnarmed => Set() | GArmed(sf) => sf._2 }
 
     // ---- 3. Job LIST + census (tick-start snapshot) ------------------
     val jobsAtList = job
@@ -672,6 +720,17 @@ module spawnCoherence {
         not(postGate.contains(i))
         and isPending(jobsAtList.get(i))
         and pastPendingGrace(jobsAtList.get(i)))
+    // Round-11 (merged_bug_047): a placed-in-flight intent that is
+    // CURRENTLY QUEUED (wanted demand) with a live Job, orphan-reaped
+    // because the fold stripped it -- the laundered-absence violation.
+    val vHeldReaped = ENABLE_HELD_MACHINERY and
+      orphanPendingReaps.filter(i =>
+        gateInFlight.contains(i) and polled.contains(i)).size() > 0
+    // Non-vacuity: the fixed law actually KEPT a held in-flight
+    // placement demand-visible this tick.
+    val heldKept = ENABLE_HELD_VISIBILITY and
+      postGate.filter(i =>
+        gateInFlight.contains(i) and heldNow.contains(i)).size() > 0
     val terminalReaps = if (wantEmpty) Set() else
       postGate.filter(i => jobsAtList.get(i).phase == JTerminal)
     val driftReaps = if (wantEmpty) Set() else
@@ -883,31 +942,35 @@ module spawnCoherence {
       CRD_PRESENT and IS_BUILDER and gate == GUnarmed
       and polled.filter(i => jobsAtList.get(i).phase == JAbsent).size() > 0
       and activeAtList < CEILING
+    // Width-not-depth (the rust evaluator's serde recursion limit
+    // bites on long .union chains — the nodeclaimLifecycle form):
+    // one flatten over the per-effect singletons.
     val effectsNow =
-      Set()
-        .union(if (spawnedSet.size() > 0) Set(ESpawned) else Set())
-        .union(if (collided.size() > 0) Set(EDedupe409) else Set())
-        .union(if (createFailed.size() > 0) Set(ECreateFailed) else Set())
-        .union(if (excessReaped.size() > 0) Set(EExcessReap) else Set())
-        .union(if (orphanReaped.size() > 0) Set(EOrphanReap) else Set())
-        .union(if (driftReaps.size() > 0) Set(EDriftReap) else Set())
-        .union(if (orphanPendingReaps.size() > 0) Set(EOrphanPendingReap) else Set())
-        .union(if (terminalReaps.size() > 0) Set(ETerminalReap) else Set())
-        .union(if (gateBlocked) Set(EGateBlockedSpawn) else Set())
-        .union(if (ackHappens) Set(EAcked) else Set())
-        .union(if (excessSuppressed) Set(EExcessSuppressed) else Set())
-        .union(if (matFiltered.size() > 0 and not(pollFails) and not(useStalePoll))
-          Set(EMatJobFiltered) else Set())
-        .union(if (poisoned.size() > 0) Set(EPoisoned) else Set())
-        .union(if (cancelSelected.size() > 0) Set(ECancelReap) else Set())
+      Set(
+        if (spawnedSet.size() > 0) Set(ESpawned) else Set(),
+        if (collided.size() > 0) Set(EDedupe409) else Set(),
+        if (createFailed.size() > 0) Set(ECreateFailed) else Set(),
+        if (excessReaped.size() > 0) Set(EExcessReap) else Set(),
+        if (orphanReaped.size() > 0) Set(EOrphanReap) else Set(),
+        if (driftReaps.size() > 0) Set(EDriftReap) else Set(),
+        if (orphanPendingReaps.size() > 0) Set(EOrphanPendingReap) else Set(),
+        if (terminalReaps.size() > 0) Set(ETerminalReap) else Set(),
+        if (gateBlocked) Set(EGateBlockedSpawn) else Set(),
+        if (ackHappens) Set(EAcked) else Set(),
+        if (excessSuppressed) Set(EExcessSuppressed) else Set(),
+        if (matFiltered.size() > 0 and not(pollFails) and not(useStalePoll))
+          Set(EMatJobFiltered) else Set(),
+        if (poisoned.size() > 0) Set(EPoisoned) else Set(),
+        if (heldKept) Set(EHeldKept) else Set(),
+        if (cancelSelected.size() > 0) Set(ECancelReap) else Set(),
         // bug_075: the fold-skip fail-open spawn edge (trace evidence
         // for the clobber twin) and the withhold arm's exercise (hold
         // non-vacuity) — both dead off-axis.
-        .union(if (ENABLE_SKIP_SPAWN_FAILOPEN and foldSkip and spawnedSet.size() > 0)
-          Set(ESkipFailopenSpawn) else Set())
-        .union(if (ENABLE_SKIP_SPAWN_FAILOPEN and SKIP_SPAWN_WITHHOLD and foldSkip
+        if (ENABLE_SKIP_SPAWN_FAILOPEN and foldSkip and spawnedSet.size() > 0)
+          Set(ESkipFailopenSpawn) else Set(),
+        if (ENABLE_SKIP_SPAWN_FAILOPEN and SKIP_SPAWN_WITHHOLD and foldSkip
             and wantedCandidates.filter(i => streak.get(i) > 0).size() > 0)
-          Set(ESkipWithheld) else Set())
+          Set(ESkipWithheld) else Set()).flatten()
 
     // ---- Violation checks ----------------------------------------------
     // I4: spawns never push active-minus-freed past the ceiling.
@@ -1004,7 +1067,7 @@ module spawnCoherence {
       // (c) armed: Builder spawns only inside the published set.
       or (builderGated and (match gate {
             | GUnarmed => false
-            | GArmed(s) => spawnedSet.filter(i => not(s.contains(i))).size() > 0
+            | GArmed(sf) => spawnedSet.filter(i => not(sf._1.contains(i))).size() > 0
           }))
       // (b)+(d) crd-absent (any kind): excess-reap stays fail-closed.
       or (not(CRD_PRESENT) and excessReaped.size() > 0)
@@ -1035,25 +1098,28 @@ module spawnCoherence {
     val vMatServed =
       not(pollFails) and not(useStalePoll)
       and polled.filter(i => matJob.get(i)).size() > 0
+    // Width-not-depth: one flatten over the per-violation singletons
+    // (the rust evaluator's serde recursion limit).
     val newViolations =
-      Set()
-        .union(if (vCeil) Set(VCeiling) else Set())
-        .union(if (vBusy) Set(VReapedBusy) else Set())
-        .union(if (vOrphan) Set(VOrphanMissed) else Set())
-        .union(if (vAckNoJob) Set(VAckedWithoutJob) else Set())
-        .union(if (vAckMissed) Set(VAckMissedPending) else Set())
-        .union(if (vDegr) Set(VDegraded) else Set())
-        .union(if (vGateV) Set(VGate) else Set())
-        .union(if (vFreed) Set(VFreedSlotUnused) else Set())
-        .union(if (vMatServed) Set(VMatJobServed) else Set())
-        .union(if (vPoisonT) Set(VPoisonTransient) else Set())
-        .union(if (vCancelNonC) Set(VCancelNonCancelled) else Set())
-        .union(if (vCancelPostClose) Set(VCancelPostCloseJob) else Set())
-        .union(if (vPoisonForeign) Set(VPoisonForeignCount) else Set())
-        .union(if (vWindowWipe) Set(VForeignStreakWipe) else Set())
-        .union(if (vPoisonBurst) Set(VPoisonBurst) else Set())
-        .union(if (vYoungReap) Set(VYoungLeaderReap) else Set())
-        .union(if (vSpawnClobber) Set(VSpawnClobberedStreak) else Set())
+      Set(
+        if (vCeil) Set(VCeiling) else Set(),
+        if (vBusy) Set(VReapedBusy) else Set(),
+        if (vOrphan) Set(VOrphanMissed) else Set(),
+        if (vAckNoJob) Set(VAckedWithoutJob) else Set(),
+        if (vAckMissed) Set(VAckMissedPending) else Set(),
+        if (vDegr) Set(VDegraded) else Set(),
+        if (vGateV) Set(VGate) else Set(),
+        if (vFreed) Set(VFreedSlotUnused) else Set(),
+        if (vMatServed) Set(VMatJobServed) else Set(),
+        if (vPoisonT) Set(VPoisonTransient) else Set(),
+        if (vCancelNonC) Set(VCancelNonCancelled) else Set(),
+        if (vCancelPostClose) Set(VCancelPostCloseJob) else Set(),
+        if (vPoisonForeign) Set(VPoisonForeignCount) else Set(),
+        if (vWindowWipe) Set(VForeignStreakWipe) else Set(),
+        if (vPoisonBurst) Set(VPoisonBurst) else Set(),
+        if (vYoungReap) Set(VYoungLeaderReap) else Set(),
+        if (vSpawnClobber) Set(VSpawnClobberedStreak) else Set(),
+        if (vHeldReaped) Set(VHeldPlacementReaped) else Set()).flatten()
 
     all {
       job' = jobsAfter,
@@ -1360,7 +1426,10 @@ module spawnCoherence {
   action gatePublishes = all {
     CRD_PRESENT,
     nondet s = INTENTS.powerset().oneOf()
-    gate' = GArmed(s),
+    nondet f = (if (ENABLE_HELD_MACHINERY) INTENTS.powerset() else Set(Set())).oneOf()
+    // The two dispositions are disjoint: in-flight ids are exactly
+    // the retained-out placements (PlacedTick's sets are disjoint).
+    gate' = GArmed((s, f.exclude(s))),
     queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
     leaderOld' = leaderOld,
     obsLive' = obsLive,
@@ -1806,7 +1875,9 @@ module spawnCoherenceBase {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -1838,7 +1909,9 @@ module spawnCoherenceFaultRpc {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -1871,7 +1944,9 @@ module spawnCoherenceFaultLease {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -1904,7 +1979,9 @@ module spawnCoherenceFaultStale {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -1937,7 +2014,9 @@ module spawnCoherenceCrdAbsent {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -1969,7 +2048,9 @@ module spawnCoherenceFetcher {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -2005,7 +2086,9 @@ module spawnCoherenceMatJobs {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -2042,7 +2125,9 @@ module spawnCoherenceRenderedDeadline {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -2075,7 +2160,9 @@ module spawnCoherenceExhaustAsBuilt {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -2109,7 +2196,9 @@ module spawnCoherenceExhaustPersist {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -2142,7 +2231,9 @@ module spawnCoherenceCancelAsBuilt {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -2175,7 +2266,9 @@ module spawnCoherenceCancelCause {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -2212,7 +2305,9 @@ module spawnCoherenceReapYoungLeader {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -2246,7 +2341,9 @@ module spawnCoherenceSynthCloseAsBuilt {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -2280,7 +2377,9 @@ module spawnCoherenceSynthClosePinned {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -2313,7 +2412,9 @@ module spawnCoherenceRetryBackoff {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -2349,7 +2450,9 @@ module spawnCoherenceMultiPoolAsBuilt {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -2383,7 +2486,9 @@ module spawnCoherenceMultiPool {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -2419,7 +2524,9 @@ module spawnCoherenceCancelGenAsBuilt {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -2452,7 +2559,9 @@ module spawnCoherenceCancelGeneration {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -2497,7 +2606,9 @@ module spawnCoherenceStreakCadence {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).*
 }
 
@@ -2541,6 +2652,86 @@ module spawnCoherenceFailopenWithhold {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = true,
-    SKIP_SPAWN_WITHHOLD = true
+    SKIP_SPAWN_WITHHOLD = true,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
+  ).*
+}
+
+
+/// Round-11 as-built twin (merged_bug_047, WO-S4-4): the held
+/// machinery under the AS-BUILT gate fold — placed-in-flight intents
+/// are stripped from the page while the transport Complete witness
+/// survives the mutation, so a held intent's still-wanted Pending Job
+/// reads AbsentFromDemand and the orphan arm foreground-deletes it at
+/// the grace (heldPlacementDemandVisible expected violated — the
+/// laundered-absence trace, P7 falsifier twin).
+module spawnCoherenceHeldAsBuilt {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 2,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = true,
+    ENABLE_HELD_VISIBILITY = false
+  ).*
+}
+
+/// Round-11 hold regime (ctrl.pool.window-visibility): the held
+/// machinery under the FIXED law — the gate fold threads the held
+/// set, so a placed-in-flight intent with a live Job stays
+/// demand-visible (no orphan delete, queued counted) while the spawn
+/// lane still excludes it. heldPlacementDemandVisible HOLDS;
+/// canReachHeldKept is the non-vacuity witness.
+module spawnCoherenceHeld {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 2,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = true,
+    ENABLE_HELD_VISIBILITY = true
   ).*
 }

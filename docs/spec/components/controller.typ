@@ -344,6 +344,34 @@ the page despite restart-totality/continuity contracts (merged_bug_049).
 The completeness witness already rode the wire (`truncated`); this rule
 makes consuming it structural rather than per-consumer diligence.
 
+#r("ctrl.pool.window-visibility")[
+  Demand-visibility is the DEFAULT for any intent with a live Job:
+  the FFD tick's `job_held` set MUST travel inside the published
+  placeable tick, and the gate fold MUST keep a held intent
+  demand-visible (want-map membership, queued count) whatever its
+  placement disposition --- a held `PlacedInFlight` or unplaceable
+  intent is filtered from the SPAWN lane only, never from demand.
+  Structurally, a narrowing of a witnessed page MUST state its
+  disposition: it either THREADS the held set (held intents survive
+  the narrowing by page-type construction, regardless of the per-arm
+  predicate) or declares itself LOSSY, which degrades the coverage
+  letter to Incomplete inside the absence lane's sole constructor ---
+  a completeness witness binds to the view it was minted from, and a
+  policy mutation after the mint must never type-check into
+  true-negative absence evidence.
+]
+The premise this law replaces --- "an in-flight placement normally
+has no Job" --- was falsified by the same wave-10 commit that stated
+it: the admission window's `job_held` exemption admits held intents
+to the fit-check, which can re-place them onto unregistered claims
+(merged_bug_047). Pre-law, the gate fold stripped exactly those
+placements while the transport `Complete` witness survived the page
+mutation, so the still-wanted Pending Job read `AbsentFromDemand` and
+was foreground-deleted single-tick at the 10s grace, inside the
+50-90s claim-registration window --- delete/respawn churn during
+capacity events, plus a queued undercount feeding the excess-pending
+arithmetic.
+
 #r("ctrl.pool.container-overhead+2")[
   The container memory limit binds the WHOLE container --- the worker
   daemon, FUSE client, and log capture are resident beside the build,

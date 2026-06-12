@@ -50,7 +50,9 @@ module ggCalibTerminatingPending {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).* from "../spawnCoherence"
 
   /// PRE-FIX pending predicate: no deletionTimestamp filter.
@@ -74,7 +76,7 @@ module ggCalibTerminatingPending {
                  else currentQueue
     val schedErr = pollFails
 
-    val gr = gateRetain(CRD_PRESENT, IS_BUILDER, gate, polled)
+    val gr = gateRetain(CRD_PRESENT, IS_BUILDER, gate, polled, Set())
     val gateArmed = gr._1
     val postGate = gr._2
     val q = postGate.size()
@@ -204,7 +206,7 @@ module ggCalibTerminatingPending {
         and (spawnedSet.size() > 0 or excessReaped.size() > 0))
       or (builderGated and (match gate {
             | GUnarmed => false
-            | GArmed(s) => spawnedSet.filter(i => not(s.contains(i))).size() > 0
+            | GArmed(sf) => spawnedSet.filter(i => not(sf._1.contains(i))).size() > 0
           }))
       or (not(CRD_PRESENT) and excessReaped.size() > 0)
       or (not(CRD_PRESENT) and postGate != polled)

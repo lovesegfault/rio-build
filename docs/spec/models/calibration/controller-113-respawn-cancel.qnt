@@ -60,7 +60,9 @@ module controllerCalib113RespawnCancel {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).* from "../spawnCoherence"
 
   /// The post-cancel mid-trace state (every var assigned; deltas from
@@ -71,7 +73,7 @@ module controllerCalib113RespawnCancel {
     job' = INTENTS.mapBy(i => { phase: JAbsent, age: AgeFresh, fp: FpA, podRunning: false }),
     execr' = INTENTS.mapBy(i => ExecAbsent),
     leaderOld' = true,
-    gate' = GArmed(Set("i1")),                        // republished
+    gate' = GArmed((Set("i1"), Set())),                        // republished
     dispatched' = Set(),
     prevQueuedSnap' = Set(),
     effects' = Set(),
@@ -125,7 +127,9 @@ module controllerCalib113RespawnCancelHold {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).* from "../spawnCoherence"
 
   action calibInit = all {
@@ -134,7 +138,7 @@ module controllerCalib113RespawnCancelHold {
     job' = INTENTS.mapBy(i => { phase: JAbsent, age: AgeFresh, fp: FpA, podRunning: false }),
     execr' = INTENTS.mapBy(i => ExecAbsent),
     leaderOld' = true,
-    gate' = GArmed(Set("i1")),
+    gate' = GArmed((Set("i1"), Set())),
     dispatched' = Set(),
     prevQueuedSnap' = Set(),
     effects' = Set(),

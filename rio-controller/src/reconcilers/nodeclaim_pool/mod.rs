@@ -189,6 +189,14 @@ pub struct PlacedTick {
     /// re-seen next tick; DEMAND-VISIBLE so the orphan/excess reaps
     /// and the consolidator do not read the deferral as demand-gone.
     deferred: HashSet<String>,
+    /// Intent ids holding a live Job (Pending pod) at sim time — the
+    /// SAME set the FFD admission window exempts (merged_bug_047):
+    /// the exemption is exactly what lets a held intent reach the
+    /// fit-check and land `PlacedInFlight` on an unregistered claim,
+    /// so the gate fold consumes THIS set to keep those placements
+    /// demand-visible (a held Job's intent must never be read as
+    /// demand-gone by a policy fold — `ctrl.pool.window-visibility`).
+    job_held: HashSet<String>,
 }
 
 /// One intent's disposition from [`PlacedTick::disposition`] — the
@@ -211,7 +219,11 @@ pub enum FfdDisposition {
 impl PlacedTick {
     /// Build from one sim outcome (the publisher side; pub(crate)
     /// for the channel-shape test in pool/jobs.rs).
-    pub(crate) fn from_sim(placeable: &[ffd::Placement], deferred: &[SpawnIntent]) -> Self {
+    pub(crate) fn from_sim(
+        placeable: &[ffd::Placement],
+        deferred: &[SpawnIntent],
+        job_held: &HashSet<String>,
+    ) -> Self {
         let mut tick = Self::default();
         for (i, _, in_flight) in placeable {
             if *in_flight {
@@ -222,7 +234,24 @@ impl PlacedTick {
         }
         tick.deferred
             .extend(deferred.iter().map(|i| i.intent_id.clone()));
+        tick.job_held = job_held.clone();
         tick
+    }
+
+    // r[impl ctrl.pool.window-visibility]
+    /// Whether `intent_id` held a live Job at sim time — the
+    /// demand-visibility axis the gate fold threads
+    /// (merged_bug_047). Orthogonal to [`Self::disposition`]: held ×
+    /// placed-in-flight is the product the window exemption created.
+    pub fn held(&self, intent_id: &str) -> bool {
+        self.job_held.contains(intent_id)
+    }
+
+    /// The held set, for the page-level threading (the structural
+    /// belt: a witnessed-page narrowing that THREADS demand keeps
+    /// every held intent regardless of the per-arm predicate).
+    pub fn job_held(&self) -> &HashSet<String> {
+        &self.job_held
     }
 
     /// The per-intent letter (total — every id answers).
@@ -238,17 +267,23 @@ impl PlacedTick {
         }
     }
 
-    /// Test-only tick constructor (gate-fold unit tests).
+    /// Test-only tick constructor (gate-fold unit tests). Carries the
+    /// FULL disposition product — merged_bug_047's test gap was this
+    /// constructor hardcoding `in_flight = empty`, so no gate-fold
+    /// test could ever exercise the `PlacedInFlight` arm.
     #[cfg(test)]
-    pub fn for_test<R, D>(on_registered: R, deferred: D) -> Self
+    pub fn for_test<R, I, D, H>(on_registered: R, in_flight: I, deferred: D, job_held: H) -> Self
     where
         R: IntoIterator<Item = &'static str>,
+        I: IntoIterator<Item = &'static str>,
         D: IntoIterator<Item = &'static str>,
+        H: IntoIterator<Item = &'static str>,
     {
         Self {
             on_registered: on_registered.into_iter().map(str::to_owned).collect(),
-            in_flight: HashSet::new(),
+            in_flight: in_flight.into_iter().map(str::to_owned).collect(),
             deferred: deferred.into_iter().map(str::to_owned).collect(),
+            job_held: job_held.into_iter().map(str::to_owned).collect(),
         }
     }
 }
@@ -311,7 +346,7 @@ impl PlaceableGate {
     /// nothing deferred).
     #[cfg(test)]
     pub fn from_ids<I: IntoIterator<Item = &'static str>>(ids: I) -> Self {
-        Self::from_tick(PlacedTick::for_test(ids, []))
+        Self::from_tick(PlacedTick::for_test(ids, [], [], []))
     }
 
     /// Test-only: gate seeded with a full disposition tick (armed).
@@ -1655,7 +1690,11 @@ impl NodeClaimPoolReconciler {
         // are the law's carrier). `send_replace`: dropped receivers
         // (controller shutdown) are not an error.
         self.placeable_tx
-            .send_replace(Some(Arc::new(PlacedTick::from_sim(&placeable, &deferred))));
+            .send_replace(Some(Arc::new(PlacedTick::from_sim(
+                &placeable,
+                &deferred,
+                pod_snapshot.job_held_intents(),
+            ))));
 
         // OA2: controller-side per-node wedge clustering — the only
         // hung-node signal (the scheduler's heartbeat-fed detector and

@@ -61,6 +61,8 @@ module controller075FailopenSpawnClobber {
     STREAK_FLOOR = 2,
     WINDOW_COUPLED_FOLD = false,
     ENABLE_SKIP_SPAWN_FAILOPEN = true,
-    SKIP_SPAWN_WITHHOLD = false
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false
   ).* from "../spawnCoherence"
 }
