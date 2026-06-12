@@ -177,13 +177,14 @@ const _: () = assert!(
 /// itself.
 pub const HEARTBEAT_RPC_BOUND: Duration = Duration::from_secs(10);
 
-// The liveness cadence's construction-grade bound (bug_148): the
-// dedicated heartbeat task is the ONLY task on the cadence path, and
-// its single await is bounded strictly inside the staleness margin —
-// one hung-then-abandoned call delays the next beat attempt by at most
-// HEARTBEAT_RPC_BOUND, so the inter-beat gap stays within
-// HEARTBEAT_INTERVAL + HEARTBEAT_RPC_BOUND <= SESSION_STALE_AFTER: a
-// single hang costs at most the one-missed-beat budget the lease math
+// The liveness cadence's construction-grade bound (bug_148; priced
+// from the ONE tick-body quantity per merged_bug_019): the dedicated
+// heartbeat task is the ONLY task on the cadence path, and its tick
+// body is bounded by TICK_BODY_BOUND — a fully-failed tick (hung, or
+// fast-error-then-bounded-retry) delays the next beat attempt by at
+// most that envelope, so the inter-beat gap stays within
+// HEARTBEAT_INTERVAL + TICK_BODY_BOUND <= SESSION_STALE_AFTER: one
+// bad tick costs at most the one-missed-beat budget the lease math
 // above already prices. The pre-fix shape kept the heartbeat as one
 // select arm of the AppendLog driver, whose sibling arms awaited chunk
 // cuts inline for up to one cut interval (60 s) plus an ack send (60 s
@@ -193,9 +194,9 @@ pub const HEARTBEAT_RPC_BOUND: Duration = Duration::from_secs(10);
 // service.rs) pins that no `sessions::heartbeat` call re-enters the
 // driver loop.
 const _: () = assert!(
-    HEARTBEAT_RPC_BOUND.as_secs() <= SESSION_STALE_AFTER.as_secs() - HEARTBEAT_INTERVAL.as_secs(),
-    "the heartbeat task's RPC bound must fit the staleness margin: \
-     HEARTBEAT_RPC_BOUND <= SESSION_STALE_AFTER - HEARTBEAT_INTERVAL"
+    TICK_BODY_BOUND.as_secs() <= SESSION_STALE_AFTER.as_secs() - HEARTBEAT_INTERVAL.as_secs(),
+    "the heartbeat tick-body envelope must fit the staleness margin: \
+     TICK_BODY_BOUND <= SESSION_STALE_AFTER - HEARTBEAT_INTERVAL"
 );
 
 /// A live ingest session, as seen by a `TailLog` reader deciding where
@@ -427,23 +428,32 @@ impl HeartbeatHandle {
         self.lost.clone()
     }
 
-    /// Stop the beat task and join it, bounded by one RPC bound (its
-    /// longest possible in-flight await); abort as the backstop. The
-    /// JOIN-OBLIGATION rule: the handle's owner MUST call this on
-    /// every teardown path — a discarded handle is a beat task renewing
-    /// a released lease until its next tick observes Lost.
+    /// Stop the beat task and join it, bounded by [`TICK_BODY_BOUND`]
+    /// (the ONE tick-body quantity, merged_bug_019: the longest the
+    /// task can lawfully be in flight is its tick-body envelope —
+    /// the join bound, the margin certificate, and the narration all
+    /// import it, never re-derive it); abort as the backstop. The
+    /// in-body stop select makes teardown prompt by construction
+    /// (every attempt races the stop token, so a conformant task
+    /// returns within a poll of the cancel, and the abort arm is
+    /// genuinely unreachable for it — the bound is the certificate's
+    /// envelope, not the expected wait). The JOIN-OBLIGATION rule:
+    /// the handle's owner MUST call this on every teardown path — a
+    /// discarded handle is a beat task renewing a released lease
+    /// until its next tick observes Lost.
     pub async fn stop(self) {
         self.stop.cancel();
         let mut task = self.task;
-        if tokio::time::timeout(HEARTBEAT_RPC_BOUND, &mut task)
+        if tokio::time::timeout(TICK_BODY_BOUND, &mut task)
             .await
             .is_err()
         {
-            // The task is parked past its own bound (only possible via
-            // a pathological scheduler stall — every await it holds is
-            // itself bounded). Abort it; the lease release that
-            // follows is session-id-predicated, so a straggler beat
-            // against a released row is a harmless zero-row UPDATE.
+            // The task is parked past the tick-body envelope (only
+            // possible via a pathological scheduler stall — every
+            // await it holds is itself bounded AND races the stop
+            // token). Abort it; the lease release that follows is
+            // session-id-predicated, so a straggler beat against a
+            // released row is a harmless zero-row UPDATE.
             task.abort();
             warn!("session heartbeat task did not stop within its bound; aborted");
         }
@@ -497,12 +507,23 @@ pub(crate) fn spawn_heartbeat_with(
                     // and the loop cannot drift.
                     let tick_started = tokio::time::Instant::now();
                     for attempt in 0..HEARTBEAT_ATTEMPTS {
-                        match tokio::time::timeout(
-                            HEARTBEAT_RPC_BOUND,
-                            heartbeat(&pool, exec_id, session_id),
-                        )
-                        .await
-                        {
+                        // Every attempt RACES the stop token
+                        // (merged_bug_019's second arm): teardown
+                        // during a hung or in-flight beat returns
+                        // promptly instead of spending the attempt's
+                        // bound — dropping the in-flight UPDATE is
+                        // safe (the release that follows is
+                        // session-id-predicated; a landed straggler
+                        // is a refreshed stamp on a row about to be
+                        // released).
+                        let outcome = tokio::select! {
+                            _ = stop_task.cancelled() => return,
+                            outcome = tokio::time::timeout(
+                                HEARTBEAT_RPC_BOUND,
+                                heartbeat(&pool, exec_id, session_id),
+                            ) => outcome,
+                        };
+                        match outcome {
                             Ok(Ok(HeartbeatOutcome::Renewed)) => break,
                             Ok(Ok(HeartbeatOutcome::Lost)) => {
                                 // Latch and exit: the lease belongs to a
@@ -962,6 +983,69 @@ mod tests {
              a healthy one-miss session dead / right: the schedule keeps \
              every healthy one-miss age strictly under the bound, so this \
              age now implies a genuinely dead session"
+        );
+    }
+
+    /// W12-G (merged_bug_019, red-first at the const tier — the
+    /// behavioral fixture is the green half): pre-fix, `stop()` joined
+    /// bounded by ONE `HEARTBEAT_RPC_BOUND` while the wave-11 retry
+    /// let the in-flight stretch reach 2× that bound — teardown
+    /// spuriously aborted a correctly-behaving task mid-UPDATE with
+    /// the misleading "pathological scheduler stall" warn (the
+    /// schedule-change fan-out: the join bound, its "longest possible
+    /// in-flight await" prose, and the inter-beat narration all
+    /// priced the one-attempt loop the same commit replaced). The
+    /// recorded red, at the constants: the old join bound
+    /// (HEARTBEAT_RPC_BOUND = 10 s) is STRICTLY BELOW the lawful
+    /// in-flight stretch (TICK_BODY_BOUND = 12 s) — asserted here as
+    /// the strawman so the relation can never silently invert again.
+    /// Post-fix: the join imports THE one tick-body const, and the
+    /// in-body stop select makes teardown prompt by construction —
+    /// `stop()` during a PG-parked (hung) beat returns within a poll
+    /// of the cancel, never waiting out the attempt bound and never
+    /// reaching the abort arm.
+    #[tokio::test]
+    async fn stop_is_prompt_during_a_hung_attempt() {
+        // The const-tier red (the strawman relation): the pre-fix
+        // join bound cannot cover the lawful in-flight stretch.
+        assert!(
+            HEARTBEAT_RPC_BOUND < TICK_BODY_BOUND,
+            "strawman: the old per-attempt join bound is below the tick-body \
+             envelope — the pre-fix stop() aborted lawful in-flight work"
+        );
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let exec = Uuid::now_v7();
+        let session = Uuid::now_v7();
+        seed_session(&db.pool, exec, session, "this-pod", 0.0).await;
+
+        // Park the beat: an ACCESS EXCLUSIVE lock makes the heartbeat
+        // UPDATE hang server-side (the hung-attempt face).
+        let lock_pool = db.reopen().await;
+        let mut tx = lock_pool.begin().await.expect("begin lock txn");
+        sqlx::query("LOCK TABLE log_ingest_sessions IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .expect("lock");
+
+        // Fast cadence so the first beat fires (and parks) quickly.
+        let handle =
+            spawn_heartbeat_with(db.pool.clone(), exec, session, Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(300)).await; // the beat is parked
+
+        let t0 = std::time::Instant::now();
+        handle.stop().await;
+        let elapsed = t0.elapsed();
+        drop(tx);
+        // Slack budget, documented (the wall-clock-gate discipline):
+        // the prompt path resolves in milliseconds; 5 s of scheduler
+        // slack still discriminates 2.4× against the 12 s envelope
+        // the abort arm would have to wait out.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "stop() during a hung beat must return promptly via the stop \
+             select (took {elapsed:?}; the abort arm would take at least \
+             TICK_BODY_BOUND = {TICK_BODY_BOUND:?})"
         );
     }
 
