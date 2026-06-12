@@ -833,7 +833,22 @@ impl UploadTask {
 
                 ack = acks.message() => match ack {
                     Ok(Some(ack)) => {
-                        let popped = self.trim(ack.durable_through_line);
+                        // The open-time coverage ack (bug_032, the
+                        // wire-1 letter): a watermark-PRESENT ack is
+                        // the typed letter — trim strictly below the
+                        // watermark. `Some(0)` means "the letter was
+                        // spoken, nothing is durable" and trims
+                        // NOTHING (the chunk-ack reading of its
+                        // durable_through_line = 0 would pop an
+                        // un-durable line-0 frame). Absent = a chunk
+                        // ack (or a legacy server that never speaks
+                        // the letter): trim through
+                        // durable_through_line as ever.
+                        let popped = match ack.open_coverage_next_line {
+                            Some(0) => 0,
+                            Some(watermark) => self.trim(watermark - 1),
+                            None => self.trim(ack.durable_through_line),
+                        };
                         sent = sent.saturating_sub(popped);
                         if let Some(input) = self.input_exhausted
                             && self.buffer.is_empty()
@@ -1329,6 +1344,24 @@ mod tests {
             .expect("ack send");
         }
 
+        /// The open-time coverage ack (bug_032): watermark-present,
+        /// `durable_through_line = watermark.saturating_sub(1)` — the
+        /// store's emission shape.
+        async fn open_ack(&self, watermark: u64) {
+            let tx = self
+                .ack_tx
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("acking a closed session");
+            tx.send(Ok(AppendLogAck {
+                durable_through_line: watermark.saturating_sub(1),
+                open_coverage_next_line: Some(watermark),
+            }))
+            .await
+            .expect("open ack send");
+        }
+
         /// End the response stream (the client sees `Ok(None)` on its ack
         /// stream — the server went away).
         fn close(&self) {
@@ -1664,6 +1697,60 @@ mod tests {
         })
         .await;
         assert_eq!(h.uploader.progress().borrow().last_acked_line, Some(99));
+    }
+
+    /// The open-time coverage ack consumed AS the typed letter
+    /// (bug_032, the wire-1 consumer seam): a watermark-present ack
+    /// trims strictly BELOW the watermark. The discriminating cell is
+    /// `Some(0)` — "the letter was spoken, nothing is durable" — which
+    /// must trim NOTHING: the chunk-ack interpretation reads its
+    /// `durable_through_line = 0` as "line 0 is durable" and pops a
+    /// line-0 frame that is NOT durable, destroying the only copy in
+    /// the retransmit buffer. The positive-watermark cell rides the
+    /// same arm (trim through watermark − 1).
+    #[tokio::test]
+    async fn open_coverage_ack_trims_typed_never_as_a_chunk_ack() {
+        let h = harness().await;
+        let tx = h.uploader.sender();
+        // One single-line frame: line 0, not durable anywhere.
+        tx.send(batch(0, 1)).await.unwrap();
+        wait_for("the mock to receive the frame", || {
+            h.mock.session_count() == 1 && h.mock.session(0).message_count() == 2
+        })
+        .await;
+        assert_eq!(h.uploader.progress().borrow().unacked_lines, 1);
+
+        // The empty-coverage open ack: watermark 0, nothing durable.
+        h.mock.session(0).open_ack(0).await;
+        // Send a second frame and wait for it — a synchronization
+        // barrier proving the ack arm ran before we assert.
+        tx.send(batch(1, 1)).await.unwrap();
+        wait_for("the second frame after the open ack", || {
+            h.mock.session(0).message_count() == 3
+        })
+        .await;
+        assert_eq!(
+            h.uploader.progress().borrow().unacked_lines,
+            2,
+            "left (pre-fix): the Some(0) open ack is consumed as a chunk ack \
+             for line 0 and pops the un-durable line-0 frame from the \
+             retransmit buffer / right: the typed letter trims strictly \
+             below the watermark — zero coverage trims nothing"
+        );
+        assert_eq!(
+            h.uploader.progress().borrow().last_acked_line,
+            None,
+            "an empty-coverage open ack proves no durability"
+        );
+
+        // The positive-watermark cell: coverage through line 1 trims
+        // both frames.
+        h.mock.session(0).open_ack(2).await;
+        wait_for("the open ack to trim both frames", || {
+            h.uploader.progress().borrow().unacked_lines == 0
+        })
+        .await;
+        assert_eq!(h.uploader.progress().borrow().last_acked_line, Some(1));
     }
 
     // ------------------------------------------------------------------
