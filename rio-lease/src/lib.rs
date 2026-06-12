@@ -1568,29 +1568,80 @@ enum ActFailedAction {
     AbsenceObserve,
 }
 
+/// Linear carrier for the routing law's verdict (merged_bug_056, R32):
+/// a computed verdict is EXECUTED or TYPED-REFUSED, never silently
+/// dropped. The pre-fix hazard was a consult site that computed the
+/// verdict through the total law and pattern-matched ONE variant —
+/// `(true, Absent)` computed `AbsenceLose` and executed only
+/// `EvidenceResolve`, re-opening the deleted-lease dual window the law
+/// was built to close. The carrier's claim, at its honest tiers:
+///
+/// - **compile face:** the action is reachable only through
+///   [`Self::execute`], whose call site is an exhaustive-match
+///   scrutinee by construction (the carrier has no `PartialEq` and no
+///   field access, so `route_act_failed_read(..) ==
+///   ActFailedAction::X` and partial destructuring do not compile);
+///   the source census plants the partial-consult shape red.
+/// - **runtime face:** silent discard (`let _ = ...;`, drop without
+///   discharge) panics through the Drop backstop below. `mem::forget`
+///   and execute-then-ignore remain representable — "unrepresentable"
+///   is deliberately not claimed; the census-pinned dispatch sites and
+///   the kernel's exhaustive fold are the standing guard for those.
+#[must_use = "a routing verdict must be executed or typed-refused \
+              (sys.obligation.linear-discharge)"]
+struct RoutingVerdict {
+    action: ActFailedAction,
+}
+
+impl RoutingVerdict {
+    /// The ONLY discharge: consume the carrier, surface the action for
+    /// an exhaustive match. Every production call site's `execute()`
+    /// feeds a total `match` (the census pins the site count and
+    /// shapes).
+    fn execute(self) -> ActFailedAction {
+        let action = self.action;
+        std::mem::forget(self);
+        action
+    }
+}
+
+impl Drop for RoutingVerdict {
+    fn drop(&mut self) {
+        // RC-3(iv): destructor-hosted enforcement carries the
+        // `thread::panicking()` gate FROM BIRTH (bug_168's mode — a
+        // guard that panics while unwinding is a SIGABRT in exactly
+        // the builds that arm it).
+        if !std::thread::panicking() {
+            panic!(
+                "RoutingVerdict dropped without discharge — every computed \
+                 routing verdict is executed or typed-refused \
+                 (sys.obligation.linear-discharge)"
+            );
+        }
+    }
+}
+
 // r[impl sched.lease.holder-evidenced-lose+3]
 /// Total routing law for a believing/standby act-failed COMPLETED
 /// read (bug_002): every cell of the `believes x Holder x Content x
 /// Ledger` product names its action — no wildcard arms, so rustc
 /// exhaustiveness IS the census generator (a new cell variant fails
 /// compilation here before any review can miss it). Pure so the kani
-/// routing proof and the product census test fold it directly.
-///
-/// The absence partition (bug_143): `Absent` cells route to exactly
-/// {`AbsenceLose`, `AbsenceObserve`} and present cells never do — the
-/// kani partition proof and the census pin both directions, which is
-/// what discharges the executor's facts-presence expects.
+/// routing proof and the product census test fold it directly. The
+/// verdict ships in the linear [`RoutingVerdict`] carrier
+/// (merged_bug_056): consult sites discharge through `execute()` into
+/// an exhaustive match, never a single-variant comparison.
 fn route_act_failed_read(
     believes: bool,
     holder: HolderCell,
     content: ContentCell,
     ledger: LedgerCell,
-) -> ActFailedAction {
+) -> RoutingVerdict {
     use ActFailedAction as A;
     use ContentCell as C;
     use HolderCell as H;
     use LedgerCell as L;
-    match (believes, holder, content, ledger) {
+    let action = match (believes, holder, content, ledger) {
         // Own-commit evidence (both belief states; the executor's
         // !believes branch is the fence-gated self-heal re-acquire).
         (true, H::Us, C::Moved, L::Armed) | (false, H::Us, C::Moved, L::Armed) => {
@@ -1632,7 +1683,8 @@ fn route_act_failed_read(
         | (false, H::Absent, C::Moved, L::Empty)
         | (false, H::Absent, C::Frozen, L::Armed)
         | (false, H::Absent, C::Frozen, L::Empty) => A::AbsenceObserve,
-    }
+    };
+    RoutingVerdict { action }
 }
 
 /// The act half of a Completed round as a derivation cell — the
@@ -1740,11 +1792,47 @@ enum RoundEdge {
     /// The believing lose edge, with its typed evidence
     /// (`sched.lease.holder-evidenced-lose`).
     Lose(CompletedLoseEvidence),
+    /// A believing conflict round whose completed GET observed the
+    /// lease ABSENT (merged_bug_056 — the create path's lost re-create
+    /// race): the routing law's `AbsenceLose` verdict EXECUTES on this
+    /// arm exactly as on the act-failed arm — the lease resolves to
+    /// nobody, a peer re-create needs no steal wait, belief exits AT
+    /// the read (bug_143's regime; the fence/steal margin does not
+    /// shield it).
+    LoseObservedAbsent,
     /// A believing renew 409 deferring one round (the Q3 deferral).
     Defer,
     /// Standby steady state (or a 409 racing a steal — never led):
     /// the round resolved not-leading.
     StandbyObserved,
+}
+
+/// Typed refusal of a conflict-round read verdict (merged_bug_056,
+/// R32's "executed or typed-refused" arm): the 409 proves the rv moved
+/// AFTER this round's GET, so only MONOTONE readings survive to
+/// execution — own-commit movement (the movement already happened;
+/// staleness cannot un-happen it), a foreign holder named by the read,
+/// and observed absence. The non-monotone readings are REFUSED here,
+/// each for a stated reason; a refusal is a first-class derivation
+/// output, not a dropped verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleReadRefusal {
+    /// `FunnelResolve` (believing, holder=us, nothing to consume): a
+    /// frozen-us reading does NOT resolve a pending 409 deferral on
+    /// the conflict arm — the bounced PUT proves a mover acted after
+    /// the GET, and funnel-resolving here would make `Exhausted`
+    /// unreachable under every-round CAS bounces, unbounding the
+    /// signed one-round deferral (the two-409 bound is the
+    /// fence/steal-separation price).
+    Funnel,
+    /// `ObserveOnly` (standby, present read): a bare baseline
+    /// observation; the re-baseline records it — no standing
+    /// transition was owed, and none is run on a provably-stale view.
+    Observe,
+    /// `AbsenceObserve` (standby, absent read): same — the baseline
+    /// records the absence; the standing transition alphabet owes
+    /// nothing.
+    AbsenceObserve,
 }
 
 /// What the executor records as the next content baseline.
@@ -1800,6 +1888,11 @@ struct RoundTransition {
     /// Confirm the leading round (`sched.recovery.bump-confirm`) —
     /// exactly the `Leading` results.
     confirm: bool,
+    /// A conflict-round read verdict refused as stale-at-adjudication
+    /// (merged_bug_056) — carried so the refusal is observable (the
+    /// executor traces it) and so "computed but neither executed nor
+    /// refused" is not a representable derivation outcome.
+    read_refusal: Option<StaleReadRefusal>,
 }
 
 // r[impl sched.lease.holder-evidenced-lose+3]
@@ -1848,18 +1941,57 @@ struct RoundTransition {
 fn complete_round(facts: ReadFacts, outcome: ActCell, standing: StandingCells) -> RoundTransition {
     let is_conflict = matches!(outcome, ActCell::Conflict);
 
-    // 1. The same-round evidence consult (merged_bug_051: consumption
-    //    is atomic with the re-baseline; the (Us, Moved, Armed) cell
-    //    would otherwise be destroyed by the unconditional re-baseline).
-    let consume = (is_conflict
-        && route_act_failed_read(standing.believes, facts.holder, facts.content, facts.ledger)
-            == ActFailedAction::EvidenceResolve)
-        .then(|| ConsumeMode::derive(facts.evidence_past_fence, standing.believes));
+    // 1. The same-round read consult (merged_bug_051: consumption is
+    //    atomic with the re-baseline; the (Us, Moved, Armed) cell
+    //    would otherwise be destroyed by the unconditional
+    //    re-baseline). The verdict is LINEAR (merged_bug_056): every
+    //    variant of the alphabet is executed or typed-refused — the
+    //    pre-fix single-variant gate computed AbsenceLose for the
+    //    deleted-lease create race and silently dropped it, deferring
+    //    a round it had evidence to lose.
+    let mut consume = None;
+    let mut read_lose_absent = false;
+    let mut read_lose_other = false;
+    let mut read_refusal = None;
+    if is_conflict {
+        match route_act_failed_read(standing.believes, facts.holder, facts.content, facts.ledger)
+            .execute()
+        {
+            // Monotone: the movement already happened — the post-GET
+            // rv mover cannot un-commit our zombie write.
+            ActFailedAction::EvidenceResolve => {
+                consume = Some(ConsumeMode::derive(
+                    facts.evidence_past_fence,
+                    standing.believes,
+                ));
+            }
+            // Monotone: the read NAMED another holder — the lease
+            // provably resolved away from us at the read point.
+            ActFailedAction::EvidencedLose => read_lose_other = true,
+            // Monotone: the read observed the lease ABSENT — deleted
+            // out from under us; a re-creator needs no steal wait.
+            ActFailedAction::AbsenceLose => read_lose_absent = true,
+            // Non-monotone: refused stale-at-adjudication, each for
+            // its stated reason (see StaleReadRefusal).
+            ActFailedAction::FunnelResolve => {
+                read_refusal = Some(StaleReadRefusal::Funnel);
+            }
+            ActFailedAction::ObserveOnly => {
+                read_refusal = Some(StaleReadRefusal::Observe);
+            }
+            ActFailedAction::AbsenceObserve => {
+                read_refusal = Some(StaleReadRefusal::AbsenceObserve);
+            }
+        }
+    }
 
     // Post-consumption standing cells (pinned to the production
-    // algebra by the kani agreement proof — see the fn doc).
+    // algebra by the kani agreement proof — see the fn doc). A
+    // read-lose ends belief through its own transition; the
+    // adjudication gate below then sees a non-believer and the 409
+    // adjudicates nothing (a lose answers the round).
     let funnel_runs = matches!(consume, Some(ConsumeMode::Restore | ConsumeMode::Funnel));
-    let believes = standing.believes || funnel_runs;
+    let believes = (standing.believes || funnel_runs) && !(read_lose_absent || read_lose_other);
     let deferred = standing.deferred && !funnel_runs;
 
     // 2.+3. Adjudication (production body, derivation-local standing)
@@ -1869,27 +2001,40 @@ fn complete_round(facts: ReadFacts, outcome: ActCell, standing: StandingCells) -
         held_unsuperseded: false,
         conflict_deferred: deferred,
     };
-    let (adjudication, edge) = match (outcome, believes) {
-        (ActCell::Leading, false) => (None, RoundEdge::Acquire),
-        (ActCell::Leading, true) => (None, RoundEdge::StillLeading),
-        (ActCell::Standby, true) => (
+    let (adjudication, edge) = if read_lose_other {
+        // The read's own lose executes — the same evidenced lose a
+        // Completed Standby resolution runs (one evidence type, both
+        // arms; sched.lease.holder-evidenced-lose's "on whichever arm
+        // observes it").
+        (
             None,
-            // Standby resolution: the read named a fresh foreign
-            // holder (or an empty/stale one we chose not to steal) —
-            // direct holder evidence either way: the lease provably
-            // no longer resolves to us.
             RoundEdge::Lose(CompletedLoseEvidence::AnotherHolderObserved),
-        ),
-        (ActCell::Standby | ActCell::Conflict, false) => (None, RoundEdge::StandbyObserved),
-        (ActCell::Conflict, true) => {
-            let verdict = adjudicated.on_believing_conflict();
-            let edge = match verdict {
-                ConflictResolution::Exhausted => {
-                    RoundEdge::Lose(CompletedLoseEvidence::ConflictDeferralExhausted)
-                }
-                ConflictResolution::Deferred => RoundEdge::Defer,
-            };
-            (Some(verdict), edge)
+        )
+    } else if read_lose_absent {
+        (None, RoundEdge::LoseObservedAbsent)
+    } else {
+        match (outcome, believes) {
+            (ActCell::Leading, false) => (None, RoundEdge::Acquire),
+            (ActCell::Leading, true) => (None, RoundEdge::StillLeading),
+            (ActCell::Standby, true) => (
+                None,
+                // Standby resolution: the read named a fresh foreign
+                // holder (or an empty/stale one we chose not to steal)
+                // — direct holder evidence either way: the lease
+                // provably no longer resolves to us.
+                RoundEdge::Lose(CompletedLoseEvidence::AnotherHolderObserved),
+            ),
+            (ActCell::Standby | ActCell::Conflict, false) => (None, RoundEdge::StandbyObserved),
+            (ActCell::Conflict, true) => {
+                let verdict = adjudicated.on_believing_conflict();
+                let edge = match verdict {
+                    ConflictResolution::Exhausted => {
+                        RoundEdge::Lose(CompletedLoseEvidence::ConflictDeferralExhausted)
+                    }
+                    ConflictResolution::Deferred => RoundEdge::Defer,
+                };
+                (Some(verdict), edge)
+            }
         }
     };
 
@@ -1908,6 +2053,7 @@ fn complete_round(facts: ReadFacts, outcome: ActCell, standing: StandingCells) -
             HolderCell::Us | HolderCell::Other => BaselineEdge::FromRead,
         },
         confirm: matches!(outcome, ActCell::Leading),
+        read_refusal,
     }
 }
 
@@ -2170,6 +2316,18 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         );
                     }
 
+                    // ---- 1b. The typed-refusal lane ----
+                    // (merged_bug_056): a non-monotone read verdict on
+                    // the conflict arm was computed and REFUSED with a
+                    // stated reason — never silently dropped. The
+                    // re-baseline below still records the read.
+                    if let Some(refusal) = plan.read_refusal {
+                        debug!(
+                            ?refusal,
+                            "conflict-round read verdict refused (stale at adjudication)"
+                        );
+                    }
+
                     // ---- 2. The 409 adjudication ----
                     // On the LIVE standing (the latch's single set
                     // path), AFTER consumption: the verdict is the
@@ -2369,6 +2527,30 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             // lose edge.
                             evidence.apply(&mut standing);
                         }
+                        RoundEdge::LoseObservedAbsent => {
+                            // r[impl sched.lease.holder-evidenced-lose+3]
+                            // The conflict round's completed GET
+                            // observed the lease ABSENT
+                            // (merged_bug_056): the same lose family
+                            // as the act-failed AbsenceLose arm —
+                            // belief exits AT the read (bug_143), the
+                            // standing transition clears any pending
+                            // deferral with it. The ledger is NOT
+                            // consumed (the wholesale clear is false
+                            // on conflicts): a transmitted Create
+                            // resolves through the evidence leg next
+                            // round.
+                            state.on_lose();
+                            warn!(
+                                holder = %cfg.holder_id,
+                                "lost leadership (a believing conflict round's completed \
+                                 read observed the lease ABSENT — deleted out from under \
+                                 us; a peer can re-create it with no steal wait)"
+                            );
+                            hooks.on_lose();
+                            marks_dirty.mark();
+                            standing.on_observed_not_leading();
+                        }
                         RoundEdge::Defer => {
                             // ---- One-round deferral ----
                             // Belief, the hold, and the ledger all
@@ -2485,7 +2667,8 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             HolderCell::of_read(facts.as_ref()),
                             ContentCell::of_read(&content_baseline, facts.as_ref()),
                             LedgerCell::of(&unconfirmed),
-                        );
+                        )
+                        .execute();
                         // The re-baseline is the match's VALUE: the arm
                         // cannot record this read's content without
                         // consuming the routing verdict (the same coupling
@@ -3235,7 +3418,7 @@ mod lease_standing_proofs {
             LedgerCell::Empty
         };
 
-        let action = route_act_failed_read(believes, holder, content, ledger);
+        let action = route_act_failed_read(believes, holder, content, ledger).execute();
         // merged_bug_051 (the conflict-gate premise, both directions):
         // EvidenceResolve is EXACTLY the (Us, Moved, Armed) product in
         // BOTH belief states — the Conflict arm's consume-before-
@@ -3593,6 +3776,20 @@ mod complete_round_proofs {
                  (the two-409 bound neither stretches nor collapses)"
             );
         }
+        // Consult-disposition linearity (merged_bug_056): a conflict
+        // round derives EXACTLY ONE of {consume, read-lose edge,
+        // typed refusal}; non-conflict rounds consult nothing —
+        // computed-but-dropped is not a derivable outcome.
+        let read_lose = matches!(plan.edge, RoundEdge::LoseObservedAbsent)
+            || (matches!(act, ActCell::Conflict)
+                && plan.edge == RoundEdge::Lose(CompletedLoseEvidence::AnotherHolderObserved));
+        let dispositions = (plan.consume.is_some() as u8)
+            + (read_lose as u8)
+            + (plan.read_refusal.is_some() as u8);
+        assert!(
+            dispositions == u8::from(matches!(act, ActCell::Conflict)),
+            "conflict rounds derive exactly one consult disposition"
+        );
     }
 
     /// r[verify sched.lease.holder-evidenced-lose+3]
@@ -3634,6 +3831,10 @@ mod complete_round_proofs {
             RoundEdge::Acquire | RoundEdge::StillLeading => s.on_observed(true),
             RoundEdge::Lose(ev) => {
                 ev.apply(&mut s);
+                assert!(!s.believes(), "every lose edge ends belief");
+            }
+            RoundEdge::LoseObservedAbsent => {
+                s.on_observed(false);
                 assert!(!s.believes(), "every lose edge ends belief");
             }
             RoundEdge::StandbyObserved => s.on_observed(false),
@@ -6948,6 +7149,103 @@ mod tests {
         loop_task.await.expect("lease loop exits");
     }
 
+    /// W12-Y (merged_bug_056): a believing leader whose lease was
+    /// DELETED re-creates, loses the create race 409, and must exit
+    /// belief AT that round — the round's completed GET observed the
+    /// lease ABSENT (deletion-axis evidence; a peer's re-create needs
+    /// no steal wait, the fence/steal margin does not shield this
+    /// regime), and the routing law's AbsenceLose verdict must EXECUTE
+    /// on the Completed-conflict arm exactly as it does on the
+    /// act-failed arm.
+    ///
+    /// Pre-fix the Completed-conflict consult computed the verdict
+    /// through the total law and executed ONLY the EvidenceResolve
+    /// variant — (true, Absent) computed AbsenceLose and silently
+    /// dropped it, so the round fell through to the one-round 409
+    /// deferral and the ex-leader kept `is_leader=true` for another
+    /// renew interval while the create winner led immediately: the
+    /// deleted-lease dual window the FENCE_MARGIN doc declares
+    /// unshielded. A total routing law with a partial consumer
+    /// re-creates the pre-law hazard (the R32 shape: a computed
+    /// verdict must be executed or typed-refused).
+    ///
+    /// Pre-fix red, verbatim: `a believing 409 on the create path must
+    /// execute the AbsenceLose verdict (the GET observed the lease
+    /// absent); pre-fix: the verdict was computed and discarded, and
+    /// the false leader held through the deferral window`.
+    // r[verify sched.lease.holder-evidenced-lose+3]
+    #[tokio::test(start_paused = true)]
+    async fn deleted_lease_create_race_exits_belief_at_the_round() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1 (t=0): acquire; settle the marks PATCH.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 10, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json_rt(Some("us"), 3, 11, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 2 (t=5s): the lease was deleted out from under us; our
+        // GET observes 404, the re-create POST races a foreign creator
+        // and bounces 409 — Completed{Conflict, facts: None}. The
+        // round's only and correct observation is ABSENCE: belief
+        // exits NOW, not a deferral later.
+        let get = park.next().await;
+        get.respond_status(404, "NotFound", "lease deleted");
+        let post = park.next().await;
+        post.respond_status(409, "AlreadyExists", "a peer re-created it first");
+        settle().await;
+
+        assert!(
+            !state.is_leader(),
+            "a believing 409 on the create path must execute the \
+             AbsenceLose verdict (the GET observed the lease absent); \
+             pre-fix: the verdict was computed and discarded, and the \
+             false leader held through the deferral window"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "the absence lose runs in the create-race round itself"
+        );
+
+        shutdown.cancel();
+        for _ in 0..6 {
+            if let Some(req) = park.try_next().await {
+                if req.path.contains("/pods/us") {
+                    req.respond_ok(pod_ok("us"));
+                } else {
+                    req.respond_status(404, "NotFound", "gone");
+                }
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
     /// merged_bug_122 (acquire-before-fence): consuming own-commit
     /// evidence whose ledger anchor is ALREADY past the self-fence
     /// deadline must not take the acquire edge — the very next
@@ -9563,6 +9861,119 @@ mod tests {
         );
     }
 
+    /// W12-Y's compile-shaped probe (merged_bug_056, R32): the
+    /// PARTIAL-CONSULT shape — the routing law's verdict fed to a
+    /// single-variant `matches!` gate — is dead in this file. The
+    /// pre-fix Conflict-arm gate was exactly this shape (computed the
+    /// total law, executed one variant, dropped the rest); the sealed
+    /// [`RoutingVerdict`] kills the un-discharged form at compile time
+    /// (no `PartialEq`, no field access) and this census holds the
+    /// discharged form (`execute()` into a single-variant gate) out of
+    /// the source. Needles concat!-split so the census cannot
+    /// self-match; the plant is the verbatim pre-fix shape.
+    #[test]
+    fn w12_y_no_partial_consult_of_the_routing_verdict() {
+        fn partial_consults(src: &str) -> Vec<String> {
+            const GATE: &str = concat!("matches", "!(");
+            const LAW_CALL: &str = concat!("route_act_failed_", "read(");
+            const VARIANT: &str = concat!("ActFailedAction", "::");
+            let lines: Vec<&str> = src.lines().collect();
+            let mut v = Vec::new();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains(GATE) {
+                    continue;
+                }
+                let window = &lines[i..lines.len().min(i + 8)];
+                if window.iter().any(|l| l.contains(LAW_CALL))
+                    && window
+                        .iter()
+                        .any(|l| l.contains(VARIANT) && !l.contains("=>"))
+                {
+                    v.push(format!(
+                        "{}: single-variant gate over the routing law",
+                        i + 1
+                    ));
+                }
+            }
+            v
+        }
+
+        let live = partial_consults(include_str!("lib.rs"));
+        assert!(
+            live.is_empty(),
+            "partial consults of the routing verdict in lib.rs:\n{live:?}"
+        );
+
+        // The plant: the verbatim pre-fix gate shape must red.
+        let plant = format!(
+            "if is_conflict\n    && {}\n        {}\n            standing.believes(),\n        ),\n        {}EvidenceResolve\n    )\n",
+            concat!("matches", "!("),
+            concat!("route_act_failed_", "read("),
+            concat!("ActFailedAction", "::"),
+        );
+        assert_eq!(
+            partial_consults(&plant).len(),
+            1,
+            "the pre-fix single-variant gate plant must red"
+        );
+        // The discharged exhaustive form passes: execute() into a
+        // match whose arms carry `=>`.
+        let green = format!(
+            "match {}standing.believes, h, c, l)\n    .execute()\n{{\n    {}EvidenceResolve => consume(),\n}}\n",
+            concat!("route_act_failed_", "read("),
+            concat!("ActFailedAction", "::"),
+        );
+        assert!(
+            partial_consults(&green).is_empty(),
+            "the exhaustive discharged form must pass"
+        );
+    }
+
+    /// The [`RoutingVerdict`] Drop backstop (merged_bug_056, R32
+    /// runtime face): a verdict dropped without discharge panics —
+    /// silent discard is killed at runtime, with the panic naming the
+    /// linear-discharge law.
+    #[test]
+    fn routing_verdict_silent_discard_panics() {
+        let caught = std::panic::catch_unwind(|| {
+            let verdict =
+                route_act_failed_read(true, HolderCell::Us, ContentCell::Frozen, LedgerCell::Empty);
+            drop(verdict);
+        })
+        .expect_err("an undischarged verdict must panic at drop");
+        let msg = caught
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| caught.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains("executed or typed-refused"),
+            "the backstop names the law, got: {msg}"
+        );
+    }
+
+    /// The backstop's `thread::panicking()` gate (RC-3(iv), bug_168's
+    /// mode): a verdict dropped DURING an unwind stays silent — the
+    /// original panic propagates instead of a double-panic SIGABRT in
+    /// exactly the builds that arm the guard.
+    #[test]
+    fn routing_verdict_drop_guard_is_unwind_gated() {
+        let caught = std::panic::catch_unwind(|| {
+            let _verdict =
+                route_act_failed_read(true, HolderCell::Us, ContentCell::Frozen, LedgerCell::Empty);
+            panic!("original panic");
+        })
+        .expect_err("the original panic must propagate");
+        let msg = caught
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            msg, "original panic",
+            "the gated Drop must not replace the in-flight panic"
+        );
+    }
+
     // r[verify sched.lease.holder-evidenced-lose+3]
     // r[verify sched.lease.cancelled-write+2]
     /// W12-W at the kernel tier (merged_bug_053, the headline cell):
@@ -9742,7 +10153,7 @@ mod tests {
         match plan.edge {
             RoundEdge::Acquire | RoundEdge::StillLeading => s.on_observed(true),
             RoundEdge::Lose(ev) => ev.apply(&mut s),
-            RoundEdge::StandbyObserved => s.on_observed(false),
+            RoundEdge::LoseObservedAbsent | RoundEdge::StandbyObserved => s.on_observed(false),
             RoundEdge::Defer => {
                 // The deferral arm's precondition (the W12-W3 cell):
                 // the latch is genuinely set when Defer runs.
@@ -9752,9 +10163,30 @@ mod tests {
                 );
             }
         }
-        if matches!(plan.edge, RoundEdge::Lose(_)) {
+        if matches!(
+            plan.edge,
+            RoundEdge::Lose(_) | RoundEdge::LoseObservedAbsent
+        ) {
             assert!(!s.believes(), "every lose edge ends belief: {cell}");
         }
+        // The consult-disposition linearity census (merged_bug_056, at
+        // the law's own quantifier): on a conflict round EXACTLY ONE
+        // of {consume, read-lose edge, typed refusal} is derived —
+        // computed-but-neither-executed-nor-refused is not a
+        // representable outcome; non-conflict rounds consult nothing.
+        let read_lose = usize::from(matches!(plan.edge, RoundEdge::LoseObservedAbsent))
+            + usize::from(
+                matches!(act, ActCell::Conflict)
+                    && plan.edge == RoundEdge::Lose(CompletedLoseEvidence::AnotherHolderObserved),
+            );
+        let dispositions = usize::from(plan.consume.is_some())
+            + read_lose
+            + usize::from(plan.read_refusal.is_some());
+        assert_eq!(
+            dispositions,
+            usize::from(matches!(act, ActCell::Conflict)),
+            "conflict rounds derive exactly one consult disposition: {cell}"
+        );
     }
 
     // r[verify sched.lease.holder-evidenced-lose+3]
@@ -9811,7 +10243,7 @@ mod tests {
             for h in HolderCell::ALL {
                 for c in ContentCell::ALL {
                     for l in LedgerCell::ALL {
-                        let routed = route_act_failed_read(believes, h, c, l);
+                        let routed = route_act_failed_read(believes, h, c, l).execute();
                         assert_eq!(
                             routed,
                             spec(believes, h, c, l),

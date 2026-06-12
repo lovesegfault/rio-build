@@ -449,3 +449,28 @@ under this rule.
   the per-row S3 drain, and the orphan scan each stop at their next batch
   boundary under a hold landed between committed batches, and release
   drains the remainder (suspension never converts into lost work).
+
+- *Lease routing verdict (rio-lease)*: the act-failed routing law's
+  verdict was consulted under a single-variant gate at the
+  Completed-conflict arm --- `(true, Absent)` computed `AbsenceLose` and
+  executed only `EvidenceResolve`, so a believing ex-leader whose lease
+  was deleted kept dispatching through the one-round deferral while the
+  re-create winner led immediately: the deleted-lease dual window the
+  fence-margin pricing declares unshielded (a total routing law with a
+  partial consumer re-creates the pre-law hazard). Closed by the round
+  derivation (`complete_round`) folding the FULL verdict alphabet ---
+  monotone verdicts (own-commit movement, foreign-holder observation,
+  observed absence) execute; non-monotone verdicts are REFUSED TYPED
+  (`StaleReadRefusal`, with the funnel refusal carrying the two-409-bound
+  rationale) --- plus the sealed `RoutingVerdict` carrier: the only
+  discharge is `execute()` into exhaustive-match consumers, silent
+  discard panics through the `thread::panicking()`-gated Drop backstop,
+  and the partial-consult source shape is census-planted red. Witness
+  tiers, disclosed: the single-variant gate shape does not compile
+  against the sealed carrier and is census-dead in source (compile
+  face); discard-without-discharge panics (runtime face);
+  execute-then-ignore remains representable and is held by the
+  census-pinned dispatch sites and the kani consult-disposition
+  linearity proof (exactly one of consume/read-lose/refusal per
+  conflict round, over the full cell product). The behavior red is the
+  deleted-lease create-race schedule (belief exits at the round).
