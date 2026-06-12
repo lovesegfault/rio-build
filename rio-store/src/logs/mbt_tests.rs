@@ -879,6 +879,21 @@ impl MbtSystem {
     /// registry-row half is a real PG effect the sweep's structural
     /// liveness exclusion reads (merged_bug_071), so the mirror
     /// executes it; the phase half stays driver bookkeeping.
+    ///
+    /// THE RELEASE LAW'S POPULATION (merged_bug_010,
+    /// `store.log.release-totality`): "released on every path except
+    /// a stolen lease" quantifies over every path AFTER A SUCCESSFUL
+    /// ACQUIRE — not only the driver's `LoopExit` alphabet this
+    /// mirror walks. The OPEN-PHASE family (acquire .. driver spawn:
+    /// the ownership witness's error arm, plus cancellation of the
+    /// handler future itself) is covered structurally by
+    /// `LeaseReleaseGuard` (release-on-drop, disarmed only at the
+    /// driver handoff), so the law's enforced population equals its
+    /// quantifier by type; the open-phase witnesses are the
+    /// `open_phase_failures_release_the_lease_row` falsify-twin pair
+    /// and `lease_release_guard_drop_tiers` (service.rs), not model
+    /// steps — the model's alphabet starts at the open session this
+    /// mirror's `builderConnects` mints.
     async fn builder_disconnects(&mut self, e: u64) -> Result<()> {
         let s = self.open_session_of(e)?;
         let exec_id = self.exec(e)?.exec_id;

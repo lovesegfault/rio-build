@@ -1445,7 +1445,7 @@ mod tests {
                 // contiguous-from-zero replays ack at their run end.
                 // Either way it never exceeds the run's own end.
                 assert!(
-                    commit.durable_ack.is_none_or(|a| a <= first + n_lines - 1),
+                    commit.durable_ack.is_none_or(|a| a < first + n_lines),
                     "a cut ack never exceeds the drained run's end: {:?}",
                     commit.durable_ack
                 );

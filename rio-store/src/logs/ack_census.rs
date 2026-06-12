@@ -195,7 +195,6 @@ fn walk(universe: &[(&'static str, &str)]) -> Result<Vec<Site>, String> {
                     let l = lines[i].1;
                     l.find(tag_needle).map(|p| {
                         l[p + tag_needle.len()..]
-                            .trim()
                             .split_whitespace()
                             .next()
                             .unwrap_or("")

@@ -2817,6 +2817,31 @@ replay (merged_bug_007). The R29 form: the envelope is denominated in
 the consumer's execution domain --- the abort predicate consumes
 "progress stalled", so the clock must measure progress.
 
+#r("store.log.release-totality")[
+  A held ingest-session lease row MUST be released on every path that
+  does not hand it to a live owner: the release obligation is minted
+  at the acquire observation as a linear value whose only discharge is
+  the handoff to the teardown-owning driver, so every fallible or
+  cancellable step between acquire and handoff --- present and future
+  --- releases by construction rather than by arm enumeration.
+]
+
+The wave-11 acquire-race close got every DRIVER exit right and itself
+minted a pre-driver fallible step (the ownership witness) outside the
+enforced alphabet: one PG blip on the witness SELECT stranded the
+just-acquired row for the full staleness window --- cross-pod
+reconnects got Busy, `lookup_live` reported a phantom Live. The law's
+quantifier is "every path after a successful acquire"; the enforced
+population was "every driver exit". `LeaseReleaseGuard`
+(release-on-drop, session-id-predicated, disarmed only at the driver
+handoff) makes the two equal by type --- cancellation included, which
+no per-arm compensation can cover --- and the linear-obligation form is
+the `sys.obligation.linear-discharge` doctrine's lease instance. The
+restore path gains the dual face: a failed open never resurrects a
+DEAD predecessor entry (driver-done is marked by the teardown
+scopeguard cancelling the entry's token), so the spent-scopeguard hang
+is unrepresentable.
+
 #r("store.log.arrival-clock")[
   Liveness gates on peer conduct MUST read arrival evidence for the
   abort decision --- frames the peer has already sent, drained and

@@ -380,7 +380,16 @@ async fn register_ingest_owner(
 /// Conditionally undo [`register_ingest_owner`]'s insert: restore the
 /// displaced entry (or clear the slot) only while OUR entry still
 /// holds it — a newer registrant's entry is governed by its own
-/// witness and must not be clobbered.
+/// witness and must not be clobbered — and only while the displaced
+/// entry's DRIVER IS STILL ALIVE (merged_bug_010's secondary face):
+/// a predecessor whose driver already ran teardown has a spent
+/// deregister scopeguard (our insert preempted its `remove_if`), so
+/// restoring it would park a registry entry whose buffer never
+/// receives another line and is never dropped — every future
+/// `TailLog` follower would hang on it. Driver liveness is the
+/// entry's cancel token: the driver's deregister guard cancels it on
+/// EVERY exit (panic included), and a successful displacer cancels it
+/// too — either way a cancelled token means "do not resurrect".
 fn restore_displaced(
     registry: &DashMap<Uuid, IngestEntry>,
     exec_id: Uuid,
@@ -391,11 +400,95 @@ fn restore_displaced(
         && Arc::ptr_eq(&slot.get().shared, ours)
     {
         match displaced {
-            Some(previous) => {
+            Some(previous) if !previous.cancel.is_cancelled() => {
                 slot.insert(previous);
             }
+            // A dead (or dying) predecessor: clear the slot instead
+            // of resurrecting it. Readers fall back to history-only,
+            // which is correct for a session whose driver is gone.
+            Some(_dead) => {
+                slot.remove();
+            }
+            // No predecessor: our failed insert just vacates.
             None => {
                 slot.remove();
+            }
+        }
+    }
+}
+
+/// The lease-release obligation, made LINEAR (merged_bug_010, R32 —
+/// `sys.obligation.linear-discharge`): minted the moment
+/// `sessions::acquire` reports `Acquired`, disarmed ONLY by handing
+/// the session to the driver task that owns teardown
+/// ([`AppendDriver::run`]'s release). Every fallible await between
+/// the acquire and the spawn — the ownership witness, plus any path
+/// the open phase grows later — is covered BY CONSTRUCTION, including
+/// CANCELLATION (a client disconnect drops the handler future
+/// mid-open; the guard drops with it), so the release law's
+/// quantifier ("every path after a successful acquire") equals the
+/// enforced population by type, not by arm enumeration.
+///
+/// Drop tier, disclosed: the Drop backstop SPAWNS the session-id-
+/// predicated release (`sessions::release` — a zero-row no-op
+/// whenever the row is no longer ours, idempotent by construction);
+/// a failed or unspawnable backstop release degrades to the
+/// staleness-window self-heal that always existed. No panic is
+/// minted in this Drop (the RC-3(iv) audit line: the Drop performs
+/// the corrective action — there is no panic-in-Drop enforcement to
+/// unwind-condition).
+// r[impl store.log.release-totality]
+struct LeaseReleaseGuard {
+    /// `Some` while armed; `None` after the driver handoff.
+    armed: Option<PgPool>,
+    exec_id: Uuid,
+    session_id: Uuid,
+}
+
+impl LeaseReleaseGuard {
+    /// Mint the obligation at the `Acquired` observation.
+    fn arm(pool: PgPool, exec_id: Uuid, session_id: Uuid) -> Self {
+        Self {
+            armed: Some(pool),
+            exec_id,
+            session_id,
+        }
+    }
+
+    /// Discharge by handoff: the driver spawned past this point owns
+    /// the teardown release on every `LoopExit`. Consumes the guard —
+    /// a disarmed guard cannot release, and a second disarm does not
+    /// compile.
+    fn disarm_into_driver(mut self) {
+        self.armed = None;
+    }
+}
+
+impl Drop for LeaseReleaseGuard {
+    fn drop(&mut self) {
+        let Some(pool) = self.armed.take() else {
+            return;
+        };
+        let (exec_id, session_id) = (self.exec_id, self.session_id);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(e) = sessions::release(&pool, exec_id, session_id).await {
+                        warn!(
+                            %exec_id, %session_id, error = %e,
+                            "open-phase lease release backstop failed; the \
+                             staleness window self-heals"
+                        );
+                    }
+                });
+            }
+            Err(_) => {
+                // Runtime teardown: the row self-heals via staleness.
+                warn!(
+                    %exec_id, %session_id,
+                    "open-phase lease release skipped (no runtime); the \
+                     staleness window self-heals"
+                );
             }
         }
     }
@@ -725,6 +818,17 @@ impl LogService for LogServiceImpl {
             }
         }
 
+        // The release obligation is minted HERE, at the Acquired
+        // observation (merged_bug_010, store.log.release-totality):
+        // every fallible await below — the ownership witness, plus
+        // cancellation of this whole handler future — releases the
+        // just-acquired row via the guard's Drop until the driver
+        // handoff disarms it. The pre-guard shape compensated per arm
+        // and the witness-error arm stranded the row for the full
+        // staleness window (phantom Live to readers, Busy to
+        // reconnects).
+        let release_guard = LeaseReleaseGuard::arm(self.pool.clone(), exec_id, session_id);
+
         // -- 6. The session, the registry entry, and the driver task.
         let session = IngestSession::new(&gate_ok, session_id, self.ingest_config.clone());
         let shared = Arc::clone(session.shared());
@@ -765,6 +869,10 @@ impl LogService for LogServiceImpl {
             session,
             max_chunks_per_exec: self.max_chunks_per_exec,
         };
+        // The handoff discharge: from here the spawned driver owns the
+        // teardown release on every LoopExit (the guard's only lawful
+        // disarm — store.log.release-totality).
+        release_guard.disarm_into_driver();
         // Detached task: it exits when the inbound stream ends (client
         // half-close, disconnect, or transport error) or when the
         // handler aborts the stream. Not cancelled on client
@@ -1248,9 +1356,22 @@ impl AppendDriver {
         // (the lease's same-pod steal arm) before this teardown runs;
         // its insert replaced our entry and we must not remove theirs.
         let deregister = scopeguard::guard(
-            (Arc::clone(&self.active_ingests), Arc::clone(&self.shared)),
-            move |(registry, shared)| {
+            (
+                Arc::clone(&self.active_ingests),
+                Arc::clone(&self.shared),
+                self.cancel.clone(),
+            ),
+            move |(registry, shared, cancel)| {
                 registry.remove_if(&exec_id, |_, v| Arc::ptr_eq(&v.shared, &shared));
+                // The driver-done marker (merged_bug_010's secondary
+                // face): cancelling our own token marks this entry
+                // dead-or-dying, so a failed displacer's
+                // restore_displaced never resurrects an entry whose
+                // teardown already ran (our remove_if above no-ops
+                // when a displacer's insert replaced us — the entry it
+                // popped must then never be restored). Runs on panic
+                // too: the scopeguard is the one teardown chokepoint.
+                cancel.cancel();
                 metrics::gauge!("rio_store_log_active_ingest_sessions").decrement(1.0);
             },
         );
@@ -3363,6 +3484,298 @@ mod tests {
         assert_eq!(INBOUND_IDLE_BOUND, sessions::HEARTBEAT_INTERVAL * 4);
     }
 
+    /// A second pool to the same test DB whose connections carry a
+    /// short `statement_timeout` — the per-query PG fault injector for
+    /// the open-phase strand tests (a lock held elsewhere makes the
+    /// witness SELECT time out as a REAL sqlx error through the
+    /// production fns; the composition-harness lane, R13-disclosed:
+    /// the test drives the production open-phase calls in the
+    /// handler's order).
+    async fn timeout_pool(db: &TestDb) -> PgPool {
+        // `SET` on a pooled connection binds only THAT connection; the
+        // injector needs the timeout on EVERY connection, so it builds
+        // its own single-connection pool over the live pool's own
+        // connect options with an `after_connect` hook.
+        let opts = (*db.pool.connect_options()).clone();
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::Executor::execute(conn, "SET statement_timeout = '500ms'")
+                        .await
+                        .map(|_| ())
+                })
+            })
+            .connect_with(opts)
+            .await
+            .expect("connect timeout pool")
+    }
+
+    /// One registry entry built from the production parts, as
+    /// `append_log` builds it.
+    fn test_entry() -> (
+        IngestEntry,
+        Arc<Mutex<IngestShared>>,
+        rio_common::signal::Token,
+    ) {
+        let session = IngestSession::new(
+            &gate::GateOk {
+                drv_hash: rio_nix::store_path::drv_log_hash(DRV_PATH),
+                exec_id: Uuid::now_v7(),
+                final_line_count: None,
+                seed: gate::LogSeed {
+                    merged_bytes: 0,
+                    merged_chunks: 0,
+                    raw_bytes: 0,
+                    raw_rows: 0,
+                },
+                covered: Default::default(),
+            },
+            Uuid::now_v7(),
+            IngestConfig::default(),
+        );
+        let shared = Arc::clone(session.shared());
+        let cancel = rio_common::signal::Token::new();
+        (
+            IngestEntry {
+                shared: Arc::clone(&shared),
+                cancel: cancel.clone(),
+            },
+            shared,
+            cancel,
+        )
+    }
+
+    /// Hold an ACCESS EXCLUSIVE lock on the sessions table inside an
+    /// open transaction: every later witness SELECT parks on it.
+    async fn park_witness(lock_pool: &PgPool) -> sqlx::Transaction<'static, sqlx::Postgres> {
+        let mut tx = lock_pool.begin().await.expect("begin lock txn");
+        sqlx::query("LOCK TABLE log_ingest_sessions IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .expect("lock");
+        tx
+    }
+
+    /// Bounded poll until the exec's session row is gone.
+    async fn poll_released(pool: &PgPool, exec: Uuid) -> bool {
+        for _ in 0..100 {
+            if let sessions::LiveLookup::Absent = sessions::lookup_live(pool, exec).await.unwrap() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    // r[verify store.log.release-totality]
+    /// W12-E (merged_bug_010), the falsify-twin pair on the open
+    /// phase's fallible window (acquire .. driver spawn), with the
+    /// PRE-FIX strand kept live as the left face (the
+    /// `ack_send_park_red_vs_bounded_green` house form):
+    ///
+    /// LEFT (the recorded red, exhibited forever): the unguarded
+    /// composition — acquire, then the ownership witness cancelled
+    /// mid-flight (a client disconnect drops the handler future; here
+    /// a lock parks the witness SELECT and a timeout cancels it) —
+    /// strands the just-acquired row: a cross-pod acquire gets Busy
+    /// and the row stays a phantom Live for the staleness window.
+    ///
+    /// RIGHT: the guarded composition (the handler's order: arm at
+    /// Acquired, disarm only at the driver handoff) releases the row
+    /// on BOTH failure shapes — the cancelled witness and the
+    /// witness-error arm (statement_timeout turns the parked SELECT
+    /// into a real sqlx error through the production fn).
+    #[tokio::test]
+    async fn open_phase_failures_release_the_lease_row() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let registry: Arc<DashMap<Uuid, IngestEntry>> = Arc::new(DashMap::new());
+        let lock_pool = db.reopen().await;
+
+        // ---- LEFT: the unguarded strand (the pre-fix shape).
+        let exec_a = seed_assignment(&db.pool, "builder-0").await;
+        let session_a = Uuid::now_v7();
+        assert!(matches!(
+            sessions::acquire(&db.pool, exec_a, session_a, "test-pod")
+                .await
+                .unwrap(),
+            Acquire::Acquired
+        ));
+        let tx = park_witness(&lock_pool).await;
+        let (entry, _shared, _cancel) = test_entry();
+        let witness_pool = timeout_pool(&db).await;
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            register_ingest_owner(&registry, &witness_pool, exec_a, session_a, entry),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the parked witness must be cancelled");
+        drop(tx); // rollback: the lock is gone; nothing else heals the row
+        match sessions::acquire(&db.pool, exec_a, Uuid::now_v7(), "other-pod")
+            .await
+            .unwrap()
+        {
+            Acquire::Busy { current_owner } => assert_eq!(
+                current_owner, "test-pod",
+                "left (pre-fix, kept live): the unguarded cancelled open \
+                 strands the row for the staleness window"
+            ),
+            other => panic!("the unguarded strand red is stale: {other:?}"),
+        }
+
+        // ---- RIGHT 1: the guarded composition under CANCELLATION.
+        // (One active assignment per derivation: release the strand
+        // explicitly and reuse the execution for the guarded cells.)
+        sessions::release(&db.pool, exec_a, session_a)
+            .await
+            .unwrap();
+        let exec_b = exec_a;
+        let session_b = Uuid::now_v7();
+        assert!(matches!(
+            sessions::acquire(&db.pool, exec_b, session_b, "test-pod")
+                .await
+                .unwrap(),
+            Acquire::Acquired
+        ));
+        let tx = park_witness(&lock_pool).await;
+        let (entry, _shared, _cancel) = test_entry();
+        let witness_pool_b = timeout_pool(&db).await;
+        let registry_b = Arc::clone(&registry);
+        let pool_for_guard = db.pool.clone();
+        let guarded_open = async move {
+            let _guard = LeaseReleaseGuard::arm(pool_for_guard, exec_b, session_b);
+            register_ingest_owner(&registry_b, &witness_pool_b, exec_b, session_b, entry).await?;
+            Ok::<(), Status>(())
+        };
+        let cancelled =
+            tokio::time::timeout(std::time::Duration::from_millis(100), guarded_open).await;
+        assert!(cancelled.is_err(), "the parked witness must be cancelled");
+        drop(tx); // rollback frees the lock; the spawned release proceeds
+        assert!(
+            poll_released(&db.pool, exec_b).await,
+            "the guard's Drop must release the row after a cancelled open \
+             (no phantom Live, no Busy window)"
+        );
+
+        // ---- RIGHT 2: the witness-ERROR arm (the named pre-driver
+        // family member).
+        let exec_c = exec_a;
+        let session_c = Uuid::now_v7();
+        assert!(matches!(
+            sessions::acquire(&db.pool, exec_c, session_c, "test-pod")
+                .await
+                .unwrap(),
+            Acquire::Acquired
+        ));
+        let tx = park_witness(&lock_pool).await;
+        let (entry, _shared, _cancel) = test_entry();
+        let witness_pool_c = timeout_pool(&db).await;
+        {
+            let _guard = LeaseReleaseGuard::arm(db.pool.clone(), exec_c, session_c);
+            let r =
+                register_ingest_owner(&registry, &witness_pool_c, exec_c, session_c, entry).await;
+            assert!(
+                r.is_err(),
+                "statement_timeout must surface the witness-error arm"
+            );
+            // _guard drops here, still armed: the Err path releases.
+        }
+        drop(tx);
+        assert!(
+            poll_released(&db.pool, exec_c).await,
+            "the guard's Drop must release the row on the witness-error arm"
+        );
+    }
+
+    // r[verify store.log.release-totality]
+    /// W12-E2 (merged_bug_010's secondary face): a failed open's
+    /// restore path must NOT resurrect a DEAD predecessor — an entry
+    /// whose driver already ran teardown (its deregister scopeguard
+    /// spent, its token cancelled by it) would park a buffer no
+    /// future reader can ever drain. Post-fix the dead entry is
+    /// cleared; readers fall back to history-only. The live face is
+    /// unchanged: an un-cancelled predecessor is restored as before.
+    #[tokio::test]
+    async fn restore_refuses_a_dead_predecessor() {
+        let registry: DashMap<Uuid, IngestEntry> = DashMap::new();
+        let exec = Uuid::now_v7();
+
+        // The dead predecessor: production parts, token cancelled
+        // exactly as the driver's deregister scopeguard does.
+        let (dead_entry, dead_shared, dead_cancel) = test_entry();
+        dead_cancel.cancel();
+        registry.insert(exec, dead_entry);
+
+        // Our failed open displaced it; the restore must clear.
+        let (ours_entry, ours_shared, _ours_cancel) = test_entry();
+        let displaced = registry.insert(exec, ours_entry);
+        let displaced = displaced.expect("the dead predecessor was displaced");
+        assert!(Arc::ptr_eq(&displaced.shared, &dead_shared));
+        restore_displaced(&registry, exec, &ours_shared, Some(displaced));
+        assert!(
+            !registry.contains_key(&exec),
+            "a dead predecessor must not be restored (the spent-scopeguard \
+             hang: its buffer never receives another line and is never \
+             dropped)"
+        );
+
+        // The live-predecessor face: restored exactly as before.
+        let (live_entry, live_shared, _live_cancel) = test_entry();
+        registry.insert(exec, live_entry);
+        let (ours2, ours2_shared, _c2) = test_entry();
+        let displaced_live = registry.insert(exec, ours2).expect("live displaced");
+        restore_displaced(&registry, exec, &ours2_shared, Some(displaced_live));
+        let restored = registry
+            .get(&exec)
+            .expect("the live predecessor is restored");
+        assert!(
+            Arc::ptr_eq(&restored.shared, &live_shared),
+            "the live predecessor's own entry holds the slot again"
+        );
+    }
+
+    // r[verify store.log.release-totality]
+    /// W12-E3 (the guard's own linearity, honest tiers disclosed):
+    /// the compile face — `disarm_into_driver` CONSUMES the guard, so
+    /// release-after-disarm and double-disarm do not compile (argued
+    /// by signature; `mem::forget`/`Box::leak` remain representable —
+    /// Rust does not forbid them; the Drop is the named backstop) —
+    /// and the runtime face: the Drop backstop releases an armed
+    /// guard and stays silent for a disarmed one.
+    #[tokio::test]
+    async fn lease_release_guard_drop_tiers() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let exec = seed_assignment(&db.pool, "builder-0").await;
+        let session = Uuid::now_v7();
+        assert!(matches!(
+            sessions::acquire(&db.pool, exec, session, "test-pod")
+                .await
+                .unwrap(),
+            Acquire::Acquired
+        ));
+
+        // Disarmed: the handoff discharged the obligation — Drop must
+        // NOT release (the driver owns teardown from here).
+        let guard = LeaseReleaseGuard::arm(db.pool.clone(), exec, session);
+        guard.disarm_into_driver();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            matches!(
+                sessions::lookup_live(&db.pool, exec).await.unwrap(),
+                sessions::LiveLookup::Live(_)
+            ),
+            "a disarmed guard must not release the row"
+        );
+
+        // Armed + silently dropped: the Drop backstop releases.
+        let guard = LeaseReleaseGuard::arm(db.pool.clone(), exec, session);
+        drop(guard);
+        assert!(
+            poll_released(&db.pool, exec).await,
+            "an armed guard dropped must release via Drop"
+        );
+    }
+
     // r[verify store.log.arrival-clock]
     /// W12-D/W12-D2 at the predicate tier (bug_020): the trip demands
     /// BOTH clocks stale. The strawman single-axis predicate (the
@@ -3589,7 +4002,7 @@ mod tests {
         // (pre-fix RED: the next tick aborts `inbound_idle` despite
         // the queued keepalives), then trip on genuine silence no
         // earlier than a full bound past the last drained keepalive.
-        let mut aborted_at: Option<std::time::Duration>;
+        let aborted_at: Option<std::time::Duration>;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
         loop {
             let next =
