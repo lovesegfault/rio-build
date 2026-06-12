@@ -598,7 +598,7 @@ pub(super) async fn report_no_eligible_source(
                 // ack — the poison lane's premise is the completed
                 // RPC itself (`attempt_resolved` is false by design
                 // on every NoEligibleSource arm; see the mint's doc).
-                // r[impl ctrl.pool.respawn-backoff+4]
+                // r[impl ctrl.pool.respawn-backoff+5]
                 acked.push((
                     intent.intent_id.clone(),
                     candidate::VerdictWitness::from_acked_no_eligible_source(&resp.into_inner()),
@@ -720,7 +720,7 @@ pub(super) fn evaluate_spawn_gate(
     // newer epoch than it latched under decays here and the intent
     // flows through the respawn_blocked filter below un-withheld ---
     // the resubmission reaches a spawn within this same tick cycle.
-    // r[impl ctrl.pool.respawn-backoff+4]
+    // r[impl ctrl.pool.respawn-backoff+5]
     let mut decayed = Vec::new();
     for i in &wanted {
         if let Some(receipt) = streaks.note_demand_epoch(key, &i.intent_id, i.resubmit_cycle) {
@@ -931,7 +931,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // `queued` and the Job census the reap arms compare against come
     // from the same tick — and BEFORE the gate fold below, so the
     // fold's demand-holding union (bug_103,
-    // `ctrl.pool.one-demand-source`) derives from the SAME Job
+    // `ctrl.pool.one-demand-source`) derives from the same Job
     // inventory `reap_stale_for_intents` walks. The fold is a local
     // computation on the already-polled page: the poll→list order
     // the law pins is unchanged.
@@ -987,7 +987,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // already spawn-eligible, and the next verdict-free death
     // re-enters the ladder at 10 s and re-climbs toward the 1280 s
     // cap. Bounded: no LIST ⇒ no spawn either.
-    // r[impl ctrl.pool.respawn-backoff+4]
+    // r[impl ctrl.pool.respawn-backoff+5]
     ctx.exhausted_streak.lock().note_job_alive(
         &streak_key,
         jobs.items
@@ -1169,7 +1169,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         // is a named resolution — the scheduler now holds the verdict,
         // so the intent's verdict-free-respawn record (if any) clears.
         // The witness was minted at the ack site (merged_bug_080(2b)).
-        // r[impl ctrl.pool.respawn-backoff+4]
+        // r[impl ctrl.pool.respawn-backoff+5]
         let mut streaks = ctx.exhausted_streak.lock();
         for (intent_id, witness) in acked {
             streaks.note_resolution(&streak_key, &intent_id, witness, std::time::Instant::now());
@@ -2815,7 +2815,7 @@ pub(super) async fn reap_stale_for_intents(
                 // the exhaustive merged_bug_080(2b) alphabet (a
                 // resolving ack already cleared the record inside the
                 // delete chokepoint; a charge-free ack proves nothing):
-                // r[impl ctrl.pool.respawn-backoff+4]
+                // r[impl ctrl.pool.respawn-backoff+5]
                 let no_verdict_at_delete = match &synthesized {
                     super::job::SynthesizedDelete::ReportedVerdict { .. } => false,
                     super::job::SynthesizedDelete::AckedNoAttempt
@@ -5649,7 +5649,7 @@ mod echo_provenance_census {
     //!
     //! Lane dispositions: `stamp` = payload parsed from
     //! `INTENT_CELLS_ANNOTATION` (the spawn-time zip; on-page and
-    //! off-page lanes); `confirm` = the page copy echoed ONLY where
+    //! off-page lanes); `confirm` = the page copy echoed only where
     //! the stamp's own absence semantics make it the spawn-time
     //! truth (hw-agnostic — never stamped, nothing armed); `skip` =
     //! the refusal arm (celled-but-unstamped: no provenance-clean
@@ -5662,7 +5662,7 @@ mod echo_provenance_census {
     //! generation clear in `actor/mod.rs`, the status sweep in
     //! `actor/housekeeping.rs`) are EXPECTED MEMBERS of the round-12
     //! registry's workspace-UNION row, relayed via the S6 handoff —
-    //! NEVER walked from this crate's nextest sandbox (cross-crate
+    //! never walked from this crate's nextest sandbox (cross-crate
     //! include_str is dev-green/gate-red under per-crate nix
     //! isolation). The in-crate consumer face enforces at THIS
     //! commit; the union face enforces at the registry's
@@ -5787,7 +5787,7 @@ mod echo_provenance_census {
     }
 
     /// The three-face plant battery (WS-4) + the empty-walk plant
-    /// (CE-1), each driven through the SAME walk path as production:
+    /// (CE-1), each driven through the same walk path as production:
     ///
     /// 1. EMPTY-WALK plant: a corpus without the census root ERRORS
     ///    (never an empty-green — the named R22'' defeat).

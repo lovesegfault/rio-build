@@ -370,7 +370,7 @@ pub enum SpawnResolution {
     },
 }
 
-// r[impl ctrl.pool.respawn-backoff+4]
+// r[impl ctrl.pool.respawn-backoff+5]
 /// merged_bug_080(2b): the verdict-evidence witness
 /// [`PoolStreaks::note_resolution`] requires. Constructible ONLY
 /// through the four mint constructors below, each demanding its typed
@@ -401,7 +401,7 @@ impl VerdictWitness {
     /// with (merged_bug_080(2b): the same-tick wipe died here; a
     /// deadline report for a never-pulled Job acks
     /// `attempt_resolved=false` and resets nothing).
-    // r[impl ctrl.pool.respawn-backoff+4]
+    // r[impl ctrl.pool.respawn-backoff+5]
     pub fn from_resolved_ack(
         resp: &rio_proto::types::ReportAttemptOutcomeResponse,
     ) -> Option<Self> {
@@ -415,7 +415,7 @@ impl VerdictWitness {
     /// returns `attempt_resolved=false` by design (the verdict is not
     /// an attempt resolution), and requiring the response makes the
     /// mint unreachable before the RPC completes.
-    // r[impl ctrl.pool.respawn-backoff+4]
+    // r[impl ctrl.pool.respawn-backoff+5]
     pub fn from_acked_no_eligible_source(
         _ack: &rio_proto::types::ReportAttemptOutcomeResponse,
     ) -> Self {
@@ -426,7 +426,7 @@ impl VerdictWitness {
     /// pull identity. `None` for materialization claims, foreign
     /// shapes, and unknown kinds --- a store replica's attempt is not
     /// build progress and never resets.
-    // r[impl ctrl.pool.respawn-backoff+4]
+    // r[impl ctrl.pool.respawn-backoff+5]
     pub fn from_open_build_attempt(attempt: &rio_proto::types::OpenAttempt) -> Option<Self> {
         (super::job::MintedPullIdentity::of(attempt) == super::job::MintedPullIdentity::Build)
             .then_some(Self(SpawnResolution::Established))
@@ -449,7 +449,7 @@ impl VerdictWitness {
     /// conservative: an older close resets less), so the
     /// `note_resolution` chronology guard compares the close's TRUE
     /// age, not the wire-frozen fetch-time stamp.
-    // r[impl ctrl.pool.respawn-backoff+4]
+    // r[impl ctrl.pool.respawn-backoff+5]
     pub fn from_recently_closed_build(
         closed: &rio_proto::types::ClosedAttempt,
         staleness: std::time::Duration,
@@ -482,7 +482,7 @@ impl VerdictWitness {
     /// drifted the postdates check permissive (covering deaths the
     /// close does not actually postdate --- uncounted deaths on a
     /// spend-enabling lane).
-    // r[impl ctrl.pool.respawn-backoff+4]
+    // r[impl ctrl.pool.respawn-backoff+5]
     pub fn covers_job_death(
         closed: &rio_proto::types::ClosedAttempt,
         job: &k8s_openapi::api::batch::v1::Job,
@@ -520,7 +520,7 @@ impl VerdictWitness {
 /// (every pod-derived mint is forbidden by the latch itself). Fields
 /// private; the caller consumes the receipt for the operator verdict
 /// plane (the RespawnGiveUpReset Event), never to mutate.
-// r[impl ctrl.pool.respawn-backoff+4]
+// r[impl ctrl.pool.respawn-backoff+5]
 #[derive(Debug, Clone, Copy)]
 pub struct GaveUpReset {
     /// Verdict-free deaths the decayed record had accumulated.
@@ -642,7 +642,7 @@ impl EvidenceState {
 /// the streak-lane expiry are independent again
 /// ([`POOL_STREAK_ORPHAN_EXPIRY_SECS`] = 120 s stands untouched for
 /// the NoEligibleSource streak lane).
-// r[impl ctrl.pool.respawn-backoff+4]
+// r[impl ctrl.pool.respawn-backoff+5]
 pub(crate) const RESPAWN_BACKOFF_CAP_SECS: u64 = 1280;
 
 /// live_056-b give-up threshold: after this many verdict-free deaths
@@ -677,7 +677,7 @@ pub(crate) const RESPAWN_BACKOFF_CAP_SECS: u64 = 1280;
 /// the unconditional recently-closed consult was REJECTED (it
 /// re-prices every tick for one lane). Deaths under the new epoch
 /// re-latch at this same budget --- the safety face is untouched.
-// r[impl ctrl.pool.respawn-backoff+4]
+// r[impl ctrl.pool.respawn-backoff+5]
 pub(crate) const RESPAWN_GIVE_UP_DEATHS: u32 = 8;
 
 /// The backoff floor after `deaths` verdict-free Job deaths.
@@ -931,7 +931,7 @@ impl RespawnEntry {
     /// [`PoolStreaks::step`]'s expiry-immunity arm --- one
     /// definition, so the spawn law and the retention law cannot
     /// drift.
-    // r[impl ctrl.pool.respawn-backoff+4]
+    // r[impl ctrl.pool.respawn-backoff+5]
     fn blocks_respawn(&self, now: std::time::Instant) -> bool {
         self.deaths >= RESPAWN_GIVE_UP_DEATHS
             || now.saturating_duration_since(self.last_death) < respawn_backoff(self.deaths)
@@ -1084,7 +1084,7 @@ impl PoolStreaks {
     /// the escalation/give-up reap-disposition letters and the
     /// give-up Event AT THE EDGE (`gave_up_edge` is true exactly once
     /// --- the call that crosses `RESPAWN_GIVE_UP_DEATHS`).
-    // r[impl ctrl.pool.respawn-backoff+4]
+    // r[impl ctrl.pool.respawn-backoff+5]
     pub fn note_verdict_free_death(
         &mut self,
         pool: &PoolKey,
@@ -1125,7 +1125,7 @@ impl PoolStreaks {
     /// spawn could complete a poison from stale evidence. With this
     /// lane the expiry reverts to its documented orphan semantics:
     /// genuinely JOBLESS fold-skip silence.
-    // r[impl ctrl.pool.respawn-backoff+4]
+    // r[impl ctrl.pool.respawn-backoff+5]
     pub fn note_job_alive<'a>(
         &mut self,
         pool: &PoolKey,
@@ -1166,7 +1166,7 @@ impl PoolStreaks {
     /// expires by itself (time is that state's exit edge), and an
     /// epoch-triggered reset mid-window would let resubmit spam
     /// bypass the breaker --- the exact hot loop it exists to stop.
-    // r[impl ctrl.pool.respawn-backoff+4]
+    // r[impl ctrl.pool.respawn-backoff+5]
     pub fn note_demand_epoch(
         &mut self,
         pool: &PoolKey,
@@ -1247,7 +1247,7 @@ impl PoolStreaks {
     /// merged_bug_080(2b): the [`VerdictWitness`] parameter makes a
     /// premise-free reset a compile error --- every caller must mint
     /// the witness at one of the four evidence sites first.
-    // r[impl ctrl.pool.respawn-backoff+4]
+    // r[impl ctrl.pool.respawn-backoff+5]
     /// merged_bug_036: the `ClosedBuild` arm binds the chronology
     /// conjunct at the record (the only place `last_death` lives) ---
     /// the record is removed IFF the close provably postdates the
@@ -1326,7 +1326,7 @@ impl PoolStreaks {
     /// gated behind the verdict-free backoff floor? Pure read --- the
     /// spawn arm consults it on EVERY tick (including fold-skip
     /// ticks, where deaths noted by the reap still gate immediately).
-    // r[impl ctrl.pool.respawn-backoff+4]
+    // r[impl ctrl.pool.respawn-backoff+5]
     pub fn respawn_blocked(&self, pool: &PoolKey, intent: &str, now: std::time::Instant) -> bool {
         self.respawn
             .get(pool, intent)
@@ -2462,7 +2462,7 @@ mod proptests {
         }
     }
 
-    // r[verify ctrl.pool.respawn-backoff+4]
+    // r[verify ctrl.pool.respawn-backoff+5]
     /// W9-CP (live_056-b): under a persistent wedge (a builder that
     /// dies verdict-free every ORPHAN_REAP_GRACE=300s cycle),
     /// same-name respawn intervals STRICTLY ESCALATE across reap
@@ -2504,7 +2504,7 @@ mod proptests {
         );
     }
 
-    // r[verify ctrl.pool.respawn-backoff+4]
+    // r[verify ctrl.pool.respawn-backoff+5]
     /// W9-CP give-up face (live_056-b): the 8th verdict-free death
     /// crosses RESPAWN_GIVE_UP_DEATHS — the edge fires EXACTLY once,
     /// respawn stays blocked at ANY future instant (no window), and
@@ -2548,7 +2548,7 @@ mod proptests {
         );
     }
 
-    // r[verify ctrl.pool.respawn-backoff+4]
+    // r[verify ctrl.pool.respawn-backoff+5]
     /// W9-CP option-(b) arm (live_056-b joint cap/expiry derivation):
     /// an IN-BACKOFF record under jobless fold-skip silence past
     /// POOL_STREAK_ORPHAN_EXPIRY_SECS is NOT expired — mid-backoff

@@ -2197,7 +2197,7 @@ fn gate_evaluates_all_wanted_not_just_window() {
 /// red (breaker neutered --- strawman, the gate cannot exist pre-fix):
 /// `left: 25 right: 5 --- verdict-free respawns must follow the
 /// exponential backoff schedule, not the reconcile cadence`.
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 #[test]
 fn verdictless_respawn_backs_off_per_intent() {
     use crate::reconcilers::pool::candidate::PoolStreaks;
@@ -2254,7 +2254,7 @@ fn verdictless_respawn_backs_off_per_intent() {
 /// the ack response exactly as the production arm mints it (every
 /// poison-arm ack carries `attempt_resolved=false` by design --- the
 /// ack itself is the premise).
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 #[test]
 fn verdict_resets_respawn_backoff() {
     use crate::reconcilers::pool::candidate::{PoolStreaks, VerdictWitness};
@@ -2334,7 +2334,7 @@ fn verdict_resets_respawn_backoff() {
 /// fold. Recorded red (pre-fix, the absorbing state live):
 /// `left: [] right: ["drv-giveup"] --- a fresh demand epoch must decay
 /// the gave-up latch and spawn within one tick cycle (R30)`.
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 #[test]
 fn fresh_demand_epoch_decays_gave_up_latch() {
     use crate::reconcilers::pool::candidate::PoolStreaks;
@@ -2478,9 +2478,9 @@ fn fresh_demand_epoch_decays_gave_up_latch() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 /// W12-AP (merged_bug_043) — proposition: the gave-up exit edge
-/// fires for EVERY demand-signal orbit, including REWIND; population:
+/// fires for every demand-signal orbit, including REWIND; population:
 /// {unseen, same, newer, REWOUND} — the value domain's actual faces
 /// (the first three pinned by the W11-BE battery above; this is the
 /// rewind face the wave-11 enumeration assumed away).
@@ -2531,7 +2531,7 @@ fn w12_ap_rewound_demand_epoch_decays_gave_up_latch() {
     }
 
     // The operator runs the documented recovery: ClearPoison + the
-    // fresh DAG re-insert present the SAME drv at cycle 0 — the
+    // fresh DAG re-insert present the same drv at cycle 0 — the
     // REWOUND epoch.
     let rewound = SpawnIntent {
         intent_id: "drv-poison".into(),
@@ -2608,7 +2608,7 @@ fn w12_ap_rewound_demand_epoch_decays_gave_up_latch() {
 /// un-blocks it), and decaying there would let resubmit spam bypass
 /// the futility breaker (respawn at tick cadence --- the exact hot
 /// loop the breaker exists to stop). Only the GAVE-UP state decays.
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 #[test]
 fn mid_ladder_resubmission_does_not_shortcut_backoff() {
     use crate::reconcilers::pool::candidate::PoolStreaks;
@@ -3135,7 +3135,7 @@ fn intent_named(id: &str) -> SpawnIntent {
     }
 }
 
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 /// merged_bug_080(2a) red 1 (recorded verbatim in the close commit):
 /// a respawn record MUST survive the Job-alive phase. Paused clock:
 /// verdict-free death at t0 (deaths=1, backoff 10 s); the Job is
@@ -3188,7 +3188,7 @@ fn job_alive_phase_does_not_expire_respawn_record() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 /// merged_bug_080(2a) red 2 (recorded verbatim in the close commit):
 /// same law through the TERMINAL-UNREAPED phase --- a terminal Job
 /// listed for the 600 s JOB_TTL window is the observable artifact of
@@ -3233,7 +3233,7 @@ fn respawn_record_survives_terminal_unreaped_window() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 /// merged_bug_080(2a) census (R15): the record's retention horizon
 /// dominates EVERY cycle phase in which the intent is structurally
 /// un-evaluated --- exhaustively over the closed [`CyclePhase`]
@@ -3355,7 +3355,7 @@ fn deadline_exceeded_job(name: &str, intent_id: &str) -> Job {
     j
 }
 
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 /// merged_bug_080(2b) red 4 (recorded verbatim in the close commit): a
 /// charge-free ack MUST NOT reset a respawn record. The reap steps the
 /// record (verdict-free death — the production noting call), then the
@@ -3409,7 +3409,7 @@ async fn noop_ack_does_not_reset_respawn_record() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 /// merged_bug_080(2b) red 5 (recorded verbatim in the close commit): a
 /// worker-closed death is NOT verdict-free. The terminal reap finds no
 /// OPEN attempt (the attempt already closed — the scheduler holds an
@@ -3495,7 +3495,7 @@ async fn worker_closed_death_is_not_verdict_free() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 /// merged_bug_080(2b) red 6 — the kind axis, differential form: the
 /// recently-closed reset lane must ride the BUILD conjunct. Same
 /// scenario twice, only `attempt_kind` differs: MATERIALIZATION and
@@ -3574,7 +3574,7 @@ async fn materialization_close_does_not_reset_build_record() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 /// merged_bug_036 R1: a close cannot mask the death of a Job created
 /// AFTER it. PROPOSITION CERTIFIED: the chronology conjunct at the
 /// constructor (mint 4b), over production-shaped Jobs (real
@@ -3657,7 +3657,7 @@ async fn pre_creation_close_does_not_cover_a_death() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 /// W9-AT, note_resolution face (bug_122): the windowed-reset
 /// chronology guard is INVARIANT in witness staleness. Fixed physical
 /// config: deaths at now−30s and now−14s (count 2 ⇒ 20s window, so
@@ -3706,7 +3706,7 @@ fn w9_at_note_resolution_retention_invariant_in_staleness() {
     }
 }
 
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 /// merged_bug_036 R2: a close cannot erase deaths recorded AFTER it.
 /// PROPOSITION CERTIFIED: the chronology conjunct at the record — the
 /// reset loop fed an in-window close at age 70s does NOT remove a
@@ -3827,7 +3827,7 @@ async fn erring_token_mint_spawns_nothing_this_tick() {
     }
 }
 
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 /// merged_bug_036 overflow red: a wire `closed_age_secs` near
 /// u64::MAX must saturate, never wrap — a wrapped tiny age INVERTS
 /// both chronology guards (a record that must be retained gets
@@ -3870,7 +3870,7 @@ fn near_max_close_age_saturates_and_retains() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 /// merged_bug_036 R3: the restored envelope — respawn count under
 /// sustained verdict-free fast-crash is LADDER-bounded inside a
 /// renewable close window. PROPOSITION CERTIFIED structurally (spawn
@@ -3922,7 +3922,7 @@ fn fast_crash_generations_meet_the_ladder_inside_a_close_window() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 /// merged_bug_080(2b) red 7 — the green companion to red 4: a
 /// RESOLVING ack (`attempt_resolved=true`) still resets — the breaker
 /// must never tax a real verdict. Both mint polarities at the seam:
@@ -5260,7 +5260,7 @@ fn annotation_round_trip_total_over_capacity_alphabet() {
         .unwrap();
 }
 
-// r[verify ctrl.pool.respawn-backoff+4]
+// r[verify ctrl.pool.respawn-backoff+5]
 /// **W10-AR (round-10 bug_078, the breaker discriminator at its own
 /// quantifier).** k CLEAN exits step NOTHING (a verdict-free terminal
 /// reap whose Job COMPLETED is the worker's lawful exit — the typed

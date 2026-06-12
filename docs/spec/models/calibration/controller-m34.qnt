@@ -39,7 +39,9 @@ module m34CalibLatchClearOnAttempt {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).* from "../nodeclaimLifecycle"
 
   /// The as-built full tick with TWO coupled changes that are one pre-fix
@@ -281,7 +283,9 @@ module m34CalibNoRecencyGate {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).* from "../nodeclaimLifecycle"
 
   /// PRE-FIX observe_registered: every unrecorded Registered claim emits

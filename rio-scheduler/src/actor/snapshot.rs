@@ -2205,7 +2205,7 @@ impl AckApplyPlan {
         //
         // bug_124 (`ctrl.pool.echo-provenance` — the cross-crate echo
         // region): the Armed arm below OVERWRITES `dispatched_cells`
-        // on EVERY re-ack, and the first pull clears the ICE ladder
+        // on every re-ack, and the first pull clears the ICE ladder
         // under an exactly-one-cell proof premised on the pod's
         // SPAWN-TIME affinity (actor/pull.rs `clear_ice`) — so the
         // controller's re-ack lanes echo the spawn-time

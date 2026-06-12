@@ -41,7 +41,9 @@ module m1CalibAcquireClearOkOnly {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).* from "../nodeclaimLifecycle"
 
   /// The as-built full tick with ONE change: the reload-latch processing
@@ -297,7 +299,9 @@ module m1CalibReapBusyGuardProbe {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).* from "../nodeclaimLifecycle"
 
   /// The as-built full tick with ONE change: reap_idle no longer requires

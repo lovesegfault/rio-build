@@ -1819,7 +1819,7 @@ impl NodeClaimPoolReconciler {
         // provenance for the vanish fold (stamped at the consumer's
         // own fold clock — a fresh stamp cannot expire before its
         // first consult by construction, R29; and per merged_bug_050
-        // the SAME tick's fold below cannot consume it — its LIST
+        // the same tick's fold below cannot consume it — its LIST
         // pre-dates these stamps, the R29′ freshness gate).
         for seed in delete_attempted {
             self.delete_tombstones.stamp(seed);

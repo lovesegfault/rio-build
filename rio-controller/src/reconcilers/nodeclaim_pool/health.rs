@@ -1517,7 +1517,7 @@ mod tests {
     ///
     /// The merged_bug_050 trace: an in-flight tracked claim is
     /// ambiguous-reaped (non-404 error; the delete may have
-    /// committed) and the SAME tick's fold consults a LIST fetched
+    /// committed) and the same tick's fold consults a LIST fetched
     /// BEFORE the delete — which still shows the claim alive and
     /// REGISTERED (registration raced the reap). Pre-fix the
     /// RegisteredHandoff exit CONSUMED the tombstone on that

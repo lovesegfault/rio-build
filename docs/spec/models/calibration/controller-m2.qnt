@@ -40,7 +40,9 @@ module m2CalibNoConsolidatePrune {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).* from "../nodeclaimLifecycle"
 
   /// The as-built consolidate-only tick with the inflight_created prune
@@ -190,7 +192,9 @@ module m2CalibInflightDropOnSight {
     ENABLE_DEFER_MACHINERY = false,
     ENABLE_DEFER_DEMAND = false,
     ENABLE_TOMBSTONE_MACHINERY = false,
-    ENABLE_FOLD_CLOCK = false
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
   ).* from "../nodeclaimLifecycle"
 
   /// The structural conservation property the KEEP arm protects. Scoped

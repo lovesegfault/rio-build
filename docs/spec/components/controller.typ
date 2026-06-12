@@ -603,7 +603,7 @@ band-boundary witnesses, stated here so the disposition is explicit.
   window, destroying by spawning what the retain law preserved.
 ]
 
-#r("ctrl.pool.respawn-backoff+4")[
+#r("ctrl.pool.respawn-backoff+5")[
   A pool MUST NOT respawn an intent whose previous Job died without
   the scheduler holding a verdict for an attempt of that intent,
   except behind the exponential backoff floor (base = reconcile
@@ -620,7 +620,7 @@ band-boundary witnesses, stated here so the disposition is explicit.
   in the tick's listing refreshes it; the orphan expiry applies only
   to jobless silence. A record at or past the give-up threshold MUST
   decay on a fresh demand epoch, keyed on epoch CHANGE, never order: a
-  wanted intent presenting ANY resubmit cycle different from the one
+  wanted intent presenting a resubmit cycle different from the one
   the record last observed --- newer or REWOUND --- decays the record
   the same tick under an evidence-carrying reset whose evidence is the
   demand epoch, not a pod (the gave-up state forbids pods, so a
@@ -2057,8 +2057,8 @@ per-exit property --- only the packet-firing exit consumes, every
 other exit hands the obligation to the registered-population sweep,
 and consumption is freshness-gated on the fold clock (a stamp is
 consumable only by a fold whose LIST post-dates it). The wave-11
-vanish_class census froze classification totality; the typed
-disposition closes per-exit discharge --- the axis the seal never
+vanish_class census froze the classification alphabet; the typed
+disposition closes per-exit discharge --- the axis that seal never
 enumerated.
 
 #r("ctrl.pool.fold-clock")[

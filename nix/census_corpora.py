@@ -731,15 +731,17 @@ EXIT_EDGE_ROWS = {
         "per-tick re-arm: tick_started re-stamps at every interval tick, so the retry window cannot absorb across ticks (the cadence loop is the reset event)",
         "W12-F policy cells + heartbeat_task_beats_on_its_own_cadence (beats keep landing) + the never-displace compile assert (the next tick exists)",
     ),
-    # The gave-up decay (WO-S7-1, the H7''' record): GaveUpReset
-    # receipt minted only by PoolStreaks::note_demand_epoch; exit
-    # edge = strictly-newer SpawnIntent.resubmit_cycle at the
-    # spawn-fold demand seam (evaluate_spawn_gate;
-    # SpawnGateOutcome.decayed; Event RespawnGiveUpReset); re-latch
-    # at full budget.
-    ("rio-controller/src/reconcilers/pool/candidate.rs", "retain-latch", "L1020"): (
-        "demand-epoch decay: a strictly-newer resubmit_cycle mints GaveUpReset (pod-free — reachable from inside the latch)",
-        "W11-BE red + quint-respawn-giveup single-leaf + the decay-reachable witness + the relatch run (S7 c1)",
+    # The gave-up decay (WO-S7-1, the H7''' record; re-keyed by
+    # round-12 merged_bug_043): GaveUpReset receipt minted only by
+    # PoolStreaks::note_demand_epoch; exit edge = a CHANGED
+    # SpawnIntent.resubmit_cycle (newer or REWOUND — ClearPoison
+    # lawfully zeroes it) at the spawn-fold demand seam
+    # (evaluate_spawn_gate; SpawnGateOutcome.decayed; Event
+    # RespawnGiveUpReset); equality alone latches (anti-replay);
+    # re-latch at full budget.
+    ("rio-controller/src/reconcilers/pool/candidate.rs", "retain-latch", "L1022"): (
+        "demand-epoch decay: a changed resubmit_cycle (newer or rewound) mints GaveUpReset (pod-free — reachable from inside the latch)",
+        "W11-BE red + W12-AP rewind red + quint-respawn-giveup single-leaf (orbit space incl. rewinds) + the decay-reachable witness + the relatch/rewind runs (S7 c1; bw12-s6 c5)",
     ),
     # The outbox reset edge (WO-S5-3, the H5''' record): the
     # guarded DO UPDATE resets attempts/enqueued_at on re-decision

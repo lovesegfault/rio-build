@@ -2726,7 +2726,7 @@ pub(crate) mod tests {
 
         // The starvation property at the window (the angle's
         // verbatim shape): the zero-mint mixed head is classified
-        // out and the mintable sibling is admitted THE SAME TICK —
+        // out and the mintable sibling is admitted the same tick —
         // both rotation phases.
         let sib = intent("s0", 4, GI, &[("lo", CapacityType::Spot)]);
         for tick in 0..2 {

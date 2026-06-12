@@ -214,7 +214,7 @@ pub fn decide(
                 }
             } else {
                 // Non-evidence tick: RESET (the cap died — a reset
-                // can never bank credit toward the regime boundary).
+                // banks nothing toward the regime boundary).
                 (predicted, ratio_in, 0)
             }
         }
