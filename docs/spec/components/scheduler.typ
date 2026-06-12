@@ -4930,22 +4930,40 @@ fully-hostable unpinned chains only).
   `inputs_gen`.
 ]
 
-#r("sched.sla.ack-validate-then-commit+1")[
-  `AckSpawnedIntents` application MUST be validate-then-commit: every refusal
-  --- undecodable plane entry, length-skewed arming echo --- MUST be computed
-  before the first state mutation, so an erring Ack implies that NO plane
-  landed; undecodable plane entries MUST be typed refusals naming the plane
-  and the offending entry, never silent drops.
+#r("sched.sla.ack-validate-then-commit+2")[
+  `AckSpawnedIntents` application MUST be validate-then-commit at PER-PLANE
+  granularity: every refusal --- undecodable plane entry, length-skewed
+  arming echo --- MUST be computed before the first state mutation; a
+  refused plane MUST withhold ALL of its own evidence (the plane is the
+  refusal unit --- the spawned plane's arm decodes and its spawn-ack
+  witnesses withhold together) while sibling planes apply, so one poisoned
+  durable row cannot black out any other plane's evidence; the reply MUST
+  disclose every refused plane as a typed refusal naming the plane and its
+  first offending entry, never a silent drop, and an erring reply that
+  names refused planes implies that every plane not named LANDED (the
+  deposed-drain refusal remains whole-request: nothing landed). A plane
+  whose apply is not idempotent under whole-buffer redelivery MUST NOT take
+  the per-plane arm --- it refuses whole-with-disclosure or stays out of
+  the redelivery loop: cell-event planes ride the per-cell evidence-epoch
+  gate, observed types upsert, binding snapshots rebuild wholesale, and the
+  verdict plane is level-triggered (minted fresh per cover pass, dropped on
+  Ack-Err, never redelivered from the retained buffer); a refused verdict
+  plane is a non-event for the pass ordinal.
 ]
 
 The commit half is infallible by signature (the validated plan carries only
-decoded cells, hashes, and rows --- no raw wire type crosses into it), so an
-error return after a sibling plane mutated is unrepresentable. Whole-request
-refusal is safe producer-side for the surviving classes: the controller's
+decoded cells, hashes, and rows --- no raw wire type crosses into it; a
+refused plane's slot is empty by construction), so partial application is
+exactly the disclosed refusal list, never an undisclosed half-apply.
+Per-plane refusal is safe producer-side: the controller's
 commit-on-Ack buffer is retained on Ack-Err
 (#rref("ctrl.nodeclaim.evidence-ack-latch")) and buffered marks keep masking
 `cover_deficit` locally until acked, so refusing loses no protection --- the
-refusal is a loud skew signal where a drop was silent evidence destruction.
+refusal is a loud skew signal where a drop was silent evidence destruction,
+and redelivered landed planes no-op through their own idempotency laws. The
+pre-round-11 whole-request form let one undecodable durable row (a Job
+annotation re-derived every tick) starve every sibling evidence plane in
+its request for the row's life --- the bug_142 wedge this rule now closes.
 The closed-cost-gate refusal class is retired: the gate existed solely to
 keep observed-type writes off the pre-reload table, and `carry_catalog`'s
 menu merge made that window lossless, so consume-once evidence is never

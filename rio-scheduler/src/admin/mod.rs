@@ -787,12 +787,18 @@ impl AdminService for AdminServiceImpl {
     /// merged_bug_005 — ack means APPLIED UNDER LEADERSHIP, never
     /// enqueued: the reply oneshot answers after the actor's
     /// leader-gated apply, so "OK" here proves every evidence plane
-    /// landed. bug_094 — and the apply is validate-then-commit, so
-    /// every error here proves NO plane landed: a deposed drain
-    /// (`NotLeader`) or an undecodable plane entry
-    /// (`PlaneEntryUndecodable` — pre-fix a silent drop) errs the RPC
-    /// with nothing applied, and the controller's commit-on-Ack
-    /// buffer is retained and redelivered whole. Pre-fix the handler
+    /// landed. bug_094 + bug_142 — the apply is validate-then-commit
+    /// at PER-PLANE granularity: `NotLeader` proves NO plane landed
+    /// (the payload was dropped whole — deposed drain), while
+    /// `PlanesRefused` names each refused plane with its first
+    /// offending entry AND proves every plane it does not name
+    /// LANDED (the pre-bug_142 "every error proves no plane landed"
+    /// contract let one durable poisoned annotation row black out
+    /// every sibling evidence plane for the row's life). Either way
+    /// the controller's commit-on-Ack buffer is retained and
+    /// redelivered whole — landed planes no-op on re-application
+    /// (evidence-epoch gate / upsert / wholesale rebuild). Pre-fix
+    /// the handler
     /// answered OK on `send_unchecked` enqueue and the actor silently
     /// dropped the payload when deposed — the controller then wiped
     /// consume-once evidence that was never applied. `send_unchecked`
@@ -834,27 +840,60 @@ impl AdminService for AdminServiceImpl {
             })
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        // bug_142: leaf refusals describe ONE plane's refusal (they
+        // reach the wire only inside `PlanesRefused`); the aggregate
+        // arm joins them and states the per-plane contract — every
+        // plane not named landed.
+        fn leaf_refusal(e: &crate::actor::AckApplyError) -> String {
+            match e {
+                crate::actor::AckApplyError::PlaneEntryUndecodable { plane, entry } => {
+                    format!(
+                        "undecodable {} entry {entry:?} (the producer is emitting \
+                         outside the shared cell-wire grammar)",
+                        plane.wire_field(),
+                    )
+                }
+                crate::actor::AckApplyError::ArmEchoSkewed {
+                    intent_id,
+                    names,
+                    terms,
+                } => format!(
+                    "spawn-intent {intent_id} echo is length-skewed \
+                     (hw_class_names={names}, node_affinity={terms}; refused \
+                     instead of zip-truncating the armed cell set)",
+                ),
+                // Non-leaf variants never nest (PlanesRefused is
+                // constructed with leaf members only; NotLeader is
+                // the whole-request lane) — render defensively.
+                other => format!("{other:?}"),
+            }
+        }
         applied.map_err(|e| match e {
             crate::actor::AckApplyError::NotLeader => Status::failed_precondition(
                 "not leader — evidence not applied; retry against the current leader",
             ),
-            crate::actor::AckApplyError::PlaneEntryUndecodable { plane, entry } => {
+            crate::actor::AckApplyError::PlanesRefused { refused } => {
                 Status::invalid_argument(format!(
-                    "undecodable {} entry {entry:?} — no evidence plane applied; \
-                     the producer is emitting outside the shared cell-wire grammar",
-                    plane.wire_field(),
+                    "refused {} evidence plane(s): [{}] — every plane not named \
+                     here APPLIED; refused planes withheld all their evidence \
+                     (bug_142 per-plane granularity; redeliver and the landed \
+                     planes no-op)",
+                    refused.len(),
+                    refused
+                        .iter()
+                        .map(leaf_refusal)
+                        .collect::<Vec<_>>()
+                        .join("; "),
                 ))
             }
-            crate::actor::AckApplyError::ArmEchoSkewed {
-                intent_id,
-                names,
-                terms,
-            } => Status::invalid_argument(format!(
-                "spawn-intent {intent_id} echo is length-skewed \
-                 (hw_class_names={names}, node_affinity={terms}) — no evidence \
-                 plane applied; refusing instead of zip-truncating the armed \
-                 cell set",
-            )),
+            // Leaf variants top-level: unreachable by construction
+            // (the actor wraps every plane refusal in PlanesRefused);
+            // kept total so a future construction change surfaces
+            // here as a visible message, never a panic.
+            ref leaf @ (crate::actor::AckApplyError::PlaneEntryUndecodable { .. }
+            | crate::actor::AckApplyError::ArmEchoSkewed { .. }) => {
+                Status::invalid_argument(leaf_refusal(leaf))
+            }
         })?;
         Ok(Response::new(()))
     }

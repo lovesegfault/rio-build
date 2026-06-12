@@ -471,6 +471,7 @@ async fn contract_ice_step_doubles_then_clears_on_registered() {
                 None,
                 &[],
             )
+            .1
             .expect("applied under leadership");
     }
     assert_eq!(
@@ -495,6 +496,7 @@ async fn contract_ice_step_doubles_then_clears_on_registered() {
 
     actor
         .handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()], &[], &[], None, &[])
+        .1
         .expect("applied under leadership");
     assert_eq!(
         actor.ice.step(&cell),
@@ -550,6 +552,7 @@ async fn ack_observed_instance_types_folds_into_cost_table() {
             None,
             &[],
         )
+        .1
         .expect("applied under leadership");
 
     let ct = actor.cost_table.read();
@@ -604,7 +607,7 @@ async fn ack_unknown_class_grows_nothing() {
             None,
             &[],
         )
-        .expect("membership skew is per-entry, never a whole-request refusal");
+        .1.expect("membership skew is per-entry, never a whole-request refusal");
 
     let ct = actor.cost_table.read();
     assert!(
@@ -664,6 +667,7 @@ async fn ack_bound_intents_populates_authoritative_binding() {
             None,
             &[],
         )
+        .1
         .expect("applied under leadership");
 
     assert_eq!(
@@ -697,6 +701,7 @@ async fn ack_bound_intents_populates_authoritative_binding() {
             None,
             &[],
         )
+        .1
         .expect("applied under leadership");
     assert_eq!(actor.authoritative_binding.len(), 1);
     assert!(!actor.authoritative_binding.contains_key(&def));
@@ -707,6 +712,7 @@ async fn ack_bound_intents_populates_authoritative_binding() {
     // nodeclaim_pool reconciler owns the stream) → map unchanged.
     actor
         .handle_ack_spawned_intents(&[], &[], &[], &[], &[], None, &[])
+        .1
         .expect("applied under leadership");
     assert_eq!(
         actor.authoritative_binding.len(),
@@ -747,6 +753,7 @@ async fn ack_binding_snapshot_presence_semantics() {
             Some(&[bi("abc285", "node-1")]),
             &[],
         )
+        .1
         .expect("applied under leadership");
     assert_eq!(actor.authoritative_binding.len(), 1);
     assert!(actor.authoritative_binding.contains_key(&abc));
@@ -754,6 +761,7 @@ async fn ack_binding_snapshot_presence_semantics() {
     // None leaves the map untouched (per-pool Ack shape).
     actor
         .handle_ack_spawned_intents(&[], &[], &[], &[], &[], None, &[])
+        .1
         .expect("applied under leadership");
     assert_eq!(
         actor.authoritative_binding.len(),
@@ -764,6 +772,7 @@ async fn ack_binding_snapshot_presence_semantics() {
     // Some(EMPTY) clears — scale-to-zero says so explicitly.
     actor
         .handle_ack_spawned_intents(&[], &[], &[], &[], &[], Some(&[]), &[])
+        .1
         .expect("applied under leadership");
     assert!(
         actor.authoritative_binding.is_empty(),
@@ -820,6 +829,7 @@ async fn ack_observed_lands_pre_reload_and_survives_the_edge_reload() {
             None,
             &[],
         )
+        .1
         .expect("pre-reload Ack applies every plane (the gate is gone)");
     assert_eq!(
         actor.cost_table.read().menu(&spot).len(),
@@ -855,19 +865,20 @@ async fn ack_observed_lands_pre_reload_and_survives_the_edge_reload() {
     assert_eq!(ct.menu(&spot)[0].name, "c7i.8xlarge");
 }
 
-/// bug_094 red: an undecodable entry in ANY plane refuses the WHOLE
-/// request before any mutation. Pre-fix all three string planes
-/// folded unparseable entries into success (`if let Some(cell) =
-/// parse_cell(s)` with no else arm; `filter_map(... parse_cell ?)`)
-/// and the fn returned `Ok(())` against its own "Ok only when EVERY
-/// plane landed" contract — on Ack-Ok the controller destroys its
-/// consume-once buffer ("the ONLY clear"), so the dropped entry was
-/// unrecoverable. `left: Ok(()) ∧ clear applied ∧ mark silently gone`
-/// / `right: Err(PlaneEntryUndecodable{UnfulfillableCells, ..}) ∧ ice
-/// state byte-identical (zero mutations)`.
-// r[verify sched.sla.ack-validate-then-commit+1]
+/// bug_094 red, re-scoped by bug_142 to PER-PLANE: an undecodable
+/// entry refuses ITS plane before any of that plane's state mutates
+/// — typed, naming plane and entry, never a silent drop (the bug_094
+/// half: pre-fix all three string planes folded unparseable entries
+/// into success and the controller destroyed its consume-once buffer
+/// on the lying Ack-Ok) — while SIBLING planes apply (the bug_142
+/// half: the pre-bug_142 whole-request refusal let one poisoned
+/// durable row black out every evidence plane for its life). Here
+/// the bogus MARK entry refuses the unfulfillable plane (the mark
+/// evidence withholds, retained controller-side for redelivery)
+/// while the valid CLEAR in the same request lands.
+// r[verify sched.sla.ack-validate-then-commit+2]
 #[tokio::test]
-async fn ack_undecodable_plane_entry_refuses_whole_request() {
+async fn ack_undecodable_plane_entry_refuses_its_plane_siblings_apply() {
     use crate::sla::config::CapacityType;
     let db = TestDb::new(&MIGRATOR).await;
     crate::actor::tests::seed_default_tenant(&db.pool).await;
@@ -897,20 +908,25 @@ async fn ack_undecodable_plane_entry_refuses_whole_request() {
         &[],
     );
     assert_eq!(
-        r,
-        Err(crate::actor::AckApplyError::PlaneEntryUndecodable {
-            plane: crate::actor::AckPlane::UnfulfillableCells,
-            entry: bogus,
+        r.1,
+        Err(crate::actor::AckApplyError::PlanesRefused {
+            refused: vec![crate::actor::AckApplyError::PlaneEntryUndecodable {
+                plane: crate::actor::AckPlane::UnfulfillableCells,
+                entry: bogus,
+            }],
         }),
         "undecodable plane entry must be a typed refusal naming plane + entry"
     );
     assert_eq!(
         actor.ice.step(&cell),
-        Some(0),
-        "zero mutations: the valid clear in the refused request must \
-         NOT have applied (err implies no plane landed)"
+        None,
+        "per-plane granularity (bug_142): the valid clear in the \
+         sibling plane APPLIES while the mark plane refuses"
     );
-    assert!(actor.ice.is_masked(&cell), "ice state byte-identical");
+    assert!(
+        !actor.ice.is_masked(&cell),
+        "the clear landed; only the refused plane withheld"
+    );
 }
 
 /// merged_bug_134 red: a length-skewed spawn-intent echo is REFUSED,
@@ -929,7 +945,7 @@ async fn ack_undecodable_plane_entry_refuses_whole_request() {
 /// paired-by-construction producer) with one `node_affinity` term
 /// dropped — the controller-side one-array-filter shape; no
 /// hand-rolled parallel arrays.
-// r[verify sched.sla.ack-validate-then-commit+1]
+// r[verify sched.sla.ack-validate-then-commit+2]
 #[tokio::test]
 async fn ack_skewed_arm_echo_refused_not_truncated() {
     use crate::sla::config::CapacityType;
@@ -963,17 +979,251 @@ async fn ack_skewed_arm_echo_refused_not_truncated() {
         &[],
     );
     assert_eq!(
-        r,
-        Err(crate::actor::AckApplyError::ArmEchoSkewed {
-            intent_id: "d-skew".into(),
-            names: 2,
-            terms: 1,
+        r.1,
+        Err(crate::actor::AckApplyError::PlanesRefused {
+            refused: vec![crate::actor::AckApplyError::ArmEchoSkewed {
+                intent_id: "d-skew".into(),
+                names: 2,
+                terms: 1,
+            }],
         }),
-        "skewed echo must refuse, not truncate"
+        "skewed echo must refuse its plane, not truncate"
     );
     assert!(
         actor.dispatched_cells.get("d-skew").is_none(),
         "dispatched_cells untouched — no forged single-cell arm"
+    );
+}
+
+/// **W11-BF (bug_142, R30 + OQ-15): refusal granularity is PER-PLANE
+/// — no single durable annotation can block any OTHER plane's
+/// evidence.** A poisoned spawned echo (out-of-alphabet capacity —
+/// the annotation rollback-skew shape an old controller re-derives
+/// every tick) rides one request with a valid epoched ICE clear, a
+/// valid observed type, and a binding snapshot. Pre-fix the WHOLE
+/// request refused: the clear never applied, the redelivery loop
+/// wedged every evidence plane for the poisoned row's life. Post-fix:
+/// the SPAWNED plane refuses disclosed (no arm, no spawn-ack witness)
+/// while every sibling plane applies, and the refusal still answers
+/// Err so the controller's buffered planes retain + redeliver — the
+/// redelivery converging through each plane's own idempotency law
+/// (epoch gate for cell events; upsert for observed types; wholesale
+/// rebuild for the snapshot).
+///
+/// REDELIVERY cell: apply→refuse→redeliver→apply ×2 converges to the
+/// SAME observable state as a single clean apply of the valid planes
+/// (ice step, cost menu, binding, dispatched_cells) — state EQUALITY,
+/// not just non-blocking. The verdict plane is asserted OUT of the
+/// redelivery loop (level-triggered controller-side: rejected ships
+/// fresh per tick, never from the retained buffer — the retention
+/// census at nodeclaim_pool::report_unfulfillable), so its
+/// non-idempotent fold stays single-shot per pass: the no-host
+/// counter steps exactly once for the one delivered pass.
+///
+/// Pre-fix red (whole-request refusal — the wedge):
+///   panicked at 'sibling planes must apply when the spawned plane
+///   refuses (per-plane granularity, bug_142): clear starved across 3
+///   redeliveries; ice step Some(0)'
+///
+/// r13-allow(refusal-probe): the junk capacity is the skew shape
+/// under test, spliced into a production `cells_to_selector_terms`
+/// echo.
+// r[verify sched.sla.ack-validate-then-commit+2]
+#[tokio::test]
+async fn w11_bf_poisoned_plane_refuses_alone_siblings_apply() {
+    use crate::sla::config::CapacityType;
+    use rio_proto::types::{ObservedInstanceType, SpawnIntent};
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+
+    // A masked cell whose valid clear rides every delivery.
+    let cell: crate::sla::config::Cell = ("intel-6".into(), CapacityType::Spot);
+    actor.ice.mark(&cell);
+    assert_eq!(actor.ice.step(&cell), Some(0), "precondition: masked");
+
+    // The poisoned spawned echo: a production-shaped term whose
+    // capacity value left the alphabet (the annotation skew).
+    let cfg = test_hw_sla_config();
+    let cells: Vec<crate::sla::config::Cell> = vec![("intel-6".into(), CapacityType::Spot)];
+    let (mut terms, names) = crate::sla::solve::cells_to_selector_terms(&cells, &cfg.hw_classes);
+    for req in &mut terms[0].match_expressions {
+        if req.key == crate::sla::config::LABEL_CAPACITY_TYPE {
+            req.values = vec!["metal".into()];
+        }
+    }
+    let poisoned = SpawnIntent {
+        intent_id: "d-poison".into(),
+        hw_class_names: names,
+        node_affinity: terms,
+        ..Default::default()
+    };
+
+    // The valid sibling planes, identical across deliveries (the
+    // controller's BUFFERED class redelivers byte-identical epoched
+    // events; binding is level-triggered but identical here).
+    let clear = rio_common::cell_wire::encode_cell_event(
+        "intel-6",
+        rio_common::cell_wire::WireCapacity::Spot,
+        Some(rio_common::cell_wire::EvidenceEpoch(7)),
+    );
+    let observed = vec![ObservedInstanceType {
+        cell: "intel-6:spot".into(),
+        instance_type: "c7i.8xlarge".into(),
+        cores: 32,
+        mem_bytes: 64 << 30,
+    }];
+    let bound = vec![rio_proto::types::BoundIntent {
+        intent_id: "d-bound".into(),
+        node_name: "node-a".into(),
+        deadline_secs: 90,
+    }];
+
+    // apply → refuse → redeliver → apply ×2 (the poisoned row is
+    // durable: an old controller re-derives it every tick).
+    for _ in 0..3 {
+        let _ = actor.handle_ack_spawned_intents(
+            std::slice::from_ref(&poisoned),
+            &[],
+            std::slice::from_ref(&clear),
+            &observed,
+            &[],
+            Some(&bound),
+            &[],
+        );
+    }
+
+    assert_eq!(
+        actor.ice.step(&cell),
+        None,
+        "sibling planes must apply when the spawned plane refuses \
+         (per-plane granularity, bug_142): clear starved across 3 \
+         redeliveries; ice step {:?}",
+        actor.ice.step(&cell)
+    );
+    assert_eq!(
+        actor.cost_table.read().menu(&cell).len(),
+        1,
+        "observed-types plane applied (upsert: ×3 redelivery folds to one menu row)"
+    );
+    assert!(
+        actor
+            .authoritative_binding
+            .contains_key(&DrvHash::from("d-bound")),
+        "binding snapshot applied (wholesale rebuild is redelivery-idempotent)"
+    );
+    assert!(
+        actor.dispatched_cells.get("d-poison").is_none(),
+        "the poisoned plane itself did NOT apply: no arm minted from the junk echo"
+    );
+    assert!(
+        !actor.acked_spawned.contains_key(&DrvHash::from("d-poison")),
+        "no spawn-ack witness from the refused plane (the plane is the unit)"
+    );
+}
+
+/// **W11-BF state-equality cell:** the triple-delivery subject from
+/// the poisoned loop converges to the SAME observable state as one
+/// clean apply of the valid planes on a fresh actor — asserted on the
+/// named observables (ice step, cost menu, binding, dispatched_cells,
+/// no-host counters), with the verdict plane delivered exactly once
+/// on BOTH sides (level-triggered: never in the retained buffer).
+// r[verify sched.sla.ack-validate-then-commit+2]
+#[tokio::test]
+async fn w11_bf_redelivery_converges_to_single_apply_state() {
+    use crate::sla::config::CapacityType;
+    use rio_proto::types::{IntentVerdict, SpawnIntent};
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+
+    let cell: crate::sla::config::Cell = ("intel-6".into(), CapacityType::Spot);
+    let clear = rio_common::cell_wire::encode_cell_event(
+        "intel-6",
+        rio_common::cell_wire::WireCapacity::Spot,
+        Some(rio_common::cell_wire::EvidenceEpoch(11)),
+    );
+    let verdict = vec![IntentVerdict {
+        intent_id: "d-nohost".into(),
+        reason: rio_proto::types::IntentVerdictReason::NoHostingClass.into(),
+        detail: "no class hosts 96 cores".into(),
+    }];
+    let cfg = test_hw_sla_config();
+    let cells_v: Vec<crate::sla::config::Cell> = vec![("intel-6".into(), CapacityType::Spot)];
+    let (mut terms, names) = crate::sla::solve::cells_to_selector_terms(&cells_v, &cfg.hw_classes);
+    for req in &mut terms[0].match_expressions {
+        if req.key == crate::sla::config::LABEL_CAPACITY_TYPE {
+            req.values = vec!["metal".into()];
+        }
+    }
+    let poisoned = SpawnIntent {
+        intent_id: "d-poison".into(),
+        hw_class_names: names,
+        node_affinity: terms,
+        ..Default::default()
+    };
+
+    // Subject: pass 1 carries the verdict plane (fresh mint) + the
+    // poisoned spawned row; redeliveries 2-3 carry the BUFFERED
+    // planes + the re-derived poisoned row, verdicts EMPTY (the
+    // level-triggered class is dropped on Ack-Err and re-derived —
+    // here the next pass minted none).
+    let mut subject = bare_actor_hw(db.pool.clone());
+    subject.ice.mark(&cell);
+    let _ = subject.handle_ack_spawned_intents(
+        std::slice::from_ref(&poisoned),
+        &[],
+        std::slice::from_ref(&clear),
+        &[],
+        &[],
+        None,
+        &verdict,
+    );
+    for _ in 0..2 {
+        let _ = subject.handle_ack_spawned_intents(
+            std::slice::from_ref(&poisoned),
+            &[],
+            std::slice::from_ref(&clear),
+            &[],
+            &[],
+            None,
+            &[],
+        );
+    }
+
+    // Baseline: ONE clean apply of the valid planes only.
+    let mut baseline = bare_actor_hw(db.pool.clone());
+    baseline.ice.mark(&cell);
+    let _ = baseline.handle_ack_spawned_intents(
+        &[],
+        &[],
+        std::slice::from_ref(&clear),
+        &[],
+        &[],
+        None,
+        &verdict,
+    );
+
+    assert_eq!(
+        subject.ice.step(&cell),
+        baseline.ice.step(&cell),
+        "ice state equal: epoch gate makes clear redelivery a total no-op"
+    );
+    assert_eq!(
+        subject.dispatched_cells.get("d-poison").is_none(),
+        baseline.dispatched_cells.get("d-poison").is_none(),
+        "no arm on either side (refused vs never sent)"
+    );
+    assert_eq!(
+        subject
+            .supply_reval
+            .no_host_verdicts
+            .get(&DrvHash::from("d-nohost")),
+        baseline
+            .supply_reval
+            .no_host_verdicts
+            .get(&DrvHash::from("d-nohost")),
+        "verdict counters stepped exactly once: the non-idempotent \
+         plane stays out of the redelivery loop (level-triggered)"
     );
 }
 
@@ -992,7 +1242,7 @@ async fn ack_skewed_arm_echo_refused_not_truncated() {
 /// duplicated term is the attack/skew shape under test — built by
 /// extending a production `cells_to_selector_terms` echo with the
 /// label copy the colliding config would inject.
-// r[verify sched.sla.ack-validate-then-commit+1]
+// r[verify sched.sla.ack-validate-then-commit+2]
 #[tokio::test]
 async fn arm_decode_refuses_the_label_copy_of_the_capacity_key() {
     use crate::sla::config::CapacityType;
@@ -1032,11 +1282,15 @@ async fn arm_decode_refuses_the_label_copy_of_the_capacity_key() {
     );
     assert!(
         matches!(
-            &r,
-            Err(crate::actor::AckApplyError::PlaneEntryUndecodable {
-                plane: crate::actor::AckPlane::SpawnedArming,
-                ..
-            })
+            &r.1,
+            Err(crate::actor::AckApplyError::PlanesRefused { refused })
+                if matches!(
+                    refused.as_slice(),
+                    [crate::actor::AckApplyError::PlaneEntryUndecodable {
+                        plane: crate::actor::AckPlane::SpawnedArming,
+                        ..
+                    }]
+                )
         ),
         "two capacity requirements in one term must refuse typed, not \
          decode the first match order-sensitively; got {r:?}"
@@ -1051,7 +1305,7 @@ async fn arm_decode_refuses_the_label_copy_of_the_capacity_key() {
 /// the COMPLEMENT of a cell; the pre-fix peek decoded it to its
 /// inverse. Pre-fix: `Ok — armed (intel-6, Spot)`; post-fix: typed
 /// refusal. r13-allow(refusal-probe): non-producer operator shape.
-// r[verify sched.sla.ack-validate-then-commit+1]
+// r[verify sched.sla.ack-validate-then-commit+2]
 #[tokio::test]
 async fn arm_decode_refuses_notin_operator() {
     use crate::sla::config::CapacityType;
@@ -1087,11 +1341,15 @@ async fn arm_decode_refuses_notin_operator() {
     );
     assert!(
         matches!(
-            &r,
-            Err(crate::actor::AckApplyError::PlaneEntryUndecodable {
-                plane: crate::actor::AckPlane::SpawnedArming,
-                ..
-            })
+            &r.1,
+            Err(crate::actor::AckApplyError::PlanesRefused { refused })
+                if matches!(
+                    refused.as_slice(),
+                    [crate::actor::AckApplyError::PlaneEntryUndecodable {
+                        plane: crate::actor::AckPlane::SpawnedArming,
+                        ..
+                    }]
+                )
         ),
         "NotIn must refuse (pre-fix: decoded to the set's own cell — its \
          inverse); got {r:?}"
@@ -1104,7 +1362,7 @@ async fn arm_decode_refuses_notin_operator() {
 /// Pre-fix: `Ok — armed (intel-6, Spot)` (silent truncation of the
 /// cell set); post-fix: typed refusal. r13-allow(refusal-probe):
 /// non-producer arity shape.
-// r[verify sched.sla.ack-validate-then-commit+1]
+// r[verify sched.sla.ack-validate-then-commit+2]
 #[tokio::test]
 async fn arm_decode_refuses_multivalue_capacity() {
     use crate::sla::config::CapacityType;
@@ -1141,11 +1399,15 @@ async fn arm_decode_refuses_multivalue_capacity() {
     );
     assert!(
         matches!(
-            &r,
-            Err(crate::actor::AckApplyError::PlaneEntryUndecodable {
-                plane: crate::actor::AckPlane::SpawnedArming,
-                ..
-            })
+            &r.1,
+            Err(crate::actor::AckApplyError::PlanesRefused { refused })
+                if matches!(
+                    refused.as_slice(),
+                    [crate::actor::AckApplyError::PlaneEntryUndecodable {
+                        plane: crate::actor::AckPlane::SpawnedArming,
+                        ..
+                    }]
+                )
         ),
         "a multi-valued capacity requirement names {{spot, od}} — not one \
          cell; the peek silently truncated to values[0]; got {r:?}"
@@ -1159,7 +1421,7 @@ async fn arm_decode_refuses_multivalue_capacity() {
 /// sets, driven through the full apply path (R13: the producer fn IS
 /// the production constructor for echo shapes; the out-of-plane
 /// producer is imported READ-ONLY).
-// r[verify sched.sla.ack-validate-then-commit+1]
+// r[verify sched.sla.ack-validate-then-commit+2]
 #[tokio::test]
 async fn producer_echo_roundtrips_through_arm_decode() {
     use crate::sla::config::CapacityType;
@@ -1199,6 +1461,7 @@ async fn producer_echo_roundtrips_through_arm_decode() {
                 None,
                 &[],
             )
+            .1
             .expect("the producer's own echo decodes");
         let armed = actor
             .dispatched_cells
@@ -1219,7 +1482,7 @@ async fn producer_echo_roundtrips_through_arm_decode() {
 /// it already zip-truncated to no-arm; its rolling-skew rationale is
 /// MOOT per SIGNED Q6 --wipe rollout and the lane survives as decode
 /// totality). Pins the refusal to the FORGING skew shapes only.
-// r[verify sched.sla.ack-validate-then-commit+1]
+// r[verify sched.sla.ack-validate-then-commit+2]
 #[tokio::test]
 async fn ack_legacy_unarmed_echo_answers_ok_without_arm() {
     use crate::sla::config::CapacityType;
@@ -1240,6 +1503,7 @@ async fn ack_legacy_unarmed_echo_answers_ok_without_arm() {
 
     actor
         .handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None, &[])
+        .1
         .expect("legacy shape is a typed no-arm lane, not a refusal");
     assert!(
         actor.dispatched_cells.get("d-legacy").is_none(),
@@ -1264,7 +1528,7 @@ async fn ack_legacy_unarmed_echo_answers_ok_without_arm() {
 /// Witness provenance (Q1-1): suffixed strings are minted exclusively
 /// via `rio_common::cell_wire::encode_cell_event` — the same fn the
 /// controller's buffer mint calls; no hand-rolled "h:cap@e" literals.
-// r[verify sched.sla.ack-validate-then-commit+1]
+// r[verify sched.sla.ack-validate-then-commit+2]
 // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
 #[tokio::test]
 async fn ack_redelivered_epoch_mark_does_not_climb_post_expiry() {
@@ -1286,6 +1550,7 @@ async fn ack_redelivered_epoch_mark_does_not_climb_post_expiry() {
             None,
             &[],
         )
+        .1
         .expect("first delivery applies");
     assert_eq!(actor.ice.step(&cell), Some(0), "first failure at rung 0");
 
@@ -1302,6 +1567,7 @@ async fn ack_redelivered_epoch_mark_does_not_climb_post_expiry() {
             None,
             &[],
         )
+        .1
         .expect("redelivery answers Ok — delivered evidence must clear the buffer");
     assert_eq!(
         actor.ice.step(&cell),
@@ -1321,6 +1587,7 @@ async fn ack_redelivered_epoch_mark_does_not_climb_post_expiry() {
             None,
             &[],
         )
+        .1
         .expect("newer epoch applies");
     assert_eq!(
         actor.ice.step(&cell),
@@ -1337,7 +1604,7 @@ async fn ack_redelivered_epoch_mark_does_not_climb_post_expiry() {
 /// reset-then-step-0: the fixed clears-then-marks apply order resets
 /// the ladder, then the strictly-newer mark masks at the BASE TTL
 /// instead of climbing from the stale rung.
-// r[verify sched.sla.ack-validate-then-commit+1]
+// r[verify sched.sla.ack-validate-then-commit+2]
 // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
 #[tokio::test]
 async fn ack_clear_then_mark_realizes_reset_then_step0() {
@@ -1361,6 +1628,7 @@ async fn ack_clear_then_mark_realizes_reset_then_step0() {
             None,
             &[],
         )
+        .1
         .expect("applies");
     actor.ice.force_expire(&cell);
     actor
@@ -1373,6 +1641,7 @@ async fn ack_clear_then_mark_realizes_reset_then_step0() {
             None,
             &[],
         )
+        .1
         .expect("applies");
     assert_eq!(actor.ice.step(&cell), Some(1), "precondition: rung 1");
     actor.ice.force_expire(&cell);
@@ -1388,6 +1657,7 @@ async fn ack_clear_then_mark_realizes_reset_then_step0() {
             None,
             &[],
         )
+        .1
         .expect("both planes apply");
     assert_eq!(
         actor.ice.step(&cell),
@@ -1435,6 +1705,7 @@ async fn contract_ack_spawned_records_full_a_prime() {
 
     actor
         .handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None, &[])
+        .1
         .expect("applied under leadership");
 
     let got: std::collections::HashSet<Cell> = actor
@@ -4376,6 +4647,7 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
             None,
             &[],
         )
+        .1
         .expect("applied under leadership");
     // Arm + mark the waiter's intent the same way (hand-built echo with
     // the same cell — the ack handler arms from the wire form alone).
@@ -4395,6 +4667,7 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
             None,
             &[],
         )
+        .1
         .expect("applied under leadership");
     assert!(actor.ice.is_masked(&cell), "precondition: cell ICE-masked");
     assert!(actor.dispatched_cells.contains_key("ice-pull-a"));
@@ -4588,6 +4861,7 @@ async fn leadership_cycle_resets_the_epoch_watermark() {
     // watermark ratchets to 1000.
     actor
         .handle_ack_spawned_intents(&[], &["intel-7:spot@1000".into()], &[], &[], &[], None, &[])
+        .1
         .expect("mark applied under leadership");
     assert_eq!(
         actor.ice.step(&cell),
@@ -4620,6 +4894,7 @@ async fn leadership_cycle_resets_the_epoch_watermark() {
     // failure climbs the ladder and re-masks.
     actor
         .handle_ack_spawned_intents(&[], &["intel-7:spot@500".into()], &[], &[], &[], None, &[])
+        .1
         .expect("successor-lineage mark applied");
     assert_eq!(
         actor.ice.step(&cell),
@@ -4699,6 +4974,7 @@ async fn acked_vanish_mark_masks_spot_and_solve_buys_od() {
         .collect();
     actor
         .handle_ack_spawned_intents(&[], &marks, &[], &[], &[], None, &[])
+        .1
         .expect("applied under leadership");
     for h in ["intel-6", "intel-7", "intel-8"] {
         let cell: crate::sla::config::Cell = (h.into(), CapacityType::Spot);
@@ -4825,6 +5101,7 @@ async fn rung_one_ice_advances_to_a_different_rung() {
         .collect();
     actor
         .handle_ack_spawned_intents(&[], &marks, &[], &[], &[], None, &[])
+        .1
         .expect("applied under leadership");
 
     // The advance: the next emission's UNMASKED set is non-empty and
@@ -4976,6 +5253,7 @@ async fn phantom_ceiling_rung_advances_not_starves() {
         .collect();
     actor
         .handle_ack_spawned_intents(&[], &marks, &[], &[], &[], None, &[])
+        .1
         .expect("applied under leadership");
 
     // The walk advances: a launchable unmasked rung exists (the
@@ -5392,17 +5670,16 @@ async fn n_no_host_verdicts_poison_the_drv_with_the_verdict_message() {
 
     // N−1 applied acks: counted, never poisoned.
     for k in 1..N {
-        let p = actor
-            .handle_ack_spawned_intents(
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                None,
-                &[no_host_verdict("d-loop", detail)],
-            )
-            .expect("applied under leadership");
+        let (p, v) = actor.handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[no_host_verdict("d-loop", detail)],
+        );
+        v.expect("applied under leadership");
         assert!(p.is_empty(), "no poison at {k} < {N}");
     }
     assert_eq!(
@@ -5413,17 +5690,16 @@ async fn n_no_host_verdicts_poison_the_drv_with_the_verdict_message() {
 
     // The Nth: the budget crosses — the typed poison row carries the
     // controller's detail; applying it drives Ready → Poisoned.
-    let p = actor
-        .handle_ack_spawned_intents(
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            None,
-            &[no_host_verdict("d-loop", detail)],
-        )
-        .expect("applied under leadership");
+    let (p, v) = actor.handle_ack_spawned_intents(
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &[no_host_verdict("d-loop", detail)],
+    );
+    v.expect("applied under leadership");
     assert_eq!(p.len(), 1, "budget crossing at exactly N = {N}");
     assert_eq!(
         p[0].detail, detail,
@@ -5464,6 +5740,7 @@ async fn verdict_budget_resets_on_spawn_and_census_change_and_dedups_in_request(
                 None,
                 &[no_host_verdict("d-heal", "A")],
             )
+            .1
             .expect("applied");
     }
     let spawned = rio_proto::types::SpawnIntent {
@@ -5480,19 +5757,19 @@ async fn verdict_budget_resets_on_spawn_and_census_change_and_dedups_in_request(
             None,
             &[],
         )
+        .1
         .expect("applied");
     for k in 1..N {
-        let p = actor
-            .handle_ack_spawned_intents(
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                None,
-                &[no_host_verdict("d-heal", "A")],
-            )
-            .expect("applied");
+        let (p, v) = actor.handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[no_host_verdict("d-heal", "A")],
+        );
+        v.expect("applied");
         assert!(
             p.is_empty(),
             "spawn reset the track: no poison at {k} of the second run"
@@ -5505,17 +5782,16 @@ async fn verdict_budget_resets_on_spawn_and_census_change_and_dedups_in_request(
     // evidence — the budget crosses HERE (pre-fix the byte-diff
     // restarted at 1 and the budget was structurally defeated for
     // the refit/price-churn population).
-    let p = actor
-        .handle_ack_spawned_intents(
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            None,
-            &[no_host_verdict("d-heal", "B")],
-        )
-        .expect("applied");
+    let (p, v) = actor.handle_ack_spawned_intents(
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &[no_host_verdict("d-heal", "B")],
+    );
+    v.expect("applied");
     assert_eq!(
         p.len(),
         1,
@@ -5527,17 +5803,16 @@ async fn verdict_budget_resets_on_spawn_and_census_change_and_dedups_in_request(
     // census): drive a fresh track to N−1, mutate the config, then
     // one more verdict — the count restarted, no poison.
     for k in 1..N {
-        let p = actor
-            .handle_ack_spawned_intents(
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                None,
-                &[no_host_verdict("d-heal", "C")],
-            )
-            .expect("applied");
+        let (p, v) = actor.handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[no_host_verdict("d-heal", "C")],
+        );
+        v.expect("applied");
         assert!(p.is_empty(), "C-run inside the budget at {k}");
     }
     actor
@@ -5546,17 +5821,16 @@ async fn verdict_budget_resets_on_spawn_and_census_change_and_dedups_in_request(
         .get_mut("intel-6")
         .unwrap()
         .max_mem = Some(64 << 30);
-    let p = actor
-        .handle_ack_spawned_intents(
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            None,
-            &[no_host_verdict("d-heal", "C")],
-        )
-        .expect("applied");
+    let (p, v) = actor.handle_ack_spawned_intents(
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &[no_host_verdict("d-heal", "C")],
+    );
+    v.expect("applied");
     assert!(
         p.is_empty(),
         "a hosting-class config change re-opens the heal window \
@@ -5565,37 +5839,35 @@ async fn verdict_budget_resets_on_spawn_and_census_change_and_dedups_in_request(
     // Re-build the track to N−1 under the NEW census for the dedup
     // conjunct below (the restart left it at 1).
     for k in 2..N {
-        let p = actor
-            .handle_ack_spawned_intents(
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                None,
-                &[no_host_verdict("d-heal", "C")],
-            )
-            .expect("applied");
-        assert!(p.is_empty(), "post-census C-run inside the budget at {k}");
-    }
-
-    // (c) in-request dedup: ONE ack carrying the drv twice counts
-    // once — the Nth B entry rides this ack (count N−1 → N), and the
-    // duplicate does NOT overshoot (poison fires exactly here, len 1).
-    let p = actor
-        .handle_ack_spawned_intents(
+        let (p, v) = actor.handle_ack_spawned_intents(
             &[],
             &[],
             &[],
             &[],
             &[],
             None,
-            &[
-                no_host_verdict("d-heal", "B"),
-                no_host_verdict("d-heal", "B"),
-            ],
-        )
-        .expect("applied");
+            &[no_host_verdict("d-heal", "C")],
+        );
+        v.expect("applied");
+        assert!(p.is_empty(), "post-census C-run inside the budget at {k}");
+    }
+
+    // (c) in-request dedup: ONE ack carrying the drv twice counts
+    // once — the Nth B entry rides this ack (count N−1 → N), and the
+    // duplicate does NOT overshoot (poison fires exactly here, len 1).
+    let (p, v) = actor.handle_ack_spawned_intents(
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &[
+            no_host_verdict("d-heal", "B"),
+            no_host_verdict("d-heal", "B"),
+        ],
+    );
+    v.expect("applied");
     assert_eq!(p.len(), 1, "duplicate entries within one ack count once");
 }
 
@@ -5658,12 +5930,14 @@ fn no_host_counter_step_law_table() {
 }
 
 // r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
-/// An out-of-alphabet verdict reason refuses the WHOLE request
-/// (validate-then-commit: no plane applied) — the closed-alphabet
+/// An out-of-alphabet verdict reason refuses the VERDICT PLANE
+/// (bug_142 per-plane: the refused plane applies nothing and the
+/// ordinal freezes as a non-event, while sibling planes — here the
+/// valid mark — land) — the closed-alphabet
 /// posture of the wire fold (rustc-exhaustive at validate; this pins
 /// the runtime half for unknown discriminants and UNSPECIFIED).
 #[tokio::test]
-async fn out_of_alphabet_verdict_reason_refuses_the_request() {
+async fn out_of_alphabet_verdict_reason_refuses_the_verdict_plane() {
     let db = TestDb::new(&MIGRATOR).await;
     crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw_builders_only(db.pool.clone());
@@ -5683,12 +5957,30 @@ async fn out_of_alphabet_verdict_reason_refuses_the_request() {
             None,
             std::slice::from_ref(&bad),
         );
-        assert!(r.is_err(), "reason={reason} refused");
         assert!(
-            !actor
+            matches!(
+                &r.1,
+                Err(crate::actor::AckApplyError::PlanesRefused { refused })
+                    if matches!(
+                        refused.as_slice(),
+                        [crate::actor::AckApplyError::PlaneEntryUndecodable {
+                            plane: crate::actor::AckPlane::Rejected,
+                            ..
+                        }]
+                    )
+            ),
+            "reason={reason} refused its plane typed"
+        );
+        assert!(
+            actor
                 .ice
                 .is_masked(&("intel-6".into(), crate::sla::config::CapacityType::Spot)),
-            "an erring ack applied NOTHING (the mark plane did not land)"
+            "the valid mark plane LANDS while the verdict plane refuses \
+             (bug_142 per-plane granularity)"
+        );
+        assert!(
+            actor.supply_reval.no_host_verdicts.is_empty(),
+            "the refused verdict plane applied nothing"
         );
     }
 }
@@ -5728,17 +6020,16 @@ async fn over_cap_verdicts_acknowledge_without_poison() {
     // and beyond the poison threshold, zero poisons and the track
     // never steps.
     for k in 1..=(N + 5) {
-        let p = actor
-            .handle_ack_spawned_intents(
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                None,
-                &[over_cap_verdict("d-overcap")],
-            )
-            .expect("an over-cap verdict is a VALID ack plane entry (observed, not refused)");
+        let (p, v) = actor.handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[over_cap_verdict("d-overcap")],
+        );
+        v.expect("an over-cap verdict is a VALID ack plane entry (observed, not refused)");
         assert!(
             p.is_empty(),
             "no poison at {k} consecutive over-cap dispositions (advisory lane)"
@@ -5761,20 +6052,19 @@ async fn over_cap_verdicts_acknowledge_without_poison() {
     // does NOT poison (the over-cap dispositions contributed nothing
     // to the terminal budget).
     for _ in 1..N {
-        let p = actor
-            .handle_ack_spawned_intents(
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                None,
-                &[no_host_verdict(
-                    "d-overcap",
-                    "no [sla.hw_classes] entry hosts it",
-                )],
-            )
-            .expect("applied");
+        let (p, v) = actor.handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[no_host_verdict(
+                "d-overcap",
+                "no [sla.hw_classes] entry hosts it",
+            )],
+        );
+        v.expect("applied");
         assert!(p.is_empty(), "fresh budget: over-cap never fed it");
     }
     assert_eq!(
@@ -6639,32 +6929,30 @@ async fn jitter_churn_does_not_defeat_the_verdict_budget() {
     // N−1 applied acks, each with a byte-DIFFERENT detail (the
     // refit/price jitter shape): counted, never poisoned.
     for k in 1..N {
-        let p = actor
-            .handle_ack_spawned_intents(
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                None,
-                &[no_host_verdict("d-jitter", &jitter_detail(k))],
-            )
-            .expect("applied under leadership");
-        assert!(p.is_empty(), "no poison at {k} < {N}");
-    }
-    // The Nth jittered verdict crosses the budget — the config census
-    // never changed, so the evidence is consecutive.
-    let p = actor
-        .handle_ack_spawned_intents(
+        let (p, v) = actor.handle_ack_spawned_intents(
             &[],
             &[],
             &[],
             &[],
             &[],
             None,
-            &[no_host_verdict("d-jitter", &jitter_detail(N))],
-        )
-        .expect("applied under leadership");
+            &[no_host_verdict("d-jitter", &jitter_detail(k))],
+        );
+        v.expect("applied under leadership");
+        assert!(p.is_empty(), "no poison at {k} < {N}");
+    }
+    // The Nth jittered verdict crosses the budget — the config census
+    // never changed, so the evidence is consecutive.
+    let (p, v) = actor.handle_ack_spawned_intents(
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &[no_host_verdict("d-jitter", &jitter_detail(N))],
+    );
+    v.expect("applied under leadership");
     assert_eq!(
         p.len(),
         1,
@@ -6795,6 +7083,7 @@ async fn pending_reack_echo_does_not_reset_the_verdict_budget() {
                 None,
                 &[no_host_verdict("d-echo", "A")],
             )
+            .1
             .expect("applied");
     }
     actor
@@ -6807,19 +7096,19 @@ async fn pending_reack_echo_does_not_reset_the_verdict_budget() {
             None,
             &[],
         )
+        .1
         .expect("applied");
     for k in 1..N {
-        let p = actor
-            .handle_ack_spawned_intents(
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-                None,
-                &[no_host_verdict("d-echo", "A")],
-            )
-            .expect("applied");
+        let (p, v) = actor.handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[no_host_verdict("d-echo", "A")],
+        );
+        v.expect("applied");
         assert!(p.is_empty(), "fresh spawn edge healed the track ({k})");
     }
     // Echo edge: the drv's acked_spawned entry is LIVE (just
@@ -6836,18 +7125,18 @@ async fn pending_reack_echo_does_not_reset_the_verdict_budget() {
             None,
             &[],
         )
+        .1
         .expect("applied (the echo)");
-    let p = actor
-        .handle_ack_spawned_intents(
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            None,
-            &[no_host_verdict("d-echo", "A")],
-        )
-        .expect("applied");
+    let (p, v) = actor.handle_ack_spawned_intents(
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &[no_host_verdict("d-echo", "A")],
+    );
+    v.expect("applied");
     assert_eq!(
         p.len(),
         1,
@@ -6888,6 +7177,7 @@ async fn frozen_track_cannot_claim_false_consecutiveness() {
                 None,
                 &[no_host_verdict("d-frozen", "A")],
             )
+            .1
             .expect("applied");
     }
     // The gap: verdict-carrying passes that SKIP d-frozen (its
@@ -6904,21 +7194,21 @@ async fn frozen_track_cannot_claim_false_consecutiveness() {
                 None,
                 &[no_host_verdict("d-other", "A")],
             )
+            .1
             .expect("applied");
     }
     // Verdicts resume for d-frozen with an IDENTICAL detail: the
     // streak broke — restart at 1, never a false "30 consecutive".
-    let p = actor
-        .handle_ack_spawned_intents(
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            None,
-            &[no_host_verdict("d-frozen", "A")],
-        )
-        .expect("applied");
+    let (p, v) = actor.handle_ack_spawned_intents(
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &[no_host_verdict("d-frozen", "A")],
+    );
+    v.expect("applied");
     assert!(
         p.is_empty(),
         "a frozen track restarts after a pass gap (merged_bug_043(3)) \
@@ -6976,6 +7266,7 @@ async fn quiet_gap_spawn_heals_by_age_not_map_presence() {
             None,
             &[],
         )
+        .1
         .expect("applied");
     // N−1 verdicts (no spawned plane → the gated retain never runs).
     for _ in 1..N {
@@ -6989,6 +7280,7 @@ async fn quiet_gap_spawn_heals_by_age_not_map_presence() {
                 None,
                 &[no_host_verdict("d-gap", "no class hosts")],
             )
+            .1
             .expect("applied");
     }
     // The fleet-quiet gap: the entry outlives the staleness horizon
@@ -7010,19 +7302,19 @@ async fn quiet_gap_spawn_heals_by_age_not_map_presence() {
             None,
             &[],
         )
+        .1
         .expect("applied");
     // One more verdict: a healed track sits at 1, far from the budget.
-    let p = actor
-        .handle_ack_spawned_intents(
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            None,
-            &[no_host_verdict("d-gap", "no class hosts")],
-        )
-        .expect("applied");
+    let (p, v) = actor.handle_ack_spawned_intents(
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &[no_host_verdict("d-gap", "no class hosts")],
+    );
+    v.expect("applied");
     assert!(
         p.is_empty(),
         "left (pre-fix): the stale acked_spawned entry made the genuine \
@@ -7046,6 +7338,7 @@ async fn quiet_gap_spawn_heals_by_age_not_map_presence() {
                 None,
                 &[no_host_verdict("d-gap", "no class hosts")],
             )
+            .1
             .expect("applied");
     }
     actor
@@ -7058,18 +7351,18 @@ async fn quiet_gap_spawn_heals_by_age_not_map_presence() {
             None,
             &[],
         )
+        .1
         .expect("applied (live echo)");
-    let p = actor
-        .handle_ack_spawned_intents(
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            None,
-            &[no_host_verdict("d-gap", "no class hosts")],
-        )
-        .expect("applied");
+    let (p, v) = actor.handle_ack_spawned_intents(
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &[no_host_verdict("d-gap", "no class hosts")],
+    );
+    v.expect("applied");
     assert_eq!(
         p.len(),
         1,
@@ -7107,6 +7400,7 @@ async fn empty_arm_decode_disarms_stale_dispatched_cells() {
     );
     actor
         .handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None, &[])
+        .1
         .expect("applied");
     assert!(
         actor.dispatched_cells.get("d-arm").is_some(),
@@ -7129,6 +7423,7 @@ async fn empty_arm_decode_disarms_stale_dispatched_cells() {
             None,
             &[],
         )
+        .1
         .expect("applied");
     assert!(
         actor.dispatched_cells.get("d-arm").is_none(),
@@ -7142,6 +7437,7 @@ async fn empty_arm_decode_disarms_stale_dispatched_cells() {
     // legacy echo must neither arm nor disarm.
     actor
         .handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None, &[])
+        .1
         .expect("applied");
     let legacy_echo = rio_proto::types::SpawnIntent {
         intent_id: "d-arm".into(),
@@ -7159,6 +7455,7 @@ async fn empty_arm_decode_disarms_stale_dispatched_cells() {
             None,
             &[],
         )
+        .1
         .expect("applied");
     assert!(
         actor.dispatched_cells.get("d-arm").is_some(),
@@ -7196,6 +7493,7 @@ async fn over_cap_only_pass_advances_the_verdict_ordinal() {
                 None,
                 &[no_host_verdict("d-pass", "no class hosts")],
             )
+            .1
             .expect("applied");
     }
     assert_eq!(
@@ -7221,6 +7519,7 @@ async fn over_cap_only_pass_advances_the_verdict_ordinal() {
             None,
             &[over_cap_verdict("d-other")],
         )
+        .1
         .expect("applied");
 
     // NoHost resumes for d-pass.
@@ -7234,6 +7533,7 @@ async fn over_cap_only_pass_advances_the_verdict_ordinal() {
             None,
             &[no_host_verdict("d-pass", "no class hosts")],
         )
+        .1
         .expect("applied");
     assert_eq!(
         actor

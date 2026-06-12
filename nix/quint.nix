@@ -7716,7 +7716,7 @@ rec {
     # measurements in the introducing commit).
     # ------------------------------------------------------------------
 
-    # r[verify sched.sla.ack-validate-then-commit+1]
+    # r[verify sched.sla.ack-validate-then-commit+2]
     # r[verify ctrl.nodeclaim.evidence-ack-latch+3]
     # r[verify ctrl.nodeclaim.ice-mark-clear+5]
     quint-ice-evidence-ack = mkQuintCheck {
@@ -7736,7 +7736,7 @@ rec {
     # retired CostGateClosed class) — planes mutate, then the refusal
     # answers; the retained-buffer redelivery re-applies every tick.
     # The twin's teeth target the SURVIVING refusal classes.
-    # r[verify sched.sla.ack-validate-then-commit+1]
+    # r[verify sched.sla.ack-validate-then-commit+2]
     quint-ice-falsify-apply-before-refuse = mkQuintSimWitnessCheck {
       name = "ice-falsify-apply-before-refuse";
       spec = "calibration/ice-apply-before-refuse";

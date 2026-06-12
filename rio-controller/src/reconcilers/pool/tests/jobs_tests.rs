@@ -4937,6 +4937,143 @@ fn w10_al_re_ack_derives_from_job_list_independent_of_paging() {
     assert_eq!(acks.len(), 3, "exactly the three lawful acks");
 }
 
+// r[verify ctrl.pool.ack-spawned-soundness]
+/// **W11-BF, the producer half (bug_142, R25-as-extended).** The
+/// durable-annotation round-trip is a PRODUCER of the capacity
+/// alphabet: `cells_from_annotation` must route every cap segment
+/// through the same typed parser the consumer decodes with
+/// (`rio_common::cell_wire::WireCapacity::parse`), and an undecodable
+/// segment degrades that Job's re-ack row to the documented skip lane
+/// (the same fail-open the render half takes — no echo this tick;
+/// the scheduler keeps its last-armed truth) instead of minting a
+/// wire entry the strict consumer refuses. Pre-fix the grammar-only
+/// parse (split_once(':'), non-empty halves) re-emitted any junk cap
+/// — one rollback-skewed or webhook-mutated annotation row wedged the
+/// pool's WHOLE ack (every sibling row's dispatched_cells arming) for
+/// the life of the Pending Job, with no self-heal.
+///
+/// Pre-fix red:
+///   left: ["fresh", "offpage", "onpage", "poisoned"]
+///   right: ["fresh", "offpage", "onpage"] --- a poisoned cap segment
+///   must degrade its row to the skip lane, never mint an
+///   out-of-alphabet wire entry
+#[test]
+fn poisoned_annotation_cap_degrades_row_to_skip_lane() {
+    use crate::reconcilers::pool::jobs::{INTENT_CELLS_ANNOTATION, assemble_re_acks};
+
+    let pending_with = |name: &str, intent_id: &str, cells: &str| {
+        let mut j = pending_job(name, 0, 30);
+        j.spec = Some(JobSpec {
+            template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    annotations: Some(BTreeMap::from([
+                        (INTENT_ID_ANNOTATION.to_string(), intent_id.to_string()),
+                        (INTENT_CELLS_ANNOTATION.to_string(), cells.to_string()),
+                    ])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        j
+    };
+
+    // Everything off-page (the reconstruction lane). The poisoned row
+    // carries one VALID cell and one out-of-alphabet cap — the
+    // rollback-skew shape (a future alphabet extension wrote "metal",
+    // the fleet rolled back). Per merged_bug_134 the row must not
+    // partially re-emit either (N-1 cells forge a different cell
+    // set): the whole row degrades to the skip lane, disclosed.
+    // r13-allow(refusal-probe): the junk cap is deliberately
+    // unproducible by the render half; the test asserts the typed
+    // degradation of the skew shape.
+    let page = IntentPage::for_test(vec![intent_named("onpage")]);
+    let jobs = vec![
+        pending_with("rio-builder-p-onpage", "onpage", "m7i:spot"),
+        pending_with("rio-builder-p-offpage", "offpage", "m7i:spot,c8g:on-demand"),
+        pending_with("rio-builder-p-poisoned", "poisoned", "m7i:spot,c8g:metal"),
+    ];
+    let acks = assemble_re_acks(
+        &page,
+        "p",
+        ExecutorKind::Builder,
+        &jobs,
+        &HashSet::new(),
+        vec![intent_named("fresh")],
+    );
+    let mut ids: Vec<&str> = acks.iter().map(|i| i.intent_id.as_str()).collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["fresh", "offpage", "onpage"],
+        "a poisoned cap segment must degrade its row to the skip lane, \
+         never mint an out-of-alphabet wire entry"
+    );
+}
+
+/// **W11-BG (bug_142): render→parse round-trip totality over the full
+/// WireCapacity alphabet.** Property: every annotation the render
+/// half (`intent_cells_annotation_value`) CAN produce parses back
+/// (`cells_from_annotation`) to the identical `(names, caps)` echo —
+/// the producer and the reconstruction are the same alphabet, by
+/// test; and every cap segment outside the alphabet refuses the row.
+#[test]
+fn annotation_round_trip_total_over_capacity_alphabet() {
+    use crate::reconcilers::pool::jobs::{cells_from_annotation, intent_cells_annotation_value};
+    use proptest::prelude::*;
+
+    let name_s = proptest::string::string_regex("[a-z0-9][a-z0-9.-]{0,14}").expect("valid regex");
+    let cap_s = proptest::sample::select(vec!["spot", "od", "on-demand"]);
+    let mut runner = proptest::test_runner::TestRunner::default();
+    runner
+        .run(&proptest::collection::vec((name_s, cap_s), 1..4), |cells| {
+            // Production render: build the intent the way
+            // cells_to_selector_terms shapes it (one In
+            // requirement on the capacity label per term).
+            let intent = SpawnIntent {
+                intent_id: "rt".into(),
+                hw_class_names: cells.iter().map(|(h, _)| h.clone()).collect(),
+                node_affinity: cells
+                    .iter()
+                    .map(|(_, cap)| rio_proto::types::NodeSelectorTerm {
+                        match_expressions: vec![rio_proto::types::NodeSelectorRequirement {
+                            key: crate::reconcilers::nodeclaim_pool::ffd::CAPACITY_TYPE_LABEL
+                                .into(),
+                            operator: "In".into(),
+                            values: vec![cap.to_string()],
+                        }],
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let rendered =
+                intent_cells_annotation_value(&intent).expect("alphabet caps always render");
+            let (names, terms) = cells_from_annotation(&rendered).expect("rendered always parses");
+            prop_assert_eq!(&names, &intent.hw_class_names);
+            prop_assert_eq!(terms.len(), names.len());
+            for (term, (_, cap)) in terms.iter().zip(&cells) {
+                prop_assert_eq!(&term.match_expressions[0].values, &vec![cap.to_string()]);
+            }
+            // The negative half: poisoning the LAST row's cap with an
+            // out-of-alphabet token refuses the whole row (structural
+            // splice after the row's separator — names cannot contain
+            // ':' by the render half's law).
+            let mut rows: Vec<String> = rendered.split(',').map(str::to_string).collect();
+            let last = rows.last_mut().expect("at least one cell");
+            let colon = last.find(':').expect("rendered row has a separator");
+            last.replace_range(colon + 1.., "metal");
+            let poisoned = rows.join(",");
+            prop_assert!(
+                cells_from_annotation(&poisoned).is_none(),
+                "out-of-alphabet cap must refuse the row: {}",
+                poisoned
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
 // r[verify ctrl.pool.respawn-backoff+3]
 /// **W10-AR (round-10 bug_078, the breaker discriminator at its own
 /// quantifier).** k CLEAN exits step NOTHING (a verdict-free terminal

@@ -1230,16 +1230,55 @@ impl DagActor {
     /// success signal is the first successful pull — see the mint's
     /// ICE-clear in `actor/pull.rs`.
     // r[impl sched.sla.hw-class.ice-mask]
-    /// merged_bug_005 + bug_094: returns the apply outcome the drain
-    /// relays to the gRPC layer — `Ok` only when EVERY plane landed,
-    /// and `Err` only when NO plane landed (validate-then-commit).
-    /// Every refusal — undecodable plane entry, skewed arm echo — is
+    /// merged_bug_005 + bug_094, re-scoped by bug_142 (R30 + OQ-15):
+    /// returns the poisons from the applied planes PLUS the apply
+    /// verdict the drain relays to the gRPC layer — `Ok` when EVERY
+    /// plane landed; `Err(PlanesRefused)` names each refused plane
+    /// (first offending entry per plane, wire-field order), and every
+    /// plane NOT named LANDED. The pre-bug_142 contract ("`Ok` only
+    /// when EVERY plane landed, and `Err` only when NO plane landed")
+    /// is retired: under whole-request refusal one poisoned durable
+    /// row — a Job annotation re-derived every tick by
+    /// `assemble_re_acks` — wedged every evidence plane in its
+    /// request for the row's life. Per-plane refusal contains the
+    /// blast radius to the poisoned plane; the redelivery loop then
+    /// converges instead of wedging.
+    ///
+    /// The refusal unit is the PLANE: a refused plane withholds ALL
+    /// its evidence (the spawned plane's arm decodes AND its
+    /// spawn-ack witnesses are one unit), and every refusal is still
     /// computed by [`AckApplyPlan::validate`] before the first state
-    /// mutation; [`AckApplyPlan::commit`] is infallible, so
-    /// error-after-mutate is unrepresentable by signature. The
-    /// controller's commit-on-Ack buffer survives an erring Ack and
-    /// redelivers the WHOLE buffer — safe, because an erring Ack
-    /// applied nothing. Pre-fix unparseable entries were silently
+    /// mutation; [`AckApplyPlan::commit`] is infallible and applies
+    /// exactly the decoded planes, so error-after-PARTIAL-apply is
+    /// now REPRESENTABLE and DISCLOSED by design (the refused-plane
+    /// list), never silent. The controller's commit-on-Ack buffer
+    /// survives an erring Ack and redelivers the WHOLE buffer — safe
+    /// per plane, the bug_142 redelivery-idempotency obligation,
+    /// discharged against each plane's own law:
+    ///
+    /// - ICE marks/clears: the merged_bug_008 evidence-epoch gate
+    ///   (`epoch > last_applied[cell]`) — `==` redelivery and `<`
+    ///   reorder are total no-ops; epoch-less legacy entries take the
+    ///   merged_bug_005 in-window re-mark refresh (same-rung, no
+    ///   double-step within the window).
+    /// - Observed types: monotone upsert (union-only menu store).
+    /// - Binding snapshots: wholesale rebuild — identical snapshot,
+    ///   identical state.
+    /// - Spawn-ack witnesses: age-keyed freshness (merged_bug_125) —
+    ///   a redelivered entry refreshes its stamp exactly as Pending
+    ///   re-acks already do every tick by design; the heal edge
+    ///   cannot re-fire on a live entry.
+    /// - The VERDICT plane is non-idempotent BY DESIGN and stays SAFE
+    ///   because it is OUT of the redelivery loop: level-triggered
+    ///   controller-side (`CoverResult::rejected` is re-minted per
+    ///   cover pass and dropped on Ack-Err — the retention census at
+    ///   `report_unfulfillable` — never redelivered from the retained
+    ///   buffer), and the fold's `seen` dedup bounds it within one
+    ///   request. A future plane whose apply is NOT idempotent under
+    ///   redelivery must NOT take the per-plane arm (refuse whole
+    ///   with disclosure, or stay out of the loop like the verdicts).
+    ///
+    /// Pre-bug_094 unparseable entries were silently
     /// dropped while the Ack answered Ok — destroying the
     /// controller's consume-once evidence ("the ONLY clear" is
     /// Ack-Ok). merged_bug_046: the cost edge-reload gate is GONE
@@ -1272,8 +1311,8 @@ impl DagActor {
         bound_intents: &[rio_proto::types::BoundIntent],
         binding_snapshot: Option<&[rio_proto::types::BoundIntent]>,
         rejected: &[rio_proto::types::IntentVerdict],
-    ) -> Result<Vec<NoHostPoison>, super::command::AckApplyError> {
-        let plan = AckApplyPlan::validate(
+    ) -> (Vec<NoHostPoison>, Result<(), super::command::AckApplyError>) {
+        let (plan, refused) = AckApplyPlan::validate(
             spawned,
             unfulfillable_cells,
             registered_cells,
@@ -1281,8 +1320,17 @@ impl DagActor {
             bound_intents,
             binding_snapshot,
             rejected,
-        )?;
-        Ok(plan.commit(self))
+        );
+        // Commit the decoded planes FIRST (poisons from applied
+        // verdict planes must fire even when a sibling plane
+        // refused), then disclose the refusals.
+        let poisons = plan.commit(self);
+        let verdict = if refused.is_empty() {
+            Ok(())
+        } else {
+            Err(super::command::AckApplyError::PlanesRefused { refused })
+        };
+        (poisons, verdict)
     }
 
     // r[impl scheduler.sla.ceiling.stale-solve-revalidation+2]
@@ -1562,8 +1610,12 @@ impl SupplyRevalidation {
 }
 
 /// One validated `AckSpawnedIntents` application (bug_094 —
-/// validate-then-commit). [`Self::validate`] computes EVERY refusal
-/// over the RAW wire planes; [`Self::commit`] applies the typed plan
+/// validate-then-commit; bug_142 — PER-PLANE refusal granularity).
+/// [`Self::validate`] computes EVERY refusal
+/// over the RAW wire planes (a refused plane's slot empties and its
+/// leaf error joins the returned refusal list — the plane is the
+/// refusal unit, so the plan always carries exactly the planes that
+/// will apply); [`Self::commit`] applies the typed plan
 /// and is infallible by signature. The wire types stop here:
 /// `commit` receives only decoded cells, hashes, and rows, so a
 /// silent per-plane parse skip — or any new refusal arm landing
@@ -1823,16 +1875,22 @@ fn decode_capacity_requirement(
 }
 
 impl AckApplyPlan {
-    // r[impl sched.sla.ack-validate-then-commit+1]
-    /// Decode and refuse BEFORE any mutation exists. Planes validate
-    /// in wire-field order (`spawned` arming = 1,
+    // r[impl sched.sla.ack-validate-then-commit+2]
+    /// Decode BEFORE any mutation exists, PER PLANE (bug_142): planes
+    /// validate in wire-field order (`spawned` arming = 1,
     /// `unfulfillable_cells` = 2, `registered_cells` = 3,
-    /// `observed_instance_types` = 4); the first failure refuses the
-    /// WHOLE request. Whole-request refusal is safe controller-side:
-    /// the buffer is retained on Ack-Err and buffered marks keep
-    /// masking `cover_deficit` locally until acked — the refusal is a
-    /// loud, logged skew signal where the pre-fix behavior was silent
-    /// evidence destruction.
+    /// `observed_instance_types` = 4, `rejected` = 7); the first
+    /// failure inside a plane refuses THAT PLANE (its decoded slot
+    /// empties, the refusal is recorded) and the remaining planes
+    /// keep validating — the returned plan carries exactly the
+    /// decoded planes, and the refusal list carries one leaf error
+    /// per refused plane. Plane refusal is safe controller-side: the
+    /// buffer is retained on Ack-Err and buffered marks keep masking
+    /// `cover_deficit` locally until acked; landed planes no-op on
+    /// redelivery (the per-plane idempotency laws — see
+    /// `handle_ack_spawned_intents`). The pre-bug_142 first-error
+    /// whole-request short-circuit let one durable poisoned row black
+    /// out every sibling plane for its life.
     pub(super) fn validate(
         spawned: &[rio_proto::types::SpawnIntent],
         unfulfillable_cells: &[String],
@@ -1841,11 +1899,15 @@ impl AckApplyPlan {
         bound_intents: &[rio_proto::types::BoundIntent],
         binding_snapshot: Option<&[rio_proto::types::BoundIntent]>,
         rejected: &[rio_proto::types::IntentVerdict],
-    ) -> Result<Self, super::command::AckApplyError> {
+    ) -> (Self, Vec<super::command::AckApplyError>) {
         use super::command::{AckApplyError, AckPlane};
+        let mut refused: Vec<AckApplyError> = Vec::new();
         // 124(d): record the spawn-ack witness for EVERY spawned
         // intent — a NoEligibleSource verdict landing within the
-        // defer window raced its own spawn.
+        // defer window raced its own spawn. bug_142: the witnesses
+        // and the arm decodes are ONE plane (wire field 1) — a
+        // refused arm decode withholds the witnesses too (the plane
+        // is the refusal unit), emptied below on refusal.
         let acked_spawned: Vec<DrvHash> = spawned
             .iter()
             .map(|i| DrvHash::from(i.intent_id.as_str()))
@@ -1860,12 +1922,36 @@ impl AckApplyPlan {
         // (bug_030) is the §1-of-N approximation: the pod's affinity
         // is OR-of-A', so the first-pull consumer needs the whole
         // set.
+        let mut acked_spawned = acked_spawned;
         let mut armed: Vec<(DrvHash, ArmDecode)> = Vec::with_capacity(spawned.len());
         for i in spawned {
-            armed.push((DrvHash::from(i.intent_id.as_str()), ArmDecode::decode(i)?));
+            match ArmDecode::decode(i) {
+                Ok(arm) => armed.push((DrvHash::from(i.intent_id.as_str()), arm)),
+                Err(e) => {
+                    // The spawned plane refuses as ONE unit: arms AND
+                    // spawn-ack witnesses withhold together.
+                    armed.clear();
+                    acked_spawned.clear();
+                    refused.push(e);
+                    break;
+                }
+            }
         }
-        let marks = Self::decode_cell_plane(unfulfillable_cells, AckPlane::UnfulfillableCells)?;
-        let clears = Self::decode_cell_plane(registered_cells, AckPlane::RegisteredCells)?;
+        let marks = match Self::decode_cell_plane(unfulfillable_cells, AckPlane::UnfulfillableCells)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                refused.push(e);
+                Vec::new()
+            }
+        };
+        let clears = match Self::decode_cell_plane(registered_cells, AckPlane::RegisteredCells) {
+            Ok(v) => v,
+            Err(e) => {
+                refused.push(e);
+                Vec::new()
+            }
+        };
         let mut observed = Vec::with_capacity(observed_instance_types.len());
         for o in observed_instance_types {
             match rio_common::cell_wire::decode_cell_event(&o.cell) {
@@ -1876,10 +1962,12 @@ impl AckApplyPlan {
                     o.mem_bytes,
                 )),
                 Err(_) => {
-                    return Err(AckApplyError::PlaneEntryUndecodable {
+                    observed.clear();
+                    refused.push(AckApplyError::PlaneEntryUndecodable {
                         plane: AckPlane::ObservedTypes,
                         entry: o.cell.clone(),
                     });
+                    break;
                 }
             }
         }
@@ -1887,9 +1975,11 @@ impl AckApplyPlan {
         // reason alphabet — rustc-exhaustive over the prost enum, zero
         // wildcard arms, so a future `IntentVerdictReason` variant
         // stops compiling here until this consumer decides its fold.
-        // `UNSPECIFIED` and unknown discriminants refuse the WHOLE
-        // request (validate-then-commit: an erring ack applied
-        // nothing; the controller re-mints next tick).
+        // `UNSPECIFIED` and unknown discriminants refuse the VERDICT
+        // PLANE (bug_142: per-plane — the refused plane applied
+        // nothing; the controller re-mints fresh verdicts next tick,
+        // the level-triggered class).
+        let mut verdict_plane_refused = false;
         let mut verdicts = Vec::with_capacity(rejected.len());
         for v in rejected {
             use rio_proto::types::IntentVerdictReason;
@@ -1937,10 +2027,13 @@ impl AckApplyPlan {
                     );
                 }
                 Ok(IntentVerdictReason::Unspecified) | Err(_) => {
-                    return Err(AckApplyError::PlaneEntryUndecodable {
+                    verdicts.clear();
+                    verdict_plane_refused = true;
+                    refused.push(AckApplyError::PlaneEntryUndecodable {
                         plane: AckPlane::Rejected,
                         entry: format!("{} reason={}", v.intent_id, v.reason),
                     });
+                    break;
                 }
             }
         }
@@ -1971,24 +2064,31 @@ impl AckApplyPlan {
                 })
                 .collect()
         });
-        Ok(Self {
-            acked_spawned,
-            binding,
-            armed,
-            clears,
-            marks,
-            observed,
-            verdicts,
-            // Stamped AFTER the full decode: an undecodable entry
-            // refused the request above, so presence here means the
-            // plane applied.
-            verdict_plane_present: !rejected.is_empty(),
-        })
+        (
+            Self {
+                acked_spawned,
+                binding,
+                armed,
+                clears,
+                marks,
+                observed,
+                verdicts,
+                // Stamped AFTER the plane's decode: a refused verdict
+                // plane is a NON-EVENT (the ordinal freezes; the
+                // step_no_host_counter pass-gap law restarts tracks at
+                // 1 — we could not decode what the pass said, so it
+                // neither advances nor fakes consecutiveness).
+                verdict_plane_present: !rejected.is_empty() && !verdict_plane_refused,
+            },
+            refused,
+        )
     }
 
     /// Strict decode of one string cell-event plane via the shared
     /// grammar ([`rio_common::cell_wire`]). Any undecodable entry
-    /// refuses the plane's WHOLE request — there is no drop lane.
+    /// refuses the PLANE (bug_142: the caller empties the plane's
+    /// slot and records the refusal; sibling planes apply) — there is
+    /// no drop lane.
     fn decode_cell_plane(
         entries: &[String],
         plane: super::command::AckPlane,
@@ -2011,7 +2111,7 @@ impl AckApplyPlan {
             .collect()
     }
 
-    // r[impl sched.sla.ack-validate-then-commit+1]
+    // r[impl sched.sla.ack-validate-then-commit+2]
     /// Apply the validated plan. Infallible by signature — every
     /// refusal was computed in [`Self::validate`], so no arm here can
     /// err after a sibling plane mutated. The destructure names every

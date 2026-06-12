@@ -1875,7 +1875,7 @@ fn intent_suffix(intent_id: &str) -> String {
 /// Fail-open: an unstamped Job degrades to the legacy no-arm re-ack,
 /// never a skewed echo (the scheduler refuses a whole ack on one
 /// undecodable entry — validate-then-commit).
-fn intent_cells_annotation_value(i: &SpawnIntent) -> Option<String> {
+pub(super) fn intent_cells_annotation_value(i: &SpawnIntent) -> Option<String> {
     if i.hw_class_names.is_empty() || i.hw_class_names.len() != i.node_affinity.len() {
         return None;
     }
@@ -1907,7 +1907,22 @@ fn intent_cells_annotation_value(i: &SpawnIntent) -> Option<String> {
 /// the shape the scheduler's arm decode consumes; pairing holds by
 /// construction (`names.len() == terms.len()` from one parsed list).
 /// `None` on an absent/garbled annotation (the legacy no-arm echo).
-fn cells_from_annotation(
+///
+/// bug_142 (R25-as-extended): this reconstruction of wire terms from
+/// persisted state is a PRODUCER of the capacity alphabet — every cap
+/// segment round-trips the same typed parser the consumer decodes
+/// with ([`rio_common::cell_wire::WireCapacity::parse`], the shared
+/// alphabet owner; validation only — the verbatim token is re-emitted
+/// for byte-fidelity, since the arm decode accepts both wire and
+/// Karpenter forms). An out-of-alphabet segment (rollback skew after
+/// a future alphabet extension; webhook mutation) degrades the WHOLE
+/// row to `None` — the same fail-open lane as the render half and the
+/// no-stamp skip (the scheduler keeps its last-armed truth; the
+/// residual is priced by the `assemble_re_acks` skip paragraph) —
+/// disclosed via the warn below. Per merged_bug_134 a PARTIAL re-emit
+/// (dropping just the poisoned cell) is forbidden: N−1 cells forge a
+/// different cell set than the original spawn ack armed.
+pub(super) fn cells_from_annotation(
     v: &str,
 ) -> Option<(Vec<String>, Vec<rio_proto::types::NodeSelectorTerm>)> {
     let mut names = Vec::new();
@@ -1915,6 +1930,16 @@ fn cells_from_annotation(
     for row in v.split(',') {
         let (h, cap) = row.split_once(':')?;
         if h.is_empty() || cap.is_empty() {
+            return None;
+        }
+        if rio_common::cell_wire::WireCapacity::parse(cap).is_none() {
+            warn!(
+                row,
+                "intent-cells annotation cap segment outside the shared capacity \
+                 alphabet; degrading the row to the no-echo skip lane (bug_142 — \
+                 the scheduler keeps its last-armed cells; heals at the Job's \
+                 terminal cycle)"
+            );
             return None;
         }
         names.push(h.to_string());

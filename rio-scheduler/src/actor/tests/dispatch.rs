@@ -1011,6 +1011,7 @@ async fn ice_mask_is_read_time() {
     let masked: crate::sla::config::Cell = ("intel-6".into(), CapacityType::Spot);
     actor
         .handle_ack_spawned_intents(&[], &["intel-6:spot".into()], &[], &[], &[], None, &[])
+        .1
         .expect("applied under leadership");
     assert!(actor.ice.is_masked(&masked));
 
@@ -1133,6 +1134,7 @@ async fn ice_step_doubles_across_mark_without_clear() {
                 None,
                 &[],
             )
+            .1
             .expect("applied under leadership");
     }
     assert_eq!(
@@ -1145,6 +1147,7 @@ async fn ice_step_doubles_across_mark_without_clear() {
     // `registered_cells` IS the success signal → resets.
     actor
         .handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()], &[], &[], None, &[])
+        .1
         .expect("applied under leadership");
     assert_eq!(actor.ice.step(&cell), None, "registered_cells clears");
 }

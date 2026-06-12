@@ -14,18 +14,26 @@ use crate::state::{BuildOptions, DrvHash, ExecutorId, PriorityClass};
 #[cfg(test)]
 use super::handle::DebugDerivationInfo;
 
-// r[impl sched.sla.ack-validate-then-commit+1]
-/// Why an `AckSpawnedIntents` payload was NOT applied
+// r[impl sched.sla.ack-validate-then-commit+2]
+/// Why an `AckSpawnedIntents` payload was not (fully) applied
 /// (merged_bug_005 — ack means applied under leadership; bug_094 —
 /// validate-then-commit: every refusal is computed by
 /// `AckApplyPlan::validate` BEFORE the first state mutation, so an
-/// erring Ack means NO plane landed). Mapped to a gRPC error by the
+/// erring Ack names what did NOT land). Mapped to a gRPC error by the
 /// admin layer; the controller's commit-on-Ack buffer survives an
-/// erring Ack and redelivers the whole buffer — safe, because an
-/// erring Ack applied nothing, and redelivery after an Ok the
-/// controller never observed is a no-op by construction
-/// (merged_bug_008: cell events carry producer evidence epochs and
-/// the ladder no-ops `epoch <= last_applied[cell]`).
+/// erring Ack and redelivers the whole buffer — safe, because every
+/// plane that DID land is redelivery-idempotent (merged_bug_008: cell
+/// events carry producer evidence epochs and the ladder no-ops
+/// `epoch <= last_applied[cell]`; observed types upsert; binding
+/// snapshots rebuild wholesale), and a refused plane applied nothing.
+///
+/// bug_142 (R30 + OQ-15): refusal granularity is PER-PLANE.
+/// `NotLeader` is the one whole-request lane (the payload was dropped
+/// entire); `PlanesRefused` is the per-plane aggregate — every plane
+/// it does NOT name landed. The leaf variants
+/// (`PlaneEntryUndecodable`, `ArmEchoSkewed`) appear only inside
+/// `PlanesRefused.refused` (one per refused plane, first error each)
+/// — never nested, never top-level on the reply wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AckApplyError {
     /// Deposed between the gRPC-layer leader check and the actor
@@ -35,11 +43,28 @@ pub enum AckApplyError {
     /// controller wiped consume-once evidence the standby never
     /// applied.
     NotLeader,
+    /// bug_142: the per-plane refusal aggregate — `refused` carries
+    /// the FIRST refusal per refused plane (each a leaf variant,
+    /// wire-field order, never nested, non-empty by construction);
+    /// every plane NOT named applied this request. The controller
+    /// retains its buffered planes on this error and redelivers;
+    /// landed planes no-op on re-application through their own
+    /// idempotency laws (epoch gate / upsert / wholesale rebuild)
+    /// while the level-triggered planes (binding snapshot, rejected
+    /// verdicts) are re-derived fresh per tick, never redelivered
+    /// from the buffer.
+    PlanesRefused {
+        /// One leaf refusal per refused plane, wire-field order.
+        refused: Vec<AckApplyError>,
+    },
     /// A plane entry failed the strict shared-grammar decode
-    /// (`rio_common::cell_wire`). The WHOLE request is refused before
-    /// any mutation — pre-fix the entry was silently dropped while
-    /// the Ack answered Ok, and the controller then destroyed its
-    /// consume-once buffer on Ack-Ok ("the ONLY clear"). The refusal
+    /// (`rio_common::cell_wire`). The entry's PLANE is refused before
+    /// any of that plane's state mutates (bug_142: sibling planes
+    /// apply — pre-fix the whole request refused, and one durable
+    /// poisoned row blacked out every evidence plane for its life;
+    /// pre-bug_094 the entry was silently dropped while the Ack
+    /// answered Ok, and the controller then destroyed its
+    /// consume-once buffer on Ack-Ok). The refusal
     /// is a loud producer-skew signal: the controller warns and
     /// redelivers its retained buffer.
     PlaneEntryUndecodable {
@@ -89,7 +114,8 @@ pub enum AckPlane {
     SpawnedArming,
     /// `rejected` (wire field 7) — live_051(c) per-intent
     /// no-hosting-class verdicts. An entry whose reason falls outside
-    /// the closed `IntentVerdictReason` alphabet refuses the request.
+    /// the closed `IntentVerdictReason` alphabet refuses the plane
+    /// (bug_142; the ordinal treats the refused plane as a non-event).
     Rejected,
 }
 

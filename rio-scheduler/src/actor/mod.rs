@@ -1778,7 +1778,7 @@ impl DagActor {
                     // unapplied payload, so the controller's
                     // commit-on-Ack buffer survives to redeliver at
                     // the next leader.
-                    let applied = if self.leader.is_leader() {
+                    let (poisons, verdict) = if self.leader.is_leader() {
                         self.handle_ack_spawned_intents(
                             &spawned,
                             &unfulfillable_cells,
@@ -1789,23 +1789,20 @@ impl DagActor {
                             &rejected,
                         )
                     } else {
-                        Err(command::AckApplyError::NotLeader)
+                        (Vec::new(), Err(command::AckApplyError::NotLeader))
                     };
                     // live_051(c): budget crossings poison AFTER the
-                    // atomic apply (commit is infallible — a poison
-                    // can never follow a half-applied ack) and BEFORE
-                    // the reply, in this arm's async context.
-                    let applied = match applied {
-                        Ok(poisons) => {
-                            self.apply_no_host_poisons(poisons).await;
-                            Ok(())
-                        }
-                        Err(e) => Err(e),
-                    };
+                    // atomic apply (commit applies exactly the decoded
+                    // planes — bug_142: poisons from an APPLIED
+                    // verdict plane fire even when a sibling plane
+                    // refused; the verdict below discloses which
+                    // planes did not land) and BEFORE the reply, in
+                    // this arm's async context.
+                    self.apply_no_host_poisons(poisons).await;
                     // Receiver gone = RPC already failed client-side;
                     // nothing to report (the controller retains its
                     // buffer either way).
-                    let _ = reply.send(applied);
+                    let _ = reply.send(verdict);
                 }
                 ActorCommand::Tick => {
                     self.handle_tick().await;

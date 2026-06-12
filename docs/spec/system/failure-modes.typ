@@ -370,3 +370,21 @@ or terminal event, and the reachability witness — under the doctrine above
   spawn) with the quint twin pair pinning both faces (the as-built module
   falsifies the liveness; the fixed module holds it with the re-latch
   safety).
+
+- *Ack-plane whole-request refusal (scheduler)*: the `AckSpawnedIntents`
+  whole-request refusal composed with the controller's durable Job-template
+  annotation --- `assemble_re_acks` re-derives the poisoned row every tick,
+  the consumer refused the whole request on one undecodable entry, and the
+  redelivery loop became an absorbing state blacking out every evidence
+  plane in the request with no self-heal. Exit edge (double --- defense in
+  depth across the version-skew window neither side alone covers): the
+  producer round-trips the typed capacity parser and degrades a poisoned
+  row to the no-echo skip lane (the mint dies at the source), and refusal
+  granularity drops to per-plane at the consumer --- one poisoned entry
+  refuses its plane while sibling planes apply, lawful only with the
+  redelivery-idempotency obligation discharged per plane (epoch gate,
+  upsert, wholesale rebuild; the verdict plane asserted out of the
+  redelivery loop) --- so the loop converges instead of wedging
+  (#rref("sched.sla.ack-validate-then-commit")). Reachability witnessed by
+  the sibling-planes-apply red across three redeliveries and the
+  state-equality cell against one clean apply.

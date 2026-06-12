@@ -389,8 +389,20 @@ module iceEvidenceAck {
 
   // --- invariants -----------------------------------------------------------------
 
-  /// A refusal applies nothing (validate-then-commit; bug_094 +
-  /// merged_bug_008's apply-before-refuse axis).
+  /// A refusal applies nothing OF THE REFUSED SCOPE
+  /// (validate-then-commit; bug_094 + merged_bug_008's
+  /// apply-before-refuse axis). Scope note (bug_142, round-11): the
+  /// real reply contract is now PER-PLANE — this model's `refuse`
+  /// action encodes the lanes where the refusal covers everything it
+  /// shipped: the whole-request NotLeader drop, and a refused
+  /// CELL-EVENT plane withholding its own ladder mutations (this
+  /// model's entire state is the ladder, so both collapse to
+  /// "nothing applied" here). The cross-plane partial case — an Err
+  /// naming one refused plane while SIBLING planes (binding,
+  /// observed, verdicts) applied — is outside this model's alphabet
+  /// by construction and is witnessed at the rust tier
+  /// (w11_bf_poisoned_plane_refuses_alone_siblings_apply and the
+  /// redelivery state-equality cell in sla_contract.rs).
   val errImpliesNoMutation = not(errApplied)
 
   /// Delivery of already-applied evidence (all epochs <= the cells'
