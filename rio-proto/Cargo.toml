@@ -24,6 +24,9 @@ prost-types = { workspace = true }
 # castore_util::directory_digest — the canonical dir_digest both the
 # builder (producer) and store (validator) compute.
 blake3 = { workspace = true }
+# submit_reject: the SubmitBuild stale-digest message encodes/parses
+# digests as hex (shared scheduler↔client contract).
+hex = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -45,8 +48,6 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 # Interceptor roundtrip test needs a real (non-noop) tracer to get
 # non-zero trace IDs, and the W3C propagator to register.
 opentelemetry_sdk = { workspace = true }
-# Golden tests pin canonical Derivation bytes/digests as hex.
-hex = { workspace = true }
 # derivation_util round-trip/tamper property tests.
 proptest = { workspace = true }
 rstest = { workspace = true }

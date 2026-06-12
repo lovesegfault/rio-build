@@ -86,6 +86,7 @@ pub mod refusal;
 // visible globally regardless of module visibility — `pub` would only
 // add an empty namespace to the docs.
 mod status;
+pub mod submit_reject;
 pub mod validated;
 
 /// Shared protobuf types (messages, enums) used across all services.

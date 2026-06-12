@@ -3159,6 +3159,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "futures-util",
+ "hex",
  "opentelemetry",
  "prost",
  "prost-types",

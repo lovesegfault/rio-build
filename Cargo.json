@@ -21138,6 +21138,10 @@
           "packageId": "futures-util"
         },
         {
+          "name": "hex",
+          "packageId": "hex"
+        },
+        {
           "name": "opentelemetry",
           "packageId": "opentelemetry"
         },
@@ -21209,10 +21213,6 @@
         }
       ],
       "devDependencies": [
-        {
-          "name": "hex",
-          "packageId": "hex"
-        },
         {
           "name": "opentelemetry_sdk",
           "packageId": "opentelemetry_sdk"

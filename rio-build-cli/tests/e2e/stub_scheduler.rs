@@ -219,12 +219,11 @@ impl SchedulerService for StubScheduler {
             missing.sort();
             missing.dedup();
             self.state.lock().unwrap().rejects += 1;
-            return Err(Status::failed_precondition(format!(
-                "unknown drv digests (not in this submission, not in the store): [{}] — \
-                 re-check presence (HasDrvs), upload the missing drv blobs (PutDrvBlobs), \
-                 and resubmit",
-                missing.join(", ")
-            )));
+            // Same shared formatter the real scheduler uses — the e2e
+            // recovery cycle exercises the production message shape.
+            return Err(Status::failed_precondition(
+                rio_proto::submit_reject::missing_drv_digests_message(&missing),
+            ));
         }
 
         let (build_id, log, hold_open) = {
