@@ -139,6 +139,14 @@ REGISTRY = [
     # from the closed R29 alphabet; un-rowed constants grandfathered
     # shrink-only at nix/duration-census-grandfather.txt.
     ("duration-census", "nix/census_corpora.py", r"DURATION_IDIOM_CELLS", {"scope", "alias"}, set(), r"DURATION_IDIOM_CELLS = \["),
+    # bw11 S8 (WO-S8-11(ii)): the R30 exit-edge census — population =
+    # enrolled R14 seed rows UNION the latch-idiom grep grammar
+    # (give-up predicates through the qualification product,
+    # retain-with-latch, ON CONFLICT enqueues fail-closed on
+    # unresolvable tables, GIVE_UP/MAX_ATTEMPTS/BUDGET const
+    # families); un-rowed hits grandfathered shrink-only at
+    # nix/exit-edge-grandfather.txt.
+    ("exit-edge-census", "nix/census_corpora.py", r"EXIT_EDGE_GIVEUP", {"scope", "fold-site"}, set(), r"EXIT_EDGE_GIVEUP = re\.compile"),
 ]
 
 MODEL_DIVERGENCE = re.compile(
@@ -640,6 +648,232 @@ def check_duration_census(src_root, mint=False):
     return fails
 
 
+# --- the R30 exit-edge census (WO-S8-11(ii)) ----------------------------
+#
+# Every absorbing or latched state ships its EXIT EDGE in the same
+# commit that ships the latch (R30): the close names the reset event
+# AND proves it REACHABLE from inside the latched state under that
+# state's own invariants. This census is the standing enforcement:
+# every latch/budget/cap/refusal row names its exit edge and its
+# reachability witness.
+#
+# DETECTION PREDICATE (CE-3 — no self-certification; the census-red
+# claim carries the predicate that finds new latches): population =
+# the R14 typed-construction seed rows (enrolled at the wave-close
+# tree as the slots land them: GaveUpReset, the expiring
+# HoldClearance, the outbox reset edge, the per-plane refusal, the
+# poison terminal) UNION the [GEN-SET] grep grammar below over latch
+# idioms verified at 4ba130cf5:
+#   give-up-pred    — `attempts/deaths >= <CONST>` predicates
+#                     (candidate.rs blocks_respawn-class), const
+#                     captured through the qualification product
+#                     (`Self::`/module-qualified — the bug_091
+#                     lesson applied at birth);
+#   retain-latch    — `.retain(…)`/`.retain_rows(…)` whose closure
+#                     consults a latch predicate (blocks_/gave_up —
+#                     candidate.rs:946-class);
+#   on-conflict-*   — `INSERT … ON CONFLICT DO NOTHING` / guarded
+#                     `DO UPDATE` enqueues in SQL strings (the
+#                     bug_111 swallow shape; gc/mod.rs-class), the
+#                     target table the identity — an INSERT the
+#                     classifier cannot resolve a table from REFUSES
+#                     (fail-closed), never skips;
+#   const-family    — GIVE_UP/MAX_ATTEMPTS/BUDGET const families.
+# Pre-existing hits are grandfathered at mint (nix/exit-edge-
+# grandfather.txt, SHRINK-ONLY — the standing debt visible; bug_151's
+# gave-up latch IS the founding grandfather entry until S7's
+# GaveUpReset row retires it at the wave close).
+EXIT_EDGE_GIVEUP = re.compile(
+    r"\b(?:deaths|attempts|failures|fails|strikes)\w*\s*(?:>=|>)\s*"
+    r"(?:\w+::)*([A-Z][A-Z0-9_]{2,})\b"
+)
+EXIT_EDGE_CONSTFAM = re.compile(r"\bconst\s+(\w*(?:GIVE_UP|MAX_ATTEMPTS|_BUDGET)\w*)\s*:")
+EXIT_EDGE_RETAIN = re.compile(r"\.retain(?:_rows)?\s*\(")
+EXIT_EDGE_LATCHWORD = re.compile(r"blocks_|gave_up|give_up")
+EXIT_EDGE_GRANDFATHER = "nix/exit-edge-grandfather.txt"
+
+# Enrolled rows — (file, idiom, identity) -> (reset event,
+# reachability witness). Seeds land with their slots this wave; the
+# integrator enrolls them at the wave-close re-mint from the H-pack
+# records (H3'''/H5'''/H7''' name the landed shapes).
+EXIT_EDGE_ROWS = {}
+
+
+def exit_edge_finder(files):
+    """(rel, idiom, identity) hits over (rel, raw) files; fail-closed
+    per R22″ — an ON CONFLICT insert without a resolvable table is a
+    refusal row, never a skip."""
+    out = []
+    for rel, raw in files:
+        try:
+            pruned = rust_strip.strip_cfg_test(raw, source=rel)
+        except rust_strip.StripError as e:
+            out.append((rel, "refusal", str(e)))
+            continue
+        lexed, spans, _ = rust_strip.lex_full(pruned, blank_string_bodies=True)
+        for m in EXIT_EDGE_GIVEUP.finditer(lexed):
+            out.append((rel, "give-up-pred", m.group(1)))
+        for m in EXIT_EDGE_CONSTFAM.finditer(lexed):
+            out.append((rel, "const-family", m.group(1)))
+        for m in EXIT_EDGE_RETAIN.finditer(lexed):
+            ext = rust_strip._match_delim(lexed, m.end() - 1)
+            if EXIT_EDGE_LATCHWORD.search(lexed[m.end() : ext]):
+                out.append(
+                    (rel, "retain-latch", f"L{lexed.count(chr(10), 0, m.start()) + 1}")
+                )
+        for a, b, _is_raw in spans:
+            body = pruned[a:b]
+            if "ON CONFLICT" in body and "INSERT" in body.upper():
+                tm = re.search(r"INSERT INTO\s+(\w+)", body, re.I)
+                kind = "on-conflict-do-update" if "DO UPDATE" in body else "on-conflict-do-nothing"
+                if tm is None:
+                    out.append(
+                        (
+                            rel,
+                            "refusal",
+                            f"{rel}:{pruned.count(chr(10), 0, a) + 1}: ON CONFLICT "
+                            f"insert without a resolvable target table — refusing "
+                            f"(fail-closed; name the table or restructure)",
+                        )
+                    )
+                    continue
+                out.append((rel, kind, tm.group(1)))
+    return out
+
+
+def check_exit_edge_census(src_root, mint=False):
+    files = []
+    for crate in REFUSAL_SCAN_CRATES:
+        for f in sorted((src_root / crate / "src").rglob("*.rs")):
+            rel = str(f.relative_to(src_root))
+            if "/tests/" in rel or rel.endswith("test_helpers.rs"):
+                continue
+            files.append((rel, f.read_text()))
+    found = exit_edge_finder(files)
+    fails = [ident for rel, idiom, ident in found if idiom == "refusal"]
+    found_keys = {(r, i, n) for r, i, n in found if i != "refusal"}
+    for (rel, idiom, name), (reset, witness) in sorted(EXIT_EDGE_ROWS.items()):
+        if (rel, idiom, name) not in found_keys:
+            fails.append(
+                f"exit-edge row {rel}:{idiom}:{name}: NOT located by the finder "
+                f"grammar — rot or a finder hole (rows are mandatory vectors)"
+            )
+        if not reset.strip() or not witness.strip():
+            fails.append(f"exit-edge row {rel}:{idiom}:{name}: empty reset event or witness")
+    gf_path = src_root / EXIT_EDGE_GRANDFATHER
+    unrowed = sorted(
+        f"{r}\t{i}\t{n}" for (r, i, n) in found_keys if (r, i, n) not in EXIT_EDGE_ROWS
+    )
+    if mint:
+        gf_path.write_text("".join(k + "\n" for k in unrowed))
+        return [f"minted {len(unrowed)} exit-edge grandfather entries"]
+    grandfathered = set()
+    if gf_path.is_file():
+        grandfathered = {x for x in gf_path.read_text().splitlines() if x.strip()}
+    for k in unrowed:
+        if k not in grandfathered:
+            r, i, n = k.split("\t")
+            fails.append(
+                f"{r}: latch idiom `{i}:{n}` has no exit-edge row — name its reset "
+                f"event and reachability witness in EXIT_EDGE_ROWS (R30: every "
+                f"latch ships its exit edge same-commit)"
+            )
+    for stale in sorted(grandfathered - set(unrowed)):
+        fails.append(
+            f"{stale.split(chr(9))[0]}: stale exit-edge grandfather entry "
+            f"({stale!r}) — remove it from {EXIT_EDGE_GRANDFATHER} (shrink-only)"
+        )
+    return fails
+
+
+# --- the R22″ self-coverage gate (WO-S8-11(ii), rides the same
+# commit) ----------------------------------------------------------------
+#
+# (a) scanner→corpus mapping: every census ARM of this file registers
+#     its own REGISTRY row — an unregistered census is itself a gate
+#     red (the existing reverse-direction check covers generator-
+#     shaped FILES; this covers the in-file arms);
+# (b) residual pricing is SCHEMA-TYPED FIRST: a census row that
+#     prices a residual against a compensating control declares it in
+#     REGISTRY_RESIDUALS with the control's firing-predicate anchor,
+#     and the anchor must resolve (the machine-bind — bug_132's
+#     channel killed at registered-census strength: the mapping in
+#     (a) is what makes "registered" total);
+# (c) the prose backstop (DEMOTED tier — word-shape detection alone
+#     is the R23′ failure mode): pricing phrases in the registry
+#     block's comments adjacent to a gaps-bearing row without a
+#     REGISTRY_RESIDUALS entry are reds;
+# (d) zero undispositioned priced-gap rows: no row may carry BOTH a
+#     non-empty gaps set AND pricing prose (the CE-7 disposition —
+#     the wire-secs fold-site row retired its gap WITH the bind).
+SELF_COVERAGE_ARMS = {
+    "wire-secs-pacing-seams",
+    "duration-census",
+    "exit-edge-census",
+}
+REGISTRY_RESIDUALS = {
+    # (census, residual) -> firing-predicate anchor (regex over the
+    # census's anchor file; the compensating control's own test).
+    ("wire-secs-pacing-seams", "fold-site"): r"WIRE_SECS_BACKSTOP_VECTORS",
+}
+PRICING_PROSE = re.compile(r"\bcovered by\b|\bcompensat\w+\b|\bsuffices\b|\bprice[sd]?\b", re.I)
+
+
+def check_self_coverage(src_root, arms=None, residuals=None):
+    arms = SELF_COVERAGE_ARMS if arms is None else arms
+    residuals = REGISTRY_RESIDUALS if residuals is None else residuals
+    fails = []
+    names = {row[0] for row in REGISTRY}
+    missing = arms - names
+    if missing:
+        fails.append(
+            f"self-coverage: census arm(s) {sorted(missing)} have no REGISTRY row — "
+            f"an unregistered census is a gate red (the scanner→corpus mapping)"
+        )
+    self_text = (src_root / "nix" / "census_corpora.py").read_text()
+    for (census, residual), anchor in sorted(residuals.items()):
+        row = next((r for r in REGISTRY if r[0] == census), None)
+        if row is None:
+            fails.append(f"self-coverage: residual entry for unregistered census {census}")
+            continue
+        anchor_file = src_root / row[1]
+        text = anchor_file.read_text() if anchor_file.is_file() else ""
+        if not re.search(anchor, text):
+            fails.append(
+                f"self-coverage: {census}:{residual} residual bind anchor /{anchor}/ "
+                f"does not resolve in {row[1]} — the compensating control's firing "
+                f"predicate rotted; the residual is UNBOUND (census red)"
+            )
+    # (c)+(d): walk the REGISTRY source block; for each row line,
+    # inspect the comment block above it.
+    lines = self_text.splitlines()
+    for idx, line in enumerate(lines):
+        m = re.match(r'\s*\("([\w-]+)",\s*"[^"]+",.*\{([^}]*)\}\s*,', line)
+        if not m:
+            continue
+        census = m.group(1)
+        row = next((r for r in REGISTRY if r[0] == census), None)
+        if row is None or not row[4]:
+            continue  # no gaps — nothing to disposition
+        comment = []
+        j = idx - 1
+        while j >= 0 and lines[j].lstrip().startswith("#"):
+            comment.append(lines[j])
+            j -= 1
+        blob = "\n".join(reversed(comment))
+        if PRICING_PROSE.search(blob):
+            for ax in row[4]:
+                if (census, ax) not in residuals:
+                    fails.append(
+                        f"self-coverage: registry row `{census}` carries gaps "
+                        f"{sorted(row[4])} WITH pricing prose but no "
+                        f"REGISTRY_RESIDUALS bind for `{ax}` — fix the gap or "
+                        f"machine-bind the compensating control (R22″: prose "
+                        f"pricing is the bug_132 channel)"
+                    )
+    return fails
+
+
 # --- the retired-knob-phrase arm (WO-S8-9, merged_bug_055) -------------
 #
 # store_pool_cpu_limit's three doc tiers (deploy.rs fn doc, the
@@ -729,7 +963,8 @@ REFUSAL_SCAN_CRATES = ["rio-builder", "rio-store", "rio-gateway", "rio-scheduler
 def main() -> int:
     args = [a for a in sys.argv[1:]]
     mint_duration = "--mint-duration-grandfather" in args
-    args = [a for a in args if a != "--mint-duration-grandfather"]
+    mint_exit_edge = "--mint-exit-edge-grandfather" in args
+    args = [a for a in args if not a.startswith("--mint-")]
     src_root = pathlib.Path(args[0])
 
     # A broken shared lexer fails closed before any scan may gate.
@@ -979,6 +1214,56 @@ def main() -> int:
         if len(named) != 1:
             print(f"FAIL: the unrowed duration const did not red: {f_d}", file=sys.stderr)
             return 1
+    # --- the R30 exit-edge census plants (WO-S8-11(ii)) ----------------
+    # One finder-vector per latch-idiom cell, incl. the qualification
+    # product on the give-up predicate (the bug_091 lesson at birth).
+    ee_vectors = [
+        ("give-up-pred", "fn f(&self) -> bool { self.deaths >= RESPAWN_GIVE_UP_DEATHS }\n", "RESPAWN_GIVE_UP_DEATHS"),
+        ("give-up-pred", "fn f(&self) -> bool { self.attempts > Self::ZERO_BACKOFF_STREAK }\n", "ZERO_BACKOFF_STREAK"),
+        ("retain-latch", "fn f(&mut self) { self.rows.retain(|r| r.blocks_respawn(now)); }\n", "L1"),
+        ("on-conflict-do-nothing", 'const Q: &str = "INSERT INTO outbox (id) VALUES ($1) ON CONFLICT DO NOTHING";\n', "outbox"),
+        ("on-conflict-do-update", 'const Q: &str = "INSERT INTO state (k) VALUES ($1) ON CONFLICT (k) DO UPDATE SET k = $1";\n', "state"),
+        ("const-family", "const REPORT_RETRY_BUDGET: u32 = 3;\n", "REPORT_RETRY_BUDGET"),
+    ]
+    for idiom, snippet, ident in ee_vectors:
+        got = [h for h in exit_edge_finder([("planted/ee.rs", snippet)]) if h[1] != "refusal"]
+        if len(got) != 1 or got[0][1] != idiom or got[0][2] != ident:
+            print(f"FAIL: exit-edge finder vector ({idiom}/{ident}) not located: {got}", file=sys.stderr)
+            return 1
+    # The fail-closed refusal plant: an ON CONFLICT insert whose table
+    # the classifier cannot resolve REFUSES, never skips.
+    refused_ee = exit_edge_finder(
+        [("planted/dyn.rs", 'fn q(t: &str) -> String { format!("INSERT INTO {t} VALUES ($1) ON CONFLICT DO NOTHING") }\n')]
+    )
+    if not any(h[1] == "refusal" and "resolvable target table" in h[2] for h in refused_ee):
+        print(f"FAIL: the unresolvable-table ON CONFLICT did not refuse: {refused_ee}", file=sys.stderr)
+        return 1
+    # The strawman violating row: an unrowed latch is a named red.
+    with tempfile.TemporaryDirectory() as td:
+        straw_root = pathlib.Path(td)
+        (straw_root / "rio-store" / "src").mkdir(parents=True)
+        (straw_root / "rio-store" / "src" / "lib.rs").write_text(
+            "fn f(&self) -> bool { self.attempts >= ROGUE_GIVE_UP_MAX }\n"
+        )
+        f_e = check_exit_edge_census(straw_root)
+        if len([x for x in f_e if "ROGUE_GIVE_UP_MAX" in x and "no exit-edge row" in x]) != 1:
+            print(f"FAIL: the unrowed latch did not red: {f_e}", file=sys.stderr)
+            return 1
+    # --- the R22'' self-coverage gate plants ---------------------------
+    # (a) an unregistered census arm is a gate red;
+    f_sc = check_self_coverage(src_root, arms=SELF_COVERAGE_ARMS | {"ghost-census"})
+    if not any("ghost-census" in x and "no REGISTRY row" in x for x in f_sc):
+        print(f"FAIL: the unregistered-census plant did not red: {f_sc}", file=sys.stderr)
+        return 1
+    # (b) a residual whose firing-predicate anchor does not resolve is
+    # an UNBOUND residual — census red (the bug_132 channel).
+    f_sc = check_self_coverage(
+        src_root,
+        residuals={("wire-secs-pacing-seams", "fold-site"): r"NO_SUCH_" + r"FIRING_PREDICATE"},
+    )
+    if not any("does not resolve" in x for x in f_sc):
+        print(f"FAIL: the dead residual-bind anchor did not red: {f_sc}", file=sys.stderr)
+        return 1
     # Arm F-allow: the allow grammar admits a documented exception.
     allowed_ws = "// wire-secs-census: allow(test fixture builds its own clock)\n" + WIRE_SECS_GRAMMAR[0][1]
     if scan_wire_secs_seams([("planted/allowed.rs", allowed_ws)]):
@@ -1056,7 +1341,15 @@ def main() -> int:
         for line in check_duration_census(src_root, mint=True):
             print(line)
         return 0
+    if mint_exit_edge:
+        for line in check_exit_edge_census(src_root, mint=True):
+            print(line)
+        return 0
     fails += check_duration_census(src_root)
+    # The R30 exit-edge census + the R22'' self-coverage gate
+    # (WO-S8-11(ii)).
+    fails += check_exit_edge_census(src_root)
+    fails += check_self_coverage(src_root)
 
     gaps = sorted(f"{name}:{ax}" for name, _, _, _, g, _ in REGISTRY for ax in g)
     derived = sum(1 for *_, d in REGISTRY if d is not None)
@@ -1066,7 +1359,9 @@ def main() -> int:
         f"{len(gaps)} grandfathered axis gaps (burn-down: {', '.join(gaps)}), "
         f"{md_count} MODEL-DIVERGENCE headers grammar-checked, "
         f"{len(refusal_files)} files swept by the negative refusal census and the wire-secs pacing-seam census, "
-        f"duration census {len(DURATION_CENSUS_ROWS)} rows enrolled"
+        f"duration census {len(DURATION_CENSUS_ROWS)} rows enrolled, "
+        f"exit-edge census {len(EXIT_EDGE_ROWS)} rows enrolled, "
+        f"self-coverage gate over {len(SELF_COVERAGE_ARMS)} arms + {len(REGISTRY_RESIDUALS)} bound residual(s)"
     )
     if fails:
         print("FAIL: census-corpora violations —", file=sys.stderr)
