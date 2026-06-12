@@ -248,6 +248,54 @@ const PUT_PATH_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Back
     jitter: rio_common::backoff::Jitter::Full,
 };
 
+// r[impl gw.putpath.emit-law]
+/// bug_118: THE single emit site for the PutPath failure series. The
+/// emit law binds to the OPERATION, not a callsite — this fn is the
+/// only place in the module that names the metric, and every
+/// failure-surfacing arm on every PutPath lane routes through one of
+/// the two typed surfacing adapters below, which consume the failure
+/// en route to the response (an arm that bypasses them has no error
+/// value to return — the R24 shape on an observability law; the
+/// W11-BI source census pins the discipline). The KEDA store
+/// ScaledObject's demand-side scale-collapse inhibitor consumes
+/// `sum(rate())` of exactly this series: pre-fix only the buffered
+/// lane emitted, so a streaming-dominated store outage (all non-.drv
+/// wopAddToStoreNar traffic + oversize AddMultiple) left the
+/// inhibitor FLAT — the merged_bug_038 defect re-instantiated one
+/// lane over.
+fn emit_put_path_failure(class: &'static str) {
+    metrics::counter!(
+        "rio_gateway_putpath_retry_events_total",
+        "class" => class,
+    )
+    .increment(1);
+}
+
+// r[impl gw.putpath.emit-law]
+/// Surface one status-bearing PutPath failure observation (buffered
+/// lane: every attempt's failure, retried or terminal; streaming
+/// lane: the store's terminal Status): emits the class-labeled
+/// counter and hands the status back for disposition.
+fn surface_put_path_failure(status: tonic::Status) -> tonic::Status {
+    emit_put_path_failure(rio_common::grpc::code_class_label(status.code()));
+    status
+}
+
+// r[impl gw.putpath.emit-law]
+/// Surface one statusless PutPath terminal failure (client NAR
+/// short-read, task panic, pre-stream channel close): a store status
+/// never existed, so the class is `"unknown"` BY DEFINITION — a
+/// first-class member of the seeded `CODE_CLASS_LABELS` alphabet,
+/// not a catch-all over it (a status-bearing failure downcasts and
+/// classifies by code instead).
+fn surface_put_path_failure_any(err: anyhow::Error) -> anyhow::Error {
+    match err.downcast_ref::<tonic::Status>() {
+        Some(s) => emit_put_path_failure(rio_common::grpc::code_class_label(s.code())),
+        None => emit_put_path_failure(rio_common::grpc::code_class_label(tonic::Code::Unknown)),
+    }
+    err
+}
+
 /// Upload a path to the store via gRPC PutPath (metadata + NAR chunks).
 ///
 /// Retries on `Code::Aborted` (concurrent same-path upload — store's
@@ -294,21 +342,18 @@ pub(super) async fn grpc_put_path(
         .await;
         let status = match result {
             Ok(resp) => return Ok(resp.into_inner().created),
-            Err(status) => status,
+            // THE class-labeled emit law (merged_bug_038, H8″; bound
+            // to the operation by bug_118): every failure observation
+            // at this chokepoint counts, labeled by its typed class —
+            // Unavailable/DeadlineExceeded/… cannot be non-emitting
+            // arms (R21: the uncounted terminal arm died). The store
+            // ScaledObject's demand-side inhibitor consumes this
+            // series; the label alphabet is
+            // rio_common::grpc::CODE_CLASS_LABELS (boot-seeded per
+            // class, lib.rs — bug_322 birth-gap discipline). The
+            // surfacing fn IS the emit site (one per module).
+            Err(status) => surface_put_path_failure(status),
         };
-        // THE class-labeled emit law (merged_bug_038, H8″): every
-        // failure observation at this chokepoint counts, labeled by
-        // its typed class — Unavailable/DeadlineExceeded/… cannot be
-        // non-emitting arms (R21: the uncounted terminal arm died).
-        // The store ScaledObject's demand-side inhibitor consumes
-        // this series; the label alphabet is
-        // rio_common::grpc::CODE_CLASS_LABELS (boot-seeded per class,
-        // lib.rs — bug_322 birth-gap discipline).
-        metrics::counter!(
-            "rio_gateway_putpath_retry_events_total",
-            "class" => rio_common::grpc::code_class_label(status.code()),
-        )
-        .increment(1);
         if status.code() == tonic::Code::Aborted {
             attempt += 1;
             // I-168: dashboard-visible retry budget (was log-only).
@@ -406,7 +451,12 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
         )),
     })
     .await
-    .map_err(|_| GatewayError::GrpcStream("PutPath channel closed before metadata".into()))?;
+    .map_err(|_| {
+        // bug_118: terminal arm — surfaces through the emit law.
+        surface_put_path_failure_any(
+            GatewayError::GrpcStream("PutPath channel closed before metadata".into()).into(),
+        )
+    })?;
 
     // Drive the gRPC call. Clone: tonic Channel is Arc-backed.
     // JWT wrapped BEFORE the spawn — jwt_token's lifetime doesn't
@@ -415,11 +465,16 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
     let mut req = with_jwt(outbound, jwt_token)?;
     attach_service_token(&mut req, service_signer);
-    let rpc: tokio::task::JoinHandle<anyhow::Result<tonic::Response<types::PutPathResponse>>> =
-        tokio::spawn(async move {
-            rio_common::grpc::with_timeout("PutPath", GRPC_STREAM_TIMEOUT, client.put_path(req))
-                .await
-        });
+    // bug_118: with_timeout_status (not with_timeout) so the
+    // store's Status survives to the surfacing fn typed — a timeout
+    // classifies deadline_exceeded instead of laundering through an
+    // anyhow message into "unknown".
+    let rpc: tokio::task::JoinHandle<
+        Result<tonic::Response<types::PutPathResponse>, tonic::Status>,
+    > = tokio::spawn(async move {
+        rio_common::grpc::with_timeout_status("PutPath", GRPC_STREAM_TIMEOUT, client.put_path(req))
+            .await
+    });
 
     // Read exactly nar_size bytes in NAR_CHUNK_SIZE chunks, forward each.
     // Backpressure: tx.send blocks when rpc isn't pulling. On a short read
@@ -490,9 +545,12 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
 
     drop(tx); // close channel → ReceiverStream yields None → rpc completes
 
-    let rpc_result = rpc
-        .await
-        .map_err(|e| GatewayError::GrpcStream(format!("PutPath task panicked: {e}")))?;
+    let rpc_result = rpc.await.map_err(|e| {
+        // bug_118: terminal arm (task panic — no store status).
+        surface_put_path_failure_any(
+            GatewayError::GrpcStream(format!("PutPath task panicked: {e}")).into(),
+        )
+    })?;
 
     // Error priority: pump error (NarRead — client short read) > rpc error.
     // A short read truncates the stream; the useful message is "NAR read at
@@ -500,8 +558,12 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     // variant is NarRead — a closed channel returns Ok above, so an early
     // store rejection (auth/quota/validation) surfaces via rpc_result?
     // with the store's actual Status, not a generic "channel closed".
-    pump_result?;
-    let resp = rpc_result?;
+    // bug_118: exactly ONE emission per terminal failure — the error
+    // that SURFACES is the one surfaced through the emit law (a
+    // swallowed rpc error behind a winning pump error stays uncounted
+    // by design: one operation, one terminal observation).
+    pump_result.map_err(surface_put_path_failure_any)?;
+    let resp = rpc_result.map_err(|s| anyhow::Error::from(surface_put_path_failure(s)))?;
     Ok(resp.into_inner().created)
 }
 
@@ -621,6 +683,7 @@ mod tests {
         }
     }
 
+    // r[verify gw.putpath.emit-law]
     /// W10-BQ (merged_bug_038, the H8'' emit law): every failure
     /// class observed at the PutPath chokepoint emits the
     /// class-labeled counter — an injected Unavailable outage must
@@ -659,6 +722,147 @@ mod tests {
              outage (the uncounted terminal arm) / right: the class-labeled \
              emit law counts it; keys seen: {:?}",
             rec.all_keys()
+        );
+    }
+
+    /// W11-BH (bug_118): the emit law binds to the OPERATION — the
+    /// STREAMING lane's failures must move the same class-labeled
+    /// series the buffered lane emits. All non-.drv wopAddToStoreNar
+    /// traffic plus oversize AddMultiple route through this lane, so
+    /// a streaming-dominated store outage pre-fix left the KEDA
+    /// scale-collapse inhibitor FLAT while every failure surfaced via
+    /// `pump_result?`/`rpc_result?` with zero emission — the
+    /// merged_bug_038 defect re-instantiated one lane over.
+    ///
+    /// Pre-fix red (the streaming-lane outage, counter flat):
+    ///   left: the streaming lane surfaces the store failure with
+    ///   ZERO emission (inhibitor flat) / right: every PutPath
+    ///   terminal failure increments exactly one class cell on every
+    ///   lane: `assertion failed ... left: 0 right: 1`.
+    // r[verify gw.putpath.emit-law]
+    #[test]
+    fn put_path_streaming_failures_emit_the_same_law() {
+        let rec = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&rec);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (store, addr, _h) = rio_test_support::grpc::spawn_mock_store()
+                .await
+                .expect("mock store");
+            // A store outage on the streaming lane: the put fails
+            // Unavailable; the lane is non-retried by design, so the
+            // failure is TERMINAL — and must still emit.
+            store.faults.fail_next_puts.store(1, SeqCst);
+            let client = rio_proto::StoreServiceClient::connect(format!("http://{addr}"))
+                .await
+                .expect("connect");
+            let info = put_info("/nix/store/cccccccccccccccccccccccccccccccc-strm-1.0");
+            let mut nar_hash = vec![0u8; 32];
+            hex::decode_to_slice(NAR_FIXTURE_SHA256, &mut nar_hash).expect("fixture hex");
+            let mut reader = std::io::Cursor::new(NAR_FIXTURE.to_vec());
+            let res = grpc_put_path_streaming(
+                &client,
+                None,
+                None,
+                info,
+                &mut reader,
+                NAR_FIXTURE.len() as u64,
+                nar_hash,
+            )
+            .await;
+            assert!(
+                res.is_err(),
+                "the injected outage must surface; got {res:?}"
+            );
+        });
+        assert_eq!(
+            rec.get("rio_gateway_putpath_retry_events_total{class=unavailable}"),
+            1,
+            "left: the streaming lane surfaces the store failure with ZERO \
+             emission (inhibitor flat during streaming-dominated outages) / \
+             right: every PutPath terminal failure increments exactly one \
+             class cell on every lane; keys seen: {:?}",
+            rec.all_keys()
+        );
+    }
+    /// W11-BI (bug_118, [GEN-SET]): the lane census — the emit law's
+    /// single-site discipline pinned structurally over THIS module's
+    /// source. Generator: the module source itself (include_str!);
+    /// the census derives the populations by token scan instead of an
+    /// author-typed list, so a new failure-surfacing arm that
+    /// bypasses the chokepoint moves a counted population and goes
+    /// red here.
+    ///
+    ///   (1) the metric literal appears exactly ONCE in production
+    ///       code (inside `emit_put_path_failure` — the law has one
+    ///       emit site);
+    ///   (2) every `return Err(` in the two PutPath lane fns routes
+    ///       through a surfacing adapter (`return Err(status.into())`
+    ///       shapes are gone);
+    ///   (3) the streaming lane's terminal `?` arms each name a
+    ///       surfacing adapter (metadata-send, task-join, pump, rpc —
+    ///       four sites, counted from the source).
+    // r[verify gw.putpath.emit-law]
+    #[test]
+    fn put_path_emit_law_census_one_site_every_lane() {
+        let src = include_str!("grpc.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module marker")];
+
+        // (1) one emit site.
+        assert_eq!(
+            prod.matches("\"rio_gateway_putpath_retry_events_total\"")
+                .count(),
+            1,
+            "the emit law has exactly ONE site (emit_put_path_failure); \
+             inline emits of the law's series are the bug_118 shape"
+        );
+
+        // Slice the two lane fns (production region order: buffered
+        // then streaming then get_path).
+        let buf_start = prod
+            .find("async fn grpc_put_path(")
+            .expect("buffered lane fn");
+        let strm_start = prod
+            .find("async fn grpc_put_path_streaming")
+            .expect("streaming lane fn");
+        let strm_end = prod.find("async fn grpc_get_path").unwrap_or(prod.len());
+        let buffered = &prod[buf_start..strm_start];
+        let streaming = &prod[strm_start..strm_end];
+
+        // (2) no naked terminal returns in either lane: every
+        // `return Err(` names a surfacing adapter on the same
+        // statement.
+        for (lane, body) in [("buffered", buffered), ("streaming", streaming)] {
+            for (i, _) in body.match_indices("return Err(") {
+                let stmt = &body[i..body[i..].find(';').map(|e| i + e).unwrap_or(body.len())];
+                assert!(
+                    stmt.contains("surface_put_path_failure") || stmt.contains("status.into()"),
+                    "{lane} lane: un-surfaced terminal arm: {stmt}"
+                );
+            }
+            // The buffered lane's `status.into()` returns are lawful:
+            // the status was ALREADY surfaced at the loop's single
+            // observation point (every failure observation counts,
+            // retried or terminal — emitting again at the terminal
+            // would double-count).
+        }
+        assert!(
+            buffered.contains("Err(status) => surface_put_path_failure(status)"),
+            "buffered lane: the loop's failure observation must route \
+             through the surfacing fn"
+        );
+
+        // (3) the streaming lane's four terminal arms.
+        assert_eq!(
+            streaming.matches("surface_put_path_failure").count(),
+            4,
+            "streaming lane: four terminal arms (metadata-send, \
+             task-join, pump, rpc) each surface through the law; a \
+             changed count means an arm was added or bypassed — \
+             re-derive the census"
         );
     }
 }

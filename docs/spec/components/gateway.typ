@@ -2017,6 +2017,31 @@ every established session on the instance with it.
   where the I-068 collision case does not apply.
 ]
 
+#r("gw.putpath.emit-law")[
+  Every PutPath failure observation at the gateway MUST emit exactly one
+  #(refs.metric)("rio_gateway_putpath_retry_events_total") increment labeled
+  by typed status class (the shared `CODE_CLASS_LABELS` alphabet;
+  a failure carrying no store status classifies `unknown` by definition),
+  on EVERY lane --- the buffered lane counts each attempt's failure
+  observation, retried or terminal, and the streaming lane counts each
+  terminal failure --- through ONE surfacing chokepoint per module that
+  consumes the failure en route to the response, so a failure-surfacing
+  arm that bypasses the emit law is structurally unwritable. The store
+  ScaledObject's demand-side scale-collapse inhibitor consumes the sum of
+  this series across the class alphabet; a lane whose failures do not move
+  the series leaves the inhibitor flat during exactly the outages it
+  guards (the merged_bug_038 defect, re-instantiated one lane over as
+  bug_118).
+]
+
+The law binds to the OPERATION, not a callsite: round 10 closed the
+buffered lane's uncounted terminal arm and the claim "every failure
+observation" lived on in a HELP string while the streaming lane ---
+all non-`.drv` `wopAddToStoreNar` traffic plus oversize `AddMultiple`
+entries --- surfaced every store failure with zero emission. One typed
+surfacing function per module is the construction that makes the
+quantifier hold for future lanes too.
+
 = High Availability
 
 #r("gw.sched.balanced")[

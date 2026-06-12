@@ -99,16 +99,20 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_gateway_putpath_retry_events_total",
-        "Every failure observation at the gateway PutPath chokepoint, labeled \
-         by typed status class (class: the rio_common CODE_CLASS_LABELS \
-         alphabet — aborted, unavailable, deadline_exceeded, \
-         resource_exhausted, ...). THE emit law for the store ScaledObject's \
-         demand-side scale-collapse inhibitor: an outage class cannot be a \
+        "Every PutPath failure observation at the gateway, on every lane — \
+         the buffered lane counts each attempt's failure (retried or \
+         terminal) and the streaming lane counts each terminal failure — \
+         labeled by typed status class (class: the rio_common \
+         CODE_CLASS_LABELS alphabet — aborted, unavailable, \
+         deadline_exceeded, resource_exhausted, ...; statusless failures \
+         classify unknown). THE emit law for the store ScaledObject's \
+         demand-side scale-collapse inhibitor: a lane cannot be a \
          non-emitting arm, so the inhibitor's series moves during the \
          reachability outages it guards (a flat series during a store outage \
-         was the merged_bug_038 defect). Retried observations count too — \
-         rate() here reads upload-plane distress, not client-visible failures \
-         (surfaced errors are the attempt-budget tails)."
+         was the merged_bug_038 defect; the uncounted STREAMING lane was \
+         bug_118). rate() here reads upload-plane distress, not \
+         client-visible failures (surfaced errors are the attempt-budget \
+         tails)."
     );
     describe_counter!(
         "rio_gateway_build_resync_rate_paced_total",
