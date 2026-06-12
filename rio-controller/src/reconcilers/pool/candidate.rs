@@ -1169,17 +1169,23 @@ impl PoolStreaks {
         let decay = {
             let e = self.respawn.get_mut(pool, intent)?;
             match e.demand_cycle {
+                // The decay cell: strictly newer epoch on a GAVE-UP
+                // record (the two-guard split keeps the mid-ladder
+                // tracking arm distinct — collapsing them into one
+                // arm with a fallthrough `Some(_)` would silently
+                // drop the epoch-tracking law).
+                Some(latched) if observed_cycle > latched && e.deaths >= RESPAWN_GIVE_UP_DEATHS => {
+                    Some(GaveUpReset {
+                        deaths: e.deaths,
+                        latched_cycle: latched,
+                        fresh_cycle: observed_cycle,
+                    })
+                }
+                // Mid-ladder at a newer epoch: TRACK it (the give-up
+                // baseline stays current), never decay.
                 Some(latched) if observed_cycle > latched => {
-                    if e.deaths >= RESPAWN_GIVE_UP_DEATHS {
-                        Some(GaveUpReset {
-                            deaths: e.deaths,
-                            latched_cycle: latched,
-                            fresh_cycle: observed_cycle,
-                        })
-                    } else {
-                        e.demand_cycle = Some(observed_cycle);
-                        None
-                    }
+                    e.demand_cycle = Some(observed_cycle);
+                    None
                 }
                 Some(_) => None,
                 None => {
