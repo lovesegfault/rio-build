@@ -1938,7 +1938,18 @@ fn substitute_cell_message(
             "",
             format!("substitution of {path} refused ({class:?}): {detail}"),
         ),
-        _ => (
+        // bug_131 (R14/R25 narration-arm): the five ChargeInfra
+        // classes, NAMED — this chokepoint is an alphabet CONSUMER
+        // and inherits the kernel's no-catch-all discipline
+        // (SUBSTITUTE_FAILURE_CLASS_COUNT pins the alphabet at 9; the
+        // kernel enforces zero wildcards at every sibling fold). The
+        // retired `_ =>` arm would have compiled a TENTH class
+        // silently and narrated "infrastructure trouble" against a
+        // RetryUncharged disposition — the exact bug_194/
+        // merged_bug_149 contradiction this function exists to
+        // prevent; rustc exhaustiveness now forces wording and
+        // charging to be decided in the same edit.
+        C::Stalled | C::AdmissionSaturated | C::Fetch | C::Integrity | C::Ingest => (
             "",
             format!("substitution of {path} hit infrastructure trouble ({class:?}): {detail}"),
         ),
