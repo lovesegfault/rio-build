@@ -12,17 +12,23 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::lock;
+use crate::{Digest, Kind, lock, record};
 
 pub(crate) const PACKS_DIR: &str = "packs";
 pub(crate) const PACK_SUFFIX: &str = ".pack";
 
 pub(crate) struct Segment {
     file: File,
-    pub name: String,
+    /// `Arc<str>`: cloned into every `BlobLoc` this writer produces —
+    /// a refcount bump, not a fresh String per 140B record.
+    pub name: Arc<str>,
     pub len: u64,
+    /// Reused encode buffer — one allocation for the whole segment
+    /// lifetime instead of one per appended record.
+    scratch: Vec<u8>,
 }
 
 impl Segment {
@@ -58,7 +64,12 @@ impl Segment {
                     // (sources already unlinked) that is data loss,
                     // not a stale cache entry.
                     File::open(packs_dir)?.sync_data()?;
-                    return Ok(Segment { file, name, len: 0 });
+                    return Ok(Segment {
+                        file,
+                        name: name.into(),
+                        len: 0,
+                        scratch: Vec::new(),
+                    });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
@@ -67,14 +78,20 @@ impl Segment {
         Err(io::Error::other("could not allocate a unique segment name"))
     }
 
-    /// Append one encoded record; returns the record's start offset.
-    /// Unbuffered on purpose: records are written as one `write_all`
+    /// Encode and append one record; returns the record's start
+    /// offset. Unbuffered on purpose: each record is one `write_all`
     /// of a pre-assembled buffer, so `get` on freshly written data
     /// reads coherently through the page cache without a flush step.
-    pub(crate) fn append(&mut self, encoded: &[u8]) -> io::Result<u64> {
+    pub(crate) fn append_record(
+        &mut self,
+        kind: Kind,
+        payload: &[u8],
+        digest: &Digest,
+    ) -> crate::Result<u64> {
+        record::encode_into(&mut self.scratch, kind, payload, digest)?;
         let offset = self.len;
-        self.file.write_all(encoded)?;
-        self.len += encoded.len() as u64;
+        self.file.write_all(&self.scratch)?;
+        self.len += self.scratch.len() as u64;
         Ok(offset)
     }
 

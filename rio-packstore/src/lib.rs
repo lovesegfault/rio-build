@@ -27,6 +27,7 @@ use std::collections::hash_map::Entry;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -162,7 +163,7 @@ pub struct PackStore {
     /// Read fd cache. POSIX keeps reads through these safe even if a
     /// concurrent GC unlinks the pack; a digest mismatch or open
     /// failure falls back to a rebuild.
-    read_fds: RefCell<HashMap<String, File>>,
+    read_fds: RefCell<HashMap<Arc<str>, File>>,
     last_gc: Option<GcStats>,
 }
 
@@ -228,9 +229,8 @@ impl PackStore {
         if self.contains(&digest) {
             return Ok(digest);
         }
-        let encoded = record::encode(kind, bytes, &digest)?;
         let seg = self.segment()?;
-        let rec_offset = seg.append(&encoded)?;
+        let rec_offset = seg.append_record(kind, bytes, &digest)?;
         let pack = seg.name.clone();
         self.own.insert(
             digest,
@@ -360,6 +360,11 @@ impl PackStore {
     /// exclusive flock — see the index module docs for why a plain
     /// write-new + rename is data loss).
     pub fn flush(&mut self) -> Result<()> {
+        if self.own.is_empty() && self.own_roots.is_empty() {
+            // Nothing local to persist — don't take the exclusive lock
+            // and rewrite the whole index for a read-only handle.
+            return Ok(());
+        }
         if let Some(seg) = &self.segment {
             seg.sync()?;
         }
@@ -407,8 +412,8 @@ impl PackStore {
     fn append_root_record(&mut self, store_path: &str, entry: &RootEntry) -> Result<()> {
         let payload = index::encode_root_payload(store_path, entry)?;
         let digest = Digest::of(&payload);
-        let encoded = record::encode(KIND_ROOT, &payload, &digest)?;
-        self.segment()?.append(&encoded)?;
+        self.segment()?
+            .append_record(KIND_ROOT, &payload, &digest)?;
         Ok(())
     }
 
@@ -465,6 +470,7 @@ fn rebuild_from_packs(dir: &Path) -> Result<IndexView> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
         };
+        let pack_name: Arc<str> = Arc::from(pack.name.as_str());
         for rec in record::scan(&data).records {
             if rec.kind == KIND_ROOT {
                 let payload = &data[rec.payload_offset as usize..][..rec.payload_len as usize];
@@ -483,7 +489,7 @@ fn rebuild_from_packs(dir: &Path) -> Result<IndexView> {
                 }
             } else {
                 view.blobs.entry(rec.digest).or_insert(BlobLoc {
-                    pack: pack.name.clone(),
+                    pack: pack_name.clone(),
                     offset: rec.payload_offset,
                     len: rec.payload_len,
                     kind: rec.kind,

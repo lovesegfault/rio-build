@@ -170,8 +170,7 @@ pub(crate) fn run(
             }
             let payload = &data[rec.payload_offset as usize..][..rec.payload_len as usize];
             let cons = ensure_consolidated(&packs_dir, &mut consolidated, &view)?;
-            let encoded = crate::record::encode(rec.kind, payload, &rec.digest)?;
-            let rec_offset = cons.append(&encoded)?;
+            let rec_offset = cons.append_record(rec.kind, payload, &rec.digest)?;
             redirects.push((
                 rec.digest,
                 index::BlobLoc {
@@ -202,7 +201,7 @@ pub(crate) fn run(
         for (digest, loc) in redirects {
             view.blobs.insert(digest, loc);
         }
-        view.blobs.retain(|_, loc| loc.pack != src.name);
+        view.blobs.retain(|_, loc| *loc.pack != *src.name);
         index::write(dir, &view)?;
         stats.peak_pack_bytes = stats
             .peak_pack_bytes
@@ -253,8 +252,7 @@ fn ensure_consolidated<'a>(
         for (name, entry) in roots {
             let payload = index::encode_root_payload(name, entry)?;
             let digest = Digest::of(&payload);
-            let encoded = crate::record::encode(KIND_ROOT, &payload, &digest)?;
-            seg.append(&encoded)?;
+            seg.append_record(KIND_ROOT, &payload, &digest)?;
         }
         *consolidated = Some(seg);
     }
