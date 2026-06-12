@@ -4529,7 +4529,7 @@ counters (#(refs.metric)("rio_scheduler_lease_rebound_total"),
 #(refs.metric)("rio_scheduler_lease_acquired_total") counts acquire edges
 only.
 
-#r("sched.lease.holder-evidenced-lose+3")[
+#r("sched.lease.holder-evidenced-lose+4")[
   A renew 409 observed while this replica believes it leads MUST NOT run the
   lose transition by itself: the 409 proves only resourceVersion movement,
   whose mover may be this replica's own cancelled-then-committed write or a
@@ -4539,19 +4539,33 @@ only.
   lease to a holder other than this replica --- on whichever arm observes it
   (a Completed round's standby resolution or an act-failed round's completed
   read) --- or a second consecutive believing 409 exhausting the one-round
-  deferral. And EVERY believing completed read MUST resolve a pending
-  deferral: a read resolving holder=us clears it through the observation
-  funnel (own-commit evidence, frozen content, and moved-content-without-
-  ledger alike), a read resolving holder=other clears it through the
-  evidenced lose --- so two 409s with any completed read between them are
-  never consecutive. A completed read observing ABSENCE is deletion-axis
-  evidence with its own routed row in the same total law: the lease
-  resolves to nobody and a re-creator needs no steal wait, so a believing
-  replica MUST exit belief at that read --- the same lose-class transition,
-  clearing any pending deferral and the release hold with it (there is no
-  lease object of ours to release) --- while a standby replica re-baselines
-  only (the Absent baseline is what lets the next read prove a transmitted
-  Create committed).
+  deferral. And EVERY believing completed read of a LATER round MUST
+  resolve a pending deferral: a read resolving holder=us clears it through
+  the observation funnel (own-commit evidence, frozen content, and
+  moved-content-without-ledger alike), a read resolving holder=other
+  clears it through the evidenced lose --- so two 409s with any completed
+  read between them are never consecutive. A conflict-bounced round's OWN
+  read is not a resolution of its OWN 409 --- the bounce proves a mover
+  acted after that GET --- so only its monotone readings may act
+  (own-commit movement, an observed foreign holder, observed absence);
+  its non-monotone readings MUST be refused typed rather than funneled,
+  which is what keeps the exhaustion bound real, while same-round
+  own-commit evidence still resolves a deferral PENDING FROM AN EARLIER
+  round before the round's own 409 is adjudicated. A completed read
+  observing ABSENCE is deletion-axis evidence with its own routed rows in
+  the same total law: the lease resolves to nobody and a re-creator needs
+  no steal wait, so a believing replica MUST exit belief at that read ---
+  the same lose-class transition, clearing any pending deferral --- and
+  the release hold is priced PER CELL: it clears only when no write of
+  ours is in doubt (an empty cancelled-write ledger and no act
+  transmitted this round --- then there is provably no lease object of
+  ours to release), and it MUST take the self-fence posture (kept) when a
+  transmitted write may still commit a lease naming us --- the
+  zombie-create window, where a cleared hold would skip the
+  holder-guarded shutdown release and cost the successor the full steal
+  wait the graceful-release pricing forbids --- while a standby replica
+  re-baselines only (the Absent baseline is what lets the next read prove
+  a transmitted Create committed).
 ]
 
 The one-round bound is what preserves the fence/steal separation: an

@@ -1521,6 +1521,36 @@ impl LedgerCell {
     }
 }
 
+/// Whether the round's OWN mutating act is in doubt at routing time
+/// (bug_059): the act-failed arm routes BEFORE its `put_transmitted`
+/// write is recorded in the ledger (the slot keeps the OLDEST anchor),
+/// so the ledger axis alone cannot see the round's own
+/// transmitted-but-unanswered act — the exact cell where the absence
+/// lose used to clear a hold its own arming falsified fifteen lines
+/// later. A Completed round's act was ANSWERED (200/409 both resolve
+/// transmission), so the Completed consult passes `Resolved`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActDoubt {
+    /// A mutating request may have left this process unanswered this
+    /// round (`put_transmitted` on the act-failed path).
+    Transmitted,
+    /// The act phase resolved (answered, or nothing was transmitted).
+    Resolved,
+}
+
+impl ActDoubt {
+    #[cfg(any(test, kani))]
+    const ALL: [Self; 2] = [Self::Transmitted, Self::Resolved];
+
+    fn of(put_transmitted: bool) -> Self {
+        if put_transmitted {
+            Self::Transmitted
+        } else {
+            Self::Resolved
+        }
+    }
+}
+
 /// What the act-failed arm MUST do with a completed read — the closed
 /// action alphabet (bug_002). There is deliberately NO no-action
 /// variant for believing cells: `ObserveOnly` is reachable only when
@@ -1554,14 +1584,28 @@ enum ActFailedAction {
     /// Not believing and nothing to consume: record the baseline
     /// only. The latch is invariantly clear here.
     ObserveOnly,
-    /// A believing completed read observed the lease ABSENT (404):
-    /// run the lose-class transitions NOW (bug_143) — the lease
-    /// resolves to nobody, a peer Create needs no steal wait, and the
-    /// fence/steal margin does not shield the absent-lease regime.
-    /// Clears any pending deferral with it (a completed read IS
-    /// evidence); re-baselines to Absent. The hold clears too: there
-    /// is no lease object of ours to release.
+    /// A believing completed read observed the lease ABSENT (404)
+    /// with NO write of ours in doubt: run the lose-class transitions
+    /// NOW (bug_143) — the lease resolves to nobody, a peer Create
+    /// needs no steal wait, and the fence/steal margin does not shield
+    /// the absent-lease regime. Clears any pending deferral with it (a
+    /// completed read IS evidence); re-baselines to Absent. The hold
+    /// clears on THIS cell only (bug_059): an empty ledger and a
+    /// resolved act mean there is provably no lease object of ours to
+    /// release — the per-axis pricing the hold-kept sibling carries
+    /// for the in-doubt cells.
     AbsenceLose,
+    /// A believing completed read observed the lease ABSENT while a
+    /// write of OURS is in doubt — an armed cancelled-write ledger, or
+    /// this round's own transmitted-but-unanswered act (bug_059):
+    /// belief still exits at the read (the lose-class transitions
+    /// run), but the HOLD takes the self-fence posture — the zombie
+    /// write may commit a lease naming us after the 404, and a
+    /// fence-then-SIGTERM in that window must still run the
+    /// holder-guarded release (the graceful-release pricing: a stale
+    /// hold costs one harmless round-trip; a cleared hold on a lease
+    /// naming us costs the successor the full steal wait).
+    AbsenceLoseHoldKept,
     /// A standby completed read observed the lease ABSENT: record the
     /// Absent baseline only (it is what lets the next read prove a
     /// transmitted Create committed — holder=us against Absent).
@@ -1621,7 +1665,7 @@ impl Drop for RoutingVerdict {
     }
 }
 
-// r[impl sched.lease.holder-evidenced-lose+3]
+// r[impl sched.lease.holder-evidenced-lose+4]
 /// Total routing law for a believing/standby act-failed COMPLETED
 /// read (bug_002): every cell of the `believes x Holder x Content x
 /// Ledger` product names its action — no wildcard arms, so rustc
@@ -1636,27 +1680,37 @@ fn route_act_failed_read(
     holder: HolderCell,
     content: ContentCell,
     ledger: LedgerCell,
+    doubt: ActDoubt,
 ) -> RoutingVerdict {
+    use ActDoubt as D;
     use ActFailedAction as A;
     use ContentCell as C;
     use HolderCell as H;
     use LedgerCell as L;
-    let action = match (believes, holder, content, ledger) {
+    let action = match (believes, holder, content, ledger, doubt) {
         // Own-commit evidence (both belief states; the executor's
         // !believes branch is the fence-gated self-heal re-acquire).
-        (true, H::Us, C::Moved, L::Armed) | (false, H::Us, C::Moved, L::Armed) => {
-            A::EvidenceResolve
-        }
+        (true, H::Us, C::Moved, L::Armed, D::Transmitted)
+        | (true, H::Us, C::Moved, L::Armed, D::Resolved)
+        | (false, H::Us, C::Moved, L::Armed, D::Transmitted)
+        | (false, H::Us, C::Moved, L::Armed, D::Resolved) => A::EvidenceResolve,
         // Believing read of a lease we hold, nothing to consume: the
         // funnel resolves (clears a pending deferral structurally).
-        (true, H::Us, C::Moved, L::Empty)
-        | (true, H::Us, C::Frozen, L::Armed)
-        | (true, H::Us, C::Frozen, L::Empty) => A::FunnelResolve,
+        (true, H::Us, C::Moved, L::Empty, D::Transmitted)
+        | (true, H::Us, C::Moved, L::Empty, D::Resolved)
+        | (true, H::Us, C::Frozen, L::Armed, D::Transmitted)
+        | (true, H::Us, C::Frozen, L::Armed, D::Resolved)
+        | (true, H::Us, C::Frozen, L::Empty, D::Transmitted)
+        | (true, H::Us, C::Frozen, L::Empty, D::Resolved) => A::FunnelResolve,
         // Believing read that does not name us: evidenced lose.
-        (true, H::Other, C::Moved, L::Armed)
-        | (true, H::Other, C::Moved, L::Empty)
-        | (true, H::Other, C::Frozen, L::Armed)
-        | (true, H::Other, C::Frozen, L::Empty) => A::EvidencedLose,
+        (true, H::Other, C::Moved, L::Armed, D::Transmitted)
+        | (true, H::Other, C::Moved, L::Armed, D::Resolved)
+        | (true, H::Other, C::Moved, L::Empty, D::Transmitted)
+        | (true, H::Other, C::Moved, L::Empty, D::Resolved)
+        | (true, H::Other, C::Frozen, L::Armed, D::Transmitted)
+        | (true, H::Other, C::Frozen, L::Armed, D::Resolved)
+        | (true, H::Other, C::Frozen, L::Empty, D::Transmitted)
+        | (true, H::Other, C::Frozen, L::Empty, D::Resolved) => A::EvidencedLose,
         // Believing read that observed NO lease object: the lease
         // resolves to nobody and a peer Create needs no steal wait —
         // exit belief AT this read (bug_143). The content/ledger axes
@@ -1665,24 +1719,44 @@ fn route_act_failed_read(
         // the evidence leg NEXT round, holder=us against the Absent
         // baseline); every cell is still named so the product census
         // stays generated.
-        (true, H::Absent, C::Moved, L::Armed)
-        | (true, H::Absent, C::Moved, L::Empty)
-        | (true, H::Absent, C::Frozen, L::Armed)
-        | (true, H::Absent, C::Frozen, L::Empty) => A::AbsenceLose,
+        // The absence partition's HOLD axis (bug_059): an armed ledger
+        // or this round's own transmitted act means a write of OURS may
+        // commit a lease naming us after the 404 — belief exits either
+        // way (bug_143 stands), the HOLD survives exactly the in-doubt
+        // cells.
+        (true, H::Absent, C::Moved, L::Armed, D::Transmitted)
+        | (true, H::Absent, C::Moved, L::Armed, D::Resolved)
+        | (true, H::Absent, C::Frozen, L::Armed, D::Transmitted)
+        | (true, H::Absent, C::Frozen, L::Armed, D::Resolved)
+        | (true, H::Absent, C::Moved, L::Empty, D::Transmitted)
+        | (true, H::Absent, C::Frozen, L::Empty, D::Transmitted) => A::AbsenceLoseHoldKept,
+        (true, H::Absent, C::Moved, L::Empty, D::Resolved)
+        | (true, H::Absent, C::Frozen, L::Empty, D::Resolved) => A::AbsenceLose,
         // Not believing, no evidence: baseline only.
-        (false, H::Us, C::Moved, L::Empty)
-        | (false, H::Us, C::Frozen, L::Armed)
-        | (false, H::Us, C::Frozen, L::Empty)
-        | (false, H::Other, C::Moved, L::Armed)
-        | (false, H::Other, C::Moved, L::Empty)
-        | (false, H::Other, C::Frozen, L::Armed)
-        | (false, H::Other, C::Frozen, L::Empty) => A::ObserveOnly,
+        (false, H::Us, C::Moved, L::Empty, D::Transmitted)
+        | (false, H::Us, C::Moved, L::Empty, D::Resolved)
+        | (false, H::Us, C::Frozen, L::Armed, D::Transmitted)
+        | (false, H::Us, C::Frozen, L::Armed, D::Resolved)
+        | (false, H::Us, C::Frozen, L::Empty, D::Transmitted)
+        | (false, H::Us, C::Frozen, L::Empty, D::Resolved)
+        | (false, H::Other, C::Moved, L::Armed, D::Transmitted)
+        | (false, H::Other, C::Moved, L::Armed, D::Resolved)
+        | (false, H::Other, C::Moved, L::Empty, D::Transmitted)
+        | (false, H::Other, C::Moved, L::Empty, D::Resolved)
+        | (false, H::Other, C::Frozen, L::Armed, D::Transmitted)
+        | (false, H::Other, C::Frozen, L::Armed, D::Resolved)
+        | (false, H::Other, C::Frozen, L::Empty, D::Transmitted)
+        | (false, H::Other, C::Frozen, L::Empty, D::Resolved) => A::ObserveOnly,
         // Standby read observing absence: record the baseline only
         // (the latch is invariantly clear when not believing).
-        (false, H::Absent, C::Moved, L::Armed)
-        | (false, H::Absent, C::Moved, L::Empty)
-        | (false, H::Absent, C::Frozen, L::Armed)
-        | (false, H::Absent, C::Frozen, L::Empty) => A::AbsenceObserve,
+        (false, H::Absent, C::Moved, L::Armed, D::Transmitted)
+        | (false, H::Absent, C::Moved, L::Armed, D::Resolved)
+        | (false, H::Absent, C::Moved, L::Empty, D::Transmitted)
+        | (false, H::Absent, C::Moved, L::Empty, D::Resolved)
+        | (false, H::Absent, C::Frozen, L::Armed, D::Transmitted)
+        | (false, H::Absent, C::Frozen, L::Armed, D::Resolved)
+        | (false, H::Absent, C::Frozen, L::Empty, D::Transmitted)
+        | (false, H::Absent, C::Frozen, L::Empty, D::Resolved) => A::AbsenceObserve,
     };
     RoutingVerdict { action }
 }
@@ -1794,12 +1868,15 @@ enum RoundEdge {
     Lose(CompletedLoseEvidence),
     /// A believing conflict round whose completed GET observed the
     /// lease ABSENT (merged_bug_056 — the create path's lost re-create
-    /// race): the routing law's `AbsenceLose` verdict EXECUTES on this
+    /// race): the routing law's absence-lose verdict EXECUTES on this
     /// arm exactly as on the act-failed arm — the lease resolves to
     /// nobody, a peer re-create needs no steal wait, belief exits AT
     /// the read (bug_143's regime; the fence/steal margin does not
-    /// shield it).
-    LoseObservedAbsent,
+    /// shield it). `write_in_doubt` carries the routed cell's hold
+    /// posture (bug_059): an armed cancelled-write ledger means a
+    /// zombie of ours may commit a lease naming us — the hold takes
+    /// the self-fence posture instead of clearing.
+    LoseObservedAbsent { write_in_doubt: bool },
     /// A believing renew 409 deferring one round (the Q3 deferral).
     Defer,
     /// Standby steady state (or a 409 racing a steal — never led):
@@ -1906,7 +1983,7 @@ struct RoundTransition {
     read_refusal: Option<StaleReadRefusal>,
 }
 
-// r[impl sched.lease.holder-evidenced-lose+3]
+// r[impl sched.lease.holder-evidenced-lose+4]
 // r[impl sched.lease.cancelled-write+2]
 /// THE Completed-round derivation (merged_bug_053): one pure function
 /// `(facts, outcome, standing) -> RoundTransition` replacing the old
@@ -1961,12 +2038,21 @@ fn complete_round(facts: ReadFacts, outcome: ActCell, standing: StandingCells) -
     //    deleted-lease create race and silently dropped it, deferring
     //    a round it had evidence to lose.
     let mut consume = None;
-    let mut read_lose_absent = false;
+    let mut read_lose_absent = None;
     let mut read_lose_other = false;
     let mut read_refusal = None;
     if is_conflict {
-        match route_act_failed_read(standing.believes, facts.holder, facts.content, facts.ledger)
-            .execute()
+        match route_act_failed_read(
+            standing.believes,
+            facts.holder,
+            facts.content,
+            facts.ledger,
+            // A Completed round's act was ANSWERED (the 409 IS a
+            // response) — nothing of this round's own is in doubt;
+            // the ledger axis carries any PRIOR doubt (bug_059).
+            ActDoubt::Resolved,
+        )
+        .execute()
         {
             // Monotone: the movement already happened — the post-GET
             // rv mover cannot un-commit our zombie write.
@@ -1980,8 +2066,11 @@ fn complete_round(facts: ReadFacts, outcome: ActCell, standing: StandingCells) -
             // provably resolved away from us at the read point.
             ActFailedAction::EvidencedLose => read_lose_other = true,
             // Monotone: the read observed the lease ABSENT — deleted
-            // out from under us; a re-creator needs no steal wait.
-            ActFailedAction::AbsenceLose => read_lose_absent = true,
+            // out from under us; a re-creator needs no steal wait. The
+            // hold posture is the routed cell's own (bug_059): kept
+            // when a write of ours is in doubt (the armed ledger).
+            ActFailedAction::AbsenceLose => read_lose_absent = Some(false),
+            ActFailedAction::AbsenceLoseHoldKept => read_lose_absent = Some(true),
             // Non-monotone: refused stale-at-adjudication, each for
             // its stated reason (see StaleReadRefusal).
             ActFailedAction::FunnelResolve => {
@@ -2002,7 +2091,8 @@ fn complete_round(facts: ReadFacts, outcome: ActCell, standing: StandingCells) -
     // adjudication gate below then sees a non-believer and the 409
     // adjudicates nothing (a lose answers the round).
     let funnel_runs = matches!(consume, Some(ConsumeMode::Restore | ConsumeMode::Funnel));
-    let believes = (standing.believes || funnel_runs) && !(read_lose_absent || read_lose_other);
+    let believes =
+        (standing.believes || funnel_runs) && !(read_lose_absent.is_some() || read_lose_other);
     let deferred = standing.deferred && !funnel_runs;
 
     // 2.+3. Adjudication (production body, derivation-local standing)
@@ -2021,8 +2111,8 @@ fn complete_round(facts: ReadFacts, outcome: ActCell, standing: StandingCells) -
             None,
             RoundEdge::Lose(CompletedLoseEvidence::AnotherHolderObserved),
         )
-    } else if read_lose_absent {
-        (None, RoundEdge::LoseObservedAbsent)
+    } else if let Some(write_in_doubt) = read_lose_absent {
+        (None, RoundEdge::LoseObservedAbsent { write_in_doubt })
     } else {
         match (outcome, believes) {
             (ActCell::Leading, false) => (None, RoundEdge::Acquire),
@@ -2493,7 +2583,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         }
                         RoundEdge::Lose(evidence) => {
                             // ---- Lose transition ----
-                            // r[impl sched.lease.holder-evidenced-lose+3]
+                            // r[impl sched.lease.holder-evidenced-lose+4]
                             // The lose edge demands a CompletedLoseEvidence
                             // witness (see its doc + the SIGNED Q3 block):
                             // a completed read naming another holder, or an
@@ -2553,8 +2643,8 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             // lose edge.
                             evidence.apply(&mut standing);
                         }
-                        RoundEdge::LoseObservedAbsent => {
-                            // r[impl sched.lease.holder-evidenced-lose+3]
+                        RoundEdge::LoseObservedAbsent { write_in_doubt } => {
+                            // r[impl sched.lease.holder-evidenced-lose+4]
                             // The conflict round's completed GET
                             // observed the lease ABSENT
                             // (merged_bug_056): the same lose family
@@ -2575,7 +2665,14 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             );
                             hooks.on_lose();
                             marks_dirty.mark();
-                            standing.on_observed_not_leading();
+                            // The hold posture is the routed cell's own
+                            // (bug_059): in-doubt cells keep it for the
+                            // shutdown release.
+                            if write_in_doubt {
+                                standing.on_self_fence();
+                            } else {
+                                standing.on_observed_not_leading();
+                            }
                         }
                         RoundEdge::Defer => {
                             // ---- One-round deferral ----
@@ -2693,6 +2790,11 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             HolderCell::of_read(facts.as_ref()),
                             ContentCell::of_read(&content_baseline, facts.as_ref()),
                             LedgerCell::of(&unconfirmed),
+                            // bug_059: the round's OWN transmitted act is a
+                            // routing input — the arming below happens
+                            // AFTER routing, so the ledger axis alone
+                            // cannot see it.
+                            ActDoubt::of(put_transmitted),
                         )
                         .execute();
                         // The re-baseline is the match's VALUE: the arm
@@ -2808,7 +2910,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                 }
                             }
                             ActFailedAction::AbsenceLose => {
-                                // r[impl sched.lease.holder-evidenced-lose+3]
+                                // r[impl sched.lease.holder-evidenced-lose+4]
                                 // The completed read OBSERVED the lease
                                 // absent: it resolves to nobody, and a
                                 // peer's re-Create needs no steal wait —
@@ -2832,6 +2934,31 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                 hooks.on_lose();
                                 marks_dirty.mark();
                                 standing.on_observed_not_leading();
+                                ContentBaseline::Absent
+                            }
+                            ActFailedAction::AbsenceLoseHoldKept => {
+                                // r[impl sched.lease.holder-evidenced-lose+4]
+                                // bug_059: same absence lose — belief
+                                // exits at the read — but a write of
+                                // OURS is in doubt (armed ledger, or
+                                // this round's own transmitted act):
+                                // the HOLD takes the self-fence
+                                // posture so a SIGTERM inside the
+                                // zombie window still runs the
+                                // holder-guarded release. The ledger
+                                // is NOT consumed; the arming tail
+                                // below still records this round's
+                                // transmitted act.
+                                state.on_lose();
+                                warn!(
+                                    holder = %cfg.holder_id,
+                                    "lost leadership (a completed read observed the lease \
+                                     ABSENT with a write of ours in doubt — the hold \
+                                     survives the zombie window for the shutdown release)"
+                                );
+                                hooks.on_lose();
+                                marks_dirty.mark();
+                                standing.on_self_fence();
                                 ContentBaseline::Absent
                             }
                             // 404→Create round whose POST died unanswered,
@@ -3222,8 +3349,8 @@ impl LeaseStanding {
 #[cfg(kani)]
 mod lease_standing_proofs {
     use super::{
-        ActFailedAction, CompletedLoseEvidence, ConflictResolution, ContentCell, HolderCell,
-        LeaseStanding, LedgerCell, route_act_failed_read,
+        ActDoubt, ActFailedAction, CompletedLoseEvidence, ConflictResolution, ContentCell,
+        HolderCell, LeaseStanding, LedgerCell, route_act_failed_read,
     };
 
     const MAX_EVENTS: usize = 8;
@@ -3294,7 +3421,7 @@ mod lease_standing_proofs {
         );
     }
 
-    /// r[verify sched.lease.holder-evidenced-lose+3]
+    /// r[verify sched.lease.holder-evidenced-lose+4]
     /// The 409 deferral is episode-scoped (merged_bug_002): over every
     /// bounded event sequence drawn from the standing alphabet
     /// {ObservedHeld, ObservedNotLeading, SelfFence, BelievingConflict}
@@ -3414,7 +3541,7 @@ mod lease_standing_proofs {
         );
     }
 
-    /// r[verify sched.lease.holder-evidenced-lose+3]
+    /// r[verify sched.lease.holder-evidenced-lose+4]
     /// Routing totality (bug_002): over the FULL `believes x Holder x
     /// Content x Ledger` product, no believing completed act-failed
     /// read maps to a no-transition action — and folding the routed
@@ -3444,7 +3571,12 @@ mod lease_standing_proofs {
             LedgerCell::Empty
         };
 
-        let action = route_act_failed_read(believes, holder, content, ledger).execute();
+        let doubt = if kani::any() {
+            ActDoubt::Transmitted
+        } else {
+            ActDoubt::Resolved
+        };
+        let action = route_act_failed_read(believes, holder, content, ledger, doubt).execute();
         // merged_bug_051 (the conflict-gate premise, both directions):
         // EvidenceResolve is EXACTLY the (Us, Moved, Armed) product in
         // BOTH belief states — the Conflict arm's consume-before-
@@ -3465,11 +3597,24 @@ mod lease_standing_proofs {
         // facts-presence expects in both directions.
         let is_absence_action = matches!(
             action,
-            ActFailedAction::AbsenceLose | ActFailedAction::AbsenceObserve
+            ActFailedAction::AbsenceLose
+                | ActFailedAction::AbsenceLoseHoldKept
+                | ActFailedAction::AbsenceObserve
         );
         assert!(
             is_absence_action == matches!(holder, HolderCell::Absent),
             "absence actions route exactly the Absent cells"
+        );
+        // bug_059: the hold-kept absence cell is exactly the believing
+        // absent read with a write of ours in doubt — the armed ledger
+        // or this round's own transmitted act.
+        assert!(
+            (action == ActFailedAction::AbsenceLoseHoldKept)
+                == (believes
+                    && matches!(holder, HolderCell::Absent)
+                    && (matches!(ledger, LedgerCell::Armed)
+                        || matches!(doubt, ActDoubt::Transmitted))),
+            "the hold survives exactly the in-doubt absence cells"
         );
         if believes {
             assert!(
@@ -3488,6 +3633,11 @@ mod lease_standing_proofs {
                 }
                 ActFailedAction::EvidencedLose | ActFailedAction::AbsenceLose => {
                     standing.on_observed(false);
+                }
+                ActFailedAction::AbsenceLoseHoldKept => {
+                    // bug_059: belief exits, the hold survives —
+                    // the self-fence posture clears the latch too.
+                    standing.on_self_fence();
                 }
                 ActFailedAction::ObserveOnly | ActFailedAction::AbsenceObserve => {
                     // Unreachable: asserted above.
@@ -3774,7 +3924,7 @@ mod complete_round_proofs {
         )
     }
 
-    /// r[verify sched.lease.holder-evidenced-lose+3]
+    /// r[verify sched.lease.holder-evidenced-lose+4]
     /// W12-X(a): the exhausted lose edge derives ONLY from an
     /// unresolved pending deferral — a round whose consult consumed
     /// funnel-grade evidence answered the pending question and can
@@ -3806,7 +3956,7 @@ mod complete_round_proofs {
         // round derives EXACTLY ONE of {consume, read-lose edge,
         // typed refusal}; non-conflict rounds consult nothing —
         // computed-but-dropped is not a derivable outcome.
-        let read_lose = matches!(plan.edge, RoundEdge::LoseObservedAbsent)
+        let read_lose = matches!(plan.edge, RoundEdge::LoseObservedAbsent { .. })
             || (matches!(act, ActCell::Conflict)
                 && plan.edge == RoundEdge::Lose(CompletedLoseEvidence::AnotherHolderObserved));
         let dispositions = (plan.consume.is_some() as u8)
@@ -3818,7 +3968,7 @@ mod complete_round_proofs {
         );
     }
 
-    /// r[verify sched.lease.holder-evidenced-lose+3]
+    /// r[verify sched.lease.holder-evidenced-lose+4]
     /// W12-X(b): folding the plan through the PRODUCTION standing
     /// transitions (the cfg-gated driver delegates to the production
     /// methods) reproduces the derivation's view — the adjudication
@@ -3859,8 +4009,12 @@ mod complete_round_proofs {
                 ev.apply(&mut s);
                 assert!(!s.believes(), "every lose edge ends belief");
             }
-            RoundEdge::LoseObservedAbsent => {
-                s.on_observed(false);
+            RoundEdge::LoseObservedAbsent { write_in_doubt } => {
+                if write_in_doubt {
+                    s.on_self_fence();
+                } else {
+                    s.on_observed(false);
+                }
                 assert!(!s.believes(), "every lose edge ends belief");
             }
             RoundEdge::StandbyObserved => s.on_observed(false),
@@ -5781,7 +5935,7 @@ mod tests {
     /// completed read naming us resolves the deferral as a renew. The
     /// old immediate-lose wiped the DAG/outbox and bounced the leader
     /// marks on what was provably our own write.
-    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.holder-evidenced-lose+4]
     #[tokio::test(start_paused = true)]
     async fn believing_409_defers_for_holder_evidence_then_renews() {
         let (client, mut park) = RequestPark::new();
@@ -5855,7 +6009,7 @@ mod tests {
     /// what keeps the NeverDual fence/steal separation intact (an
     /// unbounded deferral under every-round CAS bounces would retain
     /// belief past a standby's steal).
-    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.holder-evidenced-lose+4]
     #[tokio::test(start_paused = true)]
     async fn second_consecutive_believing_409_loses_with_deferral_exhausted() {
         let (client, mut park) = RequestPark::new();
@@ -6181,7 +6335,7 @@ mod tests {
     /// Pre-fix the facts:None arm bypassed route_act_failed_read (the
     /// if-let pre-filter) and only re-baselined — belief and a pending
     /// deferral both leaked across the arm.
-    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.holder-evidenced-lose+4]
     #[tokio::test(start_paused = true)]
     async fn w10_aw_completed_404_read_exits_belief_at_the_read() {
         let (client, mut park) = RequestPark::new();
@@ -6339,7 +6493,7 @@ mod tests {
     /// Q3 evidence path: a deferred 409 whose next completed read names
     /// a DIFFERENT holder loses WITH holder evidence — the typed lose
     /// edge the signed decision demands.
-    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.holder-evidenced-lose+4]
     #[tokio::test(start_paused = true)]
     async fn deferred_409_resolving_to_foreign_holder_loses_with_evidence() {
         let (client, mut park) = RequestPark::new();
@@ -6409,7 +6563,7 @@ mod tests {
     /// the slow clock is the "rounds fast relative to the fence
     /// budget" regime that makes the believing-observe leg reachable
     /// (the wire shapes are untouched: production loop, park JSON).
-    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.holder-evidenced-lose+4]
     #[tokio::test(start_paused = true)]
     async fn act_failed_own_commit_resolution_clears_the_deferral() {
         let (client, mut park) = RequestPark::new();
@@ -6522,7 +6676,7 @@ mod tests {
     /// so after an evidence re-acquire (a NEW belief episode) the next
     /// believing 409 exhausted immediately from the OLD episode's
     /// latch, violating the ":new belief episode starts clean" law.
-    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.holder-evidenced-lose+4]
     #[tokio::test(start_paused = true)]
     async fn self_fence_resets_the_deferral_for_the_next_belief_episode() {
         let (client, mut park) = RequestPark::new();
@@ -6649,7 +6803,7 @@ mod tests {
     /// eventually happens is the fence law working, not a 409 edge —
     /// and the surviving ledger's own-commit evidence re-acquires in
     /// the same tick.
-    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.holder-evidenced-lose+4]
     // r[verify sched.lease.cancelled-write+2]
     #[tokio::test(start_paused = true)]
     async fn zombie_ledger_survives_the_409_for_evidence_reacquire() {
@@ -6915,7 +7069,7 @@ mod tests {
     /// believing 409 must run the exhausted lose edge (signed two-409
     /// bound); pre-fix: the evidence round's set-then-clear stretched
     /// the bound and belief survived round 5`.
-    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.holder-evidenced-lose+4]
     // r[verify sched.lease.cancelled-write+2]
     #[tokio::test(start_paused = true)]
     async fn conflict_round_adjudicates_after_evidence_consumption() {
@@ -7056,7 +7210,7 @@ mod tests {
     /// adjudicate the same round's 409 against post-restore standing;
     /// pre-fix: the pre-restore snapshot skipped adjudication and
     /// round 5 deferred instead of exhausting`.
-    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.holder-evidenced-lose+4]
     // r[verify sched.lease.cancelled-write+2]
     #[tokio::test(start_paused = true)]
     async fn fenced_mid_arm_reacquire_enters_deferral_with_latch_set() {
@@ -7199,7 +7353,7 @@ mod tests {
     /// execute the AbsenceLose verdict (the GET observed the lease
     /// absent); pre-fix: the verdict was computed and discarded, and
     /// the false leader held through the deferral window`.
-    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.holder-evidenced-lose+4]
     #[tokio::test(start_paused = true)]
     async fn deleted_lease_create_race_exits_belief_at_the_round() {
         let (client, mut park) = RequestPark::new();
@@ -7395,6 +7549,110 @@ mod tests {
                 }
             }
         }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// W12-AA (bug_059): the absence partition prices the HOLD axis
+    /// per cell — a believing 404 read in the round whose OWN create
+    /// POST was transmitted-but-unanswered exits belief (the lose-class
+    /// transition stands) but KEEPS the graceful-release hold: the
+    /// zombie POST may commit a lease naming us after the read, and a
+    /// fence-then-SIGTERM in that window must still run the
+    /// holder-guarded release (the signed graceful-release pricing: a
+    /// stale hold costs one harmless round-trip; a cleared hold on a
+    /// lease naming us costs the successor the full 19s steal).
+    ///
+    /// Pre-fix the absence lose collapsed the hold axis into the
+    /// belief axis: all four believing-absent cells ran
+    /// on_observed_not_leading on the premise "there is no lease
+    /// object of ours to release" — falsified by the same arm arming
+    /// the cancelled-write ledger fifteen lines later.
+    ///
+    /// Pre-fix red, verbatim: `fence-then-SIGTERM with a write in
+    /// doubt must keep the graceful-release hold (the zombie may name
+    /// us); pre-fix: the absence lose cleared the hold and the
+    /// shutdown skipped the release`.
+    // r[verify sched.lease.holder-evidenced-lose+4]
+    // r[verify sched.lease.graceful-release+2]
+    #[tokio::test(start_paused = true)]
+    async fn transmitted_create_keeps_the_release_hold_through_absence_lose() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1 (t=0): acquire; settle the marks PATCH.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 10, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json_rt(Some("us"), 3, 11, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 2 (t=5s): the lease is deleted; our re-create POST is
+        // transmitted and DROPPED — a zombie that may commit after
+        // this round's 404 read. Belief exits at the read; the hold
+        // must survive (the write is in doubt).
+        let get = park.next().await;
+        get.respond_status(404, "NotFound", "lease deleted");
+        let post = park.next().await;
+        drop(post);
+        settle().await;
+        assert!(!state.is_leader(), "the absence read exits belief");
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "the absence lose runs its edge"
+        );
+
+        // SIGTERM inside the zombie window: the graceful release must
+        // run — the zombie committed server-side, the lease names us,
+        // and the holder-guarded step_down clears it so the successor
+        // steals in one poll tick instead of the full steal window.
+        shutdown.cancel();
+        let mut released = false;
+        for _ in 0..8 {
+            if let Some(req) = park.try_next().await {
+                if req.path.contains("/pods/us") {
+                    req.respond_ok(pod_ok("us"));
+                } else if req.method == http::Method::GET {
+                    // The step_down read phase: serve the committed
+                    // zombie — the lease names us.
+                    req.respond_ok(park_lease_json_rt(Some("us"), 3, 12, 12));
+                } else {
+                    // The holder-guarded release PUT.
+                    released = true;
+                    req.respond_ok(park_lease_json_rt(None, 3, 13, 13));
+                }
+            }
+        }
+        assert!(
+            released,
+            "fence-then-SIGTERM with a write in doubt must keep the \
+             graceful-release hold (the zombie may name us); pre-fix: \
+             the absence lose cleared the hold and the shutdown skipped \
+             the release"
+        );
         loop_task.await.expect("lease loop exits");
     }
 
@@ -9606,7 +9864,7 @@ mod tests {
     /// slow (the same regime as the own-commit-resolution red: rounds
     /// fast relative to the fence budget keeps the believing legs
     /// reachable).
-    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.holder-evidenced-lose+4]
     #[tokio::test(start_paused = true)]
     async fn act_failed_frozen_content_read_resolves_the_deferral() {
         let (client, mut park) = RequestPark::new();
@@ -9715,7 +9973,7 @@ mod tests {
     /// funnel (no evidence consume: there is nothing to consume).
     /// Pre-fix the cell sat outside the unconfirmed.take() gate and
     /// ran nothing; the following 409 exhausted falsely.
-    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.holder-evidenced-lose+4]
     #[tokio::test(start_paused = true)]
     async fn act_failed_moved_content_without_ledger_resolves_the_deferral() {
         let (client, mut park) = RequestPark::new();
@@ -9829,7 +10087,7 @@ mod tests {
     /// transmitted steal also arms the ledger, so the follow-up
     /// holder=us + moved read re-acquires through the evidence leg's
     /// !believes branch — the one-round self-heal pin.
-    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.holder-evidenced-lose+4]
     #[tokio::test(start_paused = true)]
     async fn act_failed_foreign_holder_read_runs_the_evidenced_lose() {
         let (client, mut park) = RequestPark::new();
@@ -10088,8 +10346,13 @@ mod tests {
     #[test]
     fn routing_verdict_silent_discard_panics() {
         let caught = std::panic::catch_unwind(|| {
-            let verdict =
-                route_act_failed_read(true, HolderCell::Us, ContentCell::Frozen, LedgerCell::Empty);
+            let verdict = route_act_failed_read(
+                true,
+                HolderCell::Us,
+                ContentCell::Frozen,
+                LedgerCell::Empty,
+                ActDoubt::Resolved,
+            );
             drop(verdict);
         })
         .expect_err("an undischarged verdict must panic at drop");
@@ -10111,8 +10374,13 @@ mod tests {
     #[test]
     fn routing_verdict_drop_guard_is_unwind_gated() {
         let caught = std::panic::catch_unwind(|| {
-            let _verdict =
-                route_act_failed_read(true, HolderCell::Us, ContentCell::Frozen, LedgerCell::Empty);
+            let _verdict = route_act_failed_read(
+                true,
+                HolderCell::Us,
+                ContentCell::Frozen,
+                LedgerCell::Empty,
+                ActDoubt::Resolved,
+            );
             panic!("original panic");
         })
         .expect_err("the original panic must propagate");
@@ -10126,7 +10394,7 @@ mod tests {
         );
     }
 
-    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.holder-evidenced-lose+4]
     // r[verify sched.lease.cancelled-write+2]
     /// W12-W at the kernel tier (merged_bug_053, the headline cell):
     /// over the FULL `act x holder x content x ledger x fence x
@@ -10314,7 +10582,14 @@ mod tests {
         match plan.edge {
             RoundEdge::Acquire | RoundEdge::StillLeading => s.on_observed(true),
             RoundEdge::Lose(ev) => ev.apply(&mut s),
-            RoundEdge::LoseObservedAbsent | RoundEdge::StandbyObserved => s.on_observed(false),
+            RoundEdge::LoseObservedAbsent { write_in_doubt } => {
+                if write_in_doubt {
+                    s.on_self_fence();
+                } else {
+                    s.on_observed(false);
+                }
+            }
+            RoundEdge::StandbyObserved => s.on_observed(false),
             RoundEdge::Defer => {
                 // The deferral arm's precondition (the W12-W3 cell):
                 // the latch is genuinely set when Defer runs.
@@ -10326,7 +10601,7 @@ mod tests {
         }
         if matches!(
             plan.edge,
-            RoundEdge::Lose(_) | RoundEdge::LoseObservedAbsent
+            RoundEdge::Lose(_) | RoundEdge::LoseObservedAbsent { .. }
         ) {
             assert!(!s.believes(), "every lose edge ends belief: {cell}");
         }
@@ -10335,7 +10610,7 @@ mod tests {
         // of {consume, read-lose edge, typed refusal} is derived —
         // computed-but-neither-executed-nor-refused is not a
         // representable outcome; non-conflict rounds consult nothing.
-        let read_lose = usize::from(matches!(plan.edge, RoundEdge::LoseObservedAbsent))
+        let read_lose = usize::from(matches!(plan.edge, RoundEdge::LoseObservedAbsent { .. }))
             + usize::from(
                 matches!(act, ActCell::Conflict)
                     && plan.edge == RoundEdge::Lose(CompletedLoseEvidence::AnotherHolderObserved),
@@ -10350,93 +10625,144 @@ mod tests {
         );
     }
 
-    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.holder-evidenced-lose+4]
     /// bug_002 census (Q1-1, machine-derived): iterate the GENERATED
-    /// `believes x Holder x Content x Ledger` product (the ALL consts
-    /// are pinned by route_act_failed_read's own total match — a new
-    /// variant fails compilation there) and assert the routing table
-    /// against an independently written total spec table KEYED by the
-    /// product type, so under-enumeration cannot compile in either
-    /// function. Also pins the alphabet law directly: no believing
-    /// cell routes to a no-transition action, and the absence
-    /// partition holds in both directions (bug_143).
+    /// `believes x Holder x Content x Ledger x ActDoubt` product (the
+    /// ALL consts are pinned by route_act_failed_read's own total
+    /// match — a new cell variant fails compilation there) and assert
+    /// the routing table against an independently written total spec
+    /// table KEYED by the product type, so under-enumeration cannot
+    /// compile in either function. Also pins the alphabet laws
+    /// directly: no believing cell routes to a no-transition action,
+    /// the absence partition holds in both directions (bug_143), every
+    /// NON-absence row is ActDoubt-invariant, and the believing-absent
+    /// cells map TWO distinct actions split per the hold axis
+    /// (bug_059 — enumeration WITH per-axis posture differentiation:
+    /// the hold survives exactly the in-doubt cells).
     #[test]
     fn act_failed_cell_census_total() {
+        use ActDoubt as D;
         use ActFailedAction as A;
         use ContentCell as C;
         use HolderCell as H;
         use LedgerCell as L;
         // The spec table — the WO routing law, written independently
-        // of route_act_failed_read's grouping (every cell named).
-        fn spec(believes: bool, h: H, c: C, l: L) -> A {
-            match (believes, h, c, l) {
-                (true, H::Us, C::Moved, L::Armed) => A::EvidenceResolve,
-                (false, H::Us, C::Moved, L::Armed) => A::EvidenceResolve,
-                (true, H::Us, C::Moved, L::Empty) => A::FunnelResolve,
-                (true, H::Us, C::Frozen, L::Armed) => A::FunnelResolve,
-                (true, H::Us, C::Frozen, L::Empty) => A::FunnelResolve,
-                (true, H::Other, C::Moved, L::Armed) => A::EvidencedLose,
-                (true, H::Other, C::Moved, L::Empty) => A::EvidencedLose,
-                (true, H::Other, C::Frozen, L::Armed) => A::EvidencedLose,
-                (true, H::Other, C::Frozen, L::Empty) => A::EvidencedLose,
-                (false, H::Us, C::Moved, L::Empty) => A::ObserveOnly,
-                (false, H::Us, C::Frozen, L::Armed) => A::ObserveOnly,
-                (false, H::Us, C::Frozen, L::Empty) => A::ObserveOnly,
-                (false, H::Other, C::Moved, L::Armed) => A::ObserveOnly,
-                (false, H::Other, C::Moved, L::Empty) => A::ObserveOnly,
-                (false, H::Other, C::Frozen, L::Armed) => A::ObserveOnly,
-                (false, H::Other, C::Frozen, L::Empty) => A::ObserveOnly,
-                // bug_143: the absence rows — believing exits at the
-                // read; standby re-baselines. Content/ledger vacuous
-                // (an absent read constructs Frozen; the law still
-                // names every cell).
-                (true, H::Absent, C::Moved, L::Armed) => A::AbsenceLose,
-                (true, H::Absent, C::Moved, L::Empty) => A::AbsenceLose,
-                (true, H::Absent, C::Frozen, L::Armed) => A::AbsenceLose,
-                (true, H::Absent, C::Frozen, L::Empty) => A::AbsenceLose,
-                (false, H::Absent, C::Moved, L::Armed) => A::AbsenceObserve,
-                (false, H::Absent, C::Moved, L::Empty) => A::AbsenceObserve,
-                (false, H::Absent, C::Frozen, L::Armed) => A::AbsenceObserve,
-                (false, H::Absent, C::Frozen, L::Empty) => A::AbsenceObserve,
+        // of route_act_failed_read's grouping (every cell named; the
+        // doubt axis spelled per row).
+        fn spec(believes: bool, h: H, c: C, l: L, d: D) -> A {
+            match (believes, h, c, l, d) {
+                (true, H::Us, C::Moved, L::Armed, _) => A::EvidenceResolve,
+                (false, H::Us, C::Moved, L::Armed, _) => A::EvidenceResolve,
+                (true, H::Us, C::Moved, L::Empty, _) => A::FunnelResolve,
+                (true, H::Us, C::Frozen, L::Armed, _) => A::FunnelResolve,
+                (true, H::Us, C::Frozen, L::Empty, _) => A::FunnelResolve,
+                (true, H::Other, C::Moved, L::Armed, _) => A::EvidencedLose,
+                (true, H::Other, C::Moved, L::Empty, _) => A::EvidencedLose,
+                (true, H::Other, C::Frozen, L::Armed, _) => A::EvidencedLose,
+                (true, H::Other, C::Frozen, L::Empty, _) => A::EvidencedLose,
+                (false, H::Us, C::Moved, L::Empty, _) => A::ObserveOnly,
+                (false, H::Us, C::Frozen, L::Armed, _) => A::ObserveOnly,
+                (false, H::Us, C::Frozen, L::Empty, _) => A::ObserveOnly,
+                (false, H::Other, C::Moved, L::Armed, _) => A::ObserveOnly,
+                (false, H::Other, C::Moved, L::Empty, _) => A::ObserveOnly,
+                (false, H::Other, C::Frozen, L::Armed, _) => A::ObserveOnly,
+                (false, H::Other, C::Frozen, L::Empty, _) => A::ObserveOnly,
+                // bug_143 + bug_059: the believing absence rows exit
+                // belief at the read; the HOLD survives exactly the
+                // in-doubt cells (armed ledger, or this round's own
+                // transmitted act).
+                (true, H::Absent, C::Moved, L::Armed, _) => A::AbsenceLoseHoldKept,
+                (true, H::Absent, C::Frozen, L::Armed, _) => A::AbsenceLoseHoldKept,
+                (true, H::Absent, C::Moved, L::Empty, D::Transmitted) => A::AbsenceLoseHoldKept,
+                (true, H::Absent, C::Frozen, L::Empty, D::Transmitted) => A::AbsenceLoseHoldKept,
+                (true, H::Absent, C::Moved, L::Empty, D::Resolved) => A::AbsenceLose,
+                (true, H::Absent, C::Frozen, L::Empty, D::Resolved) => A::AbsenceLose,
+                // Standby absence: re-baseline only.
+                (false, H::Absent, C::Moved, L::Armed, _) => A::AbsenceObserve,
+                (false, H::Absent, C::Moved, L::Empty, _) => A::AbsenceObserve,
+                (false, H::Absent, C::Frozen, L::Armed, _) => A::AbsenceObserve,
+                (false, H::Absent, C::Frozen, L::Empty, _) => A::AbsenceObserve,
             }
         }
+        let mut believing_absent_actions = std::collections::BTreeSet::new();
         for believes in [false, true] {
             for h in HolderCell::ALL {
                 for c in ContentCell::ALL {
                     for l in LedgerCell::ALL {
-                        let routed = route_act_failed_read(believes, h, c, l).execute();
-                        assert_eq!(
-                            routed,
-                            spec(believes, h, c, l),
-                            "cell (believes={believes}, {h:?}, {c:?}, {l:?})"
-                        );
-                        if believes {
-                            assert!(
-                                !matches!(
-                                    routed,
-                                    ActFailedAction::ObserveOnly | ActFailedAction::AbsenceObserve
-                                ),
-                                "believing cell (believes={believes}, {h:?}, {c:?}, \
-                                 {l:?}) must run a transition"
+                        for d in ActDoubt::ALL {
+                            let routed = route_act_failed_read(believes, h, c, l, d).execute();
+                            assert_eq!(
+                                routed,
+                                spec(believes, h, c, l, d),
+                                "cell (believes={believes}, {h:?}, {c:?}, {l:?}, {d:?})"
                             );
+                            if believes {
+                                assert!(
+                                    !matches!(
+                                        routed,
+                                        ActFailedAction::ObserveOnly
+                                            | ActFailedAction::AbsenceObserve
+                                    ),
+                                    "believing cell (believes={believes}, {h:?}, {c:?}, \
+                                     {l:?}, {d:?}) must run a transition"
+                                );
+                            }
+                            // The absence partition (bug_143): absence
+                            // actions route exactly the Absent cells —
+                            // this is what discharges the executor's
+                            // facts-presence expects in both directions.
+                            let is_absence_action = matches!(
+                                routed,
+                                ActFailedAction::AbsenceLose
+                                    | ActFailedAction::AbsenceLoseHoldKept
+                                    | ActFailedAction::AbsenceObserve
+                            );
+                            assert_eq!(
+                                is_absence_action,
+                                matches!(h, HolderCell::Absent),
+                                "absence partition violated at (believes={believes}, \
+                                 {h:?}, {c:?}, {l:?}, {d:?}) -> {routed:?}"
+                            );
+                            // bug_059, both directions: the hold-kept
+                            // cell is exactly the in-doubt believing
+                            // absence.
+                            assert_eq!(
+                                routed == ActFailedAction::AbsenceLoseHoldKept,
+                                believes
+                                    && matches!(h, HolderCell::Absent)
+                                    && (matches!(l, LedgerCell::Armed)
+                                        || matches!(d, ActDoubt::Transmitted)),
+                                "hold axis violated at (believes={believes}, {h:?}, \
+                                 {c:?}, {l:?}, {d:?}) -> {routed:?}"
+                            );
+                            // Every non-absence row is doubt-invariant:
+                            // the axis prices ONLY the absence hold.
+                            if !matches!(h, HolderCell::Absent) {
+                                assert_eq!(
+                                    routed,
+                                    route_act_failed_read(believes, h, c, l, D::Transmitted)
+                                        .execute(),
+                                    "non-absence rows must be ActDoubt-invariant: \
+                                     (believes={believes}, {h:?}, {c:?}, {l:?})"
+                                );
+                            }
+                            if believes && matches!(h, HolderCell::Absent) {
+                                believing_absent_actions.insert(format!("{routed:?}"));
+                            }
                         }
-                        // The absence partition (bug_143): absence
-                        // actions route exactly the Absent cells —
-                        // this is what discharges the executor's
-                        // facts-presence expects in both directions.
-                        let is_absence_action = matches!(
-                            routed,
-                            ActFailedAction::AbsenceLose | ActFailedAction::AbsenceObserve
-                        );
-                        assert_eq!(
-                            is_absence_action,
-                            matches!(h, HolderCell::Absent),
-                            "absence partition violated at (believes={believes}, \
-                             {h:?}, {c:?}, {l:?}) -> {routed:?}"
-                        );
                     }
                 }
             }
         }
+        // bug_059's census extension: the believing-absent cells map
+        // at least TWO distinct actions — enumeration WITHOUT per-axis
+        // posture differentiation (all cells to one action) reds here.
+        assert!(
+            believing_absent_actions.len() >= 2
+                && believing_absent_actions.contains("AbsenceLose")
+                && believing_absent_actions.contains("AbsenceLoseHoldKept"),
+            "believing-absent cells must split per the hold axis, got \
+             {believing_absent_actions:?}"
+        );
     }
 }

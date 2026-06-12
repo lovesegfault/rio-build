@@ -2522,7 +2522,7 @@ module leaderElection {
   /// Pre-change, this read was NOT expressible as a deferral-
   /// resolving step — noStaleExhaustedLose was green-by-omission over
   /// exactly the production leak (the model shared the blind spot).
-  // r[verify sched.lease.holder-evidenced-lose+3]
+  // r[verify sched.lease.holder-evidenced-lose+4]
   action actFailedHeldReadObserved(n: Node): bool = all {
     HOLDER_EVIDENCE_LOSE,
     alive.get(n),
