@@ -18,6 +18,7 @@ use crate::state::DerivationState;
 /// day is a runaway regardless of pod shape.
 pub(super) const DEADLINE_CAP_SECS: u32 = 86_400;
 
+// r[impl sys.liveness.exit-edge]
 /// merged_bug_016: the mem dimension's cap in the SOLVE domain — the
 /// largest solved mem whose padded container
 /// (`rio_common::footprint::container_mem_bytes`) still fits under
@@ -570,6 +571,58 @@ mod tests {
             "the at-cap arm heals the in-memory floor down to the LIVE \
              cap — the SOLVE-domain cap since merged_bug_016 (a raw \
              global floor renders an unhostable container)"
+        );
+    }
+
+    // r[verify sys.liveness.exit-edge]
+    /// **W11-AB (merged_bug_016's R30 face)** — *proposition: an
+    /// over-ceiling true mem need reaches the designed bounded
+    /// at-cap terminal in BOUNDED steps, and every attempt along the
+    /// way — including the at-cap attempts the retry counter charges
+    /// — renders a HOSTABLE container under the shared footprint
+    /// law; the negation is the advisory-forever loop (pre-fix: the
+    /// doubling cap was the raw global, so the at-cap dispatch
+    /// rendered `global + pad`, which no class hosts — the counted
+    /// attempts could never run and the strand requeued forever).*
+    /// Population: the OOM doubling walk from a 1 GiB first dispatch
+    /// to at-cap, every step checked. STRAWMAN RED (order infeasible
+    /// — commit 1 already moved the cap): with `cap = CEIL.max_mem`
+    /// restored, the hostability assert fails at the at-cap step
+    /// (`container(256 GiB) = 256 GiB + 256 MiB > 256 GiB`), and
+    /// commit 1's floor-family re-derivations pinned the same
+    /// boundary in their oracles.
+    #[test]
+    fn at_cap_terminal_reachable_in_bounded_steps_and_runnable() {
+        let mut s = st();
+        s.sched.last_intent = Some(intent(1 << 30, 0, 0));
+        let mut steps = 0u32;
+        loop {
+            let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL);
+            steps += 1;
+            // Every dispatch the next attempt would mint (>= the
+            // floor) renders a hostable container — the exit edge's
+            // REACHABILITY: the terminal's attempts can actually run.
+            let next_dispatch = s.sched.resource_floor.mem_bytes;
+            assert!(
+                rio_common::footprint::container_mem_bytes(next_dispatch) <= CEIL.max_mem,
+                "step {steps}: dispatch at {next_dispatch} renders an \
+                 unhostable container — the advisory-forever strand"
+            );
+            if o.at_cap {
+                break;
+            }
+            assert!(steps < 64, "doubling walk diverged");
+        }
+        // Hand-derived step oracle (not impl-derived): base starts at
+        // the 1 GiB last_intent; doublings 1→2→4→…→128→clip at
+        // cap' = 256 GiB − 256 MiB are 8 promoted steps, then step 9
+        // reports at_cap. Bounded ⇒ the retry counter starts charging
+        // at a known attempt number.
+        assert_eq!(steps, 9, "bounded steps to the at-cap terminal");
+        assert_eq!(
+            s.sched.resource_floor.mem_bytes,
+            mem_solve_cap(&CEIL),
+            "the terminal state is the hostable solve-domain cap"
         );
     }
 

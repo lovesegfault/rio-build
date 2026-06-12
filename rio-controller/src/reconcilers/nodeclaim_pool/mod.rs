@@ -596,6 +596,7 @@ impl NodeClaimPoolConfig {
         // caller's pin-stripped attribution then pends it typed
         // (`PlacementOutcome::PinGated`), never a silent launch.
         let pin: Option<Option<CapacityType>> = i.capacity_pin.as_deref().map(CapacityType::parse);
+        // r[impl ctrl.pool.gate-superset]
         // merged_bug_016: the admission predicate consumes the
         // CONSTRUCTED pod footprint (`intent_pod_footprint` — the
         // shared `rio_common::footprint` container law), never the
@@ -3938,6 +3939,85 @@ mod tests {
                  requeue strand (zero claims, no typed terminal) instead of \
                  the designed bounded poison"
             );
+        }
+    }
+
+    // r[verify ctrl.pool.gate-superset]
+    /// **W11-AA (controller side)** — *proposition: the controller's
+    /// admission gate (`fallback_cell`) AND the provisioning
+    /// partition (`cover::sizing`) both EQUAL the shared footprint
+    /// law over the [GEN-SET] band-boundary population
+    /// (`rio_common::footprint::band_boundary_cells` — the same
+    /// generated cells the scheduler-side twin
+    /// `retain_hosting_gate_equals_shared_law_oracle` quantifies);
+    /// population: hosting ceilings (1 GiB, the ×0.9 shape, 64 GiB)
+    /// × the generated boundary cells.* Both sides equal to one
+    /// oracle ⟹ provisioning admits ⊇ placement admits. STRAWMAN
+    /// RED: a per-side constant on either gate (the bare
+    /// `i.mem_bytes <= cls_m` compare this close retired) flips the
+    /// knife-edge cells — the commit-1 W11-Z red, over the full
+    /// generated population.
+    #[test]
+    fn fallback_and_sizing_equal_shared_law_oracle() {
+        use rio_proto::types::{HwClassLabels, NodeLabelMatch};
+        const GI: u64 = 1 << 30;
+        for cm in [GI, (64 * GI) / 10 * 9, 64 * GI] {
+            let cfg = NodeClaimPoolConfig {
+                reference_hw_class: "probe-x86".into(),
+                ..Default::default()
+            };
+            let hw = HwClassConfig::default();
+            hw.set(
+                [(
+                    "probe-x86".into(),
+                    HwClassLabels {
+                        labels: vec![NodeLabelMatch {
+                            key: ARCH_LABEL.into(),
+                            value: "amd64".into(),
+                        }],
+                        max_cores: 128,
+                        max_mem: cm,
+                        ..Default::default()
+                    },
+                )]
+                .into(),
+                (192, cm),
+            );
+            let scfg = cover::SizingCfg {
+                max_node_cores: 128,
+                max_node_mem: cm,
+                max_node_disk: cfg.max_node_disk,
+                budget: u32::MAX,
+                fuse_cache_bytes: cfg.fuse_cache_bytes,
+            };
+            let cell = Cell("probe-x86".into(), CapacityType::Spot);
+            let none = HashSet::new();
+            for mem in rio_common::footprint::band_boundary_cells(cm) {
+                let i = SpawnIntent {
+                    intent_id: "oracle-probe".into(),
+                    system: "x86_64-linux".into(),
+                    cores: 4,
+                    mem_bytes: mem,
+                    disk_bytes: GI,
+                    ..Default::default()
+                };
+                let oracle = rio_common::footprint::container_mem_bytes(mem) <= cm;
+                let admitted = cfg.fallback_cell(&i, &hw, &none).is_some();
+                assert_eq!(
+                    admitted, oracle,
+                    "fallback_cell diverged from the shared law at \
+                     (cm={cm}, mem={mem}) — a per-side constant re-opened \
+                     the band"
+                );
+                let refs = [&i];
+                let s = cover::sizing(&cell, &refs, &scfg);
+                let fits = s.over_cap.is_empty() && !s.claims.is_empty();
+                assert_eq!(
+                    fits, oracle,
+                    "cover::sizing diverged from the shared law at \
+                     (cm={cm}, mem={mem})"
+                );
+            }
         }
     }
 

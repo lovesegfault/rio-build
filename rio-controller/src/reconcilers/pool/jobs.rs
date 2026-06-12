@@ -206,7 +206,7 @@ pub(crate) fn intent_pod_footprint(i: &SpawnIntent, fuse_cache_bytes: u64) -> Po
     };
     PodFootprint {
         cores: i.cores,
-        // r[impl ctrl.pool.container-overhead]
+        // r[impl ctrl.pool.container-overhead+2]
         // live_058-a: the container law — solved BUILD mem + the
         // resident worker pad, floored. Additive at the container
         // seam, applied to the SOLVED dimension after any floor
@@ -274,7 +274,7 @@ impl PodFootprint {
 /// §sizing-model. Quantities rendered as raw byte counts (no SI
 /// suffix): k8s parses bare integers as base-unit and they roundtrip
 /// exactly.
-// r[impl ctrl.pool.container-overhead]
+// r[impl ctrl.pool.container-overhead+2]
 fn stamp_container_resources(
     container: &mut k8s_openapi::api::core::v1::Container,
     fp: &PodFootprint,
@@ -4735,7 +4735,7 @@ mod w10_cj_container_pad {
         req["memory"].0.parse::<u64>().unwrap()
     }
 
-    // r[verify ctrl.pool.container-overhead]
+    // r[verify ctrl.pool.container-overhead+2]
     /// The MINIMUM corner: a 64 MiB solve (the live incident band)
     /// renders the 512 MiB floor — pre-fix the rendered limit WAS the
     /// solve (64 MiB, below the worker's own baseline → whole-
@@ -4755,7 +4755,7 @@ mod w10_cj_container_pad {
         );
     }
 
-    // r[verify ctrl.pool.container-overhead]
+    // r[verify ctrl.pool.container-overhead+2]
     /// The PAD corner: a 1 GiB solve renders solve + pad (the floor
     /// is inert above 256 MiB solves).
     #[test]
@@ -4769,7 +4769,7 @@ mod w10_cj_container_pad {
         );
     }
 
-    // r[verify ctrl.pool.container-overhead]
+    // r[verify ctrl.pool.container-overhead+2]
     /// **W10-CK** rides `footprint_matches_stamped_requests` (the
     /// shared-fn quantifier: FFD's decrement == the pod's rendered
     /// request, count-exact, now over the PADDED mem) — this twin
@@ -4850,7 +4850,7 @@ mod mem_axis_census {
             .count()
     }
 
-    // r[verify ctrl.pool.container-overhead]
+    // r[verify ctrl.pool.container-overhead+2]
     /// The compile-sealed seam, re-verified at the scan layer: ZERO
     /// `mem_bytes` tokens inside the stamp helper (the intent cannot
     /// be read there — rustc enforces it; this pin makes the seam's
@@ -4871,7 +4871,7 @@ mod mem_axis_census {
         );
     }
 
-    // r[verify ctrl.pool.container-overhead]
+    // r[verify ctrl.pool.container-overhead+2]
     /// The census-held wider population: every production `mem_bytes`
     /// read in jobs.rs enumerated — the constructor (1 read), the
     /// hw-bench telemetry gate (1 read), zero raw Quantity stamps.
@@ -4901,7 +4901,7 @@ mod mem_axis_census {
         );
     }
 
-    // r[verify ctrl.pool.container-overhead]
+    // r[verify ctrl.pool.container-overhead+2]
     /// R22′ plants — BOTH grammar forms red at the scan layer.
     #[test]
     fn plant_raw_and_derived_stamps_detected() {

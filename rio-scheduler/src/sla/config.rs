@@ -955,6 +955,7 @@ impl SlaConfig {
             // `required=[kvm], provides=[]` because ∅⊆anything).
             let feat_ok = features_compatible(required_features, &d.provides_features);
             // Size: per-class ceiling (catalog ∩ cfg ∩ global).
+            // r[impl ctrl.pool.gate-superset]
             // merged_bug_016 (the dead-band close): the mem axis
             // compares the CONSTRUCTED container quantity —
             // `rio_common::footprint::container_mem_bytes(solve)` —
@@ -3132,6 +3133,65 @@ mod tests {
                     "band cell mem={mem} admitted by the size gate — its padded \
                      container ({container} > cm {cm}) is provisioning-rejected: \
                      the dead band"
+                );
+            }
+        }
+    }
+
+    // r[verify ctrl.pool.gate-superset]
+    /// **W11-AA (scheduler side)** — *proposition: the scheduler's
+    /// hosting gate EQUALS the shared footprint law over the
+    /// [GEN-SET] band-boundary population
+    /// (`rio_common::footprint::band_boundary_cells`, rendered from
+    /// the shared maps — never hand-typed per side); population:
+    /// ceilings at the container floor, 1 GiB, the ×0.9-margin
+    /// shape, 64 GiB, and a sub-floor non-hosting ceiling, × the
+    /// generated boundary cells of each.* The controller-side twin
+    /// (`fallback_and_sizing_equal_shared_law_oracle`,
+    /// nodeclaim_pool) quantifies the SAME generated population
+    /// through its real gates; both sides equal to one oracle ⟹
+    /// provisioning admits ⊇ placement admits (in fact equality on
+    /// the mem axis). STRAWMAN RED (the per-side-constant
+    /// reintroduction this test exists to refuse): reverting either
+    /// side to its bare compare (`mem <= cm`) flips the knife-edge
+    /// cells `cap' + 1 ..= ceiling` — the exact commit-1 W11-Z reds,
+    /// re-derived here over the full generated population.
+    #[test]
+    fn retain_hosting_gate_equals_shared_law_oracle() {
+        let mut cfg = base();
+        cfg.max_cores = Some(256.0);
+        let cat = super::super::catalog::CatalogCeilings::new();
+        let global = (256u32, 1u64 << 60);
+        for cm in [
+            rio_common::footprint::CONTAINER_MEM_MIN_BYTES,
+            1 << 30,
+            (64u64 << 30) / 10 * 9, // the derive_ceilings ×0.9 shape
+            64 << 30,
+            rio_common::footprint::CONTAINER_MEM_MIN_BYTES - 1, // hosts nothing
+        ] {
+            let mut def = test_def(ARCH_LABEL, "amd64");
+            def.max_cores = Some(64);
+            def.max_mem = Some(cm);
+            cfg.hw_classes = HashMap::from([("probe".into(), def)]);
+            let cell: Cell = ("probe".into(), CapacityType::Spot);
+            for mem in rio_common::footprint::band_boundary_cells(cm) {
+                let kept = cfg.retain_hosting_cells(
+                    vec![cell.clone()],
+                    "x86_64-linux",
+                    (8, mem),
+                    &[],
+                    &cat,
+                    global,
+                    None,
+                );
+                let oracle = rio_common::footprint::container_mem_bytes(mem) <= cm;
+                assert_eq!(
+                    !kept.is_empty(),
+                    oracle,
+                    "scheduler gate diverged from the shared law at \
+                     (cm={cm}, mem={mem}): gate={}, oracle={oracle} — a \
+                     per-side constant re-opened the band",
+                    !kept.is_empty()
                 );
             }
         }

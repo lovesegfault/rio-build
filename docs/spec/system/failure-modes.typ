@@ -294,3 +294,47 @@ execution id and filter at the consumer) is recorded REJECTED: it
 leaves the splice window open until the filter and obligates every
 present and future consumer; the typed disposition kills the splice
 at its source.
+
+= Liveness Duals
+
+A safety latch is half a design. Budgets, caps, masks, refusal lanes,
+and advisory dispositions all REMOVE behavior from a state — and a
+state whose behaviors have all been removed is absorbing unless some
+event mints one back. The round-11 corpus carried five independent
+instances of the same composition defect: two individually-sound
+safety rules whose conjunction left a state with no exit edge (a
+gave-up latch whose every reset witness required the pods the latch
+forbids; an exhausted outbox row whose re-decision was swallowed by
+its own idempotency arm; a capacity dead band whose advisory verdict
+never stepped any terminal budget). None of the latches was wrong;
+each was missing its dual.
+
+#r("sys.liveness.exit-edge")[
+  Every absorbing or latched state MUST ship its exit edge in the
+  same change that ships the latch: the close MUST name the reset or
+  terminal event AND demonstrate that the event is reachable from
+  inside the latched state under that state's own invariants — an
+  exit edge gated on evidence the latch itself forbids, or on a
+  re-decision the latch's own idempotency arm swallows, is not an
+  exit edge. Advisory (non-poisoning) dispositions on a retry loop
+  MUST be bounded by a reachable designed terminal; an
+  advisory-forever strand is an absorbing state and rejects the same
+  way.
+]
+
+The founding instance is the merged_bug_016 capacity dead band: the
+`(ceiling − pad, ceiling]` band's OverCap verdicts were ADVISORY by
+design (correct for their intended population, ≤300s config-mirror
+skew that self-heals), but the band made the population permanent —
+an infinite no-pod/no-NodeClaim/no-retry requeue of exactly the
+largest builds, with the designed bounded at-cap poison terminal
+unreachable because the at-cap dispatch itself rendered an
+unhostable container. The exit-edge proof for that close is
+two-armed: the gate/funnel adjunction makes the band EMPTY (no state
+enters), and the at-cap retry terminal is re-proven REACHABLE (the
+pinned at-cap attempt renders a hostable container, runs, and its
+failures are counted against the bounded retry budget). Sibling
+instances land with their own closes (the GC outbox reset edge, the
+gave-up latch's pod-free decay) and append their rows below this
+doctrine; the per-latch exit-edge obligation census is the standing
+machine enforcement.

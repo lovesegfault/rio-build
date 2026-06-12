@@ -729,9 +729,17 @@ pub fn sizing<'a>(cell: &Cell, u: &[&'a SpawnIntent], cfg: &SizingCfg) -> Sizing
         tracing::warn!(
             intent_id = %i.intent_id, cell = %cell, footprint = ?(ic, im, id),
             cap = ?(cfg.max_node_cores, cfg.max_node_mem, cfg.max_node_disk),
-            "intent footprint exceeds per-cell cap — dropping (scheduler ClassCeiling \
-             not gating? scheduler-controller GetHwClassConfig skew up to 300s; \
-             uncatalogued class over-permitted to global until next refresh)"
+            "intent footprint exceeds per-cell cap — dropping. Causes, in \
+             likelihood order: transient GetHwClassConfig mirror skew \
+             (≤300s, self-heals on the next refresh — incl. an \
+             uncatalogued class over-permitted to global until then); a \
+             producer bypassing the scheduler's padded gates. A PERSISTENT \
+             drop for the same intent is neither — pre-merged_bug_016 that \
+             was the (ceiling − pad, ceiling] dead band (admission raw, \
+             provisioning padded); the gate-superset contract tests now \
+             pin both sides to rio_common::footprint, so persistence here \
+             means a per-side constant drifted — check those tests first, \
+             not the mirror"
         );
         ::metrics::counter!(
             "rio_controller_nodeclaim_intent_dropped_total",

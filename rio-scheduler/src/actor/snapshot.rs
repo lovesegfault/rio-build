@@ -1877,6 +1877,23 @@ impl AckApplyPlan {
                     // from NO_HOSTING_CLASS by type; conflating the two
                     // (the laundering form) is forbidden — see the
                     // IntentVerdictReason proto doc.
+                    //
+                    // merged_bug_016: the transient premise above is
+                    // only true since the dead-band close — pre-fix,
+                    // the (ceiling − pad, ceiling] band made this
+                    // population PERMANENT (admission raw,
+                    // provisioning padded, three funnels pinning mem
+                    // exactly at the ceiling), so the advisory arm
+                    // became an infinite requeue strand of exactly
+                    // the largest builds (sys.liveness.exit-edge: an
+                    // advisory disposition on a retry loop must be
+                    // bounded by a reachable terminal). The band is
+                    // now empty by the shared-footprint adjunction
+                    // (gate-superset contract tests), so what lands
+                    // here really is skew-transient; the bounded
+                    // terminals for genuine over-ceiling need are the
+                    // at-cap retry counters (floor.rs, W11-AB) and
+                    // the NoHostingClass verdict budget above.
                     tracing::debug!(
                         intent_id = %v.intent_id,
                         detail = %v.detail,

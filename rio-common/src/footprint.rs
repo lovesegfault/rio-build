@@ -65,6 +65,8 @@ pub const WORKER_MEM_OVERHEAD_BYTES: u64 = 256 << 20;
 /// `solved + pad < floor`, i.e. solves under 256 MiB.
 pub const CONTAINER_MEM_MIN_BYTES: u64 = 512 << 20;
 
+// r[impl ctrl.pool.gate-superset]
+// r[impl ctrl.pool.container-overhead+2]
 /// The forward map: solved BUILD mem → the container mem a pod for
 /// that solve will actually request. This is the constructed quantity
 /// of the merged_bug_016 law —
@@ -82,6 +84,8 @@ pub const fn container_mem_bytes(solved_mem_bytes: u64) -> u64 {
     }
 }
 
+// r[impl ctrl.pool.gate-superset]
+// r[impl sys.liveness.exit-edge]
 /// The inverse map: a class/global mem ceiling → the LARGEST solved
 /// mem whose [`container_mem_bytes`] still fits under it, or `None`
 /// when the ceiling cannot host any container at all
@@ -106,6 +110,36 @@ pub const fn max_hostable_solve_mem(ceiling_bytes: u64) -> Option<u64> {
         // the floor branch of the forward map is satisfied at the
         // result.
         Some(ceiling_bytes - WORKER_MEM_OVERHEAD_BYTES)
+    }
+}
+
+// r[impl ctrl.pool.gate-superset]
+/// The band-boundary population for the cross-process gate contract
+/// tests — [GEN-SET]: rendered from the shared maps (never hand-typed
+/// per side), so the scheduler-side and controller-side
+/// gate-equals-law witnesses quantify over the SAME cells. For a
+/// hosting ceiling the knife edge is `cap' = max_hostable_solve_mem`
+/// (the largest admissible solve) and `cap' + 1` (the first refused
+/// one); the pre-merged_bug_016 dead band was exactly
+/// `(ceiling − pad, ceiling]` = `(cap', ceiling]`, with `ceiling`
+/// itself the value the dispatch funnels pinned. A per-side constant
+/// reintroduced on either gate flips the knife-edge cells — the
+/// contract tests go red there first.
+#[must_use]
+pub fn band_boundary_cells(ceiling_bytes: u64) -> Vec<u64> {
+    match max_hostable_solve_mem(ceiling_bytes) {
+        // Non-hosting ceiling: every solve refuses; probe zero, the
+        // ceiling itself, and one past it.
+        None => vec![0, ceiling_bytes, ceiling_bytes.saturating_add(1)],
+        Some(cap) => vec![
+            0,
+            cap / 2,
+            cap.saturating_sub(1),
+            cap,
+            cap + 1,
+            ceiling_bytes,
+            ceiling_bytes.saturating_add(1),
+        ],
     }
 }
 

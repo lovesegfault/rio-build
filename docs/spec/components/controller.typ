@@ -344,22 +344,26 @@ the page despite restart-totality/continuity contracts (merged_bug_049).
 The completeness witness already rode the wire (`truncated`); this rule
 makes consuming it structural rather than per-consumer diligence.
 
-#r("ctrl.pool.container-overhead")[
+#r("ctrl.pool.container-overhead+2")[
   The container memory limit binds the WHOLE container --- the worker
   daemon, FUSE client, and log capture are resident beside the build,
   and the per-build sub-cgroup carries no limit of its own --- so the
   rendered container memory MUST exceed the solved build size by the
   worker overhead pad, floored at the container minimum:
   `container_mem = max(solved + WORKER_MEM_OVERHEAD_BYTES,
-  CONTAINER_MEM_MIN_BYTES)`. The law MUST be applied in the ONE
-  footprint constructor consumed by the pod stamp, the FFD fit-check,
-  and the NodeClaim floor alike (the simulator-shares-accounting
-  contract on the memory axis), and the container resource map MUST be
-  buildable only from that footprint --- a raw solved size MUST NOT be
-  writable into container resources at the stamp seam. The solve and
-  its telemetry are untouched: the pad is additive at the container
-  seam, applied after any floor-ladder clamp of the solved dimension,
-  so ladder algebra is unchanged.
+  CONTAINER_MEM_MIN_BYTES)`. The pad, the floor, and the law itself
+  MUST live in the ONE shared cross-process home
+  (`rio_common::footprint::container_mem_bytes`) --- the law is a
+  process-boundary law, not a controller-local one --- and MUST be
+  applied in the ONE footprint constructor consumed by the pod stamp,
+  the FFD fit-check, and the NodeClaim floor alike (the
+  simulator-shares-accounting contract on the memory axis); the
+  container resource map MUST be buildable only from that footprint
+  --- a raw solved size MUST NOT be writable into container resources
+  at the stamp seam. The solve and its telemetry are untouched: the
+  pad is additive at the container seam, applied after any
+  floor-ladder clamp of the solved dimension, so ladder algebra is
+  unchanged.
 ]
 
 The live_058 incident is the production specimen: a warm tiny fit
@@ -369,7 +373,47 @@ and the same-size requeue looped at ~2.75 h per iteration. The
 sub-cgroup refinement (a per-build `memory.max = solved` restoring
 exact CgroupOom attribution) is a RULED named candidate --- builder
 plane, trigger: CgroupOom attribution noise observed at the padded
-limit.
+limit. The shared-home clause is the merged_bug_016 amendment: the
+round-10 close minted the constructor controller-locally and the
+coupled cross-process admission predicates kept comparing the bare
+solve --- the dead band the next rule exists to forbid.
+
+#r("ctrl.pool.gate-superset")[
+  Every predicate that decides whether a class or global memory
+  ceiling can host demand --- the scheduler's producer gate and
+  post-finalize chokepoint, the controller's fallback admission, and
+  the provisioning partition --- MUST compare the ONE constructed
+  container quantity (`rio_common::footprint::container_mem_bytes`)
+  against the ceiling, never the bare solve, so that provisioning
+  admits every solve placement admits and the admission/provisioning
+  dead band is empty by construction. Every dispatch funnel that pins
+  demand at a ceiling (the global dispatch clamp, the at-cap floor
+  catch-up, the stale-solve re-solve clamp) MUST pin at the inverse
+  map (`max_hostable_solve_mem(ceiling)`) so pinned demand renders a
+  container of exactly the ceiling --- hostable, and the designed
+  bounded at-cap terminal stays reachable (`sys.liveness.exit-edge`).
+  A per-side numeric constant (pad, margin, reserve) introduced on
+  one side of the process boundary MUST instead enter the shared
+  home; the per-side gate-vs-law agreement witnesses MUST quantify
+  over the band boundary cells rendered from the shared maps, so any
+  per-side constant drift goes red at the knife edge.
+]
+
+The wire is deliberately untouched: `GetHwClassConfig` ships
+container-domain ceilings (the controller-mirror law,
+`scheduler.sla.ceiling.controller-mirror`), and both ends construct
+their compared quantity from the same crate constants --- the
+shared-constant arm of the close. The time axis (mirror refresh skew,
+bounded at 300s) is carried by the mirror law at its own strength;
+the transient skew population self-heals by requeue and is exactly
+the population the OverCap advisory verdict was designed for. The
+scheduler's solve-side candidate prefilter (`evaluate_cell`) remains
+bare-solve by design: it is a producer-tier heuristic whose output
+the padded post-finalize chokepoint re-checks in totality
+("correctness-of-output regardless of correctness-of-producer"), so
+its bareness can admit only candidates the chokepoint then strips
+--- the complement is the chokepoint's totality plus the
+band-boundary witnesses, stated here so the disposition is explicit.
 
 #r("ctrl.pool.spawn-once")[
   Job identity is the deterministic name `job_name(pool, kind,
