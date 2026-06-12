@@ -1534,6 +1534,11 @@
       "doc": "ADR-022 castore RPC surface (P0573 / P0577 / P0570)."
     },
     {
+      "path": "grpc/drv_blob.rs",
+      "depth": 1,
+      "doc": "DrvBlobService (ADR-024 P2): derivations as a first-class castore"
+    },
+    {
       "path": "grpc/get_path.rs",
       "depth": 1,
       "doc": "GetPath: stream a store path's NAR data."

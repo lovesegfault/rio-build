@@ -8,7 +8,9 @@ use rio_proto::ChunkServiceServer;
 use rio_proto::StoreAdminServiceServer;
 use rio_proto::StoreServiceServer;
 use rio_store::backend::ChunkBackend;
-use rio_store::grpc::{ChunkServiceImpl, StoreAdminServiceImpl, StoreServiceImpl};
+use rio_store::grpc::{
+    ChunkServiceImpl, DrvBlobServiceImpl, StoreAdminServiceImpl, StoreServiceImpl,
+};
 use rio_store::signing::{Signer, TenantSigner};
 use rio_store::substitute::Substituter;
 
@@ -222,10 +224,15 @@ async fn main() -> anyhow::Result<()> {
     // castore reads derive identical trust).
     let directory_service = rio_store::grpc::DirectoryServiceImpl::new(
         pool.clone(),
-        hmac_verifier_arc,
+        hmac_verifier_arc.clone(),
         chunk_cache.clone(),
         store_service.signer().cloned(),
     );
+
+    // DrvBlobService (ADR-024 P2): canonical drv blobs, tenant-scoped
+    // via the same JWT/HMAC ladder as DirectoryService. Pure PG — drv
+    // bodies live next to Directory bodies, no chunk backend involved.
+    let drv_blob_service = DrvBlobServiceImpl::new(pool.clone(), hmac_verifier_arc);
 
     // StoreAdminServiceImpl: TriggerGC + VerifyChunks + upstream CRUD
     // + GetLoad. Gets the chunk backend directly (for key_for in
@@ -316,6 +323,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .add_service(
             rio_proto::DirectoryServiceServer::new(directory_service)
+                .max_decoding_message_size(max_msg_size)
+                .max_encoding_message_size(max_msg_size),
+        )
+        .add_service(
+            rio_proto::DrvBlobServiceServer::new(drv_blob_service)
                 .max_decoding_message_size(max_msg_size)
                 .max_encoding_message_size(max_msg_size),
         )
