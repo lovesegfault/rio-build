@@ -574,7 +574,7 @@ pub(super) async fn report_no_eligible_source(
                 // ack — the poison lane's premise is the completed
                 // RPC itself (`attempt_resolved` is false by design
                 // on every NoEligibleSource arm; see the mint's doc).
-                // r[impl ctrl.pool.respawn-backoff+2]
+                // r[impl ctrl.pool.respawn-backoff+3]
                 acked.push((
                     intent.intent_id.clone(),
                     candidate::VerdictWitness::from_acked_no_eligible_source(&resp.into_inner()),
@@ -644,6 +644,11 @@ impl GateUniverse {
 
 /// One completed (or skipped) AD2 gate evaluation (bug_028).
 pub(super) struct SpawnGateOutcome {
+    /// bug_151 (R30): gave-up records decayed by a fresh demand epoch
+    /// this tick --- `(intent_id, receipt)` pairs the caller surfaces
+    /// on the operator verdict plane (the RespawnGiveUpReset Event,
+    /// pairing the RespawnGiveUp Warning the latch minted).
+    pub(super) decayed: Vec<(String, candidate::GaveUpReset)>,
     /// Intents allowed to spawn this tick, in the scheduler's priority
     /// order, NOT yet headroom-truncated: gated intents, intents
     /// inside their verdict-free-respawn backoff, AND fold-skip
@@ -683,6 +688,21 @@ pub(super) fn evaluate_spawn_gate(
     coverage: DemandCoverage,
     now: std::time::Instant,
 ) -> SpawnGateOutcome {
+    // bug_151 (R30 exit edge): the demand seam --- observe every
+    // wanted intent's resubmit_cycle BEFORE any latch consult, on
+    // EVERY universe arm (the latch gates spawning, never the
+    // observation of demand, so this lane stays mintable from inside
+    // the gave-up state). A gave-up record observing a strictly
+    // newer epoch than it latched under decays here and the intent
+    // flows through the respawn_blocked filter below un-withheld ---
+    // the resubmission reaches a spawn within this same tick cycle.
+    // r[impl ctrl.pool.respawn-backoff+3]
+    let mut decayed = Vec::new();
+    for i in &wanted {
+        if let Some(receipt) = streaks.note_demand_epoch(key, &i.intent_id, i.resubmit_cycle) {
+            decayed.push((i.intent_id.clone(), receipt));
+        }
+    }
     let (spawnable, to_report) = match universe {
         GateUniverse::NoWanted => {
             // Fold skipped: drop the witness, retain streaks —
@@ -777,6 +797,7 @@ pub(super) fn evaluate_spawn_gate(
         .filter(|i| !streaks.respawn_blocked(key, &i.intent_id, now))
         .collect();
     SpawnGateOutcome {
+        decayed,
         spawnable,
         to_report,
     }
@@ -932,7 +953,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // already spawn-eligible, and the next verdict-free death
     // re-enters the ladder at 10 s and re-climbs toward the 1280 s
     // cap. Bounded: no LIST ⇒ no spawn either.
-    // r[impl ctrl.pool.respawn-backoff+2]
+    // r[impl ctrl.pool.respawn-backoff+3]
     ctx.exhausted_streak.lock().note_job_alive(
         &streak_key,
         jobs.items
@@ -1079,6 +1100,34 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         evidence.coverage(),
         std::time::Instant::now(),
     );
+    // bug_151 (R30): surface each gave-up decay on the operator
+    // verdict plane --- the Normal Event closes the loop the
+    // RespawnGiveUp Warning opened (same plane, same object).
+    for (intent_id, receipt) in &outcome.decayed {
+        info!(
+            pool = %name, intent = %intent_id, deaths = receipt.deaths(),
+            "gave-up latch decayed by resubmission; respawn cycle restarts fresh"
+        );
+        ctx.publish_event(
+            pool,
+            &kube::runtime::events::Event {
+                type_: kube::runtime::events::EventType::Normal,
+                reason: "RespawnGiveUpReset".into(),
+                note: Some(format!(
+                    "intent {intent_id}: a fresh resubmission (demand epoch {} -> {}) \
+                     decayed the gave-up record ({} verdict-free deaths); respawns \
+                     resume and a recurring failure streak re-latches at the full \
+                     budget.",
+                    receipt.latched_cycle(),
+                    receipt.fresh_cycle(),
+                    receipt.deaths(),
+                )),
+                action: "Reconcile".into(),
+                secondary: None,
+            },
+        )
+        .await;
+    }
     if !outcome.to_report.is_empty() {
         let to_report: Vec<&SpawnIntent> = outcome.to_report.iter().collect();
         let acked = report_no_eligible_source(ctx, &name, &to_report).await;
@@ -1086,7 +1135,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         // is a named resolution — the scheduler now holds the verdict,
         // so the intent's verdict-free-respawn record (if any) clears.
         // The witness was minted at the ack site (merged_bug_080(2b)).
-        // r[impl ctrl.pool.respawn-backoff+2]
+        // r[impl ctrl.pool.respawn-backoff+3]
         let mut streaks = ctx.exhausted_streak.lock();
         for (intent_id, witness) in acked {
             streaks.note_resolution(&streak_key, &intent_id, witness, std::time::Instant::now());
@@ -2578,7 +2627,7 @@ pub(super) async fn reap_stale_for_intents(
                 // the exhaustive merged_bug_080(2b) alphabet (a
                 // resolving ack already cleared the record inside the
                 // delete chokepoint; a charge-free ack proves nothing):
-                // r[impl ctrl.pool.respawn-backoff+2]
+                // r[impl ctrl.pool.respawn-backoff+3]
                 let no_verdict_at_delete = match &synthesized {
                     super::job::SynthesizedDelete::ReportedVerdict { .. } => false,
                     super::job::SynthesizedDelete::AckedNoAttempt
@@ -2686,7 +2735,8 @@ pub(super) async fn reap_stale_for_intents(
                                 pool, intent = %intent_id, deaths = note.deaths,
                                 "respawn GIVE-UP: verdict-free deaths crossed the \
                                  threshold; respawns stop until a named resolution \
-                                 (live_056-b)"
+                                 or a fresh resubmission of the derivation \
+                                 (live_056-b; bug_151)"
                             );
                             ctx.publish_event(
                                 pool_obj,
@@ -2696,8 +2746,9 @@ pub(super) async fn reap_stale_for_intents(
                                     note: Some(format!(
                                         "intent {intent_id}: {} verdict-free builder \
                                          deaths; respawns stop until a named \
-                                         resolution (scheduler verdict or operator \
-                                         action). The intent stays queued.",
+                                         resolution (scheduler verdict) or a fresh \
+                                         resubmission of the derivation decays the \
+                                         record. The intent stays queued.",
                                         note.deaths
                                     )),
                                     action: "Reconcile".into(),

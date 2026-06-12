@@ -355,3 +355,18 @@ or terminal event, and the reachability witness — under the doctrine above
   witnessed end-to-end (injected-outage exhaustion through the production
   drain, then a production re-decision reaching execution past backend
   recovery), with the dedup face co-witnessed: in-budget rows stay swallowed.
+- *Pool gave-up latch (controller)*: the verdict-free respawn record at the
+  give-up threshold (`RESPAWN_GIVE_UP_DEATHS`, pool/candidate.rs) is
+  expiry-immune by design while every reset witness in the prior alphabet
+  required pod/attempt evidence the latch itself forbids (gave-up partitions
+  spawnable; no pod ever exists to mint from) --- an absorbing state minted
+  by two individually-sound rules. Exit edge: the fresh-demand-epoch decay
+  --- a wanted intent presenting a strictly newer `resubmit_cycle` than the
+  record last observed decays it at the demand seam (the one lane the latch
+  does not gate) under the typed `GaveUpReset` receipt; deaths under the new
+  epoch re-latch at the full budget
+  (#rref("ctrl.pool.respawn-backoff")). Reachability witnessed end-to-end
+  through the production fold (give-up, then resubmission, then a same-tick
+  spawn) with the quint twin pair pinning both faces (the as-built module
+  falsifies the liveness; the fixed module holds it with the re-latch
+  safety).

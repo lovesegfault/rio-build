@@ -2146,7 +2146,7 @@ fn gate_evaluates_all_wanted_not_just_window() {
 /// red (breaker neutered --- strawman, the gate cannot exist pre-fix):
 /// `left: 25 right: 5 --- verdict-free respawns must follow the
 /// exponential backoff schedule, not the reconcile cadence`.
-// r[verify ctrl.pool.respawn-backoff+2]
+// r[verify ctrl.pool.respawn-backoff+3]
 #[test]
 fn verdictless_respawn_backs_off_per_intent() {
     use crate::reconcilers::pool::candidate::PoolStreaks;
@@ -2203,7 +2203,7 @@ fn verdictless_respawn_backs_off_per_intent() {
 /// the ack response exactly as the production arm mints it (every
 /// poison-arm ack carries `attempt_resolved=false` by design --- the
 /// ack itself is the premise).
-// r[verify ctrl.pool.respawn-backoff+2]
+// r[verify ctrl.pool.respawn-backoff+3]
 #[test]
 fn verdict_resets_respawn_backoff() {
     use crate::reconcilers::pool::candidate::{PoolStreaks, VerdictWitness};
@@ -2265,6 +2265,228 @@ fn verdict_resets_respawn_backoff() {
             .collect::<Vec<_>>(),
         vec!["drv-loop"],
         "a named resolution must reset the backoff --- the breaker never masks a verdict lane"
+    );
+}
+
+/// bug_151 (R30 banner) red, W11-BE: the gave-up latch composed with
+/// the pod-derived reset alphabet is an ABSORBING state --- every
+/// VerdictWitness mint requires pod/attempt evidence the latch forbids
+/// (gave-up partitions spawnable on healthy infra, so no pod ever
+/// exists to mint from), and the retain law makes gave-up records
+/// expiry-immune. A RESUBMISSION of the once-gave-up drv (intent_id ==
+/// drv_hash; the fresh `resubmit_cycle` is the scheduler's own demand
+/// epoch) silently pends to its scheduler deadline with zero spawns.
+/// The exit edge must be POD-FREE: a fresh demand epoch observed at
+/// the demand seam decays the record the same tick; a recurring
+/// failure streak re-latches at the FULL budget (the safety face
+/// untouched). Both faces driven end-to-end through the production
+/// fold. Recorded red (pre-fix, the absorbing state live):
+/// `left: [] right: ["drv-giveup"] --- a fresh demand epoch must decay
+/// the gave-up latch and spawn within one tick cycle (R30)`.
+// r[verify ctrl.pool.respawn-backoff+3]
+#[test]
+fn fresh_demand_epoch_decays_gave_up_latch() {
+    use crate::reconcilers::pool::candidate::PoolStreaks;
+    use crate::reconcilers::pool::jobs::{GateUniverse, evaluate_spawn_gate};
+    use std::time::Duration;
+
+    let mut streaks = PoolStreaks::default();
+    let key = pkey();
+    let t0 = std::time::Instant::now();
+
+    // Eight verdict-free deaths latch the give-up, interleaved with
+    // evaluated folds at the original demand epoch (resubmit_cycle=0)
+    // exactly as production interleaves reap and fold per tick.
+    let original = SpawnIntent {
+        intent_id: "drv-giveup".into(),
+        ..Default::default()
+    };
+    for n in 0..8u64 {
+        let now = t0 + Duration::from_secs(n * 10);
+        let note = streaks.note_verdict_free_death(&key, "drv-giveup", now);
+        assert_eq!(
+            note.gave_up_edge,
+            n == 7,
+            "the give-up edge fires exactly once, at the 8th death"
+        );
+        let tick = streaks.begin_tick(&key);
+        let outcome = evaluate_spawn_gate(
+            vec![original.clone()],
+            &GateUniverse::NoExclusions,
+            &mut streaks,
+            tick,
+            &key,
+            DemandCoverage::Complete,
+            now,
+        );
+        assert!(
+            outcome.spawnable.is_empty(),
+            "mid-ladder and latched ticks must withhold the respawn"
+        );
+    }
+
+    // The SAME submission keeps presenting on healthy infra: withheld
+    // every tick --- the latch's designed safety face (the latched
+    // demand epoch never decays its own record).
+    for n in 0..5u64 {
+        let now = t0 + Duration::from_secs(300 + n * 10);
+        let tick = streaks.begin_tick(&key);
+        let outcome = evaluate_spawn_gate(
+            vec![original.clone()],
+            &GateUniverse::NoExclusions,
+            &mut streaks,
+            tick,
+            &key,
+            DemandCoverage::Complete,
+            now,
+        );
+        assert!(
+            outcome.spawnable.is_empty(),
+            "the latched epoch must stay withheld (give-up holds)"
+        );
+    }
+
+    // The RESUBMISSION presents (the scheduler recomputed the intent:
+    // resubmit_cycle=1) on healthy infra. R30: the exit edge must be
+    // mintable from inside the latched state --- the decay fires at
+    // the demand seam and the intent spawns THE SAME TICK.
+    let resubmitted = SpawnIntent {
+        intent_id: "drv-giveup".into(),
+        resubmit_cycle: 1,
+        ..Default::default()
+    };
+    let now = t0 + Duration::from_secs(400);
+    let tick = streaks.begin_tick(&key);
+    let outcome = evaluate_spawn_gate(
+        vec![resubmitted.clone()],
+        &GateUniverse::NoExclusions,
+        &mut streaks,
+        tick,
+        &key,
+        DemandCoverage::Complete,
+        now,
+    );
+    assert_eq!(
+        outcome
+            .spawnable
+            .iter()
+            .map(|i| i.intent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["drv-giveup"],
+        "a fresh demand epoch must decay the gave-up latch and spawn within one tick cycle (R30)"
+    );
+    // The typed receipt carries the decay's evidence (the caller
+    // surfaces it on the operator verdict plane).
+    assert_eq!(outcome.decayed.len(), 1, "exactly one decay receipt");
+    let (decayed_id, receipt) = &outcome.decayed[0];
+    assert_eq!(decayed_id, "drv-giveup");
+    assert_eq!(
+        receipt.deaths(),
+        8,
+        "the receipt carries the latched death count"
+    );
+    assert_eq!(receipt.latched_cycle(), 0);
+    assert_eq!(receipt.fresh_cycle(), 1);
+
+    // The safety face: a recurring failure streak under the NEW epoch
+    // re-latches at the FULL budget --- eight fresh deaths, the edge
+    // firing exactly at the 8th, interleaved with evaluated folds at
+    // the resubmitted epoch (which must NOT decay its own record).
+    for n in 0..8u64 {
+        let now = t0 + Duration::from_secs(500 + n * 10);
+        let note = streaks.note_verdict_free_death(&key, "drv-giveup", now);
+        assert_eq!(
+            note.gave_up_edge,
+            n == 7,
+            "the re-latch budget is the full eight deaths (safety preserved)"
+        );
+        let tick = streaks.begin_tick(&key);
+        let _ = evaluate_spawn_gate(
+            vec![resubmitted.clone()],
+            &GateUniverse::NoExclusions,
+            &mut streaks,
+            tick,
+            &key,
+            DemandCoverage::Complete,
+            now,
+        );
+    }
+    let tick = streaks.begin_tick(&key);
+    let relatched = evaluate_spawn_gate(
+        vec![resubmitted],
+        &GateUniverse::NoExclusions,
+        &mut streaks,
+        tick,
+        &key,
+        DemandCoverage::Complete,
+        t0 + Duration::from_secs(700),
+    );
+    assert!(
+        relatched.spawnable.is_empty(),
+        "the re-latched record must withhold at the already-observed epoch"
+    );
+}
+
+/// bug_151 companion: a MID-LADDER resubmission must NOT shortcut the
+/// backoff window --- the ladder's own expiry is its exit edge (time
+/// un-blocks it), and decaying there would let resubmit spam bypass
+/// the futility breaker (respawn at tick cadence --- the exact hot
+/// loop the breaker exists to stop). Only the GAVE-UP state decays.
+// r[verify ctrl.pool.respawn-backoff+3]
+#[test]
+fn mid_ladder_resubmission_does_not_shortcut_backoff() {
+    use crate::reconcilers::pool::candidate::PoolStreaks;
+    use crate::reconcilers::pool::jobs::{GateUniverse, evaluate_spawn_gate};
+    use std::time::Duration;
+
+    let mut streaks = PoolStreaks::default();
+    let key = pkey();
+    let t0 = std::time::Instant::now();
+
+    // Three verdict-free deaths: mid-ladder, 40 s window from the
+    // last death.
+    for n in 0..3u64 {
+        streaks.note_verdict_free_death(&key, "drv-mid", t0 + Duration::from_secs(n));
+    }
+    // Resubmission arrives inside the window: still withheld.
+    let resubmitted = SpawnIntent {
+        intent_id: "drv-mid".into(),
+        resubmit_cycle: 1,
+        ..Default::default()
+    };
+    let tick = streaks.begin_tick(&key);
+    let inside = evaluate_spawn_gate(
+        vec![resubmitted.clone()],
+        &GateUniverse::NoExclusions,
+        &mut streaks,
+        tick,
+        &key,
+        DemandCoverage::Complete,
+        t0 + Duration::from_secs(10),
+    );
+    assert!(
+        inside.spawnable.is_empty(),
+        "a mid-ladder resubmission must not shortcut the backoff window"
+    );
+    // The window lapses on its own: the ladder's exit edge is time.
+    let tick = streaks.begin_tick(&key);
+    let lapsed = evaluate_spawn_gate(
+        vec![resubmitted],
+        &GateUniverse::NoExclusions,
+        &mut streaks,
+        tick,
+        &key,
+        DemandCoverage::Complete,
+        t0 + Duration::from_secs(50),
+    );
+    assert_eq!(
+        lapsed
+            .spawnable
+            .iter()
+            .map(|i| i.intent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["drv-mid"],
+        "the lapsed window must re-open spawn (the ladder's own exit edge)"
     );
 }
 
@@ -2737,7 +2959,7 @@ fn intent_named(id: &str) -> SpawnIntent {
     }
 }
 
-// r[verify ctrl.pool.respawn-backoff+2]
+// r[verify ctrl.pool.respawn-backoff+3]
 /// merged_bug_080(2a) red 1 (recorded verbatim in the close commit):
 /// a respawn record MUST survive the Job-alive phase. Paused clock:
 /// verdict-free death at t0 (deaths=1, backoff 10 s); the Job is
@@ -2790,7 +3012,7 @@ fn job_alive_phase_does_not_expire_respawn_record() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+2]
+// r[verify ctrl.pool.respawn-backoff+3]
 /// merged_bug_080(2a) red 2 (recorded verbatim in the close commit):
 /// same law through the TERMINAL-UNREAPED phase --- a terminal Job
 /// listed for the 600 s JOB_TTL window is the observable artifact of
@@ -2835,7 +3057,7 @@ fn respawn_record_survives_terminal_unreaped_window() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+2]
+// r[verify ctrl.pool.respawn-backoff+3]
 /// merged_bug_080(2a) census (R15): the record's retention horizon
 /// dominates EVERY cycle phase in which the intent is structurally
 /// un-evaluated --- exhaustively over the closed [`CyclePhase`]
@@ -2947,7 +3169,7 @@ fn deadline_exceeded_job(name: &str, intent_id: &str) -> Job {
     j
 }
 
-// r[verify ctrl.pool.respawn-backoff+2]
+// r[verify ctrl.pool.respawn-backoff+3]
 /// merged_bug_080(2b) red 4 (recorded verbatim in the close commit): a
 /// charge-free ack MUST NOT reset a respawn record. The reap steps the
 /// record (verdict-free death — the production noting call), then the
@@ -3001,7 +3223,7 @@ async fn noop_ack_does_not_reset_respawn_record() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+2]
+// r[verify ctrl.pool.respawn-backoff+3]
 /// merged_bug_080(2b) red 5 (recorded verbatim in the close commit): a
 /// worker-closed death is NOT verdict-free. The terminal reap finds no
 /// OPEN attempt (the attempt already closed — the scheduler holds an
@@ -3087,7 +3309,7 @@ async fn worker_closed_death_is_not_verdict_free() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+2]
+// r[verify ctrl.pool.respawn-backoff+3]
 /// merged_bug_080(2b) red 6 — the kind axis, differential form: the
 /// recently-closed reset lane must ride the BUILD conjunct. Same
 /// scenario twice, only `attempt_kind` differs: MATERIALIZATION and
@@ -3166,7 +3388,7 @@ async fn materialization_close_does_not_reset_build_record() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+2]
+// r[verify ctrl.pool.respawn-backoff+3]
 /// merged_bug_036 R1: a close cannot mask the death of a Job created
 /// AFTER it. PROPOSITION CERTIFIED: the chronology conjunct at the
 /// constructor (mint 4b), over production-shaped Jobs (real
@@ -3249,7 +3471,7 @@ async fn pre_creation_close_does_not_cover_a_death() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+2]
+// r[verify ctrl.pool.respawn-backoff+3]
 /// W9-AT, note_resolution face (bug_122): the windowed-reset
 /// chronology guard is INVARIANT in witness staleness. Fixed physical
 /// config: deaths at now−30s and now−14s (count 2 ⇒ 20s window, so
@@ -3298,7 +3520,7 @@ fn w9_at_note_resolution_retention_invariant_in_staleness() {
     }
 }
 
-// r[verify ctrl.pool.respawn-backoff+2]
+// r[verify ctrl.pool.respawn-backoff+3]
 /// merged_bug_036 R2: a close cannot erase deaths recorded AFTER it.
 /// PROPOSITION CERTIFIED: the chronology conjunct at the record — the
 /// reset loop fed an in-window close at age 70s does NOT remove a
@@ -3419,7 +3641,7 @@ async fn erring_token_mint_spawns_nothing_this_tick() {
     }
 }
 
-// r[verify ctrl.pool.respawn-backoff+2]
+// r[verify ctrl.pool.respawn-backoff+3]
 /// merged_bug_036 overflow red: a wire `closed_age_secs` near
 /// u64::MAX must saturate, never wrap — a wrapped tiny age INVERTS
 /// both chronology guards (a record that must be retained gets
@@ -3462,7 +3684,7 @@ fn near_max_close_age_saturates_and_retains() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+2]
+// r[verify ctrl.pool.respawn-backoff+3]
 /// merged_bug_036 R3: the restored envelope — respawn count under
 /// sustained verdict-free fast-crash is LADDER-bounded inside a
 /// renewable close window. PROPOSITION CERTIFIED structurally (spawn
@@ -3514,7 +3736,7 @@ fn fast_crash_generations_meet_the_ladder_inside_a_close_window() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff+2]
+// r[verify ctrl.pool.respawn-backoff+3]
 /// merged_bug_080(2b) red 7 — the green companion to red 4: a
 /// RESOLVING ack (`attempt_resolved=true`) still resets — the breaker
 /// must never tax a real verdict. Both mint polarities at the seam:
@@ -4715,7 +4937,7 @@ fn w10_al_re_ack_derives_from_job_list_independent_of_paging() {
     assert_eq!(acks.len(), 3, "exactly the three lawful acks");
 }
 
-// r[verify ctrl.pool.respawn-backoff+2]
+// r[verify ctrl.pool.respawn-backoff+3]
 /// **W10-AR (round-10 bug_078, the breaker discriminator at its own
 /// quantifier).** k CLEAN exits step NOTHING (a verdict-free terminal
 /// reap whose Job COMPLETED is the worker's lawful exit — the typed

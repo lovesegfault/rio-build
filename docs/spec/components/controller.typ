@@ -501,7 +501,7 @@ band-boundary witnesses, stated here so the disposition is explicit.
   window, destroying by spawning what the retain law preserved.
 ]
 
-#r("ctrl.pool.respawn-backoff+2")[
+#r("ctrl.pool.respawn-backoff+3")[
   A pool MUST NOT respawn an intent whose previous Job died without
   the scheduler holding a verdict for an attempt of that intent,
   except behind the exponential backoff floor (base = reconcile
@@ -516,7 +516,16 @@ band-boundary witnesses, stated here so the disposition is explicit.
   expire during any cycle phase in which its intent is structurally
   unobservable to the gate fold --- a live or terminal same-named Job
   in the tick's listing refreshes it; the orphan expiry applies only
-  to jobless silence.
+  to jobless silence. A record at or past the give-up threshold MUST
+  decay on a fresh demand epoch: a wanted intent presenting a strictly
+  newer resubmit cycle than the record itself last observed decays the
+  record the same tick under an evidence-carrying reset whose evidence
+  is the demand epoch, not a pod (the gave-up state forbids pods, so a
+  pod-derived exit edge is unreachable from inside it); a failure
+  streak under the new epoch MUST re-latch at the full give-up budget.
+  A mid-ladder record MUST NOT decay on resubmission --- its backoff
+  window expiring is that state's own exit edge, and an epoch-triggered
+  mid-window reset would let resubmission spam bypass the breaker.
 ]
 
 #r("ctrl.pool.ack-spawned-soundness")[

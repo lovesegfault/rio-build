@@ -2173,3 +2173,223 @@ module nodeclaimLifecycleTombstone {
         and not(violations.contains(VTombstoneDropped)))
   }
 }
+
+
+// ─────────────────────────────────────────────────────────────────────
+// WO-S7-1 (bug_151, R30 banner): the verdict-free-respawn GIVE-UP
+// latch and its fresh-demand-epoch exit edge — a deliberately small
+// companion machine beside Model N. The latch lives in the POOL
+// reconciler (pool/candidate.rs::PoolStreaks), not the NodeClaim
+// plane; the controller-formal corpus keeps its lifecycle models in
+// this file (OQ-12: S4's DeleteOutcome letters extend the core
+// module, this pair appends — disjoint regions).
+//
+// WHAT IS MODELED
+//   One (pool, intent) respawn record against one drv's demand
+//   stream. The environment owns the scheduler's demand epoch
+//   (resubmit_cycle: bumped only when the drv re-enters Ready after
+//   leaving) and the deadline that removes demand. One tick = the
+//   production order: demand-seam pass (note_demand_epoch) → latch
+//   filter (respawn_blocked) → spawn → optional verdict-free death
+//   (the next reap's note_verdict_free_death, folded into the same
+//   tick action — the ladder's TIMED windows are abstracted away:
+//   only the latch face is modeled, so a mid-ladder tick MAY spawn).
+//   demandCycle == -1 encodes the record's None (never observed an
+//   epoch: first observation SETS, never decays — the fail-closed
+//   arm).
+//
+// DIVERGENCE (recorded per the bw9 grammar): the model abstracts the
+//   exponential backoff windows (time-free; mid-ladder spawns are
+//   nondeterministic where production gates them on wall clock) and
+//   the named-resolution alphabet (VerdictWitness lanes reset records
+//   in production; omitting them only SHRINKS the reachable reset
+//   set, so the absorbing-state falsification below is conservative —
+//   a model WITH those lanes still cannot reset a gave-up record on
+//   healthy-infra pod silence, which is exactly the bug_151 trap).
+//
+// THE TWIN PAIR (P7): respawnGiveUp (DECAY_ENABLED=true, the landed
+//   code) holds freshEpochServed and reaches EGaveUpDecay (the R30
+//   reachability face, wired as an expect-violation witness on
+//   canReachGiveUpDecay); respawnGiveUpAsBuilt (DECAY_ENABLED=false,
+//   the pre-fix tree) falsifies freshEpochServed — the absorbing
+//   trace, machine-found.
+module respawnGiveUpCore {
+  /// The fix flag: the demand-seam decay arm exists (true = landed
+  /// tree; false = the pre-fix absorbing-state encoding).
+  const DECAY_ENABLED: bool
+  /// RESPAWN_GIVE_UP_DEATHS, scaled for the explored space.
+  const GIVE_UP: int
+  /// Bound on the scheduler's resubmit cycle.
+  const MAX_CYCLE: int
+
+  type GiveUpEffect =
+    | EGaveUpDecay
+    | ESpawn
+  // VFreshEpochStarved: a latched record observed a strictly newer
+  // demand epoch and the intent was still withheld that tick — the
+  // starved resubmission (the bug_151 absorbing state, live).
+  type GiveUpViolation =
+    | VFreshEpochStarved
+
+  /// 0 = no record (production: the map has no row); else the
+  /// record's verdict-free death count, saturated at GIVE_UP + 1.
+  var recDeaths: int
+  /// The record's last-observed demand epoch; -1 = None (the record
+  /// has never seen its intent at the seam).
+  var recCycle: int
+  /// The scheduler's current resubmit cycle for the drv.
+  var envCycle: int
+  /// The drv is in the wanted stream (demand is observable).
+  var intentPresent: bool
+  var giveUpViolations: Set[GiveUpViolation]
+  var giveUpEffects: Set[GiveUpEffect]
+
+  action init = all {
+    recDeaths' = 0,
+    recCycle' = -1,
+    envCycle' = 0,
+    intentPresent' = true,
+    giveUpViolations' = Set(),
+    giveUpEffects' = Set(),
+  }
+
+  def latched(d: int): bool = d >= GIVE_UP
+
+  /// One reconcile tick while demand is present, in production order
+  /// (seam → filter → spawn → optional verdict-free death).
+  action tickWith(dies: bool): bool = all {
+    intentPresent,
+    val hasRecord = recDeaths > 0
+    val freshEpoch = hasRecord and recCycle >= 0 and envCycle > recCycle
+    val decays = DECAY_ENABLED and latched(recDeaths) and freshEpoch
+    val starved = not(DECAY_ENABLED) and latched(recDeaths) and freshEpoch
+    val midDeaths = if (decays) 0 else recDeaths
+    val midCycle =
+      if (decays) -1
+      else if (hasRecord and envCycle > recCycle) envCycle
+      else recCycle
+    val spawns = not(latched(midDeaths))
+    all {
+      recDeaths' =
+        if (spawns and dies)
+          (if (midDeaths <= GIVE_UP) midDeaths + 1 else midDeaths)
+        else midDeaths,
+      // A death on a record-less intent MINTS the record with
+      // demandCycle=None (production: row_or_insert_with at the
+      // reap); an existing record keeps its seam-updated epoch.
+      recCycle' = if (spawns and dies and midDeaths == 0) -1 else midCycle,
+      envCycle' = envCycle,
+      intentPresent' = intentPresent,
+      giveUpViolations' =
+        giveUpViolations.union(if (starved) Set(VFreshEpochStarved) else Set()),
+      giveUpEffects' =
+        giveUpEffects
+          .union(if (decays) Set(EGaveUpDecay) else Set())
+          .union(if (spawns) Set(ESpawn) else Set()),
+    }
+  }
+
+  /// A tick with no wanted intent: the seam observes nothing, the
+  /// latch holds (gave-up records are expiry-immune in production —
+  /// the orphan expiry is out of scope here).
+  action tickAbsent = all {
+    not(intentPresent),
+    recDeaths' = recDeaths,
+    recCycle' = recCycle,
+    envCycle' = envCycle,
+    intentPresent' = intentPresent,
+    giveUpViolations' = giveUpViolations,
+    giveUpEffects' = giveUpEffects,
+  }
+
+  /// The drv's scheduler deadline lapses: demand leaves the stream.
+  action deadlineExpires = all {
+    intentPresent,
+    intentPresent' = false,
+    recDeaths' = recDeaths,
+    recCycle' = recCycle,
+    envCycle' = envCycle,
+    giveUpViolations' = giveUpViolations,
+    giveUpEffects' = giveUpEffects,
+  }
+
+  /// The operator resubmits the drv: it re-enters Ready with a
+  /// strictly newer resubmit cycle (the demand epoch — the one
+  /// signal observable from inside the gave-up state).
+  action resubmit = all {
+    not(intentPresent),
+    envCycle < MAX_CYCLE,
+    envCycle' = envCycle + 1,
+    intentPresent' = true,
+    recDeaths' = recDeaths,
+    recCycle' = recCycle,
+    giveUpViolations' = giveUpViolations,
+    giveUpEffects' = giveUpEffects,
+  }
+
+  action step = any {
+    tickWith(true),
+    tickWith(false),
+    tickAbsent,
+    deadlineExpires,
+    resubmit,
+  }
+
+  /// HOLDS (fixed tree): no tick ever leaves a strictly-newer demand
+  /// epoch withheld by a latched record — the resubmission is served
+  /// (decayed and spawned) the same tick it is observed.
+  val freshEpochServed = not(giveUpViolations.contains(VFreshEpochStarved))
+
+  /// Bounds (vacuity-exempt class boundsOK).
+  val giveUpBoundsOK = and {
+    recDeaths >= 0,
+    recDeaths <= GIVE_UP + 1,
+    recCycle >= -1,
+    recCycle <= MAX_CYCLE,
+    envCycle >= 0,
+    envCycle <= MAX_CYCLE,
+  }
+
+  /// Reachability witness (expect-violation wiring): the decay cell
+  /// IS reachable in the fixed encoding — R30's exit-edge face.
+  val canReachGiveUpDecay = not(giveUpEffects.contains(EGaveUpDecay))
+}
+
+/// The landed encoding: the demand-seam decay arm exists. The
+/// deterministic re-latch trace doubles as the budget pin (W11-BE's
+/// quint half): give-up → resubmission decays and spawns the same
+/// tick → fresh deaths re-latch at the FULL budget → the re-latched
+/// epoch holds (no self-decay).
+module respawnGiveUp {
+  import respawnGiveUpCore(
+    DECAY_ENABLED = true,
+    GIVE_UP = 2,
+    MAX_CYCLE = 2
+  ).*
+
+  run relatchTrace =
+    init
+      .then(tickWith(true))      // spawn, verdict-free death 1 (record minted, cycle None)
+      .then(tickWith(true))      // seam sets cycle=0; death 2 == GIVE_UP: latched
+      .then(tickWith(false))     // latched at its own epoch: withheld, no decay
+      .then(deadlineExpires)
+      .then(resubmit)            // envCycle=1, demand returns
+      .then(tickWith(true))      // DECAY + same-tick spawn; the new job dies again
+      .expect(giveUpEffects.contains(EGaveUpDecay))
+      .expect(recDeaths == 1)    // the budget restarted — not carried over
+      .then(tickWith(true))      // seam sets cycle=1; death 2: re-latched at FULL budget
+      .expect(recDeaths == 2)
+      .then(tickWith(false))     // re-latched epoch holds: no decay at its own epoch
+      .expect(freshEpochServed)
+}
+
+/// The pre-fix encoding (live-import falsify twin): no decay arm —
+/// the latched record starves the resubmission forever
+/// (freshEpochServed is violated; the absorbing trace machine-found).
+module respawnGiveUpAsBuilt {
+  import respawnGiveUpCore(
+    DECAY_ENABLED = false,
+    GIVE_UP = 2,
+    MAX_CYCLE = 2
+  ).*
+}

@@ -4770,6 +4770,59 @@ rec {
       witness = "canReachStaleRecordOnly";
     };
 
+    # ---- bug_151 (R30 banner): the respawn give-up latch pair --------
+    # The pool reconciler's gave-up latch with its fresh-demand-epoch
+    # exit edge (WO-S7-1): the fixed encoding HOLDS freshEpochServed (a
+    # latched record never starves a strictly-newer demand epoch — the
+    # decay serves it the same tick); the live-import as-built twin
+    # (DECAY_ENABLED=false) FALSIFIES the same proposition — the
+    # bug_151 absorbing trace, machine-found (P7 pairing).
+    # r[verify ctrl.pool.respawn-backoff+3]
+    quint-respawn-giveup = mkQuintCheck {
+      name = "respawn-giveup";
+      spec = "nodeclaimLifecycle";
+      main = "respawnGiveUp";
+      invariants = [
+        "freshEpochServed"
+        "giveUpBoundsOK"
+      ];
+      vacuityExempt = {
+        giveUpBoundsOK = {
+          class = "boundsOK";
+          reason = "state-bounds conjunct (deaths/cycle ranges); the behavioral leaf freshEpochServed carries the falsify twin";
+        };
+      };
+    };
+    # The falsify twin: the pre-fix encoding (no decay arm) starves the
+    # resubmission forever — freshEpochServed violated.
+    quint-respawn-giveup-asbuilt = mkQuintWitnessCheck {
+      name = "respawn-giveup-asbuilt";
+      spec = "nodeclaimLifecycle";
+      main = "respawnGiveUpAsBuilt";
+      witness = "freshEpochServed";
+    };
+    # The R30 reachability face: the decay cell IS reached in the fixed
+    # encoding (expect-violation on the negated effect — an exit edge
+    # that exists but is unreachable from inside the latch would pass
+    # the holds check vacuously; this witness pins it live).
+    # r[verify ctrl.pool.respawn-backoff+3]
+    quint-respawn-giveup-decay-reachable = mkQuintWitnessCheck {
+      name = "respawn-giveup-decay-reachable";
+      spec = "nodeclaimLifecycle";
+      main = "respawnGiveUp";
+      witness = "canReachGiveUpDecay";
+    };
+    # The deterministic W11-BE trace: give-up → resubmission decays and
+    # spawns the same tick → fresh deaths re-latch at the FULL budget →
+    # the re-latched epoch holds (no self-decay).
+    # r[verify ctrl.pool.respawn-backoff+3]
+    quint-respawn-giveup-relatch-run = mkQuintRunCheck {
+      name = "respawn-giveup-relatch-run";
+      spec = "nodeclaimLifecycle";
+      main = "respawnGiveUp";
+      match = "relatchTrace";
+    };
+
     # ---- Controller Stage-C calibration witnesses --------------------
     # The controller-formal historical-fix corpus replayed against the
     # two reconcile models (controller-invariant-map.md, the Stage-C

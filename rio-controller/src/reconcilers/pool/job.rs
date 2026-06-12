@@ -1018,7 +1018,7 @@ impl AttemptsPair {
 /// site speaks through. A charge-free ack (`attempt_resolved=false`)
 /// witnesses nothing and resets nothing — merged_bug_080(2b); the
 /// witness mint is `candidate::VerdictWitness::from_resolved_ack`.
-// r[impl ctrl.pool.respawn-backoff+2]
+// r[impl ctrl.pool.respawn-backoff+3]
 // r[impl ctrl.job.synthesize-on-delete+4]
 #[allow(clippy::too_many_arguments)] // the build_job precedent: reconcile plumbing, not an API
 pub(super) async fn delete_job_with_synthesized_report(
@@ -1611,7 +1611,7 @@ pub(super) async fn cancel_closed_attempt_jobs(
     // replica's attempt, not build progress, and never resets). This
     // is the one per-tick view read the cancel arm already pays for;
     // the noting is map-existing-only and cheap.
-    // r[impl ctrl.pool.respawn-backoff+2]
+    // r[impl ctrl.pool.respawn-backoff+3]
     {
         let mut streaks = ctx.exhausted_streak.lock();
         for a in attempts_view.freshest().attempts() {
@@ -2299,7 +2299,7 @@ pub(super) async fn report_terminated_pods(
                 // scheduler resolved an attempt with it
                 // (merged_bug_080(2b): a charge-free ack witnesses
                 // nothing and resets nothing).
-                // r[impl ctrl.pool.respawn-backoff+2]
+                // r[impl ctrl.pool.respawn-backoff+3]
                 if !intent_id_for_breaker.is_empty()
                     && let Some(witness) =
                         super::candidate::VerdictWitness::from_resolved_ack(&resp.into_inner())
@@ -2418,7 +2418,7 @@ pub(super) async fn report_deadline_exceeded_jobs(
                 // report for a never-pulled Job (no attempt) acks
                 // `attempt_resolved=false` and resets nothing — the
                 // record the same-tick reap just stepped survives.
-                // r[impl ctrl.pool.respawn-backoff+2]
+                // r[impl ctrl.pool.respawn-backoff+3]
                 let intent_id = report_intent_id_for_job(job);
                 if !intent_id.is_empty()
                     && let Some(witness) =
