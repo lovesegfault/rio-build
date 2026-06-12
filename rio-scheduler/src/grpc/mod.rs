@@ -11,6 +11,7 @@
 //! changes no longer conflict with executor-surface changes.
 
 pub(crate) mod actor_guards;
+mod digest_submit;
 mod executor_service;
 mod scheduler_service;
 

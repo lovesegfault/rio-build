@@ -2179,21 +2179,47 @@ impl DagActor {
                 .and_then(|h| id_map.get(*h).map(|(id, _)| *id))
                 .or_else(|| self.dag.db_id_for_path(drv_path))
         };
-        let edge_rows: Result<Vec<(Uuid, Uuid)>, ActorError> = edges
+        // An endpoint that is not in the DAG AT ALL was already
+        // warn-skipped by `dag.merge`'s edge loop (legacy: a stray
+        // edge to a path outside the submission; ADR-024 digest mode:
+        // an external input digest that resolved in `drv_blobs` but
+        // belongs to no live build). Skip it here too so PG matches
+        // the in-memory DAG instead of failing the whole merge over an
+        // edge the merge never applied. `MissingDbId` remains for the
+        // true invariant violation: endpoint IS a DAG node but has no
+        // db_id from this tx's id_map nor a prior merge.
+        let endpoint = |drv_path: &String| -> Result<Option<Uuid>, ActorError> {
+            match resolve(drv_path) {
+                Some(id) => Ok(Some(id)),
+                None if self.dag.hash_for_path(drv_path).is_none() => {
+                    warn!(
+                        %drv_path,
+                        "edge endpoint not in DAG; skipping edge persist \
+                         (mirrors dag.merge's warn-skip)"
+                    );
+                    Ok(None)
+                }
+                None => Err(ActorError::MissingDbId {
+                    drv_path: drv_path.clone(),
+                }),
+            }
+        };
+        let edge_rows: Result<Vec<Option<(Uuid, Uuid)>>, ActorError> = edges
             .iter()
             .map(|e| {
-                let parent =
-                    resolve(&e.parent_drv_path).ok_or_else(|| ActorError::MissingDbId {
-                        drv_path: e.parent_drv_path.clone(),
-                    })?;
-                let child = resolve(&e.child_drv_path).ok_or_else(|| ActorError::MissingDbId {
-                    drv_path: e.child_drv_path.clone(),
-                })?;
-                Ok((parent, child))
+                let parent = endpoint(&e.parent_drv_path)?;
+                let child = endpoint(&e.child_drv_path)?;
+                Ok(parent.zip(child))
             })
             .collect();
-        let edge_rows = edge_rows?;
+        let edge_rows: Vec<(Uuid, Uuid)> = edge_rows?.into_iter().flatten().collect();
         crate::db::SchedulerDb::batch_insert_edges(tx.conn(), &edge_rows).await?;
+
+        // No PG-side topdown_pruned clear in this transaction: the
+        // clear decision moved to the post-reconciliation pass in
+        // `handle_merge_dag` (clear_topdown_pruned_by_hashes), where it
+        // can see stale-Completed children that
+        // `verify_preexisting_completed` demotes after this commit.
 
         // Batch 4: Pending→Active for the build, in the SAME transaction.
         // A committed merge therefore implies an Active builds row; a

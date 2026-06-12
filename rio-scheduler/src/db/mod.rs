@@ -27,6 +27,7 @@ mod closure;
 pub(crate) mod confirm_fences;
 mod derivations;
 pub(crate) use derivations::{ReplayResidual, StatusReplay};
+mod drv_blobs;
 mod executions;
 mod history;
 pub(crate) mod live_pins;

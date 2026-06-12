@@ -289,6 +289,47 @@ impl SchedulerService for SchedulerGrpc {
             .precompute_fmp_probe(&req.nodes, jwt_token.as_deref())
             .await;
 
+        // ADR-024: digest-bearing submissions derive edges from
+        // input_drv_digests; the request's `edges` list is ignored for
+        // them (legacy submissions keep it unchanged). Every referenced
+        // digest is bulk-verified against the store's drv_blobs BEFORE
+        // the actor sees the submission: a digest that resolves neither
+        // in-submission nor in the store is a FAILED_PRECONDITION
+        // reject naming ALL missing digests (the client re-Has-es,
+        // re-uploads, resubmits). Store verification runs after tenant
+        // resolve because presence is tenant-scoped, mirroring HasDrvs.
+        let edges = match super::digest_submit::classify_and_derive_edges(&req.nodes)? {
+            None => req.edges,
+            Some(d) => {
+                // Deny-on-failure: digest submissions cannot be
+                // accepted without verifying their blobs exist.
+                let db = self.db.as_ref().ok_or_else(|| {
+                    Status::failed_precondition(
+                        "digest-bearing submission requires a database connection",
+                    )
+                })?;
+                let mut referenced: Vec<Vec<u8>> =
+                    d.own.iter().map(|(digest, _)| digest.clone()).collect();
+                referenced.extend(d.external.iter().map(|(_, digest)| digest.clone()));
+                referenced.sort();
+                referenced.dedup();
+                // r[impl sched.submit.digest-verify]
+                let resolved = db
+                    .resolve_drv_digests(&referenced, tenant_id)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "drv digest bulk-verify query failed");
+                        Status::unavailable(
+                            "drv digest verification unavailable; retry the submission",
+                        )
+                    })?;
+                let external_edges = super::digest_submit::verify_resolved(&d, &resolved)?;
+                let mut edges = d.edges;
+                edges.extend(external_edges);
+                edges
+            }
+        };
+
         // Capture the current span's traceparent BEFORE sending to the
         // actor. Span context does not cross the mpsc channel boundary;
         // the actor task's `handle_merge_dag` #[instrument] span is a
@@ -306,7 +347,7 @@ impl SchedulerService for SchedulerGrpc {
                     .status_invalid("priority_class")?
             },
             nodes: req.nodes,
-            edges: req.edges,
+            edges,
             options,
             keep_going: req.keep_going,
             traceparent,
