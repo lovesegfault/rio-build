@@ -477,6 +477,55 @@
       "doc": "A directory body failed structural validation (bad name, duplicate, oversized entry, …). Hard error: an invalid body must never be encoded, digested, or persisted."
     },
     {
+      "enum": "DirBlobError",
+      "name": "TooDeep",
+      "crate": "rio-evalstore",
+      "msg": "directory nesting depth {0} exceeds maximum {MAX_NAR_DEPTH}",
+      "doc": "Nesting deeper than the NAR reader's [`MAX_NAR_DEPTH`]. The same bound for the same reason: a deeper tree can never be regenerated as a NAR the reader accepts, so committing it would create an unservable path. It also keeps the fold recursion bounded — stack depth is capped regardless of caller-supplied input."
+    },
+    {
+      "enum": "DirStoreError",
+      "name": "Build",
+      "crate": "rio-evalstore",
+      "msg": "(transparent — delegates to inner error)",
+      "doc": ""
+    },
+    {
+      "enum": "DirStoreError",
+      "name": "Decode",
+      "crate": "rio-evalstore",
+      "msg": "directory {digest} is not a valid Directory message: {source}",
+      "doc": ""
+    },
+    {
+      "enum": "DirStoreError",
+      "name": "DigestMismatch",
+      "crate": "rio-evalstore",
+      "msg": "directory blob is not canonical: requested {requested}, re-encode digests to {recomputed}",
+      "doc": ""
+    },
+    {
+      "enum": "DirStoreError",
+      "name": "Invalid",
+      "crate": "rio-evalstore",
+      "msg": "directory {digest} failed structural validation: {source}",
+      "doc": ""
+    },
+    {
+      "enum": "DirStoreError",
+      "name": "NotFound",
+      "crate": "rio-evalstore",
+      "msg": "directory {0} not in the pack store",
+      "doc": ""
+    },
+    {
+      "enum": "DirStoreError",
+      "name": "Pack",
+      "crate": "rio-evalstore",
+      "msg": "(transparent — delegates to inner error)",
+      "doc": ""
+    },
+    {
       "enum": "EvalStoreError",
       "name": "AtermRoundTrip",
       "crate": "rio-evalstore",
@@ -1924,6 +1973,11 @@
     },
     {
       "name": "DirBlobError",
+      "crate": "rio-evalstore",
+      "doc": ""
+    },
+    {
+      "name": "DirStoreError",
       "crate": "rio-evalstore",
       "doc": ""
     },

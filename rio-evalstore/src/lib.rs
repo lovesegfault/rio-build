@@ -20,6 +20,7 @@
 
 pub mod cas;
 pub mod dirblob;
+pub mod dircache;
 pub mod ffi;
 pub mod stats;
 pub mod store;

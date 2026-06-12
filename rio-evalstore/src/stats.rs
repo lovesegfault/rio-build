@@ -49,6 +49,14 @@ impl Stats {
         stat.buckets[idx] += 1;
     }
 
+    /// Call count recorded for `op` (0 when never recorded). Test
+    /// surface for structural assertions — e.g. "the warm path did
+    /// zero directory-blob decodes" — without parsing [`Stats::render`].
+    pub fn count(&self, op: &str) -> u64 {
+        let ops = self.ops.lock().expect("stats mutex poisoned");
+        ops.get(op).map_or(0, |s| s.calls)
+    }
+
     /// Render the histogram table (one line per op).
     pub fn render(&self) -> String {
         let ops = self.ops.lock().expect("stats mutex poisoned");

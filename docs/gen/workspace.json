@@ -128,7 +128,9 @@
     },
     "rio-evalstore": {
       "prod": [
-        "rio-nix"
+        "rio-nix",
+        "rio-packstore",
+        "rio-proto"
       ],
       "optional": [],
       "dev": []
