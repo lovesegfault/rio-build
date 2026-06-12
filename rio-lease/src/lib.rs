@@ -3269,7 +3269,13 @@ struct LeaseStanding {
 /// is the episode's FIRST unresolved believing 409 (the lose edge must
 /// not run); `Exhausted` ⇔ a previous deferral is still unresolved —
 /// two consecutive believing 409s — and the caller owes the evidenced
-/// lose edge (whose `on_observed_not_leading` then clears the latch).
+/// lose edge. Edge posture, re-derived from the applied transition
+/// (merged_bug_077 — `CompletedLoseEvidence::apply` routes
+/// `ConflictDeferralExhausted` to `on_self_fence`): the latch clears
+/// and belief drops, but the HOLD survives — every exhausted round's
+/// read named US, so the shutdown release stays armed (the signed
+/// pricing at the evidence type; the round derivation's
+/// `RoundEdge::Lose(ConflictDeferralExhausted)` cell executes it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConflictResolution {
     Deferred,
@@ -3373,12 +3379,17 @@ impl LeaseStanding {
 
     /// A believing renew 409: defer (first of the episode) or report
     /// exhaustion (a previous deferral is still unresolved). The ONLY
-    /// set path for the latch — the lose-or-defer arm consumes the
+    /// set path for the latch — the round derivation consumes the
     /// verdict, so "which arms clear the latch" is not a question any
     /// arm answers by hand: resolution and episode-end run through the
     /// three transitions above. On `Exhausted` the latch stays set;
     /// the evidenced lose edge that must follow clears it via
-    /// `on_observed_not_leading`.
+    /// `on_self_fence` (the posture `CompletedLoseEvidence::apply`
+    /// routes for `ConflictDeferralExhausted` — hold KEPT, since every
+    /// exhausted round's read named us; merged_bug_077: this doc once
+    /// named `on_observed_not_leading`, the hold-clearing posture the
+    /// wave-10 fix deliberately removed, and the stale name invited a
+    /// refactor back to it).
     fn on_believing_conflict(&mut self) -> ConflictResolution {
         if self.conflict_deferred {
             ConflictResolution::Exhausted
