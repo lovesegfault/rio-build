@@ -174,13 +174,18 @@ in
   # -> 7 (bughunt-10 S5 added the bug_136 lose-edge-selection proof:
   # the alphabet widens to the typed lose evidence folded through
   # CompletedLoseEvidence::apply — an exhausted-deferral lose is
-  # fence-class for the release verdict, direct evidence clears it).
+  # fence-class for the release verdict, direct evidence clears it)
+  # -> 10 (bughunt-12 S4 added the complete_round kernel triple: the
+  # merged_bug_053 loop shim — election results onto standing
+  # transitions — as one pure derivation over bounded cells;
+  # exhausted-lose-requires-unresolved-deferral, the production-fold
+  # agreement pin, and the stamp/ledger totality laws).
   # r[verify sched.lease.k8s-lease+2]
   # r[verify sched.lease.at-most-one-leader+3]
   kani-rio-lease = mkKaniCheck {
     name = "rio-lease";
     crate = crateBuildKani.members.rio-lease;
-    expectedHarnesses = 7;
+    expectedHarnesses = 10;
   };
 
   # rio-log-kernel: the store's log-chunk decision kernels, extracted

@@ -117,7 +117,44 @@ use rio_test_support::kube_mock::MockApiServer;
 use serde::Deserialize;
 
 use crate::election::{ElectionResult, FetchOutcome, LeaderElection};
-use crate::{LEASE_TTL, LeaderState, LeaseStanding, STEAL_AFTER, decide, maybe_self_fence};
+use crate::{
+    ActCell, ContentCell, HolderCell, LEASE_TTL, LeaderState, LeaseStanding, LedgerCell, ReadFacts,
+    RoundEdge, STEAL_AFTER, StandingCells, complete_round, decide, maybe_self_fence,
+};
+
+/// The driver's Completed-round edge law — the BASE-regime shim
+/// (`leaderElectionBase` has `HOLDER_EVIDENCE_LOSE = false`, so a
+/// believing conflict loses immediately). The production LOOP refines
+/// the believing-409 edge above this layer — one deferred round, lose
+/// only on holder evidence (`sched.lease.holder-evidenced-lose`) — and
+/// that law is modeled by `leaderElectionHolderEvidence` and pinned by
+/// the loop-level tokio tests; the deferral lives in loop state the
+/// election layer this driver exercises never sees. Do NOT "fix" this
+/// arm to defer: against the base module that would be a per-step
+/// diff, not fidelity. The `loop_shim_base_regime_correspondence` pin
+/// below holds this fn cell-by-cell against the production shim
+/// (`complete_round`), so the two copies of the edge law can no longer
+/// drift silently in EITHER direction.
+fn apply_base_regime_completed_edge(
+    standing: &mut LeaseStanding,
+    state: &LeaderState,
+    result: &ElectionResult,
+) {
+    match result {
+        ElectionResult::Leading { transitions } => {
+            if !standing.believes() {
+                state.on_acquire(*transitions);
+            }
+            standing.on_observed(true);
+        }
+        ElectionResult::Standby | ElectionResult::Conflict => {
+            if standing.believes() {
+                state.on_lose();
+            }
+            standing.on_observed(false);
+        }
+    }
+}
 
 /// One model tick, in implementation time. See the module header for the
 /// derivation; the `const` assertions pin the constraint so neither the
@@ -407,35 +444,12 @@ impl MbtSystem {
             .await
             .context("PUT: act against the mock apiserver")?;
         // run_lease_loop's Ok(Ok(result)) arm: the completed round-trip
-        // re-anchors the self-fence clock, then the
-        // (leading?, was_leading) edge detection fires
-        // on_acquire/on_lose.
+        // re-anchors the self-fence clock, then the base-regime edge
+        // law fires on_acquire/on_lose (factored so the loop-shim
+        // correspondence pin below tests the very mapping this driver
+        // runs).
         h.fence_tick = h.ticks;
-        match result {
-            ElectionResult::Leading { transitions } => {
-                if !h.standing.believes() {
-                    h.state.on_acquire(transitions);
-                }
-                h.standing.on_observed(true);
-            }
-            // NOTE: this arm mirrors the BASE-regime edge law
-            // (leaderElectionBase has HOLDER_EVIDENCE_LOSE = false, so
-            // a believing conflict loses immediately). The production
-            // LOOP refines the believing-409 edge above this layer --
-            // one deferred round, lose only on holder evidence
-            // (sched.lease.holder-evidenced-lose) -- and that law is
-            // modeled by leaderElectionHolderEvidence and pinned by
-            // the loop-level tokio tests; the deferral lives in loop
-            // state the election layer this driver exercises never
-            // sees. Do NOT "fix" this arm to defer: against the base
-            // module that would be a per-step diff, not fidelity.
-            ElectionResult::Standby | ElectionResult::Conflict => {
-                if h.standing.believes() {
-                    h.state.on_lose();
-                }
-                h.standing.on_observed(false);
-            }
-        }
+        apply_base_regime_completed_edge(&mut h.standing, &h.state, &result);
         Ok(())
     }
 
@@ -870,4 +884,109 @@ fn mbt_run_self_fence_false_alarm() {
 #[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
 fn mbt_run_crash_recover_renew() {
     replay_named_run("crashRecoverRenewRun", CRASH_RECOVER_RENEW_RUN).unwrap();
+}
+
+/// The loop-shim correspondence pin (merged_bug_053, commit 2): the
+/// driver's base-regime edge law above and the production round
+/// derivation (`complete_round`) are two copies of the SAME shim in
+/// two regimes — this table holds them cell-by-cell so neither can
+/// drift silently. Cells where the regimes coincide must agree
+/// exactly; the believing-Conflict column is the DOCUMENTED regime
+/// divergence (base loses immediately, production defers one round
+/// under the holder-evidence law), asserted in both directions so a
+/// "fix" to either side reds here first. Runs in the ordinary nextest
+/// battery (no quint needed — pure cells).
+#[test]
+fn loop_shim_base_regime_correspondence() {
+    // A fresh, un-deferred round with nothing to consume: the regime
+    // comparison surface (consumption and deferral history are
+    // production-loop state the election driver never sees).
+    let plain = |holder| ReadFacts {
+        holder,
+        content: ContentCell::Frozen,
+        ledger: LedgerCell::Empty,
+        evidence_past_fence: false,
+    };
+    for believes in [false, true] {
+        let cells = StandingCells {
+            believes,
+            deferred: false,
+        };
+        // Leading: identical in both regimes.
+        let plan = complete_round(plain(HolderCell::Us), ActCell::Leading, cells);
+        assert_eq!(
+            plan.edge,
+            if believes {
+                RoundEdge::StillLeading
+            } else {
+                RoundEdge::Acquire
+            },
+            "Leading cells agree across regimes (believes={believes})"
+        );
+        // Standby: identical in both regimes — the base shim's
+        // lose-then-observe pair is the production Lose(holder
+        // evidence) for a believer, the bare observation otherwise.
+        let plan = complete_round(plain(HolderCell::Other), ActCell::Standby, cells);
+        assert_eq!(
+            plan.edge,
+            if believes {
+                RoundEdge::Lose(crate::CompletedLoseEvidence::AnotherHolderObserved)
+            } else {
+                RoundEdge::StandbyObserved
+            },
+            "Standby cells agree across regimes (believes={believes})"
+        );
+        // Conflict: the DOCUMENTED divergence while believing — the
+        // base regime (HOLDER_EVIDENCE_LOSE = false) loses
+        // immediately, the production shim defers one round. A
+        // production change that loses a fresh believing 409
+        // immediately, or a driver "fix" that defers, reds here.
+        let plan = complete_round(plain(HolderCell::Us), ActCell::Conflict, cells);
+        if believes {
+            assert_eq!(
+                plan.edge,
+                RoundEdge::Defer,
+                "production defers a fresh believing 409 (holder-evidence \
+                 law); the driver's base-regime arm loses immediately — \
+                 the divergence is the regime boundary, by design"
+            );
+        } else {
+            assert_eq!(
+                plan.edge,
+                RoundEdge::StandbyObserved,
+                "a standby 409 (raced steal) agrees across regimes"
+            );
+        }
+    }
+
+    // The base-regime fn itself: drive the four (result, believes)
+    // cells through the REAL driver mapping and assert the standing
+    // polarity it lands — the half of the correspondence the driver
+    // owns.
+    for (result, believes, expect_believes) in [
+        (ElectionResult::Leading { transitions: 3 }, false, true),
+        (ElectionResult::Leading { transitions: 3 }, true, true),
+        (ElectionResult::Standby, true, false),
+        (ElectionResult::Conflict, true, false),
+        (ElectionResult::Standby, false, false),
+        (ElectionResult::Conflict, false, false),
+    ] {
+        let state = LeaderState::pending(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)));
+        let mut standing = LeaseStanding::new();
+        if believes {
+            state.on_acquire(3);
+            standing.on_observed(true);
+        }
+        apply_base_regime_completed_edge(&mut standing, &state, &result);
+        assert_eq!(
+            standing.believes(),
+            expect_believes,
+            "base-regime edge polarity for {result:?} (believes={believes})"
+        );
+        assert_eq!(
+            state.is_leader(),
+            expect_believes,
+            "base-regime state polarity for {result:?} (believes={believes})"
+        );
+    }
 }

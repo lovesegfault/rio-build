@@ -3462,8 +3462,9 @@ impl DirtyGen {
 /// marks and snapshot/clear pairs, a mark that lands after a snapshot
 /// is never settled by that snapshot's clear. Joins the `decide_pure` /
 /// `LeaseStanding` pattern: no loops in the functions under proof,
-/// bounded driver loop. (rio-lease has no `expectedHarnesses` pin —
-/// the kani driver's "Complete - N" line is the count of record.)
+/// bounded driver loop. (The harness count IS pinned: `kani-rio-lease`
+/// in nix/kani.nix carries `expectedHarnesses` — a harness added or
+/// removed here updates that ledger in the same commit.)
 #[cfg(kani)]
 mod dirty_gen_proofs {
     use super::DirtyGen;
@@ -3506,6 +3507,184 @@ mod dirty_gen_proofs {
             }
             i += 1;
         }
+    }
+}
+
+/// The Completed-round derivation under CBMC (merged_bug_053): the
+/// loop shim — the mapping from election results onto standing
+/// transitions — was the one unverified seam between the kani-proved
+/// standing algebra and the kani-proved routing law; `complete_round`
+/// makes it a pure function over bounded enums (the OQ-12
+/// array/integer design: no collection folds, every input a bounded
+/// cell), and these harnesses close the seam over the FULL product.
+/// Joins the `decide_pure` / `lease_standing_proofs` pattern: no loops
+/// in the functions under proof, bounded symbolic inputs.
+#[cfg(kani)]
+mod complete_round_proofs {
+    use super::{
+        ActCell, CompletedLoseEvidence, ConflictResolution, ConsumeMode, ContentCell, HolderCell,
+        LeaseStanding, LedgerCell, ReadFacts, RoundEdge, StandingCells, complete_round,
+    };
+
+    fn any_cells() -> (ReadFacts, ActCell, StandingCells) {
+        let act = match kani::any::<u8>() % 3 {
+            0 => ActCell::Leading,
+            1 => ActCell::Standby,
+            _ => ActCell::Conflict,
+        };
+        let holder = match kani::any::<u8>() % 3 {
+            0 => HolderCell::Us,
+            1 => HolderCell::Other,
+            _ => HolderCell::Absent,
+        };
+        let content = if kani::any() {
+            ContentCell::Moved
+        } else {
+            ContentCell::Frozen
+        };
+        let ledger = if kani::any() {
+            LedgerCell::Armed
+        } else {
+            LedgerCell::Empty
+        };
+        let believes: bool = kani::any();
+        let deferred: bool = kani::any();
+        // The algebra's own invariant: the latch's only set path runs
+        // while believing, and every belief-ending transition clears
+        // it (latch => believes; the exhaustion proof's domain).
+        kani::assume(!deferred || believes);
+        (
+            ReadFacts {
+                holder,
+                content,
+                ledger,
+                evidence_past_fence: kani::any(),
+            },
+            act,
+            StandingCells { believes, deferred },
+        )
+    }
+
+    /// r[verify sched.lease.holder-evidenced-lose+3]
+    /// W12-X(a): the exhausted lose edge derives ONLY from an
+    /// unresolved pending deferral — a round whose consult consumed
+    /// funnel-grade evidence answered the pending question and can
+    /// never fire the stale-snapshot lose (merged_bug_053's headline
+    /// cell, total over the product including the fence-shadowed
+    /// region no schedule reaches at the shipped constants).
+    #[kani::proof]
+    fn lease_round_lose_requires_unresolved_deferral() {
+        let (facts, act, standing) = any_cells();
+        let plan = complete_round(facts, act, standing);
+        let funnel_consume = matches!(
+            plan.consume,
+            Some(ConsumeMode::Restore | ConsumeMode::Funnel)
+        );
+        if plan.edge == RoundEdge::Lose(CompletedLoseEvidence::ConflictDeferralExhausted) {
+            assert!(
+                standing.deferred && !funnel_consume,
+                "exhausted lose requires an unresolved pending deferral"
+            );
+        }
+        if funnel_consume {
+            assert!(
+                plan.adjudication == Some(ConflictResolution::Deferred),
+                "an evidence-consuming conflict round defers its OWN 409 \
+                 (the two-409 bound neither stretches nor collapses)"
+            );
+        }
+    }
+
+    /// r[verify sched.lease.holder-evidenced-lose+3]
+    /// W12-X(b): folding the plan through the PRODUCTION standing
+    /// transitions (the cfg-gated driver delegates to the production
+    /// methods) reproduces the derivation's view — the adjudication
+    /// verdict is the production body's on post-consumption standing,
+    /// the Defer arm's latch precondition is true, and every lose edge
+    /// ends belief. This is the pin that keeps the derivation's two
+    /// restated post-consumption cells from drifting off the algebra.
+    #[kani::proof]
+    fn lease_round_agrees_with_standing_algebra() {
+        let (facts, act, standing) = any_cells();
+        let plan = complete_round(facts, act, standing);
+
+        let mut s = LeaseStanding::new();
+        if standing.believes {
+            s.on_observed(true);
+            if standing.deferred {
+                let first = s.on_believing_conflict();
+                assert!(matches!(first, ConflictResolution::Deferred));
+            }
+        }
+        if matches!(
+            plan.consume,
+            Some(ConsumeMode::Restore | ConsumeMode::Funnel)
+        ) {
+            s.on_observed(true);
+        }
+        if let Some(predicted) = plan.adjudication {
+            let live = s.on_believing_conflict();
+            assert!(
+                live == predicted,
+                "the derivation's adjudication is the production verdict \
+                 on post-consumption standing"
+            );
+        }
+        match plan.edge {
+            RoundEdge::Acquire | RoundEdge::StillLeading => s.on_observed(true),
+            RoundEdge::Lose(ev) => {
+                ev.apply(&mut s);
+                assert!(!s.believes(), "every lose edge ends belief");
+            }
+            RoundEdge::StandbyObserved => s.on_observed(false),
+            RoundEdge::Defer => {
+                assert!(
+                    s.conflict_deferred,
+                    "the deferral arm's latch precondition is true on entry"
+                );
+                assert!(s.believes(), "only a believer defers");
+            }
+        }
+    }
+
+    /// r[verify sched.lease.cancelled-write+2]
+    /// W12-X(c): the round's ledger/stamp laws are total — a deferred
+    /// round never restarts the blind window (every other Completed
+    /// round stamps), only a Conflict leaves the unconfirmed ledger
+    /// armed for the next read's own-commit evidence, consumption
+    /// routes exactly the (Conflict, Us, Moved, Armed) cell, and the
+    /// held edges partition exactly the Leading results (discharging
+    /// the executor's transition-count expects).
+    #[kani::proof]
+    fn lease_round_stamp_and_ledger_laws_total() {
+        let (facts, act, standing) = any_cells();
+        let plan = complete_round(facts, act, standing);
+        assert!(
+            plan.attempt_stamp == (plan.edge != RoundEdge::Defer),
+            "defer-never-stamps; resolved rounds stamp"
+        );
+        assert!(
+            (plan.edge == RoundEdge::Defer)
+                == (plan.adjudication == Some(ConflictResolution::Deferred)),
+            "Defer <=> a Deferred adjudication"
+        );
+        assert!(
+            plan.clear_ledger_wholesale == !matches!(act, ActCell::Conflict),
+            "the ledger survives exactly the Conflicts"
+        );
+        assert!(
+            plan.consume.is_some()
+                == (matches!(act, ActCell::Conflict)
+                    && matches!(facts.holder, HolderCell::Us)
+                    && matches!(facts.content, ContentCell::Moved)
+                    && matches!(facts.ledger, LedgerCell::Armed)),
+            "consume == the own-commit evidence cell, exactly"
+        );
+        assert!(
+            matches!(plan.edge, RoundEdge::Acquire | RoundEdge::StillLeading)
+                == matches!(act, ActCell::Leading),
+            "the held edges partition exactly the Leading results"
+        );
     }
 }
 
