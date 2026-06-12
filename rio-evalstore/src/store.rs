@@ -39,7 +39,7 @@ use rio_packstore::{Digest, Kind, Options, PackStore};
 
 use crate::dirblob::{BuiltDir, BuiltEntry, DirBlobError};
 use crate::dircache::{DecodedDir, DirStore, DirStoreError, EntryRef};
-use crate::fingerprint::{FingerprintRecord, FingerprintTable, stat_fingerprint};
+use crate::fingerprint::{FingerprintRecord, FingerprintTable, stat_fingerprint, tree_stat_walk};
 use crate::ingest::{self, IngestConfig, IngestError, IngestFile, IngestNode};
 use crate::stats::Stats;
 
@@ -1253,31 +1253,50 @@ impl EvalStore {
         key
     }
 
-    /// Fingerprint shortcut: if `fs_path`'s current stat matches a
+    /// Fingerprint shortcut: if `fs_path`'s current stat state matches a
     /// recorded ingest with the same method/refs AND the recorded store
     /// path is still in the CAS, return it without re-reading content.
+    ///
+    /// Regular files validate against the root stat fingerprint; trees
+    /// validate against a tree-level record (digest over a sorted
+    /// lstat-only walk — the ADR-024 warm path's "the stat fingerprint
+    /// index skips unchanged trees entirely"). Any changed, added, or
+    /// removed entry misses, triggering a full re-ingest (P1: no partial
+    /// re-ingest). The racy rule applies per file: any regular file
+    /// whose mtime lands within the coarse-clock slack of the record's
+    /// write time could have been rewritten in place stat-invisibly, so
+    /// the record is distrusted.
     pub fn fingerprint_lookup(&self, fs_path: &str, method_key: &str) -> Result<Option<String>> {
-        let mut inner = self.lock();
-        let Some(rec) = inner.fingerprints.get(fs_path, method_key).cloned() else {
+        // Clone the record out and validate OUTSIDE the store lock: a
+        // tree walk over tens of thousands of entries must not block
+        // concurrent read ops.
+        let rec = self.lock().fingerprints.get(fs_path, method_key).cloned();
+        let Some(rec) = rec else {
             self.stats.record("fingerprint_miss", 0);
             return Ok(None);
         };
-        let now = match stat_fingerprint(fs_path) {
-            Ok(fp) => fp,
-            Err(_) => {
-                self.stats.record("fingerprint_miss", 0);
-                return Ok(None);
-            }
+        let trusted = match &rec.tree_digest {
+            Some(recorded) => match tree_stat_walk(fs_path) {
+                Ok(walk) => {
+                    walk.latest_file_mtime_ns < rec.recorded_at_ns - FINGERPRINT_SLACK_NS
+                        && hex::encode(walk.digest) == *recorded
+                }
+                Err(_) => false,
+            },
+            None => match stat_fingerprint(fs_path) {
+                Ok(now) => {
+                    rec.fingerprint.mtime_ns < rec.recorded_at_ns - FINGERPRINT_SLACK_NS
+                        && now == rec.fingerprint
+                }
+                Err(_) => false,
+            },
         };
-        let basename = match store_path::basename(&rec.store_path) {
-            Some(b) => b,
-            None => return Ok(None),
+        let Some(basename) = store_path::basename(&rec.store_path) else {
+            self.stats.record("fingerprint_miss", 0);
+            return Ok(None);
         };
-        // Racy-fingerprint rule: a record whose file mtime lands within
-        // the coarse-clock slack of the record's write time could have
-        // been rewritten in-place without changing its fingerprint.
-        let trusted = rec.fingerprint.mtime_ns < rec.recorded_at_ns - FINGERPRINT_SLACK_NS;
-        if trusted && now == rec.fingerprint && inner.dirs.pack().has_root(basename) {
+        let mut inner = self.lock();
+        if trusted && inner.dirs.pack().has_root(basename) {
             self.stats.record("fingerprint_hit", 0);
             // A hit keeps the entry live — bump its LRU clock like any
             // other read.
@@ -1296,6 +1315,13 @@ impl EvalStore {
         full_store_path: &str,
     ) -> Result<()> {
         let fingerprint = stat_fingerprint(fs_path)?;
+        // Tree records carry the per-entry walk digest; the walk runs
+        // outside the store lock (it re-stats the whole tree).
+        let tree_digest = if std::fs::symlink_metadata(fs_path)?.is_dir() {
+            Some(hex::encode(tree_stat_walk(fs_path)?.digest))
+        } else {
+            None
+        };
         let recorded_at_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as i128);
@@ -1304,6 +1330,7 @@ impl EvalStore {
             method_key: method_key.to_string(),
             store_path: full_store_path.to_string(),
             recorded_at_ns,
+            tree_digest,
         })?;
         Ok(())
     }

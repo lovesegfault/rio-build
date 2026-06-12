@@ -623,14 +623,19 @@ struct RioStore : virtual Store
 
         /* Stat-fingerprint shortcut: a physical source whose fingerprint
          * matches a prior ingest (same name + method + refs) skips the
-         * walk entirely. Only for regular files (directory mtimes don't
-         * reflect child edits) and never for repair (repair means
-         * re-ingest unconditionally). */
+         * ingest entirely. Regular files validate against the root stat;
+         * directory trees validate against a tree-level record on the
+         * Rust side (digest over a sorted lstat-only walk — directory
+         * mtimes alone don't reflect child edits, so the whole tree is
+         * stat-walked, still no reads/hashing/NAR). Never for repair
+         * (repair means re-ingest unconditionally). */
         bool fingerprintable = false;
         int caM = -1;
         if (phys && repair == NoRepair) {
             auto st = path.accessor->maybeLstat(path.path);
-            if (st && st->type == SourceAccessor::tRegular) {
+            if (st
+                && (st->type == SourceAccessor::tRegular
+                    || st->type == SourceAccessor::tDirectory)) {
                 fingerprintable = true;
                 caM = caMethodFor(method, "addToStore");
             }

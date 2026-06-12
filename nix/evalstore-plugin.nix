@@ -121,6 +121,11 @@ let
         mkdir -p $TMPDIR/work
         cp -r ${fixture}/. $TMPDIR/work/
         chmod -R u+w $TMPDIR/work
+        # Backdate the sources: the racy-fingerprint rule distrusts
+        # records whose file mtimes land within the coarse-clock slack
+        # of the record write time, and the cold eval below records
+        # fingerprints moments after this copy.
+        find $TMPDIR/work -exec touch -h -d '1 hour ago' {} +
 
         echo "== run A: stock nix, local file store"
         nix $flags --store "local?root=$TMPDIR/stock" \
@@ -130,11 +135,17 @@ let
         echo "== run B: plugin eval store"
         # --plugin-files is a global flag and must precede the subcommand;
         # --eval-store belongs to the eval command itself.
-        nix $flags --plugin-files ${pluginSo} \
+        RIO_EVALSTORE_STATS=1 nix $flags --plugin-files ${pluginSo} \
           --store "local?root=$TMPDIR/main" \
           eval --eval-store "rio://?cas=$TMPDIR/cas" \
-          --file $TMPDIR/work/fixture.nix paths --json > rio.json
+          --file $TMPDIR/work/fixture.nix paths --json > rio.json 2> stats-cold.txt
         jq . rio.json
+        # Route proof: the local dir took the two-plane ingest on the
+        # cold run, not the NAR-dump fallback (which would show as an
+        # add_from_dump of the tree and FETCHED content writes).
+        grep -q "add_source_tree" stats-cold.txt \
+          || { echo "local source dir did not take the two-plane ingest route"; \
+               cat stats-cold.txt; exit 1; }
 
         echo "== drvPath parity"
         diff stock.json rio.json
@@ -170,7 +181,7 @@ let
           store cat --store "rio://?cas=$TMPDIR/cas" "$tofile" > builder.txt
         grep -q "echo hello" builder.txt
 
-        echo "== warm re-eval: CAS dedup means zero new pack records"
+        echo "== warm re-eval: tree fingerprint short-circuits the ingest"
         RIO_EVALSTORE_STATS=1 nix $flags --plugin-files ${pluginSo} \
           --store "local?root=$TMPDIR/main" \
           eval --eval-store "rio://?cas=$TMPDIR/cas" \
@@ -182,11 +193,15 @@ let
           echo "warm re-eval wrote new pack records — CAS dedup regressed"
           exit 1
         fi
-        # Route proof: the local dir took the two-plane ingest, not the
-        # NAR-dump fallback (which would show as an add_from_dump of the
-        # tree and FETCHED content writes on the cold run).
-        grep -q "add_source_tree" stats.txt \
-          || { echo "local source dir did not take the two-plane ingest route"; exit 1; }
+        # The unchanged source tree must hit the tree-level fingerprint:
+        # a stat-walk only, zero re-ingest (no add_source_tree at all —
+        # the measured 19%-of-warm-cycles re-hash of the source tree).
+        grep -q "fingerprint_hit" stats.txt \
+          || { echo "warm re-eval missed the tree fingerprint"; exit 1; }
+        if grep -q "add_source_tree" stats.txt; then
+          echo "warm re-eval re-ingested the source tree — tree fingerprint shortcut regressed"
+          exit 1
+        fi
 
         echo "== filtered accessor: a local-git flake honours the tracked-files view"
         # nix's git workdir accessor is an AllowListSourceAccessor

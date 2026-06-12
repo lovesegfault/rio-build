@@ -47,6 +47,13 @@ pub struct FingerprintRecord {
     /// next ingest.
     #[serde(default)]
     pub recorded_at_ns: i128,
+    /// For directory trees: hex blake3 over the sorted per-entry stat
+    /// fingerprints of the whole tree ([`tree_stat_walk`]). `None` for
+    /// regular files (the root `fingerprint` carries everything) and for
+    /// records written before tree fingerprints existed — those never
+    /// short-circuit a tree ingest, they just re-record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_digest: Option<String>,
 }
 
 /// Current stat fingerprint of a filesystem path (no symlink follow on the
@@ -61,6 +68,92 @@ pub fn stat_fingerprint(fs_path: &str) -> io::Result<Fingerprint> {
         mtime_ns: i128::from(md.mtime()) * 1_000_000_000 + i128::from(md.mtime_nsec()),
         inode: md.ino(),
         ctime_ns: i128::from(md.ctime()) * 1_000_000_000 + i128::from(md.ctime_nsec()),
+    })
+}
+
+/// Aggregate of a sorted lstat-only walk over a directory tree — the
+/// tree-level analog of [`stat_fingerprint`]. A warm re-eval of an
+/// unchanged tree validates against this with stats alone: no file
+/// reads, no content hashing, no NAR.
+pub struct TreeStat {
+    /// blake3 over every entry's (rel path, kind, size, mtime, inode,
+    /// ctime), in sorted DFS order, root included. Any changed, added,
+    /// or removed entry changes the digest — one mismatch invalidates
+    /// the whole tree record (full re-ingest; no partial re-ingest).
+    pub digest: [u8; 32],
+    /// Newest REGULAR-FILE mtime in the tree, for the racy-fingerprint
+    /// rule. Only files can mutate stat-invisibly (a same-size in-place
+    /// rewrite within the mtime tick); symlinks cannot be retargeted in
+    /// place (replacement changes inode/ctime) and directory content is
+    /// the entry set, which the digest itself covers.
+    pub latest_file_mtime_ns: i128,
+}
+
+/// Walk `fs_path` (lstat-only, byte-lex sorted DFS — the NAR entry
+/// order) and fold every entry's stat fingerprint into one digest.
+pub fn tree_stat_walk(fs_path: &str) -> io::Result<TreeStat> {
+    use std::os::unix::fs::MetadataExt;
+
+    fn entry_kind(md: &fs::Metadata) -> u8 {
+        let ft = md.file_type();
+        if ft.is_file() {
+            1
+        } else if ft.is_symlink() {
+            2
+        } else if ft.is_dir() {
+            3
+        } else {
+            // Ingest rejects these; a distinct kind byte makes the
+            // record miss so the re-ingest reports the real error.
+            4
+        }
+    }
+
+    fn walk(
+        path: &Path,
+        rel: &mut Vec<u8>,
+        hasher: &mut blake3::Hasher,
+        latest: &mut i128,
+    ) -> io::Result<()> {
+        let md = fs::symlink_metadata(path)?;
+        let mtime_ns = i128::from(md.mtime()) * 1_000_000_000 + i128::from(md.mtime_nsec());
+        let ctime_ns = i128::from(md.ctime()) * 1_000_000_000 + i128::from(md.ctime_nsec());
+        hasher.update(rel);
+        hasher.update(&[0, entry_kind(&md)]);
+        hasher.update(&md.size().to_le_bytes());
+        hasher.update(&mtime_ns.to_le_bytes());
+        hasher.update(&md.ino().to_le_bytes());
+        hasher.update(&ctime_ns.to_le_bytes());
+        if md.file_type().is_file() {
+            *latest = (*latest).max(mtime_ns);
+        }
+        if md.file_type().is_dir() {
+            use std::os::unix::ffi::OsStrExt;
+            let mut names: Vec<std::ffi::OsString> = Vec::new();
+            for entry in fs::read_dir(path)? {
+                names.push(entry?.file_name());
+            }
+            names.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            for name in names {
+                let saved = rel.len();
+                if !rel.is_empty() {
+                    rel.push(b'/');
+                }
+                rel.extend_from_slice(name.as_bytes());
+                walk(&path.join(&name), rel, hasher, latest)?;
+                rel.truncate(saved);
+            }
+        }
+        Ok(())
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    let mut latest = i128::MIN;
+    let mut rel = Vec::new();
+    walk(Path::new(fs_path), &mut rel, &mut hasher, &mut latest)?;
+    Ok(TreeStat {
+        digest: *hasher.finalize().as_bytes(),
+        latest_file_mtime_ns: latest,
     })
 }
 
@@ -198,6 +291,7 @@ mod tests {
             method_key: method_key.to_string(),
             store_path: store_path.to_string(),
             recorded_at_ns: at,
+            tree_digest: None,
         }
     }
 
