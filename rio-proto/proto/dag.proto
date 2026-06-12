@@ -105,6 +105,31 @@ message DerivationNode {
   // are not structural roots. False (the proto3 default) means "only
   // demanded as a dependency", which is the pre-addition behaviour.
   bool explicitly_requested = 19;
+
+  // ADR-024 P2a: the drv's negotiation digest —
+  // blake3(canonical rio.drv.v1.Derivation bytes), 32 raw bytes
+  // (rio_proto::derivation_util::derivation_digest). Empty = legacy
+  // submission (edges-driven). When EVERY node in a submission carries
+  // drv_digest, the scheduler derives dependency edges from
+  // input_drv_digests (field 21) and ignores SubmitBuildRequest.edges;
+  // mixed submissions (some nodes with digests, some without) are
+  // rejected — no silent half-modes (the C13 hazard: a no-edges
+  // submission must never mark every node Ready).
+  //
+  // P2b plan (one release after P2a): `edges` and `drv_content`
+  // (field 9) retire; field 9 becomes `reserved 9;` and executors
+  // fetch drv bytes from the store's DrvBlobService by this digest.
+  // Until then both forms are accepted side by side.
+  bytes drv_digest = 20;
+
+  // ADR-024 P2a: digests of this node's direct inputDrvs (same keying
+  // as drv_digest). Replaces this node's outgoing DerivationEdge
+  // entries in digest-bearing submissions. Each digest resolves
+  // against the submission's own nodes first; a digest not in the
+  // submission must already be known to the store (drv_blobs) or the
+  // whole submission is rejected listing every unknown digest (the
+  // stale-ack recovery contract — the client re-Has-es and resubmits).
+  repeated bytes input_drv_digests = 21;
 }
 
 // A dependency edge in the derivation DAG.

@@ -654,6 +654,13 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
         // (IA-with-floating-CA-input) AFTER BFS — needs the
         // drv_cache to look up children's addressing mode.
         needs_resolve: drv.has_ca_floating_outputs(),
+        // ADR-024 P2a: populated by populate_drv_digests() AFTER the
+        // full BFS — input digests need every input drv parsed, which
+        // only the complete drv_cache guarantees. The BasicDerivation
+        // single-node fallback (no full drv) leaves both empty =
+        // legacy edges-driven submission.
+        drv_digest: Vec::new(),
+        input_drv_digests: vec![],
     }
 }
 
