@@ -288,7 +288,7 @@ async fn list_claimable_excludes_claimed_and_parked() -> anyhow::Result<()> {
 /// to burn another mint: 10,876 Gone-answers in one 78s live window,
 /// the fleet pinned at ~0.5% conversion. Listed ⇒ admittable
 /// (`sched.materialize.claimability-projection`) must hold on the
-/// node axis too. Every terminal status is exercised via the SAME
+/// node axis too. Every terminal status is exercised via the same
 /// derived set production splices (`terminal_status_sql!` ⇔
 /// `TERMINAL_STATUSES`, drift-pinned); non-terminal statuses are the
 /// stay-listed control.

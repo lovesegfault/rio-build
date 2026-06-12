@@ -3751,9 +3751,9 @@ impl DagActor {
     }
 
     /// The flag-gated housekeeping backstop — the MOOT sweep: resolve
-    /// jobs whose node can never consume them, each face under its
-    /// own alphabet letter (live_061 — `JobState::Obsolete` finally
-    /// has its writer):
+    /// jobs whose node can never consume them — quantifier: census(node_completed_by_other_means_resolves_obsolete) —
+    /// each face under its own alphabet letter (live_061 —
+    /// `JobState::Obsolete` finally has its writer):
     ///
     ///   - **Obsolete**: the node COMPLETED by other means while the
     ///     job was open (store probe found the outputs, a sibling

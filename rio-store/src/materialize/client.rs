@@ -664,7 +664,7 @@ const _: () = assert!(
 /// lane paces it through the structural queue. A resolving answer
 /// left NOTHING behind: the entry vanished, the job re-listed (the
 /// scheduler's durable row outlived the answer — live_061's zombies),
-/// and the next pass re-minted the SAME head, burning the per-pass
+/// and the next pass re-minted the same head, burning the per-pass
 /// allowance (`slots + STEAL_SPECULATION_ALLOWANCE` = 2 at production
 /// slots=1) on the same rows every pass: the fleet converted ~0.5% of
 /// claim attempts for hours. The cooldown is the symmetric pacing the
@@ -1216,7 +1216,7 @@ enum StandingEffect {
 ///     committed behind the lost response); a probe's loss proves
 ///     nothing either way (the screen blocks probe mints) — Keep;
 ///   - `RejectedDisproving` resolves everywhere with the cooldown
-///     (the request shape can never mint — nothing is pending behind
+///     (the request shape does not mint — nothing is pending behind
 ///     it, and re-presenting the same shape next pass re-fails);
 ///   - `RejectedAuth` resolves only the FRESH lane, with the cooldown
 ///     (its gates run pre-mint, so THIS pull was the only one that
@@ -1249,8 +1249,8 @@ fn standing_effect(lane: PresentationLane, answer: &PullAnswer) -> StandingEffec
 
 /// live061-R5 — the wire-stable `answer` label of one claim answer
 /// (the 21,337-refusals-invisible gap: refused claims had no counter
-/// anywhere; the per-pass dispositions existed only as sealed pacing
-/// inputs). One label per PullAnswer variant — rustc's exhaustiveness
+/// at any tier; the per-pass dispositions existed only as sealed
+/// pacing inputs). One label per PullAnswer variant — rustc's exhaustiveness
 /// is the census.
 fn answer_label(answer: &PullAnswer) -> &'static str {
     match answer {
@@ -3154,7 +3154,7 @@ mod tests {
             &mut self,
             _req: ListMaterializationJobsRequest,
         ) -> Result<ListMaterializationJobsResponse, tonic::Status> {
-            // The stuck set ALWAYS lists first (the oldest-first head);
+            // The stuck set lists first (the oldest-first head);
             // undelivered eligible jobs queue behind it.
             let mut jobs = self.stuck.clone();
             jobs.extend(self.eligible.iter().cloned());

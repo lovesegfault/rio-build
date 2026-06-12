@@ -775,8 +775,8 @@ db_str_enum! {
     /// claim is an open attempt (assignments + drv_executions rows);
     /// the job row is untouched until consumption resolves it.
     ///
-    /// **The obligation/discharge totality (R32, live_061 — the
-    /// linearity record).** A `pending` row is a LINEAR OBLIGATION:
+    /// **The obligation/discharge totality — quantifier: census(node_completed_by_other_means_resolves_obsolete) —
+    /// (R32, live_061, the linearity record).** A `pending` row is a LINEAR OBLIGATION:
     /// the claim plane advertises it until exactly one discharge arm
     /// resolves it, and every terminal letter has exactly one
     /// producing arm (one quantity, one producer):
@@ -794,8 +794,8 @@ db_str_enum! {
     /// laundered into `cancelled`, and the discharge set was silently
     /// partial — the unresolved rows pinned the claimable listing as
     /// permanently-refusing heads. `sched.materialize.obsolescence`
-    /// states the totality; the moot sweep + the listing's node-face
-    /// exclusion enforce it.
+    /// states the discharge law; the moot sweep + the listing's
+    /// node-face exclusion enforce it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum JobState {
         /// Unresolved: claimable by the store executor (unless parked).

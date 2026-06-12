@@ -1923,7 +1923,6 @@ rio-store/src/materialize/client.rs	// request shape can never mint) → Rejecte
 rio-store/src/materialize/client.rs	// short-circuit burns one timeout) — the SAME Charged entry,
 rio-store/src/materialize/client.rs	// the SAME job the descriptor listed → descriptor hints kept.
 rio-store/src/materialize/client.rs	// wedge observer — fed the sealed outcome on EVERY pass —
-rio-store/src/materialize/client.rs	///     can never mint — nothing is pending behind it);
 rio-store/src/materialize/client.rs	///   - `Gone` converts on EVERY lane (the documented reset-grade
 rio-store/src/materialize/client.rs	/// ([`standing_effect`]), because the kernel mints on ANY claiming
 rio-store/src/materialize/client.rs	/// 64 passes" cadence is honest over ALL exits, gated ones

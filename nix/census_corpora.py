@@ -594,6 +594,14 @@ DURATION_CENSUS_ROWS = {
         "wall (unix-epoch seconds at the signer's own sample)",
         "WO-S8-6: the post-call re-sample law pin",
     ),
+    ("rio-scheduler/src/actor/pull.rs", "WINDOW_SECS"): (
+        "wall (unix-epoch seconds at SystemTime::now — the limiter window's own sample)",
+        "WO-S9-5 (A3): the answer-log flood limiter — 20 lines/10s/arm with the rolled window's suppressed count disclosed",
+    ),
+    ("rio-store/src/materialize/client.rs", "RESOLVED_ANSWER_REMINT_COOLDOWN"): (
+        "wall (tokio Instant at the resume ledger's cooldown stamp)",
+        "WO-S9-3 (A3): W12-S9E — the K-stuck deterministic bound (6 passes at slots=1 with a 4-row stuck head deliver exactly 4)",
+    ),
 }
 DURATION_GRANDFATHER = "nix/duration-census-grandfather.txt"
 
