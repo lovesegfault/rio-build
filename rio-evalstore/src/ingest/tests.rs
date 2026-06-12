@@ -206,6 +206,7 @@ fn deterministic_across_thread_and_budget_configs() {
             reader_threads: 8,
             chunk_workers: 2,
             byte_budget: 64 * 1024,
+            ..IngestConfig::default()
         },
     ];
     let baseline = ingest_tree(&root, &configs[0]).expect("ingest succeeds");
@@ -394,6 +395,72 @@ fn size_change_between_stat_and_read_fails_cleanly() {
         }
         other => panic!("expected SizeChanged, got {other:?}"),
     }
+}
+
+// Steal-lock degraded-mode regression (P1 profiling finding): when the
+// byte budget saturates with out-of-NAR-order buffers — here forced by
+// dir "zz" (NAR-last, but listed first because its readdir is 16 entries
+// while "aa"'s is 3000) — the old pipeline parked every reader on the
+// budget and the spine then stole and read the ENTIRE "aa" subtree
+// serially at QD1 (~35s on cold ext4 for nixpkgs). The fix keeps readers
+// alive and parked centrally, reserves a budget slice while listings are
+// in flight, and lets any freed byte fund the spine-nearest pending
+// file. Structural assertion (project policy: count ops, not wall
+// clock): the reader pool must perform the bulk of the file reads.
+#[test]
+fn budget_saturation_keeps_readers_reading() {
+    const AA_FILES: usize = 3000;
+    const ZZ_FILES: usize = 16;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("tree");
+    fs::create_dir_all(root.join("aa")).unwrap();
+    fs::create_dir(root.join("zz")).unwrap();
+    for i in 0..AA_FILES {
+        fs::write(
+            root.join(format!("aa/f{i:04}")),
+            pseudo_random_bytes(i as u64, 4096),
+        )
+        .unwrap();
+    }
+    for i in 0..ZZ_FILES {
+        // 16 × 64 KiB = the whole 1 MiB budget: without the listing-gated
+        // head reserve these park out of NAR order and starve the budget.
+        fs::write(
+            root.join(format!("zz/g{i:02}")),
+            pseudo_random_bytes(1000 + i as u64, 64 * 1024),
+        )
+        .unwrap();
+    }
+    let cfg = IngestConfig {
+        reader_threads: 8,
+        chunk_workers: 2,
+        byte_budget: 1024 * 1024,
+        test_delays: super::TestDelays {
+            // Cold-device read latency: makes spine steals expensive and
+            // the regime stable enough to measure.
+            read: Some(std::time::Duration::from_micros(200)),
+            // Spine slower than the 8-way reader pool's per-file rate, so
+            // a healthy pipeline keeps readers ahead of the spine.
+            spine: Some(std::time::Duration::from_micros(100)),
+        },
+    };
+    let (result, stats) = super::pipeline::run(&root, &cfg).expect("ingest succeeds");
+    assert_nar_parity(&root, &result);
+
+    let total = stats.reader_file_reads + stats.spine_file_reads;
+    println!(
+        "reader_file_reads={} spine_file_reads={}",
+        stats.reader_file_reads, stats.spine_file_reads
+    );
+    assert_eq!(total, (AA_FILES + ZZ_FILES) as u64, "every file read once");
+    assert!(
+        stats.reader_file_reads * 2 >= total,
+        "steal-lock degraded mode: readers performed only {}/{total} file \
+         reads (spine stole {}) — the budget-saturation regime serialized \
+         the ingest at QD1",
+        stats.reader_file_reads,
+        stats.spine_file_reads,
+    );
 }
 
 // Zero-byte files: empty chunk run, blake3-of-empty digest, and the NAR

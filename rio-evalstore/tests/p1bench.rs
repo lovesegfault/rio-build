@@ -273,7 +273,8 @@ fn p1_cold_ingest() {
     };
 
     let t = Instant::now();
-    let result = ingest::ingest_tree(&tree, &cfg).expect("ingest_tree");
+    let (result, run_stats) =
+        ingest::ingest_tree_with_stats(&tree, &cfg).expect("ingest_tree_with_stats");
     let pipeline_s = t.elapsed().as_secs_f64();
 
     // Re-evict so the end-to-end run sees the same cache state as the
@@ -289,8 +290,13 @@ fn p1_cold_ingest() {
     println!(
         "P1BENCH cold_ingest readers={} workers={} evicted_files={evicted} \
          nar_size={} pipeline_s={pipeline_s:.3} add_source_tree_s={full_s:.3} \
+         reader_file_reads={} spine_file_reads={} \
          basename={basename} gate_budget_s=2.0",
-        cfg.reader_threads, cfg.chunk_workers, result.nar_size,
+        cfg.reader_threads,
+        cfg.chunk_workers,
+        result.nar_size,
+        run_stats.reader_file_reads,
+        run_stats.spine_file_reads,
     );
 }
 
