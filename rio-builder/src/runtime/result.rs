@@ -850,4 +850,114 @@ mod tests {
             );
         }
     }
+    /// **W12-LB (live059-b, A1)** — *proposition: classification is
+    /// denominated in the error's PROVENANCE, not its transport
+    /// shape; population: the decode-error family × {content-derived,
+    /// transport-derived}.* A protocol-decode error raised by BUILD
+    /// CONTENT mid-build is DETERMINISTIC per-derivation — every pod
+    /// decodes the same bytes identically, exactly the
+    /// InvalidDerivation rationale — yet pre-fix the err_completion
+    /// fold routed every non-cancelled, non-permanent ExecutorError
+    /// to InfrastructureFailure: the uncounted immediate-redispatch
+    /// lane, the live_059 carousel's feed (520 requeues/128 drvs).
+    /// Post-fix the fold consumes the typed provenance axis
+    /// (`wire_decode_provenance`): content-derived decode failures
+    /// route InputRejected-class, sibling-consistent with
+    /// InvalidDerivation ("the bytes are what they are").
+    #[test]
+    fn err_completion_content_derived_decode_is_input_rejected() {
+        let utf8_err = String::from_utf8(vec![0x66, 0xff, 0x6f]).unwrap_err();
+        let r = err_completion(
+            &ExecutorError::Wire(rio_nix::protocol::wire::WireError::InvalidUtf8(utf8_err)),
+            "/nix/store/x.drv".into(),
+            "tok".into(),
+            false,
+            stamp(),
+            0,
+            0.0,
+        );
+        assert_eq!(
+            r.result.as_ref().map(|b| b.status),
+            Some(BuildResultStatus::InputRejected.into()),
+            "left (pre-fix): a content-determined decode failure \
+             classified InfrastructureFailure — deterministic \
+             per-derivation failure misread as worker-local, feeding \
+             the uncounted hot-loop / right: provenance-routed \
+             InputRejected, sibling-consistent with InvalidDerivation"
+        );
+    }
+
+    /// **W12-LB2 (live059-b, the true-infra direction)** — a
+    /// TRANSPORT-derived decode failure (the daemon socket dying
+    /// mid-read) still classifies InfrastructureFailure: the close
+    /// splits provenance, it does not blanket-permanent decode
+    /// errors (another pod plausibly succeeds when the failure is
+    /// the worker's own daemon/socket).
+    #[test]
+    fn err_completion_transport_decode_stays_infra() {
+        let io = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        let r = err_completion(
+            &ExecutorError::Wire(rio_nix::protocol::wire::WireError::Io(io)),
+            "/nix/store/x.drv".into(),
+            "tok".into(),
+            false,
+            stamp(),
+            0,
+            0.0,
+        );
+        assert_eq!(
+            r.result.as_ref().map(|b| b.status),
+            Some(BuildResultStatus::InfrastructureFailure.into()),
+            "transport-derived decode failures stay worker-local infra \
+             (the daemon/socket is this pod's own)"
+        );
+    }
+
+    /// The provenance table, every wire variant exactly once (R14 —
+    /// zero wildcard arms at the decision site; a new variant cannot
+    /// ship without taking a position in `wire_decode_provenance`
+    /// AND filing its oracle row here).
+    #[test]
+    fn wire_decode_provenance_table_is_total() {
+        use crate::executor::DecodeProvenance as P;
+        use rio_nix::protocol::wire::WireError as W;
+        let utf8 = || String::from_utf8(vec![0xff]).unwrap_err();
+        let hexe = || hex::decode("zz").unwrap_err();
+        let table: Vec<(W, P)> = vec![
+            (
+                W::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+                P::WorkerLocal,
+            ),
+            (W::StringTooLong(9), P::WorkerLocal),
+            (W::CollectionTooLarge(9), P::WorkerLocal),
+            (W::NonZeroPadding(3), P::WorkerLocal),
+            (W::InvalidNarHash(hexe()), P::WorkerLocal),
+            (W::FrameTooLarge(9), P::WorkerLocal),
+            (W::InvalidUtf8(utf8()), P::ContentDerived),
+            (W::FramedStreamTooLarge(9), P::ContentDerived),
+        ];
+        for (w, want) in &table {
+            assert_eq!(
+                crate::executor::ExecutorError::wire_decode_provenance(w),
+                *want,
+                "provenance cell for {w:?}"
+            );
+            // The fold consumes the axis: content-derived ⇒ permanent.
+            assert_eq!(
+                crate::executor::ExecutorError::Wire(match w {
+                    W::Io(_) => W::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+                    W::StringTooLong(n) => W::StringTooLong(*n),
+                    W::CollectionTooLarge(n) => W::CollectionTooLarge(*n),
+                    W::NonZeroPadding(n) => W::NonZeroPadding(*n),
+                    W::InvalidNarHash(_) => W::InvalidNarHash(hexe()),
+                    W::FrameTooLarge(n) => W::FrameTooLarge(*n),
+                    W::InvalidUtf8(_) => W::InvalidUtf8(utf8()),
+                    W::FramedStreamTooLarge(n) => W::FramedStreamTooLarge(*n),
+                })
+                .is_permanent(),
+                *want == P::ContentDerived,
+                "is_permanent derives from the provenance axis for {w:?}"
+            );
+        }
+    }
 }

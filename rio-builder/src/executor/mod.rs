@@ -306,7 +306,21 @@ impl ExecutorError {
     /// Everything NOT matched here stays `InfrastructureFailure`: node-
     /// or network-local conditions (overlay/mount, IO, gRPC, daemon
     /// crashes, cgroup, OOM) where another pod plausibly succeeds.
+    ///
+    /// live059-b: the decode-error family joins by PROVENANCE, not by
+    /// another hand list — `Wire` carries
+    /// [`Self::wire_decode_provenance`]'s verdict (content-derived
+    /// decode failures are deterministic per-derivation: every pod
+    /// decodes the same bytes identically, exactly the
+    /// `InvalidDerivation` rationale; transport-derived ones stay
+    /// worker-local infra).
     pub fn is_permanent(&self) -> bool {
+        if let ExecutorError::Wire(w) = self {
+            return matches!(
+                Self::wire_decode_provenance(w),
+                DecodeProvenance::ContentDerived
+            );
+        }
         matches!(
             self,
             // FOD/non-FOD routed to wrong executor kind. Not "same on
@@ -322,6 +336,64 @@ impl ExecutorError {
             | ExecutorError::InvalidDerivation(_)
         )
     }
+
+    /// live059-b — the carrier-vs-consequence split on the daemon
+    /// wire-decode family: which `WireError`s are CONSEQUENCES of the
+    /// build's own content (deterministic per-derivation — the same
+    /// bytes fail every pod identically) vs CARRIER/transport faults
+    /// of THIS worker's daemon or socket (another pod plausibly
+    /// succeeds). Exhaustive per-variant derivation (zero wildcard
+    /// arms — a new wire variant must take a position here):
+    ///
+    /// - `Io` — the socket/daemon connection itself failed (EOF,
+    ///   reset, broken pipe): the carrier. WORKER-LOCAL.
+    /// - `StringTooLong` / `CollectionTooLarge` / `NonZeroPadding` —
+    ///   protocol-SHAPE violations: lengths, counts, and padding are
+    ///   daemon-computed framing, never content-fed; a healthy daemon
+    ///   cannot produce them regardless of build content — their
+    ///   appearance is daemon corruption. WORKER-LOCAL.
+    /// - `InvalidNarHash` — the narHash field is daemon-computed hex;
+    ///   content cannot make a healthy daemon emit non-hex.
+    ///   WORKER-LOCAL.
+    /// - `FrameTooLarge` — per-frame chunk sizes are daemon-chosen
+    ///   (bounded buffers), not content-determined; an oversized
+    ///   frame is daemon corruption. WORKER-LOCAL.
+    /// - `InvalidUtf8` — the DECODED STRING'S OWN BYTES failed UTF-8:
+    ///   string payloads on the daemon conversation are content-fed
+    ///   (derivation fields the daemon echoes; the live_059 trigger
+    ///   was a build's own log byte on the pre-transparency stderr
+    ///   lane). The bytes are what they are. CONTENT-DERIVED.
+    /// - `FramedStreamTooLarge` — the framed stream's TOTAL is the
+    ///   payload's own size (the build's output/NAR): the same
+    ///   derivation re-produces the same oversized payload on every
+    ///   pod. CONTENT-DERIVED.
+    pub fn wire_decode_provenance(w: &rio_nix::protocol::wire::WireError) -> DecodeProvenance {
+        use rio_nix::protocol::wire::WireError as W;
+        match w {
+            W::Io(_) => DecodeProvenance::WorkerLocal,
+            W::StringTooLong(_) => DecodeProvenance::WorkerLocal,
+            W::CollectionTooLarge(_) => DecodeProvenance::WorkerLocal,
+            W::NonZeroPadding(_) => DecodeProvenance::WorkerLocal,
+            W::InvalidNarHash(_) => DecodeProvenance::WorkerLocal,
+            W::FrameTooLarge(_) => DecodeProvenance::WorkerLocal,
+            W::InvalidUtf8(_) => DecodeProvenance::ContentDerived,
+            W::FramedStreamTooLarge(_) => DecodeProvenance::ContentDerived,
+        }
+    }
+}
+
+/// live059-b — the typed provenance axis on decode errors: the
+/// classification fold consumes THIS, never the error's transport
+/// shape (the carrier-vs-consequence law; see
+/// [`ExecutorError::wire_decode_provenance`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeProvenance {
+    /// Deterministic per-derivation: the same bytes fail every pod
+    /// identically — routes the permanent/InputRejected family.
+    ContentDerived,
+    /// The worker's own daemon/socket/framing failed — another pod
+    /// plausibly succeeds; routes the infra family.
+    WorkerLocal,
 }
 
 /// Max local retry attempts for transient daemon failures before
