@@ -90,15 +90,40 @@ pub const ADMIN_VERIFY_WORST_WAVE: Duration = Duration::from_secs(5);
 /// kernel's ~2 h TCP keepalive.
 pub const ADMIN_STREAM_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The emission-gap arithmetic, parameterized (bug_151): the waves in
+/// one emission sub-batch × the worst-case wave. One formula serves
+/// the production const fold below AND the conformance tests'
+/// non-integral counter-examples — a second hand-derivation of the
+/// gap is the R33 shape this split avoids.
+///
+/// LOSSLESS in the finest unit any input const can legally carry
+/// (R29′, the in-file [`RetryEnvelope::worst_case`] house idiom):
+/// const millis end-to-end. The pre-fix form truncated the wave to
+/// whole seconds BEFORE the multiply ("Duration × usize is not
+/// const" — avoidable, as `worst_case` in this same file already
+/// demonstrated), under-measuring a non-integral wave by up to
+/// `waves` seconds, lossy exactly toward hiding a violation of the
+/// bound the output is compared against.
+#[must_use]
+pub const fn worst_emission_gap(
+    worst_wave: Duration,
+    emit_every: usize,
+    concurrency: usize,
+) -> Duration {
+    let waves = emit_every.div_ceil(concurrency);
+    Duration::from_millis(worst_wave.as_millis() as u64 * waves as u64)
+}
+
 /// Worst-case wall time between two `VerifyChunks` progress frames
-/// under the producer cadence: the waves in one emission sub-batch ×
-/// the worst-case wave. Exposed so the conformance test (and any
-/// future bound consumer) derives it instead of re-computing it.
+/// under the producer cadence. Exposed so the conformance test (and
+/// any future bound consumer) derives it instead of re-computing it.
 #[must_use]
 pub const fn admin_verify_worst_emission_gap() -> Duration {
-    let waves = ADMIN_VERIFY_EMIT_EVERY.div_ceil(ADMIN_VERIFY_HEAD_CONCURRENCY);
-    // Duration × usize is not const; build from secs.
-    Duration::from_secs(ADMIN_VERIFY_WORST_WAVE.as_secs() * waves as u64)
+    worst_emission_gap(
+        ADMIN_VERIFY_WORST_WAVE,
+        ADMIN_VERIFY_EMIT_EVERY,
+        ADMIN_VERIFY_HEAD_CONCURRENCY,
+    )
 }
 
 /// A liveness wave budget — the `BoundedOp` half of the cadence
@@ -311,9 +336,17 @@ mod tests {
              ({ADMIN_STREAM_INACTIVITY_TIMEOUT:?}) — the client would kill healthy \
              max-batch verifies as half-open"
         );
-        // Current values: 16 waves × 5 s = 80 s vs 120 s — 1.5×
-        // headroom over the engineering worst case.
-        assert_eq!(gap, Duration::from_secs(80), "recompute the headroom note");
+        // Current values: 16 waves × 5000 ms = 80 000 ms vs 120 s —
+        // 1.5× headroom over the engineering worst case. The pin is
+        // re-derived from the LOSSLESS millis product (bug_151); the
+        // value is unchanged only because the production wave is
+        // integral-seconds — the non-integral domain is pinned by
+        // `emission_gap_witness_sees_subsecond_violations`.
+        assert_eq!(
+            gap,
+            Duration::from_millis(5000 * 16),
+            "recompute the headroom note"
+        );
     }
 
     /// Negative control: a cadence that fills the whole client window
@@ -325,6 +358,43 @@ mod tests {
             1,
             ADMIN_STREAM_INACTIVITY_TIMEOUT
         ));
+    }
+
+    /// W12-AX (bug_151, R29′): witness arithmetic is LOSSLESS in the
+    /// finest unit any input const can legally carry. The gap formula
+    /// pre-fix truncated the wave to whole seconds BEFORE multiplying
+    /// by the wave count — under-measuring up to ~16 s in exactly the
+    /// direction that hides a contract violation. The counter-example
+    /// the downcast hid: a 7900 ms wave computes a truncated
+    /// 7 s × 16 = 112 s "gap" that passes the 120 s client bound,
+    /// while the true worst gap is 126.4 s — a violating cadence
+    /// certified green by the witness sworn to catch it. Latent today
+    /// (the production 5 s wave is integral); the proposition is over
+    /// the NON-INTEGRAL domain the formula's inputs can legally
+    /// carry, driven through the same parameterized formula the
+    /// production fold uses.
+    ///
+    /// Pre-fix red, verbatim (against the extracted-but-still-lossy
+    /// formula):
+    ///   a 7900 ms wave's true gap (126.4 s) violates the 120 s
+    ///   bound — the witness must SEE it (lossy-toward-green
+    ///   downcast hid it; computed 112 s)
+    #[test]
+    fn emission_gap_witness_sees_subsecond_violations() {
+        let wave = Duration::from_millis(7900);
+        let gap = worst_emission_gap(wave, ADMIN_VERIFY_EMIT_EVERY, ADMIN_VERIFY_HEAD_CONCURRENCY);
+        assert!(
+            !keepalive_conforms(gap, 1, ADMIN_STREAM_INACTIVITY_TIMEOUT),
+            "a 7900 ms wave's true gap (126.4 s) violates the 120 s bound — \
+             the witness must SEE it (lossy-toward-green downcast hid it; \
+             computed {gap:?})"
+        );
+        // And the computed gap is the exact lossless product.
+        assert_eq!(
+            gap,
+            Duration::from_millis(7900 * 16),
+            "lossless in the finest unit the input carries"
+        );
     }
 
     /// The NEW first link of the three-link chain (merged_bug_006,
