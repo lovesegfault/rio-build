@@ -252,7 +252,8 @@ store:
     minReplicas: 2
     # PG-connection SAFETY BACKSTOP, NOT a product cap (owner decision
     # 2026-06-02: store scale is Karpenter-bounded; the operative scale
-    # knob is karpenter.nodePools[rio-general].limits.cpu below).
+    # knob is karpenter.nodePools[rio-store].limits.cpu below — D1:
+    # the store fleet's own pool; rio-general no longer hosts it).
     #
     # This default is the MODELED PG fallback for chart-only consumers
     # (no Karpenter context here — a bare chart install has nothing to

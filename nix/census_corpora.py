@@ -480,6 +480,50 @@ def scan_wire_secs_seams(files):
     return fails
 
 
+# --- the retired-knob-phrase arm (WO-S8-9, merged_bug_055) -------------
+#
+# store_pool_cpu_limit's three doc tiers (deploy.rs fn doc, the
+# derive_store_ceiling doc, values.yaml's backstop comment) kept
+# naming the retired rio-general pool after wave-9's D1 rename moved
+# the read to the rio-store pool — the identifier-driven sweep missed
+# prose naming the knob by its VALUES-PATH phrase. The phrases below
+# are RETIRED knob paths: zero live occurrences (this close swept
+# them), and any reintroduction fails tree-wide — the phrase-driven
+# belt the identifier sweep lacked.
+RETIRED_KNOB_PHRASES = [
+    # (phrase, replacement guidance)
+    (
+        "nodePools[rio-general].limits.cpu",
+        "the store scale knob is karpenter.nodePools[rio-store].limits.cpu (D1)",
+    ),
+]
+KNOB_PHRASE_SUFFIXES = {".rs", ".nix", ".py", ".sh", ".md", ".yaml", ".yml", ".toml"}
+
+
+def scan_retired_knob_phrases(src_root):
+    fails = []
+    for f in sorted(src_root.rglob("*")):
+        if not f.is_file() or f.suffix not in KNOB_PHRASE_SUFFIXES:
+            continue
+        rel = f.relative_to(src_root).as_posix()
+        parts = rel.split("/")
+        if any(p in (".git", "target", "result", "node_modules") for p in parts):
+            continue
+        if rel == "nix/census_corpora.py":
+            continue  # this table names the phrases as data
+        try:
+            text = f.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for phrase, guidance in RETIRED_KNOB_PHRASES:
+            for i, line in enumerate(text.splitlines(), 1):
+                if phrase in line:
+                    fails.append(
+                        f"{rel}:{i}: retired knob phrase `{phrase}` — {guidance}"
+                    )
+    return fails
+
+
 # --- the retention-registry numeric-claim arm (WO-S8-7) ---------------
 #
 # merged_bug_081: the retention registry lints SYMBOL linkage (xtask
@@ -725,6 +769,17 @@ def main() -> int:
         if scan_retention_notes(straw_root):
             print("FAIL: W11-BZ — the symbol-citing figure-free note flagged", file=sys.stderr)
             return 1
+    # The retired-knob-phrase belt's plant (WO-S8-9): a strawman file
+    # reintroducing the rio-general knob path is a named red.
+    with tempfile.TemporaryDirectory() as td:
+        straw_root = pathlib.Path(td)
+        (straw_root / "doc.md").write_text(
+            "raise karpenter." + "nodePools[rio-general].limits.cpu to scale\n"
+        )
+        f_k = scan_retired_knob_phrases(straw_root)
+        if len(f_k) != 1 or "retired knob phrase" not in f_k[0]:
+            print(f"FAIL: the retired-knob-phrase plant did not red: {f_k}", file=sys.stderr)
+            return 1
     # Arm F-allow: the allow grammar admits a documented exception.
     allowed_ws = "// wire-secs-census: allow(test fixture builds its own clock)\n" + WIRE_SECS_GRAMMAR[0][1]
     if scan_wire_secs_seams([("planted/allowed.rs", allowed_ws)]):
@@ -795,6 +850,8 @@ def main() -> int:
     fails += scan_proto_optional_seconds(src_root)
     # The retention-registry numeric-claim arm (WO-S8-7).
     fails += scan_retention_notes(src_root)
+    # The retired-knob-phrase belt (WO-S8-9, merged_bug_055).
+    fails += scan_retired_knob_phrases(src_root)
 
     gaps = sorted(f"{name}:{ax}" for name, _, _, _, g, _ in REGISTRY for ax in g)
     derived = sum(1 for *_, d in REGISTRY if d is not None)

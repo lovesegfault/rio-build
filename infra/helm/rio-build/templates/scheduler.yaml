@@ -249,13 +249,12 @@ spec:
             - name: RIO_DRAIN_GRACE_SECS
               value: "6"  # readinessProbe.periodSeconds (5) + 1
             # drv_executions row retention for the scheduler-owned GC
-            # (store.log.sweep-ownership): keep >= store.logRetentionDays
-            # so the lifecycle row never dies before its log chunks'
-            # window — a reclaimed row makes the log read incomplete
-            # even while chunks remain (disclosed, but
-            # operator-surprising).
+            # (store.log.sweep-ownership). Doc home: values.yaml
+            # scheduler.execRetentionDays — the single prose + single
+            # default home (no `| default` shadow; the gc refuses
+            # artifact-anchored rows structurally under any value).
             - name: RIO_EXEC_RETENTION_DAYS
-              value: {{ .Values.scheduler.execRetentionDays | default 30 | quote }}
+              value: {{ .Values.scheduler.execRetentionDays | quote }}
             - name: RIO_STORE__ADDR
               value: {{ $s.storeAddr | quote }}
             - name: RIO_DATABASE_URL

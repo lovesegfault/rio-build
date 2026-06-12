@@ -11,11 +11,11 @@
 # buffer memory and PG pool — a replica only adds capacity when it
 # lands on its own node. Placement is REQUIRED one-per-node
 # podAntiAffinity (ceiling-gated, like the gateway): a Pending store
-# pod on the untainted on-demand rio-general pool makes Karpenter mint
-# a node in ~30-60s, so scale-out is delayed one node-mint, never
-# blocked — the pool limit (karpenter.nodePools[rio-general].limits.cpu)
-# is the operative scale bound; the KEDA ceiling is only the
-# PG-connection safety backstop.
+# pod on the on-demand rio-store pool (D1: the store fleet's own
+# NodePool) makes Karpenter mint a node in ~30-60s, so scale-out is
+# delayed one node-mint, never blocked — the pool limit
+# (karpenter.nodePools[rio-store].limits.cpu) is the operative scale
+# bound; the KEDA ceiling is only the PG-connection safety backstop.
 #
 # The prometheus→KEDA→replica half cannot run in the k3s VM fixture
 # (the airgapped image set carries no KEDA operator) — THIS render

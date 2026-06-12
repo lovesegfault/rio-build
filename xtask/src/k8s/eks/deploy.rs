@@ -731,12 +731,15 @@ fn store_node_vcpus(request_cpu: u32) -> Result<u32> {
         })
 }
 
-/// `karpenter.nodePools[rio-general].limits.cpu` from the chart's
+/// `karpenter.nodePools[rio-store].limits.cpu` from the chart's
 /// values.yaml body — the hostable arm's budget input, read from the
-/// chart (not duplicated here) so an operator raising the pool limit
-/// raises the deployed ceiling on the next `eks up` with no xtask
-/// edit. Also asserts the pool's instance-family pin stays inside
-/// `GENERAL_POOL_FAMILIES` (the ladder's provenance).
+/// chart (not duplicated here) so an operator raising the STORE
+/// pool's limit raises the deployed ceiling on the next `eks up`
+/// with no xtask edit (D1: the store fleet has its own rio-store
+/// NodePool; rio-general no longer hosts it — the find() below and
+/// its error message are the operative read). Also asserts the
+/// pool's instance-family pin stays inside `GENERAL_POOL_FAMILIES`
+/// (the ladder's provenance).
 ///
 /// No path-reading unit test (crate2nix per-crate builds stage only
 /// the xtask/ subtree, the seccomp-regen precedent); the parser is
@@ -803,7 +806,9 @@ fn store_pool_cpu_limit(values_yaml: &str) -> Result<u32> {
 /// default comment documents (change both together).
 ///
 /// Hostable arm: `floor(karpenter_cpu_limit / node_vcpus)` — how many
-/// store nodes the rio-general pool can actually mint. live_052: the
+/// store nodes the rio-store pool (D1: the store fleet's own
+/// NodePool; rio-general no longer hosts it) can actually mint.
+/// live_052 (pre-D1, when the store still rode rio-general): the
 /// PG-only ceiling (173) let KEDA commit 4->173 replicas in 75s
 /// against a pool that hosts 46 nodes; 133 pods sat Pending while
 /// Karpenter churned NodeClaims at the limit. A Pending pod is not
