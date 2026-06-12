@@ -63,7 +63,11 @@ pub const SWEEP_BATCH: i64 = 1000;
 /// What one [`sweep_expired_logs`] pass deleted.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SweepStats {
-    /// Expired executions whose log artifacts this pass swept.
+    /// Expired executions claimed by this pass's candidate SELECT. A
+    /// late-revived execution (a session admitted into the statement
+    /// gap) is claimed but its artifacts are SPARED by the
+    /// per-statement exclusions (merged_bug_034); it re-qualifies at
+    /// a later pass once truly dead.
     pub executions_swept: u64,
     /// `drv_log_chunks` manifest rows deleted.
     pub chunks: u64,
@@ -141,19 +145,44 @@ pub async fn sweep_expired_logs(
 
         // Manifest rows first (RETURNING the keys we then delete from
         // the backend, post-commit). See the module doc for the
-        // ordering argument.
-        let keys: Vec<String> = sqlx::query_scalar(
-            "DELETE FROM drv_log_chunks WHERE exec_id = ANY($1) RETURNING s3_key",
-        )
-        .bind(&expired)
-        .fetch_all(&mut *tx)
-        .await?;
+        // ordering argument. THE EXCLUSION TRAVELS (merged_bug_034):
+        // under READ COMMITTED each destructive statement gets a
+        // FRESH snapshot, and `FOR UPDATE OF e` locks only
+        // drv_executions — a session admitted between the candidate
+        // SELECT and this statement (the just-admitted late replay)
+        // would otherwise lose the chunk rows its gate just read as
+        // durable. The predicate is the SAME shared fragment the
+        // SELECT used (one definition, repeated per statement — the
+        // sibling sweep_stale_sessions' house discipline).
+        let chunk_delete = format!(
+            "DELETE FROM drv_log_chunks c WHERE c.exec_id = ANY($1) \
+               AND NOT EXISTS (SELECT 1 FROM log_ingest_sessions s \
+                               WHERE s.exec_id = c.exec_id AND {live_grace}) \
+             RETURNING s3_key",
+            live_grace = rio_migrations::sql::live_ingest_session_sql("s.heartbeat_at", "$2")
+        );
+        // AssertSqlSafe: const-fragment composition, no runtime data.
+        let keys: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(chunk_delete))
+            .bind(&expired)
+            .bind(SESSION_REAP_GRACE_SECS)
+            .fetch_all(&mut *tx)
+            .await?;
 
         // Session rows of the swept executions: the victim predicate
-        // proved none is inside the reap grace, so these are dead rows
-        // that would otherwise dangle until this TTL.
-        sqlx::query("DELETE FROM log_ingest_sessions WHERE exec_id = ANY($1)")
+        // proved none was inside the reap grace AT SELECT TIME; this
+        // statement's own snapshot must re-prove it (merged_bug_034)
+        // — a lease committed into the statement gap is excluded
+        // STRUCTURALLY, exactly as the sibling sweep_stale_sessions
+        // carries NOT(live) in its own DELETE.
+        let session_delete = format!(
+            "DELETE FROM log_ingest_sessions WHERE exec_id = ANY($1) \
+               AND NOT ({live_grace})",
+            live_grace = rio_migrations::sql::live_ingest_session_sql("heartbeat_at", "$2")
+        );
+        // AssertSqlSafe: const-fragment composition, no runtime data.
+        sqlx::query(sqlx::AssertSqlSafe(session_delete))
             .bind(&expired)
+            .bind(SESSION_REAP_GRACE_SECS)
             .execute(&mut *tx)
             .await?;
 
@@ -515,6 +544,105 @@ mod tests {
     /// replicas accumulated it (the :149 comment claimed "exact" with
     /// nothing enforcing it); post-fix B skips A's rows entirely and
     /// a later pass (after A releases) sweeps exactly once.
+    /// W12-H (merged_bug_034, red-first): the sweep's exclusions must
+    /// hold at EACH destructive statement's snapshot, not only at the
+    /// candidate SELECT. Under READ COMMITTED every statement gets a
+    /// fresh snapshot, and `FOR UPDATE OF e` locks only
+    /// drv_executions — so a session committed AFTER the SELECT
+    /// evaluated its exclusion (the just-admitted late replay:
+    /// `accepts_terminal_but_incomplete_execution` keeps the
+    /// sweepable-AND-openable population legal) sat exposed to the
+    /// un-qualified statements. The fixture parks the sweep at the
+    /// chunk DELETE on row locks, commits a live session into the
+    /// statement gap (the steal arm refreshes the dead row), releases,
+    /// and asserts the live lease survived. Pre-fix RED: the session
+    /// DELETE killed the fresh lease (a transient Lost-abort of a
+    /// just-admitted replay) and the chunk DELETE erased manifest rows
+    /// a concurrently-opened gate read as durable.
+    #[tokio::test]
+    async fn sweep_statement_gap_spares_a_late_admitted_session() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let store = std::sync::Arc::new(MemoryLogChunkStore::default());
+        let exec = Uuid::now_v7();
+        seed_aged_execution(&db.pool, &store, exec, 31.0, 2).await;
+
+        // Park the sweep at its chunk DELETE: row-lock the chunk rows
+        // from an open transaction (the candidate SELECT locks only
+        // drv_executions, so it runs; the DELETE then waits on us).
+        let lock_pool = db.reopen().await;
+        let mut tx = lock_pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM drv_log_chunks WHERE exec_id = $1 FOR UPDATE")
+            .bind(exec)
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+
+        let sweep_pool = db.pool.clone();
+        let sweep_store = std::sync::Arc::clone(&store);
+        let sweep = tokio::spawn(async move {
+            sweep_expired_logs(
+                &sweep_pool,
+                &*sweep_store,
+                Duration::from_secs(30 * 86_400),
+                SWEEP_BATCH,
+            )
+            .await
+        });
+
+        // Ordering proof, not a sleep: wait until the sweep is
+        // OBSERVABLY blocked at the chunk DELETE (pg_stat_activity
+        // shows the waiting statement), so the candidate SELECT has
+        // provably evaluated its exclusion already.
+        let mut parked = false;
+        for _ in 0..200 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE wait_event_type = 'Lock' \
+                   AND query LIKE 'DELETE FROM drv_log_chunks%'",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                parked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(parked, "the sweep must be parked at its chunk DELETE");
+
+        // The statement gap: a live session is admitted NOW — the
+        // production steal arm refreshes the dead row to a fresh
+        // lease (the late replay's open).
+        let fresh_session = Uuid::now_v7();
+        match crate::logs::sessions::acquire(&db.pool, exec, fresh_session, "late-pod")
+            .await
+            .unwrap()
+        {
+            crate::logs::sessions::Acquire::Acquired => {}
+            other => panic!("the late replay must acquire the stale row, got {other:?}"),
+        }
+
+        // Release the park; the sweep finishes its transaction.
+        drop(tx);
+        sweep.await.unwrap().unwrap();
+
+        // The law, at each statement's snapshot: the live lease
+        // survives the sweep (pre-fix RED: the un-qualified session
+        // DELETE killed it — the row was gone and the next heartbeat
+        // observed Lost).
+        assert!(
+            matches!(
+                crate::logs::sessions::lookup_live(&db.pool, exec)
+                    .await
+                    .unwrap(),
+                crate::logs::sessions::LiveLookup::Live(_)
+            ),
+            "a session committed into the sweep's statement gap must survive \
+             every destructive statement (the exclusion travels per statement)"
+        );
+    }
+
     #[tokio::test]
     async fn overlapping_replicas_sweep_disjoint_batches() {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
