@@ -541,6 +541,20 @@
     },
     {
       "enum": "EvalStoreError",
+      "name": "Dir",
+      "crate": "rio-evalstore",
+      "msg": "directory store error: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "DirBlob",
+      "crate": "rio-evalstore",
+      "msg": "directory blob error: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
       "name": "ForeignPath",
       "crate": "rio-evalstore",
       "msg": "path '{0}' is not in the client CAS — cluster-backed reads for foreign paths arrive in ADR-024 M1; M0 serves only paths this store ingested",
@@ -551,6 +565,13 @@
       "name": "Hash",
       "crate": "rio-evalstore",
       "msg": "hash error: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Ingest",
+      "crate": "rio-evalstore",
+      "msg": "source ingest failed: {0}",
       "doc": ""
     },
     {
@@ -579,6 +600,20 @@
       "name": "NoSuchEntry",
       "crate": "rio-evalstore",
       "msg": "no such entry '{rel}' in store object '{basename}'",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "OriginUnreadable",
+      "crate": "rio-evalstore",
+      "msg": "origin file '{origin}' of store object '{basename}' is unreadable: {source}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Pack",
+      "crate": "rio-evalstore",
+      "msg": "pack store error: {0}",
       "doc": ""
     },
     {
