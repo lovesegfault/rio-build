@@ -1854,27 +1854,28 @@ session (`INSERT INTO gc_holds (scope, reason, created_by) VALUES ('global',
 = ...`); a wire admin verb rides the next proto-granted slot --- this wave's
 proto partition grants the store none (recorded divergence, never silent).
 
-#r("store.gc.hold-lanes+1")[
+#r("store.gc.hold-lanes+2")[
   During an active global hold, NO lane with delete authority may execute a
   destructive act: every destructive lane MUST consult the active-hold
   predicate FAIL-CLOSED at each tick before any destructive work (a consult
-  error is a skip, never a bypass), and lane membership MUST be
-  machine-derived --- the census over the spawn-periodic family
-  (`spawn_periodic` + `spawn_periodic_with` call sites) intersected with the
-  reaches-delete-sink predicate (`DELETE FROM` / `delete_by_key` /
-  `pending_s3_deletes` enqueue, transitive), union `run_gc` pinned --- never
-  author-enumerated. Periodic registration is the `DestructiveLane` wrapper
-  (the only way to register a deleting periodic lane); the per-tick
-  `HoldClearance` capability is demanded by the named delete sinks
-  (`reap_one`, `drain_once`, `collect_cycle`), and demand-driven delete
-  callers consult at call time (`reap_one_consulted`). Multi-batch tick
-  bodies MUST re-authorize the clearance at each committed-transaction
-  batch boundary (`HoldClearance::authorize_batch` --- the collect loop,
-  the post-drain reap, the orphan scan, the per-row drain), so destructive
-  work after hold-activation is bounded by the one batch already in flight
-  --- that batch completes-or-aborts within `DESTRUCTIVE_BATCH_DRAIN_BOUND`
-  (one drain cadence) and the next batch never starts at any boundary, tick
-  or intra-tick; the drain lane HOLDS its queue (`pending_s3_deletes` rows
+  error is a skip, never a bypass), and BOTH population layers MUST be
+  machine-derived, never author-enumerated --- the LANE census over the
+  spawn-periodic family (`spawn_periodic` + `spawn_periodic_with` call
+  sites) intersected with the reaches-delete-sink predicate, union `run_gc`
+  pinned; and the BODY census over destructive-loop idioms (every
+  production loop transitively reaching a durable gc-victim sink, with its
+  per-batch demand form derived --- `gensets/destructive-body-census.txt`).
+  Periodic registration is the `DestructiveLane` wrapper (the only way to
+  register a deleting periodic lane); the per-tick `HoldClearance`
+  capability is demanded by the named delete sinks, and demand-driven
+  delete callers consult at call time (`reap_one_consulted`). Every
+  multi-batch destructive body MUST re-authorize at each
+  committed-transaction batch boundary through the per-batch token
+  (#rref("store.gc.batch-authority")), so destructive work after
+  hold-activation is bounded by the one batch already in flight --- that
+  batch completes-or-aborts within `DESTRUCTIVE_BATCH_DRAIN_BOUND` (one
+  drain cadence) and the next batch never starts at any boundary, tick or
+  intra-tick; the drain lane HOLDS its queue (`pending_s3_deletes` rows
   age, never execute).
 ]
 Wave-9 shipped the hold consulted at exactly one entry (`run_gc`) while four
@@ -1882,16 +1883,26 @@ sibling lanes kept deleting during the freeze --- and the held `run_gc`
 starving `last_live_cycle_at` GUARANTEED the backstop fired (merged_bug_050,
 HIGH). The lane census (`gc/lane.rs`, committed at
 `rio-store/tests/gensets/destructive-lane-census.txt`) is the load-bearing
-population totality: the author-enumerated four-lane list this close first
+spawn-layer totality: the author-enumerated four-lane list this close first
 carried was the round-6 closure-set defect recurring inside a high close ---
 the gc-orphan-scanner (the fifth lane) hid from it; a sixth cannot hide from
-the family scan. Enforcement tiers, stated honestly (R24/R28): the clearance
-type compile-seals the named sinks (reachability); the expiry + batch
-re-authorization seal the time axis at the type's own seam; the census holds
-the population. The wave-10 form of this rule promised the drain bound while
-consulting once per tick --- false for the backstop's full collect cycle (a
-five-minute lock-held budget over fifty committed batches, merged_bug_067);
-the per-batch re-authorization is what makes the bound true.
+the family scan. The same defect then recurred one layer down (bug_084,
+merged_bug_006): the wave-11 batch-boundary law quantified over "multi-batch
+tick bodies" but its enforcement was a hand list that wired four of six
+bodies --- run_gc's phase-2 path sweep and the log TTL sweep shipped
+unwired, so a global hold could not stop either mid-pass. The BODY census
+(`gc/lane.rs`, committed at
+`rio-store/tests/gensets/destructive-body-census.txt`) is the body-layer
+totality: it derives every destructive loop from the idiom and refuses any
+member without the per-batch demand. Enforcement tiers, stated honestly
+(R24/R28-as-amended-by-R31): the clearance type compile-seals the named
+sinks and the per-batch token compile-seals the batches (reachability); the
+expiry + batch re-authorization seal the time axis at the type's own seam;
+the two censuses DERIVE the population. The wave-10 form of this rule
+promised the drain bound while consulting once per tick --- false for the
+backstop's full collect cycle (a five-minute lock-held budget over fifty
+committed batches, merged_bug_067); the per-batch re-authorization through
+the token is what makes the bound true.
 
 #r("store.gc.clearance-expiry")[
   A `HoldClearance` MUST expire `DESTRUCTIVE_BATCH_DRAIN_BOUND` after its

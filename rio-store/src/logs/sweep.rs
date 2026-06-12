@@ -93,7 +93,7 @@ pub struct SweepStats {
 /// discarded the lane clearance (`move |_clearance|`) and this loop
 /// never re-authorized — the lone violator of the per-batch law its
 /// own lane registered under.
-// r[impl store.gc.hold-lanes+1]
+// r[impl store.gc.hold-lanes+2]
 // r[impl store.gc.clearance-expiry]
 // r[impl store.gc.batch-authority]
 pub async fn sweep_expired_logs(
@@ -350,7 +350,7 @@ pub fn spawn_log_sweep(
     retention: Duration,
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
-    // r[impl store.gc.hold-lanes+1]
+    // r[impl store.gc.hold-lanes+2]
     // Registered through DestructiveLane (merged_bug_050): the
     // wrapper consults the gc-hold gate fail-closed each tick AND the
     // minted clearance is CONSUMED by the sweep body (merged_bug_006

@@ -203,7 +203,7 @@ pub mod hold {
     /// author-enumerated — the wave-11 hand list wired four of six
     /// bodies and the two unwired ones defeated the operator's
     /// emergency stop.
-    // r[impl store.gc.hold-lanes+1]
+    // r[impl store.gc.hold-lanes+2]
     // r[impl store.gc.clearance-expiry]
     #[derive(Debug)]
     pub struct HoldClearance {
@@ -329,7 +329,7 @@ pub mod hold {
         Held(ActiveHold),
     }
 
-    // r[impl store.gc.hold-lanes+1]
+    // r[impl store.gc.hold-lanes+2]
     /// THE destructive-actor consult: one query, one verdict, the
     /// only mint point for [`HoldClearance`]. Callers MUST fail
     /// CLOSED on `Err` (an unreadable hold table is never read as
@@ -606,7 +606,7 @@ pub async fn run_gc(
     // consult mints the same HoldClearance the lane wrapper does,
     // and the clearance threads to BOTH destructive phases — the
     // phase-2 path sweep and the phase-3 chunk-collect — whose sinks
-    // demand per-batch authority (store.gc.hold-lanes+1), and a
+    // demand per-batch authority (store.gc.hold-lanes+2), and a
     // drain-bound-aged clearance authorizes nothing further
     // (store.gc.clearance-expiry).
     let mut hold_clearance = match hold::gate(pool).await {
@@ -622,7 +622,7 @@ pub async fn run_gc(
                 "lane" => "run_gc", "cause" => "held"
             )
             .increment(1);
-            // r[impl store.gc.hold-lanes+1]
+            // r[impl store.gc.hold-lanes+2]
             // The starvation coupling dies HERE (merged_bug_050): a
             // held cycle is a live cycle for staleness purposes —
             // stamping keeps the backstop's due-ness clock quiet so

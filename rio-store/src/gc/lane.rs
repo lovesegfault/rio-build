@@ -66,7 +66,7 @@ pub(crate) enum LaneTick {
 pub(crate) type LaneBody =
     Box<dyn for<'t> FnMut(&'t mut hold::HoldClearance) -> BoxFuture<'t, ()> + Send>;
 
-// r[impl store.gc.hold-lanes+1]
+// r[impl store.gc.hold-lanes+2]
 /// The ONLY way to register a deleting periodic lane — see the
 /// module doc. Mirrors `rio_common::task::spawn_periodic[_with]`
 /// (biased shutdown select, `MissedTickBehavior::Skip`, panic-logged
@@ -113,7 +113,7 @@ impl DestructiveLane {
         })
     }
 
-    // r[impl store.gc.hold-lanes+1]
+    // r[impl store.gc.hold-lanes+2]
     /// ONE consulted tick: consult the hold gate FAIL-CLOSED, mint
     /// the tick's clearance, run the body under it. The testable
     /// seam — W10-D/E/F drive lanes through this exact fn.
@@ -309,7 +309,7 @@ mod tests {
         })
     }
 
-    // r[verify store.gc.hold-lanes+1]
+    // r[verify store.gc.hold-lanes+2]
     /// W10-D (merged_bug_050): with an ACTIVE GLOBAL HOLD and every
     /// periodic census member due, NO lane executes a destructive act
     /// — every tick skips typed, the skip counters increment for
@@ -444,7 +444,7 @@ mod tests {
         assert_eq!(placeholders.0, 0, "released hold: the scanner reaps");
     }
 
-    // r[verify store.gc.hold-lanes+1]
+    // r[verify store.gc.hold-lanes+2]
     /// W10-F (fail-closed): an UNREADABLE holds table is never read
     /// as "no hold" — EVERY census-member lane skips typed
     /// (`SkippedConsultError`), the counter increments, and zero
@@ -538,7 +538,7 @@ mod tests {
         }
     }
 
-    // r[verify store.gc.hold-lanes+1]
+    // r[verify store.gc.hold-lanes+2]
     /// The in-flight corner (DESTRUCTIVE_BATCH_DRAIN_BOUND): a delete
     /// batch already mid-flight when the hold lands COMPLETES (the
     /// per-tick consult granted it a clearance; aborting mid-batch
@@ -607,7 +607,7 @@ mod tests {
         assert_eq!(pending.0, 1, "the queue holds from the hold onward");
     }
 
-    // r[verify store.gc.hold-lanes+1]
+    // r[verify store.gc.hold-lanes+2]
     // r[verify store.gc.hold+2]
     /// W10-E (the starvation negation, merged_bug_050 commit 2): a
     /// hold spanning k backstop periods produces ZERO deletes and
@@ -1235,7 +1235,7 @@ mod census {
         }
     }
 
-    // r[verify store.gc.hold-lanes+1]
+    // r[verify store.gc.hold-lanes+2]
     /// THE lane census: derive the spawn-family rows, refuse any
     /// destructive ∧ ¬routed member, pin run_gc (∪ the family scan),
     /// and pin the full derived set against the committed [GEN-SET]
@@ -1304,7 +1304,7 @@ mod census {
         );
     }
 
-    // r[verify store.gc.hold-lanes+1]
+    // r[verify store.gc.hold-lanes+2]
     /// R22′ planted red: a strawman spawn-family lane with a delete
     /// sink NOT routed through DestructiveLane is flagged by the SAME
     /// derivation — planted at the SCAN layer (raw source enters the
@@ -1561,7 +1561,7 @@ async fn seed_row(pool: &PgPool) -> Result<(), sqlx::Error> {
         );
     }
 
-    // r[verify store.gc.hold-lanes+1]
+    // r[verify store.gc.hold-lanes+2]
     /// W11-AN (bug_085 leniency point 1 — the literal-less silent
     /// skip): a deleting spawn-family lane whose name rides a CONST
     /// is REFUSED by the census (an error naming the site), never
@@ -1600,7 +1600,7 @@ async fn sneaky_sweep(pool: &PgPool) -> Result<(), sqlx::Error> {
         );
     }
 
-    // r[verify store.gc.hold-lanes+1]
+    // r[verify store.gc.hold-lanes+2]
     /// W11-AO (bug_085 leniency point 2 — the adjacency forge): a raw
     /// `task::spawn_periodic` whose 200-char neighborhood names the
     /// wrapper (here: a trailing comment; the lawful-registration-
@@ -1668,6 +1668,845 @@ async fn neighbor_sweep(pool: &PgPool) -> Result<(), sqlx::Error> {
         assert!(
             lawful.routed,
             "token-path routing classifies the lawful form"
+        );
+    }
+
+    // ================= THE DESTRUCTIVE-BODY CENSUS =================
+    // bug_084 + merged_bug_006 (R31): the per-batch hold law
+    // quantifies over MULTI-BATCH DESTRUCTIVE BODIES — and the
+    // wave-11 enforcement population was a hand enumeration that
+    // wired four of six. This census DERIVES the population from the
+    // destructive-loop idiom itself: every production loop that
+    // transitively reaches a durable delete/outbox sink must either
+    // re-authorize at its own boundary (`authorize_batch(` in the
+    // loop body) or reach its sinks exclusively through callees that
+    // self-authorize per call (the `reap_one_consulted` shape). A
+    // loop that does neither is a census ERROR naming the site —
+    // refusal, never a skip (R22'' absorbed into R31: absence of a
+    // demand must produce PRESENCE of a red).
+    //
+    // Universe faces (the §-riders, each load-bearing):
+    // - JURISDICTION: the corpus is `CENSUS_SOURCES` — whole-crate,
+    //   pinned bidirectionally against the live tree by
+    //   `lane_census_universe_matches_live_tree` (one jurisdiction
+    //   derivation serves both censuses; a new file cannot hide).
+    // - POPULATION: non-vacuity asserted (>= 1 derived row) and the
+    //   six expected members verified by name — a vacuous walk
+    //   passing green is the round's named R22'' defeat.
+    // - TYPED EXEMPTIONS (each with its rationale, asserted not
+    //   skipped): session-temp-table DELETEs are non-durable
+    //   (`sweep_unreachable`, `live_chunks`, `shadow_swept` — they
+    //   die with their session); loops INSIDE a fn that itself
+    //   demands `BatchAuthority` are within the one batch that token
+    //   funds (`sweep_one_batch`'s lock/delete passes); loops inside
+    //   the sink-layer fns (`delete_batch`/`delete_by_key` backend
+    //   impls) are intra-sink — the caller's token funded the call.
+
+    /// Durable-victim refusal: `DELETE FROM <ident>` over anything
+    /// NOT in the session-temp exemption list is a durable sink; an
+    /// unparseable target REFUSES (fail-closed).
+    const TEMP_TABLE_EXEMPT: &[&str] = &["sweep_unreachable", "live_chunks", "shadow_swept"];
+
+    /// Typed exemption: whole files that are `cfg(test)`-gated module
+    /// declarations (the lock.rs census carries the same exception
+    /// class) — their loops never compile into production. Asserted
+    /// against the declaring `mod.rs` texts in the census proper so a
+    /// de-gating lands red, never silent.
+    const TEST_PLANE_FILES: &[&str] = &[
+        "gc/mark_scan_bench.rs",
+        "logs/mbt_tests.rs",
+        "test_helpers.rs",
+    ];
+
+    /// One derived multi-batch destructive body.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct BodyRow {
+        file: String,
+        fn_name: String,
+        /// `in-loop` (the boundary consult sits in the loop body) or
+        /// `via:<callee>` (every sink path runs through a
+        /// self-authorizing callee).
+        demand: String,
+    }
+
+    /// Per-file fn extraction: (name, header incl. params, body).
+    fn fns_with_sigs(text: &str) -> Vec<(String, String, String)> {
+        let bytes = text.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Some(pos) = text[i..].find("fn ") {
+            let at = i + pos;
+            if at > 0 && ((bytes[at - 1] as char).is_alphanumeric() || bytes[at - 1] == b'_') {
+                i = at + 3;
+                continue;
+            }
+            let rest = &text[at + 3..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                i = at + 3;
+                continue;
+            }
+            let mut j = at + 3;
+            let mut body_start = None;
+            let mut depth_paren = 0i32;
+            while j < text.len() {
+                match bytes[j] as char {
+                    '(' | '[' => depth_paren += 1,
+                    ')' | ']' => depth_paren -= 1,
+                    ';' if depth_paren == 0 => break,
+                    '{' if depth_paren == 0 => {
+                        body_start = Some(j);
+                        break;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            let Some(bs) = body_start else {
+                i = j.max(at + 3) + 1;
+                continue;
+            };
+            let header = text[at..bs].to_string();
+            let mut depth = 0i32;
+            let mut k = bs;
+            while k < text.len() {
+                match bytes[k] as char {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            out.push((name, header, text[bs..k.min(text.len())].to_string()));
+            i = k.min(text.len()).max(at + 3) + 1;
+        }
+        out
+    }
+
+    /// UPPER_SNAKE const/static initializer texts across the corpus
+    /// (SQL lives in consts — `REAP_BATCH_DELETE_SQL` — and the sink
+    /// scan must see through the name).
+    fn const_texts(corpus: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        let mut map = std::collections::BTreeMap::new();
+        for (_f, src) in corpus {
+            let text: String = code_lines(src).join("\n");
+            for intro in ["const ", "static "] {
+                let mut i = 0;
+                while let Some(pos) = text[i..].find(intro) {
+                    let at = i + pos;
+                    let rest = &text[at + intro.len()..];
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                        .collect();
+                    if name.len() < 2 || !rest.starts_with(&name) {
+                        i = at + intro.len();
+                        continue;
+                    }
+                    // Capture to the top-level `;`.
+                    let bytes = text.as_bytes();
+                    let mut depth = 0i32;
+                    let mut k = at;
+                    while k < text.len() {
+                        match bytes[k] as char {
+                            '(' | '[' | '{' => depth += 1,
+                            ')' | ']' | '}' => depth -= 1,
+                            ';' if depth == 0 => break,
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                    map.entry(name)
+                        .or_insert_with(String::new)
+                        .push_str(&text[at..k.min(text.len())]);
+                    i = k.min(text.len()).max(at + 1);
+                }
+            }
+        }
+        map
+    }
+
+    /// The gc-victim table classes (the classifier's closed alphabet;
+    /// anything outside it REFUSES — a new table must classify, never
+    /// silently pass):
+    /// - VICTIM tables hold the evidence the gc-hold law protects —
+    ///   ANY delete over them is a sink regardless of predicate shape
+    ///   (the path sweep deletes per-path by `= $1`, and those are
+    ///   exactly the deletes the emergency stop must stop);
+    /// - DUAL tables carry both owner-lifecycle and gc deleters
+    ///   (`log_ingest_sessions`: a session releases its OWN row by
+    ///   keyed equality — transactional self-state, outside the hold
+    ///   law — while the sweeps delete them aged/mass); predicate
+    ///   shape classifies: owner-keyed `= $` is lawful, mass markers
+    ///   are sinks, anything else refuses.
+    const VICTIM_TABLES: &[&str] = &[
+        "narinfo",
+        "realisations",
+        "path_tenants",
+        "chunks",
+        "drv_log_chunks",
+        "manifests",
+        "manifest_data",
+        "pending_s3_deletes",
+    ];
+    const DUAL_TABLES: &[&str] = &["log_ingest_sessions"];
+
+    /// Does `text` carry a DURABLE destructive sink? `Ok(Some(tok))`
+    /// = yes (the evidence token); `Ok(None)` = no; `Err` = a form the
+    /// grammar cannot attribute (refusal, never a skip).
+    fn durable_sink_in(text: &str) -> Result<Option<String>, String> {
+        for tok in [
+            "delete_by_key(",
+            "delete_batch(",
+            "INSERT INTO pending_s3_deletes",
+        ] {
+            if text.contains(tok) {
+                return Ok(Some(tok.to_string()));
+            }
+        }
+        let mut i = 0;
+        while let Some(pos) = text[i..].find("DELETE FROM ") {
+            let at = i + pos + "DELETE FROM ".len();
+            let target: String = text[at..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if target.is_empty() {
+                return Err(format!(
+                    "unparseable DELETE FROM target near `{}` (refusing fail-closed)",
+                    &text[at.saturating_sub(20)..(at + 20).min(text.len())]
+                ));
+            }
+            if !TEMP_TABLE_EXEMPT.contains(&target.as_str()) {
+                if VICTIM_TABLES.contains(&target.as_str()) {
+                    return Ok(Some(format!("DELETE FROM {target}")));
+                }
+                if DUAL_TABLES.contains(&target.as_str()) {
+                    // The statement window: to the end of the
+                    // enclosing string literal — the predicate the
+                    // shape classifier reads.
+                    let bytes = text.as_bytes();
+                    let mut w = at;
+                    while w < text.len() {
+                        match bytes[w] as char {
+                            '\\' => w += 1,
+                            '"' => break,
+                            _ => {}
+                        }
+                        w += 1;
+                    }
+                    let window = &text[at..w.min(text.len())];
+                    let mass = window.contains(" LIMIT ")
+                        || window.contains("ANY(")
+                        || window.contains("ANY (")
+                        || window.contains("make_interval");
+                    if mass {
+                        return Ok(Some(format!("DELETE FROM {target}")));
+                    }
+                    if window.contains('{') {
+                        return Err(format!(
+                            "interpolated DELETE predicate on dual-use \
+                             `{target}` — the grammar cannot attribute it \
+                             (refusing fail-closed)"
+                        ));
+                    }
+                    if window.contains("= $") {
+                        // Owner-keyed self-state release: lawful class.
+                        i = at;
+                        continue;
+                    }
+                    return Err(format!(
+                        "unclassifiable DELETE FROM {target} predicate \
+                         (dual-use table, neither mass nor owner-keyed; \
+                         refusing fail-closed): `{}`",
+                        &window[..window.len().min(80)]
+                    ));
+                }
+                return Err(format!(
+                    "DELETE FROM unclassified table `{target}` — extend the \
+                     victim/dual alphabet (refusing fail-closed)"
+                ));
+            }
+            i = at;
+        }
+        Ok(None)
+    }
+
+    /// Recursive sink-path lawfulness: a fn is lawful iff its body
+    /// self-authorizes (`authorize_batch(`), or it carries no direct
+    /// sink and every sink-reaching callee is lawful. Cycle-safe
+    /// (a back edge reads lawful for THIS path; the cycle's own
+    /// entry still gets its full check).
+    fn sink_path_lawful(
+        name: &str,
+        ctx: &mut ReachCtx<'_>,
+        in_progress: &mut std::collections::BTreeSet<String>,
+    ) -> Result<bool, String> {
+        let Some(body) = ctx.bodies.get(name).cloned() else {
+            return Ok(true); // not in corpus: no sink evidence
+        };
+        if body.contains("authorize_batch(") {
+            return Ok(true);
+        }
+        if durable_sink_in(&body)?.is_some() {
+            return Ok(false);
+        }
+        let (calls, crefs) = refs_in(&body);
+        for cn in crefs {
+            if let Some(ct) = ctx.consts.get(&cn).cloned()
+                && durable_sink_in(&ct)?.is_some()
+            {
+                return Ok(false);
+            }
+        }
+        if in_progress.contains(name) {
+            return Ok(true);
+        }
+        in_progress.insert(name.to_string());
+        for callee in calls {
+            if ctx.fn_reach(&callee)?.is_some() && !sink_path_lawful(&callee, ctx, in_progress)? {
+                in_progress.remove(name);
+                return Ok(false);
+            }
+        }
+        in_progress.remove(name);
+        Ok(true)
+    }
+
+    /// Called identifiers + referenced UPPER_SNAKE consts in a body.
+    fn refs_in(body: &str) -> (Vec<String>, Vec<String>) {
+        let b = body.as_bytes();
+        let mut calls = Vec::new();
+        let mut consts = Vec::new();
+        let mut i = 0;
+        while i < body.len() {
+            let c = b[i] as char;
+            if c.is_ascii_alphabetic() || c == '_' {
+                let start = i;
+                while i < body.len() && ((b[i] as char).is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                let ident = &body[start..i];
+                if i < body.len() && b[i] == b'(' {
+                    calls.push(ident.to_string());
+                } else if ident.len() > 2
+                    && ident
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                {
+                    consts.push(ident.to_string());
+                }
+            } else {
+                i += 1;
+            }
+        }
+        (calls, consts)
+    }
+
+    /// Memoized per-fn durable-sink reach (sound: every fn's full
+    /// subtree is explored exactly once; a path-dependent shared
+    /// visited set with a depth bound mis-answers reachability when
+    /// a node is first met deep and later met shallow). Cycles read
+    /// as no-reach on the back edge; the cycle's own forward edges
+    /// still find any real sink.
+    struct ReachCtx<'a> {
+        bodies: &'a std::collections::BTreeMap<String, String>,
+        consts: &'a std::collections::BTreeMap<String, String>,
+        memo: std::collections::BTreeMap<String, Option<String>>,
+        in_progress: std::collections::BTreeSet<String>,
+    }
+
+    impl ReachCtx<'_> {
+        fn body_reach(&mut self, body: &str) -> Result<Option<String>, String> {
+            if let Some(tok) = durable_sink_in(body)? {
+                return Ok(Some(tok));
+            }
+            let (calls, crefs) = refs_in(body);
+            for cn in crefs {
+                if let Some(ct) = self.consts.get(&cn).cloned()
+                    && let Some(tok) = durable_sink_in(&ct)?
+                {
+                    return Ok(Some(format!("{cn}: {tok}")));
+                }
+            }
+            for name in calls {
+                if let Some(tok) = self.fn_reach(&name)? {
+                    return Ok(Some(format!("{name} -> {tok}")));
+                }
+            }
+            Ok(None)
+        }
+
+        fn fn_reach(&mut self, name: &str) -> Result<Option<String>, String> {
+            if let Some(m) = self.memo.get(name) {
+                return Ok(m.clone());
+            }
+            if self.in_progress.contains(name) {
+                return Ok(None); // cycle back edge
+            }
+            let Some(body) = self.bodies.get(name).cloned() else {
+                return Ok(None);
+            };
+            self.in_progress.insert(name.to_string());
+            let r = self.body_reach(&body);
+            self.in_progress.remove(name);
+            match r {
+                Ok(v) => {
+                    self.memo.insert(name.to_string(), v.clone());
+                    Ok(v)
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    /// String-aware loop finder: `loop`/`for`/`while` keyword tokens
+    /// OUTSIDE string literals, each with its brace-balanced body.
+    fn loops_in(body: &str) -> Vec<String> {
+        let b = body.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        let mut in_str = false;
+        while i < body.len() {
+            let c = b[i] as char;
+            if in_str {
+                match c {
+                    '\\' => i += 1,
+                    '"' => in_str = false,
+                    _ => {}
+                }
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_str = true;
+                i += 1;
+                continue;
+            }
+            if c.is_ascii_alphabetic() || c == '_' {
+                let start = i;
+                while i < body.len() && ((b[i] as char).is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                let ident = &body[start..i];
+                if ident == "loop" || ident == "for" || ident == "while" {
+                    // Header scan: the body `{` at paren depth 0.
+                    let mut depth = 0i32;
+                    let mut k = i;
+                    let mut bs = None;
+                    while k < body.len() {
+                        match b[k] as char {
+                            '(' | '[' => depth += 1,
+                            ')' | ']' => depth -= 1,
+                            ';' if depth == 0 => break, // not a loop (e.g. `for` in prose)
+                            '{' if depth == 0 => {
+                                bs = Some(k);
+                                break;
+                            }
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                    if let Some(bs) = bs {
+                        let mut d = 0i32;
+                        let mut e = bs;
+                        while e < body.len() {
+                            match b[e] as char {
+                                '{' => d += 1,
+                                '}' => {
+                                    d -= 1;
+                                    if d == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            e += 1;
+                        }
+                        out.push(body[bs..e.min(body.len())].to_string());
+                    }
+                }
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// THE derivation: every production loop transitively reaching a
+    /// durable sink classifies as `in-loop` (authorize_batch at its
+    /// own boundary) or `via:<callee>` (every sink path through a
+    /// self-authorizing callee) — anything else is a refusal row.
+    fn derive_destructive_bodies(corpus: &[(&str, &str)]) -> Result<Vec<BodyRow>, Vec<String>> {
+        if corpus.is_empty() {
+            return Err(vec![
+                "EMPTY census corpus: the population face refuses a vacuous walk \
+                 (absence of sources must never read as absence of bodies)"
+                    .to_string(),
+            ]);
+        }
+        // The test-plane files leave the WHOLE derivation universe
+        // (loop enumeration AND the reach map): their fns never
+        // compile into production, and name-merged reach through a
+        // test body would manufacture phantom sink chains.
+        let corpus: Vec<(&str, &str)> = corpus
+            .iter()
+            .filter(|(f, _)| !TEST_PLANE_FILES.contains(f))
+            .copied()
+            .collect();
+        let corpus = corpus.as_slice();
+        let bodies = fn_bodies(corpus);
+        let consts = const_texts(corpus);
+        let mut ctx = ReachCtx {
+            bodies: &bodies,
+            consts: &consts,
+            memo: Default::default(),
+            in_progress: Default::default(),
+        };
+        let mut rows = Vec::new();
+        let mut errors = Vec::new();
+        for (file, src) in corpus {
+            let text: String = code_lines(src).join("\n");
+            for (fn_name, header, fbody) in fns_with_sigs(&text) {
+                // Typed exemption: a fn that demands BatchAuthority is
+                // ONE batch — its internal loops ride the caller's
+                // token (sweep_one_batch's lock/delete passes).
+                if header.contains("BatchAuthority") {
+                    continue;
+                }
+                // Typed exemption: the sink-layer impls themselves
+                // (the caller's token funded the call).
+                if fn_name == "delete_batch" || fn_name == "delete_by_key" {
+                    continue;
+                }
+                for lbody in loops_in(&fbody) {
+                    let reach = match ctx.body_reach(&lbody) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            errors.push(format!("{file}: fn {fn_name}: {e}"));
+                            continue;
+                        }
+                    };
+                    let Some(evidence) = reach else { continue };
+                    let demand = if lbody.contains("authorize_batch(") {
+                        "in-loop".to_string()
+                    } else {
+                        // Every DIRECT sink-reaching callee must
+                        // self-authorize; a direct sink token in the
+                        // loop body itself is then unlawful.
+                        match durable_sink_in(&lbody) {
+                            Err(e) => {
+                                errors.push(format!("{file}: fn {fn_name}: {e}"));
+                                continue;
+                            }
+                            Ok(Some(tok)) => {
+                                errors.push(format!(
+                                    "{file}: fn {fn_name}: destructive loop without \
+                                     per-batch authority (direct sink `{tok}`, no \
+                                     authorize_batch in the loop body) — wire the \
+                                     token or register the exemption"
+                                ));
+                                continue;
+                            }
+                            Ok(None) => {}
+                        }
+                        let (calls, crefs) = refs_in(&lbody);
+                        for cn in &crefs {
+                            if let Some(ct) = consts.get(cn)
+                                && matches!(durable_sink_in(ct), Ok(Some(_)))
+                            {
+                                errors.push(format!(
+                                    "{file}: fn {fn_name}: destructive loop without \
+                                     per-batch authority (sink via const `{cn}`, no \
+                                     authorize_batch in the loop body)"
+                                ));
+                            }
+                        }
+                        let mut lawful_via: Vec<String> = Vec::new();
+                        let mut unlawful = Vec::new();
+                        for callee in calls {
+                            if !bodies.contains_key(&callee) {
+                                continue;
+                            }
+                            match ctx.fn_reach(&callee) {
+                                Err(e) => errors.push(format!("{file}: fn {fn_name}: {e}")),
+                                Ok(Some(_)) => {
+                                    let mut prog = Default::default();
+                                    match sink_path_lawful(&callee, &mut ctx, &mut prog) {
+                                        Err(e) => errors.push(format!("{file}: fn {fn_name}: {e}")),
+                                        Ok(true) => lawful_via.push(callee),
+                                        Ok(false) => unlawful.push(callee),
+                                    }
+                                }
+                                Ok(None) => {}
+                            }
+                        }
+                        if !unlawful.is_empty() {
+                            unlawful.sort();
+                            unlawful.dedup();
+                            errors.push(format!(
+                                "{file}: fn {fn_name}: destructive loop without \
+                                 per-batch authority (sink via {unlawful:?}, which \
+                                 do not self-authorize; evidence: {evidence})"
+                            ));
+                            continue;
+                        }
+                        if lawful_via.is_empty() {
+                            errors.push(format!(
+                                "{file}: fn {fn_name}: destructive loop with \
+                                 unattributable sink reach ({evidence}) — \
+                                 extend the grammar, never skip"
+                            ));
+                            continue;
+                        }
+                        lawful_via.sort();
+                        lawful_via.dedup();
+                        format!("via:{}", lawful_via.join(","))
+                    };
+                    rows.push(BodyRow {
+                        file: file.to_string(),
+                        fn_name: fn_name.clone(),
+                        demand,
+                    });
+                }
+            }
+        }
+        rows.sort();
+        rows.dedup();
+        if errors.is_empty() {
+            if rows.is_empty() {
+                return Err(vec![
+                    "ZERO destructive bodies derived from a non-empty corpus: \
+                     the population face refuses (the walk found none of the \
+                     known bodies — the grammar broke, not the tree)"
+                        .to_string(),
+                ]);
+            }
+            Ok(rows)
+        } else {
+            errors.sort();
+            errors.dedup();
+            Err(errors)
+        }
+    }
+
+    // r[verify store.gc.batch-authority]
+    /// THE body census (bug_084/merged_bug_006, R31): derive every
+    /// multi-batch destructive body from the loop idiom, refuse any
+    /// member without the per-batch demand, verify the six expected
+    /// members by name (the population face: a vacuous walk or a
+    /// missing known member is a red, never a green), and pin the
+    /// full derived set against the committed [GEN-SET].
+    #[test]
+    fn destructive_body_census() {
+        // The typed test-plane exemptions are ASSERTED against their
+        // declaring modules, never assumed: a de-gating (the file
+        // entering production) reds here before it can silently
+        // widen the exempt set.
+        let declaring = |file: &str| {
+            CENSUS_SOURCES
+                .iter()
+                .find(|(f, _)| *f == file)
+                .map(|(_, s)| *s)
+                .expect("declaring module in the corpus")
+        };
+        assert!(
+            declaring("gc/mod.rs").contains("#[cfg(test)]\nmod mark_scan_bench;"),
+            "mark_scan_bench must stay cfg(test)-gated or leave TEST_PLANE_FILES"
+        );
+        assert!(
+            declaring("logs/mod.rs").contains("#[cfg(test)]\nmod mbt_tests;"),
+            "mbt_tests must stay cfg(test)-gated or leave TEST_PLANE_FILES"
+        );
+        assert!(
+            declaring("lib.rs")
+                .contains("#[cfg(any(test, feature = \"test-utils\"))]\npub mod test_helpers;"),
+            "test_helpers must stay test-gated or leave TEST_PLANE_FILES"
+        );
+
+        let rows = derive_destructive_bodies(CENSUS_SOURCES).unwrap_or_else(|refusals| {
+            panic!(
+                "body census REFUSED (fail-closed): every destructive loop \
+                 must demand per-batch authority (or carry a typed \
+                 exemption): {refusals:#?}"
+            )
+        });
+
+        // Population face: the six bodies the law names, verified in
+        // the DERIVED set (expected members are verification targets
+        // for the generator, never the enforcement population).
+        for (file, fn_name) in [
+            ("gc/collect.rs", "collect_cycle"),
+            ("gc/collect.rs", "run_post_drain_tail"),
+            ("gc/drain.rs", "drain_once"),
+            ("gc/orphan.rs", "scan_once"),
+            ("gc/sweep.rs", "sweep"),
+            ("logs/sweep.rs", "sweep_expired_logs"),
+        ] {
+            assert!(
+                rows.iter().any(|r| r.file == file && r.fn_name == fn_name),
+                "expected body {file}::{fn_name} missing from the derived \
+                 set — the generator lost a known member: {rows:#?}"
+            );
+        }
+
+        // The committed [GEN-SET]: the derived rows, exactly.
+        let derived: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{}\t{}\t{}", r.file, r.fn_name, r.demand))
+            .collect();
+        let committed = include_str!("../../tests/gensets/destructive-body-census.txt");
+        let committed: Vec<String> = committed
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            derived, committed,
+            "body census drifted — review the new/removed destructive \
+             loop(s) against store.gc.batch-authority (every multi-batch \
+             destructive body demands the token), then regenerate \
+             rio-store/tests/gensets/destructive-body-census.txt (the \
+             failure output above IS the new content)"
+        );
+    }
+
+    // r[verify store.gc.batch-authority]
+    /// W12-P2, the three-face plant battery (census riders (b)):
+    /// (1) ENROLLMENT plant — an in-grammar until-short DELETE loop
+    /// without the token REDs through the production walk; the
+    /// authorized control classifies lawful (both polarities pinned).
+    /// (2) JURISDICTION tooth — a hand-narrowed corpus loses a known
+    /// member (the whole-crate corpus + the live-tree pin are the
+    /// jurisdiction derivation; a strawman hand list goes red against
+    /// the expected-member verification).
+    /// (3) GRAMMAR-REFUSAL plant — a dynamic DELETE target the
+    /// grammar cannot attribute ERRORS naming the site, never greens.
+    /// Plus the empty-walk plant (census riders (a)): a vacuous
+    /// corpus refuses through the SAME walk path.
+    #[test]
+    fn body_census_plants() {
+        // (1a) The rogue: an until-short committed DELETE loop, no
+        // authority anywhere on the path.
+        let rogue = r#"
+async fn rogue_reaper(pool: &PgPool) -> Result<(), sqlx::Error> {
+    loop {
+        let mut tx = pool.begin().await?;
+        let n = sqlx::query("DELETE FROM narinfo WHERE stale LIMIT 10")
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        if n < 10 {
+            break;
+        }
+    }
+    Ok(())
+}
+"#;
+        let mut corpus: Vec<(&str, &str)> = CENSUS_SOURCES.to_vec();
+        corpus.push(("rogue.rs", rogue));
+        let err = derive_destructive_bodies(&corpus)
+            .expect_err("the unauthorized destructive loop MUST red the census");
+        assert!(
+            err.iter()
+                .any(|e| e.contains("rogue.rs") && e.contains("rogue_reaper")),
+            "the refusal names the planted site: {err:#?}"
+        );
+
+        // (1b) The authorized control: the same loop with the
+        // boundary demand classifies lawful (polarity pinned).
+        let control = r#"
+async fn lawful_reaper(
+    pool: &PgPool,
+    clearance: &mut crate::gc::hold::HoldClearance,
+) -> Result<(), sqlx::Error> {
+    loop {
+        let authority = match clearance.authorize_batch(pool).await? {
+            crate::gc::hold::BatchAuthorize::Authorized(a) => a,
+            _refused => break,
+        };
+        authority.spend();
+        let mut tx = pool.begin().await?;
+        let n = sqlx::query("DELETE FROM narinfo WHERE stale LIMIT 10")
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        if n < 10 {
+            break;
+        }
+    }
+    Ok(())
+}
+"#;
+        let mut corpus2: Vec<(&str, &str)> = CENSUS_SOURCES.to_vec();
+        corpus2.push(("control.rs", control));
+        let rows =
+            derive_destructive_bodies(&corpus2).expect("the authorized control classifies lawful");
+        assert!(
+            rows.iter().any(|r| r.file == "control.rs"
+                && r.fn_name == "lawful_reaper"
+                && r.demand == "in-loop"),
+            "the control enrolls with its demand form: {rows:#?}"
+        );
+
+        // (2) The jurisdiction tooth: a hand-narrowed corpus (the
+        // strawman population) loses a known member — exactly what
+        // the whole-crate corpus + live-tree pin forbid.
+        let narrowed: Vec<(&str, &str)> = CENSUS_SOURCES
+            .iter()
+            .filter(|(f, _)| *f != "logs/sweep.rs")
+            .copied()
+            .collect();
+        let rows = derive_destructive_bodies(&narrowed)
+            .expect("the narrowed corpus still derives (its gap is the point)");
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.file == "logs/sweep.rs" && r.fn_name == "sweep_expired_logs"),
+            "a hand-narrowed population silently loses the log sweep — \
+             the expected-member verification in the census proper is \
+             what makes this shape impossible against the live tree"
+        );
+
+        // (3) The grammar-refusal plant: a dynamic DELETE target the
+        // walk cannot attribute must ERROR naming the site.
+        let evader = r#"
+async fn dynamic_deleter(pool: &PgPool, table: &str) -> Result<(), sqlx::Error> {
+    loop {
+        let sql = format!("DELETE FROM {table} WHERE stale LIMIT 10");
+        let n = sqlx::query(&sql).execute(pool).await?.rows_affected();
+        if n < 10 {
+            break;
+        }
+    }
+    Ok(())
+}
+"#;
+        let mut corpus3: Vec<(&str, &str)> = CENSUS_SOURCES.to_vec();
+        corpus3.push(("evader.rs", evader));
+        let err = derive_destructive_bodies(&corpus3)
+            .expect_err("an unattributable DELETE target must refuse, never green");
+        assert!(
+            err.iter().any(|e| e.contains("evader.rs")),
+            "the refusal names the evading site: {err:#?}"
+        );
+
+        // (a) The empty-walk plant, through the SAME walk path.
+        let err = derive_destructive_bodies(&[])
+            .expect_err("a vacuous walk must refuse (population non-vacuity)");
+        assert!(
+            err[0].contains("EMPTY census corpus"),
+            "the vacuity refusal is typed: {err:#?}"
         );
     }
 }

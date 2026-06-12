@@ -425,3 +425,20 @@ under this rule.
   builder-side witness pins the discharge against the producing
   formula, and the store-side carrier census keeps every producer
   routed through it.
+
+- *GC batch authority (store)*: the per-batch hold re-authorization verdict
+  was advisory data --- a unit `Authorized` arm a body could match and
+  ignore (the log sweep discarded its whole lane clearance as
+  `move |_clearance|`), and two of six multi-batch destructive bodies
+  shipped outside the hand-wired demand, defeating the operator's emergency
+  stop mid-pass (bug_084, merged_bug_006). The obligation is now the linear
+  `BatchAuthority` token (#rref("store.gc.batch-authority")): minted solely
+  by the boundary consult, non-clonable, demanded BY VALUE at every
+  destructive sink, spent exactly once per batch --- a destructive batch
+  outside an authorized boundary does not compile, and the body population
+  the demand quantifies over is DERIVED by the destructive-body census
+  (R31), never author-listed. Witnessed mid-pass at every derived body:
+  the path sweep, the log sweep, the collect drain, the post-drain reap,
+  the per-row S3 drain, and the orphan scan each stop at their next batch
+  boundary under a hold landed between committed batches, and release
+  drains the remainder (suspension never converts into lost work).

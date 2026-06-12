@@ -736,7 +736,7 @@ pub(crate) static COLLECT_HOLD_AFTER_BATCHES: std::sync::atomic::AtomicU64 =
 /// aborted (parse-failure) cycle is counted by its own counter and the
 /// `outcome="parse_failure"` cycle counter instead.
 // r[impl store.gc.chunk-collect]
-// r[impl store.gc.hold-lanes+1]
+// r[impl store.gc.hold-lanes+2]
 // r[impl store.gc.clearance-expiry]
 #[instrument(skip(pool, chunk_backend, clearance))]
 pub(crate) async fn collect_cycle(
@@ -1300,6 +1300,14 @@ pub(crate) async fn collect_cycle(
 pub(crate) static REAP_FAIL_INJECT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test-only mid-reap hold interposition (W12-O3): when set to N > 0,
+/// a GLOBAL hold is inserted through the production `hold::set_hold`
+/// statement immediately after the reap commits its Nth batch — the
+/// exact "hold lands between two committed reap batches" schedule.
+#[cfg(test)]
+pub(crate) static REAP_HOLD_AFTER_BATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// The post-drain tail (bug_137): tombstone reap + mark-table cleanup,
 /// strictly lower priority than the drain they trail. NO ERROR
 /// CHANNEL — the signature returns the reap count and consumes the
@@ -1395,6 +1403,23 @@ async fn run_post_drain_tail(
                 }
                 metrics::counter!("rio_store_gc_chunks_reaped_total").increment(reaped);
                 chunks_reaped += reaped;
+                #[cfg(test)]
+                {
+                    use std::sync::atomic::Ordering;
+                    let hold_after = REAP_HOLD_AFTER_BATCHES.load(Ordering::SeqCst);
+                    if hold_after > 0 && chunks_reaped >= hold_after {
+                        REAP_HOLD_AFTER_BATCHES.store(0, Ordering::SeqCst);
+                        super::hold::set_hold(
+                            pool,
+                            super::hold::GcHoldScope::Global,
+                            "w12-o3 mid-reap hold (test interpose)",
+                            "reap-test-hook",
+                            None,
+                        )
+                        .await
+                        .expect("test interpose: set_hold");
+                    }
+                }
             }
             Err(e) => {
                 warn!(
@@ -1448,7 +1473,7 @@ async fn run_post_drain_tail(
 /// so a cycle that JUST committed is not repeated). Returns `Ok(None)`
 /// when not due or when another holder has the lease.
 // r[impl store.gc.collect-cadence+5]
-// r[impl store.gc.hold-lanes+1]
+// r[impl store.gc.hold-lanes+2]
 pub(crate) async fn collect_backstop_once(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
@@ -1598,7 +1623,7 @@ pub fn spawn_collect_backstop(
         COLLECT_BACKSTOP_CHECK_INTERVAL,
     );
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // r[impl store.gc.hold-lanes+1]
+    // r[impl store.gc.hold-lanes+2]
     // Registered through DestructiveLane (merged_bug_050): pre-fix
     // the backstop ran un-consulted, and a held run_gc starving
     // last_live_cycle_at GUARANTEED it came due and minted fresh
@@ -3975,7 +4000,7 @@ mod tests {
     }
 
     // r[verify store.gc.clearance-expiry]
-    // r[verify store.gc.hold-lanes+1]
+    // r[verify store.gc.hold-lanes+2]
     /// W11-AM face 1 (merged_bug_067, the re-consult face): a global
     /// hold landing BETWEEN two committed batches of the heaviest
     /// lane's own body — the backstop's live collect cycle, at its
@@ -5381,5 +5406,91 @@ mod tests {
             "the clean shadow session goes back to the pool, not detached"
         );
         assert!(db.pool.num_idle() >= 1, "the released connection is idle");
+    }
+
+    // r[verify store.gc.batch-authority]
+    /// W12-O3 (bug_084, the post-drain-reap cell of the derived
+    /// mid-cycle matrix): a global hold landing BETWEEN two committed
+    /// reap batches stops the NEXT batch at its boundary — post-hold
+    /// tombstone hard-deletes are bounded by zero further batches,
+    /// the cycle still commits (the tail has no error channel), and
+    /// the next un-held cycle reaps the remainder.
+    #[tokio::test]
+    async fn mid_reap_hold_stops_tombstone_reap_at_the_batch_boundary() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+        let grace = super::super::sweep::CHUNK_GRACE_SECS;
+
+        // Reap-eligible tombstones spanning two reap batches (test
+        // consts: cap 50, batch 25): tombstoned, aged past grace,
+        // drained (no outbox row).
+        let n = (COLLECT_BATCH_LIMIT + 5) as u8;
+        for tag in 0..n {
+            let h = ChunkSeed::new(0x80 + tag).uploaded().seed(&db.pool).await;
+            sqlx::query(
+                "UPDATE chunks SET deleted = TRUE, \
+                 deleted_at = now() - make_interval(secs => $2) \
+                 WHERE blake3_hash = $1",
+            )
+            .bind(&h[..])
+            .bind((grace + 100) as f64)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        REAP_HOLD_AFTER_BATCHES.store(COLLECT_BATCH_LIMIT, std::sync::atomic::Ordering::SeqCst);
+        let report = collect_cycle(
+            &db.pool,
+            Some(&backend),
+            grace,
+            CollectMode::Live,
+            None,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .expect("the held-tail cycle still commits");
+        assert_eq!(
+            report.chunks_reaped, COLLECT_BATCH_LIMIT,
+            "exactly the pre-hold reap batch commits; batch 2 refuses \
+             at its boundary"
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE deleted")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining as u64,
+            u64::from(n) - COLLECT_BATCH_LIMIT,
+            "the surviving tombstones are untouched"
+        );
+
+        // Release; the next cycle's fresh clearance reaps the rest.
+        let hold_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT hold_id FROM gc_holds WHERE created_by = 'reap-test-hook'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(
+            super::super::hold::release_hold(&db.pool, hold_id)
+                .await
+                .unwrap()
+        );
+        let report2 = collect_cycle(
+            &db.pool,
+            Some(&backend),
+            grace,
+            CollectMode::Live,
+            None,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .expect("post-release cycle");
+        assert_eq!(
+            report2.chunks_reaped,
+            u64::from(n) - COLLECT_BATCH_LIMIT,
+            "release => the remainder reaps"
+        );
     }
 }

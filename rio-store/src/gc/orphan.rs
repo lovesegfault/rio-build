@@ -60,6 +60,14 @@ const SCAN_BATCH_SIZE: i64 = 1000;
 #[cfg(test)]
 const SCAN_BATCH_SIZE: i64 = 2;
 
+/// Test-only mid-scan hold interposition (W12-O5): when set to N > 0,
+/// a GLOBAL hold is inserted through the production `hold::set_hold`
+/// statement immediately after the Nth reap commits — the exact
+/// "hold lands between two per-row reaps" schedule.
+#[cfg(test)]
+pub(crate) static SCAN_HOLD_AFTER_REAPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Selector for [`reap_one`]. Replaces the old `Option<i64>` threshold —
 /// `None` ("this is mine, no stale check") was not an ownership check:
 /// `manifests` is keyed by `store_path_hash` alone, so a late-firing
@@ -176,6 +184,25 @@ pub async fn scan_once(
                 Ok(true) => {
                     reaped += 1;
                     progressed += 1;
+                    #[cfg(test)]
+                    {
+                        use std::sync::atomic::Ordering;
+                        let hold_after = SCAN_HOLD_AFTER_REAPS.load(Ordering::SeqCst);
+                        if hold_after > 0 {
+                            let fired = SCAN_HOLD_AFTER_REAPS.fetch_sub(1, Ordering::SeqCst);
+                            if fired == 1 {
+                                crate::gc::hold::set_hold(
+                                    pool,
+                                    crate::gc::hold::GcHoldScope::Global,
+                                    "w12-o5 mid-scan hold (test interpose)",
+                                    "orphan-test-hook",
+                                    None,
+                                )
+                                .await
+                                .expect("test interpose: set_hold");
+                            }
+                        }
+                    }
                 }
                 // Row left the predicate independently (reaped by
                 // another replica / no longer stale).
@@ -251,7 +278,7 @@ pub async fn scan_once(
 /// advisory (a discarded proof, the merged_bug_006 shape one plane
 /// over); the consumed token is not discardable.
 // r[impl store.put.placeholder-claim+2]
-// r[impl store.gc.hold-lanes+1]
+// r[impl store.gc.hold-lanes+2]
 // r[impl store.gc.batch-authority]
 pub(crate) async fn reap_one(
     pool: &PgPool,
@@ -396,7 +423,7 @@ pub(crate) async fn reap_one(
     Ok(true)
 }
 
-// r[impl store.gc.hold-lanes+1]
+// r[impl store.gc.hold-lanes+2]
 /// The DEMAND-DRIVEN face of [`reap_one`] (merged_bug_050): the
 /// non-periodic callers — `abort_placeholder`, the PutPath
 /// drop-guard, the hot-path stale-reclaim, and the cas rollback
@@ -494,7 +521,7 @@ pub fn spawn_scanner(
     pool: PgPool,
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
-    // r[impl store.gc.hold-lanes+1]
+    // r[impl store.gc.hold-lanes+2]
     // Registered through DestructiveLane (merged_bug_050): every
     // tick consults the gc-hold gate fail-closed before reaping —
     // reaping during an incident freeze destroys evidence of
@@ -1272,5 +1299,68 @@ mod tests {
             !joined.contains("Seq Scan on manifests"),
             "EXPLAIN plan should NOT seq-scan manifests; got:\n{joined}"
         );
+    }
+
+    // r[verify store.gc.batch-authority]
+    /// W12-O5 (bug_084, the orphan-scan cell of the derived mid-cycle
+    /// matrix): a global hold landing BETWEEN two per-row reaps stops
+    /// the NEXT reap at its boundary — post-hold placeholder
+    /// deletions are bounded by zero further rows (during a freeze a
+    /// placeholder row is evidence of an attempted upload). Release
+    /// heals: the next tick reaps the remainder.
+    #[tokio::test]
+    async fn mid_scan_hold_stops_orphan_reaps_at_the_row_boundary() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        for tag in [0x61u8, 0x62, 0x63] {
+            let hash = vec![tag; 32];
+            let path = rio_test_support::fixtures::test_store_path(&format!("w12o5-{tag}"));
+            crate::metadata::insert_manifest_uploading(&db.pool, &hash, &path, &[])
+                .await
+                .unwrap()
+                .expect("placeholder inserted");
+        }
+        // Backdate past the (test) stale threshold.
+        sqlx::query("UPDATE manifests SET updated_at = now() - interval '1 hour'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        SCAN_HOLD_AFTER_REAPS.store(1, std::sync::atomic::Ordering::SeqCst);
+        let (reaped, failed) = scan_once(
+            &db.pool,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (reaped, failed),
+            (1, 0),
+            "exactly the pre-hold reap commits; the next refuses at its boundary"
+        );
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE status = 'uploading'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, 2, "the surviving placeholders are untouched");
+
+        let hold_id: uuid::Uuid = sqlx::query_scalar(
+            "SELECT hold_id FROM gc_holds WHERE created_by = 'orphan-test-hook'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            crate::gc::hold::release_hold(&db.pool, hold_id)
+                .await
+                .unwrap()
+        );
+        let (reaped, _) = scan_once(
+            &db.pool,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reaped, 2, "release => the remainder reaps");
     }
 }

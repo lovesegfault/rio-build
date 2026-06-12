@@ -56,7 +56,7 @@ pub(crate) const DRAIN_INTERVAL: Duration = Duration::from_secs(30);
 /// time, equivalent under contention. If a per-row tx rolls back, the
 /// S3 delete that already happened is re-processed next iteration (S3
 /// delete of a non-existent key is a no-op).
-// r[impl store.gc.hold-lanes+1]
+// r[impl store.gc.hold-lanes+2]
 // r[impl store.gc.clearance-expiry]
 pub async fn drain_once(
     pool: &PgPool,
@@ -100,7 +100,27 @@ pub async fn drain_once(
                 break;
             }
         };
-        match drain_one_row(pool, backend, &seen, authority).await? {
+        let row_outcome = drain_one_row(pool, backend, &seen, authority).await?;
+        #[cfg(test)]
+        if row_outcome.is_some() {
+            use std::sync::atomic::Ordering;
+            let hold_after = DRAIN_HOLD_AFTER_ROWS.load(Ordering::SeqCst);
+            if hold_after > 0 {
+                let fired = DRAIN_HOLD_AFTER_ROWS.fetch_sub(1, Ordering::SeqCst);
+                if fired == 1 {
+                    crate::gc::hold::set_hold(
+                        pool,
+                        crate::gc::hold::GcHoldScope::Global,
+                        "w12-o4 mid-iteration hold (test interpose)",
+                        "drain-test-hook",
+                        None,
+                    )
+                    .await
+                    .expect("test interpose: set_hold");
+                }
+            }
+        }
+        match row_outcome {
             None => break,
             Some((id, DrainOutcome::Deleted)) => {
                 seen.push(id);
@@ -148,6 +168,15 @@ pub async fn drain_once(
 
     Ok((deleted, failed))
 }
+
+/// Test-only mid-iteration hold interposition (W12-O4): when set to
+/// N > 0, a GLOBAL hold is inserted through the production
+/// `hold::set_hold` statement immediately after the Nth processed
+/// row commits — the exact "hold lands between two per-row
+/// transactions" schedule.
+#[cfg(test)]
+pub(crate) static DRAIN_HOLD_AFTER_ROWS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Outcome of one [`drain_one_row`] transaction.
 enum DrainOutcome {
@@ -321,7 +350,7 @@ pub fn spawn_drain_task(
     backend: Arc<dyn ChunkBackend>,
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
-    // r[impl store.gc.hold-lanes+1]
+    // r[impl store.gc.hold-lanes+2]
     // Registered through DestructiveLane (merged_bug_050): during an
     // active global hold the drain HOLDS its queue —
     // pending_s3_deletes rows age, never execute — so the
@@ -395,6 +424,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 0, "pending row deleted");
+    }
+
+    // r[verify store.gc.batch-authority]
+    /// W12-O4 (bug_084, the drain cell of the derived mid-cycle
+    /// matrix): a global hold landing BETWEEN two per-row drain
+    /// transactions stops the NEXT row at its boundary — post-hold
+    /// S3 deletions are bounded by zero further rows. Release heals:
+    /// the next tick's fresh clearance drains the remainder.
+    #[tokio::test]
+    async fn mid_iteration_hold_stops_drain_at_the_row_boundary() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+        let mut keys = Vec::new();
+        for tag in [0xD1u8, 0xD2, 0xD3] {
+            let hash = [tag; 32];
+            backend
+                .put(&hash, bytes::Bytes::from_static(b"mid-iter-prey"))
+                .await
+                .unwrap();
+            let key = backend.key_for(&hash);
+            sqlx::query("INSERT INTO pending_s3_deletes (s3_key) VALUES ($1)")
+                .bind(&key)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            keys.push((hash, key));
+        }
+
+        DRAIN_HOLD_AFTER_ROWS.store(1, std::sync::atomic::Ordering::SeqCst);
+        let (deleted, failed) = drain_once(
+            &db.pool,
+            &backend,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (deleted, failed),
+            (1, 0),
+            "exactly the pre-hold row drains; the next row refuses at \
+             its boundary"
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_s3_deletes")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 2, "the queue HOLDS (rows age, never execute)");
+
+        // Release + a fresh tick clearance drains the remainder.
+        let hold_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT hold_id FROM gc_holds WHERE created_by = 'drain-test-hook'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(
+            crate::gc::hold::release_hold(&db.pool, hold_id)
+                .await
+                .unwrap()
+        );
+        let (deleted, _) = drain_once(
+            &db.pool,
+            &backend,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted, 2, "release => the remainder drains");
     }
 
     #[tokio::test]
