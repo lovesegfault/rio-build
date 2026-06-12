@@ -568,7 +568,7 @@ def _extent_end(lexed: str, attr_start: int, i: int, source: str) -> int:
     # :1371 specimen).
     #
     # ANGLE TRACKING IS TOKEN-ADJACENCY CLASSIFIED (WO-S8-1, bug_049):
-    # the old walk counted EVERY `<` as a generic opener, so a spaced
+    # the old walk counted every `<` as a generic opener, so a spaced
     # comparison (`a < b;`) opened a phantom angle run whose `;` never
     # terminated — the extent silently swallowed the FOLLOWING
     # production statement when a later stray `>` re-balanced it
@@ -612,7 +612,7 @@ def _extent_end(lexed: str, attr_start: int, i: int, source: str) -> int:
                 return j + 1
             # The if/else-initializer cell (bug_049's live corroboration,
             # gc/collect.rs:1371): a brace group followed by `else`
-            # continues the SAME expression — ending here left the
+            # continues the same expression — ending here left the
             # dangling `else {…};` unblanked (under-blank residue).
             m_else = _WORD_RE.match(lexed, j)
             if m_else and m_else.group(0) == "else":
@@ -867,7 +867,7 @@ CFG_REFUSAL_VECTORS = [
 # exist only where block expressions do; discriminants and field
 # inits are expression positions; guards ride match arms). Per cell
 # the vector embeds the gated payload and a production neighbor; the
-# walk must blank exactly the payload — refuse-or-correct, NEVER a
+# walk must blank exactly the payload — refuse-or-correct, never a
 # silent neighbor blank (W12-AY). The pre-fix reds (every-`<`-opens
 # walk): lt-cmp/Statement silently blanked the FOLLOWING production
 # statement; shl/Variant raised a false StripError on `1 << 4`;

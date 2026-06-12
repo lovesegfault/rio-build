@@ -568,6 +568,25 @@ def selftest() -> list[str]:
     return misses
 
 
+def floor_fails(src_root: pathlib.Path) -> list[str]:
+    """Population floor (WO-S8-3, merged_bug_028): every declared
+    SCAN_ROOTS entry must resolve and stage at least one .rs file --
+    the walk previously skipped missing roots silently (pathlib
+    fails open at zero matches). On a correctly staged tree the
+    floor cannot false-positive."""
+    fails = []
+    for root in SCAN_ROOTS:
+        droot = src_root / root
+        if not droot.is_dir():
+            fails.append(
+                f"population floor -- declared root {root} does not "
+                f"resolve ((vvvvv))"
+            )
+        elif not any(droot.rglob("*.rs")):
+            fails.append(f"population floor -- zero .rs files under {root}")
+    return fails
+
+
 def main() -> int:
     shared_err = rust_strip.selftest()
     if shared_err:
@@ -582,11 +601,22 @@ def main() -> int:
     census_mode = "--census" in args
     args = [a for a in args if a != "--census"]
     src_root = pathlib.Path(args[0])
+    # The floor's own plant (WO-S8-3 / W12-BA): an empty root REDS.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        ff = floor_fails(pathlib.Path(td))
+        if len(ff) != len(SCAN_ROOTS):
+            print(f"FAIL: population-floor plant did not red per root: {ff}", file=sys.stderr)
+            return 1
+    floors = floor_fails(src_root)
+    if floors:
+        for x in floors:
+            print(f"FAIL: {x}", file=sys.stderr)
+        return 1
     files: dict[str, str] = {}
     for root in SCAN_ROOTS:
         droot = src_root / root
-        if not droot.exists():
-            continue
         for f in sorted(droot.rglob("*.rs")):
             files[str(f.relative_to(src_root))] = f.read_text()
     errors, fails, sanctioned, census = scan_files(files)

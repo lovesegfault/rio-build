@@ -195,7 +195,38 @@ def collect(root: Path):
     return hits, all_tags, lexed_corpus
 
 
+def floor_fails(root: Path, grandfather_path, mint: bool) -> list[str]:
+    """Population floor (WO-S8-3, merged_bug_028): the rio-*/src walk
+    must resolve at least one crate root and one file (pathlib globs
+    fail open at zero matches), and an EXPLICITLY-passed grandfather
+    ledger must resolve outside mint mode -- a missing ledger
+    previously defaulted to EMPTY, so one broken $src emptied scan
+    AND backstop together. On a correctly staged tree the floors
+    cannot false-positive."""
+    fails = []
+    crate_roots = sorted(root.glob("rio-*/src"))
+    if not crate_roots:
+        fails.append(
+            "population floor -- zero rio-*/src roots resolved under the "
+            "scan root (mis-staged tree? ((vvvvv)))"
+        )
+    elif not any(True for _ in scan_files(root)):
+        fails.append("population floor -- the rio-*/src walk yielded zero files")
+    if not mint and grandfather_path is not None and not grandfather_path.is_file():
+        fails.append(
+            f"population floor -- explicitly-passed grandfather ledger "
+            f"{grandfather_path} does not resolve; staging rot, never an "
+            f"empty backstop ((vvvvv))"
+        )
+    return fails
+
+
 def run(root: Path, grandfather_path: Path | None, mint: bool) -> int:
+    floors = floor_fails(root, grandfather_path, mint)
+    if floors:
+        for x in floors:
+            print(f"FAIL: {x}", file=sys.stderr)
+        return 1
     hits, all_tags, lexed_corpus = collect(root)
     corpus_blob = "\n".join(lexed_corpus)
     failures: list[str] = []
@@ -296,6 +327,19 @@ def selftest(tmp: Path) -> str | None:
             contextlib.redirect_stderr(io.StringIO()),
         ):
             return run(tmp, gf, mint=False)
+
+    # (A0, WO-S8-3 / W12-BA) population floors: an empty root reds the
+    # walk; a missing explicitly-passed ledger reds outside mint mode.
+    import tempfile as _tf
+
+    with _tf.TemporaryDirectory() as _etd:
+        _e = Path(_etd)
+        ff = floor_fails(_e, _e / "no-ledger.txt", mint=False)
+        if len(ff) != 2:
+            return f"floor plant: expected walk+ledger reds, got {ff}"
+        ff = floor_fails(_e, _e / "no-ledger.txt", mint=True)
+        if len(ff) != 1:
+            return f"floor plant: mint mode must exempt only the ledger arm, got {ff}"
 
     # (A) unenrolled claim -> fail.
     write("// the helper has exactly one caller in the dispatch path\nfn planted() {}\n")

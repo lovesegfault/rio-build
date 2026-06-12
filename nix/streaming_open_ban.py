@@ -249,6 +249,26 @@ def selftest(pat: re.Pattern, tokens: set[str]) -> str | None:
     return None
 
 
+def floor_walk_fails(src_root: pathlib.Path) -> list[str]:
+    """Population floor (WO-S8-3, merged_bug_028): every declared
+    daemon crate must resolve and stage at least one .rs file
+    -- pathlib rglob fails open at zero matches, so a mis-staged
+    tree previously shrank the ban's population silently. On a
+    correctly staged tree the floor cannot false-positive."""
+    fails = []
+    for crate in DAEMON_CRATES:
+        croot = src_root / crate / "src"
+        if not croot.is_dir():
+            fails.append(
+                f"population floor -- declared crate root {crate}/src does "
+                f"not resolve ((vvvvv))"
+            )
+            continue
+        if not any(croot.rglob("*.rs")):
+            fails.append(f"population floor -- zero .rs files under {crate}/src")
+    return fails
+
+
 def main() -> int:
     fds_path, src_root = sys.argv[1], pathlib.Path(sys.argv[2])
     tokens = banned_tokens(fds_path)
@@ -266,10 +286,22 @@ def main() -> int:
         print(f"FAIL: streaming-open-ban self-test — {err}", file=sys.stderr)
         return 1
 
-    fails = []
+    # The floor's own plant (WO-S8-3 / W12-BA): an empty root REDS.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        ff = floor_walk_fails(pathlib.Path(td))
+        if len(ff) != len(DAEMON_CRATES):
+            print(f"FAIL: population-floor plant did not red per crate: {ff}", file=sys.stderr)
+            return 1
+
+    fails = floor_walk_fails(src_root)
     scanned = 0
     for crate in DAEMON_CRATES:
-        for f in sorted((src_root / crate / "src").rglob("*.rs")):
+        croot = src_root / crate / "src"
+        if not croot.is_dir():
+            continue  # already a floor failure above
+        for f in sorted(croot.rglob("*.rs")):
             rel = str(f.relative_to(src_root))
             # Test code is out of scope: /tests/ submodule dirs and
             # test_helpers.rs are cfg(test)-compiled.

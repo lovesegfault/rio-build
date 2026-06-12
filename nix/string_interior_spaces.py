@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""string-interior-spaces scanner (see nix/misc-checks.nix).
+r"""string-interior-spaces scanner (see nix/misc-checks.nix).
 
 Argv: <src-root> [crate-src-dirs...]. Flags collapsed backslash
 continuations inside .rs string literals (merged_bug_016):
@@ -151,6 +151,34 @@ def selftest() -> str | None:
     return None
 
 
+def walk(src_root: pathlib.Path, roots: list[str]):
+    """The production walk with its population floor (WO-S8-3,
+    merged_bug_028): an explicitly-passed root that does not resolve
+    is an ERROR, never a silent skip, and every declared root must
+    yield at least one file — pathlib globs fail open at zero matches,
+    so a mis-staged tree previously scanned an empty population green
+    ("scanned 0 files", rc 0 — the captured pre-fix red). On a
+    correctly staged tree the floor cannot false-positive: the caller
+    declares only roots that stage .rs files."""
+    files = []
+    floor_fails = []
+    for d in roots:
+        droot = src_root / d
+        if not droot.is_dir():
+            floor_fails.append(
+                f"population floor — declared root {d} does not resolve "
+                f"under the scan root (mis-staged tree? ((vvvvv)))"
+            )
+            continue
+        found = sorted(droot.rglob("*.rs"))
+        if not found:
+            floor_fails.append(f"population floor — zero .rs files under declared root {d}")
+        files.extend(found)
+    if not roots:
+        floor_fails.append("population floor — zero roots declared (vacuous invocation)")
+    return files, floor_fails
+
+
 def main() -> int:
     shared_err = rust_strip.selftest()
     if shared_err:
@@ -160,16 +188,22 @@ def main() -> int:
     if err:
         print(f"FAIL: string-interior-spaces self-test — {err}", file=sys.stderr)
         return 1
+    # The floor's own plant (W12-BA): a deliberately empty root REDS.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        t = pathlib.Path(td)
+        (t / "empty-root").mkdir()
+        _files, ff = walk(t, ["empty-root", "missing-root"])
+        if len(ff) != 2 or "zero .rs files" not in ff[0] or "does not resolve" not in ff[1]:
+            print(f"FAIL: population-floor plant did not red: {ff}", file=sys.stderr)
+            return 1
     src_root = pathlib.Path(sys.argv[1])
-    fails = []
+    files, fails = walk(src_root, sys.argv[2:])
     scanned = 0
-    for d in sys.argv[2:]:
-        droot = src_root / d
-        if not droot.exists():
-            continue  # crate has no .rs files staged (e.g. rio-dashboard)
-        for f in sorted(droot.rglob("*.rs")):
-            scanned += 1
-            fails.extend(scan_text(str(f.relative_to(src_root)), f.read_text()))
+    for f in files:
+        scanned += 1
+        fails.extend(scan_text(str(f.relative_to(src_root)), f.read_text()))
     print(f"string-interior-spaces: scanned {scanned} files (lexer-exact string spans)")
     if fails:
         print(

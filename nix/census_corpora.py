@@ -626,14 +626,29 @@ def duration_finder(files):
 
 def check_duration_census(src_root, mint=False):
     files = []
-    for crate_src in sorted(src_root.glob("rio-*/src")):
+    crate_roots = sorted(src_root.glob("rio-*/src"))
+    fails = []
+    # WO-S8-3 (merged_bug_028): population floor — pathlib globs fail
+    # open at zero matches; a mis-staged tree must red, never scan an
+    # empty population green.
+    if not crate_roots:
+        fails.append(
+            "duration census: population floor — zero rio-*/src roots "
+            "resolved under the scan root (mis-staged tree? ((vvvvv)))"
+        )
+    for crate_src in crate_roots:
+        n_before = len(files)
         for f in sorted(crate_src.rglob("*.rs")):
             rel = str(f.relative_to(src_root))
             if "/tests/" in rel or rel.endswith("test_helpers.rs"):
                 continue
             files.append((rel, f.read_text()))
+        if len(files) == n_before:
+            fails.append(
+                f"duration census: population floor — zero production .rs "
+                f"files under {crate_src.relative_to(src_root)}"
+            )
     found = duration_finder(files)
-    fails = []
     refusals = [(r, n) for r, n, c in found if c == "refusal"]
     for r, n in refusals:
         fails.append(f"{r}: duration finder refused: {n}")
@@ -660,6 +675,12 @@ def check_duration_census(src_root, mint=False):
         f"{rel}\t{name}" for (rel, name) in found_keys if (rel, name) not in DURATION_CENSUS_ROWS
     )
     if mint:
+        if fails:
+            # Floors gate the mint too: minting from a vacuous or
+            # broken population would silently EMPTY the shrink-only
+            # ledger (merged_bug_028's "one broken $src empties scan
+            # AND backstop" face).
+            return ["mint refused: " + x for x in fails]
         gf_path.write_text("".join(k + "\n" for k in unrowed))
         return [f"minted {len(unrowed)} duration-census grandfather entries"]
     grandfathered = set()
@@ -857,14 +878,33 @@ def exit_edge_finder(files):
 
 def check_exit_edge_census(src_root, mint=False):
     files = []
+    floor_fails = []
     for crate in REFUSAL_SCAN_CRATES:
-        for f in sorted((src_root / crate / "src").rglob("*.rs")):
+        croot = src_root / crate / "src"
+        # WO-S8-3 (merged_bug_028): population floor — an enrolled
+        # crate that resolves to nothing (the rio-gateway-as-string
+        # face: a crate named only in this list, never verified to
+        # stage) must red, never silently shrink the census.
+        if not croot.is_dir():
+            floor_fails.append(
+                f"exit-edge census: population floor — declared crate "
+                f"root {crate}/src does not resolve (mis-staged tree or "
+                f"registry rot ((vvvvv)))"
+            )
+            continue
+        n_before = len(files)
+        for f in sorted(croot.rglob("*.rs")):
             rel = str(f.relative_to(src_root))
             if "/tests/" in rel or rel.endswith("test_helpers.rs"):
                 continue
             files.append((rel, f.read_text()))
+        if len(files) == n_before:
+            floor_fails.append(
+                f"exit-edge census: population floor — zero production "
+                f".rs files under {crate}/src"
+            )
     found = exit_edge_finder(files)
-    fails = [ident for rel, idiom, ident in found if idiom == "refusal"]
+    fails = floor_fails + [ident for rel, idiom, ident in found if idiom == "refusal"]
     found_keys = {(r, i, n) for r, i, n in found if i != "refusal"}
     for (rel, idiom, name), (reset, witness) in sorted(EXIT_EDGE_ROWS.items()):
         if (rel, idiom, name) not in found_keys:
@@ -889,6 +929,10 @@ def check_exit_edge_census(src_root, mint=False):
         f"{r}\t{i}\t{n}" for (r, i, n) in found_keys if (r, i, n) not in EXIT_EDGE_ROWS
     )
     if mint:
+        if floor_fails:
+            # Same mint guard as the duration census: a vacuous
+            # population must never empty the shrink-only ledger.
+            return ["mint refused: " + x for x in floor_fails]
         gf_path.write_text("".join(k + "\n" for k in unrowed))
         return [f"minted {len(unrowed)} exit-edge grandfather entries"]
     grandfathered = set()
@@ -1082,6 +1126,87 @@ def scan_retention_notes(src_root):
 
 
 REFUSAL_SCAN_CRATES = ["rio-builder", "rio-store", "rio-gateway", "rio-scheduler", "rio-controller"]
+
+# --- population floors as a REGISTRY invariant (WO-S8-3,
+# merged_bug_028, R31's population clause) ------------------------------
+#
+# pathlib glob/rglob walks fail OPEN at zero matches: a mis-staged
+# root yields an empty population and every census over it goes green
+# vacuously — absence of hits producing absence of evidence, the one
+# failure mode residual-based self-coverage cannot see (the staging
+# rot trigger class occurred once already: the census gen-tag staging
+# fix). Every production walk therefore asserts scanned > 0 per
+# declared root and ERRORS (never defaults empty) on an explicitly
+# passed path that does not resolve — on a correctly staged tree the
+# floors cannot false-positive.
+#
+# THIS TABLE is the registry face: every WALKING nix-side generator
+# enrolls its floor's firing predicate (a regex over the generator
+# source that the floor arm carries); rot reds here, and the reverse
+# arm below makes the enrollment total — a registry-enrolled nix
+# generator whose source carries a pathlib walk but no floor row is
+# itself a red. The two pre-discipline floors (quint-policy's IR
+# canary, rule-citation's zero-rules setup error) enroll with their
+# existing predicates; the nine new floors (the seven scanner walks +
+# the duration and exit-edge census arms) land with this close and
+# their runtime refusals are plant-driven in the self-test battery
+# (W12-BA).
+POPULATION_FLOORS = {
+    # census name (REGISTRY row) -> (file, floor firing-predicate).
+    "string-interior-spaces": ("nix/string_interior_spaces.py", r"population floor"),
+    "streaming-open-ban": ("nix/streaming_open_ban.py", r"population floor"),
+    "metric-reason-help-sync": ("nix/metric_reason_help_sync.py", r"population floor"),
+    "quantifier-lexicon": ("nix/quantifier_lexicon.py", r"population floor"),
+    "census-enrollment": ("nix/census_enrollment.py", r"population floor"),
+    "fixture-provenance": ("nix/fixture_provenance.py", r"population floor"),
+    "wire-secs-pacing-seams": ("nix/census_corpora.py", r"population floor"),
+    "duration-census": ("nix/census_corpora.py", r"duration census: population floor"),
+    "exit-edge-census": ("nix/census_corpora.py", r"exit-edge census: population floor"),
+    # Pre-discipline floors, enrolled with their existing predicates.
+    "quint-policy": ("nix/quint_policy.py", r"def canary\("),
+    "rule-citation-versions": ("nix/rule_citation_versions.py", r"zero rules parsed"),
+}
+_WALK_RE = re.compile(r"\.r?glob\(")
+
+
+def check_population_floors(src_root, floors=None, registry=None):
+    floors = POPULATION_FLOORS if floors is None else floors
+    registry = REGISTRY if registry is None else registry
+    fails = []
+    names = {row[0] for row in registry}
+    for census, (rel, anchor) in sorted(floors.items()):
+        if census not in names:
+            fails.append(
+                f"population floor row `{census}` names no REGISTRY census — "
+                f"floor rows ride enrolled censuses only"
+            )
+            continue
+        f = src_root / rel
+        text = f.read_text() if f.is_file() else ""
+        if not re.search(anchor, text):
+            fails.append(
+                f"population floor `{census}`: firing predicate /{anchor}/ "
+                f"does not resolve in {rel} — the floor arm rotted (the "
+                f"vacuity face is open again)"
+            )
+    # Reverse direction: a registry-enrolled nix-side generator whose
+    # source WALKS (glob/rglob) but has no floor row is the
+    # merged_bug_028 shape one census over — enrollment is total.
+    floored_files = {rel for rel, _a in floors.values()}
+    for name, rel, *_rest in registry:
+        if not rel.startswith("nix/") or not rel.endswith(".py"):
+            continue
+        f = src_root / rel
+        if not f.is_file():
+            continue  # anchor rot is check_registry's arm
+        if _WALK_RE.search(f.read_text()) and rel not in floored_files:
+            fails.append(
+                f"{rel}: registry census `{name}` carries a pathlib walk "
+                f"with no population-floor row — enroll its floor in "
+                f"POPULATION_FLOORS (merged_bug_028: unfloored walks fail "
+                f"open at zero files)"
+            )
+    return fails
 
 
 def main() -> int:
@@ -1403,6 +1528,57 @@ def main() -> int:
     if not any("does not resolve" in x for x in f_sc):
         print(f"FAIL: the dead residual-bind anchor did not red: {f_sc}", file=sys.stderr)
         return 1
+    # --- the population-floor plants (WO-S8-3, merged_bug_028,
+    # W12-BA) — the staged-tree-vacuity battery: a deliberately empty
+    # root REDS each walking census arm, and the mint guard refuses
+    # to empty a shrink-only ledger from a vacuous population. -------
+    with tempfile.TemporaryDirectory() as td:
+        empty_root = pathlib.Path(td)
+        f_floor = check_duration_census(empty_root)
+        if not any("population floor" in x for x in f_floor):
+            print(f"FAIL: W12-BA — empty root did not red the duration census: {f_floor}", file=sys.stderr)
+            return 1
+        f_floor = check_exit_edge_census(empty_root)
+        if len([x for x in f_floor if "population floor" in x]) != len(REFUSAL_SCAN_CRATES):
+            print(f"FAIL: W12-BA — empty root did not red every exit-edge crate floor: {f_floor}", file=sys.stderr)
+            return 1
+        f_floor = check_duration_census(empty_root, mint=True)
+        if not any(x.startswith("mint refused:") for x in f_floor):
+            print(f"FAIL: W12-BA — the duration mint guard accepted a vacuous population: {f_floor}", file=sys.stderr)
+            return 1
+        f_floor = check_exit_edge_census(empty_root, mint=True)
+        if not any(x.startswith("mint refused:") for x in f_floor):
+            print(f"FAIL: W12-BA — the exit-edge mint guard accepted a vacuous population: {f_floor}", file=sys.stderr)
+            return 1
+        # … and a crate dir with zero production files (not merely a
+        # missing dir) trips the per-root file floor.
+        (empty_root / "rio-onlytests" / "src" / "tests").mkdir(parents=True)
+        (empty_root / "rio-onlytests" / "src" / "tests" / "t.rs").write_text("fn t() {}\n")
+        f_floor = check_duration_census(empty_root)
+        if not any("zero production .rs" in x for x in f_floor):
+            print(f"FAIL: W12-BA — a tests-only crate did not trip the file floor: {f_floor}", file=sys.stderr)
+            return 1
+    # The floor REGISTRY arms: a rotted firing predicate reds, and a
+    # registry-enrolled walking generator without a floor row reds
+    # (the reverse direction — enrollment is total).
+    f_pf = check_population_floors(
+        src_root,
+        floors={"duration-census": ("nix/census_corpora.py", r"NO_SUCH_" + r"FLOOR_ARM")},
+    )
+    if not any("floor arm rotted" in x for x in f_pf):
+        print(f"FAIL: the rotted floor predicate did not red: {f_pf}", file=sys.stderr)
+        return 1
+    straw_registry = REGISTRY + [
+        ("straw-walker", "nix/census_enrollment.py", r"self-?test", {"scope"}, set(), r"CLAIM_SHAPES")
+    ]
+    f_pf = check_population_floors(
+        src_root,
+        floors={k: v for k, v in POPULATION_FLOORS.items() if k != "census-enrollment"},
+        registry=straw_registry,
+    )
+    if not any("no population-floor row" in x for x in f_pf):
+        print(f"FAIL: the unfloored-walker reverse arm did not red: {f_pf}", file=sys.stderr)
+        return 1
     # Arm F-allow: the allow grammar admits a documented exception.
     allowed_ws = "// wire-secs-census: allow(test fixture builds its own clock)\n" + WIRE_SECS_GRAMMAR[0][1]
     if scan_wire_secs_seams([("planted/allowed.rs", allowed_ws)]):
@@ -1453,7 +1629,18 @@ def main() -> int:
 
     refusal_files = []
     for crate in REFUSAL_SCAN_CRATES:
-        for f in sorted((src_root / crate / "src").rglob("*.rs")):
+        croot = src_root / crate / "src"
+        # WO-S8-3 (merged_bug_028): population floor — a declared
+        # crate that stages nothing must red the scan, never shrink
+        # it silently (the rio-gateway-as-string face).
+        if not croot.is_dir():
+            fails.append(
+                f"refusal/wire-secs scan: population floor — declared "
+                f"crate root {crate}/src does not resolve ((vvvvv))"
+            )
+            continue
+        n_before = len(refusal_files)
+        for f in sorted(croot.rglob("*.rs")):
             rel = str(f.relative_to(src_root))
             # Production folds only: test dirs and in-file test mods
             # assert specific codes lawfully (the adjudication law
@@ -1465,6 +1652,11 @@ def main() -> int:
             if "/tests/" in rel or rel.endswith("test_helpers.rs"):
                 continue
             refusal_files.append((rel, f.read_text()))
+        if len(refusal_files) == n_before:
+            fails.append(
+                f"refusal/wire-secs scan: population floor — zero "
+                f"production .rs files under {crate}/src"
+            )
     fails += scan_refusal_folds(refusal_files)
     fails += scan_wire_secs_seams(refusal_files)
     # The method-call leniency's machine-bound trigger (WO-S8-3): no
@@ -1489,6 +1681,8 @@ def main() -> int:
     # (WO-S8-11(ii)).
     fails += check_exit_edge_census(src_root)
     fails += check_self_coverage(src_root)
+    # The population-floor registry (WO-S8-3, merged_bug_028).
+    fails += check_population_floors(src_root)
 
     gaps = sorted(f"{name}:{ax}" for name, _, _, _, g, _ in REGISTRY for ax in g)
     derived = sum(1 for *_, d in REGISTRY if d is not None)
@@ -1500,7 +1694,8 @@ def main() -> int:
         f"{len(refusal_files)} files swept by the negative refusal census and the wire-secs pacing-seam census, "
         f"duration census {len(DURATION_CENSUS_ROWS)} rows enrolled, "
         f"exit-edge census {len(EXIT_EDGE_ROWS)} rows enrolled, "
-        f"self-coverage gate over {len(SELF_COVERAGE_ARMS)} arms + {len(REGISTRY_RESIDUALS)} bound residual(s)"
+        f"self-coverage gate over {len(SELF_COVERAGE_ARMS)} arms + {len(REGISTRY_RESIDUALS)} bound residual(s), "
+        f"{len(POPULATION_FLOORS)} population floors registry-checked"
     )
     if fails:
         print("FAIL: census-corpora violations —", file=sys.stderr)

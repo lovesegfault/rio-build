@@ -185,6 +185,26 @@ def extract_from_source(rel: str, text: str):
     return describes, emissions, dyn_emissions
 
 
+def floor_fails(src_root: pathlib.Path) -> list[str]:
+    """Population floor (WO-S8-3, merged_bug_028): every declared
+    crate must resolve and stage at least one .rs file, and the scan
+    must yield a non-vacuous describe AND emission population --
+    pathlib rglob fails open at zero matches, so a mis-staged tree
+    previously synced zero emissions against zero describes, green.
+    On a correctly staged tree the floors cannot false-positive."""
+    fails = []
+    for crate in CRATES:
+        croot = src_root / crate / "src"
+        if not croot.is_dir():
+            fails.append(
+                f"population floor -- declared crate root {crate}/src does "
+                f"not resolve ((vvvvv))"
+            )
+        elif not any(croot.rglob("*.rs")):
+            fails.append(f"population floor -- zero .rs files under {crate}/src")
+    return fails
+
+
 def scan(src_root: pathlib.Path):
     describes: dict[str, str] = {}
     emissions = []  # (file, metric, key, expr, file_text)
@@ -192,7 +212,10 @@ def scan(src_root: pathlib.Path):
     field_inits: dict[str, set] = defaultdict(set)
     const_strs: dict[str, str] = {}
     for crate in CRATES:
-        for f in sorted((src_root / crate / "src").rglob("*.rs")):
+        croot = src_root / crate / "src"
+        if not croot.is_dir():
+            continue  # floor_fails reports it
+        for f in sorted(croot.rglob("*.rs")):
             rel = str(f.relative_to(src_root))
             if "/tests/" in rel or rel.endswith("test_helpers.rs"):
                 continue
@@ -351,8 +374,26 @@ def main() -> int:
         print(f"FAIL: dyn self-test expected a dynamic-unresolved census entry, got fails={f3} census={c3}", file=sys.stderr)
         return 1
 
+    # The floor's own plant (WO-S8-3 / W12-BA): an empty root REDS.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        ff = floor_fails(pathlib.Path(td))
+        if len(ff) != len(CRATES):
+            print(f"FAIL: population-floor plant did not red per crate: {ff}", file=sys.stderr)
+            return 1
+
     describes, emissions, dyn_emissions, field_inits, const_strs = scan(src_root)
     fails, census = check(describes, emissions, dyn_emissions, field_inits, const_strs)
+    fails = floor_fails(src_root) + fails
+    if not describes or not emissions:
+        # The vacuity face of the scan itself: a staged tree that
+        # yields zero describes or zero labeled emissions means the
+        # extraction (not the code) broke -- never sync nothing green.
+        fails.append(
+            f"population floor -- vacuous scan ({len(describes)} describes, "
+            f"{len(emissions)} labeled emissions); extraction or staging rot"
+        )
     print(
         f"metric-reason-help-sync: {len(emissions)} literal + {len(dyn_emissions)} dynamic "
         f"reason-labeled emissions, {len(describes)} describes, "

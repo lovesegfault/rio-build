@@ -1273,7 +1273,6 @@ in
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-common/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-controller/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-crds/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-dashboard/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-evidence-kernel/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-gateway/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-lease/src)
@@ -1309,7 +1308,7 @@ in
         cp "$scanScript" string_interior_spaces.py
         python3 string_interior_spaces.py "$src" \
           rio-auth/src rio-authz-kernel/src rio-builder/src rio-cli/src \
-          rio-common/src rio-controller/src rio-crds/src rio-dashboard/src \
+          rio-common/src rio-controller/src rio-crds/src \
           rio-evidence-kernel/src rio-gateway/src rio-lease/src \
           rio-log-kernel/src rio-migrations/src rio-nix/src rio-proto/src \
           rio-retry-kernel/src rio-scheduler/src rio-store/src \

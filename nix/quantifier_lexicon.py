@@ -278,7 +278,38 @@ def key(rel: str, line: str) -> str:
     return f"{rel}\t{line.strip()}"
 
 
+def floor_fails(root: Path, mint: bool) -> list[str]:
+    """Population floor (WO-S8-3, merged_bug_028): every tier must
+    yield at least one file (pathlib globs fail open at zero matches
+    -- a mis-staged tree previously scanned an empty tier green), and
+    the grandfather ledger -- an explicitly-declared input of the
+    check -- must resolve outside --mint-grandfather (a missing
+    ledger previously defaulted to EMPTY, so one broken $src emptied
+    scan AND backstop together). On a correctly staged tree the
+    floors cannot false-positive."""
+    fails = []
+    for tier in TIERS:
+        if not any(True for _ in iter_tier_files(root, tier)):
+            fails.append(
+                f"population floor -- tier `{tier}` resolved zero files "
+                f"under the scan root (mis-staged tree? ((vvvvv)))"
+            )
+    if not mint and not (root / GRANDFATHER).is_file():
+        fails.append(
+            f"population floor -- grandfather ledger {GRANDFATHER} does "
+            f"not resolve; a missing ledger is staging rot, never an "
+            f"empty backstop ((vvvvv))"
+        )
+    return fails
+
+
 def run(root: Path, mint: bool) -> int:
+    floors = floor_fails(root, mint)
+    if floors:
+        for x in floors:
+            print(x, file=sys.stderr)
+        print(f"\n{len(floors)} population-floor failure(s).", file=sys.stderr)
+        return 1
     gf_path = root / GRANDFATHER
     hits = list(scan(root))
     if mint:
@@ -326,6 +357,17 @@ def run(root: Path, mint: bool) -> int:
 
 def selftest() -> str | None:
     import tempfile
+
+    # The floor's own plant (WO-S8-3 / W12-BA): an empty root REDS
+    # every tier AND the missing ledger; mint mode exempts only the
+    # ledger arm (minting writes it).
+    with tempfile.TemporaryDirectory() as td:
+        ff = floor_fails(Path(td), mint=False)
+        if len(ff) != len(TIERS) + 1:
+            return f"population-floor plant did not red per tier + ledger: {ff}"
+        ff = floor_fails(Path(td), mint=True)
+        if len(ff) != len(TIERS):
+            return f"population-floor mint-mode plant wrong: {ff}"
 
     specimens = {
         "rust": ("rio-planted/src/lib.rs", "// {} callers route through the gate\nfn x() {{}}\n"),
@@ -450,7 +492,15 @@ def selftest() -> str | None:
         if list(scan(root)):
             return "string-literal lexicon word fired in the rust tier"
         p.unlink()
-        # Grandfather: content-keyed pass + stale-entry red.
+        # Grandfather: content-keyed pass + stale-entry red. run() now
+        # enforces the population floors (WO-S8-3), so the fixture
+        # root must stage every tier non-vacuously first (benign,
+        # hit-free files).
+        for ftier in ("helm", "script", "typst"):
+            frel, _t = specimens[ftier]
+            fp = root / frel
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text("# plain\n" if ftier != "typst" else "Plain prose.\n", encoding="utf-8")
         p.write_text("// ALL lanes consult the hold\nfn x() {}\n", encoding="utf-8")
         gf = root / GRANDFATHER
         gf.parent.mkdir(parents=True, exist_ok=True)
