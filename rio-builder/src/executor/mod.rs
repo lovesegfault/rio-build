@@ -421,6 +421,14 @@ pub struct ExecuteOutcome {
     /// `None` = no prjquota OR pre-cgroup error. Sampled BEFORE
     /// `build_result?` so an OOM'd build also reports it.
     pub peak_disk_bytes: Option<u64>,
+    /// bug_090: the DISK_FULL corroboration triple, set IFF the disk
+    /// override classified this attempt (the seam's own samples — the
+    /// during-build quota peak, the hard limit, and the decoupled
+    /// node headroom). Rides into
+    /// `BuildResult.failure_classification.quota` at report assembly
+    /// so the scheduler can corroborate the class against the shape
+    /// it assigned. `None` everywhere else.
+    pub disk_telemetry: Option<rio_proto::types::QuotaTelemetry>,
     /// Highest line number this attempt's `BuildLogBatch`es reached
     /// (header + LogBatcher output). The runtime daemon-transient retry
     /// loop feeds it back as the next attempt's `first_line` so output
@@ -456,6 +464,7 @@ impl ExecuteOutcome {
             peak_memory_bytes: 0,
             peak_cpu_cores: 0.0,
             peak_disk_bytes: None,
+            disk_telemetry: None,
             final_line_count,
             footer_result: None,
         }
@@ -470,6 +479,7 @@ impl ExecuteOutcome {
             peak_memory_bytes: r.peak_memory_bytes,
             peak_cpu_cores: r.peak_cpu_cores,
             peak_disk_bytes: r.peak_disk_bytes,
+            disk_telemetry: None,
             result: Ok(r),
             final_line_count,
             footer_result: None, // RIO_BUILDER_SCRIPT short-circuit: no daemon ran.
@@ -914,6 +924,21 @@ pub async fn execute_build(
         quota_peak.and_then(|q| q.hard_limit_bytes),
     );
     let build_result = apply_disk_override(quota_peak, node_free, build_result);
+    // bug_090: the corroboration triple rides the typed wire family
+    // IFF the seam classified — the scheduler re-checks these against
+    // the shape it assigned before any floor moves. The DiskFull
+    // letter is minted ONLY at the seam above, so the match is the
+    // seam's own verdict.
+    let disk_telemetry = match (&build_result, quota_peak, node_free) {
+        (Err(ExecutorError::DiskFull), Some(q), Some(free)) => {
+            Some(rio_proto::types::QuotaTelemetry {
+                peak_used_bytes: q.used_bytes,
+                hard_limit_bytes: q.hard_limit_bytes.unwrap_or(0),
+                node_free_bytes: free,
+            })
+        }
+        _ => None,
+    };
 
     // H9″ (live_057-d instrument): fuse-cache occupancy, statfs-
     // derived, refreshed once per build completion beside the quota
@@ -929,6 +954,7 @@ pub async fn execute_build(
         peak_memory_bytes,
         peak_cpu_cores,
         peak_disk_bytes,
+        disk_telemetry,
         final_line_count,
         footer_result: Some(footer_result.clone()),
     };
@@ -1010,6 +1036,7 @@ pub async fn execute_build(
         peak_memory_bytes,
         peak_cpu_cores,
         peak_disk_bytes,
+        disk_telemetry,
         final_line_count,
         footer_result: Some(footer_result),
     }

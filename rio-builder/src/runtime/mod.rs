@@ -192,6 +192,7 @@ impl BuildSpawnContext {
         peak_disk_bytes: Option<u64>,
         circuit_trips_at_spawn: u64,
         upload_transport: bool,
+        disk_telemetry: Option<rio_proto::types::QuotaTelemetry>,
     ) -> result::CompletionStamp {
         let prev = *self.resources.read().unwrap_or_else(|e| e.into_inner());
         result::CompletionStamp {
@@ -206,6 +207,7 @@ impl BuildSpawnContext {
                 peak_disk_bytes,
                 prev,
             )),
+            disk_telemetry,
             // Per-lane store evidence (no Default — every lane named).
             store_evidence: result::StoreEvidenceSet {
                 // bug_408: degraded = open RIGHT NOW (the build very
@@ -596,6 +598,7 @@ pub async fn spawn_build_task(
             peak_memory_bytes,
             peak_cpu_cores,
             peak_disk_bytes,
+            disk_telemetry,
             final_line_count,
             footer_result: _, // tracked across attempts as `last_footer_result`
         } = outcome;
@@ -720,7 +723,12 @@ pub async fn spawn_build_task(
         // assembly fns (ok_completion reads ExecutionResult.
         // store_unreachable; err_completion classifies
         // ExecutorError::Upload) — seed false here.
-        let stamp = ctx.completion_stamp(peak_disk_bytes, circuit_trips_at_spawn, false);
+        let stamp = ctx.completion_stamp(
+            peak_disk_bytes,
+            circuit_trips_at_spawn,
+            false,
+            disk_telemetry,
+        );
         let mut completion = match result {
             Ok(exec_result) => ok_completion(exec_result, stamp),
             Err(e) => err_completion(
@@ -782,6 +790,8 @@ pub async fn spawn_build_task(
                             upload_transport: false,
                             metadata_fetch: false,
                         },
+                        // Panic: no classification seam ran.
+                        disk_telemetry: None,
                     },
                 ),
             )

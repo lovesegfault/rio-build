@@ -288,6 +288,8 @@ pub(super) async fn collect_outputs(
                     // Built is never store-degraded; the stamp chokepoint
                     // (`apply_store_degraded`) only marks infra failures.
                     store_degraded: false,
+                    // bug_090: success carries no sizing classification.
+                    failure_classification: None,
                 },
                 store_unreachable: false,
             })

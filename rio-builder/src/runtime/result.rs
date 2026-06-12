@@ -31,6 +31,13 @@ pub(super) struct CompletionStamp {
     /// classification refinement of an infra failure ("the store was
     /// degraded, wait it out"), never a verdict of its own.
     pub store_evidence: StoreEvidenceSet,
+    /// bug_090: the DISK_FULL corroboration triple from the executor's
+    /// classification seam (`ExecuteOutcome.disk_telemetry`). `Some`
+    /// IFF the disk override classified this attempt; rides into
+    /// `BuildResult.failure_classification.quota` so the scheduler can
+    /// corroborate the class against the shape it assigned. Bundled
+    /// here (not a parameter) per this struct's charter.
+    pub disk_telemetry: Option<rio_proto::types::QuotaTelemetry>,
 }
 
 /// bug_286: per-lane store-degraded evidence.
@@ -208,6 +215,27 @@ pub(super) fn err_completion(
         tracing::error!(drv_path = %drv_path, error = %e, "build execution failed");
         BuildResultStatus::InfrastructureFailure
     };
+    // bug_090: the TYPED sizing classification — the only channel the
+    // scheduler's floor gate consumes (error_msg is display-only).
+    // Minted from the typed letters, never from text: CgroupOom
+    // corroborates via peak_memory_bytes (already on the report);
+    // DiskFull carries the seam's quota triple. A cancelled build
+    // claims nothing (the cancel law owns the report).
+    let failure_classification = if was_cancelled {
+        None
+    } else {
+        match e {
+            ExecutorError::CgroupOom => Some(rio_proto::types::FailureClassification {
+                class: rio_proto::types::FailureClass::CgroupOom.into(),
+                quota: None,
+            }),
+            ExecutorError::DiskFull => Some(rio_proto::types::FailureClassification {
+                class: rio_proto::types::FailureClass::DiskFull.into(),
+                quota: stamp.disk_telemetry,
+            }),
+            _ => None,
+        }
+    };
     let mut result = ProtoBuildResult {
         status: status.into(),
         error_msg: if was_cancelled {
@@ -215,6 +243,7 @@ pub(super) fn err_completion(
         } else {
             e.to_string()
         },
+        failure_classification,
         ..Default::default()
     };
     apply_store_degraded(&mut result, stamp.store_evidence.any());
@@ -374,6 +403,7 @@ mod tests {
                 upload_transport: false,
                 metadata_fetch: false,
             },
+            disk_telemetry: None,
         }
     }
 
@@ -386,6 +416,82 @@ mod tests {
             },
             ..stamp()
         }
+    }
+
+    /// bug_090 (the producer cells): the typed sizing classification
+    /// is minted from the TYPED letters only — CgroupOom carries the
+    /// class (corroboration = the report's peak_memory field);
+    /// DiskFull carries the class + the seam's quota triple; every
+    /// other shape (and every cancelled report) carries NO claim.
+    /// The scheduler's floor gate consumes ONLY this field — error_msg
+    /// is display-only.
+    #[test]
+    fn err_completion_mints_typed_classification_from_letters_only() {
+        use rio_proto::types::FailureClass;
+        let telemetry = rio_proto::types::QuotaTelemetry {
+            peak_used_bytes: (25 << 30) - (1 << 20),
+            hard_limit_bytes: 25 << 30,
+            node_free_bytes: 50 << 30,
+        };
+        let mut s = stamp();
+        s.disk_telemetry = Some(telemetry);
+        let r = err_completion(
+            &ExecutorError::DiskFull,
+            "/nix/store/x.drv".into(),
+            "tok".into(),
+            false,
+            s,
+            0,
+            0.0,
+        );
+        let fc = r
+            .result
+            .unwrap()
+            .failure_classification
+            .expect("DiskFull mints the typed class");
+        assert_eq!(fc.class, i32::from(FailureClass::DiskFull));
+        assert_eq!(fc.quota, Some(telemetry), "the corroboration triple rides");
+
+        let r = err_completion(
+            &ExecutorError::CgroupOom,
+            "/nix/store/x.drv".into(),
+            "tok".into(),
+            false,
+            stamp(),
+            4 << 30,
+            0.0,
+        );
+        let fc = r
+            .result
+            .unwrap()
+            .failure_classification
+            .expect("CgroupOom mints the typed class");
+        assert_eq!(fc.class, i32::from(FailureClass::CgroupOom));
+        assert_eq!(fc.quota, None, "oom corroborates via peak_memory_bytes");
+
+        // No other letter claims a sizing class.
+        let r = err_completion(
+            &ExecutorError::BuildFailed("boom".into()),
+            "/nix/store/x.drv".into(),
+            "tok".into(),
+            false,
+            stamp(),
+            0,
+            0.0,
+        );
+        assert_eq!(r.result.unwrap().failure_classification, None);
+
+        // A cancelled report claims nothing even on a sizing letter.
+        let r = err_completion(
+            &ExecutorError::CgroupOom,
+            "/nix/store/x.drv".into(),
+            "tok".into(),
+            true,
+            stamp(),
+            0,
+            0.0,
+        );
+        assert_eq!(r.result.unwrap().failure_classification, None);
     }
 
     /// bug_286 (R6): `is_store_unreachable` truth table — transport

@@ -110,6 +110,8 @@ pub fn scripted_result(
             start_time: Some(start.into()),
             stop_time: Some(stop.into()),
             store_degraded: false,
+            // bug_090: scripted fixtures are successes — no sizing class.
+            failure_classification: None,
         },
         assignment_token: assignment_token.to_string(),
         peak_memory_bytes: o.peak_mem,
