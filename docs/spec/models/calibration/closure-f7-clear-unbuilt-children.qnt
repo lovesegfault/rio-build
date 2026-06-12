@@ -50,6 +50,13 @@
 //   quint verify --backend=tlc --main=closureCalibF7ClearUnbuiltChildren \
 //     --invariant=clearSoundness \
 //     docs/spec/models/calibration/closure-f7-clear-unbuilt-children.qnt
+//
+// VERDICT (Stage-C 0d calibration; relocated from the retired closure-
+// evidence invariant map, full tables: docs/spec/models/closure-
+// evidence-records.md): CE-30/CE-28 → A3 VIOLATED — 3-state TLC trace
+// (18 K distinct): pruned-merge stamp, then a full re-merge clears the
+// mark over an unbuilt child. Baseline: HOLDS-BOUNDED (Duo depth 7) + by
+// construction.
 module closureCalibF7ClearUnbuiltChildren {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

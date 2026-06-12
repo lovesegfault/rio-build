@@ -1453,8 +1453,8 @@ column-agnostic: job-table and wanted-relation writes feed the same fence
 and the same #(refs.metric)("rio_scheduler_evidence_write_fenced_total")
 counter. The
 deciding evidence was the campaign's stale-tenure model results (the A17
-stale-override and A18 deposed-writer probes,
-`docs/spec/models/closure-evidence-invariant-map.md`): entry-time gates
+stale-override and A18 deposed-writer probes; archived record:
+`docs/spec/models/closure-evidence-records.md`): entry-time gates
 cannot close the deposed-believer window --- a replica deposed after a
 handler's entry check (or after the SubmitBuild enqueue check, for the
 otherwise-ungated MergeDag handler) keeps issuing durable writes for up to

@@ -44,6 +44,14 @@
 //   quint verify --backend=tlc --main=closureCalibF5WantedOverwrite \
 //     --invariant=storedWantedMonotone \
 //     docs/spec/models/calibration/closure-f5-wanted-overwrite.qnt
+//
+// VERDICT (Stage-C 0d calibration; relocated from the retired closure-
+// evidence invariant map, full tables: docs/spec/models/closure-
+// evidence-records.md): CE-16 → B5 VIOLATED — TLC violation at search
+// depth 12 (29.8 K distinct; the full-width run did not emit the trace):
+// a narrow resubmit's apply overwrites the wide stored union. Baseline:
+// HOLDS (0c BaseEx record + by construction). Wave-4 re-validation:
+// still falsifies — TLC, 40 s, 53 K distinct (16 workers).
 module closureCalibF5WantedOverwrite {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

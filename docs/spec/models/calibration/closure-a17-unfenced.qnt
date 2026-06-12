@@ -62,6 +62,14 @@
 //     --invariant=noStaleTenureClearOverride \
 //     --max-samples=2000000 --max-steps=15 \
 //     docs/spec/models/calibration/closure-a17-unfenced.qnt
+//
+// VERDICT (Phase-1 Wave 4; relocated from the retired closure-evidence
+// invariant map, full tables: docs/spec/models/closure-evidence-
+// records.md): falsifies A18 in <2 s at 500 K samples (the 5-state
+// D14-leg trace); baseline (production fenced apply) holds at 2 M. The
+// A18 falsification is the wired oracle for the shared unfenced-apply
+// mechanism (A17's own deeper clear-then-restamp interleaving was never
+// produced in any hunted budget; the same fence closes both).
 module closureCalibA17Unfenced {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

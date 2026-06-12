@@ -6,7 +6,7 @@
 // longer wanted-complete unlocked dependents, which were then
 // dispatched against missing inputs). Crosswalk row:
 // closure-evidence-formal-design.md §4 "F1 CE-2, CE-5(ii), CE-6 → ENC
-// (rep: CE-2) → B9"; verdict table: closure-evidence-invariant-map.md
+// (rep: CE-2) → B9"; verdict table: closure-evidence-records.md
 // (Phase 0d). Together with the F1 permissiveness override
 // (closure-f1-skip-store-recheck.qnt → C4) this discharges the §4
 // both-directions clause for F1.
@@ -36,6 +36,13 @@
 //   quint verify --backend=tlc --main=closureCalibF1StaleProduced \
 //     --invariant=staleProducedNeverUnlocksDependents \
 //     docs/spec/models/calibration/closure-f1-stale-produced.qnt
+//
+// VERDICT (Stage-C 0d calibration; relocated from the retired closure-
+// evidence invariant map, full tables: docs/spec/models/closure-
+// evidence-records.md): CE-2 → B9 VIOLATED — 7-state TLC trace (756 K
+// distinct explored): narrow merge, walk-ok, poison, wider resubmit
+// leaves the parent Ready above the stale-Produced child. Baseline:
+// HOLDS (0c BaseEx record + by construction).
 module closureCalibF1StaleProduced {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

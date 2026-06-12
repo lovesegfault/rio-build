@@ -16,7 +16,7 @@
 // verdict instead of re-checking the store, so a derivation whose
 // outputs were already all present was queued and built from source).
 // Crosswalk row: closure-evidence-formal-design.md §4 "F1 CE-1 → ENC →
-// C4"; verdict table: closure-evidence-invariant-map.md (Phase 0d).
+// C4"; 0d verdict: the VERDICT block at the end of this header.
 // Together with the F1 soundness override
 // (closure-f1-stale-produced.qnt → B9) this discharges the §4
 // both-directions clause for F1.
@@ -46,6 +46,14 @@
 //   quint verify --backend=tlc --main=closureCalibF1SkipStoreRecheck \
 //     --invariant=noBuildWhenWantedPresent \
 //     docs/spec/models/calibration/closure-f1-skip-store-recheck.qnt
+//
+// VERDICT (Stage-C 0d calibration; relocated from the retired closure-
+// evidence invariant map, full tables: docs/spec/models/closure-
+// evidence-records.md): CE-1 → C4 VIOLATED — 5-state TLC trace (3.6 K
+// distinct): a locally-present node is classified missing and queued
+// from source. Baseline: HOLDS (0c BaseEx record + by construction).
+// Wave-4 re-validation: still falsifies — TLC, 3.2 s, 171 distinct
+// states (16 workers).
 module closureCalibF1SkipStoreRecheck {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

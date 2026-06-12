@@ -16,8 +16,8 @@
 // reported as confirmed-miss; CE-60 d6dd46edd is the same trichotomy
 // with a probe-cap trigger). Crosswalk row:
 // closure-evidence-formal-design.md §4 "F3 CE-60, CE-61 → ENC (rep:
-// CE-61) → B3"; verdict table: closure-evidence-invariant-map.md
-// (Phase 0d).
+// CE-61) → B3"; 0d verdict: the VERDICT block at the end of this
+// header.
 //
 // PRE-FIX behavior modeled: the must-substitute fail-fast arm of the
 // dispatch probe fires without a confirmed-missing answer being
@@ -44,6 +44,14 @@
 //   quint verify --backend=tlc --main=closureCalibF3IndetFailFast \
 //     --invariant=unknownNeverDemotes \
 //     docs/spec/models/calibration/closure-f3-indet-failfast.qnt
+//
+// VERDICT (Stage-C 0d calibration; relocated from the retired closure-
+// evidence invariant map, full tables: docs/spec/models/closure-
+// evidence-records.md): CE-61 → B3 VIOLATED — 6-state TLC trace (62 K
+// distinct): recovered marked root fail-fasted on a substitutable-only
+// answer. Baseline: HOLDS-BOUNDED (FailoverEx depth 12) + by
+// construction. Wave-4 re-validation: still falsifies — TLC, 41 s, 77 K
+// distinct (16 workers).
 module closureCalibF3IndetFailFast {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

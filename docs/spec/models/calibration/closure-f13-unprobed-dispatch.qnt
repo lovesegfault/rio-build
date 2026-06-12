@@ -16,7 +16,7 @@
 // of nodes never received a substitutability verdict before being
 // handed to a builder, so cached paths were compiled from source).
 // Crosswalk row: closure-evidence-formal-design.md §4 "F13 CE-58 → ENC
-// → B8"; verdict table: closure-evidence-invariant-map.md (Phase 0d).
+// → B8"; 0d verdict: the VERDICT block at the end of this header.
 //
 // PRE-FIX behavior modeled: the from-source admission does not require
 // a substitutability verdict consumed in the current probe pass — a
@@ -43,6 +43,14 @@
 //   quint verify --backend=tlc --main=closureCalibF13UnprobedDispatch \
 //     --invariant=dispatchImpliesProbedThisPass \
 //     docs/spec/models/calibration/closure-f13-unprobed-dispatch.qnt
+//
+// VERDICT (Stage-C 0d calibration; relocated from the retired closure-
+// evidence invariant map, full tables: docs/spec/models/closure-
+// evidence-records.md): CE-58 → B8 VIOLATED — 6-state TLC trace (6.8 K
+// distinct): recovered, never-re-probed Ready node opened from source.
+// Baseline: HOLDS-BOUNDED (FailoverEx depth 12) + by construction.
+// Wave-4 re-validation: still falsifies — TLC, 39 s, 72 K distinct (16
+// workers).
 module closureCalibF13UnprobedDispatch {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

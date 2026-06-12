@@ -6,7 +6,7 @@
 // root, so the prune dropped it entirely: never merged, classified,
 // substituted or dispatched). Crosswalk row:
 // closure-evidence-formal-design.md §4 "F4 CE-66 → ENC → B10"; verdict
-// table: closure-evidence-invariant-map.md (Phase 0d).
+// table: closure-evidence-records.md (Phase 0d).
 //
 // PRE-FIX behavior modeled: the prune's demand set is the structural
 // roots only — the explicitly-requested marking is ignored both by the
@@ -31,6 +31,12 @@
 //   quint verify --backend=tlc --main=closureCalibF4DemandDrop \
 //     --invariant=demandSetSurvivesPrune \
 //     docs/spec/models/calibration/closure-f4-demand-drop.qnt
+//
+// VERDICT (Stage-C 0d calibration; relocated from the retired closure-
+// evidence invariant map, full tables: docs/spec/models/closure-
+// evidence-records.md): CE-66 → B10 VIOLATED — 5-state TLC trace (6.6 K
+// distinct): explicitly-requested non-root dropped by the roots-only
+// prune. Baseline: HOLDS (0c BaseEx record + by construction).
 module closureCalibF4DemandDrop {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

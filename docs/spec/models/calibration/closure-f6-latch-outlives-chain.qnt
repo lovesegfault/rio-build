@@ -66,6 +66,17 @@
 //     --invariant=chainEndClearsForgiveness \
 //     --max-samples=100000 --max-steps=12 \
 //     docs/spec/models/calibration/closure-f6-latch-outlives-chain.qnt
+//
+// VERDICT (Stage-C 0d calibration; relocated from the retired closure-
+// evidence invariant map, full tables: docs/spec/models/closure-
+// evidence-records.md): CE-20/CE-21 → A21 VIOLATED — 5-state rust-
+// simulator trace (167 ms): narrow merge → failed walk forgiving the
+// unwanted output → wide co-build merge → downgrade-revert keeps nf on a
+// Ready node; TLC did not find it at this scope (re-diagnosed post-0d:
+// budget + progress-metric misreading, not a tool bug). Baseline: HOLDS
+// — rust 100 K × 12-step samples find no violation; TLC bounded to depth
+// 7. Wave-4 re-validation: still falsifies — rust sim, 1.4 s (100 K ×
+// 12).
 module closureCalibF6LatchOutlivesChain {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

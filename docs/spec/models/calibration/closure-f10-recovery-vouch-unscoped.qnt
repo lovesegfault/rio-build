@@ -18,8 +18,8 @@
 // CE-46 650d5ac14 is the same scoping rule's condemn direction).
 // Crosswalk row: closure-evidence-formal-design.md §4 "F10 CE-45,
 // CE-46 → ENC (rep: CE-45) → A3(ii)/A19 vouch direction over the
-// durable relation"; verdict table: closure-evidence-invariant-map.md
-// (Phase 0d).
+// durable relation"; 0d verdict: the VERDICT block at the end of
+// this header.
 //
 // PRE-FIX behavior modeled: the recovery clear gate accepts any durable
 // all-children-Produced row set — the live-build co-ownership scoping
@@ -44,6 +44,16 @@
 //   quint verify --backend=tlc --main=closureCalibF10RecoveryVouchUnscoped \
 //     --invariant=clearSoundness \
 //     docs/spec/models/calibration/closure-f10-recovery-vouch-unscoped.qnt
+//
+// VERDICT (Stage-C 0d calibration; relocated from the retired closure-
+// evidence invariant map, full tables: docs/spec/models/closure-
+// evidence-records.md): CE-45 → A3 VIOLATED — TLC violation at depth 17
+// (5.15 M distinct, ≈8.4 min full-width; trace not emitted): the
+// unscoped recovery gate clears on a child co-owned only by a superseded
+// submission; too deep/slow for a wired check — evidence module only.
+// Baseline: HOLDS-BOUNDED (FailoverEx depth 12) + by construction.
+// Wave-4 re-validation: still falsifies — TLC, 567 s, 4.73 M distinct
+// (60 workers).
 module closureCalibF10RecoveryVouchUnscoped {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

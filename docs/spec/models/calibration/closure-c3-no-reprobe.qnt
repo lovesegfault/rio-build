@@ -87,6 +87,15 @@
 //     --invariant=markedBrokenSettlementArmed \
 //     --max-samples=2000000 --max-steps=14 \
 //     docs/spec/models/calibration/closure-c3-no-reprobe.qnt
+//
+// VERDICT (Phase-1 Wave 4; relocated from the retired closure-evidence
+// invariant map, full tables: docs/spec/models/closure-evidence-
+// records.md): falsifies C3 6/6 independent 1 M-sample runs (the MCI-2
+// second-family trace: pre-fix reap fail-fasts a marked+tried Queued
+// survivor whose outputs are obtainable); baseline (production step,
+// same constants) holds C3 at 2 M; markedBrokenSettlementArmedPreFix
+// falsifies under the baseline (production) step — the pre/post
+// distinguisher.
 module closureCalibC3NoReprobe {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

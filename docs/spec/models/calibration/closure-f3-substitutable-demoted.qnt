@@ -17,8 +17,8 @@
 // builds). The §4 both-directions clause for the permissiveness
 // families (F1, F3, F6, the C-group) is discharged for F3 by this
 // override falsifying C2 while the F3 soundness override
-// (closure-f3-indet-failfast.qnt) falsifies B3. Verdict table:
-// closure-evidence-invariant-map.md (Phase 0d).
+// (closure-f3-indet-failfast.qnt) falsifies B3. 0d verdict: the
+// VERDICT block at the end of this header.
 //
 // PRE-FIX behavior modeled: the unmarked-Ready probe routing demotes a
 // node to the from-source lane on any missing wanted output — no
@@ -44,6 +44,14 @@
 //   quint verify --backend=tlc --main=closureCalibF3SubstitutableDemoted \
 //     --invariant=noWrongfulFromSourceDemotion \
 //     docs/spec/models/calibration/closure-f3-substitutable-demoted.qnt
+//
+// VERDICT (Stage-C 0d calibration; relocated from the retired closure-
+// evidence invariant map, full tables: docs/spec/models/closure-
+// evidence-records.md): CE-60/CE-3 → C2 VIOLATED — 6-state TLC trace
+// (4.5 K distinct): recovered Ready node with upstream-available outputs
+// routed from source. Baseline: HOLDS-BOUNDED (FailoverEx depth 12) + by
+// construction. Wave-4 re-validation: still falsifies — TLC, 38 s, 73 K
+// distinct (16 workers).
 module closureCalibF3SubstitutableDemoted {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

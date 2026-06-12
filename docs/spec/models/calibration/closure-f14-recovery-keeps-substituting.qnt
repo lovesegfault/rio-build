@@ -46,6 +46,15 @@
 //   quint verify --backend=tlc --main=closureCalibF14RecoveryKeepsSubstituting \
 //     --invariant=substitutingAlwaysArmed \
 //     docs/spec/models/calibration/closure-f14-recovery-keeps-substituting.qnt
+//
+// VERDICT (Stage-C 0d calibration; relocated from the retired closure-
+// evidence invariant map, full tables: docs/spec/models/closure-
+// evidence-records.md): CE-48(i)/CE-52-shape → L1 VIOLATED — 5-state TLC
+// trace (2 K distinct): merge, intent apply, failover, recovery re-
+// enters the persisted Substituting row with no walk anywhere. Baseline:
+// HOLDS-BOUNDED (FailoverEx depth 12; L1 is a state-form property — the
+// bounded run is the baseline). Wave-4 re-validation: still falsifies —
+// TLC, 15 s, 21 K distinct (16 workers).
 module closureCalibF14RecoveryKeepsSubstituting {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

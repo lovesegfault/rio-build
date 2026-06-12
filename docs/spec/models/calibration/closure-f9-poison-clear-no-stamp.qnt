@@ -49,6 +49,12 @@
 //   quint verify --backend=tlc --main=closureCalibF9PoisonClearNoStamp \
 //     --invariant=holeCompleteness \
 //     docs/spec/models/calibration/closure-f9-poison-clear-no-stamp.qnt
+//
+// VERDICT (Stage-C 0d calibration; relocated from the retired closure-
+// evidence invariant map, full tables: docs/spec/models/closure-
+// evidence-records.md): CE-41 → A5 VIOLATED — 4-state TLC trace
+// (4.4–13.7 K distinct): merge, poison, poison-clear with no surviving-
+// parent stamp. Baseline: HOLDS (0c BaseEx record + by construction).
 module closureCalibF9PoisonClearNoStamp {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

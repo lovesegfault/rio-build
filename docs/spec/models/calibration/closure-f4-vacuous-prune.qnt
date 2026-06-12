@@ -16,8 +16,8 @@
 // forall was vacuously true, the prune fired and the childless root was
 // dispatched from source). Crosswalk row:
 // closure-evidence-formal-design.md §4 "F4 CE-12, CE-13, CE-14 → ENC
-// (rep: CE-13) → B4"; verdict table: closure-evidence-invariant-map.md
-// (Phase 0d).
+// (rep: CE-13) → B4"; 0d verdict: the VERDICT block at the end of
+// this header.
 //
 // PRE-FIX behavior modeled: a submission may carry an unresolvable
 // (empty) wanted selection, and the prune's availability criterion is
@@ -42,6 +42,13 @@
 //   quint verify --backend=tlc --main=closureCalibF4VacuousPrune \
 //     --invariant=noVacuousWantedVerdict \
 //     docs/spec/models/calibration/closure-f4-vacuous-prune.qnt
+//
+// VERDICT (Stage-C 0d calibration; relocated from the retired closure-
+// evidence invariant map, full tables: docs/spec/models/closure-
+// evidence-records.md): CE-13 → B4 VIOLATED — 3-state TLC trace (4.4 K
+// distinct): empty wanted selection, prune fires vacuously. Baseline:
+// HOLDS (0c BaseEx record + by construction). Wave-4 re-validation:
+// still falsifies — TLC, 1.7 s, 138 distinct (16 workers).
 module closureCalibF4VacuousPrune {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

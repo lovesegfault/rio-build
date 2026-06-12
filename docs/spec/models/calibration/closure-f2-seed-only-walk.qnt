@@ -16,8 +16,8 @@
 // 808d82579 — try_substitute never walked narinfo.References, so the
 // seed landed and its transitive references were missing in the builder
 // sandbox). Crosswalk row: closure-evidence-formal-design.md §4 "F2
-// CE-8..CE-11 → ENC (rep: CE-9) → B2"; verdict table:
-// docs/spec/models/closure-evidence-invariant-map.md (Phase 0d).
+// CE-8..CE-11 → ENC (rep: CE-9) → B2"; 0d verdict: the VERDICT
+// block at the end of this header.
 //
 // PRE-FIX behavior modeled: the substitution walk checks and ingests
 // ONLY the seed node's non-forgiven outputs — the REFS-descendant
@@ -42,6 +42,13 @@
 //   quint verify --backend=tlc --main=closureCalibF2SeedOnlyWalk \
 //     --invariant=substituteOkImpliesClosureIngested \
 //     docs/spec/models/calibration/closure-f2-seed-only-walk.qnt
+//
+// VERDICT (Stage-C 0d calibration; relocated from the retired closure-
+// evidence invariant map, full tables: docs/spec/models/closure-
+// evidence-records.md): CE-9 → B2 VIOLATED — 4-state TLC trace (5.5 K
+// distinct): seed-only walk ok, consumption completes the parent with
+// the child closure never present. Baseline: HOLDS (0c BaseEx record +
+// by construction).
 module closureCalibF2SeedOnlyWalk {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

@@ -17,7 +17,7 @@
 // missing-and-unsubstitutable, left Ready and dispatched from source,
 // ENOENT on never-merged inputDrvs). Crosswalk row:
 // closure-evidence-formal-design.md §4 "F8 CE-33 → ENC (THE anchor) →
-// A1"; verdict table: closure-evidence-invariant-map.md (Phase 0d).
+// A1"; 0d verdict: the VERDICT block at the end of this header.
 //
 // PRE-FIX behavior modeled: the from-source admission (admit_pull
 // DeliverNew / the open-attempt mint) does not consult the closure
@@ -46,6 +46,13 @@
 //   quint verify --backend=tlc --main=closureCalibF8DispatchNoEvidence \
 //     --invariant=noDoomedFromSourceDispatch \
 //     docs/spec/models/calibration/closure-f8-dispatch-no-evidence.qnt
+//
+// VERDICT (Stage-C 0d calibration; relocated from the retired closure-
+// evidence invariant map, full tables: docs/spec/models/closure-
+// evidence-records.md): CE-33 → A1 VIOLATED — 6-state TLC trace (78.7 K
+// distinct): recovered marked childless root delivered from source by
+// the evidence-blind admission. Baseline: HOLDS-BOUNDED (FailoverEx
+// depth 12) + by construction.
 module closureCalibF8DispatchNoEvidence {
   import closureEvidence(
     DRVS = Set("d1", "d2"),

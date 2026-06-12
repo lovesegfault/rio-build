@@ -18,8 +18,9 @@
 // interlock (`admit_pull`'s NotYetReady refusal).
 //
 // Campaign design: closure-evidence-formal-design.md (A2-approved
-// revision); invariant <-> spec-rule linkage and stage records:
-// docs/spec/models/closure-evidence-invariant-map.md. Check wiring and
+// revision); invariant <-> spec-rule linkage and campaign records:
+// docs/spec/models/closure-evidence-records.md (closed-campaign
+// archive; full stage history in git). Check wiring and
 // r[verify] markers live in nix/quint.nix (Phase 0c), never here.
 //
 // WHAT IS MODELED
@@ -135,13 +136,13 @@
 // retired walk-era checks' dispositions and the pre-prune wiring: D7
 // commit 94996482b ("chore(models): wire the closure-evidence
 // survivors core and prune superseded checks" — identify by subject
-// after rebases) and the Phase D-prime stage record in
-// substitution-replacement-invariant-map.md. The 15 unwired
+// after rebases). The 15 unwired
 // calibration overrides' retirement notes remain valid as-is against
 // this retained model text.
 //
 // Measured state counts, depths and wall-clocks live in the introducing
-// commits' messages and the invariant map's stage records, never here.
+// commits' messages and the campaign archive
+// (closure-evidence-records.md), never here.
 module closureEvidence {
   // --- 1. types ---------------------------------------------------------
 
@@ -3449,8 +3450,13 @@ module closureEvidenceCornerFailoverDuo {
 // RDC-5 (the archived module above is an owner-waivered verbatim
 // predecessor record; extensions land as appended modules importing the
 // archived definitions — the FailoverDuo-corner pattern, 15c9ef076).
-// Addition recorded in closure-evidence-invariant-map.md (the RDC-5
-// posture note) and substitution-replacement-invariant-map.md ledger
+// RDC-5 posture (recorded 2026-06-03, folded here from the retired
+// invariant map): the archived module text above remains VERBATIM;
+// extensions land only as appended standalone modules like this one.
+// Wired: quint-closure-reap-truncate-holds (sim, archived step) and
+// quint-closure-reap-truncate-calib (seeded expect-violation,
+// nix/quint.nix). Justification ledger: the substitution-replacement
+// campaign archive (substitution-replacement-records.md), follow-up
 // row 3.
 //
 // The pin: terminal-build cleanup TRUNCATES the in-memory evidence the
