@@ -2761,3 +2761,101 @@ fn store_health_evidence_policy_is_issued_only() {
         &ProbeOutcome::BudgetExpired
     ));
 }
+
+/// **W11-BD (bug_107)** — *the spawn-intent comparator is a TOTAL
+/// order at its own domain — NaN included.* The old `(bool, f64)`
+/// tuple `partial_cmp + unwrap_or(Equal)` collapsed any NaN-involved
+/// comparison to Equal while finite pairs still ordered, breaking
+/// transitivity (a < b, a == NaN, NaN == b) — exactly the
+/// inconsistent-comparator shape Rust >= 1.81 driftsort may panic on,
+/// inside the single-threaded DagActor (a leader panic loop pointing
+/// at the sort, not the writer). NaN is structurally unreachable
+/// today only via an `is_finite` filter two modules away; this pins
+/// the order LOCALLY total. Also asserts finite-input equivalence
+/// with the previous comparator (no behavior change for every
+/// reachable input).
+#[test]
+fn spawn_intent_order_total_and_finite_compatible() {
+    use crate::actor::snapshot::spawn_intent_order;
+    use std::cmp::Ordering;
+
+    let intent =
+        |ready: Option<bool>, cores: u32, eta: f64, id: &str| rio_proto::types::SpawnIntent {
+            intent_id: id.into(),
+            cores,
+            eta_seconds: eta,
+            ready,
+            ..Default::default()
+        };
+    let mut domain: Vec<(f64, rio_proto::types::SpawnIntent)> = Vec::new();
+    for (i, &p) in [f64::NAN, f64::NEG_INFINITY, -1.0, 0.0, 2.5, f64::INFINITY]
+        .iter()
+        .enumerate()
+    {
+        for (j, &ready) in [None, Some(false), Some(true)].iter().enumerate() {
+            for (k, &eta) in [0.0, 7.0].iter().enumerate() {
+                domain.push((
+                    p,
+                    intent(ready, (k as u32) * 4, eta, &format!("i{i}-{j}-{k}")),
+                ));
+            }
+        }
+    }
+
+    // Total-order laws over the FULL domain (NaN/inf included).
+    for a in &domain {
+        assert_eq!(
+            spawn_intent_order(a, a),
+            Ordering::Equal,
+            "reflexive equality"
+        );
+        for b in &domain {
+            assert_eq!(
+                spawn_intent_order(a, b),
+                spawn_intent_order(b, a).reverse(),
+                "antisymmetry"
+            );
+            for c in &domain {
+                if spawn_intent_order(a, b) != Ordering::Greater
+                    && spawn_intent_order(b, c) != Ordering::Greater
+                {
+                    assert_ne!(
+                        spawn_intent_order(a, c),
+                        Ordering::Greater,
+                        "transitivity (the NaN cell the old tuple \
+                         partial_cmp + unwrap_or(Equal) violated)"
+                    );
+                }
+            }
+        }
+    }
+
+    // Finite-input equivalence with the retired comparator.
+    let old_order = |(pa, ia): &(f64, rio_proto::types::SpawnIntent),
+                     (pb, ib): &(f64, rio_proto::types::SpawnIntent)| {
+        (ib.ready.unwrap_or(true), *pb)
+            .partial_cmp(&(ia.ready.unwrap_or(true), *pa))
+            .unwrap_or(Ordering::Equal)
+            .then(ib.cores.cmp(&ia.cores))
+            .then(ia.eta_seconds.total_cmp(&ib.eta_seconds))
+            .then_with(|| ia.intent_id.cmp(&ib.intent_id))
+    };
+    for a in domain.iter().filter(|(p, _)| p.is_finite()) {
+        for b in domain.iter().filter(|(p, _)| p.is_finite()) {
+            assert_eq!(
+                spawn_intent_order(a, b),
+                old_order(a, b),
+                "no behavior change for finite inputs"
+            );
+        }
+    }
+
+    // And the sort itself survives a NaN-bearing population.
+    let mut v: Vec<_> = domain
+        .iter()
+        .cloned()
+        .cycle()
+        .take(domain.len() * 3)
+        .collect();
+    v.sort_unstable_by(spawn_intent_order);
+}

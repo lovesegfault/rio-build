@@ -1103,16 +1103,7 @@ impl DagActor {
         // superset of the forecast sort above so its order
         // survives within `ready=false`; per REVIEW.md
         // §HashMap-iteration. `eta` is a no-op for Ready (always 0.0).
-        intents.sort_unstable_by(|(pa, ia), (pb, ib)| {
-            // `unwrap_or(true)`: a pre-§13a sender omits field 13;
-            // pre-§13a only emitted Ready-loop intents (bug_001).
-            (ib.ready.unwrap_or(true), *pb)
-                .partial_cmp(&(ia.ready.unwrap_or(true), *pa))
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(ib.cores.cmp(&ia.cores))
-                .then(ia.eta_seconds.total_cmp(&ib.eta_seconds))
-                .then_with(|| ia.intent_id.cmp(&ib.intent_id))
-        });
+        intents.sort_unstable_by(spawn_intent_order);
 
         SpawnIntentsSnapshot {
             intents: intents.into_iter().map(|(_, i)| i).collect(),
@@ -1619,6 +1610,33 @@ pub(super) struct AckApplyPlan {
     /// the ordinal across it let a masked track read pass-adjacent
     /// when NoHost resumed (false consecutiveness).
     verdict_plane_present: bool,
+}
+
+/// bug_107: the spawn-intent emission order — `(ready desc, priority
+/// desc, cores desc, eta asc, intent_id asc)` — TOTAL over the full
+/// f64 domain. The previous inline `(bool, f64)` tuple
+/// `partial_cmp + unwrap_or(Equal)` was this pipeline's one surviving
+/// non-total comparator (driftsort-panic-eligible if a priority were
+/// ever NaN, a leader panic loop pointing at the sort, not the
+/// writer); NaN-freedom was enforced only by an `is_finite` filter
+/// two modules away (sla/mod.rs) — an invariant at a distance.
+/// `total_cmp` is the repo's standard for f64 sort keys (the eta leg
+/// below and the sibling sorts already use it); for finite inputs it
+/// orders identically to the old comparator, asserted by
+/// `spawn_intent_order_total_and_finite_compatible`.
+/// `unwrap_or(true)` on `ready`: a pre-§13a sender omits field 13;
+/// pre-§13a only emitted Ready-loop intents (bug_001).
+pub(crate) fn spawn_intent_order(
+    (pa, ia): &(f64, rio_proto::types::SpawnIntent),
+    (pb, ib): &(f64, rio_proto::types::SpawnIntent),
+) -> std::cmp::Ordering {
+    ib.ready
+        .unwrap_or(true)
+        .cmp(&ia.ready.unwrap_or(true))
+        .then(pb.total_cmp(pa))
+        .then(ib.cores.cmp(&ia.cores))
+        .then(ia.eta_seconds.total_cmp(&ib.eta_seconds))
+        .then_with(|| ia.intent_id.cmp(&ib.intent_id))
 }
 
 /// One decoded `BoundIntent` row — the typed remnant of the wire
