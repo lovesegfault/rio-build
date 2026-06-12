@@ -1258,6 +1258,140 @@ async fn consolidate_only_runs_kube_observations_and_reaps_with_empty_placeable(
     );
 }
 
+/// W11-AF (bug_112, the 404-parity row of `ctrl.pool.delete-outcome`):
+/// an idle reap whose DELETE returns 404 (Karpenter GC raced the
+/// controller) discharges the FULL `Ok` consequence — the censored
+/// `IdleGapEvent`, the `reaped_total{reason=idle}` counter, and the
+/// backing-node wedge-eviction feed — exactly like
+/// `health::reap_unhealthy`'s 404 arm. Pre-fix the lane's 404 arm was
+/// `=> {}`: the eviction feed, the counter, and the censored sample
+/// all silently skipped for the ~60-90s finalizer window.
+// r[verify ctrl.pool.delete-outcome]
+#[test]
+fn idle_reap_404_discharges_the_full_ok_consequence() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let mut lab = rt.block_on(Lab::new());
+    lab.r.consecutive_bot_ticks = 5;
+    {
+        // dead_channel's lazy connector spawns onto the ambient
+        // reactor — enter the rt for the construction only.
+        let _e = rt.enter();
+        lab.r.admin = admin_client(dead_channel());
+    }
+    let t = 1000u64;
+    // n-idle: idle since t-5000 (> the 300s policy floor) → reap fires;
+    // the DELETE comes back 404 (GC raced).
+    lab.r
+        .prev_idle
+        .insert("n-idle".into(), (T0 + t - 5000) as f64);
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        rt.block_on(lab.tick(
+            t,
+            consolidate_tick_scenario(
+                vec![],
+                vec![nc_json("n-idle", 0, Some(10))],
+                vec![Scenario::k8s_error(
+                    Method::DELETE,
+                    "/apis/karpenter.sh/v1/nodeclaims/n-idle",
+                    404,
+                    "NotFound",
+                    "nodeclaims.karpenter.sh \"n-idle\" not found",
+                )],
+            ),
+        ));
+    });
+
+    // The full Ok consequence, all three halves (the red asserts the
+    // halves the pre-fix `=> {}` arm dropped):
+    assert!(
+        lab.idle_gaps().iter().any(|g| g.censored),
+        "404 reap records its censored gap (arm parity)"
+    );
+    assert!(
+        lab.r.pending_wedge_evictions.contains("node-n-idle"),
+        "404 reap feeds the wedge eviction stash (arm parity): {:?}",
+        lab.r.pending_wedge_evictions
+    );
+    // ppppp: snapshot exactly once.
+    let snap = snapshotter.snapshot().into_vec();
+    let idle_count = snap.into_iter().find_map(|(k, _, _, v)| {
+        let key = k.key();
+        (key.name() == "rio_controller_nodeclaim_reaped_total"
+            && key
+                .labels()
+                .any(|l| l.key() == "reason" && l.value() == "idle"))
+        .then_some(v)
+    });
+    assert_eq!(
+        idle_count,
+        Some(DebugValue::Counter(1)),
+        "404 reap increments reaped_total{{reason=idle}} (arm parity)"
+    );
+    // The completed reap left no tombstone (it is not ambiguous).
+    assert!(
+        lab.r.delete_tombstones.is_empty(),
+        "a completed 404 reap carries no provenance obligation"
+    );
+}
+
+/// W11-AF sibling (the third arm): an idle DELETE erring non-404 is
+/// AMBIGUOUS — the lane tombstones the attempt (reason `Idle`, with
+/// its consequence packet) and applies NO consequence yet. Pre-fix
+/// the Err arm was warn-only: a committed-but-errored idle delete
+/// lost its provenance entirely (the bug_042 shape on a second lane).
+// r[verify ctrl.pool.delete-outcome]
+#[tokio::test]
+async fn idle_reap_ambiguous_err_tombstones_the_attempt() {
+    let mut lab = Lab::new().await;
+    lab.r.consecutive_bot_ticks = 5;
+    lab.r.admin = admin_client(dead_channel());
+    let t = 1000u64;
+    lab.r
+        .prev_idle
+        .insert("n-idle".into(), (T0 + t - 5000) as f64);
+
+    lab.tick(
+        t,
+        consolidate_tick_scenario(
+            vec![],
+            vec![nc_json("n-idle", 0, Some(10))],
+            vec![Scenario::k8s_error(
+                Method::DELETE,
+                "/apis/karpenter.sh/v1/nodeclaims/n-idle",
+                503,
+                "ServiceUnavailable",
+                "etcd leader changed",
+            )],
+        ),
+    )
+    .await;
+
+    assert!(
+        lab.r.delete_tombstones.contains("n-idle"),
+        "the ambiguous idle attempt's provenance survives the tick"
+    );
+    assert_eq!(
+        lab.r.delete_tombstones.reason("n-idle"),
+        Some(health::ReapReason::Idle),
+        "the tombstone carries the lane's own reason letter"
+    );
+    assert!(
+        !lab.r.pending_wedge_evictions.contains("node-n-idle"),
+        "no consequence before confirmation (the delete may not have committed)"
+    );
+    assert!(
+        !lab.idle_gaps().iter().any(|g| g.censored),
+        "no censored sample before confirmation"
+    );
+}
+
 /// FIX-T13 (⊥-tick close, boot half): a Registered edge INSIDE a
 /// pre-threshold outage window is observed on the ⊥ tick (5s ≤ the
 /// 30s recency gate) and its sample recorded; an edge first observed

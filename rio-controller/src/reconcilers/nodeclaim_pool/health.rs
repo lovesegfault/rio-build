@@ -61,15 +61,21 @@ fn dead_reap_cap(registered: usize) -> usize {
 /// `rio_controller_nodeclaim_reaped_total`, mask the cell if ICE, and
 /// queue the name for `inflight_created` cleanup.
 ///
-/// Called from BOTH the `Ok(_)` and `Err(404)` arms of the
-/// `delete()` match in [`reap_unhealthy`] — a 404 means Karpenter GC
-/// raced the controller's delete, but the claim *was* reaped and the
-/// cell is just as unfulfillable as if the controller had won the race.
-/// Diverging the arms (the original bug) leaves the cell unmasked for
-/// the rest of the tick → `cover_deficit` re-mints into it →
-/// `report_unfulfillable` never marks `IceBackoff` → the
-/// `RioNodeclaimPoolIceMaskedHigh` alert undercounts.
-fn record_reap(
+/// THE shared consequence chokepoint of the eviction-source law
+/// (`ctrl.pool.delete-outcome`): called from the
+/// [`DeleteOutcome::OkDeleted`] AND [`DeleteOutcome::Committed404`]
+/// arms of BOTH reap lanes ([`reap_unhealthy`] here,
+/// `consolidate::reap_idle`) — a 404 means Karpenter GC raced the
+/// controller's delete, but the claim *was* reaped and the cell is
+/// just as unfulfillable as if the controller had won the race.
+/// Diverging the arms (the original bug, re-shipped at reap_idle as
+/// bug_112) leaves the cell unmasked for the rest of the tick →
+/// `cover_deficit` re-mints into it → `report_unfulfillable` never
+/// marks `IceBackoff` → the `RioNodeclaimPoolIceMaskedHigh` alert
+/// undercounts — and on the idle lane drops the wedge-eviction feed,
+/// the reap counter, and the censored NA sample.
+// r[impl ctrl.pool.delete-outcome]
+pub(super) fn record_reap(
     reason: ReapReason,
     cell: Cell,
     name: &str,
@@ -98,6 +104,12 @@ pub enum ReapReason {
     BootTimeout,
     /// Scheduler-reported hung node.
     Dead,
+    /// Idle past the consolidation threshold (`consolidate::reap_idle`)
+    /// — joined the alphabet when the idle lane was re-typed onto
+    /// [`DeleteOutcome`] (bug_112): an ambiguous idle delete carries
+    /// the same tombstone obligation as the health reaps, so its
+    /// reason is a first-class letter, not a lane-local string.
+    Idle,
 }
 
 impl ReapReason {
@@ -106,8 +118,88 @@ impl ReapReason {
             Self::Ice => "ice",
             Self::BootTimeout => "boot-timeout",
             Self::Dead => "dead",
+            Self::Idle => "idle",
         }
     }
+
+    /// Every reason exactly once — census iteration domain (the
+    /// `WITNESSED_LETTERS` form: pinned by `reap_reason_alphabet_total`
+    /// so a new variant cannot ship without joining this set and
+    /// taking a row in every reason-indexed census).
+    #[cfg(test)]
+    pub(super) const ALL: [ReapReason; 4] = [Self::Ice, Self::BootTimeout, Self::Dead, Self::Idle];
+}
+
+/// One `Api::delete` call's outcome at a reap lane, as the
+/// eviction-source law sees it — the TYPED TOTAL the law lives on
+/// (bug_042 + bug_112): *404 = the full `Ok` consequence (the claim
+/// WAS reaped — Karpenter GC raced us); ambiguous non-404 `Err` = a
+/// tombstone whose reason's full consequence must eventually fire.*
+/// Pre-type, the law existed only as per-site match-arm discipline:
+/// each lane re-derived the arms independently and `reap_idle`
+/// discharged only the success arm (404 `=> {}`, Err warn-only).
+/// [`Self::classify`] is the SOLE translator from a raw kube delete
+/// `Result` — a lane matching the raw `Result` instead is the
+/// strawman the `delete_lane_census` red plants — and a `match` on
+/// the returned value is rustc-exhaustive: no lane can discharge one
+/// arm without naming the other two.
+// r[impl ctrl.pool.delete-outcome]
+#[derive(Debug)]
+#[must_use = "every DeleteOutcome arm carries a consequence decision (ctrl.pool.delete-outcome)"]
+pub enum DeleteOutcome {
+    /// `Ok(_)` — the controller's delete committed. Full consequence
+    /// NOW (counter, mask iff ICE, eviction feed, lane-local samples).
+    OkDeleted,
+    /// 404 — already gone: Karpenter GC raced the delete, but the
+    /// claim WAS reaped. The SAME full consequence as [`Self::OkDeleted`]
+    /// (the law's parity arm — diverging them is the original bug).
+    Committed404,
+    /// Non-404 error — AMBIGUOUS: the apiserver may have committed
+    /// the delete before erring. The lane MUST tombstone the attempt
+    /// (an [`AmbiguousDelete`] into [`DeleteTombstones`]) so the
+    /// reason's full consequence fires when a later observation
+    /// confirms the commit — never re-attributed as foreign teardown
+    /// evidence (bug_094), never silently dropped (bug_042).
+    AmbiguousErr(kube::Error),
+}
+
+impl DeleteOutcome {
+    /// The sole production translator from `Api::delete`'s result.
+    /// Total over the result domain: every kube error shape lands in
+    /// exactly one arm, and 404 is the only error that counts as a
+    /// completed reap (`delete_outcome_partition_total` walks the
+    /// product).
+    pub fn classify<T>(r: Result<T, kube::Error>) -> Self {
+        match r {
+            Ok(_) => Self::OkDeleted,
+            Err(kube::Error::Api(ae)) if ae.code == 404 => Self::Committed404,
+            Err(e) => Self::AmbiguousErr(e),
+        }
+    }
+}
+
+/// One ambiguous delete attempt, as produced by a reap lane's
+/// [`DeleteOutcome::AmbiguousErr`] arm — the REQUIRED product of that
+/// arm under the eviction-source law. Carries everything the reason's
+/// deferred FULL consequence needs, so confirmation does not depend
+/// on the claim still being readable (an absent claim's cell and
+/// backing node are unreadable at confirm time — the same argument as
+/// the `GcVanish` row's unreadable `Launched` axis):
+///
+/// - `cell`: the reap counter's label + the ICE mask target (iff
+///   `reason == Ice`).
+/// - `node_name`: the wedge-eviction feed half (bug_042 — a Dead
+///   reap's backing node must leave the wedge populations; `None` for
+///   never-registered claims, which have no backing node).
+/// - `idle_gap_secs`: `reap_idle`'s censored NA sample at delete time
+///   (`Some` iff `reason == Idle`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AmbiguousDelete {
+    pub name: String,
+    pub reason: ReapReason,
+    pub cell: Cell,
+    pub node_name: Option<String>,
+    pub idle_gap_secs: Option<f64>,
 }
 
 /// Classify each `live` NodeClaim's health. `Some(reason)` ⇒ reapable;
@@ -449,11 +541,12 @@ pub fn classify_vanish(
 /// either way, so nothing is suppressed on that arm).
 const TOMBSTONE_TTL_TICKS: u64 = 3;
 
-/// One ambiguous delete attempt: the [`ReapReason`] the controller
-/// classified before deleting, and the leader tick that stamped it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One stored ambiguous delete attempt: the full consequence packet
+/// the reap lane produced ([`AmbiguousDelete`]) plus the leader tick
+/// that stamped it.
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeleteAttempt {
-    pub reason: ReapReason,
+    pub seed: AmbiguousDelete,
     pub tick: u64,
 }
 
@@ -487,15 +580,18 @@ pub struct DeleteTombstones {
 }
 
 impl DeleteTombstones {
-    /// Record an ambiguous delete attempt at `tick`.
-    pub fn stamp(&mut self, name: String, reason: ReapReason, tick: u64) {
-        self.entries.insert(name, DeleteAttempt { reason, tick });
+    /// Record an ambiguous delete attempt at `tick` (re-stamping an
+    /// existing name refreshes its TTL and consequence packet — a
+    /// repeated `Err` is a fresh ambiguous attempt).
+    pub fn stamp(&mut self, seed: AmbiguousDelete, tick: u64) {
+        self.entries
+            .insert(seed.name.clone(), DeleteAttempt { seed, tick });
     }
 
     /// The tombstoned reason for `name`, if any — the provenance axis
     /// [`classify_vanish`] consumes.
     pub fn reason(&self, name: &str) -> Option<ReapReason> {
-        self.entries.get(name).map(|a| a.reason)
+        self.entries.get(name).map(|a| a.seed.reason)
     }
 
     /// Consume `name`'s tombstone (exit observed or retry completed).
@@ -539,21 +635,22 @@ impl DeleteTombstones {
 ///   must not re-feed the Dead arm or inflate the systemic
 ///   populations.
 ///
-/// `Api::delete` 404 is ignored; other errors warn, tombstone the
-/// attempt (`delete_attempted` — the outcome is AMBIGUOUS: the
-/// apiserver may have committed before erring), and skip (next tick
-/// retries if the claim is still alive).
+/// `Api::delete` outcomes are the [`DeleteOutcome`] total: 404 takes
+/// the full `Ok` consequence (the claim WAS reaped — GC raced);
+/// other errors warn, tombstone the attempt (`delete_attempted` —
+/// the outcome is AMBIGUOUS: the apiserver may have committed before
+/// erring), and skip (next tick retries if the claim is still alive).
 #[derive(Debug, Default)]
 pub struct ReapOutcome {
     pub ice_cells: Vec<Cell>,
     pub reaped_claims: Vec<String>,
     pub reaped_nodes: Vec<String>,
-    /// `(name, reason)` for deletes that returned a non-404 error.
+    /// Consequence packets for deletes that returned a non-404 error.
     /// The callers stamp these into their [`DeleteTombstones`] so the
     /// next tick's vanish fold classifies a committed-but-errored
     /// delete as [`VanishClass::SelfReap`] — this controller's own
     /// reap, never Karpenter evidence (bug_094).
-    pub delete_attempted: Vec<(String, ReapReason)>,
+    pub delete_attempted: Vec<AmbiguousDelete>,
 }
 
 pub async fn reap_unhealthy(
@@ -590,9 +687,20 @@ pub async fn reap_unhealthy(
         if pass_fence.check("nodeclaim-reap-unhealthy").is_err() {
             break;
         }
-        match nodeclaims.delete(&n.name, &DeleteParams::default()).await {
-            Ok(_) => {
-                debug!(name = %n.name, %cell, reason = reason.as_str(), "reaped unhealthy NodeClaim");
+        // The eviction-source law's typed total (ctrl.pool.delete-
+        // outcome): the raw kube Result is translated ONCE, and the
+        // exhaustive match below is the lane's per-arm consequence
+        // decision — the 404 arm shares the OkDeleted consequence
+        // path by or-pattern (parity unwritable-to-diverge).
+        let outcome =
+            DeleteOutcome::classify(nodeclaims.delete(&n.name, &DeleteParams::default()).await);
+        let raced = matches!(outcome, DeleteOutcome::Committed404);
+        match outcome {
+            DeleteOutcome::OkDeleted | DeleteOutcome::Committed404 => {
+                debug!(
+                    name = %n.name, %cell, reason = reason.as_str(), raced,
+                    "reaped unhealthy NodeClaim (404 = Karpenter GC raced; same full consequence)"
+                );
                 record_reap(
                     reason,
                     cell,
@@ -602,21 +710,7 @@ pub async fn reap_unhealthy(
                 );
                 out.reaped_nodes.extend(n.node_name.clone());
             }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                // Already gone (Karpenter GC raced us). Apply the FULL
-                // `Ok(_)` consequence — the claim *was* reaped, just not
-                // by us. See `record_reap` doc.
-                debug!(name = %n.name, %cell, reason = reason.as_str(), "unhealthy NodeClaim already gone (GC raced); recorded reap");
-                record_reap(
-                    reason,
-                    cell,
-                    &n.name,
-                    &mut out.ice_cells,
-                    &mut out.reaped_claims,
-                );
-                out.reaped_nodes.extend(n.node_name.clone());
-            }
-            Err(e) => {
+            DeleteOutcome::AmbiguousErr(e) => {
                 // AMBIGUOUS: the apiserver may have committed the
                 // delete before erring. The name must not vanish from
                 // provenance — a next-tick terminating/absent
@@ -626,7 +720,13 @@ pub async fn reap_unhealthy(
                     "unhealthy NodeClaim delete failed; tombstoning the attempt \
                      (ambiguous commit) and retrying next tick if still alive"
                 );
-                out.delete_attempted.push((n.name.clone(), reason));
+                out.delete_attempted.push(AmbiguousDelete {
+                    name: n.name.clone(),
+                    reason,
+                    cell,
+                    node_name: n.node_name.clone(),
+                    idle_gap_secs: None,
+                });
             }
         }
     }
@@ -644,6 +744,88 @@ mod tests {
             lead_time_seed: [(format!("{h}:spot"), seed)].into(),
             ..Default::default()
         }
+    }
+
+    /// Minimal tombstone seed for the provenance-plane tests (cell
+    /// `h:spot`, no backing node, no idle gap — the axes under test
+    /// are name/reason/clock).
+    fn ts_seed(name: &str, reason: ReapReason) -> AmbiguousDelete {
+        AmbiguousDelete {
+            name: name.into(),
+            reason,
+            cell: Cell("h".into(), CapacityType::Spot),
+            node_name: None,
+            idle_gap_secs: None,
+        }
+    }
+
+    /// `ReapReason::ALL` is total over the alphabet — rustc
+    /// exhaustiveness pins the index map, so a new variant cannot
+    /// compile without joining `ALL` (and thereby every reason-indexed
+    /// census product).
+    #[test]
+    fn reap_reason_alphabet_total() {
+        let idx = |r: ReapReason| -> usize {
+            match r {
+                ReapReason::Ice => 0,
+                ReapReason::BootTimeout => 1,
+                ReapReason::Dead => 2,
+                ReapReason::Idle => 3,
+            }
+        };
+        let mut seen = [false; ReapReason::ALL.len()];
+        for r in ReapReason::ALL {
+            assert!(!seen[idx(r)], "duplicate {r:?} in ALL");
+            seen[idx(r)] = true;
+        }
+        assert!(seen.iter().all(|s| *s), "ALL covers every variant");
+    }
+
+    /// The [`DeleteOutcome::classify`] partition, walked over the
+    /// reachable result product (Ok + every distinct kube error
+    /// shape): total — every input lands in exactly one arm — and 404
+    /// is the ONLY error that counts as a completed reap. This is the
+    /// (outcome × lane) totality proof at the classifier; the per-lane
+    /// arm decisions are rustc-exhaustive matches at the two delete
+    /// sites (`delete_lane_census` pins the lane population).
+    // r[verify ctrl.pool.delete-outcome]
+    #[test]
+    fn delete_outcome_partition_total() {
+        let api_err = |code: u16| {
+            kube::Error::Api(
+                kube::core::Status::failure("m", "r")
+                    .with_code(code)
+                    .boxed(),
+            )
+        };
+        assert!(matches!(
+            DeleteOutcome::classify(Ok::<(), _>(())),
+            DeleteOutcome::OkDeleted
+        ));
+        assert!(matches!(
+            DeleteOutcome::classify(Err::<(), _>(api_err(404))),
+            DeleteOutcome::Committed404
+        ));
+        // Every NON-404 api code is ambiguous (the apiserver may have
+        // committed before erring) — including the conflict/forbidden
+        // shapes a wrong fix might special-case as "definitely not
+        // deleted".
+        for code in [400u16, 403, 409, 410, 422, 429, 500, 503] {
+            assert!(
+                matches!(
+                    DeleteOutcome::classify(Err::<(), _>(api_err(code))),
+                    DeleteOutcome::AmbiguousErr(_)
+                ),
+                "api code {code} must classify ambiguous"
+            );
+        }
+        // Non-API transport shapes (connection reset mid-flight is the
+        // canonical committed-but-errored case) are ambiguous too.
+        let transport = kube::Error::Service(Box::new(std::io::Error::other("conn reset")));
+        assert!(matches!(
+            DeleteOutcome::classify(Err::<(), _>(transport)),
+            DeleteOutcome::AmbiguousErr(_)
+        ));
     }
 
     /// bug_040: a cell absent from `lead_time_seed` (a new hw-class
@@ -906,7 +1088,7 @@ mod tests {
         // face).
         let mut inflight: HashMap<String, Cell> = [("nc-bt".to_string(), h.clone())].into();
         let mut ts = DeleteTombstones::default();
-        ts.stamp("nc-bt".into(), ReapReason::BootTimeout, 7);
+        ts.stamp(ts_seed("nc-bt", ReapReason::BootTimeout), 7);
         let mut n = with_conds(
             node("nc-bt", "h", CapacityType::Spot, 8, 0, 0),
             &[("Launched", "True", 1001.0)],
@@ -927,7 +1109,7 @@ mod tests {
         // ambiguous error), counted under ice, NOT vanished.
         let mut inflight: HashMap<String, Cell> = [("nc-ice".to_string(), h.clone())].into();
         let mut ts = DeleteTombstones::default();
-        ts.stamp("nc-ice".into(), ReapReason::Ice, 7);
+        ts.stamp(ts_seed("nc-ice", ReapReason::Ice), 7);
         let rec = DebuggingRecorder::new();
         let _g = ::metrics::set_default_local_recorder(&rec);
         let ice = detect_vanished(&mut inflight, &mut ts, &[]);
@@ -951,7 +1133,7 @@ mod tests {
         let h = Cell("h".into(), CapacityType::Spot);
         let mut inflight: HashMap<String, Cell> = [("nc-x".to_string(), h.clone())].into();
         let mut ts = DeleteTombstones::default();
-        ts.stamp("nc-x".into(), ReapReason::BootTimeout, 10);
+        ts.stamp(ts_seed("nc-x", ReapReason::BootTimeout), 10);
         ts.prune_expired(10);
         assert!(ts.contains("nc-x"), "fresh stamp survives its own tick");
 
@@ -973,9 +1155,10 @@ mod tests {
     /// census was enrolled and GREEN over a product missing the
     /// deciding axes): `classify_vanish` product-iterated over
     /// (present × registered × terminating × launched × provenance) —
-    /// 96 cells, every axis value FROM the alphabet (`Option<bool>`
-    /// is `launched()`'s full range; the provenance axis is
-    /// `Option<ReapReason>` over the closed reason enum). Each row
+    /// 120 cells, every axis value FROM the alphabet (`Option<bool>`
+    /// is `launched()`'s full range; the provenance axis derives from
+    /// `ReapReason::ALL`, the pinned closed enum — bug_112 widened it
+    /// with `Idle`). Each row
     /// asserts its class AND its mark/tracking/tombstone effect
     /// through the production `detect_vanished` fold. Generator: the
     /// loop product + rustc exhaustiveness at the law match.
@@ -987,12 +1170,9 @@ mod tests {
             for registered in [false, true] {
                 for terminating in [false, true] {
                     for launched in [None, Some(false), Some(true)] {
-                        for tombstoned in [
-                            None,
-                            Some(ReapReason::Ice),
-                            Some(ReapReason::BootTimeout),
-                            Some(ReapReason::Dead),
-                        ] {
+                        for tombstoned in
+                            std::iter::once(None).chain(ReapReason::ALL.into_iter().map(Some))
+                        {
                             let n = match launched {
                                 None => node("nc-x", "h", CapacityType::Spot, 8, 0, 0),
                                 Some(l) => with_conds(
@@ -1030,7 +1210,7 @@ mod tests {
                                 [("nc-x".to_string(), h.clone())].into();
                             let mut ts = DeleteTombstones::default();
                             if let Some(r) = tombstoned {
-                                ts.stamp("nc-x".into(), r, 1);
+                                ts.stamp(ts_seed("nc-x", r), 1);
                             }
                             let live = if present { vec![n] } else { vec![] };
                             let ice = detect_vanished(&mut inflight, &mut ts, &live);
@@ -1366,5 +1546,177 @@ mod tests {
         // Only `a` (Launched=False) is ICE; `b` is BootTimeout.
         assert_eq!(ice_cells, vec![&0]);
         assert_eq!(r[1].1, ReapReason::BootTimeout);
+    }
+
+    /// The production half of one embedded source: everything before
+    /// the first `#[cfg(test)]`-gated module BODY (`mod … {`). A
+    /// `#[cfg(test)] mod x;` DECLARATION is not a split point —
+    /// mod.rs declares `lifecycle_tests` that way near the top, and
+    /// splitting there would silently blank the whole reconciler out
+    /// of the census (the merged_bug_018 negative-extent shape).
+    fn census_prod_half(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        for i in 0..lines.len() {
+            if lines[i].trim() == "#[cfg(test)]"
+                && i + 1 < lines.len()
+                && lines[i + 1].contains("mod ")
+                && lines[i + 1].trim_end().ends_with('{')
+            {
+                return lines[..i].join("\n");
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// The strawman detector (W11-AH): every `.delete(` call in the
+    /// production half must be routed through
+    /// `DeleteOutcome::classify(` within the 3 lines at/above the
+    /// call — a lane matching the raw kube `Result` (the bug_112
+    /// shape: arms re-derived per site, one discharged) is returned
+    /// as a violation with its 1-based line. Fail-closed: the scan is
+    /// a total line walk over the production half — there is no skip
+    /// arm, no unparseable-context exemption.
+    fn unclassified_delete_lanes(src: &str) -> Vec<usize> {
+        let prod = census_prod_half(src);
+        let lines: Vec<&str> = prod.lines().collect();
+        let mut out = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            if l.contains(".delete(") {
+                let lo = i.saturating_sub(3);
+                let routed = lines[lo..=i]
+                    .iter()
+                    .any(|w| w.contains("DeleteOutcome::classify("));
+                if !routed {
+                    out.push(i + 1);
+                }
+            }
+        }
+        out
+    }
+
+    /// W11-AH — the delete-lane census ([GEN-SET]; the R28 partition
+    /// axis of `ctrl.pool.delete-outcome`): the law's population is
+    /// ALL reap lanes, machine-derived two ways and pinned
+    /// bidirectionally per (wwwww):
+    ///
+    /// 1. **Universe**: the embedded source set IS mod.rs's own
+    ///    module-declaration grammar (non-`#[cfg(test)]` `mod x;`
+    ///    rows) — adding a submodule without enrolling its source
+    ///    here is a red, so a NEW delete lane cannot hide in an
+    ///    unembedded file.
+    /// 2. **Lanes**: every `.delete(` site in every production half
+    ///    routes through `DeleteOutcome::classify` (the sole
+    ///    translator); the total lane count is pinned so a new lane
+    ///    is a conscious census row, not a silent sibling.
+    // r[verify ctrl.pool.delete-outcome]
+    #[test]
+    fn delete_lane_census() {
+        const MOD_SRC: &str = include_str!("mod.rs");
+        const SOURCES: &[(&str, &str)] = &[
+            ("consolidate", include_str!("consolidate.rs")),
+            ("cover", include_str!("cover.rs")),
+            ("evidence", include_str!("evidence.rs")),
+            ("ffd", include_str!("ffd.rs")),
+            ("health", include_str!("health.rs")),
+            ("pods", include_str!("pods.rs")),
+            ("sketch", include_str!("sketch.rs")),
+            ("wedge", include_str!("wedge.rs")),
+        ];
+        // (1) Universe: derived from mod.rs's declaration grammar.
+        let mod_lines: Vec<&str> = MOD_SRC.lines().collect();
+        let mut declared: Vec<String> = Vec::new();
+        for (i, l) in mod_lines.iter().enumerate() {
+            let t = l.trim();
+            let decl = t
+                .strip_prefix("pub(crate) mod ")
+                .or_else(|| t.strip_prefix("pub mod "))
+                .or_else(|| t.strip_prefix("mod "));
+            if let Some(rest) = decl
+                && let Some(name) = rest.strip_suffix(';')
+            {
+                let test_gated = i > 0 && mod_lines[i - 1].trim() == "#[cfg(test)]";
+                if !test_gated {
+                    declared.push(name.to_string());
+                }
+            }
+        }
+        declared.sort();
+        let mut embedded: Vec<&str> = SOURCES.iter().map(|(n, _)| *n).collect();
+        embedded.sort();
+        assert_eq!(
+            declared, embedded,
+            "census universe == mod.rs's module list (enroll the new module's \
+             source in SOURCES, then classify its delete lanes)"
+        );
+        // (2) Lanes: zero unclassified delete sites anywhere, and the
+        // lane count pinned (health::reap_unhealthy +
+        // consolidate::reap_idle — the two lanes of the eviction-
+        // source law).
+        let mut lanes = 0usize;
+        for (name, src) in SOURCES.iter().chain([&("mod", MOD_SRC)]) {
+            let bad = unclassified_delete_lanes(src);
+            assert!(
+                bad.is_empty(),
+                "{name}.rs has raw-Result delete lanes at production lines {bad:?} \
+                 — route through DeleteOutcome::classify (ctrl.pool.delete-outcome)"
+            );
+            lanes += census_prod_half(src)
+                .lines()
+                .filter(|l| l.contains(".delete("))
+                .count();
+        }
+        assert_eq!(
+            lanes, 2,
+            "delete-lane population drifted — a new reap lane must take \
+             its own DeleteOutcome census row (and its consequence arms)"
+        );
+    }
+
+    /// W11-AH planted reds — one plant per leniency point in the
+    /// detector's OWN control flow (R22″): the corpus strings are
+    /// driven through the same detector that polices production.
+    #[test]
+    fn delete_lane_census_plants() {
+        // (a) The strawman raw-Result lane (the bug_112 shape) FIRES.
+        let raw_lane = "fn lane() {\n    match nodeclaims.delete(&n.name, &dp).await {\n        Ok(_) => {}\n        Err(e) => {}\n    }\n}";
+        assert_eq!(
+            unclassified_delete_lanes(raw_lane),
+            vec![2],
+            "planted red: the raw-Result lane must be detected"
+        );
+        // (b) The radius edge: classify FOUR lines above the call is
+        // outside the 3-line co-location window — still a violation
+        // (the window is the enforced idiom, not a suggestion).
+        let out_of_radius =
+            "let o = DeleteOutcome::classify(x);\n// 1\n// 2\n// 3\nlet r = api.delete(&n).await;";
+        assert_eq!(
+            unclassified_delete_lanes(out_of_radius),
+            vec![5],
+            "planted red: out-of-radius classify does not launder the lane"
+        );
+        // (c) Green twins — both production idioms pass: same-line
+        // (health) and call-wrapped-next-line (consolidate).
+        let same_line = "let o = DeleteOutcome::classify(api.delete(&n, &dp).await);";
+        let next_line =
+            "let o = health::DeleteOutcome::classify(\n    api.delete(&n, &dp).await,\n);";
+        assert!(unclassified_delete_lanes(same_line).is_empty());
+        assert!(unclassified_delete_lanes(next_line).is_empty());
+        // (d) The prod-split leniency, BOTH sides: a raw lane in the
+        // production half fires even when a test module follows; the
+        // same lane inside the cfg(test) BODY is exempt; and a
+        // cfg(test) mod DECLARATION does not blank what follows it.
+        let split_both_sides = "fn lane() {\n    api.delete(&n).await;\n}\n#[cfg(test)]\nmod tests {\n    fn t() { api.delete(&n).await; }\n}";
+        assert_eq!(
+            unclassified_delete_lanes(split_both_sides),
+            vec![2],
+            "planted red: prod half fires; cfg(test) body exempt"
+        );
+        let decl_not_split =
+            "#[cfg(test)]\nmod lifecycle_tests;\nfn lane() {\n    api.delete(&n).await;\n}";
+        assert_eq!(
+            unclassified_delete_lanes(decl_not_split),
+            vec![4],
+            "planted red: a cfg(test) mod DECLARATION must not blank the file"
+        );
     }
 }

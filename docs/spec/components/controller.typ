@@ -1849,6 +1849,38 @@ gate state, lease-holder only).
   here.
 ]
 
+#r("ctrl.pool.delete-outcome")[
+  Every NodeClaim reap lane (the unhealthy reap AND the idle
+  consolidation reap, and any lane added later) MUST translate its
+  `Api::delete` result through ONE shared typed total ---
+  `DeleteOutcome` with exactly the arms `OkDeleted`, `Committed404`,
+  and `AmbiguousErr` --- and MUST discharge every arm: `OkDeleted` and
+  `Committed404` apply the reason's IDENTICAL full consequence (the
+  reap counter under the lane's own reason, the ICE mask iff the
+  reason is ICE, the backing-node wedge-eviction feed, and the lane's
+  local samples --- a 404 means Karpenter GC raced the delete, but the
+  claim WAS reaped); `AmbiguousErr` MUST stamp a delete-provenance
+  tombstone carrying the reason's full consequence packet (reason,
+  cell, backing node, lane-local sample data). Every tombstone MUST be
+  consumed by an arm applying its reason's full consequence when a
+  later observation confirms the commit, or expire as a TYPED,
+  DISCLOSED disposition --- never a silent prune; a lane that matches
+  the raw kube `Result` instead of the shared total is forbidden (the
+  lane census over the reconciler's delete-call sites is the
+  enforcement).
+]
+The pre-type history is two strikes of one shape: `record_reap`'s own
+doc records the 404-vs-`Ok` divergence as "the original bug", and
+bug_112 re-shipped it at `reap_idle` (404 arm `=> {}`, `Err` arm
+warn-only) because the law existed only as per-site match-arm
+discipline --- N lanes, N hand-copies. bug_042 is the tombstone half:
+the registered-claim tombstones (Dead reaps) had no consumer at all,
+so a committed-but-errored Dead reap's wedge eviction never fired and
+`reaped_total{reason=dead}` permanently undercounted. The typed total
+makes a one-armed lane unwritable (rustc exhaustiveness), and the
+consumer census makes an unconsumed tombstone a structural
+impossibility rather than a per-site promise.
+
 #r("ctrl.nodeclaim.consolidate-only-degraded+3")[
   After `BOT_TICKS_BEFORE_CONSOLIDATE_ONLY` (5) consecutive failed
   `GetSpawnIntents` polls the NodeClaim-pool reconciler MUST run in

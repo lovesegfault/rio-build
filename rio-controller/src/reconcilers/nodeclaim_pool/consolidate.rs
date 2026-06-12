@@ -18,6 +18,7 @@ use tracing::{debug, warn};
 
 use super::NodeClaimPoolConfig;
 use super::ffd::{LiveNode, Placement, cells_of, system_to_arch};
+use super::health;
 use super::sketch::{Cell, CellSketches};
 use rio_proto::types::SpawnIntent;
 
@@ -353,6 +354,27 @@ pub struct ReapInputs<'a, F: Fn(&str, Option<&str>, &[String]) -> bool> {
     pub now_secs: f64,
 }
 
+/// One `reap_idle` tick's outcome — the idle lane's mirror of
+/// `health::ReapOutcome`, carried so the caller can discharge the
+/// SAME eviction-source-law obligations for both lanes
+/// (`ctrl.pool.delete-outcome`).
+#[derive(Debug, Default)]
+pub struct ReapIdleOutcome {
+    /// Backing-node names of reaped claims — the wedge tracker's
+    /// eviction-stash feed (merged_bug_017).
+    pub reaped_nodes: Vec<String>,
+    /// Claim names whose delete COMPLETED (`OkDeleted`/`Committed404`)
+    /// — the caller consumes any prior ambiguous-attempt tombstone for
+    /// them (the completed retry already applied the consequence).
+    pub reaped_claims: Vec<String>,
+    /// Consequence packets for ambiguous (non-404 `Err`) deletes —
+    /// stamped into the caller's `DeleteTombstones` (bug_112: the idle
+    /// lane previously discharged only the success arm, so an
+    /// ambiguous-commit idle delete lost its counter, its censored NA
+    /// sample, and its wedge eviction).
+    pub delete_attempted: Vec<health::AmbiguousDelete>,
+}
+
 /// Reap idle Registered NodeClaims past their break-even threshold.
 ///
 /// A node is reapable when: `registered` AND not `terminating` AND not
@@ -361,20 +383,23 @@ pub struct ReapInputs<'a, F: Fn(&str, Option<&str>, &[String]) -> bool> {
 /// [`consolidate_after`] over the cell's `idle_gap_events`, raised to
 /// `hold_open_threshold` for hold-open nodes
 /// (`max(max_consolidation_time, na)` when set, else `2 × na`). Each
-/// reap records a censored `IdleGapEvent`. `Api::delete` 404 is ignored
-/// (already-gone race with Karpenter); other errors warn + skip.
-/// Returns the backing-node names of the claims it deleted, so the
-/// caller can feed them to the wedge tracker's eviction stash exactly
-/// like `reap_unhealthy`'s reaps (merged_bug_017: BOTH reap paths are
-/// admission-eviction sources; idle reaps previously bypassed the
-/// stash, leaving the reaped node's still-open attempts admissible).
+/// completed reap (`Ok` AND 404 — the [`health::DeleteOutcome`] parity
+/// arms, bug_112) records the full consequence: the censored
+/// `IdleGapEvent`, the `reaped_total{reason=idle}` counter, and the
+/// backing-node eviction feed; an ambiguous error tombstones the
+/// attempt with its consequence packet. Returns [`ReapIdleOutcome`] so
+/// the caller feeds the wedge tracker's eviction stash exactly like
+/// `reap_unhealthy`'s reaps (merged_bug_017: BOTH reap paths are
+/// admission-eviction sources) and services the tombstone plane for
+/// both lanes alike.
+// r[impl ctrl.pool.delete-outcome]
 pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
     nodeclaims: &Api<NodeClaim>,
     live: &[LiveNode],
     sketches: &mut CellSketches,
     pass_fence: &crate::reconcilers::fence::MutationFence,
     inputs: &ReapInputs<'_, F>,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<ReapIdleOutcome> {
     let ReapInputs {
         placeable,
         deferred,
@@ -386,7 +411,7 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
     } = inputs;
     let now_secs = *now_secs;
     let reserved: HashSet<&str> = placeable.iter().map(|(_, n, _)| n.as_str()).collect();
-    let mut reaped_backing: Vec<String> = Vec::new();
+    let mut out = ReapIdleOutcome::default();
 
     // Phase 0: per-cell context, computed once per cell. r37 bug_006:
     // iterate all_cells so a cell with no idle/registered/unreserved
@@ -483,18 +508,39 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
         if pass_fence.check("nodeclaim-reap-idle").is_err() {
             break;
         }
-        match nodeclaims.delete(&n.name, &DeleteParams::default()).await {
-            Ok(_) => {
-                debug!(name = %n.name, %cell, idle, threshold, "reaped idle NodeClaim");
+        // The eviction-source law's typed total (ctrl.pool.delete-
+        // outcome): same translator and same arm shape as
+        // `health::reap_unhealthy` — the 404 arm shares the OkDeleted
+        // consequence path by or-pattern (bug_112: the pre-typed lane
+        // discharged only the success arm, so a GC-raced idle reap
+        // fed neither the eviction stash, the counter, nor the
+        // censored NA sample, and an ambiguous error lost its
+        // provenance entirely).
+        let outcome = health::DeleteOutcome::classify(
+            nodeclaims.delete(&n.name, &DeleteParams::default()).await,
+        );
+        let raced = matches!(outcome, health::DeleteOutcome::Committed404);
+        match outcome {
+            health::DeleteOutcome::OkDeleted | health::DeleteOutcome::Committed404 => {
+                debug!(
+                    name = %n.name, %cell, idle, threshold, raced,
+                    "reaped idle NodeClaim (404 = Karpenter GC raced; same full consequence)"
+                );
                 if let Some(bn) = n.node_name.clone() {
-                    reaped_backing.push(bn);
+                    out.reaped_nodes.push(bn);
                 }
-                metrics::counter!(
-                    "rio_controller_nodeclaim_reaped_total",
-                    "reason" => "idle",
-                    "cell" => cell.to_string(),
-                )
-                .increment(1);
+                // The shared consequence chokepoint (counter +
+                // reaped-claims push; Idle never ICE-masks, so the
+                // mask sink is a local empty vec asserted unused).
+                let mut no_mask = Vec::new();
+                health::record_reap(
+                    health::ReapReason::Idle,
+                    cell.clone(),
+                    &n.name,
+                    &mut no_mask,
+                    &mut out.reaped_claims,
+                );
+                debug_assert!(no_mask.is_empty(), "Idle reaps never ICE-mask");
                 push_idle_gap(
                     sketches,
                     cell,
@@ -504,11 +550,23 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
                     },
                 );
             }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
-            Err(e) => warn!(name = %n.name, error = %e, "idle NodeClaim delete failed; skipping"),
+            health::DeleteOutcome::AmbiguousErr(e) => {
+                warn!(
+                    name = %n.name, error = %e,
+                    "idle NodeClaim delete failed; tombstoning the attempt \
+                     (ambiguous commit) and retrying next tick if still idle"
+                );
+                out.delete_attempted.push(health::AmbiguousDelete {
+                    name: n.name.clone(),
+                    reason: health::ReapReason::Idle,
+                    cell: cell.clone(),
+                    node_name: n.node_name.clone(),
+                    idle_gap_secs: Some(idle),
+                });
+            }
         }
     }
-    Ok(reaped_backing)
+    Ok(out)
 }
 
 /// Edge-detect idle→busy transitions and record them as uncensored

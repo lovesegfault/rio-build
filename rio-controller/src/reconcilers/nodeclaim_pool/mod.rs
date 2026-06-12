@@ -1768,9 +1768,8 @@ impl NodeClaimPoolReconciler {
         // bug_094: ambiguous (non-404 Err) deletes tombstone their
         // provenance for the vanish fold; stamp-then-prune so a fresh
         // stamp is never expired by its own tick.
-        for (name, reason) in delete_attempted {
-            self.delete_tombstones
-                .stamp(name, reason, self.tick_counter);
+        for seed in delete_attempted {
+            self.delete_tombstones.stamp(seed, self.tick_counter);
         }
         self.delete_tombstones.prune_expired(self.tick_counter);
         ice_cells.extend(health::detect_vanished(
@@ -1853,7 +1852,22 @@ impl NodeClaimPoolReconciler {
         .await?;
         // merged_bug_017: idle reaps are eviction sources too — both
         // reap paths feed the wedge stash (consumed next tick).
-        self.pending_wedge_evictions.extend(idle_reaped);
+        self.pending_wedge_evictions
+            .extend(idle_reaped.reaped_nodes);
+        // The idle lane services the SAME tombstone plane as the
+        // health lane (ctrl.pool.delete-outcome): a completed retry
+        // consumes its prior ambiguous-attempt tombstone (the prompt
+        // arm already applied the consequence); an ambiguous error
+        // stamps its consequence packet. Stamps here land AFTER this
+        // tick's vanish fold ran above — they are first consultable
+        // at the next fold, exactly like the health lane's
+        // stamp-then-fold-next-tick shape.
+        for name in &idle_reaped.reaped_claims {
+            self.delete_tombstones.remove(name);
+        }
+        for seed in idle_reaped.delete_attempted {
+            self.delete_tombstones.stamp(seed, self.tick_counter);
+        }
 
         if !self.reload_pending() {
             self.sketches.persist(&self.pg).await?;
@@ -1929,7 +1943,17 @@ impl NodeClaimPoolReconciler {
         .await?;
         // merged_bug_017: idle reaps are eviction sources too — both
         // reap paths feed the wedge stash (consumed next tick).
-        self.pending_wedge_evictions.extend(idle_reaped);
+        self.pending_wedge_evictions
+            .extend(idle_reaped.reaped_nodes);
+        // Idle-lane tombstone plane, same both-modes treatment as the
+        // health lane below (ctrl.pool.delete-outcome): completed
+        // retries consume, ambiguous attempts stamp.
+        for name in &idle_reaped.reaped_claims {
+            self.delete_tombstones.remove(name);
+        }
+        for seed in idle_reaped.delete_attempted {
+            self.delete_tombstones.stamp(seed, self.tick_counter);
+        }
         // No wedge evidence without the scheduler (the open-attempt
         // view is unreadable); local
         // ICE-timeout detection still runs on `live`. bug_082 sibling:
@@ -1967,9 +1991,8 @@ impl NodeClaimPoolReconciler {
             self.inflight_created.remove(name);
             self.delete_tombstones.remove(name);
         }
-        for (name, reason) in outcome.delete_attempted {
-            self.delete_tombstones
-                .stamp(name, reason, self.tick_counter);
+        for seed in outcome.delete_attempted {
+            self.delete_tombstones.stamp(seed, self.tick_counter);
         }
         self.delete_tombstones.prune_expired(self.tick_counter);
         let vanished = health::detect_vanished(
