@@ -3979,6 +3979,9 @@ mod tests {
         }
         actor.sla_config.hw_classes = classes;
         actor.sla_config.reference_hw_class = "hi-nvme-x86".into();
+        // bug_119: the shipped classes replaced the fixture's set —
+        // re-arm the membership snapshot (sched.sla.class-membership).
+        crate::actor::tests::helpers::rearm_membership(&mut actor);
         let mut m = std::collections::HashMap::new();
         m.insert("hi-nvme-x86".to_string(), 2.0);
         m.insert("hi-nvme-x86-g7".to_string(), 1.4);

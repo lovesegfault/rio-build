@@ -521,8 +521,8 @@ async fn ack_observed_instance_types_folds_into_cost_table() {
     crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
 
-    let spot: crate::sla::config::Cell = ("mid-ebs-x86".into(), CapacityType::Spot);
-    let od: crate::sla::config::Cell = ("mid-ebs-x86".into(), CapacityType::Od);
+    let spot: crate::sla::config::Cell = ("intel-7".into(), CapacityType::Spot);
+    let od: crate::sla::config::Cell = ("intel-7".into(), CapacityType::Od);
     assert!(actor.cost_table.read().menu(&spot).is_empty());
 
     // Controller's `Cell::to_string` form: `"h:spot"` / `"h:od"`
@@ -534,13 +534,13 @@ async fn ack_observed_instance_types_folds_into_cost_table() {
             &[],
             &[
                 ObservedInstanceType {
-                    cell: "mid-ebs-x86:spot".into(),
+                    cell: "intel-7:spot".into(),
                     instance_type: "c7i.8xlarge".into(),
                     cores: 32,
                     mem_bytes: 64 << 30,
                 },
                 ObservedInstanceType {
-                    cell: "mid-ebs-x86:od".into(),
+                    cell: "intel-7:od".into(),
                     instance_type: "m7i.8xlarge".into(),
                     cores: 32,
                     mem_bytes: 128 << 30,
@@ -557,6 +557,66 @@ async fn ack_observed_instance_types_folds_into_cost_table() {
     assert_eq!(ct.menu(&spot)[0].name, "c7i.8xlarge");
     assert_eq!(ct.menu(&spot)[0].cores, 32);
     assert_eq!(ct.menu(&od).len(), 1, "controller 'od' form parses");
+}
+
+/// **W11-AZ wiring cell (bug_119)** — the membership gate is ARMED at
+/// actor construction (DagActor::new installs the configured set on
+/// BOTH stores from `cfg.sla.hw_classes`): an unknown class arriving
+/// through the FULL ack path grows neither the durable observed-types
+/// menu nor the ICE mask, while configured-class siblings on the SAME
+/// request land. This is the regression pin for the wiring itself —
+/// without it, dropping the two construction statements would
+/// silently disarm the seam (membership `None` = legacy-admit).
+// r[verify sched.sla.class-membership]
+#[tokio::test]
+async fn ack_unknown_class_grows_nothing() {
+    use crate::sla::config::CapacityType;
+    use rio_proto::types::ObservedInstanceType;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+
+    let known: crate::sla::config::Cell = ("intel-7".into(), CapacityType::Spot);
+    let ghost: crate::sla::config::Cell = ("ghost-class".into(), CapacityType::Spot);
+
+    actor
+        .handle_ack_spawned_intents(
+            &[],
+            // marks: ghost + known ride the same request.
+            &["ghost-class:spot".into(), "intel-7:spot".into()],
+            &[],
+            &[
+                ObservedInstanceType {
+                    cell: "ghost-class:spot".into(),
+                    instance_type: "c7i.8xlarge".into(),
+                    cores: 32,
+                    mem_bytes: 64 << 30,
+                },
+                ObservedInstanceType {
+                    cell: "intel-7:spot".into(),
+                    instance_type: "c7i.8xlarge".into(),
+                    cores: 32,
+                    mem_bytes: 64 << 30,
+                },
+            ],
+            &[],
+            None,
+            &[],
+        )
+        .expect("membership skew is per-entry, never a whole-request refusal");
+
+    let ct = actor.cost_table.read();
+    assert!(
+        ct.menu(&ghost).is_empty(),
+        "unknown class must not reach the durable observed-types store"
+    );
+    assert_eq!(ct.menu(&known).len(), 1, "known sibling lands");
+    assert!(
+        !actor.ice.is_masked(&ghost),
+        "unknown class must not grow the ICE mask"
+    );
+    assert!(actor.ice.is_masked(&known), "known sibling masks");
 }
 
 /// **`bound_intents` round-trips into `authoritative_binding`**
@@ -734,11 +794,10 @@ async fn ack_observed_lands_pre_reload_and_survives_the_edge_reload() {
     let db = TestDb::new(&MIGRATOR).await;
     crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
-    let spot: crate::sla::config::Cell =
-        ("mid-ebs-x86".into(), crate::sla::config::CapacityType::Spot);
+    let spot: crate::sla::config::Cell = ("intel-7".into(), crate::sla::config::CapacityType::Spot);
 
     let observed = [ObservedInstanceType {
-        cell: "mid-ebs-x86:spot".into(),
+        cell: "intel-7:spot".into(),
         instance_type: "c7i.8xlarge".into(),
         cores: 32,
         mem_bytes: 64 << 30,
@@ -754,7 +813,7 @@ async fn ack_observed_lands_pre_reload_and_survives_the_edge_reload() {
     actor
         .handle_ack_spawned_intents(
             &[],
-            &["mid-ebs-x86:spot".into()],
+            &["intel-7:spot".into()],
             &[],
             &observed,
             &[],
@@ -4523,21 +4582,12 @@ async fn leadership_cycle_resets_the_epoch_watermark() {
     let db = TestDb::new(&MIGRATOR).await;
     crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
-    let cell: crate::sla::config::Cell =
-        ("mid-ebs-x86".into(), crate::sla::config::CapacityType::Spot);
+    let cell: crate::sla::config::Cell = ("intel-7".into(), crate::sla::config::CapacityType::Spot);
 
     // Old controller lineage: genuine mark at epoch 1000 — masked,
     // watermark ratchets to 1000.
     actor
-        .handle_ack_spawned_intents(
-            &[],
-            &["mid-ebs-x86:spot@1000".into()],
-            &[],
-            &[],
-            &[],
-            None,
-            &[],
-        )
+        .handle_ack_spawned_intents(&[], &["intel-7:spot@1000".into()], &[], &[], &[], None, &[])
         .expect("mark applied under leadership");
     assert_eq!(
         actor.ice.step(&cell),
@@ -4569,15 +4619,7 @@ async fn leadership_cycle_resets_the_epoch_watermark() {
     // lose edge, so the mark APPLIES — post-expiry consecutive
     // failure climbs the ladder and re-masks.
     actor
-        .handle_ack_spawned_intents(
-            &[],
-            &["mid-ebs-x86:spot@500".into()],
-            &[],
-            &[],
-            &[],
-            None,
-            &[],
-        )
+        .handle_ack_spawned_intents(&[], &["intel-7:spot@500".into()], &[], &[], &[], None, &[])
         .expect("successor-lineage mark applied");
     assert_eq!(
         actor.ice.step(&cell),
@@ -4728,6 +4770,9 @@ async fn rung_one_ice_advances_to_a_different_rung() {
             class: "intel-8r7".into(),
         }],
     });
+    // bug_119: the rung sibling joined the config post-construction —
+    // re-arm the membership snapshot so its cells pass the gate.
+    crate::actor::tests::helpers::rearm_membership(&mut actor);
     actor.test_inject_ready("d0", Some("test-pkg"), "x86_64-linux", false);
 
     let cells_of = |i: &rio_proto::types::SpawnIntent| -> Vec<(String, String)> {

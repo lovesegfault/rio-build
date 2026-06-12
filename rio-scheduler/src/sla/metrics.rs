@@ -129,7 +129,12 @@ pub fn describe_all() {
          not a 0-core fact; sched.sla.merge-law); `nonfinite_epoch`: a \
          stored epoch decoded to ±inf/NaN ('infinity'::timestamptz — \
          refused so one poisoned row cannot disarm the stale clamp or \
-         wedge the lambda watermark; sched.sla.epoch-domain). \
+         wedge the lambda watermark; sched.sla.epoch-domain); \
+         `sequence_premise`: the λ-cursor CACHE-1 premise failed — the \
+         cursor freezes loud (sched.sla.epoch-domain's R29 sibling, \
+         merged_bug_063); `unknown_class`: a cell event or observation \
+         named a hw class outside the configured set \
+         (sched.sla.class-membership). \
          Sustained nonzero ⇒ a producer is shipping junk evidence (or \
          a poisoned PG row needs operator surgery); the stores stay \
          clean but the named plane is learning nothing from those \
@@ -454,7 +459,14 @@ pub const SLA_LABELED_METRICS: &[(&str, &str, &[&str])] = &[
         // sequence-premise freeze (cache != 1). Further reasons append
         // via the label-extension lane as their emits land (the
         // hw_ladder row's precedent).
-        &["zero_resource", "nonfinite_epoch", "sequence_premise"],
+        // bw11 WO-S6-4: the configured-set membership refusal at the
+        // closed-domain stores' growth seams.
+        &[
+            "zero_resource",
+            "nonfinite_epoch",
+            "sequence_premise",
+            "unknown_class",
+        ],
     ),
     (
         "rio_scheduler_sla_hw_ladder_exhausted_total",

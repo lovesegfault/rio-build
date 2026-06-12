@@ -5046,6 +5046,32 @@ upsert qual refuses rewinds, so the row is read-dead (refused at every
 load) until operator surgery, and the staleness clamp plus
 `RioSlaHwCostStale` arm truthfully the moment the stamp stops decoding.
 
+#r("sched.sla.class-membership")[
+  An open-string wire grammar feeding closed-domain SLA stores MUST carry a
+  MEMBERSHIP SEAM at the consumer's growth boundary: hw classes decoded from
+  cell events join the durable observed-types store and the ICE mask's
+  TTL-less watermark only by lookup against the configured class set.
+  Membership skew MUST be exactly as loud as grammar skew --- a typed,
+  counted letter (`_evidence_refused_total{reason="unknown_class"}`) ---
+  never silent durable growth. Arm dispositions (recorded): the DURABLE
+  observed-types store REFUSES the entry; the in-memory, redelivery-tolerant
+  ICE mask WARNS-AND-DROPS per event (whole-request refusal would wedge the
+  controller's commit-on-Ack redelivery loop on one skewed entry, and an
+  unknown-class mask is read-dead --- dispatch subtracts masks from
+  CONFIGURED cells only).
+]
+
+The seam makes the prose cardinality bounds enforceable: "Bounded by
+`|H|x2`" on the watermark and the catalog-bounded observed-types claim were
+producer-honesty prose over a grammar that admits any string before the
+last `:` --- a skewed or defective producer grew durable KeepForever state
+silently while undecodable entries got the loud refusal lane. The
+membership snapshot is installed at actor construction from the
+process-immutable configured set and carried across the lease-edge reload
+with the other process-lifetime table state; unarmed (`None`) admits ---
+the legacy lane for direct test constructions and the pre-construction
+boot window, pinned by the wiring regression test.
+
 #r("sched.sla.forecast.one-layer+2")[
   `compute_spawn_intents` walks the Ready frontier AND a forecast frontier of
   `Queued` derivations whose every incomplete dependency is running with a

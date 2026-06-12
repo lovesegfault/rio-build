@@ -198,6 +198,39 @@ pub(crate) fn setup_actor_configured(
     )
 }
 
+/// bug_119: a minimal builder-shaped `HwClassDef` for tests that mark
+/// or arm ad-hoc class names through the ack path — the membership
+/// gate (sched.sla.class-membership) admits only configured classes,
+/// so a test's cells must exist in its actor's config exactly as
+/// production cells do.
+pub(crate) fn minimal_hw_class(h: &str) -> crate::sla::config::HwClassDef {
+    crate::sla::config::HwClassDef {
+        labels: vec![crate::sla::config::NodeLabelMatch {
+            key: "rio.build/hw-class".into(),
+            value: h.into(),
+        }],
+        max_cores: Some(64),
+        max_mem: Some(256 << 30),
+        ..Default::default()
+    }
+}
+
+/// bug_119: re-arm the membership gates after a test mutates
+/// `actor.sla_config.hw_classes` post-construction (production config
+/// is process-immutable; these tests model a DIFFERENT deployment's
+/// config, so the snapshot must follow). Replaces the ICE mask
+/// wholesale — call straight after the config swap, before any marks.
+pub(crate) fn rearm_membership(actor: &mut DagActor) {
+    actor
+        .cost_table
+        .write()
+        .set_member_classes(actor.sla_config.hw_classes.keys().cloned());
+    actor.ice = std::sync::Arc::new(
+        crate::sla::cost::IceBackoff::new(actor.sla_config.max_lead_time)
+            .with_members(actor.sla_config.hw_classes.keys().cloned()),
+    );
+}
+
 /// Construct a bare (unspawned) actor for tests that exercise `&self`
 /// snapshot methods directly.
 pub(crate) fn bare_actor(pool: sqlx::PgPool) -> DagActor {
@@ -774,6 +807,14 @@ fn seed_hw_actor(mut actor: DagActor) -> DagActor {
     *actor.cost_table.write() =
         crate::sla::cost::CostTable::seeded("", crate::sla::cost::HwCostSource::Spot);
     actor.sla_tiers = actor.sla_config.solve_tiers();
+    // The wholesale table swap above discards the membership snapshot
+    // DagActor::new installed (bug_119) — re-install it like the
+    // resolved-global below, so harness actors match production
+    // construction.
+    actor
+        .cost_table
+        .write()
+        .set_member_classes(actor.sla_config.hw_classes.keys().cloned());
     actor.cost_table.write().set_resolved_global((
         actor.sla_config.max_cores.unwrap() as u32,
         actor.sla_config.max_mem.unwrap(),

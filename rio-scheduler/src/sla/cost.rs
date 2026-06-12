@@ -457,6 +457,18 @@ pub struct CostTable {
     /// site rather than relying on the absence of
     /// [`spot_price_poller`] (bug_034).
     source: HwCostSource,
+    /// bug_119 (sched.sla.class-membership): the configured hw-class
+    /// MEMBERSHIP SNAPSHOT — the open-string cell-wire grammar feeds
+    /// closed-domain stores, so the stores' growth seams gate on
+    /// configured-set lookup. `None` = unarmed (direct test
+    /// constructions; the boot window before actor construction —
+    /// pollers only reload/persist in that window, never grow from
+    /// the wire). Installed once at actor construction from the
+    /// process-immutable `cfg.sla.hw_classes` (the
+    /// `set_resolved_global` wiring pattern); process-lifetime like
+    /// `catalog_ceilings` (NOT in PG, carried across the lease-edge
+    /// reload by [`Self::carry_catalog`]).
+    member_classes: Option<HashSet<HwClassName>>,
     /// The SETTLED λ consumption horizon (merged_bug_063): every
     /// `interrupt_samples.id <= lambda_cursor` is consumed-or-skipped
     /// FOREVER; `refresh_lambda` consumes `(lambda_cursor,
@@ -573,6 +585,17 @@ impl CostTable {
         })
     }
 
+    // r[impl sched.sla.class-membership]
+    /// bug_119: install the configured hw-class membership snapshot
+    /// (the validate-boundary set for the wire-fed closed-domain
+    /// stores). Called once at actor construction from
+    /// `cfg.sla.hw_classes` — the same cfg→table wiring block as
+    /// `set_resolved_global`. Idempotent (last write wins; the config
+    /// is process-immutable).
+    pub fn set_member_classes(&mut self, classes: impl IntoIterator<Item = HwClassName>) {
+        self.member_classes = Some(classes.into_iter().collect());
+    }
+
     /// §13c-3: whether [`Self::set_resolved_global`] has run.
     /// `DagActor::new` checks this to wire up tests/non-K8s spawns
     /// that pass a fresh `CostTable` (production main.rs always sets
@@ -604,6 +627,7 @@ impl CostTable {
     pub fn carry_catalog(&mut self, mut fresh: Self) {
         fresh.catalog_ceilings = std::mem::take(&mut self.catalog_ceilings);
         fresh.resolved_global = self.resolved_global.take();
+        fresh.member_classes = self.member_classes.take();
         for (cell, mine) in std::mem::take(&mut self.cells) {
             let menu = fresh.cells.entry(cell).or_default();
             for it in mine {
@@ -1385,6 +1409,31 @@ impl CostTable {
                 .increment(1);
                 continue;
             }
+            // r[impl sched.sla.class-membership]
+            // bug_119: the durable observed-types store admits only
+            // configured-set members. An unknown class (controller
+            // version skew across a config change, or a producer
+            // defect) is a typed, counted refusal — membership skew
+            // is as loud as grammar skew, and KeepForever rows can no
+            // longer grow on producer honesty alone (the "bounded by
+            // the cloud catalog" claim becomes seam-enforced).
+            if let Some(members) = &self.member_classes
+                && !members.contains(&cell.0)
+            {
+                tracing::warn!(
+                    cell = %cell_label(&cell),
+                    instance_type = %name,
+                    "unknown hw class in instance-type observation refused \
+                     (not in the configured class set)"
+                );
+                ::metrics::counter!(
+                    "rio_scheduler_sla_evidence_refused_total",
+                    "plane" => "observed_types",
+                    "reason" => "unknown_class"
+                )
+                .increment(1);
+                continue;
+            }
             let menu = self.cells.entry(cell.clone()).or_default();
             let incoming = InstanceType {
                 name,
@@ -1514,10 +1563,24 @@ pub struct IceBackoff {
     /// and `clear()` RETAINS the entry, so a redelivered retained
     /// mark after a local clear no-ops instead of re-masking the
     /// just-proven-healthy cell (axis 3). Bounded by |H|×2 (one entry
-    /// per cell); in-memory, lease-holder-only — same posture as the
-    /// ladder above.
+    /// per cell) — SEAM-ENFORCED since bug_119: the wire entry points
+    /// gate on the configured-set membership snapshot (`members`), so
+    /// the key set cannot grow past the configured classes; the bound
+    /// is no longer producer-honesty prose. In-memory,
+    /// lease-holder-only — same posture as the ladder above.
     last_applied: DashMap<Cell, EvidenceEpoch>,
     max_lead_time: Duration,
+    /// bug_119 (sched.sla.class-membership): configured-set
+    /// membership snapshot gating the WIRE growth seams
+    /// ([`Self::apply_mark_event`] / [`Self::apply_clear_event`] —
+    /// the only paths that insert keys into `cells`/`last_applied`
+    /// from wire data). `None` = unarmed (direct test
+    /// constructions); production installs it at actor construction
+    /// via [`Self::with_members`]. With the gate armed, both maps'
+    /// key sets are subsets of the configured classes × capacity
+    /// types — the "Bounded by |H|×2" doc above becomes
+    /// seam-enforced instead of producer-honesty prose.
+    members: Option<HashSet<HwClassName>>,
 }
 
 impl Default for IceBackoff {
@@ -1536,7 +1599,50 @@ impl IceBackoff {
             // boot. Clamp (validation also rejects non-finite values
             // at config load).
             max_lead_time: rio_common::clamped::clamped_duration_secs(max_lead_time_secs.max(1.0)),
+            members: None,
         }
+    }
+
+    // r[impl sched.sla.class-membership]
+    /// bug_119: arm the configured-set membership gate on the wire
+    /// growth seams (builder form — the actor constructor chains it
+    /// onto [`Self::new`] from the process-immutable
+    /// `cfg.sla.hw_classes`).
+    pub fn with_members(mut self, members: impl IntoIterator<Item = HwClassName>) -> Self {
+        self.members = Some(members.into_iter().collect());
+        self
+    }
+
+    /// The membership gate shared by both wire entry points. `true`
+    /// = admit. On refusal: typed warn + counted letter, and the
+    /// event is DROPPED per-entry (never a whole-request refusal:
+    /// marks/clears redeliver on Ack-Err via the controller's
+    /// commit-on-Ack buffer, so refusing the request would wedge the
+    /// ack loop on one skewed entry — the bug_142 lesson; an
+    /// unknown-class mask is read-dead anyway, since dispatch
+    /// computes `A \ masked` over CONFIGURED cells only). The
+    /// warn-and-drop vs refuse asymmetry against the durable
+    /// observed-types store is the recorded in-slot arm choice:
+    /// in-memory + redelivery-tolerant here, durable + KeepForever
+    /// there.
+    fn member_gate(&self, cell: &Cell) -> bool {
+        if let Some(m) = &self.members
+            && !m.contains(&cell.0)
+        {
+            tracing::warn!(
+                cell = %cell_label(cell),
+                "unknown hw class in cell event dropped (not in the \
+                 configured class set)"
+            );
+            ::metrics::counter!(
+                "rio_scheduler_sla_evidence_refused_total",
+                "plane" => "cell_event",
+                "reason" => "unknown_class"
+            )
+            .increment(1);
+            return false;
+        }
+        true
     }
 
     /// WIRE-lane mark entry point (`AckSpawnedIntents`
@@ -1551,6 +1657,10 @@ impl IceBackoff {
     /// (legacy epoch-less entry) = today's semantics exactly,
     /// `last_applied` untouched.
     pub fn apply_mark_event(&self, cell: &Cell, epoch: Option<EvidenceEpoch>) {
+        // r[impl sched.sla.class-membership]
+        if !self.member_gate(cell) {
+            return;
+        }
         // `.map(|e| *e)` copies and drops the `Ref` guard BEFORE the
         // insert below (DashMap shard RwLock is non-reentrant — the
         // `is_masked` hazard).
@@ -1569,6 +1679,10 @@ impl IceBackoff {
     /// the no-op arm keeps a stale/redelivered clear from re-running
     /// the ladder reset out of order.
     pub fn apply_clear_event(&self, cell: &Cell, epoch: Option<EvidenceEpoch>) {
+        // r[impl sched.sla.class-membership]
+        if !self.member_gate(cell) {
+            return;
+        }
         match epoch_gate(self.last_applied.get(cell).map(|e| *e), epoch) {
             EpochGate::Legacy => self.clear(cell),
             EpochGate::Apply(e) => {
@@ -2883,6 +2997,79 @@ mod tests {
             })
             .sum();
         assert_eq!(refused, 4, "each refused observation is a counted letter");
+    }
+
+    // r[verify sched.sla.class-membership]
+    /// **W11-AZ (bug_119, red-first)** — *durable closed-domain
+    /// stores admit only configured-set members; population: both
+    /// stores × {known, unknown, skewed} classes* (a "skewed" class —
+    /// once configured, since removed — is runtime-indistinguishable
+    /// from unknown: the snapshot is the CURRENT configured set, so
+    /// one cell covers both). Pre-fix, the cell-wire grammar
+    /// (hw-class = any string before the last ':') fed the TTL-less
+    /// `IceBackoff::last_applied` watermark and the union-only
+    /// KeepForever observed-types store unconditionally — unknown
+    /// classes grew durable state silently while grammar skew got the
+    /// loud refusal lane. Post-fix: membership skew is a typed,
+    /// counted letter at each store's growth seam (refuse for the
+    /// durable store; warn-and-drop for the redelivery-tolerant
+    /// in-memory mask — the recorded arm choice), with zero growth.
+    #[test]
+    fn w11_az_unknown_class_grows_no_closed_domain_store() {
+        use metrics_util::debugging::DebugValue;
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        let known: Cell = ("intel-7".into(), CapacityType::Spot);
+        let ghost: Cell = ("ghost-class".into(), CapacityType::Spot);
+
+        // Store 1: the durable observed-types menu.
+        let mut t = CostTable::default();
+        t.set_member_classes(["intel-7".to_owned()]);
+        t.observe_instance_types([
+            (known.clone(), "c7i.8xlarge".into(), 32, 64 << 30),
+            (ghost.clone(), "c7i.8xlarge".into(), 32, 64 << 30),
+        ]);
+        assert_eq!(t.menu(&known).len(), 1, "known class folds");
+        assert!(
+            t.menu(&ghost).is_empty() && !t.cells.contains_key(&ghost),
+            "unknown class must not mint a durable menu row or cell"
+        );
+
+        // Store 2: the ICE mask's ladder + watermark.
+        let ice = IceBackoff::new(3600.0).with_members(["intel-7".to_owned()]);
+        ice.apply_mark_event(&ghost, Some(EvidenceEpoch(10)));
+        ice.apply_clear_event(&ghost, Some(EvidenceEpoch(11)));
+        assert!(
+            !ice.is_masked(&ghost) && ice.last_applied.get(&ghost).is_none(),
+            "unknown class must not grow the mask ladder or the \
+             TTL-less watermark"
+        );
+        ice.apply_mark_event(&known, Some(EvidenceEpoch(10)));
+        assert!(ice.is_masked(&known), "known class still masks");
+
+        // The letters are counted (one per dropped event; snapshot
+        // once — it drains).
+        let refused: u64 = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, _, _, _)| k.key().name() == "rio_scheduler_sla_evidence_refused_total")
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(refused, 3, "observe + mark + clear letters counted");
+
+        // Unarmed (None) stays legacy-permissive: direct test
+        // constructions and the pre-install boot window admit — the
+        // gate arms at actor construction (wiring pinned by
+        // `ack_unknown_class_grows_nothing`, actor/tests).
+        let mut unarmed = CostTable::default();
+        unarmed.observe_instance_types([(ghost.clone(), "x".into(), 1, 1)]);
+        assert_eq!(unarmed.menu(&ghost).len(), 1);
     }
 
     // r[verify sched.sla.epoch-domain]

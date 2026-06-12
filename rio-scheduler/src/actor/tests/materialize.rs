@@ -8054,7 +8054,20 @@ async fn materialization_mint_carries_no_builder_binding() -> TestResult {
 #[tokio::test]
 async fn materialization_mint_leaves_ice_mask_untouched() -> TestResult {
     use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm, SpawnIntent};
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    // bug_119: the membership gate admits only configured classes —
+    // the test's h-mat cell needs a config home (same mock-store
+    // wiring as setup_with_mock_store, with the class added).
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.sla
+                .hw_classes
+                .insert("h-mat".into(), minimal_hw_class("h-mat"));
+        });
+    let (_db, _tasks) = (db, (actor_task, store_task));
 
     let out = test_store_path("mat091-out");
     store.state.substitutable.write().unwrap().push(out.clone());

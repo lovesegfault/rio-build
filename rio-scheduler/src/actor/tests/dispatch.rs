@@ -1206,7 +1206,16 @@ async fn pull_mint_ice_clear_only_at_single_cell() -> TestResult {
             .expect("actor alive")
     }
 
-    let (_db, handle, _task) = setup().await;
+    // bug_119: the membership gate admits only configured classes —
+    // give this test's h0/h1/h2 cells a real config home, as
+    // production cells have.
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |cfg, _| {
+        for h in ["h0", "h1", "h2"] {
+            cfg.sla.hw_classes.insert(h.into(), minimal_hw_class(h));
+        }
+    });
 
     // |A'| = 2: arm both cells for "ice-multi" and mark h0 ICE.
     let _ev1 = merge_single_node(

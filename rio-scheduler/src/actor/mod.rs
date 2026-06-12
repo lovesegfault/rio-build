@@ -1053,7 +1053,17 @@ impl DagActor {
             {
                 ct.set_resolved_global((c as u32, m));
             }
+            // bug_119 (sched.sla.class-membership): install the
+            // configured-set membership snapshot on the shared table
+            // (unconditional — cfg.sla is process-immutable; same
+            // wiring block as the resolved-global above).
+            ct.set_member_classes(cfg.sla.hw_classes.keys().cloned());
         }
+        // bug_119: snapshot the configured classes BEFORE `cfg.sla`
+        // moves into the struct literal below (the ICE mask's gate
+        // consumes it after the move point).
+        let member_classes: Vec<crate::sla::config::HwClassName> =
+            cfg.sla.hw_classes.keys().cloned().collect();
         let sla_ceilings = crate::sla::solve::Ceilings::from_resolved(
             &cfg.sla,
             plumbing.cost_table.read().resolved_global(),
@@ -1123,7 +1133,11 @@ impl DagActor {
             cost_table: plumbing.cost_table,
             cost_was_leader: plumbing.cost_was_leader,
             cost_reload_notify: plumbing.cost_reload_notify,
-            ice: Arc::new(crate::sla::cost::IceBackoff::new(max_lead_time)),
+            // bug_119: the ICE mask's wire growth seams gate on the
+            // same configured-set membership.
+            ice: Arc::new(
+                crate::sla::cost::IceBackoff::new(max_lead_time).with_members(member_classes),
+            ),
             dispatched_cells: dashmap::DashMap::new(),
             solve_cache: Arc::default(),
             tick_count: 0,
