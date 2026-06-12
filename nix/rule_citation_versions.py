@@ -174,32 +174,96 @@ def collect_defined(spec_root: Path):
     return defined, errors
 
 
-# Locations tracey's scanner DOES read (config.styx include +
-# test_include, abridged to the classes that matter here): markers in
-# these files are tracey's domain — its bump/stale-review flow owns
-# un-versioned markers there, and this lint re-adjudicating them
-# would contradict the scanner's own semantics. Everything else is a
-# BLIND tier: marker-form tokens there look load-bearing but nothing
-# validates them (bug_017's substitute-scale.nix specimen).
-TRACEY_SCANNED_SUFFIXES = {".rs", ".ts"}
-TRACEY_SCANNED_NIX = {
-    "nix/base-runtime-spec.nix",
-    "nix/docker.nix",
-    "nix/tests/default.nix",
-    "nix/kani.nix",
-    "nix/quint.nix",
-}
+# Locations tracey's scanner DOES read: PARSED from
+# .config/tracey/config.styx include/test_include/exclude at startup
+# (WO-S8-10, merged_bug_159 — R33 list-mirrors-list: the former
+# hand-abridged suffix approximation treated ALL .rs/.ts as
+# tracey-scanned, so an enrollment omission was structurally
+# unvalidatable — post-bump staleness invisible to every validator,
+# coverage greenness masked by duplicate impls in scanned crates;
+# the bug_017 class re-opened inside the lint built to close it).
+# Markers in ENROLLED files are tracey's domain — its bump/
+# stale-review flow owns un-versioned markers there. Everything else
+# is a BLIND tier: this lint adjudicates versioned cites there, and
+# a MARKER-form token in an un-enrolled file is itself a violation
+# (tracey cannot validate it — the omission face made loud).
+TRACEY_CONFIG = ".config/tracey/config.styx"
+# tracey parses these extensions (SUPPORTED_EXTENSIONS, tracey-core
+# sources.rs — .proto/.svelte/.yaml are skipped even if globbed; the
+# config.styx header comment is the in-repo record).
+TRACEY_PARSEABLE = {".rs", ".ts", ".nix", ".typ"}
 
 
-def tracey_scanned(rel: str, suffix: str) -> bool:
-    if suffix in TRACEY_SCANNED_SUFFIXES:
-        return True
-    if rel in TRACEY_SCANNED_NIX or rel.startswith("nix/nixos-node/"):
-        return True
-    return False
+def _styx_patterns(styx_text: str):
+    """All patterns under include/test_include/exclude blocks. The
+    styx surface this consumes is line-shaped: a block opener
+    `include (` / `test_include (` / `exclude (` followed by one
+    pattern per line to the closing `)`."""
+    inc, exc = [], []
+    bucket = None
+    for raw in styx_text.splitlines():
+        line = raw.split("//")[0].strip()
+        if not line:
+            continue
+        m = re.match(r"(include|test_include|exclude)\s*\($", line)
+        if m:
+            bucket = "exc" if m.group(1) == "exclude" else "inc"
+            continue
+        if bucket is not None:
+            if line == ")":
+                bucket = None
+                continue
+            (inc if bucket == "inc" else exc).append(line)
+    return inc, exc
 
 
-def scan_tree(root: Path, defined: dict):
+def _glob_to_re(pat: str):
+    """tracey's glob semantics, per the config.styx header record:
+    `*` matches ACROSS `/` (not POSIX single-segment — the reason the
+    dashboard files are listed by explicit filename), and `**/`
+    matches zero or more whole segments (so `src/**/*.rs` covers
+    `src/lib.rs` and `src/a/b.rs` alike)."""
+    out = []
+    i = 0
+    while i < len(pat):
+        if pat.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+            continue
+        c = pat[i]
+        if c == "*":
+            while i < len(pat) and pat[i] == "*":
+                i += 1
+            out.append(".*")
+            continue
+        out.append(re.escape(c))
+        i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+
+def load_tracey_scope(root: Path):
+    """(include_res, exclude_res) parsed from the ONE source."""
+    cfg = root / TRACEY_CONFIG
+    if not cfg.is_file():
+        return None  # main() errors; selftest builds its own
+    inc, exc = _styx_patterns(cfg.read_text(encoding="utf-8"))
+    if not inc:
+        return None
+    return [_glob_to_re(p) for p in inc], [_glob_to_re(p) for p in exc]
+
+
+def tracey_scanned(rel: str, suffix: str, scope) -> bool:
+    if scope is None or suffix not in TRACEY_PARSEABLE:
+        return False
+    inc, exc = scope
+    if any(r.match(rel) for r in exc):
+        return False
+    return any(r.match(rel) for r in inc)
+
+
+def scan_tree(root: Path, defined: dict, scope=None):
+    if scope is None:
+        scope = load_tracey_scope(root)
     violations = []
     for f in sorted(root.rglob("*")):
         if not f.is_file() or f.suffix not in SCAN_SUFFIXES:
@@ -245,13 +309,27 @@ def scan_tree(root: Path, defined: dict):
                         line,
                     )
                 )
-                if tracey_scanned(rel, f.suffix):
+                if tracey_scanned(rel, f.suffix, scope):
                     # Markers (any version state) belong to tracey's
                     # own stale-review flow in its scanned tiers; the
                     # residual load-bearing form here is a VERSIONED
                     # non-marker cite, which nothing else validates.
                     if marker_form or not versioned:
                         continue
+                elif marker_form and f.suffix in TRACEY_PARSEABLE:
+                    # WO-S8-10: a MARKER-form token in a tracey-
+                    # parseable file OUTSIDE the enrolled scope is the
+                    # merged_bug_159 omission face — tracey cannot
+                    # validate it, and pre-parse this lint silently
+                    # ceded it by suffix. Loud, with the remedy named.
+                    violations.append(
+                        f"{rel}:{lineno}: r[...] marker outside tracey "
+                        f"enrollment — {TRACEY_CONFIG} does not include "
+                        f"this file, so the marker is validated by "
+                        f"NOTHING; enroll the file (include/test_include) "
+                        f"or rewrite the marker as prose"
+                    )
+                    continue
                 elif not versioned and not marker_form:
                     # Blind tier, bare prose mention: the stable-name
                     # convention (see SCAN_SUFFIXES note).
@@ -310,6 +388,24 @@ def self_test():
         (spec / "x.typ").write_text('#r("dom.area.rule+2")[body]\n')
         defined, errs = collect_defined(spec)
         assert not errs and defined == {"dom.area.rule": 2}, "mint parse"
+        # WO-S8-10: the fixture root carries its own tracey config —
+        # the scope is PARSED, never approximated, in the selftest
+        # exactly as in production (one source).
+        styx = root / TRACEY_CONFIG
+        styx.parent.mkdir(parents=True)
+        styx.write_text(
+            "specs (\n  {\n    impls (\n      {\n"
+            "        include (\n          h.rs\n          i.rs\n"
+            "          runtime/result.rs\n          fuzz/fuzz_targets/wire.rs\n"
+            "        )\n"
+            "        test_include (\n          g.nix\n        )\n"
+            "        exclude (\n          target/**\n        )\n"
+            "      }\n    )\n  }\n)\n"
+        )
+        scope = load_tracey_scope(root)
+        assert scope is not None and len(scope[0]) == 5, "styx parse"
+        assert tracey_scanned("h.rs", ".rs", scope), "enrolled file not in scope"
+        assert not tracey_scanned("z.rs", ".rs", scope), "un-enrolled file in scope"
         cases = [
             # (file, body, must_fail, early-continue arm the case
             # co-locates with — None for the token-grammar arms)
@@ -322,6 +418,11 @@ def self_test():
             ("g.nix", "# r[verify dom.area.rule+2]\n", False, None),  # exact marker
             ("h.rs", "// r[impl dom.area.rule]\n", False, "tracey-scope"),  # tracey-scanned marker: tracey's domain
             ("i.rs", "// per dom.area.rule+1 above\n", True, "tracey-scope"),  # scanned tier, stale versioned prose
+            # W12-BH (WO-S8-10): a marker-bearing tracey-parseable file
+            # OUTSIDE the parsed enrollment is the omission face —
+            # red as unvalidatable-detected (pre-parse: silently ceded
+            # by suffix; the lineCursor/authz-kernel shape).
+            ("z.rs", "// r[impl dom.area.rule]\n", True, "tracey-scope"),
             # The adjacency plants at the SCAN layer (hole 1): a stale
             # versioned cite right before sentence punctuation must
             # fail — red against the old regex, which read it as an
@@ -344,7 +445,7 @@ def self_test():
         arms_planted = set()
         for name, body, must_fail, arm in cases:
             (root / name).write_text(body)
-            got = scan_tree(root, defined)
+            got = scan_tree(root, defined, scope)
             failed = any(name in v for v in got)
             assert failed == must_fail, f"self-test arm for {name}: {got}"
             (root / name).unlink()
@@ -353,7 +454,7 @@ def self_test():
         # read-failure arm: undecodable bytes are skipped, never a
         # crash and never a phantom violation.
         (root / "q.nix").write_bytes(b"\xff\xfe per dom.area.rule+1\n")
-        got = scan_tree(root, defined)
+        got = scan_tree(root, defined, scope)
         assert not any("q.nix" in v for v in got), f"read-failure arm: {got}"
         (root / "q.nix").unlink()
         arms_planted.add("read-failure")
@@ -373,7 +474,7 @@ def self_test():
             p = root / relname
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(body)
-            got = scan_tree(root, defined)
+            got = scan_tree(root, defined, scope)
             failed = any(relname in v for v in got)
             assert failed == must_fail, f"path-scope arm for {relname}: {got}"
             p.unlink()
@@ -437,6 +538,14 @@ def main():
     if not defined:
         print("setup: zero rules parsed from docs/spec — extractor rotted", file=sys.stderr)
         return 2
+    scope = load_tracey_scope(root)
+    if scope is None:
+        print(
+            f"setup: {TRACEY_CONFIG} missing or empty — the tracey scope is "
+            f"PARSED from the one source, never approximated (WO-S8-10)",
+            file=sys.stderr,
+        )
+        return 2
     # Duplicate-mint errors are SPEC defects, not citations: they are
     # surfaced as diagnostics and fail both modes directly — never
     # grandfathered, never run through the citation keyer
@@ -451,7 +560,7 @@ def main():
             file=sys.stderr,
         )
         return 1
-    violations = scan_tree(root, defined)
+    violations = scan_tree(root, defined, scope)
 
     gf_path = root / GRANDFATHER
     if mint:

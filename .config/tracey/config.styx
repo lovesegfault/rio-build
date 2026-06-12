@@ -59,6 +59,7 @@ specs (
           rio-retry-kernel/src/**/*.rs
           rio-evidence-kernel/src/**/*.rs
           rio-log-kernel/src/**/*.rs
+          rio-authz-kernel/src/**/*.rs
           rio-common/src/**/*.rs
           rio-auth/src/**/*.rs
           rio-cli/src/**/*.rs
@@ -68,6 +69,7 @@ specs (
           nix/base-runtime-spec.nix
           nix/docker.nix
           rio-dashboard/src/lib/logStream.svelte.ts
+          rio-dashboard/src/lib/lineCursor.ts
           rio-dashboard/src/lib/graphLayout.ts
           rio-dashboard/src/lib/buildGraphPoll.svelte.ts
           rio-dashboard/src/lib/toast.ts
