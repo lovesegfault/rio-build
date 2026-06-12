@@ -53,6 +53,7 @@ let
     "rio-controller"
     "rio-migrations"
     "rio-test-support"
+    "rio-build-cli"
   ];
 in
 {

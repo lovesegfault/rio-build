@@ -139,3 +139,12 @@ filter = "test(/^test_(nix_store_|nix_path_|build_trivial)/)"
 test-group = "integration"
 slow-timeout = { period = "90s", terminate-after = 2 }
 retries = { backoff = "fixed", count = 2, delay = "2s" }
+
+[[profile.default.overrides]]
+# rio-build-cli e2e drives the real rio-store services over an
+# ephemeral PG (TestDb) — same bootstrap, same concurrency bound. The
+# >50k-node pagination test legitimately runs tens of seconds (50k
+# server-side drv verifies + PG inserts), hence the bigger budget.
+filter = 'package(rio-build-cli) and binary(e2e)'
+test-group = 'postgres'
+slow-timeout = { period = "120s", terminate-after = 2 }
