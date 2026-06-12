@@ -1423,6 +1423,28 @@ cache contract real for the first time.
   indicates under-sized fetcher pods (I-207/I-208).
 ]
 
+#r("store.materialize.live-wanted")[
+  The executor's reported coverage --- hits AND misses --- quantifies over
+  EXECUTION-END LIVE WANTED, in both directions of the live-interest
+  relation: wanted-set growth re-enters the walk (re-seeds), and
+  wanted-set SHRINKAGE drops moot misses at the store-side rootage fold
+  (the last point with rootage; the wire carries none --- `refs_missing`
+  is bare non-emptiness by design). A miss whose every root departed the
+  wanted set MUST NOT be wired: `missing_paths` members are in the final
+  wanted set; `missing_reference_paths` members are reachable from a
+  final want over the walked reference edges (recorded at every
+  encounter, so closure diamonds keep all their rootage); the
+  trust/content refusal echoes quantify over live misses only.
+]
+The bug_266 seal covered one axis (tenant) in one direction (growth) ---
+the exact R28 multi-axis shape, pre-campaign: a 404'd reference rooted
+solely in a departed want compiled into `Unobtainable` and routed a
+fully-covered surviving build to ResolveFromSource (or pruned-origin
+FailFast) on routine mid-walk interest churn (bug_140). The wire-rootage
+alternative is RECORDED REJECTED (path-to-root provenance on the wire is
+a protocol expansion no consumer needs once the fold is sound --- the
+OQ-9 ruling).
+
 #r("store.materialize.executor+5")[
   Whenever a scheduler address is configured, each store replica
   MUST execute materialization jobs as a pull-protocol client: discover jobs by

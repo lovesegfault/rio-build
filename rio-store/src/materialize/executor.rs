@@ -103,9 +103,12 @@ impl ExecutorContext {
 ///    ingested/verified path pinned (`pin_kind='materialization'`)
 ///    BEFORE the Success report — closure-complete or no Success.
 /// 4. **Final verification pass**: the wanted set is RE-READ after the
-///    walk; growth re-enters the walk (the loop), so the reported
-///    coverage is against execution-end live wanted, not a snapshot.
+///    walk; growth re-enters the walk (the loop) and SHRINKAGE drops
+///    moot misses at the rootage fold (bug_140), so the reported
+///    coverage — hits AND misses — is against execution-end live
+///    wanted, not a snapshot.
 // r[impl store.materialize.executor+5]
+// r[impl store.materialize.live-wanted]
 // r[impl sched.materialize.pinning]
 pub async fn execute_job(
     ctx: &ExecutorContext,
@@ -403,6 +406,22 @@ async fn execute_job_inner(
     // merged_bug_046: paths whose settle cause is the AlreadyComplete
     // content disagreement (mirrors trust_refused one axis over).
     let mut content_mismatched = rio_evidence_kernel::outcome::GenStampedCells::new();
+    // bug_140: the walked reference edges (parent -> children),
+    // recorded at EVERY encounter — not just first-enqueue — so
+    // closure diamonds keep all their rootage. The fold below is the
+    // last point with rootage (the wire carries none: refs_missing is
+    // bare non-emptiness BY DESIGN), so the fold owns the
+    // live-interest filter: a miss whose every root departed the
+    // wanted set is moot there, never wired. Bounded by the
+    // closure-walk cap (the enqueue chokepoint).
+    let mut walked_edges: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    // bug_140: the execution-end live wanted set (the last
+    // re-read's full view — the loop exits only when it grows no new
+    // seeds, so at exit this IS execution-end live wanted; the loop
+    // assigns it on its FIRST iteration before any exit path, and the
+    // first-iteration empty-wanted arm returns infra before the fold).
+    let mut last_wanted: std::collections::BTreeSet<String>;
     // bug_266: the tenant-set generation. Bumps when the freshly
     // resolved set contains a member the previous resolve did not —
     // ONLY growth re-opens verdicts (shrinkage cannot turn a miss
@@ -498,6 +517,12 @@ async fn execute_job_inner(
             Ok(w) => w,
             Err(e) => return infra_failure(format!("wanted-set query failed: {e}")),
         };
+        // bug_140: every iteration refreshes the live view — the LAST
+        // refresh before exit is the execution-end wanted set the
+        // fold's rootage filter quantifies over (BOTH directions of
+        // the live-interest relation: growth re-seeds above;
+        // shrinkage drops moot misses at the fold).
+        last_wanted = wanted.iter().cloned().collect();
         // merged_bug_194 (store leg): a FIRST iteration with no
         // verifiable wanted path can never produce a meaningful
         // Success — "Success with nothing verified" is exactly the
@@ -584,6 +609,16 @@ async fn execute_job_inner(
                         // commit below — late ticks are zombies.
                         window_progress.retire(&path);
                         verified_tenants_by_path.insert(path.clone(), vt);
+                        // bug_140: rootage is recorded at EVERY edge
+                        // encounter (the enqueue below dedups; this
+                        // must not — a diamond's second parent still
+                        // roots the shared child).
+                        if !references.is_empty() {
+                            walked_edges
+                                .entry(path.clone())
+                                .or_default()
+                                .extend(references.iter().cloned());
+                        }
                         if was_ingested {
                             ingested.push(path);
                         } else {
@@ -798,7 +833,56 @@ async fn execute_job_inner(
             ));
         }
     }
-    if missing_wanted.is_empty() && missing_references.is_empty() {
+    // ── bug_140: the rootage fold (the live-interest relation's
+    // SHRINKAGE direction; growth was handled in-walk by bug_266) ──
+    // A miss is LIVE iff it is still rooted in execution-end live
+    // wanted: a missing WANTED path must itself be in the final
+    // wanted set; a missing REFERENCE must be reachable from a final
+    // want over the walked edges. Misses whose every root departed
+    // mid-walk are MOOT — dropping them here (the last point with
+    // rootage) is what makes the fn's execution-end-live-wanted
+    // contract true for misses, not only for seeds; pre-fix a 404'd
+    // reference rooted solely in a departed want compiled into
+    // Unobtainable and routed a fully-covered surviving build to
+    // ResolveFromSource on routine mid-walk interest churn.
+    let live_rooted: std::collections::BTreeSet<&str> = {
+        let mut live: std::collections::BTreeSet<&str> =
+            last_wanted.iter().map(String::as_str).collect();
+        let mut frontier: Vec<&str> = live.iter().copied().collect();
+        while let Some(p) = frontier.pop() {
+            if let Some(children) = walked_edges.get(p) {
+                for c in children {
+                    if live.insert(c.as_str()) {
+                        frontier.push(c.as_str());
+                    }
+                }
+            }
+        }
+        live
+    };
+    let live_missing_wanted: Vec<String> = missing_wanted
+        .paths()
+        .filter(|p| last_wanted.contains(*p))
+        .map(str::to_owned)
+        .collect();
+    let live_missing_refs: Vec<String> = missing_references
+        .paths()
+        .filter(|p| live_rooted.contains(*p))
+        .map(str::to_owned)
+        .collect();
+    let moot = (missing_wanted.len() - live_missing_wanted.len())
+        + (missing_references.len() - live_missing_refs.len());
+    if moot > 0 {
+        info!(
+            drv_hash = %claimed.drv_hash,
+            moot,
+            live_wanted_misses = live_missing_wanted.len(),
+            live_reference_misses = live_missing_refs.len(),
+            "dropped miss verdicts rooted only in departed wants at the \
+             rootage fold (bug_140 — execution-end live interest)"
+        );
+    }
+    if live_missing_wanted.is_empty() && live_missing_refs.is_empty() {
         info!(
             drv_hash = %claimed.drv_hash,
             ingested = ingested.len(),
@@ -836,52 +920,78 @@ async fn execute_job_inner(
         covered.extend(verified);
         warn!(
             drv_hash = %claimed.drv_hash,
-            missing_wanted = missing_wanted.len(),
-            missing_references = missing_references.len(),
+            missing_wanted = live_missing_wanted.len(),
+            missing_references = live_missing_refs.len(),
             covered = covered.len(),
             "materialization job unobtainable (confirmed-absent paths)"
         );
         let mut cause = format!(
             "{} wanted / {} reference path(s) confirmed absent at every \
              configured upstream",
-            missing_wanted.len(),
-            missing_references.len()
+            live_missing_wanted.len(),
+            live_missing_refs.len()
         );
-        if !trust_refused.is_empty() {
+        // bug_140: the refusal echoes quantify over LIVE misses only —
+        // a moot path's trust/content refusal must not flavor a verdict
+        // it no longer participates in.
+        let live_any = |cells: &rio_evidence_kernel::outcome::GenStampedCells| {
+            cells
+                .paths()
+                .any(|p| last_wanted.contains(p) || live_rooted.contains(p))
+        };
+        let trust_live = live_any(&trust_refused);
+        let content_live = live_any(&content_mismatched);
+        let empty_cells = rio_evidence_kernel::outcome::GenStampedCells::new();
+        if trust_live {
             // merged_bug_005: the refusal is actionable configuration
             // feedback — name it instead of letting it read as a
-            // generic miss.
+            // generic miss. bug_140: counted over LIVE misses only.
             cause.push_str(&format!(
                 "; {} of them present upstream but no narinfo signature \
                  verified against trusted_keys (rotated or mistyped key?)",
-                trust_refused.len()
+                trust_refused
+                    .paths()
+                    .filter(|p| last_wanted.contains(*p) || live_rooted.contains(*p))
+                    .count()
             ));
         }
-        if !content_mismatched.is_empty() {
+        if content_live {
             // merged_bug_046: the content disagreement is its own
             // actionable cause — never folded into the trust wording
             // (a key rotation will not fix disagreeing bytes).
+            // bug_140: counted over LIVE misses only.
             cause.push_str(&format!(
                 "; {} of them present upstream but claiming different \
                  bytes than the stored row (content disagreement at the \
                  dedup arm)",
-                content_mismatched.len()
+                content_mismatched
+                    .paths()
+                    .filter(|p| last_wanted.contains(*p) || live_rooted.contains(*p))
+                    .count()
             ));
         }
         // bug_084: BOTH wire refusal fields are minted by the ONE
         // constructor below — the cause string above names the axes
         // for humans; the typed pair is what the settlement consumes.
-        let (refusal, trust_refused_echo) = refusal_wire(&trust_refused, &content_mismatched);
+        let (refusal, trust_refused_echo) = refusal_wire(
+            if trust_live {
+                &trust_refused
+            } else {
+                &empty_cells
+            },
+            if content_live {
+                &content_mismatched
+            } else {
+                &empty_cells
+            },
+        );
         MaterializationOutcome {
             outcome: Some(materialization_outcome::Outcome::Unobtainable(
                 materialization_outcome::Unobtainable {
                     cause,
-                    missing_paths: missing_wanted.paths().map(str::to_owned).collect(),
+                    missing_paths: live_missing_wanted,
                     verified_paths: covered,
-                    missing_reference_paths: missing_references
-                        .paths()
-                        .map(str::to_owned)
-                        .collect(),
+                    missing_reference_paths: live_missing_refs,
                     trust_refused: trust_refused_echo,
                     refusal,
                 },
@@ -3107,6 +3217,104 @@ mod tests {
         let mut want = vec![path_p.clone(), path_q.clone()];
         want.sort();
         assert_eq!(got, want, "both P (under A) and Q (under B) covered");
+    }
+
+    // r[verify store.materialize.live-wanted]
+    /// W12-U (bug_140): the live-interest relation's BOTH directions
+    /// gate the compile — growth re-probes (bug_266, preserved by the
+    /// sibling test above) and SHRINKAGE drops moot misses at the
+    /// rootage fold. Pre-fix, GenStampedCells drained only on tenant
+    /// GROWTH and the per-iteration wanted re-read fed only new
+    /// seeds, so a miss recorded for a since-departed want survived
+    /// shrinkage and compiled into Unobtainable — contradicting the
+    /// fn's own execution-end-live-wanted contract and routing a
+    /// fully-covered surviving build to ResolveFromSource on routine
+    /// mid-walk interest churn.
+    ///
+    /// Choreography: the build wants W ("out", whose NAR references
+    /// R — confirmed absent at every upstream) and V ("doc", served
+    /// clean); during iteration 1's gated NAR fetches the wanted set
+    /// SHRINKS to {doc} (W departs); the surviving want V is fully
+    /// covered, and R's only root is the departed W.
+    #[tokio::test]
+    async fn departed_want_misses_drop_at_the_rootage_fold() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-shrink").await;
+
+        let path_w = store_path(21, "mat-shrink-w");
+        let path_v = store_path(22, "mat-shrink-v");
+        let path_r = store_path(23, "mat-shrink-r");
+        let (nar_w, _) = rio_test_support::fixtures::make_nar(b"shrink contents w");
+        let (nar_v, _) = rio_test_support::fixtures::make_nar(b"shrink contents v");
+
+        // The GATED upstream serves W (whose narinfo references R);
+        // a plain sibling serves V ungated; R is served NOWHERE —
+        // the confirmed-absent reference.
+        let (up_w, mut hit_rx, release) = spawn_gated_upstream(
+            vec![(path_w.clone(), nar_w, vec![path_r.clone()])],
+            "cache.shrink-w",
+        )
+        .await;
+        wire_upstream(&db.pool, tenant, &up_w).await;
+        let up_v =
+            spawn_multi_upstream(vec![(path_v.clone(), nar_v, vec![])], "cache.shrink-v").await;
+        wire_upstream(&db.pool, tenant, &up_v).await;
+
+        let seeded = seed_job(
+            &db.pool,
+            "mat-shrink-drv",
+            &[("out", path_w.as_str()), ("doc", path_v.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+
+        let ctx = make_ctx(db.pool.clone());
+        let claimed = seeded.claimed.clone();
+        let walk = tokio::spawn(async move {
+            execute_job(&ctx, &claimed, admitted(&ctx))
+                .await
+                .into_outcome()
+        });
+
+        // Deterministic seam: inside iteration 1's gated NAR fetch —
+        // the wanted set was read before the gate.
+        tokio::time::timeout(std::time::Duration::from_secs(30), hit_rx.recv())
+            .await
+            .expect("the walk reached the gated NAR fetch")
+            .expect("gate signal");
+
+        // The SHRINK: W departs the wanted set mid-walk.
+        sqlx::query(
+            "UPDATE build_wanted_outputs SET wanted_output_names = '{doc}' \
+             WHERE build_id = $1",
+        )
+        .bind(seeded.build_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        release.notify_waiters();
+        let outcome = walk.await.unwrap();
+
+        let success = outcome_success(&outcome).unwrap_or_else(|| {
+            panic!(
+                "left: a 404'd reference rooted solely in the DEPARTED want \
+                 compiled into Unobtainable and the covered surviving build \
+                 was routed from source / right: the moot miss drops at the \
+                 rootage fold and coverage holds against execution-end live \
+                 wanted — got {outcome:?}"
+            )
+        });
+        assert!(
+            success
+                .ingested_paths
+                .iter()
+                .chain(success.verified_paths.iter())
+                .any(|p| p == &path_v),
+            "the surviving want is covered: {success:?}"
+        );
     }
 
     // r[verify sched.merge.stale-substitutable+3]
