@@ -312,6 +312,22 @@ store:
       # PG and must survive store pod restarts/rollouts. The cluster's
       # default StorageClass provisions it (k3s: local-path).
       size: 2Gi
+  # ── External castore door (ADR-024 P2) ────────────────────────────────
+  # Externally reachable gRPC entry point for the `rio build` client:
+  # a Cilium Gateway (GatewayClass rio-castore + GRPCRoute, see
+  # castore-door.yaml) routing ONLY the castore surface —
+  # DirectoryService, ChunkService, DrvBlobService, and
+  # StoreService/PutPathChunked — to rio-store:9002. The door routes;
+  # the services authenticate
+  # (JWT tenant token / HMAC assignment token; anonymous callers are
+  # rejected by the services themselves). Default off: rendering needs
+  # the Gateway API CRDs and the Cilium gateway controller, same as
+  # dashboard.enabled.
+  externalDoor:
+    enabled: false
+    # Gateway listener port (h2c — TLS posture follows the dashboard
+    # gateway: none at the Gateway, the fronting LB owns it).
+    port: 9002
   # For Rook RGW dev: AWS_ACCESS_KEY_ID etc. Prod uses IRSA (no extra env).
   extraEnv: []
   # Upstream binary-cache egress allowlist. Each entry opens 443/TCP

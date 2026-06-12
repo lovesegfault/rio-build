@@ -274,6 +274,7 @@ mod concurrent;
 mod core;
 mod directory;
 mod drv_blob;
+mod external_door;
 mod hash_part;
 mod hmac;
 mod nar_index;
