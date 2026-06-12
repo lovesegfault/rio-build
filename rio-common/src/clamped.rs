@@ -83,18 +83,18 @@ pub const DAEMON_DEFAULT_TIMEOUT_SECS: u64 = 7200;
 /// the raw `u64` (`from`/`into`), so JSONB-persisted rows are
 /// byte-compatible AND re-clamped on load — a poisoned pre-fix row
 /// saturates at read time.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
-)]
+/// bug_116 (R28 derive-list axis): the derive list is law surface — a
+/// laws-by-construction newtype SUBTRACTS std-blessed capabilities
+/// that contradict its fold law. `PartialOrd`/`Ord` are deliberately
+/// ABSENT: under derived ordering `UNSET(0)` is the global minimum —
+/// the exact inverse of the type-owned [`Self::min_permissive`] law —
+/// so a std `.min()`/sort would silently pick no-timeout over a
+/// tenant's requested bound. Convention for sentinel-encoding
+/// newtypes (0 = unset, MAX = ∞): no derived ordering unless a unit
+/// test pins `Ord::min` == the domain fold; here zero ordering uses
+/// existed (11 consumer files surveyed; the deletion compiling IS the
+/// re-verified survey), so deletion is the close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(from = "u64", into = "u64")]
 pub struct WireSecs(u64);
 
@@ -179,7 +179,10 @@ impl WireSecs {
     /// The min-nonzero fold law owned by the type: unset loses to any
     /// set value; two set values take the minimum. (Previously a free
     /// fn beside the scheduler fold; owning it here keeps the law and
-    /// the bound in one place.)
+    /// the bound in one place.) THE type's one ordering law — the
+    /// std `Ord` derives are subtracted at the type (bug_116) so this
+    /// fold cannot be shadowed by a derived ordering under which the
+    /// `UNSET(0)` sentinel sorts as the global minimum.
     #[must_use]
     pub const fn min_permissive(self, other: Self) -> Self {
         match (self.0, other.0) {
