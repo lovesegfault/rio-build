@@ -606,6 +606,16 @@ enum OpenFailure {
     Permanent(Status),
 }
 
+/// A store-witnessed contiguous-prefix durability claim
+/// (merged_bug_005): the wrapped line number asserts every line
+/// at-or-below it is durably stored. The ONLY lawful mints are the
+/// ack-borne values in the drive loop (`durable_through_line`, or the
+/// open-time watermark minus one) — the type is what keeps the
+/// retransmit buffer's destructive discharge
+/// ([`UploadTask::discharge_through`]) from ever consuming a value
+/// that was not spoken by the store as a durability statement.
+struct DurableFrontier(u64);
+
 struct UploadTask {
     client: LogServiceClient<Channel>,
     header: AppendLogHeader,
@@ -618,7 +628,11 @@ struct UploadTask {
     /// (merged_bug_010). `None` ⇔ the input is still open.
     input_exhausted: Option<InputExhausted>,
     /// Every accepted batch not yet covered by an ack, in line order.
-    /// Retransmitted in full on every reconnect.
+    /// Retransmitted in full on every reconnect. THE RETRANSMIT COPY
+    /// (R32, `sys.obligation.linear-discharge`): the builder's only
+    /// copy of un-acked lines — destructive exits are exactly the
+    /// witnessed-frontier discharge and the disclosed-loss refusal
+    /// (`reject_permanently`), nothing else.
     buffer: VecDeque<BuildLogBatch>,
     /// Cached `Σ lines.len()` over `buffer`, so progress publication does
     /// not walk the deque.
@@ -846,8 +860,12 @@ impl UploadTask {
                         // durable_through_line as ever.
                         let popped = match ack.open_coverage_next_line {
                             Some(0) => 0,
-                            Some(watermark) => self.trim(watermark - 1),
-                            None => self.trim(ack.durable_through_line),
+                            Some(watermark) => {
+                                self.discharge_through(DurableFrontier(watermark - 1))
+                            }
+                            None => {
+                                self.discharge_through(DurableFrontier(ack.durable_through_line))
+                            }
                         };
                         sent = sent.saturating_sub(popped);
                         if let Some(input) = self.input_exhausted
@@ -1016,14 +1034,30 @@ impl UploadTask {
         }
     }
 
-    /// Pop every buffered frame whose last line is covered by
-    /// `durable_through_line`, and advance the ack watermark to it
-    /// REGARDLESS of whether a whole frame popped (bug_144: the store
-    /// acks lines, the buffer holds frames — a mid-frame ack is
-    /// routine whenever a frame's payload straddles a chunk cut, and
-    /// the watermark is the truth the disclosure surfaces report
-    /// against). Returns the number of frames popped.
-    fn trim(&mut self, durable_through_line: u64) -> usize {
+    /// Pop every buffered frame whose last line is covered by the
+    /// frontier, and advance the ack watermark to it REGARDLESS of
+    /// whether a whole frame popped (bug_144: the store acks lines,
+    /// the buffer holds frames — a mid-frame ack is routine whenever
+    /// a frame's payload straddles a chunk cut, and the watermark is
+    /// the truth the disclosure surfaces report against). Returns the
+    /// number of frames popped.
+    ///
+    /// THE TYPED DISCHARGE (merged_bug_005, R32): the retransmit
+    /// buffer is the builder's ONLY copy of un-acked lines — a linear
+    /// resource whose destructive exits are exactly this method (the
+    /// ack-driven prefix discharge) and `reject_permanently` (the
+    /// disclosed-loss refusal). The argument is the witnessed
+    /// [`DurableFrontier`], never a bare integer: the value is a
+    /// CONTIGUOUS-PREFIX claim (every line at-or-below it is durable
+    /// at the store), which this prefix-pop consumes destructively.
+    /// The builder cannot verify the claim from here — soundness
+    /// rests on the producer clamp (`store.log.frontier-denominated`:
+    /// the store never emits a value above its contiguous durable
+    /// frontier, and stays silent when none exists), so the only
+    /// lawful mints of the witness type are the ack-borne values in
+    /// the drive loop.
+    fn discharge_through(&mut self, frontier: DurableFrontier) -> usize {
+        let DurableFrontier(durable_through_line) = frontier;
         let mut popped = 0;
         while let Some(front) = self.buffer.front() {
             // checked_add, not `+`: a frame whose line numbers overflow
@@ -2391,5 +2425,124 @@ mod tests {
                 rec.all_keys()
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 10. The retransmit copy is linear (merged_bug_005 / R32)
+    // ------------------------------------------------------------------
+
+    /// The production half of this file, as lines (everything before
+    /// this test module — the boundary needle is built at runtime so
+    /// it never self-matches).
+    fn production_half_lines() -> Vec<String> {
+        let src = include_str!("log_upload.rs");
+        let boundary = format!("#[cfg({})]\nmod tests", "test");
+        let cut = src.find(&boundary).expect("the test module exists");
+        src[..cut].lines().map(|l| l.to_string()).collect()
+    }
+
+    // r[verify store.log.frontier-denominated]
+    /// W12-C, the reader-witness half (merged_bug_005, R32): the
+    /// retransmit buffer is a LINEAR resource — its destructive exits
+    /// in the production half are EXACTLY the witnessed-frontier
+    /// discharge (`discharge_through(DurableFrontier)`, the ack-driven
+    /// prefix-pop) and the disclosed-loss refusal
+    /// (`reject_permanently`'s clear). The discharge's argument is the
+    /// typed frontier, never a bare integer, and the only mints of the
+    /// type are the ack-borne values in the drive loop — so a trim
+    /// against anything but a store-spoken durability statement does
+    /// not compile. The measure side (every line at-or-below the value
+    /// IS durable) is the producer clamp's obligation, pinned
+    /// store-side; this census pins that the builder consumes it
+    /// through exactly one destructive door.
+    #[test]
+    fn retransmit_buffer_destructive_exits_are_typed_discharges() {
+        let lines = production_half_lines();
+        let destructive = [
+            ".pop_front(",
+            ".pop_back(",
+            ".clear(",
+            ".drain(",
+            ".truncate(",
+            ".swap_remove_front(",
+            ".swap_remove_back(",
+            ".remove(",
+        ];
+        let hits: Vec<(usize, &String)> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| {
+                let t = l.trim();
+                !t.starts_with("//")
+                    && t.contains("buffer")
+                    && destructive.iter().any(|d| t.contains(d))
+            })
+            .map(|(i, l)| (i + 1, l))
+            .collect();
+        assert_eq!(
+            hits.len(),
+            2,
+            "the retransmit buffer must have exactly two destructive exits \
+             (the frontier discharge's pop_front and the refusal's clear); \
+             found: {hits:?}"
+        );
+        assert!(
+            hits[0].1.contains(".pop_front(") && hits[1].1.contains(".clear("),
+            "exit order/shape drifted: expected the discharge pop_front then \
+             the refusal clear, found: {hits:?}"
+        );
+
+        // The typed-argument pin: every frontier mint in the production
+        // half wraps an ack-borne value at the drive loop's ack arm —
+        // the constructor appears exactly where acks are consumed, and
+        // the discharge signature demands it.
+        let mint_needle = format!("{}(", "DurableFrontier");
+        let mints = lines
+            .iter()
+            .filter(|l| {
+                let t = l.trim();
+                !t.starts_with("//")
+                    && t.contains(&mint_needle)
+                    && !t.contains("struct ")
+                    // a destructuring `let DurableFrontier(..) = ..` CONSUMES
+                    // the witness; only constructions mint it.
+                    && !t.starts_with("let DurableFrontier")
+            })
+            .count();
+        assert_eq!(
+            mints, 2,
+            "exactly two DurableFrontier mints (the open-time watermark letter \
+             and the chunk ack) — a third mint site is a new unaudited \
+             durability claim"
+        );
+        let discharge_sig = lines
+            .iter()
+            .any(|l| l.contains("fn discharge_through(&mut self, frontier: DurableFrontier)"));
+        assert!(
+            discharge_sig,
+            "the discharge must demand the witnessed frontier type in its \
+             signature"
+        );
+
+        // The strawman (the witness can refuse): a bare-integer pop
+        // beside the buffer would be a new destructive exit — the
+        // census above counts it and reds. Verified by construction:
+        // appending such a line to a copy of the census input flips
+        // the count.
+        let mut planted = lines.clone();
+        planted.push(format!("        self.buffer{}", ".pop_front();"));
+        let planted_hits = planted
+            .iter()
+            .filter(|l| {
+                let t = l.trim();
+                !t.starts_with("//")
+                    && t.contains("buffer")
+                    && destructive.iter().any(|d| t.contains(d))
+            })
+            .count();
+        assert_eq!(
+            planted_hits, 3,
+            "the census must count a planted third destructive exit"
+        );
     }
 }
