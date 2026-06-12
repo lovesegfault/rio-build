@@ -1944,9 +1944,10 @@ async fn merge_hydrates_resource_floor_from_db() -> TestResult {
     // `floor_above_global_reclamps_at_boot` (sla_contract.rs).
     assert_eq!(
         info.sched.resource_floor.mem_bytes,
-        2 << 30,
-        "I-208 + live_051(d): floor hydrated from DB, clamped at the \
-         live global"
+        (2 << 30) - rio_common::footprint::WORKER_MEM_OVERHEAD_BYTES,
+        "I-208 + live_051(d) + merged_bug_016: floor hydrated from DB, \
+         clamped at the live global's SOLVE-domain cap (global − pad — \
+         a raw-global floor renders an unhostable container)"
     );
     Ok(())
 }

@@ -5296,9 +5296,12 @@ async fn floor_above_global_reclamps_at_boot() -> TestResult {
         .resource_floor
         .mem_bytes;
     assert_eq!(
-        hydrated, live_max_mem,
-        "the hydrate seam grounds the stale row at the LIVE global \
-         (pre-fix: 8 GiB re-imported raw)"
+        hydrated,
+        live_max_mem - rio_common::footprint::WORKER_MEM_OVERHEAD_BYTES,
+        "the hydrate seam grounds the stale row at the LIVE global's \
+         SOLVE-domain cap (global − pad, merged_bug_016 — a raw-global \
+         floor renders an unhostable container; pre-fix: 8 GiB \
+         re-imported raw)"
     );
     Ok(())
 }

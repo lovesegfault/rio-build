@@ -120,35 +120,16 @@ pub(crate) const HW_BENCH_NEEDED_ANNOTATION: &str = "rio.build/hw-bench-needed";
 /// the daemon's own state live outside. 1 GiB headroom.
 const LOG_BUDGET_BYTES: u64 = 1 << 30;
 
-/// Round-10 live_058-a (HIGH): the worker's RESIDENT overhead pad on
-/// the container-mem axis — the rio-builder daemon + FUSE client +
-/// log capture that live INSIDE the container the k8s limit binds,
-/// on top of the solved BUILD size. The solve sizes the BUILD; the
-/// limit binds the CONTAINER (k8s memory.max is set at the delegated
-/// POD level — monitors.rs: the per-build sub-cgroup carries no
-/// limit of its own), so a warm tiny fit (~45-69 MB solved, the live
-/// incident specimens) raw-stamped as request==limit landed BELOW
-/// the worker's own baseline and the kernel OOM-killed the whole
-/// container before/regardless of the build — the live_058 2.75h
-/// same-size requeue loop. Derivation basis (recorded per the A1
-/// duty): the incident pins baseline > 69 MB (those containers
-/// died); the pad covers daemon RSS + FUSE client structures + log
-/// capture with headroom — 256 MiB is the HYPOTHESIS value carried
-/// from the incident review, VIOLABLE (R17, all axes): size = the
-/// pad itself per pod (the cost of never under-housing the worker);
-/// cost = 256 MiB × pods/node of billable mem; population = every
-/// builder/fetcher container; time N/A. Measurement note: re-derive
-/// from worker-baseline RSS telemetry once a soak window exists —
-/// the consts are the knob, the constructor is the law.
-const WORKER_MEM_OVERHEAD_BYTES: u64 = 256 << 20;
-
-/// The container-mem FLOOR (live_058-a): no container renders below
-/// this regardless of how tiny the solve is — tiny solves carry the
-/// same resident worker. 512 MiB = pad + the sub-pad solve band with
-/// headroom (the incident's 45-69 MB solves land here). VIOLABLE
-/// (R17): same axes as the pad; the floor only binds when
-/// `solved + pad < floor`, i.e. solves under 256 MiB.
-const CONTAINER_MEM_MIN_BYTES: u64 = 512 << 20;
+// Round-10 live_058-a / bughunt-11 merged_bug_016: the worker pad
+// (256 MiB) and container floor (512 MiB) live in the SHARED home
+// (`rio_common::footprint` — consts + the forward/inverse maps),
+// because the law they encode straddles the scheduler/controller
+// process boundary: the scheduler's admission gates and dispatch
+// clamps consume the same constants this constructor renders with.
+// A controller-local pad re-opens the `(ceiling − pad, ceiling]`
+// admission/provisioning dead band — the full derivation basis
+// (incident pins, R17 violability axes, the RSS-telemetry
+// measurement note) moved verbatim to the shared home's docs.
 /// Overlay emptyDir sizeLimit headroom multiplier on `disk_bytes` when
 /// `SpawnIntent.disk_headroom_factor` is absent/zero (pre-ADR-023
 /// scheduler skew). The variance-aware `headroom(n_eff)` curve is
@@ -232,10 +213,11 @@ pub(crate) fn intent_pod_footprint(i: &SpawnIntent, fuse_cache_bytes: u64) -> Po
         // ladder clamp upstream (the ladder still doubles the solve;
         // CgroupOom keys on the padded pod limit — the per-build
         // sub-cgroup refinement is the RULED named candidate).
-        mem_bytes: i
-            .mem_bytes
-            .saturating_add(WORKER_MEM_OVERHEAD_BYTES)
-            .max(CONTAINER_MEM_MIN_BYTES),
+        // merged_bug_016: the law itself is the SHARED
+        // `rio_common::footprint::container_mem_bytes` — the same
+        // function the scheduler's gates compare with, so the two
+        // processes cannot disagree by a band cell.
+        mem_bytes: rio_common::footprint::container_mem_bytes(i.mem_bytes),
         ephemeral_bytes: pod_ephemeral_request(i.disk_bytes, intent_headroom(i), fuse),
     }
 }
@@ -4902,12 +4884,14 @@ mod mem_axis_census {
             .filter(|l| l.contains("mem_bytes"))
             .count();
         assert_eq!(
-            code_reads, 8,
+            code_reads, 7,
             "jobs.rs prod mem_bytes code lines: the constructor's \
-             2-line read + the struct field + the accessor (3 lines: \
-             fn/self/triple) + the helper's padded-accessor stamp + \
-             the hw-bench telemetry gate — a new reader joins the \
-             census with its class named"
+             1-line shared-law read (merged_bug_016: \
+             `rio_common::footprint::container_mem_bytes(i.mem_bytes)`) \
+             + the struct field + the accessor (3 lines: fn/self/triple) \
+             + the helper's padded-accessor stamp + the hw-bench \
+             telemetry gate — a new reader joins the census with its \
+             class named"
         );
         assert_eq!(
             raw_stamp_hits(p),

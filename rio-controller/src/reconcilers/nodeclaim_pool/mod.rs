@@ -596,6 +596,17 @@ impl NodeClaimPoolConfig {
         // caller's pin-stripped attribution then pends it typed
         // (`PlacementOutcome::PinGated`), never a silent launch.
         let pin: Option<Option<CapacityType>> = i.capacity_pin.as_deref().map(CapacityType::parse);
+        // merged_bug_016: the admission predicate consumes the
+        // CONSTRUCTED pod footprint (`intent_pod_footprint` — the
+        // shared `rio_common::footprint` container law), never the
+        // bare solve. The pre-fix raw `i.mem_bytes <= cls_m` admitted
+        // the `(cls_m − pad, cls_m]` band whose PADDED container
+        // `cover::sizing` then dropped every tick (the advisory
+        // requeue strand); it also had NO disk conjunct, so an intent
+        // whose ephemeral footprint exceeds `max_node_disk` was
+        // admitted here and dropped there the same way. All three
+        // axes now compare exactly what sizing compares.
+        let fp = crate::reconcilers::pool::jobs::intent_pod_footprint(i, self.fuse_cache_bytes);
         let candidate = |h: &str| {
             // Per-class ceiling filter: an hw-agnostic intent (override
             // bypass-path with `--cores=N`) may carry `cores >
@@ -614,8 +625,9 @@ impl NodeClaimPoolConfig {
             let c = Cell(h.into(), cap);
             (hw.matches_arch(h, arch)
                 && !masked.contains(&c)
-                && i.cores <= cls_c
-                && i.mem_bytes <= cls_m
+                && fp.cores() <= cls_c
+                && fp.mem_bytes() <= cls_m
+                && fp.ephemeral_bytes() <= self.max_node_disk
                 && rio_common::k8s::features_compatible(&i.required_features, &hw.provides_for(h)))
             .then_some(c)
         };
@@ -3821,6 +3833,112 @@ mod tests {
         );
         // 256c exceeds ALL classes → None (no_hosting_class).
         assert_eq!(cfg.fallback_cell(&mk(256), &hw, &none), None);
+    }
+
+    // r[verify ctrl.pool.gate-superset]
+    /// **W11-Z (merged_bug_016, HIGH)** — *proposition: the
+    /// admission/provisioning dead band is EMPTY — for every solve at
+    /// the band's boundary cells, `fallback_cell` admits a class iff
+    /// `cover::sizing`'s padded partition fits it; population: the
+    /// band boundary cells (`cap'`, `cap'+1`, `cm − pad + 1`, `cm` —
+    /// `cm` is what the three dispatch funnels pin) on the
+    /// `GetHwClassConfig`-mirrored ceiling both gates consume.*
+    ///
+    /// Pre-fix RED (the live shape): a solve in `(cm − pad, cm]`
+    /// admitted at the raw gate (`i.mem_bytes <= cls_m`) and stranded
+    /// at provisioning — across 3 reconcile cycles the SAME intent
+    /// was re-admitted by `fallback_cell` and dropped by `sizing`
+    /// every cycle with ZERO claims minted and no typed terminal
+    /// (`fallback_cell` returns `Some`, so the `no_hosting_class`
+    /// verdict lane never fires): the infinite advisory requeue
+    /// strand, replacing the designed bounded at-cap poison.
+    /// Post-fix: both gates compare the ONE constructed quantity
+    /// (`rio_common::footprint::container_mem_bytes`), so the band
+    /// either fits both or refuses both.
+    #[test]
+    fn fallback_admission_matches_sizing_partition_no_dead_band() {
+        use rio_proto::types::{HwClassLabels, NodeLabelMatch};
+        const GI: u64 = 1 << 30;
+        let cm: u64 = 64 * GI; // the mirrored per-class mem ceiling
+        let pad = rio_common::footprint::WORKER_MEM_OVERHEAD_BYTES;
+        let cap_prime =
+            rio_common::footprint::max_hostable_solve_mem(cm).expect("64 GiB hosts a container");
+        let cfg = NodeClaimPoolConfig {
+            reference_hw_class: "hi-ebs-x86".into(),
+            ..Default::default()
+        };
+        let hw = HwClassConfig::default();
+        hw.set(
+            [(
+                "hi-ebs-x86".into(),
+                HwClassLabels {
+                    labels: vec![NodeLabelMatch {
+                        key: ARCH_LABEL.into(),
+                        value: "amd64".into(),
+                    }],
+                    max_cores: 128,
+                    max_mem: cm,
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            (192, cm),
+        );
+        let scfg = cover::SizingCfg {
+            max_node_cores: 128,
+            max_node_mem: cm, // the SAME mirrored ceiling
+            max_node_disk: 450 * GI,
+            budget: u32::MAX,
+            fuse_cache_bytes: 50 * GI,
+        };
+        let cell = Cell("hi-ebs-x86".into(), CapacityType::Spot);
+        let none = HashSet::new();
+        let mk = |mem: u64| SpawnIntent {
+            intent_id: "band-probe".into(),
+            system: "x86_64-linux".into(),
+            cores: 4,
+            mem_bytes: mem,
+            disk_bytes: GI,
+            ..Default::default()
+        };
+        // The band boundary cells: below the knee, the knee, band
+        // interior, and the funnel pin (mem == cm exactly — what the
+        // dispatch clamp, the at-cap floor, and the StaleSolve
+        // re-solve all emit).
+        for mem in [cap_prime, cap_prime + 1, cm - pad + 1, cm] {
+            let i = mk(mem);
+            let admitted = cfg.fallback_cell(&i, &hw, &none).is_some();
+            let fits = {
+                let refs = [&i];
+                let s = cover::sizing(&cell, &refs, &scfg);
+                s.over_cap.is_empty() && !s.claims.is_empty()
+            };
+            assert_eq!(
+                admitted, fits,
+                "dead band at solve mem={mem}: fallback_cell admitted={admitted} \
+                 but sizing fits={fits} — the gates compare different quantities \
+                 (cm={cm}, pad={pad}, cap'={cap_prime})"
+            );
+        }
+        // The strand signature, rendered structurally: the funnel-pin
+        // cell (mem == cm) across 3 reconcile cycles. Whatever the
+        // per-cycle disposition, it must be the SAME typed disposition
+        // on both gates each cycle — pre-fix this loop minted zero
+        // claims while fallback kept re-admitting (admitted ∧ ¬fits ∧
+        // no terminal), cycle after cycle.
+        let pinned = mk(cm);
+        for cycle in 0..3 {
+            let admitted = cfg.fallback_cell(&pinned, &hw, &none).is_some();
+            let refs = [&pinned];
+            let s = cover::sizing(&cell, &refs, &scfg);
+            let strand = admitted && s.claims.is_empty();
+            assert!(
+                !strand,
+                "cycle {cycle}: admitted-but-unprovisionable — the advisory \
+                 requeue strand (zero claims, no typed terminal) instead of \
+                 the designed bounded poison"
+            );
+        }
     }
 
     /// §13d STRIKE-7 (r30 mb_012): `fallback_cell` filters by

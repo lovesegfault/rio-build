@@ -852,7 +852,11 @@ impl SlaConfig {
                 && cap.is_none_or(|c| self.capacity_types_for(h).contains(&c))
                 && {
                     let (cc, cm) = self.class_ceilings(h, catalog, global);
-                    cores <= cc && mem <= cm
+                    // merged_bug_016: feasibility compares the
+                    // CONSTRUCTED container quantity (the shared
+                    // footprint law), never the bare solve — same
+                    // form as `retain_hosting_cells`' size gate.
+                    cores <= cc && rio_common::footprint::container_mem_bytes(mem) <= cm
                 }
         };
         if matches(&self.reference_hw_class) {
@@ -951,8 +955,18 @@ impl SlaConfig {
             // `required=[kvm], provides=[]` because ∅⊆anything).
             let feat_ok = features_compatible(required_features, &d.provides_features);
             // Size: per-class ceiling (catalog ∩ cfg ∩ global).
+            // merged_bug_016 (the dead-band close): the mem axis
+            // compares the CONSTRUCTED container quantity —
+            // `rio_common::footprint::container_mem_bytes(solve)` —
+            // against the ceiling, the SAME quantity the controller's
+            // provisioning partition (`cover::sizing` via
+            // `intent_pod_footprint`) and its `fallback_cell`
+            // admission predicate compare. The pre-fix raw `mem <= cm`
+            // admitted the `(cm − pad, cm]` band that provisioning
+            // rejects PADDED — the infinite advisory requeue strand of
+            // exactly the largest builds.
             let (cc, cm) = self.class_ceilings(h, catalog, global);
-            let size_ok = cores <= cc && mem <= cm;
+            let size_ok = cores <= cc && rio_common::footprint::container_mem_bytes(mem) <= cm;
             // Capacity-type: an od-only class structurally never
             // hosts a `(h, Spot)` cell. The producer paths (`solve_
             // full` over `cost.cells`, the `Some(cap)` bypass)
@@ -1548,6 +1562,23 @@ impl SlaConfig {
         source: &str,
     ) -> anyhow::Result<()> {
         let (gc, gm) = global;
+        // merged_bug_016 (the R29-boundary-clause shape on the mem
+        // axis): the resolved global must host at least one CONTAINER
+        // under the shared footprint law. A global below
+        // `CONTAINER_MEM_MIN_BYTES` collapses the hostable solve
+        // domain to EMPTY (`max_hostable_solve_mem(gm) = None`):
+        // every solve renders a container above the global, every
+        // gate refuses, and the floor/clamp funnels pin at a
+        // zero-margin cap — refuse the config instead of booting a
+        // scheduler that can never dispatch a build.
+        anyhow::ensure!(
+            rio_common::footprint::max_hostable_solve_mem(gm).is_some(),
+            "resolved global max_mem={gm} ({source}) is below the container \
+             floor {} (rio_common::footprint::CONTAINER_MEM_MIN_BYTES): no \
+             solve can render a hostable container — raise sla.maxMem or fix \
+             the catalog derivation",
+            rio_common::footprint::CONTAINER_MEM_MIN_BYTES,
+        );
         // r[impl scheduler.sla.global.derive+2]
         // live_051(a)/(f2) + merged_bug_062: the global MUST NOT
         // exceed every class's JOINT hosting ceiling — demand admitted
@@ -2114,7 +2145,10 @@ mod tests {
             tiers = [{ name = "normal" }]
             default_tier = "normal"
             max_cores = 64.0
-            max_mem = 1
+            # merged_bug_016: validate_resolved refuses globals below
+            # the container floor (512 MiB) — 1 GiB keeps this
+            # label-parsing fixture above the boundary.
+            max_mem = 1073741824
             max_disk = 1
             default_disk = 1
             hw_cost_tolerance = 0.15
@@ -3034,6 +3068,72 @@ mod tests {
                 vec![ok.clone()],
                 "axis={axis}: bad cell {bad:?} not stripped"
             );
+        }
+    }
+
+    // r[verify ctrl.pool.gate-superset]
+    /// **W11-Z (scheduler leg, merged_bug_016 HIGH)** — *proposition:
+    /// the scheduler size gate compares the CONSTRUCTED container
+    /// quantity (`rio_common::footprint::container_mem_bytes`), so no
+    /// solve it admits can be provisioning-rejected by the padded
+    /// partition; population: the band boundary cells on a class
+    /// ceiling `cm` — `cap' = max_hostable_solve_mem(cm)` (kept),
+    /// `cap' + 1` (stripped), `cm − pad + 1` (band interior,
+    /// stripped), `cm` (the funnel pin, stripped).*
+    ///
+    /// Pre-fix RED (verbatim, the raw `mem <= cm` gate): every band
+    /// cell was KEPT — `band cell mem=68451041281 (cap'+1) admitted
+    /// by the size gate — its padded container (68719476737 > cm
+    /// 68719476736) is provisioning-rejected: the dead band` — the
+    /// admitted-but-unprovisionable population the controller then
+    /// requeued forever as advisory OverCap.
+    #[test]
+    fn retain_hosting_cells_size_gate_compares_padded_container() {
+        let pad = rio_common::footprint::WORKER_MEM_OVERHEAD_BYTES;
+        let cm: u64 = 64 << 30;
+        let cap_prime =
+            rio_common::footprint::max_hostable_solve_mem(cm).expect("64 GiB hosts a container");
+        let mut cfg = base();
+        cfg.max_cores = Some(256.0);
+        let mut def = test_def(ARCH_LABEL, "amd64");
+        def.max_cores = Some(64);
+        def.max_mem = Some(cm);
+        cfg.hw_classes = HashMap::from([("hi-x86".into(), def)]);
+        let cat = super::super::catalog::CatalogCeilings::new();
+        let global = (256u32, 256u64 << 30);
+        let cell: Cell = ("hi-x86".into(), CapacityType::Spot);
+        for (mem, hosted) in [
+            (cap_prime, true),
+            (cap_prime + 1, false),
+            (cm - pad + 1, false),
+            (cm, false),
+        ] {
+            let kept = cfg.retain_hosting_cells(
+                vec![cell.clone()],
+                "x86_64-linux",
+                (8, mem),
+                &[],
+                &cat,
+                global,
+                None,
+            );
+            let container = rio_common::footprint::container_mem_bytes(mem);
+            if hosted {
+                assert_eq!(
+                    kept,
+                    vec![cell.clone()],
+                    "solve mem={mem} renders container {container} <= cm {cm} — \
+                     must be admitted (over-refusal would shrink the designed \
+                     hostable region)"
+                );
+            } else {
+                assert!(
+                    kept.is_empty(),
+                    "band cell mem={mem} admitted by the size gate — its padded \
+                     container ({container} > cm {cm}) is provisioning-rejected: \
+                     the dead band"
+                );
+            }
         }
     }
 

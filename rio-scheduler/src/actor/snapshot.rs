@@ -2696,7 +2696,13 @@ impl DagActor {
                                         cost.catalog_ceilings(),
                                         cost.resolved_global(),
                                     );
-                                    memo.a.c_star <= cc && memo.a.mem_bytes <= cm
+                                    // merged_bug_016: the constructed
+                                    // container quantity, same form as
+                                    // the chokepoint below.
+                                    memo.a.c_star <= cc
+                                        && rio_common::footprint::container_mem_bytes(
+                                            memo.a.mem_bytes,
+                                        ) <= cm
                                 })
                                 .map(|c| c.cell.clone())
                                 .collect()
@@ -2735,18 +2741,24 @@ impl DagActor {
                 let fclamped =
                     super::floor::ClampedFloor::of(&state.sched.resource_floor, &self.sla_ceilings);
                 let eff_cores = memo.a.c_star.min(self.sla_ceilings.max_cores as u32).max(1);
+                // merged_bug_016: the global mem pin is the
+                // SOLVE-domain cap (`mem_solve_cap`) and the per-class
+                // survival compare is the constructed container
+                // quantity — the SAME formulas the chokepoint applies
+                // (the merged_bug_002 same-formulas law, carried onto
+                // the padded footprint).
                 let eff_mem = memo
                     .a
                     .mem_bytes
                     .max(fclamped.mem_bytes)
-                    .min(self.sla_ceilings.max_mem);
+                    .min(super::floor::mem_solve_cap(&self.sla_ceilings));
                 let survives = cells.iter().any(|(h, _)| {
                     let (cc, cm) = self.sla_config.class_ceilings(
                         h,
                         cost.catalog_ceilings(),
                         cost.resolved_global(),
                     );
-                    eff_cores <= cc && eff_mem <= cm
+                    eff_cores <= cc && rio_common::footprint::container_mem_bytes(eff_mem) <= cm
                 });
                 if survives {
                     // bug_119: a memo emission whose cells survive the
@@ -2851,6 +2863,9 @@ impl DagActor {
                 // projection — a stale persisted floor (minted under a
                 // larger old global) can never re-raise demand past
                 // the live ceiling at this seam.
+                // merged_bug_016: the pin is the SOLVE-domain cap, so
+                // the pre-clamped demand renders a hostable container
+                // (`== global` exactly), never `global + pad`.
                 let m = m
                     .max(
                         super::floor::ClampedFloor::of(
@@ -2859,7 +2874,7 @@ impl DagActor {
                         )
                         .mem_bytes,
                     )
-                    .min(self.sla_ceilings.max_mem);
+                    .min(super::floor::mem_solve_cap(&self.sla_ceilings));
                 // r[impl scheduler.sla.ceiling.stale-solve-revalidation+2]
                 // live_050(e)/live_051(b): the emission chokepoint
                 // mints a TOTAL typed outcome and folds it with zero
@@ -2921,7 +2936,17 @@ impl DagActor {
         let floor = &state.sched.resource_floor;
         let fclamped = super::floor::ClampedFloor::of(floor, &self.sla_ceilings);
         let cores = cores.min(self.sla_ceilings.max_cores as u32).max(1);
-        let mem = mem.max(fclamped.mem_bytes).min(self.sla_ceilings.max_mem);
+        // merged_bug_016: the dispatch funnel pins mem at the
+        // SOLVE-domain cap (`mem_solve_cap` — the inverse of the
+        // shared container law), NOT the raw global. The raw pin put
+        // every clamped dispatch at `container = global + pad`, which
+        // no class hosts — the dead band's largest funnel. The pinned
+        // dispatch now renders `container == global` exactly:
+        // hostable, schedulable, and the at-cap retry terminal stays
+        // reachable.
+        let mem = mem
+            .max(fclamped.mem_bytes)
+            .min(super::floor::mem_solve_cap(&self.sla_ceilings));
         // bug_132 (R24): `disk` arrives as the sealed `DiskRequest`
         // from whichever lane produced it; the reactive-floor overlay
         // is the type's ONE lawful post-constructor modification
@@ -3475,15 +3500,31 @@ impl DagActor {
         // live_051(d): the floor is the demand component a re-solve
         // cannot clamp away — consume it CLAMPED (the projection law)
         // and refuse when even the best candidate sits below it.
+        // merged_bug_016: both halves run in the shared footprint
+        // law's terms — the floor refuses when its CONSTRUCTED
+        // container exceeds the best class, and the re-solve clamp
+        // pins at the class's SOLVE-domain cap
+        // (`max_hostable_solve_mem(bcm)`), never at the raw `bcm`
+        // (the raw pin emitted `container = bcm + pad`, which the
+        // padded gates refuse — the StaleSolve funnel of the dead
+        // band). A best class below the container floor hosts
+        // nothing: Unhostable, typed.
         let fclamped =
             super::floor::ClampedFloor::of(&state.sched.resource_floor, &self.sla_ceilings);
-        if fclamped.mem_bytes > bcm {
-            return CellEmission::Unhostable {
-                demand: (cores, mem),
-                best_class: Some((best_h.to_owned(), (bcc, bcm))),
-            };
+        let unhostable = CellEmission::Unhostable {
+            demand: (cores, mem),
+            best_class: Some((best_h.to_owned(), (bcc, bcm))),
+        };
+        let Some(bcm_cap) = rio_common::footprint::max_hostable_solve_mem(bcm) else {
+            return unhostable;
+        };
+        if rio_common::footprint::container_mem_bytes(fclamped.mem_bytes) > bcm {
+            return unhostable;
         }
-        let resolved = (cores.min(bcc).max(1), mem.min(bcm).max(fclamped.mem_bytes));
+        let resolved = (
+            cores.min(bcc).max(1),
+            mem.min(bcm_cap).max(fclamped.mem_bytes),
+        );
         let cells: Vec<crate::sla::config::Cell> = match cap {
             // The pin survives the re-solve: one cell at the pinned
             // capacity (candidates were pre-filtered to pin hosts).

@@ -18,6 +18,23 @@ use crate::state::DerivationState;
 /// day is a runaway regardless of pod shape.
 pub(super) const DEADLINE_CAP_SECS: u32 = 86_400;
 
+/// merged_bug_016: the mem dimension's cap in the SOLVE domain — the
+/// largest solved mem whose padded container
+/// (`rio_common::footprint::container_mem_bytes`) still fits under
+/// the global ceiling. Every mem pin in this module (the floor
+/// doubling cap, the hydrate/read-time floor grounding) targets THIS,
+/// not the raw `ceil.max_mem`: a floor pinned at the raw ceiling
+/// rendered a container of `ceiling + pad` that no class hosts, so
+/// the at-cap retry attempts could never run and the designed bounded
+/// poison terminal was unreachable (the dead-band funnel shape).
+/// `unwrap_or(0)`: a global that cannot host any container (refused
+/// by `validate_resolved`, kept fail-closed here) floors at zero —
+/// `bump_dim` then reports `at_cap` immediately and the caller's
+/// retry counter bounds the loop.
+pub(super) fn mem_solve_cap(ceil: &Ceilings) -> u64 {
+    rio_common::footprint::max_hostable_solve_mem(ceil.max_mem).unwrap_or(0)
+}
+
 /// Result of [`bump_floor_or_count`]. Two independent bits because
 /// callers need both: `promoted` gates the promotion-exempt path
 /// (`r[sched.retry.promotion-exempt+2]`); `at_cap` tells the caller
@@ -68,10 +85,15 @@ pub fn bump_floor_or_count(
     let floor = &mut state.sched.resource_floor;
     let last = state.sched.last_intent.as_ref();
     match reason {
+        // merged_bug_016: the doubling cap is the SOLVE-domain mem cap
+        // (`mem_solve_cap`), not the raw global — at-cap dispatches
+        // must render a hostable container (`== ceiling` exactly) so
+        // the counted at-cap attempts actually run and the retry
+        // counter's bounded poison terminal stays reachable.
         R::OomKilled => bump_dim(
             &mut floor.mem_bytes,
             last.map_or(0, |i| i.mem_bytes),
-            ceil.max_mem,
+            mem_solve_cap(ceil),
         ),
         // LIVE with exactly ONE producer (live_057-b): the worker
         // quota-attributed DiskFull lane — completion.rs matches
@@ -260,7 +282,10 @@ impl ClampedFloor {
     /// raw floor; the census in sla_contract.rs pins the membership).
     pub(super) fn of(floor: &crate::state::ResourceFloor, ceil: &Ceilings) -> Self {
         Self {
-            mem_bytes: floor.mem_bytes.min(ceil.max_mem),
+            // merged_bug_016: the mem floor grounds at the SOLVE-domain
+            // cap (`mem_solve_cap`) — a floor at the raw global renders
+            // an unhostable `ceiling + pad` container downstream.
+            mem_bytes: floor.mem_bytes.min(mem_solve_cap(ceil)),
             disk_bytes: floor.disk_bytes.min(ceil.max_disk),
         }
     }
@@ -276,7 +301,10 @@ impl ClampedFloor {
 /// covered by the read-time [`ClampedFloor`] projection at every
 /// consumption site, so the law is total over both boot paths.
 pub(super) fn clamp_floor_to_live(f: &mut crate::state::ResourceFloor, ceil: &Ceilings) {
-    f.mem_bytes = f.mem_bytes.min(ceil.max_mem);
+    // merged_bug_016: mem grounds at the solve-domain cap, mirroring
+    // `ClampedFloor::of` (the two halves of the clamp law must agree
+    // on the mem pin or the hydrate seam re-opens the band).
+    f.mem_bytes = f.mem_bytes.min(mem_solve_cap(ceil));
     f.disk_bytes = f.disk_bytes.min(ceil.max_disk);
     f.deadline_secs = f.deadline_secs.min(DEADLINE_CAP_SECS);
 }
@@ -355,13 +383,17 @@ mod tests {
 
     #[test]
     fn at_ceiling_reports_at_cap_no_mutation() {
+        // merged_bug_016: the mem cap is the SOLVE-domain cap
+        // (`mem_solve_cap` = global − pad) — a floor at the raw
+        // global is ABOVE it and heals down via the at-cap arm, so
+        // the at-cap dispatch renders a hostable container.
         let mut s = st();
-        s.sched.resource_floor.mem_bytes = CEIL.max_mem;
+        s.sched.resource_floor.mem_bytes = mem_solve_cap(&CEIL);
         let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL);
         assert!(!o.promoted && o.at_cap);
         // Helper does NOT mutate retry counters; caller owns that.
         assert_eq!(s.retry.infra_count, 0);
-        assert_eq!(s.sched.resource_floor.mem_bytes, CEIL.max_mem);
+        assert_eq!(s.sched.resource_floor.mem_bytes, mem_solve_cap(&CEIL));
     }
 
     #[test]
@@ -387,14 +419,19 @@ mod tests {
         // `floor` (0), returned {promoted:true, at_cap:false} → callers
         // skipped retry-count++ → one uncounted max-size retry burned.
         let mut s = st();
-        s.sched.last_intent = Some(intent(CEIL.max_mem, 0, 0));
+        // merged_bug_016: the dispatch clamp pins at the SOLVE-domain
+        // cap, so "dispatched at ceiling" means `mem_solve_cap`, and
+        // the floor catch-up lands there too (a raw-global floor
+        // would render an unhostable `global + pad` container).
+        s.sched.last_intent = Some(intent(mem_solve_cap(&CEIL), 0, 0));
         let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL);
         assert!(
             !o.promoted && o.at_cap,
             "dispatched at ceiling ⇒ no growth possible; got {o:?}"
         );
         assert_eq!(
-            s.sched.resource_floor.mem_bytes, CEIL.max_mem,
+            s.sched.resource_floor.mem_bytes,
+            mem_solve_cap(&CEIL),
             "floor catches up to cap so persisted state starts at_cap"
         );
     }
@@ -444,15 +481,33 @@ mod tests {
     /// byte-untouched (kill-isolation: no over-clamp).
     #[test]
     fn floor_axis_product_clamp_law() {
-        // (input, live-cap, expected) per dimension — hand-written
-        // oracle rows, NOT derived from the impl's own min().
-        let rows: &[(u64, u64, u64)] = &[
-            (0, 100, 0),             // zero stays zero
-            (50, 100, 50),           // fresh below: untouched
-            (100, 100, 100),         // at live cap: untouched
-            (3_072 << 30, 100, 100), // stale above (383-era): clamped
+        // (input, live-cap, expected-mem, expected-disk) — hand-written
+        // oracle rows, NOT derived from the impl's own min(). The two
+        // dimensions carry DIFFERENT laws since merged_bug_016: disk
+        // clamps at the raw cap; mem clamps at the SOLVE-domain cap
+        // (`cap − pad` for caps at/above the container floor — a mem
+        // floor at the raw cap renders an unhostable `cap + pad`
+        // container downstream). Real-unit caps so both laws have
+        // distinct oracle values.
+        const GI: u64 = 1 << 30;
+        const PAD: u64 = 256 << 20; // rio_common::footprint pad, by value
+        let rows: &[(u64, u64, u64, u64)] = &[
+            (0, 64 * GI, 0, 0),    // zero stays zero
+            (GI, 64 * GI, GI, GI), // fresh below: untouched
+            // at the mem SOLVE cap: untouched on both axes.
+            (64 * GI - PAD, 64 * GI, 64 * GI - PAD, 64 * GI - PAD),
+            // at the RAW cap: disk untouched, mem heals DOWN to the
+            // solve cap (the merged_bug_016 funnel-heal cell).
+            (64 * GI, 64 * GI, 64 * GI - PAD, 64 * GI),
+            // stale above (383-era): both clamped, each to its own cap.
+            (3_072 * GI, 64 * GI, 64 * GI - PAD, 64 * GI),
+            // degenerate cap below the container floor: disk clamps
+            // raw; mem fails CLOSED to zero (`max_hostable_solve_mem =
+            // None` — validate_resolved refuses such globals, the
+            // projection is the backstop).
+            (50, 100, 0, 50),
         ];
-        for &(input, cap, want) in rows {
+        for &(input, cap, want_mem, want_disk) in rows {
             // Read half: the projection.
             let f = crate::state::ResourceFloor {
                 mem_bytes: input,
@@ -466,20 +521,23 @@ mod tests {
                 default_disk: 1,
             };
             let p = ClampedFloor::of(&f, &ceil);
-            assert_eq!(p.mem_bytes, want, "mem projection of {input} at cap {cap}");
             assert_eq!(
-                p.disk_bytes, want,
+                p.mem_bytes, want_mem,
+                "mem projection of {input} at cap {cap}"
+            );
+            assert_eq!(
+                p.disk_bytes, want_disk,
                 "disk projection of {input} at cap {cap}"
             );
             // Hydrate half: the in-place clamp.
             let mut g = f;
             clamp_floor_to_live(&mut g, &ceil);
             assert_eq!(
-                g.mem_bytes, want,
+                g.mem_bytes, want_mem,
                 "mem hydrate-clamp of {input} at cap {cap}"
             );
             assert_eq!(
-                g.disk_bytes, want,
+                g.disk_bytes, want_disk,
                 "disk hydrate-clamp of {input} at cap {cap}"
             );
             assert_eq!(g.deadline_secs, 60, "deadline below its cap: untouched");
@@ -507,8 +565,11 @@ mod tests {
         let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL);
         assert!(!o.promoted && o.at_cap);
         assert_eq!(
-            s.sched.resource_floor.mem_bytes, CEIL.max_mem,
-            "the at-cap arm heals the in-memory floor down to the LIVE cap"
+            s.sched.resource_floor.mem_bytes,
+            mem_solve_cap(&CEIL),
+            "the at-cap arm heals the in-memory floor down to the LIVE \
+             cap — the SOLVE-domain cap since merged_bug_016 (a raw \
+             global floor renders an unhostable container)"
         );
     }
 
