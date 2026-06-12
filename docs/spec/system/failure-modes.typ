@@ -348,13 +348,20 @@ or terminal event, and the reachability witness — under the doctrine above
 - *GC delete outbox (store)*: a `pending_s3_deletes` row that exhausts its
   retry budget (`attempts >= MAX_ATTEMPTS`) is parked outside the drain's
   partial index --- a latch with no in-band retry. Exit edge: the next fresh
-  collect decision for the same object resets the budget through the
-  enqueue's guarded conflict arm (#rref("store.gc.outbox-reset")); the reset
-  event is mintable from inside the latched state because collect decisions
-  derive from tombstone state, which the latch does not gate. Reachability
-  witnessed end-to-end (injected-outage exhaustion through the production
-  drain, then a production re-decision reaching execution past backend
-  recovery), with the dedup face co-witnessed: in-budget rows stay swallowed.
+  collect decision for the same object resets the budget --- carrying EVERY
+  decision-derived column, including the recomputed backend key --- through
+  the enqueue's guarded conflict arm (#rref("store.gc.outbox-reset")). The
+  edge's reachability is FEEDER-SCOPED (the round-12 correction of this
+  row's original claim): the production feeder is gated `deleted = FALSE`,
+  so the edge is reachable for exhausted rows over LIVE (resurrected)
+  chunks --- witnessed end-to-end from the candidate scan through the reset
+  to the executed drain --- while exhausted rows over TOMBSTONED chunks
+  have NO production reset event and are TYPED parked-operator by the
+  two-variant liveness letter (#rref("store.gc.outbox-veto-letter")); the
+  `_stuck` gauge is that population's alarm, and the prior unqualified
+  finiteness claim (witnessed only at the producer statement's lattice,
+  with hand-built rows) was the bug_116 defect. The dedup face stays
+  co-witnessed: in-budget rows stay swallowed.
 - *Pool gave-up latch (controller)*: the verdict-free respawn record at the
   give-up threshold (`RESPAWN_GIVE_UP_DEATHS`, pool/candidate.rs) is
   expiry-immune by design while every reset witness in the prior alphabet

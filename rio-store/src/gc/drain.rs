@@ -17,8 +17,12 @@ const DRAIN_BATCH_SIZE: i64 = 100;
 /// Max attempts before we stop retrying a row. After this, the row
 /// stays (attempts >= MAX → excluded by the partial index) and shows
 /// in `rio_store_s3_deletes_stuck` (not `_pending`; pending counts
-/// only retriable rows). Usually: S3 permission change, key format
-/// mismatch after a config change, or the object is Glacier-archived.
+/// only retriable rows). The parked population's liveness is the
+/// typed letter [`crate::gc::OutboxVetoLiveness::ParkedOperator`] —
+/// its `narrate()` names the operator work (S3 permissions, key
+/// format, Glacier); this doc cites the letter rather than
+/// restating it (bug_116: two modules narrating one population in
+/// prose asserted opposite liveness).
 pub(crate) const MAX_ATTEMPTS: i32 = 10;
 
 /// Interval between drain iterations. 30s: fast enough to keep
@@ -135,8 +139,16 @@ pub async fn drain_once(
                 seen.push(id);
                 // Post-commit (drain_one_row already committed). A
                 // counter is a promise of monotonic fact — never fire
-                // before the resurrection-skip is durable.
+                // before the resurrection-skip is durable. The
+                // resurrection IS the finite-class transition: the
+                // re-check witnessed deleted = FALSE, so the letter
+                // classifies live (bug_116 — the narration renders
+                // FROM the letter at the event that proves it).
                 metrics::counter!("rio_store_gc_chunk_resurrected_total").increment(1);
+                debug!(
+                    letter = crate::gc::OutboxVetoLiveness::classify(false, 0).narrate(),
+                    "resurrected chunk's outbox row removed (the finite class)"
+                );
             }
         }
     }
@@ -165,6 +177,15 @@ pub async fn drain_once(
     .await?;
     metrics::gauge!("rio_store_s3_deletes_pending").set(pending as f64);
     metrics::gauge!("rio_store_s3_deletes_stuck").set(stuck as f64);
+    if stuck > 0 {
+        // The parked population's narration renders FROM the letter
+        // (bug_116): the alarm names the work, never a false wait.
+        debug!(
+            stuck,
+            letter = crate::gc::OutboxVetoLiveness::ParkedOperator.narrate(),
+            "stuck outbox rows are parked until operator action"
+        );
+    }
 
     Ok((deleted, failed))
 }

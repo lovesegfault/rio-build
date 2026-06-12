@@ -440,12 +440,17 @@ pub(crate) static REAP_BATCH_DELETE_SQL: LazyLock<String> = LazyLock::new(|| {
 /// outbox completes for that object — a tombstone whose S3 delete is
 /// still scheduled (or parked exhausted) keeps its row, so the
 /// drain's `chunks` re-check target and the object's bookkeeping
-/// survive until the backend delete is confirmed. The conjunct is a
-/// FINITE wait, never a permanent veto, because the outbox has its
-/// exit edge: an exhausted row resets on the next fresh collect
-/// decision (`enqueue_chunk_deletes`' guarded conflict arm) and
-/// in-budget rows drain on cadence. Dropping the conjunct from one
-/// qual and not the other is exactly the divergence class this
+/// survive until the backend delete is confirmed. The conjunct's
+/// WAIT IS TYPED by [`super::OutboxVetoLiveness`] (bug_116 — this
+/// doc previously claimed "a FINITE wait, never a permanent veto",
+/// which is true only for the `FiniteDrain` population; the reset
+/// edge's sole production feeder is gated `deleted = FALSE` and
+/// cannot reach an exhausted row over a tombstoned chunk):
+/// `FiniteDrain` rows drain on cadence or re-enter the collect
+/// feeder; `ParkedOperator` rows (exhausted x tombstoned) hold the
+/// reap until operator action — the retention posture is the design,
+/// and the `_stuck` gauge is the alarm. Dropping the conjunct from
+/// one qual and not the other is exactly the divergence class this
 /// splice forecloses.
 fn render_reap_row_local_pred(a: &str) -> String {
     format!(
@@ -5667,6 +5672,222 @@ mod tests {
             super::super::hold::release_hold(&db.pool, hold_id)
                 .await
                 .unwrap()
+        );
+    }
+
+    /// A delete-failing wrapper for the exhaustion leg of W12-S (the
+    /// production drain burns the budget through real failures).
+    struct FlakyDeleteBackend {
+        inner: Arc<dyn ChunkBackend>,
+        healthy: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ChunkBackend for FlakyDeleteBackend {
+        async fn put(&self, h: &[u8; 32], d: bytes::Bytes) -> anyhow::Result<()> {
+            self.inner.put(h, d).await
+        }
+        async fn get(&self, h: &[u8; 32]) -> anyhow::Result<Option<bytes::Bytes>> {
+            self.inner.get(h).await
+        }
+        async fn exists_batch(&self, h: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
+            self.inner.exists_batch(h).await
+        }
+        fn key_for(&self, h: &[u8; 32]) -> String {
+            self.inner.key_for(h)
+        }
+        async fn delete_by_key(&self, k: &str) -> anyhow::Result<()> {
+            if self.healthy.load(std::sync::atomic::Ordering::SeqCst) {
+                self.inner.delete_by_key(k).await
+            } else {
+                anyhow::bail!("injected S3 outage")
+            }
+        }
+    }
+
+    // r[verify store.gc.outbox-veto-letter]
+    /// W12-S (bug_116, R30-hardened: feeder-witnessed exit edges).
+    /// Two faces, both tiers pinned:
+    ///
+    /// COMPILE face: the finite-drain narration is constructible only
+    /// from the `FiniteDrain` letter variant — the strings live in
+    /// `narrate()`'s match and nowhere else, so a parked-population
+    /// finite-drain claim is not writable.
+    ///
+    /// RUNTIME face: (a) the PARKED population — an exhausted row
+    /// over a TOMBSTONED chunk — classifies `ParkedOperator`, renders
+    /// the parked narration, and a full PRODUCTION collect cycle
+    /// leaves it parked (the reset feeder is gated `deleted = FALSE`
+    /// and structurally cannot reach it — the claim the wave-11
+    /// witness bypassed by calling the producer with hand-built
+    /// rows); (b) the FINITE face is witnessed FROM THE FEEDER
+    /// end-to-end: the chunk resurrects, ages out, the next
+    /// PRODUCTION collect decision flows through the candidate
+    /// scan -> soft-delete -> enqueue reset arm, the budget resets,
+    /// and the healed drain executes the carried decision.
+    #[tokio::test]
+    async fn outbox_veto_liveness_letter_is_feeder_witnessed() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let flaky = Arc::new(FlakyDeleteBackend {
+            inner: mem_backend(),
+            healthy: std::sync::atomic::AtomicBool::new(false),
+        });
+        let backend: Arc<dyn ChunkBackend> = Arc::clone(&flaky) as Arc<dyn ChunkBackend>;
+        let grace = super::super::sweep::CHUNK_GRACE_SECS;
+
+        // COMPILE face: one home for the strings, distinct variants.
+        use super::super::OutboxVetoLiveness;
+        assert!(
+            OutboxVetoLiveness::FiniteDrain
+                .narrate()
+                .starts_with("finite-drain:")
+        );
+        assert!(
+            OutboxVetoLiveness::ParkedOperator
+                .narrate()
+                .starts_with("parked-operator:")
+        );
+
+        // Chunk X: aged, unreferenced, LIVE — the production feeder
+        // soft-deletes it and enqueues (decision 1). Eligibility is
+        // GREATEST(created_at, last_referenced_at) outside grace, so
+        // BOTH stamps backdate (the seed_collectable_chunks recipe).
+        let x = ChunkSeed::new(0xE1).uploaded().seed(&db.pool).await;
+        sqlx::query(
+            "UPDATE chunks SET created_at = now() - make_interval(secs => $2), \
+             last_referenced_at = NULL WHERE blake3_hash = $1",
+        )
+        .bind(&x[..])
+        .bind((grace + 100) as f64)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let report = collect_cycle(
+            &db.pool,
+            Some(&backend),
+            grace,
+            CollectMode::Live,
+            None,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .expect("decision 1");
+        assert_eq!(report.victims_collected, 1);
+        assert_eq!(report.s3_keys_enqueued, 1);
+
+        // The outage exhausts the row through the production drain.
+        for _ in 0..super::super::drain::MAX_ATTEMPTS {
+            let (_, failed) = super::super::drain::drain_once(
+                &db.pool,
+                &backend,
+                &mut crate::test_helpers::gc_clearance(&db.pool).await,
+            )
+            .await
+            .unwrap();
+            assert_eq!(failed, 1);
+        }
+
+        // FACE (a): exhausted x tombstoned = ParkedOperator — and the
+        // production feeder CANNOT reset it (the run is the witness).
+        let (deleted, attempts): (bool, i32) = sqlx::query_as(
+            "SELECT c.deleted, p.attempts FROM chunks c \
+             JOIN pending_s3_deletes p USING (blake3_hash) WHERE c.blake3_hash = $1",
+        )
+        .bind(&x[..])
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            OutboxVetoLiveness::classify(deleted, attempts),
+            OutboxVetoLiveness::ParkedOperator,
+            "the tombstoned exhausted row is typed parked, never narrated finite"
+        );
+        let parked_report = collect_cycle(
+            &db.pool,
+            Some(&backend),
+            grace,
+            CollectMode::Live,
+            None,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .expect("a full production cycle over the parked population");
+        assert_eq!(parked_report.victims_collected, 0);
+        let attempts_after: i32 =
+            sqlx::query_scalar("SELECT attempts FROM pending_s3_deletes WHERE blake3_hash = $1")
+                .bind(&x[..])
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            attempts_after,
+            super::super::drain::MAX_ATTEMPTS,
+            "left: the reset edge claimed reachable from the tombstoned \
+             population / right: the deleted=FALSE-gated feeder leaves it \
+             parked — operator action is the honest letter"
+        );
+
+        // FACE (b): resurrection re-enters the feeder — the finite
+        // face witnessed END-TO-END from the production candidate
+        // scan (never by calling the producer with hand-built rows).
+        sqlx::query(
+            "UPDATE chunks SET deleted = false, deleted_at = NULL, \
+             created_at = now() - make_interval(secs => $2), \
+             last_referenced_at = NULL WHERE blake3_hash = $1",
+        )
+        .bind(&x[..])
+        .bind((grace + 100) as f64)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let (deleted, attempts): (bool, i32) = sqlx::query_as(
+            "SELECT c.deleted, p.attempts FROM chunks c \
+             JOIN pending_s3_deletes p USING (blake3_hash) WHERE c.blake3_hash = $1",
+        )
+        .bind(&x[..])
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            OutboxVetoLiveness::classify(deleted, attempts),
+            OutboxVetoLiveness::FiniteDrain,
+            "a resurrected chunk re-enters the feeder: finite again"
+        );
+        flaky
+            .healthy
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let finite_report = collect_cycle(
+            &db.pool,
+            Some(&backend),
+            grace,
+            CollectMode::Live,
+            None,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .expect("decision 2 through the production feeder");
+        assert_eq!(finite_report.victims_collected, 1, "the feeder re-decides");
+        let attempts_reset: i32 =
+            sqlx::query_scalar("SELECT attempts FROM pending_s3_deletes WHERE blake3_hash = $1")
+                .bind(&x[..])
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            attempts_reset, 0,
+            "the feeder-witnessed reset un-latches the row"
+        );
+        let (drained, _) = super::super::drain::drain_once(
+            &db.pool,
+            &backend,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            drained, 1,
+            "the carried decision executes; the wait was finite"
         );
     }
 }

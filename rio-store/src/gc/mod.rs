@@ -404,6 +404,65 @@ pub mod hold {
     }
 }
 
+/// The outbox veto's TYPED liveness letter (bug_116, R30-hardened:
+/// two modules narrated the SAME row population with OPPOSITE
+/// liveness — collect.rs justified the reap's NOT-EXISTS conjunct as
+/// "a FINITE wait, never a permanent veto" via a reset edge whose
+/// sole production feeder is gated `deleted = FALSE`, structurally
+/// unreachable for an already-tombstoned chunk absent PutPath
+/// resurrection, while drain.rs honestly listed the stuck causes as
+/// operator work: S3 permissions, key-format mismatch, Glacier).
+/// Both narrations consume THIS alphabet, so an untrue finiteness
+/// claim is no longer writable as prose: the finite-drain narration
+/// is constructible only from the `FiniteDrain` variant.
+// r[impl store.gc.outbox-veto-letter]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutboxVetoLiveness {
+    /// The drain (or the reset feeder) reaches this row without
+    /// operator action: in-budget rows drain on cadence; an
+    /// exhausted row whose chunk is LIVE (`deleted = FALSE` — a
+    /// post-exhaustion resurrection) re-enters the collect feeder
+    /// when the chunk next ages out, and the fresh decision resets
+    /// the budget (the feeder-witnessed exit edge).
+    FiniteDrain,
+    /// Exhausted row over a TOMBSTONED chunk: no production event
+    /// resets it — the collect feeder only emits decisions for
+    /// `deleted = FALSE` chunks. PARKED UNTIL OPERATOR ACTION (fix
+    /// S3 permissions / key layout / storage class, then re-enqueue
+    /// or release); the `_stuck` gauge is its alarm. The retention
+    /// posture is the design — the prior FINITE-wait claim over this
+    /// population was the defect.
+    ParkedOperator,
+}
+
+impl OutboxVetoLiveness {
+    /// Classify one outbox row's liveness from the facts the law
+    /// ranges over: the retry budget and the chunk's tombstone state.
+    pub(crate) fn classify(chunk_deleted: bool, attempts: i32) -> Self {
+        if attempts >= drain::MAX_ATTEMPTS && chunk_deleted {
+            Self::ParkedOperator
+        } else {
+            Self::FiniteDrain
+        }
+    }
+
+    /// The variant's one narration — the strings live HERE and only
+    /// here, so the two consuming docs/logs cannot diverge.
+    pub(crate) fn narrate(self) -> &'static str {
+        match self {
+            Self::FiniteDrain => {
+                "finite-drain: drains on cadence, or re-enters the collect \
+                 feeder on the chunk's next aging-out (no operator needed)"
+            }
+            Self::ParkedOperator => {
+                "parked-operator: no production event resets an exhausted \
+                 row over a tombstoned chunk; operator action required \
+                 (S3 permissions / key layout / storage class)"
+            }
+        }
+    }
+}
+
 pub mod collect;
 pub mod drain;
 pub mod lane;

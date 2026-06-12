@@ -2294,6 +2294,32 @@ promoted a transient S3 outage into an unreaped tombstone and a leaked
 object with only the `_stuck` gauge as evidence (bug_111; the R30
 liveness-dual discipline --- the latch and its exit edge ship together).
 
+#r("store.gc.outbox-veto-letter")[
+  The outbox veto's liveness is TYPED, never narrated in prose: every
+  narration over the `pending_s3_deletes` population MUST consume the
+  two-variant letter `OutboxVetoLiveness {finite-drain,
+  parked-operator}` --- `finite-drain` for in-budget rows (drain on
+  cadence) and exhausted rows over LIVE chunks (the `deleted = FALSE`
+  collect feeder re-decides when the chunk next ages out);
+  `parked-operator` for exhausted rows over TOMBSTONED chunks, which NO
+  production event resets (the reset feeder is gated `deleted = FALSE`)
+  --- and the finite-drain claim MUST be witnessed FROM the production
+  feeder end-to-end (candidate scan, soft-delete, reset arm, drain),
+  never by driving the producer statement with hand-built rows.
+]
+The wave-11 close justified the reap's NOT-EXISTS conjunct as "a FINITE
+wait, never a permanent veto" via an exit-edge witness that called the
+producer directly with hand-built rows --- the edge's sole production
+feeder is `deleted = FALSE`-gated and structurally unreachable for the
+ordinary stuck population (S3 permissions, key-format mismatch, Glacier),
+so collect.rs and drain.rs narrated one population with opposite liveness
+(bug_116). The retention posture is defensible --- the CLAIM was the
+defect; the letter makes the parked truth the only writable narration for
+that population. A self-healing long-backoff attempts reset was
+considered and REJECTED this round (a behavior change to a working
+retention posture, unpriced); it is the commissioned candidate if
+operator-parked rows recur in soak readbacks.
+
 *GC-vs-GC serialization:* see #rref("store.gc.serialize-lock").
 
 = Admin RPCs
