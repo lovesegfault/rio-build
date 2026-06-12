@@ -2666,7 +2666,7 @@ mod tests {
                 super::super::cost::RatioEma {
                     numerator: 1e6,
                     denominator: 1.0,
-                    updated_at: now,
+                    updated_at: super::super::cost::Epoch::from_wall_clock(now),
                 },
             );
         }
@@ -3226,7 +3226,7 @@ mod tests {
                     RatioEma {
                         numerator: 1e6,
                         denominator: 1.0,
-                        updated_at: 0.0,
+                        updated_at: crate::sla::cost::Epoch::UNSET,
                     },
                 )
             })
@@ -3271,7 +3271,7 @@ mod tests {
                     RatioEma {
                         numerator: 0.0,
                         denominator: 1e12,
-                        updated_at: 0.0,
+                        updated_at: crate::sla::cost::Epoch::UNSET,
                     },
                 )
             })
@@ -3317,7 +3317,7 @@ mod tests {
                     RatioEma {
                         numerator: 86.4,
                         denominator: 1.0,
-                        updated_at: 0.0,
+                        updated_at: crate::sla::cost::Epoch::UNSET,
                     },
                 )
             })

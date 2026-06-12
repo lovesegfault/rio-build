@@ -1941,7 +1941,7 @@ async fn contract_h_explore_schmitt_carries_prev_a() {
                 RatioEma {
                     numerator: 0.0,
                     denominator: 1e15,
-                    updated_at: 0.0,
+                    updated_at: crate::sla::cost::Epoch::UNSET,
                 },
             )]
             .into(),
@@ -2132,7 +2132,7 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
                 RatioEma {
                     numerator: 0.0,
                     denominator: 1e15,
-                    updated_at: 0.0,
+                    updated_at: crate::sla::cost::Epoch::UNSET,
                 },
             )]
             .into(),
@@ -2782,7 +2782,7 @@ async fn contract_interrupt_runaway_reachable() {
                         RatioEma {
                             numerator: 1e6,
                             denominator: 1.0,
-                            updated_at: 0.0,
+                            updated_at: crate::sla::cost::Epoch::UNSET,
                         },
                     )
                 })

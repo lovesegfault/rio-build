@@ -96,6 +96,105 @@ impl InstanceType {
     }
 }
 
+// r[impl sched.sla.epoch-domain]
+/// Absolute Unix-epoch seconds, FINITE BY CONSTRUCTION — the typed
+/// epoch domain for the SLA cost plane (bug_060; R28 family seal, R29
+/// clock domain). PG epochs cross the sqlx boundary as bare `f64`
+/// (the EXTRACT-epoch `::float8` reads), and an `'infinity'::timestamptz`
+/// row decodes to `+inf`: stored raw, ONE such row folded
+/// `price_updated_at()` to `+inf` (silently disarming the stale clamp,
+/// the RioSlaHwCostStale alert, and the stale fallback counter
+/// fleet-wide — `now − inf = −inf` never exceeds the threshold) and
+/// wedged `refresh_lambda`'s global HWM (`at > 'infinity'` matches
+/// nothing), while the monotone upsert qual made the row un-healable.
+/// The clippy disallowed-methods seal guards `f64 → Duration`
+/// conversion but not f64-epoch COMPARISON semantics — this type does:
+/// every stored epoch in the family is an `Epoch`, so a non-finite
+/// stamp is unrepresentable past the decode boundary and every
+/// comparison/age/fold method operates on finite values only.
+///
+/// Constructors (the ONLY mints):
+/// - [`Epoch::from_pg_epoch`] — the PG decode boundary:
+///   finite-or-refuse. Callers on refusal lanes turn `None` into the
+///   typed, counted letter (`_evidence_refused_total{reason=
+///   "nonfinite_epoch"}`) and SKIP the row — siblings unaffected.
+/// - [`Epoch::from_wall_clock`] — wall-clock entry for `now` values
+///   produced by `SystemTime` arithmetic (finite by construction;
+///   debug-asserted).
+/// - [`Epoch::UNSET`] (= `Default`) — "no prior": epoch 0 reads as
+///   maximally old, which is the correct fold identity for
+///   newest-wins maxima and the EMA first-sample arm. Ordering note
+///   (the bug_116 sentinel-newtype convention): `UNSET` is the global
+///   MINIMUM by design — every fold here wants "unset loses to any
+///   real stamp"; do NOT derive `Ord` semantics that need `UNSET`
+///   special-cased elsewhere without re-deriving this choice.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct Epoch(f64);
+
+impl Epoch {
+    /// The fold identity / "no prior" sentinel (epoch 0).
+    pub const UNSET: Epoch = Epoch(0.0);
+
+    /// THE PG decode boundary: refuse non-finite epochs (NaN, ±inf).
+    /// Negative finite epochs (pre-1970 timestamps) pass — they are
+    /// representable facts that merely read as very old.
+    pub fn from_pg_epoch(secs: f64) -> Option<Epoch> {
+        secs.is_finite().then_some(Epoch(secs))
+    }
+
+    /// Wall-clock entry: `secs` comes from `SystemTime` arithmetic
+    /// (`now_epoch()` and test fixtures) and is finite by
+    /// construction; a non-finite input is a programmer error
+    /// (debug-asserted) clamped to [`Epoch::UNSET`] in release.
+    pub fn from_wall_clock(secs: f64) -> Epoch {
+        debug_assert!(secs.is_finite(), "wall-clock epoch must be finite: {secs}");
+        Epoch(if secs.is_finite() { secs } else { 0.0 })
+    }
+
+    /// `true` for the "no prior" sentinel (exact epoch 0).
+    pub fn is_unset(self) -> bool {
+        self.0 == 0.0
+    }
+
+    /// Seconds elapsed from `earlier` to `self` (negative if `self`
+    /// precedes `earlier` — callers clamp where one-sided).
+    pub fn secs_since(self, earlier: Epoch) -> f64 {
+        self.0 - earlier.0
+    }
+
+    /// Age of this stamp at wall-clock `now_secs`. Finite by the type
+    /// invariant — the `now − inf = −inf` disarm is unrepresentable.
+    pub fn age_at(self, now_secs: f64) -> f64 {
+        now_secs - self.0
+    }
+
+    /// Newest-wins fold step (total over the finite domain).
+    pub fn max(self, other: Epoch) -> Epoch {
+        if other.0 > self.0 { other } else { self }
+    }
+
+    /// The sanctioned exit for SQL binds / gauges. One-way: there is
+    /// no blanket re-entry — values come back in through
+    /// [`Epoch::from_pg_epoch`] only.
+    pub fn as_secs_f64(self) -> f64 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for Epoch {
+    type Error = String;
+    fn try_from(secs: f64) -> Result<Self, Self::Error> {
+        Epoch::from_pg_epoch(secs).ok_or_else(|| format!("non-finite epoch: {secs}"))
+    }
+}
+
+impl From<Epoch> for f64 {
+    fn from(e: Epoch) -> f64 {
+        e.0
+    }
+}
+
 /// Where `$/vCPU·hr` numbers come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -122,19 +221,20 @@ pub enum HwCostSource {
 pub struct RatioEma {
     pub numerator: f64,
     pub denominator: f64,
-    /// Unix-epoch seconds of last update. Drives the decay factor.
-    pub updated_at: f64,
+    /// Last-update stamp (typed epoch — sched.sla.epoch-domain).
+    /// Drives the decay factor.
+    pub updated_at: Epoch,
 }
 
 impl RatioEma {
-    /// Fold `(num, den)` into the EMA at wall-clock `now` (epoch secs)
-    /// with `halflife_secs`. Both running sums decay by
-    /// `0.5^(Δt/halflife)` then the new sample is added — so the ratio
-    /// is `Σ decayed-num / Σ decayed-den`, not an EMA of instantaneous
-    /// ratios (which would over-weight low-denominator ticks).
-    pub fn update(&mut self, num: f64, den: f64, now: f64, halflife_secs: f64) {
-        let dt = (now - self.updated_at).max(0.0);
-        let decay = if self.updated_at == 0.0 {
+    /// Fold `(num, den)` into the EMA at `now` with `halflife_secs`.
+    /// Both running sums decay by `0.5^(Δt/halflife)` then the new
+    /// sample is added — so the ratio is `Σ decayed-num / Σ
+    /// decayed-den`, not an EMA of instantaneous ratios (which would
+    /// over-weight low-denominator ticks).
+    pub fn update(&mut self, num: f64, den: f64, now: Epoch, halflife_secs: f64) {
+        let dt = now.secs_since(self.updated_at).max(0.0);
+        let decay = if self.updated_at.is_unset() {
             0.0 // first sample: no prior to decay
         } else {
             0.5f64.powf(dt / halflife_secs)
@@ -251,19 +351,18 @@ const ICE_BASE_TTL: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct PriceEma {
     pub value: f64,
-    /// Unix-epoch seconds of last update. `0.0` ⇒ seed (first fold gets
-    /// `decay = 0.0`).
-    pub updated_at: f64,
+    /// Last-update stamp (typed epoch — sched.sla.epoch-domain).
+    /// [`Epoch::UNSET`] ⇒ seed (first fold gets `decay = 0.0`).
+    pub updated_at: Epoch,
 }
 
 impl PriceEma {
-    /// Fold one sample at wall-clock `now` with `halflife_secs`. Same
-    /// `0.5^(Δt/H)` decay as [`RatioEma::update`]; `updated_at = 0.0`
-    /// is treated as "no prior" so the first fold takes the sample
-    /// verbatim.
-    pub fn update(&mut self, sample: f64, now: f64, halflife_secs: f64) {
-        let dt = (now - self.updated_at).max(0.0);
-        let decay = if self.updated_at == 0.0 {
+    /// Fold one sample at `now` with `halflife_secs`. Same
+    /// `0.5^(Δt/H)` decay as [`RatioEma::update`]; an UNSET stamp is
+    /// "no prior" so the first fold takes the sample verbatim.
+    pub fn update(&mut self, sample: f64, now: Epoch, halflife_secs: f64) {
+        let dt = now.secs_since(self.updated_at).max(0.0);
+        let decay = if self.updated_at.is_unset() {
             0.0
         } else {
             0.5f64.powf(dt / halflife_secs)
@@ -506,7 +605,10 @@ impl CostTable {
     /// call while stale increments `_hw_cost_fallback_total{reason=
     /// "stale"}` so the rate surfaces in alerting.
     pub fn apply_stale_clamp(&mut self, now: f64) -> bool {
-        let stale = now - self.price_updated_at();
+        // Typed-epoch age (sched.sla.epoch-domain): the stamp is
+        // finite by construction, so the pre-fix `now − inf = −inf`
+        // fleet-wide disarm is unrepresentable here.
+        let stale = self.price_updated_at().age_at(now);
         self.stale_clamp = stale > STALE_CLAMP_AFTER_SECS;
         if self.stale_clamp {
             ::metrics::counter!("rio_scheduler_sla_hw_cost_fallback_total", "reason" => "stale")
@@ -515,14 +617,16 @@ impl CostTable {
         self.stale_clamp
     }
 
-    /// Unix-epoch seconds of the most-recently-updated price key. Feeds
+    /// Most-recently-updated price stamp (typed epoch). Feeds
     /// `rio_scheduler_sla_hw_cost_stale_seconds`. Derived (not stored)
-    /// so it can never drift from the per-key timestamps.
-    pub fn price_updated_at(&self) -> f64 {
+    /// so it can never drift from the per-key timestamps; the fold is
+    /// total over the finite domain (sched.sla.epoch-domain), so one
+    /// poisoned row can no longer pin it at `+inf`.
+    pub fn price_updated_at(&self) -> Epoch {
         self.price
             .values()
             .map(|p| p.updated_at)
-            .fold(0.0, f64::max)
+            .fold(Epoch::UNSET, Epoch::max)
     }
 
     /// `sla_ema_state.cluster` scope. Exposed so the poller's
@@ -635,6 +739,30 @@ impl CostTable {
         .fetch_all(db.pool())
         .await?;
         for (key, value, num, den, at) in rows {
+            // r[impl sched.sla.epoch-domain]
+            // THE decode boundary for the epoch family: a non-finite
+            // epoch (`'infinity'::timestamptz`, NaN) is a typed,
+            // counted refusal letter — the row never enters a map,
+            // SIBLINGS are unaffected, and every downstream
+            // staleness/watermark consumer runs on finite stamps
+            // only. The PG row itself stays (the monotone upsert
+            // qual rightly never rewinds it) but is read-dead until
+            // operator surgery; with the poisoned stamp refused, the
+            // stale clamp and the RioSlaHwCostStale alert arm
+            // truthfully instead of disarming fleet-wide.
+            let Some(at) = Epoch::from_pg_epoch(at) else {
+                tracing::warn!(
+                    key = %key,
+                    "non-finite epoch in sla_ema_state; row refused at decode"
+                );
+                ::metrics::counter!(
+                    "rio_scheduler_sla_evidence_refused_total",
+                    "plane" => "ema_row",
+                    "reason" => "nonfinite_epoch"
+                )
+                .increment(1);
+                continue;
+            };
             if let Some(rest) = key.strip_prefix("price:")
                 && let Some(cell) = parse_cell(rest)
             {
@@ -741,7 +869,7 @@ impl CostTable {
                 .bind(&self.cluster)
                 .bind(format!("price:{}", cell_label(cell)))
                 .bind(p.value)
-                .bind(p.updated_at)
+                .bind(p.updated_at.as_secs_f64())
                 .execute(db.pool())
                 .await?;
             }
@@ -759,7 +887,7 @@ impl CostTable {
             .bind(ema.value_or(LAMBDA_SEED))
             .bind(ema.numerator)
             .bind(ema.denominator)
-            .bind(ema.updated_at)
+            .bind(ema.updated_at.as_secs_f64())
             .execute(db.pool())
             .await?;
         }
@@ -773,7 +901,7 @@ impl CostTable {
             .bind(&self.cluster)
             .bind(format!("node_count:{h}"))
             .bind(nc.value)
-            .bind(nc.updated_at)
+            .bind(nc.updated_at.as_secs_f64())
             .execute(db.pool())
             .await?;
         }
@@ -829,6 +957,11 @@ impl CostTable {
     /// node label). λ is a solve input; the next poll's
     /// [`super::solve::SolveInputs::inputs_gen`] reflects the change.
     pub async fn refresh_lambda(&mut self, db: &SchedulerDb) -> anyhow::Result<()> {
+        let prev_hwm = self
+            .lambda
+            .values()
+            .map(|e| e.updated_at)
+            .fold(Epoch::UNSET, Epoch::max);
         let rows: Vec<(String, String, f64, f64)> = sqlx::query_as(
             "SELECT hw_class, kind, COALESCE(SUM(value), 0), \
                     EXTRACT(EPOCH FROM MAX(at))::float8 \
@@ -836,26 +969,39 @@ impl CostTable {
              GROUP BY hw_class, kind",
         )
         .bind(&self.cluster)
-        .bind(
-            self.lambda
-                .values()
-                .map(|e| e.updated_at)
-                .fold(0.0, f64::max),
-        )
+        .bind(prev_hwm.as_secs_f64())
         .fetch_all(db.pool())
         .await?;
         // HWM from the rows' MAX(at), NOT wall-clock now(): a row whose
         // PG-stamped `at` is behind the scheduler clock (skew, or commit
         // lagged the SELECT) would otherwise be permanently skipped on
         // the next tick. Same pattern as `SlaEstimator::refresh`.
-        let prev_hwm = self
-            .lambda
-            .values()
-            .map(|e| e.updated_at)
-            .fold(0.0, f64::max);
+        // The fold runs in the typed epoch domain
+        // (sched.sla.epoch-domain): pre-fix, ONE `'infinity'` sample
+        // stamp folded the global HWM to `+inf` and `at > 'infinity'`
+        // matched nothing — EVERY class's refresh froze, and the
+        // wave-10 monotone qual made the wedge permanent.
         let mut hwm = prev_hwm;
         let mut per_h: HashMap<HwClassName, (f64, f64)> = HashMap::new();
         for (hw_class, kind, sum, max_at) in rows {
+            // r[impl sched.sla.epoch-domain]
+            // Decode boundary: a non-finite MAX(at) refuses the GROUP
+            // row (typed, counted) — its sums are not folded and it
+            // cannot wedge the HWM; sibling classes proceed.
+            let Some(max_at) = Epoch::from_pg_epoch(max_at) else {
+                tracing::warn!(
+                    hw_class = %hw_class,
+                    kind = %kind,
+                    "non-finite interrupt-sample stamp; group row refused at decode"
+                );
+                ::metrics::counter!(
+                    "rio_scheduler_sla_evidence_refused_total",
+                    "plane" => "interrupt_group",
+                    "reason" => "nonfinite_epoch"
+                )
+                .increment(1);
+                continue;
+            };
             hwm = hwm.max(max_at);
             let e = per_h.entry(hw_class).or_default();
             match kind.as_str() {
@@ -867,15 +1013,15 @@ impl CostTable {
         // Per-h node_count = Σ exposure_secs / Δt over the batch window
         // (each `kind='exposure'` row is "node-seconds accrued since
         // last flush", so the sum ÷ wall-window is mean live nodes).
-        // Skip when `prev_hwm == 0` — first refresh has no window
+        // Skip when `prev_hwm` is unset — first refresh has no window
         // baseline, and a `Δt` from epoch would zero the count.
-        let dt = hwm - prev_hwm;
+        let dt = hwm.secs_since(prev_hwm);
         for (h, (n, d)) in per_h {
             self.lambda
                 .entry(h.clone())
                 .or_default()
                 .update(n, d, hwm, LAMBDA_HALFLIFE_SECS);
-            if prev_hwm > 0.0 && dt > 0.0 {
+            if prev_hwm.as_secs_f64() > 0.0 && dt > 0.0 {
                 self.node_count
                     .entry(h)
                     .or_default()
@@ -902,6 +1048,7 @@ impl CostTable {
     /// full elapsed interval, not just the gap since the last (partial)
     /// fold.
     pub fn fold_prices(&mut self, obs: &HashMap<Cell, f64>, now: f64) {
+        let now = Epoch::from_wall_clock(now);
         for (k, &v) in obs {
             self.price
                 .entry(k.clone())
@@ -919,7 +1066,7 @@ impl CostTable {
     /// [`Self::set_resolved_global`] after.
     #[cfg(test)]
     pub fn from_parts(price: HashMap<Cell, f64>, lambda: HashMap<HwClassName, RatioEma>) -> Self {
-        let now = now_epoch();
+        let now = Epoch::from_wall_clock(now_epoch());
         Self {
             price: price
                 .into_iter()
@@ -947,15 +1094,25 @@ impl CostTable {
     /// [`Self::from_parts`] for an observable price.
     #[cfg(test)]
     pub fn set_price(&mut self, h: &str, cap: CapacityType, value: f64, updated_at: f64) {
-        self.price
-            .insert((h.to_owned(), cap), PriceEma { value, updated_at });
+        self.price.insert(
+            (h.to_owned(), cap),
+            PriceEma {
+                value,
+                updated_at: Epoch::from_wall_clock(updated_at),
+            },
+        );
     }
 
     /// Test setter: per-h node-count EMA.
     #[cfg(test)]
     pub fn set_node_count(&mut self, h: &str, value: f64, updated_at: f64) {
-        self.node_count
-            .insert(h.to_owned(), PriceEma { value, updated_at });
+        self.node_count.insert(
+            h.to_owned(),
+            PriceEma {
+                value,
+                updated_at: Epoch::from_wall_clock(updated_at),
+            },
+        );
     }
 
     /// Test setter: per-cell instance-type menu (sorted by `cores`).
@@ -1470,7 +1627,7 @@ fn emit_stale_gauge(cost: &parking_lot::RwLock<CostTable>, now: f64) {
         (!g.cells.is_empty(), g.price_updated_at())
     };
     if has_cells {
-        ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds").set(now - updated);
+        ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds").set(updated.age_at(now));
     }
 }
 
@@ -2268,13 +2425,13 @@ mod tests {
     #[test]
     fn ratio_ema_decays() {
         let mut e = RatioEma::default();
-        e.update(10.0, 100.0, 1000.0, 3600.0);
+        e.update(10.0, 100.0, Epoch::from_wall_clock(1000.0), 3600.0);
         assert!((e.value_or(0.0) - 0.1).abs() < 1e-9);
         // One halflife later, add nothing → both halves halved → ratio unchanged.
-        e.update(0.0, 0.0, 4600.0, 3600.0);
+        e.update(0.0, 0.0, Epoch::from_wall_clock(4600.0), 3600.0);
         assert!((e.value_or(0.0) - 0.1).abs() < 1e-9);
         // Add a burst of interrupts with no exposure → ratio rises.
-        e.update(5.0, 0.0, 4600.0, 3600.0);
+        e.update(5.0, 0.0, Epoch::from_wall_clock(4600.0), 3600.0);
         assert!(e.value_or(0.0) > 0.1);
     }
 
@@ -2315,7 +2472,7 @@ mod tests {
             RatioEma {
                 numerator: 1.0,
                 denominator: 3600.0,
-                updated_at: 1000.0,
+                updated_at: Epoch::from_wall_clock(1000.0),
             },
         );
         t.set_node_count("h", 100.0, 1000.0);
@@ -2509,6 +2666,180 @@ mod tests {
             })
             .sum();
         assert_eq!(refused, 4, "each refused observation is a counted letter");
+    }
+
+    // r[verify sched.sla.epoch-domain]
+    /// **W11-AW (bug_060, red-first)** — *no stored non-finite epoch
+    /// can influence staleness or watermark logic; population: every
+    /// absolute-epoch decode in the family (price / lambda /
+    /// node_count; `last_observed` was already sealed via
+    /// `clamped::epoch_secs`).* One `'infinity'::timestamptz` row,
+    /// pre-fix: (a) `price_updated_at()` folds to `+inf`, so
+    /// `apply_stale_clamp` computes `now − inf = −inf` and NEVER
+    /// latches — the clamp, the RioSlaHwCostStale alert, and the
+    /// stale fallback counter disarm fleet-wide; (b) one `+inf`
+    /// lambda stamp wedges `refresh_lambda`'s global HWM bind
+    /// (`at > 'infinity'` matches nothing), freezing ALL lambda
+    /// refreshes — healthy siblings included; the wave-10 monotone
+    /// upsert qual makes the row un-healable in place. Post-fix: the
+    /// poisoned rows are REFUSED at the decode boundary (typed,
+    /// counted letters; the rows never enter the maps), siblings are
+    /// unaffected, and the staleness/watermark planes run on finite
+    /// values only — the PG rows stay (the qual rightly never
+    /// rewinds) but are read-dead.
+    #[tokio::test]
+    async fn w11_aw_nonfinite_epoch_rows_refused_at_decode() {
+        use metrics_util::debugging::DebugValue;
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        // Poisoned price/lambda/node_count rows for h0 + healthy OLD
+        // siblings for h1 (finite, ancient — staleness must be able
+        // to latch on them).
+        sqlx::query(
+            "INSERT INTO sla_ema_state (cluster, key, value, numerator, denominator, updated_at) VALUES \
+             ('c', 'price:h0:spot', 0.04, NULL, NULL, 'infinity'), \
+             ('c', 'price:h1:spot', 0.05, NULL, NULL, to_timestamp(1000)), \
+             ('c', 'lambda:h0', 0.0, 1.0, 3600.0, 'infinity'), \
+             ('c', 'lambda:h1', 0.0, 1.0, 3600.0, to_timestamp(1000)), \
+             ('c', 'node_count:h0', 3.0, NULL, NULL, 'infinity')",
+        )
+        .execute(sdb.pool())
+        .await
+        .unwrap();
+        // Fresh interrupt evidence for the healthy sibling.
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value) VALUES \
+             ('c', 'h1', 'interrupt', 2.0), ('c', 'h1', 'exposure', 7200.0)",
+        )
+        .execute(sdb.pool())
+        .await
+        .unwrap();
+
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        let mut t = CostTable::load(&sdb, "c", HwCostSource::Spot)
+            .await
+            .unwrap();
+        // (a) The staleness face: every FINITE price stamp is ancient,
+        // so the clamp must latch — a poisoned row must not disarm it.
+        assert!(
+            t.apply_stale_clamp(2_000_000.0),
+            "stale clamp must latch when every finite price stamp is \
+             ancient (a non-finite stamp must not disarm the fleet)"
+        );
+        // (b) The watermark face: the healthy sibling's fresh samples
+        // must be consumed — a poisoned stamp must not wedge the
+        // global HWM.
+        let before = t.lambda.get("h1").map(|e| e.numerator).unwrap_or(0.0);
+        t.refresh_lambda(&sdb).await.unwrap();
+        let after = t.lambda.get("h1").map(|e| e.numerator).unwrap_or(0.0);
+        assert!(
+            after > before,
+            "sibling lambda must consume fresh interrupt samples (a \
+             poisoned h0 stamp must not wedge the global HWM bind): \
+             numerator before={before} after={after}"
+        );
+        // Population sweep: no poisoned key entered any map.
+        assert!(
+            !t.price.contains_key(&("h0".into(), CapacityType::Spot)),
+            "poisoned price row must be refused at decode"
+        );
+        assert!(
+            !t.lambda.contains_key("h0"),
+            "poisoned lambda row must be refused at decode"
+        );
+        assert!(
+            !t.node_count.contains_key("h0"),
+            "poisoned node_count row must be refused at decode"
+        );
+        // The letters are counted (snapshot once — it drains).
+        let refused: u64 = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, _, _, _)| k.key().name() == "rio_scheduler_sla_evidence_refused_total")
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(refused, 3, "each refused epoch row is a counted letter");
+    }
+
+    // r[verify sched.sla.epoch-domain]
+    /// **W11-AX — the [GEN-SET] `EXTRACT(EPOCH …)` census (the
+    /// sched.sla.epoch-domain family belt).** Generator: scan every
+    /// `sla/*.rs` production source (test modules stripped) for
+    /// absolute-epoch PG reads. Committed expectation (the generator's
+    /// output, re-derived on any red):
+    ///
+    /// - cost.rs is the family's ONLY home: exactly THREE
+    ///   `EXTRACT(EPOCH FROM …)` query strings (`load`'s
+    ///   `sla_ema_state.updated_at`, `load`'s
+    ///   `sla_observed_instance_types.last_observed`,
+    ///   `refresh_lambda`'s `MAX(at)`), each consumed through a
+    ///   sanctioned decode-boundary constructor
+    ///   ([`Epoch::from_pg_epoch`] for the f64-epoch family;
+    ///   `clamped::epoch_secs` for the `SystemTime`-domain
+    ///   `last_observed`);
+    /// - every sibling sla file: ZERO.
+    ///
+    /// A strawman fourth read in cost.rs (or a first read in a
+    /// sibling) drifts a count here — route it through the typed
+    /// domain and extend the committed expectation, never store raw.
+    #[test]
+    fn extract_epoch_census() {
+        let strip = |src: &str| {
+            src.split_once("#[cfg(test)]\nmod tests")
+                .map_or(src, |(p, _)| p)
+                .to_owned()
+        };
+        let cost = strip(include_str!("cost.rs"));
+        assert_eq!(
+            cost.matches("EXTRACT(EPOCH").count(),
+            3,
+            "cost.rs absolute-epoch reads: load(sla_ema_state) + \
+             load(sla_observed_instance_types) + refresh_lambda(MAX(at))"
+        );
+        // The decode-boundary mints: the two f64-epoch refusal seams
+        // (ema rows, interrupt groups) + the SystemTime-domain seam.
+        assert!(
+            cost.matches("Epoch::from_pg_epoch(").count() >= 2,
+            "every f64-epoch read must mint through the sole constructor"
+        );
+        assert_eq!(
+            cost.matches("clamped::epoch_secs(").count(),
+            1,
+            "the SystemTime-domain read keeps its sanctioned constructor"
+        );
+        for (name, src) in [
+            ("alpha.rs", include_str!("alpha.rs")),
+            ("bootstrap.rs", include_str!("bootstrap.rs")),
+            ("catalog.rs", include_str!("catalog.rs")),
+            ("config.rs", include_str!("config.rs")),
+            ("dip.rs", include_str!("dip.rs")),
+            ("explain.rs", include_str!("explain.rs")),
+            ("explore.rs", include_str!("explore.rs")),
+            ("fit.rs", include_str!("fit.rs")),
+            ("hw.rs", include_str!("hw.rs")),
+            ("ingest.rs", include_str!("ingest.rs")),
+            ("metrics.rs", include_str!("metrics.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            ("override.rs", include_str!("override.rs")),
+            ("prior.rs", include_str!("prior.rs")),
+            ("quantile.rs", include_str!("quantile.rs")),
+            ("solve.rs", include_str!("solve.rs")),
+            ("types.rs", include_str!("types.rs")),
+        ] {
+            assert_eq!(
+                strip(src).matches("EXTRACT(EPOCH").count(),
+                0,
+                "sla/{name}: a new absolute-epoch read must join the \
+                 typed family in cost.rs, never store raw f64"
+            );
+        }
     }
 
     // r[verify sched.sla.merge-law]
@@ -2838,6 +3169,7 @@ mod tests {
             .get(&("h".into(), CapacityType::Spot))
             .unwrap()
             .updated_at;
+        let at = at.as_secs_f64();
         assert!(
             (at - 1000.0).abs() < 1.0,
             "reloaded updated_at must be data-time 1000, not now(); got {at}"
@@ -2860,7 +3192,7 @@ mod tests {
             RatioEma {
                 numerator: 3.0,
                 denominator: 9000.0,
-                updated_at: 7100.0,
+                updated_at: Epoch::from_wall_clock(7100.0),
             },
         );
         t.set_node_count("intel-7", 12.5, 7100.0);
@@ -2873,10 +3205,10 @@ mod tests {
         let l = r.lambda.get("intel-7").unwrap();
         assert!((l.numerator - 3.0).abs() < 1e-9);
         assert!((l.denominator - 9000.0).abs() < 1e-9);
-        assert!((l.updated_at - 7100.0).abs() < 1.0);
+        assert!((l.updated_at.as_secs_f64() - 7100.0).abs() < 1.0);
         let nc = r.node_count.get("intel-7").unwrap();
         assert!((nc.value - 12.5).abs() < 1e-9);
-        assert!((nc.updated_at - 7100.0).abs() < 1.0);
+        assert!((nc.updated_at.as_secs_f64() - 7100.0).abs() < 1.0);
         // λ̂ recomputed identically from the round-tripped state.
         assert!((r.lambda_for("intel-7") - t.lambda_for("intel-7")).abs() < 1e-12);
     }
@@ -3128,7 +3460,7 @@ mod tests {
         obs2.insert(h2.clone(), 0.015);
         t.fold_prices(&obs2, 1600.0);
         // h1's updated_at must NOT have moved.
-        assert_eq!(t.price[&h1].updated_at, 1000.0);
+        assert_eq!(t.price[&h1].updated_at.as_secs_f64(), 1000.0);
         // t=2200: h1 reappears. dt=1200 (vs old global-stamp dt=600).
         let mut obs3 = HashMap::new();
         obs3.insert(h1.clone(), 0.03);
@@ -3460,7 +3792,7 @@ mod tests {
         .unwrap();
         let mut t = CostTable::seeded("c", HwCostSource::Static);
         t.refresh_lambda(&sdb).await.unwrap();
-        let hwm = t.lambda["aws-8-nvme-hi"].updated_at;
+        let hwm = t.lambda["aws-8-nvme-hi"].updated_at.as_secs_f64();
         assert_eq!(hwm, 1500.0, "HWM must be MAX(at), got {hwm}");
         // Second tick with a row at at=1200 (between prev rows): the
         // `at > to_timestamp(1500)` filter excludes it, AND hwm stays
@@ -3473,7 +3805,7 @@ mod tests {
         .await
         .unwrap();
         t.refresh_lambda(&sdb).await.unwrap();
-        assert_eq!(t.lambda["aws-8-nvme-hi"].updated_at, 1500.0);
+        assert_eq!(t.lambda["aws-8-nvme-hi"].updated_at.as_secs_f64(), 1500.0);
     }
 
     /// `interrupt_samples` is bounded: rows >7d are swept (the 24h-

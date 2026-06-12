@@ -5021,6 +5021,31 @@ rows are healed by the next complete observation rather than re-stamped,
 and the intake refusal stops new junk from minting --- the keep-first
 composition had no such exit edge.
 
+#r("sched.sla.epoch-domain")[
+  Absolute PG epochs in the SLA cost plane MUST cross the sqlx boundary
+  through a finite-by-construction typed domain (`Epoch`), minted ONLY at
+  the decode boundary: a non-finite stored epoch
+  (`'infinity'::timestamptz`, NaN) is a typed, counted, per-row refusal
+  (`_evidence_refused_total{reason="nonfinite_epoch"}`) that skips the row
+  and leaves siblings unaffected --- never a raw `f64` store. Staleness
+  ages, newest-wins maxima, and watermark folds MUST be computed as
+  methods of the typed domain, so the non-finite comparison arms
+  (`now - inf = -inf` reading eternally fresh; `at > 'infinity'` matching
+  nothing) are unrepresentable for the whole family.
+]
+
+The family axis (R28) is enforced one level out by the in-crate
+`EXTRACT(EPOCH ...)` census: cost.rs is the family's only home (three
+query strings, each consumed through a sanctioned constructor), and a new
+absolute-epoch read anywhere in `sla/` goes census-red until it joins the
+typed domain. R29 context: the wave-10 clamp split (`fix(rio-common):
+split the epoch domain out of the age clamp`) hardened one of four reads
+in the same function; the type seals the family, not the site. The
+poisoned PG row itself is deliberately left in place --- the monotone
+upsert qual refuses rewinds, so the row is read-dead (refused at every
+load) until operator surgery, and the staleness clamp plus
+`RioSlaHwCostStale` arm truthfully the moment the stamp stops decoding.
+
 #r("sched.sla.forecast.one-layer+2")[
   `compute_spawn_intents` walks the Ready frontier AND a forecast frontier of
   `Queued` derivations whose every incomplete dependency is running with a

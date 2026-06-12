@@ -126,9 +126,14 @@ pub fn describe_all() {
          `plane` (which store refused) and `reason` — \
          `zero_resource`: a controller instance-type observation with \
          cores or mem of 0 (absence of parseable kubelet resources is \
-         not a 0-core fact; sched.sla.merge-law). Sustained nonzero ⇒ \
-         a producer is shipping junk evidence; the stores stay clean \
-         but the named plane is learning nothing from those rows."
+         not a 0-core fact; sched.sla.merge-law); `nonfinite_epoch`: a \
+         stored epoch decoded to ±inf/NaN ('infinity'::timestamptz — \
+         refused so one poisoned row cannot disarm the stale clamp or \
+         wedge the lambda watermark; sched.sla.epoch-domain). \
+         Sustained nonzero ⇒ a producer is shipping junk evidence (or \
+         a poisoned PG row needs operator surgery); the stores stay \
+         clean but the named plane is learning nothing from those \
+         rows."
     );
     describe_counter!(
         "rio_scheduler_sla_als_round_cap_hit_total",
@@ -444,9 +449,11 @@ pub const SLA_LABELED_METRICS: &[(&str, &str, &[&str])] = &[
         "rio_scheduler_sla_evidence_refused_total",
         "reason",
         // bw11 WO-S6-1: the zero-resource observation refusal (cost.rs
-        // intake). Further reasons append via the label-extension lane
-        // as their emits land (the hw_ladder row's precedent).
-        &["zero_resource"],
+        // intake). bw11 WO-S6-2: the non-finite epoch decode refusal
+        // (cost.rs load + refresh_lambda). Further reasons append via
+        // the label-extension lane as their emits land (the hw_ladder
+        // row's precedent).
+        &["zero_resource", "nonfinite_epoch"],
     ),
     (
         "rio_scheduler_sla_hw_ladder_exhausted_total",

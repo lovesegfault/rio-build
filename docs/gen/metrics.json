@@ -152,6 +152,7 @@
     "rio_scheduler_sla_als_round_cap_hit_total",
     "rio_scheduler_sla_class_ceiling_uncatalogued",
     "rio_scheduler_sla_envelope_result_total",
+    "rio_scheduler_sla_evidence_refused_total",
     "rio_scheduler_sla_forecast_dropped_total",
     "rio_scheduler_sla_hw_cost_fallback_total",
     "rio_scheduler_sla_hw_cost_stale_seconds",
@@ -1043,6 +1044,11 @@
         "name": "rio_scheduler_sla_envelope_result_total",
         "kind": "counter",
         "help": "SLA envelope hit/miss per tier (labeled tier, result=hit|miss, constraint=wall|mem|-). `constraint` names the dimension that missed; `-` for hits."
+      },
+      {
+        "name": "rio_scheduler_sla_evidence_refused_total",
+        "kind": "counter",
+        "help": "typed refusal letters at the SLA data plane's decode boundaries: an evidence row refused BEFORE any store mutation (the row never lands; siblings are unaffected). Labeled `plane` (which store refused) and `reason` — `zero_resource`: a controller instance-type observation with cores or mem of 0 (absence of parseable kubelet resources is not a 0-core fact; sched.sla.merge-law); `nonfinite_epoch`: a stored epoch decoded to ±inf/NaN ('infinity'::timestamptz — refused so one poisoned row cannot disarm the stale clamp or wedge the lambda watermark; sched.sla.epoch-domain). Sustained nonzero ⇒ a producer is shipping junk evidence (or a poisoned PG row needs operator surgery); the stores stay clean but the named plane is learning nothing from those rows."
       },
       {
         "name": "rio_scheduler_sla_forecast_dropped_total",
