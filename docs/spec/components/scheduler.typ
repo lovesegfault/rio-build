@@ -5350,7 +5350,7 @@ weight is the weight of the NEWEST seat row, so in a mixed-age ring the
 oldest evidence structurally outweighed all fresh evidence until ring
 eviction: `disk_p90` pinned at legacy peaks, false `exceeds_ceiling`
 tier rejection, and the degenerate-Independent fallback re-serving the
-stale footprint. The sub-population weight census ([GEN-SET],
+stale footprint. The sub-population weight census (\[GEN-SET\],
 `w12_ad_weight_census`) derives the fold-site universe from the module
 tree and REDs on any exempt arm; W12-AD pins the inverse-population
 direction the wave-11 fixtures never drove.
@@ -5393,8 +5393,8 @@ monotone position with no second fencing axis --- verified, no edit.
 
 bug_036: the wave-11 footprint seal froze a census of two gate-equality
 oracles against a law that quantifies over every mem-feasibility
-predicate --- solve admission and the shared-c* re-filter stayed bare,
-so a (cm − pad, cm] band cell entered the memo, failed per-cell
+predicate --- solve admission and the shared-#raw("c*") re-filter stayed
+bare, so a #raw("(cm − pad, cm]") band cell entered the memo, failed per-cell
 survival, rode a surviving sibling through the `.any()` forward, and
 the converging chokepoint deterministically stripped it with the
 un-debounced "classify-coverage bug" warn every poll --- falsifying the
