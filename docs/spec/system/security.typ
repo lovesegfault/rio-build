@@ -681,10 +681,13 @@ Cilium overlay layer.
 
 === Cross-Tenant Chunk Probing
 
-- *Threat*: `FindMissingChunks` can reveal whether another tenant has built a
-  specific package.
-- *Mitigation*: Per-tenant chunk scoping (at the cost of dedup) or accept the
-  risk. See Multi-Tenancy §FindMissingChunks scoping.
+- *Threat*: A chunk-presence probe (`HasChunks`) can reveal whether another
+  tenant has built a specific package.
+- *Mitigation (implemented, ADR-024 P2)*: Per-tenant presence scoping via the
+  `chunk_tenants` junction — presence answers only for chunks the calling
+  tenant has seen; dedup at rest is unaffected (storage stays digest-keyed
+  global, the cost is re-upload bandwidth). See Multi-Tenancy §Chunk Presence
+  Scoping and `r[store.chunk.has-chunks-tenant]`.
 
 == Ephemeral Builders
 
@@ -769,10 +772,11 @@ heartbeat) plus one reconciler tick (\~10s).
   NetworkPolicy. Future work: explore splitting the executor into a privileged
   setup process and an unprivileged build supervisor.
 
-+ *Cross-tenant chunk deduplication leaks build activity.* A tenant can probe
-  `FindMissingChunks` to determine whether another tenant has built a specific
-  package. Mitigation: scope `FindMissingChunks` per tenant (at the cost of
-  dedup savings) or accept the risk with documentation.
++ *Cross-tenant chunk deduplication leaks build activity — RESOLVED
+  (ADR-024 P2).* A tenant could probe chunk presence to determine whether
+  another tenant had built a specific package. `HasChunks` is now
+  tenant-scoped via the `chunk_tenants` junction
+  (`r[store.chunk.has-chunks-tenant]`); dedup at rest is unaffected.
 
 + *Fixed-output derivations (FODs) need network access.* FOD builds (fetchurl,
   fetchgit) require egress to the internet, which conflicts with the builder

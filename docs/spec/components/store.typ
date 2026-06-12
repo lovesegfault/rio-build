@@ -312,6 +312,26 @@ equivalent to `created_at` (the column is touched only by the upsert's
 orphan-chunk sweep's `refcount = 0` reaping --- that mechanism is retired with
 the counter readers; the window itself (and its 300 s default) is unchanged.
 
+#r("store.chunk.has-chunks-tenant")[
+  `HasChunks` presence MUST be tenant-scoped: a bit may be set only if the
+  calling tenant has a `chunk_tenants` row for that digest, in addition to the
+  durable-presence predicate. The junction row is written in the same
+  transaction that completes one of the tenant's manifests (atomic with the
+  `durable` flip), so "manifest is complete" and "its chunks answer present to
+  the uploader" cannot diverge. Chunk *storage* stays digest-keyed global ---
+  dedup at rest is unaffected; tenant-scoped presence costs upload bandwidth
+  only, because the duplicate upload of a tenant-invisible chunk is an
+  idempotent overwrite of identical content.
+]
+
+ADR-024 P2 settled presence as tenant-scoped for ALL object kinds (chunks were
+previously the documented cross-tenant exception). Migration rule: chunks
+ingested before `chunk_tenants` existed (migration 116) --- and chunks of
+paths a tenant adopted via an idempotent-skip or substitution --- have no
+junction row for that tenant, so presence answers false and the tenant's next
+upload re-sends them, binding visibility through the write-through put. No
+backfill; the cost is bounded re-upload bandwidth, never correctness.
+
 The two as-built counter rules that used to live here ---
 `store.chunk.refcount-decrement` (every manifest-deleting transaction
 decrements the counter from the deleted manifest's own `chunk_list`) and
@@ -1207,7 +1227,7 @@ transaction); serves the castore-FUSE builder.
   threshold.
 ]
 
-#r("store.castore.tenant-scope+2")[
+#r("store.castore.tenant-scope+3")[
   `GetDirectory`/`HasDirectories`/`HasBlobs`/`ReadBlob`/`StatBlob` MUST be
   tenant-scoped: queries resolve a digest to its containing store path(s)
   (`directory_paths` / `file_blobs.store_path_hash`) and join `path_tenants`
@@ -1225,12 +1245,14 @@ transaction); serves the castore-FUSE builder.
   cannot reach via any owned path or sig-visible substitution-only path.
   Directory bodies
   leak child names/digests --- cross-tenant exposure here is a confidentiality
-  issue, unlike the chunk-level surface (see "Cross-Tenant Chunk Probing" in
-  the security spec). `GetChunks` is *not* tenant-scoped: a 32-byte BLAKE3
-  chunk digest is unguessable and is only disclosed via tenant-scoped
-  `StatBlob`/`ReadBlob` or by self-computing it from bytes the caller already
-  holds --- knowing the digest is the read capability. Adding a `chunk_tenants`
-  JOIN would cost dedup-hot-path PG round-trips for no confidentiality gain.
+  issue. Chunk *retrieval* (`GetChunk`/`GetChunks`) is identity-gated but
+  *not* tenant-scoped: a 32-byte BLAKE3 chunk digest is unguessable and is
+  only disclosed via tenant-scoped `StatBlob`/`ReadBlob` or by self-computing
+  it from bytes the caller already holds --- knowing the digest is the read
+  capability. Chunk *presence* (`HasChunks`) IS tenant-scoped
+  (#rref("store.chunk.has-chunks-tenant")), as are drv-blob presence and
+  reads (#rref("store.drv.blob-kind")) --- ADR-024 P2 reconciled presence as
+  tenant-scoped across all object kinds.
 ]
 
 Without the substitution-only fallback the two surfaces disagreed:
@@ -1247,6 +1269,55 @@ castore mounts of substituted inputs failed forever.
   cascade-deletes its rows, surviving referrers' rows remain, so
   `ReadBlob`/`StatBlob` never resolve to a dead manifest.
 ]
+
+= Drv Blob Storage (ADR-024)
+
+Derivation content is a first-class castore blob kind: the canonical
+`rio.drv.v1.Derivation` proto bytes, keyed by `blake3(canonical bytes)` ---
+the negotiation digest of the ADR-024 build plan. Bodies live in PG
+(`drv_blobs.body`) like `directories.body`: drv blobs are a few KB, the same
+size class as Directory bodies, far below the chunked-CAS minimum.
+
+#r("store.drv.blob-kind")[
+  `DrvBlobService` stores canonical drv bytes keyed by `blake3(received
+  bytes)` and serves them back byte-identically (`GetDrvBlob`). Presence
+  (`HasDrvs`, bitmap semantics identical to `HasBlobs`) and reads are
+  tenant-scoped via the `drv_blob_tenants` junction, resolved through the
+  same JWT/HMAC tenant ladder as the rest of the castore surface; storage is
+  digest-keyed global. Puts are write-through idempotent: an existing digest
+  is an idempotent overwrite-equivalent (and refreshes the GC grace clock),
+  never a present/absent timing oracle, and `created[i]` reports only the
+  calling tenant's visibility binding.
+]
+
+#r("store.drv.verify-on-put")[
+  Every `PutDrvBlobs` blob MUST pass the full server-side cross-check
+  (`verify_drv_blob`) before anything is written: blake3 over received bytes
+  equals the claimed digest; proto decode; structural validation (sorted,
+  unique repeated fields --- hostile input is rejected, never re-sorted);
+  canonical re-encode byte-compares equal to the received bytes; ATerm
+  reconstruction; drv_path recompute equals the claimed path; fixed-output
+  output-path recompute. Any failure rejects the whole batch with
+  `INVALID_ARGUMENT` naming the failing blob --- non-canonical bytes are
+  NEVER stored, which is what makes served bytes equal received bytes equal
+  canonical bytes by construction.
+]
+
+#r("store.drv.gc-build-pinned")[
+  Drv blobs referenced by live builds MUST survive GC. The drv sweep deletes
+  a blob only when it is past the GC grace window AND its
+  `drv_path_hash = sha256(drv_path)` matches no `scheduler_live_pins` row AND
+  its `drv_path` is not in the run's `extra_roots` --- the same pin mechanism
+  and keying the path mark phase seeds from, not a parallel one. The
+  scheduler pins the `.drv` paths of a submission's live closure through the
+  existing `pin_live_inputs` call and unpins on terminal status.
+]
+
+The drv sweep runs inside `TriggerGC` after the path sweep, under the same
+advisory lock, honoring `dry_run`. Bodies are PG-only, so the DELETE is the
+whole sweep --- no `pending_s3_deletes` leg. The client-side ack-record TTL
+from ADR-024 ("TTL ≤ the cluster's minimum unpinned-blob lifetime") binds to
+this grace window; a re-put refreshes `created_at`, restarting the clock.
 
 = Upstream Cache Substitution
 
