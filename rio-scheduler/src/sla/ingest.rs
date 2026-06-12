@@ -1866,7 +1866,7 @@ mod disk_axis_tests {
         };
         assert!(
             p90.0 >= 9 * (GI as u64),
-            "mem p90 over the 5-sample consensus (~10 GiB), never the              newest single sample (2 GiB): got {} GiB",
+            "mem p90 over the 5-sample consensus (~10 GiB), never the newest single sample (2 GiB): got {} GiB",
             p90.0 / (1 << 30)
         );
     }
@@ -1899,7 +1899,7 @@ mod disk_axis_tests {
         let got = f.disk_p90.expect("peaked samples must fit").0;
         assert!(
             got >= 190 * (GI as u64),
-            "p90 over ALL 10 peaked samples (~200 GiB), never p90-of-1              (5 GiB): got {} GiB",
+            "p90 over ALL 10 peaked samples (~200 GiB), never p90-of-1 (5 GiB): got {} GiB",
             got / (1 << 30)
         );
     }
