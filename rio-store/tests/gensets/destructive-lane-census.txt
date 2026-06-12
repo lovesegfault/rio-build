@@ -1,13 +1,21 @@
-# [GEN-SET] destructive-lane census (W10-D family, merged_bug_050).
+# [GEN-SET] destructive-lane census (W10-D family, merged_bug_050;
+# fail-closed parser since bug_085).
 # Generator: rio-store/src/gc/lane.rs census::destructive_lane_census —
-# scan over the spawn-periodic FAMILY (spawn_periodic +
-# spawn_periodic_with call sites, production half, whole-crate
-# embedded universe) x the named REFUSAL PREDICATE
-# (reaches-delete-sink ∧ NOT-DestructiveLane-routed; sinks =
-# DELETE FROM / delete_by_key / INSERT INTO pending_s3_deletes,
-# transitively over fn bodies). Lane set = this output ∪ {run_gc}
-# (PINNED: RPC-spawned per TriggerGC — asserted structurally in the
-# same test: hold::gate mint + clearance threaded to collect_cycle).
+# token-grammar scan over the spawn-periodic FAMILY (the
+# `spawn_periodic`/`spawn_periodic_with` identifier tokens, production
+# half, whole-crate embedded universe). Every occurrence classifies
+# into a CLOSED set: registration (first arg = string literal),
+# declaration (`fn`-introduced), or the one typed exemption (lane.rs's
+# own `Self::spawn_periodic_with(name, …)` forwarder); anything else
+# is a census ERROR naming the site — refusal, never skip. Routing is
+# a property of the matched token's own call path (ends in
+# `DestructiveLane::`), never of a textual lookback window. The
+# REFUSAL PREDICATE: reaches-delete-sink AND NOT-DestructiveLane-routed
+# (sinks = DELETE FROM / delete_by_key / INSERT INTO
+# pending_s3_deletes, transitively over fn bodies). Lane set = this
+# output ∪ {run_gc} (PINNED: RPC-spawned per TriggerGC — asserted
+# structurally in the same test: hold::gate mint + the &mut clearance
+# threaded to collect_cycle).
 # Format: lane \t file \t routed \t destructive (sorted).
 # routed=false destructive=false rows are the lawful non-destructive
 # controls (gauge publishers) — they prove the scan is not vacuous.

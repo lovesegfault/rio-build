@@ -14,16 +14,25 @@
 //! unregistered `tokio::spawn` loop cannot reach a named sink at
 //! compile time.
 //!
-//! Enforcement, stated at its own strength (R24): the clearance type
-//! COMPILE-SEALS the named sinks (`reap_one`, `drain_once`,
-//! `collect_cycle` via `collect_backstop_once`/`run_gc`); the
-//! [GEN-SET] delete-sink census (`destructive_lane_census` below) is
-//! the LOAD-BEARING enforcement of population totality — that every
-//! deleting sink (including raw-SQL sinks the type cannot total
-//! over, e.g. the seam-registered log sweep) runs under a consult
-//! and every spawn-family lane is registered. Future lanes inherit
-//! the consult on registration; non-registration is census-red (and
-//! compile-red at any named sink).
+//! Enforcement, stated at its own strength (R24/R28): the clearance
+//! type COMPILE-SEALS the named sinks (`reap_one`, `drain_once`,
+//! `collect_cycle` via `collect_backstop_once`/`run_gc`) and carries
+//! the time axis itself (expiry + batch re-authorization,
+//! merged_bug_067); the [GEN-SET] delete-sink census
+//! (`destructive_lane_census` below) is the LOAD-BEARING enforcement
+//! of population totality — that every deleting sink (including
+//! raw-SQL sinks the type cannot total over, e.g. the seam-registered
+//! log sweep) runs under a consult and every spawn-family lane is
+//! registered. The totality claim holds because the census parser
+//! FAILS CLOSED (bug_085): every spawn-family occurrence classifies
+//! into a closed set — registration with a literal name, declaration,
+//! or the one typed lane.rs forwarder exemption — and an
+//! unclassifiable site is a census ERROR naming it, never a skip;
+//! routing is a property of the matched token's own call path, never
+//! of its textual neighborhood. The refusal predicate is
+//! reaches-delete-sink AND not-DestructiveLane-routed. Future lanes
+//! inherit the consult on registration; non-registration is
+//! census-red (and compile-red at any named sink).
 
 use std::time::Duration;
 
@@ -874,12 +883,18 @@ mod census {
     }
 
     /// The production half (cut at the first `#[cfg(test)]`) minus
-    /// line comments: the lane law quantifies over PRODUCTION spawn
-    /// sites, and the cut also keeps this census's own needle and
-    /// strawman strings (test-half) out of its scan — the
-    /// merged_bug_009 self-scan trap, structurally avoided. String
-    /// contents stay (SQL lives in strings).
-    fn code_lines(src: &str) -> Vec<&str> {
+    /// comments: the lane law quantifies over PRODUCTION spawn sites,
+    /// and the cut also keeps this census's own needle and strawman
+    /// strings (test-half) out of its scan — the merged_bug_009
+    /// self-scan trap, structurally avoided. String contents stay
+    /// (SQL lives in strings); TRAILING comments are stripped
+    /// string-aware (bug_085: comment prose is neither routing
+    /// evidence nor a refusable token — the wave-10 scan kept
+    /// trailing comments, which is exactly what let a comment naming
+    /// the wrapper forge routed=true; the naive `split("//")` form is
+    /// the merged_bug_009 evasion — `//` inside a string literal,
+    /// e.g. a URL, must not truncate the code).
+    fn code_lines(src: &str) -> Vec<String> {
         // Cut at the in-file test MODULE (not any cfg(test) attribute:
         // `#[cfg(test)] mod mark_scan_bench;`-style declarations sit
         // mid-file and must not truncate the production scan).
@@ -890,6 +905,24 @@ mod census {
         src[..cut]
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
+            .map(|l| {
+                // String-aware trailing-comment strip.
+                let b = l.as_bytes();
+                let mut in_str = false;
+                let mut i = 0;
+                while i < b.len() {
+                    match b[i] {
+                        b'\\' if in_str => i += 1,
+                        b'"' => in_str = !in_str,
+                        b'/' if !in_str && i + 1 < b.len() && b[i + 1] == b'/' => {
+                            return l[..i].to_string();
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                l.to_string()
+            })
             .collect()
     }
 
@@ -1026,67 +1059,172 @@ mod census {
         destructive: bool,
     }
 
-    /// The generator: scan the corpus for spawn-family call sites and
-    /// classify each by the refusal predicate.
-    fn derive_lanes(corpus: &[(&str, &str)]) -> Vec<LaneRow> {
-        let bodies = fn_bodies(corpus);
-        let mut rows = Vec::new();
-        for (file, src) in corpus {
-            let text: String = code_lines(src).join("\n");
-            for needle in ["spawn_periodic_with(", "spawn_periodic("] {
-                let mut i = 0;
-                while let Some(pos) = text[i..].find(needle) {
-                    let at = i + pos;
-                    let after = &text[at + needle.len()..];
-                    // Balanced-paren arg span of this call FIRST —
-                    // every later read stays inside it.
-                    let bytes = after.as_bytes();
-                    let mut depth = 1i32;
-                    let mut k = 0;
-                    while k < after.len() && depth > 0 {
-                        match bytes[k] as char {
-                            '(' => depth += 1,
-                            ')' => depth -= 1,
-                            _ => {}
-                        }
-                        k += 1;
-                    }
-                    let args = &after[..k.saturating_sub(1)];
-                    // Lane name: the first string literal WITHIN the
-                    // args. No literal = a declaration or a forwarding
-                    // call (the name rides a variable) — not a lane
-                    // registration site.
-                    let name = args
-                        .find('"')
-                        .and_then(|q| args[q + 1..].find('"').map(|e| &args[q + 1..q + 1 + e]));
-                    let Some(name) = name else {
-                        i = at + needle.len();
-                        continue;
-                    };
-                    // Routed: the call path names DestructiveLane.
-                    let line_start = text[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
-                    let window = &text[line_start.saturating_sub(200)..at + needle.len()];
-                    let routed = window.contains("DestructiveLane::spawn_periodic");
-                    let mut visited = Default::default();
-                    let destructive = reaches_sink(args, &bodies, &mut visited, 0);
-                    rows.push(LaneRow {
-                        lane: name.to_string(),
-                        file: file.to_string(),
-                        routed,
-                        destructive,
-                    });
-                    i = at + needle.len();
+    /// First top-level argument of a call args span: up to the first
+    /// comma at bracket depth 0, string literals skipped (so a comma
+    /// inside a name literal cannot truncate it).
+    fn first_arg(args: &str) -> &str {
+        let bytes = args.as_bytes();
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if in_str {
+                match c {
+                    '\\' => i += 1,
+                    '"' => in_str = false,
+                    _ => {}
+                }
+            } else {
+                match c {
+                    '"' => in_str = true,
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth -= 1,
+                    ',' if depth == 0 => return &args[..i],
+                    _ => {}
                 }
             }
+            i += 1;
         }
-        // De-dup the _with overlap: "spawn_periodic(" matches inside
-        // "spawn_periodic_with(" never happens (different suffix), but
-        // a DestructiveLane::spawn_periodic body calls
-        // spawn_periodic_with internally — same-file forwarding rows
-        // for lane.rs itself carry no string literal and were skipped.
+        args
+    }
+
+    /// The generator (bug_085: FAIL-CLOSED — the wave-10 form had two
+    /// fail-open leniency points, both now refusal or token-grammar
+    /// arms):
+    ///
+    /// 1. ROUTING IS A PROPERTY OF THE MATCHED TOKEN: the call path
+    ///    walked back from the token must end in `DestructiveLane::`;
+    ///    bare/`task::` paths default unrouted. The wave-10 predicate
+    ///    was 200-char-lookback containment of the wrapper needle, so
+    ///    adjacency (a neighboring lawful registration, a trailing
+    ///    comment naming the wrapper) forged routed=true.
+    /// 2. Every spawn-family occurrence is classified into a CLOSED
+    ///    set — registration (literal first arg), declaration
+    ///    (`fn`-preceded), or the one typed per-file exemption
+    ///    (lane.rs's own `Self::spawn_periodic_with(name, …)`
+    ///    forwarder) — and anything else is a census ERROR naming the
+    ///    site, never a skip. The wave-10 form silently dropped
+    ///    literal-less sites, so a const-named deleting lane produced
+    ///    no row, no refusal, and no genset drift.
+    ///
+    /// Errors are the refusal surface: `Err` rows name file + token +
+    /// the first-argument snippet.
+    fn derive_lanes(corpus: &[(&str, &str)]) -> Result<Vec<LaneRow>, Vec<String>> {
+        let bodies = fn_bodies(corpus);
+        let mut rows = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for (file, src) in corpus {
+            let text: String = code_lines(src).join("\n");
+            let bytes = text.as_bytes();
+            let mut i = 0;
+            while let Some(pos) = text[i..].find("spawn_periodic") {
+                let at = i + pos;
+                // Token start: the preceding char must not continue an
+                // identifier (path `::` separators are fine — they are
+                // the routing evidence, read below).
+                if at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') {
+                    i = at + "spawn_periodic".len();
+                    continue;
+                }
+                // Full identifier token.
+                let mut end = at + "spawn_periodic".len();
+                while end < text.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                {
+                    end += 1;
+                }
+                let token = &text[at..end];
+                if token != "spawn_periodic" && token != "spawn_periodic_with" {
+                    i = end;
+                    continue;
+                }
+                // Call-or-declaration form: the next non-space char
+                // opens the paren. Anything else is unclassifiable —
+                // refuse (fail-closed), never skip.
+                let after_token = text[end..].trim_start();
+                if !after_token.starts_with('(') {
+                    errors.push(format!(
+                        "{file}: `{token}` outside a call/declaration form \
+                         (cannot classify; refusing fail-closed)"
+                    ));
+                    i = end;
+                    continue;
+                }
+                // Declaration: the token is introduced by `fn` — a
+                // definition, not a registration site.
+                let prefix = text[..at].trim_end();
+                if prefix.ends_with("fn") {
+                    i = end;
+                    continue;
+                }
+                // ROUTING from the matched token's own call path: walk
+                // back over path characters; routed iff the path ends
+                // in `DestructiveLane::`.
+                let mut p = at;
+                while p > 0 && {
+                    let c = bytes[p - 1] as char;
+                    c.is_ascii_alphanumeric() || c == '_' || c == ':'
+                } {
+                    p -= 1;
+                }
+                let path = &text[p..at];
+                let routed = path.ends_with("DestructiveLane::");
+                // Balanced-paren args span.
+                let open = end + text[end..].find('(').expect("starts_with('(') above");
+                let after = &text[open + 1..];
+                let abytes = after.as_bytes();
+                let mut depth = 1i32;
+                let mut k = 0;
+                while k < after.len() && depth > 0 {
+                    match abytes[k] as char {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                let args = &after[..k.saturating_sub(1)];
+                // Lane name: the FIRST ARGUMENT must be a string
+                // literal. The wave-10 form took the first literal
+                // anywhere in the args (a body string could mis-name a
+                // lane) and silently skipped literal-less sites.
+                let arg1 = first_arg(args).trim();
+                let lane = if arg1.len() >= 2 && arg1.starts_with('"') && arg1.ends_with('"') {
+                    arg1[1..arg1.len() - 1].to_string()
+                } else if *file == "gc/lane.rs" && path == "Self::" && arg1 == "name" {
+                    // THE one typed per-file exemption: lane.rs's own
+                    // `spawn_periodic` forwarding into
+                    // `Self::spawn_periodic_with(name, …)` — the name
+                    // rides the wrapper's own parameter. Any other
+                    // non-literal first arg refuses below.
+                    i = end;
+                    continue;
+                } else {
+                    errors.push(format!(
+                        "{file}: spawn-family registration with a non-literal \
+                         lane name (refused, fail-closed): `{path}{token}({arg1}, …)`"
+                    ));
+                    i = end;
+                    continue;
+                };
+                let mut visited = Default::default();
+                let destructive = reaches_sink(args, &bodies, &mut visited, 0);
+                rows.push(LaneRow {
+                    lane,
+                    file: file.to_string(),
+                    routed,
+                    destructive,
+                });
+                i = end;
+            }
+        }
         rows.sort();
         rows.dedup();
-        rows
+        if errors.is_empty() {
+            Ok(rows)
+        } else {
+            Err(errors)
+        }
     }
 
     // r[verify store.gc.hold-lanes+1]
@@ -1096,7 +1234,13 @@ mod census {
     /// so membership drift in EITHER direction is review-visible.
     #[test]
     fn destructive_lane_census() {
-        let rows = derive_lanes(CENSUS_SOURCES);
+        let rows = derive_lanes(CENSUS_SOURCES).unwrap_or_else(|refusals| {
+            panic!(
+                "lane census REFUSED (fail-closed): every spawn-family \
+                 site must classify fully (name AND call path); fix the \
+                 site or extend the typed exemption: {refusals:#?}"
+            )
+        });
 
         // The refusal predicate: reaches-delete-sink ∧ NOT-routed.
         let violations: Vec<&LaneRow> =
@@ -1176,7 +1320,7 @@ async fn rogue_sweep(pool: &PgPool) -> Result<(), sqlx::Error> {
 "#;
         let mut corpus: Vec<(&str, &str)> = CENSUS_SOURCES.to_vec();
         corpus.push(("strawman.rs", strawman));
-        let rows = derive_lanes(&corpus);
+        let rows = derive_lanes(&corpus).expect("the strawman classifies (literal name)");
         let rogue = rows
             .iter()
             .find(|r| r.lane == "rogue-deleter")
@@ -1201,7 +1345,7 @@ pub fn spawn_lawful(pool: PgPool, shutdown: Token) {
         let mut corpus2: Vec<(&str, &str)> = CENSUS_SOURCES.to_vec();
         corpus2.push(("strawman.rs", strawman));
         corpus2.push(("control.rs", routed_control));
-        let rows2 = derive_lanes(&corpus2);
+        let rows2 = derive_lanes(&corpus2).expect("the controls classify (literal names)");
         let lawful = rows2
             .iter()
             .find(|r| r.lane == "lawful-deleter")
@@ -1209,6 +1353,116 @@ pub fn spawn_lawful(pool: PgPool, shutdown: Token) {
         assert!(
             lawful.destructive && lawful.routed,
             "the routed deleter is destructive AND routed (lawful): {lawful:?}"
+        );
+    }
+
+    // r[verify store.gc.hold-lanes+1]
+    /// W11-AN (bug_085 leniency point 1 — the literal-less silent
+    /// skip): a deleting spawn-family lane whose name rides a CONST
+    /// is REFUSED by the census (an error naming the site), never
+    /// silently dropped. Planted at the SCAN layer (raw source enters
+    /// the corpus), mirroring the parser's own leniency point per
+    /// R22''.
+    ///
+    /// Pre-fix red (verbatim in the commit body): the wave-10 parser
+    /// skipped literal-less sites — the planted deleting lane
+    /// produced NO row and NO refusal; the census stayed green with
+    /// an unrouted deleting lane in-tree.
+    #[test]
+    fn lane_census_refuses_const_named_spawn_site() {
+        let plant = r#"
+const LANE_NAME: &str = "const-named-deleter";
+pub fn spawn_sneaky(pool: PgPool, shutdown: Token) {
+    rio_common::task::spawn_periodic(LANE_NAME, INTERVAL, shutdown, move || {
+        let pool = pool.clone();
+        async move { let _ = sneaky_sweep(&pool).await; }
+    });
+}
+async fn sneaky_sweep(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM narinfo WHERE 1=1").execute(pool).await?;
+    Ok(())
+}
+"#;
+        let mut corpus: Vec<(&str, &str)> = CENSUS_SOURCES.to_vec();
+        corpus.push(("plant_const_named.rs", plant));
+        let refusals = derive_lanes(&corpus)
+            .expect_err("a const-named spawn-family site must REFUSE, never skip");
+        assert!(
+            refusals
+                .iter()
+                .any(|e| e.contains("plant_const_named.rs") && e.contains("LANE_NAME")),
+            "the refusal names the site and its non-literal first arg: {refusals:#?}"
+        );
+    }
+
+    // r[verify store.gc.hold-lanes+1]
+    /// W11-AO (bug_085 leniency point 2 — the adjacency forge): a raw
+    /// `task::spawn_periodic` whose 200-char neighborhood names the
+    /// wrapper (here: a trailing comment; the lawful-registration-
+    /// above variant is the second cell) is classified UNROUTED —
+    /// routing is a property of the matched token's own call path —
+    /// so the refusal predicate (destructive AND not routed) flags
+    /// it. Planted at the SCAN layer per R22''.
+    ///
+    /// Pre-fix red (verbatim in the commit body): the lookback-window
+    /// predicate inherited routed=true from the adjacent text, so the
+    /// rogue deleter passed the census as routed.
+    #[test]
+    fn lane_census_adjacency_cannot_forge_routing() {
+        // Cell 1: the trailing-comment forge (code_lines keeps
+        // trailing comments; the wave-10 window read them).
+        let plant_comment = r#"
+pub fn spawn_pair(pool: PgPool, shutdown: Token) {
+    let _note = (); // lawful form: DestructiveLane::spawn_periodic
+    rio_common::task::spawn_periodic("adjacent-rogue", INTERVAL, shutdown, move || {
+        let pool = pool.clone();
+        async move { let _ = adjacent_sweep(&pool).await; }
+    });
+}
+async fn adjacent_sweep(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM narinfo WHERE 1=1").execute(pool).await?;
+    Ok(())
+}
+"#;
+        // Cell 2: the beside-lawful-registration forge (the lawful
+        // call's own path text sits inside the rogue's window).
+        let plant_neighbor = r#"
+pub fn spawn_both(pool: PgPool, shutdown: Token) {
+    crate::gc::lane::DestructiveLane::spawn_periodic("lawful-neighbor", INTERVAL, pool.clone(), shutdown.clone(), body());
+    rio_common::task::spawn_periodic("neighbor-rogue", INTERVAL, shutdown, move || {
+        let pool = pool.clone();
+        async move { let _ = neighbor_sweep(&pool).await; }
+    });
+}
+async fn neighbor_sweep(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM narinfo WHERE 1=1").execute(pool).await?;
+    Ok(())
+}
+"#;
+        let mut corpus: Vec<(&str, &str)> = CENSUS_SOURCES.to_vec();
+        corpus.push(("plant_comment.rs", plant_comment));
+        corpus.push(("plant_neighbor.rs", plant_neighbor));
+        let rows = derive_lanes(&corpus).expect("the plants classify (literal names)");
+        for rogue_name in ["adjacent-rogue", "neighbor-rogue"] {
+            let rogue = rows
+                .iter()
+                .find(|r| r.lane == rogue_name)
+                .expect("the scan sees the rogue site");
+            assert!(
+                rogue.destructive && !rogue.routed,
+                "adjacency must not forge routing — the refusal predicate \
+                 (destructive AND not routed) must flag {rogue:?}"
+            );
+        }
+        // Polarity control: the lawful neighbor IS routed (the token
+        // path, not the window, is what routed it).
+        let lawful = rows
+            .iter()
+            .find(|r| r.lane == "lawful-neighbor")
+            .expect("the scan sees the lawful neighbor");
+        assert!(
+            lawful.routed,
+            "token-path routing classifies the lawful form"
         );
     }
 }
