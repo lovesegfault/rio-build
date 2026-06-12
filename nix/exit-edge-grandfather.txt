@@ -1,6 +1,9 @@
 rio-builder/src/log_upload.rs	const-family	RESIDUE_SPIN_BUDGET
 rio-builder/src/runtime/pull.rs	const-family	REPORT_RETRY_BUDGET
 rio-builder/src/runtime/setup.rs	const-family	COLD_START_CONNECT_BUDGET
+rio-cli/src/main.rs	const-family	RPC_MAX_ATTEMPTS
+rio-common/src/limits.rs	const-family	DEFAULT_STORE_NAR_BUDGET_BYTES
+rio-common/src/s3.rs	const-family	DEFAULT_S3_MAX_ATTEMPTS
 rio-controller/src/reconcilers/node_informer.rs	const-family	AUTH_STRIKE_BUDGET
 rio-controller/src/reconcilers/node_informer.rs	const-family	EXPOSURE_SHIP_PASS_BUDGET
 rio-controller/src/reconcilers/nodeclaim_pool/sketch.rs	on-conflict-do-update	nodeclaim_cell_state
@@ -12,6 +15,8 @@ rio-gateway/src/handler/build.rs	give-up-pred	ZERO_BACKOFF_STREAK
 rio-gateway/src/handler/grpc.rs	const-family	PUT_PATH_ABORTED_MAX_ATTEMPTS
 rio-gateway/src/handler/grpc.rs	const-family	STORE_TRANSIENT_MAX_ATTEMPTS
 rio-gateway/src/translate.rs	const-family	INLINE_BUDGET_BYTES
+rio-lease/src/lib.rs	const-family	SHUTDOWN_EPILOGUE_BUDGET
+rio-migrations/src/sql.rs	on-conflict-do-update	scheduler_live_pins
 rio-scheduler/src/admin/mod.rs	on-conflict-do-nothing	interrupt_samples
 rio-scheduler/src/ca/resolve.rs	on-conflict-do-nothing	realisation_deps
 rio-scheduler/src/ca/resolve.rs	on-conflict-do-nothing	realisations

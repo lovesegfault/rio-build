@@ -1,0 +1,3 @@
+rio-common/src/classify.rs	matches!( code, tonic::Code::
+rio-common/src/grpc.rs	matches!( code, tonic::Code::
+rio-proto/src/client/store.rs	matches!(self, NarCollectError::Stream(s) if s.code() == tonic::Code::

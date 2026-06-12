@@ -56,6 +56,10 @@ Two enforcement arms ride along (their plants embedded here):
     matches! desugars to `_ => false`, excluding the site from the
     authority's compile-error census. Documented extension sites
     carry `refusal-census: allow(<why>)` within the 6 lines above.
+    The scan population DERIVES from the ban's workspace-wide
+    jurisdiction (jurisdiction_crates - WO-S8-4; the wave-9 5-crate
+    hand list is retired); pre-campaign folds visible at the
+    widening live in the shrink-only refusal grandfather.
 
 Lexing is STRUCTURAL, not conventional (merged_bug_009): this scanner
 consumed the exact modes it polices — a naive per-line comment split
@@ -247,9 +251,13 @@ def check_model_divergence(src_root: pathlib.Path, models_dir="docs/spec/models"
     return fails, count
 
 
-def scan_refusal_folds(files):
-    """files: iterable of (rel, text). Returns violation list."""
-    fails = []
+def refusal_fold_hits(files):
+    """files: iterable of (rel, text). Returns [(content_key, message)]
+    per violation — the key is `rel<TAB>normalized-fold-prefix` so the
+    grandfather survives line drift while editing the fold itself
+    evicts the entry (the census_enrollment burn-down semantics; the
+    WO-S8-5 content-key convention)."""
+    hits = []
     for rel, raw in files:
         lines = raw.splitlines()
         try:
@@ -257,19 +265,30 @@ def scan_refusal_folds(files):
         except rust_strip.StripError as e:
             # R22″ fail-closed: an unclassifiable extent is a NAMED
             # census failure, never a silent skip.
-            fails.append(f"{e} [refusal census: file not classifiable]")
+            hits.append((f"{rel}\t<refused>", f"{e} [refusal census: file not classifiable]"))
             continue
         for m in MATCHES_CODE.finditer(stripped):
             lineno = stripped[: m.start()].count("\n") + 1
             window = "\n".join(lines[max(0, lineno - 7) : lineno])
             if REFUSAL_ALLOW.search(window):
                 continue
-            fails.append(
-                f"{rel}:{lineno}: open-coded matches! fold over tonic Code values — refusal "
-                f"adjudication lives in rio_proto::refusal (exhaustive match or judge_refusal); "
-                f"a documented extension site carries `refusal-census: allow(<why>)` within 6 lines above"
+            key = f"{rel}\t{' '.join(m.group(0).split())[:120]}"
+            hits.append(
+                (
+                    key,
+                    f"{rel}:{lineno}: open-coded matches! fold over tonic Code values — refusal "
+                    f"adjudication lives in rio_proto::refusal (exhaustive match or judge_refusal); "
+                    f"a documented extension site carries `refusal-census: allow(<why>)` within 6 lines above",
+                )
             )
-    return fails
+    return hits
+
+
+def scan_refusal_folds(files):
+    """files: iterable of (rel, text). Returns violation list (the
+    standing message-only shape; the grandfather-aware caller consumes
+    refusal_fold_hits directly)."""
+    return [msg for _key, msg in refusal_fold_hits(files)]
 
 
 # The founding plant (merged_bug_059): the pre-fix builder fold,
@@ -626,7 +645,10 @@ def duration_finder(files):
 
 def check_duration_census(src_root, mint=False):
     files = []
-    crate_roots = sorted(src_root.glob("rio-*/src"))
+    # WO-S8-4: ONE jurisdiction derivation for every workspace walk
+    # (a second spelling of the population is the list-mirrors-list
+    # defect).
+    crate_roots = [src_root / c / "src" for c in jurisdiction_crates(src_root)]
     fails = []
     # WO-S8-3 (merged_bug_028): population floor — pathlib globs fail
     # open at zero matches; a mis-staged tree must red, never scan an
@@ -879,12 +901,20 @@ def exit_edge_finder(files):
 def check_exit_edge_census(src_root, mint=False):
     files = []
     floor_fails = []
-    for crate in REFUSAL_SCAN_CRATES:
+    # WO-S8-4 (merged_bug_148): the population DERIVES from the stated
+    # jurisdiction (jurisdiction_crates) -- never a hand crate-list.
+    crates = jurisdiction_crates(src_root)
+    if not crates:
+        floor_fails.append(
+            "exit-edge census: population floor -- zero rio-*/src roots "
+            "resolved under the scan root (mis-staged tree? ((vvvvv)))"
+        )
+    for crate in crates:
         croot = src_root / crate / "src"
-        # WO-S8-3 (merged_bug_028): population floor — an enrolled
-        # crate that resolves to nothing (the rio-gateway-as-string
-        # face: a crate named only in this list, never verified to
-        # stage) must red, never silently shrink the census.
+        # WO-S8-3 (merged_bug_028): population floor -- a derived
+        # crate that resolves to nothing must red, never silently
+        # shrink the census (belt: the glob only yields existing
+        # dirs, so this arm guards racing deletions/symlink rot).
         if not croot.is_dir():
             floor_fails.append(
                 f"exit-edge census: population floor — declared crate "
@@ -1125,7 +1155,56 @@ def scan_retention_notes(src_root):
     return fails
 
 
-REFUSAL_SCAN_CRATES = ["rio-builder", "rio-store", "rio-gateway", "rio-scheduler", "rio-controller"]
+# --- jurisdiction derivation (WO-S8-4, merged_bug_148, R31's
+# jurisdiction clause) ---------------------------------------------------
+#
+# The refusal census's module doc claims a WORKSPACE-WIDE ban, but its
+# population was the wave-9 5-crate hand list (rio-builder/store/
+# gateway/scheduler/controller) reused by the exit-edge census — and a
+# hand crate-list against a workspace claim is exactly the absence-of-
+# hits-as-absence-of-evidence face residual-based self-coverage cannot
+# see. Live unscanned specimens at the mint: rio-common's
+# is_store_unreachable_code / is_transient matches! folds, rio-proto's
+# client-side store folds, rio-lease's SHUTDOWN_EPILOGUE_BUDGET
+# (EXIT_EDGE_CONSTFAM-shaped). The population now DERIVES from the
+# ban's stated jurisdiction — the same rio-*/src glob the duration
+# census already used — through ONE derivation fn consumed by every
+# workspace-walking arm (list-mirrors-list: a second spelling of the
+# jurisdiction is the defect class this close kills). A gap row is
+# MACHINE-DERIVED from the jurisdiction diff (jurisdiction_gaps) or
+# absent; gaps=set() self-certification is dead. Newly-visible hits
+# were dispositioned AT THE MINT into the censuses' own shrink-only
+# ledgers (disclosed births, commit body); the authority file
+# (rio-proto/src/refusal.rs) needs no exemption — it adjudicates via
+# exhaustive match, not matches!, and scans clean.
+def jurisdiction_crates(src_root):
+    """The census jurisdiction, derived: every workspace RUST crate
+    that stages a src/ tree -- the Cargo.toml witness scopes the
+    derivation to the language the bans range over (rio-dashboard
+    stages rio-dashboard/src as a TypeScript package: in the glob,
+    outside the Rust jurisdiction -- a bare rio-*/src glob plus the
+    WO-S8-3 file floors would red on its zero .rs files)."""
+    return sorted(
+        p.parent.name
+        for p in src_root.glob("rio-*/src")
+        if (p.parent / "Cargo.toml").is_file()
+    )
+
+
+def jurisdiction_gaps(declared, derived):
+    """Machine-derived gap rows: jurisdiction members a declared
+    population does not cover. Non-empty == the hand-list shape
+    (W12-BB's strawman red); the live scans pass `derived` itself,
+    so their gap set is empty BY CONSTRUCTION."""
+    return [
+        f"jurisdiction gap — workspace crate {c} stages rio-*/src but is "
+        f"outside the declared scan population (hand-list rot; derive the "
+        f"population, never enumerate it)"
+        for c in sorted(set(derived) - set(declared))
+    ]
+
+
+REFUSAL_GRANDFATHER = "nix/refusal-census-grandfather.txt"
 
 # --- population floors as a REGISTRY invariant (WO-S8-3,
 # merged_bug_028, R31's population clause) ------------------------------
@@ -1213,6 +1292,7 @@ def main() -> int:
     args = [a for a in sys.argv[1:]]
     mint_duration = "--mint-duration-grandfather" in args
     mint_exit_edge = "--mint-exit-edge-grandfather" in args
+    mint_refusal = "--mint-refusal-grandfather" in args
     args = [a for a in args if not a.startswith("--mint-")]
     src_root = pathlib.Path(args[0])
 
@@ -1455,6 +1535,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         straw_root = pathlib.Path(td)
         (straw_root / "rio-straw" / "src").mkdir(parents=True)
+        (straw_root / "rio-straw" / "Cargo.toml").write_text("[package]\n")
         (straw_root / "rio-straw" / "src" / "lib.rs").write_text(
             "pub const ORPHAN_WINDOW_SECS: u64 = 30;\n"
         )
@@ -1506,6 +1587,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         straw_root = pathlib.Path(td)
         (straw_root / "rio-store" / "src").mkdir(parents=True)
+        (straw_root / "rio-store" / "Cargo.toml").write_text("[package]\n")
         (straw_root / "rio-store" / "src" / "lib.rs").write_text(
             "fn f(&self) -> bool { self.attempts >= ROGUE_GIVE_UP_MAX }\n"
         )
@@ -1539,8 +1621,8 @@ def main() -> int:
             print(f"FAIL: W12-BA — empty root did not red the duration census: {f_floor}", file=sys.stderr)
             return 1
         f_floor = check_exit_edge_census(empty_root)
-        if len([x for x in f_floor if "population floor" in x]) != len(REFUSAL_SCAN_CRATES):
-            print(f"FAIL: W12-BA — empty root did not red every exit-edge crate floor: {f_floor}", file=sys.stderr)
+        if not any("population floor" in x for x in f_floor):
+            print(f"FAIL: W12-BA — empty root did not red the exit-edge floor: {f_floor}", file=sys.stderr)
             return 1
         f_floor = check_duration_census(empty_root, mint=True)
         if not any(x.startswith("mint refused:") for x in f_floor):
@@ -1553,11 +1635,36 @@ def main() -> int:
         # … and a crate dir with zero production files (not merely a
         # missing dir) trips the per-root file floor.
         (empty_root / "rio-onlytests" / "src" / "tests").mkdir(parents=True)
+        (empty_root / "rio-onlytests" / "Cargo.toml").write_text("[package]\n")
         (empty_root / "rio-onlytests" / "src" / "tests" / "t.rs").write_text("fn t() {}\n")
         f_floor = check_duration_census(empty_root)
         if not any("zero production .rs" in x for x in f_floor):
             print(f"FAIL: W12-BA — a tests-only crate did not trip the file floor: {f_floor}", file=sys.stderr)
             return 1
+    # --- W12-BB (WO-S8-4): the census population equals the stated
+    # jurisdiction BY DERIVATION. The strawman hand-list (the wave-9
+    # 5-crate population this close retires) goes RED against the
+    # derived jurisdiction -- each gap row machine-derived, naming
+    # the unscanned crate; the live scans consume the derivation
+    # itself, so their gap set is empty by construction.
+    derived_juris = jurisdiction_crates(src_root)
+    if "rio-common" not in derived_juris or "rio-lease" not in derived_juris:
+        print(f"FAIL: W12-BB — jurisdiction derivation lost workspace crates: {derived_juris}", file=sys.stderr)
+        return 1
+    straw_hand_list = ["rio-builder", "rio-store", "rio-gateway", "rio-scheduler", "rio-controller"]
+    gaps = jurisdiction_gaps(straw_hand_list, derived_juris)
+    if not gaps or not any("rio-common" in g for g in gaps) or not any("rio-lease" in g for g in gaps):
+        print(f"FAIL: W12-BB — the strawman hand-list did not derive its gap rows: {gaps}", file=sys.stderr)
+        return 1
+    if jurisdiction_gaps(derived_juris, derived_juris):
+        print("FAIL: W12-BB — the derived population gapped against itself", file=sys.stderr)
+        return 1
+    # Refusal-grandfather plants: a keyed entry passes its fold, a
+    # stale entry reds, an unkeyed fold reds (shrink-only semantics).
+    plant_hits = refusal_fold_hits([("planted/pull.rs", FOUNDING_PLANT)])
+    if len(plant_hits) != 1 or not plant_hits[0][0].startswith("planted/pull.rs	"):
+        print(f"FAIL: refusal content-key shape wrong: {plant_hits}", file=sys.stderr)
+        return 1
     # The floor REGISTRY arms: a rotted firing predicate reds, and a
     # registry-enrolled walking generator without a floor row reds
     # (the reverse direction — enrollment is total).
@@ -1628,7 +1735,15 @@ def main() -> int:
     fails += md_fails
 
     refusal_files = []
-    for crate in REFUSAL_SCAN_CRATES:
+    # WO-S8-4 (merged_bug_148): population derived from the stated
+    # jurisdiction -- the workspace-wide ban scans the workspace.
+    refusal_crates = jurisdiction_crates(src_root)
+    if not refusal_crates:
+        fails.append(
+            "refusal/wire-secs scan: population floor -- zero rio-*/src "
+            "roots resolved under the scan root ((vvvvv))"
+        )
+    for crate in refusal_crates:
         croot = src_root / crate / "src"
         # WO-S8-3 (merged_bug_028): population floor — a declared
         # crate that stages nothing must red the scan, never shrink
@@ -1657,7 +1772,31 @@ def main() -> int:
                 f"refusal/wire-secs scan: population floor — zero "
                 f"production .rs files under {crate}/src"
             )
-    fails += scan_refusal_folds(refusal_files)
+    # The refusal census, grandfather-aware (WO-S8-4: the jurisdiction
+    # widening dispositioned the newly-visible pre-campaign folds into
+    # a shrink-only ledger -- disclosed births, frozen thereafter).
+    ref_hits = refusal_fold_hits(refusal_files)
+    if mint_refusal:
+        if fails:
+            for x in fails:
+                print(f"mint refused: {x}")
+            return 1
+        keys = sorted({k for k, _m in ref_hits})
+        (src_root / REFUSAL_GRANDFATHER).write_text("".join(k + "\n" for k in keys))
+        print(f"minted {len(keys)} refusal-census grandfather entries")
+        return 0
+    rgf_path = src_root / REFUSAL_GRANDFATHER
+    rgf = set()
+    if rgf_path.is_file():
+        rgf = {x for x in rgf_path.read_text().splitlines() if x.strip()}
+    live_ref_keys = {k for k, _m in ref_hits}
+    fails += [m for k, m in ref_hits if k not in rgf]
+    for stale in sorted(rgf - live_ref_keys):
+        fails.append(
+            f"{stale.split(chr(9))[0]}: stale refusal-census grandfather "
+            f"entry ({stale!r}) -- the fold was fixed or rewritten; remove "
+            f"it from {REFUSAL_GRANDFATHER} (shrink-only)"
+        )
     fails += scan_wire_secs_seams(refusal_files)
     # The method-call leniency's machine-bound trigger (WO-S8-3): no
     # `optional … *_seconds` proto field may exist while the grammar
