@@ -17,20 +17,36 @@ cite the version the spec currently defines. Bump sweeps become
 TOTAL instead of rg-scope-dependent: the bump changes the spec, the
 lint fails every stale citation by path:line, the sweep is the fix.
 
-MECHANICS:
+MECHANICS (WO-S8-11/bug_137: every coverage claim cites the arm or
+plant that backs it — `[arm: <name>]` resolves in EARLY_CONTINUES or
+SELF_TEST_ARMS, and the W12-BI parity check in self_test() reds a
+claim whose cite does not resolve; free-prose coverage claims died
+with the rref overclaim this block carried for three waves):
   1. Parse docs/spec/**/*.typ for `#r("<id>")` mints: base-id ->
      defined version (absent suffix == v1; `+N` == vN). A base
-     defined at multiple versions simultaneously is itself an error.
-  2. Scan the tree (text files; see EXCLUDES) for dotted-token
-     candidates and check every token whose base is a KNOWN rule:
-     cited version must equal the defined version. Unknown bases are
-     ignored (precision over recall — this lint never guesses).
+     defined at multiple versions simultaneously is itself an error
+     [arm: duplicate-mint].
+  2. Scan the tree for dotted-token candidates [arm: suffix-filter]
+     [arm: path-exclusion] [arm: read-failure] and check every token
+     whose base is a KNOWN rule: cited version must equal the
+     defined version [arm: token-grammar]. Unknown bases are ignored
+     (precision over recall — this lint never guesses). Marker-form
+     tokens in tracey-enrolled files belong to tracey's flow
+     [arm: tracey-scope]; in un-enrolled tracey-parseable files they
+     are unvalidatable and red [arm: unvalidatable-marker]; bare
+     prose mentions ride the stable-name convention
+     [arm: bare-prose].
   3. Mint-shaped substrings (`#r("…")`) are masked at the SPAN, not
-     the line (WO-S8-4/bug_150: mints live only in docs/spec .typ,
-     which is not a scanned tier, so a mint here is always a
+     the line [arm: mint-span-mask] (mints live only in docs/spec
+     .typ, which is not a scanned tier, so a mint here is always a
      QUOTATION — the old whole-line skip was a one-token evasion).
-     `#rref(...)` citations are checked (cheap, and it catches a
-     stale rref before the docs build does).
+     THE BOUNDARY, stated honestly: `.typ` is OUTSIDE the scanned
+     tiers, so `#rref(...)` citations are NOT checked here — the
+     docs tier's anchor strips versions by design, rref() is
+     fail-soft, and a stale rref is caught by no standing check
+     (this sentence previously claimed the opposite; the .typ
+     extension is priced deferred work, trigger: the first
+     stale-rref incident).
 
 SELF-TEST ARMS (planted at runtime; a lint that cannot fail its
 fixtures does not gate — the census_enrollment.py pattern):
@@ -128,6 +144,16 @@ EARLY_CONTINUES = (
     "mint-span-mask",  # MINT_RE spans masked (was: whole-line skip)
     "tracey-scope",  # tracey_scanned tiers: markers are tracey's
     "bare-prose",  # blind tier, bare mention: stable-name convention
+)
+
+# Non-continue arms the contract may cite (WO-S8-11): each is a named
+# selftest battery in self_test() — the W12-BI parity check requires
+# every `[arm: X]` in the module contract to resolve HERE or in
+# EARLY_CONTINUES, so a claim cannot outlive its plant.
+SELF_TEST_ARMS = (
+    "token-grammar",  # the productions table battery
+    "duplicate-mint",  # collect_defined's error lane
+    "unvalidatable-marker",  # the z.rs scope plant (WO-S8-10)
 )
 
 
@@ -349,6 +375,18 @@ def scan_tree(root: Path, defined: dict, scope=None):
 
 def self_test():
     import tempfile
+
+    # W12-BI (WO-S8-11, bug_137): the contract's coverage claims
+    # derive from the enumerated arms — every `[arm: X]` cite in the
+    # module docstring resolves in EARLY_CONTINUES or SELF_TEST_ARMS
+    # (a claim without a live arm is the rref-overclaim shape), and
+    # every enumerated arm is cited at least once (an arm without a
+    # contract sentence is undocumented enforcement).
+    cited = set(re.findall(r"\[arm: ([a-z-]+)\]", __doc__ or ""))
+    known = set(EARLY_CONTINUES) | set(SELF_TEST_ARMS)
+    assert cited, "W12-BI: the contract cites zero arms — the MECHANICS rotted"
+    assert cited <= known, f"W12-BI: contract cites unknown arms {sorted(cited - known)}"
+    assert known <= cited, f"W12-BI: arms never cited by the contract {sorted(known - cited)}"
 
     # --- the token grammar's own productions (R22′: the corpus rows
     # derive from TOKEN_RE's alternation arms — bare vs versioned —
