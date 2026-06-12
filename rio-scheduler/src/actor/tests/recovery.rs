@@ -684,12 +684,17 @@ async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
     db.pin_live_inputs(&"y2-drv".into(), std::slice::from_ref(&input_path))
         .await?;
 
-    // Verify pin seeded.
+    // Verify pins present: the seeded input pin + the merge-time
+    // own-.drv pin that seed_orphan_assigned's merge_dag wrote
+    // (r[store.drv.gc-build-pinned]).
     let pins_before: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_live_pins WHERE drv_hash = 'y2-drv'")
             .fetch_one(&sched_db.pool)
             .await?;
-    assert_eq!(pins_before, 1, "pin should be seeded before recovery");
+    assert_eq!(
+        pins_before, 2,
+        "seeded input pin + merge-time own-.drv pin before recovery"
+    );
 
     let (handle, _task) = recover_with_store(sched_db.pool.clone(), store_client.clone()).await?;
 
@@ -701,8 +706,8 @@ async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
             .fetch_one(&sched_db.pool)
             .await?;
     assert_eq!(
-        pins_after_sweep, 1,
-        "sweep should KEEP pin for non-terminal drv (this is the setup, not the bug)"
+        pins_after_sweep, 2,
+        "sweep should KEEP pins for non-terminal drv (this is the setup, not the bug)"
     );
 
     // ReconcileAssignments → worker not registered → store check →

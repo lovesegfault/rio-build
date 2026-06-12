@@ -1858,6 +1858,10 @@ impl DagActor {
         self.persist_status_batch(&ok_refs, DerivationStatus::Completed)
             .await;
         self.upsert_path_tenants_for_batch(&ok_hashes).await;
+        // Terminal without dispatch: release the merge-time drv pins
+        // (r[store.drv.gc-build-pinned]) — the store-hit short-circuit
+        // never reaches the worker-completion unpin.
+        self.unpin_best_effort_batch(&ok_refs).await;
 
         // Batched promote: dedup find_newly_ready across all completed
         // hashes, transition + push_ready in-mem, then one

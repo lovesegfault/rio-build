@@ -92,10 +92,14 @@ impl DagActor {
     }
 
     /// Best-effort unpin of `scheduler_live_pins` rows for a
-    /// terminal derivation. Called at every terminal transition
-    /// (Completed/Poisoned/Cancelled; DependencyFailed is never
-    /// dispatched so never pinned). `sweep_stale_live_pins` on
-    /// recovery is the crash safety net for missed unpins.
+    /// terminal derivation. Called at every terminal transition —
+    /// Completed/Poisoned/Cancelled from the dispatch lifecycle, AND
+    /// the never-dispatched terminals (merge cache-hit, dispatch-time
+    /// store hit, CA-cutoff Skipped, DependencyFailed cascade), which
+    /// hold the merge-time drv-path pin from
+    /// r[store.drv.gc-build-pinned] even though they never gained
+    /// dispatch-time input pins. `sweep_stale_live_pins` on recovery
+    /// is the crash safety net for missed unpins.
     pub(super) async fn unpin_best_effort(&self, drv_hash: &DrvHash) {
         if let Err(e) = self.db.unpin_live_inputs(drv_hash).await {
             debug!(drv_hash = %drv_hash, error = %e,
@@ -1507,6 +1511,10 @@ impl DagActor {
             let skipped_refs: Vec<&str> = skipped.iter().map(|h| h.as_str()).collect();
             self.persist_status_batch(&skipped_refs, DerivationStatus::Skipped)
                 .await;
+            // Terminal without dispatch: release the merge-time drv
+            // pins (r[store.drv.gc-build-pinned]) — skipped nodes
+            // never reach the worker-completion unpin.
+            self.unpin_best_effort_batch(&skipped_refs).await;
             // r[impl sched.event.derivation-terminal]
             // Skipped is a terminal cached-equivalent transition: emit
             // DerivationCached + bump cached_count for each interested
@@ -2720,6 +2728,11 @@ impl DagActor {
             let refs: Vec<&str> = transitioned.iter().map(DrvHash::as_str).collect();
             self.persist_status_batch(&refs, DerivationStatus::DependencyFailed)
                 .await;
+            // DependencyFailed nodes were never dispatched, but the
+            // merge-time drv pin (r[store.drv.gc-build-pinned]) still
+            // holds their blobs — release it here, the only terminal
+            // transition these nodes get.
+            self.unpin_best_effort_batch(&refs).await;
         }
         transitioned
     }

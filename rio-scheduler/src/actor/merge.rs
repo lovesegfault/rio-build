@@ -558,6 +558,32 @@ impl DagActor {
         phase!("5-persist-and-activate");
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
+        // r[impl store.drv.gc-build-pinned]
+        // Pin every (non-terminal) submission node's own .drv path so
+        // the store's drv-blob sweep keeps its blob alive while the
+        // build is live (ADR-024: the client's ack-record TTL only
+        // covers the unpinned grace window; a build that queues longer
+        // than the grace would otherwise lose its drv bytes before
+        // dispatch). Runs AFTER the merge is committed so a rejected
+        // submission pins nothing. Pre-existing terminal nodes are
+        // skipped — no later transition would unpin them (the
+        // recovery-time sweep_stale_live_pins would be the only
+        // cleanup). Best-effort like every other live-pin write: the
+        // 24h GC grace is the fallback if PG blips here.
+        let pin_pairs: Vec<(&str, &str)> = nodes
+            .iter()
+            .filter(|n| {
+                self.dag
+                    .node(&n.drv_hash)
+                    .is_some_and(|s| !s.status().is_terminal())
+            })
+            .map(|n| (n.drv_hash.as_str(), n.drv_path.as_str()))
+            .collect();
+        if let Err(e) = self.db.pin_drv_paths(&pin_pairs).await {
+            warn!(build_id = %build_id, count = pin_pairs.len(), error = %e,
+                  "failed to pin drv paths for live build (best-effort)");
+        }
+
         // r[impl sched.merge.substitute-topdown+10]
         // Stamp topdown_pruned on the kept (demanded) nodes only now
         // that the merge is committed (steps 4–5 can no longer fail).
@@ -1181,6 +1207,11 @@ impl DagActor {
                       "failed to persist cache-hit Completed status batch");
             }
             self.upsert_path_tenants_for_batch(&completed_batch).await;
+            // Terminal without dispatch: release the merge-time drv
+            // pins (r[store.drv.gc-build-pinned]) — the worker
+            // completion path that normally unpins never runs for a
+            // cache hit.
+            self.unpin_best_effort_batch(&hashes).await;
         }
         // Fan-out: collect other builds interested in re-probe-
         // completed nodes + emit DerivationCached to each. Caller
