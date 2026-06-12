@@ -52,12 +52,9 @@ pub(super) struct LoadOpts {
     /// `packages.x86_64-linux` attribute of the bench flake.
     pub target: String,
     pub parallel: u16,
-    /// Bench flake checkout; default `~/src/nix-bench/main`.
-    pub bench_flake: Option<PathBuf>,
     /// Spread client starts evenly over this window instead of
-    /// all-at-once. 512 simultaneous starts destabilized the EKS
-    /// control plane in the 2026-06-11 campaign (~5min apiserver
-    /// blackout, 7 NotReady nodes from Karpenter churn).
+    /// all-at-once (see `--load-stagger` on `qa` for the incident
+    /// rationale).
     pub stagger: Duration,
 }
 
@@ -95,7 +92,7 @@ fn stagger_allowed(n: u16, window: Duration, elapsed: Duration) -> u16 {
 }
 
 pub(super) async fn cmd_run(p: &dyn Provider, cfg: &XtaskConfig, opts: &LoadOpts) -> Result<()> {
-    let bench = resolve_bench_flake(opts.bench_flake.clone())?;
+    let bench = resolve_bench_flake()?;
     let installable = format!("{}#{}", bench.display(), opts.target);
 
     // Pre-resolve the target to a .drv ONCE — kills the cold-eval
@@ -411,17 +408,15 @@ echo "BUILD_DONE idx=${{JOB_COMPLETION_INDEX:-?}} $(date -u +%FT%TZ)"
     .context("wave Job manifest")
 }
 
-fn resolve_bench_flake(explicit: Option<PathBuf>) -> Result<PathBuf> {
-    let p = explicit.unwrap_or_else(|| {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default()
-            .join("src/nix-bench/main")
-    });
+/// Locate the nix-bench checkout (`~/src/nix-bench/main`).
+fn resolve_bench_flake() -> Result<PathBuf> {
+    let p = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join("src/nix-bench/main");
     anyhow::ensure!(
         p.join("flake.nix").exists(),
-        "nix-bench flake not found at {}\n\
-         (pass --bench-flake /path/to/nix-bench/main)",
+        "nix-bench flake not found at {} — clone nix-bench there",
         p.display()
     );
     Ok(p)

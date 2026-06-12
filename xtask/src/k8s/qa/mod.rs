@@ -300,7 +300,6 @@ pub async fn run(
                     let load = super::stress::LoadOpts {
                         target: opts.load_target.clone(),
                         parallel: opts.load_parallel,
-                        bench_flake: None,
                         stagger: opts.load_stagger,
                     };
                     super::stress::cmd_run(p, cfg, &load).await?
