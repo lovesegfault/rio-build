@@ -103,7 +103,7 @@ pub(super) const MAX_IDENT_LEN: usize = 256;
 /// `nix build -L` terminals.
 ///
 /// Head-truncation cannot break any scheduler decision on this field:
-/// `error_msg` is DISPLAY/NARRATION ONLY (bug_090 — sizing
+/// `error_msg` is DISPLAY/NARRATION ONLY — quantifier: census(forged_free_text_never_moves_resource_floors) — (bug_090 — sizing
 /// classifications ride the typed `failure_classification` field and
 /// its corroboration gate; the I-127 `CONCURRENT_PUTPATH_MSG` infra
 /// exemption still reads a short builder-constructed prefix that sits

@@ -927,7 +927,7 @@ pub async fn execute_build(
     // bug_090: the corroboration triple rides the typed wire family
     // IFF the seam classified — the scheduler re-checks these against
     // the shape it assigned before any floor moves. The DiskFull
-    // letter is minted ONLY at the seam above, so the match is the
+    // letter is minted only at the seam above, so the match is the
     // seam's own verdict.
     let disk_telemetry = match (&build_result, quota_peak, node_free) {
         (Err(ExecutorError::DiskFull), Some(q), Some(free)) => {
@@ -1357,7 +1357,7 @@ fn apply_oom_override(
             build_result
         }
         // merged_bug_078 (the oom TWIN seam, R28 result-plane axis):
-        // the retired `(true, Err(_))` wildcard rewrote EVERY error
+        // the retired `(true, Err(_))` wildcard rewrote every error
         // under oom_detected — laundering the cancel law, the
         // network/store lanes, and the permanent lane into a memory
         // sizing signal. The typed allow-list decides per shape: the
@@ -1406,7 +1406,7 @@ enum SizingRewrite {
     /// claim it when its own evidence corroborates (the quota
     /// predicate for disk; `oom_detected` for oom).
     Rewritable,
-    /// The oom watcher's kill signature ONLY (`cgroup.kill` → daemon
+    /// The oom watcher's kill signature ONLY — quantifier: census(sizing_rewrite_authority_rows_pinned) — (`cgroup.kill` → daemon
     /// EOF): the OOM axis claims it — that EOF is the watcher's own
     /// mechanical consequence (the designed I-196 chain, and the
     /// reason the override exists at all: it must win before

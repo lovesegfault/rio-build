@@ -1251,7 +1251,7 @@ impl DagActor {
     /// too; `disk_full` is the live_057 worker quota lane) — keep
     /// the lib.rs HELP in lockstep when the census grows.
     /// bug_090 — the corroboration gate: a worker-reported TYPED
-    /// sizing claim moves a persisted floor ONLY when its telemetry is
+    /// sizing claim moves a persisted floor ONLY when its telemetry is — quantifier: census(typed_classification_bumps_only_with_corroboration) —
     /// consistent with the shape THIS scheduler assigned at dispatch
     /// (`state.sched.last_intent` — the corroboration anchor a forger
     /// cannot choose: each ladder step must claim exhaustion AT the
@@ -1552,7 +1552,7 @@ impl DagActor {
                     t
                 };
                 let paths: Vec<String> = outputs.iter().map(|o| o.output_path.clone()).collect();
-                // bug_132 — the late lane's CA face takes the SAME
+                // bug_132 — the late lane's CA face takes the same
                 // production-evidence gate as the admitted lane (the
                 // wave-9 Register face was the weaker-checked replica
                 // once already; the durable `is_ca AND NOT is_fo` is
@@ -1743,7 +1743,7 @@ impl DagActor {
     /// registration evidence instead: a path is lawful iff the store
     /// stamped it for the reporting build's attributed cohort at
     /// upload ([`SchedulerDb::paths_with_production_evidence`] — the
-    /// SAME `path_tenants` rows the visibility verdict reads). **No
+    /// SAME `path_tenants` rows the visibility verdict reads — quantifier: census(ca_no_upload_report_never_flips_visibility_on_any_lane). **No
     /// upload, no stamp:** the returned set bounds BOTH the
     /// tenant-visibility stamp
     /// ([`StampProvenance::BuiltLocallyEvidenced`]) and the
@@ -4273,7 +4273,7 @@ impl DagActor {
             degraded,
             StoreDegradedDisposition::Paced | StoreDegradedDisposition::RunBound
         );
-        // bug_090 (live_057-b rebuilt): the floor moves ONLY on the
+        // bug_090 (live_057-b rebuilt): the floor moves ONLY on the — quantifier: census(forged_free_text_never_moves_resource_floors)
         // TYPED classification field, corroborated against the shape
         // this scheduler itself assigned — worker-supplied free text
         // (error_msg) is display/narration and drives nothing. The

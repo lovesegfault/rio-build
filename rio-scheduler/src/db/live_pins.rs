@@ -52,12 +52,12 @@ pub(crate) enum StampProvenance {
     /// production evidence (the ingest-lane registration stamp,
     /// `r[store.registration.ingest-stamps]`) for the reporting
     /// build's attributed cohort, consulted via
-    /// [`SchedulerDb::paths_with_production_evidence`] — the SAME
+    /// [`SchedulerDb::paths_with_production_evidence`] — the SAME — quantifier: census(ca_no_upload_report_never_flips_visibility_on_any_lane) —
     /// `path_tenants` rows the store's `own_built_projection` feeds
     /// into the visibility verdict, so the gate cannot drift from
     /// the I-217 flip it guards. The set carries sha256(path) keys;
     /// `lawful_pairs` drops every non-member path (no upload, no
-    /// stamp). Constructed ONLY from the CA-face consult's result
+    /// stamp). Constructed ONLY from the CA-face consult's result — quantifier: census(ca_stamp_lanes_consult_production_evidence) —
     /// (`ca_production_evidence` — the construction sites are
     /// census-pinned 1:1 with the consult call sites by
     /// `ca_stamp_lanes_consult_production_evidence`).
@@ -261,7 +261,7 @@ impl SchedulerDb {
     /// face the store mints it only after `verify_ca_store_path`'s
     /// content recompute passed). The query MIRRORS the store's
     /// `own_built_projection` semantics (rio-store/src/visibility.rs,
-    /// CITE-ONLY: `bool_or(pt.tenant_id = $tid)` over exactly these
+    /// cite-only: `bool_or(pt.tenant_id = $tid)` over exactly these
     /// rows) with the singleton tenant widened to the cohort — ONE
     /// source for "the store recorded this build's tenant produced
     /// this path", so the gate cannot drift from the I-217 flip it
@@ -1191,7 +1191,7 @@ mod registration_writer_census {
     /// (a) the evidence CONSULTS (the dotted `ca_production_evidence`
     ///     paren sites) — one per CA-exempt worker-report stamp lane
     ///     (admitted + late Register), in the trust-boundary file
-    ///     ONLY;
+    ///     only;
     /// (b) the evidenced-witness CONSTRUCTIONS (the
     ///     `BuiltLocallyEvidenced` paren sites) — the stamp cannot
     ///     take the CA face without the typed witness, and the
@@ -1306,7 +1306,7 @@ mod registration_writer_census {
     /// report family (CompletionReport, BuildResult,
     /// FailureClassification, QuotaTelemetry, BuiltOutput) is parsed
     /// from the embedded `build_types.proto` ([GEN-SET]: generated
-    /// from the wire contract, never author-enumerated), and EVERY
+    /// from the wire contract, never author-enumerated), and EVERY — quantifier: census(completion_report_schema_census) —
     /// field must carry a disposition row naming how the scheduler
     /// treats it. A new wire field on this boundary is census-RED
     /// until its consumer pricing is filed — the bug_090 hole was

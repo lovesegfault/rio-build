@@ -1818,7 +1818,7 @@ async fn test_floor_bump_store_suppression_parity(
 /// completed the 25→50→100→200 GiB disk ladder; the only gate was
 /// `believed_store`, which a hostile builder simply doesn't set.
 ///
-/// Post-fix: the floor bump consumes ONLY the typed
+/// Post-fix: the floor bump consumes only the typed
 /// `failure_classification` field, corroborated against the
 /// scheduler-assigned shape; free text is display/narration.
 // r[verify sched.trust.report-corroboration+2]
@@ -6032,7 +6032,7 @@ async fn forged_output_path_never_reaches_path_tenants_on_any_lane() -> TestResu
 /// Visible cross-tenant — the I-217 flip one face over.
 ///
 /// Post-fix: the CA face consults the store-recorded registration
-/// evidence (the SAME `path_tenants` rows the visibility verdict
+/// evidence (the same `path_tenants` rows the visibility verdict
 /// reads — the ingest-lane stamp the store mints for the uploading
 /// claims-tenant, `r[store.registration.ingest-stamps]`): no
 /// evidence for the reporting build's attributed cohort ⇒ a typed,
@@ -6066,7 +6066,7 @@ async fn ca_no_upload_report_never_flips_visibility_on_any_lane() -> TestResult 
 
     // The I-217 projection cell for tenant A over a path: EXACTLY the
     // store's `own_built_projection` semantics (visibility.rs —
-    // CITE-ONLY surface), folded through the kernel's verdict.
+    // cite-only surface), folded through the kernel's verdict.
     let verdict_for_a = |path: String, pool: sqlx::PgPool| async move {
         let hash = sha2::Sha256::digest(path.as_bytes()).to_vec();
         let owned: Option<bool> = sqlx::query_scalar(

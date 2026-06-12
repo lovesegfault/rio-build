@@ -40,7 +40,6 @@ docs/spec/components/scheduler.typ	ANY completed read of a lease this replica ho
 docs/spec/components/scheduler.typ	EVERY emission of pinned demand) and MUST fail closed at every
 docs/spec/components/scheduler.typ	EVERY interested tenant, and a materialization job is created when every
 docs/spec/components/scheduler.typ	EVERY reader --- `passes_intent_filter`, `h_all` partition, `override_hash`
-docs/spec/components/scheduler.typ	EVERY report lane: the admitted success epilogue checks the resident node's
 docs/spec/components/scheduler.typ	NotIn` requirement for EVERY class at the derive seam --- one mint, so a
 docs/spec/components/scheduler.typ	Per ADR-019, fixed-output derivations route ONLY to fetcher-kind executors
 docs/spec/components/scheduler.typ	Running derivations are NEVER killed --- cutoff applies pre-dispatch only
@@ -60,7 +59,6 @@ docs/spec/components/scheduler.typ	intent stays queued and the @fod waits --- th
 docs/spec/components/scheduler.typ	its ceiling or the global --- and the grounding is EXCLUSION-ONLY negative
 docs/spec/components/scheduler.typ	kubelet `containerStatuses` attribution --- is the ONLY promoting letter
 docs/spec/components/scheduler.typ	parameter (`<> ALL($1::text[])`). The partial index `derivations_status_idx`
-docs/spec/components/scheduler.typ	registration sink) ONLY if it is a member of the scheduler-authoritative
 docs/spec/components/scheduler.typ	set confirms a live-wanted path missing-and-unsubstitutable under EVERY
 docs/spec/components/scheduler.typ	status; the ONLY lane that may warn and count a refusal), or
 docs/spec/components/scheduler.typ	widen-only establishment window governs the deadline/reap axis ONLY
@@ -212,7 +210,6 @@ rio-builder/src/executor/mod.rs	// All daemon I/O is in a helper so we can ALWAY
 rio-builder/src/executor/mod.rs	// FUSE userspace; on fetch failure `lookup()` returns EIO (NEVER
 rio-builder/src/executor/mod.rs	// I-196: NEVER pass build_cores=0 to the daemon. 0 means "use
 rio-builder/src/executor/mod.rs	// deadline math is in-range for ANY wire value (u64::MAX
-rio-builder/src/executor/mod.rs	// live_057-a: the SAME sample feeds the disk-exhaustion
 rio-builder/src/executor/mod.rs	// nproc", and nproc inside a pod sees ALL node cores (cgroup CPU
 rio-builder/src/executor/mod.rs	/// so a footer is sent whenever ANY attempt ran a daemon: an
 rio-builder/src/fuse/cache.rs	///   `Some`  → JIT armed: ONLY names in the map are fetched.

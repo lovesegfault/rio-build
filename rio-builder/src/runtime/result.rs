@@ -423,7 +423,7 @@ mod tests {
     /// class (corroboration = the report's peak_memory field);
     /// DiskFull carries the class + the seam's quota triple; every
     /// other shape (and every cancelled report) carries NO claim.
-    /// The scheduler's floor gate consumes ONLY this field — error_msg
+    /// The scheduler's floor gate consumes ONLY this field — quantifier: census(forged_free_text_never_moves_resource_floors) — error_msg
     /// is display-only.
     #[test]
     fn err_completion_mints_typed_classification_from_letters_only() {

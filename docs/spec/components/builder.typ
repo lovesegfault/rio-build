@@ -1030,7 +1030,8 @@ process or its FUSE threads.
   sizing overrides (disk and oom): only the ordinary ENOSPC-consistent
   daemon failures may be claimed; `TimedOut`, `LogLimitExceeded`,
   daemon-transient shapes, and the cancel/network/store/permanent lanes are
-  NEVER rewritable --- their own sizing/retry laws own them --- and the
+  NEVER rewritable --- their own sizing/retry laws own them // quantifier: census(sizing_rewrite_authority_rows_pinned)
+  --- and the
   authority enumerates every status and executor-error shape with no
   catch-all arm, on either seam.
 ]

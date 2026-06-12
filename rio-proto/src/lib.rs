@@ -28,7 +28,7 @@ pub use rio_common::grpc::{
 pub const CONCURRENT_PUTPATH_MSG: &str = "concurrent PutPath in progress";
 
 /// Substring carried in `ExecutorError::CgroupOom`'s Display impl —
-/// DISPLAY/NARRATION ONLY (bug_090): the scheduler's floor decision
+/// DISPLAY/NARRATION ONLY — quantifier: census(forged_free_text_never_moves_resource_floors) — (bug_090): the scheduler's floor decision
 /// consumes the typed `BuildResult.failure_classification` field, not
 /// this text. Single source of truth for the human-facing message so
 /// the `#[error]` attr and the log/event surfaces can't drift; the
@@ -37,7 +37,7 @@ pub const CONCURRENT_PUTPATH_MSG: &str = "concurrent PutPath in progress";
 pub const CGROUP_OOM_MSG: &str = "cgroup OOM during build";
 
 /// Substring carried in `ExecutorError::DiskFull`'s Display impl —
-/// DISPLAY/NARRATION ONLY (bug_090; the [`CGROUP_OOM_MSG`] twin for
+/// DISPLAY/NARRATION ONLY — quantifier: census(forged_free_text_never_moves_resource_floors) — (bug_090; the [`CGROUP_OOM_MSG`] twin for
 /// the disk axis, live_057-a/-b): the scheduler's floor decision
 /// consumes the typed `BuildResult.failure_classification` field, not
 /// this text. Single source of truth for the human-facing message;

@@ -159,8 +159,8 @@ critical-path value).
 
 #r("sched.trust.report-membership+2")[
   A worker-supplied `output_path` MUST enter `path_tenants` (or any other
-  registration sink) ONLY if it is bounded by a scheduler-verifiable path-value
-  law for that assignment, on EVERY report lane and EVERY face: the
+  registration sink) ONLY if it is bounded by a scheduler-verifiable path-value // quantifier: census(forged_output_path_never_reaches_path_tenants_on_any_lane)
+  law for that assignment, on EVERY report lane and EVERY face: the // quantifier: census(ca_no_upload_report_never_flips_visibility_on_any_lane)
   input-addressed and fixed-output faces check membership in the
   scheduler-authoritative expected set (`expected_output_paths` ---
   dispatch-minted and signed into the `AssignmentClaims` the store enforces on
@@ -202,8 +202,8 @@ joins the law's domain with its own evidence base rather than an exemption.
   (1) *Visibility:* a tenant-visibility registration stamp for a floating-CA
   report MUST bind to store-recorded production evidence: the stamp (and the
   realisation insert that feeds later stamp lanes) admits a worker-reported
-  `output_path` ONLY if the store's ingest-lane registration (`path_tenants`
-  --- the SAME rows the visibility verdict's `own_built_projection` reads,
+  `output_path` ONLY if the store's ingest-lane registration (`path_tenants` // quantifier: census(ca_no_upload_report_never_flips_visibility_on_any_lane)
+  --- the SAME rows the visibility verdict's `own_built_projection` reads, // quantifier: census(ca_stamp_lanes_consult_production_evidence)
   one source) records the path for at least one tenant of the reporting
   build's attributed cohort: no upload, no stamp. Absent evidence MUST be a
   typed refusal --- counted

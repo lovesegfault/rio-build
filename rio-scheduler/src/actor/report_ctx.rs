@@ -26,7 +26,7 @@ pub(super) struct FailureReportCtx<'a> {
     /// `CompletionReport.final_line_count`, `None` when not reported.
     pub(super) final_line_count: Option<i64>,
     /// Worker-provided error message (may be empty). DISPLAY/NARRATION
-    /// ONLY (bug_090): no decision in any failure handler may dispatch
+    /// ONLY — quantifier: census(forged_free_text_never_moves_resource_floors) — (bug_090): no decision in any failure handler may dispatch
     /// on this text — sizing classifications ride [`Self::sizing`].
     pub(super) error_msg: &'a str,
     /// bug_408: `BuildResult.store_degraded` — the builder's FUSE

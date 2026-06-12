@@ -65,7 +65,7 @@ pub(crate) fn header_lines(
     };
     // live_058-d + merged_bug_004: the law is the VIOLATION CLASS,
     // total over the input domain — a present NON-ZERO size never
-    // renders as zero at ANY unit (the live incident's 45-69 MB
+    // renders as zero at ANY unit — quantifier: census(present_nonzero_never_renders_zero_at_any_unit) — (the live incident's 45-69 MB
     // raw-stamps read as "no memory assigned" during diagnosis; the
     // header doc above forbids claiming a precision the banner
     // doesn't have, and rounding a present value to zero is the
@@ -247,7 +247,7 @@ mod tests {
 
     /// W11-Y (merged_bug_004): the formatter's law is the VIOLATION
     /// CLASS, total over the input domain — a present non-zero size
-    /// NEVER renders as zero at ANY unit. The live_058-d fix closed
+    /// NEVER renders as zero at ANY unit — quantifier: census(present_nonzero_never_renders_zero_at_any_unit). The live_058-d fix closed
     /// the truncation-to-zero at the GiB rung and the W10-CL matrix
     /// pinned three cells; the fallthrough still rendered `n >> 20`,
     /// so any present value in [1, 1 MiB) printed "0 MiB" — the
