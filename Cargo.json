@@ -21064,8 +21064,16 @@
       ],
       "devDependencies": [
         {
+          "name": "hex",
+          "packageId": "hex"
+        },
+        {
           "name": "opentelemetry_sdk",
           "packageId": "opentelemetry_sdk"
+        },
+        {
+          "name": "proptest",
+          "packageId": "proptest"
         },
         {
           "name": "rstest",

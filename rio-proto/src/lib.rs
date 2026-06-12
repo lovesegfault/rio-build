@@ -79,6 +79,7 @@ pub const SPAWN_INTENTS_DEFAULT_PAGE: u32 = 2048;
 
 pub mod castore_util;
 pub mod client;
+pub mod derivation_util;
 pub mod interceptor;
 pub mod refusal;
 // Trait impls (`From<NixStatus> for BuildResultStatus` and inverse) are
@@ -292,6 +293,18 @@ pub mod admin {
 /// rio-local discriminated root encoded into `nar_index.root_node`.
 pub mod castore {
     tonic::include_proto!("rio.castore");
+}
+
+/// Canonical stored/negotiated form of a Nix derivation (ADR-024).
+///
+/// `Derivation`/`Output`/`InputDrv`/`EnvVar` under the castore
+/// canonical-encode rule: sorted repeated fields (except `args`),
+/// defaults omitted, digest = blake3(canonical bytes). All string-ish
+/// fields are `bytes`, map-shaped data is sorted repeated pairs — see
+/// `derivation.proto` for the full identity rationale and
+/// [`derivation_util`] for digest/validate/convert/verify helpers.
+pub mod drv {
+    tonic::include_proto!("rio.drv.v1");
 }
 
 /// Binary `FileDescriptorSet` covering every `.proto` file compiled by
