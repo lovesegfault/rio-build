@@ -4,8 +4,7 @@
 // conservation): connection permits, session permits and gauges equal the
 // number of live connections/sessions, released exactly once on every
 // ending, never dependent on peer cooperation (gw-session corpus §3 F1,
-// design §3.4; verdicts in the calibration table of
-// docs/spec/models/gw-session-invariant-map.md). Same extend-and-override
+// design §3.4; verdicts in the VERDICT block at the end of this header). Same extend-and-override
 // pattern as the round-1 calibration modules: each module instantiates the
 // as-built gwConnLifecycle core at a named regime/family scope, swaps ONE
 // action for its PRE-FIX behavior (the behavior the named historical fix
@@ -43,6 +42,40 @@
 // Constants: famAdmission scope (LET_OCC for the server-side ending) plus
 // the close-out ladder. Baseline: gwCalibF1AsBuilt.baselineStep (HOLDS).
 // =========================================================================
+//
+// VERDICT (Stage-C calibration, relocated from the retired gw-session
+// invariant map; scope/baseline protocol and the acceptance table:
+// calibration/README.md, gateway section; trace walks verbatim from the
+// Stage-C record):
+// - GW-1 gwCalibF1ServerSideKeepsGuard: FALSIFIES L2 @ 14 (757,893/24,405);
+//   S15 falls on the same trace; predicted S2/S3 do not fall (note: the
+//   pre-fix accounting is internally consistent — the gauge still counts
+//   the held guard, the permit is still held by a live guard — so the
+//   conservation forms cannot distinguish it; the defect is a settlement
+//   failure, exactly the predicted-and-falsified L2; the S2/S3 half of the
+//   prediction is carried within F1 by GW-12 → S1 and GW-18 → S2; not a
+//   crosswalk contradiction). Trace: accept → auth → exec → handshake
+//   timeout (server-side ending) → pre-fix pump exit keeps the guard →
+//   close-out completes → capacity held with no budget, no enforceable
+//   force-close, no pump exit left (the 443670d43 exec-then-silent shape).
+// - GW-12 gwCalibF1AuthRejectSkipsGate (MAX_CONNECTIONS = 1): FALSIFIES S1
+//   @ 4 (297/56). Trace: a reject-only auth callback skips
+//   mark_real_connection / ensure_permit — a live connection past the auth
+//   layer neither counted nor being torn down (a2fcb8aa0); the permit-less-
+//   not-torn-down half violates the same invariant's other conjunct deeper
+//   in the same module.
+// - GW-18 gwCalibF1NoGlobalSessionCap (V): FALSIFIES S2 @ 13
+//   (159,819/8,164) — sessions spread across both connections exceed
+//   MAX_SESSIONS at the third concurrent guard (9d80038cb safety half).
+// - GW-18 gwCalibF1PerConnCapRefusals (T): FALSIFIES P1 @ 8 (6,538/556), P2
+//   @ 7 (471/56), P3 @ 7 (466/53) — the per-connection-cap world refuses a
+//   second exec below the global cap, refuses the channel open itself, and
+//   disconnects the connection the instant its session count touches zero
+//   (9d80038cb permissiveness half).
+// - BASELINES (as-built baselineStep, exhaustive, HOLDS allInvariants at
+//   scope): gwCalibF1AsBuilt (GW-1) 12,107,117 distinct / 480 s;
+//   gwCalibF1AsBuiltSpread (GW-18 V+T) 199,002 / 34 s; gwCalibF1AsBuiltCap1
+//   (GW-12) 1,119 / 30 s.
 module gwCalibF1ServerSideKeepsGuard {
   import gwConnLifecycle(
     MAX_CONNECTIONS = 2,

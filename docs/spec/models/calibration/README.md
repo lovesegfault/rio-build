@@ -147,3 +147,62 @@ model-side recalibration, recorded above); every by-construction row
 carries a structural argument against the final code shape; both
 liveness rows flipped exactly as predicted. No stop-and-report
 condition fired.
+
+## Gateway lifecycle (gw-session campaign) — Stage-C scope protocol and acceptance
+
+> Relocated verbatim from the retired gw-session invariant map (Stage-C
+> calibration record). Per-module verdicts and trace walks live in the
+> nine `gw-f*.qnt` headers; the campaign close-out banner is in
+> `gwConnLifecycle.qnt`.
+
+**Scope and baselines (a documented deviation from the §5 letter).** §5
+planned the overrides on the full-alphabet regime modules; the Stage-B
+B-measure showed those do not exhaust inside the per-check budget, so the
+falsification direction would have been fine (TLC stops at the first
+violation) but the matching baseline ("with the guard restored the
+violation disappears at the same scope") would not have been provable.
+Each override's `calibStep` therefore restricts the alphabet to its
+family's letters — the same single-rich-dimension principle as the wired
+`gwConnLifecycleFam*` checks — and the as-built baseline is an explicit
+`baselineStep` in the same file (same constants, same alphabet shape, the
+as-built action(s) restored) run to exhaustion. No §2e structural or
+environment bound is reduced, and the §2e policy-cap table's
+pre-registered override values are used where required (GW-6/GW-7 at
+`MAX_CHANNELS_PER_CONN = 1`, GW-12 at `MAX_CONNECTIONS = 1`). Verdict
+format: property @ depth (states generated / distinct); wall-clocks are
+from the same serial `quint verify --backend=tlc` protocol as the Stage-C
+check measurements (24–32 workers on the shared builder, ≈20–30 s of
+JVM/conversion overhead included in every figure).
+
+**Acceptance verdict (the §5 criterion, per corpus family).**
+"Calibrated" = the family falsifies its predicted property through at
+least one trace-walked representative, both directions where a T half
+exists, with the as-built baseline holding at the same scope.
+
+| Family | Verdict | Evidence |
+|---|---|---|
+| F1 capacity conservation | **calibrated** | GW-1 (V: L2), GW-12 (V: S1), GW-18 (V: S2; T: P1/P2/P3); GW-2's release-ordering member also lands in F1 via S15 |
+| F2 progress-bounded occupancy | **calibrated** | GW-3 (V: S20 + L1; constituent arm L3) |
+| F3 decision-to-enforcement | **calibrated** | GW-4 (V: S12); the 2f11bb8f5 constituent dispositioned by structural argument onto the wired l1-no-inactivity probe (note 2) |
+| F4 channel/session bookkeeping integrity | **calibrated** | GW-5 (V: S7), GW-6 (V: S7), GW-7 (V: S14) |
+| F5 egress flow control / bounded queues | **calibrated** | GW-2 (V: S15, L2; T: P5), GW-8 (V: S13) |
+| F6 teardown obligations | **calibrated** | GW-9 (V: S16, S10), GW-10 (V: S10), GW-11 (V: L8, S3), GW-20 (V: S19) |
+| F7 drain/shutdown ordering | **calibrated** | GW-13 (V: L4, S17; T: P6) |
+| F8 upload bounding & wire-position integrity | **pre-registered out-of-model (test-only)** | GW-14: the `wire_opcodes` upload tests (`opcodes_write.rs` — `test_add_multiple_streaming_early_ok_preserves_wire_position` is the fac58554b regression test, plus the multi-entry batch/mixed permissiveness tests) and `functional/nar_roundtrip.rs`; GW-15: store-side half owned by the store campaign, gateway permissiveness half by the same `wire_opcodes` multi-entry tests + `functional/nar_roundtrip.rs` (owner decision §8 Q5). Corrected at close-out: both halves were previously attributed to "golden-conformance" / "golden/integration" upload tests (wording inherited from design §3.4) — the golden-conformance suite has no upload tests; the dispositions themselves are unchanged |
+| F9 anti-hang deadlines on upstream waits | **calibrated** | GW-16 (V: L6); the budget-sizing members stay non-candidates per the corpus |
+| F10 accept-path availability | **calibrated** | GW-19 (V: S18) |
+| F11 session credential freshness | **pre-registered out-of-model (test-only)** | GW-17: `session_jwt_token_refreshes_per_access` + the I-129 regression tests (no clock in the model; owner decision §8 Q5) |
+| F12 result-integrity vs store | **out of corpus (pre-registered exclusion)** | not a lifecycle-machine family (corpus §3, design §1 out-of-scope table); coverage: the 85118ecdf / cb3f6bfbb output-verification paths and their build-result tests; a separate data-integrity model would own it if commissioned |
+| F13 adjacent state machines (scheduler-watch reconnect, STDERR framing, startup/readiness) | **out of corpus (pre-registered exclusion, §8 Q6)** | reconnect boundedness: `test_build_paths_reconnect_exhausted_returns_failure` + the C4 snapshot-resync tests (`test_build_paths_reconnect_snapshot_resumes_state`, `test_build_paths_reconnect_terminal_snapshot_short_circuits`) — see the WatchBuild environment-assumption row above for the C4 deletion note; STDERR framing: wire/golden conformance tests; startup/readiness: the vm-lifecycle scenarios |
+| F14 per-session ingress memory budget | **pre-registered out-of-model (test-only; named Phase-2 Kani candidate)** | GW-21: drv_cache cap unit tests (`MAX_TRANSITIVE_INPUTS`, `insert_drv_bounded`, the occupancy-aware gate tests) |
+
+No family is NOT MET: every encodable family (F1–F7, F9, F10) falsifies
+its predicted property through at least one trace-walked representative
+with the baseline holding at the same scope; the three T halves
+(GW-2/GW-13/GW-18) falsify their named permissiveness properties; the
+four OOM candidates (GW-14/15/17/21) carry their pre-registered
+dispositions. No falsification contradicted the §3.4 crosswalk (the one
+partial-prediction case, GW-1's S2/S3, falls through the predicted L2
+and is documented in note 1); no unlisted falsification of the as-built
+model surfaced (every baseline holds `allInvariants`); there is no
+stop-and-report item.

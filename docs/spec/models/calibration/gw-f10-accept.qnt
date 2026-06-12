@@ -3,8 +3,8 @@
 // Stage-C calibration override, gateway lifecycle family F10 (connection
 // accept-path availability): a transient accept(2) failure must not
 // terminate the accept loop or the process; only shutdown ends the
-// listener (gw-session corpus §3 F10, design §3.4 GW-19; verdicts in the
-// calibration table of docs/spec/models/gw-session-invariant-map.md). Same
+// listener (gw-session corpus §3 F10, design §3.4 GW-19; verdicts in
+// the VERDICT block at the end of this header). Same
 // extend-and-override pattern as gw-f1-capacity.qnt.
 //
 // Candidate carried by this file:
@@ -31,6 +31,20 @@
 // gwCalibF10AsBuilt.baselineStep (as-built acceptErrorTransient is a
 // retry; HOLDS).
 // =========================================================================
+//
+// VERDICT (Stage-C calibration, relocated from the retired gw-session
+// invariant map; scope/baseline protocol and the acceptance table:
+// calibration/README.md, gateway section; trace walks verbatim from the
+// Stage-C record):
+// - GW-19 gwCalibF10AcceptErrorFatal: FALSIFIES S18 @ 3 (82/24) — a
+//   transient accept error treated as fatal falls via the listener-death
+//   latch. Note: S18's content is latch-shaped (the as-built letter is a
+//   no-op by construction), so the override is necessarily a latch-setter;
+//   the pinned counterexample exits the process with a live connection up,
+//   making the structural consequence (the corpus's "all live sessions
+//   aborted", the L4 form) visible in the same trace (9b693441f).
+// - BASELINE: gwCalibF10AsBuilt (GW-19) 49,315 distinct / 44 s — HOLDS
+//   allInvariants.
 module gwCalibF10AcceptErrorFatal {
   import gwConnLifecycle(
     MAX_CONNECTIONS = 2,

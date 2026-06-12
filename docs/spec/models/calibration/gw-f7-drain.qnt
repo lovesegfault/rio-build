@@ -4,8 +4,7 @@
 // (drain/shutdown ordering): shutdown is staged — NOT_SERVING observable,
 // stop accepting, wait the session-drain window, cancel stragglers, then
 // exit — and established sessions are not killed before their window
-// (gw-session corpus §3 F7, design §3.4 GW-13; verdicts in the calibration
-// table of docs/spec/models/gw-session-invariant-map.md). Same
+// (gw-session corpus §3 F7, design §3.4 GW-13; verdicts in the VERDICT block at the end of this header). Same
 // extend-and-override pattern as gw-f1-capacity.qnt. The T half
 // re-introduces the over-tight pre-fix behavior (no drain window at all)
 // per design §5.
@@ -33,6 +32,25 @@
 // (as-built token observation reaches build-event-wait and exit requires
 // quiescence; HOLDS).
 // =========================================================================
+//
+// VERDICT (Stage-C calibration, relocated from the retired gw-session
+// invariant map; scope/baseline protocol and the acceptance table:
+// calibration/README.md, gateway section; trace walks verbatim from the
+// Stage-C record):
+// - GW-13 gwCalibF7DrainExpiryNoCancel (drain-expiry cancel): FALSIFIES L4
+//   @ 14 (408,403/11,417) — SIGTERM → accept-stop → drain expiry with a
+//   build parked in the build-event wait; the pre-fix token observation
+//   (opcode-read points only) never reaches it and the CANCEL_GRACE hard
+//   exit fires with the build still tracked and never cancelled
+//   (765671437).
+// - GW-13 gwCalibF7SigtermSkipsStages (stage collapse): FALSIFIES S17 @ 7
+//   (811/58) — SIGTERM with a live session takes the process straight down;
+//   the same state exits with live proto tasks (d653222cf / a6a5a77b9).
+// - GW-13 gwCalibF7AcceptStopKillsEstablished (T): FALSIFIES P6 @ 8
+//   (1,327/85) — accept-stop tears down an established connection with a
+//   live session (the pre-drain rollout behavior).
+// - BASELINE: gwCalibF7AsBuilt (GW-13 V+T) 3,337,595 distinct / 228 s —
+//   HOLDS allInvariants.
 module gwCalibF7DrainExpiryNoCancel {
   import gwConnLifecycle(
     MAX_CONNECTIONS = 2,

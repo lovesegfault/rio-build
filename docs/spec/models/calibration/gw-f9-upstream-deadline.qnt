@@ -4,7 +4,7 @@
 // deadlines on upstream waits): a protocol session never waits unboundedly
 // on the store or scheduler — every unary/store RPC await inside a session
 // carries a deadline (gw-session corpus §3 F9, design §3.4 GW-16; verdicts
-// in the calibration table of docs/spec/models/gw-session-invariant-map.md).
+// in the VERDICT block at the end of this header).
 // Same extend-and-override pattern as gw-f1-capacity.qnt. The calibration
 // target is the rpc-wait deadline 755f49744 added; the build-event wait is
 // deliberately deadline-free (design §2a) and is NOT part of this family's
@@ -29,6 +29,16 @@
 // Constants: famUpstream scope. Baseline: gwCalibF9AsBuilt.baselineStep
 // (as-built opcodeToRpcWait arms the deadline; HOLDS).
 // =========================================================================
+//
+// VERDICT (Stage-C calibration, relocated from the retired gw-session
+// invariant map; scope/baseline protocol and the acceptance table:
+// calibration/README.md, gateway section; trace walks verbatim from the
+// Stage-C record):
+// - GW-16 gwCalibF9RpcWaitNoDeadline: FALSIFIES L6 @ 10 (1,592/81) — an
+//   upstream RPC await issued without a deadline falls at the first un-
+//   deadlined rpc-wait entry (755f49744).
+// - BASELINE: gwCalibF9AsBuilt (GW-16) 1,204,287 distinct / 120 s — HOLDS
+//   allInvariants.
 module gwCalibF9RpcWaitNoDeadline {
   import gwConnLifecycle(
     MAX_CONNECTIONS = 2,

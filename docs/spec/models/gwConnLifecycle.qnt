@@ -4,8 +4,175 @@
 // lifecycle (campaign gw-session-formal, design gw-session-formal-design.md
 // DRAFT v2 §2-§3). One transport (the SSH listener), sessions as compound
 // nodes, the data plane abstracted to occupancy states. The invariant ↔
-// spec-rule linkage lives in docs/spec/models/gw-session-invariant-map.md;
-// check wiring and r[verify] markers live in nix/quint.nix, never here.
+// spec-rule linkage lives in the per-predicate Rule(s)/Carrier doc tags
+// (section 6 below); check wiring and r[verify] markers live in
+// nix/quint.nix, never here.
+//
+// ===========================================================================
+// CAMPAIGN CLOSE-OUT BANNER (gw-session-formal, Track B round 2; CLOSED at
+// Phase 0 on the design's "stop after Phase 0" arm, verify-only, 2026-05-30).
+// Relocated from the retired gw-session invariant map; this banner is the
+// campaign-level record (the closureEvidence archived-banner precedent). The
+// full original map text is in git history.
+//
+// THE VERDICT: the as-built gateway connection/channel/session/server
+// lifecycle is correct at the model's resolution — ZERO as-built defects,
+// zero code changes needed. Every §3 property (20 safety, 6 permissiveness,
+// 8 settlement) holds exhaustively over every wired per-family scope; the
+// only reachable violations are the four pre-registered documented windows
+// (W3/P4 admit race, W10 orphan bound, P12 panic carve-out, W7 degraded
+// tier), each falsifying exactly as predicted and each accepted with a
+// recorded bound; no unlisted falsification surfaced in any exhaustive run,
+// witness search, or calibration baseline; and the calibration record (the
+// gw-f*.qnt VERDICT blocks + the calibration/README.md acceptance section)
+// proves the invariant set re-finds all 17 encodable historical bug classes
+// (plus the three permissiveness halves) when their fixes are reverted.
+//
+// OWNER DECISIONS CLOSING THE CAMPAIGN (2026-05-29 design checkpoint, seven
+// Track-B decisions): B1 guard-held session accounting (S3/S4 stated against
+// guard-held; the W2 divergence is a stated bound, not a defect); B2
+// panics-in-envelope / SIGKILL-out; B3 scheduler-side cancel as a named
+// assumption; B4 conn-permit-at-accept as a fixed fact (exposure is the
+// GW-D4 alerting note); B5 GW-14/15/17/21 test-only; B6 corpus exclusions
+// ratified; B7 exit-path STDERR writes left unfixed (below the model's
+// abstraction). The 2026-05-30 Phase-0 checkpoint ratified the W2/W5/W7/W10
+// window dispositions with their recorded bounds and closed the campaign
+// verify-only: the W10 decision rule did not trigger (w10TriggerAbsent holds
+// over fam-upstream's 3.25 M states), the optional W7 hardening and
+// errors_total{setsockopt} label were not commissioned, the 1-3 small-fix
+// budget went unspent, and the two W10 pinning tests parked on the Phase-1
+// list land with no Phase 1 — they do not exist; W10's coverage is the wired
+// falsification probe plus the scheduler orphan-watcher assumption.
+//
+// COUNTER-SIGNATURES (close-out verification, workflow run wf_96638bed-4fb,
+// 2026-05-30; three independent verification slices re-derived this record's
+// claims from the artifacts — rebuilding checks, reading transcripts and
+// every cited test/marker site):
+//   - checks-vs-records (41 rows: every wired check vs the Stage-C and
+//     calibration tables — inventory, module/invariant/step/heap params,
+//     verdicts, state counts, costs; spot force-rebuilds): COUNTER-SIGNED;
+//     3 discrepancies (2 minor, 1 cosmetic) — measurement-snapshot variance
+//     and a rounding overstatement; no false claims.
+//   - acceptance-vs-corpus (18 rows: all 14 family rows + the owner-decision
+//     rows vs the corpus, all 9 override files, the named test coverage and
+//     the decision log): COUNTER-SIGNED-WITH-CORRECTIONS; 4 discrepancies
+//     (1 material, 1 minor, 2 cosmetic).
+//   - spec-markers-vs-reality (11 rows: the 7 campaign tracey rules, ~40
+//     marker sites read against cited code/tests, + the 4
+//     environment-assumption rows and wiring/validation claims):
+//     COUNTER-SIGNED-WITH-CORRECTIONS; 3 discrepancies (1 minor, 2
+//     cosmetic).
+// Aggregate: 70 rows, 10 discrepancies — 1 material (corrected in place), 4
+// minor, 5 cosmetic; no discrepancy affects any verdict. Spot-rebuild
+// evidence: 10 of the 40 checks force-rebuilt on a 192-core host across all
+// 5 kinds; exhaustive distinct-state counts reproduce EXACTLY (fam-preauth
+// 1,183 / fam-hostile 968,151 / fam-upstream 3,253,999 / fam-wedge 66,059);
+// witnesses, probes and calibration guards violate as recorded; the unwired
+// gwCalibF3AsBuilt baseline re-run HOLDS at exactly 1,183 distinct states
+// (the famPreauth structural cross-check).
+//
+// CORRECTIONS APPLIED AT CLOSE-OUT (record text only; code, model and
+// checks needed no changes): (1) MATERIAL — churn-pin provenance: the
+// inventory was mined at cccb4d778 but the corpus at origin/main dfe9a5569;
+// the four round-1 LogService cutover commits (1,313 insertions / 112
+// deletions across 14 rio-gateway files) sit between the two HEADs; none is
+// a lifecycle FIX/HARDENING commit, so no family, candidate or verdict is
+// affected. (2) minor — F8 coverage attribution corrected to the
+// wire_opcodes upload tests (opcodes_write.rs, incl. the fac58554b
+// regression test) + functional/nar_roundtrip.rs (the golden-conformance
+// suite has no upload tests). (3) minor — Stage-A commit hashes recorded
+// pre-rebase; on the integrated branch they are fd92fb873 / a9f3ee2bc /
+// a99314b20 / 56fc66ea4. (4) cosmetic — core-module line count ~2.0k;
+// ForceClose::arm_within lives in server/mod.rs, its arm-assertion tests in
+// connection.rs. NOTED, NOT CORRECTED: first-violation state counts and 4
+// of 13 measured falsification depths are TLC-worker-count and
+// parallel-BFS-race dependent (re-runs find equally valid counterexamples
+// at 2-5x different counts); rerun comparisons must use verdicts and
+// exhaustive counts, not first-violation statistics. The tracey impl list
+// for gw.conn.cancel-on-disconnect+3 carries one verb-less cross-reference
+// comment site (pre-existing); coverage is not overstated.
+//
+// ACCEPTED RESIDUALS (the GO's residue, ratified 2026-05-30):
+//   - W2 guard-vs-proto-task divergence: channels_active under-counts
+//     winding-down sessions <= ~30 s per session; structurally bounded.
+//     Pinned by witness-server-side-release; operator note GW-D2.
+//   - W5 half-open vanish occupancy: a vanished peer pins one conn permit
+//     (of 1000), one session permit (of 4096), the gauge slots, ~512 KiB of
+//     duplex buffers, possibly a NAR assembly buffer (<= 4 GiB,
+//     MAX_NAR_SIZE), and in-flight upstream work for ~300-330 s until the
+//     designed transport reap. Pinned by witness-vanish-reclaimed; GW-D3.
+//   - W7 degraded-tier reclamation: with TCP_USER_TIMEOUT setsockopt
+//     failed, parked-write reclamation degrades from ~305 s to the ~1 h
+//     inactivity backstop; the in-process-unbounded sliver (arming after
+//     both russh wakes are spent) is out of model. The gating premise (the
+//     setsockopt cannot fail on Linux/EKS) is deployment observable GW-D1.
+//     Pinned by falsification-l1-no-inactivity.
+//   - W10 non-Wire removal orphan: a non-Wire stream failure with a dead or
+//     absent client orphans a running build for up to ~300 s until the
+//     scheduler orphan watcher cancels it; the Phase-1 removal-predicate
+//     fix was NOT triggered (w10TriggerAbsent holds exhaustively). Pinned
+//     by falsification-s16-terminal-only.
+//   - Plus the two windows by design: the W3/P4 admit-vs-grace race
+//     (bounded by one grace cycle; pinned by l5-no-carve-out) and the P12
+//     handler-panic carve-out (pinned by s10-panic; backstopped by the
+//     orphan watcher).
+//   - Deferred full-regime exhaustive coverage: cross-family interleavings,
+//     conn-B concurrent full sessions, two concurrent egress/panic sessions
+//     on one connection, and the base-regime "everything legitimate at
+//     once" proof remain witness/named-run-pinned only (manual targets).
+//   - Out-of-model families on test-only coverage (B5/B6 ratified): F8
+//     (GW-14/15 upload bounding — wire_opcodes upload tests +
+//     functional/nar_roundtrip.rs; store half owned by the store campaign),
+//     F11 (GW-17 credential freshness — session_jwt refresh + I-129 tests),
+//     F14 (GW-21 ingress memory budget — drv_cache cap tests; named Phase-2
+//     kani candidate), F12/F13 (out of corpus).
+//   - Environment assumptions imported, not verified (a regression behind
+//     one is NOT caught by this campaign's checks) — the IMPORTED
+//     ASSUMPTIONS register below.
+//
+// WHAT THE CAMPAIGN DOES NOT CLAIM: no deployment, soak or canary
+// validation exists (no cluster was ever involved); every figure is a
+// model, test or CI measurement. Exhaustive verdicts hold at the §2e bounds
+// (2 conns, 2 channel slots on conn A, queue depth 2, window credits 2,
+// residue ceiling 2, <=1 tracked build) under restricted per-family
+// alphabets; full-alphabet regimes are witness/probe-pinned, not exhausted.
+// Nothing is machine-proved at the code level (no kani harness exists for
+// any gateway path); the model-code coupling is the calibration corpus plus
+// the tracey marker discipline, not refinement. SIGKILL, the data plane
+// (upload framing, NAR streaming, STDERR), credential freshness, and the
+// adjacent state machines are outside the verified envelope.
+//
+// IMPORTED ASSUMPTIONS REGISTER (the model imports these rather than
+// verifying them; each is owned by another campaign or existing tests):
+//   - Scheduler orphan-watcher backstop: a build whose gateway-side watcher
+//     is gone (skipped cancel on a handler panic, SIGKILL, or the non-wire
+//     removal heuristic guessing wrong) is auto-cancelled by the scheduler
+//     once it has no attached watcher (sched.backstop.orphan-watcher;
+//     rio-scheduler actor/housekeeping.rs 300 s sweep). Relied on by: S10
+//     (panic-regime weakening), S16 / the W10 disposition, the GW-D5
+//     SIGKILL note. Owner: the scheduler campaign.
+//   - WatchBuild reconnect residual: the in-opcode build-event-wait state
+//     has no deadline by design; the model assumes the WatchBuild reconnect
+//     loop is finitely bounded (MAX_RECONNECT = 10, capped backoff ~111 s).
+//     C4 update (2026-05-31): the resumability layer (since_sequence
+//     cursor, event-log replay, dedup) was deleted in favor of
+//     snapshot-first attach — the unverified surface shrank to the
+//     reconnect loop + snapshot consumption; the boundedness assumption is
+//     unchanged. Coverage: test_build_paths_reconnect_exhausted_returns_
+//     failure + the snapshot-resync tests (wire_opcodes/build.rs). L6 is
+//     scoped to rpc-wait only because of this.
+//   - Scheduler stream silent forever with a live client: an accepted build
+//     whose BuildEvent stream stays open and silent parks the session in
+//     build-event-wait until a terminal event, a transport-reap letter, or
+//     shutdown (process_build_events has no timeout arm) — a design
+//     assumption; relied on by the §2a abstraction-loss table and the W5
+//     occupancy bound.
+//   - ForceClose earliest-deadline-wins arithmetic: the numeric "earliest
+//     wins / never moves later" half of S11 has no observable negation in a
+//     tick-free model; coverage is the fetch_min implementation
+//     (ForceClose::arm_within, server/mod.rs) + the arm assertions in the
+//     stalled-send / window-starved unit tests (server/connection.rs).
+// ===========================================================================
 //
 // WHAT IS MODELED (design §2a/§2b/§2c)
 //   - Two connection slots with fixed asymmetric roles: "cA" plays the
@@ -316,6 +483,7 @@ module gwConnLifecycle {
   /// pre-registered state-space fallback (2) — "drop conn B's channel count
   /// to 1 in that regime" — kept as a constant so a regime can apply the
   /// fallback without touching the transition relation.
+  // MODEL-DIVERGENCE(law=gw.conn.channel-limit+4; tree=docs/spec/models/gwConnLifecycle.qnt:regime instantiations): B_CHANNEL_SLOTS is a model constant absent from the design's §2e constants table, added purely to make fallback (2) a per-regime instantiation choice instead of a model edit — retarget-by: the design's constants table absorbing the fallback knob.
   const B_CHANNEL_SLOTS: int
 
   /// Regime alphabet switches (§2e regime definitions).
@@ -621,6 +789,8 @@ module gwConnLifecycle {
   /// permit-less (over-cap) connection is torn down at its first auth
   /// callback. Reaching that callback permit-less is the legitimate
   /// over-cap path and does not violate.
+  /// Rule(s): gw.conn.cap, gw.conn.real-connection-marker. Carrier:
+  /// famPreauth + famCap (over-cap clause).
   val s1ConnPermitConservation = and {
     srv.connPermits == CONNS.filter(c => conn(c).exists and conn(c).permit).size(),
     srv.connPermits <= MAX_CONNECTIONS,
@@ -634,6 +804,8 @@ module gwConnLifecycle {
 
   /// S2 SessionPermitConservation: held session permits equal live
   /// SessionGuards and never exceed the session cap.
+  /// Rule(s): gw.conn.session-cap+2. Carrier: all (global arithmetic);
+  /// content-deepest famAdmission/famUpstream.
   val s2SessionPermitConservation = and {
     srv.sessPermits == heldGuards,
     srv.sessPermits <= MAX_SESSIONS
@@ -642,6 +814,8 @@ module gwConnLifecycle {
   /// S3 GaugeAccuracy: connections_active counts connections that reached
   /// an auth callback and have not dropped; channels_active equals live
   /// SessionGuards (the guard-held definition of "session").
+  /// Rule(s): gw.conn.real-connection-marker, gw.conn.session-cap+2. Carrier:
+  /// all; content-deepest famAdmission/famUpstream.
   val s3GaugeAccuracy = and {
     srv.connsActive == CONNS.filter(c => conn(c).exists and conn(c).counted and conn(c).live).size(),
     srv.chansActive == heldGuards
@@ -650,6 +824,8 @@ module gwConnLifecycle {
   /// S4 PerConnLiveCount: each connection's live_sessions equals its live
   /// SessionGuards, up to the increment leaked by the exec-gate panic
   /// splitter (the documented fault-letter weakening).
+  /// Rule(s): gw.conn.exit-status+3 (grace/live-count pairing). Carrier:
+  /// famAdmission (+ panic term famDegraded).
   val s4PerConnLiveCount =
     CONNS.forall(c => conn(c).liveSess == connGuards(c) + (if (conn(c).live) conn(c).panicLeaks else 0))
 
@@ -657,16 +833,22 @@ module gwConnLifecycle {
   /// transport has ended, none of its sessions still holds a SessionGuard;
   /// the proto tasks' own exits (after at most the cancel obligation) are
   /// armed by construction and pinned by the teardown witnesses.
+  /// Rule(s): gw.conn.cancel-on-disconnect+3, gw.conn.lifecycle. Carrier: all
+  /// teardown families (famWedge/famUpstream/famDrain).
   val s5NoSessionOutlivesConnection =
     CONNS.forall(c => (conn(c).exists and not(conn(c).live)) implies CHANS.forall(i => not(sessAt(c, i).guard)))
 
   /// S6 SingleExecPerChannel: a channel's write half is consumed by at most
   /// one admitted exec, ever.
+  /// Rule(s): gw.conn.exec-request, gw.conn.per-channel-state. Carrier:
+  /// famAdmission/famHostile.
   val s6SingleExecPerChannel = CHKEYS.forall(k => chans.get(k).execs <= 1)
 
   /// S7 ChannelAccounting: open_channels equals the accepted-and-open set,
   /// stays within the per-connection bound, and execs are admitted only on
   /// accepted, currently-open channels.
+  /// Rule(s): gw.conn.channel-limit+4, gw.conn.per-channel-state. Carrier:
+  /// famHostile.
   val s7ChannelAccounting = and {
     CONNS.forall(c => and {
       conn(c).openCh == CHANS.filter(i => chanAt(c, i).ch == ChAccepted).size(),
@@ -679,10 +861,13 @@ module gwConnLifecycle {
   /// splitter never strands an acquired permit (no permit held with no
   /// guard and no admission in progress). Outside the panic regime the
   /// content is subsumed by S2/S9 (design scope note).
+  /// Rule(s): gw.conn.exec-request. Carrier: famDegraded (panic splitter).
   val s8RejectReleasesCapacity = not(viol.permitStranded)
 
   /// S9 SingleRelease: no permit, gauge slot, live-count or map entry is
   /// released twice — no negative counters, no double-release latch.
+  /// Rule(s): gw.conn.session-cap+2, gw.conn.cap. Carrier: all (shares S2/S3
+  /// content).
   val s9SingleRelease = and {
     not(viol.doubleRelease),
     srv.connPermits >= 0, srv.sessPermits >= 0, srv.connsActive >= 0, srv.chansActive >= 0,
@@ -695,6 +880,8 @@ module gwConnLifecycle {
   /// still tracked, a CancelBuild attempt was made before the proto task
   /// ended (cancel_active_builds). The panic carve-out is the documented
   /// weakening; S10-strict in §6c is the probe.
+  /// Rule(s): gw.conn.cancel-on-disconnect+3. Carrier: famUpstream/famDrain
+  /// (panic carve-out famDegraded).
   val s10CancelOnSessionEnd =
     CHKEYS.forall(k =>
       (sessOf(k).exists and sessOf(k).proto == PExited and sessOf(k).exitR != RPanic and sessOf(k).tracked)
@@ -705,6 +892,8 @@ module gwConnLifecycle {
   /// peer (latches; the as-built guards keep them false). Expiry only ever
   /// follows arming. The numeric earliest-deadline-wins half lives in the
   /// ForceClose fetch_min unit tests, not the model.
+  /// Rule(s): gw.conn.force-close. Carrier: famPreauth (grace/pre-auth arms)
+  /// + famWedge (stall arm) + famDegraded (park ordering).
   val s11ForceCloseArmedSticky = and {
     not(viol.fcDisarmed),
     not(viol.deliveredAfterExpiry),
@@ -714,6 +903,8 @@ module gwConnLifecycle {
   /// S12 DecideImpliesArmed: whenever a polite disconnect is queued
   /// (auth-timeout, empty-grace), the force-close is armed at the same
   /// decision point.
+  /// Rule(s): gw.conn.force-close. Carrier: famPreauth + famWedge +
+  /// famDegraded (with S11).
   val s12DecideImpliesArmed = CONNS.forall(c => conn(c).discQ implies conn(c).fcArmed)
 
   /// S13 WindowPacedEgress: data handed to russh never exceeds the
@@ -721,6 +912,8 @@ module gwConnLifecycle {
   /// unbounded pendingData path is never used and the queue stays within
   /// its depth, so egress buffering is bounded independent of response
   /// size.
+  /// Rule(s): gw.conn.session-cap+2 (window-pacing clause). Carrier:
+  /// famWedge.
   val s13WindowPacedEgress = and {
     CHKEYS.forall(k => chans.get(k).pending == 0),
     CONNS.forall(c => conn(c).queue <= QUEUE_DEPTH)
@@ -729,12 +922,16 @@ module gwConnLifecycle {
   /// S14 RusshResidueBounded: hidden russh channel-table residue stays
   /// within the policy bound — any open that would grow it past the bound
   /// (over-bound or non-session) terminates the connection instead.
+  /// Rule(s): gw.conn.channel-limit+4, gw.conn.channel-types. Carrier:
+  /// famHostile.
   val s14RusshResidueBounded = CONNS.forall(c => conn(c).residue <= RESIDUE_BOUND)
 
   /// S15 ReleaseBeforeCloseOut: capacity release (guard drop) precedes the
   /// close-out sends — a session in its close-out phase never still holds
   /// its guard, so release never depends on the peer accepting the
   /// close-out or on the handle queue draining.
+  /// Rule(s): gw.conn.send-deadline, gw.conn.exit-status+3. Carrier:
+  /// famWedge/famUpstream.
   val s15ReleaseBeforeCloseOut =
     CHKEYS.forall(k => (sessOf(k).exists and sessOf(k).eg == EgCloseOut) implies not(sessOf(k).guard))
 
@@ -742,6 +939,8 @@ module gwConnLifecycle {
   /// only when a terminal outcome was processed or the stream error class
   /// was non-Wire (the documented trade-off); never merely because the
   /// session is ending. The strict variant in §6c is the W10 probe.
+  /// Rule(s): gw.conn.cancel-on-disconnect+3 (tracking-policy clause).
+  /// Carrier: famUpstream.
   val s16TrackedBuildPolicy =
     CHKEYS.forall(k => (sessOf(k).everTracked and not(sessOf(k).tracked))
       implies (sessOf(k).terminal or sessOf(k).nonWireErr))
@@ -749,6 +948,7 @@ module gwConnLifecycle {
   /// S17 DrainStageOrder: the shutdown stages advance only in order
   /// (NOT_SERVING ≺ accept-stop ≺ sessions-done/expiry ≺ cancel ≺ exit)
   /// and accept-stop terminates no established connection or session.
+  /// Rule(s): gw.drain.three-stage, gw.conn.session-drain. Carrier: famDrain.
   val s17DrainStageOrder = and {
     not(viol.drainOrderViolated),
     not(viol.acceptStopKilled)
@@ -756,11 +956,14 @@ module gwConnLifecycle {
 
   /// S18 ListenerSurvivesAcceptErrors: transient accept errors (EMFILE
   /// class) never stop the accept loop or the process.
+  /// Rule(s): gw.conn.accept-resilience. Carrier: famUpstream (EMFILE letter;
+  /// latch-only — the as-built letter is a no-op by construction).
   val s18ListenerSurvivesAcceptErrors = not(viol.listenerDied)
 
   /// S19 CloseOutOrder: the close-out attempts exit-status before eof
   /// before close; delivery is best-effort and bounded by the close-out
   /// budget (S15/L2 carry the budget half).
+  /// Rule(s): gw.conn.exit-status+3. Carrier: famWedge/famUpstream.
   val s19CloseOutOrder = CHKEYS.forall(k => and {
     sessOf(k).coEof implies sessOf(k).coStatus,
     sessOf(k).coClose implies sessOf(k).coEof
@@ -771,6 +974,8 @@ module gwConnLifecycle {
   /// not activity), and a live healthy authenticated connection with zero
   /// live sessions whose grace has not fired has it armed (or mid-check).
   /// Admission disarms it.
+  /// Rule(s): gw.conn.exit-status+3 (grace clause). Carrier:
+  /// famPreauth/famAdmission.
   val s20GraceArmedExactlyWhenEmpty = CONNS.forall(c => and {
     (conn(c).grace == GArmed) implies and {
       conn(c).stage == CAuthed or conn(c).stage == CChanOpen,
@@ -789,21 +994,26 @@ module gwConnLifecycle {
   /// P1 MuxFanOutAdmitted: a single connection with in-bounds channel count
   /// gets every exec admitted while global capacity remains — no
   /// per-connection refusal below the global cap.
+  /// Rule(s): gw.conn.session-cap+2 (exec-only rejection). Carrier:
+  /// famAdmission.
   val p1MuxFanOutAdmitted = not(viol.execRefusedBelowCap)
 
   /// P2 SurvivesSessionCountZero: a connection whose live-session count
   /// touches zero is not disconnected before the grace fires.
+  /// Rule(s): gw.conn.exit-status+3 (grace clause). Carrier: famAdmission.
   val p2SurvivesSessionCountZero = not(viol.disconnectOnTouchZero)
 
   /// P3 CapRejectsExecOnly: capacity exhaustion is signaled by exec
   /// rejection (channel_failure + exit-status) only — never by refusing the
   /// channel open, never by terminating the connection.
+  /// Rule(s): gw.conn.session-cap+2. Carrier: famHostile.
   val p3CapRejectsExecOnly = not(viol.capRefusedOpenOrConn)
 
   /// P4 WithinGraceExecSurvives: a connection that admits an exec before
   /// the grace re-check passes is not disconnected by that grace cycle (the
   /// post-check admit window is the documented W3 race, carved out — see
   /// the L5-strict probe).
+  /// Rule(s): gw.conn.exit-status+3 (grace clause). Carrier: famAdmission.
   val p4WithinGraceExecSurvives = not(viol.gracePreCheckAdmitKilled)
 
   /// P5 CompliantPeerNotForceClosed: against a connection whose peer has
@@ -812,6 +1022,9 @@ module gwConnLifecycle {
   /// is armed by a budget site, and no well-formed exec is rejected below
   /// the global cap. (The empty grace may still fire on an idle compliant
   /// connection — that is the as-built design, not a wedge response.)
+  /// Rule(s): gw.conn.force-close, gw.conn.send-deadline,
+  /// gw.conn.keepalive+2. Carrier: famPreauth/famWedge (+ the compliant named
+  /// run).
   val p5CompliantPeerNotForceClosed = and {
     not(viol.budgetFiredOnCompliant),
     not(viol.timerReapedCompliant),
@@ -822,6 +1035,7 @@ module gwConnLifecycle {
   /// P6 EstablishedSurviveAcceptStop: stopping the accept loop (drain stage
   /// 2) terminates no established connection or session before the drain
   /// window elapses.
+  /// Rule(s): gw.drain.three-stage. Carrier: famDrain.
   val p6EstablishedSurviveAcceptStop = not(viol.acceptStopKilled)
 
   // -- 6a.4 settlement (L1-L8): armed-style state invariants --
@@ -831,6 +1045,10 @@ module gwConnLifecycle {
   /// designed reclamation path armed/enabled for its current stage; the
   /// inactivity backstop is acceptable only where the regime admits the
   /// letter (fault-degraded — the W7 degraded tier).
+  /// Rule(s): gw.conn.force-close, gw.conn.keepalive+2, gw.conn.exit-
+  /// status+3. Carrier: famPreauth (occupancy) + famWedge (transport) +
+  /// famDegraded (inactivity tier).
+  // MODEL-DIVERGENCE(law=gw.conn.force-close; tree=rio-gateway/src/server/connection.rs:reclamation paths): L1's armed-path semantics — stage deadlines and graces count when ARMED (their fire guards protect permissiveness); reap letters and force-close enforcement count when ENABLED; the empty grace re-arms at guard release (S20), which keeps L1 designed-only outside the degraded regime — retarget-by: a change to which reclamation paths exist or their arming discipline.
   val l1ConnReclaimArmed =
     CONNS.forall(c => (conn(c).exists and conn(c).live and conn(c).liveSess == 0)
       implies reclaimPathArmed(c, true))
@@ -840,6 +1058,7 @@ module gwConnLifecycle {
   /// the capacity already released or a send/close-out budget, an
   /// enforceable force-close, or the pump's own exit armed for it — release
   /// never requires a further peer letter (the wedge response).
+  /// Rule(s): gw.conn.send-deadline. Carrier: famWedge.
   val l2SendSettleArmed = CHKEYS.forall(k =>
     (sessOf(k).exists and or {
       sessOf(k).proto == PExited,
@@ -857,6 +1076,7 @@ module gwConnLifecycle {
   /// handshake deadline armed; a session idle between opcodes has the
   /// opcode-idle deadline armed. Firing exits the occupancy (witness
   /// pinned).
+  /// Rule(s): gw.handshake.timeout, gw.conn.lifecycle. Carrier: famAdmission.
   val l3PreSessionOccupancyArmed = CHKEYS.forall(k => and {
     (sessOf(k).exists and sessOf(k).proto == PHandshaking) implies sessOf(k).hsArmed,
     (sessOf(k).exists and sessOf(k).proto == PReady) implies sessOf(k).idleArmed
@@ -868,6 +1088,8 @@ module gwConnLifecycle {
   /// without further client traffic" half is by construction (the fired
   /// token enables every proto's observe action) and is pinned by the
   /// drain named run.
+  /// Rule(s): gw.drain.three-stage, gw.conn.session-drain. Carrier: famDrain.
+  // MODEL-DIVERGENCE(law=gw.conn.session-drain; tree=rio-gateway/src/main.rs:drain stages): L4 is encoded as the exit-quiescence clause; the per-stage "shutdown path enabled" obligations hold by construction in this encoding (the fired token enables every proto's observe action) and are pinned by the drain named run — retarget-by: a drain-stage change that decouples the fired token from the proto observe actions.
   val l4DrainObligationsArmed =
     (srv.phase == SrvExited) implies and {
       liveProtos == 0,
@@ -878,12 +1100,15 @@ module gwConnLifecycle {
   /// L5 GraceNeverKillsLiveSession: the grace disconnect is never taken in
   /// a state with a live SessionGuard outside the documented post-check
   /// admit race (the carve-out); the un-carved form is the §6c probe.
+  /// Rule(s): gw.conn.exit-status+3 (grace clause). Carrier: famAdmission.
   val l5GraceNeverKillsLiveSession = not(viol.graceKilledLiveSession)
 
   /// L6 RpcWaitDeadlineArmed: every session in in-opcode-rpc-wait has that
   /// wait's upstream deadline armed (every unary/store RPC await carries a
   /// deadline — the F9 surface). Deliberately NOT claimed for
   /// in-opcode-build-event-wait, which has no deadline by design.
+  /// Rule(s): gw.conn.cancel-on-disconnect+3 (timeout-wrapped upstream
+  /// calls), gw.store.transient-retry. Carrier: famUpstream.
   val l6RpcWaitDeadlineArmed =
     CHKEYS.forall(k => (sessOf(k).exists and sessOf(k).proto == POpRpc) implies sessOf(k).rpcDl)
 
@@ -891,6 +1116,7 @@ module gwConnLifecycle {
   /// exited and its finish/abort has run, the per-build upstream-stream
   /// bit is cleared — the obligation is discharged by session exit itself,
   /// with no peer letter (the W10 decision-rule observable).
+  /// Rule(s): gw.conn.cancel-on-disconnect+3. Carrier: famUpstream.
   val l7UpstreamStreamReleasedOnExit =
     CHKEYS.forall(k =>
       (sessOf(k).exists and sessOf(k).proto == PExited
@@ -904,6 +1130,8 @@ module gwConnLifecycle {
   /// by construction in the as-built encoding (every non-EgDone egress
   /// state has one), so the reap omission is what a calibration override
   /// breaks.
+  /// Rule(s): gw.conn.lifecycle, gw.conn.per-channel-state. Carrier:
+  /// famUpstream/famWedge.
   val l8SessionTaskQuiescence =
     CHKEYS.forall(k =>
       (sessOf(k).exists and sessOf(k).proto == PExited and sessOf(k).eg == EgDone)
@@ -1126,6 +1354,7 @@ module gwConnLifecycle {
   /// accepted, its write half is registered, open_channels increments.
   /// ConnStage moves to ChannelOpen when the callback is invoked. Channel
   /// opens are NOT activity for the empty-connection grace.
+  // MODEL-DIVERGENCE(law=gw.conn.channel-limit+4; tree=rio-gateway/src/server/connection.rs:channel table): channel slots are use-once (a closed slot is not reused); over-bound and non-session open attempts need no free slot, so the §2e attempt letters stay enabled at the structural ceiling — retarget-by: a channel-table change that reuses slot identities within a connection's lifetime.
   action peerOpenChannel(c: str, i: int): bool = all {
     conn(c).exists, conn(c).live, not(conn(c).kex), not(conn(c).herr), not(conn(c).expired), not(conn(c).discQ),
     conn(c).stage == CAuthed or conn(c).stage == CChanOpen,
@@ -1224,6 +1453,7 @@ module gwConnLifecycle {
   /// held permit is released by unwind (never stranded — S8); the
   /// live_sessions increment leaks until connection teardown (S4's panic
   /// term); the handler error tears the connection down.
+  // MODEL-DIVERGENCE(law=gw.conn.exec-request; tree=rio-gateway/src/session.rs:exec gate): the exec-gate panic splitter lands after session_admitted (live-count incremented, grace disarmed, write half taken) and before the gauge bump/guard creation — the only fallible/awaitable site in the gate per the W1/W2 review evidence — so S3 stays exact and S4 carries the documented panic term — retarget-by: an exec-gate change that adds a fallible await elsewhere in the gate.
   action execGatePanic(c: str, i: int): bool = all {
     c == ADV, LET_PANIC,
     conn(c).exists, conn(c).live, not(conn(c).kex), not(conn(c).herr), not(conn(c).expired), not(conn(c).discQ),
@@ -1429,6 +1659,7 @@ module gwConnLifecycle {
   /// The protocol handshake timeout fires (30 s class): only pre-handshake,
   /// never against a compliant peer (its handshake letter completes first,
   /// §2d).
+  // MODEL-DIVERGENCE(law=gw.handshake.timeout; tree=rio-gateway/src/server/connection.rs:stage deadlines): the stage-deadline fire guards (pre-auth, handshake, opcode-idle) are keyed on "peer not in the compliant class" rather than the §2d occupancy-letter enumeration, so transport-withholding-only peers stay reapable by their stage deadline; the compliant-class exclusion (the load-bearing half) is exact — retarget-by: a §2d enumeration change for the stage-deadline rows.
   action fireHandshakeTimeout(c: str, i: int): bool = all {
     sessAt(c, i).exists, sessAt(c, i).proto == PHandshaking, sessAt(c, i).hsArmed,
     not(compliant(c)),
@@ -1466,6 +1697,7 @@ module gwConnLifecycle {
   /// (SessionSink on ChannelWriteHalf): one credit consumed, the data is
   /// delivered into russh's bounded machinery — never the unbounded
   /// pendingData path (S13).
+  // MODEL-DIVERGENCE(law=gw.conn.session-cap+2; tree=rio-gateway/src/session.rs:egress pump): egress is decoupled — window credits pace data sends (the GW-8 surface) while the handle queue carries close-out/disconnect deliveries and write-park mechanics (the GW-2/W7 surface); their cross-coupling adds state without property content — retarget-by: an egress change that couples data pacing to the handle queue.
   action pumpSendOk(c: str, i: int): bool = all {
     sessAt(c, i).exists, sessAt(c, i).eg == EgFwd,
     sessAt(c, i).proto == PHandshaking or sessAt(c, i).proto == POpEmit,
@@ -1814,6 +2046,7 @@ module gwConnLifecycle {
   /// the force-close armed at the same decision point (S12). An admission
   /// that lands between the re-check and this step is the documented
   /// W3/P4 race (the carve-out); the strict no-carve-out probe latches it.
+  // MODEL-DIVERGENCE(law=gw.conn.exit-status+3; tree=rio-gateway/src/server/connection.rs:empty-connection grace): the empty-grace fire carries no compliant-class exclusion (per the §2d table) — an idle compliant connection is grace-disconnected exactly as in production; P5 is therefore encoded over the budget/reap/cap latches and budget-armed force-close sites, not over the grace — retarget-by: a grace-fire change that exempts compliant peers.
   action graceFire(c: str): bool = all {
     conn(c).exists, conn(c).live, conn(c).grace == GChecked,
     not(conn(c).herr), not(conn(c).expired),
@@ -1830,6 +2063,7 @@ module gwConnLifecycle {
   /// writes start failing; a parked write is woken only if its enforcement
   /// wake was registered (force-close armed before the park) — the W7
   /// ordering bit. After expiry no bytes are accepted or delivered (S11).
+  // MODEL-DIVERGENCE(law=gw.conn.force-close; tree=rio-gateway/src/server/connection.rs:ForceClose enforcement): enforcement reaches a parked write only if the force-close was armed when the write parked (the parkWake bit) — the design's enforcement-once-armed letter taken literally makes the W7 degraded tier unreachable; the leftover-wake sliver stays out of model exactly as §2a scopes it — retarget-by: an enforcement-path change that wakes parked writes unconditionally.
   action fireForceCloseEnforce(c: str): bool = all {
     conn(c).exists, conn(c).live, conn(c).fcArmed, not(conn(c).expired),
     or { not(conn(c).parked), conn(c).parkWake },
@@ -1842,6 +2076,7 @@ module gwConnLifecycle {
   /// gauge slot, channel bookkeeping and any still-held SessionGuards are
   /// released through the normal drop path; proto tasks keep running and
   /// exit via their own observation actions.
+  // MODEL-DIVERGENCE(law=gw.conn.keepalive+2; tree=rio-gateway/src/server/mod.rs:TCP_USER_TIMEOUT): the kernel reap fires on the peer-class form (vanished peers and transport-withholding peers with an undeliverable write outstanding, never the compliant class), not the §2d table's literal ACK-exclusion — the literal exclusion makes the §4 W7 ~305 s tier unreachable and leaves the transport wedge with no designed reclamation — retarget-by: a re-specification of the TCP_USER_TIMEOUT enabling class in the keepalive/reap rule or the W7 tier.
   action reapTransportEnd(c: str, letter: ReapLetter): bool = all {
     conn(c).exists, conn(c).live,
     match letter {
@@ -1883,6 +2118,7 @@ module gwConnLifecycle {
   /// A transient accept error (EMFILE/ENFILE class): classified RetryAfter,
   /// the loop sleeps and retries — the listener never leaves the accepting
   /// state (S18).
+  // MODEL-DIVERGENCE(law=gw.conn.accept-resilience; tree=rio-gateway/src/server/mod.rs:accept loop): S18 has no dedicated reachability witness — the EMFILE letter is a no-op by construction; its content is the listener-death latch plus the GW-19 calibration (gw-f10-accept.qnt) — retarget-by: an accept-loop change that makes transient accept errors observable in connection state.
   action acceptErrorTransient: bool = all {
     LET_UPSTREAM,
     or { srv.phase == SrvServing, srv.phase == SrvNotServing },
@@ -1920,6 +2156,7 @@ module gwConnLifecycle {
   /// every proto task has exited (the CANCEL_GRACE hard-exit with
   /// stragglers is wall-clock behavior below this abstraction; SIGKILL is
   /// outside the verified envelope).
+  // MODEL-DIVERGENCE(law=gw.drain.three-stage; tree=rio-gateway/src/main.rs:shutdown): process exit is modeled as enabled only at full quiescence (no counted connections, no live proto tasks); the real CANCEL_GRACE hard-exit with stragglers is wall-clock behavior below the tick-free abstraction (and SIGKILL is outside the envelope per owner decision B2) — retarget-by: a shutdown-path change that exits with counted occupancy by design.
   action srvExit: bool = all {
     or { srv.phase == SrvAcceptStopped, srv.phase == SrvTokenFired },
     srv.connsActive == 0,
@@ -2312,7 +2549,7 @@ module gwConnLifecycleBaseSlim {
 // no §3.4 candidate's required structural slot is removed — the loss
 // relative to the full regimes is the cross-family / B-side-session /
 // (where noted) second-concurrent-session interleavings only, recorded per
-// property in gw-session-invariant-map.md (Stage-C record). The
+// property in the section-6 Carrier doc tags. The
 // full-alphabet regime modules above stay as the home of the witness /
 // expect-violation / named-run checks (which stop at first violation) and
 // of the Stage-C calibration overrides.

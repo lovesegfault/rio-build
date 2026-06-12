@@ -5,8 +5,7 @@
 // cancels every build the session started, reaps the session's tasks and
 // sends the ordered close-out, and no teardown mechanism may drop those
 // obligations (gw-session corpus §3 F6, design §3.4 GW-9/GW-10/GW-11/GW-20;
-// verdicts in the calibration table of
-// docs/spec/models/gw-session-invariant-map.md). Same extend-and-override
+// verdicts in the VERDICT block at the end of this header). Same extend-and-override
 // pattern as gw-f1-capacity.qnt.
 //
 // Candidates carried by this file:
@@ -34,6 +33,39 @@
 // Constants: famUpstream scope. Baseline: gwCalibF6AsBuilt.baselineStep
 // (as-built keep-on-Wire policy; HOLDS).
 // =========================================================================
+//
+// VERDICT (Stage-C calibration, relocated from the retired gw-session
+// invariant map; scope/baseline protocol and the acceptance table:
+// calibration/README.md, gateway section; trace walks verbatim from the
+// Stage-C record):
+// - GW-9 gwCalibF6WireErrorRemovesTracked (tracking cleared early):
+//   FALSIFIES S16 @ 11 (6,966/403) — a tracked build's stream fails with a
+//   Wire-class error and the pre-fix handler removes it from
+//   active_build_ids anyway (bbf30cc7f: the disconnect cleanup loop later
+//   finds an empty set).
+// - GW-9 gwCalibF6ExitEdgeSkipsCancel (exit edge): FALSIFIES S10 @ 12
+//   (14,698/723) — a non-panic exit edge skips the cancel loop with a build
+//   still tracked (the 0f476d6f0 / a207ee15c case-completeness shape).
+// - GW-10 gwCalibF6AbortWinsOverCancel: FALSIFIES S10 @ 11 (4,599/277) —
+//   channel close hard-aborts the protocol task (the pre-fix
+//   ChannelSession::Drop abort); the cancel obligation is destroyed with
+//   it. GW-9's exit-edge arm and GW-10 falsify the same property through
+//   different reverted mechanisms (a missing call site vs an abort racing
+//   the cancel loop) — not the §1 simplification trigger.
+// - GW-11 gwCalibF6FinishSkipsPumpReap (task quiescence): FALSIFIES L8 @ 14
+//   (77,880/3,536) — the close-out completes but the pre-fix finish awaits
+//   the client pump instead of reaping it (1cca275b4).
+// - GW-11 gwCalibF6ConnDropLeaksGauge (gauge, 9a18f756a): FALSIFIES S3 @ 7
+//   (965/100) — a connection drop tears down a still-held SessionGuard but
+//   the pre-fix path never decrements channels_active; S2 stays true on the
+//   same trace (the permit release is correct), so the falsification is
+//   attributable to the gauge alone.
+// - GW-20 gwCalibF6CloseOutSkipsExitStatus: FALSIFIES S19 @ 10 (3,467/222)
+//   — the close-out ladder starts at eof (24bd41581); V-only per the §3.4
+//   row (the client-side hang is environment, not modeled).
+// - BASELINE: gwCalibF6AsBuilt (GW-9, GW-10, GW-11, GW-20) 3,253,999
+//   distinct / 224 s — HOLDS; reachability-equivalent to famUpstream
+//   (3,253,999 — exact structural cross-check).
 module gwCalibF6WireErrorRemovesTracked {
   import gwConnLifecycle(
     MAX_CONNECTIONS = 2,

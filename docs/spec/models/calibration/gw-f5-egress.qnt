@@ -6,7 +6,7 @@
 // budget, a send still pending at the budget is treated as a dead
 // transport, and capacity release never depends on the peer draining the
 // close-out (gw-session corpus §3 F5, design §3.4 GW-2/GW-8; verdicts in
-// the calibration table of docs/spec/models/gw-session-invariant-map.md).
+// the VERDICT block at the end of this header).
 // Same extend-and-override pattern as gw-f1-capacity.qnt. The GW-2
 // trace-admission (T) half re-introduces the over-tight budget per design
 // §2d/§5: the override removes the peer-class enabling condition, the
@@ -34,6 +34,33 @@
 // Constants: famWedge scope. Baseline: gwCalibF5AsBuilt.baselineStep
 // (as-built guard-drop-first ordering; HOLDS).
 // =========================================================================
+//
+// VERDICT (Stage-C calibration, relocated from the retired gw-session
+// invariant map; scope/baseline protocol and the acceptance table:
+// calibration/README.md, gateway section; trace walks verbatim from the
+// Stage-C record):
+// - GW-2 gwCalibF5ReleaseAfterCloseOut (release ordering): FALSIFIES S15 @
+//   9 (5,228/408) — client EOF → proto exits → pre-fix pump exit enters the
+//   close-out with the guard still held (51123b2be: release waited on the
+//   peer-parkable handle queue).
+// - GW-2 gwCalibF5NoSendBudget (send budget): FALSIFIES L2 @ 10 (6,600/479)
+//   — a withhold-window peer parks the send with no HANDLE_SEND_TIMEOUT
+//   armed; capacity held toward a transport-withholding peer with nothing
+//   armed (861888876's unbounded handle.data() await).
+// - GW-2 gwCalibF5BudgetIgnoresPeerClass (T): FALSIFIES P5 @ 10
+//   (32,253/1,567) — a compliant peer's window runs out and the budget,
+//   stripped of the §2d peer-class condition, fires the wedge response
+//   against it (budgetFiredOnCompliant / fcByBudget — the structural form
+//   of "budget too small for normal congestion", the 5 s close-out budget
+//   861888876 replaced).
+// - GW-8 gwCalibF5UnwindowedSend: FALSIFIES S13 @ 7 (922/117) — the first
+//   response send goes through the pre-fix non-window path (Handle::data);
+//   russh-side pending occupancy above zero with no credit consumed
+//   (deea04bbc). L2 deliberately does not fall here (pre-fix sends complete
+//   instantly into the unbounded buffer), exactly as the §3.4 row predicts.
+// - BASELINE: gwCalibF5AsBuilt (GW-2 V+T, GW-8) 66,059 distinct / 44 s —
+//   HOLDS; reachability-equivalent to famWedge (66,059 — exact structural
+//   cross-check).
 module gwCalibF5ReleaseAfterCloseOut {
   import gwConnLifecycle(
     MAX_CONNECTIONS = 2,

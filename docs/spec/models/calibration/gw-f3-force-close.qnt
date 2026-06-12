@@ -4,8 +4,7 @@
 // (decision-to-enforcement): once the gateway decides to disconnect, a
 // kill deadline is armed at the decision point and enforced regardless of
 // peer cooperation; nothing un-decides it (gw-session corpus §3 F3, design
-// §3.4 GW-4; verdicts in the calibration table of
-// docs/spec/models/gw-session-invariant-map.md). Same extend-and-override
+// §3.4 GW-4; verdicts in the VERDICT block at the end of this header). Same extend-and-override
 // pattern as gw-f1-capacity.qnt.
 //
 // Candidate carried by this file:
@@ -48,6 +47,28 @@
 // gwCalibF3AsBuilt.baselineStep (the as-built firePreAuthPhase2 arms at the
 // decision point; HOLDS).
 // =========================================================================
+//
+// VERDICT (Stage-C calibration, relocated from the retired gw-session
+// invariant map; scope/baseline protocol and the acceptance table:
+// calibration/README.md, gateway section; trace walks verbatim from the
+// Stage-C record):
+// - GW-4 gwCalibF3DecideWithoutArm: FALSIFIES S12 @ 5 (443/80). Trace:
+//   reject-only auth attempts → the pre-auth deadline's phase-2 decision
+//   queues the polite disconnect WITHOUT arming the force-close
+//   (1c46d9781).
+// - GW-4 2f11bb8f5 constituent (enforcement restricted to the read path;
+//   TCP_USER_TIMEOUT added as kernel backstop): structural-argument
+//   disposition — at the model's armed-style resolution this revert is the
+//   loss of the parked-write enforcement wake (parkWake) plus the kernel
+//   reap letter, and its violating state is exactly the one quint-gw-
+//   lifecycle-falsification-l1-no-inactivity already exhibits (L1-strict
+//   falls in fault-degraded when both are absent); permanently pinned by
+//   that probe rather than duplicated as a third F3 override. The 5a50b3f70
+//   constituent's enforcement half is the same decide-implies-arm mechanism
+//   this module reverts; its occupancy half is GW-3's surface.
+// - BASELINE: gwCalibF3AsBuilt (GW-4) 1,183 distinct / 38 s — HOLDS;
+//   reachability-equivalent to famPreauth (1,183 — exact structural cross-
+//   check, re-confirmed at close-out by manual re-run).
 module gwCalibF3DecideWithoutArm {
   import gwConnLifecycle(
     MAX_CONNECTIONS = 2,

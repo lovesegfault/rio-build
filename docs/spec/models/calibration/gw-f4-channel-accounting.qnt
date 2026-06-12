@@ -6,8 +6,7 @@
 // matching closes decrement, the bound is enforced at the allocation
 // transition, and out-of-contract opens terminate the connection so
 // untracked russh-side state cannot grow (gw-session corpus §3 F4, design
-// §3.4 GW-5/GW-6/GW-7; verdicts in the calibration table of
-// docs/spec/models/gw-session-invariant-map.md). Same extend-and-override
+// §3.4 GW-5/GW-6/GW-7; verdicts in the VERDICT block at the end of this header). Same extend-and-override
 // pattern as gw-f1-capacity.qnt.
 //
 // Candidates carried by this file:
@@ -34,6 +33,28 @@
 // Constants: standard regime values, LET_HOSTILE for the forged-close
 // letter. Baseline: gwCalibF4AsBuilt.baselineStep (HOLDS).
 // =========================================================================
+//
+// VERDICT (Stage-C calibration, relocated from the retired gw-session
+// invariant map; scope/baseline protocol and the acceptance table:
+// calibration/README.md, gateway section; trace walks verbatim from the
+// Stage-C record):
+// - GW-5 gwCalibF4ForgedCloseDecrements: FALSIFIES S7 @ 3 (97/27) — a
+//   forged/duplicate CHANNEL_CLOSE on a connection with no accepted channel
+//   decrements open_channels below the accepted-set size (9739aca65's
+//   unguarded decrement); the module also carries the exec-on-never-
+//   accepted-channel arm.
+// - GW-6 gwCalibF4BoundOnSessionsMap (MAX_CHANNELS_PER_CONN = 1): FALSIFIES
+//   S7 @ 6 (1,469/110) — two opens both pass the pre-fix bound check (it
+//   reads the exec'd-sessions map, empty before any exec); the accepted-
+//   open count exceeds the bound (719f99809 burst-open-then-exec).
+// - GW-7 gwCalibF4RefusePolitely (MAX_CHANNELS_PER_CONN = 1): FALSIFIES S14
+//   @ 4 (733/68) — two politely-refused opens leave residue 2 > 1: the pre-
+//   fix Ok(false) path retains russh channel-table state and the connection
+//   survives (2cd23d940 / eef1fbd8d); the pre-auth position of the opens is
+//   the as-built attempt letter's own enabling condition.
+// - BASELINES: gwCalibF4AsBuilt (GW-5) 52,870 / 44 s;
+//   gwCalibF4AsBuiltChanCap1 (GW-6, GW-7) 18,445 / 45 s — both HOLD
+//   allInvariants.
 module gwCalibF4ForgedCloseDecrements {
   import gwConnLifecycle(
     MAX_CONNECTIONS = 2,

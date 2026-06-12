@@ -4,8 +4,7 @@
 // (progress-bounded occupancy): every connection stage that is not an
 // active protocol session is bounded by a deadline whose expiry frees the
 // slot, and answering keepalives must not extend it (gw-session corpus §3
-// F2, design §3.4 GW-3; verdicts in the calibration table of
-// docs/spec/models/gw-session-invariant-map.md). Same extend-and-override
+// F2, design §3.4 GW-3; verdicts in the VERDICT block at the end of this header). Same extend-and-override
 // pattern as gw-f1-capacity.qnt.
 //
 // Candidates carried by this file:
@@ -44,6 +43,24 @@
 // gwCalibF2AsBuilt.baselineStep (as-built peerOpenChannel keeps the grace
 // armed; HOLDS).
 // =========================================================================
+//
+// VERDICT (Stage-C calibration, relocated from the retired gw-session
+// invariant map; scope/baseline protocol and the acceptance table:
+// calibration/README.md, gateway section; trace walks verbatim from the
+// Stage-C record):
+// - GW-3 gwCalibF2OpenDisarmsGrace: FALSIFIES S20 @ 6 (506/57) and L1 @ 6
+//   (465/51). Trace: an authenticated connection opens a channel and never
+//   execs; the pre-fix open disarms the empty grace, so the connection sits
+//   with no stage deadline, no grace, no budget and no designed reap
+//   enabled against a keepalive-answering peer (79912eda0). The 0101be9c6
+//   constituent (grace armed only at channel_close) is the same wrong-
+//   emptiness-signal mechanism at model resolution, and aec2521a3 (no pre-
+//   banner bound) is the same L1 armed-path loss one stage earlier — both
+//   covered by this module's falsification.
+// - GW-3 gwCalibF2NoHandshakeDeadline (a207ee15c constituent): FALSIFIES L3
+//   @ 8 (663/67) — an exec admitted with no handshake deadline armed.
+// - BASELINE: gwCalibF2AsBuilt (GW-3 both arms) 1,350,115 distinct / 99 s —
+//   HOLDS allInvariants.
 module gwCalibF2OpenDisarmsGrace {
   import gwConnLifecycle(
     MAX_CONNECTIONS = 2,
