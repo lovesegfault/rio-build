@@ -680,7 +680,7 @@ async fn reload_ok_preserves_evidence_buffered_during_err_window() {
 /// healthy cell; `right:` the buffer holds only the newest polarity,
 /// so the Ack ships the clear alone.
 // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
-// r[verify ctrl.nodeclaim.ice-mark-clear+4]
+// r[verify ctrl.nodeclaim.ice-mark-clear+5]
 #[tokio::test]
 async fn newer_registration_supersedes_buffered_mark_end_to_end() {
     let mut lab = Lab::new().await;
@@ -740,7 +740,7 @@ async fn newer_registration_supersedes_buffered_mark_end_to_end() {
 /// scheduler's fixed clears-then-marks order + epoch gate realize
 /// reset-then-step-0`.
 // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
-// r[verify ctrl.nodeclaim.ice-mark-clear+4]
+// r[verify ctrl.nodeclaim.ice-mark-clear+5]
 #[tokio::test]
 async fn clear_then_mark_ships_both_planes_with_ordered_epochs() {
     let mut lab = Lab::new().await;
@@ -791,7 +791,7 @@ async fn clear_then_mark_ships_both_planes_with_ordered_epochs() {
 /// R2 recency gate: a stale (>3×TICK) Registered edge after the
 /// acquire clear is recorded WITHOUT a sample and WITHOUT an ICE-clear
 /// on the wire (noMassClearAfterFailover / m34CalibNoRecencyGate).
-// r[verify ctrl.nodeclaim.ice-mark-clear+4]
+// r[verify ctrl.nodeclaim.ice-mark-clear+5]
 #[tokio::test]
 async fn post_acquire_stale_registration_records_without_clear_or_sample() {
     let mut lab = Lab::new().await;
@@ -916,7 +916,7 @@ async fn vanish_is_marked_own_reap_is_not() {
 /// ICE-mask (...): [.., AckSpawnedIntentsRequest { ..,
 /// unfulfillable_cells: ["mid-ebs-x86:spot@1781162843070"], .. }]` —
 /// tick 2 shipped the false mask through the vanish fold.
-// r[verify ctrl.nodeclaim.ice-mark-clear+4]
+// r[verify ctrl.nodeclaim.ice-mark-clear+5]
 #[tokio::test]
 async fn ambiguous_commit_delete_classifies_as_self_reap_not_ice() {
     let mut lab = Lab::new().await;
@@ -975,6 +975,185 @@ async fn ambiguous_commit_delete_classifies_as_self_reap_not_ice() {
     assert!(
         lab.r.delete_tombstones.is_empty(),
         "the confirmed exit consumed the tombstone"
+    );
+}
+
+/// W11-AI (bug_043 — `ctrl.pool.fold-clock`, R29): the tombstone
+/// grace is denominated in CONSUMER FOLD EXECUTIONS, and prune runs
+/// only AFTER the consult. Pre-fix, TOMBSTONE_TTL aged on the
+/// unconditionally-incremented wall tick counter while the vanish
+/// fold was SKIPPED on failed-LIST ticks, and prune_expired ran
+/// BEFORE detect_vanished — so a tombstone stamped just before a
+/// ≥3-tick foldless window was dropped before the first fold ever
+/// consulted it, and classify_vanish(None, None) minted GcVanish
+/// (the false ICE mask + reaped_total{reason=vanished}) for the
+/// controller's own BootTimeout self-reap. The correlated
+/// apiserver-disruption path (ambiguous delete error + failed LISTs
+/// in the same outage) makes exactly this sequence realistic.
+///
+/// Proposition: a tombstone is never pruned unconsulted — it
+/// survives every foldless window to its first real consult, which
+/// classifies SelfReap(BootTimeout): counter under boot-timeout,
+/// never vanished, never masked. (The book's shorthand for the
+/// post-fix class is the consequence-equivalent BootFailureTeardown
+/// row; the actual classify_vanish row with provenance armed is
+/// SelfReap — counter parity either way, divergence recorded.)
+// r[verify ctrl.pool.fold-clock]
+// r[verify ctrl.pool.delete-outcome]
+#[test]
+fn tombstone_survives_foldless_list_failure_window_to_first_consult() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let mut lab = rt.block_on(Lab::new());
+    lab.r.inflight_created.insert("c-bt".into(), cell());
+
+    // Tick 1: boot-stuck c-bt (age 200s > the 60s default timeout) →
+    // BootTimeout reap; the DELETE errs 503 AFTER committing.
+    rt.block_on(lab.tick(
+        200,
+        full_tick_scenario(
+            vec![],
+            vec![nc_json_boot_stuck("c-bt", 0)],
+            vec![Scenario::k8s_error(
+                Method::DELETE,
+                "/apis/karpenter.sh/v1/nodeclaims/c-bt",
+                503,
+                "ServiceUnavailable",
+                "etcd leader changed",
+            )],
+        ),
+    ));
+    assert!(lab.r.delete_tombstones.contains("c-bt"));
+
+    // Ticks 2-4: the apiserver outage continues — every Pools LIST
+    // fails, the tick body warns and returns, and the vanish fold
+    // NEVER RUNS. The wall tick counter keeps advancing: this is the
+    // ≥TTL foldless window.
+    for t in [210u64, 220, 230] {
+        rt.block_on(lab.tick(
+            t,
+            vec![Scenario::k8s_error(
+                Method::GET,
+                "/apis/rio.build/v1alpha1/pools",
+                500,
+                "InternalError",
+                "etcd leader election in progress",
+            )],
+        ));
+    }
+    assert!(
+        lab.r.delete_tombstones.contains("c-bt"),
+        "the tombstone must survive the foldless window (it was never \
+         consulted): the grace is denominated in fold executions, not \
+         wall ticks"
+    );
+
+    // Tick 5: recovery — c-bt is fully GC'd (absent). The FIRST real
+    // fold since the stamp must consult the tombstone: SelfReap, the
+    // original reason's counter, NO mask.
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        rt.block_on(lab.tick(240, full_tick_scenario(vec![], vec![], vec![])));
+    });
+
+    let acks = lab.ack_calls();
+    assert!(
+        acks.iter().all(|a| a.unfulfillable_cells.is_empty()),
+        "a provenance-known self-reap must never ICE-mask, even across \
+         a foldless window (bug_043 red: the false GcVanish): {acks:?}"
+    );
+    // ppppp: snapshot exactly once.
+    let snap = snapshotter.snapshot().into_vec();
+    let count_of = |reason: &str| -> Option<u64> {
+        snap.iter().find_map(|(k, _, _, v)| {
+            let key = k.key();
+            (key.name() == "rio_controller_nodeclaim_reaped_total"
+                && key
+                    .labels()
+                    .any(|l| l.key() == "reason" && l.value() == reason))
+            .then(|| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+        })
+    };
+    assert_eq!(
+        count_of("boot-timeout"),
+        Some(1),
+        "the ORIGINAL reason's counter fires at the first consult"
+    );
+    assert_eq!(
+        count_of("vanished"),
+        None,
+        "never the vanish-attributed counter (bug_043 red)"
+    );
+    assert!(
+        lab.r.delete_tombstones.is_empty() && lab.r.inflight_created.is_empty(),
+        "the confirmed exit consumed tombstone and tracking"
+    );
+}
+
+/// W11-AI sibling — the OTHER skip path of the population product:
+/// pre-threshold ⊥ ticks (scheduler unreachable, streak below
+/// BOT_TICKS_BEFORE_CONSOLIDATE_ONLY) run kube-only observations and
+/// NO vanish fold. Same law: the tombstone survives the ⊥ window to
+/// its first consult.
+// r[verify ctrl.pool.fold-clock]
+#[test]
+fn tombstone_survives_bot_tick_window_to_first_consult() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let mut lab = rt.block_on(Lab::new());
+    lab.r.inflight_created.insert("c-bt".into(), cell());
+
+    // Tick 1: the ambiguous BootTimeout reap (as above).
+    rt.block_on(lab.tick(
+        200,
+        full_tick_scenario(
+            vec![],
+            vec![nc_json_boot_stuck("c-bt", 0)],
+            vec![Scenario::k8s_error(
+                Method::DELETE,
+                "/apis/karpenter.sh/v1/nodeclaims/c-bt",
+                503,
+                "ServiceUnavailable",
+                "etcd leader changed",
+            )],
+        ),
+    ));
+    assert!(lab.r.delete_tombstones.contains("c-bt"));
+
+    // Ticks 2-5: scheduler unreachable, streak 1..4 — each ⊥ tick
+    // makes exactly the two kube-only LISTs and never folds.
+    {
+        let _e = rt.enter();
+        lab.r.admin = admin_client(dead_channel());
+    }
+    for t in [210u64, 220, 230, 240] {
+        rt.block_on(lab.tick(t, bot_tick_scenario(vec![], vec![])));
+    }
+    assert!(
+        lab.r.delete_tombstones.contains("c-bt"),
+        "the ⊥ window is foldless — the fold-denominated grace must not move"
+    );
+
+    // Tick 6: recovery; c-bt absent → first consult → SelfReap, no mask.
+    lab.r.admin = admin_client(lab.admin_channel.clone());
+    rt.block_on(lab.tick(250, full_tick_scenario(vec![], vec![], vec![])));
+    let acks = lab.ack_calls();
+    assert!(
+        acks.iter().all(|a| a.unfulfillable_cells.is_empty()),
+        "no false mask after the ⊥ window: {acks:?}"
+    );
+    assert!(
+        lab.r.delete_tombstones.is_empty(),
+        "consumed at the consult"
     );
 }
 
@@ -2012,7 +2191,7 @@ async fn no_hosting_class_drop_answers_a_typed_verdict() {
     );
 }
 
-// r[verify ctrl.nodeclaim.ice-mark-clear+4]
+// r[verify ctrl.nodeclaim.ice-mark-clear+5]
 /// live_050(b) red R4-A / W7-D leg A — certifies: *never-registered-
 /// terminating transit through the production retain + reconcile ships
 /// the mark AT THE WIRE ARTIFACT* — `AckSpawnedIntentsRequest.

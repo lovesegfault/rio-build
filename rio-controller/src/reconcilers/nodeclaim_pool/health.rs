@@ -390,7 +390,7 @@ pub fn detect_vanished(
         // classification's OWN evidence — never a silent
         // launch-failure exit, never Karpenter-attributed evidence
         // for this controller's own delete.
-        // r[impl ctrl.nodeclaim.ice-mark-clear+4]
+        // r[impl ctrl.nodeclaim.ice-mark-clear+5]
         match class {
             VanishClass::RegisteredHandoff | VanishClass::DeliberateTeardown => {}
             VanishClass::SelfReap(reason) => {
@@ -527,27 +527,42 @@ pub fn classify_vanish(
     }
 }
 
-/// How many leader ticks an unconfirmed delete tombstone survives.
-/// Violable envelope (R17), derivation: confirmation normally lands at
-/// the NEXT tick's LIST (a committed delete shows `deletionTimestamp`
-/// immediately; the ~60–90s finalizer keeps it observable for many
-/// 10s ticks), so 3 covers one stale-LIST tick plus one missed tick —
-/// while bounding the window in which an INDEPENDENT same-name
-/// teardown could be mis-attributed to this controller (that
-/// suppression additionally requires the claim to flip into a
-/// capacity-failure shape after our non-ICE classification — near-
-/// contradictory, since Karpenter never transitions `Launched`
-/// True→False; an `Ice`-reason tombstone's consequence is the mask
-/// either way, so nothing is suppressed on that arm).
-const TOMBSTONE_TTL_TICKS: u64 = 3;
+/// How many CONSUMER FOLD EXECUTIONS an unconfirmed delete tombstone
+/// survives. THE CLOCK IS THE CONSUMING FOLD'S OWN EXECUTION COUNT
+/// (`DeleteTombstones::folds`, advanced by [`vanish_fold`] strictly
+/// AFTER each consult) — NEVER the wall tick counter (R29,
+/// `ctrl.pool.fold-clock`): the fold is skipped on pre-threshold
+/// ⊥ ticks and failed-LIST ticks while `tick_counter` keeps
+/// advancing, so a wall-denominated grace silently shortened toward
+/// zero as skip-paths accumulated — bug_043: a tombstone stamped just
+/// before a ≥3-tick foldless window was pruned before its first
+/// consult, and the next fold minted GcVanish (false ICE mask +
+/// `reaped_total{reason=vanished}`) for the controller's own
+/// BootTimeout self-reap. Denominated in fold executions, every
+/// future skip-path LENGTHENS real grace instead of shortening it.
+///
+/// Violable envelope (R17), derivation: confirmation normally lands
+/// at the next CONSULTED LIST (a committed delete shows
+/// `deletionTimestamp` immediately; the ~60–90s finalizer keeps it
+/// observable across many folds), so 3 covers one stale-LIST consult
+/// plus one missed consult — while bounding the window in which an
+/// INDEPENDENT same-name teardown could be mis-attributed to this
+/// controller (that suppression additionally requires the claim to
+/// flip into a capacity-failure shape after our non-ICE
+/// classification — near-contradictory, since Karpenter never
+/// transitions `Launched` True→False; an `Ice`-reason tombstone's
+/// consequence is the mask either way, so nothing is suppressed on
+/// that arm).
+const TOMBSTONE_TTL_FOLDS: u64 = 3;
 
 /// One stored ambiguous delete attempt: the full consequence packet
-/// the reap lane produced ([`AmbiguousDelete`]) plus the leader tick
-/// that stamped it.
+/// the reap lane produced ([`AmbiguousDelete`]) plus the consumer
+/// fold count at which it was stamped (the R29 clock — see
+/// [`TOMBSTONE_TTL_FOLDS`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteAttempt {
     pub seed: AmbiguousDelete,
-    pub tick: u64,
+    pub stamped_fold: u64,
 }
 
 /// Delete-provenance tombstones (bug_094): NodeClaim names whose
@@ -586,15 +601,26 @@ pub struct DeleteAttempt {
 #[derive(Debug, Default)]
 pub struct DeleteTombstones {
     entries: HashMap<String, DeleteAttempt>,
+    /// The CONSUMER CLOCK (R29): completed [`vanish_fold`] executions.
+    /// Stamps record it; expiry is measured against it; it advances
+    /// strictly AFTER each consult — so a tombstone is structurally
+    /// never pruned unconsulted, and wall ticks that skip the fold
+    /// (⊥ ticks, failed LISTs) do not age the grace.
+    folds: u64,
 }
 
 impl DeleteTombstones {
-    /// Record an ambiguous delete attempt at `tick` (re-stamping an
-    /// existing name refreshes its TTL and consequence packet — a
-    /// repeated `Err` is a fresh ambiguous attempt).
-    pub fn stamp(&mut self, seed: AmbiguousDelete, tick: u64) {
+    /// Record an ambiguous delete attempt at the CURRENT fold count
+    /// (re-stamping an existing name refreshes its grace and
+    /// consequence packet — a repeated `Err` is a fresh ambiguous
+    /// attempt). A stamp between folds F and F+1 is first consulted
+    /// by fold F+1 and cannot expire before fold F+`TTL`+1 — a fresh
+    /// stamp is never pruned by its own tick BY CONSTRUCTION (the
+    /// pre-R29 callers carried that as an ordering comment).
+    pub fn stamp(&mut self, seed: AmbiguousDelete) {
+        let stamped_fold = self.folds;
         self.entries
-            .insert(seed.name.clone(), DeleteAttempt { seed, tick });
+            .insert(seed.name.clone(), DeleteAttempt { seed, stamped_fold });
     }
 
     /// The tombstoned reason for `name`, if any — the provenance axis
@@ -608,27 +634,34 @@ impl DeleteTombstones {
         self.entries.remove(name);
     }
 
-    /// Drop entries stamped more than [`TOMBSTONE_TTL_TICKS`] leader
-    /// ticks ago. `wrapping_sub` matches the tick counter's wrap.
+    /// Advance the consumer clock by one completed fold, then drop
+    /// entries older than [`TOMBSTONE_TTL_FOLDS`] folds. Called ONLY
+    /// from [`vanish_fold`], strictly AFTER the consult — the
+    /// consult-then-prune order is owned by one fn, not by call-site
+    /// discipline (bug_043: prune_expired ran BEFORE detect_vanished
+    /// at both call sites). `wrapping_sub` matches the clock's wrap.
     ///
     /// Expiry is a TYPED, DISCLOSED disposition, never a silent prune
     /// (`ctrl.pool.delete-outcome`, bug_042): with the vanish fold
     /// consuming every in-flight exit and
     /// [`sweep_registered_tombstones`] consuming every confirmed
-    /// registered exit each tick, an entry can only reach expiry
+    /// registered exit each fold, an entry can only reach expiry
     /// DISCONFIRMED — its claim was observed alive (the delete
     /// provably had not committed) or was never re-observed at all.
     /// Each drop warns with the attempt's reason and increments
     /// `rio_controller_nodeclaim_tombstone_expired_total{reason}`.
-    pub fn prune_expired(&mut self, now_tick: u64) {
+    fn advance_fold_and_prune(&mut self) {
+        self.folds = self.folds.wrapping_add(1);
+        let now_fold = self.folds;
         self.entries.retain(|name, a| {
-            let keep = now_tick.wrapping_sub(a.tick) <= TOMBSTONE_TTL_TICKS;
+            let keep = now_fold.wrapping_sub(a.stamped_fold) <= TOMBSTONE_TTL_FOLDS;
             if !keep {
                 warn!(
                     %name, reason = a.seed.reason.as_str(),
                     "delete tombstone expired unconfirmed (disconfirmed or never \
-                     re-observed); dropping provenance — a later same-name \
-                     teardown is foreign evidence again"
+                     re-observed) after its fold-denominated grace; dropping \
+                     provenance — a later same-name teardown is foreign \
+                     evidence again"
                 );
                 metrics::counter!(
                     "rio_controller_nodeclaim_tombstone_expired_total",
@@ -744,6 +777,59 @@ pub fn sweep_registered_tombstones(
         }
         false
     });
+    out
+}
+
+/// One [`vanish_fold`] execution's combined consequences — the union
+/// of the in-flight fold's masks and the registered sweep's halves.
+#[derive(Debug, Default)]
+pub struct VanishFold {
+    /// ICE masks: the vanish fold's exits plus any confirmed
+    /// `Ice`-reason sweep consequence (alphabet-total).
+    pub ice_cells: Vec<Cell>,
+    /// Confirmed reaps' backing nodes — the wedge eviction feed.
+    pub evicted_nodes: Vec<String>,
+    /// Confirmed `Idle` tombstones' censored samples.
+    pub censored_gaps: Vec<(Cell, f64)>,
+}
+
+/// THE per-tick tombstone/vanish consumer chokepoint
+/// (`ctrl.pool.fold-clock`, R29): one fn owns the whole
+/// consult-then-prune sequence —
+///
+/// 1. the in-flight vanish fold ([`detect_vanished`]: every tracked
+///    exit consumes its tombstone with its classification's
+///    consequence),
+/// 2. the registered-tombstone sweep
+///    ([`sweep_registered_tombstones`]: every confirmed
+///    registered exit applies its reason's full consequence),
+/// 3. ONLY THEN the consumer clock advances and DISCONFIRMED entries
+///    older than [`TOMBSTONE_TTL_FOLDS`] expire as the disclosed
+///    disposition.
+///
+/// The ordering is structural, not call-site discipline: a tombstone
+/// can never be pruned unconsulted, because the only prune lives
+/// after the only consult, inside this fn — and the grace is
+/// denominated in executions OF THIS FN, so the skip-paths that do
+/// not call it (pre-threshold ⊥ ticks, failed-LIST ticks) lengthen
+/// real grace instead of consuming it (bug_043's wall-clock law
+/// shortened it toward zero).
+// r[impl ctrl.pool.fold-clock]
+// r[impl ctrl.pool.delete-outcome]
+pub fn vanish_fold(
+    inflight: &mut HashMap<String, Cell>,
+    tombstones: &mut DeleteTombstones,
+    live: &[LiveNode],
+) -> VanishFold {
+    let mut out = VanishFold {
+        ice_cells: detect_vanished(inflight, tombstones, live),
+        ..Default::default()
+    };
+    let swept = sweep_registered_tombstones(tombstones, inflight, live);
+    out.ice_cells.extend(swept.ice_cells);
+    out.evicted_nodes = swept.evicted_nodes;
+    out.censored_gaps = swept.censored_gaps;
+    tombstones.advance_fold_and_prune();
     out
 }
 
@@ -1059,7 +1145,7 @@ mod tests {
         assert!(inflight.is_empty());
     }
 
-    // r[verify ctrl.nodeclaim.ice-mark-clear+4]
+    // r[verify ctrl.nodeclaim.ice-mark-clear+5]
     /// live_050(b) red R3 / witness W7-C — certifies: *a never-Registered
     /// terminating claim produces a buffered-able mark with the vanish
     /// warn/counter — through the production retain path, not a
@@ -1214,7 +1300,7 @@ mod tests {
         // face).
         let mut inflight: HashMap<String, Cell> = [("nc-bt".to_string(), h.clone())].into();
         let mut ts = DeleteTombstones::default();
-        ts.stamp(ts_seed("nc-bt", ReapReason::BootTimeout), 7);
+        ts.stamp(ts_seed("nc-bt", ReapReason::BootTimeout));
         let mut n = with_conds(
             node("nc-bt", "h", CapacityType::Spot, 8, 0, 0),
             &[("Launched", "True", 1001.0)],
@@ -1235,7 +1321,7 @@ mod tests {
         // ambiguous error), counted under ice, NOT vanished.
         let mut inflight: HashMap<String, Cell> = [("nc-ice".to_string(), h.clone())].into();
         let mut ts = DeleteTombstones::default();
-        ts.stamp(ts_seed("nc-ice", ReapReason::Ice), 7);
+        ts.stamp(ts_seed("nc-ice", ReapReason::Ice));
         let rec = DebuggingRecorder::new();
         let _g = ::metrics::set_default_local_recorder(&rec);
         let ice = detect_vanished(&mut inflight, &mut ts, &[]);
@@ -1249,34 +1335,47 @@ mod tests {
         );
     }
 
-    /// Tombstone lifecycle: a DISCONFIRMED attempt (claim observed
-    /// alive, not terminating) keeps the entry tracked AND the
-    /// tombstone armed (stale-LIST tolerance); `prune_expired` drops
-    /// it after [`TOMBSTONE_TTL_TICKS`]; a fresh stamp survives its
-    /// own tick's prune.
+    /// Tombstone lifecycle on the CONSUMER FOLD CLOCK (R29,
+    /// `ctrl.pool.fold-clock`): a DISCONFIRMED attempt (claim
+    /// observed alive, not terminating) keeps the entry tracked AND
+    /// the tombstone armed across [`TOMBSTONE_TTL_FOLDS`] consults —
+    /// every one of which CONSULTED it before the clock moved (the
+    /// consult-then-prune fusion makes pruned-unconsulted
+    /// structurally unwritable); the fold after the grace expires it
+    /// DISCLOSED (warn + per-reason counter).
     #[test]
     fn tombstones_expire_and_disconfirmation_keeps_them_armed() {
         let h = Cell("h".into(), CapacityType::Spot);
         let mut inflight: HashMap<String, Cell> = [("nc-x".to_string(), h.clone())].into();
         let mut ts = DeleteTombstones::default();
-        ts.stamp(ts_seed("nc-x", ReapReason::BootTimeout), 10);
-        ts.prune_expired(10);
-        assert!(ts.contains("nc-x"), "fresh stamp survives its own tick");
+        ts.stamp(ts_seed("nc-x", ReapReason::BootTimeout));
 
-        // Disconfirmed: present ∧ !terminating → KEEP both.
+        // Disconfirmed: present ∧ !terminating → KEEP both, for
+        // exactly TOMBSTONE_TTL_FOLDS consulting folds (the stamp is
+        // not aged by clock time it was never consulted across —
+        // only by executions of THIS fold).
         let mut alive = node("nc-x", "h", CapacityType::Spot, 8, 0, 0);
         alive.registered = false;
-        assert!(detect_vanished(&mut inflight, &mut ts, &[alive]).is_empty());
-        assert!(inflight.contains_key("nc-x") && ts.contains("nc-x"));
+        for fold_n in 0..TOMBSTONE_TTL_FOLDS {
+            let out = vanish_fold(&mut inflight, &mut ts, std::slice::from_ref(&alive));
+            assert!(out.ice_cells.is_empty());
+            assert!(
+                inflight.contains_key("nc-x") && ts.contains("nc-x"),
+                "disconfirmed entry survives consulting fold {fold_n}"
+            );
+        }
 
-        // Expiry: TTL ticks later the tombstone is gone; a subsequent
-        // absence is foreign evidence again (GcVanish → mask). The
-        // expiry is DISCLOSED: warn + the per-reason expiry counter
-        // (the typed disposition — never a silent prune).
+        // The fold AFTER the grace: still disconfirmed → the expiry
+        // is DISCLOSED: warn + the per-reason expiry counter (the
+        // typed disposition — never a silent prune).
         let rec = metrics_util::debugging::DebuggingRecorder::new();
         let _g = ::metrics::set_default_local_recorder(&rec);
-        ts.prune_expired(10 + TOMBSTONE_TTL_TICKS + 1);
-        assert!(!ts.contains("nc-x"), "expired past TTL");
+        let out = vanish_fold(&mut inflight, &mut ts, std::slice::from_ref(&alive));
+        assert!(out.ice_cells.is_empty());
+        assert!(
+            !ts.contains("nc-x"),
+            "expired past the fold-denominated TTL"
+        );
         // ppppp: snapshot exactly once.
         let expired = rec
             .snapshotter()
@@ -1297,8 +1396,12 @@ mod tests {
             "expiry is a typed, disclosed disposition (the per-reason counter)"
         );
         drop(_g);
-        let ice = detect_vanished(&mut inflight, &mut ts, &[]);
-        assert_eq!(ice, vec![h], "post-expiry absence is Karpenter evidence");
+        let out = vanish_fold(&mut inflight, &mut ts, &[]);
+        assert_eq!(
+            out.ice_cells,
+            vec![h],
+            "post-expiry absence is Karpenter evidence"
+        );
     }
 
     /// W11-AG unit face — the tombstone consumer census (R25: every
@@ -1336,16 +1439,13 @@ mod tests {
                 for reason in ReapReason::ALL {
                     let row = (in_fold_population, obs, reason);
                     let mut ts = DeleteTombstones::default();
-                    ts.stamp(
-                        AmbiguousDelete {
-                            name: "nc-x".into(),
-                            reason,
-                            cell: h.clone(),
-                            node_name: Some("node-x".into()),
-                            idle_gap_secs: (reason == ReapReason::Idle).then_some(7.5),
-                        },
-                        1,
-                    );
+                    ts.stamp(AmbiguousDelete {
+                        name: "nc-x".into(),
+                        reason,
+                        cell: h.clone(),
+                        node_name: Some("node-x".into()),
+                        idle_gap_secs: (reason == ReapReason::Idle).then_some(7.5),
+                    });
                     let inflight: HashMap<String, Cell> = if in_fold_population {
                         [("nc-x".to_string(), h.clone())].into()
                     } else {
@@ -1490,7 +1590,7 @@ mod tests {
                                 [("nc-x".to_string(), h.clone())].into();
                             let mut ts = DeleteTombstones::default();
                             if let Some(r) = tombstoned {
-                                ts.stamp(ts_seed("nc-x", r), 1);
+                                ts.stamp(ts_seed("nc-x", r));
                             }
                             let live = if present { vec![n] } else { vec![] };
                             let ice = detect_vanished(&mut inflight, &mut ts, &live);

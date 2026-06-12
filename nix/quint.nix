@@ -4537,7 +4537,7 @@ rec {
     # consumer's next tick).
     # r[verify ctrl.nodeclaim.lease-edge-polarity+4]
     # r[verify ctrl.nodeclaim.placeable-gate+5]
-    # r[verify ctrl.nodeclaim.ice-mark-clear+4]
+    # r[verify ctrl.nodeclaim.ice-mark-clear+5]
     quint-nodeclaim-lifecycle-fault-lease = mkQuintCheck {
       name = "nodeclaim-lifecycle-fault-lease";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
@@ -4572,7 +4572,7 @@ rec {
     # detect_vanished, so an ICE mark is only ever emitted for a claim
     # that genuinely vanished or launch-failed).
     # r[verify ctrl.nodeclaim.inflight-conservation+3]
-    # r[verify ctrl.nodeclaim.ice-mark-clear+4]
+    # r[verify ctrl.nodeclaim.ice-mark-clear+5]
     quint-nodeclaim-lifecycle-fault-karpenter = mkQuintCheck {
       name = "nodeclaim-lifecycle-fault-karpenter";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
@@ -7497,6 +7497,81 @@ rec {
       witness = "canReachDeferKept";
     };
 
+    # Round-11 (bug_042/bug_043/bug_112, WO-S4-1/-2): the
+    # delete-outcome tombstone plane — every ambiguous NodeClaim
+    # delete is tombstoned and CONSUMED with its reason's consequence
+    # (the vanish-fold SelfReap arm + the registered-tombstone sweep),
+    # and the tombstone TTL is denominated in CONSUMER FOLD EXECUTIONS
+    # with prune-after-consult. FALSIFY half: under the as-built
+    # wall-tick law a ≥TTL foldless ⊥ window drops the tombstone
+    # before its first consult and the next fold mints
+    # foreign-attributed vanish evidence for the controller's own
+    # committed delete (iceMarkSoundness AND
+    # tombstoneConsequenceApplied both expected violated — the model
+    # also pins the deterministic w11aiFoldlessWindowDropRed run).
+    # r[verify ctrl.pool.delete-outcome]
+    # r[verify ctrl.pool.fold-clock]
+    quint-nodeclaim-falsify-tombstone-asbuilt-mark = mkQuintWitnessCheck {
+      name = "nodeclaim-falsify-tombstone-asbuilt-mark";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleTombstoneAsBuilt";
+      witness = "iceMarkSoundness";
+    };
+    # r[verify ctrl.pool.delete-outcome]
+    # r[verify ctrl.pool.fold-clock]
+    quint-nodeclaim-falsify-tombstone-asbuilt-dropped = mkQuintWitnessCheck {
+      name = "nodeclaim-falsify-tombstone-asbuilt-dropped";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleTombstoneAsBuilt";
+      witness = "tombstoneConsequenceApplied";
+    };
+    # HOLD half: with the fold-clock law the tombstone survives every
+    # foldless window to its first consult, the late consequence
+    # applies, and no foreign-attributed mark exists; the two
+    # non-vacuity witnesses below prove the ambiguous arm and the
+    # late-confirm path are exercised in this regime.
+    # r[verify ctrl.pool.delete-outcome]
+    # r[verify ctrl.pool.fold-clock]
+    quint-nodeclaim-tombstone-consequence = mkQuintCheck {
+      name = "nodeclaim-tombstone-consequence";
+      # quint-policy P1 exemption (the standing boundsOK form):
+      vacuityExempt = {
+        boundsOK = {
+          class = "boundsOK";
+          reason = "scope-ceiling tripwire: a violation means the regime misconfigured its bound consts, not a protocol defect — a falsifier would assert a misconfiguration, not a behavior";
+        };
+      };
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleTombstone";
+      invariants = [
+        "boundsOK"
+        "idleReapSafety"
+        "iceMarkSoundness"
+        "bootSampleNotLost"
+        "noMassClearAfterFailover"
+        "reloadLatchRespected"
+        "singleEffectiveProvisioner"
+        "gateProducerGuarantee"
+        "provisioningBudget"
+        "deficitFullyMinted"
+        "coverRespectsMask"
+        "degradedCoverPolarity"
+        "tombstoneConsequenceApplied"
+      ];
+    };
+    quint-nodeclaim-witness-reap-ambiguous = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-reap-ambiguous";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleTombstone";
+      witness = "canReachReapAmbiguous";
+    };
+    quint-nodeclaim-witness-tombstone-confirmed = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-tombstone-confirmed";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleTombstone";
+      witness = "canReachTombstoneConfirmed";
+    };
+
     # ------------------------------------------------------------------
     # ICE evidence/ack pipeline (bughunt-5 slot 5: bug_094 +
     # merged_bug_134/008/003) — the cross-component contract
@@ -7514,7 +7589,7 @@ rec {
 
     # r[verify sched.sla.ack-validate-then-commit+1]
     # r[verify ctrl.nodeclaim.evidence-ack-latch+3]
-    # r[verify ctrl.nodeclaim.ice-mark-clear+4]
+    # r[verify ctrl.nodeclaim.ice-mark-clear+5]
     quint-ice-evidence-ack = mkQuintCheck {
       name = "ice-evidence-ack";
       spec = "iceEvidenceAck";
@@ -7578,7 +7653,7 @@ rec {
     # merged_bug_003 FALSIFY half: latest-wins eviction — a newer
     # mark destroys the buffered clear; the mark-only request climbs
     # from the stale rung instead of reset-then-step-0.
-    # r[verify ctrl.nodeclaim.ice-mark-clear+4]
+    # r[verify ctrl.nodeclaim.ice-mark-clear+5]
     quint-ice-falsify-latest-wins-eviction = mkQuintSimWitnessCheck {
       name = "ice-falsify-latest-wins-eviction";
       spec = "calibration/ice-latest-wins-eviction";

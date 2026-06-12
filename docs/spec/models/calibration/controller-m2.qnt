@@ -38,7 +38,9 @@ module m2CalibNoConsolidatePrune {
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false,
     ENABLE_DEFER_MACHINERY = false,
-    ENABLE_DEFER_DEMAND = false
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false
   ).* from "../nodeclaimLifecycle"
 
   /// The as-built consolidate-only tick with the inflight_created prune
@@ -143,13 +145,13 @@ module m2CalibNoConsolidatePrune {
   run m2NoConsolidatePruneRun =
     init
       .then(ceilingsLoad)
-      .then(tickFullWith(false, false, false, 1, 0, Set(), Set()))
+      .then(tickFullWith(false, false, false, 1, 0, Set(), Set(), Set(), Set()))
       .then(claimRegisters("c1"))
       .then(tickBotEarly)
       .then(tickConsolidateOnlyNoPruneWith(false))
       .then(tickConsolidateOnlyNoPruneWith(false))
       .then(finalizerCompletes("c1"))
-      .then(tickFullWith(false, false, false, 0, 0, Set(), Set()))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set(), Set(), Set()))
       .expect(violations.contains(VSpuriousMark))
 }
 
@@ -186,7 +188,9 @@ module m2CalibInflightDropOnSight {
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false,
     ENABLE_DEFER_MACHINERY = false,
-    ENABLE_DEFER_DEMAND = false
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false
   ).* from "../nodeclaimLifecycle"
 
   /// The structural conservation property the KEEP arm protects. Scoped
@@ -284,11 +288,13 @@ module m2CalibInflightDropOnSight {
         else if (slotForA.contains(k))
           { phase: CInFlight, cell: "cellA", stuck: false, spell: SNotIdle,
             busyTickSeen: false, boot: BRecorded, inflightTracked: true,
-            inflightCell: "cellA", pIdle: INotTracked, ctrlReaped: false }
+            inflightCell: "cellA", pIdle: INotTracked, ctrlReaped: false,
+            tomb: false, tombAge: 0, ourCommit: false }
         else if (slotForB.contains(k))
           { phase: CInFlight, cell: "cellB", stuck: false, spell: SNotIdle,
             busyTickSeen: false, boot: BRecorded, inflightTracked: true,
-            inflightCell: "cellB", pIdle: INotTracked, ctrlReaped: false }
+            inflightCell: "cellB", pIdle: INotTracked, ctrlReaped: false,
+            tomb: false, tombAge: 0, ourCommit: false }
         // PRE-FIX (08d49c52c bug_020): every entry whose claim appears in
         // the live LIST is pruned on first sight — in-flight ones too.
         else if (c.inflightTracked and c.phase != CAbsent)

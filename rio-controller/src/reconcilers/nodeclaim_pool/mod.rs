@@ -1766,31 +1766,27 @@ impl NodeClaimPoolReconciler {
             self.delete_tombstones.remove(name);
         }
         // bug_094: ambiguous (non-404 Err) deletes tombstone their
-        // provenance for the vanish fold; stamp-then-prune so a fresh
-        // stamp is never expired by its own tick.
+        // provenance for the vanish fold (stamped at the consumer's
+        // own fold clock — a fresh stamp cannot expire before its
+        // first consult by construction, R29).
         for seed in delete_attempted {
-            self.delete_tombstones.stamp(seed, self.tick_counter);
+            self.delete_tombstones.stamp(seed);
         }
-        self.delete_tombstones.prune_expired(self.tick_counter);
-        ice_cells.extend(health::detect_vanished(
+        // The tombstone/vanish consumer chokepoint (bug_042 +
+        // bug_043): the in-flight fold, the registered sweep, and
+        // the fold-clock prune — consult-then-prune in ONE fn
+        // (ctrl.pool.fold-clock); confirmed exits apply the original
+        // reason's full consequence (counter, wedge eviction,
+        // censored gap) through the same record_reap path as the
+        // prompt arms.
+        let fold = health::vanish_fold(
             &mut self.inflight_created,
             &mut self.delete_tombstones,
             &live,
-        ));
-        // bug_042: the registered-claim tombstone consumer — the
-        // vanish fold above only consumes `inflight_created` exits,
-        // so Dead/Idle (registered-claim) tombstones are matched here
-        // against the same live view and their confirmed exits apply
-        // the original reason's full consequence (counter, wedge
-        // eviction, censored gap) through the same record_reap path.
-        let swept = health::sweep_registered_tombstones(
-            &mut self.delete_tombstones,
-            &self.inflight_created,
-            &live,
         );
-        ice_cells.extend(swept.ice_cells);
-        self.pending_wedge_evictions.extend(swept.evicted_nodes);
-        for (cell, gap) in swept.censored_gaps {
+        ice_cells.extend(fold.ice_cells);
+        self.pending_wedge_evictions.extend(fold.evicted_nodes);
+        for (cell, gap) in fold.censored_gaps {
             consolidate::push_idle_gap(
                 &mut self.sketches,
                 &cell,
@@ -1889,7 +1885,7 @@ impl NodeClaimPoolReconciler {
             self.delete_tombstones.remove(name);
         }
         for seed in idle_reaped.delete_attempted {
-            self.delete_tombstones.stamp(seed, self.tick_counter);
+            self.delete_tombstones.stamp(seed);
         }
 
         if !self.reload_pending() {
@@ -1975,7 +1971,7 @@ impl NodeClaimPoolReconciler {
             self.delete_tombstones.remove(name);
         }
         for seed in idle_reaped.delete_attempted {
-            self.delete_tombstones.stamp(seed, self.tick_counter);
+            self.delete_tombstones.stamp(seed);
         }
         // No wedge evidence without the scheduler (the open-attempt
         // view is unreadable); local
@@ -2015,29 +2011,24 @@ impl NodeClaimPoolReconciler {
             self.delete_tombstones.remove(name);
         }
         for seed in outcome.delete_attempted {
-            self.delete_tombstones.stamp(seed, self.tick_counter);
+            self.delete_tombstones.stamp(seed);
         }
-        self.delete_tombstones.prune_expired(self.tick_counter);
-        let vanished = health::detect_vanished(
+        // The tombstone/vanish consumer chokepoint runs in BOTH modes
+        // (the bug_094 both-modes discipline; consult-then-prune in
+        // ONE fn per ctrl.pool.fold-clock) — a consolidate-only tick
+        // IS a fold execution, so the grace clock moves here exactly
+        // like reconcile_once; a Dead/Idle tombstone confirmed during
+        // a scheduler outage still applies its consequence within the
+        // finalizer window. Masks buffer like every other evidence
+        // plane here.
+        let fold = health::vanish_fold(
             &mut self.inflight_created,
             &mut self.delete_tombstones,
             &live,
         );
-        self.pending_evidence.buffer_marks(vanished);
-        // bug_042: the registered-tombstone consumer runs in BOTH
-        // modes (the bug_094 both-modes discipline) — a Dead/Idle
-        // tombstone confirmed during a scheduler outage still applies
-        // its consequence within the finalizer window; masks (total
-        // over the reason alphabet, empty for Dead/Idle) buffer like
-        // every other evidence plane here.
-        let swept = health::sweep_registered_tombstones(
-            &mut self.delete_tombstones,
-            &self.inflight_created,
-            &live,
-        );
-        self.pending_evidence.buffer_marks(swept.ice_cells);
-        self.pending_wedge_evictions.extend(swept.evicted_nodes);
-        for (cell, gap) in swept.censored_gaps {
+        self.pending_evidence.buffer_marks(fold.ice_cells);
+        self.pending_wedge_evictions.extend(fold.evicted_nodes);
+        for (cell, gap) in fold.censored_gaps {
             consolidate::push_idle_gap(
                 &mut self.sketches,
                 &cell,
@@ -2644,7 +2635,7 @@ impl NodeClaimPoolReconciler {
         // idle window (and mis-attributes the next re-dispatch). One
         // Ack per tick is the cost; the old all-empty early-return
         // suppressed exactly the tick that mattered.
-        // r[impl ctrl.nodeclaim.ice-mark-clear+4]
+        // r[impl ctrl.nodeclaim.ice-mark-clear+5]
         // Per-cell dedup (inherent — the buffer keys by cell):
         // `health::reap_unhealthy`/`detect_vanished` push one entry
         // per ICE'd CLAIM (up to 8/cell/tick); the per-cell ordered

@@ -1797,7 +1797,7 @@ its clock passes the prior leader's last mint — symmetric in kind and
 magnitude with the scheduler-side handoff posture (in-memory ladder +
 gate state, lease-holder only).
 
-#r("ctrl.nodeclaim.ice-mark-clear+4")[
+#r("ctrl.nodeclaim.ice-mark-clear+5")[
   ICE mark and clear signals sent via `AckSpawnedIntents` MUST be sound:
   `unfulfillable_cells` (marks) are deduplicated to at most one entry per
   cell per tick (the scheduler's backoff ladder climbs once per DISTINCT
@@ -1812,8 +1812,10 @@ gate state, lease-holder only).
   Karpenter GC --- never for a claim this controller itself reaped,
   whether the delete completed OR returned an ambiguous non-404 error
   that later proves committed: an errored delete's provenance MUST
-  survive across ticks (the delete-attempted tombstone, expiring after
-  a bounded number of ticks) so the claim's subsequent
+  survive across ticks (the delete-attempted tombstone, whose grace is
+  denominated in CONSUMER FOLD EXECUTIONS and whose expiry is a typed,
+  disclosed disposition --- #rref("ctrl.pool.fold-clock"),
+  #rref("ctrl.pool.delete-outcome")) so the claim's subsequent
   terminating/absent observation classifies as this controller's own
   reap and applies the ORIGINAL classification's consequence --- mask
   iff that classification was ICE, counter under the original reason
@@ -1880,6 +1882,31 @@ so a committed-but-errored Dead reap's wedge eviction never fired and
 makes a one-armed lane unwritable (rustc exhaustiveness), and the
 consumer census makes an unconsumed tombstone a structural
 impossibility rather than a per-site promise.
+
+#r("ctrl.pool.fold-clock")[
+  The delete-tombstone grace MUST be denominated in CONSUMER FOLD
+  EXECUTIONS --- the executions of the one tombstone/vanish consumer
+  chokepoint (the in-flight vanish fold, then the registered-tombstone
+  sweep, then the clock advance and the prune, in that order, owned by
+  ONE function) --- never in wall ticks; the prune MUST run only after
+  the consult, at every call site, by construction; and a tombstone
+  MUST never be pruned unconsulted. Wall ticks that skip the fold
+  (pre-threshold scheduler-unreachable ticks, failed-LIST ticks)
+  therefore lengthen real grace instead of consuming it.
+]
+The wall-clock law this replaces (bug_043, R29) aged
+`TOMBSTONE_TTL_TICKS` on the unconditionally-incremented tick counter
+while the consuming fold was skipped on pre-threshold ⊥ ticks and
+kube-LIST-failure ticks, and `prune_expired` ran BEFORE
+`detect_vanished` at both call sites: a tombstone stamped just before
+a ≥3-tick foldless window was dropped before the first fold ever
+consulted it, and `classify_vanish(None, None)` minted `GcVanish`
+(false ICE mask + `reaped_total{reason=vanished}`) for the
+controller's own BootTimeout self-reap --- the correlated
+apiserver-disruption path (ambiguous delete error + failed LISTs in
+one outage) makes exactly that sequence realistic. Every quantitative
+envelope names its clock; this one's is the consuming fold's own
+execution count.
 
 #r("ctrl.nodeclaim.consolidate-only-degraded+3")[
   After `BOT_TICKS_BEFORE_CONSOLIDATE_ONLY` (5) consecutive failed

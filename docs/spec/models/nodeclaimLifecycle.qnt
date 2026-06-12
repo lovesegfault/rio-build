@@ -207,6 +207,19 @@ module nodeclaimLifecycle {
     inflightCell: Cell,
     pIdle: IdleTrack,
     ctrlReaped: bool,
+    // Round-11 (WO-S4-1/-2): the controller's delete-provenance
+    // tombstone for this claim is armed (an ambiguous non-404 delete
+    // error whose commit is unconfirmed).
+    tomb: bool,
+    // The tombstone's age — denominated in FOLD EXECUTIONS under the
+    // fixed law (ENABLE_FOLD_CLOCK) and in leader wall ticks under
+    // the as-built law.
+    tombAge: int,
+    // GROUND TRUTH (the environment's, not the controller's): an
+    // ambiguous delete of this claim COMMITTED server-side — its
+    // later teardown is this controller's reap, whatever the
+    // controller still knows.
+    ourCommit: bool,
   }
 
   type Effect =
@@ -231,6 +244,8 @@ module nodeclaimLifecycle {
     | EBindingCleared
     | EBurstFullMint
     | EDeferKept
+    | EReapAmbiguous
+    | ETombstoneConfirmed
 
   type Violation =
     | VIdleOverReap
@@ -251,6 +266,7 @@ module nodeclaimLifecycle {
     | VClearLostOnAckFailure
     | VStaleBinding
     | VDeferredDemandReaped
+    | VTombstoneDropped
 
   // ------------------------------------------------------------------
   // 2. Constants
@@ -324,6 +340,30 @@ module nodeclaimLifecycle {
   /// stale set is never consulted).
   const ENABLE_DEFER_MACHINERY: bool
   const ENABLE_DEFER_DEMAND: bool
+  /// Round-11 area (bug_042/bug_043/bug_112, WO-S4-1/-2): MACHINERY
+  /// moves the delete-outcome tombstone plane -- the ambiguous-delete
+  /// nondet at BOTH reap edges (stuck + idle), the per-claim
+  /// tombstone with its age, the ground-truth commit bit, and the
+  /// consult (vanish-fold SelfReap + registered-tombstone sweep) at
+  /// every fold-running tick (full + consolidate-only). FOLD_CLOCK
+  /// selects the FIXED law (the tombstone TTL is denominated in
+  /// CONSUMER FOLD EXECUTIONS and the prune runs AFTER the consult --
+  /// one chokepoint, consult-then-prune by construction) vs the
+  /// as-built wall-tick law (the TTL aged on every leader tick
+  /// including foldless pre-threshold ⊥ ticks, and prune_expired ran
+  /// BEFORE detect_vanished at both call sites -- a >=TTL foldless
+  /// window dropped the tombstone before its first consult, and the
+  /// next fold minted foreign-attributed vanish evidence for the
+  /// controller's own committed delete: the false ICE mask +
+  /// reaped_total{reason=vanished}). Same-tick stamps are not aged by
+  /// their own tick's fold (the conservative direction -- grace can
+  /// only lengthen). All pre-round-11 regimes bind both false -- the
+  /// ambiguous-choice sets collapse to empty and the reachable state
+  /// space is unchanged.
+  ///
+  /// MODEL-DIVERGENCE(law=ctrl.pool.delete-outcome; tree=rio-controller/src/reconcilers/nodeclaim_pool/health.rs:record_reap): the model certifies the outcome PARTITION (completed vs ambiguous -- its single completed arm IS the Ok/404 parity law) and the tombstone consume-or-disclosed-expiry protocol -- NOT the consequence payload (counters, the wedge-eviction feed, censored NA samples; the wedge plane is consumed-input, out of model) -- retarget-by: modeling the wedge admission plane or any change to the consequence-packet law.
+  const ENABLE_TOMBSTONE_MACHINERY: bool
+  const ENABLE_FOLD_CLOCK: bool
 
   pure val CLAIMS: Set[ClaimId] = Set("c1", "c2")
   pure val CELLS: Set[Cell] = Set("cellA", "cellB")
@@ -337,12 +377,25 @@ module nodeclaimLifecycle {
   pure val deferChoices: Set[Set[Cell]] =
     if (ENABLE_DEFER_MACHINERY) CELLS.powerset() else Set(Set())
 
+  /// TOMBSTONE_TTL_FOLDS (3 in the code; 2 here -- one stale-LIST
+  /// consult plus one disconfirmed consult before the disclosed
+  /// expiry, scaled to the model's smaller orbit exactly like
+  /// BOT_THRESHOLD).
+  pure val TOMBSTONE_TTL: int = 2
+
+  /// Round-11: the per-tick ambiguous-outcome / commit choice sets.
+  /// Off-machinery the only choice is the empty set (state space
+  /// unchanged for every pre-round-11 regime).
+  pure val tombChoices: Set[Set[ClaimId]] =
+    if (ENABLE_TOMBSTONE_MACHINERY) CLAIMS.powerset() else Set(Set())
+
   pure def claimRank(k: ClaimId): int = if (k == "c1") 1 else 2
 
   pure val absentClaim: ClaimRec = {
     phase: CAbsent, cell: "cellA", stuck: false, spell: SNotIdle,
     busyTickSeen: false, boot: BRecorded, inflightTracked: false,
     inflightCell: "cellA", pIdle: INotTracked, ctrlReaped: false,
+    tomb: false, tombAge: 0, ourCommit: false,
   }
 
   // ------------------------------------------------------------------
@@ -396,6 +449,15 @@ module nodeclaimLifecycle {
   /// typed deferred letter).
   val deferredDemandKept = not(violations.contains(VDeferredDemandReaped))
   val iceMarkSoundness = not(violations.contains(VSpuriousMark))
+  /// Round-11 (bug_042 + bug_043, ctrl.pool.delete-outcome /
+  /// ctrl.pool.fold-clock): a COMMITTED ambiguous delete's tombstone
+  /// is never dropped with its consequence unapplied -- every
+  /// tombstone exit is a consult-consumption (the late consequence,
+  /// ETombstoneConfirmed) or a disclosed expiry of a DISCONFIRMED
+  /// attempt. Falsified as-built (wall-tick TTL aging through the
+  /// foldless ⊥ window + prune-before-consult); holds with
+  /// ENABLE_FOLD_CLOCK.
+  val tombstoneConsequenceApplied = not(violations.contains(VTombstoneDropped))
   val bootSampleNotLost = not(violations.contains(VBootSampleLost))
   val noMassClearAfterFailover = not(violations.contains(VStaleClear))
   val reloadLatchRespected = not(violations.contains(VStaleOverwrite))
@@ -422,6 +484,11 @@ module nodeclaimLifecycle {
   /// deferred-demand cell was actually KEPT under the fixed law.
   val canReachDeferKept = not(effects.contains(EDeferKept))
   val canReachVanishMark = not(effects.contains(EVanishDetected))
+  /// Round-11 non-vacuity pair: the ambiguous arm actually taken, and
+  /// the late-confirm consequence actually applied, in the hold
+  /// regime (wired as expected-violation checks).
+  val canReachReapAmbiguous = not(effects.contains(EReapAmbiguous))
+  val canReachTombstoneConfirmed = not(effects.contains(ETombstoneConfirmed))
   val canReachClearAfterMark = not(effects.contains(EClearOfMaskedCell))
   val canReachConsolidateOnlyReap = not(effects.contains(EConsolidateOnlyReap))
   val canReachClassBudgetBound = not(effects.contains(EClassBudgetBound))
@@ -623,8 +690,17 @@ module nodeclaimLifecycle {
       val vClearDropped =
         ENABLE_CLEARBUF_MACHINERY and not(ENABLE_EVIDENCE_BUFFER)
         and freshClears.size() > 0
+      // Round-11 (bug_043): this FOLDLESS leader tick is exactly the
+      // window the fold clock exists for — the as-built wall-tick TTL
+      // ages here (tick_counter incremented, no consult ran); the
+      // fixed law's fold clock does not move.
+      val afterTomb = CLAIMS.mapBy(k =>
+        val c = afterObs.get(k)
+        if (ENABLE_TOMBSTONE_MACHINERY and not(ENABLE_FOLD_CLOCK) and c.tomb)
+          { ...c, tombAge: c.tombAge + 1 }
+        else c)
       all {
-        claims' = afterObs,
+        claims' = afterTomb,
         edgeClearDone' = if (ENABLE_EPOCH_MACHINERY) true else edgeClearDone,
         pendingClear' =
           if (ENABLE_CLEARBUF_MACHINERY and ENABLE_EVIDENCE_BUFFER)
@@ -667,7 +743,9 @@ module nodeclaimLifecycle {
   /// Parameterized so deterministic runs can pin the PG-load outcome;
   /// `tickConsolidateOnly` below is the nondeterministic wrapper used
   /// by `step`.
-  action tickConsolidateOnlyWith(pgLoadFails: bool): bool = all {
+  action tickConsolidateOnlyWith(
+    pgLoadFails: bool, ambChoice: Set[ClaimId], commitChoice: Set[ClaimId]
+  ): bool = all {
       isLeader,
       ENABLE_RPC_FAULT,
       botStreak + 1 >= BOT_THRESHOLD,
@@ -719,27 +797,78 @@ module nodeclaimLifecycle {
       val vClearDropped =
         ENABLE_CLEARBUF_MACHINERY and not(ENABLE_EVIDENCE_BUFFER)
         and freshClears.size() > 0
+      // ---- round-11 delete-outcome tombstone fold ----------------------
+      // As-built: prune_expired runs BEFORE detect_vanished on the
+      // WALL age (this tick increments it too); fixed
+      // (ENABLE_FOLD_CLOCK): the consult runs first and ages are
+      // denominated in fold executions — this tick is one.
+      val preAged = CLAIMS.mapBy(k =>
+        val c = afterObs.get(k)
+        if (ENABLE_TOMBSTONE_MACHINERY and not(ENABLE_FOLD_CLOCK) and c.tomb)
+          { ...c, tombAge: c.tombAge + 1 }
+        else c)
+      val prePruneDropped = CLAIMS.filter(k =>
+        val c = preAged.get(k)
+        ENABLE_TOMBSTONE_MACHINERY and not(ENABLE_FOLD_CLOCK)
+        and c.tomb and c.tombAge > TOMBSTONE_TTL)
+      val tombs = CLAIMS.mapBy(k =>
+        val c = preAged.get(k)
+        if (prePruneDropped.contains(k)) { ...c, tomb: false, tombAge: 0 }
+        else c)
+      // The consult: a tombstoned claim observed terminating or absent
+      // is OUR delete confirmed (the vanish fold's SelfReap arm for
+      // tracked claims; the registered-tombstone sweep for the rest) —
+      // consume + the original consequence, never foreign-attributed
+      // evidence.
+      val tombConfirmed = CLAIMS.filter(k =>
+        val c = tombs.get(k)
+        c.tomb and (c.phase == CAbsent or c.phase == CTerminating))
       // Unhealthy reap (the stuck in-flight arm) — ICE cells dropped
       // (no scheduler to report to), names still pruned from inflight.
       val stuckReaped = CLAIMS.filter(k =>
-        afterObs.get(k).phase == CInFlight and afterObs.get(k).stuck)
+        tombs.get(k).phase == CInFlight and tombs.get(k).stuck)
       // The r40 bug_012 prune: detect_vanished runs here too, with its
       // marks discarded.
       val vanished = CLAIMS.filter(k =>
-        afterObs.get(k).inflightTracked and not(stuckReaped.contains(k))
-        and afterObs.get(k).phase == CAbsent)
-      val spurious = vanished.filter(k => afterObs.get(k).ctrlReaped).size() > 0
+        tombs.get(k).inflightTracked and not(stuckReaped.contains(k))
+        and tombs.get(k).phase == CAbsent and not(tombConfirmed.contains(k)))
+      // bug_043 widening: a mark for a claim whose teardown is OURS by
+      // ground truth (ctrlReaped — completed; ourCommit — committed
+      // ambiguous) is spurious whatever the controller still knows.
+      val spurious = vanished.filter(k =>
+        tombs.get(k).ctrlReaped or tombs.get(k).ourCommit).size() > 0
       // Idle reap with an empty reserved set (no FFD this tick).
       val idleReaped = CLAIMS.filter(k =>
-        val c = afterObs.get(k)
+        val c = tombs.get(k)
         c.phase == CRegistered and c.spell != SNotIdle and c.pIdle == ITrackedOld)
-      val overReap = idleReaped.filter(k => afterObs.get(k).spell != SOld).size() > 0
+      val overReap = idleReaped.filter(k => tombs.get(k).spell != SOld).size() > 0
+      // Round-11: the delete-outcome split per reaped claim — the
+      // completed arm (Ok and 404, one arm: the parity law) vs the
+      // ambiguous arm (tombstone, no consequence yet).
+      val ambReaped = stuckReaped.union(idleReaped).intersect(ambChoice)
+      val completedReaped = stuckReaped.union(idleReaped).exclude(ambReaped)
       val claimsAfter = CLAIMS.mapBy(k =>
-        val c = afterObs.get(k)
-        if (stuckReaped.contains(k) or idleReaped.contains(k))
+        val c = tombs.get(k)
+        if (completedReaped.contains(k))
           { ...c, phase: CTerminating, stuck: false, spell: SNotIdle,
             busyTickSeen: false, boot: BRecorded, pIdle: INotTracked,
-            inflightTracked: false, ctrlReaped: true }
+            inflightTracked: false, ctrlReaped: true,
+            tomb: false, tombAge: 0, ourCommit: true }
+        else if (ambReaped.contains(k))
+          // The AmbiguousErr arm: NO consequence yet; the tombstone is
+          // (re-)stamped; whether the delete committed is the
+          // environment's truth — a committed delete surfaces as
+          // terminating at the next LIST.
+          { ...c,
+            phase: if (commitChoice.contains(k)) CTerminating else c.phase,
+            stuck: if (commitChoice.contains(k)) false else c.stuck,
+            tomb: true, tombAge: 0,
+            ourCommit: c.ourCommit or commitChoice.contains(k) }
+        else if (tombConfirmed.contains(k))
+          // The late consequence applied; provenance consumed; the
+          // tracking story is over (the fold exit / the sweep).
+          { ...c, tomb: false, tombAge: 0, inflightTracked: false,
+            ctrlReaped: true }
         else if (vanished.contains(k)) { ...c, inflightTracked: false }
         else if (c.phase == CRegistered and c.spell == SNotIdle and c.inflightTracked)
           // detect_vanished drops registered/terminating entries too.
@@ -749,8 +878,29 @@ module nodeclaimLifecycle {
         else if (c.phase == CTerminating and c.inflightTracked)
           { ...c, inflightTracked: false }
         else c)
+      // Fixed law: the post-consult fold-clock advance + prune — ages
+      // move only on fold executions, AFTER the consult; a same-tick
+      // stamp is not aged by its own fold. Expiry can only reach
+      // DISCONFIRMED entries (committed ones confirmed above).
+      val foldExpired = CLAIMS.filter(k =>
+        val c = claimsAfter.get(k)
+        ENABLE_TOMBSTONE_MACHINERY and ENABLE_FOLD_CLOCK and c.tomb
+        and not(ambReaped.contains(k)) and c.tombAge + 1 > TOMBSTONE_TTL)
+      val claimsAfterTomb = CLAIMS.mapBy(k =>
+        val c = claimsAfter.get(k)
+        if (foldExpired.contains(k)) { ...c, tomb: false, tombAge: 0 }
+        else if (ENABLE_TOMBSTONE_MACHINERY and ENABLE_FOLD_CLOCK and c.tomb
+                 and not(ambReaped.contains(k)))
+          { ...c, tombAge: c.tombAge + 1 }
+        else c)
+      // The consumer law's violation: a tombstone dropped while its
+      // delete had COMMITTED — the consequence can no longer fire
+      // (bug_042's unconsumed expiry / bug_043's pruned-unconsulted).
+      val vTombDropped = ENABLE_TOMBSTONE_MACHINERY and (
+        prePruneDropped.filter(k => preAged.get(k).ourCommit).size() > 0
+        or foldExpired.filter(k => claimsAfter.get(k).ourCommit).size() > 0)
       all {
-        claims' = claimsAfter,
+        claims' = claimsAfterTomb,
         edgeClearDone' = if (ENABLE_EPOCH_MACHINERY) true else edgeClearDone,
         pendingClear' =
           if (ENABLE_CLEARBUF_MACHINERY and ENABLE_EVIDENCE_BUFFER)
@@ -774,6 +924,8 @@ module nodeclaimLifecycle {
           .union(if (idleReaped.size() > 0) Set(EIdleReap, EConsolidateOnlyReap) else Set())
           .union(if (stuckReaped.size() > 0) Set(EStuckReap, EConsolidateOnlyReap) else Set())
           .union(if (vanished.size() > 0) Set(EVanishDetected) else Set())
+          .union(if (ambReaped.size() > 0) Set(EReapAmbiguous) else Set())
+          .union(if (tombConfirmed.size() > 0) Set(ETombstoneConfirmed) else Set())
           .union(if (staleRecordOnly) Set(EStaleRecordOnly) else Set())
           .union(if (reloadStillPending) Set(EDegradedReloadTick) else Set())
           .union(if (edgeClearActed) Set(EEdgeIdleClear) else Set())
@@ -782,6 +934,7 @@ module nodeclaimLifecycle {
         violations' = violations
           .union(if (overReap) Set(VIdleOverReap) else Set())
           .union(if (spurious) Set(VSpuriousMark) else Set())
+          .union(if (vTombDropped) Set(VTombstoneDropped) else Set())
           .union(if (lostSamples) Set(VBootSampleLost) else Set())
           .union(if (vIdleLost) Set(VIdleSpellLost) else Set())
           .union(if (vClearDropped) Set(VClearEvidenceDropped) else Set()),
@@ -790,7 +943,9 @@ module nodeclaimLifecycle {
 
   action tickConsolidateOnly = {
     nondet pgLoadFails = boolChoices(ENABLE_LEASE_FAULT).oneOf()
-    tickConsolidateOnlyWith(pgLoadFails)
+    nondet ambChoice = tombChoices.oneOf()
+    nondet commitChoice = tombChoices.oneOf()
+    tickConsolidateOnlyWith(pgLoadFails, ambChoice, commitChoice)
   }
 
   /// The full reconcile_once tick (scheduler reachable). Parameterized
@@ -800,7 +955,8 @@ module nodeclaimLifecycle {
   action tickFullWith(
     pgLoadFails: bool, ackFails: bool, createFails: bool,
     demandA: int, demandB: int, reservedChoice: Set[ClaimId],
-    deferredChoice: Set[Cell]
+    deferredChoice: Set[Cell],
+    ambChoice: Set[ClaimId], commitChoice: Set[ClaimId]
   ): bool = all {
       isLeader,
       val aged = CLAIMS.mapBy(k => ageWallclock(claims.get(k)))
@@ -857,19 +1013,53 @@ module nodeclaimLifecycle {
       // ---- FFD outcome (opaque): reserved registered idle claims ------
       val reserved = reservedChoice.filter(k =>
         afterObs.get(k).phase == CRegistered and afterObs.get(k).spell != SNotIdle)
+      // ---- round-11 delete-outcome tombstone fold ----------------------
+      // As-built: prune_expired runs BEFORE detect_vanished on the
+      // WALL age (this tick increments it too); fixed
+      // (ENABLE_FOLD_CLOCK): the consult runs first and ages are
+      // denominated in fold executions — this tick is one.
+      val preAged = CLAIMS.mapBy(k =>
+        val c = afterObs.get(k)
+        if (ENABLE_TOMBSTONE_MACHINERY and not(ENABLE_FOLD_CLOCK) and c.tomb)
+          { ...c, tombAge: c.tombAge + 1 }
+        else c)
+      val prePruneDropped = CLAIMS.filter(k =>
+        val c = preAged.get(k)
+        ENABLE_TOMBSTONE_MACHINERY and not(ENABLE_FOLD_CLOCK)
+        and c.tomb and c.tombAge > TOMBSTONE_TTL)
+      val tombs = CLAIMS.mapBy(k =>
+        val c = preAged.get(k)
+        if (prePruneDropped.contains(k)) { ...c, tomb: false, tombAge: 0 }
+        else c)
+      // The consult: tombstoned ∧ (terminating ∨ absent) = OUR delete
+      // confirmed — consume + the original consequence, never
+      // foreign-attributed evidence (SelfReap / the registered sweep).
+      val tombConfirmed = CLAIMS.filter(k =>
+        val c = tombs.get(k)
+        c.tomb and (c.phase == CAbsent or c.phase == CTerminating))
       // ---- publish the placeable set (always on a successful tick) ----
       // ---- unhealthy reap (stuck in-flight) + vanish detection --------
       val stuckReaped = CLAIMS.filter(k =>
-        afterObs.get(k).phase == CInFlight and afterObs.get(k).stuck)
-      val stuckMarks: Set[Cell] = stuckReaped.map(k => afterObs.get(k).cell)
+        tombs.get(k).phase == CInFlight and tombs.get(k).stuck)
+      val stuckMarks: Set[Cell] = stuckReaped.exclude(ambChoice).map(k => tombs.get(k).cell)
       // Reap-name removal happens BEFORE detect_vanished, so the
       // controller's own deletes are not misread as Karpenter GC.
       val vanished = CLAIMS.filter(k =>
-        afterObs.get(k).inflightTracked and not(stuckReaped.contains(k))
-        and afterObs.get(k).phase == CAbsent)
-      val vanishMarks: Set[Cell] = vanished.map(k => afterObs.get(k).inflightCell)
-      val spurious = vanished.filter(k => afterObs.get(k).ctrlReaped).size() > 0
-      val marksThisTick = stuckMarks.union(vanishMarks)
+        tombs.get(k).inflightTracked and not(stuckReaped.contains(k))
+        and tombs.get(k).phase == CAbsent and not(tombConfirmed.contains(k)))
+      val vanishMarks: Set[Cell] = vanished.map(k => tombs.get(k).inflightCell)
+      // bug_043 widening: a mark for a claim whose teardown is OURS by
+      // ground truth (ctrlReaped — completed; ourCommit — committed
+      // ambiguous) is spurious whatever the controller still knows.
+      val spurious = vanished.filter(k =>
+        tombs.get(k).ctrlReaped or tombs.get(k).ourCommit).size() > 0
+      // A confirmed Ice-reason tombstone re-applies its mask late —
+      // the model's reasons collapse to the stuck (ICE-shaped) reap,
+      // so a confirmed formerly-stuck claim's cell marks now (the
+      // SelfReap mask parity); idle-shaped confirms carry no mask.
+      val confirmMarks: Set[Cell] = tombConfirmed.filter(k =>
+        tombs.get(k).inflightTracked).map(k => tombs.get(k).inflightCell)
+      val marksThisTick = stuckMarks.union(vanishMarks).union(confirmMarks)
       val masked = iceMasked.union(marksThisTick)
       // ---- cover_deficit ----------------------------------------------
       val freeSlots = CLAIMS.filter(k => afterObs.get(k).phase == CAbsent)
@@ -967,25 +1157,64 @@ module nodeclaimLifecycle {
         idleReaped.filter(k => deferredNow.contains(afterObs.get(k).cell)).size() > 0
       val overReap = idleReaped.filter(k => afterObs.get(k).spell != SOld).size() > 0
       // ---- assemble the post-state ----------------------------------------
+      // Round-11: the delete-outcome split per reaped claim — the
+      // completed arm (Ok and 404, one arm: the parity law) vs the
+      // ambiguous arm (tombstone, no consequence yet).
+      val ambReaped = stuckReaped.union(idleReaped).intersect(ambChoice)
+      val completedReaped = stuckReaped.union(idleReaped).exclude(ambReaped)
       val claimsAfter = CLAIMS.mapBy(k =>
-        val c = afterObs.get(k)
-        if (stuckReaped.contains(k) or idleReaped.contains(k))
+        val c = tombs.get(k)
+        if (completedReaped.contains(k))
           { ...c, phase: CTerminating, stuck: false, spell: SNotIdle,
             busyTickSeen: false, boot: BRecorded, pIdle: INotTracked,
-            inflightTracked: false, ctrlReaped: true }
+            inflightTracked: false, ctrlReaped: true,
+            tomb: false, tombAge: 0, ourCommit: true }
+        else if (ambReaped.contains(k))
+          // The AmbiguousErr arm: NO consequence yet; the tombstone is
+          // (re-)stamped; whether the delete committed is the
+          // environment's truth — a committed delete surfaces as
+          // terminating at the next LIST.
+          { ...c,
+            phase: if (commitChoice.contains(k)) CTerminating else c.phase,
+            stuck: if (commitChoice.contains(k)) false else c.stuck,
+            tomb: true, tombAge: 0,
+            ourCommit: c.ourCommit or commitChoice.contains(k) }
+        else if (tombConfirmed.contains(k))
+          // The late consequence applied; provenance consumed; the
+          // tracking story is over (the fold exit / the sweep).
+          { ...c, tomb: false, tombAge: 0, inflightTracked: false,
+            ctrlReaped: true }
         else if (vanished.contains(k)) { ...c, inflightTracked: false }
         else if (slotForA.contains(k))
           { phase: CInFlight, cell: "cellA", stuck: false, spell: SNotIdle,
             busyTickSeen: false, boot: BRecorded, inflightTracked: true,
-            inflightCell: "cellA", pIdle: INotTracked, ctrlReaped: false }
+            inflightCell: "cellA", pIdle: INotTracked, ctrlReaped: false,
+            tomb: false, tombAge: 0, ourCommit: false }
         else if (slotForB.contains(k))
           { phase: CInFlight, cell: "cellB", stuck: false, spell: SNotIdle,
             busyTickSeen: false, boot: BRecorded, inflightTracked: true,
-            inflightCell: "cellB", pIdle: INotTracked, ctrlReaped: false }
+            inflightCell: "cellB", pIdle: INotTracked, ctrlReaped: false,
+            tomb: false, tombAge: 0, ourCommit: false }
         else if (c.inflightTracked and (c.phase == CRegistered or c.phase == CTerminating))
           // detect_vanished drops entries for registered/terminating claims.
           { ...c, inflightTracked: false }
         else c)
+      // Fixed law: the post-consult fold-clock advance + prune (see
+      // the consolidate-only twin for the derivation).
+      val foldExpired = CLAIMS.filter(k =>
+        val c = claimsAfter.get(k)
+        ENABLE_TOMBSTONE_MACHINERY and ENABLE_FOLD_CLOCK and c.tomb
+        and not(ambReaped.contains(k)) and c.tombAge + 1 > TOMBSTONE_TTL)
+      val claimsAfterTomb = CLAIMS.mapBy(k =>
+        val c = claimsAfter.get(k)
+        if (foldExpired.contains(k)) { ...c, tomb: false, tombAge: 0 }
+        else if (ENABLE_TOMBSTONE_MACHINERY and ENABLE_FOLD_CLOCK and c.tomb
+                 and not(ambReaped.contains(k)))
+          { ...c, tombAge: c.tombAge + 1 }
+        else c)
+      val vTombDropped = ENABLE_TOMBSTONE_MACHINERY and (
+        prePruneDropped.filter(k => preAged.get(k).ourCommit).size() > 0
+        or foldExpired.filter(k => claimsAfter.get(k).ourCommit).size() > 0)
       // ---- budget violation checks (post-hoc, against the rule) -----------
       val totalAfter = CLAIMS.filter(k => claimsAfter.get(k).phase != CAbsent).size()
       val cellAAfter = CLAIMS.filter(k =>
@@ -1025,7 +1254,7 @@ module nodeclaimLifecycle {
         or (createdB > 0 and masked.contains("cellB"))
       val vGateProd = losePending and not(isLeader)
       all {
-        claims' = claimsAfter,
+        claims' = claimsAfterTomb,
         edgeClearDone' = if (ENABLE_EPOCH_MACHINERY) true else edgeClearDone,
         // merged_bug_045: with the latch the buffer empties only when
         // the delivering ack LANDS (commit-on-Ack — retained on
@@ -1060,6 +1289,8 @@ module nodeclaimLifecycle {
           if (vanished.size() > 0) Set(EVanishDetected) else Set(),
           if (stuckReaped.size() > 0) Set(EStuckReap) else Set(),
           if (idleReaped.size() > 0) Set(EIdleReap) else Set(),
+          if (ambReaped.size() > 0) Set(EReapAmbiguous) else Set(),
+          if (tombConfirmed.size() > 0) Set(ETombstoneConfirmed) else Set(),
           if (classBound) Set(EClassBudgetBound) else Set(),
           if (ceilingsBlocked) Set(EFailClosedNoCeilings) else Set(),
           if (dropA or dropB) Set(EUnknownCellDrop) else Set(),
@@ -1076,6 +1307,7 @@ module nodeclaimLifecycle {
           if (overReap) Set(VIdleOverReap) else Set(),
           if (vDeferReaped) Set(VDeferredDemandReaped) else Set(),
           if (spurious) Set(VSpuriousMark) else Set(),
+          if (vTombDropped) Set(VTombstoneDropped) else Set(),
           if (lostSamples) Set(VBootSampleLost) else Set(),
           if (vBudgetGlobal) Set(VBudgetGlobal) else Set(),
           if (vBudgetClass) Set(VBudgetClass) else Set(),
@@ -1098,9 +1330,11 @@ module nodeclaimLifecycle {
     nondet demandB = Set(0, 1, 2).oneOf()
     nondet reservedChoice = CLAIMS.powerset().oneOf()
     nondet deferredChoice = deferChoices.oneOf()
+    nondet ambChoice = tombChoices.oneOf()
+    nondet commitChoice = tombChoices.oneOf()
     tickFullWith(
       pgLoadFails, ackFails, createFails, demandA, demandB, reservedChoice,
-      deferredChoice)
+      deferredChoice, ambChoice, commitChoice)
   }
 
   // ------------------------------------------------------------------
@@ -1174,7 +1408,12 @@ module nodeclaimLifecycle {
     claims' = claims.set(k, { ...absentClaim,
       inflightTracked: claims.get(k).inflightTracked,
       inflightCell: claims.get(k).inflightCell,
-      ctrlReaped: claims.get(k).ctrlReaped }),
+      ctrlReaped: claims.get(k).ctrlReaped,
+      // The tombstone plane is CONTROLLER state keyed by name — the
+      // claim's absence does not erase it (the consult adjudicates).
+      tomb: claims.get(k).tomb,
+      tombAge: claims.get(k).tombAge,
+      ourCommit: claims.get(k).ourCommit }),
     envFrame,
   }
 
@@ -1195,7 +1434,10 @@ module nodeclaimLifecycle {
     claims' = claims.set(k, { ...absentClaim,
       inflightTracked: claims.get(k).inflightTracked,
       inflightCell: claims.get(k).inflightCell,
-      ctrlReaped: claims.get(k).ctrlReaped }),
+      ctrlReaped: claims.get(k).ctrlReaped,
+      tomb: claims.get(k).tomb,
+      tombAge: claims.get(k).tombAge,
+      ourCommit: claims.get(k).ourCommit }),
     envFrame,
   }
 
@@ -1238,7 +1480,11 @@ module nodeclaimLifecycle {
     isLeader' = true,
     reloadPending' = true,
     hadAcquire' = true,
-    claims' = CLAIMS.mapBy(k => acquireRekey(claims.get(k))),
+    // bug_094 suppress polarity: tombstones clear on the acquisition
+    // edge beside inflight tracking (ourCommit is ground truth and
+    // survives — but tracking clears too, so no mark can fire on it).
+    claims' = CLAIMS.mapBy(k =>
+      { ...acquireRekey(claims.get(k)), tomb: false, tombAge: 0 }),
     // C2/346: a NEW acquisition arms the edge token (the on_acquire
     // fetch_add); the first leader tick consumes it.
     edgeClearDone' = if (ENABLE_EPOCH_MACHINERY) false else edgeClearDone,
@@ -1268,7 +1514,8 @@ module nodeclaimLifecycle {
     placeableArmed' = false,
     claims' = CLAIMS.mapBy(k =>
       { ...ageBootNonObserving(acquireRekey(claims.get(k))),
-        inflightTracked: false, pIdle: INotTracked }),
+        inflightTracked: false, pIdle: INotTracked,
+        tomb: false, tombAge: 0 }),
     iceMasked' = iceMasked,
     configuredCells' = configuredCells, ceilingsKnown' = ceilingsKnown,
     hadAcquire' = hadAcquire, effects' = effects, violations' = violations,
@@ -1401,7 +1648,9 @@ module nodeclaimLifecycleBase {
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false,
     ENABLE_DEFER_MACHINERY = false,
-    ENABLE_DEFER_DEMAND = false
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false
   ).*
 }
 
@@ -1426,7 +1675,9 @@ module nodeclaimLifecycleFaultRpc {
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false,
     ENABLE_DEFER_MACHINERY = false,
-    ENABLE_DEFER_DEMAND = false
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false
   ).*
 
   /// The conflation trace, post-fix: the claim is observed idle, goes
@@ -1437,13 +1688,13 @@ module nodeclaimLifecycleFaultRpc {
   run idlePruneAcrossBotRun =
     init
       .then(ceilingsLoad)
-      .then(tickFullWith(false, false, false, 1, 0, Set(), Set()))
+      .then(tickFullWith(false, false, false, 1, 0, Set(), Set(), Set(), Set()))
       .then(claimRegisters("c1"))
-      .then(tickFullWith(false, false, false, 0, 0, Set(), Set()))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set(), Set(), Set()))
       .then(claimGoesBusy("c1"))
       .then(tickBotEarlyWith(false))
       .then(claimGoesIdle("c1"))
-      .then(tickFullWith(false, false, false, 0, 0, Set(), Set()))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set(), Set(), Set()))
       .expect(not(violations.contains(VIdleOverReap)))
       .expect(claims.get("c1").pIdle != INotTracked)
 
@@ -1454,10 +1705,10 @@ module nodeclaimLifecycleFaultRpc {
   run bootRecordedAcrossBotRun =
     init
       .then(ceilingsLoad)
-      .then(tickFullWith(false, false, false, 1, 0, Set(), Set()))
+      .then(tickFullWith(false, false, false, 1, 0, Set(), Set(), Set(), Set()))
       .then(claimRegisters("c1"))
       .then(tickBotEarlyWith(false))
-      .then(tickFullWith(false, false, false, 0, 0, Set(), Set()))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set(), Set(), Set()))
       .expect(not(violations.contains(VBootSampleLost)))
       .expect(claims.get("c1").boot == BRecorded)
 }
@@ -1481,7 +1732,9 @@ module nodeclaimLifecycleFaultLease {
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false,
     ENABLE_DEFER_MACHINERY = false,
-    ENABLE_DEFER_DEMAND = false
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false
   ).*
 }
 
@@ -1505,7 +1758,9 @@ module nodeclaimLifecycleFaultKarpenter {
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false,
     ENABLE_DEFER_MACHINERY = false,
-    ENABLE_DEFER_DEMAND = false
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false
   ).*
 }
 
@@ -1530,7 +1785,9 @@ module nodeclaimLifecycleEpochAsBuilt {
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false,
     ENABLE_DEFER_MACHINERY = false,
-    ENABLE_DEFER_DEMAND = false
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false
   ).*
 }
 
@@ -1555,7 +1812,9 @@ module nodeclaimLifecycleEpoch {
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false,
     ENABLE_DEFER_MACHINERY = false,
-    ENABLE_DEFER_DEMAND = false
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false
   ).*
 }
 
@@ -1579,7 +1838,9 @@ module nodeclaimLifecycleClearBufferAsBuilt {
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false,
     ENABLE_DEFER_MACHINERY = false,
-    ENABLE_DEFER_DEMAND = false
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false
   ).*
 }
 
@@ -1603,7 +1864,9 @@ module nodeclaimLifecycleClearBuffer {
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false,
     ENABLE_DEFER_MACHINERY = false,
-    ENABLE_DEFER_DEMAND = false
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false
   ).*
 }
 
@@ -1629,7 +1892,9 @@ module nodeclaimLifecycleAckLatchAsBuilt {
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false,
     ENABLE_DEFER_MACHINERY = false,
-    ENABLE_DEFER_DEMAND = false
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false
   ).*
 }
 
@@ -1654,7 +1919,9 @@ module nodeclaimLifecycleSnapshotAsBuilt {
     ENABLE_SNAPSHOT_MACHINERY = true,
     ENABLE_SNAPSHOT_PRESENCE = false,
     ENABLE_DEFER_MACHINERY = false,
-    ENABLE_DEFER_DEMAND = false
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false
   ).*
 }
 
@@ -1679,7 +1946,9 @@ module nodeclaimLifecycleSnapshot {
     ENABLE_SNAPSHOT_MACHINERY = true,
     ENABLE_SNAPSHOT_PRESENCE = true,
     ENABLE_DEFER_MACHINERY = false,
-    ENABLE_DEFER_DEMAND = false
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false
   ).*
 }
 
@@ -1706,7 +1975,9 @@ module nodeclaimLifecycleDeferAsBuilt {
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false,
     ENABLE_DEFER_MACHINERY = true,
-    ENABLE_DEFER_DEMAND = false
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false
   ).*
 }
 
@@ -1732,6 +2003,113 @@ module nodeclaimLifecycleDefer {
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false,
     ENABLE_DEFER_MACHINERY = true,
-    ENABLE_DEFER_DEMAND = true
+    ENABLE_DEFER_DEMAND = true,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false
   ).*
+}
+
+/// Round-11 as-built twin (bug_042 + bug_043, WO-S4-1/-2): the
+/// delete-outcome tombstone machinery under the AS-BUILT clock law —
+/// the TTL ages on every leader tick (including the foldless
+/// pre-threshold ⊥ ticks) and prune_expired runs BEFORE the consult.
+/// The W11-AI shape is reachable: an ambiguous-commit reap's
+/// tombstone crosses a ≥TTL foldless window, the first fold prunes
+/// it unconsulted, and the claim's absence mints foreign-attributed
+/// vanish evidence for the controller's own delete — falsifying
+/// iceMarkSoundness AND tombstoneConsequenceApplied (both wired as
+/// expected-violation checks). BOT_THRESHOLD=3 widens the ⊥ window to
+/// two foldless ticks (mirroring the real 5-tick threshold vs the
+/// 3-tick TTL: the window can exceed the grace).
+module nodeclaimLifecycleTombstoneAsBuilt {
+  import nodeclaimLifecycle(
+    MAX_FLEET_CORES = 2,
+    CLASS_CAP_A = 1,
+    BOT_THRESHOLD = 3,
+    ENABLE_RPC_FAULT = true,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_KARPENTER_FAULT = true,
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = true,
+    ENABLE_FOLD_CLOCK = false
+  ).*
+
+  /// Deterministic W11-AI reproducer (the foldless-window
+  /// tombstone-drop trace, pinned so the falsification is a named
+  /// run, not just an unbounded search): create → launch-stuck →
+  /// ambiguous-commit reap → two foldless ⊥ ticks age the wall TTL
+  /// past the grace → finalizer completes → the consolidate-only
+  /// fold prunes the tombstone BEFORE consulting it and mints the
+  /// false vanish mark for the controller's own committed delete.
+  run w11aiFoldlessWindowDropRed = {
+    init
+      .then(tickFullWith(false, false, false, 1, 0, Set(), Set(), Set(), Set()))
+      .then(claimLaunchStuck("c1"))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set(), Set("c1"), Set("c1")))
+      .then(tickBotEarlyWith(false))
+      .then(tickBotEarlyWith(false))
+      .then(finalizerCompletes("c1"))
+      .then(tickConsolidateOnlyWith(false, Set(), Set()))
+      .expect(violations.contains(VSpuriousMark) and violations.contains(VTombstoneDropped))
+  }
+}
+
+/// Round-11 hold regime (ctrl.pool.delete-outcome +
+/// ctrl.pool.fold-clock): the tombstone machinery under the FIXED
+/// law — the TTL is denominated in consumer fold executions and the
+/// prune runs after the consult (one chokepoint). The same foldless
+/// window now lengthens real grace instead of consuming it: the
+/// tombstone survives to its first consult, the confirm applies the
+/// original consequence (ETombstoneConfirmed), and no
+/// foreign-attributed mark is minted. iceMarkSoundness and
+/// tombstoneConsequenceApplied HOLD; canReachReapAmbiguous /
+/// canReachTombstoneConfirmed are the non-vacuity witnesses.
+module nodeclaimLifecycleTombstone {
+  import nodeclaimLifecycle(
+    MAX_FLEET_CORES = 2,
+    CLASS_CAP_A = 1,
+    BOT_THRESHOLD = 3,
+    ENABLE_RPC_FAULT = true,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_KARPENTER_FAULT = true,
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = true,
+    ENABLE_FOLD_CLOCK = true
+  ).*
+
+  /// The same W11-AI prefix under the fixed law: the tombstone
+  /// SURVIVES the foldless window (the fold clock never moved), the
+  /// first fold consults and confirms it, and neither violation
+  /// fires — the deterministic green twin of the as-built red run.
+  run w11aiFoldlessWindowSurvivesGreen = {
+    init
+      .then(tickFullWith(false, false, false, 1, 0, Set(), Set(), Set(), Set()))
+      .then(claimLaunchStuck("c1"))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set(), Set("c1"), Set("c1")))
+      .then(tickBotEarlyWith(false))
+      .then(tickBotEarlyWith(false))
+      .then(finalizerCompletes("c1"))
+      .then(tickConsolidateOnlyWith(false, Set(), Set()))
+      .expect(effects.contains(ETombstoneConfirmed)
+        and not(violations.contains(VSpuriousMark))
+        and not(violations.contains(VTombstoneDropped)))
+  }
 }

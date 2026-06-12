@@ -4592,7 +4592,7 @@ async fn leadership_cycle_resets_the_epoch_watermark() {
     );
 }
 
-// r[verify ctrl.nodeclaim.ice-mark-clear+4]
+// r[verify ctrl.nodeclaim.ice-mark-clear+5]
 /// W7-D leg B (R4-B — a DISCLOSED green-side consumption pin, never
 /// claimed as a red: this WO contains zero rio-scheduler production
 /// edits, so a scheduler-side test cannot regress pre-fix). Certifies:
