@@ -6831,6 +6831,19 @@ rec {
         "persistentExhaustionEventuallyReports"
         "noPoisonWhilePlaceable"
       ];
+      # Measured re-derivation (2026-06-12, serialized calm-window run
+      # at the round-11 tree): the 1800s default killed this check
+      # with the queue CONVERGING — 1.02B generated / 41.69M distinct
+      # at depth 29 with 1.24M queued, draining ~1M/min at healthy
+      # rising throughput (30→65M states/min) — projected completion
+      # ~1950-2000s. This whale was sized near the budget edge by
+      # design (its own model doc records the 843M-state history),
+      # and the round-11 gate-payload widening (GArmed pair, ~few %
+      # per-state fingerprint cost; distinct-state count unchanged —
+      # held machinery bound false here) nudged it past 1800. 3600 =
+      # ~1.8x the measured need, calm-window margin only; contended
+      # multi-gate windows are handled by serialization, not budget.
+      modelTimeoutSec = 3600;
     };
     # bug_075 hold non-vacuity: the withhold arm is actually exercised
     # in the hold regime (a live-streak intent withheld on a fold-skip
