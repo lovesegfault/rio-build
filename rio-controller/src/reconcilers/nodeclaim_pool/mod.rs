@@ -189,13 +189,15 @@ pub struct PlacedTick {
     /// re-seen next tick; DEMAND-VISIBLE so the orphan/excess reaps
     /// and the consolidator do not read the deferral as demand-gone.
     deferred: HashSet<String>,
-    /// Intent ids holding a live Job (Pending pod) at sim time — the
-    /// same set the FFD admission window exempts (merged_bug_047):
-    /// the exemption is exactly what lets a held intent reach the
-    /// fit-check and land `PlacedInFlight` on an unregistered claim,
-    /// so the gate fold consumes THIS set to keep those placements
-    /// demand-visible (a held Job's intent must never be read as
-    /// demand-gone by a policy fold — `ctrl.pool.window-visibility`).
+    /// Intent ids holding a live POD at sim time — the same set the
+    /// FFD admission window exempts (merged_bug_047): the exemption
+    /// is exactly what lets a held intent reach the fit-check and
+    /// land `PlacedInFlight` on an unregistered claim. bug_103: this
+    /// is the POD HALF of the demand-holding union only — the gate
+    /// fold unions it with the Job inventory the reaper walks
+    /// (`demand_held_intents`, `ctrl.pool.one-demand-source`); the
+    /// pod-derived set alone strictly under-covers Job-held during
+    /// pod-creation gaps and must never be a fold's sole held source.
     job_held: HashSet<String>,
 }
 
@@ -239,17 +241,21 @@ impl PlacedTick {
     }
 
     // r[impl ctrl.pool.window-visibility]
-    /// Whether `intent_id` held a live Job at sim time — the
-    /// demand-visibility axis the gate fold threads
-    /// (merged_bug_047). Orthogonal to [`Self::disposition`]: held ×
-    /// placed-in-flight is the product the window exemption created.
+    /// Whether `intent_id` held a live POD at sim time — the pod
+    /// half of the demand-holding axis (merged_bug_047). Orthogonal
+    /// to [`Self::disposition`]: held × placed-in-flight is the
+    /// product the window exemption created. bug_103: the gate fold
+    /// no longer consults this accessor — it tests the union
+    /// (`demand_held_intents`); this stays as the channel-shape pin
+    /// for the pod half.
     pub fn held(&self, intent_id: &str) -> bool {
         self.job_held.contains(intent_id)
     }
 
-    /// The held set, for the page-level threading (the structural
-    /// belt: a witnessed-page narrowing that THREADS demand keeps
-    /// every held intent regardless of the per-arm predicate).
+    /// The pod-derived held set — the POD HALF the gate fold feeds
+    /// into the demand-holding union (`demand_held_intents`,
+    /// bug_103): the structural belt threads the UNION, never this
+    /// set alone.
     pub fn job_held(&self) -> &HashSet<String> {
         &self.job_held
     }

@@ -4590,7 +4590,7 @@ async fn w10_ai_deferred_intent_stays_demand_visible_not_spawnable() {
     // (holds a Pending Job from an earlier tick).
     let gate = PlaceableGate::from_tick(PlacedTick::for_test(["reg"], [], ["def"], ["def"]));
     let mut page = IntentPage::for_test(vec![intent_named("reg"), intent_named("def")]);
-    let tick = apply_placeable_gate(&mut page, &gate).expect("armed");
+    let tick = apply_placeable_gate(&mut page, &gate, &[]).expect("armed");
 
     // Demand lane: BOTH survive the fold.
     assert_eq!(
@@ -4656,7 +4656,7 @@ async fn w11_ak_held_in_flight_placement_stays_demand_visible() {
         intent_named("held1"),
         intent_named("fly0"),
     ]);
-    let tick = apply_placeable_gate(&mut page, &gate).expect("armed");
+    let tick = apply_placeable_gate(&mut page, &gate, &[]).expect("armed");
 
     let ids: Vec<&str> = page.iter_page().map(|i| i.intent_id.as_str()).collect();
     assert_eq!(
@@ -4745,7 +4745,7 @@ async fn w11_ak_held_pending_job_not_orphan_deleted_end_to_end() {
     // of the page survives).
     let gate = PlaceableGate::from_tick(PlacedTick::for_test(["reg"], ["held1"], [], ["held1"]));
     let mut page = IntentPage::for_test(vec![intent_named("reg"), held]);
-    apply_placeable_gate(&mut page, &gate).expect("armed");
+    apply_placeable_gate(&mut page, &gate, &[]).expect("armed");
 
     // The want-map minted from the post-fold page + the transport
     // Complete letter (the production absence-lane path).

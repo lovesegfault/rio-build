@@ -901,8 +901,21 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // `{succeeded:0,ready:0}` window before Job-controller sync looks
     // pending; reap deletes it racing the job-tracking finalizer —
     // ci-failure-patterns "job-tracking finalizer orphan").
+    // ---- List this pool's Jobs ----
+    // r[impl ctrl.pool.tick-ordering]
+    // ORDERING (I-183): list AFTER the queued poll (above), so
+    // `queued` and the Job census the reap arms compare against come
+    // from the same tick — and BEFORE the gate fold below, so the
+    // fold's demand-holding union (bug_103,
+    // `ctrl.pool.one-demand-source`) derives from the SAME Job
+    // inventory `reap_stale_for_intents` walks. The fold is a local
+    // computation on the already-polled page: the poll→list order
+    // the law pins is unchanged.
+    let jobs = jobs_api
+        .list(&ListParams::default().labels(&format!("{}={name}", super::POOL_LABEL)))
+        .await?;
     let (gate_armed, placed_tick) = match (&ctx.placeable, pool.spec.kind) {
-        (Some(g), ExecutorKind::Builder) => match apply_placeable_gate(&mut page, g) {
+        (Some(g), ExecutorKind::Builder) => match apply_placeable_gate(&mut page, g, &jobs.items) {
             Some(tick) => (true, Some(tick)),
             None => (false, None),
         },
@@ -926,13 +939,10 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         HwSampledCache::fetch(ctx, page.iter_page().flat_map(hw_classes_in).collect()).await;
 
     // ---- Count active Jobs for this pool ----
-    // r[impl ctrl.pool.tick-ordering]
-    // ORDERING (I-183): list AFTER the queued poll. The reap step
-    // compares `pending` against `queued`. Polling first keeps the
+    // (Listed above, between the queued poll and the gate fold —
+    // the I-183 ordering note at the LIST site.) The reap step
+    // compares `pending` against `queued`; polling first keeps the
     // comparison coherent.
-    let jobs = jobs_api
-        .list(&ListParams::default().labels(&format!("{}={name}", super::POOL_LABEL)))
-        .await?;
     let census = job_census(&jobs.items);
 
     // merged_bug_080(2a) structural refresh: every same-pool Job in
@@ -1551,16 +1561,17 @@ pub(crate) struct IntentPage {
 /// threads the demand axis through or degrades the letter).
 pub(crate) enum PageNarrowing<'a> {
     /// The fold THREADS demand-visibility: intents in `job_held`
-    /// (live Job at sim time) survive the narrowing REGARDLESS of the
-    /// per-arm predicate — enforced by the page type, not the caller
-    /// — so absence evidence minted from the narrowed page stays
-    /// true-negative for every Job-backed intent. The coverage letter
-    /// survives.
+    /// (the demand-holding UNION — every active Job's spawned intent
+    /// ∪ the pod-annotation holds; bug_103,
+    /// `ctrl.pool.one-demand-source`) survive the narrowing
+    /// REGARDLESS of the per-arm predicate — enforced by the page
+    /// type, not the caller — so absence evidence minted from the
+    /// narrowed page stays true-negative for every Job-backed
+    /// intent. The coverage letter survives.
     HeldThreaded { job_held: &'a HashSet<String> },
     /// The fold is lossy w.r.t. demand: the coverage letter degrades
     /// to `Incomplete` (absence becomes `Unknowable`; the destructive
     /// absence-keyed arms suspend).
-    #[allow(dead_code)] // the lawful exit for future folds; no production caller today
     Lossy,
 }
 
@@ -1806,17 +1817,48 @@ pub(crate) fn reap_queued_known(
 pub(crate) fn apply_placeable_gate(
     page: &mut IntentPage,
     gate: &crate::reconcilers::nodeclaim_pool::PlaceableGate,
+    jobs: &[Job],
 ) -> Option<std::sync::Arc<crate::reconcilers::nodeclaim_pool::PlacedTick>> {
     use crate::reconcilers::nodeclaim_pool::FfdDisposition;
     match gate.snapshot() {
         Some(tick) => {
+            // ONE demand-holding truth source (bug_103, R33 —
+            // `ctrl.pool.one-demand-source`): "held" derives from
+            // the JOB inventory the reaper walks, unioned with the
+            // tick's pod-annotation holds. The pod-derived set alone
+            // strictly under-covers Job-held during pod-creation
+            // gaps (Job-controller lag, ResourceQuota refusal,
+            // webhook failure, eviction-recreate) — the merged_bug_047
+            // incident shape one inventory over.
+            let dh = super::job::demand_held_intents(jobs, tick.job_held());
+            if dh.unrepresented > 0 {
+                // The belt's honesty arm: an active Job the union
+                // cannot represent (no parseable intent id) means
+                // the threading does NOT cover the Job inventory —
+                // the narrowing pays with the witness (letter
+                // degrades inside the absence lane's sole
+                // constructor; destructive absence-keyed arms
+                // suspend) instead of keeping a Complete letter the
+                // union does not entail.
+                warn!(
+                    unrepresented = dh.unrepresented,
+                    "active Job(s) without a parseable intent-id \
+                     annotation: demand threading incomplete — \
+                     coverage letter degraded (absence unknowable; \
+                     orphan reap suspends this tick)"
+                );
+            }
             // The DEMAND fold (R25: every letter named — no if-let
             // between the producer's alphabet and this law), with
             // demand-visibility THREADED (merged_bug_047): the
             // narrowing is HeldThreaded, so a Job-backed intent
             // survives REGARDLESS of the per-arm value — the
             // structural belt under the per-arm law below.
-            let job_held = tick.job_held().clone();
+            let narrowing = if dh.unrepresented > 0 {
+                PageNarrowing::Lossy
+            } else {
+                PageNarrowing::HeldThreaded { job_held: &dh.held }
+            };
             page.retain_page(
                 |i| match tick.disposition(&i.intent_id) {
                     // Spawnable AND demand-visible.
@@ -1841,7 +1883,9 @@ pub(crate) fn apply_placeable_gate(
                     // (foreground-deleted at 10s, mid-registration).
                     // A Job-less in-flight placement keeps the
                     // pre-round-10 strip (the premise holds for it).
-                    FfdDisposition::PlacedInFlight => tick.held(&i.intent_id),
+                    // bug_103: membership tests the UNION, not the
+                    // pod inventory — a pod-less held Job counts.
+                    FfdDisposition::PlacedInFlight => dh.held.contains(&i.intent_id),
                     // Unplaceable this tick: stripped for Job-less
                     // intents (cover_deficit owns provisioning); a
                     // held intent survives via the threading — demand
@@ -1849,9 +1893,7 @@ pub(crate) fn apply_placeable_gate(
                     // pass still filters it (not spawnable).
                     FfdDisposition::Unplaced => false,
                 },
-                PageNarrowing::HeldThreaded {
-                    job_held: &job_held,
-                },
+                narrowing,
             );
             Some(tick)
         }
@@ -4319,7 +4361,7 @@ mod tests {
         // Armed → filter to set, armed=true.
         let gate = PlaceableGate::from_ids(["a", "c", "z"]);
         let mut page = mk(&["a", "b", "c"]);
-        assert!(apply_placeable_gate(&mut page, &gate).is_some());
+        assert!(apply_placeable_gate(&mut page, &gate, &[]).is_some());
         let ids: Vec<&str> = page.iter_page().map(|i| i.intent_id.as_str()).collect();
         assert_eq!(ids, vec!["a", "c"]);
 
@@ -4327,7 +4369,7 @@ mod tests {
         let gate = PlaceableGate::unarmed();
         let mut page = mk(&["a", "b"]);
         assert!(
-            apply_placeable_gate(&mut page, &gate).is_none(),
+            apply_placeable_gate(&mut page, &gate, &[]).is_none(),
             "unarmed → None (fail-closed reap)"
         );
         assert_eq!(page.len_page(), 0);
@@ -4355,7 +4397,7 @@ mod tests {
             "i0000", "i0042", "i0137", "i0511", "i0512", "i0777", "i0999", "i1000", "i1225",
         ];
         let gate = PlaceableGate::from_ids(placed);
-        assert!(apply_placeable_gate(&mut page, &gate).is_some());
+        assert!(apply_placeable_gate(&mut page, &gate, &[]).is_some());
         assert_eq!(
             page.len_page(),
             placed.len(),
@@ -4380,7 +4422,7 @@ mod tests {
         let (tx, gate) = placeable_channel();
         // Unarmed until first publish.
         let mut page = IntentPage::for_test(vec![intent("x")]);
-        assert!(apply_placeable_gate(&mut page, &gate).is_none());
+        assert!(apply_placeable_gate(&mut page, &gate, &[]).is_none());
 
         let placeable: Vec<Placement> = vec![
             (intent("on-reg"), "n1".into(), false),
@@ -4401,12 +4443,156 @@ mod tests {
             intent("on-inflight"),
             intent("on-reg-2"),
         ]);
-        assert!(apply_placeable_gate(&mut page, &gate).is_some());
+        assert!(apply_placeable_gate(&mut page, &gate, &[]).is_some());
         let ids: Vec<&str> = page.iter_page().map(|i| i.intent_id.as_str()).collect();
         assert_eq!(
             ids,
             vec!["on-reg", "on-reg-2"],
             "in-flight placements excluded from Job-create"
+        );
+    }
+
+    // r[verify ctrl.pool.one-demand-source]
+    /// W12-AL — proposition: a held Job's intent is never read as
+    /// demand-gone, quantified over JOBS (the law's own domain — the
+    /// inventory `reap_stale_for_intents` walks); population: the
+    /// pod-creation-gap regimes (Job-controller lag, ResourceQuota
+    /// refusal, webhook failure, eviction-recreate gap), where the
+    /// pod-derived `job_held` strictly under-covers Job-held.
+    ///
+    /// The angle's exact fixture: a live Pending Job with
+    /// `status: None` (no pod created yet) whose WANTED intent the
+    /// FFD tick left `Unplaced` and the pod inventory therefore
+    /// misses. Pre-fix the gate fold stripped it (the HeldThreaded
+    /// belt was pod-keyed), the narrowing kept the `Complete`
+    /// witness, and the orphan-pending arm's full guard composition
+    /// (`AbsentFromDemand` + `is_pending_job` + past
+    /// `REAP_PENDING_GRACE`) fired — foreground delete, single-tick.
+    /// Post-fix the union (Job LIST ∪ pod holds) threads it, the
+    /// letter stays honestly `Complete`, and the same Job reads
+    /// `Wanted`. The orphan reap's own population is co-pinned: a
+    /// transport-absent Job (intent never on the page) stays
+    /// `AbsentFromDemand` — the union protects against POLICY strips
+    /// only, never against genuine demand departure.
+    #[test]
+    fn w12_al_held_job_demand_visible_through_gate_fold() {
+        use crate::reconcilers::nodeclaim_pool::{PlacedTick, placeable_channel};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+
+        let pool = test_pool("p", ExecutorKind::Builder);
+        // Production render (R13): `build_job` is the one production
+        // Job constructor; age it past the reap grace and erase
+        // status — the apiserver shape of a Job the Job controller
+        // has not reconciled yet (`status: None` ⇒ pod-less Pending).
+        let mut j = job(&pool, &intent("x"));
+        j.metadata.creation_timestamp = Some(Time(
+            k8s_openapi::jiff::Timestamp::now()
+                .checked_sub(k8s_openapi::jiff::SignedDuration::from_secs(60))
+                .unwrap(),
+        ));
+        j.status = None;
+        let job_name = j.metadata.name.clone().expect("build_job names the Job");
+        assert!(
+            is_pending_job(&j) && job_older_than(&j, REAP_PENDING_GRACE),
+            "fixture: the orphan-pending arm's phase+age guard holds \
+             (the deletion is gated on the demand verdict alone)"
+        );
+
+        // FFD tick: `x` is Unplaced (in NO disposition set) and the
+        // pod-derived `job_held` is EMPTY — the pod-creation gap.
+        let (tx, gate) = placeable_channel();
+        tx.send_replace(Some(std::sync::Arc::new(PlacedTick::for_test(
+            [],
+            [],
+            [],
+            [],
+        ))));
+
+        let mut page = IntentPage::for_test(vec![intent("x")]);
+        let jobs = [j];
+        assert!(apply_placeable_gate(&mut page, &gate, &jobs).is_some());
+
+        // The law's three faces, at its own quantifier (over JOBS):
+        // (1) the held intent SURVIVES the policy narrowing;
+        assert!(
+            page.iter_page().any(|i| i.intent_id == "x"),
+            "a Job-held wanted intent must survive the gate fold \
+             (the union belt: Job LIST ∪ pod holds)"
+        );
+        // (2) the letter stays honestly Complete (the threading
+        // covered the Job inventory — no degrade needed);
+        let want = WantMap::for_pool(&page, DemandCoverage::Complete, "p", ExecutorKind::Builder);
+        // (3) the reaper reads demand-PRESENT for the Job: the
+        // foreground-delete arm is unreachable.
+        assert!(
+            matches!(want.verdict(&job_name), WantVerdict::Wanted(_)),
+            "a held Job's intent must never be read as demand-gone \
+             (pre-fix: AbsentFromDemand ⇒ foreground delete at 10s)"
+        );
+
+        // Population co-pin: genuine demand departure still reaps.
+        // A pod-less Pending Job whose intent the transport never
+        // paged is AbsentFromDemand on a Complete view — the orphan
+        // arm's lawful population is intact post-fix.
+        assert!(
+            matches!(
+                want.verdict("p-builder-gone"),
+                WantVerdict::AbsentFromDemand
+            ),
+            "transport-absent stays reapable: the union never \
+             manufactures demand for an unwanted Job"
+        );
+    }
+
+    /// The belt's honesty arm (`ctrl.pool.one-demand-source`): an
+    /// active Job whose intent id is unrepresentable in the union
+    /// (no parseable `rio.build/intent-id` template annotation —
+    /// pre-annotation Jobs, webhook mutation) makes the threading
+    /// incomplete, so the fold pays with the witness: the narrowing
+    /// declares itself lossy, the coverage letter degrades inside
+    /// the absence lane's sole constructor, and every absence
+    /// verdict becomes `Unknowable` (destructive arms suspend)
+    /// instead of `AbsentFromDemand` on a page the belt did not
+    /// actually cover.
+    #[test]
+    fn gate_fold_degrades_letter_when_job_unrepresented() {
+        use crate::reconcilers::nodeclaim_pool::{PlacedTick, placeable_channel};
+
+        let pool = test_pool("p", ExecutorKind::Builder);
+        let mut j = job(&pool, &intent("x"));
+        j.status = None;
+        // Strip the intent annotation: the union cannot represent
+        // this active Job (the production shapes: a Job minted
+        // before the annotation existed, or a mutating webhook ate
+        // it).
+        j.spec
+            .as_mut()
+            .unwrap()
+            .template
+            .metadata
+            .as_mut()
+            .unwrap()
+            .annotations
+            .as_mut()
+            .unwrap()
+            .remove(INTENT_ID_ANNOTATION);
+
+        let (tx, gate) = placeable_channel();
+        tx.send_replace(Some(std::sync::Arc::new(PlacedTick::for_test(
+            [],
+            [],
+            [],
+            [],
+        ))));
+        let mut page = IntentPage::for_test(vec![intent("y")]);
+        let jobs = [j];
+        assert!(apply_placeable_gate(&mut page, &gate, &jobs).is_some());
+
+        let want = WantMap::for_pool(&page, DemandCoverage::Complete, "p", ExecutorKind::Builder);
+        assert!(
+            matches!(want.verdict("p-builder-zzzz"), WantVerdict::Unknowable),
+            "an unrepresentable active Job degrades the letter: \
+             absence is Unknowable, the orphan arm suspends"
         );
     }
 

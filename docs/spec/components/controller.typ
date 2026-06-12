@@ -374,6 +374,34 @@ was foreground-deleted single-tick at the 10s grace, inside the
 capacity events, plus a queued undercount feeding the excess-pending
 arithmetic.
 
+#r("ctrl.pool.one-demand-source")[
+  "Demand-holding" MUST have exactly one producing derivation, keyed
+  on the Job inventory the destructive consumer iterates: the gate
+  fold's held-threading and the orphan reap MUST consume one union
+  --- every active, non-terminating Job's spawned intent plus the
+  FFD tick's pod-annotation holds --- never a predicate re-derived
+  from a single inventory; and whenever an active Job's intent is
+  unrepresentable in that union the narrowing MUST degrade the
+  coverage letter (absence becomes unknowable; destructive
+  absence-keyed arms suspend) rather than keep a Complete witness
+  the union does not entail.
+]
+
+The round-12 instance (bug_103) is the merged_bug_047 incident shape
+one inventory over: the held-threading was keyed on the POD inventory
+(`PodSnapshot::derive` inserts only pods carrying the intent
+annotation) while the orphan reap keys candidacy on the JOB inventory
+--- and Job-held strictly contains pod-held during pod-creation gaps
+(Job-controller lag, ResourceQuota refusal, webhook failure,
+eviction-recreate), which self-correlate with capacity pressure. A
+live Pending Job whose pod did not exist yet was stripped by the
+Unplaced arm, the page kept its Complete witness, and the still-wanted
+Job read `AbsentFromDemand` --- foreground-deleted single-tick after
+the 10s grace, no strike, no attempt veto. Two inventories defining
+one predicate diverge exactly under the lag regime where the consumer
+deletes; the union producer (`demand_held_intents`) is the R33 form:
+one quantity, one producer, every consumer imports.
+
 #r("ctrl.pool.container-overhead+2")[
   The container memory limit binds the WHOLE container --- the worker
   daemon, FUSE client, and log capture are resident beside the build,

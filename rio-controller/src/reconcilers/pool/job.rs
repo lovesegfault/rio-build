@@ -297,6 +297,59 @@ pub(super) fn job_intent_id(j: &Job) -> Option<&str> {
         .map(String::as_str)
 }
 
+/// The one demand-holding truth source (bug_103, R33): which intent
+/// ids hold live demand THIS tick, derived from the JOB inventory the
+/// destructive consumer (`reap_stale_for_intents`) walks, unioned
+/// with the pod-annotation holds the FFD tick observed.
+///
+/// Two inventories defining one predicate is the divergence machine:
+/// the pod-derived `job_held` (PodSnapshot) strictly under-covers
+/// Job-held during pod-creation gaps (Job-controller lag,
+/// ResourceQuota refusal, webhook failure, eviction-recreate) — and
+/// those gaps self-correlate with capacity pressure, exactly when the
+/// reaper fires. The gate fold and the reaper both consume THIS
+/// union; neither re-derives "held" from its own inventory.
+pub(super) struct DemandHeld {
+    /// Every active, non-terminating Job's spawned intent id ∪ the
+    /// pod-annotation holds.
+    pub(super) held: std::collections::HashSet<String>,
+    /// Active Jobs whose intent is unrepresentable in the union (no
+    /// parseable `rio.build/intent-id` template annotation — Jobs
+    /// minted before the annotation existed, or webhook mutation).
+    /// The belt cannot thread them: the caller MUST degrade the
+    /// coverage letter (absence becomes unknowable; destructive arms
+    /// suspend) instead of keeping a `Complete` witness the union
+    /// does not entail — the belt's honesty arm.
+    pub(super) unrepresented: usize,
+}
+
+// r[impl ctrl.pool.one-demand-source]
+pub(super) fn demand_held_intents(
+    jobs: &[Job],
+    pod_held: &std::collections::HashSet<String>,
+) -> DemandHeld {
+    let mut held = pod_held.clone();
+    let mut unrepresented = 0usize;
+    for j in jobs {
+        // Mirrors the pod half's non-terminal rule: terminal Jobs
+        // hold no demand (the StaleTerminal arm owns them) and a
+        // deletionTimestamp'd Job is already on its way out.
+        if j.metadata.deletion_timestamp.is_some() || !is_active_job(j) {
+            continue;
+        }
+        match job_intent_id(j).filter(|s| !s.is_empty()) {
+            Some(id) => {
+                held.insert(id.to_string());
+            }
+            None => unrepresented += 1,
+        }
+    }
+    DemandHeld {
+        held,
+        unrepresented,
+    }
+}
+
 /// Is this Job covered by an open pull-mode attempt from the
 /// scheduler's ledger-backed view (`AdminService.ListOpenAttempts`,
 /// pull-filtered server-side)?
