@@ -24,7 +24,7 @@
 //! leaf-crate constant
 //! pair plus the forward map (solve → container) and its inverse
 //! (ceiling → max hostable solve), related by the adjunction pinned
-//! in [`tests::adjunction_forward_inverse`]. The scheduler's
+//! in `adjunction_forward_inverse` (this module's tests). The scheduler's
 //! admission gates and dispatch clamps, the controller's
 //! `fallback_cell` predicate, and the controller's footprint
 //! constructor (`intent_pod_footprint`) all route here; the
