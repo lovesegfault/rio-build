@@ -136,6 +136,16 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
         ),
     ),
     (
+        "chunk_tenants",
+        RetentionPolicy::CascadeFrom {
+            parent: "chunks",
+            migration: "116_drv_blobs_chunk_tenants.sql",
+            note: "tenant-attribution junction; dies with the chunk row when \
+                   collect_cycle reaps it (the tenants-side CASCADE is for \
+                   tenant deletion only)",
+        },
+    ),
+    (
         "chunks",
         RetentionPolicy::SweptBy {
             symbol: "collect_cycle",
@@ -193,6 +203,24 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
         RetentionPolicy::SweptBy {
             symbol: "gc_attempt_ledger",
             note: "the TG sweep (tick_gc_attempt_ledger), kernel-proven cut",
+        },
+    ),
+    (
+        "drv_blob_tenants",
+        RetentionPolicy::CascadeFrom {
+            parent: "drv_blobs",
+            migration: "116_drv_blobs_chunk_tenants.sql",
+            note: "tenant-attribution junction; dies with the drv_blobs row \
+                   under sweep_unpinned_drv_blobs",
+        },
+    ),
+    (
+        "drv_blobs",
+        RetentionPolicy::SweptBy {
+            symbol: "sweep_unpinned_drv_blobs",
+            note: "PG-only sweep: a drv blob with no live build pin and past \
+                   the unpinned grace age deletes in one statement (no S3 \
+                   object — bodies are inline BYTEA)",
         },
     ),
     (
