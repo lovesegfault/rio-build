@@ -1102,6 +1102,30 @@ impl AppendDriver {
             },
         );
 
+        // The open-time coverage ack (bug_032): the FIRST message on
+        // the ack stream, sent only when the execution already has
+        // durable contiguous coverage. It tells the builder where the
+        // committed prefix ends so its retransmit buffer trims BEFORE
+        // replaying — without the letter, the only trim signal is
+        // per-chunk acks, and a reconnect replays committed-but-
+        // unacked content the session then has to drop server-side.
+        // `durable_through_line = watermark - 1` keeps the message a
+        // true durability statement even for clients that predate the
+        // watermark field (they consume it as a plain chunk ack and
+        // trim to the same point). try_send into the just-created
+        // queue cannot fail on capacity; a torn-down receiver makes
+        // the drop harmless (the stream is dying anyway).
+        let watermark = self.session.open_coverage_next_line();
+        if watermark > 0 {
+            ack_try_send(
+                &ack_tx,
+                Ok(AppendLogAck {
+                    durable_through_line: watermark - 1,
+                    open_coverage_next_line: Some(watermark),
+                }),
+            );
+        }
+
         // The session-lease heartbeat lives on its OWN task (bug_148,
         // R27): the drive loop's sibling arms await chunk cuts inline
         // for up to one cut interval plus an ack send — keeping the
@@ -2661,6 +2685,69 @@ mod tests {
         assert!(
             !is_complete,
             "no terminal drv_executions row yet => the log cannot be complete"
+        );
+    }
+
+    /// W11-F (bug_032): the open-time coverage ack, end to end — the
+    /// letter's emission face. A reconnect to an execution with
+    /// durable contiguous coverage receives, as the FIRST ack-stream
+    /// message, the open ack: `open_coverage_next_line = Some(W)` with
+    /// `durable_through_line = W - 1` (a true durability statement
+    /// even for a legacy client that ignores the watermark field). A
+    /// fresh execution gets NO open ack — its first ack is a chunk
+    /// ack, watermark-absent (the legacy chunk-ack shape; absent =
+    /// no-trim semantics, per the field contract). The server-side
+    /// trim/charge correctness for a NON-trimming client is W11-E's
+    /// straddling cell (gate.rs).
+    #[tokio::test]
+    async fn open_ack_carries_the_coverage_watermark() {
+        let mut h = harness().await;
+        let exec = seed_assignment(&h.db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+
+        // Session 1 (fresh exec): the first ack is the drain's CHUNK
+        // ack — no watermark field (the legacy shape).
+        let (tx, mut acks) = open_append(&mut h.client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open");
+        tx.send(batch_msg(
+            0,
+            &["line zero", "line one", "line two", "line three"],
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        let ack = acks.message().await.expect("ack").expect("ack present");
+        assert_eq!(ack.durable_through_line, 3);
+        assert_eq!(
+            ack.open_coverage_next_line, None,
+            "a fresh execution has no coverage to advertise: chunk acks \
+             never carry the watermark"
+        );
+        assert!(acks.message().await.expect("clean close").is_none());
+
+        // Session 2 (the reconnect): durable contiguous coverage is
+        // [0,4) — the FIRST message on the ack stream is the open-time
+        // coverage ack.
+        let (tx, mut acks) = open_append(&mut h.client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("reopen");
+        let ack = acks.message().await.expect("ack").expect("ack present");
+        assert_eq!(
+            ack.open_coverage_next_line,
+            Some(4),
+            "left (pre-fix): no open-time letter exists — the builder \
+             replays its full buffer blind / right: the open ack advertises \
+             the durable coverage watermark before any replay"
+        );
+        assert_eq!(
+            ack.durable_through_line, 3,
+            "the open ack is a true durability statement for legacy clients"
+        );
+        drop(tx);
+        assert!(
+            acks.message().await.expect("clean close").is_none(),
+            "nothing was sent: no further acks"
         );
     }
 

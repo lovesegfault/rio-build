@@ -423,6 +423,23 @@ pub struct IngestSession {
     /// own cuts), and content this session cut is fenced by the
     /// monotone floor anyway.
     covered: rio_log_kernel::CoverageMap,
+    /// The session's durable floor (bug_032): one past the highest
+    /// line of the CONTIGUOUS committed coverage at open —
+    /// `covered.contiguous_prefix_end()`, the same value the open-time
+    /// coverage ack advertises to the builder. Every line below it is
+    /// durably stored, so [`Self::accept`] TRIMS a batch's below-floor
+    /// prefix before the verdict, accounting, or buffering: a
+    /// committed-but-unacked replay from a previous session is never
+    /// re-charged (the pre-fix shape seeded `accepted_bytes` from
+    /// exec-lifetime merged coverage while the floor was session-local
+    /// zero, so the region `[0, durable_end)` was charged once per
+    /// reconnect and a premature cap trip — permanent
+    /// `FAILED_PRECONDITION` to the builder — abandoned the tail
+    /// below the true cap). A trim, never a monotonicity rejection:
+    /// rejecting a straddling frame whole would drop its un-durable
+    /// tail, which a legacy (non-trimming) builder never re-sends
+    /// within a session.
+    session_floor: u64,
     consecutive_cut_failures: u8,
 }
 
@@ -458,6 +475,7 @@ impl IngestSession {
             final_line_count: None,
             accepted_bytes: merged_bytes,
             covered: gate_ok.covered.clone(),
+            session_floor: gate_ok.covered.contiguous_prefix_end(),
             consecutive_cut_failures: 0,
         };
         if let Some(n) = gate_ok.final_line_count {
@@ -496,6 +514,17 @@ impl IngestSession {
     /// are no-ops.
     pub fn set_final_line_count(&mut self, n: u64) {
         self.final_line_count.get_or_insert(n);
+    }
+
+    /// The open-time coverage watermark (bug_032): one past the
+    /// highest line of the execution's CONTIGUOUS committed coverage
+    /// at session open — the session's durable floor, and the value
+    /// the driver advertises on the open-time coverage ack so the
+    /// builder trims its retransmit buffer before replaying. Zero =
+    /// no contiguous coverage (nothing to advertise; the driver sends
+    /// no open ack).
+    pub fn open_coverage_next_line(&self) -> u64 {
+        self.session_floor
     }
 
     /// The shared buffer + subscriber-list handle. The `TailLog` path
@@ -569,6 +598,45 @@ impl IngestSession {
             // empty keepalive batch cannot mask a due cut.
             let cut_due = self.lock_shared().buffer_bytes >= self.config.cut_threshold_bytes;
             return Ok(AcceptOutcome::Accepted { cut_due });
+        }
+
+        // -- The durable-floor trim (bug_032): lines below
+        // `session_floor` are inside the contiguous committed prefix —
+        // durably stored, already counted by the merged seed — so a
+        // replay's below-floor prefix is dropped BEFORE the verdict,
+        // accounting, or buffering (trimmed-before-write: the stored
+        // chunk and its accounted bytes will contain only above-floor
+        // lines). A prefix trim preserves the remainder's contiguity
+        // for the fan-out batch; a batch fully below the floor is a
+        // committed-but-unacked replay answered like the covered
+        // consult below — uncharged, acked from the manifest truth.
+        // r[impl store.log.caps-durable+2]
+        let mut batch = batch;
+        if batch.first_line_number < self.session_floor {
+            let last = batch
+                .first_line_number
+                .saturating_add(batch.lines.len() as u64 - 1);
+            if last < self.session_floor {
+                self.high_water_line = self.high_water_line.max(last + 1);
+                tracing::debug!(
+                    exec_id = %self.exec_id,
+                    first_line_number = batch.first_line_number,
+                    session_floor = self.session_floor,
+                    "dropped below-floor replay batch: already durable per the manifest"
+                );
+                return Ok(AcceptOutcome::CoveredReplay {
+                    durable_through: last,
+                });
+            }
+            let cut = (self.session_floor - batch.first_line_number) as usize;
+            batch.lines.drain(..cut);
+            batch.first_line_number = self.session_floor;
+            tracing::debug!(
+                exec_id = %self.exec_id,
+                trimmed = cut,
+                session_floor = self.session_floor,
+                "trimmed a straddling replay batch at the durable floor"
+            );
         }
 
         // -- The input gates, delegated to the pure kernel

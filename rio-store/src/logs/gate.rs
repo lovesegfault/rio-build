@@ -1606,9 +1606,16 @@ mod tests {
         // singles [c,c+1), [c+1,c+2); session B mints the containing
         // wide [c,c+3) (one new line — never fully covered, so the
         // consult admits it), which prunes A's singles from the merged
-        // account. 8-byte lines: 40 accounted bytes each.
+        // account. 8-byte lines: 40 accounted bytes each. The orbit
+        // holds a GAP AT LINE 0 (c starts at 1, line 0 never written):
+        // contiguous-from-zero coverage would seed the session floor
+        // and the floor trim would behead every wide into a fresh
+        // single, collapsing the prune — the honest contiguous shape
+        // is defended by the floor, so the adversarial orbit lives in
+        // the gapped shapes, which is exactly why the raw-row ceiling
+        // (not any coverage heuristic) is the load-bearing bound.
         let mut refusal: Option<(usize, Status)> = None;
-        let mut c: u64 = 0;
+        let mut c: u64 = 1;
         'blocks: for block in 0..8usize {
             for (open, batches) in [(0, vec![(c, 1), (c + 1, 1)]), (1, vec![(c, 3)])] {
                 match attack_session(&db.pool, &store, exec, caps, &batches, 8, block * 2 + open)
@@ -1804,6 +1811,142 @@ mod tests {
         );
         assert_eq!(gate3.seed.raw_rows, 2, "one chunk per session, no replays");
         assert_eq!(store.len(), 2);
+    }
+
+    /// W11-E (bug_032). Proposition: **re-sent committed bytes are
+    /// never re-charged** — at the session lifecycle's own quantifier,
+    /// across reconnect — and the cap trip threshold is unreachable
+    /// below true content. The pre-fix shape seeded `accepted_bytes`
+    /// from exec-lifetime merged coverage while the session floor was
+    /// zero, so a reconnect frame straddling the durable prefix
+    /// re-charged the committed lines and tripped the permanent
+    /// `FAILED_PRECONDITION` cap below the true cap, abandoning the
+    /// tail. Population includes the STRADDLING-CHUNK cell (the
+    /// cross-WO composition pin against WO-S1-1's frozen measure): the
+    /// stored chunk and its accounted bytes contain ONLY
+    /// above-watermark lines — bytes durably written == bytes raw
+    /// charged, never written-but-uncharged.
+    #[tokio::test]
+    async fn reconnect_replay_of_committed_tail_is_not_recharged() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let exec = Uuid::now_v7();
+        // 50-byte lines charge 82 accounted each. Ten committed lines
+        // = 820; a 12-line straddling replay = 984; the cap admits the
+        // true content (820 + 164 new = 984 ≤ 1024) but not a
+        // double-charge (820 + 984 = 1804).
+        let caps = OpenCaps {
+            per_exec_byte_cap: 1024,
+            max_chunks_per_exec: 100,
+        };
+        let config = || IngestConfig {
+            per_exec_byte_cap: 1024,
+            cut_threshold_bytes: u64::MAX,
+            cut_interval: Duration::from_secs(60),
+        };
+        let mk_lines = |first: u64, n: u64| -> Vec<Vec<u8>> {
+            (0..n)
+                .map(|i| {
+                    let mut l = vec![b'x'; 50];
+                    let tag = format!("L{}", first + i);
+                    l[..tag.len()].copy_from_slice(tag.as_bytes());
+                    l
+                })
+                .collect()
+        };
+
+        // Session 1: lines [0,10) accepted and cut; the acks are lost
+        // (fire-and-forget drain) — the builder still holds them.
+        let gate1 = finish_open(
+            &db.pool,
+            "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm".into(),
+            exec,
+            caps,
+        )
+        .await
+        .expect("fresh exec admits");
+        let mut s1 = IngestSession::new(&gate1, Uuid::now_v7(), config());
+        s1.accept(BuildLogBatch {
+            derivation_path: DRV_PATH.into(),
+            lines: mk_lines(0, 10),
+            first_line_number: 0,
+            executor_id: String::new(),
+        })
+        .unwrap();
+        assert_eq!(s1.cut(&store, &db.pool).await.unwrap(), Some(9));
+        drop(s1);
+
+        // Session 2: the reconnect replays the un-acked frame [0,12) —
+        // ten committed lines plus two new ones, one straddling frame.
+        let gate2 = finish_open(
+            &db.pool,
+            "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm".into(),
+            exec,
+            caps,
+        )
+        .await
+        .expect("the reconnect admits");
+        assert_eq!(gate2.seed.merged_bytes, 820);
+        let mut s2 = IngestSession::new(&gate2, Uuid::now_v7(), config());
+        let outcome = s2
+            .accept(BuildLogBatch {
+                derivation_path: DRV_PATH.into(),
+                lines: mk_lines(0, 12),
+                first_line_number: 0,
+                executor_id: String::new(),
+            })
+            .expect(
+                "left (pre-fix): the straddling replay re-charges its committed \
+                 prefix (820 + 984 = 1804 > 1024) and trips the permanent cap \
+                 below true content — the tail is abandoned / right: the \
+                 below-floor prefix is trimmed; only the two new lines charge \
+                 (820 + 164 = 984 ≤ 1024)",
+            );
+        assert!(
+            matches!(
+                outcome,
+                super::super::ingest::AcceptOutcome::Accepted { .. }
+            ),
+            "the straddling frame's tail is accepted, got {outcome:?}"
+        );
+        assert_eq!(
+            s2.cut(&store, &db.pool).await.unwrap(),
+            Some(11),
+            "the new tail cuts durably"
+        );
+
+        // The straddling-chunk composition cell: the stored chunk holds
+        // ONLY the above-watermark lines and charges exactly them.
+        let (first_line, line_count, accounted): (i64, i64, i64) = sqlx::query_as(
+            "SELECT first_line, line_count, accounted_bytes FROM drv_log_chunks \
+             WHERE exec_id = $1 ORDER BY first_line DESC LIMIT 1",
+        )
+        .bind(exec)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (first_line, line_count, accounted),
+            (10, 2, 164),
+            "the stored chunk contains only above-watermark lines and its \
+             accounted bytes charge exactly them (written == charged)"
+        );
+
+        // And the next seed agrees on both algebras: no duplicate rows,
+        // every line charged once.
+        let gate3 = finish_open(
+            &db.pool,
+            "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm".into(),
+            exec,
+            caps,
+        )
+        .await
+        .expect("still under every cap: the true content never trips");
+        assert_eq!(
+            (gate3.seed.merged_bytes, gate3.seed.raw_bytes),
+            (984, 984),
+            "re-sent committed bytes were never re-charged"
+        );
     }
 
     /// W11-D (merged_bug_002, the measure-freeze pin). The seed SQL is
