@@ -68,17 +68,32 @@ iterate STRUCTURED extents and run their small regexes within them.
     piece_end)]`: top-level comma split within an extent (depth
     tracked over the lexed text), for macro-argument walks.
 
-`strip_cfg_test(text) -> str` is the attribute-position `#[cfg(test)]`
-pruner (merged_bug_009): ONE implementation of scope-pruning for every
-scanner, replacing the per-scanner truncate-at-first-marker walks that
-left whole production bodies unswept after an early test module
-(census_corpora.py's mid-file prune) — the xtask corpus pruner's
-attribute-position semantics, lifted here. Each cfg(test)-attributed
-ITEM (the attribute, any stacked attributes after it, and the item
-through its matching close brace or terminating `;`) is blanked
-newline-preserving; scanning RESUMES after the item. Attribute
+`strip_cfg_test(text, *, source=…) -> str` is the attribute-position
+`#[cfg(test)]` pruner (merged_bug_009): ONE implementation of
+scope-pruning for every scanner, replacing the per-scanner
+truncate-at-first-marker walks that left whole production bodies
+unswept after an early test module (census_corpora.py's mid-file
+prune) — the xtask corpus pruner's attribute-position semantics,
+lifted here. Each cfg(test)-attributed construct (the attribute, any
+stacked attributes after it, and the construct's grammatical extent)
+is blanked newline-preserving; scanning RESUMES after it. Attribute
 detection runs over the LEXED text, so a `#[cfg(test)]` lookalike
 inside a string or comment never prunes.
+
+The extent walk (WO-S8-1, merged_bug_018) is BRACKET-AWARE and
+classifies into the derived item/attachment alphabet
+(`CFG_VECTOR_ALPHABET`): `;`/`,` inside `()`/`[]`/`{}` groups never
+terminate (the `[T; 11]` array-const header no longer ends the blank
+mid-signature), and `,`-terminated attachment positions — struct
+fields, enum variants, match arms, struct-expr fields, statements —
+have their own extent rule instead of driving the brace count
+negative and blanking production code below them. The walk FAILS
+CLOSED (R22″): depth underflow, an unmatched delimiter (the
+`_match_delim` malformed-input return-n face), a missing terminator
+at EOF, or an extent it cannot classify within the alphabet raises
+`StripError` naming `source:line` — never a silent break, skip, or
+blank-to-EOF. Consumers convert the refusal into a named check
+failure (census_corpora's F″ arm is the founding plant).
 
 `selftest()` returns an error string on the first failed assertion (or
 None): an exact span/blank table over the escaped-quote families. Both
@@ -207,10 +222,283 @@ def lex(text: str, *, blank_string_bodies: bool):
 CFG_TEST_ATTR = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
 
 
-def strip_cfg_test(text: str) -> str:
+class StripError(Exception):
+    """Fail-closed scanner refusal (R22″, WO-S8-1): the extent walk
+    REFUSES any input it cannot classify within the derived alphabet —
+    depth underflow, an unmatched delimiter (the `_match_delim`
+    malformed-input face, which previously yielded a silent
+    blank-to-EOF), a missing item terminator at EOF, an unbalanced
+    generic-angle run, or an attachment head outside the alphabet.
+    Never a silent break, skip, or blank-to-EOF. The message carries
+    `<source>:<line>`; callers supply `source` (their file path) so
+    the refusal names the site."""
+
+
+def _line_of(text: str, i: int) -> int:
+    return text.count("\n", 0, min(i, len(text))) + 1
+
+
+def _match_delim_strict(lexed: str, i: int, source: str) -> int:
+    """`_match_delim`, fail-closed: an unmatched delimiter is a
+    StripError naming the opener's line — never a silent
+    run-to-EOF (the `_match_delim` malformed-input return-n face)."""
+    open_c = lexed[i]
+    close_c = _OPEN_TO_CLOSE[open_c]
+    depth = 0
+    n = len(lexed)
+    j = i
+    while j < n:
+        c = lexed[j]
+        if c == open_c:
+            depth += 1
+        elif c == close_c:
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    raise StripError(
+        f"{source}:{_line_of(lexed, i)}: unmatched `{open_c}` — the "
+        f"cfg(test) extent walk refuses malformed delimiters "
+        f"(fail-closed; previously a silent blank-to-EOF)"
+    )
+
+
+_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Item keywords that terminate at a top-level `;` (brace groups along
+# the way — struct-literal/match initializers — are skipped whole).
+_SEMI_ITEMS = {"const", "static", "type", "use", "extern crate"}
+# Item keywords whose extent ends at their first top-level `{…}` body
+# (or a `;` arriving first: `mod m;`, bodyless fn, unit/tuple struct).
+_BODY_ITEMS = {"fn", "mod", "impl", "trait", "enum", "struct", "union", "extern"}
+# Heads a COMMA-position attachment (field / variant / arm /
+# struct-expr field / statement) may legally start with. Anything
+# else is outside the derived alphabet and REFUSES.
+_ATTACH_HEAD_OK = set("([&|<'._-\"") | {"digit", "word"}
+
+
+def _skip_ws(lexed: str, i: int) -> int:
+    n = len(lexed)
+    while i < n and lexed[i].isspace():
+        i += 1
+    return i
+
+
+def _classify_construct(lexed: str, i: int, source: str):
+    """Classify the construct at `i` (first token after the cfg attr
+    and stacked attrs) into the derived alphabet: returns
+    `(mode, scan_start)` where mode ∈ {"semi", "body", "macro",
+    "comma"}. Qualifiers (pub/default/unsafe/async/extern-abi/const-fn)
+    are consumed. Unclassifiable heads REFUSE (StripError)."""
+    n = len(lexed)
+    while True:
+        i = _skip_ws(lexed, i)
+        if i >= n:
+            raise StripError(
+                f"{source}:{_line_of(lexed, i)}: cfg(test) attribute at "
+                f"EOF with no attached construct — refusing"
+            )
+        m = _WORD_RE.match(lexed, i)
+        if not m:
+            break
+        w = m.group(0)
+        if w == "pub":
+            i = _skip_ws(lexed, m.end())
+            if i < n and lexed[i] == "(":
+                i = _match_delim_strict(lexed, i, source)
+            continue
+        if w in ("default", "unsafe", "async", "auto"):
+            i = m.end()
+            continue
+        if w == "const":
+            j = _skip_ws(lexed, m.end())
+            m2 = _WORD_RE.match(lexed, j)
+            if m2 and m2.group(0) == "fn":
+                i = j
+                continue  # `const fn` — the const is a qualifier
+            return "semi", m.end()
+        if w == "extern":
+            j = _skip_ws(lexed, m.end())
+            if j < n and lexed[j] == '"':
+                # ABI string (body blanked by the lexer, delims kept):
+                # skip it, then loop — `extern "C" fn` / `extern "C" {`.
+                k = j + 1
+                while k < n and lexed[k] != '"':
+                    k += 1
+                i = k + 1
+                continue
+            m2 = _WORD_RE.match(lexed, j)
+            if m2 and m2.group(0) == "crate":
+                return "semi", m2.end()
+            return "body", j  # bare `extern { … }` foreign mod
+        if w == "macro_rules":
+            return "macro", m.end()
+        if w in _SEMI_ITEMS:
+            return "semi", m.end()
+        if w in _BODY_ITEMS:
+            return "body", m.end()
+        # A (possibly `::`-qualified) ident: a macro invocation in item
+        # position (`name! { … }` / `path::name!(…);`) or a COMMA-mode
+        # attachment head (field name, variant, pattern start).
+        j = m.end()
+        while True:
+            k = _skip_ws(lexed, j)
+            if lexed.startswith("::", k):
+                k = _skip_ws(lexed, k + 2)
+                m2 = _WORD_RE.match(lexed, k)
+                if not m2:
+                    break
+                j = m2.end()
+                continue
+            break
+        k = _skip_ws(lexed, j)
+        if k < n and lexed[k] == "!":
+            return "macro", k + 1
+        return "comma", i
+    # Non-word head: a bare `{…}` group (extern-block body reached via
+    # the qualifier loop, block statement) rides the comma walk's
+    # group rule; otherwise legal only for COMMA-position attachments
+    # (tuple-field types start at `(`… patterns at `&`/`|`/literals).
+    c = lexed[i]
+    if c == "{":
+        return "comma", i
+    head = "digit" if c.isdigit() else c
+    if head in _ATTACH_HEAD_OK:
+        return "comma", i
+    raise StripError(
+        f"{source}:{_line_of(lexed, i)}: cfg(test) attribute attached to "
+        f"an unclassifiable construct head `{c}` — outside the derived "
+        f"item/attachment alphabet; refusing (fail-closed)"
+    )
+
+
+def _extent_end(lexed: str, attr_start: int, i: int, source: str) -> int:
+    """End (exclusive) of the cfg-gated construct starting at `i`.
+    Bracket-aware: `;`/`,` inside `()`/`[]`/`{}` groups never
+    terminate (the merged_bug_018 array-const hole); `,`-terminated
+    attachment positions (struct fields, enum variants, match arms,
+    struct-expr fields — the negative-depth blank-out hole) get their
+    own rule. Fail-closed per R22″ (StripError, see class doc)."""
+    n = len(lexed)
+    mode, i = _classify_construct(lexed, i, source)
+    err_line = _line_of(lexed, attr_start)
+
+    if mode == "macro":
+        # `macro_rules! name {…}` / `name!{…}` (optional `;`) /
+        # `name!(…);` / `name![…];` — the PD-6 invocation cells.
+        i = _skip_ws(lexed, i)
+        if i < n and lexed[i] == "!":  # macro_rules path: `!` not yet eaten
+            i = _skip_ws(lexed, i + 1)
+        m = _WORD_RE.match(lexed, i)  # `macro_rules! NAME`
+        if m:
+            i = _skip_ws(lexed, m.end())
+        if i >= n or lexed[i] not in "([{":
+            raise StripError(
+                f"{source}:{err_line}: cfg(test) macro form without a "
+                f"delimiter group — refusing"
+            )
+        brace_form = lexed[i] == "{"
+        i = _match_delim_strict(lexed, i, source)
+        j = _skip_ws(lexed, i)
+        if brace_form:
+            return j + 1 if j < n and lexed[j] == ";" else i
+        if j >= n or lexed[j] != ";":
+            raise StripError(
+                f"{source}:{err_line}: cfg(test) `name!(…)`/`name![…]` "
+                f"item without its terminating `;` — refusing"
+            )
+        return j + 1
+
+    if mode in ("semi", "body"):
+        while i < n:
+            c = lexed[i]
+            if c in "([":
+                i = _match_delim_strict(lexed, i, source)
+                continue
+            if c == "{":
+                end = _match_delim_strict(lexed, i, source)
+                if mode == "body":
+                    return end
+                i = end  # semi items skip initializer braces whole
+                continue
+            if c == ";":
+                return i + 1
+            if c in ")]}":
+                raise StripError(
+                    f"{source}:{err_line}: cfg(test) item extent hit the "
+                    f"enclosing `{c}` before its terminator — depth "
+                    f"underflow; refusing (fail-closed, previously a "
+                    f"silent mis-extent)"
+                )
+            i += 1
+        raise StripError(
+            f"{source}:{err_line}: cfg(test) item extent ran to EOF "
+            f"without a terminator — refusing (previously a silent "
+            f"blank-to-EOF)"
+        )
+
+    # COMMA mode: struct field / enum variant / match arm /
+    # struct-expr field / statement. Ends at a top-level `,` or `;`
+    # (consumed), BEFORE the enclosing closer (last member, no
+    # trailing comma), or after a `{…}` group not followed by `,`
+    # (block arms, brace variants). Generic angles tracked so
+    # `HashMap<String, u64>` commas never terminate; `->`/`=>`
+    # excluded; an unbalanced angle run at the boundary REFUSES.
+    angle = 0
+    prev = ""
+    while i < n:
+        c = lexed[i]
+        if c in "([":
+            i = _match_delim_strict(lexed, i, source)
+            prev = ")"
+            continue
+        if c == "{":
+            end = _match_delim_strict(lexed, i, source)
+            j = _skip_ws(lexed, end)
+            if angle:
+                raise StripError(
+                    f"{source}:{err_line}: cfg(test) attachment extent "
+                    f"closed a brace group inside an unbalanced generic-"
+                    f"angle run — refusing (fail-closed)"
+                )
+            if j < n and lexed[j] == ",":
+                return j + 1
+            return end
+        if c == "<":
+            angle += 1
+        elif c == ">" and prev not in "-=" and angle > 0:
+            angle -= 1
+        elif c in ",;" and angle == 0:
+            return i + 1
+        elif c in ")]}":
+            if angle:
+                raise StripError(
+                    f"{source}:{err_line}: cfg(test) attachment extent "
+                    f"hit the enclosing `{c}` with an unbalanced "
+                    f"generic-angle run — refusing (fail-closed)"
+                )
+            return i  # enclosing closer: end exclusive (last member)
+        if not c.isspace():
+            prev = c
+        i += 1
+    raise StripError(
+        f"{source}:{err_line}: cfg(test) attachment extent ran to EOF — "
+        f"refusing (previously a silent blank-to-EOF)"
+    )
+
+
+def strip_cfg_test(text: str, *, source: str = "<input>") -> str:
     """Attribute-position `#[cfg(test)]` pruner — see the module
     docstring. Returns the ORIGINAL text with each cfg(test)-attributed
-    item blanked (newlines kept; line numbers stable)."""
+    construct blanked (newlines kept; line numbers stable).
+
+    WO-S8-1 (merged_bug_018): the extent walk is bracket-aware (`;`
+    inside `[]`/`()` is not an item end — the `[T; 11]` array-const
+    header no longer ends the blank mid-signature) and `,`-terminated
+    attachment positions (cfg(test) struct fields, enum variants,
+    match arms, struct-expr fields) have their own extent rule instead
+    of driving the brace count negative and blanking production code.
+    Refusals are StripError naming `source:line` (R22″ fail-closed);
+    callers pass `source` so the error names the real file."""
     lexed, _ = lex(text, blank_string_bodies=True)
     out = list(text)
     n = len(text)
@@ -224,47 +512,139 @@ def strip_cfg_test(text: str) -> str:
         i = m.end()
         # Skip whitespace and any stacked attribute blocks after the
         # cfg(test) attr (`#[allow(...)]`, multi-line attrs — bracket
-        # matched on the lexed text). Doc comments are already blank.
+        # matched fail-closed on the lexed text). Doc comments are
+        # already blank.
         while True:
-            while i < n and lexed[i].isspace():
-                i += 1
+            i = _skip_ws(lexed, i)
             if i < n and lexed[i] == "#":
-                j = i + 1
-                while j < n and lexed[j].isspace():
-                    j += 1
+                j = _skip_ws(lexed, i + 1)
                 if j < n and lexed[j] == "[":
-                    depth = 1
-                    j += 1
-                    while j < n and depth:
-                        if lexed[j] == "[":
-                            depth += 1
-                        elif lexed[j] == "]":
-                            depth -= 1
-                        j += 1
-                    i = j
+                    i = _match_delim_strict(lexed, j, source)
                     continue
             break
-        # The item extent: through the matching close of its first
-        # top-level `{` (fn/mod/impl bodies), or a `;` at depth 0 if
-        # one lands first (use decls, consts, type aliases).
-        depth = 0
-        j = i
-        end = n
-        while j < n:
-            c = lexed[j]
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    end = j + 1
-                    break
-            elif c == ";" and depth == 0:
-                end = j + 1
-                break
-            j += 1
+        end = _extent_end(lexed, m.start(), i, source)
         blank(m.start(), end)
     return "".join(out)
+
+
+# --- the derived vector alphabet (WO-S8-1, R22″ banner) ---------------
+#
+# [GEN-SET] — the vector ALPHABET is derived from the HOST GRAMMAR's
+# attribute-position list, never author-typed: syn 2.x's `syn::Item`
+# variant set (Const / Enum / ExternCrate / Fn / ForeignMod / Impl /
+# Macro / Mod / Static / Struct / Trait / TraitAlias / Type / Union /
+# Use — the item positions the canonical xtask pruner walks) PLUS the
+# non-item attachment positions an attribute may legally occupy
+# (enum Variant, named Field, tuple Field, match Arm, struct-expr
+# FieldValue, Statement). Per cell the generator emits one vector per
+# bracket-`;`/`,` placement the form admits (array-`;` in types and
+# initializers, brace initializers, optional trailing `;` on
+# brace-form macro invocations, trailing-comma vs last-member
+# attachment) — so every grammatical cell the walk must handle has a
+# vector, and the selftest's completeness pin asserts every alphabet
+# cell yielded vectors and every vector passed (a silently dropped
+# cell is a red). Regenerate by re-deriving against syn's Item enum;
+# excluded by record: const-generic default-brace headers
+# (`<const N: usize = {3}>`) — outside the placement product, refused
+# or mis-extented by no live form.
+_T = "cfg_gated_payload"  # the gated token: must be blanked
+_P = "prod_marker"  # the production token: must survive
+
+CFG_VECTOR_ALPHABET = [
+    # (cell, [vector source, …]) — each vector embeds _T inside the
+    # gated construct and _P in production code around it.
+    ("Const", [
+        f"#[cfg(test)]\nconst {_T}: u8 = 1;\nfn {_P}() {{}}\n",
+        # W11-BQ: the floor.rs array-const header — `;` inside the
+        # type's `[…]` plus a brace-block initializer.
+        f"#[cfg(test)]\nconst {_T}: [u8; 11] = {{\n    [1; 11]\n}};\nfn {_P}() {{}}\n",
+        f"#[cfg(test)]\nconst {_T}: [u8; 3] = [1, 2, 3];\nfn {_P}() {{}}\n",
+    ]),
+    ("Enum", [f"#[cfg(test)]\nenum {_T} {{ A, B }}\nfn {_P}() {{}}\n"]),
+    ("ExternCrate", [f"#[cfg(test)]\nextern crate {_T};\nfn {_P}() {{}}\n"]),
+    ("Fn", [
+        f"#[cfg(test)]\nfn {_T}() {{ x(); }}\nfn {_P}() {{}}\n",
+        f"#[cfg(test)]\nfn {_T}(x: [u8; 2]) -> [u8; 2] {{ x }}\nfn {_P}() {{}}\n",
+        f"trait Tr {{\n    #[cfg(test)]\n    fn {_T}(&self);\n    fn {_P}(&self);\n}}\n",
+    ]),
+    ("ForeignMod", [f'#[cfg(test)]\nextern "C" {{ fn {_T}(); }}\nfn {_P}() {{}}\n']),
+    ("Impl", [
+        f"struct S;\n#[cfg(test)]\nimpl S {{ fn {_T}(&self) {{}} }}\nfn {_P}() {{}}\n",
+        f"#[cfg(test)]\nimpl Tr for [u8; 3] {{ fn {_T}(&self) {{}} }}\nfn {_P}() {{}}\n",
+    ]),
+    ("Macro", [
+        # PD-6: item-position macro invocations — brace form without
+        # `;`, brace form WITH `;`, paren/bracket forms with `;`.
+        f"#[cfg(test)]\nlazy_static! {{ static ref {_T}: u8 = 1; }}\nfn {_P}() {{}}\n",
+        f"#[cfg(test)]\nmint! {{ {_T} }};\nfn {_P}() {{}}\n",
+        f"#[cfg(test)]\nthread_local!(static {_T}: u8 = 1);\nfn {_P}() {{}}\n",
+        f"#[cfg(test)]\ndeclare![{_T}, 2];\nfn {_P}() {{}}\n",
+        f"#[cfg(test)]\nmacro_rules! {_T} {{ () => {{}} }}\nfn {_P}() {{}}\n",
+        f"#[cfg(test)]\npaste::paste! {{ fn {_T}() {{}} }}\nfn {_P}() {{}}\n",
+    ]),
+    ("Mod", [
+        f"#[cfg(test)]\nmod {_T} {{ fn t() {{}} }}\nfn {_P}() {{}}\n",
+        f"#[cfg(test)]\nmod {_T};\nfn {_P}() {{}}\n",
+    ]),
+    ("Static", [f'#[cfg(test)]\nstatic {_T}: [u8; 4] = [0; 4];\nfn {_P}() {{}}\n']),
+    ("Struct", [
+        f"#[cfg(test)]\nstruct {_T} {{ a: u8 }}\nfn {_P}() {{}}\n",
+        f"#[cfg(test)]\nstruct {_T}(u8);\nfn {_P}() {{}}\n",
+        f"#[cfg(test)]\nstruct {_T};\nfn {_P}() {{}}\n",
+    ]),
+    ("Trait", [f"#[cfg(test)]\ntrait {_T} {{ fn m(&self); }}\nfn {_P}() {{}}\n"]),
+    ("TraitAlias", [f"#[cfg(test)]\ntrait {_T} = Send;\nfn {_P}() {{}}\n"]),
+    ("Type", [f"#[cfg(test)]\ntype {_T} = [u8; 8];\nfn {_P}() {{}}\n"]),
+    ("Union", [f"#[cfg(test)]\nunion {_T} {{ a: u8, b: i8 }}\nfn {_P}() {{}}\n"]),
+    ("Use", [
+        f"#[cfg(test)]\nuse {_T}::y;\nfn {_P}() {{}}\n",
+        f"#[cfg(test)]\nuse x::{{{_T}, z}};\nfn {_P}() {{}}\n",
+    ]),
+    # Non-item attachment positions (the comma-rule alphabet).
+    ("Variant", [
+        # PD-6: the enum-variant comma cell — the same negative-depth
+        # class as the field hole.
+        f"enum E {{\n    A,\n    #[cfg(test)]\n    {_T},\n    {_P},\n}}\n",
+        f"enum E {{\n    A,\n    #[cfg(test)]\n    {_T}(u8),\n    {_P},\n}}\n",
+        f"enum E {{\n    {_P},\n    #[cfg(test)]\n    {_T} {{ x: u8 }}\n}}\n",
+    ]),
+    ("FieldNamed", [
+        # W11-BR: the executor.rs `,`-terminated cfg(test) struct
+        # field — the live false-PASS blank-out hole.
+        f"struct S {{\n    a: u8,\n    #[cfg(test)]\n    {_T}: Option<X>,\n    {_P}: u8,\n}}\nfn live() {{ {_P}2(); }}\n",
+        f"struct S {{\n    #[cfg(test)]\n    {_T}: HashMap<String, u64>,\n    {_P}: u8,\n}}\n",
+        f"struct S {{\n    {_P}: u8,\n    #[cfg(test)]\n    {_T}: u8\n}}\n",
+    ]),
+    ("FieldTuple", [
+        # PD-6: the tuple-field paren cell.
+        f"struct S(u8, #[cfg(test)] {_T}, {_P});\nfn live() {{}}\n",
+        f"struct S({_P}, #[cfg(test)] {_T});\nfn live() {{}}\n",
+    ]),
+    ("Arm", [
+        f"fn f(x: u8) {{ match x {{\n    1 => a(),\n    #[cfg(test)]\n    2 => {_T}(),\n    _ => {_P}(),\n}} }}\n",
+        f"fn f(x: u8) {{ match x {{\n    #[cfg(test)]\n    2 => {{ {_T}() }}\n    _ => {_P}(),\n}} }}\n",
+    ]),
+    ("FieldValue", [
+        # The executor.rs:80 cell: cfg(test) on a struct-EXPRESSION
+        # field init.
+        f"fn f() -> S {{ S {{\n    a: 1,\n    #[cfg(test)]\n    {_T}: None,\n    b: {_P},\n}} }}\n",
+    ]),
+    ("Statement", [
+        f"fn f() {{\n    #[cfg(test)]\n    let {_T} = 1;\n    {_P}();\n}}\n",
+    ]),
+]
+
+# Refusal cells (R22″ fail-closed): one co-located plant per refusal
+# arm of the walk — (cell, source, line the error must name).
+CFG_REFUSAL_VECTORS = [
+    ("unmatched-delim", "#[cfg(test)]\nfn broken( {\n", 2),
+    ("missing-terminator-eof", "#[cfg(test)]\nconst X: u8 = 1", 1),
+    ("item-depth-underflow", "#[cfg(test)]\nuse a::b }\n", 1),
+    ("unclassifiable-head", "#[cfg(test)]\n}\n", 2),
+    ("attachment-eof", "struct S {\n    #[cfg(test)]\n    f: u8", 2),
+    ("angle-imbalance", "struct S {\n    #[cfg(test)]\n    f: Vec<u8,\n}\n", 2),
+    ("macro-missing-semi", "#[cfg(test)]\nm!(x)\n", 1),
+]
 
 
 _OPEN_TO_CLOSE = {"(": ")", "[": "]", "{": "}"}
@@ -509,6 +889,66 @@ def selftest() -> str | None:
         return f"const-array strings wrong: {vals}"
     if const_array_strings(t, "MISSING") != []:
         return "const-array on a missing const not empty"
+    # --- WO-S8-1 (merged_bug_018, R22″ banner): the derived vector
+    # alphabet + the fail-closed refusal arms -------------------------
+    # W11-BS — the generator's completeness pin, at the quantifier it
+    # actually certifies: every cell of the DERIVED alphabet (the syn
+    # Item set + attachment positions, grammar⊇language by derivation,
+    # never a hand list) has ≥1 vector; every vector blanks its gated
+    # payload, keeps every production marker, and preserves line
+    # numbering. A silently dropped cell is a red here.
+    expected_cells = {
+        # syn::Item variants (the host grammar's item positions) …
+        "Const", "Enum", "ExternCrate", "Fn", "ForeignMod", "Impl",
+        "Macro", "Mod", "Static", "Struct", "Trait", "TraitAlias",
+        "Type", "Union", "Use",
+        # … plus the non-item attachment positions.
+        "Variant", "FieldNamed", "FieldTuple", "Arm", "FieldValue",
+        "Statement",
+    }
+    got_cells = {cell for cell, _ in CFG_VECTOR_ALPHABET}
+    if got_cells != expected_cells:
+        return (
+            f"W11-BS: vector alphabet drifted from the derived cell set — "
+            f"missing {sorted(expected_cells - got_cells)}, "
+            f"extra {sorted(got_cells - expected_cells)}"
+        )
+    for cell, vectors in CFG_VECTOR_ALPHABET:
+        if not vectors:
+            return f"W11-BS: alphabet cell {cell} has zero vectors"
+        for v in vectors:
+            try:
+                stripped = strip_cfg_test(v, source=f"vector/{cell}")
+            except StripError as e:
+                return f"vector ({cell}) refused a grammatical form: {e}"
+            if _T in stripped:
+                return f"vector ({cell}): gated payload classified production: {stripped!r}"
+            if stripped.count(_P) != v.count(_P):
+                return f"vector ({cell}): production blanked (the W11-BR class): {stripped!r}"
+            if stripped.count("\n") != v.count("\n"):
+                return f"vector ({cell}): line numbering broke"
+    # W11-BQ post-fix: the floor.rs array-const artifacts die — no
+    # stray `11] = {` mid-signature tail, no leaked const body.
+    bq = strip_cfg_test(
+        "#[cfg(test)]\nconst W: [u8; 11] = {\n    [1; 11]\n};\nfn live() {}\n"
+    )
+    if "11] = {" in bq or "[1; 11]" in bq:
+        return f"W11-BQ: array-const mid-signature break survived: {bq!r}"
+    if "fn live" not in bq:
+        return f"W11-BQ: production after the const was blanked: {bq!r}"
+    # The refusal arms (R22″ fail-closed): one co-located plant per
+    # arm; the error must NAME source:line, never silently accept.
+    # (W11-BR's negative-depth vector doubles as the attachment-eof /
+    # underflow refusal family; the unmatched-delim plant covers the
+    # `_match_delim` return-n face.)
+    for cell, src, want_line in CFG_REFUSAL_VECTORS:
+        try:
+            strip_cfg_test(src, source=f"refusal/{cell}")
+        except StripError as e:
+            if f"refusal/{cell}:{want_line}" not in str(e):
+                return f"refusal ({cell}): error does not name source:line — {e}"
+        else:
+            return f"refusal ({cell}): malformed input silently accepted (fail-open)"
     return None
 
 

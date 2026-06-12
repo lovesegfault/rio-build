@@ -153,13 +153,19 @@ MATCHES_CODE = re.compile(r"matches!\s*\(\s*[^;]{0,400}?\bCode::", re.S)
 SHADOW_STRIPPER = re.compile(r"\.split\(\s*['\"]/" + r"/['\"]\s*\)")
 
 
-def strip_production(text: str) -> str:
+def strip_production(text: str, source: str = "<input>") -> str:
     """The shared production-scan pipeline (merged_bug_009): the
     attribute-position cfg(test) pruner, then comments AND string
     bodies blanked — newline-preserving throughout, so violation line
     numbers are stable. Mid-file test modules are pruned in place;
-    production code after them stays in the scan."""
-    pruned = rust_strip.strip_cfg_test(text)
+    production code after them stays in the scan.
+
+    WO-S8-1 (R22″): the pruner FAILS CLOSED — a `StripError` (depth
+    underflow, unmatched delimiter, unclassifiable extent) propagates
+    to the per-file scan loop, which converts it into a named
+    violation instead of skipping the file or scanning a mis-pruned
+    population."""
+    pruned = rust_strip.strip_cfg_test(text, source=source)
     out, _ = rust_strip.lex(pruned, blank_string_bodies=True)
     return out
 
@@ -226,7 +232,13 @@ def scan_refusal_folds(files):
     fails = []
     for rel, raw in files:
         lines = raw.splitlines()
-        stripped = strip_production(raw)
+        try:
+            stripped = strip_production(raw, rel)
+        except rust_strip.StripError as e:
+            # R22″ fail-closed: an unclassifiable extent is a NAMED
+            # census failure, never a silent skip.
+            fails.append(f"{e} [refusal census: file not classifiable]")
+            continue
         for m in MATCHES_CODE.finditer(stripped):
             lineno = stripped[: m.start()].count("\n") + 1
             window = "\n".join(lines[max(0, lineno - 7) : lineno])
@@ -294,7 +306,12 @@ def scan_wire_secs_seams(files):
         # against the pre-merged_bug_009 stripper; it now rides the
         # shared production pipeline (attribute-position cfg(test)
         # prune + comment/string blanking) like every arm here.
-        stripped = strip_production(raw)
+        try:
+            stripped = strip_production(raw, rel)
+        except rust_strip.StripError as e:
+            # R22″ fail-closed (same arm as the refusal census).
+            fails.append(f"{e} [wire-secs census: file not classifiable]")
+            continue
         slines = stripped.splitlines()
 
         def flag(lineno, what):
@@ -404,6 +421,14 @@ def main() -> int:
     interior = "#[cfg(test)]\nmod tests {\n    fn t() { assert!(matches!(c, tonic::Code::Internal)); }\n}\n"
     if scan_refusal_folds([("planted/interior.rs", interior)]):
         print("FAIL: self-test arm F' — a cfg(test)-interior fold entered the production census", file=sys.stderr)
+        return 1
+    # Arm F″ (WO-S8-1, R22″ fail-closed): a file whose cfg(test)
+    # extent the pruner cannot classify is a NAMED census failure
+    # (file:line in the message), never a silent skip or a scan over
+    # a mis-pruned population.
+    refused = scan_refusal_folds([("planted/refused.rs", "#[cfg(test)]\nconst X: u8 = 1")])
+    if len(refused) != 1 or "planted/refused.rs:1" not in refused[0]:
+        print(f"FAIL: self-test arm F″ (fail-closed pruner refusal) expected the named refusal, got {refused}", file=sys.stderr)
         return 1
     # Arm G (merged_bug_009, the LEXICAL axis): a block-comment fold
     # must not fire, and a `//`-bearing URL inside a string must not
