@@ -5970,6 +5970,29 @@ rec {
       main = "materializationJobBase";
       witness = "noBuildAttempt";
     };
+    # live_061 (the matmodel-gap repair): the store short-circuit
+    # completes a node by other means while its job is open — the
+    # obsoleteOnProduced PRE-state. This witness and the next were
+    # AUTHORED with the model and never wired; the unwired pair is how
+    # a modeled transition with zero production writers stayed
+    # invisible for the system's entire life (the model demanded the
+    # obsolete resolution; nothing checked that the demand was
+    # non-vacuous, and nothing bound production to it).
+    quint-materialization-witness-store-short-circuit = mkQuintSimWitnessCheck {
+      name = "materialization-witness-store-short-circuit";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noStoreShortCircuit";
+    };
+    # live_061: obsolete-on-produced FIRES (the fold's model image is
+    # reachable — the production arm is the moot sweep's
+    # node-Completed class, sched.materialize.obsolescence).
+    quint-materialization-witness-obsolete = mkQuintSimWitnessCheck {
+      name = "materialization-witness-obsolete";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noObsolete";
+    };
 
     # ---- Materialization C-prime calibration pins ---------------------
     # The §9.3 transfer corpus, executed (the go/no-go core): each pin
