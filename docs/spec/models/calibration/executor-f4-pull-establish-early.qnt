@@ -6,8 +6,8 @@
 // representatives executor-f4-entry-not-mid-build.qnt and
 // executor-f4-establish-early.qnt were evidence modules over the
 // frozen executorSessionAsBuilt.qnt until the 2026-05-29 as-built
-// retirement deleted them — git history is the archive, the invariant
-// map's Stage-C tables hold their verdicts). The analogous contended
+// retirement deleted them — git history is the archive and holds
+// their Stage-C verdicts with the retiring commits). The analogous contended
 // state in the pull protocol is the establishment window: the establishment
 // sweep (tick_sweep_open_pull_attempts) may charge an open attempt as
 // an unreported executor crash only once the attempt's dispatch-time

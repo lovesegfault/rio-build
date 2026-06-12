@@ -12,7 +12,7 @@
 // OR the persisted claim nonce (rio-evidence-kernel
 // check_materialization_redelivery_requires_credential; the T-0e.6
 // rule-4 amendment + the rule-4b extension — status at the
-// executor-invariant-map.md rule-4 anchor, the single record). A
+// scheduler.typ pull-contract amendment anchor, the single record). A
 // colliding identity holds NEITHER credential — the falsification
 // below is unchanged.
 //

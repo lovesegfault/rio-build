@@ -694,13 +694,13 @@ pub struct MaterializationInputs<ExecId> {
     /// cannot resume an attempt it did not open, because it cannot
     /// know the exec id). Tokenless same-identity re-pulls answer
     /// `NotYetReady` and settle through the establishment window —
-    /// the T-0e.6 rule-4 amendment (status at the
-    /// executor-invariant-map.md rule-4 anchor, the single record).
+    /// the T-0e.6 rule-4 amendment (status at the scheduler.typ
+    /// pull-contract amendment anchor, the single record).
     /// Build-kind re-delivery is
     /// untouched (lost-ack resume keeps working tokenlessly).
     pub resume_exec_id: Option<ExecId>,
     /// bug_251 (rule-4b, SIGNED 2026-06-04 — the wave signature packet;
-    /// status at the executor-invariant-map.md rule-4 anchor): the
+    /// status at the scheduler.typ pull-contract amendment anchor): the
     /// client-chosen claim nonce PRESENTED on this pull
     /// (`PullAssignmentRequest.claim_nonce`, parsed at the gRPC
     /// boundary; u128 = the UUID's scalar form). The credential that
@@ -720,7 +720,7 @@ pub struct MaterializationInputs<ExecId> {
 
 // r[impl sched.materialize.claim-resume]
 /// The rule-4b re-delivery credential (SIGNED 2026-06-04; the record
-/// lives at the executor-invariant-map.md rule-4 anchor):
+/// lives at the scheduler.typ pull-contract amendment anchor):
 /// materialization re-delivery requires `held_by_puller` AND
 /// (`resume_exec_id` match OR persisted `claim_nonce` match) —
 /// credential-less same-identity re-pulls remain `NotYetReady`.
@@ -901,7 +901,7 @@ where
                 // Credential-less/mismatched same-identity re-pulls
                 // answer NotYetReady and settle through the
                 // establishment window (the T-0e.6 rule-4 amendment —
-                // status at the executor-invariant-map.md rule-4
+                // status at the scheduler.typ pull-contract amendment
                 // anchor). Pinned by
                 // `check_materialization_redelivery_requires_credential`.
                 PullAdmission::DeliverExisting { exec_id }

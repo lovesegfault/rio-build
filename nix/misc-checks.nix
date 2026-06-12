@@ -1128,8 +1128,8 @@ in
       ''
         set +o pipefail
         # bug_109: amendment status lives at exactly ONE anchor (the
-        # counter-signature record at the executor-invariant-map.md
-        # rule-4 block); every other site POINTS there instead of
+        # counter-signature record at scheduler.typ's pull-contract
+        # amendment anchor); every other site POINTS there instead of
         # restating the state. Both halves run against planted red and
         # green fixtures below before the real tree is scanned.
         scan() {
@@ -1142,8 +1142,8 @@ in
           hits=$(rg -nU -i 'pending[[:space:]/*#-]+owner[[:space:]/*#-]+counter-signature' "$dir" || true)
           if [[ -n "$hits" ]]; then
             echo "FAIL: stale 'PENDING owner counter-signature' restatement —" >&2
-            echo "amendment status lives only at the executor-invariant-map.md" >&2
-            echo "rule-4 anchor; point there instead of restating the state:" >&2
+            echo "amendment status lives only at scheduler.typ's pull-contract" >&2
+            echo "amendment anchor; point there instead of restating the state:" >&2
             echo "$hits" >&2
             fail=1
           fi

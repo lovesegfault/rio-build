@@ -16,10 +16,9 @@
 //
 // Every action cites the production function it encodes (post-deletion
 // code; function names are the anchors, never line numbers). The
-// invariant ↔ spec-rule linkage lives in
-// docs/spec/models/executor-invariant-map.md (the Phase-1c' re-target
-// record); check wiring and r[verify] markers live in nix/quint.nix,
-// never here.
+// invariant ↔ spec-rule linkage rode the Phase-1c' re-target record
+// (git history; archive note in calibration/README.md); check wiring
+// and r[verify] markers live in nix/quint.nix, never here.
 //
 // WHAT IS MODELED
 //   - One derivation (the intent) per DRVS element, with its DAG-side

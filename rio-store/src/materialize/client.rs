@@ -2118,7 +2118,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // ledger: its credential-less re-pull answers NotYetReady
             // and the attempt settles through the establishment
             // window (the T-0e.6 rule-4 amendment — status at the
-            // executor-invariant-map.md rule-4 anchor).
+            // scheduler.typ pull-contract amendment anchor).
             resume_exec_id: String::new(),
             claim_nonce: minted.nonce_string(),
             confirm_only: false,

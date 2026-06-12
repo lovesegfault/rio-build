@@ -553,7 +553,7 @@ message PullAssignmentRequest {
   // delivery stays gated scheduler-side either way).
   string resume_exec_id = 5;
   // NEW (additive, bughunt2 — bug_251 / rule-4b, SIGNED 2026-06-04 at
-  // the executor-invariant-map.md rule-4 anchor): the client-chosen
+  // the scheduler.typ pull-contract amendment anchor): the client-chosen
   // claim nonce, the resume credential that SURVIVES response loss.
   // Minted v4 by the store worker BEFORE the pull and persisted
   // scheduler-side with the assignment at mint (096), so a worker
@@ -640,7 +640,8 @@ message ReportOutcomeResponse {}
 // The attempt class a pull claims. Proto3 zero value (UNSPECIFIED) is
 // treated as BUILD by the scheduler — deployed builder pods that predate
 // this field send nothing and must keep working unchanged (the frozen
-// pull-contract addendum, executor-invariant-map.md).
+// pull-contract addendum; the sched.materialize spec rules and the
+// scheduler.typ pull-contract amendment anchor carry the contract).
 enum AttemptKind {
   ATTEMPT_KIND_UNSPECIFIED = 0;
   ATTEMPT_KIND_BUILD = 1;

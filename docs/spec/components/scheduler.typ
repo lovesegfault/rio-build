@@ -1554,7 +1554,7 @@ materialization-kind claims are the one exception,
   same-identity re-pulls MUST be answered NotYetReady and settle through
   the establishment window.
 ]
-The rule-4b amendment (executor-invariant-map.md rule-4 anchor, SIGNED
+The rule-4b amendment (the pull-contract amendment anchor below, SIGNED
 2026-06-04): the exec-id resume token travels only on the RESPONSE, so the one
 failure mode re-delivery exists for --- the lost response --- was exactly the
 case the token could never cover (bug_251). The client-chosen nonce closes it:
@@ -1564,6 +1564,126 @@ claimable listing forever, so re-listing can never recover it). Crashed
 workers (ledger lost with the process) still settle through the charged
 establishment window --- the signed residual, now reachable only by real
 crashes. Build-kind re-delivery stays credential-less (as-built).
+
+*The pull-contract amendment anchor (rule 4 / rule 4b).* Non-normative
+record. Amendment status for the frozen pull-contract addendum's rule 4
+lives at exactly THIS anchor (the bug_109 single-record discipline, enforced
+by the `amendment-status-coherence` check); every other site points here
+instead of restating the state. Relocated verbatim from the retired executor
+invariant map's rule-4 anchor block (owner directive 2026-06-12, content
+unmodified); the wire-delta rows the amendments ride are carried by the
+`build_types.proto` field comments (`resume_exec_id = 5`, `claim_nonce = 6`,
+`Aborted = 5`), and the original block is in git history.
+
+*Rule-4 amendment* (§4.4 item 7, the follow-up-ledger row-4 / 2026-06-02
+batch procedure; never fabricated): rule 4's re-delivery clause is amended
+from "the kernel's open-attempt arm re-delivers to the same composite
+identity" to "re-delivers to the same composite identity PRESENTING the
+original exec_id resume token (`resume_exec_id`)". Tokenless or mismatched
+same-identity re-pulls answer `NotYetReady` and settle through the
+establishment window. This is a BEHAVIOR CHANGE for senders without the new
+field --- identity agreement alone no longer resumes --- and is therefore
+NOT covered by extends-never-modifies; it was recorded as the contract's own
+amendment and counter-signed below. Rationale: identity agreement is
+forgeable (merged_bug_158 --- a sanitize-fold collision or a restarted pod
+re-pulls under the same composite identity without ever having held the
+attempt); the token is known only to the puller the original
+`WorkAssignment` answered. Pinned:
+`check_materialization_redelivery_requires_resume_token` + the widened
+`check_kinded_one_winner_arbitration` (CBMC, both re-proven over the widened
+domain, 13/13), the kinded unit table, and the failover re-delivery test
+(the holder now presents its token; the tokenless same-identity re-pull is
+asserted `NotYetReady`).
+
+Owner counter-signature for the rule-4 amendment: SIGNED 2026-06-04
+(collected at the bughunt-wave close-out --- the wave's final owner act).
+Checked at signing: the resume-token arm is landed and kani-proven both
+directions (evidence-kernel 19/19 at the final recount); the
+colliding-identity calibration falsifies `atMostOneClaimWinner`; the
+failover test pins the token-presenting semantics; the wire-delta table is
+complete (second-lander A4: `Aborted=5`, `store_degraded=7`,
+`resume_exec_id=5`). The amendment's behavior change for tokenless senders
+is accepted as the contract's own term.
+
+*Rule-4b amendment --- the claim-nonce credential* (bughunt2 wave, bug_251;
+recorded at this single anchor): rule 4's re-delivery clause is amended from
+"re-delivers to the same composite identity PRESENTING the original exec_id
+resume token" to the credential disjunction: materialization re-delivery
+requires `held_by_puller` AND (`resume_exec_id` match OR persisted
+`claim_nonce` match); credential-less same-identity re-pulls remain
+`NotYetReady`. The wire delta is `PullAssignmentRequest.claim_nonce = 6`
+(client-chosen v4, minted BEFORE the pull rides the wire, persisted at mint
+--- `assignments.claim_nonce`, migration 096 --- and recovered across
+failover by the recovery join). Rationale: the resume token travels only on
+the RESPONSE, so the one failure mode re-delivery exists for (the lost
+response) is exactly where no client can hold the token; the nonce survives
+the loss by construction. The establishment-window settlement remains the
+posture for credential-less senders --- now reachable only by real crashes
+(process-lost ledger), not by every lost response. The nonce leg matches
+only with BOTH sides present (absent-vs-absent refuses --- the
+Option-equality trap is centralized in the kernel's
+`redelivery_credential_ok`).
+
+Owner counter-signature for the rule-4b amendment: SIGNED 2026-06-04 (the
+§5-S R14 signature packet, collected in-conversation before any bughunt2
+worktree branched; transcribed per R14 --- that round's directive is the
+recorded authorization).
+
+_Amendment note, 2026-06-07_ (bughunt-3 S5, recorded at this anchor per R3):
+four repairs to the close's own client loop --- answered permanent refusals
+resolve the ledger entry (bug_119: no immortal entries; the lost-response
+lane is reserved for unanswered pulls); the ledger is the sole fresh-mint
+authority (merged_bug_096: a live credential is never clobbered, and
+fresh-claim `NotYetReady` KEEPS the credential --- the post-mint TOCTOU arm
+answers `NotYetReady` after persisting the nonce); the claim pass is
+single-exit (bug_116) and budgeted by potential mints (bug_099). None alters
+the signed re-delivery clause above; the signed residual is STRENGTHENED ---
+the charged establishment window is now reachable only by real crashes, no
+longer by the loop's own credential destruction. Modeled as three
+claim-plane laws in `openAttempts.qnt` (`noCredentialClobber`,
+`noRefusalFiledAsLost`, `confirmNeverMints`), each with a falsify twin.
+
+_Amendment note, 2026-06-08_ (bughunt-4 S5a, recorded at this anchor per the
+same R3 precedent): the bug_119 disposition above is NARROWED on the resume
+arm (merged_bug_074) --- only MINT-DISPROVING refusals
+(InvalidArgument/Unimplemented: the request shape can never mint) resolve
+the ledger entry; auth-layer codes (PermissionDenied/Unauthenticated --- the
+scheduler's rotation-skew trace, emitted without consulting attempt state)
+file as Unanswered, because a RESUME entry exists precisely where the
+ORIGINAL unanswered pull may have committed a mint and the auth answer
+judges only the presentation. The fresh arm is unchanged (its gates run
+pre-mint, so either flavor disproves a mint there). This restores the
+2026-06-07 note's own claim --- the charged establishment window stays
+"reachable only by real crashes, not by the loop's own credential
+destruction" --- which the recorded bug_119 letter violated exactly during
+fleet HMAC rotations. Companion budget repair (merged_bug_072): the
+fresh-claim budget derives from the surviving ledger population (claimed +
+ledger length at or above slots) and the mint authority REFUSES at capacity
+--- eviction of live rule-4b credentials is gone. The SIGNED re-delivery
+clause above is unaltered; the claim-resume rule's text is untouched (no
+tracey bump arises). Modeled in `openAttempts.qnt`: `answeredRefusalSeat`
+and `noRefusalFiledAsLost` re-scoped to the mint-disproving reading with the
+existing refusal-as-lost twin re-measured; NEW `authRefusalSeat` + live
+`claimRefusedAuthSkew` with the rotation-skew twin targeting
+`noFaultNeverCharged`; NEW `openAttemptsBudget` module
+(`outstandingBounded`) with the per-pass-overmint twin. Pinned:
+`check_materialization_redelivery_requires_credential` (REPLACES --- widens
+--- `check_materialization_redelivery_requires_resume_token` over the
+(resume OR nonce) domain; CBMC, both directions, the credential-less refusal
+preserved as the nonce-less slice) + the widened
+`check_kinded_one_winner_arbitration` (the `DeliverExisting` branch now
+proves a credential matched), the kinded unit table
+(`lost_response_nonce_resumes_claim`; the disjunction delivers past a wrong
+token; `colliding_identity_fresh_claim_gets_not_yet_ready` extended ---
+nonce agreement never overrides the one-winner refusal), the failover
+re-delivery test (`flag_on_recovery_rebuilds_job_view_and_jobs_survive`:
+wrong-nonce refused; right-nonce tokenless re-pull re-delivers the SAME
+attempt across failover --- the migration-096 persistence pin), the store
+client battery (`timeout_then_resume_recovers_lost_response`,
+`resume_ledger_lifecycle`), and the `mat-158-colliding-identity` calibration
+(header re-pointed to the credential rule; `atMostOneClaimWinner` still
+falsifies --- identity agreement alone remains forgeable, which is exactly
+what the credential gate refuses).
 
 #r("sched.materialize.routing+7")[
   A materialization outcome MUST be consumed in exactly one fenced transaction
@@ -2948,6 +3068,12 @@ tables and git history remain the historical evidence.
   hand a FOD to a builder pod or a non-FOD to a fetcher pod.
 ]
 
+// TODO: verify-repoint follow-up (recorded at the executor campaign
+// close-out): the stream-era tests carrying this rule's verify
+// markers were deleted with the machinery and the 1c' sweep
+// re-pointed only the impl markers; re-point the verify coverage at
+// the surviving spawn-side kind/arch batteries on the next touch of
+// this rule (tracey's untested query surfaces it meanwhile).
 #r("sched.dispatch.fod-builtin-any-arch+2")[
   A FOD with `system="builtin"` is eligible on any fetcher pool regardless of
   arch: the spawn path derives no architecture constraint from `"builtin"`
@@ -2984,6 +3110,12 @@ than a scheduler-side dispatch queue gauge.
   executor-side `daemon_timeout_secs` → clean `TimedOut` report path.
 ]
 
+// TODO: verify-repoint follow-up (recorded at the executor campaign
+// close-out): the stream-era tests carrying this rule's verify
+// markers were deleted with the machinery and the 1c' sweep
+// re-pointed only the impl markers; re-point the verify coverage at
+// the surviving uncharged-requeue batteries on the next touch of
+// this rule (tracey's untested query surfaces it meanwhile).
 #r("sched.reassign.no-promote-on-ephemeral-disconnect+5")[
   Requeueing a derivation because the executor that held it is gone MUST NOT
   bump `resource_floor` and MUST NOT record into

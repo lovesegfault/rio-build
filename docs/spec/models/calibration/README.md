@@ -73,12 +73,26 @@ constants use the wired Stage-B regime checks as their baseline.
 
 The verdict table — every corpus commit, its classification, override
 module, predicted vs. actual verdict, depth/state counts, and
-disposition — lives next to the owning campaign's invariant map
-(`controller-invariant-map.md`, `refcount-invariant-map.md`,
-`executor-invariant-map.md`, `closure-evidence-invariant-map.md`,
-`gw-session-invariant-map.md`,
-`substitution-replacement-invariant-map.md`, each in its Stage-C /
-Phase-0d / Phase-C-prime calibration section).
+disposition — lives at the owning campaign's surviving carrier:
+controller and refcount in their records archives
+(`docs/spec/models/controller-records.md`,
+`docs/spec/models/refcount-records.md`, with the refcount ENC/ENC-A
+rows mirrored as VERDICT ROWS in the `refcount-g*.qnt` headers);
+closure-evidence in `docs/spec/models/closure-evidence-records.md`
+plus the per-file VERDICT blocks in the `closure-*.qnt` headers;
+gw-session in the `gw-f*.qnt` VERDICT blocks plus this file's gateway
+acceptance section; materialization (substitution-replacement) in this
+file's materializationJob verdict section; retry in
+`docs/spec/models/retry-records.md`.
+
+Executor archive note: the executor campaign's frozen as-built model
+(`executorSessionAsBuilt.qnt`) and its ten Stage-C evidence modules
+were retired 2026-05-29 (owner decision, ahead of the deployment-watch
+condition) — git history at that retiring commit is the archive and
+holds the Stage-C verdict tables; the live stack (the re-targeted
+`executorSession.qnt`, its two exhaustive regimes, 12 witnesses, and
+the re-encoded `executor-f4-pull-establish-early.qnt` flip) carries
+every pin a live invariant needs.
 A subset of the overrides is wired into `nix/quint.nix` as permanent
 expect-violation checks (`quint-ctrl-calib-*`, `quint-refcount-calib-*`,
 `quint-executor-calib-*`, `quint-closure-calib-*`, `quint-gw-calib-*`,

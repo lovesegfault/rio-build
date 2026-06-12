@@ -2206,7 +2206,7 @@ pub const M_094: () = ();
 pub const M_095: () = ();
 
 /// `096_assignments_claim_nonce.sql` — bug_251 (rule-4b, SIGNED
-/// 2026-06-04 at the executor-invariant-map.md rule-4 anchor).
+/// 2026-06-04 at the scheduler.typ pull-contract amendment anchor).
 ///
 /// `assignments.claim_nonce UUID NULL`: the client-chosen claim nonce,
 /// the materialization resume credential that SURVIVES response loss.
