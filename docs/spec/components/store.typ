@@ -761,6 +761,30 @@ compile-sealed by module privacy, and the crate-wide acquire-site census
 it. Trailer mode stays delivery-priced by design --- an attacker there pays
 real bandwidth, which IS the cost axis.
 
+#r("store.budget.lane-fairness")[
+  Granularity-mismatched waiters on one budget carry a priced ORDERING
+  axis: when the pool exceeds one whole-NAR reservation, the budget MUST
+  reserve a chunk lane --- `min(pool/8, pool - MAX_NAR_SIZE)` byte-permits
+  acquirable only through the per-chunk debit face --- so an in-flight
+  trailer chunk is never starved to a shed by a whole-NAR declared
+  reservation parked at the declared face's fair-FIFO head, while the
+  parked declaration retains its FIFO liveness over a declared face that
+  never shrinks below `MAX_NAR_SIZE` (every admissible declaration stays
+  grantable). The two faces MUST sum to the constructed pool (the
+  in-flight NAR-bytes bound is unchanged), both faces MUST live inside the
+  sealed budget home as one type, and the chunk-shed disclosure MUST state
+  the measured cause (free bytes at shed versus the charge), never an
+  unconditional at-bound claim.
+]
+The parked-head freeze itself is designed and load-bearing (the
+merged_bug_101 triage correction, binding): holder sheds release the head,
+and FIFO-head admissibility is what keeps near-MAX declarations live ---
+re-queueing the head (the rejected tail-requeue fix) would trade the chunk
+starvation for indefinite declaration starvation. The lane buys both
+halves: chunks drain at bounded latency through their own face; the head
+keeps its position. Pools at or under one reservation (tests, dev
+profiles) carry no lane and keep the single-face semantics.
+
 #r("store.put.placeholder-claim+2")[
   `insert_manifest_uploading` generates a fresh `claim_id UUID` per placeholder
   and returns it to the caller. Every owner-side mutation ---

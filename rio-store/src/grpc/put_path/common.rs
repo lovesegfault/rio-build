@@ -696,17 +696,17 @@ impl StoreServiceImpl {
         // plane's retry machinery. Behavior delta (priced): deep
         // saturation longer than the grace converts from an unbounded
         // client hang into a typed shed.
-        let acquire = self
-            .nar_budget
-            .acquire_chunk(nar_chunk_charge(chunk.len()) as u32);
+        let charge = nar_chunk_charge(chunk.len()) as u32;
+        let acquire = self.nar_budget.acquire_chunk(charge);
         let permit =
             match tokio::time::timeout(self.nar_ingest_envelope.budget_wait_grace, acquire).await {
                 Ok(r) => r.map_err(|_| Status::resource_exhausted("NAR buffer budget closed"))?,
                 Err(_) => {
-                    return Err(Status::resource_exhausted(format!(
-                        "{ctx_label}: NAR buffer budget wait exceeded {:?} \
-                         (pod at its in-flight NAR-bytes bound); retry",
-                        self.nar_ingest_envelope.budget_wait_grace
+                    return Err(Status::resource_exhausted(shed_message(
+                        ctx_label,
+                        self.nar_ingest_envelope.budget_wait_grace,
+                        charge,
+                        self.nar_budget.available_permits(),
                     )));
                 }
             };
@@ -1682,6 +1682,140 @@ mod declared_budget_tests {
             t,
             "the signed tenant is the charge authority"
         );
+    }
+}
+
+/// The chunk-shed disclosure (merged_bug_101): state the MEASURED
+/// cause, never an unconditional claim. The wave-10 text said "pod at
+/// its in-flight NAR-bytes bound" on every shed, which lied exactly in
+/// the parked-head case (gigabytes free, the chunk merely queued
+/// behind a whole-NAR declared reservation). Both arms disclose the
+/// shed-instant measurement and keep the retry honesty (the same
+/// retryable class the upload plane's machinery absorbs).
+fn shed_message(ctx_label: &str, grace: Duration, charge: u32, available: usize) -> String {
+    if available >= charge as usize {
+        format!(
+            "{ctx_label}: NAR buffer budget wait exceeded {grace:?} \
+             (queued behind outstanding NAR reservations; {available} \
+             bytes free at shed >= the {charge} B charge); retry"
+        )
+    } else {
+        format!(
+            "{ctx_label}: NAR buffer budget wait exceeded {grace:?} \
+             (at the pod's in-flight NAR-bytes bound; {available} \
+             bytes free at shed < the {charge} B charge); retry"
+        )
+    }
+}
+
+#[cfg(test)]
+mod shed_message_tests {
+    use super::*;
+    use rio_test_support::TestDb;
+
+    // r[verify store.budget.lane-fairness]
+    /// W11-AS, the put_path face (merged_bug_101): the chunk-lane
+    /// fairness at the production chokepoint plus the honest shed
+    /// message. Schedule: near-full pool, a declared whole-NAR
+    /// reservation parked at the declared face's head (through the
+    /// production `DeclaredCharge` constructor on the same budget
+    /// instance the service wires), then an in-flight chunk arrives
+    /// at `accumulate_chunk`.
+    ///
+    /// Pre-fix red (verbatim in the commit body): the chunk acquire
+    /// starved behind the parked head despite ~1 GiB free and shed
+    /// with the LYING message "(pod at its in-flight NAR-bytes
+    /// bound)". Post-fix: the chunk grants through the lane within
+    /// the grace; the lying static claim is gone from the shed arm.
+    #[tokio::test]
+    async fn chunk_accumulate_drains_past_parked_declaration_with_honest_shed() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let pool_bytes = (rio_common::limits::MAX_NAR_SIZE + (1 << 30)) as usize;
+        let svc = StoreServiceImpl::new(db.pool.clone())
+            .with_nar_budget(pool_bytes)
+            .with_nar_ingest_envelope(NarIngestEnvelopeCfg {
+                budget_wait_grace: Duration::from_millis(100),
+                hold_stall_window: Duration::from_millis(5_000),
+                hold_floor_rate: 1,
+            });
+        let budget = svc.nar_budget().clone();
+        let big = rio_common::limits::MAX_NAR_SIZE - 1;
+
+        // d1 holds most of the declared face (production constructor).
+        let d1 = crate::budget::DeclaredCharge::new(
+            &budget,
+            uuid::Uuid::from_u128(0xA54),
+            crate::budget::TENANT_RESERVATION_CAP,
+            big,
+            || {},
+        )
+        .await
+        .expect("d1 grants");
+        // d2 parks at the declared face's head.
+        let d2 = tokio::spawn({
+            let budget = budget.clone();
+            async move {
+                crate::budget::DeclaredCharge::new(
+                    &budget,
+                    uuid::Uuid::from_u128(0xA55),
+                    crate::budget::TENANT_RESERVATION_CAP,
+                    big,
+                    || {},
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+
+        // The in-flight chunk at the production chokepoint.
+        let chunk = vec![0u8; 64 << 20];
+        let mut nar_data = Vec::new();
+        let mut hasher = Sha256::new();
+        let permit = svc
+            .accumulate_chunk(&mut nar_data, &mut hasher, &chunk, "w11-as")
+            .await
+            .expect(
+                "W11-AS: the in-flight chunk drains through the lane within \
+                 the grace; pre-fix it starved behind the parked declared \
+                 head and shed with the lying at-bound message",
+            );
+
+        // W11-AT control: the parked declaration retains liveness.
+        drop(d1);
+        let d2 = tokio::time::timeout(Duration::from_secs(5), d2)
+            .await
+            .expect("W11-AT: the parked declaration grants when the face frees")
+            .expect("join")
+            .expect("d2 grants");
+        drop(d2);
+        drop(permit);
+    }
+
+    /// The shed message's two measured arms (the honest causes —
+    /// pure cells over the extracted constructor): free >= charge is
+    /// the queue-position disclosure; free < charge is the in-flight
+    /// bound. The wave-10 message claimed the bound unconditionally.
+    #[test]
+    fn shed_message_states_the_measured_cause() {
+        let q = shed_message("ctx", Duration::from_secs(3), 65_536, 1 << 30);
+        assert!(
+            q.contains("queued behind outstanding NAR reservations"),
+            "free >= charge names queue position, got: {q}"
+        );
+        assert!(q.contains("retry"), "retry honesty rides every arm: {q}");
+        let b = shed_message("ctx", Duration::from_secs(3), 65_536, 256);
+        assert!(
+            b.contains("at the pod's in-flight NAR-bytes bound"),
+            "free < charge names the bound, got: {b}"
+        );
+        assert!(b.contains("retry"), "retry honesty rides every arm: {b}");
+        // Both arms disclose the measurement (free bytes at shed).
+        for m in [&q, &b] {
+            assert!(
+                m.contains("free at shed"),
+                "the measurement is disclosed: {m}"
+            );
+        }
     }
 }
 

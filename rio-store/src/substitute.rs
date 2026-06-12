@@ -7614,12 +7614,16 @@ mod tests {
             (
                 "budget.rs",
                 "acquire_many",
-                1,
+                3,
                 "NAR budget — the delivery-priced debit face \
                  (NarBudget::acquire_chunk): trailer mode's per-chunk \
                  accrual, BUDGET_WAIT_GRACE-timed grant-or-typed-shed at \
-                 its one chokepoint (accumulate_chunk). Post-seal the raw \
-                 semaphore is module-private to crate::budget — BOTH \
+                 its one chokepoint (accumulate_chunk). THREE textual \
+                 sites, one face (merged_bug_101): the legacy no-lane \
+                 arm plus the two select arms of the chunk-lane fairness \
+                 split (declared face / chunk lane — the ordering axis, \
+                 store.budget.lane-fairness). Post-seal the raw \
+                 semaphores are module-private to crate::budget — BOTH \
                  debit faces live here and ONLY here \
                  (store.put.declared-reserve, store.budget.cost-axis)",
             ),
@@ -8690,8 +8694,11 @@ fn rogue_reserve(budget: &std::sync::Arc<tokio::sync::Semaphore>, declared: u64)
     async fn tenant_reservation_charge_is_capped() {
         // Permit pool large enough that the SEMAPHORE never refuses —
         // the cap must be the binding constraint (permits are
-        // counters, not memory).
-        let budget = crate::budget::NarBudget::new((MAX_NAR_SIZE as usize) * 3);
+        // counters, not memory). 4x: the chunk-lane carve
+        // (merged_bug_101, pool/8) leaves a declared face of
+        // 3.5 x MAX_NAR_SIZE, still above the three ~MAX reservations
+        // this schedule grants.
+        let budget = crate::budget::NarBudget::new((MAX_NAR_SIZE as usize) * 4);
         let tenant_a = Uuid::new_v4();
         let tenant_b = Uuid::new_v4();
         let big = MAX_NAR_SIZE - 1;

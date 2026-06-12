@@ -123,9 +123,40 @@ pub(crate) fn declared_charge_tenant(claims: Option<&rio_auth::hmac::AssignmentC
 /// under one cost accounting.
 #[derive(Debug, Clone)]
 pub struct NarBudget {
-    /// The raw pool. PRIVATE — see the type doc: the seal is this
-    /// field's visibility.
+    /// The DECLARED face of the pool. PRIVATE — see the type doc: the
+    /// seal is this field's visibility. Declaration-priced
+    /// acquisitions (`DeclaredCharge`) draw from this face only.
     semaphore: Arc<Semaphore>,
+    /// The CHUNK LANE (merged_bug_101 — the budget law's ORDERING
+    /// axis, R17): a reserved fraction of the pool acquirable only in
+    /// chunk-sized grabs through [`Self::acquire_chunk`], so a parked
+    /// whole-NAR declared acquisition at the declared face's
+    /// fair-FIFO head cannot gate in-flight trailer chunks — the
+    /// granularity-mismatched waiters (multi-GiB heads vs 64 KiB
+    /// chunks) get separated lanes instead of one queue that forces
+    /// "shed active work to feed the head". The lane is a second face
+    /// of THIS sealed type, never a second semaphore consumers can
+    /// confuse: the two capacities sum to the constructed pool, so
+    /// the total in-flight NAR-bytes bound is unchanged.
+    ///
+    /// SIZE DERIVATION (recorded per R5): `min(pool/8,
+    /// pool - MAX_NAR_SIZE)`, zero at or under one whole-NAR
+    /// reservation. The first term is the fraction hypothesis (an
+    /// eighth of the default 32 GiB pool = 4 GiB — orders of
+    /// magnitude above the largest lawful chunk charge, so chunk
+    /// traffic drains even when several streams hold lane permits);
+    /// the second term is the declared-liveness constraint: the
+    /// declared face keeps at least `MAX_NAR_SIZE`, so every
+    /// admissible declaration (`declared < MAX_NAR_SIZE`, the
+    /// constructor's size gate) remains grantable once holders drain
+    /// — the half of the tradeoff the rejected tail-requeue fix
+    /// would have collapsed. Pools at or under `MAX_NAR_SIZE`
+    /// (tests, dev profiles) carry no lane and keep the exact
+    /// wave-10 single-face semantics.
+    chunk_lane: Arc<Semaphore>,
+    /// The lane's constructed capacity (a `Semaphore` does not expose
+    /// it once permits are held). Zero = no lane (legacy semantics).
+    chunk_lane_capacity: usize,
     /// The cost-axis accounting (one instance per pool, by
     /// construction).
     ledger: TenantReservationLedger,
@@ -133,31 +164,53 @@ pub struct NarBudget {
 
 impl NarBudget {
     /// A fresh pool of `permits` byte-permits with its own (empty)
-    /// tenant ledger.
+    /// tenant ledger. The chunk lane is carved per the derivation on
+    /// [`Self::chunk_lane`]; the two faces sum to `permits`.
     pub fn new(permits: usize) -> Self {
+        let max_nar = rio_common::semaphore_permits(MAX_NAR_SIZE);
+        let lane = (permits / 8).min(permits.saturating_sub(max_nar));
         Self {
-            semaphore: Arc::new(Semaphore::new(permits)),
+            semaphore: Arc::new(Semaphore::new(permits - lane)),
+            chunk_lane: Arc::new(Semaphore::new(lane)),
+            chunk_lane_capacity: lane,
             ledger: TenantReservationLedger::default(),
         }
     }
 
-    /// The delivery-priced per-chunk debit face (trailer mode): a
-    /// plain `acquire_many` future for `charge` permits. The caller's
-    /// chokepoint (`accumulate_chunk`) bounds the wait with
-    /// `BUDGET_WAIT_GRACE` and sheds typed on elapse — pricing is the
-    /// delivered bytes themselves, so no per-tenant ledger consult
-    /// (an attacker pays bandwidth; the cost axis is real).
-    pub(crate) fn acquire_chunk(
+    /// The delivery-priced per-chunk debit face (trailer mode):
+    /// `charge` permits from WHICHEVER face grants first — the
+    /// declared face when it has headroom (the common case), the
+    /// chunk lane when a parked declared head gates the face
+    /// (merged_bug_101). The caller's chokepoint (`accumulate_chunk`)
+    /// bounds the wait with `BUDGET_WAIT_GRACE` and sheds typed on
+    /// elapse — pricing is the delivered bytes themselves, so no
+    /// per-tenant ledger consult (an attacker pays bandwidth; the
+    /// cost axis is real). Cancel-safe: dropping the loser of the
+    /// select releases its queue position; the returned permit
+    /// credits back to the face that granted it.
+    pub(crate) async fn acquire_chunk(
         &self,
         charge: u32,
-    ) -> impl Future<Output = Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::AcquireError>>
-    {
-        self.semaphore.acquire_many(charge)
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::AcquireError> {
+        if self.chunk_lane_capacity == 0 {
+            // No lane (pool <= one whole-NAR reservation): the
+            // wave-10 single-face semantics, exactly.
+            return self.semaphore.acquire_many(charge).await;
+        }
+        tokio::select! {
+            // Biased: when both faces have headroom the declared
+            // face grants deterministically, keeping the lane free
+            // for the contention case it exists for.
+            biased;
+            r = self.semaphore.acquire_many(charge) => r,
+            r = self.chunk_lane.acquire_many(charge) => r,
+        }
     }
 
-    /// Read-only pool headroom (tests/gauges). Reads are not debits.
+    /// Read-only pool headroom (tests/gauges), summed over both
+    /// faces. Reads are not debits.
     pub fn available_permits(&self) -> usize {
-        self.semaphore.available_permits()
+        self.semaphore.available_permits() + self.chunk_lane.available_permits()
     }
 }
 
@@ -295,6 +348,12 @@ impl DeclaredCharge {
             .ledger
             .checked_charge(tenant, u64::from(charge), cap)?;
         on_park();
+        // The DECLARED face only (merged_bug_101): a parked
+        // declaration heads this face's fair FIFO without gating the
+        // chunk lane; the face keeps at least MAX_NAR_SIZE whenever
+        // the lane is active, so every admissible declaration stays
+        // grantable (the constructor's size gate refused anything
+        // larger).
         let permits = Arc::clone(&budget.semaphore)
             .acquire_many_owned(charge)
             .await
@@ -309,6 +368,106 @@ impl DeclaredCharge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // r[verify store.budget.lane-fairness]
+    /// W11-AS (merged_bug_101, the ordering axis): near-full pool, a
+    /// declared whole-NAR acquisition parked at the head of the
+    /// declared face, an in-flight chunk acquire arrives — the chunk
+    /// MUST drain at bounded latency through the chunk lane (it can
+    /// never be starved by the parked declaration), AND the parked
+    /// declaration retains its liveness over the declared face
+    /// (W11-AT: it grants when the face frees — the tradeoff the
+    /// rejected tail-requeue would collapse). Pre-fix red (verbatim
+    /// in the commit body): the single fair-FIFO parked the 64 MiB
+    /// chunk behind the ~4 GiB declared head despite ~1 GiB free —
+    /// the acquire timed out.
+    #[tokio::test]
+    async fn chunk_lane_drains_past_a_parked_declaration() {
+        // Pool = MAX_NAR_SIZE + 1 GiB: the lane derivation yields
+        // lane = min(P/8, P - MAX_NAR_SIZE) = 640 MiB, declared face
+        // = P - lane (>= MAX_NAR_SIZE by construction).
+        let pool = (MAX_NAR_SIZE + (1 << 30)) as usize;
+        let budget = NarBudget::new(pool);
+        let t1 = Uuid::from_u128(0xA51);
+        let t2 = Uuid::from_u128(0xA52);
+        let big = MAX_NAR_SIZE - 1;
+
+        // d1 holds most of the declared face.
+        let d1 = DeclaredCharge::new(&budget, t1, TENANT_RESERVATION_CAP, big, || {})
+            .await
+            .expect("d1 grants");
+        // d2 parks at the declared face's head (face free < big).
+        let d2 = tokio::spawn({
+            let budget = budget.clone();
+            async move { DeclaredCharge::new(&budget, t2, TENANT_RESERVATION_CAP, big, || {}).await }
+        });
+        tokio::task::yield_now().await;
+
+        // The in-flight chunk acquire: 64 MiB, well under the free
+        // headroom AND under the lane size. Bounded latency demanded.
+        let charge: u32 = 64 << 20;
+        let granted = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            budget.acquire_chunk(charge),
+        )
+        .await
+        .expect(
+            "W11-AS: the chunk acquire must drain at bounded latency \
+             past the parked declared head (free permits exist; only \
+             queue position blocked it pre-fix)",
+        )
+        .expect("budget open");
+
+        // W11-AT (the declared-liveness control): the parked head
+        // still grants once the declared face frees — the park kept
+        // its position; lane traffic never starved it.
+        drop(d1);
+        let d2 = tokio::time::timeout(std::time::Duration::from_secs(5), d2)
+            .await
+            .expect("W11-AT: the parked declaration grants when the face frees")
+            .expect("join")
+            .expect("d2 grants");
+        drop(d2);
+        drop(granted);
+
+        // The budget law (total in-flight <= pool) is preserved by
+        // construction: face + lane capacities sum to the pool.
+        assert_eq!(budget.available_permits(), pool, "all permits restored");
+    }
+
+    /// The lane derivation: zero on pools at or under one whole-NAR
+    /// reservation (legacy single-FIFO semantics — small/test pools
+    /// keep exact wave-10 behavior), and the declared face never
+    /// shrinks below MAX_NAR_SIZE when the lane is active (every
+    /// admissible declaration stays grantable — the W11-AT liveness
+    /// constraint, by construction).
+    #[tokio::test]
+    async fn chunk_lane_sizing_preserves_declared_liveness() {
+        // Small pool: no lane; the whole pool serves both faces.
+        let small = NarBudget::new(1024);
+        assert_eq!(small.available_permits(), 1024);
+        let p = small
+            .acquire_chunk(1024)
+            .await
+            .expect("legacy face grants the full pool");
+        drop(p);
+
+        // Large pool: lane active; a max-size declaration still
+        // grants on the declared face alone.
+        let pool = (8 * MAX_NAR_SIZE) as usize;
+        let budget = NarBudget::new(pool);
+        assert_eq!(budget.available_permits(), pool);
+        let d = DeclaredCharge::new(
+            &budget,
+            Uuid::from_u128(0xA53),
+            TENANT_RESERVATION_CAP,
+            MAX_NAR_SIZE - 1,
+            || {},
+        )
+        .await
+        .expect("a max-size declaration grants with the lane active");
+        drop(d);
+    }
 
     /// W10-A core (the law at its own quantifier — AGGREGATE, not
     /// per-charge): a single tenant's outstanding declared charges

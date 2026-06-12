@@ -18,6 +18,10 @@ rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await
+rio-store/src/grpc/put_path/common.rs	.await
+rio-store/src/grpc/put_path/common.rs	.await
+rio-store/src/grpc/put_path/common.rs	.await
+rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await?
 rio-store/src/grpc/put_path/common.rs	.await?;
 rio-store/src/grpc/put_path/common.rs	.await?;
@@ -26,6 +30,7 @@ rio-store/src/grpc/put_path/common.rs	.await?;
 rio-store/src/grpc/put_path/common.rs	None => read.await,
 rio-store/src/grpc/put_path/common.rs	Some(h) => h.bounded("PutPath ingest", read).await?,
 rio-store/src/grpc/put_path/common.rs	if let Err(e) = insert_path_tenant_rows(pool, &[store_path_hash.to_vec()], tid).await {
+rio-store/src/grpc/put_path/common.rs	let db = TestDb::new(&crate::MIGRATOR).await;
 rio-store/src/grpc/put_path/common.rs	let db = TestDb::new(&crate::MIGRATOR).await;
 rio-store/src/grpc/put_path/common.rs	let min_refused = svc.reserve_declared(1, tenant, "W10-A").await;
 rio-store/src/grpc/put_path/common.rs	let mut tx = db.pool.begin().await.unwrap();
@@ -36,6 +41,7 @@ rio-store/src/grpc/put_path/common.rs	match tokio::time::timeout(self.nar_ingest
 rio-store/src/grpc/put_path/common.rs	self.abort_upload(&info.store_path_hash, claim).await;
 rio-store/src/grpc/put_path/common.rs	self.maybe_sign(tenant_id, &mut info).await;
 rio-store/src/grpc/put_path/common.rs	self.persist_nar(&info, claim, nar_data, "PutPath").await
+rio-store/src/grpc/put_path/common.rs	tokio::task::yield_now().await;
 rio-store/src/grpc/put_path/common.rs	tokio::time::sleep(Duration::from_millis(10)).await;
 rio-store/src/grpc/put_path/mod.rs	.await
 rio-store/src/grpc/put_path/mod.rs	.await
