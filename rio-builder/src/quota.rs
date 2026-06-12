@@ -239,6 +239,7 @@ pub fn statvfs_clamped(f_blocks: u64, f_frsize: u64, hard_limit_bytes: u64) -> b
     total.abs_diff(hard_limit_bytes) <= f_frsize
 }
 
+// r[impl builder.disk.satisfiable-letter]
 /// merged_bug_074 — the DECOUPLED node-headroom sample: free bytes of
 /// the filesystem holding `dir`, taken from a vantage the project
 /// clamp cannot reach. Walks same-device ancestors of `dir` and
@@ -300,6 +301,14 @@ pub fn fs_used_bytes(dir: &Path) -> Option<u64> {
     })
 }
 
+/// `(f_blocks, f_frsize)` of the filesystem view at `dir` — the raw
+/// inputs of [`statvfs_clamped`], exposed for the prjquota VM probe
+/// (`quota_probe`) so the clamp detector runs over the same numbers
+/// in-VM as in-process. `None` on statvfs failure.
+pub fn fs_capacity_bytes(dir: &Path) -> Option<(u64, u64)> {
+    statvfs_of(dir).map(|sv| (sv.f_blocks, sv.f_frsize))
+}
+
 fn statvfs_of(dir: &Path) -> Option<libc::statvfs> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
@@ -313,8 +322,18 @@ fn statvfs_of(dir: &Path) -> Option<libc::statvfs> {
 mod tests {
     use super::*;
 
-    /// W10-CM (the unit-level matrix cells, live_057-a): the
-    /// classification predicate's truth table, including the two
+    /// W10-CM (the unit-level matrix cells, live_057-a; re-keyed at
+    /// merged_bug_074): the classification predicate's truth table
+    /// over KERNEL-POSSIBLE input pairs. Input provenance per the
+    /// satisfiable-letter contract — `used` is the during-build peak
+    /// (project view; the 1Hz monitor max-track folded with the
+    /// post-daemon one-shot), `node_free` is the DECOUPLED ancestor
+    /// sample. Under the RETIRED same-dir sampling the positive cells
+    /// were kernel-impossible (the clamp forced
+    /// `node_free = limit − used ≤ slack < headroom` exactly when the
+    /// quota conjunct held — the dead-letter pairing the prjquota VM
+    /// probe demonstrates live); under the decoupled contract every
+    /// cell below is reachable, so none are deleted. Includes the two
     /// negative corners the §1.6.4-15 order-pin's premise rides on.
     #[test]
     fn quota_exhaustion_classification_cells() {

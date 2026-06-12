@@ -19518,6 +19518,10 @@
       ],
       "crateBin": [
         {
+          "name": "quota_probe",
+          "path": "src/bin/quota_probe.rs"
+        },
+        {
           "name": "rio-builder",
           "path": "src/main.rs"
         }

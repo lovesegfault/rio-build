@@ -35,6 +35,16 @@
       "doc": "Worker log banner: a `rio:`-prefixed header at the start of every build log, and a footer after the build process exits."
     },
     {
+      "path": "bin/",
+      "depth": 0,
+      "doc": ""
+    },
+    {
+      "path": "bin/quota_probe.rs",
+      "depth": 1,
+      "doc": "quota_probe — the prjquota classification chain, runnable against a real directory (merged_bug_074's satisfiability witness, WO-S2-2)."
+    },
+    {
       "path": "cgroup.rs",
       "depth": 0,
       "doc": "Per-build cgroup v2 resource tracking."

@@ -883,7 +883,8 @@ pub async fn execute_build(
     // mounted on this path) so an OOM'd build also reports
     // peak_disk_bytes. Previously sampled only at line 11 (teardown),
     // which the `?` at build_result skipped.
-    // r[impl builder.disk.quota-classified]
+    // r[impl builder.disk.quota-classified+2]
+    // r[impl builder.disk.satisfiable-letter]
     // merged_bug_074: the classification consumes the DURING-BUILD
     // usage peak (the 1Hz monitor max-track, folded with this
     // post-daemon one-shot — keep-failed is unset, so the daemon has
@@ -1847,7 +1848,7 @@ mod tests {
     /// statfs/ENOSPC consumers in the result plane): the quota-at-
     /// limit failed build stayed PermanentFailure — the build's-own-
     /// fault lane, retry-then-poison, no floor recovery.
-    // r[verify builder.disk.quota-classified]
+    // r[verify builder.disk.quota-classified+2]
     #[test]
     fn disk_override_classifies_quota_exhausted_failures() {
         use rio_nix::protocol::build::{BuildResult, BuildStatus};

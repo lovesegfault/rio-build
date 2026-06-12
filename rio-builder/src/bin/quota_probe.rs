@@ -1,0 +1,73 @@
+//! quota_probe — the prjquota classification chain, runnable against a
+//! real directory (merged_bug_074's satisfiability witness, WO-S2-2).
+//!
+//! Drives the PRODUCTION classifier inputs exactly as the executor's
+//! result seam does — `quota::status` (usage + hard limit via
+//! `FS_IOC_FSGETXATTR` + `quotactl_fd`), the COUPLED node sample
+//! (`node_free_bytes` on the quota'd dir itself — the retired vantage
+//! the kernel clamps to the project view), the DECOUPLED sample
+//! (`node_free_bytes_decoupled` — the unowned-ancestor walk), the
+//! clamp detector, and `classify_quota_exhaustion` over both vantage
+//! pairs — and prints one `key=value` line each, so a VM test can
+//! assert the kernel-coupled truth table that unit tests structurally
+//! cannot witness (the prjquota VM probe scenario;
+//! `nix/tests/scenarios/quota-probe.nix`).
+//!
+//! Also a node-debugging tool: run it on any builder node against an
+//! emptyDir to see what the classifier would conclude there.
+//!
+//! Output grammar (one per line, `none` for absent samples):
+//!   projid, quota_used, quota_limit, coupled_node_free,
+//!   coupled_clamped, decoupled_node_free, classify_coupled,
+//!   classify_decoupled
+
+use std::path::Path;
+
+use rio_builder::quota;
+
+fn fmt<T: std::fmt::Display>(v: Option<T>) -> String {
+    v.map_or_else(|| "none".to_string(), |x| x.to_string())
+}
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let Some(dir) = args.next() else {
+        eprintln!("usage: quota_probe <dir>");
+        std::process::exit(2);
+    };
+    let dir = Path::new(&dir);
+
+    let projid = quota::project_id(dir);
+    let status = quota::status(dir).ok().flatten();
+    let used = status.map(|q| q.used_bytes);
+    let limit = status.and_then(|q| q.hard_limit_bytes);
+
+    // The retired vantage: statvfs of the quota'd dir itself. Under
+    // enforced prjquota + PROJINHERIT the kernel clamps this to the
+    // project view (f_bavail = limit - used, f_blocks ~= limit).
+    let coupled_free = quota::node_free_bytes(dir);
+    let coupled_clamped = match (quota::fs_capacity_bytes(dir), limit) {
+        (Some((blocks, frsize)), Some(l)) => Some(quota::statvfs_clamped(blocks, frsize, l)),
+        _ => None,
+    };
+
+    // The decoupled vantage: the first same-device ancestor that is
+    // neither project-owned nor clamp-shaped.
+    let decoupled_free = quota::node_free_bytes_decoupled(dir, limit);
+
+    // The classification fold, exactly as the executor's result seam
+    // evaluates it (absent inputs => no attribution).
+    let classify = |free: Option<u64>| match (status, free) {
+        (Some(q), Some(f)) => quota::classify_quota_exhaustion(q, f),
+        _ => false,
+    };
+
+    println!("projid={}", fmt(projid));
+    println!("quota_used={}", fmt(used));
+    println!("quota_limit={}", fmt(limit));
+    println!("coupled_node_free={}", fmt(coupled_free));
+    println!("coupled_clamped={}", fmt(coupled_clamped));
+    println!("decoupled_node_free={}", fmt(decoupled_free));
+    println!("classify_coupled={}", classify(coupled_free));
+    println!("classify_decoupled={}", classify(decoupled_free));
+}

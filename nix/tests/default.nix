@@ -39,6 +39,7 @@ let
   k3sProdParity = import ./fixtures/k3s-prod-parity.nix fixtureArgs;
 
   protocol = import ./scenarios/protocol.nix;
+  quota-probe = import ./scenarios/quota-probe.nix;
   scheduling = import ./scenarios/scheduling.nix;
   # security exports { standalone, privileged-hardening-e2e } — two
   # scenario functions sharing the same file. standalone uses the
@@ -702,6 +703,19 @@ in
         pkgs.postgresql_18
       ];
     };
+  };
+
+  # prjquota satisfiability witness (merged_bug_074 / WO-S2-2, OQ-13):
+  # a real XFS project quota filled to its hard limit, driven through
+  # the production classifier chain (the quota_probe bin). Single
+  # node, no k8s. Asserts: the kernel clamp on the in-project statvfs;
+  # the retired coupled vantage's structural FALSE (the dead letter);
+  # the decoupled vantage's TRUE (the letter fires); the post-cleanup
+  # usage collapse that motivates the during-build peak monitor.
+  # r[verify builder.disk.satisfiable-letter]
+  # r[verify builder.disk.quota-classified+2]
+  vm-quota-probe-standalone = quota-probe {
+    inherit pkgs common;
   };
 
   # ── sla-sizing (standalone fixture, scripted-telemetry worker) ───────
