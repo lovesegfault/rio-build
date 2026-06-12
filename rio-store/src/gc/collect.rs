@@ -61,8 +61,8 @@ use crate::backend::ChunkBackend;
 /// the tmpfs/fsync-off bench, density/batch variance) and rounding
 /// down gives 500_000 — exactly 50 batches at the existing
 /// `LIMIT 10_000`. Figures and the gate verdicts are recorded in
-/// `docs/spec/models/refcount-invariant-map.md` ("Phase 1a
-/// measurements and adjudications", T-1a.1b / T-1a.1c).
+/// `docs/spec/models/refcount-records.md` (the Phase-1a
+/// measurement-gate chain, T-1a.1b / T-1a.1c).
 ///
 /// A cycle that stops at the cap leaves the remainder for the next
 /// cycle (run_gc phase 3 or the backstop) via the durable cursor;
@@ -348,9 +348,7 @@ pub(crate) static COLLECT_BATCH_SELECT_SQL: LazyLock<String> = LazyLock::new(|| 
 /// One collect batch's soft-delete. The UPDATE re-evaluates the collect
 /// predicate's row-local conjuncts — `deleted = FALSE` plus the
 /// `GREATEST(created_at, last_referenced_at) < cutoff` grace term — in
-/// its own WHERE clause, per the T-1a.8 consequence recorded in
-/// `docs/spec/models/refcount-invariant-map.md` (chunkCollect encoding
-/// notes, the row-lock / READ-COMMITTED bullet) and design §4.1's
+/// its own WHERE clause, per the T-1a.8 consequence and design §4.1's
 /// in-flight-overlap sentence: a READ-COMMITTED row-lock wait re-checks
 /// only the conjuncts present in this WHERE, so the touch/grace
 /// re-check here is what protects a chunk re-referenced and touched
@@ -712,7 +710,7 @@ pub(crate) static COLLECT_HOLD_AFTER_BATCHES: std::sync::atomic::AtomicU64 =
 /// mark+prepare+report span — the same order the expansion statement
 /// alone already held — and takes no locks that block writers;
 /// acceptable at the once-per-GC + daily-backstop cadence (measured
-/// spans: invariant map T-1a.1b/T-1a.1c records).
+/// spans: refcount-records.md T-1a.1b/T-1a.1c).
 ///
 /// Temp-table lifetime differs by arm. The shadow arm's mark product
 /// is `ON COMMIT DROP`, so it dies with the read transaction on every
@@ -1566,6 +1564,17 @@ pub(crate) async fn collect_backstop_once(
 /// next tick retries (`MissedTickBehavior::Skip`, like the other
 /// periodic GC tasks).
 ///
+/// C9 adjudication arc (relocated from the retired refcount invariant
+/// map, Wave-A1 review): the persisted cluster-wide recency gate was
+/// originally adjudicated NOT adopted — with the boot trigger removed
+/// the worst case was one lock-serialized cycle per replica per day,
+/// and write-path schema for a cadence question was not warranted
+/// before the A2 lock-budget pricing; "if Release-A observation shows
+/// the per-replica cadence is still too hot, the recency gate is the
+/// named follow-up". That reopen condition later fired and was
+/// executed: bug_174 / migration 090 landed `gc_collect_state`'s
+/// cluster-due check — exactly the proposed gate.
+///
 /// The tick is a cheap durable-row read; the heavy cycle runs only
 /// when the CLUSTER is due (bug_174: pre-090 each replica armed its
 /// own daily `interval_at(boot + 24h)` timer, so N replicas ⇒ up to N
@@ -1573,7 +1582,7 @@ pub(crate) async fn collect_backstop_once(
 /// check fires one full check-interval after spawn: the collect cycle
 /// is the heaviest query pattern in the system (full manifest_data
 /// expansion + chunks anti-join, multi-GB temp spill at the design
-/// point — invariant map T-1a.1b/T-1a.1c), and rolling deploys,
+/// point — refcount-records.md T-1a.1b/T-1a.1c), and rolling deploys,
 /// scale-outs, and crash-loops must not even CHECK on every pod boot
 /// — exactly the moments the database is already under stress. A
 /// fleet where neither this nor run_gc phase 3 completes a cycle is

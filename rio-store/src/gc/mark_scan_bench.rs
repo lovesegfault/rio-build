@@ -45,7 +45,9 @@
 //! and the database-wide temp-file spill delta — the numbers the go/no-go
 //! threshold (full scan at the ~1.5 M-path scale, linear-or-better growth,
 //! bounded memory) is judged against. Measured figures are volatile and
-//! belong in the introducing commit message and the invariant map, never in
+//! belong in the introducing commit message and the campaign archive
+//! (`docs/spec/models/refcount-records.md` §3, the measurement-gate chain —
+//! the recording destination for any future measurement round), never in
 //! this file.
 //!
 //! `#[ignore]`d: the measurement-scale runs take minutes by design. Run one
@@ -803,7 +805,8 @@ async fn mark_scan_bench() {
     );
 
     // Sanity, not the verdict: the verdict (against the §5a threshold) is
-    // recorded in the invariant map from the printed figures.
+    // recorded in refcount-records.md (the measurement-gate chain) from
+    // the printed figures.
     assert_eq!(rows_scanned, n_paths, "every seeded manifest is scanned");
     assert!(
         refs_parsed > 0 && refs_parsed <= seeded.entries_seeded,
@@ -1003,7 +1006,7 @@ const COLLECT_BATCH_DEFAULT: u64 = 10_000;
 /// Default per-cycle victim cap for the collect loop
 /// (`MARK_SCAN_BENCH_COLLECT_CAP` overrides). This is the design value
 /// of the collector's `COLLECT_CYCLE_VICTIM_CAP` (design §4.1 step 3
-/// v4; derivation recorded in the invariant map's T-1a.1b entry and
+/// v4; derivation recorded in refcount-records.md, T-1a.1b entry and
 /// sign-off item 8): the gate-(c) capped-cycle confirmation runs at
 /// exactly this value, so the bench defaults to it rather than to the
 /// shipped const's `cfg(test)` override (which is sized for structural
@@ -1606,8 +1609,7 @@ async fn mark_scan_bench_collect_phase() {
 /// The live arm's soft-delete statement re-evaluates the row-local
 /// collect predicate — `deleted = FALSE` AND the
 /// `GREATEST(created_at, last_referenced_at) < cutoff` grace term — in
-/// its own WHERE clause (the T-1a.8 consequence recorded in
-/// `docs/spec/models/refcount-invariant-map.md`). A candidate that a
+/// its own WHERE clause (the T-1a.8 consequence). A candidate that a
 /// concurrent upgrade re-references (touches) between the candidate
 /// scan and the soft-delete must survive the soft-delete; an untouched
 /// candidate must still be collected (the conjunct filters, it does not
