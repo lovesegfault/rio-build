@@ -1246,6 +1246,39 @@ fn standing_effect(lane: PresentationLane, answer: &PullAnswer) -> StandingEffec
     }
 }
 
+/// live061-R5 — the wire-stable `answer` label of one claim answer
+/// (the 21,337-refusals-invisible gap: refused claims had no counter
+/// anywhere; the per-pass dispositions existed only as sealed pacing
+/// inputs). One label per PullAnswer variant — rustc's exhaustiveness
+/// is the census.
+fn answer_label(answer: &PullAnswer) -> &'static str {
+    match answer {
+        PullAnswer::Deliver(_) => "deliver",
+        PullAnswer::Gone => "gone",
+        PullAnswer::NotYetReady { .. } => "not_yet_ready",
+        PullAnswer::Unanswered => "unanswered",
+        PullAnswer::RejectedDisproving => "rejected_disproving",
+        PullAnswer::RejectedAuth => "rejected_auth",
+        PullAnswer::Shutdown => "shutdown",
+    }
+}
+
+/// live061-R5 — count one answered claim presentation. Fleet-summed
+/// this is the refusal-volume forensic the live_061 window lacked
+/// (21,337 refusals/78s, invisible until a manual log census).
+fn count_claim_answer(lane: PresentationLane, answer: &PullAnswer) {
+    metrics::counter!(
+        "rio_store_materialization_claim_answers_total",
+        "lane" => match lane {
+            PresentationLane::Fresh => "fresh",
+            PresentationLane::ResumeClaiming => "resume",
+            PresentationLane::Probe => "probe",
+        },
+        "answer" => answer_label(answer)
+    )
+    .increment(1);
+}
+
 /// Issue one bounded `PullAssignment` and classify the outcome.
 async fn pull_once<T: MaterializeTransport>(
     transport: &mut T,
@@ -1920,6 +1953,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         } else {
             PresentationLane::ResumeClaiming
         };
+        count_claim_answer(lane, &answer);
         // round-8 WO-S2-2 + bug_152 — conversion evidence folds
         // LANE-AWARE through the two-axis classifier: a
         // ResumeClaiming Deliver or an either-lane Gone converts; a
@@ -2243,6 +2277,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             confirm_only: false,
         };
         let answer = pull_once(transport, shutdown, req, &descriptor.drv_hash).await;
+        count_claim_answer(PresentationLane::Fresh, &answer);
         // merged_bug_005 / round-8 WO-S2-2 — fold the outcome's
         // futility evidence as TYPED COUNTS (total over the
         // PullAnswer alphabet; rustc is the census): the latch

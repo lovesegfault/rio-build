@@ -241,6 +241,7 @@
     "rio_store_log_tail_proxied_total",
     "rio_store_log_tail_proxy_failures_total",
     "rio_store_log_tail_subscribers",
+    "rio_store_materialization_claim_answers_total",
     "rio_store_materialization_claim_rejected_total",
     "rio_store_materialization_executions_total",
     "rio_store_materialization_pinned_paths_total",
@@ -1498,6 +1499,11 @@
         "name": "rio_store_log_tail_subscribers",
         "kind": "gauge",
         "help": "Live TailLog follow-subscriptions currently attached to this replica's ingest sessions."
+      },
+      {
+        "name": "rio_store_materialization_claim_answers_total",
+        "kind": "counter",
+        "help": "Answered claim presentations, labeled by lane (fresh|resume|probe) and answer (deliver|gone|not_yet_ready|unanswered|rejected_disproving|rejected_auth|shutdown). Fleet-summed, this is the claim plane's conversion forensic (live_061: 21,337 refusals in one 78s window — 10,876 of them gone — were invisible until a manual log census; the incident signature is a high gone/deliver ratio, i.e. the listing advertising rows whose claims cannot convert). deliver/answers is the fleet conversion rate; sustained gone on the fresh lane means the scheduler is serving moot rows."
       },
       {
         "name": "rio_store_materialization_claim_rejected_total",

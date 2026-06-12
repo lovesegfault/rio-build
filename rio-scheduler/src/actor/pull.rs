@@ -424,6 +424,77 @@ impl NonKeyedLane {
     }
 }
 
+/// live061-R5 — the pull-answer DEBUG flood limiter. The leader
+/// answers every fleet claim attempt; during live_061 the two
+/// per-answer debug lines ran at ~260 lines/s (21,337 refusals/78s),
+/// rolling the scheduler pod's kubelet log retention (10MB x 5 files)
+/// down to ~60-90s — the incident's ONSET evidence was gone before
+/// any responder looked, and the forensic census had to be rebuilt
+/// from store-side logs. The limiter bounds each answer arm to
+/// [`Self::MAX_PER_WINDOW`] lines per [`Self::WINDOW_SECS`] window
+/// (<=2.2 lines/s/arm worst-case vs ~260/s) and discloses the
+/// suppressed count when a window rolls — counting is total (the
+/// `rio_store_materialization_claim_answers_total` fleet counter and
+/// the per-window suppressed disclosure carry the volume; the log
+/// lane carries bounded samples). Window state is two atomics per
+/// arm: lock-free, monotonic-coarse (a racing roll double-discloses
+/// at worst, never under-counts).
+struct AnswerLogLimiter {
+    /// Epoch-seconds of the current window's start.
+    window_start: std::sync::atomic::AtomicU64,
+    /// Lines emitted in the current window.
+    emitted: std::sync::atomic::AtomicU64,
+    /// Lines suppressed in the current window.
+    suppressed: std::sync::atomic::AtomicU64,
+}
+
+impl AnswerLogLimiter {
+    const MAX_PER_WINDOW: u64 = 20;
+    const WINDOW_SECS: u64 = 10;
+
+    const fn new() -> Self {
+        Self {
+            window_start: std::sync::atomic::AtomicU64::new(0),
+            emitted: std::sync::atomic::AtomicU64::new(0),
+            suppressed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Whether this line may emit; returns the rolled window's
+    /// suppressed count (Some on the first emit after a roll, so the
+    /// caller can disclose it) alongside the verdict.
+    fn admit(&self) -> (bool, Option<u64>) {
+        use std::sync::atomic::Ordering;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let start = self.window_start.load(Ordering::Relaxed);
+        let mut rolled = None;
+        if now.saturating_sub(start) >= Self::WINDOW_SECS
+            && self
+                .window_start
+                .compare_exchange(start, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let dropped = self.suppressed.swap(0, Ordering::Relaxed);
+            self.emitted.store(0, Ordering::Relaxed);
+            if dropped > 0 {
+                rolled = Some(dropped);
+            }
+        }
+        if self.emitted.fetch_add(1, Ordering::Relaxed) < Self::MAX_PER_WINDOW {
+            (true, rolled)
+        } else {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            (false, rolled)
+        }
+    }
+}
+
+static GONE_ANSWER_LOG: AnswerLogLimiter = AnswerLogLimiter::new();
+static NYR_ANSWER_LOG: AnswerLogLimiter = AnswerLogLimiter::new();
+
 pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
     rio_evidence_kernel::pull::admit_pull(
         rio_evidence_kernel::pull::PullRequest {
@@ -824,11 +895,29 @@ impl DagActor {
                         ));
                     }
                 };
-                debug!(intent_id = %intent_id, ?status, "pull answered Gone");
+                let (emit, rolled) = GONE_ANSWER_LOG.admit();
+                if let Some(suppressed) = rolled {
+                    debug!(
+                        suppressed,
+                        "pull-answered-Gone lines suppressed in the last window"
+                    );
+                }
+                if emit {
+                    debug!(intent_id = %intent_id, ?status, "pull answered Gone");
+                }
                 Ok(PullOutcome::Gone(license))
             }
             PullDecision::NotYetReady => {
-                debug!(intent_id = %intent_id, ?status, "pull answered NotYetReady");
+                let (emit, rolled) = NYR_ANSWER_LOG.admit();
+                if let Some(suppressed) = rolled {
+                    debug!(
+                        suppressed,
+                        "pull-answered-NotYetReady lines suppressed in the last window"
+                    );
+                }
+                if emit {
+                    debug!(intent_id = %intent_id, ?status, "pull answered NotYetReady");
+                }
                 Ok(PullOutcome::NotYetReady {
                     retry_after_secs: NOT_YET_READY_RETRY_AFTER_SECS,
                 })

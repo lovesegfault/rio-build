@@ -501,6 +501,19 @@ pub fn describe_metrics() {
          descriptor is fixed."
     );
     describe_counter!(
+        "rio_store_materialization_claim_answers_total",
+        "Answered claim presentations, labeled by lane \
+         (fresh|resume|probe) and answer (deliver|gone|not_yet_ready|\
+         unanswered|rejected_disproving|rejected_auth|shutdown). \
+         Fleet-summed, this is the claim plane's conversion forensic \
+         (live_061: 21,337 refusals in one 78s window — 10,876 of them \
+         gone — were invisible until a manual log census; the incident \
+         signature is a high gone/deliver ratio, i.e. the listing \
+         advertising rows whose claims cannot convert). deliver/answers \
+         is the fleet conversion rate; sustained gone on the fresh lane \
+         means the scheduler is serving moot rows."
+    );
+    describe_counter!(
         "rio_store_gc_chunks_reaped_total",
         "Tombstone chunk rows hard-DELETEd by the post-drain reap (091, \
          merged_bug_336): soft-deleted at least the grace term ago AND \
