@@ -483,10 +483,13 @@ enum ServeHeal {
 /// re-dispatch/terminus `JoinHandle::abort()`, or any future abort
 /// site — reaches [`Drop`], which `try_send`s the marker and the
 /// withheld lines into the output channel. Drop cannot await; the
-/// channel is a bounded mpsc, so `try_send` is the strongest send
-/// available there. Honest residual, sanctioned: a FULL channel drops
-/// the disclosure (256 slots of backlog mean the consumer is the
-/// bottleneck), and a CLOSED channel means no consumer remains —
+/// channel is a bounded mpsc, so reserved-permit sends are the
+/// strongest sends available there (bug_123: BOTH permits are
+/// reserved before either message sends — both-or-neither, so the
+/// partial-disclosure lattice is unrepresentable). Honest residual,
+/// sanctioned and now exact: a channel without two free slots drops
+/// the WHOLE disclosure (256 slots of backlog mean the consumer is
+/// the bottleneck), and a CLOSED channel means no consumer remains —
 /// the law's vacuous case.
 struct PendingGapCell {
     state: Option<PendingGap>,
@@ -515,14 +518,35 @@ impl Drop for PendingGapCell {
         // (every accepted/flushed span empties the cell and raises
         // the accepted floor before a new pending can record at or
         // above it), so no dedup consultation is needed here.
+        //
+        // bug_123 (R27 lens): the two-message disclosure is
+        // TRANSACTIONAL — both permits reserved before either message
+        // sends (both-or-neither). Two independent try_sends made the
+        // partial-failure lattice reachable: a consumer recv landing
+        // between them could yield the withheld span with the hole
+        // NEVER disclosed (marker-fails/withheld-lands), a partial
+        // disclosure the whole-drop residual above never priced. With
+        // the reservation pair, the residual IS whole-drop — exactly
+        // the priced case. The two-message vocabulary readers parse
+        // is preserved (the concat-chunk alternative was recorded and
+        // rejected for that reason).
         let marker = gap_marker(p.gap_from, p.gap_until);
-        let _ = self.out_tx.try_send(TaggedLogChunk {
+        let marker_chunk = TaggedLogChunk {
             derivation_path: p.withheld.derivation_path.clone(),
             first_line_number: p.gap_from,
             lines: vec![marker],
-        });
-        if !p.withheld.lines.is_empty() {
-            let _ = self.out_tx.try_send(p.withheld);
+        };
+        if p.withheld.lines.is_empty() {
+            if let Ok(permit) = self.out_tx.try_reserve() {
+                permit.send(marker_chunk);
+            }
+        } else if let (Ok(marker_permit), Ok(withheld_permit)) =
+            (self.out_tx.try_reserve(), self.out_tx.try_reserve())
+        {
+            // Order preserved: marker first, withheld second (permits
+            // send in acquisition order on the same channel).
+            marker_permit.send(marker_chunk);
+            withheld_permit.send(p.withheld);
         }
     }
 }
@@ -2935,5 +2959,92 @@ mod tests {
             count_at_drop,
             "dropping the set must abort its subscriptions (no further opens)"
         );
+    }
+    /// W11-BK (bug_123, the R27 lens extension): the non-cooperative
+    /// Drop epilogue's two-message disclosure is TRANSACTIONAL —
+    /// both permits reserved before either message sends. Pre-fix the
+    /// two independent try_sends made the partial-failure lattice
+    /// reachable: at the lattice's own cell (exactly one slot free)
+    /// the marker landed and the withheld chunk vanished — and under
+    /// a consumer recv between the two sends, the inverse split
+    /// (withheld-without-marker: the hole NEVER disclosed) landed.
+    /// Post-fix the cell yields NEITHER (the whole-drop residual the
+    /// doc already prices) and two free slots yield BOTH.
+    ///
+    /// Pre-fix red, verbatim:
+    ///   one-slot-free drop must send both-or-neither (pre-fix: the
+    ///   partial split — 1 message)
+    #[tokio::test]
+    async fn drop_disclosure_is_both_or_neither() {
+        let pending = || super::PendingGap {
+            gap_from: 5,
+            gap_until: 8,
+            withheld: super::TaggedLogChunk {
+                derivation_path: DRV.to_string(),
+                first_line_number: 8,
+                lines: vec![b"line-8".to_vec()],
+            },
+            next_line: 9,
+        };
+
+        // Cell 1: exactly ONE slot free — both-or-neither means
+        // NEITHER message lands (the priced whole-drop residual).
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        out_tx
+            .try_send(super::TaggedLogChunk {
+                derivation_path: DRV.to_string(),
+                first_line_number: 0,
+                lines: vec![b"filler".to_vec()],
+            })
+            .expect("fill to one-slot-free");
+        let mut cell =
+            super::PendingGapCell::new(out_tx.clone(), super::RelayDisposition::disclose_at_drop());
+        cell.state = Some(pending());
+        drop(cell);
+        drop(out_tx);
+        let mut got = Vec::new();
+        while let Some(c) = out_rx.recv().await {
+            got.push(c);
+        }
+        assert_eq!(
+            got.len() - 1, // minus the filler
+            0,
+            "one-slot-free drop must send both-or-neither (pre-fix: the \
+             partial split — {} message)",
+            got.len() - 1
+        );
+
+        // Cell 2: TWO slots free — both messages land, in order
+        // (marker then withheld).
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        let mut cell =
+            super::PendingGapCell::new(out_tx.clone(), super::RelayDisposition::disclose_at_drop());
+        cell.state = Some(pending());
+        drop(cell);
+        drop(out_tx);
+        let marker = out_rx.recv().await.expect("the marker");
+        assert!(
+            String::from_utf8(marker.lines[0].clone())
+                .expect("utf8")
+                .contains("missing"),
+            "marker first"
+        );
+        let withheld = out_rx.recv().await.expect("the withheld lines");
+        assert_eq!(withheld.first_line_number, 8);
+        assert!(out_rx.recv().await.is_none());
+
+        // Cell 3: marker-only shape (no withheld lines) needs only
+        // one permit — one free slot serves it.
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let mut cell =
+            super::PendingGapCell::new(out_tx.clone(), super::RelayDisposition::disclose_at_drop());
+        let mut p = pending();
+        p.withheld.lines.clear();
+        cell.state = Some(p);
+        drop(cell);
+        drop(out_tx);
+        let marker = out_rx.recv().await.expect("the lone marker");
+        assert_eq!(marker.first_line_number, 5);
+        assert!(out_rx.recv().await.is_none());
     }
 }
