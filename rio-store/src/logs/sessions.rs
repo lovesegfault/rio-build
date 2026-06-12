@@ -225,6 +225,22 @@ pub async fn heartbeat(
     })
 }
 
+/// The lease row's current `session_id`, if a row exists — the
+/// OWNERSHIP WITNESS for the two-store handoff (bug_010). Two
+/// same-pod opens can both pass [`acquire`] (the same-pod arm admits
+/// a steal from our own previous session), and the awaited PG acquire
+/// can invert order against the synchronous registry insert that
+/// follows it — so the registry's cancel decision must verify the
+/// inserting session still owns the row, not assume it from insertion
+/// order. "Displaced ⇒ displacer owns the row" is a checked
+/// predicate, never a comment.
+pub async fn current_session(pool: &PgPool, exec_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar("SELECT session_id FROM log_ingest_sessions WHERE exec_id = $1")
+        .bind(exec_id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Drop the lease on clean stream close. Idempotent, and a no-op when
 /// the row has already been stolen (the `session_id` predicate keeps a
 /// stale teardown from deleting the new owner's row).

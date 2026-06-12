@@ -256,6 +256,94 @@ fn ack_try_send(
     let _ = tx.try_send(msg);
 }
 
+/// The ownership-witnessed registry insert (bug_010): publish this
+/// session's ingest entry, then verify the PG lease row still names
+/// this session BEFORE cancelling whatever was displaced — the
+/// two-store handoff (PG row → in-memory registry) carries its
+/// ownership witness across the await.
+///
+/// Two concurrent same-pod opens can both pass `sessions::acquire`
+/// (the same-pod arm deliberately steals from our own previous
+/// session), and the awaited acquire can invert order against this
+/// synchronous insert: the LATER PG acquirer owns the row regardless
+/// of who registers first. The pre-fix shape cancelled the displaced
+/// entry unconditionally — the earlier-acquiring, later-registering
+/// open deposed the true owner (whose Displaced exit then stranded
+/// the row for the stale window while the survivor died at its first
+/// heartbeat with LeaseLost).
+///
+/// Post-insert re-check, not pre-insert: once our entry is visible we
+/// re-read the row; OWNED ⇒ anything we displaced is genuinely
+/// deposed (cancel it). NOT OWNED ⇒ we are the stale acquirer — the
+/// displaced entry is restored (conditionally: only if our entry
+/// still holds the slot; an even-newer registrant governs its own
+/// slot via its own witness) and the open yields `ALREADY_EXISTS`,
+/// never cancelling the owner. The restore window (our entry visible
+/// while un-owned) costs a concurrent `TailLog` attach at most a
+/// momentary history-only fallback.
+async fn register_ingest_owner(
+    registry: &DashMap<Uuid, IngestEntry>,
+    pool: &PgPool,
+    exec_id: Uuid,
+    session_id: Uuid,
+    entry: IngestEntry,
+) -> Result<(), Status> {
+    let ours = Arc::clone(&entry.shared);
+    let displaced = registry.insert(exec_id, entry);
+
+    // The ownership witness: "Displaced ⇒ displacer owns the row" is
+    // a checked predicate, never an assumed insertion order.
+    let owner = match sessions::current_session(pool, exec_id).await {
+        Ok(owner) => owner,
+        Err(e) => {
+            // Fail closed: withdraw our entry (conditionally) and
+            // surface the error — admitting a stream whose ownership
+            // is unverifiable re-opens the race this witness closes.
+            restore_displaced(registry, exec_id, &ours, displaced);
+            return Err(e).status_internal("AppendLog: ingest ownership witness");
+        }
+    };
+    if owner == Some(session_id) {
+        if let Some(displaced) = displaced {
+            displaced.cancel.cancel();
+        }
+        return Ok(());
+    }
+
+    // A concurrent open acquired the row after us: IT owns the lease.
+    // Yield without cancelling anyone; the builder's retry lands on
+    // the live owner (usually its own newer reconnect).
+    restore_displaced(registry, exec_id, &ours, displaced);
+    Err(Status::already_exists(
+        "AppendLog: a newer ingest session acquired this execution's lease \
+         during open; retry against it",
+    ))
+}
+
+/// Conditionally undo [`register_ingest_owner`]'s insert: restore the
+/// displaced entry (or clear the slot) only while OUR entry still
+/// holds it — a newer registrant's entry is governed by its own
+/// witness and must not be clobbered.
+fn restore_displaced(
+    registry: &DashMap<Uuid, IngestEntry>,
+    exec_id: Uuid,
+    ours: &Arc<Mutex<IngestShared>>,
+    displaced: Option<IngestEntry>,
+) {
+    if let dashmap::Entry::Occupied(mut slot) = registry.entry(exec_id)
+        && Arc::ptr_eq(&slot.get().shared, ours)
+    {
+        match displaced {
+            Some(previous) => {
+                slot.insert(previous);
+            }
+            None => {
+                slot.remove();
+            }
+        }
+    }
+}
+
 /// The `LogService` implementation. One per replica; cheap to clone
 /// into the tonic server (everything is `Arc`/`PgPool`).
 pub struct LogServiceImpl {
@@ -586,19 +674,23 @@ impl LogService for LogServiceImpl {
         let cancel = rio_common::signal::Token::new();
         // A previous session for the same execution on this replica
         // (its lease was stolen by `acquire`'s same-pod arm, or it is
-        // mid-teardown) may still hold the registry slot; replace it —
-        // the new session is the one the lease row now names — and
-        // CANCEL its driver so its admission permits return now, not
-        // at the next heartbeat observation of the stolen lease.
-        if let Some(displaced) = self.active_ingests.insert(
+        // mid-teardown) may still hold the registry slot; the
+        // ownership-witnessed insert replaces it and cancels its
+        // driver ONLY when the row says we own the lease (bug_010 —
+        // the awaited acquire above and this insert can invert order
+        // across two concurrent same-pod opens; the later PG acquirer
+        // owns the row regardless of who registers first).
+        register_ingest_owner(
+            &self.active_ingests,
+            &self.pool,
             exec_id,
+            session_id,
             IngestEntry {
                 shared: Arc::clone(&shared),
                 cancel: cancel.clone(),
             },
-        ) {
-            displaced.cancel.cancel();
-        }
+        )
+        .await?;
         metrics::gauge!("rio_store_log_active_ingest_sessions").increment(1.0);
         info!(
             %exec_id, %session_id,
@@ -1045,8 +1137,12 @@ enum LoopExit {
     /// auditable.
     LeaseLost,
     /// A newer session for the same execution displaced this one from
-    /// the registry (the same-pod reconnect path). Same lease posture
-    /// as `LeaseLost` — the newer session owns the row.
+    /// the registry (the same-pod reconnect path — the displacer
+    /// verified row ownership before cancelling, bug_010). The lease
+    /// posture differs from `LeaseLost`: the session-id-predicated
+    /// release RUNS (a no-op when the displacer owns the row, an
+    /// immediate free if this session somehow still does — never a
+    /// 30 s strand).
     Displaced,
 }
 
@@ -1173,10 +1269,15 @@ impl AppendDriver {
         lease.stop().await;
 
         // 3. The lease. Released on every path except a stolen lease
-        // (the row belongs to the new owner). `release` is
-        // session-id-predicated so even a racing release is safe; the
-        // explicit skip is for auditability.
-        if !matches!(exit, LoopExit::LeaseLost | LoopExit::Displaced)
+        // (the row belongs to the new owner; the heartbeat OBSERVED
+        // the steal, so skipping is auditable truth). A Displaced exit
+        // DOES release (bug_010): displacement proves only that a
+        // newer session won the registry slot — `release` is
+        // session-id-predicated, so this is a no-op when the row
+        // already belongs to the displacer (the designed reconnect)
+        // and frees the row immediately if this session somehow still
+        // owns it, instead of stranding it for the stale window.
+        if !matches!(exit, LoopExit::LeaseLost)
             && let Err(e) = sessions::release(&self.pool, exec_id, session_id).await
         {
             // Non-fatal: the row goes stale in 30 s and is stolen by
@@ -3509,6 +3610,172 @@ mod tests {
             .await
             .expect_err("a missing token must be rejected at open");
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    /// W11-G (bug_010). Proposition: **the PG row's owner is never
+    /// cancelled by a later acquirer** — at the race's own
+    /// interleaving. The same-pod steal arm admits two concurrent
+    /// opens for one execution; the awaited PG acquire and the
+    /// synchronous registry insert can invert order across the await,
+    /// and pre-fix the later REGISTRY inserter unconditionally
+    /// cancelled whatever it displaced — the true lease owner. The
+    /// orchestrated inversion: A acquires the row first, B steals it
+    /// (B owns the lease), B registers first, A's late insert lands
+    /// on top. The witness: the cancel site verifies the registry's
+    /// session against the row before cancelling; the later acquirer
+    /// yields with ALREADY_EXISTS, the owner's entry is restored, and
+    /// the owner's lease row stays live (no 30 s strand — the W11-H
+    /// no-strand half lives here too).
+    #[tokio::test]
+    async fn later_registry_insert_never_cancels_the_lease_owner() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let registry: DashMap<Uuid, IngestEntry> = DashMap::new();
+        let exec = Uuid::now_v7();
+        let session_a = Uuid::now_v7();
+        let session_b = Uuid::now_v7();
+
+        // A's PG acquire lands first…
+        assert!(matches!(
+            sessions::acquire(&db.pool, exec, session_a, "this-pod")
+                .await
+                .unwrap(),
+            sessions::Acquire::Acquired
+        ));
+        // …then B's (the same-pod arm steals): B owns the row.
+        assert!(matches!(
+            sessions::acquire(&db.pool, exec, session_b, "this-pod")
+                .await
+                .unwrap(),
+            sessions::Acquire::Acquired
+        ));
+
+        // Two real ingest sessions provide the shared handles (the
+        // production constructor; the GateOk literal is the existing
+        // fixture lane).
+        let gate_ok = |exec: Uuid| gate::GateOk {
+            drv_hash: rio_nix::store_path::drv_log_hash(DRV_PATH),
+            exec_id: exec,
+            final_line_count: None,
+            seed: gate::LogSeed {
+                merged_bytes: 0,
+                merged_chunks: 0,
+                raw_bytes: 0,
+                raw_rows: 0,
+            },
+            covered: Default::default(),
+        };
+        let ingest_a = IngestSession::new(&gate_ok(exec), session_a, IngestConfig::default());
+        let ingest_b = IngestSession::new(&gate_ok(exec), session_b, IngestConfig::default());
+        let shared_b = Arc::clone(ingest_b.shared());
+        let cancel_a = rio_common::signal::Token::new();
+        let cancel_b = rio_common::signal::Token::new();
+
+        // B registers first (it owns the row): fine.
+        register_ingest_owner(
+            &registry,
+            &db.pool,
+            exec,
+            session_b,
+            IngestEntry {
+                shared: Arc::clone(&shared_b),
+                cancel: cancel_b.clone(),
+            },
+        )
+        .await
+        .expect("the row owner's registration succeeds");
+
+        // A's registry insert resumes late — the inversion.
+        let res = register_ingest_owner(
+            &registry,
+            &db.pool,
+            exec,
+            session_a,
+            IngestEntry {
+                shared: Arc::clone(ingest_a.shared()),
+                cancel: cancel_a.clone(),
+            },
+        )
+        .await;
+
+        assert!(
+            !cancel_b.is_cancelled(),
+            "left (pre-fix): the late registry insert displaces and cancels \
+             the true lease owner — B holds the PG row, B's healthy stream \
+             dies, and the survivor A dies at its first heartbeat with \
+             LeaseLost while B's Displaced exit strands the row for the 30 s \
+             stale window / right: the cancel site checks the row's \
+             session_id and the later acquirer yields"
+        );
+        let err = res.expect_err("the later acquirer yields, never cancels");
+        assert_eq!(err.code(), tonic::Code::AlreadyExists, "{err:?}");
+
+        // The owner's entry is restored in the registry…
+        let entry = registry.get(&exec).expect("the owner's entry survives");
+        assert!(
+            Arc::ptr_eq(&entry.shared, &shared_b),
+            "the registry slot holds the row owner's entry"
+        );
+        drop(entry);
+        // …and the owner's lease row is live: no strand, no deposed
+        // stream (W11-H's no-strand half).
+        assert_eq!(
+            sessions::lookup_live(&db.pool, exec).await.unwrap(),
+            sessions::LiveLookup::Live(sessions::LiveSession {
+                session_id: session_b,
+                replica_pod: "this-pod".to_string(),
+            }),
+            "the owner keeps streaming: row live, never stranded"
+        );
+    }
+
+    /// W11-H (bug_010, the release half): a Displaced exit routes
+    /// through the session-id-predicated release — end to end on the
+    /// designed same-pod reconnect path. The displaced driver's
+    /// teardown must NOT delete the new owner's row (the predicate
+    /// no-ops on a row it no longer owns), and the displaced stream
+    /// surfaces the typed Aborted status.
+    #[tokio::test]
+    async fn displaced_exit_releases_without_touching_the_new_owner() {
+        let mut h = harness().await;
+        let exec = seed_assignment(&h.db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+
+        let (tx1, mut acks1) = open_append(&mut h.client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open 1");
+        tx1.send(batch_msg(0, &["session one line"])).await.unwrap();
+
+        // The same-pod reconnect: steals the lease, displaces stream 1.
+        let (_tx2, _acks2) = open_append(&mut h.client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("the same-pod reconnect must be admitted");
+
+        // Stream 1 observes the displacement (typed Aborted).
+        let status = loop {
+            match acks1.message().await {
+                Ok(Some(_)) => continue, // a drain ack from stream 1
+                Ok(None) => panic!("stream 1 must end with the Displaced status"),
+                Err(status) => break status,
+            }
+        };
+        assert_eq!(status.code(), tonic::Code::Aborted, "{status:?}");
+        assert!(
+            status.message().contains("displaced"),
+            "the displaced stream is told why: {}",
+            status.message()
+        );
+
+        // The new owner's row survives stream 1's release-on-Displaced
+        // (the session-id predicate no-ops on a row it no longer owns).
+        let live = sessions::lookup_live(&h.db.pool, exec).await.unwrap();
+        assert!(
+            matches!(
+                &live,
+                sessions::LiveLookup::Live(s) if s.replica_pod == "test-pod"
+            ),
+            "the new owner's lease row stays live through the displaced \
+             teardown, got {live:?}"
+        );
     }
 
     #[tokio::test]
