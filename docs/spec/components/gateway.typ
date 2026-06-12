@@ -2213,6 +2213,29 @@ detached are never re-delivered — their net effect is what the snapshot
 describes. This replaces the retired `since_sequence` replay contract
 (`gw.reconnect.since-seq`, deleted with the WatchBuild resumability layer).
 
+#r("gw.tail.truncation-disclosed")[
+  A log-tail exit at the post-terminal grace edge whose served log is
+  INCOMPLETE (the store's own `is_complete` claim has not been observed
+  true) MUST write a truncation disclosure --- the gap-vocabulary marker
+  naming the first unserved line, open-ended --- as the relay's final write
+  before closing; a grace exit over a complete serve, an orphaned exit, and
+  a typed-permanent exit MUST NOT write one (nothing was cut, or no
+  consumer remains). The disclosure rides the close: the
+  exit-exactly-at-expiry law (#rref("store.log.tail-grace-drain")) is
+  preserved verbatim --- the grace is never extended to serve residue.
+]
+
+Disclosure totality quantifies over the LOSS surface, not the fetch
+surface (bug_121): the exit flush covers fetched-but-withheld pending-gap
+lines by contract, and the one loss path it could not see was the
+store-served backlog the grace edge cut mid-replay --- durable, never
+fetched, and pre-round-11 cut with zero reader-visible disclosure. The
+kernel already holds `served_complete` at the grace exit, so the verdict
+carries the obligation typed (`TailNext::Exit{disclose_truncation}`); the
+rejected alternative (a biased select / no-progress grace) is recorded
+REJECTED --- it would amend the spec'd finiteness law, where the
+disclosure arm composes without re-deriving it.
+
 - The gateway does not own durable state. All persistent data lives in the
   scheduler (PostgreSQL) and the store.
 - Consider using a non-standard SSH port (e.g., 2222) to avoid conflicts with

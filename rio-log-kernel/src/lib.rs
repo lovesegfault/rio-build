@@ -373,7 +373,21 @@ pub enum TailNext {
     /// the remaining grace).
     Reopen,
     /// The subscription is finished.
-    Exit,
+    Exit {
+        /// bug_121 (R30-adjacent disclosure totality): the exit is the
+        /// spec-mandated hard cut at grace expiry while the served log
+        /// is INCOMPLETE (`served_complete == false`) — store-served
+        /// residue was cut mid-replay, and the relay MUST write the
+        /// truncation disclosure (gap-vocabulary form) as its final
+        /// write before closing. Every other exit shape (orphaned,
+        /// typed-permanent, natural end with the served log complete,
+        /// grace expiry over a complete serve) owes nothing: either
+        /// nothing was cut, or no consumer remains to disclose to
+        /// (the orphan's failed send is harmless). Disclosure rides
+        /// the close; the grace itself is never extended
+        /// (`store.log.tail-grace-drain` is preserved verbatim).
+        disclose_truncation: bool,
+    },
 }
 
 /// The relay's exit-decision kernel: may a `TailLog` subscription stop
@@ -406,11 +420,20 @@ pub fn tail_next(
     served_complete: bool,
 ) -> TailNext {
     if grace_expired {
-        return TailNext::Exit;
+        // bug_121: the kernel holds served_complete at this exit — an
+        // incomplete serve cut by the hard grace edge carries the
+        // typed disclosure obligation out with the verdict.
+        return TailNext::Exit {
+            disclose_truncation: !served_complete,
+        };
     }
     match cause {
-        TailStopCause::Orphaned | TailStopCause::PermanentErr => TailNext::Exit,
-        TailStopCause::NaturalEnd if terminal && served_complete => TailNext::Exit,
+        TailStopCause::Orphaned | TailStopCause::PermanentErr => TailNext::Exit {
+            disclose_truncation: false,
+        },
+        TailStopCause::NaturalEnd if terminal && served_complete => TailNext::Exit {
+            disclose_truncation: false,
+        },
         TailStopCause::NaturalEnd
         | TailStopCause::TransportErr
         | TailStopCause::OpenFailed
@@ -1553,9 +1576,15 @@ mod proofs {
         if cause != TailStopCause::NaturalEnd && !unconditional_exit {
             assert!(tail_next(cause, terminal, false, served_complete) == TailNext::Reopen);
         }
-        // The two unconditional exits ARE unconditional.
+        // The two unconditional exits ARE unconditional (and owe no
+        // disclosure: nothing was cut by a grace edge).
         if unconditional_exit {
-            assert!(tail_next(cause, terminal, false, served_complete) == TailNext::Exit);
+            assert!(matches!(
+                tail_next(cause, terminal, false, served_complete),
+                TailNext::Exit {
+                    disclose_truncation: false
+                }
+            ));
         }
     }
 
@@ -1578,9 +1607,20 @@ mod proofs {
         };
         let terminal: bool = kani::any();
         let served_complete: bool = kani::any();
-        assert!(tail_next(cause, terminal, true, served_complete) == TailNext::Exit);
+        // bug_121: the grace exit is total AND its disclosure bit is
+        // exactly the incomplete-serve predicate — the truncation
+        // obligation cannot be forgotten or over-claimed.
+        assert!(
+            tail_next(cause, terminal, true, served_complete)
+                == TailNext::Exit {
+                    disclose_truncation: !served_complete
+                }
+        );
         // The early-exit cell, exactly.
-        let early = tail_next(cause, terminal, false, served_complete) == TailNext::Exit;
+        let early = matches!(
+            tail_next(cause, terminal, false, served_complete),
+            TailNext::Exit { .. }
+        );
         let natural_drained = cause == TailStopCause::NaturalEnd && terminal && served_complete;
         assert!(
             early
@@ -1600,14 +1640,15 @@ mod proofs {
         let terminal: bool = kani::any();
         let grace_expired: bool = kani::any();
         let served_complete: bool = kani::any();
-        assert!(
+        assert!(matches!(
             tail_next(
                 TailStopCause::Orphaned,
                 terminal,
                 grace_expired,
                 served_complete
-            ) == TailNext::Exit
-        );
+            ),
+            TailNext::Exit { .. }
+        ));
     }
 
     /// Verify [`visit_object`] against its contracts for every
@@ -2187,12 +2228,20 @@ mod tests {
                     for served_complete in [false, true] {
                         rows += 1;
                         let got = tail_next(cause, terminal, grace_expired, served_complete);
-                        let want = if grace_expired
-                            || cause == Orphaned
+                        let want = if grace_expired {
+                            // bug_121: the disclosure bit is exactly
+                            // the incomplete-serve predicate at the
+                            // grace edge.
+                            Exit {
+                                disclose_truncation: !served_complete,
+                            }
+                        } else if cause == Orphaned
                             || cause == PermanentErr
                             || (cause == NaturalEnd && terminal && served_complete)
                         {
-                            Exit
+                            Exit {
+                                disclose_truncation: false,
+                            }
                         } else {
                             Reopen
                         };

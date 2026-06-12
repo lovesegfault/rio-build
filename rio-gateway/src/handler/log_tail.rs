@@ -690,7 +690,7 @@ async fn run_tail(
                 grace_deadline.is_some_and(|d| Instant::now() >= d),
                 served_complete,
             );
-            debug_assert_eq!(verdict, TailNext::Exit);
+            debug_assert!(matches!(verdict, TailNext::Exit { .. }));
             debug!("log tail orphaned (subscription set gone); exiting");
             // Orphan exit still flushes (merged_bug_150): the send
             // fails harmlessly if the consumer is truly gone, but an
@@ -835,10 +835,16 @@ async fn run_tail(
         let terminal = *drain.borrow();
         let grace_expired = grace_deadline.is_some_and(|d| Instant::now() >= d);
         match tail_next(cause, terminal, grace_expired, served_complete) {
-            TailNext::Exit => {
+            TailNext::Exit {
+                disclose_truncation,
+            } => {
                 debug!(
                     ?cause,
-                    terminal, grace_expired, served_complete, "log tail finished"
+                    terminal,
+                    grace_expired,
+                    served_complete,
+                    disclose_truncation,
+                    "log tail finished"
                 );
                 // THE single exit flush (merged_bug_150): a gap still
                 // pending at exit time never got its second chance —
@@ -852,6 +858,26 @@ async fn run_tail(
                     &mut accepted_gap_floor,
                 )
                 .await;
+                // bug_121: disclosure totality quantifies over the
+                // LOSS surface, not the fetch surface — the kernel's
+                // verdict carries the obligation typed: the hard
+                // grace edge cut store-served residue mid-replay
+                // (served incomplete), so the truncation marker is
+                // the FINAL write. The spec's exit-exactly-at-expiry
+                // law is untouched (disclosure rides the close; the
+                // grace is not extended). A send into a closed
+                // channel fails harmlessly (the orphan shape).
+                // r[impl gw.tail.truncation-disclosed]
+                if disclose_truncation {
+                    let from = last_relayed.map_or(0, |n| n.saturating_add(1));
+                    let _ = out_tx
+                        .send(TaggedLogChunk {
+                            derivation_path: derivation_path.clone(),
+                            first_line_number: from,
+                            lines: vec![truncation_marker(from)],
+                        })
+                        .await;
+                }
                 return;
             }
             TailNext::Reopen => {
@@ -1382,6 +1408,19 @@ async fn reconcile_backfill(
 /// The synthesized disclosure for an accepted durable gap (owner
 /// decision Q8: one marker line in client-visible build output, never
 /// repeated for the same span).
+/// bug_121: the truncation disclosure for the hard grace exit — the
+/// gap-vocabulary form with the un-served tail open-ended (the relay
+/// cannot know the durable extent it never fetched). The full log
+/// stays durable and retrievable from the store.
+// r[impl gw.tail.truncation-disclosed]
+fn truncation_marker(from: u64) -> Vec<u8> {
+    format!(
+        "*** rio: lines {from}- not served before the post-terminal grace \
+expired (live tail truncated; the full log is durable in the store) ***"
+    )
+    .into_bytes()
+}
+
 fn gap_marker(gap_from: u64, gap_until: u64) -> Vec<u8> {
     format!(
         "*** rio: lines {}-{} missing (durable log gap) ***",
@@ -2034,6 +2073,105 @@ mod tests {
     }
 
     // r[verify store.log.tail-grace-drain+2]
+    // r[verify gw.tail.truncation-disclosed]
+    /// W11-BJ (bug_121): disclosure totality quantifies over the LOSS
+    /// surface, not the fetch surface — the spec-mandated hard exit at
+    /// grace expiry (`tail-grace-drain`: exit exactly at expiry) cuts
+    /// store-served backlog mid-replay, and pre-fix that was the ONE
+    /// loss path in the module with zero disclosure (the exit flush is
+    /// scoped to fetched-but-withheld pending-gap lines by contract).
+    /// The kernel holds `served_complete` at the grace exit, so the
+    /// exit verdict carries the truncation obligation typed:
+    /// grace-expiry with `served_complete == false` writes the
+    /// truncation marker (gap-vocabulary form) as the FINAL write
+    /// before closing. The grace itself is NOT extended.
+    ///
+    /// Pre-fix red: the post-exit recv times out — close with no
+    /// marker and lines undelivered (`panicked at 'the grace exit
+    /// must disclose the store-served truncation as its final write
+    /// (pre-fix: silent cut)'`).
+    #[tokio::test]
+    async fn grace_exit_discloses_store_served_truncation() {
+        let mut h = harness().await;
+        // Two lines served, then the stream holds forever with the
+        // served log INCOMPLETE (no final chunk, is_complete never
+        // true): a wedged replica mid-replay of durable backlog.
+        h.mock.push_script(vec![chunk(0, 2)], SessionEnd::Hold);
+
+        h.set.on_started(DRV, EXEC_A);
+        let _ = recv_lines(&mut h.out_rx, 2).await;
+        h.set.on_terminal(DRV);
+
+        let handle = h
+            .set
+            .tasks
+            .get(DRV)
+            .expect("the subscription is still tracked")
+            .task
+            .abort_handle();
+        wait_for("the subscription task to exit at the grace cap", || {
+            handle.is_finished()
+        })
+        .await;
+
+        // The truncation disclosure is the final write.
+        let marker = tokio::time::timeout(Duration::from_secs(2), h.out_rx.recv())
+            .await
+            .expect(
+                "the grace exit must disclose the store-served truncation \
+                 as its final write (pre-fix: silent cut)",
+            )
+            .expect("output channel open");
+        assert_eq!(
+            marker.first_line_number, 2,
+            "the marker names the first unserved line"
+        );
+        let text = String::from_utf8(marker.lines[0].clone()).expect("marker is UTF-8");
+        assert!(
+            text.contains("rio:") && text.contains("grace"),
+            "gap-vocabulary truncation marker; got {text:?}"
+        );
+
+        h.set.abort_all();
+    }
+
+    /// W11-BJ companion (the negative cell): a grace exit whose served
+    /// log IS complete (the store's own claim) owes no truncation
+    /// marker — nothing was cut.
+    // r[verify gw.tail.truncation-disclosed]
+    #[tokio::test]
+    async fn grace_exit_with_complete_serve_stays_silent() {
+        let mut h = harness().await;
+        // Two lines + the completeness claim, then hold (the stream
+        // outlives its own final message; the grace still cuts it).
+        h.mock
+            .push_script(vec![chunk(0, 2), final_chunk(2, true)], SessionEnd::Hold);
+
+        h.set.on_started(DRV, EXEC_A);
+        let _ = recv_lines(&mut h.out_rx, 2).await;
+        h.set.on_terminal(DRV);
+
+        let handle = h
+            .set
+            .tasks
+            .get(DRV)
+            .expect("the subscription is still tracked")
+            .task
+            .abort_handle();
+        wait_for("the subscription task to exit", || handle.is_finished()).await;
+
+        // No further writes: a complete serve cut at grace owes
+        // nothing.
+        let extra = tokio::time::timeout(Duration::from_millis(300), h.out_rx.recv()).await;
+        assert!(
+            extra.is_err(),
+            "no truncation marker for a served-complete exit; got {extra:?}"
+        );
+
+        h.set.abort_all();
+    }
+
+    // r[verify store.log.tail-grace-drain+2]
     /// merged_bug_194's dedicated gateway twin: a store that ACCEPTS
     /// the TCP connection but never answers `TailLog` (the open future
     /// itself hangs) must not park the relay past the drain deadline.
@@ -2085,11 +2223,20 @@ mod tests {
             "expected re-opens after the drain edge, got {}",
             h.mock.request_count()
         );
-        // And nothing was ever relayed — the store never served a
-        // chunk.
+        // And no log LINE was ever relayed — the store never served a
+        // chunk. bug_121: the grace exit over the never-served (hence
+        // incomplete) log now writes exactly one truncation
+        // disclosure as its final write — the dark live tail is
+        // disclosed, not silent.
+        let only = h.out_rx.try_recv().expect("the truncation disclosure");
+        let text = String::from_utf8(only.lines[0].clone()).expect("marker is UTF-8");
+        assert!(
+            text.contains("rio:") && text.contains("grace"),
+            "the one write is the truncation marker; got {text:?}"
+        );
         assert!(
             h.out_rx.try_recv().is_err(),
-            "no chunk should have been relayed from hung opens"
+            "nothing beyond the disclosure"
         );
         h.set.abort_all();
     }
