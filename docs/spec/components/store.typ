@@ -191,7 +191,6 @@ closing that gap would take (paging the walk, not raising the cap).
 
 - *S3 key schema:* `chunks/{first-2-hex-chars}/{full-blake3-hex}`
   (prefix-partitioned to avoid S3 hotspots)
-- Chunks are stored uncompressed in S3 to maximize dedup across packages
 - Dedup during `PutPath` is decided inside the chunk-row upsert itself: the
   step-3 UPSERT returns `needs_upload = (uploaded_at IS NULL)` per row
   (#rref("store.cas.upsert-inserted")), so a chunk is skipped only when a
@@ -206,6 +205,19 @@ closing that gap would take (paging the walk, not raising the cap).
 - *S3 backend requirements:* Strong read-after-write consistency is required.
   AWS S3 provides this natively. Non-AWS S3-compatible backends (MinIO, Ceph
   RADOS GW) must be validated for consistency.
+
+#r("store.cas.zstd-at-rest")[
+  Chunk objects MUST be zstd-compressed at rest on write; chunk digests MUST
+  remain the BLAKE3 of the UNCOMPRESSED bytes (the digest space never
+  re-keys); reads MUST decompress under a `CHUNK_MAX` output bound and verify
+  BLAKE3 over the decompressed result; a stored object whose decode fails or
+  whose decompressed bytes do not match the digest MUST surface as a
+  corruption error naming the digest, never a decoder panic or unbounded
+  allocation.
+]
+
+Dedup is unaffected: identical uncompressed content compresses to the
+identical stored object under the same digest key.
 
 #r("store.backend.filesystem")[
   For dev/single-node deployments, `FilesystemChunkBackend` stores chunks on

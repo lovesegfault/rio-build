@@ -9,7 +9,6 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use prost::Message;
 use sha2::Digest as _;
 use tokio_stream::StreamExt;
@@ -511,7 +510,7 @@ async fn seed_blob(f: &Fixture, name: &str, b: &BlobNar, chunk_size: Option<usiz
         for piece in b.nar.chunks(chunk_size) {
             let hash: [u8; 32] = blake3::hash(piece).into();
             f.chunks
-                .put(&hash, Bytes::copy_from_slice(piece))
+                .put(&hash, rio_store::cas::compress_chunk(piece))
                 .await
                 .unwrap();
             entries.push(ManifestEntry {
@@ -762,8 +761,13 @@ async fn reassemble_stat(f: &Fixture, resp: &StatBlobResponse) -> Vec<u8> {
     let mut body = Vec::new();
     for (i, c) in resp.chunks.iter().enumerate() {
         let digest: [u8; 32] = c.digest.as_slice().try_into().unwrap();
-        let bytes = f.chunks.get(&digest).await.unwrap().unwrap();
-        assert_eq!(bytes.len() as u64, c.size, "ChunkMeta.size matches store");
+        let stored = f.chunks.get(&digest).await.unwrap().unwrap();
+        let bytes = rio_store::cas::decode_stored_chunk(&digest, stored).unwrap();
+        assert_eq!(
+            bytes.len() as u64,
+            c.size,
+            "ChunkMeta.size is plaintext size"
+        );
         let start = if i == 0 {
             resp.first_chunk_skip as usize
         } else {
@@ -1089,7 +1093,7 @@ async fn seed_subst_only_blob(
         for piece in b.nar.chunks(chunk_size) {
             let hash: [u8; 32] = blake3::hash(piece).into();
             f.chunks
-                .put(&hash, Bytes::copy_from_slice(piece))
+                .put(&hash, rio_store::cas::compress_chunk(piece))
                 .await
                 .unwrap();
             entries.push(ManifestEntry {

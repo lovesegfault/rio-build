@@ -246,12 +246,19 @@ async fn refetch_and_verify(
         };
         // Guard the recompute against backend corruption so a bad
         // object is reported as server-side data loss, not blamed on
-        // the builder as a digest forgery.
+        // the builder as a digest forgery. The backend returns the
+        // STORED form (zstd-framed or legacy raw) —
+        // `decode_stored_chunk` sniffs/decompresses and verifies the
+        // BLAKE3 over the UNCOMPRESSED bytes; the manifest's size
+        // claim is checked against the decoded length.
         let (ok, h) = cas::cpu_bound(move || {
-            let ok = body.len() == len as usize && *blake3::hash(&body).as_bytes() == digest;
-            if ok {
-                hasher.update(&body);
-            }
+            let ok = match cas::decode_stored_chunk(&digest, body) {
+                Ok(plain) if plain.len() == len as usize => {
+                    hasher.update(&plain);
+                    true
+                }
+                _ => false,
+            };
             (ok, hasher)
         });
         hasher = h;

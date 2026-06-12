@@ -670,7 +670,11 @@ async fn do_upload(
     stream::iter(to_upload)
         .map(|(hash, range)| {
             // Owned copy deferred to here: ≤ max_concurrent in flight.
-            let data = Bytes::copy_from_slice(&nar_data[range]);
+            // The owned form is the zstd-at-rest STORED form (the
+            // digest stays over the uncompressed slice); compressing
+            // at the same deferred point keeps the in-flight bound at
+            // ≤ max_concurrent × ~CHUNK_MAX of owned bytes.
+            let data = compress_chunk(&nar_data[range]);
             let backend = Arc::clone(backend);
             let hb = hb.clone();
             async move {
@@ -767,6 +771,57 @@ mod parsed_nar_tests {
             ParsedNar::parse(&with_junk).is_err(),
             "trailing bytes after the NAR root node must be rejected"
         );
+    }
+}
+
+// ============================================================================
+// At-rest chunk compression (zstd) — ADR-024
+// ============================================================================
+
+/// At-rest compression level: zstd default (3) — the same level the
+/// serve-time NAR encoder uses (substitute.rs's `ZstdEncoder::new`,
+/// async-compression's default). Chunks are ≤256 KiB and compressed
+/// once per unique digest; default-level is the measured sweet spot
+/// for the skeleton/inputSrcs ratios ADR-024 budgets against.
+const ZSTD_AT_REST_LEVEL: i32 = zstd::DEFAULT_COMPRESSION_LEVEL;
+
+/// Compress a chunk body for storage.
+///
+/// The DIGEST SPACE IS UNCHANGED: chunks stay keyed by the BLAKE3 of
+/// their UNCOMPRESSED bytes (compressing must never re-key the dedup
+/// namespace), only the stored object bytes are zstd-framed. Callers
+/// pass the verified plaintext; the matching read-side decode is
+/// [`decode_stored_chunk`].
+// r[impl store.cas.zstd-at-rest]
+pub fn compress_chunk(data: &[u8]) -> Bytes {
+    // encode_all over a slice cannot fail (no I/O): the only error
+    // source is the Write impl, and Vec's never errors.
+    Bytes::from(zstd::encode_all(data, ZSTD_AT_REST_LEVEL).expect("zstd encode to Vec cannot fail"))
+}
+
+/// Decode + BLAKE3-verify a chunk object as read from the backend.
+///
+/// Every stored chunk is a zstd frame (`compress_chunk`); the digest
+/// space is over the UNCOMPRESSED bytes. Decompression is bounded by
+/// `chunker::CHUNK_MAX` — every honestly-stored chunk is ≤256 KiB
+/// uncompressed (FastCDC max; `validate_begin` enforces the same bound
+/// on client-claimed sizes), so a frame claiming more is by definition
+/// not a chunk this store wrote and surfaces as [`ChunkError::Corrupt`]
+/// rather than being decompressed into memory. zstd decoder errors map
+/// to the same `Corrupt` (never a panic or I/O error).
+// r[impl store.cas.zstd-at-rest]
+pub fn decode_stored_chunk(expected: &[u8; 32], stored: Bytes) -> Result<Bytes, ChunkError> {
+    // `bulk::decompress` errors when the output would exceed the
+    // capacity — that caps decompression work and memory at CHUNK_MAX
+    // regardless of what the frame header claims.
+    match zstd::bulk::decompress(&stored, chunker::CHUNK_MAX) {
+        Ok(plain) => ChunkCache::verify(expected, Bytes::from(plain)),
+        // Torn frame / over-bound / not-zstd: report the stored object's
+        // own hash as `actual` so the operator has a fingerprint.
+        Err(_) => Err(ChunkError::Corrupt {
+            expected: *expected,
+            actual: *blake3::hash(&stored).as_bytes(),
+        }),
     }
 }
 
@@ -943,11 +998,14 @@ impl ChunkCache {
         // next call). Propagate as data-loss error.
         let bytes = fetched.ok_or(ChunkError::NotFound(*hash))?;
 
-        // --- Layer 3: Verify BEFORE cache insert ---
-        // If this fails, the corrupt bytes never enter the cache. The
-        // next call retries from the backend (which might have recovered
-        // — S3 bitrot is sometimes transient, sometimes not).
-        let verified = Self::verify(hash, bytes)?;
+        // --- Layer 3: Decode + verify BEFORE cache insert ---
+        // Backend bytes are the STORED form (zstd-framed);
+        // decode_stored_chunk decompresses under the CHUNK_MAX bound
+        // and verifies BLAKE3 over the uncompressed result. If this
+        // fails, the corrupt bytes never enter the cache. The LRU only
+        // ever holds UNCOMPRESSED bytes, which is why the layer-1 hit
+        // path above verifies raw without decoding.
+        let verified = decode_stored_chunk(hash, bytes)?;
 
         // --- Layer 4: Cache insert ---
         // moka's insert is async (eviction runs concurrently). Bytes is
@@ -1066,11 +1124,20 @@ mod cache_tests {
     use crate::test_helpers::mem_backend;
 
     /// Real hash/data pair: the BLAKE3 of "hello chunk cache".
-    /// `get_verified` hashes the data and compares, so these must match.
+    /// `get_verified` hashes the decompressed data and compares, so
+    /// the hash must be over the PLAIN bytes; the backend stores the
+    /// zstd-framed form.
     fn sample_chunk() -> ([u8; 32], Bytes) {
         let data = Bytes::from_static(b"hello chunk cache");
         let hash = *blake3::hash(&data).as_bytes();
         (hash, data)
+    }
+
+    /// Store `plain` in the backend in its at-rest (zstd) form, keyed
+    /// by the digest of the plain bytes — the same shape `do_upload`
+    /// produces.
+    async fn put_plain(backend: &MemoryChunkBackend, hash: &[u8; 32], plain: &[u8]) {
+        backend.put(hash, compress_chunk(plain)).await.unwrap();
     }
 
     fn make_cache() -> (Arc<MemoryChunkBackend>, ChunkCache) {
@@ -1085,7 +1152,7 @@ mod cache_tests {
     async fn get_found_and_verified() {
         let (backend, cache) = make_cache();
         let (hash, data) = sample_chunk();
-        backend.put(&hash, data.clone()).await.unwrap();
+        put_plain(&backend, &hash, &data).await;
 
         let got = cache.get_verified(&hash).await.unwrap();
         assert_eq!(got, data);
@@ -1143,7 +1210,7 @@ mod cache_tests {
         ));
 
         // Fix the backend (simulating S3 recovering / re-upload).
-        backend.put(&hash, good_data.clone()).await.unwrap();
+        put_plain(&backend, &hash, &good_data).await;
 
         // Second call hits backend again (corrupt bytes weren't cached),
         // sees good data, verifies, succeeds.
@@ -1159,7 +1226,7 @@ mod cache_tests {
     async fn lru_hit_skips_backend() {
         let (backend, cache) = make_cache();
         let (hash, data) = sample_chunk();
-        backend.put(&hash, data.clone()).await.unwrap();
+        put_plain(&backend, &hash, &data).await;
 
         // First get: miss → backend → cache insert.
         let first = cache.get_verified(&hash).await.unwrap();
@@ -1190,7 +1257,7 @@ mod cache_tests {
         let (backend, cache) = make_cache();
         let cache = Arc::new(cache);
         let (hash, data) = sample_chunk();
-        backend.put(&hash, data.clone()).await.unwrap();
+        put_plain(&backend, &hash, &data).await;
 
         // 10 concurrent gets.
         let handles: Vec<_> = (0..10)
@@ -1242,8 +1309,8 @@ mod cache_tests {
         // completion — the Shared caches the task's output, the map
         // entry was never removed.
         let stale: InflightFetch = {
-            let d = data.clone();
-            async move { Some(d) }.boxed().shared()
+            let stored = compress_chunk(&data);
+            async move { Some(stored) }.boxed().shared()
         };
         cache.inflight.insert(hash, stale);
 
@@ -1323,7 +1390,7 @@ mod cache_tests {
         let (hash, good_data) = sample_chunk();
 
         // Seed the backend with GOOD data.
-        backend.put(&hash, good_data.clone()).await.unwrap();
+        put_plain(&backend, &hash, &good_data).await;
 
         // Manually insert CORRUPT bytes into the LRU, simulating
         // memory corruption (cosmic ray bit-flip, bad RAM). In
@@ -1618,5 +1685,96 @@ mod upload_tests {
             200,
             "all 4×50 chunks dispatched"
         );
+    }
+}
+
+// r[verify store.cas.zstd-at-rest]
+#[cfg(test)]
+mod zstd_at_rest_tests {
+    use super::*;
+    use crate::test_helpers::mem_backend;
+
+    fn hash_of(data: &[u8]) -> [u8; 32] {
+        *blake3::hash(data).as_bytes()
+    }
+
+    fn cache_over(backend: &Arc<crate::backend::MemoryChunkBackend>) -> ChunkCache {
+        ChunkCache::with_capacity(
+            Arc::clone(backend) as Arc<dyn crate::backend::ChunkBackend>,
+            1024 * 1024,
+        )
+    }
+
+    /// Write path stores the zstd form; read path serves the original
+    /// plaintext. The digest is over the UNCOMPRESSED bytes — proven
+    /// by keying the stored compressed object under blake3(plaintext).
+    #[tokio::test]
+    async fn round_trip_compressed_chunk() {
+        let backend = mem_backend();
+        let cache = cache_over(&backend);
+        // Compressible content so stored != plaintext is meaningful.
+        let plain = Bytes::from(vec![0x42u8; 8192]);
+        let hash = hash_of(&plain);
+
+        let stored = compress_chunk(&plain);
+        assert_ne!(stored, plain);
+        assert!(stored.len() < plain.len(), "0x42-run must compress");
+        backend.put(&hash, stored).await.unwrap();
+
+        let got = cache.get_verified(&hash).await.unwrap();
+        assert_eq!(got, plain, "read serves UNCOMPRESSED bytes");
+    }
+
+    /// A corrupted compressed object must surface as Corrupt naming
+    /// the digest — never a decoder panic or an I/O error. Covers both
+    /// shapes: a torn frame (decoder error) and a valid frame holding
+    /// the wrong content (digest mismatch after decompression).
+    #[tokio::test]
+    async fn corrupt_compressed_object_is_corruption_not_panic() {
+        let backend = mem_backend();
+        let cache = cache_over(&backend);
+        let plain = Bytes::from(vec![0x37u8; 4096]);
+        let hash = hash_of(&plain);
+
+        // Shape 1: torn frame — flip a byte past the magic.
+        let mut torn = compress_chunk(&plain).to_vec();
+        let mid = torn.len() / 2;
+        torn[mid] ^= 0xFF;
+        backend.put(&hash, Bytes::from(torn)).await.unwrap();
+        match cache.get_verified(&hash).await {
+            Err(ChunkError::Corrupt { expected, .. }) => assert_eq!(expected, hash),
+            other => panic!("torn zstd frame must be Corrupt, got {other:?}"),
+        }
+
+        // Shape 2: valid frame, wrong content.
+        backend
+            .put(&hash, compress_chunk(b"entirely different content"))
+            .await
+            .unwrap();
+        match cache.get_verified(&hash).await {
+            Err(ChunkError::Corrupt { expected, .. }) => assert_eq!(expected, hash),
+            other => panic!("wrong-content frame must be Corrupt, got {other:?}"),
+        }
+    }
+
+    /// Decompression is bounded by CHUNK_MAX: a frame expanding past
+    /// the bound (no honestly-stored chunk does) is treated as
+    /// corruption, not decompressed into memory.
+    #[tokio::test]
+    async fn oversized_frame_bounded_not_decompressed() {
+        let backend = mem_backend();
+        let cache = cache_over(&backend);
+        // 4 × CHUNK_MAX of zeros compresses to a tiny frame whose
+        // decompressed size exceeds the bound.
+        let bomb_plain = vec![0u8; chunker::CHUNK_MAX * 4];
+        let bomb = compress_chunk(&bomb_plain);
+        assert!(bomb.len() < 4096, "precondition: the frame itself is tiny");
+        let hash = hash_of(&bomb_plain);
+        backend.put(&hash, bomb).await.unwrap();
+
+        match cache.get_verified(&hash).await {
+            Err(ChunkError::Corrupt { expected, .. }) => assert_eq!(expected, hash),
+            other => panic!("over-bound frame must be Corrupt, got {other:?}"),
+        }
     }
 }
