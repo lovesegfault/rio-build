@@ -180,6 +180,45 @@ mod tests {
         held.release().await.unwrap();
     }
 
+    /// Parse the gc module tree's FILE-module declarations from the
+    /// declaring `mod.rs` source (bug_002, R31's in-crate tier): the
+    /// census universe DERIVES from the one authoritative declaration
+    /// list instead of a hand-maintained second copy of the module
+    /// tree. `cfg(test)`-gated declarations are lawfully outside the
+    /// production universe (returned separately so the exclusion is
+    /// ASSERTED, never silent); inline modules (brace form) are
+    /// discharged via their HOST file's census row.
+    fn file_modules(mod_src: &str) -> (Vec<String>, Vec<String>) {
+        let mut production = Vec::new();
+        let mut test_gated = Vec::new();
+        let mut prev_cfg_test = false;
+        for line in mod_src.lines() {
+            let t = line.trim();
+            if t == "#[cfg(test)]" {
+                prev_cfg_test = true;
+                continue;
+            }
+            let rest = t
+                .strip_prefix("pub(crate) mod ")
+                .or_else(|| t.strip_prefix("pub mod "))
+                .or_else(|| t.strip_prefix("mod "));
+            if let Some(rest) = rest
+                && let Some(name) = rest.strip_suffix(';')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                if prev_cfg_test {
+                    test_gated.push(name.to_string());
+                } else {
+                    production.push(name.to_string());
+                }
+            }
+            if !t.is_empty() {
+                prev_cfg_test = false;
+            }
+        }
+        (production, test_gated)
+    }
+
     /// merged_bug_223 source pin: every pooled acquire in gc/
     /// production sources routes through [`SessionConn::acquire`] —
     /// `pool.acquire(` appears nowhere outside this file (and exactly
@@ -187,6 +226,23 @@ mod tests {
     /// freely). RED (recorded pre-fix): lock.rs try_acquire's bare
     /// pre-wrap acquire + collect.rs cycle acquire + sweep.rs sweep
     /// acquire.
+    ///
+    /// THE UNIVERSE DERIVES (bug_002, R31's in-crate tier): the
+    /// `include_str!` sibling array was a hand-maintained second copy
+    /// of the module tree that went stale the moment a sibling landed
+    /// — wave-10 added `lane.rs` without enrolling it, so a future
+    /// bare `pool.acquire(` there would have silently bypassed this
+    /// law. The array is now PINNED against the `mod.rs` declaration
+    /// parse with TWO TYPED exceptions asserted rather than skipped:
+    /// `lock` (the census home — discharged by the in-file
+    /// exactly-once rule below, not an array row) and the
+    /// cfg(test)-gated declarations (`mark_scan_bench` — lawfully
+    /// outside the production universe, asserted gated); inline
+    /// modules (`hold`) discharge via their host file's row (mod.rs
+    /// itself is in the array). Population face: the parse must find
+    /// at least one declaration (the resolve face is
+    /// compile-discharged by `include_str!`).
+    // r[verify store.gc.acquire-census-derived]
     #[test]
     fn gc_pool_acquires_route_through_session_conn() {
         fn production_half(src: &str) -> &str {
@@ -203,7 +259,45 @@ mod tests {
             ("drain.rs", include_str!("drain.rs")),
             ("mark.rs", include_str!("mark.rs")),
             ("tenant.rs", include_str!("tenant.rs")),
+            ("lane.rs", include_str!("lane.rs")),
         ];
+
+        // The universe derivation: every non-cfg(test) FILE module
+        // declared by mod.rs has an array row (lock excepted, typed).
+        let (declared, test_gated) = file_modules(include_str!("mod.rs"));
+        assert!(
+            !declared.is_empty(),
+            "population face: the mod.rs parse found no declarations — \
+             the grammar broke, not the tree"
+        );
+        assert!(
+            test_gated.contains(&"mark_scan_bench".to_string()),
+            "typed exception: mark_scan_bench is cfg(test)-gated (a \
+             de-gating moves it into the derived universe and reds the \
+             coverage check below)"
+        );
+        assert!(
+            include_str!("mod.rs").contains("pub mod hold {"),
+            "typed exception: hold is an INLINE module discharged via \
+             mod.rs's own census row; if it moves to a file, the parse \
+             enrolls it"
+        );
+        for m in &declared {
+            if m == "lock" {
+                // Typed exception: the census home itself — discharged
+                // by the in-file exactly-once rule below.
+                continue;
+            }
+            let file = format!("{m}.rs");
+            assert!(
+                outside.iter().any(|(f, _)| *f == file),
+                "census universe drifted: mod.rs declares `{m}` but the \
+                 include_str! array carries no `{file}` row — enroll the \
+                 sibling (bug_002: a hand list is a second copy of the \
+                 module tree)"
+            );
+        }
+
         for (name, src) in outside {
             let hits = production_half(src).matches("pool.acquire(").count();
             assert_eq!(
@@ -215,6 +309,56 @@ mod tests {
             .matches("pool.acquire(")
             .count();
         assert_eq!(own, 1, "lock.rs holds the single pooled-acquire site");
+    }
+
+    // r[verify store.gc.acquire-census-derived]
+    /// W12-V (bug_002): the planted red — a strawman FILE-module
+    /// declaration outside the previously-scanned array population is
+    /// auto-joined by the LIVE derivation (the jurisdiction face: the
+    /// universe is the declaration list, so a new sibling cannot hide
+    /// from it), and the coverage predicate goes red for it against
+    /// the committed array. Driven through the SAME parse path as
+    /// production.
+    #[test]
+    fn census_universe_plant_red() {
+        let doctored = format!("{}\npub mod strawman_lane;\n", include_str!("mod.rs"));
+        let (declared, _) = file_modules(&doctored);
+        assert!(
+            declared.contains(&"strawman_lane".to_string()),
+            "the derivation auto-joins the planted declaration"
+        );
+        // The coverage predicate (the census's own check) reds: no
+        // array row exists for the plant.
+        let array_files = [
+            "collect.rs",
+            "sweep.rs",
+            "mod.rs",
+            "state.rs",
+            "orphan.rs",
+            "drain.rs",
+            "mark.rs",
+            "tenant.rs",
+            "lane.rs",
+        ];
+        let missing: Vec<&String> = declared
+            .iter()
+            .filter(|m| *m != "lock")
+            .filter(|m| !array_files.contains(&format!("{m}.rs").as_str()))
+            .collect();
+        assert_eq!(
+            missing,
+            vec![&"strawman_lane".to_string()],
+            "exactly the plant is uncovered — the lawful exceptions stay \
+             typed, never silently skipped"
+        );
+        // The cfg(test) polarity control: a GATED plant stays outside.
+        let gated = format!(
+            "{}\n#[cfg(test)]\nmod strawman_gated;\n",
+            include_str!("mod.rs")
+        );
+        let (declared2, test_gated2) = file_modules(&gated);
+        assert!(!declared2.contains(&"strawman_gated".to_string()));
+        assert!(test_gated2.contains(&"strawman_gated".to_string()));
     }
 
     /// merged_bug_223: cancelling `try_acquire` at ANY await point —

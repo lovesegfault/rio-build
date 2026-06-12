@@ -2092,6 +2092,26 @@ of this rule's scope.
   from accounting.)
 ]
 
+#r("store.gc.acquire-census-derived")[
+  The gc pooled-acquire census's UNIVERSE derives from the module tree's
+  one authoritative declaration list (`include_str!("mod.rs")` parsed for
+  non-`cfg(test)` FILE-module declarations): the `include_str!` sibling
+  array MUST cover every derived member, with exceptions TYPED and
+  asserted rather than skipped --- the census home itself discharges via
+  its in-file exactly-once rule, `cfg(test)`-gated declarations are
+  lawfully outside the production universe, and inline modules discharge
+  via their host file's row. A sibling landing without enrollment reds
+  the census; a hand-maintained array is a second copy of the module
+  tree.
+]
+Wave-10 added `lane.rs` to the gc tree without extending the
+pre-campaign census (bug_002): a future bare `pool.acquire(` there would
+have silently bypassed the SessionConn law the test exists to enforce.
+No live violation existed --- the gap was census-universe staleness, the
+R31 in-crate tier's founding instance; the same `include_str!` is
+same-crate, so the cross-crate embed ban does not bite (checked
+explicitly).
+
 #r("store.gc.serialize-lock")[
   `run_gc` serializes against itself via `pg_try_advisory_lock(GC_LOCK_ID)` on
   a dedicated session-scoped pool connection. If the lock is held, `run_gc`
