@@ -766,7 +766,7 @@ EXIT_EDGE_GIVEUP = re.compile(
 )
 EXIT_EDGE_CONSTFAM = re.compile(r"\bconst\s+(\w*(?:GIVE_UP|MAX_ATTEMPTS|_BUDGET)\w*)\s*:")
 EXIT_EDGE_RETAIN = re.compile(r"\.retain(?:_rows)?\s*\(")
-EXIT_EDGE_LATCHWORD = re.compile(r"blocks_|gave_up|give_up")
+EXIT_EDGE_LATCHWORD = re.compile(r"(?:blocks_|gave_up|give_up)\w*")
 EXIT_EDGE_GRANDFATHER = "nix/exit-edge-grandfather.txt"
 
 # Enrolled rows — (file, idiom, identity) -> (reset event,
@@ -785,13 +785,15 @@ EXIT_EDGE_ROWS = {
     # The gave-up decay (WO-S7-1, the H7''' record; re-keyed by
     # round-12 merged_bug_043): GaveUpReset receipt minted only by
     # PoolStreaks::note_demand_epoch; exit edge = a CHANGED
-    # SpawnIntent.resubmit_cycle (newer or REWOUND — ClearPoison
+    # SpawnIntent.resubmit_cycle (newer or REWOUND - ClearPoison
     # lawfully zeroes it) at the spawn-fold demand seam
     # (evaluate_spawn_gate; SpawnGateOutcome.decayed; Event
     # RespawnGiveUpReset); equality alone latches (anti-replay);
-    # re-latch at full budget.
-    ("rio-controller/src/reconcilers/pool/candidate.rs", "retain-latch", "L1022"): (
-        "demand-epoch decay: a changed resubmit_cycle (newer or rewound) mints GaveUpReset (pod-free — reachable from inside the latch)",
+    # re-latch at full budget. Identity is CONTENT-KEYED (WO-S8-5:
+    # receiver.latch-token - the L-ordinal maintenance tax this
+    # conflict itself paid twice is dead).
+    ("rio-controller/src/reconcilers/pool/candidate.rs", "retain-latch", "respawn.blocks_respawn"): (
+        "demand-epoch decay: a changed resubmit_cycle (newer or rewound) mints GaveUpReset (pod-free - reachable from inside the latch)",
         "W11-BE red + W12-AP rewind red + quint-respawn-giveup single-leaf (orbit space incl. rewinds) + the decay-reachable witness + the relatch/rewind runs (S7 c1; bw12-s6 c5)",
     ),
     # The outbox reset edge (WO-S5-3, the H5''' record): the
@@ -850,7 +852,19 @@ EXIT_EDGE_SEED_CONSTRUCTIONS = {
 def exit_edge_finder(files):
     """(rel, idiom, identity) hits over (rel, raw) files; fail-closed
     per R22″ — an ON CONFLICT insert without a resolvable table is a
-    refusal row, never a skip."""
+    refusal row, never a skip.
+
+    WO-S8-5 (merged_bug_143): the SQL gates are CASE-FOLDED — a
+    scanner lexing a case-insensitive dialect case-folds EVERY gate,
+    not just the one regex that happened to get re.I (lowercase or
+    mixed-case PG syntax was silently skipped or mis-keyed against
+    this docstring's own refusal-row-never-a-skip contract); every
+    INSERT target in a literal is a row (the old first-match
+    `continue` dropped the second target per literal); retain-latch
+    identities are CONTENT-KEYED (`<receiver>.<latch-token>`, the
+    census_enrollment convention) — the old pruned-text line ordinal
+    double-red the gate with a misleading rot-or-finder-hole
+    diagnostic on any edit above the latch line."""
     out = []
     for rel, raw in files:
         try:
@@ -865,18 +879,29 @@ def exit_edge_finder(files):
             out.append((rel, "const-family", m.group(1)))
         for m in EXIT_EDGE_RETAIN.finditer(lexed):
             ext = rust_strip._match_delim(lexed, m.end() - 1)
-            if EXIT_EDGE_LATCHWORD.search(lexed[m.end() : ext]):
-                out.append(
-                    (rel, "retain-latch", f"L{lexed.count(chr(10), 0, m.start()) + 1}")
-                )
+            lm = EXIT_EDGE_LATCHWORD.search(lexed[m.end() : ext])
+            if lm:
+                r_end = m.start()
+                r_start = r_end
+                while r_start > 0 and (lexed[r_start - 1].isalnum() or lexed[r_start - 1] == "_"):
+                    r_start -= 1
+                receiver = lexed[r_start:r_end] or "<expr>"
+                out.append((rel, "retain-latch", f"{receiver}.{lm.group(0)}"))
         for a, b, _is_raw in spans:
             body = pruned[a:b]
-            if "ON CONFLICT" not in body:
+            if re.search(r"\bON\s+CONFLICT\b", body, re.I) is None:
                 continue
-            tm = re.search(r"\bINSERT\s+INTO\s+(\w+)", body, re.I)
-            if tm is not None:
-                kind = "on-conflict-do-update" if "DO UPDATE" in body else "on-conflict-do-nothing"
-                out.append((rel, kind, tm.group(1)))
+            targets = re.findall(r"\bINSERT\s+INTO\s+(\w+)", body, re.I)
+            if targets:
+                kind = (
+                    "on-conflict-do-update"
+                    if re.search(r"\bDO\s+UPDATE\b", body, re.I)
+                    else "on-conflict-do-nothing"
+                )
+                # EVERY target is a row — a literal carrying two
+                # INSERTs enqueues into two tables.
+                for t in targets:
+                    out.append((rel, kind, t))
                 continue
             # ON CONFLICT without INSERT INTO in the same literal:
             # a SQL FRAGMENT (split query-builder string — the table
@@ -884,7 +909,7 @@ def exit_edge_finder(files):
             # HELP narrating the dedup — no SQL keywords; skip, with
             # its co-located plant). The boundary is derived from the
             # string's own grammar, not the file.
-            if re.search(r"\b(?:VALUES|SELECT|SET|WHERE|UNNEST|UPDATE)\b", body):
+            if re.search(r"\b(?:VALUES|SELECT|SET|WHERE|UNNEST|UPDATE)\b", body, re.I):
                 out.append(
                     (
                         rel,
@@ -1550,7 +1575,7 @@ def main() -> int:
     ee_vectors = [
         ("give-up-pred", "fn f(&self) -> bool { self.deaths >= RESPAWN_GIVE_UP_DEATHS }\n", "RESPAWN_GIVE_UP_DEATHS"),
         ("give-up-pred", "fn f(&self) -> bool { self.attempts > Self::ZERO_BACKOFF_STREAK }\n", "ZERO_BACKOFF_STREAK"),
-        ("retain-latch", "fn f(&mut self) { self.rows.retain(|r| r.blocks_respawn(now)); }\n", "L1"),
+        ("retain-latch", "fn f(&mut self) { self.rows.retain(|r| r.blocks_respawn(now)); }\n", "rows.blocks_respawn"),
         ("on-conflict-do-nothing", 'const Q: &str = "INSERT INTO outbox (id) VALUES ($1) ON CONFLICT DO NOTHING";\n', "outbox"),
         ("on-conflict-do-update", 'const Q: &str = "INSERT INTO state (k) VALUES ($1) ON CONFLICT (k) DO UPDATE SET k = $1";\n', "state"),
         ("const-family", "const REPORT_RETRY_BUDGET: u32 = 3;\n", "REPORT_RETRY_BUDGET"),
@@ -1560,6 +1585,36 @@ def main() -> int:
         if len(got) != 1 or got[0][1] != idiom or got[0][2] != ident:
             print(f"FAIL: exit-edge finder vector ({idiom}/{ident}) not located: {got}", file=sys.stderr)
             return 1
+    # --- W12-BC (WO-S8-5): the case x drift product ------------------
+    # Dialect-lawful spellings never skip; identities survive line
+    # drift. Red pre-fix: lowercase `on conflict` skipped silently,
+    # mixed-case `Do Update` mis-keyed as do-nothing, a two-INSERT
+    # literal dropped its second target, and any edit above a retain
+    # latch evicted its line-ordinal identity.
+    bc_cases = [
+        ("lowercase", 'const Q: &str = "insert into outbox (id) values ($1) on conflict do nothing";\n', "on-conflict-do-nothing", "outbox"),
+        ("mixed-case-update", 'const Q: &str = "Insert Into state (k) Values ($1) On Conflict (k) Do Update Set k = $1";\n', "on-conflict-do-update", "state"),
+    ]
+    for case, snippet, want_kind, want_ident in bc_cases:
+        got = [h for h in exit_edge_finder([("planted/bc.rs", snippet)]) if h[1] != "refusal"]
+        if len(got) != 1 or got[0][1] != want_kind or got[0][2] != want_ident:
+            print(f"FAIL: W12-BC ({case}) — dialect-lawful spelling skipped or mis-keyed: {got}", file=sys.stderr)
+            return 1
+    two_targets = (
+        'const Q: &str = "INSERT INTO a (k) VALUES ($1) ON CONFLICT DO NOTHING; '
+        'INSERT INTO b (k) VALUES ($1)";\n'
+    )
+    got = [h for h in exit_edge_finder([("planted/two.rs", two_targets)]) if h[1] != "refusal"]
+    if len(got) != 2 or {h[2] for h in got} != {"a", "b"}:
+        print(f"FAIL: W12-BC (two-targets) — the second INSERT target dropped: {got}", file=sys.stderr)
+        return 1
+    drift_a = "fn f(&mut self) { self.rows.retain(|r| r.blocks_respawn(now)); }\n"
+    drift_b = "fn pad() {}\nfn pad2() {}\n" + drift_a
+    ka = [h for h in exit_edge_finder([("planted/drift.rs", drift_a)]) if h[1] == "retain-latch"]
+    kb = [h for h in exit_edge_finder([("planted/drift.rs", drift_b)]) if h[1] == "retain-latch"]
+    if not ka or ka[0][2] != kb[0][2] or ka[0][2] != "rows.blocks_respawn":
+        print(f"FAIL: W12-BC (line-drift) — identity did not survive drift: {ka} vs {kb}", file=sys.stderr)
+        return 1
     # The fail-closed refusal plant: an ON CONFLICT SQL fragment whose
     # INSERT INTO target lives in another string REFUSES, never skips.
     refused_ee = exit_edge_finder(
