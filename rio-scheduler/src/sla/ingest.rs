@@ -1922,48 +1922,58 @@ mod disk_axis_tests {
     }
 
     // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
-    /// **R8 (ingest half) + W7-H** — *the fit retires the disk prior
-    /// on the probe_only arm too*: a pname with fewer than two c-axis
-    /// rows (the `kept.len() < 2` early return) but MULTIPLE observed
-    /// peaks carries the aggregated p90, not the last row's absent
-    /// one. Pre-fix red (left, reverse-strawman transcript in the
-    /// commit body): `disk_p90 == None` — `probe_only` read ONLY
-    /// `rows.last()`, so two real observations were erased by one
-    /// peak-less newest row and the consumer fell back to the 100 GiB
-    /// chart default. DIVERGENCE recorded (R5): the book's R8 premise
-    /// ("warm pname on default") holds at tree ONLY for populations
-    /// whose peaks sit outside the c-axis subset — the full-fit
-    /// quantile aggregated peaked C-AXIS rows already (the book's own
-    /// evidence cites :360-:365), but filtered disk evidence to
-    /// `fit_rows` even though disk is a c-independent scalar, and the
-    /// probe_only arm read one row; both arms now recover the full
-    /// evidence universe. The live 100 GiB fleet population is the
-    /// prjquota-less pool (peaks recorded NULL — the sla-sizing.typ-
-    /// named residual: no fit can conjure absent data; the envelope
-    /// types its prior for it).
+    /// **W12-AH (bug_040, red-first)** — *the probe_only disk aggregate
+    /// is pinned at its OWN arm, by a STRUCTURAL witness of that arm.*
+    /// The predecessor test ("probe_only_disk_p90_aggregates_all_
+    /// observed_rows") carried one Some(4.0) c-axis row, so
+    /// `fit_rows.is_empty()` was FALSE and the fixture took the
+    /// FULL-FIT path: its asserted Probe came from the als-gate and
+    /// its disk assertion was satisfied by the full-fit chokepoint —
+    /// the line-176 `aggregate_disk_p90(rows, &[])` argument was
+    /// pinned by NOTHING (a None/wrong-population rewrite passed the
+    /// whole suite incl. the W11-BC read-count census), and the
+    /// r[verify] marker above attested coverage that did not exist —
+    /// vacuous from birth.
+    ///
+    /// This fixture has ZERO c-axis rows (the arm's ONLY entry
+    /// condition) and asserts the arm structurally: probe_only's
+    /// distinctive `n_eff_ring == 0.0 ∧ sum_w == 0.0` signature — the
+    /// full-fit path computes a Kish n_eff over a non-empty ring and
+    /// CANNOT mint it. Three peaked rows (the witnessed-population
+    /// floor the disk fit consumes) + one peak-less newest row: the
+    /// aggregate covers every observed peak, never the newest row's
+    /// absent one. Red (strawman, transcript in the commit body): a
+    /// None-rewrite of the probe_only disk argument fails HERE and
+    /// nowhere else in the suite.
     #[test]
-    fn probe_only_disk_p90_aggregates_all_observed_rows() {
+    fn w12_ah_probe_only_disk_aggregate_pinned_at_its_own_arm() {
         const GI: i64 = 1 << 30;
         let rows = vec![
-            // Legacy/peaked rows without a usable c-axis seat.
+            // Peaked legacy rows — no c-axis seat anywhere in the ring.
             disk_row(None, 100.0, Some(2 * GI)),
             disk_row(None, 101.0, Some(3 * GI)),
-            // Newest row: the only c-axis seat, no peak recorded.
-            disk_row(Some(4.0), 100.2, None),
+            disk_row(None, 102.0, Some(3 * GI)),
+            // Newest row: still no seat, and no peak recorded.
+            disk_row(None, 100.2, None),
         ];
         let f = refit(&key(), &rows, None, &[], &HwTable::default(), None);
+        // STRUCTURAL arm witness: only probe_only mints this triple.
         assert!(
-            matches!(f.fit, DurationFit::Probe),
-            "precondition: <2 c-axis rows takes the probe_only arm"
+            matches!(f.fit, DurationFit::Probe) && f.n_eff_ring.0 == 0.0 && f.sum_w == 0.0,
+            "the fixture must take the probe_only arm itself \
+             (n_eff_ring={}, sum_w={}) — a sibling gate's Probe carries \
+             a non-empty ring",
+            f.n_eff_ring.0,
+            f.sum_w
         );
         let p90 = f.disk_p90.expect(
-            "the disk aggregate covers EVERY observed row — a peak-less \
-             newest row no longer erases two real observations \
-             (pre-fix: None)",
+            "probe_only consumes THE disk aggregate over every observed \
+             row — a peak-less newest row erases nothing (strawman None \
+             at the :176 argument fails exactly here)",
         );
         assert!(
             p90.0 >= 2 * GI as u64 && p90.0 <= 3 * GI as u64,
-            "p90 of the observed peaks (2,3 GiB), got {}",
+            "p90 of the observed peaks (2,3,3 GiB), got {}",
             p90.0
         );
     }
