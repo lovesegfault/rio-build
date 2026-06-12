@@ -43,7 +43,7 @@ message ResourceUsage {
   double cpu_fraction = 1;                // CPU utilization in cores-equivalent (1.0 = one core fully used; >1.0 on multi-core). Comparable to cpu_limit_cores.
   uint64 memory_used_bytes = 2;           // Current memory usage
   uint64 memory_total_bytes = 3;          // Total available memory
-  uint64 disk_used_bytes = 4;             // Disk usage (SSD cache)
+  uint64 disk_used_bytes = 4;             // Node disk gauge: statvfs-style SSD-cache occupancy of the executor's store volume — NEVER a sizing input (live060-e, R33: one quantity, one field). The per-build disk-sizing observation is peak_disk_bytes (field 12, project-quota); a fit/derive consult of THIS field is a registered wrong-field lint red (the duplicate-derivation registry's disk-sizing-input row).
   uint64 disk_total_bytes = 5;            // Total disk capacity
   reserved 6;                             // was uint32 running_builds (P0537: → bool busy)
   reserved 7;                             // was available_build_slots (P0537: derivable as !busy)
