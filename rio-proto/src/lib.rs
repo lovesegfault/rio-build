@@ -27,6 +27,19 @@ pub use rio_common::grpc::{
 /// can't drift again.
 pub const CONCURRENT_PUTPATH_MSG: &str = "concurrent PutPath in progress";
 
+/// The `build_types.proto` SOURCE TEXT, embedded from this crate's own
+/// proto dir (bug_090): the worker→scheduler completion-report
+/// boundary's schema, exported so rio-scheduler's schema-derived
+/// trust census (`completion_report_schema_census`, db/live_pins.rs)
+/// can parse the field universe from the wire contract itself. The
+/// embed must live HERE — under the per-crate nix build each crate
+/// sees only its own source tree, so a consumer crate's relative
+/// `include_str!` across the workspace cannot resolve (the gate's
+/// crate2nix isolation; the same reason the census embeds its own
+/// crate sources). Content-coupled to the compiled descriptors by
+/// construction: build.rs compiles the identical file.
+pub const BUILD_TYPES_PROTO: &str = include_str!("../proto/build_types.proto");
+
 /// Substring carried in `ExecutorError::CgroupOom`'s Display impl —
 /// DISPLAY/NARRATION ONLY — quantifier: census(forged_free_text_never_moves_resource_floors) — (bug_090): the scheduler's floor decision
 /// consumes the typed `BuildResult.failure_classification` field, not

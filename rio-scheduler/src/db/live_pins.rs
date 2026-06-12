@@ -1363,10 +1363,12 @@ mod registration_writer_census {
         );
     }
 
-    /// The boundary schema, embedded at compile time (the same
-    /// (vvvvv) posture as CENSUS_SOURCES: the nix gate runs test
-    /// binaries without the source tree).
-    const PROTO_BUILD_TYPES: &str = include_str!("../../../rio-proto/proto/build_types.proto");
+    /// The boundary schema, embedded at compile time via the wire
+    /// crate's own export (the same (vvvvv) posture as
+    /// CENSUS_SOURCES: the nix gate runs test binaries without the
+    /// source tree — and the per-crate build sandbox has no sibling
+    /// crate sources, so the embed must ride rio-proto itself).
+    const PROTO_BUILD_TYPES: &str = rio_proto::BUILD_TYPES_PROTO;
 
     /// Parse the completion-report family's `Message.field` universe
     /// out of proto text. Line-grammar parser over message blocks —
