@@ -356,7 +356,9 @@ impl PutAuth {
                 tracing::warn!(
                     tenant = %signed,
                     error = %e,
-                    "ingest registration: malformed signed tenant attribution;                      skipping the stamp (re-stamp covered by the registration                      grace)"
+                    "ingest registration: malformed signed tenant attribution; \
+                     skipping the stamp (re-stamp covered by the registration \
+                     grace)"
                 );
                 None
             }
@@ -1051,7 +1053,7 @@ impl StoreServiceImpl {
         mut info: ValidatedPathInfo,
         claim: uuid::Uuid,
         nar_data: Vec<u8>,
-        // JWT/session tenant: signing-key selection ONLY (builders
+        // JWT/session tenant: signing-key selection only (builders
         // carry none; the wire lane's session tenant signs narinfo).
         tenant_id: Option<uuid::Uuid>,
         // bug_155: the REGISTRATION tenant ([`PutAuth::registration_tenant`]
