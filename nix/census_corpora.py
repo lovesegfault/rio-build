@@ -151,6 +151,18 @@ REGISTRY = [
     # families); un-rowed hits grandfathered shrink-only at
     # nix/exit-edge-grandfather.txt.
     ("exit-edge-census", "nix/census_corpora.py", r"EXIT_EDGE_GIVEUP", {"scope", "fold-site"}, set(), r"EXIT_EDGE_GIVEUP = re\.compile"),
+    # bw12 S8 (WO-S8-14): the four round-12 banner enforcement bodies.
+    # (i) the R31 reader-census registry — enrollment total over
+    # tagged censuses + the two (vvvvv)-staged cross-crate UNION rows
+    # (PD-1) with the jurisdiction planted-red at the registry diff.
+    ("reader-census-registry", "nix/reader_census_registry.py", r"jurisdiction planted-red|UNREGISTERED", {"scope", "reverse-direction"}, set(), r"UNION_ROWS = \{"),
+    # (ii) the R32 obligation census + R29' gate-clock census —
+    # pending rows flip at the wave-close --verify-landed; the
+    # lossy-arithmetic and un-named-gate grammars enforce from birth.
+    ("obligation-clock-census", "nix/obligation_clock_census.py", r"plant did not red|self-test arms", {"scope", "tier"}, set(), r"OBLIGATION_ROWS = \{"),
+    # (iii) the R33 duplicate-derivation lint + the rationale-rot
+    # sweep (OQ-14 latitude recorded in the module doc).
+    ("duplicate-derivation-lint", "nix/duplicate_derivation_lint.py", r"plants wrong|self-test arms", {"scope"}, set(), r"R33_ROWS = \{"),
 ]
 
 MODEL_DIVERGENCE = re.compile(
@@ -1276,6 +1288,10 @@ POPULATION_FLOORS = {
     # Pre-discipline floors, enrolled with their existing predicates.
     "quint-policy": ("nix/quint_policy.py", r"def canary\("),
     "rule-citation-versions": ("nix/rule_citation_versions.py", r"zero rules parsed"),
+    # The WO-S8-14 banner bodies (each walks; each floors).
+    "reader-census-registry": ("nix/reader_census_registry.py", r"population floor"),
+    "obligation-clock-census": ("nix/obligation_clock_census.py", r"population floor"),
+    "duplicate-derivation-lint": ("nix/duplicate_derivation_lint.py", r"population floor"),
 }
 _WALK_RE = re.compile(r"\.r?glob\(")
 

@@ -1475,6 +1475,64 @@ in
         touch $out
       '';
 
+  # WO-S8-14 (the round-12 banner enforcement bodies, R31/R32/R33/
+  # R29'): the reader-census registry (union rows + enrollment
+  # totality), the obligation+clock census (pending rows flip at the
+  # wave-close --verify-landed), and the duplicate-derivation lint +
+  # rationale-rot sweep. Full-tree staging ((vvvvv)): every body
+  # quantifies over workspace sources and committed [GEN-SET]
+  # expectation files (nix/census/*.union, the grandfathers).
+  reader-census-registry =
+    pkgs.runCommand "rio-reader-census-registry"
+      {
+        src = pkgs.lib.cleanSource ../.;
+        nativeBuildInputs = [ pkgs.python3 ];
+        scanScript = ../nix/reader_census_registry.py;
+        sharedLexer = ../nix/rust_strip.py;
+        censusLib = ../nix/census_corpora.py;
+      }
+      ''
+        cp "$sharedLexer" rust_strip.py
+        cp "$censusLib" census_corpora.py
+        cp "$scanScript" reader_census_registry.py
+        python3 reader_census_registry.py "$src"
+        touch $out
+      '';
+
+  obligation-clock-census =
+    pkgs.runCommand "rio-obligation-clock-census"
+      {
+        src = pkgs.lib.cleanSource ../.;
+        nativeBuildInputs = [ pkgs.python3 ];
+        scanScript = ../nix/obligation_clock_census.py;
+        sharedLexer = ../nix/rust_strip.py;
+        censusLib = ../nix/census_corpora.py;
+      }
+      ''
+        cp "$sharedLexer" rust_strip.py
+        cp "$censusLib" census_corpora.py
+        cp "$scanScript" obligation_clock_census.py
+        python3 obligation_clock_census.py "$src"
+        touch $out
+      '';
+
+  duplicate-derivation-lint =
+    pkgs.runCommand "rio-duplicate-derivation-lint"
+      {
+        src = pkgs.lib.cleanSource ../.;
+        nativeBuildInputs = [ pkgs.python3 ];
+        scanScript = ../nix/duplicate_derivation_lint.py;
+        sharedLexer = ../nix/rust_strip.py;
+        censusLib = ../nix/census_corpora.py;
+      }
+      ''
+        cp "$sharedLexer" rust_strip.py
+        cp "$censusLib" census_corpora.py
+        cp "$scanScript" duplicate_derivation_lint.py
+        python3 duplicate_derivation_lint.py "$src"
+        touch $out
+      '';
+
   census-enrollment =
     pkgs.runCommand "rio-census-enrollment"
       {
