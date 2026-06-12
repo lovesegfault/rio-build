@@ -58,10 +58,22 @@ pub const LIVE_WANTED_NAME_ROWS_BY_DRV_SQL: &str = "SELECT d.output_names, d.exp
 /// row for the full `log_retention` (30 d) regardless of the
 /// operator's `exec_retention_days`.
 ///
-/// The store's heartbeat refresh interval is half of this (one missed
-/// heartbeat survives, two do not) — `HEARTBEAT_INTERVAL` in
-/// `rio-store::logs::sessions` asserts the ratio at compile time.
-pub const SESSION_STALE_AFTER_SECS: f64 = 30.0;
+/// Derived at the CONSUMER'S clock (merged_bug_014): every consumer
+/// of this bound evaluates the age of the last COMMITTED
+/// `heartbeat_at` stamp, so the margin must cover the worst
+/// committed-stamp age of a HEALTHY session that missed one beat —
+/// `2 × HEARTBEAT_INTERVAL + HEARTBEAT_RPC_BOUND` (the recovery
+/// tick fires one interval after the missed one, and its UPDATE may
+/// take the full RPC bound to land) — plus a strictly positive
+/// slack. With the store's shipped cadence (15 s beats, 10 s RPC
+/// bound) the worst healthy committed age is 40 s; this value adds
+/// the 5 s `SESSION_MARGIN_SLACK`. `rio-store::logs::sessions`
+/// compile-asserts the full inequality (the predecessor pair —
+/// 15 × 2 == 30 — certified the producer-side cadence and read a
+/// healthy one-miss session dead for up to 10 s: the steal arm
+/// deposed healthy owners, `lookup_live` reported `Stale`, and the
+/// scheduler's gc conjunct misread).
+pub const SESSION_STALE_AFTER_SECS: f64 = 45.0;
 
 /// SQL predicate fragment: the named `heartbeat_at` column is LIVE.
 /// `hb` is the (qualified) column reference; `bind` the parameter

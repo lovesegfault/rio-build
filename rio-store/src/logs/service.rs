@@ -116,7 +116,7 @@ const PROXIED_METADATA_KEY: &str = "x-rio-log-proxied";
 /// bound, [`PROXY_OPEN_TIMEOUT`] — and only the pair bounds the worst
 /// case for a stale session row pointing at a dead pod: every read for
 /// that execution pays up to connect+open for at most the lease's
-/// 30 s staleness window, after which `lookup_live` stops returning the
+/// staleness window, after which `lookup_live` stops returning the
 /// dead owner. Accepted rather than cached — the worst case is bounded
 /// and self-healing, and a failure cache is more state to get wrong.
 const PROXY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -127,7 +127,7 @@ const PROXY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// never bounded this: a half-open owner pod (TCP accepting, process
 /// wedged) parked the forwarding reader indefinitely. Together the two
 /// bounds cap the worst case for a stale session row at
-/// connect+open ≈ 7 s, for at most the lease's 30 s staleness window.
+/// connect+open ≈ 7 s, for at most the lease's staleness window.
 const PROXY_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Inbound-silence bound for an AppendLog driver with an EMPTY buffer:
@@ -977,7 +977,7 @@ impl LogServiceImpl {
     /// [`PROXY_OPEN_TIMEOUT`] — the connect bound alone never covered a
     /// half-open owner — so a stale session row pointing at a dead pod
     /// costs each reader at most connect+open, for at most the lease's
-    /// 30 s staleness window.
+    /// staleness window.
     async fn proxy_tail(
         &self,
         resolver: &PeerResolver,
@@ -1142,7 +1142,7 @@ enum LoopExit {
     /// posture differs from `LeaseLost`: the session-id-predicated
     /// release RUNS (a no-op when the displacer owns the row, an
     /// immediate free if this session somehow still does — never a
-    /// 30 s strand).
+    /// strand for the staleness window).
     Displaced,
 }
 
@@ -1184,7 +1184,7 @@ impl AppendDriver {
         // this execution a buffer that never receives another line and
         // is never dropped — their follow streams would hang until the
         // client gives up. The lease row is NOT in the guard (releasing
-        // it is async and it self-heals via the 30 s staleness window).
+        // it is async and it self-heals via the staleness window).
         //
         // The `remove_if` identity check: a reconnecting builder can
         // open a new session for the same execution on this replica
@@ -1280,10 +1280,10 @@ impl AppendDriver {
         if !matches!(exit, LoopExit::LeaseLost)
             && let Err(e) = sessions::release(&self.pool, exec_id, session_id).await
         {
-            // Non-fatal: the row goes stale in 30 s and is stolen by
-            // the next acquire. Losing the DELETE costs one reader a
-            // 30 s window of "live session exists but the buffer is
-            // gone" (they get the history-only view).
+            // Non-fatal: the row goes stale at SESSION_STALE_AFTER and
+            // is stolen by the next acquire. Losing the DELETE costs one
+            // reader that window of "live session exists but the buffer
+            // is gone" (they get the history-only view).
             warn!(%exec_id, error = %e, "AppendLog: ingest session release failed");
         }
 
@@ -2945,7 +2945,7 @@ mod tests {
     /// `sessions::heartbeat` call in the driver's production half puts
     /// the lease cadence back behind sibling cut/ack awaits — the
     /// exact shape whose bounds (60 s cut watchdog + 60 s ack vs the
-    /// 30 s staleness window) made a healthy PUT stale the row. The
+    /// staleness window) made a healthy PUT stale the row. The
     /// cadence lives on the dedicated task (`sessions::spawn_heartbeat`,
     /// RPC-bounded by the sessions.rs compile assert) or nowhere.
     fn liveness_census_violations(src: &str) -> Vec<&'static str> {

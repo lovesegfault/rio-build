@@ -17,7 +17,13 @@
 //! refreshes `heartbeat_at` every [`HEARTBEAT_INTERVAL`]; a row whose
 //! heartbeat is older than [`SESSION_STALE_AFTER`] is dead (the replica
 //! crashed or was partitioned from PG without releasing) and the next
-//! [`acquire`] steals it. All four operations are single statements —
+//! [`acquire`] steals it. A HEALTHY session survives one missed
+//! heartbeat by construction: the staleness bound covers the worst
+//! committed-stamp age of a one-miss session plus a strictly positive
+//! slack (the compile-asserted margin law below, merged_bug_014 —
+//! consumers evaluate the COMMITTED stamp's age, so the margin is
+//! derived at their clock, not the producer's cadence). All
+//! operations are single statements —
 //! no connection is held across anything but its own query, so N
 //! concurrent streams cost 0 pinned pool connections at steady state.
 //!
@@ -42,11 +48,13 @@ use uuid::Uuid;
 /// How often the owning replica refreshes `heartbeat_at` while its
 /// `AppendLog` stream is open.
 ///
-/// Half of [`SESSION_STALE_AFTER`]: a lease survives one missed
-/// heartbeat (a slow PG round-trip, a GC pause) but not two. The
-/// constant is bound into the SQL as a `make_interval` parameter rather
-/// than written as an `interval '...'` literal so the queries cannot
-/// drift from it.
+/// A lease survives one missed heartbeat (a slow PG round-trip, a GC
+/// pause): [`SESSION_STALE_AFTER`] covers the worst COMMITTED-stamp
+/// age of a one-miss session — `2 × HEARTBEAT_INTERVAL +
+/// HEARTBEAT_RPC_BOUND` — plus [`SESSION_MARGIN_SLACK`]; the compile
+/// assert below certifies that inequality. The constant is bound into
+/// the SQL as a `make_interval` parameter rather than written as an
+/// `interval '...'` literal so the queries cannot drift from it.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 /// A session whose heartbeat is older than this is dead: its lease is
@@ -60,12 +68,43 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 pub const SESSION_STALE_AFTER: Duration =
     Duration::from_secs(rio_migrations::sql::SESSION_STALE_AFTER_SECS as u64);
 
-// One missed heartbeat survives, two do not — the lease math every
-// doc in this module quotes. Compile-time so the shared const cannot
-// drift away from the refresh cadence.
+/// The consumer-clock slack (merged_bug_014, R29): the strictly
+/// positive term separating [`SESSION_STALE_AFTER`] from the worst
+/// committed-stamp age of a HEALTHY one-miss session. The slack is a
+/// CERTIFIED term of the inequality below, not prose riding outside
+/// it — a bare `≥` would admit `SESSION_STALE_AFTER == 2×INTERVAL +
+/// RPC_BOUND` (the 40 s zero-margin boundary, the exact collapse
+/// R29's boundary clause refuses), and const drift to that boundary
+/// is a compile red.
+pub const SESSION_MARGIN_SLACK: Duration = Duration::from_secs(5);
+
+// THE staleness margin law (merged_bug_014, R29 — the conversion
+// witness, both clocks named): "one missed heartbeat survives" is a
+// claim about the CONSUMER-VISIBLE quantity — the age of the last
+// COMMITTED heartbeat_at stamp when a consumer (the steal arm,
+// lookup_live, the scheduler's gc conjunct) evaluates it — not about
+// the producer's tick cadence. Worst committed age of a healthy
+// one-miss session: the beat at t₀ commits; the t₀+I beat is missed
+// (slow PG, abandoned at the bound); the recovery beat fires at
+// t₀+2I and its UPDATE lands up to RPC_BOUND later — committed-stamp
+// age 2I + R (40 s shipped). The bound must exceed it by a strictly
+// positive slack. (The predecessor pair — `I × 2 == STALE` plus the
+// inter-attempt bound — certified the producer-side cadence and
+// admitted a 10 s window where every consumer read a healthy session
+// dead: a compile-certified false law, merged_bug_014.)
 const _: () = assert!(
-    HEARTBEAT_INTERVAL.as_secs() * 2 == SESSION_STALE_AFTER.as_secs(),
-    "HEARTBEAT_INTERVAL must be half of SESSION_STALE_AFTER"
+    SESSION_STALE_AFTER.as_secs()
+        >= 2 * HEARTBEAT_INTERVAL.as_secs()
+            + HEARTBEAT_RPC_BOUND.as_secs()
+            + SESSION_MARGIN_SLACK.as_secs(),
+    "SESSION_STALE_AFTER must cover the worst committed-stamp age of a \
+     one-miss session (2 x HEARTBEAT_INTERVAL + HEARTBEAT_RPC_BOUND) plus \
+     SESSION_MARGIN_SLACK"
+);
+const _: () = assert!(
+    SESSION_MARGIN_SLACK.as_secs() > 0,
+    "the consumer-clock slack must be strictly positive: STALE == 2I + R \
+     is the zero-margin boundary collapse"
 );
 
 /// Bound on one heartbeat UPDATE round-trip inside the dedicated
@@ -138,8 +177,8 @@ pub enum HeartbeatOutcome {
 /// round-trip. The conflict-update's `WHERE` admits the steal only when
 /// the incumbent is stale (heartbeat older than [`SESSION_STALE_AFTER`])
 /// or already ours (`replica_pod` matches — a builder reconnecting to
-/// the same replica must not be locked out for 30 s by its own previous
-/// session). When the `WHERE` rejects the steal, PostgreSQL reports the
+/// the same replica must not be locked out for the staleness window by
+/// its own previous session). When the `WHERE` rejects the steal, PostgreSQL reports the
 /// statement as having affected zero rows and `RETURNING` yields
 /// nothing — that is the [`Acquire::Busy`] case, and a follow-up
 /// point-`SELECT` fetches the incumbent's pod for the error payload.
@@ -379,37 +418,49 @@ pub(crate) fn spawn_heartbeat_with(
             tokio::select! {
                 _ = stop_task.cancelled() => return,
                 _ = ticks.tick() => {
-                    // The cadence path's ONLY await, bounded by the
-                    // compile-asserted margin: a hang is abandoned and
-                    // the next tick retries.
-                    match tokio::time::timeout(
-                        HEARTBEAT_RPC_BOUND,
-                        heartbeat(&pool, exec_id, session_id),
-                    )
-                    .await
-                    {
-                        Ok(Ok(HeartbeatOutcome::Renewed)) => {}
-                        Ok(Ok(HeartbeatOutcome::Lost)) => {
-                            // Latch and exit: the lease belongs to a
-                            // newer session; renewing further would
-                            // fight the new owner's row.
-                            let _ = lost_tx.send(true);
-                            return;
-                        }
-                        // A PG blip. Keep going: the lease survives one
-                        // missed heartbeat by construction (the beat vs
-                        // 2x-beat staleness window), and if PG is down
-                        // the chunk cuts are failing too — the driver's
-                        // gray-failure abort fires there.
-                        Ok(Err(e)) => {
-                            warn!(%exec_id, error = %e, "ingest lease heartbeat failed");
-                        }
-                        Err(_elapsed) => {
-                            warn!(
-                                %exec_id,
-                                bound_secs = HEARTBEAT_RPC_BOUND.as_secs_f64(),
-                                "ingest lease heartbeat abandoned at its RPC bound"
-                            );
+                    // Bounded beats only — a hang is abandoned at the
+                    // RPC bound. A failed/abandoned beat gets ONE
+                    // immediate bounded retry (merged_bug_014): the
+                    // failure is already known, so waiting a full tick
+                    // to re-attempt donates an interval of
+                    // committed-stamp age for free — the retry halves
+                    // the realistic worst case while the compile-
+                    // asserted margin still covers the no-retry path.
+                    for attempt in 0..2 {
+                        match tokio::time::timeout(
+                            HEARTBEAT_RPC_BOUND,
+                            heartbeat(&pool, exec_id, session_id),
+                        )
+                        .await
+                        {
+                            Ok(Ok(HeartbeatOutcome::Renewed)) => break,
+                            Ok(Ok(HeartbeatOutcome::Lost)) => {
+                                // Latch and exit: the lease belongs to a
+                                // newer session; renewing further would
+                                // fight the new owner's row.
+                                let _ = lost_tx.send(true);
+                                return;
+                            }
+                            // A PG blip. After the bounded retry, keep
+                            // going: the lease survives one missed
+                            // heartbeat by construction (the certified
+                            // committed-stamp margin), and if PG is
+                            // down the chunk cuts are failing too — the
+                            // driver's gray-failure abort fires there.
+                            Ok(Err(e)) => {
+                                warn!(
+                                    %exec_id, error = %e, attempt,
+                                    "ingest lease heartbeat failed"
+                                );
+                            }
+                            Err(_elapsed) => {
+                                warn!(
+                                    %exec_id,
+                                    bound_secs = HEARTBEAT_RPC_BOUND.as_secs_f64(),
+                                    attempt,
+                                    "ingest lease heartbeat abandoned at its RPC bound"
+                                );
+                            }
                         }
                     }
                 }
@@ -510,9 +561,16 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let exec = Uuid::now_v7();
         let dead = Uuid::now_v7();
-        // 31s > the 30s staleness threshold: the owning replica crashed
-        // without releasing and has missed two 15s heartbeats.
-        seed_session(&db.pool, exec, dead, "other-pod", 31.0).await;
+        // One past the staleness threshold: the owning replica crashed
+        // without releasing and stopped beating entirely.
+        seed_session(
+            &db.pool,
+            exec,
+            dead,
+            "other-pod",
+            SESSION_STALE_AFTER.as_secs_f64() + 1.0,
+        )
+        .await;
 
         let session = Uuid::now_v7();
         let outcome = acquire(&db.pool, exec, session, "this-pod").await.unwrap();
@@ -540,7 +598,8 @@ mod tests {
         let old_session = Uuid::now_v7();
         // FRESH row owned by us: a builder reconnecting to the same
         // replica after a stream blip, before the old session's heartbeat
-        // has gone stale. We must not lock ourselves out for 30s.
+        // has gone stale. We must not lock ourselves out for the
+        // staleness window.
         seed_session(&db.pool, exec, old_session, "this-pod", 0.0).await;
 
         let new_session = Uuid::now_v7();
@@ -598,7 +657,14 @@ mod tests {
         // (bug_148: the pre-fix Option folded this into Absent, hiding
         // a healthy-but-not-renewing owner from every operator signal).
         let stale_exec = Uuid::now_v7();
-        seed_session(&db.pool, stale_exec, Uuid::now_v7(), "pod-b", 31.0).await;
+        seed_session(
+            &db.pool,
+            stale_exec,
+            Uuid::now_v7(),
+            "pod-b",
+            SESSION_STALE_AFTER.as_secs_f64() + 1.0,
+        )
+        .await;
         assert_eq!(
             lookup_live(&db.pool, stale_exec).await.unwrap(),
             LiveLookup::Stale {
@@ -611,6 +677,113 @@ mod tests {
         assert_eq!(
             lookup_live(&db.pool, Uuid::now_v7()).await.unwrap(),
             LiveLookup::Absent
+        );
+    }
+
+    /// W11-L (merged_bug_014, R29). Proposition: **one missed beat
+    /// never makes a healthy session stealable** — at the consumer's
+    /// clock. The committed-stamp age of a healthy one-miss session
+    /// reaches `2×HEARTBEAT_INTERVAL + HEARTBEAT_RPC_BOUND` (40 s
+    /// shipped: the t₀ beat committed, the t₀+I beat missed, the
+    /// recovery beat's UPDATE landing at the full RPC bound) — the
+    /// pre-fix 30 s bound read that session dead for up to 10 s, so
+    /// the steal arm deposed a healthy owner (Lost → spurious abort,
+    /// the bug_148 incident class the wave-10 construction shipped to
+    /// close), `lookup_live` reported `Stale`, and the scheduler's gc
+    /// conjunct misread. A truly dead session (past the bound) stays
+    /// stealable — the margin is slack, not paralysis.
+    // r[verify store.log.session-margin]
+    #[tokio::test]
+    async fn one_missed_beat_never_makes_a_healthy_session_stealable() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // The healthy one-miss worst case, at the consumer's clock.
+        let worst_committed_age = (2 * HEARTBEAT_INTERVAL + HEARTBEAT_RPC_BOUND).as_secs_f64();
+        let exec = Uuid::now_v7();
+        let owner = Uuid::now_v7();
+        seed_session(&db.pool, exec, owner, "owner-pod", worst_committed_age).await;
+
+        let outcome = acquire(&db.pool, exec, Uuid::now_v7(), "thief-pod")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, Acquire::Busy { .. }),
+            "left (pre-fix): a healthy session at the one-miss worst case \
+             (committed-stamp age 2I+R = 40 s > the 30 s bound) is read dead \
+             — the steal deposes a healthy owner mid-stream / right: the \
+             bound covers the consumer-visible quantity with positive slack, \
+             got {outcome:?}"
+        );
+        assert!(
+            matches!(
+                lookup_live(&db.pool, exec).await.unwrap(),
+                LiveLookup::Live(_)
+            ),
+            "the same margin keeps lookup_live honest at the one-miss worst case"
+        );
+
+        // The dead cell: past the bound the steal still works.
+        let dead_exec = Uuid::now_v7();
+        seed_session(
+            &db.pool,
+            dead_exec,
+            Uuid::now_v7(),
+            "owner-pod",
+            SESSION_STALE_AFTER.as_secs_f64() + 1.0,
+        )
+        .await;
+        assert!(
+            matches!(
+                acquire(&db.pool, dead_exec, Uuid::now_v7(), "thief-pod")
+                    .await
+                    .unwrap(),
+                Acquire::Acquired
+            ),
+            "a truly dead session stays stealable — the margin is slack, \
+             not paralysis"
+        );
+    }
+
+    /// W11-M (merged_bug_014): the certified law can go red at both
+    /// collapse shapes. The margin formula — `STALE − (2I + R)` — is
+    /// re-derived here as a plain function and pinned at three cells:
+    /// the shipped constants (slack ≥ the certified term, > 0), the
+    /// pre-fix 2× ratio (30 s: NEGATIVE margin — consumers read a
+    /// healthy one-miss session dead, the strawman the old
+    /// `I × 2 == STALE` assert certified as law), and the exact
+    /// boundary (40 s: ZERO margin — the collapse a bare `≥` would
+    /// admit, refused by the strictly-positive slack conjunct). The
+    /// compile asserts in this module enforce the same inequality at
+    /// build time; this test is their negation-capable twin.
+    // r[verify store.log.session-margin]
+    #[test]
+    fn margin_law_rejects_both_collapse_shapes() {
+        fn committed_stamp_margin(stale: i64, interval: i64, rpc_bound: i64) -> i64 {
+            stale - (2 * interval + rpc_bound)
+        }
+        let (i, r) = (
+            HEARTBEAT_INTERVAL.as_secs() as i64,
+            HEARTBEAT_RPC_BOUND.as_secs() as i64,
+        );
+        // The shipped constants satisfy the certified law.
+        let margin = committed_stamp_margin(SESSION_STALE_AFTER.as_secs() as i64, i, r);
+        assert!(
+            margin >= SESSION_MARGIN_SLACK.as_secs() as i64,
+            "the slack is a certified term of the inequality"
+        );
+        assert!(margin > 0, "strictly positive at the shipped constants");
+        // The pre-fix strawman: the 2× ratio the old assert certified.
+        assert!(
+            committed_stamp_margin(2 * i, i, r) < 0,
+            "the 2× ratio (30 s) has NEGATIVE consumer-clock margin: the \
+             compile-certified law was false"
+        );
+        // The exact-boundary strawman: STALE set to precisely 2I + R.
+        assert_eq!(
+            committed_stamp_margin(2 * i + r, i, r),
+            0,
+            "the 40 s boundary is the zero-margin collapse the \
+             strictly-positive slack conjunct refuses"
         );
     }
 

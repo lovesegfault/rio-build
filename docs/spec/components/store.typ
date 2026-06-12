@@ -2534,6 +2534,30 @@ content. Object-before-manifest ordering means a crash between the two leaves
 an unreachable orphan (collected by the lifecycle rule), never a manifest row
 pointing at a missing object (which would read as data loss).
 
+#r("store.log.session-margin")[
+  The ingest-lease staleness bound MUST be derived at the consumer's
+  clock: `SESSION_STALE_AFTER` MUST exceed the worst committed-stamp
+  age of a healthy session that missed one heartbeat — two heartbeat
+  intervals plus the heartbeat RPC bound — by a strictly positive,
+  named slack term, certified by a compile-time assertion over the
+  shared constants; and a known-failed heartbeat MUST be retried once
+  immediately within its bound rather than waiting a full interval.
+]
+
+Every consumer of the bound (the steal arm, `lookup_live`, the
+scheduler's gc conjunct) evaluates the age of the last COMMITTED
+`heartbeat_at` stamp — not the producer's tick cadence. A margin
+derived from the cadence (the predecessor's
+`interval × 2 == stale` pair) read a healthy one-miss session dead for
+up to the RPC bound: the steal deposed healthy owners mid-stream
+(spurious abort, full replay), `lookup_live` reported `Stale`, and the
+gc conjunct misread — a compile-certified false law (merged_bug_014,
+the prescription-adopted shape: the inherited math was certified, not
+re-derived). The slack is a certified TERM of the inequality, not
+prose: a bare `≥` admits the exact zero-margin boundary
+(`stale == 2×interval + rpc`), and constant drift to either collapse
+shape is a compile red.
+
 #r("store.log.session-keyed")[
   Concurrent or successive ingest sessions for one execution MUST NOT collide:
   each `AppendLog` stream mints a fresh `session_id` that namespaces its chunk

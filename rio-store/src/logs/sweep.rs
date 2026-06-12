@@ -162,7 +162,7 @@ pub async fn sweep_expired_logs(
 }
 
 /// Grace before a dead session row is reaped outright: 10× the
-/// staleness bound (300 s). Generous on purpose — liveness consumers
+/// staleness bound. Generous on purpose — liveness consumers
 /// (`lookup_live`, the scheduler's `gc_exec_rows` conjunct 5) already
 /// ignore stale rows at [`super::sessions::SESSION_STALE_AFTER`], so
 /// this reap is pure convergence hygiene: existence converges to
