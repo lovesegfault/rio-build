@@ -388,3 +388,40 @@ or terminal event, and the reachability witness — under the doctrine above
   (#rref("sched.sla.ack-validate-then-commit")). Reachability witnessed by
   the sibling-planes-apply red across three redeliveries and the
   state-equality cell against one clean apply.
+
+= Linear Obligations
+
+#r("sys.obligation.linear-discharge")[
+  An obligation computed MUST be discharged or refused through its own
+  type: acknowledgements, trims, deletes, retransmit copies, release
+  duties, and disclosure duties are LINEAR resources --- minted as a
+  value whose only exits are its typed discharge methods, consumed
+  exactly once by construction, and droppable only through an explicit
+  typed refusal or a named Drop backstop. An obligation returned as
+  advisory data that a call site may read, discard, partially execute,
+  or lose across an await rejects.
+]
+
+Ownership is the enforcement: in Rust, a value that must be moved into
+its discharge cannot be silently ignored at a second call site, so the
+law's quantifier ("every path discharges") equals the enforced
+population by type rather than by enumeration. The round-12 founding
+instances are the two coupled-reader highs --- a destructive trim
+consuming an ack denominated in a measure weaker than the trim's
+assumption, and computed verdicts discarded as plain data. Each landed
+linear-obligation close appends its instance row below; advisory-data
+shapes (a discarded clearance closure argument, a wildcard struct
+pattern over a verdict, a take-then-await window) are review rejects
+under this rule.
+
+== Instance Register (Linear Obligations)
+
+- *Builder retransmit copy (store to builder)*: the retransmit buffer
+  is the builder's only copy of un-acked log lines; its sole
+  destructive exit is the ack-driven trim, so the trim is the copy's
+  typed discharge and its argument must be a witnessed
+  contiguous-prefix frontier (#rref("store.log.frontier-denominated")).
+  The producer-side clamp makes the existing prefix-pop sound; the
+  builder-side witness pins the discharge against the producing
+  formula, and the store-side carrier census keeps every producer
+  routed through it.

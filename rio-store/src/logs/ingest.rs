@@ -175,6 +175,7 @@ pub enum AcceptOutcome {
         /// the hole. `None` when line 0 is not durably covered: no
         /// value is a sound prefix claim, so no ack is sent and the
         /// builder keeps its retransmit copies.
+        // durable-ack: decl
         durable_through: Option<u64>,
     },
 }
@@ -192,6 +193,7 @@ pub struct CutCommit {
     /// caller's "nothing to cut": a commit without an ack still
     /// counts as progress (failure counters reset, the drain
     /// continues).
+    // durable-ack: decl
     pub durable_ack: Option<u64>,
 }
 
@@ -574,6 +576,7 @@ impl IngestSession {
         self.covered.contiguous_durable_frontier()
     }
 
+    // r[impl store.log.frontier-denominated]
     /// Clamp a natural ack value (a batch's or drained run's last
     /// line) to the contiguous durable frontier: no producer may emit
     /// a `durable_through_line` above it (merged_bug_005 — the wire
@@ -585,6 +588,7 @@ impl IngestSession {
     /// clamp is the identity (the natural value IS at-or-below the
     /// frontier), so honest contiguous traffic acks exactly what it
     /// always did.
+    // durable-ack: producer
     fn clamped_durable_ack(&self, natural_last_line: u64) -> Option<u64> {
         self.durable_frontier()
             .map(|frontier| natural_last_line.min(frontier))
@@ -694,6 +698,7 @@ impl IngestSession {
                 // (bug_032), and it routes through the one producer for
                 // the same reason every other ack does.
                 return Ok(AcceptOutcome::CoveredReplay {
+                    // durable-ack: producer
                     durable_through: self.clamped_durable_ack(last),
                 });
             }
@@ -847,6 +852,7 @@ impl IngestSession {
                 "dropped covered replay batch: already durable per the manifest"
             );
             return Ok(AcceptOutcome::CoveredReplay {
+                // durable-ack: producer
                 durable_through: self.clamped_durable_ack(end - 1),
             });
         }
@@ -1089,6 +1095,7 @@ impl IngestSession {
                 // builder's prefix-pop trim would destroy them.
                 self.covered.insert(first_line, line_count);
                 Ok(Some(CutCommit {
+                    // durable-ack: producer
                     durable_ack: self.clamped_durable_ack(last_line),
                 }))
             }
@@ -2305,6 +2312,7 @@ mod tests {
         )
     }
 
+    // r[verify store.log.frontier-denominated]
     /// W12-A (merged_bug_005, red-first): no ack may exceed the
     /// contiguous durable frontier. The covered-replay consult is
     /// reachable ONLY in holey-map states (a single contiguous prefix
@@ -2339,6 +2347,7 @@ mod tests {
         }
     }
 
+    // r[verify store.log.frontier-denominated]
     /// W12-B (merged_bug_005's no-regression face): outside holey
     /// states the frontier clamp is the IDENTITY — contiguous-prefix
     /// replays still ack at their full end (the below-floor arm's
@@ -2384,6 +2393,7 @@ mod tests {
         );
     }
 
+    // r[verify store.log.frontier-denominated]
     /// W12-A2 (merged_bug_005, red-first — the cut-leg orbit): a cut
     /// whose drained run sits ABOVE silently-rejected lines must ack
     /// at-or-below the last line of the contiguous durable prefix,

@@ -1402,6 +1402,10 @@ mod registration_writer_census {
         ("grpc/sign.rs", include_str!("../../grpc/sign.rs")),
         ("ingest.rs", include_str!("../../ingest.rs")),
         ("lib.rs", include_str!("../../lib.rs")),
+        (
+            "logs/ack_census.rs",
+            include_str!("../../logs/ack_census.rs"),
+        ),
         ("logs/chunks.rs", include_str!("../../logs/chunks.rs")),
         ("logs/gate.rs", include_str!("../../logs/gate.rs")),
         ("logs/ingest.rs", include_str!("../../logs/ingest.rs")),

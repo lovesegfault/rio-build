@@ -1366,6 +1366,7 @@ impl CoverageMap {
         }
     }
 
+    // r[impl store.log.frontier-denominated]
     /// THE producer of durable-ack values (merged_bug_005): the
     /// highest line `v` such that EVERY line `<= v` is durably
     /// covered, or `None` when line 0 is not covered (no value is a

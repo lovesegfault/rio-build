@@ -1219,6 +1219,7 @@ impl AppendDriver {
             ack_try_send(
                 &ack_tx,
                 Ok(AppendLogAck {
+                    // durable-ack: producer
                     durable_through_line: frontier,
                     open_coverage_next_line: Some(self.session.open_coverage_next_line()),
                 }),
@@ -1447,11 +1448,14 @@ impl AppendDriver {
                             // nothing is sent and the builder keeps its
                             // copies. try_send: a missed ack just means
                             // the next replay re-answers.
+                            // durable-ack: bind
                             Ok(AcceptOutcome::CoveredReplay { durable_through }) => {
+                                // durable-ack: bind
                                 if let Some(durable_through_line) = durable_through {
                                     ack_try_send(
                                         ack_tx,
                                         Ok(AppendLogAck {
+                                            // durable-ack: forward
                                             durable_through_line,
                                             open_coverage_next_line: None,
                                         }),
@@ -1735,12 +1739,14 @@ impl AppendDriver {
                 // prefix claim). It is still progress — Committed, the
                 // failure counter already reset — there is just
                 // nothing true to tell the builder yet.
+                // durable-ack: bind
                 let Some(durable_through_line) = commit.durable_ack else {
                     return CutStep::Committed;
                 };
                 let delivered = send_ack_bounded(
                     ack_tx,
                     Ok(AppendLogAck {
+                        // durable-ack: forward
                         durable_through_line,
                         open_coverage_next_line: None,
                     }),
@@ -1808,10 +1814,12 @@ impl AppendDriver {
                     // (merged_bug_005) — the drain keeps cutting; the
                     // builder's copies of the hole lines replay on
                     // reconnect.
+                    // durable-ack: bind
                     if let Some(durable_through_line) = commit.durable_ack {
                         ack_try_send(
                             ack_tx,
                             Ok(AppendLogAck {
+                                // durable-ack: forward
                                 durable_through_line,
                                 open_coverage_next_line: None,
                             }),

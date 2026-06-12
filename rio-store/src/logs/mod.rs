@@ -35,6 +35,8 @@
 //!   manifest rows and chunk objects once `log_retention_days` have
 //!   passed since the execution started.
 
+#[cfg(test)]
+mod ack_census;
 pub mod chunks;
 pub mod gate;
 pub mod ingest;

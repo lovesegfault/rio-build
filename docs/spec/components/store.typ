@@ -2352,6 +2352,33 @@ elsewhere). The merged account is one axis of a dual-axis law:
 forgiveness. Its algebra is idempotent --- which is exactly why it cannot
 be the only measure (the rule below).
 
+#r("store.log.frontier-denominated")[
+  Every durable-progress acknowledgement MUST name a contiguous durable
+  frontier: the ack value `v` asserts that every line at or below `v` is
+  durably stored, every producer MUST derive `v` through the one producing
+  formula (the coverage map's contiguous prefix end), and no producer may
+  emit a value above that frontier --- when nothing is contiguously durable
+  from line zero, no acknowledgement is sent at all.
+]
+
+The denomination is the CONSUMER'S ordering domain, not the producer's
+coverage measure: the builder's retransmit `trim()` prefix-pops every frame
+at or below the ack, so the wire value is a contiguous-prefix claim, and
+per-span set containment does not entail it. The covered-replay consult is
+reachable only in holey-coverage states (post-floor containment is
+impossible under a single contiguous prefix), so before this rule 100% of
+its live inputs were unsound: a hole-spanning ack destroyed the builder's
+only retransmit copy of the hole-filling lines, and a replica crash
+converted the transient hole to permanent undisclosed loss. The cut leg
+had the dual fault (a run committed past a silently-rejected gap acked its
+own end, laundering never-accepted lines). The caps-durable account
+measures above keep their frozen merged/raw algebras unchanged --- this
+rule EXTENDS the seal with the ack field's own measure rather than editing
+those; the machine census of every in-crate carrier site (producer, forward,
+bind, and declaration classes, jurisdiction derived from the module
+declarations) is `rio-store/src/logs/ack_census.rs`, and the cross-crate
+union face lands with the round's census registry.
+
 #r("store.log.raw-ceiling")[
   Every durable log write MUST be charged against a monotone
   per-execution ceiling that no reconnect resets: the `AppendLog` open

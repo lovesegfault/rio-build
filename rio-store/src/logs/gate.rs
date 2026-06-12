@@ -70,10 +70,17 @@ pub struct GateOk {
     pub seed: LogSeed,
     /// The execution's durable covered line ranges at open time,
     /// normalized. Consumed by the ingest session's covered-replay
-    /// consult: a batch fully inside durable coverage is dropped
-    /// uncharged and un-written (it cannot mint objects, manifest
-    /// rows, or raw charge), with the drop acked from the manifest
-    /// truth — the write-path arm of the dual-axis law.
+    /// consult (a batch fully inside durable coverage is dropped
+    /// uncharged and un-written — it cannot mint objects, manifest
+    /// rows, or raw charge) and, kept LIVE by the session's own
+    /// commits, by the contiguous durable frontier — the ack field's
+    /// OWN measure (merged_bug_005, `store.log.frontier-denominated`):
+    /// the four account quantities above keep their frozen algebras
+    /// untouched, and `durable_through_line` is additionally
+    /// denominated as a contiguous-prefix claim because that is what
+    /// its reader (the builder's prefix-pop trim) assumes — the seal
+    /// is EXTENDED with the reader's measure, not edited. The
+    /// in-crate carrier census is `logs/ack_census.rs`.
     pub covered: rio_log_kernel::CoverageMap,
 }
 

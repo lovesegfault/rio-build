@@ -217,6 +217,14 @@ message AppendLogHeader {
 // ONCE at stream open as the open-time coverage ack (the first message on
 // the ack stream).
 message AppendLogAck {
+  // A CONTIGUOUS-PREFIX durability claim: every line at or below this value
+  // is durably stored. The consumer's retransmit trim prefix-pops every
+  // frame at or below it, so the producer must never emit a value above the
+  // contiguous durable frontier — a chunk commit that lands past an
+  // unserved hole carries NO ack at all (the server stays silent rather
+  // than round up across the hole), and the next ack covers it once the
+  // hole fills. Producers derive the value through the store's one frontier
+  // formula (the coverage map's contiguous prefix end minus one).
   uint64 durable_through_line = 1;
   // The open-time durable-coverage watermark: one past the highest line of
   // the execution's CONTIGUOUS committed coverage at session open. PRESENT
