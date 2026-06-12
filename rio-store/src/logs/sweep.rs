@@ -681,6 +681,7 @@ mod tests {
                 &*sweep_store,
                 Duration::from_secs(30 * 86_400),
                 SWEEP_BATCH,
+                &mut crate::test_helpers::gc_clearance(&sweep_pool).await,
             )
             .await
         });

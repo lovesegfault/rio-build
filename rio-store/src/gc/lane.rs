@@ -1775,7 +1775,7 @@ async fn neighbor_sweep(pool: &PgPool) -> Result<(), sqlx::Error> {
                 j += 1;
             }
             let Some(bs) = body_start else {
-                i = j.max(at + 3) + 1;
+                i = (j.max(at + 3) + 1).min(text.len());
                 continue;
             };
             let header = text[at..bs].to_string();
@@ -1795,7 +1795,9 @@ async fn neighbor_sweep(pool: &PgPool) -> Result<(), sqlx::Error> {
                 k += 1;
             }
             out.push((name, header, text[bs..k.min(text.len())].to_string()));
-            i = k.min(text.len()).max(at + 3) + 1;
+            // Clamp: an unbalanced tail (k == len) must not advance
+            // past the end — text[i..] with i > len panics.
+            i = (k.min(text.len()).max(at + 3) + 1).min(text.len());
         }
         out
     }

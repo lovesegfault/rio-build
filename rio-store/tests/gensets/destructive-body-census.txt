@@ -19,7 +19,8 @@ grpc/put_path_batch.rs	commit_batch	via:drop
 grpc/put_path_batch.rs	put_path_batch_impl	via:claim_placeholder,stage_nar_for_batch
 logs/service.rs	cut_while_due	via:do_cut
 logs/service.rs	drain	via:cut_bounded
-logs/service.rs	drive	via:accept,cut_once_if_nonempty,cut_while_due
+logs/service.rs	drive	via:cut_once_if_nonempty,on_inbound
+logs/service.rs	drive	via:on_inbound
 logs/sweep.rs	sweep_expired_logs	in-loop
 materialize/executor.rs	acquire_baseline	via:drop
 materialize/executor.rs	execute_job_inner	via:acquire_baseline,drain,drop,resolve_path
