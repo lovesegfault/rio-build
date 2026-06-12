@@ -1459,6 +1459,26 @@ reconciler's signal arithmetic for whatever target a future CR names.
   learned value, not `spec.seedRatio`.
 ]
 
+#r("ctrl.scaler.evidence-funding")[
+  A windowed-evidence counter MUST increment under exactly the
+  predicate whose sustained truth it witnesses --- fund equals spend:
+  the low-load streak counts only low-load-while-WORKING ticks
+  (`builders > 0 && current > min`), and every non-evidence tick
+  (idle, at-min) RESETS the counter --- never caps, parks, or banks
+  it. Idle is non-evidence by the growth gate's own rationale;
+  banking it as redeemable credit fires the spend at the regime
+  boundary with zero of the evidence the window exists to require.
+]
+
+The round-12 instance (bug_147): gate-failure low-load ticks were
+CAPPED at the threshold instead of reset, so any idle period ≥5min
+parked the streak AT threshold and ratio growth fired on the first
+busy low tick (or the second tick after the predictive scale-up) ---
+zero low-load-while-working evidence, recurring on every idle→busy
+transition; the companion test pinned the cap and never drove the
+transition. The wave-10 close gated the SPEND but left idle ticks
+FUNDING the window --- the funding predicate is part of the law.
+
 #r("store.admin.get-load+3")[
   `StoreAdminService.GetLoad` returns `pg_pool_utilization = (pool.size −
   pool.num_idle) / max_connections` and `substitute_admission_utilization =

@@ -190,25 +190,32 @@ pub fn decide(
             // on that conflation inflates the ratio unboundedly over
             // an idle weekend (1.02^576 ≈ 88,000×) and the predictor
             // is useless for hours when load returns.
-            let ticks = status.low_load_ticks.saturating_add(1);
-            if ticks >= LOW_LOAD_TICKS_FOR_RATIO_GROWTH
-                && builders > 0
-                && current > spec.replicas.min
-            {
-                (
-                    predicted,
-                    (ratio_in * RATIO_GROWTH_ON_LOW).min(RATIO_CEILING),
-                    0,
-                )
+            // r[impl ctrl.scaler.evidence-funding]
+            // bug_147 (R29′ — fund == spend): the counter INCREMENTS
+            // under exactly the predicate whose sustained truth it
+            // witnesses — low-load-while-WORKING. Idle (builders==0)
+            // and at-min ticks are NON-EVIDENCE by this gate's own
+            // rationale; banking them as redeemable credit was the
+            // wrong-clock class on the evidence axis (the parked
+            // streak fired growth on the first busy low tick at
+            // every idle→busy transition, with zero working
+            // evidence — an R30-shaped latch missing its
+            // regime-transition exit).
+            if builders > 0 && current > spec.replicas.min {
+                let ticks = status.low_load_ticks.saturating_add(1);
+                if ticks >= LOW_LOAD_TICKS_FOR_RATIO_GROWTH {
+                    (
+                        predicted,
+                        (ratio_in * RATIO_GROWTH_ON_LOW).min(RATIO_CEILING),
+                        0,
+                    )
+                } else {
+                    (predicted, ratio_in, ticks)
+                }
             } else {
-                // Cap the counter so a long idle doesn't accumulate
-                // toward u32::MAX (cosmetic — it's mirrored to
-                // status for `kubectl get`).
-                (
-                    predicted,
-                    ratio_in,
-                    ticks.min(LOW_LOAD_TICKS_FOR_RATIO_GROWTH),
-                )
+                // Non-evidence tick: RESET (the cap died — a reset
+                // can never bank credit toward the regime boundary).
+                (predicted, ratio_in, 0)
             }
         }
         // In-band load OR no load reading: trust the prediction,
@@ -528,8 +535,10 @@ mod tests {
         );
         assert_eq!(d.learned_ratio, 50.0, "no work → no ratio growth");
         assert_eq!(
-            d.low_load_ticks, LOW_LOAD_TICKS_FOR_RATIO_GROWTH,
-            "counter caps at threshold (doesn't accumulate over long idle)"
+            d.low_load_ticks, 0,
+            "bug_147: an idle tick is NON-EVIDENCE — it RESETS the \
+             streak (the pre-fix cap parked it at threshold, \
+             redeemable at the idle→busy boundary)"
         );
 
         // builders>0 but current==min: also gated — at min there's no
@@ -543,6 +552,54 @@ mod tests {
             None,
         );
         assert_eq!(d.learned_ratio, 50.0, "current==min → no ratio growth");
+    }
+
+    // r[verify ctrl.scaler.evidence-funding]
+    /// W12-AR (bug_147) — proposition: growth consumes only
+    /// working-low-load evidence (fund == spend); population: the
+    /// regime boundaries the cap banked through (every idle→busy
+    /// transition; the post-predictive-scale-up second tick is the
+    /// same cell one step over).
+    ///
+    /// The idle→busy transition schedule: an idle period ≥5min parks
+    /// the streak AT threshold (the cap), so pre-fix ratio growth
+    /// fired on the FIRST busy low tick when current > min — zero
+    /// low-load-while-WORKING evidence, violating the documented
+    /// 5-minute law and the gate's own idle-is-non-evidence
+    /// rationale, recurring on every idle→busy transition.
+    #[test]
+    fn w12_ar_idle_banked_streak_does_not_fund_growth() {
+        let s = spec(2, 14);
+        // The idle stretch: builders=0, low load — drive the counter
+        // through the production fold to wherever idle leaves it.
+        let mut st = status(Some(50.0), 0);
+        for _ in 0..40 {
+            let d = decide(&s, &st, 2, 0, Some(0.0), None);
+            assert_eq!(d.learned_ratio, 50.0, "idle never grows");
+            st.low_load_ticks = d.low_load_ticks;
+        }
+        // The transition: work returns (builders>0, current>min),
+        // load still low THIS tick (the busy ramp's first sample).
+        let d = decide(&s, &st, 4, 200, Some(0.1), None);
+        assert_eq!(
+            d.learned_ratio, 50.0,
+            "the first busy low tick carries ZERO working evidence — \
+             growth must wait for the full streak rebuilt from the \
+             transition (pre-fix: the idle-parked counter fired here)"
+        );
+        assert_eq!(
+            d.low_load_ticks, 1,
+            "the streak rebuilds from the transition (idle banked nothing)"
+        );
+        // The law still fires after 30 TRUE working-low minutes.
+        st.low_load_ticks = LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1;
+        let d = decide(&s, &st, 4, 200, Some(0.1), None);
+        assert_eq!(
+            d.learned_ratio,
+            50.0 * RATIO_GROWTH_ON_LOW,
+            "30 consecutive working-low ticks still grow (the spend \
+             law unchanged; only the funding predicate tightened)"
+        );
     }
 
     /// `RATIO_CEILING` bounds both the read site (a pre-fix inflated
