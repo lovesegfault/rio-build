@@ -204,7 +204,7 @@ pub mod hold {
     /// bodies and the two unwired ones defeated the operator's
     /// emergency stop.
     // r[impl store.gc.hold-lanes+2]
-    // r[impl store.gc.clearance-expiry]
+    // r[impl store.gc.clearance-expiry+2]
     #[derive(Debug)]
     pub struct HoldClearance {
         /// The last successful consult (mint or batch re-consult).
@@ -284,7 +284,7 @@ pub mod hold {
         /// shared borrow of the pre-consult proof across the call.
         /// Fail-closed like [`gate`]: a consult error refuses the
         /// batch (`Err`), never authorizes.
-        // r[impl store.gc.clearance-expiry]
+        // r[impl store.gc.clearance-expiry+2]
         pub(crate) async fn authorize_batch(
             &mut self,
             pool: &PgPool,
@@ -299,6 +299,34 @@ pub mod hold {
         /// production entry). Parameterized so the expiry face is
         /// witnessable in test time without a 30s sleep; production
         /// code calls the delegating wrapper.
+        /// THE phase-seam consult (merged_bug_081, R29'): authority
+        /// ages from the consumer's last CONSULT OPPORTUNITY, not the
+        /// mint. The drain-cadence bound was frozen from the S3 drain
+        /// lane's mint-adjacent tick; the collect/run_gc consumers
+        /// mint BEFORE a read phase that dwarfs it (full mark+sweep;
+        /// ~4 minutes of validation/mark at the 1.5M-path design
+        /// point), so past 30s of pre-batch work every cycle Expired
+        /// at batch 1 with zero batches — permanent zero
+        /// chunk-collect progress exactly at scale, with "next tick
+        /// re-gates" re-minting into the same structure. A declared
+        /// seam between non-destructive phases is a consult
+        /// opportunity: this consult restarts the window on clear,
+        /// refuses under a hold, and fails closed on error. It
+        /// returns NO [`BatchAuthority`] (R32: tokens only from
+        /// `authorize_batch`) and is lawful ONLY at phase seams —
+        /// destructive cadences re-authorize per batch, where an
+        /// aged clearance still refuses unconditionally.
+        // r[impl store.gc.consult-aged-clearance]
+        pub(crate) async fn regate(&mut self, pool: &PgPool) -> Result<Regate, sqlx::Error> {
+            match active_global_hold(pool).await? {
+                Some(h) => Ok(Regate::Held(h)),
+                None => {
+                    self.consulted_at = tokio::time::Instant::now();
+                    Ok(Regate::Refreshed)
+                }
+            }
+        }
+
         pub(crate) async fn authorize_batch_with_bound(
             &mut self,
             pool: &PgPool,
@@ -317,6 +345,20 @@ pub mod hold {
                 }
             }
         }
+    }
+
+    /// A phase-seam consult verdict — see [`HoldClearance::regate`].
+    /// Closed alphabet; no wildcard consumers. Carries NO
+    /// [`BatchAuthority`]: a seam consult cannot authorize a batch.
+    #[must_use = "an unconsumed seam verdict bypasses the hold consult"]
+    #[derive(Debug)]
+    pub enum Regate {
+        /// No active hold: the authority window restarts at this
+        /// consult (the consumer's consult opportunity — R29').
+        Refreshed,
+        /// An active global hold — the phase MUST NOT proceed to its
+        /// destructive batches.
+        Held(ActiveHold),
     }
 
     /// The consult verdict for destructive actors — see [`gate`].
@@ -608,7 +650,7 @@ pub async fn run_gc(
     // phase-2 path sweep and the phase-3 chunk-collect — whose sinks
     // demand per-batch authority (store.gc.hold-lanes+2), and a
     // drain-bound-aged clearance authorizes nothing further
-    // (store.gc.clearance-expiry).
+    // (store.gc.clearance-expiry+2).
     let mut hold_clearance = match hold::gate(pool).await {
         Ok(hold::HoldGate::Held(h)) => {
             info!(
@@ -703,6 +745,48 @@ pub async fn run_gc(
         unreachable = unreachable.len(),
         "GC: mark complete, starting sweep"
     );
+
+    // --- The post-mark consult seam (merged_bug_081, R29') ---
+    // Mark is read-only and can dwarf the drain-cadence bound at
+    // scale; the seam restarts the authority window where consumption
+    // starts (the sweep's first batch) and refuses under a hold
+    // landed during mark — nothing destructive has happened yet, so
+    // a held seam exits exactly like the entry consult.
+    match hold_clearance.regate(pool).await {
+        Ok(hold::Regate::Refreshed) => {}
+        Ok(hold::Regate::Held(h)) => {
+            info!(
+                hold_id = %h.hold_id,
+                created_by = %h.created_by,
+                reason = %h.reason,
+                "GC: global hold landed during mark; collection suspended"
+            );
+            metrics::counter!(
+                "rio_store_gc_hold_lane_skips_total",
+                "lane" => "run_gc", "cause" => "held"
+            )
+            .increment(1);
+            let _ = progress_tx
+                .send(Ok(GcProgress {
+                    paths_scanned: found_unreachable,
+                    paths_collected: 0,
+                    bytes_freed: 0,
+                    is_complete: true,
+                    current_path: format!(
+                        "held: global gc hold landed during mark (reason: {}; set by {})",
+                        h.reason, h.created_by
+                    ),
+                }))
+                .await;
+            let _ = lease.release().await;
+            return Ok(None);
+        }
+        Err(e) => {
+            warn!(error = %e, "GC: post-mark hold consult failed; refusing to sweep");
+            let _ = lease.release().await;
+            return Err(Status::internal(format!("gc-hold consult: {e}")));
+        }
+    }
 
     // --- Sweep phase ---
     // Shutdown token threaded through: sweep checks it between
@@ -1466,7 +1550,7 @@ mod tests {
         assert_eq!(rows, 1);
     }
 
-    // r[verify store.gc.clearance-expiry]
+    // r[verify store.gc.clearance-expiry+2]
     /// W11-AM face 2 (the expiry face — the time axis's own cell): a
     /// clearance aged past the drain bound refuses its next
     /// batch-authorize WITH NO hold transition — `gc_holds` is empty,

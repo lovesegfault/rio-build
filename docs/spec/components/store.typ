@@ -1904,13 +1904,17 @@ backstop's full collect cycle (a five-minute lock-held budget over fifty
 committed batches, merged_bug_067); the per-batch re-authorization through
 the token is what makes the bound true.
 
-#r("store.gc.clearance-expiry")[
+#r("store.gc.clearance-expiry+2")[
   A `HoldClearance` MUST expire `DESTRUCTIVE_BATCH_DRAIN_BOUND` after its
-  last successful consult (mint or batch re-authorization): an expired
-  clearance MUST refuse batch authorization unconditionally --- with no
-  active hold in `gc_holds`, where a bare re-consult would authorize ---
-  and no re-consult resurrects it (the owning tick ends; the next tick
-  re-gates at the lane wrapper).
+  last successful consult (mint, batch re-authorization, or a declared
+  phase-seam consult): an expired clearance MUST refuse batch
+  authorization unconditionally --- with no active hold in `gc_holds`,
+  where a bare re-consult would authorize --- and within a destructive
+  cadence no re-consult resurrects it (the owning tick ends; the next tick
+  re-gates at the lane wrapper). The ONLY lawful window restart is the
+  declared phase-seam consult (#rref("store.gc.consult-aged-clearance")):
+  a consult opportunity between non-destructive phases, which refuses
+  under a hold and yields no batch authority.
 ]
 The expiry is the time axis's own law (R28): re-consult alone leaves a
 stalled body riding a tick-start consult for unbounded wall time between
@@ -1943,6 +1947,31 @@ continued deletes are unrecoverable without re-substitution (bug_084,
 merged_bug_006). The token is the R32 repair --- obligations are linear
 resources, not advisory data --- and the body population is DERIVED by the
 destructive-body census (R31), never author-listed.
+
+#r("store.gc.consult-aged-clearance")[
+  Authority windows age from the CONSUMER'S LAST CONSULT OPPORTUNITY, not
+  the mint: a destructive consumer whose pre-batch phase exceeds the
+  drain-cadence bound MUST re-consult at its declared phase seams (the
+  post-mark seam in `run_gc`; the pre-drain seam in `collect_cycle` after
+  the read phase) so the staleness clock starts where consumption starts.
+  The seam consult (`HoldClearance::regate`) restarts the window on a
+  clear consult, MUST refuse under an active global hold, MUST fail
+  closed on a consult error, and MUST NOT yield batch authority --- the
+  destructive cadence below it still re-authorizes per batch through the
+  token, where an aged clearance refuses unconditionally.
+]
+The drain-cadence bound was frozen from the S3 drain lane's mint-adjacent
+tick (merged_bug_067) and never entailed the per-batch law at the
+collect/run_gc consumers, whose mint-to-first-use distance is a full
+mark+sweep or a multi-minute validation/mark phase at the documented
+1.5M-path design point (merged_bug_081): past 30s of pre-batch work every
+cycle Expired at batch 1 with zero batches --- permanent zero
+chunk-collect progress exactly at scale, with "next tick re-gates"
+re-minting into the same structure. The seam is the consult-clock proper
+(R29': consult, not mint) --- one bound, correct denominator; a per-lane
+bound parameter was considered and REJECTED for this close (no consumer
+lacks a seam; widening the global bound would weaken the freeze guarantee
+for every lane).
 
 #r("store.gc.sweep-cycle-reclaim")[
   The sweep-phase reference re-check MUST exclude referrers that are themselves

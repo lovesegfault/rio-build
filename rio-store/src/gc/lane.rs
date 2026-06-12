@@ -180,10 +180,16 @@ impl DestructiveLane {
 /// the population). VALUE: one drain cadence —
 /// `DRAIN_BATCH_SIZE` (100) per-key S3 deletes is sized to finish
 /// well inside its own 30s `DRAIN_INTERVAL` (the cadence holds
-/// because it does), so the interval is the authority window.
-/// Violable: a pathological single S3 call can exceed it — the
-/// guarantee degrades to "one already-running batch", never "new
-/// batches".
+/// because it does), so the interval is the authority window. THE
+/// DENOMINATOR IS THE DRAIN LANE'S (merged_bug_081): this bound
+/// prices a mint-adjacent cadence; consumers with multi-minute
+/// pre-batch phases (collect's read phase, run_gc's mark) restart
+/// the window at their declared consult seams
+/// (store.gc.consult-aged-clearance) rather than widening this bound
+/// — a single global staleness bound cannot serve heterogeneous
+/// lanes. Violable: a pathological single S3 call can exceed it —
+/// the guarantee degrades to "one already-running batch", never
+/// "new batches".
 pub(crate) const DESTRUCTIVE_BATCH_DRAIN_BOUND: Duration = Duration::from_secs(30);
 
 // The derivation pin (and the const's consumer): the bound IS one
@@ -1269,13 +1275,16 @@ mod census {
             .find(|(f, _)| *f == "gc/mod.rs")
             .map(|(_, src)| {
                 let text: String = code_lines(src).join("\n");
-                text.contains("hold::gate(pool)") && text.contains("&mut hold_clearance,")
+                text.contains("hold::gate(pool)")
+                    && text.contains("&mut hold_clearance,")
+                    && text.contains("hold_clearance.regate(pool)")
             })
             .unwrap_or(false);
         assert!(
             run_gc_consults,
-            "run_gc (the pinned census member) must consult hold::gate \
-             and thread the clearance to collect_cycle"
+            "run_gc (the pinned census member) must consult hold::gate, \
+             re-gate at the post-mark consult seam, and thread the \
+             clearance to both destructive phases"
         );
 
         // The committed [GEN-SET]: the derived rows, exactly.

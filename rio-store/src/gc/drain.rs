@@ -57,7 +57,7 @@ pub(crate) const DRAIN_INTERVAL: Duration = Duration::from_secs(30);
 /// S3 delete that already happened is re-processed next iteration (S3
 /// delete of a non-existent key is a no-op).
 // r[impl store.gc.hold-lanes+2]
-// r[impl store.gc.clearance-expiry]
+// r[impl store.gc.clearance-expiry+2]
 pub async fn drain_once(
     pool: &PgPool,
     backend: &Arc<dyn ChunkBackend>,

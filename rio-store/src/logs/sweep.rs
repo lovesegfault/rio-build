@@ -94,7 +94,7 @@ pub struct SweepStats {
 /// never re-authorized — the lone violator of the per-batch law its
 /// own lane registered under.
 // r[impl store.gc.hold-lanes+2]
-// r[impl store.gc.clearance-expiry]
+// r[impl store.gc.clearance-expiry+2]
 // r[impl store.gc.batch-authority]
 pub async fn sweep_expired_logs(
     pool: &PgPool,

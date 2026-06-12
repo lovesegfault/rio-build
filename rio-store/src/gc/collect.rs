@@ -737,7 +737,7 @@ pub(crate) static COLLECT_HOLD_AFTER_BATCHES: std::sync::atomic::AtomicU64 =
 /// `outcome="parse_failure"` cycle counter instead.
 // r[impl store.gc.chunk-collect]
 // r[impl store.gc.hold-lanes+2]
-// r[impl store.gc.clearance-expiry]
+// r[impl store.gc.clearance-expiry+2]
 #[instrument(skip(pool, chunk_backend, clearance))]
 pub(crate) async fn collect_cycle(
     pool: &PgPool,
@@ -1082,7 +1082,37 @@ pub(crate) async fn collect_cycle(
     let mut pass_complete = false;
     let mut clearance_stop: Option<ClearanceStop> = None;
 
+    // --- The pre-drain consult seam (merged_bug_081, R29') ---
+    // The read phase above (validation, mark expansion, prepare,
+    // report) runs on one snapshot for multiple minutes at the
+    // documented design point, while the clearance was minted at the
+    // caller's entry (run_gc) or the lane tick (the backstop) — a
+    // drain-cadence-aged clearance would Expire at batch 1 with zero
+    // batches, every cycle, exactly at scale. The seam restarts the
+    // window where consumption starts; a hold landed during the read
+    // phase refuses HERE (zero batches, the capped-resume machinery
+    // reports the stop), and the per-batch authorization below is
+    // untouched — the seam never bypasses a live hold.
+    match clearance.regate(pool).await? {
+        super::hold::Regate::Refreshed => {}
+        super::hold::Regate::Held(h) => {
+            info!(
+                hold_id = %h.hold_id,
+                reason = %h.reason,
+                created_by = %h.created_by,
+                "chunk-collect: global hold landed during the read phase; \
+                 refusing the drain at the consult seam"
+            );
+            clearance_stop = Some(ClearanceStop::Held);
+        }
+    }
+
     loop {
+        if clearance_stop.is_some() {
+            // The seam refused: zero batches; the disposition below
+            // reuses the capped-resume machinery.
+            break;
+        }
         let remaining = COLLECT_CYCLE_VICTIM_CAP.saturating_sub(victims_collected);
         if remaining == 0 {
             // Stopping at the cap is the designed behavior for
@@ -1096,7 +1126,7 @@ pub(crate) async fn collect_cycle(
         // clearance is demanded before each batch, not once per
         // tick — a hold landed since the last consult refuses here,
         // and a drain-bound-aged clearance refuses even with no hold
-        // (store.gc.clearance-expiry). A consult error fails closed
+        // (store.gc.clearance-expiry+2). A consult error fails closed
         // through the `?` (the cycle errors; committed batches
         // stand). The refused remainder resumes from the persisted
         // cursor on the next un-held cycle — the stop reuses the
@@ -1333,7 +1363,7 @@ pub(crate) static REAP_HOLD_AFTER_BATCHES: std::sync::atomic::AtomicU64 =
 /// not data deletion). A consult error is treated like a reap error:
 /// warn, stop reaping, keep the cycle committed.
 // r[impl store.gc.completion-witness+2]
-// r[impl store.gc.clearance-expiry]
+// r[impl store.gc.clearance-expiry+2]
 async fn run_post_drain_tail(
     mut conn: super::lock::SessionConn,
     pool: &PgPool,
@@ -3999,7 +4029,7 @@ mod tests {
         );
     }
 
-    // r[verify store.gc.clearance-expiry]
+    // r[verify store.gc.clearance-expiry+2]
     // r[verify store.gc.hold-lanes+2]
     /// W11-AM face 1 (merged_bug_067, the re-consult face): a global
     /// hold landing BETWEEN two committed batches of the heaviest
@@ -5491,6 +5521,152 @@ mod tests {
             report2.chunks_reaped,
             u64::from(n) - COLLECT_BATCH_LIMIT,
             "release => the remainder reaps"
+        );
+    }
+
+    // r[verify store.gc.consult-aged-clearance]
+    /// W12-Q (merged_bug_081, R29'): authority ages from the
+    /// CONSUMER'S CONSULT OPPORTUNITY, not the mint. A clearance
+    /// minted before a multi-minute read phase (the at-scale regime
+    /// the frozen drain-cadence denominator never saw — virtual time
+    /// stands in for it; `consulted_at` is a tokio Instant, virtual
+    /// under paused test time by design) reaches the live loop aged
+    /// far past the bound. Pre-fix: batch-1 `Expired`, zero batches,
+    /// EVERY cycle — permanent zero chunk-collect progress; "next
+    /// tick re-gates" re-mints into the same structure. Post-fix:
+    /// the pre-drain consult seam restarts the window and the cycle
+    /// progresses fully under the same hold-free conditions.
+    /// (Aging is virtual: pause -> advance -> resume around the gap
+    /// only — real PG IO under a paused clock loses the race against
+    /// its own pool timers via auto-advance.)
+    #[tokio::test]
+    async fn consult_seam_restarts_authority_after_a_long_read_phase() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+        let n = (COLLECT_BATCH_LIMIT + 5) as u16;
+        seed_collectable_chunks(&db.pool, n, 100).await;
+
+        // Two consecutive mint-then-age cycles: the pre-fix structure
+        // was PERMANENT (each tick re-minted and re-expired).
+        for cycle in 0..2u8 {
+            let mut clearance = crate::test_helpers::gc_clearance(&db.pool).await;
+            // The multi-minute pre-batch phase the bound never priced.
+            tokio::time::pause();
+            tokio::time::advance(std::time::Duration::from_secs(240)).await;
+            tokio::time::resume();
+            let report = collect_cycle(
+                &db.pool,
+                Some(&backend),
+                super::super::sweep::CHUNK_GRACE_SECS,
+                CollectMode::Live,
+                None,
+                &mut clearance,
+            )
+            .await
+            .expect("cycle runs");
+            if cycle == 0 {
+                assert_eq!(
+                    report.clearance_stop, None,
+                    "left: every at-scale cycle Expires at batch 1 (zero \
+                     batches, permanent zero progress) / right: the consult \
+                     seam restarts the window where consumption starts"
+                );
+                assert!(
+                    report.batches_run >= 2 && report.victims_collected == u64::from(n),
+                    "full batch progression under hold-free conditions \
+                     (got {} batches, {} victims)",
+                    report.batches_run,
+                    report.victims_collected
+                );
+            } else {
+                // Cycle 2 finds nothing left — progress was REAL.
+                assert_eq!(report.victims_collected, 0);
+                assert_eq!(report.clearance_stop, None);
+            }
+        }
+    }
+
+    // r[verify store.gc.consult-aged-clearance]
+    // r[verify store.gc.batch-authority]
+    /// W12-Q composition pin (the WO-S3-1 interlock): the seam
+    /// restarts the window but NEVER bypasses the per-batch law — a
+    /// hold landing between two committed batches of a seam-refreshed
+    /// cycle still stops the next batch at its boundary.
+    #[tokio::test]
+    async fn aged_seam_never_bypasses_the_per_batch_law() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+        let n = (COLLECT_CYCLE_VICTIM_CAP + 10) as u16;
+        seed_collectable_chunks(&db.pool, n, 100).await;
+
+        let mut clearance = crate::test_helpers::gc_clearance(&db.pool).await;
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(240)).await;
+        tokio::time::resume();
+        COLLECT_HOLD_AFTER_BATCHES.store(1, std::sync::atomic::Ordering::SeqCst);
+        let report = collect_cycle(
+            &db.pool,
+            Some(&backend),
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Live,
+            None,
+            &mut clearance,
+        )
+        .await
+        .expect("cycle runs");
+        assert_eq!(report.batches_run, 1, "exactly the pre-hold batch ran");
+        assert_eq!(report.clearance_stop, Some(ClearanceStop::Held));
+    }
+
+    // r[verify store.gc.consult-aged-clearance]
+    /// W12-Q seam-refusal cell: a hold landed DURING the read phase
+    /// (after the caller's mint) refuses at the seam — zero batches,
+    /// the stop reported through the capped-resume machinery; the
+    /// seam is a consult, never an amnesty.
+    #[tokio::test]
+    async fn seam_refuses_under_a_hold_landed_during_the_read_phase() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+        seed_collectable_chunks(&db.pool, 5, 100).await;
+
+        // Mint FIRST (the caller's entry consult), then the hold
+        // lands — the schedule the entry consult cannot see.
+        let mut clearance = crate::test_helpers::gc_clearance(&db.pool).await;
+        let hold_id = super::super::hold::set_hold(
+            &db.pool,
+            super::super::hold::GcHoldScope::Global,
+            "w12-q read-phase hold",
+            "test",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let report = collect_cycle(
+            &db.pool,
+            Some(&backend),
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Live,
+            None,
+            &mut clearance,
+        )
+        .await
+        .expect("the held cycle still commits its (empty) progress");
+        assert_eq!(report.clearance_stop, Some(ClearanceStop::Held));
+        assert_eq!(report.batches_run, 0, "zero batches under the seam refusal");
+        assert_eq!(report.victims_collected, 0);
+        let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE NOT deleted")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(live, 5, "nothing was collected under the hold");
+        assert!(
+            super::super::hold::release_hold(&db.pool, hold_id)
+                .await
+                .unwrap()
         );
     }
 }
