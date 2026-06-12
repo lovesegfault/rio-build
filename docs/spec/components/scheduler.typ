@@ -157,24 +157,28 @@ critical-path value).
   #(refs.metric)("rio_scheduler_undeclared_built_output_total").
 ]
 
-#r("sched.trust.report-membership")[
+#r("sched.trust.report-membership+2")[
   A worker-supplied `output_path` MUST enter `path_tenants` (or any other
-  registration sink) ONLY if it is a member of the scheduler-authoritative
-  expected set for that assignment (`expected_output_paths` --- dispatch-minted
-  and signed into the `AssignmentClaims` the store enforces on upload), on
-  EVERY report lane: the admitted success epilogue checks the resident node's
-  set; the late-report Register lane checks the durable row's set, so the
-  evicted face is exactly as checked as the resident one. Non-membership MUST
-  be a typed refusal --- counted
-  (#(refs.metric)("rio_scheduler_unexpected_built_output_total")), attributed,
-  and non-poisoning (the report's lawful effects proceed). Floating-CA reports
-  (`is_ca` and not fixed-output, the claims-mint predicate) are exempt: their
-  paths are computed post-build from the NAR hash and authorized by the
-  store's content recompute on upload. Trust-boundary residual pricing for
-  worker report fields MUST be per-consumer: every sink of a worker-supplied
-  field either re-derives from scheduler-authoritative data, sits downstream
-  of this membership check, or carries a priced-residual entry NAMING that
-  sink (the taint-to-consumer census is the enforcing witness).
+  registration sink) ONLY if it is bounded by a scheduler-verifiable path-value
+  law for that assignment, on EVERY report lane and EVERY face: the
+  input-addressed and fixed-output faces check membership in the
+  scheduler-authoritative expected set (`expected_output_paths` ---
+  dispatch-minted and signed into the `AssignmentClaims` the store enforces on
+  upload; admitted lane against the resident node's set, late-report Register
+  lane against the durable row's set, so the evicted face is exactly as
+  checked as the resident one); the floating-CA face (`is_ca` and not
+  fixed-output, the claims-mint predicate --- no dispatch-time expected set
+  exists) checks store-recorded production evidence per the corroboration rule
+  below. Non-membership MUST be a typed refusal --- counted
+  (#(refs.metric)("rio_scheduler_unexpected_built_output_total") on the
+  expected-set faces,
+  #(refs.metric)("rio_scheduler_unevidenced_ca_output_total") on the CA face),
+  attributed, and non-poisoning (the report's lawful effects proceed).
+  Trust-boundary residual pricing for worker report fields MUST be
+  per-consumer: every sink of a worker-supplied field either re-derives from
+  scheduler-authoritative data, sits downstream of this membership check, or
+  carries a priced-residual entry NAMING that sink (the taint-to-consumer
+  census is the enforcing witness).
 ]
 The name-membership rule above bounds the report's output *names*; this rule
 binds the *paths* --- the axis that reaches tenant visibility. The repaired
@@ -182,7 +186,42 @@ hole (bug 138): a report naming another tenant's existing path triggers no
 upload, so the store's PutPath `path ∈ claims.expected_outputs` check never
 runs, and the stamped row flips the victim path Hidden → Visible for the
 forging tenant through `own_built_projection`'s `bool_or(tenant_id)` and the
-I-217 verdict.
+I-217 verdict. The bug 132 recurrence, one face over: the original form of
+this rule EXEMPTED floating-CA on the claim that the store's content recompute
+covers that face "exactly as on upload" --- a compensating control that
+structurally cannot fire on the no-upload attack path (the recompute lives
+inside PutPath; the attack uploads nothing). Exemptions keyed on
+submitter-controlled attributes (the CA-ness of one's own drv) convert
+per-face residuals into adversary-chosen bypasses; the CA face therefore
+joins the law's domain with its own evidence base rather than an exemption.
+
+#r("sched.trust.report-corroboration")[
+  A tenant-visibility registration stamp for a floating-CA report MUST bind to
+  store-recorded production evidence: the stamp (and the realisation insert
+  that feeds later stamp lanes) admits a worker-reported `output_path` ONLY if
+  the store's ingest-lane registration (`path_tenants` --- the SAME rows the
+  visibility verdict's `own_built_projection` reads, one source) records the
+  path for at least one tenant of the reporting build's attributed cohort: no
+  upload, no stamp. Absent evidence MUST be a typed refusal --- counted
+  (#(refs.metric)("rio_scheduler_unevidenced_ca_output_total")), attributed,
+  non-poisoning, degrading exactly to the pre-registration posture (bytes
+  durable, tenant-invisible until a lawful re-stamp); an evidence-consult
+  error MUST fail closed. Residual pricing for any face of this boundary MUST
+  name a firing predicate machine-bound in the taint census --- a census row
+  whose compensating control cannot fire on the priced path is census-RED,
+  never self-reported prose.
+]
+Granularity, priced: the binding is (path, claims-tenant-cohort), not
+(path, exec) --- the store's durable upload trace is the tenant-keyed ingest
+stamp (`AssignmentClaims` carries no exec id). The cross-tenant kill is
+intact: the attack cohort never uploaded the victim path. The in-tenant
+residual (a tenant re-claiming its OWN previously-registered path as a fresh
+CA output) carries no confidentiality flip and is integrity-equivalent to a
+compromised builder uploading arbitrary CA content, which the builder trust
+model already prices. The honest-path residual (a single-output upload whose
+best-effort ingest stamp was skipped under PG pressure) refuses until a
+lawful re-stamp --- availability-class, store-warn-visible; the batch upload
+lane stamps inside its atomic transaction and has no such window.
 
 *Retired (1d proto sweep --- the stream-carried BuildPhase surface):*
 `sched.log.phase-binding` and `sched.log.path-length` normed the actor-side

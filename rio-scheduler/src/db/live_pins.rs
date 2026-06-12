@@ -57,9 +57,10 @@ pub(crate) enum StampProvenance {
     /// into the visibility verdict, so the gate cannot drift from
     /// the I-217 flip it guards. The set carries sha256(path) keys;
     /// `lawful_pairs` drops every non-member path (no upload, no
-    /// stamp). Constructed ONLY by the CA-face consult
-    /// (`ca_stamp_provenance` — census-pinned 1:1 with the consult
-    /// call sites).
+    /// stamp). Constructed ONLY from the CA-face consult's result
+    /// (`ca_production_evidence` — the construction sites are
+    /// census-pinned 1:1 with the consult call sites by
+    /// `ca_stamp_lanes_consult_production_evidence`).
     BuiltLocallyEvidenced(std::collections::HashSet<Vec<u8>>),
     /// Every stamped tenant's own visibility-gated FindMissingPaths
     /// answered present.
@@ -978,7 +979,7 @@ mod registration_writer_census {
         );
     }
 
-    // r[verify sched.trust.report-membership]
+    // r[verify sched.trust.report-membership+2]
     /// bug_138 commit 2 (W10-N) — the TAINT-TO-CONSUMER census, the
     /// per-consumer half of the membership law (RC-2(iii): a priced
     /// residual must name every downstream sink of the tainted field
@@ -1001,10 +1002,15 @@ mod registration_writer_census {
     ///   MEMBERSHIP retain (admitted lane), the late-validator
     ///   inputs, the Register-apply membership check (durable row),
     ///   the post-retain epilogue write, and the CA bookkeeping.
-    ///   Disposition: membership-checked; the CA-exempt face is the
-    ///   NAMED priced residual — floating-CA paths are content-proven
-    ///   by the store's verify_ca_store_path on upload + the gated
-    ///   realisation insert; the evicted-CA modular-hash residual is
+    ///   Disposition: membership-checked on every face — the
+    ///   floating-CA face by the production-evidence consult
+    ///   (bug_132: no upload, no stamp), MACHINE-BOUND to its firing
+    ///   predicate by `ca_stamp_lanes_consult_production_evidence`
+    ///   below (every CA-exempt stamp lane consults; a lane reachable
+    ///   without the consult is census-RED — R22″: this row carries
+    ///   no self-reported pricing; the end-to-end flip kill is the
+    ///   W11-Q red in actor/tests/completion.rs); the evicted-CA
+    ///   modular-hash residual is
     ///   priced at the Register applier.
     /// - actor/pull.rs (1): feeds `validated_late_outputs` — the late
     ///   lane whose path law runs at apply. Membership-checked.
@@ -1174,5 +1180,122 @@ mod registration_writer_census {
         .into();
         assert_census(&hits, &expected, "bump_resource_floor callers")
             .expect("the floor-promotion caller alphabet is census-pinned");
+    }
+
+    // r[verify sched.trust.report-corroboration]
+    /// bug_132 commit 2 (W11-S, the R22″ machine-bind): the CA-face
+    /// residual pricing is BOUND to the compensating control's firing
+    /// predicate instead of self-reported prose. Two pinned needles
+    /// plus their pairing:
+    ///
+    /// (a) the evidence CONSULTS (the dotted `ca_production_evidence`
+    ///     paren sites) — one per CA-exempt worker-report stamp lane
+    ///     (admitted + late Register), in the trust-boundary file
+    ///     ONLY;
+    /// (b) the evidenced-witness CONSTRUCTIONS (the
+    ///     `BuiltLocallyEvidenced` paren sites) — the stamp cannot
+    ///     take the CA face without the typed witness, and the
+    ///     witness type's def + `lawful_pairs` arm live beside the
+    ///     funnel here;
+    /// (c) the FIRING-PREDICATE pairing: in the trust-boundary file
+    ///     the construction count EQUALS the consult count — a stamp
+    ///     lane constructing the witness without consulting (or
+    ///     consulting without carrying the witness to the funnel) is
+    ///     census-RED.
+    ///
+    /// Together with `worker_report_taint_sinks_pinned` (a NEW
+    /// `built_outputs` consumer or `output_paths` writer is named) and
+    /// `writer_family_callers_pinned` (a NEW stamp caller is named),
+    /// every lane that could mint a tenant-visibility stamp from a
+    /// worker report is forced through the consult — the control
+    /// FIRES on every priced path, which is exactly the predicate the
+    /// retired prose row asserted without a witness.
+    #[test]
+    fn ca_stamp_lanes_consult_production_evidence() {
+        let consults = census(&[".ca_production_", "evidence("]);
+        let expected_consults: BTreeMap<String, usize> =
+            [("actor/completion.rs".to_string(), 2)].into();
+        assert_census(
+            &consults,
+            &expected_consults,
+            "CA-face production-evidence consults (one per CA-exempt stamp lane)",
+        )
+        .expect("the CA-exempt stamp lanes are consult-pinned");
+
+        let witnesses = census(&["BuiltLocally", "Evidenced("]);
+        let expected_witnesses: BTreeMap<String, usize> = [
+            ("actor/completion.rs".to_string(), 2),
+            // The variant def + the lawful_pairs arm (this file).
+            ("db/live_pins.rs".to_string(), 2),
+        ]
+        .into();
+        assert_census(
+            &witnesses,
+            &expected_witnesses,
+            "evidenced-witness constructions",
+        )
+        .expect("the evidenced-witness construction sites are census-pinned");
+
+        assert_eq!(
+            consults.get("actor/completion.rs"),
+            witnesses.get("actor/completion.rs"),
+            "the firing-predicate pairing: every CA-exempt stamp lane's \
+             witness construction consults the evidence (1:1 in the \
+             trust-boundary file)"
+        );
+    }
+
+    /// W11-S's planted red (R22″, one level down): a STRAWMAN stamp
+    /// lane that constructs the evidenced witness WITHOUT a consult —
+    /// raw source text entering at the scanner layer — MUST go
+    /// census-red naming the strawman file, through BOTH the
+    /// construction pin and the pairing. Runtime-assembled so this
+    /// file's static text never matches the needles itself.
+    #[test]
+    fn ca_census_plants_red_on_unconsulted_stamp_lane() {
+        let strawman = format!(
+            "async fn rogue_ca_stamp(&self, paths: &[String], tids: &[Uuid]) {{\n\
+             let w = StampProvenance::BuiltLocally{}(Default::default());\n\
+             self.db.upsert_path_{}(paths, tids, &w).await.ok();\n\
+             }}\n",
+            "Evidenced", "tenants"
+        );
+        let mut universe: Vec<(String, String)> = CENSUS_SOURCES
+            .iter()
+            .map(|(f, t)| (f.to_string(), (*t).to_string()))
+            .collect();
+        universe.push(("actor/strawman_ca_lane.rs".to_string(), strawman));
+
+        let witnesses = census_over(&universe, &["BuiltLocally", "Evidenced("]);
+        let expected_witnesses: BTreeMap<String, usize> = [
+            ("actor/completion.rs".to_string(), 2),
+            ("db/live_pins.rs".to_string(), 2),
+        ]
+        .into();
+        let err = assert_census(
+            &witnesses,
+            &expected_witnesses,
+            "plant: evidenced-witness constructions",
+        )
+        .expect_err("an unlisted witness construction MUST go census-red");
+        assert!(
+            err.contains("strawman_ca_lane.rs"),
+            "the red must NAME the unconsulted lane; got: {err}"
+        );
+
+        // And the pairing face: the strawman file constructs without
+        // consulting — its consult count is ZERO while its
+        // construction count is nonzero.
+        let consults = census_over(&universe, &[".ca_production_", "evidence("]);
+        assert_eq!(
+            consults.get("actor/strawman_ca_lane.rs"),
+            None,
+            "plant premise: the strawman never consults"
+        );
+        assert_eq!(
+            witnesses.get("actor/strawman_ca_lane.rs"),
+            Some(&1),
+            "plant premise: the strawman constructs the witness"
+        );
     }
 }

@@ -1407,7 +1407,7 @@ impl DagActor {
                 // posture (bytes durable, tenant-invisible until
                 // re-stamp), and "" never matches a parsed store
                 // path, so the placeholder can never be forged.
-                // r[impl sched.trust.report-membership]
+                // r[impl sched.trust.report-membership+2]
                 // (De Morgan of NOT(is_ca AND NOT is_fo) — the
                 // non-exempt face.)
                 if !*is_ca || *is_fo {
@@ -1581,10 +1581,15 @@ impl DagActor {
     /// predicate (`state.ca.is_ca && !state.is_fixed_output`, or the
     /// durable `is_ca AND NOT is_fixed_output` on the cold face):
     /// floating-CA paths are computed post-build from the NAR hash —
-    /// no sign-time expected set exists; that face's authorization is
-    /// the store's content recompute (`verify_ca_store_path`) plus
-    /// the gated realisation insert, exactly as on upload.
-    // r[impl sched.trust.report-membership]
+    /// no sign-time expected set exists. That face's path-VALUE bound
+    /// is [`Self::ca_production_evidence`] (bug_132): the store's
+    /// content recompute (`verify_ca_store_path`) authorizes the
+    /// UPLOAD, but an attack that uploads nothing never meets it —
+    /// so the stamp additionally demands the store-recorded
+    /// registration evidence the upload leaves behind (no upload, no
+    /// stamp; machine-bound by the
+    /// `ca_stamp_lanes_consult_production_evidence` census).
+    // r[impl sched.trust.report-membership+2]
     pub(super) fn retain_expected_members(
         executor_id: &str,
         drv_key: &str,
@@ -2093,7 +2098,7 @@ impl DagActor {
         // overwrite runs before any assignment exists). Floating-CA
         // is exempt under EXACTLY the claims-mint predicate — see
         // [`Self::retain_expected_members`].
-        // r[impl sched.trust.report-membership]
+        // r[impl sched.trust.report-membership+2]
         // (De Morgan of NOT(is_ca AND NOT is_fixed_output) — the
         // non-exempt face.)
         if !state.ca.is_ca || state.is_fixed_output {
