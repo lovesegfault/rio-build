@@ -143,6 +143,17 @@ pub fn describe_metrics() {
          connect_failure=store unreachable; rpc_failure=TriggerGC returned error or stream aborted."
     );
     describe_counter!(
+        "rio_controller_pod_evictions_total",
+        "Kubelet pod evictions observed at terminal classification, split by \
+         attribution shape (live060-f): shape=pod_attributed_empty_dir \
+         (kubelet's per-pod statement that THIS build exceeded ITS declared \
+         disk — EmptyDir sizeLimit / pod ephemeral local storage) | \
+         node_condition (ambient DiskPressure / ephemeral-storage pressure) | \
+         other (non-disk evictions). The wire letter folds both disk shapes \
+         to evicted_disk_pressure until the carrier lands; this counter is \
+         the fleet readback for the unambiguous sub-population."
+    );
+    describe_counter!(
         "rio_controller_disruption_drains_total",
         "DisruptionTarget watcher preemption actions: synthesized preempted report + \
          foreground Job delete (result=preempted_pull|preempted_pull_report_failed). \

@@ -2030,29 +2030,57 @@ pub(super) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
     };
     if status.reason.as_deref() == Some("Evicted") {
         let msg = status.message.as_deref().unwrap_or("");
-        // kubelet's per-pod limit message is "ephemeral local storage"
-        // (spaces); the hyphenated "ephemeral-storage" is the resource
-        // NAME and only appears in node-condition messages. The
-        // emptyDir-sizeLimit eviction (`emptyDirLimit` in kubelet's
-        // eviction manager) says `Usage of EmptyDir volume "<name>"
-        // exceeds the limit "<N>".` — neither of the above substrings.
-        // Match all three; all classify as EvictedDiskPressure for
-        // the AD2c classification fill. This node-condition +
-        // pod-attributed FOLD is safe because the scheduler treats
-        // the eviction letter as CLASSIFY-ONLY: the only
-        // controller-witnessed letter that promotes a floor is
-        // OomKilled (per-container containerStatuses attribution,
-        // promoted at the establishment sweep once per attempt —
-        // live_058-b; the floor's disk arm is live with its sole
-        // producer, the worker-side prjquota-attributed DiskFull
-        // lane -- live_057, never this fill).
-        if msg.contains("DiskPressure")
-            || msg.contains("ephemeral-storage")
-            || msg.contains("ephemeral local storage")
-            || msg.contains("EmptyDir volume")
-        {
+        // live060-f (A2) — the PRODUCER half of the eviction-letter
+        // split, re-derived against the landed split-letter contract:
+        // the sub-shape grammar splits HERE, at the one site that
+        // reads kubelet's message. POD-ATTRIBUTED shapes are
+        // kubelet's own per-pod statement that THIS build exceeded
+        // ITS declared disk ("Usage of EmptyDir volume … exceeds the
+        // limit" from the eviction manager's emptyDirLimit lane;
+        // "ephemeral local storage" — spaces — from the per-pod
+        // limit lane) and carry none of I-199's ambiguity.
+        // NODE-CONDITION shapes ("DiskPressure"; the hyphenated
+        // "ephemeral-storage" resource NAME, which only appears in
+        // node-condition messages) stay ambient.
+        //
+        // The WIRE letter stays the EvictedDiskPressure fold for
+        // BOTH: the in-process split letter
+        // (`AttemptTerminalKind::EvictedEmptyDirSizeLimit`) and its
+        // label are landed and ready, but the controller→scheduler
+        // carrier is the wire enum `AttemptTerminalReason`, which
+        // has no corresponding value — adding one is a `.fields`
+        // wire change barred by this wave's zero-amendment-wire
+        // ledger, so the PROMOTE path is RULED with the wire ritual
+        // as its trigger and the scheduler stays classify-only
+        // (the only controller-witnessed letter that promotes a
+        // floor is OomKilled — live_058-b; the floor's disk arm is
+        // live with its sole producer, the worker-side
+        // prjquota-attributed DiskFull lane — live_057, never this
+        // fill). The split is PRODUCED here regardless — the
+        // grammar discriminator plus the per-shape readback counter
+        // — so the fleet sees the unambiguous sub-population today
+        // and the producer is live the moment the carrier lands.
+        if eviction_is_pod_attributed(msg) {
+            metrics::counter!(
+                "rio_controller_pod_evictions_total",
+                "shape" => "pod_attributed_empty_dir",
+            )
+            .increment(1);
             return TerminationReason::EvictedDiskPressure;
         }
+        if msg.contains("DiskPressure") || msg.contains("ephemeral-storage") {
+            metrics::counter!(
+                "rio_controller_pod_evictions_total",
+                "shape" => "node_condition",
+            )
+            .increment(1);
+            return TerminationReason::EvictedDiskPressure;
+        }
+        metrics::counter!(
+            "rio_controller_pod_evictions_total",
+            "shape" => "other",
+        )
+        .increment(1);
         return TerminationReason::EvictedOther;
     }
     for cs in status.container_statuses.iter().flatten() {
@@ -2065,6 +2093,18 @@ pub(super) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
         }
     }
     TerminationReason::Unknown
+}
+
+/// live060-f: is this eviction message kubelet's POD-ATTRIBUTED
+/// disk statement (the unambiguous sub-shapes the split letter
+/// names), as opposed to an ambient node-condition shape? The two
+/// grammars are kubelet's own: the eviction manager's emptyDirLimit
+/// lane says `Usage of EmptyDir volume "<name>" exceeds the limit`;
+/// the per-pod ephemeral limit lane says "ephemeral local storage"
+/// (spaces — the hyphenated "ephemeral-storage" is the resource
+/// name and only appears in node-condition messages).
+pub(super) fn eviction_is_pod_attributed(msg: &str) -> bool {
+    msg.contains("EmptyDir volume") || msg.contains("ephemeral local storage")
 }
 
 /// `metav1.Time` → unix-epoch seconds (kube wraps `jiff::Timestamp`).
@@ -2976,6 +3016,56 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn live060f_eviction_grammar_splits_pod_attributed_shapes() {
+        // The producer-half split (live060-f rider): the grammar
+        // discriminates kubelet's pod-attributed disk statements
+        // from ambient node-condition shapes; the WIRE letter stays
+        // the EvictedDiskPressure fold for both (the promote path is
+        // RULED pending the wire ritual — the split is observable
+        // through the per-shape readback counter today).
+        let pod = |reason: &str, msg: &str| Pod {
+            status: Some(k8s_openapi::api::core::v1::PodStatus {
+                reason: Some(reason.into()),
+                message: Some(msg.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Pod-attributed sub-shapes (unambiguous):
+        assert!(eviction_is_pod_attributed(
+            "Usage of EmptyDir volume \"build\" exceeds the limit \"40Gi\"."
+        ));
+        assert!(eviction_is_pod_attributed(
+            "Pod ephemeral local storage usage exceeds the total limit of containers 40Gi."
+        ));
+        // Node-condition shapes (ambient — NOT pod-attributed):
+        assert!(!eviction_is_pod_attributed(
+            "The node was low on resource: ephemeral-storage."
+        ));
+        assert!(!eviction_is_pod_attributed(
+            "The node had condition: [DiskPressure]."
+        ));
+        // The wire fold is unchanged for every disk shape (the
+        // carrier has no split value — zero-wire ledger):
+        for msg in [
+            "Usage of EmptyDir volume \"build\" exceeds the limit \"40Gi\".",
+            "Pod ephemeral local storage usage exceeds the total limit of containers 40Gi.",
+            "The node was low on resource: ephemeral-storage.",
+            "The node had condition: [DiskPressure].",
+        ] {
+            assert_eq!(
+                pod_termination_reason(&pod("Evicted", msg)),
+                TerminationReason::EvictedDiskPressure,
+                "wire fold preserved for: {msg}"
+            );
+        }
+        assert_eq!(
+            pod_termination_reason(&pod("Evicted", "memory pressure")),
+            TerminationReason::EvictedOther
+        );
     }
 
     /// `is_pending_job`: active AND ready==0. live_056-b retired the

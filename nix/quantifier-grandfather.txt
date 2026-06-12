@@ -600,7 +600,6 @@ rio-controller/src/reconcilers/pool/job.rs	// DeadlineExceeded fill is a verdict
 rio-controller/src/reconcilers/pool/job.rs	// EVERY pre-existing object read as older-than (merged_bug_036
 rio-controller/src/reconcilers/pool/job.rs	// EVERY s. Job is (14+s)s old at evaluation; the close's
 rio-controller/src/reconcilers/pool/job.rs	// classification fill is a verdict ONLY when the
-rio-controller/src/reconcilers/pool/job.rs	// the eviction letter as CLASSIFY-ONLY: the only
 rio-controller/src/reconcilers/pool/job.rs	// view, evaluated for EVERY job in the wave — a covering attempt
 rio-controller/src/reconcilers/pool/job.rs	///     ALWAYS set (no `None`): a missing deadline means a stuck pod
 rio-controller/src/reconcilers/pool/job.rs	///    the SAME deterministic Job name; the fresh Job is younger
