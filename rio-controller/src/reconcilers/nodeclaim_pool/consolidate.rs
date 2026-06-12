@@ -243,7 +243,7 @@ pub fn deferred_for_cell(
 }
 
 /// Append `e` to `cell`'s ring-buffered `idle_gap_events`.
-fn push_idle_gap(sketches: &mut CellSketches, cell: &Cell, e: IdleGapEvent) {
+pub(super) fn push_idle_gap(sketches: &mut CellSketches, cell: &Cell, e: IdleGapEvent) {
     let evs = &mut sketches.cell_mut(cell).idle_gap_events;
     if evs.len() >= IDLE_GAP_RING {
         evs.remove(0);

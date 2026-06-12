@@ -1777,6 +1777,29 @@ impl NodeClaimPoolReconciler {
             &mut self.delete_tombstones,
             &live,
         ));
+        // bug_042: the registered-claim tombstone consumer — the
+        // vanish fold above only consumes `inflight_created` exits,
+        // so Dead/Idle (registered-claim) tombstones are matched here
+        // against the same live view and their confirmed exits apply
+        // the original reason's full consequence (counter, wedge
+        // eviction, censored gap) through the same record_reap path.
+        let swept = health::sweep_registered_tombstones(
+            &mut self.delete_tombstones,
+            &self.inflight_created,
+            &live,
+        );
+        ice_cells.extend(swept.ice_cells);
+        self.pending_wedge_evictions.extend(swept.evicted_nodes);
+        for (cell, gap) in swept.censored_gaps {
+            consolidate::push_idle_gap(
+                &mut self.sketches,
+                &cell,
+                consolidate::IdleGapEvent {
+                    gap_secs: gap,
+                    censored: true,
+                },
+            );
+        }
         // bug_082: ICE marks enter the commit-on-Ack buffer AT the
         // production site — `report_unfulfillable` builds the request
         // from the buffer, so a failed Ack retains them exactly like
@@ -2001,6 +2024,29 @@ impl NodeClaimPoolReconciler {
             &live,
         );
         self.pending_evidence.buffer_marks(vanished);
+        // bug_042: the registered-tombstone consumer runs in BOTH
+        // modes (the bug_094 both-modes discipline) — a Dead/Idle
+        // tombstone confirmed during a scheduler outage still applies
+        // its consequence within the finalizer window; masks (total
+        // over the reason alphabet, empty for Dead/Idle) buffer like
+        // every other evidence plane here.
+        let swept = health::sweep_registered_tombstones(
+            &mut self.delete_tombstones,
+            &self.inflight_created,
+            &live,
+        );
+        self.pending_evidence.buffer_marks(swept.ice_cells);
+        self.pending_wedge_evictions.extend(swept.evicted_nodes);
+        for (cell, gap) in swept.censored_gaps {
+            consolidate::push_idle_gap(
+                &mut self.sketches,
+                &cell,
+                consolidate::IdleGapEvent {
+                    gap_secs: gap,
+                    censored: true,
+                },
+            );
+        }
         // FFD-derived gauges (`ffd_unplaced_cores`, `ffd_placeable_intents`)
         // need scheduler intents; live-derived gauges read only `live` +
         // `now`, both available here. Without this call, a scheduler

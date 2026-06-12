@@ -557,20 +557,29 @@ pub struct DeleteAttempt {
 /// observation of the claim terminating/absent classifies as
 /// [`VanishClass::SelfReap`] instead of Karpenter teardown evidence.
 ///
-/// Mutators (the `inflight_created` discipline, same shape):
-/// 1. [`stamp`](Self::stamp) — the callers fold
-///    [`ReapOutcome::delete_attempted`] in, stamped with the current
+/// Mutators (the `inflight_created` discipline, same shape — together
+/// they make every tombstone exit a CONSUMED consequence or a
+/// disclosed expiry, the `ctrl.pool.delete-outcome` consumer law):
+/// 1. [`stamp`](Self::stamp) — the callers fold BOTH lanes'
+///    `delete_attempted` packets in ([`ReapOutcome`] and
+///    `consolidate::ReapIdleOutcome`), stamped with the current
 ///    leader tick (re-stamping an existing name refreshes its TTL —
 ///    a repeated Err is a fresh ambiguous attempt).
 /// 2. [`remove`](Self::remove) — consumed on every vanish-fold exit
 ///    (`detect_vanished`), and by the callers for names a RETRIED
 ///    delete completed (`Ok`/404 → `reaped_claims` — the completed
 ///    reap's `record_reap` already applied the consequence).
-/// 3. [`prune_expired`](Self::prune_expired) — entries older than
-///    [`TOMBSTONE_TTL_TICKS`] drop (covers names that never re-enter
-///    the fold: claims outside `inflight_created` — prior-tenure or
-///    registered ones — and disconfirmed attempts).
-/// 4. `clear()` on the ACQUISITION EDGE (suppress polarity, the
+/// 3. [`sweep_registered_tombstones`] — consumed on every CONFIRMED
+///    registered-claim exit (terminating/absent observation of a
+///    name outside the vanish fold's population), applying the
+///    original reason's full consequence (bug_042: pre-sweep these
+///    tombstones had no consumer at all — the Dead-reap wedge
+///    eviction never fired and `reaped_total{reason=dead}`
+///    permanently undercounted).
+/// 4. [`prune_expired`](Self::prune_expired) — DISCONFIRMED entries
+///    older than [`TOMBSTONE_TTL_TICKS`] drop as a typed, DISCLOSED
+///    disposition (warn + expiry counter), never a silent prune.
+/// 5. `clear()` on the ACQUISITION EDGE (suppress polarity, the
 ///    `inflight_created` row's rationale: a stale previous-tenure
 ///    tombstone could suppress a genuine vanish ICE of a same-named
 ///    successor claim).
@@ -601,9 +610,34 @@ impl DeleteTombstones {
 
     /// Drop entries stamped more than [`TOMBSTONE_TTL_TICKS`] leader
     /// ticks ago. `wrapping_sub` matches the tick counter's wrap.
+    ///
+    /// Expiry is a TYPED, DISCLOSED disposition, never a silent prune
+    /// (`ctrl.pool.delete-outcome`, bug_042): with the vanish fold
+    /// consuming every in-flight exit and
+    /// [`sweep_registered_tombstones`] consuming every confirmed
+    /// registered exit each tick, an entry can only reach expiry
+    /// DISCONFIRMED — its claim was observed alive (the delete
+    /// provably had not committed) or was never re-observed at all.
+    /// Each drop warns with the attempt's reason and increments
+    /// `rio_controller_nodeclaim_tombstone_expired_total{reason}`.
     pub fn prune_expired(&mut self, now_tick: u64) {
-        self.entries
-            .retain(|_, a| now_tick.wrapping_sub(a.tick) <= TOMBSTONE_TTL_TICKS);
+        self.entries.retain(|name, a| {
+            let keep = now_tick.wrapping_sub(a.tick) <= TOMBSTONE_TTL_TICKS;
+            if !keep {
+                warn!(
+                    %name, reason = a.seed.reason.as_str(),
+                    "delete tombstone expired unconfirmed (disconfirmed or never \
+                     re-observed); dropping provenance — a later same-name \
+                     teardown is foreign evidence again"
+                );
+                metrics::counter!(
+                    "rio_controller_nodeclaim_tombstone_expired_total",
+                    "reason" => a.seed.reason.as_str(),
+                )
+                .increment(1);
+            }
+            keep
+        });
     }
 
     pub fn clear(&mut self) {
@@ -619,6 +653,98 @@ impl DeleteTombstones {
     pub fn contains(&self, name: &str) -> bool {
         self.entries.contains_key(name)
     }
+}
+
+/// One registered-tombstone sweep's applied consequences — the caller
+/// routes each half to its plane (evictions → the wedge stash, gaps →
+/// the cell's idle-gap ring, masks → the evidence buffer).
+#[derive(Debug, Default)]
+pub struct TombstoneSweep {
+    /// Cells masked by a confirmed `Ice`-reason tombstone (total over
+    /// the reason alphabet; unpopulated today — registered-claim reaps
+    /// are `Dead`/`Idle` — but the arm exists so a future
+    /// registered-ICE lane inherits the law, not a silent gap).
+    pub ice_cells: Vec<Cell>,
+    /// Backing-node names of confirmed reaps — the wedge tracker's
+    /// REQUIRED eviction feed (bug_042: this is the half whose loss
+    /// kept a dead node's expiry evidence wedge-admissible for the
+    /// ~60-90s finalizer window).
+    pub evicted_nodes: Vec<String>,
+    /// `(cell, gap_secs)` censored idle samples carried by confirmed
+    /// `Idle` tombstones — pushed through `consolidate::push_idle_gap`
+    /// by the caller (the lane's own ring).
+    pub censored_gaps: Vec<(Cell, f64)>,
+    /// Names whose tombstones confirmed this sweep (consumed; the
+    /// claims are registered, so no `inflight_created` cleanup rides
+    /// this list — it exists for observability and the unit census).
+    pub confirmed: Vec<String>,
+}
+
+/// The registered-claim tombstone consumer (bug_042, the
+/// `ctrl.pool.delete-outcome` consumer-census close): every tick,
+/// tombstones for names OUTSIDE the vanish fold's population
+/// (`inflight_created` — those are [`detect_vanished`]'s to consume)
+/// are matched against the live view. A tombstoned claim observed
+/// TERMINATING (`deletionTimestamp` set — the delete committed; the
+/// finalizer is draining) or ABSENT (committed and finalized between
+/// ticks) is this controller's own delete CONFIRMED — the sweep
+/// applies the original reason's FULL consequence through the SAME
+/// code path as the prompt arms ([`record_reap`]: counter under the
+/// original reason, mask iff `Ice`) plus the carried halves (the
+/// wedge eviction via the packet's `node_name`, the censored idle
+/// gap), and consumes the tombstone. A claim observed alive and not
+/// terminating keeps its tombstone armed (DISCONFIRMED so far — the
+/// reap lane retries while its conditions persist, and a completed
+/// retry consumes via the callers' `reaped_claims` loop).
+///
+/// Mis-attribution bound: within [`TOMBSTONE_TTL_TICKS`] of OUR
+/// delete attempt, an independent foreign teardown of the same claim
+/// would be counted as ours — the same bounded suppression window the
+/// TTL derivation prices for the vanish fold, and the consequence is
+/// safe under it (a terminating node's evidence is evicted exactly
+/// like fleet absence would evict it one window later).
+// r[impl ctrl.pool.delete-outcome]
+pub fn sweep_registered_tombstones(
+    tombstones: &mut DeleteTombstones,
+    inflight: &HashMap<String, Cell>,
+    live: &[LiveNode],
+) -> TombstoneSweep {
+    let live_by_name: HashMap<&str, &LiveNode> =
+        live.iter().map(|n| (n.name.as_str(), n)).collect();
+    let mut out = TombstoneSweep::default();
+    tombstones.entries.retain(|name, a| {
+        if inflight.contains_key(name) {
+            // The vanish fold's population — its exits consume these
+            // (one consumer per tombstone, partitioned by population).
+            return true;
+        }
+        let confirmed = match live_by_name.get(name.as_str()) {
+            None => true,
+            Some(n) if n.terminating() => true,
+            Some(_) => false,
+        };
+        if !confirmed {
+            return true;
+        }
+        debug!(
+            %name, reason = a.seed.reason.as_str(), cell = %a.seed.cell,
+            "registered NodeClaim's ambiguous delete confirmed \
+             (terminating/absent); applying the original reap consequence"
+        );
+        record_reap(
+            a.seed.reason,
+            a.seed.cell.clone(),
+            name,
+            &mut out.ice_cells,
+            &mut out.confirmed,
+        );
+        out.evicted_nodes.extend(a.seed.node_name.clone());
+        if let Some(gap) = a.seed.idle_gap_secs {
+            out.censored_gaps.push((a.seed.cell.clone(), gap));
+        }
+        false
+    });
+    out
 }
 
 /// One `reap_unhealthy` tick's outcome.
@@ -1144,11 +1270,165 @@ mod tests {
         assert!(inflight.contains_key("nc-x") && ts.contains("nc-x"));
 
         // Expiry: TTL ticks later the tombstone is gone; a subsequent
-        // absence is foreign evidence again (GcVanish → mask).
+        // absence is foreign evidence again (GcVanish → mask). The
+        // expiry is DISCLOSED: warn + the per-reason expiry counter
+        // (the typed disposition — never a silent prune).
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let _g = ::metrics::set_default_local_recorder(&rec);
         ts.prune_expired(10 + TOMBSTONE_TTL_TICKS + 1);
         assert!(!ts.contains("nc-x"), "expired past TTL");
+        // ppppp: snapshot exactly once.
+        let expired = rec
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(k, _, _, v)| {
+                let key = k.key();
+                (key.name() == "rio_controller_nodeclaim_tombstone_expired_total"
+                    && key
+                        .labels()
+                        .any(|l| l.key() == "reason" && l.value() == "boot-timeout"))
+                .then_some(v)
+            });
+        assert_eq!(
+            expired,
+            Some(metrics_util::debugging::DebugValue::Counter(1)),
+            "expiry is a typed, disclosed disposition (the per-reason counter)"
+        );
+        drop(_g);
         let ice = detect_vanished(&mut inflight, &mut ts, &[]);
         assert_eq!(ice, vec![h], "post-expiry absence is Karpenter evidence");
+    }
+
+    /// W11-AG unit face — the tombstone consumer census (R25: every
+    /// tombstone is consumed by an arm applying its reason's full
+    /// consequence, or expires disclosed — never a silent prune), as
+    /// a product walk over (fold-population × observation × reason):
+    ///
+    /// - name IN `inflight_created` → the sweep does NOT touch it
+    ///   (the vanish fold owns that population — one consumer per
+    ///   tombstone, partitioned by population);
+    /// - name OUTSIDE, observed TERMINATING or ABSENT → CONFIRMED:
+    ///   consumed + the reason's counter + the carried wedge eviction
+    ///   + the censored gap iff the packet carries one + mask iff the
+    ///   reason is `Ice`;
+    /// - name OUTSIDE, observed alive non-terminating → DISCONFIRMED:
+    ///   kept armed, zero consequence.
+    ///
+    /// The reason axis derives from `ReapReason::ALL` (the pinned
+    /// alphabet) so a new reason letter joins this census or fails to
+    /// compile out of `ALL`.
+    // r[verify ctrl.pool.delete-outcome]
+    #[test]
+    fn registered_tombstone_sweep_census_over_the_exit_product() {
+        use super::super::ffd::tests::set_terminating;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Obs {
+            Absent,
+            Terminating,
+            Alive,
+        }
+        let h = Cell("h".into(), CapacityType::Spot);
+        for in_fold_population in [false, true] {
+            for obs in [Obs::Absent, Obs::Terminating, Obs::Alive] {
+                for reason in ReapReason::ALL {
+                    let row = (in_fold_population, obs, reason);
+                    let mut ts = DeleteTombstones::default();
+                    ts.stamp(
+                        AmbiguousDelete {
+                            name: "nc-x".into(),
+                            reason,
+                            cell: h.clone(),
+                            node_name: Some("node-x".into()),
+                            idle_gap_secs: (reason == ReapReason::Idle).then_some(7.5),
+                        },
+                        1,
+                    );
+                    let inflight: HashMap<String, Cell> = if in_fold_population {
+                        [("nc-x".to_string(), h.clone())].into()
+                    } else {
+                        HashMap::new()
+                    };
+                    let live = match obs {
+                        Obs::Absent => vec![],
+                        Obs::Terminating => {
+                            let mut n = node("nc-x", "h", CapacityType::Spot, 8, 0, 0);
+                            n.registered = true;
+                            vec![set_terminating(n)]
+                        }
+                        Obs::Alive => {
+                            let mut n = node("nc-x", "h", CapacityType::Spot, 8, 0, 0);
+                            n.registered = true;
+                            vec![n]
+                        }
+                    };
+                    let rec = DebuggingRecorder::new();
+                    let _g = ::metrics::set_default_local_recorder(&rec);
+                    let swept = sweep_registered_tombstones(&mut ts, &inflight, &live);
+                    drop(_g);
+                    let confirmed =
+                        !in_fold_population && matches!(obs, Obs::Absent | Obs::Terminating);
+                    assert_eq!(
+                        ts.contains("nc-x"),
+                        !confirmed,
+                        "consumed iff confirmed for {row:?}"
+                    );
+                    assert_eq!(
+                        swept.confirmed,
+                        if confirmed {
+                            vec!["nc-x".to_string()]
+                        } else {
+                            vec![]
+                        },
+                        "confirm list for {row:?}"
+                    );
+                    assert_eq!(
+                        swept.evicted_nodes,
+                        if confirmed {
+                            vec!["node-x".to_string()]
+                        } else {
+                            vec![]
+                        },
+                        "the wedge-eviction half fires iff confirmed for {row:?}"
+                    );
+                    assert_eq!(
+                        swept.censored_gaps,
+                        if confirmed && reason == ReapReason::Idle {
+                            vec![(h.clone(), 7.5)]
+                        } else {
+                            vec![]
+                        },
+                        "the censored-gap half rides the packet for {row:?}"
+                    );
+                    assert_eq!(
+                        !swept.ice_cells.is_empty(),
+                        confirmed && reason == ReapReason::Ice,
+                        "mask iff Ice (alphabet-total arm) for {row:?}"
+                    );
+                    // ppppp: snapshot exactly once.
+                    let counted = rec
+                        .snapshotter()
+                        .snapshot()
+                        .into_vec()
+                        .into_iter()
+                        .find_map(|(k, _, _, v)| {
+                            let key = k.key();
+                            (key.name() == "rio_controller_nodeclaim_reaped_total"
+                                && key
+                                    .labels()
+                                    .any(|l| l.key() == "reason" && l.value() == reason.as_str()))
+                            .then_some(v)
+                        });
+                    assert_eq!(
+                        counted,
+                        confirmed.then_some(DebugValue::Counter(1)),
+                        "the original reason's counter fires iff confirmed for {row:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// R15 vanish-path census, widened by bug_094 (R22: the pre-fix

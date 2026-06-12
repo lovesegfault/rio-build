@@ -171,6 +171,17 @@ fn nc_json_boot_stuck_terminating(name: &str, created: u64) -> Value {
     v
 }
 
+/// REGISTERED NodeClaim observed mid-teardown (`deletionTimestamp`
+/// set, the ~60-90s Karpenter finalizer draining) — the W11-AG
+/// ambiguous-commit window for registered-claim reaps (Dead/idle):
+/// the controller's earlier DELETE errored but committed server-side.
+fn nc_json_registered_terminating(name: &str, created: u64, registered_at: u64) -> Value {
+    let mut v = nc_json(name, created, Some(registered_at));
+    v["metadata"]["deletionTimestamp"] = json!(rfc3339(created + 35));
+    v["metadata"]["finalizers"] = json!(["karpenter.sh/termination"]);
+    v
+}
+
 /// In-flight NodeClaim carrying `Launched=False reason=LaunchFailed` —
 /// [`health::classify`] short-circuits this to an ICE reap with no age
 /// gate (the deterministic reap shape).
@@ -1202,6 +1213,115 @@ async fn wedge_evidence_survives_acquire() {
     )
     .await;
     assert_eq!(lab.r.tick_counter, tc0 + 2, "tick_counter leader-monotonic");
+}
+
+/// W11-AG (bug_042 — the tombstone-consumer half of
+/// `ctrl.pool.delete-outcome`): a Dead reap whose DELETE errs non-404
+/// but committed server-side tombstones the attempt (W9-BB plane) —
+/// and because the claim is REGISTERED, the vanish fold (which only
+/// consumes `inflight_created` exits) never consults it. Pre-fix the
+/// tombstone expired UNCONSUMED: the REQUIRED `reaped_nodes` wedge
+/// eviction never fired (the dead node's expiry evidence stayed
+/// wedge-admissible the whole ~60-90s finalizer window —
+/// `registered_fleet` has no terminating exclusion) and
+/// `reaped_total{reason=dead}` permanently undercounted. Post-fix the
+/// registered-tombstone sweep matches the terminating observation and
+/// applies the FULL original consequence within the window.
+// r[verify ctrl.pool.delete-outcome]
+#[test]
+fn err_committed_dead_reap_consequence_fires_within_finalizer_window() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let mut lab = rt.block_on(Lab::new());
+    let attempt = |intent: &str| OpenAttempt {
+        intent_id: intent.into(),
+        source_node: "node-c-w".into(),
+        deadline_secs: 60,
+        assigned_at_age_secs: 120,
+        attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+        ..Default::default()
+    };
+    let claim = nc_json("c-w", 0, Some(1));
+
+    // Tick 1: one expiry anchors (below the cluster threshold).
+    lab.set_open_attempts(vec![attempt("drv-a")]);
+    rt.block_on(lab.tick(0, full_tick_scenario(vec![], vec![claim.clone()], vec![])));
+
+    // Tick 2: the pair completes → classify(Dead) → the DELETE errs
+    // 503 AFTER the apiserver committed it → tombstone (Dead, with
+    // the backing node carried in the consequence packet).
+    lab.set_open_attempts(vec![attempt("drv-a"), attempt("drv-b")]);
+    rt.block_on(lab.tick(
+        30,
+        full_tick_scenario(
+            vec![],
+            vec![claim],
+            vec![Scenario::k8s_error(
+                Method::DELETE,
+                "/apis/karpenter.sh/v1/nodeclaims/c-w",
+                503,
+                "ServiceUnavailable",
+                "etcd leader changed",
+            )],
+        ),
+    ));
+    assert!(
+        lab.r.delete_tombstones.contains("c-w"),
+        "the ambiguous Dead attempt's provenance survives the tick"
+    );
+    assert!(
+        lab.r.pending_wedge_evictions.is_empty(),
+        "no consequence before confirmation"
+    );
+
+    // Tick 3: the commit materialized — the claim is observed
+    // REGISTERED + terminating (the ~60-90s finalizer). classify
+    // skips terminating claims and the vanish fold never consults
+    // registered names: ONLY the registered-tombstone sweep can
+    // adjudicate this observation.
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        rt.block_on(lab.tick(
+            40,
+            full_tick_scenario(
+                vec![],
+                vec![nc_json_registered_terminating("c-w", 0, 1)],
+                vec![],
+            ),
+        ));
+    });
+
+    assert!(
+        lab.r.pending_wedge_evictions.contains("node-c-w"),
+        "the REQUIRED wedge eviction fires within the finalizer window \
+         (bug_042 red: the tombstone expired unconsumed and the dead \
+         node's evidence stayed admissible): {:?}",
+        lab.r.pending_wedge_evictions
+    );
+    // ppppp: snapshot exactly once.
+    let snap = snapshotter.snapshot().into_vec();
+    let dead_count = snap.into_iter().find_map(|(k, _, _, v)| {
+        let key = k.key();
+        (key.name() == "rio_controller_nodeclaim_reaped_total"
+            && key
+                .labels()
+                .any(|l| l.key() == "reason" && l.value() == "dead"))
+        .then_some(v)
+    });
+    assert_eq!(
+        dead_count,
+        Some(DebugValue::Counter(1)),
+        "reaped_total{{reason=dead}} counts the confirmed reap \
+         (bug_042 red: the permanent undercount)"
+    );
+    assert!(
+        lab.r.delete_tombstones.is_empty(),
+        "the confirmed exit consumed the tombstone"
+    );
 }
 
 /// R10 (r43 bug_023 close): consolidate-only runs the SHARED kube-only

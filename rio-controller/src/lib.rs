@@ -296,7 +296,25 @@ pub fn describe_metrics() {
          clustering over the open-attempt view; \
          reason=vanished: in-flight claim Karpenter-GC'd or torn down \
          between ticks WITHOUT launch evidence and WITHOUT this \
-         controller's own delete provenance (counts as ICE evidence)."
+         controller's own delete provenance (counts as ICE evidence). \
+         Confirmed-late entries (any reason) are the tombstone \
+         consumers: the vanish fold for in-flight claims, the \
+         registered-tombstone sweep for Dead/Idle ones — every \
+         ambiguous delete either lands here under its original reason \
+         or surfaces in nodeclaim_tombstone_expired_total, never \
+         neither."
+    );
+    describe_counter!(
+        "rio_controller_nodeclaim_tombstone_expired_total",
+        "Ambiguous-delete tombstones dropped UNCONFIRMED after the \
+         provenance TTL, by original reap `reason` — the typed expiry \
+         disposition of the delete-outcome law (an expiring entry's \
+         claim was observed alive, i.e. the errored delete provably \
+         had not committed, or was never re-observed). Sustained rate \
+         > 0 alongside apiserver delete errors = deletes erring \
+         without committing (retry loop working as designed); \
+         non-zero WITHOUT a matching reap-retry pattern = a tombstone \
+         consumer gap — see ctrl.pool.delete-outcome."
     );
     describe_counter!(
         "rio_controller_node_wedge_marked_total",

@@ -36,7 +36,8 @@ pub struct SeededSeries {
 }
 
 /// `rio_controller_nodeclaim_reaped_total`'s closed `reason` set
-/// (health::ReapReason::as_str ∪ the vanished/idle emit sites).
+/// (health::ReapReason::as_str ∪ the vanished emit site — `idle`
+/// joined the enum with bug_112's lane re-type).
 pub const REAP_REASONS: &[&str] = &["ice", "boot-timeout", "dead", "vanished", "idle"];
 
 /// `rio_controller_nodeclaim_intent_dropped_total`'s closed `reason`
