@@ -1670,9 +1670,11 @@ async fn test_store_degraded_infra_uncharged_waits_out_the_outage() -> TestResul
 }
 
 /// W10-CM (live_057-b, the consumer arm — the cross-crate cell):
-/// a worker report whose error_msg carries rio_proto::DISK_FULL_MSG
-/// (the builder's quota-attributed DiskFull Display, the contract
-/// const both sides reference) doubles the DISK resource floor —
+/// a worker report carrying the TYPED
+/// FailureClassification{DiskFull, quota} field (its error_msg
+/// narration carries rio_proto::DISK_FULL_MSG — DISPLAY/NARRATION
+/// ONLY, merged_bug_100: the substring drives nothing) doubles the
+/// DISK resource floor —
 /// the parked EvictedDiskPressure arm's first live producer. The
 /// ladder algebra itself is NOT touched (the floor.rs unit pins
 /// stand); this drives the production intake path end-to-end:

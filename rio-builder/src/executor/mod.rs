@@ -234,13 +234,19 @@ pub enum ExecutorError {
     /// limit while the node fs had headroom (live_057-a — in-build
     /// ENOSPC; FUSE deliberately surfaces StorageFull as ENOSPC).
     /// The derivation isn't broken — this builder's DISK is
-    /// undersized: maps to `InfrastructureFailure` so the scheduler
-    /// bumps the drv's disk `resource_floor` (the [`Self::CgroupOom`]
-    /// twin; classification predicate at
-    /// [`crate::quota::classify_quota_exhaustion`], thresholds
-    /// R17-typed beside it). Display pinned to
-    /// `rio_proto::DISK_FULL_MSG` (the cross-crate floor-bump
-    /// contract; `disk_full_display_contains_proto_constant`).
+    /// undersized: maps to `InfrastructureFailure`, and the report
+    /// carries the TYPED `FailureClassification{DiskFull, quota}`
+    /// field — the ONLY channel the scheduler's floor gate consumes
+    /// (bug_090/bug_102: the scheduler band-corroborates the typed
+    /// claim against its assigned shape and bumps the disk
+    /// `resource_floor`; the [`Self::CgroupOom`] twin; classification
+    /// predicate at [`crate::quota::classify_quota_exhaustion`],
+    /// thresholds R17-typed beside it). Display pinned to
+    /// `rio_proto::DISK_FULL_MSG` for STABLE OPERATOR NARRATION only
+    /// (DISPLAY/NARRATION ONLY per the rio-proto const docs — free
+    /// text drives no floor decision;
+    /// `disk_full_display_contains_proto_constant` pins the wording,
+    /// not a trust contract).
     #[error("disk full during build (overlay prjquota exhausted); bumping disk floor")]
     DiskFull,
     /// The derivation's FOD-ness does not match this executor kind.
@@ -1861,13 +1867,16 @@ fn footer_result_str(
 mod tests {
     use super::*;
 
-    /// Contract pin: rio-scheduler `handle_infrastructure_failure`
-    /// matches `error_msg.contains(rio_proto::CGROUP_OOM_MSG)` to
-    /// trigger `r[sched.sla.reactive-floor]`. thiserror's `#[error]`
-    /// attr can't reference a `const` without const-format, so this
-    /// test is the cross-crate drift guard — rewording the Display
-    /// string at line ~179 fails HERE instead of silently disabling
-    /// the floor-bump in production.
+    /// Display pin, RE-JUSTIFIED (merged_bug_100): the scheduler
+    /// consumes the TYPED `failure_classification` field — it never
+    /// matches `error_msg` substrings (the substring-trust contract
+    /// is RETIRED; `rio_proto::CGROUP_OOM_MSG` is DISPLAY/NARRATION
+    /// ONLY per its const doc). This pin guards STABLE OPERATOR
+    /// NARRATION: logs, events, and dashboards key on the canonical
+    /// wording, and thiserror's `#[error]` attr can't reference a
+    /// `const` without const-format — rewording the Display string
+    /// at line ~179 fails HERE instead of silently forking the
+    /// operator-facing message from the shared const.
     /// W10-CM (live_057-a, the seam matrix): the result seam
     /// reclassifies a failed build to DiskFull exactly when the
     /// quota predicate holds. Pre-fix red (the identity seam — NO
@@ -2174,9 +2183,12 @@ mod tests {
         }
     }
 
-    /// W10-CN: contract pin — rio-scheduler matches
-    /// `error_msg.contains(rio_proto::DISK_FULL_MSG)` to bump the
-    /// disk floor; the Display side is pinned here (the
+    /// W10-CN, RE-JUSTIFIED (merged_bug_100): the Display pin for the
+    /// disk axis — STABLE OPERATOR NARRATION, not a trust contract
+    /// (the scheduler's floor gate consumes the TYPED
+    /// `FailureClassification{DiskFull, quota}` field and
+    /// band-corroborates it; `rio_proto::DISK_FULL_MSG` is
+    /// DISPLAY/NARRATION ONLY — the
     /// `cgroup_oom_display_contains_proto_constant` mirror).
     #[test]
     fn disk_full_display_contains_proto_constant() {

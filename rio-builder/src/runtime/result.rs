@@ -662,10 +662,13 @@ mod tests {
         );
     }
 
-    /// W10-CM (the report cell): `DiskFull` assembles
-    /// InfrastructureFailure with the pinned DISK_FULL_MSG substring
-    /// and carries the peaks — the report the scheduler's floor-bump
-    /// arm matches on (the CgroupOom twin, live_057-a).
+    /// W10-CM (the report cell), RE-JUSTIFIED (merged_bug_100):
+    /// `DiskFull` assembles InfrastructureFailure carrying the TYPED
+    /// `FailureClassification{DiskFull, quota}` field — the only
+    /// channel the scheduler's floor gate consumes — plus the peaks;
+    /// the DISK_FULL_MSG substring in the narration is
+    /// DISPLAY/NARRATION ONLY (stable operator wording, the CgroupOom
+    /// twin, live_057-a).
     #[test]
     fn err_completion_disk_full_is_infra_with_pinned_msg() {
         let r = err_completion(

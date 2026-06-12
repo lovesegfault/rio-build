@@ -97,11 +97,15 @@ pub fn bump_floor_or_count(
             mem_solve_cap(ceil),
         ),
         // LIVE with exactly ONE producer (live_057-b): the worker
-        // quota-attributed DiskFull lane — completion.rs matches
-        // `rio_proto::DISK_FULL_MSG` on an InfrastructureFailure
-        // report and calls `bump_resource_floor(EvictedDiskPressure,
-        // "disk_full")`; precise by construction at the prjquota seam
-        // (`apply_disk_override` — the prjquota-vs-statvfs
+        // quota-attributed DiskFull lane — completion.rs consumes the
+        // TYPED `failure_classification` wire field (FailureClass::
+        // DiskFull + QuotaTelemetry; `rio_proto::DISK_FULL_MSG` is
+        // DISPLAY/NARRATION ONLY — merged_bug_100: free text drives
+        // nothing), band-corroborates it against the assigned shape
+        // (`CorroborationWitness::corroborated_sizing`), and bumps
+        // through the witness-demanding chokepoint with the
+        // `disk_full` label; precise by construction at the prjquota
+        // seam (`apply_disk_override` — the prjquota-vs-statvfs
         // classification at result assembly), with the worker's
         // once-per-attempt assignment-token dedup — exactly the
         // re-entry lane the parked-era note named. Witnessed
