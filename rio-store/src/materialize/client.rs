@@ -680,9 +680,10 @@ const _: () = assert!(
 /// budget — a bounded stuck set can no longer absorb the mint budget.
 /// Witness: `stuck_head_cannot_absorb_the_fresh_mint_budget`.
 ///
-/// Value derivation: ≥ the scheduler's moot-sweep cadence (1s tick)
-/// + the listing snapshot TTL (1s) with two orders of headroom for
-/// the congested-tick regime (live_053's 134.65s tick) — a healthy
+/// Value derivation: at least the scheduler's moot-sweep cadence
+/// (1s tick) plus the listing snapshot TTL (1s), with two orders of
+/// headroom for the congested-tick regime (live_053's 134.65s tick)
+/// — a healthy
 /// scheduler resolves a Gone-answering row within ~2s, so a job
 /// STILL listed after 60s is either a brand-new job under the same
 /// hash (different job_id — the cooldown keys on job_id, so it is

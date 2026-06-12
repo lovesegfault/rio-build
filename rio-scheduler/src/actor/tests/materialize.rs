@@ -11445,8 +11445,6 @@ async fn listing_excludes_in_memory_terminal_nodes() -> TestResult {
 async fn node_completed_by_other_means_resolves_obsolete() -> TestResult {
     use metrics_util::debugging::DebuggingRecorder;
 
-    use crate::sla::metrics::counter_map_by;
-
     let rec = DebuggingRecorder::new();
     let snap = rec.snapshotter();
     rec.install().expect("install global debugging recorder");
@@ -11567,7 +11565,6 @@ async fn node_completed_by_other_means_resolves_obsolete() -> TestResult {
         0,
         "the by-other-means face no longer launders into 'cancelled': {by_outcome:?}"
     );
-    let _ = counter_map_by; // counter_map_by snapshots internally; unused here by (ppppp).
     Ok(())
 }
 
