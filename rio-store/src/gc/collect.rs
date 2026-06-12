@@ -33,8 +33,9 @@
 //! # Capped collect
 //!
 //! The live arm collects at most [`COLLECT_CYCLE_VICTIM_CAP`] victims
-//! per cycle and carries a process-local keyset cursor across cycles
-//! (durable in `gc_collect_state.cursor`, migration 090) so a backlog drains across cycles instead of
+//! per cycle and carries a durable keyset cursor across cycles
+//! (`gc_collect_state.cursor`, migration 090; the process-local
+//! static it replaced is the retired pre-090 defect) so a backlog drains across cycles instead of
 //! stretching one cycle past the GC-lock-held budget. A cycle that
 //! stops at the cap leaves the remainder for the next cycle (the next
 //! GC run's phase 3 or the daily backstop); stopping early only
@@ -4883,10 +4884,11 @@ mod tests {
     }
 
     // r[verify store.gc.chunk-collect]
-    /// Cursor loss is harmless: a cap stop followed by a simulated
-    /// restart (process-local cursor lost) still drains the remainder
-    /// on the next cycle — the candidate scan's `deleted = FALSE`
-    /// conjunct skips the already-collected prefix.
+    /// Cursor loss is harmless: a cap stop followed by a wiped
+    /// durable row (simulating a lost `gc_collect_state.cursor`)
+    /// still drains the remainder on the next cycle — the candidate
+    /// scan's `deleted = FALSE` conjunct skips the already-collected
+    /// prefix.
     #[tokio::test]
     async fn live_cycle_cap_stop_survives_cursor_loss() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -4908,7 +4910,7 @@ mod tests {
         .expect("capped cycle");
         assert!(first.cap_reached);
 
-        // Simulated restart: the process-local cursor is gone.
+        // Simulate cursor loss: wipe the durable row.
         reset_collector_state(&db.pool).await;
 
         let second = collect_cycle(

@@ -1513,7 +1513,8 @@ restated as facts of the landed tree):
   and the grace conjunct in its own WHERE — the shape the
   writer-bounded HOLDS verdict is stated against (the T-1a.8
   consequence in the encoding notes above). The cap and cursor follow
-  P15: `COLLECT_CYCLE_VICTIM_CAP` per cycle, process-local cursor,
+  P15: `COLLECT_CYCLE_VICTIM_CAP` per cycle, durable row cursor
+  (`gc_collect_state.cursor`, migration 090; process-local pre-090),
   no would-collect anti-join in live cycles, backlog gauge as a
   decremental estimate, capped cycles counted. Fail-closed validation
   aborts the whole cycle before any batch runs. A dry-run GC keeps
