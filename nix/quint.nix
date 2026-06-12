@@ -4855,7 +4855,7 @@ rec {
     # decay serves it the same tick); the live-import as-built twin
     # (DECAY_ENABLED=false) FALSIFIES the same proposition — the
     # bug_151 absorbing trace, machine-found (P7 pairing).
-    # r[verify ctrl.pool.respawn-backoff+3]
+    # r[verify ctrl.pool.respawn-backoff+4]
     quint-respawn-giveup = mkQuintCheck {
       name = "respawn-giveup";
       spec = "nodeclaimLifecycle";
@@ -4880,7 +4880,7 @@ rec {
     # encoding (expect-violation on the negated effect — an exit edge
     # that exists but is unreachable from inside the latch would pass
     # the holds check vacuously; this witness pins it live).
-    # r[verify ctrl.pool.respawn-backoff+3]
+    # r[verify ctrl.pool.respawn-backoff+4]
     quint-respawn-giveup-decay-reachable = mkQuintWitnessCheck {
       name = "respawn-giveup-decay-reachable";
       spec = "nodeclaimLifecycle";
@@ -4889,13 +4889,38 @@ rec {
     };
     # The deterministic W11-BE trace: give-up → resubmission decays and
     # spawns the same tick → fresh deaths re-latch at the FULL budget →
-    # the re-latched epoch holds (no self-decay).
-    # r[verify ctrl.pool.respawn-backoff+3]
+    # the re-latched epoch holds (no self-decay). Round-12
+    # (merged_bug_043) adds the green rewind twin: the
+    # ClearPoison-rewound epoch decays under the change-keyed guard
+    # and the equal-epoch re-presentation latches (anti-replay).
+    # r[verify ctrl.pool.respawn-backoff+4]
     quint-respawn-giveup-relatch-run = mkQuintRunCheck {
       name = "respawn-giveup-relatch-run";
       spec = "nodeclaimLifecycle";
       main = "respawnGiveUp";
-      match = "relatchTrace";
+      match = "relatchTrace|w12apRewindDecaysGreen";
+    };
+    # Round-12 merged_bug_043 falsify twin: the round-11 ORDER-KEYED
+    # decay guard (envCycle > recCycle) leaves the exit edge VACUOUS
+    # for the post-ClearPoison REWOUND orbit — freshEpochServed is
+    # violated (the epoch is a demand signal, not a monotone counter;
+    # two scheduler lanes lawfully rewind it to zero).
+    # r[verify ctrl.pool.respawn-backoff+4]
+    quint-respawn-giveup-orderkeyed = mkQuintWitnessCheck {
+      name = "respawn-giveup-orderkeyed";
+      spec = "nodeclaimLifecycle";
+      main = "respawnGiveUpOrderKeyed";
+      witness = "freshEpochServed";
+    };
+    # The deterministic rewind-starvation reproducer pinned as a named
+    # run (the W12-AP trace: latch at cycle 1 → ClearPoison rewinds to
+    # 0 → the order-keyed guard absorbs — starved, no decay).
+    # r[verify ctrl.pool.respawn-backoff+4]
+    quint-respawn-giveup-rewind-red-run = mkQuintRunCheck {
+      name = "respawn-giveup-rewind-red-run";
+      spec = "nodeclaimLifecycle";
+      main = "respawnGiveUpOrderKeyed";
+      match = "w12apRewindStarvedRed";
     };
 
     # ---- Controller Stage-C calibration witnesses --------------------

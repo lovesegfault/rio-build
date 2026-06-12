@@ -2426,6 +2426,11 @@ module respawnGiveUpCore {
   /// The fix flag: the demand-seam decay arm exists (true = landed
   /// tree; false = the pre-fix absorbing-state encoding).
   const DECAY_ENABLED: bool
+  /// Round-12 merged_bug_043: the decay guard keys on epoch CHANGE
+  /// (true = the landed change-keyed law; false = the round-11
+  /// order-keyed `>` encoding, whose exit edge is vacuous for the
+  /// REWOUND orbit — ClearPoison zeroes resubmit_cycle).
+  const CHANGE_KEYED: bool
   /// RESPAWN_GIVE_UP_DEATHS, scaled for the explored space.
   const GIVE_UP: int
   /// Bound on the scheduler's resubmit cycle.
@@ -2434,9 +2439,10 @@ module respawnGiveUpCore {
   type GiveUpEffect =
     | EGaveUpDecay
     | ESpawn
-  // VFreshEpochStarved: a latched record observed a strictly newer
-  // demand epoch and the intent was still withheld that tick — the
-  // starved resubmission (the bug_151 absorbing state, live).
+  // VFreshEpochStarved: a latched record observed a CHANGED demand
+  // epoch (newer or rewound — merged_bug_043) and the intent was
+  // still withheld that tick — the starved demand signal (the
+  // bug_151 absorbing state / the round-12 rewind orbit, live).
   type GiveUpViolation =
     | VFreshEpochStarved
 
@@ -2469,13 +2475,20 @@ module respawnGiveUpCore {
   action tickWith(dies: bool): bool = all {
     intentPresent,
     val hasRecord = recDeaths > 0
-    val freshEpoch = hasRecord and recCycle >= 0 and envCycle > recCycle
-    val decays = DECAY_ENABLED and latched(recDeaths) and freshEpoch
-    val starved = not(DECAY_ENABLED) and latched(recDeaths) and freshEpoch
+    // The demand-signal TRUTH: any changed epoch (newer or rewound)
+    // is the operator's intent signal (merged_bug_043).
+    val epochChangedSignal = hasRecord and recCycle >= 0 and envCycle != recCycle
+    // The encoding under test: change-keyed (landed) or order-keyed
+    // (the round-11 guard, vacuous on the rewound orbit).
+    val epochGuardFires = hasRecord and recCycle >= 0 and
+      (if (CHANGE_KEYED) envCycle != recCycle else envCycle > recCycle)
+    val decays = DECAY_ENABLED and latched(recDeaths) and epochGuardFires
+    val starved = latched(recDeaths) and epochChangedSignal and not(decays)
     val midDeaths = if (decays) 0 else recDeaths
     val midCycle =
       if (decays) -1
-      else if (hasRecord and envCycle > recCycle) envCycle
+      else if (hasRecord and (if (CHANGE_KEYED) envCycle != recCycle else envCycle > recCycle))
+        envCycle
       else recCycle
     val spawns = not(latched(midDeaths))
     all {
@@ -2536,17 +2549,36 @@ module respawnGiveUpCore {
     giveUpEffects' = giveUpEffects,
   }
 
+  /// Round-12 merged_bug_043: the documented OPERATOR RECOVERY —
+  /// ClearPoison zeroes `resubmit_cycle` (completion.rs), the
+  /// reprobe lane mirrors the zero, and the fresh DAG re-insert
+  /// starts at cycle 0: demand returns with a REWOUND epoch. The
+  /// epoch is a demand signal, not a monotone counter — two
+  /// scheduler lanes lawfully rewind it.
+  action clearPoisonRewind = all {
+    not(intentPresent),
+    envCycle > 0,
+    envCycle' = 0,
+    intentPresent' = true,
+    recDeaths' = recDeaths,
+    recCycle' = recCycle,
+    giveUpViolations' = giveUpViolations,
+    giveUpEffects' = giveUpEffects,
+  }
+
   action step = any {
     tickWith(true),
     tickWith(false),
     tickAbsent,
     deadlineExpires,
     resubmit,
+    clearPoisonRewind,
   }
 
-  /// HOLDS (fixed tree): no tick ever leaves a strictly-newer demand
-  /// epoch withheld by a latched record — the resubmission is served
-  /// (decayed and spawned) the same tick it is observed.
+  /// HOLDS (fixed tree): no tick ever leaves a CHANGED demand epoch
+  /// (newer or REWOUND — merged_bug_043) withheld by a latched
+  /// record — the demand signal is served (decayed and spawned) the
+  /// same tick it is observed.
   val freshEpochServed = not(giveUpViolations.contains(VFreshEpochStarved))
 
   /// Bounds (vacuity-exempt class boundsOK).
@@ -2572,6 +2604,7 @@ module respawnGiveUpCore {
 module respawnGiveUp {
   import respawnGiveUpCore(
     DECAY_ENABLED = true,
+    CHANGE_KEYED = true,
     GIVE_UP = 2,
     MAX_CYCLE = 2
   ).*
@@ -2590,6 +2623,24 @@ module respawnGiveUp {
       .expect(recDeaths == 2)
       .then(tickWith(false))     // re-latched epoch holds: no decay at its own epoch
       .expect(freshEpochServed)
+
+  /// Round-12 merged_bug_043 green twin: the same ClearPoison-rewind
+  /// schedule under the change-keyed guard — the REWOUND epoch
+  /// decays the latch and the spawn goes out the same tick; the
+  /// re-presented equal epoch latches (anti-replay, W12-AP2).
+  run w12apRewindDecaysGreen =
+    init
+      .then(deadlineExpires)
+      .then(resubmit)            // envCycle=1
+      .then(tickWith(true))      // death 1 (record minted, cycle None)
+      .then(tickWith(true))      // seam sets cycle=1; death 2: latched
+      .then(deadlineExpires)
+      .then(clearPoisonRewind)   // demand returns at cycle 0 (REWOUND)
+      .then(tickWith(false))     // change-keyed: 0 != 1 — DECAY + spawn
+      .expect(giveUpEffects.contains(EGaveUpDecay))
+      .expect(freshEpochServed)
+      .then(tickWith(false))     // equal epoch (0 == 0... record gone; no-op spawn lane)
+      .expect(freshEpochServed)
 }
 
 /// The pre-fix encoding (live-import falsify twin): no decay arm —
@@ -2598,7 +2649,36 @@ module respawnGiveUp {
 module respawnGiveUpAsBuilt {
   import respawnGiveUpCore(
     DECAY_ENABLED = false,
+    CHANGE_KEYED = false,
     GIVE_UP = 2,
     MAX_CYCLE = 2
   ).*
+}
+
+/// Round-12 merged_bug_043 falsify twin: the round-11 ORDER-KEYED
+/// guard (`envCycle > recCycle`) with the decay arm present — the
+/// exit edge is vacuous for exactly the post-ClearPoison REWOUND
+/// orbit: the latched record observes cycle 0 < latched 1, the
+/// `Some(_)` fallthrough absorbs it, and the documented operator
+/// recovery never unblocks the spawn (VFreshEpochStarved — the
+/// deterministic w12apRewindStarvedRed trace).
+module respawnGiveUpOrderKeyed {
+  import respawnGiveUpCore(
+    DECAY_ENABLED = true,
+    CHANGE_KEYED = false,
+    GIVE_UP = 2,
+    MAX_CYCLE = 2
+  ).*
+
+  run w12apRewindStarvedRed =
+    init
+      .then(deadlineExpires)
+      .then(resubmit)            // envCycle=1: the drv was once resubmitted
+      .then(tickWith(true))      // death 1 (record minted, cycle None)
+      .then(tickWith(true))      // seam sets cycle=1; death 2 == GIVE_UP: latched
+      .then(deadlineExpires)
+      .then(clearPoisonRewind)   // ClearPoison: demand returns at cycle 0 (REWOUND)
+      .then(tickWith(false))     // order-keyed guard: 0 > 1 false — ABSORBED
+      .expect(giveUpViolations.contains(VFreshEpochStarved))
+      .expect(not(giveUpEffects.contains(EGaveUpDecay)))
 }

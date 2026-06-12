@@ -368,15 +368,21 @@ or terminal event, and the reachability witness — under the doctrine above
   required pod/attempt evidence the latch itself forbids (gave-up partitions
   spawnable; no pod ever exists to mint from) --- an absorbing state minted
   by two individually-sound rules. Exit edge: the fresh-demand-epoch decay
-  --- a wanted intent presenting a strictly newer `resubmit_cycle` than the
-  record last observed decays it at the demand seam (the one lane the latch
-  does not gate) under the typed `GaveUpReset` receipt; deaths under the new
-  epoch re-latch at the full budget
-  (#rref("ctrl.pool.respawn-backoff")). Reachability witnessed end-to-end
-  through the production fold (give-up, then resubmission, then a same-tick
-  spawn) with the quint twin pair pinning both faces (the as-built module
-  falsifies the liveness; the fixed module holds it with the re-latch
-  safety).
+  --- a wanted intent presenting a CHANGED `resubmit_cycle` (newer or
+  REWOUND --- merged_bug_043, round-12: ClearPoison zeroes the cycle and
+  the fresh DAG re-insert starts at 0, so the documented operator recovery
+  presents as a rewind; the round-11 order-keyed guard absorbed exactly
+  that population, leaving the exit edge vacuous until controller restart)
+  decays it at the demand seam (the one lane the latch does not gate)
+  under the typed `GaveUpReset` receipt; equality alone latches
+  (anti-replay); deaths under the changed epoch re-latch at the full
+  budget (#rref("ctrl.pool.respawn-backoff")). Reachability witnessed
+  end-to-end through the production fold (give-up, then resubmission,
+  then a same-tick spawn; the rewound face through the same feeder ---
+  W12-AP) with the quint twin pairs pinning all faces (the as-built
+  module falsifies the liveness; the order-keyed module falsifies the
+  rewind face; the fixed change-keyed module holds both with the
+  re-latch and anti-replay safety).
 
 - *Ack-plane whole-request refusal (scheduler)*: the `AckSpawnedIntents`
   whole-request refusal composed with the controller's durable Job-template
