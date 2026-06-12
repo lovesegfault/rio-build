@@ -1879,9 +1879,21 @@ enum RoundEdge {
     LoseObservedAbsent { write_in_doubt: bool },
     /// A believing renew 409 deferring one round (the Q3 deferral).
     Defer,
-    /// Standby steady state (or a 409 racing a steal — never led):
-    /// the round resolved not-leading.
+    /// Standby steady state (a completed round resolving not-leading —
+    /// direct holder evidence, or an absence with provably nothing of
+    /// ours in doubt): the hold's clearing event.
     StandbyObserved,
+    /// A not-believing conflict round with ZERO supersession evidence
+    /// (merged_bug_051): the bare 409 proves only rv movement, and the
+    /// round's own GET still names us (or observed absence with a
+    /// write of ours in doubt — bug_059's window). The standing takes
+    /// the self-fence posture: belief stays down, the
+    /// graceful-release hold SURVIVES for the fence-then-SIGTERM
+    /// release — mirroring step_down's NotOurs criterion (clear only
+    /// on observed absence/vacated/another-holder) and the believing
+    /// twin's signed pricing (exhausted deferrals whose every read
+    /// named us keep the hold).
+    ConflictHoldKept,
 }
 
 /// Typed refusal of a conflict-round read verdict (merged_bug_056,
@@ -2125,7 +2137,29 @@ fn complete_round(facts: ReadFacts, outcome: ActCell, standing: StandingCells) -
                 // provably no longer resolves to us.
                 RoundEdge::Lose(CompletedLoseEvidence::AnotherHolderObserved),
             ),
-            (ActCell::Standby | ActCell::Conflict, false) => (None, RoundEdge::StandbyObserved),
+            // Standby resolved not-leading: direct holder evidence —
+            // the hold's designed clearing event.
+            (ActCell::Standby, false) => (None, RoundEdge::StandbyObserved),
+            // merged_bug_051: a not-believing CONFLICT consumes typed
+            // resolution exactly like the believing arm — the bare 409
+            // names nobody, so the read's own facts arbitrate the hold
+            // (step_down's NotOurs criterion, with bug_059's in-doubt
+            // refinement on the absence cell).
+            (ActCell::Conflict, false) => match facts.holder {
+                // The lease still names US: zero evidence against the
+                // hold — self-fence posture, release stays armed.
+                HolderCell::Us => (None, RoundEdge::ConflictHoldKept),
+                // The read named another holder: supersession observed
+                // — the hold clears (NotOurs).
+                HolderCell::Other => (None, RoundEdge::StandbyObserved),
+                // Observed absence: provably nothing of ours UNLESS a
+                // write of ours is in doubt (the armed ledger — the
+                // zombie may commit a lease naming us, bug_059).
+                HolderCell::Absent => match facts.ledger {
+                    LedgerCell::Armed => (None, RoundEdge::ConflictHoldKept),
+                    LedgerCell::Empty => (None, RoundEdge::StandbyObserved),
+                },
+            },
             (ActCell::Conflict, true) => {
                 let verdict = adjudicated.on_believing_conflict();
                 let edge = match verdict {
@@ -2727,6 +2761,15 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         // interval would be noisy.
                         RoundEdge::StandbyObserved => {
                             standing.on_observed_not_leading();
+                        }
+                        // merged_bug_051: an evidence-free conflict while
+                        // not believing — the self-fence posture keeps
+                        // the hold for the shutdown release (the lease
+                        // may still name us); the latch clears with it.
+                        // No state/hooks/marks: belief was already down
+                        // and no transition fired.
+                        RoundEdge::ConflictHoldKept => {
+                            standing.on_self_fence();
                         }
                     }
                     // r[impl sched.recovery.bump-confirm+3]
@@ -4018,6 +4061,7 @@ mod complete_round_proofs {
                 assert!(!s.believes(), "every lose edge ends belief");
             }
             RoundEdge::StandbyObserved => s.on_observed(false),
+            RoundEdge::ConflictHoldKept => s.on_self_fence(),
             RoundEdge::Defer => {
                 assert!(
                     s.conflict_deferred,
@@ -7656,6 +7700,128 @@ mod tests {
         loop_task.await.expect("lease loop exits");
     }
 
+    /// W12-AB (merged_bug_051): the not-believing Completed arm
+    /// consumes TYPED resolution exactly like the believing arm — a
+    /// self-fenced ex-leader still NAMED by the lease must not lose
+    /// the graceful-release hold on a bare 409 (rv movement, zero
+    /// holder evidence). Standby resolutions (direct holder evidence)
+    /// still clear; the evidence-free conflict takes the self-fence
+    /// posture, mirroring step_down's NotOurs criterion.
+    ///
+    /// The schedule: fence at t=15s (blind > 11s; hold deliberately
+    /// kept by on_self_fence for exactly the fence-then-SIGTERM
+    /// window), then the fenced round's GET names US and its renew PUT
+    /// bounces on a foreign metadata rv-mover — a 409 whose own GET
+    /// named us. SIGTERM before the next successful round: the
+    /// holder-guarded release must run (~one round-trip) instead of
+    /// costing the successor the full 19s steal.
+    ///
+    /// Pre-fix the (None, false) edge ran on_observed_not_leading for
+    /// ElectionResult::Conflict too — collapsing rv-movement-only into
+    /// Standby's direct holder evidence and clearing the sole
+    /// should_release_on_shutdown gate on zero evidence, while the
+    /// believing twin (two 409s naming us) keeps the hold via
+    /// on_self_fence with signed pricing calling exactly this
+    /// cleared-hold outcome the bug.
+    ///
+    /// Pre-fix red, verbatim: `a bare 409 whose GET names us must not
+    /// clear the release hold while fenced; pre-fix: the (None,false)
+    /// edge collapsed Conflict into Standby and the shutdown skipped
+    /// the release`.
+    // r[verify sched.lease.holder-evidenced-lose+4]
+    // r[verify sched.lease.graceful-release+2]
+    #[tokio::test(start_paused = true)]
+    async fn evidence_free_conflict_keeps_the_hold_while_fenced() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1 (t=0): acquire; settle the marks PATCH.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 10, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json_rt(Some("us"), 3, 11, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Rounds 2-3 (t=5s, t=10s): the read phase fails — the blind
+        // window ages from t=0 with nothing transmitted.
+        for _ in 0..2 {
+            let get = park.next().await;
+            get.respond_status(500, "InternalError", "apiserver brownout");
+            settle().await;
+        }
+
+        // Round 4 (t=15s): the tick-top fence fires first (blind 15s >
+        // 11s; belief drops, hold KEPT — the fence-then-SIGTERM window
+        // the graceful release exists for). The round then completes:
+        // the GET still names US, the renew PUT bounces on a foreign
+        // metadata rv-mover — a bare 409 with zero holder evidence.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 11, 11));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "foreign metadata patch moved the rv");
+        settle().await;
+        assert!(!state.is_leader(), "the fence dropped belief");
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "only the fence lose — a bare 409 is not a lose"
+        );
+
+        // Answer the fence's marks PATCH if it surfaced.
+        if let Some(req) = park.try_next().await {
+            assert!(req.path.contains("/pods/us"), "marks PATCH expected");
+            req.respond_ok(pod_ok("us"));
+            settle().await;
+        }
+
+        // SIGTERM: the lease still names us at the apiserver — the
+        // holder-guarded release must run.
+        shutdown.cancel();
+        let mut released = false;
+        for _ in 0..8 {
+            if let Some(req) = park.try_next().await {
+                if req.path.contains("/pods/us") {
+                    req.respond_ok(pod_ok("us"));
+                } else if req.method == http::Method::GET {
+                    req.respond_ok(park_lease_json_rt(Some("us"), 3, 12, 12));
+                } else {
+                    released = true;
+                    req.respond_ok(park_lease_json_rt(None, 3, 13, 13));
+                }
+            }
+        }
+        assert!(
+            released,
+            "a bare 409 whose GET names us must not clear the release \
+             hold while fenced; pre-fix: the (None,false) edge collapsed \
+             Conflict into Standby and the shutdown skipped the release"
+        );
+        loop_task.await.expect("lease loop exits");
+    }
+
     /// merged_bug_122 (acquire-before-fence): consuming own-commit
     /// evidence whose ledger anchor is ALREADY past the self-fence
     /// deadline must not take the acquire edge — the very next
@@ -10590,6 +10756,7 @@ mod tests {
                 }
             }
             RoundEdge::StandbyObserved => s.on_observed(false),
+            RoundEdge::ConflictHoldKept => s.on_self_fence(),
             RoundEdge::Defer => {
                 // The deferral arm's precondition (the W12-W3 cell):
                 // the latch is genuinely set when Defer runs.

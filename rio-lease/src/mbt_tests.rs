@@ -951,10 +951,20 @@ fn loop_shim_base_regime_correspondence() {
                  the divergence is the regime boundary, by design"
             );
         } else {
+            // The SECOND documented divergence (merged_bug_051): the
+            // base-regime arm folds every not-believing resolution to
+            // observed-not-leading (clearing the model's `held`), while
+            // production prices the evidence-free conflict per the
+            // read's own facts — a 409 whose GET names us keeps the
+            // graceful-release hold (self-fence posture). Invisible to
+            // the MBT projection (lease/leading/gen — the hold is not
+            // projected); the loop-level tokio tests own the hold law.
             assert_eq!(
                 plan.edge,
-                RoundEdge::StandbyObserved,
-                "a standby 409 (raced steal) agrees across regimes"
+                RoundEdge::ConflictHoldKept,
+                "production keeps the hold on an evidence-free conflict \
+                 (the driver's base-regime arm clears — the divergence is \
+                 the regime boundary, by design)"
             );
         }
     }
