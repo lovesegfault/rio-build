@@ -375,7 +375,7 @@ pub(crate) async fn commit_foreign_for_test(
     Ok(rows)
 }
 
-// r[impl store.gc.hold-lanes]
+// r[impl store.gc.hold-lanes+1]
 /// Stamp `last_live_cycle_at` from a HELD `run_gc` tick
 /// (merged_bug_050): a held cycle is a LIVE cycle for staleness
 /// purposes — the operator deliberately suspended collection, so

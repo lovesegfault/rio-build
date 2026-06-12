@@ -1830,7 +1830,7 @@ session (`INSERT INTO gc_holds (scope, reason, created_by) VALUES ('global',
 = ...`); a wire admin verb rides the next proto-granted slot --- this wave's
 proto partition grants the store none (recorded divergence, never silent).
 
-#r("store.gc.hold-lanes")[
+#r("store.gc.hold-lanes+1")[
   During an active global hold, NO lane with delete authority may execute a
   destructive act: every destructive lane MUST consult the active-hold
   predicate FAIL-CLOSED at each tick before any destructive work (a consult
@@ -1843,10 +1843,14 @@ proto partition grants the store none (recorded divergence, never silent).
   (the only way to register a deleting periodic lane); the per-tick
   `HoldClearance` capability is demanded by the named delete sinks
   (`reap_one`, `drain_once`, `collect_cycle`), and demand-driven delete
-  callers consult at call time (`reap_one_consulted`). An in-flight
-  destructive batch at hold-start completes-or-aborts within
-  `DESTRUCTIVE_BATCH_DRAIN_BOUND` (one drain cadence) and the next batch
-  never starts; the drain lane HOLDS its queue (`pending_s3_deletes` rows
+  callers consult at call time (`reap_one_consulted`). Multi-batch tick
+  bodies MUST re-authorize the clearance at each committed-transaction
+  batch boundary (`HoldClearance::authorize_batch` --- the collect loop,
+  the post-drain reap, the orphan scan, the per-row drain), so destructive
+  work after hold-activation is bounded by the one batch already in flight
+  --- that batch completes-or-aborts within `DESTRUCTIVE_BATCH_DRAIN_BOUND`
+  (one drain cadence) and the next batch never starts at any boundary, tick
+  or intra-tick; the drain lane HOLDS its queue (`pending_s3_deletes` rows
   age, never execute).
 ]
 Wave-9 shipped the hold consulted at exactly one entry (`run_gc`) while four
@@ -1857,8 +1861,29 @@ HIGH). The lane census (`gc/lane.rs`, committed at
 population totality: the author-enumerated four-lane list this close first
 carried was the round-6 closure-set defect recurring inside a high close ---
 the gc-orphan-scanner (the fifth lane) hid from it; a sixth cannot hide from
-the family scan. Enforcement tiers, stated honestly (R24): the clearance
-type compile-seals the named sinks; the census holds the population.
+the family scan. Enforcement tiers, stated honestly (R24/R28): the clearance
+type compile-seals the named sinks (reachability); the expiry + batch
+re-authorization seal the time axis at the type's own seam; the census holds
+the population. The wave-10 form of this rule promised the drain bound while
+consulting once per tick --- false for the backstop's full collect cycle (a
+five-minute lock-held budget over fifty committed batches, merged_bug_067);
+the per-batch re-authorization is what makes the bound true.
+
+#r("store.gc.clearance-expiry")[
+  A `HoldClearance` MUST expire `DESTRUCTIVE_BATCH_DRAIN_BOUND` after its
+  last successful consult (mint or batch re-authorization): an expired
+  clearance MUST refuse batch authorization unconditionally --- with no
+  active hold in `gc_holds`, where a bare re-consult would authorize ---
+  and no re-consult resurrects it (the owning tick ends; the next tick
+  re-gates at the lane wrapper).
+]
+The expiry is the time axis's own law (R28): re-consult alone leaves a
+stalled body riding a tick-start consult for unbounded wall time between
+boundaries it happens not to reach; expiry caps the authority itself, so
+the freeze guarantee degrades only to the one in-flight batch even under
+pathological stalls. Refusal cause is typed end-to-end
+(`BatchAuthorize::{Held, Expired}` at the seam, `ClearanceStop` in the
+collect report) --- never inferred from logs.
 
 #r("store.gc.sweep-cycle-reclaim")[
   The sweep-phase reference re-check MUST exclude referrers that are themselves

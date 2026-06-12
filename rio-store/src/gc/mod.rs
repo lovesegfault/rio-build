@@ -177,10 +177,93 @@ pub mod hold {
     /// outlive its tick or be stashed for a later one: every named
     /// delete sink demands `&HoldClearance`, which structurally ties
     /// every destructive act to a same-tick consult.
-    // r[impl store.gc.hold-lanes]
+    ///
+    /// TEMPORAL SCOPE (merged_bug_067 — the R28 time axis the
+    /// reachability seal left bare): a clearance is authority for at
+    /// most [`crate::gc::lane::DESTRUCTIVE_BATCH_DRAIN_BOUND`] past
+    /// its last successful consult. Multi-batch tick bodies demand
+    /// [`Self::authorize_batch`] at each committed-transaction
+    /// boundary: the call refuses on an aged clearance (expiry — no
+    /// re-consult can resurrect it; the next tick re-gates), refuses
+    /// under a hold landed mid-body (the re-consult), and otherwise
+    /// refreshes the authority window. The axes of the hold law,
+    /// each at its stated tier (R28): reachability — compile-sealed
+    /// (this type at the named sinks, carried from merged_bug_050);
+    /// time — sealed here (the expiry check precedes the re-consult,
+    /// so a stale clearance authorizes nothing even when `gc_holds`
+    /// is empty); population — complemented by the lane census
+    /// (`gc/lane.rs`, the fail-closed scan), stated at census
+    /// strength: a body that never reaches a batch boundary seam is
+    /// the census's problem, not this type's.
+    // r[impl store.gc.hold-lanes+1]
+    // r[impl store.gc.clearance-expiry]
     #[derive(Debug)]
     pub struct HoldClearance {
+        /// The last successful consult (mint or batch re-consult).
+        /// `tokio::time::Instant`: monotonic in production, virtual
+        /// under paused test time.
+        consulted_at: tokio::time::Instant,
         _proof: (),
+    }
+
+    /// One batch-boundary authorization verdict — see
+    /// [`HoldClearance::authorize_batch`]. Closed alphabet; every
+    /// consumer matches it exhaustively (no wildcard arms).
+    #[must_use = "an unconsumed verdict is an unauthorized batch"]
+    #[derive(Debug)]
+    pub enum BatchAuthorize {
+        /// No active hold and the clearance is inside its authority
+        /// window (now refreshed): the next batch may run.
+        Authorized,
+        /// An active global hold landed since the last consult: the
+        /// body MUST stop before its next destructive batch.
+        Held(ActiveHold),
+        /// The clearance aged past the drain bound with no successful
+        /// consult: dead, refuses unconditionally (even with no hold
+        /// in `gc_holds`). The body MUST stop; the next tick re-gates.
+        Expired,
+    }
+
+    impl HoldClearance {
+        /// THE batch-boundary re-authorization (merged_bug_067):
+        /// expiry FIRST (an aged clearance refuses before any
+        /// re-consult — the time axis is the clearance's own law,
+        /// not the hold table's), then the hold re-consult, then the
+        /// window refresh. `&mut self` so a body cannot keep a
+        /// shared borrow of the pre-consult proof across the call.
+        /// Fail-closed like [`gate`]: a consult error refuses the
+        /// batch (`Err`), never authorizes.
+        // r[impl store.gc.clearance-expiry]
+        pub(crate) async fn authorize_batch(
+            &mut self,
+            pool: &PgPool,
+        ) -> Result<BatchAuthorize, sqlx::Error> {
+            self.authorize_batch_with_bound(pool, crate::gc::lane::DESTRUCTIVE_BATCH_DRAIN_BOUND)
+                .await
+        }
+
+        /// The bound-parameterized engine behind
+        /// [`Self::authorize_batch`] (which pins `bound` to
+        /// `DESTRUCTIVE_BATCH_DRAIN_BOUND` by delegation — the one
+        /// production entry). Parameterized so the expiry face is
+        /// witnessable in test time without a 30s sleep; production
+        /// code calls the delegating wrapper.
+        pub(crate) async fn authorize_batch_with_bound(
+            &mut self,
+            pool: &PgPool,
+            bound: std::time::Duration,
+        ) -> Result<BatchAuthorize, sqlx::Error> {
+            if self.consulted_at.elapsed() > bound {
+                return Ok(BatchAuthorize::Expired);
+            }
+            match active_global_hold(pool).await? {
+                Some(h) => Ok(BatchAuthorize::Held(h)),
+                None => {
+                    self.consulted_at = tokio::time::Instant::now();
+                    Ok(BatchAuthorize::Authorized)
+                }
+            }
+        }
     }
 
     /// The consult verdict for destructive actors — see [`gate`].
@@ -193,17 +276,22 @@ pub mod hold {
         Held(ActiveHold),
     }
 
-    // r[impl store.gc.hold-lanes]
+    // r[impl store.gc.hold-lanes+1]
     /// THE destructive-actor consult: one query, one verdict, the
     /// only mint point for [`HoldClearance`]. Callers MUST fail
     /// CLOSED on `Err` (an unreadable hold table is never read as
     /// "no hold") — the periodic form is
     /// `gc::lane::DestructiveLane`'s tick wrapper; the
-    /// demand-driven form is `orphan::reap_one_consulted`.
+    /// demand-driven form is `orphan::reap_one_consulted`. The
+    /// minted clearance starts its authority window here
+    /// (`consulted_at` = the mint instant).
     pub async fn gate(pool: &PgPool) -> Result<HoldGate, sqlx::Error> {
         Ok(match active_global_hold(pool).await? {
             Some(h) => HoldGate::Held(h),
-            None => HoldGate::Clear(HoldClearance { _proof: () }),
+            None => HoldGate::Clear(HoldClearance {
+                consulted_at: tokio::time::Instant::now(),
+                _proof: (),
+            }),
         })
     }
 
@@ -459,8 +547,11 @@ pub async fn run_gc(
     // (RPC-spawned per TriggerGC, not spawn-periodic): its entry
     // consult mints the same HoldClearance the lane wrapper does,
     // and the clearance threads to the phase-3 chunk-collect — the
-    // named sink demands it (store.gc.hold-lanes).
-    let hold_clearance = match hold::gate(pool).await {
+    // named sink demands it per batch (store.gc.hold-lanes+1), so a
+    // hold landing mid-pass stops phase 3 at the next batch boundary
+    // and a drain-bound-aged clearance authorizes nothing further
+    // (store.gc.clearance-expiry).
+    let mut hold_clearance = match hold::gate(pool).await {
         Ok(hold::HoldGate::Held(h)) => {
             info!(
                 hold_id = %h.hold_id,
@@ -473,7 +564,7 @@ pub async fn run_gc(
                 "lane" => "run_gc", "cause" => "held"
             )
             .increment(1);
-            // r[impl store.gc.hold-lanes]
+            // r[impl store.gc.hold-lanes+1]
             // The starvation coupling dies HERE (merged_bug_050): a
             // held cycle is a live cycle for staleness purposes —
             // stamping keeps the backstop's due-ness clock quiet so
@@ -628,7 +719,7 @@ pub async fn run_gc(
         sweep::CHUNK_GRACE_SECS,
         collect_mode,
         resume_cursor,
-        &hold_clearance,
+        &mut hold_clearance,
     )
     .await
     {
@@ -757,6 +848,7 @@ pub async fn run_gc(
                 s3_keys_enqueued = report.s3_keys_enqueued,
                 batches_run = report.batches_run,
                 cap_reached = report.cap_reached,
+                clearance_stop = ?report.clearance_stop,
                 pass_complete = report.pass_complete(),
                 chunks_reaped = report.chunks_reaped,
                 cursor_at_stop = ?report.cursor_at_stop().map(hex::encode),
@@ -981,6 +1073,71 @@ mod tests {
     use crate::manifest::{Manifest, ManifestEntry};
     use crate::test_helpers::mem_backend;
     use rio_test_support::TestDb;
+
+    // r[verify store.gc.clearance-expiry]
+    /// W11-AM face 2 (the expiry face — the time axis's own cell): a
+    /// clearance aged past the drain bound refuses its next
+    /// batch-authorize WITH NO hold transition — `gc_holds` is empty,
+    /// so a re-consult-only implementation would authorize; expiry is
+    /// the one mechanism that can refuse here. Driven at the
+    /// clearance type's own authorize seam through the production
+    /// mint (`hold::gate`); the bound is parameterized so the aging
+    /// is real elapsed monotonic time (250ms > 25ms), never a mocked
+    /// clock — `authorize_batch` pins the production bound to
+    /// `DESTRUCTIVE_BATCH_DRAIN_BOUND` by delegation. Expiry is
+    /// terminal at its bound: the second authorize refuses too (this
+    /// clearance is dead; the next tick re-gates).
+    ///
+    /// Strawman red (disclosed — the authorize seam is new, so no
+    /// pre-fix tree compiles this test): under the re-consult-only
+    /// variant (expiry check removed) the aged authorize returned
+    /// Authorized and the assert went red. Verbatim in the commit
+    /// body.
+    #[tokio::test]
+    async fn aged_clearance_refuses_with_no_hold_present() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let mut clearance = match hold::gate(&db.pool).await.unwrap() {
+            hold::HoldGate::Clear(c) => c,
+            hold::HoldGate::Held(h) => panic!("fresh db carries a hold: {h:?}"),
+        };
+
+        // Control: a fresh clearance authorizes (and refreshes its
+        // window) at the production bound.
+        assert!(matches!(
+            clearance.authorize_batch(&db.pool).await.unwrap(),
+            hold::BatchAuthorize::Authorized
+        ));
+
+        // Age it past a real (test-scaled) bound. No hold lands.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let holds: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM gc_holds")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(holds.0, 0, "precondition: no hold transition anywhere");
+
+        let bound = std::time::Duration::from_millis(25);
+        assert!(
+            matches!(
+                clearance
+                    .authorize_batch_with_bound(&db.pool, bound)
+                    .await
+                    .unwrap(),
+                hold::BatchAuthorize::Expired
+            ),
+            "a drain-bound-aged clearance refuses with gc_holds empty \
+             (re-consult cannot be what refused)"
+        );
+        // Terminal at the bound: nothing further is authorized.
+        assert!(matches!(
+            clearance
+                .authorize_batch_with_bound(&db.pool, bound)
+                .await
+                .unwrap(),
+            hold::BatchAuthorize::Expired
+        ));
+    }
 
     /// Build a serialized manifest referencing the given chunk hashes.
     fn make_manifest(hashes: &[[u8; 32]]) -> Vec<u8> {

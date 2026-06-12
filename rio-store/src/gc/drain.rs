@@ -56,11 +56,12 @@ pub(crate) const DRAIN_INTERVAL: Duration = Duration::from_secs(30);
 /// time, equivalent under contention. If a per-row tx rolls back, the
 /// S3 delete that already happened is re-processed next iteration (S3
 /// delete of a non-existent key is a no-op).
-// r[impl store.gc.hold-lanes]
+// r[impl store.gc.hold-lanes+1]
+// r[impl store.gc.clearance-expiry]
 pub async fn drain_once(
     pool: &PgPool,
     backend: &Arc<dyn ChunkBackend>,
-    _clearance: &crate::gc::hold::HoldClearance,
+    clearance: &mut crate::gc::hold::HoldClearance,
 ) -> Result<(u64, u64), sqlx::Error> {
     let mut deleted = 0u64;
     let mut failed = 0u64;
@@ -72,6 +73,33 @@ pub async fn drain_once(
     let mut seen: Vec<i64> = Vec::new();
 
     for _ in 0..DRAIN_BATCH_SIZE {
+        // Batch-boundary re-authorization (merged_bug_067): each row
+        // is its own committed transaction, so each row is a batch
+        // boundary — a hold landing mid-iteration (or an aged
+        // clearance under S3 degradation) stops the next S3 delete
+        // instead of riding the tick-start consult through 100 rows.
+        // A consult error fails closed through the `?`; the gauge
+        // refresh below still runs on a clearance stop (reads are
+        // not destructive).
+        match clearance.authorize_batch(pool).await? {
+            crate::gc::hold::BatchAuthorize::Authorized => {}
+            crate::gc::hold::BatchAuthorize::Held(h) => {
+                debug!(
+                    hold_id = %h.hold_id,
+                    deleted,
+                    "drain: global hold landed mid-iteration; queue holds"
+                );
+                break;
+            }
+            crate::gc::hold::BatchAuthorize::Expired => {
+                warn!(
+                    deleted,
+                    "drain: clearance aged past the drain bound; \
+                     stopping (next tick re-gates)"
+                );
+                break;
+            }
+        }
         match drain_one_row(pool, backend, &seen).await? {
             None => break,
             Some((id, DrainOutcome::Deleted)) => {
@@ -284,7 +312,7 @@ pub fn spawn_drain_task(
     backend: Arc<dyn ChunkBackend>,
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
-    // r[impl store.gc.hold-lanes]
+    // r[impl store.gc.hold-lanes+1]
     // Registered through DestructiveLane (merged_bug_050): during an
     // active global hold the drain HOLDS its queue —
     // pending_s3_deletes rows age, never execute — so the
@@ -340,7 +368,7 @@ mod tests {
         let (deleted, failed) = drain_once(
             &db.pool,
             &backend,
-            &crate::test_helpers::gc_clearance(&db.pool).await,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap();
@@ -375,7 +403,7 @@ mod tests {
         let (deleted, failed) = drain_once(
             &db.pool,
             &backend,
-            &crate::test_helpers::gc_clearance(&db.pool).await,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap();
@@ -446,7 +474,7 @@ mod tests {
         let (deleted, failed) = drain_once(
             &db.pool,
             &backend,
-            &crate::test_helpers::gc_clearance(&db.pool).await,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap();
@@ -494,7 +522,7 @@ mod tests {
         let (deleted, failed) = drain_once(
             &db.pool,
             &backend,
-            &crate::test_helpers::gc_clearance(&db.pool).await,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap();
@@ -526,7 +554,7 @@ mod tests {
         let (deleted, failed) = drain_once(
             &db.pool,
             &backend,
-            &crate::test_helpers::gc_clearance(&db.pool).await,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap();
@@ -564,7 +592,7 @@ mod tests {
         let (deleted, failed) = drain_once(
             &db.pool,
             &backend,
-            &crate::test_helpers::gc_clearance(&db.pool).await,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap();
@@ -631,9 +659,9 @@ mod tests {
         let pool_b = db.pool.clone();
         let backend_a = Arc::clone(&backend);
 
-        let clearance = crate::test_helpers::gc_clearance(&pool_a).await;
+        let mut clearance = crate::test_helpers::gc_clearance(&pool_a).await;
         let (drain_res, upsert_res) = tokio::join!(
-            drain_once(&pool_a, &backend_a, &clearance),
+            drain_once(&pool_a, &backend_a, &mut clearance),
             // PutPath's chunk upsert: ON CONFLICT clears deleted and
             // touches last_referenced_at. RETURNING (uploaded_at IS
             // NULL) tells the caller whether to upload (true = no
@@ -762,7 +790,7 @@ mod tests {
             drain_once(
                 &pool,
                 &backend,
-                &crate::test_helpers::gc_clearance(&pool).await,
+                &mut crate::test_helpers::gc_clearance(&pool).await,
             )
             .await
         });
@@ -822,11 +850,11 @@ mod tests {
         let backend_a = Arc::clone(&backend);
         let backend_b = Arc::clone(&backend);
 
-        let clearance_a = crate::test_helpers::gc_clearance(&pool_a).await;
-        let clearance_b = crate::test_helpers::gc_clearance(&pool_b).await;
+        let mut clearance_a = crate::test_helpers::gc_clearance(&pool_a).await;
+        let mut clearance_b = crate::test_helpers::gc_clearance(&pool_b).await;
         let (a, b) = tokio::join!(
-            drain_once(&pool_a, &backend_a, &clearance_a),
-            drain_once(&pool_b, &backend_b, &clearance_b),
+            drain_once(&pool_a, &backend_a, &mut clearance_a),
+            drain_once(&pool_b, &backend_b, &mut clearance_b),
         );
         let (del_a, fail_a) = a.unwrap();
         let (del_b, fail_b) = b.unwrap();

@@ -248,7 +248,7 @@ pub fn spawn_log_sweep(
     retention: Duration,
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
-    // r[impl store.gc.hold-lanes]
+    // r[impl store.gc.hold-lanes+1]
     // Registered through DestructiveLane (merged_bug_050, the
     // §1.6.4-16 spawn-seam conversion): the wrapper consults the
     // gc-hold gate fail-closed each tick and the WHOLE sweep body

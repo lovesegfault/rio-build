@@ -89,7 +89,7 @@ pub(crate) enum ReapBy {
 /// with different selection criteria).
 pub async fn scan_once(
     pool: &PgPool,
-    clearance: &crate::gc::hold::HoldClearance,
+    clearance: &mut crate::gc::hold::HoldClearance,
 ) -> Result<(u64, u64), sqlx::Error> {
     // Find stale uploading manifests. SELECT hash only — the
     // staleness predicate is re-checked INSIDE reap_one's tx (see the
@@ -105,6 +105,32 @@ pub async fn scan_once(
     let mut reaped = 0u64;
     let mut failed = 0u64;
     loop {
+        // Batch-boundary re-authorization (merged_bug_067): the
+        // until-short loop is a multi-batch destructive body, so a
+        // hold landing mid-scan (or a drain-bound-aged clearance)
+        // stops the next batch instead of riding the tick-start
+        // consult through the whole backlog. A consult error fails
+        // closed through the `?`.
+        match clearance.authorize_batch(pool).await? {
+            crate::gc::hold::BatchAuthorize::Authorized => {}
+            crate::gc::hold::BatchAuthorize::Held(h) => {
+                info!(
+                    hold_id = %h.hold_id,
+                    reaped,
+                    "orphan scan: global hold landed mid-scan; \
+                     stopping at the batch boundary"
+                );
+                break;
+            }
+            crate::gc::hold::BatchAuthorize::Expired => {
+                warn!(
+                    reaped,
+                    "orphan scan: clearance aged past the drain bound; \
+                     stopping at the batch boundary (next tick re-gates)"
+                );
+                break;
+            }
+        }
         let stale: Vec<(Vec<u8>,)> = sqlx::query_as(
             r#"
             SELECT m.store_path_hash
@@ -215,7 +241,7 @@ pub async fn scan_once(
 /// the claim-gated rollback `cas::put_chunked`/`cas::stage_chunked`
 /// use on their failure paths.
 // r[impl store.put.placeholder-claim+2]
-// r[impl store.gc.hold-lanes]
+// r[impl store.gc.hold-lanes+1]
 pub(crate) async fn reap_one(
     pool: &PgPool,
     store_path_hash: &[u8],
@@ -357,7 +383,7 @@ pub(crate) async fn reap_one(
     Ok(true)
 }
 
-// r[impl store.gc.hold-lanes]
+// r[impl store.gc.hold-lanes+1]
 /// The DEMAND-DRIVEN face of [`reap_one`] (merged_bug_050): the
 /// non-periodic callers — `abort_placeholder`, the PutPath
 /// drop-guard, the hot-path stale-reclaim, and the cas rollback
@@ -418,7 +444,7 @@ pub fn spawn_scanner(
     pool: PgPool,
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
-    // r[impl store.gc.hold-lanes]
+    // r[impl store.gc.hold-lanes+1]
     // Registered through DestructiveLane (merged_bug_050): every
     // tick consults the gc-hold gate fail-closed before reaping —
     // reaping during an incident freeze destroys evidence of
@@ -555,10 +581,12 @@ mod tests {
         let path = rio_test_support::fixtures::test_store_path("i040-scan-chunked");
         let (chunk_hash, _) = seed_stale_chunked(&db.pool, &hash, &path).await;
 
-        let (reaped, failed) =
-            scan_once(&db.pool, &crate::test_helpers::gc_clearance(&db.pool).await)
-                .await
-                .unwrap();
+        let (reaped, failed) = scan_once(
+            &db.pool,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert_eq!(reaped, 1);
         assert_eq!(failed, 0);
 
@@ -644,9 +672,12 @@ mod tests {
 
         // A inserts + is reaped by the orphan scanner (its row is GONE).
         let (_, claim_a) = seed_stale_chunked(&db.pool, &hash, &path).await;
-        let (reaped, _) = scan_once(&db.pool, &crate::test_helpers::gc_clearance(&db.pool).await)
-            .await
-            .unwrap();
+        let (reaped, _) = scan_once(
+            &db.pool,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert_eq!(reaped, 1, "scanner reaped A's stale placeholder");
 
         // B inserts a FRESH placeholder at the same hash.
@@ -764,9 +795,12 @@ mod tests {
         let path = rio_test_support::fixtures::test_store_path("orphan-stale");
         seed_stale_uploading(&db.pool, &hash, &path).await;
 
-        let (reaped, _) = scan_once(&db.pool, &crate::test_helpers::gc_clearance(&db.pool).await)
-            .await
-            .unwrap();
+        let (reaped, _) = scan_once(
+            &db.pool,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert_eq!(reaped, 1, "stale uploading manifest reaped");
 
         // narinfo gone (CASCADE took manifests too).
@@ -856,9 +890,12 @@ mod tests {
 
         // And scan_once itself finds nothing (status already
         // complete → SELECT filters it out).
-        let (reaped, _) = scan_once(&db.pool, &crate::test_helpers::gc_clearance(&db.pool).await)
-            .await
-            .unwrap();
+        let (reaped, _) = scan_once(
+            &db.pool,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert_eq!(reaped, 0, "scan_once found nothing (status=complete)");
     }
 
@@ -884,9 +921,12 @@ mod tests {
         .await
         .unwrap();
 
-        let (reaped, _) = scan_once(&db.pool, &crate::test_helpers::gc_clearance(&db.pool).await)
-            .await
-            .unwrap();
+        let (reaped, _) = scan_once(
+            &db.pool,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert_eq!(reaped, 0, "fresh upload not reaped");
 
         // narinfo still present.
@@ -917,9 +957,12 @@ mod tests {
 
         // --- store-0's turn: seed stale + reap ---
         seed_stale_uploading(&db.pool, &hash, &path).await;
-        let (reaped, _) = scan_once(&db.pool, &crate::test_helpers::gc_clearance(&db.pool).await)
-            .await
-            .unwrap();
+        let (reaped, _) = scan_once(
+            &db.pool,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert_eq!(reaped, 1, "store-0 reaped the stale upload");
 
         // --- Worker re-uploads same path (FRESH placeholder) ---
@@ -1083,9 +1126,12 @@ mod tests {
         // No heartbeat.
 
         // Scan: dead reaped, live skipped.
-        let (reaped, _) = scan_once(&db.pool, &crate::test_helpers::gc_clearance(&db.pool).await)
-            .await
-            .unwrap();
+        let (reaped, _) = scan_once(
+            &db.pool,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert_eq!(reaped, 1, "exactly the non-heartbeated placeholder reaped");
 
         // live still present; dead gone.

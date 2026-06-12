@@ -49,11 +49,15 @@ pub(crate) enum LaneTick {
 
 /// A lane body: borrows the tick's clearance for the tick's lifetime
 /// (the `for<'t>` bound is the no-stash law — the future cannot
-/// outlive the clearance it was handed).
+/// outlive the clearance it was handed). `&mut` since merged_bug_067:
+/// multi-batch bodies re-authorize at each committed-transaction
+/// boundary via [`hold::HoldClearance::authorize_batch`], which
+/// demands exclusive access so no shared borrow of the pre-consult
+/// proof survives the call.
 pub(crate) type LaneBody =
-    Box<dyn for<'t> FnMut(&'t hold::HoldClearance) -> BoxFuture<'t, ()> + Send>;
+    Box<dyn for<'t> FnMut(&'t mut hold::HoldClearance) -> BoxFuture<'t, ()> + Send>;
 
-// r[impl store.gc.hold-lanes]
+// r[impl store.gc.hold-lanes+1]
 /// The ONLY way to register a deleting periodic lane — see the
 /// module doc. Mirrors `rio_common::task::spawn_periodic[_with]`
 /// (biased shutdown select, `MissedTickBehavior::Skip`, panic-logged
@@ -100,14 +104,14 @@ impl DestructiveLane {
         })
     }
 
-    // r[impl store.gc.hold-lanes]
+    // r[impl store.gc.hold-lanes+1]
     /// ONE consulted tick: consult the hold gate FAIL-CLOSED, mint
     /// the tick's clearance, run the body under it. The testable
     /// seam — W10-D/E/F drive lanes through this exact fn.
     pub(crate) async fn tick(name: &'static str, pool: &PgPool, body: &mut LaneBody) -> LaneTick {
         match hold::gate(pool).await {
-            Ok(hold::HoldGate::Clear(clearance)) => {
-                body(&clearance).await;
+            Ok(hold::HoldGate::Clear(mut clearance)) => {
+                body(&mut clearance).await;
                 LaneTick::Ran
             }
             Ok(hold::HoldGate::Held(h)) => {
@@ -146,20 +150,27 @@ impl DestructiveLane {
     }
 }
 
-/// R17 bound on the IN-FLIGHT destructive batch at hold-start: the
-/// per-tick consult means at most ONE tick body is mid-flight when a
-/// hold lands; that batch completes-or-aborts and the NEXT tick never
-/// starts (the corner is structural — `lane_inflight_batch_completes_
-/// then_next_tick_skips` asserts next-never-starts, not wall-clock).
-/// VALUE (hypothesis per the WO, derivation recorded): one drain
-/// batch at the existing cadence — `DRAIN_BATCH_SIZE` (100) per-key
-/// S3 deletes is sized to finish well inside its own 30s
-/// `DRAIN_INTERVAL` (the cadence only holds if it does), so the
-/// interval IS the derived in-flight bound; the other lanes' tick
-/// bodies (orphan batch, log-sweep batch, backstop check) are
-/// lighter. Violable: a pathological S3 tail can exceed it — the
-/// hold's guarantee degrades to "one already-running batch", never
-/// "new batches".
+/// R17 bound on IN-FLIGHT destructive work at hold-start, enforced
+/// per BATCH since merged_bug_067 (the time axis): at most one
+/// committed-transaction batch is mid-flight when a hold lands —
+/// that batch completes-or-aborts, and the next batch (not just the
+/// next tick) refuses, because multi-batch tick bodies re-authorize
+/// the clearance at each batch boundary and the clearance itself
+/// expires this many seconds after its last successful consult
+/// (`hold::HoldClearance::authorize_batch` — expiry refuses even
+/// with an empty `gc_holds`, so a stalled body cannot ride a
+/// tick-start consult for minutes). The wave-10 form consulted once
+/// per tick and asserted the rest by mass ("the other lanes are
+/// lighter") — false for the backstop's full collect cycle (a
+/// 5-minute lock-held budget over 50 committed batches) and the
+/// until-short scan/sweep loops; the per-batch demand replaces that
+/// derivation with structure. VALUE: one drain cadence —
+/// `DRAIN_BATCH_SIZE` (100) per-key S3 deletes is sized to finish
+/// well inside its own 30s `DRAIN_INTERVAL` (the cadence holds
+/// because it does), so the interval is the authority window.
+/// Violable: a pathological single S3 call can exceed it — the
+/// guarantee degrades to "one already-running batch", never "new
+/// batches".
 pub(crate) const DESTRUCTIVE_BATCH_DRAIN_BOUND: Duration = Duration::from_secs(30);
 
 // The derivation pin (and the const's consumer): the bound IS one
@@ -282,7 +293,7 @@ mod tests {
         })
     }
 
-    // r[verify store.gc.hold-lanes]
+    // r[verify store.gc.hold-lanes+1]
     /// W10-D (merged_bug_050): with an ACTIVE GLOBAL HOLD and every
     /// periodic census member due, NO lane executes a destructive act
     /// — every tick skips typed, the skip counters increment for
@@ -417,7 +428,7 @@ mod tests {
         assert_eq!(placeholders.0, 0, "released hold: the scanner reaps");
     }
 
-    // r[verify store.gc.hold-lanes]
+    // r[verify store.gc.hold-lanes+1]
     /// W10-F (fail-closed): an UNREADABLE holds table is never read
     /// as "no hold" — EVERY census-member lane skips typed
     /// (`SkippedConsultError`), the counter increments, and zero
@@ -511,7 +522,7 @@ mod tests {
         }
     }
 
-    // r[verify store.gc.hold-lanes]
+    // r[verify store.gc.hold-lanes+1]
     /// The in-flight corner (DESTRUCTIVE_BATCH_DRAIN_BOUND): a delete
     /// batch already mid-flight when the hold lands COMPLETES (the
     /// per-tick consult granted it a clearance; aborting mid-batch
@@ -580,7 +591,7 @@ mod tests {
         assert_eq!(pending.0, 1, "the queue holds from the hold onward");
     }
 
-    // r[verify store.gc.hold-lanes]
+    // r[verify store.gc.hold-lanes+1]
     // r[verify store.gc.hold+2]
     /// W10-E (the starvation negation, merged_bug_050 commit 2): a
     /// hold spanning k backstop periods produces ZERO deletes and
@@ -1078,7 +1089,7 @@ mod census {
         rows
     }
 
-    // r[verify store.gc.hold-lanes]
+    // r[verify store.gc.hold-lanes+1]
     /// THE lane census: derive the spawn-family rows, refuse any
     /// destructive ∧ ¬routed member, pin run_gc (∪ the family scan),
     /// and pin the full derived set against the committed [GEN-SET]
@@ -1106,7 +1117,7 @@ mod census {
             .find(|(f, _)| *f == "gc/mod.rs")
             .map(|(_, src)| {
                 let text: String = code_lines(src).join("\n");
-                text.contains("hold::gate(pool)") && text.contains("&hold_clearance,")
+                text.contains("hold::gate(pool)") && text.contains("&mut hold_clearance,")
             })
             .unwrap_or(false);
         assert!(
@@ -1141,7 +1152,7 @@ mod census {
         );
     }
 
-    // r[verify store.gc.hold-lanes]
+    // r[verify store.gc.hold-lanes+1]
     /// R22′ planted red: a strawman spawn-family lane with a delete
     /// sink NOT routed through DestructiveLane is flagged by the SAME
     /// derivation — planted at the SCAN layer (raw source enters the
