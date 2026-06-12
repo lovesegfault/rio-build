@@ -1417,6 +1417,34 @@ in
         touch $out
       '';
 
+  # WO-S8-2 (merged_bug_088, R22″): the cfg-pruner PARITY gate. The
+  # nix pruners' production-population predicate is differentially
+  # pinned against the canonical xtask semantics (cfg_pred_gates_test,
+  # xtask/src/lint.rs): (1) the canonical's SOURCE is pinned at
+  # nix/cfg-pruner-canonical.pin ([GEN-SET]: `rust_strip.py
+  # --extract-canonical xtask/src/lint.rs`) — canonical drift reds
+  # this check until the python port is re-derived; (2) over EVERY
+  # cfg attribute in rio-*/src + xtask/src, the flat spelling table
+  # (enumeration axis) and the ported canonical predicate (recursion
+  # axis) must agree, and a spelling outside the table — the fourth
+  # spelling — is a named red, never a silent one-sided
+  # classification (the merged_bug_088 class: two "canonical" pruners
+  # diverging one spelling at a time).
+  cfg-pruner-parity =
+    pkgs.runCommand "rio-cfg-pruner-parity"
+      {
+        # Full-tree staging ((vvvvv)): the gate quantifies over every
+        # crate's cfg attributes AND the canonical's own source.
+        src = pkgs.lib.cleanSource ../.;
+        nativeBuildInputs = [ pkgs.python3 ];
+        sharedLexer = ../nix/rust_strip.py;
+      }
+      ''
+        cp "$sharedLexer" rust_strip.py
+        python3 rust_strip.py --parity "$src"
+        touch $out
+      '';
+
   # merged_bug_076: the node_informer drop classifier's producer-cite
   # rationale, machine-diffed against the Status constructors the
   # AdminService module actually mints. A `producer-census: <code> =

@@ -219,6 +219,11 @@ def lex(text: str, *, blank_string_bodies: bool):
     return out, spans
 
 
+# The historical bare-spelling recognizer (kept for reference and for
+# the spelling table's outer-bare row): merged_bug_088's defect was
+# that this regex was the WHOLE production-population predicate —
+# compound heads (`all(test, …)`, `any(test, …)`) and the inner
+# `#![cfg(test)]` leaked test code into every census population.
 CFG_TEST_ATTR = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
 
 
@@ -264,6 +269,124 @@ def _match_delim_strict(lexed: str, i: int, source: str) -> int:
 
 
 _WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+# --- the cfg-gating recognizer (WO-S8-2, merged_bug_088) --------------
+#
+# TWO independent implementations, differentially pinned:
+#
+#   1. `cfg_pred_gates_test` — the RECURSION axis: a python port of
+#      the CANONICAL xtask predicate (`cfg_pred_gates_test`,
+#      xtask/src/lint.rs — "prune ANY cfg…" — quantifier: census(cfg-pruner-parity)
+#      ("…whose argument tokens mention the bare `test` ident"),
+#      evaluated by HEAD: a bare `test` element gates; `not(..)`
+#      NEVER gates (quantifier: census(CFG_SPELLING_VECTORS not-head row)); `any(..)`/
+#      `all(..)` gate iff any inner element gates, recursing;
+#      `feature = "…"` and every other key never gate). The port is
+#      pinned to the canonical's SOURCE via nix/cfg-pruner-canonical
+#      .pin ([GEN-SET]: `rust_strip.py --extract-canonical
+#      xtask/src/lint.rs`) — if the canonical's text drifts, the
+#      parity gate goes red and the port is re-derived by a human,
+#      never silently.
+#   2. `classify_cfg_spelling` — the ENUMERATION axis: the spelling
+#      table over the grammatical forms the live tree carries (outer
+#      bare / flat all(…)-head / flat any(…)-head / not(…)-head /
+#      plain non-test). A form OUTSIDE the table returns None.
+#
+# The parity differential (`--parity`, the cfg-pruner-parity check)
+# runs BOTH over every cfg attribute in the live tree and fails on
+# None (a spelling outside the table — the fourth-spelling tripwire,
+# W11-BU) or on any table-vs-port disagreement. The strip pipeline
+# consumes axis 1 (total by recursion), so a leak needs BOTH
+# implementations wrong AND the pin stale.
+
+
+def _split_top_commas(s: str):
+    parts, depth, start = [], 0, 0
+    for i, c in enumerate(s):
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            parts.append(s[start:i])
+            start = i + 1
+    parts.append(s[start:])
+    return parts
+
+
+def cfg_pred_gates_test(pred: str) -> bool:
+    """The ported canonical predicate (axis 1; see the block comment
+    above). `pred` is the text inside `cfg( … )`, lexed or raw."""
+    for elem in _split_top_commas(pred):
+        elem = elem.strip()
+        m = _WORD_RE.match(elem)
+        if not m:
+            continue
+        head = m.group(0)
+        if head == "test":
+            return True
+        if head == "not":
+            continue
+        if head in ("any", "all"):
+            rest = elem[m.end() :].lstrip()
+            if rest.startswith("(") and rest.endswith(")"):
+                if cfg_pred_gates_test(rest[1:-1]):
+                    return True
+        # every other head (feature/unix/target_os/…) never gates
+    return False
+
+
+def classify_cfg_spelling(pred: str):
+    """The enumerated spelling table (axis 2): returns
+    `(spelling, gates)` for forms the table names, None outside it —
+    a nested compound or novel form is UNKNOWN by design (the
+    differential turns UNKNOWN into a red, never a silent guess)."""
+    s = pred.strip()
+    if re.fullmatch(r"test", s):
+        return ("outer-bare", True)
+    m = re.match(r"(all|any)\s*\(", s)
+    if m and s.endswith(")"):
+        elems = [e.strip() for e in _split_top_commas(s[m.end() : -1])]
+        if any(re.match(r"(all|any|not)\s*\(", e) for e in elems):
+            return None  # nested compound — outside the flat table
+        gates = any(
+            (w := _WORD_RE.match(e)) is not None and w.group(0) == "test"
+            for e in elems
+        )
+        return (f"compound-{m.group(1)}-head", gates)
+    if re.match(r"not\s*\(", s):
+        return ("not-head", False)
+    m = _WORD_RE.match(s)
+    if m and m.group(0) not in ("test", "all", "any", "not"):
+        return ("plain-non-test", False)
+    return None
+
+
+CFG_ATTR_HEAD = re.compile(r"#(!?)\s*\[")
+
+
+def iter_cfg_attrs(lexed: str, source: str = "<input>"):
+    """Every `#[cfg(<pred>)]` / `#![cfg(<pred>)]` attribute in the
+    LEXED text: yields `(attr_start, attr_end, inner, pred)`. Non-cfg
+    attributes are skipped; bracket matching is fail-closed
+    (StripError on malformed input)."""
+    for m in CFG_ATTR_HEAD.finditer(lexed):
+        lb = m.end() - 1
+        end = _match_delim_strict(lexed, lb, source)
+        body = lexed[m.end() : end - 1]
+        bm = re.match(r"\s*cfg\s*\(", body)
+        if not bm:
+            continue
+        po = m.end() + bm.end() - 1  # the '(' of cfg(…) in lexed
+        pe = _match_delim_strict(lexed, po, source)
+        yield m.start(), end, bool(m.group(1)), lexed[po + 1 : pe - 1]
+
+
+def _brace_depth_at(lexed: str, i: int) -> int:
+    return lexed.count("{", 0, i) - lexed.count("}", 0, i)
+
+
 # Item keywords that terminate at a top-level `;` (brace groups along
 # the way — struct-literal/match initializers — are skipped whole).
 _SEMI_ITEMS = {"const", "static", "type", "use", "extern crate"}
@@ -498,7 +621,16 @@ def strip_cfg_test(text: str, *, source: str = "<input>") -> str:
     match arms, struct-expr fields) have their own extent rule instead
     of driving the brace count negative and blanking production code.
     Refusals are StripError naming `source:line` (R22″ fail-closed);
-    callers pass `source` so the error names the real file."""
+    callers pass `source` so the error names the real file.
+
+    WO-S8-2 (merged_bug_088): the recognizer covers EVERY test-gating
+    cfg spelling via the ported canonical predicate — outer bare
+    `#[cfg(test)]`, compound heads (`all(test, …)`, `any(test, …)`,
+    arbitrarily nested), and the inner `#![cfg(test)]` (file scope:
+    the whole file is test code and blanks entirely; an inner gating
+    attr BELOW file scope refuses — outside the alphabet). `not(…)`
+    and `feature = "…"` forms never prune (the canonical's head
+    rule)."""
     lexed, _ = lex(text, blank_string_bodies=True)
     out = list(text)
     n = len(text)
@@ -508,10 +640,22 @@ def strip_cfg_test(text: str, *, source: str = "<input>") -> str:
             if out[k] != "\n":
                 out[k] = " "
 
-    for m in CFG_TEST_ATTR.finditer(lexed):
-        i = m.end()
+    for a, b, inner, pred in iter_cfg_attrs(lexed, source):
+        if not cfg_pred_gates_test(pred):
+            continue
+        if inner:
+            if _brace_depth_at(lexed, a) == 0:
+                # `#![cfg(test)]` at file scope: the whole file is
+                # test-gated (actor/debug.rs:5 — the live instance).
+                return "".join(c if c == "\n" else " " for c in text)
+            raise StripError(
+                f"{source}:{_line_of(lexed, a)}: inner `#![cfg(…)]` "
+                f"test gate below file scope — outside the derived "
+                f"alphabet; refusing (fail-closed)"
+            )
+        i = b
         # Skip whitespace and any stacked attribute blocks after the
-        # cfg(test) attr (`#[allow(...)]`, multi-line attrs — bracket
+        # cfg attr (`#[allow(...)]`, multi-line attrs — bracket
         # matched fail-closed on the lexed text). Doc comments are
         # already blank.
         while True:
@@ -522,8 +666,8 @@ def strip_cfg_test(text: str, *, source: str = "<input>") -> str:
                     i = _match_delim_strict(lexed, j, source)
                     continue
             break
-        end = _extent_end(lexed, m.start(), i, source)
-        blank(m.start(), end)
+        end = _extent_end(lexed, a, i, source)
+        blank(a, end)
     return "".join(out)
 
 
@@ -644,7 +788,125 @@ CFG_REFUSAL_VECTORS = [
     ("attachment-eof", "struct S {\n    #[cfg(test)]\n    f: u8", 2),
     ("angle-imbalance", "struct S {\n    #[cfg(test)]\n    f: Vec<u8,\n}\n", 2),
     ("macro-missing-semi", "#[cfg(test)]\nm!(x)\n", 1),
+    # WO-S8-2: an inner test gate below file scope is outside the
+    # alphabet (file-scope inner attrs blank the whole file instead).
+    ("inner-below-file-scope", "mod m {\n    #![cfg(test)]\n    fn t() {}\n}\n", 2),
 ]
+
+# WO-S8-2: the spelling plants — one derived plant per test-gating
+# spelling, consumed by THIS pruner's selftest and (via
+# `cfg_test_attr_spans`) by streaming_open_ban's twin selftest. The
+# non-gating rows pin the canonical's head rule (not(…) is
+# production-only code; feature keys never gate).
+CFG_SPELLING_VECTORS = [
+    ("outer-bare", "test", True),
+    ("compound-all-head", "all(test, target_os = \"linux\")", True),
+    ("compound-any-head", "any(test, kani)", True),
+    ("compound-any-feature", "any(test, feature = \"test-utils\")", True),
+    ("not-head", "not(test)", False),
+    ("plain-feature", "feature = \"test-utils\"", False),
+    # The fourth-spelling face: nested compounds are GATING per the
+    # ported canonical (recursion) while the flat spelling table
+    # reads them UNKNOWN — the parity differential's red (W11-BU).
+    ("nested-compound", "any(all(test, unix), kani)", True),
+]
+
+
+def cfg_test_attr_spans(text: str, source: str = "<input>"):
+    """Spans `(start, end, inner)` of every TEST-GATING cfg attribute
+    in `text` (any spelling — the ported canonical predicate decides).
+    The shared recognizer for every scanner's cfg(test) handling
+    (streaming_open_ban's mod-pruner twin consumes this instead of a
+    private bare-spelling regex)."""
+    lexed, _ = lex(text, blank_string_bodies=True)
+    return [
+        (a, b, inner)
+        for (a, b, inner, pred) in iter_cfg_attrs(lexed, source)
+        if cfg_pred_gates_test(pred)
+    ]
+
+
+CANONICAL_PIN = "nix/cfg-pruner-canonical.pin"
+
+
+def extract_canonical(lint_rs_text: str) -> str:
+    """The normalized source of xtask's `cfg_pred_gates_test` (the
+    canonical predicate this module ports): whitespace-collapsed fn
+    text, doc comment excluded. [GEN-SET]: `rust_strip.py
+    --extract-canonical xtask/src/lint.rs > nix/cfg-pruner-canonical
+    .pin` mints the pin; the parity gate re-extracts at every run and
+    fails on drift, so the canonical cannot change without the port
+    being re-derived."""
+    for name, start, _bs, body_end in fn_extents(lint_rs_text):
+        if name == "cfg_pred_gates_test":
+            return " ".join(lint_rs_text[start : body_end + 1].split())
+    raise SystemExit(
+        "FAIL: fn cfg_pred_gates_test not found — the canonical moved; "
+        "re-derive the port and the pin"
+    )
+
+
+def parity_scan(root, lint_rel="xtask/src/lint.rs"):
+    """The cfg-pruner parity gate (WO-S8-2): over every cfg attribute
+    in rio-*/src + xtask/src, the flat spelling table (axis 2) and the
+    ported canonical predicate (axis 1) must agree, and no attribute
+    may be outside the table (the fourth-spelling tripwire); plus the
+    canonical-source pin must match xtask's live text. Returns a
+    failure list."""
+    import pathlib
+
+    root = pathlib.Path(root)
+    fails = []
+    pin_path = root / CANONICAL_PIN
+    lint_path = root / lint_rel
+    if not lint_path.is_file():
+        return [f"{lint_rel} missing — the canonical surface is not staged ((vvvvv))"]
+    live_canonical = extract_canonical(lint_path.read_text())
+    if not pin_path.is_file():
+        return [f"{CANONICAL_PIN} missing — mint it: rust_strip.py --extract-canonical {lint_rel}"]
+    if pin_path.read_text().strip() != live_canonical:
+        fails.append(
+            f"{lint_rel}: cfg_pred_gates_test drifted from {CANONICAL_PIN} — "
+            f"the canonical changed; RE-DERIVE the python port "
+            f"(cfg_pred_gates_test/classify_cfg_spelling) against the new "
+            f"semantics, then re-mint the pin"
+        )
+    files = []
+    for crate_src in sorted(root.glob("rio-*/src")):
+        files.extend(sorted(crate_src.rglob("*.rs")))
+    x = root / "xtask" / "src"
+    if x.is_dir():
+        files.extend(sorted(x.rglob("*.rs")))
+    n_attrs = 0
+    for f in files:
+        rel = str(f.relative_to(root))
+        text = f.read_text(encoding="utf-8")
+        lexed, _ = lex(text, blank_string_bodies=True)
+        try:
+            for a, _b, _inner, pred in iter_cfg_attrs(lexed, rel):
+                n_attrs += 1
+                table = classify_cfg_spelling(pred)
+                port = cfg_pred_gates_test(pred)
+                if table is None:
+                    fails.append(
+                        f"{rel}:{_line_of(lexed, a)}: cfg spelling outside the "
+                        f"enumerated table (`{' '.join(pred.split())}`, port "
+                        f"says gates={port}) — extend CFG_SPELLINGS/"
+                        f"classify_cfg_spelling with this form and its plant"
+                    )
+                elif table[1] != port:
+                    fails.append(
+                        f"{rel}:{_line_of(lexed, a)}: spelling-table/"
+                        f"ported-canonical DISAGREEMENT on "
+                        f"`{' '.join(pred.split())}` (table {table} vs port "
+                        f"gates={port}) — one axis rotted; re-derive both "
+                        f"against the canonical"
+                    )
+        except StripError as e:
+            fails.append(str(e))
+    if n_attrs == 0:
+        fails.append("zero cfg attributes found — the parity population is vacuous")
+    return fails, n_attrs
 
 
 _OPEN_TO_CLOSE = {"(": ")", "[": "]", "{": "}"}
@@ -949,6 +1211,57 @@ def selftest() -> str | None:
                 return f"refusal ({cell}): error does not name source:line — {e}"
         else:
             return f"refusal ({cell}): malformed input silently accepted (fail-open)"
+    # --- WO-S8-2 (merged_bug_088): one derived plant per spelling,
+    # both differential axes, and the canonical-pin comparator -------
+    # W11-BT (red-first): pre-fix, the compound spellings leaked test
+    # code into the censused population — every gating spelling must
+    # now prune, every non-gating spelling must now SURVIVE.
+    for spelling, pred, gates in CFG_SPELLING_VECTORS:
+        v = f"#[cfg({pred})]\nfn {_T}() {{ x(); }}\nfn {_P}() {{}}\n"
+        stripped = strip_cfg_test(v, source=f"spelling/{spelling}")
+        if gates and _T in stripped:
+            return f"W11-BT ({spelling}): test code leaked into the production population: {stripped!r}"
+        if not gates and _T not in stripped:
+            return f"spelling ({spelling}): production-only code was pruned (the not(test) class): {stripped!r}"
+        if _P not in stripped:
+            return f"spelling ({spelling}): production neighbor blanked: {stripped!r}"
+        # Axis agreement per vector (UNKNOWN allowed only for the
+        # nested-compound tripwire cell).
+        table = classify_cfg_spelling(pred)
+        port = cfg_pred_gates_test(pred)
+        if port != gates:
+            return f"spelling ({spelling}): ported canonical wrong (gates={port}, want {gates})"
+        if spelling == "nested-compound":
+            if table is not None:
+                return "W11-BU precondition broke: the nested compound is inside the flat table"
+        elif table is None or table[1] != gates:
+            return f"spelling ({spelling}): table classification wrong ({table})"
+    # The inner spelling: `#![cfg(test)]` at file scope blanks the
+    # WHOLE file (actor/debug.rs:5 — the live instance).
+    inner_v = f"#![cfg(test)]\nfn {_T}() {{}}\nfn {_T}2() {{}}\n"
+    stripped = strip_cfg_test(inner_v, source="spelling/inner-bare")
+    if _T in stripped or stripped.count("\n") != inner_v.count("\n"):
+        return f"spelling (inner-bare): the inner file gate did not blank the whole file: {stripped!r}"
+    # … and an inner NON-gating attr (`#![cfg(unix)]`) must not blank.
+    stripped = strip_cfg_test(f"#![cfg(unix)]\nfn {_P}() {{}}\n")
+    if _P not in stripped:
+        return "spelling (inner-non-gating): #![cfg(unix)] blanked the file"
+    # The shared recognizer surface the streaming twin consumes.
+    spans = cfg_test_attr_spans("#[cfg(any(test, kani))]\nmod t { }\n#[cfg(not(test))]\nmod p { }\n")
+    if len(spans) != 1:
+        return f"cfg_test_attr_spans: expected exactly the gating attr, got {spans}"
+    # W11-BU — the parity differential reds: (a) a one-sided spelling
+    # (nested compound: port gates, table UNKNOWN) is a NAMED red at
+    # the parity layer; (b) a doctored canonical fails the pin
+    # comparison shape (the drift tripwire).
+    table = classify_cfg_spelling("any(all(test, unix), kani)")
+    port = cfg_pred_gates_test("any(all(test, unix), kani)")
+    if table is not None or port is not True:
+        return f"W11-BU (a): the one-sided spelling did not split the axes (table={table}, port={port})"
+    pinned = " ".join("fn cfg_pred_gates_test(ts: T) -> bool { real }".split())
+    doctored = " ".join("fn cfg_pred_gates_test(ts: T) -> bool { DOCTORED }".split())
+    if pinned == doctored:
+        return "W11-BU (b): the pin comparator cannot see a doctored canonical"
     return None
 
 
@@ -959,6 +1272,30 @@ if __name__ == "__main__":
     if err:
         print(f"FAIL: rust-strip self-test — {err}", file=sys.stderr)
         sys.exit(1)
+    if len(sys.argv) >= 2 and sys.argv[1] == "--extract-canonical":
+        # [GEN-SET] mint for nix/cfg-pruner-canonical.pin (WO-S8-2).
+        if len(sys.argv) != 3:
+            print("usage: rust_strip.py --extract-canonical LINT_RS", file=sys.stderr)
+            sys.exit(2)
+        print(extract_canonical(open(sys.argv[2], encoding="utf-8").read()))
+        sys.exit(0)
+    if len(sys.argv) >= 2 and sys.argv[1] == "--parity":
+        # The cfg-pruner parity gate (WO-S8-2; the misc-checks
+        # `cfg-pruner-parity` attr drives this).
+        if len(sys.argv) != 3:
+            print("usage: rust_strip.py --parity ROOT", file=sys.stderr)
+            sys.exit(2)
+        fails, n_attrs = parity_scan(sys.argv[2])
+        if fails:
+            print("FAIL: cfg-pruner parity —", file=sys.stderr)
+            for x in fails:
+                print(f"  {x}", file=sys.stderr)
+            sys.exit(1)
+        print(
+            f"cfg-pruner-parity: {n_attrs} cfg attributes, spelling table == "
+            f"ported canonical everywhere; canonical pin verified"
+        )
+        sys.exit(0)
     if len(sys.argv) >= 2 and sys.argv[1] == "--const-strings":
         # The shell-fragment face of the const-array primitive (the
         # 42-reason-alert-sync extraction): selftest above gates first.

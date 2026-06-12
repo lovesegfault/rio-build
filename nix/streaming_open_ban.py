@@ -53,7 +53,13 @@ ALLOW_FILES = {"rio-builder/src/log_upload.rs"}
 # scanner, with its own span/blank selftest run before any arm-level
 # selftest may gate. Escape handling can now only be wrong, and
 # fixed, in one place.
-CFG_TEST = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+#
+# WO-S8-2 (merged_bug_088): the cfg(test) RECOGNIZER is the shared
+# one too (rust_strip.cfg_test_attr_spans — the ported canonical
+# predicate over every spelling: bare, all(test,…), any(test,…),
+# inner #![cfg(test)]). The private bare-spelling CFG_TEST regex this
+# replaced recognized 1 of 3 spellings, so any(test, kani)-style mods
+# and #![cfg(test)] files leaked test code into the ban's population.
 MOD_AFTER = re.compile(r"\s*(?:#\s*\[[^\]]*\]\s*)*(?:pub\s*(?:\([^)]*\)\s*)?)?mod\s+\w+\s*([;{])")
 
 
@@ -87,22 +93,29 @@ def strip_noncode(text: str) -> str:
     return blanked
 
 
-def strip_cfg_test_mods(stripped: str) -> str:
+def strip_cfg_test_mods(stripped: str, source: str = "<input>") -> str:
     """Remove inline `#[cfg(test)] mod … { … }` blocks by brace
     matching (on already-string/comment-blanked text, so braces are
     real). `#[cfg(test)] mod x;` REFERENCES are left alone — the
     referenced files are excluded by the /tests/ and naming rules; the
     old scanner's fatal mistake was treating that reference as "test
-    code starts here" and truncating the rest of the file."""
+    code starts here" and truncating the rest of the file.
+
+    The attr recognizer is the SHARED spelling-aware one (WO-S8-2):
+    every test-gating spelling shields its mod, and a file-scope
+    `#![cfg(test)]` (actor/debug.rs-class) blanks the whole file —
+    that file is test code the bare-spelling twin used to scan."""
+    spans = rust_strip.cfg_test_attr_spans(stripped, source)
+    for a, _b, inner in spans:
+        if inner and rust_strip._brace_depth_at(stripped, a) == 0:
+            return "".join(ch if ch == "\n" else " " for ch in stripped)
     out = stripped
-    pos = 0
-    while True:
-        m = CFG_TEST.search(out, pos)
-        if not m:
-            return out
-        after = MOD_AFTER.match(out, m.end())
+    # Process right-to-left so earlier spans' offsets stay valid.
+    for a, b, inner in reversed(spans):
+        if inner:
+            continue
+        after = MOD_AFTER.match(out, b)
         if not after or after.group(1) != "{":
-            pos = m.end()
             continue
         # brace-match from the opening `{`
         depth = 0
@@ -116,13 +129,13 @@ def strip_cfg_test_mods(stripped: str) -> str:
                     j += 1
                     break
             j += 1
-        blanked = "".join(ch if ch == "\n" else " " for ch in out[m.start() : j])
-        out = out[: m.start()] + blanked + out[j:]
-        pos = m.start() + len(blanked)
+        blanked = "".join(ch if ch == "\n" else " " for ch in out[a:j])
+        out = out[:a] + blanked + out[j:]
+    return out
 
 
-def preprocess(text: str) -> list[str]:
-    return strip_cfg_test_mods(strip_noncode(text)).splitlines()
+def preprocess(text: str, source: str = "<input>") -> list[str]:
+    return strip_cfg_test_mods(strip_noncode(text), source).splitlines()
 
 
 def scan_lines(rel: str, lines: list[str], pat: re.Pattern) -> list[str]:
@@ -208,6 +221,31 @@ def selftest(pat: re.Pattern, tokens: set[str]) -> str | None:
             "an escaped-quote char literal swallowed the production open "
             "below it (brace-skew truncation)"
         )
+    # Arm 10 (WO-S8-2, merged_bug_088 — W11-BT's twin): one derived
+    # plant per test-gating SPELLING. An open inside an
+    # `any(test, kani)`/`all(test, …)` mod is test code and must not
+    # fire (pre-fix: the bare-spelling regex leaked it into the
+    # population); the same open under `not(test)` is PRODUCTION and
+    # must fire.
+    for spelling in ("any(test, kani)", "all(test, target_os = \"linux\")"):
+        compound_mod = preprocess(
+            f"fn live() {{}}\n#[cfg({spelling})]\nmod tests {{\n"
+            f"    fn t() {{ let s = client.{t0}(req); }}\n}}\n"
+        )
+        if scan_lines("planted/compound_mod.rs", compound_mod, pat):
+            return f"an open inside a #[cfg({spelling})] mod fired (spelling leak)"
+    not_test_mod = preprocess(
+        f"#[cfg(not(test))]\nmod prod {{\n    fn f() {{ let s = client\n        .{t0}(req); }}\n}}\n"
+    )
+    if not scan_lines("planted/not_test_mod.rs", not_test_mod, pat):
+        return "a production open inside #[cfg(not(test))] did not fire (over-prune)"
+    # Arm 11 (WO-S8-2): a whole-file inner `#![cfg(test)]` gate — the
+    # actor/debug.rs class — is test code; nothing in it may fire.
+    inner_file = preprocess(
+        f"#![cfg(test)]\nfn t() {{ let s = client.{t0}(req); }}\n"
+    )
+    if scan_lines("planted/inner_file.rs", inner_file, pat):
+        return "an open inside a #![cfg(test)] file fired (inner-spelling leak)"
     return None
 
 
@@ -242,7 +280,14 @@ def main() -> int:
             if "/tests/" in rel or rel.endswith("test_helpers.rs") or f.name == "tests.rs" or f.name.endswith("_tests.rs"):
                 continue
             scanned += 1
-            fails.extend(scan_lines(rel, preprocess(f.read_text()), pat))
+            try:
+                lines = preprocess(f.read_text(), rel)
+            except rust_strip.StripError as e:
+                # R22″ fail-closed: an unclassifiable cfg extent is a
+                # named failure, never a silently mis-pruned scan.
+                fails.append(f"{e} [streaming-open ban: file not classifiable]")
+                continue
+            fails.extend(scan_lines(rel, lines, pat))
     print(f"streaming-open-ban: scanned {scanned} files (full bodies; comments/strings/test-mods stripped structurally)")
     if fails:
         print(
