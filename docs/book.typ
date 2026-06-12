@@ -69,6 +69,13 @@
     #chapter("ops/eks-smoke.typ")[EKS Smoke Test]
     #chapter("ops/sla-model.typ")[SLA Model Runbook]
     #chapter("ops/hung-node-manual-reap.typ")[Hung-Node Manual Reap]
+    #chapter("ops/pull-rollout-checklist.typ")[Pull Rollout Checklist]
+    #chapter(
+      "ops/gateway-deployment-checklist.typ",
+    )[Gateway Deployment Checklist]
+    #chapter(
+      "ops/materialization-deployment-checklist.typ",
+    )[Materialization Deployment Checklist]
     = Appendix
     #chapter("glossary.typ")[Glossary]
     #chapter("contributing.typ")[Contributing]

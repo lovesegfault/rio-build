@@ -123,5 +123,5 @@ deadlines, so reap it once confirmed:
 - Tuning: the thresholds (2 establishments / 30 minutes) are deliberately
   sensitive while the fleet has few pull-mode pools. If the alert becomes
   noisy from unrelated systemic causes, fix the systemic cause; only retune
-  the thresholds with a recorded justification (deployment-time validation
-  checklist row D3).
+  the thresholds with a recorded justification
+  (#cross-link("/ops/pull-rollout-checklist.typ")[the pull-rollout checklist] row D3).

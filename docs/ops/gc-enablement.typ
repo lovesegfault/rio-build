@@ -148,6 +148,27 @@ enabling or keeping the live collect arm; adding a
 `statement_timeout` on the upgrade path is the enforcement
 alternative the design names but does not take by default.
 
+*Monitored-assumption decisions behind this alert* (T-1a.4, relocated
+from the retired refcount invariant map; full record:
+`docs/spec/models/refcount-records.md`):
+
+- No `statement_timeout` is set: a timeout would add a new
+  writer-failure mode for zero observed need, and the histogram is
+  exactly the data that would justify a timeout value later if one is
+  wanted.
+- The collector-side snapshot anchor (anchoring the collect threshold
+  at the least of cycle start and the oldest transaction open at the
+  snapshot) is noted as available but not taken — it complicates the
+  snapshot for a window the grace term already covers whenever the
+  assumption holds.
+- Accepted blind spot: the histogram is recorded only at commit, so a
+  still-open transaction is invisible until the moment it commits —
+  exactly when it becomes dangerous. In shadow mode nothing is
+  deleted, so the gap has no harm reach; before the live arm is
+  enabled the owner must either accept the gap explicitly or close it
+  with a store-DB long-transaction check (the `pg_stat_activity`
+  query above) and/or the snapshot anchor.
+
 == Refcount-cutover deployment validation checklist (rows D0--D7)
 
 The chunk collector and the retirement of the legacy refcount readers
