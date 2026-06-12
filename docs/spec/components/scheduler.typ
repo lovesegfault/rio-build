@@ -5381,6 +5381,33 @@ smells of DDL (none is allocated). Same-class sibling swept: the
 controller's hw_perf_samples exposure cursor is a single in-memory
 monotone position with no second fencing axis --- verified, no edit.
 
+#r("sched.sla.gate-inventory")[
+  The footprint law's enforcement population MUST be a DERIVED gate
+  inventory: a generator walks the sizing planes for class-ceiling
+  consults and every class-axis mem-feasibility predicate consumes the
+  one constructed pod footprint (`container_mem_bytes`); a bare-solve
+  compare is census-RED, and a set-valued emission gated on an
+  existential is the predicate's IMAGE (per-cell filter), never a
+  whole-vector forward.
+]
+
+bug_036: the wave-11 footprint seal froze a census of two gate-equality
+oracles against a law that quantifies over EVERY mem-feasibility
+predicate --- solve admission and the shared-c* re-filter stayed bare,
+so a (cm − pad, cm] band cell entered the memo, failed per-cell
+survival, rode a surviving sibling through the `.any()` forward, and
+the converging chokepoint deterministically stripped it with the
+un-debounced "classify-coverage bug" warn EVERY poll --- falsifying the
+warn's own "re-routed upstream on BOTH arms" premise and desensitizing
+the channel the merged_bug_002 close declared load-bearing. The
+inventory census (`w12_ag_gate_inventory_census`) derives the file
+universe from the three sizing trees' module declarations, refuses
+aliased law symbols, and carries two TYPED ceiling-domain exceptions
+with rationale; the crate-rest/workspace face is the registry-union row
+(WO-S8-14(i)). W12-AG drives both faces: the solve emission equals its
+own chokepoint image, and the memo arm forwards only the survival
+predicate's image with the strip-warn channel quiet.
+
 #r("sched.sla.forecast.one-layer+2")[
   `compute_spawn_intents` walks the Ready frontier AND a forecast frontier of
   `Queued` derivations whose every incomplete dependency is running with a

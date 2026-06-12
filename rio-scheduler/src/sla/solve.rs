@@ -863,7 +863,16 @@ fn evaluate_cell(
     if mem > ceil.max_mem {
         return Err(CellReject::MemCeiling);
     }
-    if c_star > class_max.0 || mem > class_max.1 {
+    // r[impl sched.sla.gate-inventory]
+    // bug_036: the class-ceiling mem compare consumes the CONSTRUCTED
+    // pod footprint — the same quantity the memo-survival filter and
+    // the post-finalize chokepoint compare. A bare-solve admission
+    // here let a (cm − pad, cm] band cell enter the memo, fail
+    // per-cell survival, and steady-state through the chokepoint's
+    // load-bearing "classify-coverage bug" strip warn. (The global
+    // gate above is the solve-cap law's: the chokepoint CLAMPS the
+    // global axis in solve domain — merged_bug_016 — it never strips.)
+    if c_star > class_max.0 || rio_common::footprint::container_mem_bytes(mem) > class_max.1 {
         return Err(CellReject::ClassCeiling);
     }
     let price = cost.price(&cell);
@@ -1073,9 +1082,11 @@ pub fn solve_full(
             .iter()
             .filter(|c| {
                 let cm = class_max_of(&c.cell.0);
+                // bug_036: the shared-c* re-filter pads identically —
+                // one constructed quantity at every class-axis gate.
                 f64::from(c.c_star) >= f64::from(c_star) / k
                     && c_star <= cm.0
-                    && mem <= cm.1
+                    && rio_common::footprint::container_mem_bytes(mem) <= cm.1
                     && e_cost_upper(fit, c_star, c.factor, c.lambda, cost.price(&c.cell))
                         <= thresh(&c.cell) * e_min
             })
@@ -3604,5 +3615,378 @@ mod tests {
         // Against p90=1200: c*≈1.95 → ceil 2.
         assert_eq!(c, 2, "ceil(solve_tier.c_star)");
         assert_eq!(d, 10 << 30, "disk_p90 from fit");
+    }
+    // r[verify sched.sla.gate-inventory]
+    /// **W12-AG (bug_036, red-first; the solve face)** — *every
+    /// class-axis mem-feasibility predicate consumes the constructed
+    /// footprint, so a solve emission equals its own post-finalize
+    /// chokepoint image.* Band fixture: intel-6's cm puts the solved
+    /// mem in the (cm − pad, cm] band — bare admits, padded rejects —
+    /// while intel-7/8 host comfortably. Pre-fix red: solve admission
+    /// was BARE (solve.rs held ZERO footprint references), the band
+    /// cells entered the admissible set, and the padded chokepoint
+    /// stripped them — the load-bearing "classify-coverage bug" strip
+    /// warn became a steady-state path, desensitized every poll.
+    /// Post-fix the inventory is uniform and nothing strips: the warn
+    /// channel's sensitivity is restored structurally (zero strips ⇒
+    /// zero warns).
+    #[test]
+    fn w12_ag_solve_emission_equals_its_chokepoint_image() {
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        // Wide cost deadband: ALL THREE classes enter the admissible
+        // set (the band shape needs the dead cell BESIDE survivors —
+        // with the default deadband only the fastest class admits and
+        // the assertions would be vacuous).
+        let mut cfg0 = cfg_hw();
+        cfg0.hw_cost_tolerance = 10.0;
+        // Derive the solved mem through the public API (huge ceilings).
+        let SolveFullResult::Feasible(probe) = solve_full(
+            &fit,
+            &[t("normal", 1200.0)],
+            &hw_three(),
+            &ct(),
+            &ceil(),
+            &cfg0,
+            &h_set(),
+            &HashSet::new(),
+            false,
+        ) else {
+            panic!("probe solve must be feasible")
+        };
+        assert!(
+            probe.a.cells.iter().any(|(h, _)| h == "intel-6"),
+            "precondition: the wide deadband admits intel-6: {:?}",
+            probe.a.cells
+        );
+        let m = probe.a.mem_bytes;
+        // intel-6 lands mid-band: bare m <= cm6, padded m + pad > cm6.
+        let cm6 = m + (128 << 20);
+        let cm_big = m + (1 << 30);
+        let mut cfg = cfg0;
+        cfg.hw_classes.get_mut("intel-6").unwrap().max_mem = Some(cm6);
+        cfg.hw_classes.get_mut("intel-7").unwrap().max_mem = Some(cm_big);
+        cfg.hw_classes.get_mut("intel-8").unwrap().max_mem = Some(cm_big);
+        let SolveFullResult::Feasible(memo) = solve_full(
+            &fit,
+            &[t("normal", 1200.0)],
+            &hw_three(),
+            &ct(),
+            &ceil(),
+            &cfg,
+            &h_set(),
+            &HashSet::new(),
+            false,
+        ) else {
+            panic!("siblings host: the solve stays feasible")
+        };
+        assert!(
+            !memo.a.cells.iter().any(|(h, _)| h == "intel-6"),
+            "the band cell never enters the emission (pre-fix red: bare \
+             admission let it ride a surviving sibling): {:?}",
+            memo.a.cells
+        );
+        // The image law: the chokepoint strips NOTHING from the solve's
+        // own emission — set equality, the structural form of "the
+        // strip-warn channel is quiet in steady state".
+        let kept = cfg.retain_hosting_cells(
+            memo.a.cells.clone(),
+            "x",
+            (memo.a.c_star, memo.a.mem_bytes),
+            &[],
+            ct().catalog_ceilings(),
+            ct().resolved_global(),
+            None,
+        );
+        assert_eq!(
+            kept, memo.a.cells,
+            "emission == its chokepoint image (zero strips)"
+        );
+    }
+
+    // ── The mem-feasibility GATE INVENTORY (bug_036; [GEN-SET]; the
+    //    §2 census riders (a)+(b)) ──────────────────────────────────
+    //
+    // Jurisdiction: the three sizing-plane module trees (sla/, actor/,
+    // admin/), each file universe DERIVED from its mod.rs declarations
+    // (cfg(test) decls excluded) and embedded below — the
+    // completeness assert REDs when a declared module is missing from
+    // the corpus. The crate-rest/workspace face is the registry-union
+    // row (H5⁗ → WO-S8-14(i)): the nix-side generator re-runs this
+    // grammar tree-wide outside the nextest sandbox (PD-1 split form).
+    //
+    // Grammar: every `class_ceilings(` / `class_max_of(` consult is an
+    // inventory member; every class-axis MEM compare (`cm`, `cm.1`,
+    // `class_max.1` as a comparison operand) within a member file must
+    // consume `container_mem_bytes(` in its statement window. Typed
+    // exceptions (committed WITH rationale, PD-8 form):
+    //   1. `gm <= cm` (config.rs global-hosting disclosure): both
+    //      sides are CEILING-domain — the resolved global vs the class
+    //      ceiling — not a solve-vs-ceiling feasibility gate.
+    // The cores half (`cc`, `cm.0`, `class_max.0`) carries no padding
+    // law and is exempt by construction.
+
+    fn gate_corpus() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("sla/alpha", include_str!("alpha.rs")),
+            ("sla/bootstrap", include_str!("bootstrap.rs")),
+            ("sla/catalog", include_str!("catalog.rs")),
+            ("sla/config", include_str!("config.rs")),
+            ("sla/cost", include_str!("cost.rs")),
+            ("sla/dip", include_str!("dip.rs")),
+            ("sla/explain", include_str!("explain.rs")),
+            ("sla/explore", include_str!("explore.rs")),
+            ("sla/fit", include_str!("fit.rs")),
+            ("sla/hw", include_str!("hw.rs")),
+            ("sla/ingest", include_str!("ingest.rs")),
+            ("sla/metrics", include_str!("metrics.rs")),
+            ("sla/override", include_str!("override.rs")),
+            ("sla/prior", include_str!("prior.rs")),
+            ("sla/quantile", include_str!("quantile.rs")),
+            ("sla/solve", include_str!("solve.rs")),
+            ("sla/types", include_str!("types.rs")),
+            ("actor/breaker", include_str!("../actor/breaker.rs")),
+            ("actor/build", include_str!("../actor/build.rs")),
+            ("actor/command", include_str!("../actor/command.rs")),
+            ("actor/completion", include_str!("../actor/completion.rs")),
+            ("actor/config", include_str!("../actor/config.rs")),
+            ("actor/dispatch", include_str!("../actor/dispatch.rs")),
+            ("actor/event", include_str!("../actor/event.rs")),
+            ("actor/executor", include_str!("../actor/executor.rs")),
+            ("actor/floor", include_str!("../actor/floor.rs")),
+            ("actor/handle", include_str!("../actor/handle.rs")),
+            (
+                "actor/housekeeping",
+                include_str!("../actor/housekeeping.rs"),
+            ),
+            ("actor/materialize", include_str!("../actor/materialize.rs")),
+            ("actor/merge", include_str!("../actor/merge.rs")),
+            ("actor/pull", include_str!("../actor/pull.rs")),
+            ("actor/recovery", include_str!("../actor/recovery.rs")),
+            ("actor/report_ctx", include_str!("../actor/report_ctx.rs")),
+            ("actor/snapshot", include_str!("../actor/snapshot.rs")),
+            ("admin/builds", include_str!("../admin/builds.rs")),
+            ("admin/executors", include_str!("../admin/executors.rs")),
+            ("admin/gc", include_str!("../admin/gc.rs")),
+            ("admin/graph", include_str!("../admin/graph.rs")),
+            ("admin/mod", include_str!("../admin/mod.rs")),
+            ("admin/sla", include_str!("../admin/sla.rs")),
+            (
+                "admin/spawn_intents",
+                include_str!("../admin/spawn_intents.rs"),
+            ),
+            ("admin/tenants", include_str!("../admin/tenants.rs")),
+        ]
+    }
+
+    fn strip_tests_prod(src: &str) -> &str {
+        src.split_once("#[cfg(test)]\nmod").map_or(src, |(p, _)| p)
+    }
+
+    /// `mod X;` declarations (any visibility), skipping cfg(test)-gated
+    /// ones — the jurisdiction derivation for one tree.
+    fn file_mod_decls(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut prev_cfg_test = false;
+        for l in src.lines() {
+            let t = l.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if t == "#[cfg(test)]" {
+                prev_cfg_test = true;
+                continue;
+            }
+            let decl = t
+                .strip_prefix("pub(crate) mod ")
+                .or_else(|| t.strip_prefix("pub mod "))
+                .or_else(|| t.strip_prefix("mod "));
+            if let Some(rest) = decl
+                && let Some(m) = rest.strip_suffix(';')
+                && !prev_cfg_test
+            {
+                out.push(m.trim_start_matches("r#").to_owned());
+            }
+            prev_cfg_test = false;
+        }
+        out
+    }
+
+    /// One class-axis MEM-ceiling comparison on this line? (`cm.1`,
+    /// `class_max.1`, or bare destructured `cm` as a compare operand —
+    /// the cores half is exempt by construction.)
+    fn line_has_mem_ceiling_compare(l: &str) -> bool {
+        let t = l.trim_start();
+        if t.starts_with("//") || t.starts_with("///") {
+            return false;
+        }
+        for pat in ["class_max.1", "cm.1"] {
+            let mut from = 0;
+            while let Some(rel) = l[from..].find(pat) {
+                let i = from + rel;
+                let lo = i.saturating_sub(4);
+                let hi = (i + pat.len() + 4).min(l.len());
+                if l[lo..hi].contains('<') || l[lo..hi].contains('>') {
+                    return true;
+                }
+                from = i + pat.len();
+            }
+        }
+        let b = l.as_bytes();
+        let mut from = 0;
+        while let Some(rel) = l[from..].find("cm") {
+            let i = from + rel;
+            let pre_ok = i == 0 || (!b[i - 1].is_ascii_alphanumeric() && b[i - 1] != b'_');
+            let j = i + 2;
+            let post_ok =
+                j >= l.len() || (!b[j].is_ascii_alphanumeric() && b[j] != b'_' && b[j] != b'.');
+            if pre_ok && post_ok {
+                let lo = i.saturating_sub(4);
+                let hi = (j + 4).min(l.len());
+                if l[lo..hi].contains('<') || l[lo..hi].contains('>') {
+                    return true;
+                }
+            }
+            from = j;
+        }
+        false
+    }
+
+    /// Walk one file: (consult count, violation lines). Err = grammar
+    /// refusal (aliased law symbols are unclassifiable).
+    fn scan_mem_gates(name: &str, src: &str) -> Result<(usize, Vec<String>), String> {
+        let prod = strip_tests_prod(src);
+        for alias in [
+            "class_ceilings as",
+            "class_max_of as",
+            "container_mem_bytes as",
+        ] {
+            if prod.contains(alias) {
+                return Err(format!("{name}: `{alias}` — aliased law symbol, refused"));
+            }
+        }
+        let consults =
+            prod.matches("class_ceilings(").count() + prod.matches("class_max_of(").count();
+        let lines: Vec<&str> = prod.lines().collect();
+        let mut violations = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            if !line_has_mem_ceiling_compare(l) {
+                continue;
+            }
+            // Statement window: this line + the two above (rustfmt may
+            // split `container_mem_bytes(x) <= cm` across lines).
+            let lo = i.saturating_sub(2);
+            let window = lines[lo..=i].join(" ");
+            if window.contains("container_mem_bytes(") {
+                continue;
+            }
+            // Typed exception 1: the ceiling-domain global-hosting
+            // disclosure (`gm <= cm`) — both sides are ceilings.
+            if window.contains("gm <= cm") {
+                continue;
+            }
+            // Typed exception 2: config validation's override-vs-catalog
+            // no-effect warn (`n > cm`, n = the per-class max_mem
+            // OVERRIDE) — ceiling-domain on both sides, not a
+            // solve-vs-ceiling feasibility gate.
+            if window.contains("&& n > cm") {
+                continue;
+            }
+            violations.push(format!("{name}:{}: {}", i + 1, l.trim()));
+        }
+        Ok((consults, violations))
+    }
+
+    // r[verify sched.sla.gate-inventory]
+    /// **The gate-inventory census (CE-1 riders: jurisdiction +
+    /// population + membership).** A bare class-axis mem compare
+    /// anywhere in the three sizing trees is a RED; the consult
+    /// population floor and the WO-named expected members
+    /// (solve admission ×2, memo survival, all_candidates fallback,
+    /// chokepoint gates) are pinned by the committed counts.
+    #[test]
+    fn w12_ag_gate_inventory_census() {
+        let corpus = gate_corpus();
+        // Jurisdiction: every non-test module declared in the three
+        // trees is embedded (sla via mod.rs; actor + admin via their
+        // mod.rs files — admin/mod.rs is itself corpus content).
+        let trees: [(&str, &str); 3] = [
+            ("sla", include_str!("mod.rs")),
+            ("actor", include_str!("../actor/mod.rs")),
+            ("admin", include_str!("../admin/mod.rs")),
+        ];
+        for (tree, modsrc) in trees {
+            let decls = file_mod_decls(modsrc);
+            assert!(
+                !decls.is_empty(),
+                "population floor: {tree} mod decls parse"
+            );
+            for m in &decls {
+                let label = format!("{tree}/{m}");
+                assert!(
+                    corpus.iter().any(|(n, _)| *n == label),
+                    "module `{label}` declared but missing from the \
+                     gate-inventory corpus — jurisdiction gap (add the embed)"
+                );
+            }
+        }
+        // Membership + the zero-violation law.
+        let mut total_consults = 0usize;
+        for (name, src) in &corpus {
+            let (consults, violations) =
+                scan_mem_gates(name, src).expect("no aliased law symbols in tree");
+            total_consults += consults;
+            assert!(
+                violations.is_empty(),
+                "BARE class-axis mem compare(s) — every mem-feasibility \
+                 gate consumes the constructed footprint:\n{}",
+                violations.join("\n")
+            );
+        }
+        assert!(
+            total_consults >= 7,
+            "population floor: the inventory walked the known consult \
+             sites (solve admission + re-filter closure, memo survival, \
+             all_candidates fallback, chokepoint, admin projection, \
+             global derive); got {total_consults}"
+        );
+    }
+
+    /// **Gate-inventory planted reds (riders (b)) — each face's oracle
+    /// driven through the SAME scan path.**
+    #[test]
+    fn w12_ag_gate_inventory_planted_reds() {
+        // (1) ENROLLMENT plant: an in-grammar bare gate is FOUND and
+        // violates.
+        let strawman = "fn admit(cfg: &SlaConfig, h: &str, mem: u64) -> bool {\n\
+            let (cc, cm) = cfg.class_ceilings(h, &cat, g);\n\
+            cores <= cc && mem <= cm\n\
+        }\n";
+        let (consults, violations) = scan_mem_gates("strawman", strawman).unwrap();
+        assert_eq!(consults, 1, "the walk FINDS the planted consult");
+        assert_eq!(violations.len(), 1, "…and the bare mem compare REDs");
+        // (2) JURISDICTION plant: a phantom module decl misses the
+        // corpus — the completeness loop's oracle.
+        let decls = file_mod_decls("pub mod solve;\n#[cfg(test)]\nmod tests;\nmod phantom;\n");
+        assert!(decls.contains(&"phantom".to_owned()));
+        assert!(
+            !decls.contains(&"tests".to_owned()),
+            "cfg(test) decls excluded"
+        );
+        assert!(
+            !gate_corpus().iter().any(|(n, _)| *n == "sla/phantom"),
+            "the planted module is absent — the live completeness loop REDs here"
+        );
+        // (3) GRAMMAR-REFUSAL plant: an aliased law symbol ERRORS.
+        let evader = "use rio_common::footprint::container_mem_bytes as pad;\n\
+            fn f(mem: u64, cm: u64) -> bool { pad(mem) <= cm }\n";
+        assert!(scan_mem_gates("evader", evader).is_err(), "alias refused");
+        // (4) EXCEPTION-TIGHTNESS plants: RENAMED ceiling-domain
+        // compares do NOT inherit the typed exceptions.
+        let renamed = "let hosted = gmx <= cm;\n";
+        let (_, v) = scan_mem_gates("renamed", renamed).unwrap();
+        assert_eq!(v.len(), 1, "only the committed `gm <= cm` text is exempt");
+        let renamed2 = "if x > cm {\n";
+        let (_, v2) = scan_mem_gates("renamed2", renamed2).unwrap();
+        assert_eq!(v2.len(), 1, "only the committed `&& n > cm` text is exempt");
     }
 }

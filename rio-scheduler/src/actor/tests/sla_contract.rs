@@ -6641,6 +6641,78 @@ async fn memo_arm_floor_bump_is_classified_not_silent_empty() {
     );
 }
 
+// r[verify sched.sla.gate-inventory]
+/// **W12-AG (bug_036; the memo face)** — *the memo arm's emission is
+/// the survival predicate's IMAGE — the partial-survivor population
+/// the .any() gate collapsed.* Post-memo floor bump lands eff_mem in
+/// intel-6's (cm − pad, cm] band while intel-7/8 still host: pre-fix
+/// red — the .any() over the surviving siblings forwarded the FULL
+/// cells vector, the converging chokepoint recomputed the identical
+/// eff_mem and deterministically stripped intel-6 with the
+/// un-debounced "classify-coverage bug" warn EVERY poll (the warn's
+/// own "re-routed upstream on BOTH arms" premise falsified; the
+/// channel the merged_bug_002 close declared load-bearing
+/// desensitized). Post-fix the dead cell never leaves the memo arm:
+/// the emission routes the survivors and the strip-warn channel stays
+/// quiet — its sensitivity restored.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn w12_ag_memo_band_cell_forwards_only_the_image() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // Wide cost deadband so ALL THREE classes enter the admissible set
+    // (the band shape needs a surviving sibling BESIDE the dead cell).
+    actor.sla_config.hw_cost_tolerance = 10.0;
+    // intel-6 hosts 64 GiB containers; siblings host 128 GiB.
+    actor
+        .sla_config
+        .hw_classes
+        .get_mut("intel-6")
+        .unwrap()
+        .max_mem = Some(64 << 30);
+    for h in ["intel-7", "intel-8"] {
+        actor.sla_config.hw_classes.get_mut(h).unwrap().max_mem = Some(128 << 30);
+    }
+    actor.test_inject_ready("d-memo-band", Some("test-pkg"), "x86_64-linux", false);
+
+    let (hw, cost, g) = actor.solve_inputs();
+    let state = actor.dag.node("d-memo-band").unwrap();
+    let i0 = actor.solve_intent_for(state, &hw, &cost, g);
+    assert!(
+        i0.hw_class_names.contains(&"intel-6".to_string()),
+        "precondition: the memo admits intel-6 at the un-bumped demand: {i0:?}"
+    );
+
+    // Post-memo floor bump into intel-6's band: container(64 GiB) =
+    // 64.25 GiB > 64 GiB (intel-6 dies) and <= 128 GiB (siblings host).
+    actor
+        .dag
+        .node_mut("d-memo-band")
+        .unwrap()
+        .sched
+        .resource_floor
+        .mem_bytes = 64 << 30;
+
+    let state = actor.dag.node("d-memo-band").unwrap();
+    let i1 = actor.solve_intent_for(state, &hw, &cost, g);
+    assert!(
+        !i1.hw_class_names.contains(&"intel-6".to_string()),
+        "the band cell never rides a surviving sibling out of the memo \
+         arm: {i1:?}"
+    );
+    assert!(
+        i1.hw_class_names.contains(&"intel-7".to_string())
+            && i1.hw_class_names.contains(&"intel-8".to_string()),
+        "the surviving siblings route: {i1:?}"
+    );
+    assert!(
+        !logs_contain("classify-coverage bug"),
+        "the load-bearing strip warn stays QUIET — pre-fix the chokepoint \
+         stripped the forwarded band cell here every poll, steady-state"
+    );
+}
+
 // r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **W9-Q (merged_bug_057)** — *time-only BestEffort (SerialFloor)
 /// featureless demand fitting every class does NOT mint StaleSolve

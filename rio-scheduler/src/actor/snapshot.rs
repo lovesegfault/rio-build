@@ -2905,15 +2905,32 @@ impl DagActor {
                     .mem_bytes
                     .max(fclamped.mem_bytes)
                     .min(super::floor::mem_solve_cap(&self.sla_ceilings));
-                let survives = cells.iter().any(|(h, _)| {
-                    let (cc, cm) = self.sla_config.class_ceilings(
-                        h,
-                        cost.catalog_ceilings(),
-                        cost.resolved_global(),
-                    );
-                    eff_cores <= cc && rio_common::footprint::container_mem_bytes(eff_mem) <= cm
-                });
-                if survives {
+                // r[impl sched.sla.gate-inventory]
+                // bug_036: the emission is the survival predicate's
+                // IMAGE — a per-cell filter, exactly as the
+                // all_candidates fallback above filters — never an
+                // .any() gate forwarding the whole vector. Pre-fix a
+                // (cm − pad, cm] band cell of a smaller class rode a
+                // surviving sibling into the emission and the
+                // converging chokepoint deterministically stripped it
+                // EVERY poll with the un-debounced "classify-coverage
+                // bug" warn — falsifying that warn's own "re-routed
+                // upstream on BOTH arms" premise and desensitizing the
+                // channel the merged_bug_002 close declared
+                // load-bearing.
+                let surviving: Vec<_> = cells
+                    .iter()
+                    .filter(|(h, _)| {
+                        let (cc, cm) = self.sla_config.class_ceilings(
+                            h,
+                            cost.catalog_ceilings(),
+                            cost.resolved_global(),
+                        );
+                        eff_cores <= cc && rio_common::footprint::container_mem_bytes(eff_mem) <= cm
+                    })
+                    .cloned()
+                    .collect();
+                if !surviving.is_empty() {
                     // bug_119: a memo emission whose cells survive the
                     // live ceilings is a HEALTHY letter too — the heal
                     // edge closes any open disclosure episode here
@@ -2929,7 +2946,7 @@ impl DagActor {
                         memo.a.c_star,
                         memo.a.mem_bytes,
                         memo.a.disk_bytes,
-                        cells,
+                        surviving,
                         Some(memo.tier),
                     )
                 } else {
