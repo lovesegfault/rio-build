@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use crate::{Digest, Error, Kind, Result};
@@ -80,7 +81,14 @@ pub(crate) fn write(dir: &Path, view: &IndexView) -> Result<()> {
 
     let tmp = dir.join(INDEX_TMP);
     {
-        let mut f = fs::File::create(&tmp)?;
+        // 0600 like the segments: the root table leaks store-path
+        // names (project structure) even without blob access.
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)?;
         io::Write::write_all(&mut f, &out)?;
         f.sync_data()?;
     }

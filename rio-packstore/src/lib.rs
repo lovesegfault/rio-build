@@ -25,7 +25,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -172,27 +172,38 @@ impl PackStore {
     /// exclusive lock is free. No background work survives this call.
     pub fn open(dir: impl AsRef<Path>, opts: Options) -> Result<PackStore> {
         let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(dir.join(segment::PACKS_DIR))?;
+        // Owner-only: the store holds fetched private source trees
+        // (flake inputs). Modes apply at creation only — pre-existing
+        // stores keep whatever the operator chose.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir.join(segment::PACKS_DIR))?;
         let lock_file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
+            .mode(0o600)
             .open(dir.join("gc.lock"))?;
 
         let mut view = load_or_rebuild(&dir)?;
         let mut last_gc = None;
         if gc::triggers_fire(&dir, &opts, &view)? && lock::try_lock_exclusive(&lock_file)? {
             let result = (|| {
-                // Re-load under the lock: another process may have
-                // flushed or GC'd between our first read and lock
-                // acquisition.
+                // Re-load AND re-check under the lock: another process
+                // may have flushed or completed a GC between our first
+                // check and lock acquisition — running anyway would
+                // repack an already-clean store.
                 let fresh = load_or_rebuild(&dir)?;
-                gc::run(&dir, &opts, unix_now(), fresh)
+                if !gc::triggers_fire(&dir, &opts, &fresh)? {
+                    return Ok((fresh, None));
+                }
+                gc::run(&dir, &opts, unix_now(), fresh).map(|(v, s)| (v, Some(s)))
             })();
             lock::unlock(&lock_file)?;
             let (gc_view, stats) = result?;
             view = gc_view;
-            last_gc = Some(stats);
+            last_gc = stats;
         }
 
         Ok(PackStore {
