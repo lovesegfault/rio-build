@@ -79,6 +79,13 @@ impl Dns1123Label {
     /// a pass-through identity can never equal a salted identity, by
     /// construction, not by probability.
     ///
+    /// bug_005 (R28 secondary-input axis): `fallback_stem` is the
+    /// seal's SECOND input axis — the empty-raw arm re-enters
+    /// sanitize with the composed fallback instead of embedding the
+    /// caller's stem verbatim, so a non-conforming stem cannot mint
+    /// an invalid label through the one constructor whose point is
+    /// making that unrepresentable (W11-BO pins both axes).
+    ///
     /// - A raw that is already a valid label within the budget passes
     ///   through unchanged — unless it is salt-shaped (above).
     /// - A raw that must be ALTERED (case-folded, invalid bytes
@@ -129,7 +136,22 @@ impl Dns1123Label {
                 raw,
                 "no usable identity in raw hostname; using a random-salted dev identity"
             );
-            return Dns1123Label(format!("{fallback_stem}-{:08x}", nonce & 0xffff_ffff));
+            // bug_005 (R28 secondary-input axis): EVERY input axis of
+            // a by-construction newtype routes through the seal — the
+            // composed fallback RE-ENTERS sanitize, so a
+            // non-conforming caller-supplied stem (uppercase,
+            // underscores, overlong, empty) is sanitized instead of
+            // embedded verbatim into the validated type. Terminates
+            // structurally: the recursed raw carries the 8-hex nonce
+            // segment, which survives sanitization (non-empty out),
+            // so the empty-raw arm cannot re-fire; the salt-shaped
+            // raw then takes the deterministic-salt arm, keeping the
+            // namespace partition law intact.
+            return Self::sanitize(
+                &format!("{fallback_stem}-{:08x}", nonce & 0xffff_ffff),
+                reserved,
+                "rio",
+            );
         }
         if out == raw && !Self::is_salt_shaped(&out) {
             return Dns1123Label(out);
@@ -379,6 +401,37 @@ mod tests {
                     .with_worker(n);
                 prop_assert_eq!(composed, again);
             }
+        }
+
+        // r[verify store.materialize.worker-identity]
+        /// W11-BO (bug_005, R28 secondary-input axis): the seal covers
+        /// BOTH input axes — `fallback_stem` is caller-supplied too,
+        /// and the empty-raw arm pre-fix embedded it VERBATIM into the
+        /// validated newtype (no alphabet/case/budget enforcement;
+        /// every existing test held the stem at a short valid
+        /// constant, so the hole was untriggered, not unwritable).
+        /// Population: the full two-axis input domain — arbitrary raw
+        /// × adversarial stems (uppercase, underscores, overlong,
+        /// empty). Pre-fix red: `invalid label "BAD_STEM-xxxxxxxx"
+        /// from raw "" stem "BAD_STEM"`.
+        #[test]
+        fn sanitize_total_over_both_input_axes(
+            raw in ".{0,100}",
+            stem in ".{0,100}",
+        ) {
+            let label = Dns1123Label::sanitize(&raw, WORKER_SUFFIX_RESERVED, &stem);
+            prop_assert!(
+                is_dns1123_label(label.as_str()),
+                "invalid label {:?} from raw {:?} stem {:?}",
+                label.as_str(),
+                raw,
+                stem
+            );
+            prop_assert!(
+                label.as_str().len() <= DNS1123_MAX_LEN - WORKER_SUFFIX_RESERVED,
+                "budget violated: {:?}",
+                label.as_str()
+            );
         }
 
         /// merged_bug_127 namespace-disjointness LAW over arbitrary
