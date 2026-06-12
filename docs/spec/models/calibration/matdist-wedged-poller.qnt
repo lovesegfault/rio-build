@@ -40,6 +40,8 @@ module matDistCalibWedgedPoller {
     EAGER_STEAL = false,
     OWNER_SERVE_SKEW = false,
     WEDGE_AXIS_ENABLED = true,
-    WEDGED_KEEPS_BEATING = true
+    WEDGED_KEEPS_BEATING = true,
+    DEAD_AXIS_ENABLED = false,
+    DEAD_HEAD_SERVED = false
   ).* from "../materializationDistribution"
 }
