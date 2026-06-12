@@ -2202,6 +2202,30 @@ impl AckApplyPlan {
         // ice.clear() exactly the cell that had been failing.
         // `LegacyUnarmed` (one array absent — the pre-field-14 echo)
         // carries NO cell information and neither arms nor disarms.
+        //
+        // bug_124 (`ctrl.pool.echo-provenance` — the cross-crate echo
+        // region): the Armed arm below OVERWRITES `dispatched_cells`
+        // on EVERY re-ack, and the first pull clears the ICE ladder
+        // under an exactly-one-cell proof premised on the pod's
+        // SPAWN-TIME affinity (actor/pull.rs `clear_ice`) — so the
+        // controller's re-ack lanes echo the spawn-time
+        // `rio.build/intent-cells` stamp on every lane (the live
+        // render may confirm, never substitute). The
+        // `dispatched_cells` WRITER/LIFECYCLE enumeration for the
+        // round-12 registry's workspace-union row (derived by grep
+        // over rio-scheduler/src — the in-commit enumeration the S6
+        // handoff relays; the controller-side consumer census walks
+        // its own crate only):
+        //   - snapshot.rs (HERE): `Empty` remove (positive disarm) +
+        //     `Armed` insert (the overwrite this law governs);
+        //   - actor/pull.rs: the first-pull remove-and-clear (the
+        //     exactly-one-cell consumer) + the two terminal-lane
+        //     removes;
+        //   - actor/mod.rs: the generation clear (stale entries from
+        //     a previous generation must not attribute re-dispatched
+        //     drvs);
+        //   - actor/housekeeping.rs: the status sweep retain
+        //     (Ready|Assigned|Running only).
         for (id, arm) in armed {
             match arm {
                 ArmDecode::Empty => {

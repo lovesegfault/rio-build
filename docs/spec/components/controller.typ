@@ -402,6 +402,35 @@ one predicate diverge exactly under the lag regime where the consumer
 deletes; the union producer (`demand_held_intents`) is the R33 form:
 one quantity, one producer, every consumer imports.
 
+#r("ctrl.pool.echo-provenance")[
+  Echo-integrity laws carry a PROVENANCE axis: the spawn-time
+  `rio.build/intent-cells` stamp is the SINGLE echo source for every
+  re-ack lane --- a re-ack channel MUST NOT re-derive its cell
+  payload from live read-time state (the rendered page, a re-solve, a
+  masked view); the live copy may CONFIRM the stamp but never
+  SUBSTITUTE it, a celled Job without a stamp produces NO re-ack row
+  (the scheduler keeps its last-armed truth), and the re-ack
+  emission lanes MUST be a derived census (machine-walked over the
+  lane grammar with the provenance named per lane), never a hand
+  list.
+]
+
+The round-12 instance (bug_124): the on-page re-ack arm echoed the
+read-time render --- `GetSpawnIntents` applies the scheduler's live
+ICE mask OUTSIDE the solve memo --- while every Armed re-ack
+unconditionally overwrites `dispatched_cells` and the first pull
+clears the ICE ladder under an exactly-one-cell proof premised on the
+pod's SPAWN-TIME affinity. A 2-cell spawn whose render shrank to 1
+let a pod frozen on OR-of-both clear the WRONG cell's ladder with
+zero launch evidence: the same N−1 forgery the merged_bug_134 law
+forbids, reached through the unsealed echo-PROVENANCE axis (that seal
+enumerated decode/skew only --- the quantifier-shape gap). A re-ack
+channel re-deriving its payload from live state drifts precisely when
+the system acts. The reader census is split-form: the in-crate
+emission lanes are walked and tagged in the controller; the
+scheduler-side `dispatched_cells` writer sites are expected members
+of the round-12 registry's workspace-union row.
+
 #r("ctrl.pool.container-overhead+2")[
   The container memory limit binds the WHOLE container --- the worker
   daemon, FUSE client, and log capture are resident beside the build,

@@ -2020,9 +2020,22 @@ pub(super) fn cells_from_annotation(
 /// close): `to_ack` DERIVES from the controller's own Job LIST — the
 /// local COMPLETE inventory — instead of filtering the demand page,
 /// so the `ctrl.pool.ack-spawned-soundness` restart-totality contract
-/// holds independent of paging. Per pending (non-reaped) Job:
+/// holds independent of paging. Per pending (non-reaped) Job, the
+/// CELL payload always comes from the spawn-time stamp (bug_124,
+/// `ctrl.pool.echo-provenance`: the page copy is the READ-TIME
+/// render — the live ICE mask is applied outside the solve memo —
+/// and may CONFIRM the stamp but never SUBSTITUTE it):
 ///
-/// - intent ON the page → the page copy (full-fidelity echo);
+/// - intent ON the page, stamped → the page copy's non-cell fields
+///   plus the STAMP's `(names, terms)` zip (render divergence is
+///   the lawful drift the stamp exists to survive; disclosed at
+///   debug);
+/// - ON-page, unstamped, hw-agnostic → the page copy as-is (never
+///   stamped; nothing was armed — the Empty echo's positive disarm
+///   is the spawn-time truth);
+/// - ON-page, unstamped, CELLED → SKIPPED (no provenance-clean echo
+///   exists; the scheduler keeps its last-armed truth — the
+///   off-page no-stamp lane's exact posture);
 /// - OFF-page → reconstructed from the Job's own stamps
 ///   ([`INTENT_CELLS_ANNOTATION`] → the minimal decodable echo; the
 ///   scheduler reads `intent_id` + the `(names, terms)` zip and
@@ -2047,6 +2060,7 @@ pub(super) fn cells_from_annotation(
 /// Census row (W10-AH): continuity / derives-from-Job-LIST.
 // r[impl ctrl.pool.demand-completeness]
 // r[impl ctrl.pool.ack-spawned-soundness]
+// r[impl ctrl.pool.echo-provenance]
 pub(crate) fn assemble_re_acks(
     page: &IntentPage,
     pool: &str,
@@ -2069,8 +2083,68 @@ pub(crate) fn assemble_re_acks(
         })
         .filter_map(|j| {
             let name = j.metadata.name.as_deref()?;
+            let stamp = j
+                .spec
+                .as_ref()
+                .and_then(|s| s.template.metadata.as_ref())
+                .and_then(|m| m.annotations.as_ref())
+                .and_then(|a| a.get(INTENT_CELLS_ANNOTATION));
             if let Some(on_page) = page_by_name.get(name) {
-                return Some((*on_page).clone());
+                // bug_124 (`ctrl.pool.echo-provenance`): the
+                // spawn-time stamp is the SINGLE echo source for the
+                // on-page lane too. The page copy is the READ-TIME
+                // render — the scheduler applies its live ICE mask
+                // OUTSIDE the solve memo — so echoing it lets
+                // mask/re-solve value drift manufacture the same N−1
+                // forgery the merged_bug_134 law forbids, with a
+                // perfectly clean decode. The render may CONFIRM the
+                // stamp but never SUBSTITUTE it; divergence is the
+                // lawful drift the stamp exists to survive, disclosed
+                // below.
+                return match stamp {
+                    Some(v) => {
+                        let (hw_class_names, node_affinity) = cells_from_annotation(v)?;
+                        if on_page.hw_class_names != hw_class_names {
+                            debug!(
+                                job = %name,
+                                stamped = ?hw_class_names,
+                                rendered = ?on_page.hw_class_names,
+                                "on-page re-ack: read-time render diverges \
+                                 from the spawn-time stamp (live ICE mask / \
+                                 re-solve); echoing the STAMP"
+                            );
+                        }
+                        // echo-provenance: stamp (the spawn-time
+                        // zip; the page copy contributes every
+                        // non-cell field).
+                        Some(SpawnIntent {
+                            hw_class_names,
+                            node_affinity,
+                            ..(*on_page).clone()
+                        })
+                    }
+                    // echo-provenance: confirm (hw-agnostic — never
+                    // stamped, nothing armed; the page copy's empty
+                    // cell arrays ARE the spawn-time truth, and the
+                    // Empty echo's positive disarm is the correct
+                    // posture for this face).
+                    None if on_page.hw_class_names.is_empty() => Some((*on_page).clone()),
+                    // echo-provenance: skip (celled but unstamped —
+                    // pre-upgrade or unrenderable-at-spawn: no
+                    // provenance-clean echo exists; the scheduler
+                    // keeps its last-armed truth, the off-page
+                    // lane's exact posture).
+                    None => {
+                        warn!(
+                            job = %name,
+                            "on-page re-ack for a celled intent with no \
+                             spawn-time stamp; skipping the row (the \
+                             scheduler keeps its last-armed cells — \
+                             heals at the Job's terminal cycle)"
+                        );
+                        None
+                    }
+                };
             }
             // Off-page: the Job LIST is the inventory; the stamps are
             // the echo. NO stamp ⇒ SKIP (never a bare-id row: under
@@ -2080,13 +2154,9 @@ pub(crate) fn assemble_re_acks(
             if intent_id.is_empty() {
                 return None;
             }
-            let (hw_class_names, node_affinity) = j
-                .spec
-                .as_ref()
-                .and_then(|s| s.template.metadata.as_ref())
-                .and_then(|m| m.annotations.as_ref())
-                .and_then(|a| a.get(INTENT_CELLS_ANNOTATION))
-                .and_then(|v| cells_from_annotation(v))?;
+            let (hw_class_names, node_affinity) = stamp.and_then(|v| cells_from_annotation(v))?;
+            // echo-provenance: stamp (the off-page lane was
+            // stamp-keyed from birth — merged_bug_049).
             Some(SpawnIntent {
                 intent_id,
                 hw_class_names,
@@ -2094,6 +2164,9 @@ pub(crate) fn assemble_re_acks(
                 ..Default::default()
             })
         })
+        // echo-provenance: mint (freshly spawned this tick: the
+        // re-acked set IS the spawn-time set by identity — the stamp
+        // was rendered from these very intents).
         .chain(spawned)
         .collect()
 }
@@ -4596,6 +4669,158 @@ mod tests {
         );
     }
 
+    /// Two-cell spawn-time intent for the echo-provenance tests: the
+    /// production stamp grammar (`m7i:spot,c8g:on-demand`) via the
+    /// same `(hw_class_names, node_affinity)` zip `build_job` stamps.
+    fn two_cell_intent(id: &str) -> SpawnIntent {
+        let mut i = intent(id);
+        i.hw_class_names = vec!["m7i".into(), "c8g".into()];
+        i.node_affinity = (0..2)
+            .map(|k| rio_proto::types::NodeSelectorTerm {
+                match_expressions: vec![rio_proto::types::NodeSelectorRequirement {
+                    key: "karpenter.sh/capacity-type".into(),
+                    operator: "In".into(),
+                    values: vec![if k == 0 {
+                        "spot".into()
+                    } else {
+                        "on-demand".into()
+                    }],
+                }],
+            })
+            .collect();
+        i
+    }
+
+    // r[verify ctrl.pool.echo-provenance]
+    /// W12-AM — proposition: every re-ack echoes the spawn-time armed
+    /// set, at the forgery the merged_bug_134 law forbids; population:
+    /// the derived echo-consumer census (the in-crate re-ack lanes
+    /// here; the cross-crate `dispatched_cells` writer union face is
+    /// discharged at the round-12 registry row).
+    ///
+    /// The drift schedule verbatim from the angle: arm [X,Y] at spawn
+    /// (the production stamp via `build_job`), mask X scheduler-side
+    /// (the read-time render shrinks the page copy to [Y]), assert
+    /// the on-page re-ack still carries [X,Y]. Pre-fix the on-page
+    /// arm echoed the live render — the re-ack carried [Y], a
+    /// clean-decode N−1 forgery: every Armed re-ack overwrites
+    /// `dispatched_cells`, and the first pull clears the ICE ladder
+    /// under an exactly-one-cell proof premised on the pod's
+    /// SPAWN-TIME affinity, so a pod frozen on OR-of-both clears the
+    /// WRONG cell's ladder with zero launch evidence (defeating
+    /// `ice_step_doubles` through the unsealed provenance axis).
+    #[test]
+    fn w12_am_re_ack_echoes_spawn_time_stamp_under_mask_drift() {
+        let pool = test_pool("p", ExecutorKind::Builder);
+        // Spawn-time: armed on BOTH cells; build_job stamps the zip.
+        let mut j = job(&pool, &two_cell_intent("drift"));
+        j.status = None;
+        // Read-time render: the live ICE mask ate m7i — the page copy
+        // is the clean-decode N−1 set.
+        let mut masked = intent("drift");
+        masked.hw_class_names = vec!["c8g".into()];
+        masked.node_affinity = vec![rio_proto::types::NodeSelectorTerm {
+            match_expressions: vec![rio_proto::types::NodeSelectorRequirement {
+                key: "karpenter.sh/capacity-type".into(),
+                operator: "In".into(),
+                values: vec!["on-demand".into()],
+            }],
+        }];
+        let page = IntentPage::for_test(vec![masked]);
+
+        let rows = assemble_re_acks(
+            &page,
+            "p",
+            ExecutorKind::Builder,
+            &[j],
+            &HashSet::new(),
+            vec![],
+        );
+        let row = rows
+            .iter()
+            .find(|i| i.intent_id == "drift")
+            .expect("the pending Job re-acks");
+        assert_eq!(
+            row.hw_class_names,
+            vec!["m7i".to_string(), "c8g".to_string()],
+            "the re-ack echoes the SPAWN-TIME armed set — the page \
+             copy may confirm but never substitute (pre-fix: the \
+             live render's N−1 set was echoed with a clean decode)"
+        );
+        assert_eq!(
+            row.node_affinity.len(),
+            2,
+            "the affinity zip echoes pairwise with the armed names"
+        );
+    }
+
+    /// The on-page lane's two no-stamp faces
+    /// (`ctrl.pool.echo-provenance`): an hw-agnostic page copy echoes
+    /// as-is (never stamped — nothing was armed, and the Empty
+    /// echo's positive disarm is the spawn-time truth: CONFIRM), and
+    /// a CELLED page intent over an unstamped Job produces NO row
+    /// (no provenance-clean echo exists; the scheduler keeps its
+    /// last-armed truth: SKIP — the off-page lane's exact posture,
+    /// now uniform across both lanes).
+    #[test]
+    fn on_page_no_stamp_faces_confirm_or_skip() {
+        let pool = test_pool("p", ExecutorKind::Builder);
+
+        // CONFIRM face: hw-agnostic intent — build_job spawns it
+        // unstamped by design; the page copy is the truth.
+        let mut j_agnostic = job(&pool, &intent("agno"));
+        j_agnostic.status = None;
+        let page = IntentPage::for_test(vec![intent("agno")]);
+        let rows = assemble_re_acks(
+            &page,
+            "p",
+            ExecutorKind::Builder,
+            &[j_agnostic],
+            &HashSet::new(),
+            vec![],
+        );
+        let row = rows
+            .iter()
+            .find(|i| i.intent_id == "agno")
+            .expect("hw-agnostic on-page Job re-acks (the Empty disarm)");
+        assert!(
+            row.hw_class_names.is_empty() && row.node_affinity.is_empty(),
+            "hw-agnostic confirm face: empty cell arrays echo as-is"
+        );
+
+        // SKIP face: celled page intent, Job unstamped (pre-upgrade /
+        // unrenderable-at-spawn shape: strip the stamp post-render).
+        let mut j_unstamped = job(&pool, &two_cell_intent("celled"));
+        j_unstamped.status = None;
+        j_unstamped
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .metadata
+            .as_mut()
+            .unwrap()
+            .annotations
+            .as_mut()
+            .unwrap()
+            .remove(INTENT_CELLS_ANNOTATION);
+        let page = IntentPage::for_test(vec![two_cell_intent("celled")]);
+        let rows = assemble_re_acks(
+            &page,
+            "p",
+            ExecutorKind::Builder,
+            &[j_unstamped],
+            &HashSet::new(),
+            vec![],
+        );
+        assert!(
+            !rows.iter().any(|i| i.intent_id == "celled"),
+            "celled-but-unstamped skip face: no provenance-clean echo \
+             exists — no row (pre-fix the live render was echoed, the \
+             forgery channel)"
+        );
+    }
+
     /// §13d toleration axis (r31 bug_020): `apply_intent_resources`
     /// derives per-intent tolerations from `intent.hw_class_names ×
     /// HwClassConfig.taints_for(h)` — the SAME `[sla.hw_classes.$h]`
@@ -4905,7 +5130,7 @@ mod demand_lane_census {
     //! | `WantMap::for_pool` body walk        | absence mint  | snapshot-tolerant (projects the page INTO the witness-fused map) |
     //! | `HwSampledCache::fetch` fan-out      | page walk     | snapshot-tolerant (per-intent RPC union) |
     //! | spawn-candidate filter (`wanted`)    | page walk     | snapshot-tolerant (per-held-element; AD2 totality is per-held by design) |
-    //! | `assemble_re_acks` page index        | continuity    | derives-from-Job-LIST (WO-S4-3: the lane's MEMBERSHIP comes from the controller's own Job LIST — the local complete inventory; the page walk here only builds the on-page full-fidelity echo index) |
+    //! | `assemble_re_acks` page index        | continuity    | derives-from-Job-LIST (WO-S4-3: the lane's MEMBERSHIP comes from the controller's own Job LIST — the local complete inventory; the page walk here only builds the on-page row index; cell payloads come from the spawn-time stamp per `ctrl.pool.echo-provenance`) |
     //! | `apply_placeable_gate` retain/clear  | page mutation | snapshot-tolerant (gate fold; the retain THREADS the held set per `PageNarrowing::HeldThreaded` — merged_bug_047: a narrowing either threads demand or degrades the witness) |
     //! | `queued` count (`len_page`)          | page count    | snapshot-tolerant (bound law owns demand counting) |
     //! | reconcile `WantMap::for_pool` mint   | absence mint  | the R26 accessor's sole production constructor call |
@@ -5306,6 +5531,225 @@ mod mem_axis_census {
         assert!(
             derived_code_lines > 0,
             "the derived-read plant must shift the enumeration census"
+        );
+    }
+}
+
+#[cfg(test)]
+mod echo_provenance_census {
+    //! **The echo-provenance reader census (bug_124, R31 — the PD-1
+    //! SPLIT FORM, in-crate face)**: every re-ack row-emission lane
+    //! inside [`super::assemble_re_acks`] derives its cell payload
+    //! from the spawn-time stamp, tagged at the lane
+    //! (`echo-provenance: stamp|confirm|skip|mint`), machine-walked
+    //! over the EMBEDDED source (include_str! — the (wwwww)
+    //! embedded-universe form; nix-gate safe).
+    //!
+    //! [GEN-SET] generator (committed; the walk below IS the
+    //! generator — re-run on any lane drift):
+    //!
+    //!   rg -n 'echo-provenance: ' rio-controller/src/reconcilers/pool/jobs.rs
+    //!
+    //! Lane dispositions: `stamp` = payload parsed from
+    //! `INTENT_CELLS_ANNOTATION` (the spawn-time zip; on-page and
+    //! off-page lanes); `confirm` = the page copy echoed ONLY where
+    //! the stamp's own absence semantics make it the spawn-time
+    //! truth (hw-agnostic — never stamped, nothing armed); `skip` =
+    //! the refusal arm (celled-but-unstamped: no provenance-clean
+    //! echo exists, NO row); `mint` = freshly spawned intents (the
+    //! re-acked set is the spawn-time set by identity).
+    //!
+    //! **CROSS-CRATE FACE (claim-strength, stated honestly):** the
+    //! rio-scheduler `dispatched_cells` WRITER sites (the Armed
+    //! overwrite + Empty disarm in `actor/snapshot.rs`, the
+    //! generation clear in `actor/mod.rs`, the status sweep in
+    //! `actor/housekeeping.rs`) are EXPECTED MEMBERS of the round-12
+    //! registry's workspace-UNION row, relayed via the S6 handoff —
+    //! NEVER walked from this crate's nextest sandbox (cross-crate
+    //! include_str is dev-green/gate-red under per-crate nix
+    //! isolation). The in-crate consumer face enforces at THIS
+    //! commit; the union face enforces at the registry's
+    //! framework row in the same wave. REJECTED-recorded: a
+    //! rio-controller→rio-scheduler dependency edge for a test
+    //! concern (inverts the dependency architecture).
+
+    const JOBS_SRC: &str = include_str!("jobs.rs");
+
+    /// The lane alphabet (closed; a new tag value is a census red).
+    const LANE_ALPHABET: [&str; 4] = ["stamp", "confirm", "skip", "mint"];
+
+    /// Expected lane multiset, sorted (the WO-named EXPECTED members
+    /// the generator VERIFIES — verification targets, never the
+    /// enforcement population: the walk derives, this list checks).
+    const EXPECTED_LANES: [&str; 5] = ["confirm", "mint", "skip", "stamp", "stamp"];
+
+    /// Slice the body of `fn assemble_re_acks` from a corpus by brace
+    /// matching. Population face (CE-1): an absent root is an ERROR,
+    /// never an empty default.
+    fn assemble_body(src: &str) -> Result<&str, String> {
+        let start = src
+            .find("fn assemble_re_acks(")
+            .ok_or("assemble_re_acks not found in corpus — the census root is the fn body; an absent root is an ERROR, never an empty default")?;
+        let rest = &src[start..];
+        let open = rest.find('{').ok_or("no opening brace")?;
+        let mut depth = 0usize;
+        for (i, c) in rest[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(&rest[open..open + i + 1]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err("unbalanced braces in assemble_re_acks".into())
+    }
+
+    /// The [GEN-SET] walk: enumerate `(emission, tag)` over the fn
+    /// body. Emission grammar (the row sources the lane type
+    /// permits): `Some(SpawnIntent {` (struct row),
+    /// `Some((*on_page).clone())` (page-copy row), `.chain(spawned)`
+    /// (the mint chain). Every emission MUST carry an
+    /// `echo-provenance:` tag within the 8 preceding lines; a tagged
+    /// refusal arm (`skip`) is a lawful non-emitting member.
+    /// Grammar-refusal face: a body whose iterator skeleton the walk
+    /// does not recognize ERRORS — never silently green.
+    fn echo_lanes(src: &str) -> Result<Vec<String>, String> {
+        let body = assemble_body(src)?;
+        if !body.contains(".filter_map(") || !body.contains(".chain(") {
+            return Err(
+                "re-ack assembly skeleton unrecognized (filter_map + chain): an \
+                 out-of-skeleton row constructor evades the emission grammar — \
+                 census refuses to certify (re-derive the walk)"
+                    .into(),
+            );
+        }
+        let lines: Vec<&str> = body.lines().collect();
+        let mut lanes: Vec<String> = Vec::new();
+        let mut emissions = 0usize;
+        for (n, line) in lines.iter().enumerate() {
+            let is_emission = line.contains("Some(SpawnIntent {")
+                || line.contains("Some((*on_page).clone())")
+                || line.contains(".chain(");
+            if let Some(ix) = line.find("echo-provenance: ") {
+                let tag: String = line[ix + "echo-provenance: ".len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphabetic())
+                    .collect();
+                if !LANE_ALPHABET.contains(&tag.as_str()) {
+                    return Err(format!("out-of-alphabet lane tag `{tag}`"));
+                }
+                lanes.push(tag);
+            }
+            if is_emission {
+                emissions += 1;
+                let tagged_above = lines[n.saturating_sub(8)..=n]
+                    .iter()
+                    .any(|l| l.contains("echo-provenance: "));
+                if !tagged_above {
+                    return Err(format!(
+                        "untagged re-ack row emission at body line {n}: `{}` — \
+                         every emission lane names its echo provenance",
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        if emissions == 0 {
+            return Err(
+                "zero row emissions found in assemble_re_acks — the emission \
+                 grammar lost the body (absence of hits is absence of evidence)"
+                    .into(),
+            );
+        }
+        Ok(lanes)
+    }
+
+    // r[verify ctrl.pool.echo-provenance]
+    /// W12-AM2 — the census ENROLLMENT/COMPLETENESS face: the walk
+    /// over the committed corpus derives the lane population,
+    /// verifies the WO-named expected members, and floors
+    /// non-vacuity. The walk-vs-census completeness pin: any NEW
+    /// in-grammar emission lane (or a tag drift) reds here.
+    #[test]
+    fn echo_provenance_lanes_census() {
+        let lanes = echo_lanes(JOBS_SRC).expect("the production walk certifies");
+        assert!(!lanes.is_empty(), "population floor: >=1 derived lane");
+        let mut sorted = lanes.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted, EXPECTED_LANES,
+            "the derived lane multiset matches the expected members \
+             (stamp x2: on-page + off-page; confirm: hw-agnostic; \
+             skip: the celled-unstamped refusal; mint: the spawned \
+             chain) — a new emission lane enrolls with its tag here"
+        );
+    }
+
+    /// The three-face plant battery (WS-4) + the empty-walk plant
+    /// (CE-1), each driven through the SAME walk path as production:
+    ///
+    /// 1. EMPTY-WALK plant: a corpus without the census root ERRORS
+    ///    (never an empty-green — the named R22'' defeat).
+    /// 2. ENROLLMENT plant: an in-grammar UNTAGGED emission lane
+    ///    inside the body reds the walk (oracle: the walk's own
+    ///    emission-tag completeness pin).
+    /// 3. JURISDICTION plant (strawman hand-list): a hand-listed
+    ///    population that misses a derived member goes RED against
+    ///    the jurisdiction derivation (oracle: the derived-walk
+    ///    diff — the registry-diff mechanism in-slot form).
+    /// 4. GRAMMAR-REFUSAL plant: an evading idiom (rows built
+    ///    through an out-of-skeleton iterator) makes the walk ERROR,
+    ///    never silently green.
+    #[test]
+    fn echo_provenance_census_plants() {
+        // (1) empty walk.
+        let err = echo_lanes("fn unrelated() { 1 + 1; }").unwrap_err();
+        assert!(
+            err.contains("absent root is an ERROR"),
+            "empty-walk plant: {err}"
+        );
+
+        // (2) enrollment: inject an untagged in-grammar emission.
+        let body = assemble_body(JOBS_SRC).unwrap();
+        let doctored_body = body.replacen(
+            '{',
+            "{\n    let _planted = Some(SpawnIntent {\n        ..Default::default()\n    });\n",
+            1,
+        );
+        let doctored = format!("fn assemble_re_acks() {doctored_body}");
+        let err = echo_lanes(&doctored).unwrap_err();
+        assert!(
+            err.contains("untagged re-ack row emission"),
+            "enrollment plant: {err}"
+        );
+
+        // (3) jurisdiction strawman: the hand list misses `mint`.
+        let derived = echo_lanes(JOBS_SRC).unwrap();
+        let hand_list = ["stamp", "confirm", "skip", "stamp"];
+        let mut derived_sorted = derived.clone();
+        derived_sorted.sort();
+        let mut hand_sorted: Vec<String> = hand_list.iter().map(|s| (*s).to_string()).collect();
+        hand_sorted.sort();
+        assert_ne!(
+            derived_sorted, hand_sorted,
+            "jurisdiction plant: the strawman hand-list population \
+             (missing the mint lane) MUST diff against the derived \
+             walk — a hand census cannot stand in for the derivation"
+        );
+
+        // (4) grammar refusal: the filter_map skeleton evaded.
+        let evading = format!(
+            "fn assemble_re_acks() {}",
+            body.replace(".filter_map(", ".flat_map(")
+        );
+        let err = echo_lanes(&evading).unwrap_err();
+        assert!(
+            err.contains("skeleton unrecognized"),
+            "grammar-refusal plant: {err}"
         );
     }
 }
