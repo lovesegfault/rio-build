@@ -480,7 +480,13 @@ fn irls_quantile(x: &[f64], y: &[f64], w: &[f64], tau: f64) -> (f64, f64, f64) {
 /// Returns `(fit, weak)` where `weak = n_eff ≥ 10 ∧ R¹ < 0.7` (or
 /// non-finite IRLS) — i.e. enough data for the coupled fit, but the
 /// fit was rejected. Drives `rio_scheduler_sla_mem_fit_weak_total`.
-pub fn fit_memory(cs: &[f64], ms: &[u64], w: &[f64], n_eff: f64) -> (MemFit, bool) {
+pub fn fit_memory(
+    cs: &[f64],
+    ms: &[u64],
+    w: &[f64],
+    n_eff: f64,
+    fallback_p90: MemBytes,
+) -> (MemFit, bool) {
     // `.max(1.0)` floors before `.ln()`: completion.rs persists
     // `peak_memory_bytes = 0` as a legitimate sample point, but
     // `ln(0) = -∞` and `wls_loglinear` has no NaN handling — `-∞ - (-∞)
@@ -501,14 +507,11 @@ pub fn fit_memory(cs: &[f64], ms: &[u64], w: &[f64], n_eff: f64) -> (MemFit, boo
     }
     let (a, b, _sig) = wls_loglinear(&lc, &lm, w);
     if !a.is_finite() || !b.is_finite() {
-        let mf: Vec<f64> = ms.iter().map(|&m| m as f64).collect();
-        let p90 = weighted_quantile(&mf, w, 0.9);
-        return (
-            MemFit::Independent {
-                p90: MemBytes(p90 as u64),
-            },
-            weak,
-        );
+        // bug_072: the degenerate design falls to THE mem
+        // aggregator's all-rows p90 (provided by the caller — refit's
+        // single chokepoint over the full row set), not a private
+        // subset quantile over the c-axis rows alone.
+        return (MemFit::Independent { p90: fallback_p90 }, weak);
     }
     (MemFit::Coupled { a, b, r1: 0.0 }, weak)
 }
@@ -817,7 +820,8 @@ mod tests {
             })
             .collect();
         let w = vec![1.0; 15];
-        let (MemFit::Coupled { b, r1, .. }, weak) = fit_memory(&cs, &ms, &w, 15.0) else {
+        let (MemFit::Coupled { b, r1, .. }, weak) = fit_memory(&cs, &ms, &w, 15.0, MemBytes(0))
+        else {
             panic!("expected Coupled")
         };
         assert!((b - 0.7).abs() < 0.15, "b={b}");
@@ -829,7 +833,8 @@ mod tests {
     fn fit_memory_small_n_uses_ols() {
         let cs = [4.0, 8.0, 16.0];
         let ms = [1000u64, 1500, 2200];
-        let (MemFit::Coupled { r1, .. }, weak) = fit_memory(&cs, &ms, &[1.0; 3], 3.0) else {
+        let (MemFit::Coupled { r1, .. }, weak) = fit_memory(&cs, &ms, &[1.0; 3], 3.0, MemBytes(0))
+        else {
             panic!("expected Coupled")
         };
         assert_eq!(r1, 0.0); // small-n sentinel
@@ -846,7 +851,7 @@ mod tests {
         let ms: Vec<u64> = (1..=15)
             .map(|i| (1_000_000.0 * (1.0 + 0.05 * (i as f64 * 2.399).sin())) as u64)
             .collect();
-        let (_, weak) = fit_memory(&cs, &ms, &[1.0; 15], 15.0);
+        let (_, weak) = fit_memory(&cs, &ms, &[1.0; 15], 15.0, MemBytes(0));
         assert!(weak, "uncorrelated mem at n_eff=15 → weak");
     }
 
@@ -889,7 +894,7 @@ mod tests {
             .chain([0u64])
             .collect();
         let w = vec![1.0; 11];
-        let (MemFit::Coupled { a, b, .. }, _) = fit_memory(&cs, &ms, &w, 11.0) else {
+        let (MemFit::Coupled { a, b, .. }, _) = fit_memory(&cs, &ms, &w, 11.0, MemBytes(0)) else {
             panic!("zero sample must not collapse Coupled → Independent");
         };
         assert!(a.is_finite() && b.is_finite(), "a={a} b={b}");
@@ -897,12 +902,19 @@ mod tests {
 
     #[test]
     fn fit_memory_degenerate_falls_back_independent() {
-        // All same c → slope undefined.
+        // All same c → slope undefined. bug_072: the degenerate arm
+        // carries the CALLER-provided all-rows aggregate through (the
+        // one mem chokepoint computes it; this pins the plumbing).
         let cs = [4.0, 4.0, 4.0];
         let ms = [1000u64, 1100, 1050];
         assert!(matches!(
-            fit_memory(&cs, &ms, &[1.0; 3], 3.0),
-            (MemFit::Independent { .. }, false)
+            fit_memory(&cs, &ms, &[1.0; 3], 3.0, MemBytes(4096)),
+            (
+                MemFit::Independent {
+                    p90: MemBytes(4096)
+                },
+                false
+            )
         ));
     }
 

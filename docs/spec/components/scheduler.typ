@@ -5072,6 +5072,24 @@ with the other process-lifetime table state; unarmed (`None`) admits ---
 the legacy lane for direct test constructions and the pre-construction
 boot window, pinned by the wiring regression test.
 
+#r("sched.sla.one-aggregator")[
+  Each c-independent scalar axis of the per-pname fit (memory, disk) MUST
+  have exactly ONE aggregation function consumed by EVERY arm (full-fit,
+  probe, degenerate fallback): the quantile's evidence universe is an
+  explicit population parameter --- always the full row set, ring-weighted
+  where a row holds a c-axis seat and unit-weighted elsewhere --- never an
+  implicit property of which vector an arm happened to collect. Subset
+  quantiles are census-red, not comment-policed.
+]
+
+bug_070/bug_072 were one law violated per axis: the disk fallback's
+emptiness gate dropped every peaked legacy row the moment one c-axis row
+carried a peak (p90 of $N+1$ collapsing to 1), and the probe arm
+single-sampled memory from the newest row two lines above the aggregated
+disk --- estimator quality silently depended on which arm a pname landed
+in. The `(axis, arm)` census (W11-BC) is the belt: per-axis evidence
+reads outside the chokepoints drift its committed counts.
+
 #r("sched.sla.forecast.one-layer+2")[
   `compute_spawn_intents` walks the Ready frontier AND a forecast frontier of
   `Queued` derivations whose every incomplete dependency is running with a

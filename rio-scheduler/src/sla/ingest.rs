@@ -173,7 +173,7 @@ pub fn refit(
         .collect();
 
     if fit_rows.is_empty() {
-        return probe_only(key, rows.last(), aggregate_disk_p90(rows, &[]));
+        return probe_only(key, rows, aggregate_disk_p90(rows, &[]));
     }
 
     let versions: Vec<_> = fit_rows.iter().map(|r| r.version.clone()).collect();
@@ -327,7 +327,10 @@ pub fn refit(
     let scale = |i: usize| alpha::dot(alpha, factors[i].unwrap_or([1.0; K]));
     let ts: Vec<f64> = (0..walls.len()).map(|i| walls[i] * scale(i)).collect();
     let ts_f: Vec<f64> = idx.iter().map(|&i| ts[i]).collect();
-    let (mut mem, weak) = fit_memory(&cs, &ms, &w, n_eff_ring.0);
+    // bug_072: the degenerate-Independent arm consumes THE mem
+    // aggregator's all-rows fold — same evidence universe as the
+    // probe arm (one aggregation fn per scalar axis, every arm).
+    let (mut mem, weak) = fit_memory(&cs, &ms, &w, n_eff_ring.0, aggregate_mem_p90(rows, &w));
     if weak {
         ::metrics::counter!(
             "rio_scheduler_sla_mem_fit_weak_total",
@@ -729,6 +732,24 @@ pub(super) fn reassign_tier(
 /// the evidence universe is always the full row set via
 /// [`axis_samples`], so a subset-quantile is unwritable rather than
 /// comment-policed.
+// r[impl sched.sla.one-aggregator]
+/// THE mem-axis aggregation chokepoint (bug_072 — the disk fn's
+/// structurally identical c-independent sibling): the recency-weighted
+/// p90 the `MemFit::Independent` variant doc promises, over EVERY
+/// sample (the mem peak column is non-optional, so the all-rows
+/// aggregate is always available) — ring weights where the row holds a
+/// c-axis seat, unit weights elsewhere. Consumed by the probe arm AND
+/// the full-fit degenerate-Independent arm (`fit_memory`), so
+/// estimator quality no longer depends on which arm a pname lands in.
+fn aggregate_mem_p90(rows: &[BuildSampleRow], fit_w: &[f64]) -> MemBytes {
+    let (vals, ws) = axis_samples(rows, fit_w, |r| Some(r.peak_memory_bytes as f64));
+    if vals.is_empty() {
+        return MemBytes(0);
+    }
+    MemBytes(weighted_quantile(&vals, &ws, 0.9) as u64)
+}
+
+// r[impl sched.sla.one-aggregator]
 fn aggregate_disk_p90(rows: &[BuildSampleRow], fit_w: &[f64]) -> Option<DiskBytes> {
     let (vals, ws) = axis_samples(rows, fit_w, |r| r.peak_disk_bytes.map(|b| b as f64));
     (!vals.is_empty()).then(|| DiskBytes(weighted_quantile(&vals, &ws, 0.9) as u64))
@@ -766,17 +787,21 @@ fn axis_samples(
 }
 
 /// No usable c-axis samples → emit a Probe placeholder so the explore
-/// ladder (Task 5.2) can pick a first c. `last` (if any) seeds `last_wall`.
+/// ladder (Task 5.2) can pick a first c. The newest row (if any) seeds
+/// `last_wall`; memory comes from THE mem aggregator over every sample
+/// (bug_072 — the pre-fix newest-row read erased the multi-sample
+/// consensus the variant doc promises).
 fn probe_only(
     key: &ModelKey,
-    last: Option<&BuildSampleRow>,
+    rows: &[BuildSampleRow],
     disk_p90: Option<DiskBytes>,
 ) -> FittedParams {
+    let last = rows.last();
     FittedParams {
         key: key.clone(),
         fit: DurationFit::Probe,
         mem: MemFit::Independent {
-            p90: MemBytes(last.map(|r| r.peak_memory_bytes as u64).unwrap_or(0)),
+            p90: aggregate_mem_p90(rows, &[]),
         },
         disk_p90,
         sigma_resid: 0.2,
@@ -1754,6 +1779,96 @@ mod disk_axis_tests {
             completed_at: now_epoch(),
             ..Default::default()
         }
+    }
+
+    // r[verify sched.sla.one-aggregator]
+    /// **W11-BC — the [GEN-SET] (axis, arm) census (the
+    /// sched.sla.one-aggregator belt).** Generator: scan ingest.rs +
+    /// fit.rs production source (test modules stripped) for the
+    /// per-axis evidence reads. Committed expectation (re-derived on
+    /// any red):
+    ///
+    /// - `peak_disk_bytes` reads in ingest.rs: exactly ONE — the disk
+    ///   chokepoint's `axis_samples` closure;
+    /// - mem-peak reads in ingest.rs: exactly TWO — the mem
+    ///   chokepoint's closure + the COUPLED fit's c-axis regression
+    ///   input `ms` (a fitted curve consumes per-row values; it is
+    ///   not a quantile arm);
+    /// - fit.rs: ZERO private quantiles over raw `ms` (the degenerate
+    ///   arm consumes the caller-provided aggregate) and zero disk
+    ///   reads.
+    ///
+    /// A new arm that collects its own Vec instead of routing through
+    /// the axis's one aggregator drifts a count here.
+    #[test]
+    fn w11_bc_axis_arm_census() {
+        let strip = |src: &str| {
+            src.split_once("#[cfg(test)]\nmod tests")
+                .map_or(src, |(p, _)| p)
+                .to_owned()
+        };
+        let ingest = strip(include_str!("ingest.rs"));
+        let fit = strip(include_str!("fit.rs"));
+        assert_eq!(
+            ingest.matches("peak_disk_bytes").count(),
+            1,
+            "disk evidence reads route through the one chokepoint"
+        );
+        assert_eq!(
+            ingest.matches("peak_memory_bytes").count(),
+            2,
+            "mem evidence reads: the chokepoint closure + the coupled \
+             fit's regression input only"
+        );
+        assert_eq!(
+            fit.matches("peak_disk_bytes").count() + fit.matches("weighted_quantile(&mf").count(),
+            0,
+            "fit.rs holds no private per-axis quantile"
+        );
+    }
+
+    /// **W11-BB (bug_072, red-first)** — *the probe arm's memory
+    /// estimate aggregates over the consensus, never the single
+    /// newest sample.* Five legacy (no-cpu_limit) rows — the
+    /// population the live fleet docs name — with peaks
+    /// [10,10,10,10,2] GiB, newest last (a cache-warm rebuild):
+    /// pre-fix `probe_only` minted `MemFit::Independent` from the
+    /// newest row alone (2 GiB), erasing the multi-sample consensus
+    /// and burning the OOM floor-doubling ladder (while one anomalous
+    /// LARGE newest sample would pin the estimate high) — against the
+    /// variant doc's own "recency-weighted p90" promise. Post-fix the
+    /// one mem aggregator folds every sample.
+    #[test]
+    fn w11_bb_probe_arm_memory_aggregates_over_the_consensus() {
+        const GI: i64 = 1 << 30;
+        let mem_row = |peak: i64| BuildSampleRow {
+            pname: "p".into(),
+            system: "x86_64-linux".into(),
+            tenant: "t".into(),
+            duration_secs: 100.0,
+            peak_memory_bytes: peak,
+            cpu_limit_cores: None,
+            completed_at: now_epoch(),
+            ..Default::default()
+        };
+        let mut rows: Vec<BuildSampleRow> = (0..4).map(|_| mem_row(10 * GI)).collect();
+        rows.push(mem_row(2 * GI));
+        let f = refit(
+            &key(),
+            &rows,
+            None,
+            &[],
+            &super::super::hw::HwTable::default(),
+            None,
+        );
+        let MemFit::Independent { p90 } = f.mem else {
+            panic!("no c-axis rows ⇒ probe arm");
+        };
+        assert!(
+            p90.0 >= 9 * (GI as u64),
+            "mem p90 over the 5-sample consensus (~10 GiB), never the              newest single sample (2 GiB): got {} GiB",
+            p90.0 / (1 << 30)
+        );
     }
 
     // r[verify sched.sla.disk-reaches-ephemeral-storage+1]

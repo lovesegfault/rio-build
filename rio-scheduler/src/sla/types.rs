@@ -112,7 +112,10 @@ impl DurationFit {
 pub enum MemFit {
     /// Koenker-Machado pseudo-R¹ ≥ 0.7 → log M = a + b·log c
     Coupled { a: f64, b: f64, r1: f64 },
-    /// fallback: independent recency-weighted p90
+    /// fallback: the per-axis recency-weighted p90 over EVERY sample
+    /// (ring-weighted where seated, unit elsewhere) — minted only by
+    /// the one mem aggregation chokepoint
+    /// (`ingest::aggregate_mem_p90`; sched.sla.one-aggregator).
     Independent { p90: MemBytes },
 }
 
