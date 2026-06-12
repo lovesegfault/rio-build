@@ -100,7 +100,7 @@ pub fn bump_floor_or_count(
         // quota-attributed DiskFull lane — completion.rs consumes the
         // TYPED `failure_classification` wire field (FailureClass::
         // DiskFull + QuotaTelemetry; `rio_proto::DISK_FULL_MSG` is
-        // DISPLAY/NARRATION ONLY — merged_bug_100: free text drives
+        // DISPLAY/NARRATION ONLY — quantifier: census(forged_free_text_never_moves_resource_floors) — merged_bug_100: free text drives
         // nothing), band-corroborates it against the assigned shape
         // (`CorroborationWitness::corroborated_sizing`), and bumps
         // through the witness-demanding chokepoint with the
@@ -146,7 +146,7 @@ pub fn bump_floor_or_count(
     }
 }
 
-// r[impl sched.trust.report-corroboration+3]
+// r[impl sched.trust.report-corroboration+4]
 /// bug_102 — the typed corroboration witness `bump_resource_floor`
 /// DEMANDS: trust is gated at the CONSEQUENCE (the floor mutation),
 /// not re-derived per carrier at each call site. The wave-11 gate
@@ -162,7 +162,7 @@ pub fn bump_floor_or_count(
 /// choose.
 ///
 /// The axis is PRIVATE (the inner enum is not visible outside this
-/// module), so the constructors below are the ONLY mints:
+/// module), so the constructors below are the ONLY mints — quantifier: census(floor_mutation_census) —:
 /// - [`Self::corroborated_sizing`] — the mem/disk bands vs the
 ///   assigned shape (the wave-11 bands, moved here so the band law
 ///   and the witness mint are one site);
@@ -344,7 +344,7 @@ pub(super) fn witnessed_disposition(
         // The controller TODAY folds the pod-attributed shapes
         // ("ephemeral local storage", "EmptyDir volume" — kubelet's
         // own per-pod statement that THIS build exceeded ITS declared
-        // limit, carrying NONE of that ambiguity) into the SAME wire
+        // limit, carrying none of that ambiguity) into the same wire
         // letter (pool/job.rs pod_termination_reason), so this row
         // must stay classify-only: promoting the folded letter would
         // re-create the I-199 ambient over-fire on the disk axis.

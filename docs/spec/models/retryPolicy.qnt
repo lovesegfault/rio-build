@@ -897,7 +897,7 @@ module retryPolicy {
     matUnobtainableCount >= 0 and matUnobtainableCount <= MAX_MAT_UNOBTAINABLE,
   }
 
-  /// The model-checked form of sched.retry.counters-refine-history+3:
+  /// The model-checked form of sched.retry.counters-refine-history+4:
   /// the cached counter view equals the reference fold of the observed
   /// history (carried incrementally as `spec`). poisoned_at is excluded
   /// when the poison came from a site outside the fold's event alphabet

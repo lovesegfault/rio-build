@@ -1952,7 +1952,7 @@ mod tests {
     }
 
     /// **W12-N (bug_153)** — *proposition: a permanent rejection is
-    /// adjudicated once, identically, in EVERY consulting loop — the
+    /// adjudicated once, identically, in EVERY consulting loop — quantifier: census(transport_retry_loop_census_consults_the_fatal_authority) — the
     /// maybe-minted resolve included; population: the [GEN-SET]
     /// transport-loop census below.* Pre-fix the Ok(Err) arm never
     /// consulted `is_fatal_rejection`, so permanent rejections
@@ -2001,7 +2001,7 @@ mod tests {
     /// of transport-consuming retry loops is DERIVED from this file
     /// (the `PullTransport` trait is `pub(super)` — every consumer is
     /// structurally in-file; widening the trait is a reviewable
-    /// event), and EVERY derived member must consult the fatal
+    /// event), and EVERY derived member — quantifier: census(transport_retry_loop_census_consults_the_fatal_authority) — must consult the fatal
     /// authority — a fourth loop born without the consult reds here
     /// (per-call-site opt-in was the enumeration trap; the fatal SET
     /// itself is authority-derived and pinned by
@@ -2012,7 +2012,7 @@ mod tests {
     /// floor is the three expected members VERIFIED in the derived
     /// set, and the walk's non-vacuity is asserted. Plant battery
     /// (riders (b)): the strawman below drives an unconsulting loop
-    /// through the SAME walk (enrollment face); the walk derives
+    /// through the same walk (enrollment face); the walk derives
     /// membership from the transport-call grammar, not a name list
     /// (jurisdiction face is the file = the trait's whole scope);
     /// aliased transport bindings still contain the dotted call text
@@ -2050,7 +2050,7 @@ mod tests {
 
     /// The census's planted red (enrollment face): a NEW
     /// transport-consuming loop WITHOUT the fatal consult, driven
-    /// through the SAME walk, MUST be derived and MUST fail the
+    /// through the same walk, MUST be derived and MUST fail the
     /// consult law NAMING the loop.
     #[test]
     fn loop_census_plants_red_on_unconsulting_loop() {

@@ -109,7 +109,7 @@
 //! `last_completed` dedup deciding which of them count) is the
 //! environment's nondeterminism; the Stage-B model quantifies over it and
 //! checks that the code's counters equal `reference_fold(observed)`
-//! (`sched.retry.counters-refine-history+3`) and that the verdict is
+//! (`sched.retry.counters-refine-history+4`) and that the verdict is
 //! the same for every observation of one physical history
 //! (`sched.retry.verdict-channel-invariant`).
 //!
@@ -762,7 +762,7 @@ pub fn exhausts_fleet<Id: Ord>(failed_builders: &IdSet<Id>, fleet: &FleetView<Id
     fleet.eligible.is_subset(failed_builders)
 }
 
-// r[impl sched.retry.counters-refine-history+3]
+// r[impl sched.retry.counters-refine-history+4]
 // r[impl sched.retry.transient-budget+2]
 // r[impl sched.retry.attempts-bounded+5]
 // r[impl sched.retry.verdict-channel-invariant]

@@ -236,14 +236,14 @@ pub enum ExecutorError {
     /// The derivation isn't broken — this builder's DISK is
     /// undersized: maps to `InfrastructureFailure`, and the report
     /// carries the TYPED `FailureClassification{DiskFull, quota}`
-    /// field — the ONLY channel the scheduler's floor gate consumes
+    /// field — the ONLY channel the scheduler's floor gate consumes — quantifier: census(forged_free_text_never_moves_resource_floors) —
     /// (bug_090/bug_102: the scheduler band-corroborates the typed
     /// claim against its assigned shape and bumps the disk
     /// `resource_floor`; the [`Self::CgroupOom`] twin; classification
     /// predicate at [`crate::quota::classify_quota_exhaustion`],
     /// thresholds R17-typed beside it). Display pinned to
     /// `rio_proto::DISK_FULL_MSG` for STABLE OPERATOR NARRATION only
-    /// (DISPLAY/NARRATION ONLY per the rio-proto const docs — free
+    /// (DISPLAY/NARRATION ONLY per the rio-proto const docs — quantifier: census(forged_free_text_never_moves_resource_floors) — free
     /// text drives no floor decision;
     /// `disk_full_display_contains_proto_constant` pins the wording,
     /// not a trust contract).
@@ -1985,7 +1985,7 @@ mod tests {
     /// consumes the TYPED `failure_classification` field — it never
     /// matches `error_msg` substrings (the substring-trust contract
     /// is RETIRED; `rio_proto::CGROUP_OOM_MSG` is DISPLAY/NARRATION
-    /// ONLY per its const doc). This pin guards STABLE OPERATOR
+    /// ONLY per its const doc — quantifier: census(forged_free_text_never_moves_resource_floors)). This pin guards STABLE OPERATOR
     /// NARRATION: logs, events, and dashboards key on the canonical
     /// wording, and thiserror's `#[error]` attr can't reference a
     /// `const` without const-format — rewording the Display string
@@ -2302,7 +2302,7 @@ mod tests {
     /// (the scheduler's floor gate consumes the TYPED
     /// `FailureClassification{DiskFull, quota}` field and
     /// band-corroborates it; `rio_proto::DISK_FULL_MSG` is
-    /// DISPLAY/NARRATION ONLY — the
+    /// DISPLAY/NARRATION ONLY — quantifier: census(forged_free_text_never_moves_resource_floors) — the
     /// `cgroup_oom_display_contains_proto_constant` mirror).
     #[test]
     fn disk_full_display_contains_proto_constant() {

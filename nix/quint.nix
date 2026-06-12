@@ -5252,7 +5252,7 @@ rec {
     # unchanged).
     # r[verify sched.retry.per-executor-budget+4]
     # r[verify sched.dispatch.fleet-exhaust+5]
-    # r[verify sched.retry.counters-refine-history+3]
+    # r[verify sched.retry.counters-refine-history+4]
     # r[verify sched.retry.no-double-count]
     # r[verify sched.retry.verdict-channel-invariant]
     # r[verify sched.poison.cascade-dependents]

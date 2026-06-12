@@ -305,7 +305,7 @@ pub(crate) fn classify(event: &ObservedFailure<'_>, floor: FloorOutcomeView) -> 
 
 // r[verify sched.retry.transient-budget+2]
 // r[verify sched.retry.attempts-bounded+5]
-// r[verify sched.retry.counters-refine-history+3]
+// r[verify sched.retry.counters-refine-history+4]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,7 +454,7 @@ mod tests {
     /// failures of THIS derivation regardless of cycle time; the
     /// negation is the live carousel: the I-127 wall-window reset
     /// zeroed `infra_count` whenever failure-cycle > 300 s, so
-    /// `max_infra_retries=10` was unreachable for ANY deterministic
+    /// `max_infra_retries=10` was unreachable for ANY deterministic // quantifier: census(deterministic_infra_carousel_poisons_at_the_cap_regardless_of_cycle_time)
     /// failure whose cycle exceeds the window — a ~340 s cycle
     /// (dispatch + build-to-failure + report + requeue) oscillated
     /// the counter 0↔1 forever (the incident's 520 requeues across

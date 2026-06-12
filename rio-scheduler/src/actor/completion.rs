@@ -155,7 +155,7 @@ pub(super) enum CaRealisationEvidence<'a> {
     /// evidence; bytes stay durable, the heal lane is lawful
     /// re-registration/re-stamp).
     Evidenced(&'a std::collections::HashSet<Vec<u8>>),
-    /// The bounded faces ONLY: deferred-IA and fixed-output reports
+    /// The bounded faces ONLY — quantifier: census(ca_evidence_reader_census) —: deferred-IA and fixed-output reports
     /// passed the dispatch-minted expected-set retain
     /// ([`DagActor::retain_expected_members`]) — the path-value law
     /// already ran upstream. Presented on a floating-CA face, the
@@ -1309,7 +1309,7 @@ impl DagActor {
     /// (`rio_scheduler_uncorroborated_sizing_claim_total`),
     /// attributed, classify-only (the report's retry/charge flow is
     /// unaffected).
-    // r[impl sched.trust.report-corroboration+3]
+    // r[impl sched.trust.report-corroboration+4]
     pub(super) async fn bump_floor_on_corroborated_claim(
         &mut self,
         drv_hash: &DrvHash,
@@ -1357,12 +1357,12 @@ impl DagActor {
             .increment(1);
             return super::floor::FloorOutcome::default();
         };
-        // Unspecified can never mint a witness (the constructor's
+        // Unspecified cannot mint a witness (the constructor's
         // false arm), so the wire-default structurally cannot bump.
         self.bump_resource_floor(drv_hash, witness).await
     }
 
-    // r[impl sched.trust.report-corroboration+3]
+    // r[impl sched.trust.report-corroboration+4]
     /// bug_102 — the corroboration chokepoint: the demand sits INSIDE
     /// the floor mutation. Every caller presents a typed
     /// [`super::floor::CorroborationWitness`] minted by a verifying
@@ -1544,7 +1544,7 @@ impl DagActor {
                 // posture (bytes durable, tenant-invisible until
                 // re-stamp), and "" never matches a parsed store
                 // path, so the placeholder can never be forged.
-                // r[impl sched.trust.report-membership+3]
+                // r[impl sched.trust.report-membership+4]
                 // (De Morgan of NOT(is_ca AND NOT is_fo) — the
                 // non-exempt face.)
                 if !*is_ca || *is_fo {
@@ -1576,7 +1576,7 @@ impl DagActor {
                 // replica once already; the durable `is_ca AND NOT
                 // is_fo` is the same claims-mint predicate the skip
                 // above keyed). The consult also bounds the
-                // realisation insert below, and it runs on EVERY
+                // realisation insert below, and it runs on EVERY — quantifier: census(ca_evidence_reader_census) —
                 // floating-CA path: an aged-out or untenanted cohort
                 // consults empty and gets the EMPTY evidence set —
                 // the realisation insert refuses all (its consumers
@@ -1737,7 +1737,7 @@ impl DagActor {
     /// registration evidence the upload leaves behind (no upload, no
     /// stamp; machine-bound by the
     /// `ca_stamp_lanes_consult_production_evidence` census).
-    // r[impl sched.trust.report-membership+3]
+    // r[impl sched.trust.report-membership+4]
     pub(super) fn retain_expected_members(
         executor_id: &str,
         drv_key: &str,
@@ -1805,7 +1805,7 @@ impl DagActor {
     ///
     /// [`SchedulerDb::paths_with_production_evidence`]: crate::db::SchedulerDb::paths_with_production_evidence
     /// [`StampProvenance::BuiltLocallyEvidenced`]: crate::db::live_pins::StampProvenance::BuiltLocallyEvidenced
-    // r[impl sched.trust.report-corroboration+3]
+    // r[impl sched.trust.report-corroboration+4]
     pub(super) async fn ca_production_evidence(
         &self,
         executor_id: &str,
@@ -2256,7 +2256,7 @@ impl DagActor {
         // overwrite runs before any assignment exists). Floating-CA
         // is exempt under EXACTLY the claims-mint predicate — see
         // [`Self::retain_expected_members`].
-        // r[impl sched.trust.report-membership+3]
+        // r[impl sched.trust.report-membership+4]
         // (De Morgan of NOT(is_ca AND NOT is_fixed_output) — the
         // non-exempt face.)
         if !state.ca.is_ca || state.is_fixed_output {
@@ -2587,13 +2587,13 @@ impl DagActor {
         // of the `retain_expected_members` arm above): consult ONCE
         // here, BEFORE the CA bookkeeping, so the same evidenced set
         // bounds the realisation insert AND the tenant-visibility
-        // stamp below. The consult runs on EVERY floating-CA path —
+        // stamp below. The consult runs on EVERY floating-CA path — quantifier: census(ca_evidence_reader_census) —
         // an untenanted report (no attributed cohort) consults with
         // the empty cohort and gets the EMPTY evidence set, which
         // refuses every realisation insert (the GLOBAL table's
         // consumers are tenant-unscoped, so "no cohort" means
         // "refuse", never "stand down"; only the tenant-keyed STAMP
-        // is vacuous there). `None` = the bounded faces ONLY
+        // is vacuous there). `None` = the bounded faces only
         // (IA/fixed-output: the expected-set retain already ran).
         let ca_evidence: Option<std::collections::HashSet<Vec<u8>>> = match self.dag.node(drv_hash)
         {
@@ -2809,7 +2809,7 @@ impl DagActor {
         // BuiltLocally and the tenant-unscoped consumers
         // (`query_batch` / `query_prior_realisation`) serve globally
         // — the flip one lane over. `ExpectedSetBounded` = the
-        // bounded faces ONLY (deferred-IA / fixed-output passed the
+        // bounded faces ONLY — quantifier: census(ca_evidence_reader_census) — (deferred-IA / fixed-output passed the
         // dispatch-minted expected-set retain); a floating-CA report
         // presenting it is refused fail-closed below.
         ca_evidence: CaRealisationEvidence<'_>,
@@ -2869,7 +2869,7 @@ impl DagActor {
                 // no cohort ⇒ no consultable evidence — `path_tenants`
                 // is tenant-keyed) refuses every path: the GLOBAL
                 // table's scope demands evidence on every floating-CA
-                // face, so the empty cohort REFUSES ALL rather than
+                // face, so the empty cohort REFUSES ALL — quantifier: census(untenanted_floating_ca_report_never_mints_global_realisations) — rather than
                 // standing down (the cohort-keyed vacuity argument is
                 // the stamp reader's; it never discharged this
                 // reader).

@@ -523,9 +523,9 @@ pub struct RetryState {
     /// the transient-failure budget (they're worker-local, not
     /// build-local) — but still bounded to prevent a misclassified
     /// deterministic failure from hot-looping forever. live059-c: the
-    /// streak resets ONLY on intervening health evidence (a
+    /// streak resets ONLY on intervening health evidence — quantifier: census(intervening_health_evidence_resets_the_infra_streak) — (a
     /// different-class outcome of this drv — Transient/timeout-class:
-    /// the build demonstrably ran), NEVER on elapsed time — the
+    /// the build demonstrably ran), NEVER on elapsed time — quantifier: census(deterministic_infra_carousel_poisons_at_the_cap_regardless_of_cycle_time) — the
     /// retired I-127 wall-window reset made the cap unreachable for
     /// any deterministic failure whose cycle exceeded 300 s (the
     /// live_059 carousel: 520 requeues / 128 drvs); this is the

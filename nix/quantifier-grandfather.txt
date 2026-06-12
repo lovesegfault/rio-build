@@ -1443,7 +1443,6 @@ rio-scheduler/src/ca/resolve.rs	// entirely (it's a Derivation-only field) — A
 rio-scheduler/src/ca/resolve.rs	/// `BasicDerivation::from_resolved` drops ALL `inputDrvs` (CA and
 rio-scheduler/src/ca/resolve.rs	/// builds produce the SAME path, the self-exclusion filters out the
 rio-scheduler/src/config.rs	// backoff can NEVER be satisfied at a re-evaluation — the
-rio-scheduler/src/config.rs	// true on EVERY non-floor-counted infra failure → `infra_count` never
 rio-scheduler/src/config.rs	/// ONLY when worker-reported `materialization_infra` charges alone
 rio-scheduler/src/config.rs	/// never-reporting-replica crash-loop — can NEVER satisfy this
 rio-scheduler/src/config.rs	/// off-by-one) or beyond can never be met and is rejected at

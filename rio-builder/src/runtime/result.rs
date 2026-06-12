@@ -667,7 +667,7 @@ mod tests {
     /// `FailureClassification{DiskFull, quota}` field — the only
     /// channel the scheduler's floor gate consumes — plus the peaks;
     /// the DISK_FULL_MSG substring in the narration is
-    /// DISPLAY/NARRATION ONLY (stable operator wording, the CgroupOom
+    /// DISPLAY/NARRATION ONLY — quantifier: census(forged_free_text_never_moves_resource_floors) — (stable operator wording, the CgroupOom
     /// twin, live_057-a).
     #[test]
     fn err_completion_disk_full_is_infra_with_pinned_msg() {

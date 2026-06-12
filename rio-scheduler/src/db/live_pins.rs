@@ -283,7 +283,7 @@ impl SchedulerDb {
     /// output) carries no confidentiality flip and is
     /// integrity-equivalent to a compromised builder uploading
     /// arbitrary CA content, which the threat model already prices.
-    // r[impl sched.trust.report-corroboration+3]
+    // r[impl sched.trust.report-corroboration+4]
     pub(crate) async fn paths_with_production_evidence(
         &self,
         output_paths: &[String],
@@ -982,7 +982,7 @@ mod registration_writer_census {
         );
     }
 
-    // r[verify sched.trust.report-membership+3]
+    // r[verify sched.trust.report-membership+4]
     /// bug_138 commit 2 (W10-N) — the TAINT-TO-CONSUMER census, the
     /// per-consumer half of the membership law (RC-2(iii): a priced
     /// residual must name every downstream sink of the tainted field
@@ -1193,7 +1193,7 @@ mod registration_writer_census {
             .expect("the floor-promotion caller alphabet is census-pinned");
     }
 
-    // r[verify sched.trust.report-corroboration+3]
+    // r[verify sched.trust.report-corroboration+4]
     /// bug_132 commit 2 (W11-S, the R22″ machine-bind): the CA-face
     /// residual pricing is BOUND to the compensating control's firing
     /// predicate instead of self-reported prose. Two pinned needles
@@ -1311,7 +1311,7 @@ mod registration_writer_census {
     }
 
     // r[verify sched.trust.evidence-scope]
-    // r[verify sched.trust.report-membership+3]
+    // r[verify sched.trust.report-membership+4]
     /// bug_155 commit 2 (W12-K2's home; the R31 founding instance on
     /// this crate) -- the CA-evidence READER census, [GEN-SET]: the
     /// reader set of the CA production-evidence consult is DERIVED
@@ -1326,12 +1326,12 @@ mod registration_writer_census {
     ///    cohort-scoped visibility -- ENTAILED: the consult derives
     ///    the set from the cohort's own `path_tenants` rows, and the
     ///    empty cohort constructs no stamp at all (the cohort-keyed
-    ///    vacuity argument is valid for THIS reader ONLY); the 1:1
+    ///    vacuity argument is valid for this reader only); the 1:1
     ///    consult/construction pairing is pinned by
     ///    `ca_stamp_lanes_consult_production_evidence`.
     /// 2. the GLOBAL `realisations` insert (constructions of the
     ///    typed insert witness): ASSUMES the evidence bounds globally
-    ///    keyed durable truth -- entailed ONLY by the non-optional
+    ///    keyed durable truth -- entailed only by the non-optional
     ///    demand: every consult's set reaches the insert (the
     ///    construction count equals the consult count), the insert
     ///    signature carries the typed witness (the pre-fix
@@ -1344,7 +1344,7 @@ mod registration_writer_census {
     /// POPULATION face (the census riders): non-vacuity asserted per
     /// derived set (>= 1 member; the expected members below are the
     /// generator's verification targets, never the enforcement
-    /// population); the empty-walk planted red drives the SAME walk
+    /// population); the empty-walk planted red drives the same walk
     /// on an empty universe and demands the floor fires.
     #[test]
     fn ca_evidence_reader_census() {
@@ -1380,7 +1380,7 @@ mod registration_writer_census {
         .expect("the consult sites are census-pinned");
 
         // The TOTAL ledger: 2 lane conversions + the chokepoint's own
-        // destructuring arm (the consumer inside the insert). ANY new
+        // destructuring arm (the consumer inside the insert). Any new
         // occurrence (a third construction, an aliased bind) reds
         // this ledger until classified.
         let expected_inserts: BTreeMap<String, usize> =
@@ -1428,7 +1428,7 @@ mod registration_writer_census {
         );
         // (iv) the pre-fix grammar is BANNED: the Option-typed
         // evidence parameter (the shape whose None arm skipped the
-        // law) must not exist anywhere in the crate.
+        // law) must not exist at any site the embedded universe scans.
         let banned = census(&["ca_evidence: Option<&std::collections::", "HashSet"]);
         assert!(
             banned.is_empty(),
@@ -1442,7 +1442,7 @@ mod registration_writer_census {
         let _ = stamp_readers;
     }
 
-    /// The EMPTY-WALK planted red (rider (a), driven through the SAME
+    /// The EMPTY-WALK planted red (rider (a), driven through the same
     /// walk path as production): the non-vacuity floor must FIRE on
     /// an empty universe -- a generator that returns green on zero
     /// scanned sources would certify absence-of-evidence as evidence.
@@ -1551,7 +1551,7 @@ mod registration_writer_census {
     /// an ALIASED/UFCS binding of the consult fn that the dotted-call
     /// needle cannot see -- must overscan-RED, never silently green.
     /// The accounting walk counts the BARE fn token per file and pins
-    /// the full ledger: any new occurrence anywhere (alias, wrapper,
+    /// the full ledger: any new occurrence in the scanned universe (alias, wrapper,
     /// re-export, doc) reds the census until the updater classifies
     /// it as a dotted call (joins the consult pin) or an accounted
     /// mention (joins this ledger).
@@ -1590,7 +1590,7 @@ mod registration_writer_census {
         );
     }
 
-    // r[verify sched.trust.report-corroboration+3]
+    // r[verify sched.trust.report-corroboration+4]
     /// bug_102 commit 4 (W12-L3's home; R31) -- the FLOOR-MUTATION
     /// census, [GEN-SET]: quantified over `resource_floor` MUTATION
     /// SITES derived from the embedded whole-crate universe, never
@@ -1719,7 +1719,7 @@ mod registration_writer_census {
         );
     }
 
-    // r[verify sched.trust.report-corroboration+3]
+    // r[verify sched.trust.report-corroboration+4]
     /// bug_090 commit 6 (W11-X, the R22″ derivation-layer form of
     /// W10-N): the worker→scheduler trust census derives PER-BOUNDARY
     /// from the PROTO SCHEMA — the field universe of the completion
@@ -1879,7 +1879,7 @@ mod registration_writer_census {
             ("BuildResult.stop_time", "telemetry; duration derivation only"),
             // concat!-split so the taint census's own needle never
             // matches this table's source text.
-            (concat!("BuildResult.", "built_outputs"), "the W10-N taint object — shape/name/membership/evidence-gated per sched.trust.report-membership+3 (the per-consumer census above)"),
+            (concat!("BuildResult.", "built_outputs"), "the W10-N taint object — shape/name/membership/evidence-gated per sched.trust.report-membership+4 (the per-consumer census above)"),
             ("BuildResult.store_degraded", "constructor-gated to the infra arm (C3); corroboration via the two-node sighting law before the uncharged class"),
             ("BuildResult.failure_classification", "the bug_090 TYPED sizing channel — consumed ONLY through the corroboration gate (bump_floor_on_corroborated_claim: telemetry vs the assigned shape; refusals counted classify-only)"),
             // ── FailureClassification ───────────────────────────

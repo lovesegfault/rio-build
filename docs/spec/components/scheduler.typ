@@ -157,7 +157,7 @@ critical-path value).
   #(refs.metric)("rio_scheduler_undeclared_built_output_total").
 ]
 
-#r("sched.trust.report-membership+3")[
+#r("sched.trust.report-membership+4")[
   A worker-supplied `output_path` MUST enter `path_tenants` (or any other
   registration sink) ONLY if it is bounded by a scheduler-verifiable path-value // quantifier: census(forged_output_path_never_reaches_path_tenants_on_any_lane)
   law for that assignment, on EVERY report lane and EVERY face: the // quantifier: census(ca_no_upload_report_never_flips_visibility_on_any_lane)
@@ -169,7 +169,7 @@ critical-path value).
   checked as the resident one); the floating-CA face (`is_ca` and not
   fixed-output, the claims-mint predicate --- no dispatch-time expected set
   exists) checks store-recorded production evidence per the corroboration rule
-  below, on EVERY cohort INCLUDING the empty one: an untenanted report
+  below, on EVERY cohort INCLUDING the empty one: an untenanted report // quantifier: census(untenanted_floating_ca_report_never_mints_global_realisations)
   (NULL-tenant anon/dev build, or a late lane whose tenant rows aged out of
   the cold resolve) consults with the empty cohort, receives the EMPTY
   evidence set, and the globally-keyed realisation insert refuses every path
@@ -202,7 +202,7 @@ submitter-controlled attributes (the CA-ness of one's own drv) convert
 per-face residuals into adversary-chosen bypasses; the CA face therefore
 joins the law's domain with its own evidence base rather than an exemption.
 
-#r("sched.trust.report-corroboration+3")[
+#r("sched.trust.report-corroboration+4")[
   A worker report's claim MUST NOT move scheduler-persisted state without
   corroboration the scheduler can verify against evidence it (or the store)
   owns. Two faces:
@@ -220,7 +220,7 @@ joins the law's domain with its own evidence base rather than an exemption.
   error MUST fail closed.
   (2) *Sizing floors:* a persisted resource-floor bump on a worker-reported
   failure MUST present a typed corroboration witness verified against
-  evidence the scheduler owns, on EVERY axis the floor struct carries ---
+  evidence the scheduler owns, on EVERY axis the floor struct carries --- // quantifier: census(floor_mutation_census)
   the carrier is irrelevant to the obligation: claims riding the TYPED
   `failure_classification` wire field (never `error_msg` text) corroborate
   with telemetry consistent with the shape the scheduler itself assigned at
@@ -762,17 +762,17 @@ between counters; the reference fold reproduces each counter's own
 convention and the fencepost unification stays the recorded open question
 (the TODO at the retry kernel's `decide()`).
 
-#r("sched.retry.counters-refine-history+3")[
+#r("sched.retry.counters-refine-history+4")[
   The per-derivation retry counters (`count`, `resubmit_cycles`,
   `infra_count`, `timeout_count`, `last_infra_failure_at`,
   `exempt_infra_count`, `failed_builders`, `failure_count`, `poisoned_at`,
   `backoff_until`) MUST at every point equal the reference fold of the
   derivation's observed failure-event history: each observed event charges
   the counters its class charges and no others; `infra_count` counts
-  CONSECUTIVE infrastructure failures --- it resets ONLY on intervening
+  CONSECUTIVE infrastructure failures --- it resets ONLY on intervening // quantifier: census(intervening_health_evidence_resets_the_infra_streak)
   health evidence (a different-class attempt outcome of this derivation:
   a transient build failure or a deadline-class outcome, each proof the
-  infrastructure delivered the build to a non-infra verdict), NEVER on
+  infrastructure delivered the build to a non-infra verdict), NEVER on // quantifier: census(deterministic_infra_carousel_poisons_at_the_cap_regardless_of_cycle_time)
   elapsed time (the poison cap is denominated in the evidence's own clock
   --- the derivation's conduct --- not the enforcer's wall-window); a
   non-exempt infrastructure failure charges `infra_count` and stamps

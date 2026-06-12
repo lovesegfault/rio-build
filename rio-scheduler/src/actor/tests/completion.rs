@@ -1673,7 +1673,7 @@ async fn test_store_degraded_infra_uncharged_waits_out_the_outage() -> TestResul
 /// a worker report carrying the TYPED
 /// FailureClassification{DiskFull, quota} field (its error_msg
 /// narration carries rio_proto::DISK_FULL_MSG — DISPLAY/NARRATION
-/// ONLY, merged_bug_100: the substring drives nothing) doubles the
+/// ONLY — quantifier: census(forged_free_text_never_moves_resource_floors) —, merged_bug_100: the substring drives nothing) doubles the
 /// DISK resource floor —
 /// the parked EvictedDiskPressure arm's first live producer. The
 /// ladder algebra itself is NOT touched (the floor.rs unit pins
@@ -1841,7 +1841,7 @@ async fn test_floor_bump_store_suppression_parity(
 /// Post-fix: the floor bump consumes only the typed
 /// `failure_classification` field, corroborated against the
 /// scheduler-assigned shape; free text is display/narration.
-// r[verify sched.trust.report-corroboration+3]
+// r[verify sched.trust.report-corroboration+4]
 #[tokio::test]
 async fn forged_free_text_never_moves_resource_floors() -> TestResult {
     let (_db, handle, _task) = setup().await;
@@ -1887,7 +1887,7 @@ async fn forged_free_text_never_moves_resource_floors() -> TestResult {
 /// refused (telemetry absent, or inconsistent with the
 /// scheduler-assigned shape); a CORROBORATED one takes exactly ONE
 /// doubling per incident. Both axes.
-// r[verify sched.trust.report-corroboration+3]
+// r[verify sched.trust.report-corroboration+4]
 #[tokio::test]
 async fn typed_classification_bumps_only_with_corroboration() -> TestResult {
     // Big ceilings: the corroborated cells assert a full doubling —
@@ -5869,7 +5869,7 @@ async fn cancel_late_report_resubmit_solves_warm_with_identity() -> TestResult {
 /// non-poisoning letter (`rio_scheduler_unexpected_built_output_total`
 /// + the structured WARN; the report's lawful effects are unaffected
 /// — the drv still completes on the admitted lane).
-// r[verify sched.trust.report-membership+3]
+// r[verify sched.trust.report-membership+4]
 #[tokio::test]
 async fn forged_output_path_never_reaches_path_tenants_on_any_lane() -> TestResult {
     use sha2::Digest;
@@ -6065,7 +6065,7 @@ async fn forged_output_path_never_reaches_path_tenants_on_any_lane() -> TestResu
 /// evidence for the reporting build's attributed cohort ⇒ a typed,
 /// counted, non-poisoning refusal of the STAMP (the report's other
 /// effects are unaffected; the drv still completes).
-// r[verify sched.trust.report-corroboration+3]
+// r[verify sched.trust.report-corroboration+4]
 #[tokio::test]
 async fn ca_no_upload_report_never_flips_visibility_on_any_lane() -> TestResult {
     use sha2::Digest;
@@ -6272,7 +6272,7 @@ async fn ca_no_upload_report_never_flips_visibility_on_any_lane() -> TestResult 
 /// the completion stamp widens to all interested tenants under the
 /// signed Q2 BuiltLocally law (locally produced bytes — all
 /// interested tenants lawful).
-// r[verify sched.trust.report-corroboration+3]
+// r[verify sched.trust.report-corroboration+4]
 #[tokio::test]
 async fn ca_honest_upload_then_report_stamps_as_today() -> TestResult {
     use sha2::Digest;
@@ -6331,7 +6331,7 @@ async fn ca_honest_upload_then_report_stamps_as_today() -> TestResult {
 
 /// **W12-J (bug_155, the round-12 HIGH)** — *proposition: no
 /// `realisations` row exists without store production evidence, at
-/// the GLOBAL table's own scope — quantified over EVERY floating-CA
+/// the GLOBAL table's own scope — quantified over EVERY floating-CA // quantifier: census(ca_evidence_reader_census)
 /// face INCLUDING the untenanted one (NULL-tenant anon/dev build);
 /// the negation is the live forgery: a token-holding worker on an
 /// untenanted build durably mints a forged modular_hash→victim_path
@@ -6342,11 +6342,11 @@ async fn ca_honest_upload_then_report_stamps_as_today() -> TestResult {
 /// The bug_132 close's own untenanted face: both lanes' empty-cohort
 /// `ca_evidence = None` arm skipped the membership law ENTIRELY at
 /// `ca_insert_realisations` — the "no boundary to guard" vacuity
-/// rationale is true ONLY for the tenant-keyed `path_tenants` stamp
+/// rationale is true only for the tenant-keyed `path_tenants` stamp
 /// reader; `realisations` is globally keyed (PK (drv_hash =
 /// modular_hash, output_name); `query_batch` /
 /// `query_prior_realisation` are tenant-unscoped), so the empty
-/// cohort is exactly where the insert must REFUSE ALL, never stand
+/// cohort is exactly where the insert must refuse all paths, never stand
 /// down. Post-fix the evidence requirement derives from the CONSUMER
 /// table's scope: empty cohort ⇒ empty evidence set ⇒ every path
 /// refuses (fail-closed structural).
@@ -6360,7 +6360,7 @@ async fn ca_honest_upload_then_report_stamps_as_today() -> TestResult {
 /// `query_prior_realisation` (the cutoff-compare consumer), both
 /// tenant-unscoped: the W11-Q end-to-end precedent's global-read
 /// manifestation.
-// r[verify sched.trust.report-corroboration+3]
+// r[verify sched.trust.report-corroboration+4]
 // r[verify sched.trust.evidence-scope]
 #[tokio::test]
 async fn untenanted_floating_ca_report_never_mints_global_realisations() -> TestResult {
@@ -6472,7 +6472,7 @@ async fn untenanted_floating_ca_report_never_mints_global_realisations() -> Test
     );
 
     // ── The honest half (production constructors; no r13-allow) ────
-    // A DIFFERENT, TENANTED build realises the SAME modular hash with
+    // A DIFFERENT, TENANTED build realises the same modular hash with
     // its REAL output: uploaded first (the ingest stamp IS the
     // production evidence), then reported.
     let honest_out = test_store_path("untenanted-ca-honest-out");
@@ -6530,7 +6530,7 @@ async fn untenanted_floating_ca_report_never_mints_global_realisations() -> Test
 /// directly — modeling the builds-retention sweep's row removal (the
 /// producer of the aged-out state; the drv row itself survives, which
 /// is exactly what makes the cold resolve succeed with zero tenants).
-// r[verify sched.trust.report-corroboration+3]
+// r[verify sched.trust.report-corroboration+4]
 #[tokio::test]
 async fn aged_out_late_ca_report_refuses_realisations() -> TestResult {
     use sha2::Digest;
@@ -6615,7 +6615,7 @@ async fn aged_out_late_ca_report_refuses_realisations() -> TestResult {
 /// reds are this witness's teeth), because evidence is structurally
 /// unrepresentable there: `path_tenants` is tenant-keyed, so an empty
 /// cohort has no consultable evidence row by construction.*
-// r[verify sched.trust.report-corroboration+3]
+// r[verify sched.trust.report-corroboration+4]
 #[tokio::test]
 async fn tenanted_evidence_backed_ca_realisation_lands_exactly_as_today() -> TestResult {
     use sha2::Digest;
@@ -6685,7 +6685,7 @@ async fn tenanted_evidence_backed_ca_realisation_lands_exactly_as_today() -> Tes
 /// reports through the production pull path); the verdict flow is
 /// asserted UNTOUCHED (timeouts still charge `timeout_count` — the
 /// close is classify-only on the floor axis, never a retry change).
-// r[verify sched.trust.report-corroboration+3]
+// r[verify sched.trust.report-corroboration+4]
 #[tokio::test]
 async fn forged_timeout_reports_never_move_the_deadline_floor() -> TestResult {
     let recorder = CountingRecorder::default();
@@ -6749,7 +6749,7 @@ async fn forged_timeout_reports_never_move_the_deadline_floor() -> TestResult {
 /// scheduler's own `running_since` clock vs the reconciled
 /// `last_intent.deadline_secs`) corroborates, and the floor doubles
 /// exactly as the wave-11 behavior intended for honest slow builds.*
-// r[verify sched.trust.report-corroboration+3]
+// r[verify sched.trust.report-corroboration+4]
 #[tokio::test]
 async fn corroborated_slow_build_timeout_still_heals_the_deadline_floor() -> TestResult {
     let recorder = CountingRecorder::default();
