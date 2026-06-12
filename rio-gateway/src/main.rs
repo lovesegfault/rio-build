@@ -77,20 +77,22 @@ async fn main() -> anyhow::Result<()> {
     // `connect_forever` → `None` only on shutdown (clean exit).
     //
     // The store connect uses `connect_raw` so the ONE balanced channel
-    // can back both store-side clients (`StoreService` for path/NAR
-    // ops, `LogService` for the build-log live tail) — the generated
-    // clients don't expose their inner channel for re-wrapping. Same
-    // pattern as the builder's `StoreClients`.
-    let Some((store_client, log_client, scheduler_client, _balance_guard)) =
+    // can back all store-side clients (`StoreService` for path/NAR
+    // ops, `LogService` for the build-log live tail, `DrvBlobService`
+    // for ADR-024 drv-digest population) — the generated clients don't
+    // expose their inner channel for re-wrapping. Same pattern as the
+    // builder's `StoreClients`.
+    let Some((store_client, log_client, drv_blob_client, scheduler_client, _balance_guard)) =
         rio_proto::client::connect_forever(&shutdown, || async {
             use rio_proto::client::ProtoClient;
             let (store_ch, _) =
                 rio_proto::client::connect_raw::<rio_proto::StoreServiceClient<_>>(&cfg.store)
                     .await?;
             let store = rio_proto::StoreServiceClient::wrap(store_ch.clone());
-            let logs = rio_proto::LogServiceClient::wrap(store_ch);
+            let logs = rio_proto::LogServiceClient::wrap(store_ch.clone());
+            let drv_blob = rio_proto::DrvBlobServiceClient::wrap(store_ch);
             let (sched, guard) = rio_proto::client::connect(&cfg.scheduler).await?;
-            anyhow::Ok((store, logs, sched, guard))
+            anyhow::Ok((store, logs, drv_blob, sched, guard))
         })
         .await
     else {
@@ -168,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
         scheduler_client,
         authorized_keys,
     )
+    .with_drv_blob_client(drv_blob_client)
     .with_rate_limiter(limiter)
     .with_max_connections(cfg.max_connections)
     .with_max_sessions(cfg.max_sessions)

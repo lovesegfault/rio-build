@@ -40,6 +40,7 @@ pub fn spawn_session_task(
             &mut w,
             &mut store_client,
             &mut log_client,
+            None, // fixtures without DrvBlobService submit legacy
             &mut sched_client,
             tenant,
             jwt,

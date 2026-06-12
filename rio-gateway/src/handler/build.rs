@@ -2712,6 +2712,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     let SessionContext {
         store_client,
         log_client,
+        drv_blob_client,
         scheduler_client,
         drv_cache,
         has_seen_build_paths_with_results,
@@ -2817,6 +2818,17 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     // silently (safe degrade; worker fetches).
     let mut nodes = nodes;
     translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
+
+    // ADR-024: compute drv digests + upload missing drv blobs so
+    // this ssh-ng submission rides the scheduler's digest path. Any
+    // failure degrades to the legacy edges-only submission.
+    translate::populate_digests_and_upload_drvs(
+        &mut nodes,
+        drv_cache,
+        drv_blob_client.as_mut(),
+        jwt.token(),
+    )
+    .await;
 
     // Rate limit + quota BEFORE SubmitBuild. Checked after wire reads
     // + validation (those are cheap; the expensive part is the
@@ -3260,6 +3272,7 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
     let SessionContext {
         store_client,
         log_client,
+        drv_blob_client,
         scheduler_client,
         drv_cache,
         active_build_ids,
@@ -3306,6 +3319,16 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
     stderr
         .log(&format!("rio: planning {n} derivations\n", n = nodes.len()))
         .await?;
+
+    // ADR-024: digest-bearing submission when the full closure is
+    // parseable and the drv blobs land in the store; legacy otherwise.
+    translate::populate_digests_and_upload_drvs(
+        &mut nodes,
+        drv_cache,
+        drv_blob_client.as_mut(),
+        jwt.token(),
+    )
+    .await;
 
     let request = translate::build_submit_request(nodes, edges, "ci", tenant_name.as_ref());
     let result = submit_and_process_build(

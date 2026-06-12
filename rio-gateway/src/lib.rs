@@ -11,7 +11,10 @@ pub(crate) mod quota;
 pub(crate) mod ratelimit;
 pub mod server;
 pub mod session;
-pub(crate) mod translate;
+// `pub` (was crate-private) so integration tests can drive
+// `populate_digests_and_upload_drvs` / `build_node` against a real
+// DrvBlobService (ADR-024 byte-stability test).
+pub mod translate;
 
 pub use quota::QuotaCache;
 pub use ratelimit::{RateLimitConfig, TenantLimiter};

@@ -175,6 +175,9 @@ pub async fn run_protocol<R, W>(
     writer: &mut W,
     store_client: &mut StoreServiceClient<Channel>,
     log_client: &mut rio_proto::LogServiceClient<Channel>,
+    // DrvBlobService client on the store channel. `None` -> the build
+    // handlers skip ADR-024 drv-digest population (legacy submission).
+    drv_blob_client: Option<rio_proto::DrvBlobServiceClient<Channel>>,
     scheduler_client: &mut SchedulerServiceClient<Channel>,
     tenant_name: Option<NormalizedName>,
     jwt: crate::handler::SessionJwt,
@@ -212,6 +215,7 @@ where
         limiter,
         quota_cache,
     );
+    ctx.drv_blob_client = drv_blob_client;
     ctx.handshake_timeout = handshake_timeout;
     run_protocol_loop(reader, writer, &mut ctx, shutdown).await
 }
