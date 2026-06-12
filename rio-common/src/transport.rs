@@ -151,7 +151,10 @@ pub enum EffectfulOutcome<T> {
     /// answered. Side effect unknown (same epistemic state as
     /// `ShutdownAfterSend`; a separate variant so retry loops keep
     /// their pacing arm).
-    TimedOut { after: Duration },
+    TimedOut {
+        /// The elapsed bound at expiry.
+        after: Duration,
+    },
 }
 
 /// [`bounded`] with a polled-once latch (merged_bug_270).

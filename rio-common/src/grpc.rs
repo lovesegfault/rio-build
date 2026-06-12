@@ -507,6 +507,8 @@ pub const CODE_CLASS_LABELS: &[&str] = &[
     "unknown",
 ];
 
+/// Whether a tonic status code is transient for retry purposes
+/// (Unavailable/Unknown-class — the jittered-retry gate's predicate).
 // r[impl builder.fuse.retry-jitter]
 pub fn is_transient(code: tonic::Code) -> bool {
     matches!(

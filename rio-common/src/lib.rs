@@ -5,6 +5,17 @@
 //! workspace. The JWT/HMAC sign-verify stack moved to `rio-auth`;
 //! only the [`JwtConfig`](config::JwtConfig) serde struct and the
 //! `*_TOKEN_HEADER` string constants in [`grpc`] remain here.
+//!
+//! `missing_docs` is DENIED crate-wide (WO-S8-8/bug_144): rio-common
+//! is an invariant-carrier crate (the wanted-outputs never-shrink
+//! contract, the clamped wire types, the transport bounds), and
+//! rustdoc attachment is positional — an edit inserting an item
+//! between a doc block and its item silently re-targets a
+//! load-bearing contract (hit twice: e163c2d77, then the
+//! `saturating_wanted_union` splice). Under the deny, a doc-detached
+//! pub item is a COMPILE ERROR at the splice commit instead of a
+//! silent contract re-target.
+#![deny(missing_docs)]
 
 pub mod backoff;
 pub mod cell_wire;

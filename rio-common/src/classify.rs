@@ -90,16 +90,27 @@ mod tests {
 /// appear here; the exhaustive `From` impl lives next to the enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptTerminalKind {
+    /// Wire zero value — reason not stated.
     Unspecified,
+    /// The cgroup OOM-killed the build.
     OomKilled,
+    /// Evicted under node disk pressure.
     EvictedDiskPressure,
+    /// Evicted for any non-disk reason.
     EvictedOther,
+    /// Finished and reported a result.
     Completed,
+    /// Failed with a build error.
     Error,
+    /// The attempt deadline elapsed.
     DeadlineExceeded,
+    /// Cancelled by its owner.
     Cancelled,
+    /// Preempted (spot reclaim or node scale-down).
     Preempted,
+    /// Reaped by the controller's excess/orphan sweeps.
     Reaped,
+    /// No eligible substitution source remained.
     NoEligibleSource,
 }
 

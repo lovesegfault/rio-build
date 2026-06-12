@@ -68,9 +68,11 @@ pub mod secs {
 
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+    /// Serialize the duration as whole seconds.
     pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
         d.as_secs().serialize(s)
     }
+    /// Deserialize whole seconds into a duration.
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         u64::deserialize(d).map(Duration::from_secs)
     }
@@ -96,9 +98,12 @@ pub mod secs_bounded {
 
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+    /// Serialize the duration as whole seconds.
     pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
         d.as_secs().serialize(s)
     }
+    /// Deserialize whole seconds through the [`super::BoundedSecs`]
+    /// clamp (the config-edge bound).
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         Ok(super::BoundedSecs::from_raw_secs(u64::deserialize(d)?).duration())
     }

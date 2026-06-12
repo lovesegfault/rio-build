@@ -54,7 +54,9 @@ pub const EPOCH_SEP: char = '@';
 /// owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WireCapacity {
+    /// Interruptible spot capacity (`"spot"` on the wire).
     Spot,
+    /// On-demand capacity (`"od"` on the wire).
     OnDemand,
 }
 
@@ -110,11 +112,20 @@ impl std::fmt::Display for EvidenceEpoch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CellDecodeError {
     /// No [`CELL_SEP`] in the entry.
-    MissingSeparator { entry: String },
+    MissingSeparator {
+        /// The undecodable entry, verbatim.
+        entry: String,
+    },
     /// The capacity token is outside the closed alphabet.
-    UnknownCapacity { entry: String },
+    UnknownCapacity {
+        /// The undecodable entry, verbatim.
+        entry: String,
+    },
     /// An [`EPOCH_SEP`] suffix is present but not a `u64`.
-    BadEpoch { entry: String },
+    BadEpoch {
+        /// The undecodable entry, verbatim.
+        entry: String,
+    },
 }
 
 impl std::fmt::Display for CellDecodeError {
@@ -143,7 +154,9 @@ impl std::error::Error for CellDecodeError {}
 /// Decoded parts of a `"h:cap[@epoch]"` cell event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CellEventParts {
+    /// The hardware-class half of the cell key.
     pub hw_class: String,
+    /// The capacity half of the cell key.
     pub capacity: WireCapacity,
     /// `None` = legacy epoch-less entry (the consumer applies it with
     /// the pre-epoch semantics and leaves its epoch gate untouched).

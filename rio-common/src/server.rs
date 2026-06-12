@@ -160,6 +160,7 @@ macro_rules! impl_has_common_config {
 /// OTel spans.
 #[must_use = "Bootstrap holds the OtelGuard — dropping it tears down tracing"]
 pub struct Bootstrap<C> {
+    /// The parsed, validated service config.
     pub cfg: C,
     /// Process-wide cancellation token. Fires on SIGTERM/SIGINT.
     /// Clone for every background loop and pass `.cancelled_owned()`

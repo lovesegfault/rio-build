@@ -152,8 +152,12 @@ pub enum RetryError<E> {
     /// clean exit, not a failure to surface.
     Cancelled,
     /// `max_attempts` reached, or `is_retryable` returned `false`.
-    /// `last` is the most recent error.
-    Exhausted { last: E, attempts: u32 },
+    Exhausted {
+        /// The most recent error.
+        last: E,
+        /// Attempts made before giving up.
+        attempts: u32,
+    },
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for RetryError<E> {
