@@ -634,7 +634,16 @@ impl MbtSystem {
         );
         // The uploader rewinds its transmit cursor to the acked
         // watermark on every (re)connect — that reset IS the
-        // at-least-once retransmit.
+        // at-least-once retransmit. The open-time coverage ack
+        // (bug_032, the wire-1 letter): the driver's first ack-stream
+        // message advertises the durable contiguous watermark
+        // (`IngestSession::open_coverage_next_line`) and the
+        // uploader's typed trim arm consumes it BEFORE replaying —
+        // mirrored here exactly as `log_upload.rs::drive` does.
+        let watermark = session.open_coverage_next_line();
+        if watermark > 0 {
+            h.acked_below = h.acked_below.max(watermark);
+        }
         h.sent_below = h.acked_below;
         h.sessions.push(SessionHarness {
             session_id,
@@ -739,6 +748,13 @@ impl MbtSystem {
             !matches!(outcome, AcceptOutcome::RejectedOverflow),
             "accept rejected a batch in the model's bounded line domain as an overflow"
         );
+        // The covered-replay drop (merged_bug_002's write-path arm):
+        // nothing was buffered or charged, and the driver acks the
+        // batch from the manifest truth (`service.rs`'s CoveredReplay
+        // arm) — the uploader's trim consumes it like any ack.
+        if let AcceptOutcome::CoveredReplay { durable_through } = outcome {
+            h.acked_below = h.acked_below.max(durable_through + 1);
+        }
         Ok(())
     }
 
@@ -851,10 +867,19 @@ impl MbtSystem {
 
     /// `builderDisconnects(e)`: the stream to the open session ends;
     /// the session goes Detached but keeps its buffer (the final drain
-    /// keeps cutting). Driver bookkeeping — the implementation's phase
-    /// is the handler's control flow.
-    fn builder_disconnects(&mut self, e: u64) -> Result<()> {
+    /// keeps cutting). The clean close RELEASES the ingest-session
+    /// registry row (`AppendDriver::run`'s teardown calls
+    /// `sessions::release` on every path but a stolen lease) — the
+    /// registry-row half is a real PG effect the sweep's structural
+    /// liveness exclusion reads (merged_bug_071), so the mirror
+    /// executes it; the phase half stays driver bookkeeping.
+    async fn builder_disconnects(&mut self, e: u64) -> Result<()> {
         let s = self.open_session_of(e)?;
+        let exec_id = self.exec(e)?.exec_id;
+        let session_id = self.exec(e)?.sessions[s - 1].session_id;
+        sessions::release(self.pool(), exec_id, session_id)
+            .await
+            .context("builderDisconnects: registry release")?;
         self.exec(e)?.sessions[s - 1].open = false;
         Ok(())
     }
@@ -1216,7 +1241,7 @@ impl MbtSystem {
             RefreshCeiling(e, s) => self.refresh_ceiling(e, s).await,
             CutChunk(e, s) => self.cut_chunk(e, s).await,
             DeliverAck(e) => self.deliver_ack(e).await,
-            BuilderDisconnects(e) => self.builder_disconnects(e),
+            BuilderDisconnects(e) => self.builder_disconnects(e).await,
             ExecutionExpires(e) => self.execution_expires(e).await,
             // The exec index is carried for symmetry with the model
             // action's parameter; the implementation step is a no-op
@@ -1353,9 +1378,12 @@ const SUPERSEDED_WRITER: NamedRun = NamedRun {
 };
 
 /// `ambiguousAckOverlapRun` (resend regime): a chunk is committed but
-/// its ack never reaches the builder; the builder replays the same
-/// lines to a fresh session, which commits an overlapping chunk; the
-/// read path serves each line exactly once.
+/// its ack never reaches the builder. Pre-letter the reconnect
+/// replayed the same lines blind and a second overlapping chunk
+/// landed; the open-time coverage ack (bug_032) now answers the
+/// ambiguity AT OPEN — the uploader trims to the durable watermark
+/// before replaying, the committed-but-unacked span mints nothing,
+/// and a fresh produced line streams alone.
 const AMBIGUOUS_ACK_OVERLAP: NamedRun = NamedRun {
     run: "ambiguousAckOverlapRun",
     main: "logServiceResend",
@@ -1370,6 +1398,7 @@ const AMBIGUOUS_ACK_OVERLAP: NamedRun = NamedRun {
         CutChunk(1, 1),
         BuilderDisconnects(1),
         OpenSession(1),
+        ProduceLine(1),
         AppendHonest(1),
         CutChunk(1, 2),
     ],
@@ -1393,13 +1422,15 @@ const SWEEP_COMPLETE_LOG: NamedRun = NamedRun {
         BuildFinishes(1),
         RecordFinalLineCount(1),
         ExecutionExpires(1),
-        SweepChunks(1),
-        // v2 ownership split: the store pass leaves the lifecycle row;
-        // the scheduler reclaims it once the attempt ledger releases
-        // AND the artifact conjuncts clear — the builder disconnect
-        // ends the live ingest-session registry row
-        // (store.log.sweep-ownership+1's sixth conjunct).
+        // The builder disconnects FIRST (merged_bug_071): a live
+        // ingest session structurally shields its execution from the
+        // sweep — the clean close releases the registry row, and only
+        // then is the expired execution a victim. The scheduler later
+        // reclaims the lifecycle row once the attempt ledger releases
+        // AND the artifact conjuncts clear
+        // (store.log.sweep-ownership+2's sixth conjunct).
         BuilderDisconnects(1),
+        SweepChunks(1),
         LedgerReleases(1),
         GcExecRow(1),
     ],
@@ -1661,7 +1692,10 @@ impl LogServiceDriver {
                 let sys = self.sys.as_mut().expect("init ran");
                 self.rt.block_on(sys.deliver_ack(e))?;
             },
-            builderDisconnectsAny(e: u64) => self.sys().builder_disconnects(e)?,
+            builderDisconnectsAny(e: u64) => {
+                let sys = self.sys.as_mut().expect("init ran");
+                self.rt.block_on(sys.builder_disconnects(e))?;
+            },
             closeExecStampAny(e: u64) => {
                 let sys = self.sys.as_mut().expect("init ran");
                 self.rt.block_on(sys.close_exec_stamp(e))?;

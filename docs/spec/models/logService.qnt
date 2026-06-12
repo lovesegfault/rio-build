@@ -769,8 +769,9 @@ module logService {
   /// kernel's fourth conjunct (no active assignment) is scheduler-side
   /// state this model does not carry; omitting it only widens the
   /// modeled reclaim. Guards `gcExecRow` (the scheduler's row delete);
-  /// the store's chunk/session pass is age-only BY DESIGN — it never
-  /// touches the row.
+  /// the store's chunk/session pass carries its own structural
+  /// exclusions (`sweepChunks`: terminal + no live registry row,
+  /// merged_bug_071) and never touches the row.
   def execRowSweepEligible(e: int): bool = and {
     expired.get(e),
     // CALIBRATION: the pre-fix SELECT was age-only.
@@ -815,6 +816,50 @@ module logService {
         if (cov2 < 0 or c.first > cov2) -1
         else maxInt(cov2, c.first + c.count)))
     covered >= upTo
+
+  /// `CoverageMap::contiguous_prefix_end` (bug_032): one past the
+  /// highest line of the contiguous-from-zero covered prefix of the
+  /// committed manifest — the open-time coverage watermark the server
+  /// advertises on the open ack and the session's durable floor. Zero
+  /// when line 0 is uncovered. Same fold as `manifestCoversUpTo`, but
+  /// a gap FREEZES the prefix instead of poisoning it.
+  def coveredPrefixEnd(e: int): int =
+    val folded = range(0, MAX_LINE).foldl({ cov: 0, stop: false }, (st, f) =>
+      chunks.get(e).filter(c => c.first == f).fold(st, (st2, c) =>
+        if (st2.stop or c.first > st2.cov) { cov: st2.cov, stop: true }
+        else { cov: maxInt(st2.cov, c.first + c.count), stop: st2.stop }))
+    folded.cov
+
+  /// Is line `l` inside some committed chunk's interval? The covered
+  /// consult's pointwise form — equivalent to the implementation's
+  /// one-span containment because `CoverageMap` merges overlapping and
+  /// adjacent spans.
+  def lineCovered(e: int, l: int): bool =
+    chunks.get(e).exists(c => c.first <= l and l < c.first + c.count)
+
+  /// Is the whole half-open `[lo, hi)` durably covered
+  /// (`CoverageMap::covers_range`)? Empty ranges are not covered.
+  def rangeCovered(e: int, lo: int, hi: int): bool = and {
+    lo < hi,
+    interval(lo, hi).forall(l => lineCovered(e, l)),
+  }
+
+  /// The session after a COVERED-REPLAY drop (merged_bug_002's
+  /// write-path arm / the bug_032 floor): the batch is dropped
+  /// uncharged and un-buffered — it can mint no chunk and no charge —
+  /// but the high water still advances past it (the lines are
+  /// accounted for: durable) and the driver acks it from the manifest
+  /// truth.
+  pure def sessAfterCoveredDrop(slot: SessionSlot, end: int): SessionSlot =
+    match slot {
+      | NoSession => NoSession
+      | Session(x) => Session({
+          phase: x.phase,
+          highWater: maxInt(x.highWater, end),
+          ceiling: x.ceiling,
+          buf: x.buf,
+        })
+    }
 
   /// `gate.rs::log_is_complete`: terminal with a known count, and the
   /// manifest contiguously covers `[0, count)`. A missing
@@ -1731,7 +1776,15 @@ module logService {
       buf: Set(),
     }))),
     sessionsOpened' = sessionsOpened.put(e, sessionsOpened.get(e) + 1),
-    sentBelow' = sentBelow.put(e, ackedBelow.get(e)),
+    // The open-time coverage ack (bug_032, the wire-1 letter): when
+    // the execution has durable contiguous coverage, the FIRST message
+    // on the new ack stream advertises its watermark and the uploader
+    // trims its retransmit buffer below it BEFORE replaying
+    // (`open_coverage_next_line`; absent/zero = legacy no-trim). The
+    // open is atomic here, so the letter rides it: ackedBelow advances
+    // to the watermark and the rewound transmit cursor follows.
+    ackedBelow' = ackedBelow.put(e, maxInt(ackedBelow.get(e), coveredPrefixEnd(e))),
+    sentBelow' = sentBelow.put(e, maxInt(ackedBelow.get(e), coveredPrefixEnd(e))),
     // CALIBRATION: the pre-fix per-session account zeroed on every
     // open; production keeps the lifetime account.
     acceptedTotal' = if (CALIB_SESSION_SCOPED_CAPS) acceptedTotal.put(e, 0)
@@ -1751,7 +1804,6 @@ module logService {
     expired' = expired,
     sweepChunksDone' = sweepChunksDone,
     uploader' = uploader,
-    ackedBelow' = ackedBelow,
     chunks' = chunks,
     fabricated' = fabricated,
     assignmentRowLost' = assignmentRowLost,
@@ -1915,27 +1967,65 @@ module logService {
     val s = openSessionOf(e)
     val lo = sentBelow.get(e)
     val hi = producedEnd.get(e)
+    // The durable floor (bug_032): the session trims a replay's
+    // below-floor prefix before the verdict — with the open-time
+    // coverage ack the honest uploader rarely sends one (the letter
+    // already trimmed), but a session opened against gapped coverage
+    // has floor 0 and replays blind, and the trim still protects the
+    // account. The covered consult (merged_bug_002's write-path arm)
+    // then drops a batch FULLY inside durable coverage: un-buffered,
+    // un-charged, high-water advanced, acked from the manifest truth.
+    val floor = coveredPrefixEnd(e)
+    val lo2 = maxInt(lo, floor)
     all {
       s != 0,
       lo < hi,
-      // The mid-stream cap guard (`store.log.caps-durable`): the kept
-      // lines must fit in the execution's lifetime account. The
+      // The mid-stream cap guard (`store.log.caps-durable+2`): the
+      // kept lines must fit in the execution's lifetime account. The
       // over-cap batch is the stream-fatal FAILED_PRECONDITION arm —
       // modeled by this action being disabled (the abort itself is
-      // `sessionAborts`' nondeterminism).
-      match acceptVerdict(sessHw(e, s), sessCeiling(e, s), lo, hi) {
-        | Accept(keptHi) => acceptedTotal.get(e) + (keptHi - lo) <= CAP
-        | RejectOversized => true
-        | RejectNonMonotone => true
-        | RejectPastFinal => true
+      // `sessionAborts`' nondeterminism). Covered drops charge
+      // nothing, so they never disable the action.
+      or {
+        hi <= floor,
+        match acceptVerdict(sessHw(e, s), sessCeiling(e, s), lo2, hi) {
+          | Accept(keptHi) => or {
+              rangeCovered(e, lo2, keptHi),
+              acceptedTotal.get(e) + (keptHi - lo2) <= CAP,
+            }
+          | RejectOversized => true
+          | RejectNonMonotone => true
+          | RejectPastFinal => true
+        },
       },
       sentBelow' = sentBelow.put(e, hi),
-      match acceptVerdict(sessHw(e, s), sessCeiling(e, s), lo, hi) {
-        | Accept(keptHi) => all {
+      if (hi <= floor) all {
+        // Fully below the floor: a committed-but-unacked replay —
+        // dropped, acked, never re-charged (`AcceptOutcome::
+        // CoveredReplay`).
+        sessions' = sessions.put(e,
+          sessions.get(e).put(s, sessAfterCoveredDrop(sessions.get(e).get(s), hi))),
+        acceptedTotal' = acceptedTotal,
+        ackedBelow' = ackedBelow.put(e, maxInt(ackedBelow.get(e), hi)),
+        wit' = wit,
+      } else
+      match acceptVerdict(sessHw(e, s), sessCeiling(e, s), lo2, hi) {
+        | Accept(keptHi) =>
+          if (rangeCovered(e, lo2, keptHi)) all {
+            // The whole admitted range is already durable: the
+            // covered-replay drop (gapped-coverage shapes; the
+            // contiguous prefix went through the floor arm above).
             sessions' = sessions.put(e,
-              sessions.get(e).put(s, sessAfterAccept(sessions.get(e).get(s), lo, keptHi))),
-            acceptedTotal' = acceptedTotal.put(e, acceptedTotal.get(e) + (keptHi - lo)),
-            wit' = if (hi - lo > MAX_BATCH_LINES)
+              sessions.get(e).put(s, sessAfterCoveredDrop(sessions.get(e).get(s), keptHi))),
+            acceptedTotal' = acceptedTotal,
+            ackedBelow' = ackedBelow.put(e, maxInt(ackedBelow.get(e), keptHi)),
+            wit' = wit,
+          } else all {
+            sessions' = sessions.put(e,
+              sessions.get(e).put(s, sessAfterAccept(sessions.get(e).get(s), lo2, keptHi))),
+            acceptedTotal' = acceptedTotal.put(e, acceptedTotal.get(e) + (keptHi - lo2)),
+            ackedBelow' = ackedBelow,
+            wit' = if (hi - lo2 > MAX_BATCH_LINES)
                 // Only reachable with CALIB_OVERSIZED_ADMITTED (the
                 // live arm rejects first): the admitted over-bound
                 // batch — batchLinesBounded's violation source.
@@ -1949,16 +2039,19 @@ module logService {
             // regime shrinks MAX_BATCH_LINES below the line domain.
             sessions' = sessions,
             acceptedTotal' = acceptedTotal,
+            ackedBelow' = ackedBelow,
             wit' = { ...wit, oversizedRejected: true },
           }
         | RejectNonMonotone => all {
             sessions' = sessions,
             acceptedTotal' = acceptedTotal,
+            ackedBelow' = ackedBelow,
             wit' = { ...wit, nonMonotoneRejected: true },
           }
         | RejectPastFinal => all {
             sessions' = sessions,
             acceptedTotal' = acceptedTotal,
+            ackedBelow' = ackedBelow,
             wit' = { ...wit, pastFinalRejected: true },
           }
       },
@@ -1971,7 +2064,6 @@ module logService {
     expired' = expired,
     sweepChunksDone' = sweepChunksDone,
     uploader' = uploader,
-    ackedBelow' = ackedBelow,
     sessionsOpened' = sessionsOpened,
     chunks' = chunks,
     fabricated' = fabricated,
@@ -2076,23 +2168,54 @@ module logService {
     lo < hi,
     hi <= MAX_LINE,
     val s = openSessionOf(e)
+    // The fabricator rides the same accept path as the honest uploader
+    // (one chokepoint): the below-floor prefix is trimmed and a batch
+    // fully inside durable coverage is dropped un-charged with the
+    // manifest-truth ack — a fabricated re-send of committed content
+    // can mint no chunk, no charge, and no fabricated ghost.
+    val floor = coveredPrefixEnd(e)
+    val lo2 = maxInt(lo, floor)
     all {
       s != 0,
       lo >= sessHw(e, s),
       // Fabricated lines are accepted (and charged) like honest ones —
-      // the cap is an accounting bound, not an honesty check.
-      match acceptVerdict(sessHw(e, s), sessCeiling(e, s), lo, hi) {
-        | Accept(keptHi) => acceptedTotal.get(e) + (keptHi - lo) <= CAP
-        | RejectOversized => true
-        | RejectNonMonotone => true
-        | RejectPastFinal => true
+      // the cap is an accounting bound, not an honesty check. Covered
+      // drops charge nothing.
+      or {
+        hi <= floor,
+        match acceptVerdict(sessHw(e, s), sessCeiling(e, s), lo2, hi) {
+          | Accept(keptHi) => or {
+              rangeCovered(e, lo2, keptHi),
+              acceptedTotal.get(e) + (keptHi - lo2) <= CAP,
+            }
+          | RejectOversized => true
+          | RejectNonMonotone => true
+          | RejectPastFinal => true
+        },
       },
-      match acceptVerdict(sessHw(e, s), sessCeiling(e, s), lo, hi) {
-        | Accept(keptHi) => all {
+      if (hi <= floor) all {
+        sessions' = sessions.put(e,
+          sessions.get(e).put(s, sessAfterCoveredDrop(sessions.get(e).get(s), hi))),
+        fabricated' = fabricated,
+        acceptedTotal' = acceptedTotal,
+        ackedBelow' = ackedBelow.put(e, maxInt(ackedBelow.get(e), hi)),
+        wit' = wit,
+      } else
+      match acceptVerdict(sessHw(e, s), sessCeiling(e, s), lo2, hi) {
+        | Accept(keptHi) =>
+          if (rangeCovered(e, lo2, keptHi)) all {
             sessions' = sessions.put(e,
-              sessions.get(e).put(s, sessAfterAccept(sessions.get(e).get(s), lo, keptHi))),
-            fabricated' = fabricated.put(e, fabricated.get(e).union(interval(lo, keptHi))),
-            acceptedTotal' = acceptedTotal.put(e, acceptedTotal.get(e) + (keptHi - lo)),
+              sessions.get(e).put(s, sessAfterCoveredDrop(sessions.get(e).get(s), keptHi))),
+            fabricated' = fabricated,
+            acceptedTotal' = acceptedTotal,
+            ackedBelow' = ackedBelow.put(e, maxInt(ackedBelow.get(e), keptHi)),
+            wit' = wit,
+          } else all {
+            sessions' = sessions.put(e,
+              sessions.get(e).put(s, sessAfterAccept(sessions.get(e).get(s), lo2, keptHi))),
+            fabricated' = fabricated.put(e, fabricated.get(e).union(interval(lo2, keptHi))),
+            acceptedTotal' = acceptedTotal.put(e, acceptedTotal.get(e) + (keptHi - lo2)),
+            ackedBelow' = ackedBelow,
             wit' = if (keptHi < hi) { ...wit, pastFinalRejected: true } else wit,
           }
         | RejectOversized => all {
@@ -2101,6 +2224,7 @@ module logService {
             sessions' = sessions,
             fabricated' = fabricated,
             acceptedTotal' = acceptedTotal,
+            ackedBelow' = ackedBelow,
             wit' = { ...wit, oversizedRejected: true },
           }
         | RejectNonMonotone => all {
@@ -2109,12 +2233,14 @@ module logService {
             sessions' = sessions,
             fabricated' = fabricated,
             acceptedTotal' = acceptedTotal,
+            ackedBelow' = ackedBelow,
             wit' = wit,
           }
         | RejectPastFinal => all {
             sessions' = sessions,
             fabricated' = fabricated,
             acceptedTotal' = acceptedTotal,
+            ackedBelow' = ackedBelow,
             wit' = { ...wit, pastFinalRejected: true },
           }
       },
@@ -2127,7 +2253,6 @@ module logService {
     expired' = expired,
     sweepChunksDone' = sweepChunksDone,
     uploader' = uploader,
-    ackedBelow' = ackedBelow,
     sentBelow' = sentBelow,
     sessionsOpened' = sessionsOpened,
     chunks' = chunks,
@@ -2524,6 +2649,17 @@ module logService {
     e <= dispatched,
     expired.get(e),
     execRowExists.get(e),
+    // The structural exclusions (merged_bug_071): age alone is not a
+    // liveness proof. A victim must be TERMINAL — a non-terminal row
+    // is an open attempt that may legally stream to the scheduler's
+    // deadline cap (config validation refuses retention at or under
+    // it) — and free of any LIVE ingest-session registry row
+    // (`registryLive`, the same notion the scheduler's reclaim keys
+    // on: open sessions and detached-but-undrained ones still hold
+    // their row; the implementation's reap-grace window bounds the
+    // row's afterlife).
+    dbFinalCount.get(e) != NoCount,
+    not(SESSION_IDS.exists(s => registryLive(e, s))),
     not(sweepChunksDone.get(e)),
     or {
       chunks.get(e) != Set(),
@@ -3494,20 +3630,30 @@ module logServiceResend {
       .then(cutChunk(1, 1))
       .expect(chunks.get(1) == Set({ sess: 1, first: 0, count: 2 }))
       // The ack is never delivered: the builder disconnects first.
+      // Pre-letter this minted the ambiguous overlap — the reconnect
+      // replayed [0,2) blind and a second identical chunk landed; the
+      // open-time coverage ack (bug_032) now answers the ambiguity AT
+      // OPEN: the uploader trims to the durable watermark before
+      // replaying, and a third produced line streams alone.
       .then(builderDisconnects(1))
       .then(openSession(1))
-      .expect(sentBelow.get(1) == 0)
+      // The letter consumed: the transmit cursor starts AT the durable
+      // coverage watermark, not at the stale acked floor.
+      .expect(all { sentBelow.get(1) == 2, ackedBelow.get(1) == 2 })
+      .then(produceLine(1))
       .then(appendHonest(1))
       .then(cutChunk(1, 2))
       .expect(all {
+        // ONE chunk per distinct span — the committed-but-unacked
+        // replay minted nothing (no overlap, no double-charge), and
+        // the fresh tail cut normally.
         chunks.get(1) == Set(
           { sess: 1, first: 0, count: 2 },
-          { sess: 2, first: 0, count: 2 }
+          { sess: 2, first: 2, count: 1 }
         ),
-        // Two overlapping chunks, two yield opportunities per line,
-        // each line served exactly once.
-        readTail(1).served == Set(0, 1),
-        readTail(1).count == 2,
+        acceptedTotal.get(1) == 3,
+        readTail(1).served == Set(0, 1, 2),
+        readTail(1).count == 3,
         servedSpanExact,
       })
 }
@@ -3577,6 +3723,11 @@ module logServiceSweep {
       .then(recordFinalLineCount(1))
       .expect(logIsComplete(1))
       .then(executionExpires(1))
+      // The builder disconnects FIRST (merged_bug_071): a live ingest
+      // session structurally shields its execution from the sweep —
+      // the clean close releases the registry row, and only then is
+      // the expired execution a victim.
+      .then(builderDisconnects(1))
       .then(sweepChunks(1))
       // v2 ownership split: the store pass strips the manifest and the
       // session registry but the lifecycle row SURVIVES it.
@@ -3588,11 +3739,9 @@ module logServiceSweep {
         noSilentLineLoss,
       })
       // The scheduler's reclaim needs the attempt ledger released
-      // AND the artifact conjuncts clear: the builder disconnects
-      // (the session's registry row dies with it —
-      // store.log.sweep-ownership+1's sixth conjunct), then the row
-      // goes.
-      .then(builderDisconnects(1))
+      // AND the artifact conjuncts clear (the registry row died at
+      // the disconnect — store.log.sweep-ownership+2's sixth
+      // conjunct), then the row goes.
       .then(ledgerReleases(1))
       .then(gcExecRow(1))
       .expect(not(execRowExists.get(1)))
