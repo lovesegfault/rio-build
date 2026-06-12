@@ -126,6 +126,42 @@ pub(super) enum LateReportEffect {
     Nothing,
 }
 
+/// bug_155 — the NON-OPTIONAL evidence witness
+/// [`DagActor::ca_insert_realisations`] demands. The `realisations`
+/// table is GLOBALLY keyed (PK `(drv_hash = modular_hash,
+/// output_name)`; its consumers — the resolve/merge `query_batch`
+/// consults and the cutoff-compare `query_prior_realisation` — are
+/// tenant-unscoped), so the evidence requirement derives from THAT
+/// consumer's scope, not from the reporting cohort: every floating-CA
+/// face carries its store-evidence set, and an EMPTY cohort yields
+/// the EMPTY set (refuse all paths) — never an absence the insert
+/// could read as "no boundary to guard". That vacuity argument is
+/// valid only for the tenant-keyed `path_tenants` stamp reader; the
+/// pre-fix `Option` encoding let the untenanted face (NULL-tenant
+/// anon/dev builds; late lanes whose tenant rows aged out) skip the
+/// membership law entirely, minting forged first-writer-wins
+/// `modular_hash → victim_path` rows with zero corroboration.
+///
+/// `Evidenced` is constructible only from a
+/// [`DagActor::ca_production_evidence`] consult (both lanes construct
+/// it on every `is_ca && !is_fixed_output` path); a lane that cannot
+/// present it takes `ExpectedSetBounded`, which the insert refuses
+/// fail-closed on the floating-CA face.
+pub(super) enum CaRealisationEvidence<'a> {
+    /// Floating-CA (`is_ca && !is_fixed_output`): the store-evidenced
+    /// `sha256(path)` set. Empty set ⇒ every output refuses — the
+    /// untenanted face lands here (no cohort, no consultable
+    /// evidence; bytes stay durable, the heal lane is lawful
+    /// re-registration/re-stamp).
+    Evidenced(&'a std::collections::HashSet<Vec<u8>>),
+    /// The bounded faces ONLY: deferred-IA and fixed-output reports
+    /// passed the dispatch-minted expected-set retain
+    /// ([`DagActor::retain_expected_members`]) — the path-value law
+    /// already ran upstream. Presented on a floating-CA face, the
+    /// insert refuses every output (the fail-closed belt).
+    ExpectedSetBounded,
+}
+
 /// The one computation `(reporting identity, node context, payload
 /// status, final_line_count, validated outputs)` →
 /// [`LateReportEffect`]. Pure; all three lanes (the pull report
@@ -1552,29 +1588,32 @@ impl DagActor {
                     t
                 };
                 let paths: Vec<String> = outputs.iter().map(|o| o.output_path.clone()).collect();
-                // bug_132 — the late lane's CA face takes the same
-                // production-evidence gate as the admitted lane (the
-                // wave-9 Register face was the weaker-checked replica
-                // once already; the durable `is_ca AND NOT is_fo` is
-                // the same claims-mint predicate the skip above
-                // keyed). The consult also bounds the realisation
-                // insert below. Untenanted reports (no cohort) have
-                // no boundary to guard — the stamp is vacuous there.
-                let ca_evidence: Option<std::collections::HashSet<Vec<u8>>> =
-                    if *is_ca && !*is_fo && !tenants.is_empty() {
-                        Some(
-                            self.ca_production_evidence(
-                                executor_id,
-                                drv_key,
-                                "late-register",
-                                &paths,
-                                &tenants,
-                            )
-                            .await,
+                // bug_132/bug_155 — the late lane's CA face takes the
+                // same production-evidence gate as the admitted lane
+                // (the wave-9 Register face was the weaker-checked
+                // replica once already; the durable `is_ca AND NOT
+                // is_fo` is the same claims-mint predicate the skip
+                // above keyed). The consult also bounds the
+                // realisation insert below, and it runs on EVERY
+                // floating-CA path: an aged-out or untenanted cohort
+                // consults empty and gets the EMPTY evidence set —
+                // the realisation insert refuses all (its consumers
+                // are tenant-unscoped; only the tenant-keyed STAMP is
+                // vacuous on the empty cohort).
+                let ca_evidence: Option<std::collections::HashSet<Vec<u8>>> = if *is_ca && !*is_fo {
+                    Some(
+                        self.ca_production_evidence(
+                            executor_id,
+                            drv_key,
+                            "late-register",
+                            &paths,
+                            &tenants,
                         )
-                    } else {
-                        None
-                    };
+                        .await,
+                    )
+                } else {
+                    None
+                };
                 if tenants.is_empty() {
                     info!(
                         drv_hash = %canonical,
@@ -1613,9 +1652,17 @@ impl DagActor {
                 // is_ca/needs_resolve gate reads the resident node;
                 // an EVICTED CA node's modular hash is not durably
                 // resolvable — the priced residual recorded in the
-                // owning commit), evidence-bounded on the CA face.
-                self.ca_insert_realisations(&canonical, &outputs, ca_evidence.as_ref())
-                    .await;
+                // owning commit), evidence-bounded on the CA face
+                // (empty cohort ⇒ empty set ⇒ refuse all — bug_155).
+                self.ca_insert_realisations(
+                    &canonical,
+                    &outputs,
+                    match &ca_evidence {
+                        Some(set) => CaRealisationEvidence::Evidenced(set),
+                        None => CaRealisationEvidence::ExpectedSetBounded,
+                    },
+                )
+                .await;
             }
             LateReportEffect::Nothing => {}
         }
@@ -1763,6 +1810,16 @@ impl DagActor {
     /// A consult ERROR fails CLOSED (empty evidence set): unknowable
     /// evidence must never grant cross-tenant visibility; the
     /// degraded posture and heal lane are the same as a refused path.
+    ///
+    /// An EMPTY cohort (bug_155 — untenanted anon/dev builds; late
+    /// lanes whose tenant rows aged out) ALSO fails closed: evidence
+    /// is structurally unrepresentable there (`path_tenants` is
+    /// tenant-keyed, so no row can speak for an absent cohort), and
+    /// the GLOBAL `realisations` consumers this set bounds are
+    /// tenant-unscoped — the consult returns the empty set and every
+    /// path takes the typed refusal letter. Degraded posture and heal
+    /// lane unchanged: bytes durable, lawful re-registration/re-stamp
+    /// recovers.
     ///
     /// [`SchedulerDb::paths_with_production_evidence`]: crate::db::SchedulerDb::paths_with_production_evidence
     /// [`StampProvenance::BuiltLocallyEvidenced`]: crate::db::live_pins::StampProvenance::BuiltLocallyEvidenced
@@ -2543,41 +2600,47 @@ impl DagActor {
                 .collect();
         }
 
-        // bug_132 — the floating-CA face's production-evidence gate
-        // (the membership law's CA face, the De-Morgan complement of
-        // the `retain_expected_members` arm above): consult ONCE here,
-        // BEFORE the CA bookkeeping, so the same evidenced set bounds
-        // the realisation insert AND the tenant-visibility stamp
-        // below. `None` = the bounded faces (IA/fixed-output: the
-        // expected-set retain already ran) or an untenanted report
-        // (no attributed cohort → no tenant boundary to guard and no
-        // stamp to gate — single-tenant/anon mode keeps today's
-        // behavior).
+        // bug_132/bug_155 — the floating-CA face's production-evidence
+        // gate (the membership law's CA face, the De-Morgan complement
+        // of the `retain_expected_members` arm above): consult ONCE
+        // here, BEFORE the CA bookkeeping, so the same evidenced set
+        // bounds the realisation insert AND the tenant-visibility
+        // stamp below. The consult runs on EVERY floating-CA path —
+        // an untenanted report (no attributed cohort) consults with
+        // the empty cohort and gets the EMPTY evidence set, which
+        // refuses every realisation insert (the GLOBAL table's
+        // consumers are tenant-unscoped, so "no cohort" means
+        // "refuse", never "stand down"; only the tenant-keyed STAMP
+        // is vacuous there). `None` = the bounded faces ONLY
+        // (IA/fixed-output: the expected-set retain already ran).
         let ca_evidence: Option<std::collections::HashSet<Vec<u8>>> = match self.dag.node(drv_hash)
         {
             Some(state) if state.ca.is_ca && !state.is_fixed_output => {
                 let tenant_ids: Vec<Uuid> = state.attributed_tenants(&self.builds).collect();
-                if tenant_ids.is_empty() {
-                    None
-                } else {
-                    let paths = state.output_paths.clone();
-                    Some(
-                        self.ca_production_evidence(
-                            executor_id.as_str(),
-                            drv_hash.as_str(),
-                            "admitted",
-                            &paths,
-                            &tenant_ids,
-                        )
-                        .await,
+                let paths = state.output_paths.clone();
+                Some(
+                    self.ca_production_evidence(
+                        executor_id.as_str(),
+                        drv_hash.as_str(),
+                        "admitted",
+                        &paths,
+                        &tenant_ids,
                     )
-                }
+                    .await,
+                )
             }
             _ => None,
         };
 
         let skipped_interested = self
-            .complete_ca_bookkeeping(drv_hash, &result.built_outputs, ca_evidence.as_ref())
+            .complete_ca_bookkeeping(
+                drv_hash,
+                &result.built_outputs,
+                match &ca_evidence {
+                    Some(set) => CaRealisationEvidence::Evidenced(set),
+                    None => CaRealisationEvidence::ExpectedSetBounded,
+                },
+            )
             .await;
 
         // I-209: persist_status(.., Completed, ..) now also closes the
@@ -2734,7 +2797,7 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         built_outputs: &[crate::domain::BuiltOutput],
-        ca_evidence: Option<&std::collections::HashSet<Vec<u8>>>,
+        ca_evidence: CaRealisationEvidence<'_>,
     ) -> HashSet<Uuid> {
         self.ca_insert_realisations(drv_hash, built_outputs, ca_evidence)
             .await;
@@ -2752,17 +2815,22 @@ impl DagActor {
         &self,
         drv_hash: &DrvHash,
         built_outputs: &[crate::domain::BuiltOutput],
-        // bug_132: `Some` on the floating-CA worker-report face — the
-        // store-evidenced sha256(path) set from
-        // [`Self::ca_production_evidence`]; a non-member output is
-        // SKIPPED (already counted/attributed by the consult's typed
-        // letter). Without this bound a forged (modular_hash →
-        // victim_path) mapping becomes durable truth the CA-cutoff
-        // cascade later stamps under plain BuiltLocally — the flip
-        // one lane over. `None` = the bounded faces (deferred-IA /
-        // fixed-output passed the expected-set retain; untenanted
-        // reports have no boundary to guard).
-        ca_evidence: Option<&std::collections::HashSet<Vec<u8>>>,
+        // bug_155: the NON-OPTIONAL typed witness — see
+        // [`CaRealisationEvidence`]. On the floating-CA face the
+        // variant is `Evidenced` with the store-evidenced
+        // sha256(path) set from [`Self::ca_production_evidence`]; a
+        // non-member output is SKIPPED (already counted/attributed by
+        // the consult's typed letter), and an EMPTY set — the
+        // untenanted face — skips every output. Without this bound a
+        // forged (modular_hash → victim_path) mapping becomes durable
+        // truth the CA-cutoff cascade later stamps under plain
+        // BuiltLocally and the tenant-unscoped consumers
+        // (`query_batch` / `query_prior_realisation`) serve globally
+        // — the flip one lane over. `ExpectedSetBounded` = the
+        // bounded faces ONLY (deferred-IA / fixed-output passed the
+        // dispatch-minted expected-set retain); a floating-CA report
+        // presenting it is refused fail-closed below.
+        ca_evidence: CaRealisationEvidence<'_>,
     ) {
         // Realisation insert: for a CA derivation, write
         // `(modular_hash, output_name) → (output_path, output_hash)`
@@ -2806,16 +2874,51 @@ impl DagActor {
                 outputs = built_outputs.len(),
                 "insert_realisation: CA build complete, writing realisations"
             );
+            // bug_155: the floating-CA predicate, re-derived HERE from
+            // the same node state the insert reads — the fail-closed
+            // belt below never trusts the caller's claimed face.
+            let floating_ca = state.ca.is_ca && !state.is_fixed_output;
             for output in built_outputs {
-                // bug_132: the evidence bound (see the parameter doc)
-                // — a worker-supplied mapping for a path the build's
-                // cohort never uploaded is refused here exactly as at
-                // the stamp; the consult already counted the letter.
-                if let Some(evidenced) = ca_evidence {
-                    use sha2::Digest;
-                    let h = sha2::Sha256::digest(output.output_path.as_bytes());
-                    if !evidenced.contains(h.as_slice()) {
-                        continue;
+                // bug_132/bug_155: the evidence bound (see the
+                // parameter doc) — a worker-supplied mapping for a
+                // path the build's cohort never uploaded is refused
+                // here exactly as at the stamp; the consult already
+                // counted the letter. The EMPTY set (untenanted face:
+                // no cohort ⇒ no consultable evidence — `path_tenants`
+                // is tenant-keyed) refuses every path: the GLOBAL
+                // table's scope demands evidence on every floating-CA
+                // face, so the empty cohort REFUSES ALL rather than
+                // standing down (the cohort-keyed vacuity argument is
+                // the stamp reader's; it never discharged this
+                // reader).
+                match ca_evidence {
+                    CaRealisationEvidence::Evidenced(evidenced) => {
+                        use sha2::Digest;
+                        let h = sha2::Sha256::digest(output.output_path.as_bytes());
+                        if !evidenced.contains(h.as_slice()) {
+                            continue;
+                        }
+                    }
+                    CaRealisationEvidence::ExpectedSetBounded => {
+                        // Fail-closed belt: a floating-CA report can
+                        // never ride the expected-set face (no
+                        // dispatch-minted set exists for it) — a
+                        // mis-constructed future lane refuses here
+                        // with the same typed letter the consult
+                        // mints, instead of inserting unguarded.
+                        if floating_ca {
+                            warn!(
+                                drv_hash = %drv_hash,
+                                output_name = %output.output_name,
+                                output_path = %output.output_path,
+                                "refusing floating-CA realisation presented without \
+                                 its evidence set (fail-closed; the lane must consult \
+                                 ca_production_evidence)"
+                            );
+                            metrics::counter!("rio_scheduler_unevidenced_ca_output_total")
+                                .increment(1);
+                            continue;
+                        }
                     }
                 }
                 let Ok(output_hash): Result<[u8; 32], _> = output.output_hash.as_slice().try_into()

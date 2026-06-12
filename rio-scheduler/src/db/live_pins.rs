@@ -962,12 +962,15 @@ mod registration_writer_census {
             // the bug_138 W10-M forged-report red's victim seeding
             // (tenant B's pre-existing rows are the I-217 baseline the
             // flip assertion reads; seeded through the censused writer
-            // on purpose, never a raw INSERT) and the bug_132 W11-Q/
+            // on purpose, never a raw INSERT), the bug_132 W11-Q/
             // W11-R seeds (the CA-face victim baseline + the honest
             // flow's ingest-stamp stand-in — same precedent: the
             // store's ingest lane is out of crate reach, so the
-            // censused writer plays it)
-            ("actor/tests/completion.rs".to_string(), 5),
+            // censused writer plays it), and the bug_155 W12-J/W12-K
+            // seeds (the untenanted-face victim baseline + the honest
+            // half's and the preservation witness's ingest-stamp
+            // stand-ins — three more rows of the same W10-M form)
+            ("actor/tests/completion.rs".to_string(), 8),
         ]
         .into();
         assert_eq!(

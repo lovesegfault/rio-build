@@ -6301,3 +6301,336 @@ async fn ca_honest_upload_then_report_stamps_as_today() -> TestResult {
     );
     Ok(())
 }
+
+/// **W12-J (bug_155, the round-12 HIGH)** — *proposition: no
+/// `realisations` row exists without store production evidence, at
+/// the GLOBAL table's own scope — quantified over EVERY floating-CA
+/// face INCLUDING the untenanted one (NULL-tenant anon/dev build);
+/// the negation is the live forgery: a token-holding worker on an
+/// untenanted build durably mints a forged modular_hash→victim_path
+/// mapping with zero corroboration, first-writer-wins blocks the
+/// later honest row, and the GLOBAL read path serves the flip to the
+/// other tenant's resolve.*
+///
+/// The bug_132 close's own untenanted face: both lanes' empty-cohort
+/// `ca_evidence = None` arm skipped the membership law ENTIRELY at
+/// `ca_insert_realisations` — the "no boundary to guard" vacuity
+/// rationale is true ONLY for the tenant-keyed `path_tenants` stamp
+/// reader; `realisations` is globally keyed (PK (drv_hash =
+/// modular_hash, output_name); `query_batch` /
+/// `query_prior_realisation` are tenant-unscoped), so the empty
+/// cohort is exactly where the insert must REFUSE ALL, never stand
+/// down. Post-fix the evidence requirement derives from the CONSUMER
+/// table's scope: empty cohort ⇒ empty evidence set ⇒ every path
+/// refuses (fail-closed structural).
+///
+/// The forged half rides `r13-allow(forged-report)` (the forgery IS
+/// the test); the honest half is production constructors end-to-end
+/// (censused stamp writer + the pull report path). The read leg
+/// consults `rio_store::realisations::query_batch` — the EXACT
+/// consumer fn the scheduler resolve/merge path consults
+/// (ca/resolve.rs `resolve_ca_inputs`; actor/merge.rs) — and
+/// `query_prior_realisation` (the cutoff-compare consumer), both
+/// tenant-unscoped: the W11-Q end-to-end precedent's global-read
+/// manifestation.
+// r[verify sched.trust.report-corroboration+2]
+#[tokio::test]
+async fn untenanted_floating_ca_report_never_mints_global_realisations() -> TestResult {
+    use sha2::Digest;
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (db, handle, _task) = setup().await;
+    let sched_db = crate::db::SchedulerDb::new(db.pool.clone());
+
+    // Tenant B (the victim) owns a real path — stamped at upload via
+    // the censused writer (the W10-M ingest-stamp stand-in).
+    let tenant_b = rio_store::test_helpers::seed_tenant(&db.pool, "untenanted-ca-victim").await;
+    let victim = test_store_path("untenanted-ca-victim-secret");
+    let prov = crate::db::live_pins::StampProvenance::BuiltLocally;
+    sched_db
+        .upsert_path_tenants(std::slice::from_ref(&victim), &[tenant_b], &prov)
+        .await?;
+
+    // ONE modular hash, two drvs: the realisations PK is
+    // (modular_hash, output_name), so the attacker's row and the
+    // honest row collide exactly when both builds realise the same
+    // modular hash — the first-writer-wins face under test.
+    let mh = sha2::Sha256::digest(b"untenanted-ca-forge").to_vec();
+    let mh32: [u8; 32] = mh.as_slice().try_into().unwrap();
+    let mk_ca = |tag: &str| {
+        let mut n = make_node(tag);
+        n.is_content_addressed = true;
+        n.ca_modular_hash = mh.clone();
+        n
+    };
+
+    // ── The forged half (r13-allow(forged-report)) ─────────────────
+    // The UNTENANTED build: `tenant_id: None` — the anon/dev face the
+    // cold/warm cohort resolution returns empty for.
+    let _ev = merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: Uuid::new_v4(),
+            tenant_id: None,
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![mk_ca("untenanted-ca-forge")],
+            edges: vec![],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
+    let _assignment = pull_attempt(&handle, "untenanted-ca-forge").await;
+    // The forged report: claims tenant B's path as this build's output.
+    pull_complete_success(&handle, "untenanted-ca-forge", &victim).await?;
+    barrier(&handle).await;
+
+    // THE GLOBAL INSERT — the coupled second reader the cohort-keyed
+    // guard never covered.
+    let forged: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM realisations WHERE drv_hash = $1 AND output_path = $2",
+    )
+    .bind(mh.as_slice())
+    .bind(&victim)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        forged, 0,
+        "left (pre-fix): the untenanted lane's ca_evidence=None arm \
+         skipped the membership law and the forged \
+         modular_hash→victim_path row LANDED in the GLOBAL \
+         realisations table / right: empty cohort ⇒ empty evidence \
+         set ⇒ the insert refuses every path"
+    );
+    // The read leg, resolve-path consumer (tenant-unscoped).
+    let served =
+        rio_store::realisations::query_batch(&db.pool, &[(mh32, "out".to_string())]).await?;
+    assert!(
+        served.is_empty(),
+        "left (pre-fix): query_batch — the resolve/merge consult — \
+         served the FORGED victim mapping to any tenant's resolve / \
+         right: no row exists, nothing is served"
+    );
+    // The read leg, cutoff-compare consumer: a DIFFERENT build asking
+    // "did any prior build realise this path?" must not see a forged
+    // prior (pre-fix it minted cross-tenant cutoff grants from it).
+    let other_mh = sha2::Sha256::digest(b"untenanted-ca-other").to_vec();
+    let other32: [u8; 32] = other_mh.as_slice().try_into().unwrap();
+    let prior = crate::ca::query_prior_realisation(&db.pool, &victim, &other32).await?;
+    assert!(
+        prior.is_none(),
+        "left (pre-fix): query_prior_realisation served the forged row \
+         as a PRIOR REALISATION of the victim path (the cutoff-compare \
+         flip) / right: none exists"
+    );
+    // The refusal is a TYPED letter (counted at the consult), and it
+    // is non-poisoning: the untenanted completion itself succeeds.
+    assert_eq!(
+        recorder.get("rio_scheduler_unevidenced_ca_output_total{}"),
+        1,
+        "the untenanted refusal is COUNTED (one per refused output), \
+         never a silent drop"
+    );
+    let info = expect_drv(&handle, "untenanted-ca-forge").await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Completed,
+        "the evidence refusal withholds the realisation, never the \
+         completion (non-poisoning; bytes durable; heal = lawful \
+         registration/re-stamp — the disclosed degraded posture)"
+    );
+
+    // ── The honest half (production constructors; no r13-allow) ────
+    // A DIFFERENT, TENANTED build realises the SAME modular hash with
+    // its REAL output: uploaded first (the ingest stamp IS the
+    // production evidence), then reported.
+    let honest_out = test_store_path("untenanted-ca-honest-out");
+    sched_db
+        .upsert_path_tenants(
+            std::slice::from_ref(&honest_out),
+            &[DEFAULT_TEST_TENANT],
+            &prov,
+        )
+        .await?;
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![mk_ca("untenanted-ca-honest")],
+        vec![],
+        false,
+    )
+    .await?;
+    let _assignment = pull_attempt(&handle, "untenanted-ca-honest").await;
+    pull_complete_success(&handle, "untenanted-ca-honest", &honest_out).await?;
+    barrier(&handle).await;
+
+    // First-writer-wins adjudicates: pre-fix the forged row blocked
+    // this insert (ON CONFLICT DO NOTHING) and the resolve consult
+    // kept serving the victim path; post-fix the honest row is the
+    // only writer and the same consumer serves it.
+    let served =
+        rio_store::realisations::query_batch(&db.pool, &[(mh32, "out".to_string())]).await?;
+    assert_eq!(
+        served.len(),
+        1,
+        "the honest evidence-backed row must exist for the resolve consult"
+    );
+    assert_eq!(
+        served[0].output_path, honest_out,
+        "left (pre-fix): first-writer-wins served the FORGED victim \
+         path to the honest tenant's own resolve (the cross-tenant \
+         flip through the global read path) / right: the honest row \
+         landed and is served"
+    );
+    Ok(())
+}
+
+/// **W12-J2 (bug_155, the aged-out late-lane orbit)** — *proposition:
+/// the refusal quantifier covers the LATE Register lane whose tenant
+/// cohort aged out — the cold resolve (`b.tenant_id IS NOT NULL`)
+/// returns an empty cohort for a drv whose build rows the retention
+/// sweep removed, and the empty cohort refuses the realisation insert
+/// exactly as the anon face does.* The late HONEST re-report refusing
+/// here is part of the DISCLOSED behavior delta (wave-log disclosure
+/// at the owning commit): bytes stay durable, the row is absent, the
+/// heal lane is lawful re-registration/re-stamp.
+///
+/// Aging stand-in: the build/build_derivations rows are deleted
+/// directly — modeling the builds-retention sweep's row removal (the
+/// producer of the aged-out state; the drv row itself survives, which
+/// is exactly what makes the cold resolve succeed with zero tenants).
+// r[verify sched.trust.report-corroboration+2]
+#[tokio::test]
+async fn aged_out_late_ca_report_refuses_realisations() -> TestResult {
+    use sha2::Digest;
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (db, handle, _task) = setup().await;
+
+    let mh = sha2::Sha256::digest(b"aged-late-ca").to_vec();
+    let mut node = make_node("aged-late-ca");
+    node.is_content_addressed = true;
+    node.ca_modular_hash = mh.clone();
+
+    let build = Uuid::new_v4();
+    let _ev = merge_dag(&handle, build, vec![node], vec![], false).await?;
+    let exec_id = open_pull_exec(&handle, "aged-late-ca").await;
+    // Cancel WITHOUT cleanup: the node stays RESIDENT (status
+    // Cancelled) so the Register lane's realisation insert has a
+    // resolvable modular hash — the exact face where the unguarded
+    // arm minted durable rows. (A cleaned/evicted node's insert
+    // no-ops on residency — the bug_132 close's priced residual —
+    // which would mask the row-landing red this orbit exists to pin.)
+    cancel_build(&handle, build).await?;
+    barrier(&handle).await;
+
+    // The aging: retention removes the build rows; the derivation row
+    // survives. The cold resolve's LEFT JOIN then yields the drv with
+    // ZERO tenanted builds — the empty cohort.
+    sqlx::query("DELETE FROM build_derivations WHERE build_id = $1")
+        .bind(build)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query("DELETE FROM builds WHERE build_id = $1")
+        .bind(build)
+        .execute(&db.pool)
+        .await?;
+
+    // The late report (honest-shaped: the build's own output path —
+    // the refusal below is the DISCLOSED delta, not an attack claim).
+    let late_out = test_store_path("aged-late-ca-out");
+    let mut payload = pull_payload(rio_proto::types::BuildResult {
+        status: rio_proto::types::BuildResultStatus::Built.into(),
+        built_outputs: vec![rio_proto::types::BuiltOutput {
+            output_name: "out".into(),
+            output_path: late_out.clone(),
+            output_hash: vec![0u8; 32],
+        }],
+        ..Default::default()
+    });
+    payload.final_line_count = 1;
+    pull_report_exec(&handle, exec_id, "aged-late-ca", payload).await?;
+    barrier(&handle).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM realisations WHERE drv_hash = $1")
+        .bind(mh.as_slice())
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        rows, 0,
+        "left (pre-fix): the aged-out late lane's empty cohort took \
+         the ca_evidence=None arm and the realisation landed \
+         unguarded (the same face a forger reaches by waiting out \
+         retention) / right: empty cohort ⇒ refuse — the late honest \
+         re-report's refusal is the disclosed delta, healed by lawful \
+         re-registration"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_unevidenced_ca_output_total{}"),
+        1,
+        "the aged-out refusal is the same COUNTED letter"
+    );
+    Ok(())
+}
+
+/// **W12-K (bug_155, the satisfiable honest faces)** — *proposition:
+/// the law's honest faces are PRESERVED at the law's own scope — a
+/// tenanted, evidence-backed floating-CA report (the single- and
+/// multi-tenant deployments' face: non-empty cohort, real upload)
+/// inserts its realisation EXACTLY as today and the global consumers
+/// serve it; on the untenanted face the witness is the REFUSAL plus
+/// the degraded-posture disclosure (asserted in W12-J/W12-J2 — the
+/// reds are this witness's teeth), because evidence is structurally
+/// unrepresentable there: `path_tenants` is tenant-keyed, so an empty
+/// cohort has no consultable evidence row by construction.*
+// r[verify sched.trust.report-corroboration+2]
+#[tokio::test]
+async fn tenanted_evidence_backed_ca_realisation_lands_exactly_as_today() -> TestResult {
+    use sha2::Digest;
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (db, handle, _task) = setup().await;
+    let sched_db = crate::db::SchedulerDb::new(db.pool.clone());
+
+    let honest_out = test_store_path("ca-evidence-realisation-out");
+    let prov = crate::db::live_pins::StampProvenance::BuiltLocally;
+    sched_db
+        .upsert_path_tenants(
+            std::slice::from_ref(&honest_out),
+            &[DEFAULT_TEST_TENANT],
+            &prov,
+        )
+        .await?;
+
+    let mh = sha2::Sha256::digest(b"ca-evidence-realisation").to_vec();
+    let mh32: [u8; 32] = mh.as_slice().try_into().unwrap();
+    let mut node = make_node("ca-evidence-realisation");
+    node.is_content_addressed = true;
+    node.ca_modular_hash = mh.clone();
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    let _assignment = pull_attempt(&handle, "ca-evidence-realisation").await;
+    pull_complete_success(&handle, "ca-evidence-realisation", &honest_out).await?;
+    barrier(&handle).await;
+
+    let served =
+        rio_store::realisations::query_batch(&db.pool, &[(mh32, "out".to_string())]).await?;
+    assert_eq!(
+        served.len(),
+        1,
+        "tenanted + evidence-backed: the realisation row lands exactly \
+         as today (the honest path is byte-identical pre/post fix)"
+    );
+    assert_eq!(served[0].output_path, honest_out);
+    assert_eq!(
+        recorder.get("rio_scheduler_unevidenced_ca_output_total{}"),
+        0,
+        "zero refusal letters on the evidence-backed face"
+    );
+    let info = expect_drv(&handle, "ca-evidence-realisation").await;
+    assert_eq!(info.status, DerivationStatus::Completed);
+    Ok(())
+}
