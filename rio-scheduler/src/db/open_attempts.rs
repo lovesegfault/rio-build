@@ -214,8 +214,8 @@ impl SchedulerDb {
     /// mint updates zero rows — the begin-time floor check is advisory;
     /// this guard is authoritative. Equal generation passes (`<=`, the
     /// same-epoch re-acquire keep). The fresh-INSERT-below-floor
-    /// residual (no conflict row to evaluate against) is priced in
-    /// `fence-invariant-map.md` and bounded in `fencedWrites.qnt`.
+    /// residual (no conflict row to evaluate against) is priced and
+    /// bounded in `fencedWrites.qnt` (the PRICED RESIDUAL header note).
     // r[impl sched.lease.fence-statement-guard]
     pub(crate) async fn mint_assignment_upsert_in_tx(
         conn: &mut sqlx::PgConnection,

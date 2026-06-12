@@ -31,6 +31,18 @@
 //!   an acquire-side consumer but no lose-side writer, so an A→B→A
 //!   lease flap inside one 600s housekeeping tick skipped the
 //!   cost-table reload and the tick body persisted stale prices.
+//!
+//! Formal-coverage record (directive-2, relocated from the retired
+//! observability invariant map): series-lifecycle plumbing (Prometheus
+//! birth semantics, metrics-rs registration, RPC-caller topology) has
+//! no adversarial interleaving the registry types do not foreclose —
+//! the binding enforcement is the parity tests, the bidirectional
+//! gauge-policy test and the family-driven sweeps; a fresh model would
+//! re-state the LEADER_EDGES table row by row. Partial supersession:
+//! the cost-latch half of that disposition was later overturned by the
+//! merged_bug_212 rebound-edge finding — `costLatch.qnt` now models the
+//! latch protocol (the registry's cost-latch cells mirrored
+//! structurally); the series-lifecycle half stands.
 // r[impl obs.metric.alert-counter-seeded]
 
 use std::sync::atomic::Ordering;

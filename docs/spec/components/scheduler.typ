@@ -4117,7 +4117,7 @@ overwrite of a newer tenure's row updates zero rows regardless of snapshot
 age. Equality passes (`<=`): the same-epoch re-acquire keep. The residual —
 a fresh INSERT below the floor when no active conflict row exists to
 evaluate against — cannot regress any newer row by construction; it is
-priced in `fence-invariant-map.md` and bounded in `fencedWrites.qnt`
+priced and bounded in `fencedWrites.qnt`
 (`activeRowGenMonotonic` holds even with the residual reachable).
 
 #r("sched.lease.tenure-stamp-type")[

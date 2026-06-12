@@ -329,6 +329,23 @@ pub(crate) struct PullInputs<'a> {
 /// `Uuid`) onto the kernel's mirrored alphabet and returns the kernel's
 /// decision unchanged.
 ///
+/// Kani-coverage arc (relocated from the retired executor invariant
+/// map): the executor campaign's close-out evaluated and DECLINED an
+/// executor-side harness for `admit_pull`/`fold_report` — the charging
+/// arithmetic already lived in the proven retry kernel, `fold_report`
+/// is a two-boolean truth table fronting durable guards no Rust-level
+/// proof reaches, `admit_pull` was a single total match whose input
+/// partition the unit tables enumerate, and hosting contracts inside
+/// rio-scheduler had already failed to converge in the gate budget.
+/// Its recorded reconsideration triggers: kernels growing
+/// loops/collections/counter arithmetic, an extraction into a
+/// dependency-light crate, or a changed floor-comparison shape. The
+/// extraction trigger FIRED: the closure-evidence campaign's Phase 2
+/// lifted the kernels into rio-evidence-kernel, and the pull-admission
+/// proofs now run in the gated kani set (nix/kani.nix, the
+/// rio-evidence-kernel pull-admission harnesses) — the omission is
+/// discharged, not standing.
+///
 /// Check order (proven in the kernel): identity first (a mis-bound
 /// token never learns anything about the drv), then the generation
 /// fence (a deposed believer answers nothing), then

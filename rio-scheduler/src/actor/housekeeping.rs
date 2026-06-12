@@ -1627,7 +1627,17 @@ impl DagActor {
             EstablishmentAction::AdoptCompleted(verified) => {
                 // Store-probe arm: every verifiable wanted output
                 // present → adopt as completed; the attempt is closed
-                // and never charged. The adopt stamps EXACTLY the
+                // and never charged.
+                //
+                // Priced residual (merged_bug_231, relocated from the
+                // retired fence invariant map): the adopt persists
+                // status and closes the assignment in TWO fenced
+                // transactions; a crash between them leaves an open
+                // assignment for an adopted derivation. Benign: the
+                // sweep re-runs idempotently (the second pass closes;
+                // no double charge — the charge row's
+                // terminal-row-wins append). Bounded by one sweep
+                // tick. The adopt stamps EXACTLY the
                 // kernel's VerifiedPresent witness (bug_148: the
                 // expected_output_paths superset contained paths the
                 // same probe had just reported absent).
