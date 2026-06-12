@@ -27,6 +27,10 @@
     "services": [],
     "doc": "DAG wire types — derivation nodes/edges and per-derivation events."
   },
+  "derivation.proto": {
+    "services": [],
+    "doc": "Canonical stored/negotiated form of a Nix derivation (ADR-024,"
+  },
   "scheduler.proto": {
     "services": [
       "SchedulerService"

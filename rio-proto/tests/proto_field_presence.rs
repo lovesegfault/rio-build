@@ -159,6 +159,7 @@ field_snapshot_tests! {
     builder_fields_frozen,     regenerate_builder     => "builder";
     castore_fields_frozen,     regenerate_castore     => "castore";
     dag_fields_frozen,         regenerate_dag         => "dag";
+    derivation_fields_frozen,  regenerate_derivation  => "derivation";
     scheduler_fields_frozen,   regenerate_scheduler   => "scheduler";
     store_fields_frozen,       regenerate_store       => "store";
     types_fields_frozen,       regenerate_types       => "types";
