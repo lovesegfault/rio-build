@@ -1248,20 +1248,22 @@ fn consume_own_commit_evidence<H: LeaseHooks>(
     holder_id: &str,
 ) {
     blind.stamp(led.anchor);
-    // merged_bug_122: the stamp is unconditional (the evidence is
-    // real and the ledger is consumed) but the ACQUIRE is
-    // fence-gated. A ledger anchor already past the acquire futility
-    // gate ([`evidence_acquire_futile`] — the one producer, shared
-    // with the Completed-round derivation) makes the acquire provably
-    // futile — the trailing maybe_self_fence in the same arm would
-    // re-fence it before the next await, churning hooks/marks/recovery
-    // once per round of a slow-commit brownout.
+    // merged_bug_122 + merged_bug_085: the stamp is unconditional
+    // (the evidence is real and the ledger is consumed) but the
+    // ACQUIRE is fence-gated. A ledger anchor past the acquire
+    // futility gate ([`evidence_acquire_futile`] — the one producer,
+    // shared with the Completed-round derivation; priced at the NEXT
+    // evaluation, the tick-top one renew interval away) makes the
+    // acquire provably futile — restoring would start recovery only
+    // for the next tick-top fence to tear it down, churning
+    // hooks/marks/recovery once per round of a slow-commit brownout.
     if matches!(mode, ConsumeMode::StampOnly) {
         info!(
             ?anchor_age,
-            "own-commit evidence consumed, but its anchor is already \
-             past the fence deadline — staying fenced (an acquire \
-             here would be re-fenced this same arm)"
+            "own-commit evidence consumed and the blind clock stamped at \
+             its anchor, but an acquire from this anchor cannot survive \
+             to the next fence evaluation (the tick-top, one renew \
+             interval away) — staying unrestored"
         );
     } else if matches!(mode, ConsumeMode::Restore) {
         // A self-fence inside the mid-band window already ran the
@@ -1819,10 +1821,11 @@ struct StandingCells {
 /// kept under the derivation rewrite).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConsumeMode {
-    /// The entry's anchor fails the acquire futility gate: consume the
-    /// ledger and stamp the blind clock (the evidence is real), but run
-    /// NO standing transition (merged_bug_122 — the acquire would not
-    /// survive to the next fence evaluation).
+    /// The entry's anchor fails the acquire futility gate
+    /// ([`evidence_acquire_futile`] — priced at the NEXT evaluation,
+    /// merged_bug_085): consume the ledger and stamp the blind clock
+    /// (the evidence is real), but run NO standing transition — the
+    /// acquire could not survive to the tick-top fence check.
     StampOnly,
     /// Not believing at consumption: the evidence proves the apiserver
     /// still (or again) names us holder — restore through the ordinary
@@ -1848,10 +1851,20 @@ impl ConsumeMode {
 /// The evidence-acquire futility gate — the ONE producing fn for the
 /// verdict both the Completed derivation and the act-failed executor
 /// consume (a second formula is the dual-derivation defect class).
-/// An entry past [`SELF_FENCE_AFTER`] cannot fund an acquire that
-/// survives the same arm's trailing fence check (merged_bug_122).
+/// Priced against the NEXT evaluation point in the actual schedule
+/// (merged_bug_085): the next fence check is the tick-top, one
+/// [`RENEW_INTERVAL`] away, with nothing stamping between — an acquire
+/// is futile iff its anchor cannot survive TO that evaluation
+/// (`anchor_age + RENEW_INTERVAL > SELF_FENCE_AFTER`). The pre-fix
+/// gate (`anchor_age > SELF_FENCE_AFTER`) priced a same-arm re-check
+/// that does not exist at the Completed call site and never fires at
+/// the act-failed site (the post-consume check reads the just-stamped
+/// age), so the (6s, 11s] band restored belief and was
+/// deterministically force-fenced one tick later — doubled recovery
+/// plus a leader-Service-label flap per brownout pass (merged_bug_122
+/// closed the > 11s half; this closes the band).
 fn evidence_acquire_futile(anchor_age: Duration) -> bool {
-    anchor_age > SELF_FENCE_AFTER
+    anchor_age + RENEW_INTERVAL > SELF_FENCE_AFTER
 }
 
 /// The standing edge a Completed round runs — the old
@@ -3738,9 +3751,17 @@ impl BlindClock {
 
     /// Record a successful round-trip: the blind window restarts at the
     /// attempt's START. Consumes the anchor — each mint stamps at most
-    /// once.
+    /// once. MONOTONE by construction (merged_bug_085): a
+    /// fence-arbitrating clock never rewinds — consuming an older
+    /// lawful anchor (a ledger entry pre-dating a fresher attempt
+    /// stamp) contributes nothing rather than jumping the fence
+    /// schedule backward. The max never stamps a value the
+    /// cancelled-write law forbids: both candidates are attempt-START
+    /// anchors of lawful stamping events (anchor <= send <= commit
+    /// holds for whichever survives), and the observing read's time
+    /// still never enters the clock.
     fn stamp(&mut self, anchor: RenewAnchor) {
-        self.last = anchor.0;
+        self.last = self.last.max(anchor.0);
     }
 
     /// The blind window as of `now`. Saturating: both readings come
@@ -6919,19 +6940,41 @@ mod tests {
         // fires on its original schedule (15s > 11s). Same tick, the
         // GET shows the zombie committed (holder=us, renewTime moved)
         // and the act fails again: the SURVIVING ledger's own-commit
-        // evidence consumes at the t=5s anchor (10s old, inside the
-        // acquire gate) and re-acquires. Old code: ledger wiped at
-        // round 3 → no evidence → stays fenced.
+        // evidence consumes at the t=5s anchor — but at 10s old the
+        // acquire cannot survive to the t=20s tick-top (blind would
+        // read 15s > 11s), so the consumption stamps WITHOUT restoring
+        // (merged_bug_085's next-evaluation gate; the in-band restore
+        // is pinned by the fenced-mid-arm-reacquire schedule at age
+        // 5s). Old code: ledger wiped at round 3 → nothing to consume.
         let get = park.next().await;
         get.respond_ok(park_lease_json(Some("us"), 3, 12));
         let put = park.next().await;
         drop(put);
         settle().await;
+        assert!(
+            !state.is_leader(),
+            "a 10s-old anchor cannot fund an acquire that survives to \
+             the next evaluation — consume stamps only"
+        );
+        // The fence dirtied the marks; settle the PATCH so round 5's
+        // lease GET is the next parked request.
+        let patch = park.next().await;
+        assert!(patch.path.contains("/pods/us"), "marks reconcile PATCH");
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 5 (t=20s): the brownout ends; the completing renew
+        // takes the ORDINARY acquire edge — a NEW belief episode.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 12));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 13));
+        settle().await;
 
         assert!(
             state.is_leader(),
-            "the surviving ledger re-acquires via own-commit evidence \
-             (the wipe-at-409 is the merged_bug_085 defect)"
+            "the completing round re-acquires (new episode) — the \
+             surviving ledger kept the fence schedule honest meanwhile"
         );
         assert_eq!(
             hooks.acquires.lock().expect("acquires lock").len(),
@@ -7561,13 +7604,41 @@ mod tests {
         settle().await;
 
         // Round 4 (t=15s): the zombie surfaces — holder=us, renewTime
-        // moved (vs the Absent baseline), ledger armed (anchor age
-        // 10s, inside the acquire gate); the PUT drops (the write
-        // brownout continues). The evidence leg must restore belief.
+        // MOVED against the recorded Absent baseline (the merged_bug_064
+        // law: pre-fix the bounced create stored NoCompletedRead, the
+        // comparison read Frozen, and this round routed ObserveOnly —
+        // no consumption, no stamp, the evidence dead). The ledger
+        // anchor is 10s old: the EvidenceResolve consumption fires but
+        // the acquire cannot survive to the t=20s tick-top
+        // (merged_bug_085's next-evaluation gate), so it stamps without
+        // restoring; the (Us, Moved-vs-Absent, Armed) ROUTE itself is
+        // pinned per-cell in act_failed_cell_census_total and the
+        // in-band restore at fenced_mid_arm_reacquire (age 5s).
         let get = park.next().await;
         get.respond_ok(park_lease_json_rt(Some("us"), 3, 12, 12));
         let put = park.next().await;
         drop(put);
+        settle().await;
+        assert!(
+            !state.is_leader(),
+            "a 10s-old anchor consumes without restoring (next-evaluation \
+             futility gate)"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "no flap — the doomed-band acquire is never taken"
+        );
+
+        // Round 5 (t=20s): the write brownout ends; the completing
+        // renew acquires — the composed self-heal lands one round
+        // after the zombie surfaced, with zero acquire/lose churn in
+        // between (pre-fix-064: the wiped baseline left the evidence
+        // unroutable; pre-fix-085: the doomed restore added a flap).
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 12, 12));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json_rt(Some("us"), 3, 13, 13));
         settle().await;
 
         assert!(
@@ -7580,7 +7651,7 @@ mod tests {
         assert_eq!(
             hooks.acquires.lock().expect("acquires lock").len(),
             2,
-            "the fence-gated evidence restore is a real acquire edge"
+            "the completing round re-acquires (the composed heal)"
         );
 
         shutdown.cancel();
@@ -7820,6 +7891,158 @@ mod tests {
              Conflict into Standby and the shutdown skipped the release"
         );
         loop_task.await.expect("lease loop exits");
+    }
+
+    /// W12-AC (merged_bug_085): the futility gate prices the NEXT
+    /// evaluation point in the actual schedule — an evidence acquire
+    /// whose anchor cannot survive to the tick-top fence check (one
+    /// RENEW_INTERVAL away) is never taken.
+    ///
+    /// The (6s, 11s] band: pre-fix the gate cut at anchor_age >
+    /// SELF_FENCE_AFTER (11s) on the premise "an acquire here would be
+    /// re-fenced this same arm" — but no same-arm re-check exists at
+    /// the Completed call site, and at the act-failed site the
+    /// post-consume check reads the just-stamped anchor age (<= 11s,
+    /// never firing). The REAL next evaluation is the tick-top, 5s
+    /// away, with nothing stamping between: an acquire taken at anchor
+    /// age 10s restores belief, starts recovery, and is
+    /// deterministically force-fenced 5s later — doubled recovery and
+    /// a leader-Service-label flap per brownout pass.
+    ///
+    /// The survivable half of the band (anchor age <= 6s restores and
+    /// holds to the next evaluation) is pinned by
+    /// `fenced_mid_arm_reacquire_enters_deferral_with_latch_set`
+    /// (age-5s restore, alive at the t+5s tick-top).
+    ///
+    /// Pre-fix red, verbatim: `an acquire that cannot survive to its
+    /// next evaluation is never taken; pre-fix: the (6s,11s] band
+    /// acquire was taken then deterministically force-fenced — one
+    /// extra acquire/lose pair per brownout pass`.
+    // r[verify sched.lease.cancelled-write+2]
+    // r[verify sched.lease.self-fence+2]
+    #[tokio::test(start_paused = true)]
+    async fn futility_gate_prices_the_next_evaluation() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1 (t=0): acquire; settle the marks PATCH.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 10, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json_rt(Some("us"), 3, 11, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 2 (t=5s): the zombie — PUT transmitted and dropped;
+        // the ledger arms at t=5s.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 11, 11));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+
+        // Round 3 (t=10s): the read fails; blind keeps aging from t=0.
+        let get = park.next().await;
+        get.respond_status(500, "InternalError", "apiserver brownout");
+        settle().await;
+
+        // Round 4 (t=15s): the tick-top fence fires (blind 15s > 11s;
+        // lose #1, hold kept). The GET then serves the committed
+        // zombie (holder=us, moved, armed at t=5s — anchor age 10s,
+        // inside the doomed band: a restore would face the t=20s
+        // tick-top at blind 15s) and the PUT drops again.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 12, 12));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+
+        // Answer any marks PATCH the fence dirtied.
+        if let Some(req) = park.try_next().await {
+            assert!(req.path.contains("/pods/us"), "marks PATCH expected");
+            req.respond_ok(pod_ok("us"));
+            settle().await;
+        }
+
+        // Round 5 (t=20s): still browned out.
+        let get = park.next().await;
+        get.respond_status(500, "InternalError", "apiserver brownout");
+        settle().await;
+
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires lock").len(),
+            1,
+            "an acquire that cannot survive to its next evaluation is \
+             never taken; pre-fix: the (6s,11s] band acquire was taken \
+             then deterministically force-fenced — one extra acquire/lose \
+             pair per brownout pass"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "exactly the one tick-top fence — no flap lose"
+        );
+
+        shutdown.cancel();
+        let mut released = false;
+        for _ in 0..8 {
+            if let Some(req) = park.try_next().await {
+                if req.path.contains("/pods/us") {
+                    req.respond_ok(pod_ok("us"));
+                } else if req.method == http::Method::GET {
+                    req.respond_ok(park_lease_json_rt(Some("us"), 3, 12, 12));
+                } else {
+                    released = true;
+                    req.respond_ok(park_lease_json_rt(None, 3, 13, 13));
+                }
+            }
+        }
+        assert!(released, "the kept hold releases on shutdown");
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// W12-AC2 (merged_bug_085): fence-arbitrating clocks are MONOTONE
+    /// by construction — consuming an older lawful anchor (the ledger
+    /// entry pre-dates a fresher attempt stamp) must not rewind the
+    /// blind window. The rewind cell: a resolved Conflict legitimately
+    /// stamps its attempt anchor; a later act-failed round consumes
+    /// the surviving ledger entry and stamps the entry's OLDER anchor
+    /// — pre-fix the overwrite jumped the clock backward, advancing
+    /// the fence schedule by the difference.
+    // r[verify sched.lease.cancelled-write+2]
+    #[test]
+    fn blind_clock_stamp_is_monotone() {
+        let mut clock = BlindClock::starting_at(RenewAnchor(Duration::from_secs(0)));
+        clock.stamp(RenewAnchor(Duration::from_secs(10)));
+        clock.stamp(RenewAnchor(Duration::from_secs(5)));
+        assert_eq!(
+            clock.blind_for(Duration::from_secs(12)),
+            Duration::from_secs(2),
+            "a fresher lawful stamp survives an older anchor's consumption \
+             (pre-fix: the overwrite rewound to t=5 and read 7s blind)"
+        );
     }
 
     /// merged_bug_122 (acquire-before-fence): consuming own-commit
@@ -9089,11 +9312,14 @@ mod tests {
         let get = park.next().await;
         assert!(get.path.contains("/leases/rio-sched"), "round 2 read phase");
         get.respond_ok(park_lease_json(Some("us"), 0, 1));
-        let put_hold = park.next().await;
-        tokio::time::advance(RENEW_PHASE_DEADLINE + Duration::from_millis(100)).await;
+        // The renew PUT dies FAST (an answered 500 — same act-failed
+        // arm as a timeout) so the consumption lands at anchor age
+        // ~5s, inside the merged_bug_085 acquire gate (an acquire must
+        // survive to the next tick-top evaluation: age + 5s <= 11s).
+        let put = park.next().await;
+        put.respond_status(500, "InternalError", "write path browned out");
         settle().await;
         drop(post_hold);
-        drop(put_hold);
 
         assert!(
             state.is_leader(),
