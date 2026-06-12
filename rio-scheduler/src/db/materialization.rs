@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use super::{FencedBegin, FencedOutcome, SchedulerDb, ServingGeneration};
+use super::{FencedBegin, FencedOutcome, SchedulerDb, ServingGeneration, terminal_status_sql};
 use crate::db::attempts::AttemptRow;
 use crate::state::{JobOrigin, JobState};
 
@@ -361,7 +361,8 @@ impl SchedulerDb {
     }
 
     /// The store-poll query: pending, not parked, no active assignment
-    /// (the anti-join), oldest first, capped by `limit`.
+    /// (the anti-join), NON-TERMINAL derivation, oldest first, capped
+    /// by `limit`.
     ///
     /// bug_099 — query-construction law: **no LIMIT without a total
     /// order.** Batch-minted jobs tie on `created_at` (DEFAULT `now()`
@@ -373,11 +374,28 @@ impl SchedulerDb {
     /// (time-ordered), so `(created_at, job_id)` is the total unique
     /// key; PG satisfies it via incremental sort above the existing
     /// `(created_at) WHERE state = 'pending'` partial index — no DDL.
+    ///
+    /// live_061 — the node-state predicate: a pending job whose
+    /// derivation is TERMINAL is unclaimable by the kernel's own
+    /// admission table (the base-table terminal arm answers `Gone` to
+    /// every materialization claim), so listing it advertises work no
+    /// claim can convert — the zombie head that pinned the oldest-first
+    /// window for hours (10,876 Gone-answers/78s; the store resolves
+    /// its ledger entry on Gone and re-mints the same head every pass).
+    /// Terminal set spliced from [`super::terminal_status_sql!`] — the
+    /// ONE SQL terminal-set producer, drift-pinned against
+    /// `DerivationStatus::is_terminal` (R33: consumers import, never
+    /// re-derive). The positive `EXISTS d.status NOT IN (…)` form also
+    /// excludes jobs whose derivations row is absent — a row no claim
+    /// could resolve either (status `None` ⇒ `Gone` at the same base
+    /// table). Per-row cost: one PK probe over the ≤`limit` candidate
+    /// rows the partial index already bounds.
+    // r[impl sched.materialize.claimability-projection+1]
     pub(crate) async fn list_claimable_materialization_jobs(
         &self,
         limit: i64,
     ) -> Result<Vec<MaterializationJobRow>, sqlx::Error> {
-        let raw: Vec<RawJobRow> = sqlx::query_as(
+        let raw: Vec<RawJobRow> = sqlx::query_as(terminal_status_sql!(
             "SELECT j.job_id, j.drv_hash, j.tenant_id, j.origin, j.state \
                FROM materialization_jobs j \
               WHERE j.state = 'pending' \
@@ -386,9 +404,14 @@ impl SchedulerDb {
                     SELECT 1 FROM assignments a \
                      WHERE a.derivation_id = j.derivation_id \
                        AND a.status IN ('pending', 'acknowledged')) \
+                AND EXISTS ( \
+                    SELECT 1 FROM derivations d \
+                     WHERE d.derivation_id = j.derivation_id \
+                       AND d.status NOT IN ",
+            ") \
               ORDER BY j.created_at, j.job_id \
-              LIMIT $1",
-        )
+              LIMIT $1"
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;

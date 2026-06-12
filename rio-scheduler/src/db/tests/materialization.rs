@@ -278,6 +278,79 @@ async fn list_claimable_excludes_claimed_and_parked() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// **W12-S9A (live061-R2)** — *a pending job whose DERIVATION is
+/// terminal is not claimable: the durable listing carries the
+/// node-state predicate*. The live_061 zombie shape: a node completes
+/// by other means (store probe, sibling production) while its
+/// materialization job is still `pending` — every claim against the
+/// terminal node answers `Gone` (the kernel base table), the store's
+/// ledger entry resolves, and the job re-enters the next listing beat
+/// to burn another mint: 10,876 Gone-answers in one 78s live window,
+/// the fleet pinned at ~0.5% conversion. Listed ⇒ admittable
+/// (`sched.materialize.claimability-projection`) must hold on the
+/// node axis too. Every terminal status is exercised via the SAME
+/// derived set production splices (`terminal_status_sql!` ⇔
+/// `TERMINAL_STATUSES`, drift-pinned); non-terminal statuses are the
+/// stay-listed control.
+// r[verify sched.materialize.claimability-projection+1]
+#[tokio::test]
+async fn list_claimable_excludes_terminal_node_jobs() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // One pending job per derivation status in the FULL alphabet —
+    // the claimable verdict is then asserted per `is_terminal()`
+    // (the one terminal-set producer), never a hand list.
+    let mut by_status: Vec<(crate::state::DerivationStatus, Uuid)> = Vec::new();
+    for status in crate::state::DerivationStatus::ALL {
+        let hash = format!("term-list-{status}");
+        let drv = insert_test_derivation(&db, &hash).await?;
+        let created = db
+            .create_materialization_job_fenced(
+                drv,
+                &hash,
+                None,
+                JobOrigin::CacheOpportunity,
+                None,
+                ServingGeneration::stamp_from_claim(1),
+            )
+            .await?;
+        let FencedJobCreate::Applied { job_id, .. } = created else {
+            anyhow::bail!("create must apply for {status}");
+        };
+        sqlx::query("UPDATE derivations SET status = $2 WHERE derivation_id = $1")
+            .bind(drv)
+            .bind(status.as_str())
+            .execute(&test_db.pool)
+            .await?;
+        by_status.push((*status, job_id));
+    }
+
+    let listed: std::collections::HashSet<Uuid> = db
+        .list_claimable_materialization_jobs(64)
+        .await?
+        .into_iter()
+        .map(|j| j.job_id)
+        .collect();
+    for (status, job_id) in &by_status {
+        if status.is_terminal() {
+            assert!(
+                !listed.contains(job_id),
+                "a pending job on a {status} (terminal) derivation must NOT be \
+                 claimable — its claim can only answer Gone (the live_061 \
+                 zombie head: the job pins the oldest-first window forever)"
+            );
+        } else {
+            assert!(
+                listed.contains(job_id),
+                "a pending job on a {status} (non-terminal) derivation must \
+                 stay claimable"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// (d) Resolution is exec_id-keyed, fenced, and at-most-once: the
 /// first resolve stamps `resolution_exec_id`/`resolved_at`; resolving
 /// an already-resolved job is a no-op (`Applied(0)` — terminal-row-

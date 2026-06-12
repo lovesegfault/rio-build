@@ -985,7 +985,7 @@ async fn retry_later_consumption_closes_uncharged_and_defers() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.claimability-projection]
+// r[verify sched.materialize.claimability-projection+1]
 /// bug_170 — listed ⊆ admittable, end-to-end: the leader listing reads
 /// THE SAME [`Claimability`] law admission reads, so it can never
 /// advertise work every claim of which admission refuses (the
@@ -11333,6 +11333,94 @@ async fn backoff_lapsing_during_the_beat_query_is_served() -> TestResult {
         "the backoff lapsed during the 1200ms beat (parked 400ms) — \
          the serve filter must evaluate at the pass clock, not the \
          pre-await one (bug_110): served={served:?}"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.claimability-projection+1]
+/// **W12-S9D (live061-R2, the race-window half)** — *the serve filter
+/// reads the IN-MEMORY node face: a job whose node went terminal
+/// in-memory is not served even while the PG status row still lags
+/// non-terminal*. The durable predicate (W12-S9A) cannot see this
+/// window: the actor transitions the node and only then persists the
+/// batch — between the two, the beat snapshot still carries the row
+/// and a view-only filter that reads claimability alone serves it
+/// (the pre-fix shape). The claim against the in-memory-terminal node
+/// answers `Gone` regardless (pull admission reads the same DAG), so
+/// serving it is advertising a doomed mint — the live_061 burn. The
+/// control node proves the filter does not over-exclude: a Ready
+/// in-memory node with the same PG shape stays served, and a
+/// DAG-ABSENT entry stays served too (absent rows are the
+/// zero-interest sweep's 1-tick transient, not the listing's call —
+/// the sweep owns them).
+#[tokio::test]
+async fn listing_excludes_in_memory_terminal_nodes() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+    let generation = actor.serving_generation();
+
+    // Three pending jobs, PG status 'created' (NON-terminal) for all —
+    // the durable predicate passes every row; only the in-memory face
+    // differs: zombie = Completed in-mem, control = Ready in-mem,
+    // ghost = no DAG node at all.
+    let mut job_ids = Vec::new();
+    for hash in ["race-zombie", "race-control", "race-ghost"] {
+        let drv = insert_test_derivation_local(&db.pool, hash).await?;
+        let created = sdb(&db.pool)
+            .create_materialization_job_fenced(
+                drv,
+                hash,
+                None,
+                JobOrigin::CacheOpportunity,
+                None,
+                generation,
+            )
+            .await?;
+        let crate::db::materialization::FencedJobCreate::Applied { job_id, .. } = created else {
+            anyhow::bail!("job create must apply for {hash}");
+        };
+        if hash != "race-ghost" {
+            actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+                derivation_id: drv,
+                ..crate::db::RecoveryDerivationRow::test_default(hash, "x86_64-linux")
+            });
+        }
+        actor.materialization_jobs.insert(
+            DrvHash::from(hash),
+            crate::actor::materialize::JobViewEntry::new_unclaimed(job_id, None),
+        );
+        job_ids.push((hash, job_id));
+    }
+    // The race window: the zombie's node completes IN-MEMORY only
+    // (persist_status_batch has not landed — PG still says 'created').
+    actor
+        .dag
+        .node_mut("race-zombie")
+        .expect("just injected")
+        .set_status_for_test(DerivationStatus::Completed);
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    actor
+        .handle_list_materialization_jobs(64, Some("w0".into()), tx)
+        .await;
+    let served = rx.await?;
+    let served_hashes: Vec<&str> = served.iter().map(|d| d.drv_hash.as_str()).collect();
+    assert!(
+        !served_hashes.contains(&"race-zombie"),
+        "a job whose node is terminal IN-MEMORY must not be served — \
+         its claim can only answer Gone (the persist-lag race window \
+         the durable predicate cannot see); served={served_hashes:?}"
+    );
+    assert!(
+        served_hashes.contains(&"race-control"),
+        "a Ready in-memory node's job stays served (no over-exclusion); \
+         served={served_hashes:?}"
+    );
+    assert!(
+        served_hashes.contains(&"race-ghost"),
+        "a DAG-absent entry stays served — absence is the zero-interest \
+         sweep's transient, not a listing verdict; served={served_hashes:?}"
     );
     Ok(())
 }

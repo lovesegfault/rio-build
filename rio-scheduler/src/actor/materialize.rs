@@ -763,7 +763,7 @@ impl JobViewEntry {
     }
 
     /// THE armament classification (see [`Claimability`]).
-    // r[impl sched.materialize.claimability-projection]
+    // r[impl sched.materialize.claimability-projection+1]
     pub(super) fn claimability(&self, now: std::time::Instant) -> Claimability {
         if matches!(self.episode, ClaimEpisode::Held { .. }) {
             Claimability::Claimed
@@ -1347,7 +1347,7 @@ impl DagActor {
     /// (`sched.materialize.listing-cost`; the envelope tests count
     /// the operations).
     // r[impl sched.materialize.job+2]
-    // r[impl sched.materialize.claimability-projection]
+    // r[impl sched.materialize.claimability-projection+1]
     // r[impl sched.materialize.listing-distribution]
     // r[impl sched.materialize.listing-cost+2]
     pub(super) async fn handle_list_materialization_jobs(
@@ -1477,9 +1477,21 @@ impl DagActor {
         // fallback, byte-identical), with claimability re-filtered
         // per row from the LIVE view (bug_170: a listed job is
         // admittable by construction — claimed / parked / deferred /
-        // resolved rows drop exactly as before). O(served slice) map
-        // lookups; zero scoring; zero member iteration (R17:
-        // member_touches == 0 on this path).
+        // resolved rows drop exactly as before) AND the node face
+        // re-read from the LIVE DAG (live_061: a node that completed
+        // by other means since the beat snapshot makes every claim
+        // answer Gone — the kernel base table's terminal arm — so
+        // serving its job advertises a doomed mint; the in-memory
+        // status is AHEAD of the durable predicate during the
+        // transition→persist window, so this filter closes the race
+        // the beat query structurally cannot see). A DAG-ABSENT entry
+        // is still served: absence is the zero-interest sweep's
+        // one-tick transient (the `None => true` cancel arm), and
+        // refusing to serve it here would also refuse the
+        // recovery-rebuilt view's legitimate rows while the DAG
+        // hydrates. O(served slice) map lookups; zero scoring; zero
+        // member iteration (R17: member_touches == 0 on this path).
+        let dag = &self.dag;
         let (view, contacts, plan) = self
             .materialization_jobs
             .hydrated_listing_mut()
@@ -1491,7 +1503,9 @@ impl DagActor {
             .filter(|row| {
                 view.get(row.drv_hash.as_str()).is_some_and(|entry| {
                     entry.claimability(pass.instant()) == Claimability::ClaimableNow
-                })
+                }) && !dag
+                    .node(row.drv_hash.as_str())
+                    .is_some_and(|s| s.status().is_terminal())
             })
             .take(limit as usize)
             .cloned()

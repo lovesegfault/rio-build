@@ -1951,13 +1951,22 @@ a ghost --- and the repair lane deliberately carries no fatal assert
 (the ghost has live producers: crash windows between close-commit and
 view update).
 
-#r("sched.materialize.claimability-projection")[
+#r("sched.materialize.claimability-projection+1")[
   Pull admission, the claimable-backlog gauge, and the leader job
   listing MUST read one shared four-way claimability classification of
   the job-view entry --- claimed, parked, deferred, claimable-now, in
   that dominance order --- and the listing MUST answer only
   view-tracked claimable-now jobs, answering empty under an
   Unavailable view, so every listed job is admittable by construction.
+  Admittability quantifies over the NODE face too: the durable
+  claimable query MUST exclude jobs whose derivation row is terminal
+  (the admission base table answers Gone to every materialization
+  claim against a terminal node, so such a listing row is
+  unconvertible by construction), and the serve filter MUST re-read
+  the live in-memory node status and drop rows whose node is terminal
+  --- the in-memory transition runs ahead of the status persist, so
+  the durable predicate alone leaves a serve window in exactly the
+  race the actor's own turn creates.
 ]
 The listing over-fetches the durable query (bounded at
 `min(2×limit, 512)`; partitioned callers draw the full 512-row
@@ -1968,7 +1977,18 @@ fresh claim can commit between the query and the reply. This rule does
 NOT re-key #rref("sched.materialize.view-settlement"): entry removal
 still gates exclusively on the durable write's settled disposition ---
 the privacy change moves reads behind the classification, not the
-removal discipline.
+removal discipline. The node-face clause is live_061's repair
+(2026-06-12): ~44 pending jobs whose nodes had completed by other
+means pinned the oldest-first head-window for hours --- every claim
+answered Gone, Gone resolves the store's resume-ledger entry (leaving
+nothing to pace a re-mint, unlike NotYetReady's surviving
+credential), and the per-pass mint allowance burned on the same head
+every pass: 21,337 refusals/78s, 10,876 of them Gone, fleet
+conversion ~0.5% of claim attempts against a ~1,472-walk design
+capacity. A DAG-ABSENT node is deliberately NOT a serve-filter
+exclusion: absence is the zero-interest sweep's one-tick transient
+(its `None ⇒ cancel` arm owns the row), and excluding it would also
+blank the recovery-rebuilt view while the DAG hydrates.
 
 #r("sched.materialize.listing-distribution")[
   The leader job listing MUST partition the claimable head-window

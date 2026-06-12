@@ -3079,7 +3079,7 @@ async fn test_attempt_ledger_gc_tick_leader_sweeps_standby_noops() -> TestResult
     Ok(())
 }
 
-// r[verify sched.materialize.claimability-projection]
+// r[verify sched.materialize.claimability-projection+1]
 // r[verify sched.materialize.claim-coherence]
 /// bug_170: the four-way [`Claimability`] precedence grid — the ONE
 /// law admission, the KEDA gauge, and the leader listing read. A held
