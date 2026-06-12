@@ -1066,6 +1066,29 @@ fetch). The optimization:
   unreachable), inlining is skipped entirely and all nodes fall back to
   executor-fetch. This is an optimization, not a correctness requirement.
 
+== Drv Digest Population (ADR-024 P2a)
+
+#r("gw.submit.digest-populate")[
+  After DAG construction, the gateway MUST attempt to turn the ssh-ng
+  submission into a digest-bearing one: compute
+  `drv_digest = blake3(canonical proto drv bytes)` and `input_drv_digests`
+  (mirroring `inputDrvs`) for every node from the session's parsed drv cache,
+  upload drv blobs the store does not yet have (`HasDrvs` →
+  `PutDrvBlobs`, authenticated with the session JWT), and only then set the
+  digest fields. The step is all-or-nothing: any failure --- a node without a
+  parsed drv (the `BasicDerivation` fallback), an input outside the
+  submission, a store RPC error, or no session JWT --- MUST leave EVERY node
+  digest-less (the legacy edges submission), because the scheduler rejects
+  mixed submissions. The uploaded body is the canonical encoding, so the
+  store's verify-on-put (#rref("store.drv.verify-on-put")) guarantees
+  `GetDrvBlob` serves the same bytes back (round-trip byte-stability).
+]
+
+This is how P2a keeps one scheduler path forward: ssh-ng submissions feed the
+digest-derived edge machinery through the gateway while the native `rio
+build` client (P3) uploads blobs directly; `edges` remains populated alongside
+the digests until P2b retires it.
+
 #info(title: [Session state])[
   Although the gateway is described as "stateless beyond the lifetime of a
   single SSH connection," each SSH channel does accumulate per-session state:

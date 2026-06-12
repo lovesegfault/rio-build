@@ -42,7 +42,7 @@ use crate::drv_cache::{max_transitive_inputs, resolve_derivations_batch};
 /// `^*`). `None` means the opcode carries no selection
 /// (`wopBuildDerivation`) — treated like `^*`: every declared output of
 /// the root is wanted. It only feeds `wanted_output_names` (see
-/// [`populate_wanted_outputs`]); the node/edge set is identical for
+/// `populate_wanted_outputs`); the node/edge set is identical for
 /// every value.
 ///
 /// NOTE: all store lookups here are ANONYMOUS (no JWT). This is build
@@ -842,6 +842,214 @@ pub async fn filter_and_inline_drv(
         bytes = total_inlined,
         skipped_over_budget = skipped_budget,
         "inlined .drv content for will-dispatch nodes"
+    );
+}
+
+/// ADR-024 P2a: populate `drv_digest`/`input_drv_digests` on every
+/// node and upload missing drv blobs to the store, turning an ssh-ng
+/// submission into a digest-bearing one — the gateway feeds the same
+/// scheduler path the native client will use.
+///
+/// All-or-nothing: the scheduler rejects mixed submissions, so any
+/// failure (a node without a parsed drv in `drv_cache`, an input drv
+/// missing from the cache, a `HasDrvs`/`PutDrvBlobs` error, no JWT to
+/// authenticate the tenant-scoped put) leaves EVERY node digest-less —
+/// the legacy edges path, which remains accepted (P2b retires it).
+/// Mirrors `filter_and_inline_drv`'s posture: this is an upgrade, not
+/// a correctness requirement, and the safe degrade is "submit legacy".
+///
+/// Byte-stability contract (`r[store.drv.verify-on-put]`): the
+/// uploaded `body` is the canonical proto encoding from
+/// [`rio_proto::derivation_util::to_proto`] +
+/// [`canonical_encode`](rio_proto::derivation_util::canonical_encode);
+/// the store verifies digest, canonical form, and drv_path recompute
+/// before storing, and serves the same bytes back from `GetDrvBlob`.
+// r[impl gw.submit.digest-populate]
+pub async fn populate_digests_and_upload_drvs(
+    nodes: &mut [types::DerivationNode],
+    drv_cache: &HashMap<StorePath, Derivation>,
+    drv_blob_client: Option<&mut rio_proto::DrvBlobServiceClient<Channel>>,
+    jwt_token: Option<&str>,
+) {
+    use rio_proto::derivation_util;
+
+    let Some(client) = drv_blob_client else {
+        return; // no store drv-blob endpoint configured — legacy submission
+    };
+    // PutDrvBlobs/HasDrvs are tenant-scoped; without a session JWT the
+    // store rejects with "requires a tenant". Dual-mode/dev sessions
+    // submit legacy.
+    let Some(jwt) = jwt_token else {
+        debug!("no session JWT; skipping drv digest population (legacy submission)");
+        return;
+    };
+
+    // Pass 1: canonical proto + digest for every node AND every input
+    // drv. reconstruct_dag puts the full closure in both `nodes` and
+    // `drv_cache`, so inputs normally resolve via the node set; the
+    // cache lookup is the defensive fallback. Any miss → legacy.
+    let mut canon: HashMap<&str, ([u8; 32], Vec<u8>)> = HashMap::with_capacity(nodes.len());
+    for node in nodes.iter() {
+        let Ok(sp) = StorePath::parse(&node.drv_path) else {
+            return;
+        };
+        let Some(drv) = drv_cache.get(&sp) else {
+            debug!(drv_path = %node.drv_path,
+                   "node missing from drv_cache; skipping digest population (legacy submission)");
+            return;
+        };
+        let msg = derivation_util::to_proto(drv);
+        let bytes = derivation_util::canonical_encode(&msg);
+        let digest = derivation_util::derivation_digest(&msg);
+        canon.insert(node.drv_path.as_str(), (digest, bytes));
+    }
+    let mut input_digests: Vec<Vec<Vec<u8>>> = Vec::with_capacity(nodes.len());
+    for node in nodes.iter() {
+        let sp = StorePath::parse(&node.drv_path).expect("parsed in pass 1");
+        let drv = drv_cache.get(&sp).expect("present in pass 1");
+        let mut per_node = Vec::with_capacity(drv.input_drvs().len());
+        for input_path in drv.input_drvs().keys() {
+            match canon.get(input_path.as_str()) {
+                Some((digest, _)) => per_node.push(digest.to_vec()),
+                None => {
+                    // Input drv outside the node set (shouldn't happen
+                    // for a reconstruct_dag closure) — bail to legacy
+                    // rather than submit a reference the scheduler
+                    // can't resolve.
+                    debug!(drv_path = %node.drv_path, input = %input_path,
+                           "input drv not in submission; skipping digest population");
+                    return;
+                }
+            }
+        }
+        input_digests.push(per_node);
+    }
+
+    // Pass 2: presence-check, then upload misses. Batched: HasDrvs
+    // accepts up to 65 536 digests, PutDrvBlobs up to 4 096 blobs —
+    // we stay well under both and additionally bound put batches by
+    // bytes so one RPC stays far below the gRPC message cap.
+    let digests: Vec<Vec<u8>> = nodes
+        .iter()
+        .map(|n| canon[n.drv_path.as_str()].0.to_vec())
+        .collect();
+    const HAS_BATCH: usize = 32_768;
+    let mut missing: Vec<usize> = Vec::new();
+    for (batch_idx, batch) in digests.chunks(HAS_BATCH).enumerate() {
+        let req = match crate::handler::with_jwt(
+            types::HasDrvsRequest {
+                digests: batch.to_vec(),
+            },
+            Some(jwt),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "HasDrvs request build failed; legacy submission");
+                return;
+            }
+        };
+        let bitmap = match tokio::time::timeout(
+            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            client.has_drvs(req),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r.into_inner().bitmap,
+            Ok(Err(e)) => {
+                warn!(error = %e, "HasDrvs failed; skipping digest population (legacy submission)");
+                return;
+            }
+            Err(_) => {
+                warn!("HasDrvs timed out; skipping digest population (legacy submission)");
+                return;
+            }
+        };
+        for (i, _) in batch.iter().enumerate() {
+            let present = bitmap
+                .get(i / 8)
+                .is_some_and(|byte| (byte >> (i % 8)) & 1 == 1);
+            if !present {
+                missing.push(batch_idx * HAS_BATCH + i);
+            }
+        }
+    }
+
+    const PUT_BATCH_MAX_BLOBS: usize = 1_024;
+    const PUT_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
+    let mut batch: Vec<types::DrvBlob> = Vec::new();
+    let mut batch_bytes = 0usize;
+    let mut uploaded = 0usize;
+    let mut flush = async |batch: &mut Vec<types::DrvBlob>| -> bool {
+        if batch.is_empty() {
+            return true;
+        }
+        let req = match crate::handler::with_jwt(
+            types::PutDrvBlobsRequest {
+                blobs: std::mem::take(batch),
+            },
+            Some(jwt),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "PutDrvBlobs request build failed; legacy submission");
+                return false;
+            }
+        };
+        match tokio::time::timeout(
+            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            client.put_drv_blobs(req),
+        )
+        .await
+        {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                warn!(error = %e, "PutDrvBlobs failed; skipping digest population (legacy submission)");
+                false
+            }
+            Err(_) => {
+                warn!("PutDrvBlobs timed out; skipping digest population (legacy submission)");
+                false
+            }
+        }
+    };
+    for idx in &missing {
+        let node = &nodes[*idx];
+        let (digest, bytes) = &canon[node.drv_path.as_str()];
+        if batch.len() >= PUT_BATCH_MAX_BLOBS || batch_bytes + bytes.len() > PUT_BATCH_MAX_BYTES {
+            if !flush(&mut batch).await {
+                return;
+            }
+            batch_bytes = 0;
+        }
+        batch_bytes += bytes.len();
+        uploaded += 1;
+        batch.push(types::DrvBlob {
+            digest: digest.to_vec(),
+            drv_path: node.drv_path.clone(),
+            body: bytes.clone(),
+        });
+    }
+    if !flush(&mut batch).await {
+        return;
+    }
+
+    // Pass 3: every blob is now in the store — mark the submission
+    // digest-bearing. Mutation happens only on full success so a
+    // partial failure can never produce a mixed submission. The
+    // own-digest list is materialized first because `canon`'s keys
+    // borrow `nodes` and the assignment below needs `iter_mut`.
+    let own_digests: Vec<Vec<u8>> = nodes
+        .iter()
+        .map(|n| canon[n.drv_path.as_str()].0.to_vec())
+        .collect();
+    drop(canon);
+    for ((node, own), inputs) in nodes.iter_mut().zip(own_digests).zip(input_digests) {
+        node.drv_digest = own;
+        node.input_drv_digests = inputs;
+    }
+    debug!(
+        nodes = nodes.len(),
+        uploaded, "populated drv digests (uploaded missing drv blobs)"
     );
 }
 

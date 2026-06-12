@@ -313,6 +313,12 @@ impl SessionJwt {
 /// in [`crate::session::run_protocol`].
 pub struct SessionContext {
     pub store_client: StoreServiceClient<Channel>,
+    /// Store `DrvBlobService` client on the same channel as
+    /// `store_client`. `None` when the store endpoint predates the
+    /// service or in fixtures that don't serve it — the build handlers
+    /// then skip drv-digest population and submit legacy (ADR-024
+    /// P2a degrade, see `translate::populate_digests_and_upload_drvs`).
+    pub drv_blob_client: Option<rio_proto::DrvBlobServiceClient<Channel>>,
     pub scheduler_client: SchedulerServiceClient<Channel>,
     pub drv_cache: HashMap<StorePath, Derivation>,
     /// IFD detection: wopBuildDerivation without prior wopBuildPathsWithResults
@@ -379,6 +385,7 @@ impl SessionContext {
     ) -> Self {
         Self {
             store_client,
+            drv_blob_client: None,
             scheduler_client,
             drv_cache: HashMap::new(),
             has_seen_build_paths_with_results: false,
