@@ -252,8 +252,15 @@ in
     #   merged_bug_130 -- Orphaned exits unconditionally)
     # + check_final_claim_contract + check_visit_fanout_batch_contract
     #   + check_object_coverage_policy (bughunt2 slot 6: served-claim,
-    #   gap-provenance, short-object coverage policy).
-    expectedHarnesses = 14;
+    #   gap-provenance, short-object coverage policy)
+    # + check_account_raw_monotone_on_both_quantities
+    #   + check_account_covered_replay_merged_flat_on_both_quantities
+    #   (bughunt11 S1: merged_bug_002 — the dual-axis log account's
+    #   W11-C product, store.log.raw-ceiling; the companion
+    #   CoverageMap harness is RECORDED INFEASIBLE at survey bounds —
+    #   the measured record sits beside the proofs in the kernel, and
+    #   the lookup law rides rio-store's differential proptest).
+    expectedHarnesses = 16;
   };
 
   # rio-authz-kernel: the store's transport authorization decision
