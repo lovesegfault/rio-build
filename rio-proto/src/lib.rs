@@ -137,9 +137,11 @@ pub mod builder {
 /// out-of-process reassembly (and exercised by tests against the
 /// `ChunkServiceImpl` cache wiring).
 ///
-/// `ChunkServiceClient` is **not** re-exported at crate root: with no
-/// production caller, only tests reach it, via the deep codegen path
-/// `store::chunk_service_client::ChunkServiceClient`.
+/// `ChunkServiceClient` / `DirectoryServiceClient` ARE re-exported at
+/// crate root since ADR-024 P3: the `rio build` client negotiates
+/// presence (`HasChunks`/`HasDirectories`/`HasDrvs`) and uploads
+/// sources through the external castore door, making them production
+/// client surfaces.
 // r[impl proto.store.batch-rpc]
 pub mod store {
     tonic::include_proto!("rio.store");
@@ -214,7 +216,9 @@ pub use builder::executor_service_client::ExecutorServiceClient;
 pub use builder::executor_service_server::{ExecutorService, ExecutorServiceServer};
 pub use scheduler::scheduler_service_client::SchedulerServiceClient;
 pub use scheduler::scheduler_service_server::{SchedulerService, SchedulerServiceServer};
+pub use store::chunk_service_client::ChunkServiceClient;
 pub use store::chunk_service_server::{ChunkService, ChunkServiceServer};
+pub use store::directory_service_client::DirectoryServiceClient;
 pub use store::directory_service_server::{DirectoryService, DirectoryServiceServer};
 pub use store::drv_blob_service_client::DrvBlobServiceClient;
 pub use store::drv_blob_service_server::{DrvBlobService, DrvBlobServiceServer};

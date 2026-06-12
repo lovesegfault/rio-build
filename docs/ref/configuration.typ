@@ -129,6 +129,16 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
     component spec] for the lease scoping.
 ]
 
+= Build client (`rio build`)
+
+The native-protocol build client (ADR-024 P3,
+#cross-link("/spec/components/build-client.typ")[component spec]).
+Component name for config layering is `build`: TOML at
+`/etc/rio/build.toml` / `./build.toml`, env prefix `RIO_`
+(e.g. `RIO_SCHEDULER_ADDR`).
+
+#_cfg-table(_cfg.build_client)
+
 = Transport
 
 There is no application-level TLS. Components run plaintext gRPC servers;

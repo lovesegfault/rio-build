@@ -5,6 +5,10 @@
       "description": "Tenant JWT + assignment HMAC token sign/verify and the gRPC interceptor that wires them"
     },
     {
+      "name": "rio-build-cli",
+      "description": "rio build — native-protocol build client (ADR-024 P3 coordinator)"
+    },
+    {
       "name": "rio-cli",
       "description": "Admin CLI for rio-build — talks to the scheduler's AdminService"
     },
@@ -76,6 +80,21 @@
       ],
       "optional": [],
       "dev": []
+    },
+    "rio-build-cli": {
+      "prod": [
+        "rio-common",
+        "rio-evalstore",
+        "rio-nix",
+        "rio-packstore",
+        "rio-proto"
+      ],
+      "optional": [],
+      "dev": [
+        "rio-auth",
+        "rio-store",
+        "rio-test-support"
+      ]
     },
     "rio-builder": {
       "prod": [

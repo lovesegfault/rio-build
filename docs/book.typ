@@ -58,6 +58,7 @@
     #chapter("spec/components/controller.typ")[Controller]
     #chapter("spec/components/dashboard.typ")[Dashboard]
     #chapter("spec/components/cli.typ")[CLI]
+    #chapter("spec/components/build-client.typ")[Build Client]
     = Reference
     #chapter("ref/configuration.typ")[Configuration]
     #chapter("ref/errors.typ")[Error Taxonomy]

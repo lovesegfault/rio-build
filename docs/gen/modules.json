@@ -21,6 +21,73 @@
       "doc": "Tenant JWT + assignment HMAC token sign/verify, and the gRPC"
     }
   ],
+  "rio-build-cli": [
+    {
+      "path": "acks.rs",
+      "depth": 0,
+      "doc": "Persistent cluster-ack table (ADR-024 \"the persistent asset\": a"
+    },
+    {
+      "path": "config.rs",
+      "depth": 0,
+      "doc": "`rio build` client configuration."
+    },
+    {
+      "path": "coordinator/",
+      "depth": 0,
+      "doc": "The pipelined coordinator (ADR-024 stages 1–5)."
+    },
+    {
+      "path": "coordinator/clients.rs",
+      "depth": 1,
+      "doc": "Cluster connections for the coordinator: one channel to the"
+    },
+    {
+      "path": "coordinator/graph.rs",
+      "depth": 1,
+      "doc": "The coordinator's global digest state: fold (stage 1) and the"
+    },
+    {
+      "path": "coordinator/submit.rs",
+      "depth": 1,
+      "doc": "Stage 4: per-root submission on the all-acked gate, with client"
+    },
+    {
+      "path": "coordinator/upload.rs",
+      "depth": 1,
+      "doc": "Stages 2+3: negotiate presence (bulk `Has` per object kind,"
+    },
+    {
+      "path": "evalchan.rs",
+      "depth": 0,
+      "doc": "The coordinator's end of the worker channel: typed frame I/O over"
+    },
+    {
+      "path": "fetch.rs",
+      "depth": 0,
+      "doc": "`--fetch` / `--out-link`: materialize build outputs through the"
+    },
+    {
+      "path": "framing.rs",
+      "depth": 0,
+      "doc": "Length-delimited proto frames over an `AsyncRead`/`AsyncWrite` fd"
+    },
+    {
+      "path": "lib.rs",
+      "depth": 0,
+      "doc": "`rio build` — the native-protocol build client (ADR-024 P3, the"
+    },
+    {
+      "path": "main.rs",
+      "depth": 0,
+      "doc": "`rio` — the native-protocol build client binary (ADR-024 P3)."
+    },
+    {
+      "path": "render.rs",
+      "depth": 0,
+      "doc": "Stage 5: per-drv status lines from `BuildEvent` streams."
+    }
+  ],
   "rio-builder": [
     {
       "path": "banner.rs",

@@ -1987,6 +1987,11 @@
       "doc": ""
     },
     {
+      "name": "SubmitError",
+      "crate": "rio-build-cli",
+      "doc": ""
+    },
+    {
       "name": "ExecutorError",
       "crate": "rio-builder",
       "doc": "Error type for executor operations. No `#[from] anyhow::Error` — every variant has a typed source. A catch-all `#[from] anyhow::Error` would mean any `?` on an anyhow::Result anywhere in execute_build silently becomes the wrong variant. Typed sources make the compiler catch misattribution at the `?` site."

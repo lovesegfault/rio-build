@@ -31,6 +31,10 @@
     "services": [],
     "doc": "Canonical stored/negotiated form of a Nix derivation (ADR-024,"
   },
+  "evaljob.proto": {
+    "services": [],
+    "doc": "Worker-channel frames for the `rio build` coordinator ↔ eval-parent"
+  },
   "scheduler.proto": {
     "services": [
       "SchedulerService"

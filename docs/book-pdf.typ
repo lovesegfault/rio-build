@@ -57,6 +57,8 @@
 #pagebreak(weak: true)
 #include "spec/components/cli.typ"
 #pagebreak(weak: true)
+#include "spec/components/build-client.typ"
+#pagebreak(weak: true)
 #include "ref/configuration.typ"
 #pagebreak(weak: true)
 #include "ref/errors.typ"
