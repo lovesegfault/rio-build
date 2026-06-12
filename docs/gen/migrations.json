@@ -110,6 +110,7 @@
     "112_directory_paths",
     "113_drop_nar_indexed",
     "114_file_blobs_path_idx",
-    "115_derivations_drv_path_idx"
+    "115_derivations_drv_path_idx",
+    "116_drv_blobs_chunk_tenants"
   ]
 }

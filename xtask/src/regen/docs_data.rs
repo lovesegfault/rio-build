@@ -1248,6 +1248,7 @@ fn config() -> Result<serde_json::Value> {
         ("store", "rio-store"),
         ("builder", "rio-builder"),
         ("controller", "rio-controller"),
+        ("build_client", "rio-build-cli"),
     ] {
         let path = root
             .join(crate_dir)

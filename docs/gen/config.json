@@ -969,6 +969,50 @@
         "default": "",
         "description": "Namespace the gateway pods run in."
       }
+    ],
+    "build_client": [
+      {
+        "key": "scheduler_addr",
+        "type": "string",
+        "default": "",
+        "description": "Scheduler gRPC endpoint as `host:port` (no scheme — `SubmitBuild`/`WatchBuild`/`CancelBuild`)."
+      },
+      {
+        "key": "store_addr",
+        "type": "string",
+        "default": "",
+        "description": "Store castore-door gRPC endpoint as `host:port` (`Has*` negotiation, drv blob puts, chunked source upload, output fetch)."
+      },
+      {
+        "key": "tenant_token_path",
+        "type": "string",
+        "default": "",
+        "description": "File containing the tenant JWT attached as `x-rio-tenant-token` on every RPC."
+      },
+      {
+        "key": "cas_root",
+        "type": "string",
+        "default": "",
+        "description": "Client CAS root (pack store, fingerprint index, cluster-ack table, fetched outputs)."
+      },
+      {
+        "key": "eval_parent",
+        "type": "string",
+        "default": "",
+        "description": "Path to the eval-parent binary (C++ libexpr embedding — ADR-024 P3b). `rio build` spawns it with the worker channel on fd 3."
+      },
+      {
+        "key": "ack_ttl_secs",
+        "type": "uint64",
+        "default": "21600",
+        "description": "Cluster-ack record TTL in seconds."
+      },
+      {
+        "key": "page_max_nodes",
+        "type": "uint",
+        "default": "50000",
+        "description": "Nodes per `SubmitBuild` page."
+      }
     ]
   }
 }

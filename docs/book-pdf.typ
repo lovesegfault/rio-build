@@ -44,6 +44,7 @@
   "spec/components/controller.typ",
   "spec/components/dashboard.typ",
   "spec/components/cli.typ",
+  "spec/components/build-client.typ",
   "ref/configuration.typ",
   "ref/errors.typ",
   "ref/metrics.typ",

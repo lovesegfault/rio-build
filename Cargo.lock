@@ -6280,6 +6280,42 @@ name = "rio-authz-kernel"
 version = "0.1.0"
 
 [[package]]
+name = "rio-build-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "blake3",
+ "bytes",
+ "clap",
+ "ed25519-dalek",
+ "hex",
+ "libc",
+ "prost",
+ "rio-auth",
+ "rio-common",
+ "rio-evalstore",
+ "rio-nix",
+ "rio-packstore",
+ "rio-proto",
+ "rio-store",
+ "rio-test-support",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
 name = "rio-builder"
 version = "0.1.0"
 dependencies = [

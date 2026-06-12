@@ -4,6 +4,7 @@
   "workspaceMembers": {
     "rio-auth": "rio-auth",
     "rio-authz-kernel": "rio-authz-kernel",
+    "rio-build-cli": "rio-build-cli",
     "rio-builder": "rio-builder",
     "rio-cli": "rio-cli",
     "rio-common": "rio-common",
@@ -19667,6 +19668,151 @@
         "type": "local",
         "path": "rio-authz-kernel"
       },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
+    "rio-build-cli": {
+      "crateName": "rio-build-cli",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-build-cli"
+      },
+      "dependencies": [
+        {
+          "name": "anyhow",
+          "packageId": "anyhow"
+        },
+        {
+          "name": "base64",
+          "packageId": "base64 0.22.1"
+        },
+        {
+          "name": "blake3",
+          "packageId": "blake3"
+        },
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "clap",
+          "packageId": "clap"
+        },
+        {
+          "name": "hex",
+          "packageId": "hex"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
+          "name": "prost",
+          "packageId": "prost"
+        },
+        {
+          "name": "rio-common",
+          "packageId": "rio-common"
+        },
+        {
+          "name": "rio-evalstore",
+          "packageId": "rio-evalstore"
+        },
+        {
+          "name": "rio-nix",
+          "packageId": "rio-nix"
+        },
+        {
+          "name": "rio-packstore",
+          "packageId": "rio-packstore"
+        },
+        {
+          "name": "rio-proto",
+          "packageId": "rio-proto"
+        },
+        {
+          "name": "schemars",
+          "packageId": "schemars 1.2.1"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "sha2",
+          "packageId": "sha2 0.11.0"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tokio-stream",
+          "packageId": "tokio-stream"
+        },
+        {
+          "name": "tonic",
+          "packageId": "tonic"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "uuid",
+          "packageId": "uuid"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
+        }
+      ],
+      "devDependencies": [
+        {
+          "name": "ed25519-dalek",
+          "packageId": "ed25519-dalek"
+        },
+        {
+          "name": "rio-auth",
+          "packageId": "rio-auth"
+        },
+        {
+          "name": "rio-store",
+          "packageId": "rio-store"
+        },
+        {
+          "name": "rio-test-support",
+          "packageId": "rio-test-support"
+        },
+        {
+          "name": "sqlx",
+          "packageId": "sqlx"
+        },
+        {
+          "name": "tempfile",
+          "packageId": "tempfile"
+        }
+      ],
+      "crateBin": [
+        {
+          "name": "rio",
+          "path": "src/main.rs"
+        }
+      ],
       "libCrateTypes": [
         "lib"
       ],

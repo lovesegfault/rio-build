@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "rio-auth",
+  "rio-build-cli",
   "rio-cli",
   "rio-common",
   "rio-controller",
@@ -37,6 +38,7 @@ repository = "https://github.com/lovesegfault/rio-build"
 # Internal crates
 rio-auth = { path = "rio-auth" }
 rio-common = { path = "rio-common" }
+rio-evalstore = { path = "rio-evalstore" }
 rio-migrations = { path = "rio-migrations" }
 rio-nix = { path = "rio-nix" }
 rio-packstore = { path = "rio-packstore" }

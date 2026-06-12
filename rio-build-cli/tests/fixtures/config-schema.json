@@ -1,0 +1,66 @@
+{
+  "schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Config",
+    "type": "object",
+    "properties": {
+      "scheduler_addr": {
+        "description": "Scheduler gRPC endpoint as `host:port` (no scheme —\n`SubmitBuild`/`WatchBuild`/`CancelBuild`). Required. Env:\n`RIO_SCHEDULER_ADDR`.",
+        "type": "string",
+        "default": ""
+      },
+      "store_addr": {
+        "description": "Store castore-door gRPC endpoint as `host:port` (`Has*`\nnegotiation, drv blob puts, chunked source upload, output\nfetch). Required. Env: `RIO_STORE_ADDR`.",
+        "type": "string",
+        "default": ""
+      },
+      "tenant_token_path": {
+        "description": "File containing the tenant JWT attached as `x-rio-tenant-token`\non every RPC. Unset = no token (single-tenant/dev clusters\nonly; a production door rejects anonymous callers).",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "cas_root": {
+        "description": "Client CAS root (pack store, fingerprint index, cluster-ack\ntable, fetched outputs). Unset = `$XDG_CACHE_HOME/rio/evalstore`\n(falling back to `~/.cache/rio/evalstore`).",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "eval_parent": {
+        "description": "Path to the eval-parent binary (C++ libexpr embedding — ADR-024\nP3b). `rio build` spawns it with the worker channel on fd 3.\nRequired for `rio build <installable>` until P3b ships a\ndefault; `--attach`/`--cancel` work without it.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "ack_ttl_secs": {
+        "description": "Cluster-ack record TTL in seconds. MUST be ≤ the cluster's\nminimum unpinned-blob lifetime (ADR-024) — a longer TTL turns\nevery cluster GC into a stale-ack recovery cycle. Default 6h,\nmatching the store's in-flight grace window.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 21600
+      },
+      "page_max_nodes": {
+        "description": "Nodes per `SubmitBuild` page. Submissions above this paginate\nwith a shared `submission_id` (the skeleton is ~334B/node; the\n16MB budget is exceeded around ~50k raw nodes).",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0,
+        "default": 50000
+      }
+    }
+  },
+  "defaults": {
+    "scheduler_addr": "",
+    "store_addr": "",
+    "tenant_token_path": null,
+    "cas_root": null,
+    "eval_parent": null,
+    "ack_ttl_secs": 21600,
+    "page_max_nodes": 50000
+  }
+}
