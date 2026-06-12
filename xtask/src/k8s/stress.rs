@@ -40,6 +40,21 @@ pub(super) struct LoadOpts {
     pub bench_flake: Option<PathBuf>,
     /// Poll scheduler metrics every 30s while builds run.
     pub watch: bool,
+    /// Spread client starts evenly over this window instead of
+    /// all-at-once. 512 simultaneous starts destabilized the EKS
+    /// control plane in the 2026-06-11 campaign (~5min apiserver
+    /// blackout, 7 NotReady nodes from Karpenter churn).
+    pub stagger: Duration,
+}
+
+/// Start offset for client `i` of `n` when ramping over `window`:
+/// evenly spaced, client 0 at t=0, client n-1 at `window * (n-1)/n`.
+fn stagger_offset(i: u16, n: u16, window: Duration) -> Duration {
+    if n == 0 || window.is_zero() {
+        return Duration::ZERO;
+    }
+    let nanos = window.as_nanos() * u128::from(i) / u128::from(n);
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 
 pub(super) async fn cmd_run(
@@ -129,7 +144,19 @@ async fn run_port_forward(
     let mut tunnels: Vec<ProcessGuard> = Vec::with_capacity(parallel as usize);
     let mut builds: Vec<(u16, tokio::process::Child)> = Vec::with_capacity(parallel as usize);
 
+    let ramp_start = tokio::time::Instant::now();
     for i in 0..parallel {
+        // --load-stagger: hold client i back until its slot in the ramp.
+        // select! so a Ctrl-C during a long window aborts immediately
+        // instead of queuing behind the remaining sleeps.
+        let due = ramp_start + stagger_offset(i, parallel, opts.stagger);
+        if tokio::time::Instant::now() < due {
+            tokio::select! {
+                biased;
+                _ = sigint.recv() => anyhow::bail!("interrupted"),
+                _ = tokio::time::sleep_until(due) => {}
+            }
+        }
         // base_port 0 → each tunnel on its own ephemeral port.
         let req = if opts.base_port == 0 {
             0
@@ -264,6 +291,24 @@ mod tests {
             parse_drv_output(p).unwrap(),
             "/nix/store/abc123-small-mixed-4x.drv"
         );
+    }
+
+    #[test]
+    fn stagger_zero_window_starts_everyone_immediately() {
+        for i in 0..8 {
+            assert_eq!(stagger_offset(i, 8, Duration::ZERO), Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn stagger_offsets_evenly_spaced_inside_window() {
+        let w = Duration::from_secs(64);
+        let offsets: Vec<_> = (0..8).map(|i| stagger_offset(i, 8, w)).collect();
+        assert_eq!(offsets[0], Duration::ZERO);
+        assert_eq!(offsets[1], Duration::from_secs(8));
+        assert_eq!(offsets[7], Duration::from_secs(56));
+        assert!(offsets.windows(2).all(|p| p[0] < p[1]), "not monotonic");
+        assert!(*offsets.last().unwrap() < w, "last start must be < window");
     }
 
     #[test]

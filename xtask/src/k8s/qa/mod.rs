@@ -97,6 +97,12 @@ pub struct QaOpts {
     /// build — so a wrong default makes `--load` deterministically red.
     #[arg(long = "load-target", default_value = "hello-shallow")]
     load_target: String,
+    /// Spread --load client starts evenly over this window (e.g. 300s)
+    /// instead of all-at-once. 512 simultaneous starts destabilized
+    /// the EKS control plane (~5min apiserver blackout, NotReady node
+    /// churn from the Karpenter thundering herd).
+    #[arg(long = "load-stagger", value_parser = super::chaos::parse_duration_secs, default_value = "0s")]
+    load_stagger: Duration,
     /// Blackhole target for --fault. Defaults to scheduler. Label-
     /// selector based — `scheduler` denies all `rio-scheduler` pods,
     /// not just the lease-holder (functionally equivalent: workers
@@ -146,7 +152,14 @@ impl QaOpts {
                     .count();
                 format!(" — {n} registered, {} tenants", self.tenant_pool)
             }
-            Stage::Load => format!(" — {}× {}", self.load_parallel, self.load_target),
+            Stage::Load => {
+                let stagger = if self.load_stagger.is_zero() {
+                    String::new()
+                } else {
+                    format!(", stagger {:?}", self.load_stagger)
+                };
+                format!(" — {}× {}{stagger}", self.load_parallel, self.load_target)
+            }
             Stage::Fault => format!(
                 " — blackhole {:?}, {:?}→{:?}",
                 self.fault_duration,
@@ -165,6 +178,9 @@ impl QaOpts {
         }
         if self.load_parallel != 8 && !selected.contains(&Stage::Load) {
             bail!("--load-parallel requires --load (or omit stage flags to run all)");
+        }
+        if !self.load_stagger.is_zero() && !selected.contains(&Stage::Load) {
+            bail!("--load-stagger requires --load (or omit stage flags to run all)");
         }
         if self.fault_target.is_some() && !selected.contains(&Stage::Fault) {
             bail!("--fault-target requires --fault (or omit stage flags to run all)");
@@ -289,6 +305,7 @@ pub async fn run(
                         base_port: 0,
                         bench_flake: None,
                         watch: false,
+                        stagger: opts.load_stagger,
                     };
                     super::stress::cmd_run(p, kind, cfg, &load).await?
                 }
