@@ -2214,16 +2214,23 @@ detached are never re-delivered — their net effect is what the snapshot
 describes. This replaces the retired `since_sequence` replay contract
 (`gw.reconnect.since-seq`, deleted with the WatchBuild resumability layer).
 
-#r("gw.tail.truncation-disclosed")[
-  A log-tail exit at the post-terminal grace edge whose served log is
-  INCOMPLETE (the store's own `is_complete` claim has not been observed
-  true) MUST write a truncation disclosure --- the gap-vocabulary marker
-  naming the first unserved line, open-ended --- as the relay's final write
-  before closing; a grace exit over a complete serve, an orphaned exit, and
-  a typed-permanent exit MUST NOT write one (nothing was cut, or no
-  consumer remains). The disclosure rides the close: the
-  exit-exactly-at-expiry law (#rref("store.log.tail-grace-drain")) is
-  preserved verbatim --- the grace is never extended to serve residue.
+#r("gw.tail.truncation-disclosed+2")[
+  A log-tail exit MUST write a truncation disclosure --- the
+  gap-vocabulary marker naming the first unserved line, open-ended ---
+  as the relay's final write before closing exactly when the served log
+  is INCOMPLETE (the store's own `is_complete` claim has not been
+  observed true) AND a consumer remains to disclose to (the relay's
+  output side is open): the (cut x consumer-alive) product, uniform
+  over the stop-cause alphabet. A grace exit over a complete serve owes
+  nothing (nothing was cut); an exit with no remaining consumer owes
+  nothing (the vacuous face); a typed-permanent or orphaned-watch exit
+  with an incomplete serve and a live consumer MUST disclose --- the
+  stop cause never stands in for consumer presence. The verdict reaches
+  the relay as a typed obligation consumable only through its discharge
+  closure; every exit path discharges. The disclosure rides the close:
+  the exit-exactly-at-expiry law (#rref("store.log.tail-grace-drain"))
+  is preserved verbatim --- the grace is never extended to serve
+  residue.
 ]
 
 Disclosure totality quantifies over the LOSS surface, not the fetch
@@ -2231,11 +2238,26 @@ surface (bug_121): the exit flush covers fetched-but-withheld pending-gap
 lines by contract, and the one loss path it could not see was the
 store-served backlog the grace edge cut mid-replay --- durable, never
 fetched, and pre-round-11 cut with zero reader-visible disclosure. The
-kernel already holds `served_complete` at the grace exit, so the verdict
-carries the obligation typed (`TailNext::Exit{disclose_truncation}`); the
-rejected alternative (a biased select / no-progress grace) is recorded
-REJECTED --- it would amend the spec'd finiteness law, where the
-disclosure arm composes without re-deriving it.
+kernel holds `served_complete` at every exit, so the verdict carries the
+obligation typed; the rejected alternative (a biased select /
+no-progress grace) is recorded REJECTED --- it would amend the spec'd
+finiteness law, where the disclosure arm composes without re-deriving
+it.
+
+The round-12 product re-denomination (merged_bug_007, R32): the wave-11
+form held the obligation only at the grace edge and hard-coded
+`disclose_truncation: false` on the typed-permanent and orphaned arms
+--- a "no consumer remains" premise false on both faces (a
+typed-permanent refusal mid-build is relayed to a live consumer whose
+log just stops; an orphaned WATCH channel can sit beside a still-open
+OUTPUT channel). And the obligation was plain data: of the relay's two
+exit paths, the post-drive path honored the field while the orphan fast
+path `debug_assert`-matched `Exit { .. }` and returned --- the wildcard
+the close itself widened. Consumer liveness is now an independent
+kernel input, the disclosure bit is the product on every exit cell
+(kani-pinned over the full 6 x 2^4 domain), and `ExitVerdict` is
+consumable only through `discharge` --- both exit paths route through
+one epilogue.
 
 #r("gw.tail.disclosure-linear")[
   The withheld-disclosure obligation is LINEAR: from the moment a relay

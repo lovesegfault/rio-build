@@ -366,28 +366,60 @@ pub enum TailStopCause {
 }
 
 /// The verdict of [`tail_next`].
-#[must_use]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "an Exit verdict carries the disclosure obligation typed; discharge it"]
+#[derive(Debug, PartialEq, Eq)]
 pub enum TailNext {
     /// Re-open the stream (after the caller-owned backoff, capped at
     /// the remaining grace).
     Reopen,
-    /// The subscription is finished.
-    Exit {
-        /// bug_121 (R30-adjacent disclosure totality): the exit is the
-        /// spec-mandated hard cut at grace expiry while the served log
-        /// is INCOMPLETE (`served_complete == false`) — store-served
-        /// residue was cut mid-replay, and the relay MUST write the
-        /// truncation disclosure (gap-vocabulary form) as its final
-        /// write before closing. Every other exit shape (orphaned,
-        /// typed-permanent, natural end with the served log complete,
-        /// grace expiry over a complete serve) owes nothing: either
-        /// nothing was cut, or no consumer remains to disclose to
-        /// (the orphan's failed send is harmless). Disclosure rides
-        /// the close; the grace itself is never extended
-        /// (`store.log.tail-grace-drain` is preserved verbatim).
-        disclose_truncation: bool,
-    },
+    /// The subscription is finished; the payload is the typed
+    /// disclosure obligation (merged_bug_007/R32) — consumable only
+    /// through [`ExitVerdict::discharge`].
+    Exit(ExitVerdict),
+}
+
+/// The exit's disclosure obligation, typed (merged_bug_007, R32
+/// linear obligations). The pre-fix shape returned
+/// `disclose_truncation` as plain data a call site could match away
+/// (`Exit { .. }`) — one of the relay's two exit paths honored the
+/// field and the other discarded it. The field is now private and the
+/// ONLY exit is [`Self::discharge`]: the caller must route the value
+/// through the closure that performs (or, for a typed reason,
+/// refuses) the disclosure — a return that never reads the obligation
+/// no longer typechecks. Not `Copy`/`Clone`: the obligation is
+/// consume-exactly-once. (`mem::forget`/binding-drop remain
+/// representable-but-unwritten; this crate is core-only, so a
+/// Drop-bomb backstop — which would also need the
+/// `thread::panicking()` unwind gate — is structurally unavailable
+/// and recorded REJECTED.)
+///
+/// bug_121 carried, re-denominated as the (cut x consumer-alive)
+/// product: `disclose_truncation` is true iff the served log is
+/// INCOMPLETE at the exit (`served_complete == false` — the store's
+/// completeness predicate declined to confirm; see [`final_claim`]
+/// for the two-face preimage) AND a consumer remains to disclose to.
+/// The stop CAUSE no longer stands in for consumer presence: a
+/// typed-permanent refusal mid-build still has a live consumer whose
+/// log just stopped (it discloses), and an orphaned relay can sit
+/// beside a still-open output channel (it discloses; the send fails
+/// harmlessly if the channel closed meanwhile). Disclosure rides the
+/// close; the grace itself is never extended
+/// (`store.log.tail-grace-drain` is preserved verbatim).
+#[must_use = "an Exit verdict carries the disclosure obligation typed; discharge it"]
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExitVerdict {
+    disclose_truncation: bool,
+}
+
+impl ExitVerdict {
+    /// Consume the obligation through the closure that performs the
+    /// disclosure decision. The closure receives the verdict's
+    /// disclose bit; its return value is passed through, so the
+    /// discharge composes with async send shapes
+    /// (`verdict.discharge(|disclose| async move { .. })`).
+    pub fn discharge<R>(self, perform: impl FnOnce(bool) -> R) -> R {
+        perform(self.disclose_truncation)
+    }
 }
 
 /// The relay's exit-decision kernel: may a `TailLog` subscription stop
@@ -407,33 +439,44 @@ pub enum TailNext {
 /// lose lines for, so exiting loses nothing and re-opening burns a
 /// store connection per backoff tick forever.
 ///
+/// The disclosure half (merged_bug_007): every Exit carries
+/// `disclose_truncation == !served_complete && consumer_alive` — the
+/// (cut x consumer-alive) product, uniform over the cause alphabet.
+/// `consumer_alive` is an INDEPENDENT input (the caller's own
+/// evidence: is the output side still open?), not a property inferred
+/// from the stop cause — the pre-fix law hard-coded
+/// `disclose_truncation: false` on the `PermanentErr` arm on a "no
+/// consumer remains" premise that is false for typed mid-build
+/// refusals relayed to a live consumer, and conflated the `Orphaned`
+/// watch-channel fact with output-channel liveness.
+///
 /// `terminal` is "the derivation reached a terminal status";
 /// `grace_expired` is "the armed-once post-terminal grace deadline has
 /// passed" (false whenever the deadline is not yet armed);
 /// `served_complete` is the most recent final message's `is_complete`
-/// — the store's own claim that everything durable was served.
+/// — the store's own claim that everything durable was served;
+/// `consumer_alive` is "the relay's output side still has a receiver".
 // r[impl store.log.tail-grace-drain+2]
+// r[impl gw.tail.truncation-disclosed+2]
 pub fn tail_next(
     cause: TailStopCause,
     terminal: bool,
     grace_expired: bool,
     served_complete: bool,
+    consumer_alive: bool,
 ) -> TailNext {
+    // The (cut x consumer-alive) product — ONE disclosure law for
+    // every exit cell; the exit-cell predicate below stays the
+    // merged_bug_076/130/164 law unchanged.
+    let verdict = ExitVerdict {
+        disclose_truncation: !served_complete && consumer_alive,
+    };
     if grace_expired {
-        // bug_121: the kernel holds served_complete at this exit — an
-        // incomplete serve cut by the hard grace edge carries the
-        // typed disclosure obligation out with the verdict.
-        return TailNext::Exit {
-            disclose_truncation: !served_complete,
-        };
+        return TailNext::Exit(verdict);
     }
     match cause {
-        TailStopCause::Orphaned | TailStopCause::PermanentErr => TailNext::Exit {
-            disclose_truncation: false,
-        },
-        TailStopCause::NaturalEnd if terminal && served_complete => TailNext::Exit {
-            disclose_truncation: false,
-        },
+        TailStopCause::Orphaned | TailStopCause::PermanentErr => TailNext::Exit(verdict),
+        TailStopCause::NaturalEnd if terminal && served_complete => TailNext::Exit(verdict),
         TailStopCause::NaturalEnd
         | TailStopCause::TransportErr
         | TailStopCause::OpenFailed
@@ -1585,8 +1628,11 @@ mod proofs {
     /// pins it as an unconditional exit). `PermanentErr` is exempt the
     /// other way around (merged_bug_164): the store typed the refusal
     /// as forever, so there are no servable lines to wait for and
-    /// re-dialing is the 1 Hz wedge. Exhaustive over the 6x2x2 input
-    /// domain.
+    /// re-dialing is the 1 Hz wedge. merged_bug_007 extends the pins
+    /// to the (cut x consumer-alive) PRODUCT: the unconditional exits
+    /// disclose exactly when the serve is incomplete AND a consumer
+    /// remains — the cause no longer stands in for consumer presence.
+    /// Exhaustive over the 6x2x2x2 input domain.
     #[kani::proof]
     fn check_tail_next_no_premature_exit() {
         let cause: u8 = kani::any();
@@ -1603,33 +1649,47 @@ mod proofs {
             matches!(cause, TailStopCause::Orphaned | TailStopCause::PermanentErr);
         let terminal: bool = kani::any();
         let served_complete: bool = kani::any();
-        // Grace unspent + log not served-complete + a consumer still
-        // listening + the store has not said never => never Exit.
+        let consumer_alive: bool = kani::any();
+        // Grace unspent + log not served-complete + retryable cause
+        // => never Exit (consumer liveness cannot create an exit).
         if !served_complete && !unconditional_exit {
-            assert!(tail_next(cause, terminal, false, served_complete) == TailNext::Reopen);
+            assert!(
+                tail_next(cause, terminal, false, served_complete, consumer_alive)
+                    == TailNext::Reopen
+            );
         }
         // Grace unspent + not a natural end + retryable => never
         // Exit, even when complete (an erred stream gets its retry).
         if cause != TailStopCause::NaturalEnd && !unconditional_exit {
-            assert!(tail_next(cause, terminal, false, served_complete) == TailNext::Reopen);
+            assert!(
+                tail_next(cause, terminal, false, served_complete, consumer_alive)
+                    == TailNext::Reopen
+            );
         }
-        // The two unconditional exits ARE unconditional (and owe no
-        // disclosure: nothing was cut by a grace edge).
+        // The two unconditional exits ARE unconditional, and their
+        // disclosure is the product: a cut (incomplete serve) with a
+        // live consumer discloses — the merged_bug_007 cell
+        // (PermanentErr mid-build with a live consumer) can no longer
+        // be hard-coded silent — and a dead consumer owes nothing.
         if unconditional_exit {
-            assert!(matches!(
-                tail_next(cause, terminal, false, served_complete),
-                TailNext::Exit {
-                    disclose_truncation: false
-                }
-            ));
+            assert!(
+                tail_next(cause, terminal, false, served_complete, consumer_alive)
+                    == TailNext::Exit(ExitVerdict {
+                        disclose_truncation: !served_complete && consumer_alive
+                    })
+            );
         }
     }
 
     /// [`tail_next`] always honours the spent grace budget: Exit for
-    /// every cause/terminal/completeness combination once
+    /// every cause/terminal/completeness/consumer combination once
     /// `grace_expired` — the loop is provably finite past the
-    /// deadline. And the early-exit cell is exactly
-    /// (NaturalEnd && terminal && served_complete) ∨ Orphaned.
+    /// deadline. The disclosure bit is exactly the
+    /// (cut x consumer-alive) product (bug_121 carried;
+    /// merged_bug_007 added the consumer axis). And the early-exit
+    /// cell is exactly
+    /// (NaturalEnd && terminal && served_complete) ∨ Orphaned ∨
+    /// PermanentErr.
     #[kani::proof]
     fn check_tail_next_grace_exit() {
         let cause: u8 = kani::any();
@@ -1644,19 +1704,20 @@ mod proofs {
         };
         let terminal: bool = kani::any();
         let served_complete: bool = kani::any();
-        // bug_121: the grace exit is total AND its disclosure bit is
-        // exactly the incomplete-serve predicate — the truncation
-        // obligation cannot be forgotten or over-claimed.
+        let consumer_alive: bool = kani::any();
+        // The grace exit is total AND its disclosure bit is exactly
+        // the product — the truncation obligation cannot be
+        // forgotten, over-claimed, or minted for a dead consumer.
         assert!(
-            tail_next(cause, terminal, true, served_complete)
-                == TailNext::Exit {
-                    disclose_truncation: !served_complete
-                }
+            tail_next(cause, terminal, true, served_complete, consumer_alive)
+                == TailNext::Exit(ExitVerdict {
+                    disclose_truncation: !served_complete && consumer_alive
+                })
         );
         // The early-exit cell, exactly.
         let early = matches!(
-            tail_next(cause, terminal, false, served_complete),
-            TailNext::Exit { .. }
+            tail_next(cause, terminal, false, served_complete, consumer_alive),
+            TailNext::Exit(_)
         );
         let natural_drained = cause == TailStopCause::NaturalEnd && terminal && served_complete;
         assert!(
@@ -1668,24 +1729,30 @@ mod proofs {
     }
 
     /// `Orphaned` always exits: with the consumer-side lifecycle
-    /// channel gone there is nothing to serve and nothing to lose —
-    /// every re-open would be the merged_bug_130 hot-loop (a store
-    /// connection per backoff tick, forever, for nobody). Exhaustive
-    /// over terminal x grace x completeness.
+    /// channel gone there is nothing left to drive — every re-open
+    /// would be the merged_bug_130 hot-loop (a store connection per
+    /// backoff tick, forever, for nobody). The disclosure rides the
+    /// product: an orphaned WATCH beside a still-open OUTPUT channel
+    /// (merged_bug_007 — the two channels are distinct facts) still
+    /// owes the cut disclosure. Exhaustive over
+    /// terminal x grace x completeness x consumer.
     #[kani::proof]
     fn check_tail_next_orphan_always_exits() {
         let terminal: bool = kani::any();
         let grace_expired: bool = kani::any();
         let served_complete: bool = kani::any();
-        assert!(matches!(
+        let consumer_alive: bool = kani::any();
+        assert!(
             tail_next(
                 TailStopCause::Orphaned,
                 terminal,
                 grace_expired,
-                served_complete
-            ),
-            TailNext::Exit { .. }
-        ));
+                served_complete,
+                consumer_alive
+            ) == TailNext::Exit(ExitVerdict {
+                disclose_truncation: !served_complete && consumer_alive
+            })
+        );
     }
 
     /// Verify [`visit_object`] against its contracts for every
@@ -2238,14 +2305,22 @@ mod tests {
     }
 
     /// The full tail_next decision table: 6 causes x terminal x
-    /// grace_expired x served_complete = 48 rows. Exit cells: every
-    /// grace_expired row, every Orphaned row, every PermanentErr row
-    /// (recorded red for the variant's introduction: the 8
-    /// PermanentErr rows did not exist — the pre-fix law had no
+    /// grace_expired x served_complete x consumer_alive = 96 rows.
+    /// Exit cells: every grace_expired row, every Orphaned row, every
+    /// PermanentErr row (recorded red for the variant's introduction:
+    /// the PermanentErr rows did not exist — the pre-fix law had no
     /// vocabulary for "the store says never", so a typed-permanent
     /// refusal re-dialed at 1 Hz until grace), plus exactly
-    /// (NaturalEnd, terminal, !grace_expired, served_complete).
+    /// (NaturalEnd, terminal, !grace_expired, served_complete). The
+    /// disclosure bit on every Exit row is the
+    /// (cut x consumer-alive) PRODUCT (merged_bug_007 — recorded red
+    /// for the product's introduction: the pre-fix Orphaned and
+    /// PermanentErr arms hard-coded `disclose_truncation: false`, so
+    /// the 8 cut-with-live-consumer rows of those causes asserted
+    /// silent exits; the W12-AU table extension is exactly those
+    /// cells flipping to disclose).
     // r[verify store.log.tail-grace-drain+2]
+    // r[verify gw.tail.truncation-disclosed+2]
     #[test]
     fn tail_next_decision_table() {
         use TailNext::*;
@@ -2263,34 +2338,39 @@ mod tests {
             for terminal in [false, true] {
                 for grace_expired in [false, true] {
                     for served_complete in [false, true] {
-                        rows += 1;
-                        let got = tail_next(cause, terminal, grace_expired, served_complete);
-                        let want = if grace_expired {
-                            // bug_121: the disclosure bit is exactly
-                            // the incomplete-serve predicate at the
-                            // grace edge.
-                            Exit {
-                                disclose_truncation: !served_complete,
-                            }
-                        } else if cause == Orphaned
-                            || cause == PermanentErr
-                            || (cause == NaturalEnd && terminal && served_complete)
-                        {
-                            Exit {
-                                disclose_truncation: false,
-                            }
-                        } else {
-                            Reopen
-                        };
-                        assert_eq!(
-                            got, want,
-                            "tail_next({cause:?}, {terminal}, {grace_expired}, {served_complete})"
-                        );
+                        for consumer_alive in [false, true] {
+                            rows += 1;
+                            let got = tail_next(
+                                cause,
+                                terminal,
+                                grace_expired,
+                                served_complete,
+                                consumer_alive,
+                            );
+                            let exits = grace_expired
+                                || cause == Orphaned
+                                || cause == PermanentErr
+                                || (cause == NaturalEnd && terminal && served_complete);
+                            let want = if exits {
+                                // bug_121 + merged_bug_007: every exit
+                                // carries the product.
+                                Exit(ExitVerdict {
+                                    disclose_truncation: !served_complete && consumer_alive,
+                                })
+                            } else {
+                                Reopen
+                            };
+                            assert_eq!(
+                                got, want,
+                                "tail_next({cause:?}, {terminal}, {grace_expired}, \
+                                 {served_complete}, {consumer_alive})"
+                            );
+                        }
                     }
                 }
             }
         }
-        assert_eq!(rows, 48, "the R5 composed table: 6 causes x 2^3");
+        assert_eq!(rows, 96, "the composed table: 6 causes x 2^4");
     }
 
     /// The clamp + classification table: `(cursor, first, manifest,

@@ -519,3 +519,23 @@ under this rule.
   prior-disclosure suppression (the accepted-gap floor), supersession
   discard (the typed disposition); priced residuals: drop-time channel
   full/closed, in-flight never-withheld serve sends.
+
+- *Tail-exit truncation disclosure (gateway log tail / log kernel)*: the
+  exit verdict's `disclose_truncation` decision. Carrier: the kernel's
+  `ExitVerdict` --- private field, not `Copy`/`Clone`, consumable only
+  through `discharge(|disclose| ...)`, so an exit path that ignores the
+  obligation no longer typechecks
+  (#rref("gw.tail.truncation-disclosed")). The pre-close shape returned
+  the bit as plain data: of the relay's two exit paths one honored it
+  and the orphan fast path `debug_assert`-matched `Exit { .. }` and
+  returned --- a computed-and-discarded verdict; and the kernel's
+  typed-permanent/orphaned arms hard-coded `false` on a "no consumer
+  remains" premise false for mid-build refusals with a live consumer.
+  The disclosure value is now the (cut x consumer-alive) product with
+  consumer liveness an independent input, kani-pinned over the full
+  input domain; both exit paths route through one discharging epilogue.
+  Discharge forms: perform (the marker send) or typed refusal inside the
+  closure; named-but-unwritten residuals: `mem::forget`/binding-drop of
+  the verdict (the kernel is core-only --- a Drop-bomb backstop needs
+  `thread::panicking()` and is structurally unavailable; recorded
+  REJECTED).

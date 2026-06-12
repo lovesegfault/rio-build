@@ -892,27 +892,50 @@ async fn run_tail(
     let mut warned_open_failure = false;
     loop {
         // An orphaned relay must never open another stream: the drain
-        // sender vanishing means the owning set is gone (and with it
-        // every consumer), so the law exits unconditionally — proven
-        // by `check_tail_next_orphan_always_exits`. Checked BEFORE the
+        // sender vanishing means the owning set is gone, so the law
+        // exits unconditionally — proven by
+        // `check_tail_next_orphan_always_exits`. Checked BEFORE the
         // open so a death observed during backoff costs zero further
         // store connections (merged_bug_130: this exact shape used to
         // skip every backoff and hot-loop opens at full speed).
+        // merged_bug_007: the orphaned WATCH does not entail a dead
+        // OUTPUT channel — consumer liveness is its own input, and
+        // the verdict's disclosure obligation is DISCHARGED here
+        // exactly as on the post-drive path (the pre-fix fast path
+        // matched `Exit { .. }` and returned, silently discarding a
+        // disclose_truncation the kernel had computed).
         if drain.has_changed().is_err() {
+            // Bound BEFORE the match: the watch read-guard inside a
+            // scrutinee temporary must not live across the discharge
+            // await below.
+            let terminal = *drain.borrow();
             let verdict = tail_next(
                 TailStopCause::Orphaned,
-                *drain.borrow(),
+                terminal,
                 grace_deadline.is_some_and(|d| Instant::now() >= d),
                 served_complete,
+                !out_tx.is_closed(),
             );
-            debug_assert!(matches!(verdict, TailNext::Exit { .. }));
-            debug!("log tail orphaned (subscription set gone); exiting");
-            // Orphan exit still flushes (merged_bug_150): the send
-            // fails harmlessly if the consumer is truly gone, but an
-            // orphaned WATCH with a live OUTPUT channel must not eat
-            // the withheld lines.
-            flush_pending_gap(&mut pending_gap, &mut last_relayed, &mut accepted_gap_floor).await;
-            return;
+            match verdict {
+                TailNext::Reopen => {
+                    // Orphaned never reopens (kernel law, kani:
+                    // check_tail_next_orphan_always_exits).
+                    unreachable!("an orphaned relay never reopens (kernel law)")
+                }
+                TailNext::Exit(verdict) => {
+                    debug!("log tail orphaned (subscription set gone); exiting");
+                    finish_exit(
+                        verdict,
+                        &derivation_path,
+                        &out_tx,
+                        &mut pending_gap,
+                        &mut last_relayed,
+                        &mut accepted_gap_floor,
+                    )
+                    .await;
+                    return;
+                }
+            }
         }
         arm_grace(&mut grace_deadline, &drain, config.terminal_grace);
         let since_line = last_relayed.map_or(0, |n| n.saturating_add(1));
@@ -1043,45 +1066,27 @@ async fn run_tail(
         arm_grace(&mut grace_deadline, &drain, config.terminal_grace);
         let terminal = *drain.borrow();
         let grace_expired = grace_deadline.is_some_and(|d| Instant::now() >= d);
-        match tail_next(cause, terminal, grace_expired, served_complete) {
-            TailNext::Exit {
-                disclose_truncation,
-            } => {
+        match tail_next(
+            cause,
+            terminal,
+            grace_expired,
+            served_complete,
+            !out_tx.is_closed(),
+        ) {
+            TailNext::Exit(verdict) => {
                 debug!(
                     ?cause,
-                    terminal,
-                    grace_expired,
-                    served_complete,
-                    disclose_truncation,
-                    "log tail finished"
+                    terminal, grace_expired, served_complete, "log tail finished"
                 );
-                // THE single exit flush (merged_bug_150): a gap still
-                // pending at exit time never got its second chance —
-                // accept it now, marker plus withheld lines, through
-                // the same path the in-stream accept uses. Exiting
-                // with fetched-but-undisclosed lines is unrepresentable.
-                flush_pending_gap(&mut pending_gap, &mut last_relayed, &mut accepted_gap_floor)
-                    .await;
-                // bug_121: disclosure totality quantifies over the
-                // LOSS surface, not the fetch surface — the kernel's
-                // verdict carries the obligation typed: the hard
-                // grace edge cut store-served residue mid-replay
-                // (served incomplete), so the truncation marker is
-                // the FINAL write. The spec's exit-exactly-at-expiry
-                // law is untouched (disclosure rides the close; the
-                // grace is not extended). A send into a closed
-                // channel fails harmlessly (the orphan shape).
-                // r[impl gw.tail.truncation-disclosed]
-                if disclose_truncation {
-                    let from = last_relayed.map_or(0, |n| n.saturating_add(1));
-                    let _ = out_tx
-                        .send(TaggedLogChunk {
-                            derivation_path: derivation_path.clone(),
-                            first_line_number: from,
-                            lines: vec![truncation_marker(from)],
-                        })
-                        .await;
-                }
+                finish_exit(
+                    verdict,
+                    &derivation_path,
+                    &out_tx,
+                    &mut pending_gap,
+                    &mut last_relayed,
+                    &mut accepted_gap_floor,
+                )
+                .await;
                 return;
             }
             TailNext::Reopen => {
@@ -1100,6 +1105,46 @@ async fn run_tail(
                 }
             }
         }
+    }
+}
+
+/// THE exit epilogue, shared by BOTH `run_tail` exit paths
+/// (merged_bug_007): the single exit flush (merged_bug_150 — a gap
+/// still pending at exit time never got its second chance; accept it
+/// now, marker plus withheld lines, through the same path the
+/// in-stream accept uses), then the typed disclosure obligation is
+/// DISCHARGED — `ExitVerdict` is consumable only through its
+/// discharge closure, so an exit path that ignores the verdict no
+/// longer typechecks (the pre-fix orphan fast path matched
+/// `Exit { .. }` and returned without reading `disclose_truncation`).
+///
+/// bug_121 carried: disclosure totality quantifies over the LOSS
+/// surface, not the fetch surface — the verdict carries the
+/// obligation typed; the truncation marker is the FINAL write. The
+/// spec's exit-exactly-at-expiry law is untouched (disclosure rides
+/// the close; the grace is not extended). A send into a closed
+/// channel fails harmlessly (the consumer raced away after the
+/// liveness read — the verdict was honest at decision time).
+// r[impl gw.tail.truncation-disclosed+2]
+async fn finish_exit(
+    verdict: rio_log_kernel::ExitVerdict,
+    derivation_path: &str,
+    out_tx: &mpsc::Sender<TaggedLogChunk>,
+    pending_gap: &mut PendingGapCell,
+    last_relayed: &mut Option<u64>,
+    accepted_gap_floor: &mut Option<u64>,
+) {
+    flush_pending_gap(pending_gap, last_relayed, accepted_gap_floor).await;
+    let from = last_relayed.map_or(0, |n| n.saturating_add(1));
+    let marker = verdict.discharge(|disclose| {
+        disclose.then(|| TaggedLogChunk {
+            derivation_path: derivation_path.to_string(),
+            first_line_number: from,
+            lines: vec![truncation_marker(from)],
+        })
+    });
+    if let Some(marker) = marker {
+        let _ = out_tx.send(marker).await;
     }
 }
 
@@ -1590,7 +1635,7 @@ async fn reconcile_backfill(
 /// gap-vocabulary form with the un-served tail open-ended (the relay
 /// cannot know the durable extent it never fetched). The full log
 /// stays durable and retrievable from the store.
-// r[impl gw.tail.truncation-disclosed]
+// r[impl gw.tail.truncation-disclosed+2]
 fn truncation_marker(from: u64) -> Vec<u8> {
     format!(
         "*** rio: lines {from}- not served before the post-terminal grace \
@@ -2251,7 +2296,7 @@ mod tests {
     }
 
     // r[verify store.log.tail-grace-drain+2]
-    // r[verify gw.tail.truncation-disclosed]
+    // r[verify gw.tail.truncation-disclosed+2]
     /// W11-BJ (bug_121): disclosure totality quantifies over the LOSS
     /// surface, not the fetch surface — the spec-mandated hard exit at
     /// grace expiry (`tail-grace-drain`: exit exactly at expiry) cuts
@@ -2316,7 +2361,7 @@ mod tests {
     /// W11-BJ companion (the negative cell): a grace exit whose served
     /// log IS complete (the store's own claim) owes no truncation
     /// marker — nothing was cut.
-    // r[verify gw.tail.truncation-disclosed]
+    // r[verify gw.tail.truncation-disclosed+2]
     #[tokio::test]
     async fn grace_exit_with_complete_serve_stays_silent() {
         let mut h = harness().await;
@@ -3431,5 +3476,123 @@ mod tests {
             "exactly the marker and the lines — a completed consume leaves \
              nothing armed, so no Drop re-discloses"
         );
+    }
+    // ------------------------------------------------------------------
+    // W12-AU / W12-AU2 (merged_bug_007, R32): every exit discharges
+    // ------------------------------------------------------------------
+
+    /// W12-AU — the orphan fast path discharges the disclosure
+    /// obligation exactly as the post-drive path. Proposition: every
+    /// `Exit` verdict is discharged on every path, and
+    /// `disclose_truncation` is true iff (cut AND consumer-alive) —
+    /// consumer liveness is its own input, never inferred from the
+    /// stop cause.
+    ///
+    /// Choreography: the relay loses its stream to a transport error
+    /// (incomplete serve), then during the reconnect backoff the
+    /// drain flips terminal and the SENDER dies — the loop-top orphan
+    /// fast path observes the orphan with the OUTPUT channel still
+    /// open and a cut serve. Pre-fix the fast path computed the
+    /// verdict, `debug_assert`-matched `Exit { .. }`, and returned
+    /// without reading the disclosure (and the kernel's orphan arm
+    /// hard-coded false regardless); post-fix the discharge sends the
+    /// truncation marker through the same epilogue the post-drive
+    /// path uses.
+    ///
+    /// Pre-fix red (the wave-12 W12-AU capture): the post-orphan recv
+    /// times out — `the orphan exit must discharge the cut disclosure
+    /// to the live output channel (pre-fix: verdict discarded)`.
+    // r[verify gw.tail.truncation-disclosed+2]
+    #[tokio::test]
+    async fn orphan_exit_with_cut_discloses_to_live_consumer() {
+        let mock = MockTail::default();
+        let router = Server::builder().add_service(LogServiceServer::new(mock.clone()));
+        let (addr, _server) = spawn_grpc_server(router).await;
+        let client = rio_proto::LogServiceClient::connect(format!("http://{addr}"))
+            .await
+            .expect("connect to the mock LogService");
+        // Two lines then a transport error: the serve is INCOMPLETE
+        // and the relay heads into its reconnect loop.
+        mock.push_script(
+            vec![chunk(0, 2)],
+            SessionEnd::Error(tonic::Code::Unavailable),
+        );
+
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+        let disposition = super::RelayDisposition::disclose_at_drop();
+        let relay = tokio::spawn(super::run_tail(
+            client,
+            None,
+            DRV.to_string(),
+            EXEC_A.to_string(),
+            super::RelayWiring {
+                out_tx: out_tx.clone(),
+                drain: drain_rx,
+                disposition,
+            },
+            test_config(),
+        ));
+
+        let lines = recv_lines(&mut out_rx, 2).await;
+        assert_eq!(lines.len(), 2);
+        // Terminal, then the watch sender dies: the relay is orphaned
+        // mid-backoff while the OUTPUT channel stays open — the
+        // loop-top fast path decides the exit.
+        drain_tx.send(true).expect("relay alive");
+        drop(drain_tx);
+
+        let marker = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .expect(
+                "the orphan exit must discharge the cut disclosure to the \
+                 live output channel (pre-fix: verdict discarded)",
+            )
+            .expect("output channel open");
+        let text = String::from_utf8(marker.lines[0].clone()).expect("marker is UTF-8");
+        assert!(
+            text.contains("rio:") && marker.first_line_number == 2,
+            "the truncation disclosure names the first unserved line; got {text:?}"
+        );
+        let _ = relay.await;
+    }
+
+    /// W12-AU2 — the PermanentErr-with-live-consumer face: a stream
+    /// the store types permanently unservable MID-BUILD (no terminal,
+    /// grace never armed) stops the relay while the nix client is
+    /// alive and reading. The kernel's pre-fix arm hard-coded
+    /// `disclose_truncation: false` on a "no consumer remains"
+    /// premise that is false here — the client's log silently
+    /// stopped. Post-fix the (cut x consumer-alive) product
+    /// discloses.
+    ///
+    /// Pre-fix red: the post-lines recv times out — `a typed-permanent
+    /// refusal with a live consumer must disclose the cut (pre-fix:
+    /// hard-coded silent)`.
+    // r[verify gw.tail.truncation-disclosed+2]
+    #[tokio::test]
+    async fn permanent_err_with_live_consumer_discloses_cut() {
+        let mut h = harness().await;
+        h.mock
+            .push_script(vec![chunk(0, 2)], SessionEnd::ErrorUnservable);
+
+        h.set.on_started(DRV, EXEC_A);
+        let lines = recv_lines(&mut h.out_rx, 2).await;
+        assert_eq!(lines.len(), 2);
+
+        let marker = tokio::time::timeout(Duration::from_secs(2), h.out_rx.recv())
+            .await
+            .expect(
+                "a typed-permanent refusal with a live consumer must disclose \
+                 the cut (pre-fix: hard-coded silent)",
+            )
+            .expect("output channel open");
+        let text = String::from_utf8(marker.lines[0].clone()).expect("marker is UTF-8");
+        assert!(
+            text.contains("rio:") && marker.first_line_number == 2,
+            "the truncation disclosure names the first unserved line; got {text:?}"
+        );
+
+        h.set.abort_all();
     }
 }
