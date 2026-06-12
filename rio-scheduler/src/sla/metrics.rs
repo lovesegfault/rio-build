@@ -119,6 +119,18 @@ pub fn describe_all() {
          to the helm seed."
     );
     describe_counter!(
+        "rio_scheduler_sla_evidence_refused_total",
+        "typed refusal letters at the SLA data plane's decode \
+         boundaries: an evidence row refused BEFORE any store mutation \
+         (the row never lands; siblings are unaffected). Labeled \
+         `plane` (which store refused) and `reason` — \
+         `zero_resource`: a controller instance-type observation with \
+         cores or mem of 0 (absence of parseable kubelet resources is \
+         not a 0-core fact; sched.sla.merge-law). Sustained nonzero ⇒ \
+         a producer is shipping junk evidence; the stores stay clean \
+         but the named plane is learning nothing from those rows."
+    );
+    describe_counter!(
         "rio_scheduler_sla_als_round_cap_hit_total",
         "ALS alternation hit ALS_MAX_ROUNDS without ‖Δα‖₁ < ALS_DELTA_TOL \
          convergence (labeled `tenant`). The α/T_ref(c) joint fit \
@@ -380,6 +392,7 @@ pub const SLA_METRICS: &[&str] = &[
     "rio_scheduler_sla_hw_ladder_exhausted_total",
     "rio_scheduler_sla_hw_cost_unknown_total",
     "rio_scheduler_sla_hw_cost_fallback_total",
+    "rio_scheduler_sla_evidence_refused_total",
     "rio_scheduler_sla_als_round_cap_hit_total",
     "rio_scheduler_sla_keys_evicted_total",
     "rio_scheduler_sla_class_ceiling_uncatalogued",
@@ -426,6 +439,14 @@ pub const SLA_LABELED_METRICS: &[(&str, &str, &[&str])] = &[
         "rio_scheduler_sla_hw_cost_fallback_total",
         "reason",
         &["api_error", "empty_history", "parse", "stale"],
+    ),
+    (
+        "rio_scheduler_sla_evidence_refused_total",
+        "reason",
+        // bw11 WO-S6-1: the zero-resource observation refusal (cost.rs
+        // intake). Further reasons append via the label-extension lane
+        // as their emits land (the hw_ladder row's precedent).
+        &["zero_resource"],
     ),
     (
         "rio_scheduler_sla_hw_ladder_exhausted_total",

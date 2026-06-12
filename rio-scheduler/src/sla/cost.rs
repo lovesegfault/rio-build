@@ -62,6 +62,40 @@ pub struct InstanceType {
     pub last_observed: SystemTime,
 }
 
+impl InstanceType {
+    // r[impl sched.sla.merge-law]
+    /// THE per-`(cell, name)` menu merge law — newest-wins-WHOLESALE,
+    /// the ONE in-crate implementation consumed by every Rust write
+    /// leg (the observation fold in
+    /// [`CostTable::observe_instance_types`] and the lease-edge carry
+    /// in [`CostTable::carry_catalog`]); the PG upsert in
+    /// `persist_rows` mirrors it in SQL with the same STRICT
+    /// monotonicity qual (`last_observed < EXCLUDED.last_observed`).
+    /// The law: a strictly newer `last_observed` replaces the WHOLE
+    /// entry (never per-field — bug_059's keep-first-with-fresh-
+    /// timestamp arm re-stamped junk as the freshest truth); ties and
+    /// older observations keep the current holder, so re-applying the
+    /// same fact is a no-op at every leg.
+    ///
+    /// R30 heal edge (the `sys.liveness.exit-edge` instance for this
+    /// store): BECAUSE the win is wholesale, a stored zero-resource
+    /// row — historical junk from before the intake refusal — is
+    /// overwritten by the next complete observation; junk that
+    /// reached the store has a reachable exit, and the intake refusal
+    /// stops new mints. The `merge_law_caller_census` test is the
+    /// belt: a new write leg that hand-merges instead of routing here
+    /// goes red there.
+    pub fn merge_newest_wins(current: &mut InstanceType, incoming: InstanceType) {
+        debug_assert_eq!(
+            current.name, incoming.name,
+            "the merge law is per (cell, name)"
+        );
+        if incoming.last_observed > current.last_observed {
+            *current = incoming;
+        }
+    }
+}
+
 /// Where `$/vCPU·hr` numbers come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -424,14 +458,12 @@ impl CostTable {
             let menu = fresh.cells.entry(cell).or_default();
             for it in mine {
                 match menu.iter_mut().find(|t| t.name == it.name) {
-                    // Both sides know the type: the newer observation
-                    // wins wholesale (data-time `last_observed`; ties
-                    // keep the PG side — same fact either way).
-                    Some(t) => {
-                        if it.last_observed > t.last_observed {
-                            *t = it;
-                        }
-                    }
+                    // Both sides know the type: the ONE merge law
+                    // ([`InstanceType::merge_newest_wins`]) — the
+                    // newer observation wins wholesale (data-time
+                    // `last_observed`; ties keep the PG side — same
+                    // fact either way).
+                    Some(t) => InstanceType::merge_newest_wins(t, it),
                     // Only the outgoing table knows it: a true cluster
                     // fact observed in the pre-reload window — union.
                     None => menu.push(it),
@@ -756,6 +788,13 @@ impl CostTable {
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .map(|d| d.as_secs_f64())
                     .unwrap_or(0.0);
+                // The SQL leg of the merge law (`InstanceType::
+                // merge_newest_wins` — sched.sla.merge-law): STRICTLY
+                // newer wins wholesale (every value column moves
+                // together); ties and older keep the stored row, so
+                // the steady-state re-persist of an unchanged menu is
+                // a no-op and a deposed writer's stale snapshot
+                // cannot rewind. Pinned by `merge_law_caller_census`.
                 sqlx::query(
                     "INSERT INTO sla_observed_instance_types \
                      (cluster, hw_class, capacity_type, instance_type, cores, mem_bytes, last_observed) \
@@ -763,7 +802,7 @@ impl CostTable {
                      ON CONFLICT (cluster, hw_class, capacity_type, instance_type) DO UPDATE SET \
                      cores = EXCLUDED.cores, mem_bytes = EXCLUDED.mem_bytes, \
                      last_observed = EXCLUDED.last_observed \
-                     WHERE sla_observed_instance_types.last_observed <= EXCLUDED.last_observed",
+                     WHERE sla_observed_instance_types.last_observed < EXCLUDED.last_observed",
                 )
                 .bind(&self.cluster)
                 .bind(h)
@@ -927,13 +966,27 @@ impl CostTable {
     }
 
     /// Fold controller-observed `(cell, instance_type, cores, mem)`
-    /// into the per-cell menu. Union-only: a `(cell, name)` already
-    /// present has its `last_observed` refreshed (NOT skipped — the
-    /// persist writes data-time, so the dedup-hit path must touch it).
-    /// New entries seed `price_per_vcpu_hr` (informational only — the
-    /// menu drives `poll_spot_once`, not `evaluate_cell`). Re-sorts
-    /// each touched menu by `(cores, mem_bytes)` for stable iteration.
+    /// into the per-cell menu through the ONE merge law
+    /// ([`InstanceType::merge_newest_wins`]): union-only across names;
+    /// a `(cell, name)` already present is overwritten WHOLESALE by
+    /// the now-stamped incoming observation (which both refreshes the
+    /// persisted data-time recency signal AND heals any stored
+    /// zero-resource junk — the bug_059 keep-first arm refreshed the
+    /// stamp while discarding the incoming cores/mem). New entries
+    /// seed `price_per_vcpu_hr` (informational only — the menu drives
+    /// `poll_spot_once`, not `evaluate_cell`). Re-sorts each touched
+    /// menu by `(cores, mem_bytes)` for stable iteration.
+    ///
+    /// Zero-resource refusal (the store's decode boundary): an
+    /// observation with `cores == 0 || mem_bytes == 0` is a typed,
+    /// counted refusal letter, never a row — `parse_resources`
+    /// defaults missing/malformed kubelet allocatable to 0 in the
+    /// LiveNode fallback chain, and absence of parseable resources is
+    /// NOT a 0-core fact. A 0-core row would be immortal junk: the
+    /// `$/vCPU` fold filters `vcpu > 0.0`, so the row could never
+    /// price, while winning every monotonicity qual on re-stamp.
     // r[impl sched.sla.cost-instance-type-feedback]
+    // r[impl sched.sla.merge-law]
     pub fn observe_instance_types(
         &mut self,
         obs: impl IntoIterator<Item = (Cell, String, u32, u64)>,
@@ -941,18 +994,35 @@ impl CostTable {
         let now = SystemTime::now();
         let mut touched: HashSet<Cell> = HashSet::new();
         for (cell, name, cores, mem_bytes) in obs {
-            let menu = self.cells.entry(cell.clone()).or_default();
-            if let Some(t) = menu.iter_mut().find(|t| t.name == name) {
-                t.last_observed = now;
+            if cores == 0 || mem_bytes == 0 {
+                tracing::warn!(
+                    cell = %cell_label(&cell),
+                    instance_type = %name,
+                    cores,
+                    mem_bytes,
+                    "zero-resource instance-type observation refused \
+                     (absence of parseable resources is not a 0-core fact)"
+                );
+                ::metrics::counter!(
+                    "rio_scheduler_sla_evidence_refused_total",
+                    "plane" => "observed_types",
+                    "reason" => "zero_resource"
+                )
+                .increment(1);
                 continue;
             }
-            menu.push(InstanceType {
+            let menu = self.cells.entry(cell.clone()).or_default();
+            let incoming = InstanceType {
                 name,
                 cores,
                 mem_bytes,
                 price_per_vcpu_hr: seed_price(cell.1),
                 last_observed: now,
-            });
+            };
+            match menu.iter_mut().find(|t| t.name == incoming.name) {
+                Some(t) => InstanceType::merge_newest_wins(t, incoming),
+                None => menu.push(incoming),
+            }
             touched.insert(cell);
         }
         for cell in touched {
@@ -2283,6 +2353,209 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2));
         t.observe_instance_types([(cell.clone(), "c7i.8xlarge".into(), 32, 64 << 30)]);
         assert!(t.menu(&cell)[0].last_observed > before);
+    }
+
+    // r[verify sched.sla.merge-law]
+    /// **W11-AU (bug_059, red-first)** — *a newer complete observation
+    /// always becomes the stored truth, at every write leg.* The leg
+    /// product: observe (cells A/C here), carry
+    /// ([`carry_catalog_merges_menus_newer_observation_wins`]), persist
+    /// ([`w11_au_persist_leg_newer_wins_older_refused`]). Cell A is the
+    /// heal edge (the R30 face, `sys.liveness.exit-edge` instance): a
+    /// stored zero-core row — minted by a pre-fix deploy and re-loaded
+    /// from PG — is OVERWRITTEN WHOLESALE by the next complete
+    /// observation. Pre-fix red: the dedup-hit arm kept the junk
+    /// (cores=0) while re-stamping it fresh, so it won every PG
+    /// monotonicity qual and stayed excluded from the `$/vCPU` fold
+    /// (`poll_spot_once` divides by menu cores and filters `vcpu >
+    /// 0.0`) with no deletion lane — immortal.
+    #[test]
+    fn w11_au_newer_observation_heals_and_wins_wholesale() {
+        // Cell A — the heal leg. Seed the junk row via the test menu
+        // setter (standing in for a pre-fix-era PG row: production
+        // mints of cores=0 are refused at the intake post-fix, so the
+        // only live population is historical rows).
+        let mut t = CostTable::default();
+        let cell: Cell = ("mid-ebs-x86".into(), CapacityType::Spot);
+        t.set_menu(
+            cell.clone(),
+            vec![InstanceType {
+                name: "c7i.8xlarge".into(),
+                cores: 0,
+                mem_bytes: 0,
+                price_per_vcpu_hr: 0.0,
+                last_observed: SystemTime::UNIX_EPOCH,
+            }],
+        );
+        t.observe_instance_types([(cell.clone(), "c7i.8xlarge".into(), 32, 64 << 30)]);
+        let healed = &t.menu(&cell)[0];
+        assert_eq!(
+            (healed.cores, healed.mem_bytes),
+            (32, 64 << 30),
+            "a later complete observation must heal the zero-core row \
+             (newest-wins WHOLESALE, not keep-first-with-fresh-timestamp)"
+        );
+        assert!(healed.last_observed > SystemTime::UNIX_EPOCH);
+
+        // Cell C — the general observe leg: a newer observation with
+        // changed resources replaces the WHOLE entry.
+        t.observe_instance_types([(cell.clone(), "c7i.8xlarge".into(), 48, 96 << 30)]);
+        let newest = &t.menu(&cell)[0];
+        assert_eq!(
+            (newest.cores, newest.mem_bytes),
+            (48, 96 << 30),
+            "newer observation wins wholesale on the observe leg"
+        );
+    }
+
+    // r[verify sched.sla.merge-law]
+    /// **W11-AU persist leg** — the PG upsert mirrors the in-crate
+    /// merge law: strictly newer `last_observed` wins WHOLESALE; an
+    /// older stamp is refused row-by-row (the monotonicity qual — the
+    /// deposed-writer fence doubles as the merge law's tie/older arm).
+    #[tokio::test]
+    async fn w11_au_persist_leg_newer_wins_older_refused() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        let cell: Cell = ("mid-ebs-x86".into(), CapacityType::Spot);
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let row = |cores: u32, mem: u64, t: SystemTime| InstanceType {
+            name: "c7i.8xlarge".into(),
+            cores,
+            mem_bytes: mem,
+            price_per_vcpu_hr: 0.0,
+            last_observed: t,
+        };
+
+        let mut a = CostTable::seeded("us-east-1", HwCostSource::Spot);
+        a.set_menu(cell.clone(), vec![row(32, 64 << 30, at(2_000))]);
+        a.persist_rows(&sdb).await.unwrap();
+
+        // Older stamp with different resources: refused (no rewind).
+        let mut stale = CostTable::seeded("us-east-1", HwCostSource::Spot);
+        stale.set_menu(cell.clone(), vec![row(16, 32 << 30, at(1_000))]);
+        stale.persist_rows(&sdb).await.unwrap();
+        let after_stale = CostTable::load(&sdb, "us-east-1", HwCostSource::Spot)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_stale.menu(&cell)[0].cores,
+            32,
+            "older observation must not rewind the persisted row"
+        );
+
+        // Newer stamp: wins wholesale (cores AND mem move together).
+        let mut newer = CostTable::seeded("us-east-1", HwCostSource::Spot);
+        newer.set_menu(cell.clone(), vec![row(48, 96 << 30, at(3_000))]);
+        newer.persist_rows(&sdb).await.unwrap();
+        let after_newer = CostTable::load(&sdb, "us-east-1", HwCostSource::Spot)
+            .await
+            .unwrap();
+        let got = &after_newer.menu(&cell)[0];
+        assert_eq!(
+            (got.cores, got.mem_bytes),
+            (48, 96 << 30),
+            "newer observation wins wholesale at the persist leg"
+        );
+    }
+
+    // r[verify sched.sla.merge-law]
+    /// **W11-AV (bug_059)** — *zero-resource decode ⇒ typed refusal
+    /// letter, never a row.* Absence of parseable kubelet resources is
+    /// not a 0-core fact: `parse_resources` defaults missing/malformed
+    /// cpu to 0 in the LiveNode fallback chain and nothing upstream
+    /// gates it, so the store's intake is the decode boundary that
+    /// must refuse. Population: {cores=0, mem=0} × {fresh cell,
+    /// existing menu}; the letter is the warn + the
+    /// `_evidence_refused_total{plane="observed_types",
+    /// reason="zero_resource"}` counter.
+    #[test]
+    fn w11_av_zero_resource_observation_refused_at_intake() {
+        use metrics_util::debugging::DebugValue;
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        let mut t = CostTable::default();
+        let cell: Cell = ("mid-ebs-x86".into(), CapacityType::Spot);
+        // Fresh cell: neither zero-resource shape mints a row or a cell.
+        t.observe_instance_types([
+            (cell.clone(), "weird.metal".into(), 0, 64 << 30),
+            (cell.clone(), "weird.metal".into(), 32, 0),
+        ]);
+        assert!(
+            t.menu(&cell).is_empty(),
+            "zero-resource observations must not mint rows"
+        );
+        // Existing menu: the refusal must also protect a populated cell
+        // (no junk overwrite of a good row, no junk sibling).
+        t.observe_instance_types([(cell.clone(), "c7i.8xlarge".into(), 32, 64 << 30)]);
+        t.observe_instance_types([
+            (cell.clone(), "c7i.8xlarge".into(), 0, 0),
+            (cell.clone(), "weird.metal".into(), 0, 0),
+        ]);
+        let menu = t.menu(&cell);
+        assert_eq!(menu.len(), 1, "no junk sibling row");
+        assert_eq!(menu[0].cores, 32, "no junk overwrite of the good row");
+        // The letter is counted (snapshot exactly once — it drains).
+        let refused: u64 = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, _, _, _)| k.key().name() == "rio_scheduler_sla_evidence_refused_total")
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(refused, 4, "each refused observation is a counted letter");
+    }
+
+    // r[verify sched.sla.merge-law]
+    /// **[GEN-SET] merge-callers census (the sched.sla.merge-law
+    /// belt).** Generator: scan THIS file's production source (test
+    /// module stripped) for menu-entry write idioms. Committed
+    /// expectation (the generator's output, re-derived on any red):
+    ///
+    /// - exactly TWO qualified `InstanceType::merge_newest_wins(`
+    ///   call sites — the observe leg and the carry leg;
+    /// - exactly ONE strict SQL mirror qual
+    ///   (`last_observed < EXCLUDED.last_observed`) — the persist leg;
+    /// - ZERO per-field hand-stamps (`.last_observed = `) and ZERO
+    ///   wholesale hand-merges (`*t = `) outside the law fn.
+    ///
+    /// A new write leg that hand-merges instead of routing through
+    /// the law shows up as a drifted count here — extend the law,
+    /// never bypass it.
+    #[test]
+    fn merge_law_caller_census() {
+        let src = include_str!("cost.rs");
+        let prod = src
+            .split_once("#[cfg(test)]\nmod tests")
+            .map_or(src, |(p, _)| p);
+        let count = |needle: &str| prod.matches(needle).count();
+        assert_eq!(
+            count("InstanceType::merge_newest_wins("),
+            2,
+            "menu write legs must route through the one merge law \
+             (observe + carry); a new leg extends the law"
+        );
+        assert_eq!(
+            count("sla_observed_instance_types.last_observed < EXCLUDED.last_observed"),
+            1,
+            "the persist leg's SQL mirror carries the strict qual \
+             (table-qualified — the law fn's doc cites the short form)"
+        );
+        assert_eq!(
+            count(".last_observed = "),
+            0,
+            "no per-field hand-stamp outside the merge law"
+        );
+        assert_eq!(
+            count("*t = "),
+            0,
+            "no wholesale hand-merge outside the merge law"
+        );
     }
 
     // r[verify sched.sla.cost-instance-type-feedback]

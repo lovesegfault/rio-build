@@ -4998,6 +4998,29 @@ name)`, the newer `last_observed` winning wholesale), so an observation
 folded before the edge reload survives it --- the menu plane needs no
 apply-window gate.
 
+#r("sched.sla.merge-law")[
+  The per-`(cell, instance_type)` menu merge law is newest-wins-WHOLESALE
+  and MUST have exactly one in-crate implementation consumed by every Rust
+  write leg (the controller-observation fold and the lease-edge carry),
+  with the PG upsert mirroring it under the same STRICT monotonicity qual:
+  a strictly newer `last_observed` replaces the whole entry, ties and older
+  observations keep the current holder. The observation intake MUST refuse
+  zero-resource observations as a typed, counted letter
+  (`_evidence_refused_total{plane="observed_types", reason="zero_resource"}`)
+  --- absence of parseable kubelet resources is not a 0-core fact.
+]
+
+A durable store with a hand-implemented merge law at $N$ write sites has
+$N$ laws: bug_059's observe leg kept-first-with-fresh-timestamp while the
+carry and persist legs honored newest-wins, so a producible 0-core first
+observation was immortal --- re-stamped fresh, winning every monotonicity
+qual, and permanently excluded from the `$/vCPU` fold (which divides by
+menu cores). The wholesale overwrite doubles as the store's liveness dual
+(the `sys.liveness.exit-edge` instance for this plane): historical junk
+rows are healed by the next complete observation rather than re-stamped,
+and the intake refusal stops new junk from minting --- the keep-first
+composition had no such exit edge.
+
 #r("sched.sla.forecast.one-layer+2")[
   `compute_spawn_intents` walks the Ready frontier AND a forecast frontier of
   `Queued` derivations whose every incomplete dependency is running with a
