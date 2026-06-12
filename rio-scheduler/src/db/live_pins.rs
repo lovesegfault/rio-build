@@ -24,7 +24,12 @@ use crate::state::DrvHash;
 ///   `Register` arm (round-9 WO-S1-1 — completed uploads survive
 ///   cancellation; tenants cold-resolved from the durable interest
 ///   rows) → [`BuiltLocally`](Self::BuiltLocally) (locally produced
-///   bytes — all interested tenants lawful, signed under Q2);
+///   bytes — all interested tenants lawful, signed under Q2). The
+///   FLOATING-CA face of the two worker-report lanes (no
+///   dispatch-minted expected set exists) instead carries
+///   [`BuiltLocallyEvidenced`](Self::BuiltLocallyEvidenced) — the
+///   bug_132 close: the Q2 widening stays, but only over paths with
+///   store-recorded production evidence;
 /// * the dispatch locally-present lane →
 ///   [`AllTenantProbe`](Self::AllTenantProbe) (every stamped tenant's
 ///   own visibility-gated probe answered present);
@@ -36,8 +41,26 @@ pub(crate) enum StampProvenance {
     /// Per-path wire-carried verified-tenant sets, keyed by
     /// sha256(store_path).
     WalkVerified(std::collections::HashMap<Vec<u8>, Vec<Uuid>>),
-    /// Locally produced bytes: worker-built or recovery-adopted.
+    /// Locally produced bytes: worker-built or recovery-adopted, on
+    /// the faces where the report's path VALUES are already bounded
+    /// by a scheduler-authoritative set (the bug_138 membership
+    /// retains, or rows re-derived from durable verified state).
     BuiltLocally,
+    /// bug_132 — locally produced bytes on the FLOATING-CA face,
+    /// where no dispatch-minted expected set bounds the report: the
+    /// lawful paths are the subset carrying store-recorded
+    /// production evidence (the ingest-lane registration stamp,
+    /// `r[store.registration.ingest-stamps]`) for the reporting
+    /// build's attributed cohort, consulted via
+    /// [`SchedulerDb::paths_with_production_evidence`] — the SAME
+    /// `path_tenants` rows the store's `own_built_projection` feeds
+    /// into the visibility verdict, so the gate cannot drift from
+    /// the I-217 flip it guards. The set carries sha256(path) keys;
+    /// `lawful_pairs` drops every non-member path (no upload, no
+    /// stamp). Constructed ONLY by the CA-face consult
+    /// (`ca_stamp_provenance` — census-pinned 1:1 with the consult
+    /// call sites).
+    BuiltLocallyEvidenced(std::collections::HashSet<Vec<u8>>),
     /// Every stamped tenant's own visibility-gated FindMissingPaths
     /// answered present.
     AllTenantProbe,
@@ -66,6 +89,19 @@ impl StampProvenance {
                     for t in attributed {
                         hashes.push(h.clone());
                         tids.push(*t);
+                    }
+                }
+                StampProvenance::BuiltLocallyEvidenced(evidenced) => {
+                    // bug_132: no upload, no stamp — a path without
+                    // store-recorded production evidence mints ZERO
+                    // ownership rows; evidenced paths widen to the
+                    // attributed cohort exactly like BuiltLocally
+                    // (the signed Q2 semantics, unchanged).
+                    if evidenced.contains(h.as_slice()) {
+                        for t in attributed {
+                            hashes.push(h.clone());
+                            tids.push(*t);
+                        }
                     }
                 }
                 StampProvenance::ProbedBy(probe_tenant) => {
@@ -208,6 +244,71 @@ impl SchedulerDb {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    /// bug_132 — the CA-face production-evidence consult: which of
+    /// `output_paths` carry store-recorded registration evidence for
+    /// at least one tenant of `tenant_ids` (the reporting build's
+    /// attributed cohort)? Returns the evidenced subset as
+    /// sha256(path) keys — the input to
+    /// [`StampProvenance::BuiltLocallyEvidenced`].
+    ///
+    /// The evidence base is the store's ingest-lane registration
+    /// stamp (`r[store.registration.ingest-stamps]`, round-9 Q1:
+    /// every byte-complete upload the store accepted is registered
+    /// evidence for the JWT/claims-verified uploader — and on the CA
+    /// face the store mints it only after `verify_ca_store_path`'s
+    /// content recompute passed). The query MIRRORS the store's
+    /// `own_built_projection` semantics (rio-store/src/visibility.rs,
+    /// CITE-ONLY: `bool_or(pt.tenant_id = $tid)` over exactly these
+    /// rows) with the singleton tenant widened to the cohort — ONE
+    /// source for "the store recorded this build's tenant produced
+    /// this path", so the gate cannot drift from the I-217 flip it
+    /// guards. Fixpoint soundness: every `path_tenants` row for a
+    /// tenant is minted either by that tenant's own byte-complete
+    /// upload (the ingest stamp) or by a stamp lane that itself
+    /// required the tenant's passing visibility verdict or bounded
+    /// path values (the Q2 witness census) — so consulting the rows
+    /// as production evidence never grants a tenant a path it could
+    /// not already read or had not produced.
+    ///
+    /// Granularity (recorded divergence from the (path, exec_id)
+    /// ideal): the store's durable upload trace is TENANT-keyed
+    /// (`AssignmentClaims` carries no exec id; ZERO DDL this wave),
+    /// so the binding is (path, exec's-claims-tenant-cohort). The
+    /// cross-tenant kill is intact — the attack cohort never
+    /// uploaded the victim path. The in-tenant residual (a tenant
+    /// re-claiming its OWN previously-registered path as a fresh CA
+    /// output) carries no confidentiality flip and is
+    /// integrity-equivalent to a compromised builder uploading
+    /// arbitrary CA content, which the threat model already prices.
+    // r[impl sched.trust.report-corroboration]
+    pub(crate) async fn paths_with_production_evidence(
+        &self,
+        output_paths: &[String],
+        tenant_ids: &[Uuid],
+    ) -> Result<std::collections::HashSet<Vec<u8>>, sqlx::Error> {
+        if output_paths.is_empty() || tenant_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        use sha2::Digest;
+        let hashes: Vec<Vec<u8>> = output_paths
+            .iter()
+            .map(|p| sha2::Sha256::digest(p.as_bytes()).to_vec())
+            .collect();
+        let rows: Vec<Vec<u8>> = sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT pt.store_path_hash
+            FROM path_tenants pt
+            JOIN UNNEST($1::bytea[]) AS k(h) ON pt.store_path_hash = k.h
+            WHERE pt.tenant_id = ANY($2)
+            "#,
+        )
+        .bind(&hashes)
+        .bind(tenant_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Round-9 WO-S1-3 — the IDENTITY half of the registration writer
@@ -860,8 +961,12 @@ mod registration_writer_census {
             // the bug_138 W10-M forged-report red's victim seeding
             // (tenant B's pre-existing rows are the I-217 baseline the
             // flip assertion reads; seeded through the censused writer
-            // on purpose, never a raw INSERT)
-            ("actor/tests/completion.rs".to_string(), 3),
+            // on purpose, never a raw INSERT) and the bug_132 W11-Q/
+            // W11-R seeds (the CA-face victim baseline + the honest
+            // flow's ingest-stamp stand-in — same precedent: the
+            // store's ingest lane is out of crate reach, so the
+            // censused writer plays it)
+            ("actor/tests/completion.rs".to_string(), 5),
         ]
         .into();
         assert_eq!(

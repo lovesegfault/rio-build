@@ -181,6 +181,7 @@
     "rio_scheduler_topdown_substitute_fail_total",
     "rio_scheduler_transition_rejected_total",
     "rio_scheduler_undeclared_built_output_total",
+    "rio_scheduler_unevidenced_ca_output_total",
     "rio_scheduler_unexpected_built_output_total",
     "rio_scheduler_unroutable_features_total",
     "rio_scheduler_wanted_outputs_gc_total",
@@ -1189,6 +1190,11 @@
         "name": "rio_scheduler_undeclared_built_output_total",
         "kind": "counter",
         "help": "Worker-supplied BuiltOutput.output_name not in derivation's output_names (dropped at handle_completion membership filter); alert if rate > 0"
+      },
+      {
+        "name": "rio_scheduler_unevidenced_ca_output_total",
+        "kind": "counter",
+        "help": "Floating-CA BuiltOutput.output_path refused for missing store-recorded production evidence (no upload, no stamp): the reporting build's attributed cohort has no ingest-lane registration for the path, so the tenant-visibility stamp and the realisation row are withheld on the admitted and late-register lanes (the membership law's CA face — the expected-set law cannot bound floating-CA paths, which are computed post-build); alert if rate > 0 — a forged report, or an upload whose best-effort ingest stamp was skipped (store-side warn names the path)"
       },
       {
         "name": "rio_scheduler_unexpected_built_output_total",

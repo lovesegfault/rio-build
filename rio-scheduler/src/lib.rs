@@ -408,6 +408,18 @@ pub fn describe_metrics() {
          report"
     );
     describe_counter!(
+        "rio_scheduler_unevidenced_ca_output_total",
+        "Floating-CA BuiltOutput.output_path refused for missing \
+         store-recorded production evidence (no upload, no stamp): the \
+         reporting build's attributed cohort has no ingest-lane registration \
+         for the path, so the tenant-visibility stamp and the realisation \
+         row are withheld on the admitted and late-register lanes (the \
+         membership law's CA face — the expected-set law cannot bound \
+         floating-CA paths, which are computed post-build); alert if \
+         rate > 0 — a forged report, or an upload whose best-effort ingest \
+         stamp was skipped (store-side warn names the path)"
+    );
+    describe_counter!(
         "rio_scheduler_pull_rejected_total",
         "Pull-mode unaries rejected (labels: rpc = \
          pull_assignment|report_outcome|list_materialization_jobs|\

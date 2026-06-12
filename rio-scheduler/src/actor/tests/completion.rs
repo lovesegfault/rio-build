@@ -5720,3 +5720,299 @@ async fn forged_output_path_never_reaches_path_tenants_on_any_lane() -> TestResu
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// bug_132: the CA-exempt face joins the membership law — no tenant-
+// visibility stamp without store-recorded production evidence (W11-Q)
+// ---------------------------------------------------------------------------
+
+/// W11-Q — proposition: NO path becomes tenant-visible without
+/// store-recorded production evidence, on the floating-CA face of
+/// EITHER stamp lane. Population: both stamp lanes (admitted success
+/// epilogue + late-report Register) × {resident, non-resident} — the
+/// adversarial cells; the resident-late cell rides the same Register
+/// applier as the evicted one (cold durable rows), driven here via
+/// the evicted face exactly like W10-M's lane 2.
+///
+/// The attack (the red this test was born failing on, pre-fix): the
+/// bug_138 membership law is De-Morgan-skipped for floating-CA
+/// (`!is_ca || is_fixed_output` gates `retain_expected_members` on
+/// BOTH lanes) on the censused claim that `verify_ca_store_path`
+/// covers that face "exactly as on upload" — but the attack uploads
+/// NOTHING (the victim path already exists; the store's content
+/// recompute only runs inside PutPath), so a tenant submitting a
+/// trivial `__contentAddressed` drv from a compromised builder stamps
+/// any existing victim path into `path_tenants` (BuiltLocally), and
+/// `own_built_projection` + `visibility_verdict(owned=true)` flips it
+/// Visible cross-tenant — the I-217 flip one face over.
+///
+/// Post-fix: the CA face consults the store-recorded registration
+/// evidence (the SAME `path_tenants` rows the visibility verdict
+/// reads — the ingest-lane stamp the store mints for the uploading
+/// claims-tenant, `r[store.registration.ingest-stamps]`): no
+/// evidence for the reporting build's attributed cohort ⇒ a typed,
+/// counted, non-poisoning refusal of the STAMP (the report's other
+/// effects are unaffected; the drv still completes).
+// r[verify sched.trust.report-corroboration]
+#[tokio::test]
+async fn ca_no_upload_report_never_flips_visibility_on_any_lane() -> TestResult {
+    use sha2::Digest;
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (db, handle, _task) = setup().await;
+    let sched_db = crate::db::SchedulerDb::new(db.pool.clone());
+
+    // Tenant B (the victim) owns two pre-existing paths — the store's
+    // ingest-lane registration stamped them at B's upload (seeded via
+    // the censused scheduler writer as the ingest-stamp stand-in, the
+    // W10-M precedent: never a raw INSERT).
+    let tenant_b = rio_store::test_helpers::seed_tenant(&db.pool, "ca-forge-victim").await;
+    let victim_adm = test_store_path("ca-forge-victim-secret-adm");
+    let victim_reg = test_store_path("ca-forge-victim-secret-reg");
+    let prov = crate::db::live_pins::StampProvenance::BuiltLocally;
+    sched_db
+        .upsert_path_tenants(
+            &[victim_adm.clone(), victim_reg.clone()],
+            &[tenant_b],
+            &prov,
+        )
+        .await?;
+
+    // The I-217 projection cell for tenant A over a path: EXACTLY the
+    // store's `own_built_projection` semantics (visibility.rs —
+    // CITE-ONLY surface), folded through the kernel's verdict.
+    let verdict_for_a = |path: String, pool: sqlx::PgPool| async move {
+        let hash = sha2::Sha256::digest(path.as_bytes()).to_vec();
+        let owned: Option<bool> = sqlx::query_scalar(
+            "SELECT bool_or(tenant_id = $2) FROM path_tenants WHERE store_path_hash = $1",
+        )
+        .bind(&hash)
+        .bind(DEFAULT_TEST_TENANT)
+        .fetch_one(&pool)
+        .await?;
+        let (owned, any_built) = (owned.unwrap_or(false), owned.is_some());
+        anyhow::Ok(rio_evidence_kernel::visibility::visibility_verdict(
+            owned, any_built, false,
+        ))
+    };
+
+    for p in [&victim_adm, &victim_reg] {
+        assert_eq!(
+            verdict_for_a(p.clone(), db.pool.clone()).await?,
+            rio_evidence_kernel::visibility::VisibilityVerdict::Hidden,
+            "baseline: tenant B's path must be Hidden from tenant A (I-217)"
+        );
+    }
+
+    // A floating-CA node: `is_content_addressed=true`,
+    // `is_fixed_output=false` — EXACTLY the claims-mint predicate the
+    // CA exemption keys on. No dispatch-minted expected set exists
+    // (floating-CA paths are computed post-build), which is the
+    // attack surface: pre-fix NOTHING bounds the reported path value.
+    let mk_ca_node = |tag: &str| {
+        let mut node = make_node(tag);
+        node.is_content_addressed = true;
+        node.ca_modular_hash = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(format!("ca-forge:{tag}").as_bytes()).to_vec()
+        };
+        node
+    };
+
+    // ── Lane 1: the ADMITTED success epilogue, CA face ─────────────
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![mk_ca_node("ca-forge-adm")],
+        vec![],
+        false,
+    )
+    .await?;
+    let _assignment = pull_attempt(&handle, "ca-forge-adm").await;
+    pull_complete_success(&handle, "ca-forge-adm", &victim_adm).await?;
+    barrier(&handle).await;
+
+    let adm_hash = sha2::Sha256::digest(victim_adm.as_bytes()).to_vec();
+    let stamped: Vec<Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM path_tenants WHERE store_path_hash = $1")
+            .bind(&adm_hash)
+            .fetch_all(&db.pool)
+            .await?;
+    assert_eq!(
+        stamped,
+        vec![tenant_b],
+        "left (pre-fix): the admitted epilogue's CA-exempt arm stamped \
+         the forged path for tenant A — path_tenants gained (B's path, \
+         A) with BuiltLocally provenance, no upload required / right: \
+         the production-evidence consult finds no store-recorded \
+         registration for A's cohort and withholds the stamp; only B's \
+         own row exists"
+    );
+    assert_eq!(
+        verdict_for_a(victim_adm.clone(), db.pool.clone()).await?,
+        rio_evidence_kernel::visibility::VisibilityVerdict::Hidden,
+        "left (pre-fix): a no-upload CA report FLIPPED tenant B's path \
+         Hidden → Visible for tenant A (the full I-217 consequence on \
+         the admitted lane's CA face) / right: Hidden holds"
+    );
+    // Non-poisoning: the refusal withholds the STAMP, never the
+    // completion — the report is recorded and the drv completes.
+    let info = expect_drv(&handle, "ca-forge-adm").await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Completed,
+        "the evidence refusal must not poison the completion itself"
+    );
+
+    // ── Lane 2: the late-report Register lane, CA face (evicted) ───
+    let build = Uuid::new_v4();
+    let _ev = merge_dag(
+        &handle,
+        build,
+        vec![mk_ca_node("ca-forge-reg")],
+        vec![],
+        false,
+    )
+    .await?;
+    let exec_id = open_pull_exec(&handle, "ca-forge-reg").await;
+    cancel_build(&handle, build).await?;
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: build })
+        .await?;
+    barrier(&handle).await;
+
+    let mut payload = pull_payload(rio_proto::types::BuildResult {
+        status: rio_proto::types::BuildResultStatus::Built.into(),
+        built_outputs: vec![rio_proto::types::BuiltOutput {
+            output_name: "out".into(),
+            output_path: victim_reg.clone(),
+            output_hash: vec![0u8; 32],
+        }],
+        ..Default::default()
+    });
+    payload.final_line_count = 3;
+    pull_report_exec(&handle, exec_id, "ca-forge-reg", payload).await?;
+    barrier(&handle).await;
+    // Settle before the ABSENCE assertion (post-fix nothing appears).
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let reg_hash = sha2::Sha256::digest(victim_reg.as_bytes()).to_vec();
+    let stamped: Vec<Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM path_tenants WHERE store_path_hash = $1")
+            .bind(&reg_hash)
+            .fetch_all(&db.pool)
+            .await?;
+    assert_eq!(
+        stamped,
+        vec![tenant_b],
+        "left (pre-fix): the Register lane's CA-exempt arm stamped the \
+         forged path for tenant A (the wave-9 weaker-checked replica, \
+         CA face) / right: the evidence consult against the durable \
+         cohort refuses it; only B's row exists"
+    );
+    assert_eq!(
+        verdict_for_a(victim_reg.clone(), db.pool.clone()).await?,
+        rio_evidence_kernel::visibility::VisibilityVerdict::Hidden,
+        "left (pre-fix): I-217 verdict FLIPPED for tenant A on the \
+         late lane's CA face / right: Hidden holds"
+    );
+
+    // The realisation plane takes the same bound: a worker-supplied
+    // (modular_hash → victim_path) mapping must NOT become durable
+    // truth — the CA-cutoff cascade later stamps skipped nodes' paths
+    // FROM `realisations` under plain BuiltLocally, so an unbounded
+    // insert here resurrects the flip one lane over.
+    let realisation_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM realisations WHERE output_path = $1")
+            .bind(&victim_adm)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        realisation_rows, 0,
+        "left (pre-fix): the forged CA report planted a realisation row \
+         mapping the attacker's modular hash to the victim path / right: \
+         the evidence bound refuses the mapping at the insert"
+    );
+
+    // The typed refusal letter: one per refused output per lane —
+    // counted on the CA-evidence counter, NOT the expected-set one
+    // (different law, different letter).
+    assert_eq!(
+        recorder.get("rio_scheduler_unevidenced_ca_output_total{}"),
+        2,
+        "the CA evidence refusal is a COUNTED letter (one per refused \
+         output: admitted lane + Register lane), not a silent drop"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_unexpected_built_output_total{}"),
+        0,
+        "the CA face refuses on the EVIDENCE law, not the expected-set \
+         law (the dispatch-minted set does not exist for floating-CA)"
+    );
+    Ok(())
+}
+
+/// W11-R — the honest CA flow is unbroken: upload-then-report stamps
+/// exactly as today. The builder uploaded its real CA output before
+/// reporting, so the store's ingest-lane registration stamp exists
+/// for the build's attributed tenant; the evidence consult passes and
+/// the completion stamp widens to all interested tenants under the
+/// signed Q2 BuiltLocally law (locally produced bytes — all
+/// interested tenants lawful).
+// r[verify sched.trust.report-corroboration]
+#[tokio::test]
+async fn ca_honest_upload_then_report_stamps_as_today() -> TestResult {
+    use sha2::Digest;
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (db, handle, _task) = setup().await;
+    let sched_db = crate::db::SchedulerDb::new(db.pool.clone());
+
+    let honest_out = test_store_path("ca-honest-out");
+
+    // The store's ingest-lane stamp: the builder's PutPath ran under
+    // the exec's AssignmentClaims (tenant = the attributed tenant),
+    // and the store stamped (path, claims-tenant) after the content
+    // recompute passed. Seeded via the censused writer as the
+    // ingest-stamp stand-in (the W10-M precedent).
+    let prov = crate::db::live_pins::StampProvenance::BuiltLocally;
+    sched_db
+        .upsert_path_tenants(
+            std::slice::from_ref(&honest_out),
+            &[DEFAULT_TEST_TENANT],
+            &prov,
+        )
+        .await?;
+
+    let mut node = make_node("ca-honest");
+    node.is_content_addressed = true;
+    node.ca_modular_hash = sha2::Sha256::digest(b"ca-honest").to_vec();
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    let _assignment = pull_attempt(&handle, "ca-honest").await;
+    pull_complete_success(&handle, "ca-honest", &honest_out).await?;
+    barrier(&handle).await;
+
+    let hash = sha2::Sha256::digest(honest_out.as_bytes()).to_vec();
+    let stamped: Vec<Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM path_tenants WHERE store_path_hash = $1")
+            .bind(&hash)
+            .fetch_all(&db.pool)
+            .await?;
+    assert_eq!(
+        stamped,
+        vec![DEFAULT_TEST_TENANT],
+        "honest CA flow: the evidence consult passes on the ingest \
+         stamp and the completion stamp lands for the interested \
+         tenant — the upload-then-report path is byte-identical to \
+         the pre-fix behavior"
+    );
+    let info = expect_drv(&handle, "ca-honest").await;
+    assert_eq!(info.status, DerivationStatus::Completed);
+    assert_eq!(
+        recorder.get("rio_scheduler_unevidenced_ca_output_total{}"),
+        0,
+        "the honest flow takes zero refusal letters"
+    );
+    Ok(())
+}

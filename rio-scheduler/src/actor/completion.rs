@@ -1433,6 +1433,29 @@ impl DagActor {
                     t
                 };
                 let paths: Vec<String> = outputs.iter().map(|o| o.output_path.clone()).collect();
+                // bug_132 — the late lane's CA face takes the SAME
+                // production-evidence gate as the admitted lane (the
+                // wave-9 Register face was the weaker-checked replica
+                // once already; the durable `is_ca AND NOT is_fo` is
+                // the same claims-mint predicate the skip above
+                // keyed). The consult also bounds the realisation
+                // insert below. Untenanted reports (no cohort) have
+                // no boundary to guard — the stamp is vacuous there.
+                let ca_evidence: Option<std::collections::HashSet<Vec<u8>>> =
+                    if *is_ca && !*is_fo && !tenants.is_empty() {
+                        Some(
+                            self.ca_production_evidence(
+                                executor_id,
+                                drv_key,
+                                "late-register",
+                                &paths,
+                                &tenants,
+                            )
+                            .await,
+                        )
+                    } else {
+                        None
+                    };
                 if tenants.is_empty() {
                     info!(
                         drv_hash = %canonical,
@@ -1448,13 +1471,16 @@ impl DagActor {
                         "registering late built outputs for cancelled/evicted \
                          derivation (completed uploads survive cancellation)"
                     );
-                    self.stamp_path_tenants(
-                        &canonical,
-                        &paths,
-                        &tenants,
-                        &crate::db::live_pins::StampProvenance::BuiltLocally,
-                    )
-                    .await;
+                    let stamp_provenance = match &ca_evidence {
+                        Some(evidenced) => {
+                            crate::db::live_pins::StampProvenance::BuiltLocallyEvidenced(
+                                evidenced.clone(),
+                            )
+                        }
+                        None => crate::db::live_pins::StampProvenance::BuiltLocally,
+                    };
+                    self.stamp_path_tenants(&canonical, &paths, &tenants, &stamp_provenance)
+                        .await;
                 }
                 // The identity half (round-9 WO-S1-3): the deriver
                 // linkage rides the COLD-resolved drv_path — the
@@ -1468,8 +1494,9 @@ impl DagActor {
                 // is_ca/needs_resolve gate reads the resident node;
                 // an EVICTED CA node's modular hash is not durably
                 // resolvable — the priced residual recorded in the
-                // owning commit).
-                self.ca_insert_realisations(&canonical, &outputs).await;
+                // owning commit), evidence-bounded on the CA face.
+                self.ca_insert_realisations(&canonical, &outputs, ca_evidence.as_ref())
+                    .await;
             }
             LateReportEffect::Nothing => {}
         }
@@ -1582,6 +1609,85 @@ impl DagActor {
             metrics::counter!("rio_scheduler_unexpected_built_output_total").increment(1);
             false
         });
+    }
+
+    /// bug_132 — the floating-CA face's production-evidence consult
+    /// (the membership law's CA face): the De-Morgan complement of
+    /// [`Self::retain_expected_members`]'s gate. Floating-CA paths
+    /// have no dispatch-minted expected set (computed post-build from
+    /// the NAR hash), so the path-VALUE bound is the store-recorded
+    /// registration evidence instead: a path is lawful iff the store
+    /// stamped it for the reporting build's attributed cohort at
+    /// upload ([`SchedulerDb::paths_with_production_evidence`] — the
+    /// SAME `path_tenants` rows the visibility verdict reads). **No
+    /// upload, no stamp:** the returned set bounds BOTH the
+    /// tenant-visibility stamp
+    /// ([`StampProvenance::BuiltLocallyEvidenced`]) and the
+    /// realisation insert ([`Self::ca_insert_realisations`] — without
+    /// the latter, a forged mapping would resurrect the flip one lane
+    /// over: the CA-cutoff cascade stamps skipped nodes' paths FROM
+    /// `realisations` under plain `BuiltLocally`).
+    ///
+    /// Each refused output is a TYPED letter, not a shadow drop:
+    /// counted (`rio_scheduler_unevidenced_ca_output_total`),
+    /// attributed (executor, drv, lane, path), non-poisoning (the
+    /// stamp is withheld; the report's other effects — completion,
+    /// retry accounting, events — are unaffected; the refusal
+    /// degrades exactly to the pre-registration posture: bytes
+    /// durable, tenant-invisible until a lawful re-stamp).
+    ///
+    /// A consult ERROR fails CLOSED (empty evidence set): unknowable
+    /// evidence must never grant cross-tenant visibility; the
+    /// degraded posture and heal lane are the same as a refused path.
+    ///
+    /// [`SchedulerDb::paths_with_production_evidence`]: crate::db::SchedulerDb::paths_with_production_evidence
+    /// [`StampProvenance::BuiltLocallyEvidenced`]: crate::db::live_pins::StampProvenance::BuiltLocallyEvidenced
+    // r[impl sched.trust.report-corroboration]
+    pub(super) async fn ca_production_evidence(
+        &self,
+        executor_id: &str,
+        drv_key: &str,
+        lane: &'static str,
+        output_paths: &[String],
+        tenant_ids: &[Uuid],
+    ) -> std::collections::HashSet<Vec<u8>> {
+        use sha2::Digest;
+        let evidenced = match self
+            .db
+            .paths_with_production_evidence(output_paths, tenant_ids)
+            .await
+        {
+            Ok(set) => set,
+            Err(e) => {
+                warn!(
+                    executor_id,
+                    drv_key,
+                    lane,
+                    error = %e,
+                    "production-evidence consult failed; failing CLOSED \
+                     (no stamp this report — the registration grace and \
+                     a lawful re-stamp cover the honest case)"
+                );
+                std::collections::HashSet::new()
+            }
+        };
+        for p in output_paths {
+            let h = sha2::Sha256::digest(p.as_bytes());
+            if !evidenced.contains(h.as_slice()) {
+                warn!(
+                    executor_id,
+                    drv_key,
+                    lane,
+                    output_path = %p,
+                    "refusing tenant-visibility stamp for a CA-reported \
+                     output without store-recorded production evidence \
+                     (no upload, no stamp; the report's other effects \
+                     are unaffected)"
+                );
+                metrics::counter!("rio_scheduler_unevidenced_ca_output_total").increment(1);
+            }
+        }
+        evidenced
     }
 
     /// The late-report classification context for `drv_key`: resident
@@ -2313,8 +2419,41 @@ impl DagActor {
                 .collect();
         }
 
+        // bug_132 — the floating-CA face's production-evidence gate
+        // (the membership law's CA face, the De-Morgan complement of
+        // the `retain_expected_members` arm above): consult ONCE here,
+        // BEFORE the CA bookkeeping, so the same evidenced set bounds
+        // the realisation insert AND the tenant-visibility stamp
+        // below. `None` = the bounded faces (IA/fixed-output: the
+        // expected-set retain already ran) or an untenanted report
+        // (no attributed cohort → no tenant boundary to guard and no
+        // stamp to gate — single-tenant/anon mode keeps today's
+        // behavior).
+        let ca_evidence: Option<std::collections::HashSet<Vec<u8>>> = match self.dag.node(drv_hash)
+        {
+            Some(state) if state.ca.is_ca && !state.is_fixed_output => {
+                let tenant_ids: Vec<Uuid> = state.attributed_tenants(&self.builds).collect();
+                if tenant_ids.is_empty() {
+                    None
+                } else {
+                    let paths = state.output_paths.clone();
+                    Some(
+                        self.ca_production_evidence(
+                            executor_id.as_str(),
+                            drv_hash.as_str(),
+                            "admitted",
+                            &paths,
+                            &tenant_ids,
+                        )
+                        .await,
+                    )
+                }
+            }
+            _ => None,
+        };
+
         let skipped_interested = self
-            .complete_ca_bookkeeping(drv_hash, &result.built_outputs)
+            .complete_ca_bookkeeping(drv_hash, &result.built_outputs, ca_evidence.as_ref())
             .await;
 
         // I-209: persist_status(.., Completed, ..) now also closes the
@@ -2376,12 +2515,18 @@ impl DagActor {
 
         // r[impl sched.gc.path-tenants-upsert]
         // Signed Q2: worker-built — locally produced bytes; all
-        // interested tenants lawful.
-        self.upsert_path_tenants_for(
-            drv_hash,
-            &crate::db::live_pins::StampProvenance::BuiltLocally,
-        )
-        .await;
+        // interested tenants lawful. bug_132: on the floating-CA face
+        // the lawful paths are additionally bounded by the evidence
+        // consult above (no upload, no stamp) — the typed witness
+        // carries the evidenced subset into the Q2 funnel.
+        let stamp_provenance = match &ca_evidence {
+            Some(evidenced) => {
+                crate::db::live_pins::StampProvenance::BuiltLocallyEvidenced(evidenced.clone())
+            }
+            None => crate::db::live_pins::StampProvenance::BuiltLocally,
+        };
+        self.upsert_path_tenants_for(drv_hash, &stamp_provenance)
+            .await;
 
         // Update ancestor priorities: this node is now terminal, so it
         // no longer contributes to its parents' max-child-priority.
@@ -2465,8 +2610,10 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         built_outputs: &[crate::domain::BuiltOutput],
+        ca_evidence: Option<&std::collections::HashSet<Vec<u8>>>,
     ) -> HashSet<Uuid> {
-        self.ca_insert_realisations(drv_hash, built_outputs).await;
+        self.ca_insert_realisations(drv_hash, built_outputs, ca_evidence)
+            .await;
         let prior_seeds = self.ca_cutoff_compare(drv_hash, built_outputs).await;
         let skipped_interested = self.ca_cutoff_cascade(drv_hash, &prior_seeds).await;
         self.ca_insert_realisation_deps(drv_hash, built_outputs)
@@ -2481,6 +2628,17 @@ impl DagActor {
         &self,
         drv_hash: &DrvHash,
         built_outputs: &[crate::domain::BuiltOutput],
+        // bug_132: `Some` on the floating-CA worker-report face — the
+        // store-evidenced sha256(path) set from
+        // [`Self::ca_production_evidence`]; a non-member output is
+        // SKIPPED (already counted/attributed by the consult's typed
+        // letter). Without this bound a forged (modular_hash →
+        // victim_path) mapping becomes durable truth the CA-cutoff
+        // cascade later stamps under plain BuiltLocally — the flip
+        // one lane over. `None` = the bounded faces (deferred-IA /
+        // fixed-output passed the expected-set retain; untenanted
+        // reports have no boundary to guard).
+        ca_evidence: Option<&std::collections::HashSet<Vec<u8>>>,
     ) {
         // Realisation insert: for a CA derivation, write
         // `(modular_hash, output_name) → (output_path, output_hash)`
@@ -2525,6 +2683,17 @@ impl DagActor {
                 "insert_realisation: CA build complete, writing realisations"
             );
             for output in built_outputs {
+                // bug_132: the evidence bound (see the parameter doc)
+                // — a worker-supplied mapping for a path the build's
+                // cohort never uploaded is refused here exactly as at
+                // the stamp; the consult already counted the letter.
+                if let Some(evidenced) = ca_evidence {
+                    use sha2::Digest;
+                    let h = sha2::Sha256::digest(output.output_path.as_bytes());
+                    if !evidenced.contains(h.as_slice()) {
+                        continue;
+                    }
+                }
                 let Ok(output_hash): Result<[u8; 32], _> = output.output_hash.as_slice().try_into()
                 else {
                     debug!(
