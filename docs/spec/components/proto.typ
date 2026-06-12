@@ -666,7 +666,11 @@ URI so pod-IP connections verify against the Service-name cert. The h2
 keepalive (30s PING + 10s PONG timeout) is NOT optional: `Change::Remove` drops
 the endpoint from selection but doesn't close existing TCP connections ---
 without keepalive, a SIGKILLed peer (no FIN) leaves in-flight bidi streams
-pinned for kernel-TCP-keepalive (\~2h). Named single-channel wrappers
+pinned for kernel-TCP-keepalive (\~2h). The same keepalive (including
+`keep_alive_while_idle`) applies on the daemon *single-channel* path: a
+2026-06-11 store rollout wedged an idle gateway replica on a half-open channel
+to the dead store pod (90s/300s client timeouts) because the eager
+single-channel connect had no keepalive. Named single-channel wrappers
 (`connect_store`, `connect_scheduler`, `connect_executor`, `connect_admin`,
 `connect_store_admin`) remain for tests, rio-cli, and ad-hoc callers.
 
