@@ -173,7 +173,7 @@ pub(crate) fn intent_headroom(i: &SpawnIntent) -> f64 {
 /// census[gen: nix/tests/helm/14-disk-ceiling.sh] — member 4 mirrors
 /// the constants by content (`OVERLAY_HEADROOM_PCT`/`LOG_BUDGET_BYTES`
 /// rows); the membership census is `disk_four_caller_census` below.
-// r[impl sched.sla.disk-reaches-ephemeral-storage+1]
+// r[impl sched.sla.disk-reaches-ephemeral-storage+2]
 pub(crate) fn pod_ephemeral_request(disk_bytes: u64, headroom: f64, fuse_cache_bytes: u64) -> u64 {
     ((disk_bytes as f64 * headroom) as u64)
         .saturating_add(fuse_cache_bytes)
@@ -3877,7 +3877,7 @@ mod tests {
 
     /// ADR-023: `build_job` stamps the scheduler-computed resources
     /// onto the executor container and the overlay emptyDir.
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
     #[test]
     fn build_job_with_intent_computed_resources() {
         const GI: u64 = 1 << 30;
@@ -4637,7 +4637,7 @@ mod disk_four_caller_census {
         src.split("#[cfg(test)]\nmod ").next().unwrap_or(src)
     }
 
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
     /// Membership: every production consumer of the ephemeral formula
     /// is one of the four censused members; an UNLISTED call site
     /// fails naming the file (closure tomorrow, not completeness
@@ -4681,7 +4681,7 @@ mod disk_four_caller_census {
         );
     }
 
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
     /// Member 4 (helm-lint): the content-bound mirror rows. The lint
     /// script is OUTSIDE the crate's build sandbox (no include_str!
     /// across the workspace under crate2nix's source filter), so the

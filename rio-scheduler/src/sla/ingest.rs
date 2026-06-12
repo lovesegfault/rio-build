@@ -358,7 +358,7 @@ pub fn refit(
         prov
     });
 
-    // r[impl sched.sla.disk-reaches-ephemeral-storage+1]
+    // r[impl sched.sla.disk-reaches-ephemeral-storage+2]
     // live_049 L2 as repaired by bug_070: disk is a c-INDEPENDENT
     // scalar (sched.sla.disk-scalar) — its evidence universe is EVERY peaked sample — quantifier: census(test: w11_bc_axis_arm_census) —
     // never an implicit property of which Vec an arm
@@ -729,7 +729,7 @@ pub(super) fn reassign_tier(
     Some(bounded[i].0.to_string())
 }
 
-// r[impl sched.sla.disk-reaches-ephemeral-storage+1]
+// r[impl sched.sla.disk-reaches-ephemeral-storage+2]
 /// live_049 L2: the disk p90 over EVERY row carrying a peak, unit
 /// weights — the probe-shaped fit's disk aggregate. Pre-fix the
 /// probe_only arm read ONLY the last row (a serial pname with five
@@ -760,8 +760,46 @@ fn aggregate_mem_p90(rows: &[BuildSampleRow], fit_w: &[f64]) -> MemBytes {
 // r[impl sched.sla.one-aggregator+2]
 fn aggregate_disk_p90(rows: &[BuildSampleRow], fit_w: &[f64]) -> Option<DiskBytes> {
     let (vals, ws) = axis_samples(rows, fit_w, |r| r.peak_disk_bytes.map(|b| b as f64));
-    (!vals.is_empty()).then(|| DiskBytes(weighted_quantile(&vals, &ws, 0.9) as u64))
+    // live060-c: the population gate + the shrink floor live INSIDE
+    // the one producer (R33 — the gate's home is the warm fit's sole
+    // mint, so EVERY consumer — the envelope's `fitted`, the
+    // `exceeds_ceiling` reject gates, the explore lanes — is
+    // witnessed by construction; gating in `DiskFitEnvelope::derive`
+    // instead would leave `exceeds_ceiling` consuming the un-gated
+    // quantity: the single-sample hazard has a reject face too).
+    // `vals` is completed_at-ascending (refit's input contract), so
+    // the last element IS the newest observed peak.
+    if vals.len() < DISK_WITNESS_MIN_PEAKS {
+        return None;
+    }
+    let p90 = weighted_quantile(&vals, &ws, 0.9);
+    let newest = vals.last().copied().unwrap_or(0.0);
+    Some(DiskBytes(p90.max(newest * DISK_SHRINK_HEADROOM) as u64))
 }
+
+/// live060-c: the disk fit's WITNESS GATE — the warm fit is consumed
+/// only at a witnessed population; below this many observed peaks the
+/// producer mints `None` and the `sla.defaultDisk` prior stands at
+/// every consumer (today's de-facto fleet behavior: the live builder
+/// fleet records NO peaks until prjquota provisioning lands, and the
+/// FIRST sparse observations after it must not retire the prior — a
+/// single unrepresentative small build would collapse the disk
+/// request fleet-wide). Mirrors the in-crate `n_eff >= 3` als-gate
+/// idiom. R17-VIOLABLE typed envelope constant with the
+/// measured-at-first-samples rider: re-derive against the first
+/// soak's real peak distribution once provisioning produces fleet
+/// observations (the owner-queue readback names this re-derivation).
+const DISK_WITNESS_MIN_PEAKS: usize = 3;
+
+/// live060-c: the SHRINK FLOOR's headroom over the newest observed
+/// peak — the witnessed fit never sits below recent observed reality
+/// plus this margin (`max(p90, newest_peak × 1.2)`).
+/// Prior-independent by design (the producer cannot see the
+/// envelope's prior): in the shrink direction it is the hysteresis
+/// law; in the growth direction it only ADDS headroom above the
+/// newest peak (conservative). R17-VIOLABLE, same
+/// measured-at-first-samples rider as the gate.
+const DISK_SHRINK_HEADROOM: f64 = 1.2;
 
 // r[impl sched.sla.one-weight-law]
 /// Shared population law for the per-axis aggregation chokepoints:
@@ -1930,7 +1968,7 @@ mod disk_axis_tests {
         );
     }
 
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
     /// **W11-BA (bug_070, red-first)** — *the disk quantile's evidence
     /// universe is every peaked sample regardless of axis mix.* One
     /// peaked c-axis row (5 GiB, a cache-warm rebuild) + nine peaked
@@ -1963,7 +2001,7 @@ mod disk_axis_tests {
         );
     }
 
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
     /// **W12-AH (bug_040, red-first)** — *the probe_only disk aggregate
     /// is pinned at its OWN arm, by a STRUCTURAL witness of that arm.*
     /// The predecessor test ("probe_only_disk_p90_aggregates_all_
@@ -1974,7 +2012,7 @@ mod disk_axis_tests {
     /// the line-176 `aggregate_disk_p90(rows, &[])` argument was
     /// pinned by NOTHING (a None/wrong-population rewrite passed the
     /// whole suite incl. the W11-BC read-count census), and the
-    /// r[verify] marker above attested coverage that did not exist —
+    /// verify marker above attested coverage that did not exist —
     /// vacuous from birth.
     ///
     /// This fixture has ZERO c-axis rows (the arm's ONLY entry
@@ -2014,13 +2052,15 @@ mod disk_axis_tests {
              at the :176 argument fails exactly here)",
         );
         assert!(
-            p90.0 >= 2 * GI as u64 && p90.0 <= 3 * GI as u64,
-            "p90 of the observed peaks (2,3,3 GiB), got {}",
+            p90.0 >= 2 * GI as u64 && p90.0 <= 4 * GI as u64,
+            "the witnessed fit over the observed peaks (2,3,3 GiB) — \
+             p90 = 3 GiB, shrink-floored at newest×1.2 = 3.6 GiB \
+             (live060-c); got {}",
             p90.0
         );
     }
 
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
     /// Cold rows (zero peaks anywhere) stay None — no evidence is no
     /// evidence; the envelope's prior arm (the chart default) is the
     /// designed cold-start posture (kill-isolation for W7-H: the
@@ -2033,6 +2073,97 @@ mod disk_axis_tests {
         ];
         let f = refit(&key(), &rows, None, &[], &HwTable::default(), None);
         assert_eq!(f.disk_p90, None);
+    }
+
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
+    /// **W12-LC (live060-c, red-first)** — *the warm disk fit is
+    /// consumed only at a witnessed population and never shrinks below
+    /// recent observed reality + headroom; population: the
+    /// sparse-first-observations regime that activation (live060-a's
+    /// prjquota provisioning) creates.* Pre-fix red (transcript in the
+    /// commit body): `DiskFitEnvelope::derive` retired the prior the
+    /// moment ANY warm p90 existed — the FIRST observation after
+    /// provisioning, a single unrepresentative 2 GiB build, collapsed
+    /// the 100 GiB prior to 2 GiB fleet-wide. Post-fix the prior
+    /// stands until DISK_WITNESS_MIN_PEAKS observations exist, and the
+    /// witnessed fit floors at newest×DISK_SHRINK_HEADROOM. The
+    /// constants are R17-violable with the measured-at-first-samples
+    /// rider (re-derived at the first soak; this test pins the
+    /// boundary AT them).
+    #[test]
+    fn w12_lc_warm_fit_consumed_only_at_witnessed_population() {
+        const GI: i64 = 1 << 30;
+        let prior = 100 * GI as u64;
+        let ceiling = 200 * GI as u64;
+        // The premature-shrink attack: one small build post-provisioning.
+        let one = vec![disk_row(None, 100.0, Some(2 * GI))];
+        let f = refit(&key(), &one, None, &[], &HwTable::default(), None);
+        assert_eq!(
+            f.disk_p90, None,
+            "below the witness gate the producer mints None (pre-fix: \
+             Some(2 GiB) — the prior retired on ONE observation)"
+        );
+        let req = super::super::fit::DiskFitEnvelope::fit(f.disk_p90, prior, ceiling);
+        assert_eq!(
+            req.bytes(),
+            prior,
+            "the request holds the prior below the gate"
+        );
+        // Two observations: still below the gate.
+        let two = vec![
+            disk_row(None, 100.0, Some(2 * GI)),
+            disk_row(None, 101.0, Some(2 * GI)),
+        ];
+        let f = refit(&key(), &two, None, &[], &HwTable::default(), None);
+        assert_eq!(f.disk_p90, None, "n=2 < DISK_WITNESS_MIN_PEAKS");
+        // At the gate: the fit consumes, and the shrink FLOORS at the
+        // newest peak × headroom (8 GiB build newest ⇒ floor 9.6 GiB
+        // even though p90 of [2,2,8] lands at 8).
+        let three = vec![
+            disk_row(None, 100.0, Some(2 * GI)),
+            disk_row(None, 101.0, Some(2 * GI)),
+            disk_row(None, 102.0, Some(8 * GI)),
+        ];
+        let f = refit(&key(), &three, None, &[], &HwTable::default(), None);
+        let fit = f.disk_p90.expect("witnessed at n=3");
+        let want = (8.0 * GI as f64 * 1.2) as u64;
+        assert_eq!(
+            fit.0, want,
+            "the shrink floors at newest×1.2 — no shrink below recent \
+             observed reality + headroom"
+        );
+        let req = super::super::fit::DiskFitEnvelope::fit(f.disk_p90, prior, ceiling);
+        assert_eq!(req.bytes(), want, "the envelope consumes the witnessed fit");
+    }
+
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
+    /// **W12-LC2 (live060-c; the steady-state direction preserved)** —
+    /// at a witnessed population of representative peaks the warm fit
+    /// governs exactly as the verified downward path intends: the
+    /// request lands in the observed band (p90 floored at newest×1.2),
+    /// FAR below the cold-start prior — the sizer learns down; the
+    /// gate does not re-pin the prior.
+    #[test]
+    fn w12_lc2_witnessed_population_governs_the_downward_path() {
+        const GI: i64 = 1 << 30;
+        let rows: Vec<BuildSampleRow> = (0..6)
+            .map(|i| disk_row(None, 100.0 + i as f64, Some(10 * GI)))
+            .collect();
+        let f = refit(&key(), &rows, None, &[], &HwTable::default(), None);
+        let fit = f.disk_p90.expect("witnessed");
+        assert_eq!(
+            fit.0,
+            (10.0 * GI as f64 * 1.2) as u64,
+            "representative peaks: p90 = newest ⇒ the floor IS the fit \
+             (observed reality + 20% headroom)"
+        );
+        let req =
+            super::super::fit::DiskFitEnvelope::fit(f.disk_p90, 100 * GI as u64, 200 * GI as u64);
+        assert!(
+            req.bytes() <= 12 * GI as u64 && req.bytes() >= 10 * GI as u64,
+            "the request lands in the observed band, not at the prior: {}",
+            req.bytes()
+        );
     }
 
     // r[verify sched.sla.one-weight-law]

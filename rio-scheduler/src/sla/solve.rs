@@ -1765,7 +1765,7 @@ mod tests {
         };
         assert_eq!(disk.bytes(), 200 << 30, "clamped to ceil.max_disk");
     }
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
     /// **W10-AC (bug_132, R24)** — *a warm small-p90 fit on the
     /// PRIMARY solve lane: pre-fix `solve_tier` emitted the raw
     /// 200 MiB observation as the ephemeral-storage request (a
@@ -1792,7 +1792,7 @@ mod tests {
         );
     }
 
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
     /// **W10-AD (bug_132)** — *lane equality at the `FittedParams`
     /// quantifier: one fit ⇒ byte-identical disk requests across
     /// every dispatch lane* — `solve_tier` (whichever arm the walk

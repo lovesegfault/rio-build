@@ -180,14 +180,33 @@ $S_(x x) = sum w_i (log c_i - overline(log c))^2$, and $overline(log c) := (sum 
   ),
 ) <fig-disk-probe>
 
-#r("sched.sla.disk-reaches-ephemeral-storage+1")
+#r("sched.sla.disk-reaches-ephemeral-storage+2")
 
 The disk input to `pod_ephemeral_request` MUST be a fitted, typed envelope —
-`floor <= fitted <= ceiling` (`DiskFitEnvelope`): the per-pname observed p90
-(aggregated over every peaked sample, probe-shaped fits included) retires the
+`floor <= fitted <= ceiling` (`DiskFitEnvelope`): the per-pname WITNESSED
+disk fit — the observed p90 aggregated over every peaked sample
+(probe-shaped fits included), consumed only at a witnessed population
+($n >= 3$ observed peaks) and shrink-floored at
+$max("p90", "newest peak" times 1.2)$ (live060-c: no shrink below recent
+observed reality plus headroom; both constants are R17-violable typed
+envelopes carrying the measured-at-first-samples rider) — retires the
 `sla.defaultDisk` cold-start prior, the floor is the probe's own scratch
-footprint, and the ceiling is `sla.maxDisk`; a flat default is a cold-start
-prior that observation MUST retire, never a steady state.
+footprint, and the ceiling is `sla.maxDisk`; below the population gate the
+prior stands, and a flat default is a cold-start prior that a WITNESSED
+population MUST retire, never a steady state.
+
+live060-c (the activation-safety amendment): the live builder fleet
+(EBS-only ext4, no prjquota) has NEVER produced a disk observation — every
+completion records a NULL peak — so the pre-fix "any observation retires
+the prior" law was vacuously safe and would have become a single-sample
+fleet-wide collapse hazard the moment provisioning (live060-a) landed: the
+first sparse, unrepresentative peaks would have retired the prior with no
+population evidence. The gate lives inside the ONE warm-fit producer
+(`aggregate_disk_p90`), so every consumer — the envelope's `fitted`, the
+`exceeds_ceiling` reject gates, the explore lanes — is witnessed by
+construction; the close lands INERT on the unprovisioned fleet
+($n = 0 < 3$) and the land-order pin (live060-c at wave position 5,
+live060-a at position 8) is safe in both directions.
 
 Enforcement (round-10, bug_132/R24 — commentary, not an additional
 requirement): the rule above is carried by construction. `DiskRequest` is a
@@ -198,9 +217,11 @@ type (`IntentDecision`, `SolveResult`, `AdmissibleSet`,
 the lane census (the wave-8 implementation wired the envelope into the
 explore lane only and left the solve lanes floor-less open-coded; the lane
 divergence is now unrepresentable). The Feasible reject gates keep reading
-the *raw* observation through one shared predicate (`exceeds_ceiling`) —
-`fit.D > maxDisk` is the genuine c-invariant "cannot fit" gate per
-@alg-estimate, and the clamped request by construction can never trip it;
+the *witnessed* observation through one shared predicate
+(`exceeds_ceiling`) — `fit.D > maxDisk` is the genuine c-invariant "cannot
+fit" gate per @alg-estimate, gated and floored by the producer like every
+other consumer (live060-c), and the clamped request by construction can
+never trip it;
 `sla explain`'s `disk-ceiling` label reads the same predicate, so the explain
 surface mirrors the solve gates by construction.
 

@@ -4,18 +4,25 @@ use super::types::{
     DiskBytes, DurationFit, FitDf, MemBytes, MemFit, RawCores, RefSeconds, RingNEff,
 };
 
-// r[impl sched.sla.disk-reaches-ephemeral-storage+1]
+// r[impl sched.sla.disk-reaches-ephemeral-storage+2]
 /// live_049 L2: the typed disk-axis envelope — `floor ≤ fitted ≤
 /// ceiling` BY CONSTRUCTION (the constructor clamps; R9's ordering
 /// law). The disk request gets the same lifecycle cores/mem have:
 ///
-/// - `fitted` = the per-pname observed p90 when ANY disk observation
-///   exists (the ingest aggregate — including probe-shaped fits, whose
-///   single-row read this WO widened to the full aggregate), else the
-///   cold-start PRIOR (`sla.defaultDisk`) that observation RETIRES —
-///   mirroring the mem axis's observed-or-probe-shape form, NOT a
-///   blend toward the chart constant (a 100 GiB blend would never
-///   shrink to a small fitted value);
+/// - `fitted` = the per-pname WITNESSED disk fit when the ingest
+///   producer minted one (live060-c: `aggregate_disk_p90` gates
+///   consumption at `DISK_WITNESS_MIN_PEAKS` observed peaks and
+///   shrink-floors at `newest_peak × DISK_SHRINK_HEADROOM` — a single
+///   unrepresentative build cannot retire the prior at activation;
+///   probe-shaped fits included, their single-row read widened to the
+///   full aggregate), else the cold-start PRIOR (`sla.defaultDisk`)
+///   that a WITNESSED population retires — mirroring the mem axis's
+///   observed-or-probe-shape form, NOT a blend toward the chart
+///   constant (a 100 GiB blend would never shrink to a small fitted
+///   value). On the live prjquota-less fleet every completion records
+///   a NULL disk peak (the live060-a precondition), so the prior
+///   stands fleet-wide until provisioning lands — the gate makes that
+///   activation safe, not different;
 /// - `floor` = the probe's own scratch footprint ([`Self::FLOOR_BYTES`]
 ///   — unpack + outputs of a bounded probe; mirrors the trivial-builder
 ///   `LOCAL_DISK_BYTES` lane in `solve.rs`, census-pinned);
@@ -73,9 +80,13 @@ impl DiskFitEnvelope {
     }
 
     /// The Feasible-lane REJECT predicate, single-sourced (bug_128's
-    /// sibling discipline applied here too): a raw observation above
-    /// the operator ceiling is the genuine "cannot fit" gate —
-    /// c-invariant, evaluated on the RAW p90 (never the clamped
+    /// sibling discipline applied here too): a witnessed observation
+    /// above the operator ceiling is the genuine "cannot fit" gate —
+    /// c-invariant, evaluated on the producer's WITNESSED fit
+    /// (live060-c: ≥ the raw p90 — the shrink floor only raises it —
+    /// and None below the population gate, so a single outlier build
+    /// can no longer reject a tier fleet-wide either: the
+    /// single-sample hazard has a reject face too; never the clamped
     /// request, which by construction can never exceed the ceiling).
     /// `solve_tier`'s tier gate, `evaluate_cell`'s per-cell gate, and
     /// `explain`'s `disk-ceiling` label all read THIS, so the explain
@@ -85,7 +96,7 @@ impl DiskFitEnvelope {
     }
 }
 
-// r[impl sched.sla.disk-reaches-ephemeral-storage+1]
+// r[impl sched.sla.disk-reaches-ephemeral-storage+2]
 /// bug_132 (R24 — laws by construction): the dispatch disk value,
 /// UNWRITABLE except through [`DiskFitEnvelope`] (the sole awaiter of
 /// the floor/ceiling law). The inner field is private and there is no
@@ -948,7 +959,7 @@ mod tests {
 mod disk_envelope_tests {
     use super::*;
 
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
     /// **R9 + W7-I** — the envelope ordering law `floor ≤ fitted ≤
     /// ceiling` over the ADVERSARIAL population (hand-oracle rows,
     /// never the impl's own min/max expression): zero observations,
