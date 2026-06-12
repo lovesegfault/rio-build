@@ -88,7 +88,7 @@ pub struct QaOpts {
     tenant_pool: usize,
     /// Parallel build count for --load.
     #[arg(long = "load-parallel", default_value_t = 8)]
-    load_parallel: u8,
+    load_parallel: u16,
     /// Build target for --load (passed to nix-bench flake). Must be a
     /// `packages.x86_64-linux` attribute of the bench flake (default
     /// `~/src/nix-bench/main`); `hello-shallow` is the smallest. The
@@ -281,19 +281,16 @@ pub async fn run(
                     scheduler::run(scenarios::ALL, &opts.only, opts.tenant_pool, kind, cfg).await?
                 }
                 Stage::Load => {
-                    super::stress::cmd_run(
-                        p,
-                        kind,
-                        cfg,
-                        &opts.load_target,
-                        opts.load_parallel,
+                    let load = super::stress::LoadOpts {
+                        target: opts.load_target.clone(),
+                        parallel: opts.load_parallel,
                         // base_port 0: each parallel tunnel binds its own
                         // ephemeral local port — no bind races.
-                        0,
-                        None,
-                        false,
-                    )
-                    .await?
+                        base_port: 0,
+                        bench_flake: None,
+                        watch: false,
+                    };
+                    super::stress::cmd_run(p, kind, cfg, &load).await?
                 }
                 Stage::Fault => {
                     use super::chaos;

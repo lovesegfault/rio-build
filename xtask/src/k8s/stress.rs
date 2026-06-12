@@ -4,6 +4,16 @@
 //! wrapped, so Ctrl-C or panic tears everything down (including
 //! session-manager-plugin grandchildren — I-158). Per-build logs land
 //! in `.stress-test/{ts}/build-{port}.log`.
+//!
+//! The bench target is resolved to a `.drv` path ONCE on the
+//! coordinator and every client builds `<drv>^*` directly. The
+//! 2026-06-11 in-cluster campaign showed that per-client cold flake
+//! eval (each client fetching nix-bench's ~8 flake inputs from
+//! github + cache.nixos.org) dominates above ~128 clients — the
+//! ladder measured internet egress, not rio. Clients never evaluate:
+//! the drv closure is already in the coordinator's local store from
+//! the pre-resolve, and `nix build --store …` uploads it to rio as
+//! part of the first build (the rest hit QueryValidPaths).
 
 use std::fs::{self, File};
 use std::path::PathBuf;
@@ -12,53 +22,92 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use console::style;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::provider::{Provider, ProviderKind};
 use super::shared::ProcessGuard;
 use crate::config::XtaskConfig;
 use crate::sh::repo_root;
 
-#[allow(clippy::too_many_arguments, clippy::print_stderr)]
+/// Knobs for the load stage, owned by `qa::QaOpts`.
+pub(super) struct LoadOpts {
+    /// `packages.x86_64-linux` attribute of the bench flake.
+    pub target: String,
+    pub parallel: u16,
+    /// 0 → each tunnel binds its own ephemeral local port.
+    pub base_port: u16,
+    /// Bench flake checkout; default `~/src/nix-bench/main`.
+    pub bench_flake: Option<PathBuf>,
+    /// Poll scheduler metrics every 30s while builds run.
+    pub watch: bool,
+}
+
 pub(super) async fn cmd_run(
     p: &dyn Provider,
     kind: ProviderKind,
     cfg: &XtaskConfig,
-    target: &str,
-    parallel: u8,
-    base_port: u16,
-    bench_flake: Option<PathBuf>,
-    watch: bool,
+    opts: &LoadOpts,
 ) -> Result<()> {
-    let bench = resolve_bench_flake(bench_flake)?;
+    let bench = resolve_bench_flake(opts.bench_flake.clone())?;
+    let installable = format!("{}#{}", bench.display(), opts.target);
+
+    // Pre-resolve the target to a .drv ONCE. This kills the cold-eval
+    // thundering herd (module doc) and also subsumes the I-161 warm-up:
+    // clients no longer evaluate at all, so the ssh-ng connection never
+    // sits idle during eval and the SSM gateway's 120s idle drop can't
+    // trigger. Hard error — every client depends on the resolved path.
+    info!("resolving {installable} to a .drv (cold eval can take ~2min)");
+    let drv = resolve_drv(&installable)?;
+    info!("target resolved: {drv}");
+
+    run_port_forward(p, kind, cfg, &drv, opts).await
+}
+
+/// Resolve `installable` to its `.drv` store path. Instantiates the
+/// derivation closure into the local store as a side effect — exactly
+/// what the port-forward clients need to build `<drv>^*` without
+/// evaluating.
+fn resolve_drv(installable: &str) -> Result<String> {
+    let out = std::process::Command::new("nix")
+        .args(["path-info", "--derivation", "--impure", installable])
+        .output()
+        .context("spawn nix path-info for drv pre-resolve")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "nix path-info --derivation {installable} failed: {}",
+        std::str::from_utf8(&out.stderr)
+            .unwrap_or("<non-utf8 stderr>")
+            .trim()
+    );
+    parse_drv_output(std::str::from_utf8(&out.stdout).context("nix path-info stdout not utf-8")?)
+}
+
+/// Pure parse of `nix path-info --derivation` stdout (one store path).
+fn parse_drv_output(stdout: &str) -> Result<String> {
+    let path = stdout.trim();
+    anyhow::ensure!(
+        path.starts_with("/nix/store/") && path.ends_with(".drv") && path.lines().count() == 1,
+        "expected a single .drv store path from nix path-info, got: {path:?}"
+    );
+    Ok(path.to_string())
+}
+
+#[allow(clippy::print_stderr)]
+async fn run_port_forward(
+    p: &dyn Provider,
+    kind: ProviderKind,
+    cfg: &XtaskConfig,
+    drv: &str,
+    opts: &LoadOpts,
+) -> Result<()> {
+    let parallel = opts.parallel;
     let key = crate::ssh::privkey_path(cfg)?;
-    let installable = format!("{}#{target}", bench.display());
+    let buildable = format!("{drv}^*");
 
     let ts = jiff::Timestamp::now().as_second();
     let dir = repo_root().join(".stress-test").join(ts.to_string());
     fs::create_dir_all(&dir)?;
     info!("logs: {}", dir.display());
-
-    // I-161: warm the eval cache so the build's ssh-ng connection
-    // doesn't sit idle during cold --impure eval. nix opens the
-    // connection on first remote query, then evaluates locally; over
-    // SSM port-forward, server-originated keepalive replies don't
-    // reliably round-trip when there's zero client→server data, so the
-    // gateway drops the session at 120s while nix is still evaluating.
-    // Pre-evaluating shrinks the connect→submit window to <5s.
-    info!("pre-evaluating {installable} (cold-eval can take ~2min)");
-    let pre_eval = std::process::Command::new("nix")
-        .args(["path-info", "--derivation", "--impure", &installable])
-        .output()
-        .context("spawn nix path-info for pre-eval")?;
-    if !pre_eval.status.success() {
-        warn!(
-            "pre-eval failed (continuing): {}",
-            std::str::from_utf8(&pre_eval.stderr)
-                .unwrap_or("<non-utf8 stderr>")
-                .trim()
-        );
-    }
 
     // SIGINT handler registered BEFORE spawning anything: default
     // disposition terminates abnormally (no Drop), so ProcessGuard's
@@ -82,10 +131,12 @@ pub(super) async fn cmd_run(
 
     for i in 0..parallel {
         // base_port 0 → each tunnel on its own ephemeral port.
-        let req = if base_port == 0 {
+        let req = if opts.base_port == 0 {
             0
         } else {
-            base_port + u16::from(i)
+            opts.base_port
+                .checked_add(i)
+                .context("base_port + parallel overflows u16")?
         };
         if req != 0 {
             super::shared::kill_port_listeners(req);
@@ -104,11 +155,11 @@ pub(super) async fn cmd_run(
 
         let child = tokio::process::Command::new("nix")
             .args(["build", "--store", &store, "--eval-store", "auto"])
-            .arg(&installable)
+            .arg(&buildable)
             // -L: stream build logs to stderr. Without it, redirected
-            // stderr stays empty until the first `copying path` line —
-            // ~2.5min of silence on cold-cache eval (I-051).
-            .args(["--impure", "--no-link", "-L", "--max-jobs", "0"])
+            // stderr stays empty until the first `copying path` line
+            // (I-051). No --impure: a .drv^* installable is pure.
+            .args(["--no-link", "-L", "--max-jobs", "0"])
             // I-149/I-161: see `shared::NIX_SSHOPTS_BASE`.
             .env("NIX_SSHOPTS", super::shared::NIX_SSHOPTS_BASE)
             .stdin(Stdio::null())
@@ -116,7 +167,7 @@ pub(super) async fn cmd_run(
             .stderr(log_err)
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("spawn nix build (installable: {installable})"))?;
+            .with_context(|| format!("spawn nix build (drv: {drv})"))?;
         info!(
             "build[{port}]: pid={} → {}",
             child.id().unwrap_or(0),
@@ -140,7 +191,7 @@ pub(super) async fn cmd_run(
         biased;
         _ = sigint.recv() => anyhow::bail!("interrupted"),
         r = async {
-            if watch {
+            if opts.watch {
                 let client = crate::k8s::client::client().await?;
                 let mut tick = tokio::time::interval(Duration::from_secs(30));
                 loop {
@@ -200,4 +251,33 @@ fn resolve_bench_flake(explicit: Option<PathBuf>) -> Result<PathBuf> {
         p.display()
     );
     Ok(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_drv_output_accepts_single_drv_path() {
+        let p = "/nix/store/abc123-small-mixed-4x.drv\n";
+        assert_eq!(
+            parse_drv_output(p).unwrap(),
+            "/nix/store/abc123-small-mixed-4x.drv"
+        );
+    }
+
+    #[test]
+    fn parse_drv_output_rejects_garbage() {
+        // Empty (eval produced nothing), an output path (forgot
+        // --derivation), and multi-line (multiple installables) would
+        // each silently break every client — fail at the coordinator.
+        for bad in [
+            "",
+            "/nix/store/abc123-small-mixed-4x",
+            "error: attribute missing",
+            "/nix/store/a.drv\n/nix/store/b.drv\n",
+        ] {
+            assert!(parse_drv_output(bad).is_err(), "accepted {bad:?}");
+        }
+    }
 }
