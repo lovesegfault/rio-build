@@ -1557,6 +1557,15 @@ impl DagActor {
                 }
             }
         }
+        // Terminal without dispatch: nodes seeded DependencyFailed (dep
+        // already poisoned at merge) were pinned in phase 5 — they were
+        // still `Created` then — and get no later terminal transition
+        // to release the merge-time drv pin
+        // (r[store.drv.gc-build-pinned]). Unpin here.
+        let depfailed: Vec<&str> = by_status[2].iter().map(DrvHash::as_str).collect();
+        if !depfailed.is_empty() {
+            self.unpin_best_effort_batch(&depfailed).await;
+        }
         first_dep_failed
     }
 

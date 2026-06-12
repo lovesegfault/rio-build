@@ -13,6 +13,7 @@
 pub(crate) mod actor_guards;
 mod digest_submit;
 mod executor_service;
+mod paginate;
 mod scheduler_service;
 
 use std::sync::Arc;
@@ -69,6 +70,12 @@ impl CallerTenant {
 /// Shared scheduler state passed to gRPC handlers.
 #[derive(Clone)]
 pub struct SchedulerGrpc {
+    /// Paginated SubmitBuild: pages staged by
+    /// `(tenant, submission_id)` until the final page assembles them.
+    /// `Arc` because `SchedulerGrpc` is cloned per connection and all
+    /// clones must see the same staging area; `std::sync::Mutex` —
+    /// every critical section is a short map operation, no awaits.
+    pub(super) staged_pages: Arc<std::sync::Mutex<paginate::StagedPages>>,
     // Fields `pub(super)` so the per-service submodules
     // (scheduler_service.rs, worker_service.rs) can read them
     // directly. Inherent-impl methods on `SchedulerGrpc` defined
@@ -153,6 +160,7 @@ impl SchedulerGrpc {
             hmac_key: None,
             service_verifier: None,
             off_actor_probe: OffActorProbe::default(),
+            staged_pages: Arc::default(),
         }
     }
 
@@ -168,6 +176,7 @@ impl SchedulerGrpc {
             hmac_key: None,
             service_verifier: None,
             off_actor_probe: OffActorProbe::default(),
+            staged_pages: Arc::default(),
         }
     }
 
@@ -202,6 +211,7 @@ impl SchedulerGrpc {
             hmac_key,
             service_verifier,
             off_actor_probe,
+            staged_pages: Arc::default(),
         }
     }
 

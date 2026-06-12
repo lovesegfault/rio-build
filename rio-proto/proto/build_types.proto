@@ -901,6 +901,22 @@ message SubmitBuildRequest {
   // resolves to UUID via tenants table — see r[sched.tenant.resolve].
   // Empty string = single-tenant mode.
   string tenant_name = 9;
+
+  // ADR-024 pagination: the 334B/node skeleton exceeds the 16MB
+  // SubmitBuild budget around ~50k nodes, so larger submissions arrive
+  // as N pages sharing a client-chosen submission_id (unique per
+  // submission attempt; scoped to the calling tenant). Pages
+  // 0..N-2 set final_page=false and carry nodes/edges only — the
+  // scheduler stages them keyed by (tenant, submission_id) and closes
+  // the response stream immediately with zero events (clean close ==
+  // staged ack). The final page (final_page=true) carries the
+  // remainder plus the build options; the scheduler assembles all
+  // pages in arrival order, applies the SAME validation and digest
+  // bulk-verify to the assembled set, and merges it as one build.
+  // Empty submission_id = unpaged submission (final_page ignored).
+  // Staged pages expire if no final page arrives (scheduler-side TTL).
+  string submission_id = 10;
+  bool final_page = 11;
 }
 
 message WatchBuildRequest {

@@ -91,7 +91,14 @@ async fn main() -> anyhow::Result<()> {
             let store = rio_proto::StoreServiceClient::wrap(store_ch.clone());
             let logs = rio_proto::LogServiceClient::wrap(store_ch.clone());
             let drv_blob = rio_proto::DrvBlobServiceClient::wrap(store_ch);
-            let (sched, guard) = rio_proto::client::connect(&cfg.scheduler).await?;
+            let (sched, guard) =
+                rio_proto::client::connect::<rio_proto::SchedulerServiceClient<_>>(&cfg.scheduler)
+                    .await?;
+            // SubmitBuild skeletons compress ~4x at zstd; the
+            // scheduler-first deploy order guarantees zstd support.
+            let sched = sched
+                .send_compressed(tonic::codec::CompressionEncoding::Zstd)
+                .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
             anyhow::Ok((store, logs, drv_blob, sched, guard))
         })
         .await
