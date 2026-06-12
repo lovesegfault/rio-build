@@ -33,13 +33,21 @@ const FORGED_HMAC_KEY: &[u8] = b"not-the-server-key-aaaaaaaaaaaaa";
 /// Builder assignment token signed with `key`. Sign with
 /// [`CHUNK_HMAC_KEY`] for a valid token, any other key for a forged one.
 fn assignment_token(key: &[u8]) -> String {
+    assignment_token_for(key, uuid::Uuid::nil(), vec![])
+}
+
+/// [`assignment_token`] with an explicit tenant claim (and output
+/// authorization) — what the tenant-scoped `HasChunks` tests need:
+/// the nil tenant has no `tenants` row, so presence for it is always
+/// empty.
+fn assignment_token_for(key: &[u8], tenant: uuid::Uuid, outputs: Vec<String>) -> String {
     rio_auth::hmac::HmacSigner::from_key(key.to_vec()).sign(&rio_auth::hmac::AssignmentClaims {
         executor_id: "test".into(),
         drv_hash: "00".repeat(32),
-        expected_outputs: vec![],
+        expected_outputs: outputs,
         is_ca: false,
         expiry_unix: 9_999_999_999,
-        tenant: Some(uuid::Uuid::nil().to_string()),
+        tenant: Some(tenant.to_string()),
         input_closure_digest: String::new(),
     })
 }
@@ -47,6 +55,29 @@ fn assignment_token(key: &[u8]) -> String {
 /// Wrap `msg` in a request carrying a valid builder assignment token.
 fn authed<T>(msg: T) -> tonic::Request<T> {
     with_token(msg, &assignment_token(CHUNK_HMAC_KEY))
+}
+
+/// [`authed`] with an explicit tenant claim.
+fn authed_as<T>(tenant: uuid::Uuid, msg: T) -> tonic::Request<T> {
+    with_token(msg, &assignment_token_for(CHUNK_HMAC_KEY, tenant, vec![]))
+}
+
+/// Bind `tenant` to `hashes` in `chunk_tenants` — the row the
+/// manifest-completion hook writes in production. For tests that seed
+/// `chunks` rows directly (no real upload to drive the hook).
+async fn bind_chunk_tenant(
+    pool: &sqlx::PgPool,
+    tenant: uuid::Uuid,
+    hashes: &[Vec<u8>],
+) -> TestResult {
+    for h in hashes {
+        sqlx::query("INSERT INTO chunk_tenants (blake3_hash, tenant_id) VALUES ($1, $2)")
+            .bind(h)
+            .bind(tenant)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Wrap `msg` in a request carrying `token` verbatim.
@@ -709,10 +740,13 @@ async fn seed_chunk_row(
 // r[verify store.chunk.has-chunks-durable]
 /// The I-201 regression: a refcount-1-but-not-durable chunk (the
 /// SIGKILL-mid-upload state) MUST read as absent, alongside the
-/// straightforward durable/deleted/absent cases.
+/// straightforward durable/deleted/absent cases. All four digests are
+/// tenant-bound (where a row exists), so the bits below isolate the
+/// durable predicate, not the tenancy gate.
 #[tokio::test]
 async fn test_has_chunks_durable_only_presence() -> TestResult {
     let mut s = ChunkSession::new().await?;
+    let tenant = rio_store::test_helpers::seed_tenant(&s.db.pool, "haschunks-durable").await;
 
     let durable = vec![0xD0u8; 32];
     let wal_window = vec![0xD1u8; 32]; // refcount 1, durable false
@@ -721,17 +755,26 @@ async fn test_has_chunks_durable_only_presence() -> TestResult {
     seed_chunk_row(&s.db.pool, &durable, true, false).await?;
     seed_chunk_row(&s.db.pool, &wal_window, false, false).await?;
     seed_chunk_row(&s.db.pool, &dead, true, true).await?;
+    bind_chunk_tenant(
+        &s.db.pool,
+        tenant,
+        &[durable.clone(), wal_window.clone(), dead.clone()],
+    )
+    .await?;
 
     let resp = s
         .chunk
-        .has_chunks(authed(HasChunksRequest {
-            digests: vec![
-                durable.clone(),
-                wal_window.clone(),
-                dead.clone(),
-                absent.clone(),
-            ],
-        }))
+        .has_chunks(authed_as(
+            tenant,
+            HasChunksRequest {
+                digests: vec![
+                    durable.clone(),
+                    wal_window.clone(),
+                    dead.clone(),
+                    absent.clone(),
+                ],
+            },
+        ))
         .await?
         .into_inner();
     // Only bit 0 (durable, not deleted) is set.
@@ -776,8 +819,10 @@ async fn test_has_chunks_validation() -> TestResult {
 #[tokio::test]
 async fn test_has_chunks_rejects_anonymous_and_forged_callers() -> TestResult {
     let mut s = ChunkSession::new().await?;
+    let tenant = rio_store::test_helpers::seed_tenant(&s.db.pool, "haschunks-auth").await;
     let durable = vec![0xD0u8; 32];
     seed_chunk_row(&s.db.pool, &durable, true, false).await?;
+    bind_chunk_tenant(&s.db.pool, tenant, std::slice::from_ref(&durable)).await?;
 
     // No token at all.
     let err = s
@@ -803,50 +848,149 @@ async fn test_has_chunks_rejects_anonymous_and_forged_callers() -> TestResult {
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 
     // Vacuity sentinel: the same digest IS reported present to an
-    // authenticated caller, so the rejections above are the auth gate
-    // firing, not the chunk being absent.
+    // authenticated caller of the binding tenant, so the rejections
+    // above are the auth gate firing, not the chunk being absent.
     let resp = s
         .chunk
-        .has_chunks(authed(HasChunksRequest {
-            digests: vec![durable],
-        }))
+        .has_chunks(authed_as(
+            tenant,
+            HasChunksRequest {
+                digests: vec![durable],
+            },
+        ))
         .await?
         .into_inner();
     assert_eq!(resp.bitmap, vec![0b0000_0001]);
     Ok(())
 }
 
+// r[verify store.chunk.has-chunks-tenant]
+/// Tenant scoping (ADR-024): a durable chunk bound to tenant A
+/// answers present to A and ABSENT to tenant B — and to a tenant-less
+/// legacy chunk (no junction rows at all, the pre-072 migration
+/// state), everyone gets absent.
+#[tokio::test]
+async fn test_has_chunks_tenant_scoped_presence() -> TestResult {
+    let mut s = ChunkSession::new().await?;
+    let tenant_a = rio_store::test_helpers::seed_tenant(&s.db.pool, "haschunks-a").await;
+    let tenant_b = rio_store::test_helpers::seed_tenant(&s.db.pool, "haschunks-b").await;
+
+    let bound = vec![0xA0u8; 32]; // durable, bound to A
+    let legacy = vec![0xA1u8; 32]; // durable, NO junction rows (pre-072)
+    seed_chunk_row(&s.db.pool, &bound, true, false).await?;
+    seed_chunk_row(&s.db.pool, &legacy, true, false).await?;
+    bind_chunk_tenant(&s.db.pool, tenant_a, std::slice::from_ref(&bound)).await?;
+
+    let digests = vec![bound.clone(), legacy.clone()];
+
+    // Tenant A: sees its own chunk; the legacy chunk is absent (the
+    // documented migration rule — re-upload re-binds).
+    let resp = s
+        .chunk
+        .has_chunks(authed_as(
+            tenant_a,
+            HasChunksRequest {
+                digests: digests.clone(),
+            },
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(resp.bitmap, vec![0b0000_0001], "A sees only its binding");
+
+    // Tenant B: nothing — A's upload is invisible.
+    let resp = s
+        .chunk
+        .has_chunks(authed_as(tenant_b, HasChunksRequest { digests }))
+        .await?
+        .into_inner();
+    assert_eq!(
+        resp.bitmap,
+        vec![0b0000_0000],
+        "tenant A's chunks must be invisible to tenant B's probe"
+    );
+    Ok(())
+}
+
 // r[verify store.chunk.durable-flag]
-/// End-to-end: a chunked PutPath flips its chunks to durable when the
-/// manifest completes, and HasChunks then reports them present. Before
-/// the upload completes nothing is durable (the WAL window).
+// r[verify store.chunk.has-chunks-tenant]
+/// End-to-end through the production write path: a chunked PutPath
+/// (HMAC identity carrying a tenant) flips its chunks to durable AND
+/// binds the uploader's `chunk_tenants` rows when the manifest
+/// completes; HasChunks then reports them present to that tenant and
+/// absent to another tenant.
 #[tokio::test]
 async fn test_has_chunks_after_putpath_complete() -> TestResult {
-    let mut s = ChunkSession::new().await?;
+    let db = TestDb::new(&MIGRATOR).await;
+    let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "haschunks-e2e").await;
+    let other = rio_store::test_helpers::seed_tenant(&db.pool, "haschunks-e2e-other").await;
+
+    // Store + chunk service on one router, both with the same HMAC
+    // verifier — the production builder identity shape.
+    let backend = mem_backend();
+    let cache = Arc::new(ChunkCache::new(
+        Arc::clone(&backend) as Arc<dyn ChunkBackend>
+    ));
+    let verifier = Arc::new(rio_auth::hmac::HmacVerifier::from_key(
+        CHUNK_HMAC_KEY.to_vec(),
+    ));
+    let store_service = StoreServiceImpl::new(db.pool.clone())
+        .with_chunk_cache(Arc::clone(&cache))
+        .with_hmac_verifier(Arc::clone(&verifier));
+    let chunk_service = ChunkServiceImpl::new(db.pool.clone(), Some(cache), Some(verifier));
+    let router = Server::builder()
+        .add_service(StoreServiceServer::new(store_service))
+        .add_service(ChunkServiceServer::new(chunk_service));
+    let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+    let _guard = scopeguard::guard(server, |h| h.abort());
+    let channel = Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut store = StoreServiceClient::new(channel.clone());
+    let mut chunk = ChunkServiceClient::new(channel);
 
     let (nar, info, _) = make_large_nar(60, 512 * 1024);
-    put_path(&mut s.store, info, nar).await?;
+    let path = info.store_path.to_string();
+    let token = assignment_token_for(CHUNK_HMAC_KEY, tenant, vec![path]);
+    assert!(put_path_with_token(&mut store, info, nar, &token).await?);
 
     let hashes: Vec<Vec<u8>> = sqlx::query_scalar("SELECT blake3_hash FROM chunks")
-        .fetch_all(&s.db.pool)
+        .fetch_all(&db.pool)
         .await?;
     assert!(hashes.len() >= 2, "512 KiB NAR must chunk into >1 chunk");
 
-    let resp = s
-        .chunk
-        .has_chunks(authed(HasChunksRequest {
-            digests: hashes.clone(),
-        }))
+    let resp = chunk
+        .has_chunks(authed_as(
+            tenant,
+            HasChunksRequest {
+                digests: hashes.clone(),
+            },
+        ))
         .await?
         .into_inner();
-    // Every chunk of the completed manifest is durable → every bit set.
+    // Every chunk of the completed manifest is durable AND bound to
+    // the uploading tenant → every bit set.
     for (i, h) in hashes.iter().enumerate() {
         assert_ne!(
             resp.bitmap[i / 8] & (1 << (i % 8)),
             0,
-            "chunk {} of a completed manifest must be durable",
+            "chunk {} of a completed manifest must be present to its uploader",
             hex::encode(h)
         );
     }
+
+    // The same digests are invisible to a different tenant.
+    let resp = chunk
+        .has_chunks(authed_as(
+            other,
+            HasChunksRequest {
+                digests: hashes.clone(),
+            },
+        ))
+        .await?
+        .into_inner();
+    assert!(
+        resp.bitmap.iter().all(|b| *b == 0),
+        "another tenant must not see the uploader's chunks"
+    );
     Ok(())
 }

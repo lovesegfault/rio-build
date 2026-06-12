@@ -658,11 +658,11 @@ pub(crate) async fn commit_chunked_output_in_conn(
     super::complete_manifest_in_conn(conn, info, claim, None, Some(parsed), tenant_id).await
 }
 
-/// `path_tenants` junction insert (`r[store.castore.tenant-scope+2]`).
+/// `path_tenants` junction insert (`r[store.castore.tenant-scope+3]`).
 /// Idempotent; a `None` tenant (dev mode, service-token caller) writes
 /// nothing. Runs for idempotent-skipped outputs too — the prior commit
 /// may belong to another tenant or predate tenancy.
-// r[impl store.castore.tenant-scope+2]
+// r[impl store.castore.tenant-scope+3]
 // r[impl store.put.tenant-junction]
 pub(crate) async fn insert_path_tenant_in_conn(
     conn: &mut sqlx::PgConnection,
@@ -683,29 +683,62 @@ pub(crate) async fn insert_path_tenant_in_conn(
     Ok(())
 }
 
-/// The PG-generated name of `path_tenants.tenant_id`'s foreign key to
-/// `tenants` (012_path_tenants.sql). PG includes it verbatim in the
-/// 23503 error message, which is how [`is_deleted_tenant_fk`]
-/// recognizes the violation without matching any other conflict.
-const PATH_TENANTS_TENANT_FK: &str = "path_tenants_tenant_id_fkey";
+/// The PG-generated names of the tenant-junction foreign keys to
+/// `tenants` (`path_tenants` from 012, `chunk_tenants` from 072). PG
+/// includes the constraint name verbatim in the 23503 error message,
+/// which is how [`is_deleted_tenant_fk`] recognizes the violation
+/// without matching any other conflict.
+const TENANT_JUNCTION_FKS: [&str; 2] = [
+    "path_tenants_tenant_id_fkey",
+    "chunk_tenants_tenant_id_fkey",
+];
 
-/// True iff `err` is the foreign-key violation raised by a
-/// `path_tenants` junction insert whose tenant row no longer exists —
-/// an assignment token minted for a tenant that was deleted while the
-/// build was in flight. [`MetadataError::Conflict`] is only produced
-/// for SQLSTATE 23503/23505 and carries PG's primary message, which
-/// for an FK violation names the constraint; requiring the full
-/// `violates foreign key constraint "<name>"` phrase means a unique
-/// violation (23505) or an FK violation on any other constraint never
-/// matches.
+/// True iff `err` is the foreign-key violation raised by a tenant
+/// junction insert (`path_tenants` or `chunk_tenants`) whose tenant
+/// row no longer exists — an assignment token minted for a tenant that
+/// was deleted while the build was in flight. [`MetadataError::
+/// Conflict`] is only produced for SQLSTATE 23503/23505 and carries
+/// PG's primary message, which for an FK violation names the
+/// constraint; requiring the full `violates foreign key constraint
+/// "<name>"` phrase means a unique violation (23505) or an FK
+/// violation on any other constraint never matches.
 pub(crate) fn is_deleted_tenant_fk(err: &MetadataError) -> bool {
     matches!(
         err,
         MetadataError::Conflict(msg)
-            if msg.contains(&format!(
-                "violates foreign key constraint \"{PATH_TENANTS_TENANT_FK}\""
+            if TENANT_JUNCTION_FKS.iter().any(|fk| msg.contains(
+                &format!("violates foreign key constraint \"{fk}\"")
             ))
     )
+}
+
+/// `chunk_tenants` junction insert (`r[store.chunk.has-chunks-tenant]`):
+/// record that `tenant_id` has seen every chunk in `chunk_hashes`.
+/// Idempotent (`ON CONFLICT DO NOTHING`); a `None` tenant (dev mode,
+/// service-token caller) writes nothing. `chunk_hashes` MUST be
+/// pre-sorted ascending (`r[store.chunk.lock-order]` — the one caller
+/// feeds `mark_manifest_chunks_durable`'s sorted output).
+pub(crate) async fn insert_chunk_tenants_in_conn(
+    conn: &mut sqlx::PgConnection,
+    chunk_hashes: &[Vec<u8>],
+    tenant_id: Option<uuid::Uuid>,
+) -> Result<()> {
+    let Some(tenant_id) = tenant_id else {
+        return Ok(());
+    };
+    if chunk_hashes.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO chunk_tenants (blake3_hash, tenant_id) \
+         SELECT h, $2 FROM UNNEST($1::bytea[]) AS u(h) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(chunk_hashes)
+    .bind(tenant_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 /// [`insert_path_tenant_in_conn`] for callers inside a multi-statement
@@ -720,11 +753,30 @@ pub(crate) fn is_deleted_tenant_fk(err: &MetadataError) -> bool {
 /// transaction usable after PG aborts the failed statement, so callers
 /// MUST be inside a transaction (every caller today is a
 /// manifest-completion transaction).
-// r[impl store.castore.tenant-scope+2]
+// r[impl store.castore.tenant-scope+3]
 // r[impl store.put.tenant-junction]
 pub(crate) async fn insert_path_tenant_skipping_deleted_in_tx(
     conn: &mut sqlx::PgConnection,
     store_path_hash: &[u8],
+    tenant_id: Option<uuid::Uuid>,
+) -> Result<()> {
+    insert_tenant_junctions_skipping_deleted_in_tx(conn, store_path_hash, &[], tenant_id).await
+}
+
+/// [`insert_path_tenant_skipping_deleted_in_tx`] plus the chunk-level
+/// visibility rows (`r[store.chunk.has-chunks-tenant]`): one savepoint
+/// covers BOTH junction inserts so a tenant deleted mid-build skips
+/// path and chunk visibility together — never a half-bound tenant.
+/// `chunk_hashes` is the manifest's deduped sorted chunk set (from
+/// `mark_manifest_chunks_durable`); empty for inline manifests and for
+/// the legacy callers that only bind the path junction.
+// r[impl store.castore.tenant-scope+3]
+// r[impl store.put.tenant-junction]
+// r[impl store.chunk.has-chunks-tenant]
+pub(crate) async fn insert_tenant_junctions_skipping_deleted_in_tx(
+    conn: &mut sqlx::PgConnection,
+    store_path_hash: &[u8],
+    chunk_hashes: &[Vec<u8>],
     tenant_id: Option<uuid::Uuid>,
 ) -> Result<()> {
     if tenant_id.is_none() {
@@ -733,12 +785,16 @@ pub(crate) async fn insert_path_tenant_skipping_deleted_in_tx(
     sqlx::query("SAVEPOINT path_tenant_junction")
         .execute(&mut *conn)
         .await?;
-    match insert_path_tenant_in_conn(conn, store_path_hash, tenant_id).await {
+    let inserts = async {
+        insert_path_tenant_in_conn(conn, store_path_hash, tenant_id).await?;
+        insert_chunk_tenants_in_conn(conn, chunk_hashes, tenant_id).await
+    };
+    match inserts.await {
         Err(e) if is_deleted_tenant_fk(&e) => {
             warn!(
                 store_path_hash = hex::encode(store_path_hash),
                 tenant_id = %tenant_id.expect("checked non-None above"),
-                "path_tenants junction skipped: tenant was deleted while the build was in flight"
+                "tenant junctions skipped: tenant was deleted while the build was in flight"
             );
             sqlx::query("ROLLBACK TO SAVEPOINT path_tenant_junction")
                 .execute(&mut *conn)

@@ -42,49 +42,69 @@ const DERIVER: &str = "/nix/store/ffffffffffffffffffffffffffffffff-agreement.drv
 /// wrapped in the production `StoreClients` bundle. The `TestDb` must
 /// stay alive for the duration of the test (its Drop deletes the DB).
 ///
-/// The real `ChunkService` is registered on the same server so the
-/// production `HasChunks` probe hits the real durable-presence query.
-/// That probe rejects anonymous callers, so the fixture also signs an
-/// HMAC assignment `token` the tests pass through `upload_all_outputs`;
-/// the `StoreService` carries no verifier (dev mode) and ignores it.
+/// Production auth posture (ADR-024): the HMAC verifier is armed on
+/// BOTH services and a tenant row is seeded. `HasChunks` presence is
+/// tenant-scoped — answered from the `chunk_tenants` junction rows that
+/// manifest completion writes for the uploader's resolved tenant — so a
+/// verifier-less store would resolve tenant `None` at completion, write
+/// no junction rows, and every later probe would miss (full re-upload,
+/// no dedup). Uploads therefore authenticate exactly like production:
+/// an assignment token carrying the tenant claim, minted per upload via
+/// [`RealStore::token_for`] because the armed `StoreService` also
+/// enforces the token's `expected_outputs` allowlist and the
+/// deriver ↔ `drv_hash` binding. Read-backs (`GetPath`) stay anonymous:
+/// callers without tenant context are unfiltered by design
+/// (`r[store.tenant.narinfo-filter]`).
 struct RealStore {
-    _db: TestDb,
+    db: TestDb,
+    /// Seeded tenant UUID (string form) every token binds; the
+    /// junction-row assertions query it directly.
+    tenant: String,
     clients: StoreClients,
     store_client: StoreServiceClient<Channel>,
     backend: Arc<rio_store::backend::MemoryChunkBackend>,
-    token: String,
+    signer: rio_auth::hmac::HmacSigner,
     _server: tokio::task::JoinHandle<()>,
+}
+
+impl RealStore {
+    /// Sign an assignment token the way the scheduler does at dispatch:
+    /// bound to the fixture tenant, `expected_outputs` = exactly the
+    /// paths the upload will claim (the armed store rejects any other),
+    /// `drv_hash` = [`DERIVER`]'s hash part (the deriver ↔ token
+    /// binding `validate_begin` enforces).
+    fn token_for(&self, expected_outputs: &[&str]) -> String {
+        self.signer.sign(&rio_auth::hmac::AssignmentClaims {
+            executor_id: "agreement-tests".into(),
+            drv_hash: StorePath::parse(DERIVER)
+                .expect("DERIVER is a valid store path")
+                .hash_part(),
+            expected_outputs: expected_outputs.iter().map(|p| p.to_string()).collect(),
+            is_ca: false,
+            expiry_unix: u64::MAX,
+            tenant: Some(self.tenant.clone()),
+            input_closure_digest: String::new(),
+        })
+    }
 }
 
 async fn real_store() -> anyhow::Result<RealStore> {
     let db = TestDb::new(&rio_store::MIGRATOR).await;
+    let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "agreement-tests")
+        .await
+        .to_string();
     let backend = rio_store::test_helpers::mem_backend();
     let cache = Arc::new(rio_store::cas::ChunkCache::new(
         Arc::clone(&backend) as Arc<dyn ChunkBackend>
     ));
-    let service = rio_store::grpc::StoreServiceImpl::new(db.pool.clone())
-        .with_chunk_cache(Arc::clone(&cache));
-
     let hmac_key = b"agreement-tests-hmac-key".to_vec();
-    let chunk_service = rio_store::grpc::ChunkServiceImpl::new(
-        db.pool.clone(),
-        Some(cache),
-        Some(Arc::new(rio_auth::hmac::HmacVerifier::from_key(
-            hmac_key.clone(),
-        ))),
-    );
-    // Claims content is irrelevant to HasChunks (only the identity's
-    // existence is checked) and to the verifier-less StoreService.
-    let token =
-        rio_auth::hmac::HmacSigner::from_key(hmac_key).sign(&rio_auth::hmac::AssignmentClaims {
-            executor_id: "agreement-tests".into(),
-            drv_hash: "00".repeat(32),
-            expected_outputs: vec![],
-            is_ca: false,
-            expiry_unix: u64::MAX,
-            tenant: None,
-            input_closure_digest: String::new(),
-        });
+    let verifier = Arc::new(rio_auth::hmac::HmacVerifier::from_key(hmac_key.clone()));
+    let service = rio_store::grpc::StoreServiceImpl::new(db.pool.clone())
+        .with_chunk_cache(Arc::clone(&cache))
+        .with_hmac_verifier(Arc::clone(&verifier));
+    let chunk_service =
+        rio_store::grpc::ChunkServiceImpl::new(db.pool.clone(), Some(cache), Some(verifier));
+    let signer = rio_auth::hmac::HmacSigner::from_key(hmac_key);
 
     let max = rio_common::grpc::max_message_size();
     let router = tonic::transport::Server::builder()
@@ -105,11 +125,12 @@ async fn real_store() -> anyhow::Result<RealStore> {
     let clients = StoreClients::from_channel(ch);
     let store_client = clients.store.clone();
     Ok(RealStore {
-        _db: db,
+        db,
+        tenant,
         clients,
         store_client,
         backend,
-        token,
+        signer,
         _server: server,
     })
 }
@@ -193,7 +214,8 @@ async fn agreement_upload_all_outputs_against_real_store() -> anyhow::Result<()>
     );
 
     let closure = vec![dep_path.clone()];
-    let results = upload_all_outputs(&s.clients, &upper_store, &s.token, DERIVER, &closure)
+    let token = s.token_for(&[&out_path, &lib_path]);
+    let results = upload_all_outputs(&s.clients, &upper_store, &token, DERIVER, &closure)
         .await
         .expect("real store accepts the production Begin + chunk stream");
 
@@ -241,7 +263,7 @@ async fn agreement_upload_all_outputs_against_real_store() -> anyhow::Result<()>
     // both outputs present and skips the upload; the store's recorded
     // nar_hash matches what we computed locally.
     let chunks_before = s.backend.len();
-    let again = upload_all_outputs(&s.clients, &upper_store, &s.token, DERIVER, &closure).await?;
+    let again = upload_all_outputs(&s.clients, &upper_store, &token, DERIVER, &closure).await?;
     assert_eq!(again.len(), 2);
     assert_eq!(
         s.backend.len(),
@@ -274,11 +296,13 @@ async fn agreement_durable_chunk_omitted_from_stream() -> anyhow::Result<()> {
 
     // Path A: uploaded normally (everything novel).
     let basename_a = format!("{HASH_OUT}-dedup-a");
+    let store_path_a = format!("/nix/store/{basename_a}");
     let root_a = upper_store.join(&basename_a);
     fs::create_dir(&root_a)?;
     fs::write(root_a.join("shared"), &shared)?;
     fs::write(root_a.join("only-a"), b"unique to a")?;
-    upload_all_outputs(&s.clients, &upper_store, &s.token, DERIVER, &[])
+    let token_a = s.token_for(&[&store_path_a]);
+    upload_all_outputs(&s.clients, &upper_store, &token_a, DERIVER, &[])
         .await
         .expect("first upload succeeds");
     let chunks_after_a = s.backend.len();
@@ -313,12 +337,13 @@ async fn agreement_durable_chunk_omitted_from_stream() -> anyhow::Result<()> {
         "B's novel must exclude the already-durable shared chunk"
     );
 
+    let token_b = s.token_for(&[&store_path_b]);
     let (created, _bytes) = send_chunked(
         &s.store_client,
         begin,
         plan,
         &upper_b,
-        "",
+        &token_b,
         chunked_stream_timeout(1),
     )
     .await
@@ -346,6 +371,11 @@ async fn agreement_durable_chunk_omitted_from_stream() -> anyhow::Result<()> {
 /// build-performing scenario went red because the deployed store had
 /// no `[chunk_backend]` configured: any deployment that receives
 /// builder uploads MUST configure one (ADR-022 §6).
+///
+/// Unlike [`real_store`], this fixture is deliberately verifier-less
+/// (dev mode): the missing-chunk-backend `FAILED_PRECONDITION` must
+/// surface for an unauthenticated dev-mode caller too, not only behind
+/// the production HMAC gate.
 #[tokio::test]
 async fn agreement_inline_only_store_rejects_chunked_upload() -> anyhow::Result<()> {
     let db = TestDb::new(&rio_store::MIGRATOR).await;
@@ -395,13 +425,16 @@ async fn agreement_inline_only_store_rejects_chunked_upload() -> anyhow::Result<
 }
 
 /// End-to-end dedup through the REAL `HasChunks` probe: a chunk made
-/// durable by an earlier upload is excluded from `novel` on a later
-/// upload of a different path — observed via the upload-bytes counter,
-/// which counts only the streamed novel chunk bytes — and the deduped
-/// output still round-trips byte-for-byte via `GetPath`. Unlike
-/// `agreement_durable_chunk_omitted_from_stream`, nothing is
-/// hand-assembled here: the probe itself (authenticated with the
-/// fixture's HMAC token) discovers the durable chunk.
+/// durable by an earlier upload of the SAME tenant is excluded from
+/// `novel` on a later upload of a different path — observed via the
+/// upload-bytes counter, which counts only the streamed novel chunk
+/// bytes — and the deduped output still round-trips byte-for-byte via
+/// `GetPath`. Unlike `agreement_durable_chunk_omitted_from_stream`,
+/// nothing is hand-assembled here: the probe itself (authenticated
+/// with a tenant-bound assignment token) discovers the durable chunk.
+/// Presence is tenant-scoped (ADR-024), so the test also asserts
+/// the mechanism directly: the first upload's completion must have
+/// written the `chunk_tenants` junction row the probe answers from.
 #[tokio::test]
 async fn agreement_real_probe_excludes_durable_chunks() -> anyhow::Result<()> {
     let s = real_store().await?;
@@ -413,13 +446,37 @@ async fn agreement_real_probe_excludes_durable_chunks() -> anyhow::Result<()> {
     let tmp_a = tempfile::tempdir()?;
     let upper_a = tmp_a.path().join("nix/store");
     fs::create_dir_all(&upper_a)?;
-    let root_a = upper_a.join(format!("{HASH_OUT}-probe-dedup-a"));
+    let basename_a = format!("{HASH_OUT}-probe-dedup-a");
+    let store_path_a = format!("/nix/store/{basename_a}");
+    let root_a = upper_a.join(&basename_a);
     fs::create_dir(&root_a)?;
     fs::write(root_a.join("shared"), &shared)?;
-    upload_all_outputs(&s.clients, &upper_a, &s.token, DERIVER, &[])
+    let token_a = s.token_for(&[&store_path_a]);
+    upload_all_outputs(&s.clients, &upper_a, &token_a, DERIVER, &[])
         .await
         .expect("first upload succeeds");
     let chunks_after_a = s.backend.len();
+
+    // The mechanism under test, asserted at the source: manifest
+    // completion bound the shared chunk to the uploader's tenant. This
+    // junction row is what the tenant-scoped HasChunks probe answers
+    // from — without it the probe would (correctly) answer absent and
+    // the second upload would re-stream the shared chunk.
+    let shared_digest = blake3::hash(&shared);
+    let junction_bound: bool = sqlx::query_scalar(
+        "SELECT EXISTS(\
+           SELECT 1 FROM chunk_tenants \
+            WHERE blake3_hash = $1 AND tenant_id = $2::uuid)",
+    )
+    .bind(shared_digest.as_bytes().as_slice())
+    .bind(&s.tenant)
+    .fetch_one(&s.db.pool)
+    .await?;
+    assert!(
+        junction_bound,
+        "manifest completion must write the chunk_tenants junction row \
+         for the uploader's tenant"
+    );
 
     // Second upload: path B = the shared chunk plus one novel chunk.
     let tmp_b = tempfile::tempdir()?;
@@ -434,10 +491,11 @@ async fn agreement_real_probe_excludes_durable_chunks() -> anyhow::Result<()> {
 
     // Recorder scoped to the second upload only, so the bytes counter
     // reflects exactly what that upload streamed.
+    let token_b = s.token_for(&[&store_path_b]);
     let recorder = rio_test_support::metrics::CountingRecorder::default();
     let result = {
         let _guard = metrics::set_default_local_recorder(&recorder);
-        upload_all_outputs(&s.clients, &upper_b, &s.token, DERIVER, &[]).await
+        upload_all_outputs(&s.clients, &upper_b, &token_b, DERIVER, &[]).await
     };
     result.expect("second upload succeeds");
 

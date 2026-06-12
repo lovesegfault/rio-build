@@ -722,6 +722,11 @@ in
   # r[verify builder.upload.chunked-manifest]
   # r[verify builder.upload.batch+3]
   # r[verify store.put.chunked-ca]
+  # r[verify store.chunk.has-chunks-tenant]
+  # (the cross-derivation dedup subtest proves the positive arm end to
+  # end: build A's completion binds the vmtest tenant's chunk_tenants
+  # rows, and build B's tenant-scoped HasChunks probe then dedups; the
+  # cross-tenant negative arm is unit-tested in chunk_service.rs)
   vm-put-path-chunked = put-path-chunked {
     inherit pkgs common;
     fixture = standalone {
