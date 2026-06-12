@@ -2642,15 +2642,28 @@ content. Object-before-manifest ordering means a crash between the two leaves
 an unreachable orphan (collected by the lifecycle rule), never a manifest row
 pointing at a missing object (which would read as data loss).
 
-#r("store.log.session-margin")[
+#r("store.log.session-margin+2")[
   The ingest-lease staleness bound MUST be derived at the consumer's
-  clock: `SESSION_STALE_AFTER` MUST exceed the worst committed-stamp
-  age of a healthy session that missed one heartbeat — two heartbeat
-  intervals plus the heartbeat RPC bound — by a strictly positive,
-  named slack term, certified by a compile-time assertion over the
-  shared constants; and a known-failed heartbeat MUST be retried once
-  immediately within its bound rather than waiting a full interval.
+  clock from the executable schedule's own constants:
+  `SESSION_STALE_AFTER` MUST exceed the schedule-derived worst
+  committed-stamp age of a healthy one-miss session by a strictly
+  positive, named slack term, certified by a compile-time assertion
+  whose inputs are the heartbeat loop's constants; a tick's body MUST
+  never displace its successor tick; a timed-out attempt is terminal
+  for its tick; and a known-failed attempt MUST be retried within the
+  tick-body envelope exactly when its failure returned inside the
+  fast-retry budget.
 ]
+
+The wave-11 retry is the cautionary instance: the same commit that
+added a second bounded attempt left the 2I+R certificate, its 40 s
+fixture, and the "longest possible in-flight await" prose pricing the
+one-attempt schedule it replaced --- the worst committed age reached
+the staleness bound exactly (zero margin) while every frozen witness
+passed, and the gap shipped as a self-reported comment residual. A
+compile-certified timing law derives from the loop it certifies: the
+formula's inputs are the constants the loop executes, so the next
+schedule change reddens the seal, not the fleet.
 
 Every consumer of the bound (the steal arm, `lookup_live`, the
 scheduler's gc conjunct) evaluates the age of the last COMMITTED
