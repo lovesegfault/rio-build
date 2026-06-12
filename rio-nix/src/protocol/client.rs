@@ -59,7 +59,10 @@ pub async fn read_stderr_message<R: AsyncRead + Unpin>(r: &mut R) -> Result<Stde
 
     match msg_type {
         STDERR_NEXT => {
-            let msg = wire::read_string(r).await?;
+            // CONTENT, not structure (live_059): the daemon relays a
+            // build's own log text verbatim — byte-transparent read,
+            // lossy only at display; the protocol never fails on it.
+            let msg = wire::read_content_string(r).await?;
             Ok(StderrMessage::Next(msg))
         }
         STDERR_READ => {
@@ -79,7 +82,10 @@ pub async fn read_stderr_message<R: AsyncRead + Unpin>(r: &mut R) -> Result<Stde
             let id = wire::read_u64(r).await?;
             let level = wire::read_u64(r).await?;
             let activity_type = wire::read_u64(r).await?;
-            let text = wire::read_string(r).await?;
+            // Activity narration is CONTENT (it can embed build/derivation
+            // text the daemon composes from build state): byte-transparent,
+            // same boundary as STDERR_NEXT (live_059 audit verdict).
+            let text = wire::read_content_string(r).await?;
             let fields = read_result_fields(r).await?;
             let parent_id = wire::read_u64(r).await?;
             Ok(StderrMessage::StartActivity {
@@ -165,7 +171,14 @@ async fn read_result_fields<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<Resul
         let field_type = wire::read_u64(r).await?;
         let field = match field_type {
             0 => ResultField::Int(wire::read_u64(r).await?),
-            1 => ResultField::String(wire::read_string(r).await?),
+            // ResultField strings are CONTENT: result_type 101/107
+            // (BuildLogLine/PostBuildLogLine) is how the modern daemon
+            // sends builder stderr — the PRIMARY log lane (the
+            // builder's stderr loop's own comment), so it carries the
+            // same byte-transparency as STDERR_NEXT (live_059 audit
+            // verdict: leaving it strict leaves the incident class
+            // armed on the main path).
+            1 => ResultField::String(wire::read_content_string(r).await?),
             _ => {
                 return Err(WireError::Io(std::io::Error::other(format!(
                     "unknown result field type: {field_type}"
@@ -574,6 +587,71 @@ mod tests {
         // Read LAST
         let msg = read_stderr_message(&mut reader).await?;
         assert!(matches!(msg, StderrMessage::Last));
+        Ok(())
+    }
+
+    /// W12-LA (live_059, red-first): log CONTENT must never fail the
+    /// protocol. A build's own stderr can lawfully contain non-UTF-8
+    /// bytes (compiler binary spew, locale bytes, a corrupted line);
+    /// the daemon relays them verbatim inside a well-formed frame.
+    /// Pre-fix RED (the carousel's trigger event): the STDERR_NEXT
+    /// arm's strict `read_string` returned `WireError::InvalidUtf8`
+    /// and the whole stderr loop died with a protocol error mid-build
+    /// — the conversation failed by content it merely transports.
+    /// Post-fix the line streams with lossy display and the
+    /// conversation completes; the byte is replaced, never fatal.
+    #[tokio::test]
+    async fn stderr_content_never_fails_the_protocol() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        // A well-formed STDERR_NEXT frame whose payload is not UTF-8
+        // (0xFF mid-line) — lawful frame, lawless text.
+        wire::write_u64(&mut buf, STDERR_NEXT).await?;
+        wire::write_bytes(&mut buf, b"warming up \xff cache").await?;
+        // The conversation continues normally after it.
+        wire::write_u64(&mut buf, STDERR_LAST).await?;
+
+        let mut reader = std::io::Cursor::new(buf);
+        let msg = read_stderr_message(&mut reader)
+            .await
+            .expect("a content byte must not fail the protocol (the live_059 trigger)");
+        match msg {
+            StderrMessage::Next(line) => {
+                assert!(
+                    line.contains("warming up"),
+                    "the line's decodable text survives: {line:?}"
+                );
+                assert!(
+                    line.contains('\u{FFFD}'),
+                    "the invalid byte is lossy-replaced at the display boundary"
+                );
+            }
+            other => panic!("expected Next, got {other:?}"),
+        }
+        // The loop keeps reading: the build conversation completes.
+        let msg = read_stderr_message(&mut reader).await?;
+        assert!(matches!(msg, StderrMessage::Last));
+        Ok(())
+    }
+
+    /// W12-LA2 (live_059's other face): STRUCTURAL strings stay
+    /// strict — the byte-transparency boundary is typed at the read
+    /// site, not a blanket laxity downgrade. A non-UTF-8 byte in a
+    /// length-prefixed field read through the strict `read_string`
+    /// (paths, opcode arguments, handshake fields) still refuses with
+    /// `InvalidUtf8`: a malformed PATH is a protocol violation, named
+    /// as such.
+    #[tokio::test]
+    async fn structural_strings_stay_strict() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        wire::write_bytes(&mut buf, b"/nix/store/\xffbad-path").await?;
+        let mut reader = std::io::Cursor::new(buf);
+        let err = wire::read_string(&mut reader)
+            .await
+            .expect_err("a structural string with invalid UTF-8 must refuse");
+        assert!(
+            matches!(err, crate::protocol::wire::WireError::InvalidUtf8(_)),
+            "the refusal names the violation: {err:?}"
+        );
         Ok(())
     }
 

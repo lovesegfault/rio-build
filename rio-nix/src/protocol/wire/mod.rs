@@ -105,10 +105,36 @@ pub async fn read_bytes<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Read a length-prefixed, padded UTF-8 string.
+/// Read a length-prefixed, padded UTF-8 string — STRICT: invalid
+/// UTF-8 refuses with [`WireError::InvalidUtf8`]. For the protocol's
+/// STRUCTURAL strings (store paths, opcode arguments, handshake
+/// fields), where malformed text IS a protocol violation. Log/text
+/// CONTENT the daemon merely transports goes through
+/// [`read_content_string`] instead — the boundary is typed at the
+/// read site so a future content field cannot silently inherit
+/// strictness (live_059).
 pub async fn read_string<R: AsyncRead + Unpin>(r: &mut R) -> Result<String> {
     let bytes = read_bytes(r).await?;
     Ok(String::from_utf8(bytes)?)
+}
+
+/// Read a length-prefixed, padded CONTENT string — BYTE-TRANSPARENT
+/// at the protocol layer (live_059): the frame is validated (length,
+/// padding), the payload is not. A build's own stderr lawfully
+/// carries non-UTF-8 bytes (compiler binary spew, locale bytes); one
+/// such byte must never fail the daemon conversation, so invalid
+/// sequences are lossy-replaced (U+FFFD) at this display boundary
+/// instead of erroring. For CONTENT channels only (log lines,
+/// activity narration, result text); structural strings stay on the
+/// strict [`read_string`].
+pub async fn read_content_string<R: AsyncRead + Unpin>(r: &mut R) -> Result<String> {
+    let bytes = read_bytes(r).await?;
+    // The U+FFFD production is DELIBERATE and documented here (the
+    // ban's reason exempts non-parse paths): this IS the display
+    // boundary the lossy conversion exists for — log content is never
+    // parsed, and failing the protocol on it is the live_059 outage.
+    #[allow(clippy::disallowed_methods)]
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Read a collection of UTF-8 strings (`u64(count)` followed by `count` strings).
