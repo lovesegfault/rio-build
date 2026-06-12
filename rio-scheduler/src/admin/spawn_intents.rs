@@ -68,9 +68,14 @@ pub(super) async fn get_spawn_intents(
         intents,
         queued_by_system: snap.queued_by_system,
         // Round-10 merged_bug_006: the forecast population class —
-        // full-population like its Ready sibling (A-2: the demand
-        // record is the demand truth; the window cuts `intents`,
-        // never the aggregates).
+        // window-proof like its Ready sibling (the limit cuts
+        // `intents`, never the aggregates) but NOT full-population
+        // (WO-S8-10/merged_bug_068: that wording restated cross-crate
+        // semantics falsely): per the `forecast_by_system` increment
+        // site in actor/snapshot.rs, forecast counts at the emit
+        // chokepoint — post tenant-budget admission, post the view
+        // filter — so it bounds exactly the forecast intents emitted
+        // to THIS view. Only `queued_by_system` is pre-filter.
         forecast_by_system: snap.forecast_by_system,
         ice_masked_cells: snap.ice_masked_cells,
         truncated,

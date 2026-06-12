@@ -72,6 +72,40 @@ import rust_strip
 LEXICON = ("ALL", "EVERY", "ANY", "NEVER", "ALWAYS", "ONLY", "SAME")
 HIT_RE = re.compile(r"\b(" + "|".join(LEXICON) + r")\b")
 
+# WO-S8-10 (merged_bug_068, R23′-as-extended): claim-semantics tiers
+# BEYOND the emphatic-uppercase word lexicon — the round-11 escapes
+# were universals the word-shape grammar cannot see, each tier named
+# after its escape:
+#   noun     — relational nouns smuggling a forall ("SUPERSET of
+#              every pool filter" rode an uppercase NON-lexicon noun
+#              with the quantifier in lowercase, merged_bug_068;
+#              'anywhere' bound a depth-1 walk, merged_bug_122).
+#              BOTH cases fire: the escapes were upper AND lower.
+#   modal    — lowercase modal universals ("can never", "cannot
+#              ever" — merged_bug_015's escape shape).
+#   compiler — compiler-semantics claims ("the compiler enforces",
+#              "deny-warnings error" — bug_127's folklore: a
+#              review-enforced convention narrated as machine-
+#              enforced).
+# Same binding grammar, same grandfather, one plant per tier
+# (W11-CD). The hit grammar is the named needles ONLY — growing a
+# tier is a review surface, not a regex creep.
+CLAIM_TIERS = (
+    (
+        "noun",
+        re.compile(
+            r"\b(?:superset|subset|invariant)\s+of\b|\bsuperset-of\b"
+            r"|\btotality\b|\banywhere\b",
+            re.I,
+        ),
+    ),
+    ("modal", re.compile(r"\bcan\s+never\b|\bcannot\s+ever\b", re.I)),
+    (
+        "compiler",
+        re.compile(r"\bthe\s+compiler\s+enforces\b|\bdeny-warnings\s+error\b", re.I),
+    ),
+)
+
 BIND_RE = re.compile(
     r"quantifier:\s*(?:census|non-normative)\(\S[^)]*\)"
     # The two bind idioms the round-10 wave landed BEFORE this lint
@@ -195,13 +229,22 @@ def scan(root: Path):
                 continue
             raw_lines = text.splitlines()
             for lineno, comment in sorted(tier_lines(tier, text).items()):
+                word = None
                 m = HIT_RE.search(comment)
-                if not m:
+                if m:
+                    word = m.group(1)
+                else:
+                    for tname, rx in CLAIM_TIERS:
+                        cm = rx.search(comment)
+                        if cm:
+                            word = f"{cm.group(0)} [{tname} tier]"
+                            break
+                if word is None:
                     continue
                 line = raw_lines[lineno - 1] if lineno <= len(raw_lines) else comment
                 if BIND_RE.search(line) or any(t in line for t in AUTO_BOUND):
                     continue
-                yield rel, lineno, m.group(1), line.strip()
+                yield rel, lineno, word, line.strip()
 
 
 def key(rel: str, line: str) -> str:
@@ -247,7 +290,8 @@ def run(root: Path, mint: bool) -> int:
         print(f"\n{len(out)} unbound quantified claim(s)/stale entr(ies).", file=sys.stderr)
         return 1
     print(
-        f"quantifier-lexicon: {len(LEXICON)} words x {len(TIERS)} tiers clean "
+        f"quantifier-lexicon: {len(LEXICON)} words + {len(CLAIM_TIERS)} claim "
+        f"tiers x {len(TIERS)} file tiers clean "
         f"({len(grandfathered)} grandfathered, burn-down)"
     )
     return 0
@@ -292,9 +336,47 @@ def selftest() -> str | None:
                 if list(scan(root)):
                     return f"plant ({word},{tier}): non-normative( demote did not clear the hit"
             p.unlink()
-        # Auto-bound arm: an enforcement-grammar line never hits.
+        # W11-CD (WO-S8-10): one plant per CLAIM tier — each the named
+        # escape from this corpus (068's relational noun with the
+        # quantifier in lowercase; 015's lowercase modal; 127's
+        # compiler claim). Unbound hits; census( bind clears;
+        # non-normative( demote clears.
         rel, template = specimens["rust"]
         p = root / rel
+        tier_plants = {
+            "noun": "// a SUPERSET of every pool filter, so over-counting under-reaps",
+            "modal": "// a concurrent check can never observe the torn state",
+            "compiler": "// the compiler enforces the consume-once law here",
+        }
+        for tname, claim in tier_plants.items():
+            p.write_text(f"{claim}\nfn x() {{}}\n", encoding="utf-8")
+            got = list(scan(root))
+            if len(got) != 1 or f"[{tname} tier]" not in got[0][2]:
+                return f"claim-tier plant ({tname}): expected 1 unbound hit, got {got}"
+            p.write_text(
+                f"{claim}  quantifier: census(planted-artifact)\nfn x() {{}}\n",
+                encoding="utf-8",
+            )
+            if list(scan(root)):
+                return f"claim-tier plant ({tname}): census( bind did not clear"
+            p.write_text(
+                f"{claim}  quantifier: non-normative(narrative)\nfn x() {{}}\n",
+                encoding="utf-8",
+            )
+            if list(scan(root)):
+                return f"claim-tier plant ({tname}): non-normative( demote did not clear"
+        # … and the claim tiers fire in EVERY file tier (the product
+        # discipline): the helm/script/typst specimens carry the noun.
+        for ftier in ("helm", "script", "typst"):
+            frel, ftemplate = specimens[ftier]
+            fp = root / frel
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(ftemplate.format("a superset of every pool filter:"), encoding="utf-8")
+            got = list(scan(root))
+            if len(got) != 1 or "[noun tier]" not in got[0][2]:
+                return f"claim-tier file-tier plant ({ftier}): {got}"
+            fp.unlink()
+        # Auto-bound arm: an enforcement-grammar line never hits.
         p.write_text("// EVERY member censused — census[gen: x.txt]\nfn x() {}\n", encoding="utf-8")
         if list(scan(root)):
             return "auto-bound census[ line still hit"

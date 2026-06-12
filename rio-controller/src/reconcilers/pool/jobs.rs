@@ -1427,7 +1427,11 @@ pub(crate) fn aggregate_upper_for(
 ///   TYPED per-population aggregates (Ready + forecast — over-counting
 ///   under-reaps, the safe direction; merged_bug_006's close: a
 ///   forecast-backed Pending Job is counted by its own class, never
-///   assumed inside a Ready-only aggregate).
+///   assumed inside a Ready-only aggregate). Class semantics per the
+///   producer's increment sites (WO-S8-10: cited, never restated —
+///   Ready/`queued_by_system` is pre-kind/feature-filter; forecast/
+///   `forecast_by_system` is post-budget post-view-filter, bounding
+///   exactly the forecast Jobs this view can hold Pending).
 /// - **Totality/continuity lane**: consumers whose contracts span
 ///   pages (re-ack, evidence-expiry) derive from controller-local
 ///   complete inventories or suspend while `Incomplete` — the third
@@ -1457,11 +1461,21 @@ impl PoolDemandView {
     ) -> Self {
         // B3 truncation honesty (the proto's own consumer law): a
         // truncated page understates demand, so absence-inference
-        // must come from the per-class aggregates instead. Each
-        // aggregate is by SYSTEM, before the kind/feature filters — a
-        // SUPERSET of this pool's demand on its systems, which is
-        // exactly the safe direction for a reap bound (over-counting
-        // under-reaps; the law lives in `reap_queued_known`).
+        // must come from the per-class aggregates instead. Per-class
+        // semantics are the PRODUCER's, cited not restated (WO-S8-10
+        // /merged_bug_068 — the producer itself warns against prose
+        // superset claims across the crate boundary): per the
+        // `queued_by_system` increment site (rio-scheduler
+        // actor/snapshot.rs), Ready is counted pre-kind/feature-
+        // filter — a true cross-filter upper bound on this pool's
+        // Ready demand; per the `forecast_by_system` increment site
+        // (the merged_bug_006 comment at the emit chokepoint),
+        // forecast is counted POST tenant-budget admission and POST
+        // the view filter — it upper-bounds exactly the forecast
+        // intents EMITTED to this view (a budget-dropped or filtered
+        // intent spawns no Job for this view). Both directions stay
+        // safe for the reap bound: over-counting under-reaps (the
+        // law lives in `reap_queued_known`).
         let ready_upper = aggregate_upper_for(systems, &resp.queued_by_system);
         let forecast_upper = aggregate_upper_for(systems, &resp.forecast_by_system);
         Self {
@@ -1739,9 +1753,15 @@ impl WantMap {
 /// — exactly by the post-filter page count on a complete view,
 /// conservatively by the SUM OF THE TYPED POPULATION CLASSES (Ready +
 /// forecast aggregates) on a truncated one (B3 truncation honesty:
-/// each aggregate is the uncapped demand truth for its class and a
-/// SUPERSET of every pool filter, so over-counting under-reaps — the
-/// safe direction for absence inference). merged_bug_006: the
+/// each aggregate is the uncapped demand truth FOR ITS CLASS, per the
+/// producer's increment sites — Ready pre-kind/feature-filter, a
+/// cross-filter upper bound; forecast post-budget post-view-filter,
+/// bounding exactly the forecast Jobs this view can hold Pending
+/// (WO-S8-10/merged_bug_068: the prior cross-filter-universal
+/// wording was FALSE for the forecast class and is cited to the
+/// producer now, never restated) — so over-counting under-reaps,
+/// the safe direction for absence inference, holds per-class in
+/// both directions). merged_bug_006: the
 /// single-aggregate form summed a Ready-only aggregate against a
 /// Ready+forecast page, so a forecast-backed Pending Job off-page was
 /// counted by NEITHER term and reaped while still wanted — and its

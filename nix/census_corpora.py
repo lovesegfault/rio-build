@@ -93,7 +93,7 @@ REGISTRY = [
     ("string-interior-spaces", "nix/string_interior_spaces.py", r"planted red", {"scope", "fold-site"}, {"alias"}, None),
     ("streaming-open-ban", "nix/streaming_open_ban.py", r"selftest", {"scope"}, {"alias"}, None),
     ("quint-policy", "nix/quint_policy.py", r"planted RED per rule arm|selftest", {"scope", "fold-site"}, set(), r"def conj_expansion"),
-    ("quantifier-lexicon", "nix/quantifier_lexicon.py", r"self-?test", {"tier", "scope"}, set(), r"LEXICON = \("),
+    ("quantifier-lexicon", "nix/quantifier_lexicon.py", r"self-?test", {"tier", "scope"}, set(), r"LEXICON = \(|CLAIM_TIERS = \("),
     ("fixture-provenance", "nix/fixture_provenance.py", r"selftest|planted red", {"scope", "label-key"}, set(), r"LANES = \{"),
     # in-crate generators (EMBEDDED corpora per the registration-census
     # precedent; the pattern pins the embed form, not a dev-tree path).

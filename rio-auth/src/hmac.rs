@@ -1541,11 +1541,10 @@ mod tests {
     /// below): exactly TWO production sites — THE sign body (clamped)
     /// and THE verify body (mints nothing) — plus three DISCLOSED
     /// test fixtures that hand-roll tampered/legacy tokens to drive
-    /// verify's rejects. A new raw-MAC site anywhere in the crate
-    /// fails this census until filed — where "anywhere" binds to the
-    /// RECURSIVE universe walk, quantifier: census(mac_census_universe_matches_live_tree)
-    /// (WO-S8-5: the depth-1 walk this replaced made the word
-    /// quantify over the flat layer only). Out-of-crate raw mints are
+    /// verify's rejects. A new raw-MAC site anywhere in the crate fails this census until filed — quantifier: census(mac_census_universe_matches_live_tree)
+    /// (WO-S8-5: the binding walk is RECURSIVE; the depth-1 walk
+    /// this replaced made the word quantify over the flat layer
+    /// only). Out-of-crate raw mints are
     /// outside this census's jurisdiction by construction (the key
     /// loader and the claims types live here; consumers sign through
     /// this module) — disclosed, not silently claimed.
@@ -1595,7 +1594,7 @@ mod tests {
     /// exclusion. The depth-1 `read_dir` + name-filter form this
     /// replaced silently dropped directory entries, so a future
     /// `src/<subdir>/foo.rs` raw mint evaded BOTH the scan and the
-    /// parity pin, voiding the "anywhere in the crate" guarantee the
+    /// parity pin, voiding the crate-wide census guarantee the
     /// CONFIRM_FENCE_GC_SECS derivation leans on.
     fn walk_rs_files(root: &std::path::Path, prefix: &str) -> Vec<String> {
         let mut out = Vec::new();
