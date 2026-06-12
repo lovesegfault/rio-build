@@ -20,6 +20,7 @@ docs/spec/components/controller.typ	holds --- the SAME predicate FFD's `simulate
 docs/spec/components/controller.typ	honored during the outage. During a `GetSpawnIntents` outage EVERY
 docs/spec/components/controller.typ	in both planes ONLY as the ordered clear-then-mark pair with
 docs/spec/components/controller.typ	ledger's `source_node` ONLY --- an attempt with no ledger node attribution,
+docs/spec/components/controller.typ	moka-based, default 2 GiB) reduces S3 round-trips for hot chunks; and
 docs/spec/components/controller.typ	planes are cleared ONLY when the RPC returns success (the epoch
 docs/spec/components/controller.typ	re-queued derivation re-creates the SAME name, so the terminal-collision
 docs/spec/components/controller.typ	the ONLY site of the counted `shutdown` forfeiture --- went unpolled:
@@ -34,13 +35,16 @@ docs/spec/components/dashboard.typ	product: the latch is released ONLY on live-w
 docs/spec/components/fetcher.typ	scheduler NEVER sends a FOD to a builder, even under pressure --- this keeps
 docs/spec/components/gateway.typ	Disclosure totality quantifies over the LOSS surface, not the fetch
 docs/spec/components/gateway.typ	[Subset of input paths that
+docs/spec/components/gateway.typ	\~2.2 GiB at the default), and it is only an effective memory backstop
 docs/spec/components/gateway.typ	`__noChroot=1` in its env (sandbox escape --- this check is ONLY at the
 docs/spec/components/gateway.typ	`active_build_ids` when an SSH channel drops, via ALL disconnect shapes: (1)
 docs/spec/components/gateway.typ	a fresh `WatchBuild` with no client-visible error and recover ALL display
 docs/spec/components/gateway.typ	copy child once started, and ONLY there: the `actSubstitute` parent is
 docs/spec/components/gateway.typ	implemented" because modern Nix clients call this for ALL derivation types. For
+docs/spec/components/proto.typ	*Max message size:* The default gRPC max message size (4MB) is insufficient for
 docs/spec/components/proto.typ	// Populated by gateway's filter_and_inline_drv ONLY for nodes with
 docs/spec/components/proto.typ	ANY($1)` reduced it \~130×.
+docs/spec/components/proto.typ	The h2 default 65 535-byte window caps a `GetPath` @nar stream at \~20--30 MB/s
 docs/spec/components/proto.typ	rpc BatchQueryPathInfo(BatchQueryPathInfoRequest) returns (BatchQueryPathInfoResponse);  // I-110 batch: one ANY(...) PG query per BFS layer
 docs/spec/components/scheduler.typ	#rref("sched.timeout.promote-on-exceed")): EVERY timeout consumes budget
 docs/spec/components/scheduler.typ	- A build is `succeeded` only if ALL derivations are `completed`.
@@ -91,12 +95,14 @@ docs/spec/components/scheduler.typ	widen-only establishment window governs the d
 docs/spec/components/sla-sizing.typ	@alg-estimate, and the clamped request by construction can never trip it;
 docs/spec/components/sla-sizing.typ	`requiredSystemFeatures` is a subset of `features` --- i.e., derivations
 docs/spec/components/sla-sizing.typ	demanded, keyed to the attempt's first classification); EVERY other
+docs/spec/components/store.typ	- In-process LRU chunk cache (configurable, default 2GB) to avoid repeated S3
 docs/spec/components/store.typ	8×) a single handler can never self-deadlock on permits it holds --- holds
 docs/spec/components/store.typ	MUST outlive every log artifact keyed on it, under ANY retention
 docs/spec/components/store.typ	NEVER stall-reclaimable --- they stay under the heartbeat-death rule
 docs/spec/components/store.typ	ONLY constructor of per-path progress callbacks. The floor is
 docs/spec/components/store.typ	Sweep MUST, before deleting each candidate path Q, re-check ALL
 docs/spec/components/store.typ	WHERE blake3_hash = ANY($1)`, `INSERT ... ON CONFLICT` with UNNEST over hash
+docs/spec/components/store.typ	`MAX_NAR_SIZE` = 8 GiB, ¼ of the default pool), keyed by the
 docs/spec/components/store.typ	acquires row locks in ANY()/UNNEST scan order; unsorted overlapping sets
 docs/spec/components/store.typ	axes, ALL bound: *time* --- the hold envelope armed at grant
 docs/spec/components/store.typ	buffer may have grown since the failed attempt --- can never re-PUT a key
@@ -157,9 +163,11 @@ infra/helm/rio-build/templates/scheduler.yaml	# All replicas contend for SAME Le
 infra/helm/rio-build/templates/store-scaledobject.yaml	# Code::Aborted ONLY — a code a LIVE store mints — so the trigger
 infra/helm/rio-build/templates/store-scaledobject.yaml	# rio_gateway_putpath_retry_events_total — EVERY failure
 infra/helm/rio-build/templates/store.yaml	# SAME origin list the scheduler renders — the contract is
+infra/helm/rio-build/values.yaml	#      pname samples) gets sla.probe (16c/48GiB default) for
 infra/helm/rio-build/values.yaml	# ("ALL CLASSES spot+on-demand — spot if available, else od")
 infra/helm/rio-build/values.yaml	# All replicas contend for SAME Lease. Presence of this name ENABLES lease
 infra/helm/rio-build/values.yaml	# Bucket-level prefix prepended to ALL rio keys (chunks/, logs/).
+infra/helm/rio-build/values.yaml	# Chart default: the MAX_NAR_SIZE floor (4 GiB — one whole-NAR
 infra/helm/rio-build/values.yaml	# Control plane + store drop to restricted — runAsNonRoot, drop-ALL,
 infra/helm/rio-build/values.yaml	# NEVER commit a real value — set via --set or values override file.
 infra/helm/rio-build/values.yaml	# ORDER-PIN (live_057-c): this flip is valid ONLY in a tree where
@@ -176,10 +184,12 @@ infra/helm/rio-build/values.yaml	# git::image_tag()). NEVER committed — privat
 infra/helm/rio-build/values.yaml	# is this ScaledObject's ONLY trigger, so without fallback a
 infra/helm/rio-build/values.yaml	# synthesizes `instance-size NotIn` for EVERY class (ceiling plane —
 infra/helm/rio-build/values.yaml	# that want to change a property for ALL pools set it on `poolDefaults`.
+infra/helm/rio-build/values.yaml	# the 25 GiB defaultDisk the 88.5 GiB default-pod request is 56%
 infra/helm/rio-build/values.yaml	# this grows EVERY builder pod's ephemeral-storage request — check
 infra/helm/rio-build/values.yaml	# to a fetcher cell and a FOD NEVER routes to a builder cell.
 infra/helm/rio-build/values.yaml	# under ANY value here. Keeping this >= store.logRetentionDays is
 nix/census_corpora.py	#   BACKSTOP (coarse, the over-approximation belt): the SAME binding
+nix/census_corpora.py	# grandfather.txt, SHRINK-ONLY — the standing debt visible; bug_151's
 nix/census_corpora.py	# idiom-blind pass: ANY conversion idiom inside the argument
 nix/census_enrollment.py	# content-keyed and deduplicated. NEVER hand-edited upward
 nix/fixture_provenance.py	# Strings visible for the arms; comments blanked. The SAME walk
@@ -203,6 +213,7 @@ nix/tests/helm/22-alert-quality.sh	#    that exists ONLY when its producing comp
 nix/tests/helm/22-alert-quality.sh	# An alert using `absent()` watches a series that exists ONLY when
 nix/tests/helm/22-alert-quality.sh	# r39 merged_003: enumerate ALL absent() alerts. A new absent() alert
 nix/tests/helm/25-gateway-antiaffinity-autoscaling-floor.sh	# Under autoscaling KEDA owns the live pod count anywhere in
+nix/tests/helm/25-gateway-antiaffinity-autoscaling-floor.sh	# chart-default 2 replicas in this render, so its PDB must be present.
 nix/tests/helm/26-store-scaling.sh	# its NAMED axis. PDB present in ALL store-enabled configs (percentage
 nix/tests/helm/27-trigger-units.sh	# anywhere. Red-first evidence: this fragment fails against the
 nix/tests/helm/29-builder-l7-log-allowlist.sh	# The network leg is L4 endpoint scoping ONLY, deliberately: an L7
@@ -222,6 +233,8 @@ nix/tests/helm/42-reason-alert-sync.sh	# old `"[a-z_]*"` class dropped it silent
 nix/tests/helm/43-metal-capacity-doctrine.sh	# The spot+od doctrine ("ALL CLASSES spot+on-demand — spot if
 nix/tests/helm/45-store-scaledown-inhibitor.sh	# (b) the trigger narration names EVERY class of the alphabet (the
 nix/tests/helm/45-store-scaledown-inhibitor.sh	# Query strings ONLY for the negative pin — $trig carries the
+nix/tests/helm/46-store-memory-identity.sh	# chart rendered NO budget env (binary default 32 GiB) against a 4Gi
+nix/tests/helm/46-store-memory-identity.sh	# default limit — 32 GiB + 4 GiB > 4 Gi.
 rio-auth/src/hmac.rs	// can never authenticate-but-not-enforce an instance-bound
 rio-auth/src/hmac.rs	// signer and verifier should get the SAME key regardless.
 rio-auth/src/hmac.rs	/// Signed with the SAME assignment-HMAC key as [`AssignmentClaims`]:
@@ -284,6 +297,8 @@ rio-builder/src/fuse/ops.rs	// I-043 redesign load-bearing change: NEVER return
 rio-builder/src/fuse/ops.rs	// NEVER ENOENT for a registered input. Any
 rio-builder/src/fuse/ops.rs	//!    mount → kernel drops ALL dentries. If an earlier subtest SIGKILLed
 rio-builder/src/fuse/ops.rs	//! **Tell for partial success:** journalctl shows a subset of expected
+rio-builder/src/hw_bench.rs	/// (gp3 root volume at default 125 MB/s provisioned throughput).
+rio-builder/src/hw_bench.rs	/// Per-array bytes for [`stream_triad_gbps`]. Prod default 1.5 GiB
 rio-builder/src/log_stream.rs	// 10 lines in <1s: first 5 buffered, next 5 dropped. ALL return
 rio-builder/src/log_stream.rs	// The store truncates every accepted line to the SAME kernel
 rio-builder/src/log_stream.rs	/// Call ONLY on exit paths (`STDERR_LAST`, `LimitExceeded`,
@@ -346,6 +361,8 @@ rio-common/src/dns.rs	/// a pass-through identity can never equal a salted ident
 rio-common/src/footprint.rs	/// pinning at the inverse can never disagree by a band cell.
 rio-common/src/grpc.rs	// the SAME constant — a typo in a string literal at one site silently
 rio-common/src/grpc.rs	/// CONTRACT (merged_bug_097): this set is a SUPERSET of
+rio-common/src/grpc.rs	/// Default max gRPC message size: 256 MiB.
+rio-common/src/grpc.rs	/// Initial h2 per-stream flow-control window (1 MiB). h2's default is
 rio-common/src/grpc.rs	/// [`H2_INITIAL_STREAM_WINDOW`] or the conn window depletes and ALL
 rio-common/src/grpc.rs	/// classifier is a superset of the store's shed alphabet. The
 rio-common/src/grpc.rs	/// close did not become durable; the store must re-deliver the SAME
@@ -354,6 +371,8 @@ rio-common/src/grpc.rs	/// retry classifier MUST be a SUPERSET of this set, boun
 rio-common/src/grpc.rs	/// row covers — re-dialing cannot ever serve them. Value names the
 rio-common/src/k8s.rs	/// NOT in hwClass config (cover.rs has a TODO to single-source ALL
 rio-common/src/k8s.rs	/// read the SAME key from the hwClass config.
+rio-common/src/limits.rs	/// - 1 GiB — build-log ingest budget (`log_bytes_budget` default;
+rio-common/src/limits.rs	/// - 2 GiB — chunk read cache (`chunk_cache_capacity_bytes` default;
 rio-common/src/limits.rs	/// callers track their cumulative charge in the SAME unit the semaphore
 rio-common/src/limits.rs	/// debits — `r[store.put.nar-bytes-budget]`'s "single batch can never
 rio-common/src/liveness.rs	/// contract (bug_108). Mintable ONLY from the liveness consts (the
@@ -362,6 +381,7 @@ rio-common/src/observability.rs	// traced, and within a traced build, ALL spans 
 rio-common/src/observability.rs	/// Boxing erases the `S` type parameter so the layer composes anywhere.
 rio-common/src/server.rs	/// Spawn a tonic server with ONLY `grpc.health.v1.Health`, on a
 rio-common/src/server.rs	/// fires on the SAME scheduler tick as set_not_serving — the
+rio-common/src/server.rs	/// streams. The h2 default 64 KiB was the 30 MB/s wall on builder NAR
 rio-common/src/server.rs	/// window. The drain task is the ONLY path to `serve_shutdown`
 rio-common/src/task.rs	// With biased; → shutdown ALWAYS wins → extra_ticks == 0.
 rio-common/src/wanted_outputs.rs	// the placeholder dimension — if ANY wanted-matched
@@ -762,6 +782,7 @@ rio-gateway/src/config.rs	/// `PutPath`. SAME file as the store's `service_hmac_
 rio-gateway/src/config.rs	/// disconnected EVERY session — a rollout killed all in-flight
 rio-gateway/src/config.rs	/// existing tonic server. This spawns a dedicated one with ONLY
 rio-gateway/src/config.rs	/// rejection tests above are testing ONLY their mutation. Also
+rio-gateway/src/config.rs	/// so the default 4096 ≈ 2.2 GiB of the 4 GiB pod limit; per-session
 rio-gateway/src/drv_cache.rs	/// Derivation)` for EVERY requested path (hits and freshly fetched) so
 rio-gateway/src/handler/build.rs	//      directly; the :107 EOF-cancel arm is NEVER reached (that arm
 rio-gateway/src/handler/build.rs	//      no cancel logic anywhere.
@@ -819,6 +840,7 @@ rio-gateway/src/handler/opcodes_write.rs	// After this point, ANY early return l
 rio-gateway/src/handler/opcodes_write.rs	// work on it directly (they take R: AsyncRead). After this point, ANY
 rio-gateway/src/main.rs	// ONLY process that holds the signing key (asymmetric:
 rio-gateway/src/ratelimit.rs	/// drain the SAME bucket. This is what makes the
+rio-gateway/src/server/connection.rs	// At the default cap (4096 ≈ 2.2 GiB of steady-state buffers;
 rio-gateway/src/server/connection.rs	// Keep the sender alive to the very end so the pump can never have
 rio-gateway/src/server/connection.rs	// session, across ALL connections on this pod. Acquired BEFORE
 rio-gateway/src/server/connection.rs	/// bug_005: russh invokes `channel_close` for ANY channel id a peer
@@ -978,8 +1000,10 @@ rio-nix/src/store_path.rs	/// log ingest/read paths) so the write and read sides
 rio-proto/src/client/balance.rs	// Resolve. For a headless Service, CoreDNS returns ALL pod IPs
 rio-proto/src/client/balance.rs	//! Nothing here may assume the scheduler's 2-replica shape: the SAME
 rio-proto/src/client/balance.rs	//! client balances the rio-store fleet, where EVERY replica is
+rio-proto/src/client/mod.rs	/// 64 KiB default. A revert to defaults reintroduces the ~30 MB/s
 rio-proto/src/client/mod.rs	/// drop their retry loop: the channel ALWAYS constructs.
 rio-proto/src/client/retry.rs	/// zero failure signal anywhere). The budget is wall-clock, not
+rio-proto/src/lib.rs	/// ~= 820 KiB per page, ~5x headroom under the 4 MiB default gRPC
 rio-proto/src/refusal.rs	// The request shape can never succeed: validation rejected the
 rio-proto/src/refusal.rs	/// Certifies: the authority's totality and the regime split itself
 rio-retry-kernel/src/lib.rs	// And the mirror: a materialization-lane reset cuts ONLY the
@@ -1429,6 +1453,7 @@ rio-scheduler/src/critical_path.rs	// Full sweep should produce the SAME priorit
 rio-scheduler/src/dag/mod.rs	// All three inserts clone the SAME Arc — they're mutually
 rio-scheduler/src/dag/mod.rs	// Eligible iff ALL deps now terminal (or provisionally
 rio-scheduler/src/dag/mod.rs	///   over ALL non-terminal nodes (not just `find_roots`) is
+rio-scheduler/src/dag/mod.rs	/// MAX_DAG_NODES=1M × ~150B/frame ≈ 150MB >> 2MB default tokio stack.
 rio-scheduler/src/dag/mod.rs	/// Subset of `newly_inserted` that were pre-existing retriable nodes
 rio-scheduler/src/dag/mod.rs	/// whose ONLY remaining incomplete dependency was the just-completed
 rio-scheduler/src/dag/mod.rs	/// would be Skipped even though their outputs have NEVER been
@@ -1530,6 +1555,7 @@ rio-scheduler/src/grpc/tests/pull_tests.rs	/// be configured — so the material
 rio-scheduler/src/grpc/tests/pull_tests.rs	/// bug_362 (A2): EVERY ExecutorService method runs the standby gate.
 rio-scheduler/src/grpc/tests/pull_tests.rs	/// pods. The split is observability metadata on the SAME judgment:
 rio-scheduler/src/grpc/tests/submit_tests.rs	// would be true for ANY non-empty table and reject everything).
+rio-scheduler/src/lib.rs	/// through the 4 MiB tonic default message cap up to the modeled
 rio-scheduler/src/main.rs	// The health-toggle loop below breaks on the SAME parent token
 rio-scheduler/src/main.rs	// against the SAME database; sqlx's default blocking
 rio-scheduler/src/main.rs	// live, the port is bound, leader-election is the ONLY thing
@@ -1587,8 +1613,10 @@ rio-scheduler/src/sla/cost.rs	/// flip changes `price()` from EMA→seed without
 rio-scheduler/src/sla/cost.rs	/// so it can never drift from the per-key timestamps; the fold is
 rio-scheduler/src/sla/cost.rs	/// totality over the string grammar).
 rio-scheduler/src/sla/cost.rs	/// window at the SAME rung instead of climbing. The controller
+rio-scheduler/src/sla/explore.rs	/// `Ceilings` matching `cfg()`'s configured `Some(64, 256GiB)` so
 rio-scheduler/src/sla/explore.rs	/// pool was always a subset of `h_all\in_a\{cheapest}`; the caller's
 rio-scheduler/src/sla/explore.rs	/// the warm path can never request past the operator bound.
+rio-scheduler/src/sla/fit.rs	///   blend toward the chart constant (a 100 GiB blend would never
 rio-scheduler/src/sla/fit.rs	/// - `fitted` = the per-pname observed p90 when ANY disk observation
 rio-scheduler/src/sla/fit.rs	/// This envelope is the SOLE constructor for EVERY dispatch lane's
 rio-scheduler/src/sla/fit.rs	/// alpha-filter so the four can never drift: the algorithm's
@@ -1603,6 +1631,7 @@ rio-scheduler/src/sla/ingest.rs	/// ("warm pname on default") holds at tree ONLY
 rio-scheduler/src/sla/ingest.rs	/// Cold rows (zero peaks anywhere) stay None — no evidence is no
 rio-scheduler/src/sla/ingest.rs	/// commit body): `disk_p90 == None` — `probe_only` read ONLY
 rio-scheduler/src/sla/ingest.rs	/// live_049 L2: the disk p90 over EVERY row carrying a peak, unit
+rio-scheduler/src/sla/ingest.rs	/// p90 of 1 (the 5 GiB estimate shipped; the 1 GiB envelope floor
 rio-scheduler/src/sla/ingest.rs	/// probe_only arm read ONLY the last row (a serial pname with five
 rio-scheduler/src/sla/metrics.rs	///      `Self::Variant` in `ALL` / `as_str()`).
 rio-scheduler/src/sla/metrics.rs	///    `ALL` / `as_str()` don't count — they're definition-site, not
@@ -1616,6 +1645,7 @@ rio-scheduler/src/sla/solve.rs	// Converse: any non-λ in SPOT → NEVER Interru
 rio-scheduler/src/sla/solve.rs	// Drv hints pin ONLY cores; mem/disk fall back to the fit when
 rio-scheduler/src/sla/solve.rs	// SAME per-cell threshold as admission. The non-empty
 rio-scheduler/src/sla/solve.rs	// `forced_mem` is hoisted so it overrides mem in EVERY branch below
+rio-scheduler/src/sla/solve.rs	// a warm 200 MiB p90 shipped a sub-scratch request). The
 rio-scheduler/src/sla/solve.rs	// construction and can never trip a ceiling gate).
 rio-scheduler/src/sla/solve.rs	// construction can never trip it.
 rio-scheduler/src/sla/solve.rs	// enable_parallel_building=false pins ONLY cores=1; mem/disk
@@ -1673,16 +1703,35 @@ rio-store/src/backend.rs	// No .tmp files anywhere in chunks/ab/.
 rio-store/src/backend.rs	// bug_108: EVERY wave runs under the typed liveness budget —
 rio-store/src/backend.rs	/// `pending_s3_deletes` in the SAME PG transaction as the
 rio-store/src/backend.rs	/// lane's worked-example shape) and is TIMEOUT-ONLY: `max_attempts`
+rio-store/src/budget.rs	//! One pool (`nar_bytes_budget`, 32 GiB default) is consumed by two
+rio-store/src/budget.rs	//! shipped exactly that bare sibling — eight ~4 GiB declarations from
+rio-store/src/budget.rs	/// (8 legs × ~4 GiB against the 32 GiB default), in EITHER
+rio-store/src/budget.rs	/// eighth of the default 32 GiB pool = 4 GiB — orders of
+rio-store/src/budget.rs	/// outside this cap. `2 × MAX_NAR_SIZE` (8 GiB = ¼ of the default
 rio-store/src/cas.rs	// SAME claim-guarded UPDATE — still one statement per heartbeat;
 rio-store/src/cas.rs	// data). Without invalidation, this would return the SAME error.
 rio-store/src/cas.rs	// with duplicate PKs in the SAME batch: "ON CONFLICT DO UPDATE
 rio-store/src/cas.rs	/// 3. **BLAKE3 verify** — EVERY returned chunk is hashed against the
+rio-store/src/cas.rs	/// Create a cache with the default 2 GiB capacity.
+rio-store/src/cas.rs	/// Default LRU capacity: 2 GiB. Configurable via `ChunkCache::with_capacity`.
 rio-store/src/cas.rs	/// means a stale rollback can never clobber a re-uploader's fresh
+rio-store/src/config.rs	// None (unset) is fine — that's the 32 GiB default.
+rio-store/src/config.rs	// The shipped pair: default budget (None → 32 GiB) and the
+rio-store/src/config.rs	// sentinel; unset for the 32 GiB default.
 rio-store/src/config.rs	/// (`store.materialize.gate-share+1`). The executor alone can never
+rio-store/src/config.rs	/// Default 1M — ~80 MB of path strings per request. Set via
 rio-store/src/config.rs	/// Global NAR buffer budget in bytes — total permits across ALL
 rio-store/src/config.rs	/// SAME file as scheduler's `hmac_key_path`. Unset = accept
 rio-store/src/config.rs	/// backstop expires at the SAME variable + 7 days of slack — the
+rio-store/src/config.rs	/// exceeded. Default 1 GiB. Env: `RIO_LOG_INGEST_BYTE_CAP`.
+rio-store/src/config.rs	/// memory cost is `K × CHUNK_MAX` (≤ 16 MiB at 64). Default 64.
+rio-store/src/config.rs	/// moka LRU capacity for chunk reads, in bytes. Default 2 GiB.
 rio-store/src/config.rs	/// rejection tests test ONLY their mutation.
+rio-store/src/config.rs	/// starve each other. Default 1 GiB; bounded above at 2^60 (a
+rio-store/src/config.rs	/// the periodic timer. Default 8 MiB (≈2 MiB compressed at the
+rio-store/src/config.rs	/// while the binary default budget is 8 × MAX_NAR_SIZE = 32 GiB —
+rio-store/src/config.rs	let cache_term = d.chunk_cache_capacity_bytes; // 2 GiB default
+rio-store/src/config.rs	let log_term = d.log_bytes_budget; // 1 GiB default
 rio-store/src/gc/collect.rs	// Chunk B: referenced ONLY by an 'uploading' placeholder.
 rio-store/src/gc/collect.rs	// CycleCommit, and EVERY replica\'s gauge publisher reads it back
 rio-store/src/gc/collect.rs	// Referenced ONLY by an 'uploading' placeholder, old.
@@ -1740,6 +1789,7 @@ rio-store/src/gc/mark.rs	/// ANY tenant's window survives, even if outside anoth
 rio-store/src/gc/mark.rs	/// Seeds are ALL store_path TEXT (not hash) because the CTE joins
 rio-store/src/gc/mark.rs	/// proves the stamp is the ONLY thing protecting it — the
 rio-store/src/gc/mark_scan_bench.rs	// by the keyset SELECT), then the sorted `= ANY` soft-delete — the
+rio-store/src/gc/mark_scan_bench.rs	//!   (default 4GB; bounds the dedup aggregate, which spills to temp files past it; also used
 rio-store/src/gc/mod.rs	// No dangling references anywhere.
 rio-store/src/gc/mod.rs	// re-check (fresh READ-COMMITTED snapshot over ALL narinfo). The
 rio-store/src/gc/mod.rs	// resurrect EVERY Q_i.
@@ -1787,10 +1837,12 @@ rio-store/src/grpc/admin.rs	/// sees the same values the caller acted on. MIRROR
 rio-store/src/grpc/admin.rs	/// stay mirrored, but no gauge's ONLY writer is an RPC handler.
 rio-store/src/grpc/mod.rs	/// (chunk_cache above). This bounds ONLY the per-request accumulation
 rio-store/src/grpc/mod.rs	/// 2. `x-rio-probe-tenant-id` header — ONLY honoured when the
+rio-store/src/grpc/mod.rs	/// Default global NAR buffer budget: 8 × MAX_NAR_SIZE (32 GiB on 64-bit).
 rio-store/src/grpc/mod.rs	/// Global budget for in-flight NAR bytes across ALL concurrent PutPath
 rio-store/src/grpc/mod.rs	/// `Ok(None)` ONLY when no tenant context was REQUESTED (no JWT,
 rio-store/src/grpc/mod.rs	/// `storage_error` maps `BackendAuthError` anywhere in the anyhow
 rio-store/src/grpc/mod.rs	/// `x-rio-probe-tenant-id` is honoured ONLY behind a valid
+rio-store/src/grpc/mod.rs	/// handler drop. Default `8 * MAX_NAR_SIZE` (32 GiB) — lets 8× max-size
 rio-store/src/grpc/mod.rs	/// median is over ALL rows (only the `HAVING` is distinct-pod), so
 rio-store/src/grpc/put_path/common.rs	// and rejects on mismatch, so an is_ca worker can never claim a
 rio-store/src/grpc/put_path/common.rs	// form): once this handler HOLDS budget permits, EVERY await
@@ -1824,15 +1876,18 @@ rio-store/src/grpc/sign.rs	/// was NEVER built by any tenant — zero `path_tena
 rio-store/src/ingest.rs	/// (`fetched_bytes == nar_size`) is NEVER stall-reclaimable — only
 rio-store/src/ingest.rs	/// merged_bug_003). The stall-takeover predicate strikes ONLY
 rio-store/src/ingest.rs	/// writes `fetched_bytes` and advances `last_progress_at` ONLY
+rio-store/src/lib.rs	/// (chromium, llvm) are ~1-2GB → 60s+. The default 10s top would lose all
 rio-store/src/logs/chunks.rs	// cuttable) can never produce a chunk the read path refuses.
 rio-store/src/logs/chunks.rs	/// compress/decompress refusals can never drift apart
 rio-store/src/logs/gate.rs	// materialization mint, which can never legitimately append log
+rio-store/src/logs/gate.rs	// the 1 GiB default cap.
 rio-store/src/logs/gate.rs	///    already covers a contiguous `[0, final_line_count)` can never be
 rio-store/src/logs/gate.rs	/// The serve path's ONLY completeness source: fetch the sealed witness
 rio-store/src/logs/gate.rs	/// anywhere else in the log plane.
 rio-store/src/logs/gate.rs	/// with the EXECUTION, so no retry anywhere can succeed. The
 rio-store/src/logs/ingest.rs	// PK makes a re-INSERT of the SAME key idempotent — which the
 rio-store/src/logs/ingest.rs	// never blocks, so a slow reader can never backpressure
+rio-store/src/logs/ingest.rs	/// Default for [`IngestConfig::per_exec_byte_cap`]: 1 GiB of accepted
 rio-store/src/logs/ingest.rs	/// SAME formula — bug_298 was exactly that drift: the buffer axes
 rio-store/src/logs/ingest.rs	/// The ONLY constructor, and it takes a `GateOk`: a session
 rio-store/src/logs/ingest.rs	/// retry anywhere can succeed; never `RESOURCE_EXHAUSTED`, which
@@ -2029,6 +2084,7 @@ rio-store/src/substitute.rs	/// N concurrent `try_substitute` calls for the SAME
 rio-store/src/substitute.rs	/// The census file universe: EVERY `.rs` under `rio-store/src`,
 rio-store/src/substitute.rs	/// [`Self::raced_events`]. Reconnects with capped backoff on ANY
 rio-store/src/substitute.rs	/// `(tenant, path)` coalesce at the moka singleflight: ALL return
+rio-store/src/substitute.rs	/// `8 × MAX_NAR_SIZE` (32 GiB) — same as `StoreServiceImpl`'s default.
 rio-store/src/substitute.rs	/// `None` (tests / no-op) skips gating. main.rs wires the SAME
 rio-store/src/substitute.rs	/// bug_081 + merged_bug_044 failover-totality: for ANY
 rio-store/src/substitute.rs	/// duration that could ONLY have come from the HTTP-date arm.
@@ -2052,6 +2108,7 @@ rio-store/src/visibility.rs	/// load per (job, tenant), and two paths of one job
 rio-store/src/visibility.rs	/// locally-present subset of a `FindMissingPaths` request, return the
 rio-store/src/visibility.rs	/// read (bug_061): per input hash — does `tid` own it, and has ANY
 rio-test-support/src/config.rs	/// Standing guard: TOML → Config roundtrip for EVERY sub-config
+rio-test-support/src/grpc/spawn.rs	// 64 KiB duplex buffer: tonic's default HTTP/2 window is 64 KiB;
 rio-test-support/src/grpc/store.rs	// Atomicity: on ANY validation failure, nothing is recorded
 rio-test-support/src/jail.rs	//! Consumer crates must therefore route ALL env mutation in their tests
 rio-test-support/src/kube_mock.rs	/// A snapshot taken before an HTTP DELETE can never pass the CAS
@@ -2078,6 +2135,7 @@ xtask/src/k8s/qa/scenarios/i115_temp_suffix_fastpath.rs	// is cluster-level: if 
 xtask/src/k8s/qa/scenarios/i163_mailbox_under_load.rs	// Tolerate transient spikes — fail only if EVERY sample over the
 xtask/src/k8s/qa/scenarios/i181_kvm_featureless.rs	// builds can never schedule — deployment-shape regression.
 xtask/src/k8s/qa/scenarios/i207_stale_uploading.rs	//! Full reproduction (PutPath retrigger for the SAME store_path)
+xtask/src/k8s/qa/scenarios/i208_floor_hydrated.rs	const PROBE_FLOOR: i64 = 1_073_741_824; // 1 GiB — distinct from any default
 xtask/src/k8s/qa/scenarios/iso02_cross_tenant_same_drv.rs	// A builds. Then B builds the SAME expression.
 xtask/src/k8s/qa/scenarios/mod.rs	//! Scenario registry. One module per scenario; `ALL` is the manual slice
 xtask/src/k8s/shared.rs	/// Spawn `cmd` in a fresh process group and wrap it. The ONLY way

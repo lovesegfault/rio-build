@@ -723,21 +723,30 @@ def exit_edge_finder(files):
                 )
         for a, b, _is_raw in spans:
             body = pruned[a:b]
-            if "ON CONFLICT" in body and "INSERT" in body.upper():
-                tm = re.search(r"INSERT INTO\s+(\w+)", body, re.I)
+            if "ON CONFLICT" not in body:
+                continue
+            tm = re.search(r"\bINSERT\s+INTO\s+(\w+)", body, re.I)
+            if tm is not None:
                 kind = "on-conflict-do-update" if "DO UPDATE" in body else "on-conflict-do-nothing"
-                if tm is None:
-                    out.append(
-                        (
-                            rel,
-                            "refusal",
-                            f"{rel}:{pruned.count(chr(10), 0, a) + 1}: ON CONFLICT "
-                            f"insert without a resolvable target table — refusing "
-                            f"(fail-closed; name the table or restructure)",
-                        )
-                    )
-                    continue
                 out.append((rel, kind, tm.group(1)))
+                continue
+            # ON CONFLICT without INSERT INTO in the same literal:
+            # a SQL FRAGMENT (split query-builder string — the table
+            # is elsewhere; unclassifiable, REFUSE) vs PROSE (metric
+            # HELP narrating the dedup — no SQL keywords; skip, with
+            # its co-located plant). The boundary is derived from the
+            # string's own grammar, not the file.
+            if re.search(r"\b(?:VALUES|SELECT|SET|WHERE|UNNEST|UPDATE)\b", body):
+                out.append(
+                    (
+                        rel,
+                        "refusal",
+                        f"{rel}:{pruned.count(chr(10), 0, a) + 1}: ON CONFLICT "
+                        f"SQL fragment without a resolvable INSERT INTO target "
+                        f"— refusing (fail-closed; split builder strings hide "
+                        f"the enqueue identity)",
+                    )
+                )
     return out
 
 
@@ -1230,13 +1239,28 @@ def main() -> int:
         if len(got) != 1 or got[0][1] != idiom or got[0][2] != ident:
             print(f"FAIL: exit-edge finder vector ({idiom}/{ident}) not located: {got}", file=sys.stderr)
             return 1
-    # The fail-closed refusal plant: an ON CONFLICT insert whose table
-    # the classifier cannot resolve REFUSES, never skips.
+    # The fail-closed refusal plant: an ON CONFLICT SQL fragment whose
+    # INSERT INTO target lives in another string REFUSES, never skips.
     refused_ee = exit_edge_finder(
-        [("planted/dyn.rs", 'fn q(t: &str) -> String { format!("INSERT INTO {t} VALUES ($1) ON CONFLICT DO NOTHING") }\n')]
+        [("planted/frag.rs", 'const TAIL: &str = "ON CONFLICT (k) DO UPDATE SET v = $1";\n')]
     )
-    if not any(h[1] == "refusal" and "resolvable target table" in h[2] for h in refused_ee):
-        print(f"FAIL: the unresolvable-table ON CONFLICT did not refuse: {refused_ee}", file=sys.stderr)
+    if not any(h[1] == "refusal" and "INSERT INTO target" in h[2] for h in refused_ee):
+        print(f"FAIL: the split ON CONFLICT fragment did not refuse: {refused_ee}", file=sys.stderr)
+        return 1
+    # … the format!-dynamic table refuses through the same arm.
+    refused_dyn = exit_edge_finder(
+        [("planted/dyn.rs", 'fn q(t: &str) -> String { format!("ON CONFLICT DO NOTHING WHERE {t}") }\n')]
+    )
+    if not any(h[1] == "refusal" for h in refused_dyn):
+        print(f"FAIL: the dynamic ON CONFLICT did not refuse: {refused_dyn}", file=sys.stderr)
+        return 1
+    # … and PROSE narrating ON CONFLICT (metric HELP — the
+    # admin/mod.rs:166 class) is NOT SQL: the leniency plant.
+    prose_ee = exit_edge_finder(
+        [("planted/prose.rs", 'const H: &str = "inserts absorbed by the M_047 ON CONFLICT dedup, by kind";\n')]
+    )
+    if prose_ee:
+        print(f"FAIL: HELP prose mentioning ON CONFLICT classified as an enqueue: {prose_ee}", file=sys.stderr)
         return 1
     # The strawman violating row: an unrowed latch is a named red.
     with tempfile.TemporaryDirectory() as td:

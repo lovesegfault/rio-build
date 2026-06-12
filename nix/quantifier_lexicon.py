@@ -106,6 +106,25 @@ CLAIM_TIERS = (
     ),
 )
 
+# WO-S8-11(iii) (merged_bug_021): the NUMERIC-NARRATION binder — a
+# `<number><unit>` magnitude in default/shipped-class context is a
+# cross-tier restatement of a constant that lives elsewhere (the
+# "shipped 100 GiB chart default" class: present-tense magnitude
+# prose in another tier has no binding census; R23' binds quantifier
+# words, not numerals). A hit BINDS to its source key — `figure:
+# values(<values-path>)` / `figure: const(<SYMBOL>)` — or demotes
+# (non-normative / lowercase has no effect here: numerals carry no
+# case). Time units are NOT in the unit set: duration constants are
+# the R29 duration census's jurisdiction, and registry-note duration
+# figures are banned outright by the retention-notes arm.
+NUMERIC_NUM_RE = re.compile(
+    r"\b\d+(?:\.\d+)?\s*(?:GiB|MiB|KiB|TiB|GB|MB|TB|vCPU|cores?|replicas?)\b"
+)
+NUMERIC_CTX_RE = re.compile(
+    r"\b(?:default|shipped|ships|configured|provisioned|the chart)\b", re.I
+)
+FIGURE_BIND_RE = re.compile(r"figure:\s*(?:values|const)\([^)]+\)")
+
 BIND_RE = re.compile(
     r"quantifier:\s*(?:census|non-normative)\(\S[^)]*\)"
     # The two bind idioms the round-10 wave landed BEFORE this lint
@@ -240,9 +259,17 @@ def scan(root: Path):
                             word = f"{cm.group(0)} [{tname} tier]"
                             break
                 if word is None:
+                    nm = NUMERIC_NUM_RE.search(comment)
+                    if nm and NUMERIC_CTX_RE.search(comment):
+                        word = f"{nm.group(0)} [numeric tier]"
+                if word is None:
                     continue
                 line = raw_lines[lineno - 1] if lineno <= len(raw_lines) else comment
-                if BIND_RE.search(line) or any(t in line for t in AUTO_BOUND):
+                if (
+                    BIND_RE.search(line)
+                    or FIGURE_BIND_RE.search(line)
+                    or any(t in line for t in AUTO_BOUND)
+                ):
                     continue
                 yield rel, lineno, word, line.strip()
 
@@ -291,7 +318,7 @@ def run(root: Path, mint: bool) -> int:
         return 1
     print(
         f"quantifier-lexicon: {len(LEXICON)} words + {len(CLAIM_TIERS)} claim "
-        f"tiers x {len(TIERS)} file tiers clean "
+        f"tiers + the numeric binder x {len(TIERS)} file tiers clean "
         f"({len(grandfathered)} grandfathered, burn-down)"
     )
     return 0
@@ -365,6 +392,30 @@ def selftest() -> str | None:
             )
             if list(scan(root)):
                 return f"claim-tier plant ({tname}): non-normative( demote did not clear"
+        # W11-CE (WO-S8-11(iii)): the numeric-narration plant — the
+        # planted stale magnitude (the merged_bug_021 shape) hits;
+        # the figure: source-key bind clears; non-normative clears.
+        p.write_text("// the shipped 100 GiB chart default governs the solve\nfn x() {}\n", encoding="utf-8")
+        got = list(scan(root))
+        if len(got) != 1 or "[numeric tier]" not in got[0][2]:
+            return f"W11-CE: the planted stale magnitude did not hit: {got}"
+        p.write_text(
+            "// the shipped 100 GiB chart default — figure: values(scheduler.sla.defaultDiskGib)\nfn x() {}\n",
+            encoding="utf-8",
+        )
+        if list(scan(root)):
+            return "W11-CE: the figure: values(...) bind did not clear"
+        p.write_text(
+            "// a 100 GiB example budget, quantifier: non-normative(illustrative)\nfn x() {}\n",
+            encoding="utf-8",
+        )
+        if list(scan(root)):
+            return "W11-CE: the non-normative demote did not clear"
+        # … a magnitude WITHOUT default/shipped context stays silent
+        # (the conjunction is the hit grammar).
+        p.write_text("// reserves 100 GiB for the solve\nfn x() {}\n", encoding="utf-8")
+        if list(scan(root)):
+            return "W11-CE: a context-free magnitude hit (conjunction broken)"
         # … and the claim tiers fire in EVERY file tier (the product
         # discipline): the helm/script/typst specimens carry the noun.
         for ftier in ("helm", "script", "typst"):
