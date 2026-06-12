@@ -105,7 +105,7 @@ def help_text(raw: str) -> str:
     return "".join(p.replace("\\\n", "").replace("\\'", "'") for p in parts)
 
 
-def resolve_reasons(expr: str, file_text: str, const_strs=None):
+def resolve_reasons(expr: str, file_text: str, const_strs=None, const_collisions=None):
     """Returns (values, skip_class). values is a list of reason strings."""
     const_strs = const_strs or {}
     expr = expr.strip()
@@ -121,9 +121,22 @@ def resolve_reasons(expr: str, file_text: str, const_strs=None):
             # an arm past the window was silently undocumented).
             for fname, _start, b0, b1 in rust_strip.fn_extents(file_text):
                 if fname == name:
-                    vals = ARM_LIT.findall(file_text[b0:b1])
-                    if vals:
+                    body = file_text[b0:b1]
+                    vals = ARM_LIT.findall(body)
+                    # WO-S8-8 (merged_bug_094): a resolution returning
+                    # non-empty values PROVES arm-exhaustiveness (every
+                    # `=>` arm yielded a literal) or the helper is
+                    # CENSUSED — the old partial-with-skip=None return
+                    # silently undocumented the non-literal arms (the
+                    # merged_bug_019 PARTIAL shape one axis over).
+                    # Arrow counting is conservative: nested arrows
+                    # over-count and route to the census, never to a
+                    # silent pass.
+                    arms = len(re.findall(r"=>", body))
+                    if vals and len(vals) == arms:
                         return vals, None
+                    if vals:
+                        return [], "helper-mixed-arms"
                     return [], "helper-unresolved"
             if re.search(rf"\bfn {name}\s*\(", file_text):
                 # Declared but no derivable body extent (bodyless decl
@@ -137,6 +150,11 @@ def resolve_reasons(expr: str, file_text: str, const_strs=None):
     # exprs the old scanner could not see).
     if CONST_PATH.match(expr):
         leaf = expr.rsplit("::", 1)[-1]
+        if const_collisions and leaf in const_collisions:
+            # WO-S8-8: the leaf-keyed global index is first-wins by
+            # construction; a leaf bound to DIFFERENT values across
+            # the scanned crates cannot be resolved honestly — census.
+            return [], "const-collision"
         if leaf in const_strs:
             return [const_strs[leaf]], None
         return [], "const-unresolved"
@@ -159,12 +177,27 @@ def extract_from_source(rel: str, text: str):
     production scan itself uses."""
     describes: dict[str, str] = {}
     emissions, dyn_emissions = [], []
-    for name, a, b in rust_strip.macro_call_extents(text, ("describe_counter", "counter")):
+    for name, a, b in rust_strip.macro_call_extents(
+        text,
+        (
+            # WO-S8-8 (merged_bug_094): the INSTRUMENT axis is closed —
+            # histogram/gauge families join the walk (the live
+            # termination_reason_label helper feeds histogram!
+            # emissions the counter-only walk never saw, masking its
+            # own mixed-arm hole).
+            "describe_counter",
+            "counter",
+            "describe_histogram",
+            "histogram",
+            "describe_gauge",
+            "gauge",
+        ),
+    ):
         pieces = [squash(text[pa:pb]).strip() for pa, pb in rust_strip.split_top_level(text, a, b)]
         if not pieces:
             continue
         head = pieces[0]
-        if name == "describe_counter":
+        if name.startswith("describe_"):
             hm = NAME_LIT.match(head)
             if hm and len(pieces) >= 2:
                 describes[hm.group(1)] = help_text(" ".join(pieces[1:]))
@@ -211,6 +244,7 @@ def scan(src_root: pathlib.Path):
     dyn_emissions = []  # (file, field_path, key, expr, file_text)
     field_inits: dict[str, set] = defaultdict(set)
     const_strs: dict[str, str] = {}
+    const_seen: dict[str, set] = {}
     for crate in CRATES:
         croot = src_root / crate / "src"
         if not croot.is_dir():
@@ -229,15 +263,18 @@ def scan(src_root: pathlib.Path):
                 field_inits[m.group(1)].add(m.group(2))
             for m in CONST_STR.finditer(flat):
                 const_strs.setdefault(m.group(1), m.group(2))
-    return describes, emissions, dyn_emissions, field_inits, const_strs
+                const_seen.setdefault(m.group(1), set()).add(m.group(2))
+    const_collisions = {k for k, v in const_seen.items() if len(v) > 1}
+    return describes, emissions, dyn_emissions, field_inits, const_strs, const_collisions
 
 
-def check(describes, emissions, dyn_emissions=(), field_inits=None, const_strs=None):
+def check(describes, emissions, dyn_emissions=(), field_inits=None, const_strs=None, const_collisions=None):
     field_inits = field_inits or {}
     const_strs = const_strs or {}
+    const_collisions = const_collisions or set()
     fails, census = [], []
     for rel, metric, key, expr, file_text in emissions:
-        values, skip = resolve_reasons(expr, file_text, const_strs)
+        values, skip = resolve_reasons(expr, file_text, const_strs, const_collisions)
         if skip:
             census.append(f"{rel}: {metric} {key} `{expr}` [{skip}]")
             continue
@@ -256,7 +293,7 @@ def check(describes, emissions, dyn_emissions=(), field_inits=None, const_strs=N
         if not names:
             census.append(f"{rel}: dynamic metric `{field_path}` {key} `{expr}` [dynamic-unresolved]")
             continue
-        values, skip = resolve_reasons(expr, file_text, const_strs)
+        values, skip = resolve_reasons(expr, file_text, const_strs, const_collisions)
         if skip:
             census.append(f"{rel}: dynamic metric `{field_path}` {key} `{expr}` [{skip}]")
             continue
@@ -317,6 +354,80 @@ def main() -> int:
     f5, _ = check(d5, e5)
     if len(f5) != 1 or '"undocumented_exit"' not in f5[0]:
         print(f"FAIL: two-key self-test expected exactly the second-key drift, got {f5}", file=sys.stderr)
+        return 1
+    # --- W12-BF (WO-S8-8, merged_bug_094): the branch-derived plant
+    # corpus [GEN-SET] -- the skip-class alphabet is DERIVED from
+    # resolve_reasons' own source (a new resolution path cannot ship
+    # without a plant: the derivation reds here first), and every
+    # class is driven through the production pipeline.
+    import inspect
+
+    derived_classes = set(re.findall(r'return \[\], "([a-z-]+)"', inspect.getsource(resolve_reasons)))
+    class_plants = {
+        # class -> (helper file_text, expr, const_strs, const_collisions)
+        "helper-mixed-arms": (
+            'fn lbl(r: R) -> &str { match r { R::A => "a", R::B => other(r) } }',
+            "lbl(r)", {}, set(),
+        ),
+        "helper-unresolved": (
+            "fn lbl(r: R) -> &str { unimplemented() }",
+            "lbl(r)", {}, set(),
+        ),
+        "helper-truncated": (
+            "fn lbl(r: R) -> &str;",
+            "lbl(r)", {}, set(),
+        ),
+        "method-call": ("", "r.as_label()", {}, set()),
+        "const-unresolved": ("", "MISSING_CONST", {}, set()),
+        "const-collision": ("", "DUP_REASON", {"DUP_REASON": "first"}, {"DUP_REASON"}),
+        "non-literal": ("", "*reason", {}, set()),
+    }
+    if derived_classes != set(class_plants):
+        print(
+            f"FAIL: W12-BF — resolver branch census drifted from the plant corpus: "
+            f"derived {sorted(derived_classes)} vs planted {sorted(class_plants)}",
+            file=sys.stderr,
+        )
+        return 1
+    for cls, (ftext, expr, cstrs, ccoll) in class_plants.items():
+        vals, skip = resolve_reasons(expr, ftext, cstrs, ccoll)
+        if skip != cls or vals:
+            print(f"FAIL: W12-BF — plant for `{cls}` resolved ({vals}, {skip})", file=sys.stderr)
+            return 1
+    # The exhaustive helper still RESOLVES (the boundary's green side:
+    # every arm a literal, or-patterns sharing one arrow included).
+    ok_helper = 'fn lbl(r: R) -> &str { match r { R::A | R::B => "ab", R::C => "c" } }'
+    vals, skip = resolve_reasons("lbl(r)", ok_helper)
+    if skip is not None or sorted(vals) != ["ab", "c"]:
+        print(f"FAIL: W12-BF — the exhaustive helper did not resolve: ({vals}, {skip})", file=sys.stderr)
+        return 1
+    # The live masked shape (hole 3 masking hole 1): a mixed-arm
+    # helper feeding histogram! is EXTRACTED (instrument axis) and
+    # CENSUSED (exhaustiveness) -- pre-fix it was invisible to the
+    # counter-only walk and would have returned partial values.
+    masked_src = (
+        'fn term_lbl(r: R) -> &str { match r { R::Oom => dynamic(r), R::Other => "other" } }\n'
+        'metrics::histogram!("rio_t_seconds", "reason" => term_lbl(reason)).record(1.0);\n'
+        'describe_histogram!("rio_t_seconds", "Terminal latency (reason: other = fallback).");\n'
+    )
+    d6, e6, _ = extract_from_source("planted.rs", strip_comments(masked_src))
+    if len(e6) != 1:
+        print(f"FAIL: W12-BF — the histogram emission was not extracted (instrument axis): {e6}", file=sys.stderr)
+        return 1
+    f6, c6 = check(d6, e6)
+    if f6 or len(c6) != 1 or "[helper-mixed-arms]" not in c6[0]:
+        print(f"FAIL: W12-BF — the masked mixed-arm case did not census: fails={f6} census={c6}", file=sys.stderr)
+        return 1
+    # A gauge-family drift FAILS like a counter's (the axis is closed,
+    # not merely walked): an undocumented literal on gauge!.
+    gauge_src = (
+        'describe_gauge!("rio_g", "Pool gauge (phase: warm = ready).");\n'
+        'metrics::gauge!("rio_g", "phase" => "draining").set(1.0);\n'
+    )
+    d7, e7, _ = extract_from_source("planted.rs", strip_comments(gauge_src))
+    f7, _ = check(d7, e7)
+    if len(f7) != 1 or '"draining"' not in f7[0]:
+        print(f"FAIL: W12-BF — the gauge-family drift did not fail: {f7}", file=sys.stderr)
         return 1
     # Self-test (merged_bug_019 axis 2, the WINDOW-OVERFLOW plant): a
     # helper fn whose LAST arm sits past the old 2500-char window —
@@ -383,8 +494,8 @@ def main() -> int:
             print(f"FAIL: population-floor plant did not red per crate: {ff}", file=sys.stderr)
             return 1
 
-    describes, emissions, dyn_emissions, field_inits, const_strs = scan(src_root)
-    fails, census = check(describes, emissions, dyn_emissions, field_inits, const_strs)
+    describes, emissions, dyn_emissions, field_inits, const_strs, const_collisions = scan(src_root)
+    fails, census = check(describes, emissions, dyn_emissions, field_inits, const_strs, const_collisions)
     fails = floor_fails(src_root) + fails
     if not describes or not emissions:
         # The vacuity face of the scan itself: a staged tree that
