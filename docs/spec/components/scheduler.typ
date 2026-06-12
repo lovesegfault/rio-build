@@ -4539,7 +4539,7 @@ only.
   lease to a holder other than this replica --- on whichever arm observes it
   (a Completed round's standby resolution or an act-failed round's completed
   read) --- or a second consecutive believing 409 exhausting the one-round
-  deferral. And EVERY believing completed read of a LATER round MUST
+  deferral. And every believing completed read of a LATER round MUST
   resolve a pending deferral: a read resolving holder=us clears it through
   the observation funnel (own-commit evidence, frozen content, and
   moved-content-without-ledger alike), a read resolving holder=other

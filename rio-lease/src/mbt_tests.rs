@@ -888,7 +888,7 @@ fn mbt_run_crash_recover_renew() {
 
 /// The loop-shim correspondence pin (merged_bug_053, commit 2): the
 /// driver's base-regime edge law above and the production round
-/// derivation (`complete_round`) are two copies of the SAME shim in
+/// derivation (`complete_round`) are two copies of the same shim in
 /// two regimes — this table holds them cell-by-cell so neither can
 /// drift silently. Cells where the regimes coincide must agree
 /// exactly; the believing-Conflict column is the DOCUMENTED regime

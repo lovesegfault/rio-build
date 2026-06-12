@@ -73,7 +73,6 @@ docs/spec/components/scheduler.typ	bounds the staleness from ANY marks falsifier
 docs/spec/components/scheduler.typ	budget's exclusion key is the attempt's _source node_, and ONLY that: an
 docs/spec/components/scheduler.typ	cached content, mark that edge as cutoff and skip downstream only when ALL
 docs/spec/components/scheduler.typ	claimable listing forever, so re-listing can never recover it). Crashed
-docs/spec/components/scheduler.typ	deferral. And EVERY believing completed read MUST resolve a pending
 docs/spec/components/scheduler.typ	deleting rows strictly below the cut can never lower a cycle count, and both
 docs/spec/components/scheduler.typ	dispatches the SAME shape. `queued_by_system` carries the unfiltered
 docs/spec/components/scheduler.typ	drv_hash = ANY($1)`. The merge-time resubmit-reset path (`reset_on_resubmit`)
@@ -894,7 +893,6 @@ rio-lease/src/lib.rs	/// The injected-client form of [`run_lease_loop`]: the SAM
 rio-lease/src/lib.rs	/// The own-commit evidence arm consumes the SAME completed-read
 rio-lease/src/lib.rs	/// The spawns are hoisted after the outcome match so EVERY arm
 rio-lease/src/lib.rs	/// [`LeaderState::step_down_for`]. `u64::MAX` can never collide with a
-rio-lease/src/lib.rs	/// `believes x Holder x Content x Ledger` product (the ALL consts
 rio-lease/src/lib.rs	/// a later re-acquire at the SAME count is the deliberate same-epoch
 rio-lease/src/lib.rs	/// a lose + re-acquire at the SAME count is the same epoch, and its
 rio-lease/src/lib.rs	/// and no round ever Completed, so the foreign term was NEVER

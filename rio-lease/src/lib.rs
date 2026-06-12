@@ -1640,10 +1640,12 @@ struct RoutingVerdict {
 }
 
 impl RoutingVerdict {
-    /// The ONLY discharge: consume the carrier, surface the action for
-    /// an exhaustive match. Every production call site's `execute()`
-    /// feeds a total `match` (the census pins the site count and
-    /// shapes).
+    /// The only discharge (the honest tiers at the type doc: the
+    /// un-discharged comparison shape does not compile, discard
+    /// panics, `mem::forget` stays representable): consume the
+    /// carrier, surface the action for an exhaustive match. Every
+    /// production call site's `execute()` feeds a total `match` (the
+    /// census pins the site count and shapes).
     fn execute(self) -> ActFailedAction {
         let action = self.action;
         std::mem::forget(self);
@@ -2194,7 +2196,7 @@ fn complete_round(facts: ReadFacts, outcome: ActCell, standing: StandingCells) -
         clear_ledger_wholesale: !is_conflict,
         // What the completed READ observed is recorded separately
         // from what the ACT returned (merged_bug_064): the act's shape
-        // supersedes the read's observation ONLY when the act itself
+        // supersedes the read's observation ONLY when the act itself — quantifier: census(test: complete_round_consumption_precedes_adjudication_over_full_product) —
         // committed a write of ours (Leading). facts:None conflated
         // two opposite-epistemic Create outcomes — POST won (baseline
         // genuinely stale) and POST bounced (the 404 is the round's
@@ -4000,8 +4002,8 @@ mod complete_round_proofs {
     }
 
     /// r[verify sched.lease.holder-evidenced-lose+4]
-    /// W12-X(a): the exhausted lose edge derives ONLY from an
-    /// unresolved pending deferral — a round whose consult consumed
+    /// W12-X(a): the exhausted lose edge derives ONLY from an — quantifier: census(kani: lease_round_lose_requires_unresolved_deferral) —
+    /// unresolved pending deferral; a round whose consult consumed
     /// funnel-grade evidence answered the pending question and can
     /// never fire the stale-snapshot lose (merged_bug_053's headline
     /// cell, total over the product including the fence-shadowed
@@ -7437,7 +7439,7 @@ mod tests {
     /// act-failed arm.
     ///
     /// Pre-fix the Completed-conflict consult computed the verdict
-    /// through the total law and executed ONLY the EvidenceResolve
+    /// through the total law and executed only the EvidenceResolve
     /// variant — (true, Absent) computed AbsenceLose and silently
     /// dropped it, so the round fell through to the one-round 409
     /// deferral and the ex-leader kept `is_leader=true` for another
@@ -10803,8 +10805,8 @@ mod tests {
     /// over the FULL `act x holder x content x ledger x fence x
     /// standing` product, the round derivation orders consumption
     /// before adjudication — a round that consumes funnel-grade
-    /// evidence can NEVER fire the exhausted lose edge (the
-    /// stale-snapshot wipe is underivable), its own 409 still pends
+    /// evidence can NEVER fire the exhausted lose edge — quantifier: census(kani: lease_round_lose_requires_unresolved_deferral) —
+    /// (the stale-snapshot wipe is underivable), its own 409 still pends
     /// (Deferred — the two-409 bound neither stretches nor collapses),
     /// the defer edge never stamps, and folding the plan through the
     /// PRODUCTION standing transitions lands every edge on a coherent
@@ -11032,8 +11034,9 @@ mod tests {
     // r[verify sched.lease.holder-evidenced-lose+4]
     /// bug_002 census (Q1-1, machine-derived): iterate the GENERATED
     /// `believes x Holder x Content x Ledger x ActDoubt` product (the
-    /// ALL consts are pinned by route_act_failed_read's own total
-    /// match — a new cell variant fails compilation there) and assert
+    /// per-cell variant arrays are pinned by route_act_failed_read's
+    /// own total match — a new cell variant fails compilation there)
+    /// and assert
     /// the routing table against an independently written total spec
     /// table KEYED by the product type, so under-enumeration cannot
     /// compile in either function. Also pins the alphabet laws
@@ -11140,7 +11143,8 @@ mod tests {
                                  {c:?}, {l:?}, {d:?}) -> {routed:?}"
                             );
                             // Every non-absence row is doubt-invariant:
-                            // the axis prices ONLY the absence hold.
+                            // the axis prices ONLY the absence hold — quantifier: census(test: act_failed_cell_census_total) —
+                            // the assert below is the binding row.
                             if !matches!(h, HolderCell::Absent) {
                                 assert_eq!(
                                     routed,
