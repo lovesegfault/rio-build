@@ -589,6 +589,18 @@ pub fn is_outlier(
 /// `avg_cores = cpu_seconds / wall` is hw-invariant (both terms scale by
 /// the same `α·factor`), so this is computed on raw wall — no `HwTable`
 /// dependency, and no circular α-dep into the ALS gate it feeds.
+/// THE avg-cores producer (bug_014, R33: one quantity, one producing
+/// fn): `cpu_seconds_total / duration_secs`, TOTAL over its domain —
+/// `None` when the wall is non-positive, so the distant producer-side
+/// gate (the completion path binds `duration_secs > 0.0`) is locally
+/// irrelevant to every consumer. Both consult sites (`observed_p_bar`,
+/// `derive_explore_state`) import; neither re-decides the restriction.
+fn avg_cores(r: &BuildSampleRow) -> Option<f64> {
+    r.cpu_seconds_total
+        .filter(|_| r.duration_secs > 0.0)
+        .map(|ct| ct / r.duration_secs)
+}
+
 fn observed_p_bar(rows: &[&BuildSampleRow], w: &[f64]) -> f64 {
     let any_unsat = rows.iter().any(|r| {
         matches!(
@@ -602,11 +614,7 @@ fn observed_p_bar(rows: &[&BuildSampleRow], w: &[f64]) -> f64 {
     let (avg, aw): (Vec<f64>, Vec<f64>) = rows
         .iter()
         .zip(w)
-        .filter_map(|(r, &wi)| {
-            r.cpu_seconds_total
-                .filter(|_| r.duration_secs > 0.0)
-                .map(|ct| (ct / r.duration_secs, wi))
-        })
+        .filter_map(|(r, &wi)| avg_cores(r).map(|a| (a, wi)))
         .unzip();
     if avg.is_empty() {
         f64::INFINITY
@@ -851,14 +859,19 @@ fn derive_explore_state(cur_cs: &[f64], last: Option<&BuildSampleRow>) -> Explor
             (lo.min(c), hi.max(c))
         });
     let min_c = if min_c.is_finite() { min_c } else { 0.0 };
-    // "Saturated" = last build's mean utilisation (cpu-seconds / wall /
-    // limit) exceeded 40% — i.e. the build actually used the cores it was
-    // given, so probing higher is worth it.
+    // "Saturated" = last build's mean utilisation (avg-cores / limit)
+    // exceeded 40% — i.e. the build actually used the cores it was
+    // given, so probing higher is worth it. The ratio derives through
+    // THE one producer (`avg_cores` — bug_014): pre-fix this site
+    // re-decided the domain restriction inline with NO zero-duration
+    // guard while observed_p_bar filtered the identical ratio, so a
+    // positive-cpu/zero-wall row read +inf > 0.4 and spuriously
+    // marked the key saturated.
     let saturated = last
         .and_then(|r| {
-            r.cpu_seconds_total
+            avg_cores(r)
                 .zip(r.cpu_limit_cores)
-                .map(|(secs, lim)| secs / r.duration_secs / lim > 0.4)
+                .map(|(a, lim)| a / lim > 0.4)
         })
         .unwrap_or(false);
     ExploreState {
@@ -909,6 +922,35 @@ mod tests {
 
     fn r_hw(rows: &[BuildSampleRow], hw: &HwTable) -> FittedParams {
         refit(&key(), rows, None, &[], hw, None)
+    }
+
+    /// **W12-AJ (bug_014)** — *the avg-cores domain restriction is
+    /// decided ONCE, in the single producer; population: both consult
+    /// sites.* A positive-cpu/zero-wall row (manual-SQL/fixture-only:
+    /// the production writer gate held in EVERY era — the triage
+    /// correction; pure defensive-parity): pre-fix
+    /// `derive_explore_state` computed `secs / 0.0 / lim = +inf > 0.4`
+    /// inline and spuriously marked the key saturated, while sibling
+    /// `observed_p_bar` filtered the identical ratio — two consumers
+    /// re-deciding one derived quantity's domain. Post-fix both
+    /// import `avg_cores` and agree: None.
+    #[test]
+    fn w12_aj_avg_cores_domain_decided_once() {
+        let mut z = row(4.0, 0.0);
+        z.cpu_seconds_total = Some(50.0); // positive cpu, zero wall
+        assert_eq!(avg_cores(&z), None, "the producer refuses zero wall");
+        let e = derive_explore_state(&[], Some(&z));
+        assert!(
+            !e.saturated,
+            "a zero-wall row cannot mark the key saturated (pre-fix: \
+             +inf > 0.4 — the inline re-decision)"
+        );
+        // The live direction preserved: a genuine saturated row still
+        // saturates (avg/limit = 0.5 > 0.4) and the producer agrees
+        // with the raw ratio on its lawful domain.
+        let r = row(4.0, 100.0);
+        assert_eq!(avg_cores(&r), Some(2.0));
+        assert!(derive_explore_state(&[], Some(&r)).saturated);
     }
 
     fn r_prior(rows: &[BuildSampleRow], priors: &PriorSources) -> FittedParams {
