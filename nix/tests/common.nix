@@ -160,8 +160,8 @@ rec {
   # controller-role service token (RIO_PULL_SPAWNER_SERVICE_TOKEN,
   # minted by fixtures/standalone.nix) on the admin calls, exactly as
   # rio-controller presents its own. Executor-lifecycle T-1c.2b
-  # standalone re-point; per-check dispositions live in
-  # docs/spec/models/executor-invariant-map.md (Phase-1c record).
+  # standalone re-point; per-check dispositions ride the re-pointing
+  # commit (git history).
   #
   # Intent pick: ordinal-staggered (trailing digits of the hostname)
   # so a multi-worker fixture spreads simultaneously-Ready intents

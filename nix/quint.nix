@@ -97,8 +97,8 @@ let
   modelsDir = unfilteredRoot + "/docs/spec/models";
 
   # The §9.1 successor conjunction for materializationJob.qnt (shared
-  # by the five per-regime holds checks below; the C-prime stage
-  # record's property table is the authoritative gloss).
+  # by the five per-regime holds checks below; the model's property
+  # doc comments are the authoritative gloss).
   matJobInvariants = [
     "boundsOK"
     "noFromSourceWhileJobUnresolved"
@@ -152,7 +152,8 @@ let
     # A3 materialization-lifecycle-kernel (bughunt wave) — the
     # contract re-derivation: budget verdicts are per-job-window sound
     # on BOTH charge channels (067 — the owner-signed Q5 reversal of
-    # counter-signed residual (a) — and 020's 085-window), a pending
+    # counter-signed residual (a), archived in
+    # substitution-replacement-records.md — and 020's 085-window), a pending
     # unclaimed job never strands its node Running (015/307 — the
     # atomic release_claim), and the stale-reset carrier survives
     # creation-to-completion (257/055 — #[must_use]
@@ -1287,8 +1288,9 @@ rec {
     # exempt from the loop-discipline tick cap (the honest statement of
     # the bug: the loop-interval assumption never held across a parked
     # await), so dual belief IS reachable here and the operative
-    # property is boundedDualLeadership, not neverDual — see the module
-    # comment and lease-invariant-map.md's documented deviation (a).
+    # property is boundedDualLeadership, not neverDual — see the
+    # leaderElection.qnt suspend-module close, which states the
+    # deviation-(a) rationale standalone.
     # The production fix encoded: renewReadOk stamps the fence from the
     # attempt-start ANCHOR (RenewAnchor/BlindClock); the paired
     # expect-violation pin is quint-lease-calib-096-response-anchor,
@@ -1985,8 +1987,9 @@ rec {
     # accept predicate, the immutable chunk manifest, the read path's
     # ordered-walk dedup over overlapping sessions, the completeness
     # fold, and the TTL sweep. The acceptance test for the model is the
-    # 22-bug calibration table in docs/spec/models/log-invariant-map.md
-    # re-run against this architecture. State counts, depths, and
+    # predecessor campaign's 22-bug corpus re-run against this
+    # architecture — executed: the MODEL-C ACCEPTANCE TABLE in the
+    # logService.qnt header carries every row's verdict. State counts, depths, and
     # wall-clocks are in the introducing commit's message and each
     # check's transcript.
     #
@@ -2732,19 +2735,83 @@ rec {
     # quint-retry-policy-pull in the executor-campaign block below) is
     # the wired proof of the same fold invariants over the live
     # event-arrival environment; it now also carries the model-checked
-    # markers the retired regime checks held. The retirement record --
-    # including the disposition of every retired non-vacuity pin and
-    # what carries it now -- is in
-    # docs/spec/models/retry-invariant-map.md (the executor-campaign
-    # 1c' retirement section); the witness vals stay defined in the
-    # core module, and the load-bearing ones are re-pinned on the pull
-    # regime here.
+    # markers the retired regime checks held. THE RETIREMENT RECORD
+    # (T-1c'.6, relocated here from the retired retry invariant map —
+    # this block is now the record; rule ids cited base-form): the
+    # witness vals stay defined in the core module, the load-bearing
+    # ones are re-pinned on the pull regime here, and every retired
+    # check's pin carries on as follows:
+    #   - quint-retry-policy-{worker,dual,crash,failover} (exhaustive
+    #     regimes): carried by quint-retry-policy-pull — same
+    #     invariants over the live event-arrival environment (plus
+    #     recoveryPreservesPoisonStatus); attemptsBoundedGlobal keeps
+    #     its bound through boundsOK in the pull HOLD list, the
+    #     attempts-bounded kani harness and the fold unit tests.
+    #   - quint-retry-policy-runs-* (divergence-reproducer
+    #     narratives): retired with their regimes; the adjudications
+    #     stay enforced by the same invariants in the pull HOLD list.
+    #   - witnesses threshold / cache-hit / crash-terminal /
+    #     failover-history: re-wired as the
+    #     quint-retry-policy-pull-witness-* checks below.
+    #   - witnesses infra-cap / exempt-cap / timeout-cancel /
+    #     window-reset / exempt-fallthrough / controller-cap /
+    #     promoted-termination: their charge arms are in the pull
+    #     alphabet and the cap/window arithmetic is fold-internal —
+    #     carried by verdictMatchesFold + countersRefineHistory on
+    #     the pull regime, the fold unit tests and the kani
+    #     contracts; poison reachability is re-pinned by the
+    #     threshold witness.
+    #   - witness atcap-termination: already pinned
+    #     (quint-retry-policy-pull-witness-fill-charge); witness
+    #     fleet-exhaust: already pinned (-witness-fleet-exhaust);
+    #     witness crash-charge: already pinned
+    #     (-witness-establishment).
+    #   - witnesses late-installment / race-ahead: the correlation
+    #     and disconnect channels are deleted; the pull-path analogs
+    #     (reason-only second installment on a recorded row;
+    #     controller fill on a still-open attempt) are pinned by the
+    #     Model-S canReachSecondInstallment witness and
+    #     -witness-no-attempt-noop.
+    #   - witness ttl-expiry: verified violating on the pull regime
+    #     (exhaustive TLC) but demoted to a documented manual target
+    #     on the cold-server conversion flake. Manual recipe:
+    #     quint verify --backend=tlc --main=retryPolicyPull
+    #     --step=pullStep --invariant=noTtlExpiry
+    #     docs/spec/models/retryPolicy.qnt
+    #     The TTL-clear lifecycle keeps its scheduler unit/VM
+    #     coverage; re-wire alongside the siblings when the
+    #     conversion flake is addressed.
+    #   - witness failover-poisoned: same demotion, same reason.
+    #     Manual recipe:
+    #     quint verify --backend=tlc --main=retryPolicyPull
+    #     --step=pullStep --invariant=noFailoverOnPoisonedRow
+    #     docs/spec/models/retryPolicy.qnt
+    #     recoveryPreservesPoisonStatus itself stays exhaustively
+    #     HOLD in the wired pull check.
+    #   - witness tx-failure: retired without a wired successor —
+    #     TX_FAULTS = 0 in the pull regime, so the inversion has no
+    #     wired producer; the post-066 single-transaction property
+    #     keeps its code-level coverage (the append_and_decide_in_tx
+    #     error-arm unit tests), and attemptTxFails stays in the
+    #     core module as the documented manual target should a pull
+    #     fault regime be wired later. Recorded, not silently
+    #     dropped.
+    # Verify-marker re-points: the model-checked markers held by the
+    # retired regime checks moved to quint-retry-policy-pull
+    # (counters-refine-history, no-double-count,
+    # verdict-channel-invariant, cascade-dependents, failover-budget,
+    # recovery-projection); transient-budget and attempts-bounded
+    # dropped their model markers (kani + fold unit-test markers
+    # unchanged). Bit-identical gate: retryPolicyPull was not edited
+    # by the retirement and the re-built check reported the same
+    # distinct-state count and depth.
     #
     # The Stage-B as-built encoding (retryPolicyAsBuilt.qnt), its
     # Stage-C calibration corpus (calibration/retry-*.qnt) and the six
     # quint-retry-calib-* checks were retired in the retry campaign's
     # Phase 2 once the acceptance table consolidated their evidence --
-    # see docs/spec/models/retry-invariant-map.md.
+    # see docs/spec/models/retry-records.md (the acceptance table and
+    # the retirement record).
 
     # Non-vacuity witnesses re-pinned on the pull regime (T-1c'.6): the
     # contended states the retired regimes' witnesses pinned that are
@@ -2758,11 +2825,12 @@ rec {
     # targets instead of wired checks: their derivations repeatedly hit
     # the cold-server conversion failure documented above while four
     # identically-shaped siblings built green, so the demotion is a
-    # tooling-budget call, recorded in the retry map, not a
-    # reachability gap. The pins whose producers were deleted with the
-    # stream machinery (the appending-tx fault at TX_FAULTS = 0, the
-    # as-built channel-ordering shapes) are likewise recorded as
-    # retired in the retry map rather than silently dropped.
+    # tooling-budget call (recorded in the retirement block above, with
+    # the manual recipes), not a reachability gap. The pins whose
+    # producers were deleted with the stream machinery (the
+    # appending-tx fault at TX_FAULTS = 0, the as-built
+    # channel-ordering shapes) are likewise recorded there rather than
+    # silently dropped.
     quint-retry-policy-pull-witness-threshold = mkQuintWitnessCheck {
       name = "retry-policy-pull-witness-threshold";
       spec = "retryPolicy";
@@ -2797,7 +2865,7 @@ rec {
     # chunks.refcount counter and the claim/heartbeat/drop-guard/token/
     # reaper machinery that maintains it (chunkLiveness.qnt — the
     # refcount-formal campaign's Phase-0 Stage-B model; the invariant ↔
-    # rule map is docs/spec/models/refcount-invariant-map.md). Four
+    # rules live in docs/spec/components/store.typ). Four
     # exhaustive regimes mirror design §3.2: base (one writer, no
     # faults), crash (process death between transactions, the drain's
     # mid-commit crash), contend (two writers sharing chunks against the
@@ -3084,14 +3152,14 @@ rec {
     };
 
     # The pre-registered as-built deviations of the corrupt regime
-    # (refcount-invariant-map.md, CR-2/CR-3 rows): with a corrupt
+    # (refcount-records.md §1, the Stage-B CR-2/CR-3 rows): with a corrupt
     # chunk_list skip, the exact counter-equals-fold form and the
     # unconditional no-stranded-garbage form MUST falsify — the C12
     # permanent leak the design's replacement exists to dissolve. These
     # are reproducer checks for documented defects, not regressions: if
     # either stops falsifying, the model has stopped reaching the leak
-    # (or the code stopped leaking) and the invariant map's Stage-B
-    # section must be revisited. The third check pins the literal leak
+    # (or the code stopped leaking) and the archived Stage-B record
+    # (refcount-records.md §1) must be revisited. The third check pins the literal leak
     # shape (refcount above zero with no referencing manifest).
     quint-chunk-liveness-corrupt-c12-overcount = mkQuintWitnessCheck {
       name = "chunk-liveness-corrupt-c12-overcount";
@@ -3137,7 +3205,8 @@ rec {
     # were reintroduced, and that the invariant is not vacuous for it.
     # The full per-commit calibration table (and the evidence-only
     # override modules that are not wired here) lives in
-    # docs/spec/models/refcount-invariant-map.md; the wired ones are the
+    # docs/spec/models/refcount-records.md §2 and the per-family
+    # VERDICT ROWS in calibration/refcount-g*.qnt; the wired ones are the
     # representative per-family regression guards (one per encodable
     # family, deepest consequence, cheap state space). Deliberately no
     # tracey markers (same policy as the other witness checks).
@@ -3146,10 +3215,19 @@ rec {
     # retired at Release B of the refcount-formal campaign: the
     # PlaceholderToken and the decrement family they guarded no longer
     # exist in the code, so the regressions they watched for cannot
-    # recur by construction. Their override modules
-    # (calibration/refcount-g{1,2}.qnt) stay committed as evidence and
-    # remain re-runnable by hand; the disposition record is in the
-    # invariant map ("Release B calibration-check disposition"). The
+    # recur by construction: G1's token-less rollback clobbering a
+    # successor's placeholder cannot recur (the rollback is the
+    # claim-gated reap_one row delete — no token to lose, no decrement
+    # to double-apply, and cr3CounterRefinesFold describes a counter
+    # with no writers left); G2's inline-only reap stranding the
+    # counter above zero is indistinguishable from shipped behavior at
+    # model resolution (every reap is a path-row delete, no counter is
+    # maintained — the leak class is dissolved, not guarded). Their
+    # override modules (calibration/refcount-g{1,2}.qnt) stay committed
+    # as evidence and remain re-runnable by hand; Release B took the
+    # retire-at-deletion reading of plan P12 (an expect-violation check
+    # whose falsification target has no remaining implementation guards
+    # nothing), recorded rather than executed silently. The
     # surviving G3/G4a/G5 guards below watch mechanisms that outlived
     # the counter (presence keyed on uploaded_at, the drain re-check,
     # the heartbeat) and stay wired against the as-built model until
@@ -3195,8 +3273,8 @@ rec {
     # rio-store's chunk-liveness subsystem, REPLACEMENT shape: lazy
     # mark-and-collect over the durable manifests (chunkCollect.qnt —
     # the refcount-formal campaign's Phase-1a / plan T-1a.5 model,
-    # design §4/§4.6; the verdict table and witness list are in
-    # docs/spec/models/refcount-invariant-map.md "Replacement model").
+    # design §4/§4.6; the verdicts are the wired checks below, and the
+    # encoding notes are archived in refcount-records.md §4).
     # The model is the counter-free end state: no refcount, no
     # decrement/token machinery; the collector of
     # rio-store/src/gc/collect.rs (snapshot → fail-closed mark →
@@ -4234,8 +4312,8 @@ rec {
     #   spawn pass and the dispatched_cells-arming ack. Six
     #   configurations: base / fault-rpc / fault-lease / fault-stale on
     #   the production Builder+CRD shape, plus the crd-absent and
-    #   Fetcher-pool postures (the C1/C2 adjudications in
-    #   docs/spec/models/controller-invariant-map.md).
+    #   Fetcher-pool postures (the C1/C2 adjudication record at
+    #   spawnCoherence.qnt's gate-split block).
     #
     #   nodeclaimLifecycle.qnt (Model N) — the L10 NodeClaim-pool
     #   reconciler's mirror lifecycle (nodeclaim_pool/): the lease-edge
@@ -4247,9 +4325,8 @@ rec {
     #   budgets over the hw-class config mirror. Four regimes: base /
     #   fault-rpc / fault-lease / fault-karpenter.
     #
-    # The Stage-A invariant map (controller-invariant-map.md) is the
-    # rule <-> invariant ledger for both models; its Stage-B section
-    # records the per-regime verdicts. The two pre-registered as-built
+    # The Stage-A rule <-> invariant ledger and the Stage-B per-regime
+    # verdicts are archived in docs/spec/models/controller-records.md. The two pre-registered as-built
     # falsifications (the ⊥-tick early-return observation skip) are
     # wired as expect-violation checks plus a named-run check below —
     # they stay green only while the documented defect reproduces, and
@@ -4534,8 +4611,9 @@ rec {
     # reaps + prunes; no create / republish / ack on either. Includes
     # idleReapSafety and bootSampleNotLost as HOLD invariants: their
     # pre-fix falsification was the corpus's only pre-registered
-    # as-built defect, flipped per the invariant map's protocol when
-    # the skip was fixed.
+    # as-built defect, flipped per the recorded
+    # expected-falsification protocol when the skip was fixed (the
+    # executed flip is noted in the nodeclaimLifecycle.qnt header).
     # r[verify ctrl.nodeclaim.consolidate-only-degraded+3]
     # r[verify ctrl.nodeclaim.budget.per-class+3]
     quint-nodeclaim-lifecycle-fault-rpc = mkQuintCheck {
@@ -4822,7 +4900,7 @@ rec {
 
     # ---- Controller Stage-C calibration witnesses --------------------
     # The controller-formal historical-fix corpus replayed against the
-    # two reconcile models (controller-invariant-map.md, the Stage-C
+    # two reconcile models (controller-records.md, the Stage-C
     # calibration table). Each check instantiates the as-built model,
     # swaps ONE tick action for its PRE-FIX behavior (the calibration
     # module's `calibStep`) and passes only while the checker still
@@ -4943,27 +5021,21 @@ rec {
     # The Stage-B AS-BUILT encoding of the stream session machinery was
     # frozen, unwired, as executorSessionAsBuilt.qnt (P14) and retired
     # on 2026-05-29 — the file is deleted, git history is the archive
-    # (the invariant map's retirement record). Its retired checks and
-    # the disposition of every retired witness/calibration check are
-    # recorded in the invariant map's Phase-1c' re-target record.
+    # (the retirement record and the per-check dispositions ride the
+    # retiring commits; the archive note is in calibration/README.md).
     #
     # Model D (executorDelivery.qnt) was retired with the 1d builder
     # collapse (T-1d.4): the stream-era delivery choreography it modeled
     # (permanent sink, relay swap, half-close flush, drain gate, idle
     # exit, generation watermark) no longer exists. Its guarantees'
-    # carriers are recorded in the invariant map's Model-D retirement
-    # record: the pull report-retry loop and exit-code unit batteries
+    # carriers, as recorded at the Model-D retirement: the pull
+    # report-retry loop and exit-code unit batteries
     # (builder.completion.exactly-once-or-death+2 verify markers), the
     # scheduler-side report idempotency tests, the chaos VM suite, and
     # — Phase 2 — the fold_report Kani contract. The model file and its
     # two f2d calibration override modules are deleted (git history
-    # holds them); the f2d calibration family's acceptance verdict is
-    # pre-staged in the retirement record.
-    #
-    # The invariant ↔ rule map, the Stage-B record for the frozen
-    # as-built model, and the Phase-1c' re-target record (verdicts,
-    # bounds, retirements) are in
-    # docs/spec/models/executor-invariant-map.md.
+    # holds them, with the f2d family's acceptance verdict in the
+    # retiring commit).
 
     # The base regime: the full pull lifecycle with no leader faults —
     # forecast spawn before Ready, the bounded NotYetReady retry loop
@@ -5014,7 +5086,7 @@ rec {
     # stale-epoch, rollback, adopt, failover-inflight,
     # deposed-believer, reap-after-stall, two-channel-death,
     # establishment, race-ahead) are recorded with their dispositions
-    # in the invariant map's Phase-1c' re-target record.
+    # in the re-targeting commit (git history).
     quint-executor-session-witness-warm-start = mkQuintWitnessCheck {
       name = "executor-session-witness-warm-start";
       spec = "executorSession";
@@ -5094,8 +5166,8 @@ rec {
 
     # ---- Executor-lifecycle Stage-C calibration witnesses -------------
     # The executor-lifecycle (campaign #1) historical-fix corpus replayed
-    # against Models S and D (executor-invariant-map.md, the Stage-C
-    # calibration section). Each check instantiates a model, swaps ONE
+    # against Models S and D (the Stage-C records; archive note in
+    # calibration/README.md). Each check instantiates a model, swaps ONE
     # action for its PRE-FIX behavior (the calibration module's
     # `calibStep`) and passes only while the checker still falsifies the
     # invariant the corresponding historical fix protects — machine-
@@ -5106,8 +5178,8 @@ rec {
     # the AS-BUILT stream machinery, which the deletion commits removed
     # — the states they pinned are unconstructible by design on the
     # pull path, so they are retired with records (the per-family
-    # "cannot recur by construction" verdicts are pre-staged in the
-    # invariant map's Phase-1c' re-target record):
+    # "cannot recur by construction" verdicts ride the retiring
+    # commits):
     #   - quint-executor-calib-f1-stale-epoch (stream-epoch attribution
     #     — no streams, no epochs; per-unary identity + the generation
     #     fence are the successors),
@@ -5120,14 +5192,14 @@ rec {
     #     exclusion — no scheduler-side placement decision exists).
     # Their override modules stayed under calibration/ as evidence over
     # the frozen executorSessionAsBuilt.qnt until the 2026-05-29
-    # as-built retirement deleted both (git history is the archive; the
-    # invariant map's retirement record has the dispositions). F4
+    # as-built retirement deleted both (git history is the archive, the
+    # dispositions ride the retiring commit). F4
     # re-encodes against the re-targeted model below;
     # F2d (Model D, builder half) retired with Model D at the 1d builder
     # collapse — the machinery it pinned (completion_pending arming, the
     # half-close flush) no longer exists, so the state is
-    # unconstructible by design; verdict pre-staged in the invariant
-    # map's retirement record. Deliberately no tracey markers (the spec
+    # unconstructible by design; verdict recorded with the retirement.
+    # Deliberately no tracey markers (the spec
     # rules are verified by the HOLD regime checks above, not by these
     # pre-fix reproductions).
 
@@ -5570,11 +5642,11 @@ rec {
     # re-evaluation split, the five-origin set, the recovery view
     # rebuild, the must_substitute claim upgrade). The §9.1 successor
     # property table (21 invariants incl. the three at-decision-time
-    # re-encodes and the delta-derived invariants), the §9.3
-    # calibration-transfer verdict table, and the exhaustive-budget
-    # measurement record live in
-    # docs/spec/models/substitution-replacement-invariant-map.md
-    # (C-prime stage record).
+    # re-encodes and the delta-derived invariants) is glossed by the
+    # model's property docs; the §9.3 calibration-transfer verdict
+    # table lives in calibration/README.md (the materializationJob
+    # section) and the exhaustive-budget measurement record in the
+    # materializationJob.qnt header MEASUREMENT block.
     #
     # Check-set shape (the closure-evidence Phase-1 precedent): the
     # exhaustive TLC conjunctions do not converge inside a
@@ -5612,9 +5684,11 @@ rec {
       main = "materializationJobAdversarialStore";
       match = "staleResetRun";
     };
-    # A3 (bughunt wave): the owner-signed Q5 reversal's contract pin —
-    # a pure-establishment crash-loop parks at the budget
-    # (establishmentParkRun needs ENABLE_CRASH).
+    # A3 (bughunt wave): the owner-signed Q5 reversal's contract pin
+    # (the supersession record is archived in
+    # substitution-replacement-records.md) — a pure-establishment
+    # crash-loop parks at the budget (establishmentParkRun needs
+    # ENABLE_CRASH).
     quint-materialization-runs-crash-loop = mkQuintRunCheck {
       name = "materialization-runs-crash-loop";
       spec = "materializationJob";
@@ -5625,8 +5699,8 @@ rec {
     # Bounded-simulation HOLDS checks, one per design-scale regime —
     # the full 21-invariant §9.1 conjunction. Bounded evidence, not
     # proof: the exhaustive Ex-scope conjunctions are the documented
-    # manual targets (commands + measured budgets in the C-prime stage
-    # record). Sample sizing: the paired calibration pins' violation
+    # manual targets (commands + measured budgets in the
+    # materializationJob.qnt header MEASUREMENT block). Sample sizing: the paired calibration pins' violation
     # classes are found by the simulator in well under 100 K samples at
     # the smaller Ex scopes; 2 M samples at design scale clears the
     # 25/p flake floor with two orders of headroom.
@@ -5879,7 +5953,8 @@ rec {
     # and passes only while the checker still falsifies the §9.1
     # property the as-built mechanism protects. Verdict table (every
     # transferred family dispositioned, incl. the by-construction rows
-    # and the two liveness witness-flips): the C-prime stage record.
+    # and the two liveness witness-flips): calibration/README.md, the
+    # materializationJob verdict section.
     # TLC backend, first-violation (13-27 s each at the qualifying
     # measurement). No tracey markers on calibration checks.
 
@@ -6140,8 +6215,8 @@ rec {
     # half — the covered-creation space (the state the as-built
     # presence re-check excludes) is reachable under the override, so
     # the recorded no-falsification verdict (the §9.1 conjunction holds
-    # over that space — the C-prime stage record's by-construction
-    # evidence) is about a real space, not vacuity.
+    # over that space — the README verdict section's by-construction
+    # row) is about a real space, not vacuity.
     quint-materialization-calib-f1-covered-creation = mkQuintWitnessCheck {
       name = "materialization-calib-f1-covered-creation";
       spec = "calibration/mat-f1-no-presence-recheck";
@@ -6227,7 +6302,8 @@ rec {
     # not-representable pre-fix splits INTRODUCED calibration-only.
     # never-parks: the establishment charge without the park decision
     # (bug_067 — the counter-signed residual the Q5 reversal
-    # superseded; TLC first violation ~2.6s).
+    # superseded, substitution-replacement-records.md; TLC first
+    # violation ~2.6s).
     quint-materialization-calib-establish-never-parks = mkQuintWitnessCheck {
       name = "materialization-calib-establish-never-parks";
       spec = "calibration/mat-establish-never-parks";
@@ -6295,7 +6371,7 @@ rec {
     # refuses the younger claim behind a parked head while the
     # as-built free claim (the in-pass skip) proceeds from the same
     # state. The sim-witness encoding is edge-shaped and cannot flip
-    # (recorded in the calibration header + the invariant map).
+    # (recorded in the calibration header).
     quint-materialization-calib-head-starvation = mkQuintRunCheck {
       name = "materialization-calib-head-starvation";
       spec = "calibration/mat-head-starvation";
@@ -6424,8 +6500,22 @@ rec {
     # 2 replicas / 1 drv; the four calibration pins are the
     # falsifiability pairs (261 TOCTOU, 231 deposed close, 273 floor
     # regression, 393 terminal refusal). The fresh-insert-below-floor
-    # residual is deliberately reachable (priced in
-    # fence-invariant-map.md) — activeRowGenMonotonic holds with it.
+    # residual is deliberately reachable (priced in the
+    # fencedWrites.qnt header) — activeRowGenMonotonic holds with it.
+    #
+    # Budget record (relocated from the retired fence invariant map):
+    # the full T1 state space at MAX_GEN=3 / 2 replicas / 1 drv,
+    # re-measured at the bughunt-2 plane introduction with all three
+    # planes LIVE — 16,643,269 generated / 795,900 distinct / ~10.5 s
+    # TLC wall-clock, still seconds-class; the ENABLE_* axes exist so
+    # any future plane growth splits per-regime instead of multiplying
+    # one board. The four legacy calibrations were re-verified
+    # violating with the planes bound DORMANT (state space unchanged);
+    # the three plane calibrations each find first violation in ~2 s
+    # with only their own plane enabled. Kani ruling (directive 2):
+    # explicitly none-sensible for this workstream — the subjects are
+    # DB-transaction interleavings and a gRPC code mapping, not pure
+    # algebra; the kernel crates stay the kani domain.
     # ------------------------------------------------------------------
     # Bughunt-2 planes (slot 2): the same board gains (1) the
     # tenure-stamp plane — writesCarryClaimedTenure (merged_bug_338:
@@ -7617,8 +7707,8 @@ rec {
     # fan-out TLC must fully exhaust; measured at the wave window, TLC
     # ground ~10k distinct states in 1800 s without reaching it, while
     # the simulator finds it 6/6 at 20k samples in <1 s (seeds in the
-    # invariant map; the deterministic w11aiFoldlessWindowDropRed run
-    # in the module pins the exact trace as a named reproducer).
+    # introducing commit; the deterministic w11aiFoldlessWindowDropRed
+    # run in the module pins the exact trace as a named reproducer).
     # 200k samples = 10x margin over the measured discovery rate.
     # r[verify ctrl.pool.delete-outcome]
     # r[verify ctrl.pool.fold-clock]
@@ -8077,9 +8167,13 @@ rec {
     # obligations, egress pacing and the three-stage drain — modeled
     # against an explicit russh transport environment
     # (docs/spec/models/gwConnLifecycle.qnt). The invariant ↔ spec-rule
-    # map, the Stage-B B-measure, the Stage-C check-set decision and the
-    # per-check verdicts live in
-    # docs/spec/models/gw-session-invariant-map.md.
+    # map lives in the model's per-predicate Rule(s)/Carrier doc tags;
+    # the campaign close-out banner in gwConnLifecycle.qnt carries the
+    # counter-signed verdict record. Rerun interpretation (close-out
+    # rule): verdicts and exhaustive distinct-state counts reproduce
+    # EXACTLY; first-violation statistics (states/depth) are
+    # TLC-worker-count and parallel-BFS-race dependent — compare
+    # verdicts and exhaustive counts, never first-violation stats.
     #
     # Check-set shape (the §2e pre-registered fallback ladder, applied at
     # the Stage-B measurement milestone): the full-alphabet regimes do not
@@ -8094,7 +8188,7 @@ rec {
     # and named-run checks below — those stop at the first violation, so
     # they stay cheap on the unrestricted alphabets. Which cross-family
     # interleavings are therefore NOT exhaustively explored is recorded
-    # per property in the invariant map's Stage-C record.
+    # per property in the model's Carrier doc tags.
     # ------------------------------------------------------------------
 
     # Pre-auth establishment / occupancy family (corpus F2/F3 pre-auth
@@ -8362,8 +8456,9 @@ rec {
       witness = "canReachParkedReclaimedByInactivity";
     };
 
-    # Pre-registered expected as-built falsifications (design §3/§4/§6,
-    # the invariant map's probe table): each strict variant is EXPECTED to
+    # Pre-registered expected as-built falsifications (design §3/§4/§6;
+    # each probe's trace summary lives in its predicate's doc comment
+    # in the model): each strict variant is EXPECTED to
     # be violated by today's code, and the check passes only while the
     # counterexample still materializes — a probe that stops falsifying
     # after a code or model change is a finding (the documented trade-off
@@ -8426,8 +8521,9 @@ rec {
     # reintroduced, and that the invariant is not vacuous for it. The full
     # per-candidate calibration table (verdict @ depth, states, the
     # trace-walk notes, and the evidence-only override modules and
-    # T-direction runs that are not wired here) lives in
-    # docs/spec/models/gw-session-invariant-map.md; the wired ones are the
+    # T-direction runs that are not wired here) lives in the
+    # gw-f*.qnt VERDICT blocks and calibration/README.md's gateway
+    # acceptance section; the wired ones are the
     # representative per-family regression guards (one per falsifying
     # family, deepest consequence, cheap state space — every check stops at
     # its first violation). Deliberately no tracey markers (same policy as
@@ -8560,13 +8656,13 @@ rec {
     # machinery were pruned HERE in the same landing that wired the
     # survivors core (FP-1: never a window with neither the old oracle
     # nor the new); per-check dispositions (retired-with-mechanism vs
-    # superseded-by-NAME) are in the pruning commit's body and the
-    # Phase D-prime stage record
-    # (docs/spec/models/substitution-replacement-invariant-map.md).
+    # superseded-by-NAME) are in the pruning commit's body (the
+    # Phase D-prime stage record rides the campaign archive's
+    # commit ledger in git history).
     # The held-back exhaustive targets, the historical verdicts and the
     # retired manual-target commands live in
-    # docs/spec/models/closure-evidence-invariant-map.md (history is
-    # append-only); the unwired calibration overrides under
+    # docs/spec/models/closure-evidence-records.md (a closed,
+    # append-only archive); the unwired calibration overrides under
     # docs/spec/models/calibration/closure-*.qnt carry per-file
     # retirement notes.
 
@@ -8740,6 +8836,20 @@ rec {
     # display map (bug_150/144), the in-stream resync signal (bug_153),
     # and the durable terminal row (merged_bug_323). Tier-1: TLC
     # exhausts the 2-drv space in seconds.
+    #
+    # Directive-2 none-sensible dispositions (relocated from the
+    # retired gw-resync map): merged_bug_097/302/036 (settled
+    # payloads) — single-actor in-memory capture-at-transition, no
+    # protocol concurrency to model; pins are the settled-equality
+    # battery (test_settled_snapshot_equals_live_emit per terminal
+    # arm, the cancel-reason round-trip, the timeout-watchdog
+    # override unit) and the type system itself (a Terminal lifecycle
+    # cannot exist without its payload). bug_304 (progress fields) —
+    # a shared 4-tuple producer consumed by both emitters makes drift
+    # unrepresentable; the unit test pins the field order. bug_150's
+    # live arms were already correct — the two-map calibration
+    # deliberately freezes only the RECONCILE, matching the
+    # as-shipped defect surface.
     # r[verify gw.display.single-map]
     # r[verify gw.resync.loss-signal+1]
     # r[verify sched.pull.kinded-running-surface]

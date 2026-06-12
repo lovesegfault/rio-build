@@ -1787,7 +1787,11 @@ in
   # exists in exactly two production files — db/mod.rs (claims_floor,
   # private to the capability) and db/recovery.rs
   # (max_known_generation, the pool-seeding read, allowlisted by
-  # design). Any other occurrence is an open-coded floor read the
+  # design). Directive-2 record (bug_269, relocated from the retired
+  # fence map): no model — the property is TEXTUAL (the literal
+  # exists in exactly two files), not behavioral; this check is the
+  # carrier, red-verified against the pre-A1 base (housekeeping.rs,
+  # pull.rs, open_attempts.rs carried the literal). Any other occurrence is an open-coded floor read the
   # capability was built to delete (bug_269's class).
   fence-sql-canonical =
     pkgs.runCommand "rio-fence-sql-canonical"
@@ -1816,6 +1820,13 @@ in
   # fence-no-raw-decision-sql: no raw write-verb SQL on the decision
   # tables (assignments, derivations, materialization_jobs,
   # build_wanted_outputs, drv_attempts) outside rio-scheduler/src/db/
+  # — directive-2 record (bug_273's coverage half, relocated from
+  # the retired fence map): no model — the property is an
+  # ENUMERATION over the crate's SQL surface; the carriers are
+  # db/tests/fence_coverage.rs (source-enumerating) plus this check
+  # for the actor/grpc/admin side, red-verified against the base
+  # (housekeeping.rs, pull.rs, materialize.rs carried raw decision
+  # SQL).
   # — actor/grpc/admin code calls the fenced db-layer fns
   # (FencedTx::close_assignment, the *_fenced writers), never inline
   # SQL (merged_bug_231's class: the derivation-keyed close lived in

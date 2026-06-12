@@ -233,8 +233,8 @@ in
   # target and unit tests, and the collector's fail-closed SQL
   # validation pass via the differential pinning and abort tests in
   # gc/collect.rs. No verify marker is claimed for the parse contract.
-  # Full record: docs/spec/models/refcount-invariant-map.md,
-  # "Phase-2 assurance layer". If a Rust-side parse or eligibility
+  # Full record: docs/spec/models/refcount-records.md (the Phase-2
+  # acceptance table and close-out). If a Rust-side parse or eligibility
   # kernel ever returns to a production path, the cfg(kani) bounded
   # representation used by rio-retry-kernel is the template to bring a
   # harness for it into the gate budget — now in this kernel crate, no
@@ -291,9 +291,8 @@ in
   # (decide()/classify()/placeable() and the reference fold's counter
   # arithmetic), extracted from rio-scheduler/src/retry_policy.rs into a
   # dependency-free crate so the harnesses' goto model closes over the
-  # kernel alone — the extraction the retry campaign's Phase-2 deferral
-  # recorded in docs/spec/models/retry-invariant-map.md as the
-  # precondition for gating this check. Gated (in checks.*) since the
+  # kernel alone — the extraction the retry campaign's Phase-2
+  # deferral recorded as the precondition for gating this check. Gated (in checks.*) since the
   # kernel's exclusion-set representation became cfg(kani)-swappable:
   # under kani every executor-id set is the kernel's fixed-capacity
   # BoundedIdSet (via the IdSet alias) instead of std's BTreeSet, the

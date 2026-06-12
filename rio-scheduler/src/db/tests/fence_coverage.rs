@@ -9,6 +9,12 @@
 //!
 //! This is a SOURCE test, not a runtime probe: it fails the moment a
 //! new unfenced decision writer is introduced, naming the function.
+//!
+//! Directive-2 record (relocated from the retired fence invariant
+//! map): bug_273's coverage half has no model — which writers are
+//! fenced is an ENUMERATION over the crate's SQL surface, and this
+//! test plus the fence-no-raw-decision-sql policy check are the
+//! carriers, red-verified against the pre-fence base.
 
 /// Decision tables: rows that drive scheduling/lifecycle decisions.
 const DECISION_TABLES: &[&str] = &[
