@@ -562,10 +562,35 @@ def _extent_end(lexed: str, attr_start: int, i: int, source: str) -> int:
     # COMMA mode: struct field / enum variant / match arm /
     # struct-expr field / statement. Ends at a top-level `,` or `;`
     # (consumed), BEFORE the enclosing closer (last member, no
-    # trailing comma), or after a `{…}` group not followed by `,`
-    # (block arms, brace variants). Generic angles tracked so
-    # `HashMap<String, u64>` commas never terminate; `->`/`=>`
-    # excluded; an unbalanced angle run at the boundary REFUSES.
+    # trailing comma), or after a `{…}` group not followed by `,`,
+    # `;`, or `else` (block arms, brace variants; the `else` chain is
+    # the WO-S8-1/bug_049 if/else-initializer cell — the gc/collect.rs
+    # :1371 specimen).
+    #
+    # ANGLE TRACKING IS TOKEN-ADJACENCY CLASSIFIED (WO-S8-1, bug_049):
+    # the old walk counted EVERY `<` as a generic opener, so a spaced
+    # comparison (`a < b;`) opened a phantom angle run whose `;` never
+    # terminated — the extent silently swallowed the FOLLOWING
+    # production statement when a later stray `>` re-balanced it
+    # (fail-open population shrink), and a legal shift discriminant
+    # (`A = 1 << 4,`) false-StripError'd. The second derivation axis
+    # (token alphabet within extents — CFG_EXPR_TOKEN_VECTORS) closes
+    # both: a `<` is a GENERIC OPENER iff its DIRECT predecessor
+    # character is type-position adjacency (`ident`/`>`/`)`/`]`/`<`/
+    # `:` — rustfmt never spaces `Ident<`, `::<`, nested `<<T`),
+    # otherwise it is an EXPRESSION token (comparison; a spaced `<<`
+    # pair is one shift token, consumed whole). The classification is
+    # exact on formatter-normalized input; the standing treefmt gate
+    # is the machine-bound compensating control for unformatted
+    # spellings, and the refusal belts below catch the residue
+    # loudly: a `;` reached inside an open angle run REFUSES (never
+    # legal in type position at bracket level — `[u8; N]` rides the
+    # bracket matcher), as does any group/closer/EOF boundary with an
+    # unbalanced run. `,` inside an open angle run still extends —
+    # that is the legal generic-interior cell (`HashMap<String, u64>`,
+    # `Result<T, E>` — the gc/collect.rs specimen's own type), and
+    # with adjacency classification an open run can only be a real
+    # type-position run.
     angle = 0
     prev = ""
     while i < n:
@@ -583,13 +608,46 @@ def _extent_end(lexed: str, attr_start: int, i: int, source: str) -> int:
                     f"closed a brace group inside an unbalanced generic-"
                     f"angle run — refusing (fail-closed)"
                 )
-            if j < n and lexed[j] == ",":
+            if j < n and lexed[j] in ",;":
                 return j + 1
+            # The if/else-initializer cell (bug_049's live corroboration,
+            # gc/collect.rs:1371): a brace group followed by `else`
+            # continues the SAME expression — ending here left the
+            # dangling `else {…};` unblanked (under-blank residue).
+            m_else = _WORD_RE.match(lexed, j)
+            if m_else and m_else.group(0) == "else":
+                i = m_else.end()
+                prev = "e"
+                continue
             return end
         if c == "<":
-            angle += 1
+            if i > 0 and (lexed[i - 1].isalnum() or lexed[i - 1] in "_>)]<:"):
+                # Type-position adjacency: a real generic opener.
+                angle += 1
+            elif i + 1 < n and lexed[i + 1] == "<":
+                # Spaced `<<`: one shift token, consumed whole (the
+                # `A = 1 << 4,` false-StripError cell).
+                i += 2
+                prev = "<"
+                continue
+            # else: spaced `<`/`<=` — an expression comparison token;
+            # never tracked (the `a < b;` swallow cell).
         elif c == ">" and prev not in "-=" and angle > 0:
             angle -= 1
+        elif c == ";" and angle > 0:
+            # The refusal belt: `;` is never legal inside a
+            # type-position angle run the walk can see (array `;`
+            # rides the bracket matcher) — an open run crossing a
+            # statement boundary is ambiguous input; refuse rather
+            # than extend into the next statement (the silent
+            # production-blanking face, now structurally closed).
+            raise StripError(
+                f"{source}:{err_line}: cfg(test) attachment extent "
+                f"reached `;` inside an open generic-angle run — "
+                f"ambiguous comparison/generic spelling; refusing "
+                f"(fail-closed; parenthesize the comparison or run "
+                f"treefmt)"
+            )
         elif c in ",;" and angle == 0:
             return i + 1
         elif c in ")]}":
@@ -791,7 +849,83 @@ CFG_REFUSAL_VECTORS = [
     # WO-S8-2: an inner test gate below file scope is outside the
     # alphabet (file-scope inner attrs blank the whole file instead).
     ("inner-below-file-scope", "mod m {\n    #![cfg(test)]\n    fn t() {}\n}\n", 2),
+    # WO-S8-1 (bug_049): an UNFORMATTED comparison (`a<b` — adjacency
+    # reads the `<` as a generic opener) crossing a `;` refuses
+    # loudly instead of extending into the next statement; treefmt
+    # normalizes the spelling out of the committed tree.
+    ("angle-run-semicolon", "fn f() {\n    #[cfg(test)]\n    let x = a<b;\n    keep();\n}\n", 2),
 ]
+
+# --- the expression-token vector axis (WO-S8-1, bug_049) ---------------
+#
+# [GEN-SET] — the SECOND derivation axis the bw11 corpus lacked: the
+# position axis above enumerates WHICH constructs exist; this table
+# enumerates the expression-position TOKEN ALPHABET within extents —
+# the tokens the comma walk must classify (comparison `<`, shift
+# `<<`, if/else `{` chains) — as the product token × attachment
+# position, restricted to the cells the GRAMMAR admits (else-chains
+# exist only where block expressions do; discriminants and field
+# inits are expression positions; guards ride match arms). Per cell
+# the vector embeds the gated payload and a production neighbor; the
+# walk must blank exactly the payload — refuse-or-correct, NEVER a
+# silent neighbor blank (W12-AY). The pre-fix reds (every-`<`-opens
+# walk): lt-cmp/Statement silently blanked the FOLLOWING production
+# statement; shl/Variant raised a false StripError on `1 << 4`;
+# brace-else/Statement left the dangling `else {…};` unblanked (the
+# live gc/collect.rs:1371 specimen, its shape the last vector below).
+_EXPR_TOKENS = ("lt-cmp", "shl", "brace-else")
+_EXPR_POSITIONS = ("Statement", "Variant", "FieldValue", "Arm")
+# Grammar-admitted product cells (token, position) -> vector.
+CFG_EXPR_TOKEN_VECTORS = {
+    ("lt-cmp", "Statement"): (
+        f"fn f() {{\n    #[cfg(test)]\n    let {_T} = a < b;\n"
+        f"    let {_P} = c > d;\n    {_P}2();\n}}\n"
+    ),
+    ("lt-cmp", "Variant"): (
+        f"enum E {{\n    #[cfg(test)]\n    {_T} = A < B,\n    {_P},\n}}\n"
+    ),
+    ("lt-cmp", "FieldValue"): (
+        f"fn g() -> S {{ S {{\n    a: 1,\n    #[cfg(test)]\n    {_T}: a < b,\n    b: {_P},\n}} }}\n"
+    ),
+    ("lt-cmp", "Arm"): (
+        f"fn f(x: u8) {{ match x {{\n    #[cfg(test)]\n    2 if a < b => {_T}(),\n    _ => {_P}(),\n}} }}\n"
+    ),
+    ("shl", "Statement"): (
+        f"fn f() {{\n    #[cfg(test)]\n    let {_T} = 1 << 4;\n    {_P}();\n}}\n"
+    ),
+    ("shl", "Variant"): (
+        f"enum E {{\n    #[cfg(test)]\n    {_T} = 1 << 4,\n    {_P},\n}}\n"
+    ),
+    ("shl", "FieldValue"): (
+        f"fn g() -> S {{ S {{\n    #[cfg(test)]\n    {_T}: 1 << 4,\n    b: {_P},\n}} }}\n"
+    ),
+    ("shl", "Arm"): (
+        f"fn f(x: u8) {{ match x {{\n    #[cfg(test)]\n    2 if x << 1 == 0 => {_T}(),\n    _ => {_P}(),\n}} }}\n"
+    ),
+    ("brace-else", "Statement"): (
+        f"fn f() {{\n    #[cfg(test)]\n    let {_T} = if c {{ 1 }} else {{ 2 }};\n    {_P}();\n}}\n"
+    ),
+    ("brace-else", "FieldValue"): (
+        f"fn g() -> S {{ S {{\n    #[cfg(test)]\n    {_T}: if c {{ 1 }} else {{ 2 }},\n    b: {_P},\n}} }}\n"
+    ),
+    ("brace-else", "Arm"): (
+        f"fn f(x: u8) {{ match x {{\n    #[cfg(test)]\n    2 => if c {{ {_T}() }} else {{ {_T}2() }}\n    _ => {_P}(),\n}} }}\n"
+    ),
+    # The live corroboration specimen (gc/collect.rs:1371-:1382, the
+    # bug_049 over-scan): a cfg(test) statement whose TYPE carries a
+    # legal generic-interior comma (`Result<T, E>` — the cell the
+    # naive `,`-refusal alternative would have falsely refused) AND
+    # whose initializer is an if/else chain ending `};`.
+    ("brace-else", "Specimen"): (
+        f"fn f() {{\n    #[cfg(test)]\n    let {_T}: Result<PgQueryResult, sqlx::Error> ="
+        f" if inject() {{\n        Err({_T}2())\n    }} else {{\n        run()\n    }};\n"
+        f"    #[cfg(not(test))]\n    let {_P} = run();\n    {_P}2();\n}}\n"
+    ),
+}
+# Cells the grammar does NOT admit (recorded, asserted absent): enum
+# variants and struct fields have no else-chains in type position;
+# the brace-else/Variant cell is excluded BY DERIVATION, not dropped.
+CFG_EXPR_EXCLUDED_CELLS = {("brace-else", "Variant")}
 
 # WO-S8-2: the spelling plants — one derived plant per test-gating
 # spelling, consumed by THIS pruner's selftest and (via
@@ -1198,6 +1332,44 @@ def selftest() -> str | None:
         return f"W11-BQ: array-const mid-signature break survived: {bq!r}"
     if "fn live" not in bq:
         return f"W11-BQ: production after the const was blanked: {bq!r}"
+    # --- WO-S8-1 (bug_049): the expression-token axis (W12-AY) ------
+    # The product completeness pin: every grammar-admitted token ×
+    # position cell has a vector (a silently dropped cell is a red
+    # here), the exclusion set is exact, and every vector blanks its
+    # payload, keeps every production marker, and preserves line
+    # numbering — refuse-or-correct, never a silent neighbor blank.
+    admitted = {
+        (t, p)
+        for t in _EXPR_TOKENS
+        for p in _EXPR_POSITIONS
+        if (t, p) not in CFG_EXPR_EXCLUDED_CELLS
+    }
+    got_expr = {k for k in CFG_EXPR_TOKEN_VECTORS if k[1] != "Specimen"}
+    if got_expr != admitted:
+        return (
+            f"W12-AY: expression-token vector table drifted from the "
+            f"admitted product — missing {sorted(admitted - got_expr)}, "
+            f"extra {sorted(got_expr - admitted)}"
+        )
+    for (tok, pos), v in CFG_EXPR_TOKEN_VECTORS.items():
+        try:
+            stripped = strip_cfg_test(v, source=f"expr/{tok}/{pos}")
+        except StripError as e:
+            return f"W12-AY ({tok}/{pos}): grammatical vector refused: {e}"
+        if _T in stripped:
+            return f"W12-AY ({tok}/{pos}): gated payload survived: {stripped!r}"
+        if stripped.count(_P) != v.count(_P):
+            return (
+                f"W12-AY ({tok}/{pos}): production neighbor blanked — the "
+                f"bug_049 swallow face: {stripped!r}"
+            )
+        if tok == "brace-else" and "else" in stripped:
+            return (
+                f"W12-AY ({tok}/{pos}): dangling else residue (the "
+                f"gc/collect.rs under-blank face): {stripped!r}"
+            )
+        if stripped.count("\n") != v.count("\n"):
+            return f"W12-AY ({tok}/{pos}): line numbering broke"
     # The refusal arms (R22″ fail-closed): one co-located plant per
     # arm; the error must NAME source:line, never silently accept.
     # (W11-BR's negative-depth vector doubles as the attachment-eof /
