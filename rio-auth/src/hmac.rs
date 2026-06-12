@@ -1416,6 +1416,17 @@ mod tests {
     /// the executor mint is bounded ≈24.25h by DEADLINE_CAP_SECS +
     /// eta + 300, so the red drives the LAW with a synthetic mint,
     /// not a live overflow).
+    ///
+    /// WO-S8-6 (bug_141, R29): the witness derives its bound from a
+    /// clock sample taken AFTER each sign call — `HmacKey::sign`
+    /// re-samples its own clock and clamps to that LATER cap, so a
+    /// pre-sampled bound false-fails on a second-boundary crossing
+    /// (correct clamp at cap+k, stale bound at cap — the catalogued
+    /// wall-clock-gate flake class inside an R24 law witness). With
+    /// the post-call re-sample, `signer_now <= now_after` holds by
+    /// sampling order, so `clamped <= cap_after` is deterministic.
+    /// The pre-sample strawman is kept as the disclosed reversal red
+    /// (`family_lifetime_pin_strawman_presample_false_fails`).
     #[test]
     fn family_lifetime_clamp_bounds_every_claims_type() {
         let signer = HmacSigner::from_key(TEST_KEY.to_vec());
@@ -1430,8 +1441,11 @@ mod tests {
             let verified: AssignmentClaims = verifier
                 .verify(&signer.sign(&ac))
                 .expect("family token verifies");
+            // R29: the bound's clock is sampled AFTER the sign call.
+            let cap_after =
+                crate::now_unix().expect("test clock after epoch") + MAX_HMAC_LIFETIME_SECS;
             assert!(
-                verified.expiry_unix <= cap,
+                verified.expiry_unix <= cap_after,
                 "left (pre-fix): an AssignmentClaims {label} mint signed with \
                  expiry−now = {}s (> {MAX_HMAC_LIFETIME_SECS}s — the leaked-token \
                  replay window the seven-day law bounds) / right: the signer \
@@ -1453,8 +1467,11 @@ mod tests {
             let verified: ExecutorClaims = verifier
                 .verify(&signer.sign(&ec))
                 .expect("family token verifies");
+            // R29: each sign gets its own post-call bound sample.
+            let cap_after =
+                crate::now_unix().expect("test clock after epoch") + MAX_HMAC_LIFETIME_SECS;
             assert!(
-                verified.expiry_unix <= cap,
+                verified.expiry_unix <= cap_after,
                 "left (pre-fix): an ExecutorClaims {label} mint signed with \
                  expiry−now = {}s (> {MAX_HMAC_LIFETIME_SECS}s) — the SIBLING \
                  mint the dispatch-local clamp never covered / right: the \
@@ -1468,6 +1485,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// W11-BY (bug_141, R29) — the split-clock witness mode, killed
+    /// deterministically: a law pin deriving its bound from a clock
+    /// sample strictly EARLIER than the producer's own re-sample
+    /// false-fails on CORRECT behavior across a second boundary
+    /// (CI-only flake; production clamp correct). The boundary cross
+    /// is FORCED by construction instead of raced: `cap_pre` derives
+    /// from a sample one second older than anything the signer can
+    /// read, so the signer's correct clamp of an over-cap mint
+    /// PROVABLY exceeds the stale bound — exactly the shape the old
+    /// `<= cap` assert misreported as a seven-day-law regression.
+    /// The strawman is the disclosed reversal red; the law pin above
+    /// re-samples after the call (signer_now <= now_after by
+    /// sampling order, so clamped <= cap_after deterministically).
+    #[test]
+    fn family_lifetime_pin_strawman_presample_false_fails() {
+        let signer = HmacSigner::from_key(TEST_KEY.to_vec());
+        let verifier = HmacVerifier::from_key(TEST_KEY.to_vec());
+        // The stale pre-sample: one second older than any clock the
+        // signer can observe — the forced boundary cross.
+        let now_pre = crate::now_unix().expect("test clock after epoch") - 1;
+        let cap_pre = now_pre + MAX_HMAC_LIFETIME_SECS;
+
+        let mut ac = test_claims(0);
+        ac.expiry_unix = cap_pre + 7200; // over-cap from every clock
+        let verified: AssignmentClaims = verifier
+            .verify(&signer.sign(&ac))
+            .expect("family token verifies");
+
+        // The signer clamped CORRECTLY (to signer_now + cap), yet the
+        // stale pre-sample bound reads the clamp as a law violation:
+        // the deterministic false-fail of the old witness shape.
+        assert!(
+            verified.expiry_unix > cap_pre,
+            "the strawman's premise broke: a correct clamp no longer exceeds \
+             the stale pre-sample bound (clamp or clock semantics changed — \
+             re-derive the witness)"
+        );
+        // Same mint, right clock: the post-call re-sample bound holds.
+        let cap_after = crate::now_unix().expect("test clock after epoch") + MAX_HMAC_LIFETIME_SECS;
+        assert!(
+            verified.expiry_unix <= cap_after,
+            "the law pin's own bound must hold on the same mint"
+        );
     }
 
     /// W10-Q (merged_bug_045, R15/R22′) — the signing-body census:
