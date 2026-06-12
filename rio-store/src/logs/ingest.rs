@@ -180,10 +180,14 @@ pub enum AbortReason {
     /// the replica cannot commit chunks (S3 or PG partition). The
     /// builder should fail over to another replica and replay.
     ConsecutiveCutFailures,
-    /// Lines have been waiting in the buffer for more than 2x
-    /// [`IngestConfig::cut_interval`] without a successful cut: the
-    /// backstop for a wedged replica whose cut attempts are not even
-    /// reaching the failure counter.
+    /// No successful cut has advanced the durable frontier for more
+    /// than 2x [`IngestConfig::cut_interval`] while lines were
+    /// pending AND at least one failure was observed: the backstop
+    /// for a wedged replica whose cut attempts are not even reaching
+    /// the failure counter. Denominated in durable progress
+    /// (merged_bug_007): a busy stream that keeps cutting
+    /// successfully is never stale, no matter how old its oldest
+    /// pending line is.
     StaleBuffer,
 }
 
@@ -278,11 +282,17 @@ pub struct IngestShared {
     /// being cut must not re-trigger `cut_due`). Maintained
     /// incrementally so the trigger check is O(1).
     buffer_bytes: u64,
-    /// When the oldest not-yet-durable line (in `in_flight` or
-    /// `buffer`) was accepted. `None` only when both are empty.
-    /// Deliberately conservative: a partial drain (a cut that stopped at
-    /// a forward gap) leaves it at the *older* timestamp, which can only
-    /// make the staleness abort fire earlier.
+    /// The PROGRESS clock (merged_bug_007, R29): when the durable
+    /// frontier last advanced while lines were pending — set when the
+    /// first pending line arrives, REFRESHED by every successful cut,
+    /// `None` only when both vecs are empty. `should_abort`'s
+    /// staleness arm reads it as "time since the last durable
+    /// progress". (The predecessor semantics — when the oldest pending
+    /// line was accepted, cleared only on full drain — was an
+    /// OCCUPANCY clock: a continuously-busy stream pinned it at
+    /// ~stream start, permanently arming the staleness arm and
+    /// degenerating the 3-strike abort budget to 1-strike on the
+    /// first transient blip.)
     oldest_pending_since: Option<Instant>,
     /// Live-tail subscribers. Each accepted batch is `try_send`-fanned
     /// to every sender; a full queue drops the batch for that subscriber
@@ -983,9 +993,22 @@ impl IngestSession {
                 // The staged run is durable and manifest-visible: drop
                 // it (freeing the line allocations and the staging vec).
                 shared.in_flight = Vec::new();
-                if shared.buffer.is_empty() {
-                    shared.oldest_pending_since = None;
-                }
+                // The PROGRESS clock (merged_bug_007, R29): every
+                // successful cut REFRESHES the stamp — `should_abort`'s
+                // staleness arm measures time since the durable
+                // frontier last advanced, never time since the pending
+                // set was last empty. The pre-fix clear-only-when-empty
+                // arm made the stamp an OCCUPANCY clock that pinned at
+                // ~stream start for any continuously-busy stream, so
+                // the staleness arm was permanently armed and the
+                // 3-strike budget degenerated to 1-strike on the first
+                // transient blip.
+                // r[impl store.log.progress-clock]
+                shared.oldest_pending_since = if shared.buffer.is_empty() {
+                    None
+                } else {
+                    Some(Instant::now())
+                };
                 drop(shared);
                 self.consecutive_cut_failures = 0;
                 metrics::counter!("rio_store_log_chunks_written_total").increment(1);
@@ -1105,7 +1128,12 @@ impl IngestSession {
     /// (merged_bug_119: pure staleness with zero failures is a healthy
     /// paced multi-run drain — a multi-MiB buffer legitimately takes
     /// several cut intervals to drain one run at a time and must not be
-    /// aborted mid-drain). Aborting drops the in-memory buffer — that
+    /// aborted mid-drain) and DENOMINATED in durable progress
+    /// (merged_bug_007, R29: `oldest_pending_since` refreshes on every
+    /// successful cut, so the arm measures cut-to-cut progress — an
+    /// occupancy clock pinned at stream start would permanently arm it
+    /// for every busy stream and collapse this 3-strike budget to
+    /// 1-strike). Aborting drops the in-memory buffer — that
     /// is safe, the builder's retransmit buffer still holds every
     /// un-acked line and replays it to the next replica.
     pub fn should_abort(&self) -> Option<AbortReason> {
@@ -1997,6 +2025,70 @@ mod tests {
         // (the backstop still exists for wedges).
         session.note_cut_abandoned();
         assert_eq!(session.should_abort(), Some(AbortReason::StaleBuffer));
+    }
+
+    /// W11-K (merged_bug_007, R29). Proposition: **a single transient
+    /// cut failure on a healthy busy stream never aborts** — at the
+    /// population the occupancy clock lies in: busy steady state, the
+    /// buffer never empty across successful cuts. All three
+    /// `oldest_pending_since` writers pre-fix (init on first pending,
+    /// accept only-when-both-vecs-empty, cut-success clear
+    /// only-when-buffer-empty) pinned the stamp at ~stream start for a
+    /// continuously-busy stream, so `should_abort`'s staleness arm
+    /// (failures > 0 ∧ elapsed > 2×cut_interval) was permanently
+    /// armed: the 3-strike budget degenerated to 1-strike for every
+    /// busy stream older than two minutes, and one transient S3/PG
+    /// blip mass-aborted every such stream on the replica. The abort
+    /// backstop must read a PROGRESS clock (time since the last
+    /// successful cut advanced the durable frontier), not an OCCUPANCY
+    /// clock (time since the pending set was last empty).
+    // r[verify store.log.progress-clock]
+    #[tokio::test]
+    async fn busy_stream_keeps_its_three_strike_budget() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let mut session = new_session(IngestConfig {
+            per_exec_byte_cap: 1024 * 1024,
+            cut_threshold_bytes: u64::MAX, // manual cuts
+            cut_interval: Duration::from_secs(1),
+        });
+
+        // Continuous load: forward-gap runs keep the buffer non-empty
+        // across every successful cut (each cut drains one contiguous
+        // run; the next run is already waiting).
+        session.accept(batch(0, 3)).unwrap();
+        session.accept(batch(5, 3)).unwrap();
+        assert_eq!(session.cut(&store, &db.pool).await.unwrap(), Some(2));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        session.accept(batch(10, 3)).unwrap();
+        assert_eq!(session.cut(&store, &db.pool).await.unwrap(), Some(7));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        // ONE transient failure on the busy stream (the S3 blip).
+        let failing = FailNTimesStore::new(1);
+        assert!(session.cut(&failing, &db.pool).await.is_err());
+        assert_eq!(
+            session.should_abort(),
+            None,
+            "left (pre-fix): the occupancy clock pinned the stamp at stream \
+             start (the buffer was never empty), so one transient failure on \
+             a busy stream older than 2×cut_interval aborts StaleBuffer \
+             immediately — the 3-strike budget degenerates to 1-strike / \
+             right: the staleness arm measures durable progress (the stamp \
+             refreshed at the last successful cut ~1.1 s ago < 2 s), and the \
+             budget runs its course"
+        );
+
+        // The budget still exists: two more consecutive failures trip
+        // the failure-count arm, exactly as designed.
+        let failing = FailNTimesStore::new(2);
+        assert!(session.cut(&failing, &db.pool).await.is_err());
+        assert!(session.cut(&failing, &db.pool).await.is_err());
+        assert_eq!(
+            session.should_abort(),
+            Some(AbortReason::ConsecutiveCutFailures),
+            "three consecutive failures still abort — the backstop is intact"
+        );
     }
 
     /// merged_bug_119 (parked-cut half): a cut whose PUT hangs forever

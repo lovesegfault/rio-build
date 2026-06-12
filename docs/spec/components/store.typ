@@ -2652,6 +2652,25 @@ told the builder to "reconnect and replay" with the same effect. The
 classifier on the builder side was correct all along; the server simply
 never spoke the class it listened for.
 
+#r("store.log.progress-clock")[
+  Abort backstops in the log-ingest plane MUST measure durable
+  progress, never occupancy: the stale-buffer staleness arm's clock
+  MUST refresh on every successful chunk cut (time since the durable
+  frontier last advanced while lines were pending), so that a
+  continuously-busy stream that keeps committing is never stale
+  regardless of how old its oldest pending line is.
+]
+
+An occupancy clock (time since the pending set was last empty) pins at
+stream start under steady load --- the exact regime a busy production
+stream lives in --- so any predicate gated on it silently degenerates:
+the 3-strike consecutive-failure budget collapsed to 1-strike for every
+busy stream older than two cut intervals, and one transient S3/PG blip
+mass-aborted every such stream on the replica with a full unacked
+replay (merged_bug_007). The R29 form: the envelope is denominated in
+the consumer's execution domain --- the abort predicate consumes
+"progress stalled", so the clock must measure progress.
+
 #r("store.log.ingest-idle-abort+2")[
   The log-ingest liveness law is bilateral. An AppendLog client whose
   session is open with an empty buffer MUST emit an empty keepalive
