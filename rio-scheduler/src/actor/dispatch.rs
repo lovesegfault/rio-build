@@ -918,6 +918,10 @@ impl DagActor {
 
         let ok_hashes: Vec<DrvHash> = ok.iter().map(|d| d.hash.clone()).collect();
         let ok_refs: Vec<&str> = ok_hashes.iter().map(|h| h.as_str()).collect();
+        // Terminal without dispatch: release the merge-time drv pins
+        // (r[store.drv.gc-build-pinned]) — the store-hit short-circuit
+        // never reaches the worker-completion unpin.
+        self.unpin_best_effort_batch(&ok_refs).await;
 
         // Batched promote: dedup find_newly_ready across all completed
         // hashes, transition in-mem, then one
