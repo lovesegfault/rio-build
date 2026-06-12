@@ -74,7 +74,11 @@ All persistent data carries a `tenant_id` foreign key:
 
   [`chunk_tenants`],
   [`tenant_id` (PK component)],
-  [N:M junction — `FindMissingChunks` scope],
+  [N:M junction — `HasChunks` presence scope (migration 072)],
+
+  [`drv_blob_tenants`],
+  [`tenant_id` (PK component)],
+  [N:M junction — `HasDrvs`/`GetDrvBlob` scope (migration 072)],
 
   [`content_index`],
   [`tenant_id` (nullable, unused)],
@@ -163,30 +167,43 @@ Single-tenant mode (empty `authorized_keys` comment) never quota-checks.
 
 = Security Considerations
 
-== `FindMissingChunks` Scoping
+== Chunk Presence Scoping (`HasChunks`)
 
-The `FindMissingChunks` RPC can reveal whether another tenant has built a
+A chunk-presence probe can reveal whether another tenant has built a
 specific package (by probing for chunk existence). Two scoping options:
 
-+ *Global scope* (default): All tenants share the chunk namespace. Maximum
-  dedup savings, but tenants can infer each other's build activity.
-+ *Per-tenant scope*: Each tenant has a separate chunk namespace. No
-  cross-tenant information leakage, but reduced dedup (identical chunks
-  stored per-tenant).
++ *Global scope*: All tenants share the presence namespace. Maximum
+  upload-dedup savings, but tenants can infer each other's build activity.
++ *Per-tenant scope*: Presence answers only for chunks the calling tenant
+  has seen. No cross-tenant information leakage; storage dedup is
+  unaffected (the `chunks` row and S3 object stay shared) and the only cost
+  is re-upload bandwidth for chunks another tenant uploaded first.
+
+History: an early `chunk_tenants` junction (migration 018) was dropped as
+dead code (migration 035) when the ADR-022 chunked-upload work shipped
+`HasChunks` with the global namespace as a documented accepted trade-off.
+ADR-024 P2 reversed that decision, reconciling presence as tenant-scoped
+across all object kinds.
 
 #info(title: [Current state])[
-  Per-tenant scoping is implemented via the `chunk_tenants` junction table
-  (migration 018). `FindMissingChunks` and `PutChunk` both require a JWT
-  with `Claims.sub` (fail-closed on missing — `UNAUTHENTICATED`). A chunk is
-  reported present to a tenant IFF that tenant has a junction row; different
-  tenants can share the same `chunks` row (dedup preserved) while each sees
-  only their own uploads. The global chunk namespace (option 1 above) is no
-  longer available.
+  Per-tenant presence is implemented via the `chunk_tenants` junction table
+  (migration 072, #rref("store.chunk.has-chunks-tenant")). `HasChunks`
+  resolves a tenant from the JWT or HMAC assignment-token claim
+  (fail-closed on missing — `UNAUTHENTICATED`). A chunk is reported present
+  to a tenant IFF it is durable AND that tenant has a junction row (written
+  when one of the tenant's manifests completes); different tenants share
+  the same `chunks` row (dedup at rest preserved) while each sees only
+  their own uploads. Chunks ingested before migration 072 have no junction
+  rows: they answer absent and re-bind on the tenant's next upload
+  (write-through idempotent puts make the duplicate upload safe). Chunk
+  *retrieval* (`GetChunk`/`GetChunks`) stays identity-gated but unscoped —
+  knowing the digest is the read capability
+  (#rref("store.castore.tenant-scope")).
 ]
 
 == Build Activity Leakage
 
-Beyond `FindMissingChunks`, a tenant can observe shared derivation
+Beyond chunk presence, a tenant can observe shared derivation
 scheduling (e.g., a shared derivation completes faster than expected,
 implying another tenant built it first). This is inherent to the DAG merging
 optimization and is documented as an accepted risk.
