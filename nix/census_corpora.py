@@ -903,7 +903,7 @@ def exit_edge_finder(files):
                     if re.search(r"\bDO\s+UPDATE\b", body, re.I)
                     else "on-conflict-do-nothing"
                 )
-                # EVERY target is a row — a literal carrying two
+                # every target is a row — a literal carrying two
                 # INSERTs enqueues into two tables.
                 for t in targets:
                     out.append((rel, kind, t))

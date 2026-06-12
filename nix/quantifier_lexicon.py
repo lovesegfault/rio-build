@@ -135,7 +135,11 @@ BIND_RE = re.compile(
     # follows in the same comment block (S1's lane-census bind:
     # "ALL is machine-backed (R23'): the census-derived ... set").
     r"|bind\[\S+\]"
-    r"|machine-backed"
+    # WO-S8-7 (bug_123): the natural-language bind token is
+    # POLARITY-ANCHORED -- a negated apposition ("this is not
+    # machine-backed yet") is a DISCLAIMER, not a bind; the bare
+    # unanchored alternative matched inside it and cleared the hit.
+    r"|(?<!\bnot )(?<!n't )(?<!\bnever )(?<!\bun)machine-backed"
 )
 AUTO_BOUND = (
     "census[",
@@ -264,13 +268,19 @@ def scan(root: Path):
                         word = f"{nm.group(0)} [numeric tier]"
                 if word is None:
                     continue
-                line = raw_lines[lineno - 1] if lineno <= len(raw_lines) else comment
+                # WO-S8-7 (bug_123): clearing tokens are LANE-MATCHED
+                # to the firing lane -- binds evaluate on the COMMENT
+                # text the hit fired on, never the raw source line
+                # (the raw-line surface strictly contains the firing
+                # surface: a same-line string literal carrying a bind
+                # token suppressed genuine comment-lane hits).
                 if (
-                    BIND_RE.search(line)
-                    or FIGURE_BIND_RE.search(line)
-                    or any(t in line for t in AUTO_BOUND)
+                    BIND_RE.search(comment)
+                    or FIGURE_BIND_RE.search(comment)
+                    or any(t in comment for t in AUTO_BOUND)
                 ):
                     continue
+                line = raw_lines[lineno - 1] if lineno <= len(raw_lines) else comment
                 yield rel, lineno, word, line.strip()
 
 
@@ -482,6 +492,31 @@ def selftest() -> str | None:
         p.write_text("// Suspend ALL collection — where ALL is machine-backed\nfn x() {}\n", encoding="utf-8")
         if list(scan(root)):
             return "machine-backed idiom did not clear the hit"
+        # W12-BE (WO-S8-7, bug_123) -- the two false-negative faces,
+        # RED plants (both yielded ZERO hits pre-fix):
+        # (a) negative polarity: a DISCLAIMER naming the bind token
+        # must still fire -- the bare alternative matched inside it.
+        p.write_text("// ALL lanes delete here; this is not machine-backed yet\nfn x() {}\n", encoding="utf-8")
+        got = list(scan(root))
+        if len(got) != 1:
+            return f"W12-BE (a): the negated machine-backed disclaimer did not fire: {got}"
+        # (negation spellings ride the same anchor)
+        p.write_text("// EVERY arm is swept; sadly never machine-backed\nfn x() {}\n", encoding="utf-8")
+        if len(list(scan(root))) != 1:
+            return "W12-BE (a'): the never-negated disclaimer did not fire"
+        # (b) lane match: a same-line STRING carrying a bind token
+        # must not clear a comment-lane hit (the clearing surface
+        # equals the firing surface now).
+        p.write_text('fn x() { let s = "machine-backed"; } // EVERY lane is swept\nfn y() {}\n', encoding="utf-8")
+        got = list(scan(root))
+        if len(got) != 1:
+            return f"W12-BE (b): a cross-lane string bind suppressed the hit: {got}"
+        # … and the binder leg rides the same law: a figure bind in a
+        # string clears nothing.
+        p.write_text('fn x() { let s = "figure: const(X)"; } // the shipped 100 GiB chart default\nfn y() {}\n', encoding="utf-8")
+        got = list(scan(root))
+        if len(got) != 1 or "[numeric tier]" not in got[0][2]:
+            return f"W12-BE (b'): a cross-lane figure bind suppressed the numeric hit: {got}"
         # Lowercase IS the demoted form: no hit.
         p.write_text("// every member is checked here\nfn x() {}\n", encoding="utf-8")
         if list(scan(root)):
