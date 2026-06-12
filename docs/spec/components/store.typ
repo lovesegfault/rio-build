@@ -2504,12 +2504,13 @@ closes the post-terminal injection hole without breaking the legitimate
 late-replay path (an *incomplete* terminal log keeps accepting the replay
 that completes it).
 
-#r("store.log.chunk-dirent-durable")[
-  A filesystem-backed log-chunk `put` MUST make the chunk's directory
-  entries durable before returning `Created`: the file is synced, then
-  every newly-created ancestor directory is fsynced child-to-root, then
-  the deepest pre-existing directory; the store root is fsynced at
-  construction.
+#r("store.log.chunk-dirent-durable+2")[
+  A filesystem-backed log-chunk `put` MUST be per-put self-sufficient
+  about dirent durability: after syncing the file it MUST fsync the
+  chunk's FULL ancestor directory chain, child-to-root through the
+  store root, unconditionally on every put --- including puts that
+  find the object already present --- never classifying ancestors by
+  observation; the store root is additionally fsynced at construction.
 ]
 
 `sync_all` on the file makes its content durable but the dirent naming it
@@ -2518,7 +2519,14 @@ dirent-sync loses a chunk whose manifest row commits afterwards, which
 reads back as a permanent `NotFound` for a line range the manifest says
 exists. The S3 backend gets the equivalent ordering for free from
 `PutObject` response semantics; the filesystem backend (standalone VM,
-single-node dev) must do it by hand.
+single-node dev) must do it by hand. Durability recipes that derive fsync
+obligations from point-in-time observation create an implicit cross-task
+obligation transfer with no handoff protocol (bug_120): a sibling put's
+`create_dir_all` makes a directory observable arbitrarily long before the
+sibling's fsync loop runs --- and its error paths never run it --- so the
+observer's `Created` rested on a put under no obligation to complete.
+Unconditional chain fsync (3-4 directories, idempotent, cheap) deletes
+the probe and the shared-fate coupling entirely.
 
 #r("store.log.chunk-immutable")[
   A committed log chunk MUST never be overwritten: chunk keys are unique per

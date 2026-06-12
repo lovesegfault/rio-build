@@ -450,7 +450,7 @@ impl FilesystemLogChunkStore {
     /// Create the root directory (and parents) if absent, and fsync it
     /// so the dirent chain of every later `durable_put` ends at a
     /// durable directory.
-    // r[impl store.log.chunk-dirent-durable]
+    // r[impl store.log.chunk-dirent-durable+2]
     pub fn new(root: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
@@ -514,34 +514,49 @@ pub(crate) mod fsync_recorder {
     }
 }
 
+impl FilesystemLogChunkStore {
+    // r[impl store.log.chunk-dirent-durable+2]
+    /// PER-PUT SELF-SUFFICIENCY (bug_120): fsync the chunk's FULL
+    /// ancestor chain, child-to-root through the store root,
+    /// unconditionally — 3-4 directories, idempotent, cheap. The
+    /// predecessor recipe classified ancestors with a point-in-time
+    /// `exists()` probe racing a sibling put's `create_dir_all`,
+    /// while the creator's fsync loop ran only after its multi-MiB
+    /// body write and its error paths returned with no dir fsyncs:
+    /// observing a directory said nothing about its dirent's
+    /// durability, so a put could return `Created` (manifest row
+    /// committed) with its chain's durability resting on a sibling
+    /// under no obligation to complete — an implicit cross-task
+    /// obligation transfer with no handoff protocol. Deleting the
+    /// probe deletes the transfer: every `Created`/`Existed` implies
+    /// its full chain was fsynced by THIS put.
+    async fn fsync_chain(&self, path: &std::path::Path, key: &str) -> Result<(), LogChunkError> {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        let mut cursor = parent;
+        loop {
+            fsync_dir(cursor)
+                .await
+                .map_err(|e| io_backend(e, "fsync_dir", key))?;
+            if cursor == self.root {
+                break;
+            }
+            match cursor.parent() {
+                Some(p) => cursor = p,
+                None => break,
+            }
+        }
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl LogChunkStore for FilesystemLogChunkStore {
     async fn put(&self, key: &str, body: Vec<u8>) -> Result<PutOutcome, LogChunkError> {
         let path = self.path_for(key)?;
         debug!(path = %path.display(), size = body.len(), "FilesystemLogChunkStore: storing chunk");
-        // r[impl store.log.chunk-dirent-durable]
-        // durable_put recipe: record which ancestors are NEW before
-        // creating them — after the file is written and synced, each
-        // new directory is fsynced child-to-root, then the deepest
-        // PRE-EXISTING directory (whose data block gained the dirent
-        // naming the topmost new one; the root itself was fsynced at
-        // construction). Without this, a crash between file-sync and
-        // dirent-sync loses a chunk whose manifest row exists.
-        let mut new_dirs: Vec<std::path::PathBuf> = Vec::new();
-        let mut preexisting = self.root.clone();
         if let Some(parent) = path.parent() {
-            let mut cursor = parent;
-            loop {
-                if cursor == self.root || cursor.exists() {
-                    preexisting = cursor.to_path_buf();
-                    break;
-                }
-                new_dirs.push(cursor.to_path_buf());
-                match cursor.parent() {
-                    Some(p) => cursor = p,
-                    None => break,
-                }
-            }
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| io_backend(e, "create_dir_all", key))?;
@@ -556,6 +571,11 @@ impl LogChunkStore for FilesystemLogChunkStore {
         {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Existed is a durability statement too: the creator
+                // may have died between its body sync and its dir
+                // fsyncs, and the caller inserts a manifest row either
+                // way. The chain fsync is per PUT, never per outcome.
+                self.fsync_chain(&path, key).await?;
                 return Ok(PutOutcome::Existed);
             }
             Err(e) => return Err(io_backend(e, "create", key)),
@@ -570,14 +590,7 @@ impl LogChunkStore for FilesystemLogChunkStore {
         file.sync_all()
             .await
             .map_err(|e| io_backend(e, "sync", key))?;
-        // Now the dirents: child-to-root over the new ancestors, then
-        // the pre-existing parent. (`new_dirs` was collected deepest
-        // first, so iteration order IS child-to-root.)
-        for dir in new_dirs.iter().chain(std::iter::once(&preexisting)) {
-            fsync_dir(dir)
-                .await
-                .map_err(|e| io_backend(e, "fsync_dir", key))?;
-        }
+        self.fsync_chain(&path, key).await?;
         Ok(PutOutcome::Created)
     }
 
@@ -687,7 +700,7 @@ impl LogChunkStore for MemoryLogChunkStore {
 
 #[cfg(test)]
 mod tests {
-    // r[verify store.log.chunk-dirent-durable]
+    // r[verify store.log.chunk-dirent-durable+2]
     #[tokio::test]
     async fn filesystem_put_fsyncs_new_ancestors_child_to_root() {
         use super::{LogChunkStore as _, fsync_recorder};
@@ -718,6 +731,80 @@ mod tests {
             ][..],
             "put must fsync each new ancestor (child→root) and the \
              pre-existing parent that gained a dirent"
+        );
+    }
+
+    /// W11-P (bug_120). Proposition: **`Created` entails this put's
+    /// OWN full-chain fsync** — at the recipe's own population:
+    /// shared-prefix concurrent puts. The pre-fix recipe classified
+    /// ancestors with an unsynchronized point-in-time `exists()`
+    /// probe racing a sibling put's `create_dir_all`, while the
+    /// creator's dir-fsync loop ran only AFTER its multi-MiB body
+    /// write and its error paths returned with no dir fsyncs: a
+    /// second put sharing a newly-created ancestor classified it
+    /// preexisting, fsynced only its own leaf chain, and returned
+    /// `Created` (manifest row committed) while the shared chain's
+    /// durability rested on a put with no obligation to complete — a
+    /// host crash in the window lost a chunk whose manifest row
+    /// exists. Orchestrated here as the share-race with the injected
+    /// creator abort: put A created the shared ancestors and died
+    /// before any fsync (simulated by raw `create_dir_all` — exactly
+    /// the on-disk state A leaves); put B must not trust A.
+    // r[verify store.log.chunk-dirent-durable+2]
+    #[tokio::test]
+    async fn shared_prefix_put_fsyncs_its_full_chain_itself() {
+        use super::{LogChunkStore as _, fsync_recorder};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("chunks");
+        let store = super::FilesystemLogChunkStore::new(&root).unwrap();
+
+        // Put A's partial progress: the shared ancestors exist, none
+        // of their dirents is durable (A died before its fsync loop).
+        std::fs::create_dir_all(root.join("logs/ab/cd/sessA")).unwrap();
+        let baseline = fsync_recorder::under(&root).len();
+
+        // Put B shares logs/ab/cd and adds its own leaf.
+        let outcome = store
+            .put("logs/ab/cd/sessB/chunk-000001", b"line".to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, super::PutOutcome::Created));
+
+        let after = fsync_recorder::under(&root)[baseline..].to_vec();
+        let chain = [
+            root.join("logs/ab/cd/sessB"),
+            root.join("logs/ab/cd"),
+            root.join("logs/ab"),
+            root.join("logs"),
+            root.clone(),
+        ];
+        assert_eq!(
+            after,
+            chain.to_vec(),
+            "left (pre-fix): B's exists() probe classified A's freshly \
+             created ancestors preexisting and fsynced only its own leaf \
+             chain — B returned Created (its manifest row commits) while \
+             the shared chain's durability rested on a put that already \
+             died; a host crash loses a chunk whose manifest row exists / \
+             right: every put fsyncs its FULL ancestor chain child→root \
+             unconditionally — Created entails own-chain durability, no \
+             cross-task obligation transfer exists"
+        );
+
+        // The Existed face: a put that finds the object already present
+        // still fsyncs the chain — the creator may have died between
+        // its body sync and its dir fsyncs.
+        let baseline = fsync_recorder::under(&root).len();
+        let outcome = store
+            .put("logs/ab/cd/sessB/chunk-000001", b"line".to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, super::PutOutcome::Existed));
+        assert_eq!(
+            fsync_recorder::under(&root)[baseline..].to_vec(),
+            chain.to_vec(),
+            "Existed is a durability statement too: the chain fsync is \
+             unconditional per put, never per outcome"
         );
     }
 
