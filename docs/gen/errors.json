@@ -1331,6 +1331,34 @@
       "doc": ""
     },
     {
+      "enum": "DerivationError",
+      "name": "Duplicate",
+      "crate": "rio-proto",
+      "msg": "duplicate {field} entry {at:?}",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
+      "name": "EmptyOutputName",
+      "crate": "rio-proto",
+      "msg": "empty output name",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
+      "name": "NoOutputs",
+      "crate": "rio-proto",
+      "msg": "derivation has no outputs",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
+      "name": "Unsorted",
+      "crate": "rio-proto",
+      "msg": "{field} not sorted byte-lexicographically at {at:?}",
+      "doc": ""
+    },
+    {
       "enum": "DirectoryError",
       "name": "BadDigestLen",
       "crate": "rio-proto",
@@ -1377,6 +1405,76 @@
       "name": "Unsorted",
       "crate": "rio-proto",
       "msg": "entries not sorted byte-lexicographically by name within a kind list at {0:?}",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "BadDrvPath",
+      "crate": "rio-proto",
+      "msg": "claimed drv path is invalid: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "Decode",
+      "crate": "rio-proto",
+      "msg": "protobuf decode failed: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "DigestMismatch",
+      "crate": "rio-proto",
+      "msg": "blob digest mismatch: claimed {claimed}, computed {computed}",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "DrvPathMismatch",
+      "crate": "rio-proto",
+      "msg": "drv path mismatch: claimed {claimed}, recomputed {computed}",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "FodPathMismatch",
+      "crate": "rio-proto",
+      "msg": "fixed-output path mismatch for output {name:?}: recorded {recorded}, recomputed {computed}",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "Invalid",
+      "crate": "rio-proto",
+      "msg": "(transparent — delegates to inner error)",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "Nix",
+      "crate": "rio-proto",
+      "msg": "derivation invariant violated: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "NonCanonical",
+      "crate": "rio-proto",
+      "msg": "blob is not the canonical encoding of its decoded message",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "NonUtf8",
+      "crate": "rio-proto",
+      "msg": "non-UTF-8 bytes in {field} ({bytes:?})",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "NotADrvPath",
+      "crate": "rio-proto",
+      "msg": "claimed drv path {0:?} does not name a .drv",
       "doc": ""
     },
     {
@@ -2014,9 +2112,19 @@
       "doc": ""
     },
     {
+      "name": "DerivationError",
+      "crate": "rio-proto",
+      "doc": "Why an untrusted [`Derivation`] message was rejected by [`validate_derivation`]."
+    },
+    {
       "name": "DirectoryError",
       "crate": "rio-proto",
       "doc": "Why a client-supplied [`Directory`] body was rejected."
+    },
+    {
+      "name": "DrvBlobError",
+      "crate": "rio-proto",
+      "doc": "Why a drv blob failed [`verify_drv_blob`] (or a proto → rio-nix conversion failed in [`from_proto`])."
     },
     {
       "name": "NarCollectError",

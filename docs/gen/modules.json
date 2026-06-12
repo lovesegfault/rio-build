@@ -1030,6 +1030,11 @@
       "doc": "`StoreService` NAR-streaming and high-level RPC helpers."
     },
     {
+      "path": "derivation_util.rs",
+      "depth": 0,
+      "doc": "Helpers on the `rio.drv.v1.Derivation` wire type: canonical"
+    },
+    {
       "path": "interceptor.rs",
       "depth": 0,
       "doc": "W3C trace-context propagation across gRPC boundaries."

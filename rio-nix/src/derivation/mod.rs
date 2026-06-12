@@ -255,6 +255,44 @@ pub struct Derivation {
 }
 
 impl Derivation {
+    /// Construct a derivation from its parts.
+    ///
+    /// This is the non-parse constructor used by codecs that rebuild a
+    /// `Derivation` from another wire form (e.g. rio-proto's canonical
+    /// `rio.drv.v1.Derivation` message, ADR-024). Going through this
+    /// constructor and [`Derivation::to_aterm`] keeps the ATerm escape
+    /// table in exactly one place — converters must not duplicate the
+    /// writer.
+    ///
+    /// `outputs` is kept in the given order: Nix emits the ATerm outputs
+    /// list sorted by name, so callers reconstructing a Nix-emitted drv
+    /// pass a sorted list and `to_aterm` reproduces the original bytes.
+    ///
+    /// Returns [`DerivationError::NoOutputs`] when `outputs` is empty
+    /// (same invariant as [`Derivation::parse`]).
+    pub fn new(
+        outputs: Vec<DerivationOutput>,
+        input_drvs: BTreeMap<String, BTreeSet<String>>,
+        input_srcs: BTreeSet<String>,
+        platform: String,
+        builder: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+    ) -> Result<Self, DerivationError> {
+        if outputs.is_empty() {
+            return Err(DerivationError::NoOutputs);
+        }
+        Ok(Derivation {
+            outputs,
+            input_drvs,
+            input_srcs,
+            platform,
+            builder,
+            args,
+            env,
+        })
+    }
+
     /// Convert to a `BasicDerivation` by stripping `input_drvs`.
     ///
     /// Infallible: [`Derivation::parse`] rejects zero-output derivations

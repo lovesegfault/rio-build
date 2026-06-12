@@ -37,6 +37,7 @@ pub const CGROUP_OOM_MSG: &str = "cgroup OOM during build";
 
 pub mod castore_util;
 pub mod client;
+pub mod derivation_util;
 pub mod interceptor;
 // Trait impls (`From<NixStatus> for BuildResultStatus` and inverse) are
 // visible globally regardless of module visibility — `pub` would only
@@ -157,6 +158,18 @@ pub mod admin {
 /// rio-local discriminated root encoded into `nar_index.root_node`.
 pub mod castore {
     tonic::include_proto!("rio.castore");
+}
+
+/// Canonical stored/negotiated form of a Nix derivation (ADR-024).
+///
+/// `Derivation`/`Output`/`InputDrv`/`EnvVar` under the castore
+/// canonical-encode rule: sorted repeated fields (except `args`),
+/// defaults omitted, digest = blake3(canonical bytes). All string-ish
+/// fields are `bytes`, map-shaped data is sorted repeated pairs — see
+/// `derivation.proto` for the full identity rationale and
+/// [`derivation_util`] for digest/validate/convert/verify helpers.
+pub mod drv {
+    tonic::include_proto!("rio.drv.v1");
 }
 
 /// Binary `FileDescriptorSet` covering every `.proto` file compiled by
