@@ -25,6 +25,25 @@ pub const RIO_OK: c_int = 0;
 pub const RIO_ERR: c_int = 1;
 pub const RIO_UNSUPPORTED: c_int = 2;
 
+/// Node kinds for [`RioStat`] and `rio_read_directory` entries. `0`
+/// doubles as "no such path" so a zeroed [`RioStat`] reads as missing.
+pub const RIO_NODE_MISSING: u8 = 0;
+pub const RIO_NODE_REGULAR: u8 = 1;
+pub const RIO_NODE_SYMLINK: u8 = 2;
+pub const RIO_NODE_DIRECTORY: u8 = 3;
+
+/// `rio_lstat` out-struct (mirrored in `shim/rio_evalstore.h`). The hot
+/// metadata op crosses the boundary as plain fields — the warm-eval
+/// profile showed JSON encode/parse of per-op results costing ~13% of
+/// cycles (serde_json here + nlohmann in the shim).
+#[repr(C)]
+pub struct RioStat {
+    /// `RIO_NODE_*`; `RIO_NODE_MISSING` = no such path.
+    pub kind: u8,
+    pub executable: u8,
+    pub size: u64,
+}
+
 /// Pull bytes from the C++ `Source`. Returns 0 on success with `*n_read`
 /// set (0 = EOF), nonzero on failure.
 pub type RioReadCb =
@@ -506,19 +525,19 @@ pub unsafe extern "C" fn rio_write_derivation(
     })
 }
 
-/// lstat within a store object. `rel` may be empty (object root).
-/// `*out_json` is null when missing; otherwise
-/// `{"type":"regular","size":…,"executable":…}` / `{"type":"symlink","target":…}`
-/// / `{"type":"directory"}`.
+/// lstat within a store object. `rel` may be empty (object root). On
+/// rc 0, `*out` is filled; `kind == RIO_NODE_MISSING` means no such
+/// path. Flat struct, no allocation — this op dominates warm-eval FFI
+/// traffic (226k calls per wide-touch nixpkgs eval).
 ///
 /// # Safety
-/// Standard contract.
+/// Standard contract; `out` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rio_lstat(
     store: *mut EvalStore,
     basename: *const c_char,
     rel: *const c_char,
-    out_json: *mut *mut c_char,
+    out: *mut RioStat,
     err: *mut *mut c_char,
 ) -> c_int {
     guard(err, || {
@@ -526,34 +545,50 @@ pub unsafe extern "C" fn rio_lstat(
         let basename = unsafe { req_str(basename) }?;
         // SAFETY: caller contract.
         let rel = unsafe { req_str(rel) }?;
-        let json = match store_ref(store).lstat(basename, rel)? {
-            None => None,
-            Some(PathStat::Regular { size, executable }) => Some(
-                serde_json::json!({"type": "regular", "size": size, "executable": executable})
-                    .to_string(),
-            ),
-            Some(PathStat::Symlink { target }) => {
-                let target = utf8_name(target, "symlink target")?;
-                Some(serde_json::json!({"type": "symlink", "target": target}).to_string())
-            }
-            Some(PathStat::Directory) => Some(serde_json::json!({"type": "directory"}).to_string()),
+        let stat = match store_ref(store).lstat(basename, rel)? {
+            None => RioStat {
+                kind: RIO_NODE_MISSING,
+                executable: 0,
+                size: 0,
+            },
+            Some(PathStat::Regular { size, executable }) => RioStat {
+                kind: RIO_NODE_REGULAR,
+                executable: u8::from(executable),
+                size,
+            },
+            // The target is not part of lstat (readLink is its own op),
+            // so non-UTF-8 targets no longer fail metadata walks.
+            Some(PathStat::Symlink { .. }) => RioStat {
+                kind: RIO_NODE_SYMLINK,
+                executable: 0,
+                size: 0,
+            },
+            Some(PathStat::Directory) => RioStat {
+                kind: RIO_NODE_DIRECTORY,
+                executable: 0,
+                size: 0,
+            },
         };
-        set_out_string(out_json, json);
+        // SAFETY: caller passes a valid out-pointer.
+        unsafe { *out = stat };
         Ok(())
     })
 }
 
-/// Read a directory. `*out_json` maps entry name → "regular" | "symlink"
-/// | "directory".
+/// Read a directory as a flat byte buffer the shim walks without
+/// parsing: `u32 count`, then per entry `u8 kind ‖ u32 name_len ‖ name
+/// bytes`, little-endian. Names are raw bytes (NAR entry names may be
+/// non-UTF-8). Caller frees with [`rio_bytes_free`].
 ///
 /// # Safety
-/// Standard contract.
+/// Standard contract; `out_buf`/`out_len` must be valid pointers.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rio_read_directory(
     store: *mut EvalStore,
     basename: *const c_char,
     rel: *const c_char,
-    out_json: *mut *mut c_char,
+    out_buf: *mut *mut u8,
+    out_len: *mut usize,
     err: *mut *mut c_char,
 ) -> c_int {
     guard(err, || {
@@ -562,21 +597,39 @@ pub unsafe extern "C" fn rio_read_directory(
         // SAFETY: caller contract.
         let rel = unsafe { req_str(rel) }?;
         let entries = store_ref(store).read_directory(basename, rel)?;
-        let mut map = serde_json::Map::new();
+        let payload: usize = entries.iter().map(|(name, _)| 5 + name.len()).sum();
+        let mut buf = Vec::with_capacity(4 + payload);
+        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         for (name, kind) in entries {
-            let kind = match kind {
-                EntryKind::Regular => "regular",
-                EntryKind::Symlink => "symlink",
-                EntryKind::Directory => "directory",
-            };
-            map.insert(
-                utf8_name(name, "directory entry name")?,
-                serde_json::Value::String(kind.to_string()),
-            );
+            buf.push(match kind {
+                EntryKind::Regular => RIO_NODE_REGULAR,
+                EntryKind::Symlink => RIO_NODE_SYMLINK,
+                EntryKind::Directory => RIO_NODE_DIRECTORY,
+            });
+            buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&name);
         }
-        set_out_string(out_json, Some(serde_json::Value::Object(map).to_string()));
+        let boxed = buf.into_boxed_slice();
+        // SAFETY: caller passes valid out-pointers.
+        unsafe {
+            *out_len = boxed.len();
+            *out_buf = Box::into_raw(boxed) as *mut u8;
+        }
         Ok(())
     })
+}
+
+/// Free a buffer returned by [`rio_read_directory`].
+///
+/// # Safety
+/// `p` must be a buffer allocated by this library with the exact `len`
+/// it was returned with (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rio_bytes_free(p: *mut u8, len: usize) {
+    if !p.is_null() {
+        // SAFETY: allocated via Box<[u8]>::into_raw with this length.
+        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, len)) });
+    }
 }
 
 /// Stream a file's contents into `write_cb`.

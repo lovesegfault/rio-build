@@ -67,6 +67,22 @@ struct RioStr
     }
 };
 
+/* RAII for byte buffers allocated by the Rust side (rio_read_directory). */
+struct RioBytes
+{
+    unsigned char * p = nullptr;
+    size_t len = 0;
+
+    RioBytes() = default;
+    RioBytes(const RioBytes &) = delete;
+    RioBytes & operator=(const RioBytes &) = delete;
+
+    ~RioBytes()
+    {
+        rio_bytes_free(p, len);
+    }
+};
+
 /* Source -> rio_read_cb trampoline state. */
 struct SourceCtx
 {
@@ -273,24 +289,27 @@ struct RioStore : virtual Store
             auto [base, rel] = split(path);
             if (base.empty())
                 return Stat{.type = tDirectory};
-            RioStr out, err;
-            int rc = rio_lstat(store.rio, base.c_str(), rel.c_str(), &out.p, &err.p);
+            /* Hot path: a plain out-struct — no allocation, no parse
+             * (this op alone was ~13% of warm-eval cycles as JSON). */
+            RioStat rst{};
+            RioStr err;
+            int rc = rio_lstat(store.rio, base.c_str(), rel.c_str(), &rst, &err.p);
             checkRc(rc, err, "lstat");
-            if (!out.has())
+            switch (rst.kind) {
+            case RIO_NODE_MISSING:
                 return std::nullopt;
-            auto j = nlohmann::json::parse(out.str());
-            auto type = j.at("type").get<std::string>();
-            Stat st;
-            if (type == "regular") {
+            case RIO_NODE_REGULAR: {
+                Stat st;
                 st.type = tRegular;
-                st.fileSize = j.at("size").get<uint64_t>();
-                st.isExecutable = j.at("executable").get<bool>();
-            } else if (type == "symlink") {
-                st.type = tSymlink;
-            } else {
-                st.type = tDirectory;
+                st.fileSize = rst.size;
+                st.isExecutable = rst.executable != 0;
+                return st;
             }
-            return st;
+            case RIO_NODE_SYMLINK:
+                return Stat{.type = tSymlink};
+            default:
+                return Stat{.type = tDirectory};
+            }
         }
 
         bool pathExists(const CanonPath & path) override
@@ -303,14 +322,34 @@ struct RioStore : virtual Store
             auto [base, rel] = split(path);
             if (base.empty())
                 return {};
-            RioStr out, err;
-            int rc = rio_read_directory(store.rio, base.c_str(), rel.c_str(), &out.p, &err.p);
+            RioBytes out;
+            RioStr err;
+            int rc = rio_read_directory(
+                store.rio, base.c_str(), rel.c_str(), &out.p, &out.len, &err.p);
             checkRc(rc, err, "readDirectory");
+            /* Flat layout (see rio_evalstore.h): u32 count, then per
+             * entry u8 kind, u32 name_len, raw name bytes. Walked, not
+             * parsed — produced in-process by the paired Rust core.
+             * memcpy because the u32s are unaligned. */
+            const unsigned char * q = out.p;
+            auto rd32 = [&q] {
+                uint32_t v;
+                std::memcpy(&v, q, 4);
+                q += 4;
+                return v;
+            };
+            uint32_t count = rd32();
             DirEntries entries;
-            for (auto & [name, kind] : nlohmann::json::parse(out.str()).items()) {
-                auto k = kind.get<std::string>();
+            for (uint32_t i = 0; i < count; i++) {
+                unsigned char kind = *q++;
+                uint32_t nameLen = rd32();
+                std::string name(reinterpret_cast<const char *>(q), nameLen);
+                q += nameLen;
                 entries.emplace(
-                    name, k == "regular" ? tRegular : k == "symlink" ? tSymlink : tDirectory);
+                    std::move(name),
+                    kind == RIO_NODE_REGULAR  ? tRegular
+                    : kind == RIO_NODE_SYMLINK ? tSymlink
+                                               : tDirectory);
             }
             return entries;
         }
