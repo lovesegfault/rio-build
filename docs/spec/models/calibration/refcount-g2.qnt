@@ -3,7 +3,8 @@
 // Stage-C calibration overrides, family G2: "a cleanup path forgot the
 // chunks" (leaked refcounts) — the missed / collapsed decrement class
 // (refcount-inventory.md §5 G2, refcount-formal-design.md §3.4; verdicts
-// in the calibration table of docs/spec/models/refcount-invariant-map.md).
+// in the VERDICT ROWS block at the end of this header — full table:
+// docs/spec/models/refcount-records.md).
 // Same extend-and-override pattern as refcount-g1.qnt.
 //
 // Family disposition of the commits NOT carried by an override module:
@@ -43,6 +44,22 @@
 // default `step` over this module's constants is the baseline, recorded
 // as HOLDS in the table.
 // =========================================================================
+//
+// VERDICT ROWS (Stage-C, relocated from the retired refcount invariant
+// map; full table with the NOT-ENC/SUBS dispositions:
+// docs/spec/models/refcount-records.md):
+// - refcountCalibG2ReapInlineOnly (e5bdbff1b / I-040, ENC): FALSIFIES
+//   cr3CounterRefinesFold and cr2NoStrandedGarbage @ calibStep (depth 4,
+//   25/20). Baseline (as-built step, same one-uploader restriction):
+//   HOLDS both (1,072/398).
+// - refcountCalibG2SweepCollapsedCount (adfd303d7 C2, ENC): FALSIFIES
+//   cr3CounterRefinesFold and cr2NoStrandedGarbage @ calibStep (depth
+//   11, 3,348,835/146,119) — the by-count clause of
+//   store.chunk.refcount-decrement exercised end-to-end. Baseline:
+//   contend-regime constants verbatim (Stage-B exhaustive HOLDS).
+// - ENC-A by analogy: dbb42232a covered by refcountCalibG2ReapInlineOnly
+//   (the model's writers funnel every owner-side cleanup through the
+//   same reap action).
 module refcountCalibG2ReapInlineOnly {
   import chunkLiveness(
     MAX_HASHES = 1,

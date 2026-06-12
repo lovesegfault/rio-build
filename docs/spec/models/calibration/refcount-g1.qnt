@@ -3,8 +3,9 @@
 // Stage-C calibration overrides, family G1: "a late or foreign cleanup
 // clobbered someone else's upload" (ownership/identity) — the claim_id /
 // PlaceholderToken / claim-gate machinery (refcount-inventory.md §5 G1,
-// refcount-formal-design.md §3.4; the verdicts live in the calibration
-// table of docs/spec/models/refcount-invariant-map.md).
+// refcount-formal-design.md §3.4; the verdicts live in the VERDICT
+// ROWS block at the end of this header — full table:
+// docs/spec/models/refcount-records.md).
 //
 // Protocol (the retry campaign's calibration pattern): each module below
 // instantiates the AS-BUILT model `chunkLiveness.qnt`, replaces ONE
@@ -69,6 +70,37 @@
 // zero). Constants are the contend regime's verbatim, so the Stage-B
 // contend verdict is the baseline.
 // =========================================================================
+//
+// VERDICT ROWS (Stage-C, relocated from the retired refcount invariant
+// map; full table with the NOT-ENC/SUBS dispositions:
+// docs/spec/models/refcount-records.md):
+// - refcountCalibG1RollbackPreToken (1cd975b90, ENC): FALSIFIES
+//   cr3CounterRefinesFold and m023NonNegative @ calibStep (depth 8,
+//   208,974/12,056) — the late rollback erases the successor's
+//   placeholder and re-decrements an already-reclaimed reference below
+//   zero; incident shape pinned by g1PreTokenDoubleDecrementRun.
+//   Baseline: contend-regime constants verbatim (Stage-B exhaustive
+//   HOLDS).
+// - refcountCalibG1CompletionUnclaimGated (937a9c928 completion half,
+//   ENC): FALSIFIES local completionRequiresCurrentOwner @ calibStep
+//   (depth 9, 53,278/5,798) and cr1NoLiveChunkCollected @ calibStep
+//   (depth 10, 142,842/15,174). Baselines over the same relaxed-clock
+//   alphabet: the local invariant HOLDS exhaustively
+//   (38,684,545/1,608,957) — the falsification is attributable to the
+//   claim gate; CR-1 does NOT hold on that baseline (depth 13,
+//   2,458,154/187,657) via the independent late-mark window, so the CR-1
+//   run is supporting evidence, not the attribution.
+// - refcountCalibG1ReapPathMatched (bf7e516e4 C1, ENC): FALSIFIES
+//   cr4PresenceFromConfirmedUpload @ calibStep (depth 11, 17,722/6,084)
+//   — the foreign reap soft-deletes and enqueues the successor's chunk;
+//   presence commits on the soft-deleted row and the drain removes the
+//   just-uploaded object. Baseline (as-built step, same restriction):
+//   HOLDS (185,649/35,161).
+// - ENC-A by analogy: 31bd9c512 and 539c2be7c covered by
+//   refcountCalibG1ReapPathMatched (a reap admitted against a row that
+//   changed under it); 31ce52b14 covered by
+//   refcountCalibG1RollbackPreToken (a decrement justified by a stale
+//   view, double-charging a generation).
 module refcountCalibG1RollbackPreToken {
   import chunkLiveness(
     MAX_HASHES = 2,

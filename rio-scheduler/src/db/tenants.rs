@@ -95,9 +95,22 @@ impl SchedulerDb {
     /// active holds → release first (the heal edge stays witnessed);
     /// released history → the tenant is permanently archival (its
     /// rows anchor the audit's WHO). FK CASCADE
-    /// (tenant_keys/upstreams/path_tenants/chunk_tenants) and SET NULL
+    /// (tenant_keys/upstreams/path_tenants) and SET NULL
     /// (builds/derivations) handle the rest — see migrations 009/012/
     /// 017/018/026.
+    // TODO: chunk_tenants stale-reference sweep (relocated from the
+    // retired refcount invariant map): the table was dropped by
+    // migration 035 (the backing PutChunk/FindMissingChunks RPCs were
+    // never production-wired; M_035 has the rationale), and this doc
+    // comment previously listed it among the CASCADE targets. The
+    // remaining stale prose-only mentions to sweep: the
+    // sched.admin.delete-tenant body in scheduler.typ (removing a dead
+    // table name does not change the rule's normative meaning, so no
+    // tracey bump is expected — make that call consciously), the
+    // tenancy.typ FindMissingChunks current-state box + isolation
+    // table + implementation-status row, and security.typ's two
+    // threat-model entries naming FindMissingChunks as live. None
+    // issues SQL; routine cleanup, no deadline.
     pub(crate) async fn delete_tenant(
         &self,
         name: &str,

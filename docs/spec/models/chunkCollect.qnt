@@ -84,7 +84,7 @@
 //   - The collector-existence / backstop-cadence obligations (a missing
 //     background loop) — carried by runtime metrics and alerts
 //     (`rio_store_gc_collect_cycles_total`, the stalled alert), not by
-//     this model (invariant map, Phase-1 input list).
+//     this model (refcount-records.md, Phase-1 input list).
 //   - The per-cycle victim cap value and the cursor mechanics: scheduling
 //     below the transition relation's granularity (capped stop ≡
 //     collectFinish before the eligible set is exhausted) — §4.6 v4.
@@ -618,8 +618,8 @@ module chunkCollect {
   /// structural form. The wall-clock half of the rule's bound (cycle
   /// cadence, the capped-cycle backlog drain of design §4.1 step 3 v4,
   /// drain lag) is background-loop scheduling carried by runtime
-  /// metrics and alerts, not model state (invariant map, Phase-1 input
-  /// list); what the protocol must guarantee is that garbage never
+  /// metrics and alerts, not model state (refcount-records.md, Phase-1
+  /// input list); what the protocol must guarantee is that garbage never
   /// becomes UNRECLAIMABLE by the standing machinery:
   ///   (a) an existing, unreferenced, not-yet-soft-deleted chunk is
   ///       never excluded from future collection by anything durable.
@@ -1299,7 +1299,13 @@ module chunkCollect {
   /// (design §4.4) — and "consecutive failed cycles on the same named
   /// manifest" (the adjudication-7 trigger) cannot accumulate against
   /// a transient placeholder, so the operator action is not modeled
-  /// against one. Corrupt regime only.
+  /// against one. Modeling an unrestricted quarantine would admit an
+  /// operator deleting a live, mid-upload placeholder, whose late S3
+  /// PUT then recreates an object with no scheduled delete — an
+  /// orphan-object shape that is not a property of the design's
+  /// remediation story; the complete-only restriction is recorded
+  /// here rather than silently narrowing the rule text. Corrupt
+  /// regime only.
   action quarantineCorrupt(p: int): bool = all {
     ENABLE_CORRUPT,
     paths.get(p).status == PComplete,

@@ -12,7 +12,8 @@
 // THE CODE AS BUILT at the formal-sprint branch point, not the design's
 // intended replacement. The protocol inventory with file:line evidence
 // for every claim mirrored here is refcount-inventory.md; the
-// invariant-to-spec-rule map is docs/spec/models/refcount-invariant-map.md.
+// campaign archive (linkage, Stage-B/C records, acceptance) is
+// docs/spec/models/refcount-records.md.
 //
 // WHAT IS MODELED
 //   - The chunked write-ahead state machine per uploader (inventory
@@ -514,7 +515,7 @@ module chunkLiveness {
   // --- 7. invariants ------------------------------------------------------
   //
   // CR-1..CR-4 are the campaign's committed invariants
-  // (refcount-formal-design.md §3.3, refcount-invariant-map.md); the
+  // (refcount-formal-design.md §3.3; archive: refcount-records.md); the
   // S/L items are the supporting set carried for calibration. Spec
   // rules are named in each comment; the r[verify ...] markers live at
   // the check wiring points in nix/quint.nix.

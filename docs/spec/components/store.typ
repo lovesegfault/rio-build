@@ -248,7 +248,7 @@ collect time (#rref("store.chunk.liveness-derived"),
 construction with no maintained aggregate left to drift; the historical
 `chunks.refcount` column is dropped by migration 072. The retirement record
 (what each rule required, what replaced it, and the calibration evidence)
-lives in `docs/spec/models/refcount-invariant-map.md`.
+lives in `docs/spec/models/refcount-records.md`.
 
 #r("store.chunk.no-live-collect")[
   No live chunk is ever collected: if any existing `'complete'` manifest's

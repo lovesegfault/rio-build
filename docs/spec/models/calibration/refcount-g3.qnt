@@ -3,7 +3,8 @@
 // Stage-C calibration overrides, family G3: "the counter was used as an
 // S3-presence signal" (data loss) — the pre-M_033 dedup semantics
 // (refcount-inventory.md §5 G3, refcount-formal-design.md §3.4; verdicts
-// in the calibration table of docs/spec/models/refcount-invariant-map.md).
+// in the VERDICT ROWS block at the end of this header — full table:
+// docs/spec/models/refcount-records.md).
 // Same extend-and-override pattern as refcount-g1.qnt. The second module
 // is the design's pre-registered G2×G3 joint-revert row (the I-040
 // stale-skip production trace), not a single-commit revert.
@@ -43,6 +44,26 @@
 // Constants are the crash regime's verbatim, so the Stage-B crash
 // verdict is the baseline.
 // =========================================================================
+//
+// VERDICT ROWS (Stage-C, relocated from the retired refcount invariant
+// map; full table with the NOT-ENC/SUBS dispositions:
+// docs/spec/models/refcount-records.md):
+// - refcountCalibG3CounterAsPresence (dd5c11376 / M_033, ENC): FALSIFIES
+//   cr4PresenceFromConfirmedUpload @ calibStep (depth 4, 1,602/145) and
+//   cr1NoLiveChunkCollected @ calibStep (depth 7, 115,050/7,014) — two
+//   concurrent writers of the same content; the loser skips the PUT
+//   nobody confirmed and completes. Baseline: crash-regime constants
+//   verbatim (Stage-B exhaustive HOLDS).
+// - refcountCalibG3JointStaleSkip (G2×G3 joint revert, ENC): FALSIFIES
+//   cr4PresenceFromConfirmedUpload @ calibStep (depth 4, 1,262/121) and
+//   cr1NoLiveChunkCollected @ calibStep (depth 7, 76,630/4,969); BFS
+//   reports the two-concurrent-writers variant as the shallowest
+//   counterexample, and the documented I-040 reap-then-stale-skip shape
+//   is pinned deterministically by g3JointStaleSkipRun. Baseline:
+//   contend-regime constants verbatim (Stage-B exhaustive HOLDS).
+// - ENC-A by analogy: b1c7a9497 covered by
+//   refcountCalibG3CounterAsPresence (the re-query race only loses data
+//   under counter-as-presence semantics; same harm state).
 module refcountCalibG3CounterAsPresence {
   import chunkLiveness(
     MAX_HASHES = 2,

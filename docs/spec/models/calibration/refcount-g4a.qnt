@@ -3,8 +3,8 @@
 // Stage-C calibration overrides, family G4a: "collect raced a concurrent
 // re-reference" — the chunk-level GC/drain TOCTOU vs a re-upload
 // (refcount-inventory.md §5 G4 chunk-level rows, refcount-formal-design.md
-// §3.4 G4a; verdicts in the calibration table of
-// docs/spec/models/refcount-invariant-map.md). Same extend-and-override
+// §3.4 G4a; verdicts in the VERDICT ROWS block at the end of this
+// header — full table: docs/spec/models/refcount-records.md). Same extend-and-override
 // pattern as refcount-g1.qnt. The path-level mark/sweep rows of G4
 // (G4b) are pre-registered NOT-ENCODED — path unreachability is an
 // abstract environment choice in chunkLiveness.qnt — and stay with the
@@ -44,6 +44,19 @@
 // state form one completion later. Constants are the contend regime's
 // verbatim, so the Stage-B contend verdict is the baseline.
 // =========================================================================
+//
+// VERDICT ROWS (Stage-C, relocated from the retired refcount invariant
+// map; full table with the NOT-ENC/SUBS dispositions:
+// docs/spec/models/refcount-records.md):
+// - refcountCalibG4aDrainNoRecheck (aa738a5d7 / M_006, ENC): FALSIFIES
+//   cr1NoLiveChunkCollected @ calibStep (depth 7, 63,334/4,030) — a re-
+//   upload resurrects the enqueued chunk and the pre-fix drain deletes
+//   its object while referenced. Baseline: contend-regime constants
+//   verbatim (Stage-B exhaustive HOLDS).
+// - ENC-A by analogy: a2d4c6cd8 (drain re-check half) covered by
+//   refcountCalibG4aDrainNoRecheck — at one-action-per-SQL-transaction
+//   granularity the lockless re-check's staleness window collapses onto
+//   "the delete does not observe the concurrent resurrect".
 module refcountCalibG4aDrainNoRecheck {
   import chunkLiveness(
     MAX_HASHES = 2,
