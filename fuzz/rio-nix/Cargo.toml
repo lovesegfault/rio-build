@@ -21,6 +21,10 @@ tempfile = "3"
 tokio = { version = "1", features = ["rt", "io-util"] }
 # nar_ls fuzz target re-derives blake3 over each indexed file slice.
 blake3 = "1"
+# drv_proto_decode fuzz target decodes/validates the canonical
+# rio.drv.v1.Derivation message (ADR-024).
+rio-proto = { path = "../../rio-proto" }
+prost = "0.14"
 
 [[bin]]
 name = "wire_primitives"
@@ -61,6 +65,12 @@ doc = false
 [[bin]]
 name = "build_result_parsing"
 path = "fuzz_targets/build_result_parsing.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "drv_proto_decode"
+path = "fuzz_targets/drv_proto_decode.rs"
 test = false
 doc = false
 
