@@ -4300,6 +4300,115 @@ async fn forecast_tenant_ceiling_holds_across_filter_views() {
     );
 }
 
+// r[verify sched.sla.forecast.tenant-ceiling]
+/// **W11-AC (bug_143)** — *proposition: Σ provisioned cores per
+/// tenant ≤ cap under every gate/backoff/forecast interleaving — the
+/// debit chokepoint sits ABOVE every emission gate, so suppressing
+/// EMISSION never un-accounts demand (the bug_129 lesson generalized
+/// from `queued_by_system` to the debit); population: the adversarial
+/// schedule pinned — Ready cores at cap inside their backoff window
+/// while forecast candidates sit inside the provisioning lead
+/// horizon, then the backoff lapses. The probe gate is
+/// position-equivalent (both gates sit below the single debit
+/// chokepoint post-fix), so this cell quantifies the gate
+/// composition.*
+///
+/// Pre-fix RED (the cap+N shape): the backoff gate `continue`d
+/// BEFORE the per-tenant debit, so a tenant's in-backoff Ready cores
+/// left the ledger at full cap and the forecast pass admitted up to
+/// cap on top — when the backoff lapsed inside the provisioning lead
+/// horizon, the never-debited Ready emission landed on the already-
+/// forecast-provisioned capacity: cap+N provisioned cores with N
+/// tenant-influenceable (a tenant manufactures backoff via failing
+/// builds). Wave-10's merged_bug_099 made the debit view-independent
+/// yet re-certified the gates as "upstream of the debit" — sound for
+/// instant spawnability, false for a future-directed budget whose
+/// lead horizon overlaps the backoff window.
+#[tokio::test]
+async fn forecast_debit_charges_backoffed_ready_cores() {
+    use crate::sla::config::CapacityType;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+
+    let forecast_cores = |snap: &crate::actor::SpawnIntentsSnapshot| -> u32 {
+        snap.intents
+            .iter()
+            .filter(|i| i.ready == Some(false))
+            .map(|i| i.cores)
+            .sum()
+    };
+    let ready_cores = |snap: &crate::actor::SpawnIntentsSnapshot| -> u32 {
+        snap.intents
+            .iter()
+            .filter(|i| i.ready == Some(true))
+            .map(|i| i.cores)
+            .sum()
+    };
+
+    let mut actor = {
+        let mut sla = test_sla_config();
+        sla.lead_time_seed
+            .insert(("test-hw".into(), CapacityType::Spot), 200.0);
+        sla.max_forecast_cores_per_tenant = 8;
+        bare_actor_cfg(
+            db.pool.clone(),
+            DagActorConfig {
+                sla,
+                ..Default::default()
+            },
+        )
+    };
+    // Ready Σ8 (2 × 4 probe cores) — IN BACKOFF (the gate that
+    // pre-fix sat above the debit).
+    for r in ["bk0", "bk1"] {
+        actor.test_inject_ready(r, None, "x86_64-linux", false);
+        actor.dag.node_mut(r).expect("injected").retry.backoff_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+    // Forecast candidates Σ8 inside the lead horizon (seed 200s,
+    // deps ~40s remaining).
+    for q in ["fa", "fb"] {
+        let dep = format!("{q}dep");
+        actor.test_inject_at(&dep, "x86_64-linux", DerivationStatus::Running);
+        actor.test_inject_at(q, "x86_64-linux", DerivationStatus::Queued);
+        actor.test_inject_edge(q, &dep);
+        actor.test_set_running_eta(&dep, 50.0, 10, 4);
+    }
+
+    // Poll 1 — during the backoff window: the provisioning plane acts
+    // on this snapshot's forecast admission.
+    let during = actor.compute_spawn_intents(&Default::default());
+    let f = forecast_cores(&during);
+    assert_eq!(
+        ready_cores(&during),
+        0,
+        "premise: the backoff gate suppresses Ready EMISSION (bug_282)"
+    );
+
+    // The window lapses inside the lead horizon: the Ready emission
+    // lands on top of whatever the forecast already provisioned.
+    for r in ["bk0", "bk1"] {
+        actor.dag.node_mut(r).expect("injected").retry.backoff_until =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    }
+    let after = actor.compute_spawn_intents(&Default::default());
+    let r = ready_cores(&after);
+    assert_eq!(r, 8, "premise: the lapsed window restores Ready emission");
+
+    assert!(
+        f + r <= 8,
+        "left (pre-fix): forecast admitted {f} cores while the tenant's \
+         Σ8 backoff'd Ready cores were never debited (the gate sat above \
+         the debit), then the lapsed backoff emitted {r} Ready cores on \
+         top — {} provisioned ≈ cap+N, N tenant-influenceable / right: \
+         the debit chokepoint sits immediately after demand counting, \
+         above every emission gate — in-backoff Ready cores exhaust the \
+         cap and the forecast admits nothing: Σ ≤ cap under the \
+         gate/backoff/forecast interleaving",
+        f + r
+    );
+}
+
 // r[verify sec.executor.identity-token+3]
 /// W10-T (bug_046, triage-corrected) — the Omitted-loop death,
 /// count-based at the mint. Pre-fix `mint_executor_tokens` re-solved

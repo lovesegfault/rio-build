@@ -669,14 +669,51 @@ impl DagActor {
             // the two aggregates are equal by construction whichever
             // RPC a consumer reads.
             *queued_by_system.entry(state.system.clone()).or_default() += 1;
+            // r[impl sched.sla.intent-from-solve]
+            // ADR-023: per-derivation SpawnIntent. intent_id is the
+            // drv_hash itself — the controller stamps it on the pod
+            // annotation, the builder presents it on `PullAssignment`,
+            // and the pull mint resolves `intent_id == drv_hash`. No
+            // separate intent→drv map to keep in sync; if the drv
+            // leaves Ready before the pod pulls, the mint answers
+            // Gone/NotYetReady instead.
+            let intent = self.solve_intent_for(state, &hw, &cost, inputs_gen);
+            // gap (d): debit Ready cores from the tenant's forecast
+            // budget. A negative balance is fine — the forecast pass
+            // checks `> cores`, not `>= 0`. merged_bug_099: the debit
+            // runs against the UNFILTERED population — ABOVE the view
+            // filter — so every filtered poll sees the same per-tenant
+            // ledger (the ceiling is per-TENANT, never per-(tenant ×
+            // view); the solve is memoized, so the off-view solve cost
+            // is a SolveCache hit).
+            // bug_143 (the debit-first law): the debit is ONE
+            // chokepoint immediately after demand counting — NO
+            // emission gate sits above it. Suppressing EMISSION must
+            // not un-account demand (the bug_129 lesson, generalized
+            // from `queued_by_system` to the debit): a backoff'd or
+            // unprobed Ready node still holds its cores against the
+            // tenant's future-directed budget, because the forecast's
+            // provisioning lead horizon can overlap the backoff
+            // window — pre-fix the gates `continue`d above this line,
+            // the ledger stayed at full cap, and a lapsing backoff
+            // landed the never-debited Ready emission on top of
+            // full-cap forecast provisioning (cap+N, N tenant-
+            // influenceable). The pre-hoist re-certification ("the
+            // gates are facts about what can spawn ANYWHERE and stay
+            // upstream of the debit") was sound for instant
+            // spawnability and false for the future-directed budget.
+            let tenant = state.attributed_tenant(&self.builds);
+            *tenant_forecast_budget.entry(tenant).or_insert(cap) -= i64::from(intent.cores);
             // bug_282: a Ready node inside its transient-retry backoff
             // window emits no spawn intent — the kernel's pull
             // admission would refuse the mint anyway (the
             // build_backoff_expired conjunct), so spawning a pod for
             // it just burns a pod-start against a guaranteed
             // NotYetReady loop until the window lapses. BELOW the
-            // aggregate (bug_129): backoff suppresses intent EMISSION
-            // only — the node is still queued demand on both surfaces.
+            // aggregate (bug_129) AND below the debit (bug_143):
+            // backoff suppresses intent EMISSION only — the node is
+            // still queued demand on both aggregate surfaces and
+            // still charged demand on the tenant ledger.
             if state.retry.backoff_until.is_some_and(|t| t > spawn_now) {
                 continue;
             }
@@ -692,6 +729,8 @@ impl DagActor {
             // `batch_probe_cached_ready` early-returns without
             // stamping) or when the node is unprobeable (floating-CA
             // / no expected_output_paths — probe never stamps it).
+            // Emission-only, below the debit (bug_143) — same law as
+            // the backoff gate above.
             if probe_gate && state.probed_generation == 0 && state.output_paths_probeable() {
                 continue;
             }
@@ -713,27 +752,6 @@ impl DagActor {
             // dispatch's overflow walk tries cheapest first, so a
             // kvm builder spawned for ∅-feature work would idle until
             // activeDeadlineSeconds).
-            // r[impl sched.sla.intent-from-solve]
-            // ADR-023: per-derivation SpawnIntent. intent_id is the
-            // drv_hash itself — the controller stamps it on the pod
-            // annotation, the builder presents it on `PullAssignment`,
-            // and the pull mint resolves `intent_id == drv_hash`. No
-            // separate intent→drv map to keep in sync; if the drv
-            // leaves Ready before the pod pulls, the mint answers
-            // Gone/NotYetReady instead.
-            let intent = self.solve_intent_for(state, &hw, &cost, inputs_gen);
-            // gap (d): debit Ready cores from the tenant's forecast
-            // budget. A negative balance is fine — the forecast pass
-            // checks `> cores`, not `>= 0`. merged_bug_099: the debit
-            // runs against the UNFILTERED population — ABOVE the view
-            // filter — so every filtered poll sees the same per-tenant
-            // ledger (the ceiling is per-TENANT, never per-(tenant ×
-            // view); the solve is memoized, so the off-view solve cost
-            // is a SolveCache hit). The population gates above
-            // (classification, backoff, probe) are facts about what
-            // can spawn ANYWHERE and stay upstream of the debit.
-            let tenant = state.attributed_tenant(&self.builds);
-            *tenant_forecast_budget.entry(tenant).or_insert(cap) -= i64::from(intent.cores);
             // The request filter is a VIEW PROJECTION over the
             // population — emission-only, downstream of every
             // admission/debit decision (merged_bug_099).
