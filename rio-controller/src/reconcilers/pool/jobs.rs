@@ -1959,8 +1959,12 @@ fn intent_suffix(intent_id: &str) -> String {
 /// name that would collide with the grammar (`:`/`,` are not legal in
 /// k8s label values, so a colliding name is config-invalid anyway).
 /// Fail-open: an unstamped Job degrades to the legacy no-arm re-ack,
-/// never a skewed echo (the scheduler refuses a whole ack on one
-/// undecodable entry — validate-then-commit).
+/// never a skewed echo. bug_075: since the wave-11 per-plane
+/// contract the scheduler refuses an undecodable entry's PLANE, not
+/// the whole ack — sibling planes land, and post-refusal redelivery
+/// is safe through each plane's own idempotency law (epoch gate /
+/// upsert / wholesale rebuild), never through a nothing-applied
+/// premise.
 pub(super) fn intent_cells_annotation_value(i: &SpawnIntent) -> Option<String> {
     if i.hw_class_names.is_empty() || i.hw_class_names.len() != i.node_affinity.len() {
         return None;

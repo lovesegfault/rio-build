@@ -2715,9 +2715,19 @@ impl NodeClaimPoolReconciler {
         // no-op; observed-type upserts dedup server-side. And since
         // merged_bug_005 the Ack itself means APPLIED UNDER
         // LEADERSHIP, not enqueued: the scheduler answers after the
-        // actor applies — and per bug_094's validate-then-commit, an
-        // erring Ack (deposed, undecodable entry) means
-        // NO plane landed, so retaining + redelivering here is exact.
+        // actor applies. bug_075: since the wave-11 PER-PLANE
+        // refusal contract (PlaneEntryUndecodable), an erring Ack
+        // means every UNNAMED plane LANDED — only the refused
+        // plane(s) did not — so retaining + redelivering here is
+        // safe NOT because nothing applied, but because every plane
+        // is redelivery-idempotent BY LAW: the cell-event epoch gate
+        // above, the observed-type server-side upsert, and the
+        // binding snapshot's wholesale rebuild. Those idempotency
+        // laws are LOAD-BEARING for post-refusal redelivery — an
+        // auditor reasoning "nothing applied ⇒ redelivery exact"
+        // could license dropping one as redundant, which is exactly
+        // backwards (a deposed-leader Ack error remains the
+        // nothing-landed face; the per-plane face is the live one).
         let req = AckSpawnedIntentsRequest {
             // The explicit per-tick snapshot (always present from this
             // reconciler; empty = clear). R9: the legacy field 5 is
