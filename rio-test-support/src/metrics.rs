@@ -139,9 +139,10 @@ pub struct CountingRecorder {
     // loss. Presence in the map also serves as the touch-set for
     // absence-checks (leader-gate: standby must NOT set).
     gauges: Mutex<HashMap<String, Arc<AtomicU64>>>,
-    // Histogram touch-set: names only, mirroring `gauges`. For "this
-    // code path recorded into this histogram" assertions where the
-    // value is non-deterministic (elapsed time).
+    // Histogram touch-set: rendered `name{labels}` keys, mirroring
+    // `gauges`. For "this code path recorded into this histogram"
+    // assertions where the value is non-deterministic (elapsed time);
+    // the rendered labels let tests pin the label arm too.
     histograms: Mutex<HashSet<String>>,
 }
 
@@ -184,11 +185,34 @@ impl CountingRecorder {
         self.gauge_value(&format!("{name}{{}}")).is_some()
     }
 
-    /// True if any `histogram!()` invocation has been observed for `name`
-    /// (unlabeled name only). For "this code path recorded into this
+    /// True if any `histogram!()` invocation has been observed for `name`,
+    /// regardless of labels. For "this code path recorded into this
     /// histogram" assertions where the value is non-deterministic.
     pub fn histogram_touched(&self, name: &str) -> bool {
-        self.histograms.lock().unwrap().contains(name)
+        let prefix = format!("{name}{{");
+        self.histograms
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|k| k.starts_with(&prefix))
+    }
+
+    /// True if `histogram!()` was observed for exactly `rendered_key`
+    /// (rendered as `name{k1=v1,k2=v2}` with labels sorted; no labels →
+    /// `"name{}"`). For pinning the label arm, not just the name —
+    /// e.g. a per-tier latency histogram recorded under the wrong tier
+    /// passes [`Self::histogram_touched`] but fails this.
+    pub fn histogram_key_touched(&self, rendered_key: &str) -> bool {
+        self.histograms.lock().unwrap().contains(rendered_key)
+    }
+
+    /// All histogram keys seen so far (sorted). For assertion-failure
+    /// diagnostics: when a label-arm check fails, this shows what DID
+    /// get recorded.
+    pub fn histogram_keys(&self) -> Vec<String> {
+        let mut keys: Vec<_> = self.histograms.lock().unwrap().iter().cloned().collect();
+        keys.sort();
+        keys
     }
 
     /// All gauge names seen so far (sorted). For assertion-failure
@@ -229,10 +253,7 @@ impl Recorder for CountingRecorder {
         Gauge::from_arc(atomic)
     }
     fn register_histogram(&self, key: &Key, _: &Metadata<'_>) -> Histogram {
-        self.histograms
-            .lock()
-            .unwrap()
-            .insert(key.name().to_string());
+        self.histograms.lock().unwrap().insert(render_key(key));
         Histogram::noop()
     }
 }
