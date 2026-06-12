@@ -1320,14 +1320,17 @@ const FUTILE_PASS_THRESHOLD: u32 = 3;
 
 /// merged_bug_005 (R17, violable + testable) — how many passes the
 /// listing stays withheld after a futile streak before ONE probe
-/// pass re-lists. Derivation: at the 1 s production beat
-/// (`poll_interval_secs` floor — `claim_loop` clamps with
-/// `.max(1)`), 64 withheld passes ≈ 64 s ≥ the scheduler's 60 s
-/// listing-membership TTL ([`SCHEDULER_LISTING_MEMBER_TTL_SECS`]):
-/// the wedged worker leaves the membership ENTIRELY and its
-/// rendezvous slice re-homes permanently until a probe pass
-/// converts again. The residual is one ≤5 s re-pin (the steal
-/// horizon) per probe interval — recorded, accepted. The
+/// pass re-lists. Derivation (bug_137, R29 — in PACED BEATS, the
+/// consumer's clock, never passes): with the worst-case `Pace::Now`
+/// budget subtracted (`RESUME_LEDGER_CAP` zero-sleep Settled seals)
+/// and every remaining sleep at the `POLL_JITTER` floor of the 1 s
+/// production beat (`claim_loop` clamps `.max(1)`; integer-second
+/// server floors never undercut it), the withhold covers the
+/// scheduler's 60 s listing-membership TTL
+/// ([`SCHEDULER_LISTING_MEMBER_TTL_SECS`]) plus the ≤5 s
+/// steal-horizon re-pin priced as margin: the wedged worker leaves
+/// the membership ENTIRELY and its rendezvous slice re-homes until
+/// a probe pass converts again. The
 /// `futile_latch_probe_interval_exceeds_member_ttl` const-relation
 /// test pins the inequality.
 ///
@@ -1338,7 +1341,27 @@ const FUTILE_PASS_THRESHOLD: u32 = 3;
 /// those froze the countdown and stretched the cadence arbitrarily
 /// in wall-clock). Running witness:
 /// `withhold_countdown_advances_on_gated_passes`.
-const FUTILE_RELIST_INTERVAL_PASSES: u32 = 64;
+///
+/// bug_137 (R29 — consumer-clock denomination): 128, NOT the retired
+/// 64. The retired pin counted PASSES at an assumed 1 s/pass, but
+/// wave-8's pacing law severed that equivalence: `Settled`
+/// resume-ledger seals pace `Now` (zero sleep — up to
+/// `RESUME_LEDGER_CAP` such ticks per window, since each sealed
+/// entry settles at most once) and every paced sleep can jitter
+/// down to the `POLL_JITTER` floor (0.8 × the 1 s production beat),
+/// so 64 passes could elapse in ~26 s — inside the 60 s membership
+/// TTL, the worker re-listed before `last_listed` lapsed, and the
+/// pinned law, this doc, and the operator warn were all false. The
+/// bound, in the consumer's own clock (paced beats):
+///
+///   (128 − 32 Now budget) × 0.8 s floor = 76.8 s ≥ 60 s TTL + 5 s
+///   steal horizon
+///
+/// symbol-bound at `futile_latch_probe_interval_exceeds_member_ttl`
+/// (a const block — breaking the relation fails the BUILD) and
+/// driven through the production latch + pace law at the storm cap
+/// by `withhold_outlasts_ttl_under_the_settled_storm`.
+const FUTILE_RELIST_INTERVAL_PASSES: u32 = 128;
 
 /// Mirrored scheduler constant (rio-scheduler
 /// `LISTING_MEMBER_TTL` = 60 s): rio-store cannot import
@@ -5052,23 +5075,48 @@ mod tests {
     }
 
     // r[verify store.materialize.honest-beat]
-    /// R17 const-relation pin: the futility re-probe interval at the
-    /// production beat floor (1 s — claim_loop clamps
-    /// `poll_interval_secs.max(1)`) covers the scheduler's
-    /// listing-membership TTL, so a withheld worker leaves the
-    /// membership ENTIRELY and its slice re-homes permanently (not
-    /// just via the 5 s steal horizon).
+    /// R17 const-relation pin, re-derived per R29 (bug_137): the
+    /// withhold is denominated in PACED BEATS, not passes — wave-8's
+    /// pacing law severed the pass↔beat equivalence the retired pin
+    /// (`64 passes × 1 s/pass ≥ 60 s`) encoded: `Settled`
+    /// resume-ledger seals pace `Now` (zero sleep, up to
+    /// `RESUME_LEDGER_CAP` such ticks — each sealed entry settles at
+    /// most once, so the cap bounds the zero-sleep budget per
+    /// window), and every paced sleep can jitter DOWN to the
+    /// `POLL_JITTER` floor of the 1 s production beat (`claim_loop`
+    /// clamps `poll_interval_secs.max(1)`; server retry floors are
+    /// integer `WireSecs`, so no `Floor` sleep undercuts the beat
+    /// floor). The law, bound to the REAL symbols (the surviving
+    /// sibling-pin form):
+    ///
+    ///   (PASSES − now_budget) × beat_floor ≥ TTL + steal_horizon
+    ///
+    /// so a withheld worker leaves the membership ENTIRELY under the
+    /// adversarial schedule (max Now budget + min jitter), with the
+    /// ≤5 s steal-horizon re-pin priced as margin. A Beat floor
+    /// clamp was NOT needed: the 0.8 s jitter floor is priced into
+    /// the bound directly (recorded per the WO's either-way rider).
     #[test]
     fn futile_latch_probe_interval_exceeds_member_ttl() {
-        const MIN_BEAT_SECS: u64 = 1;
         // Compile-anchored (R17): the relations are const blocks — a
         // constant change that breaks the law fails the BUILD, not a
         // test run.
         const {
+            let beat_floor: f64 = match crate::materialize::POLL_JITTER {
+                rio_common::backoff::Jitter::Proportional(f) => 1.0 - f,
+                rio_common::backoff::Jitter::None => 1.0,
+                rio_common::backoff::Jitter::Full => 0.0,
+            };
+            let now_budget = RESUME_LEDGER_CAP as f64;
+            let paced_beats = (FUTILE_RELIST_INTERVAL_PASSES as f64) - now_budget;
+            let covered = paced_beats * (1.0 * beat_floor);
             assert!(
-                (FUTILE_RELIST_INTERVAL_PASSES as u64) * MIN_BEAT_SECS
-                    >= SCHEDULER_LISTING_MEMBER_TTL_SECS,
-                "the withhold interval must outlast the scheduler's membership TTL"
+                covered
+                    >= (SCHEDULER_LISTING_MEMBER_TTL_SECS + SCHEDULER_LISTING_STEAL_HORIZON_SECS)
+                        as f64,
+                "the withhold interval, denominated in paced beats with the \
+                 Now budget subtracted, must outlast the scheduler's \
+                 membership TTL plus the steal-horizon margin (bug_137)"
             );
         }
         const {
@@ -5077,6 +5125,73 @@ mod tests {
                 "mirrored-constant sanity: horizon below TTL"
             );
         }
+    }
+
+    // r[verify store.materialize.honest-beat]
+    /// W11-BN (bug_137, R29): the Settled-storm schedule at its cap,
+    /// through the PRODUCTION latch and pace law — engage the latch,
+    /// then drive the withhold window with the adversarial schedule
+    /// (RESUME_LEDGER_CAP `Settled` seals pacing `Now`, the remainder
+    /// pacing `Beat`), summing each pass's WORST-CASE sleep from
+    /// `pace_for` + the `POLL_JITTER` floor. The cumulative paced
+    /// time at the probe re-list must cover the TTL + steal horizon.
+    /// Pre-fix red (64-pass interval): `the withhold elapsed in
+    /// 25.6s — inside the 60s membership TTL (early re-list; the
+    /// worker never left the listing)`.
+    #[test]
+    fn withhold_outlasts_ttl_under_the_settled_storm() {
+        let mut latch = ConversionFutilityLatch::default();
+        // Engage: FUTILE_PASS_THRESHOLD consecutive futile passes
+        // (listed, minted, every mint conversion-disproven).
+        for _ in 0..FUTILE_PASS_THRESHOLD {
+            latch.observe_outcome(
+                &PassOutcome::ListedNoAction {
+                    refused: 0,
+                    skipped: 0,
+                },
+                &PassConversion {
+                    listed: true,
+                    fresh_mints: 1,
+                    futile_rejections: 1,
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(latch.withholding(), "the latch engages at the threshold");
+
+        let beat_floor: f64 = match crate::materialize::POLL_JITTER {
+            rio_common::backoff::Jitter::Proportional(f) => 1.0 - f,
+            rio_common::backoff::Jitter::None => 1.0,
+            rio_common::backoff::Jitter::Full => 0.0,
+        };
+        let mut elapsed = 0.0f64;
+        let mut passes = 0u32;
+        while latch.withholding() {
+            passes += 1;
+            // The storm at its cap: the first RESUME_LEDGER_CAP
+            // passes seal Settled entries (each entry settles at most
+            // once — the zero-sleep budget is bounded by the ledger
+            // cap); the rest are idle beats.
+            let outcome = if passes <= RESUME_LEDGER_CAP as u32 {
+                PassOutcome::Settled { resolutions: 1 }
+            } else {
+                PassOutcome::Empty
+            };
+            elapsed += match crate::materialize::pace_for(&outcome) {
+                crate::materialize::Pace::Now => 0.0,
+                crate::materialize::Pace::Beat => 1.0 * beat_floor,
+                crate::materialize::Pace::Floor(d) => d.as_secs_f64(),
+            };
+            latch.observe_outcome(&outcome, &PassConversion::default());
+            assert!(passes <= 100_000, "runaway withhold");
+        }
+        let need =
+            (SCHEDULER_LISTING_MEMBER_TTL_SECS + SCHEDULER_LISTING_STEAL_HORIZON_SECS) as f64;
+        assert!(
+            elapsed >= need,
+            "the withhold elapsed in {elapsed}s — inside the {SCHEDULER_LISTING_MEMBER_TTL_SECS}s \
+             membership TTL (early re-list; the worker never left the listing)"
+        );
     }
 
     // -----------------------------------------------------------------
