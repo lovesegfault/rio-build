@@ -9930,6 +9930,10 @@
           "packageId": "futures-util"
         },
         {
+          "name": "hex",
+          "packageId": "hex"
+        },
+        {
           "name": "opentelemetry",
           "packageId": "opentelemetry"
         },

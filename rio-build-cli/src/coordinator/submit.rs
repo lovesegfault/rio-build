@@ -129,7 +129,10 @@ async fn submit_page(
 
 fn classify(status: tonic::Status) -> SubmitError {
     if status.code() == tonic::Code::FailedPrecondition {
-        let missing = parse_missing_digests(status.message());
+        // Shared contract with the scheduler's verify_resolved — the
+        // formatter and this parser live in rio_proto::submit_reject
+        // so a reword on either side cannot silently break recovery.
+        let missing = rio_proto::submit_reject::parse_missing_drv_digests(status.message());
         if !missing.is_empty() {
             return SubmitError::StaleAcks(missing);
         }
@@ -183,57 +186,30 @@ async fn recover_stale_acks(
     reupload_drvs(clients, acks, to_upload).await
 }
 
-/// Extract 32-byte digests from a reject message: every 64-char hex
-/// token. This parses the scheduler's documented reject shape
-/// (`digest_submit::verify_resolved` lists each missing digest in
-/// hex); scanning for hex tokens keeps the client tolerant of message
-/// rewording around the list.
-fn parse_missing_digests(message: &str) -> Vec<Digest32> {
-    let mut out = Vec::new();
-    let bytes = message.as_bytes();
-    let is_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
-    let mut i = 0;
-    while i < bytes.len() {
-        if !is_hex(bytes[i]) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && is_hex(bytes[i]) {
-            i += 1;
-        }
-        if i - start == 64
-            && let Ok(raw) = hex::decode(&message[start..i])
-            && let Ok(d) = Digest32::try_from(raw.as_slice())
-        {
-            out.push(d);
-        }
-    }
-    out.sort_unstable();
-    out.dedup();
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The recovery trigger end-to-end at the client boundary: a
+    /// FAILED_PRECONDITION built with the scheduler's shared formatter
+    /// classifies as StaleAcks with the exact digest set.
     #[test]
-    fn parses_digest_list_from_reject_message() {
-        let d1 = hex::encode([0xAB; 32]);
-        let d2 = hex::encode([0x01; 32]);
-        let msg = format!(
-            "unknown drv digests (not in this submission, not in the store): [{d1}, {d2}] — \
-             re-check presence (HasDrvs), upload the missing drv blobs (PutDrvBlobs), and resubmit"
+    fn classify_extracts_stale_acks_from_shared_format() {
+        let mut hexes = vec![hex::encode([0xAB; 32]), hex::encode([0x01; 32])];
+        hexes.sort();
+        let status = tonic::Status::failed_precondition(
+            rio_proto::submit_reject::missing_drv_digests_message(&hexes),
         );
-        let parsed = parse_missing_digests(&msg);
-        assert_eq!(parsed, vec![[0x01; 32], [0xAB; 32]]);
-    }
+        match classify(status) {
+            SubmitError::StaleAcks(missing) => {
+                assert_eq!(missing, vec![[0x01; 32], [0xAB; 32]]);
+            }
+            SubmitError::Other(e) => panic!("expected StaleAcks, got {e:#}"),
+        }
 
-    #[test]
-    fn ignores_short_hex_and_dedups() {
-        let d = hex::encode([0x42; 32]);
-        let msg = format!("deadbeef {d} cafe {d}");
-        assert_eq!(parse_missing_digests(&msg), vec![[0x42; 32]]);
+        // Any other FAILED_PRECONDITION (no digest list) is not a
+        // recovery trigger.
+        let status = tonic::Status::failed_precondition("quota exceeded");
+        assert!(matches!(classify(status), SubmitError::Other(_)));
     }
 }

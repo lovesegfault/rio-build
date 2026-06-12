@@ -213,12 +213,13 @@ pub(super) fn verify_resolved(
     }
     if !missing.is_empty() {
         missing.sort();
-        return Err(Status::failed_precondition(format!(
-            "unknown drv digests (not in this submission, not in the store): \
-             [{}] — re-check presence (HasDrvs), upload the missing drv blobs \
-             (PutDrvBlobs), and resubmit",
-            missing.join(", ")
-        )));
+        // The message format is a CONTRACT: the build client's
+        // stale-ack recovery parses the digest list back out of it
+        // (`r[bc.submit.stale-ack-once]`). Formatter and parser share
+        // rio_proto::submit_reject so they cannot drift.
+        return Err(Status::failed_precondition(
+            rio_proto::submit_reject::missing_drv_digests_message(&missing),
+        ));
     }
     Ok(external_edges)
 }

@@ -1117,6 +1117,11 @@
       "doc": "Bidirectional mapping between the nix-daemon wire `BuildStatus`"
     },
     {
+      "path": "submit_reject.rs",
+      "depth": 0,
+      "doc": "The `SubmitBuild` stale-digest reject contract (ADR-024)."
+    },
+    {
       "path": "validated.rs",
       "depth": 0,
       "doc": "Validated wrappers around generated proto types."
