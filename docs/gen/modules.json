@@ -1553,6 +1553,11 @@
       "doc": "Build-log storage."
     },
     {
+      "path": "logs/ack_census.rs",
+      "depth": 1,
+      "doc": "[GEN-SET] The durable-ack carrier census (merged_bug_005, R31)."
+    },
+    {
       "path": "logs/chunks.rs",
       "depth": 1,
       "doc": "Log-chunk storage: key scheme, line codec, and the storage backend trait."
