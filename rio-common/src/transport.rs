@@ -22,6 +22,14 @@
 //! completion) and a reserved report slice — reserving the report
 //! window at the type level is what guarantees the final best-effort
 //! report always has wire time before the kubelet's SIGKILL.
+//!
+//! Formal-coverage record (none-sensible for quint, relocated from the
+//! retired retry invariant map): [`bounded`] is a local two-arm race
+//! primitive whose model would restate tokio `select` semantics.
+//! Correctness is carried type-level (`#[must_use]` [`BoundedOutcome`]),
+//! by the `transport-unary-ban` policy check, and by the unit battery
+//! (biased shutdown, timeout, budget arithmetic, [`GraceBudget`]
+//! const-asserts).
 
 use std::future::Future;
 use std::time::Duration;

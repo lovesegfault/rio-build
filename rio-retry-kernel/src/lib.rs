@@ -56,8 +56,9 @@
 //! [`reference_fold`] is a pure function from an observed failure-event
 //! history to the ten `RetryState` counters and the budget verdict. It
 //! is the executable specification of what the seventeen `RetryState`
-//! mutation sites and nine cap-check entry points (E1–E9 in
-//! `docs/spec/models/retry-invariant-map.md`) collectively implement:
+//! mutation sites and nine cap-check entry points (E1–E9; the
+//! historical entry-point legend in the `docs/spec/models/retryPolicy.qnt`
+//! header) collectively implement:
 //! which event charges which counter, the 300 s sliding-window reset,
 //! the resource-floor `{promoted, at_cap}` exemption, the cache-hit and
 //! resubmit resets (as explicit history events), the per-executor
@@ -458,6 +459,13 @@ impl Default for Budget {
 }
 
 impl Budget {
+    // TODO: A7 (open policy question, relocated from the retired retry
+    // invariant map): only the transient class (E1) backs off — every
+    // other requeue class retries immediately. Uniform backoff vs
+    // uniform no-backoff is an unadjudicated policy choice; the
+    // 9,748-redispatch incident was the no-backoff hot-loop, and the
+    // documented mitigation is the cap, not a backoff. Adjudicate
+    // before widening any requeue class's traffic.
     /// The deterministic backoff curve for retry `attempt` (0-indexed):
     /// `min(base · multᵃ, cap)`, the no-jitter form of
     /// `RetryPolicy::backoff_duration`. E1 computes the backoff from the
@@ -697,6 +705,10 @@ impl<Id: Ord> Counters<Id> {
 /// poison reason is a free-form string (synthesized on some paths,
 /// carrying the worker's error message on others — divergence A8); the
 /// fold carries the discriminant only.
+// TODO: A8 (open policy question, relocated from the retired retry
+// invariant map): whether the poison-reason string should be unified
+// or structured is unadjudicated; the attempt row carries the worker's
+// message either way, so nothing is lost while the question is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoisonReason {
     /// `PoisonConfig::is_poisoned` — the distinct-worker / flat-count
@@ -1507,6 +1519,14 @@ fn decide_exclusion_covers_charged_attempts<Id: Ord>(
 // around a fold this size does not converge inside the merge-gate
 // budget. The two-call determinism property is the
 // `check_decide_deterministic` harness.
+// TODO: A10 (open policy question, relocated from the retired retry
+// invariant map): the per-counter fencepost conventions differ —
+// infra/timeout cap-check before increment (the cap fires on failure
+// N+1), transient checked-then-incremented on the retry arm (poison on
+// failure N+1), exempt-infra incremented before the check (poison ON
+// exempt attempt N). decide() reproduces each counter's own convention
+// exactly; unifying what `max_X_retries = N` means across counters is
+// the deferred unification candidate.
 #[cfg_attr(
     kani,
     kani::ensures(|d: &Decision<Id>| decide_verdict_partition_consistent(d, budget, now))

@@ -6,8 +6,8 @@
 // (rio-scheduler/src/retry_policy.rs) — over the durable attempt ledger
 // (`drv_attempts`, migration 068), evaluated and persisted inside the
 // site-owned appending transaction. The nine cap-check entry points
-// (E1-E9 in docs/spec/models/retry-invariant-map.md) are callers of that
-// one fold; the ten in-memory `RetryState` counters are a fold-derived
+// (E1-E9; the historical legend at the end of this header) are callers
+// of that one fold; the ten in-memory `RetryState` counters are a fold-derived
 // cached view, not independently mutated state; the per-counter PG
 // mirror columns, their writers, and the transitional mixed-era legacy
 // seed that read them are gone (migration 075 -- see WHAT IS NOT
@@ -16,7 +16,7 @@
 // The pre-collapse (as-built) encoding was frozen at
 // `retryPolicyAsBuilt.qnt` for the Stage-C calibration corpus and was
 // retired with it in Phase 2 (the acceptance table in
-// retry-invariant-map.md is the surviving record). The divergences that
+// retry-records.md is the surviving record). The divergences that
 // encoding reproduced are fixed here exactly as Phase 1b adjudicated
 // them:
 //
@@ -34,9 +34,10 @@
 // vals are unchanged, and the physical attempt-end events, the lost
 // controller report, the resets, the clock and the appending-tx fault
 // remain as the shared environment the pull regime composes. The
-// retirement record (per-pin carriers included) lives in
-// retry-invariant-map.md; the E1-E9 numbering below remains the
-// historical entry-point inventory of that map, and the prose that
+// retirement record (per-pin carriers included) lives in the
+// nix/quint.nix retry-section delegation comment; the E1-E9 numbering
+// below remains the historical entry-point inventory (legend at the
+// end of this header), and the prose that
 // describes the as-built channels is retained as the record of what
 // the divergences D1-D4/C2 were adjudicated against.
 //
@@ -161,8 +162,8 @@
 //     stay with floor.rs's unit tests.
 //   - The substitution-failure path, the cancel paths (admin cancel,
 //     per-build timeout, orphan-watcher), and build-level bookkeeping
-//     (keep_going, summaries, events): out of the fold's scope per the
-//     invariant map ("Out of scope" section); they consult no retry
+//     (keep_going, summaries, events): out of the fold's scope (a
+//     deliberate, recorded omission); they consult no retry
 //     counter and charge no budget.
 //   - Executor identity is a reusable pod SLOT, not a fresh pod name per
 //     attempt. A slot respawns (fresh registration, cleared
@@ -242,6 +243,56 @@
 // their definitions and in nix/quint.nix. Measured state counts, depths
 // and wall-clocks live in the introducing commits' messages and the CI
 // checks' transcripts, never in this file.
+//
+// E1-E9 ENTRY-POINT LEGEND (historical inventory, relocated from the
+// retired retry invariant map; the stream-era sites E5-E9 are retired
+// with the as-built-channel regime — the legend is the decoder for the
+// E-numbers used throughout this header and the calibration corpus):
+//   E1 handle_transient_failure (actor/completion.rs) — worker
+//      TransientFailure / Unspecified
+//   E2 handle_infrastructure_failure (actor/completion.rs) — worker
+//      InfrastructureFailure / unsolicited Cancelled
+//   E3 handle_permanent_failure (actor/completion.rs) — the 7
+//      permanent statuses
+//   E4 handle_timeout_failure (actor/completion.rs) — worker TimedOut
+//   E5 reassign_derivations (actor/executor.rs) — stream disconnect /
+//      heartbeat timeout / force-drain / backstop (retired)
+//   E6 handle_executor_termination (actor/executor.rs) — controller
+//      OomKilled / EvictedDiskPressure (retired channel)
+//   E7 handle_deadline_exceeded (actor/executor.rs) — controller
+//      DeadlineExceeded (retired channel)
+//   E8 tick_process_backstop_timeouts (actor/housekeeping.rs) —
+//      scheduler-side Running-too-long timer (retired)
+//   E9 dispatch fleet-exhaust backstop (actor/dispatch.rs) —
+//      find_executor None with every eligible worker failed
+// Adjacent deciders that produce the same terminal outcomes but are
+// not budget sites: the post-failover reconcile
+// (reset_orphan_to_ready / adopt_orphan_completion), the
+// substitution-failure revert, the two poison-clear paths, the
+// resubmit reset, and the cache-hit retry.clear() sites.
+//
+// MODEL-BASED TESTING: REASONED OMISSION (relocated from the retired
+// retry invariant map). The Phase-2 MBT (replaying model traces
+// against the real fold and in-memory list) was deliberately NOT
+// built: the fold-plus-list subject is already covered three ways
+// (the kani contracts prove the load-bearing decide()/classify()/
+// placeable() properties over ALL histories up to the harness bound;
+// the 31-test fold unit battery and the model's named runs pin the
+// same adjudicated histories on both sides; the protocol-level
+// content — fan-out, dedup, correlation, atomicity, failover — is
+// exactly what a fold-only MBT cannot exercise). The residual gap
+// (transcription drift between specApply and retry_policy.rs apply())
+// is bounded by the paired reproducers and review discipline, and the
+// post-collapse model carries folded counters rather than an
+// event-level ledger, so a replay harness would be more projection
+// code than checked property. Reconsideration triggers: (1) the
+// fold's event alphabet or input surface grows beyond what the unit
+// battery and contracts pin; (2) the in-memory list maintenance is
+// decoupled from the appending transaction; (3) a re-encode
+// introduces an event-level ledger that makes trace projection
+// trivial. The quint-connect machinery (#[quint_run], the ITF replay
+// pattern in rio-store/src/logs/mbt_tests.rs and
+// rio-lease/src/mbt_tests.rs) transfers directly if so.
 module retryPolicy {
   // --- 1. types ---------------------------------------------------------
 

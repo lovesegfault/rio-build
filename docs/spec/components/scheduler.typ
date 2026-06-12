@@ -568,9 +568,9 @@ scheduler-side backstop timer, and the dispatch-time fleet-exhaust check)
 each consult and mutate a subset of the per-derivation retry counters. The
 rules in this subsection state the properties the nine sites must
 collectively preserve; the executable specification of the counter
-arithmetic is the reference fold in `rio-scheduler/src/retry_policy.rs`,
-and the per-site ↔ per-rule cross-reference is
-`docs/spec/models/retry-invariant-map.md`.
+arithmetic is the reference fold in `rio-scheduler/src/retry_policy.rs`
+(kernel crate: `rio-retry-kernel`), and the model-checked statement of
+the budget laws is `docs/spec/models/retryPolicy.qnt`.
 
 #r("sched.retry.transient-budget+2")[
   A worker-reported `TransientFailure` (the build ran and exited non-zero;

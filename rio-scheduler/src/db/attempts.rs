@@ -163,8 +163,8 @@ impl AttemptRow {
     /// materialization suffix — the loaders and the GC sweep key their
     /// cuts on it. The materialization lane's production writer is
     /// `create_materialization_jobs_in_tx` (migration 085: one reset
-    /// per created job, same transaction) — see the
-    /// retry-invariant-map "mat-lane reset" entry.
+    /// per created job, same transaction) — see the `M_085` doc-const
+    /// in rio-migrations for the lane rationale.
     pub(crate) fn new_reset(
         derivation_id: Uuid,
         outcome_class: OutcomeClass,
