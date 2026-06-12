@@ -382,6 +382,35 @@ fn seed_price(cap: CapacityType) -> f64 {
     }
 }
 
+/// One captured (but not yet settled) sequence-horizon generation for
+/// the λ consumption cursor (merged_bug_063 — the TWO-PHASE SEQUENCE
+/// HORIZON; R29: the cursor is denominated in COMMIT order, and every
+/// quantity here is one PostgreSQL actually produces).
+///
+/// Capture order is LOAD-BEARING and derived: `l` =
+/// `pg_sequence_last_value(interrupt_samples_id_seq)` is read FIRST,
+/// THEN the current snapshot's in-progress xid list. After the `l`
+/// read, any NEW transaction's `nextval` exceeds `l` (premise: the
+/// sequence is CACHE 1 — asserted every refresh via `pg_sequences`),
+/// so every allocator of an id `<= l` either ended before the
+/// snapshot read or is in `xips`. The reverse order leaks
+/// transactions starting between the two captures. A generation
+/// SETTLES once every xid in its co-captured list has ended; the
+/// settled `l` becomes the consumption horizon (`id > cursor AND id
+/// <= settled_l`). BIGSERIAL id order is ALLOCATION order, not commit
+/// order — the same inversion as `at`, one denomination over — which
+/// is exactly why promotion waits for the co-captured in-progress
+/// set to drain instead of trusting any single-read proxy.
+#[derive(Debug, Clone)]
+struct SeqGeneration {
+    /// `pg_sequence_last_value` at capture (0 if the sequence has
+    /// never been called).
+    l: i64,
+    /// The snapshot's in-progress xid list co-captured AFTER `l`
+    /// (xid8 cast to bigint — same lineage at promotion checks).
+    xips: Vec<i64>,
+}
+
 /// Per-[`Cell`] `$/vCPU·hr` + per-h λ + per-cell instance-type menu.
 /// Cheap to clone (small maps); the solve takes a snapshot by value.
 #[derive(Debug, Clone, Default)]
@@ -428,6 +457,28 @@ pub struct CostTable {
     /// site rather than relying on the absence of
     /// [`spot_price_poller`] (bug_034).
     source: HwCostSource,
+    /// The SETTLED λ consumption horizon (merged_bug_063): every
+    /// `interrupt_samples.id <= lambda_cursor` is consumed-or-skipped
+    /// FOREVER; `refresh_lambda` consumes `(lambda_cursor,
+    /// settled_l]`. Persisted as the `lambda_cursor` row of
+    /// `sla_ema_state` ATOMICALLY with the λ/node_count EMAs (one
+    /// transaction in `persist_rows` — the (EMA, cursor) pair must
+    /// never split, or a crash window would re-fold or skip rows),
+    /// value-monotone qual'd. Loaded by [`Self::load`]; a fresh
+    /// deployment starts at 0 (Q6 --wipe posture: no skew bridge —
+    /// a non-empty table under a missing cursor row replays at most
+    /// the 7-day retention window into the self-decaying EMA, named
+    /// and accepted under the signed wipe rollout).
+    lambda_cursor: i64,
+    /// Captured-but-unsettled sequence-horizon generations
+    /// ([`SeqGeneration`]), oldest first. In-memory scratch: a
+    /// restart or lease-edge reload simply re-captures (one
+    /// generation of consumption lag — the generation-age guard's
+    /// own cadence). Promotion is PREFIX-ORDERED: a generation
+    /// settles only behind every older one, so a stuck transaction
+    /// freezes the cursor (loud, fail-safe) rather than letting a
+    /// younger horizon consume past the stuck writer's pending ids.
+    lambda_pending: Vec<SeqGeneration>,
     /// §13c-2: per-hwClass `(max_cores, max_mem)` derived once at boot
     /// from `describe_instance_types` ∩ `requirements`. NOT persisted
     /// — process-lifetime, re-derived each restart so a `requirements`
@@ -739,6 +790,15 @@ impl CostTable {
         .fetch_all(db.pool())
         .await?;
         for (key, value, num, den, at) in rows {
+            // The λ consumption cursor (merged_bug_063): the datum is
+            // the VALUE (a BIGSERIAL id, exact in f64 to 2^53);
+            // `updated_at` is informational here, so this arm runs
+            // before the epoch decode — a poisoned stamp must not
+            // refuse the cursor into a full-history re-fold.
+            if key == "lambda_cursor" {
+                t.lambda_cursor = value as i64;
+                continue;
+            }
             // r[impl sched.sla.epoch-domain]
             // THE decode boundary for the epoch family: a non-finite
             // epoch (`'infinity'::timestamptz`, NaN) is a typed,
@@ -874,6 +934,13 @@ impl CostTable {
                 .await?;
             }
         }
+        // The λ EMAs and the consumption cursor are ONE atomic unit
+        // (merged_bug_063): a split persist (EMAs landed, cursor not —
+        // or vice versa) would re-fold or permanently skip the rows in
+        // between on the next reload. One transaction; the cursor row
+        // is value-monotone qual'd (its own datum is the fence — a
+        // deposed writer's stale cursor can never rewind consumption).
+        let mut txn = db.pool().begin().await?;
         for (h, ema) in &self.lambda {
             sqlx::query(
                 "INSERT INTO sla_ema_state (cluster, key, value, numerator, denominator, updated_at) \
@@ -888,9 +955,23 @@ impl CostTable {
             .bind(ema.numerator)
             .bind(ema.denominator)
             .bind(ema.updated_at.as_secs_f64())
-            .execute(db.pool())
+            .execute(&mut *txn)
             .await?;
         }
+        sqlx::query(
+            "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
+             VALUES ($1, 'lambda_cursor', $2, to_timestamp($3)) \
+             ON CONFLICT (cluster, key) DO UPDATE SET value = $2, updated_at = to_timestamp($3) \
+             WHERE sla_ema_state.value <= $2",
+        )
+        .bind(&self.cluster)
+        .bind(self.lambda_cursor as f64)
+        .bind(now_epoch())
+        .execute(&mut *txn)
+        .await?;
+        // node_count rides the same transaction: it is folded from
+        // the same consumed window as λ, so a split persist would
+        // double-fold it on replay.
         for (h, nc) in &self.node_count {
             sqlx::query(
                 "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
@@ -902,9 +983,10 @@ impl CostTable {
             .bind(format!("node_count:{h}"))
             .bind(nc.value)
             .bind(nc.updated_at.as_secs_f64())
-            .execute(db.pool())
+            .execute(&mut *txn)
             .await?;
         }
+        txn.commit().await?;
         // Unconditional w.r.t. `self.source`: instance types are
         // observed regardless of Spot/Static. `last_observed` is
         // data-time (`InstanceType.last_observed`), NOT `now()` — see
@@ -957,88 +1039,223 @@ impl CostTable {
     /// node label). λ is a solve input; the next poll's
     /// [`super::solve::SolveInputs::inputs_gen`] reflects the change.
     pub async fn refresh_lambda(&mut self, db: &SchedulerDb) -> anyhow::Result<()> {
-        let prev_hwm = self
-            .lambda
-            .values()
-            .map(|e| e.updated_at)
-            .fold(Epoch::UNSET, Epoch::max);
-        let rows: Vec<(String, String, f64, f64)> = sqlx::query_as(
-            "SELECT hw_class, kind, COALESCE(SUM(value), 0), \
-                    EXTRACT(EPOCH FROM MAX(at))::float8 \
-             FROM interrupt_samples WHERE cluster = $1 AND at > to_timestamp($2) \
-             GROUP BY hw_class, kind",
+        // ── Premise pin (R29 conversion pin i): the id sequence is
+        // CACHE 1. A cached block would let a session mint an id <= a
+        // captured horizon with no in-progress marker at capture
+        // time, unsoundly settling the horizon over its pending row.
+        // On violation: typed, counted refusal; the cursor FREEZES
+        // (fail-safe: no consumption progress, loud) — never
+        // mis-consumes. This is also a named trigger for the
+        // pre-authorized overlap-window fallback (the book's CE-5
+        // record) if it ever proves unfixable operationally.
+        let cache: Option<i64> = sqlx::query_scalar(
+            "SELECT cache_size::bigint FROM pg_sequences \
+             WHERE schemaname = current_schema() \
+               AND sequencename = 'interrupt_samples_id_seq'",
         )
-        .bind(&self.cluster)
-        .bind(prev_hwm.as_secs_f64())
-        .fetch_all(db.pool())
+        .fetch_optional(db.pool())
         .await?;
-        // HWM from the rows' MAX(at), NOT wall-clock now(): a row whose
-        // PG-stamped `at` is behind the scheduler clock (skew, or commit
-        // lagged the SELECT) would otherwise be permanently skipped on
-        // the next tick. Same pattern as `SlaEstimator::refresh`.
-        // The fold runs in the typed epoch domain
-        // (sched.sla.epoch-domain): pre-fix, ONE `'infinity'` sample
-        // stamp folded the global HWM to `+inf` and `at > 'infinity'`
-        // matched nothing — EVERY class's refresh froze, and the
-        // wave-10 monotone qual made the wedge permanent.
-        let mut hwm = prev_hwm;
-        let mut per_h: HashMap<HwClassName, (f64, f64)> = HashMap::new();
-        for (hw_class, kind, sum, max_at) in rows {
-            // r[impl sched.sla.epoch-domain]
-            // Decode boundary: a non-finite MAX(at) refuses the GROUP
-            // row (typed, counted) — its sums are not folded and it
-            // cannot wedge the HWM; sibling classes proceed.
-            let Some(max_at) = Epoch::from_pg_epoch(max_at) else {
+        if cache != Some(1) {
+            tracing::warn!(
+                cache = ?cache,
+                "interrupt_samples_id_seq premise violated (cache != 1 or \
+                 sequence unreadable); lambda cursor frozen this refresh"
+            );
+            ::metrics::counter!(
+                "rio_scheduler_sla_evidence_refused_total",
+                "plane" => "lambda_cursor",
+                "reason" => "sequence_premise"
+            )
+            .increment(1);
+            return Ok(());
+        }
+        // ── Promotion pass (runs BEFORE this refresh's capture, so a
+        // promoted horizon is always at least ONE FULL REFRESH
+        // GENERATION old — R29 conversion pin ii, bounding the
+        // sub-statement nextval-before-xid window; see the residual
+        // note at the end of this fn). A generation settles when
+        // every co-captured in-progress xid has ended in the CURRENT
+        // snapshot (x ∉ xip' ∧ x < xmax'); promotion is
+        // prefix-ordered (field doc on `lambda_pending`).
+        let mut settled = self.lambda_cursor;
+        if !self.lambda_pending.is_empty() {
+            let (xmax, xips): (i64, Vec<i64>) = sqlx::query_as(
+                "SELECT pg_snapshot_xmax(s)::text::bigint, \
+                        COALESCE((SELECT array_agg(x::text::bigint) \
+                                  FROM pg_snapshot_xip(s) AS x), '{}') \
+                 FROM (SELECT pg_current_snapshot() AS s) t",
+            )
+            .fetch_one(db.pool())
+            .await?;
+            let ended = |x: &i64| *x < xmax && !xips.contains(x);
+            while let Some(g) = self.lambda_pending.first() {
+                if g.xips.iter().all(ended) {
+                    settled = settled.max(g.l);
+                    self.lambda_pending.remove(0);
+                } else {
+                    break;
+                }
+            }
+            if self.lambda_pending.len() > 8 {
                 tracing::warn!(
-                    hw_class = %hw_class,
-                    kind = %kind,
-                    "non-finite interrupt-sample stamp; group row refused at decode"
+                    pending = self.lambda_pending.len(),
+                    blockers = ?self.lambda_pending.first().map(|g| &g.xips),
+                    "lambda cursor promotion stalled behind long-lived \
+                     transaction(s); horizon frozen until they end"
                 );
-                ::metrics::counter!(
-                    "rio_scheduler_sla_evidence_refused_total",
-                    "plane" => "interrupt_group",
-                    "reason" => "nonfinite_epoch"
-                )
-                .increment(1);
-                continue;
-            };
-            hwm = hwm.max(max_at);
-            let e = per_h.entry(hw_class).or_default();
-            match kind.as_str() {
-                "interrupt" => e.0 += sum,
-                "exposure" => e.1 += sum,
-                _ => {}
             }
         }
-        // Per-h node_count = Σ exposure_secs / Δt over the batch window
-        // (each `kind='exposure'` row is "node-seconds accrued since
-        // last flush", so the sum ÷ wall-window is mean live nodes).
-        // Skip when `prev_hwm` is unset — first refresh has no window
-        // baseline, and a `Δt` from epoch would zero the count.
-        let dt = hwm.secs_since(prev_hwm);
-        for (h, (n, d)) in per_h {
-            self.lambda
-                .entry(h.clone())
-                .or_default()
-                .update(n, d, hwm, LAMBDA_HALFLIFE_SECS);
-            if prev_hwm.as_secs_f64() > 0.0 && dt > 0.0 {
-                self.node_count
-                    .entry(h)
-                    .or_default()
-                    .update(d / dt, hwm, LAMBDA_HALFLIFE_SECS);
+        // ── Consume `(cursor, settled]` in COMMIT order (every row
+        // with an id in the window is committed-and-visible: its
+        // allocator either ended before the generation's snapshot or
+        // was waited out by promotion). `MAX(at)` survives ONLY as
+        // the EMA decay / node-count window stamp (value-time) — it
+        // is no longer the consumption cursor, so visibility order vs
+        // value order can no longer exclude a late-committing row
+        // (merged_bug_063; the old `at > hwm` qual read MAX(at) of
+        // VISIBLE rows and permanently skipped an in-flight sibling
+        // with an equal-or-lower stamp).
+        if settled > self.lambda_cursor {
+            let prev_stamp = self
+                .lambda
+                .values()
+                .map(|e| e.updated_at)
+                .fold(Epoch::UNSET, Epoch::max);
+            let rows: Vec<(String, String, f64, f64)> = sqlx::query_as(
+                "SELECT hw_class, kind, COALESCE(SUM(value), 0), \
+                        EXTRACT(EPOCH FROM MAX(at))::float8 \
+                 FROM interrupt_samples \
+                 WHERE cluster = $1 AND id > $2 AND id <= $3 \
+                 GROUP BY hw_class, kind",
+            )
+            .bind(&self.cluster)
+            .bind(self.lambda_cursor)
+            .bind(settled)
+            .fetch_all(db.pool())
+            .await?;
+            // The folds run in the typed epoch domain
+            // (sched.sla.epoch-domain): pre-fix, ONE `'infinity'`
+            // sample stamp folded the global stamp to `+inf` and
+            // wedged every refresh permanently.
+            let mut batch_stamp = prev_stamp;
+            let mut per_h: HashMap<HwClassName, (f64, f64)> = HashMap::new();
+            for (hw_class, kind, sum, max_at) in rows {
+                // r[impl sched.sla.epoch-domain]
+                // Decode boundary: a non-finite MAX(at) refuses the
+                // GROUP row (typed, counted) — its sums are not
+                // folded and it cannot poison the decay stamp;
+                // sibling classes proceed.
+                let Some(max_at) = Epoch::from_pg_epoch(max_at) else {
+                    tracing::warn!(
+                        hw_class = %hw_class,
+                        kind = %kind,
+                        "non-finite interrupt-sample stamp; group row refused at decode"
+                    );
+                    ::metrics::counter!(
+                        "rio_scheduler_sla_evidence_refused_total",
+                        "plane" => "interrupt_group",
+                        "reason" => "nonfinite_epoch"
+                    )
+                    .increment(1);
+                    continue;
+                };
+                batch_stamp = batch_stamp.max(max_at);
+                let e = per_h.entry(hw_class).or_default();
+                match kind.as_str() {
+                    "interrupt" => e.0 += sum,
+                    "exposure" => e.1 += sum,
+                    _ => {}
+                }
             }
+            // Per-h node_count = Σ exposure_secs / Δt over the batch's
+            // VALUE-TIME window (each `kind='exposure'` row is
+            // "node-seconds accrued since last flush", so the sum ÷
+            // window is mean live nodes). Skip when `prev_stamp` is
+            // unset (first batch has no window baseline) or the batch
+            // carries no value-time advance (late-committing rows at
+            // or below the previous stamp — their exposure still
+            // joins the λ EMA above).
+            let dt = batch_stamp.secs_since(prev_stamp);
+            for (h, (n, d)) in per_h {
+                self.lambda.entry(h.clone()).or_default().update(
+                    n,
+                    d,
+                    batch_stamp,
+                    LAMBDA_HALFLIFE_SECS,
+                );
+                if prev_stamp.as_secs_f64() > 0.0 && dt > 0.0 {
+                    self.node_count.entry(h).or_default().update(
+                        d / dt,
+                        batch_stamp,
+                        LAMBDA_HALFLIFE_SECS,
+                    );
+                }
+            }
+            self.lambda_cursor = settled;
         }
+        // ── Capture the NEXT generation: L FIRST, THEN the snapshot's
+        // in-progress xid list (the load-bearing order — see
+        // [`SeqGeneration`]; both statements on the same connection,
+        // sequentially awaited). NULL last_value (sequence never
+        // called) is horizon 0 — nothing to consume. Skip the push
+        // when the horizon has not advanced past the cursor and every
+        // pending capture (a no-op generation would only lengthen the
+        // promotion queue).
+        let l: Option<i64> = sqlx::query_scalar(
+            "SELECT pg_sequence_last_value('interrupt_samples_id_seq'::regclass)",
+        )
+        .fetch_one(db.pool())
+        .await?;
+        let l = l.unwrap_or(0);
+        let frontier = self
+            .lambda_pending
+            .last()
+            .map_or(self.lambda_cursor, |g| g.l.max(self.lambda_cursor));
+        if l > frontier {
+            let (_, xips): (i64, Vec<i64>) = sqlx::query_as(
+                "SELECT pg_snapshot_xmax(s)::text::bigint, \
+                        COALESCE((SELECT array_agg(x::text::bigint) \
+                                  FROM pg_snapshot_xip(s) AS x), '{}') \
+                 FROM (SELECT pg_current_snapshot() AS s) t",
+            )
+            .fetch_one(db.pool())
+            .await?;
+            self.lambda_pending.push(SeqGeneration { l, xips });
+        }
+        // Priced residual (R19 form, the book's WO-S6-3 record): the
+        // sub-statement nextval-before-xid window. A writer whose xid
+        // assignment lands AFTER our snapshot read, with an id <= L,
+        // is invisible to the captured list. The generation-age guard
+        // (capture-then-promote-next-refresh) bounds it: the leak
+        // needs BOTH the micro-window coincidence AND that writer's
+        // transaction outliving a full refresh generation. The sole
+        // production writer is a statement-scoped autocommit INSERT
+        // (admin append_interrupt_sample), so the second conjunct is
+        // structurally false today. NAMED TRIGGER: any future
+        // interrupt_samples writer adopting a multi-statement
+        // transaction re-opens this residual — consequence bounded to
+        // the same self-decaying statistical under-bias this commit
+        // closes, now requiring the conjunction above.
         Ok(())
     }
 
-    /// Move `lambda` + `node_count` from `from` into `self`, leaving
-    /// `price`/`cells`/`stale_clamp` untouched. Used by
+    /// Move `lambda` + `node_count` + the consumption-cursor state
+    /// (`lambda_cursor`, `lambda_pending`) from `from` into `self`,
+    /// leaving `price`/`cells`/`stale_clamp` untouched. Used by
     /// [`interrupt_housekeeping`]'s write-back so a concurrent
     /// [`spot_price_poller`] price update isn't clobbered by a full
-    /// snapshot swap.
+    /// snapshot swap. The cursor state MUST ride with the EMAs it
+    /// fenced (merged_bug_063): absorbing folds without their cursor
+    /// would re-consume the window next tick. (The lease-edge reload
+    /// path is different by design: `carry_catalog` takes the cursor
+    /// AND the EMAs wholesale from the fresh PG load — the
+    /// transactionally-persisted pair — and drops in-memory pending
+    /// captures, costing one generation of consumption lag.)
     pub(crate) fn absorb_lambda(&mut self, from: Self) {
         self.lambda = from.lambda;
         self.node_count = from.node_count;
+        self.lambda_cursor = from.lambda_cursor;
+        self.lambda_pending = from.lambda_pending;
     }
 
     /// Fold one round of spot-price observations into the price EMA.
@@ -2731,8 +2948,10 @@ mod tests {
         );
         // (b) The watermark face: the healthy sibling's fresh samples
         // must be consumed — a poisoned stamp must not wedge the
-        // global HWM.
+        // refresh plane. (Two refreshes: capture + consume — the
+        // sequence horizon's one-generation lag.)
         let before = t.lambda.get("h1").map(|e| e.numerator).unwrap_or(0.0);
+        t.refresh_lambda(&sdb).await.unwrap();
         t.refresh_lambda(&sdb).await.unwrap();
         let after = t.lambda.get("h1").map(|e| e.numerator).unwrap_or(0.0);
         assert!(
@@ -3138,6 +3357,7 @@ mod tests {
         // And sees its own interrupt rows.
         let mut a3 = CostTable::seeded("us-east-1", HwCostSource::Spot);
         a3.refresh_lambda(&sdb).await.unwrap();
+        a3.refresh_lambda(&sdb).await.unwrap();
         assert!(a3.lambda.contains_key("intel-8"));
 
         // B persists then A reloads: A's price unchanged (PK is
@@ -3423,8 +3643,11 @@ mod tests {
         .await
         .unwrap();
         let mut t = CostTable::seeded("c", HwCostSource::Static);
+        // Each stage takes capture + consume (the sequence horizon's
+        // one-generation lag).
         t.refresh_lambda(&sdb).await.unwrap();
-        assert!(t.node_count.is_empty(), "first refresh: no baseline");
+        t.refresh_lambda(&sdb).await.unwrap();
+        assert!(t.node_count.is_empty(), "first batch: no baseline");
 
         sqlx::query(
             "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) VALUES \
@@ -3433,6 +3656,7 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
         t.refresh_lambda(&sdb).await.unwrap();
         let nc = t.node_count.get("aws-8-nvme-hi").unwrap().value;
         assert!(
@@ -3770,18 +3994,21 @@ mod tests {
         let _ = task.await;
     }
 
-    /// `refresh_lambda` advances `updated_at` to the rows' `MAX(at)`,
-    /// not the scheduler's wall-clock. Regression: the SQL always
-    /// computed `MAX(at)` but the destructure discarded it and used
-    /// `now_epoch()` — a row whose PG-stamped `at` was behind the
-    /// scheduler clock (skew / commit-lag) was permanently skipped on
-    /// the next tick.
+    /// The EMA decay stamp is the consumed batch's `MAX(at)`
+    /// (value-time), not the scheduler's wall-clock — and since
+    /// merged_bug_063 it is ONLY the decay/window stamp: consumption
+    /// is the two-phase sequence horizon, so a row whose `at` is
+    /// behind the current stamp (commit-lag, skew) is still CONSUMED
+    /// (id-ordered) while the stamp never rewinds. Pre-063 history:
+    /// the SQL computed `MAX(at)` but the destructure discarded it
+    /// and used `now_epoch()`; then the `at > hwm` qual silently and
+    /// permanently skipped late-committing rows — both retired.
     #[tokio::test]
-    async fn refresh_lambda_hwm_from_rows_not_wallclock() {
+    async fn refresh_lambda_value_stamp_from_rows_not_wallclock() {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
         let sdb = SchedulerDb::new(db.pool.clone());
-        // Row stamped well in the past — wall-clock now() is ~56 years
-        // ahead of this.
+        // Rows stamped well in the past — wall-clock now() is ~56
+        // years ahead of this.
         sqlx::query(
             "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
              VALUES ('c', 'aws-8-nvme-hi', 'interrupt', 1, to_timestamp(1000)), \
@@ -3791,12 +4018,15 @@ mod tests {
         .await
         .unwrap();
         let mut t = CostTable::seeded("c", HwCostSource::Static);
+        // Capture refresh + consume refresh (the one-generation lag
+        // IS the horizon's generation-age guard).
         t.refresh_lambda(&sdb).await.unwrap();
-        let hwm = t.lambda["aws-8-nvme-hi"].updated_at.as_secs_f64();
-        assert_eq!(hwm, 1500.0, "HWM must be MAX(at), got {hwm}");
-        // Second tick with a row at at=1200 (between prev rows): the
-        // `at > to_timestamp(1500)` filter excludes it, AND hwm stays
-        // 1500 — does not jump to wall-clock.
+        t.refresh_lambda(&sdb).await.unwrap();
+        let stamp = t.lambda["aws-8-nvme-hi"].updated_at.as_secs_f64();
+        assert_eq!(stamp, 1500.0, "decay stamp must be MAX(at), got {stamp}");
+        // A later-committed row with an EARLIER stamp (at=1200): the
+        // sequence horizon CONSUMES it (its exposure joins the EMA)
+        // while the value-time stamp does NOT rewind below 1500.
         sqlx::query(
             "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
              VALUES ('c', 'aws-8-nvme-hi', 'exposure', 50, to_timestamp(1200))",
@@ -3804,8 +4034,247 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
+        let den_before = t.lambda["aws-8-nvme-hi"].denominator;
         t.refresh_lambda(&sdb).await.unwrap();
-        assert_eq!(t.lambda["aws-8-nvme-hi"].updated_at.as_secs_f64(), 1500.0);
+        t.refresh_lambda(&sdb).await.unwrap();
+        assert_eq!(
+            t.lambda["aws-8-nvme-hi"].updated_at.as_secs_f64(),
+            1500.0,
+            "value-time stamp never rewinds and never jumps to wall-clock"
+        );
+        assert!(
+            t.lambda["aws-8-nvme-hi"].denominator > den_before,
+            "the late-committed low-stamp row is consumed, not skipped \
+             (the merged_bug_063 class)"
+        );
+    }
+
+    /// **W11-AY (merged_bug_063, red-first)** — *the consumption
+    /// cursor is denominated in COMMIT order (R29), at the MVCC
+    /// interleaving's own window.* Schedule A (inverted stamp/commit,
+    /// txn-fixture-pinned): writer-1 opens a txn and inserts a row
+    /// with a LOWER `at` (txn-start semantics), writer-2 inserts a
+    /// HIGHER-`at` row that COMMITS FIRST. Pre-fix, the `at > hwm`
+    /// qual with HWM = MAX(at)-of-visible-rows folded writer-2's row
+    /// and pinned the cursor at its stamp; when writer-1 finally
+    /// committed, its `at` was at/below the HWM — permanently
+    /// excluded, a silent under-bias the persisted non-idempotent
+    /// RatioEma and the 7-day sweep made unrecoverable. Post-fix, the
+    /// two-phase sequence horizon refuses to promote past writer-1's
+    /// in-progress txn and consumes BOTH rows exactly once on the
+    /// refresh after it ends. The trailing extra refresh pins
+    /// exactly-once (the cursor advanced; nothing re-folds).
+    #[tokio::test]
+    async fn w11_ay_interleaved_commit_rows_are_consumed_exactly_once() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        // Writer-1: txn open, LOWER stamp (at=100), commits LAST.
+        let mut w1 = db.pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
+             VALUES ('a', 'h', 'interrupt', 1.0, to_timestamp(100))",
+        )
+        .execute(&mut *w1)
+        .await
+        .unwrap();
+        // Writer-2: autocommit, HIGHER stamp (at=200), commits FIRST.
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
+             VALUES ('a', 'h', 'interrupt', 2.0, to_timestamp(200))",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let mut t = CostTable::seeded("a", HwCostSource::Static);
+        // Two refreshes while writer-1 is still in flight (the second
+        // demonstrates the generation-age guard: a captured horizon
+        // is never promoted in its own refresh, and never past an
+        // in-progress co-captured txn).
+        t.refresh_lambda(&sdb).await.unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
+        // Writer-1 commits — the in-flight row becomes visible.
+        w1.commit().await.unwrap();
+        // Next refresh(es): the horizon settles and BOTH rows fold.
+        t.refresh_lambda(&sdb).await.unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
+        let num = t.lambda.get("h").map(|e| e.numerator).unwrap_or(0.0);
+        assert!(
+            (num - 3.0).abs() < 1e-9,
+            "the fold must see BOTH writers' rows exactly once \
+             (in-flight row consumed on the refresh after its commit, \
+             never permanently skipped): numerator = {num}, want 3.0"
+        );
+        // Exactly-once: one more refresh folds nothing new.
+        t.refresh_lambda(&sdb).await.unwrap();
+        let again = t.lambda.get("h").map(|e| e.numerator).unwrap_or(0.0);
+        assert!(
+            (again - num).abs() < 1e-9,
+            "no re-consumption after the cursor advanced: {again} vs {num}"
+        );
+    }
+
+    /// **W11-AY, the xid/id-INVERSION cell (merged_bug_063 / CE-5)** —
+    /// an OLDER-xid writer holds the NEWER id still in flight while a
+    /// YOUNGER-xid writer committed first with the LOWER id. This is
+    /// the schedule that makes an xmin-style proxy ("ids below the
+    /// oldest in-flight txn's reservation are settled") misbuild
+    /// battery-visibly: BIGSERIAL id order is ALLOCATION order, and no
+    /// readable interface maps an in-flight xid to its sequence
+    /// reservations — Schedule A alone is green under such a proxy.
+    /// The two-phase horizon instead waits out the CO-CAPTURED
+    /// in-progress set: while the old-xid writer is open, NOTHING at
+    /// or below the captured horizon is consumed (an id allocated by a
+    /// still-open txn is never at-or-below the PROMOTED horizon); once
+    /// it ends, both rows fold exactly once.
+    #[tokio::test]
+    async fn w11_ay_xid_id_inversion_blocks_promotion_until_txn_ends() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        // Old-xid writer: open the txn and FORCE xid assignment now
+        // (before the young writer's), but insert (allocating the
+        // higher id) only after the young writer committed.
+        let mut old_xid = db.pool.begin().await.unwrap();
+        let _: i64 = sqlx::query_scalar("SELECT pg_current_xact_id()::text::bigint")
+            .fetch_one(&mut *old_xid)
+            .await
+            .unwrap();
+        // Young-xid writer: autocommit, takes the LOWER id, commits
+        // first.
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
+             VALUES ('b', 'h', 'interrupt', 4.0, to_timestamp(300))",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        // Old-xid writer now allocates the HIGHER id, stays open.
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
+             VALUES ('b', 'h', 'interrupt', 8.0, to_timestamp(400))",
+        )
+        .execute(&mut *old_xid)
+        .await
+        .unwrap();
+
+        let mut t = CostTable::seeded("b", HwCostSource::Static);
+        // Capture + attempted promotion while the old-xid writer is
+        // open: the co-captured list blocks — nothing consumed, the
+        // settled horizon never reaches the open writer's id.
+        t.refresh_lambda(&sdb).await.unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
+        assert!(
+            !t.lambda.contains_key("h"),
+            "nothing may fold while the captured horizon's co-captured \
+             txn is still in progress"
+        );
+        assert_eq!(
+            t.lambda_cursor, 0,
+            "an id allocated by a still-open txn is never at-or-below \
+             the promoted horizon"
+        );
+        old_xid.commit().await.unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
+        let num = t.lambda.get("h").map(|e| e.numerator).unwrap_or(0.0);
+        assert!(
+            (num - 12.0).abs() < 1e-9,
+            "both rows fold exactly once after the blocker ends: {num}"
+        );
+    }
+
+    /// **The R29 conversion-premise pin (merged_bug_063)** — the
+    /// CACHE-1 premise is ASSERTED per refresh, and its violation is
+    /// a typed, counted refusal that FREEZES the cursor (fail-safe:
+    /// no consumption progress, loud) instead of mis-consuming past a
+    /// cached block's unmarked reservations. This test can go red the
+    /// day the conversion premise breaks (the R29 form) — and proves
+    /// recovery once the premise is restored.
+    #[tokio::test]
+    async fn lambda_cursor_freezes_on_sequence_cache_premise_violation() {
+        use metrics_util::debugging::DebugValue;
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
+             VALUES ('p', 'h', 'interrupt', 1.0, to_timestamp(100))",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        // Break the premise.
+        sqlx::query("ALTER SEQUENCE interrupt_samples_id_seq CACHE 5")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let mut t = CostTable::seeded("p", HwCostSource::Static);
+        t.refresh_lambda(&sdb).await.unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
+        assert!(
+            !t.lambda.contains_key("h") && t.lambda_cursor == 0 && t.lambda_pending.is_empty(),
+            "premise violation must freeze the cursor: no capture, no \
+             consumption, no promotion"
+        );
+        let refused: u64 = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, _, _, _)| k.key().name() == "rio_scheduler_sla_evidence_refused_total")
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(refused, 2, "each frozen refresh is a counted letter");
+        // Restore the premise — the plane recovers without surgery.
+        sqlx::query("ALTER SEQUENCE interrupt_samples_id_seq CACHE 1")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
+        assert!(
+            (t.lambda.get("h").map(|e| e.numerator).unwrap_or(0.0) - 1.0).abs() < 1e-9,
+            "consumption resumes once the premise is restored"
+        );
+    }
+
+    /// The settled horizon and the EMAs persist as ONE transaction and
+    /// reload as the consistent pair: a fresh table resumes at the
+    /// persisted cursor (no re-consumption of already-folded rows).
+    #[tokio::test]
+    async fn lambda_cursor_round_trips_with_emas() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
+             VALUES ('r', 'h', 'interrupt', 5.0, to_timestamp(100))",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let mut t = CostTable::seeded("r", HwCostSource::Static);
+        t.refresh_lambda(&sdb).await.unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
+        assert!(t.lambda_cursor > 0, "consumed: cursor advanced");
+        t.persist_rows(&sdb).await.unwrap();
+
+        let mut fresh = CostTable::load(&sdb, "r", HwCostSource::Static)
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.lambda_cursor, t.lambda_cursor,
+            "the cursor reloads with the EMAs it fenced"
+        );
+        let before = fresh.lambda["h"].numerator;
+        fresh.refresh_lambda(&sdb).await.unwrap();
+        fresh.refresh_lambda(&sdb).await.unwrap();
+        assert!(
+            (fresh.lambda["h"].numerator - before).abs() < 1e-9,
+            "no re-consumption across the persist/load boundary"
+        );
     }
 
     /// `interrupt_samples` is bounded: rows >7d are swept (the 24h-

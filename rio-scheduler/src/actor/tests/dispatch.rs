@@ -2199,10 +2199,14 @@ async fn inputs_gen_stable_across_noop_refresh() -> TestResult {
         .execute(&db.pool)
     };
     seed_tick(1000.0).await?;
+    // Two refreshes per stage: the sequence-horizon cursor consumes
+    // one generation behind its capture (merged_bug_063).
+    cost.refresh_lambda(&sdb).await?;
     cost.refresh_lambda(&sdb).await?;
     let g2 = derive(&est, &cost);
     assert_ne!(g2, g1, "λ key entered → cost-side hash changes");
     seed_tick(1600.0).await?;
+    cost.refresh_lambda(&sdb).await?;
     cost.refresh_lambda(&sdb).await?;
     assert_eq!(
         derive(&est, &cost),

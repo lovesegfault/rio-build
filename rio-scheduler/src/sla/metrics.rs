@@ -450,10 +450,11 @@ pub const SLA_LABELED_METRICS: &[(&str, &str, &[&str])] = &[
         "reason",
         // bw11 WO-S6-1: the zero-resource observation refusal (cost.rs
         // intake). bw11 WO-S6-2: the non-finite epoch decode refusal
-        // (cost.rs load + refresh_lambda). Further reasons append via
-        // the label-extension lane as their emits land (the hw_ladder
-        // row's precedent).
-        &["zero_resource", "nonfinite_epoch"],
+        // (cost.rs load + refresh_lambda). bw11 WO-S6-3: the λ-cursor
+        // sequence-premise freeze (cache != 1). Further reasons append
+        // via the label-extension lane as their emits land (the
+        // hw_ladder row's precedent).
+        &["zero_resource", "nonfinite_epoch", "sequence_premise"],
     ),
     (
         "rio_scheduler_sla_hw_ladder_exhausted_total",
