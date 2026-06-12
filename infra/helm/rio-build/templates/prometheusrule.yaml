@@ -574,11 +574,20 @@ spec:
             description: >-
               {{ get (($.Files.Get "generated/metric-help.json") | fromJson) "rio_scheduler_materialization_stalled" }}
               Right now: {{`{{ $value | humanize }}`}} job(s) parked over 15
-              minutes. Check the conversion-strictness knobs and the
-              tenant's upstream cache configuration and health
+              minutes. Two arms (the MD-D1 runbook): (1) upstream — check
+              the conversion-strictness knobs and the tenant's upstream
+              cache configuration and health
               (rio_store_substitute_total{result="error"} rate, the store
               logs for the upstream URL), then fix the upstream, adjust
               the knobs, or cancel the affected builds — in that order.
+              (2) store replica — a parked job whose ledger rows are all
+              establishment-written (zero worker reports), with k8s
+              CrashLoopBackOff on a store replica and NO
+              rio_store_substitute_total error signal, is the
+              crash-looping-replica case: fix the replica, not the
+              upstream. Do NOT restart the scheduler to clear a park —
+              the park is durable state and survives restarts by design.
+              Full index: docs/ops/materialization-deployment-checklist.typ.
 
         # Substitution-replacement Phase B (T-6.2; the CE-D1 deployment-
         # checklist row's alert, extended to the materialization tables):
@@ -870,5 +879,5 @@ spec:
     # no longer exist on this release). The deployment-time deletion-gate
     # evaluation (checklist rows D6/D7) runs against the chart/release
     # that still emits those series — i.e. the release being upgraded
-    # FROM — per the executor-invariant-map deployment checklist.
+    # FROM — per docs/ops/pull-rollout-checklist.typ (rows D6/D7).
 {{- end }}
