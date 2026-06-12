@@ -127,7 +127,7 @@
 //   - nodeclaimLifecycle.qnt (Model N): nothing imported as a
 //     precondition; the dead_nodes signal this subsystem used to
 //     produce is retired — the OA2 controller-side clustering is the
-//     successor (out of model, recorded in the invariant map).
+//     successor (out of model, a recorded campaign decision).
 //
 // ENCODING DECISIONS
 //   - One state record (`st`) holding the per-intent records plus the
@@ -137,7 +137,7 @@
 //     same house pattern as the frozen as-built encoding. Latches the
 //     pull encoding can never set (the guard exists at every site) are
 //     kept so the Stage-C-style overrides (the re-encoded F4
-//     calibration check) have a stable oracle; the invariant-map
+//     calibration check) have a stable oracle; the campaign's
 //     re-target record lists which invariants are by-construction vs
 //     checked.
 //   - The establishment sweep is per-attempt here (one expired open

@@ -87,8 +87,8 @@ EXCLUDE_PARTS = {
     "infra/helm/rio-build/generated",
     ".sqlx",
     "corpus",
-    # The formal-model tier (.qnt + invariant maps) version-pins its
-    # citations as CALIBRATION PROVENANCE ("derived against rule+N")
+    # The formal-model tier (.qnt + the records archives) version-pins
+    # its citations as CALIBRATION PROVENANCE ("derived against rule+N")
     # — a different discipline with its own machinery: the model
     # divergence-header grammar owns staleness there (the
     # supply-model re-target workstream mints it this round; the

@@ -591,8 +591,10 @@ The transient budget is per poison cycle: a resubmit reset
 (#rref("sched.merge.poisoned-resubmit-bounded")) restores the full
 `max_retries` budget and charges `resubmit_cycles` instead. The backoff is
 the only one among the failure classes (infra, timeout, disconnect, and
-backstop requeues are immediate) --- the asymmetry is recorded in the
-invariant map as a Phase-1 policy decision, not specified away here.
+backstop requeues are immediate) --- the asymmetry is a recorded Phase-1
+policy decision (divergence A7 of the retry campaign's catalog; the standing
+question is the TODO at the retry kernel's `backoff_secs`), not specified
+away here.
 
 #r("sched.retry.store-degraded-uncharged+4")[
   An infrastructure failure carrying the builder's
@@ -708,13 +710,13 @@ the boundedness clause on one reachable history: a worker that hard-crashes
 without ever sending a `CompletionReport` produces a disconnect-requeue
 loop that charges no budget and never reaches the backstop timer (each
 disconnect resets the derivation to `Ready`, so the Running-too-long clock
-restarts on every attempt) --- contradiction C2 in the invariant map,
-bounded only by an optional per-build `build_timeout`, and a pre-registered
-expected Stage-B falsification. The per-counter fencepost conventions
+restarts on every attempt) --- contradiction C2 of the retry campaign's
+Stage-A catalog (git history), bounded only by an optional per-build
+`build_timeout`, and a pre-registered expected Stage-B falsification. The per-counter fencepost conventions
 (whether the cap fires on the Nth or the N+1th attempt) currently differ
 between counters; the reference fold reproduces each counter's own
-convention and the invariant map flags the inconsistency for Phase-1
-unification.
+convention and the fencepost unification stays the recorded open question
+(the TODO at the retry kernel's `decide()`).
 
 #r("sched.retry.counters-refine-history+2")[
   The per-derivation retry counters (`count`, `resubmit_cycles`,
@@ -755,7 +757,7 @@ code defect rather than a fold gap.
   the channels delivered them.
 ]
 The pre-Phase-1 code violated this on at least one reachable history,
-recorded as divergence D1 in the invariant map: the same exhausted timeout
+recorded as divergence D1 of the retry campaign's catalog: the same exhausted timeout
 budget landed as `Cancelled` (worker-reported `TimedOut`) or `Poisoned`
 (controller-reported `DeadlineExceeded`) depending on which observer
 reported the deadline overrun first --- the two reports describe one
@@ -769,8 +771,8 @@ reachable wedged-worker history where only the controller ever observes the
 deadline overrun, no implementation could satisfy both rules --- honoring
 the deadline-exceeded clause made the verdict channel-dependent (no
 terminal on the controller-observed run, `Cancelled` on the worker-observed
-run of the same physical history); the invariant map records this as
-rule-vs-rule contradiction C4. Phase 1 resolved both as the design
+run of the same physical history); the retry campaign's catalog records
+this as rule-vs-rule contradiction C4 (git history). Phase 1 resolved both as the design
 pre-committed: the timeout cap's terminal `Cancelled` is owned by the
 collapsed verdict fold regardless of the observing channel (today the
 worker-side `TimedOut` path and the establishment sweep are the observers
@@ -3051,8 +3053,8 @@ by `exec_id`, and a stale or duplicate report finds the attempt row already
 terminal (#rref("sched.executor.report-idempotent")). The retired
 stale-epoch calibration witness and the frozen as-built model
 (`executorSessionAsBuilt.qnt`) it ran against were deleted by the
-2026-05-29 as-built retirement; the executor invariant map's Stage-C
-tables and git history remain the historical evidence.
+2026-05-29 as-built retirement; git history (the retiring commits and the
+Stage-C tables they carry) remains the historical evidence.
 
 #r("sched.dispatch.fod-to-fetcher+2")[
   Per ADR-019, fixed-output derivations route ONLY to fetcher-kind executors
@@ -3214,8 +3216,8 @@ daemon. The session state, the heartbeat intake, the correlation map, the
 reconcile special case and the backstop timer are all deleted; none of the
 windows exist to be composed. This also resolves contradiction C2 (the
 deregister rule's unqualified stream-close clause vs the epoch-qualified
-code): the rule retires with the machinery, and the contradiction record in
-the invariant map stays as history.
+code): the rule retires with the machinery, and the contradiction record stays
+as history in the retired campaign records (git history).
 
 What survives, re-keyed onto the durable open-attempt row, is the
 *one-classifier-wins* discipline the precedence table existed to guarantee:

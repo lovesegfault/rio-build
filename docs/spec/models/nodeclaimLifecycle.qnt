@@ -85,7 +85,7 @@
 //   tier, machine-visible; the census-lint tier-2 drift grep consumes
 //   the literal `MODEL-DIVERGENCE(` token): a law the model
 //   deliberately does NOT certify carries, AT the model (and mirrored
-//   at its invariant-map index row), one single-line header of the
+//   at its archived index row), one single-line header of the
 //   exact form
 //     MODEL-DIVERGENCE(law=<rule-or-law id>; tree=<file:anchor>): <what is not certified> — retarget-by: <trigger>
 //   A change touching a header's `law=` id MUST either re-target the

@@ -96,7 +96,7 @@
 //   - persist_status statements are modeled synchronously with the
 //     in-memory transition (not as intents): no checked property reads
 //     the status-lag window, and the evidence bits — the subject — keep
-//     the full intent treatment. Recorded in the invariant map's stage
+//     the full intent treatment. Recorded in the campaign archive's stage
 //     record as encoding decision ENC-0b-2.
 //
 // INVARIANTS AND WITNESSES: defined in section 6 below, named exactly
@@ -366,7 +366,7 @@ module closureEvidence {
   const WALK_CONSUME_CEIL: int
   const ATTEMPT_CYCLE_CEIL: int  // attempt open/close cycles per node
   const INTENT_CEIL: int         // pending unapplied intents at any instant
-  /// Reduction-ladder step (4) (design §2b.1; invariant-map Phase 0c stage
+  /// Reduction-ladder step (4) (design §2b.1; archived Phase 0c stage
   /// record): outstanding walk instances per node. 2 in the regimes that
   /// exercise the dual-walk rows (stale-tenure / adversarial-store:
   /// an undelivered older-tenure walk next to a fresh spawn); 1 elsewhere.
@@ -1111,7 +1111,7 @@ module closureEvidence {
   /// L3) remains the expected-hold conjunction at the failover scopes;
   /// this variant is retained for comparison against the 0d record.
   /// Refutation evidence, re-hunt figures and the Wave-2b fix record:
-  /// invariant map, Phase-1 Wave-2/2b stage records. The single-tenure
+  /// campaign archive, Phase-1 Wave-2/2b stage records. The single-tenure
   /// scopes' 0c BaseEx record is unaffected.
   val asBuiltHoldInvariantsFailoverEx = and {
     noDoomedFromSourceDispatch, stampSoundness, clearSoundness,
@@ -2156,7 +2156,7 @@ module closureEvidence {
   // enqueued after the completion — e.g. a directed resubmit issued in
   // response to the build failure — can never be processed before it);
   // the refuted single-build C3 trace of the 0c record relied on exactly
-  // such a reordering. See the invariant map's correction record.
+  // such a reordering. See the archived correction record (git history).
 
   /// The walk task's serial check loop completes (environment): ok walks
   /// ingest the non-forgiven seed outputs and the REFS-descendant closure
@@ -2475,7 +2475,7 @@ module closureEvidence {
   /// started yet (Queued/Ready) — production cascade_dependency_failure
   /// skips Substituting/Assigned/Running/Failed parents, whose in-flight
   /// walk or attempt keeps its chance and settles them via its own
-  /// completion (Phase 0c encoding fix; see the invariant map).
+  /// completion (Phase 0c encoding fix; an archived record).
   ///
   /// Each failed build then runs handle_derivation_failure's
   /// keep_going=false arm, which is cancel_build_derivations: every
@@ -2625,7 +2625,7 @@ module closureEvidence {
   }
 
   // --- 8. init ------------------------------------------------------------
-  // Reduction-ladder step CE-L1 (invariant-map Phase 0c stage record): the
+  // Reduction-ladder step CE-L1 (archived Phase 0c stage record): the
   // initial store/upstream assignment is drawn PER DERIVATION (both outputs
   // of a node start with the same presence and the same upstream
   // availability) instead of per output. Every per-output-asymmetric
@@ -2664,7 +2664,7 @@ module closureEvidence {
   // node x build x output cross product for every action. The successor
   // relation is identical to the flat form (each disjunct reads only its
   // own bound variable); only the successor-generation cost changes.
-  // Recorded in the invariant map's Phase 0c stage record.
+  // Recorded in the archived Phase 0c stage record (git history).
 
   /// Per-output environment letters.
   action stepStore = {
@@ -2886,7 +2886,7 @@ module closureEvidenceAdversarialStore {
 }
 
 // ===========================================================================
-// Exhaustive-scope instantiations (Phase 0c reduction ladder; invariant-map
+// Exhaustive-scope instantiations (Phase 0c reduction ladder; archived
 // 0c stage record). The design-scale modules above keep the §2b granularity
 // and carry the witness / expected-fail-probe checks (reach tracking on,
 // dual walks, per-output store letters); these reduced instantiations are
@@ -3451,7 +3451,7 @@ module closureEvidenceCornerFailoverDuo {
 // predecessor record; extensions land as appended modules importing the
 // archived definitions — the FailoverDuo-corner pattern, 15c9ef076).
 // RDC-5 posture (recorded 2026-06-03, folded here from the retired
-// invariant map): the archived module text above remains VERBATIM;
+// retired invariant map): the archived module text above remains VERBATIM;
 // extensions land only as appended standalone modules like this one.
 // Wired: quint-closure-reap-truncate-holds (sim, archived step) and
 // quint-closure-reap-truncate-calib (seeded expect-violation,

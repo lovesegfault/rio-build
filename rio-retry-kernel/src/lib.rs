@@ -117,7 +117,7 @@
 //!
 //! Per the Phase-0 plan, every place two entry points disagree such that
 //! no single channel-invariant fold can reproduce both is a DIVERGENCE row
-//! in the invariant map; the fold implements the side the spec mandates
+//! of the retry campaign's catalog (git history); the fold implements the side the spec mandates
 //! (or the side judged intended where the spec is silent) and the other
 //! side is the deviation Phase 1 must disposition. The deviations are
 //! marked `DIVERGENCE Dn` inline below; `CountersRefineHistory` is
@@ -830,7 +830,8 @@ fn ttl_downgrade<Id>(c: &Counters<Id>, verdict: Verdict, now: AbsTime, budget: &
 
 /// Apply one event to the counters and return the verdict it produces.
 /// Each arm cites the entry point it transcribes; the `DIVERGENCE` arms
-/// deliberately deviate from the code per the invariant map.
+/// deliberately deviate from the code per the campaign's recorded
+/// adjudications.
 fn apply<Id: Ord + Clone>(
     c: &mut Counters<Id>,
     ev: &AttemptEvent<Id>,

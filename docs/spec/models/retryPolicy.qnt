@@ -1618,8 +1618,8 @@ module retryPolicy {
 // the constant binding moved. The pull-mode regime's documentation below
 // is unchanged.)
 //
-// WHAT CHANGES (exactly the T-0e.3 list in
-// docs/spec/models/executor-invariant-map.md):
+// WHAT CHANGES (exactly the executor campaign's T-0e.3 list, mirrored
+// here in full — the list below IS the record):
 //   - dispatchTo -> pullOpensAttempt: the attempt opens at PullAssignment
 //     (Ready->Running + exec mint + row insert in one fenced transaction).
 //     The dispatch-time eligibility/exclusion precondition moves to the
