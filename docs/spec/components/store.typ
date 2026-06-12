@@ -2176,6 +2176,24 @@ GC redesign must preserve.
 + Rows exceeding max retry count (default: 10) remain in the table for alerting
   (#(refs.metric)("rio_store_s3_deletes_stuck") gauge).
 
+#r("store.gc.outbox-reset")[
+  Outbox exhaustion MUST NOT be absorbing: a fresh collect decision for an
+  object whose `pending_s3_deletes` row has exhausted its retry budget
+  (`attempts >= MAX_ATTEMPTS`) MUST reset that row's budget
+  (`attempts = 0`, `enqueued_at = now()`) so the drain retries it, while a
+  duplicate decision against a row whose budget remains MUST stay swallowed
+  (the dedup the partial unique index exists for). The reap predicate's
+  NOT-EXISTS conjunct over `pending_s3_deletes` is thereby a finite wait,
+  never a permanent veto on the tombstone hard-delete.
+]
+The exit edge rides the enqueue's conflict arm (the guarded
+`DO UPDATE ... WHERE attempts >= MAX`): the one event that logically
+restarts the budget --- a fresh decision to delete the same object --- is
+exactly the event the pre-fix `ON CONFLICT DO NOTHING` swallowed, which
+promoted a transient S3 outage into an unreaped tombstone and a leaked
+object with only the `_stuck` gauge as evidence (bug_111; the R30
+liveness-dual discipline --- the latch and its exit edge ship together).
+
 *GC-vs-GC serialization:* see #rref("store.gc.serialize-lock").
 
 = Admin RPCs

@@ -338,3 +338,20 @@ instances land with their own closes (the GC outbox reset edge, the
 gave-up latch's pod-free decay) and append their rows below this
 doctrine; the per-latch exit-edge obligation census is the standing
 machine enforcement.
+
+== Instance Register
+
+Each landed liveness-dual close appends its row here: the latch, the reset
+or terminal event, and the reachability witness — under the doctrine above
+(#rref("sys.liveness.exit-edge")).
+
+- *GC delete outbox (store)*: a `pending_s3_deletes` row that exhausts its
+  retry budget (`attempts >= MAX_ATTEMPTS`) is parked outside the drain's
+  partial index --- a latch with no in-band retry. Exit edge: the next fresh
+  collect decision for the same object resets the budget through the
+  enqueue's guarded conflict arm (#rref("store.gc.outbox-reset")); the reset
+  event is mintable from inside the latched state because collect decisions
+  derive from tombstone state, which the latch does not gate. Reachability
+  witnessed end-to-end (injected-outage exhaustion through the production
+  drain, then a production re-decision reaching execution past backend
+  recovery), with the dedup face co-witnessed: in-budget rows stay swallowed.

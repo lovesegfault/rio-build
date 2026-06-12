@@ -19,7 +19,7 @@ const DRAIN_BATCH_SIZE: i64 = 100;
 /// in `rio_store_s3_deletes_stuck` (not `_pending`; pending counts
 /// only retriable rows). Usually: S3 permission change, key format
 /// mismatch after a config change, or the object is Glacier-archived.
-const MAX_ATTEMPTS: i32 = 10;
+pub(crate) const MAX_ATTEMPTS: i32 = 10;
 
 /// Interval between drain iterations. 30s: fast enough to keep
 /// the pending table small under steady-state GC, slow enough to

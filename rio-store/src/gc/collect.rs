@@ -436,9 +436,18 @@ pub(crate) static REAP_BATCH_DELETE_SQL: LazyLock<String> = LazyLock::new(|| {
 /// a tombstone resurrected between the candidate snapshot and the lock
 /// grant (deleted = FALSE, deleted_at NULL) fails the outer qual and
 /// survives. The repeated `NOT EXISTS pending_s3_deletes` conjunct is
-/// symmetry/defense (the drain's resurrect-skip makes it non-load-
-/// bearing, but dropping it from one qual and not the other is exactly
-/// the divergence class this splice forecloses).
+/// LOAD-BEARING (bug_111 corrected the prior "non-load-bearing"
+/// claim): it sequences the tombstone hard-delete strictly after the
+/// outbox completes for that object — a tombstone whose S3 delete is
+/// still scheduled (or parked exhausted) keeps its row, so the
+/// drain's `chunks` re-check target and the object's bookkeeping
+/// survive until the backend delete is confirmed. The conjunct is a
+/// FINITE wait, never a permanent veto, because the outbox has its
+/// exit edge: an exhausted row resets on the next fresh collect
+/// decision (`enqueue_chunk_deletes`' guarded conflict arm) and
+/// in-budget rows drain on cadence. Dropping the conjunct from one
+/// qual and not the other is exactly the divergence class this
+/// splice forecloses.
 fn render_reap_row_local_pred(a: &str) -> String {
     format!(
         "{a}deleted AND {a}deleted_at < now() - make_interval(secs => $1) \

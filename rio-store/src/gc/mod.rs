@@ -974,15 +974,33 @@ fn render_phase3(phase3: &Phase3Render, dry_run: bool, stats: &GcStats) -> Strin
 /// `blake3_hash` is written alongside `s3_key` so the drain task can
 /// re-check `chunks.deleted` before issuing the S3 DELETE — catches
 /// the TOCTOU where PutPath resurrected the chunk after we enqueued
-/// it. `ON CONFLICT DO NOTHING`: duplicate enqueues are idempotent
-/// (drain deletes the row after S3 success).
+/// it.
+///
+/// THE CONFLICT ARM IS THE OUTBOX'S EXIT EDGE (bug_111, R30): a
+/// duplicate enqueue against a row whose budget REMAINS
+/// (`attempts < MAX_ATTEMPTS`) is swallowed — the designed dedup,
+/// guarded by the DO UPDATE's WHERE — but against an EXHAUSTED row
+/// (`attempts >= MAX_ATTEMPTS`, parked outside the drain's partial
+/// index) the fresh collect decision RESETS the budget
+/// (`attempts = 0, enqueued_at = now()`): exhaustion is not
+/// absorbing, because a fresh decision for the same object is
+/// exactly the event that logically restarts the retry budget. The
+/// pre-fix `ON CONFLICT DO NOTHING` swallowed the re-decision too,
+/// so a ~5min transient S3 outage leaked the object with no retry
+/// path and turned the reap qual's NOT-EXISTS conjunct into a
+/// permanent veto on the chunk tombstone's hard-delete.
+/// `last_error` is intentionally retained across the reset as
+/// forensic context until the next attempt overwrites it. The
+/// conflict target names migration 024's partial unique index
+/// (`blake3_hash WHERE blake3_hash IS NOT NULL`); rows enqueued here
+/// always carry a hash.
 ///
 /// Skips hashes that fail `try_from` to `[u8; 32]` (can't-happen — the
 /// `chunks` PK is BYTEA but every writer inserts exactly 32 bytes;
 /// `warn!` + skip rather than panic so one corrupt row doesn't kill
 /// the collect batch). Returns the number of keys attempted
-/// (duplicates already enqueued are no-ops via `ON CONFLICT DO
-/// NOTHING`; actual insert count may be lower).
+/// (in-budget duplicates are no-ops; actual insert count may be
+/// lower).
 ///
 /// No-op if `backend` is None (inline-only store has no S3 keys).
 // r[impl store.gc.pending-deletes+2]
@@ -1026,10 +1044,13 @@ pub(super) async fn enqueue_chunk_deletes(
     sqlx::query(
         "INSERT INTO pending_s3_deletes (s3_key, blake3_hash) \
          SELECT * FROM unnest($1::text[], $2::bytea[]) \
-         ON CONFLICT DO NOTHING",
+         ON CONFLICT (blake3_hash) WHERE blake3_hash IS NOT NULL \
+         DO UPDATE SET attempts = 0, enqueued_at = now() \
+         WHERE pending_s3_deletes.attempts >= $3",
     )
     .bind(&keys)
     .bind(&hashes)
+    .bind(crate::gc::drain::MAX_ATTEMPTS)
     .execute(&mut **tx)
     .await?;
     Ok(keys.len() as u64)
@@ -1073,6 +1094,261 @@ mod tests {
     use crate::manifest::{Manifest, ManifestEntry};
     use crate::test_helpers::mem_backend;
     use rio_test_support::TestDb;
+
+    /// A `ChunkBackend` whose `delete_by_key` fails (non-auth) until
+    /// released — the injected S3 outage for the outbox tests.
+    struct OutageBackend {
+        inner: std::sync::Arc<dyn crate::backend::ChunkBackend>,
+        healthy: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::backend::ChunkBackend for OutageBackend {
+        async fn put(&self, h: &[u8; 32], d: bytes::Bytes) -> anyhow::Result<()> {
+            self.inner.put(h, d).await
+        }
+        async fn get(&self, h: &[u8; 32]) -> anyhow::Result<Option<bytes::Bytes>> {
+            self.inner.get(h).await
+        }
+        async fn exists_batch(&self, h: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
+            self.inner.exists_batch(h).await
+        }
+        fn key_for(&self, h: &[u8; 32]) -> String {
+            self.inner.key_for(h)
+        }
+        async fn delete_by_key(&self, k: &str) -> anyhow::Result<()> {
+            if self.healthy.load(std::sync::atomic::Ordering::SeqCst) {
+                self.inner.delete_by_key(k).await
+            } else {
+                anyhow::bail!("injected S3 outage: transient delete failure")
+            }
+        }
+    }
+
+    /// Enqueue `hashes` through the PRODUCTION outbox statement
+    /// (`enqueue_chunk_deletes`) inside its own committed transaction
+    /// — the fresh-collect-decision producer, never hand-rolled SQL.
+    async fn enqueue_via_production(
+        pool: &sqlx::PgPool,
+        backend: &Arc<dyn crate::backend::ChunkBackend>,
+        hashes: &[[u8; 32]],
+    ) -> u64 {
+        let mut tx = pool.begin().await.unwrap();
+        let soft: Vec<(Vec<u8>, i64)> = hashes.iter().map(|h| (h.to_vec(), 8)).collect();
+        let n = enqueue_chunk_deletes(&mut tx, &soft, Some(backend))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        n
+    }
+
+    // r[verify store.gc.outbox-reset]
+    /// W11-AP (bug_111, R30): from the EXHAUSTED outbox state, a fresh
+    /// producer decision reaches execution — the exit edge of the
+    /// absorbing state, witnessed at the outbox's own lattice.
+    ///
+    /// Schedule: an injected S3 outage exhausts a pending_s3_deletes
+    /// row through the production drain (MAX_ATTEMPTS real failures);
+    /// the backend recovers; a LATER fresh collect decision for the
+    /// same object re-enqueues through the production statement.
+    /// Pre-fix red (verbatim in the commit body): the decision was
+    /// swallowed by ON CONFLICT DO NOTHING — the drain never retried
+    /// (zero deletes after recovery) and the object leaked past
+    /// backend recovery while the reap conjunct stayed a permanent
+    /// veto. Post-fix: attempts reset to 0, the drain retries and
+    /// deletes, the pending row leaves, and the reap qual's three
+    /// conjuncts (tombstoned, aged, no outbox row) all pass.
+    ///
+    /// LATCH-FACE cell (the designed dedup, WITNESSED not asserted —
+    /// the law's own IFF quantifier over {exhausted, non-exhausted} ×
+    /// fresh-decision): a NON-exhausted in-flight row (attempts = 3
+    /// via injected failures) receiving a duplicate enqueue through
+    /// the same production path is STILL swallowed — attempts AND
+    /// enqueued_at unchanged. Red under an unguarded DO UPDATE; green
+    /// under the guarded reset.
+    #[tokio::test]
+    async fn fresh_collect_decision_resets_exhausted_outbox_row() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let outage = std::sync::Arc::new(OutageBackend {
+            inner: mem_backend(),
+            healthy: std::sync::atomic::AtomicBool::new(false),
+        });
+        let backend: Arc<dyn crate::backend::ChunkBackend> =
+            std::sync::Arc::clone(&outage) as Arc<dyn crate::backend::ChunkBackend>;
+
+        // Chunk X: tombstoned (the collect soft-delete shape), object
+        // in the backend, outbox row enqueued via PRODUCTION.
+        let hash_x = [0xA1u8; 32];
+        backend
+            .put(&hash_x, bytes::Bytes::from_static(b"exhausted-prey"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chunks (blake3_hash, size, deleted, deleted_at) \
+             VALUES ($1, 14, true, now() - interval '2 days')",
+        )
+        .bind(hash_x.as_slice())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            enqueue_via_production(&db.pool, &backend, &[hash_x]).await,
+            1
+        );
+
+        // The outage exhausts the row through the production drain.
+        for _ in 0..crate::gc::drain::MAX_ATTEMPTS {
+            let (deleted, failed) = crate::gc::drain::drain_once(
+                &db.pool,
+                &backend,
+                &mut crate::test_helpers::gc_clearance(&db.pool).await,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (deleted, failed),
+                (0, 1),
+                "each outage tick burns one attempt"
+            );
+        }
+        let attempts: i32 =
+            sqlx::query_scalar("SELECT attempts FROM pending_s3_deletes WHERE blake3_hash = $1")
+                .bind(hash_x.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            attempts,
+            crate::gc::drain::MAX_ATTEMPTS,
+            "the row is exhausted"
+        );
+
+        // The backend recovers. Absent a fresh decision the row stays
+        // parked (the designed operator surface) — the exit edge is
+        // the RE-DECISION, not the recovery.
+        outage
+            .healthy
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // A LATER fresh collect decision for the same object.
+        enqueue_via_production(&db.pool, &backend, &[hash_x]).await;
+
+        // The drain retries and the delete executes.
+        let (deleted, failed) = crate::gc::drain::drain_once(
+            &db.pool,
+            &backend,
+            &mut crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (deleted, failed),
+            (1, 0),
+            "the fresh decision resets the budget: the drain retries and deletes \
+             (pre-fix: swallowed, zero drain attempts ever after recovery)"
+        );
+        assert!(
+            backend.get(&hash_x).await.unwrap().is_none(),
+            "the leaked object is gone after the reset edge"
+        );
+        // The reap conjuncts all pass now: tombstoned, aged, no outbox
+        // row — the permanent veto is gone.
+        let (tombstoned, aged, outbox_rows): (bool, bool, i64) = sqlx::query_as(
+            "SELECT deleted, deleted_at < now() - interval '1 day', \
+                    (SELECT COUNT(*) FROM pending_s3_deletes p \
+                      WHERE p.blake3_hash = chunks.blake3_hash) \
+               FROM chunks WHERE blake3_hash = $1",
+        )
+        .bind(hash_x.as_slice())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            tombstoned && aged && outbox_rows == 0,
+            "the reap conjunct unblocks"
+        );
+    }
+
+    // r[verify store.gc.outbox-reset]
+    /// W11-AP latch-face cell — see
+    /// [`fresh_collect_decision_resets_exhausted_outbox_row`]'s doc:
+    /// the non-exhausted half of the IFF.
+    #[tokio::test]
+    async fn duplicate_enqueue_still_swallowed_while_attempts_remain() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let outage = std::sync::Arc::new(OutageBackend {
+            inner: mem_backend(),
+            healthy: std::sync::atomic::AtomicBool::new(false),
+        });
+        let backend: Arc<dyn crate::backend::ChunkBackend> =
+            std::sync::Arc::clone(&outage) as Arc<dyn crate::backend::ChunkBackend>;
+
+        let hash_y = [0xB2u8; 32];
+        backend
+            .put(&hash_y, bytes::Bytes::from_static(b"in-flight-prey"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chunks (blake3_hash, size, deleted, deleted_at) \
+             VALUES ($1, 14, true, now() - interval '2 days')",
+        )
+        .bind(hash_y.as_slice())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            enqueue_via_production(&db.pool, &backend, &[hash_y]).await,
+            1
+        );
+
+        // In-flight: 0 < attempts < MAX via injected failures.
+        for _ in 0..3 {
+            let (_, failed) = crate::gc::drain::drain_once(
+                &db.pool,
+                &backend,
+                &mut crate::test_helpers::gc_clearance(&db.pool).await,
+            )
+            .await
+            .unwrap();
+            assert_eq!(failed, 1);
+        }
+        let (attempts_before, enqueued_before): (i32, String) = sqlx::query_as(
+            "SELECT attempts, enqueued_at::text FROM pending_s3_deletes \
+              WHERE blake3_hash = $1",
+        )
+        .bind(hash_y.as_slice())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts_before, 3);
+
+        // Duplicate enqueue through the production path: the designed
+        // dedup MUST hold while attempts remain.
+        enqueue_via_production(&db.pool, &backend, &[hash_y]).await;
+
+        let (attempts_after, enqueued_after): (i32, String) = sqlx::query_as(
+            "SELECT attempts, enqueued_at::text FROM pending_s3_deletes \
+              WHERE blake3_hash = $1",
+        )
+        .bind(hash_y.as_slice())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (attempts_after, enqueued_after.as_str()),
+            (attempts_before, enqueued_before.as_str()),
+            "a duplicate enqueue against a non-exhausted row is swallowed: \
+             attempts AND enqueued_at unchanged (red under an unguarded DO UPDATE)"
+        );
+        // One row, still — the dedup index held.
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pending_s3_deletes WHERE blake3_hash = $1")
+                .bind(hash_y.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 1);
+    }
 
     // r[verify store.gc.clearance-expiry]
     /// W11-AM face 2 (the expiry face — the time axis's own cell): a
