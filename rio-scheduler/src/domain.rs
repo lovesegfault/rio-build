@@ -170,6 +170,12 @@ pub struct BuildResult {
     /// (`builder.outcome.store-degraded`). Routes the report to the
     /// uncharged pacing class at the completion intake.
     pub store_degraded: bool,
+    /// bug_090: the typed sizing classification + corroboration
+    /// family — the ONLY channel `bump_resource_floor` consumes
+    /// (`error_msg` is display-only). Taint-preserving carry of the
+    /// wire field; the corroboration gate in `completion.rs` is the
+    /// consumer.
+    pub failure_classification: Option<proto::FailureClassification>,
 }
 
 impl From<proto::BuildResult> for BuildResult {
@@ -188,6 +194,7 @@ impl From<proto::BuildResult> for BuildResult {
             stop_time: r.stop_time.and_then(to_system_time),
             built_outputs: r.built_outputs.into_iter().map(Into::into).collect(),
             store_degraded: r.store_degraded,
+            failure_classification: r.failure_classification,
         }
     }
 }

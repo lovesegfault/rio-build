@@ -102,12 +102,12 @@ pub(super) const MAX_IDENT_LEN: usize = 256;
 /// `(1 + cascaded_ancestors) × interested_builds` state-ring slots and
 /// `nix build -L` terminals.
 ///
-/// Head-truncation cannot break the scheduler's semantic dispatch on this
-/// field: `handle_infrastructure_failure` greps for `CGROUP_OOM_MSG` and
-/// `CONCURRENT_PUTPATH_MSG`, both short builder-constructed prefixes that
-/// sit in the first few hundred bytes of a legitimate message. A hostile
-/// builder padding the marker past 16 KiB only denies itself the
-/// resource-floor bump.
+/// Head-truncation cannot break any scheduler decision on this field:
+/// `error_msg` is DISPLAY/NARRATION ONLY (bug_090 — sizing
+/// classifications ride the typed `failure_classification` field and
+/// its corroboration gate; the I-127 `CONCURRENT_PUTPATH_MSG` infra
+/// exemption still reads a short builder-constructed prefix that sits
+/// in the first few hundred bytes of a legitimate message).
 pub(super) const MAX_ERROR_MSG_LEN: usize = 16 * 1024;
 
 /// Upper bound on the body-supplied `PullAssignmentRequest.executor_token`.

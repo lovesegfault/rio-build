@@ -195,21 +195,39 @@ submitter-controlled attributes (the CA-ness of one's own drv) convert
 per-face residuals into adversary-chosen bypasses; the CA face therefore
 joins the law's domain with its own evidence base rather than an exemption.
 
-#r("sched.trust.report-corroboration")[
-  A tenant-visibility registration stamp for a floating-CA report MUST bind to
-  store-recorded production evidence: the stamp (and the realisation insert
-  that feeds later stamp lanes) admits a worker-reported `output_path` ONLY if
-  the store's ingest-lane registration (`path_tenants` --- the SAME rows the
-  visibility verdict's `own_built_projection` reads, one source) records the
-  path for at least one tenant of the reporting build's attributed cohort: no
-  upload, no stamp. Absent evidence MUST be a typed refusal --- counted
+#r("sched.trust.report-corroboration+2")[
+  A worker report's claim MUST NOT move scheduler-persisted state without
+  corroboration the scheduler can verify against evidence it (or the store)
+  owns. Two faces:
+  (1) *Visibility:* a tenant-visibility registration stamp for a floating-CA
+  report MUST bind to store-recorded production evidence: the stamp (and the
+  realisation insert that feeds later stamp lanes) admits a worker-reported
+  `output_path` ONLY if the store's ingest-lane registration (`path_tenants`
+  --- the SAME rows the visibility verdict's `own_built_projection` reads,
+  one source) records the path for at least one tenant of the reporting
+  build's attributed cohort: no upload, no stamp. Absent evidence MUST be a
+  typed refusal --- counted
   (#(refs.metric)("rio_scheduler_unevidenced_ca_output_total")), attributed,
   non-poisoning, degrading exactly to the pre-registration posture (bytes
   durable, tenant-invisible until a lawful re-stamp); an evidence-consult
-  error MUST fail closed. Residual pricing for any face of this boundary MUST
-  name a firing predicate machine-bound in the taint census --- a census row
-  whose compensating control cannot fire on the priced path is census-RED,
-  never self-reported prose.
+  error MUST fail closed.
+  (2) *Sizing floors:* a persisted resource-floor bump on a worker-reported
+  failure MUST consume the TYPED `failure_classification` wire field ---
+  never `error_msg` text --- with telemetry consistent with the shape the
+  scheduler itself assigned at dispatch (the corroboration anchor a forger
+  cannot choose); untyped or uncorroborated claims are classify-only,
+  counted
+  (#(refs.metric)("rio_scheduler_uncorroborated_sizing_claim_total")), and
+  never move a floor. The depth bound is POPULATION-denominated: at most one
+  doubling per corroborated incident identity (drv_hash, exec_id) --- the
+  report admission fold's once-per-exec dedup is the identity law, and each
+  ladder step burns a real scheduled attempt at the previously-assigned
+  size, so a forger pays the honest path's cost with no amplification and a
+  paced forger gains nothing from pacing.
+  Residual pricing for any face of this boundary MUST name a firing
+  predicate machine-bound in the taint census --- a census row whose
+  compensating control cannot fire on the priced path is census-RED, never
+  self-reported prose.
 ]
 Granularity, priced: the binding is (path, claims-tenant-cohort), not
 (path, exec) --- the store's durable upload trace is the tenant-keyed ingest

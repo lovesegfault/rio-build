@@ -2260,16 +2260,17 @@ async fn oom_floor_doubles_from_minted_intent() -> TestResult {
         .map(|i| i.mem_bytes)
         .unwrap_or(0);
 
-    // The worker's OOM report (the cgroup-kill marker routes the
-    // completion through the resource-exhaustion classification).
+    // The worker's OOM report — bug_090: the TYPED claim with the
+    // peak corroborant at the minted shape (free text drives nothing).
     pull_report(
         &handle,
         "oom-floor",
-        pull_payload(rio_proto::types::BuildResult {
-            status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
-            error_msg: format!("{} (memory.peak 4Gi)", rio_proto::CGROUP_OOM_MSG),
-            ..Default::default()
-        }),
+        typed_sizing_failure(
+            rio_proto::types::FailureClass::CgroupOom,
+            "cgroup OOM during build (memory.peak 4Gi)",
+            None,
+            minted_mem,
+        ),
     )
     .await?;
 

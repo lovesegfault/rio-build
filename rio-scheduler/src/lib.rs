@@ -313,18 +313,36 @@ pub fn describe_metrics() {
         "rio_scheduler_resource_floor_bumps_total",
         "resource_floor doublings on explicit resource-exhaustion signals (D4, \
          labeled reason=cgroup_oom|disk_full|timeout|witnessed_oom; timeout \
-         covers DeadlineExceeded too). cgroup_oom, disk_full, and timeout are \
-         worker-reported (disk_full = the prjquota-attributed DiskFull \
-         classification, live_057 — a build that exhausts its overlay quota at \
-         disk=N retries at disk=2N); witnessed_oom is the controller-witnessed \
-         OomKilled letter promoted at the establishment sweep, once per attempt \
-         ever via the establishment transaction's won flag (live_058-b — \
-         witnessed evictions are classify-only and have NO label here). The \
-         stream-era oom_killed/disk_pressure/deadline_exceeded label arms were \
-         retired with the heuristic promote paths; the caller alphabet is \
+         covers DeadlineExceeded too). cgroup_oom and disk_full consume the \
+         TYPED failure_classification wire field, corroborated against the \
+         dispatch-assigned shape (bug_090 — worker free text drives nothing; \
+         uncorroborated claims are refused and counted on \
+         rio_scheduler_uncorroborated_sizing_claim_total); disk_full is the \
+         prjquota-attributed DiskFull classification (live_057 — a build that \
+         exhausts its overlay quota at disk=N retries at disk=2N); timeout is \
+         worker-reported; witnessed_oom is the controller-witnessed OomKilled \
+         letter promoted at the establishment sweep, once per attempt ever via \
+         the establishment transaction's won flag (live_058-b — witnessed \
+         evictions are classify-only and have NO label here). The stream-era \
+         oom_killed/disk_pressure/deadline_exceeded label arms were retired \
+         with the heuristic promote paths; the caller alphabet is \
          census-pinned (bump_resource_floor_caller_census, db/live_pins.rs). \
          Reactive upsize: a derivation that OOMs at mem=N retries at mem=2N. \
          Frequent firing for one pname = raise [sla].probe defaults."
+    );
+    describe_counter!(
+        "rio_scheduler_uncorroborated_sizing_claim_total",
+        "Worker-reported TYPED sizing claims (failure_classification) refused \
+         by the corroboration gate (bug_090; labels: class = \
+         cgroup_oom|disk_full|unspecified): the claim's telemetry was absent \
+         or inconsistent with the shape the scheduler assigned at dispatch \
+         (oom: peak_memory below half the assigned memory; disk: hard limit \
+         outside [assigned/2, assigned*4] or peak below half the limit), or \
+         no dispatch intent existed to corroborate against. Refusals are \
+         classify-only — the report's retry/charge flow is unaffected and \
+         persisted floors never move. Alert if rate > 0: a forged or \
+         misbehaving worker report (the honest producer always sends \
+         self-consistent telemetry sampled at its own classification seam)."
     );
     describe_counter!(
         "rio_scheduler_poison_fleet_exhausted_total",

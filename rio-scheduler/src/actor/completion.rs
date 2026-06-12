@@ -254,23 +254,38 @@ impl StoreDegradedDisposition {
 /// `Cancelled` synthesizes its message (the worker sent a status the
 /// scheduler never initiated — the wire message is untrusted noise on
 /// that arm); every other arm borrows the worker's `error_msg`.
+/// bug_090: the metric-label form of the sizing-class alphabet.
+pub(super) fn sizing_class_label(class: rio_proto::types::FailureClass) -> &'static str {
+    match class {
+        rio_proto::types::FailureClass::Unspecified => "unspecified",
+        rio_proto::types::FailureClass::CgroupOom => "cgroup_oom",
+        rio_proto::types::FailureClass::DiskFull => "disk_full",
+    }
+}
+
 pub(super) fn failure_ctx_for<'a>(
     status: rio_proto::types::BuildResultStatus,
     result: &'a crate::domain::BuildResult,
     report_line_count: Option<i64>,
+    peak_memory_bytes: u64,
 ) -> FailureReportCtx<'a> {
     use rio_proto::types::BuildResultStatus as S;
     match status {
-        S::InfrastructureFailure => {
-            FailureReportCtx::infra(report_line_count, &result.error_msg, result.store_degraded)
-        }
+        S::InfrastructureFailure => FailureReportCtx::infra(
+            report_line_count,
+            &result.error_msg,
+            result.store_degraded,
+            result.failure_classification.as_ref(),
+            peak_memory_bytes,
+        ),
         S::Cancelled => FailureReportCtx::non_infra(
             report_line_count,
             "worker reported Cancelled without scheduler-initiated cancel",
         ),
         // The permanent family, transient, timeout, unspecified, and
         // the (unreachable here) success statuses: structurally no
-        // store evidence — `non_infra` has no degraded parameter.
+        // store evidence and no sizing claim — `non_infra` has
+        // neither parameter.
         _ => FailureReportCtx::non_infra(report_line_count, &result.error_msg),
     }
 }
@@ -1235,6 +1250,110 @@ impl DagActor {
     /// over-broad heuristic; `timeout` covers `DeadlineExceeded`
     /// too; `disk_full` is the live_057 worker quota lane) — keep
     /// the lib.rs HELP in lockstep when the census grows.
+    /// bug_090 — the corroboration gate: a worker-reported TYPED
+    /// sizing claim moves a persisted floor ONLY when its telemetry is
+    /// consistent with the shape THIS scheduler assigned at dispatch
+    /// (`state.sched.last_intent` — the corroboration anchor a forger
+    /// cannot choose: each ladder step must claim exhaustion AT the
+    /// previously-assigned size, from a real scheduled attempt).
+    ///
+    /// Acceptance bands (CONSUMER-owned tolerances — deliberately
+    /// looser than the producer's classification predicate, which
+    /// stays authoritative for honest builders; these bands only
+    /// bound forgery and live in exactly one place, here):
+    ///
+    /// * CGROUP_OOM: `peak_memory_bytes ≥ assigned_mem / 2` —
+    ///   memory.peak saturates at memory.max (= the assigned shape)
+    ///   under a real oom kill; a claim with a peak far below the
+    ///   assignment is refused.
+    /// * DISK_FULL: `hard_limit ∈ [assigned_disk/2, assigned_disk×4]`
+    ///   (the kubelet derives the project quota from the assigned
+    ///   ephemeral-storage shape — a forged tiny- or absurd-limit
+    ///   exhaustion is refused) AND `peak_used ≥ hard_limit / 2`
+    ///   (the build genuinely consumed its quota).
+    ///
+    /// No assigned shape (cold start, never dispatched by this
+    /// leader) ⇒ refuse: there is nothing to corroborate against,
+    /// and `bump_floor_or_count` would no-op on a zero base anyway.
+    /// Refusals are TYPED letters: counted
+    /// (`rio_scheduler_uncorroborated_sizing_claim_total`),
+    /// attributed, classify-only (the report's retry/charge flow is
+    /// unaffected).
+    // r[impl sched.trust.report-corroboration+2]
+    pub(super) async fn bump_floor_on_corroborated_claim(
+        &mut self,
+        drv_hash: &DrvHash,
+        claim: super::report_ctx::SizingClaim,
+    ) -> super::floor::FloorOutcome {
+        use rio_proto::types::FailureClass;
+        let Some(intent) = self
+            .dag
+            .node(drv_hash)
+            .and_then(|state| state.sched.last_intent.as_ref())
+            .map(|i| (i.mem_bytes, i.disk_bytes))
+        else {
+            warn!(
+                drv_hash = %drv_hash, class = ?claim.class,
+                "refusing sizing claim: no dispatch intent to corroborate \
+                 against (cold/never-dispatched)"
+            );
+            metrics::counter!(
+                "rio_scheduler_uncorroborated_sizing_claim_total",
+                "class" => sizing_class_label(claim.class)
+            )
+            .increment(1);
+            return super::floor::FloorOutcome::default();
+        };
+        let (assigned_mem, assigned_disk) = intent;
+        let corroborated = match claim.class {
+            FailureClass::Unspecified => false, // unreachable: never constructed
+            FailureClass::CgroupOom => {
+                assigned_mem > 0 && claim.peak_memory_bytes >= assigned_mem / 2
+            }
+            FailureClass::DiskFull => claim.quota.is_some_and(|q| {
+                assigned_disk > 0
+                    && q.hard_limit_bytes >= assigned_disk / 2
+                    && q.hard_limit_bytes <= assigned_disk.saturating_mul(4)
+                    && q.peak_used_bytes >= q.hard_limit_bytes / 2
+            }),
+        };
+        if !corroborated {
+            warn!(
+                drv_hash = %drv_hash, class = ?claim.class,
+                peak_memory = claim.peak_memory_bytes,
+                quota = ?claim.quota,
+                assigned_mem, assigned_disk,
+                "refusing uncorroborated sizing claim (telemetry \
+                 inconsistent with the assigned shape); classify-only"
+            );
+            metrics::counter!(
+                "rio_scheduler_uncorroborated_sizing_claim_total",
+                "class" => sizing_class_label(claim.class)
+            )
+            .increment(1);
+            return super::floor::FloorOutcome::default();
+        }
+        match claim.class {
+            FailureClass::Unspecified => super::floor::FloorOutcome::default(),
+            FailureClass::CgroupOom => {
+                self.bump_resource_floor(
+                    drv_hash,
+                    rio_proto::types::TerminationReason::OomKilled,
+                    "cgroup_oom",
+                )
+                .await
+            }
+            FailureClass::DiskFull => {
+                self.bump_resource_floor(
+                    drv_hash,
+                    rio_proto::types::TerminationReason::EvictedDiskPressure,
+                    "disk_full",
+                )
+                .await
+            }
+        }
+    }
+
     pub(super) async fn bump_resource_floor(
         &mut self,
         drv_hash: &DrvHash,
@@ -1647,7 +1766,7 @@ impl DagActor {
     ///
     /// [`SchedulerDb::paths_with_production_evidence`]: crate::db::SchedulerDb::paths_with_production_evidence
     /// [`StampProvenance::BuiltLocallyEvidenced`]: crate::db::live_pins::StampProvenance::BuiltLocallyEvidenced
-    // r[impl sched.trust.report-corroboration]
+    // r[impl sched.trust.report-corroboration+2]
     pub(super) async fn ca_production_evidence(
         &self,
         executor_id: &str,
@@ -2217,7 +2336,7 @@ impl DagActor {
                     .handle_transient_failure(
                         drv_hash,
                         executor_id,
-                        failure_ctx_for(status, &result, report_line_count),
+                        failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
                     )
                     .await;
                 match handling {
@@ -2240,7 +2359,7 @@ impl DagActor {
                     .handle_infrastructure_failure(
                         drv_hash,
                         executor_id,
-                        failure_ctx_for(status, &result, report_line_count),
+                        failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
                     )
                     .await;
                 match handling {
@@ -2270,7 +2389,7 @@ impl DagActor {
                     .handle_permanent_failure(
                         drv_hash,
                         executor_id,
-                        failure_ctx_for(status, &result, report_line_count),
+                        failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
                     )
                     .await;
                 match handling {
@@ -2295,7 +2414,7 @@ impl DagActor {
                     .handle_timeout_failure(
                         drv_hash,
                         executor_id,
-                        failure_ctx_for(status, &result, report_line_count),
+                        failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
                     )
                     .await;
                 match handling {
@@ -2327,7 +2446,7 @@ impl DagActor {
                     .handle_infrastructure_failure(
                         drv_hash,
                         executor_id,
-                        failure_ctx_for(status, &result, report_line_count),
+                        failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
                     )
                     .await;
                 match handling {
@@ -2355,7 +2474,7 @@ impl DagActor {
                     .handle_transient_failure(
                         drv_hash,
                         executor_id,
-                        failure_ctx_for(status, &result, report_line_count),
+                        failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
                     )
                     .await;
                 match handling {
@@ -4142,11 +4261,6 @@ impl DagActor {
         // which deliberately never promotes (sla-sizing.typ accepted
         // residual).
         //
-        // Substring match on the `ExecutorError::CgroupOom` Display
-        // impl; both reference `rio_proto::CGROUP_OOM_MSG` so the
-        // contract can't drift between the `#[error]` attr (pinned by
-        // rio-builder's `cgroup_oom_display_contains_proto_constant`
-        // test) and this consumer match site.
         // bug_408: a store-degraded failure is never a sizing signal —
         // the breaker fired on store fetches, not on the build's
         // memory — so the floor bump is skipped even if the message
@@ -4159,34 +4273,32 @@ impl DagActor {
             degraded,
             StoreDegradedDisposition::Paced | StoreDegradedDisposition::RunBound
         );
-        // live_057-b: the DISK twin — worker-reported DiskFull (the
-        // prjquota-attributed classification, apply_disk_override)
-        // bumps the DISK floor through the same machinery. Substring
-        // match on `ExecutorError::DiskFull`'s Display; both sides
-        // reference `rio_proto::DISK_FULL_MSG` (pinned by rio-builder's
-        // `disk_full_display_contains_proto_constant`). The bug_408
-        // believed-store suppression applies IDENTICALLY: a
+        // bug_090 (live_057-b rebuilt): the floor moves ONLY on the
+        // TYPED classification field, corroborated against the shape
+        // this scheduler itself assigned — worker-supplied free text
+        // (error_msg) is display/narration and drives nothing. The
+        // bug_408 believed-store suppression applies IDENTICALLY: a
         // store-degraded failure is never a sizing signal, on either
-        // axis. Dedup: worker reports are once-per-attempt via the
-        // assignment token (the pull/report cycle), so one failed
-        // attempt bumps at most once — the durable-dedup precondition
-        // the parked arm's re-entry note named.
-        let floor_outcome = if !believed_store && error_msg.contains(rio_proto::CGROUP_OOM_MSG) {
-            self.bump_resource_floor(
-                drv_hash,
-                rio_proto::types::TerminationReason::OomKilled,
-                "cgroup_oom",
-            )
-            .await
-        } else if !believed_store && error_msg.contains(rio_proto::DISK_FULL_MSG) {
-            self.bump_resource_floor(
-                drv_hash,
-                rio_proto::types::TerminationReason::EvictedDiskPressure,
-                "disk_full",
-            )
-            .await
-        } else {
-            super::floor::FloorOutcome::default()
+        // axis.
+        //
+        // ENVELOPE (R29, enrolled in the wave's duration/envelope
+        // census; consumer: THIS gate): at most ONE doubling per
+        // corroborated incident IDENTITY — per unique
+        // (drv_hash, exec_id) — POPULATION-denominated, never
+        // wall-windowed (a wall window lets a paced forger ladder up
+        // anyway; N corroboration-free reports over any timespan move
+        // nothing). The identity law's durable half is the report
+        // admission fold: a terminal report is consumed once per exec
+        // (`fold_report` over the durable attempt row + the
+        // assignment-token dedup), so this gate runs at most once per
+        // exec and each ladder step burns a REAL scheduled attempt of
+        // the forger's own drv at the previously-assigned size — the
+        // honest path's cost, no amplification.
+        let floor_outcome = match report.sizing() {
+            Some(claim) if !believed_store => {
+                self.bump_floor_on_corroborated_claim(drv_hash, claim).await
+            }
+            _ => super::floor::FloorOutcome::default(),
         };
 
         if self.dag.node(drv_hash).is_none() {

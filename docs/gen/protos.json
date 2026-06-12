@@ -102,6 +102,8 @@
       "BuildLogBatch",
       "CompletionReport",
       "BuildResult",
+      "FailureClassification",
+      "QuotaTelemetry",
       "BuiltOutput",
       "WorkAssignment",
       "BuildOptions",

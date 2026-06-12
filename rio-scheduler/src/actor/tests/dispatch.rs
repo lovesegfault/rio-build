@@ -688,17 +688,25 @@ async fn cgroup_oom_doubles_mem_floor(
     let first_asgn = pull_attempt(&handle, tag).await;
     assert!(first_asgn.drv_path.contains(tag));
 
-    // Seed est_memory_bytes so the doubling has a base.
-    handle
-        .debug_seed_sched_hint(tag, Some(2 << 30), None, None, None)
-        .await?;
-
-    // Worker-reported CgroupOom → floor.mem doubled.
-    pull_complete_failure(
+    // bug_090: the floor consumes the TYPED claim, corroborated
+    // against the minted intent (free text drives nothing).
+    let minted_mem = expect_drv(&handle, tag)
+        .await
+        .sched
+        .last_intent
+        .as_ref()
+        .map(|i| i.mem_bytes)
+        .unwrap_or(0);
+    assert!(minted_mem > 0, "the pull mint stamps the intent");
+    pull_report(
         &handle,
         tag,
-        rio_proto::types::BuildResultStatus::InfrastructureFailure,
-        &format!("{}; bumping resource floor", rio_proto::CGROUP_OOM_MSG),
+        typed_sizing_failure(
+            rio_proto::types::FailureClass::CgroupOom,
+            "cgroup OOM during build; bumping resource floor",
+            None,
+            minted_mem,
+        ),
     )
     .await?;
     tick(&handle).await?;
@@ -709,8 +717,9 @@ async fn cgroup_oom_doubles_mem_floor(
             .sched
             .resource_floor
             .mem_bytes,
-        4 << 30,
-        "CgroupOom → mem floor doubled (2GiB→4GiB)"
+        minted_mem * 2,
+        "typed corroborated CgroupOom → mem floor doubled from the \
+         minted intent"
     );
     Ok(())
 }

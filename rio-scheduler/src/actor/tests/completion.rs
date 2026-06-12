@@ -1181,11 +1181,27 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
                 .debug_seed_sched_hint("ladder-drv", Some(prev_mem), None, None, None)
                 .await?;
         }
-        pull_complete_failure(
+        // bug_090: each rung is a typed claim corroborated at the
+        // CURRENT minted intent (the pull mints, then the report
+        // claims a peak at that shape — the honest ladder).
+        let exec_id = open_pull_exec(&handle, "ladder-drv").await;
+        let rung_mem = expect_drv(&handle, "ladder-drv")
+            .await
+            .sched
+            .last_intent
+            .as_ref()
+            .map(|i| i.mem_bytes)
+            .unwrap_or(0);
+        pull_report_exec(
             &handle,
+            exec_id,
             "ladder-drv",
-            rio_proto::types::BuildResultStatus::InfrastructureFailure,
-            &format!("{}; bumping resource floor", rio_proto::CGROUP_OOM_MSG),
+            typed_sizing_failure(
+                rio_proto::types::FailureClass::CgroupOom,
+                "cgroup OOM during build; bumping resource floor",
+                None,
+                rung_mem,
+            ),
         )
         .await?;
         let s = expect_drv(&handle, "ladder-drv").await;
@@ -1653,13 +1669,29 @@ async fn test_disk_full_report_doubles_disk_floor() -> TestResult {
         .debug_seed_sched_hint(drv, None, Some(25 << 30), None, None)
         .await?;
 
-    pull_complete_failure(
+    // bug_090: the typed claim, corroborated at the minted shape.
+    let exec_id = open_pull_exec(&handle, drv).await;
+    let minted_disk = expect_drv(&handle, drv)
+        .await
+        .sched
+        .last_intent
+        .as_ref()
+        .map(|i| i.disk_bytes)
+        .unwrap_or(0);
+    assert!(minted_disk > 0, "the pull mint stamps the disk intent");
+    pull_report_exec(
         &handle,
+        exec_id,
         drv,
-        rio_proto::types::BuildResultStatus::InfrastructureFailure,
-        &format!(
-            "{} (overlay prjquota exhausted); bumping disk floor",
-            rio_proto::DISK_FULL_MSG
+        typed_sizing_failure(
+            rio_proto::types::FailureClass::DiskFull,
+            "disk full during build (overlay prjquota exhausted); bumping disk floor",
+            Some(rio_proto::types::QuotaTelemetry {
+                peak_used_bytes: minted_disk - (1 << 20),
+                hard_limit_bytes: minted_disk,
+                node_free_bytes: 50 << 30,
+            }),
+            0,
         ),
     )
     .await?;
@@ -1709,22 +1741,39 @@ async fn test_floor_bump_store_suppression_parity(
         // degraded flag is BELIEVED (Paced/RunBound), not bare.
         handle.debug_mark_store_rpc_failure().await?;
     }
-    let msg = if oom {
-        format!("{}; bumping resource floor", rio_proto::CGROUP_OOM_MSG)
+    // bug_090: even a TYPED, CORROBORATED claim is suppressed by a
+    // believed-store attribution — corroboration gates forgery; the
+    // bug_408 law gates attribution. Claims corroborate at the
+    // minted shape.
+    let exec_id = open_pull_exec(&handle, drv).await;
+    let intent = expect_drv(&handle, drv)
+        .await
+        .sched
+        .last_intent
+        .as_ref()
+        .map(|i| (i.mem_bytes, i.disk_bytes))
+        .unwrap_or((0, 0));
+    let mut payload = if oom {
+        typed_sizing_failure(
+            rio_proto::types::FailureClass::CgroupOom,
+            "cgroup OOM during build; bumping resource floor",
+            None,
+            intent.0,
+        )
     } else {
-        format!("{}; bumping disk floor", rio_proto::DISK_FULL_MSG)
+        typed_sizing_failure(
+            rio_proto::types::FailureClass::DiskFull,
+            "disk full during build; bumping disk floor",
+            Some(rio_proto::types::QuotaTelemetry {
+                peak_used_bytes: intent.1.saturating_sub(1 << 20),
+                hard_limit_bytes: intent.1,
+                node_free_bytes: 50 << 30,
+            }),
+            0,
+        )
     };
-    pull_complete_failure_result(
-        &handle,
-        drv,
-        rio_proto::types::BuildResult {
-            status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
-            error_msg: msg,
-            store_degraded: believed_store,
-            ..Default::default()
-        },
-    )
-    .await?;
+    payload.result.store_degraded = believed_store;
+    pull_report_exec(&handle, exec_id, drv, payload).await?;
 
     let s = expect_drv(&handle, drv).await;
     let (mem, disk) = (
@@ -1748,6 +1797,237 @@ async fn test_floor_bump_store_suppression_parity(
         );
         assert_eq!(mem, 0, "…and ONLY the disk dimension");
     }
+    Ok(())
+}
+
+/// W11-W (bug_090) — proposition: NO persisted resource floor moves
+/// on unattested worker text. Population: {untyped,
+/// typed-uncorroborated, typed-corroborated} × {oom, disk}, plus the
+/// paced-forgery cell (N corroboration-free reports, arbitrarily
+/// spaced, produce ZERO ladder steps — the cap is
+/// population-denominated, never wall-windowed, R29; pacing is
+/// irrelevant because the gate is corroboration, not time).
+///
+/// The attack (the red this test was born failing on, pre-fix):
+/// `handle_infrastructure_failure` substring-matched the
+/// worker-supplied free-text `error_msg` against
+/// CGROUP_OOM_MSG/DISK_FULL_MSG to drive `bump_resource_floor` — a
+/// drv_hash-keyed (cross-tenant, M_095), GREATEST()-ratcheted,
+/// never-healed-downward persisted sizing decision riding the
+/// uncharged ExemptInfra lane. Three forged free-text reports
+/// completed the 25→50→100→200 GiB disk ladder; the only gate was
+/// `believed_store`, which a hostile builder simply doesn't set.
+///
+/// Post-fix: the floor bump consumes ONLY the typed
+/// `failure_classification` field, corroborated against the
+/// scheduler-assigned shape; free text is display/narration.
+// r[verify sched.trust.report-corroboration+2]
+#[tokio::test]
+async fn forged_free_text_never_moves_resource_floors() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let drv = "forge-floor-drv";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    // The 25 GiB rung — the ladder base the wave-10 incident rode.
+    handle
+        .debug_seed_sched_hint(drv, Some(2 << 30), Some(25 << 30), None, None)
+        .await?;
+
+    // Three forged FREE-TEXT reports (arbitrary pacing — the
+    // paced-forgery cell collapses to this population: zero
+    // corroborated incidents, zero steps).
+    for _ in 0..3 {
+        pull_complete_failure(
+            &handle,
+            drv,
+            rio_proto::types::BuildResultStatus::InfrastructureFailure,
+            &format!(
+                "{} (overlay prjquota exhausted); bumping disk floor",
+                rio_proto::DISK_FULL_MSG
+            ),
+        )
+        .await?;
+    }
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.sched.resource_floor.disk_bytes, 0,
+        "left (pre-fix): three forged free-text reports complete the \
+         25→50→100→200 GiB ladder — a persisted cross-tenant sizing \
+         decision moved on unattested display text / right: the \
+         substring channel is classify-only; the floor never moves \
+         without a typed corroborated classification"
+    );
+    assert_eq!(
+        s.sched.resource_floor.mem_bytes, 0,
+        "the forged text moves NO axis"
+    );
+    Ok(())
+}
+
+/// W11-W, the typed cells: an UNCORROBORATED typed classification is
+/// refused (telemetry absent, or inconsistent with the
+/// scheduler-assigned shape); a CORROBORATED one takes exactly ONE
+/// doubling per incident. Both axes.
+// r[verify sched.trust.report-corroboration+2]
+#[tokio::test]
+async fn typed_classification_bumps_only_with_corroboration() -> TestResult {
+    // Big ceilings: the corroborated cells assert a full doubling —
+    // the default test ceilings sit at the probe shape, where the
+    // at-cap law (a different cell) would absorb the bump.
+    let (_db, handle, _task) = setup_with_big_ceilings().await;
+
+    // ── disk axis ───────────────────────────────────────────────────
+    let drv = "typed-disk-drv";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    handle
+        .debug_seed_sched_hint(drv, Some(2 << 30), Some(25 << 30), None, None)
+        .await?;
+
+    // Typed but UNCORROBORATED: no telemetry at all.
+    pull_complete_failure_result(
+        &handle,
+        drv,
+        rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+            error_msg: "disk full during build (forged, no telemetry)".into(),
+            failure_classification: Some(rio_proto::types::FailureClassification {
+                class: rio_proto::types::FailureClass::DiskFull.into(),
+                quota: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.sched.resource_floor.disk_bytes, 0,
+        "typed-uncorroborated is REFUSED: no telemetry, no bump"
+    );
+
+    // Typed but INCONSISTENT: claims exhaustion of a limit far from
+    // the assigned shape (a forged tiny-quota exhaustion must not
+    // ladder the floor). 64 MiB is far below any minted disk shape.
+    pull_complete_failure_result(
+        &handle,
+        drv,
+        rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+            error_msg: "disk full during build (forged, tiny limit)".into(),
+            failure_classification: Some(rio_proto::types::FailureClassification {
+                class: rio_proto::types::FailureClass::DiskFull.into(),
+                quota: Some(rio_proto::types::QuotaTelemetry {
+                    peak_used_bytes: 64 << 20,
+                    hard_limit_bytes: 64 << 20,
+                    node_free_bytes: 50 << 30,
+                }),
+            }),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.sched.resource_floor.disk_bytes, 0,
+        "typed-but-inconsistent is REFUSED: the claimed limit does not \
+         match the shape the scheduler assigned"
+    );
+
+    // Typed + CORROBORATED: exhaustion AT the assigned size (read
+    // from the mint — the corroboration anchor the scheduler owns).
+    let exec_id = open_pull_exec(&handle, drv).await;
+    let minted_disk = expect_drv(&handle, drv)
+        .await
+        .sched
+        .last_intent
+        .as_ref()
+        .map(|i| i.disk_bytes)
+        .unwrap_or(0);
+    assert!(minted_disk > 0, "the pull mint stamps the disk intent");
+    pull_report_exec(
+        &handle,
+        exec_id,
+        drv,
+        typed_sizing_failure(
+            rio_proto::types::FailureClass::DiskFull,
+            "disk full during build (honest)",
+            Some(rio_proto::types::QuotaTelemetry {
+                peak_used_bytes: minted_disk - (1 << 20),
+                hard_limit_bytes: minted_disk,
+                node_free_bytes: 50 << 30,
+            }),
+            0,
+        ),
+    )
+    .await?;
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.sched.resource_floor.disk_bytes,
+        minted_disk * 2,
+        "typed + corroborated takes exactly ONE doubling from the \
+         minted shape"
+    );
+    assert_eq!(s.sched.resource_floor.mem_bytes, 0, "only its own axis");
+
+    // ── mem axis (oom) ──────────────────────────────────────────────
+    // No seeds: the default probe shape stays under the test
+    // ceilings (an at-cap bump is the at-cap law's cell, not ours).
+    let drv = "typed-oom-drv";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+
+    // Typed oom, UNCORROBORATED: the report's peak_memory is nowhere
+    // near the assigned memory shape (the corroboration anchor the
+    // scheduler itself minted at dispatch).
+    let mut payload = pull_payload(rio_proto::types::BuildResult {
+        status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+        error_msg: "cgroup OOM during build (forged, tiny peak)".into(),
+        failure_classification: Some(rio_proto::types::FailureClassification {
+            class: rio_proto::types::FailureClass::CgroupOom.into(),
+            quota: None,
+        }),
+        ..Default::default()
+    });
+    payload.peak_memory_bytes = 1 << 20;
+    pull_report(&handle, drv, payload).await?;
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.sched.resource_floor.mem_bytes, 0,
+        "typed oom with a peak far below the assigned shape is REFUSED"
+    );
+
+    // Typed oom, CORROBORATED: peak at the assigned limit (memory.peak
+    // saturates at memory.max under an oom kill). Fresh drv — the
+    // refused cell's forged tiny peak feeds the estimator, so cell
+    // isolation keeps the corroboration anchor clean.
+    let drv = "typed-oom-c-drv";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    let exec_id = open_pull_exec(&handle, drv).await;
+    let minted_mem = expect_drv(&handle, drv)
+        .await
+        .sched
+        .last_intent
+        .as_ref()
+        .map(|i| i.mem_bytes)
+        .unwrap_or(0);
+    assert!(minted_mem > 0, "the pull mint stamps the mem intent");
+    pull_report_exec(
+        &handle,
+        exec_id,
+        drv,
+        typed_sizing_failure(
+            rio_proto::types::FailureClass::CgroupOom,
+            "cgroup OOM during build (honest)",
+            None,
+            minted_mem,
+        ),
+    )
+    .await?;
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.sched.resource_floor.mem_bytes,
+        minted_mem * 2,
+        "typed + corroborated oom takes one doubling from the minted \
+         shape"
+    );
+    assert_eq!(s.sched.resource_floor.disk_bytes, 0, "only its own axis");
     Ok(())
 }
 
@@ -4577,6 +4857,7 @@ fn failure_ctx_store_evidence_only_on_infra_arm() {
         stop_time: None,
         built_outputs: Vec::new(),
         store_degraded: true,
+        failure_classification: None,
     };
     for status in [
         S::TransientFailure,
@@ -4592,7 +4873,7 @@ fn failure_ctx_store_evidence_only_on_infra_arm() {
         S::Cancelled,
         S::Unspecified,
     ] {
-        let ctx = crate::actor::completion::failure_ctx_for(status, &flagged, Some(7));
+        let ctx = crate::actor::completion::failure_ctx_for(status, &flagged, Some(7), 0);
         assert_eq!(
             ctx.store_degraded(),
             status == S::InfrastructureFailure,
@@ -5042,6 +5323,8 @@ async fn store_degraded_counter_ticks_only_on_commit() -> TestResult {
                 None,
                 "FUSE EIO: store unreachable",
                 true,
+                None,
+                0,
             ),
         )
         .await;
@@ -5069,6 +5352,8 @@ async fn store_degraded_counter_ticks_only_on_commit() -> TestResult {
                 None,
                 "FUSE EIO: store unreachable",
                 true,
+                None,
+                0,
             ),
         )
         .await;
@@ -5753,7 +6038,7 @@ async fn forged_output_path_never_reaches_path_tenants_on_any_lane() -> TestResu
 /// evidence for the reporting build's attributed cohort ⇒ a typed,
 /// counted, non-poisoning refusal of the STAMP (the report's other
 /// effects are unaffected; the drv still completes).
-// r[verify sched.trust.report-corroboration]
+// r[verify sched.trust.report-corroboration+2]
 #[tokio::test]
 async fn ca_no_upload_report_never_flips_visibility_on_any_lane() -> TestResult {
     use sha2::Digest;
@@ -5960,7 +6245,7 @@ async fn ca_no_upload_report_never_flips_visibility_on_any_lane() -> TestResult 
 /// the completion stamp widens to all interested tenants under the
 /// signed Q2 BuiltLocally law (locally produced bytes — all
 /// interested tenants lawful).
-// r[verify sched.trust.report-corroboration]
+// r[verify sched.trust.report-corroboration+2]
 #[tokio::test]
 async fn ca_honest_upload_then_report_stamps_as_today() -> TestResult {
     use sha2::Digest;

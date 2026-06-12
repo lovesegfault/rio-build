@@ -1199,6 +1199,28 @@ pub(crate) async fn pull_complete_success(
     .await
 }
 
+/// bug_090: a typed corroborated sizing-failure payload — the wire
+/// form the floor gate consumes (free text no longer drives floors).
+/// `peak_memory_bytes` is the oom corroborant; `quota` the disk one.
+pub(crate) fn typed_sizing_failure(
+    class: rio_proto::types::FailureClass,
+    error_msg: &str,
+    quota: Option<rio_proto::types::QuotaTelemetry>,
+    peak_memory_bytes: u64,
+) -> PullReportPayload {
+    let mut p = pull_payload(rio_proto::types::BuildResult {
+        status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+        error_msg: error_msg.into(),
+        failure_classification: Some(rio_proto::types::FailureClassification {
+            class: class.into(),
+            quota,
+        }),
+        ..Default::default()
+    });
+    p.peak_memory_bytes = peak_memory_bytes;
+    p
+}
+
 /// Pull-mode `complete_success_empty`: Built report with no outputs.
 pub(crate) async fn pull_complete_success_empty(
     handle: &ActorHandle,

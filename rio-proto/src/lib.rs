@@ -27,25 +27,23 @@ pub use rio_common::grpc::{
 /// can't drift again.
 pub const CONCURRENT_PUTPATH_MSG: &str = "concurrent PutPath in progress";
 
-/// Substring carried in `ExecutorError::CgroupOom`'s Display impl and
-/// matched by rio-scheduler's `handle_infrastructure_failure` to trigger
-/// `r[sched.sla.reactive-floor]`. Single source of truth so the
-/// `#[error]` attr and the `.contains()` consumer can't drift. The
+/// Substring carried in `ExecutorError::CgroupOom`'s Display impl —
+/// DISPLAY/NARRATION ONLY (bug_090): the scheduler's floor decision
+/// consumes the typed `BuildResult.failure_classification` field, not
+/// this text. Single source of truth for the human-facing message so
+/// the `#[error]` attr and the log/event surfaces can't drift; the
 /// `cgroup_oom_display_contains_proto_constant` test in rio-builder
-/// pins the Display side; the 8 scheduler test fixtures reference this
-/// constant so a rename forces all sites to update in lockstep.
+/// pins the Display side.
 pub const CGROUP_OOM_MSG: &str = "cgroup OOM during build";
 
-/// Substring carried in `ExecutorError::DiskFull`'s Display impl and
-/// matched by rio-scheduler's `handle_infrastructure_failure` to bump
-/// the derivation's DISK resource floor (live_057-a/-b — the
-/// [`CGROUP_OOM_MSG`] twin for the disk axis: an in-build ENOSPC from
-/// overlay prjquota exhaustion is a SIZING signal, not a build
-/// failure). Single source of truth so the `#[error]` attr and the
-/// `.contains()` consumer can't drift; the
-/// `disk_full_display_contains_proto_constant` test in rio-builder
-/// pins the Display side, and the scheduler fixtures reference this
-/// constant. A CONST, not a wire message — zero `.fields` impact.
+/// Substring carried in `ExecutorError::DiskFull`'s Display impl —
+/// DISPLAY/NARRATION ONLY (bug_090; the [`CGROUP_OOM_MSG`] twin for
+/// the disk axis, live_057-a/-b): the scheduler's floor decision
+/// consumes the typed `BuildResult.failure_classification` field, not
+/// this text. Single source of truth for the human-facing message;
+/// the `disk_full_display_contains_proto_constant` test in
+/// rio-builder pins the Display side. A CONST, not a wire message —
+/// zero `.fields` impact.
 pub const DISK_FULL_MSG: &str = "disk full during build";
 
 /// Round-9 B3 (Banner A-1): the cited consumer default for

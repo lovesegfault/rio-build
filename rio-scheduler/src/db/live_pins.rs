@@ -283,7 +283,7 @@ impl SchedulerDb {
     /// output) carries no confidentiality flip and is
     /// integrity-equivalent to a compromised builder uploading
     /// arbitrary CA content, which the threat model already prices.
-    // r[impl sched.trust.report-corroboration]
+    // r[impl sched.trust.report-corroboration+2]
     pub(crate) async fn paths_with_production_evidence(
         &self,
         output_paths: &[String],
@@ -1182,7 +1182,7 @@ mod registration_writer_census {
             .expect("the floor-promotion caller alphabet is census-pinned");
     }
 
-    // r[verify sched.trust.report-corroboration]
+    // r[verify sched.trust.report-corroboration+2]
     /// bug_132 commit 2 (W11-S, the R22″ machine-bind): the CA-face
     /// residual pricing is BOUND to the compensating control's firing
     /// predicate instead of self-reported prose. Two pinned needles
@@ -1297,5 +1297,181 @@ mod registration_writer_census {
             Some(&1),
             "plant premise: the strawman constructs the witness"
         );
+    }
+
+    // r[verify sched.trust.report-corroboration+2]
+    /// bug_090 commit 6 (W11-X, the R22″ derivation-layer form of
+    /// W10-N): the worker→scheduler trust census derives PER-BOUNDARY
+    /// from the PROTO SCHEMA — the field universe of the completion
+    /// report family (CompletionReport, BuildResult,
+    /// FailureClassification, QuotaTelemetry, BuiltOutput) is parsed
+    /// from the embedded `build_types.proto` ([GEN-SET]: generated
+    /// from the wire contract, never author-enumerated), and EVERY
+    /// field must carry a disposition row naming how the scheduler
+    /// treats it. A new wire field on this boundary is census-RED
+    /// until its consumer pricing is filed — the bug_090 hole was
+    /// exactly a sibling field (`error_msg`) whose floor-bump
+    /// consumer sat outside the needle-derived census.
+    #[test]
+    fn completion_report_schema_census() {
+        let universe = completion_report_field_universe(PROTO_BUILD_TYPES);
+        let rows = completion_report_dispositions();
+        let missing: Vec<&String> = universe
+            .iter()
+            .filter(|f| !rows.contains_key(f.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "wire fields on the worker→scheduler completion boundary \
+             with NO disposition row (file the consumer pricing): \
+             {missing:?}"
+        );
+        let stale: Vec<&&str> = rows.keys().filter(|k| !universe.contains(**k)).collect();
+        assert!(
+            stale.is_empty(),
+            "disposition rows for fields no longer on the wire \
+             (remove with the field): {stale:?}"
+        );
+    }
+
+    /// W11-X's planted red (R22″, one level down): a STRAWMAN wire
+    /// field entering at the SCHEMA layer (the raw proto text) with
+    /// no disposition row MUST go census-red NAMING the field.
+    /// Runtime-assembled so this file never matches the parser
+    /// itself.
+    #[test]
+    fn schema_census_plants_red_on_unpriced_field() {
+        let strawman = format!(
+            "{}\nmessage BuildResult {{\n  string exfiltration_channel = 99;\n}}\n",
+            PROTO_BUILD_TYPES
+        );
+        let universe = completion_report_field_universe(&strawman);
+        assert!(
+            universe.contains("BuildResult.exfiltration_channel"),
+            "plant premise: the parser sees the strawman field"
+        );
+        let rows = completion_report_dispositions();
+        let missing: Vec<&String> = universe
+            .iter()
+            .filter(|f| !rows.contains_key(f.as_str()))
+            .collect();
+        assert_eq!(
+            missing,
+            vec![&"BuildResult.exfiltration_channel".to_string()],
+            "an unpriced sibling field MUST be the one missing row, \
+             named verbatim"
+        );
+    }
+
+    /// The boundary schema, embedded at compile time (the same
+    /// (vvvvv) posture as CENSUS_SOURCES: the nix gate runs test
+    /// binaries without the source tree).
+    const PROTO_BUILD_TYPES: &str = include_str!("../../../rio-proto/proto/build_types.proto");
+
+    /// Parse the completion-report family's `Message.field` universe
+    /// out of proto text. Line-grammar parser over message blocks —
+    /// reserved/option/comment/nested-type lines are skipped; a field
+    /// line is `[repeated|optional] Type name = N;`.
+    fn completion_report_field_universe(proto: &str) -> std::collections::BTreeSet<String> {
+        const FAMILY: &[&str] = &[
+            "CompletionReport",
+            "BuildResult",
+            "FailureClassification",
+            "QuotaTelemetry",
+            "BuiltOutput",
+        ];
+        let mut out = std::collections::BTreeSet::new();
+        let mut current: Option<&str> = None;
+        let mut depth = 0usize;
+        for raw in proto.lines() {
+            let line = raw.split("//").next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            if current.is_none() {
+                if let Some(rest) = line.strip_prefix("message ") {
+                    let name = rest.split_whitespace().next().unwrap_or("");
+                    if FAMILY.contains(&name) {
+                        current = Some(FAMILY.iter().find(|f| **f == name).unwrap());
+                        depth = line.matches('{').count();
+                    }
+                }
+                continue;
+            }
+            depth += line.matches('{').count();
+            depth = depth.saturating_sub(line.matches('}').count());
+            if depth == 0 {
+                current = None;
+                continue;
+            }
+            let msg = current.unwrap();
+            if line.starts_with("reserved")
+                // `option ` exactly — `optional Type field` is a FIELD
+                // (the bug class this parser exists to catch would
+                // love an optional-field blind spot).
+                || line.starts_with("option ")
+                || line.starts_with("oneof")
+                || line.starts_with("enum")
+                || line.starts_with("message")
+                || line.starts_with('}')
+            {
+                continue;
+            }
+            // `[repeated|optional] Type name = N;`
+            let body = line
+                .strip_prefix("repeated ")
+                .or_else(|| line.strip_prefix("optional "))
+                .unwrap_or(line);
+            let mut parts = body.split_whitespace();
+            let (Some(_ty), Some(name), Some(eq)) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            if eq.starts_with('=') || eq == "=" {
+                out.insert(format!("{msg}.{name}"));
+            }
+        }
+        out
+    }
+
+    /// The disposition table: per wire field, HOW the scheduler
+    /// treats it (the consumer pricing record — the census IS the
+    /// boundary doc). Adding a wire field without a row here is
+    /// census-RED.
+    fn completion_report_dispositions() -> BTreeMap<&'static str, &'static str> {
+        [
+            // ── CompletionReport ────────────────────────────────
+            ("CompletionReport.drv_path", "identity key; two-key resolve at intake (hash-or-path); never persisted raw"),
+            ("CompletionReport.result", "the BuildResult payload — every sub-field priced below"),
+            ("CompletionReport.assignment_token", "HMAC-verified at the pull boundary; the once-per-exec dedup anchor"),
+            ("CompletionReport.peak_memory_bytes", "telemetry; build_samples + the CGROUP_OOM corroborant (consumed ONLY through the corroboration gate vs the assigned shape)"),
+            ("CompletionReport.peak_cpu_cores", "telemetry; build_samples only — no decision dispatches on it"),
+            ("CompletionReport.node_name", "attribution; hw join + failed_builders exclusion key"),
+            ("CompletionReport.final_resources", "telemetry snapshot; build_samples only"),
+            ("CompletionReport.hw_class", "attribution; sample normalization only"),
+            ("CompletionReport.final_line_count", "log-completeness watermark; range-checked at the stamp (0/overflow → NULL)"),
+            // ── BuildResult ─────────────────────────────────────
+            ("BuildResult.status", "decision input via the TOTAL status→handler routing match (typed enum, unknown → Unspecified)"),
+            ("BuildResult.error_msg", "DISPLAY/NARRATION ONLY (bug_090): events/logs/attempt rows; the floor gate never reads it; the I-127 CONCURRENT_PUTPATH cap exemption reads a builder-constructed prefix (bounded: cap-exemption only, no persisted state)"),
+            ("BuildResult.start_time", "telemetry; duration derivation only"),
+            ("BuildResult.stop_time", "telemetry; duration derivation only"),
+            // concat!-split so the taint census's own needle never
+            // matches this table's source text.
+            (concat!("BuildResult.", "built_outputs"), "the W10-N taint object — shape/name/membership/evidence-gated per sched.trust.report-membership+2 (the per-consumer census above)"),
+            ("BuildResult.store_degraded", "constructor-gated to the infra arm (C3); corroboration via the two-node sighting law before the uncharged class"),
+            ("BuildResult.failure_classification", "the bug_090 TYPED sizing channel — consumed ONLY through the corroboration gate (bump_floor_on_corroborated_claim: telemetry vs the assigned shape; refusals counted classify-only)"),
+            // ── FailureClassification ───────────────────────────
+            ("FailureClassification.class", "closed sizing alphabet; Unspecified/unknown decodes to NO claim (Q6 legacy)"),
+            ("FailureClassification.quota", "the DISK_FULL corroborant triple — verified against the assigned disk shape, never trusted bare"),
+            // ── QuotaTelemetry ──────────────────────────────────
+            ("QuotaTelemetry.peak_used_bytes", "corroborant; must be ≥ half the claimed limit"),
+            ("QuotaTelemetry.hard_limit_bytes", "corroborant; must sit within [assigned/2, assigned×4]"),
+            ("QuotaTelemetry.node_free_bytes", "narration; the producer's predicate input (not re-verified — the limit/peak pair carries the corroboration)"),
+            // ── BuiltOutput ─────────────────────────────────────
+            ("BuiltOutput.output_name", "declared-name membership + dedup at both lanes"),
+            ("BuiltOutput.output_path", "the flip axis — expected-set membership (IA/fixed) or production evidence (floating-CA), per the membership law"),
+            ("BuiltOutput.output_hash", "32-byte length-checked at the realisation insert; content authority stays with the store's verify"),
+        ]
+        .into()
     }
 }
