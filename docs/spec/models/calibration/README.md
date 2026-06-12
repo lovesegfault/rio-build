@@ -85,3 +85,65 @@ expect-violation checks (`quint-ctrl-calib-*`, `quint-refcount-calib-*`,
 `quint-materialization-calib-*`);
 the rest are evidence modules, re-runnable on demand with the command
 above.
+
+## materializationJob (substitution-replacement campaign) — the §9.3 calibration-transfer verdicts
+
+> Relocated verbatim from the retired substitution-replacement invariant
+> map (Phase C-prime stage record). The campaign archive is
+> `docs/spec/models/substitution-replacement-records.md`; the exhaustive
+> measurement table lives in the `materializationJob.qnt` header.
+
+### The calibration-transfer table (go/no-go criterion 1 — every §9.3 row dispositioned)
+
+Protocol: falsification first (the override must VIOLATE its predicted
+property under `calibStep`), then the baseline (the as-built step at
+the SAME constants must HOLD it). Falsifications run under BOTH
+backends (rust simulator at 400 K × 14, then TLC first-violation —
+verdict @ depth/states/wall below; development-host runs at quint's
+default TLC width — the WIRED budgets are each pin's CI-builder
+transcript, which is the width the check runs at by construction, e.g.
+F8 8.5 s / F4 2.2 s in the build logs); baselines under the rust
+simulator at 400 K × 15 (the bounded-coverage form) — the exhaustive
+baseline conjunctions are the same unconverged manual targets as the
+regime exhaustives. Worker counts are labeled on every bounded-prefix
+figure (the orchestrator's comparability rule); the 60-worker entries
+are the reference-budget coordinates. Override modules: `docs/spec/models/calibration/mat-*.qnt`
+(21 modules); wired pins: `quint-materialization-calib-*` (19 checks).
+
+| §9.3 family / rep | Override (pre-fix behavior) | Predicted property | Falsification (TLC @ calibStep) | Baseline (as-built step) | Disposition |
+|---|---|---|---|---|---|
+| F8 (CE-33→A1) + F13 (CE-58→B8) | builder pull ignores the job view + the A11 judgment | `noFromSourceWhileJobUnresolved` | **VIOLATED** — depth 12, 10,832 distinct, 17 s | HOLDS (sim 400 K) | MET (the anchor; WIRED). F13 shares the model's single pull site per the design's own "same check as F8" |
+| F10 L1-half (CE-48(i)→L1) | failover drops the view, no rebuild | `unresolvedJobAlwaysArmed` | **VIOLATED** — depth 10, 1,260 distinct, 13 s | HOLDS | MET (WIRED) |
+| F10 A3-half (CE-45→A3) | — | — | — | — | BY-CONSTRUCTION: no recovery clear gate exists in the job architecture (failover clears no marks; the only mark consumers are the resolution sites and the fail-fast). Argument recorded against `failover`'s frame |
+| B5(a) (`4e57180fd`) | dedup re-feed overwrites armament state | `unresolvedJobAlwaysArmed` | **VIOLATED** — depth 7, 382 distinct, 13 s | HOLDS | MET (WIRED) |
+| CE-17 / F6-hazard / F2(a) | success consumption skips the coverage re-check | `successConsumptionCoversLiveWanted` | **VIOLATED** — depth 10, 703 distinct, 13 s | HOLDS | MET (WIRED; the CE-17 corpus anchor). F6's latch state is by-construction gone (no never-forgive bookkeeping exists); the hazard class (wanted growth racing consumption) is this row |
+| F2(b) / BC-3 | establishment adopts on output presence | `successConsumptionCoversLiveWanted` | **VIOLATED** — depth 14, 3,179 distinct, 15 s | HOLDS | MET (WIRED) |
+| F3 soundness (CE-61→B3) (i) | InfraFailure charged as Unobtainable (unverified) | `noWrongfulTerminalFailure` | **VIOLATED** — depth 15, 41,494 distinct, 27 s | HOLDS | MET (WIRED). Re-point note: the design predicted `noWrongfulFromSourceRouting`; at this model the corrupted charge surfaces through the spent-one-shot fail-fast (the `unobChargeBacked` oracle) — within-family re-route, recorded |
+| F3 soundness (ii) / E5 | budget exhaustion fails the node (no park) | `materializationNeverPoisons` | **VIOLATED** — depth 12, 1,532 distinct, 14 s | HOLDS | MET (WIRED) |
+| F3 permissiveness (CE-60/3→C2) | report's missing paths unverified upstream | `noWrongfulFromSourceRouting` | **VIOLATED** — depth 12, 1,580 distinct, 14 s | HOLDS | MET (WIRED). The by-construction half (routing requires a completed execution) is structural: every consumption requires an open mat-kind attempt |
+| F7 (CE-30/28→A3) | un-keyed resolution (no attempt, no exec id) | `jobResolutionSound` | **VIOLATED** — depth 7, 281 distinct, 13 s | HOLDS | MET (WIRED) |
+| F9 (CE-41→A5 re-pointed) | routing trusts a divergent in-memory child view | `routingRequiresDurableVouchOrFailFast` | **VIOLATED** — depth 11, 1,660 distinct, 14 s | HOLDS | MET (WIRED). The hole-stamp half is by-construction (no holes; no DAG edges in-model; production routing reads the durable relation) |
+| F11 (CE-50→A18, extended) | stale-tenure job resolve APPLIES (no fence) | `fencedJobWritesOnly` | **VIOLATED** — depth 9, 1,059 distinct, 15 s | HOLDS | MET (WIRED; the a17-unfenced analogue for job-table writes). The regime-comparison half: the no-stale-alphabet regimes hold by construction (`ENABLE_STALE_TENURE`) |
+| F1 soundness (CE-2→B9) | — | — | — | — | KEPT GUARD: the stale-Produced verify is untouched production machinery; its oracle (`quint-closure-calib-f1-stale-produced`) stays wired and green; the new model carries the stale-reset SHAPE (Δ4: `OStaleReset` reset-from-Completed, `staleResetRun` + witness) |
+| F1 permissiveness (CE-1→C4) | creation without the presence re-check (the covered-creation delta space) | **predicted NO-falsify** | The §9.1 conjunction over `calibStep`: sim 500 K **[ok]**; TLC bounded zero-violation prefix of 546,655 distinct / depth 14 / 15-min cap at 60 workers (unconverged — recorded as bounded coverage). Reachability: `noCoveredCreationJob` **VIOLATED** (TLC depth 9, 655 distinct — the space is real) | conjunction HOLDS as-built (the regime evidence) | MET, BY-CONSTRUCTION + kept guard re-pointed: a covered-creation cannot produce the CE-1 harm (no build attempt exists for an unresolved-job node; the job resolves by Success coverage). The OLD-model override re-run (`closure-f1-skip-store-recheck` × C4): **still VIOLATED** (5,013 distinct, 55 s) — the kept guard's falsifiability re-validated |
+| F4 B4-half (CE-13→B4) | coverage over the dead-inclusive stored union | `interestUnionLiveOnly` | **VIOLATED** — depth 11, 1,432 distinct, 2.2 s (the wired check's transcript) | HOLDS (sim 400 K) | MET (WIRED). The Success-coverage override half is the CE-17 row |
+| F4 B10-half (CE-66→B10) | — | — | — | — | KEPT GUARD: the prune demand set is untouched; `quint-closure-calib-f4-demand-drop` stays wired and green |
+| F5 (CE-16→B5) PP-5(i) | a build's relation write replaces the other builds' rows | `crossBuildWantedIsolation` | **VIOLATED** — depth 11, 1,352 distinct, 13 s | HOLDS | MET (WIRED). Re-point note: the design predicted `interestUnionLiveOnly`; the per-build write-history ghost is the direct PK-isolation oracle (the live-union latch reads decisions, not rows) — recorded |
+| F5 PP-5(ii) (same-build narrowing) | — | — | `noWantedRewrite` witness **VIOLATED** (reachable) | — | DOCUMENTED-INTENDED (the sign-off evidence): the as-built upsert allows same-build narrowing; recorded as a reachable behavior, not a violation — the draft's write-once guard was corrected to the as-built upsert |
+| F14 (CE-48(i)/CE-52→L1) | — | — | — | — | BY-CONSTRUCTION: no Substituting status exists in the model (fresh flag-on work never reaches the walk — the T-5.3 zero-walk audit + `flag_on_fresh_work_never_walks` own that boundary; legacy-state absorption is VM-tested). The L1 successor is the F10 row |
+| C5 / CE-7 (the 0d deferred manual target) | (the F4 dead-union override IS the re-introduced behavior) | `interestUnionLiveOnly` | the F4 row's falsification | the F4 row's baseline | **CLOSED BY CONSTRUCTION, with the falsification the 0d deferral asked for**: no stored union exists (the §6 join is live-only and derived; `buildTerminal` drops rows atomically), AND the dead-union override demonstrates the latch re-finds exactly the stored-union behavior if re-introduced. Owner sign-off flagged (closes a standing 0d open item) |
+| B2-strong / GC-after-vouch (a) | ingest without the pin INSERT | `pinCoversIngestUntilAllInterestTerminal` | **VIOLATED** — depth 13, 1,438 distinct, 14 s (the GC trace shape re-found) | HOLDS — after the encoding correction recorded above (the release-window artifact; the FIRST baseline run violated and was triaged to the model, not the product) | MET (WIRED; the §9.3 flip executed: the old expect-violation probe's class is now a holds-property + this pin). Shape (b) narrows into B9 (kept guard row) |
+| C1-strict (PP-6) | — | — | — | — | UPGRADED + WIRED: `wrongfulFailFastBoundedPerJob` (≤1 per drv-lifetime, justified) sits in the holds conjunction; non-vacuity via the fail-fast witness; closes the AW2 open item favorably. The bound is per-DRV-history (the as-built `count_materialization_rows_in_history` read — stricter than the design's per-job phrasing; the resubmit lane is out of the §9.1 alphabet, recorded) |
+| PP-4 (i) | mat establishment writes executor_crash | `materializationInvisibleToBuildBudgets` | **VIOLATED** — depth 10, 579 distinct, 14 s | HOLDS | MET (WIRED) |
+| PP-4 (ii) | establishment closes charge-free | `materializationCrashChargedOnce` | **VIOLATED** — depth 12, 1,307 distinct, 14 s | HOLDS | MET (WIRED). Re-point note: the design's "falsifies unresolvedJobAlwaysArmed (never settled)" is a liveness shape; its safety-checkable core is the charge-once discipline — recorded |
+| dedup (the partial-unique index) | creation without the one-unresolved-job arbitration | `atMostOneUnresolvedJobPerDrv` | **VIOLATED** — depth 12, 1,427 distinct, 14 s | HOLDS | MET (WIRED; the C′ handoff's slot-widening executed via the dupJob second-slot ghost) |
+| B4 / Δ2b (`056bfc9b6`) | probe creation without the backfill | `creationLeavesTenantResolvable` | **VIOLATED** — depth 10, 1,487 distinct, 15 s | HOLDS | MET (WIRED) |
+| B1 / Δ6 (`7c9b9f949`) | claim refuses marked nodes (the pre-B1 A11 arm) | **witness flip** (liveness) | as-built direction: `noMarkedClaim` **VIOLATED** (TLC depth 13, 12,720 distinct, 17 s — wired witness); pre-fix direction: NOT violated — sim 300 K [ok]; TLC bounded zero-violation prefix of 2,338,887 distinct states / depth 18 / 24.5 min at auto(192) workers (unconverged — the [ok] direction cannot early-exit; the prefix is the bounded-coverage record) | §9.1 conjunction green under the override (a refusal strands, never corrupts) — sim 300 K [ok] | MET (witness-flip form; the B1 regression guard is the wired marked-claim witness) |
+| B3 / Δ2a (`ce17c6445`) | redial removed from the alphabet | **witness flip** (liveness) | as-built direction: `noPostFailoverClaim` **VIOLATED** (TLC depth 9, 808 distinct, 14 s — wired witness); pre-fix direction: NOT violated — sim 300 K [ok]; TLC bounded zero-violation prefix of 426,036 distinct / depth 14 / 10-min cap at 60 workers — the dead-end made visible as unreachability | §9.1 conjunction green under the override — sim 300 K [ok] | MET (witness-flip form; the B3 liveness guard is the wired post-failover-claim witness) |
+
+**Headline: zero transfer failures.** Every row predicted to falsify
+falsified (18/18, both backends); every baseline held (after one
+model-side recalibration, recorded above); every by-construction row
+carries a structural argument against the final code shape; both
+liveness rows flipped exactly as predicted. No stop-and-report
+condition fired.

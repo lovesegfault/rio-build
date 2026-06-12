@@ -196,8 +196,7 @@ pub struct ServiceClaims {
     /// built — no consumer derives destructive attribution from
     /// `instance`, and `credential_for` (the scheduler's family
     /// chokepoint) is the single place a future per-replica binding
-    /// would land. Recorded in
-    /// substitution-replacement-invariant-map.md (Phase-B obligation 1).
+    /// would land (the Phase-B obligation-1 record).
     ///
     /// **Wire-compat (the bug_011 pattern, same as
     /// [`AssignmentClaims::tenant`] — scoped per the precedent's own

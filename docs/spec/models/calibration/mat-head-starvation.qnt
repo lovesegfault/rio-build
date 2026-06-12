@@ -8,7 +8,7 @@
 // forever. The production fix decouples the listing window from the
 // claim budget (max(16, slots*8)) with in-pass refusal skip.
 //
-// Encoding note (recorded in the invariant map): the natural sim
+// Encoding note: the natural sim
 // encoding "younger claimed while older pending" is EDGE-shaped — the
 // pending head can legitimately appear AFTER a younger claim opened,
 // so the state form is reachable under any claim ordering and cannot

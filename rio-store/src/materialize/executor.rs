@@ -1908,8 +1908,7 @@ async fn pin_materialized_path(
 /// ChargeInfra — a GET 5xx charges, so a HEAD 5xx must too). The
 /// per-call deadline cut also charges: it is our own budget
 /// infrastructure failing to classify, not upstream politeness
-/// (rationale recorded in the substitution-replacement invariant
-/// map).
+/// (a recorded campaign decision).
 /// bug_194: THE class→(label, message) chokepoint shared by the
 /// attempt and probe legs. Transient classes (rate-limited / raced)
 /// get NEUTRAL text plus their label — their deferral is uncharged

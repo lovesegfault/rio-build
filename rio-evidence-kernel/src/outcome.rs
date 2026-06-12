@@ -17,8 +17,8 @@
 //! class alphabet. The kani harness sweeps the entire table; the
 //! enumeration unit test pins each row.
 //!
-//! Scope narrowing (recorded in the substitution-replacement invariant
-//! map): `Stalled` and `AdmissionSaturated` STAY `ChargeInfra` by
+//! Scope narrowing (a recorded campaign decision): `Stalled` and
+//! `AdmissionSaturated` STAY `ChargeInfra` by
 //! design — the stall-abort contract (`store.substitute.stall-abort`)
 //! deliberately reports infrastructure failure so the strike ladder
 //! and the park budget see stalls, and a saturated per-replica

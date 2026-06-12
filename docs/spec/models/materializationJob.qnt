@@ -7,8 +7,8 @@
 // substitution mechanism (the walk machinery, the Substituting status,
 // the coexistence flag and both evidence columns were deleted in Waves
 // D3-D6; migration 080). The six Phase-B behavior deltas are encoded
-// here (the stage record's "C-prime handoff" delta list,
-// substitution-replacement-invariant-map.md), with the D-prime
+// here (the C-prime handoff delta list, encoded per-delta below),
+// with the D-prime
 // adjustment recorded per affected delta:
 //
 //   Delta 1 — the pruned-origin discriminator (c952e5a51,
@@ -168,10 +168,60 @@
 // Witnesses: one canReach* per contended scenario (see section 6b).
 // The calibration-transfer table (which override falsifies which
 // property, and the by-construction rows) lives in
-// substitution-replacement-invariant-map.md's C-prime stage record;
+// calibration/README.md (the materializationJob verdict section);
 // the override modules are docs/spec/models/calibration/mat-*.qnt.
-// Measured state counts / depths / wall-clocks live in the
-// introducing commits and the check transcripts, never here.
+// Measured state counts / depths / wall-clocks for the WIRED checks
+// live in the introducing commits and the check transcripts, never
+// here; the unconverged MANUAL-TARGET coordinates (the budget
+// record) are the MEASUREMENT block below.
+//
+// MEASUREMENT BLOCK (the exhaustive budget record, relocated from
+// the retired substitution-replacement invariant map, C-prime stage
+// record; A3/A4 update: the manual sweep now spans the 36-invariant
+// post-A4 conjunction — the bounded-simulation holds checks plus the
+// calibration pins are the gate-wired deliverable, unchanged in
+// shape from C-prime):
+// ### Exhaustive measurement table (the budget record)
+//
+// Coordinates: TLC BFS, 60 workers (the house-budget worker count),
+// 10-min caps for the Ex measurements (the 15-min-hard rule's
+// determination form: every run below was still mid-frontier with a
+// growing queue at its cap — none is within reach of a 30-min
+// convergence either, per the B1-flip 24.5-min/192-worker corroboration
+// at the BaseEx scope). Manual-target command shape:
+//
+//     quint verify --backend=tlc --main=materializationJob<Scope>Ex \
+//       --invariant=<the 21-name §9.1 conjunction> \
+//       docs/spec/models/materializationJob.qnt
+//
+// | Scope (as-built step, full conjunction) | Verdict @ cap | Bounded coverage |
+// |---|---|---|
+// | materializationJobBaseEx | unconverged @ 10 min | zero violation through 435,251 distinct / depth 14 |
+// | materializationJobFailoverEx | unconverged @ 10 min | zero violation through 500,327 distinct / depth 14 |
+// | materializationJobAdversarialStoreEx | unconverged @ 10 min | zero violation through 406,878 distinct / depth 16 |
+// | materializationJobStaleTenureEx | unconverged @ 10 min | zero violation through 475,795 distinct / depth 14 |
+// | materializationJobCrashLoopEx | unconverged @ 10 min | zero violation through 400,001 distinct / depth 14 |
+// | (corroboration) matCalibB1ClaimRefusesMarked @ calibStep — a strict SUBSET of the as-built BaseEx space | unconverged @ 24.5 min, auto(192) workers | zero violation through 2,338,887 distinct / depth 18, queue still growing — the superset (as-built BaseEx) therefore cannot converge at 30 min either |
+//
+// Design-scale (2-drv) regimes are strict supersets of their Ex scopes
+// and are not separately measured (the executor/closure precedent: a
+// scope whose reduction does not converge is recorded once). The
+// `longChecks` Tier-2 mechanism stays empty — no conjunction fits the
+// 15-30-min window; pressure to change shard knobs remains
+// stop-and-report per the standing rule.
+//
+// Width posture (the orchestrator resource directive, applied): the
+// 60-worker rows above are the reference-budget coordinates (comparable
+// to the house budgets and the Wave-4 floor); the directive's
+// wide-instance allowance was additionally exploited for a deepening
+// wave on the two most-cited bounded-coverage rows — scale-annotated
+// below their reference entries:
+//
+// | Deepened row | @ 90 workers (15-min cap) |
+// |---|---|
+// | matCalibF1NoPresenceRecheck × the §9.1 conjunction (calibStep) | zero violation through 818,905 distinct / depth 15 (unconverged @ 15-min cap) |
+// | materializationJobBaseEx × the §9.1 conjunction (as-built) | zero violation through 919,952 distinct / depth 16 (unconverged @ 15-min cap) |
+//
 module materializationJob {
   // --- 1. types -----------------------------------------------------------
 
