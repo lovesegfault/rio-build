@@ -1236,10 +1236,11 @@ pub async fn run_lease_loop_with<H: LeaseHooks>(
 /// route through the observe-held funnel.
 #[allow(clippy::too_many_arguments)]
 fn consume_own_commit_evidence<H: LeaseHooks>(
+    mode: ConsumeMode,
+    anchor_age: Duration,
     led: UnconfirmedPut,
     f: &election::FetchFacts,
     blind: &mut BlindClock,
-    now: Duration,
     state: &LeaderState,
     standing: &mut LeaseStanding,
     marks_dirty: &DirtyGen,
@@ -1249,26 +1250,31 @@ fn consume_own_commit_evidence<H: LeaseHooks>(
     blind.stamp(led.anchor);
     // merged_bug_122: the stamp is unconditional (the evidence is
     // real and the ledger is consumed) but the ACQUIRE is
-    // fence-gated. A ledger anchor already past SELF_FENCE_AFTER at
-    // consumption time makes the acquire provably futile — the
-    // trailing maybe_self_fence in the same arm would re-fence it
-    // before the next await, churning hooks/marks/recovery once per
-    // round of a slow-commit brownout.
-    let anchor_age = blind.blind_for(now);
-    if anchor_age > SELF_FENCE_AFTER {
+    // fence-gated. A ledger anchor already past the acquire futility
+    // gate ([`evidence_acquire_futile`] — the one producer, shared
+    // with the Completed-round derivation) makes the acquire provably
+    // futile — the trailing maybe_self_fence in the same arm would
+    // re-fence it before the next await, churning hooks/marks/recovery
+    // once per round of a slow-commit brownout.
+    if matches!(mode, ConsumeMode::StampOnly) {
         info!(
             ?anchor_age,
             "own-commit evidence consumed, but its anchor is already \
              past the fence deadline — staying fenced (an acquire \
              here would be re-fenced this same arm)"
         );
-    } else if !standing.believes() {
+    } else if matches!(mode, ConsumeMode::Restore) {
         // A self-fence inside the mid-band window already ran the
         // lose edge; the evidence proves the apiserver still (or
         // again) names us holder, so re-enter through the ordinary
         // acquire edge with the FETCHED transition count — the
         // same-count case is the documented same-epoch re-acquire
         // (generation fetch_max no-op, in-flight work survives).
+        debug_assert!(
+            !standing.believes(),
+            "ConsumeMode::Restore derives only from a not-believing snapshot \
+             (ConsumeMode::derive is the one producer; kani agreement proof)"
+        );
         let new_gen = state.on_acquire(f.transitions);
         info!(
             generation = new_gen,
@@ -1292,6 +1298,11 @@ fn consume_own_commit_evidence<H: LeaseHooks>(
         // the same observe-completed-read body (a foreign term that
         // completed inside the observation gap rebounds here exactly
         // as on a Completed round).
+        debug_assert!(
+            standing.believes(),
+            "ConsumeMode::Funnel derives only from a believing snapshot \
+             (ConsumeMode::derive is the one producer; kani agreement proof)"
+        );
         observe_held_while_believing(
             state,
             standing,
@@ -1347,7 +1358,7 @@ fn observe_held_while_believing<H: LeaseHooks>(
 /// vs eliminating spurious DAG/outbox wipes on own-write races.
 /// Formal: leaderElection.qnt `loseRequiresHolderEvidence` invariant +
 /// falsify twin (lease-085-blind-conflict-lose).
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompletedLoseEvidence {
     /// A completed read resolved Standby: the apiserver named another
     /// holder (or the observed record says the holder is fresh and it
@@ -1624,6 +1635,282 @@ fn route_act_failed_read(
     }
 }
 
+/// The act half of a Completed round as a derivation cell — the
+/// [`election::ElectionResult`] alphabet with the `transitions` payload
+/// projected out (the executor re-binds it from the result; the
+/// derivation needs only the shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActCell {
+    Leading,
+    Standby,
+    Conflict,
+}
+
+impl ActCell {
+    #[cfg(any(test, kani))]
+    const ALL: [Self; 3] = [Self::Leading, Self::Standby, Self::Conflict];
+
+    fn of(result: &ElectionResult) -> Self {
+        match result {
+            ElectionResult::Leading { .. } => Self::Leading,
+            ElectionResult::Standby => Self::Standby,
+            ElectionResult::Conflict => Self::Conflict,
+        }
+    }
+}
+
+/// The completed GET's evidence, pre-folded to the routing law's cells
+/// plus the one time-derived fact the evidence leg consumes — read ONCE
+/// at round entry, before any mutation (merged_bug_053: the round's
+/// inputs are a coherent snapshot, not three reads of mutating state).
+#[derive(Debug, Clone, Copy)]
+struct ReadFacts {
+    holder: HolderCell,
+    content: ContentCell,
+    ledger: LedgerCell,
+    /// The armed ledger entry's anchor age is past the evidence-acquire
+    /// futility gate ([`evidence_acquire_futile`] — the ONE producer of
+    /// that verdict, shared with the act-failed executor). Meaningful
+    /// only when the evidence cell routes; `false` when the ledger is
+    /// empty.
+    evidence_past_fence: bool,
+}
+
+/// Read-only snapshot of the standing cells the round derivation
+/// consumes. `held_unsuperseded` is deliberately absent: no Completed
+/// edge selects on the hold — the postures are encoded in WHICH
+/// transition the edge runs, and the algebra owns the fold.
+#[derive(Debug, Clone, Copy)]
+struct StandingCells {
+    believes: bool,
+    deferred: bool,
+}
+
+/// How the evidence executor consumes a routed own-commit entry. ONE
+/// producer ([`Self::derive`]) serves both routing sites (the Completed
+/// derivation and the act-failed arm), so the gate/belief branch
+/// structure cannot drift between them (merged_bug_051's one-body rule,
+/// kept under the derivation rewrite).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsumeMode {
+    /// The entry's anchor fails the acquire futility gate: consume the
+    /// ledger and stamp the blind clock (the evidence is real), but run
+    /// NO standing transition (merged_bug_122 — the acquire would not
+    /// survive to the next fence evaluation).
+    StampOnly,
+    /// Not believing at consumption: the evidence proves the apiserver
+    /// still (or again) names us holder — restore through the ordinary
+    /// acquire edge, then the funnel.
+    Restore,
+    /// Still believing: route the completed read through THE
+    /// observe-completed-read body (the funnel).
+    Funnel,
+}
+
+impl ConsumeMode {
+    fn derive(past_fence: bool, believes: bool) -> Self {
+        if past_fence {
+            Self::StampOnly
+        } else if !believes {
+            Self::Restore
+        } else {
+            Self::Funnel
+        }
+    }
+}
+
+/// The evidence-acquire futility gate — the ONE producing fn for the
+/// verdict both the Completed derivation and the act-failed executor
+/// consume (a second formula is the dual-derivation defect class).
+/// An entry past [`SELF_FENCE_AFTER`] cannot fund an acquire that
+/// survives the same arm's trailing fence check (merged_bug_122).
+fn evidence_acquire_futile(anchor_age: Duration) -> bool {
+    anchor_age > SELF_FENCE_AFTER
+}
+
+/// The standing edge a Completed round runs — the old
+/// `(leading?, believes?)` match cells, now outputs of one derivation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundEdge {
+    /// `Leading` resolved while not believing: the acquire edge.
+    Acquire,
+    /// `Leading` resolved while believing: the fused
+    /// observe-completed-read body (rebound comparison + observation).
+    StillLeading,
+    /// The believing lose edge, with its typed evidence
+    /// (`sched.lease.holder-evidenced-lose`).
+    Lose(CompletedLoseEvidence),
+    /// A believing renew 409 deferring one round (the Q3 deferral).
+    Defer,
+    /// Standby steady state (or a 409 racing a steal — never led):
+    /// the round resolved not-leading.
+    StandbyObserved,
+}
+
+/// What the executor records as the next content baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaselineEdge {
+    /// The read completed with facts: re-baseline to its
+    /// holder-authored content.
+    FromRead,
+    /// No read facts (the 404→Create path): the next read
+    /// re-baselines.
+    NoCompletedRead,
+}
+
+/// The derived plan for one Completed round: every decision the old
+/// arm made across three sequential reads of mutating state, now
+/// produced by ONE pure derivation over the round-entry snapshot
+/// ([`complete_round`]). The loop executes the plan in derivation
+/// order; the kani kernel proofs and the unit cell table fold it
+/// directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoundTransition {
+    /// Consume the armed own-commit evidence entry (the Conflict-arm
+    /// consult, merged_bug_051) — executes FIRST: GET-first evidence
+    /// folds before the round's own 409 is adjudicated
+    /// (merged_bug_053).
+    consume: Option<ConsumeMode>,
+    /// The believing-409 adjudication verdict, derived from
+    /// POST-consumption standing through the production
+    /// `on_believing_conflict` body. `Some` exactly when the executor
+    /// must run that transition on the live standing (whose returned
+    /// verdict agrees by the kani agreement proof).
+    adjudication: Option<ConflictResolution>,
+    /// The standing edge for this round.
+    edge: RoundEdge,
+    /// Stamp the blind clock with this attempt's anchor. A deferred
+    /// round must NOT restart the blind window: a stamped deferral
+    /// extends belief with the lease content frozen, which is the
+    /// leaderElection.qnt holder-evidence regime's dual-belief
+    /// counterexample. Every belief-EXTENDING stamp stays coupled to a
+    /// content write or a lose — Standby and RESOLVED Conflicts stamp
+    /// (the apiserver answered; the clock tracks "am I blind", not
+    /// "am I leader"), and the evidence consumption's ledger-anchor
+    /// stamp is coupled to a committed write of ours.
+    attempt_stamp: bool,
+    /// Leading/Standby answer the unconfirmed question wholesale:
+    /// their facts describe the post-resolution state. A 409 does NOT
+    /// — the mover may be our own zombie commit, so the ledger
+    /// survives a Conflict for the NEXT completed read to consume
+    /// (`sched.lease.holder-evidenced-lose`).
+    clear_ledger_wholesale: bool,
+    /// The content re-baseline (`sched.lease.cancelled-write`).
+    baseline: BaselineEdge,
+    /// Confirm the leading round (`sched.recovery.bump-confirm`) —
+    /// exactly the `Leading` results.
+    confirm: bool,
+}
+
+// r[impl sched.lease.holder-evidenced-lose+3]
+// r[impl sched.lease.cancelled-write+2]
+/// THE Completed-round derivation (merged_bug_053): one pure function
+/// `(facts, outcome, standing) -> RoundTransition` replacing the old
+/// arm's three sequential reads of mutable state (the :1847-era verdict
+/// snapshot, the consult's standing mutation, and the edge match that
+/// fired from the stale snapshot). The loop executes what is returned —
+/// the loop shim is in kani scope for the first time (the
+/// `complete_round_proofs` module).
+///
+/// Derivation order is TEMPORAL (the law's own order):
+///
+/// 1. **Same-round evidence consult.** A Conflict's completed GET may
+///    carry own-commit evidence; the consult routes through the same
+///    total law as the act-failed arm, against the PRE-conflict
+///    baseline. Only the evidence cell is consumed here (its sibling
+///    verdicts keep their existing homes).
+/// 2. **The 409 adjudication, against POST-consumption standing.**
+///    GET-first evidence answers a PENDING deferral's question (the
+///    rv-mover was our own commit) — it cannot answer the round's OWN
+///    409, whose mover acted AFTER the GET. Pre-fix the order was
+///    inverted: the verdict was snapshotted before consumption, so the
+///    lose edge could fire from a stale `Exhausted` in the very round
+///    whose GET proved holder=us (the spurious own-write-race wipe the
+///    signed Q3 deferral priced out), a first-409-with-evidence round
+///    cleared its own just-set latch (stretching the signed two-409
+///    bound to three rounds), and a fenced mid-arm re-acquire entered
+///    the deferral arm with its precondition false.
+/// 3. **Edge selection from the post-consumption cells.** The
+///    adjudication verdict comes from the production
+///    `on_believing_conflict` body on a derivation-local standing — the
+///    latch law has exactly one formula home; the executor re-runs it
+///    on the live standing and the kani agreement proof pins the two
+///    folds together over the full cell product.
+///
+/// The post-consumption standing cells (`believes`/`deferred` after a
+/// funnel-running consume) are restated here from the algebra's
+/// transitions — `on_observed_held` sets belief and resolves the
+/// deferral — and that restatement is PINNED to the production fold by
+/// `lease_round_agrees_with_standing_algebra` (kani, full product):
+/// drift between this derivation and the algebra is machine-caught,
+/// which is the structural upgrade over the old arm's unverifiable
+/// loop-level composition.
+fn complete_round(facts: ReadFacts, outcome: ActCell, standing: StandingCells) -> RoundTransition {
+    let is_conflict = matches!(outcome, ActCell::Conflict);
+
+    // 1. The same-round evidence consult (merged_bug_051: consumption
+    //    is atomic with the re-baseline; the (Us, Moved, Armed) cell
+    //    would otherwise be destroyed by the unconditional re-baseline).
+    let consume = (is_conflict
+        && route_act_failed_read(standing.believes, facts.holder, facts.content, facts.ledger)
+            == ActFailedAction::EvidenceResolve)
+        .then(|| ConsumeMode::derive(facts.evidence_past_fence, standing.believes));
+
+    // Post-consumption standing cells (pinned to the production
+    // algebra by the kani agreement proof — see the fn doc).
+    let funnel_runs = matches!(consume, Some(ConsumeMode::Restore | ConsumeMode::Funnel));
+    let believes = standing.believes || funnel_runs;
+    let deferred = standing.deferred && !funnel_runs;
+
+    // 2.+3. Adjudication (production body, derivation-local standing)
+    //    and edge selection — one total match, no wildcard arms.
+    let mut adjudicated = LeaseStanding {
+        believes,
+        held_unsuperseded: false,
+        conflict_deferred: deferred,
+    };
+    let (adjudication, edge) = match (outcome, believes) {
+        (ActCell::Leading, false) => (None, RoundEdge::Acquire),
+        (ActCell::Leading, true) => (None, RoundEdge::StillLeading),
+        (ActCell::Standby, true) => (
+            None,
+            // Standby resolution: the read named a fresh foreign
+            // holder (or an empty/stale one we chose not to steal) —
+            // direct holder evidence either way: the lease provably
+            // no longer resolves to us.
+            RoundEdge::Lose(CompletedLoseEvidence::AnotherHolderObserved),
+        ),
+        (ActCell::Standby | ActCell::Conflict, false) => (None, RoundEdge::StandbyObserved),
+        (ActCell::Conflict, true) => {
+            let verdict = adjudicated.on_believing_conflict();
+            let edge = match verdict {
+                ConflictResolution::Exhausted => {
+                    RoundEdge::Lose(CompletedLoseEvidence::ConflictDeferralExhausted)
+                }
+                ConflictResolution::Deferred => RoundEdge::Defer,
+            };
+            (Some(verdict), edge)
+        }
+    };
+
+    RoundTransition {
+        consume,
+        adjudication,
+        edge,
+        attempt_stamp: !matches!(edge, RoundEdge::Defer),
+        clear_ledger_wholesale: !is_conflict,
+        baseline: match facts.holder {
+            // Completed with no read facts (the 404→Create path): the
+            // POST left no read facts, and Leading already answered
+            // the ledger wholesale — the next read re-baselines. (The
+            // pre-POST 404 is stale the instant the Create succeeds.)
+            HolderCell::Absent => BaselineEdge::NoCompletedRead,
+            HolderCell::Us | HolderCell::Other => BaselineEdge::FromRead,
+        },
+        confirm: matches!(outcome, ActCell::Leading),
+    }
+}
+
 pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     client: kube::Client,
     cfg: LeaseConfig,
@@ -1825,80 +2112,38 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 .await
             {
                 election::RenewOutcome::Completed { result, facts } => {
-                    let is_conflict = matches!(result, ElectionResult::Conflict);
-                    // Will this round take the one-round 409 deferral
-                    // (sched.lease.holder-evidenced-lose)? Computed BEFORE
-                    // the stamp: a deferred round must NOT restart the
-                    // blind window. The old law could stamp on every
-                    // Completed round because every belief-EXTENDING stamp
-                    // came coupled with a content write (which resets a
-                    // standby's steal clock) or a lose (which ends the
-                    // belief the stamp would extend); a stamped DEFERRAL
-                    // breaks that coupling — it extends belief with the
-                    // lease content frozen, and the leaderElection.qnt
-                    // holder-evidence regime produces the dual-belief
-                    // counterexample (a frozen-content victim whose
-                    // completing 409 lands near its fence deadline keeps
-                    // belief past the standby's steal). Deferring on the
-                    // PRE-409 blind budget keeps the original
-                    // fence-before-steal margin untouched: the deferral
-                    // changes WHICH edge runs, never how long belief may
-                    // last.
-                    let conflict_resolution = (is_conflict && standing.believes())
-                        .then(|| standing.on_believing_conflict());
-                    let will_defer =
-                        matches!(conflict_resolution, Some(ConflictResolution::Deferred));
-                    if !will_defer {
-                        // Successful round-trip (apiserver answered). Even
-                        // Standby (and a RESOLVED Conflict) restart the
-                        // blind window — we KNOW the apiserver answered,
-                        // we just don't hold the lease. The clock tracks
-                        // "am I blind", not "am I leader".
-                        blind.stamp(attempt_anchor);
-                    }
-                    // Leading/Standby answer the unconfirmed question
-                    // wholesale: their facts describe the post-resolution
-                    // state, so nothing of ours is left in doubt. A 409
-                    // does NOT — it proves only that the rv moved between
-                    // our GET and PUT, and the mover may be our own zombie
-                    // commit from the cancelled-write ledger (or a foreign
-                    // metadata patch). The ledger survives a Conflict so
-                    // the NEXT completed read can consume it as own-commit
-                    // evidence (sched.lease.holder-evidenced-lose).
-                    if !is_conflict {
-                        unconfirmed = None;
-                    }
-                    // merged_bug_051: evidence consumption and baseline
-                    // advancement are ONE ATOMIC OPERATION. A Conflict
-                    // round's completed GET may itself carry the
-                    // own-commit evidence (holder=us, renewTime moved vs
-                    // the PRE-conflict baseline) while the ledger is
-                    // armed — the foreign rv-mover that bounced our PUT
-                    // does not un-commit our zombie write. Pre-fix this
-                    // arm re-baselined unconditionally, destroying the
-                    // movement evidence the act-failed law routes
-                    // EvidenceResolve on: the (Us, Moved, Armed) cell
-                    // was unreachable from the commit-before-GET
-                    // schedule and the replica stayed fenced extra
-                    // rounds. Consult the same total routing law against
-                    // the OLD baseline and consume BEFORE re-baselining;
-                    // every other routed action keeps its existing home
-                    // (the conflict deferral machinery above, the
-                    // act-failed arm, the fence law) — only the
-                    // evidence cell is consumed here, where it would
-                    // otherwise be destroyed.
+                    // ---- The round-entry snapshot (merged_bug_053) ----
+                    // Every input the round derivation consumes, read
+                    // ONCE before any mutation: the routing cells
+                    // against the PRE-conflict baseline (merged_bug_051
+                    // — the foreign rv-mover that bounced our PUT does
+                    // not un-commit our zombie write, so the consult
+                    // must see the OLD baseline and the armed ledger),
+                    // the evidence-acquire futility verdict, and the
+                    // standing cells. The derivation then produces the
+                    // WHOLE round as one plan — pre-fix the arm read
+                    // mutating state three times (verdict snapshot,
+                    // consult, edge match) and the edge could fire from
+                    // a verdict the consult had already invalidated.
+                    let evidence_anchor_age =
+                        unconfirmed.as_ref().map(|led| led.age_at(fence_now()));
+                    let read_facts = ReadFacts {
+                        holder: HolderCell::of_read(facts.as_ref()),
+                        content: ContentCell::of_read(&content_baseline, facts.as_ref()),
+                        ledger: LedgerCell::of(&unconfirmed),
+                        evidence_past_fence: evidence_anchor_age
+                            .is_some_and(evidence_acquire_futile),
+                    };
                     // r[impl sched.lease.cancelled-write+2]
-                    if is_conflict
-                        && matches!(
-                            route_act_failed_read(
-                                standing.believes(),
-                                HolderCell::of_read(facts.as_ref()),
-                                ContentCell::of_read(&content_baseline, facts.as_ref()),
-                                LedgerCell::of(&unconfirmed),
-                            ),
-                            ActFailedAction::EvidenceResolve
-                        )
-                    {
+                    let plan = complete_round(read_facts, ActCell::of(&result), standing.cells());
+
+                    // ---- 1. Same-round evidence consumption ----
+                    // GET-first evidence folds FIRST: it answers a
+                    // PENDING deferral's question (the rv-mover was our
+                    // own commit) before the round's own 409 is
+                    // adjudicated. One consumption body for both
+                    // routing sites (merged_bug_051).
+                    if let Some(mode) = plan.consume {
                         let f = facts.as_ref().expect(
                             "EvidenceResolve is routed only for present reads \
                              (the absence partition; census + kani pinned)",
@@ -1907,11 +2152,16 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             "EvidenceResolve is routed only for an armed ledger \
                              (route_act_failed_read is total; census + kani pinned)",
                         );
+                        let anchor_age = evidence_anchor_age.expect(
+                            "the anchor age was read from the same armed entry \
+                             this consume just took",
+                        );
                         consume_own_commit_evidence(
+                            mode,
+                            anchor_age,
                             led,
                             f,
                             &mut blind,
-                            fence_now(),
                             &state,
                             &mut standing,
                             &marks_dirty,
@@ -1919,35 +2169,77 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             &cfg.holder_id,
                         );
                     }
-                    content_baseline = match facts {
-                        Some(f) => ContentBaseline::Present {
-                            renew_time: f.renew_time,
-                        },
+
+                    // ---- 2. The 409 adjudication ----
+                    // On the LIVE standing (the latch's single set
+                    // path), AFTER consumption: the verdict is the
+                    // derivation's, re-produced by the same production
+                    // body — agreement over the full cell product is
+                    // kani-pinned (lease_round_agrees_with_standing_algebra).
+                    if let Some(predicted) = plan.adjudication {
+                        let _verdict = standing.on_believing_conflict();
+                        debug_assert!(
+                            _verdict == predicted,
+                            "the live adjudication must agree with the derivation \
+                             (kani agreement proof over the full product)"
+                        );
+                    }
+
+                    // ---- 3. The wholesale ledger answer ----
+                    // Leading/Standby answer the unconfirmed question
+                    // wholesale: their facts describe the
+                    // post-resolution state, so nothing of ours is left
+                    // in doubt. A 409 does NOT — the ledger survives a
+                    // Conflict so the NEXT completed read can consume
+                    // it (sched.lease.holder-evidenced-lose).
+                    if plan.clear_ledger_wholesale {
+                        unconfirmed = None;
+                    }
+
+                    // ---- 4. The blind stamp ----
+                    // A deferred round must NOT restart the blind
+                    // window (the full coupling rationale lives at
+                    // RoundTransition::attempt_stamp); the consumption
+                    // step already stamped the LEDGER anchor when
+                    // evidence was real.
+                    if plan.attempt_stamp {
+                        blind.stamp(attempt_anchor);
+                    }
+
+                    // ---- 5. The re-baseline ----
+                    // Atomic with the consumption above
+                    // (merged_bug_051): the consult ran against the OLD
+                    // baseline; only now does the read's content become
+                    // the new one (sched.lease.cancelled-write).
+                    content_baseline = match plan.baseline {
+                        BaselineEdge::FromRead => {
+                            let f = facts.expect(
+                                "FromRead derives only from present reads \
+                                 (complete_round maps Absent to NoCompletedRead)",
+                            );
+                            ContentBaseline::Present {
+                                renew_time: f.renew_time,
+                            }
+                        }
                         // Completed Create: the POST left no read facts,
                         // and Leading just answered the ledger wholesale —
                         // the next read re-baselines. (The pre-POST 404 is
                         // stale the instant the Create succeeds.)
-                        None => ContentBaseline::NoCompletedRead,
+                        BaselineEdge::NoCompletedRead => ContentBaseline::NoCompletedRead,
                     };
-                    // Conflict on renew = the CAS bounced; WHO holds is
-                    // unknown until the next read (the deferral arm below).
-                    // Conflict on steal = another standby raced us → we
-                    // were never leading, nothing to defer. Leading carries
-                    // the lease's transition count so the acquire arm can
-                    // derive the generation from it; None ⇔ not leading.
+
+                    // ---- 6. The standing edge ----
+                    // Leading carries the lease's transition count so
+                    // the acquire/still-leading arms can derive the
+                    // generation from it; the derivation guarantees
+                    // those edges select exactly the Leading results
+                    // (kani: lease_round_edges_partition_the_product).
                     let leading_transitions = match result {
                         ElectionResult::Leading { transitions } => Some(transitions),
                         ElectionResult::Standby | ElectionResult::Conflict => None,
                     };
-                    let now_leading = leading_transitions.is_some();
-
-                    // Edge detection on (leading?, was_leading). Binding
-                    // the transition count in the acquire pattern makes
-                    // "acquired without a transition count to derive the
-                    // generation from" unrepresentable — the arm cannot
-                    // execute without a value to hand to on_acquire.
-                    match (leading_transitions, standing.believes()) {
-                        (Some(transitions), false) => {
+                    match plan.edge {
+                        RoundEdge::Acquire => {
                             // ---- Acquire transition ----
                             // on_acquire: write the generation FIRST, then
                             // set is_leader, both SeqCst. A reader seeing
@@ -1960,6 +2252,10 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             //
                             // The generation derives from the lease's
                             // transition count (see on_acquire's doc).
+                            let transitions = leading_transitions.expect(
+                                "Acquire derives only from Leading results \
+                                 (complete_round; kani edge-partition proof)",
+                            );
                             let new_gen = state.on_acquire(transitions);
                             info!(
                                 generation = new_gen,
@@ -2011,111 +2307,94 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             // the funnel's on_observed_held clears the
                             // episode latch structurally.
                         }
-                        (None, true) => {
-                            // ---- Lose-or-defer ----
+                        RoundEdge::Lose(evidence) => {
+                            // ---- Lose transition ----
                             // r[impl sched.lease.holder-evidenced-lose+3]
                             // The lose edge demands a CompletedLoseEvidence
                             // witness (see its doc + the SIGNED Q3 block):
                             // a completed read naming another holder, or an
-                            // exhausted one-round 409 deferral. A bare
-                            // first 409 constructs neither — it defers.
-                            let evidence: Option<CompletedLoseEvidence> = if !is_conflict {
-                                // Standby resolution: the read named a
-                                // fresh foreign holder (or an empty/stale
-                                // one we chose not to steal) — direct
-                                // holder evidence either way: the lease
-                                // provably no longer resolves to us.
-                                Some(CompletedLoseEvidence::AnotherHolderObserved)
-                            } else if matches!(
-                                conflict_resolution,
-                                Some(ConflictResolution::Exhausted)
-                            ) {
-                                Some(CompletedLoseEvidence::ConflictDeferralExhausted)
-                            } else {
-                                None
-                            };
+                            // exhausted one-round 409 deferral — the
+                            // derivation constructs nothing else, and a
+                            // bare first 409 takes the Defer edge instead.
+                            // Stop dispatching. The generation is
+                            // the NEW leader's concern — it derives
+                            // its own from the lease's transition
+                            // count on acquire. on_lose clears both
+                            // is_leader and recovery_complete
+                            // (SeqCst): if we re-acquire, recovery
+                            // runs again — the other replica's
+                            // actions may have changed PG.
+                            state.on_lose();
                             match evidence {
-                                Some(evidence) => {
-                                    // ---- Lose transition ----
-                                    // Stop dispatching. The generation is
-                                    // the NEW leader's concern — it derives
-                                    // its own from the lease's transition
-                                    // count on acquire. on_lose clears both
-                                    // is_leader and recovery_complete
-                                    // (SeqCst): if we re-acquire, recovery
-                                    // runs again — the other replica's
-                                    // actions may have changed PG.
-                                    state.on_lose();
-                                    match evidence {
-                                        CompletedLoseEvidence::AnotherHolderObserved => warn!(
-                                            holder = %cfg.holder_id,
-                                            "lost leadership (a completed read named another holder)"
-                                        ),
-                                        CompletedLoseEvidence::ConflictDeferralExhausted => warn!(
-                                            holder = %cfg.holder_id,
-                                            "lost leadership (two consecutive renew 409s — the \
-                                             one-round holder-evidence deferral is exhausted)"
-                                        ),
-                                    }
-
-                                    // r[impl sched.lease.standby-tick-noop+2]
-                                    // Symmetric with on_acquire above: fire
-                                    // the per-component on-lose hook
-                                    // (metrics + actor notification). Same
-                                    // non-blocking constraint. is_leader is
-                                    // already false (above) so the
-                                    // consumer's tick early-returns
-                                    // regardless; this just lets it drop
-                                    // stale state and zero leader-only
-                                    // gauges.
-                                    hooks.on_lose();
-
-                                    // The leader marks must be cleared —
-                                    // we're standby now: K8s should prefer
-                                    // to kill us over the new leader, and
-                                    // the leader-only Service must stop
-                                    // routing to us (the dashboard's RPCs
-                                    // would land here as Trailers-Only
-                                    // Unavailable otherwise). The reconcile
-                                    // arm after the edge match patches this
-                                    // tick.
-                                    marks_dirty.mark();
-                                    // The standing posture is the
-                                    // EVIDENCE's own (bug_136): direct
-                                    // holder evidence clears the hold;
-                                    // an exhausted deferral — whose every
-                                    // read named us — self-fences (hold
-                                    // kept). Both clear the episode latch:
-                                    // a deferral does not survive its own
-                                    // lose edge.
-                                    evidence.apply(&mut standing);
-                                }
-                                None => {
-                                    // ---- One-round deferral ----
-                                    // Belief, the hold, and the ledger all
-                                    // survive: nothing is wiped on a CAS
-                                    // bounce that may be our own write
-                                    // committing. No hooks, no marks — no
-                                    // transition happened. The latch was
-                                    // set by on_believing_conflict above.
-                                    // The NEXT completed read resolves:
-                                    // holder=us → ordinary renew (or
-                                    // own-commit evidence on the act-failed
-                                    // path — both run the funnel, which
-                                    // clears); holder=other → lose WITH
-                                    // evidence; another 409 → exhausted,
-                                    // lose.
-                                    warn!(
-                                        holder = %cfg.holder_id,
-                                        "renew 409 while believing: rv moved but the holder is \
-                                         unknown — deferring the lose edge one round for holder \
-                                         evidence (own zombie commit and foreign metadata writes \
-                                         are non-lose rv-movers)"
-                                    );
-                                }
+                                CompletedLoseEvidence::AnotherHolderObserved => warn!(
+                                    holder = %cfg.holder_id,
+                                    "lost leadership (a completed read named another holder)"
+                                ),
+                                CompletedLoseEvidence::ConflictDeferralExhausted => warn!(
+                                    holder = %cfg.holder_id,
+                                    "lost leadership (two consecutive renew 409s — the \
+                                     one-round holder-evidence deferral is exhausted)"
+                                ),
                             }
+
+                            // r[impl sched.lease.standby-tick-noop+2]
+                            // Symmetric with on_acquire above: fire
+                            // the per-component on-lose hook
+                            // (metrics + actor notification). Same
+                            // non-blocking constraint. is_leader is
+                            // already false (above) so the
+                            // consumer's tick early-returns
+                            // regardless; this just lets it drop
+                            // stale state and zero leader-only
+                            // gauges.
+                            hooks.on_lose();
+
+                            // The leader marks must be cleared —
+                            // we're standby now: K8s should prefer
+                            // to kill us over the new leader, and
+                            // the leader-only Service must stop
+                            // routing to us (the dashboard's RPCs
+                            // would land here as Trailers-Only
+                            // Unavailable otherwise). The reconcile
+                            // arm after the edge match patches this
+                            // tick.
+                            marks_dirty.mark();
+                            // The standing posture is the
+                            // EVIDENCE's own (bug_136): direct
+                            // holder evidence clears the hold;
+                            // an exhausted deferral — whose every
+                            // read named us — self-fences (hold
+                            // kept). Both clear the episode latch:
+                            // a deferral does not survive its own
+                            // lose edge.
+                            evidence.apply(&mut standing);
                         }
-                        (Some(transitions), true) => {
+                        RoundEdge::Defer => {
+                            // ---- One-round deferral ----
+                            // Belief, the hold, and the ledger all
+                            // survive: nothing is wiped on a CAS
+                            // bounce that may be our own write
+                            // committing. No hooks, no marks — no
+                            // transition happened. The latch was set
+                            // by the adjudication step above — against
+                            // POST-consumption standing, so a round
+                            // whose own GET answered a pending
+                            // deferral still pends its OWN 409
+                            // (merged_bug_053). The NEXT completed
+                            // read resolves: holder=us → ordinary
+                            // renew (or own-commit evidence on the
+                            // act-failed path — both run the funnel,
+                            // which clears); holder=other → lose WITH
+                            // evidence; another 409 → exhausted, lose.
+                            warn!(
+                                holder = %cfg.holder_id,
+                                "renew 409 while believing: rv moved but the holder is \
+                                 unknown — deferring the lose edge one round for holder \
+                                 evidence (own zombie commit and foreign metadata writes \
+                                 are non-lose rv-movers)"
+                            );
+                        }
+                        RoundEdge::StillLeading => {
                             // ---- Still leading ----
                             // THE observe-completed-read body: the rebound
                             // comparison and the believed-held observation
@@ -2127,7 +2406,10 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                 &marks_dirty,
                                 &hooks,
                                 &cfg.holder_id,
-                                transitions,
+                                leading_transitions.expect(
+                                    "StillLeading derives only from Leading results \
+                                     (complete_round; kani edge-partition proof)",
+                                ),
                             );
                             // A still-leading resolution clears a pending
                             // deferral — the 409's question is answered
@@ -2138,18 +2420,18 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         // leading, nothing to defer; on_observed_not_leading
                         // clears the latch either way). No log — 5s
                         // interval would be noisy.
-                        (None, false) => {
+                        RoundEdge::StandbyObserved => {
                             standing.on_observed_not_leading();
                         }
                     }
                     // r[impl sched.recovery.bump-confirm+3]
-                    // Confirm AFTER the edge-detection match: when an
-                    // acquire edge and a confirmation land in the same
-                    // round, on_acquire's stores are already visible by
-                    // the time the confirmation is observable. Standby/
+                    // Confirm AFTER the edge match: when an acquire edge
+                    // and a confirmation land in the same round,
+                    // on_acquire's stores are already visible by the
+                    // time the confirmation is observable. Standby/
                     // Conflict rounds (and the error/timeout arm below)
                     // are never confirmed.
-                    if now_leading {
+                    if plan.confirm {
                         state.confirm_leading_round(round);
                     }
                 }
@@ -2222,12 +2504,21 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                 // shared with the Conflict arm — one
                                 // body, two routing sites, so the two
                                 // cannot drift (see
-                                // consume_own_commit_evidence).
+                                // consume_own_commit_evidence); the gate
+                                // and branch verdicts come from the same
+                                // producers the Completed derivation
+                                // consumes (evidence_acquire_futile,
+                                // ConsumeMode::derive).
+                                let anchor_age = led.age_at(fence_now());
                                 consume_own_commit_evidence(
+                                    ConsumeMode::derive(
+                                        evidence_acquire_futile(anchor_age),
+                                        standing.believes(),
+                                    ),
+                                    anchor_age,
                                     led,
                                     f,
                                     &mut blind,
-                                    fence_now(),
                                     &state,
                                     &mut standing,
                                     &marks_dirty,
@@ -2587,6 +2878,7 @@ struct LeaseStanding {
 /// not run); `Exhausted` ⇔ a previous deferral is still unresolved —
 /// two consecutive believing 409s — and the caller owes the evidenced
 /// lose edge (whose `on_observed_not_leading` then clears the latch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConflictResolution {
     Deferred,
     Exhausted,
@@ -2617,6 +2909,17 @@ impl LeaseStanding {
     /// The edge-detection read (`run_lease_loop`'s old `was_leading`).
     fn believes(&self) -> bool {
         self.believes
+    }
+
+    /// Round-entry snapshot for the Completed-round derivation
+    /// ([`complete_round`]): the two cells the derivation consumes,
+    /// read ONCE before any mutation (merged_bug_053). Read-only —
+    /// the algebra's transitions remain the only mutation paths.
+    fn cells(&self) -> StandingCells {
+        StandingCells {
+            believes: self.believes,
+            deferred: self.conflict_deferred,
+        }
     }
 
     /// A COMPLETED round resolved BELIEVED-HELD. Demands the
@@ -3065,6 +3368,16 @@ impl BlindClock {
 /// believe past every steal).
 struct UnconfirmedPut {
     anchor: RenewAnchor,
+}
+
+impl UnconfirmedPut {
+    /// The entry's anchor age as of `now` — the input to
+    /// [`evidence_acquire_futile`] and the consumption log line, read
+    /// ONCE per round so the derivation and the executor consume the
+    /// same datum. Saturating like [`BlindClock::blind_for`].
+    fn age_at(&self, now: Duration) -> Duration {
+        now.saturating_sub(self.anchor.0)
+    }
 }
 
 /// Generation-counted dirty flag for the leader-marks reconcile
@@ -6167,6 +6480,295 @@ mod tests {
         loop_task.await.expect("lease loop exits");
     }
 
+    /// W12-W + W12-W2 (merged_bug_053): the conflict round adjudicates
+    /// its 409 AFTER the same round's evidence consumption, and the
+    /// signed two-409 exhaustion bound holds at the round grain.
+    ///
+    /// Round 4 (t=15s) carries BOTH a pending-resolution question and
+    /// this round's own new one: its GET serves own-commit evidence
+    /// (holder=us, renewTime moved, ledger armed at t=10s) and its PUT
+    /// bounces 409. The lawful derivation order is temporal — the
+    /// GET-first evidence folds FIRST (consuming the ledger, stamping
+    /// the blind clock at the t=10s anchor), and THE ROUND'S OWN 409 is
+    /// then adjudicated against post-consumption standing: latch clear
+    /// → Deferred, this round's question pends. Round 5's bare 409
+    /// (frozen content, empty ledger) is the second consecutive
+    /// unresolved believing 409 → Exhausted → the evidenced lose edge
+    /// (self-fence posture, hold kept) — the signed two-409 bound.
+    ///
+    /// Pre-fix the order was inverted: round 4 adjudicated FIRST
+    /// (Deferred, latch set), then the evidence consult's funnel
+    /// cleared the just-set latch in the same round — the round's own
+    /// 409 question was answered by evidence that predates it
+    /// (anchor ≤ send ≤ commit ≤ this GET < this 409's rv mover), so
+    /// round 5 minted a SECOND free deferral and the bound stretched to
+    /// three rounds, with the t=25s tick-top fence (not the signed lose
+    /// law) ending belief.
+    ///
+    /// Pre-fix red, verbatim: `the second consecutive unresolved
+    /// believing 409 must run the exhausted lose edge (signed two-409
+    /// bound); pre-fix: the evidence round's set-then-clear stretched
+    /// the bound and belief survived round 5`.
+    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.cancelled-write+2]
+    #[tokio::test(start_paused = true)]
+    async fn conflict_round_adjudicates_after_evidence_consumption() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1 (t=0): acquire; settle the marks PATCH.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 10, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json_rt(Some("us"), 3, 11, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 2 (t=5s): healthy renew — keeps the blind window fresh
+        // so neither 409 round below is fence-shadowed (the ledger
+        // stamp at consumption is 5s stale by construction; the arc
+        // needs the t=20s tick-top under the 11s fence).
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 11, 11));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json_rt(Some("us"), 3, 12, 12));
+        settle().await;
+
+        // Round 3 (t=10s): the zombie — renew PUT transmitted and
+        // dropped; it commits server-side. Ledger arms at t=10s.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 12, 12));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+        assert!(state.is_leader(), "an act failure alone never loses");
+
+        // Round 4 (t=15s): evidence + 409 in ONE round. The GET serves
+        // the zombie's renewTime (moved vs baseline 12, holder=us,
+        // ledger armed → the law routes EvidenceResolve); the PUT
+        // bounces on a foreign rv-mover. Consumption first (stamp at
+        // the t=10s anchor), THEN the 409 adjudicates: Deferred.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 13, 13));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+        assert!(
+            state.is_leader(),
+            "the evidence round defers its own 409 (one-round deferral)"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            0,
+            "no lose edge may fire in the round whose own GET proved holder=us"
+        );
+
+        // Round 5 (t=20s, tick-top blind = 10s < 11s): a bare second
+        // 409 — frozen content, empty ledger. The deferral set by round
+        // 4 is unresolved → Exhausted → the evidenced lose edge runs
+        // NOW (self-fence posture per the signed pricing).
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 13, 13));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+
+        assert!(
+            !state.is_leader(),
+            "the second consecutive unresolved believing 409 must run the \
+             exhausted lose edge (signed two-409 bound); pre-fix: the \
+             evidence round's set-then-clear stretched the bound and \
+             belief survived round 5"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "exactly the exhausted-deferral lose, on schedule"
+        );
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires lock").len(),
+            1,
+            "belief never broke before the lawful lose"
+        );
+
+        shutdown.cancel();
+        for _ in 0..6 {
+            if let Some(req) = park.try_next().await {
+                if req.path.contains("/pods/us") {
+                    req.respond_ok(pod_ok("us"));
+                } else {
+                    req.respond_status(404, "NotFound", "gone");
+                }
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// W12-W3 (merged_bug_053, the fenced mid-arm re-acquire cell): a
+    /// conflict round that RESTORES belief through the evidence leg
+    /// must adjudicate its 409 against the post-restore standing — the
+    /// deferral arm's "latch was set above" precondition is TRUE on
+    /// entry.
+    ///
+    /// Round 4 (t=15s): the tick-top fence fires first (blind 15s >
+    /// 11s; belief drops, hold kept, latch cleared). The round's GET
+    /// then serves own-commit evidence (holder=us, moved, armed at
+    /// t=10s — anchor age 5s, inside the acquire gate) and its PUT
+    /// bounces 409: the consumption's !believes branch restores belief
+    /// mid-arm (on_acquire + funnel), and the 409 must then be
+    /// adjudicated against the RESTORED standing → Deferred (latch
+    /// set). Round 5's bare 409 exhausts → lose at t=20s.
+    ///
+    /// Pre-fix the adjudication gate read the PRE-restore snapshot
+    /// (believes=false → no adjudication), so the round fell into the
+    /// deferral arm with NO latch set — a free deferral round; the
+    /// bare 409 at t=20s merely deferred and belief survived.
+    ///
+    /// Pre-fix red, verbatim: `a mid-arm evidence re-acquire must
+    /// adjudicate the same round's 409 against post-restore standing;
+    /// pre-fix: the pre-restore snapshot skipped adjudication and
+    /// round 5 deferred instead of exhausting`.
+    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.cancelled-write+2]
+    #[tokio::test(start_paused = true)]
+    async fn fenced_mid_arm_reacquire_enters_deferral_with_latch_set() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1 (t=0): acquire; settle the marks PATCH.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 10, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json_rt(Some("us"), 3, 11, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 2 (t=5s): read fails — blind keeps aging from t=0.
+        let get = park.next().await;
+        get.respond_status(500, "InternalError", "apiserver brownout");
+        settle().await;
+
+        // Round 3 (t=10s): the zombie — GET completes (blind still
+        // 10s < 11s at the tick-top), PUT transmitted and dropped;
+        // ledger arms at t=10s.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 11, 11));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+        assert!(state.is_leader(), "an act failure alone never loses");
+
+        // Round 4 (t=15s): tick-top blind = 15s > 11s → the fence
+        // fires (lose #1, hold kept, latch cleared). The round's GET
+        // serves the zombie's commit (holder=us, moved vs 11, armed,
+        // anchor age 5s — inside the acquire gate) and the PUT bounces
+        // 409: the evidence leg RESTORES belief mid-arm, and the 409
+        // adjudicates against the restored standing → latch set.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 12, 12));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+        assert!(
+            state.is_leader(),
+            "the mid-arm evidence re-acquire restores belief in the fence round"
+        );
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires lock").len(),
+            2,
+            "the restore is a real acquire edge"
+        );
+
+        // Answer the marks PATCH the fence + restore dirtied.
+        if let Some(req) = park.try_next().await {
+            assert!(
+                req.path.contains("/pods/us"),
+                "only the marks PATCH is outstanding here, got {}",
+                req.path
+            );
+            req.respond_ok(pod_ok("us"));
+            settle().await;
+        }
+
+        // Round 5 (t=20s, tick-top blind = 10s < 11s): bare second
+        // 409. The restored round's deferral is unresolved →
+        // Exhausted → lose (#2) on schedule.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 12, 12));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+
+        assert!(
+            !state.is_leader(),
+            "a mid-arm evidence re-acquire must adjudicate the same round's \
+             409 against post-restore standing; pre-fix: the pre-restore \
+             snapshot skipped adjudication and round 5 deferred instead of \
+             exhausting"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            2,
+            "the tick-top fence and the exhausted-deferral lose, nothing else"
+        );
+
+        shutdown.cancel();
+        for _ in 0..6 {
+            if let Some(req) = park.try_next().await {
+                if req.path.contains("/pods/us") {
+                    req.respond_ok(pod_ok("us"));
+                } else {
+                    req.respond_status(404, "NotFound", "gone");
+                }
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
     /// merged_bug_122 (acquire-before-fence): consuming own-commit
     /// evidence whose ledger anchor is ALREADY past the self-fence
     /// deadline must not take the acquire edge — the very next
@@ -8780,6 +9382,200 @@ mod tests {
             violations(&green).is_empty(),
             "the full-producer dispatch form must pass"
         );
+    }
+
+    // r[verify sched.lease.holder-evidenced-lose+3]
+    // r[verify sched.lease.cancelled-write+2]
+    /// W12-W at the kernel tier (merged_bug_053, the headline cell):
+    /// over the FULL `act x holder x content x ledger x fence x
+    /// standing` product, the round derivation orders consumption
+    /// before adjudication — a round that consumes funnel-grade
+    /// evidence can NEVER fire the exhausted lose edge (the
+    /// stale-snapshot wipe is underivable), its own 409 still pends
+    /// (Deferred — the two-409 bound neither stretches nor collapses),
+    /// the defer edge never stamps, and folding the plan through the
+    /// PRODUCTION standing transitions lands every edge on a coherent
+    /// final standing (the Defer arm's "latch set" precondition is
+    /// machine-true — the W12-W3 cell).
+    ///
+    /// STRAWMAN DISCLOSURE (claim-strength record): `complete_round`
+    /// did not exist pre-fix, so this table cannot run red against the
+    /// old arm; the red-first witnesses for this WO are the two loop
+    /// schedules (conflict_round_adjudicates_after_evidence_consumption,
+    /// fenced_mid_arm_reacquire_enters_deferral_with_latch_set) whose
+    /// pre-fix reds are quoted verbatim in the commit body. This table
+    /// additionally pins the fence-shadowed headline cell those
+    /// schedules cannot reach (pending latch + believing + evidence in
+    /// one round needs tick-top blind <= 10s off a >= 5s-stale ledger
+    /// stamp — geometrically excluded at the shipped 5s/11s constants,
+    /// reachable again the moment either constant moves).
+    #[test]
+    fn complete_round_consumption_precedes_adjudication_over_full_product() {
+        for act in ActCell::ALL {
+            for holder in HolderCell::ALL {
+                for content in ContentCell::ALL {
+                    for ledger in LedgerCell::ALL {
+                        for past_fence in [false, true] {
+                            for believes in [false, true] {
+                                for deferred in [false, true] {
+                                    if deferred && !believes {
+                                        // Unreachable by the algebra: the
+                                        // latch's only set path runs while
+                                        // believing, and every belief-ending
+                                        // transition clears it (latch =>
+                                        // believes; kani exhaustion proof).
+                                        continue;
+                                    }
+                                    check_complete_round_cell(
+                                        act, holder, content, ledger, past_fence, believes,
+                                        deferred,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_complete_round_cell(
+        act: ActCell,
+        holder: HolderCell,
+        content: ContentCell,
+        ledger: LedgerCell,
+        past_fence: bool,
+        believes: bool,
+        deferred: bool,
+    ) {
+        use ConsumeMode as M;
+        let facts = ReadFacts {
+            holder,
+            content,
+            ledger,
+            evidence_past_fence: past_fence,
+        };
+        let standing = StandingCells { believes, deferred };
+        let plan = complete_round(facts, act, standing);
+        let cell = format!(
+            "cell (act={act:?}, holder={holder:?}, content={content:?}, \
+             ledger={ledger:?}, past_fence={past_fence}, believes={believes}, \
+             deferred={deferred}) -> {plan:?}"
+        );
+
+        let funnel_consume = matches!(plan.consume, Some(M::Restore | M::Funnel));
+        // The headline law: the exhausted lose edge requires an
+        // UNRESOLVED deferral — a round that consumed funnel-grade
+        // evidence answered the pending question and cannot lose on it.
+        if plan.edge == RoundEdge::Lose(CompletedLoseEvidence::ConflictDeferralExhausted) {
+            assert!(
+                deferred && !funnel_consume,
+                "exhausted lose without an unresolved pending deferral: {cell}"
+            );
+        }
+        // The round's own 409 pends after consumption (the two-409
+        // bound does not stretch: the latch is SET when Defer runs).
+        if funnel_consume {
+            assert!(
+                matches!(act, ActCell::Conflict),
+                "the consult is Conflict-arm-only: {cell}"
+            );
+            assert_eq!(
+                plan.adjudication,
+                Some(ConflictResolution::Deferred),
+                "an evidence-consuming round defers its OWN 409: {cell}"
+            );
+        }
+        // Consumption routes exactly the own-commit evidence cell.
+        assert_eq!(
+            plan.consume.is_some(),
+            matches!(act, ActCell::Conflict)
+                && holder == HolderCell::Us
+                && content == ContentCell::Moved
+                && ledger == LedgerCell::Armed,
+            "consume == the (Conflict, Us, Moved, Armed) cell exactly: {cell}"
+        );
+        if let Some(mode) = plan.consume {
+            assert_eq!(
+                mode,
+                M::derive(past_fence, believes),
+                "one ConsumeMode producer: {cell}"
+            );
+        }
+        // The blind-budget law: a deferral never restarts the blind
+        // window; every other Completed round stamps.
+        assert_eq!(
+            plan.attempt_stamp,
+            plan.edge != RoundEdge::Defer,
+            "defer-never-stamps / resolved-always-stamps: {cell}"
+        );
+        assert_eq!(
+            plan.edge == RoundEdge::Defer,
+            plan.adjudication == Some(ConflictResolution::Deferred),
+            "Defer <=> a Deferred adjudication: {cell}"
+        );
+        // Edge partition: acquire/still-leading are exactly the
+        // Leading results (the executor's expects discharge on this).
+        assert_eq!(
+            matches!(plan.edge, RoundEdge::Acquire | RoundEdge::StillLeading),
+            matches!(act, ActCell::Leading),
+            "Leading <=> the held edges: {cell}"
+        );
+        // Ledger and baseline laws.
+        assert_eq!(
+            plan.clear_ledger_wholesale,
+            !matches!(act, ActCell::Conflict),
+            "only a Conflict leaves the ledger armed: {cell}"
+        );
+        assert_eq!(
+            plan.baseline == BaselineEdge::NoCompletedRead,
+            holder == HolderCell::Absent,
+            "facts-absent rounds re-baseline to NoCompletedRead: {cell}"
+        );
+        assert_eq!(plan.confirm, matches!(act, ActCell::Leading), "{cell}");
+
+        // Agreement fold: drive a PRODUCTION standing through the
+        // plan's transitions (the cfg-gated driver delegates to the
+        // production methods) and assert the plan's view of the
+        // post-round standing is the algebra's own.
+        let mut s = LeaseStanding::new();
+        if believes {
+            s.on_observed(true);
+            if deferred {
+                assert!(matches!(
+                    s.on_believing_conflict(),
+                    ConflictResolution::Deferred
+                ));
+            }
+        }
+        if funnel_consume {
+            s.on_observed(true);
+        }
+        if let Some(predicted) = plan.adjudication {
+            assert_eq!(
+                s.on_believing_conflict(),
+                predicted,
+                "the derivation's adjudication is the production body's \
+                 verdict on post-consumption standing: {cell}"
+            );
+        }
+        match plan.edge {
+            RoundEdge::Acquire | RoundEdge::StillLeading => s.on_observed(true),
+            RoundEdge::Lose(ev) => ev.apply(&mut s),
+            RoundEdge::StandbyObserved => s.on_observed(false),
+            RoundEdge::Defer => {
+                // The deferral arm's precondition (the W12-W3 cell):
+                // the latch is genuinely set when Defer runs.
+                assert!(
+                    s.conflict_deferred,
+                    "Defer must leave the latch set for the next round: {cell}"
+                );
+            }
+        }
+        if matches!(plan.edge, RoundEdge::Lose(_)) {
+            assert!(!s.believes(), "every lose edge ends belief: {cell}");
+        }
     }
 
     // r[verify sched.lease.holder-evidenced-lose+3]
