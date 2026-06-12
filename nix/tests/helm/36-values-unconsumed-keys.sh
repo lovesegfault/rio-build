@@ -93,7 +93,7 @@ extract_unconsumed() {
   # refs globally; binds and `$var.path` joins PER TEMPLATE FILE
   # (merged_bug_328 — Helm variable scope is the file/define, never
   # the chart-wide concatenation).
-  : > "$T/refs"; : > "$T/joins"
+  : > "$T/refs"; : > "$T/joins"; : > "$T/rebinds"
   for tf in "$chartdir"/templates/*.yaml "$chartdir"/templates/*.tpl; do
     [ -e "$tf" ] || continue
     strip_comments "$tf" > "$T/tf0"
@@ -104,6 +104,19 @@ extract_unconsumed() {
     { grep -oE '\.Values\.[A-Za-z0-9_.]+' "$T/tf1" || true; } | sed 's/^\.Values\.//' >> "$T/refs"
     { grep -oE '\$[A-Za-z0-9_]+ *:= *\$?\.Values\.[A-Za-z0-9_.]+' "$T/tf0" || true; } \
       | sed -E 's/\$([A-Za-z0-9_]+) *:= *\$?\.Values\./\1 /' | sort -u > "$T/tbinds"
+    # WO-S8-13 (bug_169): the join domain must honor the LANGUAGE's
+    # scope rule. tbinds is per-FILE; a same-file rebind of one $var
+    # to a DIFFERENT .Values subtree would join every use to BOTH
+    # subtrees, silently cross-blessing the dead twin (the exact
+    # duplicated-dead-knob class this lint exists for, fail-open).
+    # Cheapest sound form per the script's own posture: REFUSE the
+    # rebind loudly (the define-scope tracker alternative is
+    # rejected -- refusal closes the face without a template-language
+    # parser); a reviewer renames one binding.
+    awk '{print $1}' "$T/tbinds" | sort | uniq -d | while read -r dupvar; do
+      echo "$tf: \$$dupvar rebound to different .Values subtrees in one file:" >> "$T/rebinds"
+      grep "^$dupvar " "$T/tbinds" | sed 's/^/        /' >> "$T/rebinds"
+    done
     while read -r var path; do
       { grep -oE "\\\$$var\.[A-Za-z0-9_.]+" "$T/tf1" || true; } | sed "s/^\\\$$var\./$path./" >> "$T/joins"
     done < "$T/tbinds"
@@ -163,8 +176,35 @@ grep -qx 'zzCommentOnlyB' "$T/unconsumed-red3" || {
   exit 1
 }
 
+# ── planted RED 4 (WO-S8-13/bug_169): a SAME-FILE rebind of one $var
+# to a different .Values subtree must REFUSE, never silently bless
+# the dead twin through a both-subtree join ──
+red4=$TMPDIR/chart-169-samefile
+rm -rf "$red4"
+cp -r . "$red4"
+printf '\nzzSameHost:\n  zzDeadLeaf: 1\nzzSameOther:\n  zzDeadLeaf: 1\n' >> "$red4/values.yaml"
+cat > "$red4/templates/zz-samefile.yaml" <<'TPL'
+{{- $zs := .Values.zzSameHost }}
+zza: {{ $zs.zzDeadLeaf }}
+{{- $zs := .Values.zzSameOther }}
+zzb: {{ $zs.zzDeadLeaf }}
+TPL
+extract_unconsumed "$red4" "$T/unconsumed-red4"
+grep -q 'zz-samefile.yaml.*\$zs rebound' "$T/rebinds" || {
+  echo "FAIL: planted same-file \$var rebind was NOT refused — the join silently" >&2
+  echo "      cross-blesses dead twins (bug_169, fail-open)" >&2
+  exit 1
+}
+
 # ── real chart ──
 extract_unconsumed "$root" "$T/unconsumed-raw"
+if [ -s "$T/rebinds" ]; then
+  echo "FAIL: same-file \$var rebinds to different .Values subtrees — the" >&2
+  echo "      values-consumption join cannot be sound under them; rename one" >&2
+  echo "      binding (bug_169):" >&2
+  sed 's/^/        /' "$T/rebinds" >&2
+  exit 1
+fi
 
 # apply allowlist; every entry must be live (census)
 jq -r '.[].prefix' "$T/allowlist.json" > "$T/allowprefixes"
