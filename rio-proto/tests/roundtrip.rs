@@ -131,3 +131,40 @@ fn types_module_merges_all_proto_files() {
     let _ = rio_proto::types::ClusterStatusResponse::default(); // admin_types.proto
     let _ = rio_proto::types::PathInfo::default(); // types.proto
 }
+
+/// `AppendLogAck.open_coverage_next_line` back-compat (the wire-1
+/// coverage-ack letter, read-side-first): bytes encoded WITHOUT tag 2 —
+/// a legacy server's chunk ack — decode to `None`, the legacy
+/// semantics (a plain chunk ack; the client trims nothing at open).
+/// Presence is the open-ack discriminator, so `Some(0)` and `None`
+/// must stay distinguishable through the wire: an open ack with empty
+/// coverage is typed as the letter (no trim, but the letter was
+/// spoken) while absence means the letter was never sent.
+#[test]
+fn append_log_ack_open_coverage_absent_is_legacy() {
+    use rio_proto::store::AppendLogAck;
+
+    // A legacy chunk ack: only field 1 on the wire.
+    let legacy = AppendLogAck {
+        durable_through_line: 41,
+        open_coverage_next_line: None,
+    };
+    let bytes = legacy.encode_to_vec();
+    let decoded = AppendLogAck::decode(&*bytes).unwrap();
+    assert_eq!(decoded.durable_through_line, 41);
+    assert_eq!(
+        decoded.open_coverage_next_line, None,
+        "absent tag 2 decodes as the legacy chunk-ack semantics"
+    );
+
+    // The open-time coverage ack: presence survives the roundtrip,
+    // including at the zero value (presence != value).
+    for watermark in [0u64, 7] {
+        let open_ack = AppendLogAck {
+            durable_through_line: watermark.saturating_sub(1),
+            open_coverage_next_line: Some(watermark),
+        };
+        let decoded = AppendLogAck::decode(&*open_ack.encode_to_vec()).unwrap();
+        assert_eq!(decoded.open_coverage_next_line, Some(watermark));
+    }
+}

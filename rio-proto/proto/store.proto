@@ -212,9 +212,27 @@ message AppendLogHeader {
   string exec_id = 2;         // UUIDv7; validated against the latest assignments row
 }
 
-// Sent after each durably committed chunk (S3 PUT + manifest INSERT both done).
+// Sent after each durably committed chunk (S3 PUT + manifest INSERT both
+// done) — and, when the execution already has durable contiguous coverage,
+// ONCE at stream open as the open-time coverage ack (the first message on
+// the ack stream).
 message AppendLogAck {
   uint64 durable_through_line = 1;
+  // The open-time durable-coverage watermark: one past the highest line of
+  // the execution's CONTIGUOUS committed coverage at session open. PRESENT
+  // exactly on the open-time coverage ack (never on chunk acks); the server
+  // sends that ack only when the watermark is positive, with
+  // durable_through_line = open_coverage_next_line - 1 so the message is a
+  // true durability statement even for clients that predate this field.
+  // The client trims its retransmit buffer below the watermark before
+  // replaying — committed-but-unacked content from a previous session is
+  // already durable and re-sending it would be dropped (and, pre-trim,
+  // double-charged on legacy servers). ABSENT = legacy semantics: a plain
+  // chunk ack, or a pre-watermark server that never speaks the letter —
+  // the client trims nothing at open and replays its full buffer (the
+  // server-side covered-replay drop and merged-account seed keep that
+  // correct, just less efficient).
+  optional uint64 open_coverage_next_line = 2;
 }
 
 message TailLogRequest {

@@ -1323,6 +1323,7 @@ mod tests {
                 .expect("acking a closed session");
             tx.send(Ok(AppendLogAck {
                 durable_through_line,
+                open_coverage_next_line: None,
             }))
             .await
             .expect("ack send");

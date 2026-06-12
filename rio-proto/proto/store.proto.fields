@@ -1,6 +1,7 @@
 AppendLogHeader header = 1;
 bool follow = 4;
 bool is_complete = 4;
+optional uint64 open_coverage_next_line = 2;
 repeated bytes lines = 2;
 rio.types.BuildLogBatch batch = 2;
 string derivation = 1;

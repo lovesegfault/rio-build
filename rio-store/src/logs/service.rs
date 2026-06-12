@@ -1319,6 +1319,7 @@ impl AppendDriver {
                                     ack_tx,
                                     Ok(AppendLogAck {
                                         durable_through_line: durable_through,
+                                        open_coverage_next_line: None,
                                     }),
                                 );
                             }
@@ -1598,6 +1599,7 @@ impl AppendDriver {
                     ack_tx,
                     Ok(AppendLogAck {
                         durable_through_line,
+                        open_coverage_next_line: None,
                     }),
                     self.session_cut_interval(),
                 )
@@ -1663,6 +1665,7 @@ impl AppendDriver {
                         ack_tx,
                         Ok(AppendLogAck {
                             durable_through_line,
+                            open_coverage_next_line: None,
                         }),
                     );
                 }
@@ -2942,6 +2945,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Result<AppendLogAck, Status>>(1);
         tx.try_send(Ok(AppendLogAck {
             durable_through_line: 0,
+            open_coverage_next_line: None,
         }))
         .expect("fill the queue");
         // RED (kept as the falsify twin of the bounded form): raw send
@@ -2951,6 +2955,7 @@ mod tests {
             std::time::Duration::from_secs(3600),
             tx.send(Ok(AppendLogAck {
                 durable_through_line: 1,
+                open_coverage_next_line: None,
             })),
         )
         .await;
@@ -2965,6 +2970,7 @@ mod tests {
             &tx,
             Ok(AppendLogAck {
                 durable_through_line: 1,
+                open_coverage_next_line: None,
             }),
             std::time::Duration::from_secs(60),
         )
