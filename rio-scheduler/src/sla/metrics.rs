@@ -134,7 +134,10 @@ pub fn describe_all() {
          cursor freezes loud (sched.sla.epoch-domain's R29 sibling, \
          merged_bug_063); `unknown_class`: a cell event or observation \
          named a hw class outside the configured set \
-         (sched.sla.class-membership). \
+         (sched.sla.class-membership); `cursor_fence`: the whole \
+         lambda persist unit refused because the stored consumption \
+         cursor is ahead of the writer's — a deposed fold no-ops as \
+         ONE (sched.sla.one-fence-axis). \
          Sustained nonzero ⇒ a producer is shipping junk evidence (or \
          a poisoned PG row needs operator surgery); the stores stay \
          clean but the named plane is learning nothing from those \
@@ -461,11 +464,15 @@ pub const SLA_LABELED_METRICS: &[(&str, &str, &[&str])] = &[
         // hw_ladder row's precedent).
         // bw11 WO-S6-4: the configured-set membership refusal at the
         // closed-domain stores' growth seams.
+        // bw12 merged_bug_048: the one-fence-axis cursor abort (the
+        // whole lambda persist unit refused when the stored
+        // consumption position is ahead — cost.rs persist_rows).
         &[
             "zero_resource",
             "nonfinite_epoch",
             "sequence_premise",
             "unknown_class",
+            "cursor_fence",
         ],
     ),
     (

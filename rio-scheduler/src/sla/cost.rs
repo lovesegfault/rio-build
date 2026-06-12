@@ -958,31 +958,22 @@ impl CostTable {
                 .await?;
             }
         }
-        // The λ EMAs and the consumption cursor are ONE atomic unit
-        // (merged_bug_063): a split persist (EMAs landed, cursor not —
-        // or vice versa) would re-fold or permanently skip the rows in
-        // between on the next reload. One transaction; the cursor row
-        // is value-monotone qual'd (its own datum is the fence — a
-        // deposed writer's stale cursor can never rewind consumption).
+        // r[impl sched.sla.one-fence-axis]
+        // The λ EMAs, the consumption cursor, and node_count are ONE
+        // atomic unit (merged_bug_063): a split persist would re-fold
+        // or permanently skip the rows in between on the next reload.
+        // The unit is fenced on ONE axis — its strictest monotone
+        // datum, the cursor (merged_bug_048): the cursor writes FIRST
+        // and a refused write (rows_affected == 0: the stored
+        // consumption position is ahead of this writer's) aborts the
+        // WHOLE fold before any EMA row lands. The per-row updated_at
+        // quals below are redundant backstops only — updated_at is
+        // stallable VALUE-time (an all-late-committing batch advances
+        // the cursor while the stamp holds), so equal-stamp admission
+        // does NOT imply equal consumption progress and the stamp can
+        // no longer be the unit's fence.
         let mut txn = db.pool().begin().await?;
-        for (h, ema) in &self.lambda {
-            sqlx::query(
-                "INSERT INTO sla_ema_state (cluster, key, value, numerator, denominator, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, to_timestamp($6)) \
-                 ON CONFLICT (cluster, key) DO UPDATE SET \
-                   value = $3, numerator = $4, denominator = $5, updated_at = to_timestamp($6) \
-                 WHERE sla_ema_state.updated_at <= to_timestamp($6)",
-            )
-            .bind(&self.cluster)
-            .bind(format!("lambda:{h}"))
-            .bind(ema.value_or(LAMBDA_SEED))
-            .bind(ema.numerator)
-            .bind(ema.denominator)
-            .bind(ema.updated_at.as_secs_f64())
-            .execute(&mut *txn)
-            .await?;
-        }
-        sqlx::query(
+        let cursor_rows = sqlx::query(
             "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
              VALUES ($1, 'lambda_cursor', $2, to_timestamp($3)) \
              ON CONFLICT (cluster, key) DO UPDATE SET value = $2, updated_at = to_timestamp($3) \
@@ -992,25 +983,65 @@ impl CostTable {
         .bind(self.lambda_cursor as f64)
         .bind(now_epoch())
         .execute(&mut *txn)
-        .await?;
-        // node_count rides the same transaction: it is folded from
-        // the same consumed window as λ, so a split persist would
-        // double-fold it on replay.
-        for (h, nc) in &self.node_count {
-            sqlx::query(
-                "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
-                 VALUES ($1, $2, $3, to_timestamp($4)) \
-                 ON CONFLICT (cluster, key) DO UPDATE SET value = $3, updated_at = to_timestamp($4) \
-                 WHERE sla_ema_state.updated_at <= to_timestamp($4)",
+        .await?
+        .rows_affected();
+        if cursor_rows == 0 {
+            // Typed, counted refusal — never an error: the stored
+            // cursor is ahead, so this body's whole window view is
+            // stale and landing ANY row of the unit would split it.
+            // The surfaces outside the unit (price rows above,
+            // sla_observed_instance_types below) proceed under their
+            // own per-surface fences.
+            txn.rollback().await?;
+            tracing::warn!(
+                cluster = %self.cluster,
+                cursor = self.lambda_cursor,
+                "lambda persist unit refused at the cursor fence \
+                 (stored consumption is ahead; deposed-writer fold)"
+            );
+            ::metrics::counter!(
+                "rio_scheduler_sla_evidence_refused_total",
+                "plane" => "lambda_unit",
+                "reason" => "cursor_fence"
             )
-            .bind(&self.cluster)
-            .bind(format!("node_count:{h}"))
-            .bind(nc.value)
-            .bind(nc.updated_at.as_secs_f64())
-            .execute(&mut *txn)
-            .await?;
+            .increment(1);
+        } else {
+            for (h, ema) in &self.lambda {
+                sqlx::query(
+                    "INSERT INTO sla_ema_state (cluster, key, value, numerator, denominator, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, to_timestamp($6)) \
+                     ON CONFLICT (cluster, key) DO UPDATE SET \
+                       value = $3, numerator = $4, denominator = $5, updated_at = to_timestamp($6) \
+                     WHERE sla_ema_state.updated_at <= to_timestamp($6)",
+                )
+                .bind(&self.cluster)
+                .bind(format!("lambda:{h}"))
+                .bind(ema.value_or(LAMBDA_SEED))
+                .bind(ema.numerator)
+                .bind(ema.denominator)
+                .bind(ema.updated_at.as_secs_f64())
+                .execute(&mut *txn)
+                .await?;
+            }
+            // node_count rides the same transaction: it is folded from
+            // the same consumed window as λ, so a split persist would
+            // double-fold it on replay.
+            for (h, nc) in &self.node_count {
+                sqlx::query(
+                    "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
+                     VALUES ($1, $2, $3, to_timestamp($4)) \
+                     ON CONFLICT (cluster, key) DO UPDATE SET value = $3, updated_at = to_timestamp($4) \
+                     WHERE sla_ema_state.updated_at <= to_timestamp($4)",
+                )
+                .bind(&self.cluster)
+                .bind(format!("node_count:{h}"))
+                .bind(nc.value)
+                .bind(nc.updated_at.as_secs_f64())
+                .execute(&mut *txn)
+                .await?;
+            }
+            txn.commit().await?;
         }
-        txn.commit().await?;
         // Unconditional w.r.t. `self.source`: instance types are
         // observed regardless of Spot/Static. `last_observed` is
         // data-time (`InstanceType.last_observed`), NOT `now()` — see
@@ -2201,12 +2232,17 @@ async fn sweep_interrupt_samples_rows(db: &SchedulerDb, cluster: &str) -> sqlx::
 ///   GENERATION captured at construction — a lose-then-reacquire
 ///   between tick entry and the write changes the generation even
 ///   when `is_leader` reads true again, so the stale body refuses.
-/// - **The suspenders (PG-side, per-row):** the upsert SQL carries
-///   the updated_at/last_observed monotonicity qual — a row never
-///   rewinds, whoever the writer is. The deposed-writer corruption
-///   IS a rewind (stale snapshot stamps over the successor's fresher
-///   rows, corrupting the next decay dt), so PG itself refuses it
-///   row by row even if a racing write slips past the latch.
+/// - **The suspenders (PG-side):** the λ unit (EMAs + cursor +
+///   node_count) is fenced on its ONE strictest monotone datum — the
+///   consumption cursor writes first and `rows_affected == 0` aborts
+///   the whole transaction (sched.sla.one-fence-axis), so a deposed
+///   writer's stale fold no-ops as ONE even on the equal-stamp tie
+///   face where the per-row `updated_at` quals admit (updated_at is
+///   stallable value-time, NOT a consumption fence — merged_bug_048).
+///   The per-row monotonicity quals remain as redundant backstops,
+///   and they stay PRIMARY for the surfaces outside the unit (price
+///   rows; `sla_observed_instance_types`' strictly-newer merge law) —
+///   a row never rewinds, whoever the writer is.
 ///
 /// Refusal is typed ([`PersistOutcome::RefusedDeposed`]) and logged
 /// by callers — never an error: a deposed tick has nothing to
@@ -3618,6 +3654,72 @@ mod tests {
         assert!((nc.updated_at.as_secs_f64() - 7100.0).abs() < 1.0);
         // λ̂ recomputed identically from the round-tripped state.
         assert!((r.lambda_for("intel-7") - t.lambda_for("intel-7")).abs() < 1e-12);
+    }
+
+    // r[verify sched.sla.one-fence-axis]
+    /// **W12-AE (merged_bug_048, red-first)** — *the atomic λ unit
+    /// lands or no-ops as ONE under deposition, at the equal-stamp tie
+    /// face W10-BA never drove.* The wave-11 cursor redesign made
+    /// `updated_at` stallable VALUE-time: an all-late-committing batch
+    /// advances the cursor while the stamp holds, so a deposed writer
+    /// can present an EQUAL stamp with a LOWER cursor. Pre-fix red: the
+    /// equality-admitting `updated_at <=` quals landed the deposed
+    /// writer's stale EMA halves while its cursor write no-opped — the
+    /// declared-atomic unit split (and a successor reload then
+    /// permanently skipped the inter-cursor rows). Post-fix the cursor
+    /// writes FIRST and `rows_affected == 0` aborts the whole fold: the
+    /// unit no-ops as ONE.
+    #[tokio::test]
+    async fn w12_ae_lambda_unit_noops_whole_under_deposed_equal_stamp_fold() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        let stamp = Epoch::from_wall_clock(7100.0);
+        // The successor's fold: cursor 200, fresh EMA halves at stamp T.
+        let mut succ = CostTable::seeded("c", HwCostSource::Spot);
+        succ.lambda.insert(
+            "h".into(),
+            RatioEma {
+                numerator: 10.0,
+                denominator: 1000.0,
+                updated_at: stamp,
+            },
+        );
+        succ.set_node_count("h", 12.0, 7100.0);
+        succ.lambda_cursor = 200;
+        succ.persist_rows(&sdb).await.unwrap();
+        // The deposed writer: LOWER cursor (it consumed less) at the
+        // EQUAL value-time stamp, stale EMA halves.
+        let mut dep = CostTable::seeded("c", HwCostSource::Spot);
+        dep.lambda.insert(
+            "h".into(),
+            RatioEma {
+                numerator: 5.0,
+                denominator: 500.0,
+                updated_at: stamp,
+            },
+        );
+        dep.set_node_count("h", 3.0, 7100.0);
+        dep.lambda_cursor = 100;
+        dep.persist_rows(&sdb).await.unwrap();
+        let r = CostTable::load(&sdb, "c", HwCostSource::Spot)
+            .await
+            .unwrap();
+        assert_eq!(r.lambda_cursor, 200, "the cursor never rewinds");
+        let l = r.lambda.get("h").unwrap();
+        assert!(
+            (l.numerator - 10.0).abs() < 1e-9 && (l.denominator - 1000.0).abs() < 1e-9,
+            "the unit no-ops as ONE: pre-fix the deposed equal-stamp fold \
+             overwrote the successor's EMAs (got {}/{}) while its cursor \
+             write no-opped — the declared-atomic unit split",
+            l.numerator,
+            l.denominator
+        );
+        let nc = r.node_count.get("h").unwrap();
+        assert!(
+            (nc.value - 12.0).abs() < 1e-9,
+            "node_count rides the unit: got {}",
+            nc.value
+        );
     }
 
     /// bug_034: under `hwCostSource: static` the documented contract is

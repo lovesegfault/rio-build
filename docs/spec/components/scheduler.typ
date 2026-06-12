@@ -5335,6 +5335,32 @@ stale footprint. The sub-population weight census ([GEN-SET],
 tree and REDs on any exempt arm; W12-AD pins the inverse-population
 direction the wave-11 fixtures never drove.
 
+#r("sched.sla.one-fence-axis")[
+  Rows declared one atomic persist unit MUST share ONE fencing axis ---
+  the unit's strictest monotone datum. The lambda unit (EMAs, consumption
+  cursor, node_count) writes the cursor FIRST inside the transaction and
+  aborts the whole fold when the stored cursor is ahead
+  (`rows_affected = 0`); no row of the unit lands unless the cursor
+  admits. Per-row stamp quals are redundant backstops only: a stallable
+  value-time stamp admits equal-stamp folds and cannot fence consumption.
+]
+
+merged_bug_048: the wave-11 cursor redesign made `updated_at` pure
+value-time --- an all-late-committing batch advances the cursor while
+the stamp holds --- so the unit's two fences (time on the EMAs, value on
+the cursor) disagreed on the tie face: a deposed writer's equal-stamp
+stale fold overwrote the successor's EMAs while its lower cursor write
+no-opped, splitting the unit, and a successor reload then permanently
+skipped the inter-cursor rows. The `LeaderOwnedPersist` doc certified
+the per-row qual as THE deposed-writer fence; it is re-derived to
+backstop status. W12-AE drives the equal-stamp deposed schedule the
+W10-BA witness never reached. The qual-column alternative (carrying the
+cursor as a qual column on every row) is REJECTED: one statement
+ordering closes the face with zero schema impact, and the column form
+smells of DDL (none is allocated). Same-class sibling swept: the
+controller's hw_perf_samples exposure cursor is a single in-memory
+monotone position with no second fencing axis --- verified, no edit.
+
 #r("sched.sla.forecast.one-layer+2")[
   `compute_spawn_intents` walks the Ready frontier AND a forecast frontier of
   `Queued` derivations whose every incomplete dependency is running with a
