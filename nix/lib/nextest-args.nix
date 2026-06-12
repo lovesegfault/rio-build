@@ -53,6 +53,7 @@ let
     "rio-controller"
     "rio-migrations"
     "rio-test-support"
+    "rio-build-cli"
   ];
   # Helm templates whose expr:/query: blocks the alert-parity tests
   # (tests/alert_metrics.rs in rio-scheduler and rio-store) parse at
