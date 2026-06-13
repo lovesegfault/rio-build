@@ -1240,6 +1240,23 @@ pub(crate) async fn pull_complete_success(
     .await
 }
 
+/// bug_065 (R31'(v) — fixtures derive from producers): the hard limit
+/// a worker can actually read back is kubelet's project quota on the
+/// overlays emptyDir = the controller-stamped sizeLimit = the SHARED
+/// `rio_common::k8s::overlay_size_limit_bytes` over the intent's own
+/// headroom (the controller's flat 1.5 fallback when the intent
+/// carries none — `intent_headroom`'s composition). A fixture
+/// stamping `hard_limit_bytes: disk_bytes` asserts a value kubelet
+/// cannot mint; the re-denominated corroboration band refuses it.
+pub(crate) fn kubelet_minted_hard_limit(i: &crate::state::SolvedIntent) -> u64 {
+    let h = if i.disk_headroom > 0.0 {
+        i.disk_headroom
+    } else {
+        1.5
+    };
+    rio_common::k8s::overlay_size_limit_bytes(i.disk_bytes, h)
+}
+
 /// bug_090: a typed corroborated sizing-failure payload — the wire
 /// form the floor gate consumes (free text no longer drives floors).
 /// `peak_memory_bytes` is the oom corroborant; `quota` the disk one.

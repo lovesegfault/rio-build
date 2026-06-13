@@ -116,6 +116,87 @@ pub fn features_compatible(required: &[String], provides: &[String]) -> bool {
 /// in `READ_ONLY_ROOT_MOUNTS`).
 pub const BUILDER_SERVING_STATE_FILE: &str = "/tmp/rio-serving";
 
+// ── pod ephemeral-storage denomination (bug_065, R33'(ii)) ──────────
+// ONE shared mint for "the quota" across the controller/scheduler
+// seam. The controller stamps the overlays emptyDir sizeLimit AND the
+// pod ephemeral-storage request/limit from these fns
+// (pool/jobs.rs::apply_intent_resources). kubelet's DESIRED quota
+// size for the volume is min(pod ephemeral limit, emptyDir sizeLimit)
+// (k8s 1.33 desired_state_of_world.go AddPodToVolume — the sizeLimit
+// side here, always smaller: the pod limit adds fuse + log on top) —
+// BUT at the deployed minors AssignQuota writes the NON-ENFORCING
+// sentinel instead of the desired size (quota_linux.go: `fsbytes :=
+// ibytes; if fsbytes > 0 { fsbytes = -1 }` — "when enforcing quotas
+// are enabled, we'll condition this"; the project quota tracks usage
+// for eviction, it does not enforce), so the worker-visible hard
+// limit is the sentinel (reads ~u64::MAX) and the DiskFull lane is
+// DORMANT from kubelet-assigned quotas. The vm-kubelet-projquota
+// denomination cells pin that sentinel at the deployed-adjacent
+// minor: if kubelet ever starts enforcing the desired size, the cells
+// red and this contract activates. [`overlay_size_limit_bytes`] is
+// therefore the denomination of (a) the kubelet EVICTION accounting
+// (sizeLimit overshoot — pod-attributed eviction), and (b) any
+// ENFORCED-quota world (the vm-quota-probe manual-limit harness; a
+// future enforcing kubelet); the scheduler's corroboration band
+// (actor/floor.rs::corroborated_sizing) consumes the SAME fn with the
+// [`DISK_HEADROOM_MIN`]/[`DISK_HEADROOM_MAX`] codomain bounds, and
+// REFUSES sentinel-armed claims by construction — the two sides
+// cannot drift into different denominations without this file
+// changing (the §Simulator-shares-accounting law one seam up;
+// `footprint::container_mem_bytes` is the mem-axis precedent).
+
+/// Reserved bytes for build logs + nix-daemon state living OUTSIDE
+/// the overlay (stdout/stderr capture lands on the container fs).
+/// 1 GiB headroom; part of [`pod_ephemeral_request_bytes`], never of
+/// the overlay sizeLimit.
+pub const LOG_BUDGET_BYTES: u64 = 1 << 30;
+
+/// The disk-headroom codomain LOWER bound: the scheduler's
+/// variance-aware curve `headroom(n_eff) = 1.25 + 0.7/sqrt(n_eff)`
+/// (sla/fit.rs) approaches-but-never-reaches 1.25 from above, and the
+/// controller's flat fallback (1.5, pre-ADR-023 skew) sits inside the
+/// band. The corroboration band's floor derives from this bound; the
+/// curve's conformance is pinned where the band lives
+/// (actor/floor.rs tests).
+pub const DISK_HEADROOM_MIN: f64 = 1.25;
+
+/// The disk-headroom codomain UPPER bound: `headroom(n_eff)` is
+/// monotone decreasing on the clamped domain `n_eff >= 1`, so its
+/// maximum is `headroom(1) = 1.25 + 0.7 = 1.95` exactly.
+pub const DISK_HEADROOM_MAX: f64 = 1.95;
+
+/// kubelet rounds the assigned project quota UP to fs quota blocks
+/// (1 KiB units in the XFS ioctl); consumers comparing a read-back
+/// `hard_limit_bytes` against [`overlay_size_limit_bytes`] allow this
+/// much slack above the stamped value. 4 KiB covers any fs block
+/// size in the fleet.
+pub const KUBELET_QUOTA_BLOCK_SLACK: u64 = 4096;
+
+// The band is non-degenerate and brackets the controller's flat
+// fallback (1.5) — compile-time, so a band edit that orphans the
+// fallback cannot build.
+const _: () = assert!(DISK_HEADROOM_MIN < 1.5 && 1.5 < DISK_HEADROOM_MAX);
+
+/// The overlays emptyDir sizeLimit for a solved disk axis:
+/// `disk_bytes x headroom` (the solve-axis quota denomination — what
+/// kubelet enforces on the overlay project and what the worker's
+/// exhaustion telemetry reports as `hard_limit_bytes`).
+pub fn overlay_size_limit_bytes(disk_bytes: u64, headroom: f64) -> u64 {
+    (disk_bytes as f64 * headroom) as u64
+}
+
+/// Pod `ephemeral-storage` request/limit: the overlay component plus
+/// the FUSE-cache emptyDir budget plus [`LOG_BUDGET_BYTES`]. The
+/// controller-side wrapper (`pool/jobs.rs::pod_ephemeral_request`)
+/// delegates here; helm's `14-disk-ceiling.sh` mirrors the arithmetic
+/// by content (its rows are pinned by the controller's
+/// `disk_four_caller_census`).
+pub fn pod_ephemeral_request_bytes(disk_bytes: u64, headroom: f64, fuse_cache_bytes: u64) -> u64 {
+    overlay_size_limit_bytes(disk_bytes, headroom)
+        .saturating_add(fuse_cache_bytes)
+        .saturating_add(LOG_BUDGET_BYTES)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +249,30 @@ mod tests {
             &s(&["kvm", "nixos-test"]),
             &s(&["kvm"])
         ));
+    }
+
+    /// bug_065: the one-mint identities. The ephemeral request is
+    /// EXACTLY overlay + fuse + log (no hidden terms — helm's
+    /// 14-disk-ceiling mirror and the controller census both assume
+    /// this decomposition), the overlay component is the plain
+    /// product, and the headroom band consts bracket the fallback.
+    #[test]
+    fn pod_ephemeral_decomposes_into_overlay_fuse_log() {
+        let gi = 1u64 << 30;
+        for disk in [gi, 3 * gi, 100 * gi] {
+            for h in [DISK_HEADROOM_MIN, 1.5, DISK_HEADROOM_MAX] {
+                assert_eq!(
+                    pod_ephemeral_request_bytes(disk, h, 50 * gi),
+                    overlay_size_limit_bytes(disk, h) + 50 * gi + LOG_BUDGET_BYTES,
+                );
+                assert_eq!(overlay_size_limit_bytes(disk, h), (disk as f64 * h) as u64);
+            }
+        }
+        // Saturation, not overflow, at the absurd end.
+        assert_eq!(
+            pod_ephemeral_request_bytes(u64::MAX, 1.0, u64::MAX),
+            u64::MAX
+        );
     }
 
     /// §13e: the fetcher partition is total under [`features_compatible`]'s

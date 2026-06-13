@@ -115,10 +115,13 @@ pub(crate) const IDLE_EXIT_SECS_ANNOTATION: &str = "rio.build/idle-exit-secs";
 /// with a default).
 pub(crate) const HW_BENCH_NEEDED_ANNOTATION: &str = "rio.build/hw-bench-needed";
 
-/// Log + scratch budget. nix `build-dir` lands in the overlay emptyDir
-/// (nix ≥2.30 default = stateDir/builds), but stdout/stderr capture and
-/// the daemon's own state live outside. 1 GiB headroom.
-const LOG_BUDGET_BYTES: u64 = 1 << 30;
+// Log + scratch budget (1 GiB; nix `build-dir` lands in the overlay
+// emptyDir — nix >=2.30 default = stateDir/builds — but stdout/stderr
+// capture and the daemon's own state live outside): bug_065 moved the
+// const to the shared denomination home `rio_common::k8s::
+// LOG_BUDGET_BYTES` (the scheduler's corroboration band reads the
+// same constants); the helm 14-disk-ceiling mirror rows are pinned by
+// the census test below against the shared value.
 
 // Round-10 live_058-a / bughunt-11 merged_bug_016: the worker pad
 // (256 MiB) and container floor (512 MiB) live in the SHARED home
@@ -137,6 +140,18 @@ const LOG_BUDGET_BYTES: u64 = 1 << 30;
 /// fallback only.
 pub(crate) const OVERLAY_HEADROOM_FALLBACK: f64 = 1.5;
 
+// bug_065 (R33'(ii)): the flat fallback must sit inside the shared
+// headroom codomain — the scheduler's corroboration band accepts
+// exactly hard limits minted as disk x h for h in
+// [DISK_HEADROOM_MIN, DISK_HEADROOM_MAX], so a fallback outside the
+// band would make every pre-ADR-023-skew pod's genuine exhaustion
+// read as forged. Compile-time: a band/fallback drift fails the
+// build, not a fleet.
+const _: () = assert!(
+    rio_common::k8s::DISK_HEADROOM_MIN <= OVERLAY_HEADROOM_FALLBACK
+        && OVERLAY_HEADROOM_FALLBACK <= rio_common::k8s::DISK_HEADROOM_MAX
+);
+
 /// Resolve the overlay-disk headroom multiplier for an intent.
 /// `disk_headroom_factor` is `optional` on the wire so a pre-§sizing
 /// scheduler decodes as `None`; 0.0 (proto default for `double`) is
@@ -153,7 +168,7 @@ pub(crate) fn intent_headroom(i: &SpawnIntent) -> f64 {
 /// = `disk_bytes × headroom` (overlay emptyDir, prjquota fit × the
 /// scheduler's variance-aware `headroom(n_eff)` cushion) +
 /// `fuse_cache_bytes` (input closure, the `fuse-cache` emptyDir
-/// sizeLimit) + [`LOG_BUDGET_BYTES`] (stdout/stderr capture + daemon
+/// sizeLimit) + [`rio_common::k8s::LOG_BUDGET_BYTES`] (stdout/stderr capture + daemon
 /// state outside the overlay).
 ///
 /// Single source for FOUR callers that must agree (all via
@@ -175,9 +190,11 @@ pub(crate) fn intent_headroom(i: &SpawnIntent) -> f64 {
 /// rows); the membership census is `disk_four_caller_census` below.
 // r[impl sched.sla.disk-reaches-ephemeral-storage+2]
 pub(crate) fn pod_ephemeral_request(disk_bytes: u64, headroom: f64, fuse_cache_bytes: u64) -> u64 {
-    ((disk_bytes as f64 * headroom) as u64)
-        .saturating_add(fuse_cache_bytes)
-        .saturating_add(LOG_BUDGET_BYTES)
+    // bug_065: the FORMULA lives in rio_common::k8s (one mint for the
+    // controller stamp and the scheduler corroboration band); this
+    // wrapper keeps the four-caller census anchor and the crate-local
+    // name.
+    rio_common::k8s::pod_ephemeral_request_bytes(disk_bytes, headroom, fuse_cache_bytes)
 }
 
 /// `(cores, mem, ephemeral-storage)` triple a pod for `i` will
@@ -3217,7 +3234,11 @@ pub(super) fn apply_intent_resources(
     hw: &HwClassConfig,
 ) {
     let headroom = intent_headroom(i);
-    let overlay_limit = (i.disk_bytes as f64 * headroom) as u64;
+    // bug_065: the overlay sizeLimit IS the quota denomination kubelet
+    // enforces (min(pod limit, sizeLimit) = this, always) and the
+    // scheduler's corroboration band re-derives the same product from
+    // the same shared fn — never a second open-coded formula.
+    let overlay_limit = rio_common::k8s::overlay_size_limit_bytes(i.disk_bytes, headroom);
     // live_058-a: the container triple comes from the FOOTPRINT
     // constructor (the pad/floor law) and is stamped through the
     // sealed helper — the raw solve cannot reach the resource map
@@ -3917,7 +3938,7 @@ mod tests {
         assert_eq!(q("ephemeral-storage"), fd);
         assert_eq!(
             fd,
-            ((8 * GI) as f64 * 1.5) as u64 + fetcher_fuse + LOG_BUDGET_BYTES,
+            ((8 * GI) as f64 * 1.5) as u64 + fetcher_fuse + rio_common::k8s::LOG_BUDGET_BYTES,
             "fetcher ephemeral-storage = disk×headroom + FETCHER fuse budget + log"
         );
     }
@@ -3954,7 +3975,7 @@ mod tests {
         let (_, _, eph) = intent_pod_footprint(&i, cfg_fuse).as_triple();
         assert_eq!(
             eph,
-            (3 * GI) / 2 + pod::FETCHER_FUSE_CACHE_BYTES + LOG_BUDGET_BYTES,
+            (3 * GI) / 2 + pod::FETCHER_FUSE_CACHE_BYTES + rio_common::k8s::LOG_BUDGET_BYTES,
             "cold-start fetcher ephemeral-storage = 1Gi×1.5 + fetcher fuse + 1Gi log"
         );
         assert_eq!(eph, 6_979_321_856, "= 6.5 GiB");
@@ -4354,7 +4375,7 @@ mod tests {
             let overlay_limit = ((5 * GI) as f64 * OVERLAY_HEADROOM_FALLBACK) as u64;
             assert_eq!(
                 eph,
-                Quantity((overlay_limit + expect + LOG_BUDGET_BYTES).to_string()),
+                Quantity((overlay_limit + expect + rio_common::k8s::LOG_BUDGET_BYTES).to_string()),
                 "{kind:?} ephemeral-storage budget must include the SAME \
                  fuse-cache bytes as the emptyDir sizeLimit"
             );
@@ -4406,7 +4427,7 @@ mod tests {
                 .map(|q| q.0.parse::<u64>().unwrap())
                 .sum();
             assert!(
-                eph >= sum_sizelimits + LOG_BUDGET_BYTES,
+                eph >= sum_sizelimits + rio_common::k8s::LOG_BUDGET_BYTES,
                 "{kind:?}: ephemeral-storage limit {eph} < Σ(disk-backed \
                  emptyDir sizeLimits) {sum_sizelimits} + LOG_BUDGET — \
                  kubelet evicts before any volume cap fires"
@@ -5435,7 +5456,7 @@ mod disk_four_caller_census {
     fn helm_member_mirror_rows_pinned() {
         // LOG_BUDGET_BYTES (1 GiB) is the shared constant the script
         // mirrors; the in-crate side is the const below.
-        assert_eq!(super::LOG_BUDGET_BYTES, 1 << 30);
+        assert_eq!(rio_common::k8s::LOG_BUDGET_BYTES, 1 << 30);
         assert_eq!(HELM_MEMBER_ROWS.len(), 3, "the three mirror rows");
         assert!(
             HELM_MEMBER_ROWS[1].contains("1 << 30"),

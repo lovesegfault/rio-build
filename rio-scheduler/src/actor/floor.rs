@@ -193,15 +193,37 @@ enum WitnessAxis {
 }
 
 impl CorroborationWitness {
-    /// The wave-11 acceptance bands (CONSUMER-owned tolerances —
-    /// deliberately looser than the producer's classification
-    /// predicate; they only bound forgery and live in exactly one
-    /// place, here):
+    /// The acceptance bands (CONSUMER-owned tolerances — they only
+    /// bound forgery and live in exactly one place, here):
     ///
     /// * CGROUP_OOM: `peak_memory_bytes >= assigned_mem / 2` —
     ///   memory.peak saturates at memory.max under a real oom kill.
-    /// * DISK_FULL: `hard_limit in [assigned_disk/2, assigned_disk*4]`
-    ///   AND `peak_used >= hard_limit / 2`.
+    /// * DISK_FULL (bug_065, R33'(ii) — the band consumes the SHARED
+    ///   quota denomination, never a re-open-coded formula): an
+    ///   ENFORCED project quota on the overlays emptyDir carries the
+    ///   stamped sizeLimit =
+    ///   `rio_common::k8s::overlay_size_limit_bytes(assigned_disk, h)`
+    ///   for the intent's headroom `h`, and every producible `h` lies
+    ///   in `[DISK_HEADROOM_MIN, DISK_HEADROOM_MAX]` (the
+    ///   `headroom(n_eff)` codomain + the controller fallback; pinned
+    ///   by `headroom_curve_stays_inside_the_shared_band` below
+    ///   against the live curve). NOTE the deployed kubelet minors
+    ///   assign NON-ENFORCING sentinel quotas (usage tracking only —
+    ///   the rio_common::k8s denomination doc + the
+    ///   vm-kubelet-projquota cells pin this), so kubelet-quota'd
+    ///   nodes currently produce NO DiskFull claims at all; the band
+    ///   is the contract for enforced-quota producers (the
+    ///   vm-quota-probe manual-limit world; any future enforcing
+    ///   kubelet) and refuses sentinel-armed claims by construction.
+    ///   Acceptance:
+    ///   `hard in [overlay(assigned, H_MIN),
+    ///             overlay(assigned, H_MAX) + KUBELET_QUOTA_BLOCK_SLACK]`
+    ///   AND `peak_used >= hard / 2`. The wave-11 band
+    ///   (`[assigned/2, assigned*4]` of RAW disk) accepted any
+    ///   fabricated limit within 8x of the solve axis — a forger
+    ///   could move floors with a hard limit kubelet can never mint;
+    ///   the producer-derived band admits exactly the mintable
+    ///   products (plus quota-block rounding).
     ///
     /// No assigned shape (cold start) => `None`: nothing to
     /// corroborate against.
@@ -210,6 +232,10 @@ impl CorroborationWitness {
         assigned_mem: u64,
         assigned_disk: u64,
     ) -> Option<Self> {
+        use rio_common::k8s::{
+            DISK_HEADROOM_MAX, DISK_HEADROOM_MIN, KUBELET_QUOTA_BLOCK_SLACK,
+            overlay_size_limit_bytes,
+        };
         use rio_proto::types::FailureClass;
         let corroborated = match claim.class {
             FailureClass::Unspecified => false, // unreachable: never constructed
@@ -218,8 +244,11 @@ impl CorroborationWitness {
             }
             FailureClass::DiskFull => claim.quota.is_some_and(|q| {
                 assigned_disk > 0
-                    && q.hard_limit_bytes >= assigned_disk / 2
-                    && q.hard_limit_bytes <= assigned_disk.saturating_mul(4)
+                    && q.hard_limit_bytes
+                        >= overlay_size_limit_bytes(assigned_disk, DISK_HEADROOM_MIN)
+                    && q.hard_limit_bytes
+                        <= overlay_size_limit_bytes(assigned_disk, DISK_HEADROOM_MAX)
+                            .saturating_add(KUBELET_QUOTA_BLOCK_SLACK)
                     && q.peak_used_bytes >= q.hard_limit_bytes / 2
             }),
         };
@@ -525,6 +554,118 @@ fn bump_dim(floor: &mut u64, last: u64, cap: u64) -> FloorOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bug_065 (R33'(ii)): the corroboration band's headroom bounds
+    /// are the SHARED consts, and the live scheduler curve plus the
+    /// controller fallback must stay inside them — this pin is the
+    /// static cadence-of-denomination witness coupling the band to
+    /// its producer. `headroom(n_eff) = 1.25 + 0.7/sqrt(n_eff)` on
+    /// the clamped domain `n_eff >= 1` is monotone decreasing:
+    /// max at 1 (== DISK_HEADROOM_MAX exactly), infimum 1.25
+    /// (== DISK_HEADROOM_MIN, open). If S4's evidence work re-shapes
+    /// the curve past either bound, this test names the coupling
+    /// instead of letting genuine exhaustions read as forgeries.
+    #[test]
+    fn headroom_curve_stays_inside_the_shared_band() {
+        use crate::sla::fit::headroom;
+        use crate::sla::types::RingNEff;
+        use rio_common::k8s::{DISK_HEADROOM_MAX, DISK_HEADROOM_MIN};
+        // The exact endpoints.
+        assert!((headroom(RingNEff(1.0)) - DISK_HEADROOM_MAX).abs() < 1e-12);
+        assert!(headroom(RingNEff(1e18)) > DISK_HEADROOM_MIN);
+        // The whole sampled domain, incl. the sub-1 clamp.
+        for n in [0.1, 1.0, 2.0, 4.0, 9.0, 25.0, 100.0, 1e6, 1e12] {
+            let h = headroom(RingNEff(n));
+            assert!(
+                h > DISK_HEADROOM_MIN && h <= DISK_HEADROOM_MAX,
+                "headroom({n}) = {h} escaped the shared band"
+            );
+        }
+    }
+
+    // The controller's flat fallback (1.5) sits inside the band —
+    // mirrored compile-time controller-side
+    // (OVERLAY_HEADROOM_FALLBACK's const assert); carried here so the
+    // scheduler's own tree fails to build if the shared band ever
+    // excludes it.
+    const _: () = assert!(
+        rio_common::k8s::DISK_HEADROOM_MIN <= 1.5 && 1.5 <= rio_common::k8s::DISK_HEADROOM_MAX
+    );
+
+    /// bug_065: the band accepts exactly the kubelet-mintable
+    /// products. RED-FIRST (recorded in the commit body): under the
+    /// wave-11 raw band (`[assigned/2, assigned*4]`) the 3.9x forged
+    /// limit CORROBORATED — a worker could move floors with a hard
+    /// limit kubelet can never assign.
+    #[test]
+    fn disk_band_admits_minted_products_and_refuses_off_formula_limits() {
+        use rio_common::k8s::{
+            DISK_HEADROOM_MAX, DISK_HEADROOM_MIN, KUBELET_QUOTA_BLOCK_SLACK,
+            overlay_size_limit_bytes,
+        };
+        let gi = 1u64 << 30;
+        let claim = |hard: u64, peak: u64| super::super::report_ctx::SizingClaim {
+            class: rio_proto::types::FailureClass::DiskFull,
+            peak_memory_bytes: 0,
+            quota: Some(rio_proto::types::QuotaTelemetry {
+                peak_used_bytes: peak,
+                hard_limit_bytes: hard,
+                node_free_bytes: 50 * gi,
+            }),
+        };
+        // FITTED SCALE (the warm-fit population, W13-G): 2 GiB
+        // assigned disk. Every headroom the producers can mint
+        // corroborates — incl. the curve extremes and the flat
+        // fallback, with kubelet's quota-block rounding on top.
+        for assigned in [gi, 2 * gi, 3 * gi, 100 * gi] {
+            for h in [DISK_HEADROOM_MIN, 1.5, DISK_HEADROOM_MAX] {
+                let hard = overlay_size_limit_bytes(assigned, h);
+                for slack in [0, KUBELET_QUOTA_BLOCK_SLACK] {
+                    assert!(
+                        CorroborationWitness::corroborated_sizing(
+                            &claim(hard + slack, hard),
+                            0,
+                            assigned
+                        )
+                        .is_some(),
+                        "minted product refused: assigned={assigned} h={h} slack={slack}"
+                    );
+                }
+            }
+            // Off-formula limits refuse in BOTH directions: the bare
+            // disk identity (h=1.0 — below every mintable headroom)
+            // and the wave-11-acceptable 3.9x fabrication.
+            assert!(
+                CorroborationWitness::corroborated_sizing(&claim(assigned, assigned), 0, assigned)
+                    .is_none(),
+                "the bare-disk identity is not a mintable hard limit"
+            );
+            let forged = assigned.saturating_mul(39) / 10;
+            assert!(
+                CorroborationWitness::corroborated_sizing(&claim(forged, forged), 0, assigned)
+                    .is_none(),
+                "a 3.9x fabricated limit must not move floors"
+            );
+            // The peak conjunct survives re-denomination: a minted
+            // hard limit with a sub-half peak still refuses.
+            let hard = overlay_size_limit_bytes(assigned, 1.5);
+            assert!(
+                CorroborationWitness::corroborated_sizing(&claim(hard, hard / 2 - 1), 0, assigned)
+                    .is_none(),
+                "peak below hard/2 must keep refusing"
+            );
+        }
+        // Cold start (no assigned shape) still refuses everything.
+        assert!(CorroborationWitness::corroborated_sizing(&claim(3 * gi, 3 * gi), 0, 0).is_none());
+        // The kubelet NON-ENFORCING sentinel (-1 -> reads ~u64::MAX;
+        // the vm-kubelet-projquota cells pin the producer side): a
+        // sentinel-armed claim must never corroborate.
+        assert!(
+            CorroborationWitness::corroborated_sizing(&claim(u64::MAX, u64::MAX / 2), 0, 100 * gi)
+                .is_none(),
+            "the non-enforcing sentinel is not a mintable hard limit"
+        );
+    }
 
     const CEIL: Ceilings = Ceilings {
         max_cores: 64.0,

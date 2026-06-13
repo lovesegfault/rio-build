@@ -1690,14 +1690,19 @@ async fn test_disk_full_report_doubles_disk_floor() -> TestResult {
         .await?;
 
     // bug_090: the typed claim, corroborated at the minted shape.
+    // bug_065: the fixture's hard limit derives from the PRODUCER —
+    // kubelet's project quota is the stamped overlays sizeLimit
+    // (disk x headroom via the shared rio_common::k8s fn), never the
+    // bare disk identity the old fixture asserted (a value kubelet
+    // cannot mint; the re-denominated band refuses it).
     let exec_id = open_pull_exec(&handle, drv).await;
-    let minted_disk = expect_drv(&handle, drv)
+    let (minted_disk, minted_hard) = expect_drv(&handle, drv)
         .await
         .sched
         .last_intent
         .as_ref()
-        .map(|i| i.disk_bytes)
-        .unwrap_or(0);
+        .map(|i| (i.disk_bytes, kubelet_minted_hard_limit(i)))
+        .unwrap_or((0, 0));
     assert!(minted_disk > 0, "the pull mint stamps the disk intent");
     pull_report_exec(
         &handle,
@@ -1707,8 +1712,8 @@ async fn test_disk_full_report_doubles_disk_floor() -> TestResult {
             rio_proto::types::FailureClass::DiskFull,
             "disk full during build (overlay prjquota exhausted); bumping disk floor",
             Some(rio_proto::types::QuotaTelemetry {
-                peak_used_bytes: minted_disk - (1 << 20),
-                hard_limit_bytes: minted_disk,
+                peak_used_bytes: minted_hard - (1 << 20),
+                hard_limit_bytes: minted_hard,
                 node_free_bytes: 50 << 30,
             }),
             0,
@@ -1771,7 +1776,7 @@ async fn test_floor_bump_store_suppression_parity(
         .sched
         .last_intent
         .as_ref()
-        .map(|i| (i.mem_bytes, i.disk_bytes))
+        .map(|i| (i.mem_bytes, kubelet_minted_hard_limit(i)))
         .unwrap_or((0, 0));
     let mut payload = if oom {
         typed_sizing_failure(
@@ -1781,6 +1786,9 @@ async fn test_floor_bump_store_suppression_parity(
             intent.0,
         )
     } else {
+        // bug_065: the hard limit is the kubelet-mintable product
+        // (the shared overlay sizeLimit fn), per the producer-derived
+        // fixture law.
         typed_sizing_failure(
             rio_proto::types::FailureClass::DiskFull,
             "disk full during build; bumping disk floor",
@@ -1951,16 +1959,19 @@ async fn typed_classification_bumps_only_with_corroboration() -> TestResult {
          match the shape the scheduler assigned"
     );
 
-    // Typed + CORROBORATED: exhaustion AT the assigned size (read
-    // from the mint — the corroboration anchor the scheduler owns).
+    // Typed + CORROBORATED: exhaustion AT the assigned shape's
+    // kubelet-minted quota (the stamped overlays sizeLimit read
+    // through the shared fn — the corroboration anchor the scheduler
+    // owns; bug_065: the bare disk identity is not a mintable hard
+    // limit and the band now refuses it).
     let exec_id = open_pull_exec(&handle, drv).await;
-    let minted_disk = expect_drv(&handle, drv)
+    let (minted_disk, minted_hard) = expect_drv(&handle, drv)
         .await
         .sched
         .last_intent
         .as_ref()
-        .map(|i| i.disk_bytes)
-        .unwrap_or(0);
+        .map(|i| (i.disk_bytes, kubelet_minted_hard_limit(i)))
+        .unwrap_or((0, 0));
     assert!(minted_disk > 0, "the pull mint stamps the disk intent");
     pull_report_exec(
         &handle,
@@ -1970,8 +1981,8 @@ async fn typed_classification_bumps_only_with_corroboration() -> TestResult {
             rio_proto::types::FailureClass::DiskFull,
             "disk full during build (honest)",
             Some(rio_proto::types::QuotaTelemetry {
-                peak_used_bytes: minted_disk - (1 << 20),
-                hard_limit_bytes: minted_disk,
+                peak_used_bytes: minted_hard - (1 << 20),
+                hard_limit_bytes: minted_hard,
                 node_free_bytes: 50 << 30,
             }),
             0,
