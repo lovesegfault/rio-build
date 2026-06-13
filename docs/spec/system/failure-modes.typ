@@ -539,3 +539,48 @@ under this rule.
   the verdict (the kernel is core-only --- a Drop-bomb backstop needs
   `thread::panicking()` and is structurally unavailable; recorded
   REJECTED).
+
+= Gate Clocks (static cadence witnesses)
+
+// The round-13 R34 doctrine home. Minted with the merged_bug_045
+// close (the systemd tier's founding instance); the log-plane
+// cut-interval banner instance and the componentscaler funding-clock
+// instance cite this rule id from their own closes.
+
+#r("sys.gate.static-cadence-witness")[
+  A gate whose disarming or jurisdiction evidence is produced on
+  another component's clock MUST read that evidence on the evidence's
+  own clock, and every cadence-vs-bound coupling MUST carry a static
+  witness: (i) a conjunctive gate whose disarming stamp is refreshed
+  by a periodic event ships a compile-time assert pinning the
+  coupling's safe direction with the phase margin written down (a
+  disarming refresh at or under the bound is dead-by-construction
+  except at phase coincidence); (ii) a stamp that can be written by a
+  no-op is not activity evidence --- occupancy stamps fire only on
+  outcomes that did work; (iii) the gate-tier list is total:
+  production loops, config validation (operator-set periods validate
+  against the bound they couple to), systemd unit `Condition*=` lines
+  (evaluated on systemd's job-start clock --- a Condition read over
+  unsettled device state is a wrong-clock gate; partition decisions
+  are made once, after the evidence's clock settles), and
+  sensor-coupled funding predicates (a predicate computable without
+  the sensor evaluates on sensor-absent ticks).
+]
+
+The systemd-tier founding instance (merged_bug_045): the two
+quota-mount units partitioned instance-store-vs-EBS jurisdiction with
+a complementary `ConditionPathExistsGlob` pair --- two independent
+job-start-clock reads over udev's coldplug clock, a two-reader TOCTOU
+by construction. A late instance-store by-id link hard-blocked kubelet
+on one timing (the EBS unit ran on an instance-store node and refused)
+and booted it Ready on an unquota'd root on the other (both units
+skipped --- the live_060 silent mode the `Requires=` wiring exists to
+prevent). The in-script `udevadm settle` could not repair it: the gate
+sat _above_ the script, on the wrong clock. The repair shape is the
+settle-then-branch dispatcher (`rio-kubelet-mount` in
+`nix/nixos-node/eks-node.nix`): one condition-free oneshot, one
+settle, one classification on the settled view, one `Requires=` edge
+from kubelet. The compile-assert idiom for the periodic-refresh tier
+is `rio-common/src/liveness.rs` (the keepalive-vs-abort pair); the
+periodic-refresh and sensor-tier instances land with their owning
+components' closes and cite this rule.

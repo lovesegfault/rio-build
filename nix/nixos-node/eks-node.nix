@@ -116,16 +116,30 @@ in
       type = lib.types.listOf lib.types.str;
       default = [ "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol*" ];
       description = ''
-        Device globs rio-ebs-quota-mount enumerates to find the
-        dedicated kubelet quota volume on EBS-only nodes (live_060:
-        the karpenter EC2NodeClass attaches it as the second EBS
-        mapping). Selection is by TYPED device class
+        Device globs rio-kubelet-mount's EBS branch enumerates to find
+        the dedicated kubelet quota volume on EBS-only nodes
+        (live_060: the karpenter EC2NodeClass attaches it as the
+        second EBS mapping). Selection is by TYPED device class
         (quota-volume-select.sh, merged_bug_024): per-partition by-id
         links (`*-part[0-9]*`) are rejected by name, every candidate
         must read `lsblk TYPE == disk`, the root disk is excluded by
         its partition children, mounted disks by their mountpoints;
         exactly one bare whole-disk candidate must remain. VM tests
         point this at their virtio disk.
+      '';
+    };
+
+    instanceStoreGlobs = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ "/dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage*" ];
+      description = ''
+        Device globs whose post-settle match classifies the node as
+        instance-store and names the NVMe RAID0 member set
+        (rio-kubelet-mount's jurisdiction dispatch, merged_bug_045:
+        ONE decision on the settled udev view — never a unit
+        `Condition*=`, which systemd evaluates on its job-start clock
+        while by-id links materialize on udev's coldplug clock). VM
+        tests point this at serial-tagged virtio disks.
       '';
     };
   };
@@ -399,47 +413,69 @@ in
           };
         };
 
-        # ── rio-nvme-mount: oneshot, EARLY boot ──────────────────────
-        # ADR-023 phase-10: stripe all instance-store NVMe into /dev/md0,
-        # mkfs.xfs, mount at /var/lib/kubelet with prjquota so kubelet's
-        # per-pod ephemeral-storage limit is enforced via XFS project
-        # quotas (the default du-walk is unusable at NVMe write rates).
+        # ── rio-kubelet-mount: oneshot, EARLY boot — the settled-udev
+        # jurisdiction dispatcher (merged_bug_045) ────────────────────
+        # ONE unit owns the prjquota kubelet-root mount for BOTH
+        # storage classes (ADR-023 phase-10 instance-store RAID0;
+        # live_060-a EBS quota volume — kubelet's per-pod
+        # ephemeral-storage enforcement needs XFS project quotas, and
+        # rio-builder's quota.rs is the disk-sizing producer that was
+        # dead on 159/160 EBS-only nodes booting ext4-root).
         #
-        # Ordering is the load-bearing part. This unit MUST mount before
-        # BOTH systemd-tmpfiles-setup (hardening.nix writes the seccomp
-        # profiles into /var/lib/kubelet/seccomp/) AND nodeadm-init
-        # (writes /var/lib/kubelet/kubeconfig) — otherwise the fresh
-        # empty XFS overmounts and shadows them → kubelet can't register
-        # / builder pods CreateContainerError on the Localhost profile.
+        # Its predecessors (rio-nvme-mount / rio-ebs-quota-mount)
+        # partitioned jurisdiction with a complementary
+        # ConditionPathExistsGlob pair on the instance-store by-id
+        # link — but systemd evaluates Conditions at JOB START, on its
+        # own clock, while by-id links materialize on udev's coldplug
+        # clock, and each script's in-script `udevadm settle` sat
+        # BELOW the gate where it could not repair the decision. Two
+        # independent reads of one unsettled predicate cannot
+        # atomically partition one responsibility: a late link
+        # hard-blocked kubelet on one timing (the EBS unit ran on an
+        # instance-store node, found no quota volume, exit 1) and
+        # booted it Ready-unquota'd on the other (BOTH units skipped —
+        # the live_060 silent mode the Requires= wiring exists to
+        # prevent). The dispatcher settles FIRST, classifies ONCE on
+        # the settled view, runs exactly one branch.
+        #
+        # Ordering is the load-bearing part (unchanged from the
+        # predecessors): MUST mount before BOTH systemd-tmpfiles-setup
+        # (hardening.nix writes the seccomp profiles into
+        # /var/lib/kubelet/seccomp/) AND nodeadm-init (writes
+        # /var/lib/kubelet/kubeconfig) — otherwise the fresh empty XFS
+        # overmounts and shadows them → kubelet can't register /
+        # builder pods CreateContainerError on the Localhost profile.
         # That rules out delegating assembly to nodeadm: its LocalDisk
-        # aspect would mkfs.ext4 + mount /dev/md0 itself, AND nodeadm-init
-        # runs after tmpfiles. The rio-nvme EC2NodeClass DOES set
-        # instanceStorePolicy: RAID0, but only so Karpenter's bin-pack sim
-        # sees NVMe capacity — `nodeadm init --skip run` never executes
-        # the local-disk aspect, so this unit owns the whole
-        # mdadm→mkfs→mount chain.
-        #
-        # ConditionPathExistsGlob gates on the EC2 instance-store by-id
-        # link: ebs-only nodes (rio-default/rio-metal NodeClass) skip
-        # cleanly. Baked into the AMI because nodeadm only consumes the
-        # NodeConfig MIME part — there is no shell userData on this
-        # image (ADR-021).
-        rio-nvme-mount = {
-          description = "Mount instance-store NVMe RAID0 at /var/lib/kubelet (prjquota)";
+        # aspect would mkfs.ext4 + mount /dev/md0 itself, AND
+        # nodeadm-init runs after tmpfiles. The rio-nvme EC2NodeClass
+        # DOES set instanceStorePolicy: RAID0, but only so Karpenter's
+        # bin-pack sim sees NVMe capacity — `nodeadm init --skip run`
+        # never executes the local-disk aspect, so this unit owns the
+        # whole chain. Baked into the AMI because nodeadm only
+        # consumes the NodeConfig MIME part — there is no shell
+        # userData on this image (ADR-021).
+        # r[impl infra.node.kubelet-prjquota+1]
+        # r[impl sys.gate.static-cadence-witness]
+        rio-kubelet-mount = {
+          description = "Mount /var/lib/kubelet with prjquota (settled-udev dispatch: instance-store RAID0 or EBS quota volume)";
           wantedBy = [ "sysinit.target" ];
           before = [
             "systemd-tmpfiles-setup.service"
             "nodeadm-init.service"
             "kubelet.service"
           ];
-          # local-fs.target: fstab mounts done. udev coldplug of NON-fstab
-          # NVMe is async — settle in-script before enumerating.
+          # local-fs.target: fstab mounts done. udev coldplug of
+          # non-fstab block devices is async — the settle below IS the
+          # jurisdiction gate's clock alignment.
           after = [ "local-fs.target" ];
           unitConfig = {
             # Early boot: drop the implicit After=basic.target so this
-            # can slot between local-fs and tmpfiles-setup.
+            # can slot between local-fs and tmpfiles-setup. NO
+            # Condition*= lines — a Condition evaluates on systemd's
+            # job-start clock against evidence on udev's clock (the
+            # merged_bug_045 wrong-clock gate); the classification
+            # happens in-script, after settle.
             DefaultDependencies = false;
-            ConditionPathExistsGlob = "/dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage*";
           };
           path = [
             pkgs.mdadm
@@ -449,109 +485,80 @@ in
           ];
           script = ''
             set -euo pipefail
-            # local-fs.target orders after fstab mounts, NOT udev coldplug
-            # of non-fstab block devices; with DefaultDependencies=false
-            # there is no implicit After=sysinit.target either.
-            # ConditionPathExistsGlob needs ≥1 match, so on multi-NVMe
-            # instances (c6id/m6id.32xl: 4 disks) udev may have created
-            # some-but-not-all by-id symlinks → mdadm builds an undersized
-            # stripe with no error → premature DiskPressure once Karpenter
-            # bin-packs assuming full instanceStorePolicy:RAID0 capacity.
+            # The evidence's own clock: drain udev's coldplug queue
+            # BEFORE reading any device evidence. On multi-NVMe
+            # instances (c6id/m6id.32xl: 4 disks) udev may otherwise
+            # have created some-but-not-all by-id symlinks → an
+            # undersized stripe with no error → premature DiskPressure
+            # once Karpenter bin-packs assuming full RAID0 capacity.
             udevadm settle
-            # udev (≥v250) creates two by-id symlinks per NVMe namespace
-            # (`…_<serial>` and `…_<serial>_<nsid>`); resolve and dedup so
-            # mdadm doesn't get the same /dev/nvmeXn1 twice → EBUSY.
-            mapfile -t devs < <(readlink -f /dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage* | sort -u)
-            # Single-device families (e.g. m6id.large) skip md and format
-            # the NVMe directly — mdadm RAID0 over one disk is pure
-            # overhead.
-            if [ "''${#devs[@]}" -eq 1 ]; then
-              dev="''${devs[0]}"
+
+            # Classify the node ONCE on the settled view:
+            # instance-store links present → the NVMe branch owns
+            # /var/lib/kubelet; none → the EBS quota-volume branch.
+            # Partition links are rejected by name class here too (the
+            # merged_bug_024 device-class law): a partitioned
+            # instance-store device must never feed mdadm both the
+            # disk and its partitions.
+            shopt -s nullglob
+            is_links=()
+            for g in ${lib.escapeShellArgs cfg.instanceStoreGlobs}; do
+              for m in $g; do
+                case "$m" in *-part[0-9]*) continue ;; esac
+                is_links+=("$m")
+              done
+            done
+            shopt -u nullglob
+
+            if [ "''${#is_links[@]}" -gt 0 ]; then
+              # ── instance-store branch (ADR-023 phase-10) ──────────
+              # udev (≥v250) creates two by-id symlinks per NVMe
+              # namespace (`…_<serial>` and `…_<serial>_<nsid>`);
+              # resolve and dedup so mdadm doesn't get the same
+              # /dev/nvmeXn1 twice → EBUSY.
+              mapfile -t devs < <(readlink -f "''${is_links[@]}" | sort -u)
+              # Single-device families (e.g. m6id.large) skip md and
+              # format the NVMe directly — mdadm RAID0 over one disk
+              # is pure overhead.
+              if [ "''${#devs[@]}" -eq 1 ]; then
+                dev="''${devs[0]}"
+              else
+                mdadm --create /dev/md0 --run --level=0 --force \
+                  --raid-devices="''${#devs[@]}" "''${devs[@]}"
+                dev=/dev/md0
+              fi
+              # Instance store is wiped on stop/terminate → always
+              # fresh. -K: don't TRIM (instance-store NVMe is
+              # pre-zeroed; mkfs discard adds ~30s on multi-TB stripes
+              # for nothing).
+              mkfs.xfs -K -f "$dev"
             else
-              mdadm --create /dev/md0 --run --level=0 --force \
-                --raid-devices="''${#devs[@]}" "''${devs[@]}"
-              dev=/dev/md0
+              # ── EBS quota-volume branch (live_060-a) ──────────────
+              # Find the dedicated quota EBS volume the karpenter
+              # EC2NodeClass attaches (second mapping, /dev/xvdb) by
+              # TYPED device class (quota-volume-select.sh,
+              # merged_bug_024: partition links rejected by name,
+              # candidates must read lsblk TYPE == disk; the
+              # misc-checks unit tier runs the same file against the
+              # per-AMI-variant by-id namespaces). EBS persists across
+              # stop/start: an existing XFS signature mounts as-is; a
+              # foreign signature REFUSES (fail-closed); only a bare
+              # volume is formatted.
+              dev=$(${quotaVolumeSelect} ${lib.escapeShellArgs cfg.quotaVolumeGlobs})
+              sig=$(blkid -o value -s TYPE "$dev" || true)
+              case "$sig" in
+                xfs) ;; # persisted volume from a previous boot
+                "")
+                  mkfs.xfs -f "$dev"
+                  ;;
+                *)
+                  echo "rio-kubelet-mount: $dev carries a foreign '$sig' filesystem — refusing to clobber" >&2
+                  exit 1
+                  ;;
+              esac
             fi
-            # Instance store is wiped on stop/terminate → always fresh.
-            # -K: don't TRIM (instance-store NVMe is pre-zeroed; mkfs
-            # discard adds ~30s on multi-TB stripes for nothing).
-            mkfs.xfs -K -f "$dev"
             mkdir -p /var/lib/kubelet
             mount -o prjquota,noatime "$dev" /var/lib/kubelet
-          '';
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
-          };
-        };
-
-        # ── rio-ebs-quota-mount: oneshot, EARLY boot (live_060-a) ────
-        # The disk-sizing producer's node precondition, PROVISIONED:
-        # rio-builder's quota.rs reads kubelet-assigned XFS project
-        # quotas, but the EBS-only builder pools (rio-default/
-        # rio-metal — 159/160 of the live fleet) booted ext4-root
-        # with NO prjquota anywhere, so the only peak_disk_bytes
-        # producer never produced (2022/2022 completions None,
-        # silently) and BOTH disk-sizing ladders were dead. This unit
-        # mirrors rio-nvme-mount minus the NVMe condition: it runs
-        # exactly when the node has NO instance store (the negated
-        # glob), finds the dedicated quota EBS volume the karpenter
-        # EC2NodeClass attaches (second mapping, /dev/xvdb), and
-        # mounts it xfs `-o prjquota` at /var/lib/kubelet. Same
-        # ordering contract as the NVMe unit (before tmpfiles-setup +
-        # nodeadm-init + kubelet); kubelet Requires= it, so an
-        # EBS-only node without its quota volume stays NotReady LOUD
-        # instead of Ready-with-a-dead-producer (the live_060 mode).
-        # EBS persists across stop/start: an existing XFS signature
-        # mounts as-is; a foreign signature REFUSES (fail-closed);
-        # only a bare volume is formatted.
-        # r[impl infra.node.kubelet-prjquota]
-        rio-ebs-quota-mount = {
-          description = "Mount the dedicated EBS quota volume at /var/lib/kubelet (prjquota)";
-          wantedBy = [ "sysinit.target" ];
-          before = [
-            "systemd-tmpfiles-setup.service"
-            "nodeadm-init.service"
-            "kubelet.service"
-          ];
-          after = [ "local-fs.target" ];
-          unitConfig = {
-            DefaultDependencies = false;
-            # The mirror-minus-NVMe condition: instance-store nodes
-            # are rio-nvme-mount's jurisdiction.
-            ConditionPathExistsGlob = "!/dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage*";
-          };
-          path = [
-            pkgs.xfsprogs
-            pkgs.util-linux
-            pkgs.systemd # udevadm
-          ];
-          script = ''
-            set -euo pipefail
-            udevadm settle
-            # Typed device-class selection (merged_bug_024): partition
-            # by-id links rejected by name, candidates classified via
-            # lsblk TYPE == disk, root disk excluded by its partition
-            # children, mounted disks by their mountpoints — exactly
-            # one bare whole disk must remain. The logic lives in
-            # quota-volume-select.sh; the misc-checks unit tier runs
-            # the same file against the per-AMI-variant by-id
-            # namespaces (legacy+gpt incl. bios_grub, efi) so the
-            # exclusion claim is witnessed, never asserted.
-            quota_dev=$(${quotaVolumeSelect} ${lib.escapeShellArgs cfg.quotaVolumeGlobs})
-            sig=$(blkid -o value -s TYPE "$quota_dev" || true)
-            case "$sig" in
-              xfs) ;; # persisted volume from a previous boot: mount as-is
-              "")
-                mkfs.xfs -f "$quota_dev"
-                ;;
-              *)
-                echo "rio-ebs-quota-mount: $quota_dev carries a foreign '$sig' filesystem — refusing to clobber" >&2
-                exit 1
-                ;;
-            esac
-            mkdir -p /var/lib/kubelet
-            mount -o prjquota,noatime "$quota_dev" /var/lib/kubelet
           '';
           serviceConfig = {
             Type = "oneshot";
@@ -684,21 +691,18 @@ in
           requires = [
             "nodeadm-init.service"
             "containerd.service"
-            # NVMe mount failure must be fail-HARD (same rationale as
-            # the pause-import preStart below): a Ready node with
-            # /var/lib/kubelet on root EBS gets bin-packed by Karpenter
-            # against instanceStorePolicy:RAID0 capacity it doesn't
-            # have → DiskPressure evictions, never replaced.
-            # systemd.unit(5): Requires= on a Condition*-skipped unit
-            # is satisfied (job result `condition`), so EBS-only
-            # NodeClasses (rio-default/rio-metal) are unaffected.
-            "rio-nvme-mount.service"
-            # The EBS twin (live_060-a): same fail-HARD rationale in
-            # the other direction — an EBS-only node whose quota
-            # volume is missing must stay NotReady loud, never Ready
-            # with a dead disk producer. Condition-skipped (satisfied)
-            # on instance-store nodes.
-            "rio-ebs-quota-mount.service"
+            # The kubelet-root mount must be fail-HARD (same rationale
+            # as the pause-import preStart below), in BOTH directions:
+            # a Ready node with /var/lib/kubelet on root EBS gets
+            # bin-packed by Karpenter against instanceStorePolicy:
+            # RAID0 capacity it doesn't have → DiskPressure evictions,
+            # never replaced; an EBS-only node whose quota volume is
+            # missing must stay NotReady loud, never Ready with a dead
+            # disk producer (live_060). ONE Requires= edge — the
+            # dispatcher classifies the node in-script on the settled
+            # udev view, so there is no Condition*-skip lane and no
+            # both-skip window (merged_bug_045).
+            "rio-kubelet-mount.service"
           ];
           path = [
             # kubeconfig exec-auth (nodeadm.nix patches the template to

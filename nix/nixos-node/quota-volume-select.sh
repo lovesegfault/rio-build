@@ -1,9 +1,9 @@
 # Select the dedicated kubelet quota volume from a device-glob
-# population (rio-ebs-quota-mount's enumeration half, extracted so the
-# selection logic is unit-testable against fixture by-id namespaces —
-# merged_bug_024: the in-unit copy was only ever exercised against a
-# bare /dev/vdb, never against the per-partition by-id links the
-# production glob actually matches).
+# population (rio-kubelet-mount's EBS-branch enumeration, extracted so
+# the selection logic is unit-testable against fixture by-id
+# namespaces — merged_bug_024: the in-unit copy was only ever
+# exercised against a bare /dev/vdb, never against the per-partition
+# by-id links the production glob actually matches).
 #
 # usage: quota-volume-select GLOB...
 #   stdout: the single selected bare whole-disk device (resolved path)

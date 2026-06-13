@@ -1,6 +1,7 @@
-# ami-variant-quota — the merged_bug_024 end-to-end witness: the
-# rio-ebs-quota-mount enumeration against the REAL per-AMI-variant
-# by-id namespaces, with the partition layout as a TEST DIMENSION.
+# ami-variant-quota — the merged_bug_024 + merged_bug_045 end-to-end
+# witness: rio-kubelet-mount (the settled-udev dispatcher) against
+# the REAL per-AMI-variant by-id namespaces, with the partition
+# layout AND the coldplug timing as TEST DIMENSIONS.
 #
 # Why this scenario exists (witness-population substitution, the
 # round-13 process-clean class): the prior witnesses pinned
@@ -23,8 +24,8 @@
 #     the uefi fleet never churned. This node pins that the typed
 #     predicate keeps the SAME winner (byte-stable, W13-E2).
 #
-# Both nodes boot the real nix/nixos-node module tree (mock IMDS, no
-# AWS) with TWO serial-tagged virtio disks: a fake-root disk
+# The EBS nodes boot the real nix/nixos-node module tree (mock IMDS,
+# no AWS) with TWO serial-tagged virtio disks: a fake-root disk
 # partitioned by rio-test-ami-layout to the PRODUCER's recipe (the
 # locked nixpkgs make-disk-image.nix partition tables — the same
 # recipes the deployed AMIs are built with), and a bare quota volume.
@@ -38,9 +39,10 @@
 # make-disk-image.nix source — upstream layout drift flips this test
 # instead of silently un-witnessing the exclusion claim.
 #
-# Budget (R17): two single-node module-tree VMs (no k3s, no rio
-# binaries) booting in parallel; nixos-node-class boot is ~2-3min.
-# 900s covers the tail under builder load.
+# Budget (R17): three single-node module-tree VMs (no k3s, no rio
+# binaries) booting in parallel; nixos-node-class boot is ~2-3min
+# plus the 15s coldplug stalls. 1200s covers the tail under builder
+# load.
 { pkgs }:
 let
   # The producer's partition recipes (drift pin — read from the
@@ -49,6 +51,17 @@ let
 
   fakeRootSerial = "RIOFAKEROOT";
   quotaSerial = "RIOQUOTA";
+
+  # The merged_bug_045 timing dimension: a udev rule that stalls the
+  # tagged disk's add event (IMPORT{program} sleep) so its by-id link
+  # materializes SECONDS after the early units' job-start instants —
+  # the deterministic form of the EC2 coldplug window. The dispatcher
+  # settles through it (udevadm settle drains the stalled queue); a
+  # regression to job-start-clock reads (a unit Condition, or a
+  # pre-settle enumeration) goes red on these nodes.
+  delayRule = serialGlob: extra: ''
+    ACTION=="add", SUBSYSTEM=="block", KERNEL=="vd[a-z]", ATTRS{serial}=="${serialGlob}", IMPORT{program}="/bin/sh -c 'sleep 15'"${extra}
+  '';
 
   mkNode =
     variant:
@@ -112,6 +125,13 @@ let
       # like non-EBS devices in production.
       services.rio.eksNode.quotaVolumeGlobs = [ "/dev/disk/by-id/virtio-RIO*" ];
 
+      # merged_bug_045 timing lane: the QUOTA volume's by-id link
+      # materializes 15s late. The dispatcher's settle drains the
+      # stalled event before the EBS branch enumerates; dropping the
+      # settle (or re-keying jurisdiction on a job-start Condition
+      # read) turns this node red with n_bare=0.
+      services.udev.extraRules = delayRule quotaSerial "";
+
       # ── mock IMDS (verbatim shape from nix/tests/nixos-node.nix) ──
       systemd.services.mock-imds = {
         description = "Mock EC2 IMDSv2";
@@ -125,15 +145,16 @@ let
       };
 
       # ── the variant layout, built to the PRODUCER's recipe ────────
-      # Runs strictly before the quota mount unit so the by-id
-      # namespace already carries the partition links when the
-      # enumeration walks it (the production state: the AMI ships
-      # partitioned; coldplug timing is merged_bug_045's scenario,
-      # not this one).
+      # Runs strictly before the dispatcher so the by-id namespace
+      # already carries the partition links when the enumeration
+      # walks it (the production state: the AMI ships partitioned).
+      # The QUOTA link's 15s stall above is the separate
+      # merged_bug_045 timing lane — this unit's own settle drains
+      # it too, which only strengthens the ordering.
       systemd.services.rio-test-ami-layout = {
         description = "Partition the fake-root disk to the ${variant} AMI recipe";
         wantedBy = [ "sysinit.target" ];
-        before = [ "rio-ebs-quota-mount.service" ];
+        before = [ "rio-kubelet-mount.service" ];
         after = [ "local-fs.target" ];
         unitConfig.DefaultDependencies = false;
         path = [
@@ -201,13 +222,86 @@ in
 pkgs.testers.runNixOSTest {
   name = "rio-ami-variant-quota";
   skipTypeCheck = true;
-  globalTimeout = 900;
+  globalTimeout = 1200;
 
   node.specialArgs.pins = import ../../pins.nix;
 
   nodes = {
     bios = mkNode "bios";
     uefi = mkNode "uefi";
+
+    # The instance-store node class (merged_bug_045's other
+    # jurisdiction): two serial-tagged disks aliased into the
+    # PRODUCTION instance-store by-id namespace by a udev rule that
+    # also delays their add events 15s — the deterministic coldplug
+    # window. Pre-fix, this timing made the Condition pair fail BOTH
+    # ways (the nvme unit skipped at job start before the links
+    # existed; the EBS unit then either ran-and-refused, hard-blocking
+    # kubelet, or skipped too when its own eval landed after the
+    # links, booting kubelet Ready on an unquota'd root — the
+    # strawman transcripts in the closing commit). Post-fix the
+    # dispatcher settles through the stall, classifies instance-store
+    # once, and the RAID0 branch owns the kubelet root.
+    nvme =
+      {
+        lib,
+        pkgs,
+        modulesPath,
+        ...
+      }:
+      {
+        imports = [
+          ../../nixos-node
+          (modulesPath + "/virtualisation/amazon-init.nix")
+        ];
+        boot.initrd = {
+          availableKernelModules = [
+            "virtio_blk"
+            "virtio_pci"
+            "virtio_net"
+            "9p"
+            "9pnet_virtio"
+          ];
+          kernelModules = lib.mkOverride 40 [ ];
+        };
+        # mdadm RAID0 over the two "instance-store" disks.
+        boot.kernelModules = [ "raid0" ];
+
+        virtualisation = {
+          memorySize = 2048;
+          cores = 2;
+          diskSize = 4096;
+          emptyDiskImages = [
+            {
+              size = 2048;
+              driveConfig.deviceExtraOpts.serial = "RIONVME0";
+            }
+            {
+              size = 2048;
+              driveConfig.deviceExtraOpts.serial = "RIONVME1";
+            }
+          ];
+        };
+
+        # Alias the tagged disks into the PRODUCTION instance-store
+        # namespace (the default instanceStoreGlobs string is what the
+        # dispatcher classifies on — exercised verbatim) AND delay
+        # their add events: the jurisdiction evidence arrives on
+        # udev's clock, 15s after every early unit's job-start
+        # instant.
+        services.udev.extraRules = delayRule "RIONVME?" '', SYMLINK+="disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage_TEST_$attr{serial}"'';
+
+        systemd.services.mock-imds = {
+          description = "Mock EC2 IMDSv2";
+          wantedBy = [ "multi-user.target" ];
+          before = [ "nodeadm-init.service" ];
+          requiredBy = [ "nodeadm-init.service" ];
+          serviceConfig = {
+            ExecStartPre = "${lib.getExe' pkgs.iproute2 "ip"} addr replace 169.254.169.254/32 dev lo";
+            ExecStart = "${pkgs.python3.interpreter} ${../fixtures/mock-imds.py}";
+          };
+        };
+      };
   };
 
   testScript = ''
@@ -246,7 +340,7 @@ pkgs.testers.runNixOSTest {
             node.succeed("test -e /dev/disk/by-id/virtio-${quotaSerial}")
 
         with subtest(variant + ": quota volume selected, mounted prjquota at the kubelet root"):
-            node.wait_for_unit("rio-ebs-quota-mount.service")
+            node.wait_for_unit("rio-kubelet-mount.service")
             out = node.succeed("findmnt -no FSTYPE,OPTIONS /var/lib/kubelet")
             assert "xfs" in out and "prjquota" in out, repr(out)
             src = node.succeed("findmnt -no SOURCE /var/lib/kubelet").strip()
@@ -257,7 +351,7 @@ pkgs.testers.runNixOSTest {
             )
 
         with subtest(variant + ": the rejection trail names the partition-link class"):
-            log = node.succeed("journalctl -u rio-ebs-quota-mount.service --no-pager")
+            log = node.succeed("journalctl -u rio-kubelet-mount.service --no-pager")
             assert "2 partition-link" in log, (
                 "expected both -partN links rejected BY CLASS; trail:\n" + log
             )
@@ -283,5 +377,35 @@ pkgs.testers.runNixOSTest {
     # W13-E2: the uefi variant's winner is byte-stable — the typed
     # predicate admits exactly the previous whole-disk winner there.
     check_node(uefi, "uefi")
+
+    # W13-F: the instance-store jurisdiction under the delayed
+    # coldplug window — ONE settled decision, the RAID0 branch.
+    with subtest("nvme: dispatcher classifies instance-store on the settled view"):
+        nvme.wait_for_unit("rio-kubelet-mount.service")
+        out = nvme.succeed("findmnt -no FSTYPE,OPTIONS /var/lib/kubelet")
+        assert "xfs" in out and "prjquota" in out, repr(out)
+        src = nvme.succeed("findmnt -no SOURCE /var/lib/kubelet").strip()
+        assert src == "/dev/md0", (
+            "two instance-store disks must stripe into md0; kubelet root is on %r"
+            % src
+        )
+
+    with subtest("nvme: jurisdiction decided once - the EBS branch never ran"):
+        log = nvme.succeed("journalctl -u rio-kubelet-mount.service --no-pager")
+        assert "quota-volume-select" not in log, (
+            "the EBS branch ran on an instance-store node - two "
+            "jurisdiction reads are back:\n" + log
+        )
+
+    with subtest("nvme: kubelet starts (the Requires= consequence tier)"):
+        nvme.wait_for_unit("kubelet.service")
+
+    # W13-F2: steady-state mounts byte-equivalent on both node
+    # classes - same fstype, same prjquota option, the class-specific
+    # source (md0 vs the quota volume) being the only difference.
+    with subtest("both node classes converge on the same kubelet-root contract"):
+        for machine in (bios, nvme):
+            out = machine.succeed("findmnt -no FSTYPE,OPTIONS /var/lib/kubelet")
+            assert "xfs" in out and "prjquota" in out and "noatime" in out, repr(out)
   '';
 }

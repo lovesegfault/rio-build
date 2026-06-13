@@ -15,9 +15,10 @@
 #                       WO-S8-15 provisioning shape: a dedicated bare
 #                       volume formatted+mounted before the kubelet
 #                       starts — the same flow eks-node.nix's
-#                       rio-ebs-quota-mount runs on the fleet, minus
-#                       EC2 device enumeration; nixos-node.nix pins
-#                       the AMI-side unit itself) + the kubelet gate
+#                       rio-kubelet-mount EBS branch runs on the
+#                       fleet, minus EC2 device enumeration;
+#                       nixos-node.nix pins the AMI-side unit itself)
+#                       + the kubelet gate
 #                       (LocalStorageCapacityIsolationFSQuotaMonitoring)
 #                       + /etc/projects + /etc/projid. A REAL
 #                       hostUsers:false pod with an emptyDir is
@@ -135,8 +136,9 @@ let
 
     # The provisioning shape (WO-S8-15, in-VM): a bare volume becomes
     # the prjquota kubelet root BEFORE the kubelet starts. Mirrors
-    # rio-ebs-quota-mount's mkfs+mount flow; the EC2 enumeration half
-    # is pinned by nix/tests/nixos-node.nix against the real unit.
+    # rio-kubelet-mount's EBS-branch mkfs+mount flow; the EC2
+    # enumeration half is pinned by nix/tests/nixos-node.nix against
+    # the real unit.
     systemd.services.rio-quota-mount = pkgs.lib.mkIf provisioned {
       description = "Mount the quota volume at /var/lib/kubelet (prjquota)";
       wantedBy = [ "multi-user.target" ];

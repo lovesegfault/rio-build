@@ -73,9 +73,9 @@ pkgs.testers.runNixOSTest {
         # NodeAllocatable check ("reservation > capacity") and kubelet
         # exits 1. 4096 matches common.nix's worker default.
         diskSize = 4096;
-        # live_060-a: the quota volume rio-ebs-quota-mount provisions
-        # (the VM stand-in for the karpenter second EBS mapping) —
-        # kubelet now Requires= the mount, so the existing
+        # live_060-a: the quota volume rio-kubelet-mount's EBS branch
+        # provisions (the VM stand-in for the karpenter second EBS
+        # mapping) — kubelet Requires= the mount, so the existing
         # kubelet-starts assertion is the integration proof. 4096:
         # the ephemeral-storage reservation check moves to THIS fs
         # (it hosts /var/lib/kubelet).
@@ -135,8 +135,12 @@ pkgs.testers.runNixOSTest {
     # live_060-a: the EBS-quota provisioning half, asserted from the
     # node config the fleet boots (the end-to-end kubelet-projid
     # witness is the dedicated k3s scenario; this pins the AMI side).
+    # This QEMU node has no instance-store links, so the dispatcher's
+    # settled classification takes the EBS branch (merged_bug_045:
+    # one unit, one decision — the variant/timing battery is
+    # vm-ami-variant-quota).
     with subtest("quota volume mounted prjquota at the kubelet root"):
-        node.wait_for_unit("rio-ebs-quota-mount.service")
+        node.wait_for_unit("rio-kubelet-mount.service")
         out = node.succeed("findmnt -no FSTYPE,OPTIONS /var/lib/kubelet")
         assert "xfs" in out and "prjquota" in out, f"kubelet root not prjquota-xfs: {out!r}"
 
@@ -244,34 +248,41 @@ pkgs.testers.runNixOSTest {
             )
         node.succeed("ip link del lxc-probe")
 
-    # bug_479: local-fs.target does NOT order after udev coldplug of
-    # non-fstab block devices. Multi-NVMe instances could enumerate a
-    # partial set → undersized RAID0 stripe. The QEMU VM has no AWS
-    # instance-store NVMe (ConditionPathExistsGlob → unit skipped), so
-    # assert structurally on the rendered script: settle precedes glob.
-    # `systemctl cat` shows ExecStart= as a store-path; cat that.
-    with subtest("rio-nvme-mount settles udev before enumerating"):
+    # bug_479 + merged_bug_045: local-fs.target does NOT order after
+    # udev coldplug of non-fstab block devices, and a unit Condition
+    # evaluates at job start on systemd's clock — so the dispatcher
+    # carries NO Condition and settles IN-SCRIPT before classifying.
+    # Assert structurally on the rendered script: settle precedes the
+    # jurisdiction read (the instance-store glob) and the dispatcher
+    # renders condition-free. `systemctl show -P ExecStart` gives the
+    # store-path script; cat that.
+    with subtest("rio-kubelet-mount settles udev before classifying, condition-free"):
         script = node.succeed(
-            "cat $(systemctl show -P ExecStart rio-nvme-mount.service "
+            "cat $(systemctl show -P ExecStart rio-kubelet-mount.service "
             "| grep -oE '/nix/store/[^ ;]+')"
         )
         assert script.index("udevadm settle") < script.index(
             "nvme-Amazon_EC2_NVMe_Instance_Storage"
-        ), f"udevadm settle missing or after device glob:\n{script}"
+        ), f"udevadm settle missing or after the jurisdiction glob:\n{script}"
+        conds = node.succeed(
+            "systemctl show -p ConditionPathExistsGlob rio-kubelet-mount.service"
+        ).strip()
+        assert conds == "ConditionPathExistsGlob=", (
+            f"the dispatcher grew a path Condition back - that is the "
+            f"merged_bug_045 wrong-clock gate: {conds}"
+        )
 
-    # rio-nvme-mount script failure (mdadm/mkfs/mount) must NOT be
-    # fail-open: with only before= ordering + wantedBy=sysinit.target,
-    # tmpfiles would create /var/lib/kubelet on root EBS, kubelet
-    # starts, node Ready, Karpenter bin-packs against phantom RAID0
-    # capacity. QEMU has no instance-store NVMe (Condition skips the
-    # unit) so assert structurally on the rendered Requires=, then
-    # prove kubelet started anyway — Condition-skip satisfies
-    # Requires= (systemd.unit(5)), so EBS-only nodes are unaffected.
-    with subtest("rio-nvme-mount failure blocks kubelet (fail-hard)"):
+    # Mount failure must NOT be fail-open: with only before= ordering
+    # + wantedBy=sysinit.target, tmpfiles would create
+    # /var/lib/kubelet on root EBS, kubelet starts, node Ready,
+    # Karpenter bin-packs against phantom RAID0 capacity (or the
+    # disk-sizing producer rides a dead ext4 root — live_060). ONE
+    # Requires= edge on the dispatcher covers both node classes.
+    with subtest("rio-kubelet-mount failure blocks kubelet (fail-hard)"):
         deps = node.succeed("systemctl show -p Requires kubelet.service")
-        assert "rio-nvme-mount.service" in deps, (
-            f"kubelet does not Requires=rio-nvme-mount — NVMe mount "
-            f"failure would be fail-open (Ready node on root EBS). {deps}"
+        assert "rio-kubelet-mount.service" in deps, (
+            f"kubelet does not Requires=rio-kubelet-mount — a mount "
+            f"failure would be fail-open (Ready node, dead producer). {deps}"
         )
         node.succeed("systemctl is-active kubelet.service")
 

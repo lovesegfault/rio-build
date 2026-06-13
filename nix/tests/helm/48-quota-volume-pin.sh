@@ -6,7 +6,7 @@
 # peak_disk_bytes producer and BOTH disk-sizing ladders silently die
 # (live_060: 2022/2022 completions None while every tree-state
 # witness stayed green). rio-nvme is exempt: instance-store RAID0
-# owns its kubelet root via rio-nvme-mount.
+# owns its kubelet root via rio-kubelet-mount's NVMe branch.
 #
 # Planted red: a render with the quota volume nulled out must be
 # CAUGHT — the pin's oracle demonstrably fires on the exact
@@ -52,7 +52,7 @@ awk '
 ' "$T/render.yaml" > "$T/rio-nvme.yaml"
 if grep -q 'deviceName: /dev/xvdb' "$T/rio-nvme.yaml"; then
   echo "FAIL: rio-nvme carries the EBS quota volume — instance-store classes" >&2
-  echo "      mount their own prjquota root (rio-nvme-mount); a second volume" >&2
+  echo "      mount their own prjquota root (the dispatcher's NVMe branch); a second volume" >&2
   echo "      there is dead cost and an ambiguity hazard for the mount unit" >&2
   exit 1
 fi
