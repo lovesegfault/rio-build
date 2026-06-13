@@ -104,6 +104,13 @@ pub fn features_compatible(required: &[String], provides: &[String]) -> bool {
     required.iter().all(|f| provides.contains(f)) && required.is_empty() == provides.is_empty()
 }
 
+/// bug_063 (R25): the shared typed capacity-term decoder — ONE decode
+/// law for the `(hw_class_names, node_affinity)` wire grammar,
+/// consumed by the scheduler's `decode_capacity_requirement` and the
+/// controller's `cells_of_checked` (single-site hardening did not
+/// survive cross-crate template reuse; the law now has one home).
+pub mod capacity_term;
+
 /// live_056-b: the builder's serving-state file — the contract between
 /// `rio-builder` (writes it once `connect_upstreams` succeeds:
 /// post-connect, pre-first-pull) and the controller's Job spec (mints

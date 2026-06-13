@@ -1834,43 +1834,30 @@ enum CapacityReqDefect {
 /// `find().and_then(values.first())` peek that read one cell out of
 /// `In[spot,on-demand]`, decoded `NotIn[spot]` to its inverse, and
 /// resolved duplicate requirements order-sensitively.
+///
+/// bug_063 (R25): the decode law is EXTRACTED WHOLE to
+/// [`rio_common::k8s::capacity_term`] — one wire grammar, one
+/// decoder (the controller's `cells_of_checked` was built from the
+/// condemned peek template one day after this fn's typed parse
+/// landed; single-site hardening does not survive cross-crate
+/// template reuse). This body DELEGATES: the structural half of the
+/// shared partition maps to the existing `ArmEchoSkewed` pairing
+/// lanes, the shape half to `PlaneEntryUndecodable` with
+/// byte-identical rendered strings — refusal behavior is
+/// reader-invisible across the extraction (W13-AJ2).
 fn decode_capacity_requirement(
     term: &rio_proto::types::NodeSelectorTerm,
 ) -> Result<crate::sla::config::CapacityType, CapacityReqDefect> {
-    let mut matches = term
-        .match_expressions
-        .iter()
-        .filter(|r| r.key == crate::sla::config::LABEL_CAPACITY_TYPE);
-    let Some(req) = matches.next() else {
-        return Err(CapacityReqDefect::Pairing);
-    };
-    let dupes = matches.count();
-    if dupes > 0 {
-        return Err(CapacityReqDefect::Undecodable(format!(
-            "{} appears {} times in one term (the producer emits exactly one)",
-            crate::sla::config::LABEL_CAPACITY_TYPE,
-            dupes + 1,
-        )));
-    }
-    if req.operator != "In" {
-        return Err(CapacityReqDefect::Undecodable(format!(
-            "{} {} [{}]",
-            req.key,
-            req.operator,
-            req.values.join(", "),
-        )));
-    }
-    match req.values.as_slice() {
-        // The existing empty-values law: structural skew.
-        [] => Err(CapacityReqDefect::Pairing),
-        [value] => crate::sla::config::CapacityType::parse(value)
-            .ok_or_else(|| CapacityReqDefect::Undecodable(value.clone())),
-        more => Err(CapacityReqDefect::Undecodable(format!(
-            "{} In [{}] (multi-valued: names {} cells, not one)",
-            req.key,
-            req.values.join(", "),
-            more.len(),
-        ))),
+    use rio_common::k8s::capacity_term as ct;
+    let reqs = term.match_expressions.iter().map(|r| ct::TermRequirement {
+        key: &r.key,
+        operator: &r.operator,
+        values: &r.values,
+    });
+    match ct::decode_capacity_term(reqs) {
+        Ok(w) => Ok(w.into()),
+        Err(d) if d.is_structural() => Err(CapacityReqDefect::Pairing),
+        Err(d) => Err(CapacityReqDefect::Undecodable(d.render())),
     }
 }
 
