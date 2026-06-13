@@ -5819,6 +5819,14 @@ rec {
           reason = "the falsifier needs a double-charge injection action on the exec ledger — Q13 headline (retryPolicy)";
         };
       };
+      # Measured runtime (bughunt-13 S7 close; the four-armed
+      # establishment joins this regime's alphabet): 1637s at 8-worker
+      # TLC on an otherwise-idle host — the default 1800s budget
+      # leaves <10% margin and breaches under ordinary gate
+      # contention. Raised per this parameter's own rule (a measured
+      # runtime documented at the check); same value as the
+      # leaderElection holder-evidence precedent.
+      modelTimeoutSec = 3600;
       spec = "retryPolicy";
       main = "retryPolicyPull";
       step = "pullStep";
@@ -5973,6 +5981,14 @@ rec {
           reason = "the falsifier needs a double-charge injection action on the exec ledger — Q13 headline (retryPolicy)";
         };
       };
+      # Measured runtime (bughunt-13 S7 close; the four-armed
+      # establishment joins this regime's alphabet, and the regime is
+      # a strict superset of the pull regime so it carries the same
+      # growth): 1945s at 8-worker TLC under moderate sibling load --
+      # over the 1800s default. Raised per this parameter's own rule
+      # (a measured runtime documented at the check); same value as
+      # the pull regime's raise and the failopen-withhold precedent.
+      modelTimeoutSec = 3600;
       spec = "retryPolicy";
       main = "retryPolicyPullStoreDegraded";
       step = "pullStep";
