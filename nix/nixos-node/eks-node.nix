@@ -211,14 +211,24 @@ in
       # live_060-a, the KUBELET HALF of the project-quota chain — the
       # half nothing set before: with this gate on AND /var/lib/
       # kubelet on a prjquota filesystem, kubelet assigns a project
-      # ID to every emptyDir of a user-namespaced pod (hostUsers:
-      # false — the builder pods' standing posture per
-      # sec.pod.host-users-false) and the kernel tracks usage O(1);
-      # rio-builder's quota.rs then reads it via FS_IOC_FSGETXATTR +
-      # quotactl_fd. Derived at kubernetes 1.36 (the deployed
-      # kubelet): the gate exists and quota assignment is
-      # userns-conditioned (kubelet refuses SupportsQuotas for
+      # ID to every emptyDir of a USER-NAMESPACED pod and the kernel
+      # tracks usage O(1); rio-builder's quota.rs then reads it via
+      # FS_IOC_FSGETXATTR + quotactl_fd. Derived at kubernetes 1.36
+      # (the deployed kubelet): the gate exists and quota assignment
+      # is userns-conditioned (kubelet refuses SupportsQuotas for
       # host-user pods); UserNamespacesSupport is on by default.
+      # THE BUILDER PODS ARE NOT USER-NAMESPACED (live_063): they run
+      # hostUsers:true — I-186 FUSE passthrough, pinned until P0560;
+      # sec.pod.host-users-false is the DEFERRED target, and this
+      # comment's previous claim that it was the standing posture was
+      # one of live_063's three contradiction homes (56/56 provisioned
+      # nodes, 0/1912 completions with evidence, in plain sight). So
+      # kubelet's half covers other userns pods only; for the builder
+      # pods rio-builder self-assigns its projid at overlay setup
+      # (quota.rs ensure_project_quota, the builder-owned range below
+      # kubelet's 1048576+ allocator). The gate stays on regardless:
+      # it is the userns half of the chain and is inert for host-user
+      # pods.
       # Without the gate kubelet falls back to ~60s du walks and
       # peak_disk_bytes is None forever — the live_060 silence.
       "kubernetes/kubelet/config.json.d/30-rio-fsquota.conf".text = builtins.toJSON {

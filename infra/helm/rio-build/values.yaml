@@ -1755,8 +1755,16 @@ poolDefaults:
   # fetcher profile keeps all five denied.
   #
   # hostUsers default = true here so k3s VM tests work without
-  # idmap-mount support on /dev/fuse. EKS (NixOS AMI with containerd
-  # cgroup_writable=true) overrides to false via xtask deploy.rs.
+  # idmap-mount support on /dev/fuse — and EKS runs true AS WELL:
+  # xtask deploy.rs deliberately does NOT override it (I-186:
+  # hostUsers:false breaks FUSE passthrough, pinned until P0560
+  # deletes FUSE; the previous claim here that deploy.rs flips it to
+  # false was FALSE and was one of live_063's three contradiction
+  # homes). The posture is load-bearing for disk evidence: kubelet
+  # refuses project-quota assignment to host-user pods (quota decline
+  # mode #4), so rio-builder self-assigns its projid at overlay setup
+  # (rio-builder/src/quota.rs ensure_project_quota) instead of relying
+  # on kubelet's userns-only half.
   privileged: false
   hostUsers: true
   seccompProfile:
