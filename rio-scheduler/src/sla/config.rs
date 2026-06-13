@@ -971,7 +971,7 @@ impl SlaConfig {
             // merged_bug_016 (the dead-band close): the mem axis
             // compares the CONSTRUCTED container quantity —
             // `rio_common::footprint::container_mem_bytes(solve)` —
-            // against the ceiling, the SAME quantity the controller's quantifier: census(retain_hosting_gate_equals_shared_law_oracle)
+            // against the ceiling, the SAME quantity — quantifier: census(retain_hosting_gate_equals_shared_law_oracle) — the controller's
             // provisioning partition (`cover::sizing` via
             // `intent_pod_footprint`) and its `fallback_cell`
             // admission predicate compare. The pre-fix raw `mem <= cm`
@@ -1079,7 +1079,7 @@ impl SlaConfig {
         // r[impl sched.sla.ladder-transit]
         // merged_bug_101 + merged_bug_015: the derivation is a
         // WORKLIST FIXPOINT over TWO SEPARATED relations.
-        // REACHABILITY: the walk transits EVERY declared ladder edge quantifier: census(ladder_transits_declared_edges_independent_of_rung_admission)
+        // REACHABILITY: the walk transits EVERY declared ladder edge — quantifier: census(ladder_transits_declared_edges_independent_of_rung_admission) —
         // of a walked class — a walked rung enqueues once (walked-set
         // cycle guard) whether or not it minted any cell for THIS
         // demand. ADMISSION: the pin filter and the `hosts` predicate

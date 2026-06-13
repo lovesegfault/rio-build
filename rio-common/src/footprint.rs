@@ -73,7 +73,7 @@ pub const CONTAINER_MEM_MIN_BYTES: u64 = 512 << 20;
 /// that solve will actually request. This is the constructed quantity
 /// of the merged_bug_016 law —
 /// `max(solved + WORKER_MEM_OVERHEAD_BYTES, CONTAINER_MEM_MIN_BYTES)`
-/// — and EVERY predicate that decides mem feasibility against a class quantifier: census(retain_hosting_gate_equals_shared_law_oracle + fallback_and_sizing_equal_shared_law_oracle)
+/// — and EVERY predicate — quantifier: census(retain_hosting_gate_equals_shared_law_oracle + fallback_and_sizing_equal_shared_law_oracle) — that decides mem feasibility against a class
 /// ceiling compares `container_mem_bytes(solve) <= ceiling`, never
 /// the bare solve. Monotone and total; saturates at `u64::MAX`.
 #[must_use]
