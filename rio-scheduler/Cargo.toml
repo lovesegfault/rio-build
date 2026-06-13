@@ -12,6 +12,13 @@ description = "DAG-aware build scheduler for rio-build"
 name = "rio-scheduler"
 path = "src/main.rs"
 
+[lints.rust]
+# `cfg(kani)` is set by kani-compiler (nix `crateBuildKani` passes
+# `--cfg=kani --check-cfg=cfg(kani)`); register it here so the regular
+# cargo build doesn't warn `unexpected_cfgs` on the `#[cfg(kani)]`
+# proof modules in db/{mod,recovery}.rs.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [features]
 # AdminService.InjectBuildSample fixture (sla-sizing VM scenario): writes
 # a synthetic build_samples row keyed on (pname, system, tenant). Runtime-

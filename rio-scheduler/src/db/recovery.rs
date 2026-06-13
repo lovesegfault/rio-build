@@ -307,16 +307,11 @@ impl SchedulerDb {
                 .bind(derivation_id)
                 .fetch_one(conn)
                 .await?;
-        use rio_evidence_kernel::ClosureEvidence;
-        Ok(if n_children == 0 {
-            ClosureEvidence::ChildlessLeaf
-        } else if all_strict == Some(true) {
-            ClosureEvidence::Vouched
-        } else if stale_produced == Some(true) {
-            ClosureEvidence::Holed
-        } else {
-            ClosureEvidence::Pending
-        })
+        Ok(classify_from_durable_row(
+            n_children,
+            all_strict,
+            stale_produced,
+        ))
     }
 
     /// Load (build_id, derivation_id) links for a set of builds.
@@ -579,5 +574,154 @@ impl SchedulerDb {
         metrics::histogram!("rio_scheduler_build_graph_edges").record(edges.len() as f64);
 
         Ok((nodes, edges, total as u32))
+    }
+}
+
+/// The 4-cell map (merged_bug_301), extracted: the durable-row
+/// aggregates → [`ClosureEvidence`](rio_evidence_kernel::ClosureEvidence).
+/// One pure fn so the SQL caller and the kani agreement harness
+/// (`durable_row_classifier_agrees_with_kernel`) consume the SAME
+/// formula.
+///
+/// Row shape (the [`CLASSIFY_EVIDENCE_SQL`] aggregates):
+/// - `n_children`: COUNT of declared child edges
+/// - `all_strict`: `Some(true)` iff every child is produced AND
+///   live-vouched (`BOOL_AND` over the vouch predicate; SQL `NULL` for
+///   the empty group)
+/// - `stale_produced`: `Some(true)` iff some child is produced WITHOUT
+///   a live voucher (the previous-generation shape; SQL `NULL` for the
+///   empty group)
+///
+/// The branches are evaluated in this order — `n_children == 0` first
+/// so a structural leaf with `NULL` aggregates classifies
+/// `ChildlessLeaf`, not `Pending`.
+pub(crate) fn classify_from_durable_row(
+    n_children: i64,
+    all_strict: Option<bool>,
+    stale_produced: Option<bool>,
+) -> rio_evidence_kernel::ClosureEvidence {
+    use rio_evidence_kernel::ClosureEvidence;
+    if n_children == 0 {
+        ClosureEvidence::ChildlessLeaf
+    } else if all_strict == Some(true) {
+        ClosureEvidence::Vouched
+    } else if stale_produced == Some(true) {
+        ClosureEvidence::Holed
+    } else {
+        ClosureEvidence::Pending
+    }
+}
+
+#[cfg(kani)]
+mod durable_evidence_proofs {
+    use super::classify_from_durable_row;
+    use rio_evidence_kernel::ClosureEvidence;
+
+    /// CBMC bound on the synthesized child set: the SQL aggregates are
+    /// derived from a child-edge population, and the classifier's
+    /// verdict is independent of which child carries the un-vouched /
+    /// stale bit — three children cover every aggregate combination.
+    const PROOF_CHILD_BOUND: usize = 3;
+
+    /// Synthesize a child population of `n` declared edges with
+    /// arbitrary (live-vouched, stale-produced) bits per child, then
+    /// derive the SQL aggregates exactly as [`CLASSIFY_EVIDENCE_SQL`]
+    /// does (`BOOL_AND(vouched)`, `BOOL_OR(stale)`). The kernel side
+    /// receives the same population's `vouched` bits as its
+    /// produced-ness projection (the durable classifier's `Vouched`
+    /// requires a LIVE voucher per child, so live-vouch is the
+    /// kernel's `produced` for this comparison).
+    fn arbitrary_child_aggregates() -> (
+        i64,
+        Option<bool>,
+        Option<bool>,
+        [bool; PROOF_CHILD_BOUND],
+        usize,
+    ) {
+        let n: usize = kani::any();
+        kani::assume(n <= PROOF_CHILD_BOUND);
+        let vouched: [bool; PROOF_CHILD_BOUND] = kani::any();
+        let stale: [bool; PROOF_CHILD_BOUND] = kani::any();
+        // The SQL invariant: a child is never both live-vouched AND
+        // stale-produced (the vouch predicate is `produced ∧
+        // live-generation`; stale is `produced ∧ ¬live-generation`).
+        for i in 0..n {
+            kani::assume(!(vouched[i] && stale[i]));
+        }
+        // BOOL_AND / BOOL_OR over the n-prefix; SQL NULL for n=0.
+        let (all_strict, stale_produced) = if n == 0 {
+            (None, None)
+        } else {
+            let mut all = true;
+            let mut any_stale = false;
+            for i in 0..n {
+                all &= vouched[i];
+                any_stale |= stale[i];
+            }
+            (Some(all), Some(any_stale))
+        };
+        (n as i64, all_strict, stale_produced, vouched, n)
+    }
+
+    /// THE AGREEMENT (audit kani #2): the durable-row 4-cell map and
+    /// the proved kernel classifier
+    /// [`rio_evidence_kernel::closure_evidence`] agree over every
+    /// child population, under the kernel-input mapping the
+    /// merged_bug_301 prose claims:
+    ///   - the durable caller always classifies a PRESENT node with a
+    ///     child-set entry (the SQL row exists by construction), so
+    ///     `present = true` and `children = Some(_)`;
+    ///   - the durable Holed cell (some child stale-produced)
+    ///     corresponds to the kernel's `present = false` arm — a
+    ///     stale-produced child means the closure is broken under the
+    ///     live generation, exactly the kernel's "evidence is
+    ///     vacuously Holed" reading. The harness encodes that as
+    ///     `present = ¬stale_produced.unwrap_or(false)`.
+    ///
+    /// The strawman (the F9 hazard the audit named): swapping the
+    /// `n_children == 0` and `all_strict` branches mis-classifies an
+    /// empty group's NULL `all_strict` as `Pending`, not
+    /// `ChildlessLeaf` — the agreement reds at n=0.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn durable_row_classifier_agrees_with_kernel() {
+        let (n_children, all_strict, stale_produced, vouched, n) = arbitrary_child_aggregates();
+        let durable = classify_from_durable_row(n_children, all_strict, stale_produced);
+        // The kernel-input mapping per the agreement contract above.
+        let any_stale = stale_produced.unwrap_or(false);
+        let kernel = rio_evidence_kernel::closure_evidence(
+            !any_stale,
+            Some(vouched.iter().take(n).copied()),
+        );
+        assert_eq!(
+            durable, kernel,
+            "the durable-row classifier and the kernel disagree at \
+             n_children={n_children} all_strict={all_strict:?} \
+             stale_produced={stale_produced:?}"
+        );
+    }
+
+    /// Totality + the named cell boundaries: every (i64, Option<bool>,
+    /// Option<bool>) input — including the SQL-unreachable shapes
+    /// (negative `n_children`, non-NULL aggregates at n=0) — maps to
+    /// exactly one of the four cells without panic, and the iff-edges
+    /// hold:
+    ///   - ChildlessLeaf ⇔ n_children == 0
+    ///   - Vouched ⇒ n_children ≠ 0 ∧ all_strict == Some(true)
+    ///   - Holed ⇒ stale_produced == Some(true) ∧ all_strict ≠
+    ///     Some(true)
+    #[kani::proof]
+    fn durable_row_classifier_is_total() {
+        let n_children: i64 = kani::any();
+        let all_strict: Option<bool> = kani::any();
+        let stale_produced: Option<bool> = kani::any();
+        let cell = classify_from_durable_row(n_children, all_strict, stale_produced);
+        assert_eq!(cell == ClosureEvidence::ChildlessLeaf, n_children == 0);
+        if cell == ClosureEvidence::Vouched {
+            assert!(n_children != 0 && all_strict == Some(true));
+        }
+        if cell == ClosureEvidence::Holed {
+            assert!(stale_produced == Some(true) && all_strict != Some(true));
+        }
     }
 }

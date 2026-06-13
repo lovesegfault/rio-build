@@ -714,6 +714,76 @@ fn at_or_above_floor(floor: Option<i64>, serving_generation: i64) -> bool {
     }
 }
 
+#[cfg(kani)]
+mod fence_admission_proofs {
+    use super::{ServingGeneration, at_or_above_floor};
+
+    /// THE FENCE ADMISSION (audit kani #4): the comparison is `>=` and
+    /// that polarity is load-bearing — a write at the floor MUST apply
+    /// (the same-epoch re-acquire keep that
+    /// `sched.lease.generation-claim` requires); tightening to `>`
+    /// would fence a leader's own writes after every same-epoch
+    /// re-acquire.
+    ///
+    /// The strawman: replacing `>=` with `>` makes
+    /// `floor=Some(g), serving=g` return `false` — the harness's
+    /// `serving == f ⇒ admitted` clause reds.
+    #[kani::proof]
+    fn fence_admits_at_floor() {
+        let floor: Option<i64> = kani::any();
+        let serving: i64 = kani::any();
+        let admitted = at_or_above_floor(floor, serving);
+        match floor {
+            None => assert!(admitted, "no floor row demands nothing"),
+            Some(f) => {
+                // The `>=` law, both directions.
+                assert_eq!(admitted, serving >= f);
+                // The same-epoch keep, named: the floor itself is
+                // admitted (the strawman's red).
+                if serving == f {
+                    assert!(
+                        admitted,
+                        "a write at the floor must apply (the same-epoch \
+                         re-acquire keep — `>` self-fences)"
+                    );
+                }
+                // Monotone: a strictly newer tenure is never refused.
+                if serving > f {
+                    assert!(admitted);
+                }
+            }
+        }
+    }
+
+    /// The [`ServingGeneration`] cast pair fail-closed BOTH directions:
+    /// stamping from a u64 claim above `i64::MAX` saturates (the fence
+    /// compares in i64 — saturation can only under-claim, never
+    /// over-claim); projecting back to the kernel's u64 saturates
+    /// negative (impossible via the constructor) to 0 — below every
+    /// floor, always-fenced. The round-trip is lossless on the
+    /// representable range.
+    #[kani::proof]
+    fn serving_generation_casts_fail_closed() {
+        let claim: u64 = kani::any();
+        let stamp = ServingGeneration::stamp_from_claim(claim);
+        // stamp_from_claim never produces a negative i64 (it saturates
+        // up to i64::MAX, never wraps).
+        assert!(stamp.as_i64() >= 0);
+        // Round-trip: lossless on the i64-representable range.
+        if claim <= i64::MAX as u64 {
+            assert_eq!(stamp.as_i64() as u64, claim);
+            assert_eq!(stamp.to_kernel_u64(), claim);
+        } else {
+            // Saturation under-claims: the stamped value is at most
+            // the input — never over-claims tenure authority.
+            assert_eq!(stamp.as_i64(), i64::MAX);
+            assert!(stamp.to_kernel_u64() <= claim);
+        }
+        // The kernel projection never wraps a non-negative stamp.
+        assert_eq!(stamp.to_kernel_u64(), stamp.as_i64() as u64);
+    }
+}
+
 impl SchedulerDb {
     /// Create a new database handle from a connection pool.
     pub fn new(pool: PgPool) -> Self {

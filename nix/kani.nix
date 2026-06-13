@@ -23,9 +23,12 @@
 #     member or any reachable dep changes. Correct — `--reachability=harnesses`
 #     produces a goto program that closes over the harness's call graph.
 #
-# Limitation: only lib-only workspace members. Members with [[bin]] hit a
-# link error in crateBuildKani — deps are MIR-only. See
-# nix/crate2nix.nix's `excludeCrateTypes` for the cdylib analogue.
+# Limitation: members with [[bin]] hit a link error in crateBuildKani's
+# .out output (deps are MIR-only — see nix/crate2nix.nix's
+# `excludeCrateTypes` for the cdylib analogue), but the .lib output
+# builds fine and is what mkKaniCheck reads. The harnesses must live
+# in lib-reachable modules (src/lib.rs, not src/main.rs). Verified for
+# rio-scheduler at the round-14 D-16 lift.
 #
 # r[verify ...] markers go HERE — at the `kani-checks` attrset entry that
 # wires a member, NOT in the harness function or the .typ spec source.
@@ -190,6 +193,36 @@ in
     name = "rio-lease";
     crate = crateBuildKani.members.rio-lease;
     expectedHarnesses = 11;
+  };
+
+  # rio-scheduler: the scheduler's own pure decision kernels, proved
+  # in-crate (the audit's "lib-only kani member lift" — the .lib output
+  # builds fine; only linking the [[bin]] would hit the MIR-only-deps
+  # error, and mkKaniCheck reads .lib, never .out). Harnesses:
+  #   - durable_row_classifier_agrees_with_kernel (audit kani #2): the
+  #     classify_durable_evidence_in_tx 4-cell map agrees with the
+  #     proved rio-evidence-kernel classifier over every child
+  #     population, under the merged_bug_301 input mapping.
+  #   - durable_row_classifier_is_total: the same map is total + the
+  #     iff cell-boundary clauses (ChildlessLeaf ⇔ n=0; the F9-hazard
+  #     branch-swap reds the n=0 case).
+  #   - fence_admits_at_floor (audit kani #4): at_or_above_floor's `>=`
+  #     polarity is the same-epoch re-acquire keep — `>` self-fences
+  #     (the strawman the harness's serving==floor clause names).
+  #   - serving_generation_casts_fail_closed: stamp_from_claim /
+  #     to_kernel_u64 saturate fail-closed both directions; lossless
+  #     on the i64-representable range.
+  # Audit kani #1 (the seedFor twin from actor/recovery.rs) carries
+  # dated under the OQ-9 escape: the claim_target/floor_vouches_entry
+  # body at :1463-:1644 is async fn over &mut Self with PG + lease
+  # reads interleaved — the pure-twin extraction is a refactor of the
+  # named region, not a 10-line lift. Recorded; #2+#4 land per OQ-9.
+  # r[verify sched.evidence.durability+4]
+  # r[verify sched.lease.generation-fence+3]
+  kani-rio-scheduler = mkKaniCheck {
+    name = "rio-scheduler";
+    crate = crateBuildKani.members.rio-scheduler;
+    expectedHarnesses = 4;
   };
 
   # rio-log-kernel: the store's log-chunk decision kernels, extracted
