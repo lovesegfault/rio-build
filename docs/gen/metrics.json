@@ -23,7 +23,6 @@
     "rio_builder_memory_fraction",
     "rio_builder_overlay_teardown_failures_total",
     "rio_builder_quota_evidence_absent_total",
-    "rio_builder_quota_limit_unreadable_total",
     "rio_builder_stale_assignments_rejected_total",
     "rio_builder_upload_bytes_total",
     "rio_builder_upload_references_count",
@@ -31,7 +30,6 @@
     "rio_builder_uploads_total",
     "rio_controller_component_scaler_desired_replicas",
     "rio_controller_component_scaler_learned_ratio",
-    "rio_controller_component_scaler_load_poll_partial_total",
     "rio_controller_component_scaler_observed_load",
     "rio_controller_ddsketch_seed_fallback_total",
     "rio_controller_disruption_drains_total",
@@ -42,13 +40,11 @@
     "rio_controller_ffd_window_remainder_cores",
     "rio_controller_ffd_window_remainder_intents",
     "rio_controller_gc_runs_total",
-    "rio_controller_intent_cells_refused_total",
     "rio_controller_job_terminal_report_seconds",
     "rio_controller_lease_acquired_total",
     "rio_controller_lease_lost_total",
     "rio_controller_lease_rebound_total",
     "rio_controller_node_wedge_marked_total",
-    "rio_controller_nodeclaim_budget_starved_total",
     "rio_controller_nodeclaim_cells_decode_refused_total",
     "rio_controller_nodeclaim_consolidate_threshold_seconds",
     "rio_controller_nodeclaim_created_total",
@@ -94,8 +90,6 @@
     "rio_gateway_putpath_aborted_retries_total",
     "rio_gateway_putpath_retry_events_total",
     "rio_gateway_quota_rejections_total",
-    "rio_lease_marks_verify_failures_total",
-    "rio_lease_standby_marks_strips_total",
     "rio_scheduler_actor_admin_fast_delivery_seconds",
     "rio_scheduler_actor_cmd_seconds",
     "rio_scheduler_actor_mailbox_depth",
@@ -124,8 +118,7 @@
     "rio_scheduler_derivations_gc_deleted_total",
     "rio_scheduler_derivations_queued",
     "rio_scheduler_derivations_running",
-    "rio_scheduler_establish_defer_age_seconds",
-    "rio_scheduler_establish_deferred_total",
+    "rio_scheduler_disk_evidence_total",
     "rio_scheduler_evidence_write_fenced_total",
     "rio_scheduler_exec_rows_gc_deleted_total",
     "rio_scheduler_executor_auth_rejected_total",
@@ -395,12 +388,7 @@
       {
         "name": "rio_builder_quota_evidence_absent_total",
         "kind": "counter",
-        "help": "Completions whose project-quota disk evidence was ABSENT — BOTH producers yielded nothing (bug_046: the one-shot quota::status AND the 1 Hz during-build monitor; live060-b: the node lacks the prjquota precondition, so peak_disk_bytes is None and the disk sizer cannot learn from this pod). One increment per completion; a once-per-pod WARN names the precondition. Expect this rate to trend to ZERO as prjquota provisioning (live060-a) rolls out; a nonzero steady-state rate means builder nodes are running without the disk-evidence producer."
-      },
-      {
-        "name": "rio_builder_quota_limit_unreadable_total",
-        "kind": "counter",
-        "help": "Completions whose post-build quota LIMIT read failed while the during-build monitor HAD witnessed usage (bug_046: the (one-shot-failed, monitor-witnessed) fold cell — quota record gone after teardown, or fs error). The sizing peak survives on its own product; exhaustion classification (which needs the limit regardless) is off for that completion. Distinct from rio_builder_quota_evidence_absent_total, which now fires only when BOTH producers yielded nothing. A sustained rate here with a quiet absent counter means teardown races the one-shot — sizing is healthy, attribution is degraded."
+        "help": "Completions whose project-quota disk evidence was ABSENT (live060-b: quota::status returned None at the completion seam — the node lacks the prjquota precondition, so peak_disk_bytes is None and the disk sizer cannot learn from this pod). One increment per completion; a once-per-pod WARN names the precondition. Expect this rate to trend to ZERO as prjquota provisioning (live060-a) rolls out; a nonzero steady-state rate means builder nodes are running without the disk-evidence producer."
       },
       {
         "name": "rio_builder_stale_assignments_rejected_total",
@@ -440,14 +428,9 @@
         "help": "ComponentScaler learned builders-per-replica ratio (labelled by cs=ns/name). EMA-adjusted against observed PG-pool load; persisted in .status.learnedRatio."
       },
       {
-        "name": "rio_controller_component_scaler_load_poll_partial_total",
-        "kind": "counter",
-        "help": "Ticks whose GetLoad poll resolved more replicas than answered (labelled by cs=ns/name): the load letter was PARTIAL — survivor-high still scales up, survivor-low funds no ratio growth. A sustained rate is the load-correlated timeout regime (one replica chronically saturated or unreachable) — check that pod, not the scaler."
-      },
-      {
         "name": "rio_controller_component_scaler_observed_load",
         "kind": "gauge",
-        "help": "ComponentScaler observed load: max of pg-pool utilization and substitute-admission utilization across the loadEndpoint pods that ANSWERED at the last tick (labelled by cs=ns/name). Under partial coverage this is a survivor max — see rio_controller_component_scaler_load_poll_partial_total."
+        "help": "ComponentScaler observed load: max of pg-pool utilization and substitute-admission utilization across loadEndpoint pods at the last tick (labelled by cs=ns/name)."
       },
       {
         "name": "rio_controller_ddsketch_seed_fallback_total",
@@ -495,11 +478,6 @@
         "help": "GC cron runs. result=success|connect_failure|rpc_failure. connect_failure=store unreachable; rpc_failure=TriggerGC returned error or stream aborted."
       },
       {
-        "name": "rio_controller_intent_cells_refused_total",
-        "kind": "counter",
-        "help": "Intent-cells annotation rows refused at decode, split by degradation class (bug_031): class=structural (row lacks the hash:cap shape — pre-upgrade stamps, truncated writes, webhook row mutation) | out_of_alphabet (cap segment outside the shared capacity alphabet — rollback skew, webhook value mutation). Every refusal is fail-open (the scheduler keeps its last-armed cells, heals at the Job's terminal cycle); a nonzero rate is an operator trail, not an outage."
-      },
-      {
         "name": "rio_controller_job_terminal_report_seconds",
         "kind": "histogram",
         "help": "OA1 interval (i): terminal condition → the ReportAttemptOutcome acked by the scheduler, by `reason`. Pod/Job-terminal arms (oom_killed | evicted_disk_pressure | deadline_exceeded) measure the report latency; controller-synthesized delete arms (reaped | cancelled) record a constant 0.0 — the controller initiates the delete, so the interval closes at the delete by construction. A `preempted` eviction routes through the disruption watcher WITHOUT a histogram sample (counted in disruption_drains_total; the establishment sweep classifies any missed report). Sampled once per terminal Pod/Job per controller process at the first acked report — the report path re-reports the same object every tick for the Job TTL window (the scheduler dedups server-side), and re-sampling those would measure the TTL window instead of the report latency. This is the controller-report-slack baseline the executor-replacement establishment window is sized against (executor-lifecycle campaign, OA1) — filter to the pod-terminal reasons when baselining the establishment window, or the synthesized 0.0 samples fold into the slack quantile."
@@ -523,11 +501,6 @@
         "name": "rio_controller_node_wedge_marked_total",
         "kind": "counter",
         "help": "Nodes newly marked Dead-equivalent by the controller-side OA2 clustering: ≥2 distinct derivations' open pull-mode attempts expired (age past intent deadline + grace) on one node inside the 30-minute window. One increment per not-wedged→wedged transition; the resulting NodeClaim deletions are counted in nodeclaim_reaped_total{reason=\"dead\"} subject to the per-tick dead-reap cap. Non-zero = a node is eating builds without reporting (the wedged-but-Ready failure mode); see the hung-node runbook."
-      },
-      {
-        "name": "rio_controller_nodeclaim_budget_starved_total",
-        "kind": "counter",
-        "help": "Cover-sizing ticks where NO claim size was affordable for a demanded cell — the per-class fleet-core budget binds below the smallest family member (budget < the largest single-intent footprint). Distinct from intent_dropped_total: nothing is dropped, the deficit persists and re-fires every tick until budget frees or demand drains. A sustained rate = raise maxFleetCores / the class cap, or drain the cell."
       },
       {
         "name": "rio_controller_nodeclaim_cells_decode_refused_total",
@@ -612,7 +585,7 @@
       {
         "name": "rio_controller_pod_evictions_total",
         "kind": "counter",
-        "help": "Kubelet pod evictions observed at terminal classification, split by attribution shape (live060-f): shape=pod_attributed_empty_dir (kubelet's per-pod statement that THIS build exceeded ITS declared disk — the three upstream grammars: EmptyDir sizeLimit / pod ephemeral local storage / per-container local ephemeral storage, merged_bug_036) | node_condition (ambient DiskPressure / ephemeral-storage pressure) | other (non-disk evictions). The wire letter folds both disk shapes to evicted_disk_pressure until the carrier lands; this counter is the fleet readback for the unambiguous sub-population."
+        "help": "Kubelet pod evictions observed at terminal classification, split by attribution shape (live060-f): shape=pod_attributed_empty_dir (kubelet's per-pod statement that THIS build exceeded ITS declared disk — EmptyDir sizeLimit / pod ephemeral local storage) | node_condition (ambient DiskPressure / ephemeral-storage pressure) | other (non-disk evictions). The wire letter folds both disk shapes to evicted_disk_pressure until the carrier lands; this counter is the fleet readback for the unambiguous sub-population."
       },
       {
         "name": "rio_controller_reap_dispositions_total",
@@ -755,18 +728,6 @@
         "name": "rio_gateway_quota_rejections_total",
         "kind": "counter",
         "help": "SubmitBuild rejected because tenant is over store quota (labeled by tenant)"
-      }
-    ],
-    "lease": [
-      {
-        "name": "rio_lease_marks_verify_failures_total",
-        "kind": "counter",
-        "help": "Failed leader-marks verify attempts (GET error or timeout, either polarity). Each failure defers divergence discovery one verify interval; a sustained rate means the verify lane is down (RBAC, webhook) and the fleet has silently reverted to the pre-verify world. The log escalates to WARN after consecutive failures."
-      },
-      {
-        "name": "rio_lease_standby_marks_strips_total",
-        "kind": "counter",
-        "help": "Foreign leader marks detected on a non-leading pod by its standby self-check (each detection re-dirties the marks; the next reconcile strips them). Expected zero: any increment is an external marks falsifier live on this pod."
       }
     ],
     "scheduler": [
@@ -916,15 +877,9 @@
         "aggregation": "leader-zeroed"
       },
       {
-        "name": "rio_scheduler_establish_defer_age_seconds",
-        "kind": "gauge",
-        "help": "Oldest currently-deferred expired pull attempt's seconds past its establishment window (0 when no attempt is deferred). Recomputed every sweep pass; leader-owned. Rises monotonically while a probe-unavailable wedge persists — the RioSchedulerEstablishDeferPersistent alert's clock is this age, never the charge rate (the opposite polarity).",
-        "aggregation": "leader-zeroed"
-      },
-      {
-        "name": "rio_scheduler_establish_deferred_total",
+        "name": "rio_scheduler_disk_evidence_total",
         "kind": "counter",
-        "help": "Expired open pull-mode attempts the establishment sweep DEFERRED because the store probe was unavailable (no evidence either way — the attempt stays open for a pass with a working probe). The defer is uncharged and unbounded by design, so this counter and the defer-age gauge are the wedge's only observability: the establishment-cluster tripwire counts CHARGES and stays silent through a probe outage."
+        "help": "Build samples entering the SLA evidence store (write_build_sample, once per completion), labeled present=true|false by whether peak_disk_bytes arrived. THE live_063 acceptance signal, carried here because the builder-side absence counter is scrape-invisible (one-build pods die before the first scrape): on a prjquota-provisioned fleet present=true should dominate; a fleet stuck at present=false means the disk-evidence chain is declining again (mount, kernel, kubelet half, or the hostUsers posture vs the builder-minted projid — quota.rs's four decline modes)."
       },
       {
         "name": "rio_scheduler_evidence_write_fenced_total",
@@ -1067,7 +1022,7 @@
       {
         "name": "rio_scheduler_pull_establishments_total",
         "kind": "counter",
-        "help": "Open pull-mode attempts established as unreported executor crashes by the establishment sweep (the C2 charge arm; the store-probe adopt arm does not count, and the probe-unavailable DEFER arm has its own counter — establish_deferred_total). Feeds the OA2 interim hung-node tripwire — the attempt_requeue histogram's establishment cause is shared with the stream-mode correlation-TTL sweep and is unsuitable for that alert."
+        "help": "Open pull-mode attempts established as unreported executor crashes by the establishment sweep (the C2 charge arm; the store-probe adopt arm does not count). Feeds the OA2 interim hung-node tripwire — the attempt_requeue histogram's establishment cause is shared with the stream-mode correlation-TTL sweep and is unsuitable for that alert."
       },
       {
         "name": "rio_scheduler_pull_rejected_total",
@@ -1118,7 +1073,7 @@
       {
         "name": "rio_scheduler_sla_evidence_refused_total",
         "kind": "counter",
-        "help": "typed refusal letters at the SLA data plane's decode boundaries: an evidence row refused BEFORE any store mutation (the row never lands; siblings are unaffected). Labeled `plane` (which store refused) and `reason` — `zero_resource`: a controller instance-type observation with cores or mem of 0 (absence of parseable kubelet resources is not a 0-core fact; sched.sla.merge-law); `nonfinite_epoch`: a stored epoch decoded to ±inf/NaN ('infinity'::timestamptz — refused so one poisoned row cannot disarm the stale clamp or wedge the lambda watermark; sched.sla.epoch-domain); `sequence_premise`: the λ-cursor CACHE-1 premise failed — the cursor freezes loud (sched.sla.epoch-domain's R29 sibling, merged_bug_063); `unknown_class`: a cell event or observation named a hw class outside the configured set (sched.sla.class-membership); `cursor_fence`: the whole lambda persist unit refused because the stored consumption cursor is ahead of the writer's — a deposed fold no-ops as ONE (sched.sla.one-fence-axis); `nonfinite_value`: a float8 VALUE-family datum (cursor/price value, ratio halves, group SUM) refused at its typed decode — the row/group never enters a fold (sched.sla.refusal-per-column); `skip_to_horizon`: a poisoned consumption cursor adopted the settled horizon WITHOUT consuming (skip, never re-fold — the bounded disclosed repair); `absurd_epoch`: a FINITE but implausibly-future stamp (past now + 48h slack) refused at the epoch decode — the corruption/manual-insert class that froze decay permanently (sched.sla.epoch-domain). Sustained nonzero ⇒ a producer is shipping junk evidence; poisoned PG rows self-heal at the leader's write boundary (stamps reset; value rows overwritten at the key's next upsert — KeepForever, no deletion vector; the cursor healed in place); the stores stay clean but the named plane is learning nothing from those rows."
+        "help": "typed refusal letters at the SLA data plane's decode boundaries: an evidence row refused BEFORE any store mutation (the row never lands; siblings are unaffected). Labeled `plane` (which store refused) and `reason` — `zero_resource`: a controller instance-type observation with cores or mem of 0 (absence of parseable kubelet resources is not a 0-core fact; sched.sla.merge-law); `nonfinite_epoch`: a stored epoch decoded to ±inf/NaN ('infinity'::timestamptz — refused so one poisoned row cannot disarm the stale clamp or wedge the lambda watermark; sched.sla.epoch-domain); `sequence_premise`: the λ-cursor CACHE-1 premise failed — the cursor freezes loud (sched.sla.epoch-domain's R29 sibling, merged_bug_063); `unknown_class`: a cell event or observation named a hw class outside the configured set (sched.sla.class-membership); `cursor_fence`: the whole lambda persist unit refused because the stored consumption cursor is ahead of the writer's — a deposed fold no-ops as ONE (sched.sla.one-fence-axis). Sustained nonzero ⇒ a producer is shipping junk evidence (or a poisoned PG row needs operator surgery); the stores stay clean but the named plane is learning nothing from those rows."
       },
       {
         "name": "rio_scheduler_sla_forecast_dropped_total",
@@ -1272,7 +1227,7 @@
       {
         "name": "rio_scheduler_uncorroborated_sizing_claim_total",
         "kind": "counter",
-        "help": "Worker-reported sizing claims refused by the corroboration gate (bug_090 typed claims; bug_102 the status-borne timeout axis; labels: class = cgroup_oom|disk_full|timed_out|unspecified): the claim's evidence was absent or inconsistent with the scheduler-assigned anchor (oom: peak_memory below half the assigned memory; disk: hard limit outside the producer-derived band [overlay(assigned, H_MIN), overlay(assigned, H_MAX) + block slack] (bug_065: the shared rio_common::k8s overlay denomination — a kubelet-unmintable limit refuses) or peak below half the limit; timed_out: attempt-open duration below half the assigned deadline, or no running_since/intent anchor), or no dispatch intent existed to corroborate against. Refusals are classify-only — the report's retry/charge flow is unaffected and persisted floors never move (every floor mutation demands a typed CorroborationWitness; the caller alphabet stays census-pinned, bump_resource_floor_caller_census). Alert if rate > 0: a forged or misbehaving worker report (the honest producer always sends self-consistent telemetry sampled at its own classification seam)."
+        "help": "Worker-reported sizing claims refused by the corroboration gate (bug_090 typed claims; bug_102 the status-borne timeout axis; labels: class = cgroup_oom|disk_full|timed_out|unspecified): the claim's evidence was absent or inconsistent with the scheduler-assigned anchor (oom: peak_memory below half the assigned memory; disk: hard limit outside [assigned/2, assigned*4] or peak below half the limit; timed_out: attempt-open duration below half the assigned deadline, or no running_since/intent anchor), or no dispatch intent existed to corroborate against. Refusals are classify-only — the report's retry/charge flow is unaffected and persisted floors never move (every floor mutation demands a typed CorroborationWitness; the caller alphabet stays census-pinned, bump_resource_floor_caller_census). Alert if rate > 0: a forged or misbehaving worker report (the honest producer always sends self-consistent telemetry sampled at its own classification seam)."
       },
       {
         "name": "rio_scheduler_undeclared_built_output_total",

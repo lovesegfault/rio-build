@@ -762,6 +762,18 @@ pub fn describe_metrics() {
         "SLA estimator refresh ticks (≈60s cadence; VM-test sync barrier — \
          increments regardless of [sla] gate)"
     );
+    describe_counter!(
+        "rio_scheduler_disk_evidence_total",
+        "Build samples entering the SLA evidence store (write_build_sample, \
+         once per completion), labeled present=true|false by whether \
+         peak_disk_bytes arrived. THE live_063 acceptance signal, carried \
+         here because the builder-side absence counter is scrape-invisible \
+         (one-build pods die before the first scrape): on a prjquota-\
+         provisioned fleet present=true should dominate; a fleet stuck at \
+         present=false means the disk-evidence chain is declining again \
+         (mount, kernel, kubelet half, or the hostUsers posture vs the \
+         builder-minted projid — quota.rs's four decline modes)."
+    );
     describe_histogram!(
         "rio_scheduler_build_graph_edges",
         "Edge count per GetBuildGraph response. High p99 (>10k) = unusually \

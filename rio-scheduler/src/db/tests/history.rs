@@ -871,3 +871,62 @@ async fn read_sla_overrides_filters_cluster() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// live_063 (the measurable acceptance, both halves of (ttttt)): the
+/// evidence-ingest seam counts every sample entering the SLA evidence
+/// store, labeled by disk-axis presence — the long-lived-pod twin of
+/// the scrape-invisible builder-side absence counter. One Some row +
+/// two None rows ⇒ `present=true`=1, `present=false`=2; the counter
+/// fires only on INSERT success (the typed acceptance: a fleet stuck
+/// at present=false is the live_063 class re-armed).
+///
+/// Pre-fix RED (emission absent from `write_build_sample`, recorded
+/// verbatim in the commit body): both label series read 0 —
+/// `present=true: 0 != 1`.
+#[tokio::test]
+async fn write_build_sample_counts_disk_evidence_presence() -> anyhow::Result<()> {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let mk = |pname: &str, peak_disk: Option<i64>| BuildSampleRow {
+        pname: pname.into(),
+        system: "x86_64-linux".into(),
+        tenant: "t1".into(),
+        duration_secs: 1.0,
+        peak_memory_bytes: 1 << 20,
+        peak_disk_bytes: peak_disk,
+        ..Default::default()
+    };
+
+    let rec = DebuggingRecorder::new();
+    // (ppppp): snapshot exactly once, at the end — the debugging
+    // recorder DRAINS counters on snapshot.
+    let snap = rec.snapshotter();
+    {
+        let _g = metrics::set_default_local_recorder(&rec);
+        db.write_build_sample(&mk("with-disk", Some(1 << 30)))
+            .await?;
+        db.write_build_sample(&mk("no-disk-1", None)).await?;
+        db.write_build_sample(&mk("no-disk-2", None)).await?;
+    }
+
+    let by_present = crate::sla::metrics::counter_map_by(
+        &snap,
+        "rio_scheduler_disk_evidence_total",
+        Some("present"),
+    );
+    assert_eq!(
+        by_present.get("true").copied().unwrap_or(0),
+        1,
+        "one sample carried peak_disk_bytes; got {by_present:?}"
+    );
+    assert_eq!(
+        by_present.get("false").copied().unwrap_or(0),
+        2,
+        "two samples arrived evidence-free; got {by_present:?}"
+    );
+
+    Ok(())
+}

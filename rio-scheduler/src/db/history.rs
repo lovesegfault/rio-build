@@ -111,6 +111,23 @@ impl SchedulerDb {
         )
         .execute(&self.pool)
         .await?;
+        // live_063 (the measurable acceptance): count what actually
+        // ENTERED the sla evidence universe, labeled by whether the
+        // disk axis came along. The builder-side absence counter
+        // (`rio_builder_quota_evidence_absent_total`) is structurally
+        // scrape-invisible in production — one-build pods die before
+        // the first scrape (proven by range-vector forensics on the
+        // 0/1912 incident) — so the long-lived scheduler pod carries
+        // the acceptance signal: post-rollout, `present="true"` rises
+        // from zero on new-AMI nodes; a provisioned fleet stuck at
+        // `present="false"` is the live_063 class re-armed. Counted
+        // AFTER the INSERT succeeds (a failed write never enters the
+        // evidence universe and must not inflate the rate).
+        metrics::counter!(
+            "rio_scheduler_disk_evidence_total",
+            "present" => if row.peak_disk_bytes.is_some() { "true" } else { "false" },
+        )
+        .increment(1);
         Ok(())
     }
 
