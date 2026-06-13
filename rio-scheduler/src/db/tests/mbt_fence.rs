@@ -66,14 +66,15 @@
 //!   instant) is exactly what the flush consumes.
 //! - `advanceDerivation(r)` -> a fresh fenced transaction carrying
 //!   [`SchedulerDb::update_derivation_status_in_tx`] (a NON-terminal
-//!   status write — the migration-102 trigger stamps
-//!   `status_changed_at`, which is what makes the later guarded
-//!   flush refuse) + [`SchedulerDb::mint_assignment_upsert_in_tx`]
-//!   (the resubmit re-mint rewriting `exec_id` in place).
+//!   status write — the 102_derivations_status_changed_trigger
+//!   migration stamps `status_changed_at`, which is what makes the
+//!   later guarded flush refuse) +
+//!   [`SchedulerDb::mint_assignment_upsert_in_tx`] (the resubmit
+//!   re-mint rewriting `exec_id` in place).
 //! - `flushReplayGuarded(r)` ->
 //!   [`SchedulerDb::replay_status_batch_guarded`] with the bookkept
 //!   batch (the m011 fix: stamp-guarded drv UPDATE + the
-//!   `exec_id = ANY(latched)` close).
+//!   `exec_id = ANY(latched)` close — quantifier: census(test: mbt_fence_run_outbox_replay)).
 //! - `fenceRefuse(r)` / `answerRetryable(r)` -> consume the held
 //!   `Fenced` outcome / assert the production refusal mapping is
 //!   retryable (`actor_error_to_status(StaleGeneration).code() ==
@@ -492,8 +493,9 @@ impl FenceSystem {
                     bail!("advanceDerivation({r}): fence refused the resubmit re-mint");
                 };
                 // The resubmit's status write — a NON-terminal value
-                // change so the migration-102 trigger stamps
-                // status_changed_at without closing assignments.
+                // change so the 102_derivations_status_changed_trigger
+                // migration stamps status_changed_at without closing
+                // assignments.
                 SchedulerDb::update_derivation_status_in_tx(
                     ftx.conn(),
                     &self.drv_hash,

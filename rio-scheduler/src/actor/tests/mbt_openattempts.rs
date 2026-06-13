@@ -20,11 +20,11 @@
 //!   `assignments.claim_nonce`). "Response lost" is the network fact:
 //!   the driver bookkeeps it; the scheduler-side state is identical.
 //! - `resumeRedeliver` → a second `handle_pull_assignment` presenting
-//!   the SAME nonce (the store never learned the exec id — that is
+//!   the same nonce (the store never learned the exec id — that is
 //!   what "lost" means); the kernel's `redelivery_credential_ok`
 //!   matches `assignments.claim_nonce` and the answer is the
-//!   idempotent re-pull (`DeliverExisting` — SAME exec id, no second
-//!   mint). The driver asserts exec-id identity.
+//!   idempotent re-pull (`DeliverExisting` — the SAME exec id, no second mint — quantifier: census(test: mbt_openattempts_run_sweep_window)).
+//!   The driver asserts exec-id identity at the resume step.
 //! - `consumeCloseOk` → `handle_report_outcome` with a
 //!   `MaterializationOutcome::Success` (the settled close: charge-free,
 //!   companion releases the claim).
@@ -189,8 +189,9 @@ enum Act {
     /// production entrypoint with NO claim nonce — the shape the fix
     /// retired. Only the acceptance red-holder issues it.
     MintResponseLostNonceless,
-    /// `resumeRedeliver`: present the SAME nonce; expect the
-    /// idempotent re-pull of the SAME exec.
+    /// `resumeRedeliver`: present the same nonce; expect the
+    /// idempotent re-pull of the same exec (the identity is asserted
+    /// in the apply arm — the module doc carries the bound law).
     ResumeRedeliver,
     /// `consumeCloseOk`: report a successful materialization outcome.
     ConsumeCloseOk,
@@ -239,7 +240,7 @@ struct OaSystem {
     /// production `poll_and_claim` mints one per fresh presentation).
     nonce: Uuid,
     /// Minted exec id (driver bookkeeping; the resume step asserts
-    /// the redelivery returns the SAME one).
+    /// the redelivery returns the same one).
     exec: Option<Uuid>,
 }
 
@@ -608,8 +609,9 @@ fn mbt_openattempts_run_happy_path() {
 }
 
 /// The OQ-12 acceptance, GREEN half: the bug_251 trace — lost mint
-/// response, credential-honored redelivery (SAME exec), then the
-/// legitimate establishment charge of the genuinely expired attempt.
+/// response, credential-honored redelivery (same exec, asserted in
+/// the driver's resume arm), then the legitimate establishment
+/// charge of the genuinely expired attempt.
 #[test]
 #[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
 fn mbt_openattempts_run_sweep_window() {
