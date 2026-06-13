@@ -754,6 +754,7 @@ pub(crate) fn make_fit(pname: &str) -> crate::sla::types::FittedParams {
             p90: MemBytes(6 << 30),
         },
         disk_p90: Some(DiskBytes(10 << 30)),
+        disk_p90_raw: Some(RawDiskP90(DiskBytes(10 << 30))),
         sigma_resid: 0.1,
         log_residuals: Vec::new(),
         n_eff_ring: RingNEff(10.0),

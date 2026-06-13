@@ -1762,6 +1762,9 @@ async fn contract_metrics_once_per_miss() {
     // result; `was_miss` gates `why.emit()`.
     let mut fit = make_fit("disk-hog");
     fit.disk_p90 = Some(crate::sla::types::DiskBytes(300 << 30));
+    fit.disk_p90_raw = Some(crate::sla::types::RawDiskP90(crate::sla::types::DiskBytes(
+        300 << 30,
+    )));
     actor.sla_estimator.seed(fit);
     actor.test_inject_ready("d-disk", Some("disk-hog"), "x86_64-linux", false);
 
@@ -1877,6 +1880,9 @@ async fn contract_metrics_once_per_miss() {
     // staleness field (would have caught r5 bug_012 at the boundary).
     let mut fit = make_fit("disk-hog");
     fit.disk_p90 = Some(crate::sla::types::DiskBytes(300 << 30));
+    fit.disk_p90_raw = Some(crate::sla::types::RawDiskP90(crate::sla::types::DiskBytes(
+        300 << 30,
+    )));
     fit.hw_bias.insert("intel-7".into(), 1.2);
     actor.sla_estimator.seed(fit);
     for _ in 0..POLLS {

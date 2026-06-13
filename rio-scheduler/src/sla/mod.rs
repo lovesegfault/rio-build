@@ -872,6 +872,7 @@ mod tests {
                 r1: 0.9,
             },
             disk_p90: None,
+            disk_p90_raw: None,
             sigma_resid: 0.1,
             log_residuals: vec![],
             n_eff_ring: RingNEff(n_eff),

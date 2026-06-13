@@ -923,6 +923,7 @@ async fn spawn_intent_from_sla_estimator() {
             p90: MemBytes(6 << 30),
         },
         disk_p90: Some(DiskBytes(10 << 30)),
+        disk_p90_raw: Some(RawDiskP90(DiskBytes(10 << 30))),
         sigma_resid: 0.1,
         log_residuals: Vec::new(),
         // Asymptotic-n so z_q ≈ Φ⁻¹(0.9)=1.2816 and the closed-form
@@ -1654,6 +1655,7 @@ async fn work_assignment_carries_sla_cores() {
             p90: MemBytes(6 << 30),
         },
         disk_p90: Some(DiskBytes(10 << 30)),
+        disk_p90_raw: Some(RawDiskP90(DiskBytes(10 << 30))),
         sigma_resid: 0.1,
         log_residuals: Vec::new(),
         n_eff_ring: RingNEff(10.0),
@@ -1736,6 +1738,7 @@ async fn solve_intent_deadline_denormalized_to_slowest_hw() {
             p90: MemBytes(6 << 30),
         },
         disk_p90: Some(DiskBytes(10 << 30)),
+        disk_p90_raw: Some(RawDiskP90(DiskBytes(10 << 30))),
         sigma_resid: 0.0,
         log_residuals: Vec::new(),
         n_eff_ring: RingNEff(10.0),

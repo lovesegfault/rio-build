@@ -253,6 +253,7 @@ mod tests {
             },
             mem: MemFit::Independent { p90: MemBytes(0) },
             disk_p90: None,
+            disk_p90_raw: None,
             sigma_resid: 0.0,
             log_residuals: vec![],
             n_eff_ring: RingNEff(5.0),

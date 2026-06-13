@@ -382,7 +382,8 @@ mod tests {
     use crate::sla::config::{CapacityType, ProbeShape};
     use crate::sla::solve::{AdmissibleSet, InfeasibleReason, Tier};
     use crate::sla::types::{
-        DiskBytes, DurationFit, ExploreState, FitDf, MemFit, ModelKey, RingNEff, WallSeconds,
+        DiskBytes, DurationFit, ExploreState, FitDf, MemFit, ModelKey, RawDiskP90, RingNEff,
+        WallSeconds,
     };
 
     // ─── resolve_h_explore unit tests ────────────────────────────────────
@@ -806,6 +807,7 @@ mod tests {
             fit: DurationFit::Probe,
             mem: MemFit::Independent { p90: MemBytes(0) },
             disk_p90: None,
+            disk_p90_raw: None,
             sigma_resid: 0.2,
             log_residuals: Vec::new(),
             n_eff_ring: RingNEff(1.0),
@@ -979,6 +981,7 @@ mod tests {
         // scalar; no reason to re-climb DiskPressure on a fresh drv_hash.
         let mut f = fit(st(4.0, 4.0, 1, true, 1500.0));
         f.disk_p90 = Some(DiskBytes(75 << 30));
+        f.disk_p90_raw = Some(RawDiskP90(DiskBytes(75 << 30)));
         assert_eq!(
             next(Some(&f), &cfg(), &DrvHints::default(), &ceil())
                 .disk
@@ -1113,7 +1116,8 @@ mod disk_axis_tests {
     use crate::sla::ingest::refit;
     use crate::sla::solve::Ceilings;
     use crate::sla::types::{
-        DiskBytes, DurationFit, ExploreState, FitDf, MemFit, ModelKey, RingNEff, WallSeconds,
+        DiskBytes, DurationFit, ExploreState, FitDf, MemFit, ModelKey, RawDiskP90, RingNEff,
+        WallSeconds,
     };
 
     fn cfg_and_ceil() -> (SlaConfig, Ceilings) {
@@ -1228,6 +1232,7 @@ mod disk_axis_tests {
             ..test_fit_shell()
         };
         f.disk_p90 = Some(DiskBytes(500 << 30));
+        f.disk_p90_raw = Some(RawDiskP90(DiskBytes(500 << 30)));
         let d = next(Some(&f), &cfg, &Default::default(), &ceil);
         assert_eq!(
             d.disk.bytes(),
@@ -1250,6 +1255,7 @@ mod disk_axis_tests {
                 p90: crate::sla::types::MemBytes(0),
             },
             disk_p90: None,
+            disk_p90_raw: None,
             sigma_resid: 0.2,
             log_residuals: Vec::new(),
             n_eff_ring: RingNEff(0.0),

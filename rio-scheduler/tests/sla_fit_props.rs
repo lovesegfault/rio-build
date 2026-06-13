@@ -42,6 +42,7 @@ fn mk_fit(s: f64, p: f64, q: f64, sigma: f64) -> FittedParams {
             p90: MemBytes(2 << 30),
         },
         disk_p90: Some(DiskBytes(10 << 30)),
+        disk_p90_raw: Some(RawDiskP90(DiskBytes(10 << 30))),
         sigma_resid: sigma,
         log_residuals: Vec::new(),
         n_eff_ring: RingNEff(1e6),

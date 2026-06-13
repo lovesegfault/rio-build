@@ -770,6 +770,7 @@ async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
         },
         mem: MemFit::Independent { p90: MemBytes(0) },
         disk_p90: None,
+        disk_p90_raw: None,
         sigma_resid: 0.02,
         log_residuals: vec![0.02, -0.02, 0.02, -0.02, 0.02],
         n_eff_ring: RingNEff(8.0),

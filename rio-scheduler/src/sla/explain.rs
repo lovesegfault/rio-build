@@ -118,10 +118,11 @@ pub fn explain(
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
     let h = headroom(fit.n_eff_ring);
     // bug_132: the disk-ceiling label mirrors the solve gates BY
-    // CONSTRUCTION — the same single-sourced raw-observation
-    // predicate, never a re-derived comparison that can drift.
+    // CONSTRUCTION — the same single-sourced predicate on the RAW
+    // reject face (sched.sla.disk-polarity-fork), never a re-derived
+    // comparison that can drift.
     let disk_rejects =
-        crate::sla::fit::DiskFitEnvelope::exceeds_ceiling(fit.disk_p90, ceil.max_disk);
+        crate::sla::fit::DiskFitEnvelope::exceeds_ceiling(fit.disk_p90_raw, ceil.max_disk);
 
     let mut candidates = Vec::with_capacity(walk.len());
     for tier in walk {
@@ -220,6 +221,7 @@ mod tests {
                 p90: MemBytes(2 << 30),
             },
             disk_p90: Some(DiskBytes(10 << 30)),
+            disk_p90_raw: Some(crate::sla::types::RawDiskP90(DiskBytes(10 << 30))),
             sigma_resid: 0.1,
             log_residuals: Vec::new(),
             n_eff_ring: RingNEff(1e6),

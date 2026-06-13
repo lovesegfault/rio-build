@@ -123,7 +123,9 @@ pub enum InfeasibleReason {
     SerialFloor,
     /// `M(c*)·headroom > sla.maxMem` at the feasible `c*`.
     MemCeiling,
-    /// `disk_p90 > sla.maxDisk` (c-independent).
+    /// Raw witnessed `disk_p90_raw > sla.maxDisk` (c-independent;
+    /// the reject face of the polarity fork — never the floored
+    /// sizing face).
     DiskCeiling,
     /// Envelope infeasible at `cap_c = min(p̄, c_opt, sla.maxCores)`.
     CoreCeiling,
@@ -237,7 +239,12 @@ impl InfeasibleReason {
 pub fn classify_ceiling(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> InfeasibleReason {
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
     let h = headroom(fit.n_eff_ring);
-    if fit.disk_p90.is_some_and(|d| d.0 > ceil.max_disk) {
+    // The metric mirrors the POST-fork solve gates: the RAW reject
+    // face (sched.sla.disk-polarity-fork) — a floored consult here
+    // would mislabel the `(ceiling/1.2, ceiling]` band's core/mem/
+    // serial demotions as DiskCeiling (merged_bug_002's fourth
+    // reject-direction reader, bug_012's drift hazard).
+    if fit.disk_p90_raw.is_some_and(|d| d.bytes() > ceil.max_disk) {
         return InfeasibleReason::DiskCeiling;
     }
     // Loosest bounded tier — the last one solve_tier's reject-not-clamp
@@ -282,7 +289,8 @@ pub enum CellReject {
     EnvelopeInfeasible,
     /// `M(c*)·headroom > sla.maxMem` at the envelope-feasible `c*`.
     MemCeiling,
-    /// `disk_p90 > sla.maxDisk` (c-independent).
+    /// Raw witnessed `disk_p90_raw > sla.maxDisk` (c-independent; the
+    /// reject face of the polarity fork).
     DiskCeiling,
     /// `c* > hwClasses[h].max_cores` or `mem > hwClasses[h].max_mem` —
     /// the configured per-class catalog ceiling (what Karpenter is
@@ -683,13 +691,15 @@ pub fn solve_tier(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveR
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
     let h = headroom(fit.n_eff_ring);
     // bug_132 (R24): the REQUEST is minted only via the envelope
-    // (floor + ceiling by construction); the Feasible REJECT gate
-    // keeps reading the RAW observation through the single-sourced
-    // predicate — `fit.D > maxDisk` is the genuine c-invariant
-    // "cannot fit" gate (sla-sizing alg), and the clamped request by
-    // construction can never trip it.
+    // (floor + ceiling by construction) from the FLOORED sizing face;
+    // the Feasible REJECT gate reads the RAW face BY SIGNATURE
+    // through the single-sourced predicate (sched.sla.disk-polarity-
+    // fork — merged_bug_002: the sizing floor falsely rejected the
+    // all-fitting band population) — `fit.D_raw > maxDisk` is the
+    // genuine c-invariant "cannot fit" gate (sla-sizing alg), and the
+    // clamped request by construction can never trip it.
     let disk = fit::DiskFitEnvelope::fit(fit.disk_p90, ceil.default_disk, ceil.max_disk);
-    let disk_rejects = fit::DiskFitEnvelope::exceeds_ceiling(fit.disk_p90, ceil.max_disk);
+    let disk_rejects = fit::DiskFitEnvelope::exceeds_ceiling(fit.disk_p90_raw, ceil.max_disk);
 
     for tier in tiers {
         // hw_factor=1.0 / lambda=0.0: phase-13 wires the per-hw_class
@@ -854,10 +864,12 @@ fn evaluate_cell(
     };
     let c_star = (c_star.0.ceil() as u32).max(1);
     let mem = (fit.mem.at(RawCores(f64::from(c_star))).0 as f64 * hr) as u64;
-    // bug_132: the per-cell disk gate reads the RAW observation via
-    // the single-sourced predicate (the request below is clamped by
-    // construction and can never trip a ceiling gate).
-    if fit::DiskFitEnvelope::exceeds_ceiling(fit.disk_p90, ceil.max_disk) {
+    // bug_132: the per-cell disk gate reads the RAW face BY
+    // SIGNATURE via the single-sourced predicate (sched.sla.disk-
+    // polarity-fork; the request below is minted from the floored
+    // sizing face, clamped by construction, and can never trip a
+    // ceiling gate).
+    if fit::DiskFitEnvelope::exceeds_ceiling(fit.disk_p90_raw, ceil.max_disk) {
         return Err(CellReject::DiskCeiling);
     }
     if mem > ceil.max_mem {
@@ -1410,7 +1422,12 @@ pub fn fit_content_hash(fit: &FittedParams) -> u64 {
         x.to_bits().hash(&mut h);
     }
     fit.n_distinct_c.hash(&mut h);
+    // BOTH polarity faces are solve-relevant (sched.sla.disk-
+    // polarity-fork): the raw face drives the reject gates, the
+    // floored face the request mint — either moving alone changes
+    // solve output, so hashing one would serve stale memos.
     fit.disk_p90.map(|d| d.0).hash(&mut h);
+    fit.disk_p90_raw.map(|d| d.bytes()).hash(&mut h);
     match &fit.mem {
         super::types::MemFit::Coupled { a, b, .. } => {
             a.to_bits().hash(&mut h);
@@ -1640,6 +1657,7 @@ mod tests {
                 p90: MemBytes(2 << 30),
             },
             disk_p90: Some(DiskBytes(10 << 30)),
+            disk_p90_raw: Some(RawDiskP90(DiskBytes(10 << 30))),
             sigma_resid: sigma,
             log_residuals: Vec::new(),
             // Asymptotic-n so z_q → Φ⁻¹(q) and the closed-form test
@@ -1759,6 +1777,7 @@ mod tests {
         // ephemeral-storage request → permanently-Pending pod.
         let mut fit = mk_fit(400.0, 100.0, 0.0, f64::INFINITY, 0.1);
         fit.disk_p90 = Some(DiskBytes(300 << 30)); // > ceil.max_disk=200Gi
+        fit.disk_p90_raw = Some(RawDiskP90(DiskBytes(300 << 30)));
         let SolveResult::BestEffort { disk, .. } = solve_tier(&fit, &[t("t0", 300.0)], &ceil())
         else {
             panic!()
@@ -1779,6 +1798,7 @@ mod tests {
     fn w10ac_solve_lane_floors_warm_small_p90() {
         let mut fit = mk_fit(400.0, 100.0, 0.0, f64::INFINITY, 0.1);
         fit.disk_p90 = Some(DiskBytes(200 << 20)); // 200 MiB warm fit
+        fit.disk_p90_raw = Some(RawDiskP90(DiskBytes(200 << 20)));
         let SolveResult::Feasible { disk, .. } = solve_tier(&fit, &[t("t0", 600.0)], &ceil())
         else {
             panic!("600s tier is feasible for the 400+100/c fit")
@@ -1818,6 +1838,7 @@ mod tests {
         ] {
             let mut fit = mk_fit(400.0, 100.0, 0.0, f64::INFINITY, 0.1);
             fit.disk_p90 = obs;
+            fit.disk_p90_raw = obs.map(RawDiskP90);
             let law = DiskFitEnvelope::fit(obs, ceilings.default_disk, ceilings.max_disk);
             // solve_tier — Feasible or BestEffort, the request obeys
             // the same law.
@@ -2324,6 +2345,7 @@ mod tests {
         // self-consistent for `explain.rs`.
         let mut fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
         fit.disk_p90 = Some(DiskBytes(300 << 30));
+        fit.disk_p90_raw = Some(RawDiskP90(DiskBytes(300 << 30)));
         let max = ceil().max_disk;
         // forced_cores override.
         let o = ResolvedTarget {
@@ -3001,6 +3023,7 @@ mod tests {
         // candidates exist. The dispatch wrapper emits DiskCeiling.
         let mut fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
         fit.disk_p90 = Some(DiskBytes(300 << 30)); // > ceil.max_disk=200Gi
+        fit.disk_p90_raw = Some(RawDiskP90(DiskBytes(300 << 30)));
         let r = solve_full(
             &fit,
             &[t("normal", 1200.0)],
@@ -3336,6 +3359,7 @@ mod tests {
         let cost = CostTable::from_parts(HashMap::new(), lambda);
         let mut fit = mk_fit(800.0, 0.0, 0.0, f64::INFINITY, 0.1);
         fit.disk_p90 = Some(DiskBytes(300 << 30));
+        fit.disk_p90_raw = Some(RawDiskP90(DiskBytes(300 << 30)));
         let r = solve_full(
             &fit,
             &[t("normal", 1200.0)],
@@ -3385,6 +3409,7 @@ mod tests {
         fn f_disk() -> FittedParams {
             let mut f = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
             f.disk_p90 = Some(DiskBytes(300 << 30));
+            f.disk_p90_raw = Some(RawDiskP90(DiskBytes(300 << 30)));
             f
         }
         fn f_mem() -> FittedParams {

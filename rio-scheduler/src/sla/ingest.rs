@@ -16,7 +16,7 @@ use super::prior::{FitParams, PriorSources, partial_pool, prior_for};
 use super::solve::Tier;
 use super::types::{
     DiskBytes, DurationFit, ExploreState, FitDf, FittedParams, MemBytes, MemFit, ModelKey,
-    RawCores, RefSeconds, RingNEff, WallSeconds,
+    RawCores, RawDiskP90, RefSeconds, RingNEff, WallSeconds,
 };
 use crate::db::BuildSampleRow;
 
@@ -367,8 +367,13 @@ pub fn refit(
     // row silently dropped every peaked legacy row (p90 of N+1
     // collapsed to 1). The one chokepoint now folds BOTH populations
     // always: ring weights where the row holds a c-axis seat, unit
-    // weights elsewhere.
-    let disk_p90 = aggregate_disk_p90(rows, &w);
+    // weights elsewhere. Both polarity faces destructure from the ONE
+    // mint (sched.sla.disk-polarity-fork).
+    let disk_fork = aggregate_disk_p90(rows, &w);
+    let (disk_p90, disk_p90_raw) = match disk_fork {
+        Some(f) => (Some(f.floored), Some(f.raw)),
+        None => (None, None),
+    };
 
     let log_residuals: Vec<f64> = if matches!(fit, DurationFit::Probe) {
         Vec::new()
@@ -430,6 +435,7 @@ pub fn refit(
         fit,
         mem,
         disk_p90,
+        disk_p90_raw,
         sigma_resid: sigma,
         log_residuals,
         n_eff_ring,
@@ -757,16 +763,32 @@ fn aggregate_mem_p90(rows: &[BuildSampleRow], fit_w: &[f64]) -> MemBytes {
     MemBytes(weighted_quantile(&vals, &ws, 0.9) as u64)
 }
 
+/// The two polarity faces of the warm disk fit, minted together
+/// behind the ONE witness gate (sched.sla.disk-polarity-fork): `raw`
+/// is the witnessed weighted p90 (the reject/explain face), `floored`
+/// is `max(p90, newest x DISK_SHRINK_HEADROOM)` (the sizing face).
+/// One mint site ⇒ the faces cannot diverge in `Some`-ness.
+pub(super) struct DiskP90Fork {
+    pub raw: RawDiskP90,
+    pub floored: DiskBytes,
+}
+
 // r[impl sched.sla.one-aggregator+2]
-fn aggregate_disk_p90(rows: &[BuildSampleRow], fit_w: &[f64]) -> Option<DiskBytes> {
+// r[impl sched.sla.disk-polarity-fork]
+fn aggregate_disk_p90(rows: &[BuildSampleRow], fit_w: &[f64]) -> Option<DiskP90Fork> {
     let (vals, ws) = axis_samples(rows, fit_w, |r| r.peak_disk_bytes.map(|b| b as f64));
-    // live060-c: the population gate + the shrink floor live INSIDE
-    // the one producer (R33 — the gate's home is the warm fit's sole
-    // mint, so every consumer — the envelope's `fitted`, the
-    // `exceeds_ceiling` reject gates, the explore lanes — is
-    // witnessed by construction; gating in `DiskFitEnvelope::derive`
-    // instead would leave `exceeds_ceiling` consuming the un-gated
-    // quantity: the single-sample hazard has a reject face too).
+    // live060-c: the population gate lives INSIDE the one producer —
+    // BOTH polarity faces are gated (the single-sample hazard has a
+    // reject face too; gating in `DiskFitEnvelope::derive` instead
+    // would leave `exceeds_ceiling` consuming an un-gated quantity).
+    // The reader set and each reader's direction are DERIVED, not
+    // narrated: see the polarity-rider census
+    // (`w13_polarity_rider_census`, this module's test tier) — every
+    // `disk_p90`/`disk_p90_raw` consult site carries a committed
+    // {direction, units} row and the raw/floored split binds at
+    // consumer SIGNATURES (merged_bug_002: the retired prose census
+    // here claimed measure-compatibility for the reject readers that
+    // the shrink floor falsifies).
     // `vals` is completed_at-ascending (refit's input contract), so
     // the last element IS the newest observed peak.
     if vals.len() < DISK_WITNESS_MIN_PEAKS {
@@ -774,7 +796,10 @@ fn aggregate_disk_p90(rows: &[BuildSampleRow], fit_w: &[f64]) -> Option<DiskByte
     }
     let p90 = weighted_quantile(&vals, &ws, 0.9);
     let newest = vals.last().copied().unwrap_or(0.0);
-    Some(DiskBytes(p90.max(newest * DISK_SHRINK_HEADROOM) as u64))
+    Some(DiskP90Fork {
+        raw: RawDiskP90(DiskBytes(p90 as u64)),
+        floored: DiskBytes(p90.max(newest * DISK_SHRINK_HEADROOM) as u64),
+    })
 }
 
 /// live060-c: the disk fit's WITNESS GATE — the warm fit is consumed
@@ -857,9 +882,13 @@ fn axis_samples(
 fn probe_only(
     key: &ModelKey,
     rows: &[BuildSampleRow],
-    disk_p90: Option<DiskBytes>,
+    disk_fork: Option<DiskP90Fork>,
 ) -> FittedParams {
     let last = rows.last();
+    let (disk_p90, disk_p90_raw) = match disk_fork {
+        Some(f) => (Some(f.floored), Some(f.raw)),
+        None => (None, None),
+    };
     FittedParams {
         key: key.clone(),
         fit: DurationFit::Probe,
@@ -867,6 +896,7 @@ fn probe_only(
             p90: aggregate_mem_p90(rows, &[]),
         },
         disk_p90,
+        disk_p90_raw,
         sigma_resid: 0.2,
         log_residuals: Vec::new(),
         n_eff_ring: RingNEff(0.0),
@@ -1398,6 +1428,7 @@ mod tests {
             },
             mem: MemFit::Independent { p90: MemBytes(0) },
             disk_p90: None,
+            disk_p90_raw: None,
             sigma_resid: 0.1,
             log_residuals: Vec::new(),
             n_eff_ring: RingNEff(fit_df),
@@ -2166,6 +2197,71 @@ mod disk_axis_tests {
         );
     }
 
+    // r[verify sched.sla.disk-polarity-fork]
+    /// **W13-R (merged_bug_002, red-first)** — *no all-fitting
+    /// population is ceiling-rejected; population: the
+    /// (ceiling/1.2, ceiling] band, the live-measured shape.*
+    /// Six observed peaks 185..=190 GiB under the shipped 200 GiB
+    /// ceiling — every observation fits, the newest (190 GiB) sits in
+    /// the band where newest x 1.2 = 228 GiB crosses the ceiling.
+    /// Pre-fix red (transcript in the commit body): the single
+    /// floored field fed the reject gates, so the band population was
+    /// falsely rejected as cannot-fit, self-renewing on each refit.
+    #[test]
+    fn w13_r_all_fitting_band_population_is_never_ceiling_rejected() {
+        const GI: i64 = 1 << 30;
+        let ceiling = 200 * GI as u64;
+        let rows: Vec<BuildSampleRow> = (0..6)
+            .map(|i| disk_row(None, 100.0 + i as f64, Some((185 + i) * GI)))
+            .collect();
+        let f = refit(&key(), &rows, None, &[], &HwTable::default(), None);
+        assert!(
+            !super::super::fit::DiskFitEnvelope::exceeds_ceiling(f.disk_p90_raw, ceiling),
+            "every observed peak fits under the ceiling — the reject \
+             face must consume the RAW witnessed p90, never the \
+             sizing-face shrink floor (conservative-for-sizing is \
+             anti-conservative-for-reject)"
+        );
+        let raw = f.disk_p90_raw.expect("witnessed").bytes();
+        assert!(
+            raw <= 190 * GI as u64,
+            "the raw face is the weighted p90, bounded by the max \
+             observation: {raw}"
+        );
+    }
+
+    // r[verify sched.sla.disk-polarity-fork]
+    /// **W13-R2 (merged_bug_002)** — *the sizing face still floors on
+    /// the same band population: live060-c's shrink hysteresis is
+    /// byte-stable across the fork.* The floored face carries
+    /// `max(p90, newest x 1.2)` exactly as the pre-fork single field
+    /// did, and the envelope request consumes it (clamped at the
+    /// ceiling) — the fork moves the REJECT readers off the floor, it
+    /// never weakens the sizing protection.
+    #[test]
+    fn w13_r2_sizing_face_keeps_the_shrink_floor_on_the_band() {
+        const GI: i64 = 1 << 30;
+        let ceiling = 200 * GI as u64;
+        let rows: Vec<BuildSampleRow> = (0..6)
+            .map(|i| disk_row(None, 100.0 + i as f64, Some((185 + i) * GI)))
+            .collect();
+        let f = refit(&key(), &rows, None, &[], &HwTable::default(), None);
+        let floored = f.disk_p90.expect("witnessed").0;
+        assert_eq!(
+            floored,
+            (190.0 * GI as f64 * 1.2) as u64,
+            "the sizing face floors at newest x DISK_SHRINK_HEADROOM \
+             — byte-identical to the pre-fork mint"
+        );
+        let req = super::super::fit::DiskFitEnvelope::fit(f.disk_p90, 100 * GI as u64, ceiling);
+        assert_eq!(
+            req.bytes(),
+            ceiling,
+            "the envelope clamps the floored face at the operator \
+             ceiling — the request law is unchanged"
+        );
+    }
+
     // r[verify sched.sla.one-weight-law]
     /// **W12-AD (merged_bug_022, red-first)** — *the aggregator's weight
     /// law is total over sub-populations: BOTH directions of the mixed
@@ -2197,7 +2293,7 @@ mod disk_axis_tests {
             got.0 / (1 << 30)
         );
         assert!(
-            !super::super::fit::DiskFitEnvelope::exceeds_ceiling(f.disk_p90, 50 * GI as u64),
+            !super::super::fit::DiskFitEnvelope::exceeds_ceiling(f.disk_p90_raw, 50 * GI as u64),
             "the false tier rejection clears once fresh evidence wins"
         );
     }

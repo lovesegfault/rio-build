@@ -216,14 +216,44 @@ type (`IntentDecision`, `SolveResult`, `AdmissibleSet`,
 `disk_p90` projection no longer type-checks at any emission seam — rustc is
 the lane census (the wave-8 implementation wired the envelope into the
 explore lane only and left the solve lanes floor-less open-coded; the lane
-divergence is now unrepresentable). The Feasible reject gates keep reading
-the *witnessed* observation through one shared predicate
-(`exceeds_ceiling`) — `fit.D > maxDisk` is the genuine c-invariant "cannot
-fit" gate per @alg-estimate, gated and floored by the producer like every
-other consumer (live060-c), and the clamped request by construction can
-never trip it;
-`sla explain`'s `disk-ceiling` label reads the same predicate, so the explain
-surface mirrors the solve gates by construction.
+divergence is now unrepresentable). The Feasible reject gates read the *raw*
+witnessed face through one shared predicate (`exceeds_ceiling`, which
+demands `RawDiskP90` by signature) — `"fit.D"_"raw" > "maxDisk"` is the
+genuine c-invariant "cannot fit" gate per @alg-estimate, gated by the
+producer's witness population like every other consumer (live060-c) but
+NEVER floored (the polarity-fork rule below), and the clamped request by
+construction can never trip it;
+`sla explain`'s `disk-ceiling` label and `classify_ceiling`'s metric mirror
+read the same predicate, so the explain and metric surfaces mirror the
+solve gates by construction.
+
+#r("sched.sla.disk-polarity-fork")
+
+The warm disk evidence MUST fork by reader polarity at the producer's single
+mint: the REJECT/explain readers (`exceeds_ceiling` — the tier gate, the
+per-cell gate, the explain label, the metric classifier) consume the RAW
+witnessed p90, and the SIZING readers (`DiskFitEnvelope::derive`/`fit`)
+consume the shrink-floored quantity $max("p90", "newest" times 1.2)$; the
+two faces MUST bind at consumer signatures via distinct types
+(`RawDiskP90` vs `DiskBytes`) so re-conflation fails to type-check, and the
+witness-population gate ($n >= 3$) MUST gate both faces inside the one
+producer.
+
+merged_bug_002 (the R33$prime$ founding instance): live060-c fused the
+shrink floor into the ONE `disk_p90` mint and certified the fusion with a
+prose reader census ("every consumer ... is witnessed by construction")
+whose measure-compatibility claim was FALSE for the opposite-polarity
+readers — a floor that is *conservative* for sizing (never shrink below
+recent reality) is *anti-conservative* for reject: every all-fitting
+population whose newest peak sat in $("ceiling" slash 1.2, "ceiling"]$ (the
+live-ramp \~189–201 GiB band under the 200 GiB ceiling) was falsely
+rejected as cannot-fit, self-renewing on each refit. A transform fused into
+a single-producer mint must be proven monotone-safe for EVERY reader's
+direction, or the quantity forks — and the fork is enforced by rustc at the
+consumer signature, never by narration. The reader set and each reader's
+{direction, units} annotation are DERIVED by the polarity-rider census
+(`w13_polarity_rider_census`), which REDs on any unenrolled consult site —
+the retired prose census is the named anti-pattern.
 
 Measurement reads kubelet's own XFS/ext4 *project quota* on the emptyDir, a node-local scratch volume. Kubelet (`LocalStorageCapacityIsolationFSQuotaMonitoring=true`) assigns the project ID; the @supervisor scrapes it via `FS_IOC_FSGETXATTR` on the dir inode and reads usage with `quotactl_fd()`. This requires Linux $>= 5.14$ and piggybacks the @supervisor#"'"s existing `CAP_SYS_ADMIN` from the overlay mount; the older `quotactl()` needs a block-device path the container cannot see. The read is kernel-tracked $O(1)$ and polled in the #qty("1", "Hz") `cpu_poll` loop. Every builder pool is prjquota-provisioned (the `infra.node.kubelet-prjquota` contract: the settled-udev dispatcher `rio-kubelet-mount` classifies the node once and runs the NVMe RAID0 branch or the EBS quota-volume branch over the dedicated quota volume — live_060 closed the EBS gap that left $D$ *recorded as NULL* on 159/160 of the fleet); on a node whose chain is broken kubelet falls back to \~#qty("60", "s") `du` polls, $D$ records NULL, the no-neighbor-eviction guarantee is void, and the request falls back to `sla.defaultDisk` — which is why the chain is a hard node requirement and its absence is LOUD (NotReady), never a silent fallback. The pool-side declaration is machine-checked from the deployed values surface (helm fragment 48: every EBS-only builder-hosting class declares the quota volume); the residual live-fleet drift face is the live_060 post-rollout readback (peak_disk_bytes Some-rate), never silent green. A statvfs-delta fallback was rejected because other pods on the same node would cross-contaminate it. The build tempdir lands inside this subtree by default — nix ≥2.30 sets `build-dir = ${stateDir}/builds` — so the quota captures intermediate object files, not just outputs.
 

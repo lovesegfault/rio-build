@@ -1,7 +1,7 @@
 use nalgebra::{DMatrix, DVector};
 
 use super::types::{
-    DiskBytes, DurationFit, FitDf, MemBytes, MemFit, RawCores, RefSeconds, RingNEff,
+    DiskBytes, DurationFit, FitDf, MemBytes, MemFit, RawCores, RawDiskP90, RefSeconds, RingNEff,
 };
 
 // r[impl sched.sla.disk-reaches-ephemeral-storage+2]
@@ -79,20 +79,29 @@ impl DiskFitEnvelope {
         Self::derive(observed_p90, prior, ceiling).request()
     }
 
+    // r[impl sched.sla.disk-polarity-fork]
     /// The Feasible-lane REJECT predicate, single-sourced (bug_128's
     /// sibling discipline applied here too): a witnessed observation
     /// above the operator ceiling is the genuine "cannot fit" gate —
-    /// c-invariant, evaluated on the producer's WITNESSED fit
-    /// (live060-c: ≥ the raw p90 — the shrink floor only raises it —
-    /// and None below the population gate, so a single outlier build
-    /// can no longer reject a tier fleet-wide either: the
-    /// single-sample hazard has a reject face too; never the clamped
-    /// request, which by construction can never exceed the ceiling).
-    /// `solve_tier`'s tier gate, `evaluate_cell`'s per-cell gate, and
-    /// `explain`'s `disk-ceiling` label all read THIS, so the explain
-    /// surface mirrors the solve gates by construction.
-    pub fn exceeds_ceiling(observed_p90: Option<DiskBytes>, ceiling: u64) -> bool {
-        observed_p90.is_some_and(|d| d.0 > ceiling)
+    /// c-invariant, evaluated on the producer's RAW witnessed face
+    /// ([`RawDiskP90`], demanded BY SIGNATURE — merged_bug_002: the
+    /// sizing-face shrink floor is anti-conservative here; a floored
+    /// consult falsely rejected every all-fitting population whose
+    /// newest peak sat in `(ceiling/1.2, ceiling]`, and passing the
+    /// floored field no longer type-checks). The raw face is still
+    /// gated: `None` below the population gate, so a single
+    /// unwitnessed build cannot reject a tier fleet-wide (the
+    /// single-sample hazard has a reject face too — the gate, not the
+    /// floor, is that protection); the weighted p90 of a witnessed
+    /// all-fitting population is bounded by its max observation, so
+    /// no all-fitting population can trip this. Never the clamped
+    /// request, which by construction can never exceed the ceiling.
+    /// `solve_tier`'s tier gate, `evaluate_cell`'s per-cell gate,
+    /// `explain`'s `disk-ceiling` label, and `classify_ceiling`'s
+    /// metric mirror all read THIS, so the explain/metric surfaces
+    /// mirror the solve gates by construction.
+    pub fn exceeds_ceiling(observed_p90: Option<RawDiskP90>, ceiling: u64) -> bool {
+        observed_p90.is_some_and(|d| d.bytes() > ceiling)
     }
 }
 

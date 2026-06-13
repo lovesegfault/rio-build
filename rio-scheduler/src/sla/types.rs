@@ -137,12 +137,46 @@ pub struct ExploreState {
     pub last_wall: WallSeconds,
 }
 
+// r[impl sched.sla.disk-polarity-fork]
+/// The RAW disk-evidence face: the witnessed weighted p90 of observed
+/// peaks, NO shrink floor. Polarity rider: `{direction: reject,
+/// units: bytes}` — consumed by the ceiling REJECT/explain readers
+/// (`DiskFitEnvelope::exceeds_ceiling` demands this type BY
+/// SIGNATURE), for which any floor above the observed quantile is
+/// anti-conservative (merged_bug_002: a floor that protects the
+/// SIZING face against premature shrink falsely rejects an
+/// all-fitting band population on the reject face). A distinct
+/// nominal type, not a same-typed second field, so re-conflating the
+/// two faces fails to type-check at every consumer signature (the
+/// `DiskRequest` compile-sealed idiom, fit.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawDiskP90(pub DiskBytes);
+
+impl RawDiskP90 {
+    /// The raw witnessed p90 in bytes.
+    pub const fn bytes(self) -> u64 {
+        self.0.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FittedParams {
     pub key: ModelKey,
     pub fit: DurationFit,
     pub mem: MemFit,
+    /// The FLOORED sizing face of the warm disk evidence: `max(p90,
+    /// newest x DISK_SHRINK_HEADROOM)`. Polarity rider: `{direction:
+    /// sizing, units: bytes}` — consumed by the envelope/request
+    /// mints (`DiskFitEnvelope::fit`/`derive`), where the shrink
+    /// floor is the hysteresis law (live060-c). PAIRED MINT with
+    /// [`disk_p90_raw`](Self::disk_p90_raw): both faces are minted by
+    /// the one producer (`ingest::aggregate_disk_p90`) behind the one
+    /// witness gate — `Some`-ness is paired by construction
+    /// (sched.sla.disk-polarity-fork).
     pub disk_p90: Option<DiskBytes>,
+    /// The RAW reject face — see [`RawDiskP90`]. Paired with
+    /// [`disk_p90`](Self::disk_p90) at the producer's single mint.
+    pub disk_p90_raw: Option<RawDiskP90>,
     pub sigma_resid: f64,
     /// Per-sample `ln(t_obs / t_pred)` from the most-recent refit. Feeds
     /// the MAD outlier gate (`ingest::is_outlier`) — kept on the cached
