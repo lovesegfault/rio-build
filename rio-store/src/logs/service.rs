@@ -607,6 +607,133 @@ impl Drop for LeaseReleaseGuard {
     }
 }
 
+/// The live ingest-driver gauge (live062-R3): how many spawned
+/// AppendLog driver tasks have not yet finished their teardown
+/// (deregister + final drain + lease release). The shutdown path
+/// waits on it bounded; each driver's slot guard decrements on EVERY
+/// exit, panic included.
+#[derive(Default)]
+struct DriverGauge {
+    active: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl DriverGauge {
+    fn slot(self: &Arc<Self>) -> DriverSlot {
+        self.active
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        DriverSlot(Arc::clone(self))
+    }
+
+    fn active(&self) -> usize {
+        self.active.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// One driver task's occupancy of the gauge; Drop = the decrement +
+/// wake (runs on clean exit AND panic — the gauge cannot leak up).
+struct DriverSlot(Arc<DriverGauge>);
+
+impl Drop for DriverSlot {
+    fn drop(&mut self) {
+        self.0
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.idle.notify_waiters();
+    }
+}
+
+/// The graceful-shutdown lease-release obligation (live062-R3), TYPED
+/// and detachable from the service before it moves into the tonic
+/// router: the drain path MUST release this replica's live session
+/// rows before process exit. Pre-fix the per-driver teardown release
+/// rode detached tasks the runtime drop killed mid-flight — an
+/// evicted replica's rows lingered for the full `SESSION_STALE_AFTER`
+/// window and the reconnecting builder burned it in 1 Hz refused
+/// retries (the live evidence: 35 refusals before the steal).
+// r[impl store.log.release-totality]
+#[must_use = "the shutdown path must discharge the release obligation"]
+pub struct IngestShutdown {
+    pool: PgPool,
+    replica_pod: String,
+    drivers: Arc<DriverGauge>,
+}
+
+/// Courtesy window for in-flight driver teardowns at shutdown: clean
+/// exits release their own rows (the per-driver obligation), so the
+/// sweep below usually finds nothing. Short by design — the priority
+/// at shutdown is the lease release (the 45 s reconnect burn), not
+/// the tail flush: drain abandonment is loss-free by construction
+/// (the builder's retransmit buffer holds every un-acked line and
+/// replays it to the next replica).
+const SHUTDOWN_TEARDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl IngestShutdown {
+    /// Discharge the obligation: wait the bounded courtesy window for
+    /// driver teardowns, then sweep-release every row still owned by
+    /// this pod, bounded by the house PG-op budget
+    /// ([`sessions::HEARTBEAT_RPC_BOUND`]) — a hung release cannot
+    /// block shutdown (typed timeout, disclose-on-abandon: the
+    /// abandoned rows self-heal at the staleness window, exactly the
+    /// pre-fix worst case and no worse).
+    pub async fn release_live_sessions(self) {
+        self.release_live_sessions_with(SHUTDOWN_TEARDOWN_WAIT, sessions::HEARTBEAT_RPC_BOUND)
+            .await;
+    }
+
+    /// [`Self::release_live_sessions`] with injected budgets — the
+    /// production wrapper pins the consts; tests inject small windows
+    /// so the wedge faces are observable without real-time waits.
+    pub(crate) async fn release_live_sessions_with(
+        self,
+        teardown_wait: std::time::Duration,
+        sweep_bound: std::time::Duration,
+    ) {
+        // Courtesy window: bounded wait for the driver gauge to reach
+        // zero (notified on every driver exit).
+        let wait = async {
+            while self.drivers.active() != 0 {
+                self.drivers.idle.notified().await;
+            }
+        };
+        if tokio::time::timeout(teardown_wait, wait).await.is_err() {
+            warn!(
+                still_active = self.drivers.active(),
+                "shutdown: ingest drivers still tearing down past the courtesy                  window; sweeping their session rows now (their un-acked tails                  replay from the builders' retransmit buffers)"
+            );
+        }
+        // The sweep: one bounded statement, idempotent (clean
+        // teardowns already deleted their rows; a stolen row carries
+        // the thief's pod name and is untouched).
+        match tokio::time::timeout(
+            sweep_bound,
+            sessions::release_all_for_pod(&self.pool, &self.replica_pod),
+        )
+        .await
+        {
+            Ok(Ok(released)) => {
+                if released > 0 {
+                    info!(
+                        released,
+                        "shutdown: released ingest session rows still owned by                          this replica — reconnecting builders acquire first-try                          instead of burning the staleness window"
+                    );
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    error = %e,
+                    "shutdown: ingest session sweep failed; the rows self-heal                      at the staleness window (the pre-fix worst case)"
+                );
+            }
+            Err(_elapsed) => {
+                warn!(
+                    "shutdown: ingest session sweep abandoned at its bound; the                      rows self-heal at the staleness window (the pre-fix worst                      case) — shutdown is not blocked"
+                );
+            }
+        }
+    }
+}
+
 /// The `LogService` implementation. One per replica; cheap to clone
 /// into the tonic server (everything is `Arc`/`PgPool`).
 pub struct LogServiceImpl {
@@ -629,6 +756,12 @@ pub struct LogServiceImpl {
     /// This replica's pod name — the `log_ingest_sessions.replica_pod`
     /// value that routes cross-replica `TailLog` readers here.
     replica_pod: String,
+    /// Live ingest DRIVER tasks (live062-R3): incremented at spawn,
+    /// decremented (with a wake) when a driver's teardown completes.
+    /// The graceful-shutdown release waits on this gauge for a
+    /// bounded courtesy window so clean teardowns release their own
+    /// rows, then sweeps the remainder.
+    ingest_drivers: Arc<DriverGauge>,
     /// How a `TailLog` reader landing on this replica dials the replica
     /// that owns an execution's live ingest session.
     peer_resolver: Option<PeerResolver>,
@@ -664,6 +797,7 @@ impl LogServiceImpl {
             hmac_verifier: None,
             active_ingests: Arc::new(DashMap::new()),
             replica_pod,
+            ingest_drivers: Arc::new(DriverGauge::default()),
             // Empty = proxy disabled until with_peer_url_template
             // supplies the deployment's template (fail-closed; matches
             // Config::default).
@@ -682,6 +816,18 @@ impl LogServiceImpl {
     pub fn with_hmac_verifier(mut self, v: Arc<rio_auth::hmac::HmacVerifier>) -> Self {
         self.hmac_verifier = Some(v);
         self
+    }
+
+    /// Detach the graceful-shutdown release obligation (live062-R3)
+    /// BEFORE the service moves into the tonic router: main calls
+    /// [`IngestShutdown::release_live_sessions`] after the serve
+    /// future returns and before process exit.
+    pub fn ingest_shutdown_handle(&self) -> IngestShutdown {
+        IngestShutdown {
+            pool: self.pool.clone(),
+            replica_pod: self.replica_pod.clone(),
+            drivers: Arc::clone(&self.ingest_drivers),
+        }
     }
 
     pub fn with_ingest_config(mut self, c: IngestConfig) -> Self {
@@ -991,9 +1137,13 @@ impl LogService for LogServiceImpl {
         // handler aborts the stream. Not cancelled on client
         // disconnect — that is what lets the cleanup (deregister,
         // final drain, lease release) run on every exit path.
+        let driver_slot = self.ingest_drivers.slot();
         tokio::spawn(async move {
             // The permits ride into the task so they are held for the
-            // stream's lifetime and released on any exit path.
+            // stream's lifetime and released on any exit path; the
+            // driver slot (live062-R3) marks this teardown live to
+            // the graceful-shutdown release until the task ends.
+            let _driver_slot = driver_slot;
             let _stream_permit = stream_permit;
             let _byte_permit = byte_permit;
             driver.run(inbound, ack_tx).await;
@@ -3420,6 +3570,162 @@ mod tests {
             "eviction took {evicted_after:?} past open — outside the disclosed \
              ceiling {budget:?}"
         );
+    }
+
+    /// live062-R3, the graceful-shutdown lease release: with live
+    /// wedged-open sessions (drivers running, rows fresh — the shape
+    /// the runtime drop kills mid-teardown), discharging the typed
+    /// shutdown obligation releases every row this replica owns, and
+    /// a reconnecting builder ACQUIRES FIRST-RETRY instead of burning
+    /// the staleness window in refused retries.
+    ///
+    /// PRE-FIX RED (2026-06-13, strawman: the sweep statement
+    /// neutralized): `live062-R3 red: 5 refused retries (Busy, owner
+    /// "test-pod") after shutdown — pre-fix every reconnect burns the
+    /// full 45 s SESSION_STALE_AFTER window this way (the live
+    /// evidence: 35 refusals at 1 Hz before the steal)`. POST-FIX:
+    /// zero refusals; the first acquire wins.
+    // r[verify store.log.release-totality]
+    #[tokio::test]
+    async fn shutdown_release_frees_rows_for_first_retry_reacquire() {
+        let h = harness().await;
+        let mut client = h.client.clone();
+        let exec = seed_assignment(&h.db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+        // A live wedged-open session: driver running, row fresh.
+        let (tx, _acks) = open_append(&mut client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open");
+
+        // The reconnect face BEFORE the release: a foreign replica's
+        // acquire refuses Busy against the fresh row — each 1 Hz
+        // retry would re-hit this for the full staleness window.
+        let refused = sessions::acquire(&h.db.pool, exec, Uuid::now_v7(), "other-pod")
+            .await
+            .expect("acquire runs");
+        assert!(
+            matches!(refused, sessions::Acquire::Busy { ref current_owner } if current_owner == "test-pod"),
+            "precondition: the fresh row refuses a foreign acquire (got {refused:?})"
+        );
+
+        // Discharge the typed shutdown obligation. Zero courtesy
+        // window: the drivers are DELIBERATELY still alive (the
+        // runtime-drop shape) — the sweep must not depend on clean
+        // teardowns having happened.
+        let shut = IngestShutdown {
+            pool: h.db.pool.clone(),
+            replica_pod: "test-pod".to_string(),
+            drivers: Arc::new(DriverGauge::default()),
+        };
+        shut.release_live_sessions_with(std::time::Duration::ZERO, sessions::HEARTBEAT_RPC_BOUND)
+            .await;
+
+        // The reconnect acquires FIRST-RETRY. The bounded retry loop
+        // exists only to make the pre-fix red carry the refusal
+        // count (the 35-retries-at-1Hz live evidence, test-scaled).
+        let mut refusals = 0u32;
+        let won = loop {
+            match sessions::acquire(&h.db.pool, exec, Uuid::now_v7(), "other-pod")
+                .await
+                .expect("acquire runs")
+            {
+                sessions::Acquire::Acquired => break true,
+                sessions::Acquire::Busy { .. } => {
+                    refusals += 1;
+                    if refusals >= 5 {
+                        break false;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        };
+        assert!(
+            won && refusals == 0,
+            "live062-R3 red: {refusals} refused retries (Busy, owner \"test-pod\") \
+             after shutdown — pre-fix every reconnect burns the full 45 s \
+             SESSION_STALE_AFTER window this way (the live evidence: 35 \
+             refusals at 1 Hz before the steal)"
+        );
+        drop(tx);
+    }
+
+    /// live062-R3, the wedge face: a hung sweep cannot block
+    /// shutdown — the typed timeout abandons it (disclosed), the
+    /// method returns promptly, and the rows self-heal at the
+    /// staleness window (the pre-fix worst case, no worse).
+    #[tokio::test]
+    async fn shutdown_release_is_bounded_when_the_sweep_hangs() {
+        let h = harness().await;
+        let mut client = h.client.clone();
+        let exec = seed_assignment(&h.db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+        let (_tx, _acks) = open_append(&mut client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open");
+
+        let shut = IngestShutdown {
+            pool: h.db.pool.clone(),
+            replica_pod: "test-pod".to_string(),
+            drivers: Arc::new(DriverGauge::default()),
+        };
+        // Wedge the sweep for real: an open transaction holds an
+        // ACCESS EXCLUSIVE lock on the sessions table, so the DELETE
+        // blocks until the typed timeout abandons it.
+        let mut wedge = h.db.pool.begin().await.expect("wedge tx");
+        sqlx::query("LOCK TABLE log_ingest_sessions IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *wedge)
+            .await
+            .expect("lock");
+        let bounded = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            shut.release_live_sessions_with(
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(200),
+            ),
+        )
+        .await;
+        assert!(bounded.is_ok(), "the shutdown release must never hang");
+        wedge.rollback().await.expect("unwedge");
+        // The abandoned row remains — and self-heals at staleness
+        // (the disclosed degraded tier).
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM log_ingest_sessions WHERE exec_id = $1)",
+        )
+        .bind(exec)
+        .fetch_one(&h.db.pool)
+        .await
+        .expect("query");
+        assert!(
+            live,
+            "the abandoned sweep leaves the row to the staleness self-heal"
+        );
+    }
+
+    /// live062-R3, the gauge unit: slots count up at spawn-shape and
+    /// down on Drop (panic-safe by construction), and the courtesy
+    /// wait wakes on the LAST drop.
+    #[tokio::test]
+    async fn driver_gauge_counts_slots_and_wakes_at_zero() {
+        let gauge = Arc::new(DriverGauge::default());
+        let a = gauge.slot();
+        let b = gauge.slot();
+        assert_eq!(gauge.active(), 2);
+        drop(a);
+        assert_eq!(gauge.active(), 1);
+        let waiter = {
+            let g = Arc::clone(&gauge);
+            tokio::spawn(async move {
+                while g.active() != 0 {
+                    g.idle.notified().await;
+                }
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(b);
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("the courtesy wait wakes at zero")
+            .expect("waiter task clean");
     }
 
     /// W13-Y at the occupancy tier (bug_018): the periodic cut's

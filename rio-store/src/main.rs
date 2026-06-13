@@ -314,6 +314,9 @@ async fn main() -> anyhow::Result<()> {
         info!("HMAC verification disabled on AppendLog (dev mode)");
     }
     info!(%replica_pod, "LogService enabled");
+    // live062-R3: detach the shutdown release obligation before the
+    // service moves into the router below.
+    let ingest_shutdown = log_service.ingest_shutdown_handle();
 
     // StoreAdminServiceImpl: TriggerGC + VerifyChunks + upstream CRUD
     // + GetLoad. Gets the chunk backend directly (for key_for in
@@ -514,6 +517,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .serve_with_shutdown(addr, serve_shutdown.cancelled_owned())
         .await?;
+
+    // live062-R3: discharge the graceful-shutdown lease-release
+    // obligation BEFORE process exit — the runtime drop is about to
+    // kill any detached ingest drivers still tearing down, and their
+    // per-driver releases die with them. Without this, an evicted
+    // replica's session rows linger for the full staleness window and
+    // every reconnecting builder burns it in 1 Hz refused retries.
+    ingest_shutdown.release_live_sessions().await;
 
     info!("store shut down cleanly");
     Ok(())

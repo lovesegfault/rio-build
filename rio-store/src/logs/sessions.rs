@@ -356,6 +356,24 @@ pub async fn release(pool: &PgPool, exec_id: Uuid, session_id: Uuid) -> Result<(
     Ok(())
 }
 
+/// Release EVERY session row this replica still owns — the graceful-
+/// shutdown backstop (live062-R3). Sound exactly at shutdown: the
+/// listener is down (no new acquires mint rows for this pod) and the
+/// courtesy window for clean driver teardowns has elapsed, so any row
+/// still carrying this `replica_pod` belongs to a driver the runtime
+/// is about to drop — without this sweep the row lingers for the full
+/// [`SESSION_STALE_AFTER`] window and every reconnecting builder
+/// burns it in 1 Hz refused retries (the live evidence: 35 refusals
+/// before the steal). A row stolen by another replica carries the
+/// thief's pod name and is untouched. Returns the rows released.
+pub async fn release_all_for_pod(pool: &PgPool, replica_pod: &str) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM log_ingest_sessions WHERE replica_pod = $1")
+        .bind(replica_pod)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 /// The typed answer to "where is `exec_id`'s live ingest stream?" —
 /// the registry view's THREE states, kept distinct so a reader's
 /// history-only downgrade can disclose WHY (bug_148: the pre-fix
