@@ -858,6 +858,11 @@
                   [
                     "vm-lifecycle-prod-parity-k3s"
                     "vm-nixos-node"
+                    # Same class as vm-nixos-node: boots the module tree
+                    # (parted/udev/kubelet only, no rio-* binaries) —
+                    # zero profraws; excluding keeps after_n_builds
+                    # stable (merged_bug_024's AMI-variant dimension).
+                    "vm-ami-variant-quota"
                     # Lix client variant: rio-side coverage is identical to
                     # vm-protocol-warm-standalone (only the client differs,
                     # and the client isn't instrumented). Excluding keeps

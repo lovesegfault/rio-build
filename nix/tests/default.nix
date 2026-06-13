@@ -458,6 +458,19 @@ in
   #   Gates Phase-2 boot-path changes (initrd-networkd, UKI, perlless).
   vm-nixos-node = import ./nixos-node.nix { inherit pkgs; };
 
+  # r[verify infra.node.kubelet-prjquota]
+  #   The merged_bug_024 AMI-variant dimension: rio-ebs-quota-mount's
+  #   enumeration against the REAL udev by-id namespaces — fake-root
+  #   disks partitioned to the locked make-disk-image.nix recipes
+  #   (legacy+gpt: never-mounted no-fs bios_grub; efi: mounted ESP),
+  #   drift-pinned against the producer source. Asserts the typed
+  #   predicate selects the quota volume on BOTH variants (pre-fix
+  #   ami-bios counted n_bare=2 -> kubelet Requires= hard-fail every
+  #   boot), the by-class rejection trail, bios_grub never formatted,
+  #   and kubelet active (the Requires= consequence tier). The
+  #   unit-tier plant battery is misc-checks `quota-volume-select`.
+  vm-ami-variant-quota = import ./scenarios/ami-variant-quota.nix { inherit pkgs; };
+
   # r[verify gw.conn.exit-status+3]
   #   nom-exit subtest: client ssh_config has ControlMaster auto +
   #   ControlPersist 600. `timeout 60 nom build` must exit 0 (gateway
