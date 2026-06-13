@@ -132,9 +132,9 @@ pub fn describe_metrics() {
          AssignQuota -1 sentinel: usage tracking only, the \
          hostUsers:false fleet shape), no_limit (the builder's \
          monitoring-only mint under hostUsers:true), or unavailable \
-         (decline modes 1-3). At the deployed posture every builder pod \
-         reports non_enforcing or no_limit; an enforcing reading \
-         anywhere is the readback that proves the future enforcing flip."
+         (decline modes 1-3). At the deployed posture builder pods \
+         report non_enforcing or no_limit; an enforcing reading is the \
+         readback that proves the future enforcing flip."
     );
     describe_counter!(
         "rio_builder_quota_evidence_absent_total",

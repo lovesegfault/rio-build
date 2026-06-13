@@ -998,7 +998,7 @@ mod tests {
 
     /// W14-C3/C4 (D-2, R26 + R30 producer-reachability) — the
     /// quota-enforcement posture is a typed, observable letter.
-    /// PRE-FIX no signal exists anywhere: the kubelet `-1` sentinel
+    /// PRE-FIX nothing surfaces the dormancy: the kubelet `-1` sentinel
     /// and the builder's monitoring-only no-limit mint both leave the
     /// DiskFull lane silently dormant. The presence-asserting test
     /// (this fn) is the RED. POST-FIX the closed alphabet partitions

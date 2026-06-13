@@ -1104,7 +1104,7 @@ kubelet minor that enforces under host-users; (b) a hard-limit mint
 deliberate non-goal of `ensure_project_quota` today); (c) the in-pod
 vantage (landed); (d) the production-topology witness (landed). The flip's
 readback is #(refs.metric)("rio_builder_quota_enforcement") with
-`mode="enforcing"` reporting nonzero anywhere.
+`mode="enforcing"` reporting nonzero on a builder pod.
 
 The overlay is per-build. Each build gets its own overlayfs mount with
 separate upper and work directories. The Nix sandbox provides process-level
