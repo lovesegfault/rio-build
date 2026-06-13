@@ -215,6 +215,13 @@ let
     fileset = modelsDir + "/materializationJob.qnt";
   };
 
+  # Same narrowing for the fencedWrites model, consumed by the
+  # mbt-rio-fence conformance check below.
+  fenceModel = lib.fileset.toSource {
+    root = modelsDir;
+    fileset = modelsDir + "/fencedWrites.qnt";
+  };
+
   # The TLC backend's quint->TLA+ conversion goes through the bundled
   # Apalache acting as a gRPC server. When `quint verify` has to spawn
   # that server itself, two failure modes bite:
@@ -4800,7 +4807,12 @@ rec {
       extraRuntimeInputs = [ pkgs.quint ];
       extraArgs = [
         "-E"
-        "package(rio-scheduler) and test(/mbt_/)"
+        # rio-scheduler now hosts THREE MBT planes; each check stages
+        # only ITS model, so the filter excludes the fence and
+        # open-attempts harnesses (their own checks below/adjacent run
+        # them with their spec staged — a plane replayed without its
+        # model would red on the sandbox path fallback).
+        "package(rio-scheduler) and test(/mbt_/) and not test(/mbt_fence|mbt_openattempts/)"
         "--run-ignored"
         "all"
       ];
@@ -4817,6 +4829,62 @@ rec {
         # check that proved nothing.
         grep -E ' [1-9][0-9]* tests? run:' $out/log > /dev/null || {
           echo "mbt-rio-materialization: the mbt_* filter matched no tests" >&2
+          exit 1
+        }
+      '';
+    };
+
+    # Implementation conformance for the fencedWrites model (OP-2 /
+    # MBT-2): rio-scheduler/src/db/tests/mbt_fence.rs replays named
+    # runs from fencedWritesT1 against the real fenced-write surface —
+    # pinned per-replica serving generations, HELD-OPEN FencedTx
+    # transactions across steps (the READ COMMITTED window on real
+    # connections), and the production chokepoints (claim_generation,
+    # begin_fenced, mint_assignment_upsert_in_tx, close_assignment,
+    # update_resource_floor, replay_status_batch_guarded) — diffing
+    # the PG-projected state (claims set, active assignments row,
+    # resource floor, per-holder generations) after every step.
+    #
+    # Acceptance (OQ-12, the red-at-pre-fold form): the merged_bug_011
+    # trace (fenceOutboxReplayRun — latch E1, resubmit re-mints E2,
+    # guarded flush applies nothing) replays GREEN against the live
+    # tree, and the strawman test re-encodes the PRE-FIX absolute
+    # replay (no stamp guard, derivation-keyed unfenced close) at the
+    # flush step and asserts the per-step diff REDS exactly there with
+    # the successor exec killed — the harness proves it would catch
+    # the regression class it exists for, permanently.
+    #
+    # The markers cover what the replayed traces exercise end-to-end:
+    # the claims-floor fence at begin + the statement guard
+    # (durability), the retryable refusal mapping, and the
+    # latched-exec-scoped replay close.
+    # r[verify sched.evidence.durability+4]
+    # r[verify sched.lease.generation-fence+3]
+    # r[verify sched.grpc.fence-retryable]
+    mbt-rio-fence = mkNextestRun {
+      name = "mbt-rio-fence";
+      member = "rio-scheduler";
+      meta = mkNextestMeta { rio-scheduler = rioSchedulerTestBin; };
+      extraRuntimeInputs = [ pkgs.quint ];
+      extraArgs = [
+        "-E"
+        "package(rio-scheduler) and test(/mbt_fence/)"
+        "--run-ignored"
+        "all"
+      ];
+      preRun = ''
+        export RIO_MBT_FENCE_SPEC_PATH=$TMPDIR/ws/docs/spec/models/fencedWrites.qnt
+      '';
+      postWsSetup = ''
+        mkdir -p $ws/docs/spec/models
+        cp ${fenceModel}/fencedWrites.qnt $ws/docs/spec/models/
+      '';
+      postRun = ''
+        # Same no-tests guard as mbt-rio-lease: --no-tests=warn would
+        # otherwise turn a filter that matches nothing into a green
+        # check that proved nothing.
+        grep -E ' [1-9][0-9]* tests? run:' $out/log > /dev/null || {
+          echo "mbt-rio-fence: the mbt_fence filter matched no tests" >&2
           exit 1
         }
       '';
