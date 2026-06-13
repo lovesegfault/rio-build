@@ -105,7 +105,15 @@ PROVENANCE = {
     "string-interior-spaces": ("debt", "2026-06-12", "author grammar; queue: round-14"),
     "streaming-open-ban": ("debt", "2026-06-12", "author descriptor list; queue: round-14"),
     "quint-policy": ("debt", "2026-06-12", "rule arms planted but no K-mutation harness; queue: round-14"),
-    "quantifier-lexicon": ("debt", "2026-06-12", "author lexicon; queue: round-14"),
+    "quantifier-lexicon": (
+        "planted",
+        "nix/quantifier_lexicon.py",
+        r"MUTATIONS = \[",
+        "WO-S4-4 (W14-D3): the rider line-shape rule's K=4 battery "
+        "(delimiter-check deleted / rider-grammar widened / splice-"
+        "detection inverted / shape-walk unwired) via the shared "
+        "harness; the LEXICON x TIERS product remains the derived face",
+    ),
     "fixture-provenance": ("debt", "2026-06-12", "author lanes table; queue: round-14"),
     "timeout-census": ("debt", "2026-06-12", "in-crate; author use-grammar; queue: round-14"),
     "cap-reader-census": ("debt", "2026-06-12", "in-crate alias table; queue: round-14"),

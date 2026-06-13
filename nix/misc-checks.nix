@@ -1648,9 +1648,11 @@ in
         nativeBuildInputs = [ pkgs.python3 ];
         scanScript = ../nix/quantifier_lexicon.py;
         sharedLexer = ../nix/rust_strip.py;
+        censusLib = ../nix/census_corpora.py;
       }
       ''
         cp "$sharedLexer" rust_strip.py
+        cp "$censusLib" census_corpora.py
         cp "$scanScript" quantifier_lexicon.py
         python3 quantifier_lexicon.py "$src"
         touch $out

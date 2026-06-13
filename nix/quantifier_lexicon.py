@@ -125,6 +125,33 @@ NUMERIC_CTX_RE = re.compile(
 )
 FIGURE_BIND_RE = re.compile(r"figure:\s*(?:values|const)\([^)]+\)")
 
+# WO-S4-4 (bug_019, the R23' quality face): the rider LINE-SHAPE rule.
+# A `quantifier: census(...)` / `non-normative(...)` rider is a
+# READABLE annotation -- em-dash-delimited or sentence-terminal, never
+# spliced into the middle of the sentence it annotates. The bug_019
+# exhibit: the wave-11 mechanical compliance pass satisfied the binder
+# by wedging the rider mid-noun-phrase ("against a class quantifier:
+# census(...) ceiling"), so token-presence passed while the rendered
+# sentence broke. The rule derives from the rider grammar BIND_RE
+# already recognizes (RIDER_RE below is the `quantifier:` arm of that
+# alternation): the immediately-preceding non-whitespace character
+# must be a delimiter (em-dash, comment marker, punctuation) -- a
+# word character there is the splice. No grandfather: the convention
+# is already house style at every other site.
+RIDER_RE = re.compile(r"quantifier:\s*(?:census|non-normative)\(")
+
+
+def rider_is_spliced(comment: str) -> bool:
+    """The line-shape predicate (one comment line). Derived from
+    RIDER_RE: a rider whose prefix-in-comment ends in a word character
+    was wedged into a sentence with no delimiter."""
+    m = RIDER_RE.search(comment)
+    if not m:
+        return False
+    prefix = comment[: m.start()].rstrip()
+    return bool(prefix) and (prefix[-1].isalnum() or prefix[-1] == "_")
+
+
 BIND_RE = re.compile(
     r"quantifier:\s*(?:census|non-normative)\(\S[^)]*\)"
     # The two bind idioms the round-10 wave landed BEFORE this lint
@@ -284,6 +311,29 @@ def scan(root: Path):
                 yield rel, lineno, word, line.strip()
 
 
+def scan_rider_shape(root: Path):
+    """Yield (rel, lineno, trimmed-line) for every SPLICED rider --
+    a `quantifier:` bind whose prefix-in-comment ends in a word
+    character (WO-S4-4). Same population walk as scan(): the rule
+    governs the lines scan() ADMITS as bound, so the two predicates
+    partition the rider grammar's reach (unbound -> scan; bound but
+    spliced -> here)."""
+    for tier in TIERS:
+        for f in iter_tier_files(root, tier):
+            rel = f.relative_to(root).as_posix()
+            if rel == GRANDFATHER or rel == "nix/quantifier_lexicon.py":
+                continue
+            try:
+                text = f.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            raw_lines = text.splitlines()
+            for lineno, comment in sorted(tier_lines(tier, text).items()):
+                if rider_is_spliced(comment):
+                    line = raw_lines[lineno - 1] if lineno <= len(raw_lines) else comment
+                    yield rel, lineno, line.strip()
+
+
 def key(rel: str, line: str) -> str:
     return f"{rel}\t{line.strip()}"
 
@@ -351,6 +401,13 @@ def run(root: Path, mint: bool) -> int:
             f"{entry.split(chr(9))[0]}: stale quantifier-grandfather entry "
             f"(the claim was bound, demoted, or deleted) — remove it from "
             f"{GRANDFATHER}: {entry!r}"
+        )
+    for rel, lineno, line in scan_rider_shape(root):
+        out.append(
+            f"{rel}:{lineno}: spliced `quantifier:` rider — the bind token "
+            f"is wedged after a word with no delimiter; em-dash-delimit it "
+            f"(` — quantifier: census(...) — `) or move it to a sentence "
+            f"boundary (bug_019: token-presence passed while the prose broke)"
         )
     if out:
         for v in out:
@@ -517,6 +574,53 @@ def selftest() -> str | None:
         got = list(scan(root))
         if len(got) != 1 or "[numeric tier]" not in got[0][2]:
             return f"W12-BE (b'): a cross-lane figure bind suppressed the numeric hit: {got}"
+        # W14-D2 (WO-S4-4, bug_019): the rider line-shape plants. The
+        # planted RED is the verbatim pre-fix footprint.rs:76 text
+        # (W14-D1 -- the repair and the lint share one fixture so
+        # neither can drift from the other), inside the governed rust
+        # population; the em-dash-delimited form (the post-fix text)
+        # and the other house delimiters each pass.
+        bug_019_splice = (
+            "/// — and EVERY predicate that decides mem feasibility "
+            "against a class quantifier" + ": census(retain_hosting_gate"
+            "_equals_shared_law_oracle + fallback_and_sizing_equal_"
+            "shared_law_oracle)\n"
+        )
+        p.write_text(bug_019_splice + "fn x() {}\n", encoding="utf-8")
+        got = list(scan_rider_shape(root))
+        if len(got) != 1:
+            return f"W14-D2: the bug_019 pre-fix splice did not red: {got}"
+        # The planted splice is also BOUND (BIND_RE matches), so scan()
+        # admits it -- the two predicates partition the rider grammar's
+        # reach: the splice is the line-shape arm's red, not scan()'s.
+        if list(scan(root)):
+            return "W14-D2: the planted splice is bound; scan() must admit it"
+        # The post-fix em-dash form (the repair) passes.
+        bug_019_repaired = (
+            "/// — and EVERY predicate — quantifier" + ": census(retain_"
+            "hosting_gate_equals_shared_law_oracle + fallback_and_sizing"
+            "_equal_shared_law_oracle) — that decides mem feasibility "
+            "against a class\n"
+        )
+        p.write_text(bug_019_repaired + "fn x() {}\n", encoding="utf-8")
+        if list(scan_rider_shape(root)):
+            return "W14-D2: the em-dash-delimited repair did not pass"
+        # The other house delimiters (the convention's full alphabet,
+        # derived from the live tree's own corpus): `// `, `# `, `; `,
+        # `(`, and start-of-comment each pass.
+        for delim, label in (
+            ("EVERY axis routes here // ", "//-separator"),
+            ("EVERY axis routes here # ", "#-separator"),
+            ("EVERY axis is gated; ", ";-separator"),
+            ("EVERY axis (", "(-parenthetical"),
+            ("", "start-of-comment"),
+        ):
+            p.write_text(
+                f"// {delim}quantifier" + ": census(x)\nfn x() {}\n",
+                encoding="utf-8",
+            )
+            if list(scan_rider_shape(root)):
+                return f"W14-D2: the {label} delimiter form did not pass"
         # Lowercase IS the demoted form: no hit.
         p.write_text("// every member is checked here\nfn x() {}\n", encoding="utf-8")
         if list(scan(root)):
@@ -556,7 +660,68 @@ def selftest() -> str | None:
             rc = run(root, mint=False)
         if rc != 1:
             return "stale grandfather entry did not fail"
+        # W14-D2 wiring plant: a spliced rider reds run() (the shape
+        # arm is wired through to the rc, not just scan_rider_shape) --
+        # this is the oracle for the shape-walk-unwired K-mutation.
+        gf.write_text("", encoding="utf-8")
+        p.write_text(
+            "// EVERY axis routes here against a class quantifier"
+            + ": census(x)\nfn x() {}\n",
+            encoding="utf-8",
+        )
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as cap:
+            rc = run(root, mint=False)
+        if rc != 1 or "spliced" not in cap.getvalue():
+            return f"W14-D2 wiring: a spliced rider did not red run(): rc={rc}"
     return None
+
+
+def self_battery(_src_root) -> list:
+    """Failure-collecting wrapper for the shared K-mutation harness
+    (W14-D3): selftest() returns one error string or None; the harness
+    requires a non-empty failure LIST from a mutant. NEVER invokes the
+    mutation harness (the W13-BE grounding)."""
+    err = selftest()
+    return [err] if err else []
+
+
+# W14-D3 (WO-S4-4, R31'(iii)): the rider line-shape rule's K-mutation
+# self-test -- K=4 seeded degenerations of the line-shape arm, each
+# REQUIRED to kill the W14-D2 plant battery via the shared
+# census_corpora.run_mutation_battery harness. Needles concatenation-
+# split per the (ooooo) probe-needle note so this table never matches
+# itself.
+MUTATIONS = [
+    (
+        "delimiter-check-deleted",
+        "the word-character prefix check disabled (any prefix accepted)"
+        " -- killed by the W14-D2 bug_019 splice plant",
+        "    return bool(prefix) and (prefix[-1].isalnum() " + "or prefix[-1] == \"_\")",
+        "    return " + "False",
+    ),
+    (
+        "rider-grammar-widened",
+        "RIDER_RE widened to never-match (the rule's population emptied"
+        " at the predicate) -- killed by the W14-D2 bug_019 splice plant",
+        "RIDER_RE = re.compile(r\"quantifier" + ":\\s*(?:census|non-normative)\\(\")",
+        "RIDER_RE = re.compile(r\"NEVER_MAT" + "CHES_ANYTHING_ZZZ\")",
+    ),
+    (
+        "splice-detection-inverted",
+        "the splice predicate inverted (delimiters red, splices pass)"
+        " -- killed by the W14-D2 em-dash repair plant",
+        "    return bool(prefix) and (prefix[-1].isalnum() " + "or prefix[-1] == \"_\")",
+        "    return not (bool(prefix) and (prefix[-1].isalnum() " + "or prefix[-1] == \"_\"))",
+    ),
+    (
+        "shape-walk-unwired",
+        "scan_rider_shape unwired from run() (the arm's reds never"
+        " surface) -- killed by the W14-D2 partition plant (scan()"
+        " admits the splice; only the shape arm reds it)",
+        "    for rel, lineno, line in scan_rider_shape" + "(root):",
+        "    for rel, lineno, line in " + "[]:",
+    ),
+]
 
 
 def main() -> int:
@@ -573,6 +738,16 @@ def main() -> int:
     err = selftest()
     if err:
         print(f"FAIL: quantifier-lexicon self-test — {err}", file=sys.stderr)
+        return 1
+    import census_corpora
+
+    killed = census_corpora.run_mutation_battery(
+        Path(__file__), MUTATIONS, "self_battery", (Path(args[0]),)
+    )
+    if killed:
+        print("FAIL: quantifier-lexicon K-mutation battery —", file=sys.stderr)
+        for x in killed:
+            print(f"  {x}", file=sys.stderr)
         return 1
     return run(Path(args[0]), mint)
 
