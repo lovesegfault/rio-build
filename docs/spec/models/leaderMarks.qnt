@@ -282,8 +282,27 @@ module leaderMarks {
   // between the capture and the strip) makes "the holder is never
   // swept" deliberately false, and that residual is exactly what the
   // verify cadence bounds (the victim's own loop re-discovers within
-  // VERIFY_EVERY — marksDivergenceBounded from ITS perspective). A
-  // vacuous "holds by construction" val here would be decoration.
+  // the peerDivergenceBounded window — since F1 a CHECKED claim, not
+  // an argued one). A vacuous "holds by construction" val here would
+  // be decoration. The sweep's STRIP face, dead in every reachable
+  // pre-F1 state (nothing could set marks["other"]; bughunt-13 F2),
+  // is live since externalAdd joined the alphabet: the
+  // sweepStripsForeignPeerLabelRun drives it deterministically and
+  // the noPeerMarks witness proves the explored space reaches
+  // other-marked states at all. The spare conjunct
+  // (Leader(p) != taskSweepHolder) remains production-pinned: with
+  // the spawn-time capture and two pods, a true-polarity task always
+  // captures Leader("us"), so the spare can never bind in-model —
+  // the capture is deliberately EARLIER than production's in-task
+  // holder read (a conservatively wider TOCTOU), and the unit pin
+  // owns the spare's truth.
+
+  /// Witness (expect-violation): the peer-marked state is actually
+  /// reached in the explored space — the sweep branch the
+  /// deletion-cost+3 marker rides stopped being dead text when
+  /// externalAdd joined the alphabet (bughunt-13 F2; the bug_083
+  /// anti-vacuity pattern).
+  val noPeerMarks = not(marks.get("other"))
 
   /// Witness (expect-violation): the external strip actually fires —
   /// the green marksDivergenceBounded verdict is about a space where
@@ -668,6 +687,26 @@ module leaderMarks {
         marks.get("other"),
         not(dirty),
         wrongSince.get("us") == -1,
+      })
+
+  /// The sweep's strip face, end to end (bughunt-13 F2 — the branch
+  /// was dead text until externalAdd joined the alphabet): WE lead, a
+  /// foreign actor labels the PEER, and OUR reconcile's sweep strips
+  /// it (the peer's own loop never fires in this trace — the strip is
+  /// the sweep's, not otherLoopConverge's). The holder-aware spare
+  /// conjunct stays production-pinned (see the sweep comment above).
+  run sweepStripsForeignPeerLabelRun =
+    init
+      .then(holderChange(Leader("us")))
+      .then(externalAdd("other"))
+      .then(reconcileSpawn)
+      .then(reconcilePatched)
+      .then(reconcileClear)
+      .expect(all {
+        marks.get("us"),
+        not(marks.get("other")),
+        not(dirty),
+        wrongSince.get("other") == -1,
       })
 
   /// The DirtyGen save, end to end: a rebound marks BETWEEN the API

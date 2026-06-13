@@ -1808,6 +1808,19 @@ rec {
       witness = "noAdd";
     };
 
+    # Non-vacuity witness (bughunt-13 F2): the PEER-marked state is
+    # actually reached — the reconcilePatched sweep branch the
+    # deletion-cost+3 marker rides was dead text in every reachable
+    # pre-F1 state (nothing could set marks["other"]); externalAdd
+    # made it live, sweepStripsForeignPeerLabelRun drives it
+    # deterministically, and this witness pins the explored space.
+    quint-leader-marks-witness-peer-marks = mkQuintWitnessCheck {
+      name = "leader-marks-witness-peer-marks";
+      spec = "leaderMarks";
+      main = "leaderMarksBase";
+      witness = "noPeerMarks";
+    };
+
     # Non-vacuity witness: the rebound dirtying site actually fires in
     # the explored space — the notClobbered verdict covers the
     # post-212 writer set, not just the original edges.
@@ -1823,9 +1836,12 @@ rec {
     # standbyStripConvergesRun: the F1 close end to end — a standby
     # externally labeled leader is re-discovered by its OWN
     # cadence-forced verify and the next reconcile strips;
-    # clearKeepsPostSnapMarkRun: a rebound marks between the API write
-    # and the clear, and the clear-through arithmetic keeps the loop
-    # dirty — the DirtyGen save, end to end).
+    # sweepStripsForeignPeerLabelRun: the F2 reachability — the
+    # leader's sweep strips a foreign-labeled peer, the branch that
+    # was dead text pre-F1; clearKeepsPostSnapMarkRun: a rebound marks
+    # between the API write and the clear, and the clear-through
+    # arithmetic keeps the loop dirty — the DirtyGen save, end to
+    # end).
     quint-leader-marks-runs = mkQuintRunCheck {
       name = "leader-marks-runs";
       spec = "leaderMarks";
