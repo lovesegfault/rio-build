@@ -198,13 +198,21 @@
 //     is contained in the durable one) are therefore true by
 //     construction and are kept as cheap regression tripwires against
 //     encoding drift, not as discovery instruments.
-//   - The fleet-exhaust arm: production `decide()` never sees the live
-//     fleet (the in-history check runs against an empty fleet) and the
-//     call sites consume the exclusion set through `placeable()`. The
-//     model's `specApply` is invoked with the live eligible fleet at the
-//     observation, which makes the fold's verdict equal to
-//     "decide() + the site's placeable() check" in one step -- the same
-//     observable outcome with one fewer moving part.
+//   - The fleet-exhaust arm (re-derived at bughunt-13 F12): production
+//     `decide()` never sees the live fleet -- the fold runs against
+//     `FleetView::default()` and its kani ensures pins the
+//     fleet-exhaust verdict unreachable in-transaction. `specApply` is
+//     therefore invoked with `inTxFleet` (empty) at EVERY site, and the
+//     exhausted-universe poison arrives exclusively through the
+//     controller round-trip the code ships: the AD2 spawn gate's
+//     ReportAttemptOutcome(NoEligibleSource) observation, modeled as
+//     the separate `spawnGateExhaust` step (still-Ready only; the
+//     marker-row durable shape). The retired encoding fused that round
+//     trip into the appending transaction by passing the live fleet,
+//     which hid every interleaving between the exhausting charge and
+//     the controller's verdict -- exactly the window production's
+//     124(d) staleness guards exist for (`fleetExhaustIsDeferred` +
+//     `deferredFleetExhaustRun` pin the shipped order).
 //   - Dispatch-time poisons (E9) have no fold event -- the fold's event
 //     alphabet is the failure-event alphabet and the `fleet_exhaust`
 //     marker row is a fold no-op. They are tracked via poisonSrc and
@@ -563,15 +571,34 @@ module retryPolicy {
   pure def thresholdReached(c: Counters): bool =
     c.failedBuilders.size() >= THRESHOLD
 
-  /// exhausts_fleet (retry_policy.rs / placeable()): every statically
-  /// eligible, registered, non-draining worker is in the exclusion set;
-  /// an empty exclusion set or an empty eligible fleet never exhausts
-  /// (sched.dispatch.fleet-exhaust+4's empty-fleet defer).
+  /// exhausts_fleet (rio-retry-kernel; the spawn gate's
+  /// excluded >= spawnable form): every statically eligible,
+  /// registered, non-draining worker is in the exclusion set; an empty
+  /// exclusion set or an empty eligible fleet never exhausts
+  /// (sched.dispatch.fleet-exhaust+4's empty-fleet defer). In the fold
+  /// this arm is structurally dead -- decide() passes `inTxFleet`
+  /// (bughunt-13 F12) -- and its live consumer is `spawnGateExhaust`.
   pure def exhaustsFleet(failed: Set[str], eligible: Set[str]): bool = and {
     failed != Set(),
     eligible != Set(),
     eligible.forall(w => failed.contains(w)),
   }
+
+  /// decide()'s in-transaction fleet view: EMPTY by construction
+  /// (bughunt-13 F12). rio-retry-kernel `decide()` folds against
+  /// `FleetView::default()` -- "the in-history fleet-exhaust arm is
+  /// evaluated against an empty fleet (never exhausted): the eligible
+  /// fleet is not history" -- and its kani ensures pins the
+  /// fleet-exhaust reason unreachable from the fold. Placement
+  /// exhaustion is the controller's spawn-gate observation
+  /// (pool/jobs.rs excluded >= spawnable ->
+  /// ReportAttemptOutcome(NoEligibleSource) -> actor/pull.rs
+  /// handle_no_eligible_source), delivered one round-trip later and
+  /// modeled by `spawnGateExhaust`. Every `specApply` site passes
+  /// THIS set; passing the live fleet would fuse the round-trip into
+  /// the appending transaction -- a same-step poison no production
+  /// path can produce.
+  pure val inTxFleet: Set[str] = Set()
 
   /// RetryState::clear() / the cache-hit ledger reset -- nine of the ten
   /// fields; backoff_until survives.
@@ -1004,6 +1031,24 @@ module retryPolicy {
     (dStatus == DPoisoned and poisonSrc == DispatchPoison) implies
       lastPoisonReason == RFleetExhausted
 
+  /// bughunt-13 F12 (the audit's A7, fold half): a fleet-exhaust
+  /// poison is NEVER a charge-time verdict. Production decide() folds
+  /// against an EMPTY FleetView (kani: the RFleetExhausted reason is
+  /// unreachable from the fold), so the only fleet-exhaust producer
+  /// is the controller's spawn-gate round trip
+  /// (ReportAttemptOutcome(NoEligibleSource) -> the still-Ready
+  /// mapping), modeled by spawnGateExhaust with the marker-row
+  /// durable shape: poisonSrc = DispatchPoison, row-level stamp, NO
+  /// fold-ledger stamp. The pre-fix encoding passed the live fleet at
+  /// every charging site, fusing the round trip into the appending
+  /// transaction and hiding every interleaving between the exhausting
+  /// charge and the controller's verdict (the window production's
+  /// 124(d) staleness guards exist for). deferredFleetExhaustRun pins
+  /// the shipped order end to end.
+  val fleetExhaustIsDeferred =
+    (dStatus == DPoisoned and lastPoisonReason == RFleetExhausted) implies
+      poisonSrc == DispatchPoison
+
   /// A poison clear that took effect in memory has taken effect durably:
   /// the admin/TTL clear is PG-first (a failed PG clear aborts the whole
   /// clear -- sched.admin.clear-poison's both-stores obligation), so in
@@ -1336,8 +1381,8 @@ module retryPolicy {
   /// arms), acted on per the verdict.
   // Mirrors: completion.rs::handle_infrastructure_failure through
   //          append_and_decide_in_tx + classify().
-  action infraArm(w: str, execAfter: ExecRec, fleetAfter: Set[str], exempt: bool, atCap: bool, consumesPromotion: bool): bool = all {
-    val applied = specApply(spec, FInfra({ at: now, exempt: exempt, atCap: atCap }), fleetAfter)
+  action infraArm(w: str, execAfter: ExecRec, foldFleet: Set[str], exempt: bool, atCap: bool, consumesPromotion: bool): bool = all {
+    val applied = specApply(spec, FInfra({ at: now, exempt: exempt, atCap: atCap }), foldFleet)
     all {
       spec' = applied.c,
       specVerdict' = applied.v,
@@ -1451,7 +1496,7 @@ module retryPolicy {
       dStatus == DCancelled,
       and { dStatus == DPoisoned, live.resubmitCycles < RESUBMIT_LIMIT },
     },
-    val applied = specApply(spec, FResubmitReset(now), eligibleFleet)
+    val applied = specApply(spec, FResubmitReset(now), inTxFleet)
     all {
       dStatus' = DReady,
       poisonSrc' = NoPoison,
@@ -1483,7 +1528,7 @@ module retryPolicy {
     storeDegradedRun' = 0,
     ENABLE_RESETS,
     dStatus == DPoisoned,
-    val applied = specApply(spec, FCacheHitClear(now), eligibleFleet)
+    val applied = specApply(spec, FCacheHitClear(now), inTxFleet)
     all {
       dStatus' = DCompleted,
       poisonSrc' = NoPoison,
@@ -1516,7 +1561,7 @@ module retryPolicy {
     ENABLE_RESETS,
     dStatus == DPoisoned,
     poisonTtlElapsed,
-    val applied = specApply(spec, FPoisonCleared(now), eligibleFleet)
+    val applied = specApply(spec, FPoisonCleared(now), inTxFleet)
     all {
       dStatus' = DAbsent,
       poisonSrc' = NoPoison,
@@ -1633,19 +1678,23 @@ module retryPolicy {
 //     instead of "released attempt with no deliverable classifying
 //     report". The charge (FEstablishedCrash: failed_builders[source] +
 //     failure_count + threshold re-check) is unchanged.
-//   - E9 / fleet-exhaust re-keyed per AD2: the exclusion set carries
-//     source nodes; the exhausted-universe verdict is evaluated at the
-//     spawn-intent gate (excluded ⊇ spawnable -> NoEligibleSource ->
-//     Poison(FleetExhausted)). Encoded two ways, matching the code: the
-//     fold application at every charging site receives the live
-//     spawnable-source set (so a charge that completes the exclusion of
-//     the whole universe poisons in the same transaction — the
-//     small-fleet clause of sched.retry.per-executor-budget+4: the
-//     threshold is effectively min(threshold, |sources|)), and the
-//     standalone spawnGateExhaust action covers the no-new-charge case
-//     where the spawnable universe shrinks under an existing exclusion
-//     set (sourceLeavesPool models the shrink; the empty-universe defer
-//     arm of sched.dispatch.fleet-exhaust+4 is preserved).
+//   - E9 / fleet-exhaust re-keyed per AD2 (re-derived at bughunt-13
+//     F12): the exclusion set carries source nodes; the
+//     exhausted-universe verdict is evaluated at the spawn-intent gate
+//     ONLY (excluded ⊇ spawnable -> NoEligibleSource ->
+//     Poison(FleetExhausted)) and travels the controller round-trip
+//     before it lands. The fold application at every charging site
+//     receives `inTxFleet` (empty -- decide()'s FleetView::default()),
+//     so a charge that completes the exclusion of the whole universe
+//     REQUEUES, and the poison is `spawnGateExhaust`'s next-step
+//     observation (still-Ready only; a resubmit reset or a pool
+//     re-join inside the window averts it, mirroring the 124(d)
+//     guards). The small-fleet clause of
+//     sched.retry.per-executor-budget+4 (the threshold is effectively
+//     min(threshold, |sources|)) is served by the same gate one
+//     round-trip later, exactly as shipped; the empty-universe defer
+//     arm of sched.dispatch.fleet-exhaust+4 is preserved (the action
+//     is disabled at an empty universe).
 //   - Identity freshness is structural: a fresh pod per attempt. No
 //     respawn action, no draining bookkeeping, no executor-map identity
 //     reuse; a source node hosts at most one open attempt for this
@@ -1752,7 +1801,7 @@ module retryPolicy {
     attempt' = Running(n),
     execs' = execs.put(n, { ...execs.get(n), runningOurs: true }),
     live' = { ...live, backoffUntil: NoTime },
-    val applied = specApply(spec, FDispatched(now), eligibleFleet)
+    val applied = specApply(spec, FDispatched(now), inTxFleet)
     all {
       spec' = applied.c,
       specVerdict' = applied.v,
@@ -1772,12 +1821,13 @@ module retryPolicy {
   /// the per-class fold events and verdict handling are unchanged. What
   /// differs is the environment bookkeeping: the pod is gone after its
   /// one report (identity freshness), the source node stays spawnable
-  /// (no draining), and the fold's fleet snapshot is the live
-  /// spawnable-source set INCLUDING the reporting source — the AD2
-  /// spawn-gate evaluation would see that source as both spawnable and
-  /// excluded, so a charge that completes the exclusion of the whole
-  /// universe poisons FleetExhausted in the same transaction (the
-  /// small-fleet clause; on larger universes the distinct-source
+  /// (no draining), and the fold's fleet snapshot is `inTxFleet`
+  /// (empty -- decide() never sees the live fleet; bughunt-13 F12), so
+  /// NO report-time charge poisons FleetExhausted: a charge that
+  /// completes the exclusion of the whole universe requeues and the
+  /// spawn gate's round-trip verdict (spawnGateExhaust) lands the
+  /// poison one step later (the small-fleet clause rides that same
+  /// gate; on larger universes the distinct-source
   /// threshold fires first, exactly as for the as-built regimes).
   // Mirrors: grpc executor_service.rs::report_outcome ->
   //          completion.rs handle_* per class through
@@ -1795,7 +1845,8 @@ module retryPolicy {
 
     // the pod exits after reporting; the source stays in the universe
     val execAfter = { ...execs.get(n), runningOurs: false }
-    val sourceFleet = eligibleFleet
+    // decide()'s fold view: EMPTY (bughunt-13 F12; FleetView::default()).
+    val sourceFleet = inTxFleet
     match class {
       // ── E1: transient ──────────────────────────────────────────────
       | RcTransient =>
@@ -1942,7 +1993,7 @@ module retryPolicy {
     promoted or atCap,
     val e = execs.get(n)
     val applied = specApply(spec,
-      FControllerTermination({ at: now, promoted: promoted, atCap: atCap }), eligibleFleet)
+      FControllerTermination({ at: now, promoted: promoted, atCap: atCap }), inTxFleet)
     all {
       execs' = execs.put(n, { ...e, runningOurs: false, ctrl: NoCtrl,
         deathCharges: e.deathCharges + 1 }),
@@ -2007,7 +2058,7 @@ module retryPolicy {
     match attempt { | PodDead(p) => p.exec == n and p.kind == DkDeadline | _ => false },
     execs.get(n).ctrl == CtrlDeadline,
     val e = execs.get(n)
-    val applied = specApply(spec, FControllerDeadlineExceeded(now), eligibleFleet)
+    val applied = specApply(spec, FControllerDeadlineExceeded(now), inTxFleet)
     all {
       execs' = execs.put(n, { ...e, runningOurs: false, ctrl: NoCtrl,
         deathCharges: e.deathCharges + 1 }),
@@ -2183,7 +2234,7 @@ module retryPolicy {
     storeDegradedRun >= STORE_DEGRADED_FREE_RUN,
     freeCloseRun' = 0,
     storeDegradedRun' = 0,
-    val applied = specApply(spec, FInfra({ at: now, exempt: false, atCap: false }), eligibleFleet)
+    val applied = specApply(spec, FInfra({ at: now, exempt: false, atCap: false }), inTxFleet)
     all {
       spec' = applied.c,
       specVerdict' = applied.v,
@@ -2260,7 +2311,7 @@ module retryPolicy {
     // or already-reported attempt charges the budget but there is no
     // death to double-count.
     val isDeath = match attempt { | PodDead(p) => true | _ => false }
-    val applied = specApply(spec, FEstablishedCrash({ at: now, exec: n }), eligibleFleet)
+    val applied = specApply(spec, FEstablishedCrash({ at: now, exec: n }), inTxFleet)
     all {
       execs' = execs.put(n, { ...e, runningOurs: false,
         deathCharges: if (isDeath) e.deathCharges + 1 else e.deathCharges }),
@@ -2814,6 +2865,41 @@ module retryPolicyPull {
     ENABLE_MATERIALIZATION = false,
     ENABLE_STORE_DEGRADED = false
   ).*
+
+  /// bughunt-13 F12: the deferred fleet-exhaust order, end to end. A
+  /// charge that completes the exclusion of the shrunken universe
+  /// REQUEUES (decide() folds an empty fleet -- no exhaust verdict
+  /// inside the appending transaction); the derivation sits Ready
+  /// with every spawnable source excluded -- THE round-trip window in
+  /// which a resubmit reset or a pool re-join could still avert the
+  /// poison, and which production's 124(d) staleness guards police --
+  /// and only the controller's spawn-gate verdict (spawnGateExhaust)
+  /// lands the fleet-exhaust poison, with the marker-row durable
+  /// shape: row-level stamp + status, NO fold-ledger poison stamp.
+  run deferredFleetExhaustRun = {
+    init
+      .then(all { pullOpensAttempt("n1"), buildLeavesMatUntouched })
+      .then(all { buildEndsReported("n1", RcTransient, false), buildLeavesMatUntouched })
+      .then(all { sourceLeavesPool("n2"), buildLeavesMatUntouched })
+      .then(all { pullReportOutcome("n1", RcTransient, false, false, false), buildLeavesMatUntouched })
+      .expect(and {
+        dStatus == DReady,
+        live.failedBuilders == Set("n1"),
+        pullPlaceableSources == Set(),
+        poisonSrc == NoPoison,
+      })
+      .then(all { tick, buildLeavesMatUntouched })
+      .then(all { spawnGateExhaust, buildLeavesMatUntouched })
+      .expect(and {
+        dStatus == DPoisoned,
+        poisonSrc == DispatchPoison,
+        lastPoisonReason == RFleetExhausted,
+        pg.status == PgPoisoned,
+        pg.poisonedAt == At(now),
+        pg.ledger.poisonedAt == NoTime,
+        last.kind == OE9Dispatch,
+      })
+  }
 }
 
 /// The materialization-coexistence regime (substitution-replacement

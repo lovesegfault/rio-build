@@ -5842,7 +5842,27 @@ rec {
         # quint-retry-policy-pull-witness-free-close-bound keeps the
         # contended edge reachable).
         "boundedFreeRequeues"
+        # bughunt-13 F12: a fleet-exhaust poison is never a charge-time
+        # verdict — decide() folds an empty FleetView (kani-pinned), so
+        # the only producer is the controller round-trip
+        # (spawnGateExhaust, marker-row durable shape). The shipped
+        # order is replayed end to end by deferredFleetExhaustRun
+        # (quint-retry-policy-pull-runs below).
+        "fleetExhaustIsDeferred"
       ];
+    };
+
+    # bughunt-13 F12: deterministic conformance runs for the pull
+    # regime (".*Run$" — every named run in retryPolicyPull replays;
+    # a future run auto-joins). deferredFleetExhaustRun pins the
+    # deferred fleet-exhaust order: charge-requeue (empty fold fleet),
+    # the still-Ready round-trip window, then spawnGateExhaust's
+    # marker-row poison — exactly completion.rs/pull.rs's order.
+    quint-retry-policy-pull-runs = mkQuintRunCheck {
+      name = "retry-policy-pull-runs";
+      spec = "retryPolicy";
+      main = "retryPolicyPull";
+      match = ".*Run$";
     };
 
     # Non-vacuity witnesses for the pull-mode regime (same
@@ -5971,6 +5991,8 @@ rec {
         # reachability: the spawn-exhaust witness (below).
         # r[verify sched.retry.store-degraded-uncharged+4]
         "markerRowBreaksRuns"
+        # bughunt-13 F12 (see quint-retry-policy-pull's note).
+        "fleetExhaustIsDeferred"
       ];
     };
     quint-retry-policy-pull-runs-store-outage = mkQuintRunCheck {
@@ -6160,6 +6182,8 @@ rec {
         "clearedPoisonClearsDurably"
         "clearedPoisonScrubsExclusions"
         "recoveryPreservesPoisonStatus"
+        # bughunt-13 F12 (see quint-retry-policy-pull's note).
+        "fleetExhaustIsDeferred"
         "materializationNeverPoisons"
         "materializationInvisibleToBuildBudgets"
       ];
