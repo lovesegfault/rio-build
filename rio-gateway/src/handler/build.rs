@@ -2035,14 +2035,23 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     log_client: &rio_proto::LogServiceClient<Channel>,
     request: types::SubmitBuildRequest,
     active_build_ids: &mut HashSet<String>,
-    jwt_token: Option<&str>,
-    tail_jwt: crate::server::session_jwt::TailTokenSource,
+    session_jwt: crate::server::session_jwt::SessionTokenSource,
 ) -> anyhow::Result<BuildResult> {
     // Gateway is the trace ROOT (Nix doesn't speak W3C trace context).
     // with_jwt injects the enclosing span's context + tenant JWT — this
     // is THE hop that makes distributed tracing work; without it,
     // scheduler spans are orphaned root traces.
-    let request = with_jwt(request, jwt_token)?;
+    //
+    // r[impl gw.jwt.refresh-on-expiry+2]
+    // live_064: the token is read from the session's refreshing SOURCE
+    // at every outbound injection in this function (here, the
+    // WatchBuild re-attach below, and the log-tail subscriptions) —
+    // never snapshotted at entry. The previous Option<&str> parameter
+    // froze the submit-time mint for the build's whole lifetime; a
+    // 72-min build crossed the 65-min TTL and every re-attach replayed
+    // the dead token into UNAUTHENTICATED while the session's own
+    // accessor would have re-minted on its next read.
+    let request = with_jwt(request, session_jwt.fresh().as_deref())?;
 
     let (build_id, event_stream) =
         submit_initial(stderr, scheduler_client, request, active_build_ids).await?;
@@ -2080,11 +2089,10 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // live_062: the tails get a refresh-per-open token SOURCE, not a
     // string snapshot — a watched build's tail outlives the session
     // TTL whenever the build does, and the snapshot was the 65-min
-    // read-plane blackout. (The scheduler stream above keeps its
-    // `jwt_token` snapshot: WatchBuild reattaches re-read it within
-    // the same bounded budget; its refresh story is the
-    // r[gw.jwt.refresh-on-expiry+2] exec_request seam.)
-    let (mut tails, mut log_rx) = LogTailSet::new(log_client.clone(), tail_jwt);
+    // read-plane blackout. live_064 closed the same class for the
+    // scheduler watch stream above: both faces now share this one
+    // session source.
+    let (mut tails, mut log_rx) = LogTailSet::new(log_client.clone(), session_jwt.clone());
 
     // The watch loop, typed by event source. `Live` consumes events;
     // any stream death or loss signal drops the stream (moving to
@@ -2230,16 +2238,22 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                 // auto-reconnected. If that fails (channel dead),
                 // WatchBuild will Err and we retry.
                 // r[impl gw.jwt.propagate]
+                // r[impl gw.jwt.refresh-on-expiry+2]
                 // Reconnect goes through with_jwt like the initial submit
-                // at :678 — otherwise the resumed stream's scheduler span
-                // is an orphan root trace AND carries no x-rio-tenant-token
+                // — otherwise the resumed stream's scheduler span is an
+                // orphan root trace AND carries no x-rio-tenant-token
                 // (hard auth failure once scheduler-side WatchBuild authz
                 // lands → every failover burns through MAX_RECONNECT).
+                // live_064: the token is read from the refreshing source
+                // AT THIS INJECTION — a re-attach hours after submit
+                // carries a token minted for THIS attempt, never the
+                // submit-time snapshot (the 11-identical-UNAUTHENTICATED
+                // incident shape).
                 let watch_req = with_jwt(
                     types::WatchBuildRequest {
                         build_id: build_id.clone(),
                     },
-                    jwt_token,
+                    session_jwt.fresh().as_deref(),
                 )?;
                 // Bounded open (streaming-open-ban): a wedged
                 // scheduler must surface as a retryable Err, not park
@@ -2598,18 +2612,13 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     let request =
         translate::build_submit_request(nodes, edges, priority_class, tenant_name.as_ref());
 
-    // Hoisted: `tail_source` is a `&self` read of the cache while
-    // `token()` needs `&mut self` (the lazy re-mint) — two-phase
-    // borrow rules want the clone taken first.
-    let tail_jwt = jwt.tail_source();
     let mut build_result = match submit_and_process_build(
         stderr,
         scheduler_client,
         log_client,
         request,
         active_build_ids,
-        jwt.token(),
-        tail_jwt,
+        jwt.token_source(),
     )
     .await
     {
@@ -3058,16 +3067,13 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
     translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
 
     let request = translate::build_submit_request(nodes, edges, "ci", tenant_name.as_ref());
-    // Same two-phase-borrow hoist as the interactive submit path.
-    let tail_jwt = jwt.tail_source();
     let result = submit_and_process_build(
         stderr,
         scheduler_client,
         log_client,
         request,
         active_build_ids,
-        jwt.token(),
-        tail_jwt,
+        jwt.token_source(),
     )
     .await?;
     Ok(DagSubmitOutcome::Built(result))
@@ -5370,7 +5376,7 @@ mod tests {
         let chan = tonic::transport::Endpoint::from_static("http://127.0.0.1:9").connect_lazy();
         LogTailSet::new(
             rio_proto::LogServiceClient::new(chan),
-            crate::server::session_jwt::TailTokenSource::none(),
+            crate::server::session_jwt::SessionTokenSource::none(),
         )
     }
 

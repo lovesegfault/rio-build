@@ -310,15 +310,16 @@ impl SessionJwt {
         self.token().map(str::to_owned)
     }
 
-    /// live_062: a shareable refresh-per-open token source for the
-    /// live-tail relays — the path a `token_owned` snapshot CANNOT
-    /// serve (a watched build's tail outlives `JWT_SESSION_TTL_SECS`
-    /// whenever the build does; the frozen snapshot was the 65-min
-    /// read-plane blackout). Clones the cached mint + signing key
-    /// into a `Send + Sync` source; see
-    /// `crate::server::session_jwt::TailTokenSource`.
-    pub(crate) fn tail_source(&self) -> crate::server::session_jwt::TailTokenSource {
-        crate::server::session_jwt::TailTokenSource::new(
+    /// live_062 + live_064: a shareable refresh-per-injection token
+    /// source for the session's long-lived consumers (the live-tail
+    /// relays and the build watch stream) — the paths a `token_owned`
+    /// snapshot CANNOT serve (both outlive `JWT_SESSION_TTL_SECS`
+    /// whenever the build does; the frozen snapshots were the 65-min
+    /// tail blackout and the 72-min WatchBuild re-attach death).
+    /// Clones the cached mint + signing key into a `Send + Sync`
+    /// source; see `crate::server::session_jwt::SessionTokenSource`.
+    pub(crate) fn token_source(&self) -> crate::server::session_jwt::SessionTokenSource {
+        crate::server::session_jwt::SessionTokenSource::new(
             self.cached.clone(),
             self.signing_key.clone(),
         )

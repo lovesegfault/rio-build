@@ -51,7 +51,7 @@ use tokio::time::Instant;
 use tonic::transport::Channel;
 use tracing::{Instrument, debug, info_span, warn};
 
-use crate::server::session_jwt::TailTokenSource;
+use crate::server::session_jwt::SessionTokenSource;
 
 /// How long a subscription waits before re-opening a prematurely-ended
 /// stream. The store's failure modes here are restart/deploy shaped
@@ -243,7 +243,7 @@ pub(super) struct LogTailSet {
     /// re-mints near expiry per open and force-re-mints once after an
     /// UNAUTHENTICATED rejection (key rotation), so a tail outliving
     /// `JWT_SESSION_TTL_SECS` keeps reading.
-    jwt: TailTokenSource,
+    jwt: SessionTokenSource,
     out_tx: mpsc::Sender<TaggedLogChunk>,
     config: LogTailConfig,
     tasks: HashMap<String, TailHandle>,
@@ -254,14 +254,14 @@ impl LogTailSet {
     /// build's event loop; the set keeps a sender clone.
     pub(super) fn new(
         client: LogServiceClient<Channel>,
-        jwt: TailTokenSource,
+        jwt: SessionTokenSource,
     ) -> (Self, mpsc::Receiver<TaggedLogChunk>) {
         Self::with_config(client, jwt, LogTailConfig::default())
     }
 
     pub(super) fn with_config(
         client: LogServiceClient<Channel>,
-        jwt: TailTokenSource,
+        jwt: SessionTokenSource,
         config: LogTailConfig,
     ) -> (Self, mpsc::Receiver<TaggedLogChunk>) {
         let (out_tx, out_rx) = mpsc::channel(OUT_QUEUE_DEPTH);
@@ -951,7 +951,7 @@ use gap::{ArmedGap, PendingGap, PendingGapCell, ServeHeal, Sighting};
 /// served log complete.
 async fn run_tail(
     mut client: LogServiceClient<Channel>,
-    jwt: TailTokenSource,
+    jwt: SessionTokenSource,
     derivation_path: String,
     exec_id: String,
     wiring: RelayWiring,
@@ -1942,7 +1942,7 @@ mod tests {
     use tonic::transport::Server;
     use tonic::{Request, Response, Status, Streaming};
 
-    use super::{LogTailConfig, LogTailSet, TaggedLogChunk, TailStopCause, TailTokenSource};
+    use super::{LogTailConfig, LogTailSet, SessionTokenSource, TaggedLogChunk, TailStopCause};
 
     // ------------------------------------------------------------------
     // The mock LogService
@@ -2214,7 +2214,7 @@ mod tests {
         let client = rio_proto::LogServiceClient::connect(format!("http://{addr}"))
             .await
             .expect("connect to the mock LogService");
-        let (set, out_rx) = LogTailSet::with_config(client, TailTokenSource::none(), config);
+        let (set, out_rx) = LogTailSet::with_config(client, SessionTokenSource::none(), config);
         Harness {
             mock,
             set,
@@ -2227,7 +2227,7 @@ mod tests {
     /// mint + the signing key, so the refresh-per-open contract is
     /// observable through the mock's captured `x-rio-tenant-token`
     /// headers.
-    async fn harness_with_jwt(config: LogTailConfig, jwt: TailTokenSource) -> Harness {
+    async fn harness_with_jwt(config: LogTailConfig, jwt: SessionTokenSource) -> Harness {
         let mock = MockTail::default();
         let router = Server::builder().add_service(LogServiceServer::new(mock.clone()));
         let (addr, server) = spawn_grpc_server(router).await;
@@ -2333,7 +2333,8 @@ mod tests {
             exp: now - 10,
             jti: "stale-jti".into(),
         };
-        let source = TailTokenSource::new(Some(("stale-token".into(), stale)), Some(Arc::new(key)));
+        let source =
+            SessionTokenSource::new(Some(("stale-token".into(), stale)), Some(Arc::new(key)));
         let mut h = harness_with_jwt(test_config(), source).await;
 
         h.mock.fail_next_opens(1);
@@ -2367,7 +2368,7 @@ mod tests {
         let (token, claims) =
             crate::server::session_jwt::mint_session_jwt(uuid::Uuid::from_u128(0xF00D), &key)
                 .expect("mint");
-        let source = TailTokenSource::new(Some((token, claims)), Some(Arc::new(key)));
+        let source = SessionTokenSource::new(Some((token, claims)), Some(Arc::new(key)));
         let mut h = harness_with_jwt(test_config(), source).await;
 
         h.mock.unauth_next_opens(1);
@@ -3640,7 +3641,7 @@ mod tests {
         let (out_tx, _out_rx) = mpsc::channel(8);
         let task = tokio::spawn(super::run_tail(
             client,
-            TailTokenSource::none(),
+            SessionTokenSource::none(),
             DRV.to_string(),
             EXEC_A.to_string(),
             super::RelayWiring {
@@ -4588,7 +4589,7 @@ mod tests {
         let disposition = super::RelayDisposition::disclose_at_drop();
         let relay = tokio::spawn(super::run_tail(
             client,
-            TailTokenSource::none(),
+            SessionTokenSource::none(),
             DRV.to_string(),
             EXEC_A.to_string(),
             super::RelayWiring {
