@@ -2342,6 +2342,26 @@ member per variant, pinned to the real test fns --- never
 hand-enumerated: the wave-12 battery's three hand-listed windows
 missed exactly the fourth variant this close repairs.
 
+The supersession dual (bug_040): the discard disposition gated only
+ONE of the guard's three discharge sites (the Drop backstop) while
+both AWAITED discharges sent unconditionally once their reservation
+resolved --- a relay whose poll was in flight at mark-then-abort, or a
+sync-stalled straggler past the join bound, spliced a dead execution's
+gap marker or stale withheld lines into the successor's stream. Every
+awaited armed discharge now routes through ONE
+disposition-consulting reservation chokepoint (consulted
+POST-reserve, the latest synchronous point before the enqueue), the
+join-bound rationale is true as stated, and the module's standing
+guard is the WIDENED sealed-gap lint (the prefiled take-then-await
+candidate reconciled): count-pinned over the module's production
+text, it refuses any new take outside the sealed set, any
+obligation-reducing mutation outside the typed discharges, and any
+reservation outside the chokepoint --- with both historical shapes
+planted in-population and a K-mutation self-test proving each
+widening load-bearing (the take-only narrowing must miss the
+mutate-then-await plant, and does).
+
+
 - The gateway does not own durable state. All persistent data lives in the
   scheduler (PostgreSQL) and the store.
 - Consider using a non-standard SSH port (e.g., 2222) to avoid conflicts with

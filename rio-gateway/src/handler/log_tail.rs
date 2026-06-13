@@ -171,9 +171,14 @@ impl RelayDisposition {
 /// bound-join discipline (build.rs, the abort_all + 250 ms join at
 /// stream end): an aborted task resolves at its next yield point
 /// (typically <1 ms); the bound only caps a pathological scheduler
-/// stall, and a straggler past it can no longer splice DISCLOSURES
-/// (the disposition is already must-discard) — only an in-flight
-/// regular send, the same priced residual the terminus form carries.
+/// stall, and a straggler past it can no longer splice DISCLOSURES —
+/// the disposition is already must-discard AND every awaited armed
+/// discharge consults it post-reserve at the gap module's one
+/// disclosure chokepoint (bug_040: pre-fix only Drop consulted, so an
+/// in-flight poll or a sync-stalled straggler could still push a dead
+/// execution's marker or stale withheld lines through the armed
+/// sends) — only an in-flight regular send remains, the same priced
+/// residual the terminus form carries.
 const SUPERSEDED_JOIN_BOUND: Duration = Duration::from_millis(250);
 
 /// One live subscription: the execution it is keyed on, the signal that
@@ -753,7 +758,9 @@ mod gap {
         /// Disclose the armed hole up to `until` (clamped to the
         /// hole): one marker send, then the hole shrinks past it. The
         /// await is the permit reservation — the hole stays armed
-        /// through it. Returns `false` iff the channel is closed.
+        /// through it, and the disposition is consulted post-reserve
+        /// (bug_040). Returns `false` iff the relay must stop (channel
+        /// closed or superseded-discard).
         pub(super) async fn disclose_hole_until(&mut self, until: u64) -> bool {
             let Some((from, hole_until)) = self.hole else {
                 return true;
@@ -762,7 +769,7 @@ mod gap {
             if until <= from {
                 return true;
             }
-            let Ok(permit) = self.out_tx.reserve().await else {
+            let Some(permit) = reserve_disclosure(&self.out_tx, &self.disposition).await else {
                 return false;
             };
             permit.send(TaggedLogChunk {
@@ -804,13 +811,15 @@ mod gap {
         /// Relay the remaining withheld lines as one chunk and adopt
         /// the watermark; a no-op when nothing remains (the
         /// all-duplicates heal). The lines leave the guard only in
-        /// the synchronous permit-send after the reservation
-        /// resolves. Returns `false` iff the channel is closed.
+        /// the synchronous permit-send after the reservation resolves
+        /// — and only if the disposition still permits disclosure
+        /// (bug_040). Returns `false` iff the relay must stop (channel
+        /// closed or superseded-discard).
         pub(super) async fn send_lines(&mut self, last_relayed: &mut Option<u64>) -> bool {
             if self.lines.is_empty() {
                 return true;
             }
-            let Ok(permit) = self.out_tx.reserve().await else {
+            let Some(permit) = reserve_disclosure(&self.out_tx, &self.disposition).await else {
                 return false;
             };
             let lines = std::mem::take(&mut self.lines);
@@ -822,6 +831,33 @@ mod gap {
             *last_relayed = Some(self.next_line.saturating_sub(1));
             true
         }
+    }
+
+    /// Reserve an output permit AND consult the abort disposition —
+    /// the ONE chokepoint every AWAITED armed discharge routes
+    /// through (bug_040; the sealed-gap lint pins it: no other
+    /// `reserve()` exists in this module). The consult happens AFTER
+    /// the reservation resolves — the latest synchronous point before
+    /// the enqueue — so a relay superseded while the reserve was
+    /// parked (the in-progress-poll window) or while a sync-stalled
+    /// straggler slept past the join bound refuses the send instead
+    /// of splicing a dead execution's marker or stale lines into the
+    /// successor's stream. `None` = stop relaying: the channel is
+    /// closed OR this relay must discard; either way the caller exits
+    /// and the guard's Drop (whose own consult is the backstop)
+    /// settles the remainder. A free fn over the two fields so the
+    /// permit borrow stays field-scoped.
+    async fn reserve_disclosure<'a>(
+        out_tx: &'a mpsc::Sender<TaggedLogChunk>,
+        disposition: &RelayDisposition,
+    ) -> Option<mpsc::Permit<'a, TaggedLogChunk>> {
+        let Ok(permit) = out_tx.reserve().await else {
+            return None;
+        };
+        if disposition.must_discard() {
+            return None;
+        }
+        Some(permit)
     }
 
     impl Drop for ArmedGap {
@@ -3797,6 +3833,336 @@ mod tests {
              nothing armed, so no Drop re-discloses"
         );
     }
+    /// W13-AB (bug_040): the disposition gates EVERY awaited armed
+    /// discharge, not just Drop. The two REAL windows (the refuted
+    /// parked-then-resumed third window is recorded ABSENT per the
+    /// triage — tokio cancels queued-aborted tasks at dequeue):
+    /// (1) the in-progress poll — the owner marks-then-aborts while
+    /// the straggler's reserve is parked; (2) the sync-stalled
+    /// straggler past the 250 ms join bound whose next act is the
+    /// armed send. Both resolve at the same point: the post-reserve
+    /// consult inside the module's one disclosure chokepoint.
+    ///
+    /// Choreography (deterministic): a 1-slot channel pre-filled so
+    /// the armed send parks at its reserve; one poll parks it (the
+    /// in-flight poll); the owner marks the disposition; the
+    /// successor frees the slot; the straggler resumes.
+    ///
+    /// Pre-fix red (2026-06-12, strawman: the chokepoint consult
+    /// neutralized via `if false && disposition.must_discard()`):
+    ///   `the dead execution's withheld lines must not splice into
+    ///   the successor's stream (got ["line-8"])`.
+    /// Post-fix: the consult refuses the send (the resumed future
+    /// returns false), nothing splices, and the guard's Drop —
+    /// consulting the same disposition — discards silently.
+    // r[verify gw.tail.disclosure-linear]
+    #[tokio::test]
+    async fn superseded_armed_send_refuses_at_the_consult() {
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let disposition = super::RelayDisposition::disclose_at_drop();
+        let mut cell = super::PendingGapCell::new(out_tx.clone(), disposition.clone());
+        cell.record_first(taken_window_pending(&["line-8"]));
+        let super::ServeHeal::Healed(mut armed) = cell.on_serve(9) else {
+            panic!("a floor at 9 fully heals the [5,8) hole");
+        };
+        // Fill the only slot: the armed send's reserve parks.
+        out_tx
+            .try_send(super::TaggedLogChunk {
+                derivation_path: DRV.to_string(),
+                first_line_number: 0,
+                lines: vec![b"successor-traffic".to_vec()],
+            })
+            .expect("one slot free");
+        let mut last_relayed: Option<u64> = None;
+        let refused = {
+            let mut fut = Box::pin(armed.send_lines(&mut last_relayed));
+            // The in-flight poll: parked at the reserve.
+            poll_once(&mut fut);
+            // The owner supersedes WHILE the poll is in flight (the
+            // mark-then-abort protocol's mark; the abort has not
+            // landed yet).
+            disposition.mark_superseded();
+            // The successor consumes the slot; the straggler resumes.
+            let freed = out_rx.recv().await.expect("the successor's own traffic");
+            assert_eq!(freed.lines[0], b"successor-traffic".to_vec());
+            !fut.await
+        };
+        drop(armed);
+        drop(cell);
+        drop(out_tx);
+        let mut got = Vec::new();
+        while let Some(c) = out_rx.recv().await {
+            for l in &c.lines {
+                got.push(String::from_utf8(l.clone()).expect("test lines are UTF-8"));
+            }
+        }
+        // The proposition FIRST: nothing from the dead execution
+        // reaches the successor's stream — neither the resumed armed
+        // send (the splice) nor the guard's Drop (its consult is the
+        // backstop).
+        assert!(
+            got.is_empty(),
+            "the dead execution's withheld lines must not splice into the \
+             successor's stream (got {got:?})"
+        );
+        assert!(
+            refused,
+            "the resumed armed send must refuse at the post-reserve consult"
+        );
+    }
+
+    /// W13-AB2 — the control: the SAME choreography without the
+    /// supersession mark relays normally once the slot frees (the
+    /// consult is not a blanket downgrade; non-superseded sends are
+    /// byte-stable).
+    // r[verify gw.tail.disclosure-linear]
+    #[tokio::test]
+    async fn non_superseded_armed_send_relays_after_the_park() {
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let disposition = super::RelayDisposition::disclose_at_drop();
+        let mut cell = super::PendingGapCell::new(out_tx.clone(), disposition.clone());
+        cell.record_first(taken_window_pending(&["line-8"]));
+        let super::ServeHeal::Healed(mut armed) = cell.on_serve(9) else {
+            panic!("a floor at 9 fully heals the [5,8) hole");
+        };
+        out_tx
+            .try_send(super::TaggedLogChunk {
+                derivation_path: DRV.to_string(),
+                first_line_number: 0,
+                lines: vec![b"consumer-traffic".to_vec()],
+            })
+            .expect("one slot free");
+        let mut last_relayed: Option<u64> = None;
+        let sent = {
+            let mut fut = Box::pin(armed.send_lines(&mut last_relayed));
+            poll_once(&mut fut);
+            let _ = out_rx.recv().await.expect("the consumer's own traffic");
+            fut.await
+        };
+        assert!(sent, "an un-superseded armed send completes");
+        let relayed = out_rx.recv().await.expect("the withheld lines");
+        assert_eq!(relayed.lines[0], b"line-8".to_vec());
+    }
+
+    // ------------------------------------------------------------------
+    // The widened sealed-gap lint (bug_040 + merged_bug_025; the
+    // prefiled-#5 reconciliation, OQ-14 verdict: IN-CRATE TEST TIER —
+    // the grammar is module-local to `mod gap`, so the lint lives in
+    // the take_armed family's own file and needs no staged workspace)
+    // ------------------------------------------------------------------
+
+    /// The lint's grammar selector — and its OWN K-mutation surface
+    /// (R31′(iii)): each narrowed variant is a seeded mutation of the
+    /// artifact's control flow, and the self-test below proves every
+    /// plant DIES under the mutation that disables its rule. A lint
+    /// whose plants survive its own narrowing would be the bug_047
+    /// born-broken shape.
+    #[derive(Clone, Copy, PartialEq)]
+    enum SealedGapGrammar {
+        /// The widened grammar: the sealed take set AND
+        /// obligation-reducing mutations AND the reservation
+        /// chokepoint.
+        Full,
+        /// K-mutation 1 — the original prefiled take-only candidate:
+        /// must MISS the merged_bug_025 mutate-then-await plant.
+        TakeOnly,
+        /// K-mutation 2 — the chokepoint rule dropped: must MISS the
+        /// bug_040 unconsulted-reservation plant.
+        NoChokepointRule,
+    }
+
+    /// The sealed-gap census over `mod gap`'s production text:
+    /// comment-stripped, whitespace-stripped, count-pinned needles.
+    /// Every count names its sanctioned sites — a NEW take, a NEW
+    /// obligation-reducing mutation outside the typed discharges, or
+    /// a NEW reservation outside the disposition-consulting
+    /// chokepoint changes a count and reds the lint.
+    fn sealed_gap_violations(gap_src: &str, grammar: SealedGapGrammar) -> Vec<String> {
+        let stripped: String = gap_src
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .concat()
+            .split_whitespace()
+            .collect();
+        let mut v = Vec::new();
+        let mut pin = |got: usize, needle: &str, want: usize, why: &str| {
+            if got != want {
+                v.push(format!("{needle}: {got} != {want} ({why})"));
+            }
+        };
+        let count = |needle: &str| stripped.matches(needle).count();
+        // The sealed take set (every grammar): cell Drop, take_armed,
+        // on_serve's full-heal arm.
+        pin(
+            count("state.take()"),
+            "state.take()",
+            3,
+            "the sealed take set: PendingGapCell::drop, take_armed, on_serve full heal",
+        );
+        if grammar != SealedGapGrammar::TakeOnly {
+            // Obligation-reducing mutations live ONLY in the typed
+            // discharge fns (the merged_bug_025 lesson: a bare
+            // pre-send mutation is the R32 escape). ASSIGNMENT only:
+            // the classify arm's `gap_from ==` equality is excluded
+            // by subtracting the double-equals matches.
+            pin(
+                count("gap_from=") - count("gap_from=="),
+                "gap_from=",
+                1,
+                "discharge_served_prefix is the only recorded-hole floor writer",
+            );
+            pin(
+                count("self.hole="),
+                "self.hole=",
+                4,
+                "suppress_hole, suppress_hole_until, disclose_hole_until \
+                 (post-send), note_delivered",
+            );
+            pin(
+                count("mem::take(&mutself.lines)"),
+                "mem::take(&mutself.lines)",
+                2,
+                "send_lines' permit-send and the Drop disclosure",
+            );
+            pin(
+                count(".lines.clear()"),
+                ".lines.clear()",
+                1,
+                "note_delivered's full-coverage trim",
+            );
+            pin(
+                count(".lines.drain("),
+                ".lines.drain(",
+                1,
+                "note_delivered's prefix trim",
+            );
+        }
+        if grammar != SealedGapGrammar::NoChokepointRule {
+            // The reservation chokepoint (the bug_040 lesson: a send
+            // site that does not consult the disposition splices).
+            pin(
+                count("fnreserve_disclosure"),
+                "fnreserve_disclosure",
+                1,
+                "the one disposition-consulting reservation chokepoint exists",
+            );
+            pin(
+                count(".reserve().await"),
+                ".reserve().await",
+                1,
+                "every AWAITED reservation routes through reserve_disclosure",
+            );
+            pin(
+                count("must_discard()"),
+                "must_discard()",
+                2,
+                "the chokepoint consult + the ArmedGap::drop backstop",
+            );
+            pin(
+                count("try_reserve()"),
+                "try_reserve()",
+                3,
+                "Drop's transactional sends only (one single + one pair)",
+            );
+        }
+        v
+    }
+
+    /// Extract `mod gap`'s text from this file (the embedded census
+    /// universe — compile-time `include_str!`, never a tree walk).
+    fn gap_module_src() -> &'static str {
+        let src = include_str!("log_tail.rs");
+        let start = src.find("mod gap {").expect("mod gap exists");
+        let end = src
+            .find("use gap::{")
+            .expect("the module-close anchor exists");
+        &src[start..end]
+    }
+
+    /// The lint at head: zero violations over the real module text.
+    #[test]
+    fn sealed_gap_lint_is_clean_at_head() {
+        let v = sealed_gap_violations(gap_module_src(), SealedGapGrammar::Full);
+        assert!(v.is_empty(), "sealed-gap violations: {v:#?}");
+    }
+
+    /// W13-AB3 — both historical shapes planted INSIDE the census
+    /// population and caught: the merged_bug_025 mutate-then-await
+    /// (a bare `gap_from =` outside the typed discharge) and the
+    /// bug_040 unconsulted reservation (a second `.reserve().await`
+    /// outside the chokepoint).
+    #[test]
+    fn sealed_gap_lint_catches_both_historical_shapes() {
+        let mutate_plant = format!(
+            "{}\nfn evil_shrink(p: &mut PendingGap, next: u64) {{ p.gap_from = next; }}\n",
+            gap_module_src()
+        );
+        let v = sealed_gap_violations(&mutate_plant, SealedGapGrammar::Full);
+        assert!(
+            v.iter().any(|x| x.contains("gap_from=")),
+            "the mutate-then-await plant must red the widened lint (got {v:?})"
+        );
+
+        let reserve_plant = format!(
+            "{}\nasync fn evil_send(tx: &mpsc::Sender<TaggedLogChunk>) {{ \
+             let _ = tx.reserve().await; }}\n",
+            gap_module_src()
+        );
+        let v = sealed_gap_violations(&reserve_plant, SealedGapGrammar::Full);
+        assert!(
+            v.iter().any(|x| x.contains(".reserve().await")),
+            "the unconsulted-reservation plant must red the widened lint \
+             (got {v:?})"
+        );
+    }
+
+    /// The K-mutation self-test (R31′(iii)): each planted red DIES
+    /// under the seeded mutation that disables its rule — proving
+    /// both widenings are load-bearing, not decorative. A third
+    /// mutation (the population walk emptied) is caught by the
+    /// definition pins: an empty universe is a missing chokepoint,
+    /// never a vacuous pass.
+    #[test]
+    fn sealed_gap_lint_k_mutations_kill_the_plants() {
+        // K1: the take-only narrowing misses the mutate plant — the
+        // exact blindness the prefiled-#5 candidate had.
+        let mutate_plant = format!(
+            "{}\nfn evil_shrink(p: &mut PendingGap, next: u64) {{ p.gap_from = next; }}\n",
+            gap_module_src()
+        );
+        let v = sealed_gap_violations(&mutate_plant, SealedGapGrammar::TakeOnly);
+        assert!(
+            !v.iter().any(|x| x.contains("gap_from=")),
+            "under the take-only narrowing the mutate plant's red must DIE \
+             (got {v:?}) — otherwise the widening proves nothing"
+        );
+
+        // K2: dropping the chokepoint rule misses the reserve plant.
+        let reserve_plant = format!(
+            "{}\nasync fn evil_send(tx: &mpsc::Sender<TaggedLogChunk>) {{ \
+             let _ = tx.reserve().await; }}\n",
+            gap_module_src()
+        );
+        let v = sealed_gap_violations(&reserve_plant, SealedGapGrammar::NoChokepointRule);
+        assert!(
+            !v.iter().any(|x| x.contains(".reserve().await")),
+            "under the no-chokepoint mutation the reservation plant's red \
+             must DIE (got {v:?})"
+        );
+
+        // K3: the emptied population walk is itself a red (the
+        // definition pins demand the chokepoint EXISTS).
+        let v = sealed_gap_violations("", SealedGapGrammar::Full);
+        assert!(
+            !v.is_empty(),
+            "an empty census universe must red, never vacuously pass"
+        );
+    }
+
     // ------------------------------------------------------------------
     // W12-AU / W12-AU2 (merged_bug_007, R32): every exit discharges
     // ------------------------------------------------------------------
