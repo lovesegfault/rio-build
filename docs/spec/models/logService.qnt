@@ -1763,8 +1763,11 @@ module logService {
   /// The scheduler dispatches the derivation: a new assignment attempt
   /// with a fresh exec_id becomes the LATEST assignment, and its
   /// `drv_executions` lifecycle row is INSERTed.
-  // Mirrors: rio-scheduler assign_to_worker -> assignments INSERT +
-  //          rio-scheduler/src/db/executions.rs (the dispatch INSERT).
+  // The stream-era assign_to_worker pointer died with the dispatch
+  // stream (bughunt-13 OP-6 rot sweep); the live mint is the pull
+  // path's fenced transaction.
+  // Mirrors: rio-scheduler/src/actor/pull.rs:mint_and_deliver
+  // Mirrors: rio-scheduler/src/db/open_attempts.rs:mint_pull_attempt_fenced
   action dispatch = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -1802,8 +1805,9 @@ module logService {
   /// conjunct never admits it — what it CAN do, pre-fix, is displace
   /// a build execution's late replay (the latest-only gate;
   /// `CALIB_GATE_LATEST_ONLY`).
-  // Mirrors: rio-scheduler mint_and_deliver (kind = materialization)
-  //          observed by gate.rs as a newer assignments row.
+  // Mirrors: rio-scheduler/src/actor/pull.rs:mint_and_deliver
+  // (kind = materialization, observed by gate.rs as a newer
+  // assignments row).
   action dispatchMaterialization = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -1838,8 +1842,9 @@ module logService {
   /// references it and the v2 sweep may reclaim the lifecycle row.
   /// Guarded on the row still existing so the reference state is
   /// frozen after deletion (see the var's doc).
-  // Mirrors: the drv_attempts per-lane GC cut observed by
-  //          sweep.rs's eligibility SELECT as zero referencing rows.
+  // Mirrors: rio-scheduler/src/db/attempts.rs:gc_attempt_ledger
+  // (the per-lane GC cut, observed by sweep.rs's eligibility SELECT
+  // as zero referencing rows).
   action ledgerReleases(e: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -1873,8 +1878,8 @@ module logService {
 
   /// The build emits one more stderr line into its uploader's input
   /// channel (and so into the retransmit buffer).
-  // Mirrors: rio-builder/src/log_stream.rs (the per-line counter) +
-  //          log_upload.rs::UploadTask::accept (the buffer push).
+  // Mirrors: rio-builder/src/log_stream.rs:add_line
+  // Mirrors: rio-builder/src/log_upload.rs:accept
   action produceLine(e: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -1909,8 +1914,8 @@ module logService {
   /// The build exits: no more lines, the completion report (carrying
   /// the build's own line total) is ready for the scheduler, and the
   /// uploader's input channel closes (arming the drain deadline).
-  // Mirrors: rio-builder/src/runtime/mod.rs (the post-footer
-  //          completion report) + log_upload.rs::accept(None).
+  // Mirrors: rio-builder/src/runtime/mod.rs:send_completion
+  // (the post-footer completion report; log_upload accept(None)).
   action buildFinishes(e: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -1960,8 +1965,8 @@ module logService {
   /// that is a trusted-component failure outside this model.
   /// Precondition `not(expired)`: the terminal stamp follows the
   /// completion report by seconds, the TTL by days.
-  // Mirrors: rio-scheduler/src/actor/completion.rs
-  //          (terminal_log_epilogue's `try_from(...).filter(> 0)`).
+  // Mirrors: rio-scheduler/src/actor/completion.rs:terminal_log_epilogue
+  // (the `try_from(...).filter(> 0)` stamp).
   action recordFinalLineCount(e: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -2054,9 +2059,10 @@ module logService {
   /// known count (the late-replay case); the uploader's transmit cursor
   /// rewinds to its acked watermark so everything un-acked is
   /// retransmitted (the at-least-once replay).
-  // Mirrors: service.rs::append_log (steps 3-6) + gate.rs::
-  //          check_append_open + sessions::acquire +
-  //          log_upload.rs::UploadTask::open / drive's `sent = 0`.
+  // Mirrors: rio-store/src/logs/service.rs:append_log
+  // Mirrors: rio-store/src/logs/gate.rs:check_append_open
+  // (steps 3-6 + sessions::acquire + log_upload's UploadTask::open /
+  // drive's `sent = 0`).
   action openSession(e: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -2141,8 +2147,9 @@ module logService {
   /// buffer is discarded and the remaining input is drained to
   /// nowhere — the un-stored tail is gone, disclosed by the
   /// loss-disclosure counter and by its log never reading complete.
-  // Mirrors: gate.rs::check_append_open (the no-matching-row arm) +
-  //          log_upload.rs::reject_permanently.
+  // Mirrors: rio-store/src/logs/gate.rs:check_append_open
+  // Mirrors: rio-builder/src/log_upload.rs:reject_permanently
+  // (the no-matching-row arm).
   action openRejectedSuperseded(e: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -2184,8 +2191,9 @@ module logService {
   /// that permanently revokes the old executor's write authority
   /// under the v2 claimed-exec gate. Only non-latest executions are
   /// rewritable (the live attempt's row is what the rewrite WRITES).
-  // Mirrors: the scheduler's assignment upsert observed by
-  //          gate.rs::check_append_open as fetch_optional == None.
+  // Mirrors: rio-scheduler/src/db/open_attempts.rs:mint_pull_attempt_fenced
+  // (the ON-CONFLICT in-place rewrite, observed by
+  // gate.rs::check_append_open as fetch_optional == None).
   action rewriteAssignment(e: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -2221,8 +2229,9 @@ module logService {
   /// the superseded rejection, but nothing of value is lost: every line
   /// the buffer still holds is already covered by the (complete)
   /// manifest.
-  // Mirrors: gate.rs::check_append_open (check 4) +
-  //          log_upload.rs::reject_permanently.
+  // Mirrors: rio-store/src/logs/gate.rs:check_append_open
+  // Mirrors: rio-builder/src/log_upload.rs:reject_permanently
+  // (check 4, the completeness gate).
   action openRejectedComplete(e: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -2283,9 +2292,9 @@ module logService {
   /// advances regardless — the uploader gets no per-batch verdict, only
   /// acks — and a rejected batch's lines stay in the retransmit buffer
   /// until an ack covers them or the drain is abandoned.
-  // Mirrors: log_upload.rs::drive (the send arm) ->
-  //          service.rs::drive (the Batch arm) ->
-  //          ingest.rs::IngestSession::accept.
+  // Mirrors: rio-builder/src/log_upload.rs:drive
+  // Mirrors: rio-store/src/logs/ingest.rs:accept
+  // (the send arm -> service.rs drive's Batch arm -> the accept).
   action appendHonest(e: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -2488,9 +2497,10 @@ module logService {
   /// its high-water side effect can permanently strand the honest
   /// replay behind the monotone floor (the builder shooting its own
   /// log; the strand is disclosed by the log never completing).
-  // Mirrors: ingest.rs::IngestSession::accept (the accept and
-  //          truncate-at-ceiling arms) driven by an untrusted
-  //          LogBatcher.
+  // Mirrors: rio-store/src/logs/ingest.rs:accept
+  // (the accept and truncate-at-ceiling arms, driven by an
+  // untrusted LogBatcher -- the adversary's move through the same
+  // production admission).
   action appendFabricated(e: int, lo: int, hi: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -2603,9 +2613,9 @@ module logService {
   /// post-refresh obligation. Only an Open session refreshes (the
   /// heartbeat loop exits with the driver's select loop); the first
   /// observed value wins (the count is stamped once and never changes).
-  // Mirrors: service.rs::drive (the heartbeat arm's
-  //          sealed_final_line_count refresh) +
-  //          ingest.rs::set_final_line_count.
+  // Mirrors: rio-store/src/logs/ingest.rs:set_final_line_count
+  // (service.rs drive's heartbeat-arm sealed_final_line_count
+  // refresh).
   action refreshCeiling(e: int, s: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -2668,8 +2678,9 @@ module logService {
   /// final drain respectively) — a detached predecessor session
   /// committing its drain concurrently with its successor's cuts is
   /// the manifest-overlap source.
-  // Mirrors: ingest.rs::IngestSession::cut + commit_chunk;
-  //          service.rs::do_cut / drain.
+  // Mirrors: rio-store/src/logs/ingest.rs:cut
+  // Mirrors: rio-store/src/logs/ingest.rs:commit_chunk
+  // (service.rs::do_cut / the detached drain).
   action cutChunk(e: int, s: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -2794,8 +2805,8 @@ module logService {
   /// manifest overlap the read path dedups. Enabled in every regime
   /// (every build's stream ends); whether a SECOND session can then
   /// open is `openSession`'s ENABLE_RECONNECT gate.
-  // Mirrors: service.rs::drive (Ok(None) / Err -> ClientFinished) +
-  //          AppendDriver::run (the drain arm).
+  // Mirrors: rio-store/src/logs/service.rs:AppendDriver
+  // (drive's Ok(None) / Err -> ClientFinished; the drain arm).
   action builderDisconnects(e: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -2838,9 +2849,9 @@ module logService {
   /// or the ingest lease observed as lost. Safe by design: every
   /// dropped line is still in the builder's retransmit buffer (it was
   /// never acked) and will be replayed to the next session.
-  // Mirrors: service.rs::AppendDriver::run (the LoopExit::Abort /
-  //          LeaseLost arms — the drain is skipped and the
-  //          deregistration scopeguard drops IngestShared).
+  // Mirrors: rio-store/src/logs/service.rs:AppendDriver
+  // (the LoopExit::Abort / LeaseLost arms -- the drain is skipped
+  // and the deregistration scopeguard drops IngestShared).
   action sessionAborts(e: int, s: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -2877,13 +2888,6 @@ module logService {
     acceptedTotal' = acceptedTotal,
   }
 
-  /// The uploader gives up with lines still un-acked: the post-build
-  /// drain deadline expires while the store is unreachable (or keeps
-  /// rejecting the stream). The retransmit buffer is dropped; the loss
-  /// is disclosed by `rio_builder_log_drain_abandoned_total` and the
-  /// error log, and the execution's log never reads complete (the
-  /// manifest cannot cover the abandoned tail).
-  // Mirrors: log_upload.rs::run_inner (DeadlineExpired -> abandoned()).
   /// The EARLY uploader death (bughunt2-wave slot 8, bug_241): the
   /// upload task panics/aborts while the build still produces. The
   /// channel closes -- the refusal watermark is stamped at the
@@ -2895,8 +2899,8 @@ module logService {
   /// accounting (production: the SendError-bounced batch seeds the
   /// ledger and the LossGuard discloses the buffered range).
   /// Producer-plane only.
-  // Mirrors: rio-builder/src/log_upload.rs (UploadSink::Lost +
-  //          DiscardLedger seed on SendError).
+  // Mirrors: rio-builder/src/log_upload.rs:UploadSink
+  // (UploadSink::Lost + the DiscardLedger seed on SendError).
   action uploaderDies(e: int): bool = all {
     readerUnchanged,
     ENABLE_PRODUCER_PLANE,
@@ -2929,6 +2933,15 @@ module logService {
     acceptedTotal' = acceptedTotal,
   }
 
+  /// The uploader gives up with lines still un-acked: the post-build
+  /// drain deadline expires while the store is unreachable (or keeps
+  /// rejecting the stream). The retransmit buffer is dropped; the loss
+  /// is disclosed by `rio_builder_log_drain_abandoned_total` and the
+  /// error log, and the execution's log never reads complete (the
+  /// manifest cannot cover the abandoned tail). (This block sat
+  /// stranded above uploaderDies' doc; re-homed at the OP-6 pass.)
+  // Mirrors: rio-builder/src/log_upload.rs:run_inner
+  // (DeadlineExpired -> abandoned()).
   action uploaderAbandons(e: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -3011,8 +3024,9 @@ module logService {
   /// BECAUSE the row survives. The guard requires something to strip
   /// (the EXISTS disjunction keeps a stripped execution out of every
   /// later pass).
-  // Mirrors: sweep.rs::sweep_expired_logs (the drv_log_chunks DELETE +
-  //          delete_batch; the registry DELETE is unmodeled hygiene).
+  // Mirrors: rio-store/src/logs/sweep.rs:sweep_expired_logs
+  // (the drv_log_chunks DELETE + delete_batch; the registry DELETE
+  // is unmodeled hygiene).
   action sweepChunks(e: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -3073,8 +3087,8 @@ module logService {
   /// leaves the chunks unreachable to the store SELECT (bounded by the
   /// S3 lifecycle backstop, priced in the header), and a row that
   /// outlives its stripped chunks reads incomplete forever (disclosed).
-  // Mirrors: rio-scheduler/src/db/attempts.rs::gc_exec_rows behind
-  //          rio_retry_kernel::exec_row_sweep_eligible.
+  // Mirrors: rio-scheduler/src/db/attempts.rs:gc_exec_rows
+  // (behind rio_retry_kernel::exec_row_sweep_eligible).
   action gcExecRow(e: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -3118,8 +3132,8 @@ module logService {
   /// a row the epilogue already stamped keeps its count. Pre-fix
   /// (CALIB_CLOSE_NO_STAMP) the close stamped NOTHING — the row kept
   /// `NoCount` forever and was immortal to `gcExecRow` (bug_047).
-  // Mirrors: rio-scheduler/src/db/mod.rs::close_assignments_sql
-  //          (the stamped CTE arm; status IS NULL guard).
+  // Mirrors: rio-scheduler/src/db/mod.rs:close_assignments_sql
+  // (the stamped CTE arm; status IS NULL guard).
   action closeExecStamp(e: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -3223,6 +3237,8 @@ module logService {
   /// registration starts with an empty queue. The cursor lands one
   /// past the highest snapshot line — interior snapshot holes are the
   /// (already-disclosed) storage-hole story, not this plane's seam.
+  // Mirrors: rio-store/src/logs/service.rs:serve_tail
+  // Mirrors: rio-store/src/logs/ingest.rs:subscribe
   action readerSubscribe = all {
     ENABLE_READER,
     not(readerAttached),
@@ -3252,6 +3268,10 @@ module logService {
   /// One accepted line joins the live fan-out — or is DROPPED at a
   /// full queue (`try_send` Full, the adversarial branch). Each line
   /// fans at most once (one broadcast per accept).
+  // Mirrors: rio-store/src/logs/service.rs:serve_tail
+  // (the live fan-out delivery; same lane for the logIngest
+  // plane's fanoutDeliver -- P8 resolves same-named actions to the
+  // file's first declaration, so this block serves both).
   action fanoutDeliver(n: int): bool = all {
     ENABLE_READER,
     readerAttached,
@@ -3290,6 +3310,7 @@ module logService {
     coreUnchanged,
   }
 
+  // Mirrors: rio-store/src/logs/service.rs:serve_tail
   action fanoutDeliverAny = {
     nondet n = interval(0, MAX_LINE).oneOf()
     fanoutDeliver(n)
@@ -3301,6 +3322,7 @@ module logService {
   /// OBSERVED gap — the fixed reader back-fills the missing span from
   /// the manifest and buffers before advancing, the calibration reader
   /// advances past it (the pre-fix splice).
+  // Mirrors: rio-store/src/logs/service.rs:serve_tail
   action readerDrain = all {
     ENABLE_READER,
     readerAttached,
@@ -3430,6 +3452,7 @@ module logService {
   /// cursor-blind stamp lied. The calibration readers catch up
   /// nothing (`CALIB_READER_ADVANCE_PAST`) or advance the cursor
   /// without serving (`CALIB_RESUME_PAST_GAP`).
+  // Mirrors: rio-store/src/logs/service.rs:serve_tail
   action readerCatchup = all {
     ENABLE_READER,
     readerAttached,
@@ -3472,6 +3495,7 @@ module logService {
   /// completeness; the FinalClaim cursor-bind). The
   /// CALIB_STAMP_SKIPS_CATCHUP stamp claims the store's fold verbatim
   /// — the pre-fix cursor-blind predicate, honest only by luck.
+  // Mirrors: rio-store/src/logs/service.rs:serve_tail
   action readerStamp = all {
     ENABLE_READER,
     readerAttached,
@@ -3507,6 +3531,7 @@ module logService {
   /// fan-out output. CALIB_DROP_WAKE_LOST models the lost pulse: the
   /// action never fires (the latch the code uses cannot lose the
   /// wake; a Notify could and DID — the flaked predecessor run).
+  // Mirrors: rio-store/src/logs/service.rs:serve_tail
   action readerWakeOnDrop = all {
     ENABLE_READER,
     ENABLE_DROP_WAKE,
@@ -3555,6 +3580,7 @@ module logService {
   /// The live stream retags to a new execution (ENABLE_EXEC_AXIS): a
   /// retry on another worker whose numbering restarts. Abstract 0/1
   /// tag toggle; the reader's NEXT drain must take the switch arm.
+  // Mirrors: rio-store/src/logs/service.rs:serve_tail
   action execSwitchDelivery = all {
     ENABLE_READER,
     ENABLE_EXEC_AXIS,
@@ -3640,44 +3666,73 @@ module logService {
   // disjunct's name; an anonymous block makes the whole step anonymous
   // and undrivable).
 
+  // Mirrors: rio-builder/src/log_stream.rs:add_line
   action produceLineAny = { nondet e = EXECS.oneOf() produceLine(e) }
+  // Mirrors: rio-builder/src/runtime/mod.rs:send_completion
   action buildFinishesAny = { nondet e = EXECS.oneOf() buildFinishes(e) }
+  // Mirrors: rio-scheduler/src/actor/completion.rs:terminal_log_epilogue
   action recordFinalLineCountAny = { nondet e = EXECS.oneOf() recordFinalLineCount(e) }
+  // Mirrors: rio-store/src/logs/service.rs:append_log
+  // Mirrors: rio-store/src/logs/gate.rs:check_append_open
   action openSessionAny = { nondet e = EXECS.oneOf() openSession(e) }
+  // Mirrors: rio-store/src/logs/gate.rs:check_append_open
   action openRejectedSupersededAny = { nondet e = EXECS.oneOf() openRejectedSuperseded(e) }
+  // Mirrors: rio-scheduler/src/db/open_attempts.rs:mint_pull_attempt_fenced
   action rewriteAssignmentAny = { nondet e = EXECS.oneOf() rewriteAssignment(e) }
+  // Mirrors: rio-store/src/logs/gate.rs:check_append_open
   action openRejectedCompleteAny = { nondet e = EXECS.oneOf() openRejectedComplete(e) }
+  // Mirrors: rio-builder/src/log_upload.rs:drive
+  // Mirrors: rio-store/src/logs/ingest.rs:accept
   action appendHonestAny = { nondet e = EXECS.oneOf() appendHonest(e) }
+  // Mirrors: rio-builder/src/log_stream.rs:add_line
+  // (the rate-suppression drop arm -- the worker-side admitted
+  // hole).
   action appendWorkerGapAny = { nondet e = EXECS.oneOf() appendWorkerGap(e) }
+  // Mirrors: rio-store/src/logs/ingest.rs:accept
+  // (the adversary's batch through the production admission).
   action appendFabricatedAny = {
     nondet e = EXECS.oneOf()
     nondet lo = 0.to(MAX_LINE - 1).oneOf()
     nondet hi = 1.to(MAX_LINE).oneOf()
     appendFabricated(e, lo, hi)
   }
+  // Mirrors: rio-store/src/logs/ingest.rs:set_final_line_count
   action refreshCeilingAny = {
     nondet e = EXECS.oneOf()
     nondet s = SESSION_IDS.oneOf()
     refreshCeiling(e, s)
   }
+  // Mirrors: rio-store/src/logs/ingest.rs:cut
+  // Mirrors: rio-store/src/logs/ingest.rs:commit_chunk
   action cutChunkAny = {
     nondet e = EXECS.oneOf()
     nondet s = SESSION_IDS.oneOf()
     cutChunk(e, s)
   }
+  // Mirrors: rio-store/src/logs/ingest.rs:clamped_durable_ack
   action deliverAckAny = { nondet e = EXECS.oneOf() deliverAck(e) }
+  // Mirrors: rio-store/src/logs/service.rs:AppendDriver
   action builderDisconnectsAny = { nondet e = EXECS.oneOf() builderDisconnects(e) }
+  // Mirrors: rio-store/src/logs/service.rs:AppendDriver
   action sessionAbortsAny = {
     nondet e = EXECS.oneOf()
     nondet s = SESSION_IDS.oneOf()
     sessionAborts(e, s)
   }
+  // Mirrors: rio-builder/src/log_upload.rs:run_inner
   action uploaderAbandonsAny = { nondet e = EXECS.oneOf() uploaderAbandons(e) }
+  // Mirrors: rio-builder/src/log_upload.rs:UploadSink
   action uploaderDiesAny = { nondet e = EXECS.oneOf() uploaderDies(e) }
+  // Environment: the retention clock -- started_at ages past the
+  // TTL; the world's move (no production transition fires).
   action executionExpiresAny = { nondet e = EXECS.oneOf() executionExpires(e) }
+  // Mirrors: rio-store/src/logs/sweep.rs:sweep_expired_logs
   action sweepChunksAny = { nondet e = EXECS.oneOf() sweepChunks(e) }
+  // Mirrors: rio-scheduler/src/db/attempts.rs:gc_exec_rows
   action gcExecRowAny = { nondet e = EXECS.oneOf() gcExecRow(e) }
+  // Mirrors: rio-scheduler/src/db/mod.rs:close_assignments_sql
   action closeExecStampAny = { nondet e = EXECS.oneOf() closeExecStamp(e) }
+  // Mirrors: rio-scheduler/src/db/attempts.rs:gc_attempt_ledger
   action ledgerReleasesAny = { nondet e = EXECS.oneOf() ledgerReleases(e) }
 
   action step = any {
@@ -5385,6 +5440,9 @@ module logIngestLiveness {
   // One quiet tick on an open, empty-buffer session: time advances; the
   // producer (when present) emits its empty keepalive batch when its
   // period elapses — which IS inbound traffic at the store.
+  // Environment: the shared tick clock -- the world's move; the
+  // idle/keepalive deadlines are wall-time consults, no transition
+  // fires.
   action quietTick = all {
     ticks < MAX_TICKS,
     sessionOpen,
@@ -5402,6 +5460,9 @@ module logIngestLiveness {
 
   // The store's enforcement arm: empty buffer + inbound silence at the
   // bound => abort (the heartbeat-tick arm in service.rs).
+  // Mirrors: rio-store/src/logs/service.rs:INBOUND_IDLE_BOUND
+  // (the inbound-idle abort consult of
+  // rio_common::liveness::INBOUND_IDLE_ABORT).
   action idleAbortFire = all {
     sessionOpen,
     not(idleAborted),
@@ -5419,6 +5480,8 @@ module logIngestLiveness {
 
   // The execution switch: a retry replaces the serving execution; any
   // existing attachment is severed (its follow stream ended).
+  // Mirrors: rio-store/src/logs/service.rs:serve_tail
+  // (the exec-switch arm).
   action execSwitch = all {
     servingExec == 1,
     servingExec' = 2,
@@ -5436,6 +5499,8 @@ module logIngestLiveness {
   // execution's identity AT attach time; without it (pre-fix), the
   // observer keeps whatever stamp it last held — a reconnect across an
   // exec switch shows the dead execution as streaming.
+  // Mirrors: rio-store/src/logs/service.rs:serve_tail
+  // (the attach hello).
   action followAttach = all {
     not(attached),
     attached' = true,
@@ -5450,6 +5515,7 @@ module logIngestLiveness {
   }
 
   // Live fan-out delivery to an attached observer.
+  // Mirrors: rio-store/src/logs/service.rs:serve_tail
   action fanoutDeliver = all {
     attached,
     fanoutSeen' = true,
