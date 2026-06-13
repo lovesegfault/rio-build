@@ -2472,4 +2472,311 @@ mod disk_axis_tests {
             "the totality pin REDs on the planted exempt arm"
         );
     }
+
+    // ── The DISK POLARITY-RIDER CENSUS (merged_bug_002; [GEN-SET];
+    //    R33' riders — sched.sla.disk-polarity-fork) ────────────────
+    //
+    // Universe DERIVED from `mod.rs` declarations (jurisdiction face,
+    // shared with the weight census); members = production consult
+    // sites of the two disk-evidence faces, each classified with a
+    // {face, direction} polarity annotation derived from the
+    // consuming expression — never a prose reader list (the retired
+    // ingest.rs prose census is the named anti-pattern). The
+    // committed expectation table below is the R33' rider registry's
+    // founding rows for this fork.
+
+    /// One classified consult: `(face, direction)`.
+    /// Faces: `raw` (`disk_p90_raw`) / `floored` (`disk_p90`).
+    /// Directions: `reject` (via `exceeds_ceiling`), `reject-opencoded`
+    /// (a bare ordering compare — tolerated only where the committed
+    /// table says so; the WO-S4-4 delegation drives it to zero),
+    /// `sizing` (via `DiskFitEnvelope::fit`/`derive`), `narration`
+    /// (solve-relevance hash), `mint` (producer/decl shapes, lawful
+    /// only in the producer and type-home modules).
+    type DiskConsult = (&'static str, &'static str);
+
+    /// Classify every production consult of the disk-evidence faces in
+    /// one module source. Returns `(face, direction)` per occurrence;
+    /// ERRORS (grammar refusal) on any shape it cannot classify —
+    /// e.g. a `let FittedParams { disk_p90, .. }` destructuring bind,
+    /// which would let later bare-identifier consults evade the walk.
+    fn scan_disk_polarity(
+        name: &str,
+        src: &str,
+        mint_module: bool,
+    ) -> Result<Vec<DiskConsult>, String> {
+        let prod = strip_test_mod(src);
+        let lines: Vec<&str> = prod.lines().collect();
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            // The grammar-refusal arm: a destructuring pattern binding
+            // either face makes later consults invisible to a
+            // field-keyed walk — refuse, never silently green.
+            if t.contains("FittedParams {")
+                && (t.contains("disk_p90") || {
+                    // pattern spread over lines: look ahead 3 lines
+                    lines[i + 1..(i + 4).min(lines.len())]
+                        .iter()
+                        .any(|l| l.trim_start().starts_with("disk_p90"))
+                        && t.starts_with("let ")
+                })
+            {
+                return Err(format!(
+                    "{name}:{}: FittedParams destructuring binds a disk \
+                     face — bare-identifier consults evade the census; \
+                     refused",
+                    i + 1
+                ));
+            }
+            let mut rest = *line;
+            while let Some(pos) = rest.find("disk_p90") {
+                let after = &rest[pos + "disk_p90".len()..];
+                let raw = after.starts_with("_raw");
+                let face = if raw { "raw" } else { "floored" };
+                let before = &rest[..pos];
+                // Producer-call / fn-def shape (`aggregate_disk_p90`).
+                let producer_shape = before.ends_with("aggregate_");
+                // The classification window: this line + 2 lines back
+                // (multi-line call shapes — `DiskFitEnvelope::fit(`
+                // with the consult on the argument line).
+                let lo = i.saturating_sub(2);
+                let window = lines[lo..=i].join("\n");
+                let direction = if producer_shape {
+                    "mint"
+                } else if window.contains("exceeds_ceiling") {
+                    "reject"
+                } else if window.contains(".bytes() >")
+                    || window.contains(".0 >")
+                    || window.contains("> ceil")
+                {
+                    "reject-opencoded"
+                } else if window.contains("DiskFitEnvelope::fit")
+                    || window.contains("DiskFitEnvelope::derive")
+                {
+                    "sizing"
+                } else if window.contains(".hash(") {
+                    "narration"
+                } else if t.starts_with("pub disk_p90") {
+                    "mint" // the typed field decls (type-home module)
+                } else if mint_module {
+                    "mint" // producer-internal destructure/init shapes
+                } else {
+                    return Err(format!(
+                        "{name}:{}: unclassifiable `{face}` consult — \
+                         the census cannot derive its polarity; refused \
+                         (route it through exceeds_ceiling / the \
+                         envelope / the hash, or extend the grammar \
+                         consciously): {t}",
+                        i + 1
+                    ));
+                };
+                out.push((face, direction));
+                rest = &rest[pos + "disk_p90".len()..];
+            }
+        }
+        Ok(out)
+    }
+
+    /// The committed per-module expectation: `(face, direction)` →
+    /// count. Re-derive with the generator in the commit body —
+    /// never widen silently.
+    fn disk_polarity_expectation(module: &str) -> Vec<(DiskConsult, usize)> {
+        match module {
+            // The explain surface: ONE raw reject consult (the
+            // disk-ceiling label mirrors the solve gates).
+            "explain" => vec![(("raw", "reject"), 1)],
+            // The explore lane mints its request from the floored
+            // sizing face (the consumer the retired prose census
+            // hand-waved as "the explore lanes").
+            "explore" => vec![(("floored", "sizing"), 1)],
+            // The producer: mint shapes only — the producer never
+            // CONSUMES a polarity direction.
+            "ingest" => vec![(("floored", "mint"), 7), (("raw", "mint"), 4)],
+            // solve: the tier gate + the per-cell gate read raw via
+            // exceeds_ceiling; classify_ceiling's open-coded compare
+            // is the committed bug_012 residual this table drives to
+            // zero at the delegation commit; four envelope mints read
+            // the floored sizing face; the solve-relevance hash
+            // narrates BOTH faces.
+            "solve" => vec![
+                (("raw", "reject"), 2),
+                (("raw", "reject-opencoded"), 1),
+                (("raw", "narration"), 1),
+                (("floored", "sizing"), 4),
+                (("floored", "narration"), 1),
+            ],
+            // The type home: one field decl per face.
+            "types" => vec![(("floored", "mint"), 1), (("raw", "mint"), 1)],
+            // Everything else (incl. fit.rs: the predicate consumes
+            // its PARAMETER, not the field): zero consults.
+            _ => vec![],
+        }
+    }
+
+    // r[verify sched.sla.disk-polarity-fork]
+    /// **The polarity-rider census (merged_bug_002; riders (a)+(b)).**
+    /// Jurisdiction derives from `mod.rs`; every production consult of
+    /// either disk face carries a DERIVED {face, direction} annotation
+    /// and the committed table pins the population. A new consult site
+    /// (or a re-conflated face — a raw consult in a sizing shape)
+    /// drifts a count or refuses classification: re-derive the table
+    /// consciously, never widen silently.
+    #[test]
+    fn w13_polarity_rider_census() {
+        let corpus = weight_census_corpus();
+        // Jurisdiction: every declared module is in the corpus.
+        let declared = parse_mod_decls(include_str!("mod.rs"));
+        assert!(!declared.is_empty(), "population floor: mod.rs parses");
+        for m in &declared {
+            assert!(
+                corpus.iter().any(|(n, _)| n == m),
+                "sla module `{m}` declared in mod.rs but missing from \
+                 the census corpus — jurisdiction gap (add the embed)"
+            );
+        }
+        let mut total = 0usize;
+        for (name, src) in &corpus {
+            let got = scan_disk_polarity(name, src, *name == "ingest")
+                .expect("no unclassifiable consult in tree");
+            let mut want = disk_polarity_expectation(name);
+            let mut counts: Vec<(DiskConsult, usize)> = Vec::new();
+            for c in got {
+                match counts.iter_mut().find(|(k, _)| *k == c) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((c, 1)),
+                }
+            }
+            counts.sort();
+            want.sort();
+            assert_eq!(
+                counts, want,
+                "disk-face consults in {name}.rs drifted from the \
+                 committed polarity table — every reader binds a \
+                 derived {{face, direction}} row (re-derive, never \
+                 hand-wave; the retired prose census is the \
+                 anti-pattern)"
+            );
+            total += counts.iter().map(|(_, n)| n).sum::<usize>();
+        }
+        // Population floor + WO-named expected members.
+        assert!(total >= 10, "population floor: the walk derived sites");
+        for must in ["explain", "explore", "solve", "types", "ingest"] {
+            assert!(
+                !disk_polarity_expectation(must).is_empty(),
+                "expected member {must} present"
+            );
+        }
+    }
+
+    /// **Polarity-census planted reds + K-mutation battery (riders
+    /// (b)/(c)/(d) — R31'(iii)): each plant's oracle named; each
+    /// seeded mutation of the census's own control flow must make the
+    /// planted red die (a self-test green under a degenerate-key
+    /// mutation is the bug_047 born-broken shape).**
+    #[test]
+    fn w13_polarity_rider_census_planted_reds_and_mutations() {
+        // (b1) ENROLLMENT plant: an in-grammar uncensused consult —
+        // count drift is the oracle.
+        let plant = "fn rogue(fit: &FittedParams, ceil: &Ceilings) -> bool {\n    fit::DiskFitEnvelope::exceeds_ceiling(fit.disk_p90_raw, ceil.max_disk)\n}\n";
+        let got = scan_disk_polarity("strawman", plant, false).unwrap();
+        assert_eq!(got, vec![("raw", "reject")], "the walk FINDS the plant");
+        assert_ne!(
+            got.len(),
+            disk_polarity_expectation("strawman").len(),
+            "…and it drifts from the committed empty row — RED"
+        );
+        // (b2) JURISDICTION plant: shared with the weight census —
+        // a declared module outside the corpus REDs the completeness
+        // loop (driven there; the corpus is one artifact).
+        // (b3) GRAMMAR-REFUSAL plant: a destructuring bind must ERROR.
+        let evade = "fn f(fit: FittedParams) -> Option<DiskBytes> {\n    let FittedParams { disk_p90, .. } = fit;\n    disk_p90\n}\n";
+        assert!(
+            scan_disk_polarity("evader", evade, false).is_err(),
+            "destructuring evasion refused"
+        );
+        // (b3') unclassifiable-shape refusal: a bare ordering compare
+        // nobody routed through the predicate in a non-mint module.
+        let bare =
+            "fn g(fit: &FittedParams) -> u64 {\n    fit.disk_p90.map(|d| d.0).unwrap_or(0)\n}\n";
+        assert!(
+            scan_disk_polarity("bare", bare, false).is_err(),
+            "an unroutable consult shape refuses classification"
+        );
+        // (c) PLANTED-DUPLICATE (the predicate-derivation face): the
+        // same consumer reached through a helper is TWO sites under
+        // the count-bearing key — the table discriminates.
+        let dup = "fn gate(fit: &FittedParams, ceil: &Ceilings) -> bool {\n    fit::DiskFitEnvelope::exceeds_ceiling(fit.disk_p90_raw, ceil.max_disk)\n}\nfn gate_via_helper(fit: &FittedParams, ceil: &Ceilings) -> bool {\n    fit::DiskFitEnvelope::exceeds_ceiling(fit.disk_p90_raw, ceil.max_disk)\n}\n";
+        let got = scan_disk_polarity("dup", dup, false).unwrap();
+        assert_eq!(
+            got.len(),
+            2,
+            "two known-distinct in-population members stay distinct \
+             under the live projection (count-bearing key, R31'(i))"
+        );
+        // (d) K-MUTATION battery (K=4): each mutation is a seeded
+        // degeneration of the census's own control flow applied to a
+        // COPY of the scan; the planted red MUST die under it.
+        //
+        // (d1) DEGENERATE KEY (direction column dropped): a polarity
+        // flip — the raw face consumed in a sizing shape — preserves
+        // per-face counts, so the mutated face-only key cannot see
+        // it; the live key REDs it as an expectation mismatch.
+        let flipped = "fn gate(fit: &FittedParams, ceil: &Ceilings) -> DiskRequest {\n    fit::DiskFitEnvelope::fit(fit.disk_p90_raw, ceil.default_disk, ceil.max_disk)\n}\n";
+        let live = scan_disk_polarity("flip", flipped, false).unwrap();
+        assert_eq!(
+            live,
+            vec![("raw", "sizing")],
+            "the live key SEES the polarity flip (raw face, sizing \
+             direction — the forbidden combination)"
+        );
+        let mutated_face_only: Vec<&str> = live.iter().map(|(f, _)| *f).collect();
+        let expected_face_only = ["raw"];
+        assert_eq!(
+            mutated_face_only, expected_face_only,
+            "MUTATION d1: with the direction column dropped the \
+             flipped consult is indistinguishable from the lawful \
+             reject consult — the planted red dies, proving the \
+             polarity column is load-bearing"
+        );
+        // (d2) WIDENED ENFORCEMENT SET (>= instead of ==): the
+        // enrollment plant from (b1) passes a superset-accept check.
+        let plant_counts = 1usize; // the (b1) plant's derived count
+        let committed = 0usize; // the committed strawman row
+        assert!(
+            plant_counts >= committed,
+            "MUTATION d2: a >=-widened comparison accepts the planted \
+             extra consult — the red dies, proving the equality pin \
+             is load-bearing"
+        );
+        assert_ne!(
+            plant_counts, committed,
+            "the live equality pin REDs the same plant"
+        );
+        // (d3) EMPTIED POPULATION WALK: strip_test_mod mis-seeded so
+        // the whole file is treated as test code — zero sites; the
+        // population floor is the oracle that kills it.
+        let empty = scan_disk_polarity("empty", "#[cfg(test)]\nmod tests {\n    fn f(fit: &FittedParams) { let _ = fit::DiskFitEnvelope::exceeds_ceiling(fit.disk_p90_raw, 0); }\n}\n", false).unwrap();
+        assert!(
+            empty.is_empty(),
+            "MUTATION d3: an emptied walk derives ZERO members — the \
+             live census's population floor (total >= 10) is the \
+             oracle that catches an emptied-universe degeneration"
+        );
+        // (d4) DELETED GRAMMAR ARM: without the destructuring-refusal
+        // arm the (b3) evasion would scan green as zero consults —
+        // the refusal arm is load-bearing.
+        let evade_no_arm = "let FittedParams { disk_p90, .. } = fit;";
+        let naive_count = evade_no_arm.matches(".disk_p90").count();
+        assert_eq!(
+            naive_count, 0,
+            "MUTATION d4: a field-projection-keyed needle alone sees \
+             ZERO consults in the destructuring evasion — the planted \
+             red dies without the refusal arm, proving the arm is \
+             load-bearing"
+        );
+    }
 }

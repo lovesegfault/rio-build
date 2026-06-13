@@ -584,3 +584,27 @@ from kubelet. The compile-assert idiom for the periodic-refresh tier
 is `rio-common/src/liveness.rs` (the keepalive-vs-abort pair); the
 periodic-refresh and sensor-tier instances land with their owning
 components' closes and cite this rule.
+
+= Polarity Riders (R33' instance register)
+
+One producer mint feeding opposite-polarity readers is a standing
+failure class (round-13, merged_bug_002): a transform fused into a
+single-producer mint that is *conservative* for one reader direction is
+*anti-conservative* for the opposite direction, and a prose reader
+census cannot police the seam. Under R33' every such mint carries
+polarity+units in the type or a checked rider, consumers bind against
+it at their signatures, and the reader set with per-reader
+{direction, units} annotations is DERIVED by a census, never narrated.
+Each landed polarity close appends its instance row here.
+
+- *Warm disk evidence (scheduler sla)*: the sizing face (shrink-floored
+  `DiskBytes` --- never shrink below recent observed reality) and the
+  reject face (raw witnessed `RawDiskP90` --- a floor falsely rejects
+  all-fitting band populations) fork at the producer's single mint
+  behind one witness gate; the faces bind at consumer signatures
+  (`exceeds_ceiling` demands the raw type; the envelope mints demand
+  the floored type), so re-conflation fails to type-check, and the
+  polarity-rider census (`w13_polarity_rider_census`) derives every
+  consult site's {face, direction} row --- including the
+  reject-opencoded residual it drives to zero
+  (#rref("sched.sla.disk-polarity-fork")).
