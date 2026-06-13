@@ -114,6 +114,18 @@ test-group = 'postgres'
 slow-timeout = { period = "300s", terminate-after = 2 }
 
 [[profile.default.overrides]]
+# The bug_018 de-phased idle-eviction witnesses (W13-Y) span a real
+# INBOUND_IDLE_BOUND (60s const) plus the stamp-lag interval by
+# design: ~75s and ~105s green. NOT #[ignore]d — they are the R34
+# banner's wiring witnesses and run in every gate. PG-backed
+# (TestDb), so postgres group + a timeout above the generic budget.
+# Listed before the generic rio-store override so the longer timeout
+# wins.
+filter = 'package(rio-store) and (test(/idle_gate_evicts_wedged/) or test(/idle_trip_within_ceiling/))'
+test-group = 'postgres'
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+[[profile.default.overrides]]
 # binary(grpc) alone missed ~109 lib unit tests (gc::, metadata::,
 # cache_server::, signing::, content_index::, realisations::,
 # grpc::put_path::, grpc::admin::) that also use TestDb. Those ran in

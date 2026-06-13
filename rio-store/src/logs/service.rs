@@ -155,7 +155,7 @@ const PROXY_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 /// own producer under the bilateral contract -- never removed; R12
 /// re-points its cadence comments and budget math at these consts;
 /// the structural ingest-session-lease gates stay).
-const INBOUND_IDLE_BOUND: std::time::Duration = rio_common::liveness::INBOUND_IDLE_ABORT;
+pub(crate) const INBOUND_IDLE_BOUND: std::time::Duration = rio_common::liveness::INBOUND_IDLE_ABORT;
 
 /// Most inbound frames the housekeeping arm drains before consulting
 /// the idle predicate (bug_020). One fresh arrival is all the gate
@@ -174,10 +174,17 @@ const INBOUND_DRAIN_CAP: u32 = 64;
 ///   the moment the gate looks, which is what makes the evidence the
 ///   peer's and not the enforcer's.
 /// - `last_self_activity` — the enforcer's own occupancy: stamped
-///   when an in-arm or periodic cut attempt completes. The conjunct
-///   only ever DELAYS a trip; it exists so the enforcer's own cut
-///   stall (legally up to one watchdog bound plus a bounded ack
-///   send) cannot masquerade as peer silence.
+///   when a cut attempt that DID WORK completes (an in-arm cut run,
+///   or a periodic cut whose outcome was non-Empty — lines drained,
+///   a real attempt spent against the backend). A no-op tick is NOT
+///   activity (bug_018): a stamp an Empty cut can write would
+///   re-denominate this clock in the cut timer's SCHEDULE, and with
+///   the cut period at the idle bound the conjunct would hold the
+///   gate open forever — the wedged-but-connected builder the gate
+///   exists to evict would renew its lease indefinitely. The
+///   conjunct only ever DELAYS a trip; it exists so the enforcer's
+///   own cut stall (legally up to one watchdog bound plus a bounded
+///   ack send) cannot masquerade as peer silence.
 struct IdleClocks {
     last_drained_arrival: tokio::time::Instant,
     last_self_activity: tokio::time::Instant,
@@ -198,11 +205,17 @@ impl IdleClocks {
 /// pending AND both gate clocks past [`INBOUND_IDLE_BOUND`] —
 /// equivalently, `max(last-drained-arrival, last-self-activity)`
 /// elapsed at least the bound. The TRUE bound this states (the
-/// disclosed delay budget): under a slow-cut-then-silence schedule
-/// the trip is delayed by up to one cut occupancy (one watchdog bound
-/// plus a bounded ack send) past last arrival plus the idle bound —
-/// never earlier, and a genuinely silent peer with an idle enforcer
-/// still trips at exactly the bound.
+/// disclosed delay budget, bug_018's expanded form — the compile
+/// asserts beside [`idle_trip_worst_case`] pin it): past LAST
+/// ARRIVAL, the trip is delayed by at most the idle bound plus THREE
+/// cut-interval-denominated terms — the STAMP LAG (a sub-threshold
+/// final batch buffers until the next periodic tick, so the last
+/// occupancy stamp trails the last real work by up to one full
+/// interval), the occupied cut's watchdog bound, and its bounded ack
+/// send — plus one housekeeping consult quantum. Never earlier than
+/// the bound; and a genuinely silent peer with an idle enforcer
+/// still trips at exactly the bound, because a no-op periodic cut
+/// writes no occupancy stamp to delay it (bug_018).
 fn idle_trip_due(
     no_pending: bool,
     arrival_elapsed: std::time::Duration,
@@ -212,6 +225,106 @@ fn idle_trip_due(
         && arrival_elapsed >= INBOUND_IDLE_BOUND
         && self_activity_elapsed >= INBOUND_IDLE_BOUND
 }
+
+/// The number of cut-interval-denominated terms in the idle gate's
+/// worst-case trip-delay expansion (bug_018, the R34 derivation):
+/// (1) the STAMP LAG — a sub-threshold final batch buffers until the
+/// next periodic tick, so the last occupancy stamp trails the last
+/// real arrival by up to one full interval; (2) the occupied cut's
+/// watchdog bound — [`LogServiceImpl::cut_bounded`] abandons a hung
+/// cut at one cut interval; (3) the bounded ack send —
+/// [`send_ack_bounded`]'s bound is one cut interval at its call
+/// sites. The occupied cut's budget is INTERVAL-denominated in this
+/// file (not a fixed constant), so any assert or validation that
+/// treated "one cut occupancy" as a constant would silently
+/// under-state the ceiling.
+pub(crate) const IDLE_OCCUPANCY_INTERVAL_TERMS: u32 = 3;
+
+/// Phase margin on top of the derived worst case before it is
+/// compared against the disclosed ceiling (R34: refresh period vs
+/// bound couplings carry their phase margin written down): timer
+/// coalescing and scheduler slop. One housekeeping quantum is ample —
+/// every term in [`idle_trip_worst_case`] is already a hard bound.
+pub(crate) const IDLE_TRIP_PHASE_MARGIN: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The DISCLOSED idle-eviction ceiling: a wedged-but-connected peer
+/// (stream open, lease renewing, nothing pending, no inbound
+/// traffic) is evicted within this much PAST ITS LAST ARRIVAL. The
+/// compile asserts below pin the shipped constants inside it; config
+/// validation ([`crate::config::Config::validate`]) holds operator
+/// `log_cut_interval` values to it from ABOVE.
+pub(crate) const IDLE_TRIP_DISCLOSED_CEILING: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
+/// The idle gate's worst-case trip delay PAST LAST ARRIVAL, in the
+/// expanded form (bug_018): `INBOUND_IDLE_BOUND` + the three
+/// cut-interval terms ([`IDLE_OCCUPANCY_INTERVAL_TERMS`]) + one
+/// housekeeping consult quantum ([`sessions::HEARTBEAT_INTERVAL`] —
+/// the predicate is only CONSULTED on housekeeping ticks). ONE
+/// producer of this arithmetic: the compile asserts, the config
+/// validation, and the e2e witnesses all consume this fn — a second
+/// hand-derivation is the drift the R33 single-producer rule
+/// forbids. Lossless const millis end-to-end (the
+/// `rio_common::liveness::worst_emission_gap` house idiom).
+#[must_use]
+pub(crate) const fn idle_trip_worst_case(cut_interval: std::time::Duration) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        INBOUND_IDLE_BOUND.as_millis() as u64
+            + IDLE_OCCUPANCY_INTERVAL_TERMS as u64 * cut_interval.as_millis() as u64
+            + sessions::HEARTBEAT_INTERVAL.as_millis() as u64,
+    )
+}
+
+/// The largest operator `log_cut_interval` the disclosed ceiling
+/// admits — the UPPER bound config validation enforces:
+/// `interval <= (ceiling − phase margin − idle bound − housekeeping) / 3`.
+/// At the shipped constants: (300 − 15 − 60 − 15) / 3 = 70 s. The
+/// round-trip compile asserts below pin this closed form to
+/// [`idle_trip_worst_case`] (sound AND tight), so it cannot drift
+/// from the producer arithmetic.
+pub(crate) const MAX_LOG_CUT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(
+    (IDLE_TRIP_DISCLOSED_CEILING.as_millis() as u64
+        - IDLE_TRIP_PHASE_MARGIN.as_millis() as u64
+        - INBOUND_IDLE_BOUND.as_millis() as u64
+        - sessions::HEARTBEAT_INTERVAL.as_millis() as u64)
+        / IDLE_OCCUPANCY_INTERVAL_TERMS as u64,
+);
+
+// The R34 static cadence-vs-bound witness (bug_018, the banner
+// instance; idiom: rio-common/src/liveness.rs's const-pair
+// conformance). The shipped cut cadence must keep the idle gate's
+// worst-case trip delay — bound + 3×interval + housekeeping, plus
+// the phase margin — inside the disclosed eviction ceiling. A
+// constant change that breaks the coupling (a longer default cut
+// interval, a shorter ceiling, a longer housekeeping quantum) is a
+// BUILD failure, not a latent liveness hole.
+const _: () = assert!(
+    idle_trip_worst_case(super::ingest::DEFAULT_CUT_INTERVAL).as_millis()
+        + IDLE_TRIP_PHASE_MARGIN.as_millis()
+        <= IDLE_TRIP_DISCLOSED_CEILING.as_millis(),
+    "the shipped cut cadence breaks the idle gate's disclosed eviction ceiling: \
+     INBOUND_IDLE_BOUND + 3x DEFAULT_CUT_INTERVAL + HEARTBEAT_INTERVAL + phase margin \
+     must fit inside IDLE_TRIP_DISCLOSED_CEILING (bug_018)"
+);
+// Round-trip pins for the closed-form MAX: sound (the admitted
+// maximum still fits the ceiling) and tight (one more second does
+// not) — the closed form cannot drift from `idle_trip_worst_case`.
+const _: () = assert!(
+    idle_trip_worst_case(MAX_LOG_CUT_INTERVAL).as_millis() + IDLE_TRIP_PHASE_MARGIN.as_millis()
+        <= IDLE_TRIP_DISCLOSED_CEILING.as_millis(),
+    "MAX_LOG_CUT_INTERVAL drifted from idle_trip_worst_case: the admitted maximum \
+     no longer fits the disclosed ceiling"
+);
+const _: () = assert!(
+    idle_trip_worst_case(std::time::Duration::from_secs(
+        MAX_LOG_CUT_INTERVAL.as_secs() + 1
+    ))
+    .as_millis()
+        + IDLE_TRIP_PHASE_MARGIN.as_millis()
+        > IDLE_TRIP_DISCLOSED_CEILING.as_millis(),
+    "MAX_LOG_CUT_INTERVAL is not tight: an interval above the admitted maximum \
+     still fits the ceiling, so the closed form under-admits"
+);
 
 /// Turns the owning replica's self-identity (the
 /// `log_ingest_sessions.replica_pod` value it registered at
@@ -1601,12 +1714,20 @@ impl AppendDriver {
                     }
                 }
                 _ = cut_interval.tick() => {
-                    let outcome = self.cut_once_if_nonempty(ack_tx).await;
-                    // The cut attempt occupied this loop regardless of
-                    // outcome: stamp self-activity so the idle gate
-                    // never blames the peer for a window the enforcer
-                    // spent on its own work (bug_020).
-                    clocks.last_self_activity = tokio::time::Instant::now();
+                    let (occupancy, outcome) = self.cut_once_if_nonempty(ack_tx).await;
+                    // Only a cut that DID WORK stamps self-activity
+                    // (bug_018): the stamp is occupancy EVIDENCE —
+                    // lines drained, an ack sent, a real attempt spent
+                    // against the backend — never the timer's own
+                    // schedule. An Empty tick stamps nothing: with the
+                    // cut period at the idle bound, a no-op stamp
+                    // would hold the self-activity conjunct
+                    // permanently fresh and the idle gate could never
+                    // trip — the wedged-but-connected builder the gate
+                    // exists to evict would renew its lease forever.
+                    if let CutOccupancy::Occupied = occupancy {
+                        clocks.last_self_activity = tokio::time::Instant::now();
+                    }
                     if let Some(exit) = outcome {
                         return exit;
                     }
@@ -1912,19 +2033,25 @@ impl AppendDriver {
 
     /// The periodic cut: at most one chunk per tick (the timer fires
     /// again in a minute; there is no need to drain a gap-fragmented
-    /// buffer in one tick).
+    /// buffer in one tick). Returns the attempt's occupancy verdict
+    /// alongside any exit, so the caller's idle-gate stamp is
+    /// denominated in EVIDENCE, not in this timer's schedule
+    /// (bug_018).
     async fn cut_once_if_nonempty(
         &mut self,
         ack_tx: &mpsc::Sender<Result<AppendLogAck, Status>>,
-    ) -> Option<LoopExit> {
-        match self.do_cut(ack_tx).await {
+    ) -> (CutOccupancy, Option<LoopExit>) {
+        let step = self.do_cut(ack_tx).await;
+        let occupancy = step.occupancy();
+        let outcome = match step {
             CutStep::Committed | CutStep::Empty => None,
             CutStep::Failed => self
                 .session
                 .should_abort()
                 .map(|r| LoopExit::AbortCannotCommit(self.abort_status(r))),
             CutStep::Exit(exit) => Some(exit),
-        }
+        };
+        (occupancy, outcome)
     }
 
     /// One cut attempt + the ack + the chunk-count cap.
@@ -2140,6 +2267,54 @@ enum CutStep {
     /// The stream must end now (the ack channel is closed, or the
     /// chunk cap was hit).
     Exit(LoopExit),
+}
+
+impl CutStep {
+    /// The occupancy verdict of this cut attempt (bug_018): did the
+    /// enforcer DO WORK this window? Total over the alphabet — every
+    /// variant decides explicitly, no wildcard arm.
+    fn occupancy(&self) -> CutOccupancy {
+        match self {
+            // Nothing pending, nothing performed: the attempt returned
+            // immediately. A no-op is not activity (R34: a stamp a
+            // no-op can write re-denominates the self-activity clock
+            // in the timer's schedule).
+            CutStep::Empty => CutOccupancy::NoOp,
+            // Lines drained + the bounded ack send.
+            CutStep::Committed => CutOccupancy::Occupied,
+            // A real attempt against a non-empty buffer that failed or
+            // was watchdog-abandoned — the enforcer legally occupied
+            // this loop for up to one watchdog bound, which is exactly
+            // the stall the self-activity conjunct exists to absolve.
+            // (Unbounded deferral through this arm is impossible: a
+            // non-empty buffer means pending lines, and pending lines
+            // already defer the trip via `no_pending`; three
+            // consecutive failures trip the failover abort.)
+            CutStep::Failed => CutOccupancy::Occupied,
+            // The stream is ending; the caller returns before any
+            // stamp could matter. Classified as occupied for totality
+            // (a cap refusal or closed ack channel followed real
+            // work).
+            CutStep::Exit(_) => CutOccupancy::Occupied,
+        }
+    }
+}
+
+/// Whether one periodic cut attempt counts as enforcer OCCUPANCY for
+/// the inbound-idle gate's self-activity clock (bug_018). The gate's
+/// doc names what counts: only outcomes that performed work stamp;
+/// `CutStep::Empty` — the timer fired, the buffer was empty, nothing
+/// happened — does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CutOccupancy {
+    /// Work was performed in this loop's stead: stamp
+    /// `IdleClocks::last_self_activity`.
+    Occupied,
+    /// A no-op tick: no stamp. With `cut_interval == INBOUND_IDLE_BOUND`
+    /// (the shipped default), stamping here would make the idle
+    /// gate's self-activity conjunct satisfiable only at an exact
+    /// timer-phase coincidence — structurally dead enforcement.
+    NoOp,
 }
 
 /// What `tail_log_stream` hands `serve_tail` when this replica holds
@@ -3176,6 +3351,287 @@ mod tests {
         assert!(
             status.message().contains("no inbound traffic"),
             "got: {status:?}"
+        );
+    }
+
+    /// W13-Y at the occupancy tier (bug_018): the periodic cut's
+    /// idle-gate stamp is denominated in occupancy EVIDENCE, total
+    /// over the `CutStep` alphabet — every variant decides
+    /// explicitly. `Empty` is the load-bearing cell: a no-op tick
+    /// writes no stamp (R34: refresh-on-no-op rejects); pre-fix it
+    /// stamped, and with the cut period equal to the idle bound the
+    /// self-activity conjunct was satisfiable only at an exact
+    /// timer-phase coincidence — the enforcement half of the
+    /// bilateral liveness contract was structurally dead.
+    #[test]
+    fn empty_cut_is_not_occupancy() {
+        assert_eq!(
+            CutStep::Empty.occupancy(),
+            CutOccupancy::NoOp,
+            "a no-op tick is not activity: an Empty stamp re-denominates the \
+             self-activity clock in the timer's schedule (bug_018)"
+        );
+        assert_eq!(
+            CutStep::Committed.occupancy(),
+            CutOccupancy::Occupied,
+            "lines drained + the bounded ack send: occupancy evidence"
+        );
+        assert_eq!(
+            CutStep::Failed.occupancy(),
+            CutOccupancy::Occupied,
+            "a real attempt that failed or was watchdog-abandoned occupied the \
+             loop — exactly the stall the conjunct exists to absolve"
+        );
+        assert_eq!(
+            CutStep::Exit(LoopExit::ClientFinished).occupancy(),
+            CutOccupancy::Occupied,
+            "exits follow real work; the caller returns before the stamp matters"
+        );
+    }
+
+    /// The R34 cadence-vs-bound pair, runtime twins of the compile
+    /// asserts beside `idle_trip_worst_case` (the
+    /// rio-common/src/liveness.rs conformance pattern): the
+    /// expanded-form arithmetic at the shipped constants, the
+    /// closed-form MAX round-trips (sound AND tight), and the planted
+    /// red — the wrong-direction check's blind spot.
+    #[test]
+    fn idle_trip_ceiling_arithmetic_and_negative_control() {
+        // The expanded form at the shipped constants:
+        // 60 (bound) + 3×60 (stamp lag + watchdog + ack) + 15
+        // (housekeeping consult) = 255 s.
+        assert_eq!(
+            idle_trip_worst_case(crate::logs::ingest::DEFAULT_CUT_INTERVAL),
+            std::time::Duration::from_secs(255)
+        );
+        // The closed-form operator maximum: (300 − 15 − 60 − 15)/3 = 70 s.
+        assert_eq!(MAX_LOG_CUT_INTERVAL, std::time::Duration::from_secs(70));
+        // Sound: the admitted maximum fits the disclosed ceiling.
+        assert!(
+            idle_trip_worst_case(MAX_LOG_CUT_INTERVAL) + IDLE_TRIP_PHASE_MARGIN
+                <= IDLE_TRIP_DISCLOSED_CEILING
+        );
+        // Tight: one more second does not.
+        assert!(
+            idle_trip_worst_case(MAX_LOG_CUT_INTERVAL + std::time::Duration::from_secs(1))
+                + IDLE_TRIP_PHASE_MARGIN
+                > IDLE_TRIP_DISCLOSED_CEILING
+        );
+        // The planted red (the clause-(iii) direction proof): a
+        // 10-minute operator interval — which a wrong-direction
+        // "> bound + margin" lower-bound check would PASS — violates
+        // the disclosed ceiling several times over.
+        assert!(
+            idle_trip_worst_case(std::time::Duration::from_secs(600)) + IDLE_TRIP_PHASE_MARGIN
+                > IDLE_TRIP_DISCLOSED_CEILING,
+            "a 10-minute cut interval inflates the worst-case eviction delay \
+             ~11x past the stated budget — the upper-bound validation refuses it"
+        );
+    }
+
+    /// W13-Y (bug_018), the de-phased end-to-end face: a
+    /// wedged-but-connected builder — stream open, ingest lease
+    /// renewing on the dedicated heartbeat task, nothing pending — is
+    /// evicted within the disclosed ceiling PAST ITS LAST ARRIVAL.
+    ///
+    /// Schedule (de-phased by construction): one REAL in-arm cut at
+    /// t≈0 (the over-threshold batch — arrival AND occupancy stamps
+    /// land together), then total silence with the request stream
+    /// held open. The cut interval is 40 s — de-phased against both
+    /// the 60 s idle bound and the 15 s housekeeping consult, so the
+    /// pre-fix coincidence cell does not exist at all: Empty ticks
+    /// stamp at {40,80,120,…} and the self-activity clock reads at
+    /// most 55 s at every consult — strictly inside the bound,
+    /// forever.
+    ///
+    /// PRE-FIX RED (recorded 2026-06-12, fix neutralized via the
+    /// one-line occupancy strawman `CutStep::Empty => Occupied`): no
+    /// idle abort within 240 s — past FOUR idle bounds — while the
+    /// session row's ingest lease stayed fresh (heartbeat renewing);
+    /// the panic carried both facts. POST-FIX GREEN: the Empty ticks
+    /// stop stamping and the trip fires at ~75 s past last arrival —
+    /// inside `idle_trip_worst_case(40 s) + phase margin = 210 s`,
+    /// never before the 60 s bound.
+    // r[verify store.log.ingest-idle-abort+2]
+    #[tokio::test]
+    async fn idle_gate_evicts_wedged_but_connected_builder_de_phased() {
+        let cut_interval = std::time::Duration::from_secs(40);
+        let h = harness_with(256, |s| {
+            s.with_ingest_config(IngestConfig {
+                // A handful of bytes forces the in-arm cut.
+                cut_threshold_bytes: 64,
+                cut_interval,
+                ..IngestConfig::default()
+            })
+        })
+        .await;
+        let mut client = h.client.clone();
+        let exec = seed_assignment(&h.db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+
+        let (tx, mut acks) = open_append(&mut client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open");
+
+        // The one real cut: an over-threshold batch drains in-arm;
+        // its completion stamps occupancy, its drain stamps arrival.
+        tx.send(batch_msg(0, &[&"x".repeat(80)])).await.unwrap();
+        let last_arrival = std::time::Instant::now();
+
+        // Wedged-but-connected: tx stays alive, nothing more is sent.
+        // The dedicated heartbeat task keeps renewing the ingest
+        // lease the whole time — eviction must come from the idle
+        // gate, nowhere else.
+        let budget = idle_trip_worst_case(cut_interval) + IDLE_TRIP_PHASE_MARGIN;
+        let deadline = last_arrival + budget + std::time::Duration::from_secs(30);
+        let status = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), acks.message()).await {
+                Ok(Ok(Some(_ack))) => continue, // the real cut's ack
+                Ok(Ok(None)) => panic!("the server half-closed without a status"),
+                Ok(Err(status)) => break status,
+                Err(_elapsed) => {
+                    if std::time::Instant::now() >= deadline {
+                        let lease_fresh: bool = sqlx::query_scalar(
+                            "SELECT (now() - heartbeat_at) < make_interval(secs => $1) \
+                             FROM log_ingest_sessions WHERE exec_id = $2",
+                        )
+                        .bind(sessions::SESSION_STALE_AFTER.as_secs_f64())
+                        .bind(exec)
+                        .fetch_one(&h.db.pool)
+                        .await
+                        .expect("session row exists while the stream is open");
+                        panic!(
+                            "W13-Y red: no idle abort within {budget:?} + 30 s of the \
+                             last arrival — past four idle bounds — while the ingest \
+                             lease is {} (the wedged-but-connected builder pins its \
+                             stream permit, byte budget, and TailLog routing forever; \
+                             the self-activity conjunct never goes stale because \
+                             Empty cuts stamp it)",
+                            if lease_fresh {
+                                "still FRESH (heartbeat renewing)"
+                            } else {
+                                "stale"
+                            }
+                        );
+                    }
+                }
+            }
+        };
+        let evicted_after = last_arrival.elapsed();
+        drop(tx);
+        assert_eq!(status.code(), tonic::Code::Aborted, "{status:?}");
+        assert!(
+            status.message().contains("no inbound traffic"),
+            "got: {status:?}"
+        );
+        assert!(
+            evicted_after >= INBOUND_IDLE_BOUND,
+            "the trip must never fire before the idle bound past last arrival \
+             (got {evicted_after:?})"
+        );
+        assert!(
+            evicted_after <= budget,
+            "W13-Y: eviction took {evicted_after:?} past last arrival — outside \
+             the disclosed ceiling {budget:?} (idle_trip_worst_case(cut interval) \
+             + phase margin)"
+        );
+    }
+
+    /// W13-Y, the stamp-lag face (bug_018 / PD-4): a SUB-THRESHOLD
+    /// final batch buffers until the next periodic tick, so the last
+    /// occupancy stamp trails the last real arrival by up to one full
+    /// cut interval — the surviving cadence coupling the expanded
+    /// ceiling form exists to absorb. The witness is denominated PAST
+    /// LAST ARRIVAL (never "past last occupancy", which would absorb
+    /// the stamp lag and blind this test to exactly that coupling).
+    ///
+    /// Schedule: one small batch at t≈0 (under the cut threshold — no
+    /// in-arm cut), then wedged-but-connected silence. The 40 s
+    /// periodic tick cuts the batch (the ack proves the lag), the
+    /// occupancy stamp lands at ~40 s, and the trip fires at
+    /// ~105 s past arrival: STRICTLY PAST the naive
+    /// bound-plus-housekeeping ceiling (75 s) — the un-expanded form
+    /// would have been falsified by this very schedule — and inside
+    /// the expanded one (210 s).
+    ///
+    /// PRE-FIX RED (recorded 2026-06-12, same strawman as the
+    /// de-phased witness above): no trip within the budget + 30 s of
+    /// last arrival; the Empty ticks after the one real cut kept the
+    /// conjunct fresh forever. POST-FIX GREEN: trip at ~105 s.
+    #[tokio::test]
+    async fn idle_trip_within_ceiling_after_sub_threshold_final_batch() {
+        let cut_interval = std::time::Duration::from_secs(40);
+        let h = harness_with(256, |s| {
+            s.with_ingest_config(IngestConfig {
+                // FAR above the batch: the final batch must buffer
+                // until the periodic tick (the stamp lag).
+                cut_threshold_bytes: 4096,
+                cut_interval,
+                ..IngestConfig::default()
+            })
+        })
+        .await;
+        let mut client = h.client.clone();
+        let exec = seed_assignment(&h.db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+
+        let (tx, mut acks) = open_append(&mut client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open");
+
+        // The sub-threshold final batch: buffered, not cut in-arm.
+        tx.send(batch_msg(0, &["tail-line"])).await.unwrap();
+        let last_arrival = std::time::Instant::now();
+
+        let budget = idle_trip_worst_case(cut_interval) + IDLE_TRIP_PHASE_MARGIN;
+        let deadline = last_arrival + budget + std::time::Duration::from_secs(30);
+        let mut last_ack_at = None;
+        let status = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), acks.message()).await {
+                Ok(Ok(Some(_ack))) => {
+                    // The periodic cut's ack — the occupancy stamp's
+                    // wall-clock witness.
+                    last_ack_at = Some(last_arrival.elapsed());
+                }
+                Ok(Ok(None)) => panic!("the server half-closed without a status"),
+                Ok(Err(status)) => break status,
+                Err(_elapsed) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "W13-Y red (stamp-lag face): no idle abort within {budget:?} \
+                         + 30 s of the last arrival — the Empty ticks after the one \
+                         real periodic cut keep the self-activity conjunct fresh \
+                         forever"
+                    );
+                }
+            }
+        };
+        let evicted_after = last_arrival.elapsed();
+        drop(tx);
+        assert_eq!(status.code(), tonic::Code::Aborted, "{status:?}");
+        assert!(
+            status.message().contains("no inbound traffic"),
+            "got: {status:?}"
+        );
+        let last_ack_at = last_ack_at.expect("the periodic cut acked the buffered batch");
+        assert!(
+            last_ack_at >= std::time::Duration::from_secs(30),
+            "the final batch must have buffered until the periodic tick \
+             (~40 s), not cut in-arm — got an ack at {last_ack_at:?}: the \
+             stamp-lag schedule did not arm"
+        );
+        assert!(
+            evicted_after > INBOUND_IDLE_BOUND + sessions::HEARTBEAT_INTERVAL,
+            "PD-4's honesty witness: the trip at {evicted_after:?} past last \
+             arrival should land STRICTLY PAST the naive bound+housekeeping \
+             ceiling ({:?}) — if it doesn't, the stamp lag never happened and \
+             this schedule stopped certifying the expanded form",
+            INBOUND_IDLE_BOUND + sessions::HEARTBEAT_INTERVAL
+        );
+        assert!(
+            evicted_after <= budget,
+            "W13-Y (stamp-lag face): eviction took {evicted_after:?} past last \
+             arrival — outside the disclosed expanded ceiling {budget:?}"
         );
     }
 

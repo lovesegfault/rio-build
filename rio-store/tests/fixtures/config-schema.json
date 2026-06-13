@@ -192,7 +192,7 @@
         "default": 100000
       },
       "log_cut_interval_secs": {
-        "description": "Periodic chunk-cut cadence for `AppendLog` streams: a non-empty\ningest buffer is flushed to S3 at least this often, so a\nscheduler-visible log is never more than this far behind the\nbuilder. Also the basis for the gray-failure staleness abort\n(2× this). Default 60 s. Env: `RIO_LOG_CUT_INTERVAL_SECS`.",
+        "description": "Periodic chunk-cut cadence for `AppendLog` streams: a non-empty\ningest buffer is flushed to S3 at least this often, so a\nscheduler-visible log is never more than this far behind the\nbuilder. Also the basis for the gray-failure staleness abort\n(2× this) AND three terms of the inbound-idle eviction delay\n(stamp lag + cut watchdog + ack bound, each up to one\ninterval — bug_018), so validation caps it from ABOVE against\nthe disclosed idle-eviction ceiling (at the shipped constants:\n70 s max). Default 60 s. Env: `RIO_LOG_CUT_INTERVAL_SECS`.",
         "type": "integer",
         "format": "uint64",
         "minimum": 0,

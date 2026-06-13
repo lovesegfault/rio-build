@@ -214,7 +214,11 @@ pub struct Config {
     /// ingest buffer is flushed to S3 at least this often, so a
     /// scheduler-visible log is never more than this far behind the
     /// builder. Also the basis for the gray-failure staleness abort
-    /// (2× this). Default 60 s. Env: `RIO_LOG_CUT_INTERVAL_SECS`.
+    /// (2× this) AND three terms of the inbound-idle eviction delay
+    /// (stamp lag + cut watchdog + ack bound, each up to one
+    /// interval — bug_018), so validation caps it from ABOVE against
+    /// the disclosed idle-eviction ceiling (at the shipped constants:
+    /// 70 s max). Default 60 s. Env: `RIO_LOG_CUT_INTERVAL_SECS`.
     #[serde(rename = "log_cut_interval_secs", with = "rio_common::config::secs")]
     #[schemars(with = "u64")]
     pub log_cut_interval: std::time::Duration,
@@ -609,6 +613,28 @@ impl rio_common::config::ValidateConfig for Config {
         anyhow::ensure!(
             !self.log_cut_interval.is_zero(),
             "log_cut_interval_secs must be >= 1; set RIO_LOG_CUT_INTERVAL_SECS"
+        );
+        // bug_018: the cut interval is three of the four terms in the
+        // idle gate's worst-case eviction delay (stamp lag + cut
+        // watchdog + ack bound, each up to one interval —
+        // `logs::service::idle_trip_worst_case` is the one producer of
+        // the arithmetic). An UPPER bound, deliberately: a large
+        // interval inflates how long a wedged-but-connected builder
+        // can pin its stream permit, byte budget, and ingest lease
+        // past the disclosed eviction ceiling. (A lower-bound check
+        // against the idle bound would have the WRONG direction — it
+        // would pass a 10-minute interval that stretches eviction
+        // ~11x past the stated budget.)
+        anyhow::ensure!(
+            self.log_cut_interval <= crate::logs::service::MAX_LOG_CUT_INTERVAL,
+            "log_cut_interval_secs ({}) must be <= {}: the idle gate's worst-case \
+             eviction delay (idle bound {}s + 3x cut interval + housekeeping, plus \
+             the phase margin) must stay inside the disclosed {}s ceiling past a \
+             wedged builder's last arrival; set RIO_LOG_CUT_INTERVAL_SECS",
+            self.log_cut_interval.as_secs(),
+            crate::logs::service::MAX_LOG_CUT_INTERVAL.as_secs(),
+            crate::logs::service::INBOUND_IDLE_BOUND.as_secs(),
+            crate::logs::service::IDLE_TRIP_DISCLOSED_CEILING.as_secs()
         );
         // merged_bug_082: a stall window of 0 disables matching
         // entirely (bricked substitution: every owner instantly
@@ -1122,6 +1148,50 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("log_cut_interval_secs"), "got: {err}");
+    }
+
+    /// bug_018: the cut interval validates from ABOVE against the
+    /// idle gate's disclosed eviction ceiling (the
+    /// `logs::service::idle_trip_worst_case` expanded form) — the
+    /// boundary value is admitted, one second past it is refused, and
+    /// the refusal names the admitted maximum. Direction matters: a
+    /// lower-bound check ("> bound + margin") would PASS the
+    /// 10-minute interval this test refuses, stretching the
+    /// wedged-builder eviction ~11x past the stated budget.
+    #[test]
+    fn validate_caps_log_cut_interval_at_the_idle_ceiling() {
+        let max = crate::logs::service::MAX_LOG_CUT_INTERVAL;
+        let ok = Config {
+            database_url: "postgres://x".into(),
+            log_cut_interval: max,
+            ..Default::default()
+        };
+        ok.validate()
+            .expect("the boundary value (the admitted maximum) passes");
+
+        let over = Config {
+            database_url: "postgres://x".into(),
+            log_cut_interval: max + std::time::Duration::from_secs(1),
+            ..Default::default()
+        };
+        let err = over.validate().unwrap_err().to_string();
+        assert!(err.contains("log_cut_interval_secs"), "got: {err}");
+        assert!(
+            err.contains(&format!("must be <= {}", max.as_secs())),
+            "the refusal names the admitted maximum; got: {err}"
+        );
+
+        // The wrong-direction blind spot, refused: 10 minutes.
+        let ten_min = Config {
+            database_url: "postgres://x".into(),
+            log_cut_interval: std::time::Duration::from_secs(600),
+            ..Default::default()
+        };
+        assert!(
+            ten_min.validate().is_err(),
+            "a 10-minute interval must be refused — it passes a lower-bound \
+             check but inflates the disclosed eviction ceiling ~11x"
+        );
     }
 
     /// merged_bug_082: a stall window of 0 bricks substitution and one
