@@ -6,7 +6,7 @@
 //! The producer (`rio-scheduler::sla::solve::cells_to_selector_terms`)
 //! emits exactly ONE `karpenter.sh/capacity-type` requirement per
 //! term, operator `In`, single-valued, value from the shared
-//! [`WireCapacity`](crate::cell_wire::WireCapacity)(crate::cell_wire::WireCapacity) alphabet. This decoder is a TOTAL match over the
+//! [`WireCapacity`](crate::cell_wire::WireCapacity) alphabet. This decoder is a TOTAL match over the
 //! multiplicity × operator × arity product of that shape —
 //! merged_bug_039 hardened the scheduler's consumer
 //! (`decode_capacity_requirement`) against the
@@ -20,10 +20,10 @@
 //!
 //! Refusals are TYPED, never truncations ([`CapacityTermDefect`](crate::k8s::capacity_term::CapacityTermDefect), a
 //! closed alphabet — R14): consumers fold the partition into their
-//! own refusal lanes ([`CapacityTermDefect::is_structural`](crate::k8s::capacity_term::CapacityTermDefect::is_structural)(crate::k8s::capacity_term::CapacityTermDefect::is_structural) splits
+//! own refusal lanes ([`CapacityTermDefect::is_structural`](crate::k8s::capacity_term::CapacityTermDefect::is_structural) splits
 //! the scheduler's `ArmEchoSkewed` pairing lanes from its
 //! `PlaneEntryUndecodable` shape lanes;
-//! [`CapacityTermDefect::render`](crate::k8s::capacity_term::CapacityTermDefect::render)(crate::k8s::capacity_term::CapacityTermDefect::render) reproduces the scheduler's refusal
+//! [`CapacityTermDefect::render`](crate::k8s::capacity_term::CapacityTermDefect::render) reproduces the scheduler's refusal
 //! strings byte-for-byte so the delegation is reader-invisible).
 
 use crate::cell_wire::WireCapacity;
