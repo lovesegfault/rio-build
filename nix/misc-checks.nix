@@ -1658,6 +1658,29 @@ in
         touch $out
       '';
 
+  # WO-S4-5 (D-4b, the merged_bug_002 class-killer; T3): doc-comment
+  # `](dest)(` adjacency — a duplicated link target the second of
+  # which renders as stray prose. rustdoc -D warnings stays green
+  # (the link itself resolves), so this is the only enforcement.
+  # Full-tree staging ((vvvvv)): the lint quantifies over rio-*/src
+  # + xtask/src rust sources via the shared lexer.
+  doc-link-adjacency =
+    pkgs.runCommand "rio-doc-link-adjacency"
+      {
+        src = pkgs.lib.cleanSource ../.;
+        nativeBuildInputs = [ pkgs.python3 ];
+        scanScript = ../nix/doc_link_adjacency.py;
+        sharedLexer = ../nix/rust_strip.py;
+        censusLib = ../nix/census_corpora.py;
+      }
+      ''
+        cp "$sharedLexer" rust_strip.py
+        cp "$censusLib" census_corpora.py
+        cp "$scanScript" doc_link_adjacency.py
+        python3 doc_link_adjacency.py "$src"
+        touch $out
+      '';
+
   transport-unary-ban =
     pkgs.runCommand "rio-transport-unary-ban"
       {

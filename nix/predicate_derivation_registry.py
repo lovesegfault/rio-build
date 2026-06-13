@@ -154,7 +154,17 @@ PROVENANCE = {
         r"MUTATIONS = \[",
         "WO-S9-8(iii): dead/constructed/exempt/unconsumed plants + "
         "K=4 via the shared harness; v1 jurisdiction disclosed",
-    ),}
+    ),
+    "doc-link-adjacency": (
+        "planted",
+        "nix/doc_link_adjacency.py",
+        r"MUTATIONS = \[",
+        "WO-S4-5 (W14-D5): the merged_bug_002 dup plant + the "
+        "single-target/later-paren/non-doc/string-literal greens; "
+        "K=4 via the shared harness (needle widened / population "
+        "emptied / adjacency-window broken / doc-narrowing dropped)",
+    ),
+}
 
 # The shrink-only debt pin: the committed debt set may only SHRINK
 # (landing a battery/derivation flips the row's kind); growth is an

@@ -182,6 +182,12 @@ REGISTRY = [
     # (iii) the R33 duplicate-derivation lint + the rationale-rot
     # sweep (OQ-14 latitude recorded in the module doc).
     ("duplicate-derivation-lint", "nix/duplicate_derivation_lint.py", r"plants wrong|self-test arms", {"scope"}, set(), r"R33_ROWS = \{"),
+    # bw14 S4 (WO-S4-5, D-4b): the doc-link `)(` adjacency lint --
+    # the merged_bug_002 class-killer (a duplicated link target the
+    # second of which renders as stray prose; rustdoc -D warnings has
+    # no signal). Needle derived from the CommonMark inline-link
+    # grammar; K-mutations via the shared harness.
+    ("doc-link-adjacency", "nix/doc_link_adjacency.py", r"self_battery", {"scope"}, set(), r"ADJACENCY_RE = re\.compile"),
 ]
 
 MODEL_DIVERGENCE = re.compile(
@@ -1572,6 +1578,8 @@ POPULATION_FLOORS = {
     # The WO-S9-8 round-13 bodies (each walks; each floors).
     "cadence-polarity-registries": ("nix/cadence_polarity_registries.py", r"population floor"),
     "model-letter-reachability": ("nix/model_letter_reachability.py", r"population floor"),
+    # bw14 S4 (WO-S4-5): the doc-link adjacency lint walks rio-*/src.
+    "doc-link-adjacency": ("nix/doc_link_adjacency.py", r"population floor"),
 }
 _WALK_RE = re.compile(r"\.r?glob\(")
 
