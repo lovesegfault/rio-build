@@ -220,6 +220,34 @@ gone.
   → `TimedOut` primary path.
 ]
 
+#r("ctrl.pool.eviction-grammar-pinned")[
+  A classifier quantifying over an EXTERNAL system's message grammar
+  MUST pin that grammar as in-repo fixtures sourced from the upstream
+  constants, with the upstream file and version named: the
+  pod-attributed eviction discriminator carries one needle per
+  kubelet local-storage grammar (emptyDir sizeLimit, pod-aggregate
+  ephemeral, per-container ephemeral --- `helpers.go`, kubernetes
+  v1.33), including lanes unreachable for the current fleet pod
+  shape, and the version-stamped battery renders every upstream
+  format --- positives and the ambient node-condition negatives alike
+  --- so upstream drift or a future pod-shape change flips a test
+  instead of silently inflating the `shape=other` readback.
+]
+
+The round-13 instance (merged_bug_036, the R31′(iv) jurisdiction
+exemplar): the inherited needle set matched two of kubelet's three
+pod-attributed grammars, the doc claimed "the two grammars are
+kubelet's own", and the fixtures were derived from the
+implementation's own needles --- structurally unable to detect the
+enumeration miss (the same class had already bitten pre-campaign:
+2acd1b32's string mismatch). The miss is LATENT for the current
+single-container requests==limits builder pod (kubelet checks
+emptyDir → pod → container in order, so the pod-aggregate lane fires
+first) and arms the moment a sidecar lands. The wire letter is
+unchanged: all three pod-attributed grammars fold to the same
+in-process split letter and `EvictedDiskPressure` wire reason --- the
+recorded carrier conditional did not fire (zero wire this close).
+
 #r("ctrl.pod.arch-selector+2")[
   When the pool's `spec.systems` resolves to a single _host_ CPU architecture,
   the controller MUST inject `kubernetes.io/arch={amd64|arm64}` into the Job

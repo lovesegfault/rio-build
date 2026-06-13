@@ -2035,10 +2035,10 @@ pub(super) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
         // the sub-shape grammar splits HERE, at the one site that
         // reads kubelet's message. POD-ATTRIBUTED shapes are
         // kubelet's own per-pod statement that THIS build exceeded
-        // ITS declared disk ("Usage of EmptyDir volume … exceeds the
-        // limit" from the eviction manager's emptyDirLimit lane;
-        // "ephemeral local storage" — spaces — from the per-pod
-        // limit lane) and carry none of I-199's ambiguity.
+        // ITS declared disk (the THREE upstream grammars pinned at
+        // POD_ATTRIBUTED_NEEDLES — emptyDir sizeLimit, pod-aggregate
+        // ephemeral, per-container ephemeral; merged_bug_036) and
+        // carry none of I-199's ambiguity.
         // NODE-CONDITION shapes ("DiskPressure"; the hyphenated
         // "ephemeral-storage" resource NAME, which only appears in
         // node-condition messages) stay ambient.
@@ -2095,16 +2095,55 @@ pub(super) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
     TerminationReason::Unknown
 }
 
+/// merged_bug_036 (R31′(iv) — jurisdiction extends where the law
+/// does): kubelet's POD-ATTRIBUTED local-storage eviction needles,
+/// one per upstream grammar, pinned to the upstream constants in
+/// `pkg/kubelet/eviction/helpers.go` (kubernetes v1.33). The
+/// localStorageEviction order is emptyDir → pod → container; the
+/// container lane is UNREACHABLE for the current single-container
+/// requests==limits builder pod shape (the pod-aggregate check fires
+/// first) and arms the moment a sidecar/multi-container pod lands —
+/// the needle is pinned NOW so that day flips nothing. The
+/// version-stamped fixture battery
+/// (`eviction_grammar_battery_pins_all_five_upstream_formats`)
+/// renders every upstream format, so kubelet grammar drift flips a
+/// test instead of silently inflating `shape=other` (the inherited
+/// needle set was hand-enumerated from the implementation's own
+/// fixtures and had already missed a grammar once — 2acd1b32's
+/// string mismatch, the recurrent class).
+pub(super) const POD_ATTRIBUTED_NEEDLES: [&str; 3] = [
+    // emptyDirMessageFmt:
+    //   "Usage of EmptyDir volume %q exceeds the limit %q. "
+    "EmptyDir volume",
+    // podEphemeralStorageMessageFmt:
+    //   "Pod ephemeral local storage usage exceeds the total limit
+    //    of containers %s. "
+    "ephemeral local storage",
+    // containerEphemeralStorageMessageFmt:
+    //   "Container %s exceeded its local ephemeral storage limit %q. "
+    //   (word order "local ephemeral storage" — disjoint from the
+    //   pod-aggregate lane's "ephemeral local storage").
+    "local ephemeral storage",
+];
+
 /// live060-f: is this eviction message kubelet's POD-ATTRIBUTED
 /// disk statement (the unambiguous sub-shapes the split letter
-/// names), as opposed to an ambient node-condition shape? The two
-/// grammars are kubelet's own: the eviction manager's emptyDirLimit
-/// lane says `Usage of EmptyDir volume "<name>" exceeds the limit`;
-/// the per-pod ephemeral limit lane says "ephemeral local storage"
-/// (spaces — the hyphenated "ephemeral-storage" is the resource
-/// name and only appears in node-condition messages).
+/// names), as opposed to an ambient node-condition shape? The THREE
+/// grammars are kubelet's own ([`POD_ATTRIBUTED_NEEDLES`] — emptyDir
+/// sizeLimit, pod-aggregate ephemeral, per-container ephemeral); the
+/// hyphenated "ephemeral-storage" is the resource NAME and only
+/// appears in node-condition messages.
+// r[impl ctrl.pool.eviction-grammar-pinned]
 pub(super) fn eviction_is_pod_attributed(msg: &str) -> bool {
-    msg.contains("EmptyDir volume") || msg.contains("ephemeral local storage")
+    classify_pod_attributed(&POD_ATTRIBUTED_NEEDLES, msg)
+}
+
+/// The needle engine, parameterized so the battery's mutation copies
+/// (needle-arm-deleted, needle-widened) run the SAME match logic as
+/// production (rider (d): mutations apply to copies under harness
+/// control; the production path is this exact fn).
+pub(super) fn classify_pod_attributed(needles: &[&str], msg: &str) -> bool {
+    needles.iter().any(|n| msg.contains(n))
 }
 
 /// `metav1.Time` → unix-epoch seconds (kube wraps `jiff::Timestamp`).
@@ -3018,54 +3057,151 @@ mod tests {
         }
     }
 
+    /// The upstream-pinned fixture battery (merged_bug_036,
+    /// R31′(iv)/OQ-13): ALL FIVE kubelet local-storage/eviction
+    /// message formats, transcribed from the upstream constants in
+    /// `pkg/kubelet/eviction/helpers.go` (kubernetes v1.33 —
+    /// emptyDirMessageFmt, podEphemeralStorageMessageFmt,
+    /// containerEphemeralStorageMessageFmt, nodeLowMessageFmt,
+    /// nodeConditionMessageFmt), rendered with representative
+    /// arguments. The battery is the jurisdiction PIN: upstream
+    /// grammar drift or a future sidecar flips a test here instead of
+    /// silently inflating `shape=other`. The node-condition formats
+    /// are REQUIRED members (rider (c)'s outside-but-adjacent face —
+    /// the needle-widened mutation must red on them).
+    const UPSTREAM_FORMATS: [(&str, bool); 5] = [
+        // emptyDirMessageFmt — pod-attributed (grammar 1).
+        (
+            "Usage of EmptyDir volume \"build\" exceeds the limit \"40Gi\". ",
+            true,
+        ),
+        // podEphemeralStorageMessageFmt — pod-attributed (grammar 2).
+        (
+            "Pod ephemeral local storage usage exceeds the total limit of containers 40Gi. ",
+            true,
+        ),
+        // containerEphemeralStorageMessageFmt — pod-attributed
+        // (grammar 3: the lane the inherited needle set missed; word
+        // order "local ephemeral storage". Latent for the current
+        // single-container requests==limits pod shape — kubelet
+        // checks emptyDir → pod → container in order — and armed by
+        // any future sidecar).
+        (
+            "Container builder exceeded its local ephemeral storage limit \"40Gi\". ",
+            true,
+        ),
+        // nodeLowMessageFmt — ambient node condition (NOT attributed).
+        ("The node was low on resource: ephemeral-storage. ", false),
+        // nodeConditionMessageFmt — ambient node condition.
+        ("The node had condition: [DiskPressure]. ", false),
+    ];
+
+    // r[verify ctrl.pool.eviction-grammar-pinned]
+    /// W13-D — per-format classification across the full upstream
+    /// battery.
+    ///
+    /// PRE-FIX RED (recorded verbatim in the commit body): grammar 3
+    /// classified `shape=other` — the needle set matched two of
+    /// kubelet's three pod-attributed grammars and the doc claimed
+    /// "the two grammars are kubelet's own"; the fixtures were
+    /// derived from the implementation's own needles, so the
+    /// enumeration miss was structurally invisible to them.
     #[test]
-    fn live060f_eviction_grammar_splits_pod_attributed_shapes() {
-        // The producer-half split (live060-f rider): the grammar
-        // discriminates kubelet's pod-attributed disk statements
-        // from ambient node-condition shapes; the WIRE letter stays
-        // the EvictedDiskPressure fold for both (the promote path is
-        // RULED pending the wire ritual — the split is observable
-        // through the per-shape readback counter today).
-        let pod = |reason: &str, msg: &str| Pod {
+    fn eviction_grammar_battery_pins_all_five_upstream_formats() {
+        let pod = |msg: &str| Pod {
             status: Some(k8s_openapi::api::core::v1::PodStatus {
-                reason: Some(reason.into()),
+                reason: Some("Evicted".into()),
                 message: Some(msg.into()),
                 ..Default::default()
             }),
             ..Default::default()
         };
-        // Pod-attributed sub-shapes (unambiguous):
-        assert!(eviction_is_pod_attributed(
-            "Usage of EmptyDir volume \"build\" exceeds the limit \"40Gi\"."
-        ));
-        assert!(eviction_is_pod_attributed(
-            "Pod ephemeral local storage usage exceeds the total limit of containers 40Gi."
-        ));
-        // Node-condition shapes (ambient — NOT pod-attributed):
-        assert!(!eviction_is_pod_attributed(
-            "The node was low on resource: ephemeral-storage."
-        ));
-        assert!(!eviction_is_pod_attributed(
-            "The node had condition: [DiskPressure]."
-        ));
-        // The wire fold is unchanged for every disk shape (the
-        // carrier has no split value — zero-wire ledger):
-        for msg in [
-            "Usage of EmptyDir volume \"build\" exceeds the limit \"40Gi\".",
-            "Pod ephemeral local storage usage exceeds the total limit of containers 40Gi.",
-            "The node was low on resource: ephemeral-storage.",
-            "The node had condition: [DiskPressure].",
-        ] {
+        for (msg, attributed) in UPSTREAM_FORMATS {
             assert_eq!(
-                pod_termination_reason(&pod("Evicted", msg)),
+                eviction_is_pod_attributed(msg),
+                attributed,
+                "upstream format classification: {msg}"
+            );
+            // W13-D2: the WIRE fold is unchanged for every disk shape
+            // (the carrier has no split value — the zero-wire ledger;
+            // the recorded conditional DID NOT FIRE: grammar 3 routes
+            // through the same controller-local classifier and the
+            // same EvictedDiskPressure fold as grammars 1-2, no
+            // wire-carried value needed).
+            assert_eq!(
+                pod_termination_reason(&pod(msg)),
                 TerminationReason::EvictedDiskPressure,
                 "wire fold preserved for: {msg}"
             );
         }
         assert_eq!(
-            pod_termination_reason(&pod("Evicted", "memory pressure")),
+            pod_termination_reason(&pod("memory pressure")),
             TerminationReason::EvictedOther
         );
+    }
+
+    // r[verify ctrl.pool.eviction-grammar-pinned]
+    /// W13-D3 — the battery's own kill power (rider (d), adapted to
+    /// the keyless match-predicate shape; the degenerate-key face is
+    /// INAPPLICABLE — no key projection exists). Two inline
+    /// mutations, each applied to a COPY of the classifier through
+    /// the SAME engine production runs:
+    /// (1) needle-arm-deleted — each needle removed in turn must red
+    ///     its own grammar's classification (the needle↔grammar map
+    ///     is a bijection: the three needles are pairwise disjoint
+    ///     substrings across the three formats);
+    /// (2) needle-widened to superset-accept — must red the
+    ///     node-condition negative fixtures (which is WHY they are
+    ///     REQUIRED battery members, not incidental asserts).
+    #[test]
+    fn eviction_grammar_battery_kill_power_under_mutations() {
+        // M1 — needle-arm-deleted: dropping needle i flips exactly
+        // grammar i's verdict (and only it) across the battery.
+        for (i, _) in POD_ATTRIBUTED_NEEDLES.iter().enumerate() {
+            let mutated: Vec<&str> = POD_ATTRIBUTED_NEEDLES
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, n)| *n)
+                .collect();
+            let mut killed = 0;
+            for (msg, attributed) in UPSTREAM_FORMATS {
+                if classify_pod_attributed(&mutated, msg) != attributed {
+                    killed += 1;
+                }
+            }
+            assert_eq!(
+                killed, 1,
+                "M1: deleting needle {i} must red exactly its own \
+                 grammar's pin (the planted red dies)"
+            );
+        }
+
+        // M2 — needle-widened (superset-accept): each widening must
+        // die on the REQUIRED negative members, and the two
+        // widenings' kill sets jointly cover both node-condition
+        // formats (which is WHY they are battery members, not
+        // incidental asserts). "ephemeral" is the realistic drift
+        // (the resource NAME appears in the nodeLow message);
+        // "node" is the canonical superset plant (matches both
+        // ambient formats, no positive).
+        for (widening, expect_killed) in [("ephemeral", 1usize), ("node", 2usize)] {
+            let widened: Vec<&str> = [widening]
+                .into_iter()
+                .chain(POD_ATTRIBUTED_NEEDLES)
+                .collect();
+            let mut killed = 0;
+            for (msg, attributed) in UPSTREAM_FORMATS {
+                if classify_pod_attributed(&widened, msg) != attributed {
+                    killed += 1;
+                }
+            }
+            assert_eq!(
+                killed, expect_killed,
+                "M2 ({widening:?}): the widened needle must red the \
+                 node-condition negatives its superset swallows"
+            );
+        }
     }
 
     /// `is_pending_job`: active AND ready==0. live_056-b retired the
