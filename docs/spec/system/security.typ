@@ -248,15 +248,25 @@ typed observation budget this rule requires.
 
 == Executor Pod Security
 
-#r("sec.pod.host-users-false")[
+#r("sec.pod.host-users-false+2")[
   Executor pods MUST set `hostUsers: false` to activate Kubernetes
-  user-namespace isolation (K8s 1.33+). Container UIDs are remapped to
+  user-namespace isolation (K8s 1.33+) on every cluster where the FUSE
+  passthrough chain supports it. Container UIDs are remapped to
   unprivileged host UIDs; `CAP_SYS_ADMIN` applies only within the user
   namespace. A container escape gaining `CAP_SYS_ADMIN` cannot affect the host
   or other pods. See @sec-rationale-privileged. The `privileged: true` escape
   hatch (for clusters whose containerd lacks `base_runtime_spec` device
   injection) skips `hostUsers: false` --- privileged containers cannot be
-  user-namespaced.
+  user-namespaced. RECORDED EXCEPTION (I-186, pinned until P0560): the
+  production builder pools run `hostUsers: true` because the deployed
+  kernel/containerd FUSE-passthrough chain refuses idmapped opens on
+  user-namespaced pods; the compensating controls under that posture are
+  the builder-minted project-quota path (`ensure_project_quota` ---
+  `CAP_SYS_ADMIN` + `FS_IOC_FSSETXATTR` + `PROJINHERIT`, range-disciplined
+  below kubelet's `1048576+` allocator) and the wave-13 sanitization
+  boundary (the executor's overlay/chroot). The MUST re-engages
+  unconditionally when P0560 (kernel/containerd idmapped-FUSE support)
+  lands and the I-186 pin is retired.
 ]
 
 // rule-id is historical; mechanism is base_runtime_spec since ADR-021 §7

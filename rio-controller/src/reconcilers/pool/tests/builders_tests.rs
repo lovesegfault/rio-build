@@ -321,7 +321,7 @@ fn job_pod_kvm_privileged_keeps_toleration() {
     );
 }
 
-// r[verify sec.pod.host-users-false]
+// r[verify sec.pod.host-users-false+2]
 #[test]
 fn job_pod_host_users_false_when_unprivileged() {
     // hostUsers:false → K8s user-namespace isolation. Container UIDs
@@ -337,7 +337,7 @@ fn job_pod_host_users_false_when_unprivileged() {
     );
 }
 
-// r[verify sec.pod.host-users-false]
+// r[verify sec.pod.host-users-false+2]
 // r[verify ctrl.crd.host-users-network-exclusive]
 #[test]
 fn host_users_suppressed_when_host_network() {
@@ -366,7 +366,7 @@ fn host_users_suppressed_when_host_network() {
     assert_eq!(pod.host_network, Some(true));
 }
 
-// r[verify sec.pod.host-users-false]
+// r[verify sec.pod.host-users-false+2]
 #[test]
 fn host_users_false_when_neither_escape_hatch() {
     // Positive control: when NEITHER escape hatch is active
@@ -398,7 +398,7 @@ fn host_users_false_when_neither_escape_hatch() {
     assert_eq!(pod.host_network, None);
 }
 
-// r[verify sec.pod.host-users-false]
+// r[verify sec.pod.host-users-false+2]
 // r[verify sec.pod.fuse-device-plugin]
 #[test]
 fn job_pod_privileged_escape_hatch_uses_hostpath() {

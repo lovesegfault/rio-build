@@ -711,7 +711,7 @@ pub fn build_executor_pod_spec(
             .filter(|&h| h)
             .map(|_| "ClusterFirstWithHostNet".into()),
 
-        // r[impl sec.pod.host-users-false]
+        // r[impl sec.pod.host-users-false+2]
         // User-namespace isolation. See ADR-012. Incompatible with
         // privileged, hostNetwork, and hostPath /dev/fuse. The
         // spec.hostUsers override handles containerd<2.1 cgroup
