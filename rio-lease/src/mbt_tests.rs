@@ -892,7 +892,7 @@ const CRASH_RECOVER_RENEW_RUN: &[Action] = &[
 /// `leaderElectionVanishMbt`): n1 acquires the born-empty lease, an
 /// operator deletes the lease object out of band, n1's next read
 /// observes the 404 and EXITS BELIEF AT THE READ (bug_143's law),
-/// then n1's own create re-acquires at the SAME generation (its own
+/// then n1's own create re-acquires at the same generation (its own
 /// claim row sits at the floor — the false-alarm shape, but for an
 /// out-of-band deletion instead of a connectivity blip). The per-step
 /// diff at `ApiGet("n1")`-after-vanish is the deletion-MBT's

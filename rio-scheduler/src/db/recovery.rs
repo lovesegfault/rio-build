@@ -580,7 +580,7 @@ impl SchedulerDb {
 /// The 4-cell map (merged_bug_301), extracted: the durable-row
 /// aggregates → [`ClosureEvidence`](rio_evidence_kernel::ClosureEvidence).
 /// One pure fn so the SQL caller and the kani agreement harness
-/// (`durable_row_classifier_agrees_with_kernel`) consume the SAME
+/// (`durable_row_classifier_agrees_with_kernel`) consume the same
 /// formula.
 ///
 /// Row shape (the [`CLASSIFY_EVIDENCE_SQL`] aggregates):
@@ -701,7 +701,7 @@ mod durable_evidence_proofs {
         );
     }
 
-    /// Totality + the named cell boundaries: every (i64, Option<bool>,
+    /// Total + panic-free over the named cell boundaries: every (i64, Option<bool>,
     /// Option<bool>) input — including the SQL-unreachable shapes
     /// (negative `n_children`, non-NULL aggregates at n=0) — maps to
     /// exactly one of the four cells without panic, and the iff-edges
