@@ -2411,6 +2411,7 @@ rec {
     # watermark (see the val's doc in the model) and the per-ack
     # durability claim is only made for the honest uploader.
     # r[verify store.log.completeness-gate]
+    # r[verify store.log.frontier-denominated]
     quint-log-service-base = mkQuintCheck {
       name = "log-service-base";
       spec = "logService";
@@ -2420,6 +2421,13 @@ rec {
         "noCrossExecContamination"
         "authGateExcludesUnassignedWriters"
         "noSilentLineLoss"
+        # bughunt-13 F9: asserted in the FABRICATION regimes too — the
+        # ack clamp (deliverAck mirrors ingest.rs::clamped_durable_ack /
+        # CoverageMap::contiguous_prefix_end, the merged_bug_005 close)
+        # makes a hole-spanning ack unrepresentable, so the old
+        # fabrication withholding reason is dead; the falsify twin is
+        # quint-log-service-calib-unclamped-ack.
+        "ackImpliesDurable"
         "servedSpanExact"
         "completeLogServesAllProduced"
         "completenessGate"
@@ -2534,6 +2542,9 @@ rec {
         "producerLossCounted"
         "ingestLossCounted"
         "noSilentLineLoss"
+        # bughunt-13 F9: fabrication-enabled regime — the clamped ack
+        # holds here too (see quint-log-service-base's note).
+        "ackImpliesDurable"
         "servedSpanExact"
         "completeLogServesAllProduced"
         "completenessGate"
@@ -2696,6 +2707,20 @@ rec {
       spec = "logService";
       main = "logServiceCalibSessionCaps";
       witness = "acceptedWithinCap";
+    };
+
+    # CALIBRATION (expect-violation), bughunt-13 F9 falsify twin: the
+    # pre-merged_bug_005 unclamped ack producer (the chunk's own end,
+    # hole-spanning) lets a fabricated high chunk's ack prefix-pop real
+    # un-stored lines — ackImpliesDurable falsifies (fabricate
+    # [k, k+1), cut, unclamped ack -> ackedBelow = k+1 with [0, k)
+    # never durable). Pins that the live regimes' everywhere-asserted
+    # ackImpliesDurable actually rides the deliverAck clamp.
+    quint-log-service-calib-unclamped-ack = mkQuintWitnessCheck {
+      name = "log-service-calib-unclamped-ack";
+      spec = "logService";
+      main = "logServiceCalibUnclampedAck";
+      witness = "ackImpliesDurable";
     };
 
     # CALIBRATION (expect-violation): the open gate without the

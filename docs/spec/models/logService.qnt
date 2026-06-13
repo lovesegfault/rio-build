@@ -466,6 +466,14 @@ module logService {
   /// that `acceptedWithinCap` falsifies under it.
   const CALIB_SESSION_SCOPED_CAPS: bool
 
+  /// CALIBRATION ONLY (`logServiceCalibUnclampedAck`): re-encode the
+  /// pre-merged_bug_005 ack producer — `deliverAck` sends the committed
+  /// chunk's own end, never clamped to the contiguous durable frontier
+  /// (the hole-spanning wire value the clamp removed). Production
+  /// regimes bind false; the calibration check pins that
+  /// `ackImpliesDurable` falsifies under it (the bughunt-13 F9 twin).
+  const CALIB_UNCLAMPED_ACK: bool
+
   /// CALIBRATION ONLY (`logServiceCalibGateRow`): drop the
   /// assignment-row conjunct from the open gate — the pre-fix shape
   /// where admission never consulted the claimed exec's own row.
@@ -1364,34 +1372,39 @@ module logService {
       uploaderAbandoned(e),
     }))
 
-  /// The conservation law's load-bearing refinement FOR THE HONEST
-  /// UPLOADER: a line leaves the retransmit buffer only when an ack
-  /// covers it, an ack is sent only after the chunk's manifest INSERT
-  /// commits, and the honest uploader's batches are contiguous from its
-  /// acked watermark — so every line below that watermark is durably in
-  /// the manifest until the TTL sweep (the one sanctioned deleter)
-  /// removes it. This is the invariant that falsifies if an ack is ever
-  /// emitted before the manifest commit, or if anything other than the
-  /// sweep deletes a manifest row (an early ack lets the builder trim a
-  /// line that a store-side abort then silently drops, with no replay
-  /// and no disclosure beyond the log never completing).
+  /// The conservation law's load-bearing refinement: a line leaves the
+  /// retransmit buffer only when an ack covers it, an ack is sent only
+  /// after the chunk's manifest INSERT commits, and every ack VALUE is
+  /// clamped to the contiguous durable frontier (merged_bug_005:
+  /// `clamped_durable_ack` = min(natural end, frontier); no ack at all
+  /// when nothing new is contiguously durable from line 0) — so every
+  /// line below the acked watermark is durably in the manifest until
+  /// the TTL sweep (the one sanctioned deleter) removes it. This is
+  /// the invariant that falsifies if an ack is ever emitted before the
+  /// manifest commit, if anything other than the sweep deletes a
+  /// manifest row, or if any producer re-grows a hole-spanning ack
+  /// value (an early or unclamped ack lets the builder prefix-pop a
+  /// line that was never durably stored, with no replay and no
+  /// disclosure beyond the log never completing).
   ///
-  /// NOT asserted in the fabrication-enabled regimes, by design: the
-  /// acked watermark is a max over committed chunk ENDS
-  /// (`log_upload.rs::trim` sets `last_acked_line =
-  /// max(durable_through_line)` and pops every frame whose last line
-  /// the ack covers), so a client that violates the LogBatcher's
-  /// monotone-numbering contract — sending a high-numbered fabricated
-  /// batch before its real low-numbered lines — gets an ack for the
-  /// fabricated chunk that pops the real lines' frames from its own
-  /// retransmit buffer without their ever being stored. The model
-  /// reaches that state (fabricate [k, k+1), cut, ack -> ackedBelow =
-  /// k+1 with [0, k) never durable) and the code does too. The loss is
-  /// confined to the contract-violating builder's own log and is
-  /// disclosed by the log never reading complete (`noSilentLineLoss`'s
-  /// fourth disjunct holds over the same trace in every regime); the
-  /// per-ack durability claim is simply not a property the code offers
-  /// to a client that mis-numbers its own lines.
+  /// Asserted in EVERY regime, fabrication included (bughunt-13 F9):
+  /// the pre-merged_bug_005 producer acked a committed chunk's own end
+  /// — a max over chunk ENDS — so a client violating the LogBatcher's
+  /// monotone-numbering contract (a high-numbered fabricated batch
+  /// before its real low-numbered lines) was acked past the manifest
+  /// hole and `discharge_through` prefix-popped the real lines' only
+  /// copy unstored. The clamp removed that producer from the code;
+  /// `deliverAck` carries the same clamp, so the analogous state
+  /// (ackedBelow past a manifest hole) is unreachable in every live
+  /// regime and a model-side clamp regression falsifies HERE, not
+  /// nowhere. The pre-fix producer survives only as the
+  /// `logServiceCalibUnclampedAck` calibration regime, whose wired
+  /// check pins that this invariant falsifies under it (fabricate
+  /// [k, k+1), cut, unclamped ack -> ackedBelow = k+1 with [0, k)
+  /// never durable). The fabricated tail a clamped ack never covers
+  /// stays in the un-acked buffer and is disclosed by the log never
+  /// reading complete (`noSilentLineLoss`'s fourth disjunct holds over
+  /// the same trace in every regime, unchanged).
   val ackImpliesDurable = EXECS.forall(e =>
     not(expired.get(e)) implies
       interval(0, ackedBelow.get(e)).forall(n => manifestHolds(e, n)))
@@ -2574,17 +2587,28 @@ module logService {
   }
 
   /// The builder receives the ack for one committed chunk of its
-  /// CURRENT Open session and trims every retransmit-buffer frame whose
-  /// last line the ack covers. The ack exists only because the chunk's
-  /// manifest INSERT committed (`do_cut` sends it after `cut` returns
-  /// the durable-through line), and it is deliverable only while the
-  /// builder still holds the stream that cut the chunk — a detached
-  /// session's drain acks go to a closed response stream. Acks arrive
-  /// in cut order on the wire; the trim is a max, so delivering any
-  /// single chunk's ack reaches the same watermark set as delivering
-  /// the ordered prefix up to it.
-  // Mirrors: service.rs::do_cut (the AppendLogAck send) +
-  //          log_upload.rs::trim.
+  /// CURRENT Open session and prefix-pops every retransmit-buffer frame
+  /// whose last line the ack covers (`discharge_through`). The ack
+  /// exists only because the chunk's manifest INSERT committed
+  /// (`do_cut` sends it after `cut` returns the durable-through value),
+  /// and it is deliverable only while the builder still holds the
+  /// stream that cut the chunk — a detached session's drain acks go to
+  /// a closed response stream. The ack VALUE is a contiguous-prefix
+  /// claim, never the chunk's own end (merged_bug_005, modeled at
+  /// bughunt-13 F9): every producer routes through
+  /// `clamped_durable_ack` = min(natural end, frontier), where the
+  /// frontier is `CoverageMap::contiguous_prefix_end` over the
+  /// execution's committed chunks — `coveredPrefixEnd(e)` here — and
+  /// NO ack is sent when the clamp yields nothing new (the code's
+  /// `None`/no-send arm is this action's enabling guard). Outside
+  /// holey states the clamp is the identity, so honest contiguous
+  /// traffic acks exactly what it always did; the prefix-pop is a max,
+  /// so delivering any single chunk's clamped ack reaches the same
+  /// watermark set as delivering the ordered prefix up to it.
+  // Mirrors: rio-store/src/logs/service.rs:do_cut
+  // Mirrors: rio-store/src/logs/ingest.rs:clamped_durable_ack
+  // Mirrors: rio-log-kernel/src/lib.rs:contiguous_prefix_end
+  // Mirrors: rio-builder/src/log_upload.rs:discharge_through
   action deliverAck(e: int): bool = all {
     readerUnchanged,
     refusedFrom' = refusedFrom,
@@ -2595,9 +2619,13 @@ module logService {
     all {
       s != 0,
       nondet c = chunks.get(e).filter(c => c.sess == s).oneOf()
+      // CALIB_UNCLAMPED_ACK re-encodes the pre-merged_bug_005 producer
+      // (the chunk's own end, hole-spanning) for the falsify twin.
+      val ackEnd = if (CALIB_UNCLAMPED_ACK) c.first + c.count
+                   else minInt(c.first + c.count, coveredPrefixEnd(e))
       all {
-        c.first + c.count > ackedBelow.get(e),
-        ackedBelow' = ackedBelow.put(e, c.first + c.count),
+        ackEnd > ackedBelow.get(e),
+        ackedBelow' = ackedBelow.put(e, ackEnd),
       },
     },
     dispatched' = dispatched,
@@ -3573,6 +3601,7 @@ module logServiceBase {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -3700,6 +3729,7 @@ module logServiceRedispatch {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -3792,6 +3822,7 @@ module logServiceResend {
     // witness), making the cap conjuncts non-vacuous here.
     CAP = 4,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -3880,6 +3911,7 @@ module logServiceSweep {
     ENABLE_SWEEP = true,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     // Mat dispatch ON since the close-stamp work: the immortal-row
     // production red was an aged closed MATERIALIZATION row; the
@@ -3995,6 +4027,7 @@ module logServiceCalibSessionCaps {
     // reopen itself.
     CAP = 2,
     CALIB_SESSION_SCOPED_CAPS = true,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4038,6 +4071,7 @@ module logServiceCalibGateRow {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = true,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4086,6 +4120,7 @@ module logServiceKindMix {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = true,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4154,6 +4189,7 @@ module logServiceCalibLatestOnly {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = true,
     CALIB_GATE_LATEST_ONLY = true,
@@ -4198,6 +4234,7 @@ module logServiceCalibLossEscape {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4242,6 +4279,7 @@ module logServiceCalibSweepAgeOnly {
     ENABLE_SWEEP = true,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4288,6 +4326,7 @@ module logServiceServed {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4360,6 +4399,7 @@ module logServiceCalibReaderAdvance {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4449,6 +4489,7 @@ module logServiceWorkerGap {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4488,6 +4529,7 @@ module logServiceCalibDropWakeLost {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4528,6 +4570,7 @@ module logServiceCalibStampSkips {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4569,6 +4612,7 @@ module logServiceCalibRecoveryUngated {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4608,6 +4652,7 @@ module logServiceCalibResumePastGap {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4648,6 +4693,7 @@ module logServiceExecAxis {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4688,6 +4734,7 @@ module logServiceCalibExecSplice {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4731,6 +4778,7 @@ module logServiceFlood {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4769,6 +4817,7 @@ module logServiceCalibOversized {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4813,6 +4862,7 @@ module logServiceCalibGcRowIgnoresArtifacts {
     ENABLE_SWEEP = true,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4856,6 +4906,7 @@ module logServiceCalibCloseNoStamp {
     ENABLE_SWEEP = true,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = true,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4918,6 +4969,7 @@ module logServiceProducerLoss {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -4982,6 +5034,7 @@ module logServiceCalibProducerBlind {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
@@ -5004,6 +5057,54 @@ module logServiceCalibProducerBlind {
     CALIB_RESUME_PAST_GAP = false,
     ENABLE_PRODUCER_PLANE = true,
     CALIB_PRODUCER_BLIND = true,
+  ).*
+}
+
+// =========================================================================
+// CALIBRATION: the pre-merged_bug_005 unclamped ack producer (bughunt-13
+// F9) — the ack value is the committed chunk's own end, never clamped to
+// the contiguous durable frontier. Under fabrication, a high-numbered
+// chunk past a manifest hole is acked at its end and the builder's
+// prefix-pop trim destroys the real low-numbered lines' only copy:
+// `ackImpliesDurable` falsifies. The live regimes assert the invariant
+// everywhere (fabrication included) against the clamped `deliverAck`;
+// if this pin ever stops falsifying, the model has drifted away from
+// the hole-spanning-ack class the clamp exists to make unrepresentable.
+// =========================================================================
+module logServiceCalibUnclampedAck {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 1,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = true,
+    ENABLE_RECONNECT = false,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_UNCLAMPED_ACK = true,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 }
 
