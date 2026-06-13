@@ -350,10 +350,17 @@ impl Coordinator {
                         debug!(generation = n.generation, "eval worker recycled");
                     }
                     worker_frame::Msg::Error(e) => {
-                        expected.remove(&e.attr);
                         if e.fatal {
                             bail!("eval parent failed: {}", e.message);
                         }
+                        if e.attr.is_empty() {
+                            // Non-attr fault (e.g. a worker crash whose
+                            // attr was re-queued): visibility only, no
+                            // attr is lost.
+                            warn!(error = %e.message, "eval parent reported a non-attr fault");
+                            continue;
+                        }
+                        expected.remove(&e.attr);
                         warn!(attr = %e.attr, error = %e.message, "attr failed to evaluate");
                         eval_failures.push(BuildOutcome {
                             attr: e.attr,

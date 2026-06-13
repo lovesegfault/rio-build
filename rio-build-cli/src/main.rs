@@ -69,6 +69,12 @@ struct BuildArgs {
     #[arg(long)]
     detach: bool,
 
+    /// Evaluate attrs from a plain Nix file instead of a flake (the
+    /// installables become attr paths into the file's top-level
+    /// attrset). Mostly for tests and fixtures.
+    #[arg(long, value_name = "PATH")]
+    eval_file: Option<PathBuf>,
+
     /// Continue building independent derivations after a failure.
     #[arg(long)]
     keep_going: bool,
@@ -131,7 +137,8 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
         );
     };
 
-    let (chan, mut child) = evalchan::spawn_eval_parent(eval_parent, &[])
+    let (parent_args, attrs) = eval_plan(&args.installables, args.eval_file.as_deref(), &cas_root)?;
+    let (chan, mut child) = evalchan::spawn_eval_parent(eval_parent, &parent_args)
         .with_context(|| format!("spawning eval parent {}", eval_parent.display()))?;
 
     let acks = std::sync::Arc::new(std::sync::Mutex::new(ClusterAckTable::open(
@@ -182,7 +189,7 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
         }
     });
 
-    let summary = coordinator.run(chan, args.installables, sig_rx).await?;
+    let summary = coordinator.run(chan, attrs, sig_rx).await?;
     // Reap the eval parent (it exits on Shutdown/EOF).
     let _ = child.wait().await;
 
@@ -220,6 +227,46 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Derive the eval-parent argv + the WorkItem attrs from the
+/// installables. File mode (`--eval-file`): installables are attr
+/// paths into the file's top-level attrset. Flake mode: every
+/// installable is `ref#fragment` (or a bare ref = default attr); all
+/// must share ONE flake ref — the eval parent locks one flake per
+/// invocation (ADR-024: lock flake + fetch inputs once, pre-fork).
+fn eval_plan(
+    installables: &[String],
+    eval_file: Option<&std::path::Path>,
+    cas_root: &std::path::Path,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let mut argv = vec!["--cas".to_string(), cas_root.display().to_string()];
+    if let Some(f) = eval_file {
+        argv.push("--file".into());
+        argv.push(f.display().to_string());
+        return Ok((argv, installables.to_vec()));
+    }
+    let mut flake_ref: Option<String> = None;
+    let mut attrs = Vec::with_capacity(installables.len());
+    for inst in installables {
+        let (r, frag) = match inst.split_once('#') {
+            Some((r, frag)) => (r, frag),
+            None => (inst.as_str(), ""),
+        };
+        let r = if r.is_empty() { "." } else { r };
+        match &flake_ref {
+            None => flake_ref = Some(r.to_string()),
+            Some(prev) if prev == r => {}
+            Some(prev) => bail!(
+                "all installables must share one flake ref ({prev} vs {r}) — \
+                 the eval parent locks one flake per invocation"
+            ),
+        }
+        attrs.push(frag.to_string());
+    }
+    argv.push("--flake".into());
+    argv.push(flake_ref.expect("installables is non-empty"));
+    Ok((argv, attrs))
+}
+
 /// Post-attach fetch handling (mirrors the in-run `--fetch` path).
 async fn finish(
     outcomes: Vec<rio_build_cli::coordinator::BuildOutcome>,
@@ -255,4 +302,41 @@ async fn finish(
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::eval_plan;
+    use std::path::Path;
+
+    #[test]
+    fn eval_plan_flake_mode_splits_fragments() {
+        let (argv, attrs) = eval_plan(
+            &[".#hello".into(), ".#world".into(), ".".into()],
+            None,
+            Path::new("/cas"),
+        )
+        .unwrap();
+        assert_eq!(argv, vec!["--cas", "/cas", "--flake", "."]);
+        assert_eq!(attrs, vec!["hello", "world", ""]);
+    }
+
+    #[test]
+    fn eval_plan_rejects_mixed_flake_refs() {
+        let err =
+            eval_plan(&["./a#x".into(), "./b#y".into()], None, Path::new("/cas")).unwrap_err();
+        assert!(err.to_string().contains("share one flake ref"));
+    }
+
+    #[test]
+    fn eval_plan_file_mode_passes_attrs_verbatim() {
+        let (argv, attrs) = eval_plan(
+            &["pkgA".into(), "nested.pkgB".into()],
+            Some(Path::new("/tmp/fixture.nix")),
+            Path::new("/cas"),
+        )
+        .unwrap();
+        assert_eq!(argv, vec!["--cas", "/cas", "--file", "/tmp/fixture.nix"]);
+        assert_eq!(attrs, vec!["pkgA", "nested.pkgB"]);
+    }
 }

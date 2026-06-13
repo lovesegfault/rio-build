@@ -19403,6 +19403,10 @@
       ],
       "crateBin": [
         {
+          "name": "eval-harness",
+          "path": "src/bin/eval-harness.rs"
+        },
+        {
           "name": "rio",
           "path": "src/main.rs"
         }
