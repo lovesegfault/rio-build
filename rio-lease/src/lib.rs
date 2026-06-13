@@ -321,6 +321,33 @@ const _: () = {
 // r[impl sched.lease.marks-verify+2]
 pub const MARKS_VERIFY_EVERY: u64 = 12;
 
+// R34 (static cadence-vs-bound witness; bughunt-13 F4): the verify
+// schedule is MULTIPLE-KEYED with skip-on-busy — a multiple whose
+// single-flight slot is taken is skipped whole, deferring the attempt
+// a FULL verify interval. That skip term stays one interval (it never
+// compounds into a stall) only because a marks task cannot occupy the
+// slot across consecutive multiples: every marks task is bounded by
+// the loop's renew deadline (RENEW_INTERVAL − RENEW_SLOP), so the
+// worst-case occupancy of a task spawned at the last tick before a
+// multiple still ends at least MARKS_VERIFY_EVERY − 2 rounds before
+// the NEXT multiple. The formal model adopts the same multiple-keyed
+// schedule and prices the divergence-class skip at ZERO (a busy
+// multiple is a dirty multiple in-model — only dirt spawns
+// reconciles); this assert is the production-side bridge that makes
+// that pricing true here: a clean loop's verify task can never park
+// across a multiple and manufacture the clean+busy skip the model
+// excludes. Pre-F4 this margin was luck — nothing pinned it, and the
+// model's cadence ("deadline from the last verify") was a stronger
+// schedule than the one production runs. Phase margin at the current
+// constants: one task deadline (3s) + one round (5s) = 8s against a
+// 60s interval.
+const _: () = assert!(
+    (RENEW_INTERVAL.as_secs() - RENEW_SLOP.as_secs()) + RENEW_INTERVAL.as_secs()
+        < MARKS_VERIFY_EVERY * RENEW_INTERVAL.as_secs(),
+    "a marks task's deadline plus one round must fit inside one verify interval \
+     (the skip-on-busy term is one deferred interval, never a compounding stall)"
+);
+
 /// Counter bumped each time the standby self-check finds foreign
 /// leader marks on this NON-leading pod (the strip then rides the next
 /// reconcile). Expected zero from honest fleets: there is no lawful

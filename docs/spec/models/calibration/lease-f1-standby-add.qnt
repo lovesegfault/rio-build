@@ -54,12 +54,16 @@ module leaseCalibF1StandbyAdd {
   ).* from "../leaderMarks"
 
   /// PRE-FIX verify: the leader-only gate restored — a standby never
-  /// re-examines its own marks.
+  /// re-examines its own marks. (Multiple-keyed like production and
+  /// the live model since F4 — the deleted mechanism here is the
+  /// polarity gate only.)
   // Environment: the pre-F1 machinery restored as a regression pin — the deleted `now_leading` spawn gate / `leading=true` hardcode (rio-lease/src/lib.rs history; no live transition carries it)
   action calibVerifyLeaderOnly = all {
     leadingOf("us", holder),
     not(dirty),
     task == NoTask,
+    clock % VERIFY_EVERY == 0,
+    lastVerify != clock,
     lastVerify' = clock,
     marked' = if (wrongUnder(marks, holder, "us")) marked + 1 else marked,
     cleared' = cleared,
@@ -73,12 +77,14 @@ module leaseCalibF1StandbyAdd {
   /// PRE-FIX tick: the verify-cadence cap gated on leading (a standby
   /// loop owed no verify), and NO peer-loop obligation (the pre-F1
   /// model carried the peer's repair as prose, not structure). The
-  /// task-residency cap is KEPT: API deadlines existed pre-fix too.
+  /// task-residency cap is KEPT: API deadlines existed pre-fix too;
+  /// the multiple-keyed schedule is the live model's (F4) — the
+  /// deleted mechanism here is the polarity gate only.
   // Environment: the pre-F1 loop schedule restored as a regression pin — the leader-gated cadence obligation (rio-lease/src/lib.rs history; the live loop verifies at both polarities)
   action calibTickPreF1 = all {
     clock < MAX_TIME,
-    (leadingOf("us", holder) and not(dirty) and task == NoTask) implies
-      (clock + 1 - lastVerify <= VERIFY_EVERY),
+    (leadingOf("us", holder) and not(dirty) and task == NoTask and clock % VERIFY_EVERY == 0) implies
+      lastVerify == clock,
     (task != NoTask) implies (clock + 1 - taskSince <= TASK_TIMEOUT),
     clock' = clock + 1,
     holder' = holder, marks' = marks, marked' = marked,

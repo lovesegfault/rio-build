@@ -361,21 +361,37 @@ module leaderMarks {
   val noRebound = rebounds == 0
 
   // --- actions --------------------------------------------------------
-  /// One reconciler round passes. The verify-cadence cap (the
-  /// loopInterval pattern of leaderElection.qnt): a clean, idle
-  /// reconciler — leader OR standby, since F1 — cannot advance past
-  /// the cadence without the verify pass having run; the production
-  /// loop reaches the verify gate every round at both polarities. The
-  /// peer-loop cap is the symmetric obligation: the peer pod runs the
-  /// same binary, so its divergence cannot outlive the same cadence
-  /// bound without its own loop (otherLoopConverge) having repaired
-  /// it — the obligation form of the symmetry argument the pre-F1
-  /// model left as prose.
+  /// One reconciler round passes. The verify-cadence cap is
+  /// MULTIPLE-KEYED with skip-on-busy since bughunt-13 F4 — the
+  /// production schedule, adopted: attempts fire at rounds where
+  /// renew_rounds_started % MARKS_VERIFY_EVERY == 0 iff the marks are
+  /// clean and the single-flight slot is free; a busy multiple is
+  /// SKIPPED whole (the next attempt waits a full interval). The cap
+  /// here forces exactly that: a clean, idle reconciler — leader OR
+  /// standby, since F1 — cannot tick OUT of an unserviced multiple
+  /// round; every other round ticks freely. The skip term costs the
+  /// DIVERGENCE bound nothing in-model because busy implies dirty
+  /// (reconcile tasks spawn only from dirt and the clear frees the
+  /// slot in the same transition), so a skipped multiple is always a
+  /// multiple whose divergence was already discovered — and the
+  /// production-side bridge for that pricing is the R34 compile
+  /// assert in rio-lease (a marks task's deadline + one round fits
+  /// inside one verify interval, so a verify task can never park
+  /// ACROSS a multiple and manufacture the clean+busy skip the model
+  /// excludes). Pre-F4 the model forced deadline-from-lastVerify — a
+  /// STRONGER schedule production never ran, papered over by a "runs
+  /// every VERIFY_EVERY rounds by construction" comment that was
+  /// false (skip-on-busy defers a full interval).
+  /// The peer-loop cap is the symmetric obligation: the peer pod runs
+  /// the same binary, so its divergence cannot outlive the same
+  /// cadence bound without its own loop (otherLoopConverge) having
+  /// repaired it — the obligation form of the symmetry argument the
+  /// pre-F1 model left as prose.
   // Mirrors: rio-lease/src/lib.rs:run_lease_loop_with_client
   action tickRound = all {
     clock < MAX_TIME,
-    (not(dirty) and task == NoTask) implies
-      (clock + 1 - lastVerify <= VERIFY_EVERY),
+    (not(dirty) and task == NoTask and clock % VERIFY_EVERY == 0) implies
+      lastVerify == clock,
     // The peer pod's own cadence obligation (its loop is environment;
     // the same machinery runs there by construction).
     wrongUnder(marks, holder, "other") implies
@@ -501,13 +517,18 @@ module leaderMarks {
   /// — reads its OWN pod and MARKS on divergence (store(true) became
   /// mark() — bug_181). The standby polarity is the F1 detector: a
   /// foreign add on a non-leading pod is a divergence at
-  /// leading=false, and the re-dirtied reconcile strips it. Enabled
-  /// any round (the cadence cap on tickRound FORCES it within
-  /// VERIFY_EVERY; firing earlier is sound).
+  /// leading=false, and the re-dirtied reconcile strips it.
+  /// MULTIPLE-KEYED since F4 (production's
+  /// is_multiple_of(renew_rounds_started) gate): attempts fire at
+  /// cadence multiples only, once per multiple — the tickRound cap
+  /// forces the attempt before a clean, idle loop can leave the
+  /// multiple round.
   // Mirrors: rio-lease/src/lib.rs:spawn_verify_leader_marks
   action verify = all {
     not(dirty),
     task == NoTask,
+    clock % VERIFY_EVERY == 0,
+    lastVerify != clock,
     lastVerify' = clock,
     marked' = if (wrongUnder(marks, holder, "us")) marked + 1 else marked,
     cleared' = cleared,
@@ -534,6 +555,8 @@ module leaderMarks {
     verifyFails < MAX_VERIFY_FAILS,
     not(dirty),
     task == NoTask,
+    clock % VERIFY_EVERY == 0,
+    lastVerify != clock,
     lastVerify' = clock,
     verifyFails' = verifyFails + 1,
     marked' = marked,
@@ -721,6 +744,8 @@ module leaderMarks {
       .then(externalStrip("us"))
       .then(tickRound)
       .then(tickRound)
+      .then(tickRound)
+      .then(tickRound)
       .then(verify)
       .then(reconcileSpawn)
       .then(reconcilePatched)
@@ -746,6 +771,8 @@ module leaderMarks {
       .then(reconcilePatched)
       .then(reconcileClear)
       .then(externalAdd("us"))
+      .then(tickRound)
+      .then(tickRound)
       .then(tickRound)
       .then(tickRound)
       .then(verify)
@@ -777,6 +804,40 @@ module leaderMarks {
         not(marks.get("other")),
         not(dirty),
         wrongSince.get("other") == -1,
+      })
+
+  /// THE SKIP-ON-BUSY SCHEDULE (bughunt-13 F4, W13-L): the multiple
+  /// at clock 4 passes with the single-flight slot BUSY (a reconcile
+  /// in flight) — no attempt fires there (production: the
+  /// is_multiple_of gate finds the slot taken and skips); the next
+  /// attempt waits the FULL interval and lands at clock 8
+  /// (lastVerify jumps 0 → 8). The skipped multiple costs the
+  /// divergence bound nothing: a busy multiple is dirty by
+  /// construction (only dirt spawns reconciles; the clear frees the
+  /// slot in the same transition), so its divergence was already
+  /// discovered — the in-model pricing whose production-side bridge
+  /// is the R34 compile assert in rio-lease (a marks task can never
+  /// park ACROSS a multiple).
+  run skipOnBusyMultipleRun =
+    init
+      .then(holderChange(Leader("us")))
+      .then(tickRound)
+      .then(tickRound)
+      .then(tickRound)
+      .then(tickRound)
+      .then(reconcileSpawn)
+      .then(reconcilePatched)
+      .then(tickRound)
+      .then(reconcileClear)
+      .then(tickRound)
+      .then(tickRound)
+      .then(tickRound)
+      .then(verify)
+      .expect(all {
+        lastVerify == 8,
+        clock == 8,
+        not(dirty),
+        marks.get("us"),
       })
 
   /// The DirtyGen save, end to end: a rebound marks BETWEEN the API

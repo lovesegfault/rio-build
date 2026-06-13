@@ -1776,9 +1776,13 @@ rec {
     # budgeted MAX_VERIFY_FAILS; the bounds carry the failure term via
     # discoveryBound, and the production-shaped TASK_TIMEOUT <
     # VERIFY_EVERY proportions make the pre-F3 two-term bound twin
-    # falsifiable). Measured: exhaustive TLC ~35s at the wired
-    # constants (transcript in the introducing commit) — the default
-    # 1800s budget is ~50x headroom.
+    # falsifiable) and MULTIPLE-KEYED with skip-on-busy since F4
+    # (production's is_multiple_of schedule, adopted; the busy-skip
+    # costs the divergence bound nothing in-model because busy implies
+    # dirty, and the R34 compile assert in rio-lease is the
+    # production-side bridge for that pricing). Measured: exhaustive
+    # TLC ~10s at the wired constants (transcript in the introducing
+    # commit) — the default 1800s budget is ~180x headroom.
     # r[verify sched.lease.marks-verify+2]
     # r[verify sched.lease.deletion-cost+3]
     quint-leader-marks = mkQuintCheck {
@@ -1865,7 +1869,9 @@ rec {
     # cadence-forced verify and the next reconcile strips;
     # sweepStripsForeignPeerLabelRun: the F2 reachability — the
     # leader's sweep strips a foreign-labeled peer, the branch that
-    # was dead text pre-F1; clearKeepsPostSnapMarkRun: a rebound marks
+    # was dead text pre-F1; skipOnBusyMultipleRun: the F4 schedule —
+    # a busy multiple is skipped whole and the attempt lands a full
+    # interval later; clearKeepsPostSnapMarkRun: a rebound marks
     # between the API write and the clear, and the clear-through
     # arithmetic keeps the loop dirty — the DirtyGen save, end to
     # end).
