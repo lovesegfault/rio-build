@@ -585,6 +585,33 @@ is `rio-common/src/liveness.rs` (the keepalive-vs-abort pair); the
 periodic-refresh and sensor-tier instances land with their owning
 components' closes and cite this rule.
 
+#r("sys.recovery.witnessed-clear")[
+  Degradation, recovery, and disarm clocks MUST clear only on witnessed
+  work --- a relayed line, a committed row, a completed unit of the thing
+  previously failing --- never on connection establishment, successful
+  opens, retried attempts, or any other activity that requires no progress.
+  An event that can occur while the failure persists (a successful open
+  against a peer that refuses in-band; a re-mint that the verifier will
+  reject again; a retried reconcile that observed nothing) is not recovery
+  evidence. The #rref("sys.gate.static-cadence-witness") occupancy-stamp
+  discipline (clause (ii)) extended to the recovery edge: a stamp written
+  by a no-op is not activity evidence, and an episode cleared by a no-op
+  is not recovery evidence.
+]
+
+The founding clearing-event instance (merged_bug_003): the gateway's
+live-tail degradation episode was cleared on every successful `TailLog`
+open, while the store routes every application refusal through
+`err_stream` so the open always succeeds and the in-body error becomes
+`TransportErr` -> `Reopen`. A persistently-refusing peer reset the clock
+every cycle and neither the 30 s notice nor the per-episode warn could
+ever fire. Repaired by gating the clear on the first relayed chunk
+(`last_relayed` advanced) and arming on a zero-relayed in-stream refusal.
+The founding re-mint instance (merged_bug_005,
+#rref("gw.jwt.remint-local-expiry-only")): a rejection-triggered re-mint
+is a recovery claim and is scoped to causes the issuer can locally verify
+as heal-able.
+
 == Instance Register (Static Cadence-vs-Bound Witnesses)
 
 Landed R34 closes append their rows here: the gate, the disarming

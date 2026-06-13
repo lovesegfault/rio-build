@@ -1129,7 +1129,8 @@ fetch). The optimization:
   boot with no reload path, so re-signing with the same key cannot heal a
   verifier-side refusal of a token well within its TTL; and a fresh `jti`
   silently overrides a per-`jti` operator revocation. The recovery evidence
-  is the follow-up authorized call succeeding, never the mint itself.
+  (#rref("sys.recovery.witnessed-clear")) is the follow-up authorized call
+  succeeding, never the mint itself.
 ]
 
 #r("gw.jwt.verify")[

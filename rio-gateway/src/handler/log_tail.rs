@@ -1141,6 +1141,7 @@ async fn run_tail(
                 {
                     DriveEnd::OutputClosed => return,
                     DriveEnd::Ended(cause) => {
+                        // r[impl sys.recovery.witnessed-clear]
                         // The episode-ending event is WITNESSED WORK:
                         // `degraded` clears only on the first relayed
                         // chunk. A drive that ends with zero lines
@@ -2499,6 +2500,7 @@ mod tests {
         );
     }
 
+    // r[verify sys.recovery.witnessed-clear]
     /// W14-A4 (merged_bug_003 red-first, R34-w(i) — the err_stream
     /// silent dark tail): the store opens successfully and answers
     /// EVERY cycle through err_stream (an in-body Status — the
@@ -2551,6 +2553,7 @@ mod tests {
         );
     }
 
+    // r[verify sys.recovery.witnessed-clear]
     /// W14-A5 (merged_bug_003, the occupancy witness + the
     /// false-positive guard): (a) after an err_stream-armed
     /// degradation, the FIRST genuinely relayed line clears the
