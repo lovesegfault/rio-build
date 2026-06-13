@@ -4339,6 +4339,7 @@ dependencies = [
 name = "workspace-hack"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "anstyle",
  "aws-lc-rs",
  "aws-smithy-types",

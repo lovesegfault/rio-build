@@ -1,5 +1,6 @@
 {
   "names": [
+    "rio_auth_jwt_rejected_total",
     "rio_builder_build_duration_seconds",
     "rio_builder_builds_active",
     "rio_builder_builds_total",
@@ -79,6 +80,7 @@
     "rio_controller_spot_interrupt_dropped_total",
     "rio_controller_wedge_systemic_suppressed_total",
     "rio_gateway_auth_degraded_total",
+    "rio_gateway_build_reattach_total",
     "rio_gateway_build_resync_rate_paced_total",
     "rio_gateway_bytes_total",
     "rio_gateway_channels_active",
@@ -283,6 +285,13 @@
     "rio_store_substitute_total"
   ],
   "by_component": {
+    "auth": [
+      {
+        "name": "rio_auth_jwt_rejected_total",
+        "kind": "counter",
+        "help": "JWT interceptor rejections (present header, failed verify) by cause. Every rejection increments; the structured warn is burst-windowed (REJECTION_WARN_BURST_WINDOW). live_064: the eleven silent rejections this counter would have surfaced."
+      }
+    ],
     "builder": [
       {
         "name": "rio_builder_build_duration_seconds",
@@ -682,6 +691,11 @@
         "name": "rio_gateway_auth_degraded_total",
         "kind": "counter",
         "help": "SSH auth accepted but tenant identity degraded to single-tenant mode (labeled by reason: interior_whitespace = authorized_keys comment has a space where a dash was intended; invalid_utf8 = comment bytes are not valid UTF-8 — rewrite the comment as plain UTF-8)"
+      },
+      {
+        "name": "rio_gateway_build_reattach_total",
+        "kind": "counter",
+        "help": "Every WatchBuild stream-end charged against the re-attach budget, labeled by the closed BackoffCause alphabet (cause: resync_signal | transport | eof_without_terminal | reattach_cycle_failed). Superset of rio_gateway_build_resync_rate_paced_total -- this counts every cycle, that one counts the rate-paced subset. live_064: the per-cause split is what an incident query reads to tell a benign failover EOF from a transport fault or a re-attach refusal without scheduler-log archaeology."
       },
       {
         "name": "rio_gateway_build_resync_rate_paced_total",

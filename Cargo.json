@@ -19285,6 +19285,10 @@
           "packageId": "jsonwebtoken"
         },
         {
+          "name": "metrics",
+          "packageId": "metrics"
+        },
+        {
           "name": "rio-common",
           "packageId": "rio-common"
         },
@@ -19331,12 +19335,20 @@
           "packageId": "libc"
         },
         {
+          "name": "metrics-util",
+          "packageId": "metrics-util"
+        },
+        {
           "name": "proptest",
           "packageId": "proptest"
         },
         {
           "name": "tempfile",
           "packageId": "tempfile"
+        },
+        {
+          "name": "tracing-test",
+          "packageId": "tracing-test"
         }
       ],
       "libCrateTypes": [
@@ -20128,6 +20140,10 @@
         }
       ],
       "devDependencies": [
+        {
+          "name": "metrics-util",
+          "packageId": "metrics-util"
+        },
         {
           "name": "rio-migrations",
           "packageId": "rio-migrations"
@@ -29259,6 +29275,10 @@
       },
       "dependencies": [
         {
+          "name": "aho-corasick",
+          "packageId": "aho-corasick"
+        },
+        {
           "name": "anstyle",
           "packageId": "anstyle"
         },
@@ -29837,6 +29857,10 @@
         }
       ],
       "buildDependencies": [
+        {
+          "name": "aho-corasick",
+          "packageId": "aho-corasick"
+        },
         {
           "name": "anstyle",
           "packageId": "anstyle"

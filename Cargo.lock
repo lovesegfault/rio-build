@@ -6155,6 +6155,8 @@ dependencies = [
  "hmac 0.13.0",
  "jsonwebtoken",
  "libc",
+ "metrics",
+ "metrics-util",
  "proptest",
  "rio-common",
  "serde",
@@ -6165,6 +6167,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "tracing-test",
  "uuid",
  "workspace-hack",
 ]
@@ -6342,6 +6345,7 @@ dependencies = [
  "hex",
  "libc",
  "metrics",
+ "metrics-util",
  "rand 0.10.1",
  "rio-auth",
  "rio-common",
@@ -9199,6 +9203,7 @@ dependencies = [
 name = "workspace-hack"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "anstyle",
  "aws-lc-rs",
  "aws-smithy-types",

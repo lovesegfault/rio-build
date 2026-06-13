@@ -844,6 +844,9 @@ pub fn describe_metrics() {
     metrics::gauge!("rio_store_gc_chunks_live").set(0.0);
     metrics::gauge!("rio_store_gc_chunks_would_collect").set(0.0);
     metrics::gauge!("rio_store_gc_collect_backlog_chunks").set(0.0);
+    // live_064: the jwt_interceptor this binary layers in emits
+    // rio_auth_* — its HELP registers from here so (lllll) holds.
+    rio_auth::describe_metrics();
     // Alert-seeded counters: the table below births every
     // PrometheusRule-expr-referenced rio_store counter at 0 so the
     // alerts have a series to evaluate from boot instead of returning

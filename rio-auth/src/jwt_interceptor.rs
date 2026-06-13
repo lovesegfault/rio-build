@@ -51,7 +51,8 @@
 //! opt-in at both ends, gated on deployment config.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use ed25519_dalek::VerifyingKey;
@@ -60,6 +61,44 @@ use tonic::{Request, Status};
 use crate::jwt::{self, TenantClaims};
 use rio_common::grpc::TENANT_TOKEN_HEADER;
 use rio_common::signal::Token as CancellationToken;
+
+/// R17 burst-window for the per-rejection structured warn: at most one
+/// warn per [`REJECTION_WARN_BURST_WINDOW`] per interceptor instance.
+/// The counter increments per rejection unconditionally; the warn is the
+/// operator-log surface and a re-attaching gateway that has lost its
+/// auth (live_064: eleven rejections inside one re-attach budget) would
+/// otherwise emit one warn per re-attach cycle. Derived from the
+/// gateway's `ReattachBudget::RATE_WINDOW` (60s — the cadence at which
+/// a re-attaching client paces itself), so a sustained rejection burst
+/// surfaces as one warn per minute, not one per cycle. VIOLABLE: the
+/// window only bounds log cardinality; the metric is the durable
+/// evidence either way.
+pub const REJECTION_WARN_BURST_WINDOW: Duration = Duration::from_secs(60);
+
+/// The closed cause alphabet for `rio_auth_jwt_rejected_total{cause}`.
+/// Low-cardinality by design (R14): the jsonwebtoken error KIND
+/// (ExpiredSignature / InvalidSignature / …) rides the warn body for
+/// operator forensics; the metric label only distinguishes the
+/// rejection seam.
+#[derive(Debug, Clone, Copy)]
+enum RejectCause {
+    /// Header present but not ASCII-decodable. In practice tonic's
+    /// MetadataValue parsing rejects non-ASCII before the interceptor
+    /// sees it, so this arm is near-unreachable; named so the match is
+    /// total.
+    MalformedHeader,
+    /// `jwt::verify` failed: expired, bad signature, malformed token.
+    VerifyFailed,
+}
+
+impl RejectCause {
+    fn label(self) -> &'static str {
+        match self {
+            RejectCause::MalformedHeader => "malformed_header",
+            RejectCause::VerifyFailed => "verify_failed",
+        }
+    }
+}
 
 /// Shared pubkey handle the interceptor reads on every intercepted call.
 ///
@@ -205,6 +244,7 @@ pub fn load_and_wire_jwt(
 }
 
 // r[impl gw.jwt.verify]
+// r[impl obs.auth.rejection-counted]
 /// Build the JWT-verify interceptor closure.
 ///
 /// The returned closure is `Clone` (`InterceptorLayer` requires it):
@@ -217,7 +257,42 @@ pub fn load_and_wire_jwt(
 /// surface — it says "ExpiredSignature" or "InvalidSignature", not
 /// anything about the key material. An operator debugging a 401 can
 /// tell expired-vs-tampered without guessing.
+///
+/// Observability (live_064): every rejection increments
+/// `rio_auth_jwt_rejected_total{cause}` and emits at most one
+/// structured warn per [`REJECTION_WARN_BURST_WINDOW`]. Pre-fix the
+/// interceptor was silent — the incident's eleven UNAUTHENTICATED
+/// re-attach rejections were reconstructed from the gateway's
+/// re-attach-budget exhaustion message after the relevant scheduler
+/// logs had aged out under rotation.
 pub fn jwt_interceptor(pubkey: JwtPubkey) -> impl tonic::service::Interceptor + Clone {
+    // Shared across the per-connection clones so a re-attaching
+    // gateway (new connection per cycle) is still burst-bounded.
+    // `std::sync::Mutex`, not tokio's — the closure is sync.
+    // Deadline-shaped (R29' — the gate is `now >= deadline`, never an
+    // `.elapsed()` comparison): the slot holds the EARLIEST instant
+    // the next warn may fire, minted as `now + WINDOW` at warn time.
+    let warn_not_before: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let note_reject = {
+        let warn_not_before = Arc::clone(&warn_not_before);
+        move |cause: RejectCause, detail: &dyn std::fmt::Display| {
+            metrics::counter!("rio_auth_jwt_rejected_total", "cause" => cause.label()).increment(1);
+            let now = Instant::now();
+            let mut slot = warn_not_before
+                .lock()
+                .expect("rejection-warn mutex poisoned");
+            if slot.is_none_or(|deadline| now >= deadline) {
+                *slot = Some(now + REJECTION_WARN_BURST_WINDOW);
+                tracing::warn!(
+                    cause = cause.label(),
+                    %detail,
+                    burst_window_secs = REJECTION_WARN_BURST_WINDOW.as_secs(),
+                    "JWT verify rejected (further rejections this window: see \
+                     rio_auth_jwt_rejected_total)"
+                );
+            }
+        }
+    };
     move |mut req: Request<()>| -> Result<Request<()>, Status> {
         // ---- Dev-mode bypass ----
         // No pubkey configured → no verification possible → pass through.
@@ -244,10 +319,11 @@ pub fn jwt_interceptor(pubkey: JwtPubkey) -> impl tonic::service::Interceptor + 
         // that went to the trouble of setting the header is asserting
         // "I am authenticated via JWT" — a malformed or expired token
         // is an auth failure, not a fallback trigger.
-        let token = raw.to_str().map_err(|_| {
+        let token = raw.to_str().map_err(|e| {
             // Metadata values are ASCII-encodable bytes. A non-ASCII
             // token header is either corrupted or adversarial; either
             // way, not a valid JWT (base64url is pure ASCII).
+            note_reject(RejectCause::MalformedHeader, &e);
             Status::unauthenticated(format!("{TENANT_TOKEN_HEADER} header is not valid ASCII"))
         })?;
 
@@ -267,8 +343,10 @@ pub fn jwt_interceptor(pubkey: JwtPubkey) -> impl tonic::service::Interceptor + 
             let guard = pubkey
                 .read()
                 .expect("jwt pubkey RwLock poisoned — SIGHUP key-swap handler panicked");
-            jwt::verify(token, &guard)
-                .map_err(|e| Status::unauthenticated(format!("JWT verify failed: {e}")))?
+            jwt::verify(token, &guard).map_err(|e| {
+                note_reject(RejectCause::VerifyFailed, &e);
+                Status::unauthenticated(format!("JWT verify failed: {e}"))
+            })?
         };
 
         // Attach Claims for handlers. `insert` replaces any prior
@@ -687,6 +765,77 @@ mod tests {
             .await
             .expect("reload loop should exit on shutdown within 5s")
             .expect("reload task should not panic");
+    }
+
+    // ------------------------------------------------------------------------
+    // Rejection observability — W14-F4 (live_064: the eleven silent rejections)
+    // ------------------------------------------------------------------------
+
+    /// W14-F4: a rejected interceptor call increments the cause-labeled
+    /// counter, and exactly ONE warn fires within
+    /// [`REJECTION_WARN_BURST_WINDOW`] for N>1 rejections of the same
+    /// cause. Pre-fix the interceptor was silent at the observability
+    /// tier — live_064's eleven UNAUTHENTICATED rejections were
+    /// reconstructed from secondary evidence after the gateway's
+    /// re-attach budget exhausted.
+    // r[verify obs.auth.rejection-counted]
+    #[test]
+    #[tracing_test::traced_test]
+    fn rejection_counted_and_warn_once_per_burst() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let (sk, vk) = keypair(0x42);
+        // Expired token → the live_064 rejection cause.
+        let expired = jwt::sign(&claims(-3600), &sk).unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            let mut intercept = jwt_interceptor(pubkey(vk));
+            // N>1 rejections inside one burst window — every call
+            // increments the counter; the warn fires once.
+            for _ in 0..5 {
+                let status = intercept.call(req_with_token(&expired)).unwrap_err();
+                assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            }
+        });
+
+        // ── Counter: incremented per rejection, labeled by cause ──
+        // (ppppp): snapshot drains — call exactly once.
+        let snapshot = snapshotter.snapshot().into_vec();
+        let (key, val) = snapshot
+            .iter()
+            .find_map(|(k, _, _, v)| {
+                (k.key().name() == "rio_auth_jwt_rejected_total").then_some((k.key(), v))
+            })
+            .expect("rio_auth_jwt_rejected_total emitted on rejection");
+        assert!(matches!(val, DebugValue::Counter(5)), "got {val:?}");
+        let cause = key
+            .labels()
+            .find(|l| l.key() == "cause")
+            .expect("cause label present");
+        assert_eq!(
+            cause.value(),
+            "verify_failed",
+            "the closed cause alphabet labels every rejection"
+        );
+
+        // ── Warn: exactly once for the 5-call burst ──
+        logs_assert(|lines: &[&str]| {
+            let warns = lines
+                .iter()
+                .filter(|l| l.contains("WARN") && l.contains("JWT verify rejected"))
+                .count();
+            if warns == 1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected exactly one burst warn within \
+                     REJECTION_WARN_BURST_WINDOW, got {warns}"
+                ))
+            }
+        });
     }
 
     /// The gateway hardcodes `"x-rio-tenant-token"` as a string literal

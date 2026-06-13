@@ -3951,6 +3951,7 @@ dependencies = [
  "ed25519-dalek",
  "hmac 0.13.0",
  "jsonwebtoken",
+ "metrics",
  "rio-common",
  "serde",
  "serde_json",
@@ -6138,6 +6139,7 @@ dependencies = [
 name = "workspace-hack"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "anstyle",
  "aws-lc-rs",
  "aws-smithy-types",

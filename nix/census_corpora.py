@@ -827,6 +827,10 @@ DURATION_CENSUS_ROWS = {
         "wall (tokio Instant at the degradation episode's own arming stamp — armed and notice deadline minted together at the first failed open; the episode's age IS the user-facing evidence clock, and nothing on any other clock refreshes or re-arms it)",
         "live_062 WO-S10-6 (bw13-S10): deadline-shaped at the arm site (armed + AFTER vs Instant::now() — the in-file grace_deadline idiom; producer and consumer share the one Instant domain — same-domain, no conversion)",
     ),
+    ("rio-auth/src/jwt_interceptor.rs", "REJECTION_WARN_BURST_WINDOW"): (
+        "wall (std Instant at the interceptor's own last-warn stamp; the closure is sync so std::time, not tokio — log-cardinality bound only, the metric is the durable evidence either way)",
+        "live_064 WO-S6-4 (bw14-S6): derived from the gateway's ReattachBudget::RATE_WINDOW (60s — the cadence at which a re-attaching client paces itself); W14-F4 asserts exactly one warn within the window for N>1 rejections",
+    ),
 }
 DURATION_GRANDFATHER = "nix/duration-census-grandfather.txt"
 

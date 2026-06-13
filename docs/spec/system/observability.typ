@@ -191,6 +191,57 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   MUST follow the `rio_gateway_*` naming prefix.
 ]
 
+#r("obs.gateway.stream-end-attributed")[
+  Every gateway `WatchBuild` stream-end event MUST be attributed to its
+  source via a closed cause alphabet (`BackoffCause`: `transport`,
+  `eof_without_terminal`, `resync_signal`, `reattach_cycle_failed`); the
+  cause MUST ride the operator-log line and the
+  #(refs.metric)("rio_gateway_build_reattach_total")`{cause}` counter so a
+  benign failover EOF is distinguishable from a transport fault or a
+  re-attach refusal without cross-referencing scheduler logs.
+]
+live_064: the incident's "third benign stream EOF" could not be
+attributed to a source from the gateway's logs alone --- the stream-death
+classification existed (`StreamProcessError`) but the operator-facing
+metric counted only the rate-paced subset, so the per-cause split was
+reconstructible only by counting debug-level log lines that had aged out.
+The cause label is the producer's actual close-path evidence (which arm
+of the typed event-source match fired), never an inference from absence.
+
+== Auth Interceptor Metrics
+
+#r("obs.auth.rejection-counted")[
+  The JWT interceptor (scheduler, store) MUST increment
+  #(refs.metric)("rio_auth_jwt_rejected_total")`{cause}` on every
+  present-header rejection and MUST emit at most one structured warn per
+  `REJECTION_WARN_BURST_WINDOW` per process; the warn body MUST carry the
+  `cause` label and the underlying verify-error detail.
+]
+live_064: the eleven UNAUTHENTICATED re-attach rejections that exhausted
+the gateway's `WatchBuild` budget were silent at the interceptor's
+observability tier --- the rejection count was reconstructed from the
+gateway's exhaustion message after the scheduler's own logs had aged out
+under rotation. The burst window bounds log cardinality (a re-attaching
+client paces itself at the `ReattachBudget::RATE_WINDOW` cadence, so a
+sustained rejection burst surfaces as one warn per minute, not one per
+cycle); the counter is the durable per-rejection evidence and is what an
+incident query reads.
+
+#r("obs.log.incident-retention")[
+  Log evidence classes that an incident reconstruction depends on
+  (interceptor rejections, re-attach failures, lease transitions) MUST
+  outlive the longest plausible detection-to-forensics window; the
+  retention/rotation posture MUST NOT age out the only record of an auth
+  rejection before the rejected caller's retry budget exhausts.
+]
+Design record: live_064's scheduler logs had rotated past the rejection
+burst by the time forensics ran. The counter above is the durable half of
+the fix (Prometheus retention is days, not minutes); the
+rotation/retention posture itself is infra-level (helm log-retention
+values, not granted this round) and any change to satisfy this rule is
+owner-scheduled --- this row records the requirement so the infra change
+derives from a stated invariant.
+
 == Scheduler Metrics
 
 #r("obs.metric.scheduler")[

@@ -82,3 +82,6 @@ rio-store = { workspace = true, features = ["test-utils"] }
 sqlx = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+# DebuggingRecorder snapshotter for the per-cause re-attach counter
+# assertion (W14-F5, obs.gateway.stream-end-attributed).
+metrics-util = { workspace = true }

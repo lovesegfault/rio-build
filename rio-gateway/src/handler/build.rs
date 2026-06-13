@@ -1859,6 +1859,18 @@ impl ReattachBudget {
     fn next_backoff(&mut self, cause: BackoffCause) -> PacingDecision {
         let attempt = self.note_reattach();
         let exhausted = self.exhausted();
+        // r[impl obs.gateway.stream-end-attributed]
+        // Every stream-end charged here is attributed by cause; the
+        // rate-paced counter below is the SUBSET that engaged the rate
+        // ladder. live_064: the per-cause split is what an incident
+        // query reads — pre-fix only the rate-paced subset was
+        // countable, so the benign-EOF vs transport vs reattach-refused
+        // split was reconstructible only from debug-level logs.
+        metrics::counter!(
+            "rio_gateway_build_reattach_total",
+            "cause" => cause.label()
+        )
+        .increment(1);
         let streak_sleep = match cause {
             BackoffCause::ResyncSignal => {
                 if self.attempts > Self::ZERO_BACKOFF_STREAK {
@@ -6416,6 +6428,78 @@ mod tests {
             // The chatty build delivers an organic event inside the
             // same cycle — the streak axis resets to zero.
             budget.note_event(&Event::Progress(types::BuildProgress::default()));
+        }
+    }
+
+    // r[verify obs.gateway.stream-end-attributed]
+    /// W14-F5: every `BackoffCause` face increments
+    /// `rio_gateway_build_reattach_total` under its OWN cause label.
+    /// Population is the closed enum — the test names every variant
+    /// (no `_` arm) so a new cause without a label fails to compile,
+    /// and the per-face counter assertion proves the chokepoint
+    /// attributes every stream-end, not just the rate-paced subset.
+    /// Pre-fix only `rio_gateway_build_resync_rate_paced_total`
+    /// existed, so the live_064 benign-EOF vs transport split was
+    /// reconstructible only from debug logs.
+    #[test]
+    fn every_reattach_cause_is_counted_under_its_own_label() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use std::collections::HashMap;
+
+        let alphabet = [
+            super::BackoffCause::ResyncSignal,
+            super::BackoffCause::Transport,
+            super::BackoffCause::EofWithoutTerminal,
+            super::BackoffCause::ReattachCycleFailed,
+        ];
+        // R14: prove the alphabet above IS the enum — a match with no
+        // wildcard fails to compile when a variant is added.
+        for c in alphabet {
+            match c {
+                super::BackoffCause::ResyncSignal
+                | super::BackoffCause::Transport
+                | super::BackoffCause::EofWithoutTerminal
+                | super::BackoffCause::ReattachCycleFailed => {}
+            }
+        }
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let mut budget = super::ReattachBudget::default();
+            for cause in alphabet {
+                budget.next_backoff(cause);
+            }
+        });
+
+        // (ppppp): snapshot drains — call exactly once.
+        let by_cause: HashMap<String, u64> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, _, _, _)| k.key().name() == "rio_gateway_build_reattach_total")
+            .map(|(k, _, _, v)| {
+                let cause = k
+                    .key()
+                    .labels()
+                    .find(|l| l.key() == "cause")
+                    .expect("cause label")
+                    .value()
+                    .to_string();
+                let DebugValue::Counter(n) = v else {
+                    panic!("counter")
+                };
+                (cause, n)
+            })
+            .collect();
+
+        for cause in alphabet {
+            assert_eq!(
+                by_cause.get(cause.label()).copied(),
+                Some(1),
+                "cause={} must increment exactly once; got {by_cause:?}",
+                cause.label()
+            );
         }
     }
 

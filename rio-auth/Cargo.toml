@@ -40,6 +40,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+metrics = { workspace = true }
 # Interceptor returns tonic::Status; pubkey reload spawns on tokio.
 tonic = { workspace = true }
 tokio = { workspace = true }
@@ -50,3 +51,6 @@ proptest = { workspace = true }
 tempfile = { workspace = true }
 # libc::raise for SIGHUP self-delivery in pubkey-reload test.
 libc = { workspace = true }
+# Metric/log observability assertions for the rejection-counter tests.
+metrics-util = { workspace = true }
+tracing-test = { workspace = true }

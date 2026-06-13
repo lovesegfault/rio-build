@@ -13567,6 +13567,10 @@
       },
       "dependencies": [
         {
+          "name": "aho-corasick",
+          "packageId": "aho-corasick"
+        },
+        {
           "name": "anstyle",
           "packageId": "anstyle"
         },
@@ -14145,6 +14149,10 @@
         }
       ],
       "buildDependencies": [
+        {
+          "name": "aho-corasick",
+          "packageId": "aho-corasick"
+        },
         {
           "name": "anstyle",
           "packageId": "anstyle"

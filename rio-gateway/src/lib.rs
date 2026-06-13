@@ -127,6 +127,17 @@ pub fn describe_metrics() {
          cycle -- find the slow consumer, not a scheduler outage."
     );
     describe_counter!(
+        "rio_gateway_build_reattach_total",
+        "Every WatchBuild stream-end charged against the re-attach budget, \
+         labeled by the closed BackoffCause alphabet (cause: resync_signal | \
+         transport | eof_without_terminal | reattach_cycle_failed). Superset \
+         of rio_gateway_build_resync_rate_paced_total -- this counts every \
+         cycle, that one counts the rate-paced subset. live_064: the per-cause \
+         split is what an incident query reads to tell a benign failover EOF \
+         from a transport fault or a re-attach refusal without scheduler-log \
+         archaeology."
+    );
+    describe_counter!(
         "rio_gateway_log_tail_reconnects_total",
         "Build-log TailLog subscriptions re-opened against rio-store (labeled by \
          reason: open_failed = the TailLog RPC itself was rejected, the live \

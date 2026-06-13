@@ -12,6 +12,22 @@ pub mod hmac;
 pub mod jwt;
 pub mod jwt_interceptor;
 
+/// Register metric help text. Called from each consuming binary's own
+/// `describe_metrics()` (scheduler, store) so the (lllll) reachability
+/// holds — `rio_auth_*` names are emitted by the interceptor those
+/// binaries layer in, so the description must register from the same
+/// process.
+// r[impl obs.auth.rejection-counted]
+pub fn describe_metrics() {
+    metrics::describe_counter!(
+        "rio_auth_jwt_rejected_total",
+        "JWT interceptor rejections (present header, failed verify) by cause. \
+         Every rejection increments; the structured warn is burst-windowed \
+         (REJECTION_WARN_BURST_WINDOW). live_064: the eleven silent \
+         rejections this counter would have surfaced."
+    );
+}
+
 /// Clock-read errors. Both [`hmac`] and [`jwt`] gate token validity on
 /// "now ≥ epoch"; a pre-epoch system clock means the comparison is
 /// meaningless and MUST surface as an error rather than silently

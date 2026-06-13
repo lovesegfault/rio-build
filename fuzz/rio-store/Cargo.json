@@ -12480,6 +12480,10 @@
           "packageId": "jsonwebtoken"
         },
         {
+          "name": "metrics",
+          "packageId": "metrics"
+        },
+        {
           "name": "rio-common",
           "packageId": "rio-common"
         },
@@ -19516,6 +19520,10 @@
       },
       "dependencies": [
         {
+          "name": "aho-corasick",
+          "packageId": "aho-corasick"
+        },
+        {
           "name": "anstyle",
           "packageId": "anstyle"
         },
@@ -20094,6 +20102,10 @@
         }
       ],
       "buildDependencies": [
+        {
+          "name": "aho-corasick",
+          "packageId": "aho-corasick"
+        },
         {
           "name": "anstyle",
           "packageId": "anstyle"

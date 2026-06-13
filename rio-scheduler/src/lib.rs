@@ -858,6 +858,9 @@ pub fn describe_metrics() {
     // merged_bug_017: the outbox replay-refused HELP lives beside its
     // emit site (actor/housekeeping.rs) — same module-owned pattern.
     crate::actor::describe_housekeeping_metrics();
+    // live_064: the jwt_interceptor this binary layers in emits
+    // rio_auth_* — its HELP registers from here so (lllll) holds.
+    rio_auth::describe_metrics();
 
     // Series birth (C3 metric-ownership): every alert-referenced
     // counter and every leader-family gauge exists from the first

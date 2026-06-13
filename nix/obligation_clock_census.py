@@ -111,6 +111,14 @@ CLOCK_ROWS = {
     # idiom; same Instant domain). The clock description lives in the
     # anchor's doc per the row convention.
     "tail-degraded-notice": ("landed", "S10", "rio-gateway/src/handler/log_tail.rs", r"TAIL_DEGRADED_NOTICE_AFTER"),
+    # live_064 WO-S6-4 (bw14-S6): the rejection-warn burst gate —
+    # deadline-shaped on the interceptor's own monotonic Instant (now
+    # vs the warn_not_before deadline minted as now + WINDOW at warn
+    # time; same Instant domain, no elapsed-comparison). Log-cardinality
+    # bound only — the metric is the durable evidence; NOT a
+    # degradation/recovery clock (R34-w does not apply — the warn never
+    # CLEARS anything).
+    "auth-rejection-warn-burst": ("landed", "S6", "rio-auth/src/jwt_interceptor.rs", r"REJECTION_WARN_BURST_WINDOW"),
 }
 
 # The lossy-witness-arithmetic grammar (live from birth): seconds
