@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rio_common::transport::{OpenOutcome, bounded_open};
+use rio_common::transport::{OpenDeadline, OpenOutcome, bounded_open_within};
 use rio_log_kernel::{ChunkVisit, TailNext, TailStopCause, tail_next, visit_chunk};
 use rio_proto::LogServiceClient;
 use rio_proto::store::{TailLogChunk, TailLogRequest};
@@ -1000,13 +1000,21 @@ async fn run_tail(
                 .metadata_mut()
                 .insert(rio_proto::TENANT_TOKEN_HEADER, value);
         }
-        // The open is the one await the drain signal and grace clock
-        // cannot see: race it against the drain edge (a signal or
+        // The open is raced against the drain edge (a signal or
         // sender death mid-open aborts with zero stream consumed; the
-        // re-check below reads the fresh watch state) and a hard bound.
-        let open = bounded_open(
+        // re-check below reads the fresh watch state) and a
+        // DEADLINE-TYPED bound (bug_038, R34(iv)): the per-attempt
+        // open bound clamped to whatever remains of the armed grace
+        // envelope, consulted BEFORE the open arms. Pre-fix the open
+        // was the ONE await in this loop the grace clock could not
+        // see — a hung re-open against a half-open replica ran the
+        // full fixed bound (prod 10 s vs the 2 s grace), stretching
+        // exit-at-expiry ~5-6x past the spec'd budget and delaying
+        // the truncation disclosure; the backoff one await below was
+        // already grace-capped.
+        let open = bounded_open_within(
             async { _ = drain.changed().await },
-            config.open_bound,
+            OpenDeadline::within(config.open_bound, grace_deadline),
             client.tail_log(request),
         )
         .await;
@@ -1243,10 +1251,10 @@ async fn backoff_capped(
     backoff: Duration,
     deadline: Option<Instant>,
 ) -> BackoffEnd {
-    let dur = match deadline {
-        Some(d) => backoff.min(d.saturating_duration_since(Instant::now())),
-        None => backoff,
-    };
+    // ONE producer of the envelope-clamp arithmetic (bug_038): the
+    // backoff and the open consume the same `OpenDeadline::within`,
+    // so the two grace-capped awaits in this loop cannot drift.
+    let dur = OpenDeadline::within(backoff, deadline).bound();
     tokio::select! {
         _ = tokio::time::sleep(dur) => BackoffEnd::Slept,
         changed = drain.changed() => match changed {
@@ -1960,11 +1968,20 @@ mod tests {
     /// Test-scale timings: large enough that a loaded runner still
     /// observes the grace *window* (lines served inside it are
     /// relayed), small enough that the grace-expiry test stays fast.
+    ///
+    /// PRODUCTION PARAMETER ORDERING (bug_038, R31'(v)): `open_bound`
+    /// is LARGER than `terminal_grace` (2000 ms vs 400 ms — the same
+    /// 5x ratio as the shipped 10 s vs 2 s). The pre-fix fixture
+    /// inverted the ratio (open 100 ms < grace 400 ms), so the
+    /// missing open-vs-grace clamp was structurally untestable: every
+    /// hung open was cut by its own bound well inside the grace, and
+    /// the clamp assertion was vacuous. A grace-conformance fixture
+    /// must preserve the production ordering or it certifies nothing.
     fn test_config() -> LogTailConfig {
         LogTailConfig {
             reconnect_backoff: Duration::from_millis(50),
             terminal_grace: Duration::from_millis(400),
-            open_bound: Duration::from_millis(100),
+            open_bound: Duration::from_millis(2000),
         }
     }
 
@@ -2465,19 +2482,29 @@ mod tests {
     }
 
     // r[verify store.log.tail-grace-drain+2]
-    /// merged_bug_194's dedicated gateway twin: a store that ACCEPTS
-    /// the TCP connection but never answers `TailLog` (the open future
-    /// itself hangs) must not park the relay past the drain deadline.
-    /// The first hung open is cut by the drain EDGE (terminal signal,
-    /// raced via `bounded_open`'s abort arm); subsequent hung opens
-    /// are cut by `open_bound`; the grace budget then expires and the
-    /// law exits.
+    /// merged_bug_194's dedicated gateway twin + W13-AA (bug_038), at
+    /// PRODUCTION PARAMETER ORDERING (open_bound 2000 ms > grace
+    /// 400 ms — the shipped 5x ratio): a store that ACCEPTS the TCP
+    /// connection but never answers `TailLog` (the open future itself
+    /// hangs) must not park the relay past the drain deadline. The
+    /// first hung open is cut by the drain EDGE (terminal signal,
+    /// raced via the bounded open's abort arm); each subsequent hung
+    /// open is cut by the DEADLINE-TYPED bound — the per-attempt
+    /// open_bound clamped to the REMAINING GRACE — so exit-at-expiry
+    /// holds even though one bare open_bound is 5x the whole grace.
     ///
     /// RECORDED RED (pre-C1 shape, `bounded_open` neutered to a bare
     /// `client.tail_log(request).await`): the task never finishes —
-    /// `wait_for("the relay to exit by the drain deadline")` panics at
-    /// its 2 s cap with the open still parked (the pre-fix relay hung
-    /// on the open await forever; only the unbounded open changed).
+    /// the relay hung on the open await forever.
+    ///
+    /// W13-AA RED (2026-06-12, the clamp strawmanned to
+    /// `OpenDeadline::within(config.open_bound, None)` — the pre-fix
+    /// bare fixed bound, at production ordering): the post-edge
+    /// re-open ran its FULL 2000 ms bound — 5x past the 400 ms grace
+    /// — and `wait_for("the relay to exit by the drain deadline")`
+    /// panicked at its 2 s cap with the relay still parked in the
+    /// open. POST-FIX GREEN: exit at ~450 ms past the edge, strictly
+    /// inside one open_bound (the structural separation below).
     #[tokio::test]
     async fn hung_open_abandons_at_drain_deadline() {
         let mut h = harness().await;
@@ -2493,8 +2520,9 @@ mod tests {
         // Terminal while the open is parked: the drain edge must abort
         // the open (not wait for it), arm the grace, and the loop must
         // exit once the grace expires — cutting each further hung open
-        // at open_bound (100 ms test scale) along the way.
+        // at min(open_bound, remaining grace) along the way.
         h.set.on_terminal(DRV);
+        let edge_at = std::time::Instant::now();
         let handle = h
             .set
             .tasks
@@ -2506,11 +2534,23 @@ mod tests {
             handle.is_finished()
         })
         .await;
+        // W13-AA, the budget separation (structural, 4x headroom
+        // under load): the exit lands STRICTLY inside one bare
+        // open_bound past the edge. Pre-fix this is impossible — the
+        // post-edge hung open alone holds the loop for the full
+        // 2000 ms before the grace expiry can even be consulted (the
+        // 5-6x exit-at-expiry breach the spec'd budget forbids).
+        let exited_after = edge_at.elapsed();
+        assert!(
+            exited_after < Duration::from_millis(2000),
+            "exit-at-expiry must not wait out a bare open_bound: the hung              re-open ran unclamped past the remaining grace              (exited {exited_after:?} after the drain edge)"
+        );
 
         // The exit came from the law (grace expiry), not from a lucky
         // single attempt: the hung opens were retried and cut at least
-        // once after the drain edge (grace 400 ms / open_bound 100 ms
-        // + backoff 50 ms leaves room for ≥2 further attempts).
+        // once after the drain edge (grace 400 ms with backoff 50 ms
+        // and the grace-clamped open leaves room for >=2 further
+        // attempts).
         assert!(
             h.mock.request_count() >= 2,
             "expected re-opens after the drain edge, got {}",

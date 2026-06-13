@@ -3248,6 +3248,19 @@ dropped without an abort observed its lifecycle channel's death as a
 wake-up, skipped every backoff, and hot-looped stream opens at full
 speed --- for a consumer that no longer existed.
 
+Exit-at-expiry binds EVERY await in the loop, the open included
+(bug_038): the re-open's per-attempt bound is DEADLINE-TYPED --- the
+fixed bound clamped to whatever remains of the armed grace envelope,
+consulted before the open arms --- so a hung re-open against a
+half-open replica is cut at the remaining grace instead of running its
+full fixed bound (shipped: a 10 s open bound against a 2 s grace ---
+the unclamped await stretched exit-at-expiry 5-6x and delayed the
+truncation disclosure by the difference). The backoff sleep consumes
+the same clamp producer, and grace-conformance fixtures preserve the
+production parameter ordering (open bound LARGER than grace) --- the
+inverted-ratio fixture could not represent the breach it existed to
+refuse.
+
 #r("store.log.tail-fanout-recovery")[
   The live-tail fan-out MAY drop batches (a slow reader must never
   backpressure ingest), but a follow serve loop MUST NOT advance its

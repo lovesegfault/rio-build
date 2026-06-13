@@ -115,6 +115,54 @@ pub async fn bounded_open<T>(
     }
 }
 
+/// A DEADLINE-TYPED open bound (bug_038, R34(iv)): the fixed
+/// per-attempt bound CLAMPED to whatever remains of an enclosing
+/// armed envelope deadline (a post-terminal grace window, a shutdown
+/// budget). Awaits inside a grace envelope take THIS type, never a
+/// bare `Duration` — constructing it forces the envelope consult
+/// BEFORE the open arms, so the per-attempt bound structurally cannot
+/// outlive the envelope it is nested inside. An unarmed envelope
+/// (`None`) degenerates to the fixed bound; an already-expired one
+/// clamps to zero (the open gets a single poll and times out — the
+/// caller's exit law sees the expiry on the very next consult).
+#[derive(Debug, Clone, Copy)]
+pub struct OpenDeadline(Duration);
+
+impl OpenDeadline {
+    /// Clamp `per_attempt` to the time remaining until `envelope`
+    /// (saturating at zero). `None` = no envelope armed.
+    #[must_use]
+    pub fn within(per_attempt: Duration, envelope: Option<tokio::time::Instant>) -> Self {
+        Self(match envelope {
+            Some(deadline) => {
+                per_attempt.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            }
+            None => per_attempt,
+        })
+    }
+
+    /// The effective bound this deadline admits.
+    #[must_use]
+    pub fn bound(self) -> Duration {
+        self.0
+    }
+}
+
+/// [`bounded_open`] with the bound supplied as a typed, envelope-
+/// clamped [`OpenDeadline`] (bug_038): the sanctioned form for opens
+/// that run INSIDE a grace envelope. `TimedOut::after` reports the
+/// EFFECTIVE bound (the clamped value), so a log line distinguishes
+/// "the per-attempt bound elapsed" from "the envelope had less
+/// remaining than one attempt".
+// r[impl proto.client.streaming-open-bounded]
+pub async fn bounded_open_within<T>(
+    abort: impl Future<Output = ()>,
+    deadline: OpenDeadline,
+    open: impl Future<Output = Result<T, tonic::Status>>,
+) -> OpenOutcome<T> {
+    bounded_open(abort, deadline.bound(), open).await
+}
+
 /// Await one unary RPC, racing it (biased, in order) against shutdown
 /// and a deadline. The only sanctioned way to await a generated unary
 /// in a retry loop — see the `transport-unary-ban` policy check.
@@ -433,6 +481,46 @@ mod tests {
                 after
             } if after == Duration::from_secs(10)
         ));
+    }
+
+    /// W13-AA2 + the clamp cells (bug_038): the deadline-typed open
+    /// bound degenerates to the fixed per-attempt bound when no
+    /// envelope is armed or the envelope is ample; it clamps to the
+    /// remaining envelope when that is smaller; and it saturates at
+    /// zero once the envelope expired — the open gets one poll and
+    /// times out, so an expired grace can never fund a fresh attempt.
+    /// Paused clock: pure timer arithmetic, no IO.
+    #[tokio::test(start_paused = true)]
+    async fn open_deadline_clamps_to_the_armed_envelope() {
+        let per_attempt = Duration::from_secs(10);
+        // No envelope: the fixed bound (fast opens unchanged).
+        assert_eq!(OpenDeadline::within(per_attempt, None).bound(), per_attempt);
+        // Ample envelope: still the fixed bound.
+        let far = tokio::time::Instant::now() + Duration::from_secs(100);
+        assert_eq!(
+            OpenDeadline::within(per_attempt, Some(far)).bound(),
+            per_attempt
+        );
+        // Tight envelope: clamped to the remainder — the production
+        // shape (open 10 s vs 2 s grace) that pre-fix ran the full
+        // fixed bound, 5x past exit-at-expiry.
+        let tight = tokio::time::Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            OpenDeadline::within(per_attempt, Some(tight)).bound(),
+            Duration::from_secs(2)
+        );
+        // Expired envelope: zero — and the bounded open with a zero
+        // deadline resolves TimedOut without waiting.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let deadline = OpenDeadline::within(per_attempt, Some(tight));
+        assert_eq!(deadline.bound(), Duration::ZERO);
+        let out = bounded_open_within(
+            std::future::pending(),
+            deadline,
+            std::future::pending::<Result<(), tonic::Status>>(),
+        )
+        .await;
+        assert!(matches!(out, OpenOutcome::TimedOut { after } if after == Duration::ZERO));
     }
 
     #[tokio::test(start_paused = true)]
