@@ -3009,6 +3009,227 @@ in
         fi
         touch $out
       '';
+
+  # merged_bug_024: the quota-volume selection's unit tier. Runs the
+  # REAL nix/nixos-node/quota-volume-select.sh (staged — (vvvvv)/(wwwww):
+  # the script file is the check input AND the check asserts
+  # eks-node.nix still consumes it, so the embed is pinned both ways)
+  # against fixture by-id namespaces DERIVED FROM THE PRODUCERS:
+  #
+  #   - the partition layouts are the locked nixpkgs
+  #     make-disk-image.nix recipes (legacy+gpt: part1 = bios_grub,
+  #     no fs, never mounted; part2 = ext4 root | efi: part1 = ESP
+  #     fat32 at /boot; part2 = ext4 root) — the populations the
+  #     ami-bios/ami variants boot with;
+  #   - the by-id link shapes are udev's persistent-storage grammar
+  #     (one whole-disk link `…vol<id>` plus one `…vol<id>-partN` per
+  #     partition; nsid twins `…vol<id>_1`).
+  #
+  # The pre-fix selection (children/mountpoint side effects only)
+  # counted the bios_grub partition as a bare candidate: n_bare=2 →
+  # exit 1 → kubelet Requires= hard-fail on EVERY ami-bios boot (the
+  # I-205 churn shape), and with the quota volume late/absent SELECTED
+  # bios_grub for mkfs.xfs -f. The typed predicate (name-class
+  # `*-part[0-9]*` reject + lsblk TYPE==disk) makes both impossible by
+  # class; the plant battery below spans the predicate's shape space
+  # so a degenerate mutation of any clause turns at least one
+  # population red (R31'(v): fixture populations derive from
+  # producers; the K-mutation discipline for an authored predicate).
+  quota-volume-select =
+    pkgs.runCommand "rio-quota-volume-select"
+      {
+        selectScript = ../nix/nixos-node/quota-volume-select.sh;
+        eksNode = ../nix/nixos-node/eks-node.nix;
+        nativeBuildInputs = [ pkgs.bash ];
+      }
+      ''
+        # Bidirectional pin: the unit must consume the tested script.
+        grep -q 'quota-volume-select.sh' "$eksNode" || {
+          echo "FAIL: eks-node.nix no longer references quota-volume-select.sh —" >&2
+          echo "the unit and this check have detached (the selection logic" >&2
+          echo "under test is not the logic the fleet boots)" >&2
+          exit 1
+        }
+
+        # Mock lsblk: consults LSBLK_TABLE rows
+        # `<resolved-path>|<TYPE>|<children, space-sep>|<mountpoints>`.
+        # Implements exactly the three invocations the script makes.
+        mkdir -p bin
+        cat > bin/lsblk << 'MOCK'
+        #!/usr/bin/env bash
+        dev="''${@: -1}"
+        row=$(grep -F "$dev|" "$LSBLK_TABLE" | head -n1)
+        IFS='|' read -r _ type children mounts <<< "$row"
+        case "$*" in
+          *-ndo\ TYPE*) echo "$type" ;;
+          *-nro\ NAME*) echo self; for c in $children; do echo "$c"; done ;;
+          *-nro\ MOUNTPOINTS*) echo "$mounts" ;;
+        esac
+        MOCK
+        # The sandbox has no /usr/bin/env — point the shebang at the
+        # staged bash directly.
+        sed -i "1s|.*|#!$(command -v bash)|" bin/lsblk
+        chmod +x bin/lsblk
+        export PATH=$PWD/bin:$PATH
+
+        # The script canonicalizes candidates (readlink -f); key the
+        # mock table on the canonical base so a symlinked sandbox
+        # build dir cannot desynchronize the lookup.
+        base=$(readlink -f "$PWD")
+
+        prefix=nvme-Amazon_Elastic_Block_Store_
+
+        # mkpop NAME 'link:dev' ... — builds dev tree pop-NAME/dev with
+        # by-id links; devices created as plain files; the table is
+        # written by the caller.
+        mkpop() {
+          local name=$1; shift
+          mkdir -p "pop-$name/dev/disk/by-id"
+          local spec link devf
+          for spec in "$@"; do
+            link=''${spec%%:*}; devf=''${spec#*:}
+            : > "pop-$name/dev/$devf"
+            ln -sf "../../$devf" "pop-$name/dev/disk/by-id/$prefix$link"
+          done
+        }
+
+        run() { # run POP -> sel = stdout selection; stderr to err; rc
+          rc=0
+          sel=$(bash "$selectScript" "$base/pop-$1/dev/disk/by-id/$prefix"'vol*' 2>err) || rc=$?
+        }
+
+        fail() { echo "FAIL($1): $2" >&2; cat err >&2 || true; exit 1; }
+
+        # ── A: ami-bios (legacy+gpt) full population ──────────────────
+        mkpop A volR:R 'volR-part1:Rp1' 'volR-part2:Rp2' volQ:Q
+        cat > tA << EOF
+        $base/pop-A/dev/R|disk|p1 p2|
+        $base/pop-A/dev/Rp1|part||
+        $base/pop-A/dev/Rp2|part||/
+        $base/pop-A/dev/Q|disk||
+        EOF
+        export LSBLK_TABLE=$PWD/tA
+        run A
+        [ "$rc" = 0 ] && [ "$sel" = "$base/pop-A/dev/Q" ] \
+          || fail A "ami-bios population must select the quota volume (got rc=$rc sel=$sel) — the bios_grub partition re-entered the bare fold"
+        grep -q '2 partition-link' err || fail A "the operator trail must count both partition links"
+
+        # ── B: ami-bios, quota volume late/absent — the mkfs corner ──
+        mkpop B volR:R 'volR-part1:Rp1' 'volR-part2:Rp2'
+        cat > tB << EOF
+        $base/pop-B/dev/R|disk|p1 p2|
+        $base/pop-B/dev/Rp1|part||
+        $base/pop-B/dev/Rp2|part||/
+        EOF
+        export LSBLK_TABLE=$PWD/tB
+        run B
+        [ "$rc" = 1 ] || fail B "no-quota population must refuse (got rc=$rc sel=$sel) — pre-fix this SELECTED bios_grub for mkfs.xfs -f"
+        grep -q 'NO bare quota volume' err || fail B "refusal must keep the live_060 operator message"
+        grep -q '2 partition-link' err || fail B "refusal trail must show the partitions died by class"
+
+        # ── C: uefi (efi recipe) — the winner is byte-stable ─────────
+        mkpop C volR:R 'volR-part1:Rp1' 'volR-part2:Rp2' volQ:Q
+        cat > tC << EOF
+        $base/pop-C/dev/R|disk|p1 p2|
+        $base/pop-C/dev/Rp1|part||/boot
+        $base/pop-C/dev/Rp2|part||/
+        $base/pop-C/dev/Q|disk||
+        EOF
+        export LSBLK_TABLE=$PWD/tC
+        run C
+        [ "$rc" = 0 ] && [ "$sel" = "$base/pop-C/dev/Q" ] \
+          || fail C "uefi population must keep the pre-fix winner (got rc=$rc sel=$sel)"
+
+        # ── D: the plant battery (predicate shape space; each row
+        #      kills one clause mutation) ───────────────────────────────
+        # D1 name-class: a -part1 link whose TYPE reads disk (taxonomy
+        # alone would admit it) still dies by name.
+        mkpop D1 'volL-part1:L1' volQ:Q
+        cat > tD1 << EOF
+        $base/pop-D1/dev/L1|disk||
+        $base/pop-D1/dev/Q|disk||
+        EOF
+        export LSBLK_TABLE=$PWD/tD1
+        run D1
+        [ "$rc" = 0 ] && [ "$sel" = "$base/pop-D1/dev/Q" ] && grep -q '1 partition-link' err \
+          || fail D1 "deleting the name-class clause must turn this population ambiguous (got rc=$rc sel=$sel)"
+
+        # D2 taxonomy: a suffix-free link resolving to TYPE=part (the
+        # name class alone would admit it) dies by taxonomy.
+        mkpop D2 volALIAS:P volQ:Q
+        cat > tD2 << EOF
+        $base/pop-D2/dev/P|part||
+        $base/pop-D2/dev/Q|disk||
+        EOF
+        export LSBLK_TABLE=$PWD/tD2
+        run D2
+        [ "$rc" = 0 ] && [ "$sel" = "$base/pop-D2/dev/Q" ] && grep -q '1 non-disk' err \
+          || fail D2 "deleting the TYPE clause must turn this population ambiguous (got rc=$rc sel=$sel)"
+
+        # D3 taxonomy, loop class.
+        mkpop D3 volLOOP:LP volQ:Q
+        cat > tD3 << EOF
+        $base/pop-D3/dev/LP|loop||
+        $base/pop-D3/dev/Q|disk||
+        EOF
+        export LSBLK_TABLE=$PWD/tD3
+        run D3
+        [ "$rc" = 0 ] && [ "$sel" = "$base/pop-D3/dev/Q" ] || fail D3 "loop devices must die by taxonomy (got rc=$rc sel=$sel)"
+
+        # D4 name-class, multi-digit suffix.
+        mkpop D4 'volR-part10:P10' volQ:Q
+        cat > tD4 << EOF
+        $base/pop-D4/dev/P10|part||
+        $base/pop-D4/dev/Q|disk||
+        EOF
+        export LSBLK_TABLE=$PWD/tD4
+        run D4
+        [ "$rc" = 0 ] && [ "$sel" = "$base/pop-D4/dev/Q" ] && grep -q '1 partition-link' err \
+          || fail D4 "-part10 must die by name class (got rc=$rc sel=$sel)"
+
+        # D5 ambiguity: two bare whole disks refuse loudly.
+        mkpop D5 volQ:Q volSECOND:S
+        cat > tD5 << EOF
+        $base/pop-D5/dev/Q|disk||
+        $base/pop-D5/dev/S|disk||
+        EOF
+        export LSBLK_TABLE=$PWD/tD5
+        run D5
+        [ "$rc" = 1 ] && grep -q '2 bare candidate volumes' err \
+          || fail D5 "two bare disks must refuse as ambiguous (got rc=$rc sel=$sel)"
+
+        # D6 dedup: the nsid twin link must not double-count.
+        mkpop D6 volQ:Q volQ_1:Q
+        cat > tD6 << EOF
+        $base/pop-D6/dev/Q|disk||
+        EOF
+        export LSBLK_TABLE=$PWD/tD6
+        run D6
+        [ "$rc" = 0 ] && [ "$sel" = "$base/pop-D6/dev/Q" ] || fail D6 "nsid twin links must dedup to one candidate (got rc=$rc sel=$sel)"
+
+        # D7 mounted: a mounted whole disk is somebody's filesystem.
+        mkpop D7 volM:M volQ:Q
+        cat > tD7 << EOF
+        $base/pop-D7/dev/M|disk||/data
+        $base/pop-D7/dev/Q|disk||
+        EOF
+        export LSBLK_TABLE=$PWD/tD7
+        run D7
+        [ "$rc" = 0 ] && [ "$sel" = "$base/pop-D7/dev/Q" ] && grep -q '1 mounted' err \
+          || fail D7 "mounted disks must be excluded (got rc=$rc sel=$sel)"
+
+        # ── E: the VM shape — a direct non-by-id whole-disk path ─────
+        mkdir -p pop-E/dev
+        : > pop-E/dev/vdb
+        cat > tE << EOF
+        $base/pop-E/dev/vdb|disk||
+        EOF
+        export LSBLK_TABLE=$PWD/tE
+        rc=0; sel=$(bash "$selectScript" "$base/pop-E/dev/vdb" 2>err) || rc=$?
+        [ "$rc" = 0 ] && [ "$sel" = "$base/pop-E/dev/vdb" ] || fail E "the VM-config direct-path shape must keep selecting (got rc=$rc sel=$sel)"
+
+        touch $out
+      '';
 }
 # The quint/TLC protocol-model checks and the mbt-* conformance checks
 # used to be spliced in here; they are now imported directly by

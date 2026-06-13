@@ -28,6 +28,19 @@ let
   nodeadm = pkgs.callPackage ./nodeadm.nix { inherit pins; };
   ecr-credential-provider = pkgs.callPackage ./ecr-credential-provider.nix { inherit pins; };
 
+  # The quota-volume selection, extracted to a file so the unit-tier
+  # check (misc-checks.nix `quota-volume-select`) runs the SAME logic
+  # against fixture by-id namespaces (merged_bug_024: the in-unit copy
+  # counted the ami-bios bios_grub partition as a bare candidate —
+  # n_bare=2, exit 1, kubelet Requires= hard-fail on every x86-metal
+  # boot — and the quota-volume-late corner selected bios_grub for
+  # mkfs.xfs -f; nothing exercised the by-id enumeration until the
+  # selection became this testable unit). Needs lsblk + readlink on
+  # PATH (the consuming unit provides util-linux + coreutils).
+  quotaVolumeSelect = pkgs.writeShellScript "quota-volume-select" (
+    builtins.readFile ./quota-volume-select.sh
+  );
+
   # containerd-config.nix pins sandbox = "localhost/kubernetes/pause" and
   # expects the AMI bake to have pre-loaded it (templates/shared/runtime/
   # bin/cache-pause-container in the AL2023 builder). Build the pause binary
@@ -106,8 +119,12 @@ in
         Device globs rio-ebs-quota-mount enumerates to find the
         dedicated kubelet quota volume on EBS-only nodes (live_060:
         the karpenter EC2NodeClass attaches it as the second EBS
-        mapping). The root disk is excluded by partition-table
-        presence; exactly one bare candidate must remain. VM tests
+        mapping). Selection is by TYPED device class
+        (quota-volume-select.sh, merged_bug_024): per-partition by-id
+        links (`*-part[0-9]*`) are rejected by name, every candidate
+        must read `lsblk TYPE == disk`, the root disk is excluded by
+        its partition children, mounted disks by their mountpoints;
+        exactly one bare whole-disk candidate must remain. VM tests
         point this at their virtio disk.
       '';
     };
@@ -512,48 +529,16 @@ in
           script = ''
             set -euo pipefail
             udevadm settle
-            # Enumerate candidates from the configured globs; resolve
-            # symlinks and dedup (EBS exposes two by-id links per
-            # volume on some udev versions).
-            declare -A seen
-            cands=()
-            for g in ${lib.escapeShellArgs cfg.quotaVolumeGlobs}; do
-              for l in $g; do
-                [ -e "$l" ] || continue
-                d=$(readlink -f "$l")
-                if [ -z "''${seen[$d]:-}" ]; then
-                  seen[$d]=1
-                  cands+=("$d")
-                fi
-              done
-            done
-            # Exclude the root/boot disk: anything carrying a
-            # partition table (lsblk children) or hosting a mounted
-            # filesystem is not the bare quota volume.
-            quota_dev=""
-            n_bare=0
-            for d in "''${cands[@]:-}"; do
-              [ -n "$d" ] || continue
-              if [ -n "$(lsblk -nro NAME "$d" | tail -n +2)" ]; then
-                continue # has partitions: the root disk
-              fi
-              if [ -n "$(lsblk -nro MOUNTPOINTS "$d" | tr -d '[:space:]')" ]; then
-                continue # already mounted somewhere
-              fi
-              quota_dev="$d"
-              n_bare=$((n_bare + 1))
-            done
-            if [ "$n_bare" -eq 0 ]; then
-              echo "rio-ebs-quota-mount: NO bare quota volume found — the" >&2
-              echo "EC2NodeClass must attach the second EBS mapping (live_060:" >&2
-              echo "an EBS-only builder node without prjquota has a dead disk" >&2
-              echo "producer; refusing to let kubelet start on the root fs)" >&2
-              exit 1
-            fi
-            if [ "$n_bare" -gt 1 ]; then
-              echo "rio-ebs-quota-mount: $n_bare bare candidate volumes — ambiguous; refusing" >&2
-              exit 1
-            fi
+            # Typed device-class selection (merged_bug_024): partition
+            # by-id links rejected by name, candidates classified via
+            # lsblk TYPE == disk, root disk excluded by its partition
+            # children, mounted disks by their mountpoints — exactly
+            # one bare whole disk must remain. The logic lives in
+            # quota-volume-select.sh; the misc-checks unit tier runs
+            # the same file against the per-AMI-variant by-id
+            # namespaces (legacy+gpt incl. bios_grub, efi) so the
+            # exclusion claim is witnessed, never asserted.
+            quota_dev=$(${quotaVolumeSelect} ${lib.escapeShellArgs cfg.quotaVolumeGlobs})
             sig=$(blkid -o value -s TYPE "$quota_dev" || true)
             case "$sig" in
               xfs) ;; # persisted volume from a previous boot: mount as-is
