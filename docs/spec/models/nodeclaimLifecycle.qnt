@@ -2429,7 +2429,9 @@ module respawnGiveUpCore {
   /// Round-12 merged_bug_043: the decay guard keys on epoch CHANGE
   /// (true = the landed change-keyed law; false = the round-11
   /// order-keyed `>` encoding, whose exit edge is vacuous for the
-  /// REWOUND orbit — ClearPoison zeroes resubmit_cycle).
+  /// REWOUND orbit — produced by the poison-TTL lane's zero stamp
+  /// and the failover floor-loss corner; the admin ClearPoison lane
+  /// bumps `cycles + 1` as of bug_058 and no longer rewinds).
   const CHANGE_KEYED: bool
   /// RESPAWN_GIVE_UP_DEATHS, scaled for the explored space.
   const GIVE_UP: int
@@ -2549,12 +2551,17 @@ module respawnGiveUpCore {
     giveUpEffects' = giveUpEffects,
   }
 
-  /// Round-12 merged_bug_043: the documented OPERATOR RECOVERY —
-  /// ClearPoison zeroes `resubmit_cycle` (completion.rs), the
-  /// reprobe lane mirrors the zero, and the fresh DAG re-insert
-  /// starts at cycle 0: demand returns with a REWOUND epoch. The
-  /// epoch is a demand signal, not a monotone counter — two
-  /// scheduler lanes lawfully rewind it.
+  /// Round-12 merged_bug_043: demand returns with a REWOUND epoch.
+  /// The epoch is a demand signal, not a monotone counter —
+  /// scheduler lanes lawfully rewind it. Producer re-derivation at
+  /// bug_058 (the action name is historical): the admin ClearPoison
+  /// lane now BUMPS `cycles + 1` (completion.rs) and floors the
+  /// post-clear re-insert, so it no longer produces this orbit; the
+  /// remaining rewind producers are the poison-TTL expiry lane
+  /// (still stamps 0) and a scheduler failover inside the
+  /// clear→resubmit window (the in-memory floor is lost; the
+  /// re-insert starts at 0). The orbit stays in the environment
+  /// alphabet and the change-keyed decay stays load-bearing.
   action clearPoisonRewind = all {
     not(intentPresent),
     envCycle > 0,

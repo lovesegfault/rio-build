@@ -3930,6 +3930,7 @@ impl DagActor {
         // for this node, so the FIRST post-clear observation decays the
         // latch. The same value is parked as a DAG floor below so the
         // post-clear re-insert actually presents it.
+        // r[impl sched.resubmit.epoch-total]
         let reset_row = self
             .reset_row_for(drv_hash, OutcomeClass::PoisonCleared, ReportingParty::Admin)
             .map(|mut r| {

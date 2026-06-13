@@ -416,6 +416,7 @@ impl DerivationDag {
             // Poisoned-resubmit bound (POISON_RESUBMIT_RETRY_LIMIT)
             // accumulates across resubmits — without this, every reset
             // would start at 0 and the bound would never fire (I-169).
+            // r[impl sched.resubmit.epoch-total]
             let is_submission_root = !submission_children.contains(node.drv_path.as_str());
             let prior = if !newly_inserted.contains(&drv_hash)
                 && self

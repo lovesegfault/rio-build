@@ -637,6 +637,34 @@ band-boundary witnesses, stated here so the disposition is explicit.
   the breaker.
 ]
 
+#r("ctrl.pool.giveup-exit-mintable")[
+  The gave-up latch's exit edge MUST be satisfiable by values its
+  producer can mint from every latched configuration: each derivation
+  state a verdict-free give-up can leave latched maps to a documented
+  recovery action (explicit resubmission of the drv; `ClearPoison`)
+  whose observed demand epoch provably differs from the latched one,
+  and the decay seam MUST fire on any such changed observation the
+  same tick. The latched-configuration-to-mintable-face mapping MUST
+  be a derived census over the producer's state alphabet (the
+  scheduler's resubmit classification), never a hand list of value
+  faces.
+]
+
+The round-13 instance (bug_058, R30's producer-reachability face): the
+wave-12 close enumerated the observed-VALUE faces {unseen, same,
+newer, rewound} and keyed the decay on change --- correct at this
+seam --- but never derived which faces the PRODUCER could mint per
+latched state. The scheduler's only cycle mint sat behind the
+retriable band, a verdict-free give-up leaves the drv `queued`/`ready`
+(outside it), so "same" was the only mintable face for exactly the
+latched population: the documented recovery contract was structurally
+dead, and the build hung silently with both recovery actions consumed
+(`ClearPoison`'s rewind-to-0 was an equality fixed point at the common
+cycle-0 latch). The close is producer-side
+(#rref("sched.resubmit.epoch-total")); this rule pins the consumer
+half: the exit edge quantifies over (latched configuration ×
+producer-emittable faces), not over the value domain.
+
 #r("ctrl.pool.ack-spawned-soundness")[
   The Pool reconciler MUST ack `AckSpawnedIntents{spawned}` only for intents
   that have a Job behind them at ack time: intents whose create succeeded

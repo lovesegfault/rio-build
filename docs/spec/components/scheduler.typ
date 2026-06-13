@@ -2572,6 +2572,38 @@ column from the durability clause: migration 075 removed the column, and the
 attempt-ledger reset row has been the only carrier of the cycle index since
 the Phase-1b cutover froze the column.
 
+#r("sched.resubmit.epoch-total")[
+  Explicit resubmission MUST mint a fresh demand epoch (a changed
+  `resubmit_cycles`, carried on the next `SpawnIntent`) for every
+  derivation state a verdict-free give-up can leave latched: the
+  retriable band on any merge that touches the node, and the
+  verdict-free band (`created`/`queued`/`ready`) when the drv is a
+  root of the submission (the explicitly-requested drv --- the
+  documented per-drv recovery action). The mint classification MUST
+  be total over the derivation-status alphabet with zero wildcard
+  arms, every non-mintable state naming its exit owner (in-flight:
+  the live attempt's verdict; terminal-served: the cache-hit lane;
+  bounded refusal: `ClearPoison`/TTL). `ClearPoison` MUST move the
+  epoch past every value the controller can have observed for the
+  node --- a bump from the live cycle, never a rewind --- and the
+  post-clear re-insert MUST present it.
+]
+
+The round-13 instance (bug_058 HIGH --- R30's producer-reachability
+face, minted here): the controller's gave-up latch decays only on a
+CHANGED observed `resubmit_cycle`, and the merge's only cycle mint was
+gated on the retriable band --- so a drv left `queued`/`ready` by a
+verdict-free give-up merged interest-only at the same cycle on every
+resubmission, and `ClearPoison`'s rewind-to-0 was an equality fixed
+point at the common cycle-0 latch: a silent indefinite build hang with
+the documented recovery contract structurally dead. The verdict-free
+band is ROOT-keyed because `queued`/`ready` are the permanent states
+of every healthy shared dependency: an any-merge band reset would fire
+on every concurrent-build closure overlap, wiping per-cycle retry
+budgets and inflating `resubmit_cycles` past the
+#rref("sched.merge.poisoned-resubmit-bounded") bound for hot shared
+deps. The consumer half is #rref("ctrl.pool.giveup-exit-mintable").
+
 #r("sched.merge.stale-completed-verify+5")[
   When a build merges and finds a pre-existing `completed` or `skipped` node in
   the global DAG, the scheduler batches a `FindMissingPaths` against rio-store

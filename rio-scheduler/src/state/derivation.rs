@@ -276,6 +276,7 @@ impl DerivationStatus {
         )
     }
 
+    // r[impl sched.resubmit.epoch-total]
     /// bug_058: the VERDICT-FREE band — states with no attempt in
     /// flight and no terminal verdict, which an explicit resubmission
     /// MUST also treat as a demand-epoch event (`dag::merge` resets
@@ -2056,6 +2057,7 @@ impl DerivationState {
         )
     }
 
+    // r[impl sched.resubmit.epoch-total]
     /// bug_058: the `dag::merge` reset gate's callee — whether THIS
     /// submission resets the node and mints `resubmit_cycles + 1`.
     ///
@@ -2088,6 +2090,7 @@ impl DerivationState {
         }
     }
 
+    // r[impl sched.resubmit.epoch-total]
     /// bug_058: the TOTAL resubmit classification over the status
     /// alphabet — every status is exactly one disposition, zero
     /// wildcard arms (R14). The mint gate consumes the collapsed form

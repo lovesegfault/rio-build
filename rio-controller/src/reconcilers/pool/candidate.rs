@@ -669,10 +669,24 @@ pub(crate) const RESPAWN_BACKOFF_CAP_SECS: u64 = 1280;
 /// spawnable, is filtered by `respawn_blocked`, and never produces an
 /// attempt; the recently-closed/open-attempt consults sit behind
 /// active-Job early returns). The exit edge is therefore POD-FREE: a
-/// resubmission of the drv (a strictly newer `SpawnIntent
-/// .resubmit_cycle` than the record last observed) IS the operator's
-/// intent signal, observed at the demand seam the latch does not
-/// gate, and decays the record the same tick. Pure-time decay was
+/// resubmission of the drv (a CHANGED `SpawnIntent.resubmit_cycle`
+/// --- newer or rewound alike) IS the operator's intent signal,
+/// observed at the demand seam the latch does not gate, and decays
+/// the record the same tick.
+///
+/// bug_058 (R30's producer-reachability face): the fresh face is
+/// PRODUCER-MINTABLE from every latched configuration --- the
+/// scheduler's `dag::merge` mints `resubmit_cycles + 1` for the
+/// verdict-free band (`Queued`/`Ready`/`Created`, exactly the states
+/// a verdict-free give-up leaves) when the drv is resubmitted as a
+/// submission root (the documented per-drv action), and `ClearPoison`
+/// BUMPS the cycle past every observed value (never the old
+/// rewind-to-0, whose equality fixed point held this latch through
+/// both documented recovery actions). Before that close the only
+/// mintable face for the latched population was "same" and this
+/// contract was structurally dead --- the silent indefinite hang.
+///
+/// Pure-time decay was
 /// REJECTED (it re-arms the hot loop the latch exists to stop);
 /// the unconditional recently-closed consult was REJECTED (it
 /// re-prices every tick for one lane). Deaths under the new epoch
@@ -1155,9 +1169,11 @@ impl PoolStreaks {
     ///     the give-up baseline is the last epoch seen before the
     ///     latch), never decay;
     ///   - GAVE-UP record observing a CHANGED epoch --- newer OR
-    ///     REWOUND (merged_bug_043: ClearPoison zeroes
-    ///     `resubmit_cycle`; the value domain's faces are {unseen,
-    ///     same, newer, rewound}): DECAY --- remove the record and
+    ///     REWOUND (merged_bug_043: the value domain's faces are
+    ///     {unseen, same, newer, rewound}; the rewound producers
+    ///     post-bug_058 are the poison-TTL lane and the failover
+    ///     floor-loss corner --- admin ClearPoison now BUMPS):
+    ///     DECAY --- remove the record and
     ///     mint the [`GaveUpReset`] receipt. The epoch change is the
     ///     operator's intent signal; the next death cycle starts
     ///     fresh at the full give-up budget (the safety face).
@@ -1166,7 +1182,16 @@ impl PoolStreaks {
     /// expires by itself (time is that state's exit edge), and an
     /// epoch-triggered reset mid-window would let resubmit spam
     /// bypass the breaker --- the exact hot loop it exists to stop.
+    ///
+    /// bug_058 (the producer half of this exit edge): every face this
+    /// seam can decay on is now MINTABLE from every latched
+    /// configuration --- explicit resubmission of the drv mints
+    /// `cycles + 1` for the verdict-free band scheduler-side, and
+    /// `ClearPoison` bumps --- so the documented recovery actions
+    /// always present a changed epoch here (the producer-reachability
+    /// census and the face census are the paired [GEN-SET]s).
     // r[impl ctrl.pool.respawn-backoff+5]
+    // r[impl ctrl.pool.giveup-exit-mintable]
     pub fn note_demand_epoch(
         &mut self,
         pool: &PoolKey,
@@ -1178,13 +1203,17 @@ impl PoolStreaks {
             match e.demand_cycle {
                 // The decay cell: a CHANGED epoch on a GAVE-UP record
                 // (merged_bug_043: keyed on CHANGE, not order —
-                // ClearPoison zeroes resubmit_cycle, the reprobe lane
-                // mirrors the zero, and the fresh DAG re-insert
-                // starts at cycle 0, so the documented operator
-                // recovery presents as a REWOUND epoch; anti-replay
-                // needs only EQUALITY, and an order comparison
-                // imports a monotonicity contract two scheduler
-                // lanes legitimately break. The two-guard split
+                // anti-replay needs only EQUALITY, and an order
+                // comparison imports a monotonicity contract
+                // scheduler lanes legitimately break. The rewound
+                // producers post-bug_058: the poison-TTL expiry still
+                // stamps 0, and a scheduler failover inside the
+                // ClearPoison→resubmit window loses the in-memory
+                // floor so the re-insert starts at 0 — the admin
+                // ClearPoison lane itself now BUMPS `cycles + 1`
+                // and floors the re-insert, so the FIRST post-clear
+                // observation lands in this cell as a NEWER face.
+                // The two-guard split
                 // keeps the mid-ladder tracking arm distinct —
                 // collapsing them into one arm with a fallthrough
                 // `Some(_)` would silently drop the epoch-tracking
