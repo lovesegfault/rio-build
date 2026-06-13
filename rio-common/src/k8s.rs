@@ -138,7 +138,7 @@ pub const BUILDER_SERVING_STATE_FILE: &str = "/tmp/rio-serving";
 // (sizeLimit overshoot — pod-attributed eviction), and (b) any
 // ENFORCED-quota world (the vm-quota-probe manual-limit harness; a
 // future enforcing kubelet); the scheduler's corroboration band
-// (actor/floor.rs::corroborated_sizing) consumes the SAME fn with the
+// (actor/floor.rs::corroborated_sizing) consumes the SAME fn — quantifier: census(disk_four_caller_census) — with the
 // [`DISK_HEADROOM_MIN`]/[`DISK_HEADROOM_MAX`] codomain bounds, and
 // REFUSES sentinel-armed claims by construction — the two sides
 // cannot drift into different denominations without this file

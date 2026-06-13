@@ -221,7 +221,7 @@ impl CorroborationWitness {
     ///   AND `peak_used >= hard / 2`. The wave-11 band
     ///   (`[assigned/2, assigned*4]` of RAW disk) accepted any
     ///   fabricated limit within 8x of the solve axis — a forger
-    ///   could move floors with a hard limit kubelet can never mint;
+    ///   could move floors with a hard limit kubelet can never mint — quantifier: census(disk_band_admits_minted_products_and_refuses_off_formula_limits) —;
     ///   the producer-derived band admits exactly the mintable
     ///   products (plus quota-block rounding).
     ///
@@ -596,7 +596,7 @@ mod tests {
     /// products. RED-FIRST (recorded in the commit body): under the
     /// wave-11 raw band (`[assigned/2, assigned*4]`) the 3.9x forged
     /// limit CORROBORATED — a worker could move floors with a hard
-    /// limit kubelet can never assign.
+    /// limit kubelet can never assign — quantifier: non-normative(narrates the retired pre-fix band; the live claim is bound at the band doc and pinned by this test's own asserts) —.
     #[test]
     fn disk_band_admits_minted_products_and_refuses_off_formula_limits() {
         use rio_common::k8s::{

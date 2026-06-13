@@ -264,11 +264,14 @@ pkgs.testers.runNixOSTest {
         assert script.index("udevadm settle") < script.index(
             "nvme-Amazon_EC2_NVMe_Instance_Storage"
         ), f"udevadm settle missing or after the jurisdiction glob:\n{script}"
-        conds = node.succeed(
-            "systemctl show -p ConditionPathExistsGlob rio-kubelet-mount.service"
-        ).strip()
-        assert conds == "ConditionPathExistsGlob=", (
-            f"the dispatcher grew a path Condition back - that is the "
+        # The RENDERED unit file is the deterministic source of truth
+        # (`systemctl show -p Condition...` never prints per-type
+        # condition properties - the first form of this assert could
+        # not pass on any systemd and was caught by the gate).
+        unit = node.succeed("systemctl cat rio-kubelet-mount.service")
+        conds = [l for l in unit.splitlines() if l.strip().startswith("Condition")]
+        assert conds == [], (
+            f"the dispatcher grew a Condition back - that is the "
             f"merged_bug_045 wrong-clock gate: {conds}"
         )
 

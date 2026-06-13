@@ -9,7 +9,6 @@ rio-controller/src/reconcilers/node_informer.rs	const-family	EXPOSURE_SHIP_PASS_
 rio-controller/src/reconcilers/nodeclaim_pool/sketch.rs	on-conflict-do-update	nodeclaim_cell_state
 rio-controller/src/reconcilers/pool/candidate.rs	const-family	RESPAWN_GIVE_UP_DEATHS
 rio-controller/src/reconcilers/pool/candidate.rs	give-up-pred	RESPAWN_GIVE_UP_DEATHS
-rio-controller/src/reconcilers/pool/jobs.rs	const-family	LOG_BUDGET_BYTES
 rio-gateway/src/handler/build.rs	give-up-pred	MAX_RECONNECT
 rio-gateway/src/handler/build.rs	give-up-pred	ZERO_BACKOFF_STREAK
 rio-gateway/src/handler/grpc.rs	const-family	PUT_PATH_ABORTED_MAX_ATTEMPTS

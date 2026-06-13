@@ -791,6 +791,18 @@ EXIT_EDGE_GRANDFATHER = "nix/exit-edge-grandfather.txt"
 # integrator enrolls them at the wave-close re-mint from the H-pack
 # records (H3'''/H5'''/H7''' name the landed shapes).
 EXIT_EDGE_ROWS = {
+    # bug_065 (bw13 S2): NOT a latch — a static sizing ADDEND (bytes
+    # reserved outside the overlay for logs + daemon state). No
+    # counter ever compares against it as an attempt budget; it is
+    # summed into pod ephemeral-storage requests. The name carries
+    # _BUDGET for its helm-mirror lineage (14-disk-ceiling.sh rows),
+    # which is what the const-family regex keys on. Moved here from
+    # pool/jobs.rs (whose grandfather row retired with the move,
+    # shrink-only).
+    ("rio-common/src/k8s.rs", "const-family", "LOG_BUDGET_BYTES"): (
+        "not a latch: a pure additive sizing constant — there is no exhaustion state to exit (no counter is compared against it; it feeds pod_ephemeral_request_bytes as an addend)",
+        "pod_ephemeral_decomposes_into_overlay_fuse_log (the identity test: the addend appears once, additively) + the controller disk_four_caller_census + the helm 14-disk-ceiling mirror rows pinned by HELM_MEMBER_ROWS",
+    ),
     # The heartbeat fast-retry budget (bw12 WO-S1-4): a per-tick
     # window, not a cross-tick latch - the budget re-arms at every
     # interval tick (tick_started re-stamped), so an exhausted window
