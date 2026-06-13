@@ -98,7 +98,7 @@ spec:
         # must not voluntarily disrupt a store pod — consolidation of
         # an under-utilized store node mid-ingest burns every attached
         # builder's 45s lease-steal window and (pre-token-fix) darkened
-        # their watchers' tails. The annotation gates ONLY Karpenter's
+        # their watchers' tails. The annotation gates only Karpenter's
         # own disruption controller: kubectl drains (manual node
         # rotation) still go through the eviction API and the rio-store
         # PDB's 10% budget, and KEDA scale-in deletes pods directly —

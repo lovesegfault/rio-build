@@ -349,7 +349,7 @@ store:
     # (50). Under the max-over-triggers fold this trigger only BINDS
     # in the drain window where attempts have closed but sessions
     # linger: replicas hold until the tails land, then the 300s
-    # scale-down window sees ALL triggers quiet and collapses as
+    # scale-down window sees all triggers quiet and collapses as
     # before. Render-time unit check: rio.promTrigger ×
     # files/metric-units.json.
     targetIngestSessionsPerReplica: 50

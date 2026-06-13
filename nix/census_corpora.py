@@ -656,6 +656,9 @@ DURATION_CENSUS_ROWS = {
     ("rio-store/src/logs/service.rs", "SHUTDOWN_TEARDOWN_WAIT"): (
         "wall (tokio timeout over the driver-gauge courtesy wait at graceful shutdown)",
         "bw13 live062-R3 (A2): bounded-by-construction courtesy window; the sweep behind it runs under the HEARTBEAT_RPC_BOUND typed timeout with disclose-on-abandon (shutdown_release_is_bounded_when_the_sweep_hangs)",
+    ("rio-gateway/src/handler/log_tail.rs", "TAIL_DEGRADED_NOTICE_AFTER"): (
+        "wall (tokio Instant at the degradation episode's own arming stamp — armed and notice deadline minted together at the first failed open; the episode's age IS the user-facing evidence clock, and nothing on any other clock refreshes or re-arms it)",
+        "live_062 WO-S10-6 (bw13-S10): deadline-shaped at the arm site (armed + AFTER vs Instant::now() — the in-file grace_deadline idiom; producer and consumer share the one Instant domain — same-domain, no conversion)",
     ),
 }
 DURATION_GRANDFATHER = "nix/duration-census-grandfather.txt"

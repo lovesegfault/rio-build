@@ -188,7 +188,7 @@ spec:
     # boot), so 0 is a true reading and the trigger releases the
     # moment the last tail lands; under the max-over-triggers fold
     # it BINDS only in the drain window, and the existing 300s
-    # scale-down stabilization then needs ALL of {backlog, builders,
+    # scale-down stabilization then needs all of {backlog, builders,
     # sessions, retry-inhibitor, cpu} quiet before collapsing.
     # Threshold: targetIngestSessionsPerReplica (values.yaml —
     # derivation there).

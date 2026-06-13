@@ -1006,7 +1006,16 @@ async fn run_tail(
     // logs, users read build output, and live_062's users diagnosed
     // "stuck builds" from a silent dark tail). `degraded_lane` is the
     // last failure's binary diagnosis for the notice text.
-    let mut degraded_since: Option<Instant> = None;
+    //
+    // R29' clock row (`tail-degraded-notice`): the gate is
+    // DEADLINE-SHAPED on the episode's own arming stamp — `(armed,
+    // armed + degraded_notice_after)` minted together at the first
+    // failure, compared as `Instant::now() >= deadline` (the
+    // grace_deadline idiom below; same Instant domain, no
+    // conversion). The episode's age IS the user-facing evidence
+    // here: nothing else refreshes or re-arms the deadline, so the
+    // notice cannot be starved by activity on any other clock.
+    let mut degraded: Option<(Instant, Instant)> = None;
     let mut degraded_notice_sent = false;
     let mut degraded_lane: &'static str = open_failed_lane(tonic::Code::Unavailable);
     loop {
@@ -1101,7 +1110,7 @@ async fn run_tail(
                 warned_open_failure = false;
                 // The episode (if any) ends at a successful open: the
                 // next degradation gets its own notice.
-                degraded_since = None;
+                degraded = None;
                 degraded_notice_sent = false;
                 match drive_stream(
                     resp.into_inner(),
@@ -1165,7 +1174,10 @@ async fn run_tail(
                 // rejections too, which misdiagnosed the 65-min
                 // blackout in the one log line operators had.
                 let lane = open_failed_lane(status.code());
-                degraded_since.get_or_insert_with(Instant::now);
+                degraded.get_or_insert_with(|| {
+                    let armed = Instant::now();
+                    (armed, armed + config.degraded_notice_after)
+                });
                 degraded_lane = lane;
                 if warned_open_failure {
                     debug!(code = ?status.code(), "TailLog open failed");
@@ -1194,7 +1206,10 @@ async fn run_tail(
                 // A half-open replica: TCP up, nobody home. Same
                 // retryability as an answered open error — the lines
                 // are durable in the store regardless.
-                degraded_since.get_or_insert_with(Instant::now);
+                degraded.get_or_insert_with(|| {
+                    let armed = Instant::now();
+                    (armed, armed + config.degraded_notice_after)
+                });
                 degraded_lane = open_failed_lane(tonic::Code::Unavailable);
                 if warned_open_failure {
                     debug!(?after, "TailLog open timed out");
@@ -1233,15 +1248,15 @@ async fn run_tail(
         // in it — never backpressure the relay on it (the
         // `degraded_notice_sent` latch still flips, matching the
         // warn latch's one-per-episode law).
-        if let Some(since) = degraded_since
+        if let Some((armed, deadline)) = degraded
             && !degraded_notice_sent
-            && since.elapsed() >= config.degraded_notice_after
+            && Instant::now() >= deadline
         {
             degraded_notice_sent = true;
             let _ = out_tx.try_send(TaggedLogChunk {
                 derivation_path: derivation_path.clone(),
                 first_line_number: last_relayed.map_or(0, |n| n.saturating_add(1)),
-                lines: vec![degraded_notice(since.elapsed(), degraded_lane)],
+                lines: vec![degraded_notice(armed.elapsed(), degraded_lane)],
             });
         }
         arm_grace(&mut grace_deadline, &drain, config.terminal_grace);

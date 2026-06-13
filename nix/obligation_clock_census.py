@@ -81,6 +81,12 @@ CLOCK_ROWS = {
     "lease-futility-next-eval": ("landed", "S4", "rio-lease/src/lib.rs", r"BlindClock|futility|next_eval"),
     "scaler-fund-eq-spend": ("landed", "S6", "rio-controller/src/reconcilers/componentscaler/decide.rs", r"fund|streak|sustain"),
     "gap-witness-lossless": ("landed", "S7", "rio-common/src/liveness.rs", r"admin_verify_worst_emission_gap"),
+    # live_062 WO-S10-6 (bw13-S10): the tail degraded-notice gate —
+    # deadline-shaped on the episode's own arming stamp (armed +
+    # TAIL_DEGRADED_NOTICE_AFTER vs Instant::now(), the grace_deadline
+    # idiom; same Instant domain). The clock description lives in the
+    # anchor's doc per the row convention.
+    "tail-degraded-notice": ("landed", "S10", "rio-gateway/src/handler/log_tail.rs", r"TAIL_DEGRADED_NOTICE_AFTER"),
 }
 
 # The lossy-witness-arithmetic grammar (live from birth): seconds

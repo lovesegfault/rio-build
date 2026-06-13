@@ -517,8 +517,8 @@ mod jwt_issuance_tests {
     // r[verify gw.jwt.refresh-on-expiry+2]
     /// live_062 — `note_rejected` arms exactly ONE forced re-mint:
     /// key rotation invalidates a token whose `exp` still looks
-    /// healthy, so the slack-based refresh alone can never heal an
-    /// UNAUTHENTICATED open. After the forced re-mint the force flag
+    /// healthy, so the slack-based refresh does not reach this face
+    /// (it keys on `exp` alone). After the forced re-mint the force flag
     /// is spent (no mint-spam under a genuinely revoked tenant — the
     /// reconnect backoff paces further rejections).
     #[test]
