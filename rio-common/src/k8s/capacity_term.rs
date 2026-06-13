@@ -189,8 +189,8 @@ mod tests {
             let got = decode_capacity_term(term(&[(CAPACITY_TYPE_LABEL, "In", &vs)]));
             assert_eq!(got, Ok(want), "{v}");
         }
-        // NotIn: refused, NEVER inverted (the merged_bug_039 peek
-        // decoded NotIn[spot] to Spot).
+        // NotIn: refused, never inverted (the merged_bug_039 peek
+        // decoded NotIn[spot] to Spot; the assertion below is the pin).
         let vs = vals(&["spot"]);
         let got = decode_capacity_term(term(&[(CAPACITY_TYPE_LABEL, "NotIn", &vs)]));
         assert_eq!(

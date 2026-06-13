@@ -227,7 +227,8 @@ pub fn decide(
     let LoadThresholds { high, low } = spec.load_thresholds;
 
     // Effective replica bounds derive ONCE, at the boundary, before
-    // ANY reader (parse-don't-validate; bug_052): defensive min>max
+    // ANY reader — quantifier: census(test: w13_ah_swapped_bounds_gate_must_stay_satisfiable) —
+    // (parse-don't-validate; bug_052): defensive min>max
     // swap and >=0 floor (CEL enforces both, but a pre-CEL CRD or
     // --validate=false bypass would otherwise panic on i32::clamp /
     // patch a negative /scale -> 422 -> error-loop with no apply-time
@@ -255,7 +256,8 @@ pub fn decide(
 
     // The working/idle classification is computable WITHOUT the load
     // reading — hoisted to the observation-alphabet boundary so it
-    // evaluates on EVERY tick, observation-absent ones included
+    // evaluates on EVERY tick — quantifier: census(test: w13_ag_idle_none_ticks_must_reset_banked_streak) —
+    // observation-absent ones included
     // (merged_bug_009, R34(iii)): with scale-to-zero targets
     // (replicas.min=0 ⇒ zero pods ⇒ zero resolved addrs ⇒ None
     // letter), sensor absence is CORRELATED with the idle regime the
@@ -286,7 +288,8 @@ pub fn decide(
     // Reactive correction on observed load.
     // r[impl ctrl.scaler.load-coverage]
     // The asymmetric consume of the denominated letter: the high arm
-    // accepts ANY coverage (a survivor reading high is a real replica
+    // accepts ANY coverage — quantifier: census(test: w13_af_partial_high_still_scales_up) —
+    // (a survivor reading high is a real replica
     // really saturated — scale-up evidence survives partial
     // coverage); the low/funding arm demands TOTAL coverage (the
     // dropped replica's reading may BE the max, so a survivor-only

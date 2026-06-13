@@ -504,7 +504,7 @@ mod tests {
         // Per-pod fold picks the saturated dimension.
         assert!((fold_load(&pod_a) - 0.9).abs() < 1e-6);
         assert!((fold_load(&pod_b) - 0.7).abs() < 1e-6);
-        // Across-pod aggregate: the SAME fold `poll_max_load_addrs`
+        // Across-pod aggregate: the same fold `poll_max_load_addrs`
         // applies (`LoadAggregate::fold` over the readings vec).
         let readings: Vec<Option<f64>> = [&pod_a, &pod_b]
             .into_iter()
