@@ -391,6 +391,7 @@ module openAttempts {
 
   /// The pull mint commits and the response reaches the store: claim
   /// held, credential persisted (bug_251), nothing lost.
+  // Mirrors: rio-scheduler/src/actor/pull.rs:pull_assignment_inner
   action mintDelivered = all {
     node == NWantedLive,
     attempt != AOpen,
@@ -407,6 +408,7 @@ module openAttempts {
   /// The pull mint commits but the RESPONSE is lost (worker timeout,
   /// stream cut). The credential persisted AT MINT — the fix — so the
   /// store's next poll can redeliver.
+  // Mirrors: rio-scheduler/src/actor/pull.rs:pull_assignment_inner
   action mintResponseLost = all {
     node == NWantedLive,
     attempt != AOpen,
@@ -421,6 +423,7 @@ module openAttempts {
   /// The store's next poll presents its credential and the SAME exec
   /// re-delivers, un-charged (bug_251; kernel
   /// `redelivery_credential_ok`).
+  // Mirrors: rio-evidence-kernel/src/pull.rs:redelivery_credential_ok
   action resumeRedeliver = all {
     attempt == AOpen,
     responseLost,
@@ -449,6 +452,7 @@ module openAttempts {
   /// both companion outcomes — merged_bug_055's law folds the
   /// companion-failure fallback into the same release decision). The
   /// settled close acks (bug_182).
+  // Mirrors: rio-scheduler/src/actor/pull.rs:handle_report_outcome
   action consumeCloseOk = all {
     attempt == AOpen,
     node == NWantedLive,
@@ -464,6 +468,7 @@ module openAttempts {
   /// PullRejection::ConsumptionNotDurable). The attempt stays open,
   /// the claim is kept, and the store's bounded report redelivery
   /// re-presents the same outcome.
+  // Mirrors: rio-scheduler/src/grpc/actor_guards.rs:pull_rejection_to_status
   action consumeCloseFailedNack = all {
     attempt == AOpen,
     node == NWantedLive,
@@ -478,6 +483,7 @@ module openAttempts {
   /// The cancel's terminal persist succeeds: one statement closes the
   /// assignment (db/derivations.rs terminal_assignment_status); the
   /// stamped close family's companion releases the view claim.
+  // Mirrors: rio-scheduler/src/db/derivations.rs:update_derivation_status_in_tx
   action cancelPersistOk = all {
     node == NWantedLive,
     attempt == AOpen,
@@ -494,6 +500,7 @@ module openAttempts {
   /// (sched.attempt.cancel-close-driven) — the live decision is
   /// `latchesOutbox = true`; the outbox-dropped twin flips it and the
   /// seat latches `driverLost`.
+  // Mirrors: rio-scheduler/src/actor/mod.rs:latch_status_batch
   action cancelPersistErr = all {
     node == NWantedLive,
     attempt == AOpen,
@@ -506,6 +513,7 @@ module openAttempts {
 
   /// tick_flush_status_outbox re-drives the latched batch to Ok:
   /// dropped on Ok only; the close lands, the claim releases.
+  // Mirrors: rio-scheduler/src/actor/housekeeping.rs:tick_flush_status_outbox
   action flushOk = any {
     all {
       outbox,
@@ -541,6 +549,7 @@ module openAttempts {
   }
 
   /// The flush fails this tick: the entry is pushed back (front).
+  // Mirrors: rio-scheduler/src/actor/housekeeping.rs:tick_flush_status_outbox
   action flushErr = all {
     outbox,
     goneFenced' = goneFenced,
@@ -568,6 +577,7 @@ module openAttempts {
   /// the mint's transaction (bug_251) and the successor recovers it
   /// off the guarded assignments join. A non-durable cancel
   /// evaporates; a durable one leaves a node the sweep closes free.
+  // Mirrors: rio-scheduler/src/actor/mod.rs:clear_persisted_state
   action failover = all {
     node' = if (node == NCancelled and not(cancelDurable)) NWantedLive
             else if (node == NCancelled) NAbsent
@@ -600,6 +610,7 @@ module openAttempts {
   /// window) BEFORE the ~1h establishment window can charge it — the
   /// charged settle is reachable only when the credential is gone
   /// (a real crash) or the response was never lost.
+  // Mirrors: rio-scheduler/src/actor/housekeeping.rs:tick_sweep_open_pull_attempts
   action sweepEstablish = any {
     // Live-wanted expired attempt: charged.
     all {
@@ -629,6 +640,7 @@ module openAttempts {
 
   /// LIVE (merged_bug_096): the fresh pass over a live credential
   /// SKIPS -- the ledger API refuses the second mint.
+  // Mirrors: rio-store/src/materialize/client.rs:begin_fresh_claim
   action freshClaimSkipsLive = all {
     clientHoldsResume,
     freshClaimSeat(false),
@@ -640,6 +652,7 @@ module openAttempts {
   /// LIVE (bug_119, mint-disproving scope per merged_bug_074): a
   /// refusal that disproves a mint resolves the credential -- the
   /// entry leaves on the authoritative answer.
+  // Mirrors: rio-store/src/materialize/client.rs:standing_effect
   action claimRefusedAnswered = all {
     clientHoldsResume,
     answeredRefusalSeat(true),
@@ -654,6 +667,7 @@ module openAttempts {
   /// "nothing changes"; the rotation-skew twin perturbs the seat
   /// decision to true and the charge path falsifies
   /// noFaultNeverCharged).
+  // Mirrors: rio-store/src/materialize/client.rs:standing_effect
   action claimRefusedAuthSkew = all {
     clientHoldsResume,
     authRefusalSeat(false),
@@ -664,6 +678,7 @@ module openAttempts {
 
   /// LIVE (merged_bug_083): the confirm-only probe reads holdings and
   /// never mints (the screen).
+  // Mirrors: rio-scheduler/src/actor/pull.rs:pull_assignment_inner
   action confirmProbeReads = all {
     confirmProbeSeat(false),
     node' = node,
@@ -676,6 +691,7 @@ module openAttempts {
   /// fences the answer AHEAD of the reply (writesFence = true; the
   /// law is uniform across the live-loop and confirm arms). The
   /// unfenced-gone twin perturbs exactly this decision.
+  // Mirrors: rio-scheduler/src/db/confirm_fences.rs:insert_confirm_fence
   action goneAnswered = all {
     node != NWantedLive,
     attempt != AOpen,
@@ -691,6 +707,7 @@ module openAttempts {
   /// durability is the PREVIOUS lifecycle's fact and resets with it;
   /// the fence plane is per-TOKEN and survives (which is exactly what
   /// screens the straggler).
+  // Mirrors: rio-scheduler/src/dag/mod.rs:merge
   action resubmitReready = all {
     node != NWantedLive,
     attempt != AOpen,
@@ -799,4 +816,62 @@ module openAttempts {
     confirmNeverMints,
     noMintAfterGoneAnswer,
   }
+}
+
+// OP-1 (MBT-1): the conformance-replay run module — quint-test-only
+// (no TLC wiring; the `mbt-rio-openattempts` nextest check is its
+// sole consumer via `quint test --out-itf`). RUNS ONLY: the step
+// alphabet above is untouched; every live action is already
+// deterministic (parameterless guards + fixed seat decisions), so the
+// runs compose them directly.
+//
+// rio-scheduler/src/actor/tests/mbt_openattempts.rs mirrors each
+// action list verbatim through the production materialization-claim
+// lane (handle_pull_assignment / handle_report_outcome /
+// tick_sweep_open_pull_attempts) and diffs the projected state
+// (attempt / node / viewClaimed / clientHoldsResume / cancelDurable)
+// after every step. The runs double as in-model regression tests:
+// each `.expect` re-checks the post-state on every `quint test`.
+module openAttemptsReplay {
+  import openAttempts.*
+
+  /// Mint -> settled consumption: the claim delivers with its
+  /// credential persisted (bug_251), the consumption close settles
+  /// CHARGE-FREE and the companion releases the claim (bug_182 /
+  /// merged_bug_055).
+  run oaHappyPathRun =
+    init
+      .then(mintDelivered)
+      .then(consumeCloseOk)
+      .expect(and {
+        attempt == AClosedFree,
+        node == NWantedLive,
+        not(viewClaimed),
+        not(clientHoldsResume),
+        not(responseLost),
+        not(chargedNoFault),
+      })
+
+  /// The bug_251 redeliver-first window (the OQ-12 acceptance, GREEN
+  /// half): the mint's response is LOST but the credential persisted
+  /// in the mint's transaction, so the store's next poll REDELIVERS
+  /// un-charged; only then does the establishment window charge the
+  /// (now genuinely expired) attempt — `chargedNoFault` stays false.
+  /// The sweep guard `not(responseLost and clientHoldsResume)` is the
+  /// WINDOW-ORDERING abstraction (store redelivery << establishment
+  /// window), which is why this run must take the redeliver step
+  /// before the sweep can fire.
+  run oaSweepWindowRun =
+    init
+      .then(mintResponseLost)
+      .then(resumeRedeliver)
+      .then(sweepEstablish)
+      .expect(and {
+        attempt == AClosedCharged,
+        node == NWantedLive,
+        not(viewClaimed),
+        not(clientHoldsResume),
+        not(responseLost),
+        not(chargedNoFault),
+      })
 }

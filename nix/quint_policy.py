@@ -390,7 +390,6 @@ P8_GRANDFATHER: frozenset = frozenset(
         "nodeclaimLifecycleTombstoneAsBuilt",
         "nodeclaimLifecycleTombstoneDisposition",
         "nodeclaimLifecycleTombstoneDispositionAsBuilt",
-        "openAttempts",
         "openAttemptsAckOnFailedClose",
         "openAttemptsBudget",
         "openAttemptsChargeBlind",

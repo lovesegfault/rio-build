@@ -23,6 +23,7 @@ mod keep_going;
 mod lifecycle_sweep;
 mod materialize;
 mod mbt_materialization;
+mod mbt_openattempts;
 mod merge;
 mod misc;
 mod pull;
