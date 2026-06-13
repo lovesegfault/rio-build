@@ -35,8 +35,24 @@
 
 #include <cstring>
 #include <string>
+#include <variant>
 
 #include "rio_evalstore.h"
+#include "rio_shim.hh"
+
+/* IFD relay hook (ADR-024 P3b). Set by the rio-eval worker via
+ * rio_shim_set_ifd_handler(); nullptr in the plugin, where buildPaths
+ * stays Unsupported. The handler relays the import-from-derivation to
+ * the coordinator and blocks until it resolves (outputs imported into
+ * the store before it returns). */
+static rio_shim_ifd_fn rioIfdFn = nullptr;
+static void * rioIfdCtx = nullptr;
+
+extern "C" void rio_shim_set_ifd_handler(rio_shim_ifd_fn fn, void * ctx)
+{
+    rioIfdFn = fn;
+    rioIfdCtx = ctx;
+}
 
 namespace nix {
 
@@ -767,6 +783,34 @@ struct RioStore : virtual Store
         return std::make_shared<RioAccessor>(*this, baseName(path));
     }
 
+    /* -- IFD (ADR-024 P3b) ------------------------------------------------ */
+
+    /* Import-from-derivation reaches the eval store as buildPaths
+     * (EvalState::realiseContext → buildStore->buildPaths). In the
+     * rio-eval worker the registered hook relays the request to the
+     * coordinator and BLOCKS until the build resolves and the outputs
+     * are imported; in the plugin (no hook) this stays Unsupported. */
+    void buildPaths(
+        const std::vector<DerivedPath> & paths,
+        BuildMode buildMode = bmNormal,
+        std::shared_ptr<Store> evalStore = nullptr) override
+    {
+        if (!rioIfdFn)
+            unsupported("buildPaths");
+        for (auto & p : paths) {
+            auto * built = std::get_if<DerivedPath::Built>(&p.raw());
+            if (!built)
+                throw Unsupported("'buildPaths' in rio store: non-derivation path '%s'", p.to_string(*this));
+            auto drvPath = printStorePath(built->drvPath->getBaseStorePath());
+            RioStr err;
+            if (rioIfdFn(rioIfdCtx, drvPath.c_str(), &err.p))
+                throw Error(
+                    "import-from-derivation '%s' failed: %s",
+                    drvPath,
+                    err.has() ? err.str() : std::string("IFD relay failed"));
+        }
+    }
+
     /* -- unsupported ------------------------------------------------------ */
 
     void registerDrvOutput(const Realisation & output) override
@@ -774,6 +818,16 @@ struct RioStore : virtual Store
         unsupported("registerDrvOutput");
     }
 };
+
+/* Handle accessor for the rio-eval binary: the embedder opens the
+ * store through nix's registration ("rio://...") and needs the Rust
+ * core handle for the P3b FFI calls (emit/IFD/parent-run). C++
+ * linkage — both TUs compile into one binary. */
+RioEvalStore * rioShimStoreHandle(Store & store)
+{
+    auto * s = dynamic_cast<RioStore *>(&store);
+    return s ? s->rio : nullptr;
+}
 
 ref<Store> RioStoreConfig::openStore() const
 {

@@ -310,6 +310,26 @@ pub unsafe extern "C" fn rio_string_free(s: *mut c_char) {
     }
 }
 
+/// Duplicate a NUL-terminated string into a [`rio_string_free`]-able
+/// allocation. Embedder helper: hook error out-parameters (the shim's
+/// IFD handler) are freed with `rio_string_free`, so messages the
+/// embedder originates must come from this allocator — `malloc` is
+/// not interchangeable with `CString::into_raw`. Null in, null out.
+///
+/// # Safety
+/// `s` must be null or a valid NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rio_string_dup(s: *const c_char) -> *mut c_char {
+    if s.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller contract — valid NUL-terminated string.
+    let bytes = unsafe { CStr::from_ptr(s) }.to_bytes();
+    CString::new(bytes)
+        .expect("CStr::to_bytes never contains an interior NUL")
+        .into_raw()
+}
+
 /// # Safety
 /// Standard contract: valid store handle, valid C strings, valid out-pointers.
 #[unsafe(no_mangle)]
