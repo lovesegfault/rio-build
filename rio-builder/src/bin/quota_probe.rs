@@ -20,6 +20,16 @@
 //!   projid, quota_used, quota_limit, coupled_node_free,
 //!   coupled_clamped, decoupled_node_free, classify_coupled,
 //!   classify_decoupled
+//!
+//! `--ensure` (live_063): run the PRODUCTION acquisition face
+//! (`quota::ensure_project_quota` — the exact fn `setup_overlay`
+//! calls under hostUsers:true) against the dir BEFORE sampling, and
+//! prepend `ensure=<existing|minted|unavailable>` to the kv block.
+//! This is the R13 feeder for the kubelet-projquota witness's
+//! provisioned × hostUsers:true cell: the in-pod invocation stands in
+//! for setup_overlay (the setup_overlay→ensure threading itself is
+//! pinned at unit level in rio-builder, same tier split as the
+//! completion-row threading disclosed in the scenario header).
 
 use std::path::Path;
 
@@ -31,11 +41,25 @@ fn fmt<T: std::fmt::Display>(v: Option<T>) -> String {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let Some(dir) = args.next() else {
-        eprintln!("usage: quota_probe <dir>");
+    let (ensure, dir_arg) = match args.next() {
+        Some(a) if a == "--ensure" => (true, args.next()),
+        other => (false, other),
+    };
+    let Some(dir) = dir_arg else {
+        eprintln!("usage: quota_probe [--ensure] <dir>");
         std::process::exit(2);
     };
     let dir = Path::new(&dir);
+
+    if ensure {
+        let verdict = quota::ensure_project_quota(dir);
+        let label = match verdict {
+            quota::ProjQuota::Existing(_) => "existing",
+            quota::ProjQuota::Minted(_) => "minted",
+            quota::ProjQuota::Unavailable => "unavailable",
+        };
+        println!("ensure={label}");
+    }
 
     let projid = quota::project_id(dir);
     let status = quota::status(dir).ok().flatten();

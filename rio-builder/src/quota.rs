@@ -1,22 +1,47 @@
-//! Read kubelet's XFS/ext4 project-quota usage for the per-build emptyDir.
+//! Project-quota usage for the per-build emptyDir: read kubelet's
+//! assignment when one exists, mint our own when kubelet declines.
 //!
 //! PRECONDITION (live060-b — this module's producer is DEAD without
 //! it, and for an entire deployment era nothing said so): the
 //! filesystem hosting kubelet's emptyDir volumes must be mounted with
-//! `-o prjquota` AND kubelet must have its project-quota feature
-//! assigning a project ID per emptyDir. NEITHER is automatic: the
-//! node image/bootstrap provisions the mount option (the live060-a
-//! provisioning work — xfs `-o prjquota` at /var/lib/kubelet, or ext4
-//! with project quotas enabled), and kubelet's LocalStorageCapacityIsolationFSQuotaMonitoring
-//! wiring provides the projid half. On a node without the
-//! precondition, [`status`] returns `Ok(None)` on every consult and
-//! every completion carries `peak_disk_bytes: None` — the absence is
-//! counted and warned once per pod at the completion seam (the
-//! `rio_builder_quota_evidence_absent_total` counter), never fatal.
-//! (The previous claim here — that NixOS AMIs provide prjquota on the
-//! gp3-root pool — was FALSE on the live fleet: 159/160 builder nodes
-//! were EBS-only ext4 without project quotas, 2022/2022 completions
-//! silently evidence-free.)
+//! `-o prjquota` AND a project ID must be assigned to the emptyDir.
+//! The mount-option half is node provisioning (the live060-a work —
+//! xfs `-o prjquota` at /var/lib/kubelet). The projid half has TWO
+//! assigners with complementary jurisdictions:
+//!
+//! - **kubelet** (`LocalStorageCapacityIsolationFSQuotaMonitoring`):
+//!   assigns a projid per emptyDir of a USER-NAMESPACED pod
+//!   (`hostUsers: false`). Quota assignment is userns-conditioned at
+//!   the deployed minor (kubelet 1.36 refuses `SupportsQuotas` for
+//!   host-user pods).
+//! - **the builder itself** ([`ensure_project_quota`], live_063):
+//!   under `hostUsers: true` — the production builder pools' actual
+//!   posture (I-186 FUSE passthrough, pinned until P0560) — kubelet
+//!   never assigns, so `setup_overlay` self-assigns a projid to the
+//!   emptyDir root from the builder-owned range. The kernel permits
+//!   `FS_IOC_FSSETXATTR` projid changes only from the init user
+//!   namespace, which is exactly the `hostUsers: true` posture — the
+//!   two assigners partition the posture space with no gap.
+//!
+//! THE FOUR DECLINE MODES (every one degrades to `Ok(None)` reads and
+//! `peak_disk_bytes: None` completions — counted and warned once per
+//! pod at the completion seam via
+//! `rio_builder_quota_evidence_absent_total`, never fatal):
+//!
+//! 1. **Filesystem**: no `-o prjquota` mount (stock ext4 root, tmpfs).
+//!    The live060 silence: 159/160 builder nodes EBS-only ext4,
+//!    2022/2022 completions evidence-free.
+//! 2. **Kernel**: no `quotactl_fd` (Linux < 5.14), or quotas not
+//!    enabled on the mount.
+//! 3. **Kubelet half**: feature gate off, `/etc/projects`+`/etc/projid`
+//!    registry missing, or the FHS shim absent — kubelet silently
+//!    declines for pods it WOULD otherwise cover.
+//! 4. **Posture** (live_063): the pod runs `hostUsers: true`, kubelet
+//!    refuses quota assignment for host-user pods, and modes 1–3 are
+//!    all healthy — the wave-12 fleet shape: 56/56 nodes provisioned,
+//!    0/1912 completions with `Some`. Resolved by the builder-minted
+//!    path above; on a `hostUsers: false` pod the mint observes
+//!    kubelet's projid and stands down (kubelet precedence).
 //!
 //! When the precondition holds, the kernel tracks `dqb_curspace` per
 //! project — the
@@ -105,6 +130,89 @@ pub fn classify_quota_exhaustion(quota: QuotaStatus, node_free_bytes: u64) -> bo
 /// doesn't bind this ioctl; hard-code rather than pull `ioctl_read!`
 /// macro machinery for one call site.
 const FS_IOC_FSGETXATTR: libc::c_ulong = 0x801c_581f;
+
+/// `_IOW('X', 32, struct fsxattr)` → `0x401c5820`. The write twin of
+/// [`FS_IOC_FSGETXATTR`]; same hard-code rationale.
+const FS_IOC_FSSETXATTR: libc::c_ulong = 0x401c_5820;
+
+/// `FS_XFLAG_PROJINHERIT` (`<linux/fs.h>`): new children of a
+/// directory carrying this flag inherit its project ID — one
+/// assignment at the emptyDir root covers every per-build path
+/// created after it, kernel-side, with no per-file work.
+const FS_XFLAG_PROJINHERIT: u32 = 0x0000_0200;
+
+/// kubelet's project-ID allocator base (`volume/util/fsquota`:
+/// `firstQuota = 1048576`). Kubelet assigns projids upward from here
+/// and records them in `/etc/projid`; the builder-owned range below
+/// is collision-free against it BY CONSTRUCTION.
+const KUBELET_PROJID_BASE: u32 = 1_048_576;
+
+/// R17 (live_063): the builder-minted projid range is the half-open
+/// `[BUILDER_PROJID_BASE, BUILDER_PROJID_BASE + BUILDER_PROJID_RANGE)`
+/// = `[2^19, 2^20)`, ending EXACTLY at [`KUBELET_PROJID_BASE`] — the
+/// two allocators partition the id space statically (no registry
+/// round-trip, no shared lock; the compile-time assert below pins the
+/// adjacency). Within the range, candidates derive from the emptyDir
+/// root's inode number ([`candidate_projid`]) and a free-record probe
+/// disambiguates the residual congruence class — see
+/// [`ensure_project_quota`]'s collision note.
+pub const BUILDER_PROJID_BASE: u32 = 1 << 19;
+/// See [`BUILDER_PROJID_BASE`].
+pub const BUILDER_PROJID_RANGE: u32 = 1 << 19;
+
+// The static range-discipline witness: the builder range ends exactly
+// at kubelet's base. A drift in either constant is a compile error,
+// not a runtime collision.
+const _: () = assert!(BUILDER_PROJID_BASE + BUILDER_PROJID_RANGE == KUBELET_PROJID_BASE);
+
+/// R17 (live_063): bound on the linear free-record probe. VIOLABLE,
+/// hypothesis 64: a collision needs two live emptyDirs on one node
+/// whose root inodes are congruent mod 2^19 — with O(100) builder
+/// pods per node the expected occupancy of any one congruence class
+/// is ≪ 1, so 64 linear steps over-cover while bounding the syscall
+/// budget of a pathological mount. Exhaustion degrades to no-mint
+/// (`Unavailable`), never an error.
+const PROJID_PROBE_LIMIT: u32 = 64;
+
+/// A project ID acquired (or observed) on the emptyDir root — the
+/// typed handle of the R32 acquisition; constructed only by
+/// [`ensure_project_quota`]'s observe/mint arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectId(u32);
+
+impl ProjectId {
+    /// The raw id, for logging and the VM probe's kv grammar.
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// The closed outcome alphabet of [`ensure_project_quota`] (R14 — no
+/// wildcard consumers; the overlay setup logs each arm distinctly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjQuota {
+    /// A projid was already assigned (kubelet's, on a
+    /// `hostUsers: false` pod — or our own from an earlier build in
+    /// the same pod). Observed, honored, untouched.
+    Existing(ProjectId),
+    /// No projid was assigned and the builder minted one from the
+    /// builder-owned range (the live_063 `hostUsers: true` path).
+    Minted(ProjectId),
+    /// No project quota is obtainable here (decline modes 1–3, a
+    /// non-init user namespace, or probe exhaustion). The reader
+    /// degrades to `None` exactly as before — never fatal.
+    Unavailable,
+}
+
+impl ProjQuota {
+    /// The assigned id, if any.
+    pub fn project_id(self) -> Option<ProjectId> {
+        match self {
+            ProjQuota::Existing(id) | ProjQuota::Minted(id) => Some(id),
+            ProjQuota::Unavailable => None,
+        }
+    }
+}
 
 /// Project quota type (`PRJQUOTA` in `<linux/quota.h>`). `libc` exports
 /// `USRQUOTA`/`GRPQUOTA` but not this one.
@@ -237,6 +345,190 @@ pub fn project_id(dir: &Path) -> Option<u32> {
         return None;
     }
     (x.fsx_projid != 0).then_some(x.fsx_projid)
+}
+
+/// The candidate id for probe step `attempt`: `BASE + ((ino + attempt)
+/// mod RANGE)`. Pure — the unit cells pin the algebra (always in the
+/// builder-owned range, wraps, distinct per attempt until the range is
+/// exhausted); the kernel-coupled acquisition is the VM witness's job.
+fn candidate_projid(ino: u64, attempt: u32) -> u32 {
+    let range = u64::from(BUILDER_PROJID_RANGE);
+    let slot = (ino % range + u64::from(attempt)) % range;
+    // `slot < RANGE ≤ u32::MAX − BASE` by the compile-time range
+    // assert, so the cast and the add are exact.
+    BUILDER_PROJID_BASE + slot as u32
+}
+
+/// One free-record probe verdict (closed; no wildcard arms at the
+/// consumer in [`ensure_project_quota`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeVerdict {
+    /// No quota record, or a dead record (zero usage, zero inodes,
+    /// zero limits) — safe to claim: project accounting counts live
+    /// blocks only, so a previous tenant's reclaimed id carries
+    /// nothing forward.
+    Free,
+    /// Live usage, live inodes, or a configured limit — another
+    /// emptyDir on this filesystem owns the id; probe the next slot.
+    Taken,
+    /// The filesystem cannot answer (`EINVAL`/`ENOSYS`/… — quotas not
+    /// enabled, kernel too old): mode 1/2 territory, the whole mint
+    /// declines.
+    Unsupported,
+}
+
+/// `Q_GETQUOTA` on `candidate` through the directory's fd.
+fn probe_candidate(f: &File, candidate: u32) -> ProbeVerdict {
+    // SAFETY: dqblk is POD; zeroed is valid. Kernel fills on success.
+    let mut dq: libc::dqblk = unsafe { std::mem::zeroed() };
+    let cmd = qcmd(libc::Q_GETQUOTA, PRJQUOTA);
+    // SAFETY: as in `current_bytes` — four scalar args per the raw
+    // syscall ABI; the out-pointer lives on our stack.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_quotactl_fd,
+            f.as_raw_fd() as libc::c_long,
+            cmd as libc::c_long,
+            candidate as libc::c_long,
+            &mut dq as *mut _ as libc::c_long,
+        )
+    };
+    if r < 0 {
+        // ESRCH/ENOENT = no record for this id → free. Anything else
+        // (EINVAL: quota not enabled on the mount; ENOSYS: kernel
+        // <5.14; EPERM; …) → the mint cannot proceed here at all.
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) | Some(libc::ENOENT) => ProbeVerdict::Free,
+            _ => ProbeVerdict::Unsupported,
+        };
+    }
+    let dead = dq.dqb_curspace == 0
+        && dq.dqb_curinodes == 0
+        && dq.dqb_bhardlimit == 0
+        && dq.dqb_bsoftlimit == 0;
+    if dead {
+        ProbeVerdict::Free
+    } else {
+        ProbeVerdict::Taken
+    }
+}
+
+// r[impl sched.sla.disk-scalar]
+/// live_063 (decline mode #4): observe-or-mint the emptyDir root's
+/// project ID — the R32 acquisition face of the overlay obligation.
+/// Called by `setup_overlay` BEFORE the first per-build directory is
+/// created under `base_dir`, so `FS_XFLAG_PROJINHERIT` carries the id
+/// down the build's whole subtree and the existing readers
+/// ([`current_bytes`] in the 1 Hz poll, [`status`] at the completion
+/// seam — both consulting `base_dir`) work unchanged.
+///
+/// The acquisition lifecycle (R32, recorded):
+/// - **acquire**: this call — idempotent; an already-assigned projid
+///   (kubelet's under `hostUsers: false`, or ours from a previous
+///   build in the same pod) is observed and honored
+///   ([`ProjQuota::Existing`]), so the two assigners never fight.
+/// - **carry**: `PROJINHERIT` — every path created below the root
+///   inherits the id kernel-side; per-build dirs need no per-file
+///   work and teardown needs no un-assignment.
+/// - **account**: the kernel tracks `dqb_curspace` over LIVE blocks;
+///   build teardown (`remove_dir_all`) returns the blocks and the
+///   id's usage decays to ~0 of its own accord. The root keeps the
+///   id for the pod's lifetime — kubelet-equivalent granularity (one
+///   id per emptyDir, sequential builds share it exactly as they
+///   would under kubelet's assignment).
+/// - **no limit is minted**: monitoring-only, matching the acceptance
+///   (`peak_disk_bytes` Some). Enforcement under `hostUsers: true`
+///   (an ENOSPC at the sizing limit instead of kubelet's du-walk
+///   eviction) is a deliberate non-goal of this path: it would change
+///   the production failure mode and needs the sizeLimit plumbed into
+///   the pod — [`status`] keeps reporting `hard_limit_bytes: None`
+///   and [`classify_quota_exhaustion`] keeps returning `false`, both
+///   exactly as on the pre-fix fleet.
+///
+/// Collision discipline: candidates live in the builder-owned
+/// `[2^19, 2^20)` (statically disjoint from kubelet's `1048576+`
+/// allocator — the `const` assert above), keyed on the root's inode
+/// number and disambiguated by a bounded free-record probe. The
+/// residual race (two probes passing the same dead record in the same
+/// microsecond window, which additionally requires inode congruence
+/// mod 2^19 across pods) pools the two builds' accounting; the
+/// polarity is sizing-CONSERVATIVE (an inflated peak over-requests
+/// disk — never a lost eviction signal), and the window is priced as
+/// accepted residual rather than guarded by a cross-pod registry the
+/// pod filesystem namespace cannot host.
+///
+/// Total: every failure (non-prjquota fs, kernel <5.14, non-init
+/// userns — the kernel rejects projid changes outside it, which is
+/// why this path CAN run under `hostUsers: true` and CANNOT under
+/// `hostUsers: false`, where kubelet covers instead — probe
+/// exhaustion, verify mismatch) degrades to
+/// [`ProjQuota::Unavailable`]; the build proceeds and the reader
+/// stays `None`, the same never-fatal contract as every other decline
+/// mode.
+pub fn ensure_project_quota(dir: &Path) -> ProjQuota {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(f) = File::open(dir) else {
+        return ProjQuota::Unavailable;
+    };
+    let mut x = Fsxattr::default();
+    // SAFETY: as in `current_bytes` — the ioctl writes exactly
+    // sizeof(Fsxattr) bytes; `x` is repr(C), zeroed, on our stack.
+    if unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_FSGETXATTR, &mut x as *mut _) } < 0 {
+        // ENOTTY (tmpfs) / EOPNOTSUPP — mode 1: nothing to mint on.
+        return ProjQuota::Unavailable;
+    }
+    if x.fsx_projid != 0 {
+        // kubelet (or an earlier build in this pod) already assigned:
+        // observe and stand down.
+        return ProjQuota::Existing(ProjectId(x.fsx_projid));
+    }
+    let Ok(meta) = f.metadata() else {
+        return ProjQuota::Unavailable;
+    };
+    let ino = meta.ino();
+    let mut chosen = None;
+    for attempt in 0..PROJID_PROBE_LIMIT {
+        let candidate = candidate_projid(ino, attempt);
+        match probe_candidate(&f, candidate) {
+            ProbeVerdict::Free => {
+                chosen = Some(candidate);
+                break;
+            }
+            ProbeVerdict::Taken => continue,
+            ProbeVerdict::Unsupported => return ProjQuota::Unavailable,
+        }
+    }
+    let Some(candidate) = chosen else {
+        // Probe exhausted — 64 occupied congruence slots on one
+        // filesystem. Degrade rather than guess.
+        return ProjQuota::Unavailable;
+    };
+    // Read-modify-write: keep every other xattr field/flag as GET
+    // returned them (the kubelet fsquota applier does the same), set
+    // the id, and raise PROJINHERIT so the subtree inherits.
+    x.fsx_projid = candidate;
+    x.fsx_xflags |= FS_XFLAG_PROJINHERIT;
+    // SAFETY: FS_IOC_FSSETXATTR reads exactly sizeof(Fsxattr) bytes
+    // from the pointer; `x` is repr(C), initialized, on our stack.
+    if unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_FSSETXATTR, &x as *const _) } < 0 {
+        // EINVAL: non-init userns (the kernel's projid jurisdiction
+        // rule) or xflags the fs rejects; EPERM: capability missing.
+        // All decline modes, never errors.
+        return ProjQuota::Unavailable;
+    }
+    // Verify-readback: the acquisition is claimed only on the
+    // kernel's own word (R16 — the witness is the re-read, not the
+    // ioctl's return alone).
+    let mut check = Fsxattr::default();
+    // SAFETY: as above.
+    if unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_FSGETXATTR, &mut check as *mut _) } < 0 {
+        return ProjQuota::Unavailable;
+    }
+    if check.fsx_projid == candidate && check.fsx_xflags & FS_XFLAG_PROJINHERIT != 0 {
+        ProjQuota::Minted(ProjectId(candidate))
+    } else {
+        ProjQuota::Unavailable
+    }
 }
 
 /// Clamp detection (merged_bug_074, the in-tree arm): does this
@@ -457,5 +749,68 @@ mod tests {
     fn returns_none_on_tmpfs() {
         let r = current_bytes(std::path::Path::new("/tmp"));
         assert!(matches!(r, Ok(None)), "got {r:?}");
+    }
+
+    /// live_063 — the candidate algebra cells (the pure half of the
+    /// collision discipline; the kernel-coupled acquisition is the
+    /// kubelet-projquota VM witness's provisioned × hostUsers:true
+    /// cell). Every candidate lands in the builder-owned half-open
+    /// range for every (ino, attempt) — including the u64 extremes —
+    /// so no candidate can ever collide with kubelet's `1048576+`
+    /// allocator; attempts walk distinct slots and wrap.
+    #[test]
+    fn builder_projid_candidates_stay_in_the_owned_range() {
+        let hi = BUILDER_PROJID_BASE + BUILDER_PROJID_RANGE;
+        for ino in [0u64, 1, 524_287, 524_288, u64::MAX - 1, u64::MAX] {
+            for attempt in [0u32, 1, 63, BUILDER_PROJID_RANGE - 1, BUILDER_PROJID_RANGE] {
+                let c = candidate_projid(ino, attempt);
+                assert!(
+                    (BUILDER_PROJID_BASE..hi).contains(&c),
+                    "candidate {c} for (ino={ino}, attempt={attempt}) escaped \
+                     [{BUILDER_PROJID_BASE}, {hi})"
+                );
+            }
+        }
+        // The range's far edge is exactly kubelet's base (the
+        // compile-time assert's runtime echo, kept so a test reader
+        // sees the adjacency without chasing the const).
+        assert_eq!(hi, KUBELET_PROJID_BASE);
+        // Attempts are a linear walk: distinct until the range wraps.
+        let ino = 987_654_321u64;
+        assert_ne!(candidate_projid(ino, 0), candidate_projid(ino, 1));
+        assert_eq!(
+            candidate_projid(ino, 0),
+            candidate_projid(ino, BUILDER_PROJID_RANGE),
+            "attempt walk must wrap at the range size"
+        );
+    }
+
+    /// live_063 — the mint declines TOTALLY off-prjquota: tmpfs
+    /// (decline mode one) and a nonexistent dir both yield
+    /// `Unavailable`, never a panic or an error the overlay path
+    /// would have to handle. (On a `hostUsers: false` pod the same fn
+    /// returns `Existing` with kubelet's id — kernel-coupled,
+    /// witnessed in-VM.)
+    #[test]
+    fn ensure_declines_to_unavailable_off_prjquota() {
+        assert_eq!(
+            ensure_project_quota(std::path::Path::new("/tmp")),
+            ProjQuota::Unavailable
+        );
+        assert_eq!(
+            ensure_project_quota(std::path::Path::new("/definitely/not/a/path")),
+            ProjQuota::Unavailable
+        );
+    }
+
+    /// The `ProjQuota` alphabet is closed and its id projection total:
+    /// both assigned arms expose the id, the decline arm exposes none.
+    #[test]
+    fn projquota_id_projection_cells() {
+        let id = ProjectId(BUILDER_PROJID_BASE + 7);
+        assert_eq!(ProjQuota::Existing(id).project_id(), Some(id));
+        assert_eq!(ProjQuota::Minted(id).project_id(), Some(id));
+        assert_eq!(ProjQuota::Unavailable.project_id(), None);
+        assert_eq!(id.get(), BUILDER_PROJID_BASE + 7);
     }
 }

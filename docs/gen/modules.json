@@ -187,7 +187,7 @@
     {
       "path": "quota.rs",
       "depth": 0,
-      "doc": "Read kubelet's XFS/ext4 project-quota usage for the per-build emptyDir."
+      "doc": "Project-quota usage for the per-build emptyDir: read kubelet's assignment when one exists, mint our own when kubelet declines."
     },
     {
       "path": "runtime/",

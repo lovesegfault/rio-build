@@ -222,6 +222,41 @@ pub fn setup_overlay(
         return Err(OverlayError::InvalidBuildId(build_id.to_string()));
     }
 
+    // live_063 (decline mode #4): under hostUsers:true kubelet refuses
+    // project-quota assignment, so the overlay obligation includes
+    // minting our own projid on the emptyDir root BEFORE the first
+    // per-build dir exists — PROJINHERIT then carries it down this
+    // build's whole subtree and the quota readers (the 1 Hz cgroup
+    // poll and the completion-seam sample, both consulting base_dir)
+    // work unchanged. Idempotent and total: a kubelet-assigned projid
+    // (hostUsers:false) is observed and honored, and on a node without
+    // prjquota the mint declines — the build proceeds and the absence
+    // is disclosed once per pod at the completion seam, exactly as
+    // before (never fatal). Lifecycle: crate::quota::ensure_project_quota.
+    match crate::quota::ensure_project_quota(base_dir) {
+        crate::quota::ProjQuota::Minted(id) => {
+            tracing::info!(
+                projid = id.get(),
+                base_dir = %base_dir.display(),
+                "minted builder-owned project quota id for the overlay emptyDir \
+                 (hostUsers:true posture; kubelet declines here)"
+            );
+        }
+        crate::quota::ProjQuota::Existing(id) => {
+            tracing::debug!(
+                projid = id.get(),
+                "emptyDir already carries a project quota id (kubelet's, or a \
+                 prior build's mint); honored untouched"
+            );
+        }
+        crate::quota::ProjQuota::Unavailable => {
+            tracing::debug!(
+                "no project quota obtainable on the overlay base dir; disk \
+                 evidence degrades to None (modes 1-3, or a non-init userns)"
+            );
+        }
+    }
+
     let build_dir = base_dir.join(build_id);
     let upper = build_dir.join("upper");
     // overlayfs upperdir: a dedicated subdirectory so outputs land at
