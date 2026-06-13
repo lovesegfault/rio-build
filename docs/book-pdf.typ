@@ -26,6 +26,7 @@
 #let chapters = (
   "intro.typ",
   "architecture.typ",
+  "architecture-build-client.typ",
   "spec/system/observability.typ",
   "spec/system/security.typ",
   "spec/system/tenancy.typ",

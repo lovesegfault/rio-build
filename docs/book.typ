@@ -35,6 +35,7 @@
     #chapter("guide/programmatic.typ")[Programmatic Access]
     = Architecture
     #chapter("architecture.typ")[System Architecture]
+    #chapter("architecture-build-client.typ")[Build Client Architecture]
     // Nested parts work since shiroa-mdbook is built from our fork
     // (rio-pin → PR #239: items.sum(default: [])); upstream 0.3.1
     // crashes on a `=` part with no direct chapters.
