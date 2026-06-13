@@ -1898,13 +1898,25 @@ mod proptests {
     /// drain-on-systemic), never by calling the implementation.
     #[derive(Default)]
     struct Oracle {
-        anchors: BTreeMap<(String, String), f64>,
+        /// (node, drv) → (window anchor, ledger-frame expiry). The
+        /// expiry rides the anchor so a drain can latch the episode's
+        /// MAX expiry (merged_bug_018: the watermark law is PG-frame).
+        anchors: BTreeMap<(String, String), (f64, u64)>,
         marked: BTreeSet<String>,
-        /// merged_bug_163 mirror: the suppression watermark. The
-        /// established CONSERVATIVE approximation: set to the drain
-        /// tick's `now` (every drained expiry precedes it), for the
-        /// ratio drain and (merged_bug_023) the breadth close alike.
-        watermark: Option<f64>,
+        /// merged_bug_163 mirror: the suppression watermark,
+        /// single-frame per the merged_bug_018 law —
+        /// `(max_expiry_pg, set_at)`. Admission refuses an expiry at
+        /// or below `max_expiry_pg` while `now − set_at` is inside
+        /// the window; the dwell runs on `set_at`. The RETIRED oracle
+        /// shape ("conservative now-approximation": watermark = the
+        /// drain tick's `now`, expiries reconstructed as `now − over`
+        /// each tick) was REFUTED by the carried de8ff3853 seed: under
+        /// epoch-absent rows the sliding reconstruction keeps every
+        /// re-presented pair at or below a now-frame watermark
+        /// forever, so the oracle over-suppresses where the tracker
+        /// lawfully admits a fresh (post-episode-max) expiry — the
+        /// merged_bug_060 TTL direction says the tracker is right.
+        watermark: Option<(u64, f64)>,
         /// merged_bug_017 mirror: eviction tombstones (node → instant).
         evicted: BTreeMap<String, f64>,
         /// merged_bug_023 mirror: the engaged episode's axis as of
@@ -1925,6 +1937,25 @@ mod proptests {
     }
 
     impl Oracle {
+        /// The drain/latch law shared by the ratio arm and the breadth
+        /// close (merged_bug_018 + merged_bug_163): the watermark
+        /// latches at the MAX of any live (in-window) prior latch and
+        /// the drained episode's newest ledger-frame expiry — the gate
+        /// never lowers — and `set_at` refreshes so the dwell runs
+        /// from this latch. Set algebra over the oracle's own anchors;
+        /// never a call into the implementation.
+        fn drain_and_merge_latch(&mut self, now: f64) {
+            let drained_max = self.anchors.values().map(|(_, e)| *e).max().unwrap_or(0);
+            let live = self
+                .watermark
+                .filter(|(_, set_at)| now - set_at <= WEDGE_CLUSTER_WINDOW_SECS)
+                .map(|(max_e, _)| max_e)
+                .unwrap_or(0);
+            self.anchors.clear();
+            self.watermark = Some((live.max(drained_max), now));
+            self.marked.clear();
+        }
+
         fn step(&mut self, tick: &Tick, now: f64) -> Expect {
             for n in &tick.reaped {
                 self.anchors.retain(|(node, _), _| node != n);
@@ -1957,21 +1988,32 @@ mod proptests {
                     continue;
                 }
                 // Watermark admission (merged_bug_163): set algebra
-                // over the raw trajectory, independent of the impl.
-                let over = a.assigned_at_age_secs - (a.deadline_secs + WEDGE_DEADLINE_GRACE_SECS);
-                let expiry = now - over as f64;
-                if self
-                    .watermark
-                    .is_some_and(|w| expiry <= w && now - w <= WEDGE_CLUSTER_WINDOW_SECS)
-                {
+                // over the raw trajectory, independent of the impl —
+                // but the expiry IDENTITY is the merged_bug_018
+                // single-frame law (epoch-stamped where the row
+                // carries one; the skew-fallback reconstruction
+                // otherwise), compared against the latched MAX
+                // ledger-frame expiry, never a now-frame instant.
+                let expiry_pg = if a.assigned_at_epoch_secs > 0 {
+                    a.assigned_at_epoch_secs
+                        .saturating_add(a.deadline_secs)
+                        .saturating_add(WEDGE_DEADLINE_GRACE_SECS)
+                } else {
+                    let over =
+                        a.assigned_at_age_secs - (a.deadline_secs + WEDGE_DEADLINE_GRACE_SECS);
+                    (now - over as f64).max(0.0) as u64
+                };
+                if self.watermark.is_some_and(|(max_e, set_at)| {
+                    expiry_pg <= max_e && now - set_at <= WEDGE_CLUSTER_WINDOW_SECS
+                }) {
                     continue;
                 }
                 self.anchors
                     .entry((a.source_node.clone(), a.intent_id.clone()))
-                    .or_insert(now);
+                    .or_insert((now, expiry_pg));
             }
             self.anchors
-                .retain(|_, t| now - *t <= WEDGE_CLUSTER_WINDOW_SECS);
+                .retain(|_, (anchor, _)| now - *anchor <= WEDGE_CLUSTER_WINDOW_SECS);
             // Tombstones prune AFTER the view fold — the impl's order
             // (a tombstone at its TTL boundary still refuses within
             // the tick that retires it).
@@ -2005,15 +2047,13 @@ mod proptests {
                 breadth >= 2 && (breadth as f64 / population as f64) > WEDGE_SYSTEMIC_FRACTION;
             let dwell_active = self
                 .watermark
-                .is_some_and(|w| now - w <= WEDGE_VERDICT_DWELL_SECS);
+                .is_some_and(|(_, set_at)| now - set_at <= WEDGE_VERDICT_DWELL_SECS);
             if systemic {
                 let affected = wedged.len();
                 // Whole-episode drain + latch (merged_bug_163);
                 // ratio engages the episode in the NON-retaining
                 // phase (its release is a no-op).
-                self.anchors.clear();
-                self.watermark = Some(now);
-                self.marked.clear();
+                self.drain_and_merge_latch(now);
                 self.engaged_retaining = Some(false);
                 Expect::Systemic {
                     affected,
@@ -2036,13 +2076,11 @@ mod proptests {
                 }
             } else if self.engaged_retaining.take() == Some(true) {
                 // merged_bug_023: the breadth release edge — the
-                // close drains the whole window, latches (the
-                // conservative now-approximation) and drains marked;
-                // the tick reports a suppressed verdict with the
-                // pre-close populations.
-                self.anchors.clear();
-                self.watermark = Some(now);
-                self.marked.clear();
+                // close drains the whole window, merge-latches the
+                // PG-frame watermark and drains marked; the tick
+                // reports a suppressed verdict with the pre-close
+                // populations.
+                self.drain_and_merge_latch(now);
                 Expect::Systemic {
                     affected: wedged.len(),
                     of: population,
@@ -3346,5 +3384,592 @@ mod episode_latch_tests {
             ),
             other => panic!("unexpected verdict {other:?}"),
         }
+    }
+}
+
+/// OP-3 (MBT-3): named-run trace replay against the REAL
+/// [`WedgeTracker::update`] — the `wedgeClusterReplay` module's ITF
+/// traces (and the `wedgeCalib009SplitPopulation` acceptance trace)
+/// drive the tracker step for step, diffing a projected state after
+/// every step.
+///
+/// # Time scale and expiry construction (the alignment law)
+///
+/// One model tick = 300 s: `WINDOW = 6 ↔ 1800 s`, `VERDICT_DWELL = 1
+/// ↔ 300 s` — every admission/dwell/window comparison lands EXACTLY
+/// on the tick grid. Model tick `t` maps to `now_secs = T0 + t*300`
+/// (`T0 = 1_000_000`). A pair FIRST-PRESENTED at tick `s` carries the
+/// epoch-stamped single-frame expiry `E(s) = T0 + s*300 - 150`
+/// (deadline 10 + grace 30; `assigned_at_epoch = E(s) - 40`), held
+/// FIXED across re-presentations (same physical attempt row). The
+/// mid-gap `-150` keeps presentation lawful at `s` itself: with the
+/// expiry flush on the grid the age at `s` is exactly
+/// `deadline + grace` and `observe`'s `<=` arm reads the row HEALTHY.
+/// Strict per-tick monotonicity of `E` makes the tracker's PG-frame
+/// watermark gate (`expiry_pg <= max_expiry_pg`) tick-equivalent to
+/// the model's run-start gate (`expiredSince > watermark`) whenever
+/// each drain tick's drained set contains a pair first-presented AT
+/// that tick (the alignment precondition — the named runs satisfy it
+/// by construction; see the wedgeClusterReplay module header for the
+/// derivation and the priced out-of-scope faces).
+///
+/// # Projection (the abstraction function)
+///
+/// Model vars `lastSystemic`/`lastAffected`/`lastOf`/`lastWedged`/
+/// `marked`/`lastSkip`/`lastSuppressedNoDrain`/`episodeState` vs the
+/// tracker's verdict + in-memory state:
+/// - `Unobserved` ↔ `lastSkip` (populations zeroed both sides);
+/// - `NodeWedged(v)` ↔ `!lastSystemic ∧ lastWedged == v`;
+/// - `Systemic{axis: Ratio}` (episode engaged) and the close-edge
+///   `Systemic` (episode `None` — the breadth release reports the
+///   pre-close populations) ↔ `lastSystemic ∧ lastAffected/lastOf`;
+/// - engaged `Systemic{axis: Breadth|Dwell}` ↔ the suppressed-tick
+///   image (`lastSystemic` FALSE, populations zero, `lastWedged`
+///   empty; `lastSuppressedNoDrain` true except at a downgrade tick,
+///   whose drain is observable as post-update-empty evidence);
+/// - `episodeState` ↔ the tracker's episode field (0 none, 1 ratio,
+///   2 breadth, 3 dwell).
+///
+/// ITF decode is hand-rolled over `serde_json::Value` (`{"#bigint":
+/// "N"}` integers, `{"#set": [...]}` string sets): rio-controller
+/// does not depend on the `itf` crate, and adding it for one decoder
+/// would cascade through workspace-hack/Cargo.json regeneration —
+/// recorded divergence from the mbt_fence harness, which rides
+/// rio-scheduler's existing `itf` dependency.
+///
+/// # Clocks
+///
+/// The driver is pure in-memory: `update` takes `now_secs` as an
+/// explicit argument and performs no IO — there is no clock to pause
+/// ((cccccc) verdict: explicit-instant domain, nothing tokio-owned).
+///
+/// All tests are `#[ignore]`d: they shell out to `quint`, which the
+/// default `nextest-rio-controller` sandbox does not provide. The
+/// dedicated check (`mbt-rio-wedge`, wired in `nix/quint.nix` next to
+/// `mbt-rio-fence`) stages BOTH model files into the nextest
+/// workspace and runs them with `--run-ignored`. Locally:
+///
+/// ```text
+/// cargo nextest run -p rio-controller -E 'test(/mbt_replay/)' --run-ignored all
+/// ```
+#[cfg(test)]
+mod mbt_replay {
+    use std::collections::{BTreeSet, HashSet};
+    use std::process::Command;
+
+    use anyhow::{Context as _, Result, bail, ensure};
+    use rio_proto::types::OpenAttempt;
+
+    use super::*;
+
+    /// Model tick scale (see the module doc): seconds per tick and
+    /// the driver's epoch origin.
+    const SECS_PER_TICK: u64 = 300;
+    const T0: u64 = 1_000_000;
+    /// The mid-gap expiry offset (0 < offset < SECS_PER_TICK keeps
+    /// presentation-at-s lawful; the midpoint sits maximally far from
+    /// both tick boundaries).
+    const EXPIRY_OFFSET: u64 = 150;
+    /// The replayed plane's deadline/grace split (expiry = assigned +
+    /// deadline + grace; only the sum is law — these mirror the
+    /// model-header constants).
+    const DEADLINE_SECS: u64 = 10;
+
+    /// The spec path fallbacks for a local `cargo nextest` run. The
+    /// `mbt-rio-wedge` check overrides via `RIO_MBT_WEDGE_SPEC_PATH`:
+    /// the test binary runs in a different sandbox than the one that
+    /// compiled it, so the baked path points at a tree that no longer
+    /// exists there.
+    const SPEC_ABS: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../docs/spec/models/wedgeCluster.qnt"
+    );
+
+    fn spec_path() -> std::path::PathBuf {
+        std::env::var_os("RIO_MBT_WEDGE_SPEC_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(SPEC_ABS))
+    }
+
+    /// The merged_bug_009 acceptance twin lives beside the main model
+    /// (its `import ... from "../wedgeCluster"` needs the staged
+    /// layout to preserve the relative shape).
+    fn calib_009_path() -> std::path::PathBuf {
+        spec_path()
+            .parent()
+            .expect("the spec path has a models dir parent")
+            .join("calibration/wedge-009-split-population.qnt")
+    }
+
+    // ===================================================================
+    // The projection (the abstraction function)
+    // ===================================================================
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Projection {
+        last_systemic: bool,
+        last_affected: u64,
+        last_of: u64,
+        last_wedged: BTreeSet<String>,
+        marked: BTreeSet<String>,
+        last_skip: bool,
+        last_suppressed_no_drain: bool,
+        episode_state: u64,
+    }
+
+    /// Decode one ITF integer: quint emits `{"#bigint": "N"}`; plain
+    /// JSON numbers are accepted defensively (the ITF spec permits
+    /// them for small values).
+    fn itf_int(v: &serde_json::Value) -> Result<u64> {
+        if let Some(n) = v.as_u64() {
+            return Ok(n);
+        }
+        if let Some(big) = v.get("#bigint").and_then(|b| b.as_str()) {
+            return big
+                .parse::<u64>()
+                .with_context(|| format!("parse #bigint {big:?}"));
+        }
+        bail!("expected an ITF integer, got {v}")
+    }
+
+    /// Decode one ITF set of strings: `{"#set": ["a", ...]}`.
+    fn itf_str_set(v: &serde_json::Value) -> Result<BTreeSet<String>> {
+        let items = v
+            .get("#set")
+            .and_then(|s| s.as_array())
+            .with_context(|| format!("expected an ITF #set, got {v}"))?;
+        items
+            .iter()
+            .map(|s| {
+                s.as_str()
+                    .map(str::to_owned)
+                    .with_context(|| format!("expected a string set element, got {s}"))
+            })
+            .collect()
+    }
+
+    /// Decode one model state into the projection. `main` is the
+    /// quint main module (the ITF var namespace is
+    /// `<main>::wedgeCluster::<var>`).
+    fn decode_state(main: &str, state: &serde_json::Value) -> Result<Projection> {
+        let var = |name: &str| -> Result<&serde_json::Value> {
+            let key = format!("{main}::wedgeCluster::{name}");
+            state
+                .get(&key)
+                .with_context(|| format!("ITF state is missing {key}"))
+        };
+        Ok(Projection {
+            last_systemic: var("lastSystemic")?
+                .as_bool()
+                .context("lastSystemic: expected a bool")?,
+            last_affected: itf_int(var("lastAffected")?)?,
+            last_of: itf_int(var("lastOf")?)?,
+            last_wedged: itf_str_set(var("lastWedged")?)?,
+            marked: itf_str_set(var("marked")?)?,
+            last_skip: var("lastSkip")?
+                .as_bool()
+                .context("lastSkip: expected a bool")?,
+            last_suppressed_no_drain: var("lastSuppressedNoDrain")?
+                .as_bool()
+                .context("lastSuppressedNoDrain: expected a bool")?,
+            episode_state: itf_int(var("episodeState")?)?,
+        })
+    }
+
+    /// Fetch the model's ITF trace for one named run via `quint test`
+    /// (which also re-checks the run's `.expect` clauses).
+    fn model_trace(spec: &std::path::Path, main: &str, run: &str) -> Result<Vec<Projection>> {
+        let out =
+            std::env::temp_dir().join(format!("rio-mbt-wedge-{}-{}", std::process::id(), run));
+        std::fs::create_dir_all(&out).context("create the trace output dir")?;
+        let out_pattern = out.join("trace_{seq}.itf.json");
+        let output = Command::new("quint")
+            .arg("test")
+            .arg(spec)
+            .args(["--main", main])
+            .args(["--match", &format!("^{run}$")])
+            .args(["--max-samples", "1"])
+            .arg("--out-itf")
+            .arg(&out_pattern)
+            .args(["--verbosity", "0"])
+            .output()
+            .context("spawn quint (is it on the PATH?)")?;
+        ensure!(
+            output.status.success(),
+            "quint test --match=^{}$ failed (the run's .expect() clause may have regressed):\n{}\n{}",
+            run,
+            str::from_utf8(&output.stdout).unwrap_or("<non-UTF-8 quint stdout>"),
+            str::from_utf8(&output.stderr).unwrap_or("<non-UTF-8 quint stderr>"),
+        );
+        let trace_path = out.join("trace_0.itf.json");
+        let json = std::fs::read_to_string(&trace_path).with_context(|| {
+            format!(
+                "read {} (did quint match exactly one test?)",
+                trace_path.display()
+            )
+        })?;
+        let trace: serde_json::Value =
+            serde_json::from_str(&json).context("parse the ITF trace JSON")?;
+        let states = trace
+            .get("states")
+            .and_then(|s| s.as_array())
+            .context("ITF trace has no states array")?;
+        let decoded = states
+            .iter()
+            .map(|s| decode_state(main, s))
+            .collect::<Result<Vec<_>>>()?;
+        let _ = std::fs::remove_dir_all(&out);
+        Ok(decoded)
+    }
+
+    // ===================================================================
+    // Driver actions (the named-run mirrors)
+    // ===================================================================
+
+    /// One model action, in driver-ready form. The named runs build
+    /// these from constants mirroring the model's run definitions
+    /// verbatim. (`replayTick`'s `healthy` input is dead in the
+    /// trajectory regime — population is the registered fleet — and
+    /// `observe` skips non-expired rows entirely, so the driver
+    /// carries only the expired pairs.)
+    #[derive(Debug, Clone)]
+    enum Act {
+        /// `replayTick(expired, _)`: one `update` call with the named
+        /// (node, drv) pairs presented as expired open attempts.
+        Tick {
+            expired: &'static [(&'static str, &'static str)],
+        },
+        /// `replayReap(n)`: bookkeeping only — the name joins the
+        /// NEXT tick's `reaped_since_last` (the controller's
+        /// pending_wedge_evictions stash; the tracker is not called).
+        Reap { node: &'static str },
+    }
+
+    struct NamedRun {
+        run: &'static str,
+        actions: &'static [Act],
+    }
+
+    const PER_NODE_REAP: NamedRun = NamedRun {
+        run: "wedgeReplayPerNodeReapRun",
+        actions: &[
+            Act::Tick {
+                expired: &[("n0", "d0"), ("n0", "d1")],
+            },
+            Act::Reap { node: "n0" },
+            Act::Tick { expired: &[] },
+        ],
+    };
+
+    /// The TB-6 acceptance face: the ratio arm fires the TICK it
+    /// qualifies (the deleted arming dwell would have held this tick
+    /// at a developing image), then the re-presented pairs are
+    /// refused by the PG-frame watermark with the dwell inactive over
+    /// an empty wedged set.
+    const SYSTEMIC_IMMEDIATE: NamedRun = NamedRun {
+        run: "wedgeReplaySystemicImmediateRun",
+        actions: &[
+            Act::Tick {
+                expired: &[("n0", "d0"), ("n0", "d1"), ("n1", "d0"), ("n1", "d1")],
+            },
+            Act::Tick {
+                expired: &[("n0", "d0"), ("n0", "d1"), ("n1", "d0"), ("n1", "d1")],
+            },
+        ],
+    };
+
+    const DWELL_SUPPRESS: NamedRun = NamedRun {
+        run: "wedgeReplayDwellSuppressRun",
+        actions: &[
+            Act::Tick {
+                expired: &[("n0", "d0"), ("n0", "d1"), ("n1", "d0"), ("n1", "d1")],
+            },
+            Act::Tick {
+                expired: &[("n2", "d0"), ("n2", "d1")],
+            },
+        ],
+    };
+
+    /// The merged_bug_009 acceptance inputs — shared verbatim by the
+    /// PRE-FIX calibration trace (`wedge009AcceptanceRun`, of: 1) and
+    /// the live model's green half (`wedge009CommensurableRun`,
+    /// of: 3).
+    const ACCEPTANCE_009_ACTIONS: &[Act] = &[
+        Act::Tick {
+            expired: &[("n0", "d0"), ("n0", "d1")],
+        },
+        Act::Tick {
+            expired: &[("n1", "d0"), ("n1", "d1")],
+        },
+    ];
+
+    const COMMENSURABLE_009: NamedRun = NamedRun {
+        run: "wedge009CommensurableRun",
+        actions: ACCEPTANCE_009_ACTIONS,
+    };
+
+    // ===================================================================
+    // The system under test
+    // ===================================================================
+
+    struct ReplaySystem {
+        tracker: WedgeTracker,
+        registered: HashSet<String>,
+        /// Current model tick (0 = init; the first Tick advances to 1).
+        tick: u64,
+        /// (node, drv) -> assigned_at_epoch_secs, fixed at FIRST
+        /// presentation (the same physical attempt row re-presents
+        /// with the same epoch stamp; only its age advances).
+        assigned: std::collections::BTreeMap<(String, String), u64>,
+        /// Reap names queued for the next update (the controller's
+        /// pending_wedge_evictions mirror).
+        pending_reaps: std::collections::BTreeSet<String>,
+    }
+
+    impl ReplaySystem {
+        fn new() -> Self {
+            ReplaySystem {
+                tracker: WedgeTracker::default(),
+                registered: ["n0", "n1", "n2"].iter().map(|s| s.to_string()).collect(),
+                tick: 0,
+                assigned: Default::default(),
+                pending_reaps: Default::default(),
+            }
+        }
+
+        fn now_secs(&self) -> f64 {
+            (T0 + self.tick * SECS_PER_TICK) as f64
+        }
+
+        /// Apply one mirrored action; `Tick` returns the verdict.
+        fn apply(&mut self, act: &Act) -> Option<WedgeVerdict> {
+            match act {
+                Act::Reap { node } => {
+                    self.pending_reaps.insert((*node).to_string());
+                    None
+                }
+                Act::Tick { expired } => {
+                    self.tick += 1;
+                    let now = self.now_secs();
+                    let view: Vec<OpenAttempt> = expired
+                        .iter()
+                        .map(|(node, drv)| {
+                            let key = ((*node).to_string(), (*drv).to_string());
+                            let assigned = *self.assigned.entry(key).or_insert_with(|| {
+                                // First presentation at tick s: expiry
+                                // E(s) = T0 + s*300 - 150, assigned =
+                                // E(s) - (deadline + grace).
+                                T0 + self.tick * SECS_PER_TICK
+                                    - EXPIRY_OFFSET
+                                    - (DEADLINE_SECS + WEDGE_DEADLINE_GRACE_SECS)
+                            });
+                            OpenAttempt {
+                                intent_id: (*drv).to_owned(),
+                                source_node: (*node).to_owned(),
+                                attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+                                deadline_secs: DEADLINE_SECS,
+                                assigned_at_epoch_secs: assigned,
+                                assigned_at_age_secs: (now as u64) - assigned,
+                                ..Default::default()
+                            }
+                        })
+                        .collect();
+                    let reaped: std::collections::BTreeSet<String> =
+                        std::mem::take(&mut self.pending_reaps);
+                    Some(
+                        self.tracker
+                            .update(Some(&view), &reaped, &self.registered, now),
+                    )
+                }
+            }
+        }
+
+        /// Project the tracker's state per the verdict mapping in the
+        /// module doc. `verdict` is `None` at init only (the all-zero
+        /// image, matching the model's `init`); bookkeeping steps
+        /// (reaps) never re-project — the replay loop carries the
+        /// previous step's projection verbatim, mirroring
+        /// `replayReap`'s full frame (every `last*` var held, and the
+        /// tracker untouched).
+        fn project(&self, verdict: Option<&WedgeVerdict>) -> Projection {
+            let episode_state = match self.tracker.episode {
+                None => 0,
+                Some(EngagedEpisode {
+                    axis: SuppressionAxis::Ratio,
+                    ..
+                }) => 1,
+                Some(EngagedEpisode {
+                    axis: SuppressionAxis::Breadth,
+                    ..
+                }) => 2,
+                Some(EngagedEpisode {
+                    axis: SuppressionAxis::Dwell,
+                    ..
+                }) => 3,
+            };
+            let marked: BTreeSet<String> = self.tracker.marked.iter().cloned().collect();
+            let (last_systemic, last_affected, last_of, last_wedged, last_skip, last_sup) =
+                match verdict {
+                    None => (false, 0, 0, BTreeSet::new(), false, false),
+                    Some(WedgeVerdict::Unobserved(_)) => {
+                        (false, 0, 0, BTreeSet::new(), true, false)
+                    }
+                    Some(WedgeVerdict::NodeWedged(nodes, _)) => {
+                        (false, 0, 0, nodes.iter().cloned().collect(), false, false)
+                    }
+                    Some(WedgeVerdict::Systemic {
+                        affected, of, axis, ..
+                    }) => {
+                        let engaged = self.tracker.episode.is_some();
+                        match (axis, engaged) {
+                            // Engaged ratio tick, or the close edge
+                            // (episode taken at release): the model's
+                            // lastSystemic image with real populations.
+                            (SuppressionAxis::Ratio, _) | (_, false) => (
+                                true,
+                                *affected as u64,
+                                *of as u64,
+                                BTreeSet::new(),
+                                false,
+                                false,
+                            ),
+                            // Engaged breadth/dwell suppression: the
+                            // model zeroes the populations and withholds
+                            // the wedged set. A dwell tick reached
+                            // through the 2->3 downgrade DRAINS (its
+                            // suppressedNoDrain is false) — observable
+                            // as post-update-empty evidence.
+                            (SuppressionAxis::Breadth, true) => {
+                                (false, 0, 0, BTreeSet::new(), false, true)
+                            }
+                            (SuppressionAxis::Dwell, true) => (
+                                false,
+                                0,
+                                0,
+                                BTreeSet::new(),
+                                false,
+                                !self.tracker.evidence.is_empty(),
+                            ),
+                        }
+                    }
+                };
+            Projection {
+                last_systemic,
+                last_affected,
+                last_of,
+                last_wedged,
+                marked,
+                last_skip,
+                last_suppressed_no_drain: last_sup,
+                episode_state,
+            }
+        }
+    }
+
+    /// One post-step state comparison. The model's state is the
+    /// oracle; a mismatch is either a driver bug (the action mapping,
+    /// the projection, or the expiry alignment is wrong) or a genuine
+    /// model<->implementation disagreement — classify before fixing
+    /// either.
+    fn diff_step(
+        run: &str,
+        index: usize,
+        action: &str,
+        spec: &Projection,
+        implementation: &Projection,
+    ) -> Result<()> {
+        ensure!(
+            spec == implementation,
+            "{run}: state divergence after step {index} ({action})\n\
+             --- specification ---\n{spec:#?}\n\
+             --- implementation ---\n{implementation:#?}",
+        );
+        Ok(())
+    }
+
+    /// Replay one named run against the live tracker, diffing after
+    /// every step (including init).
+    fn replay(spec: &std::path::Path, main: &str, run: &NamedRun) -> Result<()> {
+        let states = model_trace(spec, main, run.run)?;
+        ensure!(
+            states.len() == run.actions.len() + 1,
+            "{}: the model's trace has {} states but the mirrored action sequence has {} actions \
+             (+1 for init) — the run definition and the Rust mirror have drifted",
+            run.run,
+            states.len(),
+            run.actions.len(),
+        );
+        let mut sys = ReplaySystem::new();
+        let mut projected = sys.project(None);
+        diff_step(run.run, 0, "init", &states[0], &projected)?;
+        for (i, action) in run.actions.iter().enumerate() {
+            let label = format!("{action:?}");
+            // A bookkeeping step (reap) returns no verdict and holds
+            // the previous projection — `replayReap`'s full frame.
+            if let Some(verdict) = sys.apply(action) {
+                projected = sys.project(Some(&verdict));
+            }
+            diff_step(run.run, i + 1, &label, &states[i + 1], &projected)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
+    fn mbt_replay_run_per_node_reap() {
+        replay(&spec_path(), "wedgeClusterReplay", &PER_NODE_REAP).unwrap();
+    }
+
+    #[test]
+    #[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
+    fn mbt_replay_run_systemic_immediate() {
+        replay(&spec_path(), "wedgeClusterReplay", &SYSTEMIC_IMMEDIATE).unwrap();
+    }
+
+    #[test]
+    #[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
+    fn mbt_replay_run_dwell_suppress() {
+        replay(&spec_path(), "wedgeClusterReplay", &DWELL_SUPPRESS).unwrap();
+    }
+
+    /// The merged_bug_009 acceptance, GREEN half (OQ-12): the same
+    /// tick inputs as the pre-fix calibration trace, replayed under
+    /// the LIVE model — registered-fleet denominator, commensurable
+    /// Systemic{2, of: 3} — agree with the tracker per-step.
+    #[test]
+    #[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
+    fn mbt_replay_run_009_commensurable() {
+        replay(&spec_path(), "wedgeClusterReplay", &COMMENSURABLE_009).unwrap();
+    }
+
+    /// The merged_bug_009 acceptance, RED half (OQ-12, the permanent
+    /// red-holder in the mbt_fence_strawman form): the PRE-FIX model
+    /// (`wedgeCalib009SplitPopulation`, ENABLE_POPULATIONS=false)
+    /// mints the incommensurable Systemic{affected: 2, of: 1} at step
+    /// 2 of `wedge009AcceptanceRun`; the live tracker mints
+    /// Systemic{2, of: 3} (evidence ∪ registered denominator) on the
+    /// same inputs — the per-step diff MUST red at exactly that step
+    /// with the split-population denominator visible. A green here
+    /// means the harness can no longer detect the regression class it
+    /// was built for.
+    #[test]
+    #[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
+    fn mbt_replay_009_acceptance_pre_fix_trace_reds() {
+        let pre_fix = NamedRun {
+            run: "wedge009AcceptanceRun",
+            actions: ACCEPTANCE_009_ACTIONS,
+        };
+        let err = replay(&calib_009_path(), "wedgeCalib009SplitPopulation", &pre_fix)
+            .expect_err("the pre-fix split-population trace must diverge from the tracker");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("state divergence after step 2"),
+            "the divergence must land at the systemic step (step 2); got:\n{msg}"
+        );
+        assert!(
+            msg.contains("last_of: 1") && msg.contains("last_of: 3"),
+            "the divergence must show the split-population denominator (model of: 1) \
+             against the fleet denominator (tracker of: 3); got:\n{msg}"
+        );
     }
 }

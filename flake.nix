@@ -709,17 +709,17 @@
                 inherit pkgs unfilteredRoot;
                 inherit (pkgs) lib;
                 # nextest reuse-build helpers plus the prebuilt
-                # rio-lease, rio-store and rio-scheduler test binaries,
-                # for the mbt-rio-lease, mbt-rio-logservice and
-                # mbt-rio-materialization conformance checks (they run
-                # the #[ignore]d mbt_* tests against the committed Quint
-                # models with quint on PATH — same test binaries the
-                # per-member nextest checks run, different filter and
-                # environment).
+                # rio-lease, rio-store, rio-scheduler and
+                # rio-controller test binaries, for the mbt-rio-*
+                # conformance checks (they run the #[ignore]d mbt_*
+                # tests against the committed Quint models with quint
+                # on PATH — same test binaries the per-member nextest
+                # checks run, different filter and environment).
                 inherit (crateChecks) mkNextestRun mkNextestMeta;
                 rioLeaseTestBin = crateChecks.testBins.rio-lease;
                 rioStoreTestBin = crateChecks.testBins.rio-store;
                 rioSchedulerTestBin = crateChecks.testBins.rio-scheduler;
+                rioControllerTestBin = crateChecks.testBins.rio-controller;
               };
               quintChecks = quintImport.checks;
 

@@ -84,16 +84,16 @@
   lib,
   unfilteredRoot,
   # nix/checks.nix's nextest reuse-build helpers and the prebuilt
-  # rio-lease / rio-store / rio-scheduler test binaries, threaded
-  # through flake.nix's quintChecks binding. Only the mbt-rio-lease,
-  # mbt-rio-logservice and mbt-rio-materialization conformance checks
-  # below consume them — the model checks need nothing from the Rust
-  # build.
+  # rio-lease / rio-store / rio-scheduler / rio-controller test
+  # binaries, threaded through flake.nix's quintChecks binding. Only
+  # the mbt-rio-* conformance checks below consume them — the model
+  # checks need nothing from the Rust build.
   mkNextestRun,
   mkNextestMeta,
   rioLeaseTestBin,
   rioStoreTestBin,
   rioSchedulerTestBin,
+  rioControllerTestBin,
 }:
 let
   modelsDir = unfilteredRoot + "/docs/spec/models";
@@ -220,6 +220,19 @@ let
   fenceModel = lib.fileset.toSource {
     root = modelsDir;
     fileset = modelsDir + "/fencedWrites.qnt";
+  };
+
+  # TWO files for the wedge replay (mbt-rio-wedge below): the live
+  # model (wedgeClusterReplay's home) plus the merged_bug_009 pre-fix
+  # calibration twin whose acceptance trace the red-holder test
+  # replays — staged preserving the models/calibration layout so the
+  # twin's `import ... from "../wedgeCluster"` resolves.
+  wedgeReplayModel = lib.fileset.toSource {
+    root = modelsDir;
+    fileset = lib.fileset.unions [
+      (modelsDir + "/wedgeCluster.qnt")
+      (modelsDir + "/calibration/wedge-009-split-population.qnt")
+    ];
   };
 
   # The TLC backend's quint->TLA+ conversion goes through the bundled
@@ -4885,6 +4898,58 @@ rec {
         # check that proved nothing.
         grep -E ' [1-9][0-9]* tests? run:' $out/log > /dev/null || {
           echo "mbt-rio-fence: the mbt_fence filter matched no tests" >&2
+          exit 1
+        }
+      '';
+    };
+
+    # Implementation conformance for the wedgeCluster model (OP-3 /
+    # MBT-3): rio-controller's wedge.rs `mod mbt_replay` replays named
+    # runs from wedgeClusterReplay (quint-test-only regime, 300 s/tick
+    # — never TLC-wired) through the real in-memory
+    # `WedgeTracker::update`, diffing the projected verdict image
+    # (lastSystemic/populations/lastWedged/marked/lastSkip/
+    # lastSuppressedNoDrain/episodeState) after every step.
+    #
+    # Acceptance (OQ-12, the red-at-pre-fold form): the merged_bug_009
+    # trace in BOTH halves — `wedge009AcceptanceRun` on the PRE-FIX
+    # calibration twin (split populations: Systemic{2, of: 1}) MUST
+    # diverge from the live tracker at exactly step 2 (the permanent
+    # red-holder test), and the same tick inputs under the live model
+    # (`wedge009CommensurableRun`, fleet denominator: Systemic{2,
+    # of: 3}) replay green. The named-run form replaces the historical
+    # proptest seed 0xa0fd4de6691f8839 as the violation's pinned
+    # record. The TB-6 face rides `wedgeReplaySystemicImmediateRun`:
+    # the ratio verdict fires the tick it qualifies (the deleted
+    # phantom arming dwell would have shown a developing image), and
+    # the post-drain re-presentation is refused by the PG-frame
+    # watermark.
+    mbt-rio-wedge = mkNextestRun {
+      name = "mbt-rio-wedge";
+      member = "rio-controller";
+      meta = mkNextestMeta { rio-controller = rioControllerTestBin; };
+      extraRuntimeInputs = [ pkgs.quint ];
+      extraArgs = [
+        "-E"
+        "package(rio-controller) and test(/mbt_replay/)"
+        "--run-ignored"
+        "all"
+      ];
+      preRun = ''
+        export RIO_MBT_WEDGE_SPEC_PATH=$TMPDIR/ws/docs/spec/models/wedgeCluster.qnt
+      '';
+      postWsSetup = ''
+        mkdir -p $ws/docs/spec/models/calibration
+        cp ${wedgeReplayModel}/wedgeCluster.qnt $ws/docs/spec/models/
+        cp ${wedgeReplayModel}/calibration/wedge-009-split-population.qnt \
+          $ws/docs/spec/models/calibration/
+      '';
+      postRun = ''
+        # Same no-tests guard as mbt-rio-lease: --no-tests=warn would
+        # otherwise turn a filter that matches nothing into a green
+        # check that proved nothing.
+        grep -E ' [1-9][0-9]* tests? run:' $out/log > /dev/null || {
+          echo "mbt-rio-wedge: the mbt_replay filter matched no tests" >&2
           exit 1
         }
       '';

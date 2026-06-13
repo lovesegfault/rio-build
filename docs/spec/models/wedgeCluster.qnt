@@ -901,3 +901,204 @@ module wedgeClusterDwellArm {
     VERDICT_DWELL_TICKS = 2
   ).*
 }
+
+// OP-3 (MBT-3): the conformance-replay regime — quint-test-only,
+// NEVER TLC-wired (no quint.nix verify entry; the `mbt-rio-wedge`
+// nextest check is its sole consumer via `quint test --out-itf`).
+// Full production alphabet (trajectory + dwell arm + downgrade close
+// + ghosts on), deterministic tick/reap mirrors below, named runs
+// whose ITF traces rio-controller's wedge.rs `mod mbt_replay` replays
+// through the real `WedgeTracker::update`.
+//
+// TIME SCALE — 300 s/tick, boundaries EXACT on the tick grid:
+//   WINDOW           = 6  <-> WEDGE_CLUSTER_WINDOW_SECS  = 1800 (6*300)
+//   VERDICT_DWELL    = 1  <-> WEDGE_VERDICT_DWELL_SECS   =  300 (1*300)
+// The driver maps model tick t to now_secs = T0 + t*300 (T0 =
+// 1_000_000) and mints a pair FIRST-PRESENTED at tick s with the
+// epoch-stamped single-frame expiry E(s) = T0 + s*300 - 150 (deadline
+// 10 + grace 30; assigned = E(s) - 40; age at tick t = (t-s)*300 +
+// 190 > 40, so the pair presents as expired AT s). The mid-gap -150
+// keeps presentation lawful at s — with E(s) flush on the grid the
+// age at s is exactly deadline+grace and the tracker's `<=` arm
+// reads the row HEALTHY — while keeping every comparison exact:
+// admission (model run-start s' > watermark w <-> tracker E(s') >
+// E(w), strictly monotone per tick), dwell (now-set_at <= 300 <->
+// now-watermark <= 1) and window (k*300 <= 1800 <-> k <= 6).
+// ALIGNMENT PRECONDITION (runs control it): every drain tick's
+// drained set includes a pair first-presented AT that tick, so the
+// tracker's merge-latched max expiry E(w) corresponds tick-exactly
+// to the model's tick watermark w.
+//
+// Faces the runs deliberately avoid (model<->production divergences
+// OUTSIDE the replayed space, priced here): (a) the model watermark
+// has no TTL while the tracker's gate expires after one window
+// (merged_bug_060) — no run re-presents a suppressed expiry more
+// than 6 ticks after its drain; (b) the model has no eviction
+// TOMBSTONE refusal (a reaped node's re-presented attempts re-admit
+// next tick; the tracker refuses for one window) — no run
+// re-presents a reaped node's rows; (c) the 2->3 downgrade cell
+// needs the seeded asymmetric frame (see wedgeClusterDwellArm) — no
+// cold run reaches it.
+module wedgeClusterReplay {
+  import wedgeCluster(
+    MAX_TIME = 8, WINDOW = 6, MIN_DISTINCT = 2,
+    ENABLE_POPULATIONS = true,
+    ENABLE_FULL_EPILOGUE = true,
+    ENABLE_EPISODE_LATCH = true,
+    ENABLE_EVICTION = true,
+    TRACK_EPISODE_GHOSTS = true,
+    ENABLE_TRAJECTORY = true,
+    BREADTH_MIN = 2,
+    TRACK_GHOST_NODES = false,
+    ENABLE_ADMISSION = true,
+    ENABLE_SUPPRESSED_RETENTION = true,
+    ENABLE_RELEASE_CLOSE = true,
+    ENABLE_DWELL_ARM = true,
+    DOWNGRADE_RUNS_CLOSE = true,
+    VERDICT_DWELL_TICKS = 1
+  ).*
+
+  /// Deterministic `tick` mirror (named inputs instead of nondet
+  /// picks; rpcFail fixed false — the replay drives observed ticks).
+  // Mirrors: rio-controller/src/reconcilers/nodeclaim_pool/wedge.rs:update
+  action replayTick(expired: Set[(str, str)], healthy: Set[str]): bool = {
+    val r = foldTick(expired, healthy, false)
+    all {
+      time < MAX_TIME,
+      time' = time + 1,
+      evidence' = r.evidence,
+      marked' = r.marked,
+      markedIncrements' = markedIncrements + r.delta,
+      pendingEvictions' = pendingEvictions.exclude(r.consumed),
+      reapHistory' = reapHistory,
+      lastSystemic' = r.systemic,
+      lastAffected' = r.affected,
+      lastOf' = r.of_,
+      lastWedged' = r.wedged,
+      lastDelta' = r.delta,
+      suppressedAnchors' = suppressedAnchors
+        .union(r.episodeAnchors)
+        .filter(a => and {
+          r.evidence.keys().contains(a._1),
+          nodeEvidence(r.evidence, a._1).keys().contains(a._2),
+          nodeEvidence(r.evidence, a._1).get(a._2) == a._3,
+        }),
+      watermark' = r.watermark,
+      expiredSince' = r.expiredSince,
+      sawSystemic' = (sawSystemic or r.systemic),
+      sawPerNode' = (sawPerNode or (not(r.systemic) and r.wedged.size() > 0)),
+      sawSuppressed' = (sawSuppressed or r.episodeAnchors.size() > 0),
+      lastSkip' = r.skip,
+      lastSuppressedNoDrain' = r.suppressedNoDrain,
+      lastShrankMarked' = r.shrankMarked,
+      episodeState' = r.episodeState,
+      sawRelease' = (sawRelease or r.releaseEdge),
+      sawDowngrade' = (sawDowngrade or r.downgradeEdge),
+    }
+  }
+
+  /// Deterministic `reapMarked` mirror (the controller's
+  /// pending_wedge_evictions stash; the driver bookkeeps the name and
+  /// feeds it to the NEXT update's `reaped_since_last`).
+  // Mirrors: rio-controller/src/reconcilers/nodeclaim_pool/wedge.rs:update
+  action replayReap(n: str): bool = all {
+    marked.contains(n),
+    pendingEvictions' = pendingEvictions.union(Set(n)),
+    reapHistory' = reapHistory.union(Set((n, time))),
+    time' = time, evidence' = evidence, marked' = marked,
+    markedIncrements' = markedIncrements,
+    lastSystemic' = lastSystemic, lastAffected' = lastAffected, lastOf' = lastOf,
+    lastWedged' = lastWedged, lastDelta' = lastDelta,
+    suppressedAnchors' = suppressedAnchors,
+    watermark' = watermark, expiredSince' = expiredSince,
+    sawSystemic' = sawSystemic, sawPerNode' = sawPerNode,
+    sawSuppressed' = sawSuppressed, lastSkip' = lastSkip,
+    lastSuppressedNoDrain' = lastSuppressedNoDrain, lastShrankMarked' = lastShrankMarked,
+    episodeState' = episodeState, sawRelease' = sawRelease,
+    sawDowngrade' = sawDowngrade,
+  }
+
+  // --- named conformance runs (OP-3: the mbt-rio-wedge replay) -------
+  //
+  // wedge.rs `mod mbt_replay` mirrors each action list verbatim and
+  // diffs the tracker's projected state after every step
+  // (`quint test --main=wedgeClusterReplay --match=^<run>$ --out-itf`
+  // is the trace source). The runs double as in-model regression
+  // tests: each `.expect` re-checks the post-state on every
+  // `quint test`.
+
+  /// Per-node mark -> controller reap -> quiet tick: the eviction
+  /// consumed, nothing re-marks (the merged_bug_017 flow at replay
+  /// scale).
+  run wedgeReplayPerNodeReapRun =
+    init
+      .then(replayTick(Set(("n0", "d0"), ("n0", "d1")), Set("n1", "n2")))
+      .then(replayReap("n0"))
+      .then(replayTick(Set(), Set("n1", "n2")))
+      .expect(and {
+        not(lastSystemic),
+        lastWedged == Set(),
+        marked == Set(),
+        evidence == Map(),
+        episodeState == 0,
+      })
+
+  /// The TB-6 acceptance face: a two-node storm trips the ratio arm
+  /// the TICK it qualifies (no arming dwell — the a-1 deletion made
+  /// this run's t1 image representable); the re-presented pairs are
+  /// then refused by the PG-frame watermark while the dwell stays
+  /// inactive over an empty wedged set.
+  run wedgeReplaySystemicImmediateRun =
+    init
+      .then(replayTick(
+        Set(("n0", "d0"), ("n0", "d1"), ("n1", "d0"), ("n1", "d1")),
+        Set("n2")))
+      .then(replayTick(
+        Set(("n0", "d0"), ("n0", "d1"), ("n1", "d0"), ("n1", "d1")),
+        Set("n2")))
+      .expect(and {
+        not(lastSystemic),
+        lastWedged == Set(),
+        evidence == Map(),
+        watermark == 1,
+        episodeState == 0,
+      })
+
+  /// Post-systemic fresh single-node expiry inside the dwell window:
+  /// the Dwell axis engages (suppressed-no-drain, evidence retained
+  /// toward the post-dwell re-detect).
+  run wedgeReplayDwellSuppressRun =
+    init
+      .then(replayTick(
+        Set(("n0", "d0"), ("n0", "d1"), ("n1", "d0"), ("n1", "d1")),
+        Set("n2")))
+      .then(replayTick(Set(("n2", "d0"), ("n2", "d1")), Set()))
+      .expect(and {
+        not(lastSystemic),
+        lastSuppressedNoDrain,
+        episodeState == 3,
+        marked == Set(),
+        watermark == 1,
+        evidence == Map("n2" -> Map("d0" -> 2, "d1" -> 2)),
+      })
+
+  /// The merged_bug_009 acceptance, GREEN half (OQ-12): the exact
+  /// tick inputs of `wedge009AcceptanceRun` (the PRE-FIX calibration
+  /// trace) under the LIVE model — the registered-fleet denominator
+  /// makes the verdict commensurable Systemic{2, of: 3}, agreeing
+  /// with the tracker per-step where the pre-fix model minted
+  /// Systemic{2, of: 1}.
+  run wedge009CommensurableRun =
+    init
+      .then(replayTick(Set(("n0", "d0"), ("n0", "d1")), Set("n1")))
+      .then(replayTick(Set(("n1", "d0"), ("n1", "d1")), Set()))
+      .expect(and {
+        lastSystemic,
+        lastAffected == 2,
+        lastOf == 3,
+        episodeState == 1,
+        marked == Set(),
+        evidence == Map(),
+        watermark == 2,
+      })
+}
