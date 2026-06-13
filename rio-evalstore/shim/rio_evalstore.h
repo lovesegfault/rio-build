@@ -197,6 +197,42 @@ int rio_fingerprint_record(
     const char * store_path,
     char ** err);
 
+/* ── eval-parent surface (ADR-024 P3b) ─────────────────────────────────
+ * Used only by the rio-eval binary (never the plugin). */
+
+/* Worker eval callback: invoked IN THE FORKED WORKER once per assigned
+ * attr. Evaluate `attr`, call rio_emit_result with the root drv path,
+ * return 0. On failure write a NUL-terminated message into err_buf
+ * (capacity err_cap) and return nonzero — the worker reports a
+ * non-fatal WorkerError for the attr. */
+typedef int (*rio_eval_cb)(
+    void * ctx, const char * attr, int worker_fd, char * err_buf, size_t err_cap);
+
+/* Run the eval-parent orchestration loop (fork workers, relay frames,
+ * route IFD completions, recycle, crash-requeue) until the
+ * coordinator's Shutdown drains. chan_fd = the coordinator channel
+ * (fd 3). opts_json (nullable): {"max_workers":N,"recycle_attrs":N,
+ * "recycle_rss_mb":N,"attr_retries":N}. The process MUST be
+ * single-threaded at the call (fork-no-exec). */
+int rio_eval_parent_run(
+    RioEvalStore * store,
+    int chan_fd,
+    const char * opts_json,
+    rio_eval_cb cb,
+    void * ctx,
+    char ** err);
+
+/* Assemble + send the final ResultFrame for `attr` (root drv = full
+ * /nix/store/....drv path) on the worker channel fd. */
+int rio_emit_result(
+    RioEvalStore * store, int fd, const char * attr, const char * root_drv_path, char ** err);
+
+/* Relay an import-from-derivation to the coordinator and BLOCK until
+ * it resolves. On success the outputs are imported into this worker's
+ * eval store and *out_json is a JSON array of output store paths. */
+int rio_ifd_request(
+    RioEvalStore * store, int fd, const char * drv_path, char ** out_json, char ** err);
+
 #ifdef __cplusplus
 }
 #endif

@@ -394,6 +394,20 @@ impl PackStore {
         result
     }
 
+    /// Drop the writer segment without flushing. Fork-worker hygiene:
+    /// a child inherits the parent's segment, whose O_APPEND file
+    /// description is shared with the parent and every sibling —
+    /// appending through it interleaves records and desyncs this
+    /// handle's offset bookkeeping. After this call the next `put`
+    /// allocates a fresh per-pid segment, restoring the one-writer-
+    /// per-segment invariant. Closing the inherited fd does not
+    /// release the parent's shared flock (same file description stays
+    /// open in the parent), so inherited `own` records remain
+    /// GC-protected for the parent's lifetime.
+    pub fn forget_segment(&mut self) {
+        self.segment = None;
+    }
+
     /// Stats from the GC pass run by [`PackStore::open`], if one ran.
     pub fn last_gc_stats(&self) -> Option<&GcStats> {
         self.last_gc.as_ref()

@@ -299,19 +299,35 @@ struct PathMeta {
 }
 
 /// A captured derivation: memory-only (ADR-024 "Derivations are
-/// memory-only client-side"), gone at process exit.
-struct DrvEntry {
-    aterm: Vec<u8>,
-    info: PathInfo,
+/// memory-only client-side"), gone at process exit. Alongside the
+/// ATerm bytes nix hashed, the canonical rio-proto form + its blake3
+/// digest are computed once at capture time — they are exactly what
+/// skeleton assembly ships, so assembling a subgraph is a map walk,
+/// not a re-parse.
+pub(crate) struct DrvEntry {
+    pub(crate) aterm: Vec<u8>,
+    pub(crate) info: PathInfo,
+    /// Parsed form — node-field source for skeleton assembly.
+    pub(crate) parsed: Derivation,
+    /// Canonical `rio.drv.v1.Derivation` bytes (the negotiated blob).
+    pub(crate) canonical: Vec<u8>,
+    /// `blake3(canonical)` — the ADR-024 negotiation digest.
+    pub(crate) digest: [u8; 32],
 }
 
 /// Everything mutable, behind one mutex: nix may call store ops from
 /// more than one thread, and the pack store / decoded-dir cache are
 /// deliberately single-threaded types.
-struct Inner {
+pub(crate) struct Inner {
     dirs: DirStore,
     fingerprints: FingerprintTable,
-    drvs: HashMap<String, DrvEntry>,
+    pub(crate) drvs: HashMap<String, DrvEntry>,
+    /// Digests this process already shipped in a `ResultFrame`
+    /// (per-worker dedup — the coordinator dedups globally, this just
+    /// avoids resending a shared closure on every attr of one worker).
+    pub(crate) reported: HashSet<[u8; 32]>,
+    /// Source-root dir digests already shipped, same role.
+    pub(crate) reported_sources: HashSet<[u8; 32]>,
     /// Decoded path-metadata cache (same role as the decoded-dir cache:
     /// a per-op JSON parse on the hot lstat path would re-create the
     /// 92× pathology one level up).
@@ -330,6 +346,15 @@ struct Inner {
 pub struct EvalStore {
     inner: Mutex<Inner>,
     stats: Stats,
+    /// CAS root directory (the `?cas=` value / XDG default). The IFD
+    /// resume path imports coordinator-materialized outputs from
+    /// `<cas_root>/fetched/<basename>`.
+    cas_root: PathBuf,
+    /// Advisory cross-worker claim table (ADR-024). Created by the
+    /// eval parent before forking — `None` in the plugin, where no
+    /// sibling workers exist. OnceLock, not Mutex: set exactly once
+    /// pre-fork, read lock-free by every worker.
+    claims: std::sync::OnceLock<crate::evaljob::ClaimTable>,
 }
 
 impl EvalStore {
@@ -348,14 +373,34 @@ impl EvalStore {
                 dirs: DirStore::new(pack),
                 fingerprints,
                 drvs: HashMap::new(),
+                reported: HashSet::new(),
+                reported_sources: HashSet::new(),
                 metas: HashMap::new(),
                 touched: HashSet::new(),
             }),
             stats: Stats::default(),
+            cas_root: root,
+            claims: std::sync::OnceLock::new(),
         })
     }
 
-    fn lock(&self) -> MutexGuard<'_, Inner> {
+    /// CAS root directory backing this store.
+    pub fn cas_root(&self) -> &std::path::Path {
+        &self.cas_root
+    }
+
+    /// Create the advisory claim table (eval parent, pre-fork). A
+    /// second call is a no-op — the first table wins, which is the
+    /// only sane semantics for fork-shared memory.
+    pub fn enable_claim_table(&self) -> Result<()> {
+        if self.claims.get().is_none() {
+            let table = crate::evaljob::ClaimTable::create()?;
+            let _ = self.claims.set(table);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Inner> {
         // A panic mid-op is caught at the FFI boundary; the store must
         // stay usable afterwards, so poisoning is ignored.
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
@@ -364,6 +409,18 @@ impl EvalStore {
     /// Per-op counters (tests + the ADR-024 measurement plan).
     pub fn stats(&self) -> &Stats {
         &self.stats
+    }
+
+    /// Post-fork hygiene for a fork worker: drop the pack segment
+    /// inherited from the eval parent. The segment's O_APPEND file
+    /// description is shared with the parent and every sibling worker;
+    /// writing through it would interleave records across processes
+    /// and desync this handle's offsets. The worker's first write
+    /// allocates its own segment instead (the pack store's
+    /// one-writer-per-segment invariant). Call IN THE CHILD, before
+    /// any store write.
+    pub fn post_fork_child(&self) {
+        self.lock().dirs.pack_mut().forget_segment();
     }
 
     /// Persist this process's pack records and batched LRU touches.
@@ -542,6 +599,17 @@ impl EvalStore {
         nix_path_for: &mut dyn FnMut(&AddHashes) -> Result<String>,
     ) -> Result<AddResult> {
         let refs = parse_refs(references)?;
+        // Advisory cross-worker claim (ADR-024): keyed by origin path
+        // — the content digest isn't known yet, but two workers racing
+        // on the same tree race on the same path. Held for the ingest
+        // only; correctness never depends on it.
+        // r[impl bc.evalparent.claim-advisory]
+        let _claim = self.claims.get().map(|t| {
+            crate::evaljob::claim::ClaimGuard::acquire(
+                t,
+                *blake3::hash(fs_path.as_bytes()).as_bytes(),
+            )
+        });
         let result = ingest::ingest_tree(std::path::Path::new(fs_path), &IngestConfig::default())?;
         let nar_sha256 = result.nar_sha256;
         let nar_size = result.nar_size;
@@ -570,23 +638,7 @@ impl EvalStore {
         // Tree → BuiltDir + per-file chunk-meta payloads (unique by file
         // digest; identical files share one record).
         let mut chunk_metas: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
-        let root = match &result.root {
-            IngestNode::Dir(dir) => {
-                let built = built_from_ingest(dir, &mut chunk_metas);
-                MetaRootBuild::Dir(built)
-            }
-            IngestNode::File(f) => {
-                chunk_metas.insert(f.digest, chunk_meta_payload(f));
-                MetaRootBuild::Node(MetaNode::File {
-                    digest: f.digest,
-                    size: f.size,
-                    executable: f.executable,
-                })
-            }
-            IngestNode::Symlink(s) => MetaRootBuild::Node(MetaNode::Symlink {
-                target: s.target.clone(),
-            }),
-        };
+        let root = meta_root_from_ingest(&result.root, &mut chunk_metas);
 
         let info = PathInfo {
             nar_hash: hashes.nar_sha256.clone(),
@@ -622,6 +674,56 @@ impl EvalStore {
             nar_sha256: hashes.nar_sha256,
             nar_size,
         })
+    }
+
+    /// Import an already-materialized tree under a GIVEN store path
+    /// (the IFD resume path: the coordinator fetched a build output
+    /// into `<cas_root>/fetched/<basename>`, narHash-verified on
+    /// arrival; the worker maps it into its eval store so the
+    /// blocked import can read it). Input-addressed paths are not
+    /// recomputable from content, so the path is taken as given.
+    /// Origin stays `Local` — the fetched copy is immutable and IS
+    /// the byte store, per the not-a-mirror rule.
+    ///
+    /// References are recorded empty: the fetch path does not carry
+    /// them, and eval-side reads never consult them. TODO: thread
+    /// PathInfo references through IfdCompletion if a real IFD
+    /// workload needs context propagation from imported outputs.
+    pub fn import_local_tree_as(&self, fs_path: &str, full_store_path: &str) -> Result<()> {
+        let path = StorePath::parse(full_store_path)?;
+        let result = ingest::ingest_tree(std::path::Path::new(fs_path), &IngestConfig::default())?;
+
+        let mut chunk_metas: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+        let root = meta_root_from_ingest(&result.root, &mut chunk_metas);
+        let info = PathInfo {
+            nar_hash: hex::encode(result.nar_sha256),
+            nar_size: result.nar_size,
+            references: Vec::new(),
+            ca: None,
+        };
+
+        let mut inner = self.lock();
+        let mut extra_pins = Vec::new();
+        for payload in chunk_metas.values() {
+            let digest = Digest::of(payload);
+            if !inner.dirs.pack().contains(&digest) {
+                inner.dirs.pack_mut().put(Kind::FILE_CHUNK_META, payload)?;
+                self.stats.record("chunkmeta_write", payload.len() as u64);
+            }
+            extra_pins.push(digest);
+        }
+        self.commit(
+            &mut inner,
+            path.basename(),
+            root,
+            info,
+            Origin::Local {
+                fs_path: fs_path.to_string(),
+            },
+            extra_pins,
+        )?;
+        self.stats.record("import_local_tree", result.nar_size);
+        Ok(())
     }
 
     /// Capture a derivation (`writeDerivation`) into the in-process
@@ -666,6 +768,15 @@ impl EvalStore {
         };
         let (nar_hash, nar_size) = nar_hash_of_node(&node)?;
 
+        // Canonical proto form + negotiation digest, computed once at
+        // capture (ADR-024: the stored/negotiated form is the rio
+        // proto `Derivation` under the canonical-encode rule — the
+        // skeleton assembly ships these bytes verbatim).
+        let canonical = rio_proto::derivation_util::canonical_encode(
+            &rio_proto::derivation_util::to_proto(&drv),
+        );
+        let digest = *blake3::hash(&canonical).as_bytes();
+
         let entry = DrvEntry {
             aterm: aterm.to_vec(),
             info: PathInfo {
@@ -674,6 +785,9 @@ impl EvalStore {
                 references: ref_strs,
                 ca: Some(render_ca(CaMethod::Text, &content_sha256)),
             },
+            parsed: drv,
+            canonical,
+            digest,
         };
         self.lock()
             .drvs
@@ -1309,6 +1423,178 @@ impl EvalStore {
         }
     }
 
+    // -- skeleton assembly (ADR-024) --------------------------------------
+
+    /// Assemble the skeleton subgraph reachable from `root_drv_path`
+    /// (a full `/nix/store/....drv` path): one
+    /// [`DerivationNode`](rio_proto::types::DerivationNode) +
+    /// canonical-bytes [`DrvBlob`](rio_proto::types::DrvBlob) per
+    /// not-yet-reported drv in the in-memory map, plus the
+    /// [`SourceRoot`](rio_proto::evaljob::SourceRoot)s their `inputSrcs`
+    /// reference. Every emitted digest is marked reported, so a
+    /// worker's later attrs ship only their delta — the coordinator
+    /// dedups globally anyway (`bc.fold.dedup-by-digest`), this keeps
+    /// per-worker frames small.
+    ///
+    /// `inputSrcs` that are not locally-ingested directory trees
+    /// (streamed `toFile` content, single-file roots) are skipped with
+    /// a stats count: the coordinator's source upload only handles
+    /// origin-backed directory roots today (see the TODO in
+    /// `rio-build-cli::coordinator::upload::plan_source_upload`); a
+    /// genuinely missing input surfaces at the cluster's submit-time
+    /// verify rather than silently.
+    pub fn assemble_subgraph(
+        &self,
+        root_drv_path: &str,
+    ) -> Result<rio_proto::evaljob::ResultFrame> {
+        let root = StorePath::parse(root_drv_path)?;
+        let mut inner = self.lock();
+
+        let root_digest = inner
+            .drvs
+            .get(root.basename())
+            .ok_or_else(|| {
+                EvalStoreError::Corrupt(format!(
+                    "assemble: root derivation {root_drv_path} is not in the in-memory drv map"
+                ))
+            })?
+            .digest;
+
+        let mut frame = rio_proto::evaljob::ResultFrame {
+            root_drv_digest: root_digest.to_vec(),
+            ..Default::default()
+        };
+        let mut emitted: Vec<[u8; 32]> = Vec::new();
+        let mut emitted_sources: Vec<[u8; 32]> = Vec::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = vec![root.basename().to_string()];
+        while let Some(basename) = stack.pop() {
+            if !visited.insert(basename.clone()) {
+                continue;
+            }
+            let entry = inner.drvs.get(&basename).ok_or_else(|| {
+                EvalStoreError::Corrupt(format!(
+                    "assemble: input derivation {basename} is not in the in-memory drv map \
+                     (eval writes inputs before consumers — this is a bug)"
+                ))
+            })?;
+            if inner.reported.contains(&entry.digest) {
+                // Reported digests were reported closure-wide; their
+                // inputs need no revisit.
+                continue;
+            }
+            let digest = entry.digest;
+            let drv_path = format!("{}/{basename}", store_path::STORE_DIR);
+            let (node, blob) = skeleton_node(&drv_path, entry, &inner.drvs)?;
+            frame.nodes.push(node);
+            frame.drv_blobs.push(blob);
+            emitted.push(digest);
+
+            let input_drvs: Vec<String> = entry.parsed.input_drvs().keys().cloned().collect();
+            let input_srcs: Vec<String> = entry.parsed.input_srcs().iter().cloned().collect();
+            for input in input_drvs {
+                if let Some(b) = store_path::basename(&input) {
+                    stack.push(b.to_string());
+                }
+            }
+            for src in input_srcs {
+                if let Some(sr) = self.source_root_for(&mut inner, &src)? {
+                    let d: [u8; 32] = sr
+                        .dir_digest
+                        .as_slice()
+                        .try_into()
+                        .expect("dir digests are 32 bytes");
+                    if inner.reported_sources.contains(&d)
+                        || frame
+                            .source_roots
+                            .iter()
+                            .any(|s| s.dir_digest == sr.dir_digest)
+                    {
+                        continue;
+                    }
+                    emitted_sources.push(d);
+                    frame.source_roots.push(sr);
+                }
+            }
+        }
+        inner.reported.extend(emitted);
+        inner.reported_sources.extend(emitted_sources);
+        self.stats
+            .record("assemble_subgraph", frame.nodes.len() as u64);
+        Ok(frame)
+    }
+
+    /// Node + blob for one drv, regardless of reported state — the
+    /// `IfdRequest` payload (the request must carry the root even when
+    /// an earlier frame already shipped it).
+    pub fn ifd_materials(
+        &self,
+        drv_path: &str,
+    ) -> Result<(rio_proto::types::DerivationNode, rio_proto::types::DrvBlob)> {
+        let path = StorePath::parse(drv_path)?;
+        let inner = self.lock();
+        let entry = inner.drvs.get(path.basename()).ok_or_else(|| {
+            EvalStoreError::Corrupt(format!(
+                "IFD: derivation {drv_path} is not in the in-memory drv map"
+            ))
+        })?;
+        skeleton_node(drv_path, entry, &inner.drvs)
+    }
+
+    /// Output store paths of a drv in the map (IFD resume: which paths
+    /// the coordinator's completion must have materialized).
+    pub fn drv_output_paths(&self, drv_path: &str) -> Result<Vec<String>> {
+        let path = StorePath::parse(drv_path)?;
+        let inner = self.lock();
+        let entry = inner.drvs.get(path.basename()).ok_or_else(|| {
+            EvalStoreError::Corrupt(format!("{drv_path} is not in the in-memory drv map"))
+        })?;
+        Ok(entry
+            .parsed
+            .outputs()
+            .iter()
+            .map(|o| o.path().to_string())
+            .collect())
+    }
+
+    /// `SourceRoot` for one inputSrc, or `None` when the path is not
+    /// an origin-backed directory tree (skipped, counted).
+    fn source_root_for(
+        &self,
+        inner: &mut Inner,
+        full_path: &str,
+    ) -> Result<Option<rio_proto::evaljob::SourceRoot>> {
+        let Some(basename) = store_path::basename(full_path) else {
+            return Ok(None);
+        };
+        let meta = match self.path_meta(inner, basename) {
+            Ok(Some(m)) => m,
+            // Not in the CAS (e.g. a path nix considers valid for
+            // other reasons) — skip, the cluster verify will name it.
+            Ok(None) | Err(EvalStoreError::ForeignPath(_)) => {
+                self.stats.record("source_root_skipped", 0);
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let (Origin::Local { fs_path }, MetaNode::Dir { digest }) = (&meta.origin, &meta.root)
+        else {
+            // Streamed content (toFile) or file/symlink roots: the
+            // origin-reread upload path can't serve these yet.
+            self.stats.record("source_root_skipped", 0);
+            return Ok(None);
+        };
+        let nar_hash = hex::decode(&meta.info.nar_hash)
+            .map_err(|e| EvalStoreError::Corrupt(format!("bad stored nar_hash hex: {e}")))?;
+        Ok(Some(rio_proto::evaljob::SourceRoot {
+            store_path: full_path.to_string(),
+            dir_digest: digest.to_vec(),
+            nar_hash,
+            nar_size: meta.info.nar_size,
+            origin: fs_path.clone(),
+        }))
+    }
+
     pub fn fingerprint_record(
         &self,
         fs_path: &str,
@@ -1404,6 +1690,120 @@ fn built_from_nar<'a>(
         dir.push(entry.name.as_bytes(), built);
     }
     Ok(dir)
+}
+
+/// Build the skeleton [`DerivationNode`] + [`DrvBlob`] pair for one
+/// captured drv. Field population mirrors the gateway's `build_node`
+/// (rio-gateway translate.rs) for the fields the scheduler consumes;
+/// the ADR-024 digest fields come from the capture-time canonical
+/// encode. The post-BFS gateway passes (wanted_output_names,
+/// ca_modular_hash) stay empty — digest-bearing submissions don't use
+/// them, and CA derivations are out of scope here.
+fn skeleton_node(
+    drv_path: &str,
+    entry: &DrvEntry,
+    drvs: &HashMap<String, DrvEntry>,
+) -> Result<(rio_proto::types::DerivationNode, rio_proto::types::DrvBlob)> {
+    use rio_nix::derivation::DerivationLike as _;
+
+    // Ship-time digest re-verify: the digest and the canonical bytes
+    // were computed together at capture, but a corrupted in-memory
+    // body would waste a whole negotiate+submit cycle before the
+    // server's verify rejects it. blake3 over a few KB is noise next
+    // to the frame write.
+    if *blake3::hash(&entry.canonical).as_bytes() != entry.digest {
+        return Err(EvalStoreError::Corrupt(format!(
+            "captured drv bytes for {drv_path} no longer match their digest"
+        )));
+    }
+
+    let drv = &entry.parsed;
+    let (output_names, expected_output_paths): (Vec<_>, Vec<_>) = drv
+        .outputs()
+        .iter()
+        .map(|o| (o.name().to_string(), o.path().to_string()))
+        .unzip();
+    let mut input_drv_digests = Vec::with_capacity(drv.input_drvs().len());
+    for input in drv.input_drvs().keys() {
+        let basename = store_path::basename(input).ok_or_else(|| {
+            EvalStoreError::Corrupt(format!("malformed inputDrv path {input} in {drv_path}"))
+        })?;
+        let dep = drvs.get(basename).ok_or_else(|| {
+            EvalStoreError::Corrupt(format!(
+                "inputDrv {input} of {drv_path} is not in the in-memory drv map"
+            ))
+        })?;
+        input_drv_digests.push(dep.digest.to_vec());
+    }
+    let env_clamped = |key: &str| {
+        drv.env()
+            .get(key)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.chars().take(256).collect::<String>())
+    };
+    // Nix bool env values are "1"/"" (older stdenv) or "true"/"false".
+    // Absent stays None (for enableParallelBuilding in particular,
+    // absent ≠ false — same rule as the gateway).
+    let env_bool = |key: &str| {
+        drv.env()
+            .get(key)
+            .map(|v| matches!(v.as_str(), "1" | "true"))
+    };
+    let node = rio_proto::types::DerivationNode {
+        drv_path: drv_path.to_string(),
+        // Input-addressed derivations use the store path as drv_hash
+        // (unique, non-empty DAG key — gateway convention).
+        drv_hash: drv_path.to_string(),
+        pname: env_clamped("pname")
+            .or_else(|| env_clamped("name"))
+            .unwrap_or_default(),
+        version: env_clamped("version"),
+        enable_parallel_building: env_bool("enableParallelBuilding"),
+        enable_parallel_checking: env_bool("enableParallelChecking"),
+        prefer_local_build: env_bool("preferLocalBuild"),
+        system: drv.platform().to_string(),
+        required_features: drv
+            .env()
+            .get("requiredSystemFeatures")
+            .map(|v| v.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default(),
+        output_names,
+        expected_output_paths,
+        is_fixed_output: drv.is_fixed_output(),
+        is_content_addressed: drv.is_content_addressed(),
+        needs_resolve: drv.has_ca_floating_outputs(),
+        drv_digest: entry.digest.to_vec(),
+        input_drv_digests,
+        ..Default::default()
+    };
+    let blob = rio_proto::types::DrvBlob {
+        digest: entry.digest.to_vec(),
+        drv_path: drv_path.to_string(),
+        body: entry.canonical.clone(),
+    };
+    Ok((node, blob))
+}
+
+/// Ingest root → [`MetaRootBuild`] + chunk-meta payloads (shared by
+/// `add_source_tree` and the IFD `import_local_tree_as`).
+fn meta_root_from_ingest(
+    root: &IngestNode,
+    chunk_metas: &mut HashMap<[u8; 32], Vec<u8>>,
+) -> MetaRootBuild {
+    match root {
+        IngestNode::Dir(dir) => MetaRootBuild::Dir(built_from_ingest(dir, chunk_metas)),
+        IngestNode::File(f) => {
+            chunk_metas.insert(f.digest, chunk_meta_payload(f));
+            MetaRootBuild::Node(MetaNode::File {
+                digest: f.digest,
+                size: f.size,
+                executable: f.executable,
+            })
+        }
+        IngestNode::Symlink(s) => MetaRootBuild::Node(MetaNode::Symlink {
+            target: s.target.clone(),
+        }),
+    }
 }
 
 /// Convert an ingested directory into a [`BuiltDir`], collecting one

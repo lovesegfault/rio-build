@@ -736,6 +736,161 @@ pub unsafe extern "C" fn rio_fingerprint_lookup(
     })
 }
 
+// ---------------------------------------------------------------------------
+// eval-parent surface (ADR-024)
+// ---------------------------------------------------------------------------
+
+/// Worker eval callback: invoked IN THE FORKED WORKER once per
+/// assigned attr. Must evaluate `attr` and call [`rio_emit_result`]
+/// with the root drv path before returning 0. On failure, write a
+/// NUL-terminated message into `err_buf` (capacity `err_cap`) and
+/// return nonzero — the worker reports a non-fatal `WorkerError`.
+pub type RioEvalCb = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    attr: *const c_char,
+    worker_fd: c_int,
+    err_buf: *mut c_char,
+    err_cap: usize,
+) -> c_int;
+
+/// Run the eval-parent orchestration loop (fork workers, relay frames,
+/// route IFD, recycle, crash-requeue) until the coordinator's Shutdown
+/// drains. `chan_fd` is the coordinator channel (fd 3). `opts_json`
+/// (nullable): `{"max_workers":N,"recycle_attrs":N,"recycle_rss_mb":N,
+/// "attr_retries":N}` — absent fields default. `cb` runs in each
+/// forked worker; the parent never evaluates.
+///
+/// # Safety
+/// Standard contract; `cb`/`ctx` must stay valid for the whole run.
+/// The process must be single-threaded at the call (fork-no-exec).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rio_eval_parent_run(
+    store: *mut EvalStore,
+    chan_fd: c_int,
+    opts_json: *const c_char,
+    cb: RioEvalCb,
+    ctx: *mut c_void,
+    err: *mut *mut c_char,
+) -> c_int {
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct OptsJson {
+        max_workers: Option<usize>,
+        recycle_attrs: Option<u32>,
+        recycle_rss_mb: Option<u64>,
+        attr_retries: Option<u32>,
+    }
+    guard(err, || {
+        // SAFETY: caller contract.
+        let raw = unsafe { opt_str(opts_json) }?;
+        let parsed: OptsJson = match raw {
+            None | Some("") => OptsJson::default(),
+            Some(s) => serde_json::from_str(s)
+                .map_err(|e| EvalStoreError::Unsupported(format!("malformed opts JSON: {e}")))?,
+        };
+        let defaults = crate::evaljob::EvalParentOpts::default();
+        let opts = crate::evaljob::EvalParentOpts {
+            max_workers: parsed.max_workers.unwrap_or(defaults.max_workers),
+            recycle_attrs: parsed.recycle_attrs.unwrap_or(defaults.recycle_attrs),
+            recycle_rss_mb: parsed.recycle_rss_mb.unwrap_or(defaults.recycle_rss_mb),
+            attr_retries: parsed.attr_retries.unwrap_or(defaults.attr_retries),
+        };
+        let mut eval = |attr: &str, worker_fd: std::os::fd::RawFd| -> Result<(), String> {
+            let cattr = CString::new(attr).map_err(|_| "attr contains NUL".to_string())?;
+            let mut buf = [0u8; 4096];
+            // SAFETY: cb/ctx supplied by the embedder; buffer valid.
+            let rc = unsafe {
+                cb(
+                    ctx,
+                    cattr.as_ptr(),
+                    worker_fd,
+                    buf.as_mut_ptr().cast::<c_char>(),
+                    buf.len(),
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            let nul = buf.iter().position(|&b| b == 0).unwrap_or(0);
+            // Callback messages are diagnostics, not parse inputs; a
+            // non-UTF-8 buffer falls back to a generic message.
+            let msg = std::str::from_utf8(&buf[..nul])
+                .map(str::to_owned)
+                .unwrap_or_default();
+            Err(if msg.is_empty() {
+                format!("eval callback failed (rc {rc})")
+            } else {
+                msg
+            })
+        };
+        crate::evaljob::run_eval_parent(store_ref(store), chan_fd, &opts, &mut eval)
+            .map_err(EvalStoreError::Io)
+    })
+}
+
+/// Assemble + send the final `ResultFrame` for `attr` (root =
+/// `root_drv_path`, a full `/nix/store/....drv` path) on `fd`. Called
+/// from the worker eval callback after evaluation lands the drv
+/// closure in the in-memory map.
+///
+/// # Safety
+/// Standard contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rio_emit_result(
+    store: *mut EvalStore,
+    fd: c_int,
+    attr: *const c_char,
+    root_drv_path: *const c_char,
+    err: *mut *mut c_char,
+) -> c_int {
+    guard(err, || {
+        // SAFETY: caller contract.
+        let attr = unsafe { req_str(attr) }?;
+        // SAFETY: caller contract.
+        let root = unsafe { req_str(root_drv_path) }?;
+        let mut frame = store_ref(store).assemble_subgraph(root)?;
+        frame.attr = attr.to_string();
+        let msg = rio_proto::evaljob::WorkerFrame {
+            msg: Some(rio_proto::evaljob::worker_frame::Msg::Result(frame)),
+        };
+        crate::evaljob::framing::write_frame(&mut crate::evaljob::framing::FdIo(fd), &msg)
+            .map_err(EvalStoreError::Io)
+    })
+}
+
+/// Relay an import-from-derivation to the coordinator and BLOCK until
+/// it resolves (ADR-024 "IFD"). On success the realized outputs are
+/// imported into this worker's eval store and `*out_json` is a JSON
+/// array of the output store paths. On failure `*err` carries the
+/// coordinator's message (including the `--local-ifd` refusal).
+///
+/// # Safety
+/// Standard contract. Must be called from a worker whose channel `fd`
+/// is otherwise quiescent (the worker loop is between frame reads —
+/// guaranteed when called from inside the eval callback).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rio_ifd_request(
+    store: *mut EvalStore,
+    fd: c_int,
+    drv_path: *const c_char,
+    out_json: *mut *mut c_char,
+    err: *mut *mut c_char,
+) -> c_int {
+    guard(err, || {
+        // SAFETY: caller contract.
+        let drv_path = unsafe { req_str(drv_path) }?;
+        let paths = crate::evaljob::ifd::ifd_request_blocking(store_ref(store), fd, drv_path)
+            .map_err(EvalStoreError::Unsupported)?;
+        set_out_string(
+            out_json,
+            Some(serde_json::to_string(&paths).map_err(|e| {
+                EvalStoreError::Corrupt(format!("output paths encode failed: {e}"))
+            })?),
+        );
+        Ok(())
+    })
+}
+
 /// Record a fingerprint after a successful ingest of `fs_path`.
 ///
 /// # Safety
