@@ -447,6 +447,76 @@ async fn probe_unavailable_defers_build_establishment() -> TestResult {
 }
 
 // r[verify sched.attempt.establishment-window+6]
+/// bughunt-13 F13 (W13-AN): the probe-unavailable defer is OBSERVABLE.
+/// Pre-fix red (recorded in the introducing commit): a persistent
+/// probe-unavailable wedge produced ZERO alertable signal — the only
+/// establishment tripwire (RioSchedulerAttemptEstablishmentCluster)
+/// keys on rio_scheduler_pull_establishments_total, which counts
+/// CHARGES; the defer arm charges nothing forever, so the wedge was
+/// invisible to every alert surface (the audit's opposite-polarity
+/// finding). Post-fix: every deferred resolution ticks
+/// rio_scheduler_establish_deferred_total and the sweep publishes the
+/// wedge's overdue age on rio_scheduler_establish_defer_age_seconds —
+/// rising while the wedge persists, zero once it resolves — the
+/// surface RioSchedulerEstablishDeferPersistent alerts on (the
+/// polarity-corrected alert: it fires on deferral persistence, not on
+/// charges).
+#[tokio::test]
+async fn defer_emits_alertable_signal() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let out_path = test_store_path("est-f-out");
+    let mut node = make_node("est-f");
+    node.expected_output_paths = vec![out_path.clone()];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    let assignment = pull_deliver(&handle, "est-f").await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    backdate_assignment(&db.pool, exec_id).await?;
+
+    // The store is up but FMP fails (RPC error): every sweep defers.
+    store
+        .faults
+        .fail_find_missing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    tick(&handle).await?;
+
+    assert_eq!(
+        recorder.get("rio_scheduler_establish_deferred_total{}"),
+        1,
+        "a deferred establishment must tick the defer counter"
+    );
+    let age = recorder
+        .gauge_value("rio_scheduler_establish_defer_age_seconds{}")
+        .unwrap_or(0.0);
+    assert!(
+        age > 0.0,
+        "the sweep must publish the deferred attempt's overdue age, got {age}"
+    );
+
+    // The wedge persists across passes: the counter keeps counting.
+    tick(&handle).await?;
+    assert_eq!(recorder.get("rio_scheduler_establish_deferred_total{}"), 2);
+
+    // The probe heals: the next pass resolves (charged) and the age
+    // surface returns to zero — the alert clears.
+    store
+        .faults
+        .fail_find_missing
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    tick(&handle).await?;
+    let rows = attempt_rows_for(&db.pool, "est-f").await;
+    assert_eq!(rows.len(), 1, "the healed pass establishes exactly once");
+    assert_eq!(
+        recorder.gauge_value("rio_scheduler_establish_defer_age_seconds{}"),
+        Some(0.0),
+        "a sweep with nothing deferred must zero the age surface"
+    );
+    Ok(())
+}
+
+// r[verify sched.attempt.establishment-window+6]
 /// merged_bug_232 green pin: the MATERIALIZATION arm still charges on a
 /// failing probe — the kind axis decides before the probe axis (a
 /// mid-walk crash leaves the closure incomplete; outputs-present is

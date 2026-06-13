@@ -46,7 +46,12 @@ spec:
         # (kubelet/containerd hung while the Node object stays Ready)
         # surfaces as its builds silently running out their attempt
         # deadlines and being established by the sweep as unreported
-        # executor crashes instead of reporting. Fleet-wide >=2
+        # executor crashes instead of reporting — WHEN the sweep's
+        # store probe answers (bughunt-13 F13: a probe-unavailable
+        # pass DEFERS instead of establishing, so this charge-keyed
+        # tripwire is structurally silent through a store-probe
+        # outage; that opposite-polarity wedge has its own surface,
+        # RioSchedulerEstablishDeferPersistent below). Fleet-wide >=2
         # establishments inside 30m is the tripwire, summed across
         # replicas and keyed on the dedicated pull-sweep counter (the
         # attempt_requeue histogram's establishment cause is shared
@@ -73,6 +78,42 @@ spec:
               hung-node signature: follow the manual NodeClaim reap
               procedure in docs/ops/hung-node-manual-reap.typ. Never
               bulk-reap Ready nodes without that per-node confirmation.
+
+        # bughunt-13 F13 (the model audit's enabledness-cousin): the
+        # POLARITY-CORRECTED establishment alert. The cluster tripwire
+        # above fires on CHARGES; a probe-unavailable establishment
+        # pass charges nothing — the kernel DEFERS and the attempt
+        # stays open, unbounded and memoryless by design
+        # (merged_bug_232: absence of evidence is not evidence of
+        # absence) — so a persistent store-probe outage wedges expired
+        # attempts open with ZERO charge-side signal. This alert's
+        # clock is the defer's own age (R29'): the sweep publishes the
+        # oldest deferred attempt's seconds past its establishment
+        # window and zeroes the gauge when nothing defers, so the
+        # expression reads in wedge-duration units regardless of build
+        # runtimes. Threshold: 900s past-window sits above the
+        # store-degraded corroboration window (600s — the system's own
+        # store-outage tolerance scale) so breaker-absorbed blips
+        # never page; `for: 10m` adds sweep-cadence hysteresis. A
+        # firing alert means builds are charge-frozen behind a store
+        # probe outage: check FindMissingPaths health on the scheduler
+        # -> store path, not the builders.
+        - alert: RioSchedulerEstablishDeferPersistent
+          expr: max(rio_scheduler_establish_defer_age_seconds) > 900
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "establishment sweep deferring past 15m (store probe unavailable)"
+            description: >-
+              The establishment sweep has been deferring at least one
+              expired pull attempt for
+              {{`{{ $value | humanize }}`}}s past its establishment
+              window because the store probe (FindMissingPaths) is
+              unavailable. Deferred attempts are uncharged and stay
+              open by design; the wedge resolves on the first pass
+              with a working probe. Investigate scheduler->store RPC
+              health; the builds themselves are not the cause.
 
         {{- if .Values.buildScheduler.enabled }}
         # ADR-023 §13b: kube-build-scheduler second kube-scheduler.

@@ -1155,6 +1155,16 @@ impl DagActor {
         crate::observability::LeaderGauge::OpenAttempts.set(opens.build.len() as f64);
         crate::observability::LeaderGauge::OpenMaterializationAttempts
             .set(opens.materialization.len() as f64);
+        // bughunt-13 F13: the defer-age gauge is recomputed from
+        // scratch every sweep — zeroed here, BEFORE the early
+        // returns, so a healed or empty fleet reads 0 instead of the
+        // last wedge's stale age; the establishment loop below raises
+        // it again if any expired attempt defers this pass. The value
+        // is the oldest deferred attempt's OVERDUE age (seconds past
+        // its establishment window), so the persistence alert's
+        // threshold reads in wedge-duration units, not build-runtime
+        // units.
+        crate::observability::LeaderGauge::EstablishDeferAge.set(0.0);
         // live_058-c mark hygiene: a witnessed-terminal mark whose
         // attempt is no longer OPEN resolved through some other path
         // (worker report won the race, synthesized close, adoption,
@@ -1384,10 +1394,14 @@ impl DagActor {
         // claim either widened the window by a minutes-scale solve or
         // (post-A2.3) compared apples to the store anchor.
         let now = crate::db::attempts::epoch_now();
-        let mut expired: Vec<crate::db::open_attempts::OpenAttemptRow> = opens
+        // Each expired row carries its OVERDUE seconds (now past the
+        // establishment window) — the predicates are unchanged
+        // (overdue > 0 ⟺ the old comparisons); the quantity feeds the
+        // defer-age gauge when the kernel defers (bughunt-13 F13).
+        let mut expired: Vec<(crate::db::open_attempts::OpenAttemptRow, f64)> = opens
             .build
             .into_iter()
-            .filter(|attempt| {
+            .filter_map(|attempt| {
                 // r[impl sched.attempt.witnessed-terminal]
                 // live_058-c: a controller-witnessed terminal attempt
                 // expires on the WITNESSED clock — the pod is gone, so
@@ -1399,7 +1413,8 @@ impl DagActor {
                 // keep the deadline anchor UNCHANGED below — the
                 // widen-only law for healthy attempts is untouched.
                 if let Some(mark) = self.witnessed_terminal.get(&attempt.exec_id) {
-                    return now > mark.witnessed_at + slack_secs;
+                    let overdue = now - (mark.witnessed_at + slack_secs);
+                    return (overdue > 0.0).then_some((attempt, overdue));
                 }
                 let dispatched_deadline = attempt.deadline_secs.unwrap_or(0.0);
                 let resolved_deadline = self
@@ -1413,11 +1428,13 @@ impl DagActor {
                     })
                     .unwrap_or(0.0);
                 let deadline_secs = dispatched_deadline.max(resolved_deadline);
-                attempt.age_secs > deadline_secs + slack_secs
+                let overdue = attempt.age_secs - (deadline_secs + slack_secs);
+                (overdue > 0.0).then_some((attempt, overdue))
             })
             .collect();
-        expired.extend(opens.materialization.into_iter().filter(|attempt| {
-            attempt.age_secs > attempt.deadline_secs.unwrap_or(0.0) + slack_secs
+        expired.extend(opens.materialization.into_iter().filter_map(|attempt| {
+            let overdue = attempt.age_secs - (attempt.deadline_secs.unwrap_or(0.0) + slack_secs);
+            (overdue > 0.0).then_some((attempt, overdue))
         }));
         if expired.is_empty() {
             return;
@@ -1426,29 +1443,45 @@ impl DagActor {
         // the post-failover reconcile uses).
         let probe_paths: Vec<String> = expired
             .iter()
-            .filter_map(|a| self.dag.node(a.drv_hash.as_str()))
+            .filter_map(|(a, _)| self.dag.node(a.drv_hash.as_str()))
             .flat_map(|s| s.expected_output_paths.iter())
             .filter(|p| !p.is_empty())
             .cloned()
             .collect();
         let probe = self.batch_probe_orphan_outputs(probe_paths).await;
-        for attempt in expired {
-            self.establish_open_pull_attempt(&attempt, &probe).await;
+        let mut max_defer_overdue: f64 = 0.0;
+        for (attempt, overdue_secs) in expired {
+            let deferred = self.establish_open_pull_attempt(&attempt, &probe).await;
+            if deferred {
+                max_defer_overdue = max_defer_overdue.max(overdue_secs);
+            }
+        }
+        if max_defer_overdue > 0.0 {
+            // bughunt-13 F13: at least one attempt deferred this pass —
+            // publish the oldest wedge's overdue age (the persistence
+            // alert's clock; zeroed above when nothing defers).
+            crate::observability::LeaderGauge::EstablishDeferAge.set(max_defer_overdue);
         }
     }
 
     /// Resolve one expired open pull-mode attempt: adopt (store-probe
     /// arm) or establish + requeue (C2 charge arm). See
     /// [`Self::tick_sweep_open_pull_attempts`].
+    ///
+    /// Returns `true` iff the kernel DEFERRED the attempt
+    /// (probe-unavailable: it stays open for a later pass) — the
+    /// sweep aggregates that bit into the defer-age gauge (bughunt-13
+    /// F13: the deferral plane's only observability; every other arm
+    /// answers `false`).
     async fn establish_open_pull_attempt(
         &mut self,
         attempt: &crate::db::open_attempts::OpenAttemptRow,
         probe: &super::recovery::StoreProbe,
-    ) {
+    ) -> bool {
         // Standby replicas must neither write attempt rows nor decide
         // from them (the same gate every establishment vehicle carries).
         if !self.leader.is_leader() {
-            return;
+            return false;
         }
         let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
         let executor = ExecutorId::from(attempt.executor_id.as_str());
@@ -1498,7 +1531,7 @@ impl DagActor {
                 // for an authoritative pass.
                 debug!(drv_hash = %attempt.drv_hash, exec_id = %attempt.exec_id,
                        "establishment sweep: DAG not authoritative; attempt left open");
-                return;
+                return false;
             }
         };
         // Probe axis (merged_bug_232, the §4.R2 split this workstream
@@ -1609,7 +1642,7 @@ impl DagActor {
                         "establishment sweep: charge-free close failed; the attempt stays open for this pass"
                     ),
                 }
-                return;
+                return false;
             }
             EstablishmentAction::ChargeMaterializationInfra => {
                 // Substitution-replacement (design §2.4 / findings
@@ -1622,7 +1655,7 @@ impl DagActor {
                 // never executor_crash.
                 // r[impl sched.materialize.routing+7]
                 self.establish_materialization_attempt(attempt).await;
-                return;
+                return false;
             }
             EstablishmentAction::AdoptCompleted(verified) => {
                 // Store-probe arm: every verifiable wanted output
@@ -1672,7 +1705,7 @@ impl DagActor {
                 self.witnessed_terminal.remove(&attempt.exec_id);
                 info!(drv_hash = %drv_hash, exec_id = %attempt.exec_id,
                       "establishment sweep: outputs present in store, adopted as completed (no charge)");
-                return;
+                return false;
             }
             EstablishmentAction::Defer => {
                 // No probe evidence in either direction: the attempt
@@ -1686,9 +1719,22 @@ impl DagActor {
                 // (merged_bug_005: this arm IS producible — the old
                 // "cannot produce this arm" parenthetical predated the
                 // probe-axis wiring).
+                //
+                // bughunt-13 F13: the defer is OBSERVABLE. The only
+                // establishment tripwire
+                // (RioSchedulerAttemptEstablishmentCluster) keys on
+                // pull_establishments_total, which counts CHARGES — a
+                // probe-unavailable wedge charges nothing forever, so
+                // without its own counter (here) and age surface (the
+                // sweep's defer-age gauge, fed by the `true` return)
+                // it is invisible to every alert
+                // (`defer_emits_alertable_signal` pins this
+                // executably; the persistence alert is
+                // RioSchedulerEstablishDeferPersistent).
+                metrics::counter!("rio_scheduler_establish_deferred_total").increment(1);
                 debug!(drv_hash = %attempt.drv_hash, exec_id = %attempt.exec_id,
                        "establishment sweep: probe evidence unavailable; attempt stays open");
-                return;
+                return true;
             }
             EstablishmentAction::ChargeExecutorCrash => {
                 // Fall through to the C2 charge arm below.
@@ -1753,13 +1799,13 @@ impl DagActor {
             Ok(None) => {
                 info!(drv_hash = %drv_hash, serving_generation = serving_generation.as_i64(),
                       "establishment sweep: serving generation below the claims floor; nothing written");
-                return;
+                return false;
             }
             Err(e) => {
                 warn!(drv_hash = %drv_hash, exec_id = %attempt.exec_id, error = %e,
                       "establishment sweep: appending transaction failed; the attempt stays open \
                        for this pass (no charge, no verdict)");
-                return;
+                return false;
             }
         };
         // The charging transaction committed (won or lost, the
@@ -1771,7 +1817,7 @@ impl DagActor {
             // verdict); this pass records and changes nothing — in
             // particular no promotion: the won flag is the
             // once-per-attempt cap (live_058-b).
-            return;
+            return false;
         }
         // r[impl sched.attempt.witnessed-terminal]
         // live_058-b: the witnessed reason feeds the per-reason
@@ -1836,7 +1882,7 @@ impl DagActor {
             "establishment sweep: open pull-mode attempt established as unreported executor crash"
         );
         if !verdict_eligible {
-            return;
+            return false;
         }
         match decision.verdict {
             crate::retry_policy::Verdict::Poison(reason) => {
@@ -1865,6 +1911,7 @@ impl DagActor {
                     .await;
             }
         }
+        false
     }
 }
 

@@ -511,9 +511,30 @@ pub fn describe_metrics() {
         "rio_scheduler_pull_establishments_total",
         "Open pull-mode attempts established as unreported executor crashes \
          by the establishment sweep (the C2 charge arm; the store-probe adopt \
-         arm does not count). Feeds the OA2 interim hung-node tripwire — the \
-         attempt_requeue histogram's establishment cause is shared with the \
-         stream-mode correlation-TTL sweep and is unsuitable for that alert."
+         arm does not count, and the probe-unavailable DEFER arm has its own \
+         counter — establish_deferred_total). Feeds the OA2 interim hung-node \
+         tripwire — the attempt_requeue histogram's establishment cause is \
+         shared with the stream-mode correlation-TTL sweep and is unsuitable \
+         for that alert."
+    );
+    describe_counter!(
+        "rio_scheduler_establish_deferred_total",
+        "Expired open pull-mode attempts the establishment sweep DEFERRED \
+         because the store probe was unavailable (no evidence either way — \
+         the attempt stays open for a pass with a working probe). The defer \
+         is uncharged and unbounded by design, so this counter and the \
+         defer-age gauge are the wedge's only observability: the \
+         establishment-cluster tripwire counts CHARGES and stays silent \
+         through a probe outage."
+    );
+    describe_gauge!(
+        "rio_scheduler_establish_defer_age_seconds",
+        "Oldest currently-deferred expired pull attempt's seconds past its \
+         establishment window (0 when no attempt is deferred). Recomputed \
+         every sweep pass; leader-owned. Rises monotonically while a \
+         probe-unavailable wedge persists — the \
+         RioSchedulerEstablishDeferPersistent alert's clock is this age, \
+         never the charge rate (the opposite polarity)."
     );
     describe_counter!(
         "rio_scheduler_materialization_jobs_created_total",

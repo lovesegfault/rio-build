@@ -15,6 +15,7 @@
     "RioNodeclaimPoolStuckTerminating",
     "RioSchedulerActorSlow",
     "RioSchedulerAttemptEstablishmentCluster",
+    "RioSchedulerEstablishDeferPersistent",
     "RioSchedulerEvidenceWriteFenced",
     "RioSchedulerLeaderEndpointsNotSingleton",
     "RioSchedulerMaterializationConversions",
@@ -173,6 +174,16 @@
       "templated": false,
       "metrics": [
         "rio_scheduler_pull_establishments_total"
+      ]
+    },
+    {
+      "name": "RioSchedulerEstablishDeferPersistent",
+      "expr": "max(rio_scheduler_establish_defer_age_seconds) > 900",
+      "for": "10m",
+      "severity": "warning",
+      "templated": false,
+      "metrics": [
+        "rio_scheduler_establish_defer_age_seconds"
       ]
     },
     {

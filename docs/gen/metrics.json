@@ -124,6 +124,8 @@
     "rio_scheduler_derivations_gc_deleted_total",
     "rio_scheduler_derivations_queued",
     "rio_scheduler_derivations_running",
+    "rio_scheduler_establish_defer_age_seconds",
+    "rio_scheduler_establish_deferred_total",
     "rio_scheduler_evidence_write_fenced_total",
     "rio_scheduler_exec_rows_gc_deleted_total",
     "rio_scheduler_executor_auth_rejected_total",
@@ -914,6 +916,17 @@
         "aggregation": "leader-zeroed"
       },
       {
+        "name": "rio_scheduler_establish_defer_age_seconds",
+        "kind": "gauge",
+        "help": "Oldest currently-deferred expired pull attempt's seconds past its establishment window (0 when no attempt is deferred). Recomputed every sweep pass; leader-owned. Rises monotonically while a probe-unavailable wedge persists — the RioSchedulerEstablishDeferPersistent alert's clock is this age, never the charge rate (the opposite polarity).",
+        "aggregation": "leader-zeroed"
+      },
+      {
+        "name": "rio_scheduler_establish_deferred_total",
+        "kind": "counter",
+        "help": "Expired open pull-mode attempts the establishment sweep DEFERRED because the store probe was unavailable (no evidence either way — the attempt stays open for a pass with a working probe). The defer is uncharged and unbounded by design, so this counter and the defer-age gauge are the wedge's only observability: the establishment-cluster tripwire counts CHARGES and stays silent through a probe outage."
+      },
+      {
         "name": "rio_scheduler_evidence_write_fenced_total",
         "kind": "counter",
         "help": "Evidence writes (materialization job creation/resolution, wanted-relation rows, derivation status/poison persists, merge transactions) refused by the claims-floor generation fence: the writing replica's serving generation sat below the durable floor (GREATEST over assignments.generation and leader_generation_claims.generation). On a replica that just lost the lease this is the fence working — the successor owns the evidence now; on the current leader it should be ZERO (a nonzero rate there means a capture bug or a PG floor regression and needs investigation)."
@@ -1054,7 +1067,7 @@
       {
         "name": "rio_scheduler_pull_establishments_total",
         "kind": "counter",
-        "help": "Open pull-mode attempts established as unreported executor crashes by the establishment sweep (the C2 charge arm; the store-probe adopt arm does not count). Feeds the OA2 interim hung-node tripwire — the attempt_requeue histogram's establishment cause is shared with the stream-mode correlation-TTL sweep and is unsuitable for that alert."
+        "help": "Open pull-mode attempts established as unreported executor crashes by the establishment sweep (the C2 charge arm; the store-probe adopt arm does not count, and the probe-unavailable DEFER arm has its own counter — establish_deferred_total). Feeds the OA2 interim hung-node tripwire — the attempt_requeue histogram's establishment cause is shared with the stream-mode correlation-TTL sweep and is unsuitable for that alert."
       },
       {
         "name": "rio_scheduler_pull_rejected_total",

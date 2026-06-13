@@ -255,6 +255,14 @@ leader_gauges! {
     // test forces membership.
     OpenMaterializationAttempts => ("rio_scheduler_open_materialization_attempts", None, 0.0),
     MaterializationStalled => ("rio_scheduler_materialization_stalled", None, 0.0),
+    // bughunt-13 F13: the establishment-defer wedge's age surface —
+    // the oldest currently-deferred expired attempt's seconds past
+    // its establishment window, recomputed (and zeroed) by every
+    // sweep pass. Leader-owned like the open-attempt gauges it is
+    // derived beside; reset value 0.0 = "no deferral wedge", so a
+    // failover reads alert-neutral until the new leader's first
+    // sweep republishes from ground truth.
+    EstablishDeferAge => ("rio_scheduler_establish_defer_age_seconds", None, 0.0),
     // Ratio gauge: neutral is 1.0 (in-band). A 0.0 sweep would read as
     // "clamped at the low edge" and fire RioSlaPriorDivergenceClamped
     // (`<= 0.5`) on every failover — the deposed-leader wedge this
