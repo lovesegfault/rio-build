@@ -6042,6 +6042,22 @@ rec {
       step = "pullStep";
       witness = "canChargePastBound";
     };
+    # bughunt-13 F15: the corroboration gate's refusal polarity is
+    # reachable — an UNCORROBORATED flagged report is charged as plain
+    # infra (the audit's one-node-fleet divergence trace: node-local
+    # FUSE degradation never corroborates, so its flags march to the
+    # charged path and Poison(InfraBudget) is reachable at the cap,
+    # exactly as production refuses one node's word). If this stops
+    # violating, the corroboration clause's admission gate has gone
+    # vacuous and the triple certifies a broader contract again.
+    # r[verify sched.retry.store-degraded-uncharged+4]
+    quint-retry-policy-sd-witness-uncorroborated = mkQuintWitnessCheck {
+      name = "retry-policy-sd-witness-uncorroborated";
+      spec = "retryPolicy";
+      main = "retryPolicyPullStoreDegraded";
+      step = "pullStep";
+      witness = "canChargeUncorroborated";
+    };
     # The pre-fix fold (TLC, first-violation; no tracey markers on
     # calibration checks).
     quint-retry-policy-calib-408-sd-as-infra = mkQuintWitnessCheck {

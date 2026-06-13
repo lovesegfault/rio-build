@@ -417,6 +417,12 @@ module retryPolicy {
     ctrlStale: bool,    // ...left over from a previous incarnation
     rdForCtrl: bool,    // the rd entry is the pending report's own death's
     deathCharges: int,  // GHOST: counted accounting events for that death
+    // bughunt-13 F15: the node's last store-degraded sighting (the
+    // scheduler's per-node corroboration map,
+    // note_store_degraded_sighting) — stamped by EVERY flagged report
+    // from this source regardless of disposition, exactly as the
+    // disposition notes the sighting before deciding.
+    sdFlaggedAt: TimeOpt,
   }
 
   /// The fold's event alphabet (retry_policy.rs::AttemptEvent), minus
@@ -468,6 +474,12 @@ module retryPolicy {
     // charge). Distinct kinds so attemptsChargedOnce can pin both as
     // charge-free and the per-arm witnesses stay exact.
     | OEstablishDefer | OEstablishAdopt
+    // bughunt-13 F15: the corroboration gate's refusal polarity — an
+    // UNCORROBORATED flagged report charged as plain infra below the
+    // run bound (store_degraded_disposition::Uncorroborated). Distinct
+    // from OStoreDegradedCharged so the run-bound liveness witness
+    // (canChargePastBound) cannot be satisfied by the wrong refusal.
+    | OStoreDegradedUncorroborated
   type LastObs = {
     kind: ObsKind,
     chargedAny: bool,       // some budget counter was charged by this event
@@ -565,7 +577,7 @@ module retryPolicy {
   pure val freshExec: ExecRec = {
     registered: true, draining: false, runningOurs: false,
     lastCompletedOurs: false, rd: NoTime, ctrl: NoCtrl, ctrlStale: false,
-    rdForCtrl: false, deathCharges: 0,
+    rdForCtrl: false, deathCharges: 0, sdFlaggedAt: NoTime,
   }
 
   pure val noObs: LastObs = {
@@ -854,11 +866,40 @@ module retryPolicy {
   /// taught).
   pure val STORE_DEGRADED_FREE_RUN: int = 3
 
+  /// Mirror of STORE_DEGRADED_CORROBORATION_WINDOW (600 s in
+  /// production), scaled to the model clock exactly as the budget
+  /// caps are (bughunt-13 F15). Two ticks: at MAX_TIME = 3 a sighting
+  /// can both corroborate (within 2) and EXPIRE (3 - 0 > 2), so the
+  /// window law is live in the wired regime, not vacuously inside it.
+  pure val SD_CORROBORATION_WINDOW: int = 2
+
   /// The eligible fleet as the fleet-exhaust check sees it: registered,
   /// non-draining slots (static eligibility -- kind/system/features --
   /// is uniform here).
   def eligibleFleet: Set[str] =
     EXECUTORS.filter(w => execs.get(w).registered and not(execs.get(w).draining))
+
+  /// bughunt-13 F15: the store-degraded corroboration gate
+  /// (completion.rs::store_degraded_disposition) — the flag is WORKER
+  /// evidence, one node's word is never store evidence. Corroborated
+  /// iff >= 2 DISTINCT controller-authoritative node bindings flagged
+  /// within the window; since the deciding report's own sighting is
+  /// always one of them, the gate reduces to "some OTHER source
+  /// flagged within the window". The scheduler's own store-RPC OR-leg
+  /// (last_store_rpc_failure, the fleet-of-one waiver) is PRICED OUT
+  /// of this model: omitting it only makes the model charge MORE than
+  /// production (refuse-more is the conservative direction for the
+  /// uncharged-pacing triple), and the leg's admission is pinned by
+  /// the store-health-leg unit tests at the disposition
+  /// (merged_bug_032's re-pin battery in actor/tests/completion.rs).
+  def sdCorroborated(n: str): bool =
+    EXECUTORS.exists(m => and {
+      m != n,
+      match execs.get(m).sdFlaggedAt {
+        | NoTime => false
+        | At(t) => now - t <= SD_CORROBORATION_WINDOW
+      },
+    })
 
   /// The slot's previous death is still awaiting establishment: a
   /// recently_disconnected entry exists and no classifying controller
@@ -1239,6 +1280,12 @@ module retryPolicy {
   /// liveness direction: sustained outage DOES eventually charge — the
   /// bound is a gate, not a dead arm).
   val canChargePastBound = not(last.kind == OStoreDegradedCharged)
+  /// Violated when an UNCORROBORATED flagged report is charged
+  /// (bughunt-13 F15: the audit's one-node-fleet divergence trace —
+  /// node-local FUSE degradation marches flagged reports to the
+  /// charged infra path because one node's word never corroborates;
+  /// reachability for the corroboration clause's refusal polarity).
+  val canChargeUncorroborated = not(last.kind == OStoreDegradedUncorroborated)
 
   /// bug_182 (bughunt-4 S5b) — the ONE-RUN law's marker-row clause:
   /// a fleet-exhaust MARKER row (the E9 spawn-gate verdict, appended
@@ -2232,11 +2279,17 @@ module retryPolicy {
   /// with the FUSE-breaker store-degraded stamp
   /// (`BuildResult.store_degraded`); the report and its intake are
   /// fused into one step (the pullWorkerAbort precedent). The class is
-  /// PURE PACING: the ledger row it writes is invisible to the charging
-  /// fold (`row_to_event` answers None), so no fold event is applied,
+  /// PURE PACING — once ADMITTED (bughunt-13 F15): admission requires
+  /// CORROBORATION (sdCorroborated: a second distinct node flagged
+  /// within the window; the spec's scheduler-RPC OR-leg is priced at
+  /// the gate def) AND a run strictly below the kernel bound; an
+  /// admitted report's ledger row is invisible to the charging fold
+  /// (`row_to_event` answers None), so no fold event is applied,
   /// no counter moves, no exclusion key is minted and the verdict
   /// stays whatever the charged history decided -- the derivation
   /// requeues and waits out the outage at the backoff curve's cap.
+  /// A NON-admitted flagged report (uncorroborated, or at the bound)
+  /// is charged as plain infrastructure by the fallthrough action.
   /// The curve arithmetic itself (the kernel's fold-local
   /// store_degraded_run) is below this model's untimed-backoff floor,
   /// exactly as the establishment window's timing is. A store-degraded
@@ -2244,22 +2297,29 @@ module retryPolicy {
   /// the trailing bounded-uncharged run without advancing the
   /// worker-abort count (bug_098's union law: the two uncharged
   /// classes compose instead of mutually resetting).
-  // Mirrors: rio-retry-kernel decide()'s store-degraded fold arm
-  //          (r[impl sched.retry.store-degraded-uncharged]) behind the
-  //          scheduler intake's floor-bump skip.
+  // Mirrors: rio-scheduler/src/actor/completion.rs:store_degraded_disposition
+  // Mirrors: rio-retry-kernel/src/lib.rs:admit_store_degraded
   action pullStoreDegraded(n: str): bool = all {
     ENABLE_STORE_DEGRADED,
     attempt == Running(n),
     dStatus == DRunning,
+    // bughunt-13 F15: the corroboration clause of
+    // sched.retry.store-degraded-uncharged+4 — believed only when a
+    // second distinct node corroborates within the window.
+    sdCorroborated(n),
     // Bughunt-2 slot 3 (m032): admit_store_degraded's gate — the
     // uncharged paced close is admitted only strictly below the run
-    // bound; at the bound the report can only take the charged
-    // fallthrough (pullStoreDegradedRunBound), exactly as the kernel
-    // returns ChargedFallthrough.
+    // bound; at the bound (or uncorroborated, F15) the report can
+    // only take the charged fallthrough (pullStoreDegradedRunBound),
+    // exactly as the kernel returns ChargedFallthrough / the
+    // disposition answers Uncorroborated.
     storeDegradedRun < STORE_DEGRADED_FREE_RUN,
     attempt' = NoAttempt,
     dStatus' = DReady,
-    execs' = execs.put(n, { ...execs.get(n), runningOurs: false }),
+    // the sighting is noted for EVERY flagged report (the disposition
+    // notes before it decides) — this one was also believed.
+    execs' = execs.put(n, { ...execs.get(n), runningOurs: false,
+      sdFlaggedAt: At(now) }),
     // bug_098 (union law): a sibling bounded-uncharged row EXTENDS
     // the worker-abort scan instead of breaking it — only rows
     // outside the BOUNDED_UNCHARGED union (charged, controller,
@@ -2278,30 +2338,45 @@ module retryPolicy {
     everFailedBuilders' = everFailedBuilders,
   }
 
-  /// Bughunt-2 slot 3 (m032): the run-bound charged fallthrough.
-  /// The (STORE_DEGRADED_FREE_RUN+1)-th consecutive store-degraded
-  /// report cannot take the uncharged paced close (admit_store_degraded
-  /// answers ChargedFallthrough); the intake folds it as plain worker
-  /// infra — budget drawn, exclusion key minted, poison reachable at
-  /// the cap. The charged row is NOT a store-degraded-class row, so the
+  /// The charged fallthrough, both refusal polarities (m032 +
+  /// bughunt-13 F15): a flagged report that cannot take the uncharged
+  /// paced close — UNCORROBORATED (store_degraded_disposition answers
+  /// Uncorroborated: one node's word is never store evidence,
+  /// merged_bug_032's both-charge ruling) or AT THE RUN BOUND
+  /// (admit_store_degraded answers ChargedFallthrough) — is folded as
+  /// plain worker infra: budget drawn, poison reachable at the cap.
+  /// The charged row is NOT a store-degraded-class row, so the
   /// trailing run breaks: a recovering store gets a fresh free run.
-  /// Distinct observation kind (OStoreDegradedCharged) keeps the
-  /// uncharged contract triple exact and the fallthrough witnessable.
-  // Mirrors: rio-retry-kernel admit_store_degraded's ChargedFallthrough
-  //          arm behind the scheduler intake's RunBound disposition.
+  /// Distinct observation kinds (OStoreDegradedCharged at the bound,
+  /// OStoreDegradedUncorroborated below it) keep the uncharged
+  /// contract triple exact and BOTH refusal polarities witnessable.
+  /// The sighting is still noted (the disposition notes before it
+  /// decides): an uncorroborated first flag is exactly what
+  /// corroborates the fleet's second. (The action keeps its founding
+  /// name — the m032 run-bound polarity — because the composed
+  /// calibration steps pin the alphabet; the guard and kinds carry
+  /// both polarities since F15.)
+  // Mirrors: rio-scheduler/src/actor/completion.rs:store_degraded_disposition
+  // Mirrors: rio-retry-kernel/src/lib.rs:admit_store_degraded
   action pullStoreDegradedRunBound(n: str): bool = all {
     ENABLE_STORE_DEGRADED,
     attempt == Running(n),
     dStatus == DRunning,
-    storeDegradedRun >= STORE_DEGRADED_FREE_RUN,
+    or {
+      storeDegradedRun >= STORE_DEGRADED_FREE_RUN,
+      not(sdCorroborated(n)),
+    },
     freeCloseRun' = 0,
     storeDegradedRun' = 0,
+    val obsKind = if (sdCorroborated(n)) OStoreDegradedCharged
+                  else OStoreDegradedUncorroborated
     val applied = specApply(spec, FInfra({ at: now, exempt: false, atCap: false }), inTxFleet)
     all {
       spec' = applied.c,
       specVerdict' = applied.v,
       live' = applied.c,
-      execs' = execs.put(n, { ...execs.get(n), runningOurs: false }),
+      execs' = execs.put(n, { ...execs.get(n), runningOurs: false,
+        sdFlaggedAt: At(now) }),
       attempt' = NoAttempt,
       promotionsLeft' = promotionsLeft,
       match applied.v {
@@ -2312,7 +2387,7 @@ module retryPolicy {
           pg' = { status: PgPoisoned, poisonedAt: At(now), ledger: applied.c },
           depStatus' = DepFailed,
           everFailureTerminal' = true,
-          last' = { ...noObs, kind: OStoreDegradedCharged, chargedAny: true,
+          last' = { ...noObs, kind: obsKind, chargedAny: true,
             exclusionMinted: true, terminal: true },
         }
         | VRequeue => all {
@@ -2322,7 +2397,7 @@ module retryPolicy {
           pg' = { ...pg, ledger: applied.c },
           depStatus' = depStatus,
           everFailureTerminal' = everFailureTerminal,
-          last' = { ...noObs, kind: OStoreDegradedCharged, chargedAny: true,
+          last' = { ...noObs, kind: obsKind, chargedAny: true,
             exclusionMinted: true },
         }
         | VCancel => all {
@@ -2332,7 +2407,7 @@ module retryPolicy {
           pg' = { ...pg, ledger: applied.c },
           depStatus' = depStatus,
           everFailureTerminal' = everFailureTerminal,
-          last' = { ...noObs, kind: OStoreDegradedCharged, chargedAny: true,
+          last' = { ...noObs, kind: obsKind, chargedAny: true,
             exclusionMinted: true },
         }
       },
@@ -2343,6 +2418,7 @@ module retryPolicy {
     justFailedOver' = false,
     everFailedBuilders' = everFailedBuilders,
   }
+
 
   /// The establishment sweep resolves one expired open pull-mode
   /// attempt through the four-armed kernel (bughunt-13 F13): ONE
@@ -3191,45 +3267,61 @@ module retryPolicyPullStoreDegraded {
   // also keeps the cross-file calibration import convertible -- the
   // Apalache server answers INTERNAL on a cross-file import whose
   // abstract module carries a run, while in-file mains convert).
-  /// Bughunt wave B1 (bug_408), the correlated store outage: the whole
-  /// fleet's reports come back store-degraded, repeatedly (the recorded
-  /// red: 11 flagged reports POISONED the derivation pre-fix). Three
-  /// consecutive store-degraded closes across BOTH workers leave the
-  /// derivation requeued and untouched: no counter movement, no
-  /// exclusion key, no poison -- the derivation waits out the outage.
+  /// Bughunt wave B1 (bug_408), the correlated store outage,
+  /// re-derived at bughunt-13 F15 with the corroboration gate: the
+  /// whole fleet's reports come back store-degraded, repeatedly (the
+  /// recorded red: 11 flagged reports POISONED the derivation
+  /// pre-408). The FIRST flagged report pays the corroboration toll —
+  /// one node's word is never store evidence, so it charges as plain
+  /// infra while seeding the sighting map (production's scheduler-RPC
+  /// OR-leg could waive the toll; priced out at sdCorroborated) —
+  /// and every corroborated report after it is pure pacing: no
+  /// further counter movement, no exclusion key, no poison; the
+  /// derivation waits out the outage.
   run correlatedStoreOutageRun = {
     init
       .then(all { pullOpensAttempt("n1"), buildLeavesMatUntouched })
-      .then(all { pullStoreDegraded("n1"), buildLeavesMatUntouched })
-      .then(all { pullOpensAttempt("n1"), buildLeavesMatUntouched })
-      .then(all { pullStoreDegraded("n1"), buildLeavesMatUntouched })
+      .then(all { pullStoreDegradedRunBound("n1"), buildLeavesMatUntouched })
+      .expect(and {
+        last.kind == OStoreDegradedUncorroborated,
+        live.infraCount == 1,
+        storeDegradedRun == 0,
+      })
       .then(all { pullOpensAttempt("n2"), buildLeavesMatUntouched })
       .then(all { pullStoreDegraded("n2"), buildLeavesMatUntouched })
+      .then(all { pullOpensAttempt("n1"), buildLeavesMatUntouched })
+      .then(all { pullStoreDegraded("n1"), buildLeavesMatUntouched })
       .expect(and {
         dStatus == DReady,
-        live.infraCount == 0,
+        live.infraCount == 1,
         live.failureCount == 0,
         live.timeoutCount == 0,
         live.exemptInfraCount == 0,
         live.failedBuilders == Set(),
         everFailedBuilders == Set(),
+        storeDegradedRun == 2,
         last.kind == OStoreDegraded,
         not(last.chargedAny),
         not(last.exclusionMinted),
       })
   }
 
-  /// Bughunt-2 slot 3 (m032), the sustained outage: the free run is a
-  /// GATE, not blanket immunity. Three consecutive store-degraded
-  /// closes exhaust the scaled bound (the third leaves the run AT the
-  /// bound — the canReachStoreDegradedBound edge); the fourth report
-  /// cannot take the uncharged close and falls through CHARGED: budget
-  /// drawn, exclusion ghost minted, the run broken (a recovering store
+  /// Bughunt-2 slot 3 (m032), the sustained outage, re-derived at
+  /// bughunt-13 F15: the free run is a GATE, not blanket immunity.
+  /// After the corroboration toll (one uncorroborated charge), three
+  /// consecutive corroborated store-degraded closes exhaust the
+  /// scaled bound (the third leaves the run AT the bound — the
+  /// canReachStoreDegradedBound edge); the next report cannot take
+  /// the uncharged close and falls through CHARGED at the bound
+  /// polarity: budget drawn, the run broken (a recovering store
   /// would get a fresh free run).
   run sustainedOutageChargesPastBound = {
     init
       .then(all { pullOpensAttempt("n1"), buildLeavesMatUntouched })
-      .then(all { pullStoreDegraded("n1"), buildLeavesMatUntouched })
+      .then(all { pullStoreDegradedRunBound("n1"), buildLeavesMatUntouched })
+      .expect(last.kind == OStoreDegradedUncorroborated)
+      .then(all { pullOpensAttempt("n2"), buildLeavesMatUntouched })
+      .then(all { pullStoreDegraded("n2"), buildLeavesMatUntouched })
       .then(all { pullOpensAttempt("n1"), buildLeavesMatUntouched })
       .then(all { pullStoreDegraded("n1"), buildLeavesMatUntouched })
       .then(all { pullOpensAttempt("n2"), buildLeavesMatUntouched })
@@ -3242,7 +3334,7 @@ module retryPolicyPullStoreDegraded {
         last.chargedAny,
         last.exclusionMinted,
         storeDegradedRun == 0,
-        live.infraCount == 1,
+        live.infraCount == 2,
         dStatus == DReady,
       })
   }
