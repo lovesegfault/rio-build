@@ -143,6 +143,11 @@ pub struct MockStoreCalls {
     /// fetch tests (replaces wall-clock `elapsed < backoff_floor`
     /// asserts that flaked under full-gate parallel load).
     pub get_path_calls: Arc<AtomicU32>,
+    /// `x-rio-assignment-token` value on each GetPath call (`None` =
+    /// absent). For the builder's `.drv` fetch: the store's drv-blob
+    /// GetPath fallback is tenant-scoped, so `fetch_drv_from_store`
+    /// must present the assignment token.
+    pub get_path_tokens: Arc<RwLock<Vec<Option<String>>>>,
     /// `x-rio-tenant-token` value on each QueryRealisation call
     /// (`None` = absent). For `r[gw.jwt.propagate]` — floating-CA
     /// output resolution in `wopBuildPathsWithResults`.
@@ -801,6 +806,13 @@ impl StoreService for MockStore {
         // assert "client never contacted gRPC" (== 0) vs "client did
         // and got Unavailable" (> 0).
         self.calls.get_path_calls.fetch_add(1, Ordering::SeqCst);
+        self.calls.get_path_tokens.write().unwrap().push(
+            request
+                .metadata()
+                .get(rio_proto::ASSIGNMENT_TOKEN_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+        );
         if let Some(code) = *self.faults.get_path_status.read().unwrap() {
             return Err(Status::new(code, "mock: injected get_path status"));
         }

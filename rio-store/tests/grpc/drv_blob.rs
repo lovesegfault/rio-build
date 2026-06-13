@@ -360,6 +360,280 @@ async fn drv_cross_tenant_isolation() -> TestResult {
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// GetPath drv-blob fallback (`r[store.drv.getpath-fallback]`): a `.drv`
+// that exists ONLY as a drv blob (ADR-024 native submission — no
+// narinfo row) is served by GetPath as a flat regular-file NAR with a
+// synthesized PathInfo, under the same tenant scoping as GetDrvBlob.
+// ─────────────────────────────────────────────────────────────────────
+
+use rio_proto::StoreServiceClient;
+use rio_proto::StoreServiceServer;
+use rio_proto::types::{GetPathRequest, get_path_response};
+use rio_store::grpc::StoreServiceImpl;
+use sha2::{Digest as _, Sha256};
+
+/// Builder-shaped HMAC assignment token WITHOUT a tenant claim
+/// (orphaned/recovered node — `AssignmentClaims.tenant` docs).
+fn token_tenantless() -> String {
+    HmacSigner::from_key(KEY.to_vec()).sign(&AssignmentClaims {
+        executor_id: "drv-blob-test".into(),
+        drv_hash: "00".repeat(32),
+        expected_outputs: vec![],
+        is_ca: false,
+        expiry_unix: u64::MAX,
+        tenant: None,
+        input_closure_digest: String::new(),
+    })
+}
+
+/// Like [`canonical_drv`] but with one `inputSrcs` entry, so the
+/// fallback's synthesized `references` have something to carry.
+/// Returns `(body, digest, drv_path, aterm, src_path)`.
+fn canonical_drv_with_src(tag: &str) -> (Vec<u8>, [u8; 32], String, String, String) {
+    let src = format!("/nix/store/7123456789abcdfg0123456789abcdfg-{tag}-src");
+    let aterm = format!(
+        concat!(
+            r#"Derive([("out","/nix/store/6123456789abcdfg0123456789abcdfg-{t}","","")],"#,
+            r#"[],["{s}"],"x86_64-linux","/bin/sh",["-c","echo {t}"],[("name","{t}")])"#
+        ),
+        t = tag,
+        s = src
+    );
+    let drv = NixDerivation::parse(&aterm).expect("fixture parses");
+    let p = to_proto(&drv);
+    let body = canonical_encode(&p);
+    let digest = derivation_digest(&p);
+    let h = NixHash::compute(HashAlgo::SHA256, aterm.as_bytes());
+    let refs = vec![StorePath::parse(&src).expect("src parses")];
+    let drv_path = StorePath::make_text(&format!("{tag}.drv"), &h, &refs)
+        .expect("make_text")
+        .to_string();
+    (body, digest, drv_path, aterm, src)
+}
+
+/// Harness with BOTH services on one server over one PG: drv blobs go
+/// in through the real `PutDrvBlobs`, come back out through the real
+/// `GetPath` — exactly the native-build wire shape (client uploads,
+/// builder fetches).
+struct FallbackSession {
+    db: TestDb,
+    store: StoreServiceClient<Channel>,
+    drv: DrvBlobServiceClient<Channel>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl FallbackSession {
+    async fn new() -> anyhow::Result<Self> {
+        let db = TestDb::new(&MIGRATOR).await;
+        let verifier = Arc::new(HmacVerifier::from_key(KEY.to_vec()));
+        let store_svc =
+            StoreServiceImpl::new(db.pool.clone()).with_hmac_verifier(Arc::clone(&verifier));
+        let drv_svc = DrvBlobServiceImpl::new(db.pool.clone(), Some(verifier));
+        let router = Server::builder()
+            .add_service(StoreServiceServer::new(store_svc))
+            .add_service(DrvBlobServiceServer::new(drv_svc));
+        let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+        let channel = Channel::from_shared(format!("http://{addr}"))?
+            .connect()
+            .await?;
+        Ok(Self {
+            db,
+            store: StoreServiceClient::new(channel.clone()),
+            drv: DrvBlobServiceClient::new(channel),
+            server,
+        })
+    }
+
+    /// Seed one drv blob through the real put path as `tenant`.
+    async fn put_blob(
+        &mut self,
+        tenant: uuid::Uuid,
+        body: Vec<u8>,
+        digest: [u8; 32],
+        drv_path: String,
+    ) -> anyhow::Result<()> {
+        let resp = self
+            .drv
+            .put_drv_blobs(authed(
+                tenant,
+                PutDrvBlobsRequest {
+                    blobs: vec![blob(body, digest, drv_path)],
+                },
+            ))
+            .await?
+            .into_inner();
+        anyhow::ensure!(resp.created == vec![true], "seed put must bind visibility");
+        Ok(())
+    }
+
+    /// GetPath with an optional raw `x-rio-assignment-token` header,
+    /// collecting the full stream into (PathInfo, NAR bytes).
+    async fn get_path(
+        &mut self,
+        store_path: &str,
+        token: Option<&str>,
+    ) -> Result<(rio_proto::types::PathInfo, Vec<u8>), tonic::Status> {
+        let mut req = tonic::Request::new(GetPathRequest {
+            store_path: store_path.to_string(),
+        });
+        if let Some(t) = token {
+            req.metadata_mut().insert(
+                rio_proto::ASSIGNMENT_TOKEN_HEADER,
+                t.parse().expect("token is ASCII"),
+            );
+        }
+        let mut stream = self.store.get_path(req).await?.into_inner();
+        let mut info = None;
+        let mut nar = Vec::new();
+        while let Some(msg) = stream.message().await? {
+            match msg.msg {
+                Some(get_path_response::Msg::Info(i)) => info = Some(i),
+                Some(get_path_response::Msg::NarChunk(c)) => nar.extend_from_slice(&c),
+                None => {}
+            }
+        }
+        Ok((
+            info.ok_or_else(|| tonic::Status::internal("stream had no PathInfo"))?,
+            nar,
+        ))
+    }
+}
+
+impl Drop for FallbackSession {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+// r[verify store.drv.getpath-fallback]
+/// The full native round-trip: PutDrvBlobs → GetPath of the `.drv`
+/// path → NAR unwraps to the byte-exact ATerm the codec reconstructs,
+/// and the synthesized narinfo is sane (hash/size over the served NAR,
+/// references = the drv's input anchor set) and deterministic across
+/// fetches.
+#[tokio::test]
+async fn drv_getpath_fallback_serves_aterm_nar() -> TestResult {
+    let mut s = FallbackSession::new().await?;
+    let tenant = seed_tenant(&s.db.pool, "drv-fallback").await;
+    let (body, digest, drv_path, aterm, src) = canonical_drv_with_src("fallback-0.1");
+    s.put_blob(tenant, body, digest, drv_path.clone()).await?;
+
+    let token = token_for(tenant);
+    let (info, nar) = s.get_path(&drv_path, Some(&token)).await?;
+
+    // NAR shape: flat regular file whose contents are the ATerm,
+    // byte-identical to the from_proto→to_aterm reconstruction (the
+    // fixture aterm IS that reconstruction — DRVPROTO round-trip).
+    let unwrapped = rio_nix::nar::extract_single_file(&nar)?;
+    assert_eq!(
+        String::from_utf8(unwrapped)?,
+        aterm,
+        "served NAR must unwrap to the byte-exact ATerm"
+    );
+
+    // Synthesized narinfo: deterministic in the served bytes.
+    assert_eq!(info.store_path, drv_path);
+    assert_eq!(
+        info.store_path_hash,
+        Sha256::digest(drv_path.as_bytes()).to_vec()
+    );
+    assert_eq!(info.nar_size, nar.len() as u64);
+    assert_eq!(info.nar_hash, Sha256::digest(&nar).to_vec());
+    assert_eq!(
+        info.references,
+        vec![src],
+        "references = inputDrvs ∪ inputSrcs"
+    );
+    assert!(info.signatures.is_empty());
+    assert!(info.deriver.is_empty());
+
+    // What the builder actually does with the stream: parse it.
+    let parsed = rio_nix::derivation::Derivation::parse_from_nar(&nar)?;
+    assert_eq!(parsed.platform(), "x86_64-linux");
+
+    // Deterministic / cacheable: a second fetch is byte-identical.
+    let (info2, nar2) = s.get_path(&drv_path, Some(&token)).await?;
+    assert_eq!(nar2, nar);
+    assert_eq!(info2, info);
+    Ok(())
+}
+
+// r[verify store.drv.getpath-fallback]
+/// Miss behavior is unchanged: an absent `.drv` (and an absent
+/// non-`.drv` path, token or not) still answers NotFound.
+#[tokio::test]
+async fn drv_getpath_fallback_absent_still_notfound() -> TestResult {
+    let mut s = FallbackSession::new().await?;
+    let tenant = seed_tenant(&s.db.pool, "drv-fallback-absent").await;
+    let token = token_for(tenant);
+
+    let absent_drv = "/nix/store/8123456789abcdfg0123456789abcdfg-absent-0.1.drv";
+    let err = s
+        .get_path(absent_drv, Some(&token))
+        .await
+        .expect_err("absent drv blob must stay NotFound");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    let absent_out = "/nix/store/8123456789abcdfg0123456789abcdfg-absent-0.1";
+    let err = s
+        .get_path(absent_out, Some(&token))
+        .await
+        .expect_err("non-.drv miss is untouched by the fallback");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+    Ok(())
+}
+
+// r[verify store.drv.getpath-fallback]
+/// Tenant/auth matrix — the GetDrvBlob rule, applied to the GetPath
+/// shape: foreign tenant, anonymous, and tenant-less tokens all get
+/// the same NotFound (no exists-but-not-yours oracle); a token that
+/// fails verification is an auth error, not a hide.
+#[tokio::test]
+async fn drv_getpath_fallback_tenant_matrix() -> TestResult {
+    let mut s = FallbackSession::new().await?;
+    let tenant_a = seed_tenant(&s.db.pool, "drv-fallback-a").await;
+    let tenant_b = seed_tenant(&s.db.pool, "drv-fallback-b").await;
+    let (body, digest, drv_path, _aterm, _src) = canonical_drv_with_src("matrix-0.1");
+    s.put_blob(tenant_a, body, digest, drv_path.clone()).await?;
+
+    // Owner reads it.
+    let (info, _) = s.get_path(&drv_path, Some(&token_for(tenant_a))).await?;
+    assert_eq!(info.store_path, drv_path);
+
+    // Foreign tenant: NotFound (binding is A's).
+    let err = s
+        .get_path(&drv_path, Some(&token_for(tenant_b)))
+        .await
+        .expect_err("tenant B must not read tenant A's drv via GetPath");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    // Anonymous: NotFound — exactly the pre-fallback answer.
+    let err = s
+        .get_path(&drv_path, None)
+        .await
+        .expect_err("anonymous GetPath of a drv-blob-only path stays NotFound");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    // Tenant-less (orphan/recovered) token: verified identity but
+    // nothing to scope by → NotFound, mirroring GetDrvBlob's
+    // same-answer discipline.
+    let err = s
+        .get_path(&drv_path, Some(&token_tenantless()))
+        .await
+        .expect_err("tenant-less token cannot resolve a binding");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    // Garbage token: an auth reject, not a hide — the caller presented
+    // an identity and it failed verification.
+    let err = s
+        .get_path(&drv_path, Some("not-a-real-token"))
+        .await
+        .expect_err("unverifiable token is Unauthenticated");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    Ok(())
+}
+
 /// Anonymous callers are rejected on every RPC — the tenant ladder is
 /// fail-closed.
 #[tokio::test]
