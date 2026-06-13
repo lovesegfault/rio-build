@@ -56,6 +56,24 @@ import census_corpora
 # The closed provenance alphabet (rider (c) — zero wildcard arms).
 KINDS = ("derived", "planted", "debt")
 
+# R31'-d (round-14 WO-S9-1, the merged_bug_004 perimeter repair — the
+# DENOMINATOR RIDER): every PROVENANCE row carries a mandatory closed
+# `axis` sub-field. Absence reds via the SAME two-way totality check as
+# PROVENANCE (below) — opt-out is structurally impossible: a generator
+# without an AXIS row is the gate red, exactly as a generator without a
+# PROVENANCE row is. The `coverage` axis names every coverage/ratio/
+# totality predicate (a generator that asserts "fraction of population
+# satisfies X" or "all of N are covered"); each such row carries a
+# `denominator-source` naming the AUTHORITATIVE population class —
+# spec'd-replica-count / registry / owning-resource / OTHER+rationale —
+# never a self-censored view (merged_bug_004's `resolved = addrs.len()`
+# read total because the failure censored the denominator too). Non-
+# coverage rows carry NO denominator-source: forcing one onto a syntax
+# or cadence generator is a category error (the round-14 PD-2 ruling —
+# a production-topology witness is the R31'-d(iii) face, not a ratio).
+AXES = ("coverage", "cadence", "syntax", "other")
+SOURCE_CLASSES = ("spec'd-replica-count", "registry", "owning-resource", "OTHER")
+
 # Provenance declarations — REVIEWED claims over the machine-derived
 # population (the values are declarations by design: each is the
 # review surface R31' demands; the totality and the anchors are  # quantifier: census(check_registry)
@@ -166,17 +184,73 @@ PROVENANCE = {
     ),
 }
 
+# R31'-d AXIS declarations — REVIEWED claims keyed by the SAME
+# machine-derived population (totality both ways via the same  # quantifier: census(check_registry)
+# :176-188 form below; a generator with PROVENANCE but no AXIS row
+# reds; an AXIS row naming no generator reds). Each value is
+# (axis, denominator_source) where denominator_source is
+# (class, rationale) for the `coverage` axis and None otherwise (the
+# PD-2 category-error guard enforces the None). At round-14 base zero
+# of the 36 enrolled generators are coverage/ratio predicates in the
+# R31'-d sense (they enumerate sites and check conditions; none
+# computes "fraction of population satisfies X"); the founding
+# `coverage` enrollments arrive with their slots and are reconciled at
+# the wave-close re-mint.
+AXIS = {
+    # --- cadence (clock/periodic-event/timeout generators) ------------
+    "obligation-clock-census": ("cadence", None),
+    "timeout-census": ("cadence", None),
+    "cadence-polarity-registries": ("cadence", None),
+    # --- syntax (line-shape / grammar / idiom-family generators) ------
+    "jitter-saturation-seams": ("syntax", None),
+    "wire-secs-pacing-seams": ("syntax", None),
+    "duration-census": ("syntax", None),
+    "string-interior-spaces": ("syntax", None),
+    "streaming-open-ban": ("syntax", None),
+    "quantifier-lexicon": ("syntax", None),
+    "exit-edge-census": ("syntax", None),
+    "rule-citation-versions": ("syntax", None),
+    "duplicate-derivation-lint": ("syntax", None),
+    "quint-policy": ("syntax", None),
+    # --- other (enumeration/agreement/reachability generators; not
+    # --- coverage-ratio predicates and not cadence/syntax) ------------
+    "census-enrollment": ("other", None),
+    "metric-reason-help-sync": ("other", None),
+    "exposure-producer-census": ("other", None),
+    "reason-alert-sync": ("other", None),
+    "cilium-labels-filter": ("other", None),
+    "fixture-provenance": ("other", None),
+    "cap-reader-census": ("other", None),
+    "vanish-census": ("other", None),
+    "await-genset": ("other", None),
+    "cleanup-posture-fold": ("other", None),
+    "registration-writer-census": ("other", None),
+    "registration-writer-census-store": ("other", None),
+    "cell-emission-arm-product": ("other", None),
+    "subst-dep-eta-disposition": ("other", None),
+    "refusal-agreement-census": ("other", None),
+    "destructive-lane-census": ("other", None),
+    "witnessed-disposition-product": ("other", None),
+    "cell-emission-wire-injectivity": ("other", None),
+    "pool-demand-view-consumers": ("other", None),
+    "leader-edges-census": ("other", None),
+    "reader-census-registry": ("other", None),
+    "model-letter-reachability": ("other", None),
+    "predicate-derivation-registry": ("other", None),
+}
+
 # The shrink-only debt pin: the committed debt set may only SHRINK
 # (landing a battery/derivation flips the row's kind); growth is an
 # edit to this reviewed file AND a bump here — both visible.
 DEBT_CEILING = 29
 
 
-def check_registry(src_root, provenance=None, registry_names=None):
+def check_registry(src_root, provenance=None, registry_names=None, axis=None):
     """All failure strings (rider-(b)-style collecting, no early
     return — the mutation harness depends on every arm surfacing)."""
     fails = []
     provenance = PROVENANCE if provenance is None else provenance
+    axis = AXIS if axis is None else axis
     if registry_names is None:
         # The fleet, machine-derived (this registry is itself an
         # enrolled census_corpora.REGISTRY row — self-application).
@@ -203,6 +277,65 @@ def check_registry(src_root, provenance=None, registry_names=None):
             fails.append(
                 f"{name}: provenance row names no enrolled generator — "
                 f"registry rot or an unrecorded retirement"
+            )
+    # R31'-d totality, both directions — the SAME structural form as
+    # the PROVENANCE check above (a generator with no AXIS row reds;
+    # an AXIS row naming no generator reds; opt-out is structurally
+    # impossible by reusing the same totality machinery).
+    for name in sorted(registry_names):
+        if name not in axis:
+            fails.append(
+                f"{name}: enrolled generator with NO axis row — declare "
+                f"coverage(denominator-source)/cadence/syntax/other in AXIS "
+                f"(R31'-d; the merged_bug_004 class hides exactly here)"
+            )
+    for name in sorted(axis):
+        if name not in registry_names:
+            fails.append(
+                f"{name}: axis row names no enrolled generator — registry rot"
+            )
+    # R31'-d per-row: closed axis alphabet; coverage rows carry a
+    # denominator-source in the closed class set; non-coverage rows
+    # carry None (the PD-2 category-error guard).
+    for name, (ax, source) in sorted(axis.items()):
+        if ax not in AXES:
+            fails.append(
+                f"{name}: axis `{ax}` outside the closed alphabet "
+                f"{AXES} (zero wildcard arms)"
+            )
+            continue
+        if ax == "coverage":
+            cls, rationale = source if source is not None else (None, None)
+            if cls is None:
+                fails.append(
+                    f"{name}: coverage-axis row with NO denominator-source — "
+                    f"name the AUTHORITATIVE population class "
+                    f"{SOURCE_CLASSES} (R31'-d(iv): a coverage predicate "
+                    f"over a self-censored universe is the merged_bug_004 "
+                    f"defeat — 'the answers we got back' is the rejected "
+                    f"answer)"
+                )
+            elif cls not in SOURCE_CLASSES:
+                fails.append(
+                    f"{name}: denominator-source class `{cls}` outside the "
+                    f"closed alphabet {SOURCE_CLASSES} — a self-censored "
+                    f"view (DNS answers, readiness-filtered lists, the "
+                    f"survivors of the thing being measured) is NOT an "
+                    f"authoritative population (R31'-d(i))"
+                )
+            if cls == "OTHER" and not rationale:
+                fails.append(
+                    f"{name}: denominator-source OTHER without a recorded "
+                    f"rationale (R31'-d(ii))"
+                )
+        elif source is not None:
+            fails.append(
+                f"{name}: non-coverage axis `{ax}` carries a "
+                f"denominator-source — category error (the round-14 PD-2 "
+                f"ruling: a production-topology witness or syntax/cadence "
+                f"generator is NOT a coverage/ratio predicate; forcing a "
+                f"denominator-source onto it conflates the R31'-d(iii) face "
+                f"with the R31'-d(iv) registry axis)"
             )
     # Per-row: closed kind alphabet; anchors resolve; debt dated.
     debt_count = 0
@@ -255,6 +388,7 @@ def self_battery(src_root) -> list:
         src_root,
         provenance={},
         registry_names={"strawman-census"},
+        axis={"strawman-census": ("other", None)},
     )
     if not any("NO predicate-provenance row" in x for x in got):
         fails.append(f"the missing-provenance plant did not red: {got}")
@@ -263,6 +397,7 @@ def self_battery(src_root) -> list:
         src_root,
         provenance={"ghost": ("debt", "2026-06-12", "x")},
         registry_names={"real"},
+        axis={"real": ("other", None)},
     )
     if not any("names no enrolled generator" in x for x in got) or not any(
         "NO predicate-provenance row" in x for x in got
@@ -273,14 +408,16 @@ def self_battery(src_root) -> list:
         src_root,
         provenance={"x": ("vibes", "2026-06-12", "no")},
         registry_names={"x"},
+        axis={"x": ("other", None)},
     )
-    if not any("outside the closed" in x for x in got):
+    if not any("provenance kind `vibes` outside" in x for x in got):
         fails.append(f"the unknown-kind plant did not red: {got}")
     # (b) rot plant: a planted row whose battery anchor is dead reds.
     got = check_registry(
         src_root,
         provenance={"x": ("planted", "nix/census_corpora.py", r"NO_SUCH_" + r"BATTERY", "b")},
         registry_names={"x"},
+        axis={"x": ("other", None)},
     )
     if not any("does not resolve" in x for x in got):
         fails.append(f"the dead-battery-anchor plant did not red: {got}")
@@ -289,14 +426,84 @@ def self_battery(src_root) -> list:
         src_root,
         provenance={"x": ("debt", "someday", "no date")},
         registry_names={"x"},
+        axis={"x": ("other", None)},
     )
     if not any("not dated" in x for x in got):
         fails.append(f"the undated-debt plant did not red: {got}")
     # The ceiling plant: a widened debt set reds.
     wide = {f"d{i}": ("debt", "2026-06-12", "x") for i in range(DEBT_CEILING + 1)}
-    got = check_registry(src_root, provenance=wide, registry_names=set(wide))
+    wide_ax = {k: ("other", None) for k in wide}
+    got = check_registry(src_root, provenance=wide, registry_names=set(wide), axis=wide_ax)
     if not any("shrink-only ceiling" in x for x in got):
         fails.append(f"the debt-ceiling plant did not red: {got}")
+    # R31'-d (b) totality plant: a generator WITHOUT an AXIS row reds
+    # (the same two-way form as the missing-provenance plant above —
+    # opt-out structurally impossible).
+    got = check_registry(
+        src_root,
+        provenance={"x": ("debt", "2026-06-12", "y")},
+        registry_names={"x"},
+        axis={},
+    )
+    if not any("NO axis row" in x for x in got):
+        fails.append(f"the missing-axis plant did not red: {got}")
+    # R31'-d (c) closed-axis plant: an unknown axis reds.
+    got = check_registry(
+        src_root,
+        provenance={"x": ("debt", "2026-06-12", "y")},
+        registry_names={"x"},
+        axis={"x": ("vibes", None)},
+    )
+    if not any("axis `vibes` outside" in x for x in got):
+        fails.append(f"the unknown-axis plant did not red: {got}")
+    # R31'-d denominator plants — the W14-I1 battery (every face):
+    # (1) a coverage row with NO denominator-source reds.
+    got = check_registry(
+        src_root,
+        provenance={"x": ("debt", "2026-06-12", "y")},
+        registry_names={"x"},
+        axis={"x": ("coverage", None)},
+    )
+    if not any("NO denominator-source" in x for x in got):
+        fails.append(f"the missing-denominator plant did not red: {got}")
+    # (2) a coverage row with a self-censored source class reds (the
+    # merged_bug_004 shape: 'the answers we got back').
+    got = check_registry(
+        src_root,
+        provenance={"x": ("debt", "2026-06-12", "y")},
+        registry_names={"x"},
+        axis={"x": ("coverage", ("the-answers-we-got", "DNS readiness"))},
+    )
+    if not any("outside the closed alphabet" in x and "self-censored" in x for x in got):
+        fails.append(f"the self-censored-source plant did not red: {got}")
+    # (3) OTHER without a rationale reds.
+    got = check_registry(
+        src_root,
+        provenance={"x": ("debt", "2026-06-12", "y")},
+        registry_names={"x"},
+        axis={"x": ("coverage", ("OTHER", ""))},
+    )
+    if not any("OTHER without a recorded rationale" in x for x in got):
+        fails.append(f"the OTHER-no-rationale plant did not red: {got}")
+    # (4) a non-coverage row WITH a denominator-source reds (PD-2).
+    got = check_registry(
+        src_root,
+        provenance={"x": ("debt", "2026-06-12", "y")},
+        registry_names={"x"},
+        axis={"x": ("syntax", ("registry", "wrong"))},
+    )
+    if not any("category error" in x for x in got):
+        fails.append(f"the category-error plant did not red: {got}")
+    # (5) the founding-shape green: a coverage row with a valid
+    # source class is NOT flagged (the W14-I1 founding-enrollment arm).
+    got = check_registry(
+        src_root,
+        provenance={"x": ("debt", "2026-06-12", "y")},
+        registry_names={"x"},
+        axis={"x": ("coverage", ("spec'd-replica-count", "Deployment spec.replicas"))},
+    )
+    if any("denominator" in x or "axis" in x.lower() for x in got):
+        fails.append(f"the valid-denominator founding shape FALSELY flagged: {got}")
     return fails
 
 
@@ -340,6 +547,28 @@ MUTATIONS = [
         "    if debt_count > " + "DEBT_CEILING:",
         "    if False and debt_count > " + "DEBT_CEILING:",
     ),
+    (
+        "axis-totality-disabled",
+        "the R31'-d missing-axis arm disabled — killed by the"
+        " missing-axis plant (opt-out becomes silently possible)",
+        "        if name not in " + "axis:",
+        "        if False and name not in " + "axis:",
+    ),
+    (
+        "denominator-check-deleted",
+        "the coverage denominator-source presence check disabled —"
+        " killed by the missing-denominator plant (the merged_bug_004"
+        " class re-hides)",
+        "            if cls is " + "None:",
+        "            if False and cls is " + "None:",
+    ),
+    (
+        "source-class-widened",
+        "the closed source-class alphabet accepts anything — killed"
+        " by the self-censored-source plant",
+        "            elif cls not in " + "SOURCE_CLASSES:",
+        "            elif False and cls not in " + "SOURCE_CLASSES:",
+    ),
 ]
 
 
@@ -362,10 +591,15 @@ def main() -> int:
     n = {"derived": 0, "planted": 0, "debt": 0}
     for row in PROVENANCE.values():
         n[row[0]] += 1
+    nax = {a: 0 for a in AXES}
+    for ax, _ in AXIS.values():
+        nax[ax] += 1
     print(
         f"predicate-derivation registry: {len(PROVENANCE)} generators — "
         f"{n['planted']} planted (battery + K-mutations), {n['derived']} derived, "
-        f"{n['debt']} dated debt rows (shrink-only, ceiling {DEBT_CEILING})"
+        f"{n['debt']} dated debt rows (shrink-only, ceiling {DEBT_CEILING}); "
+        f"R31'-d axis: {nax['coverage']} coverage (denominator-source named), "
+        f"{nax['cadence']} cadence, {nax['syntax']} syntax, {nax['other']} other"
     )
     return 0
 
