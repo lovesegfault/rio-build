@@ -848,6 +848,7 @@
               # testScript.
               vmWiring = import ./nix/tests/wiring.nix {
                 inherit pkgs system inputs;
+                inherit (rioEvalPkg) rioEval;
               };
 
               vmTests = vmWiring.mkVmTests {

@@ -12,6 +12,11 @@
   pkgs,
   system,
   inputs,
+  # The rio-eval eval-parent binary (nix/rio-eval.nix). Same
+  # uninstrumented C++ binary in both normal and coverage mode — the
+  # instrumented half of the client pair is the coordinator (bin/rio,
+  # a workspace member, so rio-workspace-cov covers it).
+  rioEval,
 }:
 {
   mkVmTests =
@@ -27,6 +32,7 @@
         dockerImages
         system
         coverage
+        rioEval
         ;
       rioModules = inputs.self.nixosModules;
       inherit (inputs) nixhelm;
