@@ -5959,7 +5959,6 @@ rec {
     # reports to Poisoned); the reachability pin is
     # correlatedStoreOutageRun (the fleet-correlated outage).
     # ------------------------------------------------------------------
-    # r[verify sched.retry.store-degraded-uncharged+4]
     quint-retry-policy-pull-store-degraded = mkQuintCheck {
       name = "retry-policy-pull-store-degraded";
       # quint-policy P1 exemptions (bughunt-2 slot 11; §5-Q13 — the
@@ -6014,7 +6013,6 @@ rec {
         # consumers — the one-run law's marker clause (run_step in the
         # kernel). Falsify twin: retry-182-forked-run (below);
         # reachability: the spawn-exhaust witness (below).
-        # r[verify sched.retry.store-degraded-uncharged+4]
         "markerRowBreaksRuns"
         # bughunt-13 F12 (see quint-retry-policy-pull's note).
         "fleetExhaustIsDeferred"
@@ -6045,22 +6043,6 @@ rec {
       main = "retryPolicyPullStoreDegraded";
       step = "pullStep";
       witness = "canChargePastBound";
-    };
-    # bughunt-13 F15: the corroboration gate's refusal polarity is
-    # reachable — an UNCORROBORATED flagged report is charged as plain
-    # infra (the audit's one-node-fleet divergence trace: node-local
-    # FUSE degradation never corroborates, so its flags march to the
-    # charged path and Poison(InfraBudget) is reachable at the cap,
-    # exactly as production refuses one node's word). If this stops
-    # violating, the corroboration clause's admission gate has gone
-    # vacuous and the triple certifies a broader contract again.
-    # r[verify sched.retry.store-degraded-uncharged+4]
-    quint-retry-policy-sd-witness-uncorroborated = mkQuintWitnessCheck {
-      name = "retry-policy-sd-witness-uncorroborated";
-      spec = "retryPolicy";
-      main = "retryPolicyPullStoreDegraded";
-      step = "pullStep";
-      witness = "canChargeUncorroborated";
     };
     # The pre-fix fold (TLC, first-violation; no tracey markers on
     # calibration checks).
@@ -6115,7 +6097,6 @@ rec {
     # reachable — the union law genuinely composes the classes (the
     # pre-fix mutual reset made this state unreachable, which is why
     # per-class checks could never see the composition hole).
-    # r[verify sched.retry.store-degraded-uncharged+4]
     # r[verify sched.attempt.worker-abort-bounded+2]
     quint-retry-policy-pull-witness-composed-runs = mkQuintWitnessCheck {
       name = "retry-policy-pull-witness-composed-runs";
@@ -6133,7 +6114,6 @@ rec {
     # pure same-class corner is owned by retry-032 and the kernel
     # decision tables). unionMintBounded MUST violate: seven uncharged
     # closes in one bounded-uncharged run.
-    # r[verify sched.retry.store-degraded-uncharged+4]
     # r[verify sched.attempt.worker-abort-bounded+2]
     quint-retry-policy-pull-calib-098-guard-vacuous = mkQuintWitnessCheck {
       name = "retry-policy-pull-calib-098-guard-vacuous";

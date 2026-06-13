@@ -34,6 +34,7 @@ fn store_degraded_mixed_unattributed_then_attributed_is_one_node() {
 
 /// merged_bug_013 companion: sightings age out of the corroboration
 /// window — the count is evidence-fresh, not cumulative.
+// r[verify sched.retry.store-degraded-uncharged+4]
 #[test]
 fn store_degraded_sightings_expire_outside_window() {
     use crate::actor::completion::note_store_degraded_sighting;
