@@ -165,6 +165,12 @@ REGISTRY = [
     # std type's API surface; UFCS form covered; rider-(d) narrowed
     # fixture asserted in the battery).
     ("jitter-saturation-seams", "nix/census_corpora.py", r"DURATION_MUL_PLANTS", {"scope", "alias"}, set(), r"DURATION_MUL_FAMILY = \["),
+    # bw13 S9 (WO-S9-8(i)): the R31' predicate-derivation registry +
+    # the K-mutation standing check — every enrolled generator
+    # declares derived/planted/debt provenance; battery/derivation
+    # anchors verified live; the shared run_mutation_battery harness
+    # is the WO-S9-1 template generalized; self-applied (W13-BE).
+    ("predicate-derivation-registry", "nix/predicate_derivation_registry.py", r"self_battery", {"scope", "reverse-direction"}, set(), r"PROVENANCE = \{"),
     # (iii) the R33 duplicate-derivation lint + the rationale-rot
     # sweep (OQ-14 latitude recorded in the module doc).
     ("duplicate-derivation-lint", "nix/duplicate_derivation_lint.py", r"plants wrong|self-test arms", {"scope"}, set(), r"R33_ROWS = \{"),
@@ -216,6 +222,46 @@ def content_key(rel: str, lane: str, line_text: str) -> str:
     spaces, so the key stays exactly two-TAB delimited and the
     `key.split(chr(9))[0]` file-prefix idiom keeps working)."""
     return f"{rel}\t{lane}\t{' '.join(line_text.split())}"
+
+
+def run_mutation_battery(artifact_path, mutations, battery_name, battery_args=()):
+    """The rider-(d) SHARED K-mutation harness (WO-S9-1's
+    exec-a-mutated-copy form, generalized at WO-S9-8(i)): apply each
+    committed (name, oracle, old, new) source substitution to a COPY
+    of `artifact_path`, exec the mutant, call its
+    `battery_name`(*battery_args), and REQUIRE a non-empty failure
+    list — a mutant whose own plant battery stays green is the
+    bug_047 born-broken verdict (the artifact's self-test cannot
+    detect that degeneration of the artifact). A needle matching
+    anything but exactly once is harness rot and fails loudly — the
+    fixtures pin the artifact's load-bearing lines. Callers ground
+    the recursion at the fixture tier (W13-BE): the battery the
+    mutant runs must never invoke this harness."""
+    fails = []
+    src = pathlib.Path(artifact_path).read_text(encoding="utf-8")
+    for name, oracle, old, new in mutations:
+        n = src.count(old)
+        if n != 1:
+            fails.append(
+                f"K-mutation `{name}`: target text matched {n} time(s), "
+                f"want exactly 1 — the fixture rotted against the artifact "
+                f"(re-pin the mutation to the load-bearing line)"
+            )
+            continue
+        ns = {
+            "__name__": f"mutant_{name.replace('-', '_')}",
+            "__file__": str(artifact_path),
+        }
+        exec(compile(src.replace(old, new, 1), f"<mutant:{name}>", "exec"), ns)
+        mutant_fails = ns[battery_name](*battery_args)
+        if not mutant_fails:
+            fails.append(
+                f"K-mutation `{name}` NOT killed: the mutant's {battery_name} "
+                f"stayed green — the planted red survived its artifact's "
+                f"degeneration (the bug_047 born-broken criterion; oracle: "
+                f"{oracle})"
+            )
+    return fails
 
 
 def strip_production(text: str, source: str = "<input>") -> str:

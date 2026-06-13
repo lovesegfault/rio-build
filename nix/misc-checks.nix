@@ -1516,6 +1516,31 @@ in
         touch $out
       '';
 
+  # The R31' predicate-derivation registry + the K-mutation standing
+  # check (round-13 WO-S9-8(i), the bug_047 born-broken lesson made
+  # standing): every enrolled census generator declares its predicate
+  # provenance — derived(anchor) / planted(battery, anchor-verified) /
+  # dated debt (shrink-only retrofit queue) — and the registry's own
+  # K-mutation battery runs through the shared harness on every
+  # invocation. Full-tree staging ((vvvvv)): the anchors quantify over
+  # nix/ artifact sources.
+  predicate-derivation-registry =
+    pkgs.runCommand "rio-predicate-derivation-registry"
+      {
+        src = pkgs.lib.cleanSource ../.;
+        nativeBuildInputs = [ pkgs.python3 ];
+        scanScript = ../nix/predicate_derivation_registry.py;
+        sharedLexer = ../nix/rust_strip.py;
+        censusLib = ../nix/census_corpora.py;
+      }
+      ''
+        cp "$sharedLexer" rust_strip.py
+        cp "$censusLib" census_corpora.py
+        cp "$scanScript" predicate_derivation_registry.py
+        python3 predicate_derivation_registry.py "$src"
+        touch $out
+      '';
+
   duplicate-derivation-lint =
     pkgs.runCommand "rio-duplicate-derivation-lint"
       {
