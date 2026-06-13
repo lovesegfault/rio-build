@@ -73,6 +73,13 @@ let
     ];
   };
 
+  # The SIZED pod mirrors the production overlays shape (bug_065): an
+  # emptyDir sizeLimit BELOW the container's ephemeral-storage limit.
+  # kubelet assigns the volume's project quota = MIN(pod ephemeral
+  # limit, emptyDir sizeLimit) — the sizeLimit side — so the hard
+  # limit the production reader returns is the STAMPED solve-axis
+  # product, not the fuse+log-inflated pod limit. The denomination
+  # subtest below pins exactly that MIN.
   podManifest = pkgs.writeText "scratch-writer.yaml" ''
     apiVersion: v1
     kind: Pod
@@ -89,13 +96,52 @@ let
         - name: writer
           image: rio-test/scratch-writer:v1
           imagePullPolicy: Never
+          resources:
+            limits:
+              # Sized so BOTH pods' requests fit the 4 GiB quota
+              # volume's allocatable (kubelet reserves ~1.1 GiB):
+              # 1280Mi + 1Gi requests < ~2.9 GiB.
+              ephemeral-storage: 1280Mi
           volumeMounts:
             - name: scratch
               mountPath: /scratch
       volumes:
         - name: scratch
           emptyDir:
-            sizeLimit: 1Gi
+            sizeLimit: 768Mi
+  '';
+
+  # The UNSIZED pod is the LATENT denomination cell bug_065 closes
+  # against: an emptyDir with NO sizeLimit falls back to the POD
+  # ephemeral limit as its project quota — on a builder pod that
+  # would be disk*h + fuse(50Gi) + 1Gi, the foreign-units hard limit
+  # the corroboration band refuses. The production stamp
+  # (apply_intent_resources) makes this cell unreachable for the
+  # overlays volume; this pod witnesses that the fallback is REAL at
+  # the deployed kubelet minor, so the stamp stays load-bearing
+  # (upstream behavior drift flips this test, the OQ-13 posture).
+  unsizedPodManifest = pkgs.writeText "scratch-writer-unsized.yaml" ''
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: scratch-writer-unsized
+      namespace: default
+    spec:
+      hostUsers: false
+      restartPolicy: Never
+      containers:
+        - name: writer
+          image: rio-test/scratch-writer:v1
+          imagePullPolicy: Never
+          resources:
+            limits:
+              ephemeral-storage: 1Gi
+          volumeMounts:
+            - name: scratch
+              mountPath: /scratch
+      volumes:
+        - name: scratch
+          emptyDir: {}
   '';
 
   k3sNode = provisioned: {
@@ -131,7 +177,14 @@ let
         # the diagnostic lanes instead.
         "--kubelet-arg=feature-gates=LocalStorageCapacityIsolationFSQuotaMonitoring=true"
       ];
-      manifests.scratch-writer.source = podManifest;
+      manifests = {
+        scratch-writer.source = podManifest;
+      }
+      // pkgs.lib.optionalAttrs provisioned {
+        # The denomination cells need the second pod only where
+        # quotas exist.
+        scratch-writer-unsized.source = unsizedPodManifest;
+      };
     };
 
     # The provisioning shape (WO-S8-15, in-VM): a bare volume becomes
@@ -203,20 +256,20 @@ pkgs.testers.runNixOSTest {
         return dict(line.split("=", 1) for line in out.strip().splitlines())
 
 
-    def wait_pod_wrote(node):
+    def wait_pod_wrote(node, pod="scratch-writer"):
         node.wait_until_succeeds(
-            "k3s kubectl get pod scratch-writer -o jsonpath='{.status.phase}' | grep -E 'Running|Succeeded'",
+            "k3s kubectl get pod " + pod + " -o jsonpath='{.status.phase}' | grep -E 'Running|Succeeded'",
             timeout=420,
         )
-        # The emptyDir as KUBELET created it — no manual projid
-        # anywhere in this scenario (the live060-d discrimination).
-        node.wait_until_succeeds(
-            "ls /var/lib/kubelet/pods/*/volumes/kubernetes.io~empty-dir/scratch/done",
-            timeout=180,
-        )
-        path = node.succeed(
-            "dirname /var/lib/kubelet/pods/*/volumes/kubernetes.io~empty-dir/scratch/done"
+        # Resolve the emptyDir BY POD UID (two pods share the volume
+        # name); the dir is the one KUBELET created — no manual
+        # projid anywhere in this scenario (the live060-d
+        # discrimination).
+        uid = node.succeed(
+            "k3s kubectl get pod " + pod + " -o jsonpath='{.metadata.uid}'"
         ).strip()
+        path = "/var/lib/kubelet/pods/" + uid + "/volumes/kubernetes.io~empty-dir/scratch"
+        node.wait_until_succeeds("ls " + path + "/done", timeout=180)
         return path
 
 
@@ -264,6 +317,43 @@ pkgs.testers.runNixOSTest {
         used = int(kv["quota_used"])
         assert used >= 64 * 1024 * 1024, (
             "quota tracking missed the 64 MiB scratch write: " + repr(kv)
+        )
+
+    with subtest("the kubelet quota is the NON-ENFORCING sentinel (bug_065 cells)"):
+        # THE DERIVATION-CORRECTING WITNESS: kubelet's DESIRED volume
+        # quota is min(pod ephemeral limit, emptyDir sizeLimit)
+        # (AddPodToVolume), but at the deployed minors AssignQuota
+        # writes the -1 NON-ENFORCING sentinel for any positive
+        # desired size (quota_linux.go: usage tracking for eviction,
+        # never kernel enforcement). Consequence chain the scheduler's
+        # corroboration band is derived against: the worker-visible
+        # hard limit on kubelet-quota'd nodes is the sentinel (reads
+        # ~u64::MAX through the 1KiB-block saturation), the worker
+        # DiskFull classifier cannot fire there, and the band refuses
+        # sentinel-armed claims by construction. BOTH cells (sized
+        # 768Mi-under-1280Mi and unsized 1Gi-pod-limit) pin the
+        # sentinel: if kubelet ever starts enforcing the desired size
+        # (or stops tracking usage), one of these asserts flips and
+        # the bug_065 derivation re-opens.
+        sentinel = str((1 << 64) - 1)
+        kv = probe_kv(provisioned, path)
+        assert kv["quota_limit"] == sentinel, (
+            "the sized emptyDir's quota limit is no longer the "
+            "non-enforcing sentinel - kubelet's enforcement posture "
+            "changed; re-derive the corroboration band denomination "
+            "(bug_065): " + repr(kv)
+        )
+        upath = wait_pod_wrote(provisioned, pod="scratch-writer-unsized")
+        ukv = probe_kv(provisioned, upath)
+        assert ukv["quota_limit"] == sentinel, (
+            "the unsized emptyDir's quota limit is no longer the "
+            "non-enforcing sentinel - kubelet's enforcement posture "
+            "changed; re-derive the corroboration band denomination "
+            "(bug_065): " + repr(ukv)
+        )
+        # Usage tracking is REAL on both (the quota's actual job).
+        assert int(ukv["quota_used"]) >= 64 * 1024 * 1024, (
+            "the unsized pod's usage is untracked: " + repr(ukv)
         )
 
     with subtest("RED reproduced (W12-LI): today's fleet shape yields None"):

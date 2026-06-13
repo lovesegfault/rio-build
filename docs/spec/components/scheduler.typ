@@ -246,6 +246,32 @@ joins the law's domain with its own evidence base rather than an exemption.
   compensating control cannot fire on the priced path is census-RED, never
   self-reported prose.
 ]
+Disk-band denomination (bug_065, R33'(ii)): the DISK_FULL acceptance band is
+PRODUCER-DERIVED, not a raw-disk multiple. An ENFORCED project quota on the
+overlays emptyDir carries the controller-stamped sizeLimit
+$= D dot.op "headroom"(n_"eff")$ (kubelet's desired volume quota is
+min(pod ephemeral limit, emptyDir sizeLimit), and the sizeLimit is always
+the min --- the pod limit adds the fuse-cache and log budgets on top), so
+the band accepts exactly
+`hard in [overlay(assigned, H_MIN), overlay(assigned, H_MAX) + quota-block slack]`
+where `overlay` and the headroom codomain bounds are the SHARED
+`rio_common::k8s` mint both the controller stamp and the scheduler band
+read --- the two sides of the seam cannot drift into different
+denominations without the shared file changing. The deployed kubelet
+minors assign NON-ENFORCING sentinel quotas (usage tracking for eviction
+only; `AssignQuota` writes `-1` for any positive desired size), so
+kubelet-quota'd nodes currently produce NO worker DiskFull claims --- the
+band is the standing contract for enforced-quota producers (the
+`vm-quota-probe` manual-limit harness today; any future enforcing kubelet)
+and refuses sentinel-armed claims by construction. The wave-11 raw band
+(`[assigned/2, assigned*4]`) accepted fabricated limits no producer can
+mint; the producer-derived band refuses them (classify-only, counted). The
+live `headroom` curve's conformance to the shared bounds is pinned in the
+band's own test module; the kubelet sentinel behavior and the
+desired-size law behind it are pinned end-to-end by the
+`vm-kubelet-projquota` denomination cells (drift in either flips the
+test and re-opens this derivation).
+
 Granularity, priced: the binding is (path, claims-tenant-cohort), not
 (path, exec) --- the store's durable upload trace is the tenant-keyed ingest
 stamp (`AssignmentClaims` carries no exec id). The cross-tenant kill is

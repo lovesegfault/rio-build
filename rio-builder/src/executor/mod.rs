@@ -396,34 +396,117 @@ pub enum DecodeProvenance {
     WorkerLocal,
 }
 
-/// live060-b — the quota producer's absence is LOUD: a `None` quota
-/// status at the completion seam increments
-/// `rio_builder_quota_evidence_absent_total` and emits a once-per-pod
-/// WARN naming the precondition (prjquota mount + kubelet projid
-/// assignment — see the `quota` module doc), never failing the
-/// completion. On the live fleet the producer was dead for an entire
-/// deployment era (159/160 EBS-only nodes; 2022/2022 completions with
-/// `peak_disk_bytes: None`) with zero signal.
-pub(crate) fn note_quota_evidence(
-    quota_status: Option<&crate::quota::QuotaStatus>,
-    overlay_base_dir: &std::path::Path,
-) {
-    if quota_status.is_some() {
-        return;
+/// bug_046 (R33'(iv) + R26): the disk-evidence fold mints ONE product
+/// PER CONSUMER. The two consumers have incompatible preconditions —
+/// exhaustion classification needs `hard_limit_bytes` (the one-shot's
+/// limit read), the SLA sizing axis needs only witnessed usage (the
+/// limit-free `peak_disk_bytes` lane) — so fusing both into one
+/// `Option<QuotaStatus>` coupled the weaker consumer to the stronger's
+/// precondition: a failed post-teardown one-shot (quota record gone /
+/// fs error per `quota::status`'s error surface) destroyed the 1 Hz
+/// monitor's witnessed during-build peak.
+pub(crate) struct DiskEvidence {
+    /// The SIZING product: the maximum witnessed usage across the
+    /// during-build monitor and the post-teardown one-shot —
+    /// limit-independent. `None` only when NEITHER producer witnessed
+    /// anything.
+    pub(crate) sizing_peak: Option<u64>,
+    /// The CLASSIFICATION product: the limit-bearing one-shot view
+    /// (monitor peak folded in when both exist). `None` = the limit
+    /// was unreadable this completion; exhaustion classification
+    /// (which needs the limit regardless) stays off, the sizing axis
+    /// does not.
+    pub(crate) classification: Option<crate::quota::QuotaStatus>,
+}
+
+/// The fold, TOTAL over (one-shot x monitor) — four cells, zero
+/// wildcards (the old `(None, _)` arm discarded the monitor's peak).
+pub(crate) fn fold_disk_evidence(
+    one_shot: Option<crate::quota::QuotaStatus>,
+    monitor_peak: Option<u64>,
+) -> DiskEvidence {
+    match (one_shot, monitor_peak) {
+        (Some(q), Some(peak)) => DiskEvidence {
+            sizing_peak: Some(q.used_bytes.max(peak)),
+            classification: Some(crate::quota::QuotaStatus {
+                used_bytes: q.used_bytes.max(peak),
+                hard_limit_bytes: q.hard_limit_bytes,
+            }),
+        },
+        (Some(q), None) => DiskEvidence {
+            sizing_peak: Some(q.used_bytes),
+            classification: Some(q),
+        },
+        // The repaired cell: the one-shot failed (keep-failed unset —
+        // the daemon already deleted a failed build's scratch; quota
+        // record gone / fs error) but the monitor witnessed the
+        // during-build peak. The sizing axis keeps the evidence; only
+        // the limit-bearing classification lane is unreadable.
+        (None, Some(peak)) => DiskEvidence {
+            sizing_peak: Some(peak),
+            classification: None,
+        },
+        (None, None) => DiskEvidence {
+            sizing_peak: None,
+            classification: None,
+        },
     }
-    metrics::counter!("rio_builder_quota_evidence_absent_total").increment(1);
-    static QUOTA_ABSENCE_WARNED: std::sync::Once = std::sync::Once::new();
-    QUOTA_ABSENCE_WARNED.call_once(|| {
-        tracing::warn!(
-            overlay_base_dir = %overlay_base_dir.display(),
-            "project-quota disk evidence is ABSENT on this node: every \
-             completion will carry peak_disk_bytes=None and the disk \
-             sizer cannot learn (precondition: the kubelet volume \
-             filesystem mounted with -o prjquota and kubelet project-id \
-             assignment — see rio-builder/src/quota.rs; once-per-pod \
-             warning)"
-        );
-    });
+}
+
+/// live060-b — the quota producer's absence is LOUD, and (bug_046,
+/// R26) the absence signal consumes the PRODUCED fold output, never a
+/// raw input beside it: evidence is ABSENT only when BOTH producers
+/// (the post-teardown one-shot AND the 1 Hz monitor) yielded nothing.
+/// A failed one-shot beside a witnessed monitor peak is a different,
+/// narrower fact — the LIMIT was unreadable — counted on its own
+/// lane (`rio_builder_quota_limit_unreadable_total`) with a WARN
+/// naming the one-shot only. Pre-fix the absence signal keyed on the
+/// one-shot alone and counted/WARNed "evidence ABSENT" on nodes the
+/// monitor had just proved working. Never fatal: the completion
+/// proceeds either way. On the live fleet the producer was dead for
+/// an entire deployment era (159/160 EBS-only nodes; 2022/2022
+/// completions with `peak_disk_bytes: None`) with zero signal.
+pub(crate) fn note_quota_evidence(evidence: &DiskEvidence, overlay_base_dir: &std::path::Path) {
+    match (&evidence.sizing_peak, &evidence.classification) {
+        // At least the limit is readable: the full producer chain is
+        // alive — no signal.
+        (_, Some(_)) => {}
+        // The repaired cell: the monitor witnessed usage, only the
+        // one-shot's limit read failed. NOT absence — the narrower
+        // unreadable-limit lane.
+        (Some(_), None) => {
+            metrics::counter!("rio_builder_quota_limit_unreadable_total").increment(1);
+            static QUOTA_LIMIT_UNREADABLE_WARNED: std::sync::Once = std::sync::Once::new();
+            QUOTA_LIMIT_UNREADABLE_WARNED.call_once(|| {
+                tracing::warn!(
+                    overlay_base_dir = %overlay_base_dir.display(),
+                    "the post-build quota limit read failed (quota record \
+                     gone / fs error) — the during-build monitor's peak \
+                     stands for sizing; exhaustion classification is off \
+                     for this completion (once-per-pod warning)"
+                );
+            });
+        }
+        // Both producers yielded nothing: the node lacks the prjquota
+        // precondition (or no sample ever succeeded).
+        (None, None) => {
+            metrics::counter!("rio_builder_quota_evidence_absent_total").increment(1);
+            static QUOTA_ABSENCE_WARNED: std::sync::Once = std::sync::Once::new();
+            QUOTA_ABSENCE_WARNED.call_once(|| {
+                tracing::warn!(
+                    overlay_base_dir = %overlay_base_dir.display(),
+                    "project-quota disk evidence is ABSENT on this node \
+                     (neither the post-build one-shot nor the during-build \
+                     monitor produced a sample): every completion will \
+                     carry peak_disk_bytes=None and the disk sizer cannot \
+                     learn (precondition: the kubelet volume filesystem \
+                     mounted with -o prjquota and kubelet project-id \
+                     assignment — see rio-builder/src/quota.rs; \
+                     once-per-pod warning)"
+                );
+            });
+        }
+    }
 }
 
 /// Max local retry attempts for transient daemon failures before
@@ -1015,30 +1098,23 @@ pub async fn execute_build(
     // forced node_free ≤ slack < headroom). The fold runs BEFORE the
     // footer renders so the report and the banner agree.
     let quota_status = crate::quota::status(&env.overlay_base_dir).ok().flatten();
-    // live060-b: a None quota status is EVIDENCE OF A BROKEN PRODUCER,
-    // never silently absorbed — on the live fleet (159/160 EBS-only
-    // ext4 nodes without prjquota) 2022/2022 completions carried
-    // `peak_disk_bytes: None` with ZERO signal for an entire
-    // deployment era. The absence becomes operable: a counter per
-    // completion plus a once-per-pod WARN naming the precondition
-    // (prjquota provisioning — the node must mount the kubelet volume
-    // with `-o prjquota` AND kubelet must assign per-emptyDir project
-    // ids). Never fatal: the completion proceeds — the disk-sizing
-    // pipeline degrades to estimator priors exactly as before, just
-    // loudly.
-    note_quota_evidence(quota_status.as_ref(), &env.overlay_base_dir);
-    let quota_peak = match (quota_status, peak_quota_bytes) {
-        (Some(q), Some(peak)) => Some(crate::quota::QuotaStatus {
-            used_bytes: q.used_bytes.max(peak),
-            hard_limit_bytes: q.hard_limit_bytes,
-        }),
-        (Some(q), None) => Some(q),
-        // No limit read now (quota record gone / fs error) — a bare
-        // usage peak has no exhaustion predicate to feed; the
-        // non-quota lane keeps the report.
-        (None, _) => None,
-    };
-    let peak_disk_bytes = quota_peak.map(|q| q.used_bytes);
+    // bug_046: the fold mints one product per consumer (the typed
+    // pair) — the (one-shot-failed, monitor-witnessed) cell keeps the
+    // limit-independent sizing peak instead of zeroing it, and the
+    // absence signal consumes the fold OUTPUT (absent only when BOTH
+    // producers yielded nothing — live060-b stays loud for the truly
+    // dead-producer fleet shape; the unreadable-limit lane is counted
+    // separately). Never fatal: the completion proceeds — the
+    // disk-sizing pipeline degrades to estimator priors, loudly.
+    let disk_evidence = fold_disk_evidence(quota_status, peak_quota_bytes);
+    note_quota_evidence(&disk_evidence, &env.overlay_base_dir);
+    // The CLASSIFICATION product: exhaustion attribution needs the
+    // limit regardless, so the limit-bearing lane alone feeds
+    // apply_disk_override + the DiskFull telemetry (byte-stable where
+    // the limit is readable).
+    let quota_peak = disk_evidence.classification;
+    // The SIZING product: limit-independent witnessed usage.
+    let peak_disk_bytes = disk_evidence.sizing_peak;
     let node_free = crate::quota::node_free_bytes_decoupled(
         &env.overlay_base_dir,
         quota_peak.and_then(|q| q.hard_limit_bytes),
@@ -2800,22 +2876,25 @@ mod tests {
         // completion.rs:176-183).
         assert_ne!(mapped, Proto::Unspecified);
     }
-    /// **W12-LF (live060-b, A2)** — *proposition: the sizing
-    /// producer's absence is counted and warned exactly when the
-    /// precondition fails; population: {prjquota present, absent} ×
-    /// the completion path.* Pre-fix a None quota status was silently
+    /// **W12-LF (live060-b, A2; bug_046 re-derived)** — *proposition:
+    /// the sizing producer's absence is counted exactly when BOTH
+    /// producers yielded nothing; population: the (one-shot x
+    /// monitor) fold cells.* Pre-fix a None quota status was silently
     /// absorbed (`.ok().flatten()` → `peak_disk_bytes: None`) — the
     /// live fleet ran an entire era (2022/2022 completions) with the
-    /// producer dead and zero signal. The absence is loud, never
-    /// fatal: the completion proceeds.
+    /// producer dead and zero signal; the wave-12 repair then keyed
+    /// the signal on the ONE-SHOT alone, contradicting the in-scope
+    /// monitor (the bug_046 false-absence half). The absence is loud,
+    /// never fatal: the completion proceeds.
     #[test]
     fn absent_quota_evidence_is_counted_and_warned_once() {
         let recorder = rio_test_support::metrics::CountingRecorder::default();
         let _guard = metrics::set_default_local_recorder(&recorder);
         let dir = std::path::Path::new("/tmp/lf-overlay");
-        // Two completions on a no-prjquota node: both counted…
-        super::note_quota_evidence(None, dir);
-        super::note_quota_evidence(None, dir);
+        // Two completions on a no-prjquota node ((None, None) cells):
+        // both counted…
+        super::note_quota_evidence(&super::fold_disk_evidence(None, None), dir);
+        super::note_quota_evidence(&super::fold_disk_evidence(None, None), dir);
         assert_eq!(
             recorder.get("rio_builder_quota_evidence_absent_total{}"),
             2,
@@ -2837,11 +2916,80 @@ mod tests {
             used_bytes: 42,
             hard_limit_bytes: Some(1 << 30),
         };
-        super::note_quota_evidence(Some(&q), std::path::Path::new("/tmp/lf2"));
+        super::note_quota_evidence(
+            &super::fold_disk_evidence(Some(q), None),
+            std::path::Path::new("/tmp/lf2"),
+        );
         assert_eq!(
             recorder.get("rio_builder_quota_evidence_absent_total{}"),
             0,
             "no signal when the producer is alive"
         );
+    }
+
+    /// **W13-H (bug_046)** — *proposition: a witnessed monitor peak is
+    /// never destroyed by a limit-read failure, and the absence signal
+    /// never contradicts the fold's own second producer; population:
+    /// all four (one-shot x monitor) cells — TOTAL, zero wildcards.*
+    /// RED-FIRST (recorded in the commit body): pre-fix the
+    /// `(None, _)` arm returned None — the (None, Some(peak)) cell
+    /// zeroed `peak_disk_bytes` for the limit-free SLA disk axis AND
+    /// `note_quota_evidence`, keyed on the one-shot alone,
+    /// counted/WARNed "evidence ABSENT" on a node the monitor had
+    /// just proved works.
+    #[test]
+    fn monitor_peak_survives_limit_read_failure() {
+        let recorder = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let dir = std::path::Path::new("/tmp/h-overlay");
+        let gi = 1u64 << 30;
+        let q = crate::quota::QuotaStatus {
+            used_bytes: 2 * gi,
+            hard_limit_bytes: Some(3 * gi),
+        };
+
+        // Cell (Some, Some): both products, peak folded via max.
+        let e = super::fold_disk_evidence(Some(q), Some(7 * gi));
+        assert_eq!(e.sizing_peak, Some(7 * gi));
+        assert_eq!(e.classification.map(|c| c.used_bytes), Some(7 * gi));
+        assert_eq!(
+            e.classification.and_then(|c| c.hard_limit_bytes),
+            Some(3 * gi)
+        );
+
+        // Cell (Some, None): the one-shot stands alone (W13-H2's
+        // byte-stable classification half).
+        let e = super::fold_disk_evidence(Some(q), None);
+        assert_eq!(e.sizing_peak, Some(2 * gi));
+        assert_eq!(e.classification.map(|c| c.used_bytes), Some(2 * gi));
+
+        // THE REPAIRED CELL (None, Some): the peak survives; the
+        // classification lane (which needs the limit regardless) is
+        // off; the absence signal does NOT fire — the narrower
+        // unreadable-limit lane does.
+        let e = super::fold_disk_evidence(None, Some(7 * gi));
+        assert_eq!(
+            e.sizing_peak,
+            Some(7 * gi),
+            "a witnessed monitor peak must never be destroyed by a \
+             limit-read failure"
+        );
+        assert!(e.classification.is_none());
+        super::note_quota_evidence(&e, dir);
+        assert_eq!(
+            recorder.get("rio_builder_quota_evidence_absent_total{}"),
+            0,
+            "absence must not contradict the in-scope monitor evidence"
+        );
+        assert_eq!(
+            recorder.get("rio_builder_quota_limit_unreadable_total{}"),
+            1,
+            "the one-shot lane is named on its own counter"
+        );
+
+        // Cell (None, None): truly nothing witnessed.
+        let e = super::fold_disk_evidence(None, None);
+        assert_eq!(e.sizing_peak, None);
+        assert!(e.classification.is_none());
     }
 }

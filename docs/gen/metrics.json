@@ -23,6 +23,7 @@
     "rio_builder_memory_fraction",
     "rio_builder_overlay_teardown_failures_total",
     "rio_builder_quota_evidence_absent_total",
+    "rio_builder_quota_limit_unreadable_total",
     "rio_builder_stale_assignments_rejected_total",
     "rio_builder_upload_bytes_total",
     "rio_builder_upload_references_count",
@@ -388,7 +389,12 @@
       {
         "name": "rio_builder_quota_evidence_absent_total",
         "kind": "counter",
-        "help": "Completions whose project-quota disk evidence was ABSENT (live060-b: quota::status returned None at the completion seam — the node lacks the prjquota precondition, so peak_disk_bytes is None and the disk sizer cannot learn from this pod). One increment per completion; a once-per-pod WARN names the precondition. Expect this rate to trend to ZERO as prjquota provisioning (live060-a) rolls out; a nonzero steady-state rate means builder nodes are running without the disk-evidence producer."
+        "help": "Completions whose project-quota disk evidence was ABSENT — BOTH producers yielded nothing (bug_046: the one-shot quota::status AND the 1 Hz during-build monitor; live060-b: the node lacks the prjquota precondition, so peak_disk_bytes is None and the disk sizer cannot learn from this pod). One increment per completion; a once-per-pod WARN names the precondition. Expect this rate to trend to ZERO as prjquota provisioning (live060-a) rolls out; a nonzero steady-state rate means builder nodes are running without the disk-evidence producer."
+      },
+      {
+        "name": "rio_builder_quota_limit_unreadable_total",
+        "kind": "counter",
+        "help": "Completions whose post-build quota LIMIT read failed while the during-build monitor HAD witnessed usage (bug_046: the (one-shot-failed, monitor-witnessed) fold cell — quota record gone after teardown, or fs error). The sizing peak survives on its own product; exhaustion classification (which needs the limit regardless) is off for that completion. Distinct from rio_builder_quota_evidence_absent_total, which now fires only when BOTH producers yielded nothing. A sustained rate here with a quiet absent counter means teardown races the one-shot — sizing is healthy, attribution is degraded."
       },
       {
         "name": "rio_builder_stale_assignments_rejected_total",
@@ -1227,7 +1233,7 @@
       {
         "name": "rio_scheduler_uncorroborated_sizing_claim_total",
         "kind": "counter",
-        "help": "Worker-reported sizing claims refused by the corroboration gate (bug_090 typed claims; bug_102 the status-borne timeout axis; labels: class = cgroup_oom|disk_full|timed_out|unspecified): the claim's evidence was absent or inconsistent with the scheduler-assigned anchor (oom: peak_memory below half the assigned memory; disk: hard limit outside [assigned/2, assigned*4] or peak below half the limit; timed_out: attempt-open duration below half the assigned deadline, or no running_since/intent anchor), or no dispatch intent existed to corroborate against. Refusals are classify-only — the report's retry/charge flow is unaffected and persisted floors never move (every floor mutation demands a typed CorroborationWitness; the caller alphabet stays census-pinned, bump_resource_floor_caller_census). Alert if rate > 0: a forged or misbehaving worker report (the honest producer always sends self-consistent telemetry sampled at its own classification seam)."
+        "help": "Worker-reported sizing claims refused by the corroboration gate (bug_090 typed claims; bug_102 the status-borne timeout axis; labels: class = cgroup_oom|disk_full|timed_out|unspecified): the claim's evidence was absent or inconsistent with the scheduler-assigned anchor (oom: peak_memory below half the assigned memory; disk: hard limit outside the producer-derived band [overlay(assigned, H_MIN), overlay(assigned, H_MAX) + block slack] (bug_065: the shared rio_common::k8s overlay denomination — a kubelet-unmintable limit refuses) or peak below half the limit; timed_out: attempt-open duration below half the assigned deadline, or no running_since/intent anchor), or no dispatch intent existed to corroborate against. Refusals are classify-only — the report's retry/charge flow is unaffected and persisted floors never move (every floor mutation demands a typed CorroborationWitness; the caller alphabet stays census-pinned, bump_resource_floor_caller_census). Alert if rate > 0: a forged or misbehaving worker report (the honest producer always sends self-consistent telemetry sampled at its own classification seam)."
       },
       {
         "name": "rio_scheduler_undeclared_built_output_total",

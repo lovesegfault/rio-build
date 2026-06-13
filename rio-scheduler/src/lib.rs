@@ -354,7 +354,10 @@ pub fn describe_metrics() {
          labels: class = cgroup_oom|disk_full|timed_out|unspecified): the \
          claim's evidence was absent or inconsistent with the \
          scheduler-assigned anchor (oom: peak_memory below half the assigned \
-         memory; disk: hard limit outside [assigned/2, assigned*4] or peak \
+         memory; disk: hard limit outside the producer-derived band \
+         [overlay(assigned, H_MIN), overlay(assigned, H_MAX) + block slack] \
+         (bug_065: the shared rio_common::k8s overlay denomination — a \
+         kubelet-unmintable limit refuses) or peak \
          below half the limit; timed_out: attempt-open duration below half \
          the assigned deadline, or no running_since/intent anchor), or no \
          dispatch intent existed to corroborate against. Refusals are \

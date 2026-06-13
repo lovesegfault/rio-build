@@ -111,12 +111,26 @@ pub fn describe_metrics() {
         "Total builds executed (labeled by outcome: success/failure/cancelled/timed_out/log_limit/infra_failure)"
     );
     describe_counter!(
+        "rio_builder_quota_limit_unreadable_total",
+        "Completions whose post-build quota LIMIT read failed while the \
+         during-build monitor HAD witnessed usage (bug_046: the \
+         (one-shot-failed, monitor-witnessed) fold cell — quota record \
+         gone after teardown, or fs error). The sizing peak survives on \
+         its own product; exhaustion classification (which needs the \
+         limit regardless) is off for that completion. Distinct from \
+         rio_builder_quota_evidence_absent_total, which now fires only \
+         when BOTH producers yielded nothing. A sustained rate here \
+         with a quiet absent counter means teardown races the one-shot \
+         — sizing is healthy, attribution is degraded."
+    );
+    describe_counter!(
         "rio_builder_quota_evidence_absent_total",
-        "Completions whose project-quota disk evidence was ABSENT \
-         (live060-b: quota::status returned None at the completion \
-         seam — the node lacks the prjquota precondition, so \
-         peak_disk_bytes is None and the disk sizer cannot learn from \
-         this pod). One increment per completion; a once-per-pod WARN \
+        "Completions whose project-quota disk evidence was ABSENT — \
+         BOTH producers yielded nothing (bug_046: the one-shot \
+         quota::status AND the 1 Hz during-build monitor; live060-b: \
+         the node lacks the prjquota precondition, so peak_disk_bytes \
+         is None and the disk sizer cannot learn from this pod). One \
+         increment per completion; a once-per-pod WARN \
          names the precondition. Expect this rate to trend to ZERO as \
          prjquota provisioning (live060-a) rolls out; a nonzero \
          steady-state rate means builder nodes are running without \
