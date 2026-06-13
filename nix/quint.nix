@@ -6843,6 +6843,34 @@ rec {
       main = "materializationJobBase";
       witness = "noObsolete";
     };
+    # TB-5 (round-13, WO-S9-6): the last three authored-but-unwired
+    # witnesses join — the live_061 disease's residue on the ENFORCED
+    # plane (authored with the model, never wired; the P9 lint will
+    # demand exactly this). The zero-interest cancellation closes a
+    # job (the JCancelled resolution is reachable).
+    quint-materialization-witness-cancel-zero-interest = mkQuintSimWitnessCheck {
+      name = "materialization-witness-cancel-zero-interest";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noCancelOnZeroInterest";
+    };
+    # TB-5: the stale-tenure discard fires (the claims-floor fence's
+    # non-vacuity — runs in the stale-tenure regime, the only one
+    # whose environment mints a stale write to discard).
+    quint-materialization-witness-stale-discard = mkQuintSimWitnessCheck {
+      name = "materialization-witness-stale-discard";
+      spec = "materializationJob";
+      main = "materializationJobStaleTenure";
+      witness = "noStaleDiscard";
+    };
+    # TB-5: a same-build wanted REWRITE happens (F5/PP-5 ii — the
+    # documented intended narrowing, recorded reachable).
+    quint-materialization-witness-wanted-rewrite = mkQuintSimWitnessCheck {
+      name = "materialization-witness-wanted-rewrite";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noWantedRewrite";
+    };
 
     # ---- Materialization C-prime calibration pins ---------------------
     # The §9.3 transfer corpus, executed (the go/no-go core): each pin

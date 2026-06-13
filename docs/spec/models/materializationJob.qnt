@@ -1863,6 +1863,23 @@ module materializationJob {
   /// count_materialization_rows_in_history — NOT the per-job count).
   /// The report precondition (missing paths verified absent AND
   /// unavailable) is the evidence the fsReportSound latch records.
+  /// TB-5 referee verdict (round-13, WO-S9-6 — the seam record): the
+  /// audit filed "refs-only column divergence" as the enforced
+  /// plane's one open seam, UNREFEREED. Re-derived both sides at the
+  /// wave tree: production routes on exactly the non-empty bit this
+  /// model carries (rio-evidence-kernel routing.rs,
+  /// `!inputs.missing_references.is_empty()` into
+  /// route_from_classes); a refs-only report is admissible in both
+  /// estates (the or-guard below — merged_bug_193's repair); the
+  /// moot arm refuses over a confirmed hole in both (arm0covered
+  /// carries not(refsMissing); RoutingInputs' "must never complete
+  /// over it"); and every Unobtainable charges the ledger in both
+  /// (the MaterializationUnobtainable row mints unconditionally at
+  /// the consumption arm; the per-job count is the one-shot
+  /// consult). The pre-fix fold survives only as the
+  /// mat-a4-refs-folded calibration. RECONCILED — no fix lands; this
+  /// note is the verdict record, and the three dormant witnesses
+  /// wire at the same close (hygiene, not contingent).
   // Mirrors: rio-scheduler/src/actor/materialize.rs:consume_materialization_outcome
   action consumeUnobtainable(d: str, missing: Set[str], refsMissing: bool): bool = all {
     // A4 (merged_bug_193): the report splits the miss cells — wanted
