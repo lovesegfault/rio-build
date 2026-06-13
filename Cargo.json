@@ -17682,7 +17682,8 @@
       ],
       "resolvedDefaultFeatures": [
         "default",
-        "proc-macro"
+        "proc-macro",
+        "span-locations"
       ],
       "libCrateTypes": [
         "lib"
@@ -20390,12 +20391,20 @@
           "packageId": "anyhow"
         },
         {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
           "name": "proptest",
           "packageId": "proptest"
         },
         {
           "name": "rstest",
           "packageId": "rstest"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
         },
         {
           "name": "tempfile",

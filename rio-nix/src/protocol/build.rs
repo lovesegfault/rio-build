@@ -198,9 +198,13 @@ pub async fn read_basic_derivation<R: AsyncRead + Unpin>(r: &mut R) -> Result<Ba
     }
     let mut outputs = Vec::with_capacity(output_count.min(64) as usize);
     for _ in 0..output_count {
+        // strict: drv output name (identity field)
         let name = wire::read_string(r).await?;
+        // strict: store path (identity field)
         let path = wire::read_string(r).await?;
+        // strict: hash algo token
         let hash_algo = wire::read_string(r).await?;
+        // strict: hash hex (parsed)
         let hash = wire::read_string(r).await?;
         outputs.push(
             DerivationOutput::new(name, path, hash_algo, hash).map_err(|e| {
@@ -211,10 +215,15 @@ pub async fn read_basic_derivation<R: AsyncRead + Unpin>(r: &mut R) -> Result<Ba
         );
     }
 
+    // strict: store paths (identity fields)
     let input_srcs = wire::read_strings(r).await?;
+    // strict: system token (identity field)
     let platform = wire::read_string(r).await?;
+    // strict: builder store path (identity field)
     let builder = wire::read_string(r).await?;
+    // strict: drv args (hashed identity; lossy bytes would alter the drv)
     let args = wire::read_strings(r).await?;
+    // strict: drv env (hashed identity; lossy bytes would alter the drv)
     let env = wire::read_string_pairs(r).await?;
 
     BasicDerivation::new(
@@ -311,7 +320,11 @@ pub async fn read_build_result<R: AsyncRead + Unpin>(
         }
     };
 
-    let error_msg = wire::read_string(r).await?;
+    // The build failure narration is CONTENT (bug_020's walk found
+    // this fifth arm): the daemon's BuildResult.error_msg embeds the
+    // same raw log bytes as the STDERR_ERROR message — the exact
+    // population the live_059 close targeted.
+    let error_msg = wire::read_content_string(r).await?;
 
     // Protocol 1.29+ (always present since we target 1.35+)
     let times_built = wire::read_u64(r).await?;
@@ -334,8 +347,10 @@ pub async fn read_build_result<R: AsyncRead + Unpin>(
     let mut built_outputs = Vec::with_capacity(output_count.min(64) as usize);
     for _ in 0..output_count {
         // Key: DrvOutput as string ("sha256:<hex>!<outputname>")
+        // strict: drv output id (parsed)
         let drv_output_id = wire::read_string(r).await?;
         // Value: Realisation as JSON string
+        // strict: parsed as JSON next (serde refuses invalid UTF-8 anyway)
         let json_str = wire::read_string(r).await?;
         // Wire outPath is the BASENAME (<hashpart>-<name>) per Nix's
         // StorePath::to_string(). Prepend /nix/store/ so internal

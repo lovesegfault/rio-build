@@ -79,7 +79,7 @@ pkcs8 = { version = "0.11", default-features = false, features = ["encryption", 
 portable-atomic = { version = "1", features = ["require-cas"] }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 primeorder = { version = "0.14.0-rc.9", default-features = false, features = ["alloc", "basepoint-table"] }
-proc-macro2 = { version = "1" }
+proc-macro2 = { version = "1", features = ["span-locations"] }
 prost = { version = "0.14" }
 quanta = { version = "0.12" }
 quote = { version = "1" }
@@ -199,7 +199,7 @@ pkcs8 = { version = "0.11", default-features = false, features = ["encryption", 
 portable-atomic = { version = "1", features = ["require-cas"] }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 primeorder = { version = "0.14.0-rc.9", default-features = false, features = ["alloc", "basepoint-table"] }
-proc-macro2 = { version = "1" }
+proc-macro2 = { version = "1", features = ["span-locations"] }
 prost = { version = "0.14" }
 quanta = { version = "0.12" }
 quote = { version = "1" }

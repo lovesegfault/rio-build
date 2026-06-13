@@ -111,8 +111,14 @@ pub async fn read_bytes<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
 /// fields), where malformed text IS a protocol violation. Log/text
 /// CONTENT the daemon merely transports goes through
 /// [`read_content_string`] instead — the boundary is typed at the
-/// read site so a future content field cannot silently inherit
-/// strictness (live_059).
+/// read site, and the read-verdict census
+/// (`tests/read_verdict_census.rs`, bug_020) makes that doctrine
+/// MACHINE-TRUE: a syn walk over every protocol module demands a
+/// recorded `// strict: <reason>` opt-in at each strict-family call
+/// site (transitively — wrappers join the family), so a future
+/// content field structurally cannot inherit strictness silently
+/// (live_059's claimed-sweep enforcement let the terminal error
+/// narration do exactly that).
 pub async fn read_string<R: AsyncRead + Unpin>(r: &mut R) -> Result<String> {
     let bytes = read_bytes(r).await?;
     Ok(String::from_utf8(bytes)?)

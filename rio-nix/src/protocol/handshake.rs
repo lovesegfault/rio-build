@@ -152,6 +152,7 @@ pub async fn server_handshake_split<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>
 
     // Phase 2: Feature exchange (protocol >= 1.38)
     if negotiated_version >= encode_version(1, 38) {
+        // strict: feature tokens
         let _client_features = wire::read_strings(reader).await?;
         wire::write_strings(writer, wire::NO_STRINGS).await?;
         writer.flush().await.map_err(wire::WireError::Io)?;

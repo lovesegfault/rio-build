@@ -33,3 +33,8 @@ proptest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-test = { workspace = true }
+# The read-verdict census (bug_020, R31'): a syn walk over the
+# protocol modules' string-read call sites. span-locations gives the
+# walk line numbers for its verdict-token checks.
+syn = { workspace = true, features = ["full", "visit"] }
+proc-macro2 = { workspace = true, features = ["span-locations"] }

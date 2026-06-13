@@ -11152,7 +11152,8 @@
       ],
       "resolvedDefaultFeatures": [
         "default",
-        "proc-macro"
+        "proc-macro",
+        "span-locations"
       ],
       "libCrateTypes": [
         "lib"

@@ -75,6 +75,7 @@ pub async fn read_stderr_message<R: AsyncRead + Unpin>(r: &mut R) -> Result<Stde
         }
         STDERR_LAST => Ok(StderrMessage::Last),
         STDERR_ERROR => {
+            // strict: delegated (read_stderr_error carries per-field verdicts)
             let error = read_stderr_error(r).await?;
             Ok(StderrMessage::Error(error))
         }
@@ -119,15 +120,25 @@ pub async fn read_stderr_message<R: AsyncRead + Unpin>(r: &mut R) -> Result<Stde
 
 /// Read the structured fields of STDERR_ERROR.
 async fn read_stderr_error<R: AsyncRead + Unpin>(r: &mut R) -> Result<StderrError> {
+    // strict: classifier token (matched against error kinds)
     let error_type = wire::read_string(r).await?;
     let level = wire::read_u64(r).await?;
+    // strict: error identity token
     let name = wire::read_string(r).await?;
-    let message = wire::read_string(r).await?;
+    // The terminal error narration is CONTENT (bug_020): Nix's
+    // BuildError message embeds the raw last-10-log-lines bytes
+    // VERBATIM, so the failing builds likeliest to carry non-UTF-8
+    // failed the protocol at exactly the terminal frame the
+    // narration exists for. Byte-transparent, lossy at display.
+    let message = wire::read_content_string(r).await?;
 
     // Position
     let have_pos = wire::read_u64(r).await?;
     let position = if have_pos != 0 {
-        let file = wire::read_string(r).await?;
+        // Position.file is CONTENT (bug_020/PD-7): paths are bytes
+        // on Linux and Nix positions can reference arbitrary user
+        // files — never store-path-constrained.
+        let file = wire::read_content_string(r).await?;
         let line = wire::read_u64(r).await?;
         let column = wire::read_u64(r).await?;
         Some(super::stderr::Position::new(file, line, column))
@@ -144,14 +155,18 @@ async fn read_stderr_error<R: AsyncRead + Unpin>(r: &mut R) -> Result<StderrErro
     for _ in 0..trace_count {
         let trace_have_pos = wire::read_u64(r).await?;
         let trace_pos = if trace_have_pos != 0 {
-            let file = wire::read_string(r).await?;
+            // Content, as above (PD-7): trace positions reference
+            // arbitrary user files.
+            let file = wire::read_content_string(r).await?;
             let line = wire::read_u64(r).await?;
             let column = wire::read_u64(r).await?;
             Some(super::stderr::Position::new(file, line, column))
         } else {
             None
         };
-        let trace_msg = wire::read_string(r).await?;
+        // Trace narration is CONTENT (bug_020), same population as
+        // the top-level message.
+        let trace_msg = wire::read_content_string(r).await?;
         traces.push(super::stderr::Trace::new(trace_pos, trace_msg));
     }
 
@@ -203,6 +218,7 @@ const MAX_STDERR_MESSAGES: u64 = 100_000;
 /// Aborts after `MAX_STDERR_MESSAGES` to prevent infinite loops.
 pub(crate) async fn drain_stderr<R: AsyncRead + Unpin>(r: &mut R) -> Result<()> {
     for _ in 0..MAX_STDERR_MESSAGES {
+        // strict: delegated (read_stderr_message dispatches per-opcode verdicts)
         match read_stderr_message(r).await? {
             StderrMessage::Last => return Ok(()),
             StderrMessage::Error(e) => {
@@ -265,6 +281,7 @@ pub async fn client_handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         wire::write_strings(writer, wire::NO_STRINGS).await?;
         writer.flush().await.map_err(WireError::Io)?;
         // Read server features
+        // strict: feature tokens
         let _server_features = wire::read_strings(reader).await?;
     }
 
@@ -275,10 +292,12 @@ pub async fn client_handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     writer.flush().await.map_err(WireError::Io)?;
 
     // Read server version string + trusted status
+    // strict: version token
     let _version_string = wire::read_string(reader).await?;
     let _trusted = wire::read_u64(reader).await?;
 
     // Phase 4: Read initial STDERR_LAST
+    // strict: delegated (drain_stderr loops the verdicted dispatcher)
     drain_stderr(reader).await?;
 
     Ok(HandshakeResult::new(negotiated_version))
@@ -337,6 +356,7 @@ pub async fn client_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     writer.flush().await?;
 
     // nix-daemon sends only STDERR_LAST for SetOptions
+    // strict: delegated (drain_stderr loops the verdicted dispatcher)
     drain_stderr(reader).await?;
 
     Ok(())
@@ -779,6 +799,88 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+        Ok(())
+    }
+
+    /// W13-AD (bug_020): the terminal error frame is the CONTENT
+    /// lane — Nix's BuildError message embeds the raw last-10
+    /// log-lines bytes VERBATIM, so the failing builds likeliest to
+    /// carry non-UTF-8 used to fail the protocol at exactly the
+    /// terminal frame (the typed StderrMessage::Error path bypassed,
+    /// the daemon's failure narration destroyed, the completion class
+    /// wrong for exactly the population the live_059 close targeted).
+    ///
+    /// PRE-FIX RED (2026-06-12, strawman: `message` reverted to the
+    /// strict `wire::read_string`):
+    ///   `the terminal error narration must survive byte-transparently:
+    ///    InvalidUtf8(FromUtf8Error { .. })`.
+    /// POST-FIX: the narration (message, trace messages, position
+    /// files — all content per the verdict census) arrives lossy
+    /// (U+FFFD), the typed Error path serves it, and the structural
+    /// fields (error_type, name) keep their strict opt-in.
+    #[tokio::test]
+    async fn terminal_error_narration_survives_non_utf8() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        wire::write_u64(&mut buf, STDERR_ERROR).await?;
+        wire::write_string(&mut buf, "Error").await?; // error_type (strict)
+        wire::write_u64(&mut buf, 0).await?; // level
+        wire::write_string(&mut buf, "nix::BuildError").await?; // name (strict)
+        // The message embeds raw log bytes — the exact live_059
+        // population: invalid continuation bytes mid-narration.
+        wire::write_bytes(&mut buf, b"builder failed:\n\xff\xfelast log line").await?;
+        // Position: an arbitrary user file path with non-UTF-8 bytes
+        // (paths are bytes on Linux — PD-7's pre-derived verdict).
+        wire::write_u64(&mut buf, 1).await?;
+        wire::write_bytes(&mut buf, b"/home/u\xffser/default.nix").await?;
+        wire::write_u64(&mut buf, 3).await?;
+        wire::write_u64(&mut buf, 7).await?;
+        // One trace, no position, non-UTF-8 narration.
+        wire::write_u64(&mut buf, 1).await?;
+        wire::write_u64(&mut buf, 0).await?;
+        wire::write_bytes(&mut buf, b"while building \xfe\xffthing").await?;
+
+        let msg = read_stderr_message(&mut std::io::Cursor::new(buf))
+            .await
+            .expect("the terminal error narration must survive byte-transparently");
+        match msg {
+            StderrMessage::Error(e) => {
+                assert_eq!(e.error_type, "Error");
+                assert_eq!(e.name, "nix::BuildError");
+                assert!(
+                    e.message.starts_with("builder failed:") && e.message.contains('\u{FFFD}'),
+                    "lossy display narration: {:?}",
+                    e.message
+                );
+                let pos = e.position.expect("position survives");
+                assert!(pos.file.contains('\u{FFFD}'), "lossy path: {:?}", pos.file);
+                assert!(
+                    e.traces[0].message.contains('\u{FFFD}'),
+                    "lossy trace narration: {:?}",
+                    e.traces[0].message
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// W13-AD2 (bug_020): the structural fields KEEP their strict
+    /// opt-in — a garbled `error_type` still refuses the protocol
+    /// with `InvalidUtf8` (it is a classifier token, not narration;
+    /// the verdict census records the opt-in at the read site).
+    #[tokio::test]
+    async fn terminal_error_structural_fields_stay_strict() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        wire::write_u64(&mut buf, STDERR_ERROR).await?;
+        wire::write_bytes(&mut buf, b"Err\xffor").await?; // garbled error_type
+
+        let err = read_stderr_message(&mut std::io::Cursor::new(buf))
+            .await
+            .expect_err("a garbled classifier token must refuse");
+        assert!(
+            matches!(err, crate::protocol::wire::WireError::InvalidUtf8(_)),
+            "the refusal names the violation: {err:?}"
+        );
         Ok(())
     }
 

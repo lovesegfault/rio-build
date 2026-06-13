@@ -61,13 +61,17 @@ pub async fn write_valid_path_info<W: AsyncWrite + Unpin>(
 
 /// Read the 8-field `ValidPathInfo` body.
 pub async fn read_valid_path_info<R: AsyncRead + Unpin>(r: &mut R) -> Result<ValidPathInfo> {
+    // strict: deriver store path
     let deriver = none_if_empty(read_string(r).await?);
     let nar_hash = read_nar_hash(r).await?;
+    // strict: reference store paths
     let references = read_strings(r).await?;
     let registration_time = read_u64(r).await?;
     let nar_size = read_u64(r).await?;
     let ultimate = read_bool(r).await?;
+    // strict: signatures (parsed)
     let signatures = read_strings(r).await?;
+    // strict: content address (parsed)
     let content_address = none_if_empty(read_string(r).await?);
     Ok(ValidPathInfo {
         deriver,
