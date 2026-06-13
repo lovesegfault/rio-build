@@ -14,13 +14,25 @@
 
 /// Source files that contain `*_client.method(...)` outbound calls.
 /// `include_str!` so the audit operates on the source as-compiled.
+/// Universe: every `handler/` module + every top-level src module
+/// that holds a tonic client field — the claim's quantifier is "every
+/// outbound RPC site", so a handler module is enrolled even when it
+/// currently carries zero non-clone calls (opcodes_write, log_tail).
 const SOURCES: &[(&str, &str)] = &[
     ("handler/build.rs", include_str!("../src/handler/build.rs")),
     (
         "handler/opcodes_read.rs",
         include_str!("../src/handler/opcodes_read.rs"),
     ),
+    (
+        "handler/opcodes_write.rs",
+        include_str!("../src/handler/opcodes_write.rs"),
+    ),
     ("handler/grpc.rs", include_str!("../src/handler/grpc.rs")),
+    (
+        "handler/log_tail.rs",
+        include_str!("../src/handler/log_tail.rs"),
+    ),
     ("quota.rs", include_str!("../src/quota.rs")),
     ("session.rs", include_str!("../src/session.rs")),
     ("translate.rs", include_str!("../src/translate.rs")),
@@ -52,6 +64,7 @@ fn is_client_call(line: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+// r[verify gw.jwt.propagate]
 #[test]
 fn all_grpc_calls_use_with_jwt() {
     // Look-back window for `with_jwt` / `no-jwt:` evidence. Multi-field
