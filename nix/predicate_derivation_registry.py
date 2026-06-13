@@ -57,12 +57,12 @@ import census_corpora
 KINDS = ("derived", "planted", "debt")
 
 # R31'-d (round-14 WO-S9-1, the merged_bug_004 perimeter repair — the
-# DENOMINATOR RIDER): every PROVENANCE row carries a mandatory closed
-# `axis` sub-field. Absence reds via the SAME two-way totality check as
+# DENOMINATOR RIDER): every PROVENANCE row carries a mandatory closed  # quantifier: census(check_registry)
+# `axis` sub-field. Absence reds via the same two-way totality check as  # quantifier: census(check_registry)
 # PROVENANCE (below) — opt-out is structurally impossible: a generator
 # without an AXIS row is the gate red, exactly as a generator without a
-# PROVENANCE row is. The `coverage` axis names every coverage/ratio/
-# totality predicate (a generator that asserts "fraction of population
+# PROVENANCE row is. The `coverage` axis names every coverage/ratio/  # quantifier: census(check_registry)
+# all-of-N predicate (a generator that asserts "fraction of population
 # satisfies X" or "all of N are covered"); each such row carries a
 # `denominator-source` naming the AUTHORITATIVE population class —
 # spec'd-replica-count / registry / owning-resource / OTHER+rationale —
@@ -333,7 +333,7 @@ PROVENANCE = {
     ),
 }
 
-# R31'-d AXIS declarations — REVIEWED claims keyed by the SAME
+# R31'-d AXIS declarations — REVIEWED claims keyed by the same
 # machine-derived population (totality both ways via the same  # quantifier: census(check_registry)
 # :176-188 form below; a generator with PROVENANCE but no AXIS row
 # reds; an AXIS row naming no generator reds). Each value is
@@ -428,10 +428,11 @@ def check_registry(src_root, provenance=None, registry_names=None, axis=None):
                 f"{name}: provenance row names no enrolled generator — "
                 f"registry rot or an unrecorded retirement"
             )
-    # R31'-d totality, both directions — the SAME structural form as
-    # the PROVENANCE check above (a generator with no AXIS row reds;
-    # an AXIS row naming no generator reds; opt-out is structurally
-    # impossible by reusing the same totality machinery).
+    # R31'-d totality, both directions — quantifier: census(check_registry)
+    # — the same structural form as the PROVENANCE check above (a
+    # generator with no AXIS row reds; an AXIS row naming no generator
+    # reds; opt-out is structurally impossible by reusing the same
+    # check machinery).
     for name in sorted(registry_names):
         if name not in axis:
             fails.append(
@@ -586,8 +587,8 @@ def self_battery(src_root) -> list:
     got = check_registry(src_root, provenance=wide, registry_names=set(wide), axis=wide_ax)
     if not any("shrink-only ceiling" in x for x in got):
         fails.append(f"the debt-ceiling plant did not red: {got}")
-    # R31'-d (b) totality plant: a generator WITHOUT an AXIS row reds
-    # (the same two-way form as the missing-provenance plant above —
+    # R31'-d (b) plant: a generator WITHOUT an AXIS row reds (the
+    # same two-way form as the missing-provenance plant above —
     # opt-out structurally impossible).
     got = check_registry(
         src_root,
