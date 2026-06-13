@@ -28,21 +28,40 @@
 //     sweep spares the current Lease holder)
 //
 // SCOPE, deliberately narrow: two pods, one reconciler ("us" runs the
-// modeled machinery; the peer's own loop is environment), an abstract
-// holder (who the Lease names), an external falsifier budget (the
-// strip nobody's edge writers see: a foreign sweep racing a
-// re-acquire, kubectl, any future actor), and the single-flight
-// reconcile/verify task. Time is the reconciler's round counter.
+// modeled machinery; the peer's own loop is abstracted to ONE
+// environment action, otherLoopConverge, with a cadence obligation —
+// the same binary runs on every pod by construction, so its repair
+// bound is symmetric, and bughunt-13 F1 made that abstraction
+// STRUCTURAL instead of a comment), an abstract holder (who the Lease
+// names), BOTH external falsifier polarities (the strip nobody's edge
+// writers see AND the add nobody's edge writers see — a foreign sweep
+// racing a re-acquire, kubectl label, any future actor; bughunt-13 F1:
+// the alphabet was born one-sided, so `kubectl label pod <standby>
+// role=leader` was unrepresentable while the spec claimed ANY
+// falsifier bounded), and the single-flight reconcile/verify task.
+// Time is the reconciler's round counter.
 //
 // THE INVARIANTS:
 //   - marksDivergenceBounded (cause-tagged): whenever OUR pod's stored
 //     marks diverge from our leadership, the divergence is already
-//     discovered (dirty, or a task in flight) or it is STRIP-caused
-//     and younger than the verify cadence. Edge-caused and
+//     discovered (dirty, or a task in flight) or it is externally
+//     caused (ByStrip OR ByAdd — both polarities since F1) and younger
+//     than the verify cadence. Edge-caused and
 //     stale-write-caused divergence carries NO age window: the edge
 //     writers mark the generation in the same transition, so
 //     discovery is immediate — a claim the bool encoding could not
 //     make (the clear clobbered the mark).
+//   - peerDivergenceBounded: the PEER pod's divergence — any cause,
+//     including our own sweep's read-then-patch TOCTOU and the
+//     external add — clears within the same cadence bound (its own
+//     loop runs the same machinery; the old model carried this as a
+//     comment beside the sweep, F1 makes it a checked claim).
+//   - nonLeaderDivergenceBounded: THE F1 BOUND, named — a non-leading
+//     pod carrying leader marks (the kubectl-label falsifier class
+//     the leader-only Service routes on) is discovered or converged
+//     within one standby cadence + the task-parking deadline, for
+//     EVERY pod. The lease-f1-standby-add calibration twin restores
+//     the leader-only verify world and must violate it.
 //   - notClobbered: no clear ever erases a mark made after the
 //     snapshot the clear was spawned against — the DirtyGen
 //     arithmetic itself. The lease-181-bool-clear calibration twin
@@ -64,6 +83,10 @@ module leaderMarks {
   const MAX_TIME: int
   /// External strips per trace (the falsifier budget; 0 = disabled).
   const MAX_STRIPS: int
+  /// External ADDS per trace (the falsifier's other polarity —
+  /// bughunt-13 F1; 0 = disabled). Priced exactly like MAX_STRIPS:
+  /// the budget form every environment action carries.
+  const MAX_ADDS: int
   /// Holder changes per trace (state-space bound).
   const MAX_HOLDER_CHANGES: int
   /// Rebound edges per trace (the merged_bug_212 dirtying site;
@@ -88,10 +111,11 @@ module leaderMarks {
   type HolderState = | NoLeader | Leader(Pod)
   /// Why a pod's marks diverged (stamped alongside wrongSince by the
   /// same derived helper): an external strip (verify-cadence-bounded),
+  /// an external ADD (the F1 polarity — standby-self-check-bounded),
   /// one of our own leadership edges (marks the generation in the same
   /// transition — discovery immediate), or a stale reconcile write
   /// landing after the desire moved (the racing edge already marked).
-  type Cause = | NoCause | ByStrip | ByEdge | ByWrite
+  type Cause = | NoCause | ByStrip | ByAdd | ByEdge | ByWrite
   /// The single-flight reconcile/verify slot, split into its two
   /// production phases: Reconcile = spawned, API write in flight
   /// (carries the polarity + the same-pass holder read of the
@@ -131,6 +155,8 @@ module leaderMarks {
   var wrongCause: Pod -> Cause
   /// External strips so far.
   var strips: int
+  /// External adds so far (the F1 polarity).
+  var adds: int
   /// Holder changes so far.
   var holderChanges: int
   /// Rebound edges so far.
@@ -172,19 +198,24 @@ module leaderMarks {
   val boundsOK = and {
     clock <= MAX_TIME,
     strips <= MAX_STRIPS,
+    adds <= MAX_ADDS,
     holderChanges <= MAX_HOLDER_CHANGES,
     rebounds <= MAX_REBOUNDS,
     cleared <= marked,
   }
 
   /// The headline, cause-tagged: OUR pod's divergence is discovered
-  /// (dirty / task in flight), or it is strip-caused and younger than
-  /// the verify cadence PLUS the task-parking deadline — the bound's
-  /// two terms are the verify interval (a clean-idle loop must verify
-  /// within VERIFY_EVERY) and the API-call deadline (a strip landing
-  /// inside the Patched window is undiscoverable until the slot
-  /// frees, at most TASK_TIMEOUT rounds; the split-phase model
-  /// surfaces this term, the old atomic completion hid it). Edge- and write-caused divergence gets NO age
+  /// (dirty / task in flight), or it is EXTERNALLY caused — ByStrip
+  /// or, since F1, ByAdd: the verify pass runs at both leadership
+  /// polarities, so a foreign add on the standby is discovered by the
+  /// same cadence that discovers a foreign strip on the leader — and
+  /// younger than the verify cadence PLUS the task-parking deadline.
+  /// The bound's two terms are the verify interval (a clean-idle loop
+  /// must verify within VERIFY_EVERY) and the API-call deadline (a
+  /// falsification landing inside the Patched window is
+  /// undiscoverable until the slot frees, at most TASK_TIMEOUT
+  /// rounds; the split-phase model surfaces this term, the old atomic
+  /// completion hid it). Edge- and write-caused divergence gets NO age
   /// window — the edge writers mark() in the same transition, so the
   /// dirty disjunct must already hold; the bool encoding could not
   /// sustain this (the clear clobbered the mark, the
@@ -197,10 +228,42 @@ module leaderMarks {
       dirty,
       task != NoTask,
       and {
-        wrongCause.get("us") == ByStrip,
+        or {
+          wrongCause.get("us") == ByStrip,
+          wrongCause.get("us") == ByAdd,
+        },
         clock - wrongSince.get("us") <= VERIFY_EVERY + TASK_TIMEOUT,
       },
     }
+
+  /// The PEER pod's divergence — any cause: our sweep's
+  /// read-then-patch TOCTOU (ByWrite), an edge its observation lags
+  /// (ByEdge), either external polarity — clears within the same
+  /// cadence bound. The repair machinery is the peer's OWN loop
+  /// (otherLoopConverge + the tickRound cadence obligation): the same
+  /// binary runs there by construction, which is exactly the symmetry
+  /// argument the pre-F1 model carried as prose beside the sweep
+  /// comment; this val is that argument, checked.
+  val peerDivergenceBounded =
+    wrongUnder(marks, holder, "other") implies
+      clock - wrongSince.get("other") <= VERIFY_EVERY + TASK_TIMEOUT
+
+  /// THE F1 BOUND, named: a NON-leading pod carrying leader marks —
+  /// the falsifier class the leader-only Service routes on (`kubectl
+  /// label pod <standby> …role=leader`; production: an un-retryable
+  /// Trailers-Only UNAVAILABLE data path until repaired) — is
+  /// discovered (our own dirty/task, for the modeled pod) or younger
+  /// than one standby cadence + the task-parking deadline, for EVERY
+  /// pod. Unsatisfiable in the pre-F1 world: no action could even
+  /// construct the state (no add in the alphabet), and had it
+  /// existed, nothing would have repaired it — the
+  /// lease-f1-standby-add twin pins both halves by restoring the
+  /// leader-only verify and expecting this val to fall.
+  val nonLeaderDivergenceBounded = PODS.forall(p =>
+    (not(leadingOf(p, holder)) and marks.get(p)) implies or {
+      p == "us" and (dirty or task != NoTask),
+      clock - wrongSince.get(p) <= VERIFY_EVERY + TASK_TIMEOUT,
+    })
 
   /// The DirtyGen arithmetic itself: no clear ever erases a
   /// post-snapshot mark. Written live by reconcileClear from its own
@@ -224,6 +287,12 @@ module leaderMarks {
   /// the falsifier bites.
   val noStrip = strips == 0
 
+  /// Witness (expect-violation): the external ADD actually fires —
+  /// the green nonLeaderDivergenceBounded verdict is about a space
+  /// where the F1 falsifier polarity bites (the bug_083 anti-vacuity
+  /// pattern, same as noStrip).
+  val noAdd = adds == 0
+
   /// Witness (expect-violation): the rebound dirtying site actually
   /// fires — the notClobbered verdict covers the post-212 writer set,
   /// not just the original edges.
@@ -231,14 +300,24 @@ module leaderMarks {
 
   // --- actions --------------------------------------------------------
   /// One reconciler round passes. The verify-cadence cap (the
-  /// loopInterval pattern of leaderElection.qnt): a leading, clean,
-  /// idle reconciler cannot advance past the cadence without the
-  /// verify pass having run — the production loop runs verify every
-  /// VERIFY_EVERY rounds by construction.
+  /// loopInterval pattern of leaderElection.qnt): a clean, idle
+  /// reconciler — leader OR standby, since F1 — cannot advance past
+  /// the cadence without the verify pass having run; the production
+  /// loop reaches the verify gate every round at both polarities. The
+  /// peer-loop cap is the symmetric obligation: the peer pod runs the
+  /// same binary, so its divergence cannot outlive the same cadence
+  /// bound without its own loop (otherLoopConverge) having repaired
+  /// it — the obligation form of the symmetry argument the pre-F1
+  /// model left as prose.
+  // Mirrors: rio-lease/src/lib.rs:run_lease_loop_with_client
   action tickRound = all {
     clock < MAX_TIME,
-    (leadingOf("us", holder) and not(dirty) and task == NoTask) implies
+    (not(dirty) and task == NoTask) implies
       (clock + 1 - lastVerify <= VERIFY_EVERY),
+    // The peer pod's own cadence obligation (its loop is environment;
+    // the same machinery runs there by construction).
+    wrongUnder(marks, holder, "other") implies
+      (clock + 1 - wrongSince.get("other") <= VERIFY_EVERY + TASK_TIMEOUT),
     // The task-residency cap (production patch_timeout/call_timeout):
     // an in-flight API call cannot park past its request deadline —
     // the round after TASK_TIMEOUT it has either completed or failed.
@@ -246,7 +325,7 @@ module leaderMarks {
     clock' = clock + 1,
     holder' = holder, marks' = marks, marked' = marked,
     cleared' = cleared, task' = task,
-    lastVerify' = lastVerify, strips' = strips,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds,
     holderChanges' = holderChanges, rebounds' = rebounds,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock + 1),
@@ -265,7 +344,7 @@ module leaderMarks {
     marked' = if (leadingOf("us", h) != leadingOf("us", holder)) marked + 1 else marked,
     cleared' = cleared,
     marks' = marks, task' = task, clock' = clock,
-    lastVerify' = lastVerify, strips' = strips,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds,
     holderChanges' = holderChanges + 1, rebounds' = rebounds,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, h, wrongSince, clock),
@@ -278,23 +357,24 @@ module leaderMarks {
   /// PURELY a post-snapshot mark, the writer class the generation
   /// arithmetic exists to absorb (and the clobber the bool twin
   /// erases).
+  // Mirrors: rio-lease/src/lib.rs:observe_held_while_believing
   action reboundRedirty = all {
     rebounds < MAX_REBOUNDS,
     leadingOf("us", holder),
     marked' = marked + 1,
     cleared' = cleared,
     holder' = holder, marks' = marks, task' = task, clock' = clock,
-    lastVerify' = lastVerify, strips' = strips,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds,
     holderChanges' = holderChanges, rebounds' = rebounds + 1,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock),
     wrongCause' = stampCause(marks, holder, wrongSince, wrongCause, NoCause),
   }
 
-  /// THE FALSIFIER: an external actor strips a pod's marks — a foreign
-  /// sweep racing a re-acquire (the read-then-patch TOCTOU), kubectl,
-  /// any future actor. NO local generation moves: the whole point is
-  /// that the edge-writer set does not see it.
+  /// THE FALSIFIER, strip polarity: an external actor strips a pod's
+  /// marks — a foreign sweep racing a re-acquire (the read-then-patch
+  /// TOCTOU), kubectl, any future actor. NO local generation moves:
+  /// the whole point is that the edge-writer set does not see it.
   action externalStrip(p: Pod): bool = all {
     strips < MAX_STRIPS,
     marks.get(p),
@@ -303,25 +383,73 @@ module leaderMarks {
     holder' = holder, marked' = marked, cleared' = cleared,
     task' = task, clock' = clock,
     lastVerify' = lastVerify, holderChanges' = holderChanges,
+    adds' = adds,
     rebounds' = rebounds, clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks.put(p, false), holder, wrongSince, clock),
     wrongCause' = stampCause(marks.put(p, false), holder, wrongSince, wrongCause, ByStrip),
   }
 
+  /// THE FALSIFIER, add polarity (bughunt-13 F1): an external actor
+  /// ADDS leader marks to a pod — `kubectl label pod <standby>
+  /// …role=leader`, a foreign controller, any future actor. NO local
+  /// generation moves, no edge fires, the leader's own-pod verify
+  /// never sees this pod, and the peer sweep is dormant while the
+  /// holder's loop is clean ("Steady state spawns nothing.") — which
+  /// is exactly why the pre-F1 model's one-sided alphabet kept
+  /// marksDivergenceBounded green over a world where this state was
+  /// silently unbounded in production. An add on a pod already
+  /// carrying marks is a no-op and does not burn the budget.
+  action externalAdd(p: Pod): bool = all {
+    adds < MAX_ADDS,
+    not(marks.get(p)),
+    marks' = marks.put(p, true),
+    adds' = adds + 1,
+    holder' = holder, marked' = marked, cleared' = cleared,
+    task' = task, clock' = clock,
+    lastVerify' = lastVerify, holderChanges' = holderChanges,
+    strips' = strips,
+    rebounds' = rebounds, clobberErased' = clobberErased,
+    wrongSince' = stampWrong(marks.put(p, true), holder, wrongSince, clock),
+    wrongCause' = stampCause(marks.put(p, true), holder, wrongSince, wrongCause, ByAdd),
+  }
+
+  /// The PEER pod's own loop converging its own marks — the same
+  /// binary by construction: its edges, its lose-edge reconcile, its
+  /// own verify at both polarities (since F1), compressed to one
+  /// step. This reconciler's plane models "us"; the peer's plane is
+  /// environment with the tickRound cadence obligation as its
+  /// fairness — exactly the per-pod symmetry the production fleet
+  /// has, made structural instead of a comment.
+  // Environment: the peer pod's own lease loop (the identical binary, this plane's "us" machinery from its side) compressed to one converge step; fairness = the tickRound peer cadence cap
+  action otherLoopConverge = all {
+    wrongUnder(marks, holder, "other"),
+    marks' = marks.put("other", leadingOf("other", holder)),
+    holder' = holder, marked' = marked, cleared' = cleared,
+    task' = task, clock' = clock,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds,
+    holderChanges' = holderChanges, rebounds' = rebounds,
+    clobberErased' = clobberErased,
+    wrongSince' = stampWrong(marks.put("other", leadingOf("other", holder)), holder, wrongSince, clock),
+    wrongCause' = stampCause(marks.put("other", leadingOf("other", holder)), holder, wrongSince, wrongCause, NoCause),
+  }
+
   /// The bounded-cadence verify pass (sched.lease.marks-verify): a
-  /// leading, clean, idle reconciler reads its OWN pod and MARKS on
-  /// divergence (store(true) became mark() — bug_181). Enabled any
-  /// round (the cadence cap on tickRound FORCES it within
+  /// clean, idle reconciler — AT EITHER LEADERSHIP POLARITY, since F1
+  /// — reads its OWN pod and MARKS on divergence (store(true) became
+  /// mark() — bug_181). The standby polarity is the F1 detector: a
+  /// foreign add on a non-leading pod is a divergence at
+  /// leading=false, and the re-dirtied reconcile strips it. Enabled
+  /// any round (the cadence cap on tickRound FORCES it within
   /// VERIFY_EVERY; firing earlier is sound).
+  // Mirrors: rio-lease/src/lib.rs:spawn_verify_leader_marks
   action verify = all {
-    leadingOf("us", holder),
     not(dirty),
     task == NoTask,
     lastVerify' = clock,
     marked' = if (wrongUnder(marks, holder, "us")) marked + 1 else marked,
     cleared' = cleared,
     holder' = holder, marks' = marks, task' = task, clock' = clock,
-    strips' = strips, holderChanges' = holderChanges,
+    strips' = strips, adds' = adds, holderChanges' = holderChanges,
     rebounds' = rebounds, clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock),
     wrongCause' = stampCause(marks, holder, wrongSince, wrongCause, NoCause),
@@ -331,13 +459,14 @@ module leaderMarks {
   /// the holder (the same-pass Lease read of the holder-aware sweep —
   /// rider R2), and the DirtyGen SNAPSHOT the eventual clear will
   /// clear through (production: loop reads marked at spawn).
+  // Mirrors: rio-lease/src/lib.rs:maybe_spawn_leader_marks
   action reconcileSpawn = all {
     dirty,
     task == NoTask,
     task' = Reconcile({ polarity: leadingOf("us", holder), sweepHolder: holder, snap: marked, since: clock }),
     holder' = holder, marks' = marks, marked' = marked,
     cleared' = cleared, clock' = clock,
-    lastVerify' = lastVerify, strips' = strips,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds,
     holderChanges' = holderChanges, rebounds' = rebounds,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock),
@@ -375,6 +504,7 @@ module leaderMarks {
   /// spared). The flag is NOT touched here: the clear is a separate
   /// transition (production: the task returns, THEN the loop clears),
   /// which is exactly where the bool encoding lost its race.
+  // Mirrors: rio-lease/src/lib.rs:spawn_patch_leader_marks
   action reconcilePatched = {
     val newMarks = PODS.mapBy(p =>
       if (p == "us") taskPolarity
@@ -386,7 +516,7 @@ module leaderMarks {
       task' = Patched({ snap: taskSnap, since: taskSince }),
       holder' = holder, marked' = marked, cleared' = cleared,
       clock' = clock, lastVerify' = lastVerify,
-      strips' = strips, holderChanges' = holderChanges,
+      strips' = strips, adds' = adds, holderChanges' = holderChanges,
       rebounds' = rebounds, clobberErased' = clobberErased,
       wrongSince' = stampWrong(newMarks, holder, wrongSince, clock),
       wrongCause' = stampCause(newMarks, holder, wrongSince, wrongCause, ByWrite),
@@ -401,6 +531,7 @@ module leaderMarks {
   /// transition's own values: did this clear erase a post-snapshot
   /// mark? (clean afterwards AND marks existed past the snapshot).
   /// Identically false here; the bool twin's clear-all makes it fire.
+  // Mirrors: rio-lease/src/lib.rs:clear_through
   action reconcileClear = {
     val newCleared = if (taskSnap > cleared) taskSnap else cleared
     all {
@@ -411,7 +542,7 @@ module leaderMarks {
       task' = NoTask,
       holder' = holder, marks' = marks, marked' = marked,
       clock' = clock, lastVerify' = lastVerify,
-      strips' = strips, holderChanges' = holderChanges,
+      strips' = strips, adds' = adds, holderChanges' = holderChanges,
       rebounds' = rebounds,
       wrongSince' = stampWrong(marks, holder, wrongSince, clock),
       wrongCause' = stampCause(marks, holder, wrongSince, wrongCause, NoCause),
@@ -421,12 +552,13 @@ module leaderMarks {
   /// The reconcile fails (apiserver error/timeout, EITHER phase): slot
   /// freed, generations untouched — marked > cleared still holds, the
   /// level-triggered retry contract with no store(true) re-arm needed.
+  // Mirrors: rio-lease/src/lib.rs:spawn_patch_leader_marks
   action reconcileFail = all {
     task != NoTask,
     task' = NoTask,
     holder' = holder, marks' = marks, marked' = marked,
     cleared' = cleared, clock' = clock,
-    lastVerify' = lastVerify, strips' = strips,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds,
     holderChanges' = holderChanges, rebounds' = rebounds,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock),
@@ -444,6 +576,7 @@ module leaderMarks {
     clock' = 0,
     lastVerify' = 0,
     strips' = 0,
+    adds' = 0,
     holderChanges' = 0,
     rebounds' = 0,
     clobberErased' = false,
@@ -451,13 +584,22 @@ module leaderMarks {
     wrongCause' = PODS.mapBy(p => NoCause),
   }
 
+  /// The Lease changes hands (steal, graceful release + steal, the
+  /// environment's election); see holderChange.
+  // Environment: the Lease moving at the apiserver is the election plane's move (leaderElection.qnt owns it); the fused same-transition edge-mark abstracts the production acquire/lose arms' mark() in run_lease_loop_with_client
   action holderChangeAny = {
     nondet h = Set(NoLeader, Leader("us"), Leader("other")).oneOf()
     holderChange(h)
   }
+  // Environment: the strip falsifier — kubectl label removal / a foreign sweep racing a re-acquire; budgeted MAX_STRIPS, and no local generation moves by design (the edge-writer set does not see it)
   action externalStripAny = {
     nondet p = PODS.oneOf()
     externalStrip(p)
+  }
+  // Environment: the add falsifier (F1) — kubectl label / a foreign controller stamping leader marks; budgeted MAX_ADDS, and no local generation moves by design (the edge-writer set does not see it)
+  action externalAddAny = {
+    nondet p = PODS.oneOf()
+    externalAdd(p)
   }
 
   action step = any {
@@ -465,6 +607,8 @@ module leaderMarks {
     holderChangeAny,
     reboundRedirty,
     externalStripAny,
+    externalAddAny,
+    otherLoopConverge,
     verify,
     reconcileSpawn,
     reconcilePatched,
@@ -495,6 +639,34 @@ module leaderMarks {
         wrongSince.get("us") == -1,
       })
 
+  /// The F1 structural close, end to end: converge as STANDBY (the
+  /// peer holds the Lease), get externally LABELED leader (`kubectl
+  /// label pod <standby> …role=leader` — no edge, no generation move,
+  /// the leader's verify blind to this pod, the peer sweep dormant),
+  /// and the standby's own cadence-forced verify re-discovers and the
+  /// next reconcile STRIPS — the divergence is bounded at the
+  /// polarity the pre-F1 alphabet could not even represent.
+  run standbyStripConvergesRun =
+    init
+      .then(holderChange(Leader("other")))
+      .then(otherLoopConverge)
+      .then(reconcileSpawn)
+      .then(reconcilePatched)
+      .then(reconcileClear)
+      .then(externalAdd("us"))
+      .then(tickRound)
+      .then(tickRound)
+      .then(verify)
+      .then(reconcileSpawn)
+      .then(reconcilePatched)
+      .then(reconcileClear)
+      .expect(all {
+        not(marks.get("us")),
+        marks.get("other"),
+        not(dirty),
+        wrongSince.get("us") == -1,
+      })
+
   /// The DirtyGen save, end to end: a rebound marks BETWEEN the API
   /// write and the clear, and the clear-through arithmetic keeps the
   /// loop dirty — the post-snapshot mark survives (the bool encoding
@@ -514,13 +686,14 @@ module leaderMarks {
 }
 
 // =========================================================================
-// The wired regime: small cadence, one strip, two holder changes, one
-// rebound.
+// The wired regime: small cadence, one strip, ONE ADD (the F1
+// polarity), two holder changes, one rebound.
 module leaderMarksBase {
   import leaderMarks(
     VERIFY_EVERY = 3,
     MAX_TIME = 10,
     MAX_STRIPS = 1,
+    MAX_ADDS = 1,
     MAX_HOLDER_CHANGES = 2,
     MAX_REBOUNDS = 1,
     TASK_TIMEOUT = 4

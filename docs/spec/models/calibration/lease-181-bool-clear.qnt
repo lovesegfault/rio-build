@@ -35,6 +35,7 @@ module leaseCalib181BoolClear {
     VERIFY_EVERY = 3,
     MAX_TIME = 10,
     MAX_STRIPS = 1,
+    MAX_ADDS = 0,
     MAX_HOLDER_CHANGES = 2,
     MAX_REBOUNDS = 1,
     TASK_TIMEOUT = 4
@@ -54,7 +55,7 @@ module leaseCalib181BoolClear {
       task' = NoTask,
       holder' = holder, marks' = marks, marked' = marked,
       clock' = clock, lastVerify' = lastVerify,
-      strips' = strips, holderChanges' = holderChanges,
+      strips' = strips, adds' = adds, holderChanges' = holderChanges,
       rebounds' = rebounds,
       wrongSince' = stampWrong(marks, holder, wrongSince, clock),
       wrongCause' = stampCause(marks, holder, wrongSince, wrongCause, NoCause),

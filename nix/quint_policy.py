@@ -290,8 +290,6 @@ P8_GRANDFATHER: frozenset = frozenset(
         "leaderElectionShutdown",
         "leaderElectionStepDown",
         "leaderElectionSuspend",
-        "leaderMarks",
-        "leaderMarksBase",
         "leaseCalib002ActFailedFrozenNoClear",
         "leaseCalib002StaleDeferral",
         "leaseCalib085BlindConflictLose",

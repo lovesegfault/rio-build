@@ -1731,34 +1731,49 @@ rec {
     };
 
     # The leader-marks reconciliation model (bughunt-wave F1
-    # merged_bug_138; DirtyGen rework bughunt2-wave slot 8 bug_181):
-    # the deletion-cost/label machinery as a level-triggered protocol —
+    # merged_bug_138; DirtyGen rework bughunt2-wave slot 8 bug_181;
+    # BOTH falsifier polarities since the bughunt-13 audit F1): the
+    # deletion-cost/label machinery as a level-triggered protocol —
     # edge writers that MARK a generation counter, the single-flight
     # reconcile split into its API-write and flag-clear phases, the
-    # holder-aware sweep (captured-holder skip), the external falsifier
-    # (a strip no edge writer sees), the rebound dirtying site
+    # holder-aware sweep (captured-holder skip), BOTH external
+    # falsifier polarities (the strip no edge writer sees AND the add
+    # no edge writer sees — `kubectl label pod <standby> role=leader`,
+    # unrepresentable pre-F1 while the spec claimed ANY falsifier
+    # bounded), the peer pod's own loop (otherLoopConverge — the
+    # symmetry argument made structural), the rebound dirtying site
     # (merged_bug_212's hook — the "future writer" class the
     # generation arithmetic absorbs), and the bounded-cadence verify
-    # pass. Headlines: marksDivergenceBounded (cause-tagged — OUR
-    # pod's divergence is discovered, or strip-caused and younger than
-    # the verify cadence plus the task-parking deadline; edge- and
-    # stale-write-caused divergence carries NO age window because the
-    # edge marked in the same transition) and notClobbered (no clear
-    # erases a post-snapshot mark — the DirtyGen clear-through
+    # pass at BOTH leadership polarities. Headlines:
+    # marksDivergenceBounded (cause-tagged — OUR pod's divergence is
+    # discovered, or externally caused (ByStrip OR ByAdd) and younger
+    # than the verify cadence plus the task-parking deadline; edge-
+    # and stale-write-caused divergence carries NO age window because
+    # the edge marked in the same transition), peerDivergenceBounded
+    # (the peer's divergence — any cause, including our sweep's
+    # read-then-patch TOCTOU — clears within the same cadence bound:
+    # the claim the pre-F1 model carried as prose beside the sweep),
+    # nonLeaderDivergenceBounded (THE F1 bound: a non-leading pod
+    # carrying leader marks is discovered or converged within one
+    # standby cadence + parking, for EVERY pod), and notClobbered (no
+    # clear erases a post-snapshot mark — the DirtyGen clear-through
     # arithmetic itself). The wrongSince/wrongCause stamps are single
     # derived helpers applied in EVERY action (no enumerated writer
     # list), which is what keeps the green verdict non-vacuous; the
     # paired pins are quint-lease-calib-138-edge-only (verify pass
-    # removed must falsify the bound) and
-    # quint-lease-calib-181-bool-clear (bool clear-all restored must
-    # falsify notClobbered). The holder-aware sweep half is encoded
-    # structurally (reconcilePatched) and pinned at the production
-    # level by peer_sweep_spares_current_lease_holder — see the model
-    # comment for why a model invariant there would be decorative
-    # (the spawn-to-complete TOCTOU is a real, verify-bounded
-    # residual). Measured: exhaustive TLC ~4s at the wired constants
-    # (transcript is authoritative) — the default 1800s budget is
-    # ~450x headroom.
+    # removed must falsify the bound),
+    # quint-lease-calib-f1-standby-add (the leader-only verify world
+    # restored + the add enabled must falsify
+    # nonLeaderDivergenceBounded — the F1 red, reproduced then
+    # killed), and quint-lease-calib-181-bool-clear (bool clear-all
+    # restored must falsify notClobbered). The holder-aware sweep half
+    # is encoded structurally (reconcilePatched) and pinned at the
+    # production level by peer_sweep_spares_current_lease_holder; its
+    # spawn-to-complete TOCTOU residual is now CHECKED rather than
+    # commented — the victim's own loop re-discovers within the
+    # peerDivergenceBounded window. Measured: exhaustive TLC ~13s at
+    # the wired constants (transcript in the introducing commit) —
+    # the default 1800s budget is >100x headroom.
     # r[verify sched.lease.marks-verify]
     # r[verify sched.lease.deletion-cost+3]
     quint-leader-marks = mkQuintCheck {
@@ -1768,6 +1783,8 @@ rec {
       invariants = [
         "boundsOK"
         "marksDivergenceBounded"
+        "peerDivergenceBounded"
+        "nonLeaderDivergenceBounded"
         "notClobbered"
       ];
     };
@@ -1779,6 +1796,16 @@ rec {
       spec = "leaderMarks";
       main = "leaderMarksBase";
       witness = "noStrip";
+    };
+
+    # Non-vacuity witness: the external ADD actually fires in the
+    # explored space — the nonLeaderDivergenceBounded verdict above is
+    # about a space where the F1 falsifier polarity bites.
+    quint-leader-marks-witness-add = mkQuintWitnessCheck {
+      name = "leader-marks-witness-add";
+      spec = "leaderMarks";
+      main = "leaderMarksBase";
+      witness = "noAdd";
     };
 
     # Non-vacuity witness: the rebound dirtying site actually fires in
@@ -1793,6 +1820,9 @@ rec {
 
     # Deterministic named-run replays (verifyConvergesRun: strip →
     # cadence-forced verify → re-discovery → re-assert;
+    # standbyStripConvergesRun: the F1 close end to end — a standby
+    # externally labeled leader is re-discovered by its OWN
+    # cadence-forced verify and the next reconcile strips;
     # clearKeepsPostSnapMarkRun: a rebound marks between the API write
     # and the clear, and the clear-through arithmetic keeps the loop
     # dirty — the DirtyGen save, end to end).
@@ -1929,6 +1959,23 @@ rec {
       spec = "calibration/lease-138-edge-only";
       main = "leaseCalib138EdgeOnly";
       witness = "marksDivergenceBounded";
+      step = "calibStep";
+      extraSpecs = [ "leaderMarks" ];
+    };
+
+    # bughunt-13 audit F1 pre-fix: LEADER-ONLY verify (the now_leading
+    # spawn gate + the leading=true hardcode restored) with the
+    # mark-ADD falsifier enabled — the pre-F1 production world the
+    # pre-F1 MODEL could not represent. A `kubectl label` on the
+    # standby ages unboundedly with the generations clean, no task,
+    # and no detector whose clock the falsified state cannot gate;
+    # nonLeaderDivergenceBounded falls. The F1 red, frozen as the
+    # permanent regression pin for the standby self-check.
+    quint-lease-calib-f1-standby-add = mkQuintWitnessCheck {
+      name = "lease-calib-f1-standby-add";
+      spec = "calibration/lease-f1-standby-add";
+      main = "leaseCalibF1StandbyAdd";
+      witness = "nonLeaderDivergenceBounded";
       step = "calibStep";
       extraSpecs = [ "leaderMarks" ];
     };
