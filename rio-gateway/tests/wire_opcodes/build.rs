@@ -3556,94 +3556,25 @@ async fn test_build_paths_submit_retry_budget_exhausts() -> anyhow::Result<()> {
 // surface (the mock's captured per-call x-rio-tenant-token metadata and the
 // wire-read BuildResult).
 
-/// live_064 (WO-S10-9 + WO-S10-10, the recovery half): a re-attach rejected
-/// UNAUTHENTICATED re-mints the session token and the IMMEDIATE retry
-/// resumes the build — exactly two WatchBuild calls (no budget burn), the
-/// second carrying a DIFFERENT, freshly minted token, and the build
-/// completes successfully.
+/// W14-A1 + W14-A1b + W14-A3 (merged_bug_005, R34-w(iii) — red-first): a
+/// WatchBuild re-attach rejected UNAUTHENTICATED on a token WELL WITHIN
+/// its TTL (the harness mint is `exp = now + 3600`) is `NotLocallyHealable`
+/// and the watch fails fast on the FIRST rejection with the auth evidence
+/// — no re-mint, no retry, the one-shot budget never spent. The verifier
+/// rejected the token for a cause re-signing with the SAME boot-time key
+/// cannot change (W14-A1: revoked jti, the operator denial; W14-A1b:
+/// unknown verify key, the rotation claim's runtime negative).
 ///
-/// Pre-fix red (strawman disclosure — the snapshot signature cannot host
-/// the provider; the red is the incident's own evidence): every re-attach
-/// carried the byte-identical submit-time token, all eleven were rejected
-/// UNAUTHENTICATED, and the build failed despite a healthy scheduler.
-// r[verify gw.jwt.refresh-on-expiry+2]
-#[tokio::test(flavor = "current_thread")]
-async fn test_reattach_unauthenticated_remints_and_resumes() -> anyhow::Result<()> {
-    let (mut h, initial_token) = GatewaySession::new_with_minted_jwt_handshake().await?;
-    // SubmitBuild stream: Started, then close without a terminal event →
-    // the watch loop must re-attach.
-    h.scheduler.set_submit_outcome(SubmitOutcome::close_early());
-    // First WatchBuild: rejected UNAUTHENTICATED (the rotated-key face).
-    // Second: serves the snapshot + Completed.
-    h.scheduler
-        .watch_unauth_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
-    h.scheduler.set_watch_outcome(WatchOutcome {
-        scripted_events: Some(vec![
-            active_snapshot(1),
-            ev(build_event::Event::Completed(types::BuildCompleted {
-                output_paths: vec![],
-            })),
-        ]),
-        ..Default::default()
-    });
-    let drv_path = seed_minimal_drv(&h);
-
-    // Opcode 46 so the BuildResult comes back structured.
-    wire_send!(&mut h.stream;
-        u64: 46,
-        strings: &[format!("{drv_path}!out")],
-        u64: 0,
-    );
-
-    let _frames = collect_stderr_frames(&mut h.stream).await;
-    let count = wire::read_u64(&mut h.stream).await?;
-    assert_eq!(count, 1);
-    let _derived_path = wire::read_string(&mut h.stream).await?;
-    let status = wire::read_u64(&mut h.stream).await?;
-    let error_msg = wire::read_string(&mut h.stream).await?;
-    assert_eq!(
-        status, 0,
-        "the re-minted re-attach must resume and complete the build; error_msg: {error_msg}"
-    );
-
-    let watch_md = h.scheduler.watch_metadata.read().unwrap().clone();
-    assert_eq!(
-        watch_md.len(),
-        2,
-        "exactly one rejected attempt + one re-minted retry (no budget burn): {watch_md:?}"
-    );
-    let first = watch_md[0]
-        .as_deref()
-        .expect("first re-attach carried a token");
-    let second = watch_md[1].as_deref().expect("retry carried a token");
-    assert_ne!(
-        first, second,
-        "the retry must carry a freshly minted token, not replay the rejected one"
-    );
-    assert_eq!(
-        first, initial_token,
-        "the first re-attach carries the session's current mint (precondition \
-         for the re-mint discrimination above)"
-    );
-
-    h.finish().await;
-    Ok(())
-}
-
-/// live_064 (WO-S10-10, the honest-exhaustion half): when the re-minted
-/// retry is ALSO rejected UNAUTHENTICATED, the watch fails fast — exactly
-/// two WatchBuild calls, not a MAX_RECONNECT budget burn — and the surfaced
-/// failure carries the auth evidence instead of the retired
-/// "(scheduler disconnected?)" speculation.
-///
-/// Pre-fix red (the incident verbatim): eleven identical rejections, then
-/// "build stream error (reconnect exhausted): build event stream ended
-/// unexpectedly (scheduler disconnected?)" — zero auth evidence.
-// r[verify gw.jwt.refresh-on-expiry+2]
+/// Pre-fix RED (the wave-13 unconditional `note_rejected`): the rejection
+/// re-minted with a FRESH jti and retried — the operator's per-jti
+/// revocation healed around in one cycle, and the rotation case burned
+/// the one-shot on a token signed with the same key the verifier just
+/// refused. live_064's eleven-identical-rejections incident is the
+/// upstream pre-fix shape both wave-13 and this close repair.
+// r[verify gw.jwt.remint-local-expiry-only]
 #[tokio::test(flavor = "current_thread")]
 async fn test_reattach_unauthenticated_fails_fast_with_auth_evidence() -> anyhow::Result<()> {
-    let (mut h, _initial_token) = GatewaySession::new_with_minted_jwt_handshake().await?;
+    let (mut h, initial_token) = GatewaySession::new_with_minted_jwt_handshake().await?;
     h.scheduler.set_submit_outcome(SubmitOutcome::close_early());
     // Every WatchBuild attempt is rejected: the session's key material is
     // no longer accepted at all (revoked tenant / signer mismatch).
@@ -3687,9 +3618,20 @@ async fn test_reattach_unauthenticated_fails_fast_with_auth_evidence() -> anyhow
 
     let watch_calls = h.scheduler.watch_calls.read().unwrap().len();
     assert_eq!(
-        watch_calls, 2,
-        "one rejection + the one-shot re-minted retry, then fail-fast — \
-         never a MAX_RECONNECT burn on a verdict that cannot change"
+        watch_calls, 1,
+        "one rejection, fail-fast immediately — no re-mint on a verdict that \
+         cannot change locally (W14-A3: the one-shot budget is never spent on \
+         a NotLocallyHealable cause)"
+    );
+    let watch_md = h.scheduler.watch_metadata.read().unwrap().clone();
+    let sent = watch_md[0]
+        .as_deref()
+        .expect("the re-attach carried a token");
+    assert_eq!(
+        sent, initial_token,
+        "no re-mint: the re-attach carries the session's current mint and \
+         it is surfaced honestly when rejected (pre-fix this re-minted with \
+         a fresh jti and silently overrode the operator denial)"
     );
 
     h.finish().await;

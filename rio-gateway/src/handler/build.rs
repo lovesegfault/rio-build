@@ -2069,6 +2069,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     active_build_ids: &mut HashSet<String>,
     session_jwt: crate::server::session_jwt::SessionTokenSource,
 ) -> anyhow::Result<BuildResult> {
+    use crate::server::session_jwt::RemintCause;
     // Gateway is the trace ROOT (Nix doesn't speak W3C trace context).
     // with_jwt injects the enclosing span's context + tenant JWT — this
     // is THE hop that makes distributed tracing work; without it,
@@ -2389,30 +2390,43 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                         }
                     }
                     Err(wb_err) => {
-                        // live_064: an UNAUTHENTICATED open means the
-                        // CARRIED TOKEN was rejected (expired under a
-                        // rotated key, or revoked) — retrying with the
-                        // same material cannot succeed, and the
-                        // incident burned its whole budget doing
-                        // exactly that. One forced re-mint + an
-                        // immediate retry (no budget charge, no
-                        // backoff: the scheduler is healthy and
-                        // answering); a second rejection after the
-                        // re-mint fails fast with the auth evidence.
+                        // live_064 + merged_bug_005 (R34-w(iii)): an
+                        // UNAUTHENTICATED open means the CARRIED TOKEN
+                        // was rejected. The gateway is the issuer, so
+                        // the only cause it can locally VERIFY as
+                        // heal-able is its own clock against the
+                        // token's own exp — a re-mint then produces a
+                        // token the verifier accepts. Any other
+                        // Unauthenticated (revoked jti, unknown key,
+                        // malformed) is not locally heal-able: a
+                        // re-mint would silently override an operator
+                        // denial or burn the one-shot on a token signed
+                        // with the same key the verifier just refused.
+                        // Surface those honestly with the auth
+                        // evidence; never re-mint.
                         if wb_err.code() == tonic::Code::Unauthenticated {
-                            if !unauth_remint_spent {
-                                unauth_remint_spent = true;
-                                session_jwt.note_rejected();
-                                tracing::warn!(
-                                    %build_id, error = %wb_err,
-                                    "WatchBuild re-attach rejected UNAUTHENTICATED; re-minting the session token and retrying immediately"
-                                );
-                                continue;
+                            match session_jwt.note_rejected() {
+                                RemintCause::LocalExpiry if !unauth_remint_spent => {
+                                    unauth_remint_spent = true;
+                                    tracing::warn!(
+                                        %build_id, error = %wb_err,
+                                        "WatchBuild re-attach rejected UNAUTHENTICATED; the carried token is past local expiry, re-minting and retrying immediately"
+                                    );
+                                    continue;
+                                }
+                                RemintCause::LocalExpiry => {
+                                    tracing::warn!(
+                                        %build_id, error = %wb_err,
+                                        "WatchBuild re-attach rejected UNAUTHENTICATED after a local-expiry re-mint; failing the watch with the auth evidence"
+                                    );
+                                }
+                                RemintCause::NotLocallyHealable => {
+                                    tracing::warn!(
+                                        %build_id, error = %wb_err,
+                                        "WatchBuild re-attach rejected UNAUTHENTICATED with the carried token well within its TTL (revoked jti or unknown verify key); not re-minting, failing the watch with the auth evidence"
+                                    );
+                                }
                             }
-                            tracing::warn!(
-                                %build_id, error = %wb_err,
-                                "WatchBuild re-attach rejected UNAUTHENTICATED after a re-mint; failing the watch with the auth evidence"
-                            );
                             break Err(StreamProcessError::ReattachAuthRejected);
                         }
                         // Other codes: scheduler still down (transient

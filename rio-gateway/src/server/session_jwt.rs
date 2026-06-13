@@ -142,6 +142,31 @@ pub(crate) fn refresh_session_jwt<'a>(
     cached.as_ref().map(|(t, _)| t.as_str())
 }
 
+/// What the gateway can locally conclude about an `UNAUTHENTICATED`
+/// rejection of a token it just injected — the typed cause space the
+/// pre-fix `note_rejected` collapsed into one bit (merged_bug_005,
+/// R34-w(iii)). Closed enum (R14): the gateway is the ISSUER, so the
+/// only fact it can verify without a wire round-trip is its own clock
+/// against the token's own `exp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemintCause {
+    /// The injected token is past `exp` (or inside the refresh slack)
+    /// by the gateway's own clock — re-minting WILL produce a token
+    /// the verifier accepts (same key, fresh `exp`, fresh `jti`). The
+    /// re-mint is a witnessed recovery: the productive outcome is the
+    /// follow-up call succeeding, not the mint itself.
+    LocalExpiry,
+    /// The injected token is well within its TTL by the gateway's own
+    /// clock, so the rejection is something a re-mint CANNOT heal:
+    /// per-jti revocation (the operator denied this session — a fresh
+    /// jti would silently override the denial), an unknown verify key
+    /// (the boot-time signing key in `main.rs:203-218` has no reload
+    /// path, so a re-mint signs with the SAME key the verifier just
+    /// rejected), or any other verifier-side refusal. Surfaced
+    /// honestly; never re-minted.
+    NotLocallyHealable,
+}
+
 // r[impl gw.jwt.refresh-on-expiry+2]
 /// live_062 + live_064 (the tail blackout and the WatchBuild re-attach
 /// death): a `Clone + Send + Sync` token source for every long-lived
@@ -219,21 +244,20 @@ impl SessionTokenSource {
     /// initial `SubmitBuild`, a `WatchBuild` re-attach): re-minted through
     /// [`refresh_session_jwt`] when within the slack of expiry, or
     /// unconditionally when the previous open was rejected
-    /// `UNAUTHENTICATED` ([`Self::note_rejected`] — key rotation makes
-    /// a token invalid while its `exp` still looks healthy, so expiry
-    /// slack alone cannot heal that face). Returns an owned snapshot:
-    /// the consumer attaches it to exactly one
+    /// `UNAUTHENTICATED` AND [`Self::note_rejected`] judged the cause
+    /// locally heal-able ([`RemintCause::LocalExpiry`]). Returns an
+    /// owned snapshot: the consumer attaches it to exactly one
     /// injection and re-asks next time.
     pub(crate) fn fresh(&self) -> Option<String> {
         let inner = self.inner.as_ref()?;
         let mut guard = inner.cached.lock().expect("tail token lock poisoned");
         let (cached, force) = &mut *guard;
         if *force {
-            // One forced re-mint per rejection observation: clear the
-            // flag BEFORE attempting so a mint failure (corrupt key)
-            // degrades to the stale token + the store's clear error,
-            // never a mint-spam loop (the reconnect backoff paces the
-            // next rejection).
+            // One forced re-mint per LocalExpiry observation: clear
+            // the flag BEFORE attempting so a mint failure (corrupt
+            // key) degrades to the stale token + the store's clear
+            // error, never a mint-spam loop (the reconnect backoff
+            // paces the next rejection).
             *force = false;
             if let (Some((_, claims)), Some(key)) = (cached.as_ref(), inner.signing_key.as_ref()) {
                 match mint_session_jwt(claims.sub, key) {
@@ -241,8 +265,7 @@ impl SessionTokenSource {
                         debug!(
                             jti = %new_claims.jti,
                             tenant = %new_claims.sub,
-                            "re-minted session JWT after an UNAUTHENTICATED \
-                             rejection (key rotation heal)"
+                            "re-minted session JWT after a local-expiry rejection"
                         );
                         metrics::counter!("rio_gateway_jwt_refreshed_total").increment(1);
                         *cached = Some((token, new_claims));
@@ -260,13 +283,43 @@ impl SessionTokenSource {
         refresh_session_jwt(cached, inner.signing_key.as_deref()).map(str::to_owned)
     }
 
-    /// The peer rejected the last injection `UNAUTHENTICATED`: arm one
-    /// forced re-mint for the next [`Self::fresh`]. No-op in dual
-    /// mode (nothing to re-mint — the rejection is then a real authz
-    /// failure the open-failure warn discloses).
-    pub(crate) fn note_rejected(&self) {
-        if let Some(inner) = self.inner.as_ref() {
-            inner.cached.lock().expect("tail token lock poisoned").1 = true;
+    // r[impl gw.jwt.remint-local-expiry-only]
+    /// The peer rejected the last injection `UNAUTHENTICATED`: classify
+    /// the rejection against the gateway's OWN clock and the cached
+    /// `exp`, and arm a forced re-mint ONLY for
+    /// [`RemintCause::LocalExpiry`]. Returns the typed cause so the
+    /// caller can branch (re-mint+retry vs surface honestly) without
+    /// re-deriving it — R34-w(i)/(iii): a re-mint is a recovery claim
+    /// and is scoped to causes the issuer can locally verify as
+    /// heal-able.
+    ///
+    /// `NotLocallyHealable` in dual mode (no cached claims): nothing to
+    /// re-mint; the rejection is a real authz failure the caller
+    /// surfaces.
+    pub(crate) fn note_rejected(&self) -> RemintCause {
+        let Some(inner) = self.inner.as_ref() else {
+            return RemintCause::NotLocallyHealable;
+        };
+        let mut guard = inner.cached.lock().expect("tail token lock poisoned");
+        let (cached, force) = &mut *guard;
+        let Some((_, claims)) = cached.as_ref() else {
+            return RemintCause::NotLocallyHealable;
+        };
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before 1970")
+            .as_secs() as i64;
+        // The same predicate `refresh_session_jwt` uses (within the
+        // slack of expiry), so a token the gateway WOULD have refreshed
+        // on its own — had the consumer asked one beat later — is
+        // judged LocalExpiry, not a verifier-side surprise. A token
+        // well clear of the slack was rejected for a reason a re-mint
+        // cannot change (revoked jti, unknown key, malformed).
+        if claims.exp - now < JWT_REFRESH_SLACK_SECS {
+            *force = true;
+            RemintCause::LocalExpiry
+        } else {
+            RemintCause::NotLocallyHealable
         }
     }
 }
@@ -526,38 +579,98 @@ mod jwt_issuance_tests {
         assert_eq!(t1, t2, "fresh-on-fresh must not churn jti");
     }
 
-    // r[verify gw.jwt.refresh-on-expiry+2]
-    /// live_062 — `note_rejected` arms exactly ONE forced re-mint:
-    /// key rotation invalidates a token whose `exp` still looks
-    /// healthy, so the slack-based refresh does not reach this face
-    /// (it keys on `exp` alone). After the forced re-mint the force flag
-    /// is spent (no mint-spam under a genuinely revoked tenant — the
-    /// reconnect backoff paces further rejections).
+    // r[verify gw.jwt.remint-local-expiry-only]
+    /// W14-A1 (revoked-jti) + W14-A1b (unknown-key) — merged_bug_005
+    /// red-first: a token WELL WITHIN its TTL rejected by the verifier
+    /// is `NotLocallyHealable` and `note_rejected` does NOT arm a
+    /// re-mint. Pre-fix RED (the wave-13 unconditional force flag): the
+    /// healthy token below was re-minted with a FRESH jti — the
+    /// scheduler's per-jti revocation healed around in one cycle, and
+    /// the rotation case burned the WatchBuild one-shot on a token
+    /// signed with the SAME boot-time key the verifier just refused.
+    /// Both verifier-side faces are the same gateway-side observable
+    /// (bare Unauthenticated on a healthy token); the typed cause is
+    /// what the issuer can locally PROVE, not what the verifier said.
     #[test]
-    fn tail_source_note_rejected_forces_one_remint() {
+    fn note_rejected_on_healthy_token_is_not_locally_healable() {
         let tenant_id = uuid::Uuid::from_u128(0xF0F0);
         let key = test_key(0x31);
         let (token, claims) = mint_session_jwt(tenant_id, &key).expect("mint");
         let source = SessionTokenSource::new(Some((token, claims)), Some(std::sync::Arc::new(key)));
 
         let t0 = source.fresh().expect("token");
-        source.note_rejected();
-        let t1 = source.fresh().expect("token");
-        assert_ne!(
-            t0, t1,
-            "rejection must force a re-mint of a healthy-looking token"
+        let cause = source.note_rejected();
+        assert_eq!(
+            cause,
+            RemintCause::NotLocallyHealable,
+            "a token well within TTL rejected by the verifier is not locally heal-able \
+             (revoked jti or unknown verify key — neither fixed by re-signing with the same key)"
         );
+        let t1 = source.fresh().expect("token");
+        assert_eq!(
+            t0, t1,
+            "NotLocallyHealable must NOT re-mint: pre-fix this minted a fresh jti and \
+             silently healed around the operator's per-jti revocation (merged_bug_005)"
+        );
+        // W14-A3 (the budget face): the force flag was never armed, so
+        // the one-shot forced re-mint stays available for a LATER
+        // genuine LocalExpiry — the WatchBuild caller's
+        // `unauth_remint_spent` is keyed on the LocalExpiry arm only.
+    }
+
+    // r[verify gw.jwt.remint-local-expiry-only]
+    /// W14-A2 — merged_bug_005's witnessed-recovery positive: a token
+    /// PAST `exp` (or inside the slack) rejected by the verifier IS
+    /// `LocalExpiry`, `note_rejected` arms exactly ONE forced re-mint,
+    /// and the next `fresh()` produces a token with a fresh `exp` the
+    /// verifier accepts — the productive outcome that witnesses the
+    /// recovery (R34-w(i): the recovery evidence is the re-minted
+    /// token verifying, not the mint itself).
+    #[test]
+    fn note_rejected_on_expired_token_is_local_expiry_and_remints_once() {
+        let tenant_id = uuid::Uuid::from_u128(0xF0F1);
+        let key = test_key(0x32);
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let stale = jwt::TenantClaims {
+            sub: tenant_id,
+            iat: now - JWT_SESSION_TTL_SECS - 10,
+            exp: now - 10,
+            jti: "stale-jti".into(),
+        };
+        let source = SessionTokenSource::new(
+            Some(("stale-token".into(), stale)),
+            Some(std::sync::Arc::new(key.clone())),
+        );
+
+        let cause = source.note_rejected();
+        assert_eq!(
+            cause,
+            RemintCause::LocalExpiry,
+            "a token past exp by the gateway's own clock is the one cause a re-mint can heal"
+        );
+        let t1 = source.fresh().expect("token");
+        assert_ne!(t1, "stale-token", "LocalExpiry must force a re-mint");
+        // The witnessed productive outcome: the re-minted token
+        // verifies (same signing key, fresh exp).
+        let decoded = jwt::verify(&t1, &key.verifying_key()).expect("re-mint must verify");
+        assert_eq!(decoded.sub, tenant_id);
+        assert!(decoded.exp > now, "re-minted exp must be in the future");
+        // The force flag is one-shot: a second fresh() does not churn.
         let t2 = source.fresh().expect("token");
         assert_eq!(t1, t2, "the force flag is one-shot");
     }
 
     /// Dual-mode: a `none()` source answers `None` forever and
-    /// `note_rejected` is a no-op (nothing to re-mint).
+    /// `note_rejected` is `NotLocallyHealable` (nothing to re-mint —
+    /// the rejection is a real authz failure the caller surfaces).
     #[test]
     fn tail_source_none_stays_none() {
         let source = SessionTokenSource::none();
         assert!(source.fresh().is_none());
-        source.note_rejected();
+        assert_eq!(source.note_rejected(), RemintCause::NotLocallyHealable);
         assert!(source.fresh().is_none());
         assert!(SessionTokenSource::new(None, None).fresh().is_none());
     }

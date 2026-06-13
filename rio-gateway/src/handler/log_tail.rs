@@ -51,7 +51,7 @@ use tokio::time::Instant;
 use tonic::transport::Channel;
 use tracing::{Instrument, debug, info_span, warn};
 
-use crate::server::session_jwt::SessionTokenSource;
+use crate::server::session_jwt::{RemintCause, SessionTokenSource};
 
 /// How long a subscription waits before re-opening a prematurely-ended
 /// stream. The store's failure modes here are restart/deploy shaped
@@ -1155,14 +1155,20 @@ async fn run_tail(
                 // land on a replica that is restarting right now.
                 //
                 // UNAUTHENTICATED is the live_062 face: the token the
-                // open carried is no longer valid (key rotation — the
-                // slack-based refresh can't see it; or a clock-skewed
-                // expiry). Arm one forced re-mint so the NEXT open
-                // carries a token minted under the current key instead
-                // of replaying the rejected one forever.
-                if status.code() == tonic::Code::Unauthenticated {
-                    jwt.note_rejected();
-                }
+                // open carried is no longer valid. The source classifies
+                // against the gateway's OWN clock and arms a re-mint
+                // ONLY for LocalExpiry (R34-w(iii), merged_bug_005): a
+                // token well within its TTL was rejected for a cause a
+                // re-mint cannot heal (revoked jti, unknown verify
+                // key), and re-minting around it would silently
+                // override an operator denial every cycle. The lane
+                // text below carries the typed cause so the user-facing
+                // notice and the warn name auth (not reachability).
+                let unauth_cause = if status.code() == tonic::Code::Unauthenticated {
+                    Some(jwt.note_rejected())
+                } else {
+                    None
+                };
                 // live_062 retired the "deliberately NOT surfaced"
                 // posture that used to live here: a SHORT blip is
                 // still silent (noise the user can't act on), but a
@@ -1183,15 +1189,23 @@ async fn run_tail(
                     debug!(code = ?status.code(), "TailLog open failed");
                 } else {
                     warned_open_failure = true;
-                    match status.code() {
-                        tonic::Code::Unauthenticated => warn!(
+                    match unauth_cause {
+                        Some(RemintCause::LocalExpiry) => warn!(
                             code = ?status.code(),
                             since_line,
-                            "TailLog open rejected UNAUTHENTICATED; re-minting the \
-                             session token and retrying (every {:?})",
+                            "TailLog open rejected UNAUTHENTICATED; the carried token is past \
+                             local expiry, re-minting and retrying (every {:?})",
                             config.reconnect_backoff
                         ),
-                        _ => warn!(
+                        Some(RemintCause::NotLocallyHealable) => warn!(
+                            code = ?status.code(),
+                            since_line,
+                            "TailLog open rejected UNAUTHENTICATED with the carried token well \
+                             within its TTL (revoked jti or unknown verify key); not re-minting \
+                             (retrying every {:?})",
+                            config.reconnect_backoff
+                        ),
+                        None => warn!(
                             code = ?status.code(),
                             since_line,
                             "TailLog open failed; live tail degraded until the store is reachable \
@@ -2353,40 +2367,43 @@ mod tests {
         }
     }
 
-    /// live_062 (W13-S10-B, red-first): an UNAUTHENTICATED open forces
-    /// a re-mint — the rotated-key face the slack-based refresh cannot
-    /// see (the token's `exp` still looks healthy). The first open
-    /// carries the original token; the store rejects it; the re-open
-    /// must carry a DIFFERENT (re-minted) token.
+    /// W14-A1 + W14-A1b (merged_bug_005 red-first, the
+    /// `NotLocallyHealable` face): an UNAUTHENTICATED open on a token
+    /// WELL WITHIN its TTL does NOT re-mint — the verifier rejected it
+    /// for a cause re-signing with the same key cannot heal (revoked
+    /// jti, the operator denial; or unknown verify key, the rotation
+    /// claim's runtime negative). The re-open carries the SAME token
+    /// and the rejection surfaces honestly through the auth lane.
     ///
-    /// Pre-fix RED (same strawman disclosure as above): the frozen
-    /// snapshot replays the rejected token on every re-open, forever.
+    /// Pre-fix RED (the wave-13 unconditional `note_rejected`): the
+    /// re-open carried a FRESH jti and the operator's per-jti
+    /// revocation was healed around in one cycle.
     #[tokio::test]
-    async fn unauthenticated_open_forces_token_remint() {
+    async fn unauthenticated_open_on_healthy_token_does_not_remint() {
         use ed25519_dalek::SigningKey;
-        let key = SigningKey::from_bytes(&[0x55; 32]);
+        let key = SigningKey::from_bytes(&[0x56; 32]);
         let (token, claims) =
-            crate::server::session_jwt::mint_session_jwt(uuid::Uuid::from_u128(0xF00D), &key)
+            crate::server::session_jwt::mint_session_jwt(uuid::Uuid::from_u128(0xF00E), &key)
                 .expect("mint");
         let source = SessionTokenSource::new(Some((token, claims)), Some(Arc::new(key)));
         let mut h = harness_with_jwt(test_config(), source).await;
 
-        h.mock.unauth_next_opens(1);
+        h.mock.unauth_next_opens(2);
         h.mock.push_script(vec![chunk(0, 1)], SessionEnd::Hold);
         h.set.on_started(DRV, EXEC_A);
         let mock = h.mock.clone();
-        wait_for("two opens (rejected + re-minted)", || {
-            mock.request_count() >= 2
+        wait_for("three opens (rejected, rejected, served)", || {
+            mock.request_count() >= 3
         })
         .await;
 
         let tokens = h.mock.tokens();
         let first = tokens[0].as_deref().expect("first open carried a token");
         let second = tokens[1].as_deref().expect("re-open carried a token");
-        assert_ne!(
+        assert_eq!(
             first, second,
-            "the re-open after UNAUTHENTICATED must carry a re-minted token, \
-             not replay the rejected one"
+            "a NotLocallyHealable rejection must NOT re-mint: pre-fix this minted a fresh \
+             jti and silently healed around the operator's per-jti revocation (merged_bug_005)"
         );
     }
 
