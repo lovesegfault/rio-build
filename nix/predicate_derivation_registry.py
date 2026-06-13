@@ -131,6 +131,14 @@ PROVENANCE = {
         r"MUTATIONS = \[",
         "self-application (W13-BE): the registry's own K battery",
     ),
+    "cadence-polarity-registries": (
+        "planted",
+        "nix/cadence_polarity_registries.py",
+        r"MUTATIONS = \[",
+        "WO-S9-8(ii): per-arm stamp plants (un-witnessed/witnessed/"
+        "cfg-test/pending-lane) + lifecycle plants + K=4 via the "
+        "shared harness",
+    ),
 }
 
 # The shrink-only debt pin: the committed debt set may only SHRINK

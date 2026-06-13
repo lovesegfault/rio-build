@@ -1541,6 +1541,29 @@ in
         touch $out
       '';
 
+  # The R34 (periodic-event, bound) census + the R33' polarity/units
+  # rider registry (round-13 WO-S9-8(ii)): enrolled gate-clock pairs
+  # and producer-quantity riders with the pending/anchored lifecycle
+  # (rows flip at the wave-close --verify-landed), plus the R34(ii)
+  # no-op stamp grammar enforced from birth. Full-tree staging
+  # ((vvvvv)).
+  cadence-polarity-registries =
+    pkgs.runCommand "rio-cadence-polarity-registries"
+      {
+        src = pkgs.lib.cleanSource ../.;
+        nativeBuildInputs = [ pkgs.python3 ];
+        scanScript = ../nix/cadence_polarity_registries.py;
+        sharedLexer = ../nix/rust_strip.py;
+        censusLib = ../nix/census_corpora.py;
+      }
+      ''
+        cp "$sharedLexer" rust_strip.py
+        cp "$censusLib" census_corpora.py
+        cp "$scanScript" cadence_polarity_registries.py
+        python3 cadence_polarity_registries.py "$src"
+        touch $out
+      '';
+
   duplicate-derivation-lint =
     pkgs.runCommand "rio-duplicate-derivation-lint"
       {

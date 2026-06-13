@@ -171,6 +171,10 @@ REGISTRY = [
     # anchors verified live; the shared run_mutation_battery harness
     # is the WO-S9-1 template generalized; self-applied (W13-BE).
     ("predicate-derivation-registry", "nix/predicate_derivation_registry.py", r"self_battery", {"scope", "reverse-direction"}, set(), r"PROVENANCE = \{"),
+    # bw13 S9 (WO-S9-8(ii)): the R34 cadence-bound census + R33'
+    # polarity riders — pending/anchored lifecycle, the no-op stamp
+    # grammar from birth, K-mutations via the shared harness.
+    ("cadence-polarity-registries", "nix/cadence_polarity_registries.py", r"self_battery", {"scope", "tier"}, set(), r"R34_PAIRS = \{"),
     # (iii) the R33 duplicate-derivation lint + the rationale-rot
     # sweep (OQ-14 latitude recorded in the module doc).
     ("duplicate-derivation-lint", "nix/duplicate_derivation_lint.py", r"plants wrong|self-test arms", {"scope"}, set(), r"R33_ROWS = \{"),
@@ -1484,6 +1488,8 @@ POPULATION_FLOORS = {
     "reader-census-registry": ("nix/reader_census_registry.py", r"population floor"),
     "obligation-clock-census": ("nix/obligation_clock_census.py", r"population floor"),
     "duplicate-derivation-lint": ("nix/duplicate_derivation_lint.py", r"population floor"),
+    # The WO-S9-8 round-13 bodies (each walks; each floors).
+    "cadence-polarity-registries": ("nix/cadence_polarity_registries.py", r"population floor"),
 }
 _WALK_RE = re.compile(r"\.r?glob\(")
 
