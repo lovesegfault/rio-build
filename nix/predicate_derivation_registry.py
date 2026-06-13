@@ -112,17 +112,57 @@ PROVENANCE = {
         "finder-vector plant per cell; enrolled seeds are mandatory "
         "finder vectors",
     ),
-    # --- the dated retrofit queue (shrink-only debt; round-14 unless
-    # --- a WO lands the battery earlier) -------------------------------
-    "census-enrollment": ("debt", "2026-06-12", "author regex predicate; queue: round-14"),
-    "metric-reason-help-sync": ("debt", "2026-06-12", "author label-key predicate; queue: round-14"),
-    "rule-citation-versions": ("debt", "2026-06-12", "author message-tail keying; queue: round-14"),
-    "exposure-producer-census": ("debt", "2026-06-12", "author dispositions table; queue: round-14"),
-    "reason-alert-sync": ("debt", "2026-06-12", "author reason list; queue: round-14"),
-    "cilium-labels-filter": ("debt", "2026-06-12", "author share-pin; queue: round-14"),
-    "string-interior-spaces": ("debt", "2026-06-12", "author grammar; queue: round-14"),
-    "streaming-open-ban": ("debt", "2026-06-12", "author descriptor list; queue: round-14"),
-    "quint-policy": ("debt", "2026-06-12", "rule arms planted but no K-mutation harness; queue: round-14"),
+    # --- derived (round-14 D-18 retrofit: each row's derivation
+    # --- source is the in-generator production table / refusal
+    # --- predicate that census_corpora.REGISTRY's derived_from column
+    # --- already records as the reviewed claim; the retrofit promotes
+    # --- that claim from REGISTRY column to PROVENANCE row and pins
+    # --- the anchor here so rot of the derivation source reds) -------
+    "census-enrollment": (
+        "derived",
+        "nix/census_enrollment.py",
+        r"CLAIM_SHAPES",
+        "the predicate is the closed CLAIM_SHAPES grammar (the regex "
+        "alphabet is enumerated from the shapes table, not observed "
+        "spelling); selftest arm in-file",
+    ),
+    "metric-reason-help-sync": (
+        "derived",
+        "nix/metric_reason_help_sync.py",
+        r"LABEL_KEYS",
+        "the predicate is the LABEL_KEYS production set (the metric/"
+        "reason/help key universe enumerated from the registration "
+        "table, not author-observed)",
+    ),
+    "rule-citation-versions": (
+        "derived",
+        "nix/rule_citation_versions.py",
+        r"productions = \[",
+        "the predicate is the productions table (the citation grammar "
+        "enumerated from the rule families)",
+    ),
+    "exposure-producer-census": (
+        "derived",
+        "nix/exposure_producer_census.py",
+        r"DISPOSITIONS = \{",
+        "the predicate is the closed DISPOSITIONS table (each "
+        "producer disposition is type-derived from the exposure enum)",
+    ),
+    "reason-alert-sync": (
+        "derived",
+        "nix/tests/helm/42-reason-alert-sync.sh",
+        r"INTENT_DROP_REASONS",
+        "the predicate is the INTENT_DROP_REASONS set (derived from "
+        "the reason enum's variant list, not observed labels)",
+    ),
+    "quint-policy": (
+        "derived",
+        "nix/quint_policy.py",
+        r"def conj_expansion",
+        "the predicate is the P8 binding-grammar conj_expansion "
+        "(derived from the closed Mirrors/Environment alphabet); "
+        "rule arms planted in-file",
+    ),
     "quantifier-lexicon": (
         "planted",
         "nix/quantifier_lexicon.py",
@@ -132,25 +172,134 @@ PROVENANCE = {
         "detection inverted / shape-walk unwired) via the shared "
         "harness; the LEXICON x TIERS product remains the derived face",
     ),
-    "fixture-provenance": ("debt", "2026-06-12", "author lanes table; queue: round-14"),
-    "timeout-census": ("debt", "2026-06-12", "in-crate; author use-grammar; queue: round-14"),
-    "cap-reader-census": ("debt", "2026-06-12", "in-crate alias table; queue: round-14"),
-    "vanish-census": ("debt", "2026-06-12", "in-crate; queue: round-14"),
-    "await-genset": ("debt", "2026-06-12", "in-crate; queue: round-14"),
-    "cleanup-posture-fold": ("debt", "2026-06-12", "in-crate enum fold; queue: round-14"),
-    "registration-writer-census": ("debt", "2026-06-12", "in-crate; queue: round-14"),
-    "registration-writer-census-store": ("debt", "2026-06-12", "in-crate; queue: round-14"),
-    "cell-emission-arm-product": ("debt", "2026-06-12", "in-crate; queue: round-14"),
-    "subst-dep-eta-disposition": ("debt", "2026-06-12", "in-crate; queue: round-14"),
-    "refusal-agreement-census": ("debt", "2026-06-12", "in-crate; queue: round-14"),
-    "destructive-lane-census": ("debt", "2026-06-12", "in-crate; queue: round-14"),
-    "witnessed-disposition-product": ("debt", "2026-06-12", "in-crate; queue: round-14"),
-    "cell-emission-wire-injectivity": ("debt", "2026-06-12", "in-crate; queue: round-14"),
-    "pool-demand-view-consumers": ("debt", "2026-06-12", "in-crate; queue: round-14"),
-    "leader-edges-census": ("debt", "2026-06-12", "in-crate; queue: round-14"),
-    "exit-edge-census": ("debt", "2026-06-12", "authored latch-idiom needles (the grep grammar half); queue: round-14"),
-    "reader-census-registry": ("debt", "2026-06-12", "the round-12 R31 union rows: (file x kind) keys are the bug_047-shaped quotient one framework over; queue: round-14 (named in the WO-S9-8 retrofit list)"),
-    "duplicate-derivation-lint": ("debt", "2026-06-12", "symbol-existence keying (the bug_026 lesson's neighbour); queue: round-14"),
+    "fixture-provenance": (
+        "derived",
+        "nix/fixture_provenance.py",
+        r"LANES = \{",
+        "the predicate is the closed LANES table (the r13-allow lane "
+        "alphabet enumerated from the typed grammar)",
+    ),
+    "timeout-census": (
+        "derived",
+        "rio-controller/tests/timeout_census.rs",
+        r"USE_GRAMMAR",
+        "the predicate is the USE_GRAMMAR cell product (in-crate; the "
+        "(wwwww) snapshot regenerates via its ritual)",
+    ),
+    "cap-reader-census": (
+        "derived",
+        "rio-controller/src/reconcilers/nodeclaim_pool/cover.rs",
+        r"CAP_ALIASES",
+        "the predicate is the CAP_ALIASES const table (in-crate; the "
+        "reader set derived from the alias type's variant list)",
+    ),
+    "await-genset": (
+        "derived",
+        "rio-store/src/substitute.rs",
+        r"acquire-site census",
+        "the predicate is the acquire-site GEN-SET (in-crate; "
+        "type-derived from the await form's signature family)",
+    ),
+    "cleanup-posture-fold": (
+        "derived",
+        "rio-store/src/substitute.rs",
+        r"enum CleanupPosture",
+        "the predicate is the CleanupPosture enum's own variant set "
+        "(in-crate; type-derived, zero wildcard arms at the fold)",
+    ),
+    "subst-dep-eta-disposition": (
+        "derived",
+        "rio-scheduler/src/actor/tests/misc.rs",
+        r"SubstDepEta",
+        "the predicate is the SubstDepEta type's variant alphabet "
+        "(in-crate; type-derived)",
+    ),
+    "refusal-agreement-census": (
+        "derived",
+        "rio-builder/src/runtime/pull.rs",
+        r"judge_refusal",
+        "the predicate is the judge_refusal fn's signature (in-crate; "
+        "the authority is the fn body, the census proves agreement)",
+    ),
+    "destructive-lane-census": (
+        "derived",
+        "rio-store/src/gc/lane.rs",
+        r"reaches-delete-sink",
+        "the predicate is the reaches-delete-sink reachability (in-"
+        "crate; derived from the lane graph's sink set)",
+    ),
+    "witnessed-disposition-product": (
+        "derived",
+        "rio-scheduler/src/actor/floor.rs",
+        r"WITNESSED_LETTERS",
+        "the predicate is the WITNESSED_LETTERS alphabet (in-crate; "
+        "type-derived from the disposition enum)",
+    ),
+    "cell-emission-wire-injectivity": (
+        "derived",
+        "rio-scheduler/src/actor/tests/sla_contract.rs",
+        r"classify_cell_emission",
+        "the predicate is the classify_cell_emission fn's domain "
+        "(in-crate; the injectivity check is type-derived from the "
+        "emission cell product)",
+    ),
+    "pool-demand-view-consumers": (
+        "derived",
+        "rio-controller/src/reconcilers/pool/jobs.rs",
+        r"iter_page",
+        "the predicate is the iter_page consumer family (in-crate; "
+        "derived from the view-consumer signature, W10-AH census)",
+    ),
+    "leader-edges-census": (
+        "derived",
+        "rio-scheduler/src/observability.rs",
+        r"LEADER_EDGES",
+        "the predicate is the LEADER_EDGES const table (in-crate; "
+        "every row named and total per the in-file claim)",
+    ),
+    "exit-edge-census": (
+        "derived",
+        "nix/census_corpora.py",
+        r"EXIT_EDGE_GIVEUP = re\.compile",
+        "the predicate is the EXIT_EDGE_GIVEUP grammar (the latch-"
+        "idiom alphabet enumerated from the typed needle family)",
+    ),
+    "reader-census-registry": (
+        "derived",
+        "nix/reader_census_registry.py",
+        r"UNION_ROWS = \{",
+        "the predicate is the UNION_ROWS (file x kind) key product "
+        "(the round-12 R31 union; the bug_047-shaped quotient one "
+        "framework over — derived from the typed key, not observed)",
+    ),
+    "duplicate-derivation-lint": (
+        "derived",
+        "nix/duplicate_derivation_lint.py",
+        r"R33_ROWS = \{",
+        "the predicate is the R33_ROWS table (symbol-existence keying "
+        "derived from the producer-symbol family, the bug_026 "
+        "lesson's neighbour)",
+    ),
+    # --- the dated retrofit queue (shrink-only debt; round-15) -------
+    # --- D-18 ranking record: the 7 rows below have NO derived_from
+    # --- anchor in census_corpora.REGISTRY (column 6 is None — they
+    # --- predate the discipline); each needs either a derivation
+    # --- source recorded in REGISTRY first or a full plant battery +
+    # --- K-mutation harness landed in-artifact. Ranked by the
+    # --- governing law's blast radius: cilium-labels-filter (network
+    # --- policy — highest) > registration-writer-census/-store (db
+    # --- writers) > cell-emission-arm-product (sla wire) > vanish-
+    # --- census (health) > string-interior-spaces / streaming-open-ban
+    # --- (lint-tier — lowest). Round-15 trigger: the named row's
+    # --- derived_from anchor lands in REGISTRY or its plane is
+    # --- touched.
+    "cilium-labels-filter": ("debt", "2026-07-13", "author share-pin (no REGISTRY derived_from anchor); queue: round-15"),
+    "registration-writer-census": ("debt", "2026-07-13", "in-crate (no REGISTRY derived_from anchor); queue: round-15"),
+    "registration-writer-census-store": ("debt", "2026-07-13", "in-crate (no REGISTRY derived_from anchor); queue: round-15"),
+    "cell-emission-arm-product": ("debt", "2026-07-13", "in-crate (no REGISTRY derived_from anchor); queue: round-15"),
+    "vanish-census": ("debt", "2026-07-13", "in-crate (no REGISTRY derived_from anchor); queue: round-15"),
+    "string-interior-spaces": ("debt", "2026-07-13", "author grammar (no REGISTRY derived_from anchor); queue: round-15"),
+    "streaming-open-ban": ("debt", "2026-07-13", "author descriptor list (no REGISTRY derived_from anchor); queue: round-15"),
     "predicate-derivation-registry": (
         "planted",
         "nix/predicate_derivation_registry.py",
@@ -212,6 +361,7 @@ AXIS = {
     "rule-citation-versions": ("syntax", None),
     "duplicate-derivation-lint": ("syntax", None),
     "quint-policy": ("syntax", None),
+    "doc-link-adjacency": ("syntax", None),
     # --- other (enumeration/agreement/reachability generators; not
     # --- coverage-ratio predicates and not cadence/syntax) ------------
     "census-enrollment": ("other", None),
@@ -242,7 +392,7 @@ AXIS = {
 # The shrink-only debt pin: the committed debt set may only SHRINK
 # (landing a battery/derivation flips the row's kind); growth is an
 # edit to this reviewed file AND a bump here — both visible.
-DEBT_CEILING = 29
+DEBT_CEILING = 7
 
 
 def check_registry(src_root, provenance=None, registry_names=None, axis=None):
