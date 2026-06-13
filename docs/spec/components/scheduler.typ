@@ -5463,18 +5463,42 @@ rows are healed by the next complete observation rather than re-stamped,
 and the intake refusal stops new junk from minting --- the keep-first
 composition had no such exit edge.
 
-#r("sched.sla.epoch-domain")[
+#r("sched.sla.epoch-domain+2")[
   Absolute PG epochs in the SLA cost plane MUST cross the sqlx boundary
-  through a finite-by-construction typed domain (`Epoch`), minted only at
-  the decode boundary: a non-finite stored epoch
-  (`'infinity'::timestamptz`, NaN) is a typed, counted, per-row refusal
-  (`_evidence_refused_total{reason="nonfinite_epoch"}`) that skips the row
-  and leaves siblings unaffected --- never a raw `f64` store. Staleness
-  ages, newest-wins maxima, and watermark folds MUST be computed as
-  methods of the typed domain, so the non-finite comparison arms
-  (`now - inf = -inf` reading eternally fresh; `at > 'infinity'` matching
-  nothing) are unrepresentable for the whole family.
+  through a typed domain (`Epoch`) that is finite AND plausible by
+  construction, minted only at the decode boundary: a non-finite stored
+  epoch (`'infinity'::timestamptz`, NaN ---
+  `_evidence_refused_total{reason="nonfinite_epoch"}`) OR a finite but
+  implausibly-future stamp (past `now + EPOCH_FUTURE_SLACK_SECS` ---
+  `reason="absurd_epoch"`) is a typed, counted, per-row refusal that
+  skips the row and leaves siblings unaffected --- never a raw `f64`
+  store. The refusal predicate encodes the invariant the absorbing
+  folds need (plausible value-time), not the last incident's literal
+  shape: a finite far-future stamp lifts a newest-wins max-fold
+  permanently and freezes every decay `dt` at zero, which
+  finiteness-only sealing cannot see. Staleness ages, newest-wins
+  maxima, and watermark folds MUST be computed as methods of the typed
+  domain; the stamp fences' heal arms and the leader-owned repair MUST
+  share the decode's full alphabet (non-finite OR absurd-future, one
+  ceiling mint), so a poisoned stored stamp of either class can
+  neither refuse the writer's own range nor survive the repair.
 ]
+
+bug_039 (the round-13 extension): the wave-11 `Epoch` seal proved
+"finite by construction" --- the wrong theorem for the absorbing fold
+class. A finite `+100yr` stamp (corruption/manual insert; moderate live
+clock-skew self-heals once wall-clock passes it) passed the decode,
+absorbed the value-time fold, froze `dt = 0` (decay 1.0 forever ---
+lambda-hat degraded to an UNDAMPED ALL-TIME AVERAGE where spikes never
+age out), persisted through the equality-admitting stamp fences,
+rehydrated each reload, and the non-finite repair never fired ---
+permanent and unlogged. The ceiling is an R17-violable typed envelope
+(48h: ≥3 orders above NTP-class skew; bounds the transient
+decay-freeze to two days; re-derived at first soak if refusal counters
+show false positives), minted ONCE and shared by the decode, the four
+heal arms, and both repair statements. W13-X drives the
+corruption-class schedule end-to-end (refuse, count, repair, heal);
+W13-X2 pins the live-skew tolerance.
 
 The family axis (R28) is enforced one level out by the in-crate
 `EXTRACT(EPOCH ...)` census: cost.rs is the family's only home (three

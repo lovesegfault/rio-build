@@ -96,7 +96,7 @@ impl InstanceType {
     }
 }
 
-// r[impl sched.sla.epoch-domain]
+// r[impl sched.sla.epoch-domain+2]
 /// Absolute Unix-epoch seconds, FINITE BY CONSTRUCTION — the typed
 /// epoch domain for the SLA cost plane (bug_060; R28 family seal, R29
 /// clock domain). PG epochs cross the sqlx boundary as bare `f64`
@@ -136,11 +136,26 @@ impl Epoch {
     /// The fold identity / "no prior" sentinel (epoch 0).
     pub const UNSET: Epoch = Epoch(0.0);
 
-    /// THE PG decode boundary: refuse non-finite epochs (NaN, ±inf).
-    /// Negative finite epochs (pre-1970 timestamps) pass — they are
-    /// representable facts that merely read as very old.
-    pub fn from_pg_epoch(secs: f64) -> Option<Epoch> {
-        secs.is_finite().then_some(Epoch(secs))
+    /// THE PG decode boundary: refuse non-finite epochs (NaN, ±inf)
+    /// AND implausibly-future finite stamps (bug_039 — the absurdity
+    /// ceiling). A boundary refusal predicate encodes the invariant
+    /// the absorbing FOLD needs — plausible value-time, `stamp <=
+    /// now + slack` — not the last incident's literal shape
+    /// (non-finite): a finite +100yr stamp lifted the value-time
+    /// max-fold permanently (decay dt frozen at 0; λ degraded to an
+    /// undamped all-time average), passed the equality-admitting
+    /// stamp fences, rehydrated every reload, and the non-finite
+    /// repair never fired. Negative finite epochs (pre-1970
+    /// timestamps) pass — they are representable facts that merely
+    /// read as very old, and they LOSE every newest-wins fold.
+    pub fn from_pg_epoch(secs: f64, now: Epoch) -> Result<Epoch, EpochRefusalReason> {
+        if !secs.is_finite() {
+            return Err(EpochRefusalReason::NonfiniteEpoch);
+        }
+        if secs > now.0 + EPOCH_FUTURE_SLACK_SECS {
+            return Err(EpochRefusalReason::AbsurdEpoch);
+        }
+        Ok(Epoch(secs))
     }
 
     /// Wall-clock entry: `secs` comes from `SystemTime` arithmetic
@@ -185,9 +200,50 @@ impl Epoch {
 impl TryFrom<f64> for Epoch {
     type Error = String;
     fn try_from(secs: f64) -> Result<Self, Self::Error> {
-        Epoch::from_pg_epoch(secs).ok_or_else(|| format!("non-finite epoch: {secs}"))
+        // Serde re-entry (process-internal snapshot carry): finite-
+        // only — the absurdity ceiling needs a clock and lives at the
+        // PG boundary, which is the only entry for EXTERNAL stamps;
+        // serde carries values that already crossed it (or wall-clock
+        // mints, finite-and-plausible by construction).
+        secs.is_finite()
+            .then_some(Epoch(secs))
+            .ok_or_else(|| format!("non-finite epoch: {secs}"))
     }
 }
+
+/// Typed refusal letter for [`Epoch::from_pg_epoch`] — the two
+/// refusal classes are operator-distinct (`nonfinite_epoch` = the
+/// `'infinity'`/NaN family; `absurd_epoch` = finite but implausibly
+/// future: corruption/manual insert).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochRefusalReason {
+    NonfiniteEpoch,
+    AbsurdEpoch,
+}
+
+impl EpochRefusalReason {
+    /// The `reason` label value for
+    /// `rio_scheduler_sla_evidence_refused_total` (the label census's
+    /// enum-dispatch shape: `as_str` + pascal-cased variants).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NonfiniteEpoch => "nonfinite_epoch",
+            Self::AbsurdEpoch => "absurd_epoch",
+        }
+    }
+}
+
+/// bug_039: the plausible-value-time slack over wall-clock `now` that
+/// the epoch decode admits. R17-VIOLABLE typed envelope: 48h sits ≥3
+/// orders of magnitude above observed NTP-class skew (seconds) and
+/// above un-synced-host drift (minutes-hours), while bounding the
+/// worst-case decay-freeze a within-slack future stamp can cause to
+/// two days (it self-heals once wall-clock passes the stamp — the
+/// triage-corrected transient face); the permanent class this ceiling
+/// kills is corruption/manual-insert (+100yr shapes). Re-derive
+/// against observed fleet skew at the first soak if refusal counters
+/// show false positives.
+pub const EPOCH_FUTURE_SLACK_SECS: f64 = 48.0 * 3600.0;
 
 impl From<Epoch> for f64 {
     fn from(e: Epoch) -> f64 {
@@ -493,8 +549,10 @@ pub struct CostTable {
     /// from the poller's snapshot-mutate-swap) don't need it threaded
     /// separately.
     cluster: String,
-    /// bug_120: `load()` refused at least one row for a non-finite
-    /// stored stamp — the repair obligation. Discharged by the next
+    /// bug_120 + bug_039: `load()` refused at least one row for an
+    /// out-of-domain stored stamp (non-finite OR absurd-future past
+    /// the EPOCH_FUTURE_SLACK_SECS ceiling) or a poisoned value
+    /// (merged_bug_016) — the repair obligation. Discharged by the next
     /// leader-owned [`Self::persist_rows`] (durable writes live in the
     /// sealed rows only — the W10-BB census is the bind), which resets the poisoned stamps to
     /// epoch 0 (maximally stale; values stay). merged_bug_016 widens
@@ -505,7 +563,7 @@ pub struct CostTable {
     /// which heals in place (see [`Self::cursor_poisoned`]). Cleared
     /// naturally: the next clean load rebuilds the table with the
     /// flag down.
-    repair_nonfinite: bool,
+    repair_absurd: bool,
     /// merged_bug_016: `load()` refused the `lambda_cursor` row at
     /// the typed bigserial decode ([`from_pg_cursor`]) — the stored
     /// consumption position is unknowable. The repair is
@@ -717,7 +775,7 @@ impl CostTable {
         // bug_120: an undischarged repair obligation rides the swap
         // (either side may have recorded it). merged_bug_016: the
         // cursor-poison flag rides identically.
-        fresh.repair_nonfinite |= self.repair_nonfinite;
+        fresh.repair_absurd |= self.repair_absurd;
         fresh.cursor_poisoned |= self.cursor_poisoned;
         *self = fresh;
     }
@@ -880,6 +938,7 @@ impl CostTable {
     ) -> anyhow::Result<Self> {
         type Row = (String, f64, Option<f64>, Option<f64>, f64);
         let mut t = Self::seeded(cluster, source);
+        let now = Epoch(now_epoch());
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT key, value, numerator, denominator, \
              EXTRACT(EPOCH FROM updated_at)::float8 FROM sla_ema_state WHERE cluster = $1",
@@ -915,13 +974,13 @@ impl CostTable {
                             "reason" => "nonfinite_value"
                         )
                         .increment(1);
-                        t.repair_nonfinite = true;
+                        t.repair_absurd = true;
                         t.cursor_poisoned = true;
                     }
                 }
                 continue;
             }
-            // r[impl sched.sla.epoch-domain]
+            // r[impl sched.sla.epoch-domain+2]
             // THE decode boundary for the epoch family: a non-finite
             // epoch (`'infinity'::timestamptz`, NaN) is a typed,
             // counted refusal letter — the row never enters a map,
@@ -936,19 +995,23 @@ impl CostTable {
             // range. With the poisoned stamp refused this load, the
             // stale clamp and the RioSlaHwCostStale alert still arm
             // truthfully instead of disarming fleet-wide.
-            let Some(at) = Epoch::from_pg_epoch(at) else {
-                tracing::warn!(
-                    key = %key,
-                    "non-finite epoch in sla_ema_state; row refused at decode"
-                );
-                ::metrics::counter!(
-                    "rio_scheduler_sla_evidence_refused_total",
-                    "plane" => "ema_row",
-                    "reason" => "nonfinite_epoch"
-                )
-                .increment(1);
-                t.repair_nonfinite = true;
-                continue;
+            let at = match Epoch::from_pg_epoch(at, now) {
+                Ok(at) => at,
+                Err(refusal) => {
+                    tracing::warn!(
+                        key = %key,
+                        reason = refusal.as_str(),
+                        "implausible epoch in sla_ema_state; row refused at decode"
+                    );
+                    ::metrics::counter!(
+                        "rio_scheduler_sla_evidence_refused_total",
+                        "plane" => "ema_row",
+                        "reason" => refusal.as_str()
+                    )
+                    .increment(1);
+                    t.repair_absurd = true;
+                    continue;
+                }
             };
             // r[impl sched.sla.refusal-per-column]
             // merged_bug_016: the VALUE family crosses the same kind
@@ -973,7 +1036,7 @@ impl CostTable {
                     "reason" => "nonfinite_value"
                 )
                 .increment(1);
-                t.repair_nonfinite = true;
+                t.repair_absurd = true;
                 continue;
             }
             if let Some(rest) = key.strip_prefix("price:")
@@ -1034,7 +1097,7 @@ impl CostTable {
             // bug_120 repair obligation discharged at persist_rows.
             let decoded = rio_common::clamped::epoch_secs(at);
             if decoded.is_none() {
-                t.repair_nonfinite = true;
+                t.repair_absurd = true;
             }
             t.cells.entry((h, cap)).or_default().push(InstanceType {
                 name,
@@ -1095,20 +1158,31 @@ impl CostTable {
         // fence arm + skip-to-horizon). Idempotent — re-runs each
         // tick until a clean reload rebuilds the table with the flag
         // down.
-        if self.repair_nonfinite {
+        // bug_039: ONE plausibility ceiling for every stamp fence and
+        // repair in this body — minted from the same const as the
+        // decode (one alphabet per column family, one mint).
+        let stamp_ceiling = now_epoch() + EPOCH_FUTURE_SLACK_SECS;
+        if self.repair_absurd {
+            // bug_039: the repair alphabet matches the decode's —
+            // non-finite OR absurd-future.
+            let ceiling = stamp_ceiling;
             sqlx::query(
                 "UPDATE sla_ema_state SET updated_at = to_timestamp(0) \
-                 WHERE cluster = $1 AND NOT isfinite(updated_at)",
+                 WHERE cluster = $1 AND (NOT isfinite(updated_at) \
+                    OR updated_at > to_timestamp($2))",
             )
             .bind(&self.cluster)
+            .bind(ceiling)
             .execute(db.pool())
             .await?;
             sqlx::query(
                 "UPDATE sla_observed_instance_types \
                  SET last_observed = to_timestamp(0) \
-                 WHERE cluster = $1 AND NOT isfinite(last_observed)",
+                 WHERE cluster = $1 AND (NOT isfinite(last_observed) \
+                    OR last_observed > to_timestamp($2))",
             )
             .bind(&self.cluster)
+            .bind(ceiling)
             .execute(db.pool())
             .await?;
             // r[impl sched.sla.refusal-per-column]
@@ -1151,12 +1225,14 @@ impl CostTable {
                      VALUES ($1, $2, $3, to_timestamp($4)) \
                      ON CONFLICT (cluster, key) DO UPDATE SET value = $3, updated_at = to_timestamp($4) \
                      WHERE sla_ema_state.updated_at <= to_timestamp($4) \
-                        OR NOT isfinite(sla_ema_state.updated_at)",
+                        OR NOT isfinite(sla_ema_state.updated_at) \
+                        OR sla_ema_state.updated_at > to_timestamp($5)",
                 )
                 .bind(&self.cluster)
                 .bind(format!("price:{}", cell_label(cell)))
                 .bind(p.value)
                 .bind(p.updated_at.as_secs_f64())
+                .bind(stamp_ceiling)
                 .execute(db.pool())
                 .await?;
             }
@@ -1227,7 +1303,8 @@ impl CostTable {
                      ON CONFLICT (cluster, key) DO UPDATE SET \
                        value = $3, numerator = $4, denominator = $5, updated_at = to_timestamp($6) \
                      WHERE sla_ema_state.updated_at <= to_timestamp($6) \
-                        OR NOT isfinite(sla_ema_state.updated_at)",
+                        OR NOT isfinite(sla_ema_state.updated_at) \
+                        OR sla_ema_state.updated_at > to_timestamp($7)",
                 )
                 .bind(&self.cluster)
                 .bind(format!("lambda:{h}"))
@@ -1235,6 +1312,7 @@ impl CostTable {
                 .bind(ema.numerator)
                 .bind(ema.denominator)
                 .bind(ema.updated_at.as_secs_f64())
+                .bind(stamp_ceiling)
                 .execute(&mut *txn)
                 .await?;
             }
@@ -1250,7 +1328,8 @@ impl CostTable {
                      ON CONFLICT (cluster, key) DO UPDATE SET \
                        value = $3, numerator = $4, denominator = $5, updated_at = to_timestamp($6) \
                      WHERE sla_ema_state.updated_at <= to_timestamp($6) \
-                        OR NOT isfinite(sla_ema_state.updated_at)",
+                        OR NOT isfinite(sla_ema_state.updated_at) \
+                        OR sla_ema_state.updated_at > to_timestamp($7)",
                 )
                 .bind(&self.cluster)
                 .bind(format!("node_count:{h}"))
@@ -1258,6 +1337,7 @@ impl CostTable {
                 .bind(nc.numerator)
                 .bind(nc.denominator)
                 .bind(nc.updated_at.as_secs_f64())
+                .bind(stamp_ceiling)
                 .execute(&mut *txn)
                 .await?;
             }
@@ -1295,7 +1375,8 @@ impl CostTable {
                      cores = EXCLUDED.cores, mem_bytes = EXCLUDED.mem_bytes, \
                      last_observed = EXCLUDED.last_observed \
                      WHERE sla_observed_instance_types.last_observed < EXCLUDED.last_observed \
-                        OR NOT isfinite(sla_observed_instance_types.last_observed)",
+                        OR NOT isfinite(sla_observed_instance_types.last_observed) \
+                        OR sla_observed_instance_types.last_observed > to_timestamp($8)",
                 )
                 .bind(&self.cluster)
                 .bind(h)
@@ -1308,6 +1389,7 @@ impl CostTable {
                 .bind(i32::try_from(t.cores).unwrap_or(i32::MAX))
                 .bind(i64::try_from(t.mem_bytes).unwrap_or(i64::MAX))
                 .bind(at)
+                .bind(stamp_ceiling)
                 .execute(db.pool())
                 .await?;
             }
@@ -1447,24 +1529,28 @@ impl CostTable {
                 // stamp to its own class.
                 let mut per_h: HashMap<HwClassName, (f64, f64, Epoch)> = HashMap::new();
                 for (hw_class, kind, sum, max_at) in rows {
-                    // r[impl sched.sla.epoch-domain]
+                    // r[impl sched.sla.epoch-domain+2]
                     // Decode boundary: a non-finite MAX(at) refuses the
                     // GROUP row (typed, counted) — its sums are not
                     // folded and it cannot poison the decay stamp;
                     // sibling classes proceed.
-                    let Some(max_at) = Epoch::from_pg_epoch(max_at) else {
-                        tracing::warn!(
-                            hw_class = %hw_class,
-                            kind = %kind,
-                            "non-finite interrupt-sample stamp; group row refused at decode"
-                        );
-                        ::metrics::counter!(
-                            "rio_scheduler_sla_evidence_refused_total",
-                            "plane" => "interrupt_group",
-                            "reason" => "nonfinite_epoch"
-                        )
-                        .increment(1);
-                        continue;
+                    let max_at = match Epoch::from_pg_epoch(max_at, Epoch(now_epoch())) {
+                        Ok(at) => at,
+                        Err(refusal) => {
+                            tracing::warn!(
+                                hw_class = %hw_class,
+                                kind = %kind,
+                                reason = refusal.as_str(),
+                                "implausible interrupt-sample stamp; group row refused at decode"
+                            );
+                            ::metrics::counter!(
+                                "rio_scheduler_sla_evidence_refused_total",
+                                "plane" => "interrupt_group",
+                                "reason" => refusal.as_str()
+                            )
+                            .increment(1);
+                            continue;
+                        }
                     };
                     // r[impl sched.sla.refusal-per-column]
                     // merged_bug_016: SUM over a poisoned float8 sample
@@ -1627,7 +1713,7 @@ impl CostTable {
         self.lambda_cursor = from.lambda_cursor;
         self.lambda_pending = from.lambda_pending;
         // bug_120: an undischarged repair obligation rides the move.
-        self.repair_nonfinite |= from.repair_nonfinite;
+        self.repair_absurd |= from.repair_absurd;
     }
 
     /// Fold one round of spot-price observations into the price EMA.
@@ -3426,7 +3512,7 @@ mod tests {
         assert_eq!(unarmed.menu(&ghost).len(), 1);
     }
 
-    // r[verify sched.sla.epoch-domain]
+    // r[verify sched.sla.epoch-domain+2]
     /// **W11-AW (bug_060, red-first)** — *no stored non-finite epoch
     /// can influence staleness or watermark logic; population: every
     /// absolute-epoch decode in the family (price / lambda /
@@ -3528,7 +3614,7 @@ mod tests {
         assert_eq!(refused, 3, "each refused epoch row is a counted letter");
     }
 
-    // r[verify sched.sla.epoch-domain]
+    // r[verify sched.sla.epoch-domain+2]
     /// **W11-AX — the [GEN-SET] `EXTRACT(EPOCH …)` census (the
     /// sched.sla.epoch-domain family belt).** Generator: scan every
     /// `sla/*.rs` production source (test modules stripped) for
@@ -4155,7 +4241,7 @@ mod tests {
             !t.lambda.contains_key("h0"),
             "first load still refuses the poisoned row at decode"
         );
-        assert!(t.repair_nonfinite, "load RECORDS the repair obligation");
+        assert!(t.repair_absurd, "load RECORDS the repair obligation");
         // The leader-owned write boundary discharges it.
         t.persist_rows(&sdb).await.unwrap();
         let (fin_obs, fin_ema): (bool, bool) = sqlx::query_as(
@@ -4605,6 +4691,111 @@ mod tests {
             "equal-stamp classes fold byte-identically across the \
              per-class window split (pinned at the pre-fix tree)"
         );
+    }
+
+    // r[verify sched.sla.epoch-domain+2]
+    /// **W13-X (bug_039, red-first; triage-corrected blast radius)** —
+    /// *the decode boundary refuses ABSURDITY, not just
+    /// non-finiteness; population: the corruption/manual-insert
+    /// class (the triage-corrected permanent face — moderate live
+    /// clock-skew self-heals once wall-clock passes the stamp).* A
+    /// finite far-future stamp (+100yr) pre-fix: passed the
+    /// finiteness-only decode, absorbed the value-time fold (the EMA
+    /// stamp pinned at the absurd maximum), froze every subsequent
+    /// decay dt at 0 (decay 1.0 forever — lambda-hat degrades to an
+    /// UNDAMPED ALL-TIME AVERAGE: spikes never age out; NOT a
+    /// fleet-wide seed pin), persisted through the equality-passing
+    /// stamp fence, rehydrated on reload, and `repair_absurd`
+    /// never fired — permanent and unlogged. Post-fix: refused at
+    /// decode (typed, counted), repaired at the leader's write
+    /// boundary (stamp → epoch 0, values stay), and the heal arm
+    /// admits the writer over an absurd STORED stamp.
+    #[tokio::test]
+    async fn w13_x_absurd_future_stamp_refused_and_repaired() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        let absurd = now_epoch() + 100.0 * 365.0 * 86400.0;
+        sqlx::query(
+            "INSERT INTO sla_ema_state (cluster, key, value, numerator, denominator, updated_at) \
+             VALUES ('c', 'lambda:poisoned', 1.0, 2.0, 800.0, to_timestamp($1)), \
+                    ('c', 'lambda:live', 2.0, 3.0, 900.0, now())",
+        )
+        .bind(absurd)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let t = CostTable::load(&sdb, "c", HwCostSource::Static)
+            .await
+            .unwrap();
+        assert!(
+            !t.lambda.contains_key("poisoned"),
+            "the absurd-future stamp is REFUSED at decode (pre-fix: \
+             finite passed; the fold absorbed it and dt froze at 0 \
+             forever, silently)"
+        );
+        assert!(
+            t.lambda.contains_key("live"),
+            "siblings within the plausible domain load untouched"
+        );
+        assert!(t.repair_absurd, "the repair obligation is recorded");
+        t.persist_rows(&sdb).await.unwrap();
+        let (fin, secs): (bool, f64) = sqlx::query_as(
+            "SELECT isfinite(updated_at), EXTRACT(EPOCH FROM updated_at)::float8 \
+             FROM sla_ema_state WHERE cluster = 'c' AND key = 'lambda:poisoned'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            fin && secs == 0.0,
+            "the absurd stamp is repaired to epoch 0 (maximally \
+             stale; the row's values stay): got finite={fin} secs={secs}"
+        );
+        // The fold face: an absurd-stamped sample row refuses its
+        // GROUP at the fold decode — the decay stamp stays sane.
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
+             VALUES ('c', 'h', 'exposure', 600.0, to_timestamp($1))",
+        )
+        .bind(absurd)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let mut t = t;
+        t.refresh_lambda(&sdb).await.unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
+        assert!(
+            !t.lambda.contains_key("h"),
+            "the absurd-stamped group is refused at the fold decode \
+             — the absorbing max-fold never sees it"
+        );
+    }
+
+    // r[verify sched.sla.epoch-domain+2]
+    /// **W13-X2 (bug_039)** — *live-skew tolerance preserved: stamps
+    /// within the slack envelope pass untouched.* A stamp 60s in the
+    /// future (real NTP-class skew, orders of magnitude inside the
+    /// 48h slack) loads, folds, and round-trips byte-identically.
+    #[tokio::test]
+    async fn w13_x2_stamps_within_slack_pass_untouched() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        sqlx::query(
+            "INSERT INTO sla_ema_state (cluster, key, value, numerator, denominator, updated_at) \
+             VALUES ('c', 'lambda:skewed', 1.5, 2.5, 700.0, now() + interval '60 seconds')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let t = CostTable::load(&sdb, "c", HwCostSource::Static)
+            .await
+            .unwrap();
+        let e = t.lambda.get("skewed").expect("within-slack stamp loads");
+        assert!(
+            (e.numerator - 2.5).abs() < 1e-9 && (e.denominator - 700.0).abs() < 1e-9,
+            "byte-identical halves"
+        );
+        assert!(!t.repair_absurd, "no obligation for plausible skew");
     }
 
     /// Regression: a single global `price_updated_at` advanced after
@@ -5261,7 +5452,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            t.repair_nonfinite,
+            t.repair_absurd,
             "load REFUSES the poisoned cursor value at the typed \
              decode and RECORDS the repair obligation (pre-fix: \
              `value as i64` saturated +inf to i64::MAX silently)"
@@ -5350,7 +5541,7 @@ mod tests {
             (good.numerator - 3.0).abs() < 1e-9 && (good.denominator - 900.0).abs() < 1e-9,
             "the finite sibling loads byte-identically"
         );
-        assert!(t.repair_nonfinite, "the obligation is recorded");
+        assert!(t.repair_absurd, "the obligation is recorded");
         // The leader-owned repair DELETEs the poisoned row — no-prior
         // (seed) semantics, the sanctioned legacy arm.
         t.persist_rows(&sdb).await.unwrap();

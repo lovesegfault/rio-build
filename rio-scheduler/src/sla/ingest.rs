@@ -3010,7 +3010,7 @@ mod disk_axis_tests {
     }
 
     // ── The TYPE-DERIVED PERSIST-QUAL CENSUS (merged_bug_016;
-    //    [GEN-SET]; sched.sla.refusal-per-column — R31\'(ii)) ───────
+    //    [GEN-SET]; sched.sla.refusal-per-column — R31'(ii)) ───────
     //
     // The bug_120 totality law was instantiated by hand-walking the
     // updated_at quals — site selection by column NAME (stamp axes),
@@ -3188,7 +3188,7 @@ mod disk_axis_tests {
 
     // r[verify sched.sla.refusal-per-column]
     /// **The persist-qual census (merged_bug_016; riders (a)+(b);
-    /// R31\'(ii) type-derived site selection).** Population per module
+    /// R31'(ii) type-derived site selection).** Population per module
     /// = monotone quals + aggregates over type-evidence-vulnerable
     /// columns; each site is COVERED (its refusal artifact asserted
     /// in-literal or as a production decode text-pin), REPAIR-shaped
@@ -3254,9 +3254,9 @@ mod disk_axis_tests {
             let (want_quals, want_aggs): (Vec<(&str, &str)>, Vec<(&str, &str)>) = match *name {
                 // cost.rs — the lambda-unit plane. Coverage per row:
                 //   value <= ×2  : the cursor fence qual + the heal
-                //                  arm\'s own 2^53 bound (the artifact)
-                //   value >= ×1  : the heal arm\'s 0 bound (artifact)
-                //   value/num/den </> : the repair DELETE\'s explicit
+                //                  arm's own 2^53 bound (the artifact)
+                //   value >= ×1  : the heal arm's 0 bound (artifact)
+                //   value/num/den </> : the repair DELETE's explicit
                 //                  finite-domain comparisons (artifact)
                 //   updated_at <= ×3 : price/lambda/node_count upserts
                 //                  — isfinite arm asserted in-literal
@@ -3265,21 +3265,34 @@ mod disk_axis_tests {
                 //                  RESIDUAL (a far-future stamp makes
                 //                  the row immortal: bounded to table
                 //                  bloat — consumption is id-cursored
-                //                  and the fold\'s decode refuses the
+                //                  and the fold's decode refuses the
                 //                  group; routed to the absurdity-
                 //                  ceiling family, round-14 for the
                 //                  sweep arm)
+                //   updated_at > ×4 / last_observed > ×2 : the
+                //                  bug_039 ABSURDITY arms — the heal
+                //                  faces (3 stamp fences + menu) and
+                //                  the widened repairs; each is the
+                //                  artifact's own ceiling comparison
+                //                  (bound from EPOCH_FUTURE_SLACK_SECS,
+                //                  one mint)
                 "cost" => (
                     vec![
                         ("at", "<"),
                         ("denominator", "<"),
                         ("denominator", ">"),
                         ("last_observed", "<"),
+                        ("last_observed", ">"),
+                        ("last_observed", ">"),
                         ("numerator", "<"),
                         ("numerator", ">"),
                         ("updated_at", "<="),
                         ("updated_at", "<="),
                         ("updated_at", "<="),
+                        ("updated_at", ">"),
+                        ("updated_at", ">"),
+                        ("updated_at", ">"),
+                        ("updated_at", ">"),
                         ("value", "<"),
                         ("value", "<="),
                         ("value", "<="),
@@ -3340,7 +3353,7 @@ mod disk_axis_tests {
             }
         }
         assert!(
-            cost_src.contains("Epoch::from_pg_epoch(max_at)"),
+            cost_src.contains("Epoch::from_pg_epoch(max_at,"),
             "MAX(at) is decode-covered at the fold"
         );
         assert!(

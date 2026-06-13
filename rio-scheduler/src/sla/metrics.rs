@@ -143,7 +143,10 @@ pub fn describe_all() {
          enters a fold (sched.sla.refusal-per-column); \
          `skip_to_horizon`: a poisoned consumption cursor adopted the \
          settled horizon WITHOUT consuming (skip, never re-fold — \
-         the bounded disclosed repair). \
+         the bounded disclosed repair); `absurd_epoch`: a FINITE but \
+         implausibly-future stamp (past now + 48h slack) refused at \
+         the epoch decode — the corruption/manual-insert class that \
+         froze decay permanently (sched.sla.epoch-domain). \
          Sustained nonzero ⇒ a producer is shipping junk evidence; \
          poisoned PG rows self-heal at the leader's write boundary \
          (stamps reset, value rows deleted, the cursor healed in \
@@ -485,6 +488,7 @@ pub const SLA_LABELED_METRICS: &[(&str, &str, &[&str])] = &[
             "cursor_fence",
             "nonfinite_value",
             "skip_to_horizon",
+            "absurd_epoch",
         ],
     ),
     (
