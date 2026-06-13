@@ -5270,8 +5270,9 @@ fn annotation_round_trip_total_over_capacity_alphabet() {
             last.replace_range(colon + 1.., "metal");
             let poisoned = rows.join(",");
             prop_assert!(
-                cells_from_annotation(&poisoned).is_none(),
-                "out-of-alphabet cap must refuse the row: {}",
+                cells_from_annotation(&poisoned)
+                    == Err(crate::reconcilers::pool::jobs::CellsRefusal::OutOfAlphabet),
+                "out-of-alphabet cap must refuse the row with its typed class: {}",
                 poisoned
             );
             Ok(())
@@ -5671,5 +5672,107 @@ fn w13a_giveup_face_census_kill_power_under_k_mutations() {
         emptied.len() * 4,
         11usize,
         "M4: an emptied face walk cannot satisfy the cell-count pin"
+    );
+}
+
+// r[verify ctrl.pool.echo-provenance]
+/// W13-C (bug_031) — refusals disclose per DEGRADATION CLASS, once,
+/// at the chokepoint: every `cells_from_annotation` exit class pays
+/// the same observable cost (one labeled counter increment + one
+/// warn at `refuse_cells_row`), driven through the production caller
+/// (`assemble_re_acks`) across the FULL exit alphabet — both
+/// structural exits (no separator; empty half) and the
+/// out-of-alphabet arm.
+///
+/// PRE-FIX RED (recorded verbatim in the commit body): the
+/// structural-garble rows dropped with ZERO log and ZERO counter —
+/// only the out-of-alphabet arm warned (inside the parser), so the
+/// disclosure doctrine held for exactly one of the parser's three
+/// exits and the operator trail for the structural class was empty.
+/// The fail-open behavior itself (row → skip lane; scheduler keeps
+/// last-armed cells; heals at the Job's terminal cycle) is UNCHANGED
+/// — the close is the disclosure asymmetry only (the doc-lie half of
+/// the original report was refuted: the "disclosed via the warn"
+/// sentence's subject was the arm that does warn).
+#[test]
+fn w13c_cells_refusals_disclose_per_class_at_the_chokepoint() {
+    use crate::reconcilers::pool::jobs::{INTENT_CELLS_ANNOTATION, assemble_re_acks};
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let rec = DebuggingRecorder::new();
+    let _g = ::metrics::set_default_local_recorder(&rec);
+
+    let pending_with = |name: &str, intent_id: &str, cells: &str| {
+        let mut j = pending_job(name, 0, 30);
+        j.spec = Some(JobSpec {
+            template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    annotations: Some(BTreeMap::from([
+                        (INTENT_ID_ANNOTATION.to_string(), intent_id.to_string()),
+                        (INTENT_CELLS_ANNOTATION.to_string(), cells.to_string()),
+                    ])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        j
+    };
+
+    // The full exit alphabet, off-page (the reconstruction lane):
+    // r13-allow(refusal-probe): the garbled stamps are deliberately
+    // unproducible by the render half; the test asserts the typed
+    // disclosure of each degradation class.
+    let page = IntentPage::for_test(vec![]);
+    let jobs = vec![
+        // Structural exit 1: no `:` separator.
+        pending_with("rio-builder-p-garble", "garble", "no-separator"),
+        // Structural exit 2: empty half.
+        pending_with("rio-builder-p-emptyhalf", "emptyhalf", "m7i:"),
+        // The out-of-alphabet arm (bug_142's lane).
+        pending_with("rio-builder-p-oob", "oob", "m7i:metal"),
+    ];
+    let acks = assemble_re_acks(
+        &page,
+        "p",
+        ExecutorKind::Builder,
+        &jobs,
+        &HashSet::new(),
+        vec![],
+    );
+    assert!(
+        acks.is_empty(),
+        "fail-open unchanged: every refused row degrades to the skip lane"
+    );
+
+    // (ppppp): snapshot drains — exactly once.
+    let snap = rec.snapshotter().snapshot().into_vec();
+    let count_of = |class: &str| {
+        snap.iter()
+            .find_map(|(k, _, _, v)| {
+                let key = k.key();
+                (key.name() == "rio_controller_intent_cells_refused_total"
+                    && key
+                        .labels()
+                        .any(|l| l.key() == "class" && l.value() == class))
+                .then_some(match v {
+                    metrics_util::debugging::DebugValue::Counter(n) => *n,
+                    _ => 0,
+                })
+            })
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        count_of("structural"),
+        2,
+        "both structural exits disclose (pre-fix: zero operator trail \
+         for exactly this class)"
+    );
+    assert_eq!(
+        count_of("out_of_alphabet"),
+        1,
+        "the alphabet arm keeps its disclosure, now at the same \
+         chokepoint (parity across the full exit alphabet)"
     );
 }

@@ -154,6 +154,16 @@ pub fn describe_metrics() {
          the fleet readback for the unambiguous sub-population."
     );
     describe_counter!(
+        "rio_controller_intent_cells_refused_total",
+        "Intent-cells annotation rows refused at decode, split by degradation \
+         class (bug_031): class=structural (row lacks the hash:cap shape — \
+         pre-upgrade stamps, truncated writes, webhook row mutation) | \
+         out_of_alphabet (cap segment outside the shared capacity alphabet — \
+         rollback skew, webhook value mutation). Every refusal is fail-open \
+         (the scheduler keeps its last-armed cells, heals at the Job's \
+         terminal cycle); a nonzero rate is an operator trail, not an outage."
+    );
+    describe_counter!(
         "rio_controller_disruption_drains_total",
         "DisruptionTarget watcher preemption actions: synthesized preempted report + \
          foreground Job delete (result=preempted_pull|preempted_pull_report_failed). \

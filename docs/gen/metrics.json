@@ -40,6 +40,7 @@
     "rio_controller_ffd_window_remainder_cores",
     "rio_controller_ffd_window_remainder_intents",
     "rio_controller_gc_runs_total",
+    "rio_controller_intent_cells_refused_total",
     "rio_controller_job_terminal_report_seconds",
     "rio_controller_lease_acquired_total",
     "rio_controller_lease_lost_total",
@@ -475,6 +476,11 @@
         "name": "rio_controller_gc_runs_total",
         "kind": "counter",
         "help": "GC cron runs. result=success|connect_failure|rpc_failure. connect_failure=store unreachable; rpc_failure=TriggerGC returned error or stream aborted."
+      },
+      {
+        "name": "rio_controller_intent_cells_refused_total",
+        "kind": "counter",
+        "help": "Intent-cells annotation rows refused at decode, split by degradation class (bug_031): class=structural (row lacks the hash:cap shape — pre-upgrade stamps, truncated writes, webhook row mutation) | out_of_alphabet (cap segment outside the shared capacity alphabet — rollback skew, webhook value mutation). Every refusal is fail-open (the scheduler keeps its last-armed cells, heals at the Job's terminal cycle); a nonzero rate is an operator trail, not an outage."
       },
       {
         "name": "rio_controller_job_terminal_report_seconds",

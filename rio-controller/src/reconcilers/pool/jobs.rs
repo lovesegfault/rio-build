@@ -2015,12 +2015,65 @@ pub(super) fn intent_cells_annotation_value(i: &SpawnIntent) -> Option<String> {
     Some(rows.join(","))
 }
 
+/// bug_031: why one intent-cells annotation refused to decode — the
+/// typed refusal reason, disclosed once per DEGRADATION CLASS at the
+/// chokepoint ([`refuse_cells_row`], R21). Closed enum, zero
+/// wildcards (R14): a new exit class fails to compile until it names
+/// its class label, so it cannot silently escape the disclosure
+/// doctrine the way the structural exits escaped the per-arm warn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CellsRefusal {
+    /// The annotation lacks the `hash:cap` row shape (no `:`
+    /// separator, or an empty half) — pre-upgrade stamps, truncated
+    /// writes, webhook mutation of the row structure.
+    Structural,
+    /// A cap segment failed the shared capacity-alphabet parse
+    /// (bug_142's lane — rollback skew after a future alphabet
+    /// extension; webhook mutation of a value).
+    OutOfAlphabet,
+}
+
+impl CellsRefusal {
+    /// The counter label — one value per refusal class.
+    fn class(self) -> &'static str {
+        match self {
+            Self::Structural => "structural",
+            Self::OutOfAlphabet => "out_of_alphabet",
+        }
+    }
+}
+
+/// THE disclosure chokepoint (bug_031): every refusal class pays the
+/// same observable cost — one labeled warn + one
+/// `rio_controller_intent_cells_refused_total{class}` increment — at
+/// the callers' single funnel. Pre-fix the out-of-alphabet arm warned
+/// inside the parser while the structural exits returned `None`
+/// silently (zero operator trail for exactly one class): disclosure
+/// enforced per-lane, not per-degradation-class, lets each new exit
+/// class re-escape (the labeled-refusal idiom the scheduler's
+/// `evidence_refused_total` counters established).
+fn refuse_cells_row(job_name: &str, refusal: CellsRefusal) {
+    metrics::counter!(
+        "rio_controller_intent_cells_refused_total",
+        "class" => refusal.class(),
+    )
+    .increment(1);
+    warn!(
+        job = %job_name,
+        class = refusal.class(),
+        "intent-cells annotation refused to decode; degrading the row \
+         to the no-echo skip lane (the scheduler keeps its last-armed \
+         cells; heals at the Job's terminal cycle)"
+    );
+}
+
 /// Parse the [`INTENT_CELLS_ANNOTATION`] back into the
 /// `(hw_class_names, node_affinity)` echo pair — minimal terms (one
 /// `In` requirement on the capacity label per cell), which is exactly
 /// the shape the scheduler's arm decode consumes; pairing holds by
 /// construction (`names.len() == terms.len()` from one parsed list).
-/// `None` on an absent/garbled annotation (the legacy no-arm echo).
+/// `Err(CellsRefusal)` on a garbled annotation (the legacy no-arm
+/// echo at the callers, who disclose through [`refuse_cells_row`]).
 ///
 /// bug_142 (R25-as-extended): this reconstruction of wire terms from
 /// persisted state is a PRODUCER of the capacity alphabet — every cap
@@ -2030,31 +2083,27 @@ pub(super) fn intent_cells_annotation_value(i: &SpawnIntent) -> Option<String> {
 /// for byte-fidelity, since the arm decode accepts both wire and
 /// Karpenter forms). An out-of-alphabet segment (rollback skew after
 /// a future alphabet extension; webhook mutation) degrades the WHOLE
-/// row to `None` — the same fail-open lane as the render half and the
+/// row — the same fail-open lane as the render half and the
 /// no-stamp skip (the scheduler keeps its last-armed truth; the
 /// residual is priced by the `assemble_re_acks` skip paragraph) —
-/// disclosed via the warn below. Per merged_bug_134 a PARTIAL re-emit
+/// disclosed per class at the refusal chokepoint. Per merged_bug_134
+/// a PARTIAL re-emit
 /// (dropping just the poisoned cell) is forbidden: N−1 cells forge a
 /// different cell set than the original spawn ack armed.
 pub(super) fn cells_from_annotation(
     v: &str,
-) -> Option<(Vec<String>, Vec<rio_proto::types::NodeSelectorTerm>)> {
+) -> Result<(Vec<String>, Vec<rio_proto::types::NodeSelectorTerm>), CellsRefusal> {
     let mut names = Vec::new();
     let mut terms = Vec::new();
     for row in v.split(',') {
-        let (h, cap) = row.split_once(':')?;
+        let Some((h, cap)) = row.split_once(':') else {
+            return Err(CellsRefusal::Structural);
+        };
         if h.is_empty() || cap.is_empty() {
-            return None;
+            return Err(CellsRefusal::Structural);
         }
         if rio_common::cell_wire::WireCapacity::parse(cap).is_none() {
-            warn!(
-                row,
-                "intent-cells annotation cap segment outside the shared capacity \
-                 alphabet; degrading the row to the no-echo skip lane (bug_142 — \
-                 the scheduler keeps its last-armed cells; heals at the Job's \
-                 terminal cycle)"
-            );
-            return None;
+            return Err(CellsRefusal::OutOfAlphabet);
         }
         names.push(h.to_string());
         terms.push(rio_proto::types::NodeSelectorTerm {
@@ -2065,7 +2114,7 @@ pub(super) fn cells_from_annotation(
             }],
         });
     }
-    Some((names, terms))
+    Ok((names, terms))
 }
 
 /// The re-ack assembly (round-10 merged_bug_049, the R26 third-class
@@ -2155,7 +2204,12 @@ pub(crate) fn assemble_re_acks(
                 // below.
                 return match stamp {
                     Some(v) => {
-                        let (hw_class_names, node_affinity) = cells_from_annotation(v)?;
+                        // bug_031: refusals disclose per class at the
+                        // chokepoint, then drop the row (fail-open —
+                        // the scheduler keeps its last-armed cells).
+                        let (hw_class_names, node_affinity) = cells_from_annotation(v)
+                            .map_err(|r| refuse_cells_row(name, r))
+                            .ok()?;
                         if on_page.hw_class_names != hw_class_names {
                             debug!(
                                 job = %name,
@@ -2206,7 +2260,13 @@ pub(crate) fn assemble_re_acks(
             if intent_id.is_empty() {
                 return None;
             }
-            let (hw_class_names, node_affinity) = stamp.and_then(|v| cells_from_annotation(v))?;
+            // bug_031: the off-page lane discloses through the same
+            // chokepoint as the on-page lane — one funnel per class.
+            let (hw_class_names, node_affinity) = stamp.and_then(|v| {
+                cells_from_annotation(v)
+                    .map_err(|r| refuse_cells_row(name, r))
+                    .ok()
+            })?;
             // echo-provenance: stamp (the off-page lane was
             // stamp-keyed from birth — merged_bug_049).
             Some(SpawnIntent {
