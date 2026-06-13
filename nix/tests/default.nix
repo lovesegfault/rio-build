@@ -1660,9 +1660,11 @@ in
   #   (`mkdir $out`). Regression: a whiteout at the output path
   #   makes overlayfs mkdir return EIO.
   # r[verify builder.fuse.jit-lookup]
-  #   fod-fail subtest: failing FOD propagates within 60s. Daemon's
-  #   post-fail stat($out) hits FUSE; NotInput → ENOENT without
-  #   store contact. P0308 hang would push elapsed past timeout 90.
+  #   fod-fail subtest: failing FOD propagates without hanging.
+  #   Daemon's post-fail stat($out) hits FUSE; NotInput → ENOENT
+  #   without store contact. P0308 hang ⇒ the client's nix-build
+  #   never sees a BuildResult and the shell `timeout` fires
+  #   (rc=124); the structural assertion is rc != 124.
   vm-fetcher-split-k3s = fetcher-split {
     inherit pkgs common drvs;
     fixture = k3sFull {

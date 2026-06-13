@@ -496,13 +496,27 @@ pkgs.testers.runNixOSTest {
     # Origin 404s, hashed-mirror has no entry → builtin:fetchurl exits
     # nonzero with $out absent. nix-daemon's post-build deletePath($out)
     # stat falls through to FUSE lower; JitClass::NotInput → ENOENT
-    # without store contact. Asserting elapsed bounds the hang the
-    # whiteout once papered over: a regression here means lookup() fell
-    # through to gRPC and blocked.
+    # without store contact. The property under test is "no FUSE-lookup
+    # hang" — a regression means lookup() fell through to gRPC and
+    # blocked, the daemon's post-build path never returns, the client's
+    # nix-build never sees a BuildResult, and the shell `timeout` is
+    # what terminates it (rc=124).
+    #
+    # STRUCTURAL: rc != 0 (the build failed as designed) AND rc != 124
+    # (the build process TERMINATED on its own — the daemon post-build
+    # path completed, FUSE lookup did not block). The previous
+    # `elapsed < 60` band measured the shared builder's scheduling
+    # latency, not the FUSE path: calm-host runs sit ~51s and
+    # composed-tree-contention runs cross 60s with the FOD having
+    # failed CORRECTLY (3 attempts, retries exhausted, BuildResult
+    # delivered). The 180s `timeout` is a safety net only (~3.5x the
+    # 51s calm-host floor; the heaviest recorded contention measurement
+    # was 76.8s); a genuine P0308 regression hangs for the full 180s
+    # and rc=124 names it precisely.
     with subtest("fod-fail: failing FOD propagates without hang"):
         t0 = time.monotonic()
         rc, out = client.execute(
-            "timeout 90 nix-build --no-out-link --store ssh-ng://k3s-server "
+            "timeout 180 nix-build --no-out-link --store ssh-ng://k3s-server "
             "${drvs.fodFail} 2>&1"
         )
         elapsed = time.monotonic() - t0
@@ -510,10 +524,12 @@ pkgs.testers.runNixOSTest {
             f"fod-fail unexpectedly SUCCEEDED — origin /nonexistent 404s "
             f"and hashed-mirror has no entry for its hash:\n{out}"
         )
-        assert elapsed < 60, (
-            f"fod-fail took {elapsed:.1f}s (>60s) — daemon post-fail "
-            f"stat($out) likely blocked in FUSE lookup (JitClass::NotInput "
-            f"fast-path not firing).\n{out}"
+        assert rc != 124, (
+            f"fod-fail HUNG (rc=124, timeout 180s exceeded; "
+            f"elapsed={elapsed:.1f}s) — daemon post-fail stat($out) "
+            f"blocked in FUSE lookup (JitClass::NotInput fast-path not "
+            f"firing; lookup fell through to gRPC). P0308 regression.\n"
+            f"{out}"
         )
         print(f"fod-fail PASS: rc={rc} in {elapsed:.1f}s")
 

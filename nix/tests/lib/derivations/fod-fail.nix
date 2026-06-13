@@ -4,11 +4,12 @@
 # fod-dead-origin probe).
 #
 # P0308 regression guard: a failing FOD's daemon post-build
-# `deletePath($out)` must propagate quickly. JIT FUSE lookup classifies
-# the output basename as NotInput → ENOENT without contacting the store,
-# so the daemon's stat returns immediately and BuildResult{PermanentFailure}
-# reaches the client. The subtest asserts failure within a time bound;
-# a hang means lookup fell through to gRPC.
+# `deletePath($out)` must propagate. JIT FUSE lookup classifies the
+# output basename as NotInput → ENOENT without contacting the store, so
+# the daemon's stat returns immediately and BuildResult{PermanentFailure}
+# reaches the client. The subtest asserts the build process terminates
+# on its own (rc != 124, the shell `timeout` did not fire) — a hang
+# means lookup fell through to gRPC and blocked.
 #
 # Evaluated IN THE VM via nix-build. Do not reference host-eval paths.
 {
