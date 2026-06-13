@@ -2165,6 +2165,55 @@ iteration consumed from it). The snapshot-first read is bounded like the
 open itself: an accepted-but-silent `WatchBuild` charges the budget instead
 of parking the loop.
 
+#r("gw.resync.exhaustion-disposition")[
+  When the streak axis exhausts (`MAX_RECONNECT` exceeded within one
+  outage), the gateway MUST surface a `ReattachExhausted` failure to the
+  client carrying the attempt count and the last sanitized re-attach
+  cause; the gateway MUST NOT issue `CancelBuild` for the submission ---
+  the build continues server-side and is reaped only by
+  #rref("sched.backstop.orphan-watcher") once no watcher remains attached.
+]
+The disposition is "the watch ended, the build did not": exhaustion is
+evidence the gateway cannot OBSERVE the scheduler, not evidence the build
+is doomed (live_064: the build that exhausted its watcher's budget
+completed server-side). The alternative --- `CancelBuild` on exhaustion
+--- was rejected because it converts a transient observation outage into a
+guaranteed wasted build, and the orphan-watcher backstop already bounds
+the unwatched window. The honest-error duty (the surfaced cause names the
+budget and the last re-attach failure, never the benign stream death that
+opened the episode) is the live_064 close already landed; this rule pins
+the no-cancel half. The #rref("gw.conn.cancel-on-disconnect") cancel loop
+is unaffected: it keys on the CLIENT disconnecting, not on the gateway's
+own re-attach budget --- a client that stays connected past exhaustion
+keeps its `active_build_ids` entry, and a later client disconnect cancels
+it through the normal path.
+
+#r("gw.resync.resumability")[
+  A client that wishes to resume observation of a submission after
+  `ReattachExhausted` MUST be able to do so without re-submitting the
+  build; the resume key is the `build_id` the client already holds plus
+  the last event cursor it observed before exhaustion.
+]
+Design record (wire surface ZERO this round): the current protocol carries
+no resume verb --- a fresh `WatchBuild(build_id)` from a NEW gateway
+session re-attaches and serves a snapshot, but the SSH-daemon protocol
+gives the nix client no way to issue one without a fresh `nix build` (which
+re-submits, re-runs, and re-incurs whatever exhausted the prior watch ---
+the live_064 trap). Alternates considered and rejected: (a)
+idempotent-resubmit (the scheduler dedups on drv hash and returns the
+existing `build_id`) --- rejected because the client-side observable is
+indistinguishable from a fresh build and the trap recurs unchanged; (b)
+server-side bounded event buffer keyed on `build_id` --- rejected because
+retention is unbounded on long builds (the live_064 build ran >1h) and the
+buffer is exactly the broadcast-ring whose overrun motivates the loss
+signal. CHOSEN: a cursor-carrying resume --- the client already holds
+`build_id` + the last event's monotone cursor from the watch stream, so
+the resume request adds zero new server state and the snapshot reconcile
+already handles the gap. The wire change (a resume opcode or a
+`WatchBuild` cursor field) is future signed work; this rule records the
+contract so the next round derives the wire shape from a stated invariant
+instead of from the incident transcript.
+
 #r("gw.display.single-map")[
   The gateway MUST track every derivation's client display through ONE
   per-derivation map whose value is the display family (per-derivation
