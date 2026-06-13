@@ -5852,17 +5852,21 @@ rec {
       ];
     };
 
-    # bughunt-13 F12: deterministic conformance runs for the pull
-    # regime (".*Run$" — every named run in retryPolicyPull replays;
-    # a future run auto-joins). deferredFleetExhaustRun pins the
-    # deferred fleet-exhaust order: charge-requeue (empty fold fleet),
-    # the still-Ready round-trip window, then spawnGateExhaust's
-    # marker-row poison — exactly completion.rs/pull.rs's order.
+    # bughunt-13 F12/F13: deterministic conformance runs for the pull
+    # regime. deferredFleetExhaustRun pins the deferred fleet-exhaust
+    # order (charge-requeue on the empty fold fleet, the still-Ready
+    # round-trip window, then spawnGateExhaust's marker-row poison —
+    # exactly completion.rs/pull.rs's order);
+    # establishAdoptRun/establishDeferRun replay the establishment
+    # kernel's charge-free arms. EXPLICIT match (the house form): a
+    # `.*Run$` glob also catches invariant VALS whose names end in
+    # "Run" (boundedStoreDegradedRun) and quint test fails them — new
+    # runs enroll here by name.
     quint-retry-policy-pull-runs = mkQuintRunCheck {
       name = "retry-policy-pull-runs";
       spec = "retryPolicy";
       main = "retryPolicyPull";
-      match = ".*Run$";
+      match = "deferredFleetExhaustRun|establishAdoptRun|establishDeferRun";
     };
 
     # Non-vacuity witnesses for the pull-mode regime (same
