@@ -35,7 +35,30 @@ This census is the STANDING REGISTRY for both:
       `.elapsed() >`-class comparisons must be census-rowed or
       grandfathered — the standing debt visible, never silent).
 
-Self-test arms run first (the house pattern).
+Self-test arms run first (the house pattern), restructured at
+WO-S9-1 into the R31' riders-(a)-(d) form:
+
+  - self_battery(src_root) — ALL plant arms, failure-collecting
+    (never early-return, so every seeded mutation reliably produces
+    at least one battery failure regardless of arm order): the
+    rider-(a) walk floor driven through the SAME production walk;
+    the per-alternation-arm grammar plants (one per GATE_RE arm, one
+    per LOSSY_RE arm — rider (c)); the IN-POPULATION planted
+    DUPLICATES for BOTH lanes (rels are real grandfathered files, so
+    the plants sit exactly where the bug_047 masking occurred); the
+    excess arm (an uncensused hit against an empty grandfather must
+    red); the W13-AX fix-one-of-a-pair stale-sweep arm.
+  - mutation_battery(src_root) — the rider-(d) K-SEEDED-MUTATION
+    harness (K=5, the standing template WO-S9-8 generalizes): each
+    mutation is a committed fixture (name, old, new) over THIS
+    file's own source; the harness asserts the target text exists,
+    applies it to a COPY, execs the mutant, runs the MUTANT'S OWN
+    self_battery, and requires it to FAIL — a mutant whose battery
+    stays green means the planted red survived its artifact's
+    degeneration: the born-broken bug_047 criterion, enforced at
+    every run. Recursion is grounded at the fixture tier (W13-BE):
+    self_battery never invokes mutation_battery, so the mutant runs
+    plants only.
 """
 
 import pathlib
@@ -221,6 +244,298 @@ def check_landed(src_root, rows, kind):
     return fails
 
 
+def self_battery(src_root) -> list:
+    """ALL plant arms, failure-collecting (rider (a)+(b)+(c) of the
+    R31' census riders; WO-S9-1 commit 2). Returns a list of failure
+    strings — empty means every plant red where it must and stayed
+    quiet where it must. NEVER early-returns: each arm appends, so a
+    seeded mutation of any single control-flow site still surfaces
+    through its oracle arm (mutation_battery requires a NON-empty
+    return from a mutant's battery).
+
+    Recursion grounding (W13-BE): this fn never invokes
+    mutation_battery — a mutant exec'd by the harness runs plants
+    only."""
+    fails = []
+
+    # Rider (a) — the walk floor, driven through the SAME walk path
+    # as production, plus the expected-member pins (two charged
+    # bug_047 population files; both stable production surfaces — if
+    # one moves, its grandfather row stales in the same run, so the
+    # coupling is coherent, never a stranded assert).
+    walked = [rel for rel, _raw in production_files(src_root)]
+    if not walked:
+        fails.append(
+            "rider (a): population floor — the production walk yielded "
+            "zero files ((vvvvv): mis-staged tree or emptied walk)"
+        )
+    for expected in (
+        "rio-builder/src/log_stream.rs",
+        "rio-store/src/logs/sessions.rs",
+    ):
+        if walked and expected not in walked:
+            fails.append(
+                f"rider (a): expected member {expected} absent from the "
+                f"production walk — the walk or the population rotted"
+            )
+
+    # Rider (c) — one plant per LOSSY_RE alternation arm.
+    # Arm 1: `.as_secs() *` (the contentless-fragment shape).
+    plant = scan_clock_code(
+        [("planted/lossy.rs", "fn f(d: Duration) -> u64 { d.as_secs() * 1000 }\n")]
+    )
+    if len(plant) != 1 or "lossless" not in plant[0][1]:
+        fails.append(f"the lossy-arithmetic arm-1 plant did not red: {plant}")
+    # Arm 2: `* CONST.as_secs()` (the const-naming shape).
+    plant = scan_clock_code(
+        [("planted/lossy2.rs", "fn f() -> u64 { 2 * HEARTBEAT_INTERVAL.as_secs() }\n")]
+    )
+    if len(plant) != 1 or "lossless" not in plant[0][1]:
+        fails.append(f"the lossy-arithmetic arm-2 plant did not red: {plant}")
+    # The witnessed site stays quiet.
+    plant = scan_clock_code(
+        [
+            (
+                "planted/allowed.rs",
+                "// r29-lossless: millis would overflow the wire u32; bound proven\n"
+                "fn f(d: Duration) -> u64 { d.as_secs() * 1000 }\n",
+            )
+        ]
+    )
+    if plant:
+        fails.append(f"the witnessed lossy site still flagged: {plant}")
+
+    # Rider (c) — one plant per GATE_RE alternation arm.
+    # Arm 1: bare `.elapsed() <op>`.
+    plant = scan_clock_code(
+        [("planted/gate.rs", "fn g(t: Instant) -> bool { t.elapsed() > LIMIT }\n")]
+    )
+    if len(plant) != 1 or "clock census row" not in plant[0][1]:
+        fails.append(f"the un-named-gate arm-1 plant did not red: {plant}")
+    # Arm 2: `.elapsed().as_secs() <op>`.
+    plant = scan_clock_code(
+        [
+            (
+                "planted/gate2.rs",
+                "fn g(t: Instant) -> bool { t.elapsed().as_secs() >= LIMIT_SECS }\n",
+            )
+        ]
+    )
+    if len(plant) != 1 or "clock census row" not in plant[0][1]:
+        fails.append(f"the un-named-gate arm-2 plant did not red: {plant}")
+
+    # The pending-at-verify plant.
+    f_l = check_landed(src_root, {"straw": ("pending", "S9")}, "obligation")
+    if len(f_l) != 1:
+        fails.append(f"the pending-at-verify plant did not red: {f_l}")
+
+    # The EXCESS arm (rider (b) enrollment face): an uncensused hit
+    # against an empty grandfather must fail as excess — a widened
+    # (superset-accepting) enforcement set dies here.
+    exc, _st = grandfather_diff(
+        scan_clock_code(
+            [("planted/gate.rs", "fn g(t: Instant) -> bool { t.elapsed() > LIMIT }\n")]
+        ),
+        Counter(),
+    )
+    if len(exc) != 1:
+        fails.append(
+            f"the excess arm did not red: an uncensused gate against an "
+            f"empty grandfather yielded {len(exc)} excess fail(s), want 1"
+        )
+
+    # The IN-POPULATION planted DUPLICATES, BOTH lanes (R31'(iii):
+    # the plant lives inside the grandfathered population, never only
+    # in a clean file — the rels below are real grandfathered files,
+    # exactly where the bug_047 masking occurred). The lossy plants
+    # are that lane's ONLY machine oracle today: each grandfathered
+    # lossy file carries exactly one live site (pull.rs:118,
+    # lib.rs:282, sessions.rs:125, common.rs:79), so the live-tree
+    # collision census is vacuously green for the lossy lane
+    # regardless of key degeneracy.
+    # (gate) two same-operator gates in one grandfathered file.
+    dup = [
+        k
+        for k, _m in scan_clock_code(
+            [
+                (
+                    "rio-builder/src/log_stream.rs",
+                    "fn a(t: Instant) -> bool { t.elapsed() >= WINDOW }\n"
+                    "fn b(u: Instant) -> bool { u.elapsed() >= BATCH_TIMEOUT }\n",
+                )
+            ]
+        )
+    ]
+    if len(set(dup)) != 2:
+        fails.append(
+            f"W13-AX2 (gate lane): the in-population same-operator pair "
+            f"minted {len(set(dup))} distinct key(s), want 2"
+        )
+    # (lossy, arm 1) two same-fragment `.as_secs() *` multiplies in
+    # one grandfathered file.
+    dup = [
+        k
+        for k, _m in scan_clock_code(
+            [
+                (
+                    "rio-store/src/grpc/put_path/common.rs",
+                    "fn a(d: Duration) -> u64 { d.as_secs() * 1000 }\n"
+                    "fn b(e: Duration) -> u64 { e.as_secs() * 1000 }\n",
+                )
+            ]
+        )
+    ]
+    if len(set(dup)) != 2:
+        fails.append(
+            f"W13-AX2 (lossy lane, arm 1): the in-population same-fragment "
+            f"pair minted {len(set(dup))} distinct key(s), want 2"
+        )
+    # (lossy, arm 2) two multiplies of the SAME const in one
+    # grandfathered file — the sessions.rs-shaped face.
+    dup = [
+        k
+        for k, _m in scan_clock_code(
+            [
+                (
+                    "rio-store/src/logs/sessions.rs",
+                    "fn a() -> u64 { 2 * HEARTBEAT_INTERVAL.as_secs() }\n"
+                    "fn b() -> u64 { 3 * HEARTBEAT_INTERVAL.as_secs() }\n",
+                )
+            ]
+        )
+    ]
+    if len(set(dup)) != 2:
+        fails.append(
+            f"W13-AX2 (lossy lane, arm 2): the same-const multiply pair "
+            f"minted {len(set(dup))} distinct key(s), want 2"
+        )
+
+    # W13-AX (bug_047's defeat, reproduced then killed): grandfather
+    # the gate pair, FIX one gate — the stale sweep MUST trip for the
+    # fixed site's row. Under the retired file×operator projection
+    # the surviving gate held the shared key live and the sweep
+    # stayed silent (the pre-fix red, verbatim in the landing commit
+    # body).
+    pair_rel = "rio-builder/src/log_stream.rs"
+    pair = (
+        "fn a(t: Instant) -> bool { t.elapsed() >= WINDOW }\n"
+        "fn b(u: Instant) -> bool { u.elapsed() >= BATCH_TIMEOUT }\n"
+    )
+    fixed = "fn b(u: Instant) -> bool { u.elapsed() >= BATCH_TIMEOUT }\n"
+    gf_ax = Counter(k for k, _m in scan_clock_code([(pair_rel, pair)]))
+    ax_excess, ax_stale = grandfather_diff(scan_clock_code([(pair_rel, fixed)]), gf_ax)
+    if ax_excess or len(ax_stale) != 1:
+        fails.append(
+            f"W13-AX: fixing one gate of the grandfathered pair must trip "
+            f"the stale sweep exactly once (excess={ax_excess}, "
+            f"stale={ax_stale})"
+        )
+    # The fix-plus-add face: one grandfathered gate FIXED and one NEW
+    # same-operator gate added in the same file — under content keys
+    # this is 1 stale + 1 excess; under a fragment key layered on
+    # count-bearing comparison the two events CANCEL (count
+    # unchanged) and both stay invisible. Pins that content keying is
+    # load-bearing beyond what counts alone can discriminate.
+    swapped = (
+        "fn b(u: Instant) -> bool { u.elapsed() >= BATCH_TIMEOUT }\n"
+        "fn c(v: Instant) -> bool { v.elapsed() >= FLUSH_DEADLINE }\n"
+    )
+    sw_excess, sw_stale = grandfather_diff(scan_clock_code([(pair_rel, swapped)]), gf_ax)
+    if len(sw_excess) != 1 or len(sw_stale) != 1:
+        fails.append(
+            f"W13-AX (fix-plus-add face): one fixed + one new same-operator "
+            f"gate must yield exactly 1 excess + 1 stale "
+            f"(excess={len(sw_excess)}, stale={len(sw_stale)})"
+        )
+    return fails
+
+
+# The rider-(d) K-mutation fixtures (W13-AX3; K=5 — the WO-S9-1
+# battery, the standing template WO-S9-8's framework registry
+# enrolls): committed (name, oracle, old, new) source substitutions
+# over THIS artifact. Each mutation degrades one control-flow site
+# the bug_047 class rides on; the harness requires the mutant's OWN
+# self_battery to FAIL (the planted red must die under the
+# mutation). A mutation whose `old` no longer matches EXACTLY ONCE is
+# harness rot and fails loudly — the fixtures pin the artifact's
+# load-bearing lines. The `old`/`new` literals are built by
+# CONCATENATION (the census_corpora SHADOW_STRIPPER precedent) so
+# this table's own source never matches the needles it pins.
+MUTATIONS = [
+    (
+        "key-degenerate-gate",
+        "the gate mint swapped back to the born-broken file×operator"
+        " fragment — killed by the gate-lane in-population duplicate"
+        " (W13-AX2) and the fix-plus-add cancellation face",
+        "key = census_corpora.content_" + 'key(rel, "gate", lines[lineno - 1])',
+        'key = f"{rel}' + "\\tgate\\tL-content-{' '.join(m.group(0).split())}\"",
+    ),
+    (
+        "lossy-mint-bypasses-helper",
+        "the lossy mint degraded to the m.group(0) fragment, BYPASSING"
+        " the shared helper — the per-lane miswire the gate-side"
+        " projection-swap cannot see; killed by the lossy in-population"
+        " duplicates (both arms)",
+        "key = census_corpora.content_" + 'key(rel, "lossy", lines[lineno - 1])',
+        'key = f"{rel}' + "\\tlossy\\t{' '.join(m.group(0).split())}\"",
+    ),
+    (
+        "enforcement-superset",
+        "the enforcement set widened to superset-accept (an unknown key"
+        " defaults to its own live count) — killed by the excess arm",
+        "over = len(msgs) - gf_counts." + "get(k, 0)",
+        "over = len(msgs) - gf_counts." + "get(k, len(msgs))",
+    ),
+    (
+        "population-walk-emptied",
+        "the production walk emptied/rerooted — killed by the rider-(a)"
+        " walk floor (driven through the same walk path)",
+        "for f in sorted(croot." + 'rglob("*.rs")):',
+        "for f in [" + "]:",
+    ),
+    (
+        "gate-arm-deleted",
+        "GATE_RE's `.as_secs()` alternation arm deleted — killed by the"
+        " per-arm gate-2 plant",
+        "GATE_RE = re." + r'compile(r"\.elapsed\(\)\s*(?:[<>]=?|\.as_secs\(\)\s*[<>]=?)")',
+        "GATE_RE = re." + r'compile(r"\.elapsed\(\)\s*(?:[<>]=?)")',
+    ),
+]
+
+
+def mutation_battery(src_root) -> list:
+    """Rider (d): exec a COPY of this artifact under each committed
+    MUTATION and require the mutant's self_battery to FAIL. A mutant
+    whose battery stays green is the born-broken verdict — the
+    plants cannot detect that degeneration of the artifact, which is
+    exactly how bug_047 shipped."""
+    fails = []
+    src = pathlib.Path(__file__).read_text(encoding="utf-8")
+    for name, oracle, old, new in MUTATIONS:
+        n = src.count(old)
+        if n != 1:
+            fails.append(
+                f"K-mutation `{name}`: target text matched {n} time(s), "
+                f"want exactly 1 — the fixture rotted against the artifact "
+                f"(re-pin the mutation to the load-bearing line)"
+            )
+            continue
+        ns = {
+            "__name__": f"obligation_clock_census_mutant_{name.replace('-', '_')}",
+            "__file__": str(pathlib.Path(__file__)),
+        }
+        exec(compile(src.replace(old, new, 1), f"<mutant:{name}>", "exec"), ns)
+        mutant_fails = ns["self_battery"](src_root)
+        if not mutant_fails:
+            fails.append(
+                f"K-mutation `{name}` NOT killed: the mutant's self_battery "
+                f"stayed green — the planted red survived its artifact's "
+                f"degeneration (the bug_047 born-broken criterion; oracle: "
+                f"{oracle})"
+            )
+    return fails
+
+
 def main() -> int:
     args = sys.argv[1:]
     mint = "--mint-clock-grandfather" in args
@@ -233,66 +548,19 @@ def main() -> int:
         print(f"FAIL: shared lexer self-test — {lexer_err}", file=sys.stderr)
         return 1
 
-    # --- self-test arms --------------------------------------------------
-    plant = scan_clock_code(
-        [("planted/lossy.rs", "fn f(d: Duration) -> u64 { d.as_secs() * 1000 }\n")]
-    )
-    if len(plant) != 1 or "lossless" not in plant[0][1]:
-        print(f"FAIL: the lossy-arithmetic plant did not red: {plant}", file=sys.stderr)
+    # --- self-test arms (riders (a)-(c)) + the K-mutation battery
+    # (rider (d)) — both run FIRST, every invocation -------------------
+    battery = self_battery(src_root)
+    if battery:
+        print("FAIL: obligation/clock census self-battery —", file=sys.stderr)
+        for x in battery:
+            print(f"  {x}", file=sys.stderr)
         return 1
-    plant = scan_clock_code(
-        [
-            (
-                "planted/allowed.rs",
-                "// r29-lossless: millis would overflow the wire u32; bound proven\n"
-                "fn f(d: Duration) -> u64 { d.as_secs() * 1000 }\n",
-            )
-        ]
-    )
-    if plant:
-        print(f"FAIL: the witnessed lossy site still flagged: {plant}", file=sys.stderr)
-        return 1
-    plant = scan_clock_code(
-        [("planted/gate.rs", "fn g(t: Instant) -> bool { t.elapsed() > LIMIT }\n")]
-    )
-    if len(plant) != 1 or "clock census row" not in plant[0][1]:
-        print(f"FAIL: the un-named-gate plant did not red: {plant}", file=sys.stderr)
-        return 1
-    f_l = check_landed(src_root, {"straw": ("pending", "S9")}, "obligation")
-    if len(f_l) != 1:
-        print(f"FAIL: the pending-at-verify plant did not red: {f_l}", file=sys.stderr)
-        return 1
-    # W13-AX (bug_047's defeat, reproduced then killed): two
-    # same-operator gates in ONE file — the charged fan-out shape
-    # (log_stream.rs :179/:261, the rel below is that exact
-    # grandfathered file, so the plant sits IN-POPULATION) — are
-    # grandfathered, then one gate is FIXED: the stale sweep MUST
-    # trip for the fixed site's row. Under the retired file×operator
-    # projection the surviving gate held the shared key live and the
-    # sweep stayed silent (the pre-fix red, verbatim in the landing
-    # commit body).
-    pair_rel = "rio-builder/src/log_stream.rs"
-    pair = (
-        "fn a(t: Instant) -> bool { t.elapsed() >= WINDOW }\n"
-        "fn b(u: Instant) -> bool { u.elapsed() >= BATCH_TIMEOUT }\n"
-    )
-    fixed = "fn b(u: Instant) -> bool { u.elapsed() >= BATCH_TIMEOUT }\n"
-    gf_ax = Counter(k for k, _m in scan_clock_code([(pair_rel, pair)]))
-    if len(gf_ax) != 2:
-        print(
-            f"FAIL: W13-AX — the same-operator in-population pair minted "
-            f"{len(gf_ax)} distinct key(s), want 2 (site-content keying)",
-            file=sys.stderr,
-        )
-        return 1
-    ax_excess, ax_stale = grandfather_diff(scan_clock_code([(pair_rel, fixed)]), gf_ax)
-    if ax_excess or len(ax_stale) != 1:
-        print(
-            f"FAIL: W13-AX — fixing one gate of the grandfathered pair must "
-            f"trip the stale sweep exactly once (excess={ax_excess}, "
-            f"stale={ax_stale})",
-            file=sys.stderr,
-        )
+    killed = mutation_battery(src_root)
+    if killed:
+        print("FAIL: obligation/clock census K-mutation battery —", file=sys.stderr)
+        for x in killed:
+            print(f"  {x}", file=sys.stderr)
         return 1
 
     # --- the real scan ----------------------------------------------------
