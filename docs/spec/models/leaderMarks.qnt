@@ -240,9 +240,15 @@ module leaderMarks {
   /// undiscoverable until the slot frees, at most TASK_TIMEOUT
   /// rounds; the split-phase model surfaces this term, the old atomic
   /// completion hid it). Edge- and write-caused divergence gets NO age
-  /// window — the edge writers mark() in the same transition, so the
-  /// dirty disjunct must already hold; the bool encoding could not
-  /// sustain this (the clear clobbered the mark, the
+  /// window — UNDER THIS MODULE'S FUSED ABSTRACTION: holderChange
+  /// fires the edge mark() in the same transition the Lease moves, so
+  /// the dirty disjunct must already hold. That is a premise, not a
+  /// production fact — every production edge mark is
+  /// OBSERVATION-time, a round-trip behind the apiserver — and the
+  /// leaderMarksObservationLag regime (bughunt-13 F5) unfuses the two
+  /// and prices the real window (REPAIR_BOUND: own lagged observation
+  /// or the new holder's sweep). The bool encoding could not
+  /// sustain even the fused claim (the clear clobbered the mark, the
   /// lease-181-bool-clear twin's violation). The repair itself is the
   /// next reconcile (level-triggered; pinned by the production loop
   /// tests) — the model pins DISCOVERY boundedness, which is what the
@@ -881,4 +887,238 @@ module leaderMarksBase {
     MAX_REBOUNDS = 1,
     TASK_TIMEOUT = 2
   ).*
+}
+
+// =========================================================================
+// The OBSERVATION-LAG regime (bughunt-13 F5). The live module's
+// holderChange FUSES the Lease transition with this pod's observation
+// of it: the edge-mark fires in the same step the world moves, so the
+// fused abstraction gives edge-caused divergence "no age window" BY
+// THE FUSION — a premise, not a production fact. In production every
+// edge mark() site is OBSERVATION-time (a renew round-trip after the
+// apiserver moved), and in the partition/handover case the deposed
+// ex-leader may observe nothing for a while: its stale leader label —
+// load-bearing for the leader-only Service — is repaired either by
+// its own lagged observation (the lose edge, one no-op-cost reconcile
+// behind) or by the NEW holder's peer sweep, which the pre-F5 model
+// declared environment WITHOUT pricing. This regime unfuses the two
+// and prices the window:
+//   - lagHolderChange moves the WORLD with no local mark (desire — and
+//     therefore divergence — is judged against the actual Lease);
+//   - observeEdge is the deferred local edge (the production mark
+//     sites), clearing the lag;
+//   - otherSweepsUs is the new holder's sweep stripping our stale
+//     label (production sweep_peer_leader_marks from the peer's side)
+//     — the partition-case repair, an environment action WITH the
+//     repair obligation now pricing it;
+//   - the lagTick repair cap bounds the stale-window: an unrepaired,
+//     undiscovered divergence cannot age past REPAIR_BOUND (the new
+//     holder's acquire-dirt reconcile lands within ~1–2 of its
+//     rounds; our own observation within ~1 round-trip).
+// lagDivergenceBounded is the RE-CHECKED bound: ByEdge divergence has
+// exactly that window here — not "none". The lease-f5-unpriced-lag
+// twin keeps the repairs enabled but UNFORCED (the pre-F5 "declared
+// environment" posture: no repair obligation, no sweep pricing) and
+// must violate it — repair-enabled is not repair-happening.
+//
+// SCOPE (recorded): the verify plane and both external falsifier
+// polarities are out of this regime (budgets 0; verify absent from
+// the step) — their bounds are the base regime's subject, and a
+// verify mid-lag compares against a belief this regime deliberately
+// splits from the world. Reconciles run observation-current only
+// (the not(obsLag) gate): the stale-polarity write face is the live
+// module's ByWrite subject, not the lag window's.
+module leaderMarksObservationLag {
+  import leaderMarks(
+    VERIFY_EVERY = 4,
+    MAX_TIME = 10,
+    MAX_STRIPS = 0,
+    MAX_ADDS = 0,
+    MAX_VERIFY_FAILS = 0,
+    MAX_HOLDER_CHANGES = 2,
+    MAX_REBOUNDS = 0,
+    TASK_TIMEOUT = 2
+  ).*
+
+  /// The stale-label repair budget in rounds: min(our own lagged
+  /// observation — production one renew round-trip; the new holder's
+  /// first successful reconcile+sweep — acquire dirt, spawn, patch:
+  /// ~2 of its rounds). 3 carries one round of slack.
+  val REPAIR_BOUND = 3
+
+  /// An our-leadership-affecting world move not yet locally observed.
+  var obsLag: bool
+
+  /// The world's holder moves with NO local mark — the unfused half
+  /// the live module's holderChange hides. Desire (and wrongness)
+  /// move NOW; our edge fires at observeEdge.
+  // Environment: the Lease changing hands at the apiserver, unfused from this pod's observation (the F5 window the live module's fused holderChange hides)
+  action lagHolderChange(h: HolderState): bool = all {
+    holderChanges < MAX_HOLDER_CHANGES,
+    h != holder,
+    holder' = h,
+    obsLag' = (obsLag or leadingOf("us", h) != leadingOf("us", holder)),
+    marked' = marked, cleared' = cleared,
+    marks' = marks, task' = task, clock' = clock,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds,
+    verifyFails' = verifyFails,
+    holderChanges' = holderChanges + 1, rebounds' = rebounds,
+    clobberErased' = clobberErased,
+    wrongSince' = stampWrong(marks, h, wrongSince, clock),
+    wrongCause' = stampCause(marks, h, wrongSince, wrongCause, ByEdge),
+  }
+
+  // Environment: the world's move, any target (nondet wrapper of lagHolderChange)
+  action lagHolderChangeAny = {
+    nondet h = Set(NoLeader, Leader("us"), Leader("other")).oneOf()
+    lagHolderChange(h)
+  }
+
+  /// The deferred local edge: this pod's round-trip observes the
+  /// moved Lease and runs the edge — including the mark the live
+  /// module fuses into holderChange.
+  // Mirrors: rio-lease/src/lib.rs:observe_held_while_believing
+  action observeEdge = all {
+    obsLag,
+    obsLag' = false,
+    marked' = marked + 1,
+    cleared' = cleared,
+    holder' = holder, marks' = marks, task' = task, clock' = clock,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds,
+    verifyFails' = verifyFails,
+    holderChanges' = holderChanges, rebounds' = rebounds,
+    clobberErased' = clobberErased,
+    wrongSince' = stampWrong(marks, holder, wrongSince, clock),
+    wrongCause' = stampCause(marks, holder, wrongSince, wrongCause, NoCause),
+  }
+
+  /// The NEW holder's peer sweep strips OUR stale leader label — the
+  /// partition-case repair (a deposed ex-leader cannot remove its
+  /// own; production sweep_peer_leader_marks from the peer's side).
+  // Environment: the new holder's own reconcile sweeping our stale label (sweep_peer_leader_marks from the peer pod — the partition-case repair the pre-F5 model left unpriced)
+  action otherSweepsUs = all {
+    holder == Leader("other"),
+    marks.get("us"),
+    marks' = marks.put("us", false),
+    holder' = holder, marked' = marked, cleared' = cleared,
+    task' = task, clock' = clock,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds,
+    verifyFails' = verifyFails,
+    holderChanges' = holderChanges, rebounds' = rebounds,
+    clobberErased' = clobberErased, obsLag' = obsLag,
+    wrongSince' = stampWrong(marks.put("us", false), holder, wrongSince, clock),
+    wrongCause' = stampCause(marks.put("us", false), holder, wrongSince, wrongCause, NoCause),
+  }
+
+  /// One round passes, carrying THE REPAIR OBLIGATION: an unrepaired,
+  /// undiscovered divergence of OUR marks cannot age past
+  /// REPAIR_BOUND — the new holder's sweep cadence and our own
+  /// observation round-trip are both inside it (production runs both
+  /// loops by construction; the pre-F5 model priced neither).
+  // Mirrors: rio-lease/src/lib.rs:run_lease_loop_with_client
+  action lagTick = all {
+    clock < MAX_TIME,
+    (wrongUnder(marks, holder, "us") and not(dirty) and task == NoTask) implies
+      (clock + 1 - wrongSince.get("us") <= REPAIR_BOUND),
+    (task != NoTask) implies (clock + 1 - taskSince <= TASK_TIMEOUT),
+    clock' = clock + 1,
+    holder' = holder, marks' = marks, marked' = marked,
+    cleared' = cleared, task' = task,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds,
+    verifyFails' = verifyFails,
+    holderChanges' = holderChanges, rebounds' = rebounds,
+    clobberErased' = clobberErased, obsLag' = obsLag,
+    wrongSince' = stampWrong(marks, holder, wrongSince, clock + 1),
+    wrongCause' = stampCause(marks, holder, wrongSince, wrongCause, NoCause),
+  }
+
+  /// Reconciles run observation-current only (see SCOPE).
+  // Mirrors: rio-lease/src/lib.rs:maybe_spawn_leader_marks
+  action lagReconcileSpawn = all {
+    not(obsLag),
+    reconcileSpawn,
+    obsLag' = obsLag,
+  }
+  // Mirrors: rio-lease/src/lib.rs:spawn_patch_leader_marks
+  action lagReconcilePatched = all {
+    reconcilePatched,
+    obsLag' = obsLag,
+  }
+  // Mirrors: rio-lease/src/lib.rs:clear_through
+  action lagReconcileClear = all {
+    reconcileClear,
+    obsLag' = obsLag,
+  }
+  // Mirrors: rio-lease/src/lib.rs:spawn_patch_leader_marks
+  action lagReconcileFail = all {
+    reconcileFail,
+    obsLag' = obsLag,
+  }
+
+  // Environment: the regime's init — the live init plus the lag flag down
+  action lagInit = all {
+    init,
+    obsLag' = false,
+  }
+
+  /// THE RE-CHECKED BOUND (F5): edge-caused divergence of OUR marks
+  /// has exactly the REPAIR_BOUND window — not "none" (the fused
+  /// abstraction's premise) and not "unbounded environment" (the
+  /// pre-F5 partition posture). Discovered divergence (dirty/task)
+  /// rides the live module's reconcile machinery as usual.
+  val lagDivergenceBounded =
+    wrongUnder(marks, holder, "us") implies or {
+      dirty,
+      task != NoTask,
+      clock - wrongSince.get("us") <= REPAIR_BOUND,
+    }
+
+  /// Witness (expect-violation): the lag window actually opens — a
+  /// stale-marked "us" while the world moved away is reachable with
+  /// the lag pending (the regime's subject is exercised).
+  val noStaleLagWindow = not(and {
+    obsLag,
+    wrongUnder(marks, holder, "us"),
+  })
+
+  action lagStep = any {
+    lagTick,
+    lagHolderChangeAny,
+    observeEdge,
+    otherSweepsUs,
+    lagReconcileSpawn,
+    lagReconcilePatched,
+    lagReconcileClear,
+    lagReconcileFail,
+  }
+
+  /// W13-M, end to end: acquire and converge (lagged observation),
+  /// the world moves AWAY (no local mark — the window opens), the
+  /// stale label lives one round undiscovered, and the NEW holder's
+  /// sweep repairs it before our observation ever lands — the
+  /// partition-case repair, priced.
+  run lagWindowSweptRun =
+    lagInit
+      .then(lagHolderChange(Leader("us")))
+      .then(observeEdge)
+      .then(lagReconcileSpawn)
+      .then(lagReconcilePatched)
+      .then(lagReconcileClear)
+      .then(lagHolderChange(Leader("other")))
+      .then(lagTick)
+      .then(otherSweepsUs)
+      .expect(all {
+        not(marks.get("us")),
+        wrongSince.get("us") == -1,
+        obsLag,
+      })
+      .then(observeEdge)
+      .then(lagReconcileSpawn)
+      .then(lagReconcilePatched)
+      .then(lagReconcileClear)
+      .expect(all {
+        not(marks.get("us")),
+        not(dirty),
+        not(obsLag),
+      })
 }

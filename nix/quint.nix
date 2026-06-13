@@ -1881,6 +1881,54 @@ rec {
       main = "leaderMarksBase";
     };
 
+    # The OBSERVATION-LAG regime (bughunt-13 F5): the live module's
+    # holderChange fuses the Lease transition with this pod's
+    # observation — the fused abstraction gives edge divergence "no
+    # age window" as a premise. This regime unfuses them: the world
+    # moves with no local mark (lagHolderChange), observation lands a
+    # round-trip later (observeEdge — the production mark sites), the
+    # NEW holder's sweep repairs the partition face (otherSweepsUs —
+    # priced environment, no longer prose), and the lagTick repair
+    # obligation bounds the stale-label window at REPAIR_BOUND.
+    # Headline lagDivergenceBounded: ByEdge divergence has exactly
+    # that window — not "none". Paired pin:
+    # quint-lease-calib-f5-unpriced-lag (repairs enabled-but-unforced,
+    # the pre-F5 "declared environment" posture, must falsify).
+    # Measured: exhaustive TLC ~3s at the wired constants.
+    quint-leader-marks-lag = mkQuintCheck {
+      name = "leader-marks-lag";
+      spec = "leaderMarks";
+      main = "leaderMarksObservationLag";
+      step = "lagStep";
+      init = "lagInit";
+      invariants = [
+        "boundsOK"
+        "lagDivergenceBounded"
+      ];
+    };
+
+    # Non-vacuity witness: the lag window actually OPENS — a
+    # stale-marked ex-leader with its observation pending is reachable
+    # (the regime's subject is exercised, not vacuously bounded).
+    quint-leader-marks-lag-witness-window = mkQuintWitnessCheck {
+      name = "leader-marks-lag-witness-window";
+      spec = "leaderMarks";
+      main = "leaderMarksObservationLag";
+      witness = "noStaleLagWindow";
+      step = "lagStep";
+      init = "lagInit";
+    };
+
+    # The W13-M run: the window opens, lives one undiscovered round,
+    # and the NEW holder's sweep repairs it before our observation
+    # lands — the partition-case repair, priced end to end.
+    quint-leader-marks-lag-runs = mkQuintRunCheck {
+      name = "leader-marks-lag-runs";
+      spec = "leaderMarks";
+      main = "leaderMarksObservationLag";
+      match = "lagWindowSweptRun";
+    };
+
     # ---- F1 calibration pins (expect-violation; the pre-fix
     # behaviors frozen as permanent regression evidence — the vacuity
     # guards for the three green lease checks above) ------------------
@@ -2026,6 +2074,24 @@ rec {
       main = "leaseCalibF1StandbyAdd";
       witness = "nonLeaderDivergenceBounded";
       step = "calibStep";
+      extraSpecs = [ "leaderMarks" ];
+    };
+
+    # bughunt-13 audit F5 pre-fix: the UNPRICED observation lag — the
+    # partition-case repairs (own lagged observation; the new holder's
+    # sweep) enabled but unforced, the "declared environment" posture.
+    # A deposed ex-leader's stale leader label ages past REPAIR_BOUND
+    # with observation never landing and no sweep in the alphabet;
+    # lagDivergenceBounded falls. Repair-enabled is not
+    # repair-happening — the enabledness-as-liveness pin for the lag
+    # plane.
+    quint-lease-calib-f5-unpriced-lag = mkQuintWitnessCheck {
+      name = "lease-calib-f5-unpriced-lag";
+      spec = "calibration/lease-f5-unpriced-lag";
+      main = "leaseCalibF5UnpricedLag";
+      witness = "lagDivergenceBounded";
+      step = "calibStep";
+      init = "lagInit";
       extraSpecs = [ "leaderMarks" ];
     };
 
