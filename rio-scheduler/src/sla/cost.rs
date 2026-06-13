@@ -4205,7 +4205,6 @@ mod tests {
         );
     }
 
-    // r[verify sched.sla.one-weight-law]
     /// **W12-AI (bug_044, red-first; triage-corrected magnitudes)** —
     /// *per-key rates fold over per-key windows; population: the
     /// capture-gap compound event + the steady state.* The compound

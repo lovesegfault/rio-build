@@ -5473,7 +5473,7 @@ boot window, pinned by the wiring regression test.
   probe, degenerate fallback): the quantile's evidence universe is an
   explicit population parameter --- always the full row set, every row
   weighted under the one decay law
-  (#rref("sched.sla.one-weight-law")) --- never an implicit property of
+  (#rref("sched.sla.one-weight-law+2")) --- never an implicit property of
   which vector an arm happened to collect. Subset quantiles are
   census-red, not comment-policed.
 ]
@@ -5486,15 +5486,20 @@ disk --- estimator quality silently depended on which arm a pname landed
 in. The `(axis, arm)` census (W11-BC) is the belt: per-axis evidence
 reads outside the chokepoints drift its committed counts.
 
-#r("sched.sla.one-weight-law")[
+#r("sched.sla.one-weight-law+2")[
   The aggregation chokepoints' weight law MUST be total over
-  sub-populations: every row's fold weight derives from the ONE producer
+  sub-populations AND denominated over ONE ordinal domain: every row's
+  scalar-fold weight derives from the ONE producer
   ($w_i = 0.5^("ordinal_age" slash 20) dot 0.5^"vdist"$ ---
-  #rref("sched.sla.hw-class.sample-weight-ordinal")) --- seated rows carry
-  their ring weight (the law plus the anchor floor), unseated rows derive
-  the same law from the shared completed_at ordering (the slice index IS
-  the ordinal; vdist floored at 0). Exempt defaults are unrepresentable:
-  no weight enters a quantile fold except through the law.
+  #rref("sched.sla.hw-class.sample-weight-ordinal")) with BOTH arguments
+  computed over the full row slice (ordinal age = slice index from
+  newest under the shared completed_at ordering; vdist = full-slice
+  version distance), seated and unseated rows alike. Ring weights ---
+  the same law over the fit subset plus the anchor floor --- are
+  RESERVED for the seated design matrix, whose universe IS the subset;
+  they MUST NOT enter a c-independent scalar fold. Exempt defaults and
+  second weight parameters are unrepresentable: the producer derives
+  both arguments itself, so no caller can pass a mismatched domain.
 ]
 
 merged_bug_022: the wave-11 chokepoint seal enumerated the POPULATION
@@ -5505,10 +5510,23 @@ weight is the weight of the NEWEST seat row, so in a mixed-age ring the
 oldest evidence structurally outweighed all fresh evidence until ring
 eviction: `disk_p90` pinned at legacy peaks, false `exceeds_ceiling`
 tier rejection, and the degenerate-Independent fallback re-serving the
-stale footprint. The sub-population weight census (\[GEN-SET\],
-`w12_ad_weight_census`) derives the fold-site universe from the module
-tree and REDs on any exempt arm; W12-AD pins the inverse-population
-direction the wave-11 fixtures never drove.
+stale footprint. merged_bug_004 (the wave-12 close's own survival): the
+one-law seal unified the decay FUNCTION without unifying the ordinal
+DOMAIN --- seated rows kept ring weights whose ordinal ages were SUBSET
+ordinals (plus the anchor floor, a c-curve identifiability device with
+no business in c-independent folds), commensurable with the full-slice
+scale only in the unique interleaving where seated rows form the newest
+suffix --- exactly the interleaving the regression fixture drove. In the
+inverse population (stale seated trio + fresh unseated majority:
+recovered-derivation/non-k8s history) the trio pinned `disk_p90` past
+the 0.9 weighted-quantile cutoff. The sub-population weight census
+(\[GEN-SET\], `w12_ad_weight_census`) derives the fold-site universe
+from the module tree, REDs on any exempt arm, and its law-consult pin is
+DOMAIN-checked (argument provenance: full-slice age expression +
+in-body vdist derivation + zero ring/anchor consults --- R31'(c), the
+syntactic `sample_weight(` grep was structurally blind to the domain
+mismatch); W12-AD and W13-S pin BOTH interleavings of both mixed-ring
+directions.
 
 #r("sched.sla.one-fence-axis")[
   Rows declared one atomic persist unit MUST share ONE fencing axis ---

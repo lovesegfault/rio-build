@@ -173,7 +173,7 @@ pub fn refit(
         .collect();
 
     if fit_rows.is_empty() {
-        return probe_only(key, rows, aggregate_disk_p90(rows, &[]));
+        return probe_only(key, rows, aggregate_disk_p90(rows));
     }
 
     let versions: Vec<_> = fit_rows.iter().map(|r| r.version.clone()).collect();
@@ -330,7 +330,7 @@ pub fn refit(
     // bug_072: the degenerate-Independent arm consumes THE mem
     // aggregator's all-rows fold — same evidence universe as the
     // probe arm (one aggregation fn per scalar axis, every arm).
-    let (mut mem, weak) = fit_memory(&cs, &ms, &w, n_eff_ring.0, aggregate_mem_p90(rows, &w));
+    let (mut mem, weak) = fit_memory(&cs, &ms, &w, n_eff_ring.0, aggregate_mem_p90(rows));
     if weak {
         ::metrics::counter!(
             "rio_scheduler_sla_mem_fit_weak_total",
@@ -369,7 +369,7 @@ pub fn refit(
     // always: ring weights where the row holds a c-axis seat, unit
     // weights elsewhere. Both polarity faces destructure from the ONE
     // mint (sched.sla.disk-polarity-fork).
-    let disk_fork = aggregate_disk_p90(rows, &w);
+    let disk_fork = aggregate_disk_p90(rows);
     let (disk_p90, disk_p90_raw) = match disk_fork {
         Some(f) => (Some(f.floored), Some(f.raw)),
         None => (None, None),
@@ -755,8 +755,8 @@ pub(super) fn reassign_tier(
 /// c-axis seat, unit weights elsewhere. Consumed by the probe arm AND
 /// the full-fit degenerate-Independent arm (`fit_memory`), so
 /// estimator quality no longer depends on which arm a pname lands in.
-fn aggregate_mem_p90(rows: &[BuildSampleRow], fit_w: &[f64]) -> MemBytes {
-    let (vals, ws) = axis_samples(rows, fit_w, |r| Some(r.peak_memory_bytes as f64));
+fn aggregate_mem_p90(rows: &[BuildSampleRow]) -> MemBytes {
+    let (vals, ws) = axis_samples(rows, |r| Some(r.peak_memory_bytes as f64));
     if vals.is_empty() {
         return MemBytes(0);
     }
@@ -775,8 +775,8 @@ pub(super) struct DiskP90Fork {
 
 // r[impl sched.sla.one-aggregator+2]
 // r[impl sched.sla.disk-polarity-fork]
-fn aggregate_disk_p90(rows: &[BuildSampleRow], fit_w: &[f64]) -> Option<DiskP90Fork> {
-    let (vals, ws) = axis_samples(rows, fit_w, |r| r.peak_disk_bytes.map(|b| b as f64));
+fn aggregate_disk_p90(rows: &[BuildSampleRow]) -> Option<DiskP90Fork> {
+    let (vals, ws) = axis_samples(rows, |r| r.peak_disk_bytes.map(|b| b as f64));
     // live060-c: the population gate lives INSIDE the one producer —
     // BOTH polarity faces are gated (the single-sample hazard has a
     // reject face too; gating in `DiskFitEnvelope::derive` instead
@@ -826,49 +826,42 @@ const DISK_WITNESS_MIN_PEAKS: usize = 3;
 /// measured-at-first-samples rider as the gate.
 const DISK_SHRINK_HEADROOM: f64 = 1.2;
 
-// r[impl sched.sla.one-weight-law]
+// r[impl sched.sla.one-weight-law+2]
 /// Shared population law for the per-axis aggregation chokepoints:
 /// the evidence universe is ALWAYS the full row set — quantifier: census(test: w11_bc_axis_arm_census) — and EVERY row's
 /// fold weight derives from the ONE decay law
 /// [`sample_weight`]`(ordinal_age, vdist)` — quantifier: census(test: w12_ad_weight_census) —
-/// total over sub-populations (merged_bug_022). A row holding a c-axis
-/// ring seat (`cpu_limit_cores.is_some()`, in row order) carries its
-/// ring weight from `fit_w` (the same law plus the anchor floor,
-/// computed once in `refit`); a row without a seat (legacy
-/// no-cpu_limit history) derives the same law from the shared
-/// completed_at ordering — the slice index IS its ordinal (the
-/// pre-fix "they carry no ordinal" premise was FALSE: the slice is
-/// completed_at-ascending) — with vdist floored at 0. `fit_w` empty
-/// (the probe arm computes no ring) ⇒ every row takes the unseated
-/// law. There is NO exempt default: a flat unit weight let the oldest
-/// evidence structurally outweigh all fresh evidence until ring
-/// eviction, pinning disk_p90 at legacy peaks and falsely tripping
-/// `exceeds_ceiling` tier rejection.
+/// over ONE ordinal DOMAIN: both arguments denominate over the full
+/// row slice (ordinal age = slice index from newest — the slice is
+/// completed_at-ascending; vdist = full-slice version distance),
+/// seated and unseated rows alike (merged_bug_004: "one law" is only
+/// one law if its parameters have one producer over one universe —
+/// seated rows previously carried ring weights whose ordinal ages
+/// were SUBSET ordinals plus the anchor floor, commensurable with the
+/// full-slice scale only when seated rows form the newest suffix; in
+/// the inverse population a stale seated trio held the top of the
+/// fold past the 0.9 quantile). Ring weights (the same law over the
+/// fit subset, plus the anchor floor) are RESERVED for the seated
+/// design matrix, whose universe IS the subset — they never enter a
+/// scalar fold, and the anchor floor (a c-curve identifiability
+/// device) no longer leaks into c-independent disk/mem axes. There
+/// is NO exempt default and NO second weight parameter: the producer
+/// derives both arguments itself, so a caller cannot pass a
+/// mismatched domain (merged_bug_022; merged_bug_004).
 fn axis_samples(
     rows: &[BuildSampleRow],
-    fit_w: &[f64],
     value: impl Fn(&BuildSampleRow) -> Option<f64>,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = rows.len();
-    let unseated = |i: usize| sample_weight((n - 1 - i) as u32, 0);
-    let mut seat = 0usize;
+    let versions: Vec<Option<String>> = rows.iter().map(|r| r.version.clone()).collect();
+    let current_v = rows.last().and_then(|r| r.version.clone());
+    let vdists = compute_vdists(&versions, current_v.as_deref());
     let mut vals = Vec::new();
     let mut ws = Vec::new();
     for (i, r) in rows.iter().enumerate() {
-        let wgt = if r.cpu_limit_cores.is_some() && !fit_w.is_empty() {
-            let x = fit_w.get(seat).copied();
-            seat += 1;
-            // A ring shorter than the seat walk is a refit-construction
-            // bug (both derive from the same fit_rows slice) — fall to
-            // the law, never to an exempt flat weight.
-            debug_assert!(x.is_some(), "fit_w shorter than the seat walk");
-            x.unwrap_or_else(|| unseated(i))
-        } else {
-            unseated(i)
-        };
         if let Some(v) = value(r) {
             vals.push(v);
-            ws.push(wgt);
+            ws.push(sample_weight((n - 1 - i) as u32, vdists[i]));
         }
     }
     (vals, ws)
@@ -893,7 +886,7 @@ fn probe_only(
         key: key.clone(),
         fit: DurationFit::Probe,
         mem: MemFit::Independent {
-            p90: aggregate_mem_p90(rows, &[]),
+            p90: aggregate_mem_p90(rows),
         },
         disk_p90,
         disk_p90_raw,
@@ -2262,7 +2255,7 @@ mod disk_axis_tests {
         );
     }
 
-    // r[verify sched.sla.one-weight-law]
+    // r[verify sched.sla.one-weight-law+2]
     /// **W12-AD (merged_bug_022, red-first)** — *the aggregator's weight
     /// law is total over sub-populations: BOTH directions of the mixed
     /// ring.* The INVERSE-population fixture the wave-11 seal never
@@ -2295,6 +2288,84 @@ mod disk_axis_tests {
         assert!(
             !super::super::fit::DiskFitEnvelope::exceeds_ceiling(f.disk_p90_raw, 50 * GI as u64),
             "the false tier rejection clears once fresh evidence wins"
+        );
+    }
+
+    // r[verify sched.sla.one-weight-law+2]
+    /// **W13-S (merged_bug_004, red-first)** — *one ordinal domain:
+    /// seated rows take the SAME full-slice scalar-fold weights as
+    /// unseated rows; population: BOTH interleavings (R31'(v)) — the
+    /// INVERSE population (stale SEATED trio + fresh UNSEATED
+    /// majority: recovered-derivation/non-k8s history) the W12-AD
+    /// fixture never drove.* Pre-fix red (transcript in the commit
+    /// body): the trio's weights were SUBSET ordinals (ages 0,1,2
+    /// within the 3-row seated subset, plus the anchor floor) — ~2.9
+    /// of ~21.5 total fold mass, >10% at the top of the value order —
+    /// so disk_p90 pinned at the 200 GiB legacy peak past the 0.9
+    /// weighted-quantile cutoff and exceeds_ceiling falsely tripped:
+    /// the merged_bug_022 class reopened one population over.
+    /// Post-fix the trio ages over the FULL slice (ordinals 29..31 ⇒
+    /// ~1.1 of ~19.7 mass, <10%) and the quantile reads the live
+    /// population.
+    #[test]
+    fn w13_s_inverse_population_one_ordinal_domain() {
+        const GI: i64 = 1 << 30;
+        // Stale SEATED trio first (oldest), fresh UNSEATED majority.
+        let mut rows: Vec<BuildSampleRow> = (0..3)
+            .map(|_| disk_row(Some(4.0), 100.0, Some(200 * GI)))
+            .collect();
+        rows.extend((0..29).map(|_| disk_row(None, 50.0, Some(5 * GI))));
+        let f = refit(&key(), &rows, None, &[], &HwTable::default(), None);
+        let got = f.disk_p90_raw.expect("peaked samples fit");
+        assert!(
+            got.bytes() <= 10 * GI as u64,
+            "disk_p90 follows the fresh population (~5 GiB) once the \
+             stale seated trio decays under full-slice ordinals; got \
+             {} GiB (pre-fix: pinned at the 200 GiB legacy peak by \
+             subset ordinals + the anchor floor)",
+            got.bytes() / (1 << 30)
+        );
+        assert!(
+            !super::super::fit::DiskFitEnvelope::exceeds_ceiling(f.disk_p90_raw, 50 * GI as u64),
+            "the false tier rejection clears in the inverse population"
+        );
+        // The straight population (seated rows newest — the one
+        // interleaving where the two scales coincided) keeps the same
+        // law: fresh seated evidence wins there too (both
+        // interleavings driven, R31'(v)).
+        let mut straight: Vec<BuildSampleRow> = (0..29)
+            .map(|_| disk_row(None, 50.0, Some(200 * GI)))
+            .collect();
+        straight.extend((0..3).map(|_| disk_row(Some(4.0), 100.0, Some(5 * GI))));
+        let f2 = refit(&key(), &straight, None, &[], &HwTable::default(), None);
+        let got2 = f2.disk_p90_raw.expect("witnessed");
+        assert!(
+            got2.bytes() >= 100 * GI as u64,
+            "29 stale 200 GiB rows still dominate 3 fresh 5 GiB seats \
+             — recency decays, it does not erase history: {}",
+            got2.bytes()
+        );
+    }
+
+    /// **W13-S2 (merged_bug_004)** — *the seated FIT's weight path is
+    /// byte-stable: the design matrix keeps ring weights (subset
+    /// ordinals + anchor floor are RIGHT for the fit universe).* The
+    /// pinned values were derived at the pre-fix tree and must
+    /// survive the scalar-domain split untouched — the fix moves the
+    /// SCALAR folds onto full-slice ordinals and must not touch the
+    /// duration-fit weight path (ring.weighted_rows → w → n_eff/Σw).
+    #[test]
+    fn w13_s2_seated_fit_weight_path_byte_stable() {
+        let rows: Vec<BuildSampleRow> = (0..8)
+            .map(|i| disk_row(Some(2.0 + f64::from(i % 4)), 100.0 + f64::from(i), None))
+            .collect();
+        let f = refit(&key(), &rows, None, &[], &HwTable::default(), None);
+        assert_eq!(
+            format!("{:.6}/{:.6}/{:.6}", f.n_eff_ring.0, f.fit_df.0, f.sum_w),
+            "7.949938/7.949938/7.108503",
+            "the ring-weight fit path moved — the scalar-domain split \
+             must not touch the design matrix (pinned at the pre-fix \
+             tree, 750323568 + c1/c2)"
         );
     }
 
@@ -2380,7 +2451,7 @@ mod disk_axis_tests {
         &rest[..end]
     }
 
-    // r[verify sched.sla.one-weight-law]
+    // r[verify sched.sla.one-weight-law+2]
     /// **The weight census, jurisdiction + population faces (CE-1).**
     /// The scan universe derives from `mod.rs` (a hand module-list
     /// drifts RED here); population floor: the walk derived ≥1 fold
@@ -2419,12 +2490,30 @@ mod disk_axis_tests {
                  weight law (re-derive, never hand-wave)"
             );
         }
-        // Law-consult pin: the producer body consults the law and carries
-        // NO exempt flat-weight default.
+        // Law-consult pin, DOMAIN-CHECKED (merged_bug_004, R31'(c)):
+        // the law's arguments are full-slice quantities derived IN
+        // the producer — the pre-fix syntactic `sample_weight(` grep
+        // was structurally blind to a subset-ordinal domain mismatch.
         let body = axis_samples_body(include_str!("ingest.rs"));
         assert!(
-            body.contains("sample_weight("),
-            "axis_samples consults the one decay law"
+            body.contains("sample_weight((n - 1 - i) as u32, vdists[i])"),
+            "axis_samples consults the one decay law with FULL-SLICE \
+             age and FULL-SLICE vdist (argument provenance)"
+        );
+        assert!(
+            body.contains("compute_vdists("),
+            "vdist derives in-body over the full slice — never a \
+             caller-passed subset quantity"
+        );
+        assert!(
+            !body.contains("fit_w"),
+            "no second weight parameter — a caller cannot pass a \
+             mismatched ordinal domain (merged_bug_004)"
+        );
+        assert!(
+            !body.contains("weighted_rows(") && !body.contains("anchor"),
+            "no ring/anchor-floor consult in a scalar fold — the \
+             c-curve identifiability floor stays in the fit domain"
         );
         assert!(
             !body.contains("1.0"),
@@ -2470,6 +2559,24 @@ mod disk_axis_tests {
         assert!(
             body.contains("1.0"),
             "the totality pin REDs on the planted exempt arm"
+        );
+        // (5) SUBSET-ORDINAL plant (merged_bug_004's K-mutation —
+        // R31'(c)): a body re-growing a seated branch that consults a
+        // caller-passed ring REDs the domain-checked pin; the
+        // pre-upgrade syntactic pin stayed GREEN on exactly this body
+        // (it contains `sample_weight(` and no flat `1.0`) — the
+        // born-blind consult the upgrade kills.
+        let subset = "fn axis_samples(rows: &[Row], fit_w: &[f64]) -> Vec<f64> {\n    let w = if seated { fit_w[seat] } else { sample_weight((n - 1 - i) as u32, 0) };\n}\nfn next() {}\n";
+        let body = axis_samples_body(subset);
+        assert!(
+            body.contains("sample_weight(") && !body.contains("1.0"),
+            "the RETIRED syntactic pin is green on the subset-ordinal \
+             strawman — blind to the domain mismatch"
+        );
+        assert!(
+            body.contains("fit_w"),
+            "the DOMAIN-checked pin REDs on the planted \
+             subset-ordinal arm (the fit_w consult)"
         );
     }
 
