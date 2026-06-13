@@ -1784,7 +1784,7 @@ rec {
     # TLC ~10s at the wired constants (transcript in the introducing
     # commit) — the default 1800s budget is ~180x headroom.
     # r[verify sched.lease.marks-verify+2]
-    # r[verify sched.lease.deletion-cost+3]
+    # r[verify sched.lease.deletion-cost+4]
     quint-leader-marks = mkQuintCheck {
       name = "leader-marks";
       spec = "leaderMarks";
@@ -1819,7 +1819,7 @@ rec {
 
     # Non-vacuity witness (bughunt-13 F2): the PEER-marked state is
     # actually reached — the reconcilePatched sweep branch the
-    # deletion-cost+3 marker rides was dead text in every reachable
+    # deletion-cost marker rides was dead text in every reachable
     # pre-F1 state (nothing could set marks["other"]); externalAdd
     # made it live, sweepStripsForeignPeerLabelRun drives it
     # deterministically, and this witness pins the explored space.
@@ -1927,6 +1927,31 @@ rec {
       spec = "leaderMarks";
       main = "leaderMarksObservationLag";
       match = "lagWindowSweptRun";
+    };
+
+    # The CONVERGENCE regime (bughunt-13 F6): repair is a convergence
+    # property, not an enabled action. reconcileFail is BUDGETED (it
+    # was the only unbudgeted environment action — the spawn→fail
+    # livelock satisfied the divergence bounds' dirty disjunct forever
+    # while repairing nothing) and each failure consumes its one-round
+    # production cycle floor; the tickRound spawn obligation makes the
+    # retry actually re-arm (production's once-per-tick spawn gate);
+    # marksConvergenceBounded then demands divergence actually CLEAR
+    # within convergenceBound. Wired in this dedicated regime because
+    # its horizon (12) exceeds the bound (9); the base regime's richer
+    # fault menu pushes the parametric bound past ITS horizon, where
+    # the val would be a green nobody could lose — recorded here, that
+    # is why it is NOT in quint-leader-marks's list. Paired pin:
+    # quint-lease-calib-f6-fail-livelock. Measured: exhaustive TLC ~1s
+    # at the wired constants.
+    quint-leader-marks-convergence = mkQuintCheck {
+      name = "leader-marks-convergence";
+      spec = "leaderMarks";
+      main = "leaderMarksConvergence";
+      invariants = [
+        "boundsOK"
+        "marksConvergenceBounded"
+      ];
     };
 
     # ---- F1 calibration pins (expect-violation; the pre-fix
@@ -2092,6 +2117,23 @@ rec {
       witness = "lagDivergenceBounded";
       step = "calibStep";
       init = "lagInit";
+      extraSpecs = [ "leaderMarks" ];
+    };
+
+    # bughunt-13 audit F6 pre-fix: the UNBUDGETED reconcile-failure
+    # world — the spawn→fail livelock as a lawful forever-schedule.
+    # The witness is the LIVE convergence regime's certified bound
+    # restated as a literal (the parametric form self-calibrates with
+    # the failure budget and would absorb the livelock); the livelock
+    # outruns it while marksDivergenceBounded stays GREEN over the
+    # same trace — discovery satisfied forever, repair never. The
+    # discovery-not-repair pin, the marks plane's
+    # enabledness-as-liveness kill.
+    quint-lease-calib-f6-fail-livelock = mkQuintWitnessCheck {
+      name = "lease-calib-f6-fail-livelock";
+      spec = "calibration/lease-f6-fail-livelock";
+      main = "leaseCalibF6FailLivelock";
+      witness = "marksConvergeWithinLiveBudget";
       extraSpecs = [ "leaderMarks" ];
     };
 

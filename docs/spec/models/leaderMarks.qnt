@@ -27,7 +27,7 @@
 //     polarity — is re-discovered within one verify interval; the
 //     selector-membership residual is the platform's, priced in the
 //     rule)
-//   - sched.lease.deletion-cost+3 (the holder-aware sweep: the peer
+//   - sched.lease.deletion-cost+4 (the holder-aware sweep: the peer
 //     sweep spares the current Lease holder)
 //
 // SCOPE, deliberately narrow: two pods, one reconciler ("us" runs the
@@ -98,6 +98,19 @@ module leaderMarks {
   /// real failure exceeded it. Budgeted like every other environment
   /// action; the divergence bounds carry the failure term.
   const MAX_VERIFY_FAILS: int
+  /// Failed RECONCILE attempts per trace (bughunt-13 F6). Pre-F6,
+  /// reconcileFail was the ONLY unbudgeted environment action — the
+  /// spawn→fail cycle satisfied the divergence bounds' dirty disjunct
+  /// FOREVER (discovery-not-repair: a livelock that repairs nothing
+  /// is "discovered" at every state), and no convergence property
+  /// existed anywhere. Production's analog is the persistent PATCH
+  /// 403: a platform failure the code prices as a warn-stream
+  /// forever-state. Budgeting the failures is what makes a
+  /// convergence claim STATEABLE: under at most this many failures,
+  /// divergence must actually CLEAR (marksConvergenceBounded in the
+  /// convergence regime) — beyond the budget is the platform's named
+  /// failure, never a silent satisfaction of the repair contract.
+  const MAX_RECONCILE_FAILS: int
   /// Holder changes per trace (state-space bound).
   const MAX_HOLDER_CHANGES: int
   /// Rebound edges per trace (the merged_bug_212 dirtying site;
@@ -170,6 +183,8 @@ module leaderMarks {
   var adds: int
   /// Failed verify attempts so far (the F3 fallibility).
   var verifyFails: int
+  /// Failed reconcile attempts so far (the F6 budget).
+  var reconcileFails: int
   /// Holder changes so far.
   var holderChanges: int
   /// Rebound edges so far.
@@ -223,6 +238,7 @@ module leaderMarks {
     strips <= MAX_STRIPS,
     adds <= MAX_ADDS,
     verifyFails <= MAX_VERIFY_FAILS,
+    reconcileFails <= MAX_RECONCILE_FAILS,
     holderChanges <= MAX_HOLDER_CHANGES,
     rebounds <= MAX_REBOUNDS,
     cleared <= marked,
@@ -301,7 +317,7 @@ module leaderMarks {
   /// lease-181-bool-clear twin restores clear-all and must violate.
   val notClobbered = not(clobberErased)
 
-  // The holder-aware sweep half (deletion-cost+3) is encoded
+  // The holder-aware sweep half (sched.lease.deletion-cost) is encoded
   // structurally in reconcilePatched (the sweep skips sweepHolder,
   // captured in the same pass) and pinned at the production level by
   // the red-first unit peer_sweep_spares_current_lease_holder — NOT by
@@ -326,7 +342,7 @@ module leaderMarks {
 
   /// Witness (expect-violation): the peer-marked state is actually
   /// reached in the explored space — the sweep branch the
-  /// deletion-cost+3 marker rides stopped being dead text when
+  /// deletion-cost marker rides stopped being dead text when
   /// externalAdd joined the alphabet (bughunt-13 F2; the bug_083
   /// anti-vacuity pattern).
   val noPeerMarks = not(marks.get("other"))
@@ -360,6 +376,36 @@ module leaderMarks {
       task != NoTask,
       clock - wrongSince.get("us") <= VERIFY_EVERY + TASK_TIMEOUT,
     }
+
+  /// THE CONVERGENCE BOUND (bughunt-13 F6): how long OUR pod's marks
+  /// may stay continuously wrong before they actually CONVERGE — not
+  /// merely "are discovered". Terms: discovery (discoveryBound), then
+  /// per repair attempt up to TASK_TIMEOUT of slot residency with the
+  /// spawn obligation re-arming the next attempt the round the slot
+  /// frees; failed attempts are budgeted (MAX_RECONCILE_FAILS), and a
+  /// mid-repair desire flip (each budgeted holder change) restarts
+  /// the chain at the new polarity while the continuous-wrong stamp
+  /// keeps the ORIGINAL divergence time — so each holder change buys
+  /// one more discovery+repair chain against the same stamp.
+  def convergenceBound: int =
+    (1 + MAX_HOLDER_CHANGES) * (discoveryBound + (1 + MAX_RECONCILE_FAILS) * TASK_TIMEOUT)
+
+  /// THE F6 KILL: repair is a CONVERGENCE property, not an enabled
+  /// action. Pre-F6 the model's only repair claim was
+  /// marksDivergenceBounded's dirty disjunct — satisfied FOREVER by a
+  /// spawn→fail livelock that repairs nothing (discovery-not-repair;
+  /// the audit's class-e shape; production analog: the persistent
+  /// PATCH 403 forever-state). Under budgeted failures this val
+  /// demands the divergence actually CLEAR. Wired in the convergence
+  /// regime (whose horizon exceeds the bound — in the base regime
+  /// MAX_TIME < convergenceBound makes it horizon-vacuous, recorded
+  /// at the wiring); the lease-f6-fail-livelock twin un-budgets the
+  /// failures and must violate it while the OLD disjunct form stays
+  /// green over the same livelock — the kill, recorded verbatim in
+  /// the introducing commit.
+  val marksConvergenceBounded =
+    wrongUnder(marks, holder, "us") implies
+      clock - wrongSince.get("us") <= convergenceBound
 
   /// Witness (expect-violation): the rebound dirtying site actually
   /// fires — the notClobbered verdict covers the post-212 writer set,
@@ -398,6 +444,14 @@ module leaderMarks {
     clock < MAX_TIME,
     (not(dirty) and task == NoTask and clock % VERIFY_EVERY == 0) implies
       lastVerify == clock,
+    // The spawn obligation (bughunt-13 F6): a dirty loop with a free
+    // slot SPAWNS THIS TICK — production's maybe_spawn_leader_marks
+    // runs unconditionally every iteration, so dirt never dwells
+    // across a tick boundary idly. Without this, the repair side had
+    // no forcing at all: discovery was forced (the verify cadence)
+    // while the reconcile it owes could stutter forever — exactly
+    // the discovery-not-repair face.
+    not(dirty and task == NoTask),
     // The peer pod's own cadence obligation (its loop is environment;
     // the same machinery runs there by construction).
     wrongUnder(marks, holder, "other") implies
@@ -409,7 +463,7 @@ module leaderMarks {
     clock' = clock + 1,
     holder' = holder, marks' = marks, marked' = marked,
     cleared' = cleared, task' = task,
-    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails, reconcileFails' = reconcileFails,
     holderChanges' = holderChanges, rebounds' = rebounds,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock + 1),
@@ -428,7 +482,7 @@ module leaderMarks {
     marked' = if (leadingOf("us", h) != leadingOf("us", holder)) marked + 1 else marked,
     cleared' = cleared,
     marks' = marks, task' = task, clock' = clock,
-    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails, reconcileFails' = reconcileFails,
     holderChanges' = holderChanges + 1, rebounds' = rebounds,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, h, wrongSince, clock),
@@ -448,7 +502,7 @@ module leaderMarks {
     marked' = marked + 1,
     cleared' = cleared,
     holder' = holder, marks' = marks, task' = task, clock' = clock,
-    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails, reconcileFails' = reconcileFails,
     holderChanges' = holderChanges, rebounds' = rebounds + 1,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock),
@@ -467,7 +521,7 @@ module leaderMarks {
     holder' = holder, marked' = marked, cleared' = cleared,
     task' = task, clock' = clock,
     lastVerify' = lastVerify, holderChanges' = holderChanges,
-    adds' = adds, verifyFails' = verifyFails,
+    adds' = adds, verifyFails' = verifyFails, reconcileFails' = reconcileFails,
     rebounds' = rebounds, clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks.put(p, false), holder, wrongSince, clock),
     wrongCause' = stampCause(marks.put(p, false), holder, wrongSince, wrongCause, ByStrip),
@@ -488,7 +542,7 @@ module leaderMarks {
     not(marks.get(p)),
     marks' = marks.put(p, true),
     adds' = adds + 1,
-    verifyFails' = verifyFails,
+    verifyFails' = verifyFails, reconcileFails' = reconcileFails,
     holder' = holder, marked' = marked, cleared' = cleared,
     task' = task, clock' = clock,
     lastVerify' = lastVerify, holderChanges' = holderChanges,
@@ -511,7 +565,7 @@ module leaderMarks {
     marks' = marks.put("other", leadingOf("other", holder)),
     holder' = holder, marked' = marked, cleared' = cleared,
     task' = task, clock' = clock,
-    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails, reconcileFails' = reconcileFails,
     holderChanges' = holderChanges, rebounds' = rebounds,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks.put("other", leadingOf("other", holder)), holder, wrongSince, clock),
@@ -539,7 +593,7 @@ module leaderMarks {
     marked' = if (wrongUnder(marks, holder, "us")) marked + 1 else marked,
     cleared' = cleared,
     holder' = holder, marks' = marks, task' = task, clock' = clock,
-    strips' = strips, adds' = adds, verifyFails' = verifyFails, holderChanges' = holderChanges,
+    strips' = strips, adds' = adds, verifyFails' = verifyFails, reconcileFails' = reconcileFails, holderChanges' = holderChanges,
     rebounds' = rebounds, clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock),
     wrongCause' = stampCause(marks, holder, wrongSince, wrongCause, NoCause),
@@ -565,6 +619,7 @@ module leaderMarks {
     lastVerify != clock,
     lastVerify' = clock,
     verifyFails' = verifyFails + 1,
+    reconcileFails' = reconcileFails,
     marked' = marked,
     cleared' = cleared,
     holder' = holder, marks' = marks, task' = task, clock' = clock,
@@ -585,7 +640,7 @@ module leaderMarks {
     task' = Reconcile({ polarity: leadingOf("us", holder), sweepHolder: holder, snap: marked, since: clock }),
     holder' = holder, marks' = marks, marked' = marked,
     cleared' = cleared, clock' = clock,
-    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails, reconcileFails' = reconcileFails,
     holderChanges' = holderChanges, rebounds' = rebounds,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock),
@@ -619,7 +674,7 @@ module leaderMarks {
   /// Phase 1 of the completion: the API write lands — own marks
   /// written at the captured polarity; while leading, the sweep strips
   /// every OTHER labeled pod EXCEPT the captured holder
-  /// (sched.lease.deletion-cost+3 — the just-re-acquired peer is
+  /// (sched.lease.deletion-cost+4 — the just-re-acquired peer is
   /// spared). The flag is NOT touched here: the clear is a separate
   /// transition (production: the task returns, THEN the loop clears),
   /// which is exactly where the bool encoding lost its race.
@@ -635,7 +690,7 @@ module leaderMarks {
       task' = Patched({ snap: taskSnap, since: taskSince }),
       holder' = holder, marked' = marked, cleared' = cleared,
       clock' = clock, lastVerify' = lastVerify,
-      strips' = strips, adds' = adds, verifyFails' = verifyFails, holderChanges' = holderChanges,
+      strips' = strips, adds' = adds, verifyFails' = verifyFails, reconcileFails' = reconcileFails, holderChanges' = holderChanges,
       rebounds' = rebounds, clobberErased' = clobberErased,
       wrongSince' = stampWrong(newMarks, holder, wrongSince, clock),
       wrongCause' = stampCause(newMarks, holder, wrongSince, wrongCause, ByWrite),
@@ -661,7 +716,7 @@ module leaderMarks {
       task' = NoTask,
       holder' = holder, marks' = marks, marked' = marked,
       clock' = clock, lastVerify' = lastVerify,
-      strips' = strips, adds' = adds, verifyFails' = verifyFails, holderChanges' = holderChanges,
+      strips' = strips, adds' = adds, verifyFails' = verifyFails, reconcileFails' = reconcileFails, holderChanges' = holderChanges,
       rebounds' = rebounds,
       wrongSince' = stampWrong(marks, holder, wrongSince, clock),
       wrongCause' = stampCause(marks, holder, wrongSince, wrongCause, NoCause),
@@ -671,10 +726,26 @@ module leaderMarks {
   /// The reconcile fails (apiserver error/timeout, EITHER phase): slot
   /// freed, generations untouched — marked > cleared still holds, the
   /// level-triggered retry contract with no store(true) re-arm needed.
-  // Mirrors: rio-lease/src/lib.rs:spawn_patch_leader_marks
+  /// BUDGETED since F6 (it was the only unbudgeted environment
+  /// action): within budget, the convergence regime's repair claim
+  /// must survive every failure; past it is the platform's named
+  /// forever-failure (production: the persistent PATCH 403's warn
+  /// stream), not a state this model silently absorbs. The failure
+  /// CONSUMES at least one round (`clock > taskSince`): production's
+  /// retry cycle has a one-round floor regardless of how fast the
+  /// PATCH bounced, because the spawn gate runs once per tick — a
+  /// fail inside tick N respawns at N+1 earliest. The model prices
+  /// that floor at the fail instead of the respawn (same cycle
+  /// arithmetic, no extra state); a zero-cost fail would let the
+  /// checker burn the whole failure budget inside one instant, a
+  /// schedule no production loop can run.
+  // Environment: the apiserver failing the marks PATCH/sweep (error/timeout) — spawn_patch_leader_marks err/timeout arms; budgeted MAX_RECONCILE_FAILS; the slot frees and the retry rides the surviving dirt
   action reconcileFail = all {
+    reconcileFails < MAX_RECONCILE_FAILS,
     task != NoTask,
+    clock > taskSince,
     task' = NoTask,
+    reconcileFails' = reconcileFails + 1,
     holder' = holder, marks' = marks, marked' = marked,
     cleared' = cleared, clock' = clock,
     lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails,
@@ -697,6 +768,7 @@ module leaderMarks {
     strips' = 0,
     adds' = 0,
     verifyFails' = 0,
+    reconcileFails' = 0,
     holderChanges' = 0,
     rebounds' = 0,
     clobberErased' = false,
@@ -827,11 +899,15 @@ module leaderMarks {
   run skipOnBusyMultipleRun =
     init
       .then(holderChange(Leader("us")))
-      .then(tickRound)
-      .then(tickRound)
-      .then(tickRound)
-      .then(tickRound)
       .then(reconcileSpawn)
+      .then(reconcilePatched)
+      .then(reconcileClear)
+      .then(tickRound)
+      .then(tickRound)
+      .then(tickRound)
+      .then(reboundRedirty)
+      .then(reconcileSpawn)
+      .then(tickRound)
       .then(reconcilePatched)
       .then(tickRound)
       .then(reconcileClear)
@@ -883,6 +959,7 @@ module leaderMarksBase {
     MAX_STRIPS = 1,
     MAX_ADDS = 1,
     MAX_VERIFY_FAILS = 1,
+    MAX_RECONCILE_FAILS = 2,
     MAX_HOLDER_CHANGES = 2,
     MAX_REBOUNDS = 1,
     TASK_TIMEOUT = 2
@@ -935,6 +1012,7 @@ module leaderMarksObservationLag {
     MAX_STRIPS = 0,
     MAX_ADDS = 0,
     MAX_VERIFY_FAILS = 0,
+    MAX_RECONCILE_FAILS = 2,
     MAX_HOLDER_CHANGES = 2,
     MAX_REBOUNDS = 0,
     TASK_TIMEOUT = 2
@@ -961,7 +1039,7 @@ module leaderMarksObservationLag {
     marked' = marked, cleared' = cleared,
     marks' = marks, task' = task, clock' = clock,
     lastVerify' = lastVerify, strips' = strips, adds' = adds,
-    verifyFails' = verifyFails,
+    verifyFails' = verifyFails, reconcileFails' = reconcileFails,
     holderChanges' = holderChanges + 1, rebounds' = rebounds,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, h, wrongSince, clock),
@@ -985,7 +1063,7 @@ module leaderMarksObservationLag {
     cleared' = cleared,
     holder' = holder, marks' = marks, task' = task, clock' = clock,
     lastVerify' = lastVerify, strips' = strips, adds' = adds,
-    verifyFails' = verifyFails,
+    verifyFails' = verifyFails, reconcileFails' = reconcileFails,
     holderChanges' = holderChanges, rebounds' = rebounds,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock),
@@ -1003,7 +1081,7 @@ module leaderMarksObservationLag {
     holder' = holder, marked' = marked, cleared' = cleared,
     task' = task, clock' = clock,
     lastVerify' = lastVerify, strips' = strips, adds' = adds,
-    verifyFails' = verifyFails,
+    verifyFails' = verifyFails, reconcileFails' = reconcileFails,
     holderChanges' = holderChanges, rebounds' = rebounds,
     clobberErased' = clobberErased, obsLag' = obsLag,
     wrongSince' = stampWrong(marks.put("us", false), holder, wrongSince, clock),
@@ -1025,7 +1103,7 @@ module leaderMarksObservationLag {
     holder' = holder, marks' = marks, marked' = marked,
     cleared' = cleared, task' = task,
     lastVerify' = lastVerify, strips' = strips, adds' = adds,
-    verifyFails' = verifyFails,
+    verifyFails' = verifyFails, reconcileFails' = reconcileFails,
     holderChanges' = holderChanges, rebounds' = rebounds,
     clobberErased' = clobberErased, obsLag' = obsLag,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock + 1),
@@ -1121,4 +1199,30 @@ module leaderMarksObservationLag {
         not(dirty),
         not(obsLag),
       })
+}
+
+// =========================================================================
+// The CONVERGENCE regime (bughunt-13 F6): the horizon exceeds
+// convergenceBound — (1+0)·((1+0)·3+2 + (1+1)·2) = 9 < MAX_TIME = 12 —
+// so marksConvergenceBounded is FALSIFIABLE here, which the base
+// regime cannot offer (its richer fault menu pushes the bound past its
+// horizon; wiring the convergence val there would be a green nobody
+// could ever lose — recorded at the quint.nix block). One add, one
+// budgeted reconcile failure, no holder churn: the divergence must be
+// discovered AND repaired through a failing attempt inside the bound.
+// The lease-f6-fail-livelock twin raises the failure budget past the
+// horizon and must violate — while the OLD dirty-disjunct form stays
+// green over the same livelock (the discovery-not-repair kill).
+module leaderMarksConvergence {
+  import leaderMarks(
+    VERIFY_EVERY = 3,
+    MAX_TIME = 12,
+    MAX_STRIPS = 0,
+    MAX_ADDS = 1,
+    MAX_VERIFY_FAILS = 0,
+    MAX_RECONCILE_FAILS = 1,
+    MAX_HOLDER_CHANGES = 0,
+    MAX_REBOUNDS = 0,
+    TASK_TIMEOUT = 2
+  ).*
 }

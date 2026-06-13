@@ -4747,7 +4747,7 @@ frozen-rv companion test and the model twin pin the refusal.
   the leader.
 ]
 
-#r("sched.lease.deletion-cost+3")[
+#r("sched.lease.deletion-cost+4")[
   On the acquire transition, the lease loop reconciles both leader marks onto
   its own Pod in one merge patch: the annotation
   `controller.kubernetes.io/pod-deletion-cost: "1"` and, when configured, the
@@ -4772,12 +4772,20 @@ frozen-rv companion test and the model twin pin the refusal.
   flight at a time, and each attempt is bounded by a call timeout; the marks
   MUST be re-reconciled on subsequent successful election round-trips ---
   beginning with the first round-trip after the in-flight attempt completes ---
-  until they reflect the Pod's current leadership. While reconciliation keeps
-  failing, scale-down ordering is arbitrary (the annotation half) and the
-  leader-only Service's endpoints are missing or stale --- including a peer's
-  stale label the sweep has not yet removed --- degrading or downing the
-  dashboard data path that resolves it (the label half); the warning repeated
-  on each failed attempt is the operator signal.
+  until they reflect the Pod's current leadership. That obligation binds GIVEN
+  the platform grants the marks PATCH: zero successful round-trips is never a
+  state in which this rule is vacuously met --- it is a named platform
+  failure. A persistent denial (RBAC 403 on `patch pods`) leaves every attempt
+  failing LOUDLY (the warning repeated on each failed attempt is the operator
+  signal), and the formal model prices the same face by BUDGETING reconcile
+  failures: a repair loop that only ever spawns and fails is a convergence
+  violation in the marks model (`marksConvergenceBounded`), not a lawful
+  forever-schedule --- repair-enabled is not repair-happening. While
+  reconciliation keeps failing, scale-down ordering is arbitrary (the
+  annotation half) and the leader-only Service's endpoints are missing or
+  stale --- including a peer's stale label the sweep has not yet removed ---
+  degrading or downing the dashboard data path that resolves it (the label
+  half).
 ]
 
 #r("sched.lease.marks-verify+2")[

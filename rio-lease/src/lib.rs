@@ -2695,7 +2695,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                 "acquired leadership"
                             );
 
-                            // r[impl sched.lease.deletion-cost+3]
+                            // r[impl sched.lease.deletion-cost+4]
                             // The leader marks (pod-deletion-cost=1 so K8s
                             // kills the standby first on scale-down, plus
                             // the optional leader label the
@@ -3234,7 +3234,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
             }
         }
 
-        // r[impl sched.lease.deletion-cost+3]
+        // r[impl sched.lease.deletion-cost+4]
         // r[impl sys.epilogue.reconcile]
         // Level-triggered leader-marks reconcile — the TICK'S
         // STRUCTURAL TAIL (merged_bug_072): the step-down arm and the
@@ -4386,7 +4386,7 @@ fn leader_marks_patch(
     }
 }
 
-// r[impl sched.lease.deletion-cost+3]
+// r[impl sched.lease.deletion-cost+4]
 /// Detached PATCH of the leader marks on our own Pod:
 ///
 /// - `controller.kubernetes.io/pod-deletion-cost`: K8s's ReplicaSet
@@ -4822,7 +4822,7 @@ async fn sweep_peer_leader_marks(
     label: &(String, String),
     call_timeout: Duration,
 ) -> bool {
-    // r[impl sched.lease.deletion-cost+3]
+    // r[impl sched.lease.deletion-cost+4]
     // The holder read that makes the sweep spare the live holder.
     let holder = match tokio::time::timeout(call_timeout, leases.get_opt(lease_name)).await {
         Ok(Ok(lease)) => lease
@@ -5925,7 +5925,7 @@ mod tests {
     /// the leader-only Service routes to two pods. Regression:
     /// maybe_self_fence previously consumed the `was_leading` edge
     /// without arranging the deferred patch.
-    // r[verify sched.lease.deletion-cost+3]
+    // r[verify sched.lease.deletion-cost+4]
     #[test]
     fn self_fence_sets_marks_dirty() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(2)));
@@ -5973,7 +5973,7 @@ mod tests {
     // assertion are the end-to-end coverage for it.
 
     /// Acquire: cost=1 and the label is present with its value.
-    // r[verify sched.lease.deletion-cost+3]
+    // r[verify sched.lease.deletion-cost+4]
     #[test]
     fn leader_marks_patch_sets_label_on_acquire() {
         let label = (
@@ -6098,7 +6098,7 @@ mod tests {
     /// (no single-flight gate), the lose-while-in-flight schedule below
     /// ended with the flag clear over leader marks stored on a
     /// non-leader.
-    // r[verify sched.lease.deletion-cost+3]
+    // r[verify sched.lease.deletion-cost+4]
     #[tokio::test]
     async fn marks_reconcile_single_flight_couples_flag_to_stored_polarity() {
         let (client, mut park) = RequestPark::new();
@@ -6317,7 +6317,7 @@ mod tests {
     /// `run_lease_loop_with_client` (the `transitions != recorded`
     /// branch).
     // r[verify sched.lease.rebound+4]
-    // r[verify sched.lease.deletion-cost+3]
+    // r[verify sched.lease.deletion-cost+4]
     #[tokio::test]
     async fn rebound_redirty_survives_inflight_reconcile_clear() {
         let (client, mut park) = RequestPark::new();
@@ -8812,7 +8812,7 @@ mod tests {
     /// the arm's own doc) the dirt was structurally unserviceable.
     /// The spawns are hoisted after the outcome match so EVERY arm
     /// services the dirt it (or the tick-top fence) minted.
-    // r[verify sched.lease.deletion-cost+3]
+    // r[verify sched.lease.deletion-cost+4]
     #[tokio::test(start_paused = true)]
     async fn evidence_acquire_services_marks_in_the_acts_fail_regime() {
         let (client, mut park) = RequestPark::new();
@@ -9189,7 +9189,7 @@ mod tests {
     /// the one mistake that could strip the real leader's label when WE
     /// are it; the holder exclusion is the same mistake for a peer that
     /// re-acquired mid-reconcile.
-    // r[verify sched.lease.deletion-cost+3]
+    // r[verify sched.lease.deletion-cost+4]
     #[test]
     fn peer_sweep_targets_excludes_own_name_and_holder() {
         assert_eq!(
@@ -9292,7 +9292,7 @@ mod tests {
     /// must carry the demote body (label removed via merge-patch null,
     /// cost "0"), and the flag clears only after own patch + sweep all
     /// landed.
-    // r[verify sched.lease.deletion-cost+3]
+    // r[verify sched.lease.deletion-cost+4]
     #[tokio::test]
     async fn leading_reconcile_sweeps_stale_peer_label() {
         let (client, verifier) = ApiServerVerifier::new();
@@ -10170,7 +10170,7 @@ mod tests {
     /// lease (our reconcile completing late, after a fence): stripping
     /// the real holder's label downs the leader-only Service until that
     /// victim's own next reconcile.
-    // r[verify sched.lease.deletion-cost+3]
+    // r[verify sched.lease.deletion-cost+4]
     #[tokio::test]
     async fn peer_sweep_spares_current_lease_holder() {
         let (client, verifier) = ApiServerVerifier::new();

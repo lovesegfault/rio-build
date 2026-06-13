@@ -41,6 +41,7 @@ module leaseCalib138EdgeOnly {
     MAX_STRIPS = 1,
     MAX_ADDS = 0,
     MAX_VERIFY_FAILS = 0,
+    MAX_RECONCILE_FAILS = 2,
     MAX_HOLDER_CHANGES = 2,
     MAX_REBOUNDS = 1,
     TASK_TIMEOUT = 4
@@ -56,7 +57,7 @@ module leaseCalib138EdgeOnly {
     clock' = clock + 1,
     holder' = holder, marks' = marks, marked' = marked,
     cleared' = cleared, task' = task,
-    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails, reconcileFails' = reconcileFails,
     holderChanges' = holderChanges, rebounds' = rebounds,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock + 1),
