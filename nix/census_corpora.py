@@ -625,6 +625,10 @@ DURATION_CENSUS_ROWS = {
         "wall (unix-epoch seconds at the signer's own sample)",
         "WO-S8-6: the post-call re-sample law pin",
     ),
+    ("rio-scheduler/src/sla/cost.rs", "EPOCH_FUTURE_SLACK_SECS"): (
+        "wall (the plausible value-time ceiling: stored PG stamps vs the loader's now_epoch sample)",
+        "bw13 WO-S4-7: the absurdity-ceiling decode (stamp <= now + slack; W13-X corruption-class refusal, W13-X2 live-skew tolerance); ONE mint shared by the epoch decode, the four stamp-fence heal arms, and the repair predicates",
+    ),
     ("rio-scheduler/src/actor/pull.rs", "WINDOW_SECS"): (
         "wall (unix-epoch seconds at SystemTime::now — the limiter window's own sample)",
         "WO-S9-5 (A3): the answer-log flood limiter — 20 lines/10s/arm with the rolled window's suppressed count disclosed",

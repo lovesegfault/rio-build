@@ -737,7 +737,7 @@ pub(super) fn reassign_tier(
 }
 
 // r[impl sched.sla.disk-reaches-ephemeral-storage+2]
-/// live_049 L2: the disk p90 over EVERY row carrying a peak, every
+/// live_049 L2: the disk p90 over EVERY row carrying a peak — quantifier: census(test: w11_bc_axis_arm_census) — every
 /// row weighted by the one decay law over the full-slice ordinal
 /// domain — the probe-shaped fit's disk aggregate. Pre-fix the
 /// probe_only arm read ONLY the last row (a serial pname with five
@@ -2197,7 +2197,7 @@ mod disk_axis_tests {
     /// **W13-R (merged_bug_002, red-first)** — *no all-fitting
     /// population is ceiling-rejected; population: the
     /// (ceiling/1.2, ceiling] band, the live-measured shape.*
-    /// Six observed peaks 185..=190 GiB under the shipped 200 GiB
+    /// Six observed peaks 185..=190 GiB under a 200 GiB
     /// ceiling — every observation fits, the newest (190 GiB) sits in
     /// the band where newest x 1.2 = 228 GiB crosses the ceiling.
     /// Pre-fix red (transcript in the commit body): the single
@@ -2296,7 +2296,7 @@ mod disk_axis_tests {
 
     // r[verify sched.sla.one-weight-law+2]
     /// **W13-S (merged_bug_004, red-first)** — *one ordinal domain:
-    /// seated rows take the SAME full-slice scalar-fold weights as
+    /// seated rows take the same full-slice scalar-fold weights as
     /// unseated rows; population: BOTH interleavings (R31'(v)) — the
     /// INVERSE population (stale SEATED trio + fresh UNSEATED
     /// majority: recovered-derivation/non-k8s history) the W12-AD
@@ -3012,13 +3012,13 @@ mod disk_axis_tests {
     // ── The TYPE-DERIVED PERSIST-QUAL CENSUS (merged_bug_016;
     //    [GEN-SET]; sched.sla.refusal-per-column — R31'(ii)) ───────
     //
-    // The bug_120 totality law was instantiated by hand-walking the
+    // The bug_120 refusal-alphabet law was instantiated by hand-walking the
     // updated_at quals — site selection by column NAME (stamp axes),
     // which is exactly where the value-qual fence escaped. This
     // census derives its population from TYPE EVIDENCE in the query
     // strings themselves (EXTRACT/isfinite/to_timestamp/now() ⇒
     // timestamptz; ::float8-cast comparisons ⇒ float8) and walks
-    // EVERY SQL monotone comparison, aggregate (MAX/SUM), and
+    // EVERY SQL monotone comparison — quantifier: census(test: w13_persist_qual_census) — aggregate (MAX/SUM), and
     // ORDER-BY..LIMIT over an ordering-vulnerable column across the
     // sla module corpus — cross-referencing each site to its covering
     // refusal artifact or REDDING it as uncovered. Residuals are
@@ -3186,7 +3186,7 @@ mod disk_axis_tests {
         out
     }
 
-    // r[verify sched.sla.refusal-per-column]
+    // r[verify sched.sla.refusal-per-column+2]
     /// **The persist-qual census (merged_bug_016; riders (a)+(b);
     /// R31'(ii) type-derived site selection).** Population per module
     /// = monotone quals + aggregates over type-evidence-vulnerable
@@ -3256,8 +3256,10 @@ mod disk_axis_tests {
                 //   value <= ×2  : the cursor fence qual + the heal
                 //                  arm's own 2^53 bound (the artifact)
                 //   value >= ×1  : the heal arm's 0 bound (artifact)
-                //   value/num/den </> : the repair DELETE's explicit
-                //                  finite-domain comparisons (artifact)
+                //   (num/den carry NO quals: the value-family repair
+                //    is overwrite-not-delete — KeepForever doctrine,
+                //    no deletion vector; their refusal lives at the
+                //    load decode, text-pinned below)
                 //   updated_at <= ×3 : price/lambda/node_count upserts
                 //                  — isfinite arm asserted in-literal
                 //   last_observed < ×1 : the menu upsert — isfinite arm
@@ -3279,13 +3281,9 @@ mod disk_axis_tests {
                 "cost" => (
                     vec![
                         ("at", "<"),
-                        ("denominator", "<"),
-                        ("denominator", ">"),
                         ("last_observed", "<"),
                         ("last_observed", ">"),
                         ("last_observed", ">"),
-                        ("numerator", "<"),
-                        ("numerator", ">"),
                         ("updated_at", "<="),
                         ("updated_at", "<="),
                         ("updated_at", "<="),
@@ -3293,10 +3291,8 @@ mod disk_axis_tests {
                         ("updated_at", ">"),
                         ("updated_at", ">"),
                         ("updated_at", ">"),
-                        ("value", "<"),
                         ("value", "<="),
                         ("value", "<="),
-                        ("value", ">"),
                         ("value", ">="),
                     ],
                     // MAX(at): covered by Epoch::from_pg_epoch(max_at);

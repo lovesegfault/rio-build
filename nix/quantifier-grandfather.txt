@@ -1602,14 +1602,12 @@ rio-scheduler/src/sla/explore.rs	/// the warm path can never request past the op
 rio-scheduler/src/sla/fit.rs	/// This envelope is the SOLE constructor for EVERY dispatch lane's
 rio-scheduler/src/sla/fit.rs	/// alpha-filter so the four can never drift: the algorithm's
 rio-scheduler/src/sla/fit.rs	/// derive-then-request. The ONLY public mint of [`DiskRequest`].
-rio-scheduler/src/sla/fit.rs	/// request, which by construction can never exceed the ceiling).
 rio-scheduler/src/sla/hw.rs	// SAME `tenant_medians` vector. No future filter can sit between
 rio-scheduler/src/sla/hw.rs	// merged_bug_001 coupling: before claims-derived tenant, EVERY
 rio-scheduler/src/sla/hw.rs	/// (vertex), so this is the worst-case `min_factor(α)` over ALL
 rio-scheduler/src/sla/hw.rs	/// See [`FleetMedian::tenants_with_dim`]. Populated ONLY by
 rio-scheduler/src/sla/ingest.rs	// factor-3 hw observing the SAME ref_t residual: wall_t=5/3≈1.67
 rio-scheduler/src/sla/ingest.rs	/// Cold rows (zero peaks anywhere) stay None — no evidence is no
-rio-scheduler/src/sla/ingest.rs	/// live_049 L2: the disk p90 over EVERY row carrying a peak, unit
 rio-scheduler/src/sla/ingest.rs	/// p90 of 1 (the 5 GiB estimate shipped; the 1 GiB envelope floor
 rio-scheduler/src/sla/ingest.rs	/// probe_only arm read ONLY the last row (a serial pname with five
 rio-scheduler/src/sla/metrics.rs	///      `Self::Variant` in `ALL` / `as_str()`).
@@ -1625,8 +1623,6 @@ rio-scheduler/src/sla/solve.rs	// Drv hints pin ONLY cores; mem/disk fall back t
 rio-scheduler/src/sla/solve.rs	// SAME per-cell threshold as admission. The non-empty
 rio-scheduler/src/sla/solve.rs	// `forced_mem` is hoisted so it overrides mem in EVERY branch below
 rio-scheduler/src/sla/solve.rs	// a warm 200 MiB p90 shipped a sub-scratch request). The
-rio-scheduler/src/sla/solve.rs	// construction and can never trip a ceiling gate).
-rio-scheduler/src/sla/solve.rs	// construction can never trip it.
 rio-scheduler/src/sla/solve.rs	// enable_parallel_building=false pins ONLY cores=1; mem/disk
 rio-scheduler/src/sla/solve.rs	// since `LambdaGate` is `if cap == Spot` only, OD can NEVER produce
 rio-scheduler/src/sla/solve.rs	// ── ANY spot non-λ reject → classify_ceiling. r2's witness

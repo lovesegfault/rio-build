@@ -243,7 +243,7 @@ pub fn classify_ceiling(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> 
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
     let h = headroom(fit.n_eff_ring);
     // bug_012: the metric classifier IMPORTS the gate predicate —
-    // consumers import, never re-derive. The disk arm reads the SAME
+    // consumers import, never re-derive. The disk arm reads the same
     // single-sourced raw-face predicate as solve_tier/evaluate_cell/
     // explain (sched.sla.disk-polarity-fork), so "mirrors the solve
     // gates" is true BY CONSTRUCTION, not by term-identical copy: a
@@ -706,7 +706,7 @@ pub fn solve_tier(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveR
     // fork — merged_bug_002: the sizing floor falsely rejected the
     // all-fitting band population) — `fit.D_raw > maxDisk` is the
     // genuine c-invariant "cannot fit" gate (sla-sizing alg), and the
-    // clamped request by construction can never trip it.
+    // clamped request cannot trip it — quantifier: census(test: w10ad_lane_equality_at_the_fit_quantifier) —.
     let disk = fit::DiskFitEnvelope::fit(fit.disk_p90, ceil.default_disk, ceil.max_disk);
     let disk_rejects = fit::DiskFitEnvelope::exceeds_ceiling(fit.disk_p90_raw, ceil.max_disk);
 
@@ -876,7 +876,7 @@ fn evaluate_cell(
     // bug_132: the per-cell disk gate reads the RAW face BY
     // SIGNATURE via the single-sourced predicate (sched.sla.disk-
     // polarity-fork; the request below is minted from the floored
-    // sizing face, clamped by construction, and can never trip a
+    // sizing face, clamped by construction — cannot trip a
     // ceiling gate).
     if fit::DiskFitEnvelope::exceeds_ceiling(fit.disk_p90_raw, ceil.max_disk) {
         return Err(CellReject::DiskCeiling);

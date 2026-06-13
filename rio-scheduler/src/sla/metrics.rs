@@ -149,8 +149,9 @@ pub fn describe_all() {
          froze decay permanently (sched.sla.epoch-domain). \
          Sustained nonzero ⇒ a producer is shipping junk evidence; \
          poisoned PG rows self-heal at the leader's write boundary \
-         (stamps reset, value rows deleted, the cursor healed in \
-         place); the stores stay clean but the named plane is \
+         (stamps reset; value rows overwritten at the key's next \
+         upsert — KeepForever, no deletion vector; the cursor healed \
+         in place); the stores stay clean but the named plane is \
          learning nothing from those rows."
     );
     describe_counter!(

@@ -221,8 +221,8 @@ witnessed face through one shared predicate (`exceeds_ceiling`, which
 demands `RawDiskP90` by signature) — `"fit.D"_"raw" > "maxDisk"` is the
 genuine c-invariant "cannot fit" gate per @alg-estimate, gated by the
 producer's witness population like every other consumer (live060-c) but
-NEVER floored (the polarity-fork rule below), and the clamped request by
-construction can never trip it;
+never floored (the polarity-fork rule below), and the clamped request by
+construction cannot trip it; // quantifier: census(w10ad_lane_equality_at_the_fit_quantifier)
 `sla explain`'s `disk-ceiling` label and `classify_ceiling`'s metric mirror
 read the same predicate, so the explain and metric surfaces mirror the
 solve gates by construction.
@@ -248,7 +248,7 @@ recent reality) is *anti-conservative* for reject: every all-fitting
 population whose newest peak sat in $("ceiling" slash 1.2, "ceiling"]$ (the
 live-ramp \~189–201 GiB band under the 200 GiB ceiling) was falsely
 rejected as cannot-fit, self-renewing on each refit. A transform fused into
-a single-producer mint must be proven monotone-safe for EVERY reader's
+a single-producer mint must be proven monotone-safe for EVERY reader's // quantifier: census(w13_polarity_rider_census)
 direction, or the quantity forks — and the fork is enforced by rustc at the
 consumer signature, never by narration. The reader set and each reader's
 {direction, units} annotation are DERIVED by the polarity-rider census

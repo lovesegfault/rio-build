@@ -95,7 +95,7 @@ impl DiskFitEnvelope {
     /// floor, is that protection); the weighted p90 of a witnessed
     /// all-fitting population is bounded by its max observation, so
     /// no all-fitting population can trip this. Never the clamped
-    /// request, which by construction can never exceed the ceiling.
+    /// request, which cannot exceed the ceiling — quantifier: census(test: w10ad_lane_equality_at_the_fit_quantifier) —.
     /// `solve_tier`'s tier gate, `evaluate_cell`'s per-cell gate,
     /// `explain`'s `disk-ceiling` label, and `classify_ceiling`'s
     /// metric mirror all read THIS, so the explain/metric surfaces

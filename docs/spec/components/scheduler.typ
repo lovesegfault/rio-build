@@ -5409,18 +5409,18 @@ values at load (the pre-fix bare cast saturated `+inf` to `i64::MAX`
 --- consumption frozen forever --- and NaN to 0), the fence's
 total-domain heal arm lets a finite cursor overwrite stored poison
 (pre-fix the stored `+inf` ordered above every finite float8 and
-refused the whole unit EVERY tick), and the consumption repair is
+refused the whole unit every tick), and the consumption repair is
 SKIP-TO-HORIZON: auto-zeroing remains rejected --- it would re-fold
 full history --- so the refused position adopts the settled horizon
 without consuming, the skipped window disclosed. W13-V drives the
 poisoned-cursor schedule end-to-end (refuse, skip, heal, resume).
 
-#r("sched.sla.refusal-per-column")[
-  Refusal-alphabet totality MUST be denominated per ordering-vulnerable
+#r("sched.sla.refusal-per-column+2")[
+  Refusal-alphabet totality MUST be denominated per ordering-vulnerable // quantifier: census(w13_persist_qual_census)
   COLUMN, selected by TYPE: every SQL monotone consult (fence qual,
   aggregate, ordered-limit read) over a float8 or timestamptz column
   carries that column's refusal escape; the load decode refuses the
-  SAME alphabet the fence heals and the repair discharges --- load,
+  SAME alphabet the fence heals and the repair discharges --- load, // quantifier: census(w13_persist_qual_census)
   fence, and repair share ONE alphabet per column. float8 has no
   `isfinite()` --- the idiom is explicit comparisons (`NOT (x <
   'Infinity' AND x > '-Infinity')`, total over NaN/±inf since NaN
@@ -5428,8 +5428,9 @@ poisoned-cursor schedule end-to-end (refuse, skip, heal, resume).
   and consult shapes, never from axis-family NAMES.
 ]
 
-merged_bug_016 (the r31-generator-gap instance): the bug_120 totality
-law was instantiated by hand-walking the `updated_at` quals --- fence
+merged_bug_016 (the r31-generator-gap instance): the bug_120
+refusal-alphabet law was instantiated by hand-walking the `updated_at`
+quals --- fence
 sites selected by column NAME (stamp axes) rather than TYPE --- so the
 one fence whose qual axis is `value` (the cursor), plus the
 value/numerator/denominator data columns of the same rows, sat outside
@@ -5441,9 +5442,13 @@ stamps only, beside a comment claiming load/fence/repair "agree on the
 alphabet"; and NaN halves absorbed in `RatioEma` invisibly to the
 drift hash. The per-column close: the typed bigserial-exact cursor
 decode + finite float8 decode for the value family (the `Epoch`
-analogue), the fence's total-domain heal arm, the DELETE repair for
-poisoned value rows (absent = seed semantics) with the cursor healing
-in place, and the per-group SUM decode in the consumption fold. The
+analogue), the fence's total-domain heal arm, the overwrite-not-delete
+repair for poisoned value rows (refused at load --- seed semantics
+in-memory --- and healed at the key's next leader upsert: the table is
+KeepForever and the retention registry sanctions no new deletion
+vector; a never-refolding key stays read-dead-refused, warned and
+bounded) with the cursor healing in place, and the per-group SUM
+decode in the consumption fold. The
 type-derived persist-qual census (`w13_persist_qual_census`) walks
 query strings x column types --- including aggregate and ORDER-BY
 consumption shapes --- and REDs any uncovered site; the W12-AF
@@ -5489,7 +5494,7 @@ bug_039 (the round-13 extension): the wave-11 `Epoch` seal proved
 class. A finite `+100yr` stamp (corruption/manual insert; moderate live
 clock-skew self-heals once wall-clock passes it) passed the decode,
 absorbed the value-time fold, froze `dt = 0` (decay 1.0 forever ---
-lambda-hat degraded to an UNDAMPED ALL-TIME AVERAGE where spikes never
+lambda-hat degraded to an undamped all-time average where spikes never
 age out), persisted through the equality-admitting stamp fences,
 rehydrated each reload, and the non-finite repair never fired ---
 permanent and unlogged. The ceiling is an R17-violable typed envelope
