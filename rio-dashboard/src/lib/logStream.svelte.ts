@@ -31,6 +31,7 @@ import {
   assertNever,
   tailNext,
   visitChunkKeyed,
+  type CursorKey,
   type StreamPhase,
   type TailResolution,
   type TailStopCause,
@@ -453,23 +454,31 @@ export function createLogStream(
           const chunk = r.value;
           receivedThisAttempt = true;
           everReceived = true;
-          // The execution axis FIRST (merged_bug_002): an empty
-          // chunk-side id matches anything (pre-exec-stamping
-          // servers), and the first stamped id adopts silently.
+          // The execution axis FIRST (merged_bug_002), with the
+          // cursor's PROVENANCE stated to the kernel mirror (bug_050):
+          // an empty chunk-side id matches anything (pre-exec-stamping
+          // servers); an unkeyed cursor (lastExecId === '') meeting a
+          // stamped chunk is the adoption transition the KERNEL
+          // decides — the old ad-hoc disjunct made the comparison
+          // unconditionally true, so the first stamped chunk adopted
+          // silently with no cursor/servedComplete reset (a retry's
+          // server-filtered head spliced seamlessly; a stamped
+          // restart below the cursor was swallowed as resent).
           // NOTE the completion claim is adopted AFTER the keyed visit
           // resolves (merged_bug_063): a final stamped by a DIFFERENT
           // execution carries a claim minted against the old numbering
           // — it must never finish this tab.
-          let keysMatch =
-            chunk.execId === '' || lastExecId === '' || chunk.execId === lastExecId;
-          if (lastExecId === '' && chunk.execId !== '') {
-            lastExecId = chunk.execId;
-          }
+          let relation: CursorKey =
+            chunk.execId === '' || chunk.execId === lastExecId
+              ? 'matches'
+              : lastExecId === ''
+                ? 'unkeyed'
+                : 'differs';
           // The keyed visit may demand a re-visit of the SAME chunk
           // after the switch arm resets the floor.
           keyed_visit: for (;;) {
             const keyed = visitChunkKeyed(
-              keysMatch,
+              relation,
               cursor,
               chunk.firstLineNumber,
               BigInt(chunk.lines.length),
@@ -496,8 +505,9 @@ export function createLogStream(
                 // The switching chunk IS the new execution's head:
                 // nothing was filtered server-side. Recover in-stream
                 // by re-visiting the same chunk against the fresh
-                // floor.
-                keysMatch = true;
+                // floor (the cursor is keyed to the new execution
+                // now — the relation is a plain match).
+                relation = 'matches';
                 continue keyed_visit;
               }
               // The switching message starts past zero (or is a
@@ -511,6 +521,13 @@ export function createLogStream(
               break stream_loop;
             }
             const visit = keyed.visit;
+            if (lastExecId === '' && chunk.execId !== '') {
+              // The kernel approved this stamped chunk for the
+              // unkeyed cursor (continuity proven, or nothing
+              // served): adopt the key HERE, on the kernel's verdict
+              // — never before it (bug_050).
+              lastExecId = chunk.execId;
+            }
             // r[impl dash.stream.reopen-pacing]
             // The pacer sees the VERDICT, not the receipt: a keep-alive
             // or fully-resent chunk (skip) is not progress and must not

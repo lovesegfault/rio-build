@@ -195,20 +195,43 @@ describe('tailNext', () => {
 describe('visitChunkKeyed', () => {
   // Mirrors rio-log-kernel::visit_chunk_keyed: the execution axis is
   // decided BEFORE the line axis, and a matched key delegates verbatim.
-  it('keys mismatch => execSwitch, no line verdict', () => {
-    expect(visitChunkKeyed(false, 5n, 0n, 3n)).toEqual({ kind: 'execSwitch' });
+  it('differs => execSwitch, no line verdict', () => {
+    expect(visitChunkKeyed('differs', 5n, 0n, 3n)).toEqual({ kind: 'execSwitch' });
     // Even a chunk that would be a clean serve under the cursor.
-    expect(visitChunkKeyed(false, 0n, 0n, 3n)).toEqual({ kind: 'execSwitch' });
+    expect(visitChunkKeyed('differs', 0n, 0n, 3n)).toEqual({ kind: 'execSwitch' });
   });
 
-  it('keys match => exactly visitChunk, wrapped', () => {
+  // W13-AC (bug_050): the ''->stamped adoption is the KERNEL's
+  // decision — total over {continuity-proven, retry-shaped}. The red
+  // cell pre-fix: the caller disjunct made the comparison
+  // unconditionally true, so the retry face silently adopted.
+  it('unkeyed adopts only on proof of continuity', () => {
+    // THE RED CELL: non-continuing stamped chunk under an unkeyed
+    // cursor at N>0 — a reconnect resolved to a retry execution.
+    expect(visitChunkKeyed('unkeyed', 5n, 6n, 3n)).toEqual({ kind: 'execSwitch' });
+    // A stamped restart below the cursor: switch (the caller's
+    // switch arm recovers the head in-stream at firstLine 0).
+    expect(visitChunkKeyed('unkeyed', 5n, 0n, 3n)).toEqual({ kind: 'execSwitch' });
+    // Continuity proven: the chunk continues exactly at the cursor.
+    expect(visitChunkKeyed('unkeyed', 5n, 5n, 3n)).toEqual({
+      kind: 'visit',
+      visit: visitChunk(5n, 5n, 3n),
+    });
+    // Zero cursor: nothing served, nothing to lose — adopt.
+    expect(visitChunkKeyed('unkeyed', 0n, 0n, 3n)).toEqual({
+      kind: 'visit',
+      visit: visitChunk(0n, 0n, 3n),
+    });
+  });
+
+  it('matches => exactly visitChunk, wrapped (W13-AC2: byte-stable)', () => {
     for (const [cursor, first, n] of [
       [0n, 0n, 3n],
       [5n, 0n, 3n],
       [2n, 10n, 4n],
       [0n, 0n, 0n],
     ] as const) {
-      expect(visitChunkKeyed(true, cursor, first, n)).toEqual({
+      expect(visitChunkKeyed('matches', cursor, first, n)).toEqual({
         kind: 'visit',
         visit: visitChunk(cursor, first, n),
       });

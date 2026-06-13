@@ -309,22 +309,74 @@ pub enum KeyedVisit {
     Visit(ChunkVisit),
 }
 
+/// The cursor's execution-key provenance relative to the incoming
+/// chunk's key (bug_050). The pre-fix input was a caller-derived
+/// `keys_match: bool` — payload-free AND provenance-free, so the one
+/// transition where the cursor's provenance is UNKNOWN (a cursor
+/// minted over exec-unstamped chunks, the explicitly supported
+/// pre-stamping fleet class) was decided by an ad-hoc caller disjunct
+/// OUTSIDE the type-forced match: `lastExecId == ''` made the
+/// comparison unconditionally true, the first stamped chunk adopted
+/// silently with no cursor/served-complete reset, and a reconnect
+/// resolving to a RETRY execution had its head `[0, cursor)` filtered
+/// server-side — undisclosed log-head loss. The lifecycle now lives
+/// IN the kernel: the caller states WHICH relation holds and the
+/// kernel decides the adoption, so no keyed consumer can bypass the
+/// discipline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorKey {
+    /// The cursor and the chunk carry the SAME stamped execution key
+    /// — or the CHUNK is unstamped (a pre-exec-stamping server, whose
+    /// chunks belong to whatever stream the cursor is on).
+    Matches,
+    /// Two different STAMPED keys: always a switch.
+    Differs,
+    /// The CURSOR predates exec stamping (`lastExecId == ''`) and the
+    /// chunk is stamped — the ''→stamped adoption transition. The
+    /// kernel adopts WITHOUT a switch only when the chunk proves
+    /// continuity; otherwise it routes through
+    /// [`KeyedVisit::ExecSwitch`] (reset + disclose), because the
+    /// store's `[0, cursor)` server-side filter on a retry execution
+    /// would otherwise amputate the new log's head undisclosed.
+    Unkeyed,
+}
+
 // r[impl store.log.session-keyed]
-/// [`visit_chunk`] with the execution axis in front: `keys_match` is
-/// the caller's `current_exec == chunk_exec` (payload-free — the
-/// kernel never sees the key representation, only the comparison).
-/// `keys_match == false` is an [`KeyedVisit::ExecSwitch`]; the caller
-/// resets its cursor and re-visits.
+/// [`visit_chunk`] with the execution axis in front: the caller
+/// derives [`CursorKey`] from its key comparison (payload-free — the
+/// kernel never sees the key representation, only the relation) and
+/// the kernel decides EVERY transition, the unknown-provenance
+/// adoption included (bug_050):
+///
+/// - [`CursorKey::Differs`] → [`KeyedVisit::ExecSwitch`] (the caller
+///   resets its cursor and re-visits — unchanged);
+/// - [`CursorKey::Matches`] → the plain line-axis verdict (unchanged);
+/// - [`CursorKey::Unkeyed`] → adoption ONLY on proof of continuity:
+///   a zero cursor (nothing served, nothing to lose) or a chunk
+///   continuing exactly at the cursor (`first_line == next_line` —
+///   the same stream, now stamped). Anything else is an
+///   [`KeyedVisit::ExecSwitch`]: the chunk may be a retry execution
+///   whose head the store already filtered against the stale
+///   watermark, and a silent adoption splices it seamlessly.
 pub fn visit_chunk_keyed(
-    keys_match: bool,
+    key: CursorKey,
     next_line: u64,
     first_line: u64,
     n_lines: u64,
 ) -> KeyedVisit {
-    if !keys_match {
-        return KeyedVisit::ExecSwitch;
+    match key {
+        CursorKey::Differs => KeyedVisit::ExecSwitch,
+        CursorKey::Matches => KeyedVisit::Visit(visit_chunk(next_line, first_line, n_lines)),
+        CursorKey::Unkeyed => {
+            if next_line == 0 || first_line == next_line {
+                // Continuity proven (or vacuous): adopt without a
+                // switch — the legitimate same-stream face.
+                KeyedVisit::Visit(visit_chunk(next_line, first_line, n_lines))
+            } else {
+                KeyedVisit::ExecSwitch
+            }
+        }
     }
-    KeyedVisit::Visit(visit_chunk(next_line, first_line, n_lines))
 }
 
 /// Why one connected `TailLog` stream stopped yielding messages, as
@@ -2100,6 +2152,66 @@ mod proofs {
 
 #[cfg(test)]
 mod tests {
+    /// W13-AC (bug_050): the exec-key lifecycle's unknown-provenance
+    /// transition is decided IN the kernel — total over the new
+    /// `CursorKey` state: the ''→stamped adoption either PROVES
+    /// continuity (adopt without a switch) or routes through
+    /// `ExecSwitch`. The RED cell pre-fix: the caller's
+    /// `lastExecId == ''` disjunct made `keys_match` unconditionally
+    /// true, so the retry-shaped cell silently adopted and the
+    /// store's `[0, cursor)` server-side filter amputated the new
+    /// log's head undisclosed.
+    #[test]
+    fn unkeyed_adoption_routes_through_the_switch() {
+        use super::{CursorKey, KeyedVisit, visit_chunk, visit_chunk_keyed};
+        // THE RED CELL: unkeyed cursor at N>0, stamped chunk that does
+        // not continue at the cursor (a reconnect resolved to a retry
+        // execution: the server filtered [0,5) of the NEW numbering).
+        assert_eq!(
+            visit_chunk_keyed(CursorKey::Unkeyed, 5, 5 + 1, 3),
+            KeyedVisit::ExecSwitch,
+            "an unkeyed cursor meeting a non-continuing stamped chunk must \
+             switch — silent adoption splices a retry's filtered head"
+        );
+        // A stamped chunk BELOW the cursor under unknown provenance is
+        // a switch too (the live-stream new-head face: the caller's
+        // switch arm recovers it in-stream at first_line == 0).
+        assert_eq!(
+            visit_chunk_keyed(CursorKey::Unkeyed, 5, 0, 3),
+            KeyedVisit::ExecSwitch
+        );
+        // CONTINUITY PROVEN: the stamped chunk continues exactly at
+        // the cursor — the same stream, now stamped; adopt in place.
+        assert_eq!(
+            visit_chunk_keyed(CursorKey::Unkeyed, 5, 5, 3),
+            KeyedVisit::Visit(visit_chunk(5, 5, 3))
+        );
+        // ZERO CURSOR: nothing served, nothing to lose — adopt.
+        assert_eq!(
+            visit_chunk_keyed(CursorKey::Unkeyed, 0, 0, 3),
+            KeyedVisit::Visit(visit_chunk(0, 0, 3))
+        );
+    }
+
+    /// W13-AC2 (bug_050): the keyed-to-keyed relations are
+    /// byte-stable — `Matches` delegates verbatim to the line axis,
+    /// `Differs` is always the switch, exactly the pre-fix verdicts
+    /// for the transitions whose provenance was never in question.
+    #[test]
+    fn keyed_relations_are_byte_stable() {
+        use super::{CursorKey, KeyedVisit, visit_chunk, visit_chunk_keyed};
+        for (cursor, first, n) in [(0, 0, 3), (5, 0, 3), (2, 10, 4), (0, 0, 0)] {
+            assert_eq!(
+                visit_chunk_keyed(CursorKey::Matches, cursor, first, n),
+                KeyedVisit::Visit(visit_chunk(cursor, first, n))
+            );
+            assert_eq!(
+                visit_chunk_keyed(CursorKey::Differs, cursor, first, n),
+                KeyedVisit::ExecSwitch
+            );
+        }
+    }
+
     #[test]
     fn short_object_policy_coverage_stitching() {
         use ShortObjectPolicy::*;

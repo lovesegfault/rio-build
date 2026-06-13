@@ -106,6 +106,40 @@ describe('createLogStream', () => {
     expect(opts.signal).toBeInstanceOf(AbortSignal);
   });
 
+  // W13-AC (bug_050), the behavioral face: a cursor minted over
+  // exec-UNSTAMPED chunks (the supported pre-stamping fleet class)
+  // meeting a STAMPED chunk that does not continue at the cursor
+  // must route through the exec switch — never adopt silently.
+  // Pre-fix RED (the caller disjunct `lastExecId === ''` made
+  // keysMatch unconditionally true): the stamped restart at line 0
+  // was classified RESENT under the old cursor (3n) and swallowed
+  // whole — texts() stayed ['l0','l1','l2'], no execSwitch row, the
+  // new execution's head silently lost. Post-fix: the kernel mirror
+  // returns execSwitch; the switch arm resets the cursor, pushes the
+  // disclosure row, and recovers the head in-stream.
+  it('unkeyed cursor meeting a stamped restart switches instead of swallowing', async () => {
+    tailLog.mockImplementation(async function* () {
+      // Three unstamped lines: the cursor advances to 3n with
+      // lastExecId still ''.
+      yield chunk([u8(0x6c, 0x30), u8(0x6c, 0x31), u8(0x6c, 0x32)]); // l0 l1 l2
+      // A STAMPED chunk restarting at 0: a retry execution's head.
+      yield {
+        execId: 'retry-exec-1',
+        lines: [u8(0x6e, 0x30), u8(0x6e, 0x31)], // n0 n1
+        firstLineNumber: 0n,
+        isComplete: false,
+      };
+    });
+
+    const s = createLogStream();
+    await flush(4);
+
+    expect(texts(s)).toEqual(['l0', 'l1', 'l2', 'n0', 'n1']);
+    const switches = s.rows.filter((r) => r.kind === 'execSwitch');
+    expect(switches.length).toBe(1);
+    expect(switches[0].text).toBe('retry-exec-1');
+  });
+
   it('lossily decodes non-UTF-8 bytes to U+FFFD without throwing (R8)', async () => {
     // 0x48 0x69 = "Hi". 0xff 0xfe 0x21 = two invalid continuation-less
     // high bytes followed by "!". With {fatal:false} the decoder emits

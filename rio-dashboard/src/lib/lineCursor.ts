@@ -192,20 +192,46 @@ export type KeyedVisit =
   | { kind: 'execSwitch' }
   | { kind: 'visit'; visit: ChunkVisit };
 
-/// `visitChunk` with the execution axis in front — `keysMatch` is the
-/// caller's `lastExecId === chunk.execId` comparison (an empty
-/// chunk-side id matches anything: pre-exec-stamping servers). Mirrors
-/// `rio_log_kernel::visit_chunk_keyed` exactly.
+/// The cursor's execution-key provenance relative to the incoming
+/// chunk's key (bug_050). Mirrors `rio_log_kernel::CursorKey`: the
+/// caller STATES the relation; the kernel mirror decides every
+/// transition — including the one where the cursor's provenance is
+/// unknown, which an ad-hoc caller disjunct used to decide by making
+/// the comparison unconditionally true.
+export type CursorKey = 'matches' | 'differs' | 'unkeyed';
+
+/// `visitChunk` with the execution axis in front. Mirrors
+/// `rio_log_kernel::visit_chunk_keyed` exactly (bug_050):
+/// - `differs` (two different STAMPED keys) is always the switch;
+/// - `matches` (same stamped key, or an unstamped chunk from a
+///   pre-exec-stamping server) delegates to the line axis verbatim;
+/// - `unkeyed` (the cursor predates exec stamping, the chunk is
+///   stamped — the ''→stamped adoption) adopts WITHOUT a switch only
+///   on proof of continuity: a zero cursor (nothing to lose) or a
+///   chunk continuing exactly at the cursor. Anything else routes
+///   through `execSwitch` — the store's `[0, cursor)` server-side
+///   filter on a retry execution would otherwise amputate the new
+///   log's head undisclosed, and a stamped restart below the cursor
+///   would be swallowed as resent lines.
 export function visitChunkKeyed(
-  keysMatch: boolean,
+  key: CursorKey,
   nextLine: bigint,
   firstLine: bigint,
   nLines: bigint,
 ): KeyedVisit {
-  if (!keysMatch) {
-    return { kind: 'execSwitch' };
+  switch (key) {
+    case 'differs':
+      return { kind: 'execSwitch' };
+    case 'matches':
+      return { kind: 'visit', visit: visitChunk(nextLine, firstLine, nLines) };
+    case 'unkeyed':
+      if (nextLine === 0n || firstLine === nextLine) {
+        return { kind: 'visit', visit: visitChunk(nextLine, firstLine, nLines) };
+      }
+      return { kind: 'execSwitch' };
+    default:
+      return assertNever(key);
   }
-  return { kind: 'visit', visit: visitChunk(nextLine, firstLine, nLines) };
 }
 
 /// Exhaustiveness backstop: a new `ChunkVisit`/`TailStopCause` variant
