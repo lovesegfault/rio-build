@@ -2630,7 +2630,8 @@ mod disk_axis_tests {
     /// The three stale narration sites (the refit call-site comment,
     /// the disk-aggregate predecessor doc, the mem-aggregator doc —
     /// plus the MemFit variant doc the sweep surfaced) sat on
-    /// r[impl]-annotated, census-stamped blocks: exactly the lines a
+    /// impl-marker-annotated, census-stamped blocks: exactly the
+    /// lines a
     /// future synchronizer treats as authoritative (the r21 bug_004
     /// re-entry mechanism). The standing rationale-rot lint keys on
     /// symbol existence and cannot see them.

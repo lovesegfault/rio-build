@@ -195,6 +195,33 @@ impl From<Epoch> for f64 {
     }
 }
 
+// r[impl sched.sla.refusal-per-column]
+/// THE PG decode boundary for the λ consumption cursor — a BIGSERIAL
+/// id round-tripped through the float8 `value` column
+/// (merged_bug_016). The typed domain is the exactly-representable
+/// non-negative integers (≤ 2^53, the column's own documented
+/// exactness bound): NaN/±inf (which PG orders ABOVE every finite
+/// float8 — the fence-wedge face), negatives, fractionals, and
+/// beyond-exact magnitudes all REFUSE. The pre-fix `value as i64`
+/// silently saturated `+inf` to `i64::MAX` (consumption frozen
+/// forever: `settled > cursor` never true) and NaN to 0 (full-history
+/// re-fold every tick).
+fn from_pg_cursor(v: f64) -> Option<i64> {
+    const EXACT_MAX: f64 = 9_007_199_254_740_992.0; // 2^53
+    (v.is_finite() && v >= 0.0 && v <= EXACT_MAX && v.fract() == 0.0).then_some(v as i64)
+}
+
+// r[impl sched.sla.refusal-per-column]
+/// THE PG decode boundary for the float8 VALUE family (price value,
+/// λ/node_count numerator/denominator): finite-or-refuse
+/// (merged_bug_016) — NaN absorbs in [`RatioEma::update`] and is
+/// invisible to `solve_relevant_hash` (`(NaN*1e6).round() as i64`
+/// is 0), so the poison must die at the boundary like the epoch
+/// family's (`Epoch::from_pg_epoch`).
+fn from_pg_finite(v: f64) -> Option<f64> {
+    v.is_finite().then_some(v)
+}
+
 /// Where `$/vCPU·hr` numbers come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -233,6 +260,15 @@ impl RatioEma {
     /// decayed-den`, not an EMA of instantaneous ratios (which would
     /// over-weight low-denominator ticks).
     pub fn update(&mut self, num: f64, den: f64, now: Epoch, halflife_secs: f64) {
+        // merged_bug_016: NaN absorbs permanently in the decayed sums
+        // and is invisible to the drift hash — the decode boundaries
+        // (`from_pg_finite`, the fold's group decode) refuse it
+        // before it can reach this fold; assert the contract.
+        debug_assert!(
+            num.is_finite() && den.is_finite(),
+            "RatioEma::update takes finite halves — a non-finite \
+             input evaded a decode boundary (merged_bug_016)"
+        );
         let dt = now.secs_since(self.updated_at).max(0.0);
         let decay = if self.updated_at.is_unset() {
             0.0 // first sample: no prior to decay
@@ -461,9 +497,25 @@ pub struct CostTable {
     /// stored stamp — the repair obligation. Discharged by the next
     /// leader-owned [`Self::persist_rows`] (durable writes live in the
     /// sealed rows only — the W10-BB census is the bind), which resets the poisoned stamps to
-    /// epoch 0 (maximally stale; values stay). Cleared naturally: the
-    /// next clean load rebuilds the table with the flag down.
+    /// epoch 0 (maximally stale; values stay). merged_bug_016 widens
+    /// the obligation to the VALUE family: rows whose
+    /// value/numerator/denominator refuse the typed float decode are
+    /// DELETED at the same boundary (absent = seed semantics, the
+    /// documented legacy-NULL-halves arm) — except the cursor row,
+    /// which heals in place (see [`Self::cursor_poisoned`]). Cleared
+    /// naturally: the next clean load rebuilds the table with the
+    /// flag down.
     repair_nonfinite: bool,
+    /// merged_bug_016: `load()` refused the `lambda_cursor` row at
+    /// the typed bigserial decode ([`from_pg_cursor`]) — the stored
+    /// consumption position is unknowable. The repair is
+    /// SKIP-TO-HORIZON: the next [`Self::refresh_lambda`] adopts the
+    /// settled sequence horizon WITHOUT consuming (auto-zeroing is
+    /// REJECTED — it would re-fold full history into the EMAs; the
+    /// skipped window is disclosed and the EMAs decay across it
+    /// truthfully), and the next persist overwrites the stored poison
+    /// through the fence's total-domain heal arm.
+    cursor_poisoned: bool,
     /// `[sla].hw_cost_source` — carried so [`CostTable::price`] /
     /// [`CostTable::load`] / `CostTable::persist_rows` can enforce the
     /// "[`HwCostSource::Static`] = seeds only" contract at the read
@@ -663,8 +715,10 @@ impl CostTable {
             menu.sort_by_key(|t| (t.cores, t.mem_bytes));
         }
         // bug_120: an undischarged repair obligation rides the swap
-        // (either side may have recorded it).
+        // (either side may have recorded it). merged_bug_016: the
+        // cursor-poison flag rides identically.
         fresh.repair_nonfinite |= self.repair_nonfinite;
+        fresh.cursor_poisoned |= self.cursor_poisoned;
         *self = fresh;
     }
 
@@ -839,8 +893,32 @@ impl CostTable {
             // `updated_at` is informational here, so this arm runs
             // before the epoch decode — a poisoned stamp must not
             // refuse the cursor into a full-history re-fold.
+            // r[impl sched.sla.refusal-per-column]
+            // merged_bug_016: the value crosses through the typed
+            // bigserial decode — the pre-fix bare cast saturated
+            // +inf to i64::MAX (consumption frozen forever) and NaN
+            // to 0 (full-history re-fold). A refusal records BOTH
+            // obligations: the durable heal (fence arm) and the
+            // skip-to-horizon consumption repair.
             if key == "lambda_cursor" {
-                t.lambda_cursor = value as i64;
+                match from_pg_cursor(value) {
+                    Some(c) => t.lambda_cursor = c,
+                    None => {
+                        tracing::warn!(
+                            value,
+                            "non-decodable lambda_cursor value; refused at decode \
+                             (repair: skip-to-horizon + fence heal)"
+                        );
+                        ::metrics::counter!(
+                            "rio_scheduler_sla_evidence_refused_total",
+                            "plane" => "lambda_cursor",
+                            "reason" => "nonfinite_value"
+                        )
+                        .increment(1);
+                        t.repair_nonfinite = true;
+                        t.cursor_poisoned = true;
+                    }
+                }
                 continue;
             }
             // r[impl sched.sla.epoch-domain]
@@ -872,6 +950,32 @@ impl CostTable {
                 t.repair_nonfinite = true;
                 continue;
             };
+            // r[impl sched.sla.refusal-per-column]
+            // merged_bug_016: the VALUE family crosses the same kind
+            // of typed boundary the stamps do — a non-finite
+            // value/numerator/denominator refuses the ROW (siblings
+            // unaffected) and records the repair obligation (the
+            // poisoned row is DELETED at the leader-owned write
+            // boundary: absent = seed semantics). Pre-fix NaN halves
+            // entered RatioEma, absorbed every subsequent fold, and
+            // were invisible to solve_relevant_hash.
+            let finite_triple = from_pg_finite(value).is_some()
+                && num.is_none_or(|v| from_pg_finite(v).is_some())
+                && den.is_none_or(|v| from_pg_finite(v).is_some());
+            if !finite_triple {
+                tracing::warn!(
+                    key = %key,
+                    "non-finite value/halves in sla_ema_state; row refused at decode"
+                );
+                ::metrics::counter!(
+                    "rio_scheduler_sla_evidence_refused_total",
+                    "plane" => "ema_row",
+                    "reason" => "nonfinite_value"
+                )
+                .increment(1);
+                t.repair_nonfinite = true;
+                continue;
+            }
             if let Some(rest) = key.strip_prefix("price:")
                 && let Some(cell) = parse_cell(rest)
             {
@@ -978,14 +1082,19 @@ impl CostTable {
     /// In-module tests drive this directly for ROW semantics; the
     /// leadership gate has its own witnesses (W10-BA).
     async fn persist_rows(&self, db: &SchedulerDb) -> anyhow::Result<()> {
-        // bug_120: discharge the decode-repair obligation under the
-        // leader-owned write boundary (load() RECORDS the rows it
-        // refused; the leader repairs them HERE — W10-BB pins that no
-        // durable write lives outside the sealed rows). Stamp → epoch 0
-        // = maximally stale; values stay; keyed on the same isfinite
-        // predicate as the fence arms so load, fence, and repair agree
-        // on the alphabet. Idempotent — re-runs each tick until a clean
-        // reload rebuilds the table with the flag down.
+        // bug_120 + merged_bug_016: discharge the decode-repair
+        // obligation under the leader-owned write boundary (load()
+        // RECORDS the rows it refused; the leader repairs them HERE —
+        // W10-BB pins that no durable write lives outside the sealed
+        // rows). Load, fence, and repair agree on ONE alphabet PER
+        // COLUMN (sched.sla.refusal-per-column): the timestamptz
+        // family keys on isfinite (stamp → epoch 0 = maximally stale;
+        // values stay); the float8 VALUE family keys on the finite
+        // domain (poisoned rows DELETED — seed semantics); the cursor
+        // keys on the bigserial-exact domain (healed in place via the
+        // fence arm + skip-to-horizon). Idempotent — re-runs each
+        // tick until a clean reload rebuilds the table with the flag
+        // down.
         if self.repair_nonfinite {
             sqlx::query(
                 "UPDATE sla_ema_state SET updated_at = to_timestamp(0) \
@@ -998,6 +1107,30 @@ impl CostTable {
                 "UPDATE sla_observed_instance_types \
                  SET last_observed = to_timestamp(0) \
                  WHERE cluster = $1 AND NOT isfinite(last_observed)",
+            )
+            .bind(&self.cluster)
+            .execute(db.pool())
+            .await?;
+            // r[impl sched.sla.refusal-per-column]
+            // merged_bug_016: the VALUE-family repair — rows whose
+            // value/numerator/denominator sit outside the finite
+            // float8 domain are DELETED (absent = seed semantics,
+            // the documented legacy-NULL-halves arm; the next
+            // observation re-mints the key). The float8 idiom:
+            // PG `isfinite()` is timestamp-only; `NOT (x < 'Infinity'
+            // AND x > '-Infinity')` is total over NaN/±inf (NaN
+            // orders above Infinity, so both comparisons are FALSE
+            // for it). The cursor row is EXCLUDED — it heals in
+            // place through the fence arm (deleting it would restart
+            // consumption at 0: the rejected full-history re-fold).
+            sqlx::query(
+                "DELETE FROM sla_ema_state \
+                 WHERE cluster = $1 AND key <> 'lambda_cursor' AND ( \
+                   NOT (value < 'Infinity'::float8 AND value > '-Infinity'::float8) \
+                   OR (numerator IS NOT NULL AND NOT \
+                       (numerator < 'Infinity'::float8 AND numerator > '-Infinity'::float8)) \
+                   OR (denominator IS NOT NULL AND NOT \
+                       (denominator < 'Infinity'::float8 AND denominator > '-Infinity'::float8)))",
             )
             .bind(&self.cluster)
             .execute(db.pool())
@@ -1043,11 +1176,22 @@ impl CostTable {
         // does NOT imply equal consumption progress and the stamp can
         // no longer be the unit's fence.
         let mut txn = db.pool().begin().await?;
+        // r[impl sched.sla.refusal-per-column]
+        // The heal arm mirrors the load decode's alphabet EXACTLY
+        // (load, fence, and repair agree PER COLUMN): a stored cursor
+        // outside the bigserial-exact domain — NaN/±inf (PG orders
+        // them above every finite float8: the pre-fix permanent
+        // wedge), negative, fractional, or beyond 2^53 — can no
+        // longer refuse the writer's own finite cursor. The monotone
+        // law over the lawful domain is unchanged.
         let cursor_rows = sqlx::query(
             "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
              VALUES ($1, 'lambda_cursor', $2, to_timestamp($3)) \
              ON CONFLICT (cluster, key) DO UPDATE SET value = $2, updated_at = to_timestamp($3) \
-             WHERE sla_ema_state.value <= $2",
+             WHERE sla_ema_state.value <= $2 \
+                OR NOT (sla_ema_state.value >= 0 \
+                    AND sla_ema_state.value <= 9007199254740992 \
+                    AND sla_ema_state.value = trunc(sla_ema_state.value))",
         )
         .bind(&self.cluster)
         .bind(self.lambda_cursor as f64)
@@ -1258,89 +1402,134 @@ impl CostTable {
         // VISIBLE rows and permanently skipped an in-flight sibling
         // with an equal-or-lower stamp).
         if settled > self.lambda_cursor {
-            let prev_stamp = self
-                .lambda
-                .values()
-                .map(|e| e.updated_at)
-                .fold(Epoch::UNSET, Epoch::max);
-            let rows: Vec<(String, String, f64, f64)> = sqlx::query_as(
-                "SELECT hw_class, kind, COALESCE(SUM(value), 0), \
+            // r[impl sched.sla.refusal-per-column]
+            // merged_bug_016 repair, SKIP-TO-HORIZON: the stored
+            // consumption position was refused at decode — the true
+            // position is unknowable. Adopt the settled horizon
+            // WITHOUT consuming: auto-zeroing is REJECTED (consuming
+            // (0, settled] would re-fold full retained history into
+            // the EMAs — double-count), and wedging forever is the
+            // pre-fix behavior this repairs. The skipped window is
+            // disclosed and bounded by the poison-to-repair interval;
+            // the EMAs decay across it truthfully on the next fold.
+            if self.cursor_poisoned {
+                tracing::warn!(
+                    skipped_through = settled,
+                    "lambda cursor was poisoned; adopting the settled \
+                     horizon without consuming (skip, never re-fold)"
+                );
+                ::metrics::counter!(
+                    "rio_scheduler_sla_evidence_refused_total",
+                    "plane" => "lambda_cursor",
+                    "reason" => "skip_to_horizon"
+                )
+                .increment(1);
+                self.lambda_cursor = settled;
+                self.cursor_poisoned = false;
+            } else {
+                let prev_stamp = self
+                    .lambda
+                    .values()
+                    .map(|e| e.updated_at)
+                    .fold(Epoch::UNSET, Epoch::max);
+                let rows: Vec<(String, String, f64, f64)> = sqlx::query_as(
+                    "SELECT hw_class, kind, COALESCE(SUM(value), 0), \
                         EXTRACT(EPOCH FROM MAX(at))::float8 \
                  FROM interrupt_samples \
                  WHERE cluster = $1 AND id > $2 AND id <= $3 \
                  GROUP BY hw_class, kind",
-            )
-            .bind(&self.cluster)
-            .bind(self.lambda_cursor)
-            .bind(settled)
-            .fetch_all(db.pool())
-            .await?;
-            // The folds run in the typed epoch domain
-            // (sched.sla.epoch-domain): pre-fix, ONE `'infinity'`
-            // sample stamp folded the global stamp to `+inf` and
-            // wedged every refresh permanently.
-            let mut batch_stamp = prev_stamp;
-            let mut per_h: HashMap<HwClassName, (f64, f64)> = HashMap::new();
-            for (hw_class, kind, sum, max_at) in rows {
-                // r[impl sched.sla.epoch-domain]
-                // Decode boundary: a non-finite MAX(at) refuses the
-                // GROUP row (typed, counted) — its sums are not
-                // folded and it cannot poison the decay stamp;
-                // sibling classes proceed.
-                let Some(max_at) = Epoch::from_pg_epoch(max_at) else {
-                    tracing::warn!(
-                        hw_class = %hw_class,
-                        kind = %kind,
-                        "non-finite interrupt-sample stamp; group row refused at decode"
-                    );
-                    ::metrics::counter!(
-                        "rio_scheduler_sla_evidence_refused_total",
-                        "plane" => "interrupt_group",
-                        "reason" => "nonfinite_epoch"
-                    )
-                    .increment(1);
-                    continue;
-                };
-                batch_stamp = batch_stamp.max(max_at);
-                let e = per_h.entry(hw_class).or_default();
-                match kind.as_str() {
-                    "interrupt" => e.0 += sum,
-                    "exposure" => e.1 += sum,
-                    _ => {}
+                )
+                .bind(&self.cluster)
+                .bind(self.lambda_cursor)
+                .bind(settled)
+                .fetch_all(db.pool())
+                .await?;
+                // The folds run in the typed epoch domain
+                // (sched.sla.epoch-domain): pre-fix, ONE `'infinity'`
+                // sample stamp folded the global stamp to `+inf` and
+                // wedged every refresh permanently.
+                let mut batch_stamp = prev_stamp;
+                let mut per_h: HashMap<HwClassName, (f64, f64)> = HashMap::new();
+                for (hw_class, kind, sum, max_at) in rows {
+                    // r[impl sched.sla.epoch-domain]
+                    // Decode boundary: a non-finite MAX(at) refuses the
+                    // GROUP row (typed, counted) — its sums are not
+                    // folded and it cannot poison the decay stamp;
+                    // sibling classes proceed.
+                    let Some(max_at) = Epoch::from_pg_epoch(max_at) else {
+                        tracing::warn!(
+                            hw_class = %hw_class,
+                            kind = %kind,
+                            "non-finite interrupt-sample stamp; group row refused at decode"
+                        );
+                        ::metrics::counter!(
+                            "rio_scheduler_sla_evidence_refused_total",
+                            "plane" => "interrupt_group",
+                            "reason" => "nonfinite_epoch"
+                        )
+                        .increment(1);
+                        continue;
+                    };
+                    // r[impl sched.sla.refusal-per-column]
+                    // merged_bug_016: SUM over a poisoned float8 sample
+                    // is NaN/±inf — the same per-group refusal the stamp
+                    // gets (siblings proceed; the EMA fold's finite
+                    // contract holds at the boundary, not by hope).
+                    let Some(sum) = from_pg_finite(sum) else {
+                        tracing::warn!(
+                            hw_class = %hw_class,
+                            kind = %kind,
+                            "non-finite interrupt-sample SUM; group row refused at decode"
+                        );
+                        ::metrics::counter!(
+                            "rio_scheduler_sla_evidence_refused_total",
+                            "plane" => "interrupt_group",
+                            "reason" => "nonfinite_value"
+                        )
+                        .increment(1);
+                        continue;
+                    };
+                    batch_stamp = batch_stamp.max(max_at);
+                    let e = per_h.entry(hw_class).or_default();
+                    match kind.as_str() {
+                        "interrupt" => e.0 += sum,
+                        "exposure" => e.1 += sum,
+                        _ => {}
+                    }
                 }
-            }
-            // Per-h node_count: BOTH halves of the rate fold per key
-            // (bug_044, the RatioEma shape) — `Σ exposure_secs` and
-            // `Σ window_secs` decay-summed, so the estimate is
-            // Σd/Σdt over the consumed history, never an EMA of
-            // instantaneous d/dt samples (a capture that cuts
-            // mid-flush-wave makes dt≈ms while d carries the full
-            // wave; folded as a sample, one such spike pinned the
-            // scaler — and lambda_hat toward seed — for days; folded
-            // as halves, the ms window adds ~nothing to the
-            // denominator AND the wave's exposure stays counted).
-            // Skip only when `prev_stamp` is unset (first batch has
-            // no window baseline); a zero-advance batch folds (d, 0)
-            // — its exposure still counts, exactly as it joins the λ
-            // EMA above.
-            let dt = batch_stamp.secs_since(prev_stamp);
-            for (h, (n, d)) in per_h {
-                self.lambda.entry(h.clone()).or_default().update(
-                    n,
-                    d,
-                    batch_stamp,
-                    LAMBDA_HALFLIFE_SECS,
-                );
-                if prev_stamp.as_secs_f64() > 0.0 {
-                    self.node_count.entry(h).or_default().update(
+                // Per-h node_count: BOTH halves of the rate fold per key
+                // (bug_044, the RatioEma shape) — `Σ exposure_secs` and
+                // `Σ window_secs` decay-summed, so the estimate is
+                // Σd/Σdt over the consumed history, never an EMA of
+                // instantaneous d/dt samples (a capture that cuts
+                // mid-flush-wave makes dt≈ms while d carries the full
+                // wave; folded as a sample, one such spike pinned the
+                // scaler — and lambda_hat toward seed — for days; folded
+                // as halves, the ms window adds ~nothing to the
+                // denominator AND the wave's exposure stays counted).
+                // Skip only when `prev_stamp` is unset (first batch has
+                // no window baseline); a zero-advance batch folds (d, 0)
+                // — its exposure still counts, exactly as it joins the λ
+                // EMA above.
+                let dt = batch_stamp.secs_since(prev_stamp);
+                for (h, (n, d)) in per_h {
+                    self.lambda.entry(h.clone()).or_default().update(
+                        n,
                         d,
-                        dt,
                         batch_stamp,
                         LAMBDA_HALFLIFE_SECS,
                     );
+                    if prev_stamp.as_secs_f64() > 0.0 {
+                        self.node_count.entry(h).or_default().update(
+                            d,
+                            dt,
+                            batch_stamp,
+                            LAMBDA_HALFLIFE_SECS,
+                        );
+                    }
                 }
+                self.lambda_cursor = settled;
             }
-            self.lambda_cursor = settled;
         }
         // ── Capture the NEXT generation: L FIRST, THEN the snapshot's
         // in-progress xid list (the load-bearing order — see
@@ -4895,6 +5084,156 @@ mod tests {
         assert!(
             (fresh.lambda["h"].numerator - before).abs() < 1e-9,
             "no re-consumption across the persist/load boundary"
+        );
+    }
+
+    // r[verify sched.sla.refusal-per-column]
+    /// **W13-V (merged_bug_016, red-first)** — *the lambda persist
+    /// unit's value column carries a total refusal alphabet;
+    /// population: the pre-poisoned-row class W12-AF sanctions, per
+    /// column.* A pre-poisoned `'infinity'` lambda_cursor VALUE row
+    /// (manual SQL/corruption — every production writer binds an i64
+    /// cast): pre-fix (a) the load cast `value as i64` saturated to
+    /// `i64::MAX`, freezing consumption forever (`settled > cursor`
+    /// never true); (b) the persist qual `value <= $2` evaluated
+    /// FALSE against the stored `+inf` (PG orders NaN/Infinity above
+    /// every finite float8), so the whole cursor+lambda+node_count
+    /// unit rolled back EVERY tick forever, mislabeled
+    /// "deposed-writer fold". Post-fix: refused at the typed decode
+    /// (counted), the repair adopts the settled horizon WITHOUT
+    /// consuming (skip, never auto-zero — re-folding full history is
+    /// the recorded spec rejection), the fence's total-domain heal
+    /// arm lets the finite cursor overwrite the poison, and the unit
+    /// COMMITS: consumption resumes for post-heal rows only.
+    #[tokio::test]
+    async fn w13_v_poisoned_cursor_value_heals_and_the_unit_commits() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        // The poisoned PRE-EXISTING state + one pre-poison exposure
+        // row (id=1) that the skip must NEVER fold.
+        sqlx::query(
+            "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
+             VALUES ('c', 'lambda_cursor', 'infinity', now())",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
+             VALUES ('c', 'h', 'exposure', 600.0, to_timestamp(1000))",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let mut t = CostTable::load(&sdb, "c", HwCostSource::Static)
+            .await
+            .unwrap();
+        assert!(
+            t.repair_nonfinite,
+            "load REFUSES the poisoned cursor value at the typed \
+             decode and RECORDS the repair obligation (pre-fix: \
+             `value as i64` saturated +inf to i64::MAX silently)"
+        );
+        assert_eq!(
+            t.lambda_cursor, 0,
+            "the refused cursor never enters the table"
+        );
+        // Two refreshes: capture the sequence horizon, then promote —
+        // the repair adopts the settled horizon WITHOUT consuming.
+        t.refresh_lambda(&sdb).await.unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
+        assert!(
+            t.lambda_cursor >= 1,
+            "the repair adopted the settled horizon (skip-to-horizon)"
+        );
+        assert!(
+            !t.lambda.contains_key("h"),
+            "the pre-poison window is SKIPPED, never re-folded \
+             (auto-zero would double-count — the recorded rejection)"
+        );
+        // The unit COMMITS: the fence's total-domain heal arm admits
+        // the finite cursor over the stored poison.
+        t.persist_rows(&sdb).await.unwrap();
+        let (v,): (f64,) = sqlx::query_as(
+            "SELECT value FROM sla_ema_state WHERE cluster = 'c' AND key = 'lambda_cursor'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            v.is_finite() && v >= 1.0,
+            "the cursor row HEALED durably (pre-fix: the stored \
+             +infinity refused every write forever — the loud wedge): \
+             got {v}"
+        );
+        // Consumption RESUMES for post-heal rows: one fresh exposure
+        // row, then refreshes until consumed.
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
+             VALUES ('c', 'h', 'exposure', 300.0, to_timestamp(2000))",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            t.refresh_lambda(&sdb).await.unwrap();
+        }
+        let ema = t.lambda.get("h").expect("consumption resumed");
+        assert!(
+            (ema.denominator - 300.0).abs() < 1e-9,
+            "exactly the post-heal window folded (300s) — the skipped \
+             600s row stays unfolded: got {}",
+            ema.denominator
+        );
+    }
+
+    // r[verify sched.sla.refusal-per-column]
+    /// **W13-V2 (merged_bug_016)** — *finite-path behavior is
+    /// byte-stable and refusals are PER ROW: a poisoned numerator on
+    /// one lambda row refuses that row (seed semantics after repair)
+    /// while finite siblings load, fold, and round-trip unchanged.*
+    #[tokio::test]
+    async fn w13_v2_poisoned_halves_refuse_per_row_siblings_unaffected() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        sqlx::query(
+            "INSERT INTO sla_ema_state (cluster, key, value, numerator, denominator, updated_at) \
+             VALUES ('c', 'lambda:bad', 1.0, 'NaN', 800.0, now()), \
+                    ('c', 'lambda:good', 2.0, 3.0, 900.0, now())",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let t = CostTable::load(&sdb, "c", HwCostSource::Static)
+            .await
+            .unwrap();
+        assert!(
+            !t.lambda.contains_key("bad"),
+            "the NaN-numerator row is refused at decode (pre-fix: NaN \
+             entered RatioEma and absorbed every subsequent fold, \
+             invisible to solve_relevant_hash)"
+        );
+        let good = t.lambda.get("good").expect("siblings unaffected");
+        assert!(
+            (good.numerator - 3.0).abs() < 1e-9 && (good.denominator - 900.0).abs() < 1e-9,
+            "the finite sibling loads byte-identically"
+        );
+        assert!(t.repair_nonfinite, "the obligation is recorded");
+        // The leader-owned repair DELETEs the poisoned row — no-prior
+        // (seed) semantics, the sanctioned legacy arm.
+        t.persist_rows(&sdb).await.unwrap();
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM sla_ema_state WHERE cluster = 'c' AND key = 'lambda:bad'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            n, 0,
+            "the poisoned row is repaired by DELETE — absent = seed \
+             semantics (the documented legacy-NULL-halves arm); the \
+             cursor is the one key repaired by heal-in-place instead \
+             (auto-zero re-folds history — recorded rejection)"
         );
     }
 

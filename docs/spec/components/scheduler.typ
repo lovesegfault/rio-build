@@ -5400,10 +5400,57 @@ arm (`OR NOT isfinite(stored)`) and the persisted decode repair land on
 every monotone stamp fence in the plane (`updated_at <=` on
 price/lambda/node_count, `last_observed <` on the menu); W12-AF drives
 the poisoned-then-reobserved schedule and the never-reobserved repair.
-The cursor's value qual keeps its integer-domain semantics: its float
-refusal members surface LOUDLY at the one-fence-axis abort counter
-(never a silent wedge), and auto-zeroing is rejected --- it would
-re-fold full history.
+The cursor's value column carries its OWN refusal alphabet
+(merged_bug_016, the round-13 correction of this paragraph's original
+claim --- the float refusal members did surface at the abort counter,
+but as a PERMANENT loud wedge mislabeled "deposed-writer fold"): the
+typed bigserial decode refuses NaN/±inf/negative/fractional/beyond-2^53
+values at load (the pre-fix bare cast saturated `+inf` to `i64::MAX`
+--- consumption frozen forever --- and NaN to 0), the fence's
+total-domain heal arm lets a finite cursor overwrite stored poison
+(pre-fix the stored `+inf` ordered above every finite float8 and
+refused the whole unit EVERY tick), and the consumption repair is
+SKIP-TO-HORIZON: auto-zeroing remains rejected --- it would re-fold
+full history --- so the refused position adopts the settled horizon
+without consuming, the skipped window disclosed. W13-V drives the
+poisoned-cursor schedule end-to-end (refuse, skip, heal, resume).
+
+#r("sched.sla.refusal-per-column")[
+  Refusal-alphabet totality MUST be denominated per ordering-vulnerable
+  COLUMN, selected by TYPE: every SQL monotone consult (fence qual,
+  aggregate, ordered-limit read) over a float8 or timestamptz column
+  carries that column's refusal escape; the load decode refuses the
+  SAME alphabet the fence heals and the repair discharges --- load,
+  fence, and repair share ONE alphabet per column. float8 has no
+  `isfinite()` --- the idiom is explicit comparisons (`NOT (x <
+  'Infinity' AND x > '-Infinity')`, total over NaN/±inf since NaN
+  orders above Infinity). Site populations derive from column types
+  and consult shapes, never from axis-family NAMES.
+]
+
+merged_bug_016 (the r31-generator-gap instance): the bug_120 totality
+law was instantiated by hand-walking the `updated_at` quals --- fence
+sites selected by column NAME (stamp axes) rather than TYPE --- so the
+one fence whose qual axis is `value` (the cursor), plus the
+value/numerator/denominator data columns of the same rows, sat outside
+the walked population: PG orders NaN/Infinity above every finite
+float8, so a pre-poisoned value row rolled the whole
+cursor+lambda+node_count unit back every tick forever (mislabeled);
+the load arm cast `value as i64` unguarded; the repair sweep healed
+stamps only, beside a comment claiming load/fence/repair "agree on the
+alphabet"; and NaN halves absorbed in `RatioEma` invisibly to the
+drift hash. The per-column close: the typed bigserial-exact cursor
+decode + finite float8 decode for the value family (the `Epoch`
+analogue), the fence's total-domain heal arm, the DELETE repair for
+poisoned value rows (absent = seed semantics) with the cursor healing
+in place, and the per-group SUM decode in the consumption fold. The
+type-derived persist-qual census (`w13_persist_qual_census`) walks
+query strings x column types --- including aggregate and ORDER-BY
+consumption shapes --- and REDs any uncovered site; the W12-AF
+pre-poisoned-row threat class now covers every column family, not the
+stamp axis alone. The drift hash's NaN-blindness is a PRICED residual:
+the boundary decodes machine-bind it (NaN can no longer enter the
+maps), disclosed in the hash doc rather than re-engineered.
 
 A durable store with a hand-implemented merge law at $N$ write sites has
 $N$ laws: bug_059's observe leg kept-first-with-fresh-timestamp while the

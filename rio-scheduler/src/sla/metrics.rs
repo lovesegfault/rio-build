@@ -137,11 +137,18 @@ pub fn describe_all() {
          (sched.sla.class-membership); `cursor_fence`: the whole \
          lambda persist unit refused because the stored consumption \
          cursor is ahead of the writer's — a deposed fold no-ops as \
-         ONE (sched.sla.one-fence-axis). \
-         Sustained nonzero ⇒ a producer is shipping junk evidence (or \
-         a poisoned PG row needs operator surgery); the stores stay \
-         clean but the named plane is learning nothing from those \
-         rows."
+         ONE (sched.sla.one-fence-axis); `nonfinite_value`: a float8 \
+         VALUE-family datum (cursor/price value, ratio halves, group \
+         SUM) refused at its typed decode — the row/group never \
+         enters a fold (sched.sla.refusal-per-column); \
+         `skip_to_horizon`: a poisoned consumption cursor adopted the \
+         settled horizon WITHOUT consuming (skip, never re-fold — \
+         the bounded disclosed repair). \
+         Sustained nonzero ⇒ a producer is shipping junk evidence; \
+         poisoned PG rows self-heal at the leader's write boundary \
+         (stamps reset, value rows deleted, the cursor healed in \
+         place); the stores stay clean but the named plane is \
+         learning nothing from those rows."
     );
     describe_counter!(
         "rio_scheduler_sla_als_round_cap_hit_total",
@@ -467,12 +474,17 @@ pub const SLA_LABELED_METRICS: &[(&str, &str, &[&str])] = &[
         // bw12 merged_bug_048: the one-fence-axis cursor abort (the
         // whole lambda persist unit refused when the stored
         // consumption position is ahead — cost.rs persist_rows).
+        // bw13 merged_bug_016 (sched.sla.refusal-per-column): the
+        // VALUE-family typed-decode refusal + the poisoned-cursor
+        // skip-to-horizon repair disclosure.
         &[
             "zero_resource",
             "nonfinite_epoch",
             "sequence_premise",
             "unknown_class",
             "cursor_fence",
+            "nonfinite_value",
+            "skip_to_horizon",
         ],
     ),
     (
