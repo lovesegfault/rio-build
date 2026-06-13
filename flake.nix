@@ -732,6 +732,33 @@
               };
 
               # --------------------------------------------------------------
+              # rio-eval — the eval parent binary (ADR-024 P3b)
+              # --------------------------------------------------------------
+              #
+              # C++ main embedding the pinned nix 2.34 libexpr + the SAME
+              # shim/staticlib pair as the plugin, compiled as a real binary
+              # (fork workers over the evaljob channel). packages.rio-eval;
+              # packages.rio wraps the coordinator with RIO_EVAL_PARENT
+              # pointing here (the usable pair); check rio-eval-smoke drives
+              # the real binary through the eval-harness in the sandbox.
+              rioEvalPkg = import ./nix/rio-eval.nix {
+                inherit pkgs inputs system;
+                inherit (pkgs) lib;
+                evalstoreCrate = crateBuild.cargoNix.workspaceMembers.rio-evalstore.build;
+                buildCliBins = crateBuild.memberBins.rio-build-cli;
+              };
+
+              # The usable coordinator+eval-parent pair: `rio` with the
+              # eval-parent path defaulted via the RIO_ env config layer
+              # (explicit config/--eval-parent still overrides — env sits
+              # below CLI in the precedence chain).
+              rioPair = pkgs.runCommand "rio" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
+                mkdir -p $out/bin
+                makeWrapper ${crateBuild.memberBins.rio-build-cli}/bin/rio $out/bin/rio \
+                  --set-default RIO_EVAL_PARENT ${rioEvalPkg.rioEval}/bin/rio-eval
+              '';
+
+              # --------------------------------------------------------------
               # Mutation testing (dev-only — NOT in checks)
               # --------------------------------------------------------------
               inherit
@@ -986,6 +1013,11 @@
                 # rio:// eval-store nix plugin (ADR-024 M0). Pin contract:
                 # only load into inputs.nix binaries.
                 evalstore-plugin = evalstorePlugin.plugin;
+                # The eval parent binary (ADR-024 P3b) and the usable
+                # coordinator+parent pair (`nix build .#rio` → bin/rio
+                # with RIO_EVAL_PARENT defaulted).
+                rio-eval = rioEvalPkg.rioEval;
+                rio = rioPair;
               }
               # Container images. `.#dockerImages` is the linkFarm xtask
               # `eks push` walks; individual images at `.#dockerImages.<name>`
@@ -1238,6 +1270,10 @@
                   # stock nix on the local parity fixture, zero
                   # cross-check failures.
                   evalstore-parity = evalstorePlugin.parity;
+                  # ADR-024 P3b: the REAL eval parent in the sandbox —
+                  # fork workers through real libexpr, drvPath parity vs
+                  # stock nix, recycling determinism, crash injection.
+                  rio-eval-smoke = rioEvalPkg.smoke;
                 }
                 # Workspace-level policy checks (deny, helm-lint,
                 # tracey-validate, crds-drift, tfvars-fresh, …).
