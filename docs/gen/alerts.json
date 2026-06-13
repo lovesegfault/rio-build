@@ -3,6 +3,7 @@
     "KubeBuildSchedulerDown",
     "KubeBuildSchedulerPendingStuck",
     "RioControllerRestarts",
+    "RioGatewayLogTailDegraded",
     "RioLogChunkWriteFailures",
     "RioLogReadDataLoss",
     "RioLogReadDivergence",
@@ -54,6 +55,16 @@
       "severity": "warning",
       "templated": false,
       "metrics": []
+    },
+    {
+      "name": "RioGatewayLogTailDegraded",
+      "expr": "sum(rate(rio_gateway_log_tail_reconnects_total{reason=\"open_failed\"}[5m])) > 0.2",
+      "for": "10m",
+      "severity": "warning",
+      "templated": false,
+      "metrics": [
+        "rio_gateway_log_tail_reconnects_total"
+      ]
     },
     {
       "name": "RioLogChunkWriteFailures",
