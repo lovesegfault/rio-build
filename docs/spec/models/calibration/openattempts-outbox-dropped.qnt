@@ -30,6 +30,7 @@ module openAttemptsOutboxDropped {
 
   /// PRE-FIX: the failed persist drops the close on the floor — the
   /// driver is never armed.
+  // Environment: calibration override -- the pre-fix posture this twin re-encodes (the file header names the bug); no production transition fires this arm
   action calibCancelPersistErrDropped = all {
     node == NWantedLive,
     attempt == AOpen,

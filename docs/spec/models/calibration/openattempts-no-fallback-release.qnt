@@ -31,6 +31,7 @@ module openAttemptsNoFallbackRelease {
   /// PRE-FIX: the close settles but the failed companion's release
   /// fallback never runs — the claim is stranded (releasesClaim=false
   /// at the settled-close seat).
+  // Environment: calibration override -- the pre-fix posture this twin re-encodes (the file header names the bug); no production transition fires this arm
   action calibCloseNoRelease = all {
     attempt == AOpen,
     node == NWantedLive,

@@ -37,6 +37,7 @@ module openAttemptsRotationSkew {
 
   /// PRE-FIX: the auth-layer refusal resolves the entry (the
   /// credential evaporates during rotation skew).
+  // Environment: calibration override -- the pre-fix posture this twin re-encodes (the file header names the bug); no production transition fires this arm
   action calibAuthRefusalResolves = all {
     clientHoldsResume,
     authRefusalSeat(true),

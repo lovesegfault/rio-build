@@ -28,6 +28,7 @@ module openAttemptsMintingConfirm {
   import openAttempts.* from "../openAttempts"
 
   /// PRE-FIX: the confirm probe mints (the unscreened DeliverNew arm).
+  // Environment: calibration override -- the pre-fix posture this twin re-encodes (the file header names the bug); no production transition fires this arm
   action calibConfirmMints = all {
     confirmProbeSeat(true),
     node' = node,

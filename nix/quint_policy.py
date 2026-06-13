@@ -384,18 +384,12 @@ P8_GRANDFATHER: frozenset = frozenset(
         "nodeclaimLifecycleTombstoneAsBuilt",
         "nodeclaimLifecycleTombstoneDisposition",
         "nodeclaimLifecycleTombstoneDispositionAsBuilt",
-        "openAttemptsAckOnFailedClose",
-        "openAttemptsBudget",
-        "openAttemptsChargeBlind",
-        "openAttemptsClobberedCredential",
-        "openAttemptsMintingConfirm",
-        "openAttemptsNoFallbackRelease",
-        "openAttemptsNoncelessMint",
-        "openAttemptsOutboxDropped",
-        "openAttemptsOvermint",
-        "openAttemptsRefusalAsLost",
-        "openAttemptsRotationSkew",
-        "openAttemptsUnfencedGone",
+        # openAttempts* (12 rows: openAttemptsBudget + the 11
+        # calibration twins) left the grandfather at the round-14
+        # D-17 stage-4 conversion (Mirrors/Environment lines on the
+        # full step alphabet ride the same commit -- the freeze
+        # contract above). The core openAttempts module left at
+        # bughunt-13 S8 (the MBT driver work).
         "placeholderClaim",
         "placeholderClaimMain",
         "placeholderClaimNoLiveness",
@@ -472,14 +466,13 @@ P8_GRANDFATHER: frozenset = frozenset(
         "wedgeCalib034Instantaneous",
         "wedgeCalib163PartialDrain",
         "wedgeCalib176EarlyReturn",
-        "wedgeCluster",
-        "wedgeClusterAdmission",
-        "wedgeClusterDwellArm",
-        "wedgeClusterEpilogue",
-        "wedgeClusterLatch",
-        "wedgeClusterMain",
-        "wedgeClusterNoEviction",
-        "wedgeClusterTrajectory",
+        # wedgeCluster* (8 rows: the core + 7 regime modules) left the
+        # grandfather at the round-14 D-17 stage-5 conversion (the
+        # MBT-3 driver landed bughunt-13, so the binding derivation
+        # was already done; tick + reapMarked carry Mirrors lines from
+        # the same commit). The wedgeCalib* twins above stay
+        # grandfathered (the fenceCalib* precedent -- calibration
+        # overrides are a separate burn-down lane).
     }
 )
 

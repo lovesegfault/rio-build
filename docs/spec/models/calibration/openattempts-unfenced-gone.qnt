@@ -30,6 +30,7 @@ module openAttemptsUnfencedGone {
 
   /// PRE-FIX: the live-loop Gone licenses the exit WITHOUT writing
   /// the fence (the as-built confirm_only-gated arm).
+  // Environment: calibration override -- the pre-fix posture this twin re-encodes (the file header names the bug); no production transition fires this arm
   action calibLiveGoneUnfenced = all {
     node != NWantedLive,
     attempt != AOpen,

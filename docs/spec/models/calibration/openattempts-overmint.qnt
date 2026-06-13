@@ -32,6 +32,7 @@ module openAttemptsOvermint {
 
   /// PRE-FIX: the gate consults the per-pass counter -- prior-pass
   /// unanswered mints are invisible.
+  // Environment: calibration override -- the pre-fix posture this twin re-encodes (the file header names the bug); no production transition fires this arm
   action calibMintPerPassGated = mintBudgetSeat(passMints < SLOTS)
 
   action calibStep = any {

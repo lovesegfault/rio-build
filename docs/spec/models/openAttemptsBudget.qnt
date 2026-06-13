@@ -61,16 +61,19 @@ module openAttemptsBudget {
 
   /// LIVE: the gate derives from the surviving population -- mint
   /// only while outstanding < SLOTS.
+  // Mirrors: rio-scheduler/src/actor/pull.rs:pull_assignment_inner
   action budgetMintGated = mintBudgetSeat(ledgerPop < SLOTS)
 
   /// A pass boundary: the per-pass counter resets; the POPULATION
   /// survives (unanswered nonces are existing obligations).
+  // Environment: the reconcile-pass boundary -- the production loop's per-pass counter reset; no protocol content moves
   action budgetPassEnd = all {
     ledgerPop' = ledgerPop,
     passMints' = 0,
   }
 
   /// An authoritative answer drains one entry.
+  // Mirrors: rio-scheduler/src/actor/pull.rs:handle_report_outcome
   action budgetEntryResolved = all {
     ledgerPop > 0,
     ledgerPop' = ledgerPop - 1,

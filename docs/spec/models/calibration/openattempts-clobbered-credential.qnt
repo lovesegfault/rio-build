@@ -28,6 +28,7 @@ module openAttemptsClobberedCredential {
   import openAttempts.* from "../openAttempts"
 
   /// PRE-FIX: the fresh pass mints over the live credential.
+  // Environment: calibration override -- the pre-fix posture this twin re-encodes (the file header names the bug); no production transition fires this arm
   action calibFreshMintClobbers = all {
     clientHoldsResume,
     freshClaimSeat(true),

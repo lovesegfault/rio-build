@@ -32,6 +32,7 @@ module openAttemptsChargeBlind {
 
   /// PRE-FIX: the failed persist is dropped (best-effort error log) —
   /// nothing latches, nothing re-drives.
+  // Environment: calibration override -- the pre-fix posture this twin re-encodes (the file header names the bug); no production transition fires this arm
   action calibCancelPersistErrDropped = all {
     node == NWantedLive,
     attempt == AOpen,
@@ -44,6 +45,7 @@ module openAttemptsChargeBlind {
 
   /// PRE-FIX: the sweep never consults the node — every expired open
   /// attempt is charged executor_crash, cancelled or not.
+  // Environment: calibration override -- the pre-fix posture this twin re-encodes (the file header names the bug); no production transition fires this arm
   action calibSweepChargeBlind = all {
     attempt == AOpen,
     not(responseLost and clientHoldsResume),

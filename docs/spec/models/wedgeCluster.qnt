@@ -513,6 +513,7 @@ module wedgeCluster {
       downgradeEdge: downgradeEdge,
     }
 
+  // Mirrors: rio-controller/src/reconcilers/nodeclaim_pool/wedge.rs:update
   action tick = {
     // Expiries draw from the ATTRIBUTION universe (ghosts included
     // when tracked); healthy attribution stays registered-only — a
@@ -560,6 +561,7 @@ module wedgeCluster {
   // The controller reaps a currently-marked node (Dead arm took it):
   // its backing-node name lands in the eviction stash for the NEXT
   // update — exactly mod.rs's pending_wedge_evictions flow.
+  // Mirrors: rio-controller/src/reconcilers/nodeclaim_pool/mod.rs:pending_wedge_evictions
   action reapMarked = all {
     marked.size() > 0,
     nondet n = marked.oneOf()

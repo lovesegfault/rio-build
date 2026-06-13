@@ -30,6 +30,7 @@ module openAttemptsAckOnFailedClose {
   /// PRE-FIX: the failed close write is ACKED anyway — the
   /// unconditional-ack arm routes the flipped decision through the
   /// failed-close seat.
+  // Environment: calibration override -- the pre-fix posture this twin re-encodes (the file header names the bug); no production transition fires this arm
   action calibAckOnFailedClose = all {
     attempt == AOpen,
     node == NWantedLive,

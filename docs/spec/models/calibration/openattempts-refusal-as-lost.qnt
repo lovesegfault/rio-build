@@ -28,6 +28,7 @@ module openAttemptsRefusalAsLost {
   import openAttempts.* from "../openAttempts"
 
   /// PRE-FIX: the answered refusal keeps the entry (filed as lost).
+  // Environment: calibration override -- the pre-fix posture this twin re-encodes (the file header names the bug); no production transition fires this arm
   action calibRefusalKeepsEntry = all {
     clientHoldsResume,
     answeredRefusalSeat(false),

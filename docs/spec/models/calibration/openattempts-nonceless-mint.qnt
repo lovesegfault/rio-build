@@ -32,6 +32,7 @@ module openAttemptsNoncelessMint {
 
   /// PRE-FIX: the mint's response is lost and NO credential was
   /// persisted — redelivery is impossible by construction.
+  // Environment: calibration override -- the pre-fix posture this twin re-encodes (the file header names the bug); no production transition fires this arm
   action calibMintNonceless = all {
     node == NWantedLive,
     attempt != AOpen,
