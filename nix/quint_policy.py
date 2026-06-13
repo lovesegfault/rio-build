@@ -188,8 +188,10 @@ P8_GRANDFATHER: frozenset = frozenset(
         "fenceCalib338AtomicReread",
         "fenceCalib393TerminalRefusal",
         "fenceCalibFloorBlind",
-        "fencedWrites",
-        "fencedWritesT1",
+        # fencedWrites + fencedWritesT1 left the grandfather at the
+        # bughunt-13 TB-4 conversion (Mirrors/Environment lines on the
+        # full step alphabet ride the same commit — the freeze
+        # contract above).
         "ffdCalibNoClassClamp",
         "gaCalibCrdAbsentArmed",
         "gaCalibNoLiveRecheck",

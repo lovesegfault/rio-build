@@ -1,5 +1,5 @@
 // -*- mode: Bluespec; -*-
-// quint-policy-latches: rowRegressed, belowFloorMutation, floorRegressed, deposedCloseApplied, clientGaveUp
+// quint-policy-latches: rowRegressed, belowFloorMutation, floorRegressed, deposedCloseApplied, clientGaveUp, closeScopeViolated
 //
 // fencedWrites — the claims-floor fence RE-STATED OVER INTERLEAVED
 // TRANSACTIONS (A1 fenced-write-discipline; bughunt wave).
@@ -35,6 +35,30 @@
 // partial-unique index, where the in-statement guard governs; the
 // worst case is one transient dual delivery, settled by the
 // report-side fence.
+//
+// TB-4 (bughunt-13 referee, SURVIVED): the direct closer was
+// derivation-keyed — `fencedClose` closed the derivation's CURRENT
+// row gated on OWNERSHIP (activeOwner == r), while its own doc cited
+// `FencedTx::close_assignment`, whose production selector is
+// `exec_id = $1`, NOT owner-gated (assignments carry no
+// scheduler-replica owner; the fence is the only gate). Two faces:
+// (a) under-constraint — an owner whose subject exec was superseded
+// by its own re-mint closed the SUCCESSOR exec in-model, a
+// destructive close production's stale-exec selector turns into zero
+// rows, with NO latch watching the direct path; (b) over-constraint —
+// the owner gate excluded the failover settle (a live successor
+// closing a predecessor-minted row: the daily report/sweep path,
+// housekeeping.rs + materialize.rs close by ids read from reports and
+// DB rows whoever minted them). The close is now keyed on the exec
+// the caller NAMES (`fencedCloseNamed`); the owner gate is gone; the
+// closeScopeViolated latch + the fence-tb4-derivation-keyed-close
+// calibration hold the law falsifiable; the noDirectCloseApplied /
+// noForeignSettle witnesses prove both repaired regions are entered.
+// Environment bound, priced at the action: production commit order
+// (claim ≼ mint ≼ exec-id-visibility) makes a deposed replica unable
+// to NAME an exec minted under a claim its floor read missed; the
+// model encodes the bound as an enabling condition instead of
+// data-flow provenance state.
 //
 // BUGHUNT-2 PLANES (slot 2): three axis-gated planes extend the same
 // board — (1) tenure-stamp (merged_bug_338: writes carry the
@@ -128,6 +152,21 @@ module fencedWrites {
   /// A fence refusal was answered with a terminal code and the client
   /// gave up (bug_393). Computed in answerRefusal.
   var clientGaveUp: bool
+  /// A direct close landed on an exec OTHER than the one its caller
+  /// NAMED (TB-4 — the derivation-/owner-keyed close class on the
+  /// per-attempt path; production's `exec_id = $1` selector makes the
+  /// mismatch a zero-row no-op). Computed in closeApply.
+  var closeScopeViolated: bool
+  /// Reachability ghost (TB-4 non-vacuity): some exec-matched direct
+  /// close APPLIED — the re-keyed close arm is exercised, not
+  /// vacuously green. Witness `noDirectCloseApplied` is wired
+  /// expected-VIOLATED.
+  var directCloseApplied: bool
+  /// Reachability ghost (TB-4 non-vacuity): a LIVE non-owner closed
+  /// the row it named — the failover settle the former owner gate
+  /// excluded from the verified space. Witness `noForeignSettle` is
+  /// wired expected-VIOLATED.
+  var foreignSettleApplied: bool
 
   // --- 4b. bughunt-2 plane state ---------------------------------------------
 
@@ -182,6 +221,9 @@ module fencedWrites {
     floorRegressed' = floorRegressed,
     deposedCloseApplied' = deposedCloseApplied,
     clientGaveUp' = clientGaveUp,
+    closeScopeViolated' = closeScopeViolated,
+    directCloseApplied' = directCloseApplied,
+    foreignSettleApplied' = foreignSettleApplied,
   }
   action claimsUnchanged = all {
     committedClaims' = committedClaims,
@@ -227,6 +269,9 @@ module fencedWrites {
     floorRegressed' = false,
     deposedCloseApplied' = false,
     clientGaveUp' = false,
+    closeScopeViolated' = false,
+    directCloseApplied' = false,
+    foreignSettleApplied' = false,
     atomicGen' = REPLICAS.mapBy(r => if (r == "r1") 1 else 0),
     staleWriteCommitted' = false,
     latchedExec' = 0,
@@ -264,14 +309,34 @@ module fencedWrites {
     floorRegressed' = floorRegressed,
     deposedCloseApplied' = deposedCloseApplied,
     clientGaveUp' = clientGaveUp,
+    closeScopeViolated' = closeScopeViolated,
+    directCloseApplied' = directCloseApplied,
+    foreignSettleApplied' = foreignSettleApplied,
   }
 
-  /// Row close apply — clears the active row. Owner/exec scoping is the
-  /// CALLER's decision; the deposed-foreign-close truth is computed here.
-  action closeApply(r: str, snap: int): bool = all {
+  /// Row close apply — clears the active row. Admission and the
+  /// named-exec match are the CALLER's decisions; the truths are
+  /// computed here from the pre-state (TB-4): `named` is the exec id
+  /// the caller's close statement BINDS (production: the
+  /// `exec_id = $1` selector; 0 encodes a derivation-keyed close that
+  /// names none) — a close that applies while `named` differs from
+  /// the row's exec is the scope violation; a live non-owner's
+  /// applied close is the failover settle (reachability ghost); a
+  /// deposed replica's applied close on a foreign row is the
+  /// merged_bug_231 latch, unchanged.
+  action closeApply(r: str, snap: int, named: int): bool = all {
     deposedCloseApplied' = or {
       deposedCloseApplied,
       and { activeGen > 0, activeOwner != r, deposed(r) },
+    },
+    closeScopeViolated' = or {
+      closeScopeViolated,
+      and { activeGen > 0, named != activeExec },
+    },
+    directCloseApplied' = or { directCloseApplied, activeGen > 0 },
+    foreignSettleApplied' = or {
+      foreignSettleApplied,
+      and { activeGen > 0, activeOwner != r, not(deposed(r)) },
     },
     activeGen' = 0,
     activeOwner' = "",
@@ -292,6 +357,9 @@ module fencedWrites {
     rowRegressed' = rowRegressed,
     deposedCloseApplied' = deposedCloseApplied,
     clientGaveUp' = clientGaveUp,
+    closeScopeViolated' = closeScopeViolated,
+    directCloseApplied' = directCloseApplied,
+    foreignSettleApplied' = foreignSettleApplied,
   }
 
   /// Refusal answer apply — the retryable/terminal DECISION is the
@@ -304,6 +372,9 @@ module fencedWrites {
     belowFloorMutation' = belowFloorMutation,
     floorRegressed' = floorRegressed,
     deposedCloseApplied' = deposedCloseApplied,
+    closeScopeViolated' = closeScopeViolated,
+    directCloseApplied' = directCloseApplied,
+    foreignSettleApplied' = foreignSettleApplied,
   }
 
   // --- 8. actions --------------------------------------------------------------------
@@ -311,6 +382,7 @@ module fencedWrites {
   /// A replica claims the next generation (the successor). The claim
   /// COMMITS immediately — every later floor READ sees it; an already
   /// in-flight transaction's snapshot does not (READ COMMITTED).
+  // Mirrors: rio-scheduler/src/db/recovery.rs:claim_generation
   action successorClaim(r: str): bool = all {
     maxOf(committedClaims) + 1 <= MAX_GEN,
     committedClaims' = committedClaims.union(Set(maxOf(committedClaims) + 1)),
@@ -330,6 +402,7 @@ module fencedWrites {
   }
 
   /// begin_fenced's floor read: snapshot the floor VISIBLE NOW.
+  // Mirrors: rio-scheduler/src/db/mod.rs:begin_fenced
   action beginTx(r: str): bool = all {
     txPhase.get(r) == TxIdle,
     replicaGen.get(r) > 0,
@@ -342,6 +415,7 @@ module fencedWrites {
   /// begin_fenced refuses: the visible floor exceeds the replica's
   /// generation — Fenced{floor}. The transaction ends having written
   /// NOTHING; the refusal awaits its client answer (bug_393's hook).
+  // Mirrors: rio-scheduler/src/db/mod.rs:begin_fenced
   action fenceRefuse(r: str): bool = all {
     match txPhase.get(r) {
       | TxIdle => false
@@ -403,6 +477,8 @@ module fencedWrites {
   }
 
   /// The fixed system's mint: stamps the claim-stamped tenure.
+  // Mirrors: rio-scheduler/src/db/open_attempts.rs:mint_pull_attempt_fenced
+  // Mirrors: rio-scheduler/src/db/open_attempts.rs:mint_assignment_upsert_in_tx
   action guardedUpsertCommit(r: str): bool =
     guardedUpsertCommitAs(r, replicaGen.get(r))
 
@@ -410,6 +486,7 @@ module fencedWrites {
   /// raises the live atomic ABOVE the claim-stamped tenure (the
   /// mid-mailbox window merged_bug_338 lived in). The claim stamp
   /// does NOT move — only a new claim moves it.
+  // Environment: the lease plane's mid-tenure re-acquire/rebound advances the live serving atomic (rio-lease) — no scheduler-DB transition fires; bounded by MAX_GEN, and the claim stamp (the typed ServingGeneration every write carries) does not move
   action atomicBumpReacquire(r: str): bool = all {
     ENABLE_ATOMIC_REREAD,
     atomicGen.get(r) > 0,
@@ -421,19 +498,47 @@ module fencedWrites {
     stampLatchUnchanged, outboxUnchanged, lifecycleUnchanged,
   }
 
-  /// The exec-scoped fenced close (FencedTx::close_assignment): a
-  /// replica closes only the row IT owns, inside an admitted
-  /// transaction. Deposed replicas never reach here (their begin
-  /// refuses); a non-owner's close affects zero rows.
-  action fencedClose(r: str): bool = all {
+  /// The exec-keyed fenced close (FencedTx::close_assignment), TB-4
+  /// re-derived: production's per-attempt closers bind the exec id
+  /// their REPORT/SWEEP ROW carries (`exec_id = $1`) and are NOT
+  /// owner-gated — assignments rows carry no scheduler-replica owner,
+  /// the claims-floor fence is the only gate, and the failover settle
+  /// (a live successor closing a predecessor-minted row) is the daily
+  /// path. A named exec that is no longer the active one affects ZERO
+  /// rows (the resubmit re-mint rewrote exec_id in place — the
+  /// merged_bug_011 scope law on the direct path). The named ids
+  /// range over MINTED execs only (reports and sweep rows carry real
+  /// ids; UUIDs are unguessable).
+  ///
+  /// Environment bound (TB-4, priced): a DEPOSED replica never
+  /// applies a close to a row it does not own — production commit
+  /// order (claim ≼ mint ≼ exec-id-visibility) means any read that
+  /// could learn a newer tenure's exec id happens after that tenure's
+  /// claim is floor-visible, so the deposed replica's begin refuses;
+  /// and the sweep's expiry filter cannot select a successor row
+  /// minted inside the closer's own open transaction. Encoded as an
+  /// enabling condition instead of data-flow provenance state; the
+  /// fence-231 calibration drops the whole fence and keeps the
+  /// deposed-close latch falsifiable.
+  // Mirrors: rio-scheduler/src/db/mod.rs:close_assignment
+  action fencedClose(r: str): bool = {
+    nondet e = 1.to(MAX_EXECS).oneOf()
+    fencedCloseNamed(r, e)
+  }
+
+  /// The named-exec close body (runs and calibrations call this
+  /// directly with an explicit subject).
+  action fencedCloseNamed(r: str, e: int): bool = all {
     match txPhase.get(r) {
       | TxIdle => false
       | TxFloorRead(v) => v <= replicaGen.get(r)
     },
+    e <= execsMinted,
+    not(and { deposed(r), activeGen > 0, activeExec == e, activeOwner != r }),
     txPhase' = txPhase.set(r, TxIdle),
     val snap = match txPhase.get(r) { | TxIdle => 0 | TxFloorRead(v) => v }
-    if (activeGen > 0 and activeOwner == r) {
-      closeApply(r, snap)
+    if (activeGen > 0 and activeExec == e) {
+      closeApply(r, snap, e)
     } else all {
       rowUnchanged,
       latchesUnchanged,
@@ -446,6 +551,7 @@ module fencedWrites {
   /// The fenced resource-floor write with the server-side per-
   /// dimension GREATEST ratchet (bug_273's fix): even a live leader's
   /// stale-base write can only raise the floor.
+  // Mirrors: rio-scheduler/src/db/derivations.rs:update_resource_floor
   action floorWriteGreatest(r: str, v: int): bool = all {
     match txPhase.get(r) {
       | TxIdle => false
@@ -462,6 +568,7 @@ module fencedWrites {
   /// The client answers a fence refusal as RETRYABLE (UNAVAILABLE
   /// family — sched.grpc.fence-retryable): it retries; nobody gives
   /// up. The fixed system's only answer arm.
+  // Mirrors: rio-scheduler/src/grpc/actor_guards.rs:actor_error_to_status
   action answerRetryable(r: str): bool = all {
     answerRefusal(r, true),
     txPhase' = txPhase,
@@ -474,6 +581,7 @@ module fencedWrites {
   /// Plane 2: a status persist FAILED — the leader latches the batch
   /// with the derivation's ACTIVE exec (memory is the only source).
   /// The active row stays open (the failed persist closed nothing).
+  // Mirrors: rio-scheduler/src/actor/mod.rs:latch_status_batch
   action latchFailedPersist(r: str): bool = all {
     ENABLE_OUTBOX,
     latchedExec == 0,
@@ -493,6 +601,7 @@ module fencedWrites {
   /// Plane 2: the derivation ADVANCES past the latch — the resubmit
   /// reset re-mints the active row to a FRESH exec (the production
   /// active-row upsert rewrites exec_id in place).
+  // Mirrors: rio-scheduler/src/db/open_attempts.rs:mint_assignment_upsert_in_tx
   action advanceDerivation(r: str): bool = all {
     ENABLE_OUTBOX,
     latchedExec > 0,
@@ -557,10 +666,12 @@ module fencedWrites {
 
   /// The fixed system's flush: re-derived (stale ⇒ drop) and
   /// exec-scoped.
+  // Mirrors: rio-scheduler/src/db/derivations.rs:replay_status_batch_guarded
   action flushReplayGuarded(r: str): bool = flushReplayApply(r, true, true)
 
   /// Plane 3: this tenure's recovery (the DAG load) succeeds — the
   /// RecoveredDag witness exists.
+  // Mirrors: rio-scheduler/src/actor/recovery.rs:recover_from_pg
   action recoverySucceed(r: str): bool = all {
     ENABLE_TENURE_LIFECYCLE,
     replicaGen.get(r) > 0,
@@ -595,6 +706,7 @@ module fencedWrites {
   }
 
   /// The fixed system's completion: only a recovered tenure completes.
+  // Mirrors: rio-scheduler/src/actor/recovery.rs:handle_leader_acquired
   action completeTenure(r: str): bool = all {
     recoveredOk.get(r),
     completeTenureApply(r, recoveredOk.get(r)),
@@ -604,6 +716,7 @@ module fencedWrites {
   /// (sched.recovery.step-down): the replica stops serving its
   /// generation — the DURABLE CLAIM STAYS (committedClaims untouched:
   /// the documented harmless over-claim) — and re-enters candidacy.
+  // Mirrors: rio-scheduler/src/actor/recovery.rs:request_step_down
   action stepDownFailedTenure(r: str): bool = all {
     ENABLE_TENURE_LIFECYCLE,
     replicaGen.get(r) > 0,
@@ -667,6 +780,25 @@ module fencedWrites {
   /// Falsifiability pair: calibration fence-231-unfenced-close.
   val openAttemptViewStableUnderDeposedClose = not(deposedCloseApplied)
 
+  /// TB-4 (bughunt-13): a direct close lands only on the exec it
+  /// NAMES — production's `close_assignment` selector (`exec_id =
+  /// $1`); a derivation-/owner-keyed close that lands elsewhere is
+  /// the merged_bug_231/merged_bug_011 scope class on the
+  /// per-attempt path.
+  /// Falsifiability pair: calibration
+  /// fence-tb4-derivation-keyed-close.
+  val directCloseHitsOnlyNamedExec = not(closeScopeViolated)
+
+  /// TB-4 non-vacuity witness (expected VIOLATED by its wired check):
+  /// some exec-matched close applies — the re-keyed arm is exercised.
+  val noDirectCloseApplied = not(directCloseApplied)
+
+  /// TB-4 non-vacuity witness (expected VIOLATED by its wired check):
+  /// the failover settle — a LIVE non-owner closing the row it
+  /// names — is inside the verified space (the over-constraint face's
+  /// repair proof).
+  val noForeignSettle = not(foreignSettleApplied)
+
   /// bug_393: every fence refusal is answered retryably — no client
   /// ever gives up on a request the live leader would accept.
   /// Falsifiability pair: calibration fence-393-terminal-refusal.
@@ -699,6 +831,7 @@ module fencedWrites {
     belowFloorTxNeverMutates,
     resourceFloorMonotonic,
     openAttemptViewStableUnderDeposedClose,
+    directCloseHitsOnlyNamedExec,
     fenceRefusalAlwaysRetryable,
     writesCarryClaimedTenure,
     outboxReplayNeverRegresses,

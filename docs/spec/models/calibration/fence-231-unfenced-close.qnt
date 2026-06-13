@@ -37,11 +37,14 @@ module fenceCalib231UnfencedClose {
   /// DECISION-ONLY perturbation (bughunt-2 bug_358): the owner/fence
   /// guards are SKIPPED; the deposed-foreign-close truth comes from
   /// the live closeApply oracle (fenceless writers believe
-  /// currentFloor).
+  /// currentFloor). The named-exec argument is 0 (TB-4 seat
+  /// signature): a derivation-keyed statement binds no exec id, which
+  /// the closeScopeViolated oracle also observes — this calibration's
+  /// PREDICTED witness stays the deposed-close latch.
   action calibUnfencedDerivationClose(r: str): bool = all {
     replicaGen.get(r) > 0,
     activeGen > 0,
-    closeApply(r, currentFloor),
+    closeApply(r, currentFloor, 0),
     txPhase' = txPhase,
     pendingRefusal' = pendingRefusal,
     claimsUnchanged, floorUnchanged,

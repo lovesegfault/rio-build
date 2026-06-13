@@ -7147,6 +7147,16 @@ rec {
     # explicitly none-sensible for this workstream — the subjects are
     # DB-transaction interleavings and a gRPC code mapping, not pure
     # algebra; the kernel crates stay the kani domain.
+    #
+    # TB-4 re-measure (bughunt-13: the exec-keyed close + its nondet
+    # subject pick): ~11.2 s TLC wall-clock on the same T1 board —
+    # the named-exec branching is transition-fanout only (states are
+    # unchanged modulo the three new booleans); all eight legacy
+    # calibration falsifications re-verified red post-rekey, each
+    # <2 s. The TB-4 twin (fence-tb4-derivation-keyed-close) reds in
+    # ~1.4 s and its as-built baseline holds in ~1.8 s; the two
+    # reachability witnesses (noDirectCloseApplied, noForeignSettle)
+    # violate in ~1.0-1.6 s.
     # ------------------------------------------------------------------
     # Bughunt-2 planes (slot 2): the same board gains (1) the
     # tenure-stamp plane — writesCarryClaimedTenure (merged_bug_338:
@@ -7247,6 +7257,34 @@ rec {
       extraSpecs = [ "fencedWrites" ];
       step = "calibStep";
       witness = "belowFloorTxNeverMutates";
+    };
+    # TB-4 (bughunt-13): the pre-fix close keying — owner-gated,
+    # derivation-keyed, exec-blind — re-encoded as the repair's
+    # falsifiability pair; the closeScopeViolated oracle (live in
+    # closeApply) observes the dropped exec-scope decision.
+    quint-fence-calib-tb4-derivation-keyed-close = mkQuintWitnessCheck {
+      name = "fence-calib-tb4-derivation-keyed-close";
+      spec = "calibration/fence-tb4-derivation-keyed-close";
+      main = "fenceCalibTb4DerivationKeyedClose";
+      extraSpecs = [ "fencedWrites" ];
+      step = "calibStep";
+      witness = "directCloseHitsOnlyNamedExec";
+    };
+    # TB-4 non-vacuity pair (expected VIOLATED against the LIVE step):
+    # the exec-matched close arm is exercised, and the failover settle
+    # (live non-owner close — the face the former owner gate excluded
+    # from the verified space) is reachable.
+    quint-fence-witness-direct-close = mkQuintWitnessCheck {
+      name = "fence-witness-direct-close";
+      spec = "fencedWrites";
+      main = "fencedWritesT1";
+      witness = "noDirectCloseApplied";
+    };
+    quint-fence-witness-foreign-settle = mkQuintWitnessCheck {
+      name = "fence-witness-foreign-settle";
+      spec = "fencedWrites";
+      main = "fencedWritesT1";
+      witness = "noForeignSettle";
     };
 
     # ------------------------------------------------------------------
