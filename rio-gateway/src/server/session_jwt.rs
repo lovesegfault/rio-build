@@ -26,10 +26,14 @@ use tracing::{debug, warn};
 /// static upper bound. SIGHUP key rotation (T3) swaps the VERIFY
 /// key on scheduler/store; tokens minted under the old signing key
 /// become unverifiable post-swap. A long session that spans a
-/// rotation will see `UNAUTHENTICATED` on its next gRPC call → the
-/// client (nix) retries → new SSH connect → new token under the new
-/// key. Token refresh on long sessions would avoid the one failed
-/// call, but the retry-on-reconnect path already handles it.
+/// rotation will see `UNAUTHENTICATED` on its next gRPC call and
+/// surface honestly as `NotLocallyHealable` (the gateway's signing
+/// key is read once at boot, `main.rs:203-218`, with no reload path
+/// — a re-mint signs with the SAME key the verifier just refused).
+/// The client (nix) retries → new SSH connect to a rolled gateway
+/// pod → new token under the new key. There is NO in-session heal
+/// for rotation; the only heal-able rejection cause is local expiry
+/// (`r[gw.jwt.remint-local-expiry-only]`).
 const JWT_SESSION_TTL_SECS: i64 = 3600 + 300;
 
 /// Re-mint threshold. When the cached token has fewer than this many

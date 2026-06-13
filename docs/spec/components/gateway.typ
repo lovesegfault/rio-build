@@ -1118,6 +1118,20 @@ fetch). The optimization:
   fresh `jti`; the old `jti` is NOT revoked (it expires naturally).
 ]
 
+#r("gw.jwt.remint-local-expiry-only")[
+  A rejection-triggered session-token re-mint MUST be scoped to causes the
+  gateway can locally verify as heal-able by re-minting: the cached token is
+  within `JWT_REFRESH_SLACK_SECS` of `exp` by the gateway's own clock
+  (`RemintCause::LocalExpiry`). Any other `Unauthenticated` rejection
+  (`RemintCause::NotLocallyHealable` --- revoked `jti`, unknown verify key,
+  malformed) MUST surface honestly with the auth evidence and MUST NOT
+  re-mint. The gateway is the issuer and holds the signing key read once at
+  boot with no reload path, so re-signing with the same key cannot heal a
+  verifier-side refusal of a token well within its TTL; and a fresh `jti`
+  silently overrides a per-`jti` operator revocation. The recovery evidence
+  is the follow-up authorized call succeeding, never the mint itself.
+]
+
 #r("gw.jwt.verify")[
   The tonic interceptor on scheduler and store MUST extract
   `x-rio-tenant-token`, verify signature+expiry, attach `Claims` to request

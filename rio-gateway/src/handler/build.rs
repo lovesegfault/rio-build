@@ -2144,12 +2144,12 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // live_064: the most recent re-attach failure, verbatim — the
     // evidence the exhaustion message carries.
     let mut last_reattach_err: Option<String> = None;
-    // live_064: the one-shot UNAUTHENTICATED re-mint. Armed (spent)
-    // at the first auth-rejected re-attach of an episode; a second
-    // auth rejection after the forced re-mint fails fast instead of
-    // burning the remaining budget on a verdict that cannot change.
-    // Reset on every successful re-attach so a later key rotation
-    // gets its own one-shot.
+    // live_064 + r[gw.jwt.remint-local-expiry-only]: the one-shot
+    // LocalExpiry re-mint. Armed (spent) at the first re-attach
+    // rejection the gateway can LOCALLY verify as expiry; any other
+    // Unauthenticated (NotLocallyHealable) fails fast without spending
+    // it. Reset on every successful re-attach so a later genuine
+    // expiry gets its own one-shot.
     let mut unauth_remint_spent = false;
     let outcome = loop {
         match source {
@@ -2446,8 +2446,8 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                     Some(stream) => {
                         budget.note_live_entered();
                         // A successful re-attach closes the auth
-                        // episode: a later rotation gets its own
-                        // one-shot re-mint.
+                        // episode: a later local-expiry rejection gets
+                        // its own one-shot re-mint.
                         unauth_remint_spent = false;
                         source = EventSource::Live(Box::new(stream));
                     }

@@ -241,7 +241,8 @@ pub(super) struct LogTailSet {
     /// the rest of the build (every re-open UNAUTHENTICATED with the
     /// frozen string, while the build itself ran fine). The source
     /// re-mints near expiry per open and force-re-mints once after an
-    /// UNAUTHENTICATED rejection (key rotation), so a tail outliving
+    /// UNAUTHENTICATED rejection it can locally verify as expiry
+    /// (`r[gw.jwt.remint-local-expiry-only]`), so a tail outliving
     /// `JWT_SESSION_TTL_SECS` keeps reading.
     jwt: SessionTokenSource,
     out_tx: mpsc::Sender<TaggedLogChunk>,
@@ -1898,7 +1899,7 @@ fn gap_marker(gap_from: u64, gap_until: u64) -> Vec<u8> {
 /// token-expiry blackout in the only line operators had.
 fn open_failed_lane(code: tonic::Code) -> &'static str {
     match code {
-        tonic::Code::Unauthenticated => "session token rejected; re-minting",
+        tonic::Code::Unauthenticated => "session token rejected",
         _ => "store unreachable",
     }
 }
@@ -2016,7 +2017,7 @@ mod tests {
         /// counts attempts.
         fail_opens: Mutex<u32>,
         /// How many upcoming `tail_log` calls fail at the open with
-        /// UNAUTHENTICATED (live_062: the expired/rotated-key token
+        /// UNAUTHENTICATED (live_062: a verifier-side token
         /// rejection). The request and its token are still recorded.
         unauth_opens: Mutex<u32>,
         /// How many upcoming `tail_log` calls HANG at the open itself
@@ -2042,7 +2043,8 @@ mod tests {
 
         /// Fail the next `n` `tail_log` opens with UNAUTHENTICATED
         /// (live_062: what the store answers when the carried token
-        /// is expired or signed by a rotated-away key).
+        /// is rejected by the verifier — the gateway classifies the
+        /// cause locally per `r[gw.jwt.remint-local-expiry-only]`).
         fn unauth_next_opens(&self, n: u32) {
             *self.inner.unauth_opens.lock().unwrap() = n;
         }
@@ -2463,7 +2465,7 @@ mod tests {
         use super::open_failed_lane;
         assert_eq!(
             open_failed_lane(tonic::Code::Unauthenticated),
-            "session token rejected; re-minting"
+            "session token rejected"
         );
         for code in [
             tonic::Code::Unavailable,
