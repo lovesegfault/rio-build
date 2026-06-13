@@ -81,6 +81,12 @@ int rio_store_open(const char * cas_dir /* nullable */, RioEvalStore ** out_stor
 void rio_store_free(RioEvalStore * store);
 void rio_string_free(char * s);
 
+/* Duplicate a NUL-terminated string into a rio_string_free()-able
+ * allocation (embedder helper for hook error out-parameters — malloc
+ * is not interchangeable with the Rust-side allocator). Null in, null
+ * out. */
+char * rio_string_dup(const char * s);
+
 /* Free a byte buffer returned by rio_read_directory. len must be the
  * value the call returned. */
 void rio_bytes_free(unsigned char * p, size_t len);
