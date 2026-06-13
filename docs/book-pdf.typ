@@ -21,6 +21,8 @@
 #pagebreak(weak: true)
 #include "architecture.typ"
 #pagebreak(weak: true)
+#include "architecture-build-client.typ"
+#pagebreak(weak: true)
 #include "spec/system/observability.typ"
 #pagebreak(weak: true)
 #include "spec/system/security.typ"

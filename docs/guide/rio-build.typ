@@ -3,14 +3,12 @@
 
 `rio build` is the native-protocol build client (ADR-024). It evaluates flake
 attributes locally --- in Nix's own libexpr, driven nix-eval-jobs-style ---
-and submits the resulting derivation graph to the cluster over gRPC as pure
-digest negotiation: every object that moves (file chunks, source directories,
-derivations) is keyed by #gls("blake3") of its canonical bytes, the cluster
-answers a presence bitmap, and the client uploads only what is missing,
-zstd-framed. It replaces `nix build --store ssh-ng://rio` for interactive and
-CI submission: post-eval time-to-first-build drops from 57~s (cold ssh-ng,
-measured) to about one second, and a warm rebuild ships kilobytes instead of
-re-streaming uncompressed NARs. The `ssh-ng://` gateway path stays --- use it
+and submits the resulting derivation graph to the cluster over gRPC as digest
+negotiation: the cluster reports which #gls("blake3")-keyed objects it
+already holds, and the client uploads only the misses. It replaces
+`nix build --store ssh-ng://rio` for interactive and CI submission:
+post-eval time-to-first-build drops from 57~s (cold ssh-ng, measured) to
+about one second. The `ssh-ng://` gateway path stays --- use it
 for stock Nix clients that cannot install `rio`, for deployments where only
 the SSH gateway is reachable from outside the cluster, or when you need
 outputs realized into a real local `/nix/store` (`rio build --fetch`
@@ -96,7 +94,7 @@ rio build .#hello --out-link ./result-hello
 All installables in one invocation must share a single flake reference ---
 the eval parent locks one flake and fetches its inputs once before forking
 workers. A bare reference (no `#attr`) evaluates the flake's default
-attribute.
+package (`packages.<system>.default`).
 
 While the build runs, the client prints one status line per derivation event
 (`queued`, `building`, `built`, …) and finishes with the output paths.
@@ -211,19 +209,15 @@ will actually touch:
 
 = What Happens Under the Hood
 
-A single `rio build .#attr` does, in overlapping stages: the coordinator
-spawns `rio-eval`, which locks the flake, fetches inputs once, then forks
-evaluation workers; each worker evaluates its attribute, ingesting source
-trees through the rio eval store (one walk produces FastCDC chunks,
-per-directory castore blobs and the NAR hash together) and streaming back a
-skeleton of derivation digests plus the canonical derivation bytes; the
-coordinator folds those by digest, asks the cluster which digests it already
-has (`Has*` bitmaps, short-circuited by the persistent ack table), uploads
-only the misses zstd-framed, and --- once a root's transitive skeleton is
-complete and every referenced object is acked --- submits a digest-only
-skeleton and renders the resulting `BuildEvent` stream. Derivation bytes
-never touch the client disk; source trees are re-read from your working copy
-at upload time and verified against what evaluation reported.
+A single `rio build .#attr` runs evaluation and submission overlapped: the
+coordinator spawns `rio-eval`, which locks the flake and fetches its inputs
+once, then forks evaluation workers. Workers stream back derivation digests
+plus the canonical derivation bytes; the coordinator folds them by digest,
+asks the cluster which it already has, uploads only the misses, and submits
+each root as a digest-only skeleton as soon as everything it references is
+acked, then renders the `BuildEvent` stream. Derivation bytes never touch
+the client disk; source trees are re-read from your working copy at upload
+time and verified against what evaluation reported.
 
 The full picture, with figures, is in
 #cross-link("/architecture-build-client.typ")[Build Client Architecture];
@@ -285,8 +279,7 @@ running and prints the same reattach hint.
 
 = Current Limitations
 
-These are implementation gaps in the current client, not design decisions;
-each is tracked as deferred work.
+Implementation gaps in the current client, not design decisions.
 
 - *`toFile` and single-file source roots.* Only origin-backed directory
   trees upload today. Input sources produced by `builtins.toFile` (streamed
