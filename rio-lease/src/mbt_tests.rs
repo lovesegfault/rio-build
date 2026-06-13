@@ -73,12 +73,15 @@
 //!    carries the absence partition (`leaseAbsent`, `vanishLease`,
 //!    `createLease`; the `leaderElectionVanish` regime checks the
 //!    believer-exit law and the `leaderElectionVanishHold` runs pin
-//!    the bug_059 hold split). The create path stays covered by the
-//!    unit tests (`create_on_404`,
-//!    `interleaved_create_race_admits_one_winner`); DRIVING the vanish
-//!    regime from this harness (the deletion MBT — mock-store arms for
-//!    `vanishLease`/`createLease` plus an acceptance trace) is the
-//!    recorded round-14 candidate, per the audit's phase-2 framing.
+//!    the bug_059 hold split). The deletion MBT now DRIVES the vanish
+//!    regime from this harness via the `leaderElectionVanishMbt`
+//!    module — the BASE-regime constants with one vanish armed, so the
+//!    tick mapping and the base-regime shim above apply unchanged —
+//!    and replays its `vanishBelieverExitsMbtRun` end to end
+//!    (`mbt_run_vanish_believer_exits`). The unit tests
+//!    (`create_on_404`, `interleaved_create_race_admits_one_winner`)
+//!    remain the create-race coverage; the MBT covers the believing
+//!    absent read whose belief exit is bug_143's law.
 //! 3. **The model checks the steal threshold at PUT time; the
 //!    implementation checks it at GET time.** Production's GET and PUT
 //!    are microseconds apart so the distinction is invisible there, but
@@ -96,6 +99,20 @@
 //!    suspend-aware fence clock — CLOCK_BOOTTIME in production), so the
 //!    driver maps the model's tick delta straight through. The
 //!    ambient-clock read that used to sit in the fence path is gone.
+//! 5. **The model exits a believing absent read at the `apiGet` step;
+//!    the production loop exits at the post-act `complete_round`
+//!    step.** Same evidence (the 404), different step granularity —
+//!    the production round is GET→act→derive in one tick. The driver's
+//!    `api_get` arm therefore applies the absent-lose edge inline when
+//!    `fetch_and_decide` returns `Create` on a believer (the
+//!    `RoundEdge::LoseObservedAbsent` body the production loop runs:
+//!    `on_lose` + observe-not-leading), so the per-step `leading`
+//!    projection matches. The `createLease` arm consumes the stashed
+//!    `Create` and runs `act()` exactly as the PUT arms do. THE
+//!    BELIEVER-EXIT LAW IS THE ACCEPTANCE: a driver that did NOT
+//!    apply the absent-lose edge at `api_get` (the pre-bug_143
+//!    posture) leaves `leading[n1]` true after the believing 404 read
+//!    and the projection diff fires there — the W14-H1 strawman.
 //!
 //! # Determinism policy
 //!
@@ -245,12 +262,31 @@ fn spec_path() -> std::path::PathBuf {
 ///   itself wrong.
 #[derive(Debug, PartialEq, Deserialize)]
 struct Projection {
-    #[serde(rename = "leaderElectionBase::leaderElection::lease")]
+    #[serde(
+        rename = "leaderElectionBase::leaderElection::lease",
+        alias = "leaderElectionVanishMbt::leaderElection::lease"
+    )]
     lease: ModelLease,
-    #[serde(rename = "leaderElectionBase::leaderElection::leading")]
+    #[serde(
+        rename = "leaderElectionBase::leaderElection::leading",
+        alias = "leaderElectionVanishMbt::leaderElection::leading"
+    )]
     leading: BTreeMap<String, bool>,
-    #[serde(rename = "leaderElectionBase::leaderElection::gen")]
+    #[serde(
+        rename = "leaderElectionBase::leaderElection::gen",
+        alias = "leaderElectionVanishMbt::leaderElection::gen"
+    )]
     r#gen: BTreeMap<String, u64>,
+    /// The model's `leaseAbsent`: no Lease object exists (every read
+    /// observes 404 until some replica's create lands). Projected as
+    /// `mock.stored().is_none()`. Always false in `leaderElectionBase`
+    /// (`MAX_VANISHES = 0`), so the existing base-regime replays are
+    /// unaffected; `leaderElectionVanishMbt` exercises both values.
+    #[serde(
+        rename = "leaderElectionBase::leaderElection::leaseAbsent",
+        alias = "leaderElectionVanishMbt::leaderElection::leaseAbsent"
+    )]
+    lease_absent: bool,
 }
 
 /// The model's `LeaseRec`: `{ holder: Holder, rv: int, gen: int }`.
@@ -310,6 +346,12 @@ struct MbtSystem {
     /// values is exact, so `decide()`'s observation ages come out as
     /// exact multiples of [`TICK`].
     base: Instant,
+    /// The model's `lease.rv` during the absence window: `vanishLease`
+    /// freezes the rv (no object, no revision — the eventual create
+    /// resumes from this point), so the projection needs the
+    /// rv-at-vanish to report `lease.rv` correctly while
+    /// `mock.stored()` is `None`. `Some` exactly when `leaseAbsent`.
+    vanished_at_rv: Option<u64>,
 }
 
 impl MbtSystem {
@@ -342,6 +384,7 @@ impl MbtSystem {
             client,
             nodes,
             base,
+            vanished_at_rv: None,
         }
     }
 
@@ -382,6 +425,16 @@ impl MbtSystem {
     /// outcome is stashed (the model's `snap[n]`) for a later PUT action
     /// to consume; `decide()`'s observed-record update happens here as a
     /// side effect, exactly as it does inside the production round.
+    ///
+    /// In the absence partition (the deletion regime, finding 5 in the
+    /// module header), the model exits a believing 404 read at THIS
+    /// step (`apiGet`'s `absentLoseRead` arm). Production exits at the
+    /// post-act `complete_round` derivation in the same round; the
+    /// driver applies the `LoseObservedAbsent` body inline so the
+    /// per-step `leading` projection matches. The believer-exit law is
+    /// the deletion-MBT's acceptance proposition: a driver that did
+    /// NOT apply this arm (the pre-bug_143 posture) diverges from
+    /// `vanishBelieverExitsMbtRun` at exactly the believing 404 read.
     async fn api_get(&mut self, n: &str) -> Result {
         let base = self.base;
         let h = self.node(n);
@@ -391,7 +444,70 @@ impl MbtSystem {
             .fetch_and_decide(now)
             .await
             .context("apiGet: fetch_and_decide against the mock apiserver")?;
+        // The model's `absentLoseRead = leaseAbsent ∧ leading[n]` (the
+        // base-regime ledger is always empty: MAX_DROPS = 0, so the
+        // bug_059 hold-kept arm is unreachable in either replayed
+        // regime). Production: route_act_failed_read(true, Absent,
+        // Frozen, Empty, Resolved) = AbsenceLose → on_lose +
+        // observe-not-leading.
+        if matches!(outcome, FetchOutcome::Create) && h.standing.believes() {
+            h.state.on_lose();
+            h.standing.on_observed(false);
+        }
         h.stash = Some(outcome);
+        Ok(())
+    }
+
+    /// `vanishLease`: an operator deletes the Lease object out of band
+    /// (`kubectl delete lease`, the uncollapsed form — finding 2 in
+    /// the module header). Clears the mock's stored object so every
+    /// subsequent GET observes 404; the rv counter is NOT reset (the
+    /// mock's own contract — `MockApiServer::clear`), and the driver
+    /// records the rv-at-vanish so `project_lease` can report the
+    /// model's frozen `lease.rv` during the absence window.
+    fn vanish_lease(&mut self) {
+        let rv = self.project_lease().rv;
+        // The model's vanish guard (`lease.holder != NoHolder`) means
+        // the trace never vanishes an absent or unheld lease; clear()
+        // returning false would be a driver mapping bug, not a
+        // protocol divergence — fail loudly.
+        assert!(
+            self.mock.clear(),
+            "vanishLease in the trace but the mock store was already empty \
+             (the model's vanish guard should make this unreachable)"
+        );
+        self.vanished_at_rv = Some(rv);
+    }
+
+    /// `createLease(n)`: the 404→POST create — node n's `act()` on its
+    /// stashed `Create` outcome. The mock's POST handler assigns the
+    /// next rv (which resumes from the rv-at-vanish + 1, exactly as
+    /// the model's `lease.rv + 1`), and the base-regime edge law fires
+    /// `on_acquire` from `Leading{transitions: 0}` (the fresh object
+    /// starts at transition count 0). Ends the absence window.
+    async fn create_lease(&mut self, n: &str) -> Result {
+        let h = self.node(n);
+        let outcome = h.stash.take().with_context(|| {
+            format!(
+                "createLease({n}) with no stashed apiGet outcome \
+                 (the model run pairs every createLease with a preceding \
+                 apiGet on the same node)"
+            )
+        })?;
+        ensure!(
+            matches!(outcome, FetchOutcome::Create),
+            "createLease({n}) but the stashed apiGet outcome is not Create \
+             (the model's createLease guard requires leaseAbsent — the trace \
+             and the mirrored action sequence have drifted)"
+        );
+        let result = h
+            .election
+            .act(outcome)
+            .await
+            .context("createLease: act(Create) against the mock apiserver")?;
+        h.fence_tick = h.ticks;
+        apply_base_regime_completed_edge(&mut h.standing, &h.state, &result);
+        self.vanished_at_rv = None;
         Ok(())
     }
 
@@ -510,13 +626,17 @@ impl MbtSystem {
 
     /// Project the mock apiserver's stored Lease into the model's
     /// `LeaseRec`. The mock is seeded at init so the store is never
-    /// empty in the base regime; the empty case maps to the model's
-    /// born-empty lease anyway (the same value init seeds).
+    /// empty in the base regime; the empty case is the deletion
+    /// regime's absence window (the model's `vanishLease` freezes
+    /// `lease.rv` at the rv-at-vanish, holder = NoHolder, the
+    /// transition count drops with the object).
     fn project_lease(&self) -> ModelLease {
         match self.mock.stored() {
             None => ModelLease {
                 holder: ModelHolder::NoHolder,
-                rv: 0,
+                // The rv-at-vanish (the deletion regime); 0 only
+                // before init's seed (no replay reaches that).
+                rv: self.vanished_at_rv.unwrap_or(0),
                 r#gen: 0,
             },
             Some(obj) => ModelLease {
@@ -549,6 +669,7 @@ impl MbtSystem {
                 .iter()
                 .map(|(n, h)| (n.clone(), h.state.generation()))
                 .collect(),
+            lease_absent: self.mock.stored().is_none(),
         }
     }
 }
@@ -636,10 +757,21 @@ impl Driver for LeaseDriver {
             selfFenceAny(n: String) => self.sys().self_fence(&n),
             crashAny(n: String) => self.sys().crash(&n),
             recoverAny(n: String) => self.sys().recover(&n),
+            // The deletion regime (leaderElectionVanishMbt — finding
+            // 2 in the module header). Unreachable in
+            // leaderElectionBase (MAX_VANISHES = 0: vanishLease
+            // unmintable, createLease's leaseAbsent guard
+            // unsatisfiable).
+            vanishLease => self.sys().vanish_lease(),
+            createLeaseAny(n: String) => {
+                let sys = self.sys.as_mut().expect("init ran");
+                self.rt.block_on(sys.create_lease(&n))?;
+            },
             deleteLease => anyhow::bail!(
-                "deleteLease reached the driver: a fault-regime action is \
-                 unreachable in leaderElectionBase (MAX_DELETES = 0); \
-                 driving the deletion regime is phase 2"
+                "deleteLease reached the driver: the collapsed-deletion \
+                 fault is unreachable in either replayed regime \
+                 (MAX_DELETES = 0; the deletion MBT drives the \
+                 uncollapsed vanishLease form instead)"
             ),
             pgRestore => anyhow::bail!(
                 "pgRestore reached the driver: a fault-regime action is \
@@ -695,6 +827,10 @@ enum Action {
     SelfFence(&'static str),
     Crash(&'static str),
     Recover(&'static str),
+    /// Deletion regime only (`leaderElectionVanishMbt`).
+    VanishLease,
+    /// Deletion regime only (`leaderElectionVanishMbt`).
+    CreateLease(&'static str),
 }
 
 use Action::*;
@@ -752,6 +888,29 @@ const CRASH_RECOVER_RENEW_RUN: &[Action] = &[
     RenewLease("n1"),
 ];
 
+/// `vanishBelieverExitsMbtRun` (the deletion regime,
+/// `leaderElectionVanishMbt`): n1 acquires the born-empty lease, an
+/// operator deletes the lease object out of band, n1's next read
+/// observes the 404 and EXITS BELIEF AT THE READ (bug_143's law),
+/// then n1's own create re-acquires at the SAME generation (its own
+/// claim row sits at the floor — the false-alarm shape, but for an
+/// out-of-band deletion instead of a connectivity blip). The per-step
+/// diff at `ApiGet("n1")`-after-vanish is the deletion-MBT's
+/// acceptance proposition: a believer that kept believing past the
+/// 404 read (the pre-bug_143 posture, the lease-f8-keep-believing
+/// twin) diverges from the model there. The foreign-creator variant
+/// (peer's gen strictly above the deposed believer's — the
+/// write-ahead claim) is genHW-derived and stays the
+/// `leaderElectionVanishHold` runs' job; the rio-lease projection
+/// omits `genHW` by design.
+const VANISH_BELIEVER_EXITS_RUN: &[Action] = &[
+    ApiGet("n1"),
+    Steal("n1"),
+    VanishLease,
+    ApiGet("n1"),
+    CreateLease("n1"),
+];
+
 impl MbtSystem {
     /// Apply one mirrored named-run action. The same methods the
     /// quint-connect switch dispatches to — only the dispatcher differs.
@@ -775,6 +934,11 @@ impl MbtSystem {
                 self.recover(n);
                 Ok(())
             }
+            VanishLease => {
+                self.vanish_lease();
+                Ok(())
+            }
+            CreateLease(n) => self.create_lease(n).await,
         }
     }
 }
@@ -783,8 +947,11 @@ impl MbtSystem {
 /// `.expect(...)` clause) and emit the per-step states as an ITF trace,
 /// then drive the implementation through the mirrored action sequence
 /// and diff the projection against the model's state after every step
-/// (including the init state).
-fn replay_named_run(run: &str, actions: &[Action]) -> Result {
+/// (including the init state). `main` selects the regime module
+/// (`leaderElectionBase` for the four base-regime runs;
+/// `leaderElectionVanishMbt` for the deletion-regime run — both share
+/// the BASE constants the driver's tick mapping is derived from).
+fn replay_named_run(main: &str, run: &str, actions: &[Action]) -> Result {
     // quint test writes one trace file per matched test; {seq} is its
     // 0-based index. Unique-per-process so parallel test binaries don't
     // collide.
@@ -794,7 +961,7 @@ fn replay_named_run(run: &str, actions: &[Action]) -> Result {
     let output = Command::new("quint")
         .arg("test")
         .arg(spec_path())
-        .args(["--main", "leaderElectionBase"])
+        .args(["--main", main])
         .args(["--match", &format!("^{run}$")])
         .args(["--max-samples", "1"])
         .arg("--out-itf")
@@ -873,25 +1040,51 @@ fn diff_step(
 #[test]
 #[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
 fn mbt_run_cas_race() {
-    replay_named_run("casRaceRun", CAS_RACE_RUN).unwrap();
+    replay_named_run("leaderElectionBase", "casRaceRun", CAS_RACE_RUN).unwrap();
 }
 
 #[test]
 #[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
 fn mbt_run_deposed_leader_steal() {
-    replay_named_run("deposedLeaderStealRun", DEPOSED_LEADER_STEAL_RUN).unwrap();
+    replay_named_run(
+        "leaderElectionBase",
+        "deposedLeaderStealRun",
+        DEPOSED_LEADER_STEAL_RUN,
+    )
+    .unwrap();
 }
 
 #[test]
 #[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
 fn mbt_run_self_fence_false_alarm() {
-    replay_named_run("selfFenceFalseAlarmRun", SELF_FENCE_FALSE_ALARM_RUN).unwrap();
+    replay_named_run(
+        "leaderElectionBase",
+        "selfFenceFalseAlarmRun",
+        SELF_FENCE_FALSE_ALARM_RUN,
+    )
+    .unwrap();
 }
 
 #[test]
 #[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
 fn mbt_run_crash_recover_renew() {
-    replay_named_run("crashRecoverRenewRun", CRASH_RECOVER_RENEW_RUN).unwrap();
+    replay_named_run(
+        "leaderElectionBase",
+        "crashRecoverRenewRun",
+        CRASH_RECOVER_RENEW_RUN,
+    )
+    .unwrap();
+}
+
+#[test]
+#[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
+fn mbt_run_vanish_believer_exits() {
+    replay_named_run(
+        "leaderElectionVanishMbt",
+        "vanishBelieverExitsMbtRun",
+        VANISH_BELIEVER_EXITS_RUN,
+    )
+    .unwrap();
 }
 
 /// The loop-shim correspondence pin (merged_bug_053, commit 2): the
