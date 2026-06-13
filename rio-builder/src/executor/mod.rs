@@ -1085,7 +1085,7 @@ pub async fn execute_build(
     // peak_disk_bytes. Previously sampled only at line 11 (teardown),
     // which the `?` at build_result skipped.
     // r[impl builder.disk.quota-classified+2]
-    // r[impl builder.disk.satisfiable-letter]
+    // r[impl builder.disk.satisfiable-letter+2]
     // merged_bug_074: the classification consumes the DURING-BUILD
     // usage peak (the 1Hz monitor max-track, folded with this
     // post-daemon one-shot — keep-failed is unset, so the daemon has
@@ -1118,6 +1118,11 @@ pub async fn execute_build(
     let node_free = crate::quota::node_free_bytes_decoupled(
         &env.overlay_base_dir,
         quota_peak.and_then(|q| q.hard_limit_bytes),
+        // merged_bug_012: in-pod the overlays emptyDir is a mount
+        // root (no same-device ancestors); the fuse-cache emptyDir is
+        // on the same kubelet local-disk filesystem and outside the
+        // overlays project subtree — the in-pod decoupled vantage.
+        Some(&env.fuse_cache_dir),
     );
     let build_result = apply_disk_override(quota_peak, node_free, build_result);
     // bug_090: the corroboration triple rides the typed wire family

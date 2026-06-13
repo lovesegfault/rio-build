@@ -548,19 +548,39 @@ pub fn statvfs_clamped(f_blocks: u64, f_frsize: u64, hard_limit_bytes: u64) -> b
     total.abs_diff(hard_limit_bytes) <= f_frsize
 }
 
-// r[impl builder.disk.satisfiable-letter]
+// r[impl builder.disk.satisfiable-letter+2]
 /// merged_bug_074 — the DECOUPLED node-headroom sample: free bytes of
 /// the filesystem holding `dir`, taken from a vantage the project
 /// clamp cannot reach. Walks same-device ancestors of `dir` and
 /// returns the first statvfs that is neither project-owned
 /// ([`project_id`] = `None`) nor clamp-shaped
 /// ([`statvfs_clamped`] against `hard_limit_bytes`); `PROJINHERIT`
-/// marks the quota'd subtree, so the first unowned ancestor (the
-/// kubelet volume parent, or the mount root) reports the true node
-/// view. `None` when no decoupled vantage exists on the device (every
-/// ancestor project-owned or clamp-shaped, or statvfs fails) — the
-/// caller's non-attribution lane, never a fabricated headroom.
-pub fn node_free_bytes_decoupled(dir: &Path, hard_limit_bytes: Option<u64>) -> Option<u64> {
+/// marks the quota'd subtree, so the first unowned ancestor reports
+/// the true node view.
+///
+/// merged_bug_012 (R31'-d(iii) — the production-topology face): in the
+/// builder pod `dir` is the overlays-emptyDir mountPoint itself
+/// (`/var/rio/overlays`); its parent `/var/rio` is container-rootfs
+/// overlayfs (a different device), so the ancestor walk dead-ends at
+/// the FIRST iteration and the host-namespace ancestor (the kubelet
+/// volume's parent on the node disk) is unreachable from the pod's
+/// mount namespace. The `sibling` fallback names a same-device sibling
+/// mount — in production the fuse-cache emptyDir (`/var/rio/cache`),
+/// backed by the same kubelet local-disk filesystem, outside `dir`'s
+/// `PROJINHERIT` subtree — and is consulted only when the ancestor
+/// walk yields nothing. The sibling's OWN project (kubelet's, with the
+/// non-enforcing sentinel limit; or none under `hostUsers: true`)
+/// leaves its statvfs unclamped, so it reports the node view.
+///
+/// `None` when no decoupled vantage exists on the device (every
+/// ancestor project-owned or clamp-shaped AND no same-device sibling,
+/// or statvfs fails) — the caller's non-attribution lane, never a
+/// fabricated headroom.
+pub fn node_free_bytes_decoupled(
+    dir: &Path,
+    hard_limit_bytes: Option<u64>,
+    sibling: Option<&Path>,
+) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     let dev = std::fs::metadata(dir).ok()?.dev();
     let mut cur = dir.to_path_buf();
@@ -593,7 +613,28 @@ pub fn node_free_bytes_decoupled(dir: &Path, hard_limit_bytes: Option<u64>) -> O
         }
         return Some(sv.f_bavail.saturating_mul(sv.f_frsize));
     }
-    None
+    // In-pod fallback (merged_bug_012): the ancestor walk yielded
+    // nothing — `dir` is a mount root in the container namespace. A
+    // same-device sibling mount on the same node filesystem, outside
+    // `dir`'s project subtree, is the remaining decoupled vantage.
+    let sibling = sibling?;
+    if std::fs::metadata(sibling).ok()?.dev() != dev {
+        return None; // not the same node filesystem — never fabricate
+    }
+    let sv = statvfs_of(sibling)?;
+    // The sibling carries its OWN project (a different one — kubelet's
+    // per-emptyDir id, or none under hostUsers:true). Its statvfs is
+    // unclamped when that project has no enforcing limit.
+    let sib_limit = status(sibling)
+        .ok()
+        .flatten()
+        .and_then(|q| q.hard_limit_bytes);
+    if let Some(l) = sib_limit
+        && statvfs_clamped(sv.f_blocks, sv.f_frsize, l)
+    {
+        return None; // the sibling is clamped too — no vantage
+    }
+    Some(sv.f_bavail.saturating_mul(sv.f_frsize))
 }
 
 /// USED bytes on the filesystem holding `dir`
@@ -727,18 +768,95 @@ mod tests {
     #[test]
     fn node_free_decoupled_degrades_totally() {
         assert!(
-            node_free_bytes_decoupled(std::path::Path::new("/definitely/not/a/path"), None)
+            node_free_bytes_decoupled(std::path::Path::new("/definitely/not/a/path"), None, None)
                 .is_none()
         );
         // /tmp's parent chain has no project quotas on dev nodes —
         // the first ancestor answers with the plain statvfs view.
-        let got = node_free_bytes_decoupled(std::path::Path::new("/tmp"), None);
+        let got = node_free_bytes_decoupled(std::path::Path::new("/tmp"), None, None);
         // On a tmpfs root mount the walk stops at the mount boundary
         // and may answer None; on a shared root it answers Some.
         // Either way: no panic, and Some values are plausible bytes.
         if let Some(free) = got {
             assert!(free > 0 || node_free_bytes(std::path::Path::new("/tmp")) == Some(0));
         }
+    }
+
+    /// W14-C1 (merged_bug_012, R31'-d(iii)) — the production-topology
+    /// witness. In the builder pod `overlay_base_dir` is the overlays-
+    /// emptyDir mountPoint: its parent `/var/rio` is container-rootfs
+    /// overlayfs (a different device), so the ancestor walk dead-ends
+    /// at the FIRST iteration and `node_free` is structurally `None`
+    /// in-pod — the second independent blocker on the DiskFull lane,
+    /// behind the non-enforcing kubelet quota posture.
+    ///
+    /// Fixture: `/dev/shm` is a tmpfs mount root on every Linux test
+    /// host (parent `/dev` is devtmpfs — a different device). The
+    /// premise is asserted, not assumed; a host where it does not hold
+    /// fails the witness rather than vacuously passing.
+    ///
+    /// PRE-FIX RED: with no sibling, a mount-root dir yields `None` —
+    /// the conjunct is dead in the production topology. POST-FIX: a
+    /// same-device sibling mount (the fuse-cache emptyDir in
+    /// production; here a tempdir under the same tmpfs) answers with
+    /// the node filesystem's free bytes, so the conjunct CAN be true
+    /// in-pod.
+    // r[verify builder.disk.satisfiable-letter+2]
+    #[test]
+    fn node_free_decoupled_in_pod_topology_consults_the_sibling() {
+        use std::os::unix::fs::MetadataExt;
+        let mount_root = std::path::Path::new("/dev/shm");
+        let dev = std::fs::metadata(mount_root)
+            .expect("/dev/shm exists on every Linux test host")
+            .dev();
+        let parent_dev = std::fs::metadata("/dev").unwrap().dev();
+        assert_ne!(
+            dev, parent_dev,
+            "fixture premise: /dev/shm is a mount root (parent on a \
+             different device) — the production in-pod topology"
+        );
+        // The PRE-FIX behavior, kept as the no-sibling face: the
+        // ancestor walk on a mount-root dir dead-ends; no fabricated
+        // headroom (the non-attribution lane).
+        assert_eq!(
+            node_free_bytes_decoupled(mount_root, None, None),
+            None,
+            "no sibling: a mount-root dir has no same-device ancestor"
+        );
+        // POST-FIX: a same-device sibling (the fuse-cache emptyDir in
+        // production) is a valid decoupled vantage — same node
+        // filesystem, outside `dir`'s project subtree.
+        let sibling = tempfile::Builder::new()
+            .prefix("rio-quota-sibling-")
+            .tempdir_in(mount_root)
+            .unwrap();
+        let got = node_free_bytes_decoupled(mount_root, None, Some(sibling.path()));
+        assert!(
+            got.is_some(),
+            "the same-device sibling vantage must answer in the in-pod \
+             topology (merged_bug_012): got {got:?}"
+        );
+        // W14-C2 (host vantage preserved — the fallback fires only
+        // when the ancestor walk yields nothing): on a deep
+        // non-mount-root path the FIRST ancestor answers, the sibling
+        // is never consulted, and a wrong-device sibling is harmless.
+        let deep = sibling.path().join("a/b");
+        std::fs::create_dir_all(&deep).unwrap();
+        let via_ancestor = node_free_bytes_decoupled(&deep, None, None);
+        assert!(via_ancestor.is_some(), "host topology: ancestor answers");
+        assert_eq!(
+            node_free_bytes_decoupled(&deep, None, Some(std::path::Path::new("/proc"))),
+            via_ancestor,
+            "the sibling is consulted only when the ancestor walk is empty"
+        );
+        // A different-device sibling is rejected (never a fabricated
+        // cross-filesystem headroom).
+        assert_eq!(
+            node_free_bytes_decoupled(mount_root, None, Some(std::path::Path::new("/proc"))),
+            None,
+            "a sibling on a different device is not a vantage for `dir`'s \
+             node filesystem"
+        );
     }
 
     /// tmpfs has no project quotas → `Ok(None)`, not `Err`. Verifies

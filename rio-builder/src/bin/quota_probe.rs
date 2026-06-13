@@ -46,7 +46,7 @@ fn main() {
         other => (false, other),
     };
     let Some(dir) = dir_arg else {
-        eprintln!("usage: quota_probe [--ensure] <dir>");
+        eprintln!("usage: quota_probe [--ensure] <dir> [<sibling>]");
         std::process::exit(2);
     };
     let dir = Path::new(&dir);
@@ -76,8 +76,14 @@ fn main() {
     };
 
     // The decoupled vantage: the first same-device ancestor that is
-    // neither project-owned nor clamp-shaped.
-    let decoupled_free = quota::node_free_bytes_decoupled(dir, limit);
+    // neither project-owned nor clamp-shaped, or the named sibling
+    // mount (the in-pod fallback — merged_bug_012). The probe takes
+    // an optional second positional path so the kubelet-projquota VM
+    // cells can pass the fuse-cache sibling exactly as the executor
+    // does in-pod.
+    let sibling = args.next();
+    let decoupled_free =
+        quota::node_free_bytes_decoupled(dir, limit, sibling.as_ref().map(Path::new));
 
     // The classification fold, exactly as the executor's result seam
     // evaluates it (absent inputs => no attribution).

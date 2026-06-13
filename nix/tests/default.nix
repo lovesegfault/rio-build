@@ -732,7 +732,7 @@ in
   # the retired coupled vantage's structural FALSE (the dead letter);
   # the decoupled vantage's TRUE (the letter fires); the post-cleanup
   # usage collapse that motivates the during-build peak monitor.
-  # r[verify builder.disk.satisfiable-letter]
+  # r[verify builder.disk.satisfiable-letter+2]
   # r[verify builder.disk.quota-classified+2]
   vm-quota-probe-standalone = quota-probe {
     inherit pkgs common;

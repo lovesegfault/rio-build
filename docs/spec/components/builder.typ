@@ -1041,27 +1041,33 @@ the usage sample sits below the hard limit by up to the refused
 write's size. Both thresholds are violable typed constants with recorded
 derivations beside the limit-read face (`rio-builder/src/quota.rs`).
 
-#r("builder.disk.satisfiable-letter")[
+#r("builder.disk.satisfiable-letter+2")[
   The disk-exhaustion classification's inputs MUST be satisfiable in the
-  enforcement environment: the usage input is the DURING-BUILD peak
+  PRODUCTION TOPOLOGY: the usage input is the DURING-BUILD peak
   (max-tracked at \>= 1 Hz alongside the cgroup monitors --- `keep-failed`
   is unset, so the daemon deletes a failed build's scratch before any
   post-daemon sample, and `dqb_curspace` carries no kernel high-water mark),
   and the node-headroom input is sampled from a vantage DECOUPLED from the
-  project clamp (the first same-device ancestor that is neither
-  project-owned nor clamp-shaped; under enforced prjquota with
+  project clamp --- the first same-device ancestor that is neither
+  project-owned nor clamp-shaped, OR (when the quota'd dir is itself a
+  mount root, as in-pod where the overlays emptyDir's parent is
+  container-rootfs overlayfs) a same-device sibling mount on the same node
+  filesystem outside the project subtree. Under enforced prjquota with
   `PROJINHERIT` the kernel clamps statvfs taken inside the project view to
   `limit − used`, making same-directory conjunct pairs mutually exclusive
-  exactly when the quota conjunct holds). No decoupled vantage MUST mean no
+  exactly when the quota conjunct holds. No decoupled vantage MUST mean no
   attribution --- never a fabricated headroom.
 ]
 
-The satisfiability witness is kernel-level: the prjquota VM probe
-(`nix/tests/scenarios/quota-probe.nix`) drives the production classifier
+The satisfiability witnesses are kernel-level (the prjquota VM probe at
+`nix/tests/scenarios/quota-probe.nix` drives the production classifier
 chain against a real filled XFS project quota and asserts the clamp, the
-retired vantage's structural false (the dead letter), the decoupled
-vantage's true, and the post-cleanup collapse that motivates the peak
-monitor. The wire/floor consumption of the letter is pinned at unit level
+retired same-dir vantage's structural false, the decoupled vantage's true,
+and the post-cleanup collapse that motivates the peak monitor) AND
+production-topology-level (the in-pod mount-root unit witness asserts the
+ancestor walk dead-ends and the sibling fallback answers --- merged_bug_012:
+without the sibling the conjunct was structurally `None` in every builder
+pod). The wire/floor consumption of the letter is pinned at unit level
 scheduler-side; the composition seam is the typed completion-report field
 family.
 
