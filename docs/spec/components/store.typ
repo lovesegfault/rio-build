@@ -3042,14 +3042,21 @@ DEAD predecessor entry (driver-done is marked by the teardown
 scopeguard cancelling the entry's token), so the spent-scopeguard hang
 is unrepresentable.
 
-#r("store.log.arrival-clock")[
+#r("store.log.arrival-clock+2")[
   Liveness gates on peer conduct MUST read arrival evidence for the
   abort decision --- frames the peer has already sent, drained and
   stamped at the gate's own consult, never the enforcer's read
   progress standing in for it. An explicit self-activity conjunct that
   only DELAYS a trip (masking the enforcer's own stall so it cannot
   masquerade as peer silence) is PERMITTED and MUST be named in the
-  gate's documentation together with the resulting delay budget.
+  gate's documentation together with the resulting delay budget; its
+  stamp MUST carry occupancy evidence --- an outcome that performed
+  work --- never the refreshing timer's own schedule: a stamp
+  writable by a no-op tick is FORBIDDEN (a refresh period at or under
+  the bound otherwise kills the gate except at exact phase
+  coincidence), and every cross-constant coupling in the disclosed
+  budget MUST hold by compile-time assert with its phase margin
+  written down.
 ]
 
 The inbound-idle gate (bug_020) is the founding instance: `last_inbound`
@@ -3060,13 +3067,30 @@ keepalives sitting queued unread --- the documented "a CONFORMANT peer
 cannot trip this arm" was falsified by the enforcer's own occupancy. The
 post-fix clock is honestly two-axis, `max(last-drained-arrival,
 last-self-activity)`: the housekeeping arm drains ready inbound before
-the predicate (arrival truth made visible) and cut completions stamp
-self-activity. The disclosed delay budget: under slow-cut-then-silence
-the trip lands at most one cut occupancy past last arrival plus the idle
-bound --- never earlier, and a genuinely silent peer with an idle
-enforcer trips at exactly the bound. A wave-10 fix had diagnosed this
+the predicate (arrival truth made visible) and only cut outcomes that
+DID WORK stamp self-activity --- a no-op periodic tick writes nothing
+(bug_018: with the cut period at the idle bound, an Empty-tick stamp
+made the conjunct satisfiable only at exact phase coincidence; the
+enforcement half of the bilateral law was structurally dead, and a
+wedged-but-connected builder renewed its ingest lease forever). The
+disclosed delay budget, in its honest expanded form: past LAST ARRIVAL
+the trip is delayed by at most the idle bound plus three
+cut-interval-denominated terms --- the stamp lag (a sub-threshold final
+batch buffers until the next periodic tick), the occupied cut's
+watchdog bound, and its bounded ack send --- plus one housekeeping
+consult quantum; 255 s at the shipped constants, compile-asserted
+against the disclosed 300 s eviction ceiling with a 15 s phase margin
+(`idle_trip_worst_case`, the one producer of the arithmetic), and the
+operator `log_cut_interval` validates against the same ceiling from
+ABOVE (70 s maximum --- a lower bound would be the wrong direction).
+Never earlier than the bound; a genuinely silent peer with an idle
+enforcer trips at exactly the bound, because no occupancy stamp exists
+to delay it. A wave-10 fix had diagnosed this
 same cut-latency starvation and relocated only the lease heartbeat ---
-the cured-one-consumer shape this rule's census face exists to refuse.
+the cured-one-consumer shape this rule's census face exists to refuse;
+the wave-12 close then implemented the self-activity axis as the cut
+timer's own schedule --- the refresh-on-no-op shape this rule now
+forbids outright.
 
 #r("store.log.ingest-idle-abort+2")[
   The log-ingest liveness law is bilateral. An AppendLog client whose
@@ -3087,7 +3111,11 @@ the cured-one-consumer shape this rule's census face exists to refuse.
 Lease renewal is thereby structurally coupled to observed stream
 liveness: a builder that vanished without a FIN cannot hold its
 execution's ingest lease indefinitely through a driver that renews
-forever. The nothing-pending gate makes the abort loss-free by
+forever --- and neither can a wedged-but-connected one (bug_018: the
+self-activity conjunct is occupancy-denominated under the
+arrival-clock rule above, so an idle enforcer's no-op cut ticks never
+hold this gate open; the enforcement half is witnessed de-phased,
+end to end, past four idle bounds). The nothing-pending gate makes the abort loss-free by
 construction — the predecessor form gated on buffer bytes alone, which
 excluded the in-flight run a watchdog-abandoned cut leaves staged, so
 the abort destroyed committable lines the next cut's restore would

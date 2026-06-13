@@ -585,6 +585,36 @@ is `rio-common/src/liveness.rs` (the keepalive-vs-abort pair); the
 periodic-refresh and sensor-tier instances land with their owning
 components' closes and cite this rule.
 
+== Instance Register (Static Cadence-vs-Bound Witnesses)
+
+Landed R34 closes append their rows here: the gate, the disarming
+clock's refresh event, the derived (refresh, bound) pair in its honest
+expanded form, and the compile assert pinning it --- under the
+doctrine above (#rref("sys.gate.static-cadence-witness")).
+
+- /Inbound-idle self-activity conjunct (store --- the banner instance,
+  bug_018)/: the gate's disarming clock (`last_self_activity`) was
+  refreshed by the periodic cut timer whose period (60 s) EQUALS the
+  idle bound (60 s), and a no-op `CutStep::Empty` tick could write the
+  stamp --- the conjunct was satisfiable only at an exact timer-phase
+  coincidence, the enforcement half of the bilateral liveness law
+  structurally dead, a wedged-but-connected builder renewing its
+  ingest lease forever. Closed by occupancy-evidence stamping (only
+  non-Empty cut outcomes stamp; the refresh-on-no-op reject), the
+  expanded-form compile assert (worst trip past last arrival = bound
+  plus three interval terms --- stamp lag, cut watchdog, ack bound,
+  each legally one full cut interval --- plus the housekeeping consult
+  quantum; 255 s shipped, pinned against the disclosed 300 s ceiling
+  with a 15 s phase margin via `idle_trip_worst_case`, the one
+  producer), and the upper-bound operator validation (interval at most
+  70 s at the shipped constants --- the lower-bound direction would
+  pass a 10-minute interval that inflates eviction about 11x).
+  Witnessed de-phased PAST LAST ARRIVAL (the stamp-lag schedule lands
+  strictly past the naive bound-plus-housekeeping ceiling, proving the
+  expanded form load-bearing), with the protected two-clock cells
+  green and the build-time strawman red recorded
+  (#rref("store.log.arrival-clock+2")).
+
 = Polarity Riders (R33' instance register)
 
 One producer mint feeding opposite-polarity readers is a standing

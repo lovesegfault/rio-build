@@ -121,7 +121,7 @@ slow-timeout = { period = "300s", terminate-after = 2 }
 # (TestDb), so postgres group + a timeout above the generic budget.
 # Listed before the generic rio-store override so the longer timeout
 # wins.
-filter = 'package(rio-store) and (test(/idle_gate_evicts_wedged/) or test(/idle_trip_within_ceiling/))'
+filter = 'package(rio-store) and (test(/idle_gate_evicts_wedged/) or test(/idle_trip_within_ceiling/) or test(/idle_inbound_with_empty_buffer/))'
 test-group = 'postgres'
 slow-timeout = { period = "300s", terminate-after = 2 }
 

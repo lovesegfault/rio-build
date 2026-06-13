@@ -200,7 +200,7 @@ impl IdleClocks {
     }
 }
 
-// r[impl store.log.arrival-clock]
+// r[impl store.log.arrival-clock+2]
 /// The inbound-idle trip predicate (bug_020): fires only with nothing
 /// pending AND both gate clocks past [`INBOUND_IDLE_BOUND`] —
 /// equivalently, `max(last-drained-arrival, last-self-activity)`
@@ -1801,7 +1801,7 @@ impl AppendDriver {
                     // catch-up; the next loop iteration keeps reading),
                     // and each drained frame runs the same handler the
                     // inbound arm runs, exits included.
-                    // r[impl store.log.arrival-clock]
+                    // r[impl store.log.arrival-clock+2]
                     let mut drained = 0u32;
                     while drained < INBOUND_DRAIN_CAP {
                         match tokio::time::timeout(
@@ -3322,35 +3322,103 @@ mod tests {
     /// empty and four heartbeats pass with no inbound traffic — the
     /// driver does NOT renew the ingest lease forever.
     ///
-    /// `#[ignore]`: 60–75 s of real time (HEARTBEAT_INTERVAL is a
-    /// const). Run manually: `cargo nextest run -p rio-store \
-    /// -E 'test(idle_inbound)' --run-ignored all`. RED RECORDED
-    /// (2026-06-04, fix neutralized via `if false &&`): the await
-    /// below outlived a 100 s timeout — the driver renewed the lease
-    /// forever. GREEN: Aborted("no inbound traffic") at ~75 s.
+    /// RE-RECORDED DE-PHASED (bug_018, the T4 rider: the original
+    /// RED/GREEN predates the self-activity conjunct, so it certified
+    /// a gate the conjunct then structurally killed — a stale
+    /// recording is not a witness). The cut interval here is 45 s:
+    /// the operator-sub-bound face the triage names STRICTLY
+    /// unsatisfiable pre-fix — every Empty tick stamps at 45 s
+    /// spacing, so the self-activity clock can never reach the 60 s
+    /// bound, no phase coincidence exists, and the pre-fix red is
+    /// deterministic. (45 s is inside the clause-(iii) validation
+    /// maximum of 70 s — a lawful operator value whose gate was
+    /// dead.)
+    ///
+    /// RED RECORDED (2026-06-12, conjunct LIVE, fix neutralized via
+    /// the occupancy strawman `CutStep::Empty => Occupied`): no idle
+    /// abort within 255 s — past four idle bounds — while the ingest
+    /// lease stayed FRESH (heartbeat renewing). GREEN: Aborted("no
+    /// inbound traffic") at ~62 s past open — a no-op tick writes no
+    /// stamp, so the vanish-at-open schedule trips at the bound plus
+    /// one housekeeping consult, inside the expanded ceiling.
+    ///
+    /// No longer `#[ignore]`d: this is the bilateral law's
+    /// enforcement-half wiring witness and runs in every gate (the
+    /// 60 s bound is a const; ~75 s wall is the price of the law).
     // r[verify store.log.ingest-idle-abort+2]
     #[tokio::test]
-    #[ignore = "60-75s real time (HEARTBEAT_INTERVAL is a const); run with --run-ignored all"]
     async fn idle_inbound_with_empty_buffer_aborts() {
-        let mut h = harness().await;
+        let cut_interval = std::time::Duration::from_secs(45);
+        let h = harness_with(256, |s| {
+            s.with_ingest_config(IngestConfig {
+                cut_interval,
+                ..IngestConfig::default()
+            })
+        })
+        .await;
+        let mut client = h.client.clone();
         let exec = seed_assignment(&h.db.pool, "builder-0").await;
         let tok = token("builder-0", DRV);
 
-        let (tx, mut acks) = open_append(&mut h.client, &tok, vec![header_msg(exec)])
+        let (tx, mut acks) = open_append(&mut client, &tok, vec![header_msg(exec)])
             .await
             .expect("open");
+        let opened_at = std::time::Instant::now();
         // Keep tx alive (no half-close) and send NOTHING: the
         // silently-vanished-builder shape from the server's view.
-        let verdict =
-            tokio::time::timeout(std::time::Duration::from_secs(100), acks.message()).await;
+        // Every periodic cut from here on is Empty — under the
+        // pre-fix stamp discipline that alone held the gate open
+        // forever at this interval.
+        let budget = idle_trip_worst_case(cut_interval) + IDLE_TRIP_PHASE_MARGIN;
+        let deadline = opened_at + budget + std::time::Duration::from_secs(30);
+        let status = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), acks.message()).await {
+                Ok(Ok(Some(_ack))) => panic!("nothing was sent: no ack is possible"),
+                Ok(Ok(None)) => panic!("the server half-closed without a status"),
+                Ok(Err(status)) => break status,
+                Err(_elapsed) => {
+                    if std::time::Instant::now() >= deadline {
+                        let lease_fresh: bool = sqlx::query_scalar(
+                            "SELECT (now() - heartbeat_at) < make_interval(secs => $1) \
+                             FROM log_ingest_sessions WHERE exec_id = $2",
+                        )
+                        .bind(sessions::SESSION_STALE_AFTER.as_secs_f64())
+                        .bind(exec)
+                        .fetch_one(&h.db.pool)
+                        .await
+                        .expect("session row exists while the stream is open");
+                        panic!(
+                            "re-record red: no idle abort within {budget:?} + 30 s of \
+                             open — past four idle bounds — while the ingest lease is \
+                             {} (the 45 s operator interval keeps the pre-fix \
+                             self-activity conjunct permanently fresh: the strictly-\
+                             unsatisfiable face)",
+                            if lease_fresh {
+                                "still FRESH (heartbeat renewing)"
+                            } else {
+                                "stale"
+                            }
+                        );
+                    }
+                }
+            }
+        };
+        let evicted_after = opened_at.elapsed();
         drop(tx);
-        let status = verdict
-            .expect("driver must abort within the idle bound; pre-fix this timed out (RED)")
-            .expect_err("an idle abort is an in-stream error, not a clean close");
-        assert_eq!(status.code(), tonic::Code::Aborted);
+        assert_eq!(status.code(), tonic::Code::Aborted, "{status:?}");
         assert!(
             status.message().contains("no inbound traffic"),
             "got: {status:?}"
+        );
+        assert!(
+            evicted_after >= INBOUND_IDLE_BOUND,
+            "the trip must never fire before the idle bound past open \
+             (got {evicted_after:?})"
+        );
+        assert!(
+            evicted_after <= budget,
+            "eviction took {evicted_after:?} past open — outside the disclosed \
+             ceiling {budget:?}"
         );
     }
 
@@ -4232,7 +4300,7 @@ mod tests {
         );
     }
 
-    // r[verify store.log.arrival-clock]
+    // r[verify store.log.arrival-clock+2]
     /// W12-D/W12-D2 at the predicate tier (bug_020): the trip demands
     /// BOTH clocks stale. The strawman single-axis predicate (the
     /// pre-fix `last_inbound.elapsed() >= BOUND` — read-progress
@@ -4360,7 +4428,7 @@ mod tests {
         .expect("session row exists")
     }
 
-    // r[verify store.log.arrival-clock]
+    // r[verify store.log.arrival-clock+2]
     /// W12-D + W12-D2 (bug_020), the end-to-end face: the inbound-idle
     /// gate is denominated in ARRIVAL evidence for the abort decision,
     /// gated by the enforcer's self-activity stamp — a slow-but-
@@ -4368,8 +4436,10 @@ mod tests {
     /// the peer's keepalives sit queued unread (W12-D), and a
     /// genuinely silent peer still trips at `INBOUND_IDLE_BOUND` from
     /// `max(last-drained-arrival, last-self-activity)` — within the
-    /// disclosed delay budget of one cut occupancy past last arrival
-    /// (W12-D2: the gate is not weakened beyond that budget).
+    /// disclosed expanded budget ([`idle_trip_worst_case`]: the
+    /// stamp-lag, watchdog, and ack terms past last arrival, plus
+    /// the housekeeping consult; W12-D2: the gate is not weakened
+    /// beyond that budget).
     ///
     /// Schedule: the batch at t0 parks the cut (gated PUT, watchdog
     /// far above); keepalives at ~t0+20/40/60 sit QUEUED while the
