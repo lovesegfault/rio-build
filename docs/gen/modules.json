@@ -28,6 +28,16 @@
       "doc": "Persistent cluster-ack table (ADR-024 \"the persistent asset\": a"
     },
     {
+      "path": "bin/",
+      "depth": 0,
+      "doc": ""
+    },
+    {
+      "path": "bin/eval-harness.rs",
+      "depth": 1,
+      "doc": "Coordinator-side test harness for the rio-eval parent (ADR-024"
+    },
+    {
       "path": "config.rs",
       "depth": 0,
       "doc": "`rio build` client configuration."
@@ -748,6 +758,31 @@
       "path": "dircache.rs",
       "depth": 0,
       "doc": "Decoded-directory cache over the pack store (ADR-024 P1)."
+    },
+    {
+      "path": "evaljob/",
+      "depth": 0,
+      "doc": "The eval-parent side of the `rio.evaljob` worker channel (ADR-024"
+    },
+    {
+      "path": "evaljob/claim.rs",
+      "depth": 1,
+      "doc": "Advisory memfd claim table (ADR-024 \"sharing by fork order\"): a"
+    },
+    {
+      "path": "evaljob/framing.rs",
+      "depth": 1,
+      "doc": "Synchronous length-delimited proto framing — the blocking twin of"
+    },
+    {
+      "path": "evaljob/ifd.rs",
+      "depth": 1,
+      "doc": "The worker side of the IFD relay (ADR-024 \"IFD\"): a worker hitting"
+    },
+    {
+      "path": "evaljob/parent.rs",
+      "depth": 1,
+      "doc": "The eval-parent orchestration loop (ADR-024 P3b): fork-no-exec"
     },
     {
       "path": "ffi.rs",

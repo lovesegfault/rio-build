@@ -4,14 +4,10 @@
 
 `rio build` --- the native-protocol build client (ADR-024 P3). The binary is
 the *coordinator*: pure Rust, tokio/tonic, gRPC to the cluster. Evaluation
-runs in a separate eval-parent process (libexpr + fork workers, P3b)
-connected over one `socketpair(AF_UNIX, SOCK_STREAM)`; the coordinator owns
-the attr work queue, the global digest state, the client CAS handle, and the
-cluster connection, and it never forks.
-
-This spec covers the coordinator side only. The eval-parent process
-architecture (fork workers, `GC_DONT_GC`, recycling, the memfd claim table)
-lands with P3b and is specified then.
+runs in a separate eval-parent process (`rio-eval`: libexpr + fork workers,
+P3b) connected over one `socketpair(AF_UNIX, SOCK_STREAM)`; the coordinator
+owns the attr work queue, the global digest state, the client CAS handle,
+and the cluster connection, and it never forks.
 
 = Worker channel
 
@@ -127,3 +123,66 @@ anywhere else.
   claimed `nar_hash` before materializing into the client CAS; a mismatch
   refuses materialization.
 ]
+
+= The eval parent (`rio-eval`, P3b)
+
+`rio-eval` embeds the flake-pinned nix libexpr plus the rio-evalstore Rust
+staticlib behind the same C++ store shim as the `rio://` plugin. The parent
+does the pre-fork half once --- open the rio store, build the EvalState,
+lock the flake and fetch inputs through the rio store --- then forks
+eval workers on demand (fork-no-exec, `GC_DONT_GC`; process exit is the
+evaluator GC). Workers evaluate assigned attrs, assemble their skeleton
+subgraphs from the in-memory drv map (canonical proto bytes + blake3
+digests, computed once at `writeDerivation` capture), and stream
+`ResultFrame`s on their socketpair; the parent relays raw frames to the
+coordinator (two queue edges --- the ADR's complete inventory).
+
+#r("bc.evalparent.fork-safety")[
+  Workers MUST be forked from a single-threaded parent: no live threads may
+  exist at any `fork(2)`. Ingest-pipeline threads are scoped inside a single
+  ingest call and joined before it returns; the parent loop itself spawns
+  none.
+]
+
+#r("bc.evalparent.recycle")[
+  A worker MUST be recycled (shut down and replaced by a fresh fork) after
+  the configured attr quota or when its RSS exceeds the configured
+  threshold, checked between attrs --- never mid-eval. Results MUST be
+  identical across recycle generations.
+]
+
+The recycle decision is the parent's (it sends the worker a Shutdown frame
+between attrs); a worker is deliberately too dumb to exit on its own, so
+assignment can never race a voluntary exit.
+
+#r("bc.evalparent.crash-requeue")[
+  The parent MUST survive any worker death: a reaped worker's in-flight
+  attr is re-queued to a fresh fork (bounded retries), the crash is
+  surfaced upstream as a non-fatal `WorkerError`, and only an attr whose
+  retries are exhausted is reported lost --- named --- while other attrs
+  proceed.
+]
+
+A crash report whose `attr` is empty is visibility-only: the coordinator
+logs it without failing anything (the attr was re-queued, not lost).
+
+#r("bc.evalparent.ifd-relay")[
+  A worker hitting import-from-derivation MUST first stream the needed
+  drv's transitive skeleton as an intermediate batch, then relay an
+  `IfdRequest` upstream and BLOCK on its socketpair until the matching
+  `IfdCompletion`; a completion error fails the import with the
+  coordinator's message, and a successful completion's outputs are imported
+  into the worker's eval store before eval resumes.
+]
+
+#r("bc.evalparent.claim-advisory")[
+  The cross-worker claim table is advisory only --- correctness MUST NOT
+  depend on it. A claim is stale (ignorable, take-over-able) once its pid
+  is dead or it is older than 60 seconds.
+]
+
+The claim table is a fork-shared `memfd` keyed by `blake3(origin path)`; it
+exists to stop two live workers ingesting the same big tree simultaneously.
+The CAS's single-writer segments and idempotent index already make
+concurrent ingest safe, so a lost or stale claim costs duplicate work,
+never wrong content.
