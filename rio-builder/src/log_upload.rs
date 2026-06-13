@@ -674,6 +674,18 @@ impl UploadTask {
     }
 
     async fn run_inner(&mut self) -> DrainStatus {
+        // live_062 (the 34-silent-DEBUGs triage cost): a store
+        // replica dying mid-ingest leaves its session lease held
+        // until the 45s staleness window lapses; every re-open in
+        // that window bounces ALREADY_EXISTS. Pre-fix all of them
+        // logged at debug — a healthy-looking builder silently
+        // spinning on a dead replica's lease, reconstructible only
+        // by counting DEBUG lines. The episode flag lifts exactly
+        // two lines to operator level: the FIRST rejection (WARN,
+        // with the holder pod from the store's message) and the
+        // recovery (INFO, once) — the steady-state in-window retries
+        // stay debug.
+        let mut steal_episode = false;
         loop {
             // Exit conditions, checked between sessions. Both mints
             // demand the input-exhaustion witness (merged_bug_010).
@@ -692,7 +704,15 @@ impl UploadTask {
             // while it works, so a store outage never blocks the stderr
             // loop on a full input channel.
             let (out, acks) = match self.open().await {
-                Ok(session) => session,
+                Ok(session) => {
+                    if std::mem::take(&mut steal_episode) {
+                        tracing::info!(
+                            "log ingest lease recovered after a steal wait; \
+                             resuming the upload"
+                        );
+                    }
+                    session
+                }
                 Err(OpenFailure::Permanent(status)) => {
                     tracing::warn!(
                         code = ?status.code(),
@@ -705,11 +725,25 @@ impl UploadTask {
                         .await;
                 }
                 Err(OpenFailure::Retryable(status)) => {
-                    tracing::debug!(
-                        code = ?status.code(),
-                        message = status.message(),
-                        "log stream open failed; backing off"
-                    );
+                    if note_steal_rejection(&mut steal_episode, status.code()) {
+                        // The store's message carries the holder
+                        // (`... holds this execution (on Some("pod"))`)
+                        // — the one breadcrumb that turns "builder
+                        // stuck" into "waiting out replica X's lease".
+                        tracing::warn!(
+                            code = ?status.code(),
+                            message = status.message(),
+                            "another live session holds this execution's log \
+                             ingest lease; waiting it out (retries stay at \
+                             debug until recovery)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            code = ?status.code(),
+                            message = status.message(),
+                            "log stream open failed; backing off"
+                        );
+                    }
                     self.backoff().await;
                     continue;
                 }
@@ -1210,6 +1244,23 @@ fn classify_open_failure(status: Status) -> OpenFailure {
     match status.code() {
         Code::FailedPrecondition | Code::PermissionDenied => OpenFailure::Permanent(status),
         _ => OpenFailure::Retryable(status),
+    }
+}
+
+/// live_062: the steal-episode arming decision — returns `true` iff
+/// this Retryable rejection is the FIRST `ALREADY_EXISTS` of the
+/// current episode (the one that logs at WARN with the holder; the
+/// rest of the in-window bounces stay debug). Non-steal codes never
+/// arm and never disarm: an UNAVAILABLE blip interleaved into a steal
+/// wait keeps the episode armed, so recovery still logs exactly once.
+/// Disarm is the successful open's `mem::take` (the recovery INFO).
+/// Pure so the episode law is truth-tabled without a store.
+fn note_steal_rejection(episode: &mut bool, code: Code) -> bool {
+    if code == Code::AlreadyExists && !*episode {
+        *episode = true;
+        true
+    } else {
+        false
     }
 }
 
@@ -2544,5 +2595,43 @@ mod tests {
             planted_hits, 3,
             "the census must count a planted third destructive exit"
         );
+    }
+
+    /// live_062 — the steal-episode log-lane truth table (the pure
+    /// half of WO-S10-8; the WARN/INFO sites consume it inline).
+    /// Law: exactly one WARN per episode (the first ALREADY_EXISTS),
+    /// non-steal codes neither arm nor disarm (an UNAVAILABLE blip
+    /// inside the wait keeps the episode armed so the recovery INFO
+    /// still fires exactly once), and disarm is the successful open's
+    /// `mem::take`.
+    ///
+    /// Pre-fix RED (recorded): no episode state existed — every
+    /// ALREADY_EXISTS bounce logged at debug ("log stream open
+    /// failed; backing off"), 34 of them in the live_062 forensics,
+    /// and the recovery was indistinguishable from any other open.
+    #[test]
+    fn steal_episode_log_lane_cells() {
+        use super::note_steal_rejection;
+        use tonic::Code;
+        let mut ep = false;
+        // First ALREADY_EXISTS arms and elects the WARN.
+        assert!(note_steal_rejection(&mut ep, Code::AlreadyExists));
+        assert!(ep);
+        // Repeats stay debug.
+        assert!(!note_steal_rejection(&mut ep, Code::AlreadyExists));
+        // A non-steal blip mid-episode neither re-warns nor disarms.
+        assert!(!note_steal_rejection(&mut ep, Code::Unavailable));
+        assert!(ep, "an UNAVAILABLE blip must not disarm the episode");
+        // Recovery: the open site takes the flag exactly once.
+        assert!(std::mem::take(&mut ep), "recovery INFO fires once");
+        assert!(!std::mem::take(&mut ep), "and only once");
+        // A fresh steal after recovery is a fresh episode.
+        assert!(note_steal_rejection(&mut ep, Code::AlreadyExists));
+        // Non-steal codes on a quiet flag never arm.
+        let mut quiet = false;
+        for code in [Code::Unavailable, Code::Internal, Code::DeadlineExceeded] {
+            assert!(!note_steal_rejection(&mut quiet, code), "{code:?}");
+            assert!(!quiet, "{code:?} must not arm the steal episode");
+        }
     }
 }
