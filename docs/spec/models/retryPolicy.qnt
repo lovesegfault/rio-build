@@ -1327,6 +1327,9 @@ module retryPolicy {
   /// pull regime's explicit `pullEstablish` action, never as a silent
   /// timer side effect of the clock; attempts are resolved by a
   /// classifying report or by establishment, never silently dropped.)
+  // Environment: the shared model clock advances one unit — the
+  // world's move; production consults wall time at each site, no
+  // scheduler transition fires.
   action tick = all {
     freeCloseRun' = freeCloseRun,
     storeDegradedRun' = storeDegradedRun,
@@ -1407,8 +1410,8 @@ module retryPolicy {
   /// the I-127 window reset and its exempt fall-through are retired;
   /// the streak forgiveness lives on the E1/E4/E7 health-evidence
   /// arms), acted on per the verdict.
-  // Mirrors: completion.rs::handle_infrastructure_failure through
-  //          append_and_decide_in_tx + classify().
+  // Mirrors: rio-scheduler/src/actor/completion.rs:handle_infrastructure_failure
+  // Mirrors: rio-scheduler/src/actor/completion.rs:append_and_decide_in_tx
   action infraArm(w: str, execAfter: ExecRec, foldFleet: Set[str], exempt: bool, atCap: bool, consumesPromotion: bool): bool = all {
     val applied = specApply(spec, FInfra({ at: now, exempt: exempt, atCap: atCap }), foldFleet)
     all {
@@ -1487,8 +1490,8 @@ module retryPolicy {
   /// regime's pullReportOutcome) is the re-delivery. Replaces the as-built model's independently-lost
   /// per-counter mirror writes: post-066 the charge, the verdict and the
   /// status persist commit or fail as one unit.
-  // Mirrors: completion.rs append_and_decide_in_tx error arm +
-  //          requeue_failure_completion.
+  // Mirrors: rio-scheduler/src/actor/completion.rs:append_and_decide_in_tx
+  // Mirrors: rio-scheduler/src/actor/completion.rs:requeue_failure_completion
   action attemptTxFails(w: str): bool = all {
     freeCloseRun' = freeCloseRun,
     storeDegradedRun' = storeDegradedRun,
@@ -1514,7 +1517,8 @@ module retryPolicy {
   /// row (the suffix cut point), appended in the same transaction as
   /// the merge persist; the dependent's DependencyFailed is reset by the
   /// same merge.
-  // Mirrors: dag/mod.rs (the resubmit-reset arm, reset_row_for) +
+  // Mirrors: rio-scheduler/src/dag/mod.rs:reset_row_for
+  // (the resubmit-reset arm) +
   //          merge.rs + derivation.rs::is_retriable_on_resubmit.
   action resubmitReset = all {
     freeCloseRun' = 0,
@@ -1549,8 +1553,12 @@ module retryPolicy {
   /// reset row (nine of ten counters cleared, backoff_until survives) is
   /// appended in the same transaction as the site's persist and the
   /// derivation transitions to Completed.
-  // Mirrors: merge.rs::apply_cached_hits / dispatch.rs spawn_substitute
-  //          reprobe lane (the Poisoned arm).
+  // The dead spawn_substitute pointer (bughunt-13 F14, the audit's
+  // exhibit 1): dispatch.rs::spawn_substitute was deleted whole in
+  // 9d82fc712 with the stream-era substitution machinery; the live
+  // lane is the merge-time cached-hit application, whose Poisoned arm
+  // appends exactly this reset row.
+  // Mirrors: rio-scheduler/src/actor/merge.rs:apply_cached_hits
   action cacheHitClear = all {
     freeCloseRun' = 0,
     storeDegradedRun' = 0,
@@ -1581,7 +1589,8 @@ module retryPolicy {
   /// fire) with the poison_cleared ledger row, then the node is removed
   /// from the DAG; the next merge would re-insert it fresh (not modeled
   /// -- DAbsent is a sink).
-  // Mirrors: housekeeping.rs::tick_process_expired_poisons +
+  // Mirrors: rio-scheduler/src/actor/housekeeping.rs:tick_process_expired_poisons
+  // +
   //          db::clear_poison (the full reset).
   action poisonTtlExpires = all {
     freeCloseRun' = freeCloseRun,
@@ -1648,17 +1657,26 @@ module retryPolicy {
   pure val BOOLS = Set(true, false)
   pure val PROBE_CLASSES = Set(PUnavailable, PAllPresent, PNoEvidence)
 
+  // Environment: the physical attempt end — the worker's pod
+  // finishes and its one report becomes deliverable; the scheduler
+  // transition is the intake (pullReportOutcomeAny).
   action buildEndsReportedAny = {
     nondet w = EXECUTORS.oneOf()
     nondet class = REPORT_CLASSES.oneOf()
     nondet dual = BOOLS.oneOf()
     buildEndsReported(w, class, dual)
   }
+  // Environment: the pod dies unreported (OOM / deadline / crash) —
+  // the world's move; the scheduler observes it through the
+  // controller fill or the establishment sweep.
   action buildEndsPodDeathAny = {
     nondet w = EXECUTORS.oneOf()
     nondet kind = DEATH_KINDS.oneOf()
     buildEndsPodDeath(w, kind)
   }
+  // Environment: the controller's pod-terminal report is lost
+  // (informer restart / queue overflow) — the world's move; the
+  // establishment sweep is the repair vehicle.
   action ctrlReportLostAny = { nondet w = EXECUTORS.oneOf() ctrlReportLost(w) }
   action attemptTxFailsAny = { nondet w = EXECUTORS.oneOf() attemptTxFails(w) }
 
@@ -1826,9 +1844,9 @@ module retryPolicy {
   /// they gated the push (the intent is not deliverable while the defer
   /// is pending), and the fold observes the same FDispatched event
   /// (backoff cleared in RAM, no ledger row).
-  // Mirrors: actor/pull.rs::admit_pull (Deliver arm) + the pull
-  //          transaction; the AD2 spawn-gate exclusion stands in for
-  //          hard_filter.
+  // Mirrors: rio-scheduler/src/actor/pull.rs:admit_pull
+  // (the Deliver arm + the pull transaction; the AD2 spawn-gate
+  // exclusion stands in for hard_filter).
   action pullOpensAttempt(n: str): bool = all {
     freeCloseRun' = freeCloseRun,
     storeDegradedRun' = storeDegradedRun,
@@ -1869,7 +1887,9 @@ module retryPolicy {
   /// poison one step later (the small-fleet clause rides that same
   /// gate; on larger universes the distinct-source
   /// threshold fires first, exactly as for the as-built regimes).
-  // Mirrors: grpc executor_service.rs::report_outcome ->
+  // Mirrors: rio-scheduler/src/grpc/executor_service.rs:report_outcome
+  // Mirrors: rio-scheduler/src/actor/completion.rs:handle_transient_failure
+  // ->
   //          completion.rs handle_* per class through
   //          append_and_decide_in_tx (charging semantics unchanged).
   action pullReportOutcome(n: str, class: ReportClass, dual: bool, promoted: bool, atCap: bool): bool = all {
@@ -2020,9 +2040,9 @@ module retryPolicy {
   /// installment; this action additionally covers the frozen-contract
   /// arrival order in which the unified fill itself classifies the
   /// open attempt, so both orders are explored.)
-  // Mirrors: the T-0e.6 ReportAttemptOutcome contract (C4/C5
-  //          unification, WHERE termination_reason IS NULL) for
-  //          OOMKilled / EvictedDiskPressure.
+  // Mirrors: rio-scheduler/src/actor/pull.rs:handle_report_attempt_outcome
+  // (the T-0e.6 C4/C5 unification, WHERE termination_reason IS NULL,
+  // for OOMKilled / EvictedDiskPressure).
   action pullAttemptOutcomeOom(n: str, promoted: bool, atCap: bool): bool = all {
     freeCloseRun' = 0,
     storeDegradedRun' = 0,
@@ -2090,8 +2110,8 @@ module retryPolicy {
   /// is terminal Cancelled — the same terminal the worker-reported E4
   /// produces (the D1-adjudicated channel invariance, unchanged by the
   /// pull re-key).
-  // Mirrors: admin ReportAttemptOutcome -> the scheduler fill for
-  //          DeadlineExceeded.
+  // Mirrors: rio-scheduler/src/actor/pull.rs:handle_report_attempt_outcome
+  // (the DeadlineExceeded fill).
   action pullAttemptOutcomeDeadline(n: str): bool = all {
     freeCloseRun' = 0,
     storeDegradedRun' = 0,
@@ -2149,8 +2169,9 @@ module retryPolicy {
   /// that never existed (a pod that died before its first pull). The
   /// no-attempt no-op rule: acknowledged, nothing charged, nothing
   /// created, no derivation state touched.
-  // Mirrors: the ReportAttemptOutcome no-attempt / already-filled arms
-  //          (sched.attempt.no-attempt-no-op).
+  // Mirrors: rio-scheduler/src/actor/pull.rs:handle_report_attempt_outcome
+  // (the no-attempt / already-filled arms,
+  // sched.attempt.no-attempt-no-op).
   action pullAttemptOutcomeNoOp(n: str): bool = all {
     freeCloseRun' = freeCloseRun,
     storeDegradedRun' = storeDegradedRun,
@@ -2178,7 +2199,8 @@ module retryPolicy {
   /// WORKER_ABORT_FREE_CLOSES; at the bound this action's guard closes
   /// and the worker's next abort can only take the charged report
   /// classes (the fall-through).
-  // Mirrors: rio-retry-kernel admit_worker_abort (lib.rs) consumed by
+  // Mirrors: rio-retry-kernel/src/lib.rs:admit_worker_abort
+  // consumed by
   //          the report intake's witness-first AD5 arm
   //          (r[impl sched.attempt.worker-abort-bounded+2] sites).
   action pullWorkerAbort(n: str): bool = all {
@@ -2490,10 +2512,11 @@ module retryPolicy {
   /// scan; the pre-fix fold kept the curve across exactly these
   /// rows). The empty universe defers instead (the action is
   /// disabled), per sched.dispatch.fleet-exhaust+4's empty-fleet arm.
-  // Mirrors: pool/jobs.rs spawn pass (excluded ⊇ spawnable ->
-  //          ReportAttemptOutcome(NoEligibleSource)) -> actor/pull.rs
-  //          fleet-exhaust mapping (still-Ready only) -> the kernel
-  //          run_step Break arm (rio-retry-kernel/src/lib.rs).
+  // Mirrors: rio-controller/src/reconcilers/pool/jobs.rs:report_no_eligible_source
+  // Mirrors: rio-scheduler/src/actor/pull.rs:handle_no_eligible_source
+  // (excluded superset of spawnable -> NoEligibleSource -> the
+  // still-Ready fleet-exhaust mapping; the marker row takes the
+  // kernel run_step Break arm).
   action spawnGateExhaust = all {
     freeCloseRun' = 0,
     storeDegradedRun' = 0,
@@ -2550,10 +2573,11 @@ module retryPolicy {
   /// scheduler failover does not erase. Nothing is forgiven, nothing
   /// is fabricated, and the open attempt is not re-dispatched out from
   /// under its pod.
-  // Mirrors: actor/mod.rs LeaderLost wipe + recovery.rs ledger-fold
-  //          rebuild; open attempts come up behind the new leader
-  //          untouched and the establishment sweep is their only
-  //          time-based repair (sched.attempt.establishment-window+3).
+  // Mirrors: rio-scheduler/src/actor/recovery.rs:handle_leader_acquired
+  // (the LeaderLost wipe + the ledger-fold rebuild; open attempts come
+  // up behind the new leader untouched and the establishment sweep is
+  // their only time-based repair,
+  // sched.attempt.establishment-window+3).
   action pullLeaderFailover = all {
     freeCloseRun' = freeCloseRun,
     storeDegradedRun' = storeDegradedRun,
@@ -2617,7 +2641,10 @@ module retryPolicy {
 
   // --- step (pull-mode alphabet) -------------------------------------------
 
+  // Mirrors: rio-scheduler/src/actor/pull.rs:admit_pull
   action pullOpensAttemptAny = { nondet n = EXECUTORS.oneOf() pullOpensAttempt(n) }
+  // Mirrors: rio-scheduler/src/grpc/executor_service.rs:report_outcome
+  // Mirrors: rio-scheduler/src/actor/completion.rs:handle_transient_failure
   action pullReportOutcomeAny = {
     nondet n = EXECUTORS.oneOf()
     nondet class = REPORT_CLASSES.oneOf()
@@ -2626,24 +2653,37 @@ module retryPolicy {
     nondet atCap = BOOLS.oneOf()
     pullReportOutcome(n, class, dual, promoted, atCap)
   }
+  // Mirrors: rio-scheduler/src/actor/pull.rs:handle_report_attempt_outcome
   action pullAttemptOutcomeOomAny = {
     nondet n = EXECUTORS.oneOf()
     nondet promoted = BOOLS.oneOf()
     nondet atCap = BOOLS.oneOf()
     pullAttemptOutcomeOom(n, promoted, atCap)
   }
+  // Mirrors: rio-scheduler/src/actor/pull.rs:handle_report_attempt_outcome
   action pullAttemptOutcomeDeadlineAny = { nondet n = EXECUTORS.oneOf() pullAttemptOutcomeDeadline(n) }
+  // Mirrors: rio-scheduler/src/actor/pull.rs:handle_report_attempt_outcome
   action pullAttemptOutcomeNoOpAny = { nondet n = EXECUTORS.oneOf() pullAttemptOutcomeNoOp(n) }
+  // Mirrors: rio-retry-kernel/src/lib.rs:admit_worker_abort
   action pullWorkerAbortAny = { nondet n = EXECUTORS.oneOf() pullWorkerAbort(n) }
+  // Mirrors: rio-scheduler/src/actor/completion.rs:store_degraded_disposition
+  // Mirrors: rio-retry-kernel/src/lib.rs:admit_store_degraded
   action pullStoreDegradedAny = { nondet n = EXECUTORS.oneOf() pullStoreDegraded(n) }
+  // Mirrors: rio-scheduler/src/actor/completion.rs:store_degraded_disposition
+  // Mirrors: rio-retry-kernel/src/lib.rs:admit_store_degraded
   action pullStoreDegradedRunBoundAny = {
     nondet n = EXECUTORS.oneOf() pullStoreDegradedRunBound(n)
   }
+  // Mirrors: rio-scheduler/src/actor/housekeeping.rs:establish_open_pull_attempt
+  // Mirrors: rio-evidence-kernel/src/establish.rs:establish_from_classes
   action pullEstablishAny = {
     nondet n = EXECUTORS.oneOf()
     nondet probe = PROBE_CLASSES.oneOf()
     pullEstablish(n, probe)
   }
+  // Environment: node cordon / consolidation / repair / pool shrink —
+  // the controller informer's spawnable universe shrinks; the world's
+  // move (the scheduler observes it only through the spawn gate).
   action sourceLeavesPoolAny = { nondet n = EXECUTORS.oneOf() sourceLeavesPool(n) }
 
   // --- 11. the materialization attempt class ------------------------------
@@ -2821,6 +2861,9 @@ module retryPolicy {
   /// untouched and clear the snapshot ghost (the build->materialization
   /// direction of the kind partition). Composed with every build-side
   /// disjunct of pullStep; the build actions themselves are untouched.
+  // Environment: composition frame — the kind partition's
+  // build->materialization freeze (every build-side disjunct composes
+  // with it); no transition fires.
   action buildLeavesMatUntouched = all {
     matInfraCount' = matInfraCount,
     matSchedulerInfraCount' = matSchedulerInfraCount,
@@ -2863,9 +2906,10 @@ module retryPolicy {
   /// routing verdict consumed by the four-arm consumption transaction,
   /// not a retry — it never charges the infra budget and never counts
   /// toward parking, so it carries its own ceiling.
-  // Mirrors: rio-store materialize executor reporting
-  //          MaterializationOutcome::Unobtainable -> the scheduler
-  //          consumption transaction's routing arms (T-3.5).
+  // Mirrors: rio-scheduler/src/actor/materialize.rs:consume_materialization_outcome
+  // (MaterializationOutcome::Unobtainable -> the consumption
+  // transaction's routing arms, T-3.5; produced by
+  // rio-store/src/materialize/executor.rs:execute_job).
   action materializationReportUnobtainable = all {
     ENABLE_MATERIALIZATION,
     matUnobtainableCount < MAX_MAT_UNOBTAINABLE,
@@ -2878,9 +2922,9 @@ module retryPolicy {
 
   /// A store replica's materialization attempt reports InfraFailure: the
   /// worker-reported channel of the materialization budget.
-  // Mirrors: MaterializationOutcome::InfraFailure -> the consumption
-  //          transaction's budget charge (rio-retry-kernel
-  //          materialization_decide).
+  // Mirrors: rio-scheduler/src/actor/materialize.rs:consume_materialization_outcome
+  // Mirrors: rio-retry-kernel/src/lib.rs:materialization_decide
+  // (MaterializationOutcome::InfraFailure -> the budget charge).
   action materializationReportInfra = all {
     ENABLE_MATERIALIZATION,
     not(matParked),
@@ -2898,9 +2942,9 @@ module retryPolicy {
   /// non-vacuous against it). It charges the SAME budget as the
   /// worker-reported infra channel; the scheduler-written subset is
   /// carried separately for the witness.
-  // Mirrors: actor/housekeeping.rs establishment sweep, the
-  //          materialization branch (no adopt arm, materialization_infra
-  //          charge, never executor_crash).
+  // Mirrors: rio-scheduler/src/actor/housekeeping.rs:establish_materialization_attempt
+  // (no adopt arm, materialization_infra charge, never
+  // executor_crash).
   action establishMaterializationCrash = all {
     ENABLE_MATERIALIZATION,
     not(matParked),
@@ -2929,6 +2973,12 @@ module retryPolicy {
   /// direction). In ENABLE_MATERIALIZATION = false regimes the
   /// materialization variables are frozen at their init values, so the
   /// reachable state space is bit-identical to the pre-Phase-A one.
+  // Environment: the regime's transition relation — the alphabet
+  // dispatcher (every disjunct below is a named action carrying its
+  // own binding); a composition frame with no transition of its own.
+  // Reached as a checked symbol through the regime modules' warm-up
+  // alias (`action step = pullStep`), which is why it carries a
+  // binding at all.
   action pullStep = any {
     all { tick, buildLeavesMatUntouched },
     all { pullOpensAttemptAny, buildLeavesMatUntouched },

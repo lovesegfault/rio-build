@@ -36,10 +36,15 @@ pub const MAX_REFERENCES: usize = 10_000;
 /// Maximum number of signatures in a single PathInfo.
 pub const MAX_SIGNATURES: usize = 100;
 
-/// Maximum store paths the scheduler's `spawn_substitute_fetches` BFS
-/// will visit per derivation. Bounds the closure walk against a hostile
-/// upstream serving an infinite reference chain. Real closures (full
-/// nixpkgs stdenv ~5k, full system ~20k) are well under this.
+/// Maximum store paths a closure walk visits per derivation/job.
+/// Live consumer: the materialization executor's walk
+/// (`CLOSURE_WALK_CAP` in rio-store's materialize executor). Bounds
+/// the walk against a hostile upstream serving an infinite reference
+/// chain; real closures (full nixpkgs stdenv ~5k, full system ~20k)
+/// are well under this. (The founding consumer — the scheduler's
+/// `spawn_substitute_fetches` BFS — was deleted with the stream-era
+/// substitution machinery in 9d82fc712; the constant survives as the
+/// shared cap. bughunt-13 F14's rot sweep.)
 pub const MAX_SUBSTITUTE_CLOSURE: usize = 50_000;
 
 /// Minimum NAR-budget charge per `NarChunk` message, in bytes.

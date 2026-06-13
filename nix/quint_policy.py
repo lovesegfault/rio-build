@@ -455,10 +455,11 @@ P8_GRANDFATHER: frozenset = frozenset(
         "retryCalibGuardVacuous",
         "retryCalibSdAsInfra",
         "retryCalibUnboundedDegraded",
-        "retryPolicy",
-        "retryPolicyPull",
-        "retryPolicyPullMat",
-        "retryPolicyPullStoreDegraded",
+        # bughunt-13 OP-6 stage 1 (F14): the retryPolicy plane left the
+        # grandfather — every step-referenced action carries a
+        # grammar-valid Mirrors:/Environment: binding verified against
+        # the live tree (the dead spawn_substitute pointer, the
+        # audit's exhibit 1, died with the conversion).
         "spawnCoherence",
         "spawnCoherenceBase",
         "spawnCoherenceCancelAsBuilt",
