@@ -3,8 +3,8 @@
 # Columns: <src-relative path>:<line>\t<class>
 guard.rs:178	delay
 guard.rs:433	refusal
-reconcilers/componentscaler/mod.rs:261	delay
-reconcilers/componentscaler/mod.rs:328	delay
+reconcilers/componentscaler/mod.rs:272	delay
+reconcilers/componentscaler/mod.rs:349	delay
 reconcilers/componentscaler/mod.rs:97	delay
 reconcilers/gc_schedule.rs:174	delay
 reconcilers/gc_schedule.rs:215	delay

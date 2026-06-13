@@ -97,25 +97,33 @@ pub const MAX_SCALE_DOWN_STEP: i32 = 1;
 /// reading, so they RESET regardless of sensor availability.
 pub const AMBIGUOUS_TICK_EVIDENCE_DECAY: u32 = 1;
 
-// r[impl ctrl.scaler.load-coverage]
+// r[impl ctrl.scaler.load-coverage+2]
 /// The denominated load letter: the `max()` fold over per-replica
 /// `GetLoad` gauges PLUS its coverage denominator. A max() over
 /// per-replica gauges is only a total max under total coverage — the
-/// replica whose reading was dropped (timeout, connect failure) is
-/// dropped exactly when its reading may BE the max — so the letter
-/// carries `answered`/`resolved` and [`decide`] consumes it
-/// asymmetrically: a survivor reading HIGH is trustworthy (scale-up
-/// evidence survives partial coverage); a survivor reading LOW is not
-/// (ratio-growth funding demands total coverage). `answered == 0`
-/// never constructs a letter — the established total-failure posture
-/// is `None` at the poll fold ([`LoadAggregate::fold`]).
+/// replica whose reading was dropped (timeout, connect failure,
+/// readiness-censored DNS) is dropped exactly when its reading may
+/// BE the max — so the letter carries `answered`/`resolved` and
+/// [`decide`] consumes it asymmetrically: a survivor reading HIGH is
+/// trustworthy (scale-up evidence survives partial coverage); a
+/// survivor reading LOW is not (ratio-growth funding demands total
+/// coverage). `answered == 0` never constructs a letter — the
+/// established total-failure posture is `None` at the poll fold
+/// ([`LoadAggregate::fold`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LoadAggregate {
     /// `max(fold_load)` over the replicas that answered.
     pub max: f64,
-    /// How many resolved replicas answered within the RPC timeout.
+    /// How many spec'd replicas answered within the RPC timeout.
     pub answered: usize,
-    /// How many replica addresses the headless service resolved.
+    /// The AUTHORITATIVE denominator: `max(addrs.len(),
+    /// Deployment.spec.replicas)` — the spec'd replica population
+    /// (R31'-d), never the readiness-censored DNS answer alone. The
+    /// headless Service has no `publishNotReadyAddresses`, so a
+    /// NotReady replica drops out of DNS; sourcing `resolved` from
+    /// `addrs.len()` shrank both numerator and denominator together
+    /// and read as total coverage exactly when the dropout it prices
+    /// was happening (merged_bug_004).
     pub resolved: usize,
 }
 
@@ -288,7 +296,7 @@ pub fn decide(
     };
 
     // Reactive correction on observed load.
-    // r[impl ctrl.scaler.load-coverage]
+    // r[impl ctrl.scaler.load-coverage+2]
     // The asymmetric consume of the denominated letter: the high arm
     // accepts ANY coverage — quantifier: census(test: w13_af_partial_high_still_scales_up) —
     // (a survivor reading high is a real replica
@@ -747,7 +755,7 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.scaler.load-coverage]
+    // r[verify ctrl.scaler.load-coverage+2]
     /// W13-AF (bug_061) — proposition: a partial aggregate is never
     /// consumed as a total one; population: the load-correlated
     /// timeout regime (the saturated replica is slow to answer
@@ -785,7 +793,7 @@ mod tests {
         assert_eq!(d.desired, 4, "the predictive path still drives desired");
     }
 
-    // r[verify ctrl.scaler.load-coverage]
+    // r[verify ctrl.scaler.load-coverage+2]
     /// W13-AF, the asymmetric half: a survivor reading HIGH is a real
     /// replica really saturated — scale-up evidence survives partial
     /// coverage (degrading the whole letter to None would suppress
@@ -804,7 +812,7 @@ mod tests {
         assert!(d.scaled_up);
     }
 
-    // r[verify ctrl.scaler.load-coverage]
+    // r[verify ctrl.scaler.load-coverage+2]
     /// W13-AF2 — total-coverage behavior byte-stable: with
     /// `answered == resolved` every arm reproduces the pre-letter
     /// outcomes (the letter is reader-invisible where the old fold
@@ -834,7 +842,7 @@ mod tests {
         assert_eq!((d.low_load_ticks, d.learned_ratio), (0, 50.0));
     }
 
-    // r[verify ctrl.scaler.load-coverage]
+    // r[verify ctrl.scaler.load-coverage+2]
     /// The fold denominates: answers counted against resolved, max
     /// over answers only, zero answers = the established `None`
     /// total-failure posture (never a `Some` with a fabricated max).
@@ -854,6 +862,93 @@ mod tests {
             "zero answers → None (total-failure posture preserved)"
         );
         assert_eq!(LoadAggregate::fold(&[]), None, "zero resolved → None");
+    }
+
+    // r[verify ctrl.scaler.load-coverage+2]
+    /// W14-B3 (merged_bug_004) — proposition: the coverage
+    /// denominator is the spec'd replica population (the Deployment
+    /// `spec.replicas` already in hand), never the readiness-censored
+    /// DNS answer; population: the NotReady-replica shape (a
+    /// saturated/restarting replica drops out of headless-Service DNS
+    /// — the exact dropout the letter exists to price). Pre-fix RED
+    /// (verbatim in the commit body): `resolved = addrs.len()` →
+    /// answered=1, resolved=1 → total coverage → growth funded
+    /// (left: 51.0, right: 50.0) and `load_poll_partial_total`
+    /// never increments.
+    #[test]
+    fn w14_b3_notready_replica_degrades_coverage() {
+        // r13-allow(decide-seam): the production-topology shape
+        // expressed as the readings vector poll_max_load_addrs hands
+        // to fold — DNS resolved 1 addr (the Ready survivor),
+        // spec.replicas=2, the NotReady replica's slot padded None.
+        let spec_replicas = 2usize;
+        let dns_resolved = vec![Some(0.1)]; // survivor reads LOW
+        let mut readings = dns_resolved.clone();
+        readings.resize(dns_resolved.len().max(spec_replicas), None);
+        let l = LoadAggregate::fold(&readings).expect("one answer");
+        // Load-bearing: the decide() consequence (survivor-only LOW
+        // funds nothing — the asymmetric consume's LOW face) and the
+        // suppressed reactive +1.
+        let s = spec(2, 14);
+        let d = decide(
+            &s,
+            &status(Some(50.0), LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1),
+            4,
+            200,
+            Some(l),
+            None,
+        );
+        assert_eq!(
+            d.learned_ratio, 50.0,
+            "a NotReady-censored survivor LOW must NOT fund growth \
+             (pre-fix: total_coverage()=true → ratio grew to 51.0)"
+        );
+        // Secondary mechanism checks: the denominator and the metric
+        // trail (!total_coverage → publish_metrics increments
+        // load_poll_partial_total — the recurrence's operator
+        // visibility).
+        assert_eq!(
+            (l.answered, l.resolved),
+            (1, 2),
+            "the NotReady replica is COUNTED in the denominator \
+             (pre-fix: resolved=addrs.len()=1)"
+        );
+        assert!(
+            !l.total_coverage(),
+            "answered < spec'd replicas → partial coverage \
+             (pre-fix: 1/1 read as total)"
+        );
+    }
+
+    // r[verify ctrl.scaler.load-coverage+2]
+    /// W14-B4 — the asymmetry preserved under the re-denomination: a
+    /// survivor reading HIGH still scales up under partial coverage
+    /// (the protective action survives the NotReady dropout — the
+    /// wave-13 W13-AF asymmetric half, re-stated against the spec'd
+    /// denominator).
+    #[test]
+    fn w14_b4_notready_replica_high_survivor_still_scales_up() {
+        let spec_replicas = 2usize;
+        let mut readings = vec![Some(0.9)]; // survivor reads HIGH
+        readings.resize(spec_replicas, None);
+        let l = LoadAggregate::fold(&readings).expect("one answer");
+        assert!(!l.total_coverage());
+        let s = spec(2, 14);
+        let d = decide(&s, &status(Some(50.0), 5), 5, 200, Some(l), None);
+        assert_eq!(
+            d.desired, 6,
+            "survivor-HIGH scales up under partial coverage \
+             (the asymmetry preserved against the spec'd denominator)"
+        );
+        assert!(d.scaled_up);
+        // Surge face: addrs.len() > spec_replicas → resolved=max(...)
+        // counts the surge pods (answered <= resolved invariant).
+        let (dns_surge, spec_replicas) = (3usize, 2usize);
+        let mut surge = vec![Some(0.5); dns_surge];
+        surge.resize(dns_surge.max(spec_replicas), None);
+        let l = LoadAggregate::fold(&surge).expect("three answers");
+        assert_eq!((l.answered, l.resolved), (3, 3));
+        assert!(l.total_coverage(), "surge pods all answered → total");
     }
 
     // r[verify ctrl.scaler.evidence-funding+2]

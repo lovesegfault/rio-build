@@ -108,11 +108,10 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
         }
     };
 
-    // ── Observed: max(GetLoad) across loadEndpoint pods ──────────
-    let load = poll_max_load(&spec.load_endpoint, ctx.service_interceptor.clone()).await;
-    let max_load = load.map(|l| l.max);
-
     // ── Current replica count from the Deployment ────────────────
+    // Fetched BEFORE the load poll: `spec.replicas` is the
+    // authoritative denominator for the coverage letter (R31'-d) —
+    // the load poll's headless-DNS answer is readiness-censored.
     let dep_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), &ns);
     let dep = dep_api.get(&spec.target_ref.name).await.map_err(|e| {
         Error::InvalidSpec(format!(
@@ -125,6 +124,15 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
         .as_ref()
         .and_then(|s| s.replicas)
         .unwrap_or(spec.replicas.min);
+
+    // ── Observed: max(GetLoad) across loadEndpoint pods ──────────
+    let load = poll_max_load(
+        &spec.load_endpoint,
+        current.max(0) as usize,
+        ctx.service_interceptor.clone(),
+    )
+    .await;
+    let max_load = load.map(|l| l.max);
 
     // ── Decide ───────────────────────────────────────────────────
     // low_load_ticks comes from Ctx (in-process), NOT status: writing
@@ -222,9 +230,11 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
 /// Resolve `loadEndpoint` (headless-svc DNS) → per-pod GetLoad →
 /// the denominated max-utilization letter
 /// ([`decide::LoadAggregate`]: max over answering pods + answered/
-/// resolved coverage). `None` on total failure (endpoint malformed,
-/// DNS unresolved/timed-out, all RPCs failed) — the caller skips
-/// ratio correction this tick.
+/// resolved coverage, where `resolved` is denominated by
+/// `spec_replicas` — the Deployment's spec'd replica count, never
+/// the readiness-censored DNS answer alone). `None` on total
+/// failure (endpoint malformed, DNS unresolved/timed-out, all RPCs
+/// failed) — the caller skips ratio correction this tick.
 ///
 /// Bounds total latency to ≤2×`LOAD_RPC_TIMEOUT` (DNS resolve +
 /// concurrent fan-out). DNS is timeout-wrapped: `lookup_host` is
@@ -238,6 +248,7 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
 /// `decide()` runs (bug_194).
 async fn poll_max_load(
     endpoint: &str,
+    spec_replicas: usize,
     service_interceptor: rio_auth::hmac::ServiceTokenInterceptor,
 ) -> Option<decide::LoadAggregate> {
     let Some((host, port)) = endpoint.rsplit_once(':') else {
@@ -273,7 +284,7 @@ async fn poll_max_load(
         debug!(host, "componentscaler: loadEndpoint resolved to 0 addrs");
         return None;
     }
-    poll_max_load_addrs(addrs, service_interceptor).await
+    poll_max_load_addrs(addrs, spec_replicas, service_interceptor).await
 }
 
 /// Per-pod load fold: `max(pg_pool_utilization,
@@ -290,13 +301,23 @@ fn fold_load(r: &rio_proto::types::GetLoadResponse) -> f64 {
 
 /// Concurrent per-pod `GetLoad` fan-out → the denominated letter.
 /// Split from [`poll_max_load`] so the timeout-aggregate behavior is
-/// unit-testable without DNS. `resolved` is the address count handed
-/// in; every task that errors or times out leaves its reading `None`,
-/// so the fold's denominator counts exactly the answers
-/// ([`decide::LoadAggregate::fold`]).
-// r[impl ctrl.scaler.load-coverage]
+/// unit-testable without DNS. `resolved` is the AUTHORITATIVE
+/// denominator — `max(addrs.len(), spec_replicas)` — never the
+/// readiness-censored DNS answer alone (R31'-d): the headless
+/// Service has no `publishNotReadyAddresses`, so a NotReady replica
+/// drops out of `addrs` and would otherwise shrink BOTH numerator
+/// and denominator, reading as total coverage exactly when the
+/// dropout it prices is happening (merged_bug_004). Every task that
+/// errors or times out leaves its reading `None`, and the readings
+/// vector is padded to `resolved`, so the fold's denominator counts
+/// against the spec'd population ([`decide::LoadAggregate::fold`]).
+/// `max(...)` not `spec_replicas` outright: surge pods during a
+/// rolling update can exceed spec; counting them keeps `answered <=
+/// resolved`.
+// r[impl ctrl.scaler.load-coverage+2]
 async fn poll_max_load_addrs(
     addrs: Vec<SocketAddr>,
+    spec_replicas: usize,
     service_interceptor: rio_auth::hmac::ServiceTokenInterceptor,
 ) -> Option<decide::LoadAggregate> {
     // `connect_store_admin_at` (not the balanced channel): we need
@@ -304,7 +325,7 @@ async fn poll_max_load_addrs(
     // every resolved IP directly — p2c would route all calls to one
     // or two pods. Wrapped with the service-token interceptor —
     // `r[store.admin.service-gate]` requires it on `GetLoad`.
-    let resolved = addrs.len();
+    let resolved = addrs.len().max(spec_replicas);
     let mut set = tokio::task::JoinSet::new();
     for addr in addrs {
         let int = service_interceptor.clone();
@@ -343,9 +364,10 @@ async fn poll_max_load_addrs(
             }
         }
     }
-    // A panicked/cancelled task never pushed its reading — pad the
-    // denominator so a lost task still degrades coverage instead of
-    // silently shrinking `resolved`.
+    // Pad to the authoritative denominator: a NotReady replica
+    // (absent from DNS), a panicked/cancelled task, or a surge-pod
+    // shortfall each leave a `None` reading that degrades coverage
+    // instead of silently shrinking `resolved`.
     readings.resize(resolved, None);
     decide::LoadAggregate::fold(&readings)
 }
@@ -615,7 +637,8 @@ mod tests {
             listeners.push(l);
         }
         let int = rio_auth::hmac::ServiceTokenInterceptor::new(None, "rio-controller");
-        let res = tokio::time::timeout(LOAD_RPC_TIMEOUT * 2, poll_max_load_addrs(addrs, int)).await;
+        let res =
+            tokio::time::timeout(LOAD_RPC_TIMEOUT * 2, poll_max_load_addrs(addrs, 3, int)).await;
         assert!(
             res.is_ok(),
             "concurrent fan-out must complete within 2×LOAD_RPC_TIMEOUT \
@@ -842,7 +865,8 @@ mod tests {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("127.0.0.1:{}", l.local_addr().unwrap().port());
         let int = rio_auth::hmac::ServiceTokenInterceptor::new(None, "rio-controller");
-        let res = tokio::time::timeout(LOAD_RPC_TIMEOUT * 3, poll_max_load(&endpoint, int)).await;
+        let res =
+            tokio::time::timeout(LOAD_RPC_TIMEOUT * 3, poll_max_load(&endpoint, 1, int)).await;
         assert!(
             res.is_ok(),
             "poll_max_load must complete within 3×LOAD_RPC_TIMEOUT end-to-end \

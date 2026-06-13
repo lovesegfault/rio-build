@@ -1631,15 +1631,18 @@ status-write-failure window, `None`-both is genuine "never scaled up
 or fresh CR" --- conservative-hold would freeze every restart for 5
 minutes.
 
-#r("ctrl.scaler.load-coverage")[
+#r("ctrl.scaler.load-coverage+2")[
   A partial aggregate over per-replica gauges MUST carry its
-  denominator: the poll fold reports `answered`/`resolved` alongside
-  `max`, and `decide()` MUST consume partial coverage asymmetrically
-  --- a survivor reading above `loadThresholds.high` remains scale-up
-  evidence under any coverage, while ratio-growth funding demands
-  total coverage; a partial aggregate is never consumed as a total
-  one, and zero answers degrade to the no-reading posture rather than
-  a fabricated max.
+  denominator, and the denominator MUST be the AUTHORITATIVE
+  population --- `max(addrs.len(), Deployment.spec.replicas)`, never
+  the readiness-censored DNS answer alone (R31'-d). The poll fold
+  reports `answered`/`resolved` alongside `max`, and `decide()` MUST
+  consume partial coverage asymmetrically --- a survivor reading
+  above `loadThresholds.high` remains scale-up evidence under any
+  coverage, while ratio-growth funding demands total coverage; a
+  partial aggregate is never consumed as a total one, and zero
+  answers degrade to the no-reading posture rather than a fabricated
+  max.
 ]
 Rationale: a per-replica gauge's `max()` drops the unanswered replica
 exactly when its reading may BE the max --- GetLoad is sub-ms when
@@ -1647,9 +1650,18 @@ healthy, so the slow-to-answer pod is the saturated one (the
 load-correlated timeout regime recurs every pass; the round-13
 instance is bug_061, where idle survivors' low readings funded ratio
 growth every tick while the hot replica's timeout suppressed the
-reactive scale-up). The asymmetry preserves the protective action:
-degrading the whole letter to `None` would suppress exactly the
-scale-up partial coverage can still justify.
+reactive scale-up), and the headless Service has no
+`publishNotReadyAddresses`, so a NotReady (saturated/restarting)
+replica drops out of DNS entirely --- sourcing `resolved` from
+`addrs.len()` shrank both numerator AND denominator together and
+read as total coverage exactly when the dropout it prices was
+happening (the round-14 instance, merged_bug_004). The denominator
+is sourced from the Deployment's spec'd replica count already in
+hand at reconcile time (`denominator-source =
+spec'd-replica-count`), independent of the failure being priced.
+The asymmetry preserves the protective action: degrading the whole
+letter to `None` would suppress exactly the scale-up partial
+coverage can still justify.
 #(refs.metric)("rio_controller_component_scaler_load_poll_partial_total")
 is the recurrence's operator trail.
 
