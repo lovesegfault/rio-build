@@ -1560,7 +1560,10 @@ in
         cp "$sharedLexer" rust_strip.py
         cp "$censusLib" census_corpora.py
         cp "$scanScript" cadence_polarity_registries.py
-        python3 cadence_polarity_registries.py "$src"
+        # --verify-landed from the round-13 close onward: every row is
+        # anchored at this tree; a future pending row must flip at its
+        # own wave's close or red here, never linger silently.
+        python3 cadence_polarity_registries.py "$src" --verify-landed
         touch $out
       '';
 

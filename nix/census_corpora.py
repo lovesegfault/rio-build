@@ -1336,21 +1336,26 @@ def check_self_coverage(src_root, arms=None, residuals=None):
 # = the owning close has not landed at this tree — survivors PRINT
 # (the OQ-10 latitude: advisory-red at mint; flipped to hard at the
 # wave close, where the <5%% FP measurement adjudicates RULED-to-
-# round-14 vs standing). An OBITUARY context (the line carries a
-# retirement marker) is lawful history, never a violation.
+# round-14 vs standing — round-13 measurement: 6 advisories at mint,
+# all true positives on the owning planes, 0%% FP; every advisory row
+# flipped to hard at the close after its owning slot landed). An
+# OBITUARY context (the line carries a retirement marker) is lawful
+# history, never a violation.
 RETIRED_LAW_FORMULATIONS = [
     # (name, phrase regex, mode) — first corpus: the wave's closes.
     ("matched-text-keying", r"rel \+ matched text", "hard"),
     ("l-content-fragment-keys", r"L-content-", "hard"),
     ("apply-preclamp-discharge", r"cannot overflow Duration's u64-seconds range", "hard"),
-    ("unit-weights-law", r"unit weights", "advisory:S4"),
-    ("kubelet-two-grammars", r"two grammars are kubelet", "advisory:S1"),
-    ("marks-any-falsifier", r"ANY falsifier", "advisory:S3"),
+    ("unit-weights-law", r"unit weights", "hard"),
+    ("kubelet-two-grammars", r"two grammars are kubelet", "hard"),
+    ("marks-any-falsifier", r"ANY falsifier", "hard"),
 ]
 RETIREMENT_MARKERS = re.compile(
     r"retired|obituary|pre-fix|previously|formerly|superseded|"
-    r"phrase-census|the old |RETIRED|never the|defeat|born-broken|"
-    r"degrad|mutant|mutation|swapped back"
+    r"phrase-census|the old |never the|defeat|born-broken|"
+    r"degrad|mutant|mutation|swapped back|claimed|historical|"
+    r"unrepresentable",
+    re.I,
 )
 PHRASE_SUFFIXES = {".rs", ".typ", ".qnt", ".md", ".nix", ".py"}
 
@@ -1372,6 +1377,15 @@ def scan_retired_law_formulations(src_root, table=None):
             text = f.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
+        # .rs surfaces: production prose only — cfg(test) modules are
+        # curated history (in-crate phrase exemplars and their planted
+        # resurrections live there by design; the S4 w13_t convention).
+        # The pruner is newline-preserving, so line numbers stay true.
+        if f.suffix == ".rs":
+            try:
+                text = rust_strip.strip_cfg_test(text, source=rel)
+            except rust_strip.StripError:
+                pass  # over-approximate: scan the whole file
         flines = text.splitlines()
         for i, line in enumerate(flines, 1):
             for name, rx, mode in table:

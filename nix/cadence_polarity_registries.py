@@ -54,36 +54,36 @@ R34_PAIRS = {
         "compile-assert (keepalive_conforms + the planted negative control — THE in-tree idiom R34 generalizes)",
     ),
     "log-cut-interval-vs-idle-bound": (
-        "pending",
+        "landed",
         "S5",
-        None,
-        None,
+        "rio-store/src/logs/service.rs",
+        r"idle_trip_worst_case",
         "(log cut interval, INBOUND_IDLE_BOUND) — the bug_018 banner pair",
-        "pending: WO-S5-1's assert (PD-4 expanded form: worst case ~ bound + 3x interval + housekeeping) flips here at the close",
+        "compile-assert (the PD-4 expanded form: idle_trip_worst_case(interval) + PHASE_MARGIN <= IDLE_TRIP_DISCLOSED_CEILING, plus the MAX_LOG_CUT_INTERVAL round-trip asserts; config validate consumes the same fn — H5 item 4)",
     ),
     "udev-settle-vs-condition-clock": (
-        "pending",
+        "landed",
         "S2",
-        None,
-        None,
+        "nix/nixos-node/eks-node.nix",
+        r"rio-kubelet-mount",
         "(udev coldplug settle, systemd job-start Condition evaluation) — merged_bug_045's wrong-clock gate",
-        "pending: WO-S2-2's settle-then-branch dispatcher flips here (the R34(iii) systemd tier)",
+        "structural (the R34(iii) systemd tier): ONE condition-free rio-kubelet-mount oneshot settles FIRST then classifies on the settled view; vm-nixos-node asserts the rendered unit is condition-free + settle-precedes-glob (H2: the assert is the unit's shape, not a const pair)",
     ),
     "scaler-funding-vs-sensor-cadence": (
-        "pending",
+        "landed",
         "S6",
-        None,
-        None,
+        "rio-controller/src/reconcilers/componentscaler/decide.rs",
+        r"RESET regardless of sensor availability",
         "(scaler decide tick, sensor-reading presence) — merged_bug_009's sensor-absent funding clock",
-        "pending: WO-S6-2's hoist flips here (the R34(iii) sensor tier)",
+        "structural (the R34(iii) sensor tier): the streak/bank predicates evaluate on sensor-absent ticks (the hoist — banked evidence resets regardless of sensor availability; ratio-growth funding demands total coverage)",
     ),
     "session-drain-stamp-vs-stale-after": (
-        "pending",
+        "landed",
         "S5",
-        None,
-        None,
+        "rio-store/src/logs/sessions.rs",
+        r"worst_one_miss_committed_age",
         "(drain heartbeat stamp cadence, SESSION_STALE_AFTER) — the F10/WO-S5-7 pair",
-        "pending: the H5-pack assert-or-residual verdict enrolls verbatim at the close (CE-3: the watchdog-slow-cut residual is priced if arm A)",
+        "compile-assert SATISFIED via the existing sessions.rs margin certificate (worst committed-stamp age 2I+F+R < SESSION_STALE_AFTER; the pair is REUSED at the drain's second spawn site, no new coupling minted — H5 item 2; F10 closed ARM A, the per-completed-chunk cadence rejected per CE-3)",
     ),
 }
 
@@ -93,58 +93,62 @@ R34_PAIRS = {
 #   direction table merged_bug_002's prose census lacked.
 R33_RIDERS = {
     "disk-p90-raw-vs-floored": (
-        "pending",
+        "landed",
         "S4",
-        None,
-        None,
-        "reject/explain/classify_ceiling: raw; sizing: floored",
-        "bytes (p90 of per-build peak)",
-        "pending: H4-pack posts the TYPE names + the WO-S4-1 tier verdict (type-blocked vs census-tier) — recorded here at the close",
+        "rio-scheduler/src/sla/types.rs",
+        r"struct RawDiskP90",
+        "reject/explain/classify_ceiling: raw (RawDiskP90); sizing: floored (DiskBytes on disk_p90)",
+        "bytes (p90 of per-build peak); fork minted once as ingest::DiskP90Fork{raw, floored}",
+        "TIER VERDICT: TYPE-BLOCKED (H4 — the RawDiskP90 newtype lands at consumer signatures; exceeds_ceiling re-signed; re-conflation fails to type-check; no census-tier withdrawal needed)",
     ),
     "disk-evidence-peak-vs-status": (
-        "pending",
+        "landed",
         "S2",
-        None,
-        None,
-        "sizing: monitor peak (max-fold); classification: one-shot status",
-        "bytes vs typed status (two products, two consumers)",
-        "pending: WO-S2-4's split lands; flips at the close",
+        "rio-builder/src/executor/mod.rs",
+        r"struct DiskEvidence",
+        "sizing: monitor peak (sizing_peak max-fold); classification: one-shot status (classification)",
+        "bytes vs typed QuotaStatus (DiskEvidence{sizing_peak, classification} + fold_disk_evidence — total, 4 cells; absence consumes the FOLD OUTPUT)",
+        "type-split product (H2): two fields, two consumers; the kubelet -1 sentinel finding rides the H2 pack as a round-14 candidate",
     ),
     "weight-ring-vs-full-slice": (
-        "pending",
+        "landed",
         "S4",
-        None,
-        None,
-        "fit ordinals: ring weights; anchor floor: full-slice recency",
-        "ordinal weights (one decay law, one domain post-fix)",
-        "pending: WO-S4-2's one-ordinal-domain producer flips here",
+        "rio-scheduler/src/sla/ingest.rs",
+        r"fn axis_samples",
+        "fit ordinals: ring weights (reserved to the fit's subset universe); aggregate/anchor: full-slice ordinals derived in-body",
+        "ordinal weights — ONE producer (axis_samples takes no weight parameter; callers cannot pass a mismatched domain)",
+        "producer-signature enforcement (H4: the one-ordinal-domain signature; the w12_ad consult upgraded to domain-checked)",
     ),
     "pod-ephemeral-vs-solve-disk": (
-        "pending",
+        "landed",
         "S2",
-        None,
-        None,
-        "pod request: pod-ephemeral units; corroboration band: solve-disk units",
-        "ONE shared minting fn (pod_ephemeral_request) post-fix",
-        "pending: the H2-pack OQ-3 home verdict (rio-common arm expected-fire) enrolls the producer anchor at the close",
+        "rio-common/src/k8s.rs",
+        r"pod_ephemeral_request_bytes",
+        "pod request: pod-ephemeral units; corroboration band: solve-disk units — both denominate through the ONE shared producer",
+        "bytes via rio_common::k8s::{overlay_size_limit_bytes, pod_ephemeral_request_bytes} (the OQ-3 rio-common arm FIRED; controller jobs.rs delegates; scheduler floor.rs band consumes the same fns + headroom codomain consts)",
+        "shared-minting-fn enforcement (H2; compile-time const asserts both sides pin the fallback inside the band)",
     ),
 }
 
 # The no-op stamp grammar (R34(ii)): occupancy-stamp writes need an
 # occupancy witness comment naming the outcome evidence.
 STAMP_RE = re.compile(r"last_self_activity\s*=")
-STAMP_ALLOW = re.compile(r"r34-occupancy:")
-# Stamp FILES pending their owning slot's landing (the bug_018 repair
-# plane: service.rs:1609's cut-arm stamp is the charged defeat and
-# :1810 its sibling — S5 repairs them this wave). Pre-close the
-# pending file's hits are suspended; the wave-close --verify-landed
-# REDS any survivor (the close aligns the landed shape with occupancy
-# witnesses per the H5 pack, or the row stays red and the close
-# fails). Shrink-only: removing an entry requires the witnesses;
-# adding one requires editing this reviewed table.
-STAMP_PENDING = {
-    "rio-store/src/logs/service.rs": "S5 (WO-S5-1: the occupancy-stamp repair)",
-}
+# The witness alphabet (R34(ii)): an explicit `r34-occupancy:` comment,
+# OR the landed type-derived witnesses — the `CutOccupancy::Occupied`
+# guard (the occupancy verdict's own type, S5's WO-S5-1 shape) and the
+# `cut_while_due(` work call (the in-arm cut IS the occupancy; cut_due
+# implies work per the H5 pack). A future bare stamp with none of
+# these in its window reds.
+STAMP_ALLOW = re.compile(r"r34-occupancy:|CutOccupancy::Occupied|cut_while_due\(")
+# Stamp FILES pending their owning slot's landing. EMPTIED at the
+# round-13 wave close: S5's WO-S5-1 landed the occupancy repair —
+# the cut-arm stamp is now guarded by `CutOccupancy::Occupied` (the
+# type's own verdict) and the in-arm batch stamp by the `cut_while_due`
+# work call (cut_due implies work, H5 item 3) — both recognized by
+# STAMP_ALLOW as DERIVED witnesses, so the lane has nothing left to
+# suspend. The lane mechanism stays (a future slot may need it);
+# adding an entry requires editing this reviewed table.
+STAMP_PENDING = {}
 
 
 def scan_noop_stamps(files, pending=None, verify_landed=False):
@@ -162,7 +166,7 @@ def scan_noop_stamps(files, pending=None, verify_landed=False):
         lines = raw.splitlines()
         for m in STAMP_RE.finditer(lexed):
             lineno = lexed.count("\n", 0, m.start()) + 1
-            window = "\n".join(lines[max(0, lineno - 4) : lineno])
+            window = "\n".join(lines[max(0, lineno - 6) : lineno])
             if STAMP_ALLOW.search(window):
                 continue
             if rel in pending:
@@ -306,7 +310,7 @@ MUTATIONS = [
         "allow-widened",
         "the occupancy-witness window accepts everything — killed by"
         " the un-witnessed stamp plant (it would stop redding)",
-        "STAMP_ALLOW = re." + r'compile(r"r34-occupancy:")',
+        "STAMP_ALLOW = re." + r'compile(r"r34-occupancy:|CutOccupancy::Occupied|cut_while_due\(")',
         "STAMP_ALLOW = re." + r'compile(r"")',
     ),
     (
