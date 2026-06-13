@@ -87,6 +87,65 @@ R34_PAIRS = {
     ),
 }
 
+# --- R34-w: the recovery-edge axis (round-14 WO-S9-2) ------------------
+# The R34 census above records what REFRESHES each gate's clock; this
+# axis records what CLEARS each degradation/recovery/disarm clock and
+# asserts the clearing event is in the witnessed-work class — never
+# open/connect/re-mint/retried-attempt (the merged_bug_003 perimeter
+# leak: an episode-ending event that can occur while the failure
+# persists is NOT recovery evidence; a peer that delivers refusals
+# in-band reset the clock every second so the 30s notice never fired).
+#
+# name -> (state, slot, file, anchor_regex, clearing_event, witness_class)
+#   witness_class: (class, rationale) where class is in WITNESSED_WORK
+#   for the recovery-edge axis to GREEN. The REJECTED set below names
+#   every member of R34-w's enumerated no-progress class (per R16, the
+#   plant battery covers each one — WS-I2).
+WITNESSED_WORK = ("relayed-line", "committed-row", "completed-unit", "OTHER")
+REJECTED_CLEARS = ("open", "connect", "re-mint", "retried-attempt")
+# Founding enrollments arrive with their slots (S1's occupancy-keyed
+# live-tail clear; S2's in-process fence-arming record) and are
+# reconciled at the wave-close re-mint with anchors at the landed tree.
+R34_CLEARS = {
+}
+
+
+def check_clears(src_root, rows, verify_landed=False):
+    """R34-w(iv) recovery-edge check (failure-collecting): every
+    enrolled disarm/recovery clock names its clearing event in the
+    witnessed-work class. Reuses check_rows for state/anchor; adds the
+    witness-class arm. NO population floor — the axis is empty at
+    birth; enrollment is per-slot."""
+    fails = check_rows(src_root, rows, "R34-w clear", verify_landed) if rows else []
+    for name, row in sorted(rows.items()):
+        cls, rationale = row[5]
+        if cls in REJECTED_CLEARS:
+            fails.append(
+                f"R34-w clear `{name}`: clearing event class `{cls}` is in "
+                f"the REJECTED no-progress set {REJECTED_CLEARS} — an "
+                f"event that can occur while the failure persists "
+                f"(successful open against a refusing peer; a re-mint the "
+                f"verifier rejects again; a retried call that observed "
+                f"nothing) is NOT recovery evidence (R34-w(i): the "
+                f"merged_bug_003 defeat)"
+            )
+        elif cls not in WITNESSED_WORK:
+            fails.append(
+                f"R34-w clear `{name}`: clearing event class `{cls}` "
+                f"outside the closed witnessed-work alphabet "
+                f"{WITNESSED_WORK} — name the productive outcome that "
+                f"proves the recovery actually recovered (first relayed "
+                f"chunk, the committed row at the success site, the "
+                f"completed unit of the thing previously failing)"
+            )
+        if cls == "OTHER" and not rationale:
+            fails.append(
+                f"R34-w clear `{name}`: witness class OTHER without a "
+                f"recorded rationale (R34-w(i))"
+            )
+    return fails
+
+
 # --- R33': the polarity/units rider registry ----------------------------
 # name -> (state, slot, file, anchor_regex, readers, units, tier)
 #   readers: "<reader>: <direction>" semicolon list — the per-reader
@@ -283,6 +342,47 @@ def self_battery(src_root) -> list:
     got = check_rows(src_root, {"x": ("vibes", "S9", None, None)}, "straw")
     if not any("outside {landed, pending}" in x for x in got):
         fails.append(f"the unknown-state plant did not red: {got}")
+    # R34-w plants — the W14-I2 battery (every face of the law's
+    # rejected-class enumeration, per R16/WS-I2): one planted clock row
+    # for EACH named no-progress event; all four red.
+    for rej in REJECTED_CLEARS:
+        got = check_clears(
+            src_root,
+            {"x": ("pending", "S9", None, None, f"on-{rej}", (rej, ""))},
+        )
+        if not any("REJECTED no-progress set" in x for x in got):
+            fails.append(f"the rejected-clear plant `{rej}` did not red: {got}")
+    # An unknown clearing class reds (closed alphabet).
+    got = check_clears(
+        src_root,
+        {"x": ("pending", "S9", None, None, "on-vibes", ("vibes", ""))},
+    )
+    if not any("outside the closed witnessed-work alphabet" in x for x in got):
+        fails.append(f"the unknown-clear-class plant did not red: {got}")
+    # OTHER without rationale reds.
+    got = check_clears(
+        src_root,
+        {"x": ("pending", "S9", None, None, "on-x", ("OTHER", ""))},
+    )
+    if not any("OTHER without a recorded rationale" in x for x in got):
+        fails.append(f"the clear-OTHER-no-rationale plant did not red: {got}")
+    # The founding-shape green: a witnessed-work clearing event is NOT
+    # flagged (the W14-I2 founding-enrollment arm).
+    got = check_clears(
+        src_root,
+        {
+            "x": (
+                "pending",
+                "S1",
+                None,
+                None,
+                "first relayed chunk on the live tail",
+                ("relayed-line", "the occupancy-keyed clear: episode ends on the first chunk DELIVERED, not on open"),
+            )
+        },
+    )
+    if got:
+        fails.append(f"the witnessed-work founding shape FALSELY flagged: {got}")
     return fails
 
 
@@ -326,6 +426,21 @@ MUTATIONS = [
         '        for f in sorted(croot.rglob("*' + '.rs")):',
         "        for f in [" + "]:",
     ),
+    (
+        "rejected-clear-set-emptied",
+        "the R34-w rejected no-progress set emptied — killed by the"
+        " four rejected-clear plants (open/connect/re-mint/retried-"
+        "attempt would each stop redding)",
+        "        if cls in " + "REJECTED_CLEARS:",
+        "        if cls in (" + "):",
+    ),
+    (
+        "witnessed-work-widened",
+        "the closed witnessed-work alphabet accepts anything — killed"
+        " by the unknown-clear-class plant",
+        "        elif cls not in " + "WITNESSED_WORK:",
+        "        elif False and cls not in " + "WITNESSED_WORK:",
+    ),
 ]
 
 
@@ -360,14 +475,18 @@ def main() -> int:
         fails.append("population floor — zero production files ((vvvvv))")
     fails += scan_noop_stamps(files, verify_landed=verify_landed)
     fails += check_rows(src_root, R34_PAIRS, "R34 pair", verify_landed)
+    fails += check_clears(src_root, R34_CLEARS, verify_landed)
     fails += check_rows(src_root, R33_RIDERS, "R33' rider", verify_landed)
     n34p = sum(1 for r in R34_PAIRS.values() if r[0] == "pending")
     n33p = sum(1 for r in R33_RIDERS.values() if r[0] == "pending")
+    nclr = sum(1 for r in R34_CLEARS.values() if r[0] == "pending")
     print(
         f"cadence/polarity registries: {len(R34_PAIRS)} R34 (periodic-event, "
-        f"bound) pairs ({n34p} pending slot landings), {len(R33_RIDERS)} R33' "
-        f"polarity/units riders ({n33p} pending; the wave-close "
-        f"--verify-landed flips them), the R34(ii) no-op stamp grammar live"
+        f"bound) pairs ({n34p} pending slot landings), {len(R34_CLEARS)} R34-w "
+        f"recovery-edge clears ({nclr} pending; clearing events in the "
+        f"witnessed-work class), {len(R33_RIDERS)} R33' polarity/units riders "
+        f"({n33p} pending; the wave-close --verify-landed flips them), the "
+        f"R34(ii) no-op stamp grammar live"
     )
     if fails:
         print("FAIL: cadence/polarity registry violations —", file=sys.stderr)
