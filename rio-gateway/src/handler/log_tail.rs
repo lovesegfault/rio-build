@@ -998,9 +998,11 @@ async fn run_tail(
     // the alerting signal; the warn is the "which derivation / which
     // status code" breadcrumb next to it.
     let mut warned_open_failure = false;
-    // live_062: the open-failure EPISODE clock — armed at the first
-    // failed/timed-out open of a consecutive run, cleared on a
-    // successful open. When an episode outlives
+    // live_062: the degradation EPISODE clock — armed at the first failed/timed-out open OR the
+    // first zero-relayed in-stream refusal (the store's err_stream
+    // channel) of a consecutive run, cleared only on the first RELAYED
+    // CHUNK (R34-w(i): the clearing event is witnessed work, never a
+    // successful open — merged_bug_003). When an episode outlives
     // `config.degraded_notice_after`, exactly ONE typed notice line is
     // injected into the build output (the user-visible half the warn
     // latch above structurally cannot provide — operators read pod
@@ -1109,10 +1111,18 @@ async fn run_tail(
         let cause = match open {
             OpenOutcome::Opened(Ok(resp)) => {
                 warned_open_failure = false;
-                // The episode (if any) ends at a successful open: the
-                // next degradation gets its own notice.
-                degraded = None;
-                degraded_notice_sent = false;
+                // R34-w (merged_bug_003): the episode does NOT end
+                // here. A successful open is connection
+                // establishment, not witnessed work — the store routes
+                // every application refusal (authorize_tail NotFound,
+                // missing exec row, PG errors) through err_stream so
+                // the open succeeds and the in-body error becomes
+                // TransportErr->Reopen. Clearing on the open
+                // (merged_bug_003) reset the clock every 1s cycle on a
+                // persistently-refusing peer, and neither the 30s
+                // notice nor the per-episode warn could ever fire. The
+                // clear moves below, gated on the FIRST RELAYED CHUNK.
+                let relayed_before = last_relayed;
                 match drive_stream(
                     resp.into_inner(),
                     &derivation_path,
@@ -1130,7 +1140,41 @@ async fn run_tail(
                 .await
                 {
                     DriveEnd::OutputClosed => return,
-                    DriveEnd::Ended(cause) => cause,
+                    DriveEnd::Ended(cause) => {
+                        // The episode-ending event is WITNESSED WORK:
+                        // `degraded` clears only on the first relayed
+                        // chunk. A drive that ends with zero lines
+                        // relayed via err_stream (TransportErr) ARMS
+                        // the episode — that is the store's primary
+                        // refusal channel and exactly the dark-tail
+                        // shape the 30s notice exists for. A drive
+                        // that ends NaturalEnd with zero new lines is
+                        // an idle-but-healthy tail (a quiet build) and
+                        // neither clears nor arms — the conservative
+                        // form (a held-open stream that yields nothing
+                        // is not degradation, per the WO derivation).
+                        if last_relayed != relayed_before {
+                            degraded = None;
+                            degraded_notice_sent = false;
+                        } else if matches!(cause, TailStopCause::TransportErr) {
+                            let was_armed = degraded.is_some();
+                            degraded.get_or_insert_with(|| {
+                                let armed = Instant::now();
+                                (armed, armed + config.degraded_notice_after)
+                            });
+                            degraded_lane = "store refused in-stream";
+                            if !was_armed {
+                                warn!(
+                                    since_line,
+                                    "TailLog stream opened but the store refused in-stream \
+                                     before any line was relayed; live tail degraded \
+                                     (retrying every {:?})",
+                                    config.reconnect_backoff
+                                );
+                            }
+                        }
+                        cause
+                    }
                     DriveEnd::Gap => {
                         // The jump (and its withheld lines) is already
                         // recorded in `pending_gap`; the very next
@@ -2453,6 +2497,116 @@ mod tests {
             second.is_err(),
             "a second notice arrived in the same episode: {second:?}"
         );
+    }
+
+    /// W14-A4 (merged_bug_003 red-first, R34-w(i) — the err_stream
+    /// silent dark tail): the store opens successfully and answers
+    /// EVERY cycle through err_stream (an in-body Status — the
+    /// production refusal design for authorize_tail NotFound, missing
+    /// exec row, PG errors). Pre-fix RED: `degraded` was
+    /// unconditionally cleared on every successful open
+    /// (log_tail.rs:1113-1114), so the err_stream refusal reset the
+    /// episode every 1s cycle and neither the 30s notice nor the
+    /// per-episode warn could ever fire — a persistently-dark tail
+    /// with the open succeeding and zero notice/warn. The test
+    /// ASSERTING the notice DOES fire is the RED.
+    ///
+    /// Post-fix: the episode arms on the first zero-relayed
+    /// TransportErr drive, holds across the open-succeeds cycles, and
+    /// the notice fires once at the bound with the in-stream-refusal
+    /// lane.
+    #[tokio::test]
+    async fn err_stream_refusal_arms_degradation_and_notices_once() {
+        let mut config = test_config();
+        config.degraded_notice_after = Duration::from_millis(150);
+        let mut h = harness_with(config).await;
+        // Every open SUCCEEDS; every stream answers an in-body error
+        // before any line — the store's err_stream channel.
+        for _ in 0..200 {
+            h.mock
+                .push_script(vec![], SessionEnd::Error(tonic::Code::NotFound));
+        }
+        h.set.on_started(DRV, EXEC_A);
+
+        let notice = tokio::time::timeout(Duration::from_secs(2), h.out_rx.recv())
+            .await
+            .expect("the err_stream-armed notice must arrive within the bound (merged_bug_003)")
+            .expect("output channel open");
+        let text = String::from_utf8(notice.lines[0].clone()).expect("marker is UTF-8");
+        assert!(
+            text.contains("live log tail degraded for"),
+            "notice text: {text}"
+        );
+        assert!(
+            text.contains("store refused in-stream"),
+            "the err_stream lane must be named: {text}"
+        );
+
+        // One per episode: the in-stream refusal persists, no second
+        // notice.
+        let second = tokio::time::timeout(Duration::from_millis(400), h.out_rx.recv()).await;
+        assert!(
+            second.is_err(),
+            "a second notice arrived in the same episode: {second:?}"
+        );
+    }
+
+    /// W14-A5 (merged_bug_003, the occupancy witness + the
+    /// false-positive guard): (a) after an err_stream-armed
+    /// degradation, the FIRST genuinely relayed line clears the
+    /// episode — the next degradation gets its own notice; (b) an
+    /// idle-but-healthy open stream (NaturalEnd, zero new lines) does
+    /// NOT arm — a quiet build is not degradation.
+    #[tokio::test]
+    async fn relayed_line_clears_degradation_and_idle_healthy_does_not_arm() {
+        let mut config = test_config();
+        config.degraded_notice_after = Duration::from_millis(100);
+        config.reconnect_backoff = Duration::from_millis(20);
+        let mut h = harness_with(config).await;
+        // (b) Idle-but-healthy first: a few opens that close cleanly
+        // with zero lines (a quiet build between cuts). These must
+        // neither arm nor clear — `degraded` stays None.
+        for _ in 0..3 {
+            h.mock.push_script(vec![], SessionEnd::Close);
+        }
+        // (a) Then degrade: err_stream refusals arm the episode.
+        for _ in 0..12 {
+            h.mock
+                .push_script(vec![], SessionEnd::Error(tonic::Code::Internal));
+        }
+        // Then a relayed line clears it.
+        h.mock.push_script(vec![chunk(0, 1)], SessionEnd::Close);
+        // Then a SECOND degradation episode (must get its own notice).
+        for _ in 0..50 {
+            h.mock
+                .push_script(vec![], SessionEnd::Error(tonic::Code::Internal));
+        }
+        h.set.on_started(DRV, EXEC_A);
+
+        // First emission must be the notice (idle-healthy did not arm,
+        // so the err_stream refusals start the clock; the relayed
+        // line below comes AFTER the first notice in this scripting).
+        let first = tokio::time::timeout(Duration::from_secs(2), h.out_rx.recv())
+            .await
+            .expect("first notice")
+            .expect("channel open");
+        let text = String::from_utf8(first.lines[0].clone()).unwrap();
+        assert!(
+            text.contains("live log tail degraded"),
+            "first emission must be the degradation notice (idle-healthy must not \
+             have armed earlier): {text}"
+        );
+        // The relayed chunk (clears the episode).
+        let lines = recv_lines(&mut h.out_rx, 1).await;
+        assert_eq!(lines[0].0, 0, "the relayed line: {lines:?}");
+        // The SECOND notice — proves the relayed line cleared the
+        // episode (R34-w: the clear is occupancy, not the open).
+        let second = tokio::time::timeout(Duration::from_secs(2), h.out_rx.recv())
+            .await
+            .expect("second notice (the relayed line cleared the episode)")
+            .expect("channel open");
+        let text2 = String::from_utf8(second.lines[0].clone()).unwrap();
+        assert!(text2.contains("live log tail degraded"), "second: {text2}");
     }
 
     /// live_062: the user-facing open-failure lane projection is the
