@@ -235,6 +235,18 @@ let
     ];
   };
 
+  # TWO files for the open-attempts replay (mbt-rio-openattempts
+  # below): the live model (openAttemptsReplay's home) plus the
+  # bug_251 nonceless-mint calibration whose acceptance run the
+  # red-holders consume — same models/calibration layout law.
+  oaModel = lib.fileset.toSource {
+    root = modelsDir;
+    fileset = lib.fileset.unions [
+      (modelsDir + "/openAttempts.qnt")
+      (modelsDir + "/calibration/openattempts-nonceless-mint.qnt")
+    ];
+  };
+
   # The TLC backend's quint->TLA+ conversion goes through the bundled
   # Apalache acting as a gRPC server. When `quint verify` has to spawn
   # that server itself, two failure modes bite:
@@ -4950,6 +4962,58 @@ rec {
         # check that proved nothing.
         grep -E ' [1-9][0-9]* tests? run:' $out/log > /dev/null || {
           echo "mbt-rio-wedge: the mbt_replay filter matched no tests" >&2
+          exit 1
+        }
+      '';
+    };
+
+    # Implementation conformance for the openAttempts model (OP-1 /
+    # MBT-1): rio-scheduler/src/actor/tests/mbt_openattempts.rs
+    # replays named runs from openAttemptsReplay through the
+    # production materialization-claim lane — handle_pull_assignment
+    # (the store's fresh-claim shape incl. the bug_251 claim nonce),
+    # the credential-honored redelivery (same-exec asserted),
+    # handle_report_outcome consumption, and the establishment sweep
+    # expired through the production deadline seam — diffing the
+    # PG/actor-projected state (attempt / node / viewClaimed /
+    # clientHoldsResume / cancelDurable) after every step.
+    #
+    # Acceptance (OQ-12, the red-at-pre-fold form, W13-AW): the
+    # bug_251 trace in BOTH halves — the live oaSweepWindowRun
+    # (mint-lost -> redeliver -> legitimate establishment charge)
+    # replays GREEN, and the red-holders re-encode the PRE-FIX
+    # nonceless mint through the same production entrypoint: the
+    # per-step diff MUST red at the mint step's persisted credential,
+    # and the credential presentation MUST be refused where the fix
+    # redelivers (the calibration's oa251AcceptanceRun pins the
+    # model-side consequence: chargedNoFault). The harness proves it
+    # would catch the regression class it exists for, permanently.
+    mbt-rio-openattempts = mkNextestRun {
+      name = "mbt-rio-openattempts";
+      member = "rio-scheduler";
+      meta = mkNextestMeta { rio-scheduler = rioSchedulerTestBin; };
+      extraRuntimeInputs = [ pkgs.quint ];
+      extraArgs = [
+        "-E"
+        "package(rio-scheduler) and test(/mbt_openattempts/)"
+        "--run-ignored"
+        "all"
+      ];
+      preRun = ''
+        export RIO_MBT_OA_SPEC_PATH=$TMPDIR/ws/docs/spec/models/openAttempts.qnt
+      '';
+      postWsSetup = ''
+        mkdir -p $ws/docs/spec/models/calibration
+        cp ${oaModel}/openAttempts.qnt $ws/docs/spec/models/
+        cp ${oaModel}/calibration/openattempts-nonceless-mint.qnt \
+          $ws/docs/spec/models/calibration/
+      '';
+      postRun = ''
+        # Same no-tests guard as mbt-rio-lease: --no-tests=warn would
+        # otherwise turn a filter that matches nothing into a green
+        # check that proved nothing.
+        grep -E ' [1-9][0-9]* tests? run:' $out/log > /dev/null || {
+          echo "mbt-rio-openattempts: the mbt_openattempts filter matched no tests" >&2
           exit 1
         }
       '';

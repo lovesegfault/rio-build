@@ -46,4 +46,28 @@ module openAttemptsNoncelessMint {
     step,
     calibMintNonceless,
   }
+
+  /// The bug_251 acceptance trace, PRE-FIX half (OQ-12; the named-run
+  /// form pins the violation the twin's TLC search finds): the
+  /// nonceless mint loses its response with NOTHING persisted to
+  /// redeliver against, so the establishment sweep is enabled
+  /// immediately (`not(responseLost and clientHoldsResume)` holds
+  /// vacuously -- no credential) and the charge lands on a no-fault
+  /// attempt: `chargedNoFault` latches. rio-scheduler's
+  /// `mbt_openattempts` red-holders carry the implementation half:
+  /// the production mint PERSISTS the credential
+  /// (`assignments.claim_nonce`), so the same trace diverges at the
+  /// mint step's projected credential, and a nonceless mint's
+  /// credential presentation is REFUSED where the fix redelivers.
+  run oa251AcceptanceRun =
+    init
+      .then(calibMintNonceless)
+      .then(sweepEstablish)
+      .expect(and {
+        attempt == AClosedCharged,
+        chargedNoFault,
+        not(clientHoldsResume),
+        responseLost,
+        not(viewClaimed),
+      })
 }

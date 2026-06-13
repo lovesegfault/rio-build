@@ -133,7 +133,9 @@ fn out_path() -> String {
 // =======================================================================
 
 /// The model's `AttemptState` (ITF tag-decoded; the variant names are
-/// the model's exact constructors).
+/// the model's exact constructors, prefix and all — the tag is the
+/// decode key).
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, PartialEq, Deserialize)]
 #[serde(tag = "tag", content = "value")]
 enum ModelAttempt {
@@ -612,4 +614,74 @@ fn mbt_openattempts_run_happy_path() {
 #[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
 fn mbt_openattempts_run_sweep_window() {
     replay(&SWEEP_WINDOW, None).unwrap();
+}
+
+/// The OQ-12 acceptance, RED half #1 (W13-AW, the mbt_fence strawman
+/// form — the permanent red-holder): the live sweep-window trace with
+/// the mint OVERRIDDEN to the bug_251 PRE-FIX nonceless shape
+/// (`claim_nonce = None` through the same production entrypoint). The
+/// per-step diff MUST red at exactly the mint step on the projected
+/// credential: the model persists it (`clientHoldsResume` TRUE — the
+/// fix's transaction), the strawman leaves `assignments.claim_nonce`
+/// NULL. A green here means the harness can no longer observe the
+/// regression class it was built for.
+///
+/// Divergence record (the successor brief's sketch re-derived at the
+/// tree): the brief placed this red at the SWEEP step as a charge-row
+/// divergence — refuted: the establishment kernel
+/// (`establish_expired_attempt`) consumes (kind, node, probe,
+/// verifiable) and NO credential input, so an expired un-redelivered
+/// attempt charges identically in both worlds; the model's sweep
+/// guard `not(responseLost and clientHoldsResume)` is the
+/// WINDOW-ORDERING abstraction (store redelivery << establishment
+/// window), not a sweep-time conditional. The pre-fix calibration's
+/// own header states the real mechanism ("the kernel's
+/// colliding-identity refusal answered NotYetReady ... settled
+/// through the CHARGED establishment window") — the observable
+/// divergences are the persisted credential (this red) and the
+/// refused redelivery (the companion red below).
+#[test]
+#[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
+fn mbt_openattempts_nonceless_mint_reds_at_credential() {
+    let err = replay(&SWEEP_WINDOW, Some((0, Act::MintResponseLostNonceless)))
+        .expect_err("the nonceless mint must diverge from the live model");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("state divergence after step 1"),
+        "the divergence must land at the mint step (step 1); got:\n{msg}"
+    );
+    assert!(
+        msg.contains("client_holds_resume: true") && msg.contains("client_holds_resume: false"),
+        "the divergence must show the persisted-vs-absent credential; got:\n{msg}"
+    );
+}
+
+/// The OQ-12 acceptance, RED half #2 (the behavioral consequence,
+/// pinned through the production pull surface): after a NONCELESS
+/// mint with a lost response, the store's credential presentation is
+/// REFUSED — `redelivery_credential_ok` has no `assignments.claim_nonce`
+/// to match, the exact pre-fix shape whose establishment then charged
+/// a no-fault attempt (`oa251AcceptanceRun` pins the model-side
+/// consequence: `chargedNoFault`). The production mint's redelivery
+/// on the same presentation is the SWEEP_WINDOW green half.
+#[test]
+#[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
+fn mbt_openattempts_nonceless_redelivery_refused() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+    rt.block_on(async {
+        let mut sys = OaSystem::init().await.unwrap();
+        sys.apply(Act::MintResponseLostNonceless).await.unwrap();
+        let err = sys
+            .apply(Act::ResumeRedeliver)
+            .await
+            .expect_err("a nonceless mint's credential presentation must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("the implementation answered"),
+            "the refusal must surface as a non-Deliver answer; got:\n{msg}"
+        );
+    });
 }
