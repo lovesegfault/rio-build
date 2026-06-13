@@ -1673,6 +1673,26 @@ store Deployment's own replicas gating is keyed to `store.autoscaling.enabled`
 defines no store CR.) The controller's `/scale` patches use field-manager
 `rio-controller-componentscaler` (distinct from helm's apply manager).
 
+== Disposition (post-KEDA, recorded 2026-06-13)
+
+The reconciler is KEPT. Governed-population census at the wave-14
+base (#raw("[GEN-SET]"): `rg -n 'kind:\s*ComponentScaler' infra/helm/`):
+zero CR instances --- the only match is the CRD definition
+(`infra/helm/crds/componentscalers.rio.build.yaml:9`). Gateway and
+store scaling are KEDA-owned as of wave-13: `c9a9d163e` replaced the
+store ComponentScaler CR with `templates/store-scaledobject.yaml`;
+`templates/gateway-scaledobject.yaml` owns the gateway replica
+count. The reconciler code, the CRD, and the rules in this section
+remain the contract for any future CR target --- absence of CRs at
+this base is not evidence the reconciler is dead code (R26); the
+predictive `builders/ratio` model is the design of record for
+targets KEDA's metric-threshold triggers cannot express. Retirement,
+if chosen later, is owner-scheduled follow-on work; this record
+makes the currently-ungoverned state explicit so the round-14 fixes
+above do not read as live-traffic changes. The census command is the
+re-derivable artifact: a CR appearing in a future chart re-runs the
+same generator and the disposition re-evaluates.
+
 = GC Cron
 
 #r("ctrl.gc.startup-delay")[
