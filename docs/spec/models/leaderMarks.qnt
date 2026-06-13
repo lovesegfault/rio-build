@@ -90,6 +90,14 @@ module leaderMarks {
   /// bughunt-13 F1; 0 = disabled). Priced exactly like MAX_STRIPS:
   /// the budget form every environment action carries.
   const MAX_ADDS: int
+  /// Failed verify attempts per trace (bughunt-13 F3; 0 = disabled).
+  /// Production's verify GET fails (apiserver error/timeout) and the
+  /// loop skips to the next cadence point having learned NOTHING —
+  /// the pre-F3 model's verify was infallible, so the wired two-term
+  /// divergence bound silently assumed every attempt succeeds; one
+  /// real failure exceeded it. Budgeted like every other environment
+  /// action; the divergence bounds carry the failure term.
+  const MAX_VERIFY_FAILS: int
   /// Holder changes per trace (state-space bound).
   const MAX_HOLDER_CHANGES: int
   /// Rebound edges per trace (the merged_bug_212 dirtying site;
@@ -160,6 +168,8 @@ module leaderMarks {
   var strips: int
   /// External adds so far (the F1 polarity).
   var adds: int
+  /// Failed verify attempts so far (the F3 fallibility).
+  var verifyFails: int
   /// Holder changes so far.
   var holderChanges: int
   /// Rebound edges so far.
@@ -178,6 +188,16 @@ module leaderMarks {
     m.get(p) != leadingOf(p, h)
   /// DirtyGen.dirty: the derived flag (production is_dirty()).
   def dirty: bool = marked > cleared
+
+  /// The discovery bound under FALLIBLE verification (bughunt-13 F3):
+  /// the first cadence term covers the next attempt; each budgeted
+  /// failure (a GET error/timeout that consumes the cadence point and
+  /// learns nothing) defers one full cadence; the parking term covers
+  /// a falsification landing inside the Patched window. Pre-F3 the
+  /// bounds used the bare two-term form — one real failure exceeded
+  /// it (divergenceWithinTwoTermBound, the wired twin, pins exactly
+  /// that).
+  def discoveryBound: int = (1 + MAX_VERIFY_FAILS) * VERIFY_EVERY + TASK_TIMEOUT
 
   /// THE single divergence stamp, applied in every action's frame:
   /// newly-wrong stamps now, still-wrong keeps its stamp, converged
@@ -202,6 +222,7 @@ module leaderMarks {
     clock <= MAX_TIME,
     strips <= MAX_STRIPS,
     adds <= MAX_ADDS,
+    verifyFails <= MAX_VERIFY_FAILS,
     holderChanges <= MAX_HOLDER_CHANGES,
     rebounds <= MAX_REBOUNDS,
     cleared <= marked,
@@ -235,7 +256,7 @@ module leaderMarks {
           wrongCause.get("us") == ByStrip,
           wrongCause.get("us") == ByAdd,
         },
-        clock - wrongSince.get("us") <= VERIFY_EVERY + TASK_TIMEOUT,
+        clock - wrongSince.get("us") <= discoveryBound,
       },
     }
 
@@ -249,7 +270,7 @@ module leaderMarks {
   /// comment; this val is that argument, checked.
   val peerDivergenceBounded =
     wrongUnder(marks, holder, "other") implies
-      clock - wrongSince.get("other") <= VERIFY_EVERY + TASK_TIMEOUT
+      clock - wrongSince.get("other") <= discoveryBound
 
   /// THE F1 BOUND, named: a NON-leading pod carrying leader marks —
   /// the falsifier class the leader-only Service routes on (`kubectl
@@ -265,7 +286,7 @@ module leaderMarks {
   val nonLeaderDivergenceBounded = PODS.forall(p =>
     (not(leadingOf(p, holder)) and marks.get(p)) implies or {
       p == "us" and (dirty or task != NoTask),
-      clock - wrongSince.get(p) <= VERIFY_EVERY + TASK_TIMEOUT,
+      clock - wrongSince.get(p) <= discoveryBound,
     })
 
   /// The DirtyGen arithmetic itself: no clear ever erases a
@@ -315,6 +336,25 @@ module leaderMarks {
   /// pattern, same as noStrip).
   val noAdd = adds == 0
 
+  /// Witness (expect-violation): the verify failure actually fires —
+  /// the widened discoveryBound verdicts are about a space where the
+  /// apiserver actually fails attempts (bughunt-13 F3).
+  val noVerifyFail = verifyFails == 0
+
+  /// THE PRE-F3 TWO-TERM BOUND, kept as the wired falsify twin
+  /// (expect-violation in the base regime): with verify fallible, a
+  /// SINGLE failed attempt defers discovery one full cadence past
+  /// this form — the audit's exact finding ("one failure exceeds the
+  /// wired 2-term bound"). If this ever stops violating, either the
+  /// failure letter went dead (noVerifyFail catches that
+  /// independently) or the bound derivation regressed.
+  val divergenceWithinTwoTermBound =
+    wrongUnder(marks, holder, "us") implies or {
+      dirty,
+      task != NoTask,
+      clock - wrongSince.get("us") <= VERIFY_EVERY + TASK_TIMEOUT,
+    }
+
   /// Witness (expect-violation): the rebound dirtying site actually
   /// fires — the notClobbered verdict covers the post-212 writer set,
   /// not just the original edges.
@@ -339,7 +379,7 @@ module leaderMarks {
     // The peer pod's own cadence obligation (its loop is environment;
     // the same machinery runs there by construction).
     wrongUnder(marks, holder, "other") implies
-      (clock + 1 - wrongSince.get("other") <= VERIFY_EVERY + TASK_TIMEOUT),
+      (clock + 1 - wrongSince.get("other") <= discoveryBound),
     // The task-residency cap (production patch_timeout/call_timeout):
     // an in-flight API call cannot park past its request deadline —
     // the round after TASK_TIMEOUT it has either completed or failed.
@@ -347,7 +387,7 @@ module leaderMarks {
     clock' = clock + 1,
     holder' = holder, marks' = marks, marked' = marked,
     cleared' = cleared, task' = task,
-    lastVerify' = lastVerify, strips' = strips, adds' = adds,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails,
     holderChanges' = holderChanges, rebounds' = rebounds,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock + 1),
@@ -366,7 +406,7 @@ module leaderMarks {
     marked' = if (leadingOf("us", h) != leadingOf("us", holder)) marked + 1 else marked,
     cleared' = cleared,
     marks' = marks, task' = task, clock' = clock,
-    lastVerify' = lastVerify, strips' = strips, adds' = adds,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails,
     holderChanges' = holderChanges + 1, rebounds' = rebounds,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, h, wrongSince, clock),
@@ -386,7 +426,7 @@ module leaderMarks {
     marked' = marked + 1,
     cleared' = cleared,
     holder' = holder, marks' = marks, task' = task, clock' = clock,
-    lastVerify' = lastVerify, strips' = strips, adds' = adds,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails,
     holderChanges' = holderChanges, rebounds' = rebounds + 1,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock),
@@ -405,7 +445,7 @@ module leaderMarks {
     holder' = holder, marked' = marked, cleared' = cleared,
     task' = task, clock' = clock,
     lastVerify' = lastVerify, holderChanges' = holderChanges,
-    adds' = adds,
+    adds' = adds, verifyFails' = verifyFails,
     rebounds' = rebounds, clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks.put(p, false), holder, wrongSince, clock),
     wrongCause' = stampCause(marks.put(p, false), holder, wrongSince, wrongCause, ByStrip),
@@ -426,6 +466,7 @@ module leaderMarks {
     not(marks.get(p)),
     marks' = marks.put(p, true),
     adds' = adds + 1,
+    verifyFails' = verifyFails,
     holder' = holder, marked' = marked, cleared' = cleared,
     task' = task, clock' = clock,
     lastVerify' = lastVerify, holderChanges' = holderChanges,
@@ -448,7 +489,7 @@ module leaderMarks {
     marks' = marks.put("other", leadingOf("other", holder)),
     holder' = holder, marked' = marked, cleared' = cleared,
     task' = task, clock' = clock,
-    lastVerify' = lastVerify, strips' = strips, adds' = adds,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails,
     holderChanges' = holderChanges, rebounds' = rebounds,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks.put("other", leadingOf("other", holder)), holder, wrongSince, clock),
@@ -471,6 +512,33 @@ module leaderMarks {
     marked' = if (wrongUnder(marks, holder, "us")) marked + 1 else marked,
     cleared' = cleared,
     holder' = holder, marks' = marks, task' = task, clock' = clock,
+    strips' = strips, adds' = adds, verifyFails' = verifyFails, holderChanges' = holderChanges,
+    rebounds' = rebounds, clobberErased' = clobberErased,
+    wrongSince' = stampWrong(marks, holder, wrongSince, clock),
+    wrongCause' = stampCause(marks, holder, wrongSince, wrongCause, NoCause),
+  }
+
+  /// The verify attempt FAILS (bughunt-13 F3): the GET errors or
+  /// times out — the cadence point is consumed (production skips to
+  /// the next multiple; lastVerify moves exactly as for a successful
+  /// attempt) but NOTHING is learned: no comparison, no mark, the
+  /// divergence stays undiscovered for one more cadence. Budgeted
+  /// like every other environment action; the pre-F3 model omitted
+  /// this letter entirely, which is how the wired two-term bound
+  /// silently assumed an infallible apiserver. Production's lane is
+  /// loud (warn-after-K-consecutive + the
+  /// rio_lease_marks_verify_failures_total counter) — the failure IS
+  /// evidence.
+  // Environment: the apiserver failing the verify GET (error/timeout) — spawn_verify_leader_marks err arms; budgeted MAX_VERIFY_FAILS; the cadence point is consumed with nothing learned
+  action verifyFail = all {
+    verifyFails < MAX_VERIFY_FAILS,
+    not(dirty),
+    task == NoTask,
+    lastVerify' = clock,
+    verifyFails' = verifyFails + 1,
+    marked' = marked,
+    cleared' = cleared,
+    holder' = holder, marks' = marks, task' = task, clock' = clock,
     strips' = strips, adds' = adds, holderChanges' = holderChanges,
     rebounds' = rebounds, clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock),
@@ -488,7 +556,7 @@ module leaderMarks {
     task' = Reconcile({ polarity: leadingOf("us", holder), sweepHolder: holder, snap: marked, since: clock }),
     holder' = holder, marks' = marks, marked' = marked,
     cleared' = cleared, clock' = clock,
-    lastVerify' = lastVerify, strips' = strips, adds' = adds,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails,
     holderChanges' = holderChanges, rebounds' = rebounds,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock),
@@ -538,7 +606,7 @@ module leaderMarks {
       task' = Patched({ snap: taskSnap, since: taskSince }),
       holder' = holder, marked' = marked, cleared' = cleared,
       clock' = clock, lastVerify' = lastVerify,
-      strips' = strips, adds' = adds, holderChanges' = holderChanges,
+      strips' = strips, adds' = adds, verifyFails' = verifyFails, holderChanges' = holderChanges,
       rebounds' = rebounds, clobberErased' = clobberErased,
       wrongSince' = stampWrong(newMarks, holder, wrongSince, clock),
       wrongCause' = stampCause(newMarks, holder, wrongSince, wrongCause, ByWrite),
@@ -564,7 +632,7 @@ module leaderMarks {
       task' = NoTask,
       holder' = holder, marks' = marks, marked' = marked,
       clock' = clock, lastVerify' = lastVerify,
-      strips' = strips, adds' = adds, holderChanges' = holderChanges,
+      strips' = strips, adds' = adds, verifyFails' = verifyFails, holderChanges' = holderChanges,
       rebounds' = rebounds,
       wrongSince' = stampWrong(marks, holder, wrongSince, clock),
       wrongCause' = stampCause(marks, holder, wrongSince, wrongCause, NoCause),
@@ -580,7 +648,7 @@ module leaderMarks {
     task' = NoTask,
     holder' = holder, marks' = marks, marked' = marked,
     cleared' = cleared, clock' = clock,
-    lastVerify' = lastVerify, strips' = strips, adds' = adds,
+    lastVerify' = lastVerify, strips' = strips, adds' = adds, verifyFails' = verifyFails,
     holderChanges' = holderChanges, rebounds' = rebounds,
     clobberErased' = clobberErased,
     wrongSince' = stampWrong(marks, holder, wrongSince, clock),
@@ -599,6 +667,7 @@ module leaderMarks {
     lastVerify' = 0,
     strips' = 0,
     adds' = 0,
+    verifyFails' = 0,
     holderChanges' = 0,
     rebounds' = 0,
     clobberErased' = false,
@@ -632,6 +701,7 @@ module leaderMarks {
     externalAddAny,
     otherLoopConverge,
     verify,
+    verifyFail,
     reconcileSpawn,
     reconcilePatched,
     reconcileClear,
@@ -729,15 +799,25 @@ module leaderMarks {
 
 // =========================================================================
 // The wired regime: small cadence, one strip, ONE ADD (the F1
-// polarity), two holder changes, one rebound.
+// polarity), ONE verify failure (the F3 fallibility — the widened
+// discoveryBound is exercised, and the pre-F3 two-term bound twin
+// violates here), two holder changes, one rebound. The cadence/parking
+// proportions are PRODUCTION-SHAPED since F3: TASK_TIMEOUT <
+// VERIFY_EVERY (a verify call deadline is ~1 renew round, far under
+// the 12-round cadence) — the pre-F3 constants had the parking term
+// LARGER than the cadence, which let the two-term bound absorb a
+// failure by sheer slack and would have made the F3 twin
+// unfalsifiable (the "bound survives only by unpinned constant
+// margins" face of the audit's F4, dying here a commit early).
 module leaderMarksBase {
   import leaderMarks(
-    VERIFY_EVERY = 3,
+    VERIFY_EVERY = 4,
     MAX_TIME = 10,
     MAX_STRIPS = 1,
     MAX_ADDS = 1,
+    MAX_VERIFY_FAILS = 1,
     MAX_HOLDER_CHANGES = 2,
     MAX_REBOUNDS = 1,
-    TASK_TIMEOUT = 4
+    TASK_TIMEOUT = 2
   ).*
 }

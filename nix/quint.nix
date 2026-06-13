@@ -1771,9 +1771,14 @@ rec {
     # production level by peer_sweep_spares_current_lease_holder; its
     # spawn-to-complete TOCTOU residual is now CHECKED rather than
     # commented — the victim's own loop re-discovers within the
-    # peerDivergenceBounded window. Measured: exhaustive TLC ~13s at
-    # the wired constants (transcript in the introducing commit) —
-    # the default 1800s budget is >100x headroom.
+    # peerDivergenceBounded window. The verify is FALLIBLE since F3
+    # (verifyFail consumes the cadence point and learns nothing,
+    # budgeted MAX_VERIFY_FAILS; the bounds carry the failure term via
+    # discoveryBound, and the production-shaped TASK_TIMEOUT <
+    # VERIFY_EVERY proportions make the pre-F3 two-term bound twin
+    # falsifiable). Measured: exhaustive TLC ~35s at the wired
+    # constants (transcript in the introducing commit) — the default
+    # 1800s budget is ~50x headroom.
     # r[verify sched.lease.marks-verify+2]
     # r[verify sched.lease.deletion-cost+3]
     quint-leader-marks = mkQuintCheck {
@@ -1819,6 +1824,28 @@ rec {
       spec = "leaderMarks";
       main = "leaderMarksBase";
       witness = "noPeerMarks";
+    };
+
+    # Non-vacuity witness (bughunt-13 F3): the verify FAILURE actually
+    # fires — the widened discoveryBound verdicts above are about a
+    # space where the apiserver fails attempts.
+    quint-leader-marks-witness-verify-fail = mkQuintWitnessCheck {
+      name = "leader-marks-witness-verify-fail";
+      spec = "leaderMarks";
+      main = "leaderMarksBase";
+      witness = "noVerifyFail";
+    };
+
+    # F3 falsify twin (expect-violation): the PRE-F3 two-term bound —
+    # one failed verify attempt defers discovery a full cadence past
+    # it, the audit's exact finding ("one failure exceeds the wired
+    # 2-term bound"). Violating here is what proves the failure term
+    # in discoveryBound is load-bearing, not slack.
+    quint-leader-marks-twin-two-term-bound = mkQuintWitnessCheck {
+      name = "leader-marks-twin-two-term-bound";
+      spec = "leaderMarks";
+      main = "leaderMarksBase";
+      witness = "divergenceWithinTwoTermBound";
     };
 
     # Non-vacuity witness: the rebound dirtying site actually fires in

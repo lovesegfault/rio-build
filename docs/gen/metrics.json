@@ -92,6 +92,7 @@
     "rio_gateway_putpath_aborted_retries_total",
     "rio_gateway_putpath_retry_events_total",
     "rio_gateway_quota_rejections_total",
+    "rio_lease_marks_verify_failures_total",
     "rio_lease_standby_marks_strips_total",
     "rio_scheduler_actor_admin_fast_delivery_seconds",
     "rio_scheduler_actor_cmd_seconds",
@@ -743,6 +744,11 @@
       }
     ],
     "lease": [
+      {
+        "name": "rio_lease_marks_verify_failures_total",
+        "kind": "counter",
+        "help": "Failed leader-marks verify attempts (GET error or timeout, either polarity). Each failure defers divergence discovery one verify interval; a sustained rate means the verify lane is down (RBAC, webhook) and the fleet has silently reverted to the pre-verify world. The log escalates to WARN after consecutive failures."
+      },
       {
         "name": "rio_lease_standby_marks_strips_total",
         "kind": "counter",

@@ -330,6 +330,24 @@ pub const MARKS_VERIFY_EVERY: u64 = 12;
 /// previously did not have.
 pub const STANDBY_MARKS_STRIPS_TOTAL: &str = "rio_lease_standby_marks_strips_total";
 
+/// Counter bumped on every FAILED verify attempt (GET error or
+/// timeout, either polarity). The failure IS evidence: each failed
+/// attempt defers divergence discovery one full verify interval, and a
+/// PERSISTENT failure (RBAC `get pods` revoked, a webhook rejecting
+/// reads) silently reverts the fleet to the pre-verify world — the
+/// model prices exactly this with its budgeted `verifyFail` letter and
+/// the failure term in its discovery bound
+/// (docs/spec/models/leaderMarks.qnt).
+pub const MARKS_VERIFY_FAILURES_TOTAL: &str = "rio_lease_marks_verify_failures_total";
+
+/// Consecutive verify failures after which the failure log escalates
+/// from debug to WARN. One or two failures are apiserver weather (the
+/// next interval retries, the bound holds with its failure term);
+/// `MARKS_VERIFY_WARN_AFTER` consecutive means the verify lane itself
+/// is down — at the 12-round cadence that is ≥ ~3 minutes of nobody
+/// re-examining marks, the persistent-RBAC face the audit's F3 named.
+const MARKS_VERIFY_WARN_AFTER: u64 = 3;
+
 /// Register HELP text for the rio-lease metric family. Called once at
 /// lease-loop start, so the names are described in every binary that
 /// hosts an election loop (rio-scheduler and rio-controller) before
@@ -351,6 +369,18 @@ fn describe_lease_metrics() {
          self-check (each detection re-dirties the marks; the next reconcile \
          strips them). Expected zero: any increment is an external marks \
          falsifier live on this pod."
+    );
+    debug_assert_eq!(
+        MARKS_VERIFY_FAILURES_TOTAL,
+        "rio_lease_marks_verify_failures_total"
+    );
+    metrics::describe_counter!(
+        "rio_lease_marks_verify_failures_total",
+        "Failed leader-marks verify attempts (GET error or timeout, either \
+         polarity). Each failure defers divergence discovery one verify \
+         interval; a sustained rate means the verify lane is down (RBAC, \
+         webhook) and the fleet has silently reverted to the pre-verify \
+         world. The log escalates to WARN after consecutive failures."
     );
 }
 
@@ -2331,6 +2361,11 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     // sweep a successor's) after shutdown; SlotRelease's Drop runs on
     // abort, so the slot is released either way.
     let mut inflight_marks: Option<tokio::task::JoinHandle<()>> = None;
+    // Consecutive verify-failure streak (F3's loud lane): reset by any
+    // successful verify GET; the failure arms count every failure and
+    // escalate to WARN at MARKS_VERIFY_WARN_AFTER. Arc: the detached
+    // verify task owns a clone.
+    let marks_verify_fail_streak = Arc::new(AtomicU64::new(0));
     // Blind-window clock on the injected fence clock (production:
     // CLOCK_BOOTTIME — advances across host suspend, so a suspend
     // straddling SELF_FENCE_AFTER fences at the first post-resume
@@ -3248,6 +3283,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 now_leading,
                 &marks_dirty,
                 &marks_patch_in_flight,
+                &marks_verify_fail_streak,
                 renew_deadline,
             )
         {
@@ -4555,9 +4591,12 @@ fn marks_match(
 /// them; each detection additionally bumps
 /// [`STANDBY_MARKS_STRIPS_TOTAL`] — expected zero from honest fleets,
 /// so any increment IS the falsifier class live. A GET failure leaves
-/// the marks untouched (the next verify interval retries) but is LOUD:
-/// a persistently failing verify is the silent revert to the
-/// pre-verify world, so the failure arms log at WARN, not debug. A
+/// the marks untouched (the next verify interval retries) but is
+/// COUNTED ([`MARKS_VERIFY_FAILURES_TOTAL`], every failure) and LOUD
+/// when persistent (WARN from [`MARKS_VERIFY_WARN_AFTER`] consecutive
+/// failures; below that, debug — apiserver weather): a persistently
+/// failing verify is the silent revert to the pre-verify world, and
+/// the failure IS evidence. A
 /// polarity gone stale mid-flight at worst re-dirties
 /// ([`DirtyGen::mark`]), which is always safe (one no-op PATCH) — and
 /// a mark is never erased by a concurrent reconcile's clear (the
@@ -4568,6 +4607,7 @@ fn spawn_verify_leader_marks(
     leading: bool,
     marks_dirty: Arc<DirtyGen>,
     patch_in_flight: Arc<AtomicBool>,
+    fail_streak: Arc<AtomicU64>,
     call_timeout: Duration,
 ) -> tokio::task::JoinHandle<()> {
     let namespace = cfg.namespace.clone();
@@ -4586,6 +4626,7 @@ fn spawn_verify_leader_marks(
         let pods: Api<Pod> = Api::namespaced(client, &namespace);
         match tokio::time::timeout(call_timeout, pods.get(&pod_name)).await {
             Ok(Ok(pod)) => {
+                fail_streak.store(0, Ordering::SeqCst);
                 if !marks_match(&pod.metadata, leading, label.as_ref()) {
                     if leading {
                         warn!(
@@ -4613,10 +4654,38 @@ fn spawn_verify_leader_marks(
                 }
             }
             Ok(Err(e)) => {
-                warn!(%pod_name, leading, error = %e, "leader-marks verify GET failed; next interval retries");
+                // Count every failure; escalate to WARN once the
+                // streak says the verify LANE is down (persistent
+                // RBAC/webhook denial) rather than the weather being
+                // bad — each failure defers discovery one interval,
+                // and a streak silently reverts the fleet to the
+                // pre-verify world (the model's budgeted verifyFail
+                // letter + discovery-bound failure term price exactly
+                // this).
+                let streak = fail_streak.fetch_add(1, Ordering::SeqCst) + 1;
+                metrics::counter!(MARKS_VERIFY_FAILURES_TOTAL).increment(1);
+                if streak >= MARKS_VERIFY_WARN_AFTER {
+                    warn!(
+                        %pod_name, leading, error = %e, consecutive = streak,
+                        "leader-marks verify keeps failing — the verify lane is \
+                         down and marks falsifiers are unbounded until it recovers"
+                    );
+                } else {
+                    debug!(%pod_name, leading, error = %e, consecutive = streak, "leader-marks verify GET failed; next interval retries");
+                }
             }
             Err(_) => {
-                warn!(%pod_name, leading, timeout = ?call_timeout, "leader-marks verify GET timed out; next interval retries");
+                let streak = fail_streak.fetch_add(1, Ordering::SeqCst) + 1;
+                metrics::counter!(MARKS_VERIFY_FAILURES_TOTAL).increment(1);
+                if streak >= MARKS_VERIFY_WARN_AFTER {
+                    warn!(
+                        %pod_name, leading, timeout = ?call_timeout, consecutive = streak,
+                        "leader-marks verify keeps timing out — the verify lane is \
+                         down and marks falsifiers are unbounded until it recovers"
+                    );
+                } else {
+                    debug!(%pod_name, leading, timeout = ?call_timeout, consecutive = streak, "leader-marks verify GET timed out; next interval retries");
+                }
             }
         }
     })
@@ -4646,6 +4715,7 @@ fn maybe_spawn_verify_leader_marks(
     leading: bool,
     marks_dirty: &Arc<DirtyGen>,
     patch_in_flight: &Arc<AtomicBool>,
+    fail_streak: &Arc<AtomicU64>,
     call_timeout: Duration,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !marks_dirty.is_dirty() && !patch_in_flight.swap(true, Ordering::SeqCst) {
@@ -4655,6 +4725,7 @@ fn maybe_spawn_verify_leader_marks(
             leading,
             Arc::clone(marks_dirty),
             Arc::clone(patch_in_flight),
+            Arc::clone(fail_streak),
             call_timeout,
         ))
     } else {
@@ -10329,15 +10400,26 @@ mod tests {
         loop_task.await.expect("lease loop exits");
     }
 
-    /// W13-I4 (the c1 structural half): a persistently failing
+    /// W13-I4 + W13-K (the F3 lane): a persistently failing
     /// self-check GET wedges nothing — the marks stay untouched, the
     /// single-flight slot is released every interval, and the next
     /// multiple retries (observable as repeated verify GETs under
-    /// FailFast). The loudness lane (per-failure WARN at this commit;
-    /// the counter + WARN-after-K calibration is the F3 close's
-    /// refinement) rides the same err arms.
+    /// FailFast) — and the failure lane is COUNTED:
+    /// rio_lease_marks_verify_failures_total climbs once per failed
+    /// attempt (the WARN escalation rides the same streak from
+    /// MARKS_VERIFY_WARN_AFTER consecutive). Pre-F3 the err arms were
+    /// debug-only with no counter: persistent RBAC denial reverted the
+    /// fleet to the pre-verify world with ZERO non-debug evidence (the
+    /// red recorded in the introducing commit body — the counter
+    /// assertion below fails with 0 == n against the pre-fix arms).
     #[tokio::test(start_paused = true)]
     async fn standby_self_check_get_failure_releases_slot_and_retries() {
+        // Failures fire inside the spawned verify task — recorder
+        // global, snapshot exactly once ((ppppp)).
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        rec.install().expect("install global debugging recorder");
+
         let (client, mock) = MockApiServer::new();
         mock.seed(foreign_lease(0));
         mock.seed_pod("us", pod_ok("us"));
@@ -10391,6 +10473,26 @@ mod tests {
             mock.pod("us").expect("pod")["metadata"]["annotations"][POD_DELETION_COST_ANNOTATION],
             json!("0"),
             "a failing verify changes no marks"
+        );
+
+        // W13-K: every failed attempt is counted — the failure IS
+        // evidence (pre-F3: zero counter, debug-only logs).
+        let failed_verify_gets = (gets_after - gets_before) as u64;
+        let failures: u64 = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _, _, value)| {
+                (key.key().name() == MARKS_VERIFY_FAILURES_TOTAL).then_some(value)
+            })
+            .map(|v| match v {
+                metrics_util::debugging::DebugValue::Counter(c) => c,
+                other => panic!("failure metric must be a counter, got {other:?}"),
+            })
+            .sum();
+        assert_eq!(
+            failures, failed_verify_gets,
+            "one counter increment per failed verify attempt"
         );
 
         shutdown.cancel();
