@@ -240,7 +240,7 @@ impl PlacedTick {
         tick
     }
 
-    // r[impl ctrl.pool.window-visibility]
+    // r[impl ctrl.pool.window-visibility+2]
     /// Whether `intent_id` held a live POD at sim time — the pod
     /// half of the demand-holding axis (merged_bug_047). Orthogonal
     /// to [`Self::disposition`]: held × placed-in-flight is the

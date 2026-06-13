@@ -364,7 +364,7 @@ the page despite restart-totality/continuity contracts (merged_bug_049).
 The completeness witness already rode the wire (`truncated`); this rule
 makes consuming it structural rather than per-consumer diligence.
 
-#r("ctrl.pool.window-visibility")[
+#r("ctrl.pool.window-visibility+2")[
   Demand-visibility is the DEFAULT for any intent with a live Job:
   the FFD tick's `job_held` set MUST travel inside the published
   placeable tick, and the gate fold MUST keep a held intent
@@ -375,11 +375,17 @@ makes consuming it structural rather than per-consumer diligence.
   disposition: it either THREADS the held set (held intents survive
   the narrowing by page-type construction, regardless of the per-arm
   predicate) or declares itself LOSSY, which degrades the coverage
-  letter to Incomplete inside the absence lane's sole constructor ---
-  a completeness witness binds to the view it was minted from, and a
-  policy mutation after the mint must never type-check into
-  true-negative absence evidence.
+  letter at the page itself --- the letter's single read path, so
+  every reader class binds the degraded letter
+  (#rref("ctrl.pool.letter-degrades-whole")) --- a completeness
+  witness binds to the view it was minted from, and a policy mutation
+  after the mint must never type-check into true-negative absence
+  evidence.
 ]
+The `+2` revision relocated the degradation site: the letter now
+degrades AT THE PAGE (the bug_064 close) rather than "inside the
+absence lane's sole constructor" --- the old wording was the bug's
+own quantifier (only absence consumers paid the lossy witness).
 The premise this law replaces --- "an in-flight placement normally
 has no Job" --- was falsified by the same wave-10 commit that stated
 it: the admission window's `job_held` exemption admits held intents
@@ -419,6 +425,30 @@ the 10s grace, no strike, no attempt veto. Two inventories defining
 one predicate diverge exactly under the lag regime where the consumer
 deletes; the union producer (`demand_held_intents`) is the R33 form:
 one quantity, one producer, every consumer imports.
+
+#r("ctrl.pool.letter-degrades-whole")[
+  A degraded evidence letter MUST be degraded for every reader class
+  before any consumer binds it: the demand-coverage letter lives ON
+  the page, has exactly ONE read path (the page accessor, fusing
+  transport truncation with every lossy narrowing since the mint),
+  and no count, bound, or absence consumer can obtain a less-degraded
+  copy. The letter's reader census MUST derive from the LETTER TYPE's
+  consult grammar (every accessor consult and letter bind), never
+  from the readers of one wrapper.
+]
+
+The round-13 instance (bug_064): the merged_bug_047 close fused the
+lossy bit "inside the absence lane's sole constructor" and its census
+quantified over readers-of-WantMap --- but the letter had a second
+reader class: the bound lane read the raw transport copy
+(`DemandEvidence.complete`) split off the page before the narrowings,
+so a lossy gate fold (an active Job with no parseable intent-id)
+suspended only the orphan reap while `reap_excess_pending`
+foreground-deleted still-wanted Pending Jobs against the understated
+count, and the warn disclosed only the suspended half. A plain census
+over `.coverage()` consult sites would have surfaced the sibling
+consumer; the reader census is now type-derived and the raw copy no
+longer exists to read.
 
 #r("ctrl.pool.echo-provenance")[
   Echo-integrity laws carry a PROVENANCE axis: the spawn-time

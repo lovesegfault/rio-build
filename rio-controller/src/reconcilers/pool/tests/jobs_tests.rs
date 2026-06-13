@@ -4822,7 +4822,7 @@ async fn w10_ai_deferred_intent_stays_demand_visible_not_spawnable() {
     assert_eq!(tick.disposition("ghost"), FfdDisposition::Unplaced);
 }
 
-// r[verify ctrl.pool.window-visibility]
+// r[verify ctrl.pool.window-visibility+2]
 /// **W11-AK (merged_bug_047 — R26 lens + R25 letter law), the unit
 /// face.** A job_held intent placed IN-FLIGHT (the window exemption
 /// admits held intents to the fit-check; the fit-check can land them
@@ -4884,7 +4884,7 @@ async fn w11_ak_held_in_flight_placement_stays_demand_visible() {
     assert!(tick.held("held1") && !tick.held("fly0"));
 }
 
-// r[verify ctrl.pool.window-visibility]
+// r[verify ctrl.pool.window-visibility+2]
 /// **W11-AK, the end-to-end face (the red's home):** a held Pending
 /// intent re-placed in-window onto an unregistered claim — pre-fix
 /// the gate fold stripped it while the Complete witness survived the
@@ -4975,7 +4975,7 @@ async fn w11_ak_held_pending_job_not_orphan_deleted_end_to_end() {
     guard.verified().await;
 }
 
-// r[verify ctrl.pool.window-visibility]
+// r[verify ctrl.pool.window-visibility+2]
 /// **W11-AK, the witness-degradation belt:** a LOSSY narrowing of a
 /// witnessed page degrades the coverage letter inside the absence
 /// lane's sole constructor — the stripped intent's Job reads

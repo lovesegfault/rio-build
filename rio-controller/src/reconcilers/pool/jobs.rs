@@ -1603,7 +1603,7 @@ pub(crate) struct IntentPage {
     transport_complete: bool,
 }
 
-// r[impl ctrl.pool.window-visibility]
+// r[impl ctrl.pool.window-visibility+2]
 /// What one [`IntentPage::retain_page`] narrowing means for the
 /// absence lane — every retain on a witnessed page type states its
 /// disposition (merged_bug_047: the R26 completeness witness binds to
@@ -1860,7 +1860,7 @@ pub(crate) fn reap_queued_known(
 /// clear + `false` when unarmed (no FFD tick yet / standby replica) so
 /// `queued_known = None` keeps `reap_excess_pending` fail-closed.
 // r[impl ctrl.nodeclaim.placeable-gate+5]
-// r[impl ctrl.pool.window-visibility]
+// r[impl ctrl.pool.window-visibility+2]
 pub(crate) fn apply_placeable_gate(
     page: &mut IntentPage,
     gate: &crate::reconcilers::nodeclaim_pool::PlaceableGate,
@@ -6024,5 +6024,193 @@ mod echo_provenance_census {
             err.contains("skeleton unrecognized"),
             "grammar-refusal plant: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod letter_reader_census {
+    //! **W13-B3 (bug_064, R31′(ii)): the DemandCoverage LETTER-reader
+    //! census** — consumers derived from the LETTER TYPE's grammar,
+    //! never from one wrapper's readers. The merged_bug_047 census
+    //! quantified over readers-of-WantMap ("no absence consumer can
+    //! read the un-degraded letter") and missed the sibling reader
+    //! class entirely: the bound lane's raw `DemandEvidence.complete`
+    //! read at the `reap_queued_known` call site — one `.coverage()`
+    //! grep away. This census keys on the TYPE's consult grammar so a
+    //! new reader class enrolls or reds, and the single-read-path
+    //! invariant (exactly ONE fn returns the letter) is pinned.
+    //!
+    //! [GEN-SET] generator (committed; re-run on any count drift):
+    //!
+    //!   rg -n '\.coverage\(\)|DemandCoverage::|coverage_for_absence|-> DemandCoverage|transport_complete' rio-controller/src/reconcilers/pool/
+    //!
+    //! Reader table (jobs.rs prod sites, class per row):
+    //!
+    //! | site                                    | class           |
+    //! |-----------------------------------------|-----------------|
+    //! | `IntentPage::coverage` body (×2 `::`)   | THE mint (sole read path) |
+    //! | `WantMap::for_pool` `page.coverage()`   | absence bind    |
+    //! | reconcile → `evaluate_spawn_gate` arg   | suspension bind (streak expiry, W10-AM) |
+    //! | reconcile → `reap_queued_known` conjunct| bound bind (the bug_064 lane) |
+    //! | `WantMap::verdict` `== Complete` arm    | absence consume |
+    //! | candidate.rs `step` expiry suspension   | suspension consume |
+
+    const JOBS_SRC: &str = include_str!("jobs.rs");
+    const JOB_SRC: &str = include_str!("job.rs");
+    const CANDIDATE_SRC: &str = include_str!("candidate.rs");
+    const POD_SRC: &str = include_str!("pod.rs");
+
+    /// Production half (same split as the W10-AH census).
+    fn prod(src: &str) -> &str {
+        src.split("#[cfg(test)]\nmod ").next().unwrap_or(src)
+    }
+
+    fn src_for(file: &str) -> &'static str {
+        match file {
+            "jobs.rs" => JOBS_SRC,
+            "job.rs" => JOB_SRC,
+            "candidate.rs" => CANDIDATE_SRC,
+            "pod.rs" => POD_SRC,
+            other => panic!("unenrolled census file {other}"),
+        }
+    }
+
+    /// The committed census: (file, needle, count). Rider (c): the
+    /// key is content-bearing at (file × needle) granularity — the
+    /// duplicate-discrimination test below proves the projection
+    /// keeps known-distinct rows distinct.
+    const CENSUS: &[(&str, &str, usize)] = &[
+        // The accessor consults — the letter's only read path.
+        ("jobs.rs", ".coverage()", 3),
+        ("job.rs", ".coverage()", 0),
+        ("candidate.rs", ".coverage()", 0),
+        ("pod.rs", ".coverage()", 0),
+        // Letter binds/consumes (constructors + comparisons + doc links).
+        ("jobs.rs", "DemandCoverage::", 5),
+        ("candidate.rs", "DemandCoverage::", 1),
+        ("job.rs", "DemandCoverage::", 0),
+        ("pod.rs", "DemandCoverage::", 0),
+        // THE single-read-path pin: exactly one fn in the pool plane
+        // returns the letter (IntentPage::coverage). A second
+        // accessor — the laundering shape — reds here.
+        ("jobs.rs", "-> DemandCoverage", 1),
+        ("job.rs", "-> DemandCoverage", 0),
+        ("candidate.rs", "-> DemandCoverage", 0),
+        ("pod.rs", "-> DemandCoverage", 0),
+        // The retired absence-only accessor: one historical citation
+        // in the successor's doc, zero live call sites.
+        ("jobs.rs", "coverage_for_absence", 1),
+        ("job.rs", "coverage_for_absence", 0),
+        ("candidate.rs", "coverage_for_absence", 0),
+        ("pod.rs", "coverage_for_absence", 0),
+        // The raw transport bit never leaks past the page: field decl,
+        // accessor read, two production constructors, one doc mention.
+        ("jobs.rs", "transport_complete", 5),
+        ("job.rs", "transport_complete", 0),
+        ("candidate.rs", "transport_complete", 0),
+        ("pod.rs", "transport_complete", 0),
+        // The alias-evasion surface is FORBIDDEN (the needle census
+        // cannot see through `use DemandCoverage as X` — so the idiom
+        // itself is the red; rider (b)(3)'s overscan-refusal form).
+        ("jobs.rs", "DemandCoverage as ", 0),
+        ("job.rs", "DemandCoverage as ", 0),
+        ("candidate.rs", "DemandCoverage as ", 0),
+        ("pod.rs", "DemandCoverage as ", 0),
+    ];
+
+    // r[verify ctrl.pool.letter-degrades-whole]
+    /// Enrollment totality: per-(file, needle) counts equal the
+    /// committed census. A new letter reader (or a second accessor,
+    /// or a revived absence-only path) fails here naming its file.
+    #[test]
+    fn letter_readers_enrolled() {
+        // Rider (a): population non-vacuity — the walked universe is
+        // the four pool-plane files and the table covers them all.
+        let files: std::collections::HashSet<&str> = CENSUS.iter().map(|(f, _, _)| *f).collect();
+        assert_eq!(files.len(), 4, "every pool-plane file enrolled");
+        assert!(!CENSUS.is_empty());
+        for (file, needle, want) in CENSUS {
+            let got = prod(src_for(file)).matches(needle).count();
+            assert_eq!(
+                got, *want,
+                "{file}: `{needle}` letter-reader count drifted — re-run \
+                 the [GEN-SET] generator and file the new site's class \
+                 in the reader table (a second `-> DemandCoverage` \
+                 accessor or a raw transport read is the bug_064 \
+                 laundering shape: review-reject, never enroll)"
+            );
+        }
+    }
+
+    /// Riders (b)/(c)/(d): the census's own kill power. The corpus
+    /// plants are raw-source strings driven through the SAME counting
+    /// detectors that police production; the K-mutations are detector
+    /// COPIES with degenerate predicates — each planted red must die.
+    #[test]
+    fn letter_census_kill_power() {
+        // Plant 1 (rider (c), the planted-DUPLICATE/second-accessor):
+        // a strawman wrapper accessor MUST join the derived set.
+        let second_accessor_corpus = r#"
+            impl DemandEvidence {
+                pub(crate) fn coverage_raw(&self) -> DemandCoverage {
+                    DemandCoverage::Complete
+                }
+            }
+        "#;
+        assert_eq!(
+            second_accessor_corpus.matches("-> DemandCoverage").count(),
+            1,
+            "the second-accessor plant must be visible to the \
+             single-read-path detector (count 1 + prod 1 = 2 ≠ pinned 1 → red)"
+        );
+
+        // Plant 2 (the bug_064 shape itself): the bound lane's raw
+        // letter read — visible to the type-derived grammar...
+        let bound_lane_corpus = "let q = reap_queued_known(ok, armed, \
+             evidence.coverage() == DemandCoverage::Complete, n, r, f);";
+        let type_derived_hits = |src: &str| {
+            src.matches(".coverage()").count() + src.matches("DemandCoverage::").count()
+        };
+        assert!(
+            type_derived_hits(bound_lane_corpus) >= 2,
+            "the type-derived grammar sees the bound-lane reader"
+        );
+        // ...and INVISIBLE to the K-mutation that re-keys the census
+        // to WantMap-readers-only (the merged_bug_047 quantifier — the
+        // exact generator gap bug_064 charged). The plant dies: the
+        // mutated detector misses the reader the real one counts.
+        let wantmap_only_hits =
+            |src: &str| src.matches("WantMap::for_pool").count() + src.matches(".verdict(").count();
+        assert_eq!(
+            wantmap_only_hits(bound_lane_corpus),
+            0,
+            "M1 (WantMap-readers-only re-key) must MISS the bound-lane \
+             plant the type-derived census counts — the planted red dies"
+        );
+
+        // M2 (degenerate key): quotienting the (file × needle) key to
+        // needle-only must conflate known-distinct rows — the
+        // duplicate-discrimination pin.
+        let jobs_cov = prod(JOBS_SRC).matches(".coverage()").count();
+        let cand_cov = prod(CANDIDATE_SRC).matches(".coverage()").count();
+        assert_ne!(
+            jobs_cov, cand_cov,
+            "M2: the file axis is content-bearing — collapsing it \
+             quotients distinct rows (jobs={jobs_cov}, candidate={cand_cov})"
+        );
+
+        // M3 (widened set): a superset detector (bare "coverage")
+        // overcounts doc prose — the pinned counts red under it.
+        let widened = prod(JOBS_SRC).matches("coverage").count();
+        assert!(
+            widened > jobs_cov,
+            "M3: the widened detector diverges from the pinned grammar \
+             (widened={widened} > exact={jobs_cov}) — superset-accept dies"
+        );
+
+        // M4 (emptied universe): zero files walked cannot reproduce
+        // the pinned table.
+        let emptied: &[(&str, &str, usize)] = &CENSUS[..0];
+        assert_ne!(emptied.len(), CENSUS.len(), "M4: emptied walk reds");
     }
 }

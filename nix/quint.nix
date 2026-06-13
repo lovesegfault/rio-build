@@ -4628,7 +4628,7 @@ rec {
     # wanted Pending Job reads AbsentFromDemand and the orphan arm
     # foreground-deletes it (heldPlacementDemandVisible expected
     # violated — the laundered-absence trace, the W11-AK model twin).
-    # r[verify ctrl.pool.window-visibility]
+    # r[verify ctrl.pool.window-visibility+2]
     quint-spawn-coherence-falsify-held-asbuilt = mkQuintWitnessCheck {
       name = "spawn-coherence-falsify-held-asbuilt";
       spec = "spawnCoherence";
@@ -4638,7 +4638,7 @@ rec {
     # HOLD half: the fold THREADS the held set — a placed-in-flight
     # intent with a live Job stays demand-visible while the spawn lane
     # still excludes it; canReachHeldKept below keeps it non-vacuous.
-    # r[verify ctrl.pool.window-visibility]
+    # r[verify ctrl.pool.window-visibility+2]
     quint-spawn-coherence-held-visible = mkQuintCheck {
       name = "spawn-coherence-held-visible";
       spec = "spawnCoherence";
