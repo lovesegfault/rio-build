@@ -1427,11 +1427,6 @@ impl CostTable {
                 self.lambda_cursor = settled;
                 self.cursor_poisoned = false;
             } else {
-                let prev_stamp = self
-                    .lambda
-                    .values()
-                    .map(|e| e.updated_at)
-                    .fold(Epoch::UNSET, Epoch::max);
                 let rows: Vec<(String, String, f64, f64)> = sqlx::query_as(
                     "SELECT hw_class, kind, COALESCE(SUM(value), 0), \
                         EXTRACT(EPOCH FROM MAX(at))::float8 \
@@ -1447,9 +1442,10 @@ impl CostTable {
                 // The folds run in the typed epoch domain
                 // (sched.sla.epoch-domain): pre-fix, ONE `'infinity'`
                 // sample stamp folded the global stamp to `+inf` and
-                // wedged every refresh permanently.
-                let mut batch_stamp = prev_stamp;
-                let mut per_h: HashMap<HwClassName, (f64, f64)> = HashMap::new();
+                // wedged every refresh permanently — per-class stamps
+                // (merged_bug_010) also confine a poisoned-but-finite
+                // stamp to its own class.
+                let mut per_h: HashMap<HwClassName, (f64, f64, Epoch)> = HashMap::new();
                 for (hw_class, kind, sum, max_at) in rows {
                     // r[impl sched.sla.epoch-domain]
                     // Decode boundary: a non-finite MAX(at) refuses the
@@ -1489,8 +1485,8 @@ impl CostTable {
                         .increment(1);
                         continue;
                     };
-                    batch_stamp = batch_stamp.max(max_at);
                     let e = per_h.entry(hw_class).or_default();
+                    e.2 = e.2.max(max_at);
                     match kind.as_str() {
                         "interrupt" => e.0 += sum,
                         "exposure" => e.1 += sum,
@@ -1507,23 +1503,47 @@ impl CostTable {
                 // scaler — and lambda_hat toward seed — for days; folded
                 // as halves, the ms window adds ~nothing to the
                 // denominator AND the wave's exposure stays counted).
-                // Skip only when `prev_stamp` is unset (first batch has
-                // no window baseline); a zero-advance batch folds (d, 0)
-                // — its exposure still counts, exactly as it joins the λ
-                // EMA above.
-                let dt = batch_stamp.secs_since(prev_stamp);
-                for (h, (n, d)) in per_h {
+                // merged_bug_010: the WINDOW is per key too — each
+                // class windows from ITS OWN previous stamp and stamps
+                // at its own MAX(at) (the in-file `fold_prices`
+                // per-key-stamp template, instantiated): a global
+                // window tiles wall time only for keys present in
+                // every batch, so an every-Nth-batch class folded
+                // (N batches of exposure, one batch of window) and
+                // converged node_count to ~N× truth — inflating
+                // n_lambda and pinning lambda-hat toward seed. The
+                // per-class λ stamp also ends the under-decay of
+                // stamp-skewed classes (the old global batch_stamp
+                // over-stamped classes whose own data lagged). Skip
+                // node_count only when the class has no window
+                // baseline (its λ stamp unset — first appearance); a
+                // zero-advance wave folds (d, 0) — its exposure still
+                // counts, exactly as it joins the λ EMA.
+                for (h, (n, d, window_max_at)) in per_h {
+                    let class_prev = self
+                        .lambda
+                        .get(&h)
+                        .map(|e| e.updated_at)
+                        .unwrap_or(Epoch::UNSET);
+                    // Value-time NEVER rewinds (merged_bug_048/W11-AU:
+                    // a rewound stamp corrupts the next decay dt): a
+                    // late-committed row with an earlier stamp is
+                    // CONSUMED (the id-cursor law) while the class
+                    // stamp holds — its window contribution is the
+                    // zero-advance arm below.
+                    let class_stamp = class_prev.max(window_max_at);
                     self.lambda.entry(h.clone()).or_default().update(
                         n,
                         d,
-                        batch_stamp,
+                        class_stamp,
                         LAMBDA_HALFLIFE_SECS,
                     );
-                    if prev_stamp.as_secs_f64() > 0.0 {
+                    if class_prev.as_secs_f64() > 0.0 {
+                        let dt = class_stamp.secs_since(class_prev).max(0.0);
                         self.node_count.entry(h).or_default().update(
                             d,
                             dt,
-                            batch_stamp,
+                            class_stamp,
                             LAMBDA_HALFLIFE_SECS,
                         );
                     }
@@ -4396,7 +4416,13 @@ mod tests {
 
     /// **W12-AI (bug_044, red-first; triage-corrected magnitudes)** —
     /// *per-key rates fold over per-key windows; population: the
-    /// capture-gap compound event + the steady state.* The compound
+    /// capture-gap compound event + the steady state.*
+    /// merged_bug_010 note: the wave-12 close shipped this NAME while
+    /// keeping the global dt — the oracle pinned only one split
+    /// wave's boundedness. W13-W (`w13_w_every_nth_batch_class_…`)
+    /// drives REPEATED cadence skew and the per-class window
+    /// mechanism landed with it, so the name's claim is now its
+    /// content. The compound
     /// (the triage's binding correction: NOT the report's 1000×
     /// steady-state claim — steady-state error is ±~10%
     /// alternating-sign, EMA-negligible): a sibling class commits a
@@ -4472,6 +4498,112 @@ mod tests {
             after >= 1.5,
             "the wave's exposure still counts (the dt==0-skip \
              alternative would silently drop it): {after}"
+        );
+    }
+
+    // r[verify sched.sla.one-fence-axis]
+    /// **W13-W (merged_bug_010, red-first)** — *the rate fold
+    /// denominates BOTH halves AND the decay stamp per key, over the
+    /// key's OWN window; population: cadence-skewed classes under the
+    /// real producer shape (per-class report_exposure with
+    /// recredit).* Class `a` reports every batch; class `b` ships its
+    /// exposure every THIRD batch (1800s per wave). Pre-fix red
+    /// (transcript in the commit body): `dt` was ONE GLOBAL window
+    /// (`batch_stamp - prev_stamp`, advanced every batch by `a`), so
+    /// each `b` wave folded (1800s exposure, 600s window) and
+    /// node_count:b converged to ~3× truth — inflating n_lambda and
+    /// pinning lambda-hat toward seed. Post-fix each class windows
+    /// from ITS OWN previous stamp: (1800, 1800) ⇒ truth (~1). The
+    /// wave-12 retouch (bc04b08cc) kept the global dt under the test
+    /// name "fold node-count rates per class over their own windows"
+    /// — this witness makes the name's claim its content under
+    /// REPEATED skew (two full waves).
+    #[tokio::test]
+    async fn w13_w_every_nth_batch_class_windows_from_its_own_stamp() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        let mut t = CostTable::seeded("c", HwCostSource::Static);
+        let ins = |h: &'static str, v: f64, at: f64, pool: sqlx::PgPool| async move {
+            sqlx::query(
+                "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
+                 VALUES ('c', $1, 'exposure', $2, to_timestamp($3))",
+            )
+            .bind(h)
+            .bind(v)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        };
+        // Batch schedule: a every 600s; b every third batch (1800s
+        // of exposure per wave, stamped at the wave batch).
+        let mut consume = async |t: &mut CostTable| {
+            t.refresh_lambda(&sdb).await.unwrap();
+            t.refresh_lambda(&sdb).await.unwrap();
+        };
+        ins("a", 600.0, 1000.0, db.pool.clone()).await;
+        ins("b", 1800.0, 1000.0, db.pool.clone()).await;
+        consume(&mut t).await;
+        for batch in 1..=6u32 {
+            let at = 1000.0 + 600.0 * f64::from(batch);
+            ins("a", 600.0, at, db.pool.clone()).await;
+            if batch % 3 == 0 {
+                ins("b", 1800.0, at, db.pool.clone()).await;
+            }
+            consume(&mut t).await;
+        }
+        let nc_b = t.node_count["b"].value_or(0.0);
+        assert!(
+            (0.7..=1.4).contains(&nc_b),
+            "an every-3rd-batch class recovers TRUTH (~1 node) when \
+             windowed from its own stamp; got {nc_b} (pre-fix: the \
+             global 600s window converged it to ~3x truth)"
+        );
+        let nc_a = t.node_count["a"].value_or(0.0);
+        assert!(
+            (0.7..=1.4).contains(&nc_a),
+            "the every-batch class stays at truth: got {nc_a}"
+        );
+    }
+
+    /// **W13-W2 (merged_bug_010)** — *equal-stamp single-cadence
+    /// classes are byte-stable across the per-class re-denomination:
+    /// when every class reports every batch with the same stamp, the
+    /// per-class window equals the old global window exactly.* Pinned
+    /// at the pre-fix tree.
+    #[tokio::test]
+    async fn w13_w2_equal_stamp_classes_byte_stable() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        let mut t = CostTable::seeded("c", HwCostSource::Static);
+        for batch in 0..=3u32 {
+            let at = 1000.0 + 600.0 * f64::from(batch);
+            for h in ["a", "b"] {
+                sqlx::query(
+                    "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
+                     VALUES ('c', $1, 'exposure', $2, to_timestamp($3))",
+                )
+                .bind(h)
+                .bind(600.0)
+                .bind(at)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            }
+            t.refresh_lambda(&sdb).await.unwrap();
+            t.refresh_lambda(&sdb).await.unwrap();
+        }
+        let pin = format!(
+            "{:.9}/{:.9}|{:.9}/{:.9}",
+            t.node_count["a"].numerator,
+            t.node_count["a"].denominator,
+            t.node_count["b"].numerator,
+            t.node_count["b"].denominator
+        );
+        assert_eq!(
+            pin, "1791.370315087/1791.370315087|1791.370315087/1791.370315087",
+            "equal-stamp classes fold byte-identically across the \
+             per-class window split (pinned at the pre-fix tree)"
         );
     }
 
