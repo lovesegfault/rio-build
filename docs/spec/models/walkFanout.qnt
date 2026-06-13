@@ -373,8 +373,8 @@ module walkFanout {
 /// overtaken floor — the recorded divergence from the book's {1,3}
 /// prescription). SUCCESS-ONLY
 /// scope, stated per the val docs: the abort/cancel plane lives in the
-/// base main; the licensed step-back after a FAILED attempt is the
-/// Rust witness plane's W-012c. ALL emissions — stream ticks AND
+/// base main; the licensed step-back after a FAILED attempt is out of
+/// scope on this plane. ALL emissions — stream ticks AND
 /// commit frames — are in the ghosts' quantification: commits emit
 /// the window aggregate (the e2e wire-monotone law; the floor-only
 /// commit shape was machine-refuted by the substitute-progress-e2e

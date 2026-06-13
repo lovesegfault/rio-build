@@ -4296,7 +4296,7 @@ mod tests {
     /// oscillation (the 300K → 2K → 320K shape) is unrepresentable in
     /// the emitted sequence. Asserted over the captured event vec,
     /// not wall-clock. (The licensed step-back after a FAILED attempt
-    /// is out of this trace's scope — success-only; W-012c covers it.)
+    /// is out of this trace's scope — success-only.)
     ///
     /// Pre-fix red: two concurrently-streaming siblings of different
     /// sizes emitted base-adjusted pairs whose interleave regressed

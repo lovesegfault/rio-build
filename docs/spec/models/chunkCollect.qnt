@@ -945,7 +945,7 @@ module chunkCollect {
   /// condition): FOR UPDATE on the 'uploading' row, manifest_data
   /// INSERT, chunk upsert with `RETURNING (uploaded_at IS NULL) AS
   /// needs_upload` and — when ENABLE_TOUCH — `last_referenced_at =
-  /// now()` on conflict (the migration-068 touch; collect.rs's
+  /// now()` on conflict (the migration-070 touch; collect.rs's
   /// mark-snapshot race closer). While a collect cycle is in flight,
   /// every hash written here moves out of the cycle's collectable set
   /// (its GREATEST(created_at, last_referenced_at) now postdates the

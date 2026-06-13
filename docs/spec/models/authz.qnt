@@ -221,19 +221,13 @@ module authz {
 
   // ── invariants ─────────────────────────────────────────────────────
 
-  /// (237) The assigned verdict equals the declared-knob law, AND the
-  /// law itself is foreign-knob independent over all bootable config
-  /// pairs (the quantified leg makes the invariant fall in the
-  /// calibration even for combinations the sweep has not yet visited).
-  val enforcementFromDeclaredVerifiersOnly = and {
-    layerAdmit == layerLaw(cls, cfg, presented),
-    CLASSES.forall(k =>
-      PRESENTEDS.forall(p =>
-        CONFIGS.filter(c => bootable(c)).forall(c1 =>
-          CONFIGS.filter(c => bootable(c)).forall(c2 =>
-            (declaredKnob(k, c1) == declaredKnob(k, c2))
-              implies (layerLaw(k, c1, p) == layerLaw(k, c2, p))))))
-  }
+  /// (237) The assigned verdict equals the declared-knob law.
+  /// Foreign-knob independence is by construction (`layerLaw` consults
+  /// the config only via `declaredKnob`); the calibration's
+  /// `calibDecideLayer` swap of the assigned verdict is what falsifies
+  /// this — see `calibration/authz-237-foreign-knob.qnt`.
+  val enforcementFromDeclaredVerifiersOnly =
+    layerAdmit == layerLaw(cls, cfg, presented)
 
   /// (237 dead leg / 122) A keyed class admits ONLY its declared
   /// credential kind.

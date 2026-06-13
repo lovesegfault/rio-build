@@ -804,18 +804,6 @@ module openAttempts {
   // -- the exit-0 license is terminal for the token (write-ahead +
   // DeliverNew screen; sched.executor.confirm-fence).
   val noMintAfterGoneAnswer = not(mintAfterGone)
-
-  val openAttemptsInvariants = all {
-    cancelledNeverChargedAsCrash,
-    notDriverLost,
-    ackImpliesSettledOrArmed,
-    claimedImpliesOpenAttempt,
-    noFaultNeverCharged,
-    noCredentialClobber,
-    noRefusalFiledAsLost,
-    confirmNeverMints,
-    noMintAfterGoneAnswer,
-  }
 }
 
 // OP-1 (MBT-1): the conformance-replay run module — quint-test-only
