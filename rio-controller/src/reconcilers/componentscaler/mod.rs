@@ -42,10 +42,15 @@ use decide::Decision;
 const REQUEUE: Duration = Duration::from_secs(10);
 
 /// Per-pod GetLoad timeout. Generous — GetLoad is a single PgPool
-/// stat read, sub-ms when healthy. A pod that takes >2s is
-/// unhealthy enough that we don't want its load reading anyway
-/// (treated as `None` for that pod, the max() over the others
-/// covers it).
+/// stat read, sub-ms when healthy. A pod that takes >2s is unhealthy
+/// enough that we don't trust its reading this tick — but a skipped
+/// reading is NOT covered by the survivors' max(): per-replica gauges
+/// drop the skipped replica exactly when its reading may BE the max
+/// (saturation is what makes a pod slow to answer), so the fold
+/// degrades the coverage letter (`answered < resolved`) and
+/// `decide()` consumes partial evidence asymmetrically — survivor-
+/// high still scales up, survivor-low never funds ratio growth
+/// ([`decide::LoadAggregate`]).
 const LOAD_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// SSA field-manager for `deployments/scale` patches AND status
@@ -104,7 +109,8 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
     };
 
     // ── Observed: max(GetLoad) across loadEndpoint pods ──────────
-    let max_load = poll_max_load(&spec.load_endpoint, ctx.service_interceptor.clone()).await;
+    let load = poll_max_load(&spec.load_endpoint, ctx.service_interceptor.clone()).await;
+    let max_load = load.map(|l| l.max);
 
     // ── Current replica count from the Deployment ────────────────
     let dep_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), &ns);
@@ -135,16 +141,16 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
     let since_up = status.last_scale_up_time.as_ref().and_then(since);
     let mut status_in = status.clone();
     status_in.low_load_ticks = low_ticks_in;
-    let decision = decide::decide(spec, &status_in, current, builders, max_load, since_up);
+    let decision = decide::decide(spec, &status_in, current, builders, load, since_up);
     ctx.scaler
         .low_ticks
         .lock()
         .insert(key.clone(), decision.low_load_ticks);
 
-    publish_metrics(&cs, &decision, max_load);
+    publish_metrics(&cs, &decision, load);
     debug!(
         builders,
-        ?max_load,
+        ?load,
         current,
         desired = decision.desired,
         learned_ratio = decision.learned_ratio,
@@ -191,7 +197,9 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
 }
 
 /// Resolve `loadEndpoint` (headless-svc DNS) → per-pod GetLoad →
-/// max utilization. `None` on total failure (endpoint malformed,
+/// the denominated max-utilization letter
+/// ([`decide::LoadAggregate`]: max over answering pods + answered/
+/// resolved coverage). `None` on total failure (endpoint malformed,
 /// DNS unresolved/timed-out, all RPCs failed) — the caller skips
 /// ratio correction this tick.
 ///
@@ -208,7 +216,7 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
 async fn poll_max_load(
     endpoint: &str,
     service_interceptor: rio_auth::hmac::ServiceTokenInterceptor,
-) -> Option<f64> {
+) -> Option<decide::LoadAggregate> {
     let Some((host, port)) = endpoint.rsplit_once(':') else {
         warn!(
             endpoint,
@@ -257,18 +265,23 @@ fn fold_load(r: &rio_proto::types::GetLoadResponse) -> f64 {
     (r.pg_pool_utilization as f64).max(r.substitute_admission_utilization as f64)
 }
 
-/// Concurrent per-pod `GetLoad` fan-out → max. Split from
-/// [`poll_max_load`] so the timeout-aggregate behavior is
-/// unit-testable without DNS.
+/// Concurrent per-pod `GetLoad` fan-out → the denominated letter.
+/// Split from [`poll_max_load`] so the timeout-aggregate behavior is
+/// unit-testable without DNS. `resolved` is the address count handed
+/// in; every task that errors or times out leaves its reading `None`,
+/// so the fold's denominator counts exactly the answers
+/// ([`decide::LoadAggregate::fold`]).
+// r[impl ctrl.scaler.load-coverage]
 async fn poll_max_load_addrs(
     addrs: Vec<SocketAddr>,
     service_interceptor: rio_auth::hmac::ServiceTokenInterceptor,
-) -> Option<f64> {
+) -> Option<decide::LoadAggregate> {
     // `connect_store_admin_at` (not the balanced channel): we need
     // each pod's individual GetLoad reading for the max(), so dial
     // every resolved IP directly — p2c would route all calls to one
     // or two pods. Wrapped with the service-token interceptor —
     // `r[store.admin.service-gate]` requires it on `GetLoad`.
+    let resolved = addrs.len();
     let mut set = tokio::task::JoinSet::new();
     for addr in addrs {
         let int = service_interceptor.clone();
@@ -281,22 +294,37 @@ async fn poll_max_load_addrs(
                     .into_inner();
                 anyhow::Ok(fold_load(&r))
             };
-            // timeout-census: delay — this pod's reading is skipped in
-            // the max() fold; next pass re-polls.
+            // A load-correlated timeout recurs every pass (the slow
+            // pod is the saturated one), so the consequence is priced
+            // by the LETTER, not by the re-poll: the fold's coverage
+            // degrades (answered < resolved), survivor-high still
+            // scales up, survivor-low funds nothing, and load_poll_
+            // partial_total is the recurrence's operator trail.
+            // timeout-census: delay — reading skipped; letter degraded.
             // census[gen: rio-controller/tests/timeout_census.txt]
             (addr, tokio::time::timeout(LOAD_RPC_TIMEOUT, load).await)
         });
     }
-    let mut max: Option<f64> = None;
+    let mut readings: Vec<Option<f64>> = Vec::with_capacity(resolved);
     while let Some(joined) = set.join_next().await {
         let Ok((addr, res)) = joined else { continue };
         match res {
-            Ok(Ok(l)) => max = Some(max.map_or(l, |m: f64| m.max(l))),
-            Ok(Err(e)) => debug!(%addr, error = %e, "componentscaler: GetLoad failed"),
-            Err(_) => debug!(%addr, "componentscaler: GetLoad timed out"),
+            Ok(Ok(l)) => readings.push(Some(l)),
+            Ok(Err(e)) => {
+                debug!(%addr, error = %e, "componentscaler: GetLoad failed");
+                readings.push(None);
+            }
+            Err(_) => {
+                debug!(%addr, "componentscaler: GetLoad timed out");
+                readings.push(None);
+            }
         }
     }
-    max
+    // A panicked/cancelled task never pushed its reading — pad the
+    // denominator so a lost task still degrades coverage instead of
+    // silently shrinking `resolved`.
+    readings.resize(resolved, None);
+    decide::LoadAggregate::fold(&readings)
 }
 
 /// Patch `apps/v1 Deployment {name} /scale`. Uses the `/scale`
@@ -403,7 +431,11 @@ async fn patch_status(
 
 /// Publish per-CR gauges. Labelled by `cs={ns}/{name}` so multiple
 /// ComponentScalers (store + future gateway) get separate series.
-fn publish_metrics(cs: &ComponentScaler, decision: &Decision, max_load: Option<f64>) {
+/// The partial-coverage counter is the operator trail for the
+/// load-correlated timeout regime — a chronically slow/saturated
+/// replica degrades every tick's letter, and a rate here (rather
+/// than a once-off) is exactly that recurrence.
+fn publish_metrics(cs: &ComponentScaler, decision: &Decision, load: Option<decide::LoadAggregate>) {
     let label = format!("{}/{}", cs.namespace().unwrap_or_default(), cs.name_any());
     metrics::gauge!("rio_controller_component_scaler_learned_ratio",
         "cs" => label.clone())
@@ -411,10 +443,15 @@ fn publish_metrics(cs: &ComponentScaler, decision: &Decision, max_load: Option<f
     metrics::gauge!("rio_controller_component_scaler_desired_replicas",
         "cs" => label.clone())
     .set(decision.desired as f64);
-    if let Some(l) = max_load {
+    if let Some(l) = load {
+        if !l.total_coverage() {
+            metrics::counter!("rio_controller_component_scaler_load_poll_partial_total",
+                "cs" => label.clone())
+            .increment(1);
+        }
         metrics::gauge!("rio_controller_component_scaler_observed_load",
             "cs" => label)
-        .set(l);
+        .set(l.max);
     }
 }
 
@@ -467,20 +504,22 @@ mod tests {
         // Per-pod fold picks the saturated dimension.
         assert!((fold_load(&pod_a) - 0.9).abs() < 1e-6);
         assert!((fold_load(&pod_b) - 0.7).abs() < 1e-6);
-        // Across-pod aggregate: same `f64::max` reduction the
-        // `poll_max_load_addrs` JoinSet loop applies.
-        let agg = [&pod_a, &pod_b]
+        // Across-pod aggregate: the SAME fold `poll_max_load_addrs`
+        // applies (`LoadAggregate::fold` over the readings vec).
+        let readings: Vec<Option<f64>> = [&pod_a, &pod_b]
             .into_iter()
-            .map(fold_load)
-            .fold(None::<f64>, |m, l| Some(m.map_or(l, |m| m.max(l))));
-        assert_eq!(agg, Some(0.9_f32 as f64));
+            .map(|r| Some(fold_load(r)))
+            .collect();
+        let agg = decide::LoadAggregate::fold(&readings).expect("two answers");
+        assert_eq!(agg.max, 0.9_f32 as f64);
+        assert!(agg.total_coverage(), "both pods answered");
         // Old behavior (pg-only) would have returned 0.7 — proving
         // the new dimension is load-bearing.
         let pg_only = [&pod_a, &pod_b]
             .into_iter()
             .map(|r| r.pg_pool_utilization as f64)
             .fold(f64::MIN, f64::max);
-        assert!(agg.unwrap() > pg_only);
+        assert!(agg.max > pg_only);
     }
 
     /// bug_213 regression: status writes rate-limited to once per

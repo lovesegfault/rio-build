@@ -212,8 +212,11 @@ pub struct ComponentScalerStatus {
     pub learned_ratio: Option<f64>,
 
     /// Max of pg-pool utilization and substitute-admission utilization
-    /// across `loadEndpoint` pods at the last tick. The "observed" half
-    /// of the predict-then-correct loop.
+    /// across the `loadEndpoint` pods that ANSWERED at the last tick.
+    /// The "observed" half of the predict-then-correct loop. Under
+    /// partial poll coverage this is a survivor max — the reconciler
+    /// consumes it asymmetrically (scale-up evidence survives partial
+    /// coverage; ratio-growth funding demands total coverage).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_load_factor: Option<f64>,
 

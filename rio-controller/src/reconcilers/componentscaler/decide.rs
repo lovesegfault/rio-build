@@ -80,6 +80,53 @@ pub const SCALE_DOWN_STABILIZATION: Duration = Duration::from_secs(300);
 /// CORRECT; this keeps it CHEAP.
 pub const MAX_SCALE_DOWN_STEP: i32 = 1;
 
+// r[impl ctrl.scaler.load-coverage]
+/// The denominated load letter: the `max()` fold over per-replica
+/// `GetLoad` gauges PLUS its coverage denominator. A max() over
+/// per-replica gauges is only a total max under total coverage — the
+/// replica whose reading was dropped (timeout, connect failure) is
+/// dropped exactly when its reading may BE the max — so the letter
+/// carries `answered`/`resolved` and [`decide`] consumes it
+/// asymmetrically: a survivor reading HIGH is trustworthy (scale-up
+/// evidence survives partial coverage); a survivor reading LOW is not
+/// (ratio-growth funding demands total coverage). `answered == 0`
+/// never constructs a letter — the established total-failure posture
+/// is `None` at the poll fold ([`LoadAggregate::fold`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoadAggregate {
+    /// `max(fold_load)` over the replicas that answered.
+    pub max: f64,
+    /// How many resolved replicas answered within the RPC timeout.
+    pub answered: usize,
+    /// How many replica addresses the headless service resolved.
+    pub resolved: usize,
+}
+
+impl LoadAggregate {
+    /// Fold per-replica readings (`None` = timed out / errored) into
+    /// the denominated letter. `None` when nothing answered — the
+    /// caller's established total-failure posture.
+    pub fn fold(readings: &[Option<f64>]) -> Option<Self> {
+        let answered = readings.iter().flatten().count();
+        let max = readings
+            .iter()
+            .flatten()
+            .copied()
+            .fold(None::<f64>, |m, l| Some(m.map_or(l, |m| m.max(l))))?;
+        Some(Self {
+            max,
+            answered,
+            resolved: readings.len(),
+        })
+    }
+
+    /// True iff every resolved replica answered — the only condition
+    /// under which `max` is the fleet max rather than a survivor max.
+    pub fn total_coverage(&self) -> bool {
+        self.answered == self.resolved
+    }
+}
+
 /// Result of one reconcile decision: the next status to write and
 /// the replica count to patch onto `deployments/scale`.
 #[derive(Debug, Clone, PartialEq)]
@@ -133,11 +180,13 @@ pub fn total_builders(cs: &ClusterStatusResponse) -> u64 {
 ///
 /// `builders`: from [`total_builders`].
 ///
-/// `max_load`: `max(GetLoad)` across the target's pods. `None` =
-/// the load poll failed (no endpoints resolved, all RPCs errored) —
-/// the reactive correction is skipped and only the predictive path
-/// runs. The ratio does NOT change on `None` (we have no evidence
-/// either way).
+/// `load`: the denominated `max(GetLoad)` letter across the target's
+/// pods. `None` = the load poll failed entirely (no endpoints
+/// resolved, all RPCs errored) — the reactive correction is skipped
+/// and only the predictive path runs; the ratio does NOT change (we
+/// have no evidence either way). A letter with `answered < resolved`
+/// is consumed asymmetrically per the [`LoadAggregate`] law:
+/// survivor-high still scales up; survivor-low never funds growth.
 ///
 /// `since_last_scale_up`: `now() - status.lastScaleUpTime`. `None`
 /// = never scaled up (first reconcile, or status was wiped) — the
@@ -151,7 +200,7 @@ pub fn decide(
     status: &ComponentScalerStatus,
     current: i32,
     builders: u64,
-    max_load: Option<f64>,
+    load: Option<LoadAggregate>,
     since_last_scale_up: Option<Duration>,
 ) -> Decision {
     let ratio_in = status
@@ -167,8 +216,17 @@ pub fn decide(
     let predicted = predicted.min(i32::MAX as f64).max(0.0) as i32;
 
     // Reactive correction on observed load.
-    let (raw_desired, ratio_out, low_ticks) = match max_load {
-        Some(l) if l > high => {
+    // r[impl ctrl.scaler.load-coverage]
+    // The asymmetric consume of the denominated letter: the high arm
+    // accepts ANY coverage (a survivor reading high is a real replica
+    // really saturated — scale-up evidence survives partial
+    // coverage); the low/funding arm demands TOTAL coverage (the
+    // dropped replica's reading may BE the max, so a survivor-only
+    // "all low" claim is unsubstantiated and funds nothing). The
+    // in-band arm needs no coverage qualifier: one genuinely in-band
+    // replica disproves "all replicas low" under any coverage.
+    let (raw_desired, ratio_out, low_ticks) = match load {
+        Some(l) if l.max > high => {
             // Under-provisioned. +1 over CURRENT (not predicted): if
             // the prediction is what got us here, "predicted + 0"
             // wouldn't help. The ratio decay makes the NEXT
@@ -179,7 +237,17 @@ pub fn decide(
                 0,
             )
         }
-        Some(l) if l < low => {
+        Some(l) if l.max < low && !l.total_coverage() => {
+            // Survivor-only LOW: the letter cannot substantiate
+            // "every replica is low" — the unanswered replica is
+            // dropped exactly when its reading may be the max (the
+            // load-correlated timeout regime recurs every pass, so
+            // this is a standing cell, not a blip). Funds NOTHING;
+            // the banked streak rides the same preserve posture as
+            // the sensor-absent letter below.
+            (predicted, ratio_in, status.low_load_ticks)
+        }
+        Some(l) if l.max < low => {
             // Over-provisioned — maybe. Count toward ratio growth;
             // use the prediction (which may itself be < current —
             // scale-down guard below handles that).
@@ -297,6 +365,26 @@ mod tests {
         }
     }
 
+    /// A total-coverage letter: every resolved replica answered, so
+    /// `max` is the fleet max (the pre-letter semantics).
+    fn total(l: f64) -> Option<LoadAggregate> {
+        Some(LoadAggregate {
+            max: l,
+            answered: 3,
+            resolved: 3,
+        })
+    }
+
+    /// A partial-coverage letter: one resolved replica did not answer
+    /// — the load-correlated timeout regime's shape.
+    fn partial(l: f64) -> Option<LoadAggregate> {
+        Some(LoadAggregate {
+            max: l,
+            answered: 2,
+            resolved: 3,
+        })
+    }
+
     /// Σ(queued+running+substituting) from ClusterStatus; saturates
     /// instead of wrapping. The parameter type IS the assertion:
     /// predictive signal sources from the cheap `ClusterStatus`
@@ -365,7 +453,7 @@ mod tests {
             &status(None, 0),
             5,
             total_builders(&cs),
-            Some(0.5),
+            total(0.5),
             None,
         );
         assert_eq!(
@@ -381,7 +469,7 @@ mod tests {
             &status(Some(50.0), LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1),
             5,
             total_builders(&cs),
-            Some(0.1),
+            total(0.1),
             None,
         );
         assert_eq!(
@@ -464,14 +552,14 @@ mod tests {
         let s = spec(2, 14);
         // current=5, prediction would be 4 (200/50), but load=0.9
         // says we're under-provisioned NOW → +1 over current = 6.
-        let d = decide(&s, &status(Some(50.0), 5), 5, 200, Some(0.9), None);
+        let d = decide(&s, &status(Some(50.0), 5), 5, 200, total(0.9), None);
         assert_eq!(d.desired, 6);
         assert_eq!(d.learned_ratio, 50.0 * RATIO_DECAY_ON_HIGH);
         assert_eq!(d.low_load_ticks, 0, "high load resets low streak");
         assert!(d.scaled_up);
 
         // Ratio floors at RATIO_FLOOR under sustained high.
-        let d = decide(&s, &status(Some(1.01), 0), 5, 200, Some(0.9), None);
+        let d = decide(&s, &status(Some(1.01), 0), 5, 200, total(0.9), None);
         assert_eq!(d.learned_ratio, RATIO_FLOOR);
     }
 
@@ -483,7 +571,7 @@ mod tests {
     fn low_load_grows_ratio_after_streak() {
         let s = spec(2, 14);
         // Tick 1..29: low_ticks increments, ratio unchanged.
-        let d = decide(&s, &status(Some(50.0), 0), 4, 200, Some(0.1), None);
+        let d = decide(&s, &status(Some(50.0), 0), 4, 200, total(0.1), None);
         assert_eq!(d.low_load_ticks, 1);
         assert_eq!(d.learned_ratio, 50.0);
 
@@ -492,7 +580,7 @@ mod tests {
             &status(Some(50.0), LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 2),
             4,
             200,
-            Some(0.1),
+            total(0.1),
             None,
         );
         assert_eq!(d.low_load_ticks, LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1);
@@ -504,14 +592,14 @@ mod tests {
             &status(Some(50.0), LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1),
             4,
             200,
-            Some(0.1),
+            total(0.1),
             None,
         );
         assert_eq!(d.low_load_ticks, 0);
         assert_eq!(d.learned_ratio, 50.0 * RATIO_GROWTH_ON_LOW);
 
         // In-band load resets the streak.
-        let d = decide(&s, &status(Some(50.0), 10), 4, 200, Some(0.5), None);
+        let d = decide(&s, &status(Some(50.0), 10), 4, 200, total(0.5), None);
         assert_eq!(d.low_load_ticks, 0);
         assert_eq!(d.learned_ratio, 50.0);
     }
@@ -530,7 +618,7 @@ mod tests {
             &status(Some(50.0), LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1),
             2,
             0,
-            Some(0.1),
+            total(0.1),
             None,
         );
         assert_eq!(d.learned_ratio, 50.0, "no work → no ratio growth");
@@ -548,7 +636,7 @@ mod tests {
             &status(Some(50.0), LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1),
             2,
             200,
-            Some(0.1),
+            total(0.1),
             None,
         );
         assert_eq!(d.learned_ratio, 50.0, "current==min → no ratio growth");
@@ -574,13 +662,13 @@ mod tests {
         // through the production fold to wherever idle leaves it.
         let mut st = status(Some(50.0), 0);
         for _ in 0..40 {
-            let d = decide(&s, &st, 2, 0, Some(0.0), None);
+            let d = decide(&s, &st, 2, 0, total(0.0), None);
             assert_eq!(d.learned_ratio, 50.0, "idle never grows");
             st.low_load_ticks = d.low_load_ticks;
         }
         // The transition: work returns (builders>0, current>min),
         // load still low THIS tick (the busy ramp's first sample).
-        let d = decide(&s, &st, 4, 200, Some(0.1), None);
+        let d = decide(&s, &st, 4, 200, total(0.1), None);
         assert_eq!(
             d.learned_ratio, 50.0,
             "the first busy low tick carries ZERO working evidence — \
@@ -593,13 +681,121 @@ mod tests {
         );
         // The law still fires after 30 TRUE working-low minutes.
         st.low_load_ticks = LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1;
-        let d = decide(&s, &st, 4, 200, Some(0.1), None);
+        let d = decide(&s, &st, 4, 200, total(0.1), None);
         assert_eq!(
             d.learned_ratio,
             50.0 * RATIO_GROWTH_ON_LOW,
             "30 consecutive working-low ticks still grow (the spend \
              law unchanged; only the funding predicate tightened)"
         );
+    }
+
+    // r[verify ctrl.scaler.load-coverage]
+    /// W13-AF (bug_061) — proposition: a partial aggregate is never
+    /// consumed as a total one; population: the load-correlated
+    /// timeout regime (the saturated replica is slow to answer
+    /// BECAUSE it is saturated, so the timeout recurs every pass —
+    /// the recurring face, not a blip). Pre-fix RED (verbatim in the
+    /// commit body): the bare `Some(max_of_survivors)` letter made
+    /// partial indistinguishable from total — the banked streak
+    /// funded growth on survivor-only low evidence (left: 51.0,
+    /// right: 50.0) while the saturated replica's high reading
+    /// bought no scale-up.
+    #[test]
+    fn w13_af_partial_low_does_not_fund_growth() {
+        let s = spec(2, 14);
+        // Survivors read 0.1; one resolved replica never answered.
+        let d = decide(
+            &s,
+            &status(Some(50.0), LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1),
+            4,
+            200,
+            partial(0.1),
+            None,
+        );
+        assert_eq!(
+            d.learned_ratio, 50.0,
+            "survivor-only LOW must not fund growth (the dropped \
+             replica's reading may BE the max)"
+        );
+        assert_eq!(
+            d.low_load_ticks,
+            LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1,
+            "partial-low neither funds nor spends the streak (the \
+             ambiguous cell rides the sensor-absent posture)"
+        );
+        assert_eq!(d.desired, 4, "the predictive path still drives desired");
+    }
+
+    // r[verify ctrl.scaler.load-coverage]
+    /// W13-AF, the asymmetric half: a survivor reading HIGH is a real
+    /// replica really saturated — scale-up evidence survives partial
+    /// coverage (degrading the whole letter to None would suppress
+    /// exactly the protective action partial coverage can still
+    /// justify).
+    #[test]
+    fn w13_af_partial_high_still_scales_up() {
+        let s = spec(2, 14);
+        let d = decide(&s, &status(Some(50.0), 5), 5, 200, partial(0.9), None);
+        assert_eq!(
+            d.desired, 6,
+            "survivor-high scales up under partial coverage"
+        );
+        assert_eq!(d.learned_ratio, 50.0 * RATIO_DECAY_ON_HIGH);
+        assert_eq!(d.low_load_ticks, 0, "high resets the streak (any coverage)");
+        assert!(d.scaled_up);
+    }
+
+    // r[verify ctrl.scaler.load-coverage]
+    /// W13-AF2 — total-coverage behavior byte-stable: with
+    /// `answered == resolved` every arm reproduces the pre-letter
+    /// outcomes (the letter is reader-invisible where the old fold
+    /// was already sound).
+    #[test]
+    fn w13_af2_total_coverage_byte_stable() {
+        let s = spec(2, 14);
+        // High arm.
+        let d = decide(&s, &status(Some(50.0), 5), 5, 200, total(0.9), None);
+        assert_eq!(
+            (d.desired, d.learned_ratio),
+            (6, 50.0 * RATIO_DECAY_ON_HIGH)
+        );
+        // Funding arm at threshold.
+        let d = decide(
+            &s,
+            &status(Some(50.0), LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1),
+            4,
+            200,
+            total(0.1),
+            None,
+        );
+        assert_eq!(d.learned_ratio, 50.0 * RATIO_GROWTH_ON_LOW);
+        assert_eq!(d.low_load_ticks, 0);
+        // In-band arm.
+        let d = decide(&s, &status(Some(50.0), 10), 4, 200, total(0.5), None);
+        assert_eq!((d.low_load_ticks, d.learned_ratio), (0, 50.0));
+    }
+
+    // r[verify ctrl.scaler.load-coverage]
+    /// The fold denominates: answers counted against resolved, max
+    /// over answers only, zero answers = the established `None`
+    /// total-failure posture (never a `Some` with a fabricated max).
+    #[test]
+    fn load_aggregate_fold_denominates() {
+        let l = LoadAggregate::fold(&[Some(0.1), None, Some(0.7)]).expect("two answers");
+        assert_eq!((l.max, l.answered, l.resolved), (0.7, 2, 3));
+        assert!(!l.total_coverage());
+
+        let l = LoadAggregate::fold(&[Some(0.2), Some(0.4)]).expect("all answered");
+        assert!(l.total_coverage());
+        assert_eq!(l.max, 0.4);
+
+        assert_eq!(
+            LoadAggregate::fold(&[None, None]),
+            None,
+            "zero answers → None (total-failure posture preserved)"
+        );
+        assert_eq!(LoadAggregate::fold(&[]), None, "zero resolved → None");
     }
 
     /// `RATIO_CEILING` bounds both the read site (a pre-fix inflated
@@ -613,7 +809,7 @@ mod tests {
         // to min, NOT ceil(200/1e9)=1 — same here, but the ratio_out
         // is what matters: it must be ≤ CEILING so decay starts from
         // a sane value.
-        let d = decide(&s, &status(Some(1e9), 0), 2, 200, Some(0.5), None);
+        let d = decide(&s, &status(Some(1e9), 0), 2, 200, total(0.5), None);
         assert!(d.learned_ratio <= RATIO_CEILING);
         assert_eq!(
             d.learned_ratio, RATIO_CEILING,
@@ -626,7 +822,7 @@ mod tests {
             &status(Some(RATIO_CEILING), LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1),
             4,
             200,
-            Some(0.1),
+            total(0.1),
             None,
         );
         assert_eq!(
@@ -648,7 +844,7 @@ mod tests {
             &status(Some(50.0), 0),
             8,
             200,
-            Some(0.5),
+            total(0.5),
             Some(Duration::from_secs(30)),
         );
         assert_eq!(d.desired, 8, "within 5m of last scale-up → hold current");
@@ -660,14 +856,14 @@ mod tests {
             &status(Some(50.0), 0),
             8,
             200,
-            Some(0.5),
+            total(0.5),
             Some(Duration::from_secs(360)),
         );
         assert_eq!(d.desired, 7, "max −1/tick");
 
         // Never scaled up (None) → allow scale-down. Fresh CR at an
         // over-provisioned chart `replicas` shouldn't be stuck for 5m.
-        let d = decide(&s, &status(Some(50.0), 0), 8, 200, Some(0.5), None);
+        let d = decide(&s, &status(Some(50.0), 0), 8, 200, total(0.5), None);
         assert_eq!(d.desired, 7);
     }
 
@@ -680,10 +876,10 @@ mod tests {
     fn learned_ratio_persists_over_seed() {
         let s = spec(2, 14);
         // status carries 67.3 (learned); seed is 50. 200/67.3 ≈ 3.
-        let d = decide(&s, &status(Some(67.3), 0), 2, 200, Some(0.5), None);
+        let d = decide(&s, &status(Some(67.3), 0), 2, 200, total(0.5), None);
         assert_eq!(d.desired, 3);
         // No status (fresh CR) → seed.
-        let d = decide(&s, &status(None, 0), 2, 200, Some(0.5), None);
+        let d = decide(&s, &status(None, 0), 2, 200, total(0.5), None);
         assert_eq!(d.desired, 4);
     }
 
@@ -700,7 +896,7 @@ mod tests {
             &status(Some(50.0), 0),
             20,
             200,
-            Some(0.5),
+            total(0.5),
             Some(Duration::from_secs(30)),
         );
         assert_eq!(d.desired, 14);
@@ -714,13 +910,13 @@ mod tests {
             &status(Some(50.0), 0),
             20,
             200,
-            Some(0.5),
+            total(0.5),
             Some(Duration::from_secs(360)),
         );
         assert_eq!(d.desired, 14, "stabilized branch also respects max");
 
         // High load at max → current+1=15 → clamped to 14.
-        let d = decide(&s, &status(Some(50.0), 0), 14, 200, Some(0.9), None);
+        let d = decide(&s, &status(Some(50.0), 0), 14, 200, total(0.9), None);
         assert_eq!(d.desired, 14);
         assert!(!d.scaled_up, "desired==current → not a scale-up event");
         // Ratio still decays (the LOAD signal is real even if we

@@ -185,7 +185,16 @@ pub fn describe_metrics() {
     describe_gauge!(
         "rio_controller_component_scaler_observed_load",
         "ComponentScaler observed load: max of pg-pool utilization and substitute-admission utilization \
-         across loadEndpoint pods at the last tick (labelled by cs=ns/name)."
+         across the loadEndpoint pods that ANSWERED at the last tick (labelled by cs=ns/name). \
+         Under partial coverage this is a survivor max — see \
+         rio_controller_component_scaler_load_poll_partial_total."
+    );
+    describe_counter!(
+        "rio_controller_component_scaler_load_poll_partial_total",
+        "Ticks whose GetLoad poll resolved more replicas than answered (labelled by cs=ns/name): \
+         the load letter was PARTIAL — survivor-high still scales up, survivor-low funds no ratio \
+         growth. A sustained rate is the load-correlated timeout regime (one replica chronically \
+         saturated or unreachable) — check that pod, not the scaler."
     );
     describe_gauge!(
         "rio_controller_runtime_skew_seconds",

@@ -31,6 +31,7 @@
     "rio_builder_uploads_total",
     "rio_controller_component_scaler_desired_replicas",
     "rio_controller_component_scaler_learned_ratio",
+    "rio_controller_component_scaler_load_poll_partial_total",
     "rio_controller_component_scaler_observed_load",
     "rio_controller_ddsketch_seed_fallback_total",
     "rio_controller_disruption_drains_total",
@@ -436,9 +437,14 @@
         "help": "ComponentScaler learned builders-per-replica ratio (labelled by cs=ns/name). EMA-adjusted against observed PG-pool load; persisted in .status.learnedRatio."
       },
       {
+        "name": "rio_controller_component_scaler_load_poll_partial_total",
+        "kind": "counter",
+        "help": "Ticks whose GetLoad poll resolved more replicas than answered (labelled by cs=ns/name): the load letter was PARTIAL — survivor-high still scales up, survivor-low funds no ratio growth. A sustained rate is the load-correlated timeout regime (one replica chronically saturated or unreachable) — check that pod, not the scaler."
+      },
+      {
         "name": "rio_controller_component_scaler_observed_load",
         "kind": "gauge",
-        "help": "ComponentScaler observed load: max of pg-pool utilization and substitute-admission utilization across loadEndpoint pods at the last tick (labelled by cs=ns/name)."
+        "help": "ComponentScaler observed load: max of pg-pool utilization and substitute-admission utilization across the loadEndpoint pods that ANSWERED at the last tick (labelled by cs=ns/name). Under partial coverage this is a survivor max — see rio_controller_component_scaler_load_poll_partial_total."
       },
       {
         "name": "rio_controller_ddsketch_seed_fallback_total",

@@ -1585,6 +1585,28 @@ With no store CR in the chart (KEDA owns the store replica count,
 RPC and its return values stay (rio-cli, ad-hoc diagnosis, any future CR
 target), and the store's 30 s in-process tick keeps the PG-pool gauge live.
 
+#r("ctrl.scaler.load-coverage")[
+  A partial aggregate over per-replica gauges MUST carry its
+  denominator: the poll fold reports `answered`/`resolved` alongside
+  `max`, and `decide()` MUST consume partial coverage asymmetrically
+  --- a survivor reading above `loadThresholds.high` remains scale-up
+  evidence under any coverage, while ratio-growth funding demands
+  total coverage; a partial aggregate is never consumed as a total
+  one, and zero answers degrade to the no-reading posture rather than
+  a fabricated max.
+]
+Rationale: a per-replica gauge's `max()` drops the unanswered replica
+exactly when its reading may BE the max --- GetLoad is sub-ms when
+healthy, so the slow-to-answer pod is the saturated one (the
+load-correlated timeout regime recurs every pass; the round-13
+instance is bug_061, where idle survivors' low readings funded ratio
+growth every tick while the hot replica's timeout suppressed the
+reactive scale-up). The asymmetry preserves the protective action:
+degrading the whole letter to `None` would suppress exactly the
+scale-up partial coverage can still justify.
+#(refs.metric)("rio_controller_component_scaler_load_poll_partial_total")
+is the recurrence's operator trail.
+
 For any Deployment a ComponentScaler CR targets, the helm chart MUST omit
 that Deployment's `spec.replicas` from the rendered template --- otherwise
 `helm upgrade` resets the replica count and fights the controller. (The
