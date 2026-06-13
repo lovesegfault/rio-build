@@ -3008,4 +3008,416 @@ mod disk_axis_tests {
              load-bearing"
         );
     }
+
+    // ── The TYPE-DERIVED PERSIST-QUAL CENSUS (merged_bug_016;
+    //    [GEN-SET]; sched.sla.refusal-per-column — R31\'(ii)) ───────
+    //
+    // The bug_120 totality law was instantiated by hand-walking the
+    // updated_at quals — site selection by column NAME (stamp axes),
+    // which is exactly where the value-qual fence escaped. This
+    // census derives its population from TYPE EVIDENCE in the query
+    // strings themselves (EXTRACT/isfinite/to_timestamp/now() ⇒
+    // timestamptz; ::float8-cast comparisons ⇒ float8) and walks
+    // EVERY SQL monotone comparison, aggregate (MAX/SUM), and
+    // ORDER-BY..LIMIT over an ordering-vulnerable column across the
+    // sla module corpus — cross-referencing each site to its covering
+    // refusal artifact or REDDING it as uncovered. Residuals are
+    // PRICED rows, never silent exclusions.
+
+    /// Join Rust string literals out of production source (handles
+    /// the `\\`-newline continuation idiom used by the SQL strings).
+    fn extract_string_literals(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let b: Vec<char> = src.chars().collect();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == '"' {
+                let mut lit = String::new();
+                i += 1;
+                while i < b.len() {
+                    match b[i] {
+                        '\\' => {
+                            if i + 1 < b.len() && b[i + 1] == '\n' {
+                                // line continuation: skip newline +
+                                // leading whitespace (rustc semantics)
+                                i += 2;
+                                while i < b.len() && (b[i] == ' ' || b[i] == '\t') {
+                                    i += 1;
+                                }
+                                continue;
+                            }
+                            // keep escaped char verbatim
+                            if i + 1 < b.len() {
+                                lit.push(b[i + 1]);
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                        }
+                        '"' => break,
+                        c => {
+                            lit.push(c);
+                            i += 1;
+                        }
+                    }
+                }
+                out.push(lit);
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// SQL literals only (the census population universe per module).
+    fn sql_literals(src: &str) -> Vec<String> {
+        extract_string_literals(strip_test_mod(src))
+            .into_iter()
+            .filter(|l| {
+                [
+                    "SELECT ",
+                    "INSERT INTO ",
+                    "UPDATE ",
+                    "DELETE FROM ",
+                    "TRUNCATE ",
+                ]
+                .iter()
+                .any(|v| l.contains(v))
+            })
+            .collect()
+    }
+
+    /// Strip table/EXCLUDED qualification from a column token.
+    fn bare_col(tok: &str) -> &str {
+        tok.rsplit('.').next().unwrap_or(tok)
+    }
+
+    /// TYPE EVIDENCE derived from the literals themselves: temporal
+    /// (timestamptz) and float8 column sets. The committed `int`
+    /// supplement covers columns with monotone quals but no
+    /// in-literal type evidence (BIGSERIAL `id`) — contradiction-
+    /// checked: supplement columns must never acquire vulnerable-type
+    /// evidence.
+    fn derive_type_evidence(lits: &[String]) -> (Vec<String>, Vec<String>) {
+        let mut temporal = Vec::new();
+        let mut float8 = Vec::new();
+        for l in lits {
+            for (pat, kind) in [
+                ("EXTRACT(EPOCH FROM MAX(", "t"),
+                ("EXTRACT(EPOCH FROM ", "t"),
+                ("isfinite(", "t"),
+            ] {
+                let mut rest = l.as_str();
+                while let Some(pos) = rest.find(pat) {
+                    let after = &rest[pos + pat.len()..];
+                    let col: String = after
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+                        .collect();
+                    let c = bare_col(&col).to_owned();
+                    if !c.is_empty() && kind == "t" && !temporal.contains(&c) {
+                        temporal.push(c);
+                    }
+                    rest = &rest[pos + pat.len()..];
+                }
+            }
+            // `col <op> to_timestamp(...)` / `col <op> now()` ⇒ temporal;
+            // `col <op> '...'::float8` ⇒ float8.
+            for caps in qual_sites(l) {
+                let (col, _op, rhs) = caps;
+                if rhs.starts_with("to_timestamp(") || rhs.starts_with("now()") {
+                    if !temporal.contains(&col) {
+                        temporal.push(col.clone());
+                    }
+                } else if rhs.contains("::float8") {
+                    if !float8.contains(&col) {
+                        float8.push(col.clone());
+                    }
+                }
+            }
+        }
+        temporal.sort();
+        float8.sort();
+        (temporal, float8)
+    }
+
+    /// Every `col <op> rhs` comparison in one literal:
+    /// `(bare_col, op, rhs_token)`.
+    fn qual_sites(lit: &str) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        let toks: Vec<&str> = lit.split_whitespace().collect();
+        for w in toks.windows(3) {
+            let op = w[1];
+            if ["<=", ">=", "<", ">"].contains(&op) {
+                // strip grouping parens (`NOT (value < ...`) so the
+                // column inside a NOT-group still enumerates — the
+                // paren-blind walk dropped exactly the repair
+                // DELETE's own comparisons.
+                let col = bare_col(w[0]).trim_start_matches('(');
+                if col.chars().all(|c| c.is_alphanumeric() || c == '_') && !col.is_empty() {
+                    out.push((col.to_owned(), op.to_owned(), w[2].to_owned()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Aggregate consumption shapes over a column: MAX/MIN/SUM +
+    /// ORDER BY..LIMIT.
+    fn aggregate_sites(lit: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for agg in ["MAX(", "MIN(", "SUM("] {
+            let mut rest = lit;
+            while let Some(pos) = rest.find(agg) {
+                let after = &rest[pos + agg.len()..];
+                let col: String = after
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+                    .collect();
+                out.push((
+                    bare_col(&col).to_owned(),
+                    agg.trim_end_matches('(').to_owned(),
+                ));
+                rest = &rest[pos + agg.len()..];
+            }
+        }
+        if lit.contains("ORDER BY") && lit.contains("LIMIT") {
+            out.push(("<order-by-limit>".to_owned(), "ORDERBY".to_owned()));
+        }
+        out
+    }
+
+    // r[verify sched.sla.refusal-per-column]
+    /// **The persist-qual census (merged_bug_016; riders (a)+(b);
+    /// R31\'(ii) type-derived site selection).** Population per module
+    /// = monotone quals + aggregates over type-evidence-vulnerable
+    /// columns; each site is COVERED (its refusal artifact asserted
+    /// in-literal or as a production decode text-pin), REPAIR-shaped
+    /// (it IS an artifact), or a PRICED residual — never silently out
+    /// of population.
+    #[test]
+    fn w13_persist_qual_census() {
+        let corpus = weight_census_corpus();
+        let declared = parse_mod_decls(include_str!("mod.rs"));
+        for m in &declared {
+            assert!(
+                corpus.iter().any(|(n, _)| n == m),
+                "sla module `{m}` missing from the census corpus"
+            );
+        }
+        // The committed int supplement (no in-literal type evidence;
+        // bound from i64 at every site).
+        let int_supplement = ["id", "epoch", "cores", "mem_bytes", "attempts"];
+        for (name, src) in &corpus {
+            let lits = sql_literals(src);
+            // Committed SQL-presence map: a NEW module growing SQL
+            // joins the census consciously.
+            let expect_sql = ["cost", "mod", "hw"].contains(name);
+            assert_eq!(
+                !lits.is_empty(),
+                expect_sql,
+                "{name}.rs SQL presence drifted from the committed map"
+            );
+            let (temporal, float8) = derive_type_evidence(&lits);
+            let mut quals: Vec<(String, String)> = Vec::new();
+            let mut aggs: Vec<(String, String)> = Vec::new();
+            for l in &lits {
+                for (col, op, _rhs) in qual_sites(l) {
+                    if temporal.contains(&col) || float8.contains(&col) {
+                        quals.push((col, op));
+                    } else if int_supplement.contains(&col.as_str()) {
+                        // contradiction check rides below
+                    } else if col.parse::<f64>().is_err() {
+                        panic!(
+                            "{name}.rs: monotone qual on `{col}` with NO \
+                             type evidence and no committed supplement \
+                             row — classify it (the silent-exclusion \
+                             face is the merged_bug_016 shape)"
+                        );
+                    }
+                }
+                for (col, agg) in aggregate_sites(l) {
+                    if temporal.contains(&col) || float8.contains(&col) {
+                        aggs.push((col, agg));
+                    }
+                }
+            }
+            // Supplement contradiction check.
+            for c in int_supplement {
+                assert!(
+                    !temporal.contains(&c.to_owned()) && !float8.contains(&c.to_owned()),
+                    "{name}.rs: supplement column `{c}` acquired \
+                     vulnerable-type evidence — re-derive the row"
+                );
+            }
+            quals.sort();
+            aggs.sort();
+            let (want_quals, want_aggs): (Vec<(&str, &str)>, Vec<(&str, &str)>) = match *name {
+                // cost.rs — the lambda-unit plane. Coverage per row:
+                //   value <= ×2  : the cursor fence qual + the heal
+                //                  arm\'s own 2^53 bound (the artifact)
+                //   value >= ×1  : the heal arm\'s 0 bound (artifact)
+                //   value/num/den </> : the repair DELETE\'s explicit
+                //                  finite-domain comparisons (artifact)
+                //   updated_at <= ×3 : price/lambda/node_count upserts
+                //                  — isfinite arm asserted in-literal
+                //   last_observed < ×1 : the menu upsert — isfinite arm
+                //   at < ×1      : the retention sweep — PRICED
+                //                  RESIDUAL (a far-future stamp makes
+                //                  the row immortal: bounded to table
+                //                  bloat — consumption is id-cursored
+                //                  and the fold\'s decode refuses the
+                //                  group; routed to the absurdity-
+                //                  ceiling family, round-14 for the
+                //                  sweep arm)
+                "cost" => (
+                    vec![
+                        ("at", "<"),
+                        ("denominator", "<"),
+                        ("denominator", ">"),
+                        ("last_observed", "<"),
+                        ("numerator", "<"),
+                        ("numerator", ">"),
+                        ("updated_at", "<="),
+                        ("updated_at", "<="),
+                        ("updated_at", "<="),
+                        ("value", "<"),
+                        ("value", "<="),
+                        ("value", "<="),
+                        ("value", ">"),
+                        ("value", ">="),
+                    ],
+                    // MAX(at): covered by Epoch::from_pg_epoch(max_at);
+                    // SUM(value): covered by from_pg_finite(sum) — both
+                    // text-pinned below.
+                    vec![("at", "MAX"), ("value", "SUM")],
+                ),
+                // hw.rs — measured_at > now()-7d window: PRICED
+                // RESIDUAL (an immortal far-future row biases the
+                // 7-day factor medians boundedly — median-fold
+                // robustness named as the bound; routed round-14).
+                "hw" => (vec![("measured_at", ">")], vec![]),
+                // mod.rs — config-epoch plane: ZERO vulnerable sites
+                // (proven mechanically, not assumed).
+                _ => (vec![], vec![]),
+            };
+            let got_q: Vec<(&str, &str)> = quals
+                .iter()
+                .map(|(c, o)| (c.as_str(), o.as_str()))
+                .collect();
+            let got_a: Vec<(&str, &str)> =
+                aggs.iter().map(|(c, o)| (c.as_str(), o.as_str())).collect();
+            assert_eq!(
+                got_q, want_quals,
+                "{name}.rs persist-qual population drifted — every new \
+                 monotone consult over a vulnerable column lands with \
+                 its refusal artifact or a priced residual row \
+                 (re-derive, never hand-wave)"
+            );
+            assert_eq!(got_a, want_aggs, "{name}.rs aggregate population drifted");
+        }
+        // COVERAGE cross-reference (the artifact asserted where the
+        // site lives):
+        let cost_src = strip_test_mod(include_str!("cost.rs"));
+        let cost_lits = sql_literals(cost_src);
+        for l in &cost_lits {
+            if l.contains("lambda_cursor") && l.contains("value <=") {
+                assert!(
+                    l.contains("trunc(sla_ema_state.value)"),
+                    "the cursor fence carries its total-domain heal arm"
+                );
+            }
+            if l.contains("updated_at <= to_timestamp") {
+                assert!(
+                    l.contains("NOT isfinite(sla_ema_state.updated_at)"),
+                    "every stamp fence carries its isfinite arm"
+                );
+            }
+            if l.contains("last_observed < EXCLUDED") {
+                assert!(
+                    l.contains("NOT isfinite(sla_observed_instance_types.last_observed)"),
+                    "the menu fence carries its isfinite arm"
+                );
+            }
+        }
+        assert!(
+            cost_src.contains("Epoch::from_pg_epoch(max_at)"),
+            "MAX(at) is decode-covered at the fold"
+        );
+        assert!(
+            cost_src.contains("from_pg_finite(sum)"),
+            "SUM(value) is decode-covered at the fold"
+        );
+        assert!(
+            cost_src.contains("fn from_pg_cursor") && cost_src.contains("fn from_pg_finite"),
+            "the typed value-family decode boundary exists"
+        );
+    }
+
+    /// **Persist-qual census planted reds + K-mutation battery
+    /// (riders (b)/(c)/(d)).** W13-V3.
+    #[test]
+    fn w13_v3_persist_qual_census_plants_and_mutations() {
+        // (c) PLANTED-DUPLICATE: two quals on ONE column stay two
+        // sites under the count-bearing key.
+        let dup = r#"fn f() { let _ = sqlx::query("UPDATE t SET x = 1 WHERE value <= $1 AND value <= to_timestamp($2)"); }"#;
+        let lits = sql_literals(dup);
+        let q = qual_sites(&lits[0]);
+        assert_eq!(q.len(), 2, "two quals on one column = two sites");
+        // (b) jurisdiction plant: a SQL literal growing in a module
+        // committed SQL-free REDs the presence map (driven in the
+        // live census); here: the literal-extractor FINDS it.
+        let sneaky = r#"fn g() { let _ = sqlx::query("SELECT a FROM t WHERE updated_at <= to_timestamp($1)"); }"#;
+        assert_eq!(sql_literals(sneaky).len(), 1, "the walk finds new SQL");
+        // (b3) outside-but-adjacent plant: a MAX over a float8 column
+        // must NOT silently pass — it lands in the aggregate
+        // population the moment the column has evidence.
+        let max_plant = r#"fn h() { let _ = sqlx::query("SELECT MAX(value) FROM t WHERE value < 'Infinity'::float8"); }"#;
+        let lits = sql_literals(max_plant);
+        let (_t, f8) = derive_type_evidence(&lits);
+        assert!(f8.contains(&"value".to_owned()), "evidence derived");
+        let aggs = aggregate_sites(&lits[0]);
+        assert!(
+            aggs.contains(&("value".to_owned(), "MAX".to_owned())),
+            "the MAX(value) plant joins the population — uncovered \
+             aggregates RED, never silently pass"
+        );
+        // (d) K-MUTATION: the type predicate narrowed to NAME-matching
+        // (the stamp-axis hand list that BUILT this bug) must kill the
+        // planted red — the value-qual plant drops out of the mutated
+        // population while the live census sees it.
+        let plant_lits = vec![
+            "UPDATE t SET x = 1 WHERE value <= $1".to_owned(),
+            "DELETE FROM t WHERE value < 'Infinity'::float8".to_owned(),
+        ];
+        let (_t, f8) = derive_type_evidence(&plant_lits);
+        let live: Vec<_> = qual_sites(&plant_lits[0])
+            .into_iter()
+            .filter(|(c, _, _)| f8.contains(c))
+            .collect();
+        assert_eq!(
+            live.len(),
+            1,
+            "the LIVE type-derived walk sees the value qual"
+        );
+        let name_list = ["updated_at", "last_observed", "at", "measured_at"];
+        let mutated: Vec<_> = qual_sites(&plant_lits[0])
+            .into_iter()
+            .filter(|(c, _, _)| name_list.contains(&c.as_str()))
+            .collect();
+        assert!(
+            mutated.is_empty(),
+            "MUTATION: the NAME-matched predicate is BLIND to the \
+             value qual — the planted red dies, proving the \
+             type-evidence derivation is load-bearing (the \
+             merged_bug_016 hand-list reproduced as a mutation)"
+        );
+        // (d2) emptied-walk mutation: literal extraction defeated ⇒
+        // zero literals; the SQL-presence map is the oracle.
+        assert!(
+            sql_literals("fn nothing() {}").is_empty(),
+            "MUTATION: an emptied extractor yields no literals — the \
+             committed presence map (cost/mod/hw MUST have SQL) is \
+             the oracle that REDs it"
+        );
+    }
 }
