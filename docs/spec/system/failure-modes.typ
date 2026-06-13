@@ -592,8 +592,8 @@ clock's refresh event, the derived (refresh, bound) pair in its honest
 expanded form, and the compile assert pinning it --- under the
 doctrine above (#rref("sys.gate.static-cadence-witness")).
 
-- /Inbound-idle self-activity conjunct (store --- the banner instance,
-  bug_018)/: the gate's disarming clock (`last_self_activity`) was
+- *Inbound-idle self-activity conjunct (store --- the banner instance,
+  bug_018)*: the gate's disarming clock (`last_self_activity`) was
   refreshed by the periodic cut timer whose period (60 s) EQUALS the
   idle bound (60 s), and a no-op `CutStep::Empty` tick could write the
   stamp --- the conjunct was satisfiable only at an exact timer-phase

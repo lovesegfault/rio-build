@@ -2932,6 +2932,18 @@ boundary collapse (R29), and the exactness of the swept counter derives
 from the locking primitive, never from sequential-pass reasoning
 (bug_104).
 
+The session-row conjunct is denominated in heartbeat STALENESS, so "the
+drain holds the row" is true exactly as far as a beat covers the drain
+(F10): the dedicated heartbeat task spans the disconnect drain and is
+RESPAWNED for it when the original died (the panic face --- the only
+no-latch death; PG errors retry by design), with the cadence-vs-staleness
+coupling compile-certified by the sessions margin certificate. The model's
+prior doc credited the in-memory deregistration scopeguard --- which
+governs the TailLog-routing registry entry and runs BEFORE the drain ---
+with this DB row's lifetime; that wrong-mechanism claim is retired (the
+audit's rot exhibit), and the beat-death drain window is witnessed
+RED/GREEN at the conjunct's own predicate text.
+
 #r("store.log.write-read-bound+2")[
   The chunk payload ceiling is ONE shared constant consumed by both halves
   of the codec, and it is denominated in CHARGED bytes --- content plus the

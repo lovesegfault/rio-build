@@ -2483,7 +2483,9 @@ rec {
     # artifact-free: no surviving drv_log_chunks row, no live
     # log_ingest_sessions registry row, where registry liveness covers
     # the detached-but-undrained session whose disconnect drain is
-    # still flushing); an expired-but-referenced execution's row
+    # still flushing — kept TRUE in code by the dedicated drain
+    # heartbeat, respawned on beat death (F10)); an
+    # expired-but-referenced execution's row
     # survives until the attempt-ledger GC releases it, and a row never
     # outruns its artifacts (noOrphanLogChunks).
     # r[verify store.log.sweep-ownership+2]

@@ -446,6 +446,17 @@ impl HeartbeatHandle {
         self.lost.clone()
     }
 
+    /// Whether the beat task has ENDED (F10): the only way here
+    /// without a Lost latch is a panic in the task — PG errors retry
+    /// on the next tick by design and never kill it. The driver's
+    /// cleanup consults this before the final drain: a dead beat
+    /// would leave the drain unbeaten, the row would go stale
+    /// mid-drain, and the scheduler's gc could reap the execution out
+    /// from under the drain's late chunk INSERTs.
+    pub fn is_dead(&self) -> bool {
+        self.task.is_finished()
+    }
+
     /// Stop the beat task and join it, bounded by [`TICK_BODY_BOUND`]
     /// (the ONE tick-body quantity, merged_bug_019: the longest the
     /// task can lawfully be in flight is its tick-body envelope —

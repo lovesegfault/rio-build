@@ -909,14 +909,24 @@ module logService {
     match sessions.get(e).get(s) { | NoSession => Set() | Session(x) => x.buf }
   def sessIsOpen(e: int, s: int): bool = hasSession(e, s) and sessPhase(e, s) == SessOpen
 
-  /// The `log_ingest_sessions` REGISTRY row's liveness, as the
-  /// execution-row GC's sixth conjunct sees it: the row exists from
-  /// `acquire` until the AppendDriver's deregistration scopeguard —
-  /// which runs AFTER the disconnect drain commits the buffered tail.
-  /// So: an OPEN session holds its row, and a DETACHED session holds
-  /// it exactly while its drain is still flushing (non-empty buffer).
-  /// The abort arm wipes the buffer at detach, so an aborted session's
-  /// row dies immediately — both arms mirror service.rs's exit order.
+  /// The `log_ingest_sessions` row's liveness, as the execution-row
+  /// GC's sixth conjunct sees it (F10 — the doc previously named the
+  /// WRONG mechanism: the in-memory deregistration scopeguard, which
+  /// governs the TailLog-routing registry entry and runs BEFORE the
+  /// drain, not this DB row). The TRUE mechanism the code denominates
+  /// in: the row exists from `acquire` until `sessions::release`,
+  /// which runs AFTER the disconnect drain commits the buffered tail;
+  /// the conjunct reads heartbeat STALENESS, and the heartbeat spans
+  /// the drain on a dedicated task — respawned for the drain if the
+  /// original died (the panic face) — whose cadence the sessions.rs
+  /// margin certificate compile-asserts strictly under the staleness
+  /// bound. The drain therefore HOLDS the row for as long as it
+  /// flushes, which is exactly this predicate's abstraction:
+  /// an OPEN session holds its row, and a DETACHED session holds it
+  /// while its drain is still flushing (non-empty buffer). The abort
+  /// arm wipes the buffer at detach, so an aborted session's row dies
+  /// immediately (release runs promptly there) — both arms mirror
+  /// service.rs's exit order.
   def registryLive(e: int, s: int): bool = and {
     hasSession(e, s),
     or { sessPhase(e, s) == SessOpen, sessBuf(e, s) != Set() },
@@ -973,10 +983,12 @@ module logService {
     // log_ingest_sessions), under ANY retention configuration.
     // The registry conjunct keys on `registryLive`: open sessions AND
     // detached-but-undrained ones still hold their
-    // `log_ingest_sessions` row (the deregistration scopeguard runs
-    // after the disconnect drain) — found by this model: keying on
-    // open-only admitted a reclaim under an in-flight drain, whose
-    // late chunk INSERT (no FK) would orphan.
+    // `log_ingest_sessions` row (release runs after the disconnect
+    // drain, and the dedicated drain heartbeat — respawned on beat
+    // death, F10 — keeps the staleness conjunct holding it while the
+    // drain flushes) — found by this model: keying on open-only
+    // admitted a reclaim under an in-flight drain, whose late chunk
+    // INSERT (no FK) would orphan.
     CALIB_GC_ROW_IGNORE_ARTIFACTS or and {
       chunks.get(e) == Set(),
       not(SESSION_IDS.exists(s => registryLive(e, s))),

@@ -1701,7 +1701,36 @@ impl AppendDriver {
         // ours (the new owner's session is the committing one now).
         let drain_stop = match &exit {
             LoopExit::ClientFinished | LoopExit::AbortRefusesInput(_) => {
-                self.drain(&ack_tx).await.err()
+                // F10 (arm A): the drain's session-row liveness rides
+                // the dedicated heartbeat task. If that task is DEAD —
+                // a panic; the only no-latch death, since PG errors
+                // retry by design — the drain below would run
+                // unbeaten: the row goes stale at SESSION_STALE_AFTER
+                // mid-drain, the scheduler's gc_exec_rows sees its
+                // live-session conjunct released and reaps the
+                // execution, and the drain's late chunk INSERT lands
+                // orphaned (migration 066 has no FK — the exact class
+                // the model's v3 conjunct closes). Respawn the beat
+                // for exactly the drain's lifetime: same dedicated
+                // task, same certified cadence — the sessions.rs
+                // margin certificate (worst committed-stamp age
+                // 2I + F + R < SESSION_STALE_AFTER) is the standing
+                // R34 (refresh, bound) witness for this pair; no new
+                // coupling is minted here. (Per-completed-chunk
+                // stamping was REJECTED at derivation: one
+                // watchdog-bounded cut legally occupies a full cut
+                // interval — 60 s default — which EXCEEDS the 45 s
+                // staleness bound, so a chunk-cadenced stamp cannot
+                // satisfy any assert; the bug_148 census also refuses
+                // inline heartbeats in this file's production half.)
+                let drain_beat = lease
+                    .is_dead()
+                    .then(|| sessions::spawn_heartbeat(self.pool.clone(), exec_id, session_id));
+                let stop = self.drain(&ack_tx).await.err();
+                if let Some(beat) = drain_beat {
+                    beat.stop().await;
+                }
+                stop
             }
             LoopExit::AbortCannotCommit(_) | LoopExit::LeaseLost | LoopExit::Displaced => None,
         };
@@ -3572,6 +3601,206 @@ mod tests {
         );
     }
 
+    /// W13-AE (F10), the orphan class at the component tier — the
+    /// beat-task-death drain window, RED/GREEN as the audit derives
+    /// it. The denomination claim under test: the GC's liveness
+    /// conjunct reads HEARTBEAT STALENESS (the shared
+    /// `live_ingest_session_sql` predicate — the same fragment
+    /// `gc_exec_rows` binds, conjunct 6), so the drain holds the row
+    /// exactly as long as a beat covers it. The beat-death feeder is
+    /// PANIC-ONLY (verified at the task's error arm: PG errors retry
+    /// next tick by design and never kill it), so the window is
+    /// driven here by the world it creates — a row no beat covers,
+    /// time advanced past the staleness bound via backdating (PG's
+    /// clock cannot be paused; the W10-BC precedent).
+    ///
+    /// RED face (the pre-fix world — the drain unbeaten): the
+    /// conjunct releases the row mid-drain, the reap fires, and the
+    /// drain's late chunk INSERT lands ORPHANED (no FK in migration
+    /// 066: the chunk row exists, its execution does not). GREEN
+    /// face (arm A — the dedicated drain beat, the respawn's
+    /// mechanism): the SAME backdated window with a live beat task
+    /// re-freshens within one interval, the conjunct holds the row,
+    /// the reap refuses, and no orphan can form.
+    // r[verify store.log.sweep-ownership+2]
+    #[tokio::test]
+    async fn dead_beat_drain_window_is_the_orphan_class() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let exec = seed_assignment(&db.pool, "builder-0").await;
+        let session = Uuid::now_v7();
+        let acquired = sessions::acquire(&db.pool, exec, session, "test-pod")
+            .await
+            .expect("acquire");
+        assert!(matches!(acquired, sessions::Acquire::Acquired));
+
+        // The dead-beat window: nothing refreshes; time passes (the
+        // staleness bound, compressed via backdating on PG's clock).
+        sqlx::query(
+            "UPDATE log_ingest_sessions SET heartbeat_at = now() - make_interval(secs => $1)              WHERE exec_id = $2",
+        )
+        .bind(sessions::SESSION_STALE_AFTER.as_secs_f64() + 5.0)
+        .bind(exec)
+        .execute(&db.pool)
+        .await
+        .expect("backdate");
+
+        // Conjunct 6, the production predicate text: the row reads
+        // DEAD — the gc is licensed to reap the execution although
+        // the drain still has work.
+        let live_sql = format!(
+            "SELECT EXISTS(SELECT 1 FROM log_ingest_sessions s              WHERE s.exec_id = $1 AND {})",
+            rio_migrations::sql::live_ingest_session_sql("s.heartbeat_at", "$2")
+        );
+        let live: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(live_sql.clone()))
+            .bind(exec)
+            .bind(rio_migrations::sql::SESSION_STALE_AFTER_SECS)
+            .fetch_one(&db.pool)
+            .await
+            .expect("predicate");
+        assert!(
+            !live,
+            "RED precondition: the unbeaten row reads dead mid-drain"
+        );
+
+        // The reap fires (the gc's effect), then the drain's late
+        // chunk INSERT lands — the orphan, verbatim.
+        sqlx::query("DELETE FROM drv_executions WHERE exec_id = $1")
+            .bind(exec)
+            .execute(&db.pool)
+            .await
+            .expect("the reap");
+        sqlx::query(
+            "INSERT INTO drv_log_chunks              (exec_id, session_id, chunk_seq, first_line, line_count, byte_size, s3_key,               accounted_bytes) VALUES ($1, $2, 0, 0, 1, 16, 'late-drain-chunk', 16)",
+        )
+        .bind(exec)
+        .bind(session)
+        .execute(&db.pool)
+        .await
+        .expect("the late INSERT lands — no FK refuses it");
+        let orphan: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM drv_log_chunks c WHERE c.exec_id = $1)              AND NOT EXISTS(SELECT 1 FROM drv_executions e WHERE e.exec_id = $1)",
+        )
+        .bind(exec)
+        .fetch_one(&db.pool)
+        .await
+        .expect("orphan check");
+        assert!(
+            orphan,
+            "W13-AE red: the chunk row exists and its execution does not —              the orphan the model's v3 conjunct takes credit for closing"
+        );
+
+        // GREEN face: the SAME window with a live dedicated beat (the
+        // respawn's mechanism, production task at a fast test
+        // cadence — the injected-runner lane; the BEAT is the real
+        // `sessions::heartbeat` UPDATE). The red exec's assignment is
+        // retired first (one active assignment per derivation).
+        sqlx::query("UPDATE assignments SET status = 'completed' WHERE exec_id = $1")
+            .bind(exec)
+            .execute(&db.pool)
+            .await
+            .expect("retire the red exec's assignment");
+        let exec2 = seed_assignment(&db.pool, "builder-1").await;
+        let session2 = Uuid::now_v7();
+        let acquired = sessions::acquire(&db.pool, exec2, session2, "test-pod")
+            .await
+            .expect("acquire");
+        assert!(matches!(acquired, sessions::Acquire::Acquired));
+        let beat = sessions::spawn_heartbeat_with(
+            db.pool.clone(),
+            exec2,
+            session2,
+            std::time::Duration::from_millis(100),
+        );
+        sqlx::query(
+            "UPDATE log_ingest_sessions SET heartbeat_at = now() - make_interval(secs => $1)              WHERE exec_id = $2",
+        )
+        .bind(sessions::SESSION_STALE_AFTER.as_secs_f64() + 5.0)
+        .bind(exec2)
+        .execute(&db.pool)
+        .await
+        .expect("backdate");
+        // Within a few beats the dedicated task re-freshens the row.
+        let mut live = false;
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            live = sqlx::query_scalar(sqlx::AssertSqlSafe(live_sql.clone()))
+                .bind(exec2)
+                .bind(rio_migrations::sql::SESSION_STALE_AFTER_SECS)
+                .fetch_one(&db.pool)
+                .await
+                .expect("predicate");
+            if live {
+                break;
+            }
+        }
+        assert!(
+            live,
+            "W13-AE green: the dedicated drain beat re-freshens the row —              the conjunct holds it and the reap refuses while the drain works"
+        );
+        beat.stop().await;
+    }
+
+    /// W13-AE2 (F10): the reaper's TRUE positives are preserved — a
+    /// genuinely dead session (stale, no beat, no drain) reads dead
+    /// to the same predicate, exactly as before.
+    #[tokio::test]
+    async fn genuinely_dead_sessions_still_read_dead() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let exec = seed_assignment(&db.pool, "builder-0").await;
+        let session = Uuid::now_v7();
+        sessions::acquire(&db.pool, exec, session, "test-pod")
+            .await
+            .expect("acquire");
+        sqlx::query(
+            "UPDATE log_ingest_sessions SET heartbeat_at = now() - make_interval(secs => $1)              WHERE exec_id = $2",
+        )
+        .bind(sessions::SESSION_STALE_AFTER.as_secs_f64() + 5.0)
+        .bind(exec)
+        .execute(&db.pool)
+        .await
+        .expect("backdate");
+        let live_sql = format!(
+            "SELECT EXISTS(SELECT 1 FROM log_ingest_sessions s              WHERE s.exec_id = $1 AND {})",
+            rio_migrations::sql::live_ingest_session_sql("s.heartbeat_at", "$2")
+        );
+        let live: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(live_sql))
+            .bind(exec)
+            .bind(rio_migrations::sql::SESSION_STALE_AFTER_SECS)
+            .fetch_one(&db.pool)
+            .await
+            .expect("predicate");
+        assert!(!live, "a genuinely dead session stays reapable");
+    }
+
+    /// F10: `HeartbeatHandle::is_dead` — the respawn arm's detector.
+    /// False while the task runs; true once it ends (here: a stopped
+    /// task — the panic face ends the task identically).
+    #[tokio::test]
+    async fn heartbeat_is_dead_tracks_task_end() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let exec = seed_assignment(&db.pool, "builder-0").await;
+        let session = Uuid::now_v7();
+        sessions::acquire(&db.pool, exec, session, "test-pod")
+            .await
+            .expect("acquire");
+        let beat = sessions::spawn_heartbeat_with(
+            db.pool.clone(),
+            exec,
+            session,
+            std::time::Duration::from_millis(50),
+        );
+        assert!(!beat.is_dead(), "a running beat is not dead");
+        let watch = beat.lost_watch();
+        beat.stop().await;
+        // stop() joined the task: a fresh handle view would read dead.
+        // (HeartbeatHandle::stop consumes self; the watch's sender is
+        // gone — the driver-side death observation.)
+        assert!(
+            watch.has_changed().is_err(),
+            "the task ended without latching Lost — the death face the              respawn arm keys on"
+        );
+    }
+
     /// live062-R3, the graceful-shutdown lease release: with live
     /// wedged-open sessions (drivers running, rows fresh — the shape
     /// the runtime drop kills mid-teardown), discharging the typed
@@ -4078,11 +4307,12 @@ mod tests {
             );
         }
         let spawn_beat = format!("sessions::{}(", "spawn_heartbeat");
-        if src.matches(&spawn_beat).count() != 1 {
+        if src.matches(&spawn_beat).count() != 2 {
             v.push(
-                "exactly one sessions::spawn_heartbeat site: the driver spawns the \
-                 dedicated heartbeat task once per stream (run), and nothing else \
-                 mints one",
+                "exactly two sessions::spawn_heartbeat sites: the stream-open spawn \
+                 (run) and the dead-beat drain respawn (F10's arm A — the census \
+                 widened DELIBERATELY for it); nothing else mints one, and inline \
+                 heartbeats remain refused above",
             );
         }
         v
