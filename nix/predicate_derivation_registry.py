@@ -58,7 +58,7 @@ KINDS = ("derived", "planted", "debt")
 
 # Provenance declarations — REVIEWED claims over the machine-derived
 # population (the values are declarations by design: each is the
-# review surface R31' demands; the totality and the anchors are
+# review surface R31' demands; the totality and the anchors are  # quantifier: census(check_registry)
 # machine-checked).
 PROVENANCE = {
     # --- planted (battery + K-mutation harness in-artifact) -----------
@@ -170,7 +170,8 @@ def check_registry(src_root, provenance=None, registry_names=None):
             "population floor — the enrolled generator fleet is empty "
             "((vvvvv): census_corpora.REGISTRY unreadable or emptied)"
         )
-    # totality, both directions (R31': a census with neither
+    # totality, both directions — quantifier: census(check_registry)
+    # (R31': a census with neither
     # provenance nor debt is the gate red).
     for name in sorted(registry_names):
         if name not in provenance:
