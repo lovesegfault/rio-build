@@ -1545,7 +1545,7 @@ reconciler's signal arithmetic for whatever target a future CR names.
   learned value, not `spec.seedRatio`.
 ]
 
-#r("ctrl.scaler.evidence-funding")[
+#r("ctrl.scaler.evidence-funding+2")[
   A windowed-evidence counter MUST increment under exactly the
   predicate whose sustained truth it witnesses --- fund equals spend:
   the low-load streak counts only low-load-while-WORKING ticks
@@ -1554,6 +1554,14 @@ reconciler's signal arithmetic for whatever target a future CR names.
   it. Idle is non-evidence by the growth gate's own rationale;
   banking it as redeemable credit fires the spend at the regime
   boundary with zero of the evidence the window exists to require.
+  The funding predicate evaluates at the OBSERVATION-ALPHABET
+  boundary: any conjunct computable without the load reading
+  (working vs idle/at-min) MUST also evaluate on observation-absent
+  ticks --- preserve-on-absent is reserved for the genuinely
+  evidence-ambiguous cell (working, load unknown --- sensor absent or
+  partial-coverage low), and even there the banked streak is
+  staleness-bounded (decayed one tick per ambiguous tick), so an
+  unbounded sensor outage expires the bank instead of parking it.
 ]
 
 The round-12 instance (bug_147): gate-failure low-load ticks were
@@ -1564,6 +1572,17 @@ zero low-load-while-working evidence, recurring on every idle→busy
 transition; the companion test pinned the cap and never drove the
 transition. The wave-10 close gated the SPEND but left idle ticks
 FUNDING the window --- the funding predicate is part of the law.
+
+The round-13 instance (merged_bug_009): the bug_147 reset lived only
+inside the low-reading arm, so it was evaluated only when the poll
+clock ticked --- with scale-to-zero targets (`replicas.min: 0` ⇒ zero
+pods ⇒ zero resolved addresses ⇒ no reading) sensor absence is
+CORRELATED with the idle regime the gate classifies, the reset was
+structurally unreachable across the whole idle window, and the
+parked streak funded growth on the first busy low tick. The repair
+hoists the sensor-free classification to the observation-alphabet
+boundary (the R34(iii) funding-clock face: a predicate computable
+without the sensor is evaluated on sensor-absent ticks).
 
 #r("store.admin.get-load+3")[
   `StoreAdminService.GetLoad` returns `pg_pool_utilization = (pool.size −

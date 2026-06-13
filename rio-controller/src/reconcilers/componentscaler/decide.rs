@@ -13,13 +13,16 @@
 //! builders   = Σ(class.queued + class.running)          [predictive]
 //! ratio      = status.learnedRatio ?? spec.seedRatio
 //! predicted  = ceil(builders / ratio)
-//! max_load   = max(GetLoad over loadEndpoint pods)       [observed]
+//! load       = denominated max(GetLoad) letter           [observed]
+//! working    = builders > 0 && current > min       [sensor-free]
 //!
-//! if max_load > high:  desired = current + 1; ratio *= 0.95; low_ticks = 0
-//! elif max_load < low: low_ticks += 1; desired = predicted
-//!                       if low_ticks >= 30 && builders > 0 && current > min:
-//!                           ratio *= 1.02; low_ticks = 0
-//! else:                desired = predicted; low_ticks = 0
+//! if load high (any coverage):   desired = current + 1; ratio *= 0.95; ticks = 0
+//! elif load low (total cover):   desired = predicted
+//!                                 working ? ticks += 1 (at 30: ratio *= 1.02, ticks = 0)
+//!                                         : ticks = 0
+//! elif load in-band:             desired = predicted; ticks = 0
+//! else (absent | partial-low):   desired = predicted
+//!                                 working ? ticks -= 1 : ticks = 0   [staleness decay]
 //!
 //! desired = clamp(desired, min, max)
 //! if desired < current && now-lastScaleUp < 5m: desired = current
@@ -79,6 +82,20 @@ pub const SCALE_DOWN_STABILIZATION: Duration = Duration::from_secs(300);
 /// in-flight PutPath cleanly. I-125a/b made mid-PutPath termination
 /// CORRECT; this keeps it CHEAP.
 pub const MAX_SCALE_DOWN_STEP: i32 = 1;
+
+/// Staleness cap on banked low-load evidence across sensor-ambiguous
+/// ticks. On a WORKING tick whose load letter cannot adjudicate the
+/// low streak (sensor absent, or partial-coverage low), the banked
+/// streak DECAYS by this many ticks instead of parking bit-exact:
+/// preserved evidence survives at most bank-size ambiguous ticks, so
+/// the staleness envelope is priced by the two consts alone —
+/// ≤ [`LOW_LOAD_TICKS_FOR_RATIO_GROWTH`] ticks (300s) of outage
+/// expires any bank to zero, with no new clock or cross-tick state
+/// (R17) — while a short poll blip costs exactly its own duration,
+/// keeping the genuinely evidence-ambiguous cell preserved.
+/// Idle/at-min ticks never reach this: their classification needs no
+/// reading, so they RESET regardless of sensor availability.
+pub const AMBIGUOUS_TICK_EVIDENCE_DECAY: u32 = 1;
 
 // r[impl ctrl.scaler.load-coverage]
 /// The denominated load letter: the `max()` fold over per-replica
@@ -215,6 +232,36 @@ pub fn decide(
     let predicted = ((builders as f64) / ratio_in).ceil();
     let predicted = predicted.min(i32::MAX as f64).max(0.0) as i32;
 
+    // The working/idle classification is computable WITHOUT the load
+    // reading — hoisted to the observation-alphabet boundary so it
+    // evaluates on EVERY tick, observation-absent ones included
+    // (merged_bug_009, R34(iii)): with scale-to-zero targets
+    // (replicas.min=0 ⇒ zero pods ⇒ zero resolved addrs ⇒ None
+    // letter), sensor absence is CORRELATED with the idle regime the
+    // gate classifies, so a predicate evaluated only when the poll
+    // clock ticks parks banked streaks across exactly the idle
+    // windows whose ticks are non-evidence by the gate's own
+    // rationale. Low load with zero builders means "nothing to do",
+    // NOT "each replica handles more than we thought" — growing on
+    // that conflation inflates the ratio unboundedly over an idle
+    // weekend (1.02^576 ≈ 88,000×; bug_288).
+    let working = builders > 0 && current > spec.replicas.min;
+    // The genuinely evidence-ambiguous cell (working, low-side
+    // unknown — sensor absent or partial-coverage low): the bank is
+    // preserved DECAY-BOUNDED ([`AMBIGUOUS_TICK_EVIDENCE_DECAY`], the
+    // staleness cap), never bit-exact across unbounded outages. The
+    // non-working face of the same letters RESETS — the
+    // classification needed no reading.
+    let ambiguous_ticks = || {
+        if working {
+            status
+                .low_load_ticks
+                .saturating_sub(AMBIGUOUS_TICK_EVIDENCE_DECAY)
+        } else {
+            0
+        }
+    };
+
     // Reactive correction on observed load.
     // r[impl ctrl.scaler.load-coverage]
     // The asymmetric consume of the denominated letter: the high arm
@@ -239,37 +286,29 @@ pub fn decide(
         }
         Some(l) if l.max < low && !l.total_coverage() => {
             // Survivor-only LOW: the letter cannot substantiate
-            // "every replica is low" — the unanswered replica is
-            // dropped exactly when its reading may be the max (the
-            // load-correlated timeout regime recurs every pass, so
-            // this is a standing cell, not a blip). Funds NOTHING;
-            // the banked streak rides the same preserve posture as
-            // the sensor-absent letter below.
-            (predicted, ratio_in, status.low_load_ticks)
+            // "every replica is low" (the load-correlated timeout
+            // regime recurs every pass — a standing cell, not a
+            // blip). Funds NOTHING; the streak takes the hoisted
+            // classification: ambiguous-while-working, reset
+            // otherwise.
+            (predicted, ratio_in, ambiguous_ticks())
         }
         Some(l) if l.max < low => {
             // Over-provisioned — maybe. Count toward ratio growth;
             // use the prediction (which may itself be < current —
             // scale-down guard below handles that).
-            //
-            // Gate growth on `builders > 0 && current > min`: low
-            // load with zero builders means "nothing to do", NOT
-            // "each replica handles more than we thought". Growing
-            // on that conflation inflates the ratio unboundedly over
-            // an idle weekend (1.02^576 ≈ 88,000×) and the predictor
-            // is useless for hours when load returns.
-            // r[impl ctrl.scaler.evidence-funding]
+            // r[impl ctrl.scaler.evidence-funding+2]
             // bug_147 (R29′ — fund == spend): the counter INCREMENTS
             // under exactly the predicate whose sustained truth it
-            // witnesses — low-load-while-WORKING. Idle (builders==0)
-            // and at-min ticks are NON-EVIDENCE by this gate's own
-            // rationale; banking them as redeemable credit was the
-            // wrong-clock class on the evidence axis (the parked
-            // streak fired growth on the first busy low tick at
-            // every idle→busy transition, with zero working
-            // evidence — an R30-shaped latch missing its
-            // regime-transition exit).
-            if builders > 0 && current > spec.replicas.min {
+            // witnesses — low-load-while-WORKING (the hoisted
+            // `working`). Idle (builders==0) and at-min ticks are
+            // NON-EVIDENCE by this gate's own rationale; banking
+            // them as redeemable credit was the wrong-clock class on
+            // the evidence axis (the parked streak fired growth on
+            // the first busy low tick at every idle→busy transition,
+            // with zero working evidence — an R30-shaped latch
+            // missing its regime-transition exit).
+            if working {
                 let ticks = status.low_load_ticks.saturating_add(1);
                 if ticks >= LOW_LOAD_TICKS_FOR_RATIO_GROWTH {
                     (
@@ -286,10 +325,13 @@ pub fn decide(
                 (predicted, ratio_in, 0)
             }
         }
-        // In-band load OR no load reading: trust the prediction,
-        // reset the low streak (in-band) / preserve it (None).
+        // In-band load: one replica genuinely in-band disproves
+        // "all replicas low" — reset under any coverage.
         Some(_) => (predicted, ratio_in, 0),
-        None => (predicted, ratio_in, status.low_load_ticks),
+        // Sensor absent: the hoisted classification still evaluates
+        // — idle/at-min resets (merged_bug_009's face), working
+        // preserves decay-bounded (the ambiguous cell).
+        None => (predicted, ratio_in, ambiguous_ticks()),
     };
 
     // Clamp. Defensive min>max swap and ≥0 floor (CEL enforces both,
@@ -642,7 +684,7 @@ mod tests {
         assert_eq!(d.learned_ratio, 50.0, "current==min → no ratio growth");
     }
 
-    // r[verify ctrl.scaler.evidence-funding]
+    // r[verify ctrl.scaler.evidence-funding+2]
     /// W12-AR (bug_147) — proposition: growth consumes only
     /// working-low-load evidence (fund == spend); population: the
     /// regime boundaries the cap banked through (every idle→busy
@@ -720,9 +762,10 @@ mod tests {
         );
         assert_eq!(
             d.low_load_ticks,
-            LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1,
-            "partial-low neither funds nor spends the streak (the \
-             ambiguous cell rides the sensor-absent posture)"
+            LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 2,
+            "partial-low while working is the evidence-ambiguous cell \
+             — the bank is preserved decay-bounded (one tick consumed \
+             per ambiguous tick, the staleness cap), never funded"
         );
         assert_eq!(d.desired, 4, "the predictive path still drives desired");
     }
@@ -796,6 +839,100 @@ mod tests {
             "zero answers → None (total-failure posture preserved)"
         );
         assert_eq!(LoadAggregate::fold(&[]), None, "zero resolved → None");
+    }
+
+    // r[verify ctrl.scaler.evidence-funding+2]
+    /// W13-AG (merged_bug_009) — proposition: funding predicates
+    /// computable without the observation evaluate on
+    /// observation-absent ticks; population: the scale-to-zero idle
+    /// window (replicas.min=0 ⇒ zero pods ⇒ zero resolved addrs ⇒
+    /// None letter — the dominant path the preserve-arm
+    /// misclassified, sensor absence CORRELATED with the regime).
+    /// Pre-fix RED (verbatim in the commit body): the banked streak
+    /// parked across the whole idle window (left: 29, right: 0) and
+    /// funded growth on the first busy low tick.
+    #[test]
+    fn w13_ag_idle_none_ticks_must_reset_banked_streak() {
+        let s = spec(0, 14);
+        // Bank a 29-streak the honest way: working low-load ticks.
+        let mut st = status(Some(50.0), 0);
+        for _ in 0..(LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1) {
+            let d = decide(&s, &st, 4, 200, total(0.1), None);
+            st.low_load_ticks = d.low_load_ticks;
+        }
+        assert_eq!(st.low_load_ticks, LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1);
+        // Scale-to-zero idle window: zero pods => poll resolves zero
+        // addrs => None letter, builders=0, current=min=0. The idle
+        // classification is computable WITHOUT the reading.
+        for _ in 0..60 {
+            let d = decide(&s, &st, 0, 0, None, None);
+            st.low_load_ticks = d.low_load_ticks;
+        }
+        assert_eq!(
+            st.low_load_ticks, 0,
+            "idle/at-min ticks are NON-EVIDENCE regardless of sensor \
+             availability — the banked streak must reset on the None \
+             ticks (pre-fix: parked across the whole idle window)"
+        );
+        // Work returns, load still low: growth demands the documented
+        // 30 consecutive WORKING ticks rebuilt from the transition —
+        // the idle window banked nothing.
+        let d = decide(&s, &st, 4, 200, total(0.1), None);
+        assert_eq!(
+            d.learned_ratio, 50.0,
+            "the first busy low tick carries zero working evidence \
+             (pre-fix: the idle-parked streak fired growth here)"
+        );
+        assert_eq!(
+            d.low_load_ticks, 1,
+            "the streak rebuilds from the transition"
+        );
+    }
+
+    // r[verify ctrl.scaler.evidence-funding+2]
+    /// W13-AG2 — the legitimate preserve face pinned: the genuinely
+    /// evidence-ambiguous cell (WORKING, load unknown) keeps the
+    /// streak across a transient poll blip at a cost of exactly the
+    /// blip's duration, and an unbounded outage EXPIRES the bank
+    /// (the staleness cap: ≤ bank-size ambiguous ticks ≤ 300s).
+    #[test]
+    fn w13_ag2_working_blip_preserved_outage_expires() {
+        let s = spec(2, 14);
+        // A 10-tick bank, then a 2-tick poll blip while WORKING:
+        // the bank survives minus the blip's own duration.
+        let mut st = status(Some(50.0), 10);
+        for _ in 0..2 {
+            let d = decide(&s, &st, 4, 200, None, None);
+            st.low_load_ticks = d.low_load_ticks;
+        }
+        assert_eq!(
+            st.low_load_ticks, 8,
+            "working + load-unknown keeps the streak decay-bounded \
+             (a blip costs its duration, never a reset)"
+        );
+        // Resume low: the streak continues from the decayed bank.
+        let d = decide(&s, &st, 4, 200, total(0.1), None);
+        assert_eq!(
+            d.low_load_ticks, 9,
+            "the ambiguous cell composes with funding"
+        );
+
+        // The outage face: a 29-bank under a sensor outage longer
+        // than the bank expires to zero — stale evidence is never
+        // redeemable after the outage.
+        let mut st = status(Some(50.0), LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1);
+        for _ in 0..(LOW_LOAD_TICKS_FOR_RATIO_GROWTH) {
+            let d = decide(&s, &st, 4, 200, None, None);
+            st.low_load_ticks = d.low_load_ticks;
+        }
+        assert_eq!(
+            st.low_load_ticks, 0,
+            "an outage ≥ the bank expires it (the R17 staleness \
+             envelope: ≤ LOW_LOAD_TICKS_FOR_RATIO_GROWTH ticks)"
+        );
+        // And the expired bank never under-flows.
+        let d = decide(&s, &st, 4, 200, None, None);
+        assert_eq!(d.low_load_ticks, 0);
     }
 
     /// `RATIO_CEILING` bounds both the read site (a pre-fix inflated

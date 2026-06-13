@@ -232,10 +232,14 @@ pub struct ComponentScalerStatus {
     #[schemars(with = "Option<String>")]
     pub last_scale_up_time: Option<Time>,
 
-    /// Consecutive ticks with `observedLoadFactor < loadThresholds.
-    /// low`. At `LOW_LOAD_TICKS_FOR_RATIO_GROWTH` (30), the ratio
-    /// grows by 2% and this resets. Mirrored to status for
-    /// observability; the reconciler's authoritative counter is
+    /// Consecutive WORKING ticks (builders > 0, current > min) whose
+    /// total-coverage load reading was `< loadThresholds.low`. At
+    /// `LOW_LOAD_TICKS_FOR_RATIO_GROWTH` (30), the ratio grows by 2%
+    /// and this resets. Idle/at-min ticks reset it regardless of
+    /// sensor availability; working ticks without an adjudicating
+    /// reading (poll outage, partial coverage) consume one banked
+    /// tick each instead of parking the streak. Mirrored to status
+    /// for observability; the reconciler's authoritative counter is
     /// in-process (writing it here every tick would self-trigger the
     /// CR watch). Restart resets the streak — at most one extra
     /// 5-minute over-provisioning window per controller restart.
