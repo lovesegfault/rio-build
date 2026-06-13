@@ -852,6 +852,14 @@ impl GcCycleLease {
                     None => "",
                 };
                 // r[impl store.gc.completion-witness+2]
+                //
+                // The `backlog_estimate = CASE` arm's LAW OF RECORD is
+                // [`next_backlog_estimate`] (TB-2, round-13): the SQL
+                // stays in the statement for atomicity, but edits move
+                // BOTH — the pure fn is what the gcBacklogEstimate
+                // model plane Mirrors by symbol and what the future
+                // kani harness targets (the audit's hostile-backlog
+                // double).
                 let q = sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE gc_collect_state SET \
                        cycle_epoch = cycle_epoch + 1, \
@@ -907,6 +915,46 @@ impl GcCycleLease {
     }
 }
 
+/// The backlog-estimate update LAW OF RECORD (TB-2, round-13): the
+/// pure form of the `backlog_estimate = CASE` arm in
+/// [`GcCycleLease::execute_commit`]'s Live UPDATE. The SQL stays in
+/// the statement for atomicity; THIS fn is what both estates bind —
+/// the `gcBacklogEstimate` model plane (gcCollectState.qnt) Mirrors
+/// it by symbol, and it is the designated future kani subject (the
+/// audit's hostile-backlog double). Edits move fn and SQL together.
+///
+/// Arms: an anchoring disposition RESETS to zero (the full-scan
+/// zero-backlog claim); a NULL estimate SEEDS from the cycle's
+/// unmarked-backlog observation minus this cycle's victims; an
+/// existing estimate RATCHETS down by victims only. Fresh
+/// observations are DISCARDED outside the NULL arm — deliberate
+/// (bug_174: a capped/resumed cycle cannot testify about keys it
+/// never scanned) — so between anchors the estimate tracks reality
+/// only as well as its seed did; the model's divergence witness and
+/// `compoundingEstimateRun` document that face, and the
+/// `rio_store_gc_collect_backlog_chunks` gauge serves the ESTIMATE,
+/// not the truth.
+// The runtime arm executes in SQL (atomicity); the fn is the law's
+// reference implementation — exercised by the unit grid, mirrored by
+// the model, targeted by the future kani harness (the ingest.rs:72
+// cfg_attr house form).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn next_backlog_estimate(
+    anchors_zero: bool,
+    current: Option<i64>,
+    unmarked_seed: i64,
+    victims_collected: i64,
+) -> i64 {
+    if anchors_zero {
+        0
+    } else {
+        match current {
+            None => (unmarked_seed - victims_collected).max(0),
+            Some(b) => (b - victims_collected).max(0),
+        }
+    }
+}
+
 /// Spawn the per-replica gauge publisher: every 60s, read the durable
 /// row (unlocked) and publish the three collect gauges from it. Every
 /// replica converges on the cluster value within one period —
@@ -949,5 +997,32 @@ pub(crate) fn publish_gauges(state: &GcCollectState) {
     }
     if let Some(wc) = state.last_would_collect {
         metrics::gauge!("rio_store_gc_chunks_would_collect").set(wc as f64);
+    }
+}
+
+#[cfg(test)]
+mod backlog_estimate_tests {
+    use super::next_backlog_estimate;
+
+    /// W13-BA (the law grid): all three CASE arms + the GREATEST
+    /// floor edges, mirroring the SQL arm-for-arm. The model's
+    /// `nextEstimate` (gcBacklogEstimate, gcCollectState.qnt) encodes
+    /// the same table with NULL as -1.
+    #[test]
+    fn arm_grid_matches_the_sql_case() {
+        // Anchor arm: zero regardless of current/seed/victims.
+        assert_eq!(next_backlog_estimate(true, None, 7, 3), 0);
+        assert_eq!(next_backlog_estimate(true, Some(9), 7, 3), 0);
+        // Seed arm (NULL current): seed - victims, floored.
+        assert_eq!(next_backlog_estimate(false, None, 7, 3), 4);
+        assert_eq!(next_backlog_estimate(false, None, 2, 5), 0);
+        // Ratchet arm: current - victims, floored — the fresh seed is
+        // DISCARDED (the bug_174-deliberate face the model's
+        // divergence run documents).
+        assert_eq!(next_backlog_estimate(false, Some(2), 99, 1), 1);
+        assert_eq!(next_backlog_estimate(false, Some(2), 99, 5), 0);
+        // Zero-victim commits hold the line in both non-anchor arms.
+        assert_eq!(next_backlog_estimate(false, None, 6, 0), 6);
+        assert_eq!(next_backlog_estimate(false, Some(6), 0, 0), 6);
     }
 }

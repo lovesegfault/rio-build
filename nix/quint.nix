@@ -4312,6 +4312,76 @@ rec {
       witness = "anchoredByFullScanOnly";
     };
 
+    # ── gcBacklogEstimate: the persisted backlog estimate's three-arm
+    # update law (round-13 TB-2 / WO-S9-4 — refereed SURVIVED: the
+    # CASE arm of CycleCommit::Live had zero model footprint). The law
+    # of record is the extracted rio_store::gc::state::
+    # next_backlog_estimate; the model transitions Mirror it by
+    # symbol. DEDICATED module per the gcDrainPass precedent (the
+    # estimate axis must not multiply the drain-pass census). Small
+    # integer lattice (MAX_TRUTH=4) — sub-second under TLC.
+    quint-gc-backlog-estimate = mkQuintCheck {
+      name = "gc-backlog-estimate";
+      spec = "gcCollectState";
+      main = "gcBacklogEstimateMain";
+      invariants = [
+        "estimateFloored"
+        "anchorZeroResets"
+      ];
+    };
+
+    # The compounding-face choreography (W13-BA): seed 3−1=2, churn up
+    # to 4 (the observation the ratchet discards), one 2-victim
+    # ratchet commit → estimate 0 over truth 2 (the silent-zero face
+    # the rio_store_gc_collect_backlog_chunks gauge serves), recovered
+    # at the anchoring full drain.
+    quint-gc-backlog-estimate-runs = mkQuintRunCheck {
+      name = "gc-backlog-estimate-runs";
+      spec = "gcCollectState";
+      main = "gcBacklogEstimateMain";
+    };
+
+    # NON-VACUITY witness (expect-violation): seeding is reachable —
+    # the estimate does not sit NULL forever (the bug_083 pattern).
+    quint-gc-backlog-estimate-witness-seeded = mkQuintWitnessCheck {
+      name = "gc-backlog-estimate-witness-seeded";
+      spec = "gcCollectState";
+      main = "gcBacklogEstimateMain";
+      witness = "estimateAlwaysNull";
+    };
+
+    # THE DIVERGENCE witness (expect-violation): the TB-2 compounding
+    # face is reachable IN THE LIVE LAW — between anchors the
+    # ratcheted estimate and the truth come apart (a documented
+    # divergence, not a falsification: the law claims no tracking,
+    # and the gauge's reader inherits exactly this gap).
+    quint-gc-backlog-estimate-witness-diverges = mkQuintWitnessCheck {
+      name = "gc-backlog-estimate-witness-diverges";
+      spec = "gcCollectState";
+      main = "gcBacklogEstimateMain";
+      witness = "estimateTracksTruth";
+    };
+
+    # CALIBRATION (expect-violation): the GREATEST floor dropped —
+    # estimateFloored falsifies (victims past the current estimate
+    # mint a negative row).
+    quint-gc-backlog-estimate-calib-no-floor = mkQuintWitnessCheck {
+      name = "gc-backlog-estimate-calib-no-floor";
+      spec = "gcCollectState";
+      main = "gcBacklogEstimateCalibNoFloor";
+      witness = "estimateFloored";
+    };
+
+    # CALIBRATION (expect-violation): the anchor arm keeps the
+    # ratcheted value — anchorZeroResets falsifies on the first
+    # anchoring commit over a seeded estimate.
+    quint-gc-backlog-estimate-calib-anchor-keeps = mkQuintWitnessCheck {
+      name = "gc-backlog-estimate-calib-anchor-keeps";
+      spec = "gcCollectState";
+      main = "gcBacklogEstimateCalibAnchorKeeps";
+      witness = "anchorZeroResets";
+    };
+
     # ── gcCoordination: the cluster-scoped collect cadence and gauge
     # publication over the durable gc_collect_state row (bughunt wave
     # D1, bug_174 + merged_bug_211; migration 090). Two replicas, a

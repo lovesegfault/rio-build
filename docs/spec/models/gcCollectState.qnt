@@ -576,3 +576,192 @@ module gcDrainPassCalibResumeAnchors {
     CALIB_RESUME_ANCHORS = true
   ).*
 }
+
+// ===========================================================================
+// BACKLOG-ESTIMATE PLANE (round-13 TB-2 / WO-S9-4): the persisted
+// running estimate's three-armed update law — the `backlog_estimate =
+// CASE` arm of CycleCommit::Live (rio-store/src/gc/state.rs, the
+// execute_commit UPDATE), whose pure LAW OF RECORD is
+// rio_store::gc::state::next_backlog_estimate (extracted at this
+// close; the SQL stays in the statement for atomicity and names the
+// fn). Arms: an anchoring disposition RESETS to zero; a NULL estimate
+// SEEDS from the cycle's unmarked-backlog observation minus this
+// cycle's victims; an existing estimate RATCHETS down by victims only
+// — fresh observations are DISCARDED outside the NULL arm
+// (deliberate: bug_174 — a capped/resumed cycle cannot testify about
+// keys it never scanned). What the law therefore does NOT claim — and
+// the divergence witness + compoundingEstimateRun below DOCUMENT — is
+// estimate==truth between anchors: under churn the ratcheted estimate
+// diverges (either direction) until the next anchoring full scan, and
+// the rio_store_gc_collect_backlog_chunks gauge serves the ESTIMATE.
+// This was TB-2's filed core (audit: high, class c — UNREFEREED);
+// refereed SURVIVED at round-13: the law had zero model footprint
+// across all three gcCollectState planes. It now has exactly this
+// one. DEDICATED module (the gcDrainPass precedent): the estimate
+// axis must not multiply the drain-pass or commit-basis censuses.
+// ===========================================================================
+module gcBacklogEstimate {
+  /// Truth ceiling (TLC finiteness; the census bound, not a claim).
+  const MAX_TRUTH: int
+  /// Calibration: the GREATEST floor dropped from both non-anchor
+  /// arms (the floor law falsifies on victims past the estimate).
+  const CALIB_NO_FLOOR: bool
+  /// Calibration: the anchor arm keeps the ratcheted value instead of
+  /// resetting (the anchor law falsifies).
+  const CALIB_ANCHOR_KEEPS: bool
+
+  /// SQL NULL encoding for the persisted estimate (house int form —
+  /// the materializationDistribution deadAt `< 0` precedent).
+  val NULL_EST = -1
+
+  pure def maxI(a: int, b: int): int = if (a > b) a else b
+
+  /// Mirrors (the law of record, arm-for-arm):
+  /// rio_store::gc::state::next_backlog_estimate — anchor-zero /
+  /// seed-when-NULL / ratchet, GREATEST-floored at zero.
+  pure def nextEstimate(anchorsZero: bool, current: int, seed: int, victims: int): int =
+    if (anchorsZero)
+      (if (CALIB_ANCHOR_KEEPS) maxI(current, 0) else 0)
+    else if (current == NULL_EST)
+      (if (CALIB_NO_FLOOR) seed - victims else maxI(seed - victims, 0))
+    else
+      (if (CALIB_NO_FLOOR) current - victims else maxI(current - victims, 0))
+
+  /// True eligible backlog (the mark complement's image; churn moves
+  /// it between commits).
+  var truth: int
+  /// The persisted gc_collect_state.backlog_estimate (NULL_EST = SQL
+  /// NULL — no observation has ever seeded it).
+  var estimate: int
+  /// The last commit anchored a zero-backlog claim.
+  var lastAnchored: bool
+
+  action init = all {
+    truth' = 0,
+    estimate' = NULL_EST,
+    lastAnchored' = false,
+  }
+
+  // Environment: writer activity — references dropped (truth grows)
+  // or re-taken (truth shrinks) between cycle commits; the world's
+  // move, priced by the MAX_TRUTH census ceiling.
+  action churn = all {
+    nondet t = 0.to(MAX_TRUTH).oneOf()
+    truth' = t,
+    estimate' = estimate,
+    lastAnchored' = lastAnchored,
+  }
+
+  // Mirrors: rio-store/src/gc/state.rs:next_backlog_estimate
+  action commitLive = {
+    nondet victims = 0.to(truth).oneOf()
+    nondet anchors = Set(true, false).oneOf()
+    all {
+      // An anchoring disposition is a CompleteFullScan: it drained
+      // every eligible at its basis (victims == truth);
+      // non-anchoring commits (capped/resumed) collect any prefix.
+      (not(anchors) or victims == truth),
+      estimate' = nextEstimate(anchors, estimate, truth, victims),
+      truth' = truth - victims,
+      lastAnchored' = anchors,
+    }
+  }
+
+  action step = any { churn, commitLive }
+
+  /// The floor law (GREATEST(x, 0) in both non-anchor arms): a
+  /// persisted estimate is never negative (NULL excepted by
+  /// encoding).
+  val estimateFloored = estimate == NULL_EST or estimate >= 0
+
+  /// The anchor law: an anchoring commit leaves a zero estimate.
+  val anchorZeroResets = not(lastAnchored) or estimate == 0
+
+  /// NON-VACUITY witness (expect-violation): seeding is reachable —
+  /// the estimate does not sit NULL forever (the bug_083 pattern).
+  val estimateAlwaysNull = estimate == NULL_EST
+
+  /// THE DIVERGENCE witness (expect-violation — the TB-2 compounding
+  /// face is REACHABLE under the live law): between anchors the
+  /// ratcheted estimate and the truth come apart. A violation here is
+  /// a DOCUMENTED divergence of the law, not a falsification of it —
+  /// the law never claims tracking; the gauge's reader inherits
+  /// exactly this gap.
+  val estimateTracksTruth = estimate == NULL_EST or estimate == truth
+
+  /// The compounding face, choreographed (W13-BA): seed at 3−1=2,
+  /// churn UP to 4 (the fresh observation the ratchet will discard),
+  /// one 2-victim ratchet commit drives the estimate to 0 while the
+  /// truth stands at 2 — the silent-zero face: the gauge reads empty
+  /// over a live backlog — then the anchoring full drain recovers
+  /// agreement.
+  run compoundingEstimateRun =
+    init
+      .then(all {
+        // churn: writers drop three references.
+        truth' = 3, estimate' = estimate, lastAnchored' = lastAnchored,
+      })
+      .then(all {
+        // Live commit, 1 victim, no anchor: the NULL arm seeds 3−1=2.
+        truth' = 2,
+        estimate' = nextEstimate(false, estimate, truth, 1),
+        lastAnchored' = false,
+      })
+      .expect(all { estimate == 2, truth == 2, estimateTracksTruth })
+      .then(all {
+        // churn UP: two more references dropped (truth 4).
+        truth' = 4, estimate' = estimate, lastAnchored' = lastAnchored,
+      })
+      .then(all {
+        // ratchet commit, 2 victims: 2−2=0 — the fresh seed (4) is
+        // DISCARDED by the ELSE arm; truth stands at 2.
+        truth' = 2,
+        estimate' = nextEstimate(false, estimate, 4, 2),
+        lastAnchored' = false,
+      })
+      .expect(all {
+        estimate == 0,
+        truth == 2,
+        not(estimateTracksTruth),
+        estimateFloored,
+      })
+      .then(all {
+        // the anchoring full drain: victims == truth, zero claimed.
+        truth' = 0,
+        estimate' = nextEstimate(true, estimate, 2, 2),
+        lastAnchored' = true,
+      })
+      .expect(all { estimate == 0, truth == 0, anchorZeroResets, estimateTracksTruth })
+}
+
+/// The live regime (TLC exhaustive at MAX_TRUTH=4 — a small integer
+/// lattice; sub-second).
+module gcBacklogEstimateMain {
+  import gcBacklogEstimate(
+    MAX_TRUTH = 4,
+    CALIB_NO_FLOOR = false,
+    CALIB_ANCHOR_KEEPS = false
+  ).*
+}
+
+/// CALIBRATION twin (expect-violation): the GREATEST floor dropped —
+/// estimateFloored falsifies (victims past the current estimate mint
+/// a negative row).
+module gcBacklogEstimateCalibNoFloor {
+  import gcBacklogEstimate(
+    MAX_TRUTH = 4,
+    CALIB_NO_FLOOR = true,
+    CALIB_ANCHOR_KEEPS = false
+  ).*
+}
+
+/// CALIBRATION twin (expect-violation): the anchor arm keeps the
+/// ratcheted value — anchorZeroResets falsifies on the first
+/// anchoring commit over a seeded estimate.
+module gcBacklogEstimateCalibAnchorKeeps {
+  import gcBacklogEstimate(
+    MAX_TRUTH = 4,
+    CALIB_NO_FLOOR = false,
+    CALIB_ANCHOR_KEEPS = true
+  ).*
+}
