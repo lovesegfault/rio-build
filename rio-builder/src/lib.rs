@@ -123,6 +123,19 @@ pub fn describe_metrics() {
          with a quiet absent counter means teardown races the one-shot \
          — sizing is healthy, attribution is degraded."
     );
+    describe_gauge!(
+        "rio_builder_quota_enforcement",
+        "Project-quota enforcement posture observed on the overlay \
+         emptyDir (D-2: the DiskFull lane's dormancy made visible). \
+         Label mode = enforcing (a real sub-sentinel hard limit is set; \
+         the DiskFull classifier CAN fire), non_enforcing (kubelet's \
+         AssignQuota -1 sentinel: usage tracking only, the \
+         hostUsers:false fleet shape), no_limit (the builder's \
+         monitoring-only mint under hostUsers:true), or unavailable \
+         (decline modes 1-3). At the deployed posture every builder pod \
+         reports non_enforcing or no_limit; an enforcing reading \
+         anywhere is the readback that proves the future enforcing flip."
+    );
     describe_counter!(
         "rio_builder_quota_evidence_absent_total",
         "Completions whose project-quota disk evidence was ABSENT — \

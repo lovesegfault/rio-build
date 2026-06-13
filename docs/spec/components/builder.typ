@@ -1059,6 +1059,18 @@ derivations beside the limit-read face (`rio-builder/src/quota.rs`).
   attribution --- never a fabricated headroom.
 ]
 
+#r("builder.disk.enforcement-posture")[
+  The builder MUST surface the project-quota enforcement posture observed
+  on the overlay emptyDir as a typed letter (`QuotaEnforcement` ---
+  `Enforcing` / `NonEnforcing` / `NoLimit` / `Unavailable`) derived from
+  the kernel's own limit record after the projid is in place, emitted via
+  the #(refs.metric)("rio_builder_quota_enforcement") gauge (label `mode`)
+  and a once-per-pod log line. The DiskFull lane's first conjunct depends on an
+  external system's posture (kubelet's `AssignQuota` and the builder's own
+  mint policy); the lane's dormancy MUST be a fact in the telemetry, not
+  an inference from the lane never firing.
+]
+
 The satisfiability witnesses are kernel-level (the prjquota VM probe at
 `nix/tests/scenarios/quota-probe.nix` drives the production classifier
 chain against a real filled XFS project quota and asserts the clamp, the

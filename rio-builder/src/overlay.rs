@@ -256,6 +256,28 @@ pub fn setup_overlay(
             );
         }
     }
+    // D-2 (R26): the enforcement posture, observed from the kernel's
+    // own limit record AFTER the projid is in place. The DiskFull
+    // lane's first conjunct depends on this; the gauge + once-per-pod
+    // log line make the dormancy a fact in the telemetry instead of an
+    // inference from the lane never firing.
+    let posture =
+        crate::quota::QuotaEnforcement::classify(crate::quota::status(base_dir).ok().flatten());
+    metrics::gauge!("rio_builder_quota_enforcement", "mode" => posture.label()).set(1.0);
+    static POSTURE_LOGGED: std::sync::Once = std::sync::Once::new();
+    POSTURE_LOGGED.call_once(|| {
+        tracing::info!(
+            mode = posture.label(),
+            base_dir = %base_dir.display(),
+            "project-quota enforcement posture observed (D-2): the worker \
+             DiskFull classification lane is {} on this pod",
+            if matches!(posture, crate::quota::QuotaEnforcement::Enforcing) {
+                "ARMED"
+            } else {
+                "dormant (non-enforcing or no hard limit)"
+            },
+        );
+    });
 
     let build_dir = base_dir.join(build_id);
     let upper = build_dir.join("upper");

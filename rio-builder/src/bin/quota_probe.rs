@@ -95,6 +95,12 @@ fn main() {
     println!("projid={}", fmt(projid));
     println!("quota_used={}", fmt(used));
     println!("quota_limit={}", fmt(limit));
+    // D-2: the typed enforcement-posture letter (the same alphabet as
+    // the rio_builder_quota_enforcement gauge label).
+    println!(
+        "enforcement={}",
+        quota::QuotaEnforcement::classify(status).label()
+    );
     println!("coupled_node_free={}", fmt(coupled_free));
     println!("coupled_clamped={}", fmt(coupled_clamped));
     println!("decoupled_node_free={}", fmt(decoupled_free));

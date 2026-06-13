@@ -187,6 +187,81 @@ impl ProjectId {
     }
 }
 
+// r[impl builder.disk.enforcement-posture]
+/// D-2 (R26 + R30 producer-reachability) — the project-quota
+/// ENFORCEMENT posture, observed from the kernel's own limit record.
+/// The DiskFull lane's first conjunct (`hard_limit_bytes` is a real
+/// enforcing limit) depends on an external system's posture; this
+/// letter surfaces that posture as a typed observable so the lane's
+/// dormancy is a fact in the telemetry, not an inference from absence.
+///
+/// Produced by the actual detection (the `Q_GETQUOTA` limit-read after
+/// [`ensure_project_quota`] has observed-or-minted the projid), never a
+/// config assumption. Emitted once per pod via the
+/// `rio_builder_quota_enforcement` gauge (label `mode` = [`label`]) and
+/// a startup-tier log line at the overlay setup seam.
+///
+/// [`label`]: QuotaEnforcement::label
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaEnforcement {
+    /// A real (sub-sentinel, nonzero) hard limit is set: the kernel
+    /// enforces ENOSPC at the limit and [`classify_quota_exhaustion`]
+    /// CAN fire. Not the deployed posture today; the readback that
+    /// proves the future enforcing flip when the owner schedules it.
+    Enforcing,
+    /// kubelet's `AssignQuota` `-1` non-enforcing sentinel
+    /// (`dqb_bhardlimit` reads back as `u64::MAX` through the
+    /// 1 KiB-block saturating conversion): usage tracking for kubelet
+    /// eviction only, never kernel enforcement at the deployed minors.
+    /// The DiskFull lane is dormant — the `hostUsers: false` fleet
+    /// shape under kubelet-assigned projids.
+    NonEnforcing,
+    /// A projid is set with NO hard limit (`dqb_bhardlimit == 0`):
+    /// the builder's own monitoring-only mint (the deliberate non-goal
+    /// of [`ensure_project_quota`] under `hostUsers: true`). The
+    /// DiskFull lane is dormant — the `hostUsers: true` fleet shape.
+    NoLimit,
+    /// No project assigned, or the quota record is unreadable (decline
+    /// modes 1–3). The DiskFull lane is dormant; sizing evidence is
+    /// absent too (the live060-b producer is dead).
+    Unavailable,
+}
+
+impl QuotaEnforcement {
+    /// Derive the posture from one [`status`] read (the limit-read
+    /// face), taken AFTER the projid is in place.
+    pub fn classify(status: Option<QuotaStatus>) -> Self {
+        match status {
+            None => Self::Unavailable,
+            Some(QuotaStatus {
+                hard_limit_bytes: None,
+                ..
+            }) => Self::NoLimit,
+            // The kubelet -1 sentinel: dqb_bhardlimit = u64::MAX
+            // saturates to u64::MAX through the ×1024 conversion. No
+            // real limit on a kubelet local disk approaches this.
+            Some(QuotaStatus {
+                hard_limit_bytes: Some(u64::MAX),
+                ..
+            }) => Self::NonEnforcing,
+            Some(QuotaStatus {
+                hard_limit_bytes: Some(_),
+                ..
+            }) => Self::Enforcing,
+        }
+    }
+
+    /// The `mode` label value on `rio_builder_quota_enforcement`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Enforcing => "enforcing",
+            Self::NonEnforcing => "non_enforcing",
+            Self::NoLimit => "no_limit",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// The closed outcome alphabet of [`ensure_project_quota`] (R14 — no
 /// wildcard consumers; the overlay setup logs each arm distinctly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -919,6 +994,64 @@ mod tests {
             ensure_project_quota(std::path::Path::new("/definitely/not/a/path")),
             ProjQuota::Unavailable
         );
+    }
+
+    /// W14-C3/C4 (D-2, R26 + R30 producer-reachability) — the
+    /// quota-enforcement posture is a typed, observable letter.
+    /// PRE-FIX no signal exists anywhere: the kubelet `-1` sentinel
+    /// and the builder's monitoring-only no-limit mint both leave the
+    /// DiskFull lane silently dormant. The presence-asserting test
+    /// (this fn) is the RED. POST-FIX the closed alphabet partitions
+    /// the limit-read result, and the gauge label is the alphabet.
+    // r[verify builder.disk.enforcement-posture]
+    #[test]
+    fn quota_enforcement_posture_cells() {
+        // W14-C3: the dormant fleet shapes — both readable, both
+        // non-enforcing, distinguished by source.
+        assert_eq!(
+            QuotaEnforcement::classify(Some(QuotaStatus {
+                used_bytes: 0,
+                hard_limit_bytes: None,
+            })),
+            QuotaEnforcement::NoLimit,
+            "the builder's monitoring-only mint (dqb_bhardlimit == 0)"
+        );
+        assert_eq!(
+            QuotaEnforcement::classify(Some(QuotaStatus {
+                used_bytes: 0,
+                hard_limit_bytes: Some(u64::MAX),
+            })),
+            QuotaEnforcement::NonEnforcing,
+            "kubelet's AssignQuota -1 sentinel (saturates to u64::MAX \
+             through the 1KiB-block conversion)"
+        );
+        // W14-C4: the enforcing face — when a real (sub-sentinel)
+        // hard limit IS read back, the letter says so. The witness for
+        // the future posture flip: when the owner schedules enforcing
+        // quotas, this letter is the readback that proves it.
+        assert_eq!(
+            QuotaEnforcement::classify(Some(QuotaStatus {
+                used_bytes: 0,
+                hard_limit_bytes: Some(25 << 30),
+            })),
+            QuotaEnforcement::Enforcing,
+        );
+        // The decline modes (no project / unreadable).
+        assert_eq!(
+            QuotaEnforcement::classify(None),
+            QuotaEnforcement::Unavailable,
+        );
+        // The label alphabet is closed and the gauge name is reachable
+        // from describe_metrics() (the (lllll) suite asserts the
+        // registration; this pins the label values the suite cannot).
+        for v in [
+            QuotaEnforcement::Enforcing,
+            QuotaEnforcement::NonEnforcing,
+            QuotaEnforcement::NoLimit,
+            QuotaEnforcement::Unavailable,
+        ] {
+            assert!(!v.label().is_empty());
+        }
     }
 
     /// The `ProjQuota` alphabet is closed and its id projection total:
