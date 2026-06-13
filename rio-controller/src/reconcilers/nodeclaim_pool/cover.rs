@@ -1319,6 +1319,59 @@ mod tests {
         assert_eq!(c[0].0, 16, "the packing-minimal chunk is kept");
     }
 
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional+2]
+    /// The re-derived budget-brake pin (bug_062, the witness half):
+    /// asserts the LAW — affordable ⇒ nonzero mint — never the
+    /// starved output. The pre-fix pin (`budget=10 ⇒ c.is_empty()`)
+    /// was a regression floor on the bug itself (max_c=8 ≤ 10:
+    /// affordable members existed at larger n) and 2e2ce1a32 later
+    /// pinned it as the green side without examining the cell. The
+    /// genuinely-unaffordable fixture moves BELOW max_c, where the
+    /// family's floor really binds — and that arm must disclose
+    /// (warn + counter), never defer silently.
+    #[test]
+    fn budget_brake_quantifies_over_the_family() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let u: Vec<_> = (0..10)
+            .map(|k| intent_hd(&format!("i{k}"), 8, 8 * GI, 5 * GI, Some(true)))
+            .collect();
+        let refs: Vec<&SpawnIntent> = u.iter().collect();
+        // (ppppp): snapshot drains — taken exactly once per scope.
+        let starved_count = |rec: &DebuggingRecorder| {
+            rec.snapshotter()
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(k, _, _, v)| {
+                    (k.key().name() == "rio_controller_nodeclaim_budget_starved_total").then_some(v)
+                })
+        };
+        // budget=10 ∈ [max_c=8, chunk(n_pack)=16): the first
+        // affordable member mints (n=8: chunk=⌈80/8⌉=10 ≤ 10) and
+        // the brake truncates to ⌊10/10⌋ = 1 claim.
+        {
+            let rec = DebuggingRecorder::new();
+            let _g = ::metrics::set_default_local_recorder(&rec);
+            let Sizing { claims: c, .. } = sizing(&h_spot(), &refs, &cfg(32, 10));
+            assert_eq!(c.len(), 1, "affordable ⇒ nonzero mint (the law)");
+            assert_eq!(c[0].0, 10, "the first affordable chunk (n=8)");
+            assert_eq!(starved_count(&rec), None, "progress ⇒ no starvation signal");
+        }
+        // budget=7 < max_c=8: the family's floor binds — zero claims,
+        // DISCLOSED with the same trail as the dropping sibling.
+        {
+            let rec = DebuggingRecorder::new();
+            let _g = ::metrics::set_default_local_recorder(&rec);
+            let Sizing { claims: c, .. } = sizing(&h_spot(), &refs, &cfg(32, 7));
+            assert!(c.is_empty(), "below the family floor nothing mints");
+            assert_eq!(
+                starved_count(&rec),
+                Some(DebugValue::Counter(1)),
+                "zero progress is counted, never silent"
+            );
+        }
+    }
+
     /// Oracle: feed `claims` back as synthetic LiveNodes to the
     /// production FFD sim and assert all `intents` place. The
     /// §Simulator-shares-accounting executable guarantee — sizing
