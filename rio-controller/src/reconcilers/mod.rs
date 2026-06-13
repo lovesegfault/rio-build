@@ -244,6 +244,20 @@ pub struct ScalerState {
     /// loop-rate, and the 5%-per-10s decay becomes 5%-per-loop-
     /// iteration (ratio 50→1 in seconds, not ~13min). bug_213.
     pub last_status_write: Mutex<HashMap<String, Instant>>,
+    /// Per-ComponentScaler last successful `patch_scale` scale-UP
+    /// time, keyed by `{ns}/{name}`. The fence-arming record at
+    /// the mutating write's success site (R34-w(v)): the durable
+    /// `status.lastScaleUpTime` stamp is written by a SECOND,
+    /// separately-failing apiserver call, so a transient
+    /// `patch_status` failure after a successful scale patch
+    /// would otherwise leave the 5-min `SCALE_DOWN_STABILIZATION`
+    /// fence permanently disarmed for that burst (bug_021).
+    /// `decide()` consults the freshest of (this, status); status
+    /// remains the restart-surviving copy and backfills on the
+    /// next successful write. Restart loss is acceptable: a
+    /// restarted controller re-observes within one poll and the
+    /// guard is a 5-minute window.
+    pub last_scale_up: Mutex<HashMap<String, Instant>>,
 }
 
 impl Ctx {

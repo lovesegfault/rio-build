@@ -205,8 +205,10 @@ pub fn total_builders(cs: &ClusterStatusResponse) -> u64 {
 /// is consumed asymmetrically per the [`LoadAggregate`] law:
 /// survivor-high still scales up; survivor-low never funds growth.
 ///
-/// `since_last_scale_up`: `now() - status.lastScaleUpTime`. `None`
-/// = never scaled up (first reconcile, or status was wiped) — the
+/// `since_last_scale_up`: the freshest of (in-process record stamped
+/// at `patch_scale`'s success site, `status.lastScaleUpTime`) — see
+/// [`super::freshest_since_up`]. `None` = never scaled up (first
+/// reconcile, or controller restart with status wiped) — the
 /// scale-down guard treats `None` as "infinitely long ago" (allow
 /// scale-down). The alternative (treat as "just now") would mean a
 /// fresh CR can never scale down for the first 5 minutes even from

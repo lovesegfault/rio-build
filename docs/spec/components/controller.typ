@@ -1604,6 +1604,33 @@ With no store CR in the chart (KEDA owns the store replica count,
 RPC and its return values stay (rio-cli, ad-hoc diagnosis, any future CR
 target), and the store's 30 s in-process tick keeps the PG-pool gauge live.
 
+#r("ctrl.scaler.fence-arming")[
+  Every successful scale-up MUST leave a fresh
+  `SCALE_DOWN_STABILIZATION` fence: the arming fact is recorded
+  in-process at the success site of the `patch_scale` call (the
+  mutating write), and `decide()` consults the freshest of
+  (in-process record, `status.lastScaleUpTime`). The status stamp is
+  the durable, restart-surviving backfill written by the next
+  successful `patch_status`; it MUST NOT be the sole arming record.
+]
+A scale-up is two non-atomic apiserver writes (`patch_scale` then
+`patch_status`), and `lastScaleUpTime` was stamped only in the second
+and only when `scaled_up` --- so a transient `patch_status` failure
+after a successful scale patch left the retried reconcile reading
+`current==desired`, `scaled_up=false`, and the stale/`None` stamp
+preserved permanently: the 5-minute anti-flap guard silently disarmed
+for that burst (the round-14 instance, bug_021; the bug_060 close
+fixed the rate-limit edge of the same window, not the write-failure
+edge). The R34-w(v) law: a fence-arming stamp is recorded at the
+success site of the mutating write it fences, never solely parked in
+a second, separately-failing write. Restart loss of the in-process
+record is acceptable (≤ one 10s poll of the 5-minute window; the
+status backfill survives). The `None`-both polarity (`unwrap_or(true)`
+→ allow scale-down) is kept: with the in-process record closing the
+status-write-failure window, `None`-both is genuine "never scaled up
+or fresh CR" --- conservative-hold would freeze every restart for 5
+minutes.
+
 #r("ctrl.scaler.load-coverage")[
   A partial aggregate over per-replica gauges MUST carry its
   denominator: the poll fold reports `answered`/`resolved` alongside

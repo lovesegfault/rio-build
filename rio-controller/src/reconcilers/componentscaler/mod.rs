@@ -133,12 +133,22 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
     // field still exists for `kubectl get` observability — populated
     // from the in-process counter, but the reconciler reads from Ctx.
     let key = error_key(cs.as_ref());
-    let (low_ticks_in, last_status_write) = {
+    let (low_ticks_in, last_status_write, last_scale_up) = {
         let low = ctx.scaler.low_ticks.lock().get(&key).copied().unwrap_or(0);
         let last = ctx.scaler.last_status_write.lock().get(&key).copied();
-        (low, last)
+        let up = ctx.scaler.last_scale_up.lock().get(&key).copied();
+        (low, last, up)
     };
-    let since_up = status.last_scale_up_time.as_ref().and_then(since);
+    // r[impl ctrl.scaler.fence-arming]
+    // The fence reads the freshest of (in-process record, status
+    // stamp): a transient patch_status failure after a successful
+    // scale patch leaves status stale/None but the in-process record
+    // fresh (bug_021 — the second-write failure edge of the bug_060
+    // window).
+    let since_up = freshest_since_up(
+        status.last_scale_up_time.as_ref().and_then(since),
+        last_scale_up,
+    );
     let mut status_in = status.clone();
     status_in.low_load_ticks = low_ticks_in;
     let decision = decide::decide(spec, &status_in, current, builders, load, since_up);
@@ -161,6 +171,18 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
     // ── Patch /scale (only if changed) ───────────────────────────
     if decision.desired != current {
         patch_scale(&dep_api, &spec.target_ref.name, decision.desired).await?;
+        // r[impl ctrl.scaler.fence-arming]
+        // The fence-arming record at the mutating write's SUCCESS
+        // site (R34-w(v)): stamped in-process the moment patch_scale
+        // returns Ok, before and independent of the second
+        // (patch_status) write. The status stamp below is the
+        // durable backfill; this is the correctness copy (bug_021).
+        if decision.scaled_up {
+            ctx.scaler
+                .last_scale_up
+                .lock()
+                .insert(key.clone(), Instant::now());
+        }
         metrics::counter!("rio_controller_scaling_decisions_total",
             "direction" => if decision.scaled_up { "up" } else { "down" })
         .increment(1);
@@ -174,10 +196,11 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
     // REQUEUE window via in-process timestamp (same pattern as
     // `low_ticks`). Worst case: 2 reconciles/10s (the requeue + one
     // watch-echo whose status-write is suppressed). Scale-ups bypass
-    // the rate-limit: `lastScaleUpTime` is correctness-load-bearing
-    // (gates SCALE_DOWN_STABILIZATION), not observability, and
-    // scale-ups are rare + self-limiting so the watch-loop concern
-    // doesn't apply (bug_060).
+    // the rate-limit: `lastScaleUpTime` is the durable backfill of
+    // the in-process fence record (the correctness copy is stamped
+    // at patch_scale's success site above — bug_021), and scale-ups
+    // are rare + self-limiting so the watch-loop concern doesn't
+    // apply (bug_060).
     if status_write_gate(
         decision.scaled_up,
         last_status_write,
@@ -358,15 +381,15 @@ pub(super) fn status_write_due(last: Option<Instant>) -> bool {
 
 /// Combined gate for `patch_status`. Rate-limited to once per
 /// `REQUEUE` AND only on material change — except `scaled_up` always
-/// passes the rate-limit. `lastScaleUpTime` is the sole input to
-/// `decide()`'s `SCALE_DOWN_STABILIZATION` (correctness, not
-/// observability); a scale-up landing in the suppression window
-/// would patch `/scale` but skip the stamp, and by the next
-/// non-suppressed tick `current` has caught up so `scaled_up=false`
-/// preserves the stale timestamp → stabilization bypassed → flap
-/// (bug_060). Scale-ups are rare and self-limiting (next tick sees
-/// `desired==current`), so bypassing the rate-limit for them does
-/// not reintroduce the bug_213 watch-loop.
+/// passes the rate-limit. `lastScaleUpTime` is the durable backfill
+/// of `decide()`'s `SCALE_DOWN_STABILIZATION` fence (the
+/// correctness copy is the in-process `ScalerState::last_scale_up`
+/// record); a scale-up landing in the suppression window
+/// would patch `/scale` but skip the durable stamp until the next
+/// non-suppressed tick (bug_060). Scale-ups are rare and
+/// self-limiting (next tick sees `desired==current`), so bypassing
+/// the rate-limit for them does not reintroduce the bug_213
+/// watch-loop.
 pub(super) fn status_write_gate(
     scaled_up: bool,
     last: Option<Instant>,
@@ -455,11 +478,46 @@ fn publish_metrics(cs: &ComponentScaler, decision: &Decision, load: Option<decid
     }
 }
 
+// r[impl ctrl.scaler.fence-arming]
+/// `since_last_scale_up` for [`decide::decide`]: the freshest of the
+/// in-process record (stamped at `patch_scale`'s success site) and
+/// the durable status stamp. The smaller Duration is the more-recent
+/// record; either alone suffices. A scale-up is two non-atomic
+/// apiserver writes — `patch_scale` then `patch_status` — and only
+/// the second carried `lastScaleUpTime`, so a transient status-write
+/// failure after a successful scale patch left the next reconcile
+/// reading `current==desired`, `scaled_up=false`, and the stale/
+/// `None` stamp preserved permanently → the 5-minute anti-flap fence
+/// silently disarmed for that burst (bug_021; the bug_060 close
+/// fixed the rate-limit edge of the same window, not the
+/// write-failure edge). The in-process record is the R34-w(v)
+/// fence-arming fact at the mutating write's success site; the
+/// status stamp is the restart-surviving backfill.
+///
+/// Alternates priced: (a) stamp status BEFORE the scale patch — an
+/// earlier write can still fail separately and the invariant is
+/// "every successful scale-up leaves a fresh fence", so reordering
+/// alone does not close the window; (b) infer scale-up from
+/// observed-replicas vs `status.desiredReplicas` delta — ties the
+/// fence to a third apiserver-dependent observation. The in-process
+/// record is the cheapest sound close (restart loss ≤ one 10s poll
+/// of the 5-minute window).
+pub(super) fn freshest_since_up(
+    status: Option<Duration>,
+    in_process: Option<Instant>,
+) -> Option<Duration> {
+    let in_process = in_process.map(|t| t.elapsed());
+    match (status, in_process) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// `now() - t` as a non-negative Duration. `None` on parse failure
 /// or future timestamp (clock skew between controller restarts) —
-/// caller treats `None` as "infinitely long ago" (allow
-/// scale-down), which is the safe direction for a corrupt
-/// lastScaleUpTime.
+/// the [`freshest_since_up`] merge then falls through to the
+/// in-process record; if that too is absent the caller treats
+/// `None` as "infinitely long ago" (allow scale-down).
 fn since(t: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time) -> Option<Duration> {
     let then = &t.0;
     let now = Timestamp::now();
@@ -594,6 +652,180 @@ mod tests {
         assert!(
             !status_write_gate(false, Some(Instant::now()), &prev, &d_no_up, None),
             "non-scale-up inside suppression → suppressed"
+        );
+    }
+
+    fn cs_spec(min: i32, max: i32) -> ComponentScalerSpec {
+        ComponentScalerSpec {
+            target_ref: rio_crds::componentscaler::TargetRef {
+                kind: "Deployment".into(),
+                name: "rio-store".into(),
+            },
+            signal: Signal::SchedulerBuilders,
+            replicas: rio_crds::componentscaler::Replicas { min, max },
+            seed_ratio: 50.0,
+            load_endpoint: "rio-store-headless:9002".into(),
+            load_thresholds: rio_crds::componentscaler::LoadThresholds::default(),
+        }
+    }
+
+    fn cs_status(ratio: f64) -> ComponentScalerStatus {
+        ComponentScalerStatus {
+            learned_ratio: Some(ratio),
+            ..Default::default()
+        }
+    }
+
+    fn cs_total(l: f64) -> Option<decide::LoadAggregate> {
+        Some(decide::LoadAggregate {
+            max: l,
+            answered: 3,
+            resolved: 3,
+        })
+    }
+
+    // r[verify ctrl.scaler.fence-arming]
+    /// W14-B1 (bug_021) — proposition: every successful scale-up
+    /// leaves a fresh fence regardless of whether the second
+    /// (status) write succeeds; population: the transient
+    /// apiserver-failure regime (patch_scale lands, patch_status
+    /// 5xx — the write-failure edge of the bug_060 window). Pre-fix
+    /// RED (verbatim in the commit body): since_up sourced solely
+    /// from status → None → `unwrap_or(true)` stabilized → the
+    /// EMITTED scale-down (left: 5, right: 6) at the next lull.
+    #[test]
+    fn w14_b1_status_write_failure_keeps_fence_armed() {
+        // r13-allow(decide-seam): the patch-failure scenario is
+        // expressed as the state the retried reconcile observes —
+        // the in-process record + status stamp the production fold
+        // (`freshest_since_up`) consumes.
+        let state = crate::reconcilers::ScalerState::default();
+        let key = "ns/cs".to_string();
+        // Tick N: scale-up. patch_scale returned Ok → the in-process
+        // record is stamped at the mutating write's success site.
+        state
+            .last_scale_up
+            .lock()
+            .insert(key.clone(), Instant::now());
+        // patch_status FAILED (transient 5xx) → status.lastScaleUpTime
+        // stays None. The retried reconcile sees current=6 (the
+        // /scale patch landed), low builders (the lull after the
+        // burst), in-band load.
+        let status_since: Option<Duration> = None;
+        let since = freshest_since_up(status_since, state.last_scale_up.lock().get(&key).copied());
+        let d = decide::decide(
+            &cs_spec(2, 14),
+            &cs_status(50.0),
+            6,
+            100,
+            cs_total(0.5),
+            since,
+        );
+        // Load-bearing: the EMITTED decision (the walk-down-at-next-
+        // lull blast radius — `d.desired`, not gate state).
+        assert_eq!(
+            d.desired, 6,
+            "a transient patch_status failure after a successful \
+             scale-up must NOT disarm the 5-min stabilization fence \
+             (pre-fix: since_up=None from status only → d.desired=5)"
+        );
+        // Secondary mechanism check: the merge supplied the fresh
+        // in-process record where status was absent.
+        assert!(
+            since.is_some_and(|d| d < decide::SCALE_DOWN_STABILIZATION),
+            "the in-process record arms the fence"
+        );
+        // The status backfill: the next successful patch_status
+        // writes lastScaleUpTime (the durable copy); both records
+        // present → the merge picks the freshest (smaller Duration).
+        let backfilled = freshest_since_up(Some(Duration::from_secs(10)), Some(Instant::now()));
+        assert!(backfilled.is_some_and(|d| d < Duration::from_secs(10)));
+    }
+
+    // r[verify ctrl.scaler.fence-arming]
+    /// W14-B1b — the R34-w(v) success-site negative: patch_scale
+    /// itself failing MUST NOT stamp the in-process record (no
+    /// phantom fence). The next reconcile's scale-up is not
+    /// suppressed by a stamp from a write that never landed.
+    #[test]
+    fn w14_b1b_scale_patch_failure_stamps_nothing() {
+        let state = crate::reconcilers::ScalerState::default();
+        let key = "ns/cs".to_string();
+        // Tick N: patch_scale FAILED → reconcile_inner returns Err
+        // BEFORE the in-process stamp (`?` at the patch_scale call
+        // site precedes the insert). The record stays absent.
+        assert!(
+            state.last_scale_up.lock().get(&key).is_none(),
+            "no successful scale → no in-process record"
+        );
+        // Tick N+1: high load, current still 5 (the patch never
+        // landed). With NO record either side, since_up=None and the
+        // scale-UP path is unaffected (the fence gates scale-DOWN
+        // only).
+        let since = freshest_since_up(None, state.last_scale_up.lock().get(&key).copied());
+        assert_eq!(since, None);
+        let d = decide::decide(
+            &cs_spec(2, 14),
+            &cs_status(50.0),
+            5,
+            200,
+            cs_total(0.9),
+            since,
+        );
+        assert_eq!(
+            d.desired, 6,
+            "a failed scale patch leaves no phantom fence — the \
+             next reconcile's scale-up is not suppressed"
+        );
+        assert!(d.scaled_up);
+    }
+
+    // r[verify ctrl.scaler.fence-arming]
+    /// W14-B2 — the None/restart polarity, both directions priced.
+    /// With BOTH records absent (fresh CR, or controller restart with
+    /// status wiped), `decide()` treats since_up=None as "infinitely
+    /// long ago" → allow scale-down. R26 examined: absence of both
+    /// is genuine "never scaled up" — the bug_021 window (status
+    /// absent but a scale-up DID happen) is closed by the in-process
+    /// record, so the only None-BOTH case left is the deliberate
+    /// one. Conservative-hold (treat None as "just now") would
+    /// freeze every fresh CR for 5 minutes from an over-provisioned
+    /// chart `replicas` and freeze every restart — rejected; the
+    /// `unwrap_or(true)` polarity is KEPT.
+    #[test]
+    fn w14_b2_restart_none_both_allows_scale_down() {
+        // Fresh restart: neither record.
+        let since = freshest_since_up(None, None);
+        assert_eq!(since, None);
+        let d = decide::decide(
+            &cs_spec(2, 14),
+            &cs_status(50.0),
+            8,
+            100,
+            cs_total(0.5),
+            since,
+        );
+        assert_eq!(
+            d.desired, 7,
+            "None-both (restart/fresh CR) → allow scale-down \
+             (the deliberate polarity; conservative-hold rejected)"
+        );
+        // Restart with status PRESERVED: the durable stamp suffices
+        // alone — the in-process record is the supplement for the
+        // status-write-failure edge, never a replacement.
+        let since = freshest_since_up(Some(Duration::from_secs(30)), None);
+        let d = decide::decide(
+            &cs_spec(2, 14),
+            &cs_status(50.0),
+            8,
+            100,
+            cs_total(0.5),
+            since,
+        );
+        assert_eq!(
+            d.desired, 8,
+            "restart with status preserved → the durable stamp \
+             alone arms the fence"
         );
     }
 
