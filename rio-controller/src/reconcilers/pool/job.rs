@@ -2139,7 +2139,7 @@ pub(super) fn eviction_is_pod_attributed(msg: &str) -> bool {
 }
 
 /// The needle engine, parameterized so the battery's mutation copies
-/// (needle-arm-deleted, needle-widened) run the SAME match logic as
+/// (needle-arm-deleted, needle-widened) run the same match logic as
 /// production (rider (d): mutations apply to copies under harness
 /// control; the production path is this exact fn).
 pub(super) fn classify_pod_attributed(needles: &[&str], msg: &str) -> bool {
@@ -3058,7 +3058,7 @@ mod tests {
     }
 
     /// The upstream-pinned fixture battery (merged_bug_036,
-    /// R31′(iv)/OQ-13): ALL FIVE kubelet local-storage/eviction
+    /// R31′(iv)/OQ-13): ALL FIVE — quantifier: census(test: eviction_grammar_battery_pins_all_five_upstream_formats) — kubelet local-storage/eviction
     /// message formats, transcribed from the upstream constants in
     /// `pkg/kubelet/eviction/helpers.go` (kubernetes v1.33 —
     /// emptyDirMessageFmt, podEphemeralStorageMessageFmt,
@@ -3145,7 +3145,7 @@ mod tests {
     /// the keyless match-predicate shape; the degenerate-key face is
     /// INAPPLICABLE — no key projection exists). Two inline
     /// mutations, each applied to a COPY of the classifier through
-    /// the SAME engine production runs:
+    /// the same engine production runs:
     /// (1) needle-arm-deleted — each needle removed in turn must red
     ///     its own grammar's classification (the needle↔grammar map
     ///     is a bijection: the three needles are pairwise disjoint

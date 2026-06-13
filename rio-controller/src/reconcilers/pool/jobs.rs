@@ -1457,7 +1457,7 @@ pub(crate) fn aggregate_upper_for(
 ///   accessor alone cannot govern).
 /// - **Absence lane** ([`WantMap`], minted via [`WantMap::for_pool`]
 ///   from the page — the coverage letter is read off the page itself,
-///   bug_064): the ONLY source of negative
+///   bug_064): the ONLY source — quantifier: census(test: letter_readers_enrolled) — of negative
 ///   evidence. On an incomplete view the only verdict an absence
 ///   query can return is [`WantVerdict::Unknowable`] — "absent from
 ///   page" cannot type-check as "absent from demand"; destructive
@@ -1670,11 +1670,11 @@ impl IntentPage {
     }
 
     /// bug_064: THE coverage letter — the only read path, serving
-    /// EVERY reader class (the absence lane's `WantMap::for_pool`
+    /// EVERY reader class — quantifier: census(test: letter_readers_enrolled) — (the absence lane's `WantMap::for_pool`
     /// mint, the bound lane's `reap_queued_known` conjunct, the
     /// streak expiry's suspension law). The letter is degraded AT THE
     /// PAGE: transport truncation and any lossy narrowing since the
-    /// mint fold here, so a mutated page can never be paired with an
+    /// mint fold here, so a mutated page cannot be paired with an
     /// un-degraded letter (merged_bug_047, now for every lane — the
     /// retired `coverage_for_absence` accessor fused for absence
     /// consumers only, and the bound lane read the raw transport
@@ -1768,7 +1768,7 @@ pub(crate) enum WantVerdict<'a> {
 impl WantMap {
     /// Mint the absence lane for one pool from the page. The
     /// coverage letter is read off the page itself (bug_064:
-    /// [`IntentPage::coverage`] is the letter's ONLY read path, so no
+    /// [`IntentPage::coverage`] is the letter's ONLY read path — quantifier: census(test: letter_readers_enrolled) — so no
     /// caller can pair a mutated page with an un-degraded letter —
     /// the merged_bug_047 fusion, now structural for every lane).
     /// The fingerprint is the same `RenderInputs`
@@ -1883,7 +1883,7 @@ pub(crate) fn apply_placeable_gate(
                 // cannot represent (no parseable intent id) means
                 // the threading does NOT cover the Job inventory —
                 // the narrowing pays with the witness (the letter
-                // degrades ON the page — bug_064: EVERY reader class
+                // degrades ON the page — bug_064: every reader class
                 // pays, absence and bound alike) instead of keeping
                 // a Complete letter the union does not entail.
                 warn!(
@@ -4850,7 +4850,7 @@ mod tests {
             "an unrepresentable active Job degrades the letter: \
              absence is Unknowable, the orphan arm suspends"
         );
-        // bug_064: the SAME degraded letter is what the bound lane
+        // bug_064: the same degraded letter is what the bound lane
         // reads — `reap_queued_known`'s complete conjunct goes false,
         // so the excess-pending reap suspends too (every reader class
         // pays; the page accessor is the letter's only read path).
@@ -4864,7 +4864,7 @@ mod tests {
     /// W13-B (bug_064) — the lossy demand letter degrades the BOUND
     /// lane too: an active Job with no parseable intent-id makes the
     /// gate fold lossy, and the bound conjunct (`reap_queued_known`'s
-    /// `complete` argument) is read off the SAME page letter the
+    /// `complete` argument) is read off the same page letter the
     /// absence lane consumes — so `reap_excess_pending`'s authority
     /// collapses to the per-class aggregates, or suspends entirely
     /// when they read zero.
@@ -4988,7 +4988,7 @@ mod tests {
             ),
             Some(1)
         );
-        // And the transport's own truncation degrades the SAME letter
+        // And the transport's own truncation degrades the same letter
         // (the page carries both halves — one read path).
         let view = PoolDemandView::from_response(
             rio_proto::types::GetSpawnIntentsResponse {
@@ -6179,7 +6179,7 @@ mod letter_reader_census {
     ];
 
     // r[verify ctrl.pool.letter-degrades-whole]
-    /// Enrollment totality: per-(file, needle) counts equal the
+    /// Enrollment: per-(file, needle) counts equal the
     /// committed census. A new letter reader (or a second accessor,
     /// or a revived absence-only path) fails here naming its file.
     #[test]
@@ -6203,7 +6203,7 @@ mod letter_reader_census {
     }
 
     /// Riders (b)/(c)/(d): the census's own kill power. The corpus
-    /// plants are raw-source strings driven through the SAME counting
+    /// plants are raw-source strings driven through the same counting
     /// detectors that police production; the K-mutations are detector
     /// COPIES with degenerate predicates — each planted red must die.
     #[test]

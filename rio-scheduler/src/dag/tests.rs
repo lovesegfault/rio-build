@@ -2628,7 +2628,7 @@ fn advance_to(dag: &mut DerivationDag, hash: &str, status: DerivationStatus) {
 /// no pod, no verdict, cycle 0. The controller's gave-up latch decays
 /// only on a CHANGED observed `SpawnIntent.resubmit_cycle`
 /// (candidate.rs `note_demand_epoch`: the equality arm is the only hold
-/// face), and `dag::merge` is the scheduler's ONLY cycle mint.
+/// face), and `dag::merge` is the scheduler's only cycle mint.
 ///
 /// PRE-FIX RED (recorded verbatim in the commit body): the resubmit
 /// merged interest-only — `resubmit_cycles` stayed 0, so "same" was the
@@ -2651,7 +2651,7 @@ fn w13a_explicit_resubmission_mints_fresh_epoch_for_verdict_free_band(
     advance_to(&mut dag, "w13a", band_status);
     assert_eq!(dag.nodes["w13a"].retry.resubmit_cycles, 0);
 
-    // Explicit resubmission: the SAME drv as the submission's root.
+    // Explicit resubmission: the same drv as the submission's root.
     let build2 = Uuid::new_v4();
     let result = dag.merge(build2, &nodes, &[], "")?;
 
@@ -2681,7 +2681,7 @@ fn w13a_explicit_resubmission_mints_fresh_epoch_for_verdict_free_band(
 }
 
 /// W13-A (monotone face): every further explicit resubmission keeps
-/// minting STRICTLY fresh epochs — the producer can never re-mint a
+/// minting STRICTLY fresh epochs — the producer cannot re-mint a
 /// face the controller already latched on (the anti-replay equality
 /// arm is the controller's only hold face, so strict growth = the exit
 /// edge is satisfiable from every latched configuration).
@@ -2845,7 +2845,7 @@ fn w13a2_failed_merge_reparks_the_clear_poison_floor() -> anyhow::Result<()> {
 // bug_058 (W13-A4): the producer-reachability census — for every
 // DerivationState, which `note_demand_epoch` faces can the scheduler
 // mint? [GEN-SET]: the population is the macro-generated
-// `DerivationStatus::ALL` alphabet (× the Poisoned bound configs);
+// `DerivationStatus::ALL` alphabet — quantifier: census(test: w13a4_producer_reachability_census) — (× the Poisoned bound configs);
 // every member is driven through the REAL mint gate (`dag::merge`),
 // and the classification layers (the :272 status core, the state-level
 // wrapper, the disposition) are cross-checked so none can silently
@@ -2865,8 +2865,8 @@ struct CensusRow {
 }
 
 /// The pinned classification table — the WO-named EXPECTED members
-/// (rider (a)). Every `DerivationStatus::ALL` member appears (the
-/// totality assert below), Poisoned in BOTH bound configurations.
+/// (rider (a)). Every `DerivationStatus::ALL` member — quantifier: census(test: w13a4_producer_reachability_census) — appears (the
+/// per-member assert below), Poisoned in BOTH bound configurations.
 fn pinned_census() -> Vec<CensusRow> {
     use DerivationStatus as S;
     use EpochMintBand as B;
@@ -2970,7 +2970,7 @@ fn dag_with_status(
 fn w13a4_producer_reachability_census() -> anyhow::Result<()> {
     let census = pinned_census();
 
-    // Rider (a) — population non-vacuity + totality: every ALL member
+    // Rider (a) — population non-vacuity: every alphabet member
     // appears in the pinned table (and the table holds nothing else).
     assert_eq!(DerivationStatus::ALL.len(), 11, "the status alphabet");
     for s in DerivationStatus::ALL {
@@ -3038,7 +3038,7 @@ fn w13a4_producer_reachability_census() -> anyhow::Result<()> {
              mintable"
         );
 
-        // The root key: the verdict-free band mints ONLY for explicit
+        // The root key: the verdict-free band mints only for explicit
         // roots; every other class is root-invariant.
         let keyed =
             dag_with_status("cz", *status, *cycles)?.nodes["cz"].mints_epoch_on_resubmit(false);
@@ -3147,8 +3147,8 @@ fn w13a4_census_kill_power_under_k_mutations() -> anyhow::Result<()> {
         "M2 (superset-accept) must kill every refusal plant"
     );
 
-    // M3 — emptied population walk: the census's totality pin (every
-    // ALL member classified) reds on an emptied alphabet.
+    // M3 — emptied population walk: the census's every-member pin (each
+    // alphabet member classified) reds on an emptied alphabet.
     let emptied: &[DerivationStatus] = &DerivationStatus::ALL[..0];
     assert_ne!(
         emptied.len(),

@@ -5498,7 +5498,7 @@ fn w13a_giveup_face_census() {
             }),
             // A baseline-less record has no Same/Newer/Rewound faces.
             (RecordState::FreshNoBaseline, _) => None,
-            // Mid-ladder NEVER decays at the demand seam (its backoff
+            // Mid-ladder never decays at the demand seam (its backoff
             // window is its own exit edge; an epoch-triggered
             // mid-window reset would let resubmit spam bypass the
             // breaker): Same holds, changed faces TRACK the baseline.
@@ -5509,7 +5509,7 @@ fn w13a_giveup_face_census() {
                 })
             }
             (RecordState::MidLadder, Face::First) => None, // baseline pre-set
-            // THE LATCH: equality alone holds (anti-replay); ANY
+            // THE LATCH: equality alone holds (anti-replay); any
             // changed face — newer or rewound — is the demand signal
             // and decays the record the same observation.
             (RecordState::GaveUp, Face::Same) => Some(FaceOutcome {

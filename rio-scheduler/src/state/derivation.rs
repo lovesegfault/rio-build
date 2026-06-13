@@ -2043,7 +2043,7 @@ impl DerivationState {
     /// every latchable state, the controller's gave-up latch always
     /// has a producer-mintable fresh face to decay on (R30's
     /// producer-reachability face: the exit edge's guard is
-    /// satisfiable from EVERY latched configuration).
+    /// satisfiable from EVERY latched configuration — quantifier: census(test: w13a4_producer_reachability_census) —).
     ///
     /// Derived single-source: this is `resubmit_disposition()`
     /// collapsed to its mintability bit — the census walks both
@@ -2067,7 +2067,7 @@ impl DerivationState {
     /// documented recovery action's shape ("a resubmission of THE
     /// drv"; the `RespawnGiveUp` K8s Event names the latched drv).
     ///
-    /// The retriable band mints on ANY merge that touches the node
+    /// The retriable band mints on ANY merge — quantifier: census(test: w13a4_producer_reachability_census) — that touches the node
     /// (dead states; revival-on-any-touch is the long-standing
     /// semantics, and their transient windows bound the
     /// `resubmit_cycles` the overlap can mint). The verdict-free band

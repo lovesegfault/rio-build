@@ -632,7 +632,6 @@ rio-controller/src/reconcilers/pool/jobs.rs	// §13d chokepoint: `pod::taint_to_
 rio-controller/src/reconcilers/pool/jobs.rs	//! intent re-creates the SAME Job name and the apiserver's
 rio-controller/src/reconcilers/pool/jobs.rs	//! | spawn-candidate filter (`wanted`)    | page walk     | snapshot-tolerant (per-held-element; AD2 totality is per-held by design) |
 rio-controller/src/reconcilers/pool/jobs.rs	///   NAME carries the incompleteness so a totality-dependent consumer
-rio-controller/src/reconcilers/pool/jobs.rs	///   from the page + [`DemandCoverage`]): the ONLY source of negative
 rio-controller/src/reconcilers/pool/jobs.rs	///   positive walks with totality contracts, which an absence
 rio-controller/src/reconcilers/pool/jobs.rs	/// - **Totality/continuity lane**: consumers whose contracts span
 rio-controller/src/reconcilers/pool/jobs.rs	/// EVERY letter of the alphabet — a new variant fails here until
@@ -1260,7 +1259,6 @@ rio-scheduler/src/actor/tests/completion.rs	/// mint signs at dispatch) reaches 
 rio-scheduler/src/actor/tests/completion.rs	/// non-floor infra (FUSE EIO) poison at the SAME attempt number.
 rio-scheduler/src/actor/tests/completion.rs	/// the SAME output — the drv succeeded; this worker lost the upload
 rio-scheduler/src/actor/tests/dispatch.rs	// Determinism: re-emit returns the SAME affinity (memoized; no
-rio-scheduler/src/actor/tests/dispatch.rs	// Second submit: SAME derivation, DIFFERENT traceparent (dedup hit).
 rio-scheduler/src/actor/tests/dispatch.rs	// batched Ready probe completes X as cached and fans out to ALL
 rio-scheduler/src/actor/tests/dispatch.rs	// cap+1 insert via the SAME `on_evict` wiring `maybe_refresh_estimator`
 rio-scheduler/src/actor/tests/dispatch.rs	/// treating EVERY first-leadership assignment as unset/stale.
@@ -1444,7 +1442,6 @@ rio-scheduler/src/dag/mod.rs	// All three inserts clone the SAME Arc — they're
 rio-scheduler/src/dag/mod.rs	// Eligible iff ALL deps now terminal (or provisionally
 rio-scheduler/src/dag/mod.rs	///   over ALL non-terminal nodes (not just `find_roots`) is
 rio-scheduler/src/dag/mod.rs	/// MAX_DAG_NODES=1M × ~150B/frame ≈ 150MB >> 2MB default tokio stack.
-rio-scheduler/src/dag/mod.rs	/// Subset of `newly_inserted` that were pre-existing retriable nodes
 rio-scheduler/src/dag/mod.rs	/// whose ONLY remaining incomplete dependency was the just-completed
 rio-scheduler/src/dag/mod.rs	/// would be Skipped even though their outputs have NEVER been
 rio-scheduler/src/dag/tests.rs	// Failed merge by the SAME build growing its own prior entry: the

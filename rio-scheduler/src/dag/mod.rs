@@ -46,7 +46,7 @@ pub struct MergeResult {
     /// Rollback removes interest only from these (not from nodes where
     /// build_id was already present from a prior merge).
     pub interest_added: Vec<DrvHash>,
-    /// Subset of `newly_inserted` that mint a fresh demand epoch this
+    /// The `newly_inserted` members that mint a fresh demand epoch this
     /// merge: pre-existing mintable nodes (the retriable band
     /// `Cancelled`/`Failed`/`DependencyFailed`/`Poisoned`-under-limit,
     /// any-merge; plus the bug_058 verdict-free band
@@ -383,9 +383,9 @@ impl DerivationDag {
             // The verdict-free band is the bug_058 close: the
             // controller's gave-up latch decays only on a CHANGED
             // observed `SpawnIntent.resubmit_cycle`, and this gate is
-            // the scheduler's ONLY cycle mint — with the retriable
+            // the scheduler's ONLY cycle mint — quantifier: census(test: w13a4_producer_reachability_census) — with the retriable
             // band alone, a drv that a verdict-free give-up left
-            // Queued/Ready merged interest-only at the SAME cycle on
+            // Queued/Ready merged interest-only at the same cycle on
             // every resubmission ("same" was the only
             // producer-emittable face for exactly the latched
             // population), so the documented recovery action was
