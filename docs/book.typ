@@ -30,6 +30,7 @@
     #chapter("intro.typ")[Introduction]
     = Guide
     #chapter("guide/setup.typ")[Setup]
+    #chapter("guide/rio-build.typ")[Building with rio build]
     #chapter("guide/ci.typ")[CI Integration]
     #chapter("guide/programmatic.typ")[Programmatic Access]
     = Architecture
