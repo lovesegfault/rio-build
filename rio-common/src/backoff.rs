@@ -57,13 +57,13 @@ impl Jitter {
     /// TOTAL for every finite `d` (bug_049): the product saturates at
     /// the ONE shared absurdity ceiling
     /// ([`crate::clamped::ClampedSecs::MAX_SECS`], one year — the same
-    /// ceiling [`MAX_BACKOFF`] mirrors) instead of panicking on
+    /// ceiling `MAX_BACKOFF` mirrors) instead of panicking on
     /// overflow. The
     /// previous contract discharged the overflow obligation by
     /// comment — "`d` is clamped to 1yr in `Backoff::duration`" — an
     /// assumption the direct call sites bypass (the materializer
     /// feeds a raw config-sourced `poll_interval_secs` here without
-    /// any pre-clamp). Totality deletes the obligation class for
+    /// any pre-clamp). The total form deletes the obligation class for
     /// every present and future caller; the rejected alternative (a
     /// clamped-seconds newtype at each seam) would only have
     /// relocated it.

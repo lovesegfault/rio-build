@@ -486,7 +486,7 @@ P8_GRANDFATHER: frozenset = frozenset(
 # P8 HISTORICAL PINS — THE ONE SANCTIONED NON-ANNOTATION EXIT from
 # the grandfather (round-13 OP-7 / WO-S9-7, the model-of-record flip;
 # the audit's ruling: do NOT annotate chunkLiveness's dead protocol —
-# its rows would bind to nothing). A module enters this set ONLY when
+# its rows would bind to nothing). A module enters this set only when
 # it leaves model-of-record standing while its checks stay wired as
 # regression pins of a PREVIOUS RELEASE's encoding (deleting the
 # checks would discard the only model of the still-deployable prior
@@ -1611,7 +1611,7 @@ def selftest():
 
     # The HISTORICAL-PIN lane (round-13 OP-7, the sanctioned
     # non-annotation exit): (i) a pinned module's unbound step action
-    # does NOT red and the census reports the pin; (ii) the SAME
+    # does NOT red and the census reports the pin; (ii) the same
     # corpus un-pinned still reds — the lane exempts exactly the
     # registered retirement, never a hair more (the loophole face).
     census_pin = expect_p8(
@@ -1632,7 +1632,7 @@ def selftest():
         )
     # (ii) is exactly the p8-arms expectation above (pins empty there:
     # 'unbound' red) — re-asserted structurally: the two runs differ
-    # ONLY in the pins set, so the exemption is attributable to it.
+    # only in the pins set, so the exemption is attributable to it.
 
     # P8 green: every step action bound and resolvable.
     p8_green = (

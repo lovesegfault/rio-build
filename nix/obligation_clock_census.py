@@ -258,7 +258,7 @@ def self_battery(src_root) -> list:
     only."""
     fails = []
 
-    # Rider (a) — the walk floor, driven through the SAME walk path
+    # Rider (a) — the walk floor, driven through the same walk path
     # as production, plus the expected-member pins (two charged
     # bug_047 population files; both stable production surfaces — if
     # one moves, its grandfather row stales in the same run, so the
@@ -348,7 +348,7 @@ def self_battery(src_root) -> list:
     # the plant lives inside the grandfathered population, never only
     # in a clean file — the rels below are real grandfathered files,
     # exactly where the bug_047 masking occurred). The lossy plants
-    # are that lane's ONLY machine oracle today: each grandfathered
+    # are that lane's only machine oracle today: each grandfathered
     # lossy file carries exactly one live site (pull.rs:118,
     # lib.rs:282, sessions.rs:125, common.rs:79), so the live-tree
     # collision census is vacuously green for the lossy lane
@@ -390,7 +390,7 @@ def self_battery(src_root) -> list:
             f"W13-AX2 (lossy lane, arm 1): the in-population same-fragment "
             f"pair minted {len(set(dup))} distinct key(s), want 2"
         )
-    # (lossy, arm 2) two multiplies of the SAME const in one
+    # (lossy, arm 2) two multiplies of the same const in one
     # grandfathered file — the sessions.rs-shaped face.
     dup = [
         k
