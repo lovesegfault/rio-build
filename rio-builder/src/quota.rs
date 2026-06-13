@@ -149,11 +149,11 @@ const KUBELET_PROJID_BASE: u32 = 1_048_576;
 
 /// R17 (live_063): the builder-minted projid range is the half-open
 /// `[BUILDER_PROJID_BASE, BUILDER_PROJID_BASE + BUILDER_PROJID_RANGE)`
-/// = `[2^19, 2^20)`, ending EXACTLY at [`KUBELET_PROJID_BASE`] — the
+/// = `[2^19, 2^20)`, ending EXACTLY at `KUBELET_PROJID_BASE` — the
 /// two allocators partition the id space statically (no registry
 /// round-trip, no shared lock; the compile-time assert below pins the
 /// adjacency). Within the range, candidates derive from the emptyDir
-/// root's inode number ([`candidate_projid`]) and a free-record probe
+/// root's inode number (`candidate_projid`) and a free-record probe
 /// disambiguates the residual congruence class — see
 /// [`ensure_project_quota`]'s collision note.
 pub const BUILDER_PROJID_BASE: u32 = 1 << 19;
