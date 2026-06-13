@@ -25,11 +25,10 @@ platforms = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 # only affects local cargo + the importCargoLock-based checks (mutants/
 # fuzz/deny).
 #
-# rio-retry-kernel, rio-evidence-kernel, and rio-log-kernel are the
-# dependency-free CBMC-verified decision-kernel crates (see their
-# Cargo.toml headers): they must not gain the workspace-hack dependency
-# stub, and with zero third-party deps they contribute nothing to
-# unification anyway.
+# The `*-kernel` crates listed below are the dependency-free
+# CBMC-verified decision kernels (see their Cargo.toml headers): they
+# must not gain the workspace-hack dependency stub, and with zero
+# third-party deps they contribute nothing to unification anyway.
 [final-excludes]
 workspace-members = [
   "xtask",
