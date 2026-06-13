@@ -189,6 +189,30 @@ MATCHES_CODE = re.compile(r"matches!\s*\(\s*[^;]{0,400}?\bCode::", re.S)
 SHADOW_STRIPPER = re.compile(r"\.split\(\s*['\"]/" + r"/['\"]\s*\)")
 
 
+# --- the shared content-key projection (WO-S9-1, R31′(i)) ---------------
+#
+# bug_047: the obligation-clock census grandfathered exceptions under
+# (file × operator-fragment) keys — GATE_RE's m.group(0) carries no
+# site-identifying content, so every same-operator gate in a file
+# quotiented into ONE key: a fixed gate never tripped the stale sweep,
+# a brand-new same-operator gate stayed green, and the shrink-only /
+# visible-debt contract was defeated from birth across all 17
+# grandfathered combos (18 live sites at the repair tree). The repair
+# is ONE shared projection, content-bearing at the granularity of the
+# thing excepted: the whitespace-normalized TRIMMED SOURCE LINE of the
+# excepted site joins the key, and no lint re-derives its own
+# (degenerate) projection. Consumers compare grandfathers as
+# MULTISETS, so the identical-line corner stays count-bearing —
+# shrink-only made literal: live > grandfathered count fails the
+# excess, live < grandfathered count stales the deficit.
+def content_key(rel: str, lane: str, line_text: str) -> str:
+    """`rel<TAB>lane<TAB><trimmed line>` — the excepted site's own
+    source line, whitespace-normalized (tabs collapse to single
+    spaces, so the key stays exactly two-TAB delimited and the
+    `key.split(chr(9))[0]` file-prefix idiom keeps working)."""
+    return f"{rel}\t{lane}\t{' '.join(line_text.split())}"
+
+
 def strip_production(text: str, source: str = "<input>") -> str:
     """The shared production-scan pipeline (merged_bug_009): the
     attribute-position cfg(test) pruner, then comments AND string

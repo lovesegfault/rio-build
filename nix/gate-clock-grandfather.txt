@@ -1,17 +1,18 @@
-rio-builder/src/log_stream.rs	gate	L-content-.elapsed() >=
-rio-builder/src/runtime/pull.rs	lossy	* SIGTERM_FINAL_ATTEMPT.as_secs()
-rio-controller/src/reconcilers/componentscaler/mod.rs	gate	L-content-.elapsed() >=
-rio-controller/src/reconcilers/node_informer.rs	gate	L-content-.elapsed() >=
-rio-controller/src/reconcilers/pool/job.rs	gate	L-content-.elapsed() <
-rio-gateway/src/handler/build.rs	gate	L-content-.elapsed() >=
-rio-gateway/src/quota.rs	gate	L-content-.elapsed() <
-rio-lease/src/lib.rs	lossy	* FENCE_MARGIN.as_secs()
-rio-scheduler/src/actor/event.rs	gate	L-content-.elapsed() <
-rio-scheduler/src/actor/housekeeping.rs	gate	L-content-.elapsed() >
-rio-scheduler/src/actor/housekeeping.rs	gate	L-content-.elapsed().as_secs() >
-rio-scheduler/src/actor/materialize.rs	gate	L-content-.elapsed().as_secs() >=
-rio-store/src/cas.rs	gate	L-content-.elapsed() >=
-rio-store/src/gc/mod.rs	gate	L-content-.elapsed() >
-rio-store/src/grpc/put_path/common.rs	lossy	.as_secs() *
-rio-store/src/logs/ingest.rs	gate	L-content-.elapsed() >
-rio-store/src/logs/sessions.rs	lossy	* HEARTBEAT_INTERVAL.as_secs()
+rio-builder/src/log_stream.rs	gate	if !self.lines.is_empty() && self.batch_start.elapsed() >= BATCH_TIMEOUT {
+rio-builder/src/log_stream.rs	gate	if self.window_start.elapsed() >= Duration::from_secs(1) {
+rio-builder/src/runtime/pull.rs	lossy	2 * SIGTERM_FINAL_ATTEMPT.as_secs() <= rio_common::limits::PULL_MODE_TERMINATION_GRACE_SECS
+rio-controller/src/reconcilers/componentscaler/mod.rs	gate	last.is_none_or(|t| t.elapsed() >= REQUEUE)
+rio-controller/src/reconcilers/node_informer.rs	gate	if start.elapsed() >= per_pass_budget {
+rio-controller/src/reconcilers/pool/job.rs	gate	.retain(|_, inserted| inserted.elapsed() < TERMINAL_REPORT_SAMPLED_TTL);
+rio-gateway/src/handler/build.rs	gate	&& since.elapsed() >= Self::LIVE_TENURE_RESET
+rio-gateway/src/quota.rs	gate	if e.fetched_at.elapsed() < QUOTA_CACHE_TTL {
+rio-lease/src/lib.rs	lossy	2 * FENCE_MARGIN.as_secs() > RENEW_INTERVAL.as_secs(),
+rio-scheduler/src/actor/event.rs	gate	.is_some_and(|t| t.elapsed() < PROGRESS_DEBOUNCE)
+rio-scheduler/src/actor/housekeeping.rs	gate	&& build.submitted_at.elapsed().as_secs() > build.options.build_timeout.raw()
+rio-scheduler/src/actor/housekeeping.rs	gate	&& poisoned_at.elapsed() > POISON_TTL
+rio-scheduler/src/actor/materialize.rs	gate	.is_some_and(|began| began.elapsed().as_secs() >= dwell_secs);
+rio-store/src/cas.rs	gate	|| g.0.elapsed() >= HEARTBEAT_TIME_INTERVAL
+rio-store/src/gc/mod.rs	gate	if self.consulted_at.elapsed() > bound {
+rio-store/src/grpc/put_path/common.rs	lossy	< crate::substitute::DEFAULT_SUBSTITUTE_STALL_WINDOW.as_secs()
+rio-store/src/logs/ingest.rs	gate	&& since.elapsed() > 2 * self.config.cut_interval
+rio-store/src/logs/sessions.rs	lossy	2 * HEARTBEAT_INTERVAL.as_secs()

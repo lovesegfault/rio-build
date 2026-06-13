@@ -41,6 +41,7 @@ Self-test arms run first (the house pattern).
 import pathlib
 import re
 import sys
+from collections import Counter
 
 import census_corpora
 import rust_strip
@@ -112,8 +113,17 @@ def production_files(src_root):
 
 
 def scan_clock_code(files):
-    """[(key, message)] for lossy-arithmetic and un-named-gate hits;
-    content-keyed (rel + matched text) per the WO-S8-5 convention."""
+    """[(key, message)] for lossy-arithmetic and un-named-gate hits.
+
+    Keys are CONTENT-BEARING at the granularity of the excepted SITE
+    (R31'(i), the bug_047 repair): the trimmed source line joins the
+    key through the ONE shared projection
+    (census_corpora.content_key) — in BOTH lanes. The retired
+    projection keyed on the regex match fragment (`m.group(0)`),
+    which carries zero site-identifying content for GATE_RE and for
+    LOSSY_RE's first alternation arm, quotienting every same-operator
+    site in a file into one grandfather class — a fixed site never
+    tripped the stale sweep and a new site stayed green."""
     hits = []
     for rel, raw in files:
         try:
@@ -127,7 +137,11 @@ def scan_clock_code(files):
             window = "\n".join(lines[max(0, lineno - 4) : lineno])
             if LOSSY_ALLOW.search(window):
                 continue
-            key = f"{rel}\tlossy\t{' '.join(m.group(0).split())}"
+            # R31'(i): the site's own line, never the bare fragment —
+            # the lossy lane is lane-explicit (the `.as_secs() *` arm
+            # matched a contentless fragment; the `* CONST.as_secs()`
+            # arm quotiented same-const multiplies).
+            key = census_corpora.content_key(rel, "lossy", lines[lineno - 1])
             hits.append(
                 (
                     key,
@@ -139,7 +153,8 @@ def scan_clock_code(files):
             )
         for m in GATE_RE.finditer(lexed):
             lineno = lexed.count("\n", 0, m.start()) + 1
-            key = f"{rel}\tgate\tL-content-{' '.join(m.group(0).split())}"
+            # R31'(i): site-content keying (the gate lane's mint).
+            key = census_corpora.content_key(rel, "gate", lines[lineno - 1])
             hits.append(
                 (
                     key,
@@ -150,6 +165,35 @@ def scan_clock_code(files):
                 )
             )
     return hits
+
+
+def grandfather_diff(hits, gf_counts):
+    """(excess_msgs, stale_rows) of live `hits` against the MULTISET
+    grandfather `gf_counts` (Counter of key -> recorded count).
+
+    Shrink-only made literal (R31'(i) count-bearing semantics layered
+    over content keys): a key's live count above its recorded count
+    fails the excess hits (new sites are never silently absorbed by a
+    same-content row); a live count below the recorded count is a
+    stale row (the fixed site's debt entry must be removed). The
+    identical-line corner — two sites whose trimmed source lines are
+    byte-equal — is therefore still discriminated by COUNT even
+    though content alone cannot split them."""
+    live_by_key = {}
+    for k, m in hits:
+        live_by_key.setdefault(k, []).append(m)
+    excess = []
+    for k in sorted(live_by_key):
+        msgs = live_by_key[k]
+        over = len(msgs) - gf_counts.get(k, 0)
+        if over > 0:
+            excess.extend(msgs[-over:])
+    stale = []
+    for k in sorted(gf_counts):
+        deficit = gf_counts[k] - len(live_by_key.get(k, []))
+        if deficit > 0:
+            stale.append((k, deficit))
+    return excess, stale
 
 
 def check_landed(src_root, rows, kind):
@@ -218,6 +262,38 @@ def main() -> int:
     if len(f_l) != 1:
         print(f"FAIL: the pending-at-verify plant did not red: {f_l}", file=sys.stderr)
         return 1
+    # W13-AX (bug_047's defeat, reproduced then killed): two
+    # same-operator gates in ONE file — the charged fan-out shape
+    # (log_stream.rs :179/:261, the rel below is that exact
+    # grandfathered file, so the plant sits IN-POPULATION) — are
+    # grandfathered, then one gate is FIXED: the stale sweep MUST
+    # trip for the fixed site's row. Under the retired file×operator
+    # projection the surviving gate held the shared key live and the
+    # sweep stayed silent (the pre-fix red, verbatim in the landing
+    # commit body).
+    pair_rel = "rio-builder/src/log_stream.rs"
+    pair = (
+        "fn a(t: Instant) -> bool { t.elapsed() >= WINDOW }\n"
+        "fn b(u: Instant) -> bool { u.elapsed() >= BATCH_TIMEOUT }\n"
+    )
+    fixed = "fn b(u: Instant) -> bool { u.elapsed() >= BATCH_TIMEOUT }\n"
+    gf_ax = Counter(k for k, _m in scan_clock_code([(pair_rel, pair)]))
+    if len(gf_ax) != 2:
+        print(
+            f"FAIL: W13-AX — the same-operator in-population pair minted "
+            f"{len(gf_ax)} distinct key(s), want 2 (site-content keying)",
+            file=sys.stderr,
+        )
+        return 1
+    ax_excess, ax_stale = grandfather_diff(scan_clock_code([(pair_rel, fixed)]), gf_ax)
+    if ax_excess or len(ax_stale) != 1:
+        print(
+            f"FAIL: W13-AX — fixing one gate of the grandfathered pair must "
+            f"trip the stale sweep exactly once (excess={ax_excess}, "
+            f"stale={ax_stale})",
+            file=sys.stderr,
+        )
+        return 1
 
     # --- the real scan ----------------------------------------------------
     fails = []
@@ -231,19 +307,29 @@ def main() -> int:
             for x in fails:
                 print(f"mint refused: {x}")
             return 1
-        keys = sorted({k for k, _m in hits})
+        # MULTISET mint (no dedup): one row per live hit — "count
+        # preserved" through the projection is the literal
+        # non-degeneracy fact (a projection that quotients distinct
+        # sites would write fewer rows than hits; the W13-AX
+        # sub-assert pins rows == live sites at every re-mint).
+        keys = sorted(k for k, _m in hits)
         gf_path.write_text("".join(k + "\n" for k in keys))
-        print(f"minted {len(keys)} gate-clock grandfather entries")
+        print(
+            f"minted {len(keys)} gate-clock grandfather entries "
+            f"({len(set(keys))} distinct content keys)"
+        )
         return 0
-    gf = set()
+    gf_counts = Counter()
     if gf_path.is_file():
-        gf = {x for x in gf_path.read_text().splitlines() if x.strip()}
-    live_keys = {k for k, _m in hits}
-    fails += [m for k, m in hits if k not in gf]
-    for stale in sorted(gf - live_keys):
+        gf_counts = Counter(
+            x for x in gf_path.read_text().splitlines() if x.strip()
+        )
+    excess, stale_rows = grandfather_diff(hits, gf_counts)
+    fails += excess
+    for k, deficit in stale_rows:
         fails.append(
-            f"{stale.split(chr(9))[0]}: stale gate-clock grandfather entry "
-            f"({stale!r}) — remove it ({CLOCK_GRANDFATHER}, shrink-only)"
+            f"{k.split(chr(9))[0]}: stale gate-clock grandfather entry "
+            f"({k!r} ×{deficit}) — remove it ({CLOCK_GRANDFATHER}, shrink-only)"
         )
     if verify_landed:
         fails += check_landed(src_root, OBLIGATION_ROWS, "obligation")
@@ -253,7 +339,8 @@ def main() -> int:
         f"obligation+clock census: {len(OBLIGATION_ROWS)} obligation rows, "
         f"{len(CLOCK_ROWS)} clock rows ({n_pending} pending slot landings; "
         f"the wave-close --verify-landed flips them), lossy-arithmetic + "
-        f"un-named-gate grammars live ({len(gf)} grandfathered, shrink-only); "
+        f"un-named-gate grammars live ({sum(gf_counts.values())} grandfathered "
+        f"site rows, content-keyed, shrink-only); "
         f"recorded: {TAKE_THEN_AWAIT_CANDIDATE[:40]}..."
     )
     if fails:
