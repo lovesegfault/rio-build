@@ -2464,7 +2464,16 @@ rec {
     # overlapping chunks, and the read path's (first_line, session_id)
     # ordered walk serves each line exactly once. The honest uploader's
     # ack-implies-durable refinement is asserted here (no fabrication).
+    # bughunt-13 F11: the RAW containment axis is asserted here too —
+    # the account seeds from the merged projection at every open
+    # (production's forgiveness axis), the overlap drain's double MINT
+    # is counted by rawMinted (SUM-vs-union: the algebra the merged
+    # account structurally cannot see), and the open gate's
+    # REPLAY_ALLOWANCE ceiling holds (rawWithinCeiling; falsify twin
+    # quint-log-service-calib-raw-ceiling; reachability witness
+    # quint-log-service-witness-raw-amplification).
     # r[verify store.log.session-keyed]
+    # r[verify store.log.raw-ceiling]
     quint-log-service-resend = mkQuintCheck {
       name = "log-service-resend";
       spec = "logService";
@@ -2479,6 +2488,7 @@ rec {
         "completeLogServesAllProduced"
         "completenessGate"
         "acceptedWithinCap"
+        "rawWithinCeiling"
         "ingestLossCounted"
       ];
     };
@@ -2513,6 +2523,10 @@ rec {
         "ingestLossCounted"
         "sweepOnlyTerminalUnreferenced"
         "noOrphanLogChunks"
+        # bughunt-13 F11: the sweep is the raw axis's one sanctioned
+        # reset (the row deleter drops the seed the open gate reads) —
+        # the ceiling law holds across that interplay too.
+        "rawWithinCeiling"
       ];
     };
 
@@ -2721,6 +2735,32 @@ rec {
       spec = "logService";
       main = "logServiceCalibUnclampedAck";
       witness = "ackImpliesDurable";
+    };
+
+    # Non-vacuity witness (bughunt-13 F11): the raw minted total
+    # actually EXCEEDS the merged footprint in the resend regime — the
+    # at-least-once overlap re-commit's amplification is represented,
+    # not collapsed to a set-union stutter. If this stops violating,
+    # the raw axis has gone vacuous and rawWithinCeiling certifies
+    # nothing.
+    quint-log-service-witness-raw-amplification = mkQuintWitnessCheck {
+      name = "log-service-witness-raw-amplification";
+      spec = "logService";
+      main = "logServiceResend";
+      witness = "noRawAmplification";
+    };
+
+    # CALIBRATION (expect-violation), bughunt-13 F11 falsify twin: the
+    # pre-merged_bug_002 open gate (no durable open conjuncts) keeps
+    # re-admitting a writer whose raw minted total has reached
+    # REPLAY_ALLOWANCE x CAP — the admission ghost trips and
+    # rawWithinCeiling falsifies. Pins the live regimes' raw-ceiling
+    # conjunct as load-bearing.
+    quint-log-service-calib-raw-ceiling = mkQuintWitnessCheck {
+      name = "log-service-calib-raw-ceiling";
+      spec = "logService";
+      main = "logServiceCalibRawCeiling";
+      witness = "rawWithinCeiling";
     };
 
     # CALIBRATION (expect-violation): the open gate without the

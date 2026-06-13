@@ -71,7 +71,15 @@
 //     ingest-bounds`), the per-line truncation, the stream-count and
 //     byte-budget semaphores, and the line-number-overflow rejection.
 //     Resource bounds, not protocol; the overflow arm is unrepresentable
-//     in the bounded line domain (a Kani/fuzz obligation).
+//     in the bounded line domain (a Kani/fuzz obligation). The raw
+//     CONTAINMENT axis is NOT in this exclusion (bughunt-13 F11): the
+//     REPLAY_ALLOWANCE ceiling (`store.log.raw-ceiling`) is protocol —
+//     its rationale is an unbounded-storage attacker — and it IS
+//     modeled (`rawMinted`, the openAdmitted conjunct,
+//     `rawWithinCeiling`, the `logServiceCalibRawCeiling` twin); only
+//     the byte-vs-row unit split stays collapsed onto the one
+//     line-denominated counter (same SUM-vs-union algebra, priced at
+//     the var).
 //   - The S3 object behind a manifest row as separate state. The
 //     object-before-manifest write order and the loud
 //     missing-object read error are unit-tested code branches; modeling
@@ -708,10 +716,17 @@ module logService {
   /// row does, permanently.
   var assignmentRowLost: int -> bool
 
-  /// Ghost: lines accepted for the execution over its LIFETIME (all
-  /// sessions; never reset on reconnect — that is the
-  /// `store.log.caps-durable` fix). The accept guard charges it; the
-  /// open gate refuses an at-cap execution.
+  /// The durable accepted account the cap admission consults: SEEDED
+  /// from the MERGED projection of the committed manifest at every
+  /// open (`ingest.rs`: `accepted_bytes = merged_bytes` -- an honest
+  /// retry's re-send of committed content is never double-charged)
+  /// and charged by the accept guard in-session. Never reset to zero
+  /// on reconnect -- that is the `store.log.caps-durable` fix; the
+  /// pre-fix per-session zeroing survives only as
+  /// CALIB_SESSION_SCOPED_CAPS. The open gate refuses an execution
+  /// whose MERGED footprint is at cap (`mergedSize`), and refuses at
+  /// the RAW ceiling independently (`rawMinted`,
+  /// store.log.raw-ceiling).
   var acceptedTotal: int -> int
   /// Per execution: the store's TTL pass has stripped this execution
   /// (chunks + session registry). Mirrors the SELECT's EXISTS
@@ -774,6 +789,24 @@ module logService {
   /// bounds every chunk's lines by `delivered union fabricated` — the
   /// set of lines the execution's own bound builder ever sent.
   var fabricated: int -> Set[int]
+
+  /// Per execution: the RAW minted total -- the sum of every committed
+  /// chunk row's line count, over ALL commits including re-commits of
+  /// already-covered intervals (bughunt-13 F11). This is
+  /// `gate.rs::LogSeed`'s raw algebra at model scale: SUM over live
+  /// rows, which no reconnect resets and only the TTL sweep (the row
+  /// deleter) zeroes; the merged projection is `mergedSize`. One
+  /// line-denominated counter carries both production quantities'
+  /// algebra (raw bytes and raw manifest rows differ only in unit;
+  /// the split the law is about is SUM-vs-union, not bytes-vs-rows).
+  var rawMinted: int -> int
+  /// GHOST: an AppendLog open was ADMITTED while the execution's raw
+  /// minted total sat at-or-above the replay ceiling -- the admission
+  /// store.log.raw-ceiling's open-gate refusal makes unreachable.
+  /// Live regimes keep it false by construction (the openAdmitted
+  /// conjunct refuses first); the logServiceCalibRawCeiling
+  /// calibration drops the conjunct and trips it.
+  var rawCeilingBreached: bool
 
   /// History flags (model-only bookkeeping, never read by an action
   /// guard; each is the discriminator for one expect-violation witness).
@@ -1038,6 +1071,23 @@ module logService {
         else { cov: maxInt(st2.cov, c.first + c.count), stop: st2.stop }))
     folded.cov
 
+  /// `gate.rs::REPLAY_ALLOWANCE` (= 2), transcribed: how many times
+  /// the per-execution cap the raw durable totals may reach before
+  /// the open gate refuses outright (store.log.raw-ceiling). The
+  /// honest worst case is ONE full replay of a session whose every
+  /// ack was lost; cycles beyond that are indistinguishable from the
+  /// adversarial replay loop the ceiling exists to contain.
+  pure val REPLAY_ALLOWANCE: int = 2
+
+  /// The MERGED durable account (LogSeed::merged_pair at model
+  /// scale): the idempotent union footprint of the committed
+  /// manifest -- what an honest retry may re-send without
+  /// double-charge. Structurally cannot bound a writer that controls
+  /// duplication (identical-interval replays witness zero here);
+  /// that is the raw axis's job (`rawMinted`).
+  def mergedSize(e: int): int =
+    chunks.get(e).fold(Set(), (acc, c) => acc.union(chunkLines(c))).size()
+
   /// Is line `l` inside some committed chunk's interval? The covered
   /// consult's pointwise form — equivalent to the implementation's
   /// one-span containment because `CoverageMap` merges overlapping and
@@ -1251,6 +1301,32 @@ module logService {
   /// Witness (negated): some execution actually REACHES the cap
   /// boundary — the cap conjuncts are exercised, not vacuous.
   val noCapBoundary = EXECS.forall(e => acceptedTotal.get(e) < CAP)
+
+  /// store.log.raw-ceiling, the open-gate law at model scale
+  /// (bughunt-13 F11): no AppendLog open is ever ADMITTED while the
+  /// execution's raw minted total — the SUM over committed rows that
+  /// no reconnect resets — sits at-or-above REPLAY_ALLOWANCE x CAP.
+  /// True by construction in every live regime (the openAdmitted
+  /// conjunct is the gate; the countersRefineHistory tripwire
+  /// pattern); logServiceCalibRawCeiling drops the conjunct and
+  /// falsifies. Containment corollary, priced in the doc rather than
+  /// as a constant formula: with every admission below the ceiling
+  /// and each session's in-flight mint bounded by its own
+  /// merged-seeded cap admission, the raw total is finitely
+  /// contained under ANY replay schedule — the unbounded-storage
+  /// attacker the spec rationale names cannot mint unboundedly. The
+  /// production 2x-cap scenario pin lives in gate.rs's unit tier
+  /// (raw ceiling tests) and kani (nix/kani.nix's log gate entries);
+  /// the model pins the LAW's claim surface, which those code tiers
+  /// cannot see (the audit's "only unpriced hole").
+  val rawWithinCeiling = not(rawCeilingBreached)
+
+  /// Witness (negated): the raw total actually EXCEEDS the merged
+  /// footprint somewhere — the at-least-once re-cut amplification is
+  /// REPRESENTED, not collapsed (a chunks-as-a-set encoding shows
+  /// zero here forever; bughunt-13 F11's stutter critique).
+  val noRawAmplification = EXECS.forall(e =>
+    rawMinted.get(e) <= mergedSize(e))
 
   /// `store.log.append-auth+2`'s kind half + the displacement fix
   /// (bughunt-wave B2 item 8, merged_bug_101's kind leg): a
@@ -1698,6 +1774,8 @@ module logService {
     dispatched' = dispatched + 1,
     execRowExists' = execRowExists.put(dispatched + 1, true),
     execKind' = execKind.put(dispatched + 1, KBuild),
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced.put(dispatched + 1, true),
     producedEnd' = producedEnd,
     buildFinished' = buildFinished,
@@ -1735,6 +1813,8 @@ module logService {
     dispatched' = dispatched + 1,
     execRowExists' = execRowExists.put(dispatched + 1, true),
     execKind' = execKind.put(dispatched + 1, KMat),
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced.put(dispatched + 1, true),
     producedEnd' = producedEnd,
     buildFinished' = buildFinished,
@@ -1770,6 +1850,8 @@ module logService {
     execRowExists.get(e),
     ledgerReferenced' = ledgerReferenced.put(e, false),
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     dispatched' = dispatched,
     producedEnd' = producedEnd,
     buildFinished' = buildFinished,
@@ -1818,6 +1900,8 @@ module logService {
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
@@ -1860,6 +1944,8 @@ module logService {
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
@@ -1916,6 +2002,8 @@ module logService {
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
@@ -1946,9 +2034,18 @@ module logService {
     not(logIsComplete(e)),
     not(expired.get(e)),
     // CALIBRATION: pre-fix there WAS no open-time cap check (check 5
-    // did not exist) — the per-session encoding drops this conjunct
-    // along with resetting the account.
-    CALIB_SESSION_SCOPED_CAPS or acceptedTotal.get(e) < CAP,
+    // did not exist) — the per-session encoding drops both durable
+    // open conjuncts along with resetting the account.
+    // The MERGED open check (check 5's first arms): the gate consults
+    // the durable idempotent footprint, never the previous session's
+    // account value — the account re-seeds from the same projection
+    // in the open's effect (gate.rs::log_seed -> merged_pair).
+    CALIB_SESSION_SCOPED_CAPS or mergedSize(e) < CAP,
+    // r[impl store.log.raw-ceiling] (model mirror): the RAW monotone
+    // total — which no reconnect resets BY ALGEBRA and only the TTL
+    // sweep zeroes — must sit below REPLAY_ALLOWANCE x the cap or
+    // the open refuses outright (merged_bug_002; bughunt-13 F11).
+    CALIB_SESSION_SCOPED_CAPS or rawMinted.get(e) < REPLAY_ALLOWANCE * CAP,
   }
 
   /// The builder opens (or re-opens) an `AppendLog` stream for its
@@ -1998,10 +2095,15 @@ module logService {
     // to the watermark and the rewound transmit cursor follows.
     ackedBelow' = ackedBelow.put(e, maxInt(ackedBelow.get(e), coveredPrefixEnd(e))),
     sentBelow' = sentBelow.put(e, maxInt(ackedBelow.get(e), coveredPrefixEnd(e))),
-    // CALIBRATION: the pre-fix per-session account zeroed on every
-    // open; production keeps the lifetime account.
+    // The account SEEDS from the MERGED durable projection at every
+    // open (ingest.rs: `accepted_bytes = merged_bytes`): an honest
+    // retry's re-send of committed content is never double-charged,
+    // while the un-committed overlap a concurrent drain later
+    // commits IS charged on both sessions' accounts — and its
+    // double MINT is exactly what the raw axis counts (`rawMinted`).
+    // CALIBRATION: the pre-fix per-session account zeroed instead.
     acceptedTotal' = if (CALIB_SESSION_SCOPED_CAPS) acceptedTotal.put(e, 0)
-                     else acceptedTotal,
+                     else acceptedTotal.put(e, mergedSize(e)),
     // Witness ghost: this open is a REPLAY (not the first session) and
     // a later materialization attempt holds the latest slot — the
     // admission the pre-fix latest-only gate displaced.
@@ -2021,6 +2123,13 @@ module logService {
     fabricated' = fabricated,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    // GHOST (store.log.raw-ceiling): record an admission at-or-above
+    // the raw ceiling -- unreachable live (the openAdmitted conjunct
+    // refuses first); logServiceCalibRawCeiling drops the conjunct
+    // and trips this (rawWithinCeiling's falsify twin).
+    rawCeilingBreached' = (rawCeilingBreached or
+      rawMinted.get(e) >= REPLAY_ALLOWANCE * CAP),
     ledgerReferenced' = ledgerReferenced,
   }
 
@@ -2064,6 +2173,8 @@ module logService {
     fabricated' = fabricated,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
@@ -2091,6 +2202,8 @@ module logService {
     expired' = expired,
     acceptedTotal' = acceptedTotal,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
     sweepChunksDone' = sweepChunksDone,
     uploader' = uploader,
@@ -2137,6 +2250,8 @@ module logService {
     fabricated' = fabricated,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
@@ -2282,6 +2397,8 @@ module logService {
     fabricated' = fabricated,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
   }
 
@@ -2363,6 +2480,8 @@ module logService {
     fabricated' = fabricated,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
   }
 
@@ -2471,6 +2590,8 @@ module logService {
     chunks' = chunks,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
   }
 
@@ -2527,6 +2648,8 @@ module logService {
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
@@ -2561,6 +2684,14 @@ module logService {
         first: setMin(cutRun),
         count: cutRun.size(),
       }))),
+      // The RAW mint (bughunt-13 F11, store.log.raw-ceiling): every
+      // committed row charges the monotone raw total by its line
+      // count, INCLUDING an interval the set-union above already
+      // holds (a detached drain's overlap re-commit mints rows the
+      // merged projection cannot see) -- the SUM-vs-union algebra
+      // split gate.rs::LogSeed carries as raw_bytes/raw_rows vs
+      // merged_pair.
+      rawMinted' = rawMinted.put(e, rawMinted.get(e) + cutRun.size()),
       sessions' = sessions.put(e, sessions.get(e).put(s,
         match sessions.get(e).get(s) {
           | NoSession => NoSession
@@ -2582,6 +2713,7 @@ module logService {
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
@@ -2644,6 +2776,8 @@ module logService {
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
@@ -2692,6 +2826,8 @@ module logService {
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
@@ -2735,6 +2871,8 @@ module logService {
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
@@ -2785,6 +2923,8 @@ module logService {
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
@@ -2817,6 +2957,8 @@ module logService {
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
@@ -2849,6 +2991,8 @@ module logService {
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
@@ -2911,6 +3055,11 @@ module logService {
     assignmentRowLost' = assignmentRowLost,
     acceptedTotal' = acceptedTotal,
     execKind' = execKind,
+    // The sweep deletes the manifest rows, so the raw seed the
+    // open gate reads (gate.rs::log_seed: SUM over LIVE rows)
+    // drops with them -- the one sanctioned reset of the raw axis.
+    rawMinted' = rawMinted.put(e, 0),
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
   }
 
@@ -2954,6 +3103,8 @@ module logService {
     assignmentRowLost' = assignmentRowLost,
     acceptedTotal' = acceptedTotal,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
   }
 
@@ -2995,6 +3146,8 @@ module logService {
     assignmentRowLost' = assignmentRowLost,
     acceptedTotal' = acceptedTotal,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
   }
 
@@ -3044,6 +3197,8 @@ module logService {
     acceptedTotal' = acceptedTotal,
     sweepChunksDone' = sweepChunksDone,
     execKind' = execKind,
+    rawMinted' = rawMinted,
+    rawCeilingBreached' = rawCeilingBreached,
     ledgerReferenced' = ledgerReferenced,
     uploader' = uploader,
     ackedBelow' = ackedBelow,
@@ -3437,6 +3592,8 @@ module logService {
     acceptedTotal' = EXECS.mapBy(e => 0),
     sweepChunksDone' = EXECS.mapBy(e => false),
     execKind' = EXECS.mapBy(e => KBuild),
+    rawMinted' = EXECS.mapBy(e => 0),
+    rawCeilingBreached' = false,
     ledgerReferenced' = EXECS.mapBy(e => true),
     uploader' = EXECS.mapBy(e => Uploading),
     refusedFrom' = EXECS.mapBy(e => -1),
@@ -3813,14 +3970,19 @@ module logServiceResend {
     ENABLE_FABRICATION = false,
     ENABLE_RECONNECT = true,
     ENABLE_SWEEP = false,
-    // 4, not MAX_LINE: the at-least-once replay re-charges the
-    // retransmitted lines (the durable account is seeded from committed
-    // chunks and the new session re-accepts the un-acked tail — the
-    // code's exact double-charge on overlap), so the canonical
-    // 2-line-cut + reconnect + 2-line-replay trace costs 4. The cap
-    // boundary is reached by exactly that trace (noCapBoundary's
-    // witness), making the cap conjuncts non-vacuous here.
-    CAP = 4,
+    // = MAX_LINE (re-derived at bughunt-13 F11, the merged-seed
+    // re-encode): the account now SEEDS from the merged durable
+    // projection at every open — production's forgiveness axis — so
+    // the pre-reseed encoding's account-level double-charge no longer
+    // accumulates across reconnects, and the account boundary
+    // (noCapBoundary's witness) is reached at the produced-line
+    // volume; past it the open gate's merged check refuses the
+    // reopen, keeping both durable-cap conjuncts exercised. The
+    // at-least-once overlap's double MINT is no longer an account
+    // fact at all: it is the RAW axis's subject, witnessed here by
+    // noRawAmplification (raw > merged via the detached drain's
+    // overlap re-commit) and bounded by rawWithinCeiling.
+    CAP = 3,
     CALIB_SESSION_SCOPED_CAPS = false,
     CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
@@ -4023,8 +4185,9 @@ module logServiceCalibSessionCaps {
     // an over-cap footprint to be representable. Pre-fix: session 1
     // accepts {0,1} (= CAP) and cuts; the reconnect resets the
     // account; session 2 accepts line 2 — footprint {0,1,2} = 3 > 2.
-    // Post-fix the lifetime account blocks session 2's accept and the
-    // reopen itself.
+    // Post-fix the merged-seeded durable account and the open-time
+    // merged check block session 2's over-cap accept and the reopen
+    // itself.
     CAP = 2,
     CALIB_SESSION_SCOPED_CAPS = true,
     CALIB_UNCLAMPED_ACK = false,
@@ -5083,6 +5246,54 @@ module logServiceCalibUnclampedAck {
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
     CALIB_UNCLAMPED_ACK = true,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
+  ).*
+}
+
+// =========================================================================
+// CALIBRATION: the pre-merged_bug_002 world without the raw replay
+// ceiling (bughunt-13 F11) — the open gate carries neither durable
+// open conjunct (the session-scoped-caps pre-fix shape), so reconnects
+// keep re-admitting a writer whose raw minted total has reached
+// REPLAY_ALLOWANCE x CAP: `rawWithinCeiling` falsifies (the admission
+// ghost trips). Pins that the live regimes' raw-ceiling conjunct is
+// load-bearing, not decorative: if this stops falsifying, the model
+// has drifted away from the unbounded-replay-mint class the ceiling
+// exists to contain.
+// =========================================================================
+module logServiceCalibRawCeiling {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 3,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = true,
+    ENABLE_SWEEP = false,
+    CAP = 2,
+    CALIB_SESSION_SCOPED_CAPS = true,
+    CALIB_UNCLAMPED_ACK = false,
     CALIB_GATE_IGNORES_ROW = false,
     ENABLE_MAT_DISPATCH = false,
     CALIB_GATE_LATEST_ONLY = false,
