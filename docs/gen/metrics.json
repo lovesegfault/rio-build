@@ -48,6 +48,7 @@
     "rio_controller_lease_lost_total",
     "rio_controller_lease_rebound_total",
     "rio_controller_node_wedge_marked_total",
+    "rio_controller_nodeclaim_budget_starved_total",
     "rio_controller_nodeclaim_cells_decode_refused_total",
     "rio_controller_nodeclaim_consolidate_threshold_seconds",
     "rio_controller_nodeclaim_created_total",
@@ -520,6 +521,11 @@
         "name": "rio_controller_node_wedge_marked_total",
         "kind": "counter",
         "help": "Nodes newly marked Dead-equivalent by the controller-side OA2 clustering: ≥2 distinct derivations' open pull-mode attempts expired (age past intent deadline + grace) on one node inside the 30-minute window. One increment per not-wedged→wedged transition; the resulting NodeClaim deletions are counted in nodeclaim_reaped_total{reason=\"dead\"} subject to the per-tick dead-reap cap. Non-zero = a node is eating builds without reporting (the wedged-but-Ready failure mode); see the hung-node runbook."
+      },
+      {
+        "name": "rio_controller_nodeclaim_budget_starved_total",
+        "kind": "counter",
+        "help": "Cover-sizing ticks where NO claim size was affordable for a demanded cell — the per-class fleet-core budget binds below the smallest family member (budget < the largest single-intent footprint). Distinct from intent_dropped_total: nothing is dropped, the deficit persists and re-fires every tick until budget frees or demand drains. A sustained rate = raise maxFleetCores / the class cap, or drain the cell."
       },
       {
         "name": "rio_controller_nodeclaim_cells_decode_refused_total",

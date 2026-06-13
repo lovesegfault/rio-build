@@ -1709,7 +1709,7 @@ the first sentinel-attributed freeze). The window's fairness mirrors
 permanently starve a sibling class's window share, preserving the
 budget brake's rotation property upstream of the mint.
 
-#r("ctrl.nodeclaim.anchor-bulk+6")[
+#r("ctrl.nodeclaim.anchor-bulk+7")[
   Unplaced intents per `(h,cap)` cell whose pod footprint fits the cell's
   per-class `(max_cores, max_mem)` and global `max_disk` cap are covered by `n`
   uniform claims at `(max(⌈Σc*/n⌉, max_i c*), max(⌈Σm/n⌉, max_i m),
@@ -1726,10 +1726,12 @@ budget brake's rotation property upstream of the mint.
   m)` chunk is hostable by some instance in `h`'s `requirements` set;
   `cover_deficit` skips the tick when the global ceiling is not yet loaded
   (fail-closed, ≤300s self-heal). NodeClaim creation is bounded by the
-  two-term law `min(n_pack, ⌊budget/chunk⌋)` — demand (the FFD bin count over
-  real placeable-gated footprints) and the `sla.maxFleetCores` fleet-budget
-  brake, and by nothing else (the flat `sla.maxNodeClaimsPerCellPerTick`
-  per-tick cap is RETIRED, live_049 L1 — its helm row is parse-only;
+  two-term law `min(n, ⌊budget/chunk(n)⌋)` — demand (`n = n_pack`, the FFD
+  bin count over real placeable-gated footprints, or the first affordable
+  larger-`n` family member when `chunk(n_pack)` exceeds the budget) and the
+  `sla.maxFleetCores` fleet-budget brake, and by nothing else (the flat
+  `sla.maxNodeClaimsPerCellPerTick` per-tick cap is RETIRED, live_049 L1 —
+  its helm row is parse-only;
   #rref("ctrl.nodeclaim.mint-deficit-proportional")); cells
   are iterated round-robin from a rotating start so no cell starves under
   sustained pressure.
@@ -1793,7 +1795,7 @@ budget brake's rotation property upstream of the mint.
   taint.
 ]
 
-#r("ctrl.nodeclaim.budget.per-class+3")[
+#r("ctrl.nodeclaim.budget.per-class+4")[
   `cover_deficit` clamps each cell's per-tick mint at `min(global_remaining,
   hwClasses[cell.0].max_fleet_cores − class_live − class_created_this_tick)`
   where `class_live` and `class_created_this_tick` are summed across
@@ -1802,20 +1804,31 @@ budget brake's rotation property upstream of the mint.
   ⇒ global budget only. The per-tick created-core accounting (global and
   per-class) MUST count only successful creates --- a failed NodeClaim
   create consumes no budget. The budget brake and demand are the ONLY
-  mint bounds: the per-cell sizing law is the two-term
-  `min(n_pack, ⌊budget/chunk⌋)` (the
-  `ctrl.nodeclaim.mint-deficit-proportional` law --- the former flat
-  per-cell-per-tick cap is retired, live_049 L1).
+  mint bounds: the per-cell sizing law is
+  `ctrl.nodeclaim.mint-deficit-proportional`'s two-term bound (one
+  formula home, stated there --- the former flat per-cell-per-tick
+  cap is retired, live_049 L1).
 ]
 
-#r("ctrl.nodeclaim.mint-deficit-proportional")[
+#r("ctrl.nodeclaim.mint-deficit-proportional+2")[
   Minting MUST be bounded by demand and by the fleet budget --- the two
   quantities with safety meaning --- and by NOTHING else: each cell's
-  per-tick claim count is `min(n_pack, ⌊budget/chunk⌋)`, where `n_pack`
-  is the FFD bin count over the actual placeable-gated unplaced
-  intents (right-sizing by construction) and `budget` is the per-class
-  fleet-core sub-budget. A deficit of `D` placeable-gated chunks
-  within budget MUST mint fully in ONE tick.
+  per-tick claim count is `min(n, ⌊budget/chunk(n)⌋)`, where `n` is
+  the packing-minimal FFD bin count `n_pack` over the actual
+  placeable-gated unplaced intents (right-sizing by construction)
+  when `chunk(n_pack)` is affordable, else the FIRST affordable
+  member of the weakly-decreasing uniform-claim family (the upward
+  search, bounded by the partition's cardinality) --- an
+  affordability decision over a parametric family MUST quantify over
+  the family, because a zero mint under an affordable family leaves
+  demand and headroom unchanged and repeats identically every tick
+  (steady-state cell starvation, not deferral). `budget` is the
+  per-class fleet-core sub-budget. A deficit of `D` placeable-gated
+  chunks within budget MUST mint fully in ONE tick. The
+  truly-unaffordable arm (budget below the largest single-intent
+  footprint, the family's floor) MUST disclose with the same
+  operator trail as the dropping siblings (warn +
+  #(refs.metric)("rio_controller_nodeclaim_budget_starved_total")).
 ]
 Rationale (live_049 L1, the parallel-ramp verdict): the 208-claim peak
 ramped at 18 ticks x 8/cell x \~1.44 slots/claim with demand drained

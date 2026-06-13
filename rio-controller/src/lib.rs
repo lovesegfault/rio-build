@@ -190,6 +190,14 @@ pub fn describe_metrics() {
          rio_controller_component_scaler_load_poll_partial_total."
     );
     describe_counter!(
+        "rio_controller_nodeclaim_budget_starved_total",
+        "Cover-sizing ticks where NO claim size was affordable for a demanded cell — the \
+         per-class fleet-core budget binds below the smallest family member (budget < the \
+         largest single-intent footprint). Distinct from intent_dropped_total: nothing is \
+         dropped, the deficit persists and re-fires every tick until budget frees or demand \
+         drains. A sustained rate = raise maxFleetCores / the class cap, or drain the cell."
+    );
+    describe_counter!(
         "rio_controller_component_scaler_load_poll_partial_total",
         "Ticks whose GetLoad poll resolved more replicas than answered (labelled by cs=ns/name): \
          the load letter was PARTIAL — survivor-high still scales up, survivor-low funds no ratio \

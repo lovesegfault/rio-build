@@ -5032,8 +5032,8 @@ rec {
     # deficit-within-budget-mints-fully-in-ONE-tick law (the retired
     # per-cell-per-tick cap is gone from relation AND invariant; the
     # burst regime is non-vacuous via canReachBurstFullMint below).
-    # r[verify ctrl.nodeclaim.budget.per-class+3]
-    # r[verify ctrl.nodeclaim.mint-deficit-proportional]
+    # r[verify ctrl.nodeclaim.budget.per-class+4]
+    # r[verify ctrl.nodeclaim.mint-deficit-proportional+2]
     quint-nodeclaim-lifecycle-base = mkQuintCheck {
       name = "nodeclaim-lifecycle-base";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
@@ -5072,7 +5072,7 @@ rec {
     # expected-falsification protocol when the skip was fixed (the
     # executed flip is noted in the nodeclaimLifecycle.qnt header).
     # r[verify ctrl.nodeclaim.consolidate-only-degraded+3]
-    # r[verify ctrl.nodeclaim.budget.per-class+3]
+    # r[verify ctrl.nodeclaim.budget.per-class+4]
     quint-nodeclaim-lifecycle-fault-rpc = mkQuintCheck {
       name = "nodeclaim-lifecycle-fault-rpc";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census

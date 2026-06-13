@@ -2538,7 +2538,7 @@ impl NodeClaimPoolReconciler {
                         )
                         .increment(1);
                         created.push((name, cell.clone()));
-                        // r[impl ctrl.nodeclaim.budget.per-class+3]
+                        // r[impl ctrl.nodeclaim.budget.per-class+4]
                         // r40 bug_015: budget counters track cores MINTED this
                         // tick (`class_budget` doc, cover.rs:339). A failed
                         // create is neither Registered nor in-flight; counting

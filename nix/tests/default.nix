@@ -1166,7 +1166,7 @@ in
   #
   # r[verify ctrl.nodeclaim.ffd-sim]
   # r[verify ctrl.nodeclaim.shim-nodepool]
-  # r[verify ctrl.nodeclaim.anchor-bulk+6]
+  # r[verify ctrl.nodeclaim.anchor-bulk+7]
   # r[verify ctrl.nodeclaim.priority-bucket]
   # r[verify ctrl.nodeclaim.placeable-gate+5]
   vm-sla-sizing-kwok = forecast-provisioning {
