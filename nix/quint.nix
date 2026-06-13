@@ -3375,22 +3375,24 @@ rec {
     # counts, depths and wall-clocks live in the introducing commits'
     # messages and the checks' transcripts.
     #
-    # Marker scope: of the Stage-A spec-audit rules, the surviving ones
-    # (no-live-collect, liveness-not-presence) keep verify markers here,
-    # on the regime that makes each load-bearing; the two as-built
-    # counter rules the audit added (refcount-meaning,
-    # refcount-decrement) were retired with the counter writers in
-    # Release B, so these checks no longer claim spec coverage for them
-    # — the checks themselves stay wired against the as-built model
-    # until its own retirement (Phase 2). Pre-existing mechanism rules
-    # the as-built machinery still implements (upsert-inserted,
-    # chunk-upload-committed, placeholder-claim, orphan-heartbeat) keep
-    # the model-checked form on top of their unit-test markers; rules
-    # whose text now describes the replacement collector (refcount-txn's
-    # upsert+touch pairing, grace-ttl, pending-deletes,
-    # bounded-garbage-retention, two-phase) carry their verify markers
-    # at the chunkCollect wirings below instead. Witness checks carry no
-    # markers (same policy as the other models).
+    # HISTORICAL PINS (round-13 OP-7 / WO-S9-7 — the model-of-record
+    # FLIP): chunkCollect is the chunk plane's model of record;
+    # chunkLiveness models the PREVIOUS release's deleted refcount
+    # protocol (Release B / migration 072 dropped the counter). These
+    # checks stay wired as regression pins of that prior encoding —
+    # deleting them would discard the only model of the
+    # still-deployable previous release (refcount-records.md, the
+    # Phase-2 retirement row, ownership assigned at this flip) — but
+    # they no longer claim ANY spec coverage: every verify marker they
+    # carried (no-live-collect, liveness-not-presence,
+    # upsert-inserted+3, chunk-upload-committed, orphan-heartbeat,
+    # placeholder-claim+2) is carried by the chunkCollect wirings
+    # below (W13-BD: zero verifies orphaned by the consolidation).
+    # P8: the chunkLiveness modules sit in quint_policy.py's
+    # P8_HISTORICAL_PINS register — the ONE sanctioned non-annotation
+    # exit from the grandfather (the dead protocol binds to nothing;
+    # annotating it was the rejected loophole). Witness checks carry
+    # no markers (same policy as the other models).
     # ------------------------------------------------------------------
 
     # The base regime: one writer over two paths and three hashes with
@@ -3399,7 +3401,6 @@ rec {
     # The counter must equal the manifest fold at every state, garbage
     # must stay reclaimable, and no referenced chunk's object may be
     # deleted.
-    # r[verify store.chunk.no-live-collect]
     quint-chunk-liveness-base = mkQuintCheck {
       name = "chunk-liveness-base";
       spec = "chunkLiveness";
@@ -3426,12 +3427,6 @@ rec {
     # garbage), a reclaimed chunk's cleared uploaded_at forces the next
     # writer to re-PUT instead of trusting the counter, and a live
     # heartbeating owner is never reaped.
-    # r[verify store.chunk.no-live-collect]
-    # r[verify store.chunk.liveness-not-presence]
-    # r[verify store.cas.upsert-inserted+3]
-    # r[verify store.cas.chunk-upload-committed]
-    # r[verify store.gc.orphan-heartbeat]
-    # r[verify store.put.placeholder-claim+2]
     quint-chunk-liveness-crash = mkQuintCheck {
       name = "chunk-liveness-crash";
       spec = "chunkLiveness";
@@ -3454,8 +3449,6 @@ rec {
     # family, the orphan-chunk sweep's select-vs-update race (C11), the
     # by-count batch sweep, and the late-cleanup no-op contention. No
     # process death: every interleaving is a healthy-process schedule.
-    # r[verify store.chunk.no-live-collect]
-    # r[verify store.chunk.liveness-not-presence]
     quint-chunk-liveness-contend = mkQuintCheck {
       name = "chunk-liveness-contend";
       spec = "chunkLiveness";
@@ -3481,7 +3474,6 @@ rec {
     # skipped amount, and the data-loss invariant is untouched (the skip
     # errs toward retention). The unconditional forms are the
     # pre-registered falsifications below, never invariants here.
-    # r[verify store.chunk.no-live-collect]
     quint-chunk-liveness-corrupt = mkQuintCheck {
       name = "chunk-liveness-corrupt";
       spec = "chunkLiveness";

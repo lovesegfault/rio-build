@@ -125,12 +125,6 @@ P8_GRANDFATHER: frozenset = frozenset(
         "chunkCollectThresholdOrder",
         "chunkCollectWriterBounded",
         "chunkCollectWriterOverrun",
-        "chunkLiveness",
-        "chunkLivenessBase",
-        "chunkLivenessContend",
-        "chunkLivenessCorrupt",
-        "chunkLivenessCrash",
-        "chunkLivenessThresholdOrder",
         "closureCalibA17Unfenced",
         "closureCalibC3NoReprobe",
         "closureCalibF10RecoveryVouchUnscoped",
@@ -487,6 +481,44 @@ P8_GRANDFATHER: frozenset = frozenset(
         "wedgeClusterNoEviction",
         "wedgeClusterTrajectory",
     }
+)
+
+# P8 HISTORICAL PINS — THE ONE SANCTIONED NON-ANNOTATION EXIT from
+# the grandfather (round-13 OP-7 / WO-S9-7, the model-of-record flip;
+# the audit's ruling: do NOT annotate chunkLiveness's dead protocol —
+# its rows would bind to nothing). A module enters this set ONLY when
+# it leaves model-of-record standing while its checks stay wired as
+# regression pins of a PREVIOUS RELEASE's encoding (deleting the
+# checks would discard the only model of the still-deployable prior
+# release — refcount-records.md, the Phase-2 retirement row). Rows
+# here are NOT debt being burned down by annotation: they are a
+# retirement register — the exit fires because the module stopped
+# being the record holder, never because bindings were written. The
+# exit form, so it cannot become a loophole: (a) entry requires a
+# wave ruling naming the SUCCESSOR model of record (chunkCollect for
+# the chunk plane) and the demotion comment on every wiring; (b) a
+# module may never sit in both this set and P8_GRANDFATHER (asserted
+# below); (c) the census reports pinned modules separately — the
+# register is visible, never silent.
+P8_HISTORICAL_PINS: frozenset = frozenset(
+    {
+        # The chunk plane's previous-release encoding (the exact
+        # chunks.refcount counter protocol, deleted in Release B /
+        # migration 072): model of record FLIPPED to chunkCollect at
+        # round-13 WO-S9-7; these regimes stay wired as historical
+        # pins with their verify markers consolidated at the
+        # chunkCollect wirings.
+        "chunkLiveness",
+        "chunkLivenessBase",
+        "chunkLivenessContend",
+        "chunkLivenessCorrupt",
+        "chunkLivenessCrash",
+        "chunkLivenessThresholdOrder",
+    }
+)
+assert not (P8_GRANDFATHER & P8_HISTORICAL_PINS), (
+    "a module cannot be both grandfathered debt and a historical pin — "
+    "the exit is a MOVE, never a duplication"
 )
 
 HOLDS_KINDS = {"holds", "holds-sim"}
@@ -1115,6 +1147,7 @@ def run_policy(manifest, corpus, assume_latches="", models_dir=None, mirrors_roo
     # ---- P8: action bindings over wired step alphabets
     p8_checked = set()
     p8_grandfathered_mods = set()
+    p8_historical_mods = set()
     for cname, meta in sorted(manifest.items()):
         if not meta or meta.get("main") not in corpus.mod_decls:
             continue
@@ -1141,6 +1174,14 @@ def run_policy(manifest, corpus, assume_latches="", models_dir=None, mirrors_roo
             p8_checked.add((amod, nm))
             if amod in P8_GRANDFATHER:
                 p8_grandfathered_mods.add(amod)
+                continue
+            # The sanctioned non-annotation exit (round-13 OP-7): a
+            # demoted module's checks stay wired as previous-release
+            # regression pins; its dead protocol binds to nothing, so
+            # P8 does not demand bindings — the register above is the
+            # visible record, and the census reports it separately.
+            if amod in P8_HISTORICAL_PINS:
+                p8_historical_mods.add(amod)
                 continue
             if models_dir is None:
                 continue  # census-less invocation (unit shims)
@@ -1181,6 +1222,8 @@ def run_policy(manifest, corpus, assume_latches="", models_dir=None, mirrors_roo
                     census["P8-mirrors"].append(f"{amod}.{nm}")
     for m in sorted(p8_grandfathered_mods):
         census["P8-grandfathered-module"].append(m)
+    for m in sorted(p8_historical_mods):
+        census["P8-historical-pin-module"].append(m)
 
     # ---- P3 pairing census (no enforcement beyond reporting)
     holds_by_livemod = defaultdict(list)
@@ -1484,10 +1527,20 @@ def selftest():
     # the green corpus (resolving Mirrors + Environment) and the
     # grandfather census lane. Each runs the same engine the live gate
     # runs, with a real staged mirrors root.
-    def expect_p8(tag, files, manifest, mirrors_files, expected_prefixes, grandfather=frozenset()):
-        global P8_GRANDFATHER
+    def expect_p8(
+        tag,
+        files,
+        manifest,
+        mirrors_files,
+        expected_prefixes,
+        grandfather=frozenset(),
+        pins=frozenset(),
+    ):
+        global P8_GRANDFATHER, P8_HISTORICAL_PINS
         saved = P8_GRANDFATHER
+        saved_pins = P8_HISTORICAL_PINS
         P8_GRANDFATHER = grandfather
+        P8_HISTORICAL_PINS = pins
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 corpus = build(tmp, files)
@@ -1502,6 +1555,7 @@ def selftest():
                 )
         finally:
             P8_GRANDFATHER = saved
+            P8_HISTORICAL_PINS = saved_pins
         unmatched = list(expected_prefixes)
         extra = []
         for v in violations:
@@ -1554,6 +1608,31 @@ def selftest():
     )
     if not census.get("P8-mirrors") or not census.get("P8-environment"):
         fail("self-test[p8-arms]: the resolving Mirrors / Environment census lanes are empty")
+
+    # The HISTORICAL-PIN lane (round-13 OP-7, the sanctioned
+    # non-annotation exit): (i) a pinned module's unbound step action
+    # does NOT red and the census reports the pin; (ii) the SAME
+    # corpus un-pinned still reds — the lane exempts exactly the
+    # registered retirement, never a hair more (the loophole face).
+    census_pin = expect_p8(
+        "p8-historical-pin",
+        p8_files,
+        p8_manifest,
+        p8_mirrors,
+        [
+            # only the non-P8 arms fire when the module is pinned:
+            "P1 p8Holds: invariant leaf 'invX'",
+        ],
+        pins=frozenset({"liveP8"}),
+    )
+    if census_pin.get("P8-historical-pin-module") != ["liveP8"]:
+        fail(
+            f"self-test[p8-historical-pin]: the pinned module must be censused "
+            f"as a historical pin, got {census_pin.get('P8-historical-pin-module')}"
+        )
+    # (ii) is exactly the p8-arms expectation above (pins empty there:
+    # 'unbound' red) — re-asserted structurally: the two runs differ
+    # ONLY in the pins set, so the exemption is attributable to it.
 
     # P8 green: every step action bound and resolvable.
     p8_green = (
