@@ -52,7 +52,9 @@ module leaseCalib180RvKeyed {
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
     STEP_DOWN_COUNT_KEYED = false,
-    CONFLICT_CLEARS_HOLD = false
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 0,
+    ABSENT_READ_KEEPS_BELIEF = false
   ).* from "../leaderElection"
 
   /// Same fault economy as the live regime's foreignRvStep — the only

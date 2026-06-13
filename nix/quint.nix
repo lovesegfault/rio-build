@@ -1433,6 +1433,82 @@ rec {
       match = "zombieConflictSigtermReleasesRun";
     };
 
+    # The lease-vanish (absence) regime (bughunt-13 F8): the Lease
+    # object deleted with NO re-create in the same step — the absence
+    # partition (every read in between observes 404) joins the model's
+    # reachable space for the first time. That partition is the
+    # implementation's empirically bug-densest region (bug_143: belief
+    # must exit AT the absent read; bug_059: the hold's posture under
+    # an in-doubt write) and the audit's reverse-live_061 exhibit: no
+    # prior reachable state lacked a lease object, so the wired greens
+    # said nothing about it. Headlines: believerExitsAtAbsentRead (THE
+    # F8 law — the law-site latch is unreachable under the live law;
+    # the lease-f8-keep-believing twin restores the pre-bug_143
+    # keep-believing posture and must violate it),
+    # boundedDualLeadership + staleLeaderHasStaleGeneration (a
+    # vanished lease grants a creator immediate acquisition, so the
+    # dual window is REAL — bounded by the victim's read/fence clocks,
+    # with the write-ahead claim keeping the creator's generation
+    # strictly above the vanished holder's). neverDual is deliberately
+    # NOT wired here: the asymmetric margin does not shield the
+    # absence partition (production prices the window as "bounded by
+    # one read latency" — rio-lease/src/lib.rs FENCE_MARGIN doc), and
+    # the witness check below proves the window reachable rather than
+    # letting this regime claim it empty. The deterministic hold-split
+    # pins (bug_059) live in the leaderElectionVanishHold runs check.
+    quint-leader-election-vanish = mkQuintCheck {
+      name = "leader-election-vanish";
+      # quint-policy P1 exemption (bughunt-2 slot 11; §5-Q13): the
+      # vanish regime conjoins the base invariant set, so the same
+      # untwinned leaf carries the same exemption as its sibling
+      # regimes.
+      vacuityExempt = {
+        atMostOneCASWinner = {
+          class = "pre-r2-untwinned";
+          reason = "the falsifier needs an apiserver-fault twin (duplicate resourceVersion admission) — a new fault axis priced in the Q13 burn-down headline list";
+        };
+      };
+      spec = "leaderElection";
+      main = "leaderElectionVanish";
+      invariants = [
+        "boundsOK"
+        "clockSkewBound"
+        "atMostOneCASWinner"
+        "loopInterval"
+        "boundedDualLeadership"
+        "staleLeaderHasStaleGeneration"
+        "believerExitsAtAbsentRead"
+      ];
+    };
+
+    # The W13-P runs: the believing absent read end to end, both hold
+    # postures (bug_059) — the empty-ledger read exits belief and
+    # CLEARS the hold (AbsenceLose) and the peer create lands with a
+    # strictly greater generation; the armed-ledger read exits belief
+    # with the hold KEPT (AbsenceLoseHoldKept) and the ledger
+    # surviving the read for the next round's evidence leg.
+    quint-leader-election-runs-vanish-hold = mkQuintRunCheck {
+      name = "leader-election-runs-vanish-hold";
+      spec = "leaderElection";
+      main = "leaderElectionVanishHold";
+    };
+
+    # Non-vacuity witness for the vanish regime: the creator-vs-
+    # deposed-believer dual window actually opens during the absence
+    # window (a vanished lease grants the creator immediate
+    # acquisition while the deposed believer has not yet read) — the
+    # production-real window bug_143's read-evidence law exists to
+    # bound. Proves boundedDualLeadership's antecedent satisfiable in
+    # this regime and keeps the deliberate absence of neverDual from
+    # the regime's invariant list an honest statement rather than an
+    # untested assumption.
+    quint-leader-election-witness-vanish-dual-belief = mkQuintWitnessCheck {
+      name = "leader-election-witness-vanish-dual-belief";
+      spec = "leaderElection";
+      main = "leaderElectionVanish";
+      witness = "neverDual";
+    };
+
     # Non-vacuity witnesses for the two new regimes (same discipline as
     # the witness block above: each check passes only when the checker
     # VIOLATES the witness, proving the guarded scenario reachable).
@@ -2058,6 +2134,27 @@ rec {
       spec = "calibration/lease-f7-clear-hold-409";
       main = "leaseCalibF7ClearHold409";
       witness = "noConflictClearedHold";
+      extraSpecs = [ "leaderElection" ];
+    };
+
+    # bughunt-13 audit F8 pre-fix: KEEP-BELIEVING — ABSENT_READ_KEEPS_
+    # BELIEF restores the pre-bug_143 posture inside the vanish
+    # regime: a believing node's completed read observes the lease
+    # ABSENT (404) and belief survives the read, coasting to the next
+    # facts:Some round or the self-fence while a creator can already
+    # have acquired with no steal wait. The LAW-SITE latch fires
+    # (believerExitsAtAbsentRead falls) the moment the kept-believing
+    # branch runs — the consequence invariants cannot see it (the F7
+    # lesson: they judge by the very belief the broken law preserves).
+    # The production law this pins: election.rs FetchOutcome::Create
+    # routed through route_act_failed_read to AbsenceLose /
+    # AbsenceLoseHoldKept — belief exits AT the read. The quint-policy
+    # P1 falsify twin for believerExitsAtAbsentRead.
+    quint-lease-calib-f8-keep-believing = mkQuintWitnessCheck {
+      name = "lease-calib-f8-keep-believing";
+      spec = "calibration/lease-f8-keep-believing";
+      main = "leaseCalibF8KeepBelieving";
+      witness = "believerExitsAtAbsentRead";
       extraSpecs = [ "leaderElection" ];
     };
 

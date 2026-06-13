@@ -50,7 +50,9 @@ module leaseCalib096ResponseAnchor {
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
     STEP_DOWN_COUNT_KEYED = false,
-    CONFLICT_CLEARS_HOLD = false
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 0,
+    ABSENT_READ_KEEPS_BELIEF = false
   ).* from "../leaderElection"
 
   /// PRE-FIX read: stamps the fence at the READ instant — the
@@ -85,6 +87,8 @@ module leaseCalib096ResponseAnchor {
       staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,

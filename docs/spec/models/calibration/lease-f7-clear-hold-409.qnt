@@ -64,6 +64,8 @@ module leaseCalibF7ClearHold409 {
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
     STEP_DOWN_COUNT_KEYED = false,
-    CONFLICT_CLEARS_HOLD = true
+    CONFLICT_CLEARS_HOLD = true,
+    MAX_VANISHES = 0,
+    ABSENT_READ_KEEPS_BELIEF = false
   ).* from "../leaderElection"
 }

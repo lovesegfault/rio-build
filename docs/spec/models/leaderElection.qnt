@@ -1,5 +1,5 @@
 // -*- mode: Bluespec; -*-
-// quint-policy-latches: evidenceFabricated, evidenceConsumed, holdClearedByConflict
+// quint-policy-latches: evidenceFabricated, evidenceConsumed, holdClearedByConflict, keptBelievingPastAbsentRead
 //
 // Phase-1 model of rio-lease's apiserver-CAS leader election protocol:
 // per-node monotonic clocks with bounded skew, the observed-record
@@ -367,6 +367,24 @@ module leaderElection {
   /// lease-f7-clear-hold-409 twin, whose shutdown+rv-mover regime
   /// reds gracefulHandover under it.
   const CONFLICT_CLEARS_HOLD: bool
+  /// Lease-object vanishes per trace (0 = the absence plane is
+  /// disabled and its vars are frozen — pre-existing regimes
+  /// unchanged). Unlike MAX_DELETES (modeled as delete + immediate
+  /// empty re-create, the collapsed 404→POST window), a vanish
+  /// leaves NO object behind: every subsequent read observes 404
+  /// until some replica's create lands (createLease). bughunt-13
+  /// F8's fault axis — the absence partition where bug_143/bug_059
+  /// cluster and the phase-2 deletion MBT was blocked.
+  const MAX_VANISHES: int
+  /// Calibration hook for the bughunt-13 F8 twin: a believing node's
+  /// completed read that observes the lease ABSENT keeps believing
+  /// (the pre-bug_143 posture — belief survived to the next
+  /// facts:Some round or the self-fence) instead of exiting belief
+  /// at the read. The keptBelievingPastAbsentRead latch records the
+  /// kept belief at the read arm itself (the F7 lesson: the
+  /// consequence invariants judge by state the broken law corrupts).
+  /// false everywhere except the lease-f8-keep-believing twin.
+  const ABSENT_READ_KEEPS_BELIEF: bool
 
   /// acquiredAt sentinel: "never acquired" (the TLA+ acquiredAt[n] =
   /// NULL). -1 can never equal a real rv (>= 0), mirroring a model
@@ -409,10 +427,12 @@ module leaderElection {
   var casRace: bool
   /// Lease-object deletions so far (0..MAX_DELETES).
   var deletes: int
-  /// Holders deposed by a deletion rather than a steal -- their
-  /// dual-belief window is bounded by their own self-fence deadline, not
-  /// the thief's staleness measurement (see boundedDualLeadership's
-  /// fourth disjunct).
+  /// Holders deposed by a deletion rather than a steal (deleteLease,
+  /// or its uncollapsed F8 form vanishLease) -- their dual-belief
+  /// window is bounded by their own self-fence deadline, not the
+  /// thief's staleness measurement (see boundedDualLeadership's
+  /// fourth disjunct); under the F8 believer-exit law the window
+  /// usually closes earlier, at the victim's next completed read.
   var delVictims: Set[Node]
   /// Failed claim INSERTs so far (0..MAX_CLAIM_FAILURES).
   var claimFailures: int
@@ -581,6 +601,24 @@ module leaderElection {
   /// did not file it (the merged_bug_128 stale demotion). Judged on
   /// the true filing instance, independent of the stamp keying.
   var staleStepDownServed: bool
+  /// The Lease OBJECT does not exist at the apiserver (bughunt-13
+  /// F8): vanishLease set it, createLease clears it. While true,
+  /// every read observes 404 and no rv-guarded write can land —
+  /// production's PUT against a deleted object is NotFound, never
+  /// Conflict. Frozen (false) at MAX_VANISHES = 0, so pre-existing
+  /// regimes' state spaces are unchanged.
+  var leaseAbsent: bool
+  /// Lease-object vanishes so far (0..MAX_VANISHES).
+  var vanishes: int
+  /// History latch (LAW SITE — the F7 lesson): a believing node's
+  /// completed read observed the lease ABSENT and belief survived the
+  /// read. Under the live law (bug_143: belief exits AT the read)
+  /// this is unreachable; only the ABSENT_READ_KEEPS_BELIEF twin can
+  /// set it. The consequence invariants (neverDual /
+  /// boundedDualLeadership) cannot be the detector here: the kept
+  /// belief is exactly the state they would need to read, and the
+  /// dual window it opens is bounded by other clocks in most traces.
+  var keptBelievingPastAbsentRead: bool
 
   // --- 4. accessor / guard helpers --------------------------------------
   // The TLA+ reads snap[n].rv directly after guarding snap[n] /= NULL;
@@ -687,6 +725,7 @@ module leaderElection {
     deletes >= 0, deletes <= MAX_DELETES,
     claimFailures >= 0, claimFailures <= MAX_CLAIM_FAILURES,
     restores >= 0, restores <= MAX_RESTORES,
+    vanishes >= 0, vanishes <= MAX_VANISHES,
     delVictims.subseteq(NODES),
   }
 
@@ -821,6 +860,22 @@ module leaderElection {
   /// lease-f7-clear-hold-409 twin restores that law and must
   /// violate.
   val noConflictClearedHold = not(holdClearedByConflict)
+
+  /// THE F8 BELIEVER-EXIT LAW (bug_143, sched.lease.holder-evidenced-
+  /// lose's absence arm): a believing node's completed read that
+  /// observes the lease ABSENT exits belief AT that read — a deleted
+  /// lease grants a creator immediate acquisition (no steal wait), so
+  /// the fence/steal margin does not shield the absence partition and
+  /// READ EVIDENCE is what bounds the dual window (production
+  /// election.rs FetchOutcome::Create routed through
+  /// route_act_failed_read to AbsenceLose / AbsenceLoseHoldKept).
+  /// The latch is the LAW-SITE detector (the F7 lesson: the
+  /// consequence invariants judge by the very belief the broken law
+  /// preserves); under the live law it is unreachable, and the
+  /// lease-f8-keep-believing twin (ABSENT_READ_KEEPS_BELIEF — the
+  /// pre-bug_143 posture) must violate it. Wired in the vanish
+  /// regime.
+  val believerExitsAtAbsentRead = not(keptBelievingPastAbsentRead)
 
   /// sched.recovery.step-down instance law (merged_bug_128): a
   /// step-down is served only by the tenure instance that filed it.
@@ -1235,6 +1290,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -1279,7 +1336,19 @@ module leaderElection {
   /// steal deadline (anchored to the rv) by an unbounded number of reads.
   /// Anchoring both clocks to the same event -- the last completed write
   /// -- is what makes the fence/steal separation argument sound.
-  action apiGet(n: Node): bool = all {
+  action apiGet(n: Node): bool = {
+    // The believing absent read (bughunt-13 F8): the GET observed NO
+    // lease object (404 — production election.rs FetchOutcome::Create)
+    // while this node still believes it leads. Under the live law
+    // (bug_143) belief exits AT this read: the lease resolves to
+    // nobody, a peer Create needs no steal wait, and the fence/steal
+    // margin does not shield the absence partition — only read
+    // evidence bounds the dual window. The twin toggle
+    // (ABSENT_READ_KEEPS_BELIEF) restores the pre-fix posture: belief
+    // survives the read and the law-site latch records it.
+    val absentLoseRead = leaseAbsent and leading.get(n) and not(ABSENT_READ_KEEPS_BELIEF)
+    val absentKeepRead = leaseAbsent and leading.get(n) and ABSENT_READ_KEEPS_BELIEF
+    all {
     alive.get(n),
     pending.get(n) == NoPending,
     // A GET that would observe own-commit evidence IS the evidence
@@ -1288,13 +1357,20 @@ module leaderElection {
     // the cursor, so a bare GET that ignores pending evidence does
     // not exist. Identically true at MAX_DROPS = 0.
     not(evidenceEnabled(n)),
-    snap' = snap.put(n, Snap(lease)),
+    // An absent read carries no object: production's Create outcome
+    // has no lease payload, so there is nothing to CAS against later
+    // (the 404→POST create is createLease, not an rv-guarded PUT).
+    snap' = snap.put(n, if (leaseAbsent) NoSnap else Snap(lease)),
     obs' = obs.put(n,
       if (lease.holder == NoHolder) NoObs
       else if (lease.holder == Held(n)) obs.get(n)
       else if (hasObs(n) and obsKeyOf(n) == leaseKey(lease)) obs.get(n)
       else Observed({ key: leaseKey(lease), since: clocks.get(n) })),
-    clocks' = clocks, lease' = lease, alive' = alive, leading' = leading,
+    // Belief: unchanged by a bare read of a PRESENT lease (loseObserved
+    // / conflict / selfFence own those exits); exits here exactly when
+    // the read observed ABSENCE while believing (bug_143).
+    leading' = if (absentLoseRead) leading.put(n, false) else leading,
+    clocks' = clocks, lease' = lease, alive' = alive,
     fence' = fence, gen' = gen, genHW' = genHW, genHWHolder' = genHWHolder,
     acquiredAt' = acquiredAt,
     casRace' = casRace, deletes' = deletes, delVictims' = delVictims,
@@ -1305,8 +1381,19 @@ module leaderElection {
     // The hold clears when the GET observes a holder that is not us
     // (the model point where production's Standby resolution lands —
     // on_observed(false)); observing our own holdership keeps it.
+    // The ABSENT read takes the bug_059 split instead: an empty
+    // ledger and a believing read mean there is provably no lease
+    // object of ours to release (AbsenceLose — clear); an ARMED
+    // ledger means a transmitted write of ours may still commit a
+    // lease naming us after the 404, so the hold takes the
+    // self-fence posture (AbsenceLoseHoldKept — keep); a standby's
+    // absent read records the baseline only (AbsenceObserve — keep).
     pending' = pending,
-    held' = trackHeld(held, n, if (lease.holder == Held(n)) held.get(n) else false),
+    held' =
+      if (leaseAbsent)
+        (if (absentLoseRead and unconfirmed.get(n) == NoUnconf) trackHeld(held, n, false)
+         else held)
+      else trackHeld(held, n, if (lease.holder == Held(n)) held.get(n) else false),
     exited' = exited,
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
@@ -1318,8 +1405,13 @@ module leaderElection {
     // run_lease_loop Completed arm. Observing OURSELVES is only the
     // fetch half of a round still in flight: ledger and cursor wait
     // for the round's resolution. Value-identical at MAX_DROPS = 0.
+    // The ABSENT read never consumes the ledger (production: the
+    // absence partition constructs Frozen and leaves the doubt to the
+    // evidence leg — the transmitted Create resolves NEXT round,
+    // holder=us against the Absent baseline).
     unconfirmed' =
-      if (lease.holder == Held(n)) unconfirmed
+      if (leaseAbsent) unconfirmed
+      else if (lease.holder == Held(n)) unconfirmed
       else unconfirmed.put(n, NoUnconf),
     // Cursor per the same arm (404/empty resets the baseline --
     // production's create path); gated for byte-identical
@@ -1336,6 +1428,11 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    // The F8 law-site latch: a believing absent read whose belief
+    // SURVIVED the read (only the ABSENT_READ_KEEPS_BELIEF twin can
+    // take that branch — the live law exits above).
+    keptBelievingPastAbsentRead' = (keptBelievingPastAbsentRead or absentKeepRead),
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -1351,8 +1448,12 @@ module leaderElection {
     evidenceConsumed' = evidenceConsumed,
     // The blind condition is invariant under a bare GET: the entry
     // only clears when the holder is foreign (that node's blind term
-    // was already false), and no other coordinate moves.
+    // was already false), and no other coordinate moves. (During
+    // absence the holder is NoHolder, so the exists-clause is false
+    // and the ghost is 0 with either belief value — the absent arm's
+    // belief exit does not need threading here.)
     blindHolderFor' = bhNext(lease, leading, alive, unconfirmed, lastFetchedKey, blindHolderFor, false),
+    }
   }
 
   /// The write-ahead claim INSERT succeeds: the PG floor advances to the
@@ -1478,6 +1579,11 @@ module leaderElection {
     all {
       alive.get(n),
       pending.get(n) == NoPending,
+      // No object, no rv-guarded PUT: production's replace() against a
+      // vanished lease is NotFound, never a successful write — the only
+      // write path during absence is createLease (the 404→POST).
+      // Identically true at MAX_VANISHES = 0.
+      not(leaseAbsent),
       hasSnap(n),
       // decide()'s steal condition: the lease is unheld, or its holder
       // has been observed at the same rv for longer than the steal
@@ -1563,6 +1669,8 @@ module leaderElection {
       staleExhaustedLose' = staleExhaustedLose,
       blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
       acquireInstV' =
         if (MAX_STEP_DOWNS == 0) acquireInstV
         else acquireInstV.put(n, acquireInstV.get(n) + 1),
@@ -1705,6 +1813,9 @@ module leaderElection {
     all {
       alive.get(n),
       pending.get(n) == NoPending,
+      // Same absence gate as steal: no object, no rv-guarded PUT
+      // (identically true at MAX_VANISHES = 0).
+      not(leaseAbsent),
       hasSnap(n),
       snapHolderOf(n) == Held(n),
       casOk(n),
@@ -1755,6 +1866,8 @@ module leaderElection {
       staleExhaustedLose' = staleExhaustedLose,
       blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
       acquireInstV' =
         if (MAX_STEP_DOWNS == 0 or not(isEdge)) acquireInstV
         else acquireInstV.put(n, acquireInstV.get(n) + 1),
@@ -1778,6 +1891,109 @@ module leaderElection {
       any {
         claimOk(Held(n), claimTarget),
         claimFails(claimTarget),
+      },
+    }
+  }
+
+  /// The decide()->Create path (bughunt-13 F8): the GET observed NO
+  /// lease object and the act phase POSTs a fresh one with us as
+  /// holder (election.rs create() — lease_transitions: 0). An
+  /// immediate acquisition with no steal wait: the apiserver admits
+  /// exactly one creator (the rest 409 into standby), which the model
+  /// encodes structurally — the first createLease ends the absence,
+  /// disabling every later one until another vanish.
+  ///
+  /// gen'/genHW' run the same on_acquire + recovery-claim collapse as
+  /// steal/renewLease, with the FRESH object's transition count:
+  /// entry = fetch_max(0 + 1) = max(gen[n], 1) = gen[n], and seedFor
+  /// bumps past a foreign PG floor exactly as after a deleteLease —
+  /// the write-ahead claim is what keeps a foreign creator's
+  /// generation strictly above the vanished holder's during the
+  /// read-latency dual window (staleLeaderHasStaleGeneration in the
+  /// vanish regime), because the fresh object's count vouches for
+  /// nothing.
+  ///
+  /// acquiredAt records the pre-create revision point: the POST has no
+  /// CAS precondition, the fresh object lands at lease.rv + 1, so the
+  /// accounting keeps steal's "admitted at rv, object now at rv + 1"
+  /// shape and casRaceAfterPut's reading of acquiredAt stays uniform.
+  /// casRace itself cannot flip on a create — one-winner-by-
+  /// construction is the apiserver's exactly-one-creator admission.
+  // Mirrors: rio-lease/src/election.rs:create
+  action createLease(n: Node): bool = {
+    val entry = if (gen.get(n) > 1) gen.get(n) else 1
+    val seeded = seedFor(n, entry)
+    val fresh = { holder: Held(n), rv: lease.rv + 1, content: lease.content + 1, gen: 0 }
+    all {
+      leaseAbsent,
+      alive.get(n),
+      pending.get(n) == NoPending,
+      // State-space bounds as PRECONDITIONS (the steal convention).
+      lease.rv < MAX_RV,
+      seeded <= MAX_GEN,
+      lease' = fresh,
+      leaseAbsent' = false,
+      vanishes' = vanishes,
+      keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
+      leading' = leading.put(n, true),
+      gen' = gen.put(n, seeded),
+      casRace' = casRace,
+      acquiredAt' = acquiredAt.put(n, lease.rv),
+      fence' = fence.put(n, clocks.get(n)),
+      obs' = obs.put(n, NoObs),       // on_acquire clears observed
+      snap' = snap.put(n, NoSnap),
+      // A fresh acquisition starts a fresh leadership term (same
+      // cleanup as steal's).
+      delVictims' = delVictims.exclude(Set(n)),
+      clocks' = clocks,
+      alive' = alive,
+      deletes' = deletes,
+      restores' = restores,
+      stealRetained' = stealRetained,
+      stealBumpedForeignTie' = stealBumpedForeignTie,
+      renewBumpedAboveEntry' = renewBumpedAboveEntry,
+      pending' = pending, held' = trackHeld(held, n, true), exited' = exited,
+      suspends' = suspends, shutdowns' = shutdowns,
+      releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+      suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+      // A successful create is a completed round: the unconfirmed
+      // question is answered wholesale; the cursor takes the fresh
+      // object's key (gated for byte-identical pre-existing regimes).
+      unconfirmed' = unconfirmed.put(n, NoUnconf),
+      lastFetchedKey' =
+        if (MAX_DROPS == 0) lastFetchedKey
+        else lastFetchedKey.put(n, leaseKey(fresh)),
+      drops' = drops,
+      foreignBumps' = foreignBumps,
+      // Acquire edge: same bookkeeping as steal (deferral cleared,
+      // tenure instance bumped, pending step-down cleared) — gated so
+      // disabled planes stay frozen.
+      conflictDeferredV' =
+        if (not(HOLDER_EVIDENCE_LOSE)) conflictDeferredV
+        else conflictDeferredV.put(n, false),
+      deferralResolvedV' = deferralResolvedV,
+      staleExhaustedLose' = staleExhaustedLose,
+      blindConflictLose' = blindConflictLose,
+      holdClearedByConflict' = holdClearedByConflict,
+      acquireInstV' =
+        if (MAX_STEP_DOWNS == 0) acquireInstV
+        else acquireInstV.put(n, acquireInstV.get(n) + 1),
+      stepDownReqV' =
+        if (MAX_STEP_DOWNS == 0 or STEP_DOWN_COUNT_KEYED) stepDownReqV
+        else stepDownReqV.put(n, NoStepDown),
+      stepDownsV' = stepDownsV,
+      staleStepDownServed' = staleStepDownServed,
+      lastFetchedContent' =
+        if (MAX_FOREIGN_BUMPS == 0) lastFetchedContent
+        else lastFetchedContent.put(n, fresh.content),
+      evidenceFabricated' = evidenceFabricated,
+      evidenceConsumed' = evidenceConsumed,
+      blindHolderFor' = 0,  // the creator is the holder AND a believer post-state
+      // The same claim disjunction as steal's: the acquire edge offers
+      // the seeded generation to the ledger.
+      any {
+        claimOk(Held(n), seeded),
+        claimFails(seeded),
       },
     }
   }
@@ -1842,6 +2058,12 @@ module leaderElection {
     all {
       alive.get(n),
       pending.get(n) == NoPending,
+      // A 409 is the apiserver refusing an rv-guarded write against a
+      // PRESENT object whose rv moved; a write against a VANISHED
+      // object is NotFound and routes through the act-failed reads
+      // (the priced m056/m064 residual — see the createLease doc).
+      // Identically true at MAX_VANISHES = 0.
+      not(leaseAbsent),
       hasSnap(n),
       lease.rv != snapRvOf(n),
       // A DEFERRED 409 does NOT re-stamp the fence: the deferral runs
@@ -1914,6 +2136,8 @@ module leaderElection {
         else conflictDeferredV.put(n, defers),
       blindConflictLose' = (blindConflictLose or blindLose),
       holdClearedByConflict' = (holdClearedByConflict or (clearsHold and held.get(n))),
+      leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+      keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
       // A conflict either mints a FRESH deferral (nothing resolved it
       // yet) or consumes/clears the latch -- either way the node's
       // resolved-since ghost resets.
@@ -1989,6 +2213,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2040,6 +2266,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     staleStepDownServed' = staleStepDownServed,
     lastFetchedContent' = lastFetchedContent,
@@ -2108,6 +2336,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownsV' = stepDownsV,
     lastFetchedContent' = lastFetchedContent,
@@ -2167,6 +2397,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2224,6 +2456,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV.put(n, 0),
     stepDownReqV' = stepDownReqV.put(n, NoStepDown),
     stepDownsV' = stepDownsV,
@@ -2266,6 +2500,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2291,6 +2527,9 @@ module leaderElection {
     alive.get(n),
     leading.get(n),
     pending.get(n) == NoPending,
+    // Absence gate (bughunt-13 F8): a PUT cannot commit against a
+    // vanished object. Identically true at MAX_VANISHES = 0.
+    not(leaseAbsent),
     hasSnap(n),
     snapHolderOf(n) == Held(n),
     casOk(n),
@@ -2320,6 +2559,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2372,6 +2613,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2402,6 +2645,9 @@ module leaderElection {
     drops < MAX_DROPS,
     alive.get(n),
     pending.get(n) == NoPending,
+    // Absence gate (bughunt-13 F8): a PUT cannot commit against a
+    // vanished object. Identically true at MAX_VANISHES = 0.
+    not(leaseAbsent),
     hasSnap(n),
     snapHolderOf(n) == Held(n),
     casOk(n),
@@ -2418,6 +2664,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2467,6 +2715,11 @@ module leaderElection {
     drops < MAX_DROPS,
     alive.get(n),
     pending.get(n) == NoPending,
+    // Absence gate (bughunt-13 F8): the abandoned PUT's both
+    // resolutions are against a PRESENT object (the act-failed read
+    // against an ABSENT one is the priced m056/m064 residual).
+    // Identically true at MAX_VANISHES = 0.
+    not(leaseAbsent),
     hasSnap(n),
     snapHolderOf(n) == Held(n),
     casOk(n),
@@ -2483,6 +2736,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2587,6 +2842,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2658,6 +2915,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2692,6 +2951,9 @@ module leaderElection {
   action bumpRv = all {
     MAX_FOREIGN_BUMPS > 0,
     foreignBumps < MAX_FOREIGN_BUMPS,
+    // Absence gate (bughunt-13 F8): a metadata patch needs an object
+    // to patch. Identically true at MAX_VANISHES = 0.
+    not(leaseAbsent),
     lease.rv < MAX_RV,
     lease' = { ...lease, rv: lease.rv + 1 },
     foreignBumps' = foreignBumps + 1,
@@ -2700,6 +2962,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2794,6 +3058,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2843,6 +3109,12 @@ module leaderElection {
   /// collision); only a held lease (deleting an unheld lease changes
   /// nothing any invariant constrains and only inflates the state space);
   /// rv headroom for the recreation's fresh resourceVersion.
+  ///
+  /// The UNCOLLAPSED form — the deletion whose absence window stays
+  /// open until some replica's create lands — is vanishLease
+  /// (bughunt-13 F8); this collapsed action deliberately keeps its
+  /// original semantics so the deletion regime's verified state space
+  /// is untouched.
   // Environment: operator/infrastructure deleting the Lease object (kubectl delete lease) — budgeted MAX_DELETES; modeled as delete+immediate-empty-recreate (the collapsed 404→POST window)
   action deleteLease = all {
     deletes < MAX_DELETES,
@@ -2874,6 +3146,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2882,6 +3156,71 @@ module leaderElection {
     evidenceFabricated' = evidenceFabricated,
     evidenceConsumed' = evidenceConsumed,
     blindHolderFor' = 0,  // recreated empty: nobody is named holder
+  }
+
+  /// Operator fault, the UNCOLLAPSED form of deleteLease (bughunt-13
+  /// F8): `kubectl delete lease` destroys the Lease object and NOTHING
+  /// re-creates it inside the same step — the object stays absent
+  /// (leaseAbsent) until some replica's createLease lands. deleteLease
+  /// collapses delete + the next replica's 404→POST into one action,
+  /// which is exactly why the absence partition every replica reads in
+  /// between (the 404 — bug_143/bug_059's home, the implementation's
+  /// empirically bug-densest region) was unrepresentable before this
+  /// action existed.
+  ///
+  /// holder := NoHolder (no object names anybody); the rv does NOT
+  /// move (no object, no revision — the eventual createLease takes the
+  /// fresh rv, exactly as deleteLease's collapsed re-create does); the
+  /// transition count is dropped with the object (createLease starts
+  /// the new one at 0). The deposed holder joins delVictims — the same
+  /// environmental-deposition accounting as deleteLease, so
+  /// boundedDualLeadership's fourth disjunct prices its window the
+  /// same way (its own fence deadline; under the F8 believer-exit law
+  /// the window usually closes at its next read instead).
+  ///
+  /// Guards: the budget; only a held lease (vanishing an unheld or
+  /// already-absent lease changes nothing the wired invariants
+  /// constrain and only inflates the state space).
+  // Environment: operator/infrastructure deleting the Lease object with NO re-create in the same step (kubectl delete lease, the uncollapsed form) — budgeted MAX_VANISHES; the absence window stays open until some replica's createLease lands
+  action vanishLease = all {
+    vanishes < MAX_VANISHES,
+    lease.holder != NoHolder,
+    lease' = { holder: NoHolder, rv: lease.rv, content: lease.content, gen: 0 },
+    leaseAbsent' = true,
+    vanishes' = vanishes + 1,
+    delVictims' = match lease.holder {
+      | NoHolder => delVictims
+      | Held(h) => delVictims.union(Set(h))
+    },
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
+    clocks' = clocks, alive' = alive, leading' = leading, snap' = snap,
+    obs' = obs, fence' = fence, gen' = gen, genHW' = genHW,
+    genHWHolder' = genHWHolder, acquiredAt' = acquiredAt,
+    casRace' = casRace, deletes' = deletes,
+    claimFailures' = claimFailures, restores' = restores,
+    stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    pending' = pending, held' = held, exited' = exited,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+    unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
+    drops' = drops,
+    foreignBumps' = foreignBumps,
+    conflictDeferredV' = conflictDeferredV,
+    deferralResolvedV' = deferralResolvedV,
+    staleExhaustedLose' = staleExhaustedLose,
+    blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
+    blindHolderFor' = 0,  // no object names a holder: the blind condition is false
   }
 
   /// Operator/infrastructure fault: a PostgreSQL point-in-time restore
@@ -2923,6 +3262,8 @@ module leaderElection {
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2983,6 +3324,9 @@ module leaderElection {
     stepDownReqV' = NODES.mapBy(_ => NoStepDown),
     stepDownsV' = 0,
     staleStepDownServed' = false,
+    leaseAbsent' = false,
+    vanishes' = 0,
+    keptBelievingPastAbsentRead' = false,
   }
 
   // --- 8. step ----------------------------------------------------------
@@ -3033,6 +3377,13 @@ module leaderElection {
   action renewLeaseAny = {
     nondet n = NODES.oneOf()
     renewLease(n)
+  }
+  /// One node's 404→POST create lands (the absence partition's only
+  /// write path; bughunt-13 F8).
+  // Mirrors: rio-lease/src/election.rs:create
+  action createLeaseAny = {
+    nondet n = NODES.oneOf()
+    createLease(n)
   }
   /// One node's PUT 409s against a stale snapshot.
   // Mirrors: rio-lease/src/lib.rs:on_observed_not_leading
@@ -3154,6 +3505,13 @@ module leaderElection {
     loseObservedAny,
     requestStepDownAny,
     serveStepDownAny,
+    // Fault-gated (disabled at MAX_VANISHES = 0 -- same discipline;
+    // vanishLease is unmintable and createLease's leaseAbsent guard is
+    // unsatisfiable, so pre-existing regimes' transition relations and
+    // state spaces are unchanged; re-verified at the introducing
+    // commit, bughunt-13 F8).
+    vanishLease,
+    createLeaseAny,
   }
 }
 
@@ -3266,7 +3624,9 @@ module leaderElectionBase {
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
     STEP_DOWN_COUNT_KEYED = false,
-    CONFLICT_CLEARS_HOLD = false
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 0,
+    ABSENT_READ_KEEPS_BELIEF = false
   ).*
 
   // --- deterministic protocol runs ---------------------------------------
@@ -3471,7 +3831,9 @@ module leaderElectionDeletion {
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
     STEP_DOWN_COUNT_KEYED = false,
-    CONFLICT_CLEARS_HOLD = false
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 0,
+    ABSENT_READ_KEEPS_BELIEF = false
   ).*
 }
 
@@ -3568,7 +3930,9 @@ module leaderElectionAsymmetric {
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
     STEP_DOWN_COUNT_KEYED = false,
-    CONFLICT_CLEARS_HOLD = false
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 0,
+    ABSENT_READ_KEEPS_BELIEF = false
   ).*
 }
 
@@ -3664,7 +4028,9 @@ module leaderElectionPgFaults {
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
     STEP_DOWN_COUNT_KEYED = false,
-    CONFLICT_CLEARS_HOLD = false
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 0,
+    ABSENT_READ_KEEPS_BELIEF = false
   ).*
 }
 
@@ -3728,7 +4094,9 @@ module leaderElectionSuspend {
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
     STEP_DOWN_COUNT_KEYED = false,
-    CONFLICT_CLEARS_HOLD = false
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 0,
+    ABSENT_READ_KEEPS_BELIEF = false
   ).*
 
   /// The suspend-straddle scenario, end to end: n1 acquires, its next
@@ -3797,7 +4165,9 @@ module leaderElectionShutdown {
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
     STEP_DOWN_COUNT_KEYED = false,
-    CONFLICT_CLEARS_HOLD = false
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 0,
+    ABSENT_READ_KEEPS_BELIEF = false
   ).*
 
   /// Fence-then-SIGTERM releases: n1 acquires, goes blind past its
@@ -3902,7 +4272,9 @@ module leaderElectionDroppedWrite {
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
     STEP_DOWN_COUNT_KEYED = false,
-    CONFLICT_CLEARS_HOLD = false
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 0,
+    ABSENT_READ_KEEPS_BELIEF = false
   ).*
 
   /// The mid-band step: no complete renew rounds (the regime's
@@ -3997,7 +4369,9 @@ module leaderElectionForeignRv {
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
     STEP_DOWN_COUNT_KEYED = false,
-    CONFLICT_CLEARS_HOLD = false
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 0,
+    ABSENT_READ_KEEPS_BELIEF = false
   ).*
 
   /// The mid-band step plus the foreign mutator (same fault economy
@@ -4066,7 +4440,9 @@ module leaderElectionHolderEvidence {
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
     STEP_DOWN_COUNT_KEYED = false,
-    CONFLICT_CLEARS_HOLD = false
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 0,
+    ABSENT_READ_KEEPS_BELIEF = false
   ).*
 
   /// foreignRvStep plus the holder-evidenced resolution path.
@@ -4153,7 +4529,9 @@ module leaderElectionStepDown {
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 2,
     STEP_DOWN_COUNT_KEYED = false,
-    CONFLICT_CLEARS_HOLD = false
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 0,
+    ABSENT_READ_KEEPS_BELIEF = false
   ).*
 
   /// The base step plus the step-down pair.
@@ -4210,7 +4588,9 @@ module leaderElectionShutdownConflict {
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
     STEP_DOWN_COUNT_KEYED = false,
-    CONFLICT_CLEARS_HOLD = false
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 0,
+    ABSENT_READ_KEEPS_BELIEF = false
   ).*
 
   /// W13-O, end to end: the zombie-window SIGTERM. n1 acquires; a
@@ -4242,5 +4622,193 @@ module leaderElectionShutdownConflict {
         lease.holder == NoHolder,
         exited.get("n1"),
         gracefulHandover,
+      })
+}
+
+// =========================================================================
+// The lease-vanish (absence) regime (bughunt-13 F8): the Lease object
+// is deleted and NOT re-created in the same step — every read in
+// between observes 404. Before this regime no reachable model state
+// lacked a lease object (deleteLease collapses delete + the next
+// 404→POST into one action), so the implementation's empirically
+// bug-densest region — the absence partition where bug_143 (the
+// believer that kept believing past a 404 read) and bug_059 (the hold
+// posture under an in-doubt write) live, and the region the deferred
+// phase-2 deletion MBT is blocked on — was unrepresentable: the audit's
+// reverse-live_061 shape, environment partiality at birth.
+//
+// Constants: the ASYMMETRIC (healthy) separation, deliberately — the
+// point of the regime is that the fence/steal margin does NOT shield
+// the absence partition. A vanished lease grants a creator immediate
+// acquisition (createLease — no steal wait), so a dual window opens
+// the moment a creator lands while the deposed believer has not yet
+// read: that window is REAL production behavior (the FENCE_MARGIN
+// derivation in rio-lease/src/lib.rs prices it as "bounded by one read
+// latency rather than by the margin"), so neverDual is NOT wired here
+// as an invariant — the quint-leader-election-witness-vanish-dual-
+// belief check proves the window reachable (non-vacuity), and the
+// operative properties are the bounded ones, exactly as in the
+// deletion regime:
+//   - believerExitsAtAbsentRead — THE F8 LAW: a believing node's
+//     completed read that observes absence exits belief at that read
+//     (bug_143). The lease-f8-keep-believing twin (the pre-fix
+//     keep-believing posture) must falsify it.
+//   - boundedDualLeadership — the deposed believer is a delVictim
+//     (its own fence deadline bounds the window) and usually exits at
+//     its next read anyway (the law above).
+//   - staleLeaderHasStaleGeneration — the write-ahead claim keeps a
+//     foreign creator's generation strictly above the vanished
+//     holder's (the fresh object's transition count vouches for
+//     nothing — the same asymmetry the deletion regime proves, now
+//     across the open absence window).
+//   - atMostOneCASWinner / boundsOK / clockSkewBound / loopInterval —
+//     the standing core, unchanged.
+//
+// What the regime deliberately leaves out (priced, not silent): the
+// 404→POST create RACE (the loser's act-failed read — merged_bug_056's
+// consult-site shape) and the in-doubt transmitted-act axis against
+// the absent baseline (merged_bug_064) need an act-failure observable
+// the model does not carry; both are recorded as R19 provisos in the
+// introducing commit and routed to the round-14 deletion-MBT brief.
+// The hold split at the absent read (bug_059) is pinned
+// deterministically by the leaderElectionVanishHold runs below.
+// =========================================================================
+module leaderElectionVanish {
+  import leaderElection(
+    NODES = Set("n1", "n2"),
+    FENCE_AFTER = 2,
+    STEAL_AFTER = 5,
+    RENEW = 1,
+    MAX_SKEW = 1,
+    MAX_TIME = 8,
+    MAX_GEN = 4,
+    MAX_RV = 8,
+    MAX_DELETES = 0,
+    MAX_CLAIM_FAILURES = 0,
+    MAX_RESTORES = 0,
+    MAX_SUSPENDS = 0,
+    MAX_SHUTDOWNS = 0,
+    MAX_DROPS = 0,
+    MAX_FOREIGN_BUMPS = 0,
+    OBS_KEY_RV = false,
+    BLIND_HOLDER_BOUND = 0,
+    HOLDER_EVIDENCE_LOSE = true,
+    CONFLICT_IMMEDIATE_LOSE = false,
+    MAX_STEP_DOWNS = 0,
+    STEP_DOWN_COUNT_KEYED = false,
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 1,
+    ABSENT_READ_KEEPS_BELIEF = false
+  ).*
+}
+
+// =========================================================================
+// The vanish HOLD-SPLIT runs (bughunt-13 F8, the bug_059 axis): the
+// deterministic pins for what the believing absent read does to the
+// graceful-release hold. Two runs:
+//   - vanishBelieverExitsRun — the W13-P trace end to end: acquire,
+//     vanish, the believing read observes absence, belief exits AT the
+//     read and the hold CLEARS (empty ledger ⇒ provably no lease
+//     object of ours to release — production AbsenceLose), then a peer
+//     createLease acquires immediately with a strictly greater
+//     generation (the read-evidence-bounded handover).
+//   - vanishArmedLedgerHoldKeptRun — the bug_059 variant: a dropped
+//     renew arms the cancelled-write ledger first; the believing
+//     absent read still exits belief but the hold takes the SELF-FENCE
+//     posture (kept — production AbsenceLoseHoldKept: a transmitted
+//     write of ours may still commit a lease naming us after the 404,
+//     and a fence-then-SIGTERM in that window must still run the
+//     holder-guarded release).
+//
+// Constants: the vanish regime's, plus MAX_SHUTDOWNS = 1 so held
+// tracking is live (trackHeld is frozen at 0 — no shutdown fires in
+// either run) and MAX_DROPS = 1 so the armed variant can mint the
+// in-doubt ledger entry via renewSendDropped. Wired as a runs check
+// only (quint-leader-election-runs-vanish-hold) — the exhaustive
+// coverage of the believer-exit law lives in leaderElectionVanish;
+// these pin the hold-split end deterministically.
+// =========================================================================
+module leaderElectionVanishHold {
+  import leaderElection(
+    NODES = Set("n1", "n2"),
+    FENCE_AFTER = 2,
+    STEAL_AFTER = 5,
+    RENEW = 1,
+    MAX_SKEW = 1,
+    MAX_TIME = 8,
+    MAX_GEN = 4,
+    MAX_RV = 8,
+    MAX_DELETES = 0,
+    MAX_CLAIM_FAILURES = 0,
+    MAX_RESTORES = 0,
+    MAX_SUSPENDS = 0,
+    MAX_SHUTDOWNS = 1,
+    MAX_DROPS = 1,
+    MAX_FOREIGN_BUMPS = 0,
+    OBS_KEY_RV = false,
+    BLIND_HOLDER_BOUND = 8,
+    HOLDER_EVIDENCE_LOSE = true,
+    CONFLICT_IMMEDIATE_LOSE = false,
+    MAX_STEP_DOWNS = 0,
+    STEP_DOWN_COUNT_KEYED = false,
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 1,
+    ABSENT_READ_KEEPS_BELIEF = false
+  ).*
+
+  /// W13-P, end to end: acquire → vanish → the believing read observes
+  /// absence → belief exits AT the read, the hold clears (empty
+  /// ledger) → a peer creates immediately and the generation fence
+  /// discriminates inside the read-latency window.
+  run vanishBelieverExitsRun =
+    init
+      .then(apiGet("n1"))
+      .then(steal("n1"))
+      .then(vanishLease)
+      .expect(all {
+        leaseAbsent,
+        leading.get("n1"),
+        held.get("n1"),
+        delVictims.contains("n1"),
+      })
+      .then(apiGet("n1"))
+      .expect(all {
+        not(leading.get("n1")),
+        not(held.get("n1")),
+        leaseAbsent,
+        not(keptBelievingPastAbsentRead),
+      })
+      .then(createLease("n2"))
+      .expect(all {
+        not(leaseAbsent),
+        lease.holder == Held("n2"),
+        leading.get("n2"),
+        gen.get("n2") > gen.get("n1"),
+      })
+
+  /// The bug_059 variant: the cancelled-write ledger is ARMED when the
+  /// believing absent read lands — belief still exits at the read, the
+  /// HOLD takes the self-fence posture (kept), and the ledger survives
+  /// the read (the absence partition never consumes it; the
+  /// transmitted write resolves via the evidence leg next round).
+  run vanishArmedLedgerHoldKeptRun =
+    init
+      .then(apiGet("n1"))
+      .then(steal("n1"))
+      .then(apiGet("n1"))
+      .then(renewSendDropped("n1"))
+      .expect(all {
+        unconfirmed.get("n1") != NoUnconf,
+        leading.get("n1"),
+        held.get("n1"),
+      })
+      .then(vanishLease)
+      .then(apiGet("n1"))
+      .expect(all {
+        not(leading.get("n1")),
+        held.get("n1"),
+        unconfirmed.get("n1") != NoUnconf,
+        leaseAbsent,
+        not(keptBelievingPastAbsentRead),
       })
 }

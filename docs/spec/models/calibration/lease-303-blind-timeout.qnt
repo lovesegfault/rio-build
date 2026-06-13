@@ -63,7 +63,9 @@ module leaseCalib303BlindTimeout {
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
     STEP_DOWN_COUNT_KEYED = false,
-    CONFLICT_CLEARS_HOLD = false
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 0,
+    ABSENT_READ_KEEPS_BELIEF = false
   ).* from "../leaderElection"
 
   /// PRE-FIX tick: no evidence-forcing cap (the loop owes no fetch it
@@ -94,6 +96,8 @@ module leaseCalib303BlindTimeout {
       staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -146,6 +150,8 @@ module leaseCalib303BlindTimeout {
       staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     holdClearedByConflict' = holdClearedByConflict,
+    leaseAbsent' = leaseAbsent, vanishes' = vanishes,
+    keptBelievingPastAbsentRead' = keptBelievingPastAbsentRead,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,

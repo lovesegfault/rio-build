@@ -60,17 +60,25 @@
 //!    the projection (e.g. reordering ticks within the skew constraint)
 //!    escape, which is acceptable because tick touches none of
 //!    lease/leading/gen.
-//! 2. **The model's initial state is "a Lease exists with no holder at
-//!    rv 0", not "no Lease object".** The driver's `init` seeds the mock
-//!    store accordingly. The implementation's 404→POST create path is
-//!    therefore *outside the modeled state space* (the model's first
-//!    acquisition is a steal of the born-empty lease, which bumps the
-//!    transition count to 1 and derives generation 2; a real first
-//!    deployment creates the lease at transition count 0 and derives
-//!    generation 1). The create path stays covered by the unit tests
-//!    (`create_on_404`, `interleaved_create_race_admits_one_winner`);
-//!    closing the gap requires the model to grow a distinct "no lease"
-//!    state, which changes the verified state space and is deferred.
+//! 2. **The BASE regime's initial state is "a Lease exists with no
+//!    holder at rv 0", not "no Lease object".** The driver's `init`
+//!    seeds the mock store accordingly, and in the base regime this
+//!    driver replays (`MAX_VANISHES = 0`) the 404→POST create path
+//!    stays outside the replayed state space (the first acquisition is
+//!    a steal of the born-empty lease, which bumps the transition
+//!    count to 1 and derives generation 2; a real first deployment
+//!    creates at transition count 0 and derives generation 1). The
+//!    historical blocker here — "the model has no absent state at all"
+//!    — is CLOSED as of bughunt-13 F8: `leaderElection.qnt` now
+//!    carries the absence partition (`leaseAbsent`, `vanishLease`,
+//!    `createLease`; the `leaderElectionVanish` regime checks the
+//!    believer-exit law and the `leaderElectionVanishHold` runs pin
+//!    the bug_059 hold split). The create path stays covered by the
+//!    unit tests (`create_on_404`,
+//!    `interleaved_create_race_admits_one_winner`); DRIVING the vanish
+//!    regime from this harness (the deletion MBT — mock-store arms for
+//!    `vanishLease`/`createLease` plus an acceptance trace) is the
+//!    recorded round-14 candidate, per the audit's phase-2 framing.
 //! 3. **The model checks the steal threshold at PUT time; the
 //!    implementation checks it at GET time.** Production's GET and PUT
 //!    are microseconds apart so the distinction is invisible there, but
