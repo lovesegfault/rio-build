@@ -2014,13 +2014,28 @@ mod tests {
     /// (riders (b)): the strawman below drives an unconsulting loop
     /// through the same walk (enrollment face); the walk derives
     /// membership from the transport-call grammar, not a name list
-    /// (jurisdiction face is the file = the trait's whole scope);
-    /// aliased transport bindings still contain the dotted call text
-    /// (the receiver name is not anchored — overscan posture).
+    /// (jurisdiction face: `PullTransport` is `pub(super)`, so the
+    /// scanned universe is every `runtime/` module file — a sibling
+    /// could host a transport loop and the trait's visibility would
+    /// admit it); aliased transport bindings still contain the dotted
+    /// call text (the receiver name is not anchored — overscan
+    /// posture).
     #[test]
     fn transport_retry_loop_census_consults_the_fatal_authority() {
-        const SELF_SRC: &str = include_str!("pull.rs");
-        let members = derive_transport_loops(SELF_SRC);
+        const MODULE_SRC: &[(&str, &str)] = &[
+            ("pull.rs", include_str!("pull.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            ("idle.rs", include_str!("idle.rs")),
+            ("result.rs", include_str!("result.rs")),
+            ("setup.rs", include_str!("setup.rs")),
+            ("slot.rs", include_str!("slot.rs")),
+        ];
+        let src: String = MODULE_SRC
+            .iter()
+            .map(|(_, s)| *s)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let members = derive_transport_loops(&src);
         assert!(
             members.len() >= 3,
             "VACUOUS WALK: expected at least the three known loops, \
