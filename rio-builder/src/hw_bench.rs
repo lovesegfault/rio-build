@@ -417,10 +417,15 @@ mod tests {
     ///
     /// `threads-required = num-cpus` in `.config/nextest.toml` so this
     /// gets the machine to itself — the band was ±5% but flaked under
-    /// parallel nextest load (contended L2 + DVFS); ±20% is the
-    /// catches-elision-and-miscalibration band, not the production
-    /// reproducibility band (the real bench runs on an idle pod at
-    /// init, before any build).
+    /// parallel nextest load (contended L2 + DVFS); ±20% held until a
+    /// shared-builder load-1300 saturation window measured rel
+    /// 0.230/0.251 (3/3 solo-green at load-40 on the same tip). ±35%
+    /// is priced for that observed tail. The band is a CI-tier sanity
+    /// check (catches "timing is non-deterministic-instruction-count",
+    /// e.g. branch-unpredictable rewrite), NOT the production
+    /// reproducibility band — the real bench runs on an idle pod at
+    /// init before any build, and the structural elision /
+    /// miscalibration witnesses are the `(0.1, 100.0)` bounds above.
     // r[verify sched.sla.hw-bench-append-only]
     #[test]
     fn alu_is_reproducible_within_band() {
@@ -436,7 +441,7 @@ mod tests {
         );
         let rel = (f1 - f2).abs() / f1.max(f2);
         assert!(
-            rel < 0.20,
+            rel < 0.35,
             "factor not reproducible: f1={f1} f2={f2} (rel diff {rel:.3})"
         );
     }

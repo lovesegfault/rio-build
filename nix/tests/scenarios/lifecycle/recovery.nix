@@ -178,9 +178,15 @@ scope: with scope; ''
       # but the dispatch leg is builder-load-sensitive — observed
       # 39.15s under the round-9 boundary gate (18 VM tests in
       # parallel on the shared builder; solo re-run green at the same
-      # tip). 120s = ~3× the observed tail / ~6× nominal — the
-      # ci-failure-patterns tail-budget discipline (budget for tail,
-      # not typical; builder variance 5×).
+      # tip). 120s held through round-12 then crossed once at round-13
+      # (the 4th recorded occurrence: "interrupted by the user" at
+      # the 120s budget under composed-tree contention; lease moved in
+      # 1.3s and recovery_total{outcome=success}=1 observed in 6.65s,
+      # so the recovery itself completed — only the post-recovery
+      # client dispatch leg exceeded the budget). 240s = ~6× the
+      # 39.15s observed tail / ~11× nominal — the ci-failure-patterns
+      # tail-budget discipline (budget for tail, not typical; builder
+      # variance 5×).
       #
       # Structural (convergence wait), not retry-on-error: same
       # pattern as sched_metric_wait above. The probe-interval gap is
@@ -190,7 +196,7 @@ scope: with scope; ''
           "nix-build --no-out-link --store 'ssh-ng://k3s-server' "
           "--arg busybox '(builtins.storePath ${common.busybox})' "
           "${recoveryDrv}",
-          timeout=120,
+          timeout=240,
       ).strip()
       assert out_recovery.startswith("/nix/store/"), (
           f"post-recovery build should succeed: {out_recovery!r}"
