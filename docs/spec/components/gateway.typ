@@ -2325,6 +2325,23 @@ cell's `&mut` borrow across every consume's awaits, serializing the
 three consumes against the borrow instead of localizing each
 obligation with its consume.
 
+The round-13 repair of the discharge ESCAPE (merged_bug_025): the
+partial-heal arm reduced the obligation by bare field mutation
+(`gap_from` advanced) BEFORE the caller's serve send, while the
+sibling full-heal arm stayed armed across that exact send --- an abort
+parked there destroyed the healing prefix with Drop disclosing only
+the shrunk hole, the emitted marker actively misstating the missing
+span. Every obligation REDUCTION now routes through a typed discharge:
+the partial arm returns a deferred floor token (minted only by the
+partial arm, consumed only by the post-send discharge, the sole writer
+of a recorded hole's `gap_from`), so an abort parked in the send drops
+the token undischarged and the full hole discloses. The abort-window
+battery population is DERIVED from the heal-verdict variant alphabet
+--- a wildcard-free exhaustive match naming one abort-parked-in-send
+member per variant, pinned to the real test fns --- never
+hand-enumerated: the wave-12 battery's three hand-listed windows
+missed exactly the fourth variant this close repairs.
+
 - The gateway does not own durable state. All persistent data lives in the
   scheduler (PostgreSQL) and the store.
 - Consider using a non-standard SSH port (e.g., 2222) to avoid conflicts with

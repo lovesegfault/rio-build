@@ -487,13 +487,33 @@ mod gap {
         Divergent,
     }
 
+    /// The deferred partial-heal floor (merged_bug_025): proof
+    /// material that a serve send covering the hole prefix
+    /// `[gap_from, floor)` is in flight. Minted ONLY by
+    /// [`PendingGapCell::on_serve`]'s partial arm; consumed ONLY by
+    /// [`PendingGapCell::discharge_served_prefix`], which the caller
+    /// invokes AFTER the serve send resolves Ok. An abort parked in
+    /// the send drops this token undischarged and the cell still
+    /// records the FULL hole — Drop (or the terminus flush) discloses
+    /// `[old gap_from, gap_until)`, never the shrunk span. Field
+    /// private to `mod gap`: the reduction has no other writer.
+    #[must_use = "a partial heal reduces the hole only at the post-send discharge"]
+    pub(super) struct ServedPrefix {
+        floor: u64,
+    }
+
     /// How a `Serve` interacted with a pending hole.
     pub(super) enum ServeHeal {
         /// No pending, or the serve did not reach into the hole.
         Untouched,
-        /// Partial heal: the hole shrank (`gap_from` advanced); the
-        /// withheld lines stay recorded for the eventual flush.
-        Shrunk,
+        /// Partial heal: the serve chunk now in flight covers the
+        /// hole prefix. The payload is the DEFERRED floor — the hole
+        /// shrinks only at the post-send
+        /// [`PendingGapCell::discharge_served_prefix`], exactly as
+        /// the full-heal arm defuses only at post-send
+        /// [`ArmedGap::note_delivered`]; the withheld lines stay
+        /// recorded for the eventual flush either way.
+        Shrunk(ServedPrefix),
         /// The hole fully healed — the serve chunk now in flight
         /// covers it. The payload is the ARMED remainder: the hole
         /// stays marker-armed (if the serve send aborts, the client
@@ -615,7 +635,13 @@ mod gap {
         /// A `Serve` advanced the floor to `next_line`: shrink, keep,
         /// or heal the pending hole. Healing returns the ARMED
         /// remainder (see [`ServeHeal::Healed`]) — never a bare chunk
-        /// a parked send could silently destroy.
+        /// a parked send could silently destroy. A PARTIAL heal
+        /// returns the DEFERRED floor (see [`ServedPrefix`]) and
+        /// mutates NOTHING here (merged_bug_025): the hole shrinks
+        /// only at the post-send discharge, exactly as the full-heal
+        /// arm defuses only at post-send `note_delivered` — an abort
+        /// parked in the serve send finds the recorded state still
+        /// covering the FULL hole, healing prefix included.
         pub(super) fn on_serve(&mut self, next_line: u64) -> ServeHeal {
             let Some(p) = self.state.as_mut() else {
                 return ServeHeal::Untouched;
@@ -627,15 +653,34 @@ mod gap {
                 // Partial heal: the served prefix [gap_from,
                 // next_line) cannot duplicate the withheld lines
                 // (they start at gap_until); only the residual hole
-                // remains. (A serve send aborted mid-flight here is
-                // the priced in-flight residual — the recorded state
-                // keeps covering the shrunk hole and the lines.)
-                p.gap_from = next_line;
-                return ServeHeal::Shrunk;
+                // will remain ONCE THE SERVE SEND COMPLETES. The
+                // reduction itself is deferred through the typed
+                // token — a bare `p.gap_from = next_line` here was
+                // the R32 discharge escape: it destroyed the healing
+                // prefix's disclosure under an abort parked in the
+                // send, and the Drop marker misstated the span.
+                return ServeHeal::Shrunk(ServedPrefix { floor: next_line });
             }
             // Full heal: the serve covers [.., next_line) ⊇ the hole.
             let p = self.state.take().expect("checked above");
             ServeHeal::Healed(self.arm(p))
+        }
+
+        /// The partial-heal obligation reduction (merged_bug_025): the
+        /// ONLY writer of a recorded hole's `gap_from`. Consumes the
+        /// [`ServedPrefix`] token minted by [`Self::on_serve`]'s
+        /// partial arm — the caller invokes this AFTER the serve send
+        /// resolved Ok, so the hole shrinks exactly when the covering
+        /// lines were handed to the channel (the same priced in-flight
+        /// sliver as every completed send). Total over cell states: a
+        /// displaced or already-healed cell ignores a stale floor
+        /// (`max`), and a floor past `gap_until` cannot be minted.
+        pub(super) fn discharge_served_prefix(&mut self, served: ServedPrefix) {
+            if let Some(p) = self.state.as_mut()
+                && served.floor < p.gap_until
+            {
+                p.gap_from = p.gap_from.max(served.floor);
+            }
         }
     }
 
@@ -1280,13 +1325,17 @@ async fn drive_stream(
                             // no hole remains. The pre-fix void fired
                             // on any next_line > gap_from, destroying
                             // withheld lines on partial heals.
-                            // The heal verdict is ARMED (bug_122/R32):
-                            // on a full heal the hole and the withheld
+                            // The heal verdict is ARMED or DEFERRED
+                            // (bug_122/R32; merged_bug_025): on a full
+                            // heal the hole and the withheld
                             // continuation ride a disclosure-on-drop
-                            // guard ACROSS the serve send below — an
-                            // abort parked there finds them still
-                            // armed and Drop discloses; the completed
-                            // send defuses exactly what it delivered.
+                            // guard ACROSS the serve send below; on a
+                            // partial heal the hole reduction rides
+                            // the typed deferred floor. An abort
+                            // parked in the send finds the obligation
+                            // intact either way and Drop discloses the
+                            // FULL recorded state; the completed send
+                            // discharges exactly what it delivered.
                             let heal = pending_gap.on_serve(next_line);
                             let tagged =
                                 slice_chunk(chunk, derivation_path, yield_from, yield_until);
@@ -1302,10 +1351,16 @@ async fn drive_stream(
                             if out_tx.send(tagged).await.is_err() {
                                 return DriveEnd::OutputClosed;
                             }
-                            if let ServeHeal::Healed(mut armed) = heal {
-                                armed.note_delivered(next_line);
-                                if !armed.send_lines(last_relayed).await {
-                                    return DriveEnd::OutputClosed;
+                            match heal {
+                                ServeHeal::Untouched => {}
+                                ServeHeal::Shrunk(served) => {
+                                    pending_gap.discharge_served_prefix(served);
+                                }
+                                ServeHeal::Healed(mut armed) => {
+                                    armed.note_delivered(next_line);
+                                    if !armed.send_lines(last_relayed).await {
+                                        return DriveEnd::OutputClosed;
+                                    }
                                 }
                             }
                             break;
@@ -3460,6 +3515,216 @@ mod tests {
             got.iter().any(|l| l == "line-9"),
             "the heal continuation must survive an abort at the serve send \
              (got {got:?})"
+        );
+    }
+
+    /// W13-Z window 4 — the PARTIAL-heal consume (merged_bug_025, the
+    /// R32 discharge escape repaired): `on_serve`'s partial arm used
+    /// to discharge the hole-prefix obligation by bare field mutation
+    /// (`p.gap_from = next_line`) BEFORE the caller's serve send,
+    /// while the sibling full-heal arm stays armed across that exact
+    /// send. An abort parked in the send destroyed the healing prefix
+    /// `[5,6)` with Drop disclosing only the SHRUNK hole — lines
+    /// inside a recorded hole silently lost AND the emitted marker
+    /// actively misstating the missing span.
+    ///
+    /// Pre-fix red (2026-06-12, strawman: the pre-send
+    /// `p.gap_from = next_line` mutation restored in the partial
+    /// arm): `the partial-heal abort must disclose the FULL recorded
+    /// hole [5,8) — got marker "*** rio: lines 6-7 missing (durable
+    /// log gap) ***" (the shrunk misstatement; the healing prefix
+    /// [5,6) was never delivered and is now undisclosed)`.
+    // r[verify gw.tail.disclosure-linear]
+    #[tokio::test]
+    async fn partial_heal_abort_at_serve_send_discloses_full_hole() {
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let mut cell =
+            super::PendingGapCell::new(out_tx.clone(), super::RelayDisposition::disclose_at_drop());
+        cell.record_first(taken_window_pending(&["line-8", "line-9"]));
+        // A serve advances the floor to 6: INTO the hole [5,8) —
+        // a partial heal of [5,6).
+        let heal = cell.on_serve(6);
+        match heal {
+            super::ServeHeal::Shrunk(served) => {
+                // The simulated abort: the caller's local (the
+                // deferred floor) is destroyed at the parked serve
+                // send — the discharge never runs.
+                drop(served);
+            }
+            _ => panic!("a floor at 6 partially heals the [5,8) hole"),
+        }
+        drop(cell);
+        drop(out_tx);
+        let mut markers = Vec::new();
+        let mut lines = Vec::new();
+        while let Some(c) = out_rx.recv().await {
+            for l in &c.lines {
+                let s = String::from_utf8(l.clone()).expect("test lines are UTF-8");
+                if s.contains("missing (durable log gap)") {
+                    markers.push((c.first_line_number, s.clone()));
+                } else {
+                    lines.push(s);
+                }
+            }
+        }
+        assert_eq!(
+            markers.len(),
+            1,
+            "exactly one disclosure marker (got {markers:?})"
+        );
+        let (marker_from, marker_text) = &markers[0];
+        assert_eq!(
+            (*marker_from, marker_text.as_str()),
+            (5, "*** rio: lines 5-7 missing (durable log gap) ***"),
+            "the partial-heal abort must disclose the FULL recorded hole [5,8) \
+             — the serve send never completed, so the healing prefix [5,6) was \
+             never delivered and a shrunk marker would misstate the span"
+        );
+        assert!(
+            lines.iter().any(|l| l == "line-8") && lines.iter().any(|l| l == "line-9"),
+            "the withheld lines still disclose (got {lines:?})"
+        );
+    }
+
+    /// W13-Z2 — the happy partial-heal path is byte-stable: a serve
+    /// send that COMPLETES discharges the deferred floor, the hole
+    /// shrinks to exactly the residual `[6,8)`, and the eventual
+    /// flush discloses the shrunk marker plus the withheld lines —
+    /// identical bytes to the pre-fix happy path.
+    // r[verify gw.tail.disclosure-linear]
+    #[tokio::test]
+    async fn partial_heal_completed_send_shrinks_at_discharge() {
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let mut cell =
+            super::PendingGapCell::new(out_tx.clone(), super::RelayDisposition::disclose_at_drop());
+        cell.record_first(taken_window_pending(&["line-8", "line-9"]));
+        match cell.on_serve(6) {
+            super::ServeHeal::Shrunk(served) => {
+                // The serve send completed: the post-send discharge
+                // is the one writer of the reduction.
+                cell.discharge_served_prefix(served);
+            }
+            _ => panic!("a floor at 6 partially heals the [5,8) hole"),
+        }
+        let mut last_relayed: Option<u64> = None;
+        let mut floor: Option<u64> = None;
+        assert!(
+            super::flush_pending_gap(&mut cell, &mut last_relayed, &mut floor).await,
+            "roomy channel: the flush completes"
+        );
+        drop(cell);
+        drop(out_tx);
+        let mut got = Vec::new();
+        while let Some(c) = out_rx.recv().await {
+            for l in &c.lines {
+                got.push((
+                    c.first_line_number,
+                    String::from_utf8(l.clone()).expect("test lines are UTF-8"),
+                ));
+            }
+        }
+        assert!(
+            got.iter()
+                .any(|(from, s)| *from == 6
+                    && s == "*** rio: lines 6-7 missing (durable log gap) ***"),
+            "the completed partial heal flushes the RESIDUAL hole [6,8) \
+             (got {got:?})"
+        );
+        assert!(
+            got.iter().any(|(_, s)| s == "line-8"),
+            "the withheld lines relay (got {got:?})"
+        );
+    }
+
+    /// W13-Z battery, the Untouched window: a serve that never
+    /// reaches into the hole arms nothing and defers nothing — an
+    /// abort parked at its send leaves the recorded state intact and
+    /// Drop discloses the full hole plus lines, exactly as if the
+    /// serve had never happened.
+    // r[verify gw.tail.disclosure-linear]
+    #[tokio::test]
+    async fn untouched_serve_abort_changes_nothing() {
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let mut cell =
+            super::PendingGapCell::new(out_tx.clone(), super::RelayDisposition::disclose_at_drop());
+        cell.record_first(taken_window_pending(&["line-8"]));
+        // The floor stops AT the hole's start: no heal of any kind.
+        match cell.on_serve(5) {
+            super::ServeHeal::Untouched => {}
+            _ => panic!("a floor at 5 does not reach into the [5,8) hole"),
+        }
+        drop(cell);
+        drop(out_tx);
+        let mut got = Vec::new();
+        while let Some(c) = out_rx.recv().await {
+            for l in &c.lines {
+                got.push(String::from_utf8(l.clone()).expect("test lines are UTF-8"));
+            }
+        }
+        assert!(
+            got.iter()
+                .any(|s| s == "*** rio: lines 5-7 missing (durable log gap) ***"),
+            "the untouched window discloses the full hole (got {got:?})"
+        );
+        assert!(
+            got.iter().any(|s| s == "line-8"),
+            "the withheld lines disclose (got {got:?})"
+        );
+    }
+
+    /// [GEN-SET] The abort-window battery census (merged_bug_025,
+    /// R31′(ii)): the battery population derives from the `ServeHeal`
+    /// variant ALPHABET, never a hand list — this match is exhaustive
+    /// with NO wildcard arm, so adding a variant refuses to compile
+    /// until its abort-parked-in-send battery member is named here,
+    /// and the named members are pinned as real test fns by the
+    /// function references below (a renamed or deleted test breaks
+    /// the build, not just the census). The wave-12 battery was
+    /// hand-enumerated to three windows and missed the fourth variant
+    /// (`Shrunk`) — exactly the gap this derivation closes.
+    #[test]
+    fn serve_heal_abort_battery_is_variant_total() {
+        fn battery_member(h: &super::ServeHeal) -> &'static str {
+            match h {
+                super::ServeHeal::Untouched => "untouched_serve_abort_changes_nothing",
+                super::ServeHeal::Shrunk(_) => {
+                    "partial_heal_abort_at_serve_send_discloses_full_hole"
+                }
+                super::ServeHeal::Healed(_) => {
+                    "heal_abort_at_serve_send_still_discloses_continuation"
+                }
+            }
+        }
+        // The named members are REAL tests in this module: referencing
+        // them makes the census structurally un-rottable.
+        let _members: [fn(); 3] = [
+            untouched_serve_abort_changes_nothing,
+            partial_heal_abort_at_serve_send_discloses_full_hole,
+            heal_abort_at_serve_send_still_discloses_continuation,
+        ];
+        // Construct every variant through the PRODUCTION constructor
+        // (`on_serve` on a recorded [5,8) hole — R13 provenance), and
+        // pin each to its battery member by name.
+        let (out_tx, _out_rx) = mpsc::channel(4);
+        let mk = || {
+            let mut cell = super::PendingGapCell::new(
+                out_tx.clone(),
+                super::RelayDisposition::disclose_at_drop(),
+            );
+            cell.record_first(taken_window_pending(&["line-8"]));
+            cell
+        };
+        assert_eq!(
+            battery_member(&mk().on_serve(5)),
+            "untouched_serve_abort_changes_nothing"
+        );
+        assert_eq!(
+            battery_member(&mk().on_serve(6)),
+            "partial_heal_abort_at_serve_send_discloses_full_hole"
+        );
+        assert_eq!(
+            battery_member(&mk().on_serve(9)),
+            "heal_abort_at_serve_send_still_discloses_continuation"
         );
     }
 
