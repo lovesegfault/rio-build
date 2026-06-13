@@ -25,7 +25,6 @@ module wedgeCalib024GhostAdmission {
     ENABLE_EVICTION = true,
     TRACK_EPISODE_GHOSTS = false,
     ENABLE_TRAJECTORY = false,
-    DWELL_TICKS = 1,
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = true,
     ENABLE_ADMISSION = false,

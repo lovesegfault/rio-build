@@ -35,7 +35,7 @@ module wedgeCalib009SplitPopulation {
     ENABLE_FULL_EPILOGUE = true,
     ENABLE_EVICTION = true,
   ENABLE_EPISODE_LATCH = false,
-    TRACK_EPISODE_GHOSTS = false,    ENABLE_TRAJECTORY = false,    DWELL_TICKS = 1,    BREADTH_MIN = 2,
+    TRACK_EPISODE_GHOSTS = false,    ENABLE_TRAJECTORY = false,    BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
     ENABLE_SUPPRESSED_RETENTION = true,

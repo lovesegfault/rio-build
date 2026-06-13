@@ -26,7 +26,6 @@ module wedgeCalib016SuppressedDrain {
     ENABLE_EVICTION = true,
     TRACK_EPISODE_GHOSTS = false,
     ENABLE_TRAJECTORY = true,
-    DWELL_TICKS = 1,
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,

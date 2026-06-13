@@ -101,20 +101,29 @@ module wedgeCluster {
   const TRACK_EPISODE_GHOSTS: bool
   // merged_bug_034 (Q2 SIGNED, round-4): the trajectory axis. Off ---
   // the retired instantaneous guard (per-tick wedged/population
-  // ratio, no dwell; per-node verdicts fire while a multi-node
-  // episode is still forming). On --- the systemic denominator is the
+  // ratio; per-node verdicts fire while a multi-node episode is
+  // still forming). On --- the systemic denominator is the
   // REGISTERED fleet (NODES is the model's registered set), the
   // verdict additionally requires breadth (distinct evidence-bearing
-  // nodes inside the window) >= BREADTH_MIN and a dwell of
-  // DWELL_TICKS ticks of continuously-tripped raw condition, and
-  // per-node verdicts are WITHHELD while an episode is developing
-  // (breadth >= BREADTH_MIN) --- staggered shared-cause onset routes
-  // to the systemic arm instead of serial per-node Dead reaps.
-  // Off-axis the one trajectory state var (pendingSince) freezes at
-  // init (zero state cost; TRACK_EPISODE_GHOSTS parameter-ladder
-  // precedent).
+  // nodes inside the window) >= BREADTH_MIN (implied at these consts:
+  // wedged nodes bear evidence, so breadth >= wedged >= 2 =
+  // BREADTH_MIN --- recorded, not load-bearing), and per-node
+  // verdicts are WITHHELD while an episode is developing (breadth >=
+  // BREADTH_MIN) --- staggered shared-cause onset routes to the
+  // systemic arm instead of serial per-node Dead reaps.
+  // TB-6 (bughunt-13 referee, SURVIVED, a-1): the round-4 model
+  // additionally demanded a PRE-VERDICT ARMING DWELL --- the raw
+  // condition holding DWELL_TICKS consecutive ticks before Systemic
+  // fired --- which production never exhibits: finalize's ratio arm
+  // fires the tick it trips (wedge.rs `systemic = affected >= 2 &&
+  // ratio > WEDGE_SYSTEMIC_FRACTION`; the only production dwell is
+  // the POST-watermark suppression dwell, WEDGE_VERDICT_DWELL_SECS,
+  // modeled as VERDICT_DWELL_TICKS below). The phantom dwell made the
+  // model's first tripped tick a developing/retain image where
+  // production drains+latches a Systemic --- verdict timing AND
+  // effects diverged. The arming dwell (DWELL_TICKS, pendingSince) is
+  // DELETED; the trajectory verdict is immediate, like the code.
   const ENABLE_TRAJECTORY: bool
-  const DWELL_TICKS: int
   const BREADTH_MIN: int
   // merged_bug_024 (round-5): the ghost-admission axis. The two
   // consts follow the TRACK_EPISODE_GHOSTS parameter ladder:
@@ -206,7 +215,6 @@ module wedgeCluster {
   var lastOf: int
   var lastWedged: Set[str]
   var lastDelta: int              // counter increments this update
-  var lastConsumedEvictions: Set[str]
   // Anchors that survived a suppressed episode: (node, drv, anchor).
   // Written by the same update that suppresses; drained anchors leave.
   var suppressedAnchors: Set[(str, str, int)]
@@ -220,13 +228,9 @@ module wedgeCluster {
   // reachability evidence
   var sawSystemic: bool
   var sawPerNode: bool
-  var sawReWedge: bool            // a node marked, unmarked, marked again
   // m288: suppression-surviving anchors actually observed (the
   // tautology guard for noPerNodeFromSuppressedEvidence).
   var sawSuppressed: bool
-  // merged_bug_034 trajectory state (frozen -1 off-axis): the tick
-  // the CURRENT continuous raw-systemic run began; -1 = not tripped.
-  var pendingSince: int
   // m288: whether the last verdict-bearing update was a skip (RPC
   // failure) --- the restated counter law exempts unobserved ticks.
   var lastSkip: bool
@@ -300,15 +304,12 @@ module wedgeCluster {
     lastOf' = 0,
     lastWedged' = Set(),
     lastDelta' = 0,
-    lastConsumedEvictions' = Set(),
     suppressedAnchors' = Set(),
     watermark' = -1,
     expiredSince' = Map(),
     sawSystemic' = false,
     sawPerNode' = false,
-    sawReWedge' = false,
     sawSuppressed' = false,
-    pendingSince' = -1,
     lastSkip' = false,
     lastSuppressedNoDrain' = false,
     lastShrankMarked' = false,
@@ -329,7 +330,7 @@ module wedgeCluster {
       consumed: Set[str], systemic: bool, affected: int, of_: int,
       wedged: Set[str], skip: bool, episodeAnchors: Set[(str, str, int)],
       watermark: int, expiredSince: (str, str) -> int,
-      pendingSince: int, suppressedNoDrain: bool, shrankMarked: bool,
+      suppressedNoDrain: bool, shrankMarked: bool,
       episodeState: int, releaseEdge: bool, downgradeEdge: bool } =
     val now = time + 1
     val consumed = if (ENABLE_EVICTION) pendingEvictions else Set()
@@ -378,16 +379,12 @@ module wedgeCluster {
       2 * wedged.size() > population,
       (not(ENABLE_TRAJECTORY)) or breadth >= BREADTH_MIN,
     }
-    // Dwell: the raw condition must hold DWELL_TICKS ticks before the
-    // verdict fires; a skip holds the run (we did not look), a calm
-    // observed tick resets it.
-    val newPendingSince = if (not(ENABLE_TRAJECTORY)) -1
-      else if (skip) pendingSince
-      else if (rawSystemic) (if (pendingSince >= 0) pendingSince else now)
-      else -1
-    val systemic = if (ENABLE_TRAJECTORY)
-        rawSystemic and newPendingSince >= 0 and now - newPendingSince >= DWELL_TICKS
-      else rawSystemic
+    // TB-6 (a-1): the verdict is IMMEDIATE --- production's ratio arm
+    // fires the tick it trips; the only dwell production exhibits is
+    // the POST-watermark suppression dwell (dwellEngaged below). The
+    // round-4 arming dwell (raw condition held DWELL_TICKS ticks
+    // before firing) was a phantom and is deleted.
+    val systemic = rawSystemic
     // merged_bug_034: a developing episode (breadth at the bar while
     // the verdict has not fired) withholds per-node Dead verdicts.
     val developing = ENABLE_TRAJECTORY and breadth >= BREADTH_MIN
@@ -509,7 +506,6 @@ module wedgeCluster {
       // the merge --- the gate never lowers).
       watermark: if (TRACK_EPISODE_GHOSTS) (if (systemic or closeFires or downgradeFires) now else watermark) else -1,
       expiredSince: if (TRACK_EPISODE_GHOSTS) newExpiredSince else Map(),
-      pendingSince: newPendingSince,
       suppressedNoDrain: suppressedNoDrain,
       shrankMarked: shrankMarked,
       episodeState: newEpisodeState,
@@ -538,7 +534,6 @@ module wedgeCluster {
       lastOf' = r.of_,
       lastWedged' = r.wedged,
       lastDelta' = r.delta,
-      lastConsumedEvictions' = r.consumed,
       // Episode survivors accumulate; an anchor leaves the set when it
       // no longer exists in evidence (re-anchored fresh or drained).
       suppressedAnchors' = suppressedAnchors
@@ -552,9 +547,7 @@ module wedgeCluster {
       expiredSince' = r.expiredSince,
       sawSystemic' = (sawSystemic or r.systemic),
       sawPerNode' = (sawPerNode or (not(r.systemic) and r.wedged.size() > 0)),
-      sawReWedge' = (sawReWedge or (r.delta > 0 and markedIncrements > 0 and marked.size() == 0)),
       sawSuppressed' = (sawSuppressed or r.episodeAnchors.size() > 0),
-      pendingSince' = r.pendingSince,
       lastSkip' = r.skip,
       lastSuppressedNoDrain' = r.suppressedNoDrain,
       lastShrankMarked' = r.shrankMarked,
@@ -578,11 +571,10 @@ module wedgeCluster {
     markedIncrements' = markedIncrements,
     lastSystemic' = lastSystemic, lastAffected' = lastAffected, lastOf' = lastOf,
     lastWedged' = lastWedged, lastDelta' = lastDelta,
-    lastConsumedEvictions' = lastConsumedEvictions,
     suppressedAnchors' = suppressedAnchors,
     watermark' = watermark, expiredSince' = expiredSince,
-    sawSystemic' = sawSystemic, sawPerNode' = sawPerNode, sawReWedge' = sawReWedge,
-    sawSuppressed' = sawSuppressed, pendingSince' = pendingSince, lastSkip' = lastSkip,
+    sawSystemic' = sawSystemic, sawPerNode' = sawPerNode,
+    sawSuppressed' = sawSuppressed, lastSkip' = lastSkip,
     lastSuppressedNoDrain' = lastSuppressedNoDrain, lastShrankMarked' = lastShrankMarked,
     episodeState' = episodeState, sawRelease' = sawRelease,
     sawDowngrade' = sawDowngrade,
@@ -728,7 +720,6 @@ module wedgeClusterMain {
     ENABLE_EVICTION = true,
     TRACK_EPISODE_GHOSTS = false,
     ENABLE_TRAJECTORY = false,
-    DWELL_TICKS = 1,
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
@@ -757,7 +748,6 @@ module wedgeClusterLatch {
     ENABLE_EVICTION = true,
     TRACK_EPISODE_GHOSTS = true,
     ENABLE_TRAJECTORY = false,
-    DWELL_TICKS = 1,
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
@@ -781,7 +771,6 @@ module wedgeClusterNoEviction {
     ENABLE_EVICTION = false,
     TRACK_EPISODE_GHOSTS = false,
     ENABLE_TRAJECTORY = false,
-    DWELL_TICKS = 1,
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
@@ -794,12 +783,12 @@ module wedgeClusterNoEviction {
 }
 
 // merged_bug_034 (Q2): the production trajectory regime --- fleet
-// denominator + breadth + dwell live, per-node withholding during a
-// developing episode. One notch below the main bounds (the dwell run
-// state multiplies the space; measured numbers at the
-// quint-wedge-cluster-trajectory check in nix/quint.nix). The
-// systemic-arm witness guards these bounds against vacuation (the
-// dwell needs raw-trip at t, hold at t+1 --- MAX_TIME=4 leaves
+// denominator + breadth live, per-node withholding during a
+// developing episode. One notch below the main bounds (measured
+// numbers at the quint-wedge-cluster-trajectory check in
+// nix/quint.nix). The systemic-arm witness guards these bounds
+// against vacuation (the verdict is IMMEDIATE on the tick the ratio
+// trips --- TB-6 deleted the phantom arming dwell; MAX_TIME=4 leaves
 // headroom).
 module wedgeClusterTrajectory {
   import wedgeCluster(
@@ -810,7 +799,6 @@ module wedgeClusterTrajectory {
     ENABLE_EVICTION = true,
     TRACK_EPISODE_GHOSTS = false,
     ENABLE_TRAJECTORY = true,
-    DWELL_TICKS = 1,
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
@@ -838,7 +826,6 @@ module wedgeClusterEpilogue {
     ENABLE_EVICTION = true,
     TRACK_EPISODE_GHOSTS = false,
     ENABLE_TRAJECTORY = false,
-    DWELL_TICKS = 1,
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
@@ -868,7 +855,6 @@ module wedgeClusterAdmission {
     ENABLE_EVICTION = true,
     TRACK_EPISODE_GHOSTS = false,
     ENABLE_TRAJECTORY = false,
-    DWELL_TICKS = 1,
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = true,
     ENABLE_ADMISSION = true,
@@ -905,7 +891,6 @@ module wedgeClusterDwellArm {
     ENABLE_EVICTION = true,
     TRACK_EPISODE_GHOSTS = true,
     ENABLE_TRAJECTORY = true,
-    DWELL_TICKS = 1,
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,

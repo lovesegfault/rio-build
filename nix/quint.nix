@@ -7995,18 +7995,22 @@ rec {
     };
 
     # merged_bug_034 (Q2 SIGNED): the production trajectory regime —
-    # fleet denominator + breadth + dwell + per-node withholding,
-    # PLUS (round-5, merged_bug_016) the suppressed-retention law:
+    # fleet denominator + breadth + per-node withholding, PLUS
+    # (round-5, merged_bug_016) the suppressed-retention law:
     # developing-episode ticks retain the marked transition-memory.
-    # All eight laws TLC-EXHAUSTIVE at MAX_TIME=4/WINDOW=2:
-    # 9,987,163 states generated / 57,968 distinct / 0 on queue, 69s
-    # at workers=auto under a parallel sweep — budget 1800s ≈ 26×
-    # measured (the round-5 ladder: the retention restatement grew
-    # the space from 8.7M/44,111, then the release-edge close pruned
-    # it slightly — drained windows collapse states; the episode
-    # carriers are frozen off-trajectory, so the other regimes'
-    # spaces are byte-identical to their recorded baselines). The dwell-gated systemic arm is
-    # reachability-pinned below.
+    # TB-6 (bughunt-13 referee, SURVIVED): the round-4 PRE-VERDICT
+    # ARMING DWELL (raw condition held DWELL_TICKS ticks before the
+    # verdict fired) was a PHANTOM — production's ratio arm fires the
+    # tick it trips (wedge.rs finalize; the only production dwell is
+    # the POST-watermark suppression dwell, VERDICT_DWELL_TICKS) —
+    # so the arming dwell, its DWELL_TICKS const and the pendingSince
+    # carrier are DELETED; the verdict is immediate, like the code.
+    # All eight laws TLC-EXHAUSTIVE at MAX_TIME=4/WINDOW=2 — the
+    # deletion shrinks every regime's space monotonically (a state
+    # var and a const axis removed; nothing else moved); re-measured
+    # wall-clocks at the TB-6 tree are recorded in the slot's landing
+    # entry, all in the same seconds-class as the prior baselines.
+    # The systemic arm is reachability-pinned below.
     # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-trajectory = mkQuintCheck {
       name = "wedge-cluster-trajectory";
@@ -8040,8 +8044,9 @@ rec {
       extraSpecs = [ "wedgeCluster" ];
       witness = "suppressedTickRetainsMarked";
     };
-    # Anti-vacuation: the dwell-gated systemic arm actually fires at
-    # the trajectory bounds (raw-trip at t, hold through DWELL_TICKS).
+    # Anti-vacuation: the systemic arm actually fires at the
+    # trajectory bounds (immediate on the tick the ratio trips —
+    # TB-6: the arming dwell was deleted).
     quint-wedge-cluster-trajectory-witness-systemic = mkQuintWitnessCheck {
       name = "wedge-cluster-trajectory-witness-systemic";
       spec = "wedgeCluster";
