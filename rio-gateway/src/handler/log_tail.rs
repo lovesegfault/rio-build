@@ -1203,7 +1203,7 @@ async fn run_tail(
                 // UNAUTHENTICATED is the live_062 face: the token the
                 // open carried is no longer valid. The source classifies
                 // against the gateway's OWN clock and arms a re-mint
-                // ONLY for LocalExpiry (R34-w(iii), merged_bug_005): a
+                // only for LocalExpiry (R34-w(iii), merged_bug_005): a
                 // token well within its TTL was rejected for a cause a
                 // re-mint cannot heal (revoked jti, unknown verify
                 // key), and re-minting around it would silently
@@ -2419,7 +2419,7 @@ mod tests {
     /// WELL WITHIN its TTL does NOT re-mint — the verifier rejected it
     /// for a cause re-signing with the same key cannot heal (revoked
     /// jti, the operator denial; or unknown verify key, the rotation
-    /// claim's runtime negative). The re-open carries the SAME token
+    /// claim's runtime negative). The re-open carries the same token
     /// and the rejection surfaces honestly through the auth lane.
     ///
     /// Pre-fix RED (the wave-13 unconditional `note_rejected`): the
@@ -2503,7 +2503,7 @@ mod tests {
     // r[verify sys.recovery.witnessed-clear]
     /// W14-A4 (merged_bug_003 red-first, R34-w(i) — the err_stream
     /// silent dark tail): the store opens successfully and answers
-    /// EVERY cycle through err_stream (an in-body Status — the
+    /// every cycle through err_stream (an in-body Status — the
     /// production refusal design for authorize_tail NotFound, missing
     /// exec row, PG errors). Pre-fix RED: `degraded` was
     /// unconditionally cleared on every successful open

@@ -29,7 +29,7 @@ use tracing::{debug, warn};
 /// rotation will see `UNAUTHENTICATED` on its next gRPC call and
 /// surface honestly as `NotLocallyHealable` (the gateway's signing
 /// key is read once at boot, `main.rs:203-218`, with no reload path
-/// — a re-mint signs with the SAME key the verifier just refused).
+/// — a re-mint signs with the same key the verifier just refused).
 /// The client (nix) retries → new SSH connect to a rolled gateway
 /// pod → new token under the new key. There is NO in-session heal
 /// for rotation; the only heal-able rejection cause is local expiry
@@ -165,7 +165,7 @@ pub(crate) enum RemintCause {
     /// per-jti revocation (the operator denied this session — a fresh
     /// jti would silently override the denial), an unknown verify key
     /// (the boot-time signing key in `main.rs:203-218` has no reload
-    /// path, so a re-mint signs with the SAME key the verifier just
+    /// path, so a re-mint signs with the same key the verifier just
     /// rejected), or any other verifier-side refusal. Surfaced
     /// honestly; never re-minted.
     NotLocallyHealable,
@@ -290,7 +290,7 @@ impl SessionTokenSource {
     // r[impl gw.jwt.remint-local-expiry-only]
     /// The peer rejected the last injection `UNAUTHENTICATED`: classify
     /// the rejection against the gateway's OWN clock and the cached
-    /// `exp`, and arm a forced re-mint ONLY for
+    /// `exp`, and arm a forced re-mint only for
     /// [`RemintCause::LocalExpiry`]. Returns the typed cause so the
     /// caller can branch (re-mint+retry vs surface honestly) without
     /// re-deriving it — R34-w(i)/(iii): a re-mint is a recovery claim
@@ -591,7 +591,7 @@ mod jwt_issuance_tests {
     /// healthy token below was re-minted with a FRESH jti — the
     /// scheduler's per-jti revocation healed around in one cycle, and
     /// the rotation case burned the WatchBuild one-shot on a token
-    /// signed with the SAME boot-time key the verifier just refused.
+    /// signed with the same boot-time key the verifier just refused.
     /// Both verifier-side faces are the same gateway-side observable
     /// (bare Unauthenticated on a healthy token); the typed cause is
     /// what the issuer can locally PROVE, not what the verifier said.
