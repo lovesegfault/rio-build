@@ -69,7 +69,6 @@ docs/spec/components/scheduler.typ	and non-FODs ONLY to builder-kind executors. 
 docs/spec/components/scheduler.typ	armed-action totality test and the failover VM scenario.
 docs/spec/components/scheduler.typ	as a typed `Unhostable` carrying demand and best-class. The totality
 docs/spec/components/scheduler.typ	at most once per attempt, ever; EVERY other witnessed letter (both
-docs/spec/components/scheduler.typ	bounds the staleness from ANY marks falsifier --- a foreign sweep racing a
 docs/spec/components/scheduler.typ	budget's exclusion key is the attempt's _source node_, and ONLY that: an
 docs/spec/components/scheduler.typ	cached content, mark that edge as cutoff and skip downstream only when ALL
 docs/spec/components/scheduler.typ	claimable listing forever, so re-listing can never recover it). Crashed
@@ -898,7 +897,6 @@ rio-lease/src/lib.rs	/// count — so its still-believing leg must run the SAME 
 rio-lease/src/lib.rs	/// direct-evidence lose ALWAYS clears it (the graceful-release
 rio-lease/src/lib.rs	/// exhaustion (a previous deferral is still unresolved). The ONLY
 rio-lease/src/lib.rs	/// leader-marks dirt the SAME tick — the step-down arm exits
-rio-lease/src/lib.rs	/// level-triggered: ANY falsifier (a foreign sweep racing a re-acquire,
 rio-lease/src/lib.rs	/// local increment. Two replicas that both believe they lead can never
 rio-lease/src/lib.rs	/// lose NEVER changes the release verdict (it is fence-class —
 rio-lease/src/lib.rs	/// means a completion racing a concurrent lease transition can never
@@ -906,7 +904,6 @@ rio-lease/src/lib.rs	/// must cover the eldest); it is consumed ONLY by own-comm
 rio-lease/src/lib.rs	/// observed our supersession. Reads ONLY the hold — belief has no
 rio-lease/src/lib.rs	/// re-acquire installs a NEW tenure INSTANCE at the SAME transition
 rio-lease/src/lib.rs	/// re-acquires at the SAME generation and in-flight work survives.
-rio-lease/src/lib.rs	/// re-dirties on divergence — so ANY falsifier (foreign sweep,
 rio-lease/src/lib.rs	/// reads as complete again if this acquire records the SAME
 rio-lease/src/lib.rs	/// renews (nobody stole in between) re-acquires at the SAME
 rio-lease/src/lib.rs	/// same-epoch re-acquire pair re-acquires at the SAME transition

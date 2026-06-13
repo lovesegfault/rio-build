@@ -334,13 +334,16 @@ pub const MARKS_VERIFY_EVERY: u64 = 12;
 // schedule and prices the divergence-class skip at ZERO (a busy
 // multiple is a dirty multiple in-model — only dirt spawns
 // reconciles); this assert is the production-side bridge that makes
-// that pricing true here: a clean loop's verify task can never park
-// across a multiple and manufacture the clean+busy skip the model
-// excludes. Pre-F4 this margin was luck — nothing pinned it, and the
-// model's cadence ("deadline from the last verify") was a stronger
-// schedule than the one production runs. Phase margin at the current
-// constants: one task deadline (3s) + one round (5s) = 8s against a
-// 60s interval.
+// that pricing true here: it pins that a clean loop's verify task
+// does not park across a multiple and manufacture the clean+busy
+// skip the model excludes. Pre-F4 this margin was luck — nothing
+// pinned it, and the model's cadence ("deadline from the last
+// verify") was a stronger schedule than the one production runs.
+// Phase margin at the current constants: one task deadline (3s) +
+// one round (5s) = 8s against a 60s interval. The operands below are
+// whole-second protocol constants (5s renew, 2s slop, a round count),
+// so seconds are the finest unit any input carries.
+// r29-lossless: whole-second constants only — nothing finer to truncate.
 const _: () = assert!(
     (RENEW_INTERVAL.as_secs() - RENEW_SLOP.as_secs()) + RENEW_INTERVAL.as_secs()
         < MARKS_VERIFY_EVERY * RENEW_INTERVAL.as_secs(),
@@ -384,8 +387,8 @@ const MARKS_VERIFY_WARN_AFTER: u64 = 3;
 fn describe_lease_metrics() {
     // Literal name (not the const): the docs scrape
     // (xtask/src/regen/docs_data.rs::METRICS_RE) reads describe_*!
-    // string literals; the assert pins literal == const so the
-    // emission sites and this HELP can never drift apart.
+    // string literals; the assert pins literal == const, so a drift
+    // between the emission sites and this HELP fails right here.
     debug_assert_eq!(
         STANDBY_MARKS_STRIPS_TOTAL,
         "rio_lease_standby_marks_strips_total"
@@ -5226,7 +5229,7 @@ mod tests {
         }
 
         /// Rider (b1) enrollment plant: an in-grammar uncensused
-        /// member reds through the SAME walk path as production.
+        /// member reds through the same walk path as production.
         #[test]
         fn marks_census_enrollment_plant_reds() {
             let planted = "fn f(d: &DirtyGen) {\n    d.mark();\n}\n";

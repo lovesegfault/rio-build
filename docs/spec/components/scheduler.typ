@@ -4790,7 +4790,7 @@ frozen-rv companion test and the model twin pin the refusal.
 
 #r("sched.lease.marks-verify+2")[
   The leader-marks reconcile MUST be backed by a bounded-cadence
-  verification ON EVERY REPLICA: every `MARKS_VERIFY_EVERY` election rounds
+  verification on every replica: every `MARKS_VERIFY_EVERY` election rounds
   (12 renews, \~60s), a loop whose marks are clean and whose reconcile slot
   is free --- leader OR standby --- reads its OWN Pod and compares the
   stored marks (deletion-cost annotation; leader label when configured)
@@ -4824,9 +4824,9 @@ all move the data path with nothing pod-side to repair it. That residual is
 the platform's jurisdiction --- pod create/delete in the system namespace
 is RBAC-gated exactly like the marks writes themselves --- and its
 detection tier is the leader-Service endpoint-count alert
-(`RioSchedulerLeaderEndpointsNotSingleton`: ready endpoints `!= 1`, both
-polarities), which covers deletion, orphaning, and foreign creation at
-once.
+(#(refs.alert)("RioSchedulerLeaderEndpointsNotSingleton"): ready endpoints
+`!= 1`, both polarities), which covers deletion, orphaning, and foreign
+creation at once.
 
 The verify pass shares the reconcile's single-flight slot (verify and patch
 never interleave) and runs at BOTH leadership polarities: the leader
@@ -4843,8 +4843,9 @@ nothing examines them. The pass costs one Pod GET per replica per interval
 and is LOUD (a persistently failing self-check is the silent revert to the
 pre-verify world); a divergence verdict is always safe to act on (the
 repair is one idempotent merge patch), and a standby-side strip
-additionally bumps `rio_lease_standby_marks_strips_total` --- expected zero
-from honest fleets, so any increment is the falsifier class live.
+additionally bumps #(refs.metric)("rio_lease_standby_marks_strips_total")
+--- expected zero from honest fleets, so any increment is the falsifier
+class live.
 
 *Deployment strategy interaction:* Readiness is decoupled from leadership
 (#rref("sched.grpc.leader-guard")): both pods are Ready (TCP probe = process
