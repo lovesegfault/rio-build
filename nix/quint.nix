@@ -1774,7 +1774,7 @@ rec {
     # peerDivergenceBounded window. Measured: exhaustive TLC ~13s at
     # the wired constants (transcript in the introducing commit) —
     # the default 1800s budget is >100x headroom.
-    # r[verify sched.lease.marks-verify]
+    # r[verify sched.lease.marks-verify+2]
     # r[verify sched.lease.deletion-cost+3]
     quint-leader-marks = mkQuintCheck {
       name = "leader-marks";

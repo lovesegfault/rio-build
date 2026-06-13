@@ -4780,28 +4780,63 @@ frozen-rv companion test and the model twin pin the refusal.
   on each failed attempt is the operator signal.
 ]
 
-#r("sched.lease.marks-verify")[
+#r("sched.lease.marks-verify+2")[
   The leader-marks reconcile MUST be backed by a bounded-cadence
-  verification: every `MARKS_VERIFY_EVERY` election rounds (12 renews, ~60s),
-  a leading loop whose marks are clean and whose reconcile slot is free reads
-  its OWN Pod and compares the stored marks (deletion-cost annotation; leader
-  label when configured) against its current leadership; on divergence it
-  re-marks the reconcile dirty so the next round-trip repairs them. This
-  bounds the staleness from ANY marks falsifier --- a foreign sweep racing a
-  re-acquisition (the sweep's read-then-patch TOCTOU), `kubectl label`, or
-  any future actor outside the edge-writer set --- to one verify interval
-  plus one reconcile, replacing the previous contract in which a divergence
-  not caused by an enumerated edge writer persisted until the next leadership
-  transition.
+  verification ON EVERY REPLICA: every `MARKS_VERIFY_EVERY` election rounds
+  (12 renews, \~60s), a loop whose marks are clean and whose reconcile slot
+  is free --- leader OR standby --- reads its OWN Pod and compares the
+  stored marks (deletion-cost annotation; leader label when configured)
+  against its current leadership; on divergence it re-marks the reconcile
+  dirty so the next round-trip repairs them, which at standby polarity
+  STRIPS foreign leader marks. This bounds the staleness from every marks
+  falsifier that writes marks on a pod running the election loop, at both
+  polarities: a falsifier that STRIPS or garbles the leader's marks (a
+  foreign sweep racing a re-acquisition --- the sweep's read-then-patch
+  TOCTOU --- or `kubectl annotate`/`kubectl label`) is re-discovered by the
+  leader's own verify, and a falsifier that ADDS leader marks to a
+  non-leading pod (`kubectl label`, a foreign controller, any future actor
+  outside the edge-writer set) is re-discovered by that pod's own standby
+  self-check --- each to one verify interval plus one reconcile, replacing
+  the previous contract in which a divergence not caused by an enumerated
+  edge writer persisted until the next leadership transition. The bound
+  binds given the platform grants the verify GET and the marks PATCH: a
+  persistent platform denial (RBAC 403) is a named, observable failure ---
+  the repeated warning stream is the operator signal --- never a silent
+  satisfaction of this rule.
 ]
 
+The falsifier class this rule deliberately does NOT claim: actors that
+change leader-Service *selector membership* without writing marks on a
+loop-running pod. The `rio-scheduler-leader` Service selects by label match
+alone, so deleting a pod, orphaning it from its Deployment selector, or
+CREATING a foreign pod that carries the selector + role labels while
+running no scheduler binary (no election loop, hence no self-check --- and
+the marks model's fixed two-pod universe cannot represent a third pod)
+all move the data path with nothing pod-side to repair it. That residual is
+the platform's jurisdiction --- pod create/delete in the system namespace
+is RBAC-gated exactly like the marks writes themselves --- and its
+detection tier is the leader-Service endpoint-count alert
+(`RioSchedulerLeaderEndpointsNotSingleton`: ready endpoints `!= 1`, both
+polarities), which covers deletion, orphaning, and foreign creation at
+once.
+
 The verify pass shares the reconcile's single-flight slot (verify and patch
-never interleave) and is leader-only: a standby's marks are converged by its
-own lose-edge reconcile and swept by the live holder, so verifying them too
-would double the fleet's read load for marks nothing routes on. The pass
-costs one Pod GET per leader per interval; a GET failure is benign (the next
-interval retries) and a divergence verdict is always safe to act on (the
-repair is one idempotent merge patch).
+never interleave) and runs at BOTH leadership polarities: the leader
+re-asserts stripped marks; a standby strips foreign ones. The previous
+leader-only form rested on "a standby's marks are converged by its own
+lose-edge reconcile and swept by the live holder" --- true only for
+falsifiers that REMOVE marks: an external ADD on a standby has no edge, is
+invisible to the leader's own-pod verify, and sits outside the peer sweep's
+reach in quiet steady state (the sweep runs only inside a reconcile the
+leader's own dirt must spawn), while the leader-only Service routes on the
+label by pure label match --- the marks are load-bearing precisely while
+nothing examines them. The pass costs one Pod GET per replica per interval
+(two GETs per fleet per \~60s); a GET failure leaves the marks untouched
+and is LOUD (a persistently failing self-check is the silent revert to the
+pre-verify world); a divergence verdict is always safe to act on (the
+repair is one idempotent merge patch), and a standby-side strip
+additionally bumps `rio_lease_standby_marks_strips_total` --- expected zero
+from honest fleets, so any increment is the falsifier class live.
 
 *Deployment strategy interaction:* Readiness is decoupled from leadership
 (#rref("sched.grpc.leader-guard")): both pods are Ready (TCP probe = process

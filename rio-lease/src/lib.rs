@@ -318,7 +318,7 @@ const _: () = {
 /// that pod's own standby self-check — each within one verify interval
 /// plus one reconcile, instead of lingering until the next leadership
 /// transition.
-// r[impl sched.lease.marks-verify]
+// r[impl sched.lease.marks-verify+2]
 pub const MARKS_VERIFY_EVERY: u64 = 12;
 
 /// Counter bumped each time the standby self-check finds foreign
@@ -3216,7 +3216,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
             inflight_marks = Some(task);
         }
 
-        // r[impl sched.lease.marks-verify]
+        // r[impl sched.lease.marks-verify+2]
         // Bounded-cadence verification, BOTH polarities: every
         // MARKS_VERIFY_EVERY rounds a clean-and-idle loop re-reads its
         // OWN Pod and compares the stored marks against its CURRENT
@@ -4541,7 +4541,7 @@ fn marks_match(
     cost_ok && label_ok
 }
 
-// r[impl sched.lease.marks-verify]
+// r[impl sched.lease.marks-verify+2]
 /// Detached verify pass: GET our OWN Pod (timeout-bounded; RBAC `get
 /// pods` — granted alongside the existing `patch pods`/`list pods`
 /// verbs; both replicas run under the same ServiceAccount, so the
@@ -9126,7 +9126,7 @@ mod tests {
     /// Pure marks comparison driving the verify pass: all four
     /// (leading, stored-marks) quadrants plus the absent-annotation and
     /// no-label-configured arms.
-    // r[verify sched.lease.marks-verify]
+    // r[verify sched.lease.marks-verify+2]
     #[test]
     fn marks_match_quadrants() {
         let label = ("role".to_owned(), "leader".to_owned());
@@ -10129,13 +10129,17 @@ mod tests {
         );
     }
 
-    /// The structural close of merged_bug_138: a bounded-cadence verify
-    /// pass re-reads our own pod every MARKS_VERIFY_EVERY rounds and
-    /// re-dirties on divergence — so ANY falsifier (foreign sweep,
-    /// kubectl, future actor) is bounded to one verify interval plus
-    /// one reconcile, instead of "until the next leadership
-    /// transition". Pre-fix: steady state spawned nothing, ever.
-    // r[verify sched.lease.marks-verify]
+    /// The structural close of merged_bug_138, leader polarity: a
+    /// bounded-cadence verify pass re-reads our own pod every
+    /// MARKS_VERIFY_EVERY rounds and re-dirties on divergence — so a
+    /// falsifier that strips or garbles the LEADER's marks (foreign
+    /// sweep, kubectl, future actor) is bounded to one verify interval
+    /// plus one reconcile, instead of "until the next leadership
+    /// transition". Pre-fix: steady state spawned nothing, ever. The
+    /// add-polarity twin (foreign marks on a STANDBY) is
+    /// standby_self_check_strips_foreign_leader_marks — together they
+    /// cover the falsifier class the re-scoped rule names.
+    // r[verify sched.lease.marks-verify+2]
     #[tokio::test(start_paused = true)]
     async fn nth_renew_verify_redirties_on_external_strip() {
         let (client, mock) = MockApiServer::new();
@@ -10233,7 +10237,7 @@ mod tests {
     /// stays in the leader-only Service's endpoints until the next
     /// leadership transition (the red is recorded verbatim in the
     /// introducing commit body; order-infeasible strawman disclosure).
-    // r[verify sched.lease.marks-verify]
+    // r[verify sched.lease.marks-verify+2]
     #[tokio::test(start_paused = true)]
     async fn standby_self_check_strips_foreign_leader_marks() {
         // The strip counter fires inside the spawned verify task —

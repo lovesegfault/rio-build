@@ -22,8 +22,11 @@
 // encoding lost (rio-lease/src/lib.rs pre-fix store(false)).
 //
 // Spec rules verified here (markers at the nix/quint.nix wiring):
-//   - sched.lease.marks-verify (the bounded-cadence verification: ANY
-//     marks falsifier is re-discovered within one verify interval)
+//   - sched.lease.marks-verify (the bounded-cadence verification on
+//     EVERY replica: a marks falsifier on a loop-running pod — either
+//     polarity — is re-discovered within one verify interval; the
+//     selector-membership residual is the platform's, priced in the
+//     rule)
 //   - sched.lease.deletion-cost+3 (the holder-aware sweep: the peer
 //     sweep spares the current Lease holder)
 //
