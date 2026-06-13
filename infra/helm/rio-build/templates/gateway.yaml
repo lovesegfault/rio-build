@@ -77,6 +77,18 @@ spec:
     metadata:
       labels:
         {{- include "rio.labels" (dict "root" . "name" "rio-gateway" "component" "gateway") | nindent 8 }}
+      annotations:
+        # live_064 (parity with the builders' I-126 posture and the
+        # store's live_062 stamp): a gateway pod holds every live SSH
+        # session and the per-build WatchBuild + log-tail streams —
+        # Karpenter consolidating its node severs all of them at once
+        # (each one a client-visible build interruption, even when the
+        # re-attach machinery recovers). The annotation gates ONLY
+        # Karpenter's own disruption controller: kubectl drains and
+        # node rotations still ride the eviction API + the rio-gateway
+        # PDB (minAvailable 1 when the fleet can run multiple), and
+        # KEDA scale-in deletes pods directly — both unaffected.
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       serviceAccountName: rio-gateway
       {{- if .Values.karpenter.enabled }}

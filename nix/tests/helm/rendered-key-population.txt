@@ -490,6 +490,8 @@ default	Deployment/rio-gateway	spec.strategy.rollingUpdate.maxUnavailable
 default	Deployment/rio-gateway	spec.strategy.type
 default	Deployment/rio-gateway	spec.template
 default	Deployment/rio-gateway	spec.template.metadata
+default	Deployment/rio-gateway	spec.template.metadata.annotations
+default	Deployment/rio-gateway	spec.template.metadata.annotations.karpenter.sh/do-not-disrupt
 default	Deployment/rio-gateway	spec.template.metadata.labels
 default	Deployment/rio-gateway	spec.template.metadata.labels.app.kubernetes.io/component
 default	Deployment/rio-gateway	spec.template.metadata.labels.app.kubernetes.io/managed-by
@@ -587,6 +589,7 @@ default	Deployment/rio-scheduler	spec.template
 default	Deployment/rio-scheduler	spec.template.metadata
 default	Deployment/rio-scheduler	spec.template.metadata.annotations
 default	Deployment/rio-scheduler	spec.template.metadata.annotations.checksum/scheduler-toml
+default	Deployment/rio-scheduler	spec.template.metadata.annotations.karpenter.sh/do-not-disrupt
 default	Deployment/rio-scheduler	spec.template.metadata.labels
 default	Deployment/rio-scheduler	spec.template.metadata.labels.app.kubernetes.io/component
 default	Deployment/rio-scheduler	spec.template.metadata.labels.app.kubernetes.io/managed-by
@@ -1903,6 +1906,8 @@ karpenter	Deployment/rio-gateway	spec.strategy.rollingUpdate.maxUnavailable
 karpenter	Deployment/rio-gateway	spec.strategy.type
 karpenter	Deployment/rio-gateway	spec.template
 karpenter	Deployment/rio-gateway	spec.template.metadata
+karpenter	Deployment/rio-gateway	spec.template.metadata.annotations
+karpenter	Deployment/rio-gateway	spec.template.metadata.annotations.karpenter.sh/do-not-disrupt
 karpenter	Deployment/rio-gateway	spec.template.metadata.labels
 karpenter	Deployment/rio-gateway	spec.template.metadata.labels.app.kubernetes.io/component
 karpenter	Deployment/rio-gateway	spec.template.metadata.labels.app.kubernetes.io/managed-by
@@ -2002,6 +2007,7 @@ karpenter	Deployment/rio-scheduler	spec.template
 karpenter	Deployment/rio-scheduler	spec.template.metadata
 karpenter	Deployment/rio-scheduler	spec.template.metadata.annotations
 karpenter	Deployment/rio-scheduler	spec.template.metadata.annotations.checksum/scheduler-toml
+karpenter	Deployment/rio-scheduler	spec.template.metadata.annotations.karpenter.sh/do-not-disrupt
 karpenter	Deployment/rio-scheduler	spec.template.metadata.labels
 karpenter	Deployment/rio-scheduler	spec.template.metadata.labels.app.kubernetes.io/component
 karpenter	Deployment/rio-scheduler	spec.template.metadata.labels.app.kubernetes.io/managed-by

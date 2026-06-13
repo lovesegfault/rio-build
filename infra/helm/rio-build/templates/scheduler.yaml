@@ -188,6 +188,16 @@ spec:
         # list — that drifts) so any input that lands in the TOML rolls
         # the pod. helm/19-scheduler-checksum-covers-toml.sh enforces.
         checksum/scheduler-toml: {{ include "rio.schedulerToml" . | sha256sum }}
+        # live_064 (parity with the builders' I-126 posture and the
+        # store's live_062 stamp): the leader holds the dispatch lease
+        # and every WatchBuild stream; Karpenter consolidating its node
+        # forces a leader failover plus a reconnect storm from every
+        # watching gateway in the middle of whatever was building. The
+        # annotation gates ONLY Karpenter's own disruption controller:
+        # kubectl drains and node rotations still ride the eviction API
+        # + the rio-scheduler PDB (maxUnavailable 1 when replicas > 1),
+        # and deploys roll pods directly — both unaffected.
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       serviceAccountName: rio-scheduler
       {{- if .Values.karpenter.enabled }}
