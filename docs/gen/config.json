@@ -999,7 +999,7 @@
         "key": "eval_parent",
         "type": "string",
         "default": "",
-        "description": "Path to the eval-parent binary (C++ libexpr embedding — ADR-024 P3b). `rio build` spawns it with the worker channel on fd 3."
+        "description": "Path to the eval-parent binary (C++ libexpr embedding). `rio build` spawns it with the worker channel on fd 3."
       },
       {
         "key": "ack_ttl_secs",

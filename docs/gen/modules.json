@@ -1684,7 +1684,7 @@
     {
       "path": "grpc/paginate.rs",
       "depth": 1,
-      "doc": "Paginated `SubmitBuild` assembly (ADR-024 P2a)."
+      "doc": "Paginated `SubmitBuild` assembly (ADR-024)."
     },
     {
       "path": "grpc/scheduler_service.rs",
@@ -1981,7 +1981,7 @@
     {
       "path": "grpc/drv_blob.rs",
       "depth": 1,
-      "doc": "DrvBlobService (ADR-024 P2): derivations as a first-class castore blob kind."
+      "doc": "DrvBlobService (ADR-024): derivations as a first-class castore blob kind."
     },
     {
       "path": "grpc/get_path.rs",

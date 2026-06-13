@@ -33,10 +33,11 @@ pub struct Config {
     /// table, fetched outputs). Unset = `$XDG_CACHE_HOME/rio/evalstore`
     /// (falling back to `~/.cache/rio/evalstore`).
     pub cas_root: Option<PathBuf>,
-    /// Path to the eval-parent binary (C++ libexpr embedding — ADR-024
-    /// P3b). `rio build` spawns it with the worker channel on fd 3.
-    /// Required for `rio build <installable>` until P3b ships a
-    /// default; `--attach`/`--cancel` work without it.
+    /// Path to the eval-parent binary (C++ libexpr embedding).
+    /// `rio build` spawns it with the worker channel on fd 3.
+    /// Required for `rio build <installable>`; `--attach`/`--cancel`
+    /// work without it. The nix-built pair (`nix build .#rio`) defaults
+    /// this via `RIO_EVAL_PARENT` in its wrapper.
     pub eval_parent: Option<PathBuf>,
     /// Cluster-ack record TTL in seconds. MUST be ≤ the cluster's
     /// minimum unpinned-blob lifetime (ADR-024) — a longer TTL turns

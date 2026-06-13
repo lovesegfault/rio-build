@@ -12,6 +12,12 @@ description = "rio build — native-protocol build client (ADR-024 P3 coordinato
 name = "rio"
 path = "src/main.rs"
 
+# Coordinator-side channel harness for the rio-eval parent — the
+# rio-eval-smoke nix check drives the real C++ binary through it.
+[[bin]]
+name = "eval-harness"
+path = "src/bin/eval-harness.rs"
+
 [dependencies]
 rio-common = { workspace = true }
 # Client CAS: ingest (source re-read on upload miss) + dirblob fold.

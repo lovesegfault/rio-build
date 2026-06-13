@@ -31,7 +31,7 @@
         "default": null
       },
       "eval_parent": {
-        "description": "Path to the eval-parent binary (C++ libexpr embedding — ADR-024\nP3b). `rio build` spawns it with the worker channel on fd 3.\nRequired for `rio build <installable>` until P3b ships a\ndefault; `--attach`/`--cancel` work without it.",
+        "description": "Path to the eval-parent binary (C++ libexpr embedding).\n`rio build` spawns it with the worker channel on fd 3.\nRequired for `rio build <installable>`; `--attach`/`--cancel`\nwork without it. The nix-built pair (`nix build .#rio`) defaults\nthis via `RIO_EVAL_PARENT` in its wrapper.",
         "type": [
           "string",
           "null"
