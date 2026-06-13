@@ -5124,6 +5124,7 @@ rec {
     # the live pod phase and arbitrary (stale-allowed) gate publishes.
     # r[verify ctrl.pool.tick-ordering]
     # r[verify ctrl.pool.ack-spawned-soundness]
+    # r[verify ctrl.pool.spawn-once]
     quint-spawn-coherence-base = mkQuintCheck {
       name = "spawn-coherence-base";
       spec = "spawnCoherence";
@@ -5272,6 +5273,7 @@ rec {
       witness = "canReachOrphanReap";
     };
     # A 409 dedupe occurs (the deterministic-name collision path).
+    # r[verify ctrl.pool.spawn-once]
     quint-spawn-coherence-witness-409 = mkQuintWitnessCheck {
       name = "spawn-coherence-witness-409";
       spec = "spawnCoherence";
