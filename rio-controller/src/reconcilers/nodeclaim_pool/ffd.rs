@@ -16,10 +16,13 @@ use rio_proto::types::SpawnIntent;
 
 use super::sketch::{CapacityType, Cell, CellSketches};
 
-/// Karpenter's well-known capacity-type label key. Values: `"spot"` /
-/// `"on-demand"` (NOT the PG/helm `"od"` form — `cap_from_label`
-/// maps).
-pub const CAPACITY_TYPE_LABEL: &str = "karpenter.sh/capacity-type";
+/// Karpenter's well-known capacity-type label key — re-exported from
+/// the shared decoder module so the grammar's key has ONE owner
+/// beside its decode law (bug_063). Node-LABEL values are
+/// `"spot"`/`"on-demand"` (`cap_from_label` maps that lane); the
+/// wire selector-term lane decodes through
+/// `rio_common::k8s::capacity_term` with the full shared alphabet.
+pub use rio_common::k8s::capacity_term::CAPACITY_TYPE_LABEL;
 
 /// hw-class label key. The scheduler emits this on each
 /// `node_affinity` term (`r[sched.sla.hw-class]`); B8's
@@ -985,10 +988,13 @@ pub fn per_cell_hit_ratio(placeable: &[Placement], live: &[LiveNode]) -> HashMap
     out
 }
 
-/// Map `karpenter.sh/capacity-type` label values to [`CapacityType`].
+/// Map `karpenter.sh/capacity-type` NODE-LABEL values to
+/// [`CapacityType`] — the LiveNode label-map lane (karpenter writes
+/// the node label; canon `"spot"`/`"on-demand"`). NOT the wire
+/// selector-term lane: that grammar decodes through the one shared
+/// typed decoder ([`rio_common::k8s::capacity_term`], bug_063).
 /// Distinct from [`CapacityType::parse`] which takes the PG/helm
-/// `"spot"`/`"od"` form (migration 059 CHECK constraint). Karpenter's
-/// label canon is `"spot"`/`"on-demand"`.
+/// `"spot"`/`"od"` form (migration 059 CHECK constraint).
 fn cap_from_label(s: &str) -> Option<CapacityType> {
     match s {
         "spot" => Some(CapacityType::Spot),
@@ -999,13 +1005,22 @@ fn cap_from_label(s: &str) -> Option<CapacityType> {
 
 /// One intent's decoded cell set plus its decode-loss count
 /// (merged_bug_006): `refused` counts wire entries the decode could
-/// not honor — a length mismatch between the parallel arrays, a term
-/// missing the `karpenter.sh/capacity-type` requirement, or an
-/// unparseable capacity value. `refused > 0` means the pair is SKEWED
-/// (producer regression or scheduler/controller version skew) and the
-/// set is untrustworthy evidence; the cover chokepoint refuses the
-/// whole intent loudly (`PlacementOutcome::DecodeRefused`) instead of
-/// placing against a silently truncated set.
+/// not honor — a length mismatch between the parallel arrays, or any
+/// term the shared typed decoder refuses (missing/duplicate capacity
+/// requirement, non-`In` operator, empty/multi-valued values,
+/// out-of-alphabet value — the full
+/// [`rio_common::k8s::capacity_term::CapacityTermDefect`] partition).
+/// `refused > 0` means the pair is SKEWED (producer regression or
+/// scheduler/controller version skew) and the set is untrustworthy
+/// evidence; the cover chokepoint refuses the whole intent loudly
+/// (`PlacementOutcome::DecodeRefused`) instead of placing against a
+/// silently truncated set. bug_063 made the contrapositive TRUE:
+/// `refused == 0` now entails every term decoded through the one
+/// shared law — the retained `find().and_then(values.first())` peek
+/// (which inverted `NotIn`, truncated multi-value, and resolved
+/// duplicates order-sensitively, all with `refused == 0`) is dead,
+/// and the in-crate term-decoder census keeps a third parse from
+/// ever minting again.
 pub struct CellsDecode {
     pub cells: Vec<Cell>,
     pub refused: usize,
@@ -1015,19 +1030,26 @@ pub struct CellsDecode {
 /// `(hw_class_names, node_affinity)` arrays, REPORTING decode losses.
 /// One cell per term; hw-agnostic mode emits empty arrays (zero terms,
 /// zero losses).
+// r[impl ctrl.nodeclaim.one-term-decoder]
 pub fn cells_of_checked(i: &SpawnIntent) -> CellsDecode {
+    use rio_common::k8s::capacity_term as ct;
     let mut refused = i.hw_class_names.len().abs_diff(i.node_affinity.len());
     let mut cells = Vec::with_capacity(i.hw_class_names.len());
     for (h, t) in i.hw_class_names.iter().zip(&i.node_affinity) {
-        let cap = t
-            .match_expressions
-            .iter()
-            .find(|r| r.key == CAPACITY_TYPE_LABEL)
-            .and_then(|r| r.values.first())
-            .and_then(|v| cap_from_label(v));
-        match cap {
-            Some(cap) => cells.push(Cell(h.clone(), cap)),
-            None => refused += 1,
+        // The ONE decode law (bug_063): the shared typed decoder —
+        // operator/duplicate/arity-checked, the same semantics the
+        // scheduler's decode_capacity_requirement delegates to. The
+        // pre-fix peek here was the condemned template
+        // (find().and_then(values.first())) rebuilt cross-crate one
+        // day after the scheduler's typed parse condemned it.
+        let reqs = t.match_expressions.iter().map(|r| ct::TermRequirement {
+            key: &r.key,
+            operator: &r.operator,
+            values: &r.values,
+        });
+        match ct::decode_capacity_term(reqs) {
+            Ok(w) => cells.push(Cell(h.clone(), w.into())),
+            Err(_) => refused += 1,
         }
     }
     CellsDecode { cells, refused }
@@ -1176,6 +1198,85 @@ pub(crate) mod tests {
     const GI: u64 = 1 << 30;
 
     // --- builders ------------------------------------------------------
+
+    // r[verify ctrl.nodeclaim.one-term-decoder]
+    /// W13-AJ (bug_063) — proposition: one wire grammar, one decode
+    /// law; population: the full term alphabet {In-single, NotIn,
+    /// multi-value, duplicate, malformed, missing, empty} — the
+    /// shared decoder's own unit battery carries the total walk;
+    /// this is the controller-consume half. Pre-fix RED (verbatim in
+    /// the commit body): NotIn[spot] decoded to Cell("h", Spot) —
+    /// the INVERSE — with refused==0 (the silent skew the
+    /// DecodeRefused defense exists to catch).
+    #[test]
+    fn w13_aj_notin_term_must_refuse_not_invert() {
+        let i = SpawnIntent {
+            hw_class_names: vec!["h".into()],
+            node_affinity: vec![NodeSelectorTerm {
+                match_expressions: vec![NodeSelectorRequirement {
+                    key: CAPACITY_TYPE_LABEL.into(),
+                    operator: "NotIn".into(),
+                    values: vec!["spot".into()],
+                }],
+            }],
+            ..Default::default()
+        };
+        let d = cells_of_checked(&i);
+        assert!(
+            d.cells.is_empty(),
+            "NotIn[spot] must NOT decode to a cell (pre-fix: decoded \
+             to Cell(h, Spot) — the inverse of what the term says): \
+             got {:?}",
+            d.cells
+        );
+        assert_eq!(
+            d.refused, 1,
+            "an undecodable term is REFUSED (typed, counted) — \
+             refused==0 with a wrong cell is the silent skew"
+        );
+    }
+
+    // r[verify ctrl.nodeclaim.one-term-decoder]
+    /// W13-AJ, the controller's off-shape walk: duplicate and
+    /// multi-value terms refuse (pre-fix: order-sensitive /
+    /// first-only with refused==0); the producer's exact shape and
+    /// the shared alphabet's third token still decode.
+    #[test]
+    fn w13_aj_off_shape_terms_refuse_in_shape_decodes() {
+        let term = |reqs: Vec<NodeSelectorRequirement>| NodeSelectorTerm {
+            match_expressions: reqs,
+        };
+        let req = |op: &str, vals: &[&str]| NodeSelectorRequirement {
+            key: CAPACITY_TYPE_LABEL.into(),
+            operator: op.into(),
+            values: vals.iter().map(|s| (*s).into()).collect(),
+        };
+        let intent = |t: NodeSelectorTerm| SpawnIntent {
+            hw_class_names: vec!["h".into()],
+            node_affinity: vec![t],
+            ..Default::default()
+        };
+        // Multi-value: pre-fix truncated to first-only.
+        let d = cells_of_checked(&intent(term(vec![req("In", &["spot", "on-demand"])])));
+        assert_eq!((d.cells.len(), d.refused), (0, 1), "multi-value refuses");
+        // Duplicate: pre-fix resolved order-sensitively.
+        let d = cells_of_checked(&intent(term(vec![
+            req("In", &["spot"]),
+            req("In", &["on-demand"]),
+        ])));
+        assert_eq!((d.cells.len(), d.refused), (0, 1), "duplicate refuses");
+        // The producer's exact shape decodes (byte-stable consume).
+        let d = cells_of_checked(&intent(term(vec![req("In", &["on-demand"])])));
+        assert_eq!(d.refused, 0);
+        assert_eq!(d.cells, vec![Cell("h".into(), CapacityType::OnDemand)]);
+        // The shared alphabet's wire token now decodes here too (the
+        // one-law consequence: the controller accepts exactly what
+        // the scheduler accepts; the producer never emits "od" on
+        // this wire, so no production behavior shifts).
+        let d = cells_of_checked(&intent(term(vec![req("In", &["od"])])));
+        assert_eq!(d.refused, 0);
+        assert_eq!(d.cells, vec![Cell("h".into(), CapacityType::OnDemand)]);
+    }
 
     fn nc(name: &str, registered: bool) -> NodeClaim {
         // `Condition` has non-Default `last_transition_time` (Time);

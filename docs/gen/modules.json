@@ -364,6 +364,16 @@
       "doc": "Proto-agnostic gRPC helpers shared across rio binaries."
     },
     {
+      "path": "k8s/",
+      "depth": 0,
+      "doc": ""
+    },
+    {
+      "path": "k8s/capacity_term.rs",
+      "depth": 1,
+      "doc": "The ONE typed decoder for the `(hw_class_names, node_affinity)` wire grammar's capacity requirement — shared by every consumer of the selector-term alphabet (bug_063, R25: one wire grammar, ONE decode law)."
+    },
+    {
       "path": "k8s.rs",
       "depth": 0,
       "doc": "k8s/nix interop helpers shared across the workspace."

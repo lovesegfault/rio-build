@@ -1830,6 +1830,27 @@ budget brake's rotation property upstream of the mint.
   operator trail as the dropping siblings (warn +
   #(refs.metric)("rio_controller_nodeclaim_budget_starved_total")).
 ]
+#r("ctrl.nodeclaim.one-term-decoder")[
+  The `(hw_class_names, node_affinity)` capacity grammar has ONE
+  typed decoder --- `rio_common::k8s::capacity_term`, total over the
+  multiplicity × operator × arity product with typed refusals --- and
+  every consumer MUST decode through it: the scheduler's arm decode
+  and the controller's placement decode both delegate, and a
+  production consult that adjudicates the capacity key outside the
+  shared decoder is a census red, with content-keyed exception rows
+  frozen shrink-only (the intent-cells annotation render's
+  verbatim-token lane is the one standing row, its re-parse
+  validated through the shared `WireCapacity` alphabet).
+]
+Rationale (bug_063, the R25 instance): merged_bug_039 hardened the
+scheduler's decoder against the `find().first()` peek --- no
+operator/duplicate/arity check, `NotIn` decoding to its inverse with
+`refused == 0` --- and merged_bug_006's close rebuilt the condemned
+template cross-crate ONE DAY later in `cells_of_checked`,
+structurally bypassing the `DecodeRefused` skew defense on the
+NodeClaim-minting path. Single-site hardening does not survive
+template reuse; one decode law with a derived consult census does.
+
 Rationale (live_049 L1, the parallel-ramp verdict): the 208-claim peak
 ramped at 18 ticks x 8/cell x \~1.44 slots/claim with demand drained
 BEFORE the budget crossing --- the flat cap stretched the ramp while

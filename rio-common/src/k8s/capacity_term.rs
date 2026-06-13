@@ -6,7 +6,7 @@
 //! The producer (`rio-scheduler::sla::solve::cells_to_selector_terms`)
 //! emits exactly ONE `karpenter.sh/capacity-type` requirement per
 //! term, operator `In`, single-valued, value from the shared
-//! [`WireCapacity`] alphabet. This decoder is a TOTAL match over the
+//! [`WireCapacity`](crate::cell_wire::WireCapacity)(crate::cell_wire::WireCapacity) alphabet. This decoder is a TOTAL match over the
 //! multiplicity × operator × arity product of that shape —
 //! merged_bug_039 hardened the scheduler's consumer
 //! (`decode_capacity_requirement`) against the
@@ -18,12 +18,12 @@
 //! hardening cannot survive template reuse, so the decode law now has
 //! one home and both planes delegate.
 //!
-//! Refusals are TYPED, never truncations ([`CapacityTermDefect`], a
+//! Refusals are TYPED, never truncations ([`CapacityTermDefect`](crate::k8s::capacity_term::CapacityTermDefect), a
 //! closed alphabet — R14): consumers fold the partition into their
-//! own refusal lanes ([`CapacityTermDefect::is_structural`] splits
+//! own refusal lanes ([`CapacityTermDefect::is_structural`](crate::k8s::capacity_term::CapacityTermDefect::is_structural)(crate::k8s::capacity_term::CapacityTermDefect::is_structural) splits
 //! the scheduler's `ArmEchoSkewed` pairing lanes from its
 //! `PlaneEntryUndecodable` shape lanes;
-//! [`CapacityTermDefect::render`] reproduces the scheduler's refusal
+//! [`CapacityTermDefect::render`](crate::k8s::capacity_term::CapacityTermDefect::render)(crate::k8s::capacity_term::CapacityTermDefect::render) reproduces the scheduler's refusal
 //! strings byte-for-byte so the delegation is reader-invisible).
 
 use crate::cell_wire::WireCapacity;
@@ -124,6 +124,7 @@ impl CapacityTermDefect {
 /// (`"spot"` / `"od"` / `"on-demand"`). Total over the
 /// multiplicity × operator × arity product — every off-shape face is
 /// a typed refusal, never a peek.
+// r[impl ctrl.nodeclaim.one-term-decoder]
 pub fn decode_capacity_term<'a, I>(reqs: I) -> Result<WireCapacity, CapacityTermDefect>
 where
     I: IntoIterator<Item = TermRequirement<'a>>,
