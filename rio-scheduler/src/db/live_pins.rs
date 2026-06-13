@@ -617,6 +617,10 @@ mod registration_writer_census {
             include_str!("../actor/tests/mbt_materialization.rs"),
         ),
         (
+            "actor/tests/mbt_openattempts.rs",
+            include_str!("../actor/tests/mbt_openattempts.rs"),
+        ),
+        (
             "actor/tests/merge.rs",
             include_str!("../actor/tests/merge.rs"),
         ),
@@ -744,6 +748,10 @@ mod registration_writer_census {
         (
             "db/tests/materialization.rs",
             include_str!("../db/tests/materialization.rs"),
+        ),
+        (
+            "db/tests/mbt_fence.rs",
+            include_str!("../db/tests/mbt_fence.rs"),
         ),
         ("db/tests/mod.rs", include_str!("../db/tests/mod.rs")),
         (
