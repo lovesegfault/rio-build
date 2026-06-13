@@ -46,11 +46,17 @@ pub struct MergeResult {
     /// Rollback removes interest only from these (not from nodes where
     /// build_id was already present from a prior merge).
     pub interest_added: Vec<DrvHash>,
-    /// Subset of `newly_inserted` that were pre-existing retriable nodes
-    /// (`Cancelled`/`Failed`/`DependencyFailed`/`Poisoned`-under-limit)
-    /// removed and reinserted fresh by the resubmit-retry path. Surfaced
-    /// so the actor can `db.clear_poison` them — `batch_upsert_derivations`'
-    /// ON CONFLICT does not touch `poisoned_at`/`failed_builders`.
+    /// Subset of `newly_inserted` that mint a fresh demand epoch this
+    /// merge: pre-existing mintable nodes (the retriable band
+    /// `Cancelled`/`Failed`/`DependencyFailed`/`Poisoned`-under-limit,
+    /// any-merge; plus the bug_058 verdict-free band
+    /// `Created`/`Queued`/`Ready`, root-keyed) removed and reinserted
+    /// fresh by the resubmit-reset path, and fresh inserts that
+    /// consumed a `ClearPoison` epoch floor. Surfaced so the actor can
+    /// append their `resubmit_reset` ledger rows and `db.clear_poison`
+    /// them — `batch_upsert_derivations`' ON CONFLICT does not touch
+    /// `poisoned_at`/`failed_builders` (a no-op for the never-poisoned
+    /// band members).
     pub reset_on_resubmit: Vec<DrvHash>,
     /// Full prior state of each retriable node destructively removed by
     /// the resubmit-retry path. `rollback_merge` re-inserts these AFTER
@@ -75,6 +81,10 @@ pub struct MergeResult {
     /// rollback removes the former wholesale and restores the latter's
     /// full prior state.
     pub contributions_recorded: Vec<(DrvHash, Option<Vec<String>>)>,
+    /// bug_058: `ClearPoison` demand-epoch floors this merge's fresh
+    /// inserts consumed (hash, floor). Rollback re-parks them so a
+    /// failed merge does not eat the post-clear bump.
+    pub floors_consumed: Vec<(String, u32)>,
 }
 
 /// Result of [`DerivationDag::remove_build_interest_and_reap`].
@@ -121,6 +131,22 @@ pub struct DerivationDag {
     /// SLA `solve_intent_for` + `resource_floor` clamp own initial
     /// sizing now. Strip-only.
     soft_features: Vec<String>,
+    /// bug_058: demand-epoch floors for nodes removed by `ClearPoison`
+    /// (admin lane). The clear bumps the durable `poison_cleared` row
+    /// to `cycles + 1` and parks the same value here; the next merge's
+    /// fresh insert consumes it as the starting `resubmit_cycles`, so
+    /// the first post-clear `SpawnIntent` presents a cycle no
+    /// controller latch has ever observed (the change-keyed gave-up
+    /// decay fires on the FIRST post-clear observation — the
+    /// rewind-to-0 equality fixed point is dead). Entries are consumed
+    /// at the next merge of the hash; the map is bounded by admin
+    /// clears of never-resubmitted drvs within one leader tenure.
+    /// In-memory only: a failover inside the clear→resubmit window
+    /// loses the floor and the re-insert starts at 0 — bounded
+    /// degradation, because the verdict-free band keeps explicit
+    /// resubmission itself a total epoch producer (one extra resubmit
+    /// escapes; never a fixed point).
+    resubmit_floors: HashMap<String, u32>,
 }
 
 impl DerivationDag {
@@ -134,6 +160,21 @@ impl DerivationDag {
     /// and the merge path read this. No-op if called with an empty vec.
     pub fn set_soft_features(&mut self, soft: Vec<String>) {
         self.soft_features = soft;
+    }
+
+    /// bug_058: park a demand-epoch floor for a node the `ClearPoison`
+    /// lane just removed. The next merge's fresh insert of `drv_hash`
+    /// starts at `floor` instead of 0 (and appends the corresponding
+    /// `resubmit_reset` ledger row, making the floor durable from that
+    /// point on). See the `resubmit_floors` field doc for the bounds.
+    pub fn note_resubmit_floor(&mut self, drv_hash: &str, floor: u32) {
+        self.resubmit_floors.insert(drv_hash.to_string(), floor);
+    }
+
+    /// Test-only: the parked floor for a hash, if any.
+    #[cfg(test)]
+    pub(crate) fn resubmit_floor(&self, drv_hash: &str) -> Option<u32> {
+        self.resubmit_floors.get(drv_hash).copied()
     }
 
     // r[impl sched.dispatch.soft-features+2]
@@ -305,6 +346,17 @@ impl DerivationDag {
         let mut removed_retriable: Vec<(DrvHash, DerivationState)> = Vec::new();
         // Pre-existing nodes whose empty traceparent was upgraded below.
         let mut traceparent_upgraded: Vec<DrvHash> = Vec::new();
+        // bug_058: `ClearPoison` floors consumed by fresh inserts below,
+        // with the consumed value — restored by `rollback_merge` so a
+        // failed merge leaves the floor parked for the next attempt.
+        let mut floors_consumed: Vec<(String, u32)> = Vec::new();
+
+        // bug_058: the roots of THIS submission — drv_paths no
+        // submitted edge lists as a child, i.e. the drvs the client
+        // explicitly asked to build. The verdict-free band's epoch
+        // mint is keyed on these (see `mints_epoch_on_resubmit`).
+        let submission_children: HashSet<&str> =
+            edges.iter().map(|e| e.child_drv_path.as_str()).collect();
 
         // Insert or update nodes
         for node in nodes {
@@ -318,31 +370,58 @@ impl DerivationDag {
                 .canonical(node.drv_hash.as_str())
                 .unwrap_or_else(|| node.drv_hash.as_str().into());
 
-            // Resubmit-retry: if the existing node is Cancelled or Failed,
-            // remove it so the else-branch below re-inserts fresh state and
-            // it flows through `compute_initial_states` → `newly_inserted`.
-            // Defense-in-depth: reap now removes Cancelled nodes for terminal
-            // builds, so the reset is only load-bearing during the
+            // Resubmit-reset (bug_058: the demand-epoch mint face): if
+            // the existing node's state mints for this submission —
+            // `mints_epoch_on_resubmit` = the retriable band
+            // (Cancelled/Failed/DependencyFailed + Poisoned-under-limit,
+            // any-merge) ∪ the verdict-free band (Created/Queued/Ready
+            // — the give-up-abandoned population, ROOT-keyed) — remove
+            // it so the else-branch below re-inserts fresh state with
+            // `resubmit_cycles + 1` and it flows through
+            // `compute_initial_states` → `newly_inserted`.
+            //
+            // The verdict-free band is the bug_058 close: the
+            // controller's gave-up latch decays only on a CHANGED
+            // observed `SpawnIntent.resubmit_cycle`, and this gate is
+            // the scheduler's ONLY cycle mint — with the retriable
+            // band alone, a drv that a verdict-free give-up left
+            // Queued/Ready merged interest-only at the SAME cycle on
+            // every resubmission ("same" was the only
+            // producer-emittable face for exactly the latched
+            // population), so the documented recovery action was
+            // structurally dead and the build hung silently forever.
+            // The band is ROOT-keyed (the predicate's doc derives
+            // why): explicit resubmission of THE drv mints; incidental
+            // closure overlap from a concurrent build never does.
+            //
+            // The `newly_inserted` guard keeps the band a CROSS-merge
+            // event: a submission carrying the same drv twice would
+            // otherwise re-reset the node its own first occurrence
+            // just inserted (the fresh insert is Created — in-band)
+            // and mint a spurious cycle.
+            //
+            // Cancelled defense-in-depth note (pre-band rationale,
+            // still true): reap removes Cancelled nodes for terminal
+            // builds, so that arm is only load-bearing during the
             // TERMINAL_CLEANUP_DELAY window or for nodes shared with a
-            // still-active build at cancel time. Without it, merge adds
-            // interest but `compute_initial_states` only iterates
-            // newly-inserted, and `handle_merge_dag`'s pre-existing-node
-            // match ignores Cancelled — the resubmitted build would hang.
+            // still-active build at cancel time.
             //
             // Edges are NOT scrubbed: `children`/`parents` are keyed by hash
             // string, so they stay valid across the remove+reinsert. The merge's
             // own edge loop re-adds this submission's edges idempotently.
             //
             // Prior interested_builds are carried over so any OTHER build
-            // that was stuck on this Cancelled node also benefits from the
+            // that was stuck on this node also benefits from the
             // reset. resubmit_cycles is carried over so the
             // Poisoned-resubmit bound (POISON_RESUBMIT_RETRY_LIMIT)
             // accumulates across resubmits — without this, every reset
             // would start at 0 and the bound would never fire (I-169).
-            let prior = if self
-                .nodes
-                .get(&drv_hash)
-                .is_some_and(DerivationState::is_retriable_on_resubmit)
+            let is_submission_root = !submission_children.contains(node.drv_path.as_str());
+            let prior = if !newly_inserted.contains(&drv_hash)
+                && self
+                    .nodes
+                    .get(&drv_hash)
+                    .is_some_and(|s| s.mints_epoch_on_resubmit(is_submission_root))
             {
                 let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
                 let carry = (
@@ -415,6 +494,7 @@ impl DerivationDag {
                             &contributions_recorded,
                             build_id,
                             removed_retriable,
+                            floors_consumed,
                         );
                         return Err(DagError::InvalidDrvPath {
                             path: node.drv_path.clone(),
@@ -437,19 +517,20 @@ impl DerivationDag {
                     .wanted_by_build
                     .insert(build_id, node.wanted_output_names.clone());
                 // Carry over interested_builds + resubmit_cycles from the
-                // removed retriable node (if any) — other stuck builds
+                // removed node (if any) — other stuck builds
                 // get the reset too; resubmit_cycles is INCREMENTED here
                 // (the reset itself IS the cycle event) so the
                 // POISON_RESUBMIT_RETRY_LIMIT bound accumulates.
                 // This is the documented in-memory seed of the new cycle
-                // (the one remaining direct write to a RetryState budget
-                // field after the T-1b.13 retirement): the old node
-                // object is destroyed here, so the new cycle index has
-                // to be carried in memory; `reset_row_for` then stamps
-                // it onto the `resubmit_reset` ledger row and the fold
-                // reproduces the same value from that row, so the cached
-                // view and the durable history agree from the first
-                // refresh onward.
+                // (this arm and the bug_058 ClearPoison-floor arm below
+                // are the two remaining direct writes to a RetryState
+                // budget field after the T-1b.13 retirement): the old
+                // node object is destroyed here, so the new cycle index
+                // has to be carried in memory; `reset_row_for` then
+                // stamps it onto the `resubmit_reset` ledger row and the
+                // fold reproduces the same value from that row, so the
+                // cached view and the durable history agree from the
+                // first refresh onward.
                 // retry.count stays at the fresh-state default (0) → full
                 // per-cycle max_retries budget restored on every resubmit.
                 // The prior per-build contributions are carried over too
@@ -463,6 +544,20 @@ impl DerivationDag {
                     for (b, w) in prior_contributions {
                         state.wanted_by_build.entry(b).or_insert(w);
                     }
+                    reset_on_resubmit.push(drv_hash.clone());
+                } else if let Some(floor) = self.resubmit_floors.remove(drv_hash.as_str()) {
+                    // bug_058: a `ClearPoison` removed this node and
+                    // parked the bumped cycle; the post-clear re-insert
+                    // starts there so the first post-clear
+                    // `SpawnIntent` presents a cycle no controller
+                    // latch has ever observed (the rewind-to-0
+                    // equality fixed point is dead). Joining
+                    // `reset_on_resubmit` appends the `resubmit_reset`
+                    // ledger row carrying this value, so the floor is
+                    // durable from here on (the suffix loader cuts at
+                    // that row and the fold's seed reproduces it).
+                    state.retry.resubmit_cycles = floor;
+                    floors_consumed.push((drv_hash.to_string(), floor));
                     reset_on_resubmit.push(drv_hash.clone());
                 }
                 state.traceparent = submitter_traceparent.to_string();
@@ -538,6 +633,7 @@ impl DerivationDag {
                     &contributions_recorded,
                     build_id,
                     removed_retriable,
+                    floors_consumed,
                 );
                 return Err(DagError::CycleDetected);
             }
@@ -551,6 +647,7 @@ impl DerivationDag {
             removed_retriable,
             traceparent_upgraded,
             contributions_recorded,
+            floors_consumed,
         })
     }
 
@@ -642,7 +739,15 @@ impl DerivationDag {
         contributions_recorded: &[(DrvHash, Option<Vec<String>>)],
         build_id: Uuid,
         removed_retriable: Vec<(DrvHash, DerivationState)>,
+        floors_consumed: Vec<(String, u32)>,
     ) {
+        // bug_058: re-park ClearPoison floors the failed merge's fresh
+        // inserts consumed — the next merge of the hash must still
+        // start at the post-clear bump.
+        for (hash, floor) in floors_consumed {
+            self.resubmit_floors.insert(hash, floor);
+        }
+
         // Remove newly-inserted edges
         for (parent, child) in new_edges {
             if let Some(children) = self.children.get_mut(parent) {

@@ -276,6 +276,51 @@ impl DerivationStatus {
         )
     }
 
+    /// bug_058: the VERDICT-FREE band — states with no attempt in
+    /// flight and no terminal verdict, which an explicit resubmission
+    /// MUST also treat as a demand-epoch event (`dag::merge` resets
+    /// them with `resubmit_cycles + 1`, exactly as the retriable band).
+    ///
+    /// Why: the controller's gave-up latch (verdict-free Job deaths ≥
+    /// the give-up budget) decays only on a CHANGED observed
+    /// `SpawnIntent.resubmit_cycle`. A verdict-free give-up leaves the
+    /// drv exactly here — `Queued`/`Ready`, no pod, no verdict — and
+    /// the pre-fix mint gate ([`Self::is_retriable_on_resubmit`] alone)
+    /// could never mint a new cycle for this band: "same" was the only
+    /// producer-emittable face for precisely the population the latch
+    /// captures, so the documented recovery action (resubmit) was
+    /// structurally dead and the build hung silently forever.
+    ///
+    /// `Created` joins the band for the recovery-orphan face: recovery
+    /// loads non-terminal rows, and a post-`ClearPoison` node that was
+    /// never resubmitted recovers at `created` with no active build —
+    /// the recompute pass skips it, and only a band reset
+    /// (remove + re-insert through `compute_initial_states`) can ever
+    /// move it again. A pre-existing `Created` node is unreachable on
+    /// the no-failover path (every successful merge computes initial
+    /// states), so the arm is vacuous there and load-bearing after
+    /// failover.
+    ///
+    /// Exhaustive match, zero wildcard arms (R14): every status is
+    /// classified here, so a new variant fails to compile until it
+    /// states its band membership. The full classification (with the
+    /// not-mintable reasons) is [`DerivationState::resubmit_disposition`].
+    pub fn is_giveup_abandoned(self) -> bool {
+        match self {
+            // The verdict-free band: nothing in flight, nothing served.
+            Self::Created | Self::Queued | Self::Ready => true,
+            // An attempt is in flight — its verdict owns the next
+            // epoch event (reset here would orphan the live attempt).
+            Self::Assigned | Self::Running => false,
+            // The retriable band — already mintable via
+            // `is_retriable_on_resubmit` (status core) or the bounded
+            // Poisoned arm (state level), never through this band.
+            Self::Cancelled | Self::Failed | Self::DependencyFailed | Self::Poisoned => false,
+            // Terminal-served: the cache-hit lane answers resubmits.
+            Self::Completed | Self::Skipped => false,
+        }
+    }
+
     // r[impl sched.state.transitions]
     // r[impl sched.state.terminal-idempotent+2]
     // r[impl sched.state.poisoned-ttl]
@@ -1307,6 +1352,53 @@ pub enum ReleaseOutcome {
     AlreadyReleased(DerivationStatus),
 }
 
+/// bug_058: which mint band admits a state to the resubmit-reset
+/// gate — the layer record the producer-reachability census walks
+/// (so the status core and the state wrapper cannot silently
+/// diverge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochMintBand {
+    /// The pre-existing reset semantics: the status three-class core
+    /// (`Cancelled`/`Failed`/`DependencyFailed`) plus the bounded
+    /// `Poisoned` arm (state level — needs `retry.resubmit_cycles`).
+    Retriable,
+    /// The verdict-free band (`Created`/`Queued`/`Ready` — the
+    /// give-up-abandoned population): no attempt in flight, no
+    /// terminal verdict. Joined the mint alphabet at the bug_058
+    /// close so explicit resubmission is a real demand-epoch event
+    /// for exactly the population the controller's gave-up latch
+    /// captures.
+    VerdictFree,
+}
+
+/// bug_058: the total resubmit classification — every
+/// [`DerivationStatus`] maps to exactly one arm (zero wildcards,
+/// R14). The not-mintable arms name their exit owner, so the
+/// reachability argument ("the documented recovery action reaches
+/// every latched configuration") is walkable: `MintsEpoch` exits via
+/// the resubmit mint itself; `BoundedRefusal` via `ClearPoison`
+/// (which bumps, never rewinds — the equality fixed point died with
+/// it) or the 24h TTL; `InFlightVerdictPending` via the live
+/// attempt's verdict; `ServedTerminal` needs no exit (no spawn
+/// demand remains to latch on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResubmitDisposition {
+    /// Explicit resubmission removes + re-inserts the node with
+    /// `resubmit_cycles + 1` — a fresh, producer-mintable demand
+    /// epoch.
+    MintsEpoch(EpochMintBand),
+    /// An attempt is in flight; its verdict owns the next epoch
+    /// event.
+    InFlightVerdictPending,
+    /// Terminal with servable outputs — the cache-hit /
+    /// stale-completed-verify lanes serve resubmissions.
+    ServedTerminal,
+    /// `Poisoned` at/over `POISON_RESUBMIT_RETRY_LIMIT`: the bounded
+    /// refusal whose documented overrides are `ClearPoison` and the
+    /// 24h TTL.
+    BoundedRefusal,
+}
+
 impl DerivationState {
     /// THE stale-reset destruction site (merged_bug_257): clear
     /// `output_paths`, returning the non-empty, still-wanted realized
@@ -1939,6 +2031,101 @@ impl DerivationState {
         self.status.is_retriable_on_resubmit()
             || (self.status == DerivationStatus::Poisoned
                 && self.retry.resubmit_cycles < POISON_RESUBMIT_RETRY_LIMIT)
+    }
+
+    /// bug_058: the resubmit MINT union — can the producer mint a
+    /// fresh demand epoch for this state at all? Union of the
+    /// retriable band ([`Self::is_retriable_on_resubmit`] — the
+    /// status three-class core plus the bounded `Poisoned` arm) and
+    /// the verdict-free band ([`DerivationStatus::is_giveup_abandoned`]
+    /// — the give-up-abandoned population). With the union total over
+    /// every latchable state, the controller's gave-up latch always
+    /// has a producer-mintable fresh face to decay on (R30's
+    /// producer-reachability face: the exit edge's guard is
+    /// satisfiable from EVERY latched configuration).
+    ///
+    /// Derived single-source: this is `resubmit_disposition()`
+    /// collapsed to its mintability bit — the census walks both
+    /// layers and the disposition so none of the three can silently
+    /// diverge. The merge gate consumes the keyed form,
+    /// [`Self::mints_epoch_on_resubmit`].
+    pub fn is_resubmit_epoch_mintable(&self) -> bool {
+        matches!(
+            self.resubmit_disposition(),
+            ResubmitDisposition::MintsEpoch(_)
+        )
+    }
+
+    /// bug_058: the `dag::merge` reset gate's callee — whether THIS
+    /// submission resets the node and mints `resubmit_cycles + 1`.
+    ///
+    /// `explicit_root` = the node is a root of the submission (no
+    /// submitted edge lists its drv as a child) — i.e. the drv the
+    /// client explicitly asked to build, which is exactly the
+    /// documented recovery action's shape ("a resubmission of THE
+    /// drv"; the `RespawnGiveUp` K8s Event names the latched drv).
+    ///
+    /// The retriable band mints on ANY merge that touches the node
+    /// (dead states; revival-on-any-touch is the long-standing
+    /// semantics, and their transient windows bound the
+    /// `resubmit_cycles` the overlap can mint). The verdict-free band
+    /// mints ROOT-KEYED only: `Queued`/`Ready` are the PERMANENT
+    /// states of every healthy shared dependency, so an any-merge
+    /// band reset would fire on every concurrent-build closure
+    /// overlap — wiping per-cycle retry budgets and inflating
+    /// `resubmit_cycles` past `POISON_RESUBMIT_RETRY_LIMIT` for hot
+    /// shared deps (a node poisoning later would be refused its
+    /// FIRST documented poison-resubmit — I-169 inverted). Root-keyed,
+    /// the mint fires for exactly the documented operator action and
+    /// never for incidental overlap.
+    pub fn mints_epoch_on_resubmit(&self, explicit_root: bool) -> bool {
+        match self.resubmit_disposition() {
+            ResubmitDisposition::MintsEpoch(EpochMintBand::Retriable) => true,
+            ResubmitDisposition::MintsEpoch(EpochMintBand::VerdictFree) => explicit_root,
+            ResubmitDisposition::InFlightVerdictPending
+            | ResubmitDisposition::ServedTerminal
+            | ResubmitDisposition::BoundedRefusal => false,
+        }
+    }
+
+    /// bug_058: the TOTAL resubmit classification over the status
+    /// alphabet — every status is exactly one disposition, zero
+    /// wildcard arms (R14). The mint gate consumes the collapsed form
+    /// ([`Self::is_resubmit_epoch_mintable`]); tests and the
+    /// producer-reachability census consume this one.
+    pub fn resubmit_disposition(&self) -> ResubmitDisposition {
+        use DerivationStatus as S;
+        match self.status {
+            // The verdict-free band (give-up-abandoned population).
+            S::Created | S::Queued | S::Ready => {
+                ResubmitDisposition::MintsEpoch(EpochMintBand::VerdictFree)
+            }
+            // The status-level retriable core.
+            S::Cancelled | S::Failed | S::DependencyFailed => {
+                ResubmitDisposition::MintsEpoch(EpochMintBand::Retriable)
+            }
+            // The bounded Poisoned arm — the one classification that
+            // NEEDS the state level (`retry.resubmit_cycles` is
+            // invisible to the status core, whose own doc defers
+            // Poisoned upward).
+            S::Poisoned => {
+                if self.retry.resubmit_cycles < POISON_RESUBMIT_RETRY_LIMIT {
+                    ResubmitDisposition::MintsEpoch(EpochMintBand::Retriable)
+                } else {
+                    ResubmitDisposition::BoundedRefusal
+                }
+            }
+            // An attempt is in flight; its verdict (completion,
+            // failure, timeout-cancel) is the next epoch event —
+            // resetting here would orphan the live attempt's
+            // exec_id/claim_nonce against the executor's report.
+            S::Assigned | S::Running => ResubmitDisposition::InFlightVerdictPending,
+            // Terminal with outputs servable: the cache-hit lane
+            // serves the resubmission (or stale-completed-verify
+            // resets it on GC'd outputs); no spawn demand remains for
+            // a latch to gate.
+            S::Completed | S::Skipped => ResubmitDisposition::ServedTerminal,
+        }
     }
 
     /// Append one committed attempt-ledger row's in-memory mirror to

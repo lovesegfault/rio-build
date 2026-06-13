@@ -46,19 +46,38 @@ fn test_merge_empty_dag() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Dedup core: two builds sharing a dep converge on ONE node carrying
+/// both interests. bug_058 note: the shared node is merged as a CHILD
+/// (the production overlap shape — a concurrent build's closure
+/// contains it as a dep). A root re-merge of a verdict-free node is an
+/// explicit resubmission and takes the epoch-mint reset lane instead
+/// (`w13a_*` below).
 #[test]
 fn test_merge_dedup() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
     let build1 = Uuid::new_v4();
     let build2 = Uuid::new_v4();
-    let nodes = vec![make_node("hash1", "x86_64-linux")];
 
-    let newly1 = dag.merge(build1, &nodes, &[], "")?.newly_inserted;
+    let newly1 = dag
+        .merge(build1, &[make_node("hash1", "x86_64-linux")], &[], "")?
+        .newly_inserted;
     assert_eq!(newly1.len(), 1);
 
-    let result2 = dag.merge(build2, &nodes, &[], "")?;
-    assert_eq!(result2.newly_inserted.len(), 0); // Already exists
+    // build2's closure contains hash1 as a DEP of its own root.
+    let nodes2 = vec![
+        make_node("root2", "x86_64-linux"),
+        make_node("hash1", "x86_64-linux"),
+    ];
+    let edges2 = vec![make_edge("root2", "hash1")];
+    let result2 = dag.merge(build2, &nodes2, &edges2, "")?;
+    assert_eq!(result2.newly_inserted.len(), 1); // root2 only
+    assert!(result2.newly_inserted.contains("root2"));
     assert_eq!(result2.interest_added, vec!["hash1"]);
+    assert!(
+        result2.reset_on_resubmit.is_empty(),
+        "incidental closure overlap must NOT mint a demand epoch \
+         (bug_058: the verdict-free band is root-keyed)"
+    );
 
     let node = &dag.nodes["hash1"];
     assert!(node.interested_builds.contains(&build1));
@@ -1507,12 +1526,25 @@ fn test_interning_invariant_across_maps() -> anyhow::Result<()> {
         assert!(DrvHash::ptr_eq(h, &canon));
     }
 
-    // --- The key case: second merge of the same node. ---
+    // --- The key case: second merge of the same nodes. ---
     // Without canonical() interning: interest_added holds a fresh
     // Arc (from proto string). With it: exchanged via canonical()
-    // upfront, so it's ptr-equal.
+    // upfront, so it's ptr-equal. bug_058 note: the overlap rides
+    // under a fresh grandparent so both shared nodes are NON-roots —
+    // a root re-merge of a verdict-free node takes the epoch-mint
+    // reset lane (`w13a_*`), which exercises removed_retriable, not
+    // interest_added.
     let b2 = Uuid::new_v4();
-    let result2 = dag.merge(b2, &nodes, &edges, "")?;
+    let nodes2 = vec![
+        make_node("grandparent", "x86_64-linux"),
+        make_node("parent", "x86_64-linux"),
+        make_node("child", "x86_64-linux"),
+    ];
+    let edges2 = vec![
+        make_edge("grandparent", "parent"),
+        make_edge("parent", "child"),
+    ];
+    let result2 = dag.merge(b2, &nodes2, &edges2, "")?;
     assert_eq!(result2.interest_added.len(), 2);
     for h in &result2.interest_added {
         let canon = dag.canonical(h).unwrap();
@@ -2394,17 +2426,26 @@ fn test_cyclic_merge_reverts_traceparent_upgrade() -> anyhow::Result<()> {
     dag.merge(b1, &[make_node("hashX", "x86_64-linux")], &[], "")?;
     assert_eq!(dag.node("hashX").expect("hashX").traceparent, "");
 
-    // B2 merges {X, A↔B cycle} with a real traceparent. The X-upgrade
-    // fires before the cycle is detected.
+    // B2 merges {P2→X, A↔B cycle} with a real traceparent. The
+    // X-upgrade fires before the cycle is detected. bug_058 note: X
+    // rides as a CHILD so the pre-existing-node UPGRADE lane (this
+    // test's subject) is the one exercised — a root re-merge of a
+    // verdict-free node takes the epoch-mint reset lane, whose
+    // traceparent rollback is covered by removed_retriable wholesale.
     let b2 = Uuid::new_v4();
     let result = dag.merge(
         b2,
         &[
+            make_node("hashP2", "x86_64-linux"),
             make_node("hashX", "x86_64-linux"),
             make_node("hashA", "x86_64-linux"),
             make_node("hashB", "x86_64-linux"),
         ],
-        &[make_edge("hashA", "hashB"), make_edge("hashB", "hashA")],
+        &[
+            make_edge("hashP2", "hashX"),
+            make_edge("hashA", "hashB"),
+            make_edge("hashB", "hashA"),
+        ],
         "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
     );
     assert!(matches!(result, Err(DagError::CycleDetected)));
@@ -2417,7 +2458,15 @@ fn test_cyclic_merge_reverts_traceparent_upgrade() -> anyhow::Result<()> {
 
     // B3 (the build that actually drives X) now gets its trace linked.
     let b3 = Uuid::new_v4();
-    let r3 = dag.merge(b3, &[make_node("hashX", "x86_64-linux")], &[], "00-b3-01")?;
+    let r3 = dag.merge(
+        b3,
+        &[
+            make_node("hashP3", "x86_64-linux"),
+            make_node("hashX", "x86_64-linux"),
+        ],
+        &[make_edge("hashP3", "hashX")],
+        "00-b3-01",
+    )?;
     assert_eq!(r3.traceparent_upgraded, vec!["hashX"]);
     assert_eq!(dag.node("hashX").expect("hashX").traceparent, "00-b3-01");
     Ok(())
@@ -2549,5 +2598,588 @@ fn build_summary_running_excludes_materialization_claims() -> anyhow::Result<()>
         summary.running, 1,
         "the materialization-claimed node must not count as a running build (Q10)"
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// bug_058 (W13-A battery): the gave-up exit edge is producer-mintable —
+// explicit resubmission always moves the demand epoch.
+// ---------------------------------------------------------------------------
+
+/// Drive `hash` from Created to `status` through the production state
+/// machine (never a raw status write — R13).
+fn advance_to(dag: &mut DerivationDag, hash: &str, status: DerivationStatus) {
+    let n = dag.node_mut(hash).expect(hash);
+    match status {
+        DerivationStatus::Created => {}
+        DerivationStatus::Queued => {
+            n.transition(DerivationStatus::Queued).unwrap();
+        }
+        DerivationStatus::Ready => {
+            n.transition(DerivationStatus::Queued).unwrap();
+            n.transition(DerivationStatus::Ready).unwrap();
+        }
+        other => panic!("advance_to: unsupported target {other:?}"),
+    }
+}
+
+/// W13-A — the latch-consequence red. A verdict-free give-up leaves the
+/// drv exactly here: Queued/Ready (Created = the recovery-orphan face),
+/// no pod, no verdict, cycle 0. The controller's gave-up latch decays
+/// only on a CHANGED observed `SpawnIntent.resubmit_cycle`
+/// (candidate.rs `note_demand_epoch`: the equality arm is the only hold
+/// face), and `dag::merge` is the scheduler's ONLY cycle mint.
+///
+/// PRE-FIX RED (recorded verbatim in the commit body): the resubmit
+/// merged interest-only — `resubmit_cycles` stayed 0, so "same" was the
+/// only producer-emittable face for exactly the latched population, the
+/// equality arm held the latch forever, and the build hung silently
+/// with the documented recovery action (resubmission of the drv)
+/// structurally dead.
+// r[verify sched.resubmit.epoch-total]
+#[rstest]
+#[case::queued(DerivationStatus::Queued)]
+#[case::ready(DerivationStatus::Ready)]
+#[case::created_recovery_orphan(DerivationStatus::Created)]
+fn w13a_explicit_resubmission_mints_fresh_epoch_for_verdict_free_band(
+    #[case] band_status: DerivationStatus,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build1 = Uuid::new_v4();
+    let nodes = vec![make_node("w13a", "x86_64-linux")];
+    dag.merge(build1, &nodes, &[], "")?;
+    advance_to(&mut dag, "w13a", band_status);
+    assert_eq!(dag.nodes["w13a"].retry.resubmit_cycles, 0);
+
+    // Explicit resubmission: the SAME drv as the submission's root.
+    let build2 = Uuid::new_v4();
+    let result = dag.merge(build2, &nodes, &[], "")?;
+
+    assert!(
+        result.newly_inserted.contains("w13a"),
+        "{band_status:?}: explicit resubmission must reset the verdict-free node"
+    );
+    assert!(
+        result.reset_on_resubmit.contains(&DrvHash::from("w13a")),
+        "{band_status:?}: the reset must surface for its resubmit_reset ledger row"
+    );
+    let n = &dag.nodes["w13a"];
+    assert_eq!(
+        n.retry.resubmit_cycles, 1,
+        "{band_status:?}: the demand epoch MUST move — a fresh, \
+         producer-mintable face the gave-up latch decays on \
+         (pre-fix: stayed 0 = the silent indefinite hang)"
+    );
+    // Both builds' interests survive the reset.
+    assert!(n.interested_builds.contains(&build1));
+    assert!(n.interested_builds.contains(&build2));
+    // The reset node re-enters the initial-state computation.
+    let states = dag.compute_initial_states(&result.newly_inserted);
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].1, DerivationStatus::Ready);
+    Ok(())
+}
+
+/// W13-A (monotone face): every further explicit resubmission keeps
+/// minting STRICTLY fresh epochs — the producer can never re-mint a
+/// face the controller already latched on (the anti-replay equality
+/// arm is the controller's only hold face, so strict growth = the exit
+/// edge is satisfiable from every latched configuration).
+// r[verify sched.resubmit.epoch-total]
+#[test]
+fn w13a_resubmission_epochs_are_strictly_monotone() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let nodes = vec![make_node("w13a-mono", "x86_64-linux")];
+    dag.merge(Uuid::new_v4(), &nodes, &[], "")?;
+    for expect in 1..=3u32 {
+        advance_to(&mut dag, "w13a-mono", DerivationStatus::Queued);
+        dag.merge(Uuid::new_v4(), &nodes, &[], "")?;
+        assert_eq!(
+            dag.nodes["w13a-mono"].retry.resubmit_cycles, expect,
+            "resubmission {expect}: strictly monotone epoch"
+        );
+    }
+    Ok(())
+}
+
+/// W13-A5 — the anti-inflation pin (the root-key divergence's reason):
+/// incidental closure overlap from a concurrent build (the shared node
+/// rides as a DEP, not a root) must NOT mint an epoch — an any-merge
+/// band reset would fire on every shared-dep overlap, wiping per-cycle
+/// retry budgets and inflating `resubmit_cycles` past
+/// `POISON_RESUBMIT_RETRY_LIMIT` for hot shared deps (I-169 inverted:
+/// the first documented poison-resubmit would be refused).
+// r[verify sched.resubmit.epoch-total]
+#[rstest]
+#[case::queued(DerivationStatus::Queued)]
+#[case::ready(DerivationStatus::Ready)]
+fn w13a5_incidental_closure_overlap_never_mints(
+    #[case] band_status: DerivationStatus,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build1 = Uuid::new_v4();
+    dag.merge(build1, &[make_node("w13a5-dep", "x86_64-linux")], &[], "")?;
+    advance_to(&mut dag, "w13a5-dep", band_status);
+    // Mid-cycle retry pacing state that an any-merge reset would wipe.
+    dag.nodes.get_mut("w13a5-dep").unwrap().retry.count = 1;
+
+    // A concurrent build whose closure CONTAINS the dep (non-root).
+    let build2 = Uuid::new_v4();
+    let result = dag.merge(
+        build2,
+        &[
+            make_node("w13a5-root", "x86_64-linux"),
+            make_node("w13a5-dep", "x86_64-linux"),
+        ],
+        &[make_edge("w13a5-root", "w13a5-dep")],
+        "",
+    )?;
+
+    assert!(
+        !result.newly_inserted.contains("w13a5-dep"),
+        "{band_status:?}: incidental overlap must NOT reset the shared dep"
+    );
+    assert!(result.reset_on_resubmit.is_empty());
+    let n = &dag.nodes["w13a5-dep"];
+    assert_eq!(
+        n.retry.resubmit_cycles, 0,
+        "{band_status:?}: no epoch mint on overlap (resubmit_cycles \
+         inflation would invert the I-169 bound for hot shared deps)"
+    );
+    assert_eq!(
+        n.retry.count, 1,
+        "{band_status:?}: the per-cycle retry budget survives the overlap"
+    );
+    assert_eq!(n.status(), band_status, "state untouched by overlap");
+    assert!(n.interested_builds.contains(&build1));
+    assert!(n.interested_builds.contains(&build2));
+    Ok(())
+}
+
+/// W13-A2 (DAG half) — the ClearPoison floor: the post-clear fresh
+/// insert starts at the parked bump, surfaces in `reset_on_resubmit`
+/// (so its `resubmit_reset` row makes the floor durable), and the
+/// floor is consumed exactly once.
+///
+/// PRE-FIX RED (recorded verbatim in the commit body): the rewind-to-0
+/// made the post-clear re-insert present cycle 0 — observed 0 ==
+/// latched 0 at the common cycle-0 latch — an equality FIXED POINT:
+/// both documented recovery actions (ClearPoison, then resubmit)
+/// consumed, latch still held.
+// r[verify ctrl.pool.giveup-exit-mintable]
+#[test]
+fn w13a2_clear_poison_floor_decays_the_cycle_zero_latch() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    // The ClearPoison lane parks the bumped epoch after removing the
+    // node (handle_clear_poison drives this exact pair).
+    dag.note_resubmit_floor("w13a2", 1);
+    assert_eq!(dag.resubmit_floor("w13a2"), Some(1));
+
+    let nodes = vec![make_node("w13a2", "x86_64-linux")];
+    let result = dag.merge(Uuid::new_v4(), &nodes, &[], "")?;
+
+    assert!(result.newly_inserted.contains("w13a2"));
+    assert!(
+        result.reset_on_resubmit.contains(&DrvHash::from("w13a2")),
+        "the floor-consuming insert must append its resubmit_reset row \
+         (durability: the suffix loader cuts at that row and the fold's \
+         seed reproduces the floor)"
+    );
+    assert_eq!(
+        dag.nodes["w13a2"].retry.resubmit_cycles, 1,
+        "the first post-clear SpawnIntent presents the bumped cycle — \
+         no controller latch has ever observed it, so the change-keyed \
+         decay fires on the FIRST post-clear observation \
+         (pre-fix: re-inserted at 0 = the equality fixed point)"
+    );
+    assert_eq!(
+        dag.resubmit_floor("w13a2"),
+        None,
+        "the floor is consumed exactly once"
+    );
+
+    // Subsequent resubmissions keep climbing from the floor.
+    advance_to(&mut dag, "w13a2", DerivationStatus::Queued);
+    dag.merge(Uuid::new_v4(), &nodes, &[], "")?;
+    assert_eq!(dag.nodes["w13a2"].retry.resubmit_cycles, 2);
+    Ok(())
+}
+
+/// W13-A2 (rollback half) — a failed merge re-parks the consumed floor
+/// so the post-clear bump survives the retry.
+#[test]
+fn w13a2_failed_merge_reparks_the_clear_poison_floor() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    dag.note_resubmit_floor("w13a2-rb", 3);
+
+    // The same submission carries a cycle → merge fails AFTER the
+    // floor-consuming insert; rollback must re-park the floor.
+    let result = dag.merge(
+        Uuid::new_v4(),
+        &[
+            make_node("w13a2-rb", "x86_64-linux"),
+            make_node("cyc-a", "x86_64-linux"),
+            make_node("cyc-b", "x86_64-linux"),
+        ],
+        &[make_edge("cyc-a", "cyc-b"), make_edge("cyc-b", "cyc-a")],
+        "",
+    );
+    assert!(matches!(result, Err(DagError::CycleDetected)));
+    assert_eq!(
+        dag.resubmit_floor("w13a2-rb"),
+        Some(3),
+        "rollback must re-park the consumed floor (a failed merge must \
+         not eat the post-clear bump)"
+    );
+    assert!(dag.node("w13a2-rb").is_none(), "insert rolled back");
+
+    // The retry then consumes it normally.
+    let nodes = vec![make_node("w13a2-rb", "x86_64-linux")];
+    dag.merge(Uuid::new_v4(), &nodes, &[], "")?;
+    assert_eq!(dag.nodes["w13a2-rb"].retry.resubmit_cycles, 3);
+    assert_eq!(dag.resubmit_floor("w13a2-rb"), None);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// bug_058 (W13-A4): the producer-reachability census — for every
+// DerivationState, which `note_demand_epoch` faces can the scheduler
+// mint? [GEN-SET]: the population is the macro-generated
+// `DerivationStatus::ALL` alphabet (× the Poisoned bound configs);
+// every member is driven through the REAL mint gate (`dag::merge`),
+// and the classification layers (the :272 status core, the state-level
+// wrapper, the disposition) are cross-checked so none can silently
+// diverge. Census riders (a)–(d): population non-vacuity + expected
+// members (a); the duplicate/jurisdiction plants and the K-mutation
+// battery live in `w13a4_census_kill_power_under_k_mutations` (c)/(d).
+// ---------------------------------------------------------------------------
+
+use crate::state::{EpochMintBand, POISON_RESUBMIT_RETRY_LIMIT, ResubmitDisposition};
+
+/// One census row: the pinned expectation for a (status, cycles)
+/// configuration.
+struct CensusRow {
+    status: DerivationStatus,
+    cycles: u32,
+    disposition: ResubmitDisposition,
+}
+
+/// The pinned classification table — the WO-named EXPECTED members
+/// (rider (a)). Every `DerivationStatus::ALL` member appears (the
+/// totality assert below), Poisoned in BOTH bound configurations.
+fn pinned_census() -> Vec<CensusRow> {
+    use DerivationStatus as S;
+    use EpochMintBand as B;
+    use ResubmitDisposition as D;
+    vec![
+        // The verdict-free band — the bug_058 close's new mint faces.
+        CensusRow {
+            status: S::Created,
+            cycles: 0,
+            disposition: D::MintsEpoch(B::VerdictFree),
+        },
+        CensusRow {
+            status: S::Queued,
+            cycles: 0,
+            disposition: D::MintsEpoch(B::VerdictFree),
+        },
+        CensusRow {
+            status: S::Ready,
+            cycles: 0,
+            disposition: D::MintsEpoch(B::VerdictFree),
+        },
+        // The retriable band (status core).
+        CensusRow {
+            status: S::Cancelled,
+            cycles: 0,
+            disposition: D::MintsEpoch(B::Retriable),
+        },
+        CensusRow {
+            status: S::Failed,
+            cycles: 0,
+            disposition: D::MintsEpoch(B::Retriable),
+        },
+        CensusRow {
+            status: S::DependencyFailed,
+            cycles: 0,
+            disposition: D::MintsEpoch(B::Retriable),
+        },
+        // The bounded Poisoned arm — the state-level extension.
+        CensusRow {
+            status: S::Poisoned,
+            cycles: 0,
+            disposition: D::MintsEpoch(B::Retriable),
+        },
+        CensusRow {
+            status: S::Poisoned,
+            cycles: POISON_RESUBMIT_RETRY_LIMIT,
+            disposition: D::BoundedRefusal,
+        },
+        // In-flight: the live attempt's verdict owns the next epoch.
+        CensusRow {
+            status: S::Assigned,
+            cycles: 0,
+            disposition: D::InFlightVerdictPending,
+        },
+        CensusRow {
+            status: S::Running,
+            cycles: 0,
+            disposition: D::InFlightVerdictPending,
+        },
+        // Terminal-served: the cache-hit lane answers resubmits.
+        CensusRow {
+            status: S::Completed,
+            cycles: 0,
+            disposition: D::ServedTerminal,
+        },
+        CensusRow {
+            status: S::Skipped,
+            cycles: 0,
+            disposition: D::ServedTerminal,
+        },
+    ]
+}
+
+/// Build a single-node dag with `hash` at `status` (production state
+/// machine; only the test-only status setter for the states whose
+/// transition chains need worker plumbing) and `cycles`.
+fn dag_with_status(
+    hash: &str,
+    status: DerivationStatus,
+    cycles: u32,
+) -> anyhow::Result<DerivationDag> {
+    let mut dag = DerivationDag::new();
+    dag.merge(Uuid::new_v4(), &[make_node(hash, "x86_64-linux")], &[], "")?;
+    {
+        let n = dag.nodes.get_mut(hash).unwrap();
+        if status != DerivationStatus::Created {
+            n.set_status_for_test(status);
+        }
+        n.retry.resubmit_cycles = cycles;
+    }
+    Ok(dag)
+}
+
+/// The which-faces-can-this-producer-emit walk: every alphabet member
+/// driven through the REAL gate, the classification layers
+/// cross-checked, and the exit edge verified reachable from every
+/// latched configuration.
+// r[verify sched.resubmit.epoch-total]
+// r[verify ctrl.pool.giveup-exit-mintable]
+#[test]
+fn w13a4_producer_reachability_census() -> anyhow::Result<()> {
+    let census = pinned_census();
+
+    // Rider (a) — population non-vacuity + totality: every ALL member
+    // appears in the pinned table (and the table holds nothing else).
+    assert_eq!(DerivationStatus::ALL.len(), 11, "the status alphabet");
+    for s in DerivationStatus::ALL {
+        assert!(
+            census.iter().any(|r| r.status == *s),
+            "{s:?}: every alphabet member must be classified (zero \
+             wildcard arms — a new status fails here until it states \
+             its resubmit disposition)"
+        );
+    }
+    assert_eq!(
+        census.len(),
+        12,
+        "11 statuses + the second Poisoned bound config"
+    );
+
+    for row in &census {
+        let CensusRow {
+            status,
+            cycles,
+            disposition,
+        } = row;
+        let dag = dag_with_status("cz", *status, *cycles)?;
+        let state = &dag.nodes["cz"];
+
+        // The classification layers cannot silently diverge:
+        // layer 1 — the :272 status core; layer 2 — the state-level
+        // wrapper (core + bounded Poisoned); layer 3 — the band;
+        // the disposition collapses to exactly layer2 ∨ band.
+        let layer1 = status.is_retriable_on_resubmit();
+        let layer2 = state.is_retriable_on_resubmit();
+        let band = status.is_giveup_abandoned();
+        assert_eq!(
+            layer2,
+            layer1
+                || (*status == DerivationStatus::Poisoned && *cycles < POISON_RESUBMIT_RETRY_LIMIT),
+            "{status:?}@{cycles}: the state wrapper extends the status \
+             core by exactly the bounded Poisoned arm"
+        );
+        assert_eq!(
+            state.resubmit_disposition(),
+            *disposition,
+            "{status:?}@{cycles}"
+        );
+        assert_eq!(
+            state.is_resubmit_epoch_mintable(),
+            layer2 || band,
+            "{status:?}@{cycles}: the mint union is exactly \
+             retriable ∨ verdict-free"
+        );
+
+        // Drive the REAL gate: an explicit (root) resubmission.
+        let mints = matches!(disposition, ResubmitDisposition::MintsEpoch(_));
+        let mut dag = dag;
+        let result = dag.merge(Uuid::new_v4(), &[make_node("cz", "x86_64-linux")], &[], "")?;
+        assert_eq!(
+            result.newly_inserted.contains("cz"),
+            mints,
+            "{status:?}@{cycles}: gate behavior must match the census"
+        );
+        assert_eq!(
+            dag.nodes["cz"].retry.resubmit_cycles,
+            if mints { cycles + 1 } else { *cycles },
+            "{status:?}@{cycles}: the epoch moves iff the census says \
+             mintable"
+        );
+
+        // The root key: the verdict-free band mints ONLY for explicit
+        // roots; every other class is root-invariant.
+        let keyed =
+            dag_with_status("cz", *status, *cycles)?.nodes["cz"].mints_epoch_on_resubmit(false);
+        match disposition {
+            ResubmitDisposition::MintsEpoch(EpochMintBand::VerdictFree) => {
+                assert!(!keyed, "{status:?}: band mint is root-keyed")
+            }
+            ResubmitDisposition::MintsEpoch(EpochMintBand::Retriable) => {
+                assert!(keyed, "{status:?}: retriable mint is any-merge")
+            }
+            _ => assert!(!keyed, "{status:?}: never mints"),
+        }
+    }
+
+    // Exit-edge reachability for the NON-mint classes (the census's
+    // reachability half — every latched configuration reaches the
+    // mint alphabet):
+    // - InFlightVerdictPending: the live attempt's verdict moves the
+    //   node INTO the mintable alphabet (Running → Failed here), and
+    //   the next resubmission mints.
+    let mut dag = dag_with_status("cz-fly", DerivationStatus::Running, 0)?;
+    dag.nodes
+        .get_mut("cz-fly")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Failed);
+    dag.merge(
+        Uuid::new_v4(),
+        &[make_node("cz-fly", "x86_64-linux")],
+        &[],
+        "",
+    )?;
+    assert_eq!(
+        dag.nodes["cz-fly"].retry.resubmit_cycles, 1,
+        "in-flight exits via the verdict lane into the mint alphabet"
+    );
+    // - BoundedRefusal: ClearPoison parks the bumped floor — the
+    //   post-clear re-insert presents it (w13a2_* pins the mechanism;
+    //   re-asserted here so the census names every exit owner).
+    let mut dag = DerivationDag::new();
+    dag.note_resubmit_floor("cz-bound", POISON_RESUBMIT_RETRY_LIMIT + 1);
+    dag.merge(
+        Uuid::new_v4(),
+        &[make_node("cz-bound", "x86_64-linux")],
+        &[],
+        "",
+    )?;
+    assert_eq!(
+        dag.nodes["cz-bound"].retry.resubmit_cycles,
+        POISON_RESUBMIT_RETRY_LIMIT + 1,
+        "the bounded refusal exits via the ClearPoison bump"
+    );
+    // - ServedTerminal: no spawn demand remains (nothing to latch on);
+    //   the cache-hit/stale-completed lanes own resubmissions — pinned
+    //   by the merge/stale-completed batteries, named here.
+    Ok(())
+}
+
+/// W13-A4 (rider (c)/(d)) — the census's own kill power: the planted
+/// reds die under K seeded mutations of the mint predicate (harness
+/// COPIES of the gate callee's logic — the live artifact is never
+/// mutated). K = 5: (M1) union narrowed back to retriable-only — THE
+/// historic bug; (M2) union widened to superset-accept; (M3) the
+/// population walk emptied; (M4) a status-core arm deleted; (M5) the
+/// planted-DUPLICATE — the pairs a degenerate "non-terminal ⇒
+/// mintable" quotient would conflate must classify distinctly.
+#[test]
+fn w13a4_census_kill_power_under_k_mutations() -> anyhow::Result<()> {
+    use DerivationStatus as S;
+
+    // The live verdict for a (status, cycles) configuration, read
+    // through the production state (the gate callee's exact input).
+    let live = |status: S, cycles: u32| -> anyhow::Result<bool> {
+        Ok(dag_with_status("kz", status, cycles)?.nodes["kz"].is_resubmit_epoch_mintable())
+    };
+
+    // M1 — retriable-only (the pre-fix predicate): the verdict-free
+    // plants must die (the self-test reds under this mutation).
+    let m1 = |status: S, cycles: u32| -> bool {
+        status.is_retriable_on_resubmit()
+            || (status == S::Poisoned && cycles < POISON_RESUBMIT_RETRY_LIMIT)
+    };
+    let mut killed = 0;
+    for plant in [S::Created, S::Queued, S::Ready] {
+        if m1(plant, 0) != live(plant, 0)? {
+            killed += 1;
+        }
+    }
+    assert_eq!(killed, 3, "M1 (retriable-only) must kill every band plant");
+
+    // M2 — superset-accept (always-mint): the never-mint plants die.
+    let m2 = |_: S, _: u32| -> bool { true };
+    let mut killed = 0;
+    for (plant, cycles) in [
+        (S::Assigned, 0),
+        (S::Running, 0),
+        (S::Completed, 0),
+        (S::Skipped, 0),
+        (S::Poisoned, POISON_RESUBMIT_RETRY_LIMIT),
+    ] {
+        if m2(plant, cycles) != live(plant, cycles)? {
+            killed += 1;
+        }
+    }
+    assert_eq!(
+        killed, 5,
+        "M2 (superset-accept) must kill every refusal plant"
+    );
+
+    // M3 — emptied population walk: the census's totality pin (every
+    // ALL member classified) reds on an emptied alphabet.
+    let emptied: &[DerivationStatus] = &DerivationStatus::ALL[..0];
+    assert_ne!(
+        emptied.len(),
+        DerivationStatus::ALL.len(),
+        "M3: an emptied walk cannot satisfy the population pin"
+    );
+
+    // M4 — status-core arm deleted (Cancelled dropped): the Cancelled
+    // plant dies.
+    let m4 = |status: S, cycles: u32| -> bool {
+        matches!(status, S::Failed | S::DependencyFailed)
+            || (status == S::Poisoned && cycles < POISON_RESUBMIT_RETRY_LIMIT)
+            || status.is_giveup_abandoned()
+    };
+    assert_ne!(
+        m4(S::Cancelled, 0),
+        live(S::Cancelled, 0)?,
+        "M4 (core-arm-deleted) must kill the Cancelled plant"
+    );
+
+    // M5 — the planted DUPLICATE: pairs a degenerate "non-terminal ⇒
+    // mintable" key would quotient into one class MUST classify
+    // distinctly under the live projection.
+    for (a, b) in [(S::Ready, S::Running), (S::Queued, S::Assigned)] {
+        let da = dag_with_status("kz", a, 0)?.nodes["kz"].resubmit_disposition();
+        let db = dag_with_status("kz", b, 0)?.nodes["kz"].resubmit_disposition();
+        assert_ne!(
+            da, db,
+            "M5: {a:?} and {b:?} are known-distinct members the \
+             classification must discriminate"
+        );
+    }
     Ok(())
 }

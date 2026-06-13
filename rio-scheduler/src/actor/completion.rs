@@ -538,9 +538,15 @@ impl DagActor {
     /// Build a reset-event ledger row for `drv_hash`. `resubmit_cycle`
     /// is read from the node's CURRENT in-memory value (already
     /// incremented for a resubmit reset; already cleared for a
-    /// cache-hit clear); the poison-clear sites override it to 0 to
-    /// match the PG-side full reset. `None` when the node is unknown or
-    /// its merge has not committed.
+    /// cache-hit clear). The admin `ClearPoison` site BUMPS it to
+    /// `cycles + 1` (bug_058 — the demand-epoch floor the post-clear
+    /// re-insert presents, so the gave-up latch's change-keyed decay
+    /// fires on the first post-clear observation); the TTL-expiry
+    /// site still overrides it to 0 — a rewound face whose 0 == 0
+    /// presentation a cycle-0 latch holds on (anti-replay equality),
+    /// with the verdict-free band's explicit-resubmission mint as the
+    /// documented escape. `None` when the node is unknown or its
+    /// merge has not committed.
     pub(super) fn reset_row_for(
         &self,
         drv_hash: &DrvHash,
@@ -3886,7 +3892,9 @@ impl DagActor {
     ///
     /// In-mem: node removed from the DAG entirely — next submit re-inserts
     /// it fresh with full proto fields and runs it through
-    /// `compute_initial_states`. PG: `db.clear_poison()` sets
+    /// `compute_initial_states`; the re-insert's `resubmit_cycles`
+    /// starts at the parked demand-epoch floor (`cycles + 1` — bug_058,
+    /// see the reset-row comment below). PG: `db.clear_poison()` sets
     /// status='created', NULLs `poisoned_at`/`retry_count`/`failed_builders`.
     /// Surviving parents are closure-hole stamped and then re-evaluated
     /// (`reevaluate_removal_survivors` — settlement / promotion), so a
@@ -3909,13 +3917,28 @@ impl DagActor {
         // itself (PG-first, scrubs the durable exclusion set) is pinned
         // by `clearedPoisonClearsDurably` / `clearedPoisonScrubsExclusions`
         // in the model — this only ADDS a row; it must not reorder the
-        // clear. `resubmit_cycle = 0` mirrors the full PG reset.
+        // clear.
+        //
+        // bug_058: the row carries `cycles + 1` — a BUMP from the live
+        // value, never the old rewind-to-0. The controller's gave-up
+        // latch decays on a CHANGED observed `SpawnIntent
+        // .resubmit_cycle`; the rewind made the documented
+        // ClearPoison-then-resubmit recovery an equality FIXED POINT at
+        // the common cycle-0 latch (cleared row 0 → fresh re-insert at
+        // 0 → observed 0 == latched 0 → held forever). The bump is
+        // monotone over everything the controller can have observed
+        // for this node, so the FIRST post-clear observation decays the
+        // latch. The same value is parked as a DAG floor below so the
+        // post-clear re-insert actually presents it.
         let reset_row = self
             .reset_row_for(drv_hash, OutcomeClass::PoisonCleared, ReportingParty::Admin)
             .map(|mut r| {
-                r.resubmit_cycle = 0;
+                r.resubmit_cycle = r.resubmit_cycle.saturating_add(1);
                 r
             });
+        let epoch_floor = reset_row
+            .as_ref()
+            .map(|r| u32::try_from(r.resubmit_cycle).unwrap_or(u32::MAX));
         match self
             .record_reset_with_clear_poison(drv_hash, reset_row)
             .await
@@ -3953,6 +3976,16 @@ impl DagActor {
         let surviving_parents = self.dag.get_parents(drv_hash);
         self.prune_interested_keep_going(drv_hash);
         self.dag.remove_node(drv_hash);
+        // bug_058: park the bumped demand epoch so the next merge's
+        // fresh insert of this drv starts at it (in-memory floor; the
+        // committed `poison_cleared` row above carries the same value
+        // — the re-insert's own `resubmit_reset` row then makes it
+        // durable; a failover inside the clear→resubmit window
+        // degrades to the verdict-free band's explicit-resubmission
+        // mint, never to a fixed point).
+        if let Some(floor) = epoch_floor {
+            self.dag.note_resubmit_floor(drv_hash, floor);
+        }
         // r[impl sched.poison.clear-survivor-reevaluation+2]
         // Wake the surviving parents: promote Queued ones whose deps
         // are now (vacuously) satisfied; survivors with an unresolved

@@ -938,14 +938,20 @@ async fn test_topdown_stamp_skips_kept_node_whose_children_are_already_produced(
     );
 
     // R's children are all produced (⇒ Vouched) → the pruned arm
-    // must skip it; the reprobe lane still queues its job, with the
-    // non-doomed origin.
+    // must skip it; the substitution lane still queues its job, with
+    // a non-doomed origin. bug_058 note: B1 re-submits R as ROOT —
+    // an explicit resubmission — so the verdict-free band resets R
+    // into the newly-inserted lane and the job classifies
+    // `cache_opportunity` (the fresh-substitutable origin) instead of
+    // the pre-band `reprobe`; both are non-doomed, and the law under
+    // test (never pruned-origin for a produced-children keep) holds
+    // identically.
     let (origin,): (String,) =
         sqlx::query_as("SELECT origin FROM materialization_jobs WHERE drv_hash = 'tdc-r'")
             .fetch_one(&db.pool)
             .await?;
     assert_eq!(
-        origin, "reprobe",
+        origin, "cache_opportunity",
         "a kept node whose DAG children are already produced must not be \
          classified pruned-origin (its closure is in the store; from-source \
          remains valid)"

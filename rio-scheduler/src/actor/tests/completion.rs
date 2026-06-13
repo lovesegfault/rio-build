@@ -6868,3 +6868,85 @@ async fn infra_requeues_are_counted_with_their_charge_disposition() -> TestResul
     );
     Ok(())
 }
+
+/// W13-A2 (actor half, bug_058) — `ClearPoison` is never an epoch
+/// fixed point: the `poison_cleared` row carries `cycles + 1` (the
+/// BUMP, not the old rewind-to-0), the bumped value is parked as the
+/// DAG floor, and the post-clear resubmission re-inserts AT the floor
+/// — so the first post-clear `SpawnIntent` presents a cycle no
+/// controller latch has ever observed and the change-keyed gave-up
+/// decay fires on the FIRST post-clear observation.
+///
+/// PRE-FIX RED (recorded verbatim in the commit body): the rewind
+/// stamped 0 and the post-clear re-insert started at 0 — observed 0 ==
+/// latched 0 at the common cycle-0 latch — both documented recovery
+/// actions (ClearPoison, then resubmit) consumed with the latch still
+/// held.
+// r[verify ctrl.pool.giveup-exit-mintable]
+#[tokio::test]
+async fn w13a2_clear_poison_bumps_the_demand_epoch_end_to_end() -> TestResult {
+    let (db, handle, _task) = setup().await;
+
+    // Poison at cycle 0 via the production completion path.
+    seed_poisoned(&handle, "w13a2-e2e").await?;
+    let s = expect_drv(&handle, "w13a2-e2e").await;
+    assert_eq!(s.status, DerivationStatus::Poisoned);
+    assert_eq!(s.retry.resubmit_cycles, 0, "the common cycle-0 latch shape");
+
+    // The documented recovery action #1: admin ClearPoison.
+    let (tx, rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::ClearPoison {
+            drv_hash: "w13a2-e2e".into(),
+            reply: tx,
+        })
+        .await?;
+    assert!(rx.await?, "live leader's clear applies");
+
+    // The durable row carries the BUMP (pre-fix: 0 — the rewind).
+    let cleared_cycle: i32 = sqlx::query_scalar(
+        "SELECT a.resubmit_cycle FROM drv_attempts a \
+         JOIN derivations d ON a.derivation_id = d.derivation_id \
+         WHERE d.drv_hash = 'w13a2-e2e' AND a.outcome_class = 'poison_cleared'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        cleared_cycle, 1,
+        "the poison_cleared row must carry cycles + 1 (the bump) — \
+         pre-fix it carried the rewind-to-0"
+    );
+
+    // The documented recovery action #2: resubmit the drv. The fresh
+    // insert consumes the parked floor — the next SpawnIntent presents
+    // a cycle the controller has never observed.
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "w13a2-e2e",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let s = expect_drv(&handle, "w13a2-e2e").await;
+    assert_eq!(
+        s.retry.resubmit_cycles, 1,
+        "the post-clear re-insert must start at the bumped floor — \
+         pre-fix it re-entered at 0 and the equality arm held the \
+         gave-up latch forever (the fixed point)"
+    );
+
+    // Durability: the re-insert's resubmit_reset row carries the floor.
+    let reset_cycle: i32 = sqlx::query_scalar(
+        "SELECT a.resubmit_cycle FROM drv_attempts a \
+         JOIN derivations d ON a.derivation_id = d.derivation_id \
+         WHERE d.drv_hash = 'w13a2-e2e' AND a.outcome_class = 'resubmit_reset'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        reset_cycle, 1,
+        "the floor is durable through the resubmit_reset row (the \
+         suffix loader cuts at it; the fold's seed reproduces it)"
+    );
+    Ok(())
+}

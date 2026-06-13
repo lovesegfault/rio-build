@@ -93,10 +93,17 @@ async fn test_dispatch_carries_submitter_traceparent() -> TestResult {
     Ok(())
 }
 
-/// Dedup: if a second submitter merges an already-present derivation,
-/// the FIRST submitter's traceparent is preserved on the state. The
-/// worker's span should chain back to whichever build first introduced
-/// the derivation (operationally: the trace that will have waited longest).
+/// Dedup: if a second submitter's closure CONTAINS an already-present
+/// derivation (the shared-dep overlap shape), the FIRST submitter's
+/// traceparent is preserved on the state. The worker's span should
+/// chain back to whichever build first introduced the derivation
+/// (operationally: the trace that will have waited longest).
+///
+/// bug_058 note: a second submission of the same drv AS ROOT is an
+/// explicit resubmission — it takes the verdict-free band's epoch-mint
+/// reset lane, whose fresh insert carries the RESUBMITTER's
+/// traceparent (the established reset-lane law, same as a
+/// Cancelled/Failed reset).
 #[tokio::test]
 async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult {
     let (db, handle, _task) = setup().await;
@@ -104,13 +111,14 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
     let tp_first = "00-11111111111111111111111111111111-1111111111111111-01";
     let tp_second = "00-22222222222222222222222222222222-2222222222222222-01";
 
-    // Helper: merge dedup-hash with a given traceparent (defaults otherwise).
-    let merge_with_tp = |tp: &str| MergeDagRequest {
+    let merge_req = |nodes: Vec<rio_proto::types::DerivationNode>,
+                     edges: Vec<rio_proto::types::DerivationEdge>,
+                     tp: &str| MergeDagRequest {
         build_id: Uuid::new_v4(),
         tenant_id: None,
         priority_class: PriorityClass::Scheduled,
-        nodes: vec![make_node("dedup-hash")],
-        edges: vec![],
+        nodes,
+        edges,
         options: BuildOptions::default(),
         keep_going: false,
         traceparent: tp.to_string(),
@@ -119,9 +127,30 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
     };
 
     // First submit with tp_first.
-    let _ = merge_dag_req(&handle, merge_with_tp(tp_first)).await?;
-    // Second submit: SAME derivation, DIFFERENT traceparent (dedup hit).
-    let _ = merge_dag_req(&handle, merge_with_tp(tp_second)).await?;
+    let _ = merge_dag_req(
+        &handle,
+        merge_req(vec![make_node("dedup-hash")], vec![], tp_first),
+    )
+    .await?;
+    // Second submit: the same derivation as a DEP of another root
+    // (incidental closure overlap — the dedup face).
+    let _ = merge_dag_req(
+        &handle,
+        merge_req(
+            vec![make_node("dedup-root"), make_node("dedup-hash")],
+            vec![rio_test_support::fixtures::make_edge(
+                "dedup-root",
+                "dedup-hash",
+            )],
+            tp_second,
+        ),
+    )
+    .await?;
+
+    // The root-resubmission face (a same-drv ROOT re-submission takes
+    // the epoch-mint reset lane instead) is pinned by the dag-level
+    // `w13a_*` battery and the actor-level
+    // `w13a2_clear_poison_bumps_the_demand_epoch_end_to_end`.
 
     // Pull the deduped node: the payload carries the stored traceparent.
     let assignment = pull_attempt(&handle, "dedup-hash").await;

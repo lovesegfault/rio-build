@@ -1118,11 +1118,21 @@ impl DagActor {
                 .await;
             }
         }
-        // Fan-out: collect other builds interested in re-probe-
-        // completed nodes + emit DerivationCached to each. Caller
-        // does update_build_counts + check_build_completion per build.
+        // Fan-out: collect OTHER builds interested in cache-completed
+        // nodes + emit DerivationCached to each. Caller does
+        // update_build_counts + check_build_completion per build.
+        // Population: the WHOLE completed batch (bug_058): a
+        // resubmit-reset node (retriable or verdict-free band) is
+        // newly_inserted with its prior builds' interest CARRIED, so
+        // a reprobe-only fan-out would leave exactly those builds
+        // hanging Active when the reset composes with a cache hit —
+        // the same C4 hang one lane over (latent for Cancelled/Failed
+        // resets before the band made it reachable for Ready). For
+        // genuinely-new nodes the interest set is the submitter alone
+        // and the loop no-ops, so the widening is behavior-preserving
+        // for the pre-existing lanes.
         let mut other_builds: HashSet<Uuid> = HashSet::new();
-        for h in &reprobe_completed {
+        for h in &completed_batch {
             let (drv_path, output_paths) = match self.dag.node(h) {
                 Some(s) => (s.drv_path().to_string(), s.output_paths.clone()),
                 None => continue,
@@ -2319,6 +2329,7 @@ impl DagActor {
             &merge_result.contributions_recorded,
             build_id,
             merge_result.removed_retriable,
+            merge_result.floors_consumed,
         );
         self.events.remove(build_id);
         self.builds.remove(&build_id);
