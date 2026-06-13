@@ -175,6 +175,10 @@ REGISTRY = [
     # polarity riders — pending/anchored lifecycle, the no-op stamp
     # grammar from birth, K-mutations via the shared harness.
     ("cadence-polarity-registries", "nix/cadence_polarity_registries.py", r"self_battery", {"scope", "tier"}, set(), r"R34_PAIRS = \{"),
+    # bw13 S9 (WO-S9-8(iii)): P9 — the model-letter reachability lint
+    # (the F2 class codified; v1 variant-label jurisdiction disclosed;
+    # shrink-only content-keyed grandfather; K-mutations shared).
+    ("model-letter-reachability", "nix/model_letter_reachability.py", r"self_battery", {"scope"}, set(), r"MUTATIONS = \["),
     # (iii) the R33 duplicate-derivation lint + the rationale-rot
     # sweep (OQ-14 latitude recorded in the module doc).
     ("duplicate-derivation-lint", "nix/duplicate_derivation_lint.py", r"plants wrong|self-test arms", {"scope"}, set(), r"R33_ROWS = \{"),
@@ -1322,6 +1326,69 @@ def check_self_coverage(src_root, arms=None, residuals=None):
 # are RETIRED knob paths: zero live occurrences (this close swept
 # them), and any reintroduction fails tree-wide — the phrase-driven
 # belt the identifier sweep lacked.
+# --- the SEMANTIC phrase-census (round-13 WO-S9-8(iii); the bug_026
+# lesson — symbol-liveness linting is BLIND to a stale LAW CLAIM whose
+# prose cites no symbol): every close that changes a stated law's
+# FORMULATION declares the retired formulation here; the standing
+# check greps it across rs/typ/qnt/md/nix surfaces (the dead-alphabet
+# -letter idiom applied to prose). Modes: "hard" = a survivor fails
+# the gate (the close landed; the phrase is dead); "advisory:<slot>"
+# = the owning close has not landed at this tree — survivors PRINT
+# (the OQ-10 latitude: advisory-red at mint; flipped to hard at the
+# wave close, where the <5%% FP measurement adjudicates RULED-to-
+# round-14 vs standing). An OBITUARY context (the line carries a
+# retirement marker) is lawful history, never a violation.
+RETIRED_LAW_FORMULATIONS = [
+    # (name, phrase regex, mode) — first corpus: the wave's closes.
+    ("matched-text-keying", r"rel \+ matched text", "hard"),
+    ("l-content-fragment-keys", r"L-content-", "hard"),
+    ("apply-preclamp-discharge", r"cannot overflow Duration's u64-seconds range", "hard"),
+    ("unit-weights-law", r"unit weights", "advisory:S4"),
+    ("kubelet-two-grammars", r"two grammars are kubelet", "advisory:S1"),
+    ("marks-any-falsifier", r"ANY falsifier", "advisory:S3"),
+]
+RETIREMENT_MARKERS = re.compile(
+    r"retired|obituary|pre-fix|previously|formerly|superseded|"
+    r"phrase-census|the old |RETIRED|never the|defeat|born-broken|"
+    r"degrad|mutant|mutation|swapped back"
+)
+PHRASE_SUFFIXES = {".rs", ".typ", ".qnt", ".md", ".nix", ".py"}
+
+
+def scan_retired_law_formulations(src_root, table=None):
+    """(hard_fails, advisories) over the tree's prose surfaces."""
+    table = RETIRED_LAW_FORMULATIONS if table is None else table
+    hard, adv = [], []
+    skip_dirs = {".git", "target", "result"}
+    for f in sorted(src_root.rglob("*")):
+        if not f.is_file() or f.suffix not in PHRASE_SUFFIXES:
+            continue
+        if any(part in skip_dirs for part in f.parts):
+            continue
+        rel = str(f.relative_to(src_root))
+        if rel == "nix/census_corpora.py":
+            continue  # the table itself (needles live here)
+        try:
+            text = f.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        flines = text.splitlines()
+        for i, line in enumerate(flines, 1):
+            for name, rx, mode in table:
+                # Obituary context = the line or its 4-line window
+                # above carries a retirement marker (quoted history,
+                # seeded-mutation fixtures, pre-fix narration).
+                window = "\n".join(flines[max(0, i - 5) : i])
+                if re.search(rx, line) and not RETIREMENT_MARKERS.search(window):
+                    msg = (
+                        f"{rel}:{i}: retired law formulation `{name}` survives "
+                        f"(/{rx}/) — the law changed; the prose must die with "
+                        f"it or carry an obituary marker (bug_026's class)"
+                    )
+                    (hard if mode == "hard" else adv).append((mode, msg))
+    return [m for _md, m in hard], adv
+
+
 RETIRED_KNOB_PHRASES = [
     # (phrase, replacement guidance)
     (
@@ -1490,6 +1557,7 @@ POPULATION_FLOORS = {
     "duplicate-derivation-lint": ("nix/duplicate_derivation_lint.py", r"population floor"),
     # The WO-S9-8 round-13 bodies (each walks; each floors).
     "cadence-polarity-registries": ("nix/cadence_polarity_registries.py", r"population floor"),
+    "model-letter-reachability": ("nix/model_letter_reachability.py", r"population floor"),
 }
 _WALK_RE = re.compile(r"\.r?glob\(")
 
@@ -1753,6 +1821,29 @@ def main() -> int:
         if len(f_k) != 1 or "retired knob phrase" not in f_k[0]:
             print(f"FAIL: the retired-knob-phrase plant did not red: {f_k}", file=sys.stderr)
             return 1
+    # --- the semantic phrase-census plants (WO-S9-8(iii)) -------------
+    with tempfile.TemporaryDirectory() as td:
+        straw_root = pathlib.Path(td)
+        (straw_root / "doc.md").write_text(
+            "the grandfather is content-keyed (rel " + "+ matched text) here\n"
+        )
+        ph, _adv = scan_retired_law_formulations(straw_root)
+        if len(ph) != 1 or "retired law formulation" not in ph[0]:
+            print(f"FAIL: the retired-formulation plant did not red: {ph}", file=sys.stderr)
+            return 1
+        (straw_root / "doc.md").write_text(
+            "the retired keying (rel " + "+ matched text) is quoted as history\n"
+        )
+        ph, _adv = scan_retired_law_formulations(straw_root)
+        if ph:
+            print(f"FAIL: the obituary-context plant still flagged: {ph}", file=sys.stderr)
+            return 1
+        (straw_root / "doc.md").write_text("the old unit " + "weights law\n")
+        ph, adv = scan_retired_law_formulations(straw_root)
+        if ph:
+            print("FAIL: an advisory-mode phrase hard-failed pre-close", file=sys.stderr)
+            return 1
+
     # --- the R29 duration census plants (WO-S8-11(i)) -----------------
     # One finder-vector per idiom cell (the leniency plants: every
     # population-grammar cell demonstrably catches its form).
@@ -2162,6 +2253,11 @@ def main() -> int:
     fails += scan_retention_notes(src_root)
     # The retired-knob-phrase belt (WO-S8-9, merged_bug_055).
     fails += scan_retired_knob_phrases(src_root)
+    # The SEMANTIC phrase-census (WO-S9-8(iii); the bug_026 class).
+    phrase_hard, phrase_adv = scan_retired_law_formulations(src_root)
+    fails += phrase_hard
+    for mode, msg in phrase_adv:
+        print(f"advisory ({mode}): {msg}")
     # The R29 duration census (WO-S8-11(i)).
     if mint_duration:
         for line in check_duration_census(src_root, mint=True):

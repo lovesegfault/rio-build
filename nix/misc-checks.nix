@@ -1564,6 +1564,27 @@ in
         touch $out
       '';
 
+  # P9 — the model-letter reachability lint (round-13 WO-S9-8(iii);
+  # the F2 founding class): variant letters consumed by the invariant
+  # tier need an action/run constructor occurrence, a p9-vacuity
+  # exemption, or the shrink-only content-keyed grandfather.
+  model-letter-reachability =
+    pkgs.runCommand "rio-model-letter-reachability"
+      {
+        src = pkgs.lib.cleanSource ../.;
+        nativeBuildInputs = [ pkgs.python3 ];
+        scanScript = ../nix/model_letter_reachability.py;
+        sharedLexer = ../nix/rust_strip.py;
+        censusLib = ../nix/census_corpora.py;
+      }
+      ''
+        cp "$sharedLexer" rust_strip.py
+        cp "$censusLib" census_corpora.py
+        cp "$scanScript" model_letter_reachability.py
+        python3 model_letter_reachability.py "$src"
+        touch $out
+      '';
+
   duplicate-derivation-lint =
     pkgs.runCommand "rio-duplicate-derivation-lint"
       {

@@ -1,0 +1,13 @@
+docs/spec/models/gwConnLifecycle.qnt	p9	| RNone
+docs/spec/models/iceEvidenceAck.qnt	p9	| OSome(e) =>
+docs/spec/models/materializationJob.qnt	p9	| PAllTenantProbe => tuples(stampEv.attributed, stampEv.outputs)
+docs/spec/models/materializationJob.qnt	p9	| PBuiltLocally => tuples(stampEv.attributed, stampEv.outputs)
+docs/spec/models/materializationJob.qnt	p9	| PProbedBy =>
+docs/spec/models/nodeclaimLifecycle.qnt	p9	| VStaleClear
+docs/spec/models/nodeclaimLifecycle.qnt	p9	| VStaleOverwrite
+docs/spec/models/nodeclaimLifecycle.qnt	p9	| VStandbyEffect
+docs/spec/models/retryPolicy.qnt	p9	| FBackstopTimeout({ at: int, exec: str })
+docs/spec/models/retryPolicy.qnt	p9	| FDisconnect(int)
+docs/spec/models/retryPolicy.qnt	p9	| RExemptInfraBudget
+docs/spec/models/retryPolicy.qnt	p9	| RInfraBudget
+docs/spec/models/retryPolicy.qnt	p9	| RTransientBudget

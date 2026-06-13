@@ -139,7 +139,14 @@ PROVENANCE = {
         "cfg-test/pending-lane) + lifecycle plants + K=4 via the "
         "shared harness",
     ),
-}
+
+    "model-letter-reachability": (
+        "planted",
+        "nix/model_letter_reachability.py",
+        r"MUTATIONS = \[",
+        "WO-S9-8(iii): dead/constructed/exempt/unconsumed plants + "
+        "K=4 via the shared harness; v1 jurisdiction disclosed",
+    ),}
 
 # The shrink-only debt pin: the committed debt set may only SHRINK
 # (landing a battery/derivation flips the row's kind); growth is an
