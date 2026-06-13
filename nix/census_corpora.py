@@ -160,6 +160,11 @@ REGISTRY = [
     # pending rows flip at the wave-close --verify-landed; the
     # lossy-arithmetic and un-named-gate grammars enforce from birth.
     ("obligation-clock-census", "nix/obligation_clock_census.py", r"plant did not red|self-test arms", {"scope", "tier"}, set(), r"OBLIGATION_ROWS = \{"),
+    # bw13 S9 (WO-S9-2, bug_049): the jitter-saturation seam census —
+    # the panicking-Duration-multiply ban (family derived from the
+    # std type's API surface; UFCS form covered; rider-(d) narrowed
+    # fixture asserted in the battery).
+    ("jitter-saturation-seams", "nix/census_corpora.py", r"DURATION_MUL_PLANTS", {"scope", "alias"}, set(), r"DURATION_MUL_FAMILY = \["),
     # (iii) the R33 duplicate-derivation lint + the rationale-rot
     # sweep (OQ-14 latitude recorded in the module doc).
     ("duplicate-derivation-lint", "nix/duplicate_derivation_lint.py", r"plants wrong|self-test arms", {"scope"}, set(), r"R33_ROWS = \{"),
@@ -548,6 +553,83 @@ def scan_wire_secs_seams(files):
                     "a parameter/local carrying the proto seconds convention)",
                 )
     return fails
+
+
+# --- the jitter-saturation seam census (bug_049, WO-S9-2) ---------------
+#
+# `Jitter::apply` is TOTAL (saturates at Duration::MAX through
+# rio-common's `saturating_mul_f64`), so the overflow obligation its
+# old no-panic comment discharged by PROSE — "d is clamped to 1yr in
+# Backoff::duration", an assumption the materializer's config-fed
+# poll-interval seam bypassed — is deleted at the source for every
+# present and future caller. The residual class this census pins
+# closed: any NEW panicking Duration multiply in production code
+# re-opens the comment-discharged obligation one seam over.
+#
+# The predicate DERIVES from the host type's API surface (R31'(c)):
+# Duration's panicking multiply combinators are exactly
+# DURATION_MUL_FAMILY = {mul_f64, mul_f32} — the std type's own
+# family, never an observed-spelling list — and the grammar covers
+# both the method-call and the UFCS/qualified call forms (the
+# aliased-call evasion axis; the UFCS plant is the battery's
+# grammar-refusal face). A documented exception carries
+# `jitter-seam: allow(<why>)` within the 6 lines above. Rider (d)
+# inline: DURATION_MUL_NARROWED_FIXTURE is the committed degenerate
+# predicate (the mul_f32 arm dropped); the self-test battery asserts
+# the mul_f32 plant DIES under it — the seeded narrowing demonstrably
+# kills, which is the discrimination proof the bug_047 criterion
+# demands of every new census at birth.
+DURATION_MUL_FAMILY = ["mul_f64", "mul_f32"]
+DURATION_MUL_RE = re.compile(
+    r"(?:\.|::)(?:" + "|".join(DURATION_MUL_FAMILY) + r")\s*\("
+)
+# The rider-(d) committed degenerate fixture: the family narrowed to
+# its first member — the mul_f32 plant must not survive it.
+DURATION_MUL_NARROWED_FIXTURE = re.compile(r"(?:\.|::)(?:mul_f64)\s*\(")
+JITTER_SEAM_ALLOW = re.compile(r"jitter-seam:\s*allow\(")
+
+
+def scan_duration_muls(files, pattern=None):
+    """files: (rel, text). One violation per panicking Duration
+    multiply in production code (bug_049's class; pattern overridable
+    ONLY by the rider-(d) narrowed fixture in the self-test)."""
+    pattern = DURATION_MUL_RE if pattern is None else pattern
+    fails = []
+    for rel, raw in files:
+        lines = raw.splitlines()
+        try:
+            stripped = strip_production(raw, rel)
+        except rust_strip.StripError as e:
+            # R22'' fail-closed (same arm as the refusal census).
+            fails.append(f"{e} [jitter-seam census: file not classifiable]")
+            continue
+        for m in pattern.finditer(stripped):
+            lineno = stripped[: m.start()].count("\n") + 1
+            window = "\n".join(lines[max(0, lineno - 7) : lineno])
+            if JITTER_SEAM_ALLOW.search(window):
+                continue
+            fails.append(
+                f"{rel}:{lineno}: panicking Duration multiply "
+                f"(`{m.group(0).strip()}`…) in production — overflow is an "
+                f"obligation, never a comment: route through rio-common's "
+                f"saturating jitter (`Jitter::apply` is total) or a "
+                f"saturating sibling; a documented exception carries "
+                f"`jitter-seam: allow(<why>)` within 6 lines above (bug_049)"
+            )
+    return fails
+
+
+# The per-family-member plants (rider (c): one per alternation arm)
+# plus the UFCS evading idiom (rider (b)(3)): committed vectors the
+# self-test battery drives through scan_duration_muls.
+DURATION_MUL_PLANTS = [
+    ("method-mul_f64", "fn j(d: Duration) -> Duration { d.mul_f64(1.5) }\n"),
+    ("method-mul_f32", "fn j(d: Duration) -> Duration { d.mul_f32(1.5) }\n"),
+    (
+        "ufcs-qualified",
+        "fn j(d: Duration) -> Duration { Duration::mul_f64(d, 1.5) }\n",
+    ),
+]
 
 
 # --- the R29 duration census (WO-S8-11(i)) -----------------------------
@@ -1869,6 +1951,52 @@ def main() -> int:
         print("FAIL: self-test arm F-mint — the sanctioned WireSecs mint flagged", file=sys.stderr)
         return 1
 
+    # --- the jitter-saturation seam plants (bug_049, WO-S9-2) ----------
+    # Rider (c): one plant per DURATION_MUL_FAMILY member (the
+    # family derives from Duration's own panicking-multiply API
+    # surface) + the UFCS evading idiom (rider (b)(3)).
+    for plant_name, snippet in DURATION_MUL_PLANTS:
+        f_j = scan_duration_muls([("planted/jitter.rs", snippet)])
+        if len(f_j) != 1 or "panicking Duration multiply" not in f_j[0]:
+            print(
+                f"FAIL: jitter-seam plant `{plant_name}` expected 1 violation, got {f_j}",
+                file=sys.stderr,
+            )
+            return 1
+    # The documented exception stays quiet.
+    allowed_j = (
+        "// jitter-seam: allow(saturation proven at this call site)\n"
+        "fn j(d: Duration) -> Duration { d.mul_f64(0.5) }\n"
+    )
+    if scan_duration_muls([("planted/allowed_j.rs", allowed_j)]):
+        print("FAIL: the documented jitter-seam exception still flagged", file=sys.stderr)
+        return 1
+    # A cfg(test)-interior multiply stays out of the population (the
+    # backoff.rs distribution tests and the substitute.rs HEAD_DELAY
+    # fixture are exactly this shape).
+    gated_j = (
+        "#[cfg(test)]\nmod t {\n"
+        "    fn j(d: Duration) -> Duration { d.mul_f64(1.5) }\n}\n"
+    )
+    if scan_duration_muls([("planted/gated_j.rs", gated_j)]):
+        print("FAIL: a cfg(test) Duration multiply entered the jitter-seam census", file=sys.stderr)
+        return 1
+    # Rider (d) inline: under the COMMITTED narrowed fixture (the
+    # mul_f32 arm dropped) the mul_f32 plant MUST die — the seeded
+    # degeneration demonstrably kills the planted red, so a future
+    # silent narrowing of the family cannot pass the battery.
+    f_n = scan_duration_muls(
+        [("planted/narrow.rs", DURATION_MUL_PLANTS[1][1])],
+        pattern=DURATION_MUL_NARROWED_FIXTURE,
+    )
+    if f_n:
+        print(
+            f"FAIL: rider (d) — the mul_f32 plant SURVIVED the narrowed-"
+            f"predicate fixture (the battery has no kill-power): {f_n}",
+            file=sys.stderr,
+        )
+        return 1
+
     # --- the real scans -------------------------------------------------
     fails = check_registry(src_root)
 
@@ -1970,6 +2098,10 @@ def main() -> int:
             f"it from {REFUSAL_GRANDFATHER} (shrink-only)"
         )
     fails += scan_wire_secs_seams(refusal_files)
+    # The jitter-saturation seam census (bug_049, WO-S9-2): zero
+    # production sites at birth — the ban consumes the same floored
+    # production population as the refusal/wire-secs scans.
+    fails += scan_duration_muls(refusal_files)
     # The method-call leniency's machine-bound trigger (WO-S8-3): no
     # `optional … *_seconds` proto field may exist while the grammar
     # excludes the prost-getter read form.

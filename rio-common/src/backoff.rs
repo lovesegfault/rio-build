@@ -53,12 +53,27 @@ impl Jitter {
     /// table-based schedule (not pure exponential — e.g., the FUSE
     /// fetch retry table) can share the jitter mechanism without
     /// adopting [`Backoff`].
+    ///
+    /// TOTAL for every finite `d` (bug_049): the product saturates at
+    /// the ONE shared absurdity ceiling
+    /// ([`crate::clamped::ClampedSecs::MAX_SECS`], one year — the same
+    /// ceiling [`MAX_BACKOFF`] mirrors) instead of panicking on
+    /// overflow. The
+    /// previous contract discharged the overflow obligation by
+    /// comment — "`d` is clamped to 1yr in `Backoff::duration`" — an
+    /// assumption the direct call sites bypass (the materializer
+    /// feeds a raw config-sourced `poll_interval_secs` here without
+    /// any pre-clamp). Totality deletes the obligation class for
+    /// every present and future caller; the rejected alternative (a
+    /// clamped-seconds newtype at each seam) would only have
+    /// relocated it.
     pub fn apply(&self, d: Duration) -> Duration {
-        // mul_f64 panics on NaN/negative/overflow. The factors below
-        // are all finite non-negative draws from [0, 2), and `d` is a
-        // finite Duration, so `d × [0, 2)` cannot overflow Duration's
-        // u64-seconds range for any `d` we'd ever compute (clamped to
-        // 1yr in `Backoff::duration`).
+        // The factors below are all finite non-negative draws from
+        // [0, 2) (`f` is clamped, the `Full` range is [0, 1]), and
+        // `d.as_secs_f64()` is finite, so the product is finite or
+        // `+inf` and never NaN/negative — `saturating_mul_f64`
+        // converts the one remaining panic face (overflow) into
+        // saturation at the shared ceiling.
         match *self {
             Jitter::None => d,
             Jitter::Proportional(f) => {
@@ -67,8 +82,7 @@ impl Jitter {
                 // panicking on `random_range(hi < lo)` or producing a
                 // negative factor. Non-finite (NaN/inf) survives
                 // `f64::clamp` unchanged — `NaN.clamp(0,1) = NaN` —
-                // so guard explicitly and degrade to no-jitter rather
-                // than panic in `mul_f64`.
+                // so guard explicitly and degrade to no-jitter.
                 let f = if f.is_finite() {
                     f.clamp(0.0, 1.0)
                 } else {
@@ -77,16 +91,30 @@ impl Jitter {
                 if f == 0.0 {
                     return d;
                 }
-                d.mul_f64(rand::rng().random_range((1.0 - f)..(1.0 + f)))
+                saturating_mul_f64(d, rand::rng().random_range((1.0 - f)..(1.0 + f)))
             }
             Jitter::Full => {
                 if d.is_zero() {
                     return d;
                 }
-                d.mul_f64(rand::rng().random_range(0.0..=1.0))
+                saturating_mul_f64(d, rand::rng().random_range(0.0..=1.0))
             }
         }
     }
+}
+
+/// `d × factor`, saturating at the shared absurdity ceiling
+/// ([`crate::clamped::ClampedSecs::MAX_SECS`], one year); never
+/// panics for finite non-negative `factor`. Routed through the house
+/// age/interval constructor (`clamped_duration_secs` — the clippy
+/// disallowed-methods sweep's sanctioned lane), whose in-range arm is
+/// `Duration::from_secs_f64(secs)` exactly — byte-identical to
+/// [`Duration::mul_f64`] for any product within the ceiling, since
+/// `mul_f64` computes `from_secs_f64(rhs × as_secs_f64())` and f64
+/// multiplication is commutative — so in-range jitter draws are
+/// unchanged (W13-AY2 pins this).
+fn saturating_mul_f64(d: Duration, factor: f64) -> Duration {
+    crate::clamped::clamped_duration_secs(d.as_secs_f64() * factor)
 }
 
 /// Exponential backoff curve: `base × multᵃ`, capped at `cap`, then
@@ -373,6 +401,62 @@ mod tests {
             assert!(d <= base, "{d:?} > base {base:?}");
         }
         assert_eq!(Jitter::Full.apply(Duration::ZERO), Duration::ZERO);
+    }
+
+    /// W13-AY (bug_049): `apply` is TOTAL — a `Duration::from_secs
+    /// (u64::MAX)` input (the exact shape the materializer's raw
+    /// config-fed `poll_interval_secs` seam can mint, which bypasses
+    /// every `Backoff::duration` pre-clamp) saturates instead of
+    /// panicking in the multiply. Pre-fix this panicked in `mul_f64`
+    /// for any `Proportional` draw above 1.0 (the red, verbatim in
+    /// the commit body).
+    #[test]
+    fn jitter_apply_total_at_duration_max() {
+        let d = Duration::from_secs(u64::MAX);
+        for j in [Jitter::Proportional(0.2), Jitter::Full, Jitter::None] {
+            for _ in 0..64 {
+                // 64 draws: Proportional(0.2) exceeds factor 1.0 with
+                // p≈0.5 per draw, so the pre-fix panic fires with
+                // p ≈ 1 − 2⁻⁶⁴ — deterministic for all purposes.
+                let out = j.apply(d);
+                assert!(out <= Duration::MAX);
+            }
+        }
+    }
+
+    /// W13-AY (deterministic saturation face) + W13-AY2 (normal-range
+    /// jitter byte-stable): `saturating_mul_f64` saturates at the
+    /// shared one-year ceiling exactly where `mul_f64` would panic or
+    /// mint an absurd sleep, and is byte-identical to `mul_f64` in
+    /// the in-ceiling range (the clamp's in-range arm is
+    /// `from_secs_f64(secs)`; `mul_f64` computes
+    /// `from_secs_f64(rhs × as_secs_f64())`; f64 multiplication is
+    /// commutative).
+    #[test]
+    fn saturating_mul_saturates_and_matches_mul_in_range() {
+        let ceiling = crate::clamped::clamped_duration_secs(f64::INFINITY);
+        assert_eq!(
+            ceiling,
+            Duration::from_secs(365 * 86400),
+            "the shared 1yr ceiling"
+        );
+        assert_eq!(
+            saturating_mul_f64(Duration::from_secs(u64::MAX), 1.2),
+            ceiling
+        );
+        assert_eq!(
+            saturating_mul_f64(Duration::MAX, 1.0 + f64::EPSILON),
+            ceiling
+        );
+        for (d, f) in [
+            (Duration::from_secs(4), 0.75),
+            (Duration::from_millis(1500), 1.25),
+            (Duration::from_secs(60), 0.0),
+            (Duration::from_nanos(12_345), 1.999),
+            (Duration::from_secs(86_400), 1.2),
+        ] {
+            assert_eq!(saturating_mul_f64(d, f), d.mul_f64(f), "d={d:?} f={f}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

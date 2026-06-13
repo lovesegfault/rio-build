@@ -470,6 +470,13 @@ async fn claim_loop<T>(
         match pace {
             Pace::Now => {}
             Pace::Beat => {
+                // This seam feeds a RAW config-sourced u64 into the
+                // jitter with no `Backoff::duration`-style pre-clamp;
+                // it is lawful because `Jitter::apply` is TOTAL
+                // (saturates at the shared 1-year absurdity ceiling —
+                // bug_049). Config validation additionally bounds the
+                // interval to one day (defense in depth, rio-store
+                // config.rs).
                 let interval =
                     POLL_JITTER.apply(Duration::from_secs(cfg.poll_interval_secs.max(1)));
                 if pace_after_empty_pass(&shutdown, interval).await {

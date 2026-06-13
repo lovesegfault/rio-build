@@ -731,6 +731,20 @@ impl rio_common::config::ValidateConfig for Config {
              (0 busy-polls the scheduler); set RIO_MATERIALIZATION__POLL_INTERVAL_SECS",
             self.materialization.poll_interval_secs
         );
+        // Upper bound (bug_049, defense in depth beside the >= 1
+        // check): the claim loop is the materializer's heartbeat — an
+        // interval above one day is a unit typo (millis pasted as
+        // secs), not an operating point. The jitter seam itself is
+        // TOTAL (`Jitter::apply` saturates at Duration::MAX), so this
+        // bound is an R17-priced operator-error envelope, not the
+        // panic guard.
+        anyhow::ensure!(
+            self.materialization.poll_interval_secs <= 86_400,
+            "materialization.poll_interval_secs must be <= 86400 (1 day), got {} \
+             (a slower claim loop is a dead materializer — likely a unit typo); \
+             set RIO_MATERIALIZATION__POLL_INTERVAL_SECS",
+            self.materialization.poll_interval_secs
+        );
         Ok(())
     }
 }
