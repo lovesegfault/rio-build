@@ -83,7 +83,7 @@ spec:
         # session and the per-build WatchBuild + log-tail streams —
         # Karpenter consolidating its node severs all of them at once
         # (each one a client-visible build interruption, even when the
-        # re-attach machinery recovers). The annotation gates ONLY
+        # re-attach machinery recovers). The annotation gates only
         # Karpenter's own disruption controller: kubectl drains and
         # node rotations still ride the eviction API + the rio-gateway
         # PDB (minAvailable 1 when the fleet can run multiple), and

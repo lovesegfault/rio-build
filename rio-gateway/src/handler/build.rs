@@ -2170,7 +2170,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                     Err(e @ StreamProcessError::Wire(_)) => {
                         break Err(e);
                     }
-                    // The re-attach verdicts are minted ONLY by the
+                    // The re-attach verdicts are minted only by the
                     // NeedsReattach arm below — process_build_events
                     // never constructs them. Named here (not a
                     // wildcard) so the alphabet stays total; surfacing

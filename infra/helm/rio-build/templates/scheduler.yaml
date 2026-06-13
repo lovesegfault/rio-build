@@ -193,7 +193,7 @@ spec:
         # and every WatchBuild stream; Karpenter consolidating its node
         # forces a leader failover plus a reconnect storm from every
         # watching gateway in the middle of whatever was building. The
-        # annotation gates ONLY Karpenter's own disruption controller:
+        # annotation gates only Karpenter's own disruption controller:
         # kubectl drains and node rotations still ride the eviction API
         # + the rio-scheduler PDB (maxUnavailable 1 when replicas > 1),
         # and deploys roll pods directly — both unaffected.
