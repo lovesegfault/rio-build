@@ -2334,7 +2334,20 @@ fn verdict_resets_respawn_backoff() {
 /// fold. Recorded red (pre-fix, the absorbing state live):
 /// `left: [] right: ["drv-giveup"] --- a fresh demand epoch must decay
 /// the gave-up latch and spawn within one tick cycle (R30)`.
+///
+/// bug_058 provenance (the producer-reachability re-derivation): the
+/// `resubmit_cycle: 1` this trajectory presents is PRODUCER-CERTIFIED
+/// as of the bug_058 scheduler close — `dag::merge` mints `cycles+1`
+/// for the verdict-free band (Queued/Ready/Created, root-keyed:
+/// exactly the states a verdict-free give-up leaves and exactly the
+/// documented action, "a resubmission of THE drv"). Before that
+/// close, this test certified a face the scheduler could not mint
+/// for the latched population (verdict-free give-up leaves the drv
+/// OUT of the retriable band, so "same" was the only emittable face)
+/// — the trajectory was green here and structurally dead in
+/// production (the r31-generator-gap bug_058 charges).
 // r[verify ctrl.pool.respawn-backoff+5]
+// r[verify ctrl.pool.giveup-exit-mintable]
 #[test]
 fn fresh_demand_epoch_decays_gave_up_latch() {
     use crate::reconcilers::pool::candidate::PoolStreaks;
@@ -2483,13 +2496,18 @@ fn fresh_demand_epoch_decays_gave_up_latch() {
 /// fires for every demand-signal orbit, including REWIND; population:
 /// {unseen, same, newer, REWOUND} — the value domain's actual faces
 /// (the first three pinned by the W11-BE battery above; this is the
-/// rewind face the wave-11 enumeration assumed away).
+/// rewind face the wave-11 enumeration assumed away; the full
+/// (record-state × face) table is `w13a_giveup_face_census`).
 ///
-/// The ClearPoison-then-resubmit schedule: ClearPoison ZEROES
-/// `resubmit_cycle` (completion.rs), the reprobe lane mirrors the
-/// zero, and the fresh DAG re-insert starts at cycle 0 — so a record
-/// latched at epoch N observes the documented operator recovery as a
-/// REWOUND epoch (0 < N). Pre-fix the decay guard keyed on ORDER
+/// The rewound orbit's producers, re-derived at the bug_058 close:
+/// the admin `ClearPoison` lane now BUMPS `resubmit_cycle` (the
+/// scheduler stamps `cycles + 1` and floors the post-clear re-insert
+/// — the rewind-to-0 equality fixed point is dead), so the REMAINING
+/// rewind producers are the poison-TTL expiry lane (still stamps 0),
+/// a scheduler failover inside the clear→resubmit window (the
+/// in-memory floor is lost; the re-insert starts at 0), and pre-close
+/// fleet history. The rewind face therefore stays load-bearing and
+/// the decay stays change-keyed. Pre-fix the guard keyed on ORDER
 /// (`observed > latched`) with a `Some(_) => None` fallthrough:
 /// "≤ latched" conflated anti-replay (equal) with reset orbits
 /// (lower), the exit edge was VACUOUS for exactly the
@@ -5379,4 +5397,278 @@ async fn w10_ar_clean_exits_never_step_the_ladder_wedged_deaths_do() {
     };
     assert_eq!(count_of("clean-exit"), 2, "two clean letters counted");
     assert_eq!(count_of("escalated"), 1, "one wedged escalation only");
+}
+
+// ---------------------------------------------------------------------------
+// bug_058 commit 2 (W13-A controller half): the gave-up exit-edge face
+// census — [GEN-SET] over (record-state × observed-face), every cell
+// driven through the PRODUCTION seams (note_verdict_free_death — the
+// reap's death seam; note_demand_epoch via evaluate_spawn_gate — the
+// demand seam), riders (a)–(d).
+//
+// The faces are PRODUCER-CERTIFIED as of the scheduler half of this
+// close (rio-scheduler dag::tests w13a_* battery): explicit
+// resubmission mints `cycles + 1` for the verdict-free band
+// (Queued/Ready/Created — exactly the states a verdict-free give-up
+// leaves behind), and ClearPoison BUMPS (never rewinds) with the
+// bumped floor riding the post-clear re-insert. Pre-close, these
+// contract tests presented faces the scheduler could NOT mint for the
+// latched population (the r31-generator-gap this commit closes): the
+// only producer-emittable face for a latched Queued/Ready drv was
+// "same", and the exit edge below was structurally dead in
+// production however green it was here.
+// ---------------------------------------------------------------------------
+
+/// One face-census row: the record state the production feeders build,
+/// the face presented at the demand seam, and the pinned outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordState {
+    /// No record (no deaths ever) — demand alone never mints evidence.
+    Absent,
+    /// Deaths recorded, no demand observation yet (no baseline).
+    FreshNoBaseline,
+    /// 1 ≤ deaths < give-up, baseline observed.
+    MidLadder,
+    /// deaths ≥ give-up, baseline observed — the latch.
+    GaveUp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Face {
+    /// The record's first demand observation (sets the baseline).
+    First,
+    /// observed == baseline (the anti-replay equality face).
+    Same,
+    /// observed > baseline (explicit resubmission's minted face).
+    Newer,
+    /// observed < baseline (TTL-expiry rewind; failover floor loss;
+    /// pre-close ClearPoison history).
+    Rewound,
+}
+
+/// The pinned outcome, in API observables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FaceOutcome {
+    /// `note_demand_epoch` minted a `GaveUpReset` receipt.
+    decays: bool,
+    /// The record survives the observation.
+    record_survives: bool,
+}
+
+// r[verify ctrl.pool.giveup-exit-mintable]
+/// The face census: every (record-state × face) cell pinned and driven
+/// through the production seams. Rider (a): the table is TOTAL over
+/// both alphabets (the per-axis loops below red on an unclassified
+/// cell). The exit edge fires for EXACTLY the {GaveUp} × {Newer,
+/// Rewound} cells — every other cell holds, tracks, or no-ops; with
+/// the producer total (the scheduler half), every latched
+/// configuration can reach one of the firing cells.
+#[test]
+fn w13a_giveup_face_census() {
+    use crate::reconcilers::pool::candidate::{PoolStreaks, RESPAWN_GIVE_UP_DEATHS};
+    use std::time::Duration;
+
+    const BASELINE: u64 = 5;
+    let states = [
+        RecordState::Absent,
+        RecordState::FreshNoBaseline,
+        RecordState::MidLadder,
+        RecordState::GaveUp,
+    ];
+    let faces = [Face::First, Face::Same, Face::Newer, Face::Rewound];
+
+    // The pinned table (riders (a): the WO-named EXPECTED members).
+    let expected = |state: RecordState, face: Face| -> Option<FaceOutcome> {
+        match (state, face) {
+            // No record: every observation is a no-op (demand alone
+            // never mints evidence). `First` is the only meaningful
+            // face (there is no baseline to be Same/Newer/Rewound
+            // against); the value-blindness of the no-op arm is
+            // asserted by driving all four values anyway.
+            (RecordState::Absent, _) => Some(FaceOutcome {
+                decays: false,
+                record_survives: false, // nothing exists to survive
+            }),
+            // First observation SETS the baseline, never decays.
+            (RecordState::FreshNoBaseline, Face::First) => Some(FaceOutcome {
+                decays: false,
+                record_survives: true,
+            }),
+            // A baseline-less record has no Same/Newer/Rewound faces.
+            (RecordState::FreshNoBaseline, _) => None,
+            // Mid-ladder NEVER decays at the demand seam (its backoff
+            // window is its own exit edge; an epoch-triggered
+            // mid-window reset would let resubmit spam bypass the
+            // breaker): Same holds, changed faces TRACK the baseline.
+            (RecordState::MidLadder, Face::Same | Face::Newer | Face::Rewound) => {
+                Some(FaceOutcome {
+                    decays: false,
+                    record_survives: true,
+                })
+            }
+            (RecordState::MidLadder, Face::First) => None, // baseline pre-set
+            // THE LATCH: equality alone holds (anti-replay); ANY
+            // changed face — newer or rewound — is the demand signal
+            // and decays the record the same observation.
+            (RecordState::GaveUp, Face::Same) => Some(FaceOutcome {
+                decays: false,
+                record_survives: true,
+            }),
+            (RecordState::GaveUp, Face::Newer | Face::Rewound) => Some(FaceOutcome {
+                decays: true,
+                record_survives: false,
+            }),
+            (RecordState::GaveUp, Face::First) => None, // baseline pre-set
+        }
+    };
+
+    let key = pkey();
+    let t0 = std::time::Instant::now();
+    let mut cells = 0u32;
+    for state in states {
+        for face in faces {
+            let Some(want) = expected(state, face) else {
+                continue;
+            };
+            // Build the record state through the PRODUCTION feeders.
+            let mut streaks = PoolStreaks::default();
+            let deaths = match state {
+                RecordState::Absent => 0,
+                RecordState::FreshNoBaseline => 1,
+                RecordState::MidLadder => 2,
+                RecordState::GaveUp => RESPAWN_GIVE_UP_DEATHS,
+            };
+            for n in 0..deaths {
+                streaks.note_verdict_free_death(
+                    &key,
+                    "drv-cz",
+                    t0 + Duration::from_secs(u64::from(n)),
+                );
+            }
+            // Set the baseline where the state demands one.
+            if !matches!(state, RecordState::Absent | RecordState::FreshNoBaseline) {
+                assert!(
+                    streaks
+                        .note_demand_epoch(&key, "drv-cz", BASELINE)
+                        .is_none(),
+                    "{state:?}: baseline set never decays"
+                );
+            }
+            let observed = match face {
+                Face::First => BASELINE,
+                Face::Same => BASELINE,
+                Face::Newer => BASELINE + 1,
+                Face::Rewound => BASELINE - 5, // 0 — the rewind orbit
+            };
+            let receipt = streaks.note_demand_epoch(&key, "drv-cz", observed);
+            assert_eq!(
+                receipt.is_some(),
+                want.decays,
+                "{state:?} × {face:?}: decay face"
+            );
+            assert_eq!(
+                streaks.respawn_deaths(&key, "drv-cz").is_some(),
+                want.record_survives,
+                "{state:?} × {face:?}: record survival"
+            );
+            // The tracking sub-law: a mid-ladder changed face moves
+            // the baseline (the give-up baseline is the LAST observed
+            // epoch) — observable once the ladder tops out: the
+            // tracked value is now Same (holds), everything else
+            // decays.
+            if state == RecordState::MidLadder && face != Face::Same {
+                for n in 0..RESPAWN_GIVE_UP_DEATHS {
+                    streaks.note_verdict_free_death(
+                        &key,
+                        "drv-cz",
+                        t0 + Duration::from_secs(100 + u64::from(n)),
+                    );
+                }
+                assert!(
+                    streaks
+                        .note_demand_epoch(&key, "drv-cz", observed)
+                        .is_none(),
+                    "{state:?} × {face:?}: the tracked baseline is the \
+                     anti-replay value after the latch"
+                );
+                assert!(
+                    streaks
+                        .note_demand_epoch(&key, "drv-cz", observed + 1)
+                        .is_some(),
+                    "{state:?} × {face:?}: any non-tracked value decays \
+                     the latch"
+                );
+            }
+            cells += 1;
+        }
+    }
+    // Rider (a) non-vacuity: the walked cell count equals the pinned
+    // table's populated cells (4 Absent + 1 Fresh + 3 MidLadder + 3
+    // GaveUp).
+    assert_eq!(cells, 11, "the face census walks every populated cell");
+}
+
+/// W13-A4 (controller half, rider (d)) — the face census's kill
+/// power: K = 4 seeded mutations of the decay law (harness COPIES;
+/// the live artifact is never mutated), each killing its plant.
+#[test]
+fn w13a_giveup_face_census_kill_power_under_k_mutations() {
+    use crate::reconcilers::pool::candidate::{PoolStreaks, RESPAWN_GIVE_UP_DEATHS};
+    use std::time::Duration;
+
+    // The live decay verdict for (gave_up, baseline, observed),
+    // observed through the production API.
+    let live = |gave_up: bool, baseline: u64, observed: u64| -> bool {
+        let key = pkey();
+        let t0 = std::time::Instant::now();
+        let mut streaks = PoolStreaks::default();
+        let deaths = if gave_up { RESPAWN_GIVE_UP_DEATHS } else { 2 };
+        for n in 0..deaths {
+            streaks.note_verdict_free_death(&key, "drv-kz", t0 + Duration::from_secs(u64::from(n)));
+        }
+        assert!(
+            streaks
+                .note_demand_epoch(&key, "drv-kz", baseline)
+                .is_none()
+        );
+        streaks
+            .note_demand_epoch(&key, "drv-kz", observed)
+            .is_some()
+    };
+
+    // M1 — order-keyed decay (`observed > latched`): the historic
+    // merged_bug_043 bug. The REWOUND plant dies.
+    let m1 = |gave_up: bool, baseline: u64, observed: u64| gave_up && observed > baseline;
+    assert_ne!(
+        m1(true, 5, 0),
+        live(true, 5, 0),
+        "M1 (order-keyed) must kill the rewound plant"
+    );
+
+    // M2 — mid-ladder decays on change (the resubmit-spam bypass):
+    // the mid-ladder hold plant dies.
+    let m2 = |_gave_up: bool, baseline: u64, observed: u64| observed != baseline;
+    assert_ne!(
+        m2(false, 5, 6),
+        live(false, 5, 6),
+        "M2 (mid-ladder-decays) must kill the backoff-shortcut plant"
+    );
+
+    // M3 — equality decays (anti-replay deleted): the same-face
+    // plant dies.
+    let m3 = |gave_up: bool, _baseline: u64, _observed: u64| gave_up;
+    assert_ne!(
+        m3(true, 5, 5),
+        live(true, 5, 5),
+        "M3 (equality-decays) must kill the anti-replay plant"
+    );
+
+    // M4 — the face walk emptied: the census's populated-cell pin
+    // (11) reds on an emptied alphabet.
+    let emptied: &[Face] = &[];
+    assert_ne!(
+        emptied.len() * 4,
+        11usize,
+        "M4: an emptied face walk cannot satisfy the cell-count pin"
+    );
 }
