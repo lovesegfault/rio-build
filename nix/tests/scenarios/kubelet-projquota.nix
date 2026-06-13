@@ -40,6 +40,18 @@
 #                       which the manual-projid probe structurally
 #                       cannot.
 #
+#   provisioned node,   live_063 — the FOURTH decline mode's missing
+#   hostUsers:true:     cell (the one that would have caught the 0/1912
+#                       silence pre-deploy): same provisioned node, the
+#                       PRODUCTION posture (drift-pinned to values.yaml
+#                       poolDefaults — never hand-written). kubelet
+#                       refuses SupportsQuotas for host-user pods, so
+#                       the cell asserts the BUILDER-MINTED path:
+#                       quota.rs ensure_project_quota self-assigns a
+#                       projid from the builder-owned range below
+#                       kubelet's allocator, and the unchanged
+#                       production reader returns Some.
+#
 # Tier disclosure (honest): the completion-row threading
 # (monitor max-track → BuildCompleted.peak_disk_bytes) is pinned at
 # unit level in rio-builder; this scenario proves the link the fleet
@@ -57,6 +69,15 @@
 let
   inherit (common) rio-workspace;
   probe = "${rio-workspace}/bin/quota_probe";
+
+  # live_063 (the fourth decline mode's posture pin): the production
+  # pool spec the hostUsers:true cell's posture DERIVES from. The
+  # testScript drift-asserts the manifest posture against
+  # poolDefaults.hostUsers in this file — a hand-written posture here
+  # is exactly how live_063 happened (the wave-12 witness ran
+  # hostUsers:false while every production pool ran true, and the
+  # provisioned × true cell never existed).
+  prodValues = ../../../infra/helm/rio-build/values.yaml;
 
   # Deterministic in-VM workload image (airgapped test: no registry).
   workloadImage = pkgs.dockerTools.buildImage {
@@ -87,9 +108,13 @@ let
       name: scratch-writer
       namespace: default
     spec:
-      # The builder pods' standing posture (sec.pod.host-users-false);
-      # kubelet's fsquota assignment is userns-conditioned at the
-      # deployed minor — quotas apply to user-namespaced pods.
+      # The USERNS posture — what kubelet's fsquota covers (assignment
+      # is userns-conditioned at the deployed minor). This is the
+      # sec.pod.host-users-false DEFERRED target, NOT the production
+      # builders' standing posture (they run hostUsers:true until
+      # P0560 — the live_063 cell below covers that half; this
+      # comment's previous "standing posture" claim was the same rot
+      # the three live_063 homes carried).
       hostUsers: false
       restartPolicy: Never
       containers:
@@ -144,6 +169,60 @@ let
           emptyDir: {}
   '';
 
+  # live_063 — the FOURTH decline mode's witness pod: the PRODUCTION
+  # posture (hostUsers:true, drift-pinned to the pool spec below) on
+  # the PROVISIONED node. kubelet 1.36 refuses SupportsQuotas for
+  # host-user pods, so with modes 1-3 healthy the ONLY Some-path is
+  # the builder-minted projid (quota.rs ensure_project_quota, invoked
+  # here via `quota_probe --ensure` — the production acquisition face
+  # standing in for setup_overlay; the setup_overlay→ensure threading
+  # is pinned at unit level in rio-builder, the same tier split as the
+  # completion-row threading disclosed above). Privilege shape mirrors
+  # the production builder pod (root + CAP_SYS_ADMIN, pool/pod.rs):
+  # under hostUsers:true the pod IS in the init userns — exactly the
+  # jurisdiction where the kernel permits FS_IOC_FSSETXATTR projid
+  # changes (their refusal outside it is WHY kubelet's userns-only
+  # half and this half partition the posture space).
+  #
+  # `sleep 86399` (not 86400): the uid_map subtests pgrep their pod's
+  # parked process by its distinct sleep duration — two pods park on
+  # this node.
+  hostUsersPodManifest = pkgs.writeText "scratch-writer-hostusers.yaml" ''
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: scratch-writer-hostusers
+      namespace: default
+    spec:
+      hostUsers: true
+      restartPolicy: Never
+      containers:
+        - name: writer
+          image: rio-test/scratch-writer:v1
+          imagePullPolicy: Never
+          command:
+            - /bin/sh
+            - -c
+            - "${probe} --ensure /scratch && dd if=/dev/zero of=/scratch/fill bs=1M count=64 && touch /scratch/done && sleep 86399"
+          securityContext:
+            capabilities:
+              add: ["SYS_ADMIN"]
+          volumeMounts:
+            - name: scratch
+              mountPath: /scratch
+            - name: nix-store
+              mountPath: /nix/store
+              readOnly: true
+      volumes:
+        - name: scratch
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: nix-store
+          hostPath:
+            path: /nix/store
+            type: Directory
+  '';
+
   k3sNode = provisioned: {
     virtualisation = {
       memorySize = 3072;
@@ -184,6 +263,10 @@ let
         # The denomination cells need the second pod only where
         # quotas exist.
         scratch-writer-unsized.source = unsizedPodManifest;
+        # The live_063 cell's pod likewise runs only where the
+        # provisioning half holds — the unprovisioned twin keeps
+        # reproducing today's fleet with the original pod alone.
+        scratch-writer-hostusers.source = hostUsersPodManifest;
       };
     };
 
@@ -261,7 +344,7 @@ pkgs.testers.runNixOSTest {
             "k3s kubectl get pod " + pod + " -o jsonpath='{.status.phase}' | grep -E 'Running|Succeeded'",
             timeout=420,
         )
-        # Resolve the emptyDir BY POD UID (two pods share the volume
+        # Resolve the emptyDir BY POD UID (three pods share the volume
         # name); the dir is the one KUBELET created — no manual
         # projid anywhere in this scenario (the live060-d
         # discrimination).
@@ -285,7 +368,7 @@ pkgs.testers.runNixOSTest {
         assert "xfs" in out and "prjquota" in out, repr(out)
 
     with subtest("the pod is genuinely user-namespaced (the quota precondition)"):
-        path = wait_pod_wrote(provisioned)
+        path = wait_pod_wrote(provisioned, "scratch-writer")
         uid_map = provisioned.succeed(
             "cat /proc/$(pgrep -f 'sleep 86400' | head -n1)/uid_map"
         ).split()
@@ -356,11 +439,77 @@ pkgs.testers.runNixOSTest {
             "the unsized pod's usage is untracked: " + repr(ukv)
         )
 
+    with subtest("live_063: the witness posture derives from the production pool spec"):
+        # The R31' fixture-derivation face: hostUsers:true in the
+        # scratch-writer-hostusers manifest is NOT hand-chosen — it is
+        # pinned to the production pool defaults. When production
+        # flips to false (P0560 deletes the I-186 pin), this red
+        # forces the cell's re-derivation instead of letting the
+        # witness rot against a stale posture (live_063 inverted:
+        # the wave-12 witness hand-wrote false while the fleet ran
+        # true, and the production cell never existed).
+        prod = None
+        in_defaults = False
+        for line in open("${prodValues}"):
+            if line.rstrip() == "poolDefaults:":
+                in_defaults = True
+                continue
+            if in_defaults and line.strip() and not line.startswith(" "):
+                break
+            if in_defaults and line.strip().startswith("hostUsers:"):
+                prod = line.split(":", 1)[1].strip()
+                break
+        assert prod == "true", (
+            "production poolDefaults.hostUsers is " + repr(prod) + " but this "
+            "witness cell runs hostUsers:true - re-derive the cell (the "
+            "builder-minted path is posture-conditional)"
+        )
+
+    with subtest("live_063 (the missing cell): provisioned x hostUsers:true -> builder-minted Some"):
+        path2 = wait_pod_wrote(provisioned, "scratch-writer-hostusers")
+        # The inverse posture precondition: this pod is genuinely
+        # HOST-user (identity uid_map), i.e. exactly the posture
+        # kubelet's fsquota refuses — any Some below is the builder's.
+        uid_map = provisioned.succeed(
+            "cat /proc/$(pgrep -f 'sleep 86399' | head -n1)/uid_map"
+        ).split()
+        assert uid_map[0] == "0" and uid_map[1] == "0", (
+            "the pod is user-namespaced despite hostUsers:true - the cell "
+            "is not testing the production posture; uid_map: " + " ".join(uid_map)
+        )
+        kv = probe_kv(provisioned, path2)
+        # THE live_063 red, verbatim shape: pre-fix (no builder mint)
+        # this emptyDir has projid 0 and the production reader returns
+        # None on a FULLY PROVISIONED node — the fourth decline mode.
+        assert kv["quota_used"] != "none", (
+            "THE LIVE_063 RED: provisioned x hostUsers:true still yields "
+            "None - kubelet declined (host-user pod) and no builder mint "
+            "fired: " + repr(kv)
+        )
+        assert int(kv["quota_used"]) >= 64 * 1024 * 1024, (
+            "quota tracking missed the 64 MiB scratch write through the "
+            "builder-minted projid: " + repr(kv)
+        )
+        # The id sits in the builder-owned range [2^19, 2^20) — below
+        # kubelet's 1048576+ allocator BY CONSTRUCTION (quota.rs's
+        # compile-time range assert; this is its kernel-coupled echo).
+        projid = int(kv["projid"])
+        assert 524288 <= projid < 1048576, (
+            "projid outside the builder-owned range - collision "
+            "discipline broken or kubelet unexpectedly assigned: " + repr(kv)
+        )
+        # The mint trace: the production acquisition face reported a
+        # FRESH mint (not an observed kubelet id) inside the pod.
+        logs = provisioned.succeed("k3s kubectl logs scratch-writer-hostusers")
+        assert "ensure=minted" in logs, (
+            "the production ensure face did not report a mint: " + repr(logs)
+        )
+
     with subtest("RED reproduced (W12-LI): today's fleet shape yields None"):
         unprovisioned.start()
         unprovisioned.wait_for_unit("k3s.service")
         unprovisioned.wait_until_succeeds("k3s kubectl get node | grep -q ' Ready'", timeout=900)
-        path = wait_pod_wrote(unprovisioned)
+        path = wait_pod_wrote(unprovisioned, "scratch-writer")
         kv = probe_kv(unprovisioned, path)
         assert kv["quota_used"] == "none", (
             "the un-provisioned node unexpectedly produced a quota "

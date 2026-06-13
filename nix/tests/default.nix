@@ -748,6 +748,12 @@ in
   # witnesses the kernel half; this witnesses the kubelet half). The
   # un-provisioned twin node reproduces today's fleet (None) so the
   # red stays red.
+  # live_063 extends it with the fourth-decline-mode cell: the same
+  # provisioned node × the PRODUCTION hostUsers:true posture
+  # (drift-pinned to values.yaml poolDefaults), where kubelet refuses
+  # quota assignment and the BUILDER-MINTED projid (quota.rs
+  # ensure_project_quota — the cell invokes the production acquisition
+  # face via quota_probe --ensure) is the only Some-path.
   # r[verify infra.node.kubelet-prjquota+1]
   vm-kubelet-projquota-standalone = kubelet-projquota {
     inherit pkgs common;
