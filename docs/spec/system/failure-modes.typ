@@ -615,6 +615,32 @@ doctrine above (#rref("sys.gate.static-cadence-witness")).
   green and the build-time strawman red recorded
   (#rref("store.log.arrival-clock+2")).
 
+- *Low-load streak funding (controller componentscaler --- the
+  sensor-coupled funding-predicate tier, merged_bug_009)*: the
+  ratio-growth funding gate's reset lived only inside the low-reading
+  arm, so the working-vs-idle classification --- computable without
+  the load reading --- was evaluated only when the poll clock ticked;
+  with scale-to-zero targets (`replicas.min: 0` ⇒ zero pods ⇒ zero
+  resolved addresses ⇒ no reading) sensor absence is correlated with
+  the idle regime the gate classifies, the reset was structurally
+  unreachable across the idle window, and the parked streak funded
+  growth on the first busy low tick with zero working evidence ---
+  the doctrine's clause (iii) tier
+  (#rref("sys.gate.static-cadence-witness")). Closed by hoisting the
+  sensor-free conjunct to the observation-alphabet boundary (idle and
+  at-min ticks reset on every tick, reading or none), reserving
+  preserve-on-absent for the genuinely evidence-ambiguous cell
+  (working, load unknown) under a staleness decay (one banked tick
+  consumed per ambiguous tick), so the carried-evidence envelope is
+  priced by the two constants alone --- at most the full streak
+  length, 30 ticks = 300 s, of sensor outage expires any bank ---
+  with no new clock or cross-tick state. Witnessed across the
+  scale-to-zero idle window (the banked streak resets on the
+  observation-absent ticks and growth demands the documented 30
+  consecutive working ticks rebuilt from the transition), with the
+  legitimate preserve face and the outage-expiry face pinned
+  (#rref("ctrl.scaler.evidence-funding+2")).
+
 = Polarity Riders (R33' instance register)
 
 One producer mint feeding opposite-polarity readers is a standing

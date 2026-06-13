@@ -30,10 +30,21 @@
 //! K-mutation battery over the census's own control flow (each
 //! seeded mutation must MISS the plant the intact census catches).
 //!
-//! PROVISIONAL (T0-disclosed): authored in the standing [GEN-SET]
-//! census shape pending the wave's H1-pack census-grammar post;
-//! re-verified at the integration rebase (grammar consumer, never
-//! re-deriver).
+//! H1-pack grammar consumption (re-verified at the integration
+//! rebase against the landed S1 censuses — consumer, never
+//! re-deriver): this census carries the posted grammar's four faces
+//! in the same shape the producer-reachability and letter-reader
+//! censuses carry them — (i) the population is DERIVED (consult
+//! shapes over the embedded universe — type/shape selection, never
+//! a name list), (ii) per member the census cross-checks the
+//! classification against the blessed/exception disposition and
+//! drives the discrimination at site granularity, (iii) the planted
+//! red lives INSIDE the population (the condemned-peek plant + the
+//! same-file duplicate), (iv) the K-mutation battery seeds the
+//! census's own control flow (population walk, key lane, window,
+//! shape needle, jurisdiction) and every arm must miss the plant.
+//! The S1 packs' own census homes stay theirs; nothing here
+//! re-derives them.
 
 #[path = "census_universe.rs"]
 mod census_universe;
