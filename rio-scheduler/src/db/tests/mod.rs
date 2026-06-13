@@ -20,6 +20,7 @@ mod fenced_tx;
 mod history;
 mod live_pins;
 mod materialization;
+mod mbt_fence;
 mod open_attempts;
 mod recovery;
 mod tenants;

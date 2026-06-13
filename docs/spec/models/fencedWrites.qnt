@@ -852,4 +852,72 @@ module fencedWritesT1 {
     ENABLE_OUTBOX = true,
     ENABLE_TENURE_LIFECYCLE = true
   ).*
+
+  // --- named conformance runs (OP-2: the mbt-rio-fence replay) -------
+  //
+  // db/tests/mbt_fence.rs mirrors each action list verbatim and diffs
+  // the implementation's projected state against the model's after
+  // every step (`quint test --match=^<run>$ --out-itf` is the trace
+  // source). The runs double as in-model regression tests: each
+  // `.expect` clause re-checks the post-state on every `quint test`.
+
+  /// Mint -> exec-keyed close -> floor ratchet -> successor claim ->
+  /// fence refusal -> retryable answer: one pass over every legacy
+  /// plane surface the db-level driver maps.
+  run fenceHappyPathRun =
+    init
+      .then(beginTx("r1"))
+      .then(guardedUpsertCommit("r1"))
+      .then(beginTx("r1"))
+      .then(fencedCloseNamed("r1", 1))
+      .then(beginTx("r1"))
+      .then(floorWriteGreatest("r1", 2))
+      .then(successorClaim("r2"))
+      .then(beginTx("r1"))
+      .then(fenceRefuse("r1"))
+      .then(answerRetryable("r1"))
+      .expect(and {
+        activeGen == 0,
+        resourceFloor == 2,
+        committedClaims == Set(1, 2),
+        not(clientGaveUp),
+        not(belowFloorMutation),
+      })
+
+  /// The merged_bug_011 acceptance shape (OQ-12): the outbox latches
+  /// the active exec, the derivation ADVANCES past the latch (the
+  /// resubmit re-mint rewrites exec_id in place), and the guarded
+  /// flush applies NOTHING — no stale apply, no close off the latched
+  /// exec, the successor attempt survives.
+  run fenceOutboxReplayRun =
+    init
+      .then(beginTx("r1"))
+      .then(guardedUpsertCommit("r1"))
+      .then(latchFailedPersist("r1"))
+      .then(advanceDerivation("r1"))
+      .then(flushReplayGuarded("r1"))
+      .expect(and {
+        activeExec == 2,
+        execsMinted == 2,
+        latchedExec == 0,
+        not(staleReplayApplied),
+        not(successorExecClosed),
+      })
+
+  /// The failover settle (TB-4 face (b) coverage): a LIVE successor
+  /// closes the exec a predecessor minted — the daily report/sweep
+  /// path the former owner gate excluded from the verified space.
+  run fenceForeignSettleRun =
+    init
+      .then(beginTx("r1"))
+      .then(guardedUpsertCommit("r1"))
+      .then(successorClaim("r2"))
+      .then(beginTx("r2"))
+      .then(fencedCloseNamed("r2", 1))
+      .expect(and {
+        activeGen == 0,
+        foreignSettleApplied,
+        not(deposedCloseApplied),
+        not(closeScopeViolated),
+      })
 }
