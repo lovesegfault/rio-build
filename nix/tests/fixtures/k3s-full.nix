@@ -1011,14 +1011,25 @@ rec {
     # for. The reconciler patches `.status` on first reconcile;
     # presence of status confirms the controller has seen the CR and
     # the Job-spawn loop is live. First build in each test triggers a
-    # Job spawn (~10s reconcile tick + ~10s pod schedule). 120s budget:
-    # gatewayEnabled adds gateway-api CRD + cilium-operator reconcile
-    # load; under builder contention 60s was the tail, not typical.
+    # Job spawn (~10s reconcile tick + ~10s pod schedule).
+    #
+    # 240s budget — priced for the COMPOSED-TREE CONTENTION TAIL, not
+    # typical. The structural condition (`.status` non-empty) is the
+    # controller-first-reconcile witness; the budget is the safety
+    # net. History: 60s was calm-host typical; 120s held until the
+    # bw13 composed-tree gates, where this poll timed out at 120.17s
+    # under 18+ concurrent VM builds and the diagnostic dump observed
+    # the pool CR sitting 190s with empty status (controller alive,
+    # no errors — startup contention only). 240s ≈ 1.25× that
+    # observed tail. The fixture-wide globalTimeout backstops a
+    # genuine controller hang; this per-wait budget exists for
+    # diagnostic precision (which setup leg stalled), not as the
+    # property under test.
     try:
         k3s_server.wait_until_succeeds(
             "k3s kubectl -n ${nsBuilders} get pool x86-64 "
             "-o jsonpath='{.status}' | grep -q .",
-            timeout=120,
+            timeout=240,
         )
     except Exception:
         print("=== pool .status TIMEOUT — diagnostic dump ===")

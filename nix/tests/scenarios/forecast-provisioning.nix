@@ -123,12 +123,18 @@ pkgs.testers.runNixOSTest {
     # populated (LiveNode::from input). On timeout dump kwok-controller
     # logs — KWOK swallows gojq selector / template errors at info
     # level, so a regressed Stage rule looks like silence otherwise.
+    #
+    # 120s budget — composed-tree contention tail. 5s nominal (the
+    # KWOK Stage delays) + reconcile ticks; 60s held calm but timed
+    # out at 60.29s under the bw13 composed-tree gate (18+ concurrent
+    # VM builds; the KWOK controller restart above adds a discovery
+    # round-trip). Setup precondition, not a property under test.
     try:
         k3s_server.wait_until_succeeds(
             "k3s kubectl get nodeclaims -l rio.build/nodeclaim-pool=builder "
             "-o jsonpath='{.items[*].status.conditions[?(@.type==\"Registered\")].status}' "
             "| grep -q True",
-            timeout=60,
+            timeout=120,
         )
     except Exception:
         print("=== NodeClaim never Registered — kwok Stage rule did not fire ===")
@@ -185,14 +191,18 @@ pkgs.testers.runNixOSTest {
         f"k3s kubectl get node {nc0['status']['nodeName']} "
         "-o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' "
         "| grep -q True",
-        timeout=60,
+        timeout=120,
     )
 
     # ── builder Job stamped schedulerName=kube-build-scheduler ───────
     # PlaceableGate publishes after a Registered claim appears; next
     # Pool-reconciler tick spawns Jobs with kube-build-scheduler +
     # priorityClassName per r[ctrl.nodeclaim.priority-bucket].
-    wait_worker_pod(pool="x86-64", ns="${nsBuilders}", timeout=120)
+    # No timeout override: wait_worker_pod's 180s default is priced
+    # for the pool-reconcile + Job-spawn + pod-schedule tail; the
+    # prior 120s override timed out at 120.83s under the bw13
+    # composed-tree gate.
+    wait_worker_pod(pool="x86-64", ns="${nsBuilders}")
     with subtest("builder pod has schedulerName=kube-build-scheduler + priorityClass"):
         pod = k3s_server.succeed(
             "k3s kubectl -n ${nsBuilders} get pods -l rio.build/pool=x86-64 "
