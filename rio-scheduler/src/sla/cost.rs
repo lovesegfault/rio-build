@@ -4621,7 +4621,7 @@ mod tests {
         };
         // Batch schedule: a every 600s; b every third batch (1800s
         // of exposure per wave, stamped at the wave batch).
-        let mut consume = async |t: &mut CostTable| {
+        let consume = async |t: &mut CostTable| {
             t.refresh_lambda(&sdb).await.unwrap();
             t.refresh_lambda(&sdb).await.unwrap();
         };

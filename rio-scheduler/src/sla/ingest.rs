@@ -2765,10 +2765,10 @@ mod disk_axis_tests {
                     "sizing"
                 } else if window.contains(".hash(") {
                     "narration"
-                } else if t.starts_with("pub disk_p90") {
-                    "mint" // the typed field decls (type-home module)
-                } else if mint_module {
-                    "mint" // producer-internal destructure/init shapes
+                } else if t.starts_with("pub disk_p90") || mint_module {
+                    // the typed field decls (type-home module) and
+                    // producer-internal destructure/init shapes
+                    "mint"
                 } else {
                     return Err(format!(
                         "{name}:{}: unclassifiable `{face}` consult — \
@@ -3128,10 +3128,8 @@ mod disk_axis_tests {
                     if !temporal.contains(&col) {
                         temporal.push(col.clone());
                     }
-                } else if rhs.contains("::float8") {
-                    if !float8.contains(&col) {
-                        float8.push(col.clone());
-                    }
+                } else if rhs.contains("::float8") && !float8.contains(&col) {
+                    float8.push(col.clone());
                 }
             }
         }
@@ -3251,7 +3249,8 @@ mod disk_axis_tests {
             }
             quals.sort();
             aggs.sort();
-            let (want_quals, want_aggs): (Vec<(&str, &str)>, Vec<(&str, &str)>) = match *name {
+            type Rows = Vec<(&'static str, &'static str)>;
+            let (want_quals, want_aggs): (Rows, Rows) = match *name {
                 // cost.rs — the lambda-unit plane. Coverage per row:
                 //   value <= ×2  : the cursor fence qual + the heal
                 //                  arm's own 2^53 bound (the artifact)
