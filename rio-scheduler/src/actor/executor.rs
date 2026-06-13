@@ -87,7 +87,7 @@ impl DagActor {
     ///
     /// Leader-gated at the top, so it is the single chokepoint keeping
     /// a deposed leader from writing poison/Ready/terminal-log state
-    /// from a stale DAG (r[sched.lease.standby-drops-writes+3]).
+    /// from a stale DAG (r[sched.lease.standby-drops-writes+4]).
     ///
     /// `reset_to_ready()` handles both Assigned → Ready and Running →
     /// Failed → Ready. A derivation in any other state (Completed,
@@ -129,7 +129,7 @@ impl DagActor {
         kind: crate::state::AttemptKind,
         lost_worker: Option<&ExecutorId>,
     ) {
-        // r[impl sched.lease.standby-drops-writes+3]
+        // r[impl sched.lease.standby-drops-writes+4]
         // Same defense-in-depth as the ProcessCompletion/CancelBuild arm
         // gates (mod.rs). A deposed leader processing a stale loss
         // against its stale DAG would otherwise:

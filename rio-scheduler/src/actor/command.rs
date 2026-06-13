@@ -37,7 +37,7 @@ use super::handle::DebugDerivationInfo;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AckApplyError {
     /// Deposed between the gRPC-layer leader check and the actor
-    /// drain (`r[sched.lease.standby-drops-writes+3]`
+    /// drain (`r[sched.lease.standby-drops-writes+4]`
     /// defense-in-depth): the payload was dropped whole. Pre-fix the
     /// gRPC layer had already answered OK on enqueue, so the
     /// controller wiped consume-once evidence the standby never

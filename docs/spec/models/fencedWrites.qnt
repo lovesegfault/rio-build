@@ -402,10 +402,25 @@ module fencedWrites {
   }
 
   /// begin_fenced's floor read: snapshot the floor VISIBLE NOW.
+  ///
+  /// OP-5 (bughunt-13): the never-led STANDBY's begin is IN-ALPHABET
+  /// — a pooled connection can always open a transaction; the FENCE
+  /// is what refuses it (production: a standby's stamp saturates to
+  /// 0, below every floor — `ServingGeneration::to_kernel_u64`'s
+  /// fail-closed projection; `at_or_above_floor(Some(f), 0)` is
+  /// false). The former `replicaGen > 0` guard excluded the exact
+  /// trace `sched.lease.standby-drops-writes` quantifies over, so
+  /// the rule was green by OMISSION (the enabledness shape). In this
+  /// model every reachable floor is >= 1 (init commits claim 1), so
+  /// a gen-0 begin can only continue into fenceRefuse — the
+  /// nonHolderWriteNeverCommits law below. Out-of-space note: a
+  /// FRESH cluster's None-floor admits any generation in production
+  /// (`at_or_above_floor(None, _)`) — outside this model's space by
+  /// init construction, and the existing fresh-cluster trust posture
+  /// (`begin_fenced`'s doc) prices it.
   // Mirrors: rio-scheduler/src/db/mod.rs:begin_fenced
   action beginTx(r: str): bool = all {
     txPhase.get(r) == TxIdle,
-    replicaGen.get(r) > 0,
     txPhase' = txPhase.set(r, TxFloorRead(currentFloor)),
     pendingRefusal' = pendingRefusal,
     claimsUnchanged, rowUnchanged, floorUnchanged, latchesUnchanged,
@@ -771,6 +786,34 @@ module fencedWrites {
   /// only fenceRefuse); bites under the 231/273 calibration steps.
   val belowFloorTxNeverMutates = not(belowFloorMutation)
 
+  /// OP-5 (bughunt-13): the sched.lease.standby-drops-writes pin —
+  /// a NON-HOLDER's write never commits: any transaction whose
+  /// begin-time floor exceeded its replica's generation (the
+  /// never-led standby at gen 0 — now in-alphabet via the relaxed
+  /// beginTx — and the deposed-at-begin ex-leader alike) mutates
+  /// nothing. Same oracle seat as belowFloorTxNeverMutates
+  /// (snapshotExceedsGen, computed in every mutation apply): the
+  /// model's holdership projection IS the generation order, so the
+  /// two law names share one latch — this val is the spec rule's
+  /// falsifiable verify site, that one is the open-coded-compare
+  /// class; each carries its own twin. The in-flight residual (a
+  /// transaction begun BEFORE the deposing claim was visible) is
+  /// deliberately outside this law and damage-bounded by
+  /// activeRowGenMonotonic + directCloseHitsOnlyNamedExec +
+  /// openAttemptViewStableUnderDeposedClose + resourceFloorMonotonic.
+  /// Falsifiability pair: calibration fence-op5-standby-write.
+  val nonHolderWriteNeverCommits = not(belowFloorMutation)
+
+  /// OP-5 non-vacuity witness (expected VIOLATED by its wired
+  /// check): the standby's queued write is ATTEMPTED and refused —
+  /// the begin+refusal trace is in-space, so
+  /// nonHolderWriteNeverCommits is not green by omission (the
+  /// enabledness shape this pin retires).
+  val noStandbyRefusal = not(REPLICAS.exists(r => and {
+    replicaGen.get(r) == 0,
+    pendingRefusal.get(r),
+  }))
+
   /// bug_273: the resource floor is monotone.
   /// Falsifiability pair: calibration fence-273-plain-floor-set.
   val resourceFloorMonotonic = not(floorRegressed)
@@ -829,6 +872,7 @@ module fencedWrites {
   val fencedWritesAll = and {
     activeRowGenMonotonic,
     belowFloorTxNeverMutates,
+    nonHolderWriteNeverCommits,
     resourceFloorMonotonic,
     openAttemptViewStableUnderDeposedClose,
     directCloseHitsOnlyNamedExec,
@@ -902,6 +946,24 @@ module fencedWritesT1 {
         latchedExec == 0,
         not(staleReplayApplied),
         not(successorExecClosed),
+      })
+
+  /// OP-5: the standby's queued write — a never-led replica's pooled
+  /// connection opens a transaction, the fence refuses it at the
+  /// floor read, and the refusal is answered retryably. The rule's
+  /// own trace (sched.lease.standby-drops-writes), previously
+  /// outside the alphabet.
+  run fenceStandbyRefusalRun =
+    init
+      .then(beginTx("r2"))
+      .then(fenceRefuse("r2"))
+      .then(answerRetryable("r2"))
+      .expect(and {
+        replicaGen.get("r2") == 0,
+        not(belowFloorMutation),
+        not(clientGaveUp),
+        activeGen == 0,
+        execsMinted == 0,
       })
 
   /// The failover settle (TB-4 face (b) coverage): a LIVE successor

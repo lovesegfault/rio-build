@@ -7225,6 +7225,15 @@ rec {
     # ~1.4 s and its as-built baseline holds in ~1.8 s; the two
     # reachability witnesses (noDirectCloseApplied, noForeignSettle)
     # violate in ~1.0-1.6 s.
+    #
+    # OP-5 re-measure (the standby begin joins the alphabet —
+    # beginTx's gen>0 guard dropped): T1 exhaustive ~18.7 s (the gen-0
+    # begin/refuse/answer cycle adds txPhase x pendingRefusal states
+    # for never-led replicas; still seconds-class). All TEN
+    # calibration falsifications re-verified red with green as-built
+    # baselines post-relaxation; the standby twin
+    # (fence-op5-standby-write) reds in ~1.2 s; noStandbyRefusal
+    # violates in ~1.3 s.
     # ------------------------------------------------------------------
     # Bughunt-2 planes (slot 2): the same board gains (1) the
     # tenure-stamp plane — writesCarryClaimedTenure (merged_bug_338:
@@ -7244,6 +7253,7 @@ rec {
     # r[verify sched.lease.tenure-stamp-type]
     # r[verify sched.recovery.step-down+3]
     # r[verify sched.attempt.cancel-close-driven+3]
+    # r[verify sched.lease.standby-drops-writes+4]
     quint-fenced-writes = mkQuintCheck {
       name = "fenced-writes";
       spec = "fencedWrites";
@@ -7353,6 +7363,27 @@ rec {
       spec = "fencedWrites";
       main = "fencedWritesT1";
       witness = "noForeignSettle";
+    };
+    # OP-5 (bughunt-13): the sched.lease.standby-drops-writes pin's
+    # falsification twin — a never-led standby's queued write with the
+    # begin fence dropped commits under a stale (zero) generation; the
+    # snapshotExceedsGen oracle latches it live.
+    quint-fence-calib-op5-standby-write = mkQuintWitnessCheck {
+      name = "fence-calib-op5-standby-write";
+      spec = "calibration/fence-op5-standby-write";
+      main = "fenceCalibOp5StandbyWrite";
+      extraSpecs = [ "fencedWrites" ];
+      step = "calibStep";
+      witness = "nonHolderWriteNeverCommits";
+    };
+    # OP-5 non-vacuity (expected VIOLATED against the LIVE step): the
+    # standby's begin+refusal trace is in-space — the law is not green
+    # by omission (the enabledness shape the pin retires).
+    quint-fence-witness-standby-refusal = mkQuintWitnessCheck {
+      name = "fence-witness-standby-refusal";
+      spec = "fencedWrites";
+      main = "fencedWritesT1";
+      witness = "noStandbyRefusal";
     };
 
     # ------------------------------------------------------------------

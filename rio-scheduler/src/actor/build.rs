@@ -890,7 +890,7 @@ impl DagActor {
         // that child's removal is its only wake-up edge
         // (`sched.poison.clear-survivor-reevaluation`).
         //
-        // r[impl sched.lease.standby-drops-writes+3]
+        // r[impl sched.lease.standby-drops-writes+4]
         // Leader-gated (the standby-drops-writes discipline): the
         // rest of this handler stays ungated (in-memory build/
         // event-map removal and the DAG reap run on standby as before),

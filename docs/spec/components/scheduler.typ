@@ -4345,15 +4345,23 @@ condition, and the response-anchoring premise (the renew attempt deadline
 keeps the response-anchored fence within the commit-anchored bound the
 model assumes) so no constant moves without the others.
 
-#r("sched.lease.standby-drops-writes+3")[
+#r("sched.lease.standby-drops-writes+4")[
   A replica that has lost the lease MUST NOT write scheduler-owned PG state
-  (`derivations`, `realisations`, `build_samples`). The
-  pull-mode work surfaces are leader-gated at the gRPC layer and the fenced
-  transactions re-check the durable floor
-  (#rref("sched.lease.generation-fence")). `ProcessCompletion`, `CancelBuild`,
+  (`derivations`, `realisations`, `build_samples`). The enforcement is the
+  durable fence, held falsifiable: every decision-state transaction begins
+  through the claims-floor re-check (#rref("sched.lease.generation-fence")),
+  and the wired `nonHolderWriteNeverCommits` invariant
+  (`docs/spec/models/fencedWrites.qnt`, with its standby-write falsification
+  twin and the standby-refusal reachability witness) pins that a transaction
+  whose begin-time floor exceeds its replica's generation mutates nothing ---
+  a standby's pooled connection with a queued write is REFUSED at begin, not
+  merely never asked. The bounded in-flight residual (a transaction begun
+  before the deposing claim became visible) is damage-bounded by the same
+  module's row, floor, and close-scope monotonicity invariants. The pull-mode
+  work surfaces being leader-gated at the gRPC layer is defense-in-depth,
+  never the law's standing; `ProcessCompletion`, `CancelBuild`,
   `AckSpawnedIntents`, `ReconcileAssignments`,
-  `SubstituteComplete`, and `Tick` are additionally gated at actor dispatch as
-  defense-in-depth.
+  `SubstituteComplete`, and `Tick` are additionally gated at actor dispatch.
   `reassign_derivations` --- the requeue tail that can poison a derivation
   and run the terminal log epilogue --- is individually leader-gated at its
   own chokepoint (the stream-era arms it used to ride behind ---

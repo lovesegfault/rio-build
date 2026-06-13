@@ -367,7 +367,11 @@ impl FenceSystem {
                     matches!(self.tx.get(r), Some(TxSlot::Idle)),
                     "beginTx({r}): the model requires TxIdle"
                 );
-                let g = self.gen_of(r)?;
+                // OP-5: a never-led standby's pooled connection CAN
+                // begin (gen 0 — the fail-closed stamp below every
+                // floor); the fence decides, mirroring the model's
+                // relaxed beginTx guard.
+                let g = *self.gens.get(r).context("known replica")?;
                 let slot = match self.db.begin_fenced(gen_stamp(g)).await? {
                     FencedBegin::Open(ftx) => TxSlot::Open(ftx),
                     FencedBegin::Fenced { floor } => TxSlot::Fenced { floor },
@@ -376,7 +380,7 @@ impl FenceSystem {
             }
             Act::FenceRefuse { r } => match self.take_slot(r) {
                 TxSlot::Fenced { floor } => {
-                    let g = self.gen_of(r)?;
+                    let g = *self.gens.get(r).context("known replica")?;
                     ensure!(
                         floor > g,
                         "fenceRefuse({r}): production refused at floor {floor} \
@@ -691,6 +695,23 @@ const OUTBOX_REPLAY: NamedRun = NamedRun {
     },
 };
 
+/// `fenceStandbyRefusalRun` (OP-5): the standby's queued write — a
+/// never-led replica's pooled connection begins, the fence refuses
+/// at the floor read (the gen-0 stamp is below every floor), and the
+/// refusal maps to the retryable family. The
+/// sched.lease.standby-drops-writes trace, replayed against the real
+/// fence instead of resting on the gRPC gate's enabledness.
+const STANDBY_REFUSAL: NamedRun = NamedRun {
+    run: "fenceStandbyRefusalRun",
+    actions: || {
+        vec![
+            Act::BeginTx { r: "r2" },
+            Act::FenceRefuse { r: "r2" },
+            Act::AnswerRetryable { r: "r2" },
+        ]
+    },
+};
+
 /// `fenceForeignSettleRun`: the failover settle (TB-4 face (b)) — a
 /// live successor closes the exec its predecessor minted.
 const FOREIGN_SETTLE: NamedRun = NamedRun {
@@ -823,6 +844,13 @@ fn mbt_fence_run_outbox_replay() {
 #[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
 fn mbt_fence_run_foreign_settle() {
     replay(&FOREIGN_SETTLE, None).unwrap();
+}
+
+// r[verify sched.lease.standby-drops-writes+4]
+#[test]
+#[ignore = "shells out to quint; run by the dedicated MBT check with --run-ignored"]
+fn mbt_fence_run_standby_refusal() {
+    replay(&STANDBY_REFUSAL, None).unwrap();
 }
 
 /// The OQ-12 acceptance red (W13-AS, strawman half): the PRE-FIX

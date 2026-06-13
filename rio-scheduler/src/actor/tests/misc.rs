@@ -86,7 +86,7 @@ fn spawn_actor_with_flags(
 /// controller's commit-on-Ack buffer survives to redeliver at the
 /// next leader. `left:` pre-fix the handler answered OK on
 /// `send_unchecked` enqueue while the standby dropped the payload
-/// whole (r[sched.lease.standby-drops-writes+3] defense-in-depth) —
+/// whole (r[sched.lease.standby-drops-writes+4] defense-in-depth) —
 /// the controller then cleared consume-once evidence that was never
 /// applied. `right:` leader applies → `Ok`; deposed → typed refusal.
 // r[verify ctrl.nodeclaim.evidence-ack-latch+3]

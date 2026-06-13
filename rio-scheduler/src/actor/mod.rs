@@ -1642,7 +1642,7 @@ impl DagActor {
                     final_resources,
                     final_line_count,
                 } => {
-                    // r[impl sched.lease.standby-drops-writes+3]
+                    // r[impl sched.lease.standby-drops-writes+4]
                     // Defense-in-depth under the stream-reader's
                     // generation fence (executor_service.rs): an
                     // ex-leader MUST NOT write terminal PG state
@@ -1671,7 +1671,7 @@ impl DagActor {
                     reason,
                     reply,
                 } => {
-                    // r[impl sched.lease.standby-drops-writes+3]
+                    // r[impl sched.lease.standby-drops-writes+4]
                     // Defense-in-depth like ProcessCompletion: an
                     // ex-leader's cancel writes terminal PG state from
                     // a stale DAG, and its terminal_log_epilogue pins
@@ -1701,7 +1701,7 @@ impl DagActor {
                     executor_token_sha256,
                     reply,
                 } => {
-                    // r[sched.lease.standby-drops-writes+3]: the handler
+                    // r[sched.lease.standby-drops-writes+4]: the handler
                     // self-gates on is_leader() and the mint transaction
                     // carries the durable generation fence.
                     self.handle_pull_assignment(
@@ -1722,7 +1722,7 @@ impl DagActor {
                     instance,
                     reply,
                 } => {
-                    // r[sched.lease.standby-drops-writes+3]: the handler
+                    // r[sched.lease.standby-drops-writes+4]: the handler
                     // self-gates on is_leader() (standby answers empty)
                     // and is read-only either way.
                     self.handle_list_materialization_jobs(limit, instance, reply)
@@ -1734,7 +1734,7 @@ impl DagActor {
                     payload,
                     reply,
                 } => {
-                    // r[sched.lease.standby-drops-writes+3]: the handler
+                    // r[sched.lease.standby-drops-writes+4]: the handler
                     // self-gates on is_leader(); the classification
                     // path it funnels into carries the same appending
                     // discipline as the stream Completion arm.
@@ -1748,7 +1748,7 @@ impl DagActor {
                     resubmit_cycle,
                     reply,
                 } => {
-                    // r[sched.lease.standby-drops-writes+3]: the handler
+                    // r[sched.lease.standby-drops-writes+4]: the handler
                     // self-gates on is_leader(); its only write is the
                     // first-writer-wins reason fill.
                     self.handle_report_attempt_outcome(
@@ -1770,7 +1770,7 @@ impl DagActor {
                     rejected,
                     reply,
                 } => {
-                    // r[impl sched.lease.standby-drops-writes+3] —
+                    // r[impl sched.lease.standby-drops-writes+4] —
                     // ICE state is lease-holder only. merged_bug_005:
                     // the reply makes the defense-in-depth drop
                     // VISIBLE — a deposed drain answers `NotLeader`
