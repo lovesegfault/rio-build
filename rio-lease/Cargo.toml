@@ -37,6 +37,11 @@ tracing = { workspace = true }
 libc = { workspace = true }
 # `became_leader_at` RwLock<Option<Instant>> — Instant is 16B, not atomic.
 parking_lot = { workspace = true }
+# rio_lease_* counters (the standby-strip detection lane) emitted from
+# the detached marks tasks, where the per-component `LeaseHooks` metric
+# seam does not reach. Names are described in-crate at lease-loop start
+# (`describe_lease_metrics`), so every hosting binary carries the HELP.
+metrics = { workspace = true }
 # HOSTNAME-unset fallback in LeaseConfig::from_parts.
 uuid = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
@@ -44,6 +49,9 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 [dev-dependencies]
 # ApiServerVerifier mock for the I/O-shell + hung-apiserver tests.
 rio-test-support = { workspace = true }
+# DebuggingRecorder for the standby-strip counter assertions (W13-I):
+# snapshot exactly once per test — the snapshot DRAINS counters.
+metrics-util = { workspace = true }
 # election.rs mock-apiserver scenarios need http::Method.
 http = { workspace = true }
 # Model-based testing (src/mbt_tests.rs): replay generated traces from

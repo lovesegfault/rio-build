@@ -242,8 +242,11 @@ rules:
   # that peer sweep — it lists pods by the leader label; RBAC cannot
   # label-scope a list, so it is namespace-wide like the patch. `get`
   # carries the bounded-cadence marks verify (sched.lease.marks-verify:
-  # the leader re-reads its OWN pod every MARKS_VERIFY_EVERY rounds and
-  # re-dirties on divergence) and kube-rs's GET-before-PATCH.
+  # EACH replica — leader and standby — re-reads its OWN pod every
+  # MARKS_VERIFY_EVERY rounds and re-dirties on divergence; the standby
+  # polarity is the self-check that strips foreign leader marks) and
+  # kube-rs's GET-before-PATCH. Both replicas run under this same
+  # ServiceAccount, so the standby self-check needs no extra rule.
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, patch]

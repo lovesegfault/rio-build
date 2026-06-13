@@ -6379,6 +6379,8 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "libc",
+ "metrics",
+ "metrics-util",
  "parking_lot",
  "quint-connect",
  "rio-common",

@@ -20191,6 +20191,10 @@
           "packageId": "libc"
         },
         {
+          "name": "metrics",
+          "packageId": "metrics"
+        },
+        {
           "name": "parking_lot",
           "packageId": "parking_lot"
         },
@@ -20231,6 +20235,10 @@
         {
           "name": "itf",
           "packageId": "itf"
+        },
+        {
+          "name": "metrics-util",
+          "packageId": "metrics-util"
         },
         {
           "name": "quint-connect",

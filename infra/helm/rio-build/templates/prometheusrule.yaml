@@ -252,6 +252,53 @@ spec:
               diagnostics and `kubectl describe pod` — restarts are NOT
               expected (a wedge does not crash); a manual restart recovers.
 
+        # F1 (sched.lease.marks-verify, the platform-jurisdiction tier):
+        # the rio-scheduler-leader Service selects pods by LABEL MATCH
+        # ALONE (selectorLabels + rio.build/scheduler-role=leader), so
+        # its ready-endpoint count is the ground truth of who the
+        # dashboard's nginx upstream — which can neither health-probe
+        # nor retry a Trailers-Only UNAVAILABLE — actually reaches.
+        # The in-process detectors (the leader's own-pod verify and the
+        # standby's self-check) bound every falsifier that lands ON a
+        # scheduler pod; this rule covers the selector-membership faces
+        # no pod-side clock can police: a FOREIGN-CREATED pod minted
+        # with the app+role labels (it runs no scheduler binary, so no
+        # self-check ever runs there), a deleted/orphaned pod, or a
+        # label state both replicas' loops have stopped converging.
+        # Both polarities in one expr: 0 ready endpoints = dashboard
+        # down (no pod carries the label); >=2 = dual serve (standby or
+        # foreign pod silently in the data path — requests pin to one
+        # backend, so a session can be 100% broken, not ~half).
+        # `or vector(0)` makes the zero-endpoint polarity fire (an
+        # empty Endpoints object exports NO kube_endpoint_address
+        # series); it also means a kube-state-metrics outage surfaces
+        # here as a 0-count — this template already leans on KSM
+        # (kube_pod_container_status_restarts_total above), and a
+        # monitoring hole over the leader Service is itself pageworthy.
+        # `for: 5m` prices rollouts and failovers (label converges
+        # within one reconcile, ~seconds; the standby self-check bounds
+        # a pod-side falsifier at ~MARKS_VERIFY_EVERY renews ≈ 60s+5s);
+        # the residual faces this rule exists for persist indefinitely.
+        - alert: RioSchedulerLeaderEndpointsNotSingleton
+          expr: (sum(kube_endpoint_address{namespace="{{ .Values.namespaces.system.name }}", endpoint="rio-scheduler-leader", ready="true"}) or vector(0)) != 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: rio-scheduler-leader Service has {{`{{ $value }}`}} ready endpoints (want exactly 1)
+            description: >-
+              The leader-only Service routes by label match alone; its ready
+              endpoint count must be exactly 1. 0 means the dashboard data
+              path is down (no pod carries the leader label, or
+              kube-state-metrics stopped exporting endpoint series); 2+ means
+              a non-leader pod is silently serving un-retryable UNAVAILABLE
+              to pinned nginx sessions — kubectl label, a foreign controller,
+              or a foreign-created pod carrying the selector labels (the
+              face no scheduler-pod self-check can repair). Inspect
+              `kubectl -n {{ .Values.namespaces.system.name }} get pods
+              -l rio.build/scheduler-role=leader` and compare against the
+              Lease holder.
+
         # ADR-023 §13b: ≥3 distinct cells reaping for `reason=ice`
         # (Launched=False — InsufficientCapacity / quota / unfulfillable
         # instance-type). One cell ICE is routine spot churn; ≥3

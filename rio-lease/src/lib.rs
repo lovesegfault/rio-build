@@ -306,16 +306,53 @@ const _: () = {
 };
 
 /// Verify cadence for the leader-marks reconcile: every Nth election
-/// round (N renews ≈ 60s at the 5s interval) a clean-and-leading loop
-/// re-reads its OWN Pod and compares the stored marks against its
-/// leadership — re-dirtying on divergence. This converts the marks
-/// machinery from edge-triggered-with-enumerated-writers to genuinely
-/// level-triggered: ANY falsifier (a foreign sweep racing a re-acquire,
-/// `kubectl label`, a future actor nobody enumerated) is repaired
-/// within one verify interval plus one reconcile, instead of lingering
-/// until the next leadership transition.
+/// round (N renews ≈ 60s at the 5s interval) a clean-and-idle loop —
+/// leader OR standby — re-reads its OWN Pod and compares the stored
+/// marks against its current leadership, re-dirtying on divergence.
+/// This converts the marks machinery from
+/// edge-triggered-with-enumerated-writers to genuinely level-triggered
+/// at BOTH polarities: a falsifier that STRIPS the leader's marks (a
+/// foreign sweep racing a re-acquire) is repaired by the leader's
+/// verify, and a falsifier that ADDS leader marks to a non-leading pod
+/// (`kubectl label`, a future actor nobody enumerated) is repaired by
+/// that pod's own standby self-check — each within one verify interval
+/// plus one reconcile, instead of lingering until the next leadership
+/// transition.
 // r[impl sched.lease.marks-verify]
 pub const MARKS_VERIFY_EVERY: u64 = 12;
+
+/// Counter bumped each time the standby self-check finds foreign
+/// leader marks on this NON-leading pod (the strip then rides the next
+/// reconcile). Expected zero from honest fleets: there is no lawful
+/// writer of leader marks onto a pod the Lease does not name, so any
+/// increment is the external falsifier class live (`kubectl label`, a
+/// foreign controller) — the detection signal the marks plane
+/// previously did not have.
+pub const STANDBY_MARKS_STRIPS_TOTAL: &str = "rio_lease_standby_marks_strips_total";
+
+/// Register HELP text for the rio-lease metric family. Called once at
+/// lease-loop start, so the names are described in every binary that
+/// hosts an election loop (rio-scheduler and rio-controller) before
+/// their first emission — emission sites live in detached tasks behind
+/// the `LeaseHooks`-less marks machinery, where no per-component
+/// `describe_metrics()` reaches.
+fn describe_lease_metrics() {
+    // Literal name (not the const): the docs scrape
+    // (xtask/src/regen/docs_data.rs::METRICS_RE) reads describe_*!
+    // string literals; the assert pins literal == const so the
+    // emission sites and this HELP can never drift apart.
+    debug_assert_eq!(
+        STANDBY_MARKS_STRIPS_TOTAL,
+        "rio_lease_standby_marks_strips_total"
+    );
+    metrics::describe_counter!(
+        "rio_lease_standby_marks_strips_total",
+        "Foreign leader marks detected on a non-leading pod by its standby \
+         self-check (each detection re-dirties the marks; the next reconcile \
+         strips them). Expected zero: any increment is an external marks \
+         falsifier live on this pod."
+    );
+}
 
 /// Annotation key the leader stamps on its own Pod so the ReplicaSet
 /// controller evicts the standby first during scale-down/RollingUpdate.
@@ -1284,6 +1321,8 @@ fn consume_own_commit_evidence<H: LeaseHooks>(
             "own-commit evidence (holder=us, renewTime moved) restored \
              leadership belief after an abandoned write"
         );
+        // marks-census(edge): the evidence-restore acquire edge — belief
+        // re-entered from own-commit evidence after an abandoned write.
         marks_dirty.mark();
         hooks.on_acquire();
         observe_held_while_believing(
@@ -1328,6 +1367,8 @@ fn observe_held_while_believing<H: LeaseHooks>(
     if observed_transitions != recorded {
         // The rebound re-dirty: a guaranteed-foreign-sweep falsifier
         // handled at its edge; the verify pass bounds the rest.
+        // marks-census(rebound): the unobserved-holder-change rebound —
+        // a compressed lose→acquire pair with no is_leader write.
         marks_dirty.mark();
         let new_gen = state.on_rebound(observed_transitions);
         warn!(
@@ -2248,6 +2289,10 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         "lease loop starting"
     );
 
+    // (lllll): describe before any emission — the marks tasks emit from
+    // detached spawns that no component describe_metrics() covers.
+    describe_lease_metrics();
+
     let mut standing = LeaseStanding::new();
     // Level-triggered pod-marks reconciliation. `true` means "this
     // pod's leader marks (deletion-cost annotation + optional leader
@@ -2399,6 +2444,8 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
             }
             state.on_lose();
             hooks.on_lose();
+            // marks-census(edge): the cooperative step-down lose edge —
+            // tenure released after a failed recovery's demotion request.
             marks_dirty.mark();
         } else {
             // Round id BEFORE the attempt starts: a consumer that snapshots
@@ -2594,6 +2641,9 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             // longer match this pod — the reconcile arm
                             // after the edge match patches them this same
                             // tick.
+                            // marks-census(edge): the acquire edge — a
+                            // Completed round resolved Leading while not
+                            // believing.
                             marks_dirty.mark();
 
                             // r[impl sched.lease.non-blocking-acquire+2]
@@ -2681,6 +2731,9 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             // Unavailable otherwise). The reconcile
                             // arm after the edge match patches this
                             // tick.
+                            // marks-census(edge): the evidenced lose
+                            // edge — another holder observed, or an
+                            // exhausted one-round 409 deferral.
                             marks_dirty.mark();
                             // The standing posture is the
                             // EVIDENCE's own (bug_136): direct
@@ -2713,6 +2766,8 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                  us; a peer can re-create it with no steal wait)"
                             );
                             hooks.on_lose();
+                            // marks-census(edge): the conflict-round
+                            // absent-read lose edge (merged_bug_056).
                             marks_dirty.mark();
                             // The hold posture is the routed cell's own
                             // (bug_059): in-doubt cells keep it for the
@@ -2952,6 +3007,8 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                      longer names us as holder)"
                                 );
                                 hooks.on_lose();
+                                // marks-census(edge): the act-failed evidenced
+                                // lose edge — the read no longer names us.
                                 marks_dirty.mark();
                                 standing.on_observed_not_leading();
                                 ContentBaseline::Present {
@@ -2990,6 +3047,9 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                      re-create it with no steal wait)"
                                 );
                                 hooks.on_lose();
+                                // marks-census(edge): the act-failed absence
+                                // lose edge (bug_143 — belief exits at the
+                                // read).
                                 marks_dirty.mark();
                                 standing.on_observed_not_leading();
                                 ContentBaseline::Absent
@@ -3015,6 +3075,9 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                      survives the zombie window for the shutdown release)"
                                 );
                                 hooks.on_lose();
+                                // marks-census(edge): the absence lose
+                                // edge with a write in doubt (bug_059 —
+                                // the hold keeps the self-fence posture).
                                 marks_dirty.mark();
                                 standing.on_self_fence();
                                 ContentBaseline::Absent
@@ -3154,22 +3217,35 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         }
 
         // r[impl sched.lease.marks-verify]
-        // Bounded-cadence verification: every MARKS_VERIFY_EVERY
-        // rounds a clean-and-leading loop re-reads its OWN Pod and
-        // compares the stored marks against its leadership, re-dirtying
-        // on divergence — the level-triggered closure over falsifiers
-        // nobody enumerated (a foreign sweep racing a re-acquire,
-        // kubectl, a future actor). Shares the marks single-flight
-        // slot, so verify and reconcile never interleave; the dirty
-        // short-circuit inside the gate means a divergence found here
-        // is repaired by the ordinary reconcile on the NEXT round-trip.
-        if now_leading
-            && state
-                .renew_rounds_started()
-                .is_multiple_of(MARKS_VERIFY_EVERY)
+        // Bounded-cadence verification, BOTH polarities: every
+        // MARKS_VERIFY_EVERY rounds a clean-and-idle loop re-reads its
+        // OWN Pod and compares the stored marks against its CURRENT
+        // leadership, re-dirtying on divergence — the level-triggered
+        // closure over falsifiers nobody enumerated (a foreign sweep
+        // racing a re-acquire, kubectl, a future actor). The standby
+        // polarity is load-bearing, not symmetry decoration: an
+        // external mark-ADD on a non-leading pod (`kubectl label pod
+        // <standby> …role=leader`) moves no DirtyGen generation, is
+        // invisible to the leader's own-pod verify, and is outside the
+        // peer sweep's reach in quiet steady state (the sweep runs only
+        // inside a reconcile the leader's own dirt must spawn) — yet
+        // the leader-only Service selects on the label by pure label
+        // match, so the falsified standby silently joins the dashboard
+        // data path with un-retryable UNAVAILABLE until the next
+        // leadership transition. The standby's own cadence here is the
+        // one repair clock that state cannot gate. Shares the marks
+        // single-flight slot, so verify and reconcile never interleave;
+        // the dirty short-circuit inside the gate means a divergence
+        // found here is repaired by the ordinary reconcile on the NEXT
+        // round-trip (which, at standby polarity, strips the foreign
+        // marks).
+        if state
+            .renew_rounds_started()
+            .is_multiple_of(MARKS_VERIFY_EVERY)
             && let Some(task) = maybe_spawn_verify_leader_marks(
                 &pod_patch_client,
                 &cfg,
+                now_leading,
                 &marks_dirty,
                 &marks_patch_in_flight,
                 renew_deadline,
@@ -4194,6 +4270,8 @@ fn maybe_self_fence(
         // reconcile still matters: in a symmetric partition there is no
         // reachable holder to sweep us, and our own first reachable
         // round-trip is what clears the marks (and the cost tie) then.
+        // marks-census(self-fence): the local self-fence — apiserver
+        // unreachable; the mark IS the deferred reconcile debt.
         marks_dirty.mark();
         true
     } else {
@@ -4466,11 +4544,21 @@ fn marks_match(
 // r[impl sched.lease.marks-verify]
 /// Detached verify pass: GET our OWN Pod (timeout-bounded; RBAC `get
 /// pods` — granted alongside the existing `patch pods`/`list pods`
-/// verbs), compare the stored marks against the leadership polarity
-/// captured at spawn, and on divergence re-dirty the marks + warn —
-/// the repair itself reuses the level-triggered reconcile on the next
-/// round-trip. A GET failure changes nothing (the next verify interval
-/// retries); a polarity gone stale mid-flight at worst re-dirties
+/// verbs; both replicas run under the same ServiceAccount, so the
+/// standby polarity needs no new RBAC surface), compare the stored
+/// marks against the leadership polarity captured at spawn, and on
+/// divergence re-dirty the marks + warn — the repair itself reuses the
+/// level-triggered reconcile on the next round-trip. At standby
+/// polarity the divergence is foreign leader marks on a pod the lease
+/// does not name (the F1 falsifier class: `kubectl label`, a foreign
+/// controller, any future actor) and the re-dirtied reconcile STRIPS
+/// them; each detection additionally bumps
+/// [`STANDBY_MARKS_STRIPS_TOTAL`] — expected zero from honest fleets,
+/// so any increment IS the falsifier class live. A GET failure leaves
+/// the marks untouched (the next verify interval retries) but is LOUD:
+/// a persistently failing verify is the silent revert to the
+/// pre-verify world, so the failure arms log at WARN, not debug. A
+/// polarity gone stale mid-flight at worst re-dirties
 /// ([`DirtyGen::mark`]), which is always safe (one no-op PATCH) — and
 /// a mark is never erased by a concurrent reconcile's clear (the
 /// clear-through arithmetic), so the verify's verdict cannot be lost.
@@ -4499,19 +4587,36 @@ fn spawn_verify_leader_marks(
         match tokio::time::timeout(call_timeout, pods.get(&pod_name)).await {
             Ok(Ok(pod)) => {
                 if !marks_match(&pod.metadata, leading, label.as_ref()) {
-                    warn!(
-                        %pod_name, leading,
-                        "leader-marks verify found divergence (external strip/foreign \
-                         sweep?); re-dirtying for the next reconcile"
-                    );
-                    marks_dirty.mark();
+                    if leading {
+                        warn!(
+                            %pod_name, leading,
+                            "leader-marks verify found divergence (external strip/foreign \
+                             sweep?); re-dirtying for the next reconcile"
+                        );
+                        // marks-census(leader-verify): the leader's own-pod verify
+                        // re-dirty — stripped/garbled leader marks re-asserted by
+                        // the next reconcile.
+                        marks_dirty.mark();
+                    } else {
+                        warn!(
+                            %pod_name, leading,
+                            "standby self-check found FOREIGN leader marks on this \
+                             non-leading pod (kubectl label / foreign actor?); \
+                             re-dirtying so the next reconcile strips them"
+                        );
+                        metrics::counter!(STANDBY_MARKS_STRIPS_TOTAL).increment(1);
+                        // marks-census(standby-strip): the standby self-check
+                        // re-dirty — foreign leader marks on a non-leading pod,
+                        // stripped by the next reconcile (the F1 detector).
+                        marks_dirty.mark();
+                    }
                 }
             }
             Ok(Err(e)) => {
-                debug!(%pod_name, error = %e, "leader-marks verify GET failed; next interval retries");
+                warn!(%pod_name, leading, error = %e, "leader-marks verify GET failed; next interval retries");
             }
             Err(_) => {
-                debug!(%pod_name, timeout = ?call_timeout, "leader-marks verify GET timed out; next interval retries");
+                warn!(%pod_name, leading, timeout = ?call_timeout, "leader-marks verify GET timed out; next interval retries");
             }
         }
     })
@@ -4524,13 +4629,21 @@ fn spawn_verify_leader_marks(
 /// means a reconcile/verify is mid-flight and this round skips
 /// (level-triggered: the next multiple retries).
 ///
-/// Always called with `leading == true` (the loop gates on
-/// `now_leading`): a standby's marks are converged by its own lose-edge
-/// reconcile and swept by the live holder; verifying them too would
-/// double the fleet's GET load for marks nobody routes on.
+/// Called at BOTH leadership polarities (`leading` is the loop's
+/// `now_leading`, captured at spawn). The previous leader-only gate
+/// rested on a falsifier-class enumeration that was half right: a
+/// standby's marks are indeed converged by its own lose-edge reconcile
+/// against falsifiers that REMOVE marks, but an external mark-ADD on a
+/// non-leading pod (kubectl, a foreign controller) has no edge writer,
+/// no peer-sweep coverage in quiet steady state, and no other detector
+/// whose clock the falsified state cannot gate — while the leader-only
+/// Service routes on the label by pure label match. The standby verify
+/// is that detector; it costs one Pod GET per replica per
+/// MARKS_VERIFY_EVERY rounds.
 fn maybe_spawn_verify_leader_marks(
     client: &kube::Client,
     cfg: &LeaseConfig,
+    leading: bool,
     marks_dirty: &Arc<DirtyGen>,
     patch_in_flight: &Arc<AtomicBool>,
     call_timeout: Duration,
@@ -4539,7 +4652,7 @@ fn maybe_spawn_verify_leader_marks(
         Some(spawn_verify_leader_marks(
             client.clone(),
             cfg,
-            true,
+            leading,
             Arc::clone(marks_dirty),
             Arc::clone(patch_in_flight),
             call_timeout,
@@ -4731,6 +4844,443 @@ pub(crate) fn maybe_spawn_leader_marks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [GEN-SET] The DirtyGen mark-site census (F1's structural face,
+    /// R31′ riders (a)–(d)).
+    ///
+    /// POPULATION (derived, never author-enumerated): every
+    /// `.mark()` call site in this crate's non-test, non-proof source
+    /// — the walk runs over the committed bytes of all crate source
+    /// files (jurisdiction = wherever `DirtyGen::mark` is callable),
+    /// with the `mod tests` / `mod dirty_gen_proofs` bodies excluded
+    /// by a brace-tracked scan, not by receiver-name convention (an
+    /// aliased receiver still matches: the predicate is the call
+    /// shape, so an evasion via `let d = &marks_dirty; d.mark()`
+    /// OVERSCANS into the census rather than silently escaping it).
+    ///
+    /// CLASSIFICATION (closed alphabet, zero wildcard arms): every
+    /// site carries a `// marks-census(<class>): <unique text>` tag in
+    /// the comment block directly above it; the walker ERRORS on an
+    /// untagged site (un-censused member — the wrapper-fn idiom lands
+    /// here: a new wrapper's interior `.mark()` has no tag and reds),
+    /// on a class outside the alphabet, on two sites sharing one tag
+    /// line, and on a tag separated from its site by another `.mark()`.
+    ///
+    /// WHAT THE CENSUS CLOSES (the F1 future-drift jurisdiction): the
+    /// model's environment alphabet (docs/spec/models/leaderMarks.qnt)
+    /// and the re-scoped `sched.lease.marks-verify` rule both quantify
+    /// over exactly these classes — edge writers that mark in the same
+    /// transition, the self-fence's deferred debt, the rebound, and
+    /// the two verify polarities (the leader's own-pod re-assert and
+    /// the standby's foreign-marks strip). Every class is
+    /// divergence-evidence-triggered on THIS pod's own state: no mark
+    /// site fires on another pod's state, and none fires
+    /// unconditionally on a clock (the verify GETs are periodic; their
+    /// marks are conditional on observed divergence). A future mark
+    /// site must join a class or extend the alphabet — and an alphabet
+    /// extension is precisely a model + spec revisit, which is the
+    /// drift this census exists to force into view (the pre-F1 world
+    /// shipped a one-sided alphabet exactly because nothing pinned the
+    /// site population to the claim).
+    mod marks_census {
+        /// The closed class alphabet. Extending it is a deliberate
+        /// model/spec event, not a convenience.
+        const ALPHABET: [&str; 5] = [
+            "edge",
+            "self-fence",
+            "rebound",
+            "leader-verify",
+            "standby-strip",
+        ];
+
+        /// Expected per-class site counts at this tree (the count-
+        /// bearing key half; the content-bearing half is the per-site
+        /// unique tag text). 8 edges: restore-acquire, step-down lose,
+        /// acquire, evidenced lose, conflict-absent lose, act-failed
+        /// evidenced lose, act-failed absence lose, absence lose with
+        /// write-in-doubt.
+        const EXPECTED: [(&str, usize); 5] = [
+            ("edge", 8),
+            ("self-fence", 1),
+            ("rebound", 1),
+            ("leader-verify", 1),
+            ("standby-strip", 1),
+        ];
+
+        /// Tag must sit within this many lines above its site, with no
+        /// intervening `.mark()`.
+        const TAG_WINDOW: usize = 8;
+
+        /// The crate's source universe (R31′ jurisdiction: every file
+        /// `DirtyGen::mark` is reachable from). `mbt_tests.rs` is
+        /// `#[cfg(test)]`-only but walked anyway — overscan is the
+        /// safe direction.
+        fn crate_sources() -> Vec<(&'static str, &'static str)> {
+            vec![
+                ("lib.rs", include_str!("lib.rs")),
+                ("election.rs", include_str!("election.rs")),
+                ("clock.rs", include_str!("clock.rs")),
+                ("mbt_tests.rs", include_str!("mbt_tests.rs")),
+            ]
+        }
+
+        /// Blank out the BODY of each named inline `mod` (test/proof
+        /// universes) by brace tracking, preserving line numbers. Pure
+        /// text — no receiver-name or cfg-attr heuristics.
+        fn strip_excluded_mods(src: &str, mods: &[&str]) -> String {
+            let mut out: Vec<String> = Vec::new();
+            let mut depth: usize = 0;
+            let mut excluding = false;
+            for line in src.lines() {
+                let starts_excluded = !excluding
+                    && mods.iter().any(|m| {
+                        let t = line.trim_start();
+                        t.starts_with(&format!("mod {m} {{"))
+                            || t.starts_with(&format!("pub mod {m} {{"))
+                            || t.starts_with(&format!("pub(crate) mod {m} {{"))
+                    });
+                if starts_excluded {
+                    excluding = true;
+                    depth = 0;
+                }
+                if excluding {
+                    depth += line.matches('{').count();
+                    depth = depth.saturating_sub(line.matches('}').count());
+                    out.push(String::new());
+                    if depth == 0 {
+                        excluding = false;
+                    }
+                } else {
+                    out.push(line.to_string());
+                }
+            }
+            out.join("\n")
+        }
+
+        /// One censused site.
+        #[derive(Debug, PartialEq)]
+        struct Site {
+            file: &'static str,
+            line: usize,
+            class: String,
+            tag: String,
+        }
+
+        /// The derived walk: every `.mark()` call line in the
+        /// (exclusion-blanked) source joins the population; each must
+        /// resolve a tag. Errors are the census's refusals — never a
+        /// silent skip.
+        fn walk(file: &'static str, src: &str) -> Result<Vec<Site>, String> {
+            let lines: Vec<&str> = src.lines().collect();
+            let mut sites = Vec::new();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains(".mark()") || line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let mut found = None;
+                for back in 1..=TAG_WINDOW.min(i) {
+                    let cand = lines[i - back];
+                    if cand.contains(".mark()") && !cand.trim_start().starts_with("//") {
+                        break; // one tag per site — another site intervenes
+                    }
+                    if let Some(pos) = cand.find("marks-census(") {
+                        let rest = &cand[pos + "marks-census(".len()..];
+                        let Some(close) = rest.find(')') else {
+                            return Err(format!(
+                                "{file}:{}: malformed marks-census tag",
+                                i - back + 1
+                            ));
+                        };
+                        found = Some(Site {
+                            file,
+                            line: i + 1,
+                            class: rest[..close].to_string(),
+                            tag: cand.trim().to_string(),
+                        });
+                        break;
+                    }
+                }
+                match found {
+                    Some(site) => {
+                        if !ALPHABET.contains(&site.class.as_str()) {
+                            return Err(format!(
+                                "{file}:{}: marks-census class '{}' is outside the closed \
+                                 alphabet {ALPHABET:?} — extending the alphabet is a model + \
+                                 spec event (leaderMarks.qnt / sched.lease.marks-verify)",
+                                site.line, site.class
+                            ));
+                        }
+                        sites.push(site);
+                    }
+                    None => {
+                        return Err(format!(
+                            "{file}:{}: un-censused DirtyGen mark site — every `.mark()` \
+                             call carries a `marks-census(<class>)` tag within {TAG_WINDOW} \
+                             lines (new wrapper fns and new dirtying sites must classify \
+                             or extend the alphabet)",
+                            i + 1
+                        ));
+                    }
+                }
+            }
+            Ok(sites)
+        }
+
+        /// The census proper over the real tree.
+        fn census() -> Result<Vec<Site>, String> {
+            let mut all = Vec::new();
+            for (file, raw) in crate_sources() {
+                let src = strip_excluded_mods(raw, &["tests", "dirty_gen_proofs"]);
+                all.extend(walk(file, &src)?);
+            }
+            // Tag-line uniqueness: two sites may share a class, never
+            // a tag line (the content-bearing key at site granularity).
+            for (a, b) in all
+                .iter()
+                .enumerate()
+                .flat_map(|(i, a)| all[i + 1..].iter().map(move |b| (a, b)))
+            {
+                if a.tag == b.tag {
+                    return Err(format!(
+                        "duplicate marks-census tag line: {}:{} and {}:{} share '{}'",
+                        a.file, a.line, b.file, b.line, a.tag
+                    ));
+                }
+            }
+            Ok(all)
+        }
+
+        /// Rider (a): population non-vacuity + the expected members.
+        #[test]
+        fn marks_census_population_and_classes() {
+            let sites = census().expect("census walks clean");
+            assert!(
+                !sites.is_empty(),
+                "population non-vacuity: the walk derived members"
+            );
+            let total: usize = EXPECTED.iter().map(|(_, n)| n).sum();
+            assert_eq!(
+                sites.len(),
+                total,
+                "the derived mark-site population moved — classify the new/removed site \
+                 and update EXPECTED with the model/spec alphabet in view: {sites:#?}"
+            );
+            for (class, want) in EXPECTED {
+                let got = sites.iter().filter(|s| s.class == class).count();
+                assert_eq!(
+                    got, want,
+                    "class '{class}' count moved (want {want}, got {got}): {sites:#?}"
+                );
+            }
+            // The two verify polarities both present — the F1 face: the
+            // detector pair exists at both leadership polarities.
+            assert!(sites.iter().any(|s| s.class == "leader-verify"));
+            assert!(sites.iter().any(|s| s.class == "standby-strip"));
+        }
+
+        /// Rider (b1) enrollment plant: an in-grammar uncensused
+        /// member reds through the SAME walk path as production.
+        #[test]
+        fn marks_census_enrollment_plant_reds() {
+            let planted = "fn f(d: &DirtyGen) {\n    d.mark();\n}\n";
+            let err = walk("planted.rs", planted).expect_err("untagged site must red");
+            assert!(err.contains("un-censused"), "got: {err}");
+        }
+
+        /// Rider (b2) jurisdiction plant: a site in a previously
+        /// mark-free crate file joins the walk (the universe is the
+        /// crate, not lib.rs).
+        #[test]
+        fn marks_census_jurisdiction_covers_all_crate_files() {
+            let planted =
+                "fn g(d: &DirtyGen) {\n    // marks-census(edge): planted\n    d.mark();\n}\n";
+            let sites = walk("election.rs", planted).expect("tagged plant walks");
+            assert_eq!(sites.len(), 1);
+            assert_eq!(sites[0].class, "edge");
+            // …and the live election.rs/clock.rs really are in the
+            // walked universe (a hand-list regression re-rooting the
+            // walk to lib.rs alone fails here).
+            let files: Vec<&str> = crate_sources().iter().map(|(f, _)| *f).collect();
+            for f in ["lib.rs", "election.rs", "clock.rs", "mbt_tests.rs"] {
+                assert!(files.contains(&f), "crate universe lost {f}");
+            }
+        }
+
+        /// Rider (b3) grammar refusal: the aliased receiver OVERSCANS
+        /// (caught, classified or red — never silently green), the
+        /// wrapper-fn idiom reds at its interior site, and the
+        /// outside-but-adjacent shape (`mark()` with arguments — a
+        /// different method) does NOT match.
+        #[test]
+        fn marks_census_grammar_refusals() {
+            // Aliased receiver: still in-population (overscan-safe).
+            let aliased =
+                "fn f(marks_dirty: &DirtyGen) {\n    let d = marks_dirty;\n    d.mark();\n}\n";
+            assert!(
+                walk("planted.rs", aliased).is_err(),
+                "aliased+untagged must red"
+            );
+            // Outside-but-adjacent: a different `.mark(x)` arity does
+            // not join (DirtyGen::mark takes no arguments).
+            let adjacent = "fn f(x: &OtherThing) {\n    x.mark(1);\n}\n";
+            assert_eq!(walk("planted.rs", adjacent).expect("no members").len(), 0);
+            // Two sites under ONE tag (the second site lacks its own):
+            // the intervening-site rule refuses.
+            let shared_tag = "fn f(d: &DirtyGen) {\n    // marks-census(edge): one tag\n    d.mark();\n    d.mark();\n}\n";
+            assert!(
+                walk("planted.rs", shared_tag).is_err(),
+                "tag reuse across sites must red"
+            );
+        }
+
+        /// Rider (c) planted-DUPLICATE: two same-class sites must key
+        /// distinctly under the live projection (tag-line uniqueness);
+        /// collapsing them is a census red.
+        #[test]
+        fn marks_census_duplicate_tag_discriminates() {
+            let dup = "fn f(d: &DirtyGen) {\n    // marks-census(edge): same text\n    d.mark();\n}\nfn g(d: &DirtyGen) {\n    // marks-census(edge): same text\n    d.mark();\n}\n";
+            let sites = walk("planted.rs", dup).expect("both walk");
+            assert_eq!(sites.len(), 2);
+            // The census-level uniqueness oracle (the projection that
+            // must discriminate):
+            assert_eq!(
+                sites[0].tag, sites[1].tag,
+                "the plant is two distinct sites under one tag text"
+            );
+            // census() refuses exactly this shape on the real tree —
+            // simulate its uniqueness pass:
+            let collide = sites
+                .iter()
+                .enumerate()
+                .any(|(i, a)| sites[i + 1..].iter().any(|b| a.tag == b.tag));
+            assert!(
+                collide,
+                "the duplicate must be visible to the uniqueness pass"
+            );
+        }
+
+        /// Rider (d) K-mutation battery: K = 4 seeded mutations of the
+        /// census's own control flow, each applied to a copy of the
+        /// artifact; the planted red MUST die under every one (a
+        /// self-test that stays green under a degenerate mutation is
+        /// born-broken — the bug_047 criterion).
+        #[test]
+        fn marks_census_k_mutation_battery() {
+            let untagged = "fn f(d: &DirtyGen) {\n    d.mark();\n}\n";
+            let wrong_class =
+                "fn f(d: &DirtyGen) {\n    // marks-census(volcano): boom\n    d.mark();\n}\n";
+
+            // Unmutated: both plants red.
+            assert!(walk("p.rs", untagged).is_err());
+            assert!(walk("p.rs", wrong_class).is_err());
+
+            // M1 — key projection degenerated (every site keyed to one
+            // class regardless of tag): the wrong-class red dies.
+            fn walk_m1(src: &str) -> Result<usize, String> {
+                // Degenerate classifier: any tag line accepted as "edge".
+                let lines: Vec<&str> = src.lines().collect();
+                let mut n = 0;
+                for (i, line) in lines.iter().enumerate() {
+                    if !line.contains(".mark()") || line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    let tagged =
+                        (1..=TAG_WINDOW.min(i)).any(|b| lines[i - b].contains("marks-census("));
+                    if !tagged {
+                        return Err("untagged".into());
+                    }
+                    n += 1;
+                }
+                Ok(n)
+            }
+            assert!(
+                walk_m1(wrong_class).is_ok(),
+                "M1 (degenerate class key) must kill the wrong-class red — proving the \
+                 live walker's alphabet check is load-bearing"
+            );
+
+            // M2 — enforcement set widened to superset-accept (alphabet
+            // gains a wildcard): the wrong-class red dies.
+            fn walk_m2(file: &'static str, src: &str) -> Result<Vec<Site>, String> {
+                // Same walk, alphabet check deleted.
+                let lines: Vec<&str> = src.lines().collect();
+                let mut sites = Vec::new();
+                for (i, line) in lines.iter().enumerate() {
+                    if !line.contains(".mark()") || line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    let mut found = None;
+                    for back in 1..=TAG_WINDOW.min(i) {
+                        let cand = lines[i - back];
+                        if cand.contains(".mark()") && !cand.trim_start().starts_with("//") {
+                            break;
+                        }
+                        if let Some(pos) = cand.find("marks-census(") {
+                            let rest = &cand[pos + "marks-census(".len()..];
+                            let close = rest.find(')').ok_or("malformed")?;
+                            found = Some(Site {
+                                file,
+                                line: i + 1,
+                                class: rest[..close].to_string(),
+                                tag: cand.trim().to_string(),
+                            });
+                            break;
+                        }
+                    }
+                    sites.push(found.ok_or("untagged")?);
+                }
+                Ok(sites)
+            }
+            assert!(
+                walk_m2("p.rs", wrong_class).is_ok(),
+                "M2 (widened enforcement set) must kill the wrong-class red"
+            );
+
+            // M3 — population walk emptied (re-rooted off the real
+            // sources): the untagged red dies because nothing is
+            // walked at all.
+            let empty_universe: Vec<(&str, &str)> = Vec::new();
+            let mut all = Vec::new();
+            let mut errs = Vec::new();
+            for (file, raw) in empty_universe {
+                match walk(file, raw) {
+                    Ok(s) => all.extend(s),
+                    Err(e) => errs.push(e),
+                }
+            }
+            assert!(
+                errs.is_empty() && all.is_empty(),
+                "M3 (emptied walk) must kill every red — proving population non-vacuity \
+                 is load-bearing"
+            );
+
+            // M4 — exclusion scan widened to swallow everything (the
+            // strip step blanks the WHOLE file): the untagged red dies.
+            let blanked = strip_excluded_mods(&format!("mod tests {{\n{untagged}}}\n"), &["tests"]);
+            assert!(
+                walk("p.rs", &blanked)
+                    .expect("blanked file walks empty")
+                    .is_empty(),
+                "M4 (exclusion overreach) must kill the red — proving the brace scan's \
+                 scope is load-bearing"
+            );
+        }
+
+        /// The exclusion scan is exact: a mark AFTER an excluded mod's
+        /// closing brace is still walked (the brace tracking neither
+        /// under- nor over-shoots).
+        #[test]
+        fn marks_census_exclusion_brace_tracking_exact() {
+            let src = "mod dirty_gen_proofs {\n    fn p(d: &DirtyGen) { d.mark(); }\n}\nfn live(d: &DirtyGen) {\n    d.mark();\n}\n";
+            let stripped = strip_excluded_mods(src, &["dirty_gen_proofs"]);
+            let err = walk("p.rs", &stripped).expect_err("the live site survives the strip");
+            assert!(err.contains("un-censused"), "got: {err}");
+            assert!(
+                err.contains(":5"),
+                "the surviving site is the post-mod one: {err}"
+            );
+        }
+    }
 
     /// from_parts returns None when lease_name unset — the signal
     /// for "non-K8s mode." This is how VM tests stay unaffected.
@@ -9642,6 +10192,201 @@ mod tests {
             json!(LEADER_ROLE_LEADER),
             "an externally-stripped leader label must be re-asserted within one \
              verify interval + one reconcile"
+        );
+
+        shutdown.cancel();
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// A fresh foreign-holder Lease body whose `renewTime` moves with
+    /// `seq` — re-seeded each round so a long-running standby never
+    /// observes staleness (the foreign leader renewing, exactly
+    /// production).
+    fn foreign_lease(seq: u64) -> k8s_openapi::serde_json::Value {
+        json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "rio-sched",
+                "namespace": "default",
+                "resourceVersion": format!("{}", 100 + seq),
+            },
+            "spec": {
+                "holderIdentity": "other-replica",
+                "leaseTransitions": 3,
+                "leaseDurationSeconds": 15,
+                "renewTime": format!("2026-01-01T00:00:{:02}.{:06}Z", seq % 60, seq),
+            },
+        })
+    }
+
+    /// W13-I — the F1 close, production half: an external mark-ADD on a
+    /// NON-leading pod (`kubectl label pod <standby> …role=leader` +
+    /// deletion-cost "1") is repaired within one standby cadence by the
+    /// pod's own self-check, with the strip counter bumped.
+    ///
+    /// Population: quiet steady state — the exact regime the audit
+    /// proved unrepaired. Pre-fix (the verify gate restored to
+    /// `now_leading &&` / the hardcoded `leading=true`), this test REDS:
+    /// the foreign label survives every round to the horizon, zero
+    /// repair traffic, zero non-debug evidence — the falsified standby
+    /// stays in the leader-only Service's endpoints until the next
+    /// leadership transition (the red is recorded verbatim in the
+    /// introducing commit body; order-infeasible strawman disclosure).
+    // r[verify sched.lease.marks-verify]
+    #[tokio::test(start_paused = true)]
+    async fn standby_self_check_strips_foreign_leader_marks() {
+        // The strip counter fires inside the spawned verify task —
+        // install the recorder process-globally before the loop spawns
+        // (nextest process-per-test; (ppppp): snapshot exactly once).
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        rec.install().expect("install global debugging recorder");
+
+        let (client, mock) = MockApiServer::new();
+        mock.seed(foreign_lease(0));
+        mock.seed_pod("us", pod_ok("us"));
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = marks_test_cfg();
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Converge as standby: the init-dirty reconcile writes the
+        // non-leader marks (cost "0", label absent).
+        settle().await;
+        assert!(!state.is_leader(), "foreign holder: we stay standby");
+
+        // THE FALSIFIER: an external actor stamps the full leader marks
+        // onto the standby pod. No edge fires, no generation moves, the
+        // leader's own-pod verify never sees this pod, and the peer
+        // sweep is dormant (the holder's loop is clean — steady state
+        // spawns nothing).
+        let mut falsified = pod_ok("us");
+        falsified["metadata"]["labels"][LEADER_ROLE_LABEL] = json!(LEADER_ROLE_LEADER);
+        falsified["metadata"]["annotations"][POD_DELETION_COST_ANNOTATION] = json!("1");
+        mock.seed_pod("us", falsified);
+
+        // One standby cadence: MARKS_VERIFY_EVERY rounds to the next
+        // verify multiple + one round for the strip reconcile. The
+        // foreign holder keeps renewing (re-seed per round) so the
+        // standby never steals.
+        for seq in 1..=(MARKS_VERIFY_EVERY + 2) {
+            mock.seed(foreign_lease(seq));
+            tokio::time::advance(RENEW_INTERVAL).await;
+            settle().await;
+        }
+
+        assert!(!state.is_leader(), "still standby at the horizon");
+        let pod = mock.pod("us").expect("pod");
+        assert_eq!(
+            pod["metadata"]["labels"].get(LEADER_ROLE_LABEL),
+            None,
+            "the standby self-check must strip the foreign leader label \
+             within one cadence (label absent is the non-leader state)"
+        );
+        assert_eq!(
+            pod["metadata"]["annotations"][POD_DELETION_COST_ANNOTATION],
+            json!("0"),
+            "the foreign deletion-cost must be reset with the same patch"
+        );
+
+        // The detection lane: exactly one strip detection (the repaired
+        // pod re-verifies clean on later multiples — no spurious
+        // re-counts).
+        let strips: u64 = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _, _, value)| {
+                (key.key().name() == STANDBY_MARKS_STRIPS_TOTAL).then_some(value)
+            })
+            .map(|v| match v {
+                metrics_util::debugging::DebugValue::Counter(c) => c,
+                other => panic!("strip metric must be a counter, got {other:?}"),
+            })
+            .sum();
+        assert_eq!(
+            strips, 1,
+            "exactly one standby-strip detection for one falsification"
+        );
+
+        shutdown.cancel();
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// W13-I4 (the c1 structural half): a persistently failing
+    /// self-check GET wedges nothing — the marks stay untouched, the
+    /// single-flight slot is released every interval, and the next
+    /// multiple retries (observable as repeated verify GETs under
+    /// FailFast). The loudness lane (per-failure WARN at this commit;
+    /// the counter + WARN-after-K calibration is the F3 close's
+    /// refinement) rides the same err arms.
+    #[tokio::test(start_paused = true)]
+    async fn standby_self_check_get_failure_releases_slot_and_retries() {
+        let (client, mock) = MockApiServer::new();
+        mock.seed(foreign_lease(0));
+        mock.seed_pod("us", pod_ok("us"));
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = marks_test_cfg();
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Converge clean as standby first (the verify gate requires
+        // clean marks).
+        settle().await;
+        assert!(!state.is_leader());
+
+        // From here every apiserver call 503s — election rounds AND
+        // verify GETs. The loop keeps ticking; rounds keep consuming
+        // ids; each verify multiple must spawn a fresh (failing) GET —
+        // a wedged slot would make the count stick at one.
+        mock.set_behavior(MockBehavior::FailFast);
+        let gets_before = mock
+            .requests()
+            .iter()
+            .filter(|(m, p)| *m == http::Method::GET && p.contains("/pods/us"))
+            .count();
+        for _ in 0..(2 * MARKS_VERIFY_EVERY + 2) {
+            tokio::time::advance(RENEW_INTERVAL).await;
+            settle().await;
+        }
+        let gets_after = mock
+            .requests()
+            .iter()
+            .filter(|(m, p)| *m == http::Method::GET && p.contains("/pods/us"))
+            .count();
+        assert!(
+            gets_after >= gets_before + 2,
+            "two verify multiples under persistent failure must each spawn a \
+             fresh GET (slot released on every failure; got {gets_before} -> \
+             {gets_after})"
+        );
+        assert_eq!(
+            mock.pod("us").expect("pod")["metadata"]["annotations"][POD_DELETION_COST_ANNOTATION],
+            json!("0"),
+            "a failing verify changes no marks"
         );
 
         shutdown.cancel();

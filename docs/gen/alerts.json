@@ -16,6 +16,7 @@
     "RioSchedulerActorSlow",
     "RioSchedulerAttemptEstablishmentCluster",
     "RioSchedulerEvidenceWriteFenced",
+    "RioSchedulerLeaderEndpointsNotSingleton",
     "RioSchedulerMaterializationConversions",
     "RioSchedulerMaterializationStalled",
     "RioSchedulerRecoveryFailing",
@@ -183,6 +184,14 @@
       "metrics": [
         "rio_scheduler_evidence_write_fenced_total"
       ]
+    },
+    {
+      "name": "RioSchedulerLeaderEndpointsNotSingleton",
+      "expr": "(sum(kube_endpoint_address{namespace=\"{{ .Values.namespaces.system.name }}\", endpoint=\"rio-scheduler-leader\", ready=\"true\"}) or vector(0)) != 1",
+      "for": "5m",
+      "severity": "warning",
+      "templated": true,
+      "metrics": []
     },
     {
       "name": "RioSchedulerMaterializationConversions",
