@@ -179,13 +179,17 @@ in
   # merged_bug_053 loop shim — election results onto standing
   # transitions — as one pure derivation over bounded cells;
   # exhausted-lose-requires-unresolved-deferral, the production-fold
-  # agreement pin, and the stamp/ledger totality laws).
+  # agreement pin, and the stamp/ledger totality laws)
+  # -> 11 (bughunt-13 S3: the acquire-futility band law — the
+  # merged_bug_085 close pinned under CBMC, futility iff the anchor
+  # cannot survive to the NEXT evaluation point; the authoritative pin
+  # while the model still encodes the pre-085 gate).
   # r[verify sched.lease.k8s-lease+2]
   # r[verify sched.lease.at-most-one-leader+3]
   kani-rio-lease = mkKaniCheck {
     name = "rio-lease";
     crate = crateBuildKani.members.rio-lease;
-    expectedHarnesses = 10;
+    expectedHarnesses = 11;
   };
 
   # rio-log-kernel: the store's log-chunk decision kernels, extracted

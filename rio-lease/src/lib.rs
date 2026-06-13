@@ -4085,6 +4085,55 @@ mod dirty_gen_proofs {
     }
 }
 
+/// The acquire-futility band law under CBMC (bughunt-13 OP-4): the
+/// merged_bug_085 close priced futility against the NEXT evaluation
+/// point in the actual schedule (`anchor_age + RENEW_INTERVAL >
+/// SELF_FENCE_AFTER`), closing the (6s, 11s] band where the pre-fix
+/// gate (`anchor_age > SELF_FENCE_AFTER`) restored belief only to be
+/// deterministically force-fenced one tick later. The formal model
+/// still encodes the pre-085 gate (the audit's standing backlog row),
+/// so this contract is the authoritative pin of the band law while
+/// that text is stale. Joins the `dirty_gen_proofs` /
+/// `lease_standing_proofs` pattern: a pure function over a bounded
+/// symbolic domain, no loops, integer cells only.
+#[cfg(kani)]
+mod acquire_futility_proofs {
+    use std::time::Duration;
+
+    use super::{RENEW_INTERVAL, SELF_FENCE_AFTER, evidence_acquire_futile};
+
+    /// Over every anchor age up to a minute (production anchors are
+    /// seconds old; 60s is several fence lifetimes of headroom), the
+    /// shipped gate equals the band law: futile iff the anchor cannot
+    /// survive TO the next evaluation point, one [`RENEW_INTERVAL`]
+    /// away. The bounded domain also discharges panic-freedom for the
+    /// gate's `anchor_age + RENEW_INTERVAL` Duration add (no overflow
+    /// is reachable below the assumed bound).
+    #[kani::proof]
+    fn acquire_futility_matches_the_band_law() {
+        let age_secs: u64 = kani::any();
+        kani::assume(age_secs <= 60);
+        let futile = evidence_acquire_futile(Duration::from_secs(age_secs));
+        assert_eq!(
+            futile,
+            age_secs + RENEW_INTERVAL.as_secs() > SELF_FENCE_AFTER.as_secs(),
+            "futility iff the anchor cannot survive to the next evaluation point"
+        );
+        // The band edges at the shipped constants (5s renew, 11s
+        // fence): age 6 still has one evaluation left; age 7 does
+        // not. The pre-085 gate put the whole (6, 11] band on the
+        // wrong side — belief restored, then force-fenced one tick
+        // later (doubled recovery plus a leader-Service label flap
+        // per brownout pass).
+        if age_secs == 6 {
+            assert!(!futile, "age 6 survives to the next evaluation point");
+        }
+        if age_secs == 7 {
+            assert!(futile, "age 7 cannot survive to the next evaluation point");
+        }
+    }
+}
+
 /// The Completed-round derivation under CBMC (merged_bug_053): the
 /// loop shim — the mapping from election results onto standing
 /// transitions — was the one unverified seam between the kani-proved
