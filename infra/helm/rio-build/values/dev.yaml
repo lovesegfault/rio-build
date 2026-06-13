@@ -25,6 +25,12 @@ scheduler:
   # No HA for local dev. Lease still works (acquires immediately, no
   # contention). Faster iteration.
   replicas: 1
+  sla:
+    # Empirically derived targets. Helm replaces arrays wholesale — keep
+    # best-effort here or infeasible builds have no floor tier.
+    tiers:
+      - {name: normal, p50: 1.4, p90: 7.7, p99: 102}
+      - {name: best-effort}
 
 gateway:
   replicas: 1
