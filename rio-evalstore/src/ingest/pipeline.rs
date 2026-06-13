@@ -24,6 +24,14 @@
 //! funds whatever pending file is closest to the deque front, which
 //! tracks the spine's NAR position.
 //!
+//! Charges returned by buffer drops are staged in an atomic counter and
+//! folded back into the balance in batches (and at every point the spine
+//! could block or steal): on a page-cache-warm source the spine is the
+//! last holder of nearly every buffer, and a per-drop lock + wakeup put
+//! the queue mutex on the NAR-sha256 critical path for every file of the
+//! tree. Staged bytes are unspendable until folded back, so memory use
+//! only ever undershoots the accounted budget.
+//!
 //! The P1 profiling campaign measured the failure mode this prevents:
 //! the previous design had each budget-starved reader block on the
 //! budget *holding* one specific node. Once the budget saturated with
@@ -65,8 +73,9 @@
 //!
 //! Every blocking point has a wake path: readers wait on the queue
 //! condvar, which is notified by child pushes, item completion, budget
-//! releases, listing completion, spine claims, and failure; the spine
-//! waits on per-node condvars, which `resolve` notifies.
+//! release flushes, listing completion, the spine's stolen-listing
+//! claims, the spine finishing its walk, and failure; the spine waits on
+//! per-node condvars, which `resolve` notifies.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -237,6 +246,21 @@ struct Shared {
     /// typical small files revolving on the spine's path even when
     /// read-ahead has parked the rest of the budget out of NAR order.
     budget_floor: u64,
+    /// Byte charges returned by buffer drops but not yet folded back
+    /// into [`QueueState::avail`]. On a fast (page-cache-warm) source
+    /// the spine is the last holder of nearly every buffer, so a
+    /// per-drop lock + reader wakeup put ~8 µs of queue-mutex traffic on
+    /// the NAR-sha256 critical path for every file of the tree — the
+    /// measured bulk of the fast-device regression. Drops stage their
+    /// charge here (one atomic add) instead; [`Shared::flush_releases`]
+    /// folds it back in batches. Staged bytes are unspendable until
+    /// flushed, so real memory use only ever undershoots the accounted
+    /// budget — the bound is unchanged.
+    pending_release: AtomicU64,
+    /// Fold threshold for `pending_release` (budget/32, min 1): big
+    /// enough to amortize the queue lock, small enough that read-ahead
+    /// loses at most ~3% of its window to staging lag.
+    release_batch: u64,
     /// Fast failure flag; the actual error lives in `error_slot`.
     error: AtomicBool,
     /// First failure wins; later ones are dropped.
@@ -276,20 +300,40 @@ impl Shared {
         self.notify_queue();
     }
 
-    /// Return a byte charge to the budget and wake parked readers.
+    /// Return a byte charge to the budget. The charge is staged in
+    /// `pending_release` (no lock, no wakeup — this runs on the spine
+    /// for nearly every consumed buffer) and folded back into the
+    /// spendable balance once a batch accumulates. The spine also
+    /// flushes at every point where it could block or steal (see
+    /// [`spine_wait_file`] / [`spine_wait_dir`]), so readers are never
+    /// left parked behind staged budget while the spine is idle.
     fn release(&self, charge: u64) {
         if charge == 0 {
             return;
         }
+        let staged = self.pending_release.fetch_add(charge, Ordering::AcqRel) + charge;
+        if staged >= self.release_batch {
+            self.flush_releases();
+        }
+    }
+
+    /// Fold staged byte charges back into the spendable balance and wake
+    /// parked readers. Cheap when nothing is staged.
+    fn flush_releases(&self) {
+        let staged = self.pending_release.swap(0, Ordering::AcqRel);
+        if staged == 0 {
+            return;
+        }
         let mut q = self.queue.lock().expect("queue lock");
-        q.avail += charge;
+        q.avail += staged;
         drop(q);
         self.queue_cond.notify_all();
     }
 
-    /// Lock-then-notify the queue condvar (spine claims, failure): a
-    /// reader between its scan and its wait holds the queue lock, so
-    /// acquiring it here serializes the notify after the wait begins.
+    /// Lock-then-notify the queue condvar (stolen-listing claims, end of
+    /// the spine walk, failure): a reader between its scan and its wait
+    /// holds the queue lock, so acquiring it here serializes the notify
+    /// after the wait begins.
     fn notify_queue(&self) {
         drop(self.queue.lock().expect("queue lock"));
         self.queue_cond.notify_all();
@@ -320,8 +364,11 @@ impl Shared {
 
     /// Snapshot: could a reader charge `size` bytes right now? Drives
     /// the spine's steal grace — only a heuristic, so a stale answer
-    /// costs at most one grace period, never correctness.
+    /// costs at most one grace period, never correctness. Flushes staged
+    /// releases first so the answer (and the readers racing to claim the
+    /// file during the grace) sees the budget the spine just returned.
     fn reader_could_charge(&self, size: u64) -> bool {
+        self.flush_releases();
         let q = self.queue.lock().expect("queue lock");
         charge_admissible(&q, self, size)
     }
@@ -414,6 +461,8 @@ pub(super) fn run(
         queue_cond: Condvar::new(),
         budget_total: total,
         budget_floor: total / 4,
+        pending_release: AtomicU64::new(0),
+        release_batch: (total / 32).max(1),
         error: AtomicBool::new(false),
         error_slot: Mutex::new(None),
         reader_file_reads: AtomicU64::new(0),
@@ -456,7 +505,13 @@ pub(super) fn run(
             written: 0,
         };
         emit(frame::magic(&mut tee));
-        spine_child(&shared, &mut tee, &root_child).map(|()| (tee.sha, tee.written))
+        let out = spine_child(&shared, &mut tee, &root_child).map(|()| (tee.sha, tee.written));
+        // The spine walk is complete; deque entries it claimed without a
+        // wakeup may still be awaiting garbage collection by a parked
+        // reader. One wake here lets the readers GC them, observe the
+        // tree as fully accounted, and exit so the scope can join.
+        shared.notify_queue();
+        out
     });
 
     // All threads are joined; results and errors are final.
@@ -867,11 +922,13 @@ fn spine_wait_file(shared: &Arc<Shared>, node: &Arc<Node>) -> Result<Arc<FileBuf
                 *st = State::Reading;
                 node.taken.store(true, Ordering::Release);
                 drop(st);
-                // Wake parked readers: the stale deque entry for this
-                // node must be garbage-collected so the deque front (and
-                // with it the readers' scan window) keeps tracking the
-                // spine's frontier.
-                shared.notify_queue();
+                // The stale deque entry is left for the next reader scan
+                // to garbage-collect (any scan GCs every claimed entry it
+                // walks over). No wakeup here: parked readers have
+                // nothing else to do with it, and on a fast device this
+                // path runs thousands of times per ingest — the final
+                // wake in [`run`] covers the case where the tree ends on
+                // a run of stolen files with every reader parked.
                 return match read_file(&node.path, size) {
                     Ok(data) => {
                         #[cfg(test)]
@@ -900,6 +957,11 @@ fn spine_wait_file(shared: &Arc<Shared>, node: &Arc<Node>) -> Result<Arc<FileBuf
                 };
             }
             State::Reading => {
+                // About to block on a reader's in-flight IO: hand any
+                // staged budget back first so the readers can spend it
+                // while the spine sleeps. Nested node→queue locking,
+                // the one allowed order.
+                shared.flush_releases();
                 st = node.cond.wait(st).expect("node lock");
             }
             State::FileReady(buf) => {
@@ -954,6 +1016,9 @@ fn spine_wait_dir(shared: &Arc<Shared>, node: &Arc<Node>) -> Result<Arc<Vec<Chil
                 };
             }
             State::Reading => {
+                // Same as spine_wait_file: flush staged budget before
+                // blocking on the in-flight listing.
+                shared.flush_releases();
                 st = node.cond.wait(st).expect("node lock");
             }
             State::DirReady(children) => return Ok(Arc::clone(children)),
