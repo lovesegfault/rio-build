@@ -1525,6 +1525,28 @@ rec {
       main = "leaderElectionVanishHold";
     };
 
+    # The deletion-MBT acceptance run (round-14 D-15): the believing
+    # absent read at the BASE-regime constants the rio-lease MBT driver
+    # replays (FENCE_AFTER = STEAL_AFTER = 3, the legacy
+    # HOLDER_EVIDENCE_LOSE = false world), so the harness's tick
+    # mapping and base-regime shim apply unchanged. The run is
+    # mirrored as VANISH_BELIEVER_EXITS_RUN in rio-lease/src/
+    # mbt_tests.rs and replayed by mbt-rio-lease's
+    # mbt_run_vanish_believer_exits — this check pins the model side
+    # so the .expect(...) clauses (belief exits at the read; rv frozen
+    # across the vanish; the peer creator's generation strictly above
+    # the deposed believer's) cannot regress silently. Exhaustive
+    # coverage of believerExitsAtAbsentRead stays the
+    # leaderElectionVanish regime check; the falsify twin for THIS
+    # regime's instance of the law is the same lease-f8-keep-believing
+    # calibration (the latch is read-arm-local, so the constants do
+    # not change which world keeps belief).
+    quint-leader-election-runs-vanish-mbt = mkQuintRunCheck {
+      name = "leader-election-runs-vanish-mbt";
+      spec = "leaderElection";
+      main = "leaderElectionVanishMbt";
+    };
+
     # Non-vacuity witness for the vanish regime: the creator-vs-
     # deposed-believer dual window actually opens during the absence
     # window (a vanished lease grants the creator immediate

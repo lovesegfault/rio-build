@@ -4812,3 +4812,105 @@ module leaderElectionVanishHold {
         not(keptBelievingPastAbsentRead),
       })
 }
+
+// =========================================================================
+// The vanish regime AT THE MBT-DRIVER CONSTANTS (round-14 D-15): the
+// BASE-regime constants (FENCE_AFTER = STEAL_AFTER = 3, the LEGACY
+// HOLDER_EVIDENCE_LOSE = false world the rio-lease MBT driver replays)
+// with one vanish armed. The driver's tick mapping (1 model tick = 7s,
+// MODEL_DEADLINE_TICKS = 3; rio-lease/src/mbt_tests.rs) and its
+// base-regime completed-edge shim are derived from EXACTLY these
+// constants, so this is the only vanish-regime instance the harness
+// can replay without re-deriving the time mapping or the shim.
+//
+// The sole replayed run lives here (vanishBelieverExitsMbtRun); the
+// exhaustive state-space coverage of believerExitsAtAbsentRead remains
+// the leaderElectionVanish regime's job. The keptBelievingPastAbsentRead
+// latch is the strawman-seam coupling: replaying the same run against
+// the lease-f8-keep-believing twin (ABSENT_READ_KEEPS_BELIEF = true,
+// the pre-bug_143 posture) makes the model keep belief past the 404
+// read and the implementation's projection (which exits) diverges at
+// exactly that step -- the W14-H1 acceptance.
+//
+// Wired as a runs check only (quint-leader-election-runs-vanish-mbt);
+// the MBT replay itself is mbt-rio-lease's mbt_run_vanish_believer_exits.
+// =========================================================================
+module leaderElectionVanishMbt {
+  import leaderElection(
+    NODES = Set("n1", "n2"),
+    FENCE_AFTER = 3,
+    STEAL_AFTER = 3,
+    RENEW = 1,
+    MAX_SKEW = 1,
+    MAX_TIME = 8,
+    MAX_GEN = 4,
+    MAX_RV = 8,
+    MAX_DELETES = 0,
+    MAX_CLAIM_FAILURES = 0,
+    MAX_RESTORES = 0,
+    MAX_SUSPENDS = 0,
+    MAX_SHUTDOWNS = 0,
+    MAX_DROPS = 0,
+    MAX_FOREIGN_BUMPS = 0,
+    OBS_KEY_RV = false,
+    BLIND_HOLDER_BOUND = 0,
+    HOLDER_EVIDENCE_LOSE = false,
+    CONFLICT_IMMEDIATE_LOSE = false,
+    MAX_STEP_DOWNS = 0,
+    STEP_DOWN_COUNT_KEYED = false,
+    CONFLICT_CLEARS_HOLD = false,
+    MAX_VANISHES = 1,
+    ABSENT_READ_KEEPS_BELIEF = false
+  ).*
+
+  /// The deletion-MBT acceptance trace (W14-H1): n1 acquires the
+  /// born-empty lease, an operator deletes the lease object out of
+  /// band, n1's next read observes the 404 and EXITS BELIEF AT THE
+  /// READ (bug_143; the keptBelievingPastAbsentRead latch stays
+  /// clear), then n1's own create re-acquires at the SAME generation
+  /// (its own claim row sits at the floor; the fresh object's
+  /// transition count vouches for nothing on its own, exactly the
+  /// false-alarm shape the self-fence run pins for the connectivity
+  /// blip). Mirrored step-for-step as VANISH_BELIEVER_EXITS_RUN in
+  /// rio-lease/src/mbt_tests.rs; the per-step projection diff is the
+  /// conformance proof.
+  ///
+  /// The foreign-creator variant (a peer's create lands at a strictly
+  /// greater generation -- the write-ahead claim) is the
+  /// leaderElectionVanishHold vanishBelieverExitsRun's job: that
+  /// property is genHW-derived (the rio-scheduler claims ledger), and
+  /// the rio-lease MBT projection deliberately omits genHW (phase 2).
+  run vanishBelieverExitsMbtRun =
+    init
+      .then(apiGet("n1"))
+      .then(steal("n1"))
+      .expect(all {
+        leading.get("n1"),
+        lease.holder == Held("n1"),
+        lease.rv == 1,
+        not(leaseAbsent),
+      })
+      .then(vanishLease)
+      .expect(all {
+        leaseAbsent,
+        leading.get("n1"),          // not yet read -- still believes
+        lease.holder == NoHolder,
+        lease.rv == 1,              // rv frozen across the vanish
+      })
+      .then(apiGet("n1"))
+      .expect(all {
+        not(leading.get("n1")),     // THE F8 LAW: belief exits at the read
+        leaseAbsent,
+        not(keptBelievingPastAbsentRead),
+        gen.get("n1") == 2,         // generation untouched by the lose
+      })
+      .then(createLease("n1"))
+      .expect(all {
+        not(leaseAbsent),
+        lease.holder == Held("n1"),
+        lease.rv == 2,              // rv resumes from the frozen point
+        lease.gen == 0,             // fresh object: count restarts at 0
+        leading.get("n1"),
+        gen.get("n1") == 2,         // SAME generation: own floor row
+      })
+}
