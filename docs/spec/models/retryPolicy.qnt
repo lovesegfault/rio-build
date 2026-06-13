@@ -443,6 +443,15 @@ module retryPolicy {
   /// per-event invariants and witnesses read. Overwritten by every
   /// accounting action; ONone between them. OEstablish is the
   /// establishment sweep's observation (Phase 1b).
+  /// The establishment probe's decision cells, collapsed to this
+  /// model's resolution (bughunt-13 F13). The kernel's ProbeClass has
+  /// five build-relevant cells; the three that charge the same class
+  /// (VerifiedMissingWanted / VerifiedNothingVerifiable /
+  /// NoStoreConfigured -> ChargeExecutorCrash) collapse to
+  /// PNoEvidence, so each model cell is one DISTINCT establishment
+  /// disposition: defer / adopt / charge.
+  type ProbeClass = | PUnavailable | PAllPresent | PNoEvidence
+
   type ObsKind =
     | ONone | OE1 | OE2 | OE3 | OE4 | OE5 | OE6 | OE7 | OE8 | OEstablish
     | OE9Dispatch | OResubmit | OCacheHit | OPoisonClear | OTtlExpire | OFailover
@@ -453,6 +462,12 @@ module retryPolicy {
     // plain worker infra (charged); distinct kind so the uncharged
     // contract triple stays exact and the fallthrough is witnessable.
     | OStoreDegradedCharged
+    // bughunt-13 F13: the establishment's charge-free arms — the
+    // probe-unavailable DEFER (attempt stays open; nothing written)
+    // and the all-outputs-present ADOPT (closed + completed, no
+    // charge). Distinct kinds so attemptsChargedOnce can pin both as
+    // charge-free and the per-arm witnesses stay exact.
+    | OEstablishDefer | OEstablishAdopt
   type LastObs = {
     kind: ObsKind,
     chargedAny: bool,       // some budget counter was charged by this event
@@ -970,6 +985,12 @@ module retryPolicy {
     (last.kind == OE6 or last.kind == OE7 or last.kind == OEstablish)
       implies (last.chargedAny or last.terminal or last.dropped),
     (last.kind == OE5) implies not(last.chargedAny),
+    // bughunt-13 F13: the establishment's defer/adopt arms are
+    // charge-free BY KERNEL CONTRACT (Defer writes nothing; Adopt
+    // closes without a row) — a charge on either kind is an encoding
+    // regression.
+    (last.kind == OEstablishDefer or last.kind == OEstablishAdopt)
+      implies not(last.chargedAny),
   }
 
   /// sched.retry.attempts-bounded+5, the boundedness clause: the number
@@ -1152,6 +1173,13 @@ module retryPolicy {
   /// Violated when an unreported executor crash is established and
   /// charges the threshold/exclusion budget (the C2 charge is reachable).
   val noEstablishedCrashCharge = not(last.kind == OEstablish and last.chargedAny)
+  /// Violated when the establishment sweep ADOPTS (bughunt-13 F13:
+  /// the probe verified every wanted output present; closed +
+  /// completed, charge-free — the DRunning->DCompleted transition).
+  val noEstablishAdopt = not(last.kind == OEstablishAdopt)
+  /// Violated when the establishment sweep DEFERS (bughunt-13 F13:
+  /// probe unavailable; the attempt stays open, nothing charged).
+  val noEstablishDefer = not(last.kind == OEstablishDefer)
   /// Violated when the crash-only alphabet reaches a failure-terminal
   /// state (the no-report crash loop now terminates).
   val noCrashLoopTerminal = not(failureTerminal)
@@ -1618,6 +1646,7 @@ module retryPolicy {
   pure val REPORT_CLASSES = Set(RcTransient, RcInfraPutPath, RcInfraOom, RcInfraOther, RcPermanent, RcTimeout)
   pure val DEATH_KINDS = Set(DkOom, DkDeadline, DkCrash)
   pure val BOOLS = Set(true, false)
+  pure val PROBE_CLASSES = Set(PUnavailable, PAllPresent, PNoEvidence)
 
   action buildEndsReportedAny = {
     nondet w = EXECUTORS.oneOf()
@@ -1734,13 +1763,24 @@ module retryPolicy {
 //     consts); a failed appending transaction behind ReportOutcome is the
 //     same atomic-tx inversion the as-built fault regime prices
 //     (TX_FAULTS = 0 here).
-//   - The wedge as a distinct state (ENABLE_WEDGE = false): a pull-mode
-//     build that never reports is closed by activeDeadlineSeconds (the
-//     controller's deadline fill) or by the establishment sweep; with
-//     pullEstablish enabled on any open attempt the Wedged state adds no
-//     distinct outcome, and the as-built backstop (E8) has no pull-mode
-//     successor (the establishment sweep is the only scheduler-side
-//     time-based repair).
+//   - The wedge as a distinct state (ENABLE_WEDGE = false; re-derived
+//     at bughunt-13 F13): a pull-mode build that never reports is
+//     closed by activeDeadlineSeconds (the controller's deadline fill)
+//     or by the establishment sweep WHEN THE SWEEP RESOLVES — the
+//     sweep's resolution is probe-gated, and the probe-unavailable
+//     DEFER arm leaves the attempt open for a later pass
+//     (pullEstablish's PUnavailable arm; production:
+//     EstablishmentAction::Defer, unbounded and memoryless by design).
+//     The Wedged attempt SHAPE adds no distinct outcome because the
+//     defer arm now REPRESENTS the held-open state in-model; the
+//     former "with pullEstablish enabled on any open attempt" framing
+//     was an enabledness claim, not a liveness fact — the model is
+//     safety-only, and the liveness half is priced in production
+//     observability (rio_scheduler_establish_deferred_total + the
+//     defer-age gauge and its persistence alert, the F13 code half).
+//     The as-built backstop (E8) has no pull-mode successor: the
+//     establishment sweep remains the only scheduler-side time-based
+//     repair VEHICLE, defer-gated as above.
 //   - Multi-derivation interference and the spawn/Job lifecycle itself
 //     (Model J/N territory); the busy bridge and synthesize-on-delete
 //     arms are controller-side and carry no retry charge.
@@ -2282,21 +2322,55 @@ module retryPolicy {
     everFailedBuilders' = everFailedBuilders,
   }
 
-  /// The establishment sweep: an open attempt whose deadline +
-  /// report-slack elapsed with no terminal row is established as
-  /// executor_crash/unreported and charged (failed_builders[source] +
-  /// failure_count + threshold re-check), closing the attempt and
-  /// requeueing or poisoning in the same transaction. The clock gate is
-  /// over-approximated away (see the header); the establishment may
-  /// therefore race the controller fill and the in-flight worker report
-  /// here — whichever lands first closes the row, the loser is the
-  /// no-attempt no-op.
-  // Mirrors: actor/housekeeping.rs establishment sweep for open
-  //          pull-mode attempts (sched.attempt.establishment-window's
-  //          charge half; the window timing itself is not modeled).
-  action pullEstablish(n: str): bool = all {
-    freeCloseRun' = 0,
-    storeDegradedRun' = 0,
+  /// The establishment sweep resolves one expired open pull-mode
+  /// attempt through the four-armed kernel (bughunt-13 F13): ONE
+  /// kernel call dispositions the attempt
+  /// (establish_from_classes(kind, node, probe)), and this action
+  /// carries the kernel's BUILD-kind probe dispatch as a parameter —
+  /// the probe's answer is environment nondeterminism (the store's
+  /// contents are outside this model's subject):
+  ///
+  ///   - PAllPresent  -> ADOPT-AS-COMPLETED: every verifiable wanted
+  ///     output is present, so the work succeeded and only the report
+  ///     was lost; the attempt closes, the derivation COMPLETES,
+  ///     nothing is charged — the DRunning->DCompleted transition the
+  ///     audit named as the refinement hole.
+  ///   - PUnavailable -> DEFER: no probe evidence in either direction
+  ///     (the batch FindMissingPaths probe failed or timed out); the
+  ///     attempt STAYS OPEN for a pass with a working probe —
+  ///     uncharged, memoryless, unbounded by design (merged_bug_232:
+  ///     absence of evidence is not evidence of absence). The
+  ///     held-open wedge a persistent outage sustains is
+  ///     production-observable through the establish-defer
+  ///     counter/age metrics and their persistence alert (the F13
+  ///     code half), never through a model-side eventually — this
+  ///     model is safety-only.
+  ///   - PNoEvidence  -> CHARGE executor_crash/unreported
+  ///     (failed_builders[source] + failure_count + threshold
+  ///     re-check), closing the attempt and requeueing or poisoning
+  ///     in the same transaction. Covers the kernel's
+  ///     VerifiedMissingWanted / VerifiedNothingVerifiable /
+  ///     NoStoreConfigured cells — all three charge the same class.
+  ///
+  /// The kernel's remaining arms live elsewhere or out of frame: the
+  /// materialization kind routes to establishMaterializationCrash
+  /// (no adopt arm, materialization_infra, never executor_crash);
+  /// the node-axis CloseChargeFree arm (Cancelled / Absent /
+  /// TerminalSettled nodes with stale open attempts) has NO
+  /// constructible population in this single-derivation frame — an
+  /// open attempt here coexists only with DRunning (every poison
+  /// path closes the attempt in its own step and there is no cancel
+  /// plane) — so modeling it would mint a dead letter (the F2
+  /// lesson); it is PRICED here instead, its production behavior
+  /// pinned by the kernel's own decision-table test.
+  ///
+  /// The window clock stays over-approximated (see the header): the
+  /// sweep may fire as soon as the attempt is open, racing the
+  /// controller fill and the in-flight worker report — whichever
+  /// lands first closes the row, the loser is the no-attempt no-op.
+  // Mirrors: rio-scheduler/src/actor/housekeeping.rs:establish_open_pull_attempt
+  // Mirrors: rio-evidence-kernel/src/establish.rs:establish_from_classes
+  action pullEstablish(n: str, probe: ProbeClass): bool = all {
     match attempt {
       | NoAttempt => false
       | Running(w) => w == n
@@ -2305,55 +2379,102 @@ module retryPolicy {
       | Wedged(w) => w == n
     },
     dStatus == DRunning,
-    val e = execs.get(n)
-    // the charge counts against the pod's death only if the pod actually
-    // died unreported (the PodDead shape); establishing a still-running
-    // or already-reported attempt charges the budget but there is no
-    // death to double-count.
-    val isDeath = match attempt { | PodDead(p) => true | _ => false }
-    val applied = specApply(spec, FEstablishedCrash({ at: now, exec: n }), inTxFleet)
-    all {
-      execs' = execs.put(n, { ...e, runningOurs: false,
-        deathCharges: if (isDeath) e.deathCharges + 1 else e.deathCharges }),
-      attempt' = NoAttempt,
-      spec' = applied.c,
-      specVerdict' = applied.v,
-      live' = applied.c,
-      match applied.v {
-        | VPoison(r) => all {
-          dStatus' = DPoisoned,
-          poisonSrc' = EventPoison,
-          lastPoisonReason' = r,
-          pg' = { ...pg, status: PgPoisoned, poisonedAt: At(now), ledger: applied.c },
-          depStatus' = DepFailed,
-          everFailureTerminal' = true,
-          last' = { ...noObs, kind: OEstablish, chargedAny: true, terminal: true },
-        }
-        | VRequeue => all {
-          dStatus' = DReady,
+    match probe {
+      | PUnavailable =>
+        // EstablishmentAction::Defer: no row, no charge, no pacing-run
+        // movement (nothing enters the ledger); the attempt stays
+        // open. Only the observation ghost moves — the deferral's
+        // model-visible face.
+        all {
+          freeCloseRun' = freeCloseRun,
+          storeDegradedRun' = storeDegradedRun,
+          execs' = execs,
+          attempt' = attempt,
+          spec' = spec, specVerdict' = specVerdict, live' = live,
+          pg' = pg,
+          dStatus' = dStatus,
           poisonSrc' = poisonSrc,
           lastPoisonReason' = lastPoisonReason,
-          pg' = { ...pg, ledger: applied.c },
           depStatus' = depStatus,
           everFailureTerminal' = everFailureTerminal,
-          last' = { ...noObs, kind: OEstablish, chargedAny: true },
+          last' = { ...noObs, kind: OEstablishDefer },
+          everFailedBuilders' = everFailedBuilders,
         }
-        | VCancel => all {
-          // unreachable: the establishment arm never cancels
-          dStatus' = DReady,
+      | PAllPresent =>
+        // EstablishmentAction::AdoptCompleted: close + complete,
+        // charge-free; no fold event (no attempt row is written, no
+        // pacing-run movement). The adopt stamps exactly the probe's
+        // verified witness (bug_148) — at this resolution, the
+        // completion itself.
+        all {
+          freeCloseRun' = freeCloseRun,
+          storeDegradedRun' = storeDegradedRun,
+          execs' = execs.put(n, { ...execs.get(n), runningOurs: false }),
+          attempt' = NoAttempt,
+          spec' = spec, specVerdict' = specVerdict, live' = live,
+          pg' = { ...pg, status: PgCompleted },
+          dStatus' = DCompleted,
           poisonSrc' = poisonSrc,
           lastPoisonReason' = lastPoisonReason,
-          pg' = { ...pg, ledger: applied.c },
           depStatus' = depStatus,
           everFailureTerminal' = everFailureTerminal,
-          last' = { ...noObs, kind: OEstablish, chargedAny: true },
+          last' = { ...noObs, kind: OEstablishAdopt },
+          everFailedBuilders' = everFailedBuilders,
         }
-      },
+      | PNoEvidence =>
+        // The C2 charge arm, unchanged from the charge-only encoding.
+        val e = execs.get(n)
+        // the charge counts against the pod's death only if the pod
+        // actually died unreported (the PodDead shape); establishing a
+        // still-running or already-reported attempt charges the budget
+        // but there is no death to double-count.
+        val isDeath = match attempt { | PodDead(p) => true | _ => false }
+        val applied = specApply(spec, FEstablishedCrash({ at: now, exec: n }), inTxFleet)
+        all {
+          freeCloseRun' = 0,
+          storeDegradedRun' = 0,
+          execs' = execs.put(n, { ...e, runningOurs: false,
+            deathCharges: if (isDeath) e.deathCharges + 1 else e.deathCharges }),
+          attempt' = NoAttempt,
+          spec' = applied.c,
+          specVerdict' = applied.v,
+          live' = applied.c,
+          match applied.v {
+            | VPoison(r) => all {
+              dStatus' = DPoisoned,
+              poisonSrc' = EventPoison,
+              lastPoisonReason' = r,
+              pg' = { ...pg, status: PgPoisoned, poisonedAt: At(now), ledger: applied.c },
+              depStatus' = DepFailed,
+              everFailureTerminal' = true,
+              last' = { ...noObs, kind: OEstablish, chargedAny: true, terminal: true },
+            }
+            | VRequeue => all {
+              dStatus' = DReady,
+              poisonSrc' = poisonSrc,
+              lastPoisonReason' = lastPoisonReason,
+              pg' = { ...pg, ledger: applied.c },
+              depStatus' = depStatus,
+              everFailureTerminal' = everFailureTerminal,
+              last' = { ...noObs, kind: OEstablish, chargedAny: true },
+            }
+            | VCancel => all {
+              // unreachable: the establishment arm never cancels
+              dStatus' = DReady,
+              poisonSrc' = poisonSrc,
+              lastPoisonReason' = lastPoisonReason,
+              pg' = { ...pg, ledger: applied.c },
+              depStatus' = depStatus,
+              everFailureTerminal' = everFailureTerminal,
+              last' = { ...noObs, kind: OEstablish, chargedAny: true },
+            }
+          },
+          everFailedBuilders' = everFailedBuilders.union(Set(n)),
+        }
     },
     now' = now, promotionsLeft' = promotionsLeft, physAttempts' = physAttempts,
     failoversLeft' = failoversLeft, txFaultsLeft' = txFaultsLeft,
     justFailedOver' = false,
-    everFailedBuilders' = everFailedBuilders.union(Set(n)),
   }
 
   /// The spawn-intent gate's exhausted-universe verdict with no new
@@ -2518,7 +2639,11 @@ module retryPolicy {
   action pullStoreDegradedRunBoundAny = {
     nondet n = EXECUTORS.oneOf() pullStoreDegradedRunBound(n)
   }
-  action pullEstablishAny = { nondet n = EXECUTORS.oneOf() pullEstablish(n) }
+  action pullEstablishAny = {
+    nondet n = EXECUTORS.oneOf()
+    nondet probe = PROBE_CLASSES.oneOf()
+    pullEstablish(n, probe)
+  }
   action sourceLeavesPoolAny = { nondet n = EXECUTORS.oneOf() sourceLeavesPool(n) }
 
   // --- 11. the materialization attempt class ------------------------------
@@ -2898,6 +3023,55 @@ module retryPolicyPull {
         pg.poisonedAt == At(now),
         pg.ledger.poisonedAt == NoTime,
         last.kind == OE9Dispatch,
+      })
+  }
+
+  /// bughunt-13 F13, the adopt arm end to end: a pod dies after the
+  /// work succeeded (outputs landed; the report was lost); the
+  /// sweep's probe verifies every verifiable wanted output present
+  /// and ADOPTS — closed, completed, zero charges (the
+  /// DRunning->DCompleted transition the audit named as the
+  /// refinement hole, replayed against the kernel's
+  /// AdoptCompleted arm).
+  run establishAdoptRun = {
+    init
+      .then(all { pullOpensAttempt("n1"), buildLeavesMatUntouched })
+      .then(all { buildEndsPodDeath("n1", DkCrash), buildLeavesMatUntouched })
+      .then(all { pullEstablish("n1", PAllPresent), buildLeavesMatUntouched })
+      .expect(and {
+        dStatus == DCompleted,
+        attempt == NoAttempt,
+        live.failureCount == 0,
+        live.failedBuilders == Set(),
+        pg.status == PgCompleted,
+        last.kind == OEstablishAdopt,
+        not(last.chargedAny),
+      })
+  }
+
+  /// bughunt-13 F13, the defer arm: probe unavailable — the attempt
+  /// stays open and uncharged across the pass (the named zombie
+  /// state, now a modeled step instead of an invisible stutter); a
+  /// later pass with probe evidence charges, so the deferral paces
+  /// the sweep without forgiving the crash.
+  run establishDeferRun = {
+    init
+      .then(all { pullOpensAttempt("n1"), buildLeavesMatUntouched })
+      .then(all { buildEndsPodDeath("n1", DkCrash), buildLeavesMatUntouched })
+      .then(all { pullEstablish("n1", PUnavailable), buildLeavesMatUntouched })
+      .expect(and {
+        dStatus == DRunning,
+        attempt != NoAttempt,
+        live.failureCount == 0,
+        live.failedBuilders == Set(),
+        last.kind == OEstablishDefer,
+        not(last.chargedAny),
+      })
+      .then(all { pullEstablish("n1", PNoEvidence), buildLeavesMatUntouched })
+      .expect(and {
+        last.kind == OEstablish,
+        last.chargedAny,
+        live.failedBuilders == Set("n1"),
       })
   }
 }

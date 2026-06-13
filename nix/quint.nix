@@ -5889,6 +5889,27 @@ rec {
       step = "pullStep";
       witness = "noEstablishedCrashCharge";
     };
+    # bughunt-13 F13: the establishment's other arms are REACHABLE, not
+    # decorative — adopt (the DRunning->DCompleted transition the audit
+    # named as the refinement hole: outputs present, report lost,
+    # closed + completed charge-free) and the probe-unavailable defer
+    # (the attempt stays open, uncharged — the held-open wedge the
+    # defer-age alert observes in production). If either stops
+    # violating, the four-armed kernel conformance has gone vacuous.
+    quint-retry-policy-pull-witness-establish-adopt = mkQuintWitnessCheck {
+      name = "retry-policy-pull-witness-establish-adopt";
+      spec = "retryPolicy";
+      main = "retryPolicyPull";
+      step = "pullStep";
+      witness = "noEstablishAdopt";
+    };
+    quint-retry-policy-pull-witness-establish-defer = mkQuintWitnessCheck {
+      name = "retry-policy-pull-witness-establish-defer";
+      spec = "retryPolicy";
+      main = "retryPolicyPull";
+      step = "pullStep";
+      witness = "noEstablishDefer";
+    };
     quint-retry-policy-pull-witness-no-attempt-noop = mkQuintWitnessCheck {
       name = "retry-policy-pull-witness-no-attempt-noop";
       spec = "retryPolicy";
