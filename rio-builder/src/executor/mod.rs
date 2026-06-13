@@ -462,7 +462,8 @@ pub async fn execute_build(
     // missing-output nodes; empty means cache-hit or
     // inline-budget exceeded, so fall back to store fetch.
     let drv = if assignment.drv_content.is_empty() {
-        match fetch_drv_from_store(&mut store_client, drv_path).await {
+        match fetch_drv_from_store(&mut store_client, &assignment.assignment_token, drv_path).await
+        {
             Ok(d) => d,
             Err(e) => return ExecuteOutcome::pre_cgroup(e, first_line),
         }
@@ -598,7 +599,7 @@ pub async fn execute_build(
             basic_drv,
             input_paths,
             input_metadata,
-        } = resolve_inputs(&store_client, &drv, drv_path).await?;
+        } = resolve_inputs(&store_client, &assignment.assignment_token, &drv, drv_path).await?;
 
         // 3. Castore root nodes for the closure: scheduler-attested
         // `WorkAssignment.input_roots` (P0588) plus a GetNarIndexBatch
@@ -1281,6 +1282,7 @@ struct ResolvedInputs {
 #[instrument(skip_all, fields(drv_path = %drv_path))]
 async fn resolve_inputs(
     store_client: &StoreServiceClient<Channel>,
+    assignment_token: &str,
     drv: &Derivation,
     drv_path: &str,
 ) -> Result<ResolvedInputs, ExecutorError> {
@@ -1297,8 +1299,9 @@ async fn resolve_inputs(
     let fetched: Vec<Vec<String>> = stream::iter(input_drv_specs)
         .map(|(path, names)| {
             let mut client = store_client.clone();
+            let token = assignment_token.to_owned();
             async move {
-                let input_drv = fetch_drv_from_store(&mut client, &path).await?;
+                let input_drv = fetch_drv_from_store(&mut client, &token, &path).await?;
                 let matching: Vec<String> = input_drv
                     .outputs()
                     .iter()
@@ -1968,7 +1971,7 @@ mod tests {
         );
 
         // === Resolve ===
-        let resolved = resolve_inputs(&client, &drv, &main_drv_path).await?;
+        let resolved = resolve_inputs(&client, "test-token", &drv, &main_drv_path).await?;
 
         // The dep's concrete output path is now in input_srcs.
         assert!(

@@ -230,11 +230,26 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
 /// or inline budget exceeded). The .drv is a single regular file in the
 /// store, so we fetch its NAR and extract the ATerm content via
 /// `extract_single_file`.
+///
+/// `assignment_token` rides along as on every other castore read: for
+/// ADR-024 native submissions the `.drv` exists only as a drv blob, and
+/// the store's GetPath fallback (`r[store.drv.getpath-fallback]`) is
+/// tenant-scoped — the token's `tenant` claim is what authorizes the
+/// read. Legacy (narinfo-backed) `.drv` paths ignore the header, so this
+/// is a no-op for the ssh-ng flow.
 #[instrument(skip_all, fields(drv_path = %drv_path))]
 pub(super) async fn fetch_drv_from_store(
     store_client: &mut StoreServiceClient<Channel>,
+    assignment_token: &str,
     drv_path: &str,
 ) -> Result<Derivation, ExecutorError> {
+    let token_pair;
+    let extra_metadata: &[(&'static str, &str)] = if assignment_token.is_empty() {
+        &[]
+    } else {
+        token_pair = [(rio_proto::ASSIGNMENT_TOKEN_HEADER, assignment_token)];
+        &token_pair
+    };
     // .drv files are small (KB range), but wrap in stream timeout: this is
     // the first gRPC call after setup_overlay, so a stalled store would hang
     // the build with an overlay mount held indefinitely.
@@ -243,7 +258,7 @@ pub(super) async fn fetch_drv_from_store(
         drv_path,
         rio_common::grpc::GRPC_STREAM_TIMEOUT,
         rio_common::limits::MAX_NAR_SIZE,
-        &[],
+        extra_metadata,
     )
     .await
     .map_err(|e| ExecutorError::MetadataFetch {
@@ -1355,12 +1370,45 @@ mod tests {
         let drv_path = tp("test.drv");
         store.seed(make_path_info(&drv_path, &nar, hash), nar);
 
-        let drv = fetch_drv_from_store(&mut client, &drv_path)
+        let drv = fetch_drv_from_store(&mut client, "test-token", &drv_path)
             .await
             .expect("fetch + parse should succeed");
 
         assert_eq!(drv.platform(), "x86_64-linux");
         assert_eq!(drv.outputs().len(), 1);
+        // The assignment token must ride the GetPath: the store's
+        // drv-blob fallback (`store.drv.getpath-fallback`) is
+        // tenant-scoped, and the token's tenant claim is the only
+        // identity the builder has. An empty token sends no header.
+        assert_eq!(
+            store.calls.get_path_tokens.read().unwrap().as_slice(),
+            &[Some("test-token".to_owned())],
+            "fetch_drv_from_store must attach the assignment token"
+        );
+        Ok(())
+    }
+
+    /// An empty token (dev mode, no HMAC) must not send an empty
+    /// header — the store treats header-present as "verify this".
+    #[tokio::test]
+    async fn test_fetch_drv_from_store_empty_token_sends_no_header() -> anyhow::Result<()> {
+        let (store, mut client) = spawn_and_connect().await?;
+        let out = tp("test-out");
+        let drv_text = format!(
+            r#"Derive([("out","{out}","","")],[],[],"x86_64-linux","/bin/sh",[],[("out","{out}")])"#
+        );
+        let (nar, hash) = make_nar(drv_text.as_bytes());
+        let drv_path = tp("tokenless.drv");
+        store.seed(make_path_info(&drv_path, &nar, hash), nar);
+
+        fetch_drv_from_store(&mut client, "", &drv_path)
+            .await
+            .expect("fetch + parse should succeed");
+        assert_eq!(
+            store.calls.get_path_tokens.read().unwrap().as_slice(),
+            &[None],
+            "empty assignment token must omit the header entirely"
+        );
         Ok(())
     }
 
@@ -1369,7 +1417,7 @@ mod tests {
         let (_store, mut client) = spawn_and_connect().await?;
 
         let missing = tp("nonexistent.drv");
-        let err = fetch_drv_from_store(&mut client, &missing)
+        let err = fetch_drv_from_store(&mut client, "test-token", &missing)
             .await
             .expect_err("should fail on missing .drv");
 
@@ -1390,7 +1438,7 @@ mod tests {
         let drv_path = tp("bad.drv");
         store.seed(make_path_info(&drv_path, &garbage, [0u8; 32]), garbage);
 
-        let err = fetch_drv_from_store(&mut client, &drv_path)
+        let err = fetch_drv_from_store(&mut client, "test-token", &drv_path)
             .await
             .expect_err("should fail on bad NAR");
 

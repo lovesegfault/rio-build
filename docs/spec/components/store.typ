@@ -968,6 +968,31 @@ whole sweep --- no `pending_s3_deletes` leg. The client-side ack-record TTL
 from ADR-024 ("TTL ≤ the cluster's minimum unpinned-blob lifetime") binds to
 this grace window; a re-put refreshes `created_at`, restarting the clock.
 
+#r("store.drv.getpath-fallback")[
+  On a `GetPath` narinfo miss for a path ending in `.drv`, the store MUST
+  attempt to serve the derivation from `drv_blobs` (looked up by
+  `drv_path_hash = sha256(store path)`) before answering `NOT_FOUND`:
+  reconstruct the ATerm from the canonical proto bytes through the full
+  `verify_drv_blob` cross-check (any failure is `DATA_LOSS`, never a silent
+  serve), frame it as a flat regular-file NAR, and synthesize the `PathInfo`
+  deterministically from the blob (`nar_hash`/`nar_size` over the
+  reconstructed NAR; `references` = inputDrvs ∪ inputSrcs). Visibility is the
+  `GetDrvBlob` rule: the caller's tenant --- gateway JWT, else the HMAC
+  assignment token's `tenant` claim, the shared castore identity ladder ---
+  must hold a `drv_blob_tenants` binding; no identity and no binding both
+  yield the same `NOT_FOUND` as before the fallback existed.
+]
+
+This is what makes ADR-024 native submissions buildable: the client uploads
+the derivation ONLY as a drv blob (`PutDrvBlobs` --- no `PutPath`, no narinfo
+row), and the builder's `fetch_drv_from_store` fallback reads the `.drv` via
+`GetPath` when `WorkAssignment.drv_content` is empty. The builder presents
+its assignment token on that fetch; the token's `tenant` claim is the
+submitting tenant, whose `PutDrvBlobs` bound visibility for every drv in the
+submission (own and input `.drv`s alike), so the scoped lookup resolves
+without any cross-tenant exemption. Legacy ssh-ng `.drv` paths have narinfo
+rows and never reach the fallback.
+
 = Upstream Cache Substitution
 
 #r("store.substitute.upstream")[

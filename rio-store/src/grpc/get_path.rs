@@ -140,6 +140,16 @@ impl StoreServiceImpl {
     ) -> Result<Response<GetPathStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
         let tenant_id = self.request_tenant_id(&request);
+        // Captured (not verified) before the request body is consumed:
+        // the drv-blob fallback below resolves the builder's HMAC
+        // identity lazily, only on a narinfo miss for a `.drv` path.
+        // Eager verification here would also reject hit-path requests
+        // carrying a stale token, which GetPath has always ignored.
+        let assignment_token: Option<String> = request
+            .metadata()
+            .get(rio_proto::ASSIGNMENT_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let req = request.into_inner();
 
         validate_store_path(&req.store_path)?;
@@ -155,31 +165,43 @@ impl StoreServiceImpl {
             .await
             .map_err(|e| metadata_status("GetPath: query_path_info", e))?;
         let local_hit = local.is_some();
-        let info = match local {
-            Some(i) => {
-                // r[impl store.substitute.tenant-sig-visibility+2]
-                // Same gate as QueryPathInfo: hide-as-NotFound on
-                // failure, fall through to try_substitute_on_miss
-                // (the requesting tenant's upstreams may also have
-                // it, which would append a trusted sig).
-                if self.sig_visibility_gate(tenant_id, &i).await? {
-                    i
-                } else if let Some(sub) = self
-                    .try_substitute_on_miss(tenant_id, &req.store_path)
-                    .await?
-                {
-                    sub
-                } else {
-                    return Err(Status::not_found(format!(
-                        "path not found: {}",
-                        req.store_path
-                    )));
-                }
-            }
-            None => self
-                .try_substitute_on_miss(tenant_id, &req.store_path)
+        // r[impl store.substitute.tenant-sig-visibility+2]
+        // Same gate as QueryPathInfo: hide-as-NotFound on failure, fall
+        // through to try_substitute_on_miss (the requesting tenant's
+        // upstreams may also have it, which would append a trusted sig).
+        let resolved = if let Some(i) = local
+            && self.sig_visibility_gate(tenant_id, &i).await?
+        {
+            Some(i)
+        } else {
+            self.try_substitute_on_miss(tenant_id, &req.store_path)
                 .await?
-                .ok_or_else(|| Status::not_found(format!("path not found: {}", req.store_path)))?,
+        };
+        let info = match resolved {
+            Some(i) => i,
+            None => {
+                // ADR-024 native submissions carry the derivation ONLY
+                // as a drv blob (`PutDrvBlobs`) — there is no narinfo
+                // row for the `.drv` path. Serve it from `drv_blobs`
+                // before answering NotFound so the builder's
+                // `fetch_drv_from_store` (and any other GetPath
+                // consumer of `.drv` content) works unchanged.
+                if req.store_path.ends_with(".drv")
+                    && let Some(resp) = self
+                        .serve_drv_blob_as_path(
+                            tenant_id,
+                            assignment_token.as_deref(),
+                            &req.store_path,
+                        )
+                        .await?
+                {
+                    return Ok(resp);
+                }
+                return Err(Status::not_found(format!(
+                    "path not found: {}",
+                    req.store_path
+                )));
+            }
         };
         let lookup_elapsed = lookup_start.elapsed();
         if lookup_elapsed > std::time::Duration::from_secs(1) {
@@ -210,6 +232,168 @@ impl StoreServiceImpl {
 
         let (root, dirs) = decode_dag_for(&info.store_path, dag)?;
         self.stream_path(info, manifest, root, dirs).await
+    }
+
+    /// GetPath fallback for `.drv` paths that exist only as drv blobs
+    /// (ADR-024 native submissions): reconstruct the ATerm from the
+    /// canonical proto bytes and serve it as a flat regular-file NAR
+    /// with a synthesized `PathInfo`.
+    ///
+    /// Visibility is the SAME rule as `GetDrvBlob`
+    /// (`r[store.drv.blob-kind]`): the caller's tenant — gateway JWT /
+    /// scheduler probe (`request_tenant_id`), else the HMAC assignment
+    /// token's `tenant` claim via [`super::resolve_tenant_id`], the one
+    /// shared identity→tenant mapping of the castore surface — must
+    /// hold a `drv_blob_tenants` binding. The builder qualifies because
+    /// its assignment token carries the submitting tenant, and that
+    /// tenant's `PutDrvBlobs` wrote the binding for every drv in the
+    /// submission (own + input `.drv`s alike). No-identity and
+    /// no-binding both fall through to the caller's NotFound — the same
+    /// non-oracle answer GetPath gave before this fallback existed.
+    ///
+    /// Reconstruction reuses [`verify_drv_blob`] — the exact cross-check
+    /// `PutDrvBlobs` ran (digest, canonical re-encode, ATerm, drv-path
+    /// recompute against the REQUESTED path) — so a hash collision on
+    /// `drv_path_hash` or at-rest corruption is `DATA_LOSS`, never
+    /// silently served. The synthesized narinfo is fully deterministic
+    /// in the blob bytes (nar_hash/nar_size over the reconstructed NAR;
+    /// references = inputDrvs ∪ inputSrcs, the same anchor set the
+    /// drv-path recompute hashes), so repeated fetches are byte-stable
+    /// and client-cacheable with no stored row.
+    // r[impl store.drv.getpath-fallback]
+    async fn serve_drv_blob_as_path(
+        &self,
+        tenant_id: Option<uuid::Uuid>,
+        assignment_token: Option<&str>,
+        store_path: &str,
+    ) -> Result<Option<Response<GetPathStream>>, Status> {
+        let tenant = match tenant_id {
+            Some(t) => t,
+            None => {
+                let (Some(verifier), Some(tok)) = (self.hmac_verifier.as_ref(), assignment_token)
+                else {
+                    // Anonymous (or unverifiable dev-mode) caller:
+                    // nothing to scope by → NotFound, as ever.
+                    return Ok(None);
+                };
+                let claims = verifier
+                    .verify::<rio_auth::hmac::AssignmentClaims>(tok)
+                    .map_err(|_| Status::unauthenticated("assignment token rejected"))?;
+                match super::resolve_tenant_id(None, Some(&claims)) {
+                    Some(t) => t,
+                    // Tenant-less token (orphaned/recovered node):
+                    // hide-as-NotFound, mirroring GetDrvBlob's "same
+                    // answer for doesn't-exist and not-yours".
+                    None => return Ok(None),
+                }
+            }
+        };
+
+        let path_hash = Sha256::digest(store_path.as_bytes());
+        let row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT d.digest, d.body FROM drv_blobs d \
+               JOIN drv_blob_tenants t ON t.digest = d.digest \
+              WHERE d.drv_path_hash = $1 AND d.drv_path = $2 AND t.tenant_id = $3",
+        )
+        .bind(path_hash.as_slice())
+        .bind(store_path)
+        .bind(tenant)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "GetPath: drv blob fallback query failed");
+            Status::internal("drv blob query failed")
+        })?;
+        let Some((digest, body)) = row else {
+            return Ok(None);
+        };
+        let digest: [u8; 32] = digest
+            .try_into()
+            .map_err(|_| Status::data_loss("stored drv blob digest is not 32 bytes"))?;
+
+        let verified = rio_proto::derivation_util::verify_drv_blob(&body, &digest, store_path)
+            .map_err(|e| {
+                // PutDrvBlobs verified these bytes before storing;
+                // failing now is at-rest corruption.
+                error!(store_path, error = %e, "GetPath: stored drv blob failed re-verification");
+                Status::data_loss(format!("stored drv blob is corrupt: {e}"))
+            })?;
+
+        // A `.drv` is a single regular file; its NAR is the flat
+        // framing around the ATerm bytes — exactly what
+        // `Derivation::parse_from_nar` / `extract_single_file` on the
+        // client side unwrap.
+        let aterm = verified.aterm.into_bytes();
+        let mut nar = Vec::with_capacity(aterm.len() + 128);
+        rio_nix::nar::serialize(
+            &mut nar,
+            &rio_nix::nar::NarNode::Regular {
+                executable: false,
+                contents: aterm,
+            },
+        )
+        .map_err(|e| Status::internal(format!("NAR framing of drv blob failed: {e}")))?;
+
+        // References: inputDrvs ∪ inputSrcs — what Nix records for an
+        // on-disk `.drv` (the `make_text` reference anchor the drv-path
+        // recompute in verify_drv_blob just confirmed).
+        let references: Vec<String> = verified
+            .derivation
+            .input_drvs()
+            .keys()
+            .chain(verified.derivation.input_srcs().iter())
+            .cloned()
+            .collect();
+        let nar_hash = Sha256::digest(&nar);
+        let nar_size = nar.len() as u64;
+        let info = PathInfo {
+            store_path: store_path.to_string(),
+            store_path_hash: path_hash.to_vec(),
+            deriver: String::new(),
+            nar_hash: nar_hash.to_vec(),
+            nar_size,
+            references,
+            registration_time: 0,
+            ultimate: false,
+            signatures: vec![],
+            content_address: String::new(),
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let guard = ActiveStreamGuard::new(Arc::clone(&self.active_get_path_streams));
+        let nar = Bytes::from(nar);
+        let path_for_log = store_path.to_string();
+        rio_common::task::spawn_monitored("get-path-drv-fallback", async move {
+            let _guard = guard;
+            let stream_fut = async {
+                if tx
+                    .send(Ok(GetPathResponse {
+                        msg: Some(get_path_response::Msg::Info(info)),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if !stream_bytes(&tx, &nar).await {
+                    return; // client disconnected
+                }
+                // r[impl obs.metric.transfer-volume]
+                metrics::counter!("rio_store_get_path_bytes_total").increment(nar_size);
+                metrics::counter!("rio_store_get_path_total").increment(1);
+            };
+            if drain_with_timeout("GetPath", &tx, stream_fut)
+                .await
+                .is_none()
+            {
+                warn!(
+                    store_path = %path_for_log,
+                    nar_size,
+                    "GetPath drv-blob fallback streaming task timed out"
+                );
+            }
+        });
+        Ok(Some(Response::new(ReceiverStream::new(rx))))
     }
 
     /// Steps 2-4 of GetPath: pre-flight backend check, spawn the
