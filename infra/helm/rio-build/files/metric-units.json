@@ -1,16 +1,18 @@
 {
-  "_comment": "Unit registry for KEDA prometheus triggers (bug_299). rio.promTrigger (templates/_helpers.tpl) joins a metric and a threshold knob through this file and FAILS THE RENDER when either name is missing or their units disagree — a paths-knob dividing a jobs-gauge cannot ship again. Add a row when adding a trigger; units are free-form labels, equality-checked only.",
+  "_comment": "Unit registry for KEDA prometheus triggers (bug_299). rio.promTrigger (templates/_helpers.tpl) joins a metric and a threshold knob through this file and FAILS THE RENDER when either name is missing or their units disagree \u2014 a paths-knob dividing a jobs-gauge cannot ship again. Add a row when adding a trigger; units are free-form labels, equality-checked only.",
   "metrics": {
     "rio_scheduler_substituting_derivations": "jobs",
     "rio_scheduler_open_attempts": "attempts",
     "rio_gateway_channels_active": "sessions",
     "rio_gateway_putpath_aborted_retries_total": "retry-rate",
-    "rio_gateway_putpath_retry_events_total": "retry-rate"
+    "rio_gateway_putpath_retry_events_total": "retry-rate",
+    "rio_store_log_active_ingest_sessions": "sessions"
   },
   "knobs": {
     "targetBacklogJobsPerReplica": "jobs",
     "targetBuildersPerReplica": "attempts",
     "targetSessionsPerPod": "sessions",
-    "targetRetryAttemptsPerReplica": "retry-rate"
+    "targetRetryAttemptsPerReplica": "retry-rate",
+    "targetIngestSessionsPerReplica": "sessions"
   }
 }

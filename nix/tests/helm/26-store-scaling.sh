@@ -102,11 +102,13 @@ test "$maxr_cfg" = "37" || {
   exit 1
 }
 
-# The three triggers (KEDA takes the max): substitution backlog
-# (leading, class 1), builders-per-replica (leading, classes 2-3 —
-# keyed to open attempts, the busy-fleet gauge), CPU (reactive
-# corrective). Both prometheus triggers are AverageValue (per-replica
-# targets).
+# The triggers (KEDA takes the max): substitution backlog (leading,
+# class 1), builders-per-replica (leading, classes 2-3 — keyed to
+# open attempts, the busy-fleet gauge), live ingest sessions
+# (live_062 — the store-side drain-window truth: attempts close
+# before the log tails land, and the scale-in that ignored sessions
+# killed 5 mid-fan-out pods), CPU (reactive corrective). The
+# prometheus triggers are AverageValue (per-replica targets).
 trig=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.triggers' "$out")
 grep -q 'rio_scheduler_substituting_derivations' <<<"$trig" || {
   echo "FAIL: store ScaledObject lost the substitution-backlog trigger (rio_scheduler_substituting_derivations) — the leading class-1 signal" >&2
@@ -116,13 +118,17 @@ grep -q 'rio_scheduler_open_attempts' <<<"$trig" || {
   echo "FAIL: store ScaledObject lost the builders-per-replica trigger (rio_scheduler_open_attempts) — the leading class-2/3 signal" >&2
   exit 1
 }
+grep -q 'rio_store_log_active_ingest_sessions' <<<"$trig" || {
+  echo "FAIL: store ScaledObject lost the live-ingest-sessions trigger (rio_store_log_active_ingest_sessions) — the live_062 drain-window guard" >&2
+  exit 1
+}
 grep -q 'type: cpu' <<<"$trig" || {
   echo "FAIL: store ScaledObject lost the cpu saturation trigger — the reactive corrective term" >&2
   exit 1
 }
 n_avg=$(grep -c 'metricType: AverageValue' <<<"$trig" || true)
-test "$n_avg" -eq 3 || {
-  echo "FAIL: expected 3 AverageValue prometheus triggers on the store ScaledObject (backlog, builders, D2 demand inhibitor), got $n_avg" >&2
+test "$n_avg" -eq 4 || {
+  echo "FAIL: expected 4 AverageValue prometheus triggers on the store ScaledObject (backlog, builders, ingest sessions, D2 demand inhibitor), got $n_avg" >&2
   exit 1
 }
 

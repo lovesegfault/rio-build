@@ -93,6 +93,21 @@ spec:
     metadata:
       labels:
         {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 8 }}
+      annotations:
+        # live_062 (parity with the builders' I-126 posture): Karpenter
+        # must not voluntarily disrupt a store pod — consolidation of
+        # an under-utilized store node mid-ingest burns every attached
+        # builder's 45s lease-steal window and (pre-token-fix) darkened
+        # their watchers' tails. The annotation gates ONLY Karpenter's
+        # own disruption controller: kubectl drains (manual node
+        # rotation) still go through the eviction API and the rio-store
+        # PDB's 10% budget, and KEDA scale-in deletes pods directly —
+        # both unaffected. Static (not per-build like the builders'
+        # dynamic stamp): the store runs one-replica-per-node on its
+        # own pool, so there is no bin-packing win to give up, and a
+        # session-conditional flip would need a controller the chart
+        # does not have.
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       serviceAccountName: rio-store
       {{- /* One replica per node (decision 5), REQUIRED. All three

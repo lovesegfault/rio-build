@@ -335,6 +335,24 @@ store:
     # protective (inhibits on fainter demand); raise only with a
     # recorded re-derivation.
     targetRetryAttemptsPerReplica: 0.05
+    # live_062 store scale-in safety: desired replicas (ingest-session
+    # trigger) = ceil(sum(rio_store_log_active_ingest_sessions) /
+    # this). The gauge is store-side TRUTH about live AppendLog
+    # sessions; the scheduler-side gauges above LEAD the load but LAG
+    # the drain — builds complete (attempts close, backlog empties)
+    # while their log tails are still uploading, and the live_062
+    # scale-in killed 5 store pods in ~7min mid-fan-out exactly in
+    # that window (sessions were not a scaler input; each kill burned
+    # a 45s ingest-lease steal on the builders). R17 NAMED VIOLABLE;
+    # derivation: one session ≈ one live builder log stream, the same
+    # denominator class as targetBuildersPerReplica — seeded equal
+    # (50). Under the max-over-triggers fold this trigger only BINDS
+    # in the drain window where attempts have closed but sessions
+    # linger: replicas hold until the tails land, then the 300s
+    # scale-down window sees ALL triggers quiet and collapses as
+    # before. Render-time unit check: rio.promTrigger ×
+    # files/metric-units.json.
+    targetIngestSessionsPerReplica: 50
     # CPU saturation trigger (percent average utilization).
     cpuUtilization: 70
     # In-cluster prometheus the KEDA scaler queries. Default matches

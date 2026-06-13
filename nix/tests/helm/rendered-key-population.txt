@@ -684,6 +684,8 @@ default	Deployment/rio-store	spec.strategy.rollingUpdate.maxUnavailable
 default	Deployment/rio-store	spec.strategy.type
 default	Deployment/rio-store	spec.template
 default	Deployment/rio-store	spec.template.metadata
+default	Deployment/rio-store	spec.template.metadata.annotations
+default	Deployment/rio-store	spec.template.metadata.annotations.karpenter.sh/do-not-disrupt
 default	Deployment/rio-store	spec.template.metadata.labels
 default	Deployment/rio-store	spec.template.metadata.labels.app.kubernetes.io/component
 default	Deployment/rio-store	spec.template.metadata.labels.app.kubernetes.io/managed-by
@@ -2099,6 +2101,8 @@ karpenter	Deployment/rio-store	spec.strategy.rollingUpdate.maxUnavailable
 karpenter	Deployment/rio-store	spec.strategy.type
 karpenter	Deployment/rio-store	spec.template
 karpenter	Deployment/rio-store	spec.template.metadata
+karpenter	Deployment/rio-store	spec.template.metadata.annotations
+karpenter	Deployment/rio-store	spec.template.metadata.annotations.karpenter.sh/do-not-disrupt
 karpenter	Deployment/rio-store	spec.template.metadata.labels
 karpenter	Deployment/rio-store	spec.template.metadata.labels.app.kubernetes.io/component
 karpenter	Deployment/rio-store	spec.template.metadata.labels.app.kubernetes.io/managed-by
