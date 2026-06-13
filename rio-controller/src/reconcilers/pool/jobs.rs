@@ -1019,7 +1019,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // off-page is `Unknowable`, and the destructive arm suspends
     // (merged_bug_029: the page-built want-map foreground-deleted
     // still-wanted off-page Pending Jobs at 10s, single-tick).
-    let want = WantMap::for_pool(&page, evidence.coverage(), &name, pool.spec.kind);
+    let want = WantMap::for_pool(&page, &name, pool.spec.kind);
     let reaped =
         reap_stale_for_intents(&jobs_api, &jobs.items, &want, ctx, pool, &name, &streak_key).await;
     // Reaped active Jobs (selector-drifted / orphan Pending) free
@@ -1131,7 +1131,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         &mut ctx.exhausted_streak.lock(),
         streak_tick,
         &streak_key,
-        evidence.coverage(),
+        page.coverage(),
         std::time::Instant::now(),
     );
     // bug_151 (R30): surface each gave-up decay on the operator
@@ -1323,10 +1323,17 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // unboundable: reap is fail-CLOSED (spawn is fail-open). On a
     // truncated view the bound sums the TYPED population classes
     // (Ready + forecast — merged_bug_006).
+    // bug_064: the bound lane consumes THE letter (the page accessor,
+    // fused with every lossy narrowing) — never a raw transport copy.
+    // A lossy fold (e.g. an active Job with no parseable intent-id)
+    // now degrades BOTH destructive lanes: the orphan reap's absence
+    // verdicts go Unknowable AND this conjunct goes false, so
+    // `reap_excess_pending` suspends instead of foreground-deleting
+    // still-wanted Pending Jobs against an understated `queued`.
     let queued_known = reap_queued_known(
         scheduler_err.is_none(),
         gate_armed,
-        evidence.coverage() == DemandCoverage::Complete,
+        page.coverage() == DemandCoverage::Complete,
         queued,
         evidence.ready_upper(),
         evidence.forecast_upper(),
@@ -1449,15 +1456,20 @@ pub(crate) fn aggregate_upper_for(
 ///   positive walks with totality contracts, which an absence
 ///   accessor alone cannot govern).
 /// - **Absence lane** ([`WantMap`], minted via [`WantMap::for_pool`]
-///   from the page + [`DemandCoverage`]): the ONLY source of negative
+///   from the page — the coverage letter is read off the page itself,
+///   bug_064): the ONLY source of negative
 ///   evidence. On an incomplete view the only verdict an absence
 ///   query can return is [`WantVerdict::Unknowable`] — "absent from
 ///   page" cannot type-check as "absent from demand"; destructive
 ///   absence-keyed arms (the orphan-pending reap) SUSPEND on it
 ///   (merged_bug_029's close).
-/// - **Bound lane** ([`DemandEvidence`] → [`reap_queued_known`]):
-///   counts that infer absence consume the exact post-filter count on
-///   a COMPLETE view; on a truncated view the bound is the sum of the
+/// - **Bound lane** ([`IntentPage::coverage`] + [`DemandEvidence`]
+///   bounds → [`reap_queued_known`]): counts that infer absence
+///   consume the exact post-filter count only under a COMPLETE letter
+///   read off the LIVE page (bug_064: the letter folds transport
+///   truncation AND every lossy narrowing — a lossy fold suspends
+///   this lane exactly as it suspends the absence lane); on an
+///   Incomplete letter the bound is the sum of the
 ///   TYPED per-population aggregates (Ready + forecast — over-counting
 ///   under-reaps, the safe direction; merged_bug_006's close: a
 ///   forecast-backed Pending Job is counted by its own class, never
@@ -1472,7 +1484,6 @@ pub(crate) fn aggregate_upper_for(
 ///   declared class; members file as W10-AH census rows.
 pub(crate) struct PoolDemandView {
     page: IntentPage,
-    complete: bool,
     /// Σ `queued_by_system[s]` for `s ∈ pool.spec.systems`, saturated
     /// into `u32` — pre-kind/feature-filter, hence ≥ the pool's true
     /// READY demand on every coherent snapshot.
@@ -1513,12 +1524,15 @@ impl PoolDemandView {
         let ready_upper = aggregate_upper_for(systems, &resp.queued_by_system);
         let forecast_upper = aggregate_upper_for(systems, &resp.forecast_by_system);
         Self {
-            complete: !resp.truncated,
             ready_upper,
             forecast_upper,
             page: IntentPage {
                 intents: resp.intents,
                 lossy: false,
+                // bug_064: the transport letter joins the page AT
+                // CONSTRUCTION — every reader consumes it through
+                // `IntentPage::coverage`, already fused with `lossy`.
+                transport_complete: !resp.truncated,
             },
         }
     }
@@ -1534,21 +1548,21 @@ impl PoolDemandView {
             page: IntentPage {
                 intents: Vec::new(),
                 lossy: false,
+                transport_complete: true,
             },
-            complete: true,
             ready_upper: 0,
             forecast_upper: 0,
         }
     }
 
-    /// Decompose into the page lane and the evidence (witness +
-    /// bounds). The page mutates through its own typed surface; the
-    /// evidence is immutable for the tick.
+    /// Decompose into the page lane and the demand bounds. The page
+    /// mutates through its own typed surface and CARRIES the coverage
+    /// letter (bug_064 — `IntentPage::coverage` is the letter's only
+    /// read path); the bounds are immutable for the tick.
     pub(crate) fn split(self) -> (IntentPage, DemandEvidence) {
         (
             self.page,
             DemandEvidence {
-                complete: self.complete,
                 ready_upper: self.ready_upper,
                 forecast_upper: self.forecast_upper,
             },
@@ -1568,13 +1582,25 @@ pub(crate) struct IntentPage {
     intents: Vec<SpawnIntent>,
     /// A LOSSY narrowing happened since the transport mint
     /// (merged_bug_047): the page no longer supports true-negative
-    /// absence — [`Self::coverage_for_absence`] degrades the
-    /// transport letter to `Incomplete`. The laundering form (policy
-    /// strip after the witness mint, witness untouched) is thereby
-    /// unwritable: a fold either THREADS demand-visibility
+    /// absence — [`Self::coverage`] degrades the letter to
+    /// `Incomplete`. The laundering form (policy strip after the
+    /// witness mint, witness untouched) is thereby unwritable: a fold
+    /// either THREADS demand-visibility
     /// ([`PageNarrowing::HeldThreaded`] — held intents survive by
     /// construction) or pays with the witness.
     lossy: bool,
+    /// bug_064: the transport half of the coverage letter
+    /// (`!resp.truncated`), carried ON the page since construction so
+    /// the letter has exactly ONE read path ([`Self::coverage`]) and
+    /// no consumer — count or absence — can ever read the transport
+    /// letter un-fused with `lossy`. The pre-fix shape kept this bit
+    /// on `DemandEvidence`, split from the page at the view boundary:
+    /// the bound lane read it raw, so a lossy narrowing degraded only
+    /// the absence lane while `reap_queued_known` still saw
+    /// `Complete` and `reap_excess_pending` foreground-deleted
+    /// still-wanted Pending Jobs the lossy fold had dropped from
+    /// `queued`.
+    transport_complete: bool,
 }
 
 // r[impl ctrl.pool.window-visibility]
@@ -1643,16 +1669,21 @@ impl IntentPage {
         self.intents.len()
     }
 
-    /// The transport coverage letter as the ABSENCE lane may consume
-    /// it: degraded to `Incomplete` if any lossy narrowing happened
-    /// since the mint (the witness binds to the view it was minted
-    /// from — merged_bug_047). Fused inside [`WantMap::for_pool`], so
-    /// no absence consumer can read the un-degraded letter.
-    fn coverage_for_absence(&self, transport: DemandCoverage) -> DemandCoverage {
-        if self.lossy {
+    /// bug_064: THE coverage letter — the only read path, serving
+    /// EVERY reader class (the absence lane's `WantMap::for_pool`
+    /// mint, the bound lane's `reap_queued_known` conjunct, the
+    /// streak expiry's suspension law). The letter is degraded AT THE
+    /// PAGE: transport truncation and any lossy narrowing since the
+    /// mint fold here, so a mutated page can never be paired with an
+    /// un-degraded letter (merged_bug_047, now for every lane — the
+    /// retired `coverage_for_absence` accessor fused for absence
+    /// consumers only, and the bound lane read the raw transport
+    /// letter around it).
+    pub(crate) fn coverage(&self) -> DemandCoverage {
+        if self.lossy || !self.transport_complete {
             DemandCoverage::Incomplete
         } else {
-            transport
+            DemandCoverage::Complete
         }
     }
 
@@ -1664,41 +1695,38 @@ impl IntentPage {
         Self {
             intents,
             lossy: false,
+            transport_complete: true,
         }
     }
 }
 
 /// The completeness witness, as a typed letter — constructed only by
-/// [`DemandEvidence::coverage`], so a consumer holding `Complete`
-/// provably read it off the view (R26: the witness is consumed BY the
-/// test, not asserted beside it).
+/// [`IntentPage::coverage`] (bug_064: the letter lives ON the page,
+/// fused with every lossy narrowing since the transport mint), so a
+/// consumer holding `Complete` provably read it off the LIVE page
+/// (R26: the witness is consumed BY the test, not asserted beside it;
+/// R31′(ii): degradation is a property of the LETTER, quantified over
+/// every reader class — count and absence alike — never of one
+/// accessor).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DemandCoverage {
     /// The page IS the whole demand for this pool's filter.
     Complete,
-    /// The page was truncated — membership absence is unknowable.
+    /// The page was truncated or lossily narrowed — membership
+    /// absence is unknowable and the post-filter count understates.
     Incomplete,
 }
 
-/// The non-page half of the demand view: the completeness witness +
-/// the per-population-class demand bounds.
+/// The non-page half of the demand view: the per-population-class
+/// demand bounds. (The coverage letter moved ONTO the page at the
+/// bug_064 close — a split-off copy here was exactly the un-fused
+/// transport letter the bound lane laundered.)
 pub(crate) struct DemandEvidence {
-    complete: bool,
     ready_upper: u32,
     forecast_upper: u32,
 }
 
 impl DemandEvidence {
-    /// The typed completeness letter (feeds [`WantMap::for_pool`] and
-    /// the continuity consumers' suspension law).
-    pub(crate) fn coverage(&self) -> DemandCoverage {
-        if self.complete {
-            DemandCoverage::Complete
-        } else {
-            DemandCoverage::Incomplete
-        }
-    }
-
     /// The Ready-class demand upper bound (pool systems sum).
     pub(crate) fn ready_upper(&self) -> u32 {
         self.ready_upper
@@ -1738,21 +1766,16 @@ pub(crate) enum WantVerdict<'a> {
 }
 
 impl WantMap {
-    /// Mint the absence lane for one pool from the page + the
-    /// coverage letter. The fingerprint is the same `RenderInputs`
+    /// Mint the absence lane for one pool from the page. The
+    /// coverage letter is read off the page itself (bug_064:
+    /// [`IntentPage::coverage`] is the letter's ONLY read path, so no
+    /// caller can pair a mutated page with an un-degraded letter —
+    /// the merged_bug_047 fusion, now structural for every lane).
+    /// The fingerprint is the same `RenderInputs`
     /// projection the pod render stamps (`ctrl.pool.intent-candidate-
     /// set`).
-    pub(crate) fn for_pool(
-        page: &IntentPage,
-        coverage: DemandCoverage,
-        pool: &str,
-        kind: ExecutorKind,
-    ) -> Self {
-        // merged_bug_047: the witness is consumed THROUGH the page —
-        // a lossy narrowing since the transport mint degrades it
-        // here, inside the sole absence-lane constructor, so no
-        // caller can pair a mutated page with the un-degraded letter.
-        let coverage = page.coverage_for_absence(coverage);
+    pub(crate) fn for_pool(page: &IntentPage, pool: &str, kind: ExecutorKind) -> Self {
+        let coverage = page.coverage();
         let names = page
             .iter_page()
             .map(|i| {
@@ -1859,17 +1882,18 @@ pub(crate) fn apply_placeable_gate(
                 // The belt's honesty arm: an active Job the union
                 // cannot represent (no parseable intent id) means
                 // the threading does NOT cover the Job inventory —
-                // the narrowing pays with the witness (letter
-                // degrades inside the absence lane's sole
-                // constructor; destructive absence-keyed arms
-                // suspend) instead of keeping a Complete letter the
-                // union does not entail.
+                // the narrowing pays with the witness (the letter
+                // degrades ON the page — bug_064: EVERY reader class
+                // pays, absence and bound alike) instead of keeping
+                // a Complete letter the union does not entail.
                 warn!(
                     unrepresented = dh.unrepresented,
                     "active Job(s) without a parseable intent-id \
                      annotation: demand threading incomplete — \
-                     coverage letter degraded (absence unknowable; \
-                     orphan reap suspends this tick)"
+                     coverage letter degraded; BOTH destructive lanes \
+                     suspend this tick (orphan reap: absence \
+                     unknowable; excess-pending reap: queued bound \
+                     unboundable)"
                 );
             }
             // The DEMAND fold (R25: every letter named — no if-let
@@ -4690,8 +4714,10 @@ mod tests {
              (the union belt: Job LIST ∪ pod holds)"
         );
         // (2) the letter stays honestly Complete (the threading
-        // covered the Job inventory — no degrade needed);
-        let want = WantMap::for_pool(&page, DemandCoverage::Complete, "p", ExecutorKind::Builder);
+        // covered the Job inventory — no degrade needed; the letter
+        // is read off the page, bug_064);
+        assert_eq!(page.coverage(), DemandCoverage::Complete);
+        let want = WantMap::for_pool(&page, "p", ExecutorKind::Builder);
         // (3) the reaper reads demand-PRESENT for the Job: the
         // foreground-delete arm is unreachable.
         assert!(
@@ -4758,12 +4784,162 @@ mod tests {
         let jobs = [j];
         assert!(apply_placeable_gate(&mut page, &gate, &jobs).is_some());
 
-        let want = WantMap::for_pool(&page, DemandCoverage::Complete, "p", ExecutorKind::Builder);
+        let want = WantMap::for_pool(&page, "p", ExecutorKind::Builder);
         assert!(
             matches!(want.verdict("p-builder-zzzz"), WantVerdict::Unknowable),
             "an unrepresentable active Job degrades the letter: \
              absence is Unknowable, the orphan arm suspends"
         );
+        // bug_064: the SAME degraded letter is what the bound lane
+        // reads — `reap_queued_known`'s complete conjunct goes false,
+        // so the excess-pending reap suspends too (every reader class
+        // pays; the page accessor is the letter's only read path).
+        assert_eq!(
+            page.coverage(),
+            DemandCoverage::Incomplete,
+            "the lossy fold degrades THE letter, not one lane's copy"
+        );
+    }
+
+    /// W13-B (bug_064) — the lossy demand letter degrades the BOUND
+    /// lane too: an active Job with no parseable intent-id makes the
+    /// gate fold lossy, and the bound conjunct (`reap_queued_known`'s
+    /// `complete` argument) is read off the SAME page letter the
+    /// absence lane consumes — so `reap_excess_pending`'s authority
+    /// collapses to the per-class aggregates, or suspends entirely
+    /// when they read zero.
+    ///
+    /// PRE-FIX RED (recorded verbatim in the commit body): the bound
+    /// lane read the raw transport letter (`DemandEvidence.complete =
+    /// !resp.truncated`, split OFF the page before the narrowings) —
+    /// still `Complete` after the lossy retain dropped the job_held
+    /// union — so `reap_queued_known` returned `Some(queued)` with
+    /// `queued` UNDERSTATED and `reap_excess_pending`
+    /// foreground-deleted still-wanted Pending Jobs while the gate
+    /// stayed armed; only the absence lane paid the lossy witness.
+    // r[verify ctrl.pool.letter-degrades-whole]
+    #[test]
+    fn w13b_lossy_letter_suspends_the_bound_lane() {
+        use crate::reconcilers::nodeclaim_pool::{PlacedTick, placeable_channel};
+
+        let pool = test_pool("p", ExecutorKind::Builder);
+        // An active Job the demand-holding union cannot represent
+        // (the production lossy trigger — same feeder as the absence
+        // lane's test above).
+        let mut j = job(&pool, &intent("x"));
+        j.status = None;
+        j.spec
+            .as_mut()
+            .unwrap()
+            .template
+            .metadata
+            .as_mut()
+            .unwrap()
+            .annotations
+            .as_mut()
+            .unwrap()
+            .remove(INTENT_ID_ANNOTATION);
+
+        // Production view constructor (R13): an UNTRUNCATED transport
+        // page — the pre-fix bound lane read this raw bit as Complete
+        // no matter what the folds did afterwards.
+        let view = PoolDemandView::from_response(
+            rio_proto::types::GetSpawnIntentsResponse {
+                intents: vec![intent("x"), intent("y")],
+                truncated: false,
+                ..Default::default()
+            },
+            &["x86_64-linux".to_string()],
+        );
+        let (mut page, evidence) = view.split();
+        assert_eq!(
+            page.coverage(),
+            DemandCoverage::Complete,
+            "fixture: the transport letter is Complete before the fold"
+        );
+
+        let (tx, gate) = placeable_channel();
+        tx.send_replace(Some(std::sync::Arc::new(PlacedTick::for_test(
+            [],
+            [],
+            [],
+            [],
+        ))));
+        let jobs = [j];
+        assert!(apply_placeable_gate(&mut page, &gate, &jobs).is_some());
+
+        // The fold was lossy → THE letter (one read path, every
+        // reader class) is degraded.
+        assert_eq!(page.coverage(), DemandCoverage::Incomplete);
+
+        // The bound lane consumes the fused letter: with zero
+        // per-class aggregates the reap authority is None —
+        // reap_excess_pending suspends (pre-fix: Some(queued) with
+        // queued understated by the lossy retain → foreground delete
+        // of still-wanted Pending Jobs).
+        let queued = page.len_page().min(u32::MAX as usize) as u32;
+        assert_eq!(
+            reap_queued_known(
+                true,
+                true,
+                page.coverage() == DemandCoverage::Complete,
+                queued,
+                evidence.ready_upper(),
+                evidence.forecast_upper(),
+            ),
+            None,
+            "a lossy fold must suspend the excess-pending reap \
+             (the bound lane pays the lossy witness too)"
+        );
+    }
+
+    /// W13-B2 (bug_064) — reader-invisible where already sound: a
+    /// CLEAN fold (held-threaded, nothing unrepresented) keeps the
+    /// letter Complete for BOTH lanes, and the bound lane's exact
+    /// count arm stays armed — the fusion changes no verdict on the
+    /// paths that were already honest.
+    // r[verify ctrl.pool.letter-degrades-whole]
+    #[test]
+    fn w13b2_clean_fold_keeps_both_lanes_armed() {
+        let view = PoolDemandView::from_response(
+            rio_proto::types::GetSpawnIntentsResponse {
+                intents: vec![intent("x")],
+                truncated: false,
+                ..Default::default()
+            },
+            &["x86_64-linux".to_string()],
+        );
+        let (page, evidence) = view.split();
+        // Absence lane: a Complete letter mints true negatives.
+        let want = WantMap::for_pool(&page, "p", ExecutorKind::Builder);
+        assert!(matches!(
+            want.verdict("p-builder-gone"),
+            WantVerdict::AbsentFromDemand
+        ));
+        // Bound lane: the exact-count arm is armed.
+        assert_eq!(
+            reap_queued_known(
+                true,
+                true,
+                page.coverage() == DemandCoverage::Complete,
+                1,
+                evidence.ready_upper(),
+                evidence.forecast_upper(),
+            ),
+            Some(1)
+        );
+        // And the transport's own truncation degrades the SAME letter
+        // (the page carries both halves — one read path).
+        let view = PoolDemandView::from_response(
+            rio_proto::types::GetSpawnIntentsResponse {
+                intents: vec![intent("x")],
+                truncated: true,
+                ..Default::default()
+            },
+            &["x86_64-linux".to_string()],
+        );
+        let (page, _) = view.split();
+        assert_eq!(page.coverage(), DemandCoverage::Incomplete);
     }
 
     /// Two-cell spawn-time intent for the echo-provenance tests: the

@@ -24,24 +24,20 @@ use crate::reconcilers::pool::job::{
     try_spawn_job,
 };
 use crate::reconcilers::pool::jobs::{
-    DemandCoverage, INTENT_ID_ANNOTATION, INTENT_SELECTOR_ANNOTATION, IntentPage, WantMap,
-    reap_stale_for_intents,
+    DemandCoverage, INTENT_ID_ANNOTATION, INTENT_SELECTOR_ANNOTATION, IntentPage, PoolDemandView,
+    WantMap, reap_stale_for_intents,
 };
 use rio_crds::pool::ExecutorKind;
 use rio_proto::types::{AttemptTerminalReason, OpenAttempt, SpawnIntent};
 
 /// Complete-view want-map over `intents` --- the pre-round-10 call
 /// shape for the legacy reap scenarios (their demand views were
-/// implicitly complete). Incomplete-view scenarios mint their own
-/// coverage via the production [`WantMap::for_pool`] with
-/// [`DemandCoverage::Incomplete`].
+/// implicitly complete). Incomplete-view scenarios mint their page
+/// through the production [`PoolDemandView::from_response`] with
+/// `truncated: true` (bug_064: the letter lives ON the page; there is
+/// no per-call coverage override to inject).
 fn want_complete(intents: &[SpawnIntent], pool: &str, kind: ExecutorKind) -> WantMap {
-    WantMap::for_pool(
-        &IntentPage::for_test(intents.to_vec()),
-        DemandCoverage::Complete,
-        pool,
-        kind,
-    )
+    WantMap::for_pool(&IntentPage::for_test(intents.to_vec()), pool, kind)
 }
 
 // r[verify ctrl.pool.ephemeral+2]
@@ -4573,7 +4569,7 @@ fn w10_af_forecast_backed_job_survives_truncated_bound() {
     let bound = reap_queued_known(
         true,
         true,
-        evidence.coverage() == DemandCoverage::Complete,
+        page.coverage() == DemandCoverage::Complete,
         queued,
         evidence.ready_upper(),
         evidence.forecast_upper(),
@@ -4634,7 +4630,7 @@ fn w10_af_all_forecast_page_keeps_reap_bounded() {
         reap_queued_known(
             true,
             true,
-            ev.coverage() == DemandCoverage::Complete,
+            page.coverage() == DemandCoverage::Complete,
             page.len_page() as u32,
             ev.ready_upper(),
             ev.forecast_upper(),
@@ -4678,14 +4674,19 @@ async fn w10_ag_orphan_reap_suspends_on_incomplete_view() {
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     // One on-page intent (its Job lives); one OFF-PAGE Pending Job,
-    // old enough for the grace. View INCOMPLETE (truncated page).
-    let on_page = intent_named("onpage");
-    let want = WantMap::for_pool(
-        &IntentPage::for_test(vec![on_page]),
-        DemandCoverage::Incomplete,
-        "p",
-        ExecutorKind::Builder,
-    );
+    // old enough for the grace. View INCOMPLETE: the truncated
+    // transport rides ON the page (bug_064 — production constructor,
+    // no per-call coverage override exists to inject).
+    let (page, _ev) = PoolDemandView::from_response(
+        rio_proto::types::GetSpawnIntentsResponse {
+            intents: vec![intent_named("onpage")],
+            truncated: true,
+            ..Default::default()
+        },
+        &["x86_64-linux".to_string()],
+    )
+    .split();
+    let want = WantMap::for_pool(&page, "p", ExecutorKind::Builder);
     let existing = vec![pending_job("rio-offpage-job", 0, 30)];
 
     // ZERO scenarios: any DELETE is a guard failure.
@@ -4941,9 +4942,9 @@ async fn w11_ak_held_pending_job_not_orphan_deleted_end_to_end() {
     let mut page = IntentPage::for_test(vec![intent_named("reg"), held]);
     apply_placeable_gate(&mut page, &gate, &[]).expect("armed");
 
-    // The want-map minted from the post-fold page + the transport
-    // Complete letter (the production absence-lane path).
-    let want = WantMap::for_pool(&page, DemandCoverage::Complete, "p", ExecutorKind::Builder);
+    // The want-map minted from the post-fold page (the production
+    // absence-lane path; the letter rides the page — bug_064).
+    let want = WantMap::for_pool(&page, "p", ExecutorKind::Builder);
 
     // ONE canary scenario: the reap must issue ZERO kube requests
     // (post-fix), so the first and only request the verifier sees is
@@ -4989,7 +4990,7 @@ async fn w11_ak_lossy_narrowing_degrades_the_absence_witness() {
     let mut page = IntentPage::for_test(vec![intent_named("x1"), intent_named("x2")]);
     // A policy fold that strips x2 and DECLARES itself lossy.
     page.retain_page(|i| i.intent_id == "x1", PageNarrowing::Lossy);
-    let want = WantMap::for_pool(&page, DemandCoverage::Complete, "p", ExecutorKind::Builder);
+    let want = WantMap::for_pool(&page, "p", ExecutorKind::Builder);
     let x2_job = crate::reconcilers::pool::pod::job_name("p", ExecutorKind::Builder, "x2");
     assert!(
         matches!(
