@@ -12,6 +12,9 @@
   system,
   coverage ? false,
   lixPackage,
+  # The rio-eval eval-parent binary (nix/rio-eval.nix), the C++ half
+  # of the `rio build` pair for vm-build-client-standalone.
+  rioEval,
 }:
 let
   # Shared arg set for common.nix + every fixture. Fixtures take `...`
@@ -57,6 +60,7 @@ let
   chaos = import ./scenarios/chaos.nix;
   ca-cutoff = import ./scenarios/ca-cutoff.nix;
   put-path-chunked = import ./scenarios/put-path-chunked.nix;
+  build-client = import ./scenarios/build-client.nix;
   componentscaler = import ./scenarios/componentscaler.nix;
   substitute = import ./scenarios/substitute.nix;
   substitute-scale = import ./scenarios/substitute-scale.nix;
@@ -512,6 +516,59 @@ in
       extraPackages = [ pkgs.postgresql_18 ];
     };
   };
+
+  # ── rio build end-to-end (ADR-024 P3): the real coordinator+rio-eval
+  # pair on the client VM against the real cluster — external-door JWT
+  # auth, chunked source upload, drv-blob negotiation, digest-bearing
+  # SubmitBuild, worker execution, BuildEvents render, --out-link
+  # fetch. Single-test scenario; markers at the wiring point per
+  # P0341 convention — scenario header maps subtests to rules.
+  # r[verify bc.submit.all-acked]
+  # r[verify bc.fetch.narhash-verify]
+  # r[verify store.drv.getpath-fallback]
+  vm-build-client-standalone =
+    let
+      jwtKeys = import ./lib/jwt-keys.nix;
+      jwtPubkey = pkgs.writeText "jwt-pubkey" jwtKeys.pubkeyB64;
+    in
+    build-client {
+      inherit
+        pkgs
+        common
+        rioEval
+        ;
+      fixture = standalone {
+        # P0560 tenancy stopgap (P0593 deletes): the worker's
+        # tenant-scoped castore reads need the client-uploaded sources
+        # and outputs tenant-visible, like every build-running
+        # scenario. Implies HMAC (assignment tokens).
+        defaultTenant = "vmtest";
+        # Snappier dispatch for the 2-node chain.
+        extraSchedulerConfig = {
+          tickIntervalSecs = 2;
+        };
+        # JWT verify on the scheduler: SubmitBuild/WatchBuild require
+        # x-rio-tenant-token once a pubkey is configured
+        # (require_tenant). Env (not extraConfig) so the [sla] block
+        # in common.nix's scheduler defaults survives.
+        extraSchedulerEnv.RIO_JWT__KEY_PATH = "${jwtPubkey}";
+        # JWT verify on the store's castore door (the client's
+        # PutPathChunked/Has*/PutDrvBlobs/GetPath rung). extraConfig
+        # REPLACES the mkControlNode default, so [chunk_backend] must
+        # be restated — without it every builder output upload is
+        # rejected with FAILED_PRECONDITION.
+        extraStoreConfig.extraConfig = ''
+          [chunk_backend]
+          kind = "filesystem"
+          base_dir = "/var/lib/rio/store/chunks"
+
+          [jwt]
+          key_path = "${jwtPubkey}"
+        '';
+        # psql() on control for the tenant UUID + drv_blobs assertions.
+        extraPackages = [ pkgs.postgresql_18 ];
+      };
+    };
 
   vm-protocol-cold-standalone = protocol {
     inherit pkgs common;
