@@ -488,7 +488,8 @@ mod tests {
     /// envelope is armed or the envelope is ample; it clamps to the
     /// remaining envelope when that is smaller; and it saturates at
     /// zero once the envelope expired — the open gets one poll and
-    /// times out, so an expired grace can never fund a fresh attempt.
+    /// times out, so an expired grace funds no fresh attempt (the
+    /// expired cell below is the pin).
     /// Paused clock: pure timer arithmetic, no IO.
     #[tokio::test(start_paused = true)]
     async fn open_deadline_clamps_to_the_armed_envelope() {

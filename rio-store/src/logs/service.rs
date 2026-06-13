@@ -231,7 +231,7 @@ fn idle_trip_due(
 /// (1) the STAMP LAG — a sub-threshold final batch buffers until the
 /// next periodic tick, so the last occupancy stamp trails the last
 /// real arrival by up to one full interval; (2) the occupied cut's
-/// watchdog bound — [`LogServiceImpl::cut_bounded`] abandons a hung
+/// watchdog bound — `AppendDriver::cut_bounded` abandons a hung
 /// cut at one cut interval; (3) the bounded ack send —
 /// [`send_ack_bounded`]'s bound is one cut interval at its call
 /// sites. The occupied cut's budget is INTERVAL-denominated in this
@@ -251,7 +251,7 @@ pub(crate) const IDLE_TRIP_PHASE_MARGIN: std::time::Duration = std::time::Durati
 /// (stream open, lease renewing, nothing pending, no inbound
 /// traffic) is evicted within this much PAST ITS LAST ARRIVAL. The
 /// compile asserts below pin the shipped constants inside it; config
-/// validation ([`crate::config::Config::validate`]) holds operator
+/// validation (`Config::validate` in `crate::config`) holds operator
 /// `log_cut_interval` values to it from ABOVE.
 pub(crate) const IDLE_TRIP_DISCLOSED_CEILING: std::time::Duration =
     std::time::Duration::from_secs(300);
@@ -610,7 +610,7 @@ impl Drop for LeaseReleaseGuard {
 /// The live ingest-driver gauge (live062-R3): how many spawned
 /// AppendLog driver tasks have not yet finished their teardown
 /// (deregister + final drain + lease release). The shutdown path
-/// waits on it bounded; each driver's slot guard decrements on EVERY
+/// waits on it bounded; each driver's slot guard decrements on EVERY — quantifier: census(test: driver_gauge_counts_slots_and_wakes_at_zero)
 /// exit, panic included.
 #[derive(Default)]
 struct DriverGauge {
@@ -699,7 +699,7 @@ impl IngestShutdown {
         if tokio::time::timeout(teardown_wait, wait).await.is_err() {
             warn!(
                 still_active = self.drivers.active(),
-                "shutdown: ingest drivers still tearing down past the courtesy                  window; sweeping their session rows now (their un-acked tails                  replay from the builders' retransmit buffers)"
+                "shutdown: ingest drivers still tearing down past the courtesy window; sweeping their session rows now (their un-acked tails replay from the builders' retransmit buffers)"
             );
         }
         // The sweep: one bounded statement, idempotent (clean
@@ -715,19 +715,19 @@ impl IngestShutdown {
                 if released > 0 {
                     info!(
                         released,
-                        "shutdown: released ingest session rows still owned by                          this replica — reconnecting builders acquire first-try                          instead of burning the staleness window"
+                        "shutdown: released ingest session rows still owned by this replica — reconnecting builders acquire first-try instead of burning the staleness window"
                     );
                 }
             }
             Ok(Err(e)) => {
                 warn!(
                     error = %e,
-                    "shutdown: ingest session sweep failed; the rows self-heal                      at the staleness window (the pre-fix worst case)"
+                    "shutdown: ingest session sweep failed; the rows self-heal at the staleness window (the pre-fix worst case)"
                 );
             }
             Err(_elapsed) => {
                 warn!(
-                    "shutdown: ingest session sweep abandoned at its bound; the                      rows self-heal at the staleness window (the pre-fix worst                      case) — shutdown is not blocked"
+                    "shutdown: ingest session sweep abandoned at its bound; the rows self-heal at the staleness window (the pre-fix worst case) — shutdown is not blocked"
                 );
             }
         }
@@ -2471,7 +2471,8 @@ impl CutStep {
             // consecutive failures trip the failover abort.)
             CutStep::Failed => CutOccupancy::Occupied,
             // The stream is ending; the caller returns before any
-            // stamp could matter. Classified as occupied for totality
+            // stamp could matter. Classified as occupied — the variant
+            // alphabet decides explicitly, no wildcard arm; quantifier: census(test: empty_cut_is_not_occupancy)
             // (a cap refusal or closed ack channel followed real
             // work).
             CutStep::Exit(_) => CutOccupancy::Occupied,
@@ -3507,7 +3508,7 @@ mod tests {
     /// recording is not a witness). The cut interval here is 45 s:
     /// the operator-sub-bound face the triage names STRICTLY
     /// unsatisfiable pre-fix — every Empty tick stamps at 45 s
-    /// spacing, so the self-activity clock can never reach the 60 s
+    /// spacing, so the self-activity clock stays strictly inside the 60 s
     /// bound, no phase coincidence exists, and the pre-fix red is
     /// deterministic. (45 s is inside the clause-(iii) validation
     /// maximum of 70 s — a lawful operator value whose gate was
@@ -3608,7 +3609,7 @@ mod tests {
     /// `live_ingest_session_sql` predicate — the same fragment
     /// `gc_exec_rows` binds, conjunct 6), so the drain holds the row
     /// exactly as long as a beat covers it. The beat-death feeder is
-    /// PANIC-ONLY (verified at the task's error arm: PG errors retry
+    /// panic-only (verified at the task's error arm: PG errors retry
     /// next tick by design and never kill it), so the window is
     /// driven here by the world it creates — a row no beat covers,
     /// time advanced past the staleness bound via backdating (PG's
@@ -3619,7 +3620,7 @@ mod tests {
     /// drain's late chunk INSERT lands ORPHANED (no FK in migration
     /// 066: the chunk row exists, its execution does not). GREEN
     /// face (arm A — the dedicated drain beat, the respawn's
-    /// mechanism): the SAME backdated window with a live beat task
+    /// mechanism): the same backdated window with a live beat task
     /// re-freshens within one interval, the conjunct holds the row,
     /// the reap refuses, and no orphan can form.
     // r[verify store.log.sweep-ownership+2]
@@ -3636,7 +3637,7 @@ mod tests {
         // The dead-beat window: nothing refreshes; time passes (the
         // staleness bound, compressed via backdating on PG's clock).
         sqlx::query(
-            "UPDATE log_ingest_sessions SET heartbeat_at = now() - make_interval(secs => $1)              WHERE exec_id = $2",
+            "UPDATE log_ingest_sessions SET heartbeat_at = now() - make_interval(secs => $1) WHERE exec_id = $2",
         )
         .bind(sessions::SESSION_STALE_AFTER.as_secs_f64() + 5.0)
         .bind(exec)
@@ -3648,7 +3649,7 @@ mod tests {
         // DEAD — the gc is licensed to reap the execution although
         // the drain still has work.
         let live_sql = format!(
-            "SELECT EXISTS(SELECT 1 FROM log_ingest_sessions s              WHERE s.exec_id = $1 AND {})",
+            "SELECT EXISTS(SELECT 1 FROM log_ingest_sessions s WHERE s.exec_id = $1 AND {})",
             rio_migrations::sql::live_ingest_session_sql("s.heartbeat_at", "$2")
         );
         let live: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(live_sql.clone()))
@@ -3670,7 +3671,7 @@ mod tests {
             .await
             .expect("the reap");
         sqlx::query(
-            "INSERT INTO drv_log_chunks              (exec_id, session_id, chunk_seq, first_line, line_count, byte_size, s3_key,               accounted_bytes) VALUES ($1, $2, 0, 0, 1, 16, 'late-drain-chunk', 16)",
+            "INSERT INTO drv_log_chunks (exec_id, session_id, chunk_seq, first_line, line_count, byte_size, s3_key, accounted_bytes) VALUES ($1, $2, 0, 0, 1, 16, 'late-drain-chunk', 16)",
         )
         .bind(exec)
         .bind(session)
@@ -3678,7 +3679,7 @@ mod tests {
         .await
         .expect("the late INSERT lands — no FK refuses it");
         let orphan: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM drv_log_chunks c WHERE c.exec_id = $1)              AND NOT EXISTS(SELECT 1 FROM drv_executions e WHERE e.exec_id = $1)",
+            "SELECT EXISTS(SELECT 1 FROM drv_log_chunks c WHERE c.exec_id = $1) AND NOT EXISTS(SELECT 1 FROM drv_executions e WHERE e.exec_id = $1)",
         )
         .bind(exec)
         .fetch_one(&db.pool)
@@ -3686,10 +3687,10 @@ mod tests {
         .expect("orphan check");
         assert!(
             orphan,
-            "W13-AE red: the chunk row exists and its execution does not —              the orphan the model's v3 conjunct takes credit for closing"
+            "W13-AE red: the chunk row exists and its execution does not — the orphan the model's v3 conjunct takes credit for closing"
         );
 
-        // GREEN face: the SAME window with a live dedicated beat (the
+        // GREEN face: the same window with a live dedicated beat (the
         // respawn's mechanism, production task at a fast test
         // cadence — the injected-runner lane; the BEAT is the real
         // `sessions::heartbeat` UPDATE). The red exec's assignment is
@@ -3712,7 +3713,7 @@ mod tests {
             std::time::Duration::from_millis(100),
         );
         sqlx::query(
-            "UPDATE log_ingest_sessions SET heartbeat_at = now() - make_interval(secs => $1)              WHERE exec_id = $2",
+            "UPDATE log_ingest_sessions SET heartbeat_at = now() - make_interval(secs => $1) WHERE exec_id = $2",
         )
         .bind(sessions::SESSION_STALE_AFTER.as_secs_f64() + 5.0)
         .bind(exec2)
@@ -3735,7 +3736,7 @@ mod tests {
         }
         assert!(
             live,
-            "W13-AE green: the dedicated drain beat re-freshens the row —              the conjunct holds it and the reap refuses while the drain works"
+            "W13-AE green: the dedicated drain beat re-freshens the row — the conjunct holds it and the reap refuses while the drain works"
         );
         beat.stop().await;
     }
@@ -3752,7 +3753,7 @@ mod tests {
             .await
             .expect("acquire");
         sqlx::query(
-            "UPDATE log_ingest_sessions SET heartbeat_at = now() - make_interval(secs => $1)              WHERE exec_id = $2",
+            "UPDATE log_ingest_sessions SET heartbeat_at = now() - make_interval(secs => $1) WHERE exec_id = $2",
         )
         .bind(sessions::SESSION_STALE_AFTER.as_secs_f64() + 5.0)
         .bind(exec)
@@ -3760,7 +3761,7 @@ mod tests {
         .await
         .expect("backdate");
         let live_sql = format!(
-            "SELECT EXISTS(SELECT 1 FROM log_ingest_sessions s              WHERE s.exec_id = $1 AND {})",
+            "SELECT EXISTS(SELECT 1 FROM log_ingest_sessions s WHERE s.exec_id = $1 AND {})",
             rio_migrations::sql::live_ingest_session_sql("s.heartbeat_at", "$2")
         );
         let live: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(live_sql))
@@ -3797,7 +3798,7 @@ mod tests {
         // gone — the driver-side death observation.)
         assert!(
             watch.has_changed().is_err(),
-            "the task ended without latching Lost — the death face the              respawn arm keys on"
+            "the task ended without latching Lost — the death face the respawn arm keys on"
         );
     }
 

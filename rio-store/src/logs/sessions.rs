@@ -356,7 +356,7 @@ pub async fn release(pool: &PgPool, exec_id: Uuid, session_id: Uuid) -> Result<(
     Ok(())
 }
 
-/// Release EVERY session row this replica still owns — the graceful-
+/// Release EVERY session row this replica still owns — quantifier: census(test: shutdown_release_frees_rows_for_first_retry_reacquire) — the graceful-
 /// shutdown backstop (live062-R3). Sound exactly at shutdown: the
 /// listener is down (no new acquires mint rows for this pod) and the
 /// courtesy window for clean driver teardowns has elapsed, so any row

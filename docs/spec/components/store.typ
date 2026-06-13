@@ -3260,7 +3260,7 @@ dropped without an abort observed its lifecycle channel's death as a
 wake-up, skipped every backoff, and hot-looped stream opens at full
 speed --- for a consumer that no longer existed.
 
-Exit-at-expiry binds EVERY await in the loop, the open included
+Exit-at-expiry binds EVERY await in the loop, the open included // quantifier: census(hung_open_abandons_at_drain_deadline)
 (bug_038): the re-open's per-attempt bound is DEADLINE-TYPED --- the
 fixed bound clamped to whatever remains of the armed grace envelope,
 consulted before the open arms --- so a hung re-open against a

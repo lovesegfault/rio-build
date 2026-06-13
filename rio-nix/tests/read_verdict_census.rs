@@ -211,35 +211,81 @@ fn census(modules: &[Module], grammar: Grammar) -> Vec<String> {
     violations
 }
 
-/// The real universe: every `.rs` directly under `src/protocol/`
-/// (the `wire/` subdirectory hosts the family DEFINITIONS and is the
-/// boundary, not a consumer).
+/// The real universe, EMBEDDED at compile time ((wwwww): a gate
+/// check quantifying over in-crate sources embeds its universe in
+/// the check input — the test binary runs in the nix harness without
+/// the source tree, so a runtime directory walk is dev-green/
+/// gate-red). Every `.rs` directly under `src/protocol/` (the
+/// `wire/` subdirectory hosts the family DEFINITIONS and is the
+/// boundary, not a consumer). The embed is pinned BIDIRECTIONALLY
+/// against the embedded `mod.rs` declaration list by
+/// `embedded_universe_matches_the_module_decls`: a new protocol
+/// module must be declared in mod.rs to exist as code, and the pin
+/// refuses an embed list that drifts from those declarations in
+/// either direction.
+const PROTOCOL_MODULES: &[(&str, &str)] = &[
+    ("build.rs", include_str!("../src/protocol/build.rs")),
+    ("client.rs", include_str!("../src/protocol/client.rs")),
+    (
+        "derived_path.rs",
+        include_str!("../src/protocol/derived_path.rs"),
+    ),
+    ("handshake.rs", include_str!("../src/protocol/handshake.rs")),
+    ("mod.rs", include_str!("../src/protocol/mod.rs")),
+    ("opcodes.rs", include_str!("../src/protocol/opcodes.rs")),
+    ("pathinfo.rs", include_str!("../src/protocol/pathinfo.rs")),
+    ("stderr.rs", include_str!("../src/protocol/stderr.rs")),
+];
+
 fn protocol_modules() -> Vec<Module> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/protocol");
-    let mut out = Vec::new();
-    let mut entries: Vec<_> = std::fs::read_dir(&dir)
-        .expect("src/protocol exists")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-        .collect();
-    entries.sort();
-    for p in entries {
-        out.push(Module {
-            name: p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .expect("protocol module names are ASCII")
-                .to_string(),
-            src: std::fs::read_to_string(&p).expect("readable"),
-        });
+    PROTOCOL_MODULES
+        .iter()
+        .map(|(name, src)| Module {
+            name: (*name).to_string(),
+            src: (*src).to_string(),
+        })
+        .collect()
+}
+
+/// The (wwwww) bidirectional pin: the embedded universe equals the
+/// `mod.rs` declaration list (plus `mod.rs` itself, minus the `wire`
+/// boundary module). A module added to the protocol without joining
+/// the embed — or an embed row whose file was deleted — reds HERE,
+/// in the gate, with no filesystem dependence.
+#[test]
+fn embedded_universe_matches_the_module_decls() {
+    let mod_rs = PROTOCOL_MODULES
+        .iter()
+        .find(|(n, _)| *n == "mod.rs")
+        .expect("mod.rs embedded")
+        .1;
+    let mut declared: Vec<String> = Vec::new();
+    for line in mod_rs.lines() {
+        let l = line.trim();
+        for prefix in ["pub mod ", "pub(crate) mod ", "mod "] {
+            if let Some(rest) = l.strip_prefix(prefix)
+                && let Some(name) = rest.strip_suffix(';')
+            {
+                if name != "wire" {
+                    declared.push(format!("{name}.rs"));
+                }
+                break;
+            }
+        }
     }
-    assert!(
-        out.iter().any(|m| m.name == "client.rs") && out.iter().any(|m| m.name == "stderr.rs"),
-        "the universe lists the known protocol modules — the directory walk \
-         is alive"
+    declared.sort();
+    let mut embedded: Vec<String> = PROTOCOL_MODULES
+        .iter()
+        .map(|(n, _)| (*n).to_string())
+        .filter(|n| n != "mod.rs")
+        .collect();
+    embedded.sort();
+    assert_eq!(
+        embedded, declared,
+        "the embedded census universe must equal src/protocol/mod.rs's \
+         module declarations (wire excluded as the defining boundary) — \
+         re-derive the PROTOCOL_MODULES embed"
     );
-    out
 }
 
 /// The census at head: every strict read site carries its verdict.

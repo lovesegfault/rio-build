@@ -637,6 +637,26 @@ DURATION_CENSUS_ROWS = {
         "wall (tokio Instant at the resume ledger's cooldown stamp)",
         "WO-S9-3 (A3): W12-S9E — the K-stuck deterministic bound (6 passes at slots=1 with a 4-row stuck head deliver exactly 4)",
     ),
+    # bw13 WO-S5-1 (PD-4) + live062-R3: the idle-gate ceiling family +
+    # the shutdown courtesy window. Rows appended by S5 (the consts'
+    # author) per the gate's own demand; S9 re-derives at the final
+    # tree — disclosed in the S5 landing record.
+    ("rio-store/src/logs/service.rs", "IDLE_TRIP_DISCLOSED_CEILING"): (
+        "wall (tokio Instant elapsed at the idle gate's housekeeping consult; the operator-disclosed eviction ceiling past last arrival)",
+        "bw13 WO-S5-1 (PD-4): compile-certified idle_trip_worst_case(DEFAULT_CUT_INTERVAL) + PHASE_MARGIN <= CEILING; the W13-Y e2e pair asserts eviction inside it past last arrival",
+    ),
+    ("rio-store/src/logs/service.rs", "IDLE_TRIP_PHASE_MARGIN"): (
+        "wall (the same consult clock; the R34 phase-margin term over the derived worst case)",
+        "bw13 WO-S5-1 (PD-4): a certified term of the ceiling inequality — the compile asserts and the sound+tight MAX round-trips carry it",
+    ),
+    ("rio-store/src/logs/service.rs", "MAX_LOG_CUT_INTERVAL"): (
+        "wall (config-validation bound; the clause-(iii) upper bound the disclosed ceiling admits)",
+        "bw13 WO-S5-1 (PD-4): round-tripped through idle_trip_worst_case sound AND tight at compile time; validate_caps_log_cut_interval_at_the_idle_ceiling is the boundary witness",
+    ),
+    ("rio-store/src/logs/service.rs", "SHUTDOWN_TEARDOWN_WAIT"): (
+        "wall (tokio timeout over the driver-gauge courtesy wait at graceful shutdown)",
+        "bw13 live062-R3 (A2): bounded-by-construction courtesy window; the sweep behind it runs under the HEARTBEAT_RPC_BOUND typed timeout with disclose-on-abandon (shutdown_release_is_bounded_when_the_sweep_hangs)",
+    ),
 }
 DURATION_GRANDFATHER = "nix/duration-census-grandfather.txt"
 

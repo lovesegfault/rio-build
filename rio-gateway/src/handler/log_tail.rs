@@ -494,8 +494,8 @@ mod gap {
 
     /// The deferred partial-heal floor (merged_bug_025): proof
     /// material that a serve send covering the hole prefix
-    /// `[gap_from, floor)` is in flight. Minted ONLY by
-    /// [`PendingGapCell::on_serve`]'s partial arm; consumed ONLY by
+    /// `[gap_from, floor)` is in flight. Minted ONLY by — quantifier: census(test: sealed_gap_lint_is_clean_at_head)
+    /// [`PendingGapCell::on_serve`]'s partial arm; consumed ONLY by — quantifier: census(test: sealed_gap_lint_is_clean_at_head)
     /// [`PendingGapCell::discharge_served_prefix`], which the caller
     /// invokes AFTER the serve send resolves Ok. An abort parked in
     /// the send drops this token undischarged and the cell still
@@ -672,7 +672,7 @@ mod gap {
         }
 
         /// The partial-heal obligation reduction (merged_bug_025): the
-        /// ONLY writer of a recorded hole's `gap_from`. Consumes the
+        /// ONLY writer of a recorded hole's `gap_from` — quantifier: census(test: sealed_gap_lint_is_clean_at_head). Consumes the
         /// [`ServedPrefix`] token minted by [`Self::on_serve`]'s
         /// partial arm — the caller invokes this AFTER the serve send
         /// resolved Ok, so the hole shrinks exactly when the covering
@@ -2579,7 +2579,7 @@ mod tests {
         let exited_after = edge_at.elapsed();
         assert!(
             exited_after < Duration::from_millis(2000),
-            "exit-at-expiry must not wait out a bare open_bound: the hung              re-open ran unclamped past the remaining grace              (exited {exited_after:?} after the drain edge)"
+            "exit-at-expiry must not wait out a bare open_bound: the hung re-open ran unclamped past the remaining grace (exited {exited_after:?} after the drain edge)"
         );
 
         // The exit came from the law (grace expiry), not from a lucky
@@ -3833,7 +3833,7 @@ mod tests {
              nothing armed, so no Drop re-discloses"
         );
     }
-    /// W13-AB (bug_040): the disposition gates EVERY awaited armed
+    /// W13-AB (bug_040): the disposition gates EVERY awaited armed — quantifier: census(test: sealed_gap_lint_is_clean_at_head)
     /// discharge, not just Drop. The two REAL windows (the refuted
     /// parked-then-resumed third window is recorded ABSENT per the
     /// triage — tokio cancels queued-aborted tasks at dequeue):
@@ -3911,7 +3911,7 @@ mod tests {
         );
     }
 
-    /// W13-AB2 — the control: the SAME choreography without the
+    /// W13-AB2 — the control: the same choreography without the
     /// supersession mark relays normally once the slot frees (the
     /// consult is not a blanket downgrade; non-superseded sends are
     /// byte-stable).
@@ -4004,7 +4004,7 @@ mod tests {
             "the sealed take set: PendingGapCell::drop, take_armed, on_serve full heal",
         );
         if grammar != SealedGapGrammar::TakeOnly {
-            // Obligation-reducing mutations live ONLY in the typed
+            // Obligation-reducing mutations live ONLY in the typed — quantifier: census(test: sealed_gap_lint_catches_both_historical_shapes)
             // discharge fns (the merged_bug_025 lesson: a bare
             // pre-send mutation is the R32 escape). ASSIGNMENT only:
             // the classify arm's `gap_from ==` equality is excluded

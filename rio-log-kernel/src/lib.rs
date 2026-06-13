@@ -325,7 +325,7 @@ pub enum KeyedVisit {
 /// discipline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorKey {
-    /// The cursor and the chunk carry the SAME stamped execution key
+    /// The cursor and the chunk carry the same stamped execution key
     /// — or the CHUNK is unstamped (a pre-exec-stamping server, whose
     /// chunks belong to whatever stream the cursor is on).
     Matches,
@@ -345,13 +345,13 @@ pub enum CursorKey {
 /// [`visit_chunk`] with the execution axis in front: the caller
 /// derives [`CursorKey`] from its key comparison (payload-free — the
 /// kernel never sees the key representation, only the relation) and
-/// the kernel decides EVERY transition, the unknown-provenance
+/// the kernel decides EVERY transition — quantifier: census(test: unkeyed_adoption_routes_through_the_switch) — the unknown-provenance
 /// adoption included (bug_050):
 ///
 /// - [`CursorKey::Differs`] → [`KeyedVisit::ExecSwitch`] (the caller
 ///   resets its cursor and re-visits — unchanged);
 /// - [`CursorKey::Matches`] → the plain line-axis verdict (unchanged);
-/// - [`CursorKey::Unkeyed`] → adoption ONLY on proof of continuity:
+/// - [`CursorKey::Unkeyed`] → adoption ONLY on proof of continuity — quantifier: census(test: unkeyed_adoption_routes_through_the_switch):
 ///   a zero cursor (nothing served, nothing to lose) or a chunk
 ///   continuing exactly at the cursor (`first_line == next_line` —
 ///   the same stream, now stamped). Anything else is an
