@@ -1,0 +1,310 @@
+#import "/lib/rio.typ": *
+#show: rio.with(domains: none)
+
+`rio build` is the native-protocol build client (ADR-024). It evaluates flake
+attributes locally --- in Nix's own libexpr, driven nix-eval-jobs-style ---
+and submits the resulting derivation graph to the cluster over gRPC as pure
+digest negotiation: every object that moves (file chunks, source directories,
+derivations) is keyed by #gls("blake3") of its canonical bytes, the cluster
+answers a presence bitmap, and the client uploads only what is missing,
+zstd-framed. It replaces `nix build --store ssh-ng://rio` for interactive and
+CI submission: post-eval time-to-first-build drops from 57~s (cold ssh-ng,
+measured) to about one second, and a warm rebuild ships kilobytes instead of
+re-streaming uncompressed NARs. The `ssh-ng://` gateway path stays --- use it
+for stock Nix clients that cannot install `rio`, for deployments where only
+the SSH gateway is reachable from outside the cluster, or when you need
+outputs realized into a real local `/nix/store` (`rio build --fetch`
+materializes into the client cache, not `/nix/store`).
+
+See #cross-link("/architecture-build-client.typ")[Build Client Architecture]
+for the process model and the submission pipeline, and the
+#cross-link("/spec/components/build-client.typ")[build-client component spec]
+for the normative requirements. ADR-024 carries the full design rationale
+and measurements.
+
+= Getting the Client
+
+`rio build` is two binaries that ship as a pair:
+
+- the *coordinator* (`rio`) --- pure Rust, owns the cluster connection and
+  the client CAS;
+- the *eval parent* (`rio-eval`) --- embeds the flake-pinned Nix libexpr plus
+  the rio eval store, and forks the actual evaluation workers.
+
+```bash
+# The usable pair: bin/rio with RIO_EVAL_PARENT pre-pointed at rio-eval.
+nix build .#rio
+./result/bin/rio build .#myPackage
+
+# The eval parent alone (only needed if you wire eval_parent yourself).
+nix build .#rio-eval
+```
+
+The `.#rio` wrapper sets `RIO_EVAL_PARENT` as a default; an explicit
+`eval_parent` config key or `--eval-parent` flag still overrides it.
+
+= Quickstart
+
+== Cluster endpoints
+
+The client talks to two gRPC doors: the scheduler (build submission and event
+streams) and the store's castore door (presence negotiation, uploads, output
+fetch). Both are `host:port` with no scheme. Configure them in
+`./build.toml` or `/etc/rio/build.toml`, or via `RIO_*` environment
+variables, or as flags --- precedence is CLI flags over environment over
+config file over defaults
+(#cross-link("/ref/configuration.typ")[Configuration Reference]).
+
+```toml
+# build.toml
+scheduler_addr = "rio.example.com:9001"
+store_addr = "rio.example.com:9002"
+tenant_token_path = "/run/secrets/rio-tenant.jwt"
+```
+
+== Tenant token
+
+Every RPC carries a tenant JWT as `x-rio-tenant-token`; the scheduler and
+store verify its signature and expiry, and presence answers, drv blobs and
+fetches are scoped to the tenant in its `sub` claim. The token is minted by
+your cluster operator with the cluster's JWT signing key (the same EdDSA key
+the gateway's JWT mode uses --- see
+#cross-link("/guide/setup.typ")[Authentication Setup]); `sub` is your tenant
+UUID. Point `tenant_token_path` (or `RIO_TENANT_TOKEN_PATH`) at a file
+containing it.
+
+#info[
+  Leaving `tenant_token_path` unset sends no token. That only works against
+  single-tenant development clusters; a production door rejects anonymous
+  callers.
+]
+
+== Building
+
+```bash
+# Build a flake attribute against the cluster.
+rio build .#hello
+
+# Several attributes from the same flake, keep going past failures,
+# and materialize the outputs locally.
+rio build .#pkgA .#pkgB --keep-going --fetch
+
+# Symlink the first output (implies --fetch).
+rio build .#hello --out-link ./result-hello
+```
+
+All installables in one invocation must share a single flake reference ---
+the eval parent locks one flake and fetches its inputs once before forking
+workers. A bare reference (no `#attr`) evaluates the flake's default
+attribute.
+
+While the build runs, the client prints one status line per derivation event
+(`queued`, `building`, `built`, …) and finishes with the output paths.
+Pressing Ctrl-C cancels: the client cancels every build this invocation
+submitted, prints the cancelled build ids, and exits non-zero. A second
+Ctrl-C exits immediately without waiting for the cancel acknowledgements,
+printing each remaining build id with its reattach hint. Pass `--detach`
+when you want the old behaviour --- Ctrl-C exits the client, the builds keep
+running cluster-side, and each in-flight build id is printed with a reattach
+hint.
+
+```bash
+# Submit and leave running on Ctrl-C instead of cancelling.
+rio build .#hello --detach
+
+# Reattach to a running (or completed) build's event stream — from any
+# machine that holds the tenant credential. Ctrl-C here only stops
+# watching; it never cancels a build you did not submit.
+rio build --attach 01HV5...
+
+# Stop a build from anywhere.
+rio build --cancel 01HV5...
+```
+
+= Command Reference
+
+`rio build [INSTALLABLE]... [flags]`
+
+#figure(
+  caption: [`rio build` flags.],
+  table(
+    columns: (auto, 1fr),
+    table.header([Flag], [Meaning]),
+    [`INSTALLABLE...`],
+    [Flake attributes to evaluate and build (`ref#attr`; bare `ref` = default
+      attribute). All must share one flake reference.],
+
+    [`--attach BUILD_ID`],
+    [Reattach to a build's event stream via `WatchBuild` and render it to
+      completion. Conflicts with installables and `--cancel`; works without
+      an eval parent configured.],
+
+    [`--cancel BUILD_ID`],
+    [Cancel a running build. Prints `cancelled BUILD_ID` on success; exits
+      non-zero if the build is unknown or already terminal.],
+
+    [`--fetch`],
+    [Materialize completed outputs through the store read path into the
+      client CAS (`<cas_root>/fetched/<basename>`), verifying the streamed
+      NAR's SHA-256 against the server's claimed `nar_hash` before anything
+      appears on disk.],
+
+    [`--out-link PATH`],
+    [Symlink the first fetched output at `PATH` (further outputs get
+      `PATH-2`, `PATH-3`, …). Implies `--fetch`. The link target is the CAS
+      materialization --- the client has no `/nix/store` to link into.],
+
+    [`--eval-file PATH`],
+    [Evaluate attributes from a plain Nix file instead of a flake; the
+      installables become attribute paths into the file's top-level
+      attribute set. Mostly for tests and fixtures.],
+
+    [`--keep-going`],
+    [Continue building independent derivations after a failure (the
+      scheduler keeps dispatching unaffected subgraphs).],
+
+    [`--detach`],
+    [On Ctrl-C (or SIGTERM), exit and leave the submitted builds running
+      cluster-side instead of cancelling them; each in-flight build id is
+      printed with its `--attach` reattach hint.],
+
+    [`--local-ifd`],
+    [Build import-from-derivation locally instead of remotely. Flag-gated
+      fallback from ADR-024; *not wired yet* --- an IFD under this flag
+      fails with an explicit message rather than silently going remote.],
+
+    [`--scheduler-addr`, `--store-addr`, `--tenant-token-path`, `--cas-root`,
+      `--eval-parent`],
+    [Config overlay flags --- highest-precedence layer over `RIO_*`
+      environment variables and the TOML file.],
+  ),
+)
+
+Exit status is non-zero if any attribute failed to evaluate, any build
+failed or was cancelled, or the run was interrupted (the default Ctrl-C
+cancellation). A `--detach` run interrupted by Ctrl-C exits zero after
+printing the reattach hints.
+
+= Configuration
+
+The component name for config layering is `build`: TOML at
+`/etc/rio/build.toml` / `./build.toml`, environment prefix `RIO_`. The full
+generated key table lives in the
+#cross-link("/ref/configuration.typ")[Configuration Reference]; the keys you
+will actually touch:
+
+- `scheduler_addr`, `store_addr` --- the two gRPC doors (required).
+- `tenant_token_path` --- file containing the tenant JWT.
+- `cas_root` --- client CAS root; defaults to `$XDG_CACHE_HOME/rio/evalstore`
+  (falling back to `~/.cache/rio/evalstore`). Holds the pack store,
+  fingerprint index, cluster-ack table and fetched outputs. Safe to delete;
+  the next run re-ingests and re-negotiates.
+- `eval_parent` --- path to the `rio-eval` binary. The `nix build .#rio`
+  wrapper defaults this; only set it when running the coordinator binary
+  directly.
+- `ack_ttl_secs` --- how long a "the cluster has this digest" record is
+  trusted (default 6~h). Must stay at or below the cluster's minimum
+  unpinned-blob lifetime, otherwise every cluster GC turns into a stale-ack
+  recovery cycle.
+- `page_max_nodes` --- nodes per `SubmitBuild` page (default 50,000);
+  submissions above it paginate automatically.
+
+= What Happens Under the Hood
+
+A single `rio build .#attr` does, in overlapping stages: the coordinator
+spawns `rio-eval`, which locks the flake, fetches inputs once, then forks
+evaluation workers; each worker evaluates its attribute, ingesting source
+trees through the rio eval store (one walk produces FastCDC chunks,
+per-directory castore blobs and the NAR hash together) and streaming back a
+skeleton of derivation digests plus the canonical derivation bytes; the
+coordinator folds those by digest, asks the cluster which digests it already
+has (`Has*` bitmaps, short-circuited by the persistent ack table), uploads
+only the misses zstd-framed, and --- once a root's transitive skeleton is
+complete and every referenced object is acked --- submits a digest-only
+skeleton and renders the resulting `BuildEvent` stream. Derivation bytes
+never touch the client disk; source trees are re-read from your working copy
+at upload time and verified against what evaluation reported.
+
+The full picture, with figures, is in
+#cross-link("/architecture-build-client.typ")[Build Client Architecture];
+the measurements behind the design are in ADR-024.
+
+= Troubleshooting
+
+*"config `eval_parent` is not set".* You are running the bare coordinator
+binary. Use the `nix build .#rio` wrapper (which defaults `RIO_EVAL_PARENT`),
+or set `eval_parent` / `--eval-parent` to a `rio-eval` binary. `--attach` and
+`--cancel` work without it.
+
+*`Unauthenticated` / `PermissionDenied` from the scheduler or store.* The
+tenant JWT is missing, expired, or signed with a key the cluster does not
+trust. Production doors reject anonymous callers, so `tenant_token_path` must
+point at a current token whose `sub` is your tenant UUID. Ask the cluster
+operator for a fresh token; nothing is cached --- the next invocation picks
+the new file up.
+
+*"all installables must share one flake ref".* One invocation locks one
+flake. Split the command per flake.
+
+*"origin tree … changed since eval: NAR sha256 … != reported".* A source
+tree in your working copy was modified between evaluation and upload. The
+client refuses to upload content the submitted skeleton never referenced ---
+re-run the build on the settled tree. (The bounded re-ingest escape hatch
+from ADR-024 is not implemented yet; mutation is currently a hard error.)
+
+*"submission rejected twice on missing drv digests … giving up".* The
+stale-ack recovery cycle ran once (evict acks, re-probe, re-upload, resubmit)
+and the scheduler still reported missing digests. Per ADR-024 a second reject
+is a hard error: either the cluster is collecting garbage faster than
+`ack_ttl_secs` models (lower it, or have the operator check the store's
+unpinned-blob lifetime) or the upload path is broken --- check the store door
+logs before retrying.
+
+*"drv digest … missing but its body is no longer retained … rerun the
+build".* Stale-ack recovery needed a derivation body that was already dropped
+after an earlier accepted submission in the same run. Re-running the build
+recomputes it (derivations are memory-only client-side).
+
+*"IFD stall: building remotely".* Not an error. Evaluation hit
+import-from-derivation; the needed derivation is submitted as an immediate
+mini-build, its output fetched back into the client CAS, and the worker
+resumes. Deep import chains serialize on this --- expect a pause per link.
+`--local-ifd` exists as the planned escape hatch but is not wired yet.
+
+*"narHash mismatch fetching …: refusing to materialize".* The streamed NAR
+did not hash to what the store claimed; nothing was written. Retry once; a
+persistent mismatch points at store-side corruption and should go to the
+operator.
+
+*"detached: ‹attr› continues as build ‹id›".* That is Ctrl-C under
+`--detach` behaving as designed. `rio build --attach ‹id›` resumes the
+stream, `--cancel ‹id›` stops the build. Without `--detach`, Ctrl-C prints
+"interrupted: cancelled ‹attr› (build ‹id›)" instead --- the build was
+cancelled cluster-side; only a *second* Ctrl-C leaves builds possibly
+running and prints the same reattach hint.
+
+= Current Limitations
+
+These are implementation gaps in the current client, not design decisions;
+each is tracked as deferred work.
+
+- *`toFile` and single-file source roots.* Only origin-backed directory
+  trees upload today. Input sources produced by `builtins.toFile` (streamed
+  text) or rooted at a single file or symlink are skipped at skeleton
+  assembly and rejected by the upload planner; a build that genuinely needs
+  one fails at the cluster's submit-time verification rather than silently.
+  Directory trees --- flake inputs and local working trees --- cover the
+  dominant case.
+- *IFD output references.* Outputs fetched back for import-from-derivation
+  are recorded with empty reference sets; evaluation logic that depends on
+  the references of an imported output does not see them.
+- *`--fetch` buffers whole NARs.* Output materialization holds the full NAR
+  in memory before verifying and restoring it. Fine for typical outputs;
+  very large outputs are expensive until streaming restore lands.
+- *Mutated-origin escape hatch.* ADR-024's bounded re-ingest (re-negotiate
+  the delta at most twice, then snapshot) is not implemented; a mutated
+  origin is a hard error for that root.
+- *`--local-ifd` is not wired.* The flag is parsed and plumbed, but the
+  local fallback build path does not exist yet; IFD always builds remotely.
+- *One flake per invocation*, and fetched outputs land in the client CAS,
+  not in `/nix/store`.
