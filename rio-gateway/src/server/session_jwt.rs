@@ -142,6 +142,123 @@ pub(crate) fn refresh_session_jwt<'a>(
     cached.as_ref().map(|(t, _)| t.as_str())
 }
 
+// r[impl gw.jwt.refresh-on-expiry+2]
+/// live_062 (the read-plane blackout): a `Clone + Send + Sync` token
+/// source for the LIVE-TAIL relays — the refresh seam the tail path
+/// never had. `LogTailSet` used to hold a STRING snapshot of the
+/// session JWT ("snapshot semantics", documented in-code at its field
+/// — the confession live_062 cashed in: every `TailLog` re-open after
+/// mint+65min carried the expired token, `UNAUTHENTICATED` forever,
+/// total tail blackout while the build succeeded). Each relay task
+/// now holds a clone of this source and calls [`Self::fresh`] per
+/// open: the token is a RENEWABLE obligation of the tail session, not
+/// a frozen capability (R32).
+///
+/// Derivation note (recorded): the build-scoped long-TTL read-token
+/// alternative was REJECTED — TTL >= build deadline is unbounded for
+/// unbounded builds, it weakens the revocation posture (a new
+/// long-lived token class), and the refresh path already exists with
+/// its own spec rule (the scheduler-stream precedent this extends).
+pub(crate) struct TailTokenSource {
+    inner: Option<std::sync::Arc<TailTokenInner>>,
+}
+
+impl Clone for TailTokenSource {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+struct TailTokenInner {
+    /// The cached `(token, claims)` + the force-re-mint flag set by
+    /// [`TailTokenSource::note_rejected`]. One uncontended lock per
+    /// tail OPEN (reconnects are backoff-paced; never per-chunk).
+    cached: std::sync::Mutex<(Option<(String, jwt::TenantClaims)>, bool)>,
+    signing_key: Option<std::sync::Arc<SigningKey>>,
+}
+
+impl TailTokenSource {
+    /// Dual-mode fallback / single-tenant: no JWT was minted for the
+    /// session; [`Self::fresh`] always answers `None` and the store's
+    /// tenant check rides the proto body's `tenant_name` instead.
+    pub(crate) fn none() -> Self {
+        Self { inner: None }
+    }
+
+    /// Construct from the session's cached mint + signing key (both
+    /// cloned off `SessionJwt` — see `SessionJwt::tail_source`).
+    pub(crate) fn new(
+        cached: Option<(String, jwt::TenantClaims)>,
+        signing_key: Option<std::sync::Arc<SigningKey>>,
+    ) -> Self {
+        if cached.is_none() && signing_key.is_none() {
+            return Self::none();
+        }
+        Self {
+            inner: Some(std::sync::Arc::new(TailTokenInner {
+                cached: std::sync::Mutex::new((cached, false)),
+                signing_key,
+            })),
+        }
+    }
+
+    /// A token fit for ONE `TailLog` open: re-minted through
+    /// [`refresh_session_jwt`] when within the slack of expiry, or
+    /// unconditionally when the previous open was rejected
+    /// `UNAUTHENTICATED` ([`Self::note_rejected`] — key rotation makes
+    /// a token invalid while its `exp` still looks healthy, so expiry
+    /// slack alone cannot heal that face). Returns an owned snapshot:
+    /// the relay attaches it to exactly one open and re-asks next
+    /// time.
+    pub(crate) fn fresh(&self) -> Option<String> {
+        let inner = self.inner.as_ref()?;
+        let mut guard = inner.cached.lock().expect("tail token lock poisoned");
+        let (cached, force) = &mut *guard;
+        if *force {
+            // One forced re-mint per rejection observation: clear the
+            // flag BEFORE attempting so a mint failure (corrupt key)
+            // degrades to the stale token + the store's clear error,
+            // never a mint-spam loop (the reconnect backoff paces the
+            // next rejection).
+            *force = false;
+            if let (Some((_, claims)), Some(key)) = (cached.as_ref(), inner.signing_key.as_ref()) {
+                match mint_session_jwt(claims.sub, key) {
+                    Ok((token, new_claims)) => {
+                        debug!(
+                            jti = %new_claims.jti,
+                            tenant = %new_claims.sub,
+                            "re-minted session JWT for the live tail (store \
+                             rejected the previous token as UNAUTHENTICATED)"
+                        );
+                        metrics::counter!("rio_gateway_jwt_refreshed_total").increment(1);
+                        *cached = Some((token, new_claims));
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "tail JWT forced re-mint failed; keeping stale token"
+                        );
+                        metrics::counter!("rio_gateway_jwt_refresh_failed_total").increment(1);
+                    }
+                }
+            }
+        }
+        refresh_session_jwt(cached, inner.signing_key.as_deref()).map(str::to_owned)
+    }
+
+    /// The store answered the last open `UNAUTHENTICATED`: arm one
+    /// forced re-mint for the next [`Self::fresh`]. No-op in dual
+    /// mode (nothing to re-mint — the rejection is then a real authz
+    /// failure the open-failure warn discloses).
+    pub(crate) fn note_rejected(&self) {
+        if let Some(inner) = self.inner.as_ref() {
+            inner.cached.lock().expect("tail token lock poisoned").1 = true;
+        }
+    }
+}
+
 // r[verify gw.jwt.issue]
 #[cfg(test)]
 mod jwt_issuance_tests {
@@ -362,5 +479,74 @@ mod jwt_issuance_tests {
         let mut cached: Option<(String, jwt::TenantClaims)> = None;
         assert!(refresh_session_jwt(&mut cached, Some(&key)).is_none());
         assert!(cached.is_none());
+    }
+
+    // r[verify gw.jwt.refresh-on-expiry+2]
+    /// live_062 — the tail token source heals expiry: a source built
+    /// over an EXPIRED cached token answers `fresh()` with a re-mint,
+    /// not the stale string (the pre-fix `LogTailSet` snapshot served
+    /// the stale token on every re-open forever — the 65-min
+    /// blackout).
+    #[test]
+    fn tail_source_fresh_heals_expiry() {
+        let tenant_id = uuid::Uuid::from_u128(0xBEEF);
+        let key = test_key(0x21);
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let stale_claims = jwt::TenantClaims {
+            sub: tenant_id,
+            iat: now - JWT_SESSION_TTL_SECS - 10,
+            exp: now - 10,
+            jti: "stale-jti".to_string(),
+        };
+        let source = TailTokenSource::new(
+            Some(("stale-token".to_string(), stale_claims)),
+            Some(std::sync::Arc::new(key)),
+        );
+
+        let t1 = source.fresh().expect("token present");
+        assert_ne!(t1, "stale-token", "expired snapshot must be re-minted");
+        // A clone shares the cache: the refreshed token is visible
+        // through every relay's handle (one session, one cache).
+        let t2 = source.clone().fresh().expect("token present");
+        assert_eq!(t1, t2, "fresh-on-fresh must not churn jti");
+    }
+
+    // r[verify gw.jwt.refresh-on-expiry+2]
+    /// live_062 — `note_rejected` arms exactly ONE forced re-mint:
+    /// key rotation invalidates a token whose `exp` still looks
+    /// healthy, so the slack-based refresh alone can never heal an
+    /// UNAUTHENTICATED open. After the forced re-mint the force flag
+    /// is spent (no mint-spam under a genuinely revoked tenant — the
+    /// reconnect backoff paces further rejections).
+    #[test]
+    fn tail_source_note_rejected_forces_one_remint() {
+        let tenant_id = uuid::Uuid::from_u128(0xF0F0);
+        let key = test_key(0x31);
+        let (token, claims) = mint_session_jwt(tenant_id, &key).expect("mint");
+        let source = TailTokenSource::new(Some((token, claims)), Some(std::sync::Arc::new(key)));
+
+        let t0 = source.fresh().expect("token");
+        source.note_rejected();
+        let t1 = source.fresh().expect("token");
+        assert_ne!(
+            t0, t1,
+            "rejection must force a re-mint of a healthy-looking token"
+        );
+        let t2 = source.fresh().expect("token");
+        assert_eq!(t1, t2, "the force flag is one-shot");
+    }
+
+    /// Dual-mode: a `none()` source answers `None` forever and
+    /// `note_rejected` is a no-op (nothing to re-mint).
+    #[test]
+    fn tail_source_none_stays_none() {
+        let source = TailTokenSource::none();
+        assert!(source.fresh().is_none());
+        source.note_rejected();
+        assert!(source.fresh().is_none());
+        assert!(TailTokenSource::new(None, None).fresh().is_none());
     }
 }

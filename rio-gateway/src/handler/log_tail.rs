@@ -51,6 +51,8 @@ use tokio::time::Instant;
 use tonic::transport::Channel;
 use tracing::{Instrument, debug, info_span, warn};
 
+use crate::server::session_jwt::TailTokenSource;
+
 /// How long a subscription waits before re-opening a prematurely-ended
 /// stream. The store's failure modes here are restart/deploy shaped
 /// (the replica serving the stream went away), not congestion shaped,
@@ -211,13 +213,18 @@ struct RelayWiring {
 /// `None` while the set is alive.
 pub(super) struct LogTailSet {
     client: LogServiceClient<Channel>,
-    /// The watching caller's session tenant token, forwarded on every
-    /// `TailLog` open (the store enforces tenant ownership; bug_290).
-    /// Snapshot semantics match `with_jwt` on the scheduler stream: a
-    /// token that expires mid-build degrades the live tail (opens get
-    /// UNAUTHENTICATED and the reconnect loop keeps retrying) without
-    /// affecting the build itself.
-    jwt_token: Option<String>,
+    /// The watching caller's session token SOURCE, consulted fresh on
+    /// every `TailLog` open (the store enforces tenant ownership;
+    /// bug_290). live_062 retired the previous `Option<String>`
+    /// snapshot here: its own doc admitted "a token that expires
+    /// mid-build degrades the live tail … the reconnect loop keeps
+    /// retrying" — which at mint+65min was a TOTAL tail blackout for
+    /// the rest of the build (every re-open UNAUTHENTICATED with the
+    /// frozen string, while the build itself ran fine). The source
+    /// re-mints near expiry per open and force-re-mints once after an
+    /// UNAUTHENTICATED rejection (key rotation), so a tail outliving
+    /// `JWT_SESSION_TTL_SECS` keeps reading.
+    jwt: TailTokenSource,
     out_tx: mpsc::Sender<TaggedLogChunk>,
     config: LogTailConfig,
     tasks: HashMap<String, TailHandle>,
@@ -228,21 +235,21 @@ impl LogTailSet {
     /// build's event loop; the set keeps a sender clone.
     pub(super) fn new(
         client: LogServiceClient<Channel>,
-        jwt_token: Option<String>,
+        jwt: TailTokenSource,
     ) -> (Self, mpsc::Receiver<TaggedLogChunk>) {
-        Self::with_config(client, jwt_token, LogTailConfig::default())
+        Self::with_config(client, jwt, LogTailConfig::default())
     }
 
     pub(super) fn with_config(
         client: LogServiceClient<Channel>,
-        jwt_token: Option<String>,
+        jwt: TailTokenSource,
         config: LogTailConfig,
     ) -> (Self, mpsc::Receiver<TaggedLogChunk>) {
         let (out_tx, out_rx) = mpsc::channel(OUT_QUEUE_DEPTH);
         (
             Self {
                 client,
-                jwt_token,
+                jwt,
                 out_tx,
                 config,
                 tasks: HashMap::new(),
@@ -324,7 +331,7 @@ impl LogTailSet {
         );
         let relay = run_tail(
             self.client.clone(),
-            self.jwt_token.clone(),
+            self.jwt.clone(),
             derivation_path.to_string(),
             exec_id.to_string(),
             RelayWiring {
@@ -925,7 +932,7 @@ use gap::{ArmedGap, PendingGap, PendingGapCell, ServeHeal, Sighting};
 /// served log complete.
 async fn run_tail(
     mut client: LogServiceClient<Channel>,
-    jwt_token: Option<String>,
+    jwt: TailTokenSource,
     derivation_path: String,
     exec_id: String,
     wiring: RelayWiring,
@@ -1028,8 +1035,12 @@ async fn run_tail(
         });
         // Forward the watching caller's tenant token — the store
         // verifies it and checks build-membership ownership
-        // (bug_290; store.log.tail-ownership).
-        if let Some(token) = jwt_token.as_deref()
+        // (bug_290; store.log.tail-ownership). Fresh PER OPEN
+        // (live_062): the source re-mints near expiry, so a tail that
+        // outlives the session TTL keeps opening with a live token
+        // instead of replaying a frozen snapshot into UNAUTHENTICATED
+        // forever.
+        if let Some(token) = jwt.fresh()
             && let Ok(value) = token.parse()
         {
             request
@@ -1098,6 +1109,16 @@ async fn run_tail(
                 // historical read path. After terminal the kernel keeps
                 // retrying within the grace budget: the final lines may
                 // land on a replica that is restarting right now.
+                //
+                // UNAUTHENTICATED is the live_062 face: the token the
+                // open carried is no longer valid (key rotation — the
+                // slack-based refresh can't see it; or a clock-skewed
+                // expiry). Arm one forced re-mint so the NEXT open
+                // carries a token minted under the current key instead
+                // of replaying the rejected one forever.
+                if status.code() == tonic::Code::Unauthenticated {
+                    jwt.note_rejected();
+                }
                 //
                 // Deliberately NOT surfaced to the nix client: a
                 // "log tail reconnecting" line in build output is
@@ -1805,7 +1826,7 @@ mod tests {
     use tonic::transport::Server;
     use tonic::{Request, Response, Status, Streaming};
 
-    use super::{LogTailConfig, LogTailSet, TaggedLogChunk};
+    use super::{LogTailConfig, LogTailSet, TaggedLogChunk, TailTokenSource};
 
     // ------------------------------------------------------------------
     // The mock LogService
@@ -1855,10 +1876,19 @@ mod tests {
         /// this to deterministically interleave "the subscription is
         /// open" with "the terminal signal fires".
         gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        /// The `x-rio-tenant-token` metadata observed per `tail_log`
+        /// call, in arrival order (`None` = no header). live_062: the
+        /// refresh-per-open contract is asserted against THESE — the
+        /// store-visible tokens, not the source's internal state.
+        tokens: Mutex<Vec<Option<String>>>,
         /// How many upcoming `tail_log` calls fail at the open itself
         /// (UNAVAILABLE). The request is still recorded — the counter
         /// counts attempts.
         fail_opens: Mutex<u32>,
+        /// How many upcoming `tail_log` calls fail at the open with
+        /// UNAUTHENTICATED (live_062: the expired/rotated-key token
+        /// rejection). The request and its token are still recorded.
+        unauth_opens: Mutex<u32>,
         /// How many upcoming `tail_log` calls HANG at the open itself
         /// (the future never resolves — a wedged store accepting TCP
         /// but never answering the RPC). The request is still
@@ -1878,6 +1908,18 @@ mod tests {
         /// Fail the next `n` `tail_log` opens with UNAVAILABLE.
         fn fail_next_opens(&self, n: u32) {
             *self.inner.fail_opens.lock().unwrap() = n;
+        }
+
+        /// Fail the next `n` `tail_log` opens with UNAUTHENTICATED
+        /// (live_062: what the store answers when the carried token
+        /// is expired or signed by a rotated-away key).
+        fn unauth_next_opens(&self, n: u32) {
+            *self.inner.unauth_opens.lock().unwrap() = n;
+        }
+
+        /// The tenant-token header observed per open, arrival order.
+        fn tokens(&self) -> Vec<Option<String>> {
+            self.inner.tokens.lock().unwrap().clone()
         }
 
         /// Hang the next `n` `tail_log` opens forever (the open future
@@ -1921,8 +1963,21 @@ mod tests {
             &self,
             request: Request<TailLogRequest>,
         ) -> Result<Response<Self::TailLogStream>, Status> {
+            let token = request
+                .metadata()
+                .get(rio_proto::TENANT_TOKEN_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            self.inner.tokens.lock().unwrap().push(token);
             let req = request.into_inner();
             self.inner.requests.lock().unwrap().push(req);
+            {
+                let mut unauths = self.inner.unauth_opens.lock().unwrap();
+                if *unauths > 0 {
+                    *unauths -= 1;
+                    return Err(Status::unauthenticated("scripted: token rejected"));
+                }
+            }
             {
                 let mut fails = self.inner.fail_opens.lock().unwrap();
                 if *fails > 0 {
@@ -2039,7 +2094,27 @@ mod tests {
         let client = rio_proto::LogServiceClient::connect(format!("http://{addr}"))
             .await
             .expect("connect to the mock LogService");
-        let (set, out_rx) = LogTailSet::with_config(client, None, config);
+        let (set, out_rx) = LogTailSet::with_config(client, TailTokenSource::none(), config);
+        Harness {
+            mock,
+            set,
+            out_rx,
+            _server: server,
+        }
+    }
+
+    /// Harness with a REAL token source (live_062): an expired cached
+    /// mint + the signing key, so the refresh-per-open contract is
+    /// observable through the mock's captured `x-rio-tenant-token`
+    /// headers.
+    async fn harness_with_jwt(config: LogTailConfig, jwt: TailTokenSource) -> Harness {
+        let mock = MockTail::default();
+        let router = Server::builder().add_service(LogServiceServer::new(mock.clone()));
+        let (addr, server) = spawn_grpc_server(router).await;
+        let client = rio_proto::LogServiceClient::connect(format!("http://{addr}"))
+            .await
+            .expect("connect to the mock LogService");
+        let (set, out_rx) = LogTailSet::with_config(client, jwt, config);
         Harness {
             mock,
             set,
@@ -2107,6 +2182,92 @@ mod tests {
     // ------------------------------------------------------------------
     // Tests
     // ------------------------------------------------------------------
+
+    /// live_062 (W13-S10-A, red-first): every `TailLog` open carries a
+    /// FRESH token, never the construction-time snapshot. The source
+    /// is built over an EXPIRED cached mint (`"stale-token"`,
+    /// exp = now−10 — the mint+65min shape); the store-visible header
+    /// must be a re-mint on the FIRST open and on the re-open after a
+    /// scripted UNAVAILABLE.
+    ///
+    /// Pre-fix RED (the `Option<String>` snapshot design): the type
+    /// cannot host this witness at all — `LogTailSet` froze the string
+    /// at construction, so every captured header reads `stale-token`
+    /// verbatim (the field's own doc conceded it: "a token that
+    /// expires mid-build degrades the live tail … the reconnect loop
+    /// keeps retrying"). Strawman disclosure per §1.5-4: the red is
+    /// the retired design's documented behavior, quoted; the witness
+    /// is expressible only post-redesign.
+    #[tokio::test]
+    async fn tail_opens_carry_refreshed_token_not_the_snapshot() {
+        use ed25519_dalek::SigningKey;
+        use rio_auth::jwt::TenantClaims;
+        let key = SigningKey::from_bytes(&[0x42; 32]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let stale = TenantClaims {
+            sub: uuid::Uuid::from_u128(0xCAFE),
+            iat: now - 4000,
+            exp: now - 10,
+            jti: "stale-jti".into(),
+        };
+        let source = TailTokenSource::new(Some(("stale-token".into(), stale)), Some(Arc::new(key)));
+        let mut h = harness_with_jwt(test_config(), source).await;
+
+        h.mock.fail_next_opens(1);
+        h.mock.push_script(vec![chunk(0, 1)], SessionEnd::Hold);
+        h.set.on_started(DRV, EXEC_A);
+        let mock = h.mock.clone();
+        wait_for("two opens (failed + retried)", || mock.request_count() >= 2).await;
+
+        let tokens = h.mock.tokens();
+        for (i, t) in tokens.iter().take(2).enumerate() {
+            let t = t.as_deref().expect("token header present");
+            assert_ne!(
+                t, "stale-token",
+                "open {i} replayed the frozen snapshot (the live_062 blackout)"
+            );
+        }
+    }
+
+    /// live_062 (W13-S10-B, red-first): an UNAUTHENTICATED open forces
+    /// a re-mint — the rotated-key face the slack-based refresh cannot
+    /// see (the token's `exp` still looks healthy). The first open
+    /// carries the original token; the store rejects it; the re-open
+    /// must carry a DIFFERENT (re-minted) token.
+    ///
+    /// Pre-fix RED (same strawman disclosure as above): the frozen
+    /// snapshot replays the rejected token on every re-open, forever.
+    #[tokio::test]
+    async fn unauthenticated_open_forces_token_remint() {
+        use ed25519_dalek::SigningKey;
+        let key = SigningKey::from_bytes(&[0x55; 32]);
+        let (token, claims) =
+            crate::server::session_jwt::mint_session_jwt(uuid::Uuid::from_u128(0xF00D), &key)
+                .expect("mint");
+        let source = TailTokenSource::new(Some((token, claims)), Some(Arc::new(key)));
+        let mut h = harness_with_jwt(test_config(), source).await;
+
+        h.mock.unauth_next_opens(1);
+        h.mock.push_script(vec![chunk(0, 1)], SessionEnd::Hold);
+        h.set.on_started(DRV, EXEC_A);
+        let mock = h.mock.clone();
+        wait_for("two opens (rejected + re-minted)", || {
+            mock.request_count() >= 2
+        })
+        .await;
+
+        let tokens = h.mock.tokens();
+        let first = tokens[0].as_deref().expect("first open carried a token");
+        let second = tokens[1].as_deref().expect("re-open carried a token");
+        assert_ne!(
+            first, second,
+            "the re-open after UNAUTHENTICATED must carry a re-minted token, \
+             not replay the rejected one"
+        );
+    }
 
     /// Rule 1 + 5: a `Started` opens a `TailLog(since_line: 0,
     /// follow: true)` subscription and the served chunks arrive on the
@@ -3261,7 +3422,7 @@ mod tests {
         let (out_tx, _out_rx) = mpsc::channel(8);
         let task = tokio::spawn(super::run_tail(
             client,
-            None,
+            TailTokenSource::none(),
             DRV.to_string(),
             EXEC_A.to_string(),
             super::RelayWiring {
@@ -4209,7 +4370,7 @@ mod tests {
         let disposition = super::RelayDisposition::disclose_at_drop();
         let relay = tokio::spawn(super::run_tail(
             client,
-            None,
+            TailTokenSource::none(),
             DRV.to_string(),
             EXEC_A.to_string(),
             super::RelayWiring {

@@ -2036,6 +2036,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     request: types::SubmitBuildRequest,
     active_build_ids: &mut HashSet<String>,
     jwt_token: Option<&str>,
+    tail_jwt: crate::server::session_jwt::TailTokenSource,
 ) -> anyhow::Result<BuildResult> {
     // Gateway is the trace ROOT (Nix doesn't speak W3C trace context).
     // with_jwt injects the enclosing span's context + tenant JWT — this
@@ -2076,7 +2077,14 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // reconnects — the subscriptions are independent of the scheduler
     // connection (a scheduler failover must not restart the log tail
     // from line 0).
-    let (mut tails, mut log_rx) = LogTailSet::new(log_client.clone(), jwt_token.map(str::to_owned));
+    // live_062: the tails get a refresh-per-open token SOURCE, not a
+    // string snapshot — a watched build's tail outlives the session
+    // TTL whenever the build does, and the snapshot was the 65-min
+    // read-plane blackout. (The scheduler stream above keeps its
+    // `jwt_token` snapshot: WatchBuild reattaches re-read it within
+    // the same bounded budget; its refresh story is the
+    // r[gw.jwt.refresh-on-expiry+2] exec_request seam.)
+    let (mut tails, mut log_rx) = LogTailSet::new(log_client.clone(), tail_jwt);
 
     // The watch loop, typed by event source. `Live` consumes events;
     // any stream death or loss signal drops the stream (moving to
@@ -2590,6 +2598,10 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     let request =
         translate::build_submit_request(nodes, edges, priority_class, tenant_name.as_ref());
 
+    // Hoisted: `tail_source` is a `&self` read of the cache while
+    // `token()` needs `&mut self` (the lazy re-mint) — two-phase
+    // borrow rules want the clone taken first.
+    let tail_jwt = jwt.tail_source();
     let mut build_result = match submit_and_process_build(
         stderr,
         scheduler_client,
@@ -2597,6 +2609,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         request,
         active_build_ids,
         jwt.token(),
+        tail_jwt,
     )
     .await
     {
@@ -3045,6 +3058,8 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
     translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
 
     let request = translate::build_submit_request(nodes, edges, "ci", tenant_name.as_ref());
+    // Same two-phase-borrow hoist as the interactive submit path.
+    let tail_jwt = jwt.tail_source();
     let result = submit_and_process_build(
         stderr,
         scheduler_client,
@@ -3052,6 +3067,7 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
         request,
         active_build_ids,
         jwt.token(),
+        tail_jwt,
     )
     .await?;
     Ok(DagSubmitOutcome::Built(result))
@@ -5352,7 +5368,10 @@ mod tests {
     /// without a live LogService.
     fn lazy_tails() -> (LogTailSet, tokio::sync::mpsc::Receiver<TaggedLogChunk>) {
         let chan = tonic::transport::Endpoint::from_static("http://127.0.0.1:9").connect_lazy();
-        LogTailSet::new(rio_proto::LogServiceClient::new(chan), None)
+        LogTailSet::new(
+            rio_proto::LogServiceClient::new(chan),
+            crate::server::session_jwt::TailTokenSource::none(),
+        )
     }
 
     fn snap_running(entries: &[(&str, &str, types::AttemptKind)]) -> types::BuildSnapshot {
