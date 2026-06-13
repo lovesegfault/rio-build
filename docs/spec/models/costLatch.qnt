@@ -37,6 +37,8 @@
 // foreign persist while we hold the real lease is dual-leadership
 // territory and is leaderElection.qnt's claim, not this model's.
 //
+// MODEL-DIVERGENCE(law=sched.lease.rebound+4; tree=rio-scheduler/src/sla/cost.rs:LeaderOwnedPersist): pollerTickBody couples the latch consult and the persist in ONE action — production's body spans PG awaits, so the edge-delivery drain window admits a deposed body whose in-process boundary facts (latch, tenure generation) all read stale-true while the successor's rows are already durable (the write lands BETWEEN check and write, below this model's atomicity); priced (TB-3 referee, round-13): the covering instruments are the merged_bug_146 write boundary (LeaderOwnedPersist::still_owner — latch AND tenure at write entry; W10-BA), the SQL tier beneath it (the price upsert's data-time qual; the λ unit's whole-fold abort at the cursor fence, merged_bug_048/063), and the W13-BB interleaving test (w13_bb_drain_window_at_the_write_boundary — the undelivered-edge worst case driven at the boundary with the successor's write between check and write) — retarget-by: any durable cost-plane write that bypasses LeaderOwnedPersist or lands outside the qual/fence tiers.
+//
 // State counts, depth, and wall-clock: in the wired check's
 // transcript and the introducing commit message, never here.
 module costLatch {

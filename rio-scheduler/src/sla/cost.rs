@@ -5941,4 +5941,101 @@ mod tests {
         // Huge tier → still 8.
         assert_eq!(IceBackoff::ladder_cap(86400.0, 600.0, 120.0), 8);
     }
+
+    /// W13-BB (TB-3, round-13 referee — the drain window driven AT
+    /// the write boundary): the below-model-atomicity interleaving.
+    /// costLatch.qnt's pollerTickBody couples the latch consult and
+    /// the persist in ONE action; production's body spans PG awaits,
+    /// and the edge-delivery drain window means a deposed replica can
+    /// pass every IN-PROCESS boundary fact — latch still true (the
+    /// lose cell undelivered), generation unchanged (the deposition
+    /// unobserved) — while the successor's evolved rows are already
+    /// durable: the successor's write lands BETWEEN our boundary
+    /// check and our write. What holds in that window is the SQL
+    /// tier, asserted per face: the price upsert's data-time qual
+    /// refuses the stale row, and the λ unit aborts WHOLE at the
+    /// cursor fence — even a NEWER-stamped λ row in the deposed
+    /// snapshot cannot land, because the cursor write is refused
+    /// first and the transaction rolls back (merged_bug_048/063).
+    /// Rows are minted via production constructors (R13); real PG IO,
+    /// no paused clock ((cccccc) — paused clocks lose to real IO).
+    /// Named as a covering instrument by costLatch.qnt's
+    /// MODEL-DIVERGENCE scope row.
+    #[tokio::test]
+    async fn w13_bb_drain_window_at_the_write_boundary() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        let cell = ("intel-8".into(), CapacityType::Spot);
+
+        // The deposed-to-be writer enters its body while genuinely
+        // leading; its boundary facts FREEZE here.
+        let leader = rio_lease::LeaderState::always_leader(Arc::new(AtomicU64::new(7)));
+        let was_leader = Arc::new(AtomicBool::new(true));
+        let owner = LeaderOwnedPersist::begin(&leader, &was_leader);
+
+        // THE INTERLEAVING: the successor's evolved rows land between
+        // our boundary check and our write — deposition + successor
+        // tenure with OUR lose-cell delivery still in flight (the
+        // drain window: was_leader stays true and the generation
+        // stays 7 from this replica's view).
+        let mut successor = CostTable::seeded("us-east-1", HwCostSource::Spot);
+        successor.set_price("intel-8", CapacityType::Spot, 0.7, 2000.0);
+        successor.lambda_cursor = 10;
+        successor.lambda.insert(
+            "intel-8".into(),
+            RatioEma {
+                numerator: 4.0,
+                denominator: 2.0,
+                updated_at: Epoch::from_wall_clock(2000.0),
+            },
+        );
+        successor.persist_rows(&sdb).await.unwrap();
+
+        // The deposed body's snapshot: stale price (data-time 1000),
+        // BEHIND cursor (5), but a NEWER-stamped λ row (3000) — the
+        // per-row qual alone would admit that row; only the unit
+        // fence keeps it out.
+        let mut stale = CostTable::seeded("us-east-1", HwCostSource::Spot);
+        stale.set_price("intel-8", CapacityType::Spot, 0.1, 1000.0);
+        stale.lambda_cursor = 5;
+        stale.lambda.insert(
+            "intel-8".into(),
+            RatioEma {
+                numerator: 9.0,
+                denominator: 1.0,
+                updated_at: Epoch::from_wall_clock(3000.0),
+            },
+        );
+
+        // The in-process boundary PASSES — an undelivered edge is
+        // invisible to it. This is the window under test, not a
+        // regression: the assertion documents WHERE the floor sits.
+        assert_eq!(
+            owner.persist(&stale, &sdb).await.unwrap(),
+            PersistOutcome::Persisted,
+            "the in-process boundary cannot see an undelivered edge"
+        );
+
+        // …and the SQL tier holds every face.
+        let after = CostTable::load(&sdb, "us-east-1", HwCostSource::Spot)
+            .await
+            .unwrap();
+        assert!(
+            (after.price(&cell) - 0.7).abs() < 1e-9,
+            "the price data-time qual held: {}",
+            after.price(&cell)
+        );
+        assert_eq!(after.lambda_cursor, 10, "the cursor fence held");
+        let lam = after
+            .lambda
+            .get(&HwClassName::from("intel-8"))
+            .expect("successor λ row");
+        assert!(
+            (lam.numerator - 4.0).abs() < 1e-9 && (lam.denominator - 2.0).abs() < 1e-9,
+            "the λ unit aborted WHOLE: the deposed snapshot's newer-stamped row \
+             never landed (cursor fence before any EMA row)"
+        );
+    }
 }
