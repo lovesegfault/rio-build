@@ -1083,6 +1083,29 @@ pod). The wire/floor consumption of the letter is pinned at unit level
 scheduler-side; the composition seam is the typed completion-report field
 family.
 
+*The lane disposition (D-3, recorded 2026-06-13).* The DiskFull
+classification lane is DOCUMENTED-DORMANT at the deployed posture: every
+builder pool runs `hostUsers: true` (the I-186 FUSE-passthrough pin, until
+P0560 --- the same root as the `sec.pod.host-users-false` exception
+clause), so kubelet declines projid assignment and the builder mints
+monitoring-only projids with no hard limit (`QuotaEnforcement::NoLimit`);
+under `hostUsers: false` kubelet's `AssignQuota` writes the `-1`
+non-enforcing sentinel at the deployed minors
+(`QuotaEnforcement::NonEnforcing`, pinned by the `vm-kubelet-projquota`
+cells). In neither posture does the first conjunct of
+`classify_quota_exhaustion` hold, so the lane never fires on the fleet ---
+kubelet's du-walk eviction (`EvictedDiskPressure`) is the operative
+disk-exhaustion signal. The two independent blockers are now both VISIBLE
+(the enforcement-posture gauge) or REPAIRED (the in-pod sibling vantage)
+rather than silent. Prerequisites for the enforcing flip, all owner-
+scheduled and outside this record: (a) the `hostUsers` posture flip or a
+kubelet minor that enforces under host-users; (b) a hard-limit mint
+(either kubelet's, when it enforces, or the builder's own --- the
+deliberate non-goal of `ensure_project_quota` today); (c) the in-pod
+vantage (landed); (d) the production-topology witness (landed). The flip's
+readback is #(refs.metric)("rio_builder_quota_enforcement") with
+`mode="enforcing"` reporting nonzero anywhere.
+
 The overlay is per-build. Each build gets its own overlayfs mount with
 separate upper and work directories. The Nix sandbox provides process-level
 isolation (user, mount, PID, and network namespaces). Even if the Nix sandbox
