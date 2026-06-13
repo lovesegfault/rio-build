@@ -3,8 +3,9 @@
 //! Each bootstrap replicate draws `n` indices from the sample set with
 //! probability ∝ `w_i` (the recency × version-distance weight already
 //! computed in `ingest::refit`), refits T(c) on the resampled set with
-//! UNIT weights (resampling encodes the prior weights — re-weighting
-//! the refit would double-count), and records that replicate's T_min.
+//! uniform all-1 weights (resampling encodes the prior weights —
+//! re-weighting the refit would double-count), and records that
+//! replicate's T_min.
 //! The 10th/90th percentiles of the T_min distribution form the 80% CI.
 //!
 //! Seeded deterministically from sample content so the CI is

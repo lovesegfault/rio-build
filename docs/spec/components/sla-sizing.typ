@@ -146,7 +146,7 @@ rather than raw $n$. After a version bump the ring buffer may hold 32 samples bu
 
 Below $n_"eff" = 10$, p90 is not estimable. Instead the model fits ordinary least squares on $log M$ and applies the small-sample prediction-interval factor $exp(t_(0.9, max(3, n_"eff" - 2)) dot.op hat(sigma)_"resid" dot.op sqrt(1 + h_0))$, with leverage
 $ h_0 = 1 / (sum w_i) + (log c^* - overline(log c))^2 / S_(x x), $
-$S_(x x) = sum w_i (log c_i - overline(log c))^2$, and $overline(log c) := (sum w_i log c_i) slash (sum w_i)$. Because $n_"eff" >= sum w_i$ under sub-unit weights, substituting $1 slash n_"eff"$ for the first term would *narrow* the interval and is therefore anti-conservative. Degrees of freedom are floored at 3: the Student-$t$ factor, not $z = 1.28$, is what widens the interval under extrapolation, which is exactly the post-bump case.
+$S_(x x) = sum w_i (log c_i - overline(log c))^2$, and $overline(log c) := (sum w_i log c_i) slash (sum w_i)$. Because $n_"eff" >= sum w_i$ when weights sit below 1, substituting $1 slash n_"eff"$ for the first term would *narrow* the interval and is therefore anti-conservative. Degrees of freedom are floored at 3: the Student-$t$ factor, not $z = 1.28$, is what widens the interval under extrapolation, which is exactly the post-bump case.
 
 #r("sched.sla.disk-scalar")
 

@@ -366,9 +366,10 @@ pub fn refit(
     // when the c-axis subset carried ZERO peaks, so one peaked c-axis
     // row silently dropped every peaked legacy row (p90 of N+1
     // collapsed to 1). The one chokepoint now folds BOTH populations
-    // always: ring weights where the row holds a c-axis seat, unit
-    // weights elsewhere. Both polarity faces destructure from the ONE
-    // mint (sched.sla.disk-polarity-fork).
+    // always, every row weighted by the one decay law over the
+    // full-slice ordinal domain (sched.sla.one-weight-law+2). Both
+    // polarity faces destructure from the ONE mint
+    // (sched.sla.disk-polarity-fork).
     let disk_fork = aggregate_disk_p90(rows);
     let (disk_p90, disk_p90_raw) = match disk_fork {
         Some(f) => (Some(f.floored), Some(f.raw)),
@@ -736,8 +737,9 @@ pub(super) fn reassign_tier(
 }
 
 // r[impl sched.sla.disk-reaches-ephemeral-storage+2]
-/// live_049 L2: the disk p90 over EVERY row carrying a peak, unit
-/// weights — the probe-shaped fit's disk aggregate. Pre-fix the
+/// live_049 L2: the disk p90 over EVERY row carrying a peak, every
+/// row weighted by the one decay law over the full-slice ordinal
+/// domain — the probe-shaped fit's disk aggregate. Pre-fix the
 /// probe_only arm read ONLY the last row (a serial pname with five
 /// observed peaks whose newest row lacked one fell back to the 100 GiB
 /// chart default forever — the un-fitted population the live ramp
@@ -751,8 +753,9 @@ pub(super) fn reassign_tier(
 /// structurally identical c-independent sibling): the recency-weighted
 /// p90 the `MemFit::Independent` variant doc promises, over EVERY sample — quantifier: census(test: w11_bc_axis_arm_census) —
 /// (the mem peak column is non-optional, so the all-rows
-/// aggregate is always available) — ring weights where the row holds a
-/// c-axis seat, unit weights elsewhere. Consumed by the probe arm AND
+/// aggregate is always available) — every row weighted by the one
+/// decay law over the full-slice ordinal domain
+/// (sched.sla.one-weight-law+2). Consumed by the probe arm AND
 /// the full-fit degenerate-Independent arm (`fit_memory`), so
 /// estimator quality no longer depends on which arm a pname lands in.
 fn aggregate_mem_p90(rows: &[BuildSampleRow]) -> MemBytes {
@@ -2577,6 +2580,100 @@ mod disk_axis_tests {
             body.contains("fit_w"),
             "the DOMAIN-checked pin REDs on the planted \
              subset-ordinal arm (the fit_w consult)"
+        );
+    }
+
+    // ── The SEMANTIC PHRASE-CENSUS pin (bug_026; [GEN-SET]; the
+    //    §1.5-7 retired-formulation rider's FOUNDING instance) ──────
+    //
+    // When a census-stamped law changes FORMULATION, symbol-liveness
+    // linting is structurally blind to prose still stating the old
+    // law (a semantic claim cites no symbol). This pin applies the
+    // dead-alphabet-letter idiom to prose: the RETIRED formulations
+    // of the weight law ("unit weights" as the unseated fold law;
+    // "ring weights where seated" as the seated scalar-fold law) must
+    // have ZERO survivors in production prose across the sla module
+    // corpus. Scope: production text (test modules stripped — test
+    // docs narrating historical reds are curated history); .typ spec
+    // surfaces are swept at the owning close and policed by the
+    // standing cross-tree check (WO-S9-8).
+
+    /// Needles built non-literally so the pin cannot match itself.
+    fn retired_weight_formulations() -> Vec<String> {
+        vec![
+            concat!("unit", " weight").to_owned(),
+            concat!("unit", "-weight").to_owned(),
+            concat!("unit", " elsewhere").to_owned(),
+            concat!("ring weights", " where").to_owned(),
+            concat!("ring-weighted", " where").to_owned(),
+        ]
+    }
+
+    /// Scan one module's PRODUCTION text (comments included — prose
+    /// is the target) for retired-formulation survivors.
+    fn scan_retired_formulation(name: &str, src: &str) -> Vec<(String, usize)> {
+        let needles = retired_weight_formulations();
+        let prod = strip_test_mod(src);
+        let mut hits = Vec::new();
+        for (i, line) in prod.lines().enumerate() {
+            let lower = line.to_lowercase();
+            if needles.iter().any(|n| lower.contains(n.as_str())) {
+                hits.push((format!("{name}:{}", i + 1), i + 1));
+            }
+        }
+        hits
+    }
+
+    // r[verify sched.sla.one-weight-law+2]
+    /// **The phrase pin (bug_026)** — *the law's prose dies with the
+    /// law: zero retired-formulation survivors in production prose.*
+    /// The three stale narration sites (the refit call-site comment,
+    /// the disk-aggregate predecessor doc, the mem-aggregator doc —
+    /// plus the MemFit variant doc the sweep surfaced) sat on
+    /// r[impl]-annotated, census-stamped blocks: exactly the lines a
+    /// future synchronizer treats as authoritative (the r21 bug_004
+    /// re-entry mechanism). The standing rationale-rot lint keys on
+    /// symbol existence and cannot see them.
+    #[test]
+    fn w13_t_retired_weight_formulation_has_zero_survivors() {
+        let corpus = weight_census_corpus();
+        let declared = parse_mod_decls(include_str!("mod.rs"));
+        for m in &declared {
+            assert!(
+                corpus.iter().any(|(n, _)| n == m),
+                "sla module `{m}` missing from the phrase-pin corpus"
+            );
+        }
+        let mut survivors = Vec::new();
+        for (name, src) in &corpus {
+            survivors.extend(scan_retired_formulation(name, src));
+        }
+        assert!(
+            survivors.is_empty(),
+            "retired weight-law formulations survive in production \
+             prose — re-derive each site from the live dataflow \
+             (bug_026; the law is sched.sla.one-weight-law+2): \
+             {survivors:?}"
+        );
+    }
+
+    /// **W13-T planted resurrection** — the pin REDs on a planted
+    /// revival of the retired formulation, through the same scan path
+    /// as the live census (rider (b): the oracle is the survivor
+    /// list).
+    #[test]
+    fn w13_t_phrase_pin_reds_on_planted_resurrection() {
+        let plant = "/// unseated rows fold with unit weights\nfn f() {}\n";
+        let hits = scan_retired_formulation("plant", plant);
+        assert_eq!(hits.len(), 1, "the pin FINDS the planted revival");
+        // The pin is prose-aware: it scans comments (a consult census
+        // skips them) — the planted line IS a doc comment.
+        let in_test_mod =
+            "#[cfg(test)]\nmod tests {\n    /// unit weights here are historical narration\n}\n";
+        assert!(
+            scan_retired_formulation("hist", in_test_mod).is_empty(),
+            "test-module historical narration is outside the pin's \
+             production-prose scope"
         );
     }
 

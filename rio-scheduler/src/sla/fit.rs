@@ -167,7 +167,7 @@ pub fn sample_weight(ordinal_age: u32, vdist: u32) -> f64 {
 /// asymptotes to `Φ⁻¹(q)` (≈ 1.2816 at q=0.9).
 ///
 /// `sum_w` is `Σw_i` over the ring — NOT `n_eff` (they coincide only
-/// under uniform unit weights).
+/// when every weight is exactly 1).
 pub fn z_q(q: f64, fit_df: FitDf, n_distinct_c: u32, n_par: u32, sum_w: f64) -> f64 {
     let df = (fit_df.0.min(f64::from(n_distinct_c)) - f64::from(n_par)).max(3.0);
     // Hill's t-quantile (distrs); golden-pinned in `t_ppf_golden`.

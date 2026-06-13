@@ -113,7 +113,8 @@ pub enum MemFit {
     /// Koenker-Machado pseudo-R¹ ≥ 0.7 → log M = a + b·log c
     Coupled { a: f64, b: f64, r1: f64 },
     /// fallback: the per-axis recency-weighted p90 over EVERY sample — quantifier: census(test: w11_bc_axis_arm_census) —
-    /// (ring-weighted where seated, unit elsewhere) — minted only by
+    /// (every row under the one decay law, full-slice ordinal
+    /// domain) — minted only by
     /// the one mem aggregation chokepoint
     /// (`ingest::aggregate_mem_p90`; sched.sla.one-aggregator).
     Independent { p90: MemBytes },
@@ -196,7 +197,7 @@ pub struct FittedParams {
     /// quantity then.
     pub n_distinct_c: u32,
     /// `Σw_i` over the ring. Feeds [`super::fit::z_q`]'s `√(1 + 1/Σw)`
-    /// leverage term. NOT `n_eff`: under sub-unit weights `n_eff ≥ Σw`,
+    /// leverage term. NOT `n_eff`: when weights sit below 1, `n_eff ≥ Σw`,
     /// so substituting would *narrow* the interval (anti-conservative).
     pub sum_w: f64,
     pub span: f64,
