@@ -138,8 +138,10 @@ pub fn describe_metrics() {
          tail fan-out drops, a sustained rate on one derivation means its \
          stored log has a hole, check rio_store_log_read_data_loss_total). A \
          sustained open_failed rate means every watched build's live tail is \
-         degraded fleet-wide; the lines remain durable in the store and \
-         readable via `rio-cli logs` regardless."
+         degraded fleet-wide (the live_062 blackout shape — \
+         RioGatewayLogTailDegraded alerts on it, and affected builds carry \
+         one in-output degradation notice); the lines remain durable in the \
+         store and readable via `rio-cli logs` regardless."
     );
 
     // r[impl obs.metric.alert-counter-seeded]
@@ -165,6 +167,16 @@ pub struct SeededSeries {
 /// `putpath_retry_attempt_axis_matches_the_emit_law`.
 pub const PUTPATH_ABORTED_RETRY_ATTEMPTS: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8"];
 
+/// The `reason` label axis of `rio_gateway_log_tail_reconnects_total`:
+/// the image of `reconnect_reason` over every `TailStopCause` that can
+/// reach a Reopen verdict (NaturalEnd/TransportErr fold to
+/// stream_ended; OpenFailed; GapObserved — Orphaned/PermanentErr exit
+/// unconditionally and never reopen, kernel law). Pinned to the fn
+/// image by `tail_reconnect_reason_axis_matches_the_emit_law`
+/// (handler/log_tail.rs tests) so a new stop cause cannot ship a
+/// birth-gapped series behind the live_062 alert.
+pub const TAIL_RECONNECT_REASONS: &[&str] = &["stream_ended", "open_failed", "gap_observed"];
+
 /// Every alert-`expr:`-referenced rio_gateway counter, born at 0 at
 /// boot on every replica (the parity test fails when a
 /// PrometheusRule/ScaledObject references a counter missing here).
@@ -186,6 +198,15 @@ pub const ALERT_SEEDED_COUNTERS: &[SeededSeries] = &[
     SeededSeries {
         name: "rio_gateway_putpath_retry_events_total",
         label: Some(("class", rio_common::grpc::CODE_CLASS_LABELS)),
+    },
+    // live_062: RioGatewayLogTailDegraded reads
+    // rate(...{reason="open_failed"}) — a quiet boot must present the
+    // series at 0, not absent, or the alert is blind exactly until
+    // the first failure it exists to catch (the bug_322 birth-gap
+    // class). Seeded across the full closed reason axis.
+    SeededSeries {
+        name: "rio_gateway_log_tail_reconnects_total",
+        label: Some(("reason", TAIL_RECONNECT_REASONS)),
     },
 ];
 

@@ -959,6 +959,37 @@ spec:
               transactions in pg_stat_activity and see
               docs/ops/gc-enablement.typ (slow upgrade transactions).
 
+        # live_062: the live-tail read plane can black out while every
+        # build succeeds (the 65-min token-expiry incident read as
+        # "stuck builds" — writes healthy, tails dark, nothing paged).
+        # open_failed re-opens run at ~1/s per dark tail (the 1s
+        # reconnect backoff), so a sustained 0.2/s floor means at
+        # least one tail has been dark across the whole window with
+        # margin for blips; 10m `for` rides out store rolling deploys
+        # (which re-resolve in seconds) and the 45s ingest-lease steal
+        # window. The counter is alert-seeded at zero across the full
+        # reason axis from boot (rio-gateway ALERT_SEEDED_COUNTERS —
+        # the parity test imports that table), so the expr has series
+        # on day one; sum() collapses replicas.
+        - alert: RioGatewayLogTailDegraded
+          expr: sum(rate(rio_gateway_log_tail_reconnects_total{reason="open_failed"}[5m])) > 0.2
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: live log tails degraded (TailLog opens failing for 10m)
+            description: >-
+              Gateway TailLog re-opens are failing at
+              {{`{{ $value | humanize }}`}}/s (reason=open_failed) —
+              watched builds' live tails are dark while the builds
+              themselves keep running. Check the gateway warn lines for
+              the lane: "rejected UNAUTHENTICATED" = token/key plane
+              (key rotation or mint failure; the gateway re-mints per
+              open), "until the store is reachable/answers" = store
+              plane (deploy, scale-in, or network). Durable logs are
+              unaffected and remain readable via `rio-cli logs`;
+              affected builds carry one in-output degradation notice.
+
     # The executor-lifecycle deletion-gate recording rules
     # (rio:scheduler_stream_registrations:max over the workers_active
     # gauge, and rio:scheduler_stream_attempts:rate5m over the stream

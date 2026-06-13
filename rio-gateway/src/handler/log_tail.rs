@@ -85,6 +85,21 @@ const TERMINAL_GRACE: Duration = Duration::from_secs(2);
 /// backpressure to its own reads.
 const OUT_QUEUE_DEPTH: usize = 256;
 
+/// R17 (live_062): how long a tail's open-failure episode runs before
+/// the ONE user-visible degradation line is injected into the build
+/// output. VIOLABLE, hypothesis 30 s — derivation: a routine store
+/// rolling deploy re-resolves through the balanced channel in well
+/// under 10 s (below the bound, no notice); a full ingest-lease steal
+/// window is 45 s and a token blackout is permanent, so both faces the
+/// notice exists for clear 30 s comfortably; the floor is one worst-
+/// case open cycle (`TAIL_OPEN_BOUND` 10 s + backoff 1 s), so a single
+/// half-open replica blip cannot fire it. Raising it trades operator
+/// silence for fewer benign lines; the live_062 lesson is that
+/// SILENCE escalated a cosmetic degradation into an incident
+/// ("stuck builds" — the builds were fine, nobody could see the
+/// logs), so the bound stays tight-ish.
+const TAIL_DEGRADED_NOTICE_AFTER: Duration = Duration::from_secs(30);
+
 /// Tuning knobs for [`LogTailSet`], overridable in tests so the
 /// grace/backoff tests don't take wall-clock seconds.
 #[derive(Clone, Copy, Debug)]
@@ -95,6 +110,9 @@ pub(super) struct LogTailConfig {
     /// production). Test-overridable so the hung-open conformance test
     /// does not wall-clock 10 s per cut.
     pub open_bound: Duration,
+    /// Episode age at which the one degradation notice is injected
+    /// ([`TAIL_DEGRADED_NOTICE_AFTER`] in production).
+    pub degraded_notice_after: Duration,
 }
 
 impl Default for LogTailConfig {
@@ -103,6 +121,7 @@ impl Default for LogTailConfig {
             reconnect_backoff: RECONNECT_BACKOFF,
             terminal_grace: TERMINAL_GRACE,
             open_bound: TAIL_OPEN_BOUND,
+            degraded_notice_after: TAIL_DEGRADED_NOTICE_AFTER,
         }
     }
 }
@@ -978,6 +997,18 @@ async fn run_tail(
     // the alerting signal; the warn is the "which derivation / which
     // status code" breadcrumb next to it.
     let mut warned_open_failure = false;
+    // live_062: the open-failure EPISODE clock — armed at the first
+    // failed/timed-out open of a consecutive run, cleared on a
+    // successful open. When an episode outlives
+    // `config.degraded_notice_after`, exactly ONE typed notice line is
+    // injected into the build output (the user-visible half the warn
+    // latch above structurally cannot provide — operators read pod
+    // logs, users read build output, and live_062's users diagnosed
+    // "stuck builds" from a silent dark tail). `degraded_lane` is the
+    // last failure's binary diagnosis for the notice text.
+    let mut degraded_since: Option<Instant> = None;
+    let mut degraded_notice_sent = false;
+    let mut degraded_lane: &'static str = open_failed_lane(tonic::Code::Unavailable);
     loop {
         // An orphaned relay must never open another stream: the drain
         // sender vanishing means the owning set is gone, so the law
@@ -1068,6 +1099,10 @@ async fn run_tail(
         let cause = match open {
             OpenOutcome::Opened(Ok(resp)) => {
                 warned_open_failure = false;
+                // The episode (if any) ends at a successful open: the
+                // next degradation gets its own notice.
+                degraded_since = None;
+                degraded_notice_sent = false;
                 match drive_stream(
                     resp.into_inner(),
                     &derivation_path,
@@ -1119,22 +1154,39 @@ async fn run_tail(
                 if status.code() == tonic::Code::Unauthenticated {
                     jwt.note_rejected();
                 }
-                //
-                // Deliberately NOT surfaced to the nix client: a
-                // "log tail reconnecting" line in build output is
-                // noise the user can't act on, and the lines are
-                // durable in the store regardless.
+                // live_062 retired the "deliberately NOT surfaced"
+                // posture that used to live here: a SHORT blip is
+                // still silent (noise the user can't act on), but a
+                // SUSTAINED episode now injects one typed notice line
+                // below — silence escalated a cosmetic degradation
+                // into a "stuck builds" incident while every build
+                // was succeeding. The warn text forks by lane: the
+                // pre-fix text blamed store reachability for token
+                // rejections too, which misdiagnosed the 65-min
+                // blackout in the one log line operators had.
+                let lane = open_failed_lane(status.code());
+                degraded_since.get_or_insert_with(Instant::now);
+                degraded_lane = lane;
                 if warned_open_failure {
                     debug!(code = ?status.code(), "TailLog open failed");
                 } else {
                     warned_open_failure = true;
-                    warn!(
-                        code = ?status.code(),
-                        since_line,
-                        "TailLog open failed; live tail degraded until the store is reachable \
-                         (retrying every {:?})",
-                        config.reconnect_backoff
-                    );
+                    match status.code() {
+                        tonic::Code::Unauthenticated => warn!(
+                            code = ?status.code(),
+                            since_line,
+                            "TailLog open rejected UNAUTHENTICATED; re-minting the \
+                             session token and retrying (every {:?})",
+                            config.reconnect_backoff
+                        ),
+                        _ => warn!(
+                            code = ?status.code(),
+                            since_line,
+                            "TailLog open failed; live tail degraded until the store is reachable \
+                             (retrying every {:?})",
+                            config.reconnect_backoff
+                        ),
+                    }
                 }
                 TailStopCause::OpenFailed
             }
@@ -1142,6 +1194,8 @@ async fn run_tail(
                 // A half-open replica: TCP up, nobody home. Same
                 // retryability as an answered open error — the lines
                 // are durable in the store regardless.
+                degraded_since.get_or_insert_with(Instant::now);
+                degraded_lane = open_failed_lane(tonic::Code::Unavailable);
                 if warned_open_failure {
                     debug!(?after, "TailLog open timed out");
                 } else {
@@ -1173,6 +1227,23 @@ async fn run_tail(
         } else {
             cause
         };
+        // live_062: the one degradation notice per episode. try_send,
+        // not send: a full output queue means the consumer has plenty
+        // to read already and the notice is the least important line
+        // in it — never backpressure the relay on it (the
+        // `degraded_notice_sent` latch still flips, matching the
+        // warn latch's one-per-episode law).
+        if let Some(since) = degraded_since
+            && !degraded_notice_sent
+            && since.elapsed() >= config.degraded_notice_after
+        {
+            degraded_notice_sent = true;
+            let _ = out_tx.try_send(TaggedLogChunk {
+                derivation_path: derivation_path.clone(),
+                first_line_number: last_relayed.map_or(0, |n| n.saturating_add(1)),
+                lines: vec![degraded_notice(since.elapsed(), degraded_lane)],
+            });
+        }
         arm_grace(&mut grace_deadline, &drain, config.terminal_grace);
         let terminal = *drain.borrow();
         let grace_expired = grace_deadline.is_some_and(|d| Instant::now() >= d);
@@ -1788,6 +1859,36 @@ fn gap_marker(gap_from: u64, gap_until: u64) -> Vec<u8> {
     .into_bytes()
 }
 
+/// live_062: the binary user-facing diagnosis of an open failure. The
+/// projection is TOTAL by design over exactly two lanes — the token
+/// lane (UNAUTHENTICATED: the gateway re-mints and retries; with a
+/// healthy key this self-heals on the next open) and the reachability
+/// lane (everything else: the store is down/deploying/half-open; the
+/// reconnect loop rides it out). The pre-fix warn text folded both
+/// into "until the store is reachable", which misdiagnosed the
+/// token-expiry blackout in the only line operators had.
+fn open_failed_lane(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::Unauthenticated => "session token rejected; re-minting",
+        _ => "store unreachable",
+    }
+}
+
+/// live_062: the ONE user-visible line of a sustained tail
+/// degradation (the `***`-marker house form, same family as the gap
+/// and truncation markers). States the three things the user can act
+/// on: how long it has been dark, the lane, and that the build itself
+/// is unaffected with the log durable for later.
+fn degraded_notice(elapsed: Duration, lane: &str) -> Vec<u8> {
+    format!(
+        "*** rio: live log tail degraded for {}s ({lane}); the build is \
+         unaffected and the full log stays readable from the store after \
+         completion ***",
+        elapsed.as_secs()
+    )
+    .into_bytes()
+}
+
 /// Tag the kernel-chosen `[yield_from, yield_until)` slice of `chunk`
 /// for relay. The slice bounds come from [`visit_chunk`], which
 /// guarantees they lie inside the chunk.
@@ -1826,7 +1927,7 @@ mod tests {
     use tonic::transport::Server;
     use tonic::{Request, Response, Status, Streaming};
 
-    use super::{LogTailConfig, LogTailSet, TaggedLogChunk, TailTokenSource};
+    use super::{LogTailConfig, LogTailSet, TaggedLogChunk, TailStopCause, TailTokenSource};
 
     // ------------------------------------------------------------------
     // The mock LogService
@@ -2073,6 +2174,10 @@ mod tests {
             reconnect_backoff: Duration::from_millis(50),
             terminal_grace: Duration::from_millis(400),
             open_bound: Duration::from_millis(2000),
+            // Big enough that the non-notice tests never trip it
+            // through their scripted single failures; the notice test
+            // overrides it down.
+            degraded_notice_after: Duration::from_secs(30),
         }
     }
 
@@ -2266,6 +2371,101 @@ mod tests {
             first, second,
             "the re-open after UNAUTHENTICATED must carry a re-minted token, \
              not replay the rejected one"
+        );
+    }
+
+    /// live_062 (WO-S10-6, red-first): a SUSTAINED open-failure
+    /// episode injects exactly ONE user-visible notice line into the
+    /// build output after `degraded_notice_after`; further failures in
+    /// the same episode stay silent (the warn latch's law, mirrored).
+    ///
+    /// Pre-fix RED (the design's own text, quoted from the deleted
+    /// comment at the open-failure arm): "Deliberately NOT surfaced to
+    /// the nix client" — no notice existed at any duration; live_062's
+    /// users diagnosed "stuck builds" from a silently dark tail while
+    /// every build succeeded. Strawman disclosure per the
+    /// order-infeasible form (the notice machinery and its witness
+    /// land together).
+    #[tokio::test]
+    async fn sustained_degradation_notices_user_once_per_episode() {
+        let mut config = test_config();
+        config.degraded_notice_after = Duration::from_millis(150);
+        let mut h = harness_with(config).await;
+        // Every open fails for the whole test: one episode, many
+        // cycles (50 ms backoff → ~3 cycles before the threshold,
+        // many after).
+        h.mock.fail_next_opens(200);
+        h.set.on_started(DRV, EXEC_A);
+
+        let notice = tokio::time::timeout(Duration::from_secs(2), h.out_rx.recv())
+            .await
+            .expect("the degradation notice must arrive within the bound")
+            .expect("output channel open");
+        let text = String::from_utf8(notice.lines[0].clone()).expect("marker is UTF-8");
+        assert!(
+            text.contains("live log tail degraded for"),
+            "notice text: {text}"
+        );
+        assert!(
+            text.contains("store unreachable"),
+            "UNAVAILABLE opens are the reachability lane: {text}"
+        );
+
+        // One per episode: the episode persists (opens keep failing),
+        // so no second notice may arrive.
+        let second = tokio::time::timeout(Duration::from_millis(400), h.out_rx.recv()).await;
+        assert!(
+            second.is_err(),
+            "a second notice arrived in the same episode: {second:?}"
+        );
+    }
+
+    /// live_062: the user-facing open-failure lane projection is the
+    /// closed two-letter alphabet — UNAUTHENTICATED is the token lane
+    /// (the pre-fix text blamed store reachability for it, which
+    /// misdiagnosed the blackout), everything else the reachability
+    /// lane.
+    #[test]
+    fn open_failed_lane_cells() {
+        use super::open_failed_lane;
+        assert_eq!(
+            open_failed_lane(tonic::Code::Unauthenticated),
+            "session token rejected; re-minting"
+        );
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::NotFound,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Internal,
+        ] {
+            assert_eq!(open_failed_lane(code), "store unreachable", "{code:?}");
+        }
+    }
+
+    /// live_062 ((lllll) + the axis pin): `TAIL_RECONNECT_REASONS` —
+    /// the boot-seed axis behind RioGatewayLogTailDegraded — IS the
+    /// image of `reconnect_reason` over every cause that can reach a
+    /// Reopen verdict. A new stop cause that mints a new reason string
+    /// fails here instead of shipping a birth-gapped series.
+    #[test]
+    fn tail_reconnect_reason_axis_matches_the_emit_law() {
+        use super::reconnect_reason;
+        // The reopen-reachable causes (Orphaned/PermanentErr exit
+        // unconditionally — kernel law, kani-pinned).
+        let image: std::collections::BTreeSet<&str> = [
+            TailStopCause::NaturalEnd,
+            TailStopCause::TransportErr,
+            TailStopCause::OpenFailed,
+            TailStopCause::GapObserved,
+        ]
+        .into_iter()
+        .map(reconnect_reason)
+        .collect();
+        let seeded: std::collections::BTreeSet<&str> =
+            crate::TAIL_RECONNECT_REASONS.iter().copied().collect();
+        assert_eq!(
+            image, seeded,
+            "the seeded reason axis must equal reconnect_reason's image"
         );
     }
 
@@ -2850,6 +3050,7 @@ mod tests {
             reconnect_backoff: Duration::from_millis(300),
             terminal_grace: Duration::from_millis(800),
             open_bound: Duration::from_millis(100),
+            degraded_notice_after: Duration::from_secs(30),
         })
         .await;
         h.mock.push_script(vec![chunk(0, 2)], SessionEnd::Close);
@@ -2959,6 +3160,7 @@ mod tests {
             reconnect_backoff: Duration::from_millis(50),
             terminal_grace: Duration::from_millis(150),
             open_bound: Duration::from_millis(100),
+            degraded_notice_after: Duration::from_secs(30),
         })
         .await;
         // One stream serves the prefix and the jump, then closes. The
@@ -3340,6 +3542,7 @@ mod tests {
                         reconnect_backoff: Duration::from_millis(backoff_ms),
                         terminal_grace: Duration::from_millis(grace_ms),
                         open_bound: Duration::from_millis(100),
+                        degraded_notice_after: Duration::from_secs(30),
                     })
                     .await;
                     let tail = chunk(100, 2);
