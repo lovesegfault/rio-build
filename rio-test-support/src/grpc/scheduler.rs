@@ -121,6 +121,13 @@ pub struct MockScheduler {
     /// For `r[gw.jwt.propagate]` — catches bare-struct call sites that
     /// bypass `with_jwt` on the reconnect path.
     pub watch_metadata: Arc<RwLock<Vec<Option<String>>>>,
+    /// How many upcoming `watch_build` calls are rejected with
+    /// `UNAUTHENTICATED` before the normal outcome applies (live_064:
+    /// the expired/rotated-key token rejection — what the scheduler's
+    /// jwt interceptor answers when the carried token no longer
+    /// verifies). Decremented per call; the call's metadata/build_id
+    /// are still recorded. Checked BEFORE `WatchOutcome.fail_count`.
+    pub watch_unauth_count: Arc<AtomicU32>,
     /// `x-rio-tenant-token` value on each CancelBuild call (`None` = absent).
     pub cancel_metadata: Arc<RwLock<Vec<Option<String>>>>,
     /// Artificial latency applied to every `resolve_tenant` call before it
@@ -304,6 +311,23 @@ impl SchedulerService for MockScheduler {
         self.watch_calls.write().unwrap().push(req.build_id);
 
         let watch = self.watch.read().unwrap().clone();
+
+        // live_064 injected-rejection countdown: the carried token is
+        // refused as unauthenticated (the scheduler-side interceptor's
+        // answer to an expired or rotated-away token). Checked before
+        // the Unavailable countdown so a test can script "auth reject,
+        // then serve".
+        if self
+            .watch_unauth_count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            return Err(Status::unauthenticated(
+                "mock: x-rio-tenant-token rejected (expired or unknown signer)",
+            ));
+        }
 
         // Injected-failure countdown: decrement and return Unavailable while > 0.
         // For reconnect-exhausted tests (gateway retries watch_build up to

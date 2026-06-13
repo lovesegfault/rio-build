@@ -396,8 +396,22 @@
       "enum": "StreamProcessError",
       "name": "EofWithoutTerminal",
       "crate": "rio-gateway",
-      "msg": "build event stream ended unexpectedly (scheduler disconnected?)",
-      "doc": "Stream returned `Ok(None)` (EOF) without a Completed/ Failed/Cancelled event. This IS the primary failover signature: k8s pod kill → SIGTERM → graceful shutdown → TCP FIN → clean stream close. NOT a Transport error. Reconnect-worthy for the same reason as Transport."
+      "msg": "build event stream ended without a terminal event",
+      "doc": "Stream returned `Ok(None)` (EOF) without a Completed/ Failed/Cancelled event. This IS the primary failover signature: k8s pod kill → SIGTERM → graceful shutdown → TCP FIN → clean stream close. NOT a Transport error. Reconnect-worthy for the same reason as Transport. (live_064 retired the \"(scheduler disconnected?)\" parenthetical this Display used to carry: the owner's incident surfaced it as the build's failure cause while the scheduler was perfectly healthy and the real cause — eleven UNAUTHENTICATED re-attach rejections — never reached the message. Stream-death classification stays descriptive; causes belong to the re-attach evidence below.)"
+    },
+    {
+      "enum": "StreamProcessError",
+      "name": "ReattachAuthRejected",
+      "crate": "rio-gateway",
+      "msg": "WatchBuild re-attach rejected as unauthenticated even after a session-token re-mint",
+      "doc": "live_064: a WatchBuild re-attach was rejected `UNAUTHENTICATED` even after the one-shot session-token re-mint — the session's key material no longer verifies (revoked tenant, signer mismatch). NOT retried further: every later cycle would carry the same verdict, and burning the budget on it is exactly how the live_064 incident spent its last six minutes. The client message states the auth-rejection FACT only; the upstream Status body is operator-log material (the warn at the branch site carries it with the build_id) — scheduler-internal error detail never rides the client wire."
+    },
+    {
+      "enum": "StreamProcessError",
+      "name": "ReattachExhausted",
+      "crate": "rio-gateway",
+      "msg": "WatchBuild re-attach failed {attempts} times; last attempt: {last_reattach}",
+      "doc": "live_064: the re-attach budget exhausted. The surfaced cause is the LAST RE-ATTACH failure (what actually kept the watch from resuming), never the benign stream EOF that opened the episode — the incident's exhaustion message blamed a healthy scheduler while the auth rejections never reached it. `last_reattach` is a SANITIZED classification (fixed sentences + gRPC codes, built at the recording sites); the full upstream Status bodies live in the per-attempt operator warns, never on the client wire."
     },
     {
       "enum": "StreamProcessError",

@@ -3539,3 +3539,159 @@ async fn test_build_paths_submit_retry_budget_exhausts() -> anyhow::Result<()> {
     h.finish().await;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// live_064: WatchBuild re-attach token refresh — gw.jwt.refresh-on-expiry
+// ---------------------------------------------------------------------------
+//
+// The owner's 72-min build died with eleven re-attach cycles all rejected
+// UNAUTHENTICATED: the re-attach loop replayed the submit-time token
+// snapshot after the session TTL, no branch recognised the auth rejection,
+// and the surfaced failure blamed a healthy scheduler ("build event stream
+// ended unexpectedly (scheduler disconnected?)") while the auth evidence
+// never reached it. WO-S10-9 made every injection read the refreshing
+// session source; WO-S10-10 added the UNAUTHENTICATED branch (one forced
+// re-mint + immediate retry, then fail-fast) and the honest exhaustion
+// message. These two witnesses pin both halves against the store-visible
+// surface (the mock's captured per-call x-rio-tenant-token metadata and the
+// wire-read BuildResult).
+
+/// live_064 (WO-S10-9 + WO-S10-10, the recovery half): a re-attach rejected
+/// UNAUTHENTICATED re-mints the session token and the IMMEDIATE retry
+/// resumes the build — exactly two WatchBuild calls (no budget burn), the
+/// second carrying a DIFFERENT, freshly minted token, and the build
+/// completes successfully.
+///
+/// Pre-fix red (strawman disclosure — the snapshot signature cannot host
+/// the provider; the red is the incident's own evidence): every re-attach
+/// carried the byte-identical submit-time token, all eleven were rejected
+/// UNAUTHENTICATED, and the build failed despite a healthy scheduler.
+// r[verify gw.jwt.refresh-on-expiry+2]
+#[tokio::test(flavor = "current_thread")]
+async fn test_reattach_unauthenticated_remints_and_resumes() -> anyhow::Result<()> {
+    let (mut h, initial_token) = GatewaySession::new_with_minted_jwt_handshake().await?;
+    // SubmitBuild stream: Started, then close without a terminal event →
+    // the watch loop must re-attach.
+    h.scheduler.set_submit_outcome(SubmitOutcome::close_early());
+    // First WatchBuild: rejected UNAUTHENTICATED (the rotated-key face).
+    // Second: serves the snapshot + Completed.
+    h.scheduler
+        .watch_unauth_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    h.scheduler.set_watch_outcome(WatchOutcome {
+        scripted_events: Some(vec![
+            active_snapshot(1),
+            ev(build_event::Event::Completed(types::BuildCompleted {
+                output_paths: vec![],
+            })),
+        ]),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    // Opcode 46 so the BuildResult comes back structured.
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let _frames = collect_stderr_frames(&mut h.stream).await;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+    let _derived_path = wire::read_string(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert_eq!(
+        status, 0,
+        "the re-minted re-attach must resume and complete the build; error_msg: {error_msg}"
+    );
+
+    let watch_md = h.scheduler.watch_metadata.read().unwrap().clone();
+    assert_eq!(
+        watch_md.len(),
+        2,
+        "exactly one rejected attempt + one re-minted retry (no budget burn): {watch_md:?}"
+    );
+    let first = watch_md[0]
+        .as_deref()
+        .expect("first re-attach carried a token");
+    let second = watch_md[1].as_deref().expect("retry carried a token");
+    assert_ne!(
+        first, second,
+        "the retry must carry a freshly minted token, not replay the rejected one"
+    );
+    assert_eq!(
+        first, initial_token,
+        "the first re-attach carries the session's current mint (precondition \
+         for the re-mint discrimination above)"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// live_064 (WO-S10-10, the honest-exhaustion half): when the re-minted
+/// retry is ALSO rejected UNAUTHENTICATED, the watch fails fast — exactly
+/// two WatchBuild calls, not a MAX_RECONNECT budget burn — and the surfaced
+/// failure carries the auth evidence instead of the retired
+/// "(scheduler disconnected?)" speculation.
+///
+/// Pre-fix red (the incident verbatim): eleven identical rejections, then
+/// "build stream error (reconnect exhausted): build event stream ended
+/// unexpectedly (scheduler disconnected?)" — zero auth evidence.
+// r[verify gw.jwt.refresh-on-expiry+2]
+#[tokio::test(flavor = "current_thread")]
+async fn test_reattach_unauthenticated_fails_fast_with_auth_evidence() -> anyhow::Result<()> {
+    let (mut h, _initial_token) = GatewaySession::new_with_minted_jwt_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::close_early());
+    // Every WatchBuild attempt is rejected: the session's key material is
+    // no longer accepted at all (revoked tenant / signer mismatch).
+    h.scheduler
+        .watch_unauth_count
+        .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let _frames = collect_stderr_frames(&mut h.stream).await;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+    let _derived_path = wire::read_string(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert_eq!(
+        status, 6,
+        "TransientFailure (the build itself was never refuted)"
+    );
+    assert!(
+        error_msg.to_lowercase().contains("unauthenticated"),
+        "the surfaced failure must carry the auth evidence: {error_msg}"
+    );
+    assert!(
+        !error_msg.contains("scheduler disconnected"),
+        "the retired speculation must not resurface: {error_msg}"
+    );
+    // The sanitization boundary (security-review fold-in): the client
+    // gets the auth-rejection FACT, never the upstream Status body —
+    // the mock's message ("mock: x-rio-tenant-token rejected ...") is
+    // scheduler-internal detail and must stay in the operator log.
+    assert!(
+        !error_msg.contains("mock:"),
+        "the upstream Status body must not reach the client wire: {error_msg}"
+    );
+
+    let watch_calls = h.scheduler.watch_calls.read().unwrap().len();
+    assert_eq!(
+        watch_calls, 2,
+        "one rejection + the one-shot re-minted retry, then fail-fast — \
+         never a MAX_RECONNECT burn on a verdict that cannot change"
+    );
+
+    h.finish().await;
+    Ok(())
+}

@@ -174,6 +174,39 @@ impl GatewaySession {
         Ok(sess)
     }
 
+    /// Handshake-ready session whose JWT is a REAL mint over a real
+    /// signing key (live_064): unlike [`new_with_jwt_handshake`]'s
+    /// keyless literal, this session CAN re-mint — the
+    /// refresh-on-rejection witnesses need a token whose successor is
+    /// observably different. Returns the session and the initially
+    /// minted token string (so tests can assert a later injection
+    /// carries a DIFFERENT, re-minted one).
+    ///
+    /// [`new_with_jwt_handshake`]: Self::new_with_jwt_handshake
+    pub async fn new_with_minted_jwt_handshake() -> anyhow::Result<(Self, String)> {
+        use ed25519_dalek::SigningKey;
+        let key = SigningKey::from_bytes(&[0x4D; 32]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs() as i64;
+        let claims = rio_auth::jwt::TenantClaims {
+            sub: uuid::Uuid::from_u128(0x5E55_1014),
+            iat: now,
+            exp: now + 3600,
+            jti: "live064-initial".to_string(),
+        };
+        let token = rio_auth::jwt::sign(&claims, &key)?;
+        let session_jwt = rio_gateway::handler::SessionJwt::new(
+            Some((token.clone(), claims)),
+            Some(std::sync::Arc::new(key)),
+        );
+        let mut sess = Self::new_inner("", session_jwt).await?;
+        do_handshake(&mut sess.stream).await?;
+        send_set_options(&mut sess.stream).await?;
+        Ok((sess, token))
+    }
+
     async fn new_inner(
         tenant_name: &str,
         jwt: rio_gateway::handler::SessionJwt,

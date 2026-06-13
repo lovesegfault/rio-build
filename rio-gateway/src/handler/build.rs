@@ -41,7 +41,14 @@ enum StreamProcessError {
     /// signature: k8s pod kill → SIGTERM → graceful shutdown →
     /// TCP FIN → clean stream close. NOT a Transport error.
     /// Reconnect-worthy for the same reason as Transport.
-    #[error("build event stream ended unexpectedly (scheduler disconnected?)")]
+    /// (live_064 retired the "(scheduler disconnected?)" parenthetical
+    /// this Display used to carry: the owner's incident surfaced it as
+    /// the build's failure cause while the scheduler was perfectly
+    /// healthy and the real cause — eleven UNAUTHENTICATED re-attach
+    /// rejections — never reached the message. Stream-death
+    /// classification stays descriptive; causes belong to the
+    /// re-attach evidence below.)
+    #[error("build event stream ended without a terminal event")]
     EofWithoutTerminal,
     /// Error writing STDERR to the client (WireError). The Nix
     /// client disconnected or the SSH channel closed. NOT
@@ -55,6 +62,31 @@ enum StreamProcessError {
     /// recovery (gw.resync.loss-signal).
     #[error("scheduler signalled event loss; resync via snapshot")]
     ResyncRequired,
+    /// live_064: a WatchBuild re-attach was rejected `UNAUTHENTICATED`
+    /// even after the one-shot session-token re-mint — the session's
+    /// key material no longer verifies (revoked tenant, signer
+    /// mismatch). NOT retried further: every later cycle would carry
+    /// the same verdict, and burning the budget on it is exactly how
+    /// the live_064 incident spent its last six minutes. The client
+    /// message states the auth-rejection FACT only; the upstream
+    /// Status body is operator-log material (the warn at the branch
+    /// site carries it with the build_id) — scheduler-internal error
+    /// detail never rides the client wire.
+    #[error("WatchBuild re-attach rejected as unauthenticated even after a session-token re-mint")]
+    ReattachAuthRejected,
+    /// live_064: the re-attach budget exhausted. The surfaced cause is
+    /// the LAST RE-ATTACH failure (what actually kept the watch from
+    /// resuming), never the benign stream EOF that opened the episode
+    /// — the incident's exhaustion message blamed a healthy scheduler
+    /// while the auth rejections never reached it. `last_reattach` is
+    /// a SANITIZED classification (fixed sentences + gRPC codes, built
+    /// at the recording sites); the full upstream Status bodies live
+    /// in the per-attempt operator warns, never on the client wire.
+    #[error("WatchBuild re-attach failed {attempts} times; last attempt: {last_reattach}")]
+    ReattachExhausted {
+        attempts: u32,
+        last_reattach: String,
+    },
 }
 
 // r[impl gw.reject.build-mode]
@@ -2102,11 +2134,22 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // tenure at the next death) — see `ReattachBudget`.
     budget.note_live_entered();
     let mut source = EventSource::Live(Box::new(event_stream));
-    // The most recent stream error, reported to the caller when the
-    // re-attach budget is exhausted (re-attach failures themselves are
-    // open errors, not stream errors — the original cause is the
-    // truthful one).
+    // The most recent stream error. live_064 demoted it from the
+    // exhaustion message to an operator-log field: the user-facing
+    // exhaustion cause is the LAST RE-ATTACH failure (what actually
+    // kept the watch down), while the stream-death classification —
+    // benign EOF vs transport vs resync — stays in the warn beside it.
     let mut last_stream_err = StreamProcessError::EofWithoutTerminal;
+    // live_064: the most recent re-attach failure, verbatim — the
+    // evidence the exhaustion message carries.
+    let mut last_reattach_err: Option<String> = None;
+    // live_064: the one-shot UNAUTHENTICATED re-mint. Armed (spent)
+    // at the first auth-rejected re-attach of an episode; a second
+    // auth rejection after the forced re-mint fails fast instead of
+    // burning the remaining budget on a verdict that cannot change.
+    // Reset on every successful re-attach so a later key rotation
+    // gets its own one-shot.
+    let mut unauth_remint_spent = false;
     let outcome = loop {
         match source {
             EventSource::Live(ref mut event_stream) => {
@@ -2125,6 +2168,18 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                     // (SSH closed) — scheduler is fine, there's no one to
                     // send the result to. Surface immediately.
                     Err(e @ StreamProcessError::Wire(_)) => {
+                        break Err(e);
+                    }
+                    // The re-attach verdicts are minted ONLY by the
+                    // NeedsReattach arm below — process_build_events
+                    // never constructs them. Named here (not a
+                    // wildcard) so the alphabet stays total; surfacing
+                    // unchanged is correct if a future refactor ever
+                    // routes one through this seam.
+                    Err(
+                        e @ (StreamProcessError::ReattachAuthRejected
+                        | StreamProcessError::ReattachExhausted { .. }),
+                    ) => {
                         break Err(e);
                     }
                     // Transport OR EofWithoutTerminal: both are failover
@@ -2306,38 +2361,80 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                                     event = ?other.event.as_ref().map(std::mem::discriminant),
                                     "WatchBuild first message was not the snapshot; discarding stream"
                                 );
+                                last_reattach_err =
+                                    Some("WatchBuild first message was not the snapshot".into());
                                 None
                             }
                             Ok(Ok(None)) => {
                                 tracing::warn!(%build_id, "WatchBuild stream closed before the snapshot");
+                                last_reattach_err =
+                                    Some("WatchBuild stream closed before the snapshot".into());
                                 None
                             }
                             Ok(Err(status)) => {
                                 tracing::warn!(%build_id, error = %status, "WatchBuild stream errored before the snapshot");
+                                last_reattach_err = Some(format!(
+                                    "WatchBuild stream errored before the snapshot ({})",
+                                    status.code()
+                                ));
                                 None
                             }
                             Err(_elapsed) => {
                                 tracing::warn!(%build_id, "WatchBuild accepted but served no snapshot in time");
+                                last_reattach_err = Some(
+                                    "WatchBuild accepted but served no snapshot in time".into(),
+                                );
                                 None
                             }
                         }
                     }
                     Err(wb_err) => {
-                        // WatchBuild failed. Could be: scheduler
-                        // still down (transient — next cycle
-                        // retries), OR build not found (recovery
-                        // didn't reconstruct it — terminal). We
-                        // can't distinguish without the error code
-                        // check; for simplicity, treat both as
-                        // retryable and let MAX_RECONNECT cap it.
+                        // live_064: an UNAUTHENTICATED open means the
+                        // CARRIED TOKEN was rejected (expired under a
+                        // rotated key, or revoked) — retrying with the
+                        // same material cannot succeed, and the
+                        // incident burned its whole budget doing
+                        // exactly that. One forced re-mint + an
+                        // immediate retry (no budget charge, no
+                        // backoff: the scheduler is healthy and
+                        // answering); a second rejection after the
+                        // re-mint fails fast with the auth evidence.
+                        if wb_err.code() == tonic::Code::Unauthenticated {
+                            if !unauth_remint_spent {
+                                unauth_remint_spent = true;
+                                session_jwt.note_rejected();
+                                tracing::warn!(
+                                    %build_id, error = %wb_err,
+                                    "WatchBuild re-attach rejected UNAUTHENTICATED; re-minting the session token and retrying immediately"
+                                );
+                                continue;
+                            }
+                            tracing::warn!(
+                                %build_id, error = %wb_err,
+                                "WatchBuild re-attach rejected UNAUTHENTICATED after a re-mint; failing the watch with the auth evidence"
+                            );
+                            break Err(StreamProcessError::ReattachAuthRejected);
+                        }
+                        // Other codes: scheduler still down (transient
+                        // — next cycle retries), OR build not found
+                        // (recovery didn't reconstruct it — terminal).
+                        // Treat both as retryable and let MAX_RECONNECT
+                        // cap it; the failure is recorded as the
+                        // exhaustion evidence.
                         tracing::warn!(%build_id, error = %wb_err,
                                       "WatchBuild reconnect attempt failed");
+                        last_reattach_err =
+                            Some(format!("WatchBuild open failed ({})", wb_err.code()));
                         None
                     }
                 };
                 match reattached {
                     Some(stream) => {
                         budget.note_live_entered();
+                        // A successful re-attach closes the auth
+                        // episode: a later rotation gets its own
+                        // one-shot re-mint.
+                        unauth_remint_spent = false;
                         source = EventSource::Live(Box::new(stream));
                     }
                     None => {
@@ -2349,7 +2446,22 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                         // back to).
                         let decision = budget.next_backoff(BackoffCause::ReattachCycleFailed);
                         if decision.exhausted {
-                            break Err(last_stream_err);
+                            // live_064: the surfaced cause is the last
+                            // RE-ATTACH failure (the auth evidence in
+                            // the incident); the stream-death
+                            // classification stays in the operator log
+                            // here, not in the user-facing message.
+                            tracing::warn!(
+                                %build_id,
+                                last_stream_error = %last_stream_err,
+                                "WatchBuild re-attach budget exhausted"
+                            );
+                            break Err(StreamProcessError::ReattachExhausted {
+                                attempts: decision.attempt,
+                                last_reattach: last_reattach_err.take().unwrap_or_else(|| {
+                                    "no re-attach attempt completed".to_string()
+                                }),
+                            });
                         }
                         tracing::debug!(
                             %build_id,
