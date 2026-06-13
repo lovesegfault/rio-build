@@ -50,7 +50,8 @@ module leaseCalib387BeliefGate {
     HOLDER_EVIDENCE_LOSE = false,
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
-    STEP_DOWN_COUNT_KEYED = false
+    STEP_DOWN_COUNT_KEYED = false,
+    CONFLICT_CLEARS_HOLD = false
   ).* from "../leaderElection"
 
   /// PRE-FIX shutdown: releases on BELIEF. The latch is the live
@@ -95,6 +96,7 @@ module leaseCalib387BeliefGate {
       deferralResolvedV' = deferralResolvedV,
       staleExhaustedLose' = staleExhaustedLose,
       blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
       acquireInstV' = acquireInstV,
       stepDownReqV' = stepDownReqV,
       stepDownsV' = stepDownsV,

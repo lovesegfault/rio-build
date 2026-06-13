@@ -54,7 +54,8 @@ module leaseCalib128CountKeyedStepDown {
     HOLDER_EVIDENCE_LOSE = false,
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 2,
-    STEP_DOWN_COUNT_KEYED = true
+    STEP_DOWN_COUNT_KEYED = true,
+    CONFLICT_CLEARS_HOLD = false
   ).* from "../leaderElection"
 
   /// Same fault economy as the live regime's stepDownStep — the only

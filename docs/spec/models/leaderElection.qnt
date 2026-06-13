@@ -1,5 +1,5 @@
 // -*- mode: Bluespec; -*-
-// quint-policy-latches: evidenceFabricated, evidenceConsumed
+// quint-policy-latches: evidenceFabricated, evidenceConsumed, holdClearedByConflict
 //
 // Phase-1 model of rio-lease's apiserver-CAS leader election protocol:
 // per-node monotonic clocks with bounded skew, the observed-record
@@ -351,6 +351,22 @@ module leaderElection {
   /// filing instance, independent of the keying) fires. false
   /// everywhere except the lease-128-count-keyed-stepdown twin.
   const STEP_DOWN_COUNT_KEYED: bool
+  /// Calibration hook for the bughunt-13 F7 twin: restore the
+  /// PRE-merged_bug_051/077 hold posture — a resolved 409 CLEARS the
+  /// graceful-release hold (the model carried that law for every
+  /// world until F7, justified by a stale citation of
+  /// on_observed_not_leading, the exact hold-clearing posture the
+  /// wave-10 production fix deliberately removed; the lib.rs doc at
+  /// on_believing_conflict warns that the stale name "invited a
+  /// refactor back to it" — the model WAS that refactor). Under the
+  /// live law (HOLDER_EVIDENCE_LOSE without the immediate-lose twin)
+  /// NO 409 clears the hold: an exhausted deferral takes the
+  /// self-fence posture (every exhausted round's read named us; the
+  /// shutdown release must still run), and only a completed read
+  /// RESOLVING not-leading clears. false everywhere except the
+  /// lease-f7-clear-hold-409 twin, whose shutdown+rv-mover regime
+  /// reds gracefulHandover under it.
+  const CONFLICT_CLEARS_HOLD: bool
 
   /// acquiredAt sentinel: "never acquired" (the TLA+ acquiredAt[n] =
   /// NULL). -1 can never equal a real rv (>= 0), mirroring a model
@@ -508,6 +524,26 @@ module leaderElection {
   /// lose. Writable only under CONFLICT_IMMEDIATE_LOSE (the twin
   /// toggle); loseRequiresHolderEvidence is its negation.
   var blindConflictLose: bool
+  /// History latch (bughunt-13 F7): a 409 CLEARED a held
+  /// graceful-release hold -- the pre-merged_bug_051/077 posture.
+  /// Written live at the conflict law site from the transition's own
+  /// values (the clearing branch taken against a held pre-state),
+  /// never a ghost assignment: under the live law
+  /// (HOLDER_EVIDENCE_LOSE without the immediate-lose twin) no 409
+  /// routes to the clearing branch, so the latch is unreachable; the
+  /// CONFLICT_CLEARS_HOLD twin toggle restores the branch and the
+  /// latch fires on the first exhausted (or evidence-free) 409
+  /// against a held hold. In the LEGACY worlds (gate off / the
+  /// immediate-lose twin) the clearing branch is the lawful pre-Q3
+  /// production model, so the latch may fire there lawfully -- which
+  /// is why noConflictClearedHold (its negation) is wired only in
+  /// live-law regimes. The
+  /// shutdown plane's gracefulHandover latch judges by the gate's
+  /// own spec (held) -- exactly the value this law corrupts -- so
+  /// the consequence latch goes blind under the broken law, and THIS
+  /// law-site latch is the detector (the blindConflictLose house
+  /// pattern).
+  var holdClearedByConflict: bool
   /// Ghost (merged_bug_002/bug_002): a resolving action -- own-commit
   /// fetch, the evidence-free holder=self act-failed read, self-fence,
   /// cooperative step-down -- fired while this node's 409
@@ -775,6 +811,16 @@ module leaderElection {
   /// trace; green once the clears scope the latch to the belief
   /// episode. Falsify evidence recorded in the fixing commit.
   val noStaleExhaustedLose = not(staleExhaustedLose)
+  /// bughunt-13 F7: no 409 ever clears a held graceful-release hold
+  /// under the live law -- a deferral is no transition, an exhausted
+  /// deferral takes the self-fence posture (hold KEPT for the
+  /// shutdown release; every exhausted round's read named us), and
+  /// only a completed read RESOLVING not-leading clears. Wired in
+  /// the shutdown+conflict regime, whose co-enabled rv-movers are
+  /// what unmasked the pre-F7 clear-on-409 law; the
+  /// lease-f7-clear-hold-409 twin restores that law and must
+  /// violate.
+  val noConflictClearedHold = not(holdClearedByConflict)
 
   /// sched.recovery.step-down instance law (merged_bug_128): a
   /// step-down is served only by the tenure instance that filed it.
@@ -1188,6 +1234,7 @@ module leaderElection {
     deferralResolvedV' = deferralResolvedV,
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -1288,6 +1335,7 @@ module leaderElection {
     deferralResolvedV' = deferralResolvedV,
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -1514,6 +1562,7 @@ module leaderElection {
       deferralResolvedV' = deferralResolvedV,
       staleExhaustedLose' = staleExhaustedLose,
       blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
       acquireInstV' =
         if (MAX_STEP_DOWNS == 0) acquireInstV
         else acquireInstV.put(n, acquireInstV.get(n) + 1),
@@ -1705,6 +1754,7 @@ module leaderElection {
       deferralResolvedV' = deferralResolvedV,
       staleExhaustedLose' = staleExhaustedLose,
       blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
       acquireInstV' =
         if (MAX_STEP_DOWNS == 0 or not(isEdge)) acquireInstV
         else acquireInstV.put(n, acquireInstV.get(n) + 1),
@@ -1770,6 +1820,25 @@ module leaderElection {
       leading.get(n),
       conflictDeferredV.get(n),
     }
+    // The hold verdict (bughunt-13 F7): under the live law NO 409
+    // clears -- the keep-gate covers exhausted loses (self-fence
+    // posture) and evidence-free non-believing conflicts
+    // (ConflictHoldKept) alike; a deferral keeps in every world (no
+    // transition happened). The clearing branch survives only in the
+    // legacy worlds (gate off / the immediate-lose twin, which model
+    // pre-fix production) and behind CONFLICT_CLEARS_HOLD, the F7
+    // falsify-twin toggle. The latch below records a clear landing on
+    // a HELD hold -- the law-site detector gracefulHandover cannot be
+    // (its latch judges by `held`, the value this very branch
+    // corrupts).
+    val clearsHold = and {
+      not(defers),
+      not(and {
+        HOLDER_EVIDENCE_LOSE,
+        not(CONFLICT_IMMEDIATE_LOSE),
+        not(CONFLICT_CLEARS_HOLD),
+      }),
+    }
     all {
       alive.get(n),
       pending.get(n) == NoPending,
@@ -1796,11 +1865,32 @@ module leaderElection {
       stealRetained' = stealRetained,
       stealBumpedForeignTie' = stealBumpedForeignTie,
       renewBumpedAboveEntry' = renewBumpedAboveEntry,
-      // A resolved 409 is a completed round resolving not-leading:
-      // the hold clears (production's on_observed_not_leading). A
-      // DEFERRED 409 keeps the hold -- no transition happened.
+      // The hold across a 409 (bughunt-13 F7 — the merged_bug_051/077
+      // posture, finally followed): under the live law
+      // (HOLDER_EVIDENCE_LOSE without the immediate-lose twin) NO 409
+      // ever clears the graceful-release hold. A deferral is no
+      // transition; an exhausted deferral runs the lose edge through
+      // the SELF-FENCE posture (production
+      // CompletedLoseEvidence::ConflictDeferralExhausted →
+      // on_self_fence: every exhausted round's read named us, so the
+      // apiserver state is unknown and the SIGTERM release must still
+      // run — a stale hold costs one holder-guarded round-trip; the
+      // pre-fix cleared hold on a lease still naming us cost the
+      // successor the full steal threshold); an evidence-free
+      // conflict while not believing takes the same posture
+      // (RoundEdge::ConflictHoldKept). Only a completed read
+      // RESOLVING not-leading clears (on_observed_not_leading —
+      // apiGet/loseObserved own that edge). The pre-051 hold-clearing
+      // posture survives in the legacy worlds (gate off / the
+      // immediate-lose twin, which model pre-fix production) and
+      // behind CONFLICT_CLEARS_HOLD, the F7 falsify-twin toggle. The
+      // previous law cleared on every resolved 409 in EVERY world,
+      // justified by a stale on_observed_not_leading citation — the
+      // refactor-back the production doc warned about, masked because
+      // no wired regime co-enabled shutdowns with rv-movers
+      // (leaderElectionShutdownConflict now does).
       pending' = pending,
-      held' = if (defers) held else trackHeld(held, n, false),
+      held' = if (clearsHold) trackHeld(held, n, false) else held,
       exited' = exited,
       suspends' = suspends, shutdowns' = shutdowns,
       releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
@@ -1823,6 +1913,7 @@ module leaderElection {
         if (not(HOLDER_EVIDENCE_LOSE)) conflictDeferredV
         else conflictDeferredV.put(n, defers),
       blindConflictLose' = (blindConflictLose or blindLose),
+      holdClearedByConflict' = (holdClearedByConflict or (clearsHold and held.get(n))),
       // A conflict either mints a FRESH deferral (nothing resolved it
       // yet) or consumes/clears the latch -- either way the node's
       // resolved-since ghost resets.
@@ -1897,6 +1988,7 @@ module leaderElection {
     deferralResolvedV' = deferralResolvedV,
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -1947,6 +2039,7 @@ module leaderElection {
     deferralResolvedV' = deferralResolvedV,
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     staleStepDownServed' = staleStepDownServed,
     lastFetchedContent' = lastFetchedContent,
@@ -2014,6 +2107,7 @@ module leaderElection {
       ),
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     stepDownsV' = stepDownsV,
     lastFetchedContent' = lastFetchedContent,
@@ -2072,6 +2166,7 @@ module leaderElection {
       ),
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2128,6 +2223,7 @@ module leaderElection {
     deferralResolvedV' = deferralResolvedV,
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV.put(n, 0),
     stepDownReqV' = stepDownReqV.put(n, NoStepDown),
     stepDownsV' = stepDownsV,
@@ -2169,6 +2265,7 @@ module leaderElection {
     deferralResolvedV' = deferralResolvedV,
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2222,6 +2319,7 @@ module leaderElection {
     deferralResolvedV' = deferralResolvedV,
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2273,6 +2371,7 @@ module leaderElection {
     deferralResolvedV' = deferralResolvedV,
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2318,6 +2417,7 @@ module leaderElection {
     deferralResolvedV' = deferralResolvedV,
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2382,6 +2482,7 @@ module leaderElection {
     deferralResolvedV' = deferralResolvedV,
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2485,6 +2586,7 @@ module leaderElection {
       ),
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2555,6 +2657,7 @@ module leaderElection {
       ),
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2585,6 +2688,7 @@ module leaderElection {
   /// in-flight protocol snapshots exactly like any other write (the
   /// CAS guard keys on rv), but MUST move neither the observed-record
   /// clock nor the evidence cursor — both key on content.
+  // Environment: a foreign metadata writer moving resourceVersion without protocol content (kubectl annotate, a co-tenant controller) — budgeted MAX_FOREIGN_BUMPS; the content keying (merged_bug_180) exists for exactly this actor
   action bumpRv = all {
     MAX_FOREIGN_BUMPS > 0,
     foreignBumps < MAX_FOREIGN_BUMPS,
@@ -2595,6 +2699,7 @@ module leaderElection {
     deferralResolvedV' = deferralResolvedV,
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2688,6 +2793,7 @@ module leaderElection {
     deferralResolvedV' = deferralResolvedV,
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2737,6 +2843,7 @@ module leaderElection {
   /// collision); only a held lease (deleting an unheld lease changes
   /// nothing any invariant constrains and only inflates the state space);
   /// rv headroom for the recreation's fresh resourceVersion.
+  // Environment: operator/infrastructure deleting the Lease object (kubectl delete lease) — budgeted MAX_DELETES; modeled as delete+immediate-empty-recreate (the collapsed 404→POST window)
   action deleteLease = all {
     deletes < MAX_DELETES,
     lease.holder != NoHolder,
@@ -2766,6 +2873,7 @@ module leaderElection {
     deferralResolvedV' = deferralResolvedV,
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2789,6 +2897,7 @@ module leaderElection {
   /// monotonic across stealers as long as nobody resets the transition
   /// count. Guarded by genHW > 0 (restoring an empty ledger changes
   /// nothing) and MAX_RESTORES.
+  // Environment: a PostgreSQL point-in-time restore regressing the claims ledger — the operator fault; budgeted by the genHW > 0 guard
   action pgRestore = all {
     restores < MAX_RESTORES,
     genHW > 0,
@@ -2813,6 +2922,7 @@ module leaderElection {
     deferralResolvedV' = deferralResolvedV,
     staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
+    holdClearedByConflict' = holdClearedByConflict,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
     stepDownsV' = stepDownsV,
@@ -2868,6 +2978,7 @@ module leaderElection {
     deferralResolvedV' = NODES.mapBy(_ => false),
     staleExhaustedLose' = false,
     blindConflictLose' = false,
+    holdClearedByConflict' = false,
     acquireInstV' = NODES.mapBy(_ => 0),
     stepDownReqV' = NODES.mapBy(_ => NoStepDown),
     stepDownsV' = 0,
@@ -2900,84 +3011,101 @@ module leaderElection {
   // names; the outer disjunct's nondet picks are still recorded.
 
   /// One node's clock advances.
+  // Environment: per-node local time advancing under MAX_SKEW — the clock plane's move; production has no transition here (renew scheduling rides tokio's interval)
   action tickAny = {
     nondet n = NODES.oneOf()
     tick(n)
   }
   /// One node GETs the lease.
+  // Mirrors: rio-lease/src/election.rs:fetch_and_decide
   action apiGetAny = {
     nondet n = NODES.oneOf()
     apiGet(n)
   }
   /// One node's decide()->Steal PUT lands.
+  // Mirrors: rio-lease/src/election.rs:replace
   action stealAny = {
     nondet n = NODES.oneOf()
     steal(n)
   }
   /// One node's decide()->Renew PUT lands.
+  // Mirrors: rio-lease/src/election.rs:replace
   action renewLeaseAny = {
     nondet n = NODES.oneOf()
     renewLease(n)
   }
   /// One node's PUT 409s against a stale snapshot.
+  // Mirrors: rio-lease/src/lib.rs:on_observed_not_leading
   action loseObservedAny = {
     nondet n = NODES.oneOf()
     loseObserved(n)
   }
+  // Mirrors: rio-lease/src/lib.rs:request_step_down
   action requestStepDownAny = {
     nondet n = NODES.oneOf()
     requestStepDown(n)
   }
+  // Mirrors: rio-lease/src/lib.rs:take_step_down_request
   action serveStepDownAny = {
     nondet n = NODES.oneOf()
     serveStepDown(n)
   }
+  // Mirrors: rio-lease/src/lib.rs:on_believing_conflict
   action conflictAny = {
     nondet n = NODES.oneOf()
     conflict(n)
   }
   /// One node's self-fence deadline fires.
+  // Mirrors: rio-lease/src/lib.rs:maybe_self_fence
   action selfFenceAny = {
     nondet n = NODES.oneOf()
     selfFence(n)
   }
   /// One node's process crashes.
+  // Environment: process death (OOM/SIGKILL/node loss) — the platform's move; no production transition fires
   action crashAny = {
     nondet n = NODES.oneOf()
     crash(n)
   }
   /// One crashed node's process restarts.
+  // Environment: process restart by the kubelet — the platform's move; the fresh process re-enters via the ordinary poll (apiGet/steal)
   action recoverAny = {
     nondet n = NODES.oneOf()
     recover(n)
   }
   /// One holder's split renew commits at send (suspend fault).
+  // Mirrors: rio-lease/src/election.rs:renew_phased
   action renewSendSteadyAny = {
     nondet n = NODES.oneOf()
     renewSendSteady(n)
   }
   /// One parked read completes (suspend fault).
+  // Mirrors: rio-lease/src/election.rs:renew_phased
   action renewReadOkAny = {
     nondet n = NODES.oneOf()
     renewReadOk(n)
   }
   /// One node receives SIGTERM (shutdown fault).
+  // Mirrors: rio-lease/src/election.rs:step_down
   action shutdownAny = {
     nondet n = NODES.oneOf()
     shutdown(n)
   }
   /// One holder-shaped PUT commits while its round fails after
   /// transmission (dropped-write fault).
+  // Environment: the network committing a transmitted PUT while dropping its response — the fault the UnconfirmedPut ledger exists for (rio-lease/src/lib.rs UnconfirmedPut); no production transition fires at the drop itself
   action renewSendDroppedAny = {
     nondet n = NODES.oneOf()
     renewSendDropped(n)
   }
+  // Environment: the network losing a transmitted PUT whole (no commit, no response) — the fault half with no protocol content moved; budgeted MAX_DROPS
   action renewSendLostAny = {
     nondet n = NODES.oneOf()
     renewSendLost(n)
   }
   /// One node's fetch observes its own committed-but-unconfirmed
   /// write (dropped-write fault's evidence rule).
+  // Mirrors: rio-lease/src/lib.rs:consume_own_commit_evidence
   action fetchObservesOwnCommitAny = {
     nondet n = NODES.oneOf()
     fetchObservesOwnCommit(n)
@@ -2985,6 +3113,7 @@ module leaderElection {
 
   /// One node's evidence-free believing holder=self completed read
   /// (bug_002 FunnelResolve cells).
+  // Mirrors: rio-lease/src/lib.rs:route_act_failed_read
   action actFailedHeldReadObservedAny = {
     nondet n = NODES.oneOf()
     actFailedHeldReadObserved(n)
@@ -3136,7 +3265,8 @@ module leaderElectionBase {
     HOLDER_EVIDENCE_LOSE = false,
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
-    STEP_DOWN_COUNT_KEYED = false
+    STEP_DOWN_COUNT_KEYED = false,
+    CONFLICT_CLEARS_HOLD = false
   ).*
 
   // --- deterministic protocol runs ---------------------------------------
@@ -3340,7 +3470,8 @@ module leaderElectionDeletion {
     HOLDER_EVIDENCE_LOSE = false,
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
-    STEP_DOWN_COUNT_KEYED = false
+    STEP_DOWN_COUNT_KEYED = false,
+    CONFLICT_CLEARS_HOLD = false
   ).*
 }
 
@@ -3436,7 +3567,8 @@ module leaderElectionAsymmetric {
     HOLDER_EVIDENCE_LOSE = false,
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
-    STEP_DOWN_COUNT_KEYED = false
+    STEP_DOWN_COUNT_KEYED = false,
+    CONFLICT_CLEARS_HOLD = false
   ).*
 }
 
@@ -3531,7 +3663,8 @@ module leaderElectionPgFaults {
     HOLDER_EVIDENCE_LOSE = false,
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
-    STEP_DOWN_COUNT_KEYED = false
+    STEP_DOWN_COUNT_KEYED = false,
+    CONFLICT_CLEARS_HOLD = false
   ).*
 }
 
@@ -3594,7 +3727,8 @@ module leaderElectionSuspend {
     HOLDER_EVIDENCE_LOSE = false,
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
-    STEP_DOWN_COUNT_KEYED = false
+    STEP_DOWN_COUNT_KEYED = false,
+    CONFLICT_CLEARS_HOLD = false
   ).*
 
   /// The suspend-straddle scenario, end to end: n1 acquires, its next
@@ -3662,7 +3796,8 @@ module leaderElectionShutdown {
     HOLDER_EVIDENCE_LOSE = false,
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
-    STEP_DOWN_COUNT_KEYED = false
+    STEP_DOWN_COUNT_KEYED = false,
+    CONFLICT_CLEARS_HOLD = false
   ).*
 
   /// Fence-then-SIGTERM releases: n1 acquires, goes blind past its
@@ -3766,7 +3901,8 @@ module leaderElectionDroppedWrite {
     HOLDER_EVIDENCE_LOSE = false,
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
-    STEP_DOWN_COUNT_KEYED = false
+    STEP_DOWN_COUNT_KEYED = false,
+    CONFLICT_CLEARS_HOLD = false
   ).*
 
   /// The mid-band step: no complete renew rounds (the regime's
@@ -3860,7 +3996,8 @@ module leaderElectionForeignRv {
     HOLDER_EVIDENCE_LOSE = false,
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
-    STEP_DOWN_COUNT_KEYED = false
+    STEP_DOWN_COUNT_KEYED = false,
+    CONFLICT_CLEARS_HOLD = false
   ).*
 
   /// The mid-band step plus the foreign mutator (same fault economy
@@ -3928,7 +4065,8 @@ module leaderElectionHolderEvidence {
     HOLDER_EVIDENCE_LOSE = true,
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 0,
-    STEP_DOWN_COUNT_KEYED = false
+    STEP_DOWN_COUNT_KEYED = false,
+    CONFLICT_CLEARS_HOLD = false
   ).*
 
   /// foreignRvStep plus the holder-evidenced resolution path.
@@ -4014,7 +4152,8 @@ module leaderElectionStepDown {
     HOLDER_EVIDENCE_LOSE = false,
     CONFLICT_IMMEDIATE_LOSE = false,
     MAX_STEP_DOWNS = 2,
-    STEP_DOWN_COUNT_KEYED = false
+    STEP_DOWN_COUNT_KEYED = false,
+    CONFLICT_CLEARS_HOLD = false
   ).*
 
   /// The base step plus the step-down pair.
@@ -4030,4 +4169,78 @@ module leaderElectionStepDown {
     requestStepDownAny,
     serveStepDownAny,
   }
+}
+
+// =========================================================================
+// The shutdown+conflict regime (bughunt-13 F7): graceful-exit fault
+// CO-ENABLED with rv-movers under the holder-evidence law — the
+// composition no wired regime carried, which is exactly what masked
+// the conflict hold-law divergence: the Shutdown regime had no 409s
+// that could reach a held believer (no rv-movers, gate off), so
+// gracefulHandover was verified over a space where the law never
+// fired. Here a foreign bumpRv bounces a believing holder's renew
+// (the one-round deferral), a second bump exhausts it (the lose edge
+// with the lease STILL naming the victim — its own write never
+// vacated), and the SIGTERM lands inside that zombie window: under
+// the fixed law the hold survived the exhausted lose (the self-fence
+// posture) and the release runs; under the pre-051 clear-on-409 law
+// (the lease-f7-clear-hold-409 twin) the release is skipped while
+// the apiserver still names the victim — releaseSkippedWhileHolder
+// latches and gracefulHandover falls.
+module leaderElectionShutdownConflict {
+  import leaderElection(
+    NODES = Set("n1", "n2"),
+    FENCE_AFTER = 2,
+    STEAL_AFTER = 5,
+    RENEW = 1,
+    MAX_SKEW = 1,
+    MAX_TIME = 8,
+    MAX_GEN = 4,
+    MAX_RV = 8,
+    MAX_DELETES = 0,
+    MAX_CLAIM_FAILURES = 0,
+    MAX_RESTORES = 0,
+    MAX_SUSPENDS = 0,
+    MAX_SHUTDOWNS = 1,
+    MAX_DROPS = 0,
+    MAX_FOREIGN_BUMPS = 2,
+    OBS_KEY_RV = false,
+    BLIND_HOLDER_BOUND = 0,
+    HOLDER_EVIDENCE_LOSE = true,
+    CONFLICT_IMMEDIATE_LOSE = false,
+    MAX_STEP_DOWNS = 0,
+    STEP_DOWN_COUNT_KEYED = false,
+    CONFLICT_CLEARS_HOLD = false
+  ).*
+
+  /// W13-O, end to end: the zombie-window SIGTERM. n1 acquires; a
+  /// foreign bump 409s its believing renew (the one-round deferral —
+  /// hold kept, no transition); a second bump exhausts it (the lose
+  /// edge through the SELF-FENCE posture — belief gone, HOLD KEPT:
+  /// every exhausted round's read named n1, the lease still does);
+  /// SIGTERM inside the window — the hold-gated release fires and
+  /// clears the holder the apiserver still attributes to n1. Under
+  /// the pre-051 law the exhaust cleared the hold and this exact
+  /// schedule skipped the release (the twin's falsification).
+  run zombieConflictSigtermReleasesRun =
+    init
+      .then(apiGet("n1"))
+      .then(steal("n1"))
+      .then(apiGet("n1"))
+      .then(bumpRv)
+      .then(conflict("n1"))
+      .then(apiGet("n1"))
+      .then(bumpRv)
+      .then(conflict("n1"))
+      .expect(all {
+        not(leading.get("n1")),
+        lease.holder == Held("n1"),
+        held.get("n1"),
+      })
+      .then(shutdown("n1"))
+      .expect(all {
+        lease.holder == NoHolder,
+        exited.get("n1"),
+        gracefulHandover,
+      })
 }

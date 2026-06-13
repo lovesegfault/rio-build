@@ -1391,6 +1391,48 @@ rec {
       ];
     };
 
+    # The shutdown+conflict regime (bughunt-13 F7): graceful exit
+    # CO-ENABLED with rv-movers under the holder-evidence law — the
+    # composition no wired regime carried, which is exactly what
+    # masked the pre-F7 conflict hold-law divergence (the model
+    # cleared the graceful-release hold on every resolved 409, the
+    # pre-merged_bug_051/077 posture, justified by a stale citation of
+    # on_observed_not_leading — the hold-clearing transition the
+    # wave-10 production fix deliberately removed). Headlines:
+    # gracefulHandover (the zombie-window SIGTERM still releases — its
+    # latch judges by `held`, so it discriminates only under the FIXED
+    # law) and noConflictClearedHold (the LAW-SITE latch: no 409 ever
+    # clears a held hold under the live law — the detector the
+    # consequence latch cannot be, because the broken law corrupts the
+    # very `held` the consequence latch trusts). The
+    # zombieConflictSigtermReleasesRun pins the release end
+    # deterministically; the paired pin is
+    # quint-lease-calib-f7-clear-hold-409 (the clear-on-409 law
+    # restored must trip the law-site latch). Measured: exhaustive TLC
+    # ~265s at the wired constants — the default 1800s budget is ~6x
+    # headroom.
+    quint-leader-election-shutdown-conflict = mkQuintCheck {
+      name = "leader-election-shutdown-conflict";
+      spec = "leaderElection";
+      main = "leaderElectionShutdownConflict";
+      invariants = [
+        "boundsOK"
+        "neverDual"
+        "gracefulHandover"
+        "noConflictClearedHold"
+      ];
+    };
+
+    # The W13-O run: the zombie-window SIGTERM end to end — deferral,
+    # exhausted lose with the hold KEPT (self-fence posture), release
+    # fires against the lease that still names the victim.
+    quint-leader-election-runs-shutdown-conflict = mkQuintRunCheck {
+      name = "leader-election-runs-shutdown-conflict";
+      spec = "leaderElection";
+      main = "leaderElectionShutdownConflict";
+      match = "zombieConflictSigtermReleasesRun";
+    };
+
     # Non-vacuity witnesses for the two new regimes (same discipline as
     # the witness block above: each check passes only when the checker
     # VIOLATES the witness, proving the guarded scenario reachable).
@@ -1998,6 +2040,24 @@ rec {
       main = "leaseCalib303BlindTimeout";
       witness = "blindHolderBounded";
       step = "calibStep";
+      extraSpecs = [ "leaderElection" ];
+    };
+
+    # bughunt-13 audit F7 pre-fix: CLEAR-ON-409 — CONFLICT_CLEARS_HOLD
+    # restores the pre-merged_bug_051/077 hold posture inside the
+    # shutdown+conflict regime. An exhausted believing 409 (its every
+    # read still naming the victim; the lease never vacated) clears
+    # the graceful-release hold; the LAW-SITE latch fires
+    # (noConflictClearedHold falls) — the consequence latch
+    # (gracefulHandover) cannot see this corruption because it judges
+    # by the very `held` the broken law clears. The skipped-release /
+    # full-steal-threshold production cost the wave-10 fix paid down,
+    # frozen as the regression pin.
+    quint-lease-calib-f7-clear-hold-409 = mkQuintWitnessCheck {
+      name = "lease-calib-f7-clear-hold-409";
+      spec = "calibration/lease-f7-clear-hold-409";
+      main = "leaseCalibF7ClearHold409";
+      witness = "noConflictClearedHold";
       extraSpecs = [ "leaderElection" ];
     };
 

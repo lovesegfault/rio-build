@@ -951,20 +951,32 @@ fn loop_shim_base_regime_correspondence() {
                  the divergence is the regime boundary, by design"
             );
         } else {
-            // The SECOND documented divergence (merged_bug_051): the
-            // base-regime arm folds every not-believing resolution to
-            // observed-not-leading (clearing the model's `held`), while
-            // production prices the evidence-free conflict per the
-            // read's own facts — a 409 whose GET names us keeps the
-            // graceful-release hold (self-fence posture). Invisible to
-            // the MBT projection (lease/leading/gen — the hold is not
-            // projected); the loop-level tokio tests own the hold law.
+            // The SECOND documented divergence (merged_bug_051),
+            // RE-SCOPED by the bughunt-13 F7 model fix: the model's
+            // HOLDER-EVIDENCE law now keeps the graceful-release hold
+            // across every 409 (deferral, exhausted lose via the
+            // self-fence posture, and the evidence-free ConflictHoldKept
+            // arm alike — leaderElection.qnt's conflict `clearsHold`
+            // verdict, with the law-site latch holdClearedByConflict and
+            // the shutdown+conflict regime discriminating it), exactly
+            // matching the production posture this assertion pins. The
+            // divergence that REMAINS is the base-regime boundary by
+            // design: the LEGACY worlds (HOLDER_EVIDENCE_LOSE = false —
+            // the regime this driver replays) still model the pre-Q3
+            // clear-on-resolution protocol, so the driver's base-regime
+            // arm folds every not-believing resolution to
+            // observed-not-leading. Invisible to the MBT projection
+            // (lease/leading/gen — the hold is not projected); the
+            // loop-level tokio tests and the
+            // quint-leader-election-shutdown-conflict regime own the
+            // live hold law.
             assert_eq!(
                 plan.edge,
                 RoundEdge::ConflictHoldKept,
                 "production keeps the hold on an evidence-free conflict \
-                 (the driver's base-regime arm clears — the divergence is \
-                 the regime boundary, by design)"
+                 (the driver's LEGACY base-regime arm clears — the \
+                 divergence is the regime boundary, by design; the \
+                 holder-evidence model law keeps, since F7)"
             );
         }
     }
