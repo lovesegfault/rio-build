@@ -233,18 +233,27 @@ impl InfeasibleReason {
 /// Which of the four ceiling reasons bound at the loosest bounded tier
 /// when [`solve_tier`] / [`solve_full`] fell through to `BestEffort`.
 /// Mirrors `solve_tier`'s per-tier reject gates so the metric label
-/// matches what `sla explain` shows. `InterruptRunaway` /
-/// `CapacityExhausted` are gated separately by callers (those need λ /
-/// ICE state this fn doesn't see).
+/// matches what `sla explain` shows — the disk arm BY CONSTRUCTION
+/// (it imports the gates' own `exceeds_ceiling` predicate on the raw
+/// face; bug_012 killed the term-identical copy), the core/mem/serial
+/// arms via the shared `explain_envelope`/`mem.at` terms.
+/// `InterruptRunaway` / `CapacityExhausted` are gated separately by
+/// callers (those need λ / ICE state this fn doesn't see).
 pub fn classify_ceiling(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> InfeasibleReason {
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
     let h = headroom(fit.n_eff_ring);
-    // The metric mirrors the POST-fork solve gates: the RAW reject
-    // face (sched.sla.disk-polarity-fork) — a floored consult here
+    // bug_012: the metric classifier IMPORTS the gate predicate —
+    // consumers import, never re-derive. The disk arm reads the SAME
+    // single-sourced raw-face predicate as solve_tier/evaluate_cell/
+    // explain (sched.sla.disk-polarity-fork), so "mirrors the solve
+    // gates" is true BY CONSTRUCTION, not by term-identical copy: a
+    // future predicate change propagates here without a sweep, and a
+    // floored re-bind no longer type-checks (the argument-provenance
+    // assert IS the signature — R31'(c)). A floored consult here
     // would mislabel the `(ceiling/1.2, ceiling]` band's core/mem/
     // serial demotions as DiskCeiling (merged_bug_002's fourth
-    // reject-direction reader, bug_012's drift hazard).
-    if fit.disk_p90_raw.is_some_and(|d| d.bytes() > ceil.max_disk) {
+    // reject-direction reader).
+    if fit::DiskFitEnvelope::exceeds_ceiling(fit.disk_p90_raw, ceil.max_disk) {
         return InfeasibleReason::DiskCeiling;
     }
     // Loosest bounded tier — the last one solve_tier's reject-not-clamp
@@ -3043,6 +3052,46 @@ mod tests {
         };
         assert_eq!(disk_bytes.bytes(), 200 << 30, "clamped");
         assert_eq!(why, InfeasibleReason::DiskCeiling);
+    }
+
+    // r[verify sched.sla.disk-polarity-fork]
+    /// **W13-U2 (bug_012; populations named exactly)** — *the metric
+    /// classifier mirrors the post-fork gates through the imported
+    /// predicate.* OFF the band (raw above the ceiling): DiskCeiling —
+    /// parity with the gates, byte-stable across the delegation (the
+    /// classifier was re-bound to the raw face with the gates at the
+    /// fork commit, so the envelope delegation is the identical
+    /// predicate). ON the band INTERSECT the non-disk-demoted
+    /// population (raw <= ceiling < floored; demotion driven by the
+    /// serial floor): the relabel IS the fix — the formerly mislabeled
+    /// DiskCeiling classifies as the true binding axis.
+    #[test]
+    fn w13_u2_classifier_band_populations() {
+        const GI: u64 = 1 << 30;
+        // OFF-band: raw 300 GiB > 200 GiB ceiling.
+        let mut fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        fit.disk_p90 = Some(DiskBytes(300 * GI));
+        fit.disk_p90_raw = Some(RawDiskP90(DiskBytes(300 * GI)));
+        assert_eq!(
+            classify_ceiling(&fit, &[t("normal", 1200.0)], &ceil()),
+            InfeasibleReason::DiskCeiling,
+            "off-band: the raw face exceeds the ceiling — DiskCeiling \
+             (parity with solve_tier/evaluate_cell)"
+        );
+        // ON-band, non-disk-demoted: raw 190 <= 200 < floored 228;
+        // the BestEffort cause is the serial floor (s=2000 > 1200s
+        // bound at every c).
+        let mut fit = mk_fit(2000.0, 100.0, 0.0, f64::INFINITY, 0.1);
+        fit.disk_p90 = Some(DiskBytes(228 * GI));
+        fit.disk_p90_raw = Some(RawDiskP90(DiskBytes(190 * GI)));
+        assert_eq!(
+            classify_ceiling(&fit, &[t("normal", 1200.0)], &ceil()),
+            InfeasibleReason::SerialFloor,
+            "on-band intersect non-disk-demoted: the true binding \
+             axis, never the floored-face DiskCeiling mislabel \
+             (pre-fork: rio_scheduler_sla_infeasible_total mislabeled \
+             this population disk_ceiling)"
+        );
     }
 
     proptest! {

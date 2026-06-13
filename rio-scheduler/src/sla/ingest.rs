@@ -2800,15 +2800,17 @@ mod disk_axis_tests {
             // The producer: mint shapes only — the producer never
             // CONSUMES a polarity direction.
             "ingest" => vec![(("floored", "mint"), 7), (("raw", "mint"), 4)],
-            // solve: the tier gate + the per-cell gate read raw via
-            // exceeds_ceiling; classify_ceiling's open-coded compare
-            // is the committed bug_012 residual this table drives to
-            // zero at the delegation commit; four envelope mints read
+            // solve: the tier gate, the per-cell gate, AND the metric
+            // classifier (bug_012: delegated — consumers import,
+            // never re-derive) read raw via exceeds_ceiling; the
+            // reject-opencoded class is DRIVEN TO ZERO and stays
+            // there (an open-coded ordering compare on disk evidence
+            // is the bug_012 drift hazard — re-derive consciously or
+            // route through the predicate); four envelope mints read
             // the floored sizing face; the solve-relevance hash
             // narrates BOTH faces.
             "solve" => vec![
-                (("raw", "reject"), 2),
-                (("raw", "reject-opencoded"), 1),
+                (("raw", "reject"), 3),
                 (("raw", "narration"), 1),
                 (("floored", "sizing"), 4),
                 (("floored", "narration"), 1),
@@ -2892,6 +2894,28 @@ mod disk_axis_tests {
             got.len(),
             disk_polarity_expectation("strawman").len(),
             "…and it drifts from the committed empty row — RED"
+        );
+        // (b1') W13-U — the bug_012 strawman: a classify_* helper
+        // RE-DERIVING the gate predicate as an open-coded compare.
+        // The walk classifies it reject-opencoded; the committed
+        // table holds that class at ZERO, so the divergence REDs —
+        // the drift hazard (a classifier copy drifting from the gate
+        // predicate) is killed structurally, and the lawful close is
+        // importing the predicate (consumers import, never
+        // re-derive).
+        let classify = "fn classify_strawman(fit: &FittedParams, ceil: &Ceilings) -> bool {\n    fit.disk_p90_raw.is_some_and(|d| d.bytes() > ceil.max_disk)\n}\n";
+        let got = scan_disk_polarity("classify", classify, false).unwrap();
+        assert_eq!(
+            got,
+            vec![("raw", "reject-opencoded")],
+            "the walk classifies the open-coded re-derivation"
+        );
+        assert!(
+            !disk_polarity_expectation("solve")
+                .iter()
+                .any(|((_, d), _)| *d == "reject-opencoded"),
+            "the committed table holds reject-opencoded at ZERO — the \
+             strawman drifts RED (W13-U)"
         );
         // (b2) JURISDICTION plant: shared with the weight census —
         // a declared module outside the corpus REDs the completeness
