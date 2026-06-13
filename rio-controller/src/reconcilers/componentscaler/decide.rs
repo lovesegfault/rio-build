@@ -226,6 +226,27 @@ pub fn decide(
         .clamp(RATIO_FLOOR, RATIO_CEILING);
     let LoadThresholds { high, low } = spec.load_thresholds;
 
+    // Effective replica bounds derive ONCE, at the boundary, before
+    // ANY reader (parse-don't-validate; bug_052): defensive min>max
+    // swap and >=0 floor (CEL enforces both, but a pre-CEL CRD or
+    // --validate=false bypass would otherwise panic on i32::clamp /
+    // patch a negative /scale -> 422 -> error-loop with no apply-time
+    // feedback; bug_027's leaked -2 came from per-site re-flooring).
+    // Tolerance is a property of the INPUT, not of one consumer -- a
+    // normalization living inside the clamp made the evidence gate
+    // (raw `spec.replicas.min`) and the clamp (swapped+floored)
+    // disagree on exactly the misconfig population the normalization
+    // exists to tolerate: under min>max the gate demanded
+    // `current > raw min`, unreachable under the swapped clamp, and
+    // ratio learning silently froze (wave-12's relocation of the
+    // gate preserved the raw read -- the free hoist missed).
+    let (min, max) = if spec.replicas.min > spec.replicas.max {
+        (spec.replicas.max, spec.replicas.min)
+    } else {
+        (spec.replicas.min, spec.replicas.max)
+    };
+    let (min, max) = (min.max(0), max.max(0));
+
     // Predictive: ceil(builders / ratio). f64 ceil is fine here —
     // builders fits in f64's 53-bit mantissa for any realistic count
     // (a u64 > 2^53 builders is not a thing).
@@ -245,7 +266,7 @@ pub fn decide(
     // NOT "each replica handles more than we thought" — growing on
     // that conflation inflates the ratio unboundedly over an idle
     // weekend (1.02^576 ≈ 88,000×; bug_288).
-    let working = builders > 0 && current > spec.replicas.min;
+    let working = builders > 0 && current > min;
     // The genuinely evidence-ambiguous cell (working, low-side
     // unknown — sensor absent or partial-coverage low): the bank is
     // preserved DECAY-BOUNDED ([`AMBIGUOUS_TICK_EVIDENCE_DECAY`], the
@@ -334,20 +355,9 @@ pub fn decide(
         None => (predicted, ratio_in, ambiguous_ticks()),
     };
 
-    // Clamp. Defensive min>max swap and ≥0 floor (CEL enforces both,
-    // but a pre-CEL CRD or --validate=false bypass would panic on
-    // i32::clamp / patch the /scale subresource with a negative value
-    // → 422 → reconciler error-loops with no apply-time feedback).
-    // Floor the BOUNDS once here so every `clamp(min,max)` /
-    // `.min(max)` downstream is intrinsically ≥0 — avoids re-applying
-    // `.max(0)` at each producer site (one of three was missed and
-    // leaked −2 through the stabilized branch; bug_027).
-    let (min, max) = if spec.replicas.min > spec.replicas.max {
-        (spec.replicas.max, spec.replicas.min)
-    } else {
-        (spec.replicas.min, spec.replicas.max)
-    };
-    let (min, max) = (min.max(0), max.max(0));
+    // Clamp to the boundary-normalized bounds (derived once above —
+    // every `clamp(min,max)` / `.min(max)` downstream is
+    // intrinsically >=0; bug_027).
     let mut desired = raw_desired.clamp(min, max);
 
     // Scale-down safety: 5m stabilization since last UP, then max
@@ -933,6 +943,57 @@ mod tests {
         // And the expired bank never under-flows.
         let d = decide(&s, &st, 4, 200, None, None);
         assert_eq!(d.low_load_ticks, 0);
+    }
+
+    /// W13-AH (bug_052) — proposition: effective bounds derive ONCE
+    /// at the boundary and every reader consumes the normalized
+    /// pair; population: the min>max CEL-bypass band, where the
+    /// clamp keeps `current` in the swapped range so a raw-min gate
+    /// is unsatisfiable at every scaler-reachable count. Pre-fix RED
+    /// (verbatim in the commit body): zero evidence ticks across the
+    /// band (left: 0, right: 1) — ratio learning silently frozen.
+    #[test]
+    fn w13_ah_swapped_bounds_gate_must_stay_satisfiable() {
+        let s = spec(5, 2); // min>max: effective bounds are [2,5].
+        // current=4 is inside the effective band and above the
+        // effective min — a working low tick MUST accrue evidence.
+        let d = decide(&s, &status(Some(50.0), 0), 4, 200, total(0.1), None);
+        assert_eq!(
+            d.low_load_ticks, 1,
+            "the evidence gate must read the SAME normalized bounds \
+             the clamp enforces (raw min=5 makes the gate demand \
+             current>5, unreachable under the [2,5] clamp)"
+        );
+        // The full law still fires across the band: a banked streak
+        // at threshold grows the ratio under the normalized gate.
+        let d = decide(
+            &s,
+            &status(Some(50.0), LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1),
+            4,
+            200,
+            total(0.1),
+            None,
+        );
+        assert_eq!(d.learned_ratio, 50.0 * RATIO_GROWTH_ON_LOW);
+    }
+
+    /// W13-AH2 — well-formed specs byte-stable, and the swapped
+    /// CLAMP face unchanged (the normalization MOVED to the
+    /// boundary; its tolerance semantics did not change).
+    #[test]
+    fn w13_ah2_normalization_byte_stable() {
+        // Well-formed: the gate semantics match the raw read.
+        let s = spec(2, 14);
+        let d = decide(&s, &status(Some(50.0), 3), 4, 200, total(0.1), None);
+        assert_eq!((d.low_load_ticks, d.desired), (4, 4));
+        // at-min stays non-working under the normalized min.
+        let d = decide(&s, &status(Some(50.0), 3), 2, 200, total(0.1), None);
+        assert_eq!(d.low_load_ticks, 0, "current==min: non-evidence reset");
+        // Swapped bounds: desired still clamps into the effective
+        // [2,5] band exactly as before the hoist.
+        let s = spec(5, 2);
+        let d = decide(&s, &status(None, 0), 0, 10_000, None, None);
+        assert_eq!(d.desired, 5, "clamp face unchanged under min>max");
     }
 
     /// `RATIO_CEILING` bounds both the read site (a pre-fix inflated
