@@ -186,6 +186,7 @@
       "IfdRequest",
       "RecycleNotice",
       "AttrsetExpansion",
+      "Note",
       "WorkerError"
     ],
     "doc": "Worker-channel frames for the `rio build` coordinator ↔ eval-parent IPC (ADR-024 \"IPC\"): each edge is one socketpair(AF_UNIX, SOCK_STREAM); frames are length-delimited proto on the stream (a 4-byte big-endian length prefix, then the encoded message — the framing lives client-side in `rio-build-cli::framing`, NOT in tonic: this channel is a pipe between two local processes, not an RPC surface)."

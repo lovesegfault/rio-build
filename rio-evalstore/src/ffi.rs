@@ -930,6 +930,32 @@ pub unsafe extern "C" fn rio_emit_result(
     })
 }
 
+/// Emit a free-form `Note` frame on `fd` (the coordinator channel
+/// during the eval parent's pre-fork warmup): one-line progress text
+/// — libnix fetch-activity start lines — that the coordinator
+/// surfaces verbatim via the renderer's Note path.
+///
+/// # Safety
+/// Standard contract; `text` is a NUL-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rio_emit_note(
+    fd: c_int,
+    text: *const c_char,
+    err: *mut *mut c_char,
+) -> c_int {
+    guard(err, || {
+        // SAFETY: caller contract.
+        let text = unsafe { req_str(text) }?.to_string();
+        let msg = rio_proto::evaljob::WorkerFrame {
+            msg: Some(rio_proto::evaljob::worker_frame::Msg::Note(
+                rio_proto::evaljob::Note { text },
+            )),
+        };
+        crate::evaljob::framing::write_frame(&mut crate::evaljob::framing::FdIo(fd), &msg)
+            .map_err(EvalStoreError::Io)
+    })
+}
+
 /// Send an `AttrsetExpansion` frame for `attr` on `fd`: the attr
 /// resolved to an attrset rather than a derivation, and `children` are
 /// the full attr paths of its derivation children (the coordinator

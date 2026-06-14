@@ -408,6 +408,11 @@ impl Coordinator {
                     worker_frame::Msg::Recycle(n) => {
                         debug!(generation = n.generation, "eval worker recycled");
                     }
+                    worker_frame::Msg::Note(n) => {
+                        // Pre-fork warmup progress (libnix fetch
+                        // activity) — visibility only.
+                        self.render.note(n.text);
+                    }
                     worker_frame::Msg::Error(e) => {
                         if e.fatal {
                             bail!("eval parent failed: {}", e.message);

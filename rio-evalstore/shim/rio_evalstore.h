@@ -272,6 +272,11 @@ int rio_emit_expansion(
     size_t n_skipped,
     char ** err);
 
+/* Send a free-form Note frame on `fd` (the coordinator channel during
+ * the eval parent's pre-fork warmup): one-line progress text the
+ * coordinator surfaces verbatim. */
+int rio_emit_note(int fd, const char * text, char ** err);
+
 /* Relay an import-from-derivation to the coordinator and BLOCK until
  * it resolves. On success the outputs are imported into this worker's
  * eval store and *out_json is a JSON array of output store paths. */

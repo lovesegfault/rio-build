@@ -74,6 +74,9 @@ struct Summary {
     expansions: Vec<(String, Vec<String>)>,
     /// Children skipped by expansions (not derivations, not recursable).
     skipped: Vec<String>,
+    /// Pre-fork warmup progress notes (libnix fetch-activity start
+    /// lines forwarded as `Note` frames).
+    notes: Vec<String>,
     recycles: usize,
     total_nodes: usize,
 }
@@ -124,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
         faults: vec![],
         expansions: vec![],
         skipped: vec![],
+        notes: vec![],
         recycles: 0,
         total_nodes: 0,
     };
@@ -221,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
                 summary.expansions.push((exp.attr, exp.children));
             }
             worker_frame::Msg::Recycle(_) => summary.recycles += 1,
+            worker_frame::Msg::Note(n) => summary.notes.push(n.text),
             worker_frame::Msg::Error(e) => {
                 if e.fatal {
                     bail!("eval parent fatal: {}", e.message);
