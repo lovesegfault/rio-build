@@ -117,6 +117,46 @@ merely until upload-ack, as the ADR's coordinator sketch suggests): stale-ack
 recovery must re-upload from memory, and drvs are memory-only client-side ---
 a body dropped at ack time would force a full re-eval to recover.
 
+= Rendering
+
+#r("bc.render.stdout-results")[
+  Stdout MUST carry only the final result lines (`attr: built /nix/store/...`,
+  `fetched to ...`, `cancelled <id>`); every status, log and diagnostic line
+  goes to stderr.
+]
+
+This is the machine-readable surface --- a piped invocation gets clean
+result paths and nothing else.
+
+#r("bc.render.select")[
+  The `--render` mode `auto` MUST pick `tty` when stderr and stdin are
+  both ttys and `TERM` is set and not `dumb`; otherwise `ci` when
+  `GITHUB_ACTIONS=true`; otherwise `plain`.
+]
+
+#r("bc.render.plain-default")[
+  The `plain` renderer MUST keep the one-line-per-state-edge format
+  (`[<id8>] <state> <drv>`) on stderr.
+]
+
+The format is a compatibility surface for scripts and the VM test.
+
+#r("bc.render.sanitize")[
+  Every emitted build-derived string (log lines, phase, error message,
+  diagnostic notes) MUST be sanitized (SGR-only ANSI, no other control
+  characters, length-capped) and MUST be prefixed so no line can start
+  with `::`.
+]
+
+The prefix neutralises Actions `::endgroup::` / `::add-mask::`
+injection from build output; the sanitizer guarantees no CR/LF survives
+to fabricate a fresh line start.
+
+#r("bc.render.tty-restore")[
+  Terminal attributes (termios, cursor visibility) MUST be restored on
+  every exit path, including panic and SIGINT.
+]
+
 = Attach, detach, results
 
 #r("bc.interrupt.cancel-default")[

@@ -246,6 +246,7 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
         // Outcome lines were already printed by the detach path.
         return Ok(());
     }
+    // r[impl bc.render.stdout-results]
     let mut failed = false;
     for o in &summary.outcomes {
         match &o.state {
