@@ -1014,17 +1014,22 @@ mod ffi_smoke {
         0
     }
 
+    /// `ctx` is the store-path name as a NUL-terminated C string;
+    /// computes the recursive fixed-output path from `nar_sha256`.
     unsafe extern "C" fn path_cb(
-        _ctx: *mut c_void,
+        ctx: *mut c_void,
         hashes_json: *const c_char,
         out_path: *mut c_char,
         out_cap: usize,
     ) -> c_int {
+        let name = unsafe { CStr::from_ptr(ctx.cast::<c_char>()) }
+            .to_str()
+            .unwrap();
         let json = unsafe { CStr::from_ptr(hashes_json) }.to_str().unwrap();
         let hashes: BTreeMap<String, serde_json::Value> = serde_json::from_str(json).unwrap();
         let nar_hex = hashes["nar_sha256"].as_str().unwrap();
         let h = NixHash::new(HashAlgo::SHA256, hex::decode(nar_hex).unwrap()).unwrap();
-        let path = StorePath::make_fixed_output("ffi-sample", &h, true, &[]).unwrap();
+        let path = StorePath::make_fixed_output(name, &h, true, &[]).unwrap();
         let cpath = CString::new(path.as_str()).unwrap();
         let bytes = cpath.as_bytes_with_nul();
         if bytes.len() > out_cap {
@@ -1078,7 +1083,7 @@ mod ffi_smoke {
                 read_cb,
                 (&raw mut read_state).cast::<c_void>(),
                 path_cb,
-                std::ptr::null_mut(),
+                name.as_ptr().cast_mut().cast::<c_void>(),
                 &mut out_json,
                 &mut err,
             )
@@ -1154,6 +1159,80 @@ mod ffi_smoke {
         assert_eq!(rc, RIO_UNSUPPORTED);
         let msg = take_string(err).expect("error message");
         assert!(msg.contains("M1"), "{msg}");
+
+        unsafe { rio_store_free(store) };
+        Ok(())
+    }
+
+    /// `rio_add_source_tree` end to end: ingests a local tree through
+    /// the two-plane pipeline, returns the cross-checked path as JSON,
+    /// and reads file bytes back from the origin.
+    #[test]
+    fn add_source_tree_through_ffi() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cas = CString::new(dir.path().join("cas").to_str().unwrap())?;
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree)?;
+        std::fs::write(tree.join("data.txt"), b"tree payload\n")?;
+
+        let mut store: *mut EvalStore = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { rio_store_open(cas.as_ptr(), &mut store, &mut err) },
+            RIO_OK,
+            "{:?}",
+            take_string(err)
+        );
+
+        let fs_path = CString::new(tree.to_str().unwrap())?;
+        let name = CString::new("ffi-tree")?;
+        let refs = CString::new("[]")?;
+        let mut out_json: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe {
+            rio_add_source_tree(
+                store,
+                fs_path.as_ptr(),
+                name.as_ptr(),
+                refs.as_ptr(),
+                path_cb,
+                name.as_ptr().cast_mut().cast::<c_void>(),
+                &mut out_json,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, RIO_OK, "{:?}", take_string(err));
+        let result: BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(&take_string(out_json).expect("result json"))?;
+        let path = result["path"].as_str().unwrap().to_string();
+
+        // Independent recomputation from rio-nix's own dump.
+        let mut dump = Vec::new();
+        nar::dump_path_streaming(&tree, &mut dump)?;
+        let h = NixHash::new(HashAlgo::SHA256, Sha256::digest(&dump).to_vec())?;
+        assert_eq!(
+            path,
+            StorePath::make_fixed_output("ffi-tree", &h, true, &[])?.as_str()
+        );
+
+        // Read-back through FFI serves bytes from the origin tree.
+        let basename = path.strip_prefix("/nix/store/").unwrap();
+        let cbase = CString::new(basename)?;
+        let rel = CString::new("data.txt")?;
+        let mut content: Vec<u8> = Vec::new();
+        assert_eq!(
+            unsafe {
+                rio_read_file(
+                    store,
+                    cbase.as_ptr(),
+                    rel.as_ptr(),
+                    write_cb,
+                    (&raw mut content).cast::<c_void>(),
+                    &mut err,
+                )
+            },
+            RIO_OK
+        );
+        assert_eq!(content, b"tree payload\n");
 
         unsafe { rio_store_free(store) };
         Ok(())

@@ -29,6 +29,7 @@
 #include "nix/util/serialise.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/util/source-path.hh"
+#include "nix/fetchers/filtering-source-accessor.hh"
 
 #include <nlohmann/json.hpp>
 
@@ -537,28 +538,66 @@ struct RioStore : virtual Store
         PathFilter & filter = defaultPathFilter,
         RepairFlag repair = NoRepair) override
     {
-        /* Stat-fingerprint shortcut: a physical source whose fingerprint
-         * matches a prior ingest (same name + method + refs) skips the
-         * dump entirely. Only valid with the default filter (a custom
-         * filter changes content independently of the file stats), only
-         * for regular files (directory mtimes don't reflect child edits),
-         * and never for repair (repair means re-ingest unconditionally). */
+        /* A physical source is one whose raw on-disk tree IS what nix is
+         * adding: a filesystem accessor whose subtree view equals raw fs,
+         * and the all-pass filter (a custom filter changes content
+         * independently of the tree). The filter check must be by closure
+         * TYPE, not address: fetchToStore passes a local COPY of
+         * defaultPathFilter (`auto filter2 = filter ? *filter :
+         * defaultPathFilter`), so an address compare never matches the
+         * real eval flow. defaultPathFilter's lambda closure type is
+         * unique to its definition site, so target_type() identifies it
+         * and every copy of it — and nothing else.
+         *
+         * The accessor check must be by TYPE too. getPhysicalPath()
+         * answers "where is THIS path on disk", NOT "is the subtree
+         * identical": FilteringSourceAccessor (the abstract base of every
+         * nix accessor that hides subtree entries — git workdir's
+         * AllowListSourceAccessor, GitExportIgnoreSourceAccessor)
+         * delegates it to `next` after access-checking only the queried
+         * path, so a tracked-files view over a dirty worktree returns the
+         * worktree root and a raw walk then ingests every gitignored
+         * file. Gating it out routes filtered sources through dumpPath
+         * (honours accessor + filter), same as stock nix. The remaining
+         * getPhysicalPath() overrides in the pinned nix are
+         * PosixSourceAccessor and the routing wrappers (Mounted, Union)
+         * around it — non-filtering by construction; for the one
+         * composition nix actually builds (rootFS = posix ∪ storeFS
+         * mounted at /nix/store) a non-store-dir physical path is
+         * posix-only at every sub-path.
+         *
+         * TODO: a local-git workdir flake with `?submodules=1` wraps the
+         * AllowList in a MountedSourceAccessor (git.cc
+         * getAccessorFromWorkdir); the outer-type cast then misses and
+         * the raw walk still leaks gitignored content. Submodules default
+         * off so the dogfood path is fixed; closing this gap needs either
+         * a recursive accessor-chain probe or a getPhysicalPath()
+         * contract change upstream. */
         std::string nameStr(name);
         std::optional<std::filesystem::path> phys;
+        if (filter.get_fn().target_type() == defaultPathFilter.get_fn().target_type()
+            && hashAlgo == HashAlgorithm::SHA256 && method.raw != ContentAddressMethod::Raw::Git
+            && !dynamic_cast<FilteringSourceAccessor *>(&*path.accessor))
+            phys = path.accessor->getPhysicalPath(path.path);
+
+        auto refs = refsJson(references).dump();
+
+        /* Stat-fingerprint shortcut: a physical source whose fingerprint
+         * matches a prior ingest (same name + method + refs) skips the
+         * walk entirely. Only for regular files (directory mtimes don't
+         * reflect child edits) and never for repair (repair means
+         * re-ingest unconditionally). */
+        bool fingerprintable = false;
         int caM = -1;
-        if (&filter == &defaultPathFilter && repair == NoRepair && hashAlgo == HashAlgorithm::SHA256
-            && method.raw != ContentAddressMethod::Raw::Git) {
-            if (auto p = path.accessor->getPhysicalPath(path.path)) {
-                auto st = path.accessor->maybeLstat(path.path);
-                if (st && st->type == SourceAccessor::tRegular) {
-                    phys = std::move(p);
-                    caM = caMethodFor(method, "addToStore");
-                }
+        if (phys && repair == NoRepair) {
+            auto st = path.accessor->maybeLstat(path.path);
+            if (st && st->type == SourceAccessor::tRegular) {
+                fingerprintable = true;
+                caM = caMethodFor(method, "addToStore");
             }
         }
 
-        if (phys) {
-            auto refs = refsJson(references).dump();
+        if (fingerprintable) {
             RioStr out, err;
             int rc = rio_fingerprint_lookup(
                 rio, phys->string().c_str(), nameStr.c_str(), caM, refs.c_str(), &out.p, &err.p);
@@ -567,10 +606,52 @@ struct RioStore : virtual Store
             /* miss or lookup failure → fall through to a real ingest */
         }
 
-        auto result = Store::addToStore(name, path, method, hashAlgo, references, filter, repair);
+        auto result = [&]() -> StorePath {
+            if (!phys || method.raw != ContentAddressMethod::Raw::NixArchive)
+                /* Non-filesystem accessor (fetchTree, filtered source) or
+                 * flat/text addressing: generic NAR-dump ingest — those
+                 * bytes have no other local home, so they land as
+                 * FETCHED content records. */
+                return Store::addToStore(name, path, method, hashAlgo, references, filter, repair);
 
-        if (phys) {
-            auto refs = refsJson(references).dump();
+            /* Direct two-plane ingest (ADR-024 not-a-mirror): one walk of
+             * the origin tree feeds the NAR-sha256 spine and the chunk
+             * plane; NO file content is copied into the CAS. Same hard
+             * path cross-check as addToStoreFromDump. */
+            PathCbCtx pctx{
+                .compute =
+                    [&](const nlohmann::json & h) {
+                        auto narHash = Hash::parseNonSRIUnprefixed(
+                            h.at("nar_sha256").get<std::string>(), HashAlgorithm::SHA256);
+                        auto info = ValidPathInfo::makeFromCA(
+                            *this,
+                            nameStr,
+                            ContentAddressWithReferences::fromParts(
+                                method,
+                                Hash(narHash),
+                                StoreReferences{
+                                    .others = references,
+                                    .self = false,
+                                }),
+                            narHash);
+                        return printStorePath(info.path);
+                    },
+            };
+            RioStr out, err;
+            int rc = rio_add_source_tree(
+                rio,
+                phys->string().c_str(),
+                nameStr.c_str(),
+                refs.c_str(),
+                &rioPathCompute,
+                &pctx,
+                &out.p,
+                &err.p);
+            checkRc(rc, err, "addToStore", pctx.ex);
+            return parseStorePath(nlohmann::json::parse(out.str()).at("path").get<std::string>());
+        }();
+
+        if (fingerprintable) {
             RioStr err;
             /* Best-effort: a failed record only loses the shortcut. */
             rio_fingerprint_record(

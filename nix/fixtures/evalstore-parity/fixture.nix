@@ -1,7 +1,10 @@
 # Local parity fixture for the rio:// eval-store plugin — NO nixpkgs, NO
 # network. Exercises every eval-time store op the plugin intercepts:
 #   - builtins.toFile          → addToStoreFromDump (Text method)
-#   - ./src-dir reference      → addToStore(SourcePath) → NAR dump
+#   - ./src-dir reference      → addToStore(SourcePath) → two-plane
+#                                 source-tree ingest (not-a-mirror:
+#                                 data.txt carries a canary line the
+#                                 parity check greps the CAS for)
 #   - derivation { … }         → writeDerivation (ATerm + drv JSON capture)
 #   - __structuredAttrs        → the highest drvPath-divergence-risk shape
 #   - plain → structured edge  → inputDrvs in the second derivation

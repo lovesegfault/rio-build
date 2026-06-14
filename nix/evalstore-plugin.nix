@@ -25,6 +25,11 @@ let
   nixCli = nixPkgs.nix-cli;
   nixStoreDev = lib.getDev nixPkgs.nix-store;
   nixUtilDev = lib.getDev nixPkgs.nix-util;
+  # Header-only: the shim type-gates on FilteringSourceAccessor (the
+  # local-git workdir accessor base) and the typeinfo symbol resolves
+  # at dlopen against the host binary's libnixfetchers, same as the
+  # nix-store/util symbols below.
+  nixFetchersDev = lib.getDev nixPkgs.nix-fetchers;
 
   plugin = pkgs.stdenv.mkDerivation {
     pname = "rio-evalstore-plugin";
@@ -35,6 +40,7 @@ let
     buildInputs = [
       nixStoreDev
       nixUtilDev
+      nixFetchersDev
       # boost is used by nix headers but absent from the .pc files.
       pkgs.boost
       pkgs.nlohmann_json
@@ -52,7 +58,7 @@ let
       fi
       $CXX -std=c++23 -fPIC -shared -o librio-evalstore.so \
         shim.cc \
-        $(pkg-config --cflags nix-store nix-util) \
+        $(pkg-config --cflags nix-store nix-util nix-fetchers) \
         "$staticlib" \
         -pthread -ldl -lm
       runHook postBuild
@@ -101,6 +107,7 @@ let
         nativeBuildInputs = [
           nixCli
           pkgs.jq
+          pkgs.git
         ];
       }
       ''
@@ -142,6 +149,17 @@ let
         test -d $TMPDIR/cas/packs
         test -f $TMPDIR/cas/index.bin
 
+        echo "== not-a-mirror: local source-tree bytes never enter the CAS"
+        # Real nix ingested ./src-dir through addToStore(SourcePath); the
+        # two-plane route stores chunk metadata + directory blobs only.
+        # The canary line in data.txt would appear verbatim in a pack
+        # record if any FETCHED copy of the tree were made.
+        grep -q "RIO-NOT-A-MIRROR-CANARY" $TMPDIR/work/src-dir/data.txt
+        if grep -rqa "RIO-NOT-A-MIRROR-CANARY" $TMPDIR/cas; then
+          echo "local tree content leaked into the client CAS — not-a-mirror violated"
+          exit 1
+        fi
+
         echo "== readback: real nix serves source + toFile from the pack store"
         src=$(jq -r .source rio.json)
         nix $flags --plugin-files ${pluginSo} \
@@ -164,6 +182,98 @@ let
           echo "warm re-eval wrote new pack records — CAS dedup regressed"
           exit 1
         fi
+        # Route proof: the local dir took the two-plane ingest, not the
+        # NAR-dump fallback (which would show as an add_from_dump of the
+        # tree and FETCHED content writes on the cold run).
+        grep -q "add_source_tree" stats.txt \
+          || { echo "local source dir did not take the two-plane ingest route"; exit 1; }
+
+        echo "== filtered accessor: a local-git flake honours the tracked-files view"
+        # nix's git workdir accessor is an AllowListSourceAccessor
+        # (FilteringSourceAccessor) over posix; getPhysicalPath() on it
+        # returns the worktree root even though gitignored entries are
+        # hidden. The two-plane fast path used to walk the raw worktree —
+        # ingesting every gitignored file and producing a different NAR
+        # hash than stock nix.
+        export GIT_CONFIG_GLOBAL=$TMPDIR/gitconfig
+        git config --global user.email nobody@example.com
+        git config --global user.name nobody
+        git config --global init.defaultBranch main
+        mkdir -p $TMPDIR/gitrepo/target
+        echo target/ > $TMPDIR/gitrepo/.gitignore
+        echo RIO-GIT-TRACKED-CONTENT > $TMPDIR/gitrepo/tracked.txt
+        cat > $TMPDIR/gitrepo/flake.nix <<'EOF'
+        { outputs = { self }: { source = "''${self}"; }; }
+        EOF
+        # Gitignored sentinels: never tracked. A raw-fs walk (the pre-fix
+        # route) records the entry name in a dirblob — the grep below.
+        head -c 65536 /dev/zero | tr '\0' R > $TMPDIR/gitrepo/target/sentinel.bin
+        echo RIO-GITIGNORE-SENTINEL > $TMPDIR/gitrepo/target/marker
+        git -C $TMPDIR/gitrepo init -q
+        git -C $TMPDIR/gitrepo add flake.nix tracked.txt .gitignore
+        git -C $TMPDIR/gitrepo commit -q -m init
+        # Dirty the worktree so the warning trail is unmistakably the
+        # workdir-accessor route (a clean repo also takes it: no ref/rev
+        # → getAccessorFromWorkdir).
+        echo dirty >> $TMPDIR/gitrepo/tracked.txt
+        gflags="$flags --extra-experimental-features flakes --option warn-dirty false"
+
+        nix $gflags --store "local?root=$TMPDIR/stock-git" \
+          eval "$TMPDIR/gitrepo#source" --raw > stock-git.txt
+        nix $gflags --plugin-files ${pluginSo} \
+          --store "local?root=$TMPDIR/main-git" \
+          eval --eval-store "rio://?cas=$TMPDIR/cas-git" \
+          "$TMPDIR/gitrepo#source" --raw > rio-git.txt
+
+        # Same NAR hash → same store path: the rio store saw exactly the
+        # tracked-files view stock nix did. A raw-fs walk would include
+        # target/ and the paths would diverge.
+        diff stock-git.txt rio-git.txt
+        # The dirblob entry name proves the route: a raw walk records the
+        # ignored entries (not their content — not-a-mirror) in the
+        # per-directory blob.
+        if grep -rqa "sentinel.bin" $TMPDIR/cas-git; then
+          echo "gitignored entry leaked into the CAS — accessor not honoured"
+          exit 1
+        fi
+        if grep -rqa "RIO-GITIGNORE-SENTINEL" $TMPDIR/cas-git; then
+          echo "gitignored content leaked into the CAS — accessor not honoured"
+          exit 1
+        fi
+        # The tracked file IS what nix added — it must read back.
+        nix $gflags --plugin-files ${pluginSo} \
+          store cat --store "rio://?cas=$TMPDIR/cas-git" \
+          "$(cat rio-git.txt)/tracked.txt" | grep -q RIO-GIT-TRACKED-CONTENT
+        echo "== substitution: rio:// accepts a CA path from a binary cache"
+        # builtins.storePath → ensurePath → PathSubstitutionGoal on the
+        # destination store, the same path flake-input fetchToStore takes.
+        # The base Store::pathInfoIsUntrusted is unconditionally true; if
+        # RioStore lacks the override, the goal warns "not signed by any
+        # of the keys in 'trusted-public-keys'" and FAILS even for this
+        # CA path (which needs no signature). $src is the CA source path
+        # already valid in the run-A stock store; serve it from a file://
+        # cache and a fresh rio:// CAS must substitute it. (`substitute
+        # true` overridden explicitly: in the build sandbox nix detects
+        # no-internet and would otherwise force it false.)
+        nix $flags copy --no-check-sigs \
+          --from "local?root=$TMPDIR/stock" --to "file://$TMPDIR/cache" "$src" 2>&1
+        test -f $TMPDIR/cache/nix-cache-info
+        subFlags="--extra-experimental-features nix-command --plugin-files ${pluginSo}"
+        nix $subFlags --store "rio://?cas=$TMPDIR/cas-sub" \
+          --option substitute true --substituters "file://$TMPDIR/cache" \
+          eval --impure --raw --expr "builtins.storePath \"$src\"" \
+          > sub-out.txt 2> sub-err.txt \
+          || { cat sub-err.txt; exit 1; }
+        cat sub-err.txt
+        if grep -q "not signed by any of the keys" sub-err.txt; then
+          echo "rio:// rejected a CA substitute — pathInfoIsUntrusted not overridden"
+          exit 1
+        fi
+        test "$(cat sub-out.txt)" = "$src"
+        # The path actually landed (readback through the rio store).
+        nix $subFlags store cat --store "rio://?cas=$TMPDIR/cas-sub" \
+          "$src/data.txt" > sub-data.txt
+        diff sub-data.txt $TMPDIR/work/src-dir/data.txt
 
         cp stats.txt $out
       '';

@@ -91,6 +91,22 @@ int rio_add_from_dump(
 int rio_add_nar(
     RioEvalStore * store, const char * info_json, rio_read_cb read_cb, void * read_ctx, char ** err);
 
+/* addToStore(SourcePath) on a physical path: ingest the local tree at
+ * fs_path through the single-read two-plane pipeline. Stores NO file
+ * content (chunk metadata + directory blobs only — the origin tree is
+ * the byte store). Recursive (NAR) sha256 content addressing only; use
+ * rio_add_from_dump for everything else. refs_json / *out_json as in
+ * rio_add_from_dump. */
+int rio_add_source_tree(
+    RioEvalStore * store,
+    const char * fs_path,
+    const char * name,
+    const char * refs_json,
+    rio_path_cb path_cb,
+    void * path_ctx,
+    char ** out_json,
+    char ** err);
+
 /* writeDerivation. name = store-path name ("foo-1.2.drv"); aterm = the
  * canonical bytes nix hashed; drv_json = nix's derivation JSON;
  * nix_drv_path = nix's computed path (hard cross-check). */

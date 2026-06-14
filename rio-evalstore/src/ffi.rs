@@ -428,6 +428,51 @@ pub unsafe extern "C" fn rio_add_nar(
     })
 }
 
+/// Ingest a local source tree (`addToStore(SourcePath)` on a physical
+/// path): the single-read two-plane pipeline walks `fs_path` directly —
+/// NO file content enters the CAS (chunk metadata + directory blobs
+/// only; the origin tree is the byte store, ADR-024's not-a-mirror
+/// rule). Recursive (NixArchive) sha256 content addressing only; the
+/// shim falls back to [`rio_add_from_dump`] for everything else
+/// (non-filesystem accessors, custom filters, flat/text methods).
+/// `refs_json` and `*out_json` as in [`rio_add_from_dump`].
+///
+/// # Safety
+/// Standard contract; `path_cb` must be valid for the duration of the
+/// call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rio_add_source_tree(
+    store: *mut EvalStore,
+    fs_path: *const c_char,
+    name: *const c_char,
+    refs_json: *const c_char,
+    path_cb: RioPathCb,
+    path_ctx: *mut c_void,
+    out_json: *mut *mut c_char,
+    err: *mut *mut c_char,
+) -> c_int {
+    guard(err, || {
+        // SAFETY: caller contract.
+        let fs_path = unsafe { req_str(fs_path) }?;
+        // SAFETY: caller contract.
+        let name = unsafe { req_str(name) }?;
+        // SAFETY: caller contract.
+        let refs = parse_refs_json(unsafe { req_str(refs_json) }?)?;
+        let result = store_ref(store).add_source_tree(fs_path, name, &refs, &mut |h| {
+            call_path_cb(path_cb, path_ctx, h)
+        })?;
+        set_out_string(
+            out_json,
+            Some(
+                serde_json::to_string(&result).map_err(|e| {
+                    EvalStoreError::Corrupt(format!("add result encode failed: {e}"))
+                })?,
+            ),
+        );
+        Ok(())
+    })
+}
+
 /// Capture a derivation. `name` is the store-path name (`foo-1.2.drv`),
 /// `aterm` the canonical bytes nix hashed, `nix_drv_path` nix's computed
 /// path (cross-checked). On success `*out_path` is the (identical) drv
