@@ -118,15 +118,16 @@ impl Drop for OtelGuard {
 pub fn init_tracing(component: &'static str) -> anyhow::Result<OtelGuard> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // sh-002 H4: wrap stdout in a non-blocking writer so log emit is a
+    // sh-002 H4: wrap stderr in a non-blocking writer so log emit is a
     // bounded channel send, never a synchronous `write(2)` on the calling
     // task. Under `RUST_LOG=debug` the scheduler emits thousands of
-    // lines/s; the default fmt writer blocks on stdout per event and
-    // contributed to actor turn cost. Lossy at the 128k-line default
-    // buffer (v1-I6: acceptable; no `r[obs.log.*]` rule constrains it).
-    // The returned `WorkerGuard` is held in `OtelGuard` so buffered lines
-    // flush at process exit.
-    let (writer, log_writer) = tracing_appender::non_blocking(std::io::stdout());
+    // lines/s; the default fmt writer blocks per event and contributed to
+    // actor turn cost. Lossy at the 128k-line default buffer (v1-I6:
+    // acceptable; no `r[obs.log.*]` rule constrains it). The returned
+    // `WorkerGuard` is held in `OtelGuard` so buffered lines flush at
+    // process exit. Logs go to STDERR — stdout is the machine-readable
+    // surface (e.g. `rio build` final result paths feed into `xargs`).
+    let (writer, log_writer) = tracing_appender::non_blocking(std::io::stderr());
 
     // fmt layer: JSON or pretty. `.boxed()` so both arms have the same type.
     let fmt_layer = match log_format_from_env() {
