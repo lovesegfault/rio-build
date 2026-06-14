@@ -10,9 +10,15 @@ use rio_proto::types::{BuildEvent, DerivationEventKind, build_event::Event};
 use super::{RenderEvent, short_drv};
 
 pub(super) fn on_event(out: &mut impl Write, ev: &RenderEvent) {
-    let RenderEvent::Build(ev) = ev;
-    if let Some(s) = line(ev) {
-        let _ = writeln!(out, "{s}");
+    match ev {
+        RenderEvent::Build(ev) => {
+            if let Some(s) = line(ev) {
+                let _ = writeln!(out, "{s}");
+            }
+        }
+        RenderEvent::Note(s) => {
+            let _ = writeln!(out, "{}", super::term::sanitize_line(s));
+        }
     }
 }
 

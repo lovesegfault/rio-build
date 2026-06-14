@@ -26,6 +26,10 @@ pub mod tty;
 pub enum RenderEvent {
     /// A `BuildEvent` from one of the per-root watch streams.
     Build(BuildEvent),
+    /// One non-build line (eval-parent stderr, coordinator messages).
+    /// Anything written to stderr behind the TTY display's back lands
+    /// inside the ephemeral region and corrupts it.
+    Note(String),
 }
 
 /// Cloneable sender into the renderer task. `send` never blocks; a
@@ -43,6 +47,10 @@ impl RenderHandle {
         if let Some(tx) = &self.0 {
             let _ = tx.send(ev);
         }
+    }
+
+    pub fn note(&self, msg: impl Into<String>) {
+        self.send(RenderEvent::Note(msg.into()));
     }
 }
 

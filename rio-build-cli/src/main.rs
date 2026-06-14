@@ -164,7 +164,11 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
     };
 
     let (parent_args, attrs) = eval_plan(&args.installables, args.eval_file.as_deref(), &cas_root)?;
-    let (chan, mut child) = evalchan::spawn_eval_parent(eval_parent, &parent_args)
+    // Under the TTY renderer, eval-parent stderr would land inside the
+    // ephemeral region and corrupt it; pipe it and forward through the
+    // renderer instead.
+    let pipe_stderr = !matches!(render_opts.mode, render::RenderMode::Plain);
+    let (chan, mut child) = evalchan::spawn_eval_parent(eval_parent, &parent_args, pipe_stderr)
         .with_context(|| format!("spawning eval parent {}", eval_parent.display()))?;
 
     let acks = std::sync::Arc::new(std::sync::Mutex::new(ClusterAckTable::open(
@@ -174,6 +178,16 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
     )));
 
     let (render, render_task) = render::spawn(render_opts, pager_gate.clone());
+    if let Some(stderr) = child.stderr.take() {
+        let r = render.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                r.note(line);
+            }
+        });
+    }
     let mut coordinator = Coordinator {
         clients: clients.clone(),
         acks,
