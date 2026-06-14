@@ -523,8 +523,16 @@ pub async fn ensure_jwt_keypair(client: &kube::Client) -> Result<JwtKeypair> {
     // Derive pubkey from seed. `SigningKey::from_bytes` takes the raw
     // 32-byte seed; `verifying_key().to_bytes()` gives the 32-byte pub.
     // Both match what gateway/scheduler expect per `_helpers.tpl`.
+    let sk = decode_jwt_seed(&seed)?;
+    let pubkey = B64.encode(sk.verifying_key().to_bytes());
+    Ok(JwtKeypair { seed, pubkey })
+}
+
+/// Decode the b64 `ed25519_seed` value from the `rio-jwt-signing`
+/// Secret into a signing key.
+fn decode_jwt_seed(seed_b64: &str) -> Result<ed25519_dalek::SigningKey> {
     let raw: [u8; 32] = B64
-        .decode(&seed)
+        .decode(seed_b64)
         .context("rio-jwt-signing secret ed25519_seed is not valid base64")?
         .try_into()
         .map_err(|v: Vec<u8>| {
@@ -533,9 +541,22 @@ pub async fn ensure_jwt_keypair(client: &kube::Client) -> Result<JwtKeypair> {
                 v.len()
             )
         })?;
-    let sk = ed25519_dalek::SigningKey::from_bytes(&raw);
-    let pubkey = B64.encode(sk.verifying_key().to_bytes());
-    Ok(JwtKeypair { seed, pubkey })
+    Ok(ed25519_dalek::SigningKey::from_bytes(&raw))
+}
+
+/// Read the gateway's JWT signing key from the live `rio-jwt-signing`
+/// Secret. Unlike [`ensure_jwt_keypair`], never generates one — a
+/// token minted under a key the cluster doesn't verify with would just
+/// fail every RPC with `UNAUTHENTICATED`, so a missing Secret is the
+/// caller's problem to surface, not paper over.
+pub async fn jwt_signing_key(client: &kube::Client) -> Result<ed25519_dalek::SigningKey> {
+    let seed = kube::get_secret_key(client, NS, "rio-jwt-signing", "ed25519_seed")
+        .await?
+        .context(
+            "Secret rio-jwt-signing not found — the cluster has no JWT signing key \
+             (deploy with `cargo xtask k8s up --deploy` first)",
+        )?;
+    decode_jwt_seed(&seed)
 }
 
 /// Label selector matching every rio Deployment. Set by the chart's
@@ -904,6 +925,21 @@ mod tests {
         // Matches what operators pass via `openssl rand -base64 32`.
         let seed = B64.encode([0u8; 32]);
         assert_eq!(seed.len(), 44);
+    }
+
+    #[test]
+    fn decode_jwt_seed_validates_length() {
+        // A truncated/corrupt Secret value must error with the byte
+        // count, not panic or silently produce a wrong key.
+        let err = decode_jwt_seed(&B64.encode([0u8; 16])).unwrap_err();
+        assert!(err.to_string().contains("16 bytes"), "{err}");
+        // Round-trip: same seed bytes → same pubkey as direct from_bytes.
+        let raw = [7u8; 32];
+        let sk = decode_jwt_seed(&B64.encode(raw)).unwrap();
+        assert_eq!(
+            sk.verifying_key(),
+            ed25519_dalek::SigningKey::from_bytes(&raw).verifying_key()
+        );
     }
 
     /// I-158 regression: ProcessGuard must kill GRANDCHILDREN. The
