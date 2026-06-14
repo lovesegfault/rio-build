@@ -118,6 +118,11 @@
       "path": "render/term.rs",
       "depth": 1,
       "doc": "Terminal/CI output helpers shared by the build-log renderers."
+    },
+    {
+      "path": "render/tty.rs",
+      "depth": 1,
+      "doc": "Interactive (TTY) renderer."
     }
   ],
   "rio-builder": [

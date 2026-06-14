@@ -80,8 +80,9 @@ struct BuildArgs {
     #[arg(long)]
     keep_going: bool,
 
-    /// Renderer: auto picks ci when GITHUB_ACTIONS is set, otherwise
-    /// plain (one line per state edge, for scripts).
+    /// Renderer: auto picks tty when stderr+stdin are a tty and
+    /// TERM≠dumb, ci when GITHUB_ACTIONS is set, otherwise plain (one
+    /// line per state edge, for scripts).
     #[arg(long, value_enum, default_value = "auto")]
     render: render::RenderMode,
 
@@ -135,8 +136,11 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
         no_fold: args.no_fold,
         stall_timeout: args.stall_timeout,
     };
+    // High while a pager owns the terminal: Ctrl-C must reach the pager
+    // (exits less follow mode), not abort builds behind its back.
+    let pager_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     if let Some(id) = &args.attach {
-        let (render, render_task) = render::spawn(render_opts);
+        let (render, render_task) = render::spawn(render_opts, pager_gate);
         let outcome = rio_build_cli::coordinator::attach_build(&mut clients, id, 0, render).await?;
         let _ = render_task.await;
         return finish(
@@ -169,7 +173,7 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
         std::time::Duration::from_secs(cfg.ack_ttl_secs),
     )));
 
-    let (render, render_task) = render::spawn(render_opts);
+    let (render, render_task) = render::spawn(render_opts, pager_gate.clone());
     let mut coordinator = Coordinator {
         clients: clients.clone(),
         acks,
@@ -206,6 +210,9 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
             tokio::select! {
                 _ = int.recv() => {}
                 _ = term.recv() => {}
+            }
+            if pager_gate.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
             }
             if sig_tx.send(()).is_err() {
                 return;
