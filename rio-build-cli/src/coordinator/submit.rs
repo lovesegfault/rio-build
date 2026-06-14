@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, bail};
 use rio_proto::types::{BuildEvent, DerivationNode, DrvBlob, HasDrvsRequest, SubmitBuildRequest};
 use tonic::Streaming;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use crate::acks::{ClusterAckTable, ObjectKind};
 use crate::coordinator::clients::{Clients, bitmap_bit};
@@ -97,8 +97,20 @@ async fn try_submit(
 ) -> Result<Streaming<BuildEvent>, SubmitError> {
     let submission_id = format!("{}-{attempt}", uuid::Uuid::new_v4());
     let mut pages = paginate(nodes.to_vec(), opts, page_max_nodes, &submission_id);
+    let n_pages = pages.len();
+    debug!(
+        nodes = nodes.len(),
+        pages = n_pages,
+        "SubmitBuild: paginated"
+    );
     let last = pages.pop().expect("paginate returns at least one page");
     for (i, page) in pages.into_iter().enumerate() {
+        debug!(
+            page = i,
+            of = n_pages,
+            nodes = page.nodes.len(),
+            "SubmitBuild: staging page"
+        );
         let mut stream = submit_page(clients, page).await?;
         // Staged ack == clean close with zero events.
         match stream.message().await {
@@ -113,7 +125,15 @@ async fn try_submit(
             Err(status) => return Err(classify(status)),
         }
     }
-    submit_page(clients, last).await
+    debug!(
+        page = n_pages - 1,
+        of = n_pages,
+        nodes = last.nodes.len(),
+        "SubmitBuild: final page"
+    );
+    let stream = submit_page(clients, last).await?;
+    debug!("SubmitBuild: accepted");
+    Ok(stream)
 }
 
 async fn submit_page(
