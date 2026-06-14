@@ -41,9 +41,11 @@
 #include "nix/flake/flake.hh"
 #include "nix/flake/flakeref.hh"
 #include "nix/flake/settings.hh"
-#include "nix/store/globals.hh" // initLibStore
+#include "nix/store/filetransfer.hh" // fileTransferSettings
+#include "nix/store/globals.hh"      // initLibStore
 #include "nix/store/store-api.hh"
 #include "nix/store/store-open.hh"
+#include "nix/util/logging.hh" // Logger / activity types
 #include "nix/util/file-system.hh"
 #include "nix/util/signals.hh" // unix::saveSignalMask (via signals-impl.hh)
 
@@ -72,6 +74,38 @@ extern "C" int ifdHandler(void * /*ctx*/, const char * drvPath, char ** err) noe
     rio_string_free(outJson); /* outputs already imported store-side */
     return rc;
 }
+
+/* Forwards libnix fetch-activity start lines to fd 3 as Note frames so
+ * the coordinator's renderer surfaces fetch progress during the
+ * pre-fork lockFlake/callFlake warmup. Without it, a cold flake eval
+ * is silent for the entire transitive-input fetch — indistinguishable
+ * from a hang. Everything else passes through to the previous logger.
+ *
+ * Installed for the pre-fork warmup ONLY: after rio_eval_parent_run
+ * forks, fd 3 belongs to the parent's poll loop and a worker writing
+ * to it would corrupt framing; the previous logger is restored before
+ * the parent loop starts. */
+struct FetchNoteLogger : nix::Logger
+{
+    nix::Logger * prev;
+    void log(nix::Verbosity lvl, std::string_view s) override { prev->log(lvl, s); }
+    void logEI(const nix::ErrorInfo & ei) override { prev->logEI(ei); }
+    void startActivity(
+        nix::ActivityId act,
+        nix::Verbosity lvl,
+        nix::ActivityType type,
+        const std::string & s,
+        const Fields & fields,
+        nix::ActivityId parent) override
+    {
+        if ((type == nix::actFileTransfer || type == nix::actFetchTree) && !s.empty()) {
+            char * err = nullptr;
+            rio_emit_note(3, s.c_str(), &err);
+            rio_string_free(err);
+        }
+        prev->startActivity(act, lvl, type, s, fields, parent);
+    }
+};
 
 struct EvalCtx
 {
@@ -420,7 +454,18 @@ int main(int argc, char ** argv)
         };
 
         /* Pre-fork warmup: parse + lock + fetch ONCE; workers inherit
-         * the forced top-level value COW (sharing by fork order). */
+         * the forced top-level value COW (sharing by fork order).
+         * Fetch progress goes to fd 3 as Note frames so the
+         * coordinator surfaces it; restored before the parent loop
+         * starts (see FetchNoteLogger). Tighten stalled-download from
+         * the 300s default so a stuck tarball has a hard ceiling. */
+        auto prevLogger = std::move(nix::logger);
+        {
+            auto fnl = std::make_unique<FetchNoteLogger>();
+            fnl->prev = prevLogger.get();
+            nix::logger = std::move(fnl);
+        }
+        nix::fileTransferSettings.stalledDownloadTimeout = 60;
         if (ctx.flakeMode) {
             auto parsed = nix::parseFlakeRef(
                 nix::fetchSettings, flakeRef, nix::absPath(std::filesystem::path(".")));
@@ -439,6 +484,7 @@ int main(int argc, char ** argv)
             state->autoCallFunction(autoArgs, vTop, *ctx.vRoot);
             state->forceAttrs(*ctx.vRoot, nix::noPos, "while forcing the top-level attrset");
         }
+        nix::logger = std::move(prevLogger);
 
         /* Hand the loop to Rust: fork workers, relay frames, recycle,
          * crash-requeue — until the coordinator's Shutdown drains. */

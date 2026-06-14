@@ -81,6 +81,7 @@ message WorkerFrame {
     RecycleNotice recycle = 3;
     WorkerError error = 4;
     AttrsetExpansion expansion = 5;
+    Note note = 6;
   }
 }
 
@@ -161,6 +162,15 @@ message AttrsetExpansion {
   // Children that are neither derivations nor recursable attrsets —
   // surfaced as warnings, never a hard error for the run.
   repeated string skipped = 3;
+}
+
+// Free-form progress text from the eval parent's pre-fork warmup
+// (libnix fetch-activity start lines: "downloading …", "fetching …").
+// The coordinator surfaces it verbatim via the renderer's Note path
+// so a cold flake eval — silent for the entire transitive-input fetch
+// otherwise — has visible progress.
+message Note {
+  string text = 1;
 }
 
 // An attr failed to evaluate (or the parent hit a non-attr fault).
