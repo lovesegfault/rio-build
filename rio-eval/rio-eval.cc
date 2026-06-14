@@ -38,6 +38,7 @@
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/get-drvs.hh"
+#include "nix/fetchers/attrs.hh" // maybeGetStrAttr
 #include "nix/flake/flake.hh"
 #include "nix/flake/flakeref.hh"
 #include "nix/flake/settings.hh"
@@ -474,6 +475,26 @@ int main(int argc, char ** argv)
              * needed-but-missing lock entry stays in memory. */
             lockFlags.writeLockFile = false;
             auto locked = nix::flake::lockFlake(nix::flakeSettings, *state, parsed, lockFlags);
+            /* PathInputScheme::getAccessor copies a `path:` flake into
+             * the store via addToStoreFromDump (a NAR stream — no
+             * origin path), so the rio store records Origin::Streamed
+             * and source_root_for then skips it: `self` never rides a
+             * SourceRoot frame and the cluster build fails on the
+             * missing inputSrc. Record the local origin here so forked
+             * workers inherit it.
+             * TODO: walk locked.lockFile for transitive `path:` inputs;
+             * `self` is the load-bearing case (every flake build). */
+            if (locked.flake.lockedRef.input.getType() == "path") {
+                if (auto p = nix::fetchers::maybeGetStrAttr(
+                        locked.flake.lockedRef.input.attrs, "path");
+                    p && !store->isInStore(*p)) {
+                    auto sp = store->printStorePath(
+                        locked.flake.lockedRef.input.computeStorePath(*store));
+                    char * err = nullptr;
+                    rio_mark_local_origin(gRio, sp.c_str(), p->c_str(), &err);
+                    rio_string_free(err);
+                }
+            }
             ctx.vRoot = state->allocValue();
             nix::flake::callFlake(*state, locked, *ctx.vRoot);
             state->forceAttrs(*ctx.vRoot, nix::noPos, "while forcing the flake's outputs");

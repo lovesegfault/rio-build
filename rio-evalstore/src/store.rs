@@ -1609,6 +1609,42 @@ impl EvalStore {
             .collect())
     }
 
+    /// Upgrade a Streamed-origin path's record to `Local{fs_path}` in
+    /// the in-memory meta cache. The `path:` flake input scheme calls
+    /// `addToStoreFromDump` directly (libfetchers `path.cc`) — the dump
+    /// is a NAR stream with no origin path, so the ingest records
+    /// `Origin::Streamed` and `source_root_for` then skips it,
+    /// leaving the flake's `self` un-uploadable. The eval parent calls
+    /// this post-`lockFlake` with the path it parsed the flakeref from,
+    /// and forked workers COW-inherit the upgraded cache entry.
+    ///
+    /// Cache-only: the persisted record is left Streamed. `path:`
+    /// flakes re-dump on every `lockFlake` regardless, so a warm-CAS
+    /// run reaches this same point and re-upgrades; no readback path
+    /// depends on the persisted origin between runs.
+    pub fn mark_local_origin(&self, full_store_path: &str, fs_path: &str) -> Result<()> {
+        let Some(basename) = store_path::basename(full_store_path) else {
+            return Ok(());
+        };
+        let mut inner = self.lock();
+        let Some(meta) = self.path_meta(&mut inner, basename)? else {
+            return Ok(());
+        };
+        if matches!(meta.origin, Origin::Local { .. }) {
+            return Ok(());
+        }
+        inner.metas.insert(
+            basename.to_string(),
+            std::sync::Arc::new(PathMeta {
+                origin: Origin::Local {
+                    fs_path: fs_path.to_string(),
+                },
+                ..(*meta).clone()
+            }),
+        );
+        Ok(())
+    }
+
     /// `SourceRoot` for one inputSrc, or `None` when the path is not
     /// an origin-backed directory tree (skipped, counted).
     fn source_root_for(

@@ -250,6 +250,11 @@ let
         # leaf+hello+world graph assembled (proves callFlake → forceAttrs
         # → eval reached the derivations).
         test "$(jq '.total_nodes' run5.json)" -ge 3
+        # Self rode the frames as a SourceRoot (path: scheme calls
+        # addToStoreFromDump, so the eval parent records the local
+        # origin post-lockFlake; without it, source_roots is 0 and the
+        # vm-build-client flake leg fails on the missing inputSrc).
+        test "$(jq '[.results[].source_roots] | add' run5.json)" -ge 1
         # The end-to-end build (self uploaded → worker reads it) is the
         # vm-build-client flake leg's job; this smoke leg only checks the
         # eval-parent contract.
