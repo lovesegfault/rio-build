@@ -466,6 +466,7 @@ mod tests {
         assert!(text(&buf).contains("pkg-a.drv> @ phase buildPhase"));
     }
 
+    // r[verify bc.render.sanitize]
     #[test]
     fn sanitize_at_ingestion_neutralizes_injection() {
         let (mut r, buf, _now) = make(CiOpts {

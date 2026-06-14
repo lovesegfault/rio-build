@@ -46,6 +46,7 @@ pub const SGR_RESET: &str = "\x1b[0m";
 /// the start of a line. Renderers prefix every build line with `"label> "`,
 /// and this function guarantees no CR/LF survives, so build output can
 /// never fabricate a line start to smuggle `::endgroup::`/`::add-mask::`.
+// r[impl bc.render.sanitize]
 pub fn sanitize_line(s: &str) -> String {
     // CR overwrite: keep the last non-empty segment.
     let s = if s.contains('\r') {

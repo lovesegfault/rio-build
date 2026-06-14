@@ -753,6 +753,8 @@ in
   # r[verify bc.submit.all-acked]
   # r[verify bc.fetch.narhash-verify]
   # r[verify store.drv.getpath-fallback]
+  # r[verify bc.render.stdout-results]
+  # r[verify bc.render.plain-default]
   vm-build-client-standalone =
     let
       jwtKeys = import ./lib/jwt-keys.nix;

@@ -946,6 +946,7 @@ fn local_hms() -> String {
 
 // ── terminal ownership (cbreak, cursor, stdin reader) ──────────────
 
+// r[impl bc.render.tty-restore]
 /// Restores termios + cursor on drop so panic/SIGINT can't leave the
 /// terminal broken. Construct on the main stack (not inside a spawned
 /// task) so `Drop` runs on `?`-unwind.

@@ -80,6 +80,7 @@ pub struct RenderOpts {
     pub stall_timeout: u64,
 }
 
+// r[impl bc.render.select]
 /// Auto-selection: `Tty` when stderr+stdin are a tty and `TERM` isn't
 /// `dumb`; else `Ci` when `GITHUB_ACTIONS` is set; else `Plain`.
 pub fn select(
@@ -311,6 +312,7 @@ mod tests {
         assert_eq!(fmt_duration(Duration::from_secs(3700)), "1h01m40s");
     }
 
+    // r[verify bc.render.select]
     #[test]
     fn select_mode() {
         let env = |k: &[(&str, &str)]| -> HashMap<String, String> {

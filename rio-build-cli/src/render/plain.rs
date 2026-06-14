@@ -22,6 +22,7 @@ pub(super) fn on_event(out: &mut impl Write, ev: &RenderEvent) {
     }
 }
 
+// r[impl bc.render.plain-default]
 /// Render one event to a status line. `None` = not a status edge
 /// (log/phase/progress are deliberately not rendered — this is a
 /// status surface, not a log pipe).
