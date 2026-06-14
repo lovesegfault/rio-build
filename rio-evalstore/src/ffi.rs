@@ -808,6 +808,29 @@ pub unsafe extern "C" fn rio_fingerprint_lookup(
     })
 }
 
+/// Upgrade `store_path`'s origin record to `Local{fs_path}`: the
+/// `path:` flake input scheme calls `addToStoreFromDump` directly, so
+/// the eval parent records the actual local origin post-`lockFlake`
+/// for SourceRoot emission. See [`EvalStore::mark_local_origin`].
+///
+/// # Safety
+/// Standard contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rio_mark_local_origin(
+    store: *mut EvalStore,
+    store_path: *const c_char,
+    fs_path: *const c_char,
+    err: *mut *mut c_char,
+) -> c_int {
+    guard(err, || {
+        // SAFETY: caller contract.
+        let store_path = unsafe { req_str(store_path) }?;
+        // SAFETY: caller contract.
+        let fs_path = unsafe { req_str(fs_path) }?;
+        store_ref(store).mark_local_origin(store_path, fs_path)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // eval-parent surface (ADR-024 P3b)
 // ---------------------------------------------------------------------------

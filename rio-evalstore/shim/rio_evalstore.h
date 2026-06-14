@@ -228,6 +228,13 @@ int rio_fingerprint_record(
     const char * store_path,
     char ** err);
 
+/* Upgrade store_path's origin record to Local{fs_path}: the path:
+ * flake input scheme calls addToStoreFromDump directly (no origin
+ * path on the dump), so the eval parent records the actual local
+ * origin post-lockFlake for SourceRoot emission. */
+int rio_mark_local_origin(
+    RioEvalStore * store, const char * store_path, const char * fs_path, char ** err);
+
 /* ── eval-parent surface (ADR-024 P3b) ─────────────────────────────────
  * Used only by the rio-eval binary (never the plugin). */
 
