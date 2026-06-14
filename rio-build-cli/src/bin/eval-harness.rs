@@ -35,8 +35,11 @@ struct Args {
     #[arg(long)]
     cas: PathBuf,
     /// Fixture nix file (passed through as --file).
+    #[arg(long, conflicts_with = "flake", required_unless_present = "flake")]
+    file: Option<PathBuf>,
+    /// Fixture flake ref (passed through as --flake).
     #[arg(long)]
-    file: PathBuf,
+    flake: Option<String>,
     /// Comma-separated attrs to evaluate.
     #[arg(long, value_delimiter = ',')]
     attrs: Vec<String>,
@@ -84,12 +87,12 @@ struct Summary {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let mut parent_args = vec![
-        "--cas".to_string(),
-        args.cas.display().to_string(),
-        "--file".to_string(),
-        args.file.display().to_string(),
-    ];
+    let mut parent_args = vec!["--cas".to_string(), args.cas.display().to_string()];
+    match (&args.file, &args.flake) {
+        (Some(f), None) => parent_args.extend(["--file".into(), f.display().to_string()]),
+        (None, Some(r)) => parent_args.extend(["--flake".into(), r.clone()]),
+        _ => unreachable!("clap enforces exactly one of --file/--flake"),
+    }
     if let Some(n) = args.recycle_attrs {
         parent_args.extend(["--recycle-attrs".into(), n.to_string()]);
     }

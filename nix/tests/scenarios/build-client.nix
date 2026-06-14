@@ -19,6 +19,10 @@
 #                 scheduler cache-hits — zero new builder executions
 #   attach        `rio build --attach <id>` replays the completed
 #                 build's event stream from seq 0
+#   flake-mode    `rio build path:...#attr` (no --eval-file): the
+#                 parseFlakeRef → lockFlake → callFlake path,
+#                 hermetic flake (no inputs), distinct drv names so it
+#                 never cache-hits the file-mode runs
 #
 # Native-path purity: the client never gets an SSH key and the
 # gateway's authorized_keys only holds the boot placeholder — nothing
@@ -44,6 +48,42 @@ let
   rio = "${common.rio-workspace}/bin/rio";
   rioEvalBin = "${rioEval}/bin/rio-eval";
   fixtureNix = "${../lib/derivations/build-client.nix}";
+
+  # Flake-mode fixture: same dep→consumer chain as fixtureNix, but
+  # behind a flake `outputs` so the path that does parseFlakeRef →
+  # lockFlake → callFlake is exercised. Hermetic (no inputs); bb and
+  # src are staged INSIDE the flake dir so pure-eval can reference
+  # them via `self`.
+  flakeFixture = pkgs.writeText "flake.nix" ''
+    {
+      inputs = { };
+      outputs = { self }:
+        let
+          bb = "''${self}/bb";
+          src = "''${self}/src";
+          sh = "''${bb}/bin/sh";
+          bbx = "''${bb}/bin/busybox";
+          mkDrv = name: script: extra:
+            derivation ({
+              inherit name;
+              system = "x86_64-linux";
+              builder = sh;
+              args = [ "-c" script ];
+            } // extra);
+          dep = mkDrv "rio-bc-flake-dep" '''
+            ''${bbx} mkdir -p $out
+            ''${bbx} cat ''${src}/data.txt > $out/data
+            ''${bbx} echo rio-bc-flake-dep-built >> $out/data
+          ''' { };
+        in {
+          packages.x86_64-linux.consumer = mkDrv "rio-bc-flake-consumer" '''
+            ''${bbx} mkdir -p $out
+            ''${bbx} cat ''${dep}/data > $out/summary
+            ''${bbx} echo rio-bc-flake-consumer-built >> $out/summary
+          ''' { };
+        };
+    }
+  '';
 
   # PyJWT for signing the test tenant token (same pattern as
   # substitute.nix). cryptography provides the ed25519 backend PyJWT
@@ -74,8 +114,8 @@ pkgs.testers.runNixOSTest {
   skipTypeCheck = true;
 
   # ~90s boot + eval-parent cold start + 2 tiny builds at tick=2s +
-  # warm rerun + attach. Generous for TCG runners.
-  globalTimeout = 600 + common.covTimeoutHeadroom;
+  # warm rerun + attach + flake-mode (2 more builds). Generous for TCG.
+  globalTimeout = 720 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 
@@ -204,6 +244,39 @@ pkgs.testers.runNixOSTest {
         print(out)
         assert rc == 0, f"--attach failed (rc={rc}):\n{out}"
         assert "completed" in out, f"attach output missing completion:\n{out}"
+
+    # ══════════════════════════════════════════════════════════════════
+    with subtest("flake-mode: rio build path:...#attr (no --eval-file)"):
+        # Stage a hermetic flake (no inputs) with bb/src inside so
+        # pure-eval can reference them via self. Distinct drv names
+        # so this leg never cache-hits the file-mode runs.
+        client.succeed("mkdir -p /tmp/work-flake/src")
+        client.succeed("cp -r /tmp/work/bb /tmp/work-flake/bb")
+        client.succeed("echo rio-bc-src-v1 > /tmp/work-flake/src/data.txt")
+        client.succeed("cp ${flakeFixture} /tmp/work-flake/flake.nix")
+        client.succeed("find /tmp/work-flake -exec touch -h -d '1 hour ago' {} +")
+        before = journal_builds_succeeded(worker)
+        rc, out = rio_build(
+            "path:/tmp/work-flake#packages.x86_64-linux.consumer "
+            "--out-link /tmp/result-flake",
+            "flake",
+        )
+        print(out)
+        assert rc == 0, f"flake-mode rio build failed (rc={rc}):\n{out}"
+        assert "consumer: built /nix/store/" in out, out
+        summary = client.succeed("cat /tmp/result-flake/summary")
+        for needle in (
+            "rio-bc-src-v1",
+            "rio-bc-flake-dep-built",
+            "rio-bc-flake-consumer-built",
+        ):
+            assert needle in summary, (
+                f"{needle!r} missing from flake-mode output:\n{summary}"
+            )
+        after = journal_builds_succeeded(worker)
+        assert after >= before + 2, (
+            f"expected >=2 new worker builds for flake leg, {before} -> {after}"
+        )
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';
