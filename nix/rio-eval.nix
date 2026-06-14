@@ -92,6 +92,7 @@ let
   };
 
   fixture = ./fixtures/rio-eval-smoke;
+  flakeFixture = ./fixtures/rio-eval-smoke-flake;
 
   smoke =
     pkgs.runCommand "rio-eval-smoke"
@@ -215,9 +216,47 @@ let
         jq -e '.eval_errors[0][0] == "emptyset"' run4.json
         jq -e '.eval_errors[0][1] | test("zero derivations")' run4.json
 
-        cp run1.json run2.json run3.json run4.json stock.json $TMPDIR/work/ 2>/dev/null || true
+        echo "== run 5: flake mode — parseFlakeRef → lockFlake → callFlake → eval"
+        # lockFlake checks Xp::Flakes against the loaded nix.conf;
+        # the smoke conf dir was empty so far.
+        echo 'experimental-features = nix-command flakes' > $NIX_CONF_DIR/nix.conf
+        # Copy the hermetic flake fixture out of the store (a path
+        # already at a store path would short-circuit `self` ingest)
+        # and backdate past the racy-fingerprint slack.
+        mkdir -p $TMPDIR/work-flake
+        cp -r ${flakeFixture}/. $TMPDIR/work-flake/
+        chmod -R u+w $TMPDIR/work-flake
+        find $TMPDIR/work-flake -exec touch -h -d '1 hour ago' {} +
+        # Stock parity: pinned nix-cli evaluates the same path flake.
+        nix $flags --store "local?root=$TMPDIR/stock-flake" \
+          --extra-experimental-features flakes \
+          eval --no-write-lock-file --raw \
+          "path:$TMPDIR/work-flake#packages.x86_64-linux.hello.drvPath" \
+          > stock-flake.txt
+        eval-harness \
+          --eval-parent ${rioEval}/bin/rio-eval \
+          --cas $TMPDIR/cas5 \
+          --flake "path:$TMPDIR/work-flake" \
+          --attrs packages.x86_64-linux.hello,packages.x86_64-linux.world \
+          > run5.json
+        jq . run5.json
+        test "$(jq '.results | length' run5.json)" = 2
+        stock=$(cat stock-flake.txt)
+        got=$(jq -r '.results[] | select(.attr == "packages.x86_64-linux.hello") | .root_drv_path' run5.json)
+        if [ "$stock" != "$got" ]; then
+          echo "flake drvPath parity FAILED: stock=$stock rio-eval=$got" >&2
+          exit 1
+        fi
+        # leaf+hello+world graph assembled (proves callFlake → forceAttrs
+        # → eval reached the derivations).
+        test "$(jq '.total_nodes' run5.json)" -ge 3
+        # The end-to-end build (self uploaded → worker reads it) is the
+        # vm-build-client flake leg's job; this smoke leg only checks the
+        # eval-parent contract.
+
+        cp run1.json run2.json run3.json run4.json run5.json stock.json $TMPDIR/work/ 2>/dev/null || true
         mkdir -p $out
-        cp run1.json run2.json run3.json run4.json stock.json $out/
+        cp run1.json run2.json run3.json run4.json run5.json stock.json $out/
       '';
 in
 {
