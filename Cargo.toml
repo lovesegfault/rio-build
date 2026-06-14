@@ -4,6 +4,7 @@ members = [
   "rio-cli",
   "rio-common",
   "rio-controller",
+  "rio-evalstore",
   "rio-gateway",
   "rio-lease",
   "rio-migrations",

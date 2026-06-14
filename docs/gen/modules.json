@@ -671,6 +671,33 @@
       "doc": "Pool CRD: spawns one-shot rio-builder Jobs (builder OR fetcher mode)."
     }
   ],
+  "rio-evalstore": [
+    {
+      "path": "cas.rs",
+      "depth": 0,
+      "doc": "On-disk content-addressed store layout + flat-file index."
+    },
+    {
+      "path": "ffi.rs",
+      "depth": 0,
+      "doc": "`extern \"C\"` surface for the C++ shim (`shim/shim.cc`)."
+    },
+    {
+      "path": "lib.rs",
+      "depth": 0,
+      "doc": "Client-side eval store: a persistent content-addressed cache (CAS) that"
+    },
+    {
+      "path": "stats.rs",
+      "depth": 0,
+      "doc": "Per-op count/bytes statistics, dumped to stderr on store drop when"
+    },
+    {
+      "path": "store.rs",
+      "depth": 0,
+      "doc": "The eval-store core: ingest, path computation + cross-checks, read-back."
+    }
+  ],
   "rio-gateway": [
     {
       "path": "config.rs",
