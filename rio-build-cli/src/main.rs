@@ -80,6 +80,20 @@ struct BuildArgs {
     #[arg(long)]
     keep_going: bool,
 
+    /// Renderer: auto picks ci when GITHUB_ACTIONS is set, otherwise
+    /// plain (one line per state edge, for scripts).
+    #[arg(long, value_enum, default_value = "auto")]
+    render: render::RenderMode,
+
+    /// Don't wrap successful build logs in ::group:: folds (CI renderer).
+    #[arg(long)]
+    no_fold: bool,
+
+    /// Seconds a build may produce no output before its tail is dumped
+    /// and further output is streamed live (CI renderer). 0 disables.
+    #[arg(long, default_value = "300", value_name = "SECS")]
+    stall_timeout: u64,
+
     #[command(flatten)]
     overlay: ConfigOverlay,
 }
@@ -116,8 +130,13 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&cas_root)
         .with_context(|| format!("creating CAS root {}", cas_root.display()))?;
 
+    let render_opts = render::RenderOpts {
+        mode: args.render,
+        no_fold: args.no_fold,
+        stall_timeout: args.stall_timeout,
+    };
     if let Some(id) = &args.attach {
-        let (render, render_task) = render::spawn();
+        let (render, render_task) = render::spawn(render_opts);
         let outcome = rio_build_cli::coordinator::attach_build(&mut clients, id, 0, render).await?;
         let _ = render_task.await;
         return finish(
@@ -150,7 +169,7 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
         std::time::Duration::from_secs(cfg.ack_ttl_secs),
     )));
 
-    let (render, render_task) = render::spawn();
+    let (render, render_task) = render::spawn(render_opts);
     let mut coordinator = Coordinator {
         clients: clients.clone(),
         acks,
