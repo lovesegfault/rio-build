@@ -3,22 +3,105 @@
 //! test asserts on it). Written to stderr; stdout is the result-path
 //! surface only.
 
+use std::collections::HashSet;
 use std::io::Write;
 
-use rio_proto::types::{BuildEvent, DerivationEventKind, build_event::Event};
+use rio_proto::types::{BuildEvent, BuildProgress, DerivationEventKind, build_event::Event};
 
 use super::{RenderEvent, short_drv};
 
-pub(super) fn on_event(out: &mut impl Write, ev: &RenderEvent) {
-    match ev {
-        RenderEvent::Build(ev) => {
-            if let Some(s) = line(ev) {
-                let _ = writeln!(out, "{s}");
+/// Progress lines after this many events without one. The cluster
+/// sends a `Progress` after every derivation state edge; rendering
+/// every one made a 4121-drv warm run produce ~7500 lines (2.5/drv).
+/// The interval tick in [`super::spawn`] flushes at 1s regardless.
+const PROGRESS_EVERY_N_EVENTS: u32 = 50;
+
+/// Coalescing state across events. The renderer is otherwise
+/// stateless; this holds only what's needed to (a) emit at most one
+/// `Progress` line per `PROGRESS_EVERY_N_EVENTS` events / 1s tick,
+/// and (b) split the cluster's `running` count into
+/// substituting-vs-building from the `DerivationEvent` edges seen.
+#[derive(Default)]
+pub(super) struct PlainRenderer {
+    /// Latest Progress received but not yet rendered.
+    pending: Option<(String, BuildProgress)>,
+    /// Events since the last Progress line.
+    since_progress: u32,
+    /// drv paths currently in `Substituting` (entered on the edge,
+    /// left on Cached/Completed/Failed). The cluster's
+    /// `BuildProgress.running` covers BOTH substituting and building;
+    /// subtracting this set's size yields actually-building.
+    substituting: HashSet<String>,
+}
+
+impl PlainRenderer {
+    pub(super) fn on_event(&mut self, out: &mut impl Write, ev: &RenderEvent) {
+        match ev {
+            RenderEvent::Build(ev) => self.on_build(out, ev),
+            RenderEvent::Log(_) => {}
+            RenderEvent::Note(s) => {
+                let _ = writeln!(out, "{}", super::term::sanitize_line(s));
             }
         }
-        RenderEvent::Note(s) => {
-            let _ = writeln!(out, "{}", super::term::sanitize_line(s));
+    }
+
+    /// Flush the held-back Progress line if any (1s tick).
+    pub(super) fn tick(&mut self, out: &mut impl Write) {
+        self.flush_progress(out);
+    }
+
+    fn on_build(&mut self, out: &mut impl Write, ev: &BuildEvent) {
+        if let Some(Event::Derivation(d)) = ev.event.as_ref() {
+            match DerivationEventKind::try_from(d.kind) {
+                Ok(DerivationEventKind::Substituting) => {
+                    self.substituting.insert(d.derivation_path.clone());
+                }
+                // Any non-Substituting edge closes a substituting row.
+                // Substituting → Queued/Started is the RC-A reset (the
+                // fetch downgraded; the build really starts now) — same
+                // handling as the ci/tty renderers. Cached/Completed/
+                // Failed are terminal.
+                Ok(_) => {
+                    self.substituting.remove(&d.derivation_path);
+                }
+                Err(_) => {}
+            }
         }
+        if let Some(Event::Progress(p)) = ev.event.as_ref() {
+            self.pending = Some((ev.build_id.clone(), p.clone()));
+            self.since_progress += 1;
+            if self.since_progress >= PROGRESS_EVERY_N_EVENTS {
+                self.flush_progress(out);
+            }
+            return;
+        }
+        // Non-Progress events flush any pending Progress first when
+        // the line is terminal — keeps the final status line ordered
+        // before "completed:" / "FAILED".
+        if matches!(
+            ev.event.as_ref(),
+            Some(Event::Completed(_) | Event::Failed(_) | Event::Cancelled(_))
+        ) {
+            self.flush_progress(out);
+        }
+        self.since_progress += 1;
+        if let Some(s) = line(ev) {
+            let _ = writeln!(out, "{s}");
+        }
+    }
+
+    fn flush_progress(&mut self, out: &mut impl Write) {
+        if let Some((id, p)) = self.pending.take() {
+            let id_short = id.get(..8).unwrap_or(&id);
+            let sub = self.substituting.len() as u32;
+            let building = p.running.saturating_sub(sub);
+            let _ = writeln!(
+                out,
+                "[{id_short}] {}/{} done, {} substituting, {} building, {} queued",
+                p.completed, p.total, sub, building, p.queued
+            );
+        }
+        self.since_progress = 0;
     }
 }
 
@@ -54,10 +137,10 @@ pub fn line(ev: &BuildEvent) -> Option<String> {
             }
             Some(s)
         }
-        Event::Progress(p) => Some(format!(
-            "[{id_short}] {}/{} done, {} building, {} queued",
-            p.completed, p.total, p.running, p.queued
-        )),
+        // Progress is coalesced by `PlainRenderer` (held back until
+        // the every-N-events / 1s tick flush) and rendered with the
+        // substituting/building split — never one line per edge here.
+        Event::Progress(_) => None,
         Event::Completed(c) => Some(format!(
             "[{id_short}] completed: {}",
             c.output_paths.join(" ")
@@ -111,7 +194,7 @@ mod tests {
     #[test]
     fn on_event_writes_to_sink() {
         let mut buf = Vec::new();
-        on_event(
+        PlainRenderer::default().on_event(
             &mut buf,
             &RenderEvent::Build(ev(Event::Derivation(DerivationEvent {
                 derivation_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".into(),
@@ -122,5 +205,98 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("queued"), "{s}");
         assert!(s.ends_with('\n'));
+    }
+
+    fn drv(path: &str, kind: DerivationEventKind) -> RenderEvent {
+        RenderEvent::Build(ev(Event::Derivation(DerivationEvent {
+            derivation_path: path.into(),
+            kind: kind as i32,
+            ..Default::default()
+        })))
+    }
+
+    fn progress(completed: u32, running: u32, queued: u32, total: u32) -> RenderEvent {
+        RenderEvent::Build(ev(Event::Progress(BuildProgress {
+            completed,
+            running,
+            queued,
+            total,
+            ..Default::default()
+        })))
+    }
+
+    #[test]
+    fn progress_coalesced_and_split_substituting() {
+        let mut r = PlainRenderer::default();
+        let mut buf = Vec::new();
+        // Substituting edges + Progress events: nothing emitted until
+        // the tick (or the 50-event threshold) flushes.
+        r.on_event(
+            &mut buf,
+            &drv("/nix/store/a", DerivationEventKind::Substituting),
+        );
+        r.on_event(
+            &mut buf,
+            &drv("/nix/store/b", DerivationEventKind::Substituting),
+        );
+        r.on_event(&mut buf, &progress(0, 5, 10, 100));
+        r.on_event(&mut buf, &progress(1, 5, 9, 100));
+        let s = std::str::from_utf8(&buf).unwrap();
+        // Only the two derivation-edge lines so far; Progress held back.
+        assert_eq!(s.lines().count(), 2, "{s}");
+        assert!(!s.contains("done"), "{s}");
+        // Tick flushes the LATEST Progress with the substituting split.
+        r.tick(&mut buf);
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert!(
+            s.contains("1/100 done, 2 substituting, 3 building, 9 queued"),
+            "{s}"
+        );
+        // Cached closes a substituting drv.
+        r.on_event(&mut buf, &drv("/nix/store/a", DerivationEventKind::Cached));
+        r.on_event(&mut buf, &progress(2, 4, 9, 100));
+        r.tick(&mut buf);
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert!(
+            s.contains("2/100 done, 1 substituting, 3 building, 9 queued"),
+            "{s}"
+        );
+        // RC-A: Substituting → Started resets (the fetch downgraded;
+        // the drv counts as building now, not substituting).
+        r.on_event(&mut buf, &drv("/nix/store/b", DerivationEventKind::Started));
+        r.on_event(&mut buf, &progress(2, 4, 9, 100));
+        r.tick(&mut buf);
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert!(
+            s.contains("2/100 done, 0 substituting, 4 building, 9 queued"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn progress_flushed_on_threshold_and_before_terminal() {
+        let mut r = PlainRenderer::default();
+        let mut buf = Vec::new();
+        for i in 0..PROGRESS_EVERY_N_EVENTS {
+            r.on_event(&mut buf, &progress(i, 1, 0, 100));
+        }
+        // The Nth Progress event flushes (no tick needed).
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert_eq!(s.lines().count(), 1, "{s}");
+        // Terminal event flushes any pending Progress first.
+        let mut r = PlainRenderer::default();
+        let mut buf = Vec::new();
+        r.on_event(&mut buf, &progress(99, 0, 0, 100));
+        r.on_event(
+            &mut buf,
+            &RenderEvent::Build(ev(Event::Completed(BuildCompleted {
+                output_paths: vec!["/nix/store/x-out".into()],
+            }))),
+        );
+        let s = std::str::from_utf8(&buf).unwrap();
+        let lines: Vec<_> = s.lines().collect();
+        assert_eq!(lines.len(), 2, "{s}");
+        assert!(lines[0].contains("99/100 done"), "{s}");
+        assert!(lines[1].contains("completed:"), "{s}");
     }
 }
