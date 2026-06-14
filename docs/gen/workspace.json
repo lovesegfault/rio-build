@@ -286,6 +286,7 @@
     },
     "xtask": {
       "prod": [
+        "rio-auth",
         "rio-common",
         "rio-crds",
         "rio-migrations",

@@ -348,6 +348,27 @@ pub enum K8sCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
     },
+    /// Run the native `rio build` client (ADR-024) LOCALLY against a
+    /// port-forwarded scheduler+store. Resolves the tenant, mints a
+    /// short-lived tenant JWT under the cluster's signing key, and
+    /// hands it to `rio build` via /dev/fd — same plumbing CliTunnel
+    /// uses for the service-HMAC key.
+    #[command(visible_alias = "build")]
+    BuildTunnel {
+        /// Tenant the build runs as. Must already exist
+        /// (`cargo xtask k8s cli -- create-tenant <name>`).
+        #[arg(long, default_value = "default")]
+        tenant: String,
+        /// Local port for scheduler:9001 forward. 0 = ephemeral.
+        #[arg(long, default_value_t = 0)]
+        sched_port: u16,
+        /// Local port for store:9002 forward. 0 = ephemeral.
+        #[arg(long, default_value_t = 0)]
+        store_port: u16,
+        /// Passed through to `rio build`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
     /// NixOS node AMI management (ADR-021). EKS-only — `up --ami`
     /// builds + registers; this is the maintenance side.
     #[command(subcommand)]
@@ -536,6 +557,12 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             })
             .await
         }
+        K8sCmd::BuildTunnel {
+            tenant,
+            sched_port,
+            store_port,
+            args,
+        } => with_build_tunnel(&*p, &tenant, sched_port, store_port, &args).await,
         K8sCmd::Grant {
             pubkey,
             tenant,
@@ -868,6 +895,94 @@ where
         }
     };
     f(&sh)
+}
+
+// TODO: dev-cluster interim. Minting the tenant JWT here requires reading
+// the gateway's signing Secret, i.e. cluster-admin access. The production
+// path for native clients is a gateway token-issue endpoint plus external
+// gRPC ingress; once that exists this command should obtain its token
+// there and stop touching the Secret.
+/// Port-forward scheduler:9001 + store:9002 and run `rio build <args>`
+/// as `tenant`. The tenant name is resolved to its UUID over the
+/// scheduler tunnel, a session-shaped JWT (same claims as the gateway's
+/// `mint_session_jwt`) is signed with the cluster's `rio-jwt-signing`
+/// seed, and the token rides an anonymous memfd
+/// (`RIO_TENANT_TOKEN_PATH=/dev/fd/N`) so it never touches disk.
+async fn with_build_tunnel(
+    p: &dyn Provider,
+    tenant: &str,
+    sched: u16,
+    store: u16,
+    args: &[String],
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let ((sched, _g1), (store, _g2)) =
+        ui::step("tunnel scheduler+store", || p.tunnel_grpc(sched, store)).await?;
+
+    // Signing key first: failing on a cluster without JWT support
+    // before the resolve RPC keeps the error unambiguous.
+    let client = kube::client().await?;
+    let signing_key = shared::jwt_signing_key(&client).await?;
+
+    // Resolve tenant name → UUID over the forwarded scheduler.
+    // ResolveTenant is unauthenticated and not leader-gated, so a bare
+    // channel is enough.
+    let tenant_id = ui::step("resolve tenant", || async {
+        let ch = rio_proto::client::connect_channel(&format!("localhost:{sched}")).await?;
+        let resp = rio_proto::SchedulerServiceClient::new(ch)
+            .resolve_tenant(rio_proto::scheduler::ResolveTenantRequest {
+                tenant_name: tenant.to_owned(),
+            })
+            .await
+            .map_err(|status| {
+                anyhow!(
+                    "ResolveTenant({tenant}): {} ({}); create it first with \
+                     `cargo xtask k8s cli -- create-tenant {tenant}`",
+                    status.message(),
+                    status.code()
+                )
+            })?;
+        resp.into_inner()
+            .tenant_id
+            .parse::<uuid::Uuid>()
+            .context("scheduler returned unparseable tenant_id UUID")
+    })
+    .await?;
+
+    // Same claim shape as the gateway's mint_session_jwt: 1h + 5min
+    // grace TTL, fresh jti per invocation.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before 1970")
+        .as_secs() as i64;
+    let claims = rio_auth::jwt::TenantClaims {
+        sub: tenant_id,
+        iat: now,
+        exp: now + 3600 + 300,
+        jti: uuid::Uuid::new_v4().to_string(),
+    };
+    let token = rio_auth::jwt::sign(&claims, &signing_key)?;
+
+    let sh = sh::shell()?;
+    let _e1 = sh.push_env("RIO_SCHEDULER_ADDR", format!("localhost:{sched}"));
+    let _e2 = sh.push_env("RIO_STORE_ADDR", format!("localhost:{store}"));
+    let token_fd = shared::bytes_to_memfd(token.as_bytes())?;
+    let _e3 = sh.push_env(
+        "RIO_TENANT_TOKEN_PATH",
+        format!("/dev/fd/{}", token_fd.as_raw_fd()),
+    );
+    // RIO_CAS_ROOT stays unset: the client already defaults to
+    // $XDG_CACHE_HOME/rio/evalstore.
+
+    // `rio build` needs the eval parent (RIO_EVAL_PARENT), which only
+    // the nix-built pair wires up — so unlike CliTunnel there is no
+    // `cargo run` fallback; use `nix run .#rio` instead.
+    let on_path = sh::read(sh::cmd!(sh, "command -v rio")).is_ok();
+    if on_path {
+        sh::run_interactive(sh::cmd!(sh, "rio build {args...}"))
+    } else {
+        sh::run_interactive(sh::cmd!(sh, "nix run .#rio -- build {args...}"))
+    }
 }
 
 #[cfg(test)]

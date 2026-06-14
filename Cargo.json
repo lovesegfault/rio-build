@@ -31418,6 +31418,10 @@
           "packageId": "reqwest"
         },
         {
+          "name": "rio-auth",
+          "packageId": "rio-auth"
+        },
+        {
           "name": "rio-common",
           "packageId": "rio-common"
         },
@@ -31504,6 +31508,10 @@
         {
           "name": "tracing-subscriber",
           "packageId": "tracing-subscriber"
+        },
+        {
+          "name": "uuid",
+          "packageId": "uuid"
         },
         {
           "name": "xshell",

@@ -9612,6 +9612,7 @@ dependencies = [
  "rand 0.10.1",
  "regex",
  "reqwest",
+ "rio-auth",
  "rio-common",
  "rio-crds",
  "rio-migrations",
@@ -9634,6 +9635,7 @@ dependencies = [
  "tonic-health",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "xshell",
 ]
 
