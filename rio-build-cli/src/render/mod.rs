@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 pub mod plain;
+pub mod term;
 
 /// What the coordinator hands the renderer.
 #[derive(Debug)]

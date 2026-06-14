@@ -1611,6 +1611,46 @@
         "lib"
       ]
     },
+    "console": {
+      "crateName": "console",
+      "version": "0.16.3",
+      "edition": "2021",
+      "sha256": "11zwz1vnfr0nx6dyjx0gjymp8864y5hxwf01ynfd2s8kapsqlknn",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "encode_unicode",
+          "packageId": "encode_unicode",
+          "target": "cfg(windows)"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
+          "name": "unicode-width",
+          "packageId": "unicode-width"
+        },
+        {
+          "name": "windows-sys",
+          "packageId": "windows-sys 0.61.2",
+          "target": "cfg(windows)"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "ansi-parsing",
+        "default",
+        "std",
+        "unicode-width",
+        "windows-console-colors"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "const-oid": {
       "crateName": "const-oid",
       "version": "0.10.2",
@@ -2876,6 +2916,25 @@
       ],
       "authors": [
         "RustCrypto Developers"
+      ]
+    },
+    "encode_unicode": {
+      "crateName": "encode_unicode",
+      "version": "1.0.0",
+      "edition": "2021",
+      "sha256": "1h5j7j7byi289by63s3w4a8b3g6l5ccdrws7a67nn07vdxj77ail",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Torbjørn Birch Moltu <t.b.moltu@lyse.net>"
       ]
     },
     "endian-type": {
@@ -14083,6 +14142,26 @@
         "David Tolnay <dtolnay@gmail.com>"
       ]
     },
+    "unicode-width": {
+      "crateName": "unicode-width",
+      "version": "0.2.2",
+      "edition": "2021",
+      "sha256": "0m7jjzlcccw716dy9423xxh0clys8pfpllc5smvfxrzdf66h9b5l",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "cjk",
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "kwantam <kwantam@gmail.com>",
+        "Manish Goregaokar <manishsmail@gmail.com>"
+      ]
+    },
     "unicode-xid": {
       "crateName": "unicode-xid",
       "version": "0.2.6",
@@ -15078,6 +15157,9 @@
         "Win32_System_Threading",
         "Win32_System_Time",
         "Win32_System_WindowsProgramming",
+        "Win32_UI",
+        "Win32_UI_Input",
+        "Win32_UI_Input_KeyboardAndMouse",
         "default"
       ],
       "libCrateTypes": [
@@ -15606,6 +15688,10 @@
         {
           "name": "cipher",
           "packageId": "cipher"
+        },
+        {
+          "name": "console",
+          "packageId": "console"
         },
         {
           "name": "crossbeam-epoch",
@@ -16197,6 +16283,10 @@
         {
           "name": "cipher",
           "packageId": "cipher"
+        },
+        {
+          "name": "console",
+          "packageId": "console"
         },
         {
           "name": "crossbeam-epoch",

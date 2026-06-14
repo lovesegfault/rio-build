@@ -108,6 +108,11 @@
       "path": "render/plain.rs",
       "depth": 1,
       "doc": "The status-line renderer: one line per state edge, no log/phase events."
+    },
+    {
+      "path": "render/term.rs",
+      "depth": 1,
+      "doc": "Terminal/CI output helpers shared by the build-log renderers."
     }
   ],
   "rio-builder": [
