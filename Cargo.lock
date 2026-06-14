@@ -9470,6 +9470,7 @@ dependencies = [
  "hyper-util",
  "indexmap 2.14.0",
  "inout 0.2.2",
+ "ipnet",
  "jiff",
  "k8s-openapi",
  "kube",
