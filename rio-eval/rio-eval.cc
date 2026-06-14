@@ -360,6 +360,23 @@ int main(int argc, char ** argv)
          * outlives the pre-fork warmup — a residual fork-safety gap
          * until nix grows a way to tear that singleton down. Path
          * flakes and --file mode never start it. */
+
+        /* initLibStore opens the local-store db lock under
+         * NIX_STATE_DIR (default /nix/var/nix), failing on any
+         * read-only-nix-store / unprivileged-container client even
+         * though rio-eval's only store is rio:// and nothing here
+         * touches the local store. Default the state dir to a
+         * per-user XDG path so an unset env doesn't surface that
+         * lock as "Read-only file system". */
+        if (!std::getenv("NIX_STATE_DIR")) {
+            const char * base = std::getenv("XDG_STATE_HOME");
+            std::filesystem::path dir = base && *base
+                ? std::filesystem::path(base)
+                : std::filesystem::path(std::getenv("HOME") ?: "/tmp") / ".local/state";
+            dir /= "rio-eval/nix";
+            std::filesystem::create_directories(dir);
+            setenv("NIX_STATE_DIR", dir.c_str(), 1);
+        }
         nix::initLibStore(true);
         nix::unix::saveSignalMask();
         {
