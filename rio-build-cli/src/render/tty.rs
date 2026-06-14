@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use rio_proto::types::DerivationEventKind;
 use tokio::sync::Notify;
 
-use super::term::{clip_ansi, subseq_match, trunc_middle};
+use super::term::{clip_ansi, sanitize_line, subseq_match, trunc_middle};
 use super::{Clock, DrvEdge, DrvRow, RenderEvent, fmt_duration, ingest_log, route, wall_clock};
 
 const CSI: &str = "\x1b[";
@@ -270,9 +270,16 @@ impl<W: Write> TtyRenderer<W> {
     // ── event ingestion ────────────────────────────────────────────
 
     pub fn on_event(&mut self, ev: &RenderEvent) {
-        let RenderEvent::Build(ev) = ev;
+        let (build_id, edge) = match ev {
+            RenderEvent::Build(ev) => (ev.build_id.as_str(), route(ev)),
+            RenderEvent::Log(b) => ("", DrvEdge::Log(b)),
+            RenderEvent::Note(s) => {
+                self.display.permanent(&[sanitize_line(s)]);
+                return;
+            }
+        };
         let now = self.now();
-        match route(ev) {
+        match edge {
             DrvEdge::Open(d) => {
                 let kind = DerivationEventKind::try_from(d.kind).ok();
                 if let Some(row) = self.rows.get_mut(&d.derivation_path) {
@@ -307,27 +314,31 @@ impl<W: Write> TtyRenderer<W> {
             }
             DrvEdge::Phase(p) => {
                 if let Some(row) = self.rows.get_mut(&p.derivation_path) {
-                    row.phase = Some(p.phase.clone());
-                    row.push_line(format!("@ phase {}", p.phase), now);
+                    let phase = sanitize_line(&p.phase);
+                    row.push_line(format!("@ phase {phase}"), now);
+                    row.phase = Some(phase);
                 }
             }
             DrvEdge::Substitute(p) => {
                 if let Some(row) = self.rows.get_mut(&p.derivation_path) {
                     row.last_output_at = now;
-                    let line = format!(
+                    // Replace, don't append: a substituting row carries
+                    // one synthetic progress line.
+                    row.lines.clear();
+                    row.lines.push_back(sanitize_line(&format!(
                         "{:.1}/{:.1} MiB from {}",
                         p.bytes_done as f64 / (1 << 20) as f64,
                         p.bytes_expected as f64 / (1 << 20) as f64,
                         p.upstream_uri
-                    );
-                    // Replace, don't append: a substituting row carries
-                    // one synthetic progress line.
-                    row.lines.clear();
-                    row.lines.push_back(line);
+                    )));
                 }
             }
             DrvEdge::Close { kind, drv } => {
-                self.finish_drv(&drv.derivation_path, kind, &drv.error_message);
+                self.finish_drv(
+                    &drv.derivation_path,
+                    kind,
+                    &sanitize_line(&drv.error_message),
+                );
             }
             DrvEdge::Drain { build_id } => {
                 // This build was cancelled/failed: drop its still-open

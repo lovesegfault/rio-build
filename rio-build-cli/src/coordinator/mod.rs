@@ -326,6 +326,8 @@ impl Coordinator {
                             continue;
                         }
                         info!(drv = %drv_path, "IFD stall: building remotely");
+                        self.render
+                            .note(format!("IFD stall: building {drv_path} remotely"));
                         let digest: Digest32 =
                             node.drv_digest.as_slice().try_into().map_err(|_| {
                                 anyhow::anyhow!("IfdRequest drv_digest is not 32 bytes")
@@ -362,6 +364,9 @@ impl Coordinator {
                                 "skipping attrset entry: neither a derivation nor a recursable \
                                  attrset"
                             );
+                            self.render.note(format!(
+                                "skipping {skipped}: neither a derivation nor a recursable attrset"
+                            ));
                         }
                         if exp.children.is_empty() {
                             // The worker normally errors instead of
@@ -384,6 +389,11 @@ impl Coordinator {
                             children = exp.children.len(),
                             "attrset installable expanded"
                         );
+                        self.render.note(format!(
+                            "{}: expanded to {} derivations",
+                            exp.attr,
+                            exp.children.len()
+                        ));
                         for child in exp.children {
                             if !requested.insert(child.clone()) {
                                 continue;
@@ -411,6 +421,8 @@ impl Coordinator {
                         }
                         expected.remove(&e.attr);
                         warn!(attr = %e.attr, error = %e.message, "attr failed to evaluate");
+                        self.render
+                            .note(format!("{}: evaluation failed: {}", e.attr, e.message));
                         eval_failures.push(BuildOutcome {
                             attr: e.attr,
                             build_id: String::new(),
@@ -583,7 +595,9 @@ impl Coordinator {
                 // Builds keep running; tell the user how to come back.
                 detached = true;
                 for (attr, id) in &pending {
-                    eprintln!("detached: {attr} continues as build {id} — rio build --attach {id}");
+                    self.render.note(format!(
+                        "detached: {attr} continues as build {id} — rio build --attach {id}"
+                    ));
                     outcomes.push(BuildOutcome {
                         attr: attr.clone(),
                         build_id: id.clone(),
@@ -605,15 +619,15 @@ impl Coordinator {
                             biased;
                             _ = next_interrupt(&mut interrupt) => aborted = true,
                             res = cancel_build(&mut self.clients, id) => {
-                                match res {
-                                    Ok(true) => eprintln!("interrupted: cancelled {attr} (build {id})"),
+                                self.render.note(match res {
+                                    Ok(true) => format!("interrupted: cancelled {attr} (build {id})"),
                                     Ok(false) => {
-                                        eprintln!("interrupted: {attr} (build {id}) already terminal")
+                                        format!("interrupted: {attr} (build {id}) already terminal")
                                     }
-                                    Err(e) => eprintln!(
+                                    Err(e) => format!(
                                         "interrupted: cancelling {attr} (build {id}) failed: {e:#}"
                                     ),
-                                }
+                                });
                                 outcomes.push(BuildOutcome {
                                     attr: attr.clone(),
                                     build_id: id.clone(),
@@ -627,10 +641,10 @@ impl Coordinator {
                         }
                     }
                     if aborted {
-                        eprintln!(
+                        self.render.note(format!(
                             "interrupted again: {attr} may still be running as build {id} — \
                              rio build --attach {id} (or --cancel {id})"
-                        );
+                        ));
                         outcomes.push(BuildOutcome {
                             attr: attr.clone(),
                             build_id: id.clone(),

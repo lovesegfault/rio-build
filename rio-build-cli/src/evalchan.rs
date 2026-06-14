@@ -72,10 +72,13 @@ impl EvalChannel {
 }
 
 /// Spawn the eval parent with its channel end on fd 3 and return the
-/// coordinator's end plus the child handle.
+/// coordinator's end plus the child handle. With `pipe_stderr`, the
+/// child's stderr is captured (the caller forwards it through the
+/// renderer so it doesn't land inside the TTY ephemeral region).
 pub fn spawn_eval_parent(
     program: &Path,
     args: &[String],
+    pipe_stderr: bool,
 ) -> anyhow::Result<(EvalChannel, tokio::process::Child)> {
     use std::os::fd::{AsRawFd, IntoRawFd};
 
@@ -83,9 +86,14 @@ pub fn spawn_eval_parent(
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .stdin(Stdio::null())
-        // Eval diagnostics pass through to the user's terminal.
+        // Eval diagnostics pass through to the user's terminal — or
+        // through the renderer when the live region is up.
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stderr(if pipe_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        });
     let theirs_fd = theirs.into_raw_fd();
     // SAFETY: pre_exec runs post-fork pre-exec in the child; dup2 and
     // fcntl are async-signal-safe. `ours` is not inherited (CLOEXEC by

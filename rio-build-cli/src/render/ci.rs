@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use rio_proto::types::DerivationEventKind;
 
+use super::term::sanitize_line;
 use super::{Clock, DrvEdge, DrvRow, RenderEvent, fmt_duration, ingest_log, route, wall_clock};
 
 /// Unfolded tail of a failure log; earlier output gets folded.
@@ -80,9 +81,19 @@ impl<W: Write> CiRenderer<W> {
     }
 
     pub fn on_event(&mut self, ev: &RenderEvent) {
-        let RenderEvent::Build(ev) = ev;
+        let (build_id, edge) = match ev {
+            RenderEvent::Build(ev) => (ev.build_id.as_str(), route(ev)),
+            RenderEvent::Log(b) => ("", DrvEdge::Log(b)),
+            RenderEvent::Note(s) => {
+                // Notes carry eval-error text and attr names from user
+                // input — sanitize and prefix like log lines so they
+                // can't smuggle ::group::/::error:: at line start.
+                self.print(&[format!("· {}", sanitize_line(s))]);
+                return;
+            }
+        };
         let now = (self.opts.clock)();
-        match route(ev) {
+        match edge {
             DrvEdge::Open(d) => {
                 let kind = DerivationEventKind::try_from(d.kind).ok();
                 if let Some(row) = self.running.get_mut(&d.derivation_path) {
@@ -121,8 +132,9 @@ impl<W: Write> CiRenderer<W> {
             }
             DrvEdge::Phase(p) => {
                 if let Some(row) = self.running.get_mut(&p.derivation_path) {
-                    row.phase = Some(p.phase.clone());
-                    row.push_line(format!("@ phase {}", p.phase), now);
+                    let phase = sanitize_line(&p.phase);
+                    row.push_line(format!("@ phase {phase}"), now);
+                    row.phase = Some(phase);
                 }
             }
             DrvEdge::Substitute(p) => {
@@ -137,7 +149,7 @@ impl<W: Write> CiRenderer<W> {
             }
             DrvEdge::Close { kind, drv } => {
                 if let Some(row) = self.running.remove(&drv.derivation_path) {
-                    self.finish(row, kind, &drv.error_message);
+                    self.finish(row, kind, &sanitize_line(&drv.error_message));
                 }
             }
             DrvEdge::Drain { build_id } => {
@@ -462,13 +474,31 @@ mod tests {
         });
         r.on_event(&drv(DRV_A, DerivationEventKind::Started));
         r.on_event(&log(DRV_A, 0, &["::endgroup::", "10%\r100%", "a\x1b[2Jb"]));
-        r.on_event(&drv(DRV_A, DerivationEventKind::Completed));
+        // Phase, error_message and Note carry build/eval-derived strings
+        // too — same sanitize+prefix discipline.
+        r.on_event(&ev(Event::Phase(BuildPhase {
+            derivation_path: DRV_A.into(),
+            phase: "x\r::error::evil".into(),
+        })));
+        r.on_event(&ev(Event::Derivation(DerivationEvent {
+            derivation_path: DRV_A.into(),
+            kind: DerivationEventKind::Failed as i32,
+            error_message: "boom\r::add-mask::secret".into(),
+            ..Default::default()
+        })));
+        r.on_event(&RenderEvent::Note("eval: \r::group::leaked".into()));
         let t = text(&buf);
-        // Prefix neutralizes CI command injection.
+        // Short failure log → renderer emits no fold markers of its own;
+        // any line starting :: would be an injection.
+        for line in t.lines() {
+            assert!(!line.starts_with("::"), "injected line start: {line:?}");
+        }
+        // Prefix neutralizes CI command injection from log lines.
         assert!(t.contains("pkg-a.drv> ::endgroup::"), "{t}");
-        assert!(!t.contains("\n::endgroup::\npkg-a.drv>"), "{t}");
         assert!(t.contains("pkg-a.drv> 100%"), "{t}");
         assert!(t.contains("pkg-a.drv> ab"), "{t}");
+        // CR-overwrite ate "eval: " — fine, the prefix is what matters.
+        assert!(t.contains("· ::group::leaked"), "{t}");
     }
 
     #[test]

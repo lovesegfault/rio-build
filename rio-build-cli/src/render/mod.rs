@@ -28,7 +28,10 @@ pub enum RenderEvent {
     Build(BuildEvent),
     /// A log batch from the store-side `LogService.TailLog` stream.
     Log(BuildLogBatch),
-}
+    /// One non-build line (eval-parent stderr, coordinator messages).
+    /// Anything written to stderr behind the TTY display's back lands
+    /// inside the ephemeral region and corrupts it.
+    Note(String),
 }
 
 /// Cloneable sender into the renderer task. `send` never blocks; a
@@ -46,6 +49,10 @@ impl RenderHandle {
         if let Some(tx) = &self.0 {
             let _ = tx.send(ev);
         }
+    }
+
+    pub fn note(&self, msg: impl Into<String>) {
+        self.send(RenderEvent::Note(msg.into()));
     }
 }
 
