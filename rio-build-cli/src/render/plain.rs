@@ -1,24 +1,24 @@
-//! Stage 5: per-drv status lines from `BuildEvent` streams.
-//!
-//! Pure formatting — the coordinator decides where lines go (stdout in
-//! the CLI, nowhere in tests). One line per state edge; log batches
-//! and byte-progress events are deliberately not rendered (this is a
-//! status surface, not a log pipe — `--attach` against a chatty build
-//! must not flood the terminal).
+//! The status-line renderer: one line per state edge, no log/phase
+//! events. Script-compatible — the output format is frozen (the VM
+//! test asserts on it). Written to stderr; stdout is the result-path
+//! surface only.
+
+use std::io::Write;
 
 use rio_proto::types::{BuildEvent, DerivationEventKind, build_event::Event};
 
-/// Short display name for a drv path (`/nix/store/<hash>-foo.drv` →
-/// `foo.drv`).
-fn short_drv(path: &str) -> &str {
-    let base = path.rsplit('/').next().unwrap_or(path);
-    match base.split_once('-') {
-        Some((hash, rest)) if hash.len() == 32 => rest,
-        _ => base,
+use super::{RenderEvent, short_drv};
+
+pub(super) fn on_event(out: &mut impl Write, ev: &RenderEvent) {
+    let RenderEvent::Build(ev) = ev;
+    if let Some(s) = line(ev) {
+        let _ = writeln!(out, "{s}");
     }
 }
 
-/// Render one event to a status line. `None` = not a status edge.
+/// Render one event to a status line. `None` = not a status edge
+/// (log/phase/progress are deliberately not rendered — this is a
+/// status surface, not a log pipe).
 pub fn line(ev: &BuildEvent) -> Option<String> {
     let id_short = ev.build_id.get(..8).unwrap_or(&ev.build_id);
     match ev.event.as_ref()? {
@@ -100,5 +100,21 @@ mod tests {
             output_paths: vec!["/nix/store/x-out".into()],
         }));
         assert!(line(&done).unwrap().contains("/nix/store/x-out"));
+    }
+
+    #[test]
+    fn on_event_writes_to_sink() {
+        let mut buf = Vec::new();
+        on_event(
+            &mut buf,
+            &RenderEvent::Build(ev(Event::Derivation(DerivationEvent {
+                derivation_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".into(),
+                kind: DerivationEventKind::Queued as i32,
+                ..Default::default()
+            }))),
+        );
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("queued"), "{s}");
+        assert!(s.ends_with('\n'));
     }
 }

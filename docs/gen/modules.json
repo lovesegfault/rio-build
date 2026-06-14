@@ -93,9 +93,14 @@
       "doc": "`rio` — the native-protocol build client binary (ADR-024 P3)."
     },
     {
-      "path": "render.rs",
+      "path": "render/",
       "depth": 0,
-      "doc": "Stage 5: per-drv status lines from `BuildEvent` streams."
+      "doc": "Stage 5: build-log rendering."
+    },
+    {
+      "path": "render/plain.rs",
+      "depth": 1,
+      "doc": "The status-line renderer: one line per state edge, no log/phase"
     }
   ],
   "rio-builder": [
