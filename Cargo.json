@@ -19299,6 +19299,10 @@
           "packageId": "clap"
         },
         {
+          "name": "console",
+          "packageId": "console"
+        },
+        {
           "name": "hex",
           "packageId": "hex"
         },
@@ -19309,6 +19313,10 @@
         {
           "name": "prost",
           "packageId": "prost"
+        },
+        {
+          "name": "regex",
+          "packageId": "regex"
         },
         {
           "name": "rio-common",
@@ -29272,6 +29280,10 @@
           "packageId": "cipher"
         },
         {
+          "name": "console",
+          "packageId": "console"
+        },
+        {
           "name": "crossbeam-epoch",
           "packageId": "crossbeam-epoch"
         },
@@ -29841,6 +29853,10 @@
         {
           "name": "cipher",
           "packageId": "cipher"
+        },
+        {
+          "name": "console",
+          "packageId": "console"
         },
         {
           "name": "crossbeam-epoch",

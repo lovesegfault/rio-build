@@ -25,6 +25,7 @@ byteorder = { version = "1" }
 bytes = { version = "1" }
 chacha20 = { version = "0.10", default-features = false, features = ["legacy", "rng", "zeroize"] }
 cipher = { version = "0.5", default-features = false, features = ["block-padding", "stream-wrapper"] }
+console = { version = "0.16", features = ["windows-console-colors"] }
 crossbeam-epoch = { version = "0.9" }
 crossbeam-utils = { version = "0.8" }
 crypto-bigint = { version = "0.7", features = ["alloc", "getrandom", "hybrid-array", "subtle", "zeroize"] }
@@ -143,6 +144,7 @@ bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 chacha20 = { version = "0.10", default-features = false, features = ["legacy", "rng", "zeroize"] }
 cipher = { version = "0.5", default-features = false, features = ["block-padding", "stream-wrapper"] }
+console = { version = "0.16", features = ["windows-console-colors"] }
 crossbeam-epoch = { version = "0.9" }
 crossbeam-utils = { version = "0.8" }
 crypto-bigint = { version = "0.7", features = ["alloc", "getrandom", "hybrid-array", "subtle", "zeroize"] }
