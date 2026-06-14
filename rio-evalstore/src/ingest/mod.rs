@@ -281,3 +281,113 @@ pub fn ingest_tree_with_stats(
 ) -> Result<(IngestResult, IngestRunStats), IngestError> {
     pipeline::run(root, config)
 }
+
+/// A pre-walked tree shape: what a nix `SourceAccessor` saw, with each
+/// regular file's physical filesystem path. Produced by the C++ shim's
+/// accessor walk for filtered sources (git workdir flake `self`): the
+/// accessor's view is the tracked-files subset, but every visible file
+/// still maps to a real path on disk.
+#[derive(Debug, Clone)]
+pub enum ManifestNode {
+    /// A regular file — content lives at `physical` on disk.
+    File {
+        /// Any execute bit set on the accessor's lstat.
+        executable: bool,
+        /// File size from the accessor's lstat (the read must agree).
+        size: u64,
+        /// Absolute on-disk path the readers open.
+        physical: PathBuf,
+    },
+    /// A symlink (target as the accessor reports it).
+    Symlink {
+        /// readlink result, raw bytes.
+        target: Vec<u8>,
+    },
+    /// A directory with byte-lex sorted entries (NAR order, as the
+    /// accessor's `readDirectory` — a `std::map` — yields them).
+    Dir {
+        /// Sorted (name, child) pairs.
+        entries: Vec<(Vec<u8>, ManifestNode)>,
+    },
+}
+
+/// Ingest a pre-walked tree: same single-read two-plane pipeline as
+/// [`ingest_tree`], but discovery is already done — the manifest IS the
+/// tree shape. Only file reads run on the parallel reader pool, opening
+/// each regular file at its `physical` path; the NAR-sha256 spine and the
+/// chunk plane are unchanged. This is the filtered-accessor route: the
+/// filtered view fixes the structure, the physical paths are where the
+/// bytes live.
+pub fn ingest_manifest(
+    root: &ManifestNode,
+    config: &IngestConfig,
+) -> Result<IngestResult, IngestError> {
+    pipeline::run_manifest(root, config).map(|(result, _)| result)
+}
+
+/// Decode the shim's accessor-manifest buffer (see `rio_evalstore.h`,
+/// `rio_add_filtered_tree`) into a [`ManifestNode`]. Layout, native-
+/// endian, recursive: `u8 kind`, then per kind — REGULAR: `u8 exec, u64
+/// size, u32 plen, path`; SYMLINK: `u32 tlen, target`; DIRECTORY: `u32
+/// count, (u32 nlen, name, node)*`. Integers are unaligned. Malformed
+/// input is a programming error in the shim — both sides are compiled
+/// from the same tree — so a short or trailing buffer is reported as an
+/// I/O failure rather than tolerated.
+pub fn parse_manifest(buf: &[u8]) -> io::Result<ManifestNode> {
+    struct Cur<'a> {
+        buf: &'a [u8],
+        p: usize,
+    }
+    impl Cur<'_> {
+        fn take(&mut self, n: usize) -> io::Result<&[u8]> {
+            let s = self
+                .buf
+                .get(self.p..self.p + n)
+                .ok_or_else(|| io::Error::other("accessor manifest truncated"))?;
+            self.p += n;
+            Ok(s)
+        }
+        fn u32(&mut self) -> io::Result<usize> {
+            Ok(u32::from_ne_bytes(self.take(4)?.try_into().unwrap()) as usize)
+        }
+        fn bytes(&mut self) -> io::Result<Vec<u8>> {
+            let n = self.u32()?;
+            Ok(self.take(n)?.to_vec())
+        }
+        fn node(&mut self) -> io::Result<ManifestNode> {
+            match self.take(1)?[0] {
+                crate::ffi::RIO_NODE_REGULAR => {
+                    let executable = self.take(1)?[0] != 0;
+                    let size = u64::from_ne_bytes(self.take(8)?.try_into().unwrap());
+                    use std::os::unix::ffi::OsStringExt;
+                    Ok(ManifestNode::File {
+                        executable,
+                        size,
+                        physical: std::ffi::OsString::from_vec(self.bytes()?).into(),
+                    })
+                }
+                crate::ffi::RIO_NODE_SYMLINK => Ok(ManifestNode::Symlink {
+                    target: self.bytes()?,
+                }),
+                crate::ffi::RIO_NODE_DIRECTORY => {
+                    let n = self.u32()?;
+                    let mut entries = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let name = self.bytes()?;
+                        entries.push((name, self.node()?));
+                    }
+                    Ok(ManifestNode::Dir { entries })
+                }
+                k => Err(io::Error::other(format!(
+                    "accessor manifest: unknown node kind {k}"
+                ))),
+            }
+        }
+    }
+    let mut c = Cur { buf, p: 0 };
+    let root = c.node()?;
+    if c.p != buf.len() {
+        return Err(io::Error::other("accessor manifest has trailing bytes"));
+    }
+    Ok(root)
+}

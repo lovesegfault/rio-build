@@ -512,6 +512,58 @@ pub unsafe extern "C" fn rio_add_source_tree(
     })
 }
 
+/// Ingest a filtered local source tree (`addToStore(SourcePath)` on a
+/// `FilteringSourceAccessor` over a physical store): same two-plane
+/// pipeline as [`rio_add_source_tree`], but the tree shape comes from a
+/// manifest the shim walked through the accessor (so it honours the
+/// tracked-files view) while regular files are read in parallel from
+/// their physical paths. `manifest` encoding: see `rio_evalstore.h`.
+/// `fs_path` / `refs_json` / `*out_json` as in [`rio_add_source_tree`].
+///
+/// # Safety
+/// Standard contract; `manifest` valid for `manifest_len` bytes;
+/// `path_cb` valid for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rio_add_filtered_tree(
+    store: *mut EvalStore,
+    fs_path: *const c_char,
+    name: *const c_char,
+    refs_json: *const c_char,
+    manifest: *const u8,
+    manifest_len: usize,
+    path_cb: RioPathCb,
+    path_ctx: *mut c_void,
+    out_json: *mut *mut c_char,
+    err: *mut *mut c_char,
+) -> c_int {
+    guard(err, || {
+        // SAFETY: caller contract.
+        let fs_path = unsafe { req_str(fs_path) }?;
+        // SAFETY: caller contract.
+        let name = unsafe { req_str(name) }?;
+        // SAFETY: caller contract.
+        let refs = parse_refs_json(unsafe { req_str(refs_json) }?)?;
+        // SAFETY: caller contract.
+        let manifest = crate::ingest::parse_manifest(unsafe { byte_slice(manifest, manifest_len) })
+            .map_err(|e| {
+                EvalStoreError::Unsupported(format!("malformed accessor manifest: {e}"))
+            })?;
+        let result =
+            store_ref(store).add_filtered_tree(fs_path, name, &refs, &manifest, &mut |h| {
+                call_path_cb(path_cb, path_ctx, h)
+            })?;
+        set_out_string(
+            out_json,
+            Some(
+                serde_json::to_string(&result).map_err(|e| {
+                    EvalStoreError::Corrupt(format!("add result encode failed: {e}"))
+                })?,
+            ),
+        );
+        Ok(())
+    })
+}
+
 /// Capture a derivation. `name` is the store-path name (`foo-1.2.drv`),
 /// `aterm` the canonical bytes nix hashed, `nix_drv_path` nix's computed
 /// path (cross-checked). On success `*out_path` is the (identical) drv

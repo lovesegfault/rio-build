@@ -13,7 +13,10 @@ use rio_common::limits::{FASTCDC_AVG_BYTES, FASTCDC_MAX_BYTES, FASTCDC_MIN_BYTES
 use rio_nix::nar::frame;
 use sha2::{Digest, Sha256};
 
-use super::{IngestConfig, IngestError, IngestFile, IngestNode, IngestResult, ingest_tree};
+use super::{
+    IngestConfig, IngestError, IngestFile, IngestNode, IngestResult, ManifestNode, ingest_manifest,
+    ingest_tree,
+};
 
 /// Deterministic filler (xorshift64*) — incompressible enough to exercise
 /// content-defined boundaries without a dev-dependency.
@@ -104,6 +107,130 @@ fn oneshot_chunks(data: &[u8]) -> Vec<super::IngestChunk> {
         len: c.length as u32,
     })
     .collect()
+}
+
+/// Walk a real fs tree into a [`ManifestNode`] — what the C++ shim's
+/// `dumpAccessorManifest` produces for an unfiltered posix accessor over
+/// the same tree.
+fn manifest_of(path: &Path) -> ManifestNode {
+    let meta = fs::symlink_metadata(path).unwrap();
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        use std::os::unix::ffi::OsStringExt;
+        ManifestNode::Symlink {
+            target: fs::read_link(path).unwrap().into_os_string().into_vec(),
+        }
+    } else if ft.is_file() {
+        ManifestNode::File {
+            executable: meta.permissions().mode() & 0o111 != 0,
+            size: meta.len(),
+            physical: path.to_path_buf(),
+        }
+    } else {
+        let mut names: Vec<_> = fs::read_dir(path)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        ManifestNode::Dir {
+            entries: names
+                .into_iter()
+                .map(|n| {
+                    use std::os::unix::ffi::OsStrExt;
+                    (n.as_bytes().to_vec(), manifest_of(&path.join(&n)))
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Encode a [`ManifestNode`] in the shim's wire format — the inverse of
+/// [`super::parse_manifest`], for the roundtrip test.
+fn encode_manifest(m: &ManifestNode, out: &mut Vec<u8>) {
+    use crate::ffi::{RIO_NODE_DIRECTORY, RIO_NODE_REGULAR, RIO_NODE_SYMLINK};
+    let put_s = |out: &mut Vec<u8>, s: &[u8]| {
+        out.extend_from_slice(&(s.len() as u32).to_ne_bytes());
+        out.extend_from_slice(s);
+    };
+    match m {
+        ManifestNode::File {
+            executable,
+            size,
+            physical,
+        } => {
+            out.push(RIO_NODE_REGULAR);
+            out.push(u8::from(*executable));
+            out.extend_from_slice(&size.to_ne_bytes());
+            put_s(out, physical.as_os_str().as_bytes());
+        }
+        ManifestNode::Symlink { target } => {
+            out.push(RIO_NODE_SYMLINK);
+            put_s(out, target);
+        }
+        ManifestNode::Dir { entries } => {
+            out.push(RIO_NODE_DIRECTORY);
+            out.extend_from_slice(&(entries.len() as u32).to_ne_bytes());
+            for (name, child) in entries {
+                put_s(out, name);
+                encode_manifest(child, out);
+            }
+        }
+    }
+}
+
+// Manifest-driven ingest must equal fs-driven ingest of the same tree:
+// the manifest path is a perf route, never a behaviour change. Exercises
+// every node kind via the standard fixture, plus the manifest decoder
+// roundtrip (the actual encoder is C++ dumpAccessorManifest in shim.cc;
+// this is its Rust mirror).
+#[test]
+fn manifest_ingest_equals_fs_ingest() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("tree");
+    build_fixture(&root);
+
+    let walked = ingest_default(&root);
+    let manifest = manifest_of(&root);
+    let from_manifest = ingest_manifest(&manifest, &IngestConfig::default()).unwrap();
+    assert_eq!(
+        walked, from_manifest,
+        "manifest route diverged from fs walk"
+    );
+
+    let mut buf = Vec::new();
+    encode_manifest(&manifest, &mut buf);
+    let decoded = super::parse_manifest(&buf).expect("parse_manifest roundtrip");
+    let from_decoded = ingest_manifest(&decoded, &IngestConfig::default()).unwrap();
+    assert_eq!(walked, from_decoded, "decoded manifest route diverged");
+}
+
+// A manifest naming a strict subset of an on-disk tree must hash to the
+// same NAR as a separate copy of just that subset — that is exactly the
+// filtered-accessor contract (tracked-files view over a dirty workdir).
+#[test]
+fn manifest_ingest_honours_filtered_subset() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("workdir");
+    fs::create_dir_all(work.join("target")).unwrap();
+    fs::write(work.join("a.txt"), b"tracked").unwrap();
+    fs::write(work.join("target/ignored"), b"gitignored").unwrap();
+
+    let manifest = ManifestNode::Dir {
+        entries: vec![(
+            b"a.txt".to_vec(),
+            ManifestNode::File {
+                executable: false,
+                size: 7,
+                physical: work.join("a.txt"),
+            },
+        )],
+    };
+    let from_manifest = ingest_manifest(&manifest, &IngestConfig::default()).unwrap();
+
+    let oracle = dir.path().join("subset");
+    fs::create_dir(&oracle).unwrap();
+    fs::write(oracle.join("a.txt"), b"tracked").unwrap();
+    assert_nar_parity(&oracle, &from_manifest);
 }
 
 // NAR sha256 parity: the spine's framing + content interleave must hash

@@ -235,15 +235,33 @@ let
 
         nix $gflags --store "local?root=$TMPDIR/stock-git" \
           eval "$TMPDIR/gitrepo#source" --raw > stock-git.txt
-        nix $gflags --plugin-files ${pluginSo} \
+        RIO_EVALSTORE_STATS=1 nix $gflags --plugin-files ${pluginSo} \
           --store "local?root=$TMPDIR/main-git" \
           eval --eval-store "rio://?cas=$TMPDIR/cas-git" \
-          "$TMPDIR/gitrepo#source" --raw > rio-git.txt
+          "$TMPDIR/gitrepo#source" --raw > rio-git.txt 2> stats-git.txt
+        cat stats-git.txt
 
         # Same NAR hash → same store path: the rio store saw exactly the
         # tracked-files view stock nix did. A raw-fs walk would include
         # target/ and the paths would diverge.
         diff stock-git.txt rio-git.txt
+        # Route proof: the filtered accessor took the manifest two-plane
+        # ingest, not the dumpPath fallback. The fallback would record
+        # add_from_dump (NAR through the accessor → addToStoreFromDump);
+        # the manifest route records add_filtered_tree.
+        grep -q "add_filtered_tree" stats-git.txt \
+          || { echo "filtered accessor did not take the manifest ingest route"; exit 1; }
+        if grep -q "add_from_dump" stats-git.txt; then
+          echo "filtered accessor fell back to the serial dumpPath route"
+          exit 1
+        fi
+        # Not-a-mirror for the manifest route too: TRACKED file content
+        # never enters the CAS (chunk metadata + dirblobs only). The
+        # dumpPath fallback would land it as a FETCHED record.
+        if grep -rqa "RIO-GIT-TRACKED-CONTENT" $TMPDIR/cas-git; then
+          echo "tracked file content leaked into the CAS — manifest route not Origin::Local"
+          exit 1
+        fi
         # The dirblob entry name proves the route: a raw walk records the
         # ignored entries (not their content — not-a-mirror) in the
         # per-directory blob.

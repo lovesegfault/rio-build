@@ -92,7 +92,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     IngestChunk, IngestConfig, IngestDir, IngestEntry, IngestError, IngestFile, IngestNode,
-    IngestResult, IngestRunStats, IngestSymlink,
+    IngestResult, IngestRunStats, IngestSymlink, ManifestNode,
 };
 
 /// What the discovery `lstat` said a node is. Fixed before the node enters
@@ -443,15 +443,9 @@ fn emit(r: io::Result<()>) {
     r.expect("sha256 tee sink is infallible");
 }
 
-/// Entry point — see [`super::ingest_tree`].
-pub(super) fn run(
-    root: &Path,
-    config: &IngestConfig,
-) -> Result<(IngestResult, IngestRunStats), IngestError> {
-    let readers = config.reader_threads.max(1);
-    let workers = config.chunk_workers.max(1);
+fn make_shared(config: &IngestConfig) -> Arc<Shared> {
     let total = config.byte_budget.max(1);
-    let shared = Arc::new(Shared {
+    Arc::new(Shared {
         queue: Mutex::new(QueueState {
             deque: VecDeque::new(),
             outstanding: 0,
@@ -469,8 +463,15 @@ pub(super) fn run(
         spine_file_reads: AtomicU64::new(0),
         #[cfg(test)]
         test_delays: config.test_delays,
-    });
+    })
+}
 
+/// Entry point — see [`super::ingest_tree`].
+pub(super) fn run(
+    root: &Path,
+    config: &IngestConfig,
+) -> Result<(IngestResult, IngestRunStats), IngestError> {
+    let shared = make_shared(config);
     // Discover the root on the calling thread (one lstat; readlink if it
     // is a symlink). Errors here never start a thread.
     let root_child = discover(root, 0)?;
@@ -479,12 +480,105 @@ pub(super) fn run(
         q.deque.push_back(Arc::clone(n));
         q.outstanding = 1;
     }
+    drive(shared, root_child, config)
+}
+
+/// Manifest-driven entry point — see [`super::ingest_manifest`].
+/// Discovery is already done: every directory is built `DirReady` and
+/// never enters the deque, so the readers do file IO only and
+/// `listings_in_flight` stays zero (no head reserve). The spine, chunk
+/// plane, and budget discipline are unchanged.
+pub(super) fn run_manifest(
+    root: &ManifestNode,
+    config: &IngestConfig,
+) -> Result<(IngestResult, IngestRunStats), IngestError> {
+    let shared = make_shared(config);
+    let mut files = Vec::new();
+    let root_child = manifest_child(root, 0, &mut files)?;
+    {
+        let mut q = shared.queue.lock().expect("queue lock");
+        q.outstanding = files.len();
+        // Manifest order is NAR pre-order; the deque-as-DFS-stack
+        // invariant (front = spine-nearest) wants the same.
+        q.deque.extend(files);
+    }
+    drive(shared, root_child, config)
+}
+
+/// Convert one manifest node into a pipeline [`Child`]: directories are
+/// pre-resolved (`DirReady`), files become `Pending` nodes whose `path`
+/// is the physical on-disk path the readers open. The `files` vec
+/// collects every file node in NAR pre-order for the initial deque seed.
+fn manifest_child(
+    m: &ManifestNode,
+    depth: usize,
+    files: &mut Vec<Arc<Node>>,
+) -> Result<Child, IngestError> {
+    if depth > MAX_NAR_DEPTH {
+        return Err(IngestError::TooDeep {
+            path: PathBuf::new(),
+            depth,
+        });
+    }
+    match m {
+        ManifestNode::Symlink { target } => Ok(Child::Symlink(target.clone())),
+        ManifestNode::File {
+            executable,
+            size,
+            physical,
+        } => {
+            let node = Arc::new(Node::new(
+                physical.clone(),
+                depth,
+                Kind::File {
+                    size: *size,
+                    executable: *executable,
+                },
+            ));
+            files.push(Arc::clone(&node));
+            Ok(Child::Node(node))
+        }
+        ManifestNode::Dir { entries } => {
+            if entries.len() >= MAX_DIRECTORY_ENTRIES {
+                return Err(IngestError::TooManyEntries {
+                    path: PathBuf::new(),
+                    count: entries.len(),
+                });
+            }
+            let children = entries
+                .iter()
+                .map(|(name, child)| {
+                    Ok(ChildEntry {
+                        name: name.clone(),
+                        child: manifest_child(child, depth + 1, files)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, IngestError>>()?;
+            // Never queued: spine_wait_dir reads DirReady straight off.
+            let node = Arc::new(Node::new(PathBuf::new(), depth, Kind::Dir));
+            node.resolve(State::DirReady(Arc::new(children)));
+            Ok(Child::Node(node))
+        }
+    }
+}
+
+/// Spawn readers/chunk-workers, run the spine on the calling thread,
+/// join everything, fold the result. Seeding the deque is the caller's
+/// job — fs-driven [`run`] seeds the root node, manifest-driven
+/// [`run_manifest`] seeds every file.
+fn drive(
+    shared: Arc<Shared>,
+    root_child: Child,
+    config: &IngestConfig,
+) -> Result<(IngestResult, IngestRunStats), IngestError> {
+    let readers = config.reader_threads.max(1);
+    let workers = config.chunk_workers.max(1);
 
     let (chunk_tx, chunk_rx) = mpsc::channel::<ChunkJob>();
     let chunk_rx = Mutex::new(chunk_rx);
 
     // FORK SAFETY: every thread lives inside this scope; the scope joins
-    // them all before `run` returns, on success and on error alike.
+    // them all before `drive` returns, on success and on error alike.
     let spine_out = thread::scope(|s| {
         for _ in 0..readers {
             let tx = chunk_tx.clone();
