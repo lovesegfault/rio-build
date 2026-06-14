@@ -232,6 +232,7 @@ async fn upload_source(
         .expect("ack table mutex poisoned")
         .is_acked(ObjectKind::Directory, digest)
     {
+        debug!(store_path = %src.store_path, "source: ack-short-circuit");
         return Ok(());
     }
     let bitmap = clients
@@ -243,7 +244,9 @@ async fn upload_source(
         .context("HasDirectories")?
         .into_inner()
         .bitmap;
-    if !bitmap_bit(&bitmap, 0) {
+    if bitmap_bit(&bitmap, 0) {
+        debug!(store_path = %src.store_path, "source: cluster-has");
+    } else {
         let plan = plan_source_upload(src).context("planning source upload")?;
         put_source_chunked(clients, acks, src, plan).await?;
     }
