@@ -229,6 +229,9 @@ impl Coordinator {
 
         let mut graph = BuildGraph::default();
         let mut expected: HashSet<String> = attrs.iter().cloned().collect();
+        // Every attr ever sent as a WorkItem (user-typed or expansion
+        // child) — the dedup set for attrset expansions.
+        let mut requested: HashSet<String> = expected.clone();
         let mut eval_failures: Vec<BuildOutcome> = Vec::new();
         let mut outcomes: Vec<BuildOutcome> = Vec::new();
         let mut pending_uploads = 0usize;
@@ -343,6 +346,54 @@ impl Coordinator {
                             &mut pending_uploads,
                             &tx,
                         )?;
+                    }
+                    worker_frame::Msg::Expansion(exp) => {
+                        // The attrset installable becomes one root per
+                        // derivation child, named by its full attr
+                        // path; children spread across the worker pool
+                        // like explicitly listed attrs. A child already
+                        // requested (explicitly or by another
+                        // expansion) is not queued twice.
+                        // r[impl bc.eval.attrset-expansion]
+                        expected.remove(&exp.attr);
+                        for skipped in &exp.skipped {
+                            warn!(
+                                attr = %skipped,
+                                "skipping attrset entry: neither a derivation nor a recursable \
+                                 attrset"
+                            );
+                        }
+                        if exp.children.is_empty() {
+                            // The worker normally errors instead of
+                            // sending an empty expansion; never let the
+                            // attr vanish silently.
+                            eval_failures.push(BuildOutcome {
+                                attr: exp.attr,
+                                build_id: String::new(),
+                                state: OutcomeState::EvalFailed {
+                                    message: "attrset installable expanded to zero derivations"
+                                        .into(),
+                                },
+                                drv_events: vec![],
+                                fetched: vec![],
+                            });
+                            continue;
+                        }
+                        info!(
+                            attr = %exp.attr,
+                            children = exp.children.len(),
+                            "attrset installable expanded"
+                        );
+                        for child in exp.children {
+                            if !requested.insert(child.clone()) {
+                                continue;
+                            }
+                            expected.insert(child.clone());
+                            writer
+                                .send(coordinator_frame::Msg::Work(WorkItem { attr: child }))
+                                .await
+                                .context("sending WorkItem")?;
+                        }
                     }
                     worker_frame::Msg::Recycle(n) => {
                         debug!(generation = n.generation, "eval worker recycled");

@@ -20,8 +20,8 @@ use rio_nix::derivation::{Derivation, DerivationOutput};
 use rio_nix::hash::{HashAlgo, NixHash};
 use rio_nix::store_path::StorePath;
 use rio_proto::evaljob::{
-    CoordinatorFrame, IfdCompletion, ResultFrame, Shutdown, WorkItem, WorkerFrame,
-    coordinator_frame, worker_frame,
+    AttrsetExpansion, CoordinatorFrame, IfdCompletion, ResultFrame, Shutdown, WorkItem,
+    WorkerFrame, coordinator_frame, worker_frame,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -403,6 +403,18 @@ fn drive_parent(
                         unsafe { libc::raise(libc::SIGKILL) };
                     }
                 }
+                if let Some(rest) = attr.strip_prefix("expand:") {
+                    // Attrset installable: report the children instead
+                    // of a result frame.
+                    let exp = WorkerFrame {
+                        msg: Some(worker_frame::Msg::Expansion(AttrsetExpansion {
+                            attr: attr.to_string(),
+                            children: rest.split(',').map(str::to_string).collect(),
+                            skipped: vec![],
+                        })),
+                    };
+                    return framing::write_frame(&mut FdIo(fd), &exp).map_err(|e| e.to_string());
+                }
                 framing::write_frame(&mut FdIo(fd), &stub_result(attr)).map_err(|e| e.to_string())
             };
             match run_eval_parent(&store, parent_end.as_raw_fd(), &opts, &mut eval) {
@@ -454,6 +466,20 @@ fn drive_parent(
                     Some(worker_frame::Msg::Error(e)) if !e.attr.is_empty() => {
                         results += 1;
                     }
+                    // Mirror the coordinator: an expansion's children
+                    // come back as ordinary WorkItems.
+                    Some(worker_frame::Msg::Expansion(e)) => {
+                        for child in &e.children {
+                            framing::write_frame(
+                                &mut io,
+                                &CoordinatorFrame {
+                                    msg: Some(coordinator_frame::Msg::Work(WorkItem {
+                                        attr: child.clone(),
+                                    })),
+                                },
+                            )?;
+                        }
+                    }
                     _ => {}
                 }
                 frames.push(f);
@@ -501,6 +527,32 @@ fn parent_completes_attrs_and_drains_cleanly() -> anyhow::Result<()> {
     let mut attrs: Vec<String> = result_attrs(&frames).into_iter().map(|(a, _)| a).collect();
     attrs.sort();
     assert_eq!(attrs, vec!["alpha", "beta", "gamma"]);
+    Ok(())
+}
+
+/// An attrset installable's worker answers with an `AttrsetExpansion`:
+/// the parent must treat that as the attr's completion (the worker is
+/// idle again), serve the children's WorkItems on the SAME single
+/// worker, and drain cleanly.
+// r[verify bc.eval.attrset-expansion]
+#[test]
+fn expansion_frees_the_worker_for_its_children() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (frames, code) = drive_parent(
+        EvalParentOpts {
+            max_workers: 1,
+            recycle_attrs: 0,
+            recycle_rss_mb: 0,
+            attr_retries: 1,
+        },
+        &["expand:kid-a,kid-b"],
+        dir.path(),
+        2,
+    )?;
+    assert_eq!(code, 0, "parent must drain after expansion + children");
+    let mut attrs: Vec<String> = result_attrs(&frames).into_iter().map(|(a, _)| a).collect();
+    attrs.sort();
+    assert_eq!(attrs, vec!["kid-a", "kid-b"]);
     Ok(())
 }
 

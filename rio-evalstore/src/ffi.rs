@@ -878,6 +878,64 @@ pub unsafe extern "C" fn rio_emit_result(
     })
 }
 
+/// Send an `AttrsetExpansion` frame for `attr` on `fd`: the attr
+/// resolved to an attrset rather than a derivation, and `children` are
+/// the full attr paths of its derivation children (the coordinator
+/// queues each as its own WorkItem). `skipped` names children that are
+/// neither derivations nor recursable attrsets — surfaced as warnings.
+///
+/// # Safety
+/// Standard contract; `children`/`skipped` must point at `n_children`/
+/// `n_skipped` valid NUL-terminated strings (null pointers allowed when
+/// the count is 0).
+// r[impl bc.eval.attrset-expansion]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rio_emit_expansion(
+    fd: c_int,
+    attr: *const c_char,
+    children: *const *const c_char,
+    n_children: usize,
+    skipped: *const *const c_char,
+    n_skipped: usize,
+    err: *mut *mut c_char,
+) -> c_int {
+    /// # Safety
+    /// `p` must point at `n` valid NUL-terminated strings when `n > 0`.
+    unsafe fn str_vec(
+        p: *const *const c_char,
+        n: usize,
+        what: &str,
+    ) -> Result<Vec<String>, EvalStoreError> {
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            // SAFETY: caller contract.
+            let s = unsafe { req_str(*p.add(i)) }
+                .map_err(|e| EvalStoreError::Unsupported(format!("{what}[{i}]: {e}")))?;
+            out.push(s.to_string());
+        }
+        Ok(out)
+    }
+    guard(err, || {
+        // SAFETY: caller contract.
+        let attr = unsafe { req_str(attr) }?;
+        // SAFETY: caller contract.
+        let children = unsafe { str_vec(children, n_children, "children") }?;
+        // SAFETY: caller contract.
+        let skipped = unsafe { str_vec(skipped, n_skipped, "skipped") }?;
+        let msg = rio_proto::evaljob::WorkerFrame {
+            msg: Some(rio_proto::evaljob::worker_frame::Msg::Expansion(
+                rio_proto::evaljob::AttrsetExpansion {
+                    attr: attr.to_string(),
+                    children,
+                    skipped,
+                },
+            )),
+        };
+        crate::evaljob::framing::write_frame(&mut crate::evaljob::framing::FdIo(fd), &msg)
+            .map_err(EvalStoreError::Io)
+    })
+}
+
 /// Relay an import-from-derivation to the coordinator and BLOCK until
 /// it resolves (ADR-024 "IFD"). On success the realized outputs are
 /// imported into this worker's eval store and `*out_json` is a JSON

@@ -224,8 +224,21 @@ impl TestCluster {
         script: HashMap<String, Vec<ResultFrame>>,
         attrs: &[&str],
     ) -> anyhow::Result<(RunSummary, StubParent)> {
+        self.run_expanding(coordinator, script, HashMap::new(), attrs)
+            .await
+    }
+
+    /// Like [`TestCluster::run`], but attrs in `expansions` answer with
+    /// an `AttrsetExpansion` frame (the `.#checks`-style installable).
+    pub async fn run_expanding(
+        &self,
+        coordinator: &mut Coordinator,
+        script: HashMap<String, Vec<ResultFrame>>,
+        expansions: HashMap<String, rio_proto::evaljob::AttrsetExpansion>,
+        attrs: &[&str],
+    ) -> anyhow::Result<(RunSummary, StubParent)> {
         let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
-        let parent = stub_parent::spawn(theirs, script);
+        let parent = stub_parent::spawn_expanding(theirs, script, expansions);
         let chan = EvalChannel::from_std(ours)?;
         // Keep the sender alive for the whole run: dropping it must
         // not read as an interrupt.

@@ -13,8 +13,9 @@
 # forks workers, evaluates through real libexpr, streams ResultFrames
 # over a real socketpair — and asserts drvPath parity against the
 # stock pinned nix-cli, worker recycling (N=1 → fresh fork per attr,
-# identical results), and crash injection (kill -9 a worker mid-eval →
-# the parent re-queues and completes).
+# identical results), crash injection (kill -9 a worker mid-eval →
+# the parent re-queues and completes), and attrset-installable
+# expansion (a checks-style attr fans out into per-child roots).
 {
   pkgs,
   lib,
@@ -118,7 +119,13 @@ let
         echo "== stock drvPaths (pinned nix-cli, local file store)"
         nix $flags --store "local?root=$TMPDIR/stock" \
           eval --file $TMPDIR/work/fixture.nix --json \
-          --apply 'f: { hello = f.hello.drvPath; world = f.world.drvPath; }' \
+          --apply 'f: let sys = builtins.currentSystem; in {
+            hello = f.hello.drvPath;
+            world = f.world.drvPath;
+            "checks.''${sys}.alpha" = f.checks.''${sys}.alpha.drvPath;
+            "checks.''${sys}.beta" = f.checks.''${sys}.beta.drvPath;
+            "checks.''${sys}.grouped.gamma" = f.checks.''${sys}.grouped.gamma.drvPath;
+          }' \
           > stock.json
         jq . stock.json
 
@@ -176,9 +183,41 @@ let
         test "$(jq '.results | length' run3.json)" = 1
         test "$(jq '.faults | length' run3.json)" -ge 1
 
-        cp run1.json run2.json run3.json stock.json $TMPDIR/work/ 2>/dev/null || true
+        echo "== run 4: attrset expansion — a checks-style attr fans out per child"
+        sys=$(nix $flags eval --impure --raw --expr builtins.currentSystem)
+        eval-harness \
+          --eval-parent ${rioEval}/bin/rio-eval \
+          --cas $TMPDIR/cas4 \
+          --file $TMPDIR/work/fixture.nix \
+          --attrs checks,emptyset \
+          > run4.json
+        jq . run4.json
+        # Three derivation children become roots, named by full attr path,
+        # with drvPath parity against stock nix (system descent + the
+        # recurseForDerivations descent included).
+        test "$(jq '.results | length' run4.json)" = 3
+        for child in alpha beta grouped.gamma; do
+          attr="checks.$sys.$child"
+          stock=$(jq -r --arg a "$attr" '.[$a]' stock.json)
+          got=$(jq -r --arg a "$attr" '.results[] | select(.attr == $a) | .root_drv_path' run4.json)
+          if [ -z "$got" ] || [ "$stock" != "$got" ]; then
+            echo "expansion drvPath parity FAILED for $attr: stock=$stock rio-eval=$got" >&2
+            exit 1
+          fi
+        done
+        # The non-recursable subset and the all-digit name are skipped
+        # with a warning, never an error.
+        test "$(jq '.skipped | length' run4.json)" = 2
+        jq -e --arg a "checks.$sys.plain" '.skipped | index($a) != null' run4.json
+        jq -e --arg a "checks.$sys.404" '.skipped | index($a) != null' run4.json
+        # An attrset with zero derivation children is a hard eval error.
+        test "$(jq '.eval_errors | length' run4.json)" = 1
+        jq -e '.eval_errors[0][0] == "emptyset"' run4.json
+        jq -e '.eval_errors[0][1] | test("zero derivations")' run4.json
+
+        cp run1.json run2.json run3.json run4.json stock.json $TMPDIR/work/ 2>/dev/null || true
         mkdir -p $out
-        cp run1.json run2.json run3.json stock.json $out/
+        cp run1.json run2.json run3.json run4.json stock.json $out/
       '';
 in
 {

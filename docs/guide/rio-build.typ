@@ -96,6 +96,24 @@ the eval parent locks one flake and fetches its inputs once before forking
 workers. A bare reference (no `#attr`) evaluates the flake's default
 package (`packages.<system>.default`).
 
+An installable may also name an attribute set instead of a single
+derivation:
+
+```bash
+# Every check derivation, spread across the eval workers.
+rio build .#checks            # descends into checks.<system> first
+rio build .#checks.x86_64-linux
+```
+
+Expansion follows nix-eval-jobs conventions: every immediate derivation
+child becomes its own build root, named by its full attribute path
+(`checks.x86_64-linux.clippy-rio-nix`); nested sets are entered only when
+they set `recurseForDerivations = true`; anything else is skipped with a
+warning. An attribute set that contains no derivations at all fails
+evaluation. For `.#checks` the entry matching the evaluating system is
+selected first --- a missing system entry surfaces as the zero-derivations
+error naming it.
+
 While the build runs, the client prints one status line per derivation event
 (`queued`, `building`, `built`, …) and finishes with the output paths.
 Pressing Ctrl-C cancels: the client cancels every build this invocation
@@ -130,7 +148,8 @@ rio build --cancel 01HV5...
     table.header([Flag], [Meaning]),
     [`INSTALLABLE...`],
     [Flake attributes to evaluate and build (`ref#attr`; bare `ref` = default
-      attribute). All must share one flake reference.],
+      attribute). All must share one flake reference. An attribute set
+      (`.#checks`) expands into one build root per derivation child.],
 
     [`--attach BUILD_ID`],
     [Reattach to a build's event stream via `WatchBuild` and render it to

@@ -233,6 +233,20 @@ int rio_eval_parent_run(
 int rio_emit_result(
     RioEvalStore * store, int fd, const char * attr, const char * root_drv_path, char ** err);
 
+/* Send an AttrsetExpansion frame for `attr` on the worker channel fd:
+ * the attr resolved to an attrset rather than a derivation. children =
+ * full attr paths of its derivation children (one later WorkItem each);
+ * skipped = children that are neither derivations nor recursable
+ * attrsets (warnings). Null pointers are allowed when a count is 0. */
+int rio_emit_expansion(
+    int fd,
+    const char * attr,
+    const char * const * children,
+    size_t n_children,
+    const char * const * skipped,
+    size_t n_skipped,
+    char ** err);
+
 /* Relay an import-from-derivation to the coordinator and BLOCK until
  * it resolves. On success the outputs are imported into this worker's
  * eval store and *out_json is a JSON array of output store paths. */
