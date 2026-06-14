@@ -548,8 +548,12 @@ async fn detach_then_attach_resumes_stream() -> TestResult {
 
     // --attach re-streams from sequence 0 and reaches the terminal.
     let mut clients = cluster.clients.clone();
-    let outcome =
-        rio_build_cli::coordinator::attach_build(&mut clients, &build_id, 0, false).await?;
+    let outcome = rio_build_cli::coordinator::attach_build(
+        &mut clients,
+        &build_id,
+        rio_build_cli::render::RenderHandle::null(),
+    )
+    .await?;
     assert_eq!(outcome.build_id, build_id);
     assert_eq!(
         outcome.state,

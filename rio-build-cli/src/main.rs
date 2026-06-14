@@ -8,7 +8,8 @@
 //!
 //! Observability: tracing spans carry `component = "build-client"`;
 //! logs are JSON by default (`RIO_LOG_FORMAT=pretty` for humans) on
-//! stderr — stdout is the status-line surface. No Prometheus exporter:
+//! stderr. Stdout carries the final result paths only — every status
+//! and log line goes to stderr via the renderer. No Prometheus exporter:
 //! the observability spec defines server-side metric surfaces only,
 //! and a short-lived CLI has no scrape endpoint to register against.
 
@@ -21,7 +22,7 @@ use rio_build_cli::acks::ClusterAckTable;
 use rio_build_cli::config::{Config, ConfigOverlay};
 use rio_build_cli::coordinator::clients::Clients;
 use rio_build_cli::coordinator::{Coordinator, CoordinatorOpts, OutcomeState};
-use rio_build_cli::evalchan;
+use rio_build_cli::{evalchan, render};
 
 #[derive(Parser)]
 #[command(name = "rio", version, about = "rio native-protocol build client")]
@@ -116,7 +117,9 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
         .with_context(|| format!("creating CAS root {}", cas_root.display()))?;
 
     if let Some(id) = &args.attach {
-        let outcome = rio_build_cli::coordinator::attach_build(&mut clients, id, 0, true).await?;
+        let (render, render_task) = render::spawn();
+        let outcome = rio_build_cli::coordinator::attach_build(&mut clients, id, 0, render).await?;
+        let _ = render_task.await;
         return finish(
             vec![outcome],
             args.fetch || args.out_link.is_some(),
@@ -147,6 +150,7 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
         std::time::Duration::from_secs(cfg.ack_ttl_secs),
     )));
 
+    let (render, render_task) = render::spawn();
     let mut coordinator = Coordinator {
         clients: clients.clone(),
         acks,
@@ -160,6 +164,7 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
             detach_on_interrupt: args.detach,
             ..CoordinatorOpts::default()
         },
+        render,
     };
 
     // The first SIGINT/SIGTERM cancels this invocation's builds (or
@@ -192,6 +197,10 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
     let summary = coordinator.run(chan, attrs, sig_rx).await?;
     // Reap the eval parent (it exits on Shutdown/EOF).
     let _ = child.wait().await;
+    // Stop the renderer (drains the channel, clears any live region)
+    // before the result-path lines and the failure summaries below.
+    drop(coordinator);
+    let _ = render_task.await;
 
     if summary.detached {
         // Outcome lines were already printed by the detach path.

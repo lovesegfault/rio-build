@@ -141,10 +141,12 @@ pkgs.testers.runNixOSTest {
         print(out)
         assert rc == 0, f"rio build failed (rc={rc}):\n{out}"
 
-        # BuildEvent progression rendered on stdout: dispatch states for
-        # a really-executed build, then the terminal completion line.
+        # BuildEvent progression rendered on stderr (the status surface;
+        # stdout carries result paths only): dispatch states for a
+        # really-executed build, then the terminal completion line.
+        err = client.succeed("cat /tmp/rio-stderr-cold.log")
         for needle in ("queued", "building", "built", "completed:"):
-            assert needle in out, f"missing {needle!r} in client output:\n{out}"
+            assert needle in err, f"missing {needle!r} in client stderr:\n{err}"
         assert "consumer: built /nix/store/" in out, out
         assert "fetched to" in out, out
 

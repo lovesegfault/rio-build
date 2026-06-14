@@ -197,12 +197,9 @@ impl TestCluster {
 
     /// A coordinator wired to this cluster: ack table under the
     /// cluster's CAS root (persists across coordinators — that's the
-    /// warm path), status printing off.
+    /// warm path), null renderer.
     pub fn coordinator(&self, tweak: impl FnOnce(&mut CoordinatorOpts)) -> Coordinator {
-        let mut opts = CoordinatorOpts {
-            print_status: false,
-            ..CoordinatorOpts::default()
-        };
+        let mut opts = CoordinatorOpts::default();
         tweak(&mut opts);
         Coordinator {
             clients: self.clients.clone(),
@@ -213,6 +210,7 @@ impl TestCluster {
             ))),
             cas_root: self.cas.path().to_path_buf(),
             opts,
+            render: rio_build_cli::render::RenderHandle::null(),
         }
     }
 

@@ -38,7 +38,7 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::acks::ClusterAckTable;
 use crate::evalchan::EvalChannel;
-use crate::render;
+use crate::render::{RenderEvent, RenderHandle};
 use clients::Clients;
 use graph::{BuildGraph, Digest32, RootGate, SubmitOptions};
 use submit::SubmitMaterials;
@@ -61,8 +61,6 @@ pub struct CoordinatorOpts {
     /// `--detach`: an interrupt exits the client and leaves builds
     /// running cluster-side instead of cancelling them.
     pub detach_on_interrupt: bool,
-    /// Print status lines to stdout (off in tests).
-    pub print_status: bool,
 }
 
 impl Default for CoordinatorOpts {
@@ -76,7 +74,6 @@ impl Default for CoordinatorOpts {
             out_link: None,
             local_ifd: false,
             detach_on_interrupt: false,
-            print_status: true,
         }
     }
 }
@@ -163,6 +160,9 @@ pub struct Coordinator {
     pub acks: Arc<Mutex<ClusterAckTable>>,
     pub cas_root: PathBuf,
     pub opts: CoordinatorOpts,
+    /// The renderer task's send handle. Every `BuildEvent` from a watch
+    /// stream goes here; the renderer decides what to print.
+    pub render: RenderHandle,
 }
 
 /// Wait for the next interrupt signal. A dropped sender must NOT read
@@ -750,7 +750,7 @@ impl Coordinator {
         };
         let mut clients = self.clients.clone();
         let acks = Arc::clone(&self.acks);
-        let print_status = self.opts.print_status;
+        let render = self.render.clone();
         tokio::spawn(async move {
             let result = async {
                 let stream = submit::submit_root(&mut clients, &acks, &mats).await?;
@@ -758,7 +758,7 @@ impl Coordinator {
                     root_idx: idx,
                     digests,
                 });
-                watch_stream(&mut clients, stream, idx, &tx, print_status).await
+                watch_stream(&mut clients, stream, idx, &tx, render).await
             }
             .await;
             let _ = tx.send(Internal::Finished {
@@ -778,7 +778,7 @@ async fn watch_stream(
     mut stream: tonic::Streaming<BuildEvent>,
     root_idx: usize,
     tx: &mpsc::UnboundedSender<Internal>,
-    print_status: bool,
+    render: RenderHandle,
 ) -> anyhow::Result<WatchResult> {
     let mut result = WatchResult {
         build_id: String::new(),
@@ -817,9 +817,7 @@ async fn watch_stream(
                 build_id: ev.build_id.clone(),
             });
         }
-        if print_status && let Some(line) = render::line(&ev) {
-            println!("{line}");
-        }
+        render.send(RenderEvent::Build(ev.clone()));
         match ev.event {
             Some(Event::Derivation(d)) => {
                 result.drv_events.push((d.derivation_path, d.kind));
@@ -858,7 +856,7 @@ fn terminal(state: &OutcomeState) -> bool {
 pub async fn attach_build(
     clients: &mut Clients,
     build_id: &str,
-    print_status: bool,
+    render: RenderHandle,
 ) -> anyhow::Result<BuildOutcome> {
     let resp = clients
         .scheduler
@@ -868,7 +866,7 @@ pub async fn attach_build(
         .await
         .context("WatchBuild")?;
     let (tx, _rx) = mpsc::unbounded_channel();
-    let mut result = watch_stream(clients, resp.into_inner(), 0, &tx, print_status).await?;
+    let mut result = watch_stream(clients, resp.into_inner(), 0, &tx, render).await?;
     if result.build_id.is_empty() {
         result.build_id = build_id.to_string();
     }
