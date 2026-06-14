@@ -105,6 +105,11 @@
       "doc": "Stage 5: build-log rendering."
     },
     {
+      "path": "render/ci.rs",
+      "depth": 1,
+      "doc": "Non-interactive (CI) renderer."
+    },
+    {
       "path": "render/plain.rs",
       "depth": 1,
       "doc": "The status-line renderer: one line per state edge, no log/phase events."
