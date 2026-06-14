@@ -19355,6 +19355,10 @@
           "packageId": "sha2 0.11.0"
         },
         {
+          "name": "tempfile",
+          "packageId": "tempfile"
+        },
+        {
           "name": "thiserror",
           "packageId": "thiserror"
         },
@@ -19403,10 +19407,6 @@
         {
           "name": "sqlx",
           "packageId": "sqlx"
-        },
-        {
-          "name": "tempfile",
-          "packageId": "tempfile"
         }
       ],
       "crateBin": [

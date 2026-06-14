@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 pub mod ci;
 pub mod plain;
 pub mod term;
+pub mod tty;
 
 /// What the coordinator hands the renderer.
 #[derive(Debug)]
@@ -55,6 +56,8 @@ pub enum RenderMode {
     Plain,
     /// Buffered per-drv blocks with `::group::` folds and a heartbeat.
     Ci,
+    /// Live ephemeral region + `f` log browser.
+    Tty,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -67,23 +70,41 @@ pub struct RenderOpts {
     pub stall_timeout: u64,
 }
 
-/// Auto-selection: `Ci` when `GITHUB_ACTIONS` is set, otherwise
-/// `Plain` (TTY detection added later).
-pub fn select(mode: RenderMode, env: &HashMap<String, String>) -> RenderMode {
-    match mode {
-        RenderMode::Auto if term::fold_markers(env) => RenderMode::Ci,
-        RenderMode::Auto => RenderMode::Plain,
-        explicit => explicit,
+/// Auto-selection: `Tty` when stderr+stdin are a tty and `TERM` isn't
+/// `dumb`; else `Ci` when `GITHUB_ACTIONS` is set; else `Plain`.
+pub fn select(
+    mode: RenderMode,
+    env: &HashMap<String, String>,
+    stderr_tty: bool,
+    stdin_tty: bool,
+) -> RenderMode {
+    if mode != RenderMode::Auto {
+        return mode;
+    }
+    let term_ok = env.get("TERM").is_none_or(|t| !t.is_empty() && t != "dumb");
+    if stderr_tty && stdin_tty && term_ok {
+        RenderMode::Tty
+    } else if term::fold_markers(env) {
+        RenderMode::Ci
+    } else {
+        RenderMode::Plain
     }
 }
 
 /// Spawn the renderer task. Returns the send handle plus a `stop`
 /// future: drop every clone of the handle, then await the future to
-/// drain the channel and clear any live region.
-pub fn spawn(opts: RenderOpts) -> (RenderHandle, JoinHandle<()>) {
+/// drain the channel and clear any live region. `pager_gate` is set
+/// while a pager owns the terminal — the caller's signal handler
+/// should swallow Ctrl-C while it's high.
+pub fn spawn(
+    opts: RenderOpts,
+    pager_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> (RenderHandle, JoinHandle<()>) {
     let env: HashMap<String, String> = std::env::vars().collect();
-    let mode = select(opts.mode, &env);
     let isatty = console::Term::stderr().is_term();
+    // SAFETY: isatty(0) is a pure read.
+    let stdin_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+    let mode = select(opts.mode, &env, isatty, stdin_tty);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
         let mut out = std::io::stderr();
@@ -115,6 +136,7 @@ pub fn spawn(opts: RenderOpts) -> (RenderHandle, JoinHandle<()>) {
                     }
                 }
             }
+            RenderMode::Tty => tty::drive(rx, pager_gate).await,
         }
     });
     (RenderHandle(Some(tx)), task)
@@ -285,14 +307,40 @@ mod tests {
         let env = |k: &[(&str, &str)]| -> HashMap<String, String> {
             k.iter().map(|(a, b)| ((*a).into(), (*b).into())).collect()
         };
-        assert_eq!(select(RenderMode::Auto, &env(&[])), RenderMode::Plain);
         assert_eq!(
-            select(RenderMode::Auto, &env(&[("GITHUB_ACTIONS", "true")])),
+            select(RenderMode::Auto, &env(&[]), false, false),
+            RenderMode::Plain
+        );
+        assert_eq!(
+            select(
+                RenderMode::Auto,
+                &env(&[("GITHUB_ACTIONS", "true")]),
+                false,
+                false
+            ),
             RenderMode::Ci
+        );
+        assert_eq!(
+            select(RenderMode::Auto, &env(&[]), true, true),
+            RenderMode::Tty
+        );
+        assert_eq!(
+            select(RenderMode::Auto, &env(&[("TERM", "dumb")]), true, true),
+            RenderMode::Plain
+        );
+        // stdin not a tty (pipe, </dev/null) → no tty mode.
+        assert_eq!(
+            select(RenderMode::Auto, &env(&[]), true, false),
+            RenderMode::Plain
         );
         // --render overrides everything.
         assert_eq!(
-            select(RenderMode::Plain, &env(&[("GITHUB_ACTIONS", "true")])),
+            select(
+                RenderMode::Plain,
+                &env(&[("GITHUB_ACTIONS", "true")]),
+                true,
+                true
+            ),
             RenderMode::Plain
         );
     }
