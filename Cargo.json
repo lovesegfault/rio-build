@@ -13808,6 +13808,7 @@
         "client",
         "config",
         "derive",
+        "http-proxy",
         "kube-client",
         "kube-derive",
         "kube-runtime",
@@ -13957,6 +13958,7 @@
         "futures",
         "http-body",
         "http-body-util",
+        "http-proxy",
         "hyper",
         "hyper-rustls",
         "hyper-timeout",
@@ -29433,22 +29435,16 @@
           "packageId": "hyper-util"
         },
         {
-          "name": "hyper-util",
-          "packageId": "hyper-util",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "hyper-util",
-          "packageId": "hyper-util",
-          "target": "x86_64-unknown-linux-gnu"
-        },
-        {
           "name": "indexmap",
           "packageId": "indexmap"
         },
         {
           "name": "inout",
           "packageId": "inout 0.2.2"
+        },
+        {
+          "name": "ipnet",
+          "packageId": "ipnet"
         },
         {
           "name": "jiff",
@@ -30008,22 +30004,16 @@
           "packageId": "hyper-util"
         },
         {
-          "name": "hyper-util",
-          "packageId": "hyper-util",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "hyper-util",
-          "packageId": "hyper-util",
-          "target": "x86_64-unknown-linux-gnu"
-        },
-        {
           "name": "indexmap",
           "packageId": "indexmap"
         },
         {
           "name": "inout",
           "packageId": "inout 0.2.2"
+        },
+        {
+          "name": "ipnet",
+          "packageId": "ipnet"
         },
         {
           "name": "jiff",

@@ -9204,6 +9204,7 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "inout 0.2.2",
+ "ipnet",
  "jiff",
  "k8s-openapi",
  "kube",
