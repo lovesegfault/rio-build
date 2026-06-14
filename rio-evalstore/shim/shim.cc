@@ -195,6 +195,42 @@ void checkRc(int rc, const RioStr & err, std::string_view op, std::exception_ptr
     throw Error("'%s' in rio store: %s", std::string(op), msg);
 }
 
+/* Walk the accessor's view and emit the rio_add_filtered_tree manifest
+ * (encoding documented in rio_evalstore.h): tree shape with each
+ * regular file's physical path. Metadata-only — the Rust side reads
+ * file contents from those paths in parallel. readDirectory()'s
+ * std::map iteration is byte-lex sorted, i.e. NAR order. Throws if a
+ * file has no physical path; the caller gated on the root having one,
+ * so a posix-backed filtering accessor never hits this. */
+void dumpAccessorManifest(SourceAccessor & acc, const CanonPath & path, std::string & out)
+{
+    auto put32 = [&](uint32_t v) { out.append(reinterpret_cast<char *>(&v), 4); };
+    auto putS = [&](std::string_view s) { put32(s.size()); out.append(s); };
+    auto st = acc.lstat(path);
+    if (st.type == SourceAccessor::tRegular) {
+        out.push_back(RIO_NODE_REGULAR);
+        out.push_back(st.isExecutable ? 1 : 0);
+        uint64_t sz = st.fileSize.value_or(0);
+        out.append(reinterpret_cast<char *>(&sz), 8);
+        auto p = acc.getPhysicalPath(path);
+        if (!p)
+            throw Error("rio store: '%s' has no physical path", acc.showPath(path));
+        putS(p->string());
+    } else if (st.type == SourceAccessor::tSymlink) {
+        out.push_back(RIO_NODE_SYMLINK);
+        putS(acc.readLink(path));
+    } else if (st.type == SourceAccessor::tDirectory) {
+        out.push_back(RIO_NODE_DIRECTORY);
+        auto entries = acc.readDirectory(path);
+        put32(entries.size());
+        for (auto & [name, _] : entries) {
+            putS(name);
+            dumpAccessorManifest(acc, path / name, out);
+        }
+    } else
+        throw Error("file '%s' has an unsupported type", acc.showPath(path));
+}
+
 int caMethodFor(ContentAddressMethod method, std::string_view op)
 {
     switch (method.raw) {
@@ -629,11 +665,24 @@ struct RioStore : virtual Store
          * a recursive accessor-chain probe or a getPhysicalPath()
          * contract change upstream. */
         std::string nameStr(name);
+        auto * filtering = dynamic_cast<FilteringSourceAccessor *>(&*path.accessor);
         std::optional<std::filesystem::path> phys;
         if (filter.get_fn().target_type() == defaultPathFilter.get_fn().target_type()
             && hashAlgo == HashAlgorithm::SHA256 && method.raw != ContentAddressMethod::Raw::Git
-            && !dynamic_cast<FilteringSourceAccessor *>(&*path.accessor))
+            && !filtering)
             phys = path.accessor->getPhysicalPath(path.path);
+
+        /* A FilteringSourceAccessor whose root has a physical path (the
+         * git workdir flake `self` case) takes the manifest route below;
+         * a pure-virtual one keeps the dumpPath fallback. The stat-
+         * fingerprint shortcut stays unfiltered-only: a raw-fs stat
+         * digest cannot see tracked-set changes. */
+        std::optional<std::filesystem::path> filteredPhys;
+        if (filtering
+            && filter.get_fn().target_type() == defaultPathFilter.get_fn().target_type()
+            && hashAlgo == HashAlgorithm::SHA256
+            && method.raw == ContentAddressMethod::Raw::NixArchive)
+            filteredPhys = path.accessor->getPhysicalPath(path.path);
 
         auto refs = refsJson(references).dump();
 
@@ -667,11 +716,11 @@ struct RioStore : virtual Store
         }
 
         auto result = [&]() -> StorePath {
-            if (!phys || method.raw != ContentAddressMethod::Raw::NixArchive)
-                /* Non-filesystem accessor (fetchTree, filtered source) or
-                 * flat/text addressing: generic NAR-dump ingest — those
-                 * bytes have no other local home, so they land as
-                 * FETCHED content records. */
+            if ((!phys || method.raw != ContentAddressMethod::Raw::NixArchive) && !filteredPhys)
+                /* Non-filesystem / pure-virtual accessor or flat/text
+                 * addressing: generic NAR-dump ingest — those bytes have
+                 * no other local home, so they land as FETCHED content
+                 * records. */
                 return Store::addToStore(name, path, method, hashAlgo, references, filter, repair);
 
             /* Direct two-plane ingest (ADR-024 not-a-mirror): one walk of
@@ -698,15 +747,32 @@ struct RioStore : virtual Store
                     },
             };
             RioStr out, err;
-            int rc = rio_add_source_tree(
-                rio,
-                phys->string().c_str(),
-                nameStr.c_str(),
-                refs.c_str(),
-                &rioPathCompute,
-                &pctx,
-                &out.p,
-                &err.p);
+            int rc;
+            if (phys)
+                rc = rio_add_source_tree(
+                    rio,
+                    phys->string().c_str(),
+                    nameStr.c_str(),
+                    refs.c_str(),
+                    &rioPathCompute,
+                    &pctx,
+                    &out.p,
+                    &err.p);
+            else {
+                std::string manifest;
+                dumpAccessorManifest(*path.accessor, path.path, manifest);
+                rc = rio_add_filtered_tree(
+                    rio,
+                    filteredPhys->string().c_str(),
+                    nameStr.c_str(),
+                    refs.c_str(),
+                    reinterpret_cast<const unsigned char *>(manifest.data()),
+                    manifest.size(),
+                    &rioPathCompute,
+                    &pctx,
+                    &out.p,
+                    &err.p);
+            }
             checkRc(rc, err, "addToStore", pctx.ex);
             return parseStorePath(nlohmann::json::parse(out.str()).at("path").get<std::string>());
         }();

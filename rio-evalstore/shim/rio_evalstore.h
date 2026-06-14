@@ -136,6 +136,31 @@ int rio_add_source_tree(
     char ** out_json,
     char ** err);
 
+/* addToStore(SourcePath) on a FilteringSourceAccessor over a physical
+ * store (git workdir flake `self`): same two-plane ingest as
+ * rio_add_source_tree, but the tree shape comes from a manifest the
+ * shim walked through the accessor — so the tracked-files view is
+ * honoured — while regular files are read in parallel from their
+ * physical paths. fs_path is getPhysicalPath() on the accessor's root.
+ *
+ * Manifest encoding (recursive, native-endian, NAR sorted order):
+ *   node := u8 kind (RIO_NODE_*), then
+ *     REGULAR:   u8 executable, u64 size, u32 plen, path bytes
+ *     SYMLINK:   u32 tlen, target bytes
+ *     DIRECTORY: u32 count, then per entry: u32 nlen, name bytes, node
+ * refs_json / *out_json as in rio_add_source_tree. */
+int rio_add_filtered_tree(
+    RioEvalStore * store,
+    const char * fs_path,
+    const char * name,
+    const char * refs_json,
+    const unsigned char * manifest,
+    size_t manifest_len,
+    rio_path_cb path_cb,
+    void * path_ctx,
+    char ** out_json,
+    char ** err);
+
 /* writeDerivation. name = store-path name ("foo-1.2.drv"); aterm = the
  * canonical bytes nix hashed; drv_json = nix's derivation JSON;
  * nix_drv_path = nix's computed path (hard cross-check). */

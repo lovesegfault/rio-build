@@ -40,7 +40,7 @@ use rio_packstore::{Digest, Kind, Options, PackStore};
 use crate::dirblob::{BuiltDir, BuiltEntry, DirBlobError};
 use crate::dircache::{DecodedDir, DirStore, DirStoreError, EntryRef};
 use crate::fingerprint::{FingerprintRecord, FingerprintTable, stat_fingerprint, tree_stat_walk};
-use crate::ingest::{self, IngestConfig, IngestError, IngestFile, IngestNode};
+use crate::ingest::{self, IngestConfig, IngestError, IngestFile, IngestNode, IngestResult};
 use crate::stats::Stats;
 
 /// Pack-record kind for per-path metadata records ([`PathMeta`] JSON).
@@ -610,6 +610,59 @@ impl EvalStore {
             )
         });
         let result = ingest::ingest_tree(std::path::Path::new(fs_path), &IngestConfig::default())?;
+        let out =
+            self.commit_local_ingest(fs_path, name, references, &refs, result, nix_path_for)?;
+        self.stats.record("add_source_tree", out.nar_size);
+        Ok(out)
+    }
+
+    /// Ingest a filtered local source tree (`addToStore(SourcePath)` on a
+    /// `FilteringSourceAccessor` over a physical store — git workdir flake
+    /// `self`): same single-read two-plane pipeline as
+    /// [`EvalStore::add_source_tree`], but the tree shape is the
+    /// accessor's tracked-files view, supplied as a pre-walked
+    /// [`ingest::ManifestNode`]. Regular files are read in parallel from
+    /// their physical paths; the NAR sha256 is computed over the filtered
+    /// shape, so the resulting store path equals what `dumpPath` through
+    /// the accessor would produce. `fs_path` is the physical root
+    /// (`getPhysicalPath` on the accessor's root) — every visible file
+    /// lives at `fs_path/<rel>` for the same `<rel>` the directory blobs
+    /// record, so `Origin::Local` readback applies unchanged.
+    pub fn add_filtered_tree(
+        &self,
+        fs_path: &str,
+        name: &str,
+        references: &[String],
+        manifest: &ingest::ManifestNode,
+        nix_path_for: &mut dyn FnMut(&AddHashes) -> Result<String>,
+    ) -> Result<AddResult> {
+        let refs = parse_refs(references)?;
+        // r[impl bc.evalparent.claim-advisory]
+        let _claim = self.claims.get().map(|t| {
+            crate::evaljob::claim::ClaimGuard::acquire(
+                t,
+                *blake3::hash(fs_path.as_bytes()).as_bytes(),
+            )
+        });
+        let result = ingest::ingest_manifest(manifest, &IngestConfig::default())?;
+        let out =
+            self.commit_local_ingest(fs_path, name, references, &refs, result, nix_path_for)?;
+        self.stats.record("add_filtered_tree", out.nar_size);
+        Ok(out)
+    }
+
+    /// Shared back half of the local-tree ingest routes: NAR-recursive
+    /// store-path computation + nix cross-check, ingest-tree → directory
+    /// blobs + chunk-meta records, commit as [`Origin::Local`].
+    fn commit_local_ingest(
+        &self,
+        fs_path: &str,
+        name: &str,
+        references: &[String],
+        refs: &[StorePath],
+        result: IngestResult,
+        nix_path_for: &mut dyn FnMut(&AddHashes) -> Result<String>,
+    ) -> Result<AddResult> {
         let nar_sha256 = result.nar_sha256;
         let nar_size = result.nar_size;
 
@@ -617,7 +670,7 @@ impl EvalStore {
             name,
             &NixHash::new(HashAlgo::SHA256, nar_sha256.to_vec())?,
             true,
-            &refs,
+            refs,
         )?;
         let hashes = AddHashes {
             nar_sha256: hex::encode(nar_sha256),
@@ -666,7 +719,6 @@ impl EvalStore {
             },
             extra_pins,
         )?;
-        self.stats.record("add_source_tree", nar_size);
 
         Ok(AddResult {
             path: rust_path.to_string(),
