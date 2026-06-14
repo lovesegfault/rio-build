@@ -29,6 +29,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "nix/cmd/common-eval-args.hh" // fetchSettings / evalSettings / flakeSettings globals + lookupFileArg
@@ -100,6 +101,126 @@ std::vector<std::string> attrCandidates(const EvalCtx & ctx, const std::string &
     };
 }
 
+/* Attr-path component for re-resolution by findAlongAttrPath: quote
+ * names its dot-splitting parser would otherwise tear apart. Names it
+ * cannot address at all — containing '"' (the parser has no escapes),
+ * all digits (parsed as a list index), or empty — return nullopt; the
+ * caller skips those with a warning. */
+std::optional<std::string> attrPathComponent(std::string_view name)
+{
+    if (name.find('"') != std::string_view::npos
+        || name.find_first_not_of("0123456789") == std::string_view::npos)
+        return std::nullopt;
+    if (name.find('.') != std::string_view::npos)
+        return "\"" + std::string(name) + "\"";
+    return std::string(name);
+}
+
+/* Enumerate the derivation children of an attrset value (one level,
+ * descending into `recurseForDerivations = true` sub-attrsets). A child
+ * that is neither a derivation nor a recursable attrset — or that fails
+ * to force — lands in `skipped`; one odd entry must not kill the
+ * expansion. */
+void collectDrvChildren(
+    nix::EvalState & state,
+    nix::Value & v,
+    const std::string & prefix,
+    std::vector<std::string> & children,
+    std::vector<std::string> & skipped)
+{
+    for (auto & a : v.attrs()->lexicographicOrder(state.symbols)) {
+        std::string_view name{state.symbols[a->name]};
+        if (name == "recurseForDerivations")
+            continue;
+        auto component = attrPathComponent(name);
+        std::string path = prefix + "." + component.value_or(std::string(name));
+        if (!component) {
+            skipped.push_back(path);
+            continue;
+        }
+        try {
+            if (nix::getDerivation(state, *a->value, false)) {
+                children.push_back(path);
+                continue;
+            }
+            if (a->value->type() == nix::nAttrs) {
+                auto r = a->value->attrs()->get(state.s.recurseForDerivations);
+                if (r
+                    && state.forceBool(
+                        *r->value, r->pos, "while evaluating `recurseForDerivations`")) {
+                    collectDrvChildren(state, *a->value, path, children, skipped);
+                    continue;
+                }
+            }
+            skipped.push_back(path);
+        } catch (nix::Error &) {
+            // The child's own eval error resurfaces if it is requested
+            // explicitly; here it only costs the skip warning.
+            skipped.push_back(path);
+        }
+    }
+}
+
+/* The resolved attr is an attrset, not a derivation: expand it into one
+ * WorkItem per derivation child (reported via an AttrsetExpansion
+ * frame) instead of failing. `resolved` is the candidate attr path that
+ * matched — children are named relative to it so the coordinator's
+ * WorkItems re-resolve verbatim. */
+// r[impl bc.eval.attrset-expansion]
+int expandAttrset(
+    EvalCtx & ctx, const std::string & attr, const std::string & resolved, nix::Value & v, int workerFd)
+{
+    std::string prefix = resolved;
+    nix::Value * cur = &v;
+    std::vector<std::string> children;
+    std::vector<std::string> skipped;
+
+    /* `.#checks` style: descend into the eval system's entry first (the
+     * same system the flake fragment fallbacks use). */
+    auto sys = cur->attrs()->get(ctx.state->symbols.create(ctx.system));
+    if (sys) {
+        prefix += "." + ctx.system;
+        if (nix::getDerivation(*ctx.state, *sys->value, false)) {
+            children.push_back(prefix);
+        } else if (sys->value->type() == nix::nAttrs) {
+            cur = sys->value;
+        } else {
+            throw nix::Error(
+                "attribute '%s' is neither a derivation nor an attrset of derivations", prefix);
+        }
+    }
+    if (children.empty())
+        collectDrvChildren(*ctx.state, *cur, prefix, children, skipped);
+    if (children.empty()) {
+        std::string hint = sys ? "" : " and no '" + ctx.system + "' entry";
+        throw nix::Error(
+            "attribute '%s' expanded to zero derivations (no derivation children below '%s'%s)",
+            attr,
+            prefix,
+            hint);
+    }
+
+    std::vector<const char *> childPtrs, skippedPtrs;
+    for (auto & c : children)
+        childPtrs.push_back(c.c_str());
+    for (auto & s : skipped)
+        skippedPtrs.push_back(s.c_str());
+    char * err = nullptr;
+    if (rio_emit_expansion(
+            workerFd,
+            attr.c_str(),
+            childPtrs.data(),
+            childPtrs.size(),
+            skippedPtrs.data(),
+            skippedPtrs.size(),
+            &err)) {
+        std::string m = err ? err : "emit failed";
+        rio_string_free(err);
+        throw nix::Error("emitting expansion for '%s': %s", attr, m);
+    }
+    return 0;
+}
+
 /* Per-attr worker callback (runs in the FORKED CHILD). */
 extern "C" int
 evalAttr(void * ctxRaw, const char * attrC, int workerFd, char * errBuf, size_t errCap) noexcept
@@ -109,11 +230,13 @@ evalAttr(void * ctxRaw, const char * attrC, int workerFd, char * errBuf, size_t 
     try {
         std::string attr(attrC);
         nix::Value * v = nullptr;
+        std::string resolved;
         std::optional<std::string> firstError;
         for (auto & candidate : attrCandidates(*ctx, attr)) {
             try {
                 v = nix::findAlongAttrPath(*ctx->state, candidate, *ctx->autoArgs, *ctx->vRoot)
                         .first;
+                resolved = candidate;
                 break;
             } catch (nix::Error & e) {
                 if (!firstError)
@@ -127,8 +250,12 @@ evalAttr(void * ctxRaw, const char * attrC, int workerFd, char * errBuf, size_t 
                 firstError.value_or("no candidates tried"));
 
         auto packageInfo = nix::getDerivation(*ctx->state, *v, false);
-        if (!packageInfo)
+        if (!packageInfo) {
+            // getDerivation already forced *v.
+            if (v->type() == nix::nAttrs)
+                return expandAttrset(*ctx, attr, resolved, *v, workerFd);
             throw nix::Error("attribute '%s' does not evaluate to a derivation", attr);
+        }
         /* Forcing drvPath instantiates the derivation closure: every
          * drv lands in the rio store's in-memory map (writeDerivation)
          * and every local source tree takes the two-plane ingest. */

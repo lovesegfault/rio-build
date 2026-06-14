@@ -80,6 +80,7 @@ message WorkerFrame {
     IfdRequest ifd_request = 2;
     RecycleNotice recycle = 3;
     WorkerError error = 4;
+    AttrsetExpansion expansion = 5;
   }
 }
 
@@ -141,6 +142,25 @@ message IfdRequest {
 // incomplete attr; the coordinator surfaces it in the UI only.
 message RecycleNotice {
   uint32 generation = 1;
+}
+
+// The attr resolved to an attribute set instead of a derivation: the
+// worker enumerated its derivation children (descending into the eval
+// system's entry first, and into nested sets only when they carry
+// `recurseForDerivations = true`) and reports their full attr paths.
+// The expansion is the attr's final answer — the worker is idle again.
+// The coordinator queues each child as an ordinary `WorkItem`, so the
+// children spread across the fork-worker pool exactly like explicitly
+// listed attrs (per-child crash-requeue, recycling and IFD included).
+message AttrsetExpansion {
+  // The attr as assigned in the WorkItem.
+  string attr = 1;
+  // Full attr paths of the derivation children (each resolvable
+  // verbatim by a later WorkItem).
+  repeated string children = 2;
+  // Children that are neither derivations nor recursable attrsets —
+  // surfaced as warnings, never a hard error for the run.
+  repeated string skipped = 3;
 }
 
 // An attr failed to evaluate (or the parent hit a non-attr fault).

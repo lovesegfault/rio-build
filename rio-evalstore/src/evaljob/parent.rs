@@ -303,6 +303,17 @@ fn handle_worker_frame(
                     .push(pid);
             }
         }
+        Some(worker_frame::Msg::Expansion(ref e)) => {
+            // The attr's answer is its child list; the children come
+            // back as ordinary WorkItems, so this worker is idle again.
+            // r[impl bc.eval.attrset-expansion]
+            let w = &mut workers[idx];
+            if w.current.as_deref() == Some(e.attr.as_str()) {
+                w.current = None;
+                w.attrs_done += 1;
+                maybe_recycle(chan, w, generation, opts)?;
+            }
+        }
         Some(worker_frame::Msg::Error(ref e)) => {
             let w = &mut workers[idx];
             if w.current.as_deref() == Some(e.attr.as_str()) {

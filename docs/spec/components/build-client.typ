@@ -28,6 +28,33 @@ A `ResultFrame` batch whose `root_drv_digest` is non-empty closes its attr:
 the attr's transitive skeleton is complete once every digest reachable from
 that root has been folded.
 
+= Installables
+
+An installable that names a single derivation becomes one build root. An
+installable that names an attribute set (`.#checks`,
+`.#checks.x86_64-linux`) is expanded instead of rejected.
+
+#r("bc.eval.attrset-expansion")[
+  An installable whose attr resolves to an attribute set rather than a
+  derivation MUST be expanded: the eval worker reports the full attr paths
+  of the set's derivation children (descending first into the entry named
+  after the eval system when present, and into nested sets only when they
+  carry `recurseForDerivations = true`), the coordinator queues each child
+  as its own build root named by that attr path, a child that is neither a
+  derivation nor a recursable attribute set is skipped with a warning
+  naming it, and an installable that expands to zero derivations fails
+  evaluation for that attr.
+]
+
+The expansion rides an `AttrsetExpansion` worker frame and is the attr's
+final answer: the children come back to the eval parent as ordinary
+`WorkItem`s, so they spread across the fork-worker pool exactly like
+explicitly listed attrs --- per-child crash-requeue, recycling and IFD all
+apply unchanged. A child that was also requested explicitly (or by another
+expansion) is queued once. A child whose name cannot be written as a
+re-resolvable attr path (it contains `"`, is all digits, or is empty) is
+skipped the same way as a non-derivation entry.
+
 = Pipeline
 
 The five ADR-024 stages run overlapped --- nothing waits for "eval finished":

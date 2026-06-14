@@ -335,6 +335,74 @@ async fn multi_root_excludes_already_submitted_nodes() -> TestResult {
     Ok(())
 }
 
+/// `.#checks`-style attrset installable: the worker answers with an
+/// `AttrsetExpansion`; the coordinator queues each child as its own
+/// build root named by its full attr path, dedups a child that was
+/// also requested explicitly, and the run completes with one outcome
+/// per derivation child.
+// r[verify bc.eval.attrset-expansion]
+#[tokio::test]
+async fn attrset_expansion_builds_each_child_once() -> TestResult {
+    let cluster = TestCluster::new().await?;
+    let alpha = drvgen::make_drv("exp-alpha", &[], &[]);
+    let beta = drvgen::make_drv("exp-beta", &[], &[]);
+    let alpha_attr = "checks.x86_64-linux.alpha";
+    let beta_attr = "checks.x86_64-linux.beta";
+
+    let script = HashMap::from([
+        (
+            alpha_attr.to_string(),
+            vec![single_frame(alpha_attr, &[&alpha], vec![], &alpha)],
+        ),
+        (
+            beta_attr.to_string(),
+            vec![single_frame(beta_attr, &[&beta], vec![], &beta)],
+        ),
+    ]);
+    let expansions = HashMap::from([(
+        "checks".to_string(),
+        rio_proto::evaljob::AttrsetExpansion {
+            attr: "checks".into(),
+            children: vec![alpha_attr.to_string(), beta_attr.to_string()],
+            skipped: vec!["checks.x86_64-linux.not-a-check".to_string()],
+        },
+    )]);
+
+    // The attrset AND one of its children are requested explicitly —
+    // the expanded child must not become a second root.
+    let mut coordinator = cluster.coordinator(|_| {});
+    let (summary, parent) = cluster
+        .run_expanding(
+            &mut coordinator,
+            script,
+            expansions,
+            &["checks", alpha_attr],
+        )
+        .await?;
+
+    assert_eq!(summary.outcomes.len(), 2, "{:?}", summary.outcomes);
+    let mut attrs: Vec<&str> = summary.outcomes.iter().map(|o| o.attr.as_str()).collect();
+    attrs.sort_unstable();
+    assert_eq!(
+        attrs,
+        vec![alpha_attr, beta_attr],
+        "roots are named by the worker-reported child attr paths"
+    );
+    assert!(
+        summary
+            .outcomes
+            .iter()
+            .all(|o| matches!(o.state, OutcomeState::Completed { .. })),
+        "{:?}",
+        summary.outcomes
+    );
+
+    // One submission per child root, none for the expanded attr itself.
+    assert_eq!(cluster.sched.state.lock().unwrap().accepted.len(), 2);
+    assert!(parent.seen.lock().unwrap().shutdown);
+    Ok(())
+}
+
 /// >50k nodes paginate: non-final pages stage under one submission_id
 /// and ack with an empty close; the final page carries the remainder
 /// and the build options; the scheduler assembles and verifies the

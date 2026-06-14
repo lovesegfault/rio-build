@@ -70,6 +70,10 @@ struct Summary {
     eval_errors: Vec<(String, String)>,
     /// Attr-less faults (crash visibility reports).
     faults: Vec<String>,
+    /// Attrset expansions: (attr, child attr paths).
+    expansions: Vec<(String, Vec<String>)>,
+    /// Children skipped by expansions (not derivations, not recursable).
+    skipped: Vec<String>,
     recycles: usize,
     total_nodes: usize,
 }
@@ -118,6 +122,8 @@ async fn main() -> anyhow::Result<()> {
         results: vec![],
         eval_errors: vec![],
         faults: vec![],
+        expansions: vec![],
+        skipped: vec![],
         recycles: 0,
         total_nodes: 0,
     };
@@ -197,6 +203,22 @@ async fn main() -> anyhow::Result<()> {
                         },
                     ))
                     .await?;
+            }
+            worker_frame::Msg::Expansion(exp) => {
+                // Mirror the coordinator: the attrset attr resolves into
+                // one WorkItem per derivation child.
+                pending.remove(&exp.attr);
+                summary.skipped.extend(exp.skipped);
+                for child in &exp.children {
+                    if pending.insert(child.clone()) {
+                        writer
+                            .send(coordinator_frame::Msg::Work(WorkItem {
+                                attr: child.clone(),
+                            }))
+                            .await?;
+                    }
+                }
+                summary.expansions.push((exp.attr, exp.children));
             }
             worker_frame::Msg::Recycle(_) => summary.recycles += 1,
             worker_frame::Msg::Error(e) => {
