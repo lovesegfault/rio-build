@@ -470,6 +470,97 @@
       "doc": "K8s API error (connection, permission, not-found)."
     },
     {
+      "enum": "EvalStoreError",
+      "name": "AtermRoundTrip",
+      "crate": "rio-evalstore",
+      "msg": "ATerm round-trip FAILED for derivation '{name}': rio-nix unparse(parse(aterm)) differs from nix's original bytes — refusing to continue (parser/serializer divergence)",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Corrupt",
+      "crate": "rio-evalstore",
+      "msg": "client CAS is corrupt: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Derivation",
+      "crate": "rio-evalstore",
+      "msg": "derivation error: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "ForeignPath",
+      "crate": "rio-evalstore",
+      "msg": "path '{0}' is not in the client CAS — cluster-backed reads for foreign paths arrive in ADR-024 M1; M0 serves only paths this store ingested",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Hash",
+      "crate": "rio-evalstore",
+      "msg": "hash error: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Io",
+      "crate": "rio-evalstore",
+      "msg": "I/O error: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Nar",
+      "crate": "rio-evalstore",
+      "msg": "NAR error: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "NarHashMismatch",
+      "crate": "rio-evalstore",
+      "msg": "NAR hash cross-check FAILED for '{path}': computed sha256:{computed} but caller claimed sha256:{claimed}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "NoSuchEntry",
+      "crate": "rio-evalstore",
+      "msg": "no such entry '{rel}' in store object '{basename}'",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "PathMismatch",
+      "crate": "rio-evalstore",
+      "msg": "store path cross-check FAILED for {op} of '{name}': rio-nix computed {rust_path} but nix computed {nix_path} — refusing to continue (one of the two hashing implementations is wrong)",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "StorePath",
+      "crate": "rio-evalstore",
+      "msg": "store path error: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Unsupported",
+      "crate": "rio-evalstore",
+      "msg": "unsupported in rio-evalstore M0: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Utf8",
+      "crate": "rio-evalstore",
+      "msg": "derivation is not valid UTF-8: {0}",
+      "doc": ""
+    },
+    {
       "enum": "GatewayError",
       "name": "ClientReported",
       "crate": "rio-gateway",
@@ -1795,6 +1886,11 @@
       "name": "Error",
       "crate": "rio-controller",
       "doc": "Top-level reconcile error. kube's `Controller::run` takes an `error_policy` fn that receives this and decides requeue timing. `Box` on the finalizer variant: `finalizer::Error<Self>` is recursive (it wraps our Error for ApplyFailed/CleanupFailed). Unboxed it's an infinite-size type. Box breaks the cycle with a pointer indirection."
+    },
+    {
+      "name": "EvalStoreError",
+      "crate": "rio-evalstore",
+      "doc": ""
     },
     {
       "name": "GatewayError",

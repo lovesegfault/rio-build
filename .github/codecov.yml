@@ -20,7 +20,7 @@ codecov:
     # codecov-matrix-sync check in flake.nix — updating the matrix without
     # bumping this value fails `nix flake check`. Count = unit-* (one per
     # workspace member) + vm-* coverage scenarios.
-    after_n_builds: 54
+    after_n_builds: 55
     # Keep wait_for_ci as a floor: if a coverage job is skipped/cancelled
     # we still want to hold until CI is done rather than wait forever.
     wait_for_ci: true

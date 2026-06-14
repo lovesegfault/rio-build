@@ -9,6 +9,7 @@
     "rio-common": "rio-common",
     "rio-controller": "rio-controller",
     "rio-crds": "rio-crds",
+    "rio-evalstore": "rio-evalstore",
     "rio-evidence-kernel": "rio-evidence-kernel",
     "rio-gateway": "rio-gateway",
     "rio-lease": "rio-lease",
@@ -5607,9 +5608,9 @@
     },
     "dashu-base": {
       "crateName": "dashu-base",
-      "version": "0.4.2",
+      "version": "0.4.3",
       "edition": "2021",
-      "sha256": "135k714n87zxxhj63rh0ddnxdfr8rn2b70dxh193k1c5disz1czs",
+      "sha256": "1r6szy6mnz2kgm7m1r2y5qx8axbf3nj1gc6w8xbkz3i43gf9afwr",
       "source": {
         "type": "crates-io"
       },
@@ -5625,9 +5626,9 @@
     },
     "dashu-int": {
       "crateName": "dashu-int",
-      "version": "0.4.2",
+      "version": "0.4.3",
       "edition": "2021",
-      "sha256": "04y7sfq5473fafy3f43s6ls8n7j4hgw2mjvf3q3rmjiavj9kvafn",
+      "sha256": "1ij27ky4zglqnzvcfmwq4g70vf94mkyk4r64hz69zcxhbh6mmh29",
       "source": {
         "type": "crates-io"
       },
@@ -20373,6 +20374,70 @@
       ],
       "libCrateTypes": [
         "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
+    "rio-evalstore": {
+      "crateName": "rio-evalstore",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-evalstore"
+      },
+      "dependencies": [
+        {
+          "name": "blake3",
+          "packageId": "blake3"
+        },
+        {
+          "name": "hex",
+          "packageId": "hex"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
+          "name": "rio-nix",
+          "packageId": "rio-nix"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "sha2",
+          "packageId": "sha2 0.11.0"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
+        }
+      ],
+      "devDependencies": [
+        {
+          "name": "anyhow",
+          "packageId": "anyhow"
+        },
+        {
+          "name": "tempfile",
+          "packageId": "tempfile"
+        }
+      ],
+      "libCrateTypes": [
+        "staticlib",
+        "rlib"
       ],
       "authors": [
         "Rio Contributors"

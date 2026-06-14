@@ -17,6 +17,10 @@
       "description": "Kubernetes operator for rio-build: Pool, ComponentScaler CRDs"
     },
     {
+      "name": "rio-evalstore",
+      "description": "Client-side eval store: persistent CAS backing the rio:// nix store plugin (ADR-024 M0)"
+    },
+    {
       "name": "rio-gateway",
       "description": "SSH gateway and Nix protocol frontend for rio-build"
     },
@@ -57,22 +61,6 @@
       "description": "CustomResourceDefinition types for rio-build (Pool, ComponentScaler)"
     },
     {
-      "name": "rio-retry-kernel",
-      "description": "Pure retry/poison decision kernels for the rio-build scheduler (CBMC-verified)"
-    },
-    {
-      "name": "rio-evidence-kernel",
-      "description": "Pure closure-evidence decision kernel for the rio-build scheduler (CBMC-verified)"
-    },
-    {
-      "name": "rio-log-kernel",
-      "description": "Pure log chunk-range/dedup/gate decision kernels for the rio-build store (CBMC-verified)"
-    },
-    {
-      "name": "rio-authz-kernel",
-      "description": "Pure credential-class authorization decision kernel for the rio-build store (CBMC-verified)"
-    },
-    {
       "name": "xtask",
       "description": "Dev/ops tooling: codegen, local cluster lifecycle, AMI build, helm/k8s helpers"
     }
@@ -85,15 +73,9 @@
       "optional": [],
       "dev": []
     },
-    "rio-authz-kernel": {
-      "prod": [],
-      "optional": [],
-      "dev": []
-    },
     "rio-builder": {
       "prod": [
         "rio-common",
-        "rio-log-kernel",
         "rio-nix",
         "rio-proto"
       ],
@@ -109,7 +91,6 @@
         "rio-auth",
         "rio-common",
         "rio-crds",
-        "rio-log-kernel",
         "rio-proto"
       ],
       "optional": [],
@@ -141,8 +122,10 @@
       "optional": [],
       "dev": []
     },
-    "rio-evidence-kernel": {
-      "prod": [],
+    "rio-evalstore": {
+      "prod": [
+        "rio-nix"
+      ],
       "optional": [],
       "dev": []
     },
@@ -150,7 +133,6 @@
       "prod": [
         "rio-auth",
         "rio-common",
-        "rio-log-kernel",
         "rio-nix",
         "rio-proto"
       ],
@@ -170,11 +152,6 @@
       "dev": [
         "rio-test-support"
       ]
-    },
-    "rio-log-kernel": {
-      "prod": [],
-      "optional": [],
-      "dev": []
     },
     "rio-migrations": {
       "prod": [],
@@ -196,21 +173,14 @@
       "optional": [],
       "dev": []
     },
-    "rio-retry-kernel": {
-      "prod": [],
-      "optional": [],
-      "dev": []
-    },
     "rio-scheduler": {
       "prod": [
         "rio-auth",
         "rio-common",
-        "rio-evidence-kernel",
         "rio-lease",
         "rio-migrations",
         "rio-nix",
         "rio-proto",
-        "rio-retry-kernel",
         "rio-store"
       ],
       "optional": [],
@@ -221,10 +191,7 @@
     "rio-store": {
       "prod": [
         "rio-auth",
-        "rio-authz-kernel",
         "rio-common",
-        "rio-evidence-kernel",
-        "rio-log-kernel",
         "rio-migrations",
         "rio-nix",
         "rio-proto"
@@ -246,7 +213,6 @@
       "prod": [
         "rio-common",
         "rio-crds",
-        "rio-migrations",
         "rio-proto",
         "rio-scheduler",
         "rio-test-support"
