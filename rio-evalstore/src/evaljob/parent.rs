@@ -590,5 +590,12 @@ fn run_worker_loop(store: &EvalStore, stream: UnixStream, eval: &mut EvalFn<'_>)
     // exit IS the eval-state GC (boehmgc never collects under
     // GC_DONT_GC), so this flush is the only teardown that matters.
     let _ = store.flush();
+    // The exit(0) below skips Drop (and so the EvalStore::drop stats
+    // dump). Per-worker ingest counters are the ONLY observability
+    // hook for ADR-024 ingest perf — the parent's store sees only
+    // pre-fork warmup ops — so dump them here explicitly.
+    if crate::stats::Stats::enabled() {
+        eprintln!("{}", store.stats().render());
+    }
     std::process::exit(0);
 }
