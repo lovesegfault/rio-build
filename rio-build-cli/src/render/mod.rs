@@ -119,8 +119,17 @@ pub fn spawn(
         let mut out = std::io::stderr();
         match mode {
             RenderMode::Auto | RenderMode::Plain => {
-                while let Some(ev) = rx.recv().await {
-                    plain::on_event(&mut out, &ev);
+                let mut r = plain::PlainRenderer::default();
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        ev = rx.recv() => match ev {
+                            Some(ev) => r.on_event(&mut out, &ev),
+                            None => { r.tick(&mut out); break; }
+                        },
+                        _ = tick.tick() => r.tick(&mut out),
+                    }
                 }
             }
             RenderMode::Ci => {
