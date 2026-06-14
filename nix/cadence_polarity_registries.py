@@ -103,10 +103,44 @@ R34_PAIRS = {
 #   plant battery covers each one — WS-I2).
 WITNESSED_WORK = ("relayed-line", "committed-row", "completed-unit", "OTHER")
 REJECTED_CLEARS = ("open", "connect", "re-mint", "retried-attempt")
-# Founding enrollments arrive with their slots (S1's occupancy-keyed
-# live-tail clear; S2's in-process fence-arming record) and are
-# reconciled at the wave-close re-mint with anchors at the landed tree.
+# Founding enrollments (round-14 wave-close, anchors at the landed
+# tree). Doctrine coupling: docs/spec/system/failure-modes.typ
+# `sys.recovery.witnessed-clear` (minted at S1) is the law text these
+# rows enforce — cited, not re-minted (the spec rule's r[verify]
+# markers are W14-A4/W14-A5 in rio-gateway/tests).
 R34_CLEARS = {
+    "live-tail-degraded-vs-relayed-progress": (
+        "landed",
+        "S1",
+        "rio-gateway/src/handler/log_tail.rs",
+        r"if last_relayed != relayed_before",
+        "first relayed chunk on the live tail (the DriveEnd::Ended arm "
+        "snapshots last_relayed before drive_stream and clears the "
+        "degraded episode iff it advanced — the merged_bug_003 repair)",
+        (
+            "relayed-line",
+            "the occupancy-keyed clear: episode ends on the first "
+            "chunk DELIVERED, not on the open that may carry an "
+            "in-band err_stream refusal each 1s cycle",
+        ),
+    ),
+    "scaler-fence-vs-scale-patch-success": (
+        "landed",
+        "S2",
+        "rio-controller/src/reconcilers/mod.rs",
+        r"last_scale_up: Mutex<HashMap<String, Instant>>",
+        "patch_scale Ok at the mutating write's success site (the "
+        "fence ARMS, not clears — R34-w(v) extends the same law to "
+        "the arming edge: the in-process record stamps at the success "
+        "site so a failed status write cannot disarm it; the bug_021 "
+        "repair)",
+        (
+            "committed-row",
+            "the in-process ScalerState::last_scale_up insert keyed "
+            "by error_key, stamped at the patch_scale Ok return — "
+            "freshest_since_up merges with status as durable backfill",
+        ),
+    ),
 }
 
 
