@@ -54,6 +54,11 @@ fn source_root_for(origin: &Path, name: &str) -> SourceRoot {
         nar_hash: result.nar_sha256.to_vec(),
         nar_size: result.nar_size,
         origin: origin.to_str().expect("utf8 temp path").to_string(),
+        root_node: Some(rio_proto::castore::RootNode {
+            node: Some(rio_proto::castore::root_node::Node::DirDigest(
+                folded.root_digest.0.to_vec(),
+            )),
+        }),
     }
 }
 

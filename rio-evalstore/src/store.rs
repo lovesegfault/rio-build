@@ -1680,6 +1680,11 @@ impl EvalStore {
             nar_hash,
             nar_size: meta.info.nar_size,
             origin: fs_path.clone(),
+            root_node: Some(rio_proto::castore::RootNode {
+                node: Some(rio_proto::castore::root_node::Node::DirDigest(
+                    digest.to_vec(),
+                )),
+            }),
         }))
     }
 
