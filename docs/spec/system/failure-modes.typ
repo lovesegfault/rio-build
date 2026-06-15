@@ -610,7 +610,11 @@ open, while the store routes every application refusal through
 `TransportErr` -> `Reopen`. A persistently-refusing peer reset the clock
 every cycle and neither the 30 s notice nor the per-episode warn could
 ever fire. Repaired by gating the clear on the first relayed chunk
-(`last_relayed` advanced) and arming on a zero-relayed in-stream refusal.
+(`DriveOutcome.relayed_any`, computed once at the `drive_stream` tail
+and consulted ABOVE the `DriveEnd` match so EVERY end variant --- `Gap`
+included --- consults it; merged_bug_006 was the §Multi-axis-fn
+sibling-arm hole where the per-arm diff lived only in `Ended`) and
+arming on a zero-relayed in-stream refusal.
 The founding re-mint instance (merged_bug_005,
 #rref("gw.jwt.remint-local-expiry-only")): a rejection-triggered re-mint
 is a recovery claim and is scoped to causes the issuer can locally verify

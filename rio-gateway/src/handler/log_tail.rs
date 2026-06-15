@@ -466,9 +466,14 @@ enum DriveEnd {
     /// The stream jumped past the relay floor and the gap has not had
     /// its one re-open chance yet. The sliced lines are WITHHELD in
     /// the caller's [`PendingGap`] (merged_bug_150: dropping them made
-    /// "exit at the grace edge" silently lose fetched lines); nothing
-    /// was relayed or advanced; the caller re-opens at the unchanged
-    /// floor.
+    /// "exit at the grace edge" silently lose fetched lines). Earlier
+    /// `Serve` chunks in the SAME drive may well have advanced the
+    /// floor — only the gap chunk's own contribution is withheld; the
+    /// caller re-opens at the (possibly advanced) floor and consults
+    /// [`DriveOutcome::relayed_any`] for the witnessed-work clear
+    /// (merged_bug_006: the prior doc claimed "nothing was relayed or
+    /// advanced", which mis-stated exactly the serve-then-gap case the
+    /// Gap arm bypassed).
     Gap,
     /// The output channel's receiver is gone — the build's event loop
     /// has exited. Nothing left to relay to.
