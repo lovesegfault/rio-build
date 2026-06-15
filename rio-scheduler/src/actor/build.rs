@@ -408,6 +408,7 @@ impl DagActor {
                         // derivation (completion.rs:517 receives it from the
                         // worker; build state needs a field to carry it).
                         status: 0,
+                        ..Default::default()
                     })
                 }
                 BuildState::Cancelled => rio_proto::types::build_event::Event::Cancelled(
@@ -601,6 +602,7 @@ impl DagActor {
                 error_message: error_summary,
                 failed_derivation,
                 status: 0,
+                ..Default::default()
             }),
         );
         metrics::counter!("rio_scheduler_builds_total", "outcome" => "failure").increment(1);

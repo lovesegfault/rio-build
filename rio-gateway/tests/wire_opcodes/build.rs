@@ -1086,6 +1086,7 @@ async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Resu
             error_message: "build failed".into(),
             failed_derivation: target.clone(),
             status: 0,
+            ..Default::default()
         })),
     ]));
     let drv_path = seed_minimal_drv(&h);
@@ -1171,6 +1172,7 @@ async fn test_build_paths_dependency_failed_omits_rio_cli_hint() -> anyhow::Resu
             error_message: "build failed".into(),
             failed_derivation: trigger.clone(),
             status: 0,
+            ..Default::default()
         })),
     ]));
     let drv_path = seed_minimal_drv(&h);
@@ -1485,6 +1487,7 @@ async fn test_build_paths_first_event_failed_short_circuit() -> anyhow::Result<(
                 error_message: "instant fail".into(),
                 failed_derivation: String::new(),
                 status: 0,
+                ..Default::default()
             }),
         )]));
     let drv_path = seed_minimal_drv(&h);
@@ -2753,6 +2756,7 @@ async fn test_build_paths_with_results_failure_keeps_verified_target_built() -> 
             error_message: "boom".into(),
             failed_derivation: HONEST_B_DRV.into(),
             status: types::BuildResultStatus::PermanentFailure as i32,
+            ..Default::default()
         })),
     ]));
 

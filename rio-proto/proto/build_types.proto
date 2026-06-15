@@ -123,6 +123,18 @@ message BuildFailed {
   string error_message = 1;
   string failed_derivation = 2;             // Which derivation caused the failure
   BuildResultStatus status = 3;             // Failure classification (for nix-wire BuildStatus at gateway)
+
+  // Culprit attribution for fail-fast failures: the build failed because a
+  // derivation in its DAG already failed in an EARLIER build (still
+  // poisoned at merge time), so no execution ran for this build. These
+  // fields name that original culprit so the client can fetch its log via
+  // SchedulerService.GetDerivationLog and print the persisted reason. All
+  // empty/absent for live failures (the failing execution streamed its
+  // log on this build's own event stream).
+  string culprit_derivation = 4;            // .drv path of the poisoned culprit
+  string culprit_exec_id = 5;               // Execution that produced the original failure; "" = never executed
+  string culprit_error_message = 6;         // Persisted failure reason (derivations.failure_msg)
+  google.protobuf.Timestamp culprit_failed_at = 7;  // When the culprit was poisoned
 }
 
 message BuildCancelled {

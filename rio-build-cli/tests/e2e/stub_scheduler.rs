@@ -79,6 +79,11 @@ pub struct SchedState {
     pub hold_open: bool,
     pub builds: HashMap<String, Arc<BuildLog>>,
     pub cancel_calls: Vec<(String, String)>,
+    /// Per-derivation stored log served by `GetDerivationLog`, keyed by
+    /// derivation_path. A missing key answers with an immediately-closed
+    /// empty stream — the no-content / cross-tenant shape the failure
+    /// replay handles by printing the persisted reason text instead.
+    pub derivation_logs: HashMap<String, Vec<Vec<u8>>>,
     next_id: u64,
 }
 
@@ -347,5 +352,43 @@ impl SchedulerService for StubScheduler {
         _request: Request<scheduler::ResolveTenantRequest>,
     ) -> Result<Response<scheduler::ResolveTenantResponse>, Status> {
         Err(Status::unimplemented("not needed by the coordinator"))
+    }
+
+    type GetDerivationLogStream =
+        tokio_stream::wrappers::ReceiverStream<Result<types::DerivationLogChunk, Status>>;
+
+    async fn get_derivation_log(
+        &self,
+        request: Request<scheduler::GetDerivationLogRequest>,
+    ) -> Result<Response<Self::GetDerivationLogStream>, Status> {
+        let req = request.into_inner();
+        let lines = {
+            let st = self.state.lock().unwrap();
+            st.derivation_logs.get(&req.derivation_path).cloned()
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        if let Some(lines) = lines {
+            // Server-side tail: serve only the last `tail_lines` lines
+            // (0 = full log), numbering them by their true position.
+            let skip = if req.tail_lines == 0 {
+                0
+            } else {
+                lines.len().saturating_sub(req.tail_lines as usize)
+            };
+            let chunk = types::DerivationLogChunk {
+                derivation_path: req.derivation_path.clone(),
+                exec_id: req.exec_id.clone(),
+                lines: lines[skip..].to_vec(),
+                first_line_number: skip as u64,
+                is_complete: true,
+            };
+            tokio::spawn(async move {
+                let _ = tx.send(Ok(chunk)).await;
+            });
+        }
+        // No entry: tx drops immediately → empty stream, clean close.
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 }

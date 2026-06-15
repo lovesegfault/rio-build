@@ -135,6 +135,12 @@ pub struct MockScheduler {
     /// deadlines to prove the injected latency really made the caller's
     /// authentication straddle them.
     pub resolve_responded: Arc<RwLock<Vec<std::time::Instant>>>,
+    /// Chunks served verbatim by `GetDerivationLog` (empty = the stream
+    /// closes with no content, the no-log / cross-tenant fallback shape).
+    pub derivation_log: Arc<RwLock<Vec<types::DerivationLogChunk>>>,
+    /// GetDerivationLog requests received, for asserting the client
+    /// passed the right derivation/exec and tail_lines.
+    pub derivation_log_calls: Arc<RwLock<Vec<rio_proto::scheduler::GetDerivationLogRequest>>>,
 }
 
 /// Extract `x-rio-tenant-token` from request metadata as `Option<String>`.
@@ -369,6 +375,31 @@ impl SchedulerService for MockScheduler {
         Ok(Response::new(types::CancelBuildResponse {
             cancelled: true,
         }))
+    }
+
+    type GetDerivationLogStream =
+        tokio_stream::wrappers::ReceiverStream<Result<types::DerivationLogChunk, Status>>;
+
+    async fn get_derivation_log(
+        &self,
+        request: Request<rio_proto::scheduler::GetDerivationLogRequest>,
+    ) -> Result<Response<Self::GetDerivationLogStream>, Status> {
+        self.derivation_log_calls
+            .write()
+            .unwrap()
+            .push(request.into_inner());
+        let chunks = self.derivation_log.read().unwrap().clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(chunks.len().max(1));
+        tokio::spawn(async move {
+            for chunk in chunks {
+                if tx.send(Ok(chunk)).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn resolve_tenant(
