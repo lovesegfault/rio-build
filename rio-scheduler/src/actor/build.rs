@@ -702,6 +702,7 @@ impl DagActor {
                 error_message,
                 failed_derivation,
                 status,
+                ..Default::default()
             }),
         );
         metrics::counter!("rio_scheduler_builds_total", "outcome" => "failure").increment(1);

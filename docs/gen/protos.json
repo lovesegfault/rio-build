@@ -196,6 +196,7 @@
       "SchedulerService"
     ],
     "messages": [
+      "GetDerivationLogRequest",
       "ResolveTenantRequest",
       "ResolveTenantResponse"
     ],

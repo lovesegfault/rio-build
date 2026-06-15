@@ -570,6 +570,24 @@ impl SchedulerService for SchedulerGrpc {
         }))
     }
 
+    type GetDerivationLogStream = super::derivation_log::LogStream;
+
+    /// Stream a stored derivation-execution log for a build the caller
+    /// owns (`rio log`, and the client's failure replay after a
+    /// fail-fast). Implemented in a follow-up change (the scheduler only
+    /// starts emitting the culprit fields the failure replay needs then);
+    /// until that lands, callers get UNIMPLEMENTED.
+    #[instrument(skip(self, request), fields(rpc = "GetDerivationLog"))]
+    async fn get_derivation_log(
+        &self,
+        request: Request<rio_proto::scheduler::GetDerivationLogRequest>,
+    ) -> Result<Response<Self::GetDerivationLogStream>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        Err(Status::unimplemented(
+            "GetDerivationLog is not implemented yet",
+        ))
+    }
+
     // r[impl sched.tenant.resolve+2]
     /// Name→UUID resolution exposed as an RPC for the gateway's JWT
     /// mint path. Same `resolve_tenant_name` helper as SubmitBuild's
