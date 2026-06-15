@@ -238,7 +238,10 @@ spec:
     # bug_015: a non-WhenEmpty policy is only meaningful if some
     # targeting workload is disruptable — 49-disrupt-policy-coherence
     # pins that. Every shipped static pool is WhenEmpty today (the
-    # store's pods carry do-not-disrupt; rio-general's do too).
+    # store's pods carry do-not-disrupt; on rio-general only
+    # scheduler+gateway do — controller+kube-build-scheduler are
+    # disruptable, so rio-general COULD go Underutilized but stays
+    # WhenEmpty by static-pool sizing).
     consolidationPolicy: {{ .consolidationPolicy | default "WhenEmpty" }}
     consolidateAfter: {{ .consolidateAfter | default "10m" }}
     {{- with .budgets }}
