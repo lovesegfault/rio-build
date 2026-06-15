@@ -748,9 +748,13 @@ impl Coordinator {
         *pending_uploads += 1;
         let clients = self.clients.clone();
         let acks = Arc::clone(&self.acks);
+        // Streamed source roots (origin-less) are served from the
+        // client CAS; the upload task opens its own read handle there.
+        let cas_root = self.cas_root.clone();
         let itx = tx.clone();
         tokio::spawn(async move {
-            let result = upload::upload_batch(clients, acks, upload_blobs, upload_sources).await;
+            let result =
+                upload::upload_batch(clients, acks, cas_root, upload_blobs, upload_sources).await;
             let _ = itx.send(Internal::Uploaded(result));
         });
         Ok(())

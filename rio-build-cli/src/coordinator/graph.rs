@@ -49,8 +49,8 @@ pub struct FoldOutcome {
     /// Drv digests first seen in this frame (bodies attached in the
     /// graph).
     pub new_drvs: Vec<Digest32>,
-    /// Source roots first seen in this frame (keyed by root dir
-    /// digest).
+    /// Source roots first seen in this frame (keyed by
+    /// [`rio_evalstore::source_root_key`]).
     pub new_sources: Vec<Digest32>,
     /// Set when the frame completed an attr (carried a root digest).
     pub completed_root: Option<Digest32>,
@@ -119,8 +119,15 @@ impl BuildGraph {
             out.new_drvs.push(d);
         }
         for src in frame.source_roots {
-            let d = digest32(&src.dir_digest)
-                .ok_or_else(|| anyhow::anyhow!("source root dir_digest is not 32 bytes"))?;
+            // Same key the eval side dedups on and the upload path acks
+            // on — dir roots keep the raw dir_digest, file/symlink
+            // roots a domain-separated digest over store path + root.
+            let d = rio_evalstore::source_root_key(&src).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "source root {} carries neither a root node nor a 32-byte dir_digest",
+                    src.store_path
+                )
+            })?;
             self.attr_sources
                 .entry(frame.attr.clone())
                 .or_default()

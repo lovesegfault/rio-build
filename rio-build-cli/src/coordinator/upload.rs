@@ -4,14 +4,18 @@
 //!
 //! Drv blobs go through `DrvBlobService::PutDrvBlobs` (write-through
 //! idempotent; the store verifies digest ↔ canonical bytes ↔ drv_path
-//! server-side). Source trees go through the existing castore put
+//! server-side). Source roots go through the existing castore put
 //! surface, `StoreService::PutPathChunked`: one Begin frame carrying
-//! the Directory DAG + per-file chunk manifest + the `novel` chunk
-//! list (the `HasChunks` misses), then one Chunk frame per novel
-//! digest. Chunk bytes are re-read from the ORIGIN tree at upload time
-//! (the client CAS never stores chunk copies of local working trees —
-//! ADR-024); the re-read is digest-verified so a mutated tree fails
-//! loudly instead of uploading wrong content.
+//! the Directory DAG (directory roots) or the inline root node
+//! (single-file/symlink roots) + per-file chunk manifest + the `novel`
+//! chunk list (the `HasChunks` misses), then one Chunk frame per novel
+//! digest. For roots with a filesystem origin the chunk bytes are
+//! re-read from the ORIGIN tree at upload time (the client CAS never
+//! stores chunk copies of local working trees — ADR-024); the re-read
+//! is digest-verified so a mutated tree fails loudly instead of
+//! uploading wrong content. Roots with no origin (streamed: fetched
+//! flake inputs, toFile text) are served from the client CAS itself —
+//! its content records are digest-verified on read.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,7 +24,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, bail};
 use prost::Message;
 use rio_evalstore::dirblob::{BuiltDir, BuiltEntry};
-use rio_evalstore::ingest::{IngestConfig, IngestNode, ingest_tree};
+use rio_evalstore::ingest::{IngestConfig, IngestNode, chunk_bytes, ingest_tree};
+use rio_evalstore::source_root_key;
+use rio_proto::castore::root_node::Node as RootKind;
+use rio_proto::castore::{Directory, FileEntry, RootNode, SymlinkEntry};
 use rio_proto::evaljob::SourceRoot;
 use rio_proto::types::{
     ChunkData, ChunkMeta, ChunkedOutput, DrvBlob, HasChunksRequest, HasDirectoriesRequest,
@@ -63,23 +70,31 @@ pub struct UploadReport {
 pub async fn upload_batch(
     mut clients: Clients,
     acks: Arc<Mutex<ClusterAckTable>>,
+    cas_root: PathBuf,
     drv_blobs: Vec<DrvBlob>,
     sources: Vec<SourceRoot>,
 ) -> anyhow::Result<UploadReport> {
     let mut report = UploadReport::default();
 
     for src in sources {
-        let digest: Digest32 = src
-            .dir_digest
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("source root dir_digest is not 32 bytes"))?;
-        upload_source(&mut clients, &acks, &src, &digest).await?;
-        report.acked_sources.push(digest);
+        let key: Digest32 = source_root_key(&src).ok_or_else(|| {
+            anyhow::anyhow!(
+                "source root {} carries neither a root node nor a 32-byte dir_digest",
+                src.store_path
+            )
+        })?;
+        upload_source(&mut clients, &acks, &cas_root, &src, &key).await?;
+        report.acked_sources.push(key);
     }
 
     report.acked_drvs = upload_drvs(&mut clients, &acks, drv_blobs).await?;
     Ok(report)
+}
+
+/// The reported castore root kind, if any. `None` only on old-worker
+/// frames, which can only describe directory roots (`dir_digest`).
+fn root_kind(src: &SourceRoot) -> Option<&RootKind> {
+    src.root_node.as_ref().and_then(|r| r.node.as_ref())
 }
 
 /// Drv negotiation + upload: ack-table short-circuit → bulk `HasDrvs`
@@ -217,62 +232,109 @@ pub async fn reupload_drvs(
     Ok(())
 }
 
-/// Source negotiation + upload. Presence key is the root Directory
-/// digest: present + tenant-visible ⇒ the whole tree was committed by
-/// a completed upload (`PutPathChunked` commits dirs + chunks + path
-/// atomically), so the root bit short-circuits the entire tree.
+/// Source negotiation + upload, keyed by [`source_root_key`].
+///
+/// Directory roots keep the cluster `HasDirectories` probe: present +
+/// tenant-visible ⇒ the whole tree was committed by a completed upload
+/// (`PutPathChunked` commits dirs + chunks + path atomically), so the
+/// root bit short-circuits the entire tree. Single-file and symlink
+/// roots have no path-level Has RPC — they are KB-sized, the put is
+/// idempotent, and the persistent ack table suppresses repeats.
+// r[impl bc.upload.source-root-kinds]
 async fn upload_source(
     clients: &mut Clients,
     acks: &Arc<Mutex<ClusterAckTable>>,
+    cas_root: &Path,
     src: &SourceRoot,
-    digest: &Digest32,
+    key: &Digest32,
 ) -> anyhow::Result<()> {
+    // The ack table reuses ObjectKind::Directory for every root kind:
+    // file/symlink keys are domain-separated (source_root_key), so they
+    // cannot collide with real directory digests, and existing ack
+    // files stay valid.
     if acks
         .lock()
         .expect("ack table mutex poisoned")
-        .is_acked(ObjectKind::Directory, digest)
+        .is_acked(ObjectKind::Directory, key)
     {
         debug!(store_path = %src.store_path, "source: ack-short-circuit");
         return Ok(());
     }
-    let bitmap = clients
-        .directories
-        .has_directories(clients.req(HasDirectoriesRequest {
-            digests: vec![digest.to_vec()],
-        })?)
-        .await
-        .context("HasDirectories")?
-        .into_inner()
-        .bitmap;
-    if bitmap_bit(&bitmap, 0) {
+    let is_dir_root = matches!(root_kind(src), Some(RootKind::DirDigest(_)) | None);
+    let cluster_has = if is_dir_root {
+        let bitmap = clients
+            .directories
+            .has_directories(clients.req(HasDirectoriesRequest {
+                digests: vec![key.to_vec()],
+            })?)
+            .await
+            .context("HasDirectories")?
+            .into_inner()
+            .bitmap;
+        bitmap_bit(&bitmap, 0)
+    } else {
+        false
+    };
+    if cluster_has {
         debug!(store_path = %src.store_path, "source: cluster-has");
     } else {
-        let plan = plan_source_upload(src).context("planning source upload")?;
+        let plan = if src.origin.is_empty() {
+            plan_source_upload_cas(cas_root, src).context("planning CAS-read source upload")?
+        } else {
+            plan_source_upload(src).context("planning source upload")?
+        };
         put_source_chunked(clients, acks, src, plan).await?;
     }
     acks.lock()
         .expect("ack table mutex poisoned")
-        .record(ObjectKind::Directory, &[*digest])?;
+        .record(ObjectKind::Directory, &[*key])?;
     Ok(())
 }
 
-/// Everything `PutPathChunked` needs for one source root, derived by
-/// re-reading the origin tree (single-read ingest: NAR identity +
-/// FastCDC plane in one walk).
+/// Where one novel chunk's bytes come from at upload time.
+enum ChunkSource {
+    /// Re-read from the origin tree (local roots — the origin IS the
+    /// byte store, ADR-024 not-a-mirror rule).
+    File {
+        path: PathBuf,
+        offset: u64,
+        len: u32,
+    },
+    /// Already in memory (CAS-read roots: the content record was
+    /// fetched digest-verified at plan time).
+    Bytes(Vec<u8>),
+}
+
+/// Everything `PutPathChunked` needs for one source root.
 struct SourcePlan {
-    root_node: rio_proto::castore::RootNode,
-    directories: Vec<rio_proto::castore::Directory>,
+    root_node: RootNode,
+    directories: Vec<Directory>,
     /// Per-file chunk runs in canonical NAR walk order (repeats
     /// included, per the wire contract).
     chunk_manifest: Vec<ChunkMeta>,
     /// Global first-occurrence order of unique chunk digests — the
     /// order `novel` must follow.
     chunk_order: Vec<Digest32>,
-    /// Where to re-read each unique chunk: (file, offset, len).
-    chunk_locations: HashMap<Digest32, (PathBuf, u64, u32)>,
+    /// Where to obtain each unique chunk's bytes.
+    chunk_sources: HashMap<Digest32, ChunkSource>,
 }
 
-// r[impl bc.upload.origin-reread]
+impl SourcePlan {
+    fn empty() -> SourcePlan {
+        SourcePlan {
+            root_node: RootNode { node: None },
+            directories: Vec::new(),
+            chunk_manifest: Vec::new(),
+            chunk_order: Vec::new(),
+            chunk_sources: HashMap::new(),
+        }
+    }
+}
+
+/// Local-origin plan: re-read the origin at upload time (single-read
+/// ingest: NAR identity + FastCDC plane in one walk) and verify the
+/// recomputed root identity against what eval reported.
+// r[impl bc.upload.origin-reread+2]
 fn plan_source_upload(src: &SourceRoot) -> anyhow::Result<SourcePlan> {
     let origin = Path::new(&src.origin);
     let result = ingest_tree(origin, &IngestConfig::default())
@@ -292,19 +354,13 @@ fn plan_source_upload(src: &SourceRoot) -> anyhow::Result<SourcePlan> {
         );
     }
 
-    let mut plan = SourcePlan {
-        root_node: rio_proto::castore::RootNode { node: None },
-        directories: Vec::new(),
-        chunk_manifest: Vec::new(),
-        chunk_order: Vec::new(),
-        chunk_locations: HashMap::new(),
-    };
+    let mut plan = SourcePlan::empty();
 
     use std::os::unix::ffi::OsStrExt;
 
-    // One walk produces the chunk manifest (NAR order) + locations;
-    // the dirblob fold (shared canonical encode) produces the
-    // Directory bodies + root digest.
+    // One walk produces the chunk manifest (NAR order) + read
+    // locations; the dirblob fold (shared canonical encode) produces
+    // the Directory bodies + root digest.
     fn walk(
         node: &IngestNode,
         fs_path: &Path,
@@ -317,10 +373,16 @@ fn plan_source_upload(src: &SourceRoot) -> anyhow::Result<SourcePlan> {
                         digest: c.digest.to_vec(),
                         size: u64::from(c.len),
                     });
-                    if !plan.chunk_locations.contains_key(&c.digest) {
+                    if !plan.chunk_sources.contains_key(&c.digest) {
                         plan.chunk_order.push(c.digest);
-                        plan.chunk_locations
-                            .insert(c.digest, (fs_path.to_path_buf(), c.offset, c.len));
+                        plan.chunk_sources.insert(
+                            c.digest,
+                            ChunkSource::File {
+                                path: fs_path.to_path_buf(),
+                                offset: c.offset,
+                                len: c.len,
+                            },
+                        );
                     }
                 }
                 Ok(Some(BuiltEntry::File {
@@ -359,30 +421,216 @@ fn plan_source_upload(src: &SourceRoot) -> anyhow::Result<SourcePlan> {
                 .blobs
                 .iter()
                 .map(|(_, bytes)| {
-                    rio_proto::castore::Directory::decode(bytes.as_ref())
-                        .context("decoding folded directory blob")
+                    Directory::decode(bytes.as_ref()).context("decoding folded directory blob")
                 })
                 .collect::<anyhow::Result<_>>()?;
-            plan.root_node = rio_proto::castore::RootNode {
-                node: Some(rio_proto::castore::root_node::Node::DirDigest(
-                    folded.root_digest.0.to_vec(),
-                )),
+            plan.root_node = RootNode {
+                node: Some(RootKind::DirDigest(folded.root_digest.0.to_vec())),
             };
         }
-        Some(BuiltEntry::File { .. }) | Some(BuiltEntry::Symlink { .. }) => {
-            // Single-file / symlink source roots have no Directory DAG;
-            // their castore form is an inline RootNode. The negotiation
-            // key the worker reported (dir_digest) has no Directory to
-            // resolve to, so the protocol needs a per-kind root.
-            // TODO: support file/symlink roots end-to-end (RootNode::
-            // file/symlink in evaljob.SourceRoot + Has keyed on the
-            // file digest). Tree sources cover the dominant case
-            // (flake inputs, local working trees).
-            bail!("source root {origin:?} is not a directory (file/symlink roots: TODO)");
+        Some(BuiltEntry::File { .. }) => {
+            // Single-file root: no Directory DAG, the inline root node
+            // carries the identity. Cross-check the re-ingested root
+            // against the eval-reported one, mirroring the dir_digest
+            // check above.
+            let IngestNode::File(f) = &result.root else {
+                unreachable!("walk returned File for a non-file root")
+            };
+            match root_kind(src) {
+                Some(RootKind::File(reported)) => {
+                    if reported.digest.as_slice() != f.digest || reported.executable != f.executable
+                    {
+                        bail!(
+                            "origin file {origin:?} no longer matches the eval-reported root \
+                             (content digest or executable bit changed)"
+                        );
+                    }
+                }
+                other => bail!(
+                    "origin {origin:?} re-ingested as a single file but eval reported {other:?}"
+                ),
+            }
+            plan.root_node = RootNode {
+                node: Some(RootKind::File(FileEntry {
+                    // A NAR root has no name.
+                    name: Vec::new(),
+                    digest: f.digest.to_vec(),
+                    size: f.size,
+                    executable: f.executable,
+                })),
+            };
+        }
+        Some(BuiltEntry::Symlink { .. }) => {
+            let IngestNode::Symlink(s) = &result.root else {
+                unreachable!("walk returned Symlink for a non-symlink root")
+            };
+            match root_kind(src) {
+                Some(RootKind::Symlink(reported)) => {
+                    if reported.target != s.target {
+                        bail!(
+                            "origin symlink {origin:?} target changed since eval ({} != {})",
+                            s.target.escape_ascii(),
+                            reported.target.escape_ascii()
+                        );
+                    }
+                }
+                other => {
+                    bail!("origin {origin:?} re-ingested as a symlink but eval reported {other:?}")
+                }
+            }
+            plan.root_node = RootNode {
+                node: Some(RootKind::Symlink(SymlinkEntry {
+                    name: Vec::new(),
+                    target: s.target.clone(),
+                })),
+            };
         }
         None => unreachable!("walk always returns an entry"),
     }
     Ok(plan)
+}
+
+/// CAS-read plan: the root has no filesystem origin (streamed — a
+/// fetched flake input or toFile text). Bytes come out of the client
+/// CAS instead: whole-file content records keyed by content blake3 and
+/// Directory blobs keyed by dir_digest, every read digest-verified by
+/// the pack store, so no changed-since-eval guard is needed.
+// r[impl bc.upload.cas-read]
+fn plan_source_upload_cas(cas_root: &Path, src: &SourceRoot) -> anyhow::Result<SourcePlan> {
+    let pack = rio_packstore::PackStore::open(cas_root, rio_packstore::Options::default())
+        .with_context(|| format!("opening client CAS at {cas_root:?}"))?;
+    let mut plan = SourcePlan::empty();
+
+    match root_kind(src) {
+        Some(RootKind::File(f)) => {
+            let data = cas_record(&pack, src, &f.digest)?;
+            cas_add_file(&mut plan, &data);
+            plan.root_node = RootNode {
+                node: Some(RootKind::File(f.clone())),
+            };
+        }
+        Some(RootKind::Symlink(s)) => {
+            plan.root_node = RootNode {
+                node: Some(RootKind::Symlink(s.clone())),
+            };
+        }
+        Some(RootKind::DirDigest(_)) | None => {
+            let root: Digest32 = src
+                .dir_digest
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("source root dir_digest is not 32 bytes"))?;
+            let mut seen_dirs: std::collections::HashSet<Digest32> =
+                std::collections::HashSet::new();
+            walk_cas_dir(&pack, src, &root, &mut plan, &mut seen_dirs)?;
+            plan.root_node = RootNode {
+                node: Some(RootKind::DirDigest(root.to_vec())),
+            };
+        }
+    }
+    Ok(plan)
+}
+
+/// One content/Directory record from the client CAS, digest-verified by
+/// the pack store on read.
+fn cas_record(
+    pack: &rio_packstore::PackStore,
+    src: &SourceRoot,
+    digest: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let d: Digest32 = digest
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("CAS record digest is not 32 bytes"))?;
+    let bytes = pack.get(&rio_packstore::Digest(d))?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "client CAS has no record {} (needed by {})",
+            hex::encode(d),
+            src.store_path
+        )
+    })?;
+    Ok(bytes.to_vec())
+}
+
+/// Append one file's chunk run to the manifest; the first occurrence of
+/// each chunk also registers its in-memory bytes.
+fn cas_add_file(plan: &mut SourcePlan, data: &[u8]) {
+    let (_digest, chunks) = chunk_bytes(data);
+    for c in chunks {
+        plan.chunk_manifest.push(ChunkMeta {
+            digest: c.digest.to_vec(),
+            size: u64::from(c.len),
+        });
+        if !plan.chunk_sources.contains_key(&c.digest) {
+            plan.chunk_order.push(c.digest);
+            let body = data[c.offset as usize..(c.offset + u64::from(c.len)) as usize].to_vec();
+            plan.chunk_sources
+                .insert(c.digest, ChunkSource::Bytes(body));
+        }
+    }
+}
+
+/// One Directory level of the CAS-read walk: DFS from the eval-reported
+/// root digest. Within one Directory the canonical encode keeps the
+/// three kind lists sorted independently; NAR walk order is the global
+/// byte-lex merge across kinds, so entries are merged by name before
+/// recursing. Hash-chained digests cannot cycle; depth is bounded by
+/// the ingest-time NAR limits.
+fn walk_cas_dir(
+    pack: &rio_packstore::PackStore,
+    src: &SourceRoot,
+    digest: &Digest32,
+    plan: &mut SourcePlan,
+    seen_dirs: &mut std::collections::HashSet<Digest32>,
+) -> anyhow::Result<()> {
+    let bytes = cas_record(pack, src, digest)?;
+    let dir = Directory::decode(bytes.as_slice()).context("decoding CAS directory blob")?;
+    if seen_dirs.insert(*digest) {
+        plan.directories.push(dir.clone());
+    }
+
+    enum Entry<'a> {
+        Dir(&'a rio_proto::castore::DirectoryEntry),
+        File(&'a FileEntry),
+        Symlink,
+    }
+    let mut entries: Vec<(&[u8], Entry)> = Vec::new();
+    entries.extend(
+        dir.directories
+            .iter()
+            .map(|d| (d.name.as_slice(), Entry::Dir(d))),
+    );
+    entries.extend(
+        dir.files
+            .iter()
+            .map(|f| (f.name.as_slice(), Entry::File(f))),
+    );
+    entries.extend(
+        dir.symlinks
+            .iter()
+            .map(|s| (s.name.as_slice(), Entry::Symlink)),
+    );
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    for (_, entry) in entries {
+        match entry {
+            Entry::Dir(d) => {
+                let child: Digest32 = d
+                    .digest
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("directory entry digest is not 32 bytes"))?;
+                walk_cas_dir(pack, src, &child, plan, seen_dirs)?;
+            }
+            Entry::File(f) => {
+                // Identical files repeat their chunk run per the wire
+                // contract; a re-fetch per repeat is a local pack read.
+                let data = cas_record(pack, src, &f.digest)?;
+                cas_add_file(plan, &data);
+            }
+            Entry::Symlink => {}
+        }
+    }
+    Ok(())
 }
 
 /// Probe chunk presence and stream the `PutPathChunked` upload.
@@ -443,23 +691,31 @@ async fn put_source_chunked(
         input_closure: vec![],
     };
 
-    // Read novel chunk bodies from the origin, digest-verified.
+    // Gather novel chunk bodies (origin re-read or CAS-resident bytes),
+    // digest-verified either way before they hit the wire.
     let mut frames: Vec<PutPathChunkedRequest> = Vec::with_capacity(novel.len() + 1);
     frames.push(PutPathChunkedRequest {
         msg: Some(put_path_chunked_request::Msg::Begin(begin)),
     });
     for d in &novel {
-        let (path, offset, len) = plan
-            .chunk_locations
+        let data = match plan
+            .chunk_sources
             .get(d)
-            .expect("novel digests come from chunk_order");
-        let data = read_chunk(path, *offset, *len)?;
-        if blake3::hash(&data).as_bytes() != d {
-            bail!(
-                "chunk at {path:?}+{offset} no longer hashes to {} — origin mutated mid-upload",
-                hex::encode(d)
-            );
-        }
+            .expect("novel digests come from chunk_order")
+        {
+            ChunkSource::File { path, offset, len } => {
+                let data = read_chunk(path, *offset, *len)?;
+                if blake3::hash(&data).as_bytes() != d {
+                    bail!(
+                        "chunk at {path:?}+{offset} no longer hashes to {} — origin mutated \
+                         mid-upload",
+                        hex::encode(d)
+                    );
+                }
+                data
+            }
+            ChunkSource::Bytes(body) => body.clone(),
+        };
         frames.push(PutPathChunkedRequest {
             msg: Some(put_path_chunked_request::Msg::Chunk(ChunkData {
                 digest: d.to_vec(),

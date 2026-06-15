@@ -75,12 +75,38 @@ root, render event streams.
   unpinned-blob lifetime.
 ]
 
-#r("bc.upload.origin-reread")[
-  Source-tree upload MUST re-read the origin tree at upload time and verify
-  that the recomputed NAR hash and root directory digest match the values
-  eval reported; a mismatch is an error for that root, never a silent upload
-  of divergent content.
+#r("bc.upload.origin-reread+2")[
+  Upload of a source root that carries a filesystem origin MUST re-read that
+  origin at upload time and verify that the recomputed NAR hash and root
+  identity (root directory digest, or the file digest and executable bit, or
+  the symlink target) match what eval reported; a mismatch is an error for
+  that root, never a silent upload of divergent content.
 ]
+
+#r("bc.upload.source-root-kinds")[
+  The upload planner MUST handle directory, single-file and symlink source
+  roots: file and symlink roots ship their inline castore root node via
+  `PutPathChunked` with no Directory DAG, and only directory roots are
+  presence-probed via `HasDirectories`.
+]
+
+File and symlink roots are negotiated through the persistent ack table
+alone: they are KB-sized, the put is idempotent, and there is no path-level
+`Has` RPC to probe them with.
+
+#r("bc.upload.cas-read")[
+  A source root reported with an empty origin MUST be served from the client
+  CAS: chunk bodies come from its digest-verified content records and
+  Directory bodies from its directory blobs, with no origin re-read.
+]
+
+Empty-origin roots are the streamed ingests --- files and trees fetched as
+flake inputs, `builtins.toFile` text --- for which no origin tree exists on
+disk. The eval worker flushes its pack segment before emitting a frame that
+carries one, so the coordinator's own CAS handle sees the records. Known
+caveat: a `toFile` path with references registers cluster-side with an
+empty reference set (the `SourceRoot` frame carries none) --- a follow-up
+threads references through.
 
 Drv-blob misses upload largest-first (big drvs gate the most downstream
 bytes); restartability is free because a re-`Has` after any disconnect only
