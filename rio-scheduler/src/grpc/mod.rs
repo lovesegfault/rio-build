@@ -11,6 +11,7 @@
 //! changes no longer conflict with executor-surface changes.
 
 pub(crate) mod actor_guards;
+mod derivation_log;
 mod digest_submit;
 mod executor_service;
 mod paginate;
@@ -123,6 +124,10 @@ pub struct SchedulerGrpc {
     /// (`scheduler_service.rs`). Bundled so a test can't set one half
     /// of the feature without the other.
     pub(super) off_actor_probe: OffActorProbe,
+    /// `LogService` client for the `GetDerivationLog` proxy. Same lazy
+    /// store channel as `off_actor_probe.store_client`. `None` in tests
+    /// (the resolution layer is testable without an upstream).
+    pub(super) log_client: Option<rio_proto::LogServiceClient<tonic::transport::Channel>>,
 }
 
 /// sh-036.1 off-actor `FindMissingPaths` probe wiring — store client
@@ -160,6 +165,7 @@ impl SchedulerGrpc {
             hmac_key: None,
             service_verifier: None,
             off_actor_probe: OffActorProbe::default(),
+            log_client: None,
             staged_pages: Arc::default(),
         }
     }
@@ -176,6 +182,7 @@ impl SchedulerGrpc {
             hmac_key: None,
             service_verifier: None,
             off_actor_probe: OffActorProbe::default(),
+            log_client: None,
             staged_pages: Arc::default(),
         }
     }
@@ -194,6 +201,10 @@ impl SchedulerGrpc {
     /// `off_actor_probe`: sh-036.1 off-actor FMP probe — same lazy
     /// store channel as the actor's, plus the actor's
     /// `cache_breaker.is_open()` mirror for the conditional timeout.
+    ///
+    /// `log_client`: `LogService` client for the `GetDerivationLog`
+    /// proxy (same lazy store channel).
+    #[allow(clippy::too_many_arguments)] // one-off prod constructor, each arg documented
     pub fn new(
         actor: ActorHandle,
         db: SchedulerDb,
@@ -202,6 +213,7 @@ impl SchedulerGrpc {
         hmac_key: Option<Arc<HmacKey>>,
         service_verifier: Option<Arc<HmacKey>>,
         off_actor_probe: OffActorProbe,
+        log_client: Option<rio_proto::LogServiceClient<tonic::transport::Channel>>,
     ) -> Self {
         Self {
             actor,
@@ -211,6 +223,7 @@ impl SchedulerGrpc {
             hmac_key,
             service_verifier,
             off_actor_probe,
+            log_client,
             staged_pages: Arc::default(),
         }
     }

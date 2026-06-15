@@ -497,6 +497,12 @@ async fn main() -> anyhow::Result<()> {
                 store_client,
                 breaker_open,
             },
+            // Same lazy store channel for the GetDerivationLog →
+            // LogService.TailLog proxy. A bad addr was already warned
+            // about for `store_client` above.
+            rio_proto::client::connect_lazy_channel(&cfg.store.addr)
+                .ok()
+                .map(rio_proto::LogServiceClient::new),
         );
 
         // Background refresh for ClusterStatus.store_size_bytes — 60s PG poll

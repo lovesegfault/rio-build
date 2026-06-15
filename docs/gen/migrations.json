@@ -112,6 +112,7 @@
     "114_file_blobs_path_idx",
     "115_derivations_drv_path_idx",
     "116_drv_blobs_chunk_tenants",
-    "117_derivation_failure_reason"
+    "117_derivation_failure_reason",
+    "118_build_derivations_exec_idx"
   ]
 }

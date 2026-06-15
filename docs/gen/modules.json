@@ -60,6 +60,11 @@
       "doc": "Cluster connections for the coordinator: one channel to the scheduler (zstd-compressed both ways — the SubmitBuild skeleton compresses ~4×, ADR-024), one to the store's external castore door (negotiation + upload + fetch; the store does NOT advertise gRPC zstd, so those calls go uncompressed — at-rest compression is the store's job)."
     },
     {
+      "path": "coordinator/faillog.rs",
+      "depth": 1,
+      "doc": "Failure replay: when a build fail-fasts on a derivation that already failed in an earlier build, the `BuildFailed` event names the poisoned culprit and the execution that originally failed (`culprit_*` fields)."
+    },
+    {
       "path": "coordinator/graph.rs",
       "depth": 1,
       "doc": "The coordinator's global digest state: fold (stage 1) and the per-root all-acked submit gate bookkeeping (stage 4's predicate)."
@@ -82,12 +87,17 @@
     {
       "path": "fetch.rs",
       "depth": 0,
-      "doc": "`--fetch` / `--out-link`: materialize build outputs through the read path, narHash-verified on arrival (ADR-024 \"Attach, detach, results\")."
+      "doc": "Client-CAS materialization of build outputs through the read path, narHash-verified on arrival (ADR-024 \"Attach, detach, results\")."
     },
     {
       "path": "framing.rs",
       "depth": 0,
       "doc": "Length-delimited proto frames over an `AsyncRead`/`AsyncWrite` fd pair (ADR-024 \"IPC\")."
+    },
+    {
+      "path": "import.rs",
+      "depth": 0,
+      "doc": "Default fetch path: import completed build outputs into the local `/nix/store` by speaking the nix worker protocol to the local daemon socket (ADR-024 \"Attach, detach, results\")."
     },
     {
       "path": "lib.rs",
@@ -1323,6 +1333,11 @@
       "doc": "Helpers on the `rio.castore` wire types that both producers and consumers of `Directory` bodies must agree on."
     },
     {
+      "path": "chunk_reject.rs",
+      "depth": 0,
+      "doc": "The `PutPathChunked` missing-chunk reject contract (ADR-024)."
+    },
+    {
       "path": "client/",
       "depth": 0,
       "doc": "gRPC client transport: channel construction, h2 tuning, and the generic [`ProtoClient`] connect helpers."
@@ -1650,6 +1665,11 @@
       "path": "grpc/actor_guards.rs",
       "depth": 1,
       "doc": "Shared actor-liveness and leader guards for gRPC handlers."
+    },
+    {
+      "path": "grpc/derivation_log.rs",
+      "depth": 1,
+      "doc": "`SchedulerService.GetDerivationLog` — tenant-facing log reads."
     },
     {
       "path": "grpc/digest_submit.rs",
