@@ -2612,6 +2612,68 @@ mod tests {
         assert!(text2.contains("live log tail degraded"), "second: {text2}");
     }
 
+    // r[verify sys.recovery.witnessed-clear]
+    /// merged_bug_006 (the §Multi-axis-fn sibling-arm hole next to
+    /// W14-A5): a drive that RELAYS lines and then withholds at a
+    /// forward jump (`DriveEnd::Gap`) is witnessed work — the
+    /// degradation episode MUST clear. Pre-fix the witnessed-work
+    /// clear lived only in the `DriveEnd::Ended` arm; the `Gap` arm
+    /// left `degraded_notice_sent = true`, so the second episode below
+    /// was muted forever (timeout on the second notice).
+    #[tokio::test]
+    async fn serve_then_gap_drive_clears_degradation_episode() {
+        let mut config = test_config();
+        config.degraded_notice_after = Duration::from_millis(100);
+        config.reconnect_backoff = Duration::from_millis(20);
+        // The serve-then-gap drive must take the WITHHOLD branch (the
+        // `Sighting::First` re-open chance, not the budget-edge
+        // immediate accept) — the grace clock is unarmed in this test,
+        // but pin a generous budget so that stays the only reason.
+        config.terminal_grace = Duration::from_secs(5);
+        let mut h = harness_with(config).await;
+        // Episode 1: err_stream refusals arm the clock.
+        for _ in 0..12 {
+            h.mock
+                .push_script(vec![], SessionEnd::Error(tonic::Code::Internal));
+        }
+        // The serve-then-gap drive: lines 0-4 reach the output (the
+        // user sees them), then a forward jump to line 100 returns
+        // `DriveEnd::Gap`. THIS is the witnessed-work clear.
+        h.mock
+            .push_script(vec![chunk(0, 5), chunk(100, 5)], SessionEnd::Hold);
+        // Episode 2: a fresh degradation that MUST get its own notice.
+        for _ in 0..50 {
+            h.mock
+                .push_script(vec![], SessionEnd::Error(tonic::Code::Internal));
+        }
+        h.set.on_started(DRV, EXEC_A);
+
+        let first = tokio::time::timeout(Duration::from_secs(2), h.out_rx.recv())
+            .await
+            .expect("first notice")
+            .expect("channel open");
+        let text = String::from_utf8(first.lines[0].clone()).unwrap();
+        assert!(
+            text.contains("live log tail degraded"),
+            "first emission must be the degradation notice: {text}"
+        );
+        // The relayed lines from the serve-then-gap drive.
+        let lines = recv_lines(&mut h.out_rx, 5).await;
+        assert_eq!(lines.last().map(|l| l.0), Some(4), "lines 0-4: {lines:?}");
+        // The SECOND notice — proves a relayed-then-Gap drive cleared
+        // the episode (merged_bug_006: the Gap arm bypassed the clear
+        // and `degraded_notice_sent` stayed latched true).
+        let second = tokio::time::timeout(Duration::from_secs(2), h.out_rx.recv())
+            .await
+            .expect(
+                "second notice within 2s (a serve-then-gap drive is witnessed \
+                 work and MUST clear the degradation episode — merged_bug_006)",
+            )
+            .expect("channel open");
+        let text2 = String::from_utf8(second.lines[0].clone()).unwrap();
+        assert!(text2.contains("live log tail degraded"), "second: {text2}");
+    }
+
     /// live_062: the user-facing open-failure lane projection is the
     /// closed two-letter alphabet — UNAUTHENTICATED is the token lane
     /// (the pre-fix text blamed store reachability for it, which
