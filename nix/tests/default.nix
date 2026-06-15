@@ -747,13 +747,16 @@ in
   # ── rio build end-to-end (ADR-024 P3): the real coordinator+rio-eval
   # pair on the client VM against the real cluster — external-door JWT
   # auth, chunked source upload, drv-blob negotiation, digest-bearing
-  # SubmitBuild, worker execution, BuildEvents render, --out-link
-  # fetch, and the cached-failure replay (fail-fast culprit attribution
+  # SubmitBuild, worker execution, BuildEvents render, the default
+  # /nix/store import (signed narinfo → daemon require-sigs → ./result),
+  # and the cached-failure replay (fail-fast culprit attribution
   # + GetDerivationLog tail). Single-test scenario; markers at the
   # wiring point per P0341 convention — scenario header maps subtests
   # to rules.
   # r[verify bc.submit.all-acked]
+  # r[verify bc.fetch.store-import-default]
   # r[verify bc.fetch.narhash-verify+2]
+  # r[verify bc.outlink.nix-parity]
   # r[verify store.drv.getpath-fallback]
   # r[verify bc.render.stdout-results]
   # r[verify bc.render.plain-default]
@@ -765,6 +768,14 @@ in
     let
       jwtKeys = import ./lib/jwt-keys.nix;
       jwtPubkey = pkgs.writeText "jwt-pubkey" jwtKeys.pubkeyB64;
+      # Cluster narinfo signing key — same fixed test seed (32×0x55) as
+      # vm-substitute-standalone; Nix secret-key format name:base64seed.
+      rioSigningKey = pkgs.writeText "rio-signing-key" "rio-vm-test-1:VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
+      # ed25519 public half of that seed, derived offline with the same
+      # python one-liner documented in lib/jwt-keys.nix (hardcoded for
+      # the same no-IFD reason). The client daemon trusts it so the
+      # default /nix/store import passes require-sigs.
+      rioSigningPubkey = "rio-vm-test-1:xoImN8fTEOxXYnvgC6JZ0lN0n0qvZERwz/vlOjX3MkI=";
     in
     build-client {
       inherit
@@ -792,19 +803,38 @@ in
         # instead of needing per-attempt retries first. Env for the
         # same reason as the JWT key above.
         extraSchedulerEnv.RIO_POISON__THRESHOLD = "1";
-        # JWT verify on the store's castore door (the client's
-        # PutPathChunked/Has*/PutDrvBlobs/GetPath rung). extraConfig
-        # REPLACES the mkControlNode default, so [chunk_backend] must
-        # be restated — without it every builder output upload is
-        # rejected with FAILED_PRECONDITION.
-        extraStoreConfig.extraConfig = ''
-          [chunk_backend]
-          kind = "filesystem"
-          base_dir = "/var/lib/rio/store/chunks"
+        extraStoreConfig = {
+          # Sign every uploaded path's narinfo with the cluster key —
+          # what the client's default /nix/store import verifies against.
+          signingKeyFile = "${rioSigningKey}";
+          # JWT verify on the store's castore door (the client's
+          # PutPathChunked/Has*/PutDrvBlobs/GetPath rung). extraConfig
+          # REPLACES the mkControlNode default, so [chunk_backend] must
+          # be restated — without it every builder output upload is
+          # rejected with FAILED_PRECONDITION.
+          extraConfig = ''
+            [chunk_backend]
+            kind = "filesystem"
+            base_dir = "/var/lib/rio/store/chunks"
 
-          [jwt]
-          key_path = "${jwtPubkey}"
-        '';
+            [jwt]
+            key_path = "${jwtPubkey}"
+          '';
+        };
+        extraClientModules = [
+          {
+            # The default fetch imports outputs into the client VM's own
+            # /nix/store with signature checking on — the daemon must
+            # trust the cluster signing key.
+            nix.settings.trusted-public-keys = [ rioSigningPubkey ];
+            # The scenario runs `rio build` as this user: root is a nix
+            # trusted-user, which could mask signature handling, so the
+            # import must work for a plain user talking to the daemon.
+            users.users.alice = {
+              isNormalUser = true;
+            };
+          }
+        ];
         # psql() on control for the tenant UUID + drv_blobs assertions.
         extraPackages = [ pkgs.postgresql_18 ];
       };
