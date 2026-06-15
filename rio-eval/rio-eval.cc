@@ -412,6 +412,21 @@ int main(int argc, char ** argv)
             std::filesystem::create_directories(dir);
             setenv("NIX_STATE_DIR", dir.c_str(), 1);
         }
+        /* The coordinator mirrors its RUST_LOG level here so nix's own
+         * logging follows it — fetch/eval diagnostics reach stderr
+         * instead of staying silent during cold input fetches. */
+        if (const char * v = std::getenv("RIO_EVAL_NIX_VERBOSITY")) {
+            if (std::strcmp(v, "error") == 0)
+                nix::verbosity = nix::lvlError;
+            else if (std::strcmp(v, "warn") == 0)
+                nix::verbosity = nix::lvlWarn;
+            else if (std::strcmp(v, "info") == 0)
+                nix::verbosity = nix::lvlInfo;
+            else if (std::strcmp(v, "debug") == 0)
+                nix::verbosity = nix::lvlDebug;
+            else if (std::strcmp(v, "trace") == 0)
+                nix::verbosity = nix::lvlVomit;
+        }
         nix::initLibStore(true);
         nix::unix::saveSignalMask();
         {

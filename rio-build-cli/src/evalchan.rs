@@ -75,10 +75,14 @@ impl EvalChannel {
 /// coordinator's end plus the child handle. With `pipe_stderr`, the
 /// child's stderr is captured (the caller forwards it through the
 /// renderer so it doesn't land inside the TTY ephemeral region).
+/// `nix_verbosity` (`error`…`trace`, the coordinator's resolved log
+/// level) sets nix's own logging inside the eval parent via
+/// `RIO_EVAL_NIX_VERBOSITY`; `None` keeps nix's default.
 pub fn spawn_eval_parent(
     program: &Path,
     args: &[String],
     pipe_stderr: bool,
+    nix_verbosity: Option<&str>,
 ) -> anyhow::Result<(EvalChannel, tokio::process::Child)> {
     use std::os::fd::{AsRawFd, IntoRawFd};
 
@@ -94,6 +98,9 @@ pub fn spawn_eval_parent(
         } else {
             Stdio::inherit()
         });
+    if let Some(level) = nix_verbosity {
+        cmd.env("RIO_EVAL_NIX_VERBOSITY", level);
+    }
     let theirs_fd = theirs.into_raw_fd();
     // SAFETY: pre_exec runs post-fork pre-exec in the child; dup2 and
     // fcntl are async-signal-safe. `ours` is not inherited (CLOEXEC by
