@@ -30,6 +30,93 @@ pub enum RenderEvent {
     /// Anything written to stderr behind the TTY display's back lands
     /// inside the ephemeral region and corrupts it.
     Note(String),
+    /// Cumulative pre-build pipeline counters (eval → upload → submit).
+    /// The coordinator sends a fresh snapshot whenever a counter
+    /// changes; each renderer decides how to show it (live status line
+    /// on the TTY, milestone lines for plain/CI).
+    Prebuild(PrebuildSnapshot),
+}
+
+/// Cumulative counters for the pre-build window of one `rio build`
+/// invocation: evaluation, digest negotiation/upload, and submission.
+/// All counts only ever grow.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrebuildSnapshot {
+    /// Requested attrs whose evaluation has not reported yet.
+    pub attrs_pending: usize,
+    /// Submit roots produced by evaluation so far.
+    pub roots_found: usize,
+    /// Derivations discovered by evaluation so far.
+    pub drvs_found: usize,
+    /// Source roots discovered by evaluation so far.
+    pub sources_found: usize,
+    /// Drv digests the cluster acknowledged (uploaded or already held).
+    pub drvs_acked: usize,
+    /// Of [`drvs_acked`](Self::drvs_acked), how many were actually uploaded.
+    pub drvs_uploaded: usize,
+    /// Source roots the cluster acknowledged.
+    pub sources_acked: usize,
+    /// Of [`sources_acked`](Self::sources_acked), how many were actually uploaded.
+    pub sources_uploaded: usize,
+    /// Submitted builds whose event stream has started.
+    pub builds_accepted: usize,
+}
+
+impl PrebuildSnapshot {
+    /// Every requested attr has evaluated and at least one produced a
+    /// build root.
+    pub fn eval_done(&self) -> bool {
+        self.attrs_pending == 0 && self.roots_found > 0
+    }
+
+    /// Every object discovered so far has been acknowledged by the
+    /// cluster.
+    pub fn uploads_done(&self) -> bool {
+        self.drvs_acked >= self.drvs_found && self.sources_acked >= self.sources_found
+    }
+
+    /// Objects the cluster already held (no bytes transferred).
+    pub fn already_present(&self) -> usize {
+        (self.drvs_acked + self.sources_acked)
+            .saturating_sub(self.drvs_uploaded + self.sources_uploaded)
+    }
+
+    /// Nothing left to narrate: builds are accepted and streaming.
+    pub fn done(&self) -> bool {
+        self.eval_done() && self.uploads_done() && self.builds_accepted >= self.roots_found
+    }
+}
+
+/// Milestone gate shared by the line-oriented renderers (plain, CI):
+/// yields the "evaluation finished" and "uploads finished" lines at
+/// most once each, so both renderers print identical text.
+#[derive(Default)]
+pub(crate) struct PrebuildMilestones {
+    eval_reported: bool,
+    upload_reported: bool,
+}
+
+impl PrebuildMilestones {
+    pub(crate) fn lines(&mut self, s: &PrebuildSnapshot) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.eval_reported && s.eval_done() {
+            self.eval_reported = true;
+            out.push(format!(
+                "evaluated {} root(s): {} derivations, {} sources",
+                s.roots_found, s.drvs_found, s.sources_found
+            ));
+        }
+        if self.eval_reported && !self.upload_reported && s.uploads_done() {
+            self.upload_reported = true;
+            out.push(format!(
+                "uploaded {} drv blobs, {} sources ({} already present)",
+                s.drvs_uploaded,
+                s.sources_uploaded,
+                s.already_present()
+            ));
+        }
+        out
+    }
 }
 
 /// Cloneable sender into the renderer task. `send` never blocks; a

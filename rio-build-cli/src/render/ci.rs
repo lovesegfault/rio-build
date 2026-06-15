@@ -15,7 +15,10 @@ use std::time::Duration;
 use rio_proto::types::DerivationEventKind;
 
 use super::term::sanitize_line;
-use super::{Clock, DrvEdge, DrvRow, RenderEvent, fmt_duration, ingest_log, route, wall_clock};
+use super::{
+    Clock, DrvEdge, DrvRow, PrebuildMilestones, PrebuildSnapshot, RenderEvent, fmt_duration,
+    ingest_log, route, wall_clock,
+};
 
 /// Unfolded tail of a failure log; earlier output gets folded.
 const FAILURE_TAIL_LINES: usize = 200;
@@ -54,6 +57,8 @@ pub struct CiRenderer<W: Write> {
     opts: CiOpts,
     /// drv_path → row.
     running: HashMap<String, DrvRow>,
+    /// Pre-build milestones already announced (one line each, ever).
+    milestones: PrebuildMilestones,
 }
 
 impl<W: Write> CiRenderer<W> {
@@ -62,6 +67,7 @@ impl<W: Write> CiRenderer<W> {
             out,
             opts,
             running: HashMap::new(),
+            milestones: PrebuildMilestones::default(),
         }
     }
 
@@ -88,6 +94,10 @@ impl<W: Write> CiRenderer<W> {
                 // input — sanitize and prefix like log lines so they
                 // can't smuggle ::group::/::error:: at line start.
                 self.print(&[format!("· {}", sanitize_line(s))]);
+                return;
+            }
+            RenderEvent::Prebuild(s) => {
+                self.on_prebuild(s);
                 return;
             }
         };
@@ -163,6 +173,20 @@ impl<W: Write> CiRenderer<W> {
             }
             DrvEdge::Ignore => {}
         }
+    }
+
+    /// Low-frequency pre-build milestones: one line when evaluation
+    /// finishes, one when every discovered object is acked. Counts
+    /// only — but keep the `· ` note prefix so no line can start with
+    /// `::`.
+    fn on_prebuild(&mut self, s: &PrebuildSnapshot) {
+        let lines: Vec<String> = self
+            .milestones
+            .lines(s)
+            .into_iter()
+            .map(|l| format!("· {l}"))
+            .collect();
+        self.print(&lines);
     }
 
     fn finish(&mut self, row: DrvRow, kind: DerivationEventKind, error: &str) {
@@ -524,6 +548,59 @@ mod tests {
         assert!(t.contains("pkg-a.drv> ab"), "{t}");
         // CR-overwrite ate "eval: " — fine, the prefix is what matters.
         assert!(t.contains("· ::group::leaked"), "{t}");
+    }
+
+    #[test]
+    fn prebuild_milestones_low_frequency_and_prefixed() {
+        let (mut r, buf, _now) = make(CiOpts::default());
+        // Mid-eval snapshots stay silent; only the milestones print.
+        r.on_event(&RenderEvent::Prebuild(PrebuildSnapshot {
+            attrs_pending: 2,
+            drvs_found: 100,
+            ..Default::default()
+        }));
+        assert_eq!(text(&buf), "");
+        let evaled = PrebuildSnapshot {
+            attrs_pending: 0,
+            roots_found: 2,
+            drvs_found: 1234,
+            sources_found: 6,
+            drvs_acked: 800,
+            drvs_uploaded: 100,
+            sources_acked: 4,
+            sources_uploaded: 1,
+            ..Default::default()
+        };
+        r.on_event(&RenderEvent::Prebuild(evaled));
+        r.on_event(&RenderEvent::Prebuild(PrebuildSnapshot {
+            drvs_acked: 1234,
+            drvs_uploaded: 150,
+            sources_acked: 6,
+            sources_uploaded: 2,
+            ..evaled
+        }));
+        let t = text(&buf);
+        assert_eq!(t.lines().count(), 2, "{t}");
+        assert!(
+            t.contains("· evaluated 2 root(s): 1234 derivations, 6 sources"),
+            "{t}"
+        );
+        assert!(
+            t.contains("· uploaded 150 drv blobs, 2 sources (1088 already present)"),
+            "{t}"
+        );
+        // Same prefix discipline as notes: no line may start with `::`.
+        for line in t.lines() {
+            assert!(!line.starts_with("::"), "{line:?}");
+        }
+        // A repeat snapshot prints nothing more.
+        r.on_event(&RenderEvent::Prebuild(PrebuildSnapshot {
+            builds_accepted: 2,
+            drvs_acked: 1234,
+            sources_acked: 6,
+            ..evaled
+        }));
+        assert_eq!(text(&buf).lines().count(), 2);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::io::Write;
 
 use rio_proto::types::{BuildEvent, BuildProgress, DerivationEventKind, build_event::Event};
 
-use super::{RenderEvent, short_drv};
+use super::{PrebuildMilestones, PrebuildSnapshot, RenderEvent, short_drv};
 
 /// Progress lines after this many events without one. The cluster
 /// sends a `Progress` after every derivation state edge; rendering
@@ -33,6 +33,10 @@ pub(super) struct PlainRenderer {
     /// `BuildProgress.running` covers BOTH substituting and building;
     /// subtracting this set's size yields actually-building.
     substituting: HashSet<String>,
+    /// Pre-build milestones already announced (one line each, ever —
+    /// snapshots arrive per counter change but this is a status
+    /// surface, not a progress bar).
+    milestones: PrebuildMilestones,
 }
 
 impl PlainRenderer {
@@ -42,6 +46,16 @@ impl PlainRenderer {
             RenderEvent::Note(s) => {
                 let _ = writeln!(out, "{}", super::term::sanitize_line(s));
             }
+            RenderEvent::Prebuild(s) => self.on_prebuild(out, s),
+        }
+    }
+
+    /// Low-frequency pre-build milestones: one line when evaluation
+    /// finishes, one when every discovered object is acked. The
+    /// build-accepted line comes from the coordinator as a Note.
+    fn on_prebuild(&mut self, out: &mut impl Write, s: &PrebuildSnapshot) {
+        for line in self.milestones.lines(s) {
+            let _ = writeln!(out, "{line}");
         }
     }
 
@@ -299,6 +313,71 @@ mod tests {
             s.contains("1/1 done, 0 substituting, 0 building, 0 queued"),
             "{s}"
         );
+    }
+
+    #[test]
+    fn prebuild_milestones_print_once() {
+        let mut r = PlainRenderer::default();
+        let mut buf = Vec::new();
+        // Mid-eval snapshots are silent — this is a status surface, not
+        // a progress bar.
+        r.on_event(
+            &mut buf,
+            &RenderEvent::Prebuild(PrebuildSnapshot {
+                attrs_pending: 1,
+                drvs_found: 10,
+                sources_found: 2,
+                ..Default::default()
+            }),
+        );
+        assert!(buf.is_empty(), "{}", std::str::from_utf8(&buf).unwrap());
+        // Eval finished: one summary line with the discovered counts.
+        r.on_event(
+            &mut buf,
+            &RenderEvent::Prebuild(PrebuildSnapshot {
+                attrs_pending: 0,
+                roots_found: 1,
+                drvs_found: 42,
+                sources_found: 3,
+                drvs_acked: 10,
+                drvs_uploaded: 4,
+                ..Default::default()
+            }),
+        );
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert_eq!(s.lines().count(), 1, "{s}");
+        assert!(
+            s.contains("evaluated 1 root(s): 42 derivations, 3 sources"),
+            "{s}"
+        );
+        // Everything acked: one upload summary with the cached split.
+        let done = PrebuildSnapshot {
+            attrs_pending: 0,
+            roots_found: 1,
+            drvs_found: 42,
+            sources_found: 3,
+            drvs_acked: 42,
+            drvs_uploaded: 12,
+            sources_acked: 3,
+            sources_uploaded: 1,
+            ..Default::default()
+        };
+        r.on_event(&mut buf, &RenderEvent::Prebuild(done));
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert_eq!(s.lines().count(), 2, "{s}");
+        assert!(
+            s.contains("uploaded 12 drv blobs, 1 sources (32 already present)"),
+            "{s}"
+        );
+        // Later snapshots (builds accepted) add nothing more.
+        r.on_event(
+            &mut buf,
+            &RenderEvent::Prebuild(PrebuildSnapshot {
+                builds_accepted: 1,
+                ..done
+            }),
+        );
+        assert_eq!(std::str::from_utf8(&buf).unwrap().lines().count(), 2);
     }
 
     #[test]

@@ -22,7 +22,10 @@ use rio_proto::types::DerivationEventKind;
 use tokio::sync::Notify;
 
 use super::term::{clip_ansi, sanitize_line, subseq_match, trunc_middle};
-use super::{Clock, DrvEdge, DrvRow, RenderEvent, fmt_duration, ingest_log, route, wall_clock};
+use super::{
+    Clock, DrvEdge, DrvRow, PrebuildSnapshot, RenderEvent, fmt_duration, ingest_log, route,
+    wall_clock,
+};
 
 const CSI: &str = "\x1b[";
 const DIM: &str = "\x1b[2m";
@@ -218,6 +221,9 @@ pub struct TtyRenderer<W: Write> {
     last_viewed: Option<String>,
     /// Builds finished, only the browser keeps us up.
     all_done: bool,
+    /// Latest pre-build counters; drives the prep status line until
+    /// every root's build is accepted.
+    prebuild: Option<PrebuildSnapshot>,
     flash_text: String,
     flash_until: Instant,
     /// Set while a pager owns the terminal.
@@ -250,6 +256,7 @@ impl<W: Write> TtyRenderer<W> {
             cursor: 0,
             last_viewed: None,
             all_done: false,
+            prebuild: None,
             flash_text: String::new(),
             flash_until: now,
             pager_gate: Arc::new(AtomicBool::new(false)),
@@ -274,6 +281,10 @@ impl<W: Write> TtyRenderer<W> {
             RenderEvent::Build(ev) => ev,
             RenderEvent::Note(s) => {
                 self.display.permanent(&[sanitize_line(s)]);
+                return;
+            }
+            RenderEvent::Prebuild(s) => {
+                self.prebuild = Some(*s);
                 return;
             }
         };
@@ -506,13 +517,52 @@ impl<W: Write> TtyRenderer<W> {
         )
     }
 
+    /// Live pre-build status: the current phase (eval → upload →
+    /// submit) with its counts, gone once every root's build is
+    /// accepted and streaming events.
+    fn prep_line(&self) -> Option<String> {
+        let s = self.prebuild?;
+        if s.done() {
+            return None;
+        }
+        let spin = SPINNER[self.spin % SPINNER.len()];
+        let detail = if !s.eval_done() {
+            format!(
+                "evaluating: {} derivations, {} sources found · uploads {}/{}",
+                s.drvs_found,
+                s.sources_found,
+                s.drvs_acked + s.sources_acked,
+                s.drvs_found + s.sources_found
+            )
+        } else if !s.uploads_done() {
+            format!(
+                "uploading: {}/{} drv blobs · {}/{} sources ({} already present)",
+                s.drvs_acked,
+                s.drvs_found,
+                s.sources_acked,
+                s.sources_found,
+                s.already_present()
+            )
+        } else {
+            format!(
+                "submitting: {}/{} builds accepted",
+                s.builds_accepted, s.roots_found
+            )
+        };
+        Some(format!(" {YELLOW}{spin}{RESET} {detail}"))
+    }
+
     pub fn render_normal(&self) -> Vec<String> {
         let mut lines = vec![self.header()];
+        if let Some(prep) = self.prep_line() {
+            lines.push(prep);
+        }
         let spin = SPINNER[self.spin % SPINNER.len()];
         // A region taller than the terminal breaks the cursor-up anchor,
-        // so clamp the rows. Reserve 3 lines: header, footer, off-by-one.
+        // so clamp the rows. Reserve 3 lines (header, footer, off-by-one)
+        // plus the prep status line when it is shown.
         let (height, _) = self.display.size();
-        let mut budget = (height as i32 - 3).max(2) as usize;
+        let mut budget = (height as i32 - 2 - lines.len() as i32).max(2) as usize;
         let open = self.open_rows_sorted();
         let now = self.now();
         for (shown, row) in open.iter().enumerate() {
@@ -1425,6 +1475,60 @@ mod tests {
         assert!(t.contains("compiling foo.c"), "{t}");
         assert!(t.contains("pkg-01.drv"), "{t}");
         assert!(t.contains("[f] logs"), "{t}");
+    }
+
+    #[test]
+    fn prep_line_tracks_phases_then_disappears() {
+        let (mut r, _buf, _now) = make();
+        // Eval still streaming: live discovery counts.
+        r.on_event(&RenderEvent::Prebuild(PrebuildSnapshot {
+            attrs_pending: 1,
+            drvs_found: 5,
+            sources_found: 1,
+            drvs_acked: 2,
+            ..Default::default()
+        }));
+        let t = plain(&r.render_normal());
+        assert!(
+            t.contains("evaluating: 5 derivations, 1 sources found"),
+            "{t}"
+        );
+        assert!(t.contains("uploads 2/6"), "{t}");
+        // Eval done, uploads outstanding: upload phase with cached split.
+        let uploading = PrebuildSnapshot {
+            attrs_pending: 0,
+            roots_found: 1,
+            drvs_found: 5,
+            sources_found: 1,
+            drvs_acked: 3,
+            drvs_uploaded: 1,
+            sources_acked: 1,
+            sources_uploaded: 0,
+            ..Default::default()
+        };
+        r.on_event(&RenderEvent::Prebuild(uploading));
+        let t = plain(&r.render_normal());
+        assert!(
+            t.contains("uploading: 3/5 drv blobs · 1/1 sources (3 already present)"),
+            "{t}"
+        );
+        // Everything acked, build not yet accepted: submitting phase.
+        let submitting = PrebuildSnapshot {
+            drvs_acked: 5,
+            ..uploading
+        };
+        r.on_event(&RenderEvent::Prebuild(submitting));
+        let t = plain(&r.render_normal());
+        assert!(t.contains("submitting: 0/1 builds accepted"), "{t}");
+        // Build accepted: the prep line is gone.
+        r.on_event(&RenderEvent::Prebuild(PrebuildSnapshot {
+            builds_accepted: 1,
+            ..submitting
+        }));
+        let t = plain(&r.render_normal());
+        assert!(!t.contains("submitting"), "{t}");
+        assert!(!t.contains("uploading"), "{t}");
+        assert!(!t.contains("evaluating"), "{t}");
     }
 
     #[test]

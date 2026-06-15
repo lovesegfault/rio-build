@@ -41,7 +41,7 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::acks::ClusterAckTable;
 use crate::evalchan::EvalChannel;
-use crate::render::{RenderEvent, RenderHandle};
+use crate::render::{PrebuildSnapshot, RenderEvent, RenderHandle};
 use clients::Clients;
 use graph::{BuildGraph, Digest32, RootGate, SubmitOptions};
 use submit::SubmitMaterials;
@@ -262,6 +262,11 @@ impl Coordinator {
         let mut shutdown_sent = false;
         let mut channel_closed = false;
         let mut interrupted = false;
+        // Pre-build narration counters (eval/upload/submit). The acked
+        // and accepted counts accumulate in the message arms below; the
+        // discovery counts are re-read from the graph each pass.
+        let mut prebuild = PrebuildSnapshot::default();
+        let mut prebuild_sent: Option<PrebuildSnapshot> = None;
 
         loop {
             // Spawn submits for every root whose gate opened.
@@ -294,6 +299,17 @@ impl Coordinator {
                 if channel_closed {
                     break;
                 }
+            }
+
+            // Pre-build narration: refresh the eval-discovery counts
+            // and hand the renderer a snapshot when anything changed.
+            prebuild.attrs_pending = expected.len();
+            prebuild.roots_found = graph.roots().len();
+            prebuild.drvs_found = graph.node_count();
+            prebuild.sources_found = graph.source_count();
+            if prebuild_sent != Some(prebuild) {
+                prebuild_sent = Some(prebuild);
+                self.render.send(RenderEvent::Prebuild(prebuild));
             }
 
             // Biased toward the internal queue: already-arrived state
@@ -472,6 +488,10 @@ impl Coordinator {
                 Internal::Uploaded(result) => {
                     pending_uploads -= 1;
                     let report = result.context("upload batch failed")?;
+                    prebuild.drvs_acked += report.acked_drvs.len();
+                    prebuild.sources_acked += report.acked_sources.len();
+                    prebuild.drvs_uploaded += report.uploaded_drvs;
+                    prebuild.sources_uploaded += report.uploaded_sources;
                     for d in &report.acked_drvs {
                         graph.mark_drv_acked(d);
                     }
@@ -498,7 +518,11 @@ impl Coordinator {
                     graph.drop_bodies(&digests);
                 }
                 Internal::Started { root_idx, build_id } => {
-                    info!(build_id = %build_id, attr = %graph.root(root_idx).attr, "build accepted");
+                    let attr = &graph.root(root_idx).attr;
+                    info!(build_id = %build_id, attr = %attr, "build accepted");
+                    self.render
+                        .note(format!("{attr}: build {build_id} accepted"));
+                    prebuild.builds_accepted += 1;
                     build_ids.insert(root_idx, build_id);
                 }
                 Internal::Finished { root_idx, result } => {

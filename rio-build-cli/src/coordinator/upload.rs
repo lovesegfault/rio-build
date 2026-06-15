@@ -60,6 +60,11 @@ const HAS_BATCH: usize = 65_536;
 pub struct UploadReport {
     pub acked_drvs: Vec<Digest32>,
     pub acked_sources: Vec<Digest32>,
+    /// Of `acked_drvs`, how many bodies were actually transferred (the
+    /// rest were already known to the cluster or the local ack table).
+    pub uploaded_drvs: usize,
+    /// Of `acked_sources`, how many roots ran a `PutPathChunked`.
+    pub uploaded_sources: usize,
 }
 
 /// Negotiate + upload one batch of fresh objects (the fold outcome of
@@ -83,11 +88,13 @@ pub async fn upload_batch(
                 src.store_path
             )
         })?;
-        upload_source(&mut clients, &acks, &cas_root, &src, &key).await?;
+        if upload_source(&mut clients, &acks, &cas_root, &src, &key).await? {
+            report.uploaded_sources += 1;
+        }
         report.acked_sources.push(key);
     }
 
-    report.acked_drvs = upload_drvs(&mut clients, &acks, drv_blobs).await?;
+    (report.acked_drvs, report.uploaded_drvs) = upload_drvs(&mut clients, &acks, drv_blobs).await?;
     Ok(report)
 }
 
@@ -98,13 +105,14 @@ fn root_kind(src: &SourceRoot) -> Option<&RootKind> {
 }
 
 /// Drv negotiation + upload: ack-table short-circuit → bulk `HasDrvs`
-/// → `PutDrvBlobs` the misses, largest body first.
+/// → `PutDrvBlobs` the misses, largest body first. Returns the acked
+/// digests plus how many of them were actually uploaded.
 // r[impl bc.negotiate.ack-short-circuit]
 async fn upload_drvs(
     clients: &mut Clients,
     acks: &Arc<Mutex<ClusterAckTable>>,
     blobs: Vec<DrvBlob>,
-) -> anyhow::Result<Vec<Digest32>> {
+) -> anyhow::Result<(Vec<Digest32>, usize)> {
     let mut acked: Vec<Digest32> = Vec::new();
     let mut unknown: Vec<(Digest32, DrvBlob)> = Vec::new();
     {
@@ -123,7 +131,7 @@ async fn upload_drvs(
         }
     }
     if unknown.is_empty() {
-        return Ok(acked);
+        return Ok((acked, 0));
     }
 
     // One flat bulk Has over the batch (ADR-024: never a level walk),
@@ -192,9 +200,10 @@ async fn upload_drvs(
         table.record(ObjectKind::Drv, &present)?;
         table.record(ObjectKind::Drv, &uploaded)?;
     }
+    let n_uploaded = uploaded.len();
     acked.extend(present);
     acked.extend(uploaded);
-    Ok(acked)
+    Ok((acked, n_uploaded))
 }
 
 /// Re-upload specific drv blobs unconditionally (stale-ack recovery:
@@ -232,7 +241,9 @@ pub async fn reupload_drvs(
     Ok(())
 }
 
-/// Source negotiation + upload, keyed by [`source_root_key`].
+/// Source negotiation + upload, keyed by [`source_root_key`]. Returns
+/// whether a `PutPathChunked` actually ran (false = skipped because the
+/// ack table or the cluster already had the root).
 ///
 /// Directory roots keep the cluster `HasDirectories` probe: present +
 /// tenant-visible ⇒ the whole tree was committed by a completed upload
@@ -247,7 +258,7 @@ async fn upload_source(
     cas_root: &Path,
     src: &SourceRoot,
     key: &Digest32,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     // The ack table reuses ObjectKind::Directory for every root kind:
     // file/symlink keys are domain-separated (source_root_key), so they
     // cannot collide with real directory digests, and existing ack
@@ -258,7 +269,7 @@ async fn upload_source(
         .is_acked(ObjectKind::Directory, key)
     {
         debug!(store_path = %src.store_path, "source: ack-short-circuit");
-        return Ok(());
+        return Ok(false);
     }
     let is_dir_root = matches!(root_kind(src), Some(RootKind::DirDigest(_)) | None);
     let cluster_has = if is_dir_root {
@@ -288,7 +299,7 @@ async fn upload_source(
     acks.lock()
         .expect("ack table mutex poisoned")
         .record(ObjectKind::Directory, &[*key])?;
-    Ok(())
+    Ok(!cluster_has)
 }
 
 /// Where one novel chunk's bytes come from at upload time.
