@@ -477,6 +477,49 @@ in
   # target's build-samples retention sweep calls it from outside the
   # lib crate. Formal-coverage rationale (none-sensible): visibility
   # policy; the tripwire is the closure.
+
+  # bug_025 (the §SCC(3) sibling-sweep close): `total_cmp` is the
+  # repo's standard for f64 sort keys — `partial_cmp().unwrap_or(Equal)`
+  # is a non-total comparator (NaN compares Equal to everything, which
+  # driftsort can panic on or silently mis-order). The snapshot.rs
+  # spawn-intent close (cc20603) declared the standard but the done-gate
+  # rg sweep was never run; ingest.rs/alpha.rs/hw.rs each carried the
+  # shape. The pattern is multiline (hw.rs's nested-paren arg spans two
+  # lines) and matches both `unwrap_or` and `unwrap_or_else`; `[^;]*?`
+  # bounds the match to one statement so a `.partial_cmp` call on one
+  # line cannot pair with an unrelated `.unwrap_or` on the next.
+  # Comment-only lines are excluded — prose may cite the retired form.
+  # Formal-coverage rationale: the canonical comparator
+  # (`sla::cmp_f64_array`) is kani-proven total; this gate makes a new
+  # open-coded sibling a CI red instead of a §SCC(3) miss.
+  f64-sort-totality =
+    pkgs.runCommand "rio-f64-sort-totality"
+      {
+        nativeBuildInputs = [ pkgs.ripgrep ];
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions (
+            map (m: pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") (../. + "/${m}/src")) (
+              builtins.filter (m: pkgs.lib.hasPrefix "rio-" m)
+                (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.members
+            )
+          );
+        };
+      }
+      ''
+        hits=$(rg -nU --multiline-dotall \
+          '\.partial_cmp\b[^;]*?\.\s*unwrap_or(_else)?\b[^;]*?\bEqual\b' \
+          $src/*/src --glob '!**/tests/**' \
+          | rg -v '^\S+:[0-9]+:\s*//' || true)
+        test -z "$hits" || {
+          echo "FAIL: non-total f64 sort comparator — use f64::total_cmp or" >&2
+          echo "rio_scheduler::sla::cmp_f64_array (bug_025; the §SCC(3) sibling sweep):" >&2
+          echo "$hits" >&2
+          exit 1
+        }
+        touch $out
+      '';
+
   db-mutator-visibility =
     pkgs.runCommand "rio-db-mutator-visibility"
       {
