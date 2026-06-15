@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH ranked AS (\n              SELECT id,\n                ROW_NUMBER() OVER\n                  (ORDER BY completed_at DESC) AS rn,\n                ROW_NUMBER() OVER\n                  (PARTITION BY round(cpu_limit_cores) ORDER BY completed_at DESC) AS rn_c\n              FROM build_samples\n              WHERE pname = $1 AND system = $2 AND tenant = $3\n                AND NOT outlier_excluded\n            )\n            DELETE FROM build_samples\n            WHERE id IN (SELECT id FROM ranked WHERE rn > $4 AND rn_c > 1)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2268bb205ebb0a85aa1dad4d9dd3bb23b284fc2047ab30985d806eb7893f43ac"
+}

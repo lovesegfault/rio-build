@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE build_samples SET outlier_excluded = TRUE WHERE id = ANY($1::bigint[])",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "98afbf0bff74b38d2eefe5d7d76c38520d2351b6d17d26c1f52520282bc9d57a"
+}

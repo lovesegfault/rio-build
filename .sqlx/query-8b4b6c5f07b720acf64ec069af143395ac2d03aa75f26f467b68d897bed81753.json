@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM scheduler_live_pins WHERE drv_hash = ANY($1::text[]) AND pin_kind = 'build_input'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8b4b6c5f07b720acf64ec069af143395ac2d03aa75f26f467b68d897bed81753"
+}

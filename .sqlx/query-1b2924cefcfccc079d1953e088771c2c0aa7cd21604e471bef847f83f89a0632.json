@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE derivations SET status = 'poisoned', poisoned_at = now(), failure_msg = $2, failure_exec_id = $3, assigned_builder_id = NULL, updated_at = now() WHERE drv_hash = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1b2924cefcfccc079d1953e088771c2c0aa7cd21604e471bef847f83f89a0632"
+}

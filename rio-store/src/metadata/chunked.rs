@@ -380,6 +380,27 @@ pub(crate) async fn insert_pending_chunks(pool: &PgPool, chunks: &[([u8; 32], u3
     Ok(())
 }
 
+/// Stop claiming presence for a chunk whose backing object is provably
+/// gone: clear `durable` and `uploaded_at` (both assert "the S3 object
+/// exists") so `HasChunks` answers absent and the next uploader streams
+/// the chunk again instead of skipping it. The row, its refcount, and
+/// any referencing manifests are left alone — the re-upload is an
+/// idempotent overwrite that makes them readable again, whereas a
+/// row delete would orphan their refcount accounting.
+///
+/// Used by the `PutPathChunked` deferred file-digest verification when
+/// a backend GET for a supposedly-durable chunk returns "no object"
+/// (the GC-grace-vs-ack-TTL hole observed in production: a presence row
+/// that outlived its S3 object made every client skip the upload and
+/// fail forever).
+pub(crate) async fn clear_chunk_presence(pool: &PgPool, digest: &[u8; 32]) -> Result<()> {
+    sqlx::query("UPDATE chunks SET durable = FALSE, uploaded_at = NULL WHERE blake3_hash = $1")
+        .bind(digest.as_slice())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// One committed `file_blobs` binding per requested digest:
 /// `(digest, store_path_hash, nar_offset, size)` for the
 /// lowest-`(store_path_hash, nar_offset)` row whose manifest is

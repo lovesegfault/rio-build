@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE derivations\n             SET poisoned_at = NULL, failure_msg = NULL, failure_exec_id = NULL,\n                 status = 'created', updated_at = now()\n             WHERE drv_hash = ANY($1::text[])",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7c4b17e1b3e314fefae4ab4636a7dda485717d0d3cf78aadd0dac4ddb2e9dbfc"
+}

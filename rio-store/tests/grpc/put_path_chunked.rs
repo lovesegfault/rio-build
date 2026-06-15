@@ -1124,6 +1124,92 @@ async fn mixed_novel_dedup_file_recomputes_and_commits() -> TestResult {
     Ok(())
 }
 
+// r[verify store.chunk.has-chunks-durable]
+/// The production stale-presence hole: a `chunks` row claims durable
+/// but its S3 object is gone (orphan-GC grace shorter than the client
+/// ack TTL, or an S3 fault). The deferred file-digest refetch is where
+/// the store discovers the lie — it must reject the upload UNAVAILABLE
+/// naming the digest (the `rio_proto::chunk_reject` contract) AND
+/// demote the row, so the next attempt's `HasChunks` answers absent,
+/// the chunk is re-streamed, and the upload commits.
+#[tokio::test]
+async fn verification_miss_demotes_lying_chunk_presence() -> TestResult {
+    let (mut s, backend) = StoreSession::new_chunked().await?;
+    let part_a = vec![0x41u8; 1000];
+    let part_b = vec![0x42u8; 1000];
+    let part_c = vec![0x43u8; 1000];
+    let a_digest = *blake3::hash(&part_a).as_bytes();
+
+    // Upload 1: file A||B split as [A, B] commits — both chunks durable
+    // and S3-backed.
+    let dir1 = tempfile::TempDir::new()?;
+    let f1 = dir1.path().join("v1");
+    std::fs::write(&f1, [part_a.as_slice(), part_b.as_slice()].concat())?;
+    let mut fx1 = fixture_for_tree(&f1, &out_path("vmd1"), vec![]);
+    split_single_chunk(&mut fx1, [part_a.as_slice(), part_b.as_slice()]);
+    let (begin, frames) = assemble_begin(&[&fx1], vec![], &Default::default());
+    assert_eq!(
+        send_chunked(&mut s.client, begin, frames, None).await?,
+        vec![true]
+    );
+
+    // The lie: A's S3 object disappears while its row keeps claiming
+    // durable presence.
+    backend.delete_by_key(&backend.key_for(&a_digest)).await?;
+
+    // Upload 2: file A||C dedups A and streams C. The new file digest
+    // has no committed binding, so the store must refetch A — and find
+    // it gone.
+    let dir2 = tempfile::TempDir::new()?;
+    let f2 = dir2.path().join("v2");
+    std::fs::write(&f2, [part_a.as_slice(), part_c.as_slice()].concat())?;
+    let path2 = out_path("vmd2");
+    let mut fx2 = fixture_for_tree(&f2, &path2, vec![]);
+    split_single_chunk(&mut fx2, [part_a.as_slice(), part_c.as_slice()]);
+    let durable: std::collections::HashSet<[u8; 32]> = [a_digest].into();
+    let (begin, frames) = assemble_begin(&[&fx2], vec![], &durable);
+    let err = send_chunked(&mut s.client, begin, frames, None)
+        .await
+        .expect_err("a missing backing object must fail the upload");
+    assert_eq!(err.code(), tonic::Code::Unavailable, "{err:?}");
+    assert_eq!(
+        rio_proto::chunk_reject::parse_missing_chunk_digests(err.message()),
+        vec![a_digest],
+        "the reject must name the missing chunk via the shared contract: {err:?}"
+    );
+
+    // The presence lie is cleared: the HasChunks predicate no longer
+    // matches, and the S3-confirmation stamp is gone with it.
+    let (durable_now, uploaded_now): (bool, bool) = sqlx::query_as(
+        "SELECT durable AND NOT deleted, uploaded_at IS NOT NULL FROM chunks \
+         WHERE blake3_hash = $1",
+    )
+    .bind(a_digest.as_slice())
+    .fetch_one(&s.db.pool)
+    .await?;
+    assert!(!durable_now, "demoted chunk must stop answering HasChunks");
+    assert!(!uploaded_now, "demoted chunk must lose its S3 confirmation");
+    let n = poll_scalar_until::<i64>(&s.db.pool, "SELECT COUNT(*) FROM manifests", 1).await;
+    assert_eq!(n, 1, "the rejected upload must not leave a placeholder");
+
+    // The retry an honest HasChunks now produces — A back in `novel` —
+    // re-streams the chunk and commits.
+    let (begin, frames) = assemble_begin(&[&fx2], vec![], &Default::default());
+    assert_eq!(
+        send_chunked(&mut s.client, begin, frames, None).await?,
+        vec![true],
+        "re-streaming the demoted chunk must commit"
+    );
+    let durable_again: bool =
+        sqlx::query_scalar("SELECT durable AND NOT deleted FROM chunks WHERE blake3_hash = $1")
+            .bind(a_digest.as_slice())
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert!(durable_again, "the re-upload restores durable presence");
+    assert_eq!(get_path_bytes(&mut s.client, &path2).await?, fx2.nar);
+    Ok(())
+}
+
 // ── verify-pipeline tests (bounded-concurrent chunk PUTs) ──────────
 
 /// Latency-injecting wrapper around the memory backend: tracks the PUT
