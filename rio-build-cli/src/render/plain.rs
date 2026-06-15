@@ -1,6 +1,7 @@
-//! The status-line renderer: one line per state edge, no log/phase
-//! events. Script-compatible — the output format is frozen (the VM
-//! test asserts on it). Written to stderr; stdout is the result-path
+//! The status-line renderer: one line per state edge (cached drvs are
+//! counted in summaries, not listed), no log/phase events.
+//! Script-compatible — the output format is frozen (the VM test
+//! asserts on it). Written to stderr; stdout is the result-path
 //! surface only.
 
 use std::collections::HashSet;
@@ -122,7 +123,10 @@ pub fn line(ev: &BuildEvent) -> Option<String> {
                 DerivationEventKind::Queued => "queued",
                 DerivationEventKind::Started => "building",
                 DerivationEventKind::Completed => "built",
-                DerivationEventKind::Cached => "cached",
+                // No per-drv line: a warm cluster caches thousands of
+                // drvs; the started summary and the coalesced Progress
+                // line already carry the cached/done counts.
+                DerivationEventKind::Cached => return None,
                 DerivationEventKind::Failed => "FAILED",
                 DerivationEventKind::Substituting => "substituting",
             };
@@ -269,6 +273,30 @@ mod tests {
         let s = std::str::from_utf8(&buf).unwrap();
         assert!(
             s.contains("2/100 done, 0 substituting, 4 building, 9 queued"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn cached_edge_emits_no_line_but_closes_substituting() {
+        let mut r = PlainRenderer::default();
+        let mut buf = Vec::new();
+        r.on_event(
+            &mut buf,
+            &drv("/nix/store/a", DerivationEventKind::Substituting),
+        );
+        r.on_event(&mut buf, &drv("/nix/store/a", DerivationEventKind::Cached));
+        let s = std::str::from_utf8(&buf).unwrap();
+        // The substituting edge prints; the cached edge does not.
+        assert_eq!(s.lines().count(), 1, "{s}");
+        assert!(!s.contains("cached"), "{s}");
+        // The drv still left the substituting set, so the next Progress
+        // counts it as done rather than substituting.
+        r.on_event(&mut buf, &progress(1, 0, 0, 1));
+        r.tick(&mut buf);
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert!(
+            s.contains("1/1 done, 0 substituting, 0 building, 0 queued"),
             "{s}"
         );
     }

@@ -163,6 +163,12 @@ impl<W: Write> CiRenderer<W> {
     }
 
     fn finish(&mut self, row: DrvRow, kind: DerivationEventKind, error: &str) {
+        // Cached drvs print nothing: a warm cluster caches thousands and
+        // one "✔ (cached)" line each drowns the real output. The row was
+        // already dropped from `running` by the caller.
+        if kind == DerivationEventKind::Cached {
+            return;
+        }
         let duration = fmt_duration(row.elapsed((self.opts.clock)()));
         if row.streaming {
             // Log already on screen; just print the verdict.
@@ -185,7 +191,7 @@ impl<W: Write> CiRenderer<W> {
                 };
                 self.sgr(RED, &format!("✘  {} failed after {dur}{suffix}", row.label))
             }
-            DerivationEventKind::Cached => self.sgr(GREEN, &format!("✔  {} (cached)", row.label)),
+            // Cached is dropped in `finish` and never rendered.
             _ => self.sgr(GREEN, &format!("✔  {} ({dur})", row.label)),
         }
     }
@@ -404,6 +410,20 @@ mod tests {
         // Logs of concurrent builds don't interleave.
         assert!(t.contains("pkg-a.drv> a1\npkg-a.drv> a2\n"), "{t}");
         assert!(t.contains("✔  pkg-a.drv (1m05s)"), "{t}");
+        assert!(r.running.is_empty());
+    }
+
+    #[test]
+    fn cached_drv_prints_nothing() {
+        let (mut r, buf, _now) = make(CiOpts::default());
+        r.on_event(&drv(DRV_A, DerivationEventKind::Substituting));
+        r.on_event(&drv(DRV_A, DerivationEventKind::Cached));
+        // The open line still shows liveness; the cached close is silent
+        // and the row leaves the heartbeat set.
+        let t = text(&buf);
+        assert!(t.contains("pkg-a.drv started"), "{t}");
+        assert!(!t.contains("cached"), "{t}");
+        assert!(!t.contains('✔'), "{t}");
         assert!(r.running.is_empty());
     }
 

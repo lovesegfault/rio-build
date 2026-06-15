@@ -112,7 +112,7 @@
     {
       "path": "render/plain.rs",
       "depth": 1,
-      "doc": "The status-line renderer: one line per state edge, no log/phase events."
+      "doc": "The status-line renderer: one line per state edge (cached drvs are counted in summaries, not listed), no log/phase events."
     },
     {
       "path": "render/term.rs",
