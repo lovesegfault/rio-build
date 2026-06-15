@@ -234,6 +234,20 @@ pub(crate) struct PoisonedDerivationRow {
     pub is_fixed_output: bool,
 }
 
+/// Row from `load_failure_reason`: the persisted failure attribution of
+/// an already-poisoned derivation (M_117), read by the merge fail-fast
+/// path to name the culprit and surface the original reason.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct FailureReasonRow {
+    /// Builder-reported error text of the failing attempt.
+    pub failure_msg: Option<String>,
+    /// Execution that produced it (`None` = never reached a worker).
+    pub failure_exec_id: Option<Uuid>,
+    /// `poisoned_at` as a Unix epoch (seconds). PG-side EXTRACT so the
+    /// caller converts straight to `SystemTime` without a chrono dep.
+    pub poisoned_epoch: Option<f64>,
+}
+
 /// Row from `load_nonterminal_derivations`. Mirrors the INSERT
 /// columns from `batch_upsert_derivations` plus live-state fields
 /// (assigned_builder_id, the persisted resource floor, the active

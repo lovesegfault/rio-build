@@ -5,8 +5,8 @@ use std::sync::LazyLock;
 use sqlx::PgConnection;
 
 use super::{
-    AssignmentCloseStatus, FencedBegin, FencedOutcome, PoisonedDerivationRow, SchedulerDb,
-    ServingGeneration, terminal_status_sql,
+    AssignmentCloseStatus, FailureReasonRow, FencedBegin, FencedOutcome, PoisonedDerivationRow,
+    SchedulerDb, ServingGeneration, terminal_status_sql,
 };
 use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 
@@ -547,6 +547,7 @@ impl SchedulerDb {
     }
 
     // r[impl sched.poison.ttl-persist]
+    // r[impl obs.log.failure-reason-persisted]
     /// Transaction-joining body of [`Self::persist_poisoned`]: the
     /// atomic `status='poisoned'` + `poisoned_at=now()` write plus the
     /// persisted failure reason (`failure_msg`, `failure_exec_id` —
@@ -622,6 +623,29 @@ impl SchedulerDb {
         Self::persist_poisoned_in_tx(tx.conn(), drv_hash, failure_msg, failure_exec_id).await?;
         tx.commit().await?;
         Ok(FencedOutcome::Applied(0))
+    }
+
+    /// Read the persisted failure attribution for a poisoned derivation
+    /// (M_117). `None` when the derivation row doesn't exist; the inner
+    /// fields are `None` when nothing was recorded (pre-117 rows, or a
+    /// poison persisted without a builder error).
+    ///
+    /// Runtime-checked query (same pattern as
+    /// [`load_poisoned_derivations`](Self::load_poisoned_derivations) —
+    /// the EXTRACT alias keeps the epoch conversion PG-side).
+    pub(crate) async fn load_failure_reason(
+        &self,
+        drv_hash: &DrvHash,
+    ) -> Result<Option<FailureReasonRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT failure_msg, failure_exec_id, \
+                    EXTRACT(EPOCH FROM poisoned_at)::float8 AS poisoned_epoch \
+             FROM derivations WHERE drv_hash = $1",
+        )
+        .bind(drv_hash.as_str())
+        .fetch_optional(&self.pool)
+        .await
+    }
 
     // r[impl sched.db.assignment-stale-sweep]
     /// Recovery backstop: close any `pending`/`acknowledged`

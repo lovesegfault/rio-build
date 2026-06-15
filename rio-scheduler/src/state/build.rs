@@ -163,6 +163,27 @@ enum Lifecycle {
     Terminal(SettledBuild),
 }
 
+/// Culprit attribution for a merge-time fail-fast: the build failed
+/// because a derivation in its DAG was already terminally failed
+/// (poisoned) by an EARLIER build, so no execution ran for this build.
+/// Carries what the client needs to show the original failure — the
+/// real culprit derivation (not the cascaded ancestor the reconcile
+/// loop surfaced), the execution that produced it, and the persisted
+/// reason (`derivations.failure_msg`, M_117).
+#[derive(Debug, Clone)]
+pub struct FailfastCulprit {
+    /// .drv path of the poisoned culprit (hash fallback when the path
+    /// is unknown).
+    pub derivation_path: String,
+    /// Execution that produced the original failure. `None` when the
+    /// culprit never reached a worker (fleet-exhaustion poison).
+    pub exec_id: Option<Uuid>,
+    /// Persisted builder error text. Empty when nothing was recorded.
+    pub error_message: String,
+    /// When the culprit was poisoned (`derivations.poisoned_at`).
+    pub failed_at: Option<std::time::SystemTime>,
+}
+
 /// In-memory state for a build request.
 #[derive(Debug, Clone)]
 pub struct BuildInfo {
@@ -217,6 +238,10 @@ pub struct BuildInfo {
     /// PG-recovered age intact — a 30h-old build on a 1h-booted leader
     /// reads 30h elapsed, never "submitted just now" (merged_bug_300).
     pub submitted_at: crate::state::RecoveredInstant,
+    /// Culprit attribution when the failure was a merge-time fail-fast
+    /// on a node already poisoned by an EARLIER build (`r[sched.merge.
+    /// failfast-culprit]`). `None` for live-execution failures.
+    pub culprit: Option<FailfastCulprit>,
     /// When the orphan-watcher sweep first observed this build's
     /// `build_events` broadcast channel with zero receivers. `None`
     /// while at least one watcher (gateway SubmitBuild/WatchBuild
@@ -256,7 +281,19 @@ impl BuildInfo {
             failed_count: 0,
             first_failure: None,
             submitted_at: crate::state::RecoveredInstant::fresh_now(),
+            culprit: None,
             orphaned_since: None,
+        }
+    }
+
+    /// Populate the `culprit_*` fields of a `BuildFailed` payload from
+    /// the recorded fail-fast attribution (when present).
+    pub fn fill_culprit(&self, failed: &mut rio_proto::types::BuildFailed) {
+        if let Some(culprit) = &self.culprit {
+            failed.culprit_derivation = culprit.derivation_path.clone();
+            failed.culprit_exec_id = culprit.exec_id.map(|u| u.to_string()).unwrap_or_default();
+            failed.culprit_error_message = culprit.error_message.clone();
+            failed.culprit_failed_at = culprit.failed_at.map(prost_types::Timestamp::from);
         }
     }
 

@@ -696,14 +696,18 @@ impl DagActor {
                 ),
                 _ => Default::default(),
             };
+        let mut failed = rio_proto::types::BuildFailed {
+            error_message,
+            failed_derivation,
+            status,
+            ..Default::default()
+        };
+        if let Some(b) = self.builds.get(&build_id) {
+            b.fill_culprit(&mut failed);
+        }
         self.events.emit(
             build_id,
-            rio_proto::types::build_event::Event::Failed(rio_proto::types::BuildFailed {
-                error_message,
-                failed_derivation,
-                status,
-                ..Default::default()
-            }),
+            rio_proto::types::build_event::Event::Failed(failed),
         );
         metrics::counter!("rio_scheduler_builds_total", "outcome" => "failure").increment(1);
 

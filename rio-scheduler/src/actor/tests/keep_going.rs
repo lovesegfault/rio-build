@@ -188,6 +188,81 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() -> TestResult
     Ok(())
 }
 
+/// A merge that fail-fasts on a still-poisoned dependency must attribute
+/// the failure to the poisoned CULPRIT — its drv path, persisted reason
+/// and originating execution — not to the cascaded DependencyFailed
+/// ancestor the reconcile pass surfaces first.
+// r[verify sched.merge.failfast-culprit]
+#[tokio::test]
+async fn test_failfast_attributes_poisoned_culprit() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Build 1: poison the leaf with a real builder error.
+    let build1 = Uuid::new_v4();
+    let _rx1 = merge_single_node(&handle, build1, "culprit-leaf", PriorityClass::Scheduled).await?;
+    pull_complete_failure(
+        &handle,
+        "culprit-leaf",
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "gcc: fatal error: boom",
+    )
+    .await?;
+    // Pin resubmit_cycles at the limit so the leaf stays Poisoned across
+    // the next merge (same shape as the prepoisoned-dep test above).
+    assert!(
+        handle
+            .debug_force_poisoned("culprit-leaf", crate::state::POISON_RESUBMIT_RETRY_LIMIT)
+            .await?
+    );
+
+    // Build 2: a new parent depending on the poisoned leaf → fail-fast at
+    // merge. The reconcile pass surfaces the PARENT (DependencyFailed);
+    // attribution must descend to the leaf.
+    let build2 = Uuid::new_v4();
+    let mut rx2 = merge_dag(
+        &handle,
+        build2,
+        vec![make_node("culprit-parent"), make_node("culprit-leaf")],
+        vec![make_test_edge("culprit-parent", "culprit-leaf")],
+        false,
+    )
+    .await?;
+
+    let failed = loop {
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx2.recv())
+            .await
+            .expect("BuildFailed within 5s")?;
+        if let Some(rio_proto::types::build_event::Event::Failed(f)) = ev.event {
+            break f;
+        }
+    };
+    let leaf_path = test_drv_path("culprit-leaf");
+    assert_eq!(
+        failed.culprit_derivation, leaf_path,
+        "culprit must be the poisoned leaf, not the cascaded parent"
+    );
+    assert_eq!(
+        failed.culprit_error_message, "gcc: fatal error: boom",
+        "culprit_error_message must carry the persisted builder error"
+    );
+    assert!(
+        !failed.culprit_exec_id.is_empty(),
+        "culprit_exec_id must name the original execution"
+    );
+    assert!(
+        failed.culprit_failed_at.is_some(),
+        "culprit_failed_at must carry the poison timestamp"
+    );
+    // The headline summary names the culprit too (not just the new fields).
+    assert!(
+        failed.error_message.contains(&leaf_path) && failed.error_message.contains("boom"),
+        "error_message must name the culprit and its reason, got: {}",
+        failed.error_message
+    );
+    assert_eq!(failed.failed_derivation, leaf_path);
+    Ok(())
+}
+
 /// Single-node resubmit of a still-Poisoned derivation (within TTL,
 /// no ClearPoison) must fail the build immediately.
 ///
