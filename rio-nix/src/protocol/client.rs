@@ -329,6 +329,143 @@ pub async fn client_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Send `wopQueryValidPaths` and return the subset of `paths` the daemon
+/// already considers valid.
+///
+/// `substitute = false` keeps the daemon from kicking off its own
+/// substituter downloads while answering — the caller only wants the
+/// validity answer (the prune step before importing a closure).
+pub async fn client_query_valid_paths<R, W, S>(
+    reader: &mut R,
+    writer: &mut W,
+    paths: &[S],
+    substitute: bool,
+) -> Result<Vec<String>>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    S: AsRef<str>,
+{
+    wire::write_u64(writer, WorkerOp::QueryValidPaths as u64).await?;
+    wire::write_strings(writer, paths).await?;
+    // `substitute` flag exists since protocol 1.27; our daemon floor is
+    // 1.35 so it is sent unconditionally.
+    wire::write_bool(writer, substitute).await?;
+    writer.flush().await?;
+
+    drain_stderr(reader).await?;
+    wire::read_strings(reader).await
+}
+
+/// Send `wopAddToStoreNar`: register `store_path` with the metadata in
+/// `info` and stream its NAR serialization from `nar` as a framed byte
+/// stream (mandatory at protocol ≥ 1.23; our floor is 1.35).
+///
+/// `repair` and `dontCheckSigs` are always sent as 0 — the daemon applies
+/// its own `require-sigs` policy against `info.signatures`.
+///
+/// The daemon's STDERR channel is processed CONCURRENTLY with the frame
+/// writes, mirroring Nix's own client: the daemon may reject the import
+/// (signature policy, malformed info) while the NAR is still in flight,
+/// and without draining stderr the rejection both arrives late (after
+/// gigabytes shipped into a refusal) and can deadlock — daemon blocked
+/// writing the error, client blocked writing frames the daemon no longer
+/// reads.
+///
+/// On any error the framed stream is left UNTERMINATED (no `u64(0)`
+/// sentinel) and the connection must be abandoned by the caller — the
+/// daemon discards the partial import. This includes errors surfaced by
+/// `nar` itself, which is how callers abort on a hash mismatch detected
+/// at EOF of the source stream.
+pub async fn client_add_to_store_nar<R, W, N>(
+    reader: &mut R,
+    writer: &mut W,
+    store_path: &str,
+    info: &super::pathinfo::ValidPathInfo,
+    nar: &mut N,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    N: AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    wire::write_u64(writer, WorkerOp::AddToStoreNar as u64).await?;
+    wire::write_string(writer, store_path).await?;
+    super::pathinfo::write_valid_path_info(writer, info).await?;
+    // repair, dontCheckSigs
+    wire::write_bool(writer, false).await?;
+    wire::write_bool(writer, false).await?;
+    writer.flush().await?;
+
+    // Two independent halves driven concurrently: the frame copy owns the
+    // writer + NAR source, the stderr loop owns the reader. Each is a
+    // single pinned future so a select wake-up never drops a half-read
+    // protocol message or a half-written frame.
+    let write_fut = async {
+        let mut framed = wire::FramedStreamWriter::new(writer);
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = nar.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            framed.write_frame(&buf[..n]).await?;
+        }
+        framed.finish().await?;
+        writer.flush().await?;
+        Ok::<(), WireError>(())
+    };
+    let stderr_fut = async {
+        for _ in 0..MAX_STDERR_MESSAGES {
+            match read_stderr_message(reader).await? {
+                StderrMessage::Last => return Ok(()),
+                StderrMessage::Error(e) => {
+                    return Err(WireError::Io(std::io::Error::other(format!(
+                        "daemon error: {}",
+                        e.message
+                    ))));
+                }
+                StderrMessage::Read(_) => {
+                    return Err(WireError::Io(std::io::Error::other(
+                        "unexpected STDERR_READ during AddToStoreNar",
+                    )));
+                }
+                _ => {} // log/activity chatter
+            }
+        }
+        Err(WireError::Io(std::io::Error::other(format!(
+            "exceeded {MAX_STDERR_MESSAGES} STDERR messages without STDERR_LAST"
+        ))))
+    };
+    tokio::pin!(write_fut);
+    tokio::pin!(stderr_fut);
+
+    let mut write_done = false;
+    loop {
+        tokio::select! {
+            w = &mut write_fut, if !write_done => {
+                w?;
+                write_done = true;
+            }
+            s = &mut stderr_fut => {
+                s?;
+                if !write_done {
+                    // STDERR_LAST before the framed stream is complete
+                    // means the daemon stopped consuming — the import
+                    // cannot have happened.
+                    return Err(WireError::Io(std::io::Error::other(
+                        "daemon ended AddToStoreNar before the NAR was fully sent",
+                    )));
+                }
+                // wopAddToStoreNar has no result value after STDERR_LAST.
+                return Ok(());
+            }
+        }
+    }
+}
+
 /// Write the `wopBuildDerivation` request payload (opcode + path + drv + mode) and flush.
 ///
 /// Read side is left to the caller: loop on [`read_stderr_message`] until
@@ -895,6 +1032,228 @@ mod tests {
         let (mut cr, mut cw) = tokio::io::split(client_stream);
         client_set_options(&mut cr, &mut cw, 3600, 4).await?;
         server.await??;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // client_query_valid_paths + client_add_to_store_nar
+    // -----------------------------------------------------------------------
+
+    /// Wire layout + result decode for wopQueryValidPaths: opcode 31, the
+    /// path collection, the post-1.27 substitute flag, then STDERR loop +
+    /// a string collection result.
+    #[tokio::test]
+    async fn test_client_query_valid_paths_roundtrip() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+
+        let server = tokio::spawn(async move {
+            let (mut sr, mut sw) = tokio::io::split(server_stream);
+            let op = wire::read_u64(&mut sr).await?;
+            assert_eq!(op, WorkerOp::QueryValidPaths as u64);
+            let paths = wire::read_strings(&mut sr).await?;
+            let substitute = wire::read_bool(&mut sr).await?;
+            assert!(!substitute, "prune query must not trigger substitution");
+
+            // Log chatter before the result exercises the drain.
+            wire::write_u64(&mut sw, STDERR_NEXT).await?;
+            wire::write_string(&mut sw, "querying...").await?;
+            wire::write_u64(&mut sw, STDERR_LAST).await?;
+            // Pretend only the first path is valid.
+            wire::write_strings(&mut sw, &paths[..1]).await?;
+            sw.flush().await?;
+            anyhow::Ok(paths)
+        });
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let asked = [
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep",
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-out",
+        ];
+        let valid = client_query_valid_paths(&mut cr, &mut cw, &asked, false).await?;
+
+        let server_paths = server.await??;
+        assert_eq!(server_paths, asked);
+        assert_eq!(valid, vec![asked[0].to_string()]);
+        Ok(())
+    }
+
+    fn import_info() -> super::super::pathinfo::ValidPathInfo {
+        super::super::pathinfo::ValidPathInfo {
+            deriver: Some("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".into()),
+            nar_hash: vec![0x42; 32],
+            references: vec!["/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep".into()],
+            registration_time: 0,
+            nar_size: 11,
+            ultimate: false,
+            signatures: vec!["rio-test-1:c2ln".into()],
+            content_address: None,
+        }
+    }
+
+    /// wopAddToStoreNar request layout: opcode 39, store path, the 8-field
+    /// ValidPathInfo body, repair=0, dontCheckSigs=0, then the NAR as a
+    /// framed stream. The fake daemon interleaves STDERR_NEXT chatter with
+    /// the client's frame writes (the concurrent-stderr contract) and only
+    /// sends STDERR_LAST after the terminator.
+    #[tokio::test]
+    async fn test_client_add_to_store_nar_roundtrip() -> anyhow::Result<()> {
+        use crate::protocol::pathinfo::read_valid_path_info;
+
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let nar_bytes = b"hello nar bytes".to_vec();
+        let info = import_info();
+        let expected_info = info.clone();
+        let expected_nar = nar_bytes.clone();
+        let store_path = "/nix/store/cccccccccccccccccccccccccccccccc-out";
+
+        let server = tokio::spawn(async move {
+            let (mut sr, mut sw) = tokio::io::split(server_stream);
+            let op = wire::read_u64(&mut sr).await?;
+            assert_eq!(op, WorkerOp::AddToStoreNar as u64);
+            let path = wire::read_string(&mut sr).await?;
+            let got_info = read_valid_path_info(&mut sr).await?;
+            let repair = wire::read_bool(&mut sr).await?;
+            let dont_check_sigs = wire::read_bool(&mut sr).await?;
+            assert!(!repair && !dont_check_sigs);
+
+            // Chatter while the framed stream is still arriving — the
+            // client must keep writing frames while consuming this.
+            wire::write_u64(&mut sw, STDERR_NEXT).await?;
+            wire::write_string(&mut sw, "importing...").await?;
+            sw.flush().await?;
+
+            let nar = wire::read_framed_stream(&mut sr).await?;
+
+            wire::write_u64(&mut sw, STDERR_LAST).await?;
+            sw.flush().await?;
+            anyhow::Ok((path, got_info, nar))
+        });
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let mut nar_src = std::io::Cursor::new(nar_bytes);
+        client_add_to_store_nar(&mut cr, &mut cw, store_path, &info, &mut nar_src).await?;
+
+        let (path, got_info, nar) = server.await??;
+        assert_eq!(path, store_path);
+        assert_eq!(got_info, expected_info);
+        assert_eq!(nar, expected_nar);
+        Ok(())
+    }
+
+    /// Fail fast on STDERR_ERROR: the daemon rejects the import while the
+    /// NAR is still being written (signature policy). The client must
+    /// surface the daemon error promptly instead of pushing the remaining
+    /// gigabytes — the duplex buffer here is far smaller than the NAR, so
+    /// a client that ignored stderr until its writes finished would
+    /// deadlock (daemon stopped reading, client blocked writing).
+    #[tokio::test]
+    async fn test_client_add_to_store_nar_fails_fast_on_daemon_error() -> anyhow::Result<()> {
+        use tokio::io::AsyncReadExt as _;
+
+        // 64 KiB pipe, 64 MiB claimed NAR.
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let info = import_info();
+        let store_path = "/nix/store/cccccccccccccccccccccccccccccccc-out";
+
+        let server = tokio::spawn(async move {
+            let (mut sr, mut sw) = tokio::io::split(server_stream);
+            let _op = wire::read_u64(&mut sr).await?;
+            let _path = wire::read_string(&mut sr).await?;
+            let _info = crate::protocol::pathinfo::read_valid_path_info(&mut sr).await?;
+            let _repair = wire::read_bool(&mut sr).await?;
+            let _dont_check_sigs = wire::read_bool(&mut sr).await?;
+
+            // Reject immediately; never read the framed stream.
+            StderrWriter::new(&mut sw)
+                .error(&StderrError::simple(
+                    "nix-daemon",
+                    "cannot add path because it lacks a signature by a trusted key",
+                ))
+                .await?;
+            // Keep the read half open (don't drop sr yet) so the client
+            // can't mistake an EOF for the failure mode under test.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            drop(sr);
+            anyhow::Ok(())
+        });
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let mut nar_src = tokio::io::repeat(0u8).take(64 * 1024 * 1024);
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_add_to_store_nar(&mut cr, &mut cw, store_path, &info, &mut nar_src),
+        )
+        .await
+        .expect("must fail fast, not block until the whole NAR is written")
+        .expect_err("daemon rejection must surface as an error");
+        assert!(
+            err.to_string().contains("lacks a signature"),
+            "daemon error text must be preserved, got: {err}"
+        );
+        server.abort();
+        Ok(())
+    }
+
+    /// A NAR source that errors mid-stream (the import caller's hash
+    /// mismatch abort) propagates without writing the frame terminator,
+    /// leaving the daemon to discard the partial import.
+    #[tokio::test]
+    async fn test_client_add_to_store_nar_source_error_leaves_stream_unterminated()
+    -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(1024 * 1024);
+        let info = import_info();
+        let store_path = "/nix/store/cccccccccccccccccccccccccccccccc-out";
+
+        let server = tokio::spawn(async move {
+            let (mut sr, _sw) = tokio::io::split(server_stream);
+            let _op = wire::read_u64(&mut sr).await?;
+            let _path = wire::read_string(&mut sr).await?;
+            let _info = crate::protocol::pathinfo::read_valid_path_info(&mut sr).await?;
+            let _repair = wire::read_bool(&mut sr).await?;
+            let _dont_check_sigs = wire::read_bool(&mut sr).await?;
+            // Reading the framed stream must fail with EOF/short-read —
+            // the client aborts without ever writing the terminator.
+            let res = wire::read_framed_stream(&mut sr).await;
+            anyhow::Ok(res.is_err())
+        });
+
+        // 8 KiB of valid data, then an error (what a verifying reader does
+        // when the hash doesn't match at EOF).
+        struct FailingSource {
+            remaining: usize,
+        }
+        impl tokio::io::AsyncRead for FailingSource {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if self.remaining == 0 {
+                    return std::task::Poll::Ready(Err(std::io::Error::other(
+                        "narHash mismatch detected at EOF",
+                    )));
+                }
+                let n = self.remaining.min(buf.remaining());
+                buf.put_slice(&vec![0xAA; n]);
+                self.remaining -= n;
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let mut nar_src = FailingSource { remaining: 8192 };
+        let err = client_add_to_store_nar(&mut cr, &mut cw, store_path, &info, &mut nar_src)
+            .await
+            .expect_err("source error must abort the import");
+        assert!(err.to_string().contains("narHash mismatch"), "{err}");
+        // Dropping the client half closes the stream; the server's framed
+        // read must observe truncation, not a clean terminator.
+        drop(cw);
+        drop(cr);
+        assert!(
+            server.await??,
+            "daemon-side framed read must fail (stream left unterminated)"
+        );
         Ok(())
     }
 
