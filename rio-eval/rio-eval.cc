@@ -541,10 +541,10 @@ int main(int argc, char ** argv)
             /* PathInputScheme::getAccessor copies a `path:` flake into
              * the store via addToStoreFromDump (a NAR stream — no
              * origin path), so the rio store records Origin::Streamed
-             * and source_root_for then skips it: `self` never rides a
-             * SourceRoot frame and the cluster build fails on the
-             * missing inputSrc. Record the local origin here so forked
-             * workers inherit it.
+             * and the coordinator would upload `self` through the
+             * CAS-read path. Record the local origin here so forked
+             * workers inherit it and `self` stays on the cheaper
+             * origin re-read (the not-a-mirror rule).
              * TODO: walk locked.lockFile for transitive `path:` inputs;
              * `self` is the load-bearing case (every flake build). */
             if (locked.flake.lockedRef.input.getType() == "path") {

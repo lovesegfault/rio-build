@@ -388,13 +388,15 @@ running and prints the same reattach hint.
 
 Implementation gaps in the current client, not design decisions.
 
-- *`toFile` and single-file source roots.* Only origin-backed directory
-  trees upload today. Input sources produced by `builtins.toFile` (streamed
-  text) or rooted at a single file or symlink are skipped at skeleton
-  assembly and rejected by the upload planner; a build that genuinely needs
-  one fails at the cluster's submit-time verification rather than silently.
-  Directory trees --- flake inputs and local working trees --- cover the
-  dominant case.
+- *Foreign store paths.* The only input sources skipped at skeleton
+  assembly are store paths the evaluation never ingested into the client
+  CAS (paths that were already valid for some other reason); a build that
+  genuinely needs one fails at the cluster's submit-time verification
+  rather than silently. Everything the eval ingested uploads --- directory
+  trees, single files, symlinks, and streamed content such as fetched
+  flake inputs and `builtins.toFile` text. Caveat: a `toFile` path that
+  carries references is registered cluster-side with an empty reference
+  set for now.
 - *IFD output references.* Outputs fetched back for import-from-derivation
   are recorded with empty reference sets; evaluation logic that depends on
   the references of an imported output does not see them.
