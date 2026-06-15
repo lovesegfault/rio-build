@@ -357,12 +357,41 @@ fn join_census_universe_matches_live_tree() {
     );
 }
 
+/// W10-AS (bug_023, the runtime enforcement face): a `GuardJoin`
+/// dropped without `.join()` panics. The §Verifier-one-step-removed(b)
+/// recurrence one lifecycle level up — `#[must_use]` cannot catch
+/// `let (g, _) = …`, so the linear token's Drop is the runtime gate.
+#[test]
+#[should_panic(expected = "bug_023")]
+fn dropped_guard_join_panics() {
+    let shutdown = rio_common::signal::Token::new();
+    let main = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("main runtime");
+    // The `_` suppression is THE evasion the Drop-panic exists to
+    // close — axis-6 plant, here driven against the real spawn.
+    #[allow(clippy::no_effect_underscore_binding)]
+    let (_g, _) = rio_controller::guard::spawn(
+        main.handle().clone(),
+        Arc::new(AtomicBool::new(true)),
+        rio_controller::guard::GuardConfig {
+            health_addr: ([127, 0, 0, 1], 0).into(),
+            ..Default::default()
+        },
+        shutdown.clone(),
+    );
+    shutdown.cancel();
+    // GuardJoin drops here → panic("… bug_023 …").
+}
+
 // r[verify sys.epilogue.drain]
 #[tokio::test(flavor = "multi_thread")]
-async fn w10_as_shutdown_release_lands_before_guard_runtime_drops() {
+async fn w10_as_process_join_gates_holder_clear() {
     let (client, mock) = MockApiServer::new();
     let shutdown = rio_common::signal::Token::new();
-    let guard = rio_controller::guard::spawn(
+    let (guard, guard_join) = rio_controller::guard::spawn(
         tokio::runtime::Handle::current(),
         Arc::new(AtomicBool::new(true)),
         rio_controller::guard::GuardConfig {
@@ -402,21 +431,23 @@ async fn w10_as_shutdown_release_lands_before_guard_runtime_drops() {
     // epilogue — the graceful-release step_down() PATCH.
     shutdown.cancel();
 
-    // The law (sys.epilogue.drain): the epilogue EXECUTES before the
-    // guard runtime drops — the lease record shows the release. A
-    // discarded epilogue leaves holder = the dead pod, and the
-    // successor's acquire path waits out STEAL_AFTER (~19s) instead of
-    // one tick: the bug_118 red. Budget: the host-side drain bound the
-    // guard root drains under, plus polling slack.
-    assert!(
-        became_true(
-            || mock.holder().is_none(),
-            rio_lease::SHUTDOWN_EPILOGUE_BUDGET + Duration::from_secs(2)
-        )
-        .await,
-        "the lease record must show the shutdown release (holder cleared): \
-         the guard runtime dropped the in-flight step_down PATCH — \
-         holder still {:?}",
-        mock.holder()
+    // The law (sys.epilogue.drain) at the PROCESS level (bug_023):
+    // `GuardJoin::join()` returns only after the guard root's drain
+    // state completes — the lease record shows the release
+    // SYNCHRONOUSLY at the join, no polling. Pre-fix the W10-AS test
+    // polled `holder().is_none()` from a tokio runtime that stayed
+    // alive — it verified the drain protocol, not that the process
+    // owner WAITS for it. spawn_blocking so the multi_thread runtime
+    // keeps serving the mock apiserver while the rio-guard thread
+    // drains.
+    tokio::task::spawn_blocking(move || guard_join.join())
+        .await
+        .expect("the rio-guard thread panicked during the epilogue drain");
+    assert_eq!(
+        mock.holder(),
+        None,
+        "GuardJoin::join() returned before the shutdown release landed — \
+         the process owner would exit with the lease still naming the dead pod \
+         (the bug_023 ~19s STEAL_AFTER tax)"
     );
 }

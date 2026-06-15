@@ -2443,7 +2443,7 @@ pub(crate) mod tests {
     async fn windowed_walk_keeps_the_main_domain_schedulable() {
         use std::time::Duration;
         let shutdown = rio_common::signal::Token::new();
-        let guard = crate::guard::spawn(
+        let (guard, guard_join) = crate::guard::spawn(
             tokio::runtime::Handle::current(),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             crate::guard::GuardConfig {
@@ -2488,6 +2488,12 @@ pub(crate) mod tests {
         let skew = guard.main_skew();
         let stalls = guard.main_stalls();
         shutdown.cancel();
+        // Process↔thread join (bug_023): the guard root has no
+        // adopted epilogue here, so the join is immediate; the
+        // GuardJoin Drop-panic is the discharge enforcement.
+        tokio::task::spawn_blocking(move || guard_join.join())
+            .await
+            .expect("rio-guard thread panicked");
         assert_eq!(
             stalls, 0,
             "zero stall episodes across {walks} windowed walks (the \

@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use rio_controller::guard::{GuardConfig, spawn};
+use rio_controller::guard::{GuardConfig, GuardJoin, spawn};
 
 /// Plain-TCP HTTP/1.1 GET from the TEST thread (never a runtime under
 /// test), so the probe cannot be descheduled by the stall it measures.
@@ -67,6 +67,7 @@ fn guard_on_stallable_main(
     rio_controller::guard::GuardHandle,
     std::net::SocketAddr,
     rio_common::signal::Token,
+    GuardJoin,
 ) {
     let main_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -75,7 +76,7 @@ fn guard_on_stallable_main(
         .expect("main runtime");
     let shutdown = rio_common::signal::Token::new();
     let addr = cfg.health_addr;
-    let guard = spawn(main_rt.handle().clone(), ready, cfg, shutdown.clone());
+    let (guard, guard_join) = spawn(main_rt.handle().clone(), ready, cfg, shutdown.clone());
     // Wait for the guard's listener (bound on the guard thread).
     let t0 = Instant::now();
     loop {
@@ -88,7 +89,16 @@ fn guard_on_stallable_main(
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    (main_rt, guard, addr, shutdown)
+    (main_rt, guard, addr, shutdown, guard_join)
+}
+
+/// Process↔thread join (bug_023): cancel + join. The W9/W10 tests
+/// drive the guard mid-stream and never adopted an epilogue, so the
+/// join is immediate; the GuardJoin Drop-panic forces every test to
+/// discharge it explicitly.
+fn shut_guard(shutdown: rio_common::signal::Token, guard_join: GuardJoin) {
+    shutdown.cancel();
+    guard_join.join();
 }
 
 fn free_local_addr() -> std::net::SocketAddr {
@@ -118,7 +128,7 @@ fn w9_aj_guard_serves_liveness_and_sheds_readiness_during_main_stall() {
         stall_threshold: Duration::from_millis(400),
         ready_probe_budget: Duration::from_millis(300),
     };
-    let (main_rt, guard, addr, _shutdown) = guard_on_stallable_main(cfg, ready.clone());
+    let (main_rt, guard, addr, shutdown, guard_join) = guard_on_stallable_main(cfg, ready.clone());
 
     // Pre-ready: /healthz 200, /readyz 503 (ready-gates-connect).
     let (_, h) = get_http(addr, "/healthz", Duration::from_secs(1)).expect("healthz pre-ready");
@@ -210,6 +220,7 @@ fn w9_aj_guard_serves_liveness_and_sheds_readiness_during_main_stall() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    shut_guard(shutdown, guard_join);
 }
 
 #[test]
@@ -222,7 +233,7 @@ fn w9_ak_stall_counter_and_capture_fire_past_threshold() {
         stall_threshold: Duration::from_millis(300),
         ready_probe_budget: Duration::from_millis(200),
     };
-    let (main_rt, guard, _addr, _shutdown) = guard_on_stallable_main(cfg, ready);
+    let (main_rt, guard, _addr, shutdown, guard_join) = guard_on_stallable_main(cfg, ready);
     assert_eq!(
         guard.main_stalls(),
         0,
@@ -271,6 +282,7 @@ fn w9_ak_stall_counter_and_capture_fire_past_threshold() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    shut_guard(shutdown, guard_join);
 }
 
 /// W10-AT (wiring face): one sustained guard-domain starvation episode
@@ -288,7 +300,7 @@ fn w10_at_guard_domain_counts_episodes_not_late_ticks() {
         stall_threshold: Duration::from_millis(300),
         ready_probe_budget: Duration::from_millis(200),
     };
-    let (_main_rt, guard, _addr, _shutdown) = guard_on_stallable_main(cfg, ready);
+    let (_main_rt, guard, _addr, shutdown, guard_join) = guard_on_stallable_main(cfg, ready);
     assert_eq!(guard.guard_stalls(), 0, "no episodes on a healthy guard");
 
     // ONE sustained partial-starvation episode on the GUARD runtime:
@@ -331,4 +343,5 @@ fn w10_at_guard_domain_counts_episodes_not_late_ticks() {
         "one sustained starvation episode = one increment (per-late-tick \
          counting is the merged_bug_003 anti-shape)"
     );
+    shut_guard(shutdown, guard_join);
 }

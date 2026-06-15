@@ -316,19 +316,82 @@ struct ReadyState {
     budget: Duration,
 }
 
+/// The guard thread's LINEAR join token (the process↔thread axis;
+/// bug_023). [`spawn`] returns `(GuardHandle, GuardJoin)`: the
+/// clonable atomics handle is split from the move-only join token so
+/// the process owner CANNOT exit without explicitly disposing of the
+/// thread. `#[must_use]` alone does NOT catch `let (g, _) = …`
+/// (verified on stable; `_` suppresses the lint), so [`Self::join`] is
+/// the only discharge and the [`Drop`] impl panics on any other path —
+/// the runtime enforcement; the W10-AU `PROCESS_JOIN_FORMS` census in
+/// `tests/guard_epilogue.rs` is the static one.
+#[must_use = "the process owner MUST GuardJoin::join() after the working \
+              domain drains; a dropped token is the bug_023 shape"]
+pub struct GuardJoin {
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl GuardJoin {
+    /// Block until the guard thread exits — bounded: the root drains
+    /// every adopted epilogue under each handle's own budget before it
+    /// returns (the lease loop's is
+    /// [`rio_lease::SHUTDOWN_EPILOGUE_BUDGET`], whose derivation from
+    /// the renew constants is the `const_assert!` at
+    /// `rio-lease/src/lib.rs:160`). Call AFTER the cancellation token
+    /// fires and the working domain's drains return; calling before
+    /// cancellation deadlocks (the root never reaches the drain
+    /// state).
+    // r[impl sys.epilogue.drain]
+    pub fn join(mut self) {
+        if let Err(panic) = self
+            .thread
+            .take()
+            .expect("GuardJoin::join consumes the token exactly once")
+            .join()
+        {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+impl Drop for GuardJoin {
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            // The `take()` in `join()` is the only path that empties
+            // `thread`; reaching here with it populated means the
+            // process owner returned without joining — the guard
+            // thread is mid-`epilogue.drain()` and process exit will
+            // abort the in-flight `step_down()` PATCH, leaving the
+            // dead pod holding the lease the full ~19s STEAL_AFTER.
+            // Panic is bounded-safe: we are already on the
+            // process-exit path; an unwind here turns a silent lease
+            // hold into a loud crash with a stack the next reviewer
+            // can read.
+            panic!(
+                "GuardJoin dropped without .join() — bug_023: the process owner \
+                 returned without joining the rio-guard thread; the in-flight \
+                 lease step_down() PATCH would be aborted by process exit"
+            );
+        }
+    }
+}
+
 /// Spawn the guard domain: one OS thread (`rio-guard`) driving a
 /// `current_thread` runtime that hosts the health server and the skew
 /// sentinel. The lease loop joins via [`GuardHandle::spawn_lease`].
 ///
 /// `main` is the WORKING domain's handle (probe target); `ready` is
-/// the readiness flag main.rs flips after `connect_forever`.
+/// the readiness flag main.rs flips after `connect_forever`. Returns
+/// the clonable [`GuardHandle`] and the linear [`GuardJoin`] token —
+/// the process owner MUST `.join()` the token after the working
+/// domain drains (`sys.epilogue.drain`).
 // r[impl sys.guard.domain-isolation]
 pub fn spawn(
     main: tokio::runtime::Handle,
     ready: Arc<AtomicBool>,
     cfg: GuardConfig,
     shutdown: rio_common::signal::Token,
-) -> GuardHandle {
+) -> (GuardHandle, GuardJoin) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .thread_name("rio-guard")
@@ -345,7 +408,7 @@ pub fn spawn(
     };
     let h = handle.clone();
     let thread_shutdown = shutdown.clone();
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("rio-guard".into())
         .spawn(move || {
             rt.block_on(async move {
@@ -413,7 +476,12 @@ pub fn spawn(
             });
         })
         .expect("spawning the rio-guard thread cannot fail at boot");
-    handle
+    (
+        handle,
+        GuardJoin {
+            thread: Some(thread),
+        },
+    )
 }
 
 /// Readiness: 503 until the dependency flag flips, then 200 iff the
@@ -728,13 +796,20 @@ mod tests {
             !table.is_empty() && !table.starts_with("<thread table unavailable"),
             "capture failed: {table}"
         );
-        // Every row is `tid comm state` — tid numeric, state one char+.
+        // Every row is `tid comm state` — tid numeric, comm nonempty,
+        // state exactly one char. Anchored from the RIGHT (bug_011):
+        // comm may contain spaces (`prctl(PR_SET_NAME, "my thread")`),
+        // so `splitn(3, ' ')` cannot isolate the state token; the
+        // production parse already anchors on `rfind(')')` and the
+        // smoke test mirrors that with `rsplit_once(' ')`.
         for row in table.split("; ").filter(|r| !r.starts_with('<')) {
-            let mut parts = row.splitn(3, ' ');
-            let tid = parts.next().expect("tid");
+            let (head, state) = row
+                .rsplit_once(' ')
+                .unwrap_or_else(|| panic!("state: {row}"));
+            let (tid, comm) = head.split_once(' ').unwrap_or((head, ""));
             assert!(tid.chars().all(|c| c.is_ascii_digit()), "tid: {row}");
-            assert!(parts.next().is_some(), "comm: {row}");
-            assert!(parts.next().is_some(), "state: {row}");
+            assert!(!comm.is_empty(), "comm: {row}");
+            assert_eq!(state.len(), 1, "state one char: {row}");
         }
     }
 

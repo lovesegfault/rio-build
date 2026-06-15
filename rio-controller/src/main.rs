@@ -81,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
     // kill). Cross-domain state is lock-free only — the census lives
     // in the guard module doc.
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let guard = rio_controller::guard::spawn(
+    let (guard, guard_join) = rio_controller::guard::spawn(
         tokio::runtime::Handle::current(),
         ready.clone(),
         rio_controller::guard::GuardConfig {
@@ -429,6 +429,16 @@ async fn main() -> anyhow::Result<()> {
     // silent-swallow), Ok-exits wait for sibling (no half-drained
     // state on shutdown).
     tokio::join!(pool_controller, cs_controller);
+
+    // Process↔thread join (sys.epilogue.drain; bug_023): the guard
+    // root drains the lease step_down() bounded by
+    // SHUTDOWN_EPILOGUE_BUDGET, so this join is itself bounded —
+    // bug_118 one lifecycle level up. spawn_blocking so the
+    // multi_thread runtime keeps polling (the otel guard's flush etc.)
+    // while the rio-guard thread drains.
+    tokio::task::spawn_blocking(move || guard_join.join())
+        .await
+        .expect("the rio-guard thread panicked during the epilogue drain");
 
     info!("controller shutting down");
     Ok(())
