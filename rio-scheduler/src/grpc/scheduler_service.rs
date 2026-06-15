@@ -466,18 +466,22 @@ impl SchedulerService for SchedulerGrpc {
 
     /// Stream a stored derivation-execution log for a build the caller
     /// owns (`rio log`, and the client's failure replay after a
-    /// fail-fast). Implemented in a follow-up change (the scheduler only
-    /// starts emitting the culprit fields the failure replay needs then);
-    /// until that lands, callers get UNIMPLEMENTED.
+    /// fail-fast). Tenant scoping, execution resolution and the
+    /// server-side tail cursor live in `grpc/derivation_log.rs`; the
+    /// byte-serving body is shared with `AdminService.GetDerivationLogs`.
     #[instrument(skip(self, request), fields(rpc = "GetDerivationLog"))]
     async fn get_derivation_log(
         &self,
         request: Request<rio_proto::scheduler::GetDerivationLogRequest>,
     ) -> Result<Response<Self::GetDerivationLogStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        Err(Status::unimplemented(
-            "GetDerivationLog is not implemented yet",
-        ))
+        self.ensure_leader()?;
+        // r[impl sched.tenant.authz+2]
+        let caller_tenant = self.require_tenant(&request).await?.map(|(sub, _)| sub);
+        let req = request.into_inner();
+        super::derivation_log::serve(self, caller_tenant, req)
+            .await
+            .map(Response::new)
     }
 
     // r[impl sched.tenant.resolve+2]

@@ -458,6 +458,9 @@ async fn main() -> anyhow::Result<()> {
     let grpc_service = SchedulerGrpc::with_log_buffers(
         actor.clone(),
         Arc::clone(&log_buffers),
+        // Same S3 client/bucket pair the AdminService gets below —
+        // SchedulerService.GetDerivationLog reads stored logs through it.
+        admin_s3.clone(),
         db,
         Arc::clone(&is_leader_for_grpc),
         Arc::clone(&generation),

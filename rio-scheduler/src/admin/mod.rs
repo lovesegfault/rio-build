@@ -68,7 +68,7 @@ mod builds;
 mod executors;
 mod gc;
 mod graph;
-mod logs;
+pub(crate) mod logs;
 mod sla;
 mod spawn_intents;
 mod tenants;

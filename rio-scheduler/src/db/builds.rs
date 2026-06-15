@@ -279,4 +279,88 @@ impl SchedulerDb {
 
         Ok(())
     }
+
+    // ── GetDerivationLog resolution queries ─────────────────────────────
+    //
+    // Tenant-facing log access (r[sched.log.tenant-scoped]): every query
+    // below either anchors on a build the caller owns or filters by the
+    // caller's tenant, so log content can never be resolved through
+    // another tenant's builds. Runtime-checked queries (read path, same
+    // style as `list_builds`).
+
+    /// `builds.tenant_id` for `build_id`. Outer `None` = no such build;
+    /// inner `None` = single-tenant/dev build with no tenant recorded.
+    pub(crate) async fn build_tenant(
+        &self,
+        build_id: Uuid,
+    ) -> Result<Option<Option<Uuid>>, sqlx::Error> {
+        sqlx::query_scalar("SELECT tenant_id FROM builds WHERE build_id = $1")
+            .bind(build_id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    /// The execution recorded for (`build_id`, `drv_path`) on
+    /// `build_derivations`. Outer `None` = the derivation is not part of
+    /// that build; inner `None` = part of the build but no execution was
+    /// observed for it (cache hit, never dispatched, fail-fast).
+    pub(crate) async fn build_drv_exec(
+        &self,
+        build_id: Uuid,
+        drv_path: &str,
+    ) -> Result<Option<Option<Uuid>>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT bd.exec_id FROM build_derivations bd \
+             JOIN derivations d ON d.derivation_id = bd.derivation_id \
+             WHERE bd.build_id = $1 AND d.drv_path = $2",
+        )
+        .bind(build_id)
+        .bind(drv_path)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Latest execution of `drv_path` among builds owned by `tenant`
+    /// (`None` tenant = single-tenant mode, no filter). UUIDv7 ordering
+    /// = newest dispatch. Uses `derivations_drv_path_idx` (M_074).
+    pub(crate) async fn latest_exec_for_drv(
+        &self,
+        drv_path: &str,
+        tenant: Option<Uuid>,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT bd.exec_id FROM build_derivations bd \
+             JOIN builds b ON b.build_id = bd.build_id \
+             JOIN derivations d ON d.derivation_id = bd.derivation_id \
+             WHERE d.drv_path = $1 AND bd.exec_id IS NOT NULL \
+               AND ($2::uuid IS NULL OR b.tenant_id = $2) \
+             ORDER BY bd.exec_id DESC LIMIT 1",
+        )
+        .bind(drv_path)
+        .bind(tenant)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Whether `exec_id` is attributable to a build owned by `tenant`
+    /// (`None` tenant = single-tenant mode, always attributable if the
+    /// execution is recorded at all). Uses `build_derivations_exec_idx`
+    /// (M_075).
+    pub(crate) async fn exec_attributable(
+        &self,
+        exec_id: Uuid,
+        tenant: Option<Uuid>,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM build_derivations bd \
+                 JOIN builds b ON b.build_id = bd.build_id \
+                 WHERE bd.exec_id = $1 \
+                   AND ($2::uuid IS NULL OR b.tenant_id = $2))",
+        )
+        .bind(exec_id)
+        .bind(tenant)
+        .fetch_one(&self.pool)
+        .await
+    }
 }

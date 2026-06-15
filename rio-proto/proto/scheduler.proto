@@ -42,9 +42,12 @@ service SchedulerService {
 }
 
 message GetDerivationLogRequest {
-  string build_id = 1;          // A build owned by the caller (ownership anchor)
-  string derivation_path = 2;   // .drv path within that build (e.g. BuildFailed.culprit_derivation)
-  string exec_id = 3;           // Execution to pin (e.g. culprit_exec_id); empty = latest stored execution
+  // A build owned by the caller, as the ownership anchor. Empty = no pin:
+  // the scheduler resolves the most recent execution of the derivation
+  // among the caller's own builds (`rio log <drv>` without --build).
+  string build_id = 1;
+  string derivation_path = 2;   // .drv path (e.g. BuildFailed.culprit_derivation)
+  string exec_id = 3;           // Execution to pin (e.g. culprit_exec_id); empty = latest resolvable execution
   // Serve only the last N lines (server computes the start cursor from the
   // stored line span). 0 = the full log.
   uint32 tail_lines = 4;

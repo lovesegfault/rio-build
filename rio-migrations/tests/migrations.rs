@@ -51,10 +51,14 @@ async fn concurrent_migrations_no_deadlock() {
     .expect("a replica failed to migrate");
     let _ = r;
 
-    // CONCURRENTLY indexes from 022 exist AND are valid (CIC leaves
-    // an INVALID shell on failure; IF NOT EXISTS would then no-op
-    // the retry — assert validity, not just presence).
-    for idx in ["builds_keyset_idx"] {
+    // CONCURRENTLY indexes (022, 074, 075) exist AND are valid (CIC
+    // leaves an INVALID shell on failure; IF NOT EXISTS would then
+    // no-op the retry — assert validity, not just presence).
+    for idx in [
+        "builds_keyset_idx",
+        "derivations_drv_path_idx",
+        "build_derivations_exec_idx",
+    ] {
         let valid: Option<bool> = sqlx::query_scalar(
             "SELECT i.indisvalid \
              FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid \
@@ -286,10 +290,12 @@ fn migration_checksums_frozen() {
         // that flag on, the reverse check below ("PINNED lists
         // migration v but migrations/ has no such file") is the ONLY
         // guard against renumbering an applied migration into a
-        // silent re-apply. Next free migration number: 074.
+        // silent re-apply. Next free migration number: 076.
         (71, "bfcddc6f3a994e2f6467162ddb95d6ff41e8a2e2f7dab0f87e84c20bbedd8ed000e7182db0fb26c9da0e5766559d7e30"),
         (72, "b2054c16396b78930c134581423174fefb8583e2834a8e4be11104d2590798baece42ee162ce27c4b90c68e2717b5d95"),
         (73, "0e8877cc4ad73afc0d417acce07e3a52e43195ef8808177017694a4c913b1f7f50a35e359af16bed4c407dfdcd677f96"),
+        (74, "8388ff914373f4eec49478b58e29ab99d73e523eab6d1f075594be87dcac5951b56a51cddb7fdb116a027b9715b40af1"),
+        (75, "a3fe3f81a2d7653c4caabbaa5e9a16fbf95bc108912453a1897340e86adfddc8a849ea2845a7b118c79e859bff106235"),
     ];
 
     let pinned: std::collections::HashMap<i64, &str> = PINNED.iter().copied().collect();

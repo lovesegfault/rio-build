@@ -11,6 +11,7 @@
 //! changes no longer conflict with heartbeat/stream-dispatch changes.
 
 pub(crate) mod actor_guards;
+mod derivation_log;
 mod digest_submit;
 mod executor_service;
 mod paginate;
@@ -46,10 +47,16 @@ pub struct SchedulerGrpc {
     pub(super) actor: ActorHandle,
     /// Per-derivation log ring buffers. Written directly by the
     /// BuildExecution recv task (bypasses the actor), read by
-    /// AdminService.GetDerivationLogs and drained by the S3 flusher on
+    /// AdminService.GetDerivationLogs / SchedulerService.GetDerivationLog
+    /// and drained by the S3 flusher on
     /// completion. `Arc` because `SchedulerGrpc` is `Clone`d per-connection
     /// and all handlers + the spawned recv tasks need the same buffers.
     pub(super) log_buffers: Arc<LogBuffers>,
+    /// S3 client + bucket for stored-log reads (GetDerivationLog). Same
+    /// pair the AdminService and the flusher use; `None` when
+    /// `RIO_LOG_S3_BUCKET` is unset — only ring-buffer-resident logs are
+    /// then servable.
+    pub(super) s3: Option<(aws_sdk_s3::Client, String)>,
     /// DB handle for tenant resolve / jti revocation / WatchBuild
     /// event-log replay. `Option` so `new_for_tests` can skip it
     /// (None → broadcast-only, no replay, no tenant resolve).
@@ -105,6 +112,7 @@ impl SchedulerGrpc {
         Self {
             actor,
             log_buffers: Arc::new(LogBuffers::new()),
+            s3: None,
             db: None,
             is_leader: Arc::new(AtomicBool::new(true)),
             generation: Arc::new(AtomicU64::new(1)),
@@ -121,6 +129,7 @@ impl SchedulerGrpc {
         Self {
             actor,
             log_buffers: Arc::new(LogBuffers::new()),
+            s3: None,
             db: Some(SchedulerDb::new(pool)),
             is_leader: Arc::new(AtomicBool::new(true)),
             generation: Arc::new(AtomicU64::new(1)),
@@ -140,9 +149,13 @@ impl SchedulerGrpc {
     /// `jwt_mode`: whether a JWT pubkey is configured (drives
     /// `require_tenant`). `hmac_key`: assignment-HMAC key, reused as
     /// the executor-identity verifier (drives `require_executor`).
+    /// `s3`: stored-log client + bucket for `GetDerivationLog` (the same
+    /// pair handed to the AdminService; `None` = ring-buffer-only logs).
+    #[allow(clippy::too_many_arguments)]
     pub fn with_log_buffers(
         actor: ActorHandle,
         log_buffers: Arc<LogBuffers>,
+        s3: Option<(aws_sdk_s3::Client, String)>,
         db: SchedulerDb,
         is_leader: Arc<AtomicBool>,
         generation: Arc<AtomicU64>,
@@ -152,6 +165,7 @@ impl SchedulerGrpc {
         Self {
             actor,
             log_buffers,
+            s3,
             db: Some(db),
             is_leader,
             generation,
