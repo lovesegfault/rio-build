@@ -44,6 +44,10 @@ const JWT_SEED: [u8; 32] = [0x07; 32];
 /// (the fetch test's output seed) need a real assignment token.
 const HMAC_KEY: &[u8] = b"e2e-cluster-hmac-key-32-bytes!!!";
 
+/// Name of the cluster narinfo signing key the in-process store signs
+/// with — what the daemon-import tests assert rides GetPath.
+pub const SIGNING_KEY_NAME: &str = "rio-e2e-1";
+
 fn tenant_jwt(sub: uuid::Uuid) -> String {
     let key = ed25519_dalek::SigningKey::from_bytes(&JWT_SEED);
     rio_auth::jwt::sign(
@@ -121,9 +125,17 @@ impl TestCluster {
         // tenant JWT, so its source uploads exercise the
         // PutPathChunked tenant-JWT rung, not dev mode.
         let hmac = Arc::new(rio_auth::hmac::HmacVerifier::from_key(HMAC_KEY.to_vec()));
+        // Cluster signing key: production stores sign narinfo on upload;
+        // the daemon-import tests assert those signatures ride GetPath
+        // into the local-store import.
+        let signer = rio_store::signing::TenantSigner::new(
+            rio_store::signing::Signer::from_seed(SIGNING_KEY_NAME, &[0x5A; 32]),
+            db.pool.clone(),
+        );
         let store_service = StoreServiceImpl::new(db.pool.clone())
             .with_chunk_cache(Arc::clone(&cache))
-            .with_hmac_verifier(Arc::clone(&hmac));
+            .with_hmac_verifier(Arc::clone(&hmac))
+            .with_signer(signer);
         let chunk_service = ChunkServiceImpl::new(
             db.pool.clone(),
             Some(Arc::clone(&cache)),

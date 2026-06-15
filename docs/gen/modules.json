@@ -80,12 +80,17 @@
     {
       "path": "fetch.rs",
       "depth": 0,
-      "doc": "`--fetch` / `--out-link`: materialize build outputs through the"
+      "doc": "Client-CAS materialization of build outputs through the read path,"
     },
     {
       "path": "framing.rs",
       "depth": 0,
       "doc": "Length-delimited proto frames over an `AsyncRead`/`AsyncWrite` fd"
+    },
+    {
+      "path": "import.rs",
+      "depth": 0,
+      "doc": "Default fetch path: import completed build outputs into the local"
     },
     {
       "path": "lib.rs",

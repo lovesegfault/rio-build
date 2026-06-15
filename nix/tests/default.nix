@@ -526,7 +526,7 @@ in
   # wiring point per P0341 convention — scenario header maps subtests
   # to rules.
   # r[verify bc.submit.all-acked]
-  # r[verify bc.fetch.narhash-verify]
+  # r[verify bc.fetch.narhash-verify+2]
   # r[verify store.drv.getpath-fallback]
   # r[verify bc.render.stdout-results]
   # r[verify bc.render.plain-default]

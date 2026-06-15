@@ -19373,6 +19373,10 @@
           "packageId": "tokio-stream"
         },
         {
+          "name": "tokio-util",
+          "packageId": "tokio-util"
+        },
+        {
           "name": "tonic",
           "packageId": "tonic"
         },
@@ -25829,6 +25833,7 @@
         "codec",
         "default",
         "io",
+        "io-util",
         "slab",
         "time"
       ],

@@ -120,7 +120,7 @@ sync_wrapper = { version = "1", default-features = false, features = ["futures"]
 thiserror = { version = "2" }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net", "sync"] }
-tokio-util = { version = "0.7", features = ["codec", "io", "time"] }
+tokio-util = { version = "0.7", features = ["codec", "io-util", "time"] }
 toml = { version = "1" }
 toml_datetime = { version = "1", features = ["serde"] }
 toml_parser = { version = "1" }
@@ -241,7 +241,7 @@ sync_wrapper = { version = "1", default-features = false, features = ["futures"]
 thiserror = { version = "2" }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net", "sync"] }
-tokio-util = { version = "0.7", features = ["codec", "io", "time"] }
+tokio-util = { version = "0.7", features = ["codec", "io-util", "time"] }
 toml = { version = "1" }
 toml_datetime = { version = "1", features = ["serde"] }
 toml_parser = { version = "1" }
