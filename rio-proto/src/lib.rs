@@ -78,6 +78,7 @@ pub const DISK_FULL_MSG: &str = "disk full during build";
 pub const SPAWN_INTENTS_DEFAULT_PAGE: u32 = 2048;
 
 pub mod castore_util;
+pub mod chunk_reject;
 pub mod client;
 pub mod derivation_util;
 pub mod interceptor;

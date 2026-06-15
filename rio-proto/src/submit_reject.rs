@@ -27,6 +27,13 @@ pub fn missing_drv_digests_message(missing_hex: &[String]) -> String {
 /// AROUND the list, but the list encoding itself is pinned by
 /// [`missing_drv_digests_message`] and the round-trip test.
 pub fn parse_missing_drv_digests(message: &str) -> Vec<[u8; 32]> {
+    parse_hex_digest_tokens(message)
+}
+
+/// The shared token scanner behind [`parse_missing_drv_digests`] and
+/// [`crate::chunk_reject::parse_missing_chunk_digests`] — both reject
+/// contracts encode their digest list as lowercase 64-char hex tokens.
+pub(crate) fn parse_hex_digest_tokens(message: &str) -> Vec<[u8; 32]> {
     let mut out = Vec::new();
     let bytes = message.as_bytes();
     let is_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
