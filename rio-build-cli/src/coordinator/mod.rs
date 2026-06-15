@@ -419,10 +419,14 @@ impl Coordinator {
                         if e.fatal {
                             bail!("eval parent failed: {}", e.message);
                         }
-                        if e.attr.is_empty() {
-                            // Non-attr fault (e.g. a worker crash whose
-                            // attr was re-queued): visibility only, no
-                            // attr is lost.
+                        // The empty attr is a real WorkItem in zero-installable
+                        // file mode (the file's top-level value), so an Error
+                        // naming it while it is still expected is that attr's
+                        // eval failure — otherwise the build would wait on it
+                        // forever. Only an empty attr that was never requested
+                        // is a non-attr fault (e.g. a worker crash whose attr
+                        // was re-queued): visibility only, no attr is lost.
+                        if e.attr.is_empty() && !expected.contains("") {
                             warn!(error = %e.message, "eval parent reported a non-attr fault");
                             continue;
                         }

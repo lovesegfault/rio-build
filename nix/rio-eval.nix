@@ -14,8 +14,10 @@
 # over a real socketpair — and asserts drvPath parity against the
 # stock pinned nix-cli, worker recycling (N=1 → fresh fork per attr,
 # identical results), crash injection (kill -9 a worker mid-eval →
-# the parent re-queues and completes), and attrset-installable
-# expansion (a checks-style attr fans out into per-child roots).
+# the parent re-queues and completes), attrset-installable
+# expansion (a checks-style attr fans out into per-child roots), and
+# nix-build-style file mode (-I lookup path, --arg/--argstr auto-args,
+# zero-attr default = the file's top-level value).
 {
   pkgs,
   lib,
@@ -259,9 +261,85 @@ let
         # vm-build-client flake leg's job; this smoke leg only checks the
         # eval-parent contract.
 
-        cp run1.json run2.json run3.json run4.json run5.json stock.json $TMPDIR/work/ 2>/dev/null || true
+        echo "== run 6: nix-build parity — -I lookup path, --arg/--argstr auto-args, zero-attr default"
+        # args.nix is an auto-called top-level function: <probe> resolves
+        # only through -I (NIX_PATH is unset in the sandbox), name comes
+        # from --argstr and the -tagged suffix from --arg. No --attrs:
+        # the harness submits the empty attr path (the file's top-level
+        # value), the coordinator's zero-installable default.
+        stock=$(nix-instantiate $flags --store "local?root=$TMPDIR/stock6" \
+          -I probe=$TMPDIR/work/probe-dir \
+          --arg tagged true --argstr name smoke-args-custom \
+          $TMPDIR/work/args.nix | sed 's/!.*$//')
+        echo "stock drvPath: $stock"
+        eval-harness \
+          --eval-parent ${rioEval}/bin/rio-eval \
+          --cas $TMPDIR/cas6 \
+          --file $TMPDIR/work/args.nix \
+          -I probe=$TMPDIR/work/probe-dir \
+          --arg tagged true --argstr name smoke-args-custom \
+          > run6.json
+        jq . run6.json
+        test "$(jq '.results | length' run6.json)" = 1
+        jq -e '.results[0].attr == ""' run6.json
+        got=$(jq -r '.results[0].root_drv_path' run6.json)
+        # The drv name proves both auto-args were honored; full parity
+        # against nix-instantiate proves the lookup-path resolution and
+        # the auto-call produced the identical derivation.
+        case "$got" in
+          *-smoke-args-custom-tagged.drv) ;;
+          *) echo "auto-args not honored: $got" >&2; exit 1 ;;
+        esac
+        if [ "$stock" != "$got" ]; then
+          echo "nix-build parity FAILED: stock=$stock rio-eval=$got" >&2
+          exit 1
+        fi
+        # The <probe> tree rode the frames as a SourceRoot.
+        test "$(jq '[.results[].source_roots] | add' run6.json)" -ge 1
+
+        echo "== run 7: zero-attr file mode on an attrset root — expands like nix-build default.nix"
+        # fixture.nix's top-level value is a plain attrset, so the empty
+        # attr expands into its derivation children. The child attrs must
+        # be plain names (no leading dot from the empty prefix) or the
+        # coordinator's WorkItems can never re-resolve.
+        eval-harness \
+          --eval-parent ${rioEval}/bin/rio-eval \
+          --cas $TMPDIR/cas7 \
+          --file $TMPDIR/work/fixture.nix \
+          > run7.json
+        jq . run7.json
+        test "$(jq '.eval_errors | length' run7.json)" = 0
+        test "$(jq '.results | length' run7.json)" = 3
+        for attr in hello world; do
+          stock=$(jq -r ".$attr" stock.json)
+          got=$(jq -r --arg a "$attr" '.results[] | select(.attr == $a) | .root_drv_path' run7.json)
+          if [ -z "$got" ] || [ "$stock" != "$got" ]; then
+            echo "zero-attr expansion parity FAILED for $attr: stock=$stock rio-eval=$got" >&2
+            exit 1
+          fi
+        done
+
+        echo "== run 8: eval error on the empty attr surfaces as that attr's failure"
+        # args.nix without -I (and no NIX_PATH in the sandbox) cannot
+        # resolve <probe>. The Error frame names the empty attr — the
+        # harness/coordinator must record it as the zero-attr WorkItem's
+        # eval failure, not an attr-less fault that leaves the build
+        # waiting forever.
+        eval-harness \
+          --eval-parent ${rioEval}/bin/rio-eval \
+          --cas $TMPDIR/cas8 \
+          --file $TMPDIR/work/args.nix \
+          --arg tagged true --argstr name smoke-args-custom \
+          > run8.json
+        jq . run8.json
+        test "$(jq '.results | length' run8.json)" = 0
+        test "$(jq '.eval_errors | length' run8.json)" = 1
+        jq -e '.eval_errors[0][0] == ""' run8.json
+        jq -e '.eval_errors[0][1] | test("probe")' run8.json
+
+        cp run1.json run2.json run3.json run4.json run5.json run6.json run7.json run8.json stock.json $TMPDIR/work/ 2>/dev/null || true
         mkdir -p $out
-        cp run1.json run2.json run3.json run4.json run5.json stock.json $out/
+        cp run1.json run2.json run3.json run4.json run5.json run6.json run7.json run8.json stock.json $out/
       '';
 in
 {

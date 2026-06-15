@@ -114,6 +114,21 @@ evaluation. For `.#checks` the entry matching the evaluating system is
 selected first --- a missing system entry surfaces as the zero-derivations
 error naming it.
 
+== Non-flake builds
+
+`-f`/`--file` evaluates a plain Nix file (or a directory containing
+`default.nix`) the way `nix-build` does: installables are attribute paths
+into the file's top-level value, and with no installables the top-level
+value itself is built (an attribute set expands into its derivation
+children, like `nix-build` without `-A`). `<nixpkgs>`-style lookup paths
+come from `NIX_PATH` or `-I`, and `--arg`/`--argstr` feed the file's
+top-level function.
+
+```bash
+rio build -f default.nix
+rio build -f release.nix pkgA pkgB --argstr version 1.2 -I nixpkgs=./nixpkgs
+```
+
 While the build runs, the client prints one status line per derivation event
 (`queued`, `building`, `built`, …) and finishes with the output paths.
 Pressing Ctrl-C cancels: the client cancels every build this invocation
@@ -171,10 +186,23 @@ rio build --cancel 01HV5...
       `PATH-2`, `PATH-3`, …). Implies `--fetch`. The link target is the CAS
       materialization --- the client has no `/nix/store` to link into.],
 
-    [`--eval-file PATH`],
-    [Evaluate attributes from a plain Nix file instead of a flake; the
-      installables become attribute paths into the file's top-level
-      attribute set. Mostly for tests and fixtures.],
+    [`-f PATH`, `--file PATH`],
+    [Evaluate a plain Nix file (or a directory containing `default.nix`)
+      instead of a flake, `nix-build` style: installables are attribute
+      paths into the file's top-level value, and with no installables the
+      top-level value itself is the build root.],
+
+    [`--arg NAME EXPR`],
+    [Pass the Nix expression `EXPR` as argument `NAME` to the file's
+      top-level function (file mode only; repeatable).],
+
+    [`--argstr NAME VALUE`],
+    [Pass the string `VALUE` as argument `NAME` to the file's top-level
+      function (file mode only; repeatable).],
+
+    [`-I PATH`, `--include PATH`],
+    [Add an entry to the angle-bracket lookup path (`<nixpkgs>`), taking
+      precedence over `NIX_PATH` (file mode only; repeatable).],
 
     [`--keep-going`],
     [Continue building independent derivations after a failure (the

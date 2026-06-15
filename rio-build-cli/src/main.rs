@@ -70,11 +70,27 @@ struct BuildArgs {
     #[arg(long)]
     detach: bool,
 
-    /// Evaluate attrs from a plain Nix file instead of a flake (the
-    /// installables become attr paths into the file's top-level
-    /// attrset). Mostly for tests and fixtures.
-    #[arg(long, value_name = "PATH")]
-    eval_file: Option<PathBuf>,
+    /// Evaluate a plain Nix file (or a directory containing
+    /// default.nix) instead of a flake, nix-build style: installables
+    /// are attr paths into its top-level value; with no installables
+    /// the top-level value itself is the build root.
+    #[arg(short = 'f', long, value_name = "PATH")]
+    file: Option<PathBuf>,
+
+    /// Pass the Nix expression EXPR as argument NAME to the file's
+    /// top-level function (file mode only, like nix-build --arg).
+    #[arg(long, num_args = 2, value_names = ["NAME", "EXPR"], requires = "file")]
+    arg: Vec<String>,
+
+    /// Pass the string VALUE as argument NAME to the file's top-level
+    /// function (file mode only, like nix-build --argstr).
+    #[arg(long, num_args = 2, value_names = ["NAME", "VALUE"], requires = "file")]
+    argstr: Vec<String>,
+
+    /// Add an entry to the angle-bracket lookup path (`<nixpkgs>`),
+    /// taking precedence over NIX_PATH (file mode only).
+    #[arg(short = 'I', long = "include", value_name = "PATH", requires = "file")]
+    include: Vec<String>,
 
     /// Continue building independent derivations after a failure.
     #[arg(long)]
@@ -173,8 +189,10 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
         .await;
     }
 
-    if args.installables.is_empty() {
-        bail!("nothing to build: pass at least one installable (or --attach/--cancel)");
+    // File mode with zero installables is nix-build's "build the
+    // file's top-level value" — eval_plan submits the empty attr path.
+    if args.installables.is_empty() && args.file.is_none() {
+        bail!("nothing to build: pass at least one installable, --file, or --attach/--cancel");
     }
     let Some(eval_parent) = &cfg.eval_parent else {
         bail!(
@@ -183,7 +201,17 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
         );
     };
 
-    let (parent_args, attrs) = eval_plan(&args.installables, args.eval_file.as_deref(), &cas_root)?;
+    let file_opts = FileEvalOpts {
+        args: &args.arg,
+        argstrs: &args.argstr,
+        includes: &args.include,
+    };
+    let (parent_args, attrs) = eval_plan(
+        &args.installables,
+        args.file.as_deref(),
+        file_opts,
+        &cas_root,
+    )?;
     // Under the TTY renderer, eval-parent stderr would land inside the
     // ephemeral region and corrupt it; pipe it and forward through the
     // renderer instead.
@@ -302,22 +330,53 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// nix-build-style evaluation flags forwarded to the eval parent in
+/// file mode (clap rejects them without `--file`).
+#[derive(Clone, Copy, Default)]
+struct FileEvalOpts<'a> {
+    /// `--arg NAME EXPR` pairs, flattened by clap (`num_args = 2`).
+    args: &'a [String],
+    /// `--argstr NAME VALUE` pairs, flattened by clap.
+    argstrs: &'a [String],
+    /// `-I` lookup-path entries.
+    includes: &'a [String],
+}
+
 /// Derive the eval-parent argv + the WorkItem attrs from the
-/// installables. File mode (`--eval-file`): installables are attr
-/// paths into the file's top-level attrset. Flake mode: every
+/// installables. File mode (`-f/--file`): installables are attr paths
+/// into the file's top-level value; none means the top-level value
+/// itself (the empty attr path, nix-build parity). Flake mode: every
 /// installable is `ref#fragment` (or a bare ref = default attr); all
 /// must share ONE flake ref — the eval parent locks one flake per
 /// invocation (ADR-024: lock flake + fetch inputs once, pre-fork).
 fn eval_plan(
     installables: &[String],
-    eval_file: Option<&std::path::Path>,
+    file: Option<&std::path::Path>,
+    file_opts: FileEvalOpts<'_>,
     cas_root: &std::path::Path,
 ) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let mut argv = vec!["--cas".to_string(), cas_root.display().to_string()];
-    if let Some(f) = eval_file {
+    if let Some(f) = file {
         argv.push("--file".into());
         argv.push(f.display().to_string());
-        return Ok((argv, installables.to_vec()));
+        for pair in file_opts.args.chunks(2) {
+            argv.push("--arg".into());
+            argv.extend(pair.iter().cloned());
+        }
+        for pair in file_opts.argstrs.chunks(2) {
+            argv.push("--argstr".into());
+            argv.extend(pair.iter().cloned());
+        }
+        for inc in file_opts.includes {
+            argv.push("-I".into());
+            argv.push(inc.clone());
+        }
+        let attrs = if installables.is_empty() {
+            vec![String::new()]
+        } else {
+            installables.to_vec()
+        };
+        return Ok((argv, attrs));
     }
     let mut flake_ref: Option<String> = None;
     let mut attrs = Vec::with_capacity(installables.len());
@@ -381,7 +440,8 @@ async fn finish(
 
 #[cfg(test)]
 mod tests {
-    use super::{eval_plan, nix_verbosity_env};
+    use super::{Cli, FileEvalOpts, eval_plan, nix_verbosity_env};
+    use clap::Parser;
     use std::path::Path;
     use tracing::level_filters::LevelFilter;
 
@@ -405,6 +465,7 @@ mod tests {
         let (argv, attrs) = eval_plan(
             &[".#hello".into(), ".#world".into(), ".".into()],
             None,
+            FileEvalOpts::default(),
             Path::new("/cas"),
         )
         .unwrap();
@@ -414,8 +475,13 @@ mod tests {
 
     #[test]
     fn eval_plan_rejects_mixed_flake_refs() {
-        let err =
-            eval_plan(&["./a#x".into(), "./b#y".into()], None, Path::new("/cas")).unwrap_err();
+        let err = eval_plan(
+            &["./a#x".into(), "./b#y".into()],
+            None,
+            FileEvalOpts::default(),
+            Path::new("/cas"),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("share one flake ref"));
     }
 
@@ -424,10 +490,74 @@ mod tests {
         let (argv, attrs) = eval_plan(
             &["pkgA".into(), "nested.pkgB".into()],
             Some(Path::new("/tmp/fixture.nix")),
+            FileEvalOpts::default(),
             Path::new("/cas"),
         )
         .unwrap();
         assert_eq!(argv, vec!["--cas", "/cas", "--file", "/tmp/fixture.nix"]);
         assert_eq!(attrs, vec!["pkgA", "nested.pkgB"]);
+    }
+
+    #[test]
+    fn eval_plan_file_mode_zero_installables_builds_top_level() {
+        let (argv, attrs) = eval_plan(
+            &[],
+            Some(Path::new("/tmp/default.nix")),
+            FileEvalOpts::default(),
+            Path::new("/cas"),
+        )
+        .unwrap();
+        assert_eq!(argv, vec!["--cas", "/cas", "--file", "/tmp/default.nix"]);
+        // The empty attr path is the file's top-level value.
+        assert_eq!(attrs, vec![String::new()]);
+    }
+
+    #[test]
+    fn eval_plan_file_mode_forwards_nix_build_flags() {
+        let arg = vec!["tagged".to_string(), "true".to_string()];
+        let argstr = vec!["name".to_string(), "custom".to_string()];
+        let include = vec!["probe=/tmp/probe".to_string()];
+        let (argv, _) = eval_plan(
+            &["pkgA".into()],
+            Some(Path::new("/tmp/fixture.nix")),
+            FileEvalOpts {
+                args: &arg,
+                argstrs: &argstr,
+                includes: &include,
+            },
+            Path::new("/cas"),
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "--cas",
+                "/cas",
+                "--file",
+                "/tmp/fixture.nix",
+                "--arg",
+                "tagged",
+                "true",
+                "--argstr",
+                "name",
+                "custom",
+                "-I",
+                "probe=/tmp/probe",
+            ]
+        );
+    }
+
+    #[test]
+    fn nix_build_flags_rejected_without_file() {
+        // --arg/--argstr/-I only make sense for the file's top-level
+        // function; in flake mode they must error, not be ignored.
+        for args in [
+            vec!["rio", "build", ".#hello", "--arg", "a", "1"],
+            vec!["rio", "build", ".#hello", "--argstr", "a", "v"],
+            vec!["rio", "build", ".#hello", "-I", "p=/tmp"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "accepted {args:?}");
+        }
+        assert!(Cli::try_parse_from(["rio", "build", "-f", "x.nix", "--argstr", "a", "v"]).is_ok());
     }
 }
