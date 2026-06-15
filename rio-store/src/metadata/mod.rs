@@ -51,7 +51,7 @@ pub(crate) mod upstreams;
 // `pub use chunked::*` etc.) so dead items in submodules
 // surface as `unused` instead of being silently exported.
 pub(crate) use chunked::{
-    PlaceholderToken, chunk_lists_for_paths, commit_chunked_output_in_conn,
+    PlaceholderToken, chunk_lists_for_paths, clear_chunk_presence, commit_chunked_output_in_conn,
     complete_manifest_chunked, delete_manifest_chunked_uploading, insert_path_tenant_in_conn,
     insert_path_tenant_skipping_deleted_in_tx, insert_pending_chunks, is_deleted_tenant_fk,
     lock_chunks_for_commit, lock_staged_chunks_for_commit, mark_chunks_uploaded,

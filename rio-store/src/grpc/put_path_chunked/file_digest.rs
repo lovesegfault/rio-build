@@ -75,7 +75,9 @@ pub(super) fn file_digest_mismatch(output: usize, claimed: &[u8; 32], actual: &[
 /// agreement, else refetch). `Err` is terminal for the RPC: a forged
 /// digest is `INVALID_ARGUMENT`; a chunk that disappeared since the
 /// walk (GC race / S3 fault) is `UNAVAILABLE` for the builder to
-/// retry, mirroring the commit-time presence-proof failure.
+/// retry, mirroring the commit-time presence-proof failure — and its
+/// `chunks` presence row is demoted so the retry's `HasChunks` answers
+/// honestly instead of repeating the skip that hit the miss.
 // r[impl store.integrity.verify-on-put+3]
 pub(super) async fn verify_deferred_runs(
     pool: &PgPool,
@@ -101,7 +103,7 @@ pub(super) async fn verify_deferred_runs(
         // the bytes can arbitrate (the honest causes are a never-seen
         // digest or a chunking-parameter change; the forgery cause is
         // the poisoning attempt).
-        refetch_and_verify(backend, d.output, run, claimed).await?;
+        refetch_and_verify(pool, backend, d.output, run, claimed).await?;
     }
     Ok(())
 }
@@ -209,6 +211,7 @@ fn window_matches(window: &[ManifestEntry], claimed: &[([u8; 32], u32)]) -> bool
 /// memory), re-verify each body against its chunk digest, and require
 /// the whole-file BLAKE3 to equal the claimed digest.
 async fn refetch_and_verify(
+    pool: &PgPool,
     backend: &Arc<dyn ChunkBackend>,
     output: usize,
     run: &FileRun,
@@ -227,13 +230,30 @@ async fn refetch_and_verify(
             // The chunk was durable when `novel` was validated (or PUT
             // by this stream and confirmed); a miss now is the GC
             // race / S3 fault window — retryable, same shape as the
-            // commit-time presence-proof abort.
+            // commit-time presence-proof abort. The presence row is
+            // demoted so `HasChunks` stops claiming an object that is
+            // provably gone — without this, every retry trusts the
+            // same lie and skips the re-upload forever (the production
+            // GC-grace-vs-ack-TTL hole).
+            // r[impl store.chunk.has-chunks-durable]
             Ok(None) => {
+                let digest_hex = hex::encode(digest);
+                tracing::warn!(
+                    chunk = %digest_hex,
+                    "PutPathChunked: durable chunk has no backing object — clearing its \
+                     presence so the next upload streams it again"
+                );
                 metrics::counter!("rio_store_putpath_verify_unavailable_total").increment(1);
+                if let Err(e) = metadata::clear_chunk_presence(pool, &digest).await {
+                    // Best effort: the reject below already forces the
+                    // builder to retry; a failed demote only means the
+                    // next attempt may hit the same miss once more.
+                    tracing::warn!(chunk = %digest_hex, error = %e,
+                        "PutPathChunked: failed to clear presence for missing chunk");
+                }
                 return Err(Status::unavailable(format!(
-                    "PutPathChunked: chunk {} disappeared during file-digest \
-                     verification; retry",
-                    hex::encode(digest),
+                    "PutPathChunked: {}",
+                    rio_proto::chunk_reject::missing_chunk_digest_message(&digest_hex),
                 )));
             }
             Err(e) => {
