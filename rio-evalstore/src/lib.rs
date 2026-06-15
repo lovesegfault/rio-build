@@ -30,4 +30,4 @@ pub mod ingest;
 pub mod stats;
 pub mod store;
 
-pub use store::{CaMethod, DumpMethod, EvalStore, EvalStoreError};
+pub use store::{CaMethod, DumpMethod, EvalStore, EvalStoreError, source_root_key};

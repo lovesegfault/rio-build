@@ -282,6 +282,17 @@ pub fn ingest_tree_with_stats(
     pipeline::run(root, config)
 }
 
+/// Chunk an in-memory buffer with the same FastCDC parameters and
+/// blake3 keys as the tree ingest — one shared definition, so chunks
+/// produced from CAS-resident streamed sources (the coordinator's
+/// CAS-read upload path) dedup against chunks produced from origin
+/// re-reads and builder outputs. Returns the whole-buffer blake3 plus
+/// the chunk run (empty for an empty buffer).
+pub fn chunk_bytes(data: &[u8]) -> ([u8; 32], Vec<IngestChunk>) {
+    let out = pipeline::chunk_buf(data);
+    (out.digest, out.chunks)
+}
+
 /// A pre-walked tree shape: what a nix `SourceAccessor` saw, with each
 /// regular file's physical filesystem path. Produced by the C++ shim's
 /// accessor walk for filtered sources (git workdir flake `self`): the

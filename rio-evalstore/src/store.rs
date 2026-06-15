@@ -1727,6 +1727,48 @@ impl Drop for EvalStore {
     }
 }
 
+/// Stable dedup/ack key for one [`SourceRoot`](rio_proto::evaljob::SourceRoot).
+/// Shared between the eval-side per-worker dedup set and the
+/// coordinator's graph + cluster-ack keying — both sides must agree or
+/// a warm second run re-uploads.
+///
+/// Directory roots keep using the root Directory digest verbatim: it is
+/// already the cluster negotiation key (`HasDirectories`) and existing
+/// ack-table records are keyed by it. File and symlink roots have no
+/// Directory blob, so their key is a domain-separated blake3 over the
+/// store path plus the root identity (content digest + executable bit,
+/// or the symlink target). Including the store path keeps two distinct
+/// store paths with identical content from collapsing into one upload.
+///
+/// `None` = the message carries neither a usable `root_node` nor a
+/// 32-byte `dir_digest` (malformed frame; the coordinator rejects it).
+pub fn source_root_key(sr: &rio_proto::evaljob::SourceRoot) -> Option<[u8; 32]> {
+    use rio_proto::castore::root_node::Node;
+    match sr.root_node.as_ref().and_then(|r| r.node.as_ref()) {
+        Some(Node::File(f)) => {
+            let mut h = blake3::Hasher::new();
+            h.update(b"rio-src-file\0");
+            h.update(sr.store_path.as_bytes());
+            h.update(b"\0");
+            h.update(&f.digest);
+            h.update(&[u8::from(f.executable)]);
+            Some(*h.finalize().as_bytes())
+        }
+        Some(Node::Symlink(s)) => {
+            let mut h = blake3::Hasher::new();
+            h.update(b"rio-src-symlink\0");
+            h.update(sr.store_path.as_bytes());
+            h.update(b"\0");
+            h.update(&s.target);
+            Some(*h.finalize().as_bytes())
+        }
+        Some(Node::DirDigest(d)) => d.as_slice().try_into().ok(),
+        // Old workers omit root_node entirely; the only shape they ever
+        // sent is a directory root keyed by dir_digest.
+        None => sr.dir_digest.as_slice().try_into().ok(),
+    }
+}
+
 /// A resolved tree member (post `resolve` walk).
 #[derive(Debug, Clone)]
 enum Resolved {

@@ -188,9 +188,9 @@ enum Child {
 }
 
 /// Plane-2 result for one file.
-struct ChunkOutput {
-    digest: [u8; 32],
-    chunks: Vec<IngestChunk>,
+pub(super) struct ChunkOutput {
+    pub(super) digest: [u8; 32],
+    pub(super) chunks: Vec<IngestChunk>,
 }
 
 /// A read file's bytes plus its byte-budget charge. Both planes hold an
@@ -911,8 +911,9 @@ const _: () = assert!(FASTCDC_MAX_BYTES <= u32::MAX as usize);
 /// Plane 2 for one file: whole-file blake3 + FastCDC chunk list, same
 /// constants and call shape as rio-builder's fused output walk so chunks
 /// dedup across the builder and the eval store. Called by the chunk
-/// workers and, for stolen reads, inline by the spine.
-fn chunk_buf(data: &[u8]) -> ChunkOutput {
+/// workers and, for stolen reads, inline by the spine; re-exported via
+/// [`super::chunk_bytes`] for the coordinator's CAS-read upload path.
+pub(super) fn chunk_buf(data: &[u8]) -> ChunkOutput {
     let digest = *blake3::hash(data).as_bytes();
     let mut chunks = Vec::new();
     if !data.is_empty() {
