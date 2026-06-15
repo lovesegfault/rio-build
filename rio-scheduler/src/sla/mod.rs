@@ -151,6 +151,35 @@ pub fn cmp_f64_array<const N: usize>(a: &[f64; N], b: &[f64; N]) -> std::cmp::Or
     std::cmp::Ordering::Equal
 }
 
+#[cfg(kani)]
+mod cmp_f64_array_proofs {
+    use super::cmp_f64_array;
+
+    /// bug_025: [`cmp_f64_array`] is TOTAL — no panic over the full
+    /// f64 domain (NaN/±∞/±0/subnormals; the open-coded form's
+    /// `unwrap` would panic on NaN, and its `unwrap_or(Equal)` would
+    /// silently mis-order) — and ANTISYMMETRIC: swapping arguments
+    /// reverses the verdict, the law `sort_by` requires of its
+    /// comparator. Proof-local `K = 2`: distinguishes the
+    /// lexicographic tie-break (a single element would not), and the
+    /// `[f64; 3]` instance is the same loop one iteration longer
+    /// (CBMC cost is per-bit of the input domain — 384 bits at K=3
+    /// vs 256 here; the wave-r26 H-hazard fallback).
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn cmp_f64_array_is_total() {
+        const K: usize = 2;
+        let a: [f64; K] = kani::any();
+        let b: [f64; K] = kani::any();
+        let ord = cmp_f64_array(&a, &b);
+        assert_eq!(
+            cmp_f64_array(&b, &a),
+            ord.reverse(),
+            "antisymmetry: swapping arguments reverses the verdict"
+        );
+    }
+}
+
 /// cgroup poll interval (`executor::monitors`). Feeds the MAD floor in
 /// [`ingest::is_outlier`] — a 1s sampler on a 10s build is ±10% wall-
 /// clock noise; the gate's relative-granularity floor stops that being

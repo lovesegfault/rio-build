@@ -217,12 +217,16 @@ in
   # body at :1463-:1644 is async fn over &mut Self with PG + lease
   # reads interleaved — the pure-twin extraction is a refactor of the
   # named region, not a 10-line lift. Recorded; #2+#4 land per OQ-9.
+  # Harness ledger: 4 → 5 (bug_025: cmp_f64_array_is_total — the
+  # canonical [f64; N] sort comparator is panic-free and antisymmetric
+  # over the full f64 domain at proof-local K=2; the f64-sort-totality
+  # rg-policy gate routes every open-coded sibling to it).
   # r[verify sched.evidence.durability+4]
   # r[verify sched.lease.generation-fence+3]
   kani-rio-scheduler = mkKaniCheck {
     name = "rio-scheduler";
     crate = crateBuildKani.members.rio-scheduler;
-    expectedHarnesses = 4;
+    expectedHarnesses = 5;
   };
 
   # rio-controller: the ComponentScaler's pure (band × coverage)
