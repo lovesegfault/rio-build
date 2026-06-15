@@ -386,6 +386,36 @@ fn dropped_guard_join_panics() {
     // GuardJoin drops here → panic("… bug_023 …").
 }
 
+/// r26 irony-check on bug_023 (the §one-step-removed inverse): a
+/// `GuardJoin` live across an UNWINDING panic must yield to the
+/// original failure. At HEAD the Drop fires a SECOND panic ("bug_023
+/// …") → panic-while-panicking → SIGABRT, burying the real message.
+#[test]
+#[should_panic(expected = "the actual failure")]
+fn guard_join_drop_during_unwind_yields_original_panic() {
+    let shutdown = rio_common::signal::Token::new();
+    let main = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("main runtime");
+    let (_g, _gj) = rio_controller::guard::spawn(
+        main.handle().clone(),
+        Arc::new(AtomicBool::new(true)),
+        rio_controller::guard::GuardConfig {
+            health_addr: ([127, 0, 0, 1], 0).into(),
+            ..Default::default()
+        },
+        shutdown.clone(),
+    );
+    shutdown.cancel();
+    // _gj is live across this panic; at HEAD its Drop fires a SECOND
+    // panic ("bug_023 …") → abort (test reports SIGABRT, not
+    // "the actual failure"). After fix: Drop sees thread::panicking()
+    // and yields, so #[should_panic(expected=…)] matches.
+    panic!("the actual failure");
+}
+
 // r[verify sys.epilogue.drain+2]
 #[tokio::test(flavor = "multi_thread")]
 async fn w10_as_process_join_gates_holder_clear() {
