@@ -14,8 +14,11 @@
 #   cold-build    eval → upload (chunked dir + single-file + symlink
 #                 sources + drv blobs) → digest submission → worker
 #                 executes dep+consumer → event progression on stdout →
-#                 fetched output content byte-checked → drv blobs
-#                 tenant-bound in PG
+#                 default fetch imports the output closure into the
+#                 client's /nix/store (signed narinfo, require-sigs
+#                 daemon, non-root user), ./result points at it,
+#                 nix path-info / nix store verify accept it, content
+#                 byte-checked → drv blobs tenant-bound in PG
 #   warm-rerun    same attr again: ack table suppresses re-upload, the
 #                 scheduler cache-hits — zero new builder executions
 #   attach        `rio build --attach <id>` replays the completed
@@ -48,8 +51,16 @@
 # fixture-seeded 'vmtest' tenant's UUID with the matching seed. The
 # defaultTenant narinfo trigger attributes every registered path to
 # vmtest, so client uploads, builder castore reads (HMAC assignment
-# token rung) and the client's --fetch read (JWT rung) all resolve to
-# one tenant.
+# token rung) and the client's output-fetch read (JWT rung) all resolve
+# to one tenant.
+#
+# The default fetch path: every successful `rio build` run imports its
+# outputs into the client VM's /nix/store through the local nix daemon.
+# The store signs narinfo with the rio-vm-test-1 key (signingKeyFile in
+# default.nix) and the client's nix.conf trusts its public half, so the
+# imports pass require-sigs. All rio invocations run as the non-root
+# user `alice` — root is a nix trusted-user, which could mask the
+# signature mechanism.
 {
   pkgs,
   common,
@@ -161,7 +172,9 @@ pkgs.testers.runNixOSTest {
     tid = psql(control, "SELECT tenant_id FROM tenants WHERE tenant_name = 'vmtest'")
     assert tid, "vmtest tenant row missing — rio-seed-tenant did not run?"
     token = control.succeed(f"${signJwt} {tid}").strip()
-    client.succeed(f"umask 077 && echo '{token}' > /tmp/tenant.jwt")
+    # Readable by the non-root build user (every rio invocation runs as
+    # alice — see the scenario header).
+    client.succeed(f"umask 077 && echo '{token}' > /tmp/tenant.jwt && chown alice /tmp/tenant.jwt")
 
     # ══════════════════════════════════════════════════════════════════
     # Stage the eval inputs at the absolute paths the fixture file
@@ -170,6 +183,8 @@ pkgs.testers.runNixOSTest {
     # past the racy-fingerprint slack (same as rio-eval-smoke).
     # ══════════════════════════════════════════════════════════════════
     client.succeed("mkdir -p /tmp/work/src /var/lib/rio/cov")
+    # Coverage profraws are written by alice's rio processes too.
+    client.succeed("chmod 0777 /var/lib/rio/cov")
     client.succeed("echo rio-bc-src-v1 > /tmp/work/src/data.txt")
     client.succeed(
         "cp -r ${common.busybox}/. /tmp/work/bb && chmod -R u+w /tmp/work/bb"
@@ -190,9 +205,13 @@ pkgs.testers.runNixOSTest {
     )
 
     def rio_build(args, log_suffix, dump_on_fail=True):
+        # Run as the non-root user from their home directory: the default
+        # ./result out-link lands there, and the /nix/store import goes
+        # through the daemon socket without root's trusted-user status.
         rc, out = client.execute(
-            f"timeout 300 env {rio_env} ${rio} build {args} "
-            f"2>/tmp/rio-stderr-{log_suffix}.log"
+            "su - alice -c "
+            f"'cd /home/alice && timeout 300 env {rio_env} ${rio} build {args} "
+            f"2>/tmp/rio-stderr-{log_suffix}.log'"
         )
         if rc != 0 and dump_on_fail:
             print(f"--- rio stderr ({log_suffix}) ---")
@@ -207,9 +226,7 @@ pkgs.testers.runNixOSTest {
 
     # ══════════════════════════════════════════════════════════════════
     with subtest("cold-build: rio build end-to-end against the cluster"):
-        rc, out = rio_build(
-            "consumer -f ${fixtureNix} --out-link /tmp/result", "cold"
-        )
+        rc, out = rio_build("consumer -f ${fixtureNix}", "cold")
         print(out)
         assert rc == 0, f"rio build failed (rc={rc}):\n{out}"
 
@@ -220,19 +237,28 @@ pkgs.testers.runNixOSTest {
         for needle in ("queued", "building", "built", "completed:"):
             assert needle in err, f"missing {needle!r} in client stderr:\n{err}"
         assert "consumer: built /nix/store/" in out, out
-        assert "fetched to" in out, out
+        assert "fetched to /nix/store/" in out, out
 
-        # The out-link resolves into the client CAS (the native fetch
-        # path), not the client's /nix/store.
-        link = client.succeed("readlink /tmp/result").strip()
-        assert "/tmp/rio-cas/fetched/" in link, f"out-link points at {link!r}"
+        # Default fetch: the output closure was imported into the client
+        # VM's /nix/store through the daemon and ./result (in alice's
+        # cwd) points at the imported store path — not at the client CAS.
+        link = client.succeed("readlink /home/alice/result").strip()
+        assert link.startswith("/nix/store/"), f"out-link points at {link!r}"
+
+        # The path is registered with the daemon and carries the cluster
+        # signature: nix path-info answers, and `nix store verify`
+        # accepts it via the rio-vm-test-1 key in trusted-public-keys.
+        # Both run as the non-root user — root's trusted-user status must
+        # not be what makes this pass.
+        client.succeed(f"su - alice -c 'nix path-info {link}'")
+        client.succeed(f"su - alice -c 'nix store verify {link}'")
 
         # Content round-trip: src marker flowed through the dep build,
         # the consumer read it through the castore lower on the worker,
-        # and --fetch (narHash-verified) brought it back. The note and
+        # and the import (narHash-verified) brought it back. The note and
         # symlink markers prove single-file and symlink source roots
         # were uploaded and materialized for the worker.
-        summary = client.succeed("cat /tmp/result/summary")
+        summary = client.succeed("cat /home/alice/result/summary")
         for needle in (
             "rio-bc-src-v1",
             "rio-bc-note-v1",
