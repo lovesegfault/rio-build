@@ -532,6 +532,8 @@ in
   # r[verify bc.render.plain-default]
   # r[verify bc.render.failure-log-tail]
   # r[verify sched.merge.failfast-culprit]
+  # r[verify bc.upload.source-root-kinds]
+  # r[verify bc.upload.cas-read]
   vm-build-client-standalone =
     let
       jwtKeys = import ./lib/jwt-keys.nix;

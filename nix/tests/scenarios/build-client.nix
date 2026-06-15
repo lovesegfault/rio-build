@@ -11,18 +11,21 @@
 # stream → `--out-link` round-trips the output content.
 #
 # Subtests:
-#   cold-build    eval → upload (chunked dir sources + drv blobs) →
-#                 digest submission → worker executes dep+consumer →
-#                 event progression on stdout → fetched output content
-#                 byte-checked → drv blobs tenant-bound in PG
+#   cold-build    eval → upload (chunked dir + single-file + symlink
+#                 sources + drv blobs) → digest submission → worker
+#                 executes dep+consumer → event progression on stdout →
+#                 fetched output content byte-checked → drv blobs
+#                 tenant-bound in PG
 #   warm-rerun    same attr again: ack table suppresses re-upload, the
 #                 scheduler cache-hits — zero new builder executions
 #   attach        `rio build --attach <id>` replays the completed
 #                 build's event stream from seq 0
 #   flake-mode    `rio build path:...#attr` (no --file): the
-#                 parseFlakeRef → lockFlake → callFlake path,
-#                 hermetic flake (no inputs), distinct drv names so it
-#                 never cache-hits the file-mode runs
+#                 parseFlakeRef → lockFlake → callFlake path. The dep
+#                 consumes two streamed (CAS-read) source roots: a
+#                 fetched `path:` input referenced as a whole tree and
+#                 a `builtins.toFile` single file. Distinct drv names
+#                 so it never cache-hits the file-mode runs.
 #   cached-failure-replay
 #                 failing dep poisons ([poison] threshold=1 via env);
 #                 three priming submissions exhaust the resubmit-reset
@@ -62,18 +65,28 @@ let
 
   # Flake-mode fixture: same dep→consumer chain as fixtureNix, but
   # behind a flake `outputs` so the path that does parseFlakeRef →
-  # lockFlake → callFlake is exercised. Hermetic (no inputs); bb and
-  # src are staged INSIDE the flake dir so pure-eval can reference
-  # them via `self`.
+  # lockFlake → callFlake is exercised. bb and src are staged INSIDE
+  # the flake dir so pure-eval can reference them via `self`. Two
+  # inputs reach the eval store as STREAMED ingests (no origin tree on
+  # disk), so the dep exercises the coordinator's CAS-read source
+  # upload for both root kinds: `patchesDir` is a fetched (`path:`)
+  # non-flake input referenced as a whole tree (streamed directory
+  # root), and `noteFile` is `builtins.toFile` text (streamed
+  # single-file root — the same shape as a .patch copied out of a
+  # lazily fetched nixpkgs input).
   flakeFixture = pkgs.writeText "flake.nix" ''
     {
-      inputs = { };
-      outputs = { self }:
+      inputs.patches = {
+        url = "path:/tmp/work-patches";
+        flake = false;
+      };
+      outputs = { self, patches }:
         let
           bb = "''${self}/bb";
           src = "''${self}/src";
           sh = "''${bb}/bin/sh";
           bbx = "''${bb}/bin/busybox";
+          noteFile = builtins.toFile "rio-bc-tofile-note" "rio-bc-tofile-v1\n";
           mkDrv = name: script: extra:
             derivation ({
               inherit name;
@@ -84,8 +97,10 @@ let
           dep = mkDrv "rio-bc-flake-dep" '''
             ''${bbx} mkdir -p $out
             ''${bbx} cat ''${src}/data.txt > $out/data
+            ''${bbx} cat $noteFile >> $out/data
+            ''${bbx} cat $patchesDir/note.patch >> $out/data
             ''${bbx} echo rio-bc-flake-dep-built >> $out/data
-          ''' { };
+          ''' { inherit noteFile; patchesDir = patches; };
         in {
           packages.x86_64-linux.consumer = mkDrv "rio-bc-flake-consumer" '''
             ''${bbx} mkdir -p $out
@@ -159,6 +174,10 @@ pkgs.testers.runNixOSTest {
     client.succeed(
         "cp -r ${common.busybox}/. /tmp/work/bb && chmod -R u+w /tmp/work/bb"
     )
+    # Single-file and symlink source roots consumed by the dep drv. The
+    # symlink dangles on purpose: only its target string is read.
+    client.succeed("echo rio-bc-note-v1 > /tmp/work/note.patch")
+    client.succeed("ln -s rio-bc-symlink-target /tmp/work/link")
     client.succeed("find /tmp/work -exec touch -h -d '1 hour ago' {} +")
 
     rio_env = (
@@ -210,9 +229,17 @@ pkgs.testers.runNixOSTest {
 
         # Content round-trip: src marker flowed through the dep build,
         # the consumer read it through the castore lower on the worker,
-        # and --fetch (narHash-verified) brought it back.
+        # and --fetch (narHash-verified) brought it back. The note and
+        # symlink markers prove single-file and symlink source roots
+        # were uploaded and materialized for the worker.
         summary = client.succeed("cat /tmp/result/summary")
-        for needle in ("rio-bc-src-v1", "rio-bc-dep-built", "rio-bc-consumer-built"):
+        for needle in (
+            "rio-bc-src-v1",
+            "rio-bc-note-v1",
+            "rio-bc-symlink-target",
+            "rio-bc-dep-built",
+            "rio-bc-consumer-built",
+        ):
             assert needle in summary, (
                 f"{needle!r} missing from fetched output:\n{summary}"
             )
@@ -260,14 +287,20 @@ pkgs.testers.runNixOSTest {
 
     # ══════════════════════════════════════════════════════════════════
     with subtest("flake-mode: rio build path:...#attr (no --file)"):
-        # Stage a hermetic flake (no inputs) with bb/src inside so
-        # pure-eval can reference them via self. Distinct drv names
-        # so this leg never cache-hits the file-mode runs.
-        client.succeed("mkdir -p /tmp/work-flake/src")
+        # Stage the flake with bb/src inside so pure-eval can reference
+        # them via self, plus the fetched `patches` input it consumes
+        # (a path: input — its content reaches the eval store as a
+        # streamed ingest and uploads via the coordinator's CAS-read
+        # path). Distinct drv names so this leg never cache-hits the
+        # file-mode runs.
+        client.succeed("mkdir -p /tmp/work-flake/src /tmp/work-patches")
         client.succeed("cp -r /tmp/work/bb /tmp/work-flake/bb")
         client.succeed("echo rio-bc-src-v1 > /tmp/work-flake/src/data.txt")
         client.succeed("cp ${flakeFixture} /tmp/work-flake/flake.nix")
-        client.succeed("find /tmp/work-flake -exec touch -h -d '1 hour ago' {} +")
+        client.succeed("echo rio-bc-fetched-note-v1 > /tmp/work-patches/note.patch")
+        client.succeed(
+            "find /tmp/work-flake /tmp/work-patches -exec touch -h -d '1 hour ago' {} +"
+        )
         before = journal_builds_succeeded(worker)
         rc, out = rio_build(
             "path:/tmp/work-flake#packages.x86_64-linux.consumer "
@@ -280,6 +313,8 @@ pkgs.testers.runNixOSTest {
         summary = client.succeed("cat /tmp/result-flake/summary")
         for needle in (
             "rio-bc-src-v1",
+            "rio-bc-tofile-v1",
+            "rio-bc-fetched-note-v1",
             "rio-bc-flake-dep-built",
             "rio-bc-flake-consumer-built",
         ):

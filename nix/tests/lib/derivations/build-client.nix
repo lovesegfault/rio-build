@@ -3,23 +3,27 @@
 # pass `--arg`, so the input paths are absolute literals the testScript
 # stages first):
 #
-#   /tmp/work/bb   static busybox copied OUT of the client's store (a
-#                  source already at a store path would bypass ingest)
-#   /tmp/work/src  small directory source with a known marker file
+#   /tmp/work/bb          static busybox copied OUT of the client's
+#                         store (a source already at a store path would
+#                         bypass ingest)
+#   /tmp/work/src         small directory source with a known marker
+#   /tmp/work/note.patch  single-file source root
+#   /tmp/work/link        symlink source root (dangling on purpose; the
+#                         build only reads its target string)
 #
-# Deliberate constraints (current coordinator limitations):
-#   - source roots are DIRECTORIES (file/symlink roots are a TODO in
-#     rio-build-cli upload.rs)
-#   - no builtins.toFile (streamed content is skipped at upload with a
-#     stats counter, rio-evalstore store.rs)
+# Deliberate constraints:
 #   - system is a constant: the VM and its worker are x86_64-linux
 #
 # dep -> consumer gives a 2-node inputDrvs chain, so the submission
 # exercises digest-derived edges and the worker executes both in
-# dependency order.
+# dependency order; dep's inputs cover directory, single-file and
+# symlink source roots end-to-end (upload → castore FUSE on the
+# worker).
 let
   bb = /tmp/work/bb;
   src = /tmp/work/src;
+  note = /tmp/work/note.patch;
+  link = /tmp/work/link;
   sh = "${bb}/bin/sh";
   bbx = "${bb}/bin/busybox";
   mkDrv =
@@ -39,8 +43,10 @@ let
   dep = mkDrv "rio-bc-dep" ''
     ${bbx} mkdir -p $out
     ${bbx} cat $src/data.txt > $out/data
+    ${bbx} cat $note >> $out/data
+    ${bbx} readlink $link >> $out/data
     ${bbx} echo rio-bc-dep-built >> $out/data
-  '' { inherit src; };
+  '' { inherit src note link; };
   # Failure-replay fixtures (cached-failure-replay subtest): a dep that
   # prints 30 recognizable lines and exits 1, so the SECOND-and-later
   # submissions of failingConsumer fail-fast on the poisoned dep and the
