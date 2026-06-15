@@ -241,7 +241,7 @@ async fn became_true(mut cond: impl FnMut() -> bool, budget: Duration) -> bool {
 
 /// W10-AU: the join-obligation census over the live tree — every
 /// guard-runtime spawn site discharges its obligation.
-// r[verify sys.epilogue.drain]
+// r[verify sys.epilogue.drain+2]
 #[test]
 fn w10_au_every_guard_spawn_site_carries_a_join_obligation() {
     let mut violations = Vec::new();
@@ -386,7 +386,7 @@ fn dropped_guard_join_panics() {
     // GuardJoin drops here → panic("… bug_023 …").
 }
 
-// r[verify sys.epilogue.drain]
+// r[verify sys.epilogue.drain+2]
 #[tokio::test(flavor = "multi_thread")]
 async fn w10_as_process_join_gates_holder_clear() {
     let (client, mock) = MockApiServer::new();

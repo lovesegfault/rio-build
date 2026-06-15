@@ -79,16 +79,24 @@
 //! - [`GuardHandle::spawn_on_guard`] (test/diagnostic seam): the
 //!   caller owns the returned `JoinHandle`; production callsites must
 //!   declare a `drain-census:` disposition.
+//! - the `rio-guard` OS thread itself (`std::thread::Builder::spawn`
+//!   in [`spawn`]): PROCESS-JOINED — its `JoinHandle` is captured in
+//!   [`GuardJoin`] and the process owner `.join()`s it after the
+//!   working domain drains (bug_023; the §Verifier-one-step-removed(b)
+//!   recurrence of bug_118 one lifecycle level up).
 //!
 //! The lease loop's kube client is NOT shared: `run_lease_loop`
 //! constructs its own client, so apiserver I/O for renewal never rides
 //! a main-domain connection pool.
 //!
-//! Residual (priced, signed via the dossier): a dedicated thread still
-//! dies with the process (kubelet covers that) and still lags under
-//! cgroup-level CPU starvation — if a future freeze is cgroup-class,
-//! the sentinel's capture will say so and a CPU-request raise joins
-//! the fix.
+//! Residual (priced, signed via the dossier): on the GRACEFUL path the
+//! process owner [`GuardJoin::join`]s this thread after the working
+//! domain drains, so the epilogue lands before exit (bug_023; the
+//! process-joined class above). The thread still dies with the process
+//! on SIGKILL/crash (kubelet covers that — the steal threshold is the
+//! designed fallback) and still lags under cgroup-level CPU starvation
+//! — if a future freeze is cgroup-class, the sentinel's capture will
+//! say so and a CPU-request raise joins the fix.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -237,7 +245,7 @@ impl GuardHandle {
     /// [`Self::adopt_epilogue`]; the root drains it bounded
     /// ([`rio_lease::SHUTDOWN_EPILOGUE_BUDGET`]) before the runtime
     /// drops.
-    // r[impl sys.epilogue.drain]
+    // r[impl sys.epilogue.drain+2]
     pub fn spawn_lease<H: rio_lease::LeaseHooks>(
         &self,
         cfg: rio_lease::LeaseConfig,
@@ -341,7 +349,7 @@ impl GuardJoin {
     /// fires and the working domain's drains return; calling before
     /// cancellation deadlocks (the root never reaches the drain
     /// state).
-    // r[impl sys.epilogue.drain]
+    // r[impl sys.epilogue.drain+2]
     pub fn join(mut self) {
         if let Err(panic) = self
             .thread

@@ -215,7 +215,7 @@ supersession TYPED drain and fence protocols — an entry check alone
 (or an entry check plus a second entry check) is never a conforming
 implementation of any of them.
 
-#r("sys.epilogue.drain")[
+#r("sys.epilogue.drain+2")[
   A runtime that hosts post-cancellation epilogue work MUST NOT key
   its lifetime to the same cancellation token as its tasks. Spawning
   an epilogue-bearing task MUST return a drain handle carrying the
@@ -224,7 +224,11 @@ implementation of any of them.
   states cancelled → draining (every adopted handle awaited, each
   bounded by its own budget) → dropped — the runtime drops only after
   the drain state completes, and a budget expiry abandons that one
-  epilogue (logged) without re-entering it.
+  epilogue (logged) without re-entering it. Where the host root runs
+  on its own OS thread, the process-level owner MUST hold and join
+  that thread via a linear join token whose only discharge is an
+  explicit `join()` and whose drop on any other path is a panic — a
+  `#[must_use]` annotation alone is not a conforming discharge.
 ]
 
 The transition algebra is deliberately small: *running* →(token
