@@ -243,11 +243,51 @@ Either way the cluster needs no client to make progress: `rio build
 with the tenant credential; `--cancel <id>` is the explicit cancel from
 anywhere else.
 
-#r("bc.fetch.narhash-verify")[
-  `--fetch` MUST verify the streamed NAR's SHA-256 against the server's
-  claimed `nar_hash` before materializing into the client CAS; a mismatch
-  refuses materialization.
+= Fetching outputs
+
+#r("bc.fetch.store-import-default")[
+  By default `rio build` MUST import every completed root output's closure
+  into the local `/nix/store` through the local nix daemon; only `--no-fetch`
+  leaves outputs in the cluster store.
 ]
+
+The import speaks the worker protocol directly to the daemon socket
+(`wopAddToStoreNar` per missing path, NAR streamed — never buffered whole),
+so the result is a real store path that `nix path-info`, `nix store verify`
+and downstream tooling all understand.
+
+#r("bc.fetch.closure-topo")[
+  The importer MUST walk the output's runtime closure via the store's
+  `QueryPathInfo`, prune paths the local daemon already considers valid via
+  `wopQueryValidPaths`, and import the remainder in topological order
+  (dependencies before dependents).
+]
+
+#r("bc.fetch.narhash-verify+2")[
+  Every output materialization — store import or CAS fallback — MUST verify
+  the streamed NAR's SHA-256 and size against the server's claimed
+  `nar_hash`/`nar_size`, and a mismatch MUST abort before the content
+  becomes visible (no daemon frame terminator, no CAS rename).
+]
+
+#r("bc.fetch.daemonless-fallback")[
+  When no local nix daemon is reachable, or the cluster store serves the
+  closure unsigned (no signing key configured), the client MUST materialize
+  outputs into the client CAS instead and MUST emit a single stderr note
+  naming the cause.
+]
+
+#r("bc.fetch.sig-reject-ux")[
+  A daemon signature-policy rejection MUST surface as one error that names
+  the cluster signing key, shows the `trusted-public-keys` line to add, and
+  names `--no-fetch` as the escape hatch.
+]
+
+Signature checking is never disabled client-side (`dontCheckSigs` is always
+zero): the local daemon's own `require-sigs` policy decides, fed by the
+cluster signatures riding the path metadata. A cluster whose store has no
+signing key configured therefore cannot feed a default daemon — that case is
+the second arm of the daemonless fallback, not a hard error.
 
 = The eval parent (`rio-eval`, P3b)
 

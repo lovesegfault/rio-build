@@ -7,6 +7,7 @@
 
 mod common;
 mod drvgen;
+mod fake_daemon;
 mod stub_parent;
 mod stub_scheduler;
 
@@ -1148,7 +1149,7 @@ async fn second_interrupt_skips_cancel_wait() -> TestResult {
 
 /// `--fetch`: the completed output materializes through GetPath into
 /// the client CAS, narHash-verified, and `--out-link` points at it.
-// r[verify bc.fetch.narhash-verify]
+// r[verify bc.fetch.narhash-verify+2]
 #[tokio::test]
 async fn fetch_materializes_output_with_narhash_verify() -> TestResult {
     let cluster = TestCluster::new().await?;
@@ -1186,6 +1187,200 @@ async fn fetch_materializes_output_with_narhash_verify() -> TestResult {
     assert_eq!(std::fs::read(dest)?, payload);
     // Out-link points at the materialization.
     assert_eq!(&std::fs::read_link(&link)?, dest);
+    Ok(())
+}
+
+/// Helpers for the local-store import tests: upload a (signed) output to
+/// the in-process store, with optional references.
+async fn seed_output(
+    cluster: &common::TestCluster,
+    name: &str,
+    payload: &[u8],
+    references: &[&str],
+) -> anyhow::Result<(String, Vec<u8>)> {
+    let (nar, nar_hash) = rio_test_support::fixtures::make_nar(payload);
+    let path = drvgen::fake_out_path(name);
+    let mut info = rio_test_support::fixtures::make_path_info(&path, &nar, nar_hash);
+    info.references = references
+        .iter()
+        .map(|r| rio_nix::store_path::StorePath::parse(r))
+        .collect::<Result<_, _>>()?;
+    assert!(cluster.put_path_as_builder(info, nar.clone()).await?);
+    Ok((path, nar))
+}
+
+/// Shared note sink for `OutputFetcher` (the single fallback note).
+fn note_sink() -> (
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    impl Fn(String) + Send + Sync + 'static,
+) {
+    let notes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&notes);
+    (notes, move |msg: String| {
+        sink.lock().expect("notes lock").push(msg)
+    })
+}
+
+/// Default fetch path: the output's closure imports into the local nix
+/// store via the daemon — closure walked through QueryPathInfo, pruned
+/// against the daemon, imported dependencies-first, with the cluster
+/// signatures and references riding each AddToStoreNar, and the streamed
+/// NAR bytes hash-verified on the way through.
+// r[verify bc.fetch.store-import-default]
+// r[verify bc.fetch.closure-topo]
+// r[verify bc.fetch.narhash-verify+2]
+#[tokio::test]
+async fn default_fetch_imports_closure_into_local_store() -> TestResult {
+    let cluster = TestCluster::new().await?;
+    let (dep_path, dep_nar) = seed_output(&cluster, "import-dep", b"dep payload", &[]).await?;
+    let (root_path, root_nar) = seed_output(
+        &cluster,
+        "import-root",
+        b"root payload",
+        &[dep_path.as_str()],
+    )
+    .await?;
+
+    let daemon = fake_daemon::FakeDaemon::spawn().await?;
+    let (notes, note) = note_sink();
+    let mut fetcher = rio_build_cli::import::OutputFetcher::new(
+        daemon.socket.clone(),
+        cluster.cas.path().to_path_buf(),
+        note,
+    );
+    let mut clients = cluster.clients.clone();
+    let fetched = fetcher.fetch(&mut clients, &root_path).await?;
+    assert_eq!(
+        fetched,
+        rio_build_cli::import::FetchedOutput::Store(std::path::PathBuf::from(&root_path))
+    );
+
+    let st = daemon.state.lock().expect("daemon state");
+    assert_eq!(st.imported.len(), 2, "dep + root must both import");
+    assert_eq!(
+        st.imported[0].store_path, dep_path,
+        "dependencies import before dependents"
+    );
+    assert_eq!(st.imported[1].store_path, root_path);
+    assert_eq!(st.imported[0].nar, dep_nar);
+    assert_eq!(st.imported[1].nar, root_nar);
+    // Metadata rides the import: references and the cluster signature.
+    assert_eq!(st.imported[1].info.references, vec![dep_path.clone()]);
+    for imported in &st.imported {
+        assert!(
+            imported
+                .info
+                .signatures
+                .iter()
+                .any(|s| s.starts_with(&format!("{}:", common::SIGNING_KEY_NAME))),
+            "cluster signature must ride AddToStoreNar: {:?}",
+            imported.info.signatures
+        );
+    }
+    assert!(
+        notes.lock().expect("notes lock").is_empty(),
+        "no fallback note on the daemon path"
+    );
+    Ok(())
+}
+
+/// Paths the daemon already considers valid are pruned — only the
+/// missing part of the closure is imported.
+// r[verify bc.fetch.closure-topo]
+#[tokio::test]
+async fn import_prunes_paths_already_valid_in_daemon() -> TestResult {
+    let cluster = TestCluster::new().await?;
+    let (dep_path, _) = seed_output(&cluster, "prune-dep", b"dep payload", &[]).await?;
+    let (root_path, _) = seed_output(
+        &cluster,
+        "prune-root",
+        b"root payload",
+        &[dep_path.as_str()],
+    )
+    .await?;
+
+    let daemon = fake_daemon::FakeDaemon::spawn().await?;
+    daemon
+        .state
+        .lock()
+        .expect("daemon state")
+        .valid
+        .insert(dep_path.clone());
+    let (_notes, note) = note_sink();
+    let mut fetcher = rio_build_cli::import::OutputFetcher::new(
+        daemon.socket.clone(),
+        cluster.cas.path().to_path_buf(),
+        note,
+    );
+    let mut clients = cluster.clients.clone();
+    fetcher.fetch(&mut clients, &root_path).await?;
+
+    let st = daemon.state.lock().expect("daemon state");
+    assert_eq!(st.imported.len(), 1, "already-valid dep must be pruned");
+    assert_eq!(st.imported[0].store_path, root_path);
+    Ok(())
+}
+
+/// A daemon signature-policy rejection maps to guidance naming the
+/// signing key, the trusted-public-keys line, and --no-fetch.
+// r[verify bc.fetch.sig-reject-ux]
+#[tokio::test]
+async fn daemon_sig_rejection_maps_to_trusted_key_guidance() -> TestResult {
+    let cluster = TestCluster::new().await?;
+    let (root_path, _) = seed_output(&cluster, "sigfail-root", b"payload", &[]).await?;
+
+    let daemon = fake_daemon::FakeDaemon::spawn().await?;
+    daemon.state.lock().expect("daemon state").reject_with =
+        Some("cannot add path because it lacks a signature by a trusted key".to_string());
+    let (_notes, note) = note_sink();
+    let mut fetcher = rio_build_cli::import::OutputFetcher::new(
+        daemon.socket.clone(),
+        cluster.cas.path().to_path_buf(),
+        note,
+    );
+    let mut clients = cluster.clients.clone();
+    let err = fetcher
+        .fetch(&mut clients, &root_path)
+        .await
+        .expect_err("rejected import must fail the fetch");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("trusted-public-keys"), "{msg}");
+    assert!(msg.contains(common::SIGNING_KEY_NAME), "{msg}");
+    assert!(msg.contains("--no-fetch"), "{msg}");
+    Ok(())
+}
+
+/// No daemon socket → the output materializes into the client CAS, with
+/// exactly one stderr note naming the cause, and the bytes still verify.
+// r[verify bc.fetch.daemonless-fallback]
+#[tokio::test]
+async fn no_daemon_falls_back_to_cas_materialization() -> TestResult {
+    let cluster = TestCluster::new().await?;
+    let payload = b"fallback payload".to_vec();
+    let (root_path, _) = seed_output(&cluster, "fallback-root", &payload, &[]).await?;
+
+    let missing_socket = cluster.cas.path().join("no-such-daemon.sock");
+    let (notes, note) = note_sink();
+    let mut fetcher = rio_build_cli::import::OutputFetcher::new(
+        missing_socket,
+        cluster.cas.path().to_path_buf(),
+        note,
+    );
+    let mut clients = cluster.clients.clone();
+    let first = fetcher.fetch(&mut clients, &root_path).await?;
+    let rio_build_cli::import::FetchedOutput::Cas(dest) = first else {
+        panic!("expected CAS fallback, got {first:?}");
+    };
+    assert!(dest.starts_with(cluster.cas.path()));
+    // Single-file NAR → restored verbatim.
+    assert_eq!(std::fs::read(&dest)?, payload);
+
+    // A second output reuses the probe answer and must not repeat the note.
+    let (second_path, _) = seed_output(&cluster, "fallback-second", b"more", &[]).await?;
+    fetcher.fetch(&mut clients, &second_path).await?;
+    let notes = notes.lock().expect("notes lock");
+    assert_eq!(notes.len(), 1, "exactly one fallback note: {notes:?}");
+    assert!(notes[0].contains("no local nix daemon"), "{notes:?}");
     Ok(())
 }
 

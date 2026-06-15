@@ -23,4 +23,5 @@ pub mod coordinator;
 pub mod evalchan;
 pub mod fetch;
 pub mod framing;
+pub mod import;
 pub mod render;
