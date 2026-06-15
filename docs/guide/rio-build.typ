@@ -77,6 +77,12 @@ containing it.
   callers.
 ]
 
+Against a development cluster you operate yourself, `cargo xtask k8s env`
+sets all of this up for you: it port-forwards the scheduler and store, mints
+a short-lived tenant JWT, and drops you into a shell (or runs a command you
+pass after `--`) with `RIO_SCHEDULER_ADDR`, `RIO_STORE_ADDR` and
+`RIO_TENANT_TOKEN_PATH` exported, so `rio build` works directly.
+
 == Building
 
 ```bash
