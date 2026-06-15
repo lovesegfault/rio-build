@@ -139,8 +139,10 @@ pub struct DrvLogChunkRow {
 ///
 /// Store-OWNED, store-written: the live-ingest routing registry. At
 /// most one live session per execution (PK on `exec_id`); `acquire`
-/// steals a row whose `heartbeat_at` is older than 30 s. Readers
-/// treat a row with a stale heartbeat as dead and serve history-only.
+/// steals a row whose `heartbeat_at` is older than
+/// [`SESSION_STALE_AFTER_SECS`](crate::sql::SESSION_STALE_AFTER_SECS).
+/// Readers treat a row with a stale heartbeat as dead and serve
+/// history-only.
 #[derive(Debug, sqlx::FromRow)]
 pub struct LogIngestSessionRow {
     pub exec_id: Uuid,
@@ -149,6 +151,8 @@ pub struct LogIngestSessionRow {
     /// Epoch seconds (`EXTRACT(EPOCH FROM …)::bigint` at the query
     /// site).
     pub started_at: i64,
-    /// Epoch seconds; the 15 s heartbeat / 30 s staleness lease.
+    /// Epoch seconds; the 15 s heartbeat /
+    /// [`SESSION_STALE_AFTER_SECS`](crate::sql::SESSION_STALE_AFTER_SECS)-second
+    /// staleness lease.
     pub heartbeat_at: i64,
 }

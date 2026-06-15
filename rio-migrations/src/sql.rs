@@ -62,12 +62,14 @@ pub const LIVE_WANTED_NAME_ROWS_BY_DRV_SQL: &str = "SELECT d.output_names, d.exp
 /// of this bound evaluates the age of the last COMMITTED
 /// `heartbeat_at` stamp, so the margin must cover the worst
 /// committed-stamp age of a HEALTHY session that missed one beat —
-/// `2 × HEARTBEAT_INTERVAL + HEARTBEAT_RPC_BOUND` (the recovery
-/// tick fires one interval after the missed one, and its UPDATE may
-/// take the full RPC bound to land) — plus a strictly positive
-/// slack. With the store's shipped cadence (15 s beats, 10 s RPC
-/// bound) the worst healthy committed age is 40 s; this value adds
-/// the 5 s `SESSION_MARGIN_SLACK`. `rio-store::logs::sessions`
+/// `rio_store::logs::sessions::worst_one_miss_committed_age()` =
+/// `2 × HEARTBEAT_INTERVAL + FAST_RETRY_BUDGET + HEARTBEAT_RPC_BOUND`
+/// (the recovery tick fires one interval after the missed one, may
+/// burn one fast-retry window, and its UPDATE may take the full RPC
+/// bound to land) — plus a strictly positive slack. With the store's
+/// shipped cadence (15 s beats, 2 s fast-retry, 10 s RPC bound) the
+/// worst healthy committed age is 42 s; this value adds the 3 s
+/// `SESSION_MARGIN_SLACK`. `rio-store::logs::sessions`
 /// compile-asserts the full inequality (the predecessor pair —
 /// 15 × 2 == 30 — certified the producer-side cadence and read a
 /// healthy one-miss session dead for up to 10 s: the steal arm

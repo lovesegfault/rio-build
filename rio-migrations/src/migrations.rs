@@ -1290,7 +1290,8 @@ pub const M_065: () = ();
 ///   **rio-store** only. `exec_id` PK = at most one live session per
 ///   execution (the single-session admission rule); the row carries which
 ///   replica owns the in-memory ingest buffer so `TailLog` subscribers on
-///   other replicas can proxy to it. Heartbeat-leased (15 s beat / 30 s
+///   other replicas can proxy to it. Heartbeat-leased (15 s beat /
+///   [`SESSION_STALE_AFTER_SECS`](crate::sql::SESSION_STALE_AFTER_SECS)-second
 ///   staleness), deleted on clean stream close; a stale row is stealable.
 ///
 /// `drv_logs` is intentionally NOT dropped here: the scheduler code that

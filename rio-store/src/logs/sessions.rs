@@ -49,9 +49,10 @@ use uuid::Uuid;
 /// `AppendLog` stream is open.
 ///
 /// A lease survives one missed heartbeat (a slow PG round-trip, a GC
-/// pause): [`SESSION_STALE_AFTER`] covers the worst COMMITTED-stamp
-/// age of a one-miss session — `2 × HEARTBEAT_INTERVAL +
-/// HEARTBEAT_RPC_BOUND` — plus [`SESSION_MARGIN_SLACK`]; the compile
+/// pause): [`SESSION_STALE_AFTER`] covers
+/// [`worst_one_miss_committed_age`] (= `2 × HEARTBEAT_INTERVAL +
+/// FAST_RETRY_BUDGET + HEARTBEAT_RPC_BOUND`) plus
+/// [`SESSION_MARGIN_SLACK`]; the compile
 /// assert below certifies that inequality. The constant is bound into
 /// the SQL as a `make_interval` parameter rather than written as an
 /// `interval '...'` literal so the queries cannot drift from it.
