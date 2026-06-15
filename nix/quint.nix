@@ -8538,6 +8538,10 @@ rec {
       };
       spec = "nodeclaimLifecycle";
       main = "nodeclaimLifecycleEpoch";
+      # 3600s ≈ 3.2× the measured solo runtime; the 1800s default left
+      # ~1.6× headroom and budget-killed (queue draining) when
+      # co-scheduled with wedge-cluster-admission in the same shard.
+      modelTimeoutSec = 3600;
       invariants = [
         "boundsOK"
         "idleReapSafety"
