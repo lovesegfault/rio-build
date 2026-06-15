@@ -176,7 +176,7 @@ impl LoadAggregate {
 /// at the boundary into a five-variant alphabet whose every cell is
 /// self-contained. [`decide`] matches on this with structural
 /// patterns only and zero `if` guards, so reorder-safety and
-/// totality are rustc-enforced (bug_019, the §Multi-axis-fn close:
+/// totality — quantifier: census(kani: check_load_letter_partition_iff) — are rustc-enforced (bug_019, the §Multi-axis-fn close:
 /// the prior five ordered if-guarded arms made arm 3 borrow
 /// `total_coverage()` from arm 2 positionally; rustc does not lint
 /// guarded-arm reorder, and a 2↔3 swap silently re-admitted the
@@ -188,7 +188,7 @@ pub enum LoadLetter {
     /// [`LoadAggregate::classify`] never returns it
     /// (`check_load_letter_absent_is_none`).
     Absent,
-    /// `max > high` under ANY coverage: a survivor reading high is a
+    /// `max > high` under ANY coverage — quantifier: census(kani: check_load_letter_partition_iff): a survivor reading high is a
     /// real replica really saturated — scale-up evidence survives
     /// partial coverage (W13-AF, the asymmetric half).
     High,
@@ -199,7 +199,7 @@ pub enum LoadLetter {
     /// dropped replica's reading may BE the max, so the "all low"
     /// claim is unsubstantiated. Funds nothing.
     LowPartial,
-    /// `low <= max <= high` under ANY coverage: one replica
+    /// `low <= max <= high` under ANY coverage — quantifier: census(kani: check_load_letter_partition_iff): one replica
     /// genuinely in-band disproves "all replicas low".
     InBand,
 }

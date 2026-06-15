@@ -134,7 +134,7 @@ type FitCache = HashMap<String, LruCache<FitKey, types::FittedParams>>;
 /// replaces is non-total
 /// (NaN compares Equal to everything, which driftsort can panic on or
 /// silently mis-order). For finite inputs the order is identical to
-/// `partial_cmp().unwrap()`. The `f64-sort-totality` rg-policy gate
+/// `partial_cmp().unwrap()`. The `f64-sort-totality` rg-policy gate — quantifier: census(nix-checks: f64-sort-totality + kani: cmp_f64_array_is_total) —
 /// (nix/misc-checks.nix) bans the open-coded form workspace-wide;
 /// `cmp_f64_array_is_total` (below, kani) proves no-panic +
 /// antisymmetry over arbitrary `[f64; 2]` pairs. Scalar callers use

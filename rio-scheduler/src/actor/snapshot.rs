@@ -1672,7 +1672,7 @@ pub(super) struct AckApplyPlan {
 /// NaN-freedom was enforced only by an `is_finite` filter two modules
 /// away (sla/mod.rs) — an invariant at a distance. `total_cmp` is the
 /// repo's standard for f64 sort keys (bug_025: enforced workspace-wide
-/// by the `f64-sort-totality` rg-policy gate; arrays via
+/// by the `f64-sort-totality` rg-policy gate — quantifier: census(nix-checks: f64-sort-totality + kani: cmp_f64_array_is_total); arrays via
 /// [`crate::sla::cmp_f64_array`]); for finite inputs it orders
 /// identically to the old comparator, asserted by
 /// `spawn_intent_order_total_and_finite_compatible`.

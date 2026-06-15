@@ -102,7 +102,7 @@ impl Dns1123Label {
 
     /// `true` iff `sanitize(raw, reserved, _)` takes the
     /// random-salted fallback arm — the EXACT predicate, by routing
-    /// through the same [`Self::fold`] and [`Self::folded_hits_random`]
+    /// through the same `Self::fold` and `Self::folded_hits_random`
     /// production calls (bug_018: the proptest's determinism gate is
     /// this predicate, not an output-prefix heuristic that
     /// over-excludes deterministic raws wearing the fallback stem).

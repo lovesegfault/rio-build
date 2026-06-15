@@ -439,7 +439,7 @@ impl Drop for LogTailSet {
     }
 }
 
-/// What one [`drive_stream`] call observed: whether ANY chunk reached
+/// What one [`drive_stream`] call observed: whether ANY chunk reached — quantifier: census(quint: tailReaderLoop.degradedImpliesNoRelaySinceArm) —
 /// the output channel (`relayed_any` — the `r[sys.recovery.witnessed-clear]`
 /// witnessed-work bit) and how the stream stopped (`end`).
 ///
@@ -467,7 +467,7 @@ enum DriveEnd {
     /// its one re-open chance yet. The sliced lines are WITHHELD in
     /// the caller's [`PendingGap`] (merged_bug_150: dropping them made
     /// "exit at the grace edge" silently lose fetched lines). Earlier
-    /// `Serve` chunks in the SAME drive may well have advanced the
+    /// `Serve` chunks in the same drive may well have advanced the
     /// floor — only the gap chunk's own contribution is withheld; the
     /// caller re-opens at the (possibly advanced) floor and consults
     /// [`DriveOutcome::relayed_any`] for the witnessed-work clear
@@ -1164,7 +1164,7 @@ async fn run_tail(
                 // The episode-ending event is WITNESSED WORK:
                 // `degraded` clears only on the first relayed chunk.
                 // Hoisted ABOVE the `DriveEnd` match (merged_bug_006,
-                // the §Multi-axis-fn hoist-the-guard template): EVERY
+                // the §Multi-axis-fn hoist-the-guard template): EVERY — quantifier: census(quint: tailReaderLoop.degradedImpliesNoRelaySinceArm) —
                 // drive that relayed lines clears the episode — Ended,
                 // Gap, AND any future variant. A drive that ends with
                 // zero lines relayed via err_stream (TransportErr)

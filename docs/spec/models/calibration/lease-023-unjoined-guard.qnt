@@ -63,6 +63,8 @@ module leaseCalib023UnjoinedGuard {
   /// but `landed` ANDs in — the process-exit race. The latch is the
   /// live gate's spec (held ∧ holder == us ∧ no release), so a
   /// decided-but-aborted release latches.
+  // Mirrors: rio-controller/src/main.rs:main
+  // (pre-GuardJoin — the std::thread::JoinHandle was dropped, so process exit raced step_down)
   action calibShutdownUnjoined(n: str, landed: bool): bool = {
     val releases = held.get(n) and lease.holder == Held(n) and landed
     all {

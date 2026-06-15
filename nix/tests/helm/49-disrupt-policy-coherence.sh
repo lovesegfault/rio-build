@@ -7,7 +7,7 @@
 # consolidationPolicy is NOT WhenEmpty must host at least one targeting
 # Deployment/StatefulSet whose pod template is disruptable (no
 # `do-not-disrupt: "true"` annotation), or the non-WhenEmpty half of
-# the policy can never fire and the values.yaml/prose claims it makes
+# the policy cannot fire and the values.yaml/prose claims it makes
 # are false on render. The join key is `rio.build/node-role` (the one
 # label every static pool stamps and every workload nodeSelector
 # names).

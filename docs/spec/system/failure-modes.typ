@@ -611,7 +611,7 @@ open, while the store routes every application refusal through
 every cycle and neither the 30 s notice nor the per-episode warn could
 ever fire. Repaired by gating the clear on the first relayed chunk
 (`DriveOutcome.relayed_any`, computed once at the `drive_stream` tail
-and consulted ABOVE the `DriveEnd` match so EVERY end variant --- `Gap`
+and consulted ABOVE the `DriveEnd` match so EVERY end variant --- `Gap` // quantifier: census(quint: tailReaderLoop.degradedImpliesNoRelaySinceArm)
 included --- consults it; merged_bug_006 was the §Multi-axis-fn
 sibling-arm hole where the per-arm diff lived only in `Ended`) and
 arming on a zero-relayed in-stream refusal.

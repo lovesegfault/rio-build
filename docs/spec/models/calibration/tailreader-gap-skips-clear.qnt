@@ -28,6 +28,8 @@ module tailReaderCalibGapSkipsClear {
   /// PRE-FIX: a serve-then-gap re-open is productive (relays lines,
   /// resets the pacer) but the DriveEnd::Gap arm did NOT clear the
   /// degraded episode. The oracle records the relay-while-armed.
+  // Mirrors: rio-gateway/src/handler/log_tail.rs:run_tail
+  // (pre-DriveOutcome — the witnessed-clear lived only in the DriveEnd::Ended arm)
   action calibReopenServeThenGapNoClr = all {
     not(orphanSignal), not(exited), reopens < MAX_REOPENS,
     reopens' = reopens + 1,
