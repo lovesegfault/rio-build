@@ -31,6 +31,9 @@
 #                 default 20-line tail, full under -L, and the
 #                 persisted reason text for a culprit that produced no
 #                 output
+#   rio-log       `rio log <drv>` (no --build) prints the culprit's full
+#                 stored log on stdout; --build pins a build and
+#                 --log-lines tails; an unknown drv exits non-zero
 #
 # Native-path purity: the client never gets an SSH key and the
 # gateway's authorized_keys only holds the boot placeholder — nothing
@@ -343,6 +346,48 @@ pkgs.testers.runNixOSTest {
         assert "rio-bc-fail-marker" not in err, (
             f"silent run must not replay the loud fixture's log:\n{err}"
         )
+
+    # ══════════════════════════════════════════════════════════════════
+    with subtest("rio log: stored-log read by drv path"):
+        import re
+
+        # The fail-fast stderr names the culprit's full drv path — the
+        # form a user would copy into `rio log`.
+        err = client.succeed("cat /tmp/rio-stderr-failfast.log")
+        m = re.search(r"/nix/store/\S+-rio-bc-fail-dep\.drv", err)
+        assert m, f"culprit drv path not found in fail-fast stderr:\n{err}"
+        culprit_drv = m.group(0)
+
+        # Drv-only form: the scheduler resolves the most recent execution
+        # among this tenant's builds; the full raw log lands on stdout.
+        rc, out = client.execute(f"env {rio_env} ${rio} log {culprit_drv}")
+        assert rc == 0, f"rio log failed (rc={rc}):\n{out}"
+        assert "rio-bc-fail-marker line 5" in out, f"full log missing early lines:\n{out}"
+        assert "rio-bc-fail-marker line 30" in out, f"full log missing tail lines:\n{out}"
+
+        # Pinned-build form + tail.
+        bid = psql(
+            control,
+            "SELECT build_id FROM builds WHERE status = 'failed' "
+            "AND error_summary LIKE '%rio-bc-fail-dep%' "
+            "ORDER BY submitted_at DESC LIMIT 1",
+        )
+        assert bid, "no failed build naming the loud culprit"
+        rc, out = client.execute(
+            f"env {rio_env} ${rio} log {culprit_drv} --build {bid} --log-lines 5"
+        )
+        assert rc == 0, f"rio log --build failed (rc={rc}):\n{out}"
+        assert "rio-bc-fail-marker line 30" in out, f"tail missing last line:\n{out}"
+        assert "rio-bc-fail-marker line 20" not in out, (
+            f"--log-lines 5 must not include early lines:\n{out}"
+        )
+
+        # A drv path nothing in this tenant ever built exits non-zero.
+        rc, out = client.execute(
+            f"env {rio_env} ${rio} log "
+            "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-rio-bc-nope.drv"
+        )
+        assert rc != 0, f"bogus drv must exit non-zero:\n{out}"
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';
