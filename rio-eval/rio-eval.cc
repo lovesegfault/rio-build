@@ -27,9 +27,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "nix/cmd/common-eval-args.hh" // fetchSettings / evalSettings / flakeSettings globals + lookupFileArg
@@ -118,8 +120,10 @@ struct EvalCtx
 };
 
 /* Attr-path candidates for one WorkItem attr. File mode: the attr
- * verbatim. Flake mode: the fragment, then the `nix build` fallback
- * prefixes; an empty fragment means the default package. */
+ * verbatim (the empty attr is the file's top-level value —
+ * findAlongAttrPath on the empty path returns the root). Flake mode:
+ * the fragment, then the `nix build` fallback prefixes; an empty
+ * fragment means the default package. */
 std::vector<std::string> attrCandidates(const EvalCtx & ctx, const std::string & attr)
 {
     if (!ctx.flakeMode)
@@ -134,6 +138,15 @@ std::vector<std::string> attrCandidates(const EvalCtx & ctx, const std::string &
         "packages." + ctx.system + "." + attr,
         "legacyPackages." + ctx.system + "." + attr,
     };
+}
+
+/* Join an attr-path component onto a (possibly empty) prefix. The empty
+ * prefix is the file's top-level value (zero-installable file mode);
+ * its children must be addressed without a leading dot or
+ * findAlongAttrPath rejects the re-resolved WorkItem attr. */
+std::string joinAttrPath(const std::string & prefix, const std::string & name)
+{
+    return prefix.empty() ? name : prefix + "." + name;
 }
 
 /* Attr-path component for re-resolution by findAlongAttrPath: quote
@@ -168,7 +181,7 @@ void collectDrvChildren(
         if (name == "recurseForDerivations")
             continue;
         auto component = attrPathComponent(name);
-        std::string path = prefix + "." + component.value_or(std::string(name));
+        std::string path = joinAttrPath(prefix, component.value_or(std::string(name)));
         if (!component) {
             skipped.push_back(path);
             continue;
@@ -214,7 +227,7 @@ int expandAttrset(
      * same system the flake fragment fallbacks use). */
     auto sys = cur->attrs()->get(ctx.state->symbols.create(ctx.system));
     if (sys) {
-        prefix += "." + ctx.system;
+        prefix = joinAttrPath(prefix, ctx.system);
         if (nix::getDerivation(*ctx.state, *sys->value, false)) {
             children.push_back(prefix);
         } else if (sys->value->type() == nix::nAttrs) {
@@ -319,7 +332,8 @@ evalAttr(void * ctxRaw, const char * attrC, int workerFd, char * errBuf, size_t 
 {
     fprintf(
         stderr,
-        "usage: %s --cas DIR (--file PATH | --flake REF) [--workers N] "
+        "usage: %s --cas DIR (--file PATH | --flake REF) "
+        "[--arg NAME EXPR] [--argstr NAME VALUE] [-I PATH] [--workers N] "
         "[--recycle-attrs N] [--recycle-rss-mb N]\n"
         "Spawned by `rio build` with the worker channel on fd 3 — not a "
         "user-facing command.\n",
@@ -339,6 +353,12 @@ int main(int argc, char ** argv)
     std::string casDir;
     std::string file;
     std::string flakeRef;
+    /* nix-build parity (file mode only — the coordinator rejects these
+     * flags for flakes): --arg/--argstr feed the autoArgs bindings,
+     * -I prepends lookup-path entries. Keyed by name so a repeated
+     * name keeps the last spelling, like MixEvalArgs. */
+    std::map<std::string, std::pair<bool /*isExpr*/, std::string>> autoArgSpecs;
+    std::vector<std::string> includes;
     std::string optsJson = "{";
     bool firstOpt = true;
     auto addOpt = [&](const char * key, const std::string & val) {
@@ -360,6 +380,11 @@ int main(int argc, char ** argv)
             file = next();
         else if (arg == "--flake")
             flakeRef = next();
+        else if (arg == "--arg" || arg == "--argstr") {
+            auto name = next();
+            autoArgSpecs.insert_or_assign(name, std::make_pair(arg == "--arg", next()));
+        } else if (arg == "-I")
+            includes.push_back(next());
         else if (arg == "--workers")
             addOpt("max_workers", next());
         else if (arg == "--recycle-attrs")
@@ -457,9 +482,32 @@ int main(int argc, char ** argv)
         }
         rio_shim_set_ifd_handler(&ifdHandler, nullptr);
 
+        /* nix-build parity: -I entries are the highest-priority lookup
+         * path; NIX_PATH reaches the EvalState the same way it does for
+         * nix-build — initGC() copied it into settings.nixPath, which
+         * the EvalState constructor appends after these entries. Flake
+         * mode never gets -I, so it keeps today's empty argument path. */
+        nix::LookupPath lookupPath;
+        for (auto & i : includes)
+            lookupPath.elements.emplace_back(nix::LookupPath::Elem::parse(i));
+
         auto state = nix::make_ref<nix::EvalState>(
-            nix::LookupPath{}, store, nix::fetchSettings, nix::evalSettings);
-        nix::Bindings & autoArgs = *state->buildBindings(0).finish();
+            lookupPath, store, nix::fetchSettings, nix::evalSettings);
+
+        /* --arg/--argstr bindings, mirroring MixEvalArgs::getAutoArgs:
+         * an --arg expression becomes a thunk (parse errors surface
+         * here, eval errors only if the argument is used), an --argstr
+         * is a plain string. */
+        auto autoArgsBuilder = state->buildBindings(autoArgSpecs.size());
+        for (auto & [name, spec] : autoArgSpecs) {
+            auto * v = state->allocValue();
+            if (spec.first)
+                state->mkThunk_(*v, state->parseExprFromString(spec.second, state->rootPath(".")));
+            else
+                v->mkString(spec.second, state->mem);
+            autoArgsBuilder.insert(state->symbols.create(name), v);
+        }
+        nix::Bindings & autoArgs = *autoArgsBuilder.finish();
 
         EvalCtx ctx{
             .state = state,

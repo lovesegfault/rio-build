@@ -19,7 +19,7 @@
 #                 scheduler cache-hits — zero new builder executions
 #   attach        `rio build --attach <id>` replays the completed
 #                 build's event stream from seq 0
-#   flake-mode    `rio build path:...#attr` (no --eval-file): the
+#   flake-mode    `rio build path:...#attr` (no --file): the
 #                 parseFlakeRef → lockFlake → callFlake path,
 #                 hermetic flake (no inputs), distinct drv names so it
 #                 never cache-hits the file-mode runs
@@ -176,7 +176,7 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     with subtest("cold-build: rio build end-to-end against the cluster"):
         rc, out = rio_build(
-            "consumer --eval-file ${fixtureNix} --out-link /tmp/result", "cold"
+            "consumer -f ${fixtureNix} --out-link /tmp/result", "cold"
         )
         print(out)
         assert rc == 0, f"rio build failed (rc={rc}):\n{out}"
@@ -223,7 +223,7 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     with subtest("warm-rerun: ack short-circuit + scheduler cache-hit, no re-execution"):
         before = journal_builds_succeeded(worker)
-        rc, out = rio_build("consumer --eval-file ${fixtureNix}", "warm")
+        rc, out = rio_build("consumer -f ${fixtureNix}", "warm")
         print(out)
         assert rc == 0, f"warm rio build failed (rc={rc}):\n{out}"
         assert "consumer: built /nix/store/" in out, out
@@ -246,7 +246,7 @@ pkgs.testers.runNixOSTest {
         assert "completed" in out, f"attach output missing completion:\n{out}"
 
     # ══════════════════════════════════════════════════════════════════
-    with subtest("flake-mode: rio build path:...#attr (no --eval-file)"):
+    with subtest("flake-mode: rio build path:...#attr (no --file)"):
         # Stage a hermetic flake (no inputs) with bb/src inside so
         # pure-eval can reference them via self. Distinct drv names
         # so this leg never cache-hits the file-mode runs.
