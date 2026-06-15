@@ -53,6 +53,11 @@
       "doc": "Cluster connections for the coordinator: one channel to the"
     },
     {
+      "path": "coordinator/faillog.rs",
+      "depth": 1,
+      "doc": "Failure replay: when a build fail-fasts on a derivation that already"
+    },
+    {
       "path": "coordinator/graph.rs",
       "depth": 1,
       "doc": "The coordinator's global digest state: fold (stage 1) and the"
@@ -1412,6 +1417,11 @@
       "path": "grpc/actor_guards.rs",
       "depth": 1,
       "doc": "Shared actor-liveness and leader guards for gRPC handlers."
+    },
+    {
+      "path": "grpc/derivation_log.rs",
+      "depth": 1,
+      "doc": "`SchedulerService.GetDerivationLog` — tenant-facing stored-log reads."
     },
     {
       "path": "grpc/digest_submit.rs",
