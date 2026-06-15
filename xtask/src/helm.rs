@@ -119,6 +119,7 @@ pub struct Helm {
     create_ns: bool,
     values: Vec<String>,
     sets: Vec<(String, String)>,
+    set_strings: Vec<(String, String)>,
     set_jsons: Vec<(String, String)>,
     wait: Option<Duration>,
     no_hooks: bool,
@@ -133,6 +134,7 @@ impl Helm {
             create_ns: false,
             values: vec![],
             sets: vec![],
+            set_strings: vec![],
             set_jsons: vec![],
             wait: None,
             no_hooks: false,
@@ -156,6 +158,17 @@ impl Helm {
 
     pub fn set(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
         self.sets.push((key.into(), val.into()));
+        self
+    }
+
+    /// `--set-string` — bypasses helm's strvals type coercion. Use for any
+    /// value that is *semantically* a string but may *lexically* match
+    /// another YAML scalar: git SHAs (all-digit → int64), AWS account IDs,
+    /// commit-ish tags, anything a user types. `--set foo=591224927664`
+    /// arrives at the template as int64; `printf "%s"` then renders Go's
+    /// `%!s(int64=…)` error sentinel into the manifest.
+    pub fn set_string(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
+        self.set_strings.push((key.into(), val.into()));
         self
     }
 
@@ -209,6 +222,12 @@ impl Helm {
         for (k, v) in self.sets {
             args.extend([
                 "--set".into(),
+                format!("{k}={}", Self::escape_set_value(&v)),
+            ]);
+        }
+        for (k, v) in self.set_strings {
+            args.extend([
+                "--set-string".into(),
                 format!("{k}={}", Self::escape_set_value(&v)),
             ]);
         }

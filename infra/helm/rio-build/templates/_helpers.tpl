@@ -9,10 +9,12 @@ missing tag = ImagePullBackOff, which is the right failure mode).
 {{- $root := index . 0 -}}
 {{- $repo := index . 1 -}}
 {{- $g := $root.Values.global.image -}}
+{{- /* toString: --set coerces an all-digit git SHA to int64; %s on int64 renders as the literal `%!s(int64=N)` → InvalidImageName. */ -}}
+{{- $tag := $g.tag | toString -}}
 {{- if $g.registry -}}
-{{- printf "%s/%s:%s" $g.registry $repo $g.tag | quote -}}
+{{- printf "%s/%s:%s" $g.registry $repo $tag | quote -}}
 {{- else -}}
-{{- printf "%s:%s" $repo $g.tag | quote -}}
+{{- printf "%s:%s" $repo $tag | quote -}}
 {{- end -}}
 {{- end -}}
 

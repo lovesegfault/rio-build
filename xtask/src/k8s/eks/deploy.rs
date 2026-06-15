@@ -310,7 +310,7 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             .namespace(NS)
             .set("namespaces.create", "false")
             .set("global.image.registry", &ecr)
-            .set("global.image.tag", tag)
+            .set_string("global.image.tag", tag)
             .set("global.region", &region)
             .set("global.logLevel", log_level)
             .set("store.chunkBackend.bucket", &bucket)
