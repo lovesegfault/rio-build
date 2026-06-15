@@ -865,6 +865,32 @@ mod tests {
     }
 
     // r[verify ctrl.scaler.load-coverage+2]
+    /// W26-S3 (bug_019) — proposition: the (band × coverage) product
+    /// classifies ONCE at the boundary into a closed five-variant
+    /// alphabet whose every cell is self-contained — `LowTotal`
+    /// DEMANDS `total_coverage()` in its constructor, never by arm
+    /// order; population: the full 6-cell {low, in-band, high} ×
+    /// {partial, total} grid. Pre-fix RED (verbatim in the commit
+    /// body): `LoadLetter` does not exist — the law lives in five
+    /// ordered if-guarded match arms whose arm 3 borrows
+    /// `total_coverage()` from arm 2 positionally (rustc does not
+    /// lint guarded-arm reorder; a 2↔3 swap silently re-admits the
+    /// partial-low-funds-growth shape W13-AF closed).
+    #[test]
+    fn w26_s3_load_letter_partition_self_contained() {
+        for (l, want) in [
+            (partial(0.1), LoadLetter::LowPartial),
+            (total(0.1), LoadLetter::LowTotal),
+            (partial(0.9), LoadLetter::High),
+            (total(0.9), LoadLetter::High),
+            (partial(0.5), LoadLetter::InBand),
+            (total(0.5), LoadLetter::InBand),
+        ] {
+            assert_eq!(l.unwrap().classify(0.2, 0.8), want);
+        }
+    }
+
+    // r[verify ctrl.scaler.load-coverage+2]
     /// W14-B3 (merged_bug_004) — proposition: the coverage
     /// denominator is the spec'd replica population (the Deployment
     /// `spec.replicas` already in hand), never the readiness-censored
