@@ -19,6 +19,7 @@ repeated rio.types.DrvBlob drv_blobs = 3;
 repeated string children = 2;
 repeated string output_paths = 2;
 repeated string skipped = 3;
+rio.castore.RootNode root_node = 6;
 rio.types.DerivationNode node = 1;
 rio.types.DrvBlob blob = 2;
 string attr = 1;

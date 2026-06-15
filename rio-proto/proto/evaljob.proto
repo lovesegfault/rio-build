@@ -20,6 +20,7 @@ package rio.evaljob;
 // The eval parent multiplexes its fork-workers onto this single pair;
 // the coordinator never sees individual workers.
 
+import "castore.proto"; // SourceRoot.root_node → rio.castore.RootNode
 import "dag.proto";   // ResultFrame.nodes → rio.types.DerivationNode
 import "types.proto"; // ResultFrame.drv_blobs → rio.types.DrvBlob
 
@@ -110,22 +111,33 @@ message ResultFrame {
   bytes root_drv_digest = 5;
 }
 
-// One ingested source tree the coordinator may need to upload. The
-// client CAS holds the per-directory metadata blobs; the byte store is
-// the ORIGIN tree (ADR-024 "not stored: chunk copies of local working
-// trees") — upload-on-miss re-reads `origin`, re-chunks, and verifies
-// `dir_digest` still matches before uploading.
+// One ingested source root the coordinator may need to upload. The
+// client CAS holds the per-directory metadata blobs; for locally
+// originated roots the byte store is the ORIGIN tree (ADR-024 "not
+// stored: chunk copies of local working trees") — upload-on-miss
+// re-reads `origin`, re-chunks, and verifies the root identity still
+// matches before uploading. Streamed roots (fetched flake inputs,
+// toFile text) have no origin tree; their bytes live in the client
+// CAS and `origin` is empty.
 message SourceRoot {
-  // Store path the tree dumped to (NAR sha256 identity).
+  // Store path the root dumped to (NAR sha256 identity).
   string store_path = 1;
   // blake3 of the root castore Directory blob (negotiation key).
+  // Empty for single-file and symlink roots — their identity lives in
+  // `root_node`.
   bytes dir_digest = 2;
   // SHA-256 of the canonical NAR serialization, 32 raw bytes. Claimed
   // on upload (PutPathChunked recomputes server-side).
   bytes nar_hash = 3;
   uint64 nar_size = 4;
-  // Local filesystem path of the origin tree.
+  // Local filesystem path of the origin tree. Empty for streamed
+  // roots: the coordinator serves the upload from the client CAS
+  // instead of an origin re-read.
   string origin = 5;
+  // Discriminated castore root (dir_digest | file | symlink). Workers
+  // populate it for every root; an old worker that omits it implies a
+  // directory root keyed by `dir_digest` (back-compat decode).
+  rio.castore.RootNode root_node = 6;
 }
 
 // A worker hit import-from-derivation and is blocked mid-eval. The

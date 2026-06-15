@@ -103,6 +103,49 @@ fn derivation_node_is_content_addressed_roundtrip() {
     assert!(!default_decoded.is_content_addressed);
 }
 
+/// `SourceRoot.root_node` (field 6) back-compat: an old eval worker
+/// that doesn't know the field encodes nothing for it, and the
+/// coordinator decodes `None` — which it must treat as a directory
+/// root keyed by `dir_digest` (the only shape old workers ever sent).
+/// Bytes are crafted without tag 6 (an old-shape encode), not just
+/// `::default()`, so a future non-optional re-declaration that changes
+/// absent-field semantics trips this test.
+#[test]
+fn source_root_without_root_node_decodes_as_dir_root() {
+    let old_shape = rio_proto::evaljob::SourceRoot {
+        store_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src".into(),
+        dir_digest: vec![7; 32],
+        nar_hash: vec![9; 32],
+        nar_size: 123,
+        origin: "/home/user/src".into(),
+        root_node: None,
+    };
+    // An unset message field encodes nothing (prost emits the tag only
+    // for `Some`), so these are exactly the bytes an old worker sends.
+    let bytes = old_shape.encode_to_vec();
+    let decoded = rio_proto::evaljob::SourceRoot::decode(&*bytes).unwrap();
+    assert!(decoded.root_node.is_none());
+    assert_eq!(decoded.dir_digest, vec![7; 32]);
+    assert_eq!(decoded.origin, "/home/user/src");
+
+    // New-shape roundtrip: a populated RootNode survives.
+    let file_root = rio_proto::evaljob::SourceRoot {
+        root_node: Some(rio_proto::castore::RootNode {
+            node: Some(rio_proto::castore::root_node::Node::File(
+                rio_proto::castore::FileEntry {
+                    name: vec![],
+                    digest: vec![1; 32],
+                    size: 4,
+                    executable: true,
+                },
+            )),
+        }),
+        ..old_shape
+    };
+    let decoded = rio_proto::evaljob::SourceRoot::decode(&*file_root.encode_to_vec()).unwrap();
+    assert_eq!(decoded.root_node, file_root.root_node);
+}
+
 /// All four data-type .proto files (types / dag / build_types /
 /// admin_types) share `package rio.types;` → prost merges into one
 /// module. COMPILE-TIME smoke: if a message moved files but wasn't added

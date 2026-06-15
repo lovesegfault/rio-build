@@ -450,6 +450,8 @@ mod tests {
             nar_hash: vec![0; 32],
             nar_size: 1,
             origin: "/src".into(),
+            // Old-worker shape (no root node): keys by dir_digest.
+            root_node: None,
         });
         g.fold(f).unwrap();
         g.fold(frame("b", &[(2, &[])], Some(2))).unwrap();
