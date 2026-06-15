@@ -759,6 +759,17 @@
                   --set-default RIO_EVAL_PARENT ${rioEvalPkg.rioEval}/bin/rio-eval
               '';
 
+              # Default package: the workspace bins, but with bin/rio swapped
+              # for the wrapped pair so a plain `nix build` yields a `rio`
+              # that finds its eval parent. The unwrapped workspace stays
+              # available as `.#workspace` (docker/VM tests keep consuming
+              # rio-workspace directly).
+              rioWorkspaceDefault = pkgs.runCommand "rio-workspace-default" { } ''
+                mkdir -p $out/bin
+                ln -s ${rio-workspace}/bin/* $out/bin/
+                ln -sfn ${rioPair}/bin/rio $out/bin/rio
+              '';
+
               # --------------------------------------------------------------
               # Mutation testing (dev-only — NOT in checks)
               # --------------------------------------------------------------
@@ -992,7 +1003,7 @@
               # passthru on packages.{ci,coverage,helm,dockerImages,mutants}
               # (reachable by attr path, not enumerated by `nix flake show`).
               packages = {
-                default = rio-workspace;
+                default = rioWorkspaceDefault;
                 workspace = rio-workspace;
                 dashboard = rioDashboard;
                 # fsbench (P0594): xtask pre-builds fsbench-bin locally
