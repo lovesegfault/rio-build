@@ -971,25 +971,50 @@ async fn with_build_tunnel(
     };
     let token = rio_auth::jwt::sign(&claims, &signing_key)?;
 
-    let sh = sh::shell()?;
-    let _e1 = sh.push_env("RIO_SCHEDULER_ADDR", format!("localhost:{sched}"));
-    let _e2 = sh.push_env("RIO_STORE_ADDR", format!("localhost:{store}"));
     let token_fd = shared::bytes_to_memfd(token.as_bytes())?;
-    let _e3 = sh.push_env(
-        "RIO_TENANT_TOKEN_PATH",
-        format!("/dev/fd/{}", token_fd.as_raw_fd()),
-    );
     // RIO_CAS_ROOT stays unset: the client already defaults to
     // $XDG_CACHE_HOME/rio/evalstore.
 
     // `rio build` needs the eval parent (RIO_EVAL_PARENT), which only
     // the nix-built pair wires up — so unlike CliTunnel there is no
     // `cargo run` fallback; use `nix run .#rio` instead.
-    if on_path(&sh, "rio") {
-        sh::run_interactive(sh::cmd!(sh, "rio build {args...}"))
+    let sh = sh::shell()?;
+    // Raw Command (sh.rs policy): xshell nulls the child's stdin, but
+    // the rio build renderer only enables its TTY mode (colors, log
+    // browser keys) when both stderr AND stdin are terminals — the
+    // child must inherit the parent's real terminal.
+    let mut cmd = if on_path(&sh, "rio") {
+        let mut c = std::process::Command::new("rio");
+        c.arg("build");
+        c
     } else {
-        sh::run_interactive(sh::cmd!(sh, "nix run .#rio -- build {args...}"))
+        let mut c = std::process::Command::new("nix");
+        c.args(["run", ".#rio", "--", "build"]);
+        c
+    };
+    cmd.args(args);
+    let argv = std::iter::once(cmd.get_program())
+        .chain(cmd.get_args())
+        .map(|a| a.to_str().unwrap_or("?"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    debug!("exec (interactive): {argv}");
+    let status = cmd
+        .current_dir(sh::repo_root())
+        .env("RIO_SCHEDULER_ADDR", format!("localhost:{sched}"))
+        .env("RIO_STORE_ADDR", format!("localhost:{store}"))
+        // token_fd stays open until the child exits; bytes_to_memfd
+        // leaves FD_CLOEXEC unset so /dev/fd/N survives the exec.
+        .env(
+            "RIO_TENANT_TOKEN_PATH",
+            format!("/dev/fd/{}", token_fd.as_raw_fd()),
+        )
+        .status()
+        .with_context(|| format!("failed to spawn: {argv}"))?;
+    if !status.success() {
+        bail!("{argv}: {status}");
     }
+    Ok(())
 }
 
 #[cfg(test)]
