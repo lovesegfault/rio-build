@@ -153,6 +153,16 @@ impl BuildGraph {
         Ok(out)
     }
 
+    /// Folded derivation nodes so far (the eval-discovered drv count).
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Registered source roots so far.
+    pub fn source_count(&self) -> usize {
+        self.sources.len()
+    }
+
     pub fn mark_drv_acked(&mut self, digest: &Digest32) {
         if let Some(n) = self.nodes.get_mut(digest) {
             n.acked = true;
