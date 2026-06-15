@@ -36,6 +36,7 @@ pub const CONCURRENT_PUTPATH_MSG: &str = "concurrent PutPath in progress";
 pub const CGROUP_OOM_MSG: &str = "cgroup OOM during build";
 
 pub mod castore_util;
+pub mod chunk_reject;
 pub mod client;
 pub mod derivation_util;
 pub mod interceptor;
