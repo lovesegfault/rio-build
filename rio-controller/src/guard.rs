@@ -364,7 +364,7 @@ impl GuardJoin {
 
 impl Drop for GuardJoin {
     fn drop(&mut self) {
-        if self.thread.is_some() {
+        if self.thread.is_some() && !std::thread::panicking() {
             // The `take()` in `join()` is the only path that empties
             // `thread`; reaching here with it populated means the
             // process owner returned without joining — the guard
@@ -374,7 +374,11 @@ impl Drop for GuardJoin {
             // Panic is bounded-safe: we are already on the
             // process-exit path; an unwind here turns a silent lease
             // hold into a loud crash with a stack the next reviewer
-            // can read.
+            // can read. The bomb is for the NON-UNWINDING leak only:
+            // during unwind a second panic is an abort that buries
+            // the real failure (r26 irony-check on bug_023), so the
+            // panicking() guard yields to the original panic — the
+            // steal threshold is the fallback either way.
             panic!(
                 "GuardJoin dropped without .join() — bug_023: the process owner \
                  returned without joining the rio-guard thread; the in-flight \
