@@ -12,6 +12,13 @@ description = "Kubernetes operator for rio-build: Pool, ComponentScaler CRDs"
 name = "rio-controller"
 path = "src/main.rs"
 
+[lints.rust]
+# `cfg(kani)` is set by kani-compiler (nix `crateBuildKani` passes
+# `--cfg=kani --check-cfg=cfg(kani)`); register it here so the regular
+# cargo build doesn't warn `unexpected_cfgs` on the `#[cfg(kani)]`
+# proofs module in reconcilers/componentscaler/decide.rs.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [dependencies]
 rio-auth = { workspace = true }
 rio-common = { workspace = true }

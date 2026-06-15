@@ -225,6 +225,25 @@ in
     expectedHarnesses = 4;
   };
 
+  # rio-controller: the ComponentScaler's pure (band × coverage)
+  # classification kernel, in-crate (the kani-rio-scheduler precedent —
+  # the .lib output builds; harnesses live in lib-reachable
+  # reconcilers/componentscaler/decide.rs `mod proofs`). Two harnesses:
+  #   - check_load_letter_partition_iff: the asymmetric-coverage law as
+  #     four iffs over the full 6-cell {low,in-band,high} ×
+  #     {partial,total} partition — each LoadLetter variant equals
+  #     exactly its stated predicate, so the cells are self-contained
+  #     (bug_019: arm 3 borrowed `total_coverage()` from arm 2
+  #     positionally; the structural match has no order to depend on).
+  #   - check_load_letter_absent_is_none: `classify` never constructs
+  #     `Absent` — only `decide`'s `map_or` arm produces it.
+  # r[verify ctrl.scaler.load-coverage+2]
+  kani-rio-controller = mkKaniCheck {
+    name = "rio-controller";
+    crate = crateBuildKani.members.rio-controller;
+    expectedHarnesses = 2;
+  };
+
   # rio-log-kernel: the store's log-chunk decision kernels, extracted
   # from rio-store/src/logs/kernel.rs into a dependency-free crate (the
   # rio-retry-kernel template) so the harnesses' goto model closes over

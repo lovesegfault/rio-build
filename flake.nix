@@ -1587,6 +1587,7 @@
                     kani-rio-retry-kernel
                     kani-rio-evidence-kernel
                     kani-rio-scheduler
+                    kani-rio-controller
                     ;
                   # Regression: per-node profraw extract must not drop
                   # filename-colliding profraws across multi-worker nodes.

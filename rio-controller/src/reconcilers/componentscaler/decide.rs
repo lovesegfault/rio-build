@@ -204,6 +204,61 @@ pub enum LoadLetter {
     InBand,
 }
 
+#[cfg(kani)]
+mod proofs {
+    use super::{LoadAggregate, LoadLetter};
+
+    /// The 6-cell (band × coverage) population: {0.1, 0.5, 0.9} ×
+    /// {(3,3) total, (2,3) partial}. Every `u8` maps onto one cell.
+    fn agg_of_index(i: u8) -> LoadAggregate {
+        let max = match i % 3 {
+            0 => 0.1,
+            1 => 0.5,
+            _ => 0.9,
+        };
+        let (answered, resolved) = match (i / 3) % 2 {
+            0 => (3, 3),
+            _ => (2, 3),
+        };
+        LoadAggregate {
+            max,
+            answered,
+            resolved,
+        }
+    }
+
+    /// The asymmetric-coverage law as four iffs over the full 6-cell
+    /// partition: each variant equals exactly its stated predicate,
+    /// so the cells are self-contained — `LowTotal` cannot silently
+    /// absorb `LowPartial` under reorder (there is no order).
+    #[kani::proof]
+    fn check_load_letter_partition_iff() {
+        let l = agg_of_index(kani::any::<u8>());
+        let letter = l.classify(0.2, 0.8);
+        assert_eq!(
+            letter == LoadLetter::LowTotal,
+            l.max < 0.2 && l.total_coverage()
+        );
+        assert_eq!(
+            letter == LoadLetter::LowPartial,
+            l.max < 0.2 && !l.total_coverage()
+        );
+        assert_eq!(letter == LoadLetter::High, l.max > 0.8);
+        assert_eq!(letter == LoadLetter::InBand, l.max >= 0.2 && l.max <= 0.8);
+    }
+
+    /// `Absent` is never constructed by [`LoadAggregate::classify`]
+    /// — only `decide`'s `map_or` arm produces it (the established
+    /// `None` total-failure posture).
+    #[kani::proof]
+    fn check_load_letter_absent_is_none() {
+        assert_ne!(
+            agg_of_index(kani::any::<u8>()).classify(0.2, 0.8),
+            LoadLetter::Absent
+        );
+    }
+}
+
 /// Result of one reconcile decision: the next status to write and
 /// the replica count to patch onto `deployments/scale`.
 #[derive(Debug, Clone, PartialEq)]
