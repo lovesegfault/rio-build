@@ -156,39 +156,38 @@ fn assemble_subgraph_ships_closure_with_digests() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn assemble_emits_local_dir_source_roots_only() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let store = open_store(dir.path());
-
-    // A real local tree, ingested the way eval does.
-    let tree = dir.path().join("tree");
-    std::fs::create_dir_all(tree.join("sub"))?;
-    std::fs::write(tree.join("sub/data.txt"), b"hello source\n")?;
-    let added = store.add_source_tree(tree.to_str().unwrap(), "tree", &[], &mut |h| {
+/// Path-callback for `add_source_tree`: recompute the recursive
+/// fixed-output path the way nix would (matches `commit_local_ingest`).
+fn fixed_output_path(
+    name: &'static str,
+) -> impl FnMut(&rio_evalstore::store::AddHashes) -> Result<String, rio_evalstore::EvalStoreError> {
+    move |h| {
         let hash = NixHash::new(HashAlgo::SHA256, hex::decode(&h.nar_sha256).unwrap()).unwrap();
-        Ok(StorePath::make_fixed_output("tree", &hash, true, &[])
+        Ok(StorePath::make_fixed_output(name, &hash, true, &[])
             .unwrap()
             .to_string())
-    })?;
+    }
+}
 
-    // A streamed path (no origin): toFile-shaped content.
-    let text = b"builder text".to_vec();
-    let streamed_path = {
-        let hash = NixHash::new(HashAlgo::SHA256, Sha256::digest(&text).to_vec()).unwrap();
-        StorePath::make_text("builder.sh", &hash, &[]).unwrap()
+/// Stream a single regular file into the store (the shape a file copied
+/// out of a fetched flake input lands as: `addToStoreFromDump`, no
+/// origin tree on disk). Returns the full store path.
+fn add_streamed_file(store: &EvalStore, name: &str, contents: &[u8]) -> anyhow::Result<String> {
+    let path = {
+        let hash = NixHash::new(HashAlgo::SHA256, Sha256::digest(contents).to_vec()).unwrap();
+        StorePath::make_text(name, &hash, &[]).unwrap()
     };
     let mut nar = Vec::new();
     rio_nix::nar::serialize(
         &mut nar,
         &rio_nix::nar::NarNode::Regular {
             executable: false,
-            contents: text,
+            contents: contents.to_vec(),
         },
     )?;
     store.add_nar(
         &rio_evalstore::store::ProvidedInfo {
-            path: streamed_path.to_string(),
+            path: path.to_string(),
             nar_hash: hex::encode(Sha256::digest(&nar)),
             nar_size: nar.len() as u64,
             references: vec![],
@@ -196,33 +195,225 @@ fn assemble_emits_local_dir_source_roots_only() -> anyhow::Result<()> {
         },
         &mut nar.as_slice(),
     )?;
+    Ok(path.to_string())
+}
+
+/// Every inputSrc with a path-meta record rides a SourceRoot, whatever
+/// its origin (local tree or streamed) and root kind (dir, single file,
+/// symlink); only never-ingested foreign paths are skipped (counted).
+#[test]
+fn assemble_emits_source_roots_for_all_origins_and_kinds() -> anyhow::Result<()> {
+    use rio_proto::castore::root_node::Node;
+
+    let dir = tempfile::tempdir()?;
+    let store = open_store(dir.path());
+
+    // Local directory tree, ingested the way eval does.
+    let tree = dir.path().join("tree");
+    std::fs::create_dir_all(tree.join("sub"))?;
+    std::fs::write(tree.join("sub/data.txt"), b"hello source\n")?;
+    let added_dir = store.add_source_tree(
+        tree.to_str().unwrap(),
+        "tree",
+        &[],
+        &mut fixed_output_path("tree"),
+    )?;
+
+    // Local single-file root (a `/tmp/work/note.patch`-shaped input).
+    let note = dir.path().join("note.patch");
+    std::fs::write(&note, b"--- a\n+++ b\n")?;
+    let added_file = store.add_source_tree(
+        note.to_str().unwrap(),
+        "note",
+        &[],
+        &mut fixed_output_path("note"),
+    )?;
+
+    // Local symlink root.
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink("data.txt", &link)?;
+    let added_link = store.add_source_tree(
+        link.to_str().unwrap(),
+        "link",
+        &[],
+        &mut fixed_output_path("link"),
+    )?;
+
+    // Streamed single-file root (toFile / fetched-flake-input shape).
+    let streamed_path = add_streamed_file(&store, "builder.sh", b"builder text")?;
+
+    // A foreign store path the eval never ingested — still skipped.
+    let foreign = fake_out_path('q');
 
     let (drv_path, aterm) = mk_drv(
         "withsrc",
         'd',
         &[],
-        &[added.path.as_str(), streamed_path.as_str()],
+        &[
+            added_dir.path.as_str(),
+            added_file.path.as_str(),
+            added_link.path.as_str(),
+            streamed_path.as_str(),
+            foreign.as_str(),
+        ],
     );
     store.write_derivation("withsrc.drv", aterm.as_bytes(), &drv_path)?;
 
     let frame = store.assemble_subgraph(&drv_path)?;
-    // Only the origin-backed directory tree becomes a SourceRoot; the
-    // streamed text path is skipped (counted) — the coordinator's
-    // upload path can only re-read origins.
-    assert_eq!(frame.source_roots.len(), 1);
-    let sr = &frame.source_roots[0];
-    assert_eq!(sr.store_path, added.path);
-    assert_eq!(sr.origin, tree.to_str().unwrap());
-    assert_eq!(sr.nar_hash, hex::decode(&added.nar_sha256)?);
-    assert_eq!(sr.dir_digest.len(), 32);
-    assert!(store.stats().count("source_root_skipped") >= 1);
+    assert_eq!(frame.source_roots.len(), 4, "{:#?}", frame.source_roots);
+    let by_path = |p: &str| {
+        frame
+            .source_roots
+            .iter()
+            .find(|s| s.store_path == p)
+            .unwrap_or_else(|| panic!("no SourceRoot for {p}"))
+    };
 
-    // Dedup: re-assembling a sibling drv referencing the same tree
-    // doesn't resend the source root.
-    let (drv2, aterm2) = mk_drv("withsrc2", 'e', &[], &[added.path.as_str()]);
+    let sr_dir = by_path(&added_dir.path);
+    assert_eq!(sr_dir.origin, tree.to_str().unwrap());
+    assert_eq!(sr_dir.nar_hash, hex::decode(&added_dir.nar_sha256)?);
+    assert_eq!(sr_dir.dir_digest.len(), 32);
+    assert!(matches!(
+        sr_dir.root_node.as_ref().and_then(|r| r.node.as_ref()),
+        Some(Node::DirDigest(d)) if *d == sr_dir.dir_digest
+    ));
+
+    let sr_file = by_path(&added_file.path);
+    assert_eq!(sr_file.origin, note.to_str().unwrap());
+    assert!(sr_file.dir_digest.is_empty());
+    let Some(Node::File(f)) = sr_file.root_node.as_ref().and_then(|r| r.node.as_ref()) else {
+        panic!("file root expected: {sr_file:?}");
+    };
+    assert_eq!(
+        f.digest.as_slice(),
+        blake3::hash(b"--- a\n+++ b\n").as_bytes()
+    );
+    assert!(!f.executable);
+
+    let sr_link = by_path(&added_link.path);
+    assert_eq!(sr_link.origin, link.to_str().unwrap());
+    let Some(Node::Symlink(s)) = sr_link.root_node.as_ref().and_then(|r| r.node.as_ref()) else {
+        panic!("symlink root expected: {sr_link:?}");
+    };
+    assert_eq!(s.target, b"data.txt");
+
+    let sr_streamed = by_path(&streamed_path);
+    assert_eq!(sr_streamed.origin, "", "streamed roots carry no origin");
+    assert!(matches!(
+        sr_streamed.root_node.as_ref().and_then(|r| r.node.as_ref()),
+        Some(Node::File(_))
+    ));
+
+    // The foreign path is the only skip.
+    assert_eq!(store.stats().count("source_root_skipped"), 1);
+
+    // All four keys are distinct (per-worker dedup + coordinator keying).
+    let keys: std::collections::HashSet<[u8; 32]> = frame
+        .source_roots
+        .iter()
+        .map(|s| rio_evalstore::source_root_key(s).unwrap())
+        .collect();
+    assert_eq!(keys.len(), 4);
+
+    // Dedup: re-assembling a sibling drv referencing the same inputs
+    // doesn't resend any source root.
+    let (drv2, aterm2) = mk_drv(
+        "withsrc2",
+        'e',
+        &[],
+        &[added_dir.path.as_str(), added_file.path.as_str()],
+    );
     store.write_derivation("withsrc2.drv", aterm2.as_bytes(), &drv2)?;
     let frame2 = store.assemble_subgraph(&drv2)?;
     assert!(frame2.source_roots.is_empty());
+    Ok(())
+}
+
+/// `source_root_key`: distinct store paths must never collapse to one
+/// key even with identical content/target; directory roots keep the
+/// dir_digest verbatim (the existing ack-table key); a root_node-less
+/// message (old worker) falls back to dir_digest.
+#[test]
+fn source_root_key_separates_kinds_and_store_paths() {
+    use rio_proto::castore::{FileEntry, RootNode, SymlinkEntry, root_node::Node};
+    use rio_proto::evaljob::SourceRoot;
+
+    let file_root = |store_path: &str, executable: bool| SourceRoot {
+        store_path: store_path.into(),
+        root_node: Some(RootNode {
+            node: Some(Node::File(FileEntry {
+                name: vec![],
+                digest: vec![1; 32],
+                size: 4,
+                executable,
+            })),
+        }),
+        ..Default::default()
+    };
+    let a = rio_evalstore::source_root_key(&file_root("/nix/store/a-x", false)).unwrap();
+    let b = rio_evalstore::source_root_key(&file_root("/nix/store/b-x", false)).unwrap();
+    let a_exec = rio_evalstore::source_root_key(&file_root("/nix/store/a-x", true)).unwrap();
+    assert_ne!(a, b, "store path must be part of the key");
+    assert_ne!(a, a_exec, "executable bit must be part of the key");
+
+    let link = SourceRoot {
+        store_path: "/nix/store/a-x".into(),
+        root_node: Some(RootNode {
+            node: Some(Node::Symlink(SymlinkEntry {
+                name: vec![],
+                target: b"target".to_vec(),
+            })),
+        }),
+        ..Default::default()
+    };
+    assert_ne!(rio_evalstore::source_root_key(&link).unwrap(), a);
+
+    let dir = SourceRoot {
+        store_path: "/nix/store/a-x".into(),
+        dir_digest: vec![7; 32],
+        root_node: Some(RootNode {
+            node: Some(Node::DirDigest(vec![7; 32])),
+        }),
+        ..Default::default()
+    };
+    assert_eq!(rio_evalstore::source_root_key(&dir).unwrap(), [7; 32]);
+    // Old-worker shape: no root_node at all — same dir key.
+    let old = SourceRoot {
+        root_node: None,
+        ..dir
+    };
+    assert_eq!(rio_evalstore::source_root_key(&old).unwrap(), [7; 32]);
+    // Neither root_node nor a 32-byte dir_digest = malformed.
+    assert!(rio_evalstore::source_root_key(&SourceRoot::default()).is_none());
+}
+
+/// Streamed roots are served from the client CAS by the coordinator's
+/// OWN pack-store handle, so the worker must flush its segment before
+/// the frame leaves: a second handle opened after assembly sees the
+/// FETCHED record.
+#[test]
+fn streamed_source_root_records_visible_to_second_pack_handle() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = open_store(dir.path());
+
+    let contents = b"fetched flake input file\n";
+    let streamed_path = add_streamed_file(&store, "fetched.patch", contents)?;
+    let (drv_path, aterm) = mk_drv("streamed", 'p', &[], &[streamed_path.as_str()]);
+    store.write_derivation("streamed.drv", aterm.as_bytes(), &drv_path)?;
+
+    let frame = store.assemble_subgraph(&drv_path)?;
+    assert_eq!(frame.source_roots.len(), 1);
+    assert_eq!(frame.source_roots[0].origin, "");
+
+    // The coordinator's view: a fresh handle on the same CAS root,
+    // opened only AFTER the frame was assembled (no shared in-memory
+    // state with the worker's handle).
+    let pack = rio_packstore::PackStore::open(dir.path(), rio_packstore::Options::default())?;
+    let digest = rio_packstore::Digest(*blake3::hash(contents).as_bytes());
+    let read_back = pack
+        .get(&digest)?
+        .expect("FETCHED record must be index-visible after assemble_subgraph");
+    assert_eq!(read_back.as_ref(), contents);
     Ok(())
 }
 

@@ -663,7 +663,17 @@ struct RioStore : virtual Store
          * the raw walk still leaks gitignored content. Submodules default
          * off so the dogfood path is fixed; closing this gap needs either
          * a recursive accessor-chain probe or a getPhysicalPath()
-         * contract change upstream. */
+         * contract change upstream.
+         *
+         * TODO: a source rooted INSIDE an eagerly-copied `path:` flake
+         * input (e.g. `src = inputs.x + "/some.patch"` or
+         * `import "${inputs.x}/file.nix"`) arrives here as a SourcePath
+         * under the store dir. getPhysicalPath() reports that store
+         * subpath, but it only exists virtually (content lives in the
+         * client CAS, not on the host filesystem), so the physical-route
+         * ingest below fails to stat the origin. Treat store-dir-prefixed
+         * physical paths as non-physical and fall back to the dumpPath
+         * route, which reads through the accessor. */
         std::string nameStr(name);
         auto * filtering = dynamic_cast<FilteringSourceAccessor *>(&*path.accessor);
         std::optional<std::filesystem::path> phys;
