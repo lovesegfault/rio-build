@@ -30,6 +30,7 @@ module tailReaderCalibOrphanHotloop {
     reopens' = reopens + 1,
     pacerLevel' = min2(pacerLevel + 1, PACER_MAX_LEVEL),
     sinceProgress' = sinceProgress + 1,
+    degradedArmed' = degradedArmed, relayedSinceArm' = relayedSinceArm,
     orphanSignal' = orphanSignal, exited' = exited,
     reopensAtOrphan' = reopensAtOrphan,
   }

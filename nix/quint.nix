@@ -10034,6 +10034,7 @@ rec {
       invariants = [
         "orphanNeverReopens"
         "pacingEscalatesAbsentProgress"
+        "degradedImpliesNoRelaySinceArm"
       ];
     };
 
@@ -10244,6 +10245,15 @@ rec {
       extraSpecs = [ "tailReaderLoop" ];
       step = "calibStep";
       witness = "pacingEscalatesAbsentProgress";
+    };
+    # r[verify sys.recovery.witnessed-clear]
+    quint-tailreader-calib-gap-skips-clear = mkQuintWitnessCheck {
+      name = "tailreader-calib-gap-skips-clear";
+      spec = "calibration/tailreader-gap-skips-clear";
+      main = "tailReaderCalibGapSkipsClear";
+      extraSpecs = [ "tailReaderLoop" ];
+      step = "calibStep";
+      witness = "degradedImpliesNoRelaySinceArm";
     };
     # openAttempts twins (§4-R2): live-import action-only, each
     # perturbing ONE decision through the model's oracle seats; every

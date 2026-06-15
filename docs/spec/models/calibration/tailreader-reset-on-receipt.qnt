@@ -31,6 +31,7 @@ module tailReaderCalibResetOnReceipt {
     reopens' = reopens + 1,
     pacerLevel' = 0,
     sinceProgress' = sinceProgress + 1,
+    degradedArmed' = degradedArmed, relayedSinceArm' = relayedSinceArm,
     orphanSignal' = orphanSignal, exited' = exited,
     reopensAtOrphan' = reopensAtOrphan,
   }

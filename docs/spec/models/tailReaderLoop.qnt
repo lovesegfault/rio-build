@@ -33,6 +33,11 @@
 //   tailreader-reset-on-receipt (054) — a bare receipt resets the pacer
 //                                       (the shipped
 //                                       receivedThisAttempt reset).
+//   tailreader-gap-skips-clear (006)  — a serve-then-gap drive does not
+//                                       clear the degraded episode (the
+//                                       shipped DriveEnd::Gap arm
+//                                       bypassed the witnessed-work
+//                                       clear).
 //
 // Tier-1 budget: reopens <= MAX_REOPENS bounds everything; hundreds of
 // states, TLC exhausts instantly.
@@ -61,6 +66,14 @@ module tailReaderLoop {
   /// written by the same live actions; the invariant pins pacerLevel
   /// to min(sinceProgress, cap).
   var sinceProgress: int
+  /// The READER's degraded-episode bit (the implementation artifact
+  /// under test — `degraded.is_some()`). Armed by a failed open;
+  /// cleared by the witnessed-work hoist on EVERY relayed drive.
+  var degradedArmed: bool
+  /// ORACLE SEAT: a relay reached the output while the degraded
+  /// episode was armed and was not cleared in the same step. The
+  /// invariant pins this to false whenever degradedArmed is true.
+  var relayedSinceArm: bool
 
   pure def min2(a: int, b: int): int = if (a < b) a else b
 
@@ -71,6 +84,8 @@ module tailReaderLoop {
     reopensAtOrphan' = 0,
     pacerLevel' = 0,
     sinceProgress' = 0,
+    degradedArmed' = false,
+    relayedSinceArm' = false,
   }
 
   /// A re-open whose stream yields a productive verdict (serve or
@@ -80,6 +95,11 @@ module tailReaderLoop {
     reopens' = reopens + 1,
     pacerLevel' = 0,
     sinceProgress' = 0,
+    // The witnessed-work hoist (DriveOutcome.relayed_any): a drive
+    // that relayed lines clears the degraded episode regardless of how
+    // the drive ended — Ended OR Gap.
+    degradedArmed' = false,
+    relayedSinceArm' = false,
     orphanSignal' = orphanSignal, exited' = exited,
     reopensAtOrphan' = reopensAtOrphan,
   }
@@ -93,6 +113,10 @@ module tailReaderLoop {
     reopens' = reopens + 1,
     pacerLevel' = min2(pacerLevel + 1, PACER_MAX_LEVEL),
     sinceProgress' = sinceProgress + 1,
+    // A bare receipt is neither witnessed work (no relay) nor a
+    // refusal — neither clears nor arms (the idle-but-healthy form).
+    degradedArmed' = degradedArmed,
+    relayedSinceArm' = relayedSinceArm,
     orphanSignal' = orphanSignal, exited' = exited,
     reopensAtOrphan' = reopensAtOrphan,
   }
@@ -103,6 +127,10 @@ module tailReaderLoop {
     reopens' = reopens + 1,
     pacerLevel' = min2(pacerLevel + 1, PACER_MAX_LEVEL),
     sinceProgress' = sinceProgress + 1,
+    // Open failed (or in-stream refused with zero relayed): arm the
+    // degraded episode. No relay this cycle.
+    degradedArmed' = true,
+    relayedSinceArm' = relayedSinceArm,
     orphanSignal' = orphanSignal, exited' = exited,
     reopensAtOrphan' = reopensAtOrphan,
   }
@@ -117,6 +145,7 @@ module tailReaderLoop {
     reopensAtOrphan' = reopens,
     exited' = exited, reopens' = reopens,
     pacerLevel' = pacerLevel, sinceProgress' = sinceProgress,
+    degradedArmed' = degradedArmed, relayedSinceArm' = relayedSinceArm,
   }
 
   /// The orphaned reader exits — its only legal continuation.
@@ -126,6 +155,7 @@ module tailReaderLoop {
     orphanSignal' = orphanSignal, reopens' = reopens,
     reopensAtOrphan' = reopensAtOrphan,
     pacerLevel' = pacerLevel, sinceProgress' = sinceProgress,
+    degradedArmed' = degradedArmed, relayedSinceArm' = relayedSinceArm,
   }
 
   action step = any {
@@ -148,8 +178,17 @@ module tailReaderLoop {
   val pacingEscalatesAbsentProgress =
     pacerLevel == min2(sinceProgress, PACER_MAX_LEVEL)
 
+  // merged_bug_006: a relayed drive clears the degraded episode —
+  // regardless of how the drive ended (Ended OR Gap). The oracle
+  // records "a relay reached the output while armed and the arm
+  // survived the step"; the hoisted DriveOutcome.relayed_any clear
+  // forbids that state.
+  val degradedImpliesNoRelaySinceArm =
+    degradedArmed implies not(relayedSinceArm)
+
   val tailReaderLoopInvariants = all {
     orphanNeverReopens,
     pacingEscalatesAbsentProgress,
+    degradedImpliesNoRelaySinceArm,
   }
 }
