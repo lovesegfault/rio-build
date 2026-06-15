@@ -392,9 +392,9 @@ impl<W: Write> TtyRenderer<W> {
                 self.state.insert(drv.to_string(), RowState::Failed);
             }
             DerivationEventKind::Cached => {
-                self.display.permanent(&[format!(
-                    "{stamp} {GREEN}✔  {label}{RESET}  {DIM}(cached){RESET}"
-                )]);
+                // No scrollback line: a warm cluster caches thousands of
+                // drvs and one line each drowns the real output. Cached
+                // drvs still count toward the header's ✔ total.
                 self.state.insert(drv.to_string(), RowState::Succeeded);
                 self.rows.remove(drv);
             }
@@ -1396,6 +1396,20 @@ mod tests {
         assert!(t.contains("bad.drv> l5"), "{t}");
         assert!(!t.contains("bad.drv> l4"), "{t}");
         assert!(t.contains("rio build --attach build-abc"), "{t}");
+    }
+
+    #[test]
+    fn cached_drv_no_scrollback_but_counts_succeeded() {
+        let (mut r, buf, _now) = make();
+        r.on_event(&drv_ev(DRV, DerivationEventKind::Substituting));
+        r.on_event(&drv_ev(DRV, DerivationEventKind::Cached));
+        // Counted as done in the header, but no per-drv scrollback line.
+        assert_eq!(r.count(RowState::Succeeded), 1);
+        assert_eq!(r.count(RowState::Substituting), 0);
+        assert!(plain(&[r.header()]).contains("✔1"), "{}", r.header());
+        let t = plain(&[text(&buf)]);
+        assert!(!t.contains("cached"), "{t}");
+        assert!(!t.contains('✔'), "{t}");
     }
 
     #[test]
