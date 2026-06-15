@@ -1148,9 +1148,11 @@ async fn second_interrupt_skips_cancel_wait() -> TestResult {
     Ok(())
 }
 
-/// `--fetch`: the completed output materializes through GetPath into
-/// the client CAS, narHash-verified, and `--out-link` points at it.
+/// Default fetch through the coordinator on a machine without a nix
+/// daemon: the completed output materializes through GetPath into the
+/// client CAS, narHash-verified, and the out-link points at it.
 // r[verify bc.fetch.narhash-verify+2]
+// r[verify bc.fetch.daemonless-fallback]
 #[tokio::test]
 async fn fetch_materializes_output_with_narhash_verify() -> TestResult {
     let cluster = TestCluster::new().await?;
@@ -1173,9 +1175,16 @@ async fn fetch_materializes_output_with_narhash_verify() -> TestResult {
     )]);
 
     let link = cluster.cas.path().join("result");
+    // Pin the daemon socket to a path that cannot exist so the test is
+    // deterministic on developer machines that DO run a nix daemon —
+    // this test covers the daemonless CAS fallback through the
+    // coordinator; the daemon import path is covered by the
+    // OutputFetcher tests above.
+    let no_daemon = cluster.cas.path().join("no-daemon.sock");
     let mut coordinator = cluster.coordinator(|opts| {
         opts.fetch = true;
         opts.out_link = Some(link.clone());
+        opts.daemon_socket = Some(no_daemon.clone());
     });
     let (summary, _) = cluster.run(&mut coordinator, script, &["a"]).await?;
 

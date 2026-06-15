@@ -289,6 +289,18 @@ cluster signatures riding the path metadata. A cluster whose store has no
 signing key configured therefore cannot feed a default daemon — that case is
 the second arm of the daemonless fallback, not a hard error.
 
+#r("bc.outlink.nix-parity")[
+  Out-link handling MUST follow nix-build's semantics: a `./result` symlink
+  by default, `-o`/`--out-link PATH` to rename it, numbered `PATH-2`,
+  `PATH-3`, … suffixes for further outputs, and `--no-link` (or `--no-fetch`)
+  to suppress it.
+]
+
+The out-link is a plain symlink. Registering it as an indirect
+garbage-collector root (what nix-build additionally does under
+`/nix/var/nix/gcroots/auto`) is an explicit deferral — the symlink alone does
+not protect the imported output from `nix-collect-garbage`.
+
 = The eval parent (`rio-eval`, P3b)
 
 `rio-eval` embeds the flake-pinned nix libexpr plus the rio-evalstore Rust

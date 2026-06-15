@@ -202,7 +202,7 @@ process that forks, and Nix's libexpr must be confined to one binary.
       <coord>,
       <cas>,
       "<|-|>",
-      [ack table, `--fetch` outputs],
+      [ack table, fetched outputs],
       label-size: 0.7em,
       label-pos: 0.3,
     ),
@@ -311,7 +311,7 @@ other attributes may still be evaluating at that point.
         _seq(
           "Coord",
           "Store",
-          comment: [`GetPath` (`--fetch`, narHash-verified)],
+          comment: [`GetPath` (output fetch, narHash-verified)],
         )
       },
       [stale acks (`FAILED_PRECONDITION`, missing digests named)],
@@ -505,8 +505,8 @@ layer and no double hashing.
 
 The split of what persists where follows ADR-024's "fetch cache plus an
 index, not a mirror" rule. The client CAS stores only what has no other
-local home: fetched content (flake inputs, fetched IFD outputs, `--fetch`
-results), the directory metadata packs, and the two persistent indexes ---
+local home: fetched content (flake inputs, fetched IFD outputs, daemonless
+fetch results), the directory metadata packs, and the two persistent indexes ---
 the stat-fingerprint index that lets a second invocation skip re-hashing
 unchanged trees, and the cluster-ack table that lets it skip re-negotiating
 digests the cluster was recently confirmed to hold (scoped to cluster
@@ -532,7 +532,7 @@ already stores and serves: chunks and directories land in the existing
 castore surface (#cross-link("/spec/components/store.typ")[rio-store]), and
 derivation blobs are a castore blob kind with build-pinned GC, so the
 scheduler's submit-time verification, the builders' input fetches and the
-client's `--fetch` reads all resolve against one store. Presence answers are
+client's output-fetch reads all resolve against one store. Presence answers are
 tenant-scoped for all three kinds: negotiation never reveals whether another
 tenant's bytes exist, while storage itself stays digest-keyed and
 deduplicated.

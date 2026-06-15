@@ -54,8 +54,16 @@ pub struct CoordinatorOpts {
     pub tenant_name: String,
     pub keep_going: bool,
     pub page_max_nodes: usize,
+    /// Fetch completed outputs to the local machine (the CLI default;
+    /// `--no-fetch` turns it off). The destination is the local
+    /// /nix/store via the nix daemon, falling back to the client CAS
+    /// when no daemon is reachable.
     pub fetch: bool,
     pub out_link: Option<PathBuf>,
+    /// Daemon socket override for the output import. `None` = the
+    /// standard location ([`crate::import::daemon_socket_path`]); tests
+    /// point this at a fake daemon or a nonexistent path.
+    pub daemon_socket: Option<PathBuf>,
     /// Flag-gated local IFD fallback (default off). P3b wires the
     /// actual local build; until then the flag is parsed and plumbed,
     /// and an IFD under it fails with an explicit message instead of
@@ -78,6 +86,7 @@ impl Default for CoordinatorOpts {
             page_max_nodes: 50_000,
             fetch: false,
             out_link: None,
+            daemon_socket: None,
             local_ifd: false,
             detach_on_interrupt: false,
             failure_log: FailureLogOpts::default(),
@@ -115,7 +124,8 @@ pub struct BuildOutcome {
     pub state: OutcomeState,
     /// `(drv_path, DerivationEventKind)` edges observed, in order.
     pub drv_events: Vec<(String, i32)>,
-    /// Materialized locations (`--fetch`).
+    /// Locally fetched output locations (imported `/nix/store` paths, or
+    /// CAS materializations on the daemonless fallback).
     pub fetched: Vec<PathBuf>,
 }
 
@@ -676,26 +686,32 @@ impl Coordinator {
         }
         outcomes.extend(eval_failures);
 
-        // `--fetch`: materialize completed outputs into the CAS.
+        // Default fetch: import completed outputs into the local
+        // /nix/store (CAS fallback when no daemon is reachable) and
+        // create the out-links. `--no-fetch` clears `opts.fetch`.
+        // r[impl bc.fetch.store-import-default]
+        // r[impl bc.outlink.nix-parity]
         if self.opts.fetch && !interrupted {
+            let socket = self
+                .opts
+                .daemon_socket
+                .clone()
+                .unwrap_or_else(crate::import::daemon_socket_path);
+            let note_render = self.render.clone();
+            let mut fetcher =
+                crate::import::OutputFetcher::new(socket, self.cas_root.clone(), move |note| {
+                    note_render.note(note)
+                });
             let mut link_idx = 0usize;
             for outcome in &mut outcomes {
                 let OutcomeState::Completed { output_paths } = &outcome.state else {
                     continue;
                 };
                 for path in output_paths.clone() {
-                    let dest =
-                        crate::fetch::materialize(&mut self.clients, &self.cas_root, &path).await?;
+                    let fetched = fetcher.fetch(&mut self.clients, &path).await?;
+                    let dest = fetched.local_path().to_path_buf();
                     if let Some(link) = &self.opts.out_link {
-                        let target = if link_idx == 0 {
-                            link.clone()
-                        } else {
-                            // result, result-2, result-3 … (nix's
-                            // multi-output out-link numbering).
-                            let mut name = link.file_name().unwrap_or_default().to_os_string();
-                            name.push(format!("-{}", link_idx + 1));
-                            link.with_file_name(name)
-                        };
+                        let target = crate::fetch::numbered_link(link, link_idx);
                         crate::fetch::out_link(&target, &dest)?;
                         link_idx += 1;
                     }
