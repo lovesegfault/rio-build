@@ -208,6 +208,14 @@ rio build --cancel 01HV5...
     [Continue building independent derivations after a failure (the
       scheduler keeps dispatching unaffected subgraphs).],
 
+    [`--log-lines N`],
+    [When the build fails on a derivation that already failed in an earlier
+      build, replay the last `N` lines (default 20) of the original
+      failure's log on stderr.],
+
+    [`-L`, `--print-build-logs`],
+    [Replay the original failure's full build log instead of a tail.],
+
     [`--detach`],
     [On Ctrl-C (or SIGTERM), exit and leave the submitted builds running
       cluster-side instead of cancelling them; each in-flight build id is
@@ -233,6 +241,54 @@ printing the reattach hints.
 `RUST_LOG` sets the coordinator's log level and is mirrored into the eval
 parent as nix's own verbosity --- `RUST_LOG=debug` also shows nix fetch and
 eval detail.
+
+= Inspecting build logs
+
+`nix log` cannot work over ssh-ng (the daemon protocol has no log-read
+opcode for remote stores); `rio log` is the native replacement. It streams a
+derivation's stored build log straight from the cluster --- raw lines on
+stdout, nothing else --- for any derivation that was built under one of your
+tenant's builds, success or failure:
+
+```bash
+# The most recent execution of this derivation among your builds.
+rio log /nix/store/…-openssl-3.5.1.drv
+
+# Pin a build or a specific execution, or take just a tail.
+rio log /nix/store/…-openssl-3.5.1.drv --build 01HV5… --log-lines 200
+rio log /nix/store/…-openssl-3.5.1.drv --exec 0196ab…
+```
+
+The argument must be a `.drv` store path (resolving an installable to its
+derivation needs an evaluation; pass the path printed in the build output or
+failure message). Like `--attach`/`--cancel`, `rio log` works without an
+eval parent configured. The exit status is non-zero when the derivation has
+no log under your builds --- never built by your tenant, the execution
+produced no output, or the log has expired.
+
+When a build fails because one of its derivations *already failed in an
+earlier build* (the scheduler fail-fasts on the still-poisoned node), `rio
+build` does this for you: it names the original culprit derivation and
+replays the tail of its original log (`--log-lines`, `-L`), or the persisted
+failure reason when that execution produced no output.
+
+#figure(
+  caption: [`rio log` flags.],
+  table(
+    columns: (auto, 1fr),
+    table.header([Flag], [Meaning]),
+    [`DRV_PATH`], [Full `/nix/store/…-*.drv` path whose log to print.],
+
+    [`--build BUILD_ID`],
+    [Pin the build the log should belong to. Default: the most recent
+      execution of the derivation among your own builds.],
+
+    [`--exec EXEC_ID`],
+    [Pin a specific execution id (e.g. from a failure message).],
+
+    [`--log-lines N`], [Print only the last `N` lines. Default: the full log.],
+  ),
+)
 
 = Configuration
 
