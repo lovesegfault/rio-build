@@ -17,7 +17,7 @@ use std::sync::atomic::Ordering;
 use common::{TestCluster, single_frame};
 use rio_build_cli::coordinator::OutcomeState;
 use rio_evalstore::dirblob::{BuiltDir, BuiltEntry};
-use rio_evalstore::ingest::{IngestConfig, IngestNode, ingest_tree};
+use rio_evalstore::ingest::{IngestConfig, IngestNode, chunk_bytes, ingest_tree};
 use rio_proto::evaljob::{ResultFrame, SourceRoot};
 
 type TestResult = anyhow::Result<()>;
@@ -414,6 +414,112 @@ async fn stale_ack_second_reject_is_hard_error() -> TestResult {
         "hard error names the contract: {message}"
     );
     assert_eq!(cluster.sched.state.lock().unwrap().rejects, 2);
+    Ok(())
+}
+
+/// Chunk stale-ack recovery (the production GC-grace-vs-ack-TTL hole):
+/// a chunk the client's ack table remembers loses its S3 object while
+/// its presence row keeps claiming durable. A later upload that dedups
+/// against it is rejected UNAVAILABLE naming the digest; the client
+/// evicts the chunk ack, re-HasChunks-es (the store demoted the lying
+/// row, so the probe now answers absent), re-streams the chunk, and the
+/// retried upload — and the whole build — completes.
+// r[verify bc.upload.stale-ack-once]
+#[tokio::test]
+async fn stale_chunk_ack_recovery_reuploads_and_completes() -> TestResult {
+    // The chunk-backend fault injection goes through the trait surface.
+    use rio_store::backend::ChunkBackend as _;
+
+    let cluster = TestCluster::new().await?;
+
+    // Run 1: a source tree whose payload spans several FastCDC chunks.
+    let payload = rio_test_support::fixtures::pseudo_random_bytes(0xC4A5, 1 << 20);
+    let (_, payload_chunks) = chunk_bytes(&payload);
+    assert!(
+        payload_chunks.len() >= 2,
+        "fixture must span multiple chunks (got {})",
+        payload_chunks.len()
+    );
+    let dir1 = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir1.path().join("src"))?;
+    std::fs::write(dir1.path().join("src/blob.bin"), &payload)?;
+    let src1 = source_root_for(dir1.path(), "chunkstale-src-v1");
+
+    let chain1 = drvgen::chain(&["chunkstale-leaf", "chunkstale-root"]);
+    let root1 = &chain1[1];
+    let script1 = HashMap::from([(
+        "a".to_string(),
+        vec![single_frame(
+            "a",
+            &[&chain1[0], root1],
+            vec![src1.clone()],
+            root1,
+        )],
+    )]);
+    let mut cold = cluster.coordinator(|_| {});
+    let (summary, _) = cluster.run(&mut cold, script1, &["a"]).await?;
+    assert!(matches!(
+        summary.outcomes[0].state,
+        OutcomeState::Completed { .. }
+    ));
+
+    // The hole: the first chunk's S3 object disappears while its
+    // `chunks` row keeps claiming durable presence and the client's ack
+    // table keeps remembering the ack.
+    let victim = payload_chunks[0].digest;
+    cluster
+        .backend
+        .delete_by_key(&cluster.backend.key_for(&victim))
+        .await?;
+
+    // Run 2: a tree whose payload shares the victim chunk (identical
+    // prefix, so FastCDC reproduces the same first cut) but ends in new
+    // content — its whole-file digest has no committed binding, so the
+    // store must fetch the victim back to verify it and discovers the
+    // miss.
+    let prefix_len = (payload_chunks[0].offset + u64::from(payload_chunks[0].len)) as usize;
+    let mut payload2 = payload[..prefix_len].to_vec();
+    payload2.extend(rio_test_support::fixtures::pseudo_random_bytes(
+        0xC4A6,
+        512 * 1024,
+    ));
+    let dir2 = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir2.path().join("src"))?;
+    std::fs::write(dir2.path().join("src/blob.bin"), &payload2)?;
+    let src2 = source_root_for(dir2.path(), "chunkstale-src-v2");
+
+    let chain2 = drvgen::chain(&["chunkstale2-leaf", "chunkstale2-root"]);
+    let root2 = &chain2[1];
+    let script2 = HashMap::from([(
+        "b".to_string(),
+        vec![single_frame(
+            "b",
+            &[&chain2[0], root2],
+            vec![src2.clone()],
+            root2,
+        )],
+    )]);
+    let mut warm = cluster.coordinator(|_| {});
+    let (summary, _) = cluster.run(&mut warm, script2, &["b"]).await?;
+    assert!(
+        matches!(summary.outcomes[0].state, OutcomeState::Completed { .. }),
+        "chunk stale-ack recovery must converge: {:?}",
+        summary.outcomes[0].state
+    );
+
+    // Recovery re-streamed the victim chunk: the object is back in the
+    // backend, presence is honest again, and the v2 source committed.
+    assert!(
+        cluster.backend.exists_batch(&[victim]).await?[0],
+        "recovery must re-upload the missing chunk object"
+    );
+    let durable: bool =
+        sqlx::query_scalar("SELECT durable AND NOT deleted FROM chunks WHERE blake3_hash = $1")
+            .bind(victim.as_slice())
+            .fetch_one(&cluster.db.pool)
+            .await?;
+    assert!(durable, "the re-uploaded chunk answers HasChunks again");
+    assert_eq!(narinfo_rows(&cluster, &src2.store_path).await, 1);
     Ok(())
 }
 

@@ -101,6 +101,9 @@ pub struct TestCluster {
     pub drv_has_calls: Arc<AtomicUsize>,
     pub drv_put_calls: Arc<AtomicUsize>,
     pub cas: tempfile::TempDir,
+    /// The store's chunk backend — tests reach in to simulate S3-side
+    /// faults (an object lost while its presence row survives).
+    pub backend: Arc<MemoryChunkBackend>,
     _server: tokio::task::JoinHandle<()>,
 }
 
@@ -191,6 +194,7 @@ impl TestCluster {
             drv_has_calls,
             drv_put_calls,
             cas: tempfile::tempdir()?,
+            backend,
             _server: server,
         })
     }

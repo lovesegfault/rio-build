@@ -34,7 +34,7 @@ use rio_proto::types::{
     HasDrvsRequest, PutDrvBlobsRequest, PutPathChunkedBegin, PutPathChunkedRequest,
     put_path_chunked_request,
 };
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::acks::{ClusterAckTable, ObjectKind};
 use crate::coordinator::clients::{Clients, bitmap_bit};
@@ -633,14 +633,136 @@ fn walk_cas_dir(
     Ok(())
 }
 
-/// Probe chunk presence and stream the `PutPathChunked` upload.
+/// Probe chunk presence and stream the `PutPathChunked` upload, with
+/// chunk stale-ack recovery — the upload-path sibling of
+/// [`crate::coordinator::submit::submit_root`]'s drv recovery.
+///
+/// An `UNAVAILABLE` reject means the store could not find the backing
+/// object for a chunk this upload referenced as already present (the
+/// ack TTL outlived the cluster's GC grace, or a presence row outlived
+/// its S3 object). The named acks are evicted (every chunk in the
+/// upload when the reject names none), presence is re-probed, and the
+/// upload retried — ONCE. A second reject is a hard error: either the
+/// cluster is GCing faster than the ack TTL models (a config bug) or
+/// the store keeps lying about presence; retrying forever would mask
+/// both.
+// r[impl bc.upload.stale-ack-once]
 async fn put_source_chunked(
     clients: &mut Clients,
     acks: &Arc<Mutex<ClusterAckTable>>,
     src: &SourceRoot,
     plan: SourcePlan,
 ) -> anyhow::Result<()> {
-    // Chunk negotiation: ack table first, then bulk HasChunks.
+    match try_put_source(clients, acks, src, &plan).await {
+        Ok(()) => Ok(()),
+        Err(PutSourceError::StaleChunks { missing, reject }) => {
+            warn!(
+                store_path = %src.store_path,
+                missing = missing.len(),
+                reject = %reject,
+                "PutPathChunked rejected on chunks the cluster no longer holds — \
+                 running stale-ack recovery"
+            );
+            acks.lock()
+                .expect("ack table mutex poisoned")
+                .evict(ObjectKind::Chunk, &missing)?;
+            match try_put_source(clients, acks, src, &plan).await {
+                Ok(()) => {
+                    info!(store_path = %src.store_path, "stale-ack recovery succeeded on re-upload");
+                    Ok(())
+                }
+                Err(PutSourceError::StaleChunks {
+                    reject: second_reject,
+                    ..
+                }) => bail!(
+                    "PutPathChunked for {} rejected twice on missing chunks — recovery \
+                     evicted {} ack(s), re-probed presence and re-uploaded, but the second \
+                     attempt was rejected again ({second_reject}); giving up (second reject \
+                     is a hard error per ADR-024)",
+                    src.store_path,
+                    missing.len(),
+                ),
+                Err(PutSourceError::Other(e)) => Err(e),
+            }
+        }
+        Err(PutSourceError::Other(e)) => Err(e),
+    }
+}
+
+enum PutSourceError {
+    /// `UNAVAILABLE` from the store: the backing object for at least
+    /// one referenced chunk is gone — the listed acks are stale.
+    /// `reject` keeps the store's status message so a misclassified
+    /// transient fault still surfaces its real cause in logs/errors.
+    StaleChunks {
+        missing: Vec<Digest32>,
+        reject: String,
+    },
+    Other(anyhow::Error),
+}
+
+/// Map a `PutPathChunked` failure. An `UNAVAILABLE` triggers stale-ack
+/// recovery: the digests it names (shared formatter/parser in
+/// `rio_proto::chunk_reject`) are the stale acks; an `UNAVAILABLE`
+/// naming none falls back to every chunk in the upload — the store
+/// proved at least one referenced object is unreachable but not which.
+fn classify_put_status(status: tonic::Status, plan_chunks: &[Digest32]) -> PutSourceError {
+    if status.code() == tonic::Code::Unavailable {
+        let named: Vec<Digest32> =
+            rio_proto::chunk_reject::parse_missing_chunk_digests(status.message())
+                .into_iter()
+                .filter(|d| plan_chunks.contains(d))
+                .collect();
+        return PutSourceError::StaleChunks {
+            missing: if named.is_empty() {
+                plan_chunks.to_vec()
+            } else {
+                named
+            },
+            reject: status.message().to_string(),
+        };
+    }
+    PutSourceError::Other(anyhow::Error::new(status).context("PutPathChunked"))
+}
+
+/// One negotiation + upload attempt for a source root.
+async fn try_put_source(
+    clients: &mut Clients,
+    acks: &Arc<Mutex<ClusterAckTable>>,
+    src: &SourceRoot,
+    plan: &SourcePlan,
+) -> Result<(), PutSourceError> {
+    let (novel, present) = negotiate_chunks(clients, acks, src, plan)
+        .await
+        .map_err(PutSourceError::Other)?;
+    let frames = chunk_frames(src, plan, &novel).map_err(PutSourceError::Other)?;
+
+    let req = clients
+        .req(tokio_stream::iter(frames))
+        .map_err(PutSourceError::Other)?;
+    if let Err(status) = clients.store.put_path_chunked(req).await {
+        return Err(classify_put_status(status, &plan.chunk_order));
+    }
+
+    let mut table = acks.lock().expect("ack table mutex poisoned");
+    table
+        .record(ObjectKind::Chunk, &present)
+        .map_err(|e| PutSourceError::Other(e.into()))?;
+    table
+        .record(ObjectKind::Chunk, &novel)
+        .map_err(|e| PutSourceError::Other(e.into()))?;
+    Ok(())
+}
+
+/// Chunk negotiation for one source root: ack table first, then bulk
+/// `HasChunks`. Returns `(novel, present)` — the misses to stream and
+/// the cluster-confirmed hits to ack.
+async fn negotiate_chunks(
+    clients: &mut Clients,
+    acks: &Arc<Mutex<ClusterAckTable>>,
+    src: &SourceRoot,
+    plan: &SourcePlan,
+) -> anyhow::Result<(Vec<Digest32>, Vec<Digest32>)> {
     let (cached, unknown): (Vec<Digest32>, Vec<Digest32>) = {
         let table = acks.lock().expect("ack table mutex poisoned");
         plan.chunk_order
@@ -675,7 +797,18 @@ async fn put_source_chunked(
         present = present.len(),
         "PutPathChunked"
     );
+    Ok((novel, present))
+}
 
+/// Build the `PutPathChunked` frame sequence: the Begin frame plus one
+/// Chunk frame per novel digest, with bodies gathered from the origin
+/// re-read or the CAS-resident bytes — digest-verified either way
+/// before they hit the wire.
+fn chunk_frames(
+    src: &SourceRoot,
+    plan: &SourcePlan,
+    novel: &[Digest32],
+) -> anyhow::Result<Vec<PutPathChunkedRequest>> {
     let begin = PutPathChunkedBegin {
         deriver: String::new(), // sources have no deriver
         outputs: vec![ChunkedOutput {
@@ -691,13 +824,11 @@ async fn put_source_chunked(
         input_closure: vec![],
     };
 
-    // Gather novel chunk bodies (origin re-read or CAS-resident bytes),
-    // digest-verified either way before they hit the wire.
     let mut frames: Vec<PutPathChunkedRequest> = Vec::with_capacity(novel.len() + 1);
     frames.push(PutPathChunkedRequest {
         msg: Some(put_path_chunked_request::Msg::Begin(begin)),
     });
-    for d in &novel {
+    for d in novel {
         let data = match plan
             .chunk_sources
             .get(d)
@@ -723,18 +854,7 @@ async fn put_source_chunked(
             })),
         });
     }
-
-    let req = clients.req(tokio_stream::iter(frames))?;
-    clients
-        .store
-        .put_path_chunked(req)
-        .await
-        .context("PutPathChunked")?;
-
-    let mut table = acks.lock().expect("ack table mutex poisoned");
-    table.record(ObjectKind::Chunk, &present)?;
-    table.record(ObjectKind::Chunk, &novel)?;
-    Ok(())
+    Ok(frames)
 }
 
 fn read_chunk(path: &Path, offset: u64, len: u32) -> anyhow::Result<Vec<u8>> {
@@ -746,4 +866,48 @@ fn read_chunk(path: &Path, offset: u64, len: u32) -> anyhow::Result<Vec<u8>> {
     f.read_exact(&mut buf)
         .with_context(|| format!("reading chunk {path:?}+{offset}+{len}"))?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The recovery trigger at the client boundary: an `UNAVAILABLE`
+    /// built with the store's shared formatter classifies as
+    /// `StaleChunks` naming exactly the digest; one naming nothing from
+    /// this upload falls back to the whole chunk set; any other code
+    /// never triggers recovery.
+    #[test]
+    fn classify_put_status_extracts_stale_chunks() {
+        let plan: Vec<Digest32> = vec![[0x11; 32], [0x22; 32]];
+
+        let status = tonic::Status::unavailable(format!(
+            "PutPathChunked: {}",
+            rio_proto::chunk_reject::missing_chunk_digest_message(&hex::encode([0x22u8; 32]))
+        ));
+        match classify_put_status(status, &plan) {
+            PutSourceError::StaleChunks { missing, .. } => {
+                assert_eq!(missing, vec![[0x22; 32]]);
+            }
+            PutSourceError::Other(e) => panic!("expected StaleChunks, got {e:#}"),
+        }
+
+        // A reject naming no chunk of this upload (e.g. a transient S3
+        // fault message) conservatively evicts the whole set, and the
+        // original message is retained for the eventual hard error.
+        let status = tonic::Status::unavailable("PutPathChunked: chunk upload failed: timeout");
+        match classify_put_status(status, &plan) {
+            PutSourceError::StaleChunks { missing, reject } => {
+                assert_eq!(missing, plan);
+                assert_eq!(reject, "PutPathChunked: chunk upload failed: timeout");
+            }
+            PutSourceError::Other(e) => panic!("expected StaleChunks, got {e:#}"),
+        }
+
+        // Anything that is not UNAVAILABLE is a plain error.
+        assert!(matches!(
+            classify_put_status(tonic::Status::invalid_argument("bad Begin"), &plan),
+            PutSourceError::Other(_)
+        ));
+    }
 }

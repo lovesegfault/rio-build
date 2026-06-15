@@ -2113,6 +2113,11 @@
       "doc": ""
     },
     {
+      "name": "PutSourceError",
+      "crate": "rio-build-cli",
+      "doc": ""
+    },
+    {
       "name": "SubmitError",
       "crate": "rio-build-cli",
       "doc": ""

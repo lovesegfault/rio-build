@@ -108,6 +108,22 @@ caveat: a `toFile` path with references registers cluster-side with an
 empty reference set (the `SourceRoot` frame carries none) --- a follow-up
 threads references through.
 
+#r("bc.upload.stale-ack-once")[
+  On an `UNAVAILABLE` reject from `PutPathChunked` the client MUST evict the
+  chunk acks the reject names (or, when it names none, every chunk ack
+  involved in that upload), re-probe presence via `HasChunks`, re-upload
+  what the cluster reports missing, and retry the upload exactly once; a
+  second reject is a hard error.
+]
+
+This is the chunk sibling of the drv-digest recovery below: the ack TTL is
+allowed to exceed the cluster's orphan-chunk GC grace, and a `chunks` row
+can outlive its S3 object, so a presence answer the client cached can stop
+being true. The store rejects the upload `UNAVAILABLE` naming the digest it
+could not fetch back (and demotes the lying presence row); without the
+eviction-and-retry cycle the client keeps trusting its ack and fails the
+same upload until the ack expires.
+
 Drv-blob misses upload largest-first (big drvs gate the most downstream
 bytes); restartability is free because a re-`Has` after any disconnect only
 shrinks the miss set.
