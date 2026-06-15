@@ -8,6 +8,7 @@ use crate::db::SchedulerDb;
 use crate::state::DrvHash;
 
 // r[verify sched.poison.ttl-persist]
+// r[verify obs.log.failure-reason-persisted]
 /// Roundtrip: persist_poisoned → load_poisoned_derivations → clear_poison.
 /// Catches the `.as_bytes()` vs `.as_str()` binding regression — PG rejects
 /// BYTEA against a TEXT column, but call sites swallow the error as best-effort.
@@ -56,6 +57,21 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
         "failure_msg must persist the builder error"
     );
     assert_eq!(failure_exec, Some(exec), "failure_exec_id must persist");
+
+    // The fail-fast read path sees the same attribution.
+    let reason = db
+        .load_failure_reason(&drv_hash)
+        .await?
+        .expect("derivation row exists");
+    assert_eq!(
+        reason.failure_msg.as_deref(),
+        Some("builder exited 1: cc not found")
+    );
+    assert_eq!(reason.failure_exec_id, Some(exec));
+    assert!(
+        reason.poisoned_epoch.is_some_and(|e| e > 0.0),
+        "poisoned_epoch must reflect poisoned_at"
+    );
 
     let rows = db.load_poisoned_derivations().await?;
     assert_eq!(rows.len(), 1, "persist_poisoned should make row loadable");

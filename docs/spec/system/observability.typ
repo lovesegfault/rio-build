@@ -285,6 +285,19 @@ holds at the log level too.
   failover.
 ]
 
+#r("obs.log.failure-reason-persisted")[
+  When a derivation reaches terminal failure (poisoned), the scheduler MUST
+  persist the builder-reported error text and the originating execution id
+  alongside the poison mark, and MUST clear both whenever the poison state is
+  reset (admin clear, TTL expiry, resubmit reset).
+]
+
+The persisted reason (`derivations.failure_msg` / `failure_exec_id`,
+migration 073) is what a later build's fail-fast surfaces to the client
+(#rref("sched.merge.failfast-culprit")) --- the original execution's log may
+have expired or contain nothing, but the reason text survives with the poison
+mark and dies with it.
+
 #figure(
   chronos.diagram({
     import chronos: *

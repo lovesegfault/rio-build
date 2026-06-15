@@ -261,6 +261,16 @@ impl DagActor {
                 )
             })
         {
+            // r[impl sched.merge.failfast-culprit]
+            // Attribute the fail-fast to the REAL poisoned culprit (the
+            // node whose execution originally failed) rather than to
+            // whatever cascaded ancestor the reconcile pass surfaced
+            // first, and surface its persisted failure reason. Must run
+            // BEFORE handle_derivation_failure: that helper get_or_inserts
+            // error_summary/failed_derivation, so whichever is set first
+            // wins.
+            self.attribute_failfast_culprit(build_id, &failed_hash)
+                .await;
             self.handle_derivation_failure(build_id, &failed_hash).await;
             // handle_derivation_failure may have transitioned the build to
             // Failed. If so, don't dispatch.
@@ -310,6 +320,83 @@ impl DagActor {
         );
 
         Ok(ingest.event_rx)
+    }
+
+    /// Resolve the poisoned culprit behind a merge-time fail-fast and
+    /// stamp culprit attribution onto the build BEFORE
+    /// `handle_derivation_failure` runs.
+    ///
+    /// `failed_hash` is the first Poisoned-or-DependencyFailed node the
+    /// reconcile pass surfaced. A Poisoned trigger is its own culprit; a
+    /// DependencyFailed ancestor is resolved by descending its dependency
+    /// edges to a Poisoned node. When no Poisoned node is reachable
+    /// (e.g. the poisoned dep was removed by ClearPoison/TTL after the
+    /// cascade ran), nothing is recorded and the failure keeps today's
+    /// generic "derivation X failed" summary.
+    ///
+    /// The persisted reason (`derivations.failure_msg` /
+    /// `failure_exec_id`, M_073) is read best-effort — attribution is
+    /// still useful without it.
+    async fn attribute_failfast_culprit(&mut self, build_id: Uuid, failed_hash: &DrvHash) {
+        let Some(culprit_hash) = self.find_poisoned_culprit(failed_hash) else {
+            return;
+        };
+        let culprit_path = self.dag.path_or_hash_fallback(&culprit_hash);
+
+        let reason = match self.db.load_failure_reason(&culprit_hash).await {
+            Ok(reason) => reason,
+            Err(e) => {
+                warn!(drv_hash = %culprit_hash, error = %e,
+                      "failed to load persisted failure reason for fail-fast culprit (continuing)");
+                None
+            }
+        };
+        let (failure_msg, failure_exec_id, poisoned_epoch) = reason
+            .map(|r| (r.failure_msg, r.failure_exec_id, r.poisoned_epoch))
+            .unwrap_or((None, None, None));
+        let error_message = failure_msg.unwrap_or_default();
+        let summary = if error_message.is_empty() {
+            format!("derivation {culprit_path} failed in an earlier build (still poisoned)")
+        } else {
+            format!("derivation {culprit_path} failed in an earlier build: {error_message}")
+        };
+
+        if let Some(build) = self.builds.get_mut(&build_id) {
+            build.error_summary.get_or_insert(summary);
+            build.failed_derivation.get_or_insert(culprit_path.clone());
+            build.culprit = Some(crate::state::FailfastCulprit {
+                derivation_path: culprit_path,
+                exec_id: failure_exec_id,
+                error_message,
+                failed_at: poisoned_epoch.map(|secs| {
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(secs.max(0.0))
+                }),
+            });
+        }
+    }
+
+    /// BFS from `start` down the dependency edges (DAG children) to the
+    /// first `Poisoned` node. `Some(start)` when `start` itself is
+    /// Poisoned; `None` when no Poisoned node is reachable.
+    fn find_poisoned_culprit(&self, start: &DrvHash) -> Option<DrvHash> {
+        let mut to_visit = vec![start.clone()];
+        let mut visited: HashSet<DrvHash> = HashSet::new();
+        while let Some(hash) = to_visit.pop() {
+            if !visited.insert(hash.clone()) {
+                continue;
+            }
+            match self.dag.node(&hash).map(|s| s.status()) {
+                Some(DerivationStatus::Poisoned) => return Some(hash),
+                // Only descend through nodes that are themselves part of
+                // the failure cascade — a healthy sibling subtree can't
+                // contain the culprit that doomed THIS chain.
+                Some(DerivationStatus::DependencyFailed) => {
+                    to_visit.extend(self.dag.get_children(&hash));
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Steps 0–5 of merge: top-down root prune, DB build row, in-mem DAG

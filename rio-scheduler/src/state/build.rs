@@ -85,6 +85,27 @@ impl BuildStateExt for BuildState {
     }
 }
 
+/// Culprit attribution for a merge-time fail-fast: the build failed
+/// because a derivation in its DAG was already terminally failed
+/// (poisoned) by an EARLIER build, so no execution ran for this build.
+/// Carries what the client needs to show the original failure — the
+/// real culprit derivation (not the cascaded ancestor the reconcile
+/// loop surfaced), the execution that produced it, and the persisted
+/// reason (`derivations.failure_msg`, M_073).
+#[derive(Debug, Clone)]
+pub struct FailfastCulprit {
+    /// .drv path of the poisoned culprit (hash fallback when the path
+    /// is unknown).
+    pub derivation_path: String,
+    /// Execution that produced the original failure. `None` when the
+    /// culprit never reached a worker (fleet-exhaustion poison).
+    pub exec_id: Option<Uuid>,
+    /// Persisted builder error text. Empty when nothing was recorded.
+    pub error_message: String,
+    /// When the culprit was poisoned (`derivations.poisoned_at`).
+    pub failed_at: Option<std::time::SystemTime>,
+}
+
 /// In-memory state for a build request.
 #[derive(Debug, Clone)]
 pub struct BuildInfo {
@@ -127,6 +148,9 @@ pub struct BuildInfo {
     pub error_summary: Option<String>,
     /// The derivation that caused the failure (if any).
     pub failed_derivation: Option<String>,
+    /// Culprit attribution when the failure was a merge-time fail-fast
+    /// on an already-poisoned node. `None` for live failures.
+    pub culprit: Option<FailfastCulprit>,
     /// When the build was submitted (for rio_scheduler_build_duration_seconds).
     pub submitted_at: Instant,
     /// When the orphan-watcher sweep first observed this build's
@@ -168,9 +192,34 @@ impl BuildInfo {
             failed_count: 0,
             error_summary: None,
             failed_derivation: None,
+            culprit: None,
             submitted_at: Instant::now(),
             orphaned_since: None,
         }
+    }
+
+    /// The `BuildFailed` event payload for this build's terminal state:
+    /// the recorded failure summary plus culprit attribution when the
+    /// failure was a merge-time fail-fast on an already-poisoned node.
+    /// Shared by `transition_build_to_failed` and the late-subscriber
+    /// re-send in `handle_watch_build` so the two emit sites can't drift.
+    pub fn to_build_failed(&self) -> rio_proto::types::BuildFailed {
+        let mut failed = rio_proto::types::BuildFailed {
+            error_message: self.error_summary.clone().unwrap_or_default(),
+            failed_derivation: self.failed_derivation.clone().unwrap_or_default(),
+            // TODO: thread BuildResultStatus from the failing derivation
+            // (the completion handler receives it from the worker; build
+            // state needs a field to carry it).
+            status: 0,
+            ..Default::default()
+        };
+        if let Some(culprit) = &self.culprit {
+            failed.culprit_derivation = culprit.derivation_path.clone();
+            failed.culprit_exec_id = culprit.exec_id.map(|u| u.to_string()).unwrap_or_default();
+            failed.culprit_error_message = culprit.error_message.clone();
+            failed.culprit_failed_at = culprit.failed_at.map(prost_types::Timestamp::from);
+        }
+        failed
     }
 
     /// Read the current state.
