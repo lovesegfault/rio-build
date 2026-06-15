@@ -113,6 +113,17 @@ fn remove_path_all(path: &Path) {
     }
 }
 
+/// The name of the `idx`-th out-link, following nix-build's numbering:
+/// `result`, `result-2`, `result-3`, …
+pub fn numbered_link(link: &Path, idx: usize) -> PathBuf {
+    if idx == 0 {
+        return link.to_path_buf();
+    }
+    let mut name = link.file_name().unwrap_or_default().to_os_string();
+    name.push(format!("-{}", idx + 1));
+    link.with_file_name(name)
+}
+
 /// Create (or replace) `link` pointing at `target` — nix's out-link
 /// semantics; the target is either the imported `/nix/store` path or the
 /// CAS materialization (daemonless fallback).
@@ -133,4 +144,20 @@ pub fn out_link(link: &Path, target: &Path) -> anyhow::Result<()> {
     std::os::unix::fs::symlink(target, link)
         .with_context(|| format!("symlinking {} -> {}", link.display(), target.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// nix-build numbering: the first link keeps the given name, further
+    /// outputs get `-2`, `-3`, … (not `-1`).
+    // r[verify bc.outlink.nix-parity]
+    #[test]
+    fn numbered_link_follows_nix_build_numbering() {
+        let link = Path::new("/tmp/result");
+        assert_eq!(numbered_link(link, 0), PathBuf::from("/tmp/result"));
+        assert_eq!(numbered_link(link, 1), PathBuf::from("/tmp/result-2"));
+        assert_eq!(numbered_link(link, 2), PathBuf::from("/tmp/result-3"));
+    }
 }

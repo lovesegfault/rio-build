@@ -55,13 +55,25 @@ struct BuildArgs {
     #[arg(long, value_name = "BUILD_ID", conflicts_with_all = ["attach", "installables"])]
     cancel: Option<String>,
 
-    /// Materialize outputs into the client CAS after completion.
-    #[arg(long)]
-    fetch: bool,
-
-    /// Symlink the (first) fetched output here. Implies --fetch.
-    #[arg(long, value_name = "PATH")]
+    /// Symlink the first fetched output here (default: ./result;
+    /// further outputs get -2, -3, … suffixes).
+    #[arg(
+        short = 'o',
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["no_link", "no_fetch"]
+    )]
     out_link: Option<PathBuf>,
+
+    /// Do not create the ./result out-link (outputs still import into
+    /// the local /nix/store).
+    #[arg(long)]
+    no_link: bool,
+
+    /// Leave completed outputs in the cluster store: no local import,
+    /// no out-link.
+    #[arg(long)]
+    no_fetch: bool,
 
     /// Build import-from-derivation locally instead of remotely.
     /// Flag-gated fallback, default off; not wired yet.
@@ -295,19 +307,24 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
         log_lines: args.log_lines,
         print_build_logs: args.print_build_logs,
     };
+    // Default fetch behavior (also for --attach): import completed
+    // outputs into the local /nix/store and create a ./result out-link;
+    // --no-link drops the link, --no-fetch leaves outputs remote.
+    // r[impl bc.fetch.store-import-default]
+    // r[impl bc.outlink.nix-parity]
+    let fetch = !args.no_fetch;
+    let out_link = if args.no_fetch || args.no_link {
+        None
+    } else {
+        Some(args.out_link.unwrap_or_else(|| PathBuf::from("result")))
+    };
+
     if let Some(id) = &args.attach {
         let (render, render_task) = render::spawn(render_opts, pager_gate);
         let outcome =
             rio_build_cli::coordinator::attach_build(&mut clients, id, render, failure_log).await?;
         let _ = render_task.await;
-        return finish(
-            vec![outcome],
-            args.fetch || args.out_link.is_some(),
-            args.out_link,
-            &mut clients,
-            &cas_root,
-        )
-        .await;
+        return finish(vec![outcome], fetch, out_link, &mut clients, &cas_root).await;
     }
 
     // File mode with zero installables is nix-build's "build the
@@ -369,8 +386,8 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
         opts: CoordinatorOpts {
             keep_going: args.keep_going,
             page_max_nodes: cfg.page_max_nodes,
-            fetch: args.fetch || args.out_link.is_some(),
-            out_link: args.out_link,
+            fetch,
+            out_link,
             local_ifd: args.local_ifd,
             detach_on_interrupt: args.detach,
             failure_log,
@@ -523,7 +540,9 @@ fn eval_plan(
     Ok((argv, attrs))
 }
 
-/// Post-attach fetch handling (mirrors the in-run `--fetch` path).
+/// Post-attach fetch handling (mirrors the in-run default-fetch path):
+/// import into the local /nix/store (or fall back to the CAS) and create
+/// the numbered out-links.
 async fn finish(
     outcomes: Vec<rio_build_cli::coordinator::BuildOutcome>,
     fetch: bool,
@@ -531,19 +550,26 @@ async fn finish(
     clients: &mut Clients,
     cas_root: &std::path::Path,
 ) -> anyhow::Result<()> {
+    let mut fetcher = rio_build_cli::import::OutputFetcher::new(
+        rio_build_cli::import::daemon_socket_path(),
+        cas_root.to_path_buf(),
+        |note| eprintln!("{note}"),
+    );
     let mut failed = false;
+    let mut link_idx = 0usize;
     for o in &outcomes {
         match &o.state {
             OutcomeState::Completed { output_paths } => {
                 println!("build {}: completed {}", o.build_id, output_paths.join(" "));
                 if fetch {
-                    for (i, p) in output_paths.iter().enumerate() {
-                        let dest = rio_build_cli::fetch::materialize(clients, cas_root, p).await?;
+                    for p in output_paths {
+                        let fetched = fetcher.fetch(clients, p).await?;
+                        let dest = fetched.local_path();
                         println!("fetched to {}", dest.display());
-                        if i == 0
-                            && let Some(link) = &out_link
-                        {
-                            rio_build_cli::fetch::out_link(link, &dest)?;
+                        if let Some(link) = &out_link {
+                            let target = rio_build_cli::fetch::numbered_link(link, link_idx);
+                            rio_build_cli::fetch::out_link(&target, dest)?;
+                            link_idx += 1;
                         }
                     }
                 }
@@ -687,6 +713,27 @@ mod tests {
         let args = build_args(&["rio", "build", ".#x"]);
         assert_eq!(args.log_lines, 20);
         assert!(!args.print_build_logs);
+    }
+
+    /// Out-link / fetch flags: `-o` is the short form, `--no-link` and
+    /// `--no-fetch` conflict with it, and the removed `--fetch` flag is
+    /// gone (not aliased).
+    // r[verify bc.outlink.nix-parity]
+    #[test]
+    fn fetch_flags_parse_and_conflict() {
+        let args = build_args(&["rio", "build", ".#x"]);
+        assert!(!args.no_fetch && !args.no_link && args.out_link.is_none());
+
+        let args = build_args(&["rio", "build", ".#x", "-o", "out"]);
+        assert_eq!(args.out_link.as_deref(), Some(Path::new("out")));
+
+        for argv in [
+            vec!["rio", "build", ".#x", "-o", "out", "--no-link"],
+            vec!["rio", "build", ".#x", "-o", "out", "--no-fetch"],
+        ] {
+            assert!(Cli::try_parse_from(&argv).is_err(), "accepted {argv:?}");
+        }
+        assert!(Cli::try_parse_from(["rio", "build", ".#x", "--fetch"]).is_err());
     }
 
     #[test]

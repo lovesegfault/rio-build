@@ -8,11 +8,11 @@ negotiation: the cluster reports which #gls("blake3")-keyed objects it
 already holds, and the client uploads only the misses. It replaces
 `nix build --store ssh-ng://rio` for interactive and CI submission:
 post-eval time-to-first-build drops from 57~s (cold ssh-ng, measured) to
-about one second. The `ssh-ng://` gateway path stays --- use it
-for stock Nix clients that cannot install `rio`, for deployments where only
-the SSH gateway is reachable from outside the cluster, or when you need
-outputs realized into a real local `/nix/store` (`rio build --fetch`
-materializes into the client cache, not `/nix/store`).
+about one second. Completed outputs are imported into the local
+`/nix/store` through the nix daemon by default, with a `./result` out-link
+like `nix build`. The `ssh-ng://` gateway path stays --- use it for stock
+Nix clients that cannot install `rio`, or for deployments where only the
+SSH gateway is reachable from outside the cluster.
 
 See #cross-link("/architecture-build-client.typ")[Build Client Architecture]
 for the process model and the submission pipeline, and the
@@ -86,16 +86,25 @@ pass after `--`) with `RIO_SCHEDULER_ADDR`, `RIO_STORE_ADDR` and
 == Building
 
 ```bash
-# Build a flake attribute against the cluster.
+# Build a flake attribute against the cluster. The completed output's
+# closure is imported into the local /nix/store and ./result points at it.
 rio build .#hello
 
-# Several attributes from the same flake, keep going past failures,
-# and materialize the outputs locally.
-rio build .#pkgA .#pkgB --keep-going --fetch
+# Several attributes from the same flake, keep going past failures.
+rio build .#pkgA .#pkgB --keep-going
 
-# Symlink the first output (implies --fetch).
-rio build .#hello --out-link ./result-hello
+# Rename the out-link, skip the link, or leave outputs in the cluster.
+rio build .#hello -o ./result-hello
+rio build .#hello --no-link
+rio build .#hello --no-fetch
 ```
+
+The local import goes through the nix daemon and keeps signature checking
+on, so the machine's `trusted-public-keys` must include the cluster's
+narinfo signing key (ask your operator for the public half; the EKS
+bootstrap stores it as `rio/signing-key-pub`). When no local daemon is
+reachable --- a container without nix, say --- outputs fall back to the
+client CAS under `<cas_root>/fetched/` and a single stderr note says so.
 
 All installables in one invocation must share a single flake reference ---
 the eval parent locks one flake and fetches its inputs once before forking
@@ -181,16 +190,21 @@ rio build --cancel 01HV5...
     [Cancel a running build. Prints `cancelled BUILD_ID` on success; exits
       non-zero if the build is unknown or already terminal.],
 
-    [`--fetch`],
-    [Materialize completed outputs through the store read path into the
-      client CAS (`<cas_root>/fetched/<basename>`), verifying the streamed
-      NAR's SHA-256 against the server's claimed `nar_hash` before anything
-      appears on disk.],
+    [`-o PATH`, `--out-link PATH`],
+    [Symlink the first fetched output at `PATH` (default `./result`;
+      further outputs get `PATH-2`, `PATH-3`, …).],
 
-    [`--out-link PATH`],
-    [Symlink the first fetched output at `PATH` (further outputs get
-      `PATH-2`, `PATH-3`, …). Implies `--fetch`. The link target is the CAS
-      materialization --- the client has no `/nix/store` to link into.],
+    [`--no-link`],
+    [Do not create the `./result` out-link. Outputs still import into the
+      local `/nix/store`.],
+
+    [`--no-fetch`],
+    [Leave completed outputs in the cluster store: no local import, no
+      out-link. Without this flag every completed output's closure is
+      imported into the local `/nix/store` through the nix daemon
+      (NAR streams are SHA-256-verified on the way), falling back to the
+      client CAS (`<cas_root>/fetched/<basename>`) when no daemon is
+      reachable.],
 
     [`-f PATH`, `--file PATH`],
     [Evaluate a plain Nix file (or a directory containing `default.nix`)
@@ -378,10 +392,21 @@ mini-build, its output fetched back into the client CAS, and the worker
 resumes. Deep import chains serialize on this --- expect a pause per link.
 `--local-ifd` exists as the planned escape hatch but is not wired yet.
 
-*"narHash mismatch fetching …: refusing to materialize".* The streamed NAR
-did not hash to what the store claimed; nothing was written. Retry once; a
-persistent mismatch points at store-side corruption and should go to the
-operator.
+*"narHash mismatch fetching …: refusing to import/materialize".* The
+streamed NAR did not hash to what the store claimed; nothing was written
+(the daemon discards the partial import, the CAS keeps no temp tree). Retry
+once; a persistent mismatch points at store-side corruption and should go
+to the operator.
+
+*"the local nix daemon refused to import …: it is not signed by any key in
+this machine's `trusted-public-keys`".* The cluster signs outputs with its
+narinfo signing key, but this machine's nix daemon does not trust it yet.
+Add the cluster's public key (the error names the key; your operator holds
+the public half, on EKS as the `rio/signing-key-pub` secret) to
+`trusted-public-keys` in `nix.conf`, or pass `--no-fetch` to leave outputs
+in the cluster store. A tenant-specific signing key, when configured
+cluster-side, takes the place of the cluster key in both the signature and
+the error.
 
 *"detached: ‹attr› continues as build ‹id›".* That is Ctrl-C under
 `--detach` behaving as designed. `rio build --attach ‹id›` resumes the
@@ -406,13 +431,12 @@ Implementation gaps in the current client, not design decisions.
 - *IFD output references.* Outputs fetched back for import-from-derivation
   are recorded with empty reference sets; evaluation logic that depends on
   the references of an imported output does not see them.
-- *`--fetch` buffers whole NARs.* Output materialization holds the full NAR
-  in memory before verifying and restoring it. Fine for typical outputs;
-  very large outputs are expensive until streaming restore lands.
+- *`./result` is not a GC root.* The out-link is a plain symlink; it is not
+  registered as an indirect garbage-collector root the way `nix-build`'s
+  is, so `nix-collect-garbage` may delete the imported output.
 - *Mutated-origin escape hatch.* ADR-024's bounded re-ingest (re-negotiate
   the delta at most twice, then snapshot) is not implemented; a mutated
   origin is a hard error for that root.
 - *`--local-ifd` is not wired.* The flag is parsed and plumbed, but the
   local fallback build path does not exist yet; IFD always builds remotely.
-- *One flake per invocation*, and fetched outputs land in the client CAS,
-  not in `/nix/store`.
+- *One flake per invocation.*
