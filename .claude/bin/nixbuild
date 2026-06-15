@@ -62,8 +62,12 @@ case "$target" in
   --checks)
     mode="checks"
     system="$(nix eval --raw --impure --expr builtins.currentSystem)"
+    # Cap eval workers — nix-eval-jobs scales badly past ~16 even with more cores.
+    nproc_val=$(nproc)
+    eval_workers=$(( nproc_val < 16 ? nproc_val : 16 ))
     # CI gate: stream-eval all checks via nix-eval-jobs.
     nix-fast-build --no-nom --skip-cached \
+      --eval-workers "$eval_workers" \
       --flake "${root}#checks.${system}" \
       "$@" >>"$log" 2>&1
     rc=$?
