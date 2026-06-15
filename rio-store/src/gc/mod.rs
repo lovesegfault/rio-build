@@ -80,6 +80,14 @@
 /// `gensets/destructive-lane-census.txt`) derives the suspended
 /// population from the spawn-periodic family × the
 /// reaches-delete-sink predicate, with `run_gc` pinned.
+///
+/// `#[deny(missing_docs_in_private_items)]` (bug_022): rustdoc
+/// attachment is positional — inserting an item between a doc block
+/// and its target silently re-targets the contract (the
+/// bound-parameterized-engine paragraph rode `regate` for a release
+/// while `authorize_batch_with_bound` rendered bare). The deny makes
+/// the newly-bare item a clippy red instead of a confused reader.
+#[deny(clippy::missing_docs_in_private_items)]
 pub mod hold {
     use sqlx::PgPool;
     use uuid::Uuid;
@@ -211,6 +219,7 @@ pub mod hold {
         /// `tokio::time::Instant`: monotonic in production, virtual
         /// under paused test time.
         consulted_at: tokio::time::Instant,
+        /// Construction privacy: only [`gate`] mints a clearance.
         _proof: (),
     }
 
@@ -229,6 +238,9 @@ pub mod hold {
     #[must_use = "an unconsumed batch authority is an unauthorized batch"]
     #[derive(Debug)]
     pub struct BatchAuthority {
+        /// Construction privacy: only
+        /// [`HoldClearance::authorize_batch`]'s `Authorized` arm
+        /// mints a token (R32 — one consult, one batch).
         _proof: (),
     }
 
@@ -293,12 +305,6 @@ pub mod hold {
                 .await
         }
 
-        /// The bound-parameterized engine behind
-        /// [`Self::authorize_batch`] (which pins `bound` to
-        /// `DESTRUCTIVE_BATCH_DRAIN_BOUND` by delegation — the one
-        /// production entry). Parameterized so the expiry face is
-        /// witnessable in test time without a 30s sleep; production
-        /// code calls the delegating wrapper.
         /// THE phase-seam consult (merged_bug_081, R29'): authority
         /// ages from the consumer's last CONSULT OPPORTUNITY, not the
         /// mint. The drain-cadence bound was frozen from the S3 drain
@@ -327,6 +333,12 @@ pub mod hold {
             }
         }
 
+        /// The bound-parameterized engine behind
+        /// [`Self::authorize_batch`] (which pins `bound` to
+        /// `DESTRUCTIVE_BATCH_DRAIN_BOUND` by delegation — the one
+        /// production entry). Parameterized so the expiry face is
+        /// witnessable in test time without a 30s sleep; production
+        /// code calls the delegating wrapper.
         pub(crate) async fn authorize_batch_with_bound(
             &mut self,
             pool: &PgPool,
