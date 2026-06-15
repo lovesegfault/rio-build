@@ -439,6 +439,24 @@ impl Drop for LogTailSet {
     }
 }
 
+/// What one [`drive_stream`] call observed: whether ANY chunk reached
+/// the output channel (`relayed_any` — the `r[sys.recovery.witnessed-clear]`
+/// witnessed-work bit) and how the stream stopped (`end`).
+///
+/// merged_bug_006 (the §Multi-axis-fn sibling-arm hole): the
+/// witnessed-work bit was a per-arm `last_relayed != relayed_before`
+/// diff that the `DriveEnd::Gap` arm never computed — a drive that
+/// served lines and then withheld at a forward jump bypassed the
+/// degradation clear. `relayed_any` is constructed at exactly ONE
+/// site (the function tail, after the labeled-break loop), so a
+/// future 13th `DriveEnd` exit cannot hand-roll `relayed_any: false`
+/// — there is no construction site for it.
+#[must_use]
+struct DriveOutcome {
+    relayed_any: bool,
+    end: DriveEnd,
+}
+
 /// Why one driven `TailLog` stream stopped yielding, as observed by
 /// [`drive_stream`]. The kernel's [`tail_next`] — not this enum —
 /// decides whether the subscription re-opens or exits.
@@ -1122,8 +1140,7 @@ async fn run_tail(
                 // persistently-refusing peer, and neither the 30s
                 // notice nor the per-episode warn could ever fire. The
                 // clear moves below, gated on the FIRST RELAYED CHUNK.
-                let relayed_before = last_relayed;
-                match drive_stream(
+                let DriveOutcome { relayed_any, end } = drive_stream(
                     resp.into_inner(),
                     &derivation_path,
                     &exec_id,
@@ -1137,27 +1154,30 @@ async fn run_tail(
                     config.terminal_grace,
                     config.reconnect_backoff,
                 )
-                .await
-                {
+                .await;
+                // r[impl sys.recovery.witnessed-clear]
+                // The episode-ending event is WITNESSED WORK:
+                // `degraded` clears only on the first relayed chunk.
+                // Hoisted ABOVE the `DriveEnd` match (merged_bug_006,
+                // the §Multi-axis-fn hoist-the-guard template): EVERY
+                // drive that relayed lines clears the episode — Ended,
+                // Gap, AND any future variant. A drive that ends with
+                // zero lines relayed via err_stream (TransportErr)
+                // ARMS the episode — that is the store's primary
+                // refusal channel and exactly the dark-tail shape the
+                // 30s notice exists for. A drive that ends NaturalEnd
+                // with zero new lines is an idle-but-healthy tail (a
+                // quiet build) and neither clears nor arms — the
+                // conservative form (a held-open stream that yields
+                // nothing is not degradation, per the WO derivation).
+                if relayed_any {
+                    degraded = None;
+                    degraded_notice_sent = false;
+                }
+                match end {
                     DriveEnd::OutputClosed => return,
                     DriveEnd::Ended(cause) => {
-                        // r[impl sys.recovery.witnessed-clear]
-                        // The episode-ending event is WITNESSED WORK:
-                        // `degraded` clears only on the first relayed
-                        // chunk. A drive that ends with zero lines
-                        // relayed via err_stream (TransportErr) ARMS
-                        // the episode — that is the store's primary
-                        // refusal channel and exactly the dark-tail
-                        // shape the 30s notice exists for. A drive
-                        // that ends NaturalEnd with zero new lines is
-                        // an idle-but-healthy tail (a quiet build) and
-                        // neither clears nor arms — the conservative
-                        // form (a held-open stream that yields nothing
-                        // is not degradation, per the WO derivation).
-                        if last_relayed != relayed_before {
-                            degraded = None;
-                            degraded_notice_sent = false;
-                        } else if matches!(cause, TailStopCause::TransportErr) {
+                        if !relayed_any && matches!(cause, TailStopCause::TransportErr) {
                             let was_armed = degraded.is_some();
                             degraded.get_or_insert_with(|| {
                                 let armed = Instant::now();
@@ -1490,8 +1510,13 @@ async fn drive_stream(
     accepted_gap_floor: &mut Option<u64>,
     terminal_grace: Duration,
     reconnect_backoff: Duration,
-) -> DriveEnd {
-    loop {
+) -> DriveOutcome {
+    let entry_floor = *last_relayed;
+    // merged_bug_006: every former `return DriveEnd::X` is a
+    // `break 'drive DriveEnd::X` so `relayed_any` is computed at
+    // exactly ONE site — the function tail. A future exit cannot
+    // bypass it.
+    let end: DriveEnd = 'drive: loop {
         tokio::select! {
             msg = stream.message() => match msg {
                 Ok(Some(chunk)) => {
@@ -1560,7 +1585,7 @@ async fn drive_stream(
                             // bottleneck and "exit promptly after terminal"
                             // has already lost to "deliver the lines at all".
                             if out_tx.send(tagged).await.is_err() {
-                                return DriveEnd::OutputClosed;
+                                break 'drive DriveEnd::OutputClosed;
                             }
                             match heal {
                                 ServeHeal::Untouched => {}
@@ -1570,7 +1595,7 @@ async fn drive_stream(
                                 ServeHeal::Healed(mut armed) => {
                                     armed.note_delivered(next_line);
                                     if !armed.send_lines(last_relayed).await {
-                                        return DriveEnd::OutputClosed;
+                                        break 'drive DriveEnd::OutputClosed;
                                     }
                                 }
                             }
@@ -1619,7 +1644,7 @@ async fn drive_stream(
                                         )
                                         .await
                                         {
-                                            return DriveEnd::OutputClosed;
+                                            break 'drive DriveEnd::OutputClosed;
                                         }
                                         break;
                                     }
@@ -1642,7 +1667,7 @@ async fn drive_stream(
                                     )
                                     .await
                                     {
-                                        return DriveEnd::OutputClosed;
+                                        break 'drive DriveEnd::OutputClosed;
                                     }
                                     continue;
                                 }
@@ -1674,7 +1699,7 @@ async fn drive_stream(
                                     )
                                     .await
                                     {
-                                        return DriveEnd::OutputClosed;
+                                        break 'drive DriveEnd::OutputClosed;
                                     }
                                     break;
                                 }
@@ -1711,7 +1736,7 @@ async fn drive_stream(
                                         )
                                         .await
                                         {
-                                            return DriveEnd::OutputClosed;
+                                            break 'drive DriveEnd::OutputClosed;
                                         }
                                         break;
                                     }
@@ -1722,14 +1747,14 @@ async fn drive_stream(
                                     // replica version skew, racing
                                     // manifest read). The withheld copy
                                     // makes every later exit total.
-                                    return DriveEnd::Gap;
+                                    break 'drive DriveEnd::Gap;
                                 }
                             }
                         }
                         }
                     }
                 }
-                Ok(None) => return DriveEnd::Ended(TailStopCause::NaturalEnd),
+                Ok(None) => break 'drive DriveEnd::Ended(TailStopCause::NaturalEnd),
                 Err(status) => {
                     // merged_bug_164's reader half: a status the store
                     // typed as unservable-forever
@@ -1748,10 +1773,10 @@ async fn drive_stream(
                             msg = %status.message(),
                             "TailLog stream refused as permanently unservable; not retrying"
                         );
-                        return DriveEnd::Ended(TailStopCause::PermanentErr);
+                        break 'drive DriveEnd::Ended(TailStopCause::PermanentErr);
                     }
                     debug!(code = ?status.code(), "TailLog stream error");
-                    return DriveEnd::Ended(TailStopCause::TransportErr);
+                    break 'drive DriveEnd::Ended(TailStopCause::TransportErr);
                 }
             },
             // The derivation went terminal while the stream is open:
@@ -1763,7 +1788,7 @@ async fn drive_stream(
                 // unreachable, but a closed drain means there is nobody
                 // left to flip it — treat as terminal-with-no-grace.
                 if res.is_err() {
-                    return DriveEnd::Ended(TailStopCause::NaturalEnd);
+                    break 'drive DriveEnd::Ended(TailStopCause::NaturalEnd);
                 }
                 arm_grace(grace_deadline, drain, terminal_grace);
             }
@@ -1775,9 +1800,13 @@ async fn drive_stream(
                 if grace_deadline.is_some() =>
             {
                 debug!("post-terminal grace expired; closing the log tail");
-                return DriveEnd::Ended(TailStopCause::NaturalEnd);
+                break 'drive DriveEnd::Ended(TailStopCause::NaturalEnd);
             }
         }
+    };
+    DriveOutcome {
+        relayed_any: *last_relayed != entry_floor,
+        end,
     }
 }
 

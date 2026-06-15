@@ -113,10 +113,12 @@ R34_CLEARS = {
         "landed",
         "S1",
         "rio-gateway/src/handler/log_tail.rs",
-        r"if last_relayed != relayed_before",
-        "first relayed chunk on the live tail (the DriveEnd::Ended arm "
-        "snapshots last_relayed before drive_stream and clears the "
-        "degraded episode iff it advanced — the merged_bug_003 repair)",
+        r"if relayed_any \{",
+        "first relayed chunk on the live tail (drive_stream returns "
+        "DriveOutcome{relayed_any, end} and run_tail clears the "
+        "degraded episode iff relayed_any — hoisted ABOVE the DriveEnd "
+        "match per merged_bug_006 so EVERY end variant, Gap included, "
+        "consults it; the merged_bug_003 repair)",
         (
             "relayed-line",
             "the occupancy-keyed clear: episode ends on the first "
