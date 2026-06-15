@@ -380,10 +380,11 @@ fn dropped_guard_join_panics() {
             health_addr: ([127, 0, 0, 1], 0).into(),
             ..Default::default()
         },
-        shutdown.clone(),
+        shutdown,
     );
-    shutdown.cancel();
-    // GuardJoin drops here → panic("… bug_023 …").
+    // `_` drops at end-of-statement (the line above), so the Drop-panic
+    // already fired; the guard thread leaks for this nextest process's
+    // lifetime — bounded.
 }
 
 /// r26 irony-check on bug_023 (the §one-step-removed inverse): a
