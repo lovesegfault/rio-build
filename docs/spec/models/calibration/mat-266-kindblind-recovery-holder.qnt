@@ -31,23 +31,29 @@
 //     --invariant=claimedByOnlyMatHolders \
 //     docs/spec/models/calibration/mat-266-kindblind-recovery-holder.qnt
 module matCalib266KindblindRecoveryHolder {
+  // Parameter ladder: the bug needs ONE drv with a KBuild attempt open
+  // and no unresolved job, then one failover — singleton sets suffice
+  // everywhere multiplicity is not load-bearing. The original 2× sizing
+  // outgrew the witness budget once the model accumulated the
+  // walk/stamp/A4 oracle planes; measured falsification at this regime
+  // is in the introducing commit.
   import materializationJob(
-    BUILDS = Set("b1", "b2"),
+    BUILDS = Set("b1"),
     DRVS = Set("d1"),
-    OUTPUTS = Set("o1", "o2"),
-    REPLICAS = Set("r1", "r2"),
+    OUTPUTS = Set("o1"),
+    REPLICAS = Set("r1"),
     BUILDERS = Set("w1"),
-    MAT_BUDGET = 2,
-    MAX_EXECS = 4,
+    MAT_BUDGET = 1,
+    MAX_EXECS = 2,
     MAX_GEN = 1,
-    MAX_UPSTREAM_FLIPS = 4,
+    MAX_UPSTREAM_FLIPS = 1,
     MAX_LEGACY = 0,
     ENABLE_FAILOVER = true,
-    ENABLE_GC = true,
+    ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
-    TENANTS = Set("tA", "tB"),
+    TENANTS = Set("tA"),
     ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
