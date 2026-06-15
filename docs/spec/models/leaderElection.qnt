@@ -2999,6 +2999,16 @@ module leaderElection {
   /// poll tick instead of waiting out the staleness threshold. The
   /// fenceThenExit latch records the interesting shape: exiting
   /// not-believing while the apiserver still names us.
+  ///
+  /// Hosting (bug_023; sys.epilogue.drain): the model collapses
+  /// "release decided" and "release LANDED at the apiserver" into one
+  /// step. Production threads them through TWO lifetime levels — the
+  /// guard runtime drains the lease loop's `step_down()` PATCH
+  /// (bug_118), AND the process owner `GuardJoin::join()`s the guard
+  /// thread before `main()` returns (bug_023). The calibration
+  /// override lease-023-unjoined-guard swaps the release for a
+  /// nondeterministic `landed` to model process exit aborting the
+  /// in-flight PATCH; gracefulHandover must fall there.
   action shutdown(n: Node): bool = {
     // The release predicate — THE FIX: hold-gated. The latch below
     // fires iff the node exits while the GATE'S OWN SPEC says release

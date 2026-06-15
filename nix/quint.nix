@@ -2156,6 +2156,23 @@ rec {
       extraSpecs = [ "leaderElection" ];
     };
 
+    # bug_023 pre-fix: UNJOINED guard thread — the §Verifier-one-step
+    # -removed(b) recurrence of bug_118 one lifecycle level up
+    # (runtime→task drain was fixed; process→thread join was not).
+    # The release gate DECIDES correctly but a nondeterministic
+    # `landed` ANDs in: process exit kills the detached rio-guard
+    # thread mid-PATCH; gracefulHandover falls. The `(GuardHandle,
+    # GuardJoin)` split + Drop-panic make `landed = false`
+    # unrepresentable on the graceful-SIGTERM path.
+    quint-lease-calib-023-unjoined-guard = mkQuintWitnessCheck {
+      name = "lease-calib-023-unjoined-guard";
+      spec = "calibration/lease-023-unjoined-guard";
+      main = "leaseCalib023UnjoinedGuard";
+      witness = "gracefulHandover";
+      step = "calibStep";
+      extraSpecs = [ "leaderElection" ];
+    };
+
     # merged_bug_303 pre-fix (bughunt2-wave slot 8): BLIND TIMEOUT --
     # no evidence rule (no consumption, no anchor stamp, no forcing
     # cap, the pre-fix GET): a fenced holder whose committed writes
