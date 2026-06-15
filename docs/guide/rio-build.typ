@@ -202,6 +202,10 @@ failed or was cancelled, or the run was interrupted (the default Ctrl-C
 cancellation). A `--detach` run interrupted by Ctrl-C exits zero after
 printing the reattach hints.
 
+`RUST_LOG` sets the coordinator's log level and is mirrored into the eval
+parent as nix's own verbosity --- `RUST_LOG=debug` also shows nix fetch and
+eval detail.
+
 = Configuration
 
 The component name for config layering is `build`: TOML at

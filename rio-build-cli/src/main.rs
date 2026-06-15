@@ -110,6 +110,26 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Mirror the coordinator's resolved tracing level into the env value
+/// the eval parent maps onto nix's own verbosity, so `RUST_LOG=debug`
+/// also surfaces nix fetch/eval detail. `None` means leave nix at its
+/// default: info matches it already, and OFF has no nix equivalent
+/// worth forcing.
+fn nix_verbosity_env(level: tracing::level_filters::LevelFilter) -> Option<&'static str> {
+    use tracing::level_filters::LevelFilter;
+    if level == LevelFilter::ERROR {
+        Some("error")
+    } else if level == LevelFilter::WARN {
+        Some("warn")
+    } else if level == LevelFilter::DEBUG {
+        Some("debug")
+    } else if level == LevelFilter::TRACE {
+        Some("trace")
+    } else {
+        None
+    }
+}
+
 async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
     let cfg: Config = rio_common::config::load("build", &args.overlay)?;
     cfg.validate()?;
@@ -168,8 +188,13 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
     // ephemeral region and corrupt it; pipe it and forward through the
     // renderer instead.
     let pipe_stderr = !matches!(render_opts.mode, render::RenderMode::Plain);
-    let (chan, mut child) = evalchan::spawn_eval_parent(eval_parent, &parent_args, pipe_stderr)
-        .with_context(|| format!("spawning eval parent {}", eval_parent.display()))?;
+    // `current()` is the subscriber's global max-level hint, so a per-target
+    // directive (`RUST_LOG=info,h2=trace`) raises nix verbosity too — accepted
+    // coarseness for a debugging aid, not worth resolving per target.
+    let nix_verbosity = nix_verbosity_env(tracing::level_filters::LevelFilter::current());
+    let (chan, mut child) =
+        evalchan::spawn_eval_parent(eval_parent, &parent_args, pipe_stderr, nix_verbosity)
+            .with_context(|| format!("spawning eval parent {}", eval_parent.display()))?;
 
     let acks = std::sync::Arc::new(std::sync::Mutex::new(ClusterAckTable::open(
         &cas_root,
@@ -356,8 +381,24 @@ async fn finish(
 
 #[cfg(test)]
 mod tests {
-    use super::eval_plan;
+    use super::{eval_plan, nix_verbosity_env};
     use std::path::Path;
+    use tracing::level_filters::LevelFilter;
+
+    #[test]
+    fn nix_verbosity_env_maps_tracing_level() {
+        let cases = [
+            (LevelFilter::OFF, None),
+            (LevelFilter::ERROR, Some("error")),
+            (LevelFilter::WARN, Some("warn")),
+            (LevelFilter::INFO, None),
+            (LevelFilter::DEBUG, Some("debug")),
+            (LevelFilter::TRACE, Some("trace")),
+        ];
+        for (level, expected) in cases {
+            assert_eq!(nix_verbosity_env(level), expected, "level={level}");
+        }
+    }
 
     #[test]
     fn eval_plan_flake_mode_splits_fragments() {

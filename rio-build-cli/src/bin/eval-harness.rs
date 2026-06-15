@@ -100,8 +100,9 @@ async fn main() -> anyhow::Result<()> {
         parent_args.extend(["--workers".into(), n.to_string()]);
     }
 
-    let (chan, mut child) = evalchan::spawn_eval_parent(&args.eval_parent, &parent_args, false)
-        .context("spawning eval parent")?;
+    let (chan, mut child) =
+        evalchan::spawn_eval_parent(&args.eval_parent, &parent_args, false, None)
+            .context("spawning eval parent")?;
     let evalchan::EvalChannel {
         mut reader,
         mut writer,
