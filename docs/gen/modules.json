@@ -1137,6 +1137,11 @@
       "doc": "Helpers on the `rio.castore` wire types that both producers and"
     },
     {
+      "path": "chunk_reject.rs",
+      "depth": 0,
+      "doc": "The `PutPathChunked` missing-chunk reject contract (ADR-024)."
+    },
+    {
       "path": "client/",
       "depth": 0,
       "doc": "gRPC client transport: channel construction, h2 tuning, and the"
