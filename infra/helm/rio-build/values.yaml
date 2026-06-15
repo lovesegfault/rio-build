@@ -388,6 +388,35 @@ store:
   # (pgMaxConnections × 3).clamp(64, 128). Override only when the
   # derived value mis-tracks the upstream-fetch bottleneck.
   # substituteAdmissionPermits: 128
+  # ── narinfo signing ────────────────────────────────────────────────
+  # Mounts the rio-signing-key Secret and sets RIO_SIGNING_KEY_PATH so
+  # the store signs every uploaded path's narinfo with the cluster key
+  # (Nix secret-key format, `name:base64`). Without it `rio build`
+  # clients cannot import outputs into a local /nix/store whose daemon
+  # enforces `require-sigs` (the default) — they fall back to the
+  # client CAS.
+  #
+  # Where the Secret comes from:
+  #   EKS    — the rio-signing-key ExternalSecret (externalSecrets.enabled),
+  #            populated by the bootstrap Job as `rio/signing-key`. The
+  #            matching PUBLIC key is stored as `rio/signing-key-pub`;
+  #            that is what users add to their machines'
+  #            `trusted-public-keys`.
+  #   dev/k3s — set `key` below (e.g. the output of
+  #            `nix-store --generate-binary-cache-key rio-dev-1
+  #            secret pub`); the chart then renders the Secret itself.
+  #            NEVER commit a real value — pass via --set or a values
+  #            override file.
+  # Per-tenant signing keys (the store's tenant_keys table) override the
+  # cluster key per upload; clients of such a tenant must trust the
+  # tenant key's public half instead.
+  signing:
+    # Set false to run the store without narinfo signing even when a
+    # source for the Secret exists.
+    enabled: true
+    # Dev/k3s literal signing key (`name:base64-secret`). Ignored when
+    # externalSecrets.enabled (the ExternalSecret owns the Secret).
+    key: ""
   resources:
     # NAR uploads buffer up to one chunk (4MB) per concurrent stream.
     # 10 × 4MB = 40MB working set + ChunkCache (default 2GB). 4Gi is headroom.

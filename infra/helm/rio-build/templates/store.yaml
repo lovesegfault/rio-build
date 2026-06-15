@@ -3,6 +3,12 @@
 {{- $cb := $s.chunkBackend | default dict -}}
 {{- $fsChunks := eq ($cb.kind | default "") "filesystem" -}}
 {{- $express := and (eq ($cb.kind | default "") "tiered") $cb.expressBuckets -}}
+{{- /* narinfo signing: mount rio-signing-key when a source for the Secret
+       exists — the ExternalSecret (EKS) or the literal store.signing.key
+       (dev/k3s, rendered below). Without the mount signing_key_path stays
+       None and uploaded paths are unsigned, which blocks `rio build`'s
+       local /nix/store import on require-sigs daemons. */}}
+{{- $signing := and $s.signing.enabled (or .Values.externalSecrets.enabled (ne $s.signing.key "")) -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -174,11 +180,20 @@ spec:
               value: {{ .endpoint | quote }}
             {{- end }}
             {{- end }}
+            {{- if $signing }}
+            - name: RIO_SIGNING_KEY_PATH
+              value: /etc/rio/signing/key
+            {{- end }}
             {{- with $s.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
             {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac" "rdsCa")) | nindent 12 }}
+            {{- if $signing }}
+            - name: signing-key
+              mountPath: /etc/rio/signing
+              readOnly: true
+            {{- end }}
             {{- if $express }}
             # /etc/rio/store.toml written by the express-bucket
             # initContainer. Mounting the emptyDir at /etc/rio is safe
@@ -212,6 +227,11 @@ spec:
             {{- toYaml $s.resources | nindent 12 }}
       volumes:
         {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac" "rdsCa")) | nindent 8 }}
+        {{- if $signing }}
+        - name: signing-key
+          secret:
+            secretName: rio-signing-key
+        {{- end }}
         {{- if $express }}
         - name: rio-etc
           emptyDir: {}
@@ -242,6 +262,24 @@ spec:
   resources:
     requests:
       storage: {{ dig "persistence" "size" "2Gi" $cb }}
+{{- end }}
+{{- if and $s.signing.enabled (ne $s.signing.key "") (not .Values.externalSecrets.enabled) }}
+---
+# Dev/k3s narinfo signing key, rendered from the literal
+# store.signing.key value. EKS deployments get the same Secret from the
+# rio-signing-key ExternalSecret instead (the bootstrap Job populates
+# rio/signing-key, and publishes the public half as rio/signing-key-pub
+# for users' trusted-public-keys).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rio-signing-key
+  namespace: {{ .Values.namespaces.store.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
+type: Opaque
+stringData:
+  key: {{ $s.signing.key | quote }}
 {{- end }}
 # ClusterIP + headless pair (see rio.grpcServicePair). Builders/fetchers
 # resolve the headless name to pod IPs and p2c across them — a sticky
