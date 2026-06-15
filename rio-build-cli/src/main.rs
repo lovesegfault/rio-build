@@ -21,7 +21,7 @@ use clap::{Args, Parser, Subcommand};
 use rio_build_cli::acks::ClusterAckTable;
 use rio_build_cli::config::{Config, ConfigOverlay};
 use rio_build_cli::coordinator::clients::Clients;
-use rio_build_cli::coordinator::{Coordinator, CoordinatorOpts, OutcomeState};
+use rio_build_cli::coordinator::{Coordinator, CoordinatorOpts, FailureLogOpts, OutcomeState};
 use rio_build_cli::{evalchan, render};
 
 #[derive(Parser)]
@@ -95,6 +95,16 @@ struct BuildArgs {
     /// Continue building independent derivations after a failure.
     #[arg(long)]
     keep_going: bool,
+
+    /// When the build fails on a derivation that already failed in an
+    /// earlier build, replay the last N lines of the original failure's
+    /// log.
+    #[arg(long, default_value = "20", value_name = "N")]
+    log_lines: u32,
+
+    /// Replay the original failure's full build log instead of a tail.
+    #[arg(short = 'L', long)]
+    print_build_logs: bool,
 
     /// Renderer: auto picks tty when stderr+stdin are a tty and
     /// TERM≠dumb, ci when GITHUB_ACTIONS is set, otherwise plain (one
@@ -175,9 +185,14 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
     // High while a pager owns the terminal: Ctrl-C must reach the pager
     // (exits less follow mode), not abort builds behind its back.
     let pager_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failure_log = FailureLogOpts {
+        log_lines: args.log_lines,
+        print_build_logs: args.print_build_logs,
+    };
     if let Some(id) = &args.attach {
         let (render, render_task) = render::spawn(render_opts, pager_gate);
-        let outcome = rio_build_cli::coordinator::attach_build(&mut clients, id, 0, render).await?;
+        let outcome =
+            rio_build_cli::coordinator::attach_build(&mut clients, id, render, failure_log).await?;
         let _ = render_task.await;
         return finish(
             vec![outcome],
@@ -252,6 +267,7 @@ async fn run_build(args: BuildArgs) -> anyhow::Result<()> {
             out_link: args.out_link,
             local_ifd: args.local_ifd,
             detach_on_interrupt: args.detach,
+            failure_log,
             ..CoordinatorOpts::default()
         },
         render,
@@ -440,7 +456,7 @@ async fn finish(
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, FileEvalOpts, eval_plan, nix_verbosity_env};
+    use super::{Cli, Command, FileEvalOpts, eval_plan, nix_verbosity_env};
     use clap::Parser;
     use std::path::Path;
     use tracing::level_filters::LevelFilter;
@@ -545,6 +561,21 @@ mod tests {
                 "probe=/tmp/probe",
             ]
         );
+    }
+
+    #[test]
+    fn log_lines_flags_parse() {
+        // Failure-replay knobs: --log-lines N tail (default 20) and
+        // -L/--print-build-logs for the full log.
+        let cli = Cli::try_parse_from(["rio", "build", ".#x", "--log-lines", "5", "-L"]).unwrap();
+        let Command::Build(args) = cli.command;
+        assert_eq!(args.log_lines, 5);
+        assert!(args.print_build_logs);
+
+        let cli = Cli::try_parse_from(["rio", "build", ".#x"]).unwrap();
+        let Command::Build(args) = cli.command;
+        assert_eq!(args.log_lines, 20);
+        assert!(!args.print_build_logs);
     }
 
     #[test]

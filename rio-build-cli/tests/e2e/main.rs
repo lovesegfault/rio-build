@@ -552,6 +552,7 @@ async fn detach_then_attach_resumes_stream() -> TestResult {
         &mut clients,
         &build_id,
         rio_build_cli::render::RenderHandle::null(),
+        rio_build_cli::coordinator::FailureLogOpts::default(),
     )
     .await?;
     assert_eq!(outcome.build_id, build_id);
@@ -737,5 +738,92 @@ async fn fetch_materializes_output_with_narhash_verify() -> TestResult {
     assert_eq!(std::fs::read(dest)?, payload);
     // Out-link points at the materialization.
     assert_eq!(&std::fs::read_link(&link)?, dest);
+    Ok(())
+}
+
+/// Fail-fast failure replay: the client fetches the culprit's original
+/// log via `GetDerivationLog` (server-side tail), re-prints it one note
+/// per line with a header naming the culprit, honors `-L` for the full
+/// log, and falls back to the persisted reason text when no log content
+/// is available (cross-tenant culprit, expired log, no output).
+// r[verify bc.render.failure-log-tail]
+#[tokio::test]
+async fn failure_replay_prints_culprit_log_tail() -> TestResult {
+    use rio_build_cli::coordinator::{FailureLogOpts, replay_failure_log};
+    use rio_build_cli::render::RenderHandle;
+
+    let cluster = TestCluster::new().await?;
+    let culprit = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-culprit.drv".to_string();
+    cluster.sched.state.lock().unwrap().derivation_logs.insert(
+        culprit.clone(),
+        (0..30)
+            .map(|i| format!("compile step {i}").into_bytes())
+            .collect(),
+    );
+
+    let failed = rio_proto::types::BuildFailed {
+        error_message: format!("derivation {culprit} failed in an earlier build: boom"),
+        failed_derivation: culprit.clone(),
+        culprit_derivation: culprit.clone(),
+        culprit_exec_id: "0190f7a1-7c2e-7d10-b5c5-3be41b1c6f7e".into(),
+        culprit_error_message: "boom".into(),
+        ..Default::default()
+    };
+    let mut clients = cluster.clients.clone();
+    let render = RenderHandle::null();
+
+    // Default: header + 20-line tail, lines 10..=29.
+    let notes = replay_failure_log(
+        &mut clients,
+        "build-0001",
+        &failed,
+        FailureLogOpts::default(),
+        &render,
+    )
+    .await;
+    assert_eq!(notes.len(), 21, "header + 20 tail lines: {notes:?}");
+    assert!(
+        notes[0].contains("failed previously") && notes[0].contains("last 20 line"),
+        "{}",
+        notes[0]
+    );
+    assert!(notes[1].ends_with("compile step 10"), "{}", notes[1]);
+    assert!(notes[20].ends_with("compile step 29"), "{}", notes[20]);
+
+    // -L / --print-build-logs: the full log.
+    let notes = replay_failure_log(
+        &mut clients,
+        "build-0001",
+        &failed,
+        FailureLogOpts {
+            print_build_logs: true,
+            ..Default::default()
+        },
+        &render,
+    )
+    .await;
+    assert_eq!(notes.len(), 31, "header + all 30 lines: {notes:?}");
+    assert!(notes[1].ends_with("compile step 0"), "{}", notes[1]);
+
+    // No log content for the culprit (the stub closes the stream empty,
+    // the same shape as a cross-tenant execution): the persisted reason
+    // text is printed instead.
+    let mut no_log = failed.clone();
+    no_log.culprit_derivation = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-other.drv".to_string();
+    no_log.culprit_error_message = "builder exited 1: cc not found".into();
+    let notes = replay_failure_log(
+        &mut clients,
+        "build-0001",
+        &no_log,
+        FailureLogOpts::default(),
+        &render,
+    )
+    .await;
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains("failed previously") && notes[0].contains("cc not found"),
+        "{}",
+        notes[0]
+    );
     Ok(())
 }

@@ -41,11 +41,29 @@ let
     ${bbx} cat $src/data.txt > $out/data
     ${bbx} echo rio-bc-dep-built >> $out/data
   '' { inherit src; };
+  # Failure-replay fixtures (cached-failure-replay subtest): a dep that
+  # prints 30 recognizable lines and exits 1, so the SECOND-and-later
+  # submissions of failingConsumer fail-fast on the poisoned dep and the
+  # client must replay this output; and a dep that fails with NO output,
+  # so the client must fall back to the persisted reason text.
+  failingDep = mkDrv "rio-bc-fail-dep" ''
+    ${bbx} seq 1 30 | ${bbx} sed 's/^/rio-bc-fail-marker line /'
+    exit 1
+  '' { };
+  silentDep = mkDrv "rio-bc-fail-silent" ''
+    exec ${bbx} false
+  '' { };
 in
 {
   consumer = mkDrv "rio-bc-consumer" ''
     ${bbx} mkdir -p $out
     ${bbx} cat ${dep}/data > $out/summary
     ${bbx} echo rio-bc-consumer-built >> $out/summary
+  '' { };
+  failingConsumer = mkDrv "rio-bc-fail-consumer" ''
+    ${bbx} cat ${failingDep}/never > $out
+  '' { };
+  silentConsumer = mkDrv "rio-bc-silent-consumer" ''
+    ${bbx} cat ${silentDep}/never > $out
   '' { };
 }

@@ -748,13 +748,17 @@ in
   # pair on the client VM against the real cluster — external-door JWT
   # auth, chunked source upload, drv-blob negotiation, digest-bearing
   # SubmitBuild, worker execution, BuildEvents render, --out-link
-  # fetch. Single-test scenario; markers at the wiring point per
-  # P0341 convention — scenario header maps subtests to rules.
+  # fetch, and the cached-failure replay (fail-fast culprit attribution
+  # + GetDerivationLog tail). Single-test scenario; markers at the
+  # wiring point per P0341 convention — scenario header maps subtests
+  # to rules.
   # r[verify bc.submit.all-acked]
   # r[verify bc.fetch.narhash-verify]
   # r[verify store.drv.getpath-fallback]
   # r[verify bc.render.stdout-results]
   # r[verify bc.render.plain-default]
+  # r[verify bc.render.failure-log-tail]
+  # r[verify sched.merge.failfast-culprit]
   vm-build-client-standalone =
     let
       jwtKeys = import ./lib/jwt-keys.nix;
@@ -781,6 +785,11 @@ in
         # (require_tenant). Env (not extraConfig) so the [sla] block
         # in common.nix's scheduler defaults survives.
         extraSchedulerEnv.RIO_JWT__KEY_PATH = "${jwtPubkey}";
+        # Poison on the FIRST failure so the cached-failure-replay
+        # subtest reaches the merge fail-fast within four submissions
+        # instead of needing per-attempt retries first. Env for the
+        # same reason as the JWT key above.
+        extraSchedulerEnv.RIO_POISON__THRESHOLD = "1";
         # JWT verify on the store's castore door (the client's
         # PutPathChunked/Has*/PutDrvBlobs/GetPath rung). extraConfig
         # REPLACES the mkControlNode default, so [chunk_backend] must

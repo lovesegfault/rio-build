@@ -42,7 +42,7 @@
     {
       "path": "bin/eval-harness.rs",
       "depth": 1,
-      "doc": "Coordinator-side test harness for the rio-eval parent (ADR-024 P3b)."
+      "doc": "Coordinator-side test harness for the rio-eval parent."
     },
     {
       "path": "config.rs",
@@ -102,12 +102,12 @@
     {
       "path": "lib.rs",
       "depth": 0,
-      "doc": "`rio build` — the native-protocol build client (ADR-024 P3, the coordinator half)."
+      "doc": "`rio build` — the native-protocol build client (ADR-024, the coordinator half)."
     },
     {
       "path": "main.rs",
       "depth": 0,
-      "doc": "`rio` — the native-protocol build client binary (ADR-024 P3)."
+      "doc": "`rio` — the native-protocol build client binary (ADR-024)."
     },
     {
       "path": "render/",
@@ -899,17 +899,17 @@
     {
       "path": "dirblob.rs",
       "depth": 0,
-      "doc": "Bottom-up canonicalization of an in-memory source tree into per-directory castore-proto blobs (ADR-024 P1, \"Source-DAG metadata\")."
+      "doc": "Bottom-up canonicalization of an in-memory source tree into per-directory castore-proto blobs (ADR-024, \"Source-DAG metadata\")."
     },
     {
       "path": "dircache.rs",
       "depth": 0,
-      "doc": "Decoded-directory cache over the pack store (ADR-024 P1)."
+      "doc": "Decoded-directory cache over the pack store (ADR-024)."
     },
     {
       "path": "evaljob/",
       "depth": 0,
-      "doc": "The eval-parent side of the `rio.evaljob` worker channel (ADR-024 P3b): synchronous frame I/O, the fork-worker orchestration loop, and the IFD relay."
+      "doc": "The eval-parent side of the `rio.evaljob` worker channel: synchronous frame I/O, the fork-worker orchestration loop, and the IFD relay."
     },
     {
       "path": "evaljob/claim.rs",
@@ -929,7 +929,7 @@
     {
       "path": "evaljob/parent.rs",
       "depth": 1,
-      "doc": "The eval-parent orchestration loop (ADR-024 P3b): fork-no-exec workers over per-worker socketpairs, relay worker frames to the coordinator channel, route IFD completions, re-queue crashed workers' attrs, and recycle workers between attrs."
+      "doc": "The eval-parent orchestration loop (ADR-024): fork-no-exec workers over per-worker socketpairs, relay worker frames to the coordinator channel, route IFD completions, re-queue crashed workers' attrs, and recycle workers between attrs."
     },
     {
       "path": "ffi.rs",
@@ -939,7 +939,7 @@
     {
       "path": "fingerprint.rs",
       "depth": 0,
-      "doc": "Stat-fingerprint table: one file in the CAS root, not per-path loose JSON (ADR-024 P1 — \"no loose objects anywhere\")."
+      "doc": "Stat-fingerprint table: one file in the CAS root, not per-path loose JSON (ADR-024 — \"no loose objects anywhere\")."
     },
     {
       "path": "ingest/",
@@ -954,7 +954,7 @@
     {
       "path": "lib.rs",
       "depth": 0,
-      "doc": "Client-side eval store: a persistent content-addressed cache (CAS) that backs the `rio://` nix store plugin (ADR-024 P1, \"client CAS v2\")."
+      "doc": "Client-side eval store: a persistent content-addressed cache (CAS) that backs the `rio://` nix store plugin (ADR-024, \"client CAS v2\")."
     },
     {
       "path": "stats.rs",
@@ -1308,7 +1308,7 @@
     {
       "path": "lib.rs",
       "depth": 0,
-      "doc": "Client-side pack store for the rio:// eval store (ADR-024 P1)."
+      "doc": "Client-side pack store for the rio:// eval store (ADR-024)."
     },
     {
       "path": "lock.rs",

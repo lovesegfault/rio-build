@@ -152,6 +152,22 @@ The prefix neutralises Actions `::endgroup::` / `::add-mask::`
 injection from build output; the sanitizer guarantees no CR/LF survives
 to fabricate a fresh line start.
 
+#r("bc.render.failure-log-tail")[
+  When a build fails with culprit attribution (`BuildFailed.culprit_*` ---
+  a fail-fast on a derivation that already failed in an earlier build), the
+  client MUST fetch the culprit execution's stored log via
+  `GetDerivationLog` and re-print it on stderr --- the last `--log-lines`
+  lines (default 20), or the full log under `-L`/`--print-build-logs` ---
+  emitted one renderer note per line so the per-line sanitization
+  (#rref("bc.render.sanitize")) applies; when no log content is available
+  the client MUST print the persisted `culprit_error_message` instead.
+]
+
+A fail-fast build runs no execution of its own, so without the replay the
+user sees only "derivation X failed" with nothing to debug. The tail is
+requested server-side (`tail_lines`), so `-L` is the only mode that
+transfers the whole log.
+
 #r("bc.render.tty-restore")[
   Terminal attributes (termios, cursor visibility) MUST be restored on
   every exit path, including panic and SIGINT.
