@@ -65,8 +65,14 @@ const JOIN_CENSUS_SOURCES: &[(&str, &str)] = &[
     ("reconcilers/pool/tests/mod.rs", include_str!("../src/reconcilers/pool/tests/mod.rs")),
 ];
 
-/// The closed `drain-census:` disposition vocabulary.
-const DRAIN_DISPOSITIONS: [&str; 2] = ["runtime-lifetime", "caller-joined"];
+/// The closed `drain-census:` disposition vocabulary. The fourth class
+/// (process-joined) is the bug_023 lifetime: the guard THREAD's
+/// `JoinHandle` is captured in a `GuardJoin` and the process owner
+/// `.join()`s it after the working domain drains — the
+/// §Verifier-one-step-removed(b) recurrence of bug_118 one lifecycle
+/// level up (runtime→task drain was fixed; process→thread join was
+/// not).
+const DRAIN_DISPOSITIONS: [&str; 3] = ["runtime-lifetime", "caller-joined", "process-joined"];
 
 /// The guard spawn family (W10-AU population, enumerated from spawn
 /// sites — R15): method-call forms reachable anywhere in the crate,
@@ -79,6 +85,37 @@ const GUARD_SPAWN_FORMS: [&str; 3] = [
     ".spawn_on_guard(",
 ];
 const GUARD_RAW_FORMS: [&str; 2] = ["guard_rt.spawn(", "tokio::spawn("];
+
+/// OS-thread spawn forms (the process↔thread join axis; bug_023): a
+/// thread hosting the guard runtime owes a PROCESS-level join,
+/// discharged structurally by capture into a `GuardJoin {` constructor
+/// later in the same file — the linear join token `guard::spawn`
+/// returns to the process owner. A discarded `std::thread::JoinHandle`
+/// is exactly the bug_023 shape: `main()` returns and process exit
+/// kills the detached thread mid-`step_down()` PATCH.
+const OS_THREAD_FORMS: [&str; 2] = ["std::thread::Builder::new(", "std::thread::spawn("];
+
+/// The `guard::spawn` callsite forms (the process owner's side of the
+/// process↔thread axis; bug_023): every callsite MUST tuple-bind the
+/// returned `GuardJoin` AND `.join()` it later in the same file.
+/// `#[must_use]` alone does NOT catch `let (g, _) = …` — verified on
+/// stable; `_` suppresses the lint — so this census is the static
+/// enforcement and the `GuardJoin` Drop-panic is the runtime one.
+const PROCESS_JOIN_FORMS: [&str; 3] = [
+    "rio_controller::guard::spawn(",
+    "crate::guard::spawn(",
+    "guard::spawn(",
+];
+
+/// Parse the second binding name out of `let (X, Y) = …` on a
+/// `guard::spawn` site line. None when the line is not tuple-bound.
+fn process_join_binding(line: &str) -> Option<String> {
+    let after = line.split_once("let (")?.1;
+    let inside = after.split_once(')')?.0;
+    let second = inside.split(',').nth(1)?.trim();
+    (!second.is_empty() && second.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        .then(|| second.to_string())
+}
 
 /// One join-obligation violation: a guard-runtime spawn site whose
 /// window carries neither a structural discharge (`adopt_epilogue(` /
@@ -98,6 +135,42 @@ fn join_obligation_violations(rel_path: &str, src: &str) -> Vec<String> {
         let code = line.trim_start();
         if code.starts_with("//") {
             continue; // comment lines are not spawn sites
+        }
+        // Process↔thread axis, OS-thread side (bug_023): the
+        // `std::thread` JoinHandle MUST flow into a `GuardJoin {`
+        // constructor later in the same file — the linear join token.
+        if OS_THREAD_FORMS.iter().any(|f| line.contains(f)) {
+            let captured = lines[idx + 1..].iter().any(|l| l.contains("GuardJoin {"));
+            if !captured {
+                violations.push(format!(
+                    "{rel_path}:{}: OS-thread spawn site with no join obligation — \
+                     capture the JoinHandle in a GuardJoin and return it to the process owner",
+                    idx + 1
+                ));
+            }
+            continue;
+        }
+        // Process↔thread axis, process-owner side (bug_023): every
+        // `guard::spawn(` callsite tuple-binds the GuardJoin AND
+        // `.join()`s it later in the same file. `_` is NOT a
+        // discharge (the must_use suppression the census exists to
+        // close).
+        if PROCESS_JOIN_FORMS.iter().any(|f| line.contains(f)) {
+            let discharged = process_join_binding(line)
+                .filter(|b| b != "_")
+                .is_some_and(|b| {
+                    let joined = format!("{b}.join()");
+                    lines[idx + 1..].iter().any(|l| l.contains(&joined))
+                });
+            if !discharged {
+                violations.push(format!(
+                    "{rel_path}:{}: guard::spawn callsite with no process-level join — \
+                     tuple-bind `(handle, guard_join)` and `guard_join.join()` before \
+                     the process owner returns",
+                    idx + 1
+                ));
+            }
+            continue;
         }
         let is_site = GUARD_SPAWN_FORMS.iter().any(|f| line.contains(f))
             || (rel_path == "guard.rs" && GUARD_RAW_FORMS.iter().any(|f| line.contains(f)));
@@ -216,6 +289,29 @@ fn w10_au_planted_reds_caught() {
         1,
         "the uncaptured raw-spawn plant must red"
     );
+    // Axis 5 (bug_023, OS-thread side): the discarded
+    // `std::thread::JoinHandle` — THE bug_023 shape at guard.rs:348.
+    let os_detached =
+        "std::thread::Builder::new().name(n).spawn(move || rt.block_on(f)).expect(e);\n";
+    assert_eq!(
+        join_obligation_violations("guard.rs", os_detached).len(),
+        1,
+        "the detached-OS-thread plant must red"
+    );
+    // Axis 5 green twin: the JoinHandle flows into a GuardJoin.
+    let os_captured = "let t = std::thread::Builder::new().spawn(f).expect(e);\n(h, GuardJoin { thread: Some(t) })\n";
+    assert!(join_obligation_violations("guard.rs", os_captured).is_empty());
+    // Axis 6 (bug_023, process-owner side): `_`-suppressed GuardJoin —
+    // the must_use evasion the census exists to close.
+    let proc_suppressed = "let (g, _) = rio_controller::guard::spawn(h, r, c, s);\n";
+    assert_eq!(
+        join_obligation_violations("main.rs", proc_suppressed).len(),
+        1,
+        "the `_`-suppressed GuardJoin plant must red"
+    );
+    // Axis 6 green twin: tuple-bound AND joined later in the file.
+    let proc_joined = "let (g, gj) = crate::guard::spawn(h, r, c, s);\ngj.join();\n";
+    assert!(join_obligation_violations("main.rs", proc_joined).is_empty());
 }
 
 /// The (wwwww) bidirectional completeness pin: the embedded universe
