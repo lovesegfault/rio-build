@@ -62,7 +62,7 @@ spec:
   #      with required anti-affinity on a fixed-size cluster).
   #   4. REQUIRED-SPREAD-BLOCKS-SCALE-OUT — dissolved by Karpenter: a
   #      Pending store pod on the dedicated tainted rio-store NodePool
-  #      (D1 — od-only, WhenEmptyOrUnderutilized reclaim) mints a node
+  #      (D1 — od-only, WhenEmpty reclaim) mints a node
   #      in ~30-60s, up to that pool's limits.cpu — which IS the
   #      intended operative scale bound (the KEDA ceiling is only the
   #      PG backstop). bind[44-store-nodepool.sh]
@@ -146,8 +146,8 @@ spec:
       {{- end }}
       {{- if .Values.karpenter.enabled }}
       # D1: the store fleet targets its OWN NodePool (rio-store —
-      # WhenEmptyOrUnderutilized reclaim; values.yaml karpenter block)
-      # instead of squatting rio-general's Drifted-0/WhenEmpty nodes.
+      # WhenEmpty reclaim; values.yaml karpenter block) instead of
+      # squatting rio-general's Drifted-0/WhenEmpty nodes.
       # Gated on karpenter.enabled: the k3s VM tests and local dev run
       # no Karpenter and must stay schedulable on plain nodes.
       nodeSelector:

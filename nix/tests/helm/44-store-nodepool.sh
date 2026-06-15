@@ -4,7 +4,9 @@
 # the store), so a 3-millicore store pod pinned a whole 32-vCPU node
 # indefinitely. Both faces pinned here:
 #   (i)  rio-store NodePool renders with STORE-plane reclaim
-#        (WhenEmptyOrUnderutilized + the rio.build/store taint) and
+#        (WhenEmpty + the rio.build/store taint — bug_015: every store
+#        pod carries do-not-disrupt, so Underutilized is unreachable;
+#        49-disrupt-policy-coherence quantifies the relationship) and
 #        the store Deployment targets it (selector + toleration);
 #   (ii) the builder-default face survives: rio-general (and every
 #        other pool entry) keeps WhenEmpty — the per-pool override
@@ -28,8 +30,8 @@ test -n "$pool" || {
   exit 1
 }
 policy=$(yq -N 'select(.kind=="NodePool" and .metadata.name=="rio-store") | .spec.disruption.consolidationPolicy' "$out")
-test "$policy" = "WhenEmptyOrUnderutilized" || {
-  echo "FAIL: rio-store consolidationPolicy is '$policy', want WhenEmptyOrUnderutilized — store reclaim must be STORE-plane policy, not the builder default" >&2
+test "$policy" = "WhenEmpty" || {
+  echo "FAIL: rio-store consolidationPolicy is '$policy', want WhenEmpty — every store pod carries do-not-disrupt (bug_015); Underutilized cannot fire" >&2
   exit 1
 }
 taint=$(yq -N 'select(.kind=="NodePool" and .metadata.name=="rio-store") | .spec.template.spec.taints[0].key' "$out")
@@ -120,4 +122,4 @@ test "$sel2" = "null" || {
   exit 1
 }
 
-echo "OK: rio-store pool (WhenEmptyOrUnderutilized, tainted, od) + targeted Deployment; rio-general keeps WhenEmpty; k3s face clean"
+echo "OK: rio-store pool (WhenEmpty, tainted, od) + targeted Deployment; rio-general keeps WhenEmpty; k3s face clean"

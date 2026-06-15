@@ -233,10 +233,12 @@ spec:
     # provisioned for one stays warm for the next, avoiding ~90s
     # cold-start churn). D1 (bughunt-9): the rationale was blanket-
     # applied to EVERY static pool, including ones no build ever
-    # lands on — pools whose pods are droppable-with-drain (the store)
-    # declare their own policy per-entry (values.yaml
-    # consolidationPolicy: WhenEmptyOrUnderutilized) instead of
-    # inheriting the builder default.
+    # lands on — pools declare their own policy per-entry (values.yaml
+    # consolidationPolicy:) instead of inheriting the builder default.
+    # bug_015: a non-WhenEmpty policy is only meaningful if some
+    # targeting workload is disruptable — 49-disrupt-policy-coherence
+    # pins that. Every shipped static pool is WhenEmpty today (the
+    # store's pods carry do-not-disrupt; rio-general's do too).
     consolidationPolicy: {{ .consolidationPolicy | default "WhenEmpty" }}
     consolidateAfter: {{ .consolidateAfter | default "10m" }}
     {{- with .budgets }}

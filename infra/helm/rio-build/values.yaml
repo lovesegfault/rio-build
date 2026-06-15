@@ -1528,9 +1528,12 @@ karpenter:
     # rode rio-general, whose Drifted-0 budget + the template's blanket
     # WhenEmpty policy (a BUILDER rationale that never applied to the
     # store) meant a 3-millicore store pod pinned a whole 32-vCPU node
-    # indefinitely — store reclaim is now bounded by STORE-plane
-    # policy: WhenEmptyOrUnderutilized + a 5m grace. Tainted so only
-    # store pods (which tolerate it, store.yaml) land here; the
+    # indefinitely — store reclaim is now WhenEmpty + a 5m grace
+    # (Underutilized is structurally unreachable: every store pod
+    # carries karpenter.sh/do-not-disrupt — store.yaml live_062 — and
+    # required anti-affinity puts exactly one per node; bug_015's
+    # 49-disrupt-policy-coherence pins the relationship). Tainted so
+    # only store pods (which tolerate it, store.yaml) land here; the
     # one-replica-per-node antiAffinity makes each replica pin a whole
     # node, so limits.cpu/32 IS the hostable replica ceiling — the
     # xtask pg-preflight reads THIS pool's limit for the hostable arm
@@ -1551,7 +1554,7 @@ karpenter:
           operator: In
           values: [on-demand]
       limits: {cpu: 1500}
-      consolidationPolicy: WhenEmptyOrUnderutilized
+      consolidationPolicy: WhenEmpty
       consolidateAfter: 5m
 
     # General: untainted, for future gateway/scheduler HPA overflow.
