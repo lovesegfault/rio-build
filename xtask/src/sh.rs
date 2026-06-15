@@ -287,7 +287,9 @@ pub fn run_capture(
 }
 
 /// Run a command that must interact with a tty (prompts for input).
-/// Always inherits stdio, regardless of verbosity.
+/// Inherits stdout/stderr regardless of verbosity, but xshell sets the
+/// child's stdin to null when no stdin data is supplied — children
+/// that need the real terminal on stdin must spawn a raw `Command`.
 pub fn run_interactive(cmd: xshell::Cmd<'_>) -> Result<()> {
     let argv = cmd.to_string();
     debug!("exec (interactive): {argv}");
