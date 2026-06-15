@@ -1809,7 +1809,8 @@ impl DagActor {
                 && verdict_eligible
                 && matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_))
             {
-                crate::db::SchedulerDb::persist_poisoned_in_tx(tx.conn(), &drv_hash).await?;
+                crate::db::SchedulerDb::persist_poisoned_in_tx(tx.conn(), &drv_hash, None, None)
+                    .await?;
             }
             tx.close_assignment(attempt.exec_id, crate::db::AssignmentCloseStatus::Failed)
                 .await?;

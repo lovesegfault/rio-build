@@ -202,7 +202,7 @@ async fn test_attempt_append_and_status_persist_share_tx() -> anyhow::Result<()>
     row2.exec_id = Some(Uuid::now_v7());
     let mut tx = db.pool().begin().await?;
     assert!(SchedulerDb::append_attempt(&mut tx, &row2).await?);
-    SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash).await?;
+    SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash, None, None).await?;
     tx.commit().await?;
 
     let (status, has_poisoned_at): (String, bool) = sqlx::query_as(

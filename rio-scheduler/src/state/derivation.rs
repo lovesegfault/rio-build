@@ -621,6 +621,12 @@ pub struct RetryState {
     /// node (merged_bug_300; the recovery-time wall-clock expiry
     /// pre-filter stays as the first line of defense).
     pub poisoned_at: Option<crate::state::RecoveredInstant>,
+    /// Builder-reported error text of the most recent failed attempt
+    /// (set by `handle_transient_failure` per attempt). When the poison
+    /// threshold trips, this — not the scheduler-synthesized "threshold
+    /// reached" summary — is what `persist_poisoned` records as
+    /// `derivations.failure_msg` (migration 117). In-memory only.
+    pub last_error: Option<String>,
     /// Earliest time this derivation may be dispatched. Set by
     /// handle_transient_failure to implement the retry backoff —
     /// the derivation stays Ready, but the pull admission's
@@ -2401,6 +2407,7 @@ impl DerivationState {
             failed_builders: c.failed_builders.iter().cloned().map(Into::into).collect(),
             failure_count: c.failure_count,
             poisoned_at: self.retry.poisoned_at,
+            last_error: self.retry.last_error.take(),
             backoff_until: c.backoff_until.map(|t| {
                 let now = Instant::now();
                 if t > now_epoch_secs {

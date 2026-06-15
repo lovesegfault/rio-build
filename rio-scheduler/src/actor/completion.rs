@@ -231,6 +231,25 @@ pub(super) fn late_report_effect(
 /// shouldn't accidentally widen this budget.
 const CA_CUTOFF_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Cap on the persisted `derivations.failure_msg` (M_117). Builder
+/// error text is normally a few hundred bytes; the cap keeps a
+/// pathological multi-megabyte error from bloating the row. 4 KiB keeps
+/// the useful head of even a verbose compiler diagnostic.
+const FAILURE_MSG_MAX_BYTES: usize = 4096;
+
+/// Truncate `msg` to [`FAILURE_MSG_MAX_BYTES`] on a char boundary so the
+/// persisted text stays valid UTF-8 (PG `TEXT` rejects torn code points).
+fn truncate_failure_msg(msg: &str) -> &str {
+    if msg.len() <= FAILURE_MSG_MAX_BYTES {
+        return msg;
+    }
+    let mut end = FAILURE_MSG_MAX_BYTES;
+    while !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    &msg[..end]
+}
+
 /// Per-candidate prior realisation discovered during the CA cutoff
 /// cascade walk. Carries everything needed to (a) verify the output
 /// exists in the store and (b) stamp the skipped node with its
@@ -407,9 +426,12 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         row: Option<AttemptRow>,
+        failure_msg: Option<&str>,
+        failure_exec_id: Option<Uuid>,
     ) {
         let Some(row) = row else {
-            self.persist_poisoned(drv_hash).await;
+            self.persist_poisoned(drv_hash, failure_msg, failure_exec_id)
+                .await;
             return;
         };
         let result: Result<Option<bool>, sqlx::Error> = async {
@@ -420,7 +442,13 @@ impl DagActor {
                 crate::db::FencedBegin::Open(ftx) => ftx,
             };
             let inserted = crate::db::SchedulerDb::append_attempt(tx.conn(), &row).await?;
-            crate::db::SchedulerDb::persist_poisoned_in_tx(tx.conn(), drv_hash).await?;
+            crate::db::SchedulerDb::persist_poisoned_in_tx(
+                tx.conn(),
+                drv_hash,
+                failure_msg,
+                failure_exec_id,
+            )
+            .await?;
             tx.commit().await?;
             Ok(Some(inserted))
         }
@@ -674,15 +702,26 @@ impl DagActor {
         }
     }
 
-    /// Best-effort atomic persist of `status='poisoned'` + `poisoned_at=now()`.
-    /// Single SQL UPDATE — no crash window between the two columns.
+    /// Best-effort atomic persist of `status='poisoned'`, `poisoned_at=now()`
+    /// and the failure reason (`failure_msg`/`failure_exec_id`, M_117).
+    /// Single SQL UPDATE — no crash window between the columns.
     /// Logs error!, never returns it (same semantics as `persist_status`).
     /// Claims-floor fenced (`sched.evidence.durability`), same posture.
     // r[impl sched.evidence.durability+4]
-    pub(super) async fn persist_poisoned(&self, drv_hash: &DrvHash) {
+    pub(super) async fn persist_poisoned(
+        &self,
+        drv_hash: &DrvHash,
+        failure_msg: Option<&str>,
+        failure_exec_id: Option<Uuid>,
+    ) {
         match self
             .db
-            .persist_poisoned(drv_hash, self.serving_generation())
+            .persist_poisoned(
+                drv_hash,
+                failure_msg,
+                failure_exec_id,
+                self.serving_generation(),
+            )
             .await
         {
             Ok(crate::db::FencedOutcome::Fenced) => {
@@ -694,6 +733,32 @@ impl DagActor {
                        "failed to persist poisoned status+timestamp");
             }
         }
+    }
+
+    /// Resolve what `persist_poisoned` should record for `drv_hash`:
+    /// the builder-reported error of the most recent failed attempt
+    /// (`retry.last_error`, recorded per attempt by
+    /// `handle_transient_failure`) when present, otherwise the caller's
+    /// message — and the execution the failure is attributed to
+    /// (`exec_id_for_terminal`, `None` for a never-dispatched poison).
+    /// The message is truncated to [`FAILURE_MSG_MAX_BYTES`] so a
+    /// pathological builder error can't bloat the `derivations` row.
+    pub(super) fn failure_attribution(
+        &self,
+        drv_hash: &DrvHash,
+        fallback_msg: &str,
+    ) -> (Option<String>, Option<Uuid>) {
+        let non_empty = |s: &str| (!s.is_empty()).then(|| truncate_failure_msg(s).to_string());
+        let Some(state) = self.dag.node(drv_hash) else {
+            return (non_empty(fallback_msg), None);
+        };
+        let msg = state
+            .retry
+            .last_error
+            .as_deref()
+            .and_then(&non_empty)
+            .or_else(|| non_empty(fallback_msg));
+        (msg, self.exec_id_for_terminal(state))
     }
 
     /// Best-effort unpin of `scheduler_live_pins` rows for a
@@ -3859,7 +3924,18 @@ impl DagActor {
         }
         state.retry.poisoned_at = Some(crate::state::RecoveredInstant::fresh_now());
 
-        self.record_attempt_with_poison(drv_hash, attempt_row).await;
+        // Persist the failure reason alongside the poison mark: the
+        // builder-reported error of the failing attempt (recorded on
+        // `retry.last_error`) wins over the synthesized poison summary
+        // in `error_msg`, attributed to the execution that produced it.
+        let (failure_msg, failure_exec_id) = self.failure_attribution(drv_hash, error_msg);
+        self.record_attempt_with_poison(
+            drv_hash,
+            attempt_row,
+            failure_msg.as_deref(),
+            failure_exec_id,
+        )
+        .await;
         self.unpin_best_effort(drv_hash).await;
 
         self.terminal_failure_epilogue(
@@ -4186,6 +4262,15 @@ impl DagActor {
         // report is the terminal observation; the requeue (if the
         // verdict is a retry) happens in this same actor turn.
         let observed_at = Instant::now();
+        // Remember THIS attempt's builder-reported error so a poison —
+        // whether the threshold trips right here or fleet exhaustion
+        // fires on a later event — persists the real failure text
+        // instead of the synthesized summary (M_117).
+        if !report.error_msg.is_empty()
+            && let Some(state) = self.dag.node_mut(drv_hash)
+        {
+            state.retry.last_error = Some(report.error_msg.to_string());
+        }
         // Ledger row for this observed attempt (1a): captured before
         // any transition clears the exec_id carrier; appended together
         // with whichever status persist this handler ends in.
@@ -4225,7 +4310,13 @@ impl DagActor {
                 };
                 let (_, decision) = self.append_and_decide_in_tx(tx.conn(), &row).await?;
                 if matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_)) {
-                    crate::db::SchedulerDb::persist_poisoned_in_tx(tx.conn(), drv_hash).await?;
+                    crate::db::SchedulerDb::persist_poisoned_in_tx(
+                        tx.conn(),
+                        drv_hash,
+                        row.error_msg.as_deref(),
+                        row.exec_id,
+                    )
+                    .await?;
                 } else {
                     crate::db::SchedulerDb::update_derivation_status_in_tx(
                         tx.conn(),
@@ -4640,7 +4731,13 @@ impl DagActor {
                 };
                 let (_, decision) = self.append_and_decide_in_tx(tx.conn(), &row).await?;
                 if matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_)) {
-                    crate::db::SchedulerDb::persist_poisoned_in_tx(tx.conn(), drv_hash).await?;
+                    crate::db::SchedulerDb::persist_poisoned_in_tx(
+                        tx.conn(),
+                        drv_hash,
+                        row.error_msg.as_deref(),
+                        row.exec_id,
+                    )
+                    .await?;
                 } else {
                     crate::db::SchedulerDb::update_derivation_status_in_tx(
                         tx.conn(),
@@ -4917,7 +5014,13 @@ impl DagActor {
                 };
                 let (_, decision) = self.append_and_decide_in_tx(tx.conn(), &row).await?;
                 if matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_)) {
-                    crate::db::SchedulerDb::persist_poisoned_in_tx(tx.conn(), drv_hash).await?;
+                    crate::db::SchedulerDb::persist_poisoned_in_tx(
+                        tx.conn(),
+                        drv_hash,
+                        row.error_msg.as_deref(),
+                        row.exec_id,
+                    )
+                    .await?;
                 } else {
                     crate::db::SchedulerDb::update_derivation_status_in_tx(
                         tx.conn(),
@@ -5136,7 +5239,13 @@ impl DagActor {
                     crate::db::FencedBegin::Open(ftx) => ftx,
                 };
                 let (_, decision) = self.append_and_decide_in_tx(tx.conn(), &row).await?;
-                crate::db::SchedulerDb::persist_poisoned_in_tx(tx.conn(), drv_hash).await?;
+                crate::db::SchedulerDb::persist_poisoned_in_tx(
+                    tx.conn(),
+                    drv_hash,
+                    row.error_msg.as_deref(),
+                    row.exec_id,
+                )
+                .await?;
                 tx.commit().await?;
                 Ok(Some(decision))
             }
@@ -5172,7 +5281,9 @@ impl DagActor {
             // No db_id yet (merge not committed): nothing to append or
             // fold. Degrade to the as-built best-effort poison persist so
             // the terminal outcome is preserved.
-            self.persist_poisoned(drv_hash).await;
+            let (failure_msg, failure_exec_id) = self.failure_attribution(drv_hash, error_msg);
+            self.persist_poisoned(drv_hash, failure_msg.as_deref(), failure_exec_id)
+                .await;
             None
         };
 
@@ -5190,6 +5301,12 @@ impl DagActor {
             return FailureHandling::Handled;
         }
         state.retry.poisoned_at = Some(crate::state::RecoveredInstant::fresh_now());
+        // Most-recent-attempt error (M_117): a stale `last_error` from an
+        // earlier transient retry must not shadow this attempt's
+        // permanent error.
+        if !error_msg.is_empty() {
+            state.retry.last_error = Some(error_msg.to_string());
+        }
         // I-209: which builder produced the permanent failure is carried
         // by the appended `permanent` row (the fold's diagnostics-only
         // `failed_builders` insert), so the refreshed view and the

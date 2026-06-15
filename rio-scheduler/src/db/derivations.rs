@@ -549,20 +549,26 @@ impl SchedulerDb {
     // r[impl sched.poison.ttl-persist]
     /// Transaction-joining body of [`Self::persist_poisoned`]: the
     /// atomic `status='poisoned'` + `poisoned_at=now()` write plus the
-    /// active-assignment close, on the caller's connection — so a 1a
-    /// appending site can carry the poison persist in the same
-    /// transaction as its `drv_attempts` append.
+    /// persisted failure reason (`failure_msg`, `failure_exec_id` —
+    /// migration 117) and the active-assignment close, on the caller's
+    /// connection — so a 1a appending site can carry the poison persist
+    /// in the same transaction as its `drv_attempts` append.
     // r[impl sched.db.assignment-terminal-on-status+2]
     pub(crate) async fn persist_poisoned_in_tx(
         tx: &mut PgConnection,
         drv_hash: &DrvHash,
+        failure_msg: Option<&str>,
+        failure_exec_id: Option<uuid::Uuid>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "UPDATE derivations \
              SET status = 'poisoned', poisoned_at = now(), \
+                 failure_msg = $2, failure_exec_id = $3, \
                  assigned_builder_id = NULL, updated_at = now() \
              WHERE drv_hash = $1",
             drv_hash.as_str(),
+            failure_msg,
+            failure_exec_id,
         )
         .execute(&mut *tx)
         .await?;
@@ -575,13 +581,21 @@ impl SchedulerDb {
         Ok(())
     }
 
-    /// Atomically set `status='poisoned'` AND `poisoned_at=now()`.
+    /// Atomically set `status='poisoned'` AND `poisoned_at=now()`, plus
+    /// the persisted failure reason (`failure_msg`, `failure_exec_id` —
+    /// migration 117) so a later build that fail-fasts on this node can
+    /// surface the original error and the execution that produced it.
     ///
     /// Replaces the previous two-call sequence (`update_derivation_status`
     /// then `set_poisoned_at`) which had a crash window: status='poisoned'
     /// but poisoned_at=NULL. Rows in that state were invisible to
     /// `load_poisoned_derivations` (filtered by `poisoned_at IS NOT NULL`)
     /// — poison TTL tracking silently broken for those rows.
+    ///
+    /// `failure_msg` is the builder-reported error of the failing attempt
+    /// (NOT a scheduler-synthesized "threshold reached" summary); `None`
+    /// keeps the column NULL. `failure_exec_id` is nullable — a poison
+    /// while Ready (fleet exhaustion) never had an execution.
     ///
     /// `assigned_builder_id` is NULLed: a poisoned derivation has no
     /// assignment. Matches the in-mem semantics the caller should enforce.
@@ -597,16 +611,17 @@ impl SchedulerDb {
     pub(crate) async fn persist_poisoned(
         &self,
         drv_hash: &DrvHash,
+        failure_msg: Option<&str>,
+        failure_exec_id: Option<uuid::Uuid>,
         serving_generation: ServingGeneration,
     ) -> Result<FencedOutcome, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
             FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
             FencedBegin::Open(ftx) => ftx,
         };
-        Self::persist_poisoned_in_tx(tx.conn(), drv_hash).await?;
+        Self::persist_poisoned_in_tx(tx.conn(), drv_hash, failure_msg, failure_exec_id).await?;
         tx.commit().await?;
         Ok(FencedOutcome::Applied(0))
-    }
 
     // r[impl sched.db.assignment-stale-sweep]
     /// Recovery backstop: close any `pending`/`acknowledged`
@@ -660,14 +675,18 @@ impl SchedulerDb {
 
     /// Transaction-joining body of [`Self::clear_poison`] — so a reset
     /// site can carry the poison clear in the same transaction as its
-    /// `drv_attempts` reset row (the 1a write discipline).
+    /// `drv_attempts` reset row (the 1a write discipline). The persisted
+    /// failure reason (`failure_msg`/`failure_exec_id`, migration 117) is
+    /// per-poison-cycle state and is NULLed too — a stale reason must
+    /// not be attributed to a later, unrelated failure.
     pub(crate) async fn clear_poison_in_tx(
         tx: &mut PgConnection,
         drv_hash: &DrvHash,
     ) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "UPDATE derivations
-             SET poisoned_at = NULL, status = 'created', updated_at = now()
+             SET poisoned_at = NULL, failure_msg = NULL, failure_exec_id = NULL,
+                 status = 'created', updated_at = now()
              WHERE drv_hash = $1",
             drv_hash.as_str(),
         )
@@ -709,12 +728,12 @@ impl SchedulerDb {
     // r[impl sched.db.clear-poison-batch+3]
     /// Batch poison clear for the resubmit-reset path: one round-trip
     /// for N hashes via `WHERE drv_hash = ANY($1)`. Clears the
-    /// poison-lifecycle state (`poisoned_at`, status) — the new cycle
-    /// index that keeps the `r[sched.merge.poisoned-resubmit-bounded]`
-    /// bound alive across a leader failover is carried by the
-    /// `resubmit_reset` ledger row appended in the same transaction (the
-    /// in-mem carry at `dag::merge` is the dispatch-time seed it
-    /// stamps).
+    /// poison-lifecycle state (`poisoned_at`, `failure_msg`,
+    /// `failure_exec_id`, status) — the new cycle index that keeps the
+    /// `r[sched.merge.poisoned-resubmit-bounded]` bound alive across a
+    /// leader failover is carried by the `resubmit_reset` ledger row
+    /// appended in the same transaction (the in-mem carry at `dag::merge`
+    /// is the dispatch-time seed it stamps).
     ///
     /// I-169: `merge.rs`' resubmit-reset path called `clear_poison`
     /// per-hash inside the single-threaded actor — a 500-node resubmit
@@ -768,7 +787,8 @@ impl SchedulerDb {
         let hashes: Vec<&str> = drv_hashes.iter().map(DrvHash::as_str).collect();
         let result = sqlx::query!(
             "UPDATE derivations
-             SET poisoned_at = NULL, status = 'created', updated_at = now()
+             SET poisoned_at = NULL, failure_msg = NULL, failure_exec_id = NULL,
+                 status = 'created', updated_at = now()
              WHERE drv_hash = ANY($1::text[])",
             &hashes as &[&str],
         )

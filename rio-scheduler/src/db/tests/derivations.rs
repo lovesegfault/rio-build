@@ -23,17 +23,31 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
     let _ = insert_test_derivation(&db, drv_hash.as_str()).await?;
 
     // Single atomic call: sets status='poisoned' AND poisoned_at=now()
-    // AND assigned_builder_id=NULL. No separate status update needed.
-    // (No claims rows in this test -> any serving generation passes the
-    // claims-floor fence; same for every write below.)
+    // AND assigned_builder_id=NULL AND the failure reason (M_117).
+    // No separate status update needed. (No claims rows in this test ->
+    // any serving generation passes the claims-floor fence; same for
+    // every write below.)
+    let exec = Uuid::now_v7();
     let fenced_outcome = db
-        .persist_poisoned(&drv_hash, ServingGeneration::stamp_from_claim(1))
+        .persist_poisoned(
+            &drv_hash,
+            Some("builder exited 1: cc not found"),
+            Some(exec),
+            ServingGeneration::stamp_from_claim(1),
+        )
         .await?;
     assert!(fenced_outcome.settled());
 
-    // Verify all three columns updated in one statement.
-    let (status, has_ts, worker): (String, bool, Option<String>) = sqlx::query_as(
-        "SELECT status, poisoned_at IS NOT NULL, assigned_builder_id \
+    // Verify all columns updated in one statement.
+    let (status, has_ts, worker, failure_msg, failure_exec): (
+        String,
+        bool,
+        Option<String>,
+        Option<String>,
+        Option<Uuid>,
+    ) = sqlx::query_as(
+        "SELECT status, poisoned_at IS NOT NULL, assigned_builder_id, \
+                failure_msg, failure_exec_id \
          FROM derivations WHERE drv_hash=$1",
     )
     .bind(drv_hash.as_str())
@@ -42,6 +56,12 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
     assert_eq!(status, "poisoned");
     assert!(has_ts, "poisoned_at must be set in the same statement");
     assert!(worker.is_none(), "assigned_builder_id must be NULLed");
+    assert_eq!(
+        failure_msg.as_deref(),
+        Some("builder exited 1: cc not found"),
+        "failure_msg must persist the builder error"
+    );
+    assert_eq!(failure_exec, Some(exec), "failure_exec_id must persist");
 
     let rows = db.load_poisoned_derivations().await?;
     assert_eq!(rows.len(), 1, "persist_poisoned should make row loadable");
@@ -64,8 +84,14 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
         "clear_poison should remove from poisoned set"
     );
 
-    let (status, poisoned_at): (String, Option<f64>) = sqlx::query_as(
-        "SELECT status, EXTRACT(EPOCH FROM poisoned_at)::float8 \
+    let (status, poisoned_at, failure_msg, failure_exec): (
+        String,
+        Option<f64>,
+        Option<String>,
+        Option<Uuid>,
+    ) = sqlx::query_as(
+        "SELECT status, EXTRACT(EPOCH FROM poisoned_at)::float8, \
+                failure_msg, failure_exec_id \
          FROM derivations WHERE drv_hash=$1",
     )
     .bind(drv_hash.as_str())
@@ -73,6 +99,10 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
     .await?;
     assert_eq!(status, "created");
     assert!(poisoned_at.is_none());
+    assert!(
+        failure_msg.is_none() && failure_exec.is_none(),
+        "clear_poison must NULL the persisted failure reason"
+    );
     Ok(())
 }
 
@@ -96,7 +126,12 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
     for h in &hashes {
         insert_test_derivation(&db, h.as_str()).await?;
         let fenced_outcome = db
-            .persist_poisoned(h, ServingGeneration::stamp_from_claim(1))
+            .persist_poisoned(
+                h,
+                Some("batch poison reason"),
+                None,
+                ServingGeneration::stamp_from_claim(1),
+            )
             .await?;
         assert!(fenced_outcome.settled());
     }
@@ -121,7 +156,9 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
     let (n_created, n_clean): (i64, i64) = sqlx::query_as(
         "SELECT
              COUNT(*) FILTER (WHERE status = 'created'),
-             COUNT(*) FILTER (WHERE poisoned_at IS NULL)
+             COUNT(*) FILTER (WHERE poisoned_at IS NULL
+                              AND failure_msg IS NULL
+                              AND failure_exec_id IS NULL)
          FROM derivations WHERE drv_hash = ANY($1)",
     )
     .bind(hashes.iter().map(DrvHash::as_str).collect::<Vec<_>>())
@@ -449,7 +486,7 @@ async fn stale_tenure_status_and_poison_writes_are_fenced() -> anyhow::Result<()
     );
     // Poison stamp on the plain row.
     assert_eq!(
-        db.persist_poisoned(&plain, ServingGeneration::stamp_from_claim(1))
+        db.persist_poisoned(&plain, None, None, ServingGeneration::stamp_from_claim(1))
             .await?,
         FencedOutcome::Fenced,
         "the poison stamp must be fenced below the floor"
@@ -519,7 +556,7 @@ async fn current_tenure_status_and_poison_writes_apply() -> anyhow::Result<()> {
 
     // Fresh cluster (no claims): everything applies.
     assert_eq!(
-        db.persist_poisoned(&h, ServingGeneration::stamp_from_claim(1))
+        db.persist_poisoned(&h, None, None, ServingGeneration::stamp_from_claim(1))
             .await?,
         FencedOutcome::Applied(0)
     );
@@ -853,7 +890,9 @@ async fn status_writers_stamp_status_changed_at_biconditional() -> anyhow::Resul
         // the only status transition under measurement).
         if matches!(*writer, "clear_poison_in_tx" | "clear_poison_batch_in_tx") {
             assert!(
-                db.persist_poisoned(&drv_hash, generation).await?.settled(),
+                db.persist_poisoned(&drv_hash, None, None, generation)
+                    .await?
+                    .settled(),
                 "world setup poison must apply"
             );
             sqlx::query(
@@ -913,7 +952,7 @@ async fn status_writers_stamp_status_changed_at_biconditional() -> anyhow::Resul
             }
             "persist_poisoned_in_tx" => {
                 let mut tx = test_db.pool.begin().await?;
-                SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash).await?;
+                SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash, None, None).await?;
                 tx.commit().await?;
             }
             "clear_poison_in_tx" => {
@@ -1041,7 +1080,7 @@ async fn status_writers_hold_the_comparand_on_value_preserving_writes() -> anyho
             }
             "persist_poisoned_in_tx" => {
                 let mut tx = test_db.pool.begin().await?;
-                SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash).await?;
+                SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash, None, None).await?;
                 tx.commit().await?;
             }
             // The clear arms re-assert 'created' — the fresh insert's
@@ -1126,7 +1165,7 @@ async fn status_writers_hold_the_comparand_on_value_preserving_writes() -> anyho
             "persist_poisoned_in_tx" => {
                 // Re-poison the poisoned row.
                 let mut tx = test_db.pool.begin().await?;
-                SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash).await?;
+                SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash, None, None).await?;
                 tx.commit().await?;
             }
             "clear_poison_in_tx" => {
