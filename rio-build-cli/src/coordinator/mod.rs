@@ -20,9 +20,12 @@
 //! ids with the `--attach` hint.
 
 pub mod clients;
+mod faillog;
 pub mod graph;
 pub mod submit;
 pub mod upload;
+
+pub use faillog::{FailureLogOpts, replay_failure_log};
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -61,6 +64,9 @@ pub struct CoordinatorOpts {
     /// `--detach`: an interrupt exits the client and leaves builds
     /// running cluster-side instead of cancelling them.
     pub detach_on_interrupt: bool,
+    /// `--log-lines` / `-L`: how a fail-fast failure's original log is
+    /// replayed.
+    pub failure_log: FailureLogOpts,
 }
 
 impl Default for CoordinatorOpts {
@@ -74,6 +80,7 @@ impl Default for CoordinatorOpts {
             out_link: None,
             local_ifd: false,
             detach_on_interrupt: false,
+            failure_log: FailureLogOpts::default(),
         }
     }
 }
@@ -776,6 +783,7 @@ impl Coordinator {
         let mut clients = self.clients.clone();
         let acks = Arc::clone(&self.acks);
         let render = self.render.clone();
+        let failure_log = self.opts.failure_log;
         tokio::spawn(async move {
             let result = async {
                 let stream = submit::submit_root(&mut clients, &acks, &mats).await?;
@@ -783,7 +791,7 @@ impl Coordinator {
                     root_idx: idx,
                     digests,
                 });
-                watch_stream(&mut clients, stream, idx, &tx, render).await
+                watch_stream(&mut clients, stream, idx, &tx, render, failure_log).await
             }
             .await;
             let _ = tx.send(Internal::Finished {
@@ -804,6 +812,7 @@ async fn watch_stream(
     root_idx: usize,
     tx: &mpsc::UnboundedSender<Internal>,
     render: RenderHandle,
+    failure_log: FailureLogOpts,
 ) -> anyhow::Result<WatchResult> {
     let mut result = WatchResult {
         build_id: String::new(),
@@ -857,6 +866,13 @@ async fn watch_stream(
                 return Ok(result);
             }
             Some(Event::Failed(f)) => {
+                // Fail-fast on a previously-failed derivation: replay the
+                // original culprit's log (or its persisted reason) before
+                // reporting the terminal state. Live failures carry no
+                // culprit fields — their log already streamed above.
+                if !f.culprit_derivation.is_empty() {
+                    replay_failure_log(clients, &result.build_id, &f, failure_log, &render).await;
+                }
                 result.state = OutcomeState::Failed {
                     message: f.error_message,
                 };
@@ -886,6 +902,7 @@ pub async fn attach_build(
     build_id: &str,
     since_sequence: u64,
     render: RenderHandle,
+    failure_log: FailureLogOpts,
 ) -> anyhow::Result<BuildOutcome> {
     let resp = clients
         .scheduler
@@ -896,7 +913,7 @@ pub async fn attach_build(
         .await
         .context("WatchBuild")?;
     let (tx, _rx) = mpsc::unbounded_channel();
-    let mut result = watch_stream(clients, resp.into_inner(), 0, &tx, render).await?;
+    let mut result = watch_stream(clients, resp.into_inner(), 0, &tx, render, failure_log).await?;
     if result.build_id.is_empty() {
         result.build_id = build_id.to_string();
     }

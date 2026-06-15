@@ -23,6 +23,14 @@
 #                 parseFlakeRef → lockFlake → callFlake path,
 #                 hermetic flake (no inputs), distinct drv names so it
 #                 never cache-hits the file-mode runs
+#   cached-failure-replay
+#                 failing dep poisons ([poison] threshold=1 via env);
+#                 three priming submissions exhaust the resubmit-reset
+#                 budget; the 4th fail-fasts and the client must name
+#                 the poisoned CULPRIT and replay its original log —
+#                 default 20-line tail, full under -L, and the
+#                 persisted reason text for a culprit that produced no
+#                 output
 #
 # Native-path purity: the client never gets an SSH key and the
 # gateway's authorized_keys only holds the boot placeholder — nothing
@@ -114,8 +122,10 @@ pkgs.testers.runNixOSTest {
   skipTypeCheck = true;
 
   # ~90s boot + eval-parent cold start + 2 tiny builds at tick=2s +
-  # warm rerun + attach + flake-mode (2 more builds). Generous for TCG.
-  globalTimeout = 720 + common.covTimeoutHeadroom;
+  # warm rerun + attach + flake-mode (2 more builds) + the
+  # cached-failure-replay leg (3 priming invocations of 2 failing
+  # builds each, then 3 cheap fail-fast invocations). Generous for TCG.
+  globalTimeout = 1200 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 
@@ -157,12 +167,12 @@ pkgs.testers.runNixOSTest {
         "${common.covShellEnv}"
     )
 
-    def rio_build(args, log_suffix):
+    def rio_build(args, log_suffix, dump_on_fail=True):
         rc, out = client.execute(
             f"timeout 300 env {rio_env} ${rio} build {args} "
             f"2>/tmp/rio-stderr-{log_suffix}.log"
         )
-        if rc != 0:
+        if rc != 0 and dump_on_fail:
             print(f"--- rio stderr ({log_suffix}) ---")
             client.execute(f"cat /tmp/rio-stderr-{log_suffix}.log >&2")
             print("--- worker rio-builder journal tail ---")
@@ -276,6 +286,62 @@ pkgs.testers.runNixOSTest {
         after = journal_builds_succeeded(worker)
         assert after >= before + 2, (
             f"expected >=2 new worker builds for flake leg, {before} -> {after}"
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    with subtest("cached-failure-replay: fail-fast names the culprit and replays its log"):
+        # Three priming submissions: each fails the loud and the silent
+        # dep live (poison threshold 1 via RIO_POISON__THRESHOLD), and
+        # each resubmission consumes one resubmit-reset cycle (limit 2).
+        # The 4th submission of either root fail-fasts at merge.
+        for i in range(3):
+            rc, out = rio_build(
+                "failingConsumer silentConsumer -f ${fixtureNix}",
+                f"prime-{i}",
+                dump_on_fail=False,
+            )
+            assert rc != 0, f"priming run {i} should fail:\n{out}"
+
+        # 4th submission of the loud root: no execution runs; the client
+        # must attribute the failure to the poisoned dep (not the
+        # consumer it submitted) and replay the tail of its original log.
+        rc, out = rio_build(
+            "failingConsumer -f ${fixtureNix} --log-lines 20",
+            "failfast",
+            dump_on_fail=False,
+        )
+        assert rc != 0, f"fail-fast run should fail:\n{out}"
+        err = client.succeed("cat /tmp/rio-stderr-failfast.log")
+        assert "failed previously" in err, f"missing failure replay header:\n{err}"
+        assert "rio-bc-fail-dep" in err, f"culprit dep not named:\n{err}"
+        assert "rio-bc-fail-marker line 30" in err, f"tail content missing:\n{err}"
+        assert "rio-bc-fail-marker line 5" not in err, (
+            f"default 20-line tail must not include early lines:\n{err}"
+        )
+
+        # -L / --print-build-logs: the full original log.
+        rc, out = rio_build(
+            "failingConsumer -f ${fixtureNix} -L",
+            "failfast-full",
+            dump_on_fail=False,
+        )
+        assert rc != 0, f"-L fail-fast run should fail:\n{out}"
+        err = client.succeed("cat /tmp/rio-stderr-failfast-full.log")
+        assert "rio-bc-fail-marker line 5" in err, f"-L must replay the full log:\n{err}"
+
+        # The silent culprit produced no log lines: the client prints the
+        # persisted failure reason instead of a (nonexistent) tail.
+        rc, out = rio_build(
+            "silentConsumer -f ${fixtureNix}",
+            "failfast-silent",
+            dump_on_fail=False,
+        )
+        assert rc != 0, f"silent fail-fast run should fail:\n{out}"
+        err = client.succeed("cat /tmp/rio-stderr-failfast-silent.log")
+        assert "failed previously" in err, f"missing failure replay header:\n{err}"
+        assert "rio-bc-fail-silent" in err, f"silent culprit not named:\n{err}"
+        assert "rio-bc-fail-marker" not in err, (
+            f"silent run must not replay the loud fixture's log:\n{err}"
         )
 
     ${common.collectCoverage fixture.pyNodeVars}
