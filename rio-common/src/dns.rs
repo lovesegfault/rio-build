@@ -68,6 +68,48 @@ fn fnv1a_64(raw: &str) -> u64 {
 pub struct Dns1123Label(String);
 
 impl Dns1123Label {
+    /// Suffix-budgeted label length: `DNS1123_MAX_LEN - reserved`,
+    /// floored so at least one stem char survives next to the 9-char
+    /// salt footprint (`-xxxxxxxx`) when the altered arm fires.
+    fn budget_for(reserved: usize) -> usize {
+        DNS1123_MAX_LEN.saturating_sub(reserved).max(10)
+    }
+
+    /// The deterministic char-map → take(budget) → edge-trim fold:
+    /// the ONE place a raw is shaped into the candidate label body,
+    /// shared by [`Self::sanitize`] and [`Self::hits_random_fallback`]
+    /// so the test predicate and the production trigger cannot drift.
+    fn fold(raw: &str, budget: usize) -> String {
+        raw.chars()
+            .map(|c| match c {
+                'a'..='z' | '0'..='9' | '-' => c,
+                'A'..='Z' => c.to_ascii_lowercase(),
+                _ => '-',
+            })
+            .take(budget)
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string()
+    }
+
+    /// The random-fallback arm's trigger over a [`Self::fold`]ed
+    /// body: production `sanitize` literally calls this, so a future
+    /// trigger edit (e.g. `out.is_empty() || out.len() == 1`) has
+    /// exactly one place to land and the test gate moves with it.
+    fn folded_hits_random(out: &str) -> bool {
+        out.is_empty()
+    }
+
+    /// `true` iff `sanitize(raw, reserved, _)` takes the
+    /// random-salted fallback arm — the EXACT predicate, by routing
+    /// through the same [`Self::fold`] and [`Self::folded_hits_random`]
+    /// production calls (bug_018: the proptest's determinism gate is
+    /// this predicate, not an output-prefix heuristic that
+    /// over-excludes deterministic raws wearing the fallback stem).
+    pub fn hits_random_fallback(raw: &str, reserved: usize) -> bool {
+        Self::folded_hits_random(&Self::fold(raw, Self::budget_for(reserved)))
+    }
+
     /// Sanitize an arbitrary hostname into a DNS-1123 label of length
     /// ≤ `DNS1123_MAX_LEN - reserved`, leaving `reserved` chars of
     /// suffix budget for [`Self::with_worker`].
@@ -111,21 +153,9 @@ impl Dns1123Label {
     /// identities, exactly as for the original truncation change.
     // r[impl store.materialize.worker-identity]
     pub fn sanitize(raw: &str, reserved: usize, fallback_stem: &str) -> Dns1123Label {
-        // 9 = the salt suffix's own footprint ("-xxxxxxxx"), kept
-        // inside the budget when the altered arm fires; floor keeps
-        // one stem char beside it.
-        let budget = DNS1123_MAX_LEN.saturating_sub(reserved).max(10);
-        let mut out: String = raw
-            .chars()
-            .map(|c| match c {
-                'a'..='z' | '0'..='9' | '-' => c,
-                'A'..='Z' => c.to_ascii_lowercase(),
-                _ => '-',
-            })
-            .take(budget)
-            .collect();
-        out = out.trim_matches('-').to_string();
-        if out.is_empty() {
+        let budget = Self::budget_for(reserved);
+        let mut out = Self::fold(raw, budget);
+        if Self::folded_hits_random(&out) {
             // No usable identity at all: salt randomly (per process) so
             // two such replicas never collide, and say so loudly.
             use std::hash::{BuildHasher, Hasher};
@@ -296,7 +326,11 @@ mod tests {
         assert_ne!(c, b, "host.a no longer folds onto host-a");
         assert_ne!(a, c, "distinct raws get distinct salts");
         assert_eq!(a, s("Host_A"), "deterministic across restarts");
-        // Empty/garbage raw → the salted fallback stem.
+        // Empty/garbage raw → the salted fallback stem. This is a
+        // POSITIVE output-shape assertion (the fallback wears the
+        // stem), NOT a discriminator for the random arm — bug_018:
+        // `hits_random_fallback` is the discriminator; the prefix is
+        // also worn by deterministic raws that sanitize onto it.
         let e = s("");
         assert!(e.as_str().starts_with("rio-store-dev-"), "got {e}");
         assert!(is_dns1123_label(e.as_str()));
@@ -394,6 +428,43 @@ mod tests {
         }
     }
 
+    /// bug_018: the proptest's determinism gate must be the EXACT
+    /// random-arm trigger predicate, not an output-prefix heuristic.
+    /// The old gate `!out.starts_with("rio-store-dev-")` over-excludes
+    /// deterministic raws that happen to sanitize onto the fallback
+    /// stem — both witnesses below are fully deterministic (one
+    /// passes through, one case-folds and salts) yet both wear the
+    /// prefix and were silently SKIPPED by the determinism check.
+    ///
+    /// RED (the assertion below IS the old gate, applied to the two
+    /// witnesses; verbatim failure captured before the predicate
+    /// export):
+    ///   deterministic raw "rio-store-dev-abc" must not be excluded
+    ///   by the determinism gate; old output-prefix heuristic gives
+    ///   "rio-store-dev-abc"
+    #[test]
+    fn random_fallback_predicate_is_exact_not_output_heuristic() {
+        let s = |raw: &str| Dns1123Label::sanitize(raw, WORKER_SUFFIX_RESERVED, "rio-store-dev");
+        for raw in ["rio-store-dev-abc", "RIO-STORE-DEV-X"] {
+            assert!(
+                !Dns1123Label::hits_random_fallback(raw, WORKER_SUFFIX_RESERVED),
+                "deterministic raw {raw:?} must not be excluded by the \
+                 determinism gate; old output-prefix heuristic gives {:?}",
+                s(raw).as_str()
+            );
+            // The over-excluded population IS deterministic:
+            assert_eq!(s(raw), s(raw), "deterministic across calls: {raw:?}");
+        }
+        // The predicate is total over the random arm's actual domain
+        // (raws that fold to empty):
+        for raw in ["", "___", "-.-", "   "] {
+            assert!(
+                Dns1123Label::hits_random_fallback(raw, WORKER_SUFFIX_RESERVED),
+                "{raw:?} folds to empty and must hit the random fallback"
+            );
+        }
+    }
+
     /// W12-AW (bug_157): the empty-raw arm's termination is
     /// STRUCTURAL — the nonce provably survives sanitization for
     /// every stem, so the arm fires at most once and the caller's
@@ -466,9 +537,13 @@ mod tests {
                 composed.as_str(),
                 raw
             );
-            // Determinism on the non-empty arm (the empty-raw fallback
-            // is deliberately random per process).
-            if !base.as_str().starts_with("rio-store-dev-") {
+            // Determinism on the non-random arm (the empty-fold
+            // fallback is deliberately random per process). bug_018:
+            // gate on the EXACT production trigger predicate, not an
+            // output-prefix heuristic — see the
+            // `random_fallback_predicate_is_exact_not_output_heuristic`
+            // witnesses for raws the old prefix gate over-excluded.
+            if !Dns1123Label::hits_random_fallback(&raw, WORKER_SUFFIX_RESERVED) {
                 let again = Dns1123Label::sanitize(&raw, WORKER_SUFFIX_RESERVED, "rio-store-dev")
                     .with_worker(n);
                 prop_assert_eq!(composed, again);
