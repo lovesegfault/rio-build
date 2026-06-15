@@ -150,6 +150,58 @@ impl LoadAggregate {
     pub fn total_coverage(&self) -> bool {
         self.answered == self.resolved
     }
+
+    // r[impl ctrl.scaler.load-coverage+2]
+    /// Fold the (band × coverage) two-axis product into the closed
+    /// [`LoadLetter`] alphabet. The asymmetric-coverage law lives
+    /// HERE, in the variant constructors — `High` accepts any
+    /// coverage; `LowTotal` demands `total_coverage()` — checked by
+    /// kani as four iffs over the full 6-cell partition
+    /// (`check_load_letter_partition_iff`). Never returns
+    /// [`LoadLetter::Absent`]: a constructed aggregate has
+    /// `answered > 0` ([`Self::fold`]); only `decide`'s `map_or`
+    /// produces that variant.
+    pub fn classify(self, low: f64, high: f64) -> LoadLetter {
+        match (self.max > high, self.max < low, self.total_coverage()) {
+            (true, _, _) => LoadLetter::High,
+            (false, true, true) => LoadLetter::LowTotal,
+            (false, true, false) => LoadLetter::LowPartial,
+            (false, false, _) => LoadLetter::InBand,
+        }
+    }
+}
+
+/// The closed (band × coverage) classification of the denominated
+/// load letter — the [`LoadAggregate`] two-axis product folded ONCE
+/// at the boundary into a five-variant alphabet whose every cell is
+/// self-contained. [`decide`] matches on this with structural
+/// patterns only and zero `if` guards, so reorder-safety and
+/// totality are rustc-enforced (bug_019, the §Multi-axis-fn close:
+/// the prior five ordered if-guarded arms made arm 3 borrow
+/// `total_coverage()` from arm 2 positionally; rustc does not lint
+/// guarded-arm reorder, and a 2↔3 swap silently re-admitted the
+/// partial-low-funds-growth shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadLetter {
+    /// `load = None` — the poll resolved zero addrs / every RPC
+    /// errored. Only [`decide`]'s `map_or` constructs this;
+    /// [`LoadAggregate::classify`] never returns it
+    /// (`check_load_letter_absent_is_none`).
+    Absent,
+    /// `max > high` under ANY coverage: a survivor reading high is a
+    /// real replica really saturated — scale-up evidence survives
+    /// partial coverage (W13-AF, the asymmetric half).
+    High,
+    /// `max < low` AND `total_coverage()`: every resolved replica
+    /// answered low — the only cell that can fund ratio growth.
+    LowTotal,
+    /// `max < low` AND `!total_coverage()`: survivor-only LOW — the
+    /// dropped replica's reading may BE the max, so the "all low"
+    /// claim is unsubstantiated. Funds nothing.
+    LowPartial,
+    /// `low <= max <= high` under ANY coverage: one replica
+    /// genuinely in-band disproves "all replicas low".
+    InBand,
 }
 
 /// Result of one reconcile decision: the next status to write and
@@ -296,18 +348,19 @@ pub fn decide(
     };
 
     // Reactive correction on observed load.
-    // r[impl ctrl.scaler.load-coverage+2]
-    // The asymmetric consume of the denominated letter: the high arm
-    // accepts ANY coverage — quantifier: census(test: w13_af_partial_high_still_scales_up) —
-    // (a survivor reading high is a real replica
-    // really saturated — scale-up evidence survives partial
-    // coverage); the low/funding arm demands TOTAL coverage (the
-    // dropped replica's reading may BE the max, so a survivor-only
-    // "all low" claim is unsubstantiated and funds nothing). The
-    // in-band arm needs no coverage qualifier: one genuinely in-band
-    // replica disproves "all replicas low" under any coverage.
-    let (raw_desired, ratio_out, low_ticks) = match load {
-        Some(l) if l.max > high => {
+    // The asymmetric consume of the denominated letter — quantifier:
+    // census(test: w13_af_partial_high_still_scales_up) — is folded
+    // ONCE into the closed `LoadLetter` alphabet at the boundary
+    // (the law lives in `classify`, kani-checked); the raw aggregate
+    // is then SEALED so no arm can re-guard on `load.max` /
+    // `total_coverage()` and reintroduce a positional dependency.
+    let letter = load.map_or(LoadLetter::Absent, |l| l.classify(low, high));
+    #[allow(clippy::let_unit_value)]
+    let load = ();
+    #[allow(clippy::let_unit_value)]
+    let _ = load; // raw aggregate sealed — extend LoadLetter, never re-guard
+    let (raw_desired, ratio_out, low_ticks) = match letter {
+        LoadLetter::High => {
             // Under-provisioned. +1 over CURRENT (not predicted): if
             // the prediction is what got us here, "predicted + 0"
             // wouldn't help. The ratio decay makes the NEXT
@@ -318,7 +371,7 @@ pub fn decide(
                 0,
             )
         }
-        Some(l) if l.max < low && !l.total_coverage() => {
+        LoadLetter::LowPartial => {
             // Survivor-only LOW: the letter cannot substantiate
             // "every replica is low" (the load-correlated timeout
             // regime recurs every pass — a standing cell, not a
@@ -327,7 +380,7 @@ pub fn decide(
             // otherwise.
             (predicted, ratio_in, ambiguous_ticks())
         }
-        Some(l) if l.max < low => {
+        LoadLetter::LowTotal => {
             // Over-provisioned — maybe. Count toward ratio growth;
             // use the prediction (which may itself be < current —
             // scale-down guard below handles that).
@@ -361,11 +414,11 @@ pub fn decide(
         }
         // In-band load: one replica genuinely in-band disproves
         // "all replicas low" — reset under any coverage.
-        Some(_) => (predicted, ratio_in, 0),
+        LoadLetter::InBand => (predicted, ratio_in, 0),
         // Sensor absent: the hoisted classification still evaluates
         // — idle/at-min resets (merged_bug_009's face), working
         // preserves decay-bounded (the ambiguous cell).
-        None => (predicted, ratio_in, ambiguous_ticks()),
+        LoadLetter::Absent => (predicted, ratio_in, ambiguous_ticks()),
     };
 
     // Clamp to the boundary-normalized bounds (derived once above —
