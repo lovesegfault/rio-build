@@ -124,7 +124,7 @@ pub fn simplex_project(v: [f64; K]) -> Alpha {
 /// under-determined and the active set picks an arbitrary vertex.
 fn rank_gate(samples: &[AlphaSample]) -> bool {
     let mut distinct: Vec<[f64; K]> = samples.iter().map(|s| s.factor).collect();
-    distinct.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    distinct.sort_unstable_by(super::cmp_f64_array);
     distinct.dedup_by(|a, b| a.iter().zip(&*b).all(|(x, y)| (x - y).abs() < 1e-6));
     if distinct.len() < 2 {
         return false;

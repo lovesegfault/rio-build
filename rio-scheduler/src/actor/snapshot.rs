@@ -1666,15 +1666,15 @@ pub(super) struct AckApplyPlan {
 
 /// bug_107: the spawn-intent emission order — `(ready desc, priority
 /// desc, cores desc, eta asc, intent_id asc)` — TOTAL over the full
-/// f64 domain. The previous inline `(bool, f64)` tuple
-/// `partial_cmp + unwrap_or(Equal)` was this pipeline's one surviving
-/// non-total comparator (driftsort-panic-eligible if a priority were
-/// ever NaN, a leader panic loop pointing at the sort, not the
-/// writer); NaN-freedom was enforced only by an `is_finite` filter
-/// two modules away (sla/mod.rs) — an invariant at a distance.
-/// `total_cmp` is the repo's standard for f64 sort keys (the eta leg
-/// below and the sibling sorts already use it); for finite inputs it
-/// orders identically to the old comparator, asserted by
+/// f64 domain. The previous inline `(bool, f64)` tuple comparator was
+/// non-total (driftsort-panic-eligible if a priority were ever NaN, a
+/// leader panic loop pointing at the sort, not the writer);
+/// NaN-freedom was enforced only by an `is_finite` filter two modules
+/// away (sla/mod.rs) — an invariant at a distance. `total_cmp` is the
+/// repo's standard for f64 sort keys (bug_025: enforced workspace-wide
+/// by the `f64-sort-totality` rg-policy gate; arrays via
+/// [`crate::sla::cmp_f64_array`]); for finite inputs it orders
+/// identically to the old comparator, asserted by
 /// `spawn_intent_order_total_and_finite_compatible`.
 /// `unwrap_or(true)` on `ready`: a pre-§13a sender omits field 13;
 /// pre-§13a only emitted Ready-loop intents (bug_001).

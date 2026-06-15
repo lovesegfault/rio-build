@@ -127,6 +127,30 @@ pub mod types;
 type FitKey = (String, String);
 type FitCache = HashMap<String, LruCache<FitKey, types::FittedParams>>;
 
+/// THE canonical lexicographic comparator for `[f64; N]` sort keys
+/// (bug_025): element-wise [`f64::total_cmp`], so the order is TOTAL
+/// over the full f64 domain (NaN/±∞/±0/subnormals included) — the
+/// open-coded `unwrap_or(Equal)` fallback on `partial_cmp` it
+/// replaces is non-total
+/// (NaN compares Equal to everything, which driftsort can panic on or
+/// silently mis-order). For finite inputs the order is identical to
+/// `partial_cmp().unwrap()`. The `f64-sort-totality` rg-policy gate
+/// (nix/misc-checks.nix) bans the open-coded form workspace-wide;
+/// `cmp_f64_array_is_total` (below, kani) proves no-panic +
+/// antisymmetry over arbitrary `[f64; 2]` pairs. Scalar callers use
+/// `f64::total_cmp` directly.
+#[inline]
+pub fn cmp_f64_array<const N: usize>(a: &[f64; N], b: &[f64; N]) -> std::cmp::Ordering {
+    let mut i = 0;
+    while i < N {
+        match a[i].total_cmp(&b[i]) {
+            std::cmp::Ordering::Equal => i += 1,
+            ord => return ord,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 /// cgroup poll interval (`executor::monitors`). Feeds the MAD floor in
 /// [`ingest::is_outlier`] — a 1s sampler on a 10s build is ±10% wall-
 /// clock noise; the gate's relative-granularity floor stops that being

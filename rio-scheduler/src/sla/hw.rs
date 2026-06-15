@@ -347,8 +347,7 @@ impl HwTable {
             .min_by(|(ka, va), (kb, vb)| {
                 (va.factor[0] - 1.0)
                     .abs()
-                    .partial_cmp(&(vb.factor[0] - 1.0).abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .total_cmp(&(vb.factor[0] - 1.0).abs())
                     .then_with(|| ka.cmp(kb))
             })
             .map(|(k, _)| k.clone())
