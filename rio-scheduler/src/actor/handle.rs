@@ -430,7 +430,30 @@ impl ActorHandle {
             est_memory_bytes,
             est_disk_bytes,
             est_deadline_secs,
+            est_cores: None,
             floor,
+            reply,
+        })
+        .await
+    }
+
+    /// Seed `last_intent.{cores, deadline_secs}` for the D4 cores-axis
+    /// tests (sh-012). Separate seam so the existing five-param call
+    /// sites stay untouched.
+    pub async fn debug_seed_intent_cores(
+        &self,
+        drv_hash: &str,
+        cores: u32,
+        deadline_secs: u32,
+    ) -> Result<bool, ActorError> {
+        let drv_hash = drv_hash.to_string();
+        self.debug(|reply| DebugCmd::SeedSchedHint {
+            drv_hash,
+            est_memory_bytes: None,
+            est_disk_bytes: None,
+            est_deadline_secs: Some(deadline_secs),
+            est_cores: Some(cores),
+            floor: None,
             reply,
         })
         .await

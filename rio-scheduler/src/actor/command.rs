@@ -828,6 +828,7 @@ pub enum DebugCmd {
         est_memory_bytes: Option<u64>,
         est_disk_bytes: Option<u64>,
         est_deadline_secs: Option<u32>,
+        est_cores: Option<u32>,
         floor: Option<crate::state::ResourceFloor>,
         reply: oneshot::Sender<bool>,
     },

@@ -298,8 +298,7 @@ async fn resource_floor_is_fenced_and_monotone() -> anyhow::Result<()> {
     insert_claim(&test_db.pool, 2).await?;
     let promoted = crate::state::ResourceFloor {
         mem_bytes: 16 << 30,
-        disk_bytes: 0,
-        deadline_secs: 0,
+        ..Default::default()
     };
     assert!(
         db.update_resource_floor(&drv_hash, &promoted, ServingGeneration::stamp_from_claim(2))
@@ -310,8 +309,7 @@ async fn resource_floor_is_fenced_and_monotone() -> anyhow::Result<()> {
     // (a) A deposed gen-1 replica's late 8G write is FENCED: still 16G.
     let stale = crate::state::ResourceFloor {
         mem_bytes: 8 << 30,
-        disk_bytes: 0,
-        deadline_secs: 0,
+        ..Default::default()
     };
     assert_eq!(
         db.update_resource_floor(&drv_hash, &stale, ServingGeneration::stamp_from_claim(1))
@@ -343,8 +341,7 @@ async fn resource_floor_is_fenced_and_monotone() -> anyhow::Result<()> {
     // (c) A genuine promotion to 32G goes through.
     let bigger = crate::state::ResourceFloor {
         mem_bytes: 32 << 30,
-        disk_bytes: 0,
-        deadline_secs: 0,
+        ..Default::default()
     };
     assert!(
         db.update_resource_floor(&drv_hash, &bigger, ServingGeneration::stamp_from_claim(2))
@@ -357,5 +354,45 @@ async fn resource_floor_is_fenced_and_monotone() -> anyhow::Result<()> {
             .fetch_one(&test_db.pool)
             .await?;
     assert_eq!(mem, 32 << 30);
+
+    // (d) sh-012: the cores dimension (M_106) ratchets independently
+    // — a cores=8 write at gen-2 lands GREATEST(0,8)=8; a stale
+    // gen-2 cores=4 base keeps 8; mem (32G) is untouched.
+    let cores_promote = crate::state::ResourceFloor {
+        cores: 8,
+        ..Default::default()
+    };
+    assert!(
+        db.update_resource_floor(
+            &drv_hash,
+            &cores_promote,
+            ServingGeneration::stamp_from_claim(2)
+        )
+        .await?
+        .settled()
+    );
+    let cores_stale = crate::state::ResourceFloor {
+        cores: 4,
+        ..Default::default()
+    };
+    assert!(
+        db.update_resource_floor(
+            &drv_hash,
+            &cores_stale,
+            ServingGeneration::stamp_from_claim(2)
+        )
+        .await?
+        .settled()
+    );
+    let (cores, mem): (i32, i64) =
+        sqlx::query_as("SELECT floor_cores, floor_mem_bytes FROM derivations WHERE drv_hash = $1")
+            .bind(drv_hash.as_str())
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(
+        cores, 8,
+        "floor_cores GREATEST keeps the promoted dimension"
+    );
+    assert_eq!(mem, 32 << 30, "the cores write left mem untouched");
     Ok(())
 }

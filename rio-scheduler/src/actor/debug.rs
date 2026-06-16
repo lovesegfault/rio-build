@@ -139,6 +139,7 @@ impl DagActor {
                 est_memory_bytes,
                 est_disk_bytes,
                 est_deadline_secs,
+                est_cores,
                 floor,
                 reply,
             } => {
@@ -148,6 +149,7 @@ impl DagActor {
                     if est_memory_bytes.is_some()
                         || est_disk_bytes.is_some()
                         || est_deadline_secs.is_some()
+                        || est_cores.is_some()
                     {
                         let i = s.sched.last_intent.get_or_insert_with(Default::default);
                         if let Some(v) = est_memory_bytes {
@@ -158,6 +160,9 @@ impl DagActor {
                         }
                         if let Some(v) = est_deadline_secs {
                             i.deadline_secs = v;
+                        }
+                        if let Some(v) = est_cores {
+                            i.cores = v;
                         }
                     }
                     if let Some(f) = floor {

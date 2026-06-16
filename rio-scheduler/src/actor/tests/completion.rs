@@ -1133,7 +1133,7 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
 /// `ReportAttemptOutcome` classification fill, which never
 /// promotes).
 // r[verify sched.retry.promotion-exempt+3]
-// r[verify sched.sla.reactive-floor+4]
+// r[verify sched.sla.reactive-floor+5]
 #[tokio::test]
 async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -5401,7 +5401,7 @@ async fn store_degraded_counter_ticks_only_on_commit() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.sla.reactive-floor+4]
+// r[verify sched.sla.reactive-floor+5]
 /// bug_027 companion red — the carried-at-ceiling cell of `bump_dim`'s
 /// at_cap law: when the pod was DISPATCHED at the deadline cap (the
 /// carried `BoundIntent` rendered 86400s) and the mint-time solve
@@ -6802,6 +6802,122 @@ async fn corroborated_slow_build_timeout_still_heals_the_deadline_floor() -> Tes
         recorder.get("rio_scheduler_uncorroborated_sizing_claim_total{class=timed_out}"),
         0,
         "zero refusal letters on the corroborated path"
+    );
+    Ok(())
+}
+
+/// **sh-012 D4 cores axis (S1b red-first)** — *proposition: an
+/// `ExecutorVariantFailure` whose attempt's measured cpu utilization
+/// corroborates compute-bound (`cpu_seconds_total /
+/// (assigned_deadline × assigned_cores) ≥ threshold`) doubles
+/// `floor.cores` from the assigned shape; the next dispatch is at
+/// least the doubled cores.* RED at base: `ResourceFloor.cores` does
+/// not exist.
+// r[verify sched.sla.reactive-floor+5]
+// r[verify sched.retry.executor-variant-threshold]
+#[tokio::test]
+async fn e3a_compute_bound_doubles_floor_cores() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (_db, handle, _task) = setup().await;
+
+    let drv = "e3a-compute-bound";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    let exec = open_pull_exec(&handle, drv).await;
+    // The assigned shape: cores=4, deadline=600s (overwrite the
+    // mint's solve so the corroborant denominators are deterministic).
+    handle.debug_seed_intent_cores(drv, 4, 600).await?;
+    // cpu_util = 2280 / (600 × 4) = 0.95 ≥ 0.8.
+    pull_report_exec(
+        &handle,
+        exec,
+        drv,
+        PullReportPayload {
+            final_resources: Some(rio_proto::types::ResourceUsage {
+                cpu_seconds_total: Some(2280.0),
+                ..Default::default()
+            }),
+            ..pull_payload(rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::ExecutorVariantFailure.into(),
+                error_msg: "exit 1 (compute-bound)".into(),
+                ..Default::default()
+            })
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.sched.resource_floor.cores, 8,
+        "corroborated cpu_util=0.95: floor.cores doubles from the \
+         assigned 4 → 8"
+    );
+    assert_eq!(
+        s.status,
+        DerivationStatus::Ready,
+        "below the distinct-executor threshold: requeue (E3a)"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_resource_floor_bumps_total{reason=compute_bound}"),
+        1,
+        "the compute_bound label is the cores-axis bump letter"
+    );
+    Ok(())
+}
+
+/// **sh-012 D4 cores axis (the inverse-cost bound)** — *proposition: an
+/// `ExecutorVariantFailure` with cpu_util ≪ threshold (the genuine
+/// compile-error exit shape — died fast, near-zero cpu) refuses the
+/// compute-bound witness: `floor.cores` stays zero, and the 3-attempt
+/// E3a inverse cost is bounded at the same shape, never 3× resource.*
+// r[verify sched.retry.executor-variant-threshold]
+#[tokio::test]
+async fn e3a_low_cpu_util_leaves_floor_cores_unchanged() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (_db, handle, _task) = setup().await;
+
+    let drv = "e3a-compile-error";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    let exec = open_pull_exec(&handle, drv).await;
+    handle.debug_seed_intent_cores(drv, 4, 600).await?;
+    // cpu_util = 120 / (600 × 4) = 0.05 ≪ 0.8.
+    pull_report_exec(
+        &handle,
+        exec,
+        drv,
+        PullReportPayload {
+            final_resources: Some(rio_proto::types::ResourceUsage {
+                cpu_seconds_total: Some(120.0),
+                ..Default::default()
+            }),
+            ..pull_payload(rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::ExecutorVariantFailure.into(),
+                error_msg: "error: cannot find value `foo`".into(),
+                ..Default::default()
+            })
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let s = expect_drv(&handle, drv).await;
+    assert_eq!(
+        s.sched.resource_floor.cores, 0,
+        "uncorroborated cpu_util=0.05: floor.cores never moves on a \
+         fast intrinsic exit≠0 (the inverse-cost bound: 3 attempts at \
+         the same shape, never 3× resource)"
+    );
+    assert_eq!(
+        s.status,
+        DerivationStatus::Ready,
+        "below the distinct-executor threshold: requeue (E3a)"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_resource_floor_bumps_total{reason=compute_bound}"),
+        0,
+        "no bump letter on the refused path"
     );
     Ok(())
 }
