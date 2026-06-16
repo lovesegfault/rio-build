@@ -1533,6 +1533,33 @@ fn decide_exclusion_covers_charged_attempts<Id: Ord>(
         })
 }
 
+/// Clause 4 of [`decide`]'s contract (sh-012, E3a): an
+/// `ExecutorVariant` last event reaches `Poison(Permanent)` only via
+/// the distinct-executor threshold — never first-observation. (E3b's
+/// `Permanent` last event keeps first-observation poison and is NOT
+/// constrained by this clause; clause 1's `Permanent` arm asserts only
+/// `poisoned_at.is_some()` for both.)
+///
+/// "Last event" means the last BUILD-kind row, per the kind partition
+/// (the same convention as clause 2).
+#[cfg(kani)]
+fn decide_executor_variant_permanent_is_threshold<Id: Ord>(
+    d: &Decision<Id>,
+    history: &[LedgerRow<Id>],
+    budget: &Budget,
+) -> bool {
+    let last_is_executor_variant = history
+        .iter()
+        .rev()
+        .find(|r| r.kind == AttemptKind::Build)
+        .is_some_and(|r| {
+            r.event_kind == AttemptEventKind::Attempt
+                && r.outcome_class == OutcomeClass::ExecutorVariant
+        });
+    !(last_is_executor_variant && matches!(d.verdict, Verdict::Poison(PoisonReason::Permanent)))
+        || d.counters.poison_threshold_reached(budget)
+}
+
 /// Phase-1b decision function: fold a derivation's attempt-ledger suffix
 /// into the budget verdict and the derived counter/exclusion views.
 ///
@@ -1581,8 +1608,10 @@ fn decide_exclusion_covers_charged_attempts<Id: Ord>(
 // the exempt cap over every history whose last event is exempt-charging
 // — the global form additionally needs the writer discipline that
 // poisoned nodes get no further attempt rows, which is upstream of the
-// fold); and the exclusion set contains the executor of every charged
-// threshold attempt after the last reset row. The clause bodies are the
+// fold); the exclusion set contains the executor of every charged
+// threshold attempt after the last reset row; and (sh-012) an
+// executor-variant last event reaches Poison(Permanent) only via the
+// distinct-executor threshold. The clause bodies are the
 // `decide_*` predicate
 // functions above (one source of truth); `check_decide_contract` in
 // `#[cfg(kani)] mod proofs` asserts those same predicates on the result
@@ -1610,6 +1639,10 @@ fn decide_exclusion_covers_charged_attempts<Id: Ord>(
 #[cfg_attr(
     kani,
     kani::ensures(|d: &Decision<Id>| decide_exclusion_covers_charged_attempts(d, history))
+)]
+#[cfg_attr(
+    kani,
+    kani::ensures(|d: &Decision<Id>| decide_executor_variant_permanent_is_threshold(d, history, budget))
 )]
 pub fn decide<Id: Ord + Clone>(
     history: &[LedgerRow<Id>],
@@ -3658,16 +3691,17 @@ mod proofs {
         AbsTime::from(v)
     }
 
-    /// Every outcome class, including the two materialization classes
-    /// and the store-degraded pacing class (the full 16-literal
-    /// alphabet): the row domain stays a strict
+    /// Every outcome class, including the two materialization classes,
+    /// the store-degraded pacing class, and the executor-variant
+    /// threshold class (the full 18-literal alphabet): the row domain
+    /// stays a strict
     /// superset of what any appending site can write, so kind/class
     /// combinations that are malformed by writer discipline (e.g. a
     /// build-kind row carrying a materialization class) are inside the
     /// proven domain and covered by the fold's no-op arms.
     fn any_outcome_class() -> OutcomeClass {
         let i: u8 = kani::any();
-        kani::assume(i < 17);
+        kani::assume(i < 18);
         match i {
             0 => OutcomeClass::Transient,
             1 => OutcomeClass::Infra,
@@ -3685,7 +3719,8 @@ mod proofs {
             13 => OutcomeClass::MaterializationUnobtainable,
             14 => OutcomeClass::MaterializationInfra,
             15 => OutcomeClass::MaterializationReset,
-            _ => OutcomeClass::StoreDegraded,
+            16 => OutcomeClass::StoreDegraded,
+            _ => OutcomeClass::ExecutorVariant,
         }
     }
 
@@ -3838,9 +3873,10 @@ mod proofs {
         assert_eq!(yielded, s.len());
     }
 
-    /// Verify [`decide`] against its three stated `kani::ensures`
-    /// clauses — the verdict partition, the Requeue cap bounds, and the
-    /// exclusion-set superset — for every
+    /// Verify [`decide`] against its four stated `kani::ensures`
+    /// clauses — the verdict partition, the Requeue cap bounds, the
+    /// exclusion-set superset, and the executor-variant
+    /// permanent-poison threshold gate (sh-012) — for every
     /// suffix of up to 4 arbitrary rows, every scaled budget, and every
     /// clock value up to 16. With
     /// overflow checks on, the same run is the no-overflow proof for
@@ -3864,6 +3900,10 @@ mod proofs {
         assert!(decide_verdict_partition_consistent(&d, &budget, now));
         assert!(decide_requeue_within_caps(&d, history, &budget));
         assert!(decide_exclusion_covers_charged_attempts(&d, history));
+        // r[verify sched.retry.executor-variant-threshold]
+        assert!(decide_executor_variant_permanent_is_threshold(
+            &d, history, &budget
+        ));
     }
 
     /// The verdict partition is deterministic: two calls on the same
@@ -3955,7 +3995,7 @@ mod proofs {
             _ => "remote: concurrent PutPath in progress (path locked)",
         };
         let ev_sel: u8 = kani::any();
-        kani::assume(ev_sel < 10);
+        kani::assume(ev_sel < 11);
         let event = match ev_sel {
             0 => ObservedFailure::WorkerTransient,
             1 => ObservedFailure::WorkerInfra { error_msg },
@@ -3966,7 +4006,8 @@ mod proofs {
             6 => ObservedFailure::ControllerDeadlineExceeded,
             7 => ObservedFailure::BackstopTimeout,
             8 => ObservedFailure::UnreportedCrash,
-            _ => ObservedFailure::WorkerStoreDegraded,
+            9 => ObservedFailure::WorkerStoreDegraded,
+            _ => ObservedFailure::WorkerExecutorVariant,
         };
         let _ = classify(&event, floor);
     }
