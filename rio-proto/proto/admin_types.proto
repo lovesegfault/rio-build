@@ -184,6 +184,13 @@ enum TerminationReason {
   // bounded ladder as worker-reported TimedOut). Reported by JOB name
   // (pod is already deleted by Job controller).
   TERMINATION_REASON_DEADLINE_EXCEEDED = 6;
+  // sh-012 D4 cores axis: an executor-variant exit≠0 whose attempt
+  // demonstrably exhausted its parallelism budget — cpu_seconds_total
+  // / (assigned_deadline × assigned_cores) >= compute_bound_threshold.
+  // Worker-side; never produced by the controller (no controller-
+  // witnessed letter carries cpu telemetry). → bump
+  // `resource_floor.cores`.
+  TERMINATION_REASON_COMPUTE_BOUND = 7;
 }
 
 // ───────────────────────────────────────────────────────────────────────────

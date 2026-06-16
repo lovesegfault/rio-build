@@ -2221,6 +2221,10 @@ fn termination_reason_label(reason: TerminationReason) -> &'static str {
         TerminationReason::EvictedOther
         | TerminationReason::Completed
         | TerminationReason::Error
+        // ComputeBound is worker-side only (cpu_util corroboration on
+        // `final_resources.cpu_seconds_total`); the controller never
+        // produces it — `pod_termination_reason` has no producing arm.
+        | TerminationReason::ComputeBound
         | TerminationReason::Unknown => "other",
     }
 }
@@ -2239,6 +2243,10 @@ fn unified_attempt_reason(reason: TerminationReason) -> rio_proto::types::Attemp
         TerminationReason::Completed => A::Completed,
         TerminationReason::Error => A::Error,
         TerminationReason::DeadlineExceeded => A::DeadlineExceeded,
+        // Unreachable: worker-side only; `pod_termination_reason`
+        // never returns it. Mapped to Unspecified so a future
+        // mis-route stays classify-only at the establishment sweep.
+        TerminationReason::ComputeBound => A::Unspecified,
     }
 }
 
