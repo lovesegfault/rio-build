@@ -51,7 +51,29 @@ impl DagActor {
         if !self.leader.recovery_complete() {
             return;
         }
+        // sh-002 advisory row 6: per-phase wall-clock guard
+        // (defense-in-depth WARN now the lease is guard-isolated). The
+        // lease loop is on its own runtime (sched.lease.guard-isolated),
+        // so a 16.35s Tick no longer self-fences — but a sweep this
+        // long still head-of-line blocks every queued RPC. The
+        // `DISPATCH_PROBE_TICK_QUOTA` ledger already bounds the FMP
+        // batch; this WARN names the residual (the
+        // `complete_ready_from_store_batch` 3× serial PG awaits) when
+        // it crosses `SELF_FENCE_AFTER/2 = 5.5s`, the threshold past
+        // which the pre-guard shape would have starved a renew.
+        let t0 = std::time::Instant::now();
         let _ = self.batch_probe_cached_ready().await;
+        let elapsed = t0.elapsed();
+        if elapsed * 2 > rio_lease::SELF_FENCE_AFTER {
+            tracing::warn!(
+                ?elapsed,
+                budget_secs = rio_lease::SELF_FENCE_AFTER.as_secs_f64() / 2.0,
+                "17-ready-cache-sweep exceeded SELF_FENCE_AFTER/2; the lease is \
+                 guard-isolated so this no longer self-fences, but the dag-actor \
+                 is head-of-line blocked — the quota-deferred tail is served by \
+                 the next probe_generation"
+            );
+        }
     }
     // -----------------------------------------------------------------------
     // Dispatch

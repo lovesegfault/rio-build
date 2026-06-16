@@ -68,6 +68,14 @@ fn gauge_exemptions() -> Vec<GaugeExemption> {
                         outbox it measures (every clear caller, not just \
                         LeaderLost); family membership would double-own the reset",
         },
+        GaugeExemption {
+            name: "rio_scheduler_runtime_skew_seconds",
+            rationale: "per-replica by design (sched.lease.guard-isolated): the \
+                        guard-domain sentinel measures THIS replica's executor- \
+                        scheduling delay, leader and standby alike; a standby's \
+                        skew is its own real signal (the sh-002C 16.35s Tick \
+                        attribution), no leader edge",
+        },
     ]
 }
 

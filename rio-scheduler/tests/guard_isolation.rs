@@ -38,39 +38,56 @@ use rio_scheduler::guard::{GuardConfig, spawn};
 /// runtime and keeps its cadence through the stall (≥15 ticks).
 #[test]
 // r[verify sched.lease.guard-isolated]
+// r[verify sys.guard.domain-isolation]
 fn sh002c_long_actor_turn_does_not_self_fence() {
-    // SHIPPED topology (main.rs:24,333): the lease loop is a
-    // `spawn_monitored` task on the dag-actor's `#[tokio::main]`
-    // runtime — modeled here as one `current_thread` runtime so the
-    // starvation is deterministic (the live incident was on a
-    // 32-worker `multi_thread` runtime; the failure mode is the same
-    // when every worker is contended — the advisory's Stage C).
-    let main_rt = tokio::runtime::Builder::new_current_thread()
+    // PRODUCTION topology (main.rs `guard::spawn` wiring): a
+    // multi-thread main runtime (the dag-actor's domain) + the guard
+    // spawned exactly as `main.rs` does. 2 workers so the stall is
+    // deterministic (every worker pinned).
+    let main_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("main runtime");
-    // The lease-cadence canary at the scaled `RENEW_INTERVAL`. The
-    // production lease loop (`rio_lease::run_lease_loop`) is exactly a
-    // task at this shape: `interval.tick().await` → renew PATCH; one
-    // missed tick past `SELF_FENCE_AFTER` is `maybe_self_fence`.
+    let shutdown = rio_common::signal::Token::new();
+    let (guard, guard_join) = spawn(
+        main_rt.handle().clone(),
+        Arc::new(AtomicBool::new(true)),
+        GuardConfig {
+            health_addr: ([127, 0, 0, 1], 0).into(),
+            probe_interval: Duration::from_millis(50),
+            stall_threshold: Duration::from_millis(400),
+            ready_probe_budget: Duration::from_millis(300),
+        },
+        shutdown.clone(),
+    );
+    // The lease-cadence canary at the scaled `RENEW_INTERVAL`, hosted
+    // on the GUARD runtime via the production seam — the production
+    // lease loop (`rio_lease::run_lease_loop`) is exactly a task at
+    // this shape: `interval.tick().await` → renew PATCH; one missed
+    // tick past `SELF_FENCE_AFTER` is `maybe_self_fence`.
     let ticks = Arc::new(AtomicU64::new(0));
     let t = ticks.clone();
-    main_rt.spawn(async move {
+    guard.spawn_on_guard(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
             t.fetch_add(1, Ordering::Relaxed);
         }
     });
     // The 16.35s Tick (sh-002 Stage B; `17-ready-cache-sweep` /
-    // `complete_ready_from_store_batch`), scaled. `block_on` a
-    // blocking sleep so the runtime's ONE worker is pinned in user
-    // code — the admitted-load shape, not a paused clock.
-    main_rt.block_on(async {
-        std::thread::sleep(Duration::from_secs(2));
-    });
+    // `complete_ready_from_store_batch`), scaled. Every main worker
+    // pinned by blocking work — the admitted-load shape, not a paused
+    // clock.
+    for _ in 0..2 {
+        main_rt.spawn(async {
+            std::thread::sleep(Duration::from_secs(2));
+        });
+    }
+    std::thread::sleep(Duration::from_secs(2));
     let after = ticks.load(Ordering::Relaxed);
     // 2s at a 100ms cadence = 20 ticks budget; the assertion floor is
-    // 15 (25% slack for builder contention). RED at base: 0.
+    // 15 (25% slack for builder contention). RED at base: 0 (the
+    // canary shared the dag-actor's runtime).
     assert!(
         after >= 15,
         "lease-cadence canary starved during a long actor turn: {after} ticks \
@@ -79,6 +96,24 @@ fn sh002c_long_actor_turn_does_not_self_fence() {
          runtime the dag-actor cannot starve.",
         n = 2000 / 220,
     );
+    // D5 sentinel: main skew tracks the live stall (running lower
+    // bound), guard self-skew stays O(ms) — the D1 witness.
+    assert!(
+        guard.main_skew() >= Duration::from_millis(500),
+        "main skew should track the live stall, got {:?}",
+        guard.main_skew()
+    );
+    assert!(
+        guard.guard_skew() < Duration::from_millis(50),
+        "guard self-skew should stay O(ms) during a MAIN stall, got {:?}",
+        guard.guard_skew()
+    );
+    assert!(
+        guard.main_stalls() >= 1,
+        "the stall episode must be edge-counted (sh-002C attribution)"
+    );
+    shutdown.cancel();
+    guard_join.join();
 }
 
 /// F2 (bug_023, the runtime enforcement face): a `GuardJoin` dropped

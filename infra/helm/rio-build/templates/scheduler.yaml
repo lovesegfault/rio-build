@@ -238,6 +238,8 @@ spec:
               containerPort: 9001
             - name: metrics
               containerPort: 9091
+            - name: health
+              containerPort: 9194
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
             {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtVerify" "serviceHmac" "assignHmac")) | nindent 12 }}
@@ -291,28 +293,38 @@ spec:
               mountPath: /etc/rio/scheduler.toml
               subPath: scheduler.toml
               readOnly: true
-          # TCP, NOT gRPC. "is gRPC server listening." NOT gated on is_leader
-          # — that's the whole design point. Both pods Ready; clients route
-          # via health-aware balancer which DOES check is_leader (via
-          # grpc.health.v1 on named service). The old gRPC-named-service probe
-          # is still what the BALANCER uses — just not what K8s uses.
-          #
-          # No TLS retarget: tcpSocket handshake completes before TLS layer.
+          # httpGet on the GUARD-DOMAIN axum server (:9194,
+          # sched.lease.guard-isolated). NOT gated on is_leader — both
+          # pods Ready; clients route via health-aware balancer which
+          # DOES check is_leader (via grpc.health.v1 on named service).
+          # /readyz is 503 until init_db_pool/migrations complete AND
+          # the main runtime answers a no-op probe within budget — a
+          # browned-out dag-actor sheds (Endpoints removal), never a
+          # kill. The gRPC-named-service probe is still what the
+          # BALANCER uses — just not what K8s uses.
           readinessProbe:
-            tcpSocket: {port: 9001}
+            httpGet: {path: /readyz, port: health}
             periodSeconds: 5
             failureThreshold: 3
-          # Longer threshold. Standby is NOT_SERVING but ALIVE — don't restart.
-          # Liveness only fires if gRPC server itself dead. grpc.service
-          # liveness would ALSO fail on standby → wrong.
+          # /healthz: unconditional 200 (process alive + the dedicated
+          # current_thread runtime schedulable). Standby is NOT_SERVING
+          # but ALIVE — don't restart. sh-002C: pre-split, a 16.35s Tick
+          # starved the lease renew on the SHARED runtime and the leader
+          # self-fenced; the guard thread keeps /healthz answerable
+          # through any main-domain stall. grpc.service liveness would
+          # fail on standby → wrong.
           livenessProbe:
-            tcpSocket: {port: 9001}
+            httpGet: {path: /healthz, port: health}
             periodSeconds: 10
             failureThreshold: 6
-          # TCP (NOT named gRPC). Named SchedulerService only goes SERVING
-          # when is_leader=true; standby never acquires while leader healthy
-          # → named-service startupProbe would crash-loop standby. Generous:
-          # migrations + PG connect + store connect ~60s worst case.
+          # tcpSocket:9001 STAYS — gRPC bind ≈ post-init_db_pool/
+          # migrations. The guard binds /healthz BEFORE init_db_pool,
+          # so an httpGet startupProbe would be vacuous (200 before any
+          # dependency-connect). Named SchedulerService only goes
+          # SERVING when is_leader=true; standby never acquires while
+          # leader healthy → named-service startupProbe would
+          # crash-loop standby. Generous: migrations + PG connect ~60s
+          # worst case.
           startupProbe:
             tcpSocket: {port: 9001}
             periodSeconds: 5

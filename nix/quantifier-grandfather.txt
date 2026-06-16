@@ -1542,7 +1542,6 @@ rio-scheduler/src/grpc/tests/submit_tests.rs	// would be true for ANY non-empty 
 rio-scheduler/src/lib.rs	/// through the 4 MiB tonic default message cap up to the modeled
 rio-scheduler/src/main.rs	// The health-toggle loop below breaks on the SAME parent token
 rio-scheduler/src/main.rs	// against the SAME database; sqlx's default blocking
-rio-scheduler/src/main.rs	// live, the port is bound, leader-election is the ONLY thing
 rio-scheduler/src/main.rs	// lock as rio-store. Both services run the SAME migration set
 rio-scheduler/src/observability.rs	//!   SAME table, so an acquire-side effect cannot merge without its
 rio-scheduler/src/observability.rs	/// (Totality is structural — fn-pointer fields can't be omitted —
