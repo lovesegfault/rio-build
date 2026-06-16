@@ -23,6 +23,8 @@ aws-sdk-s3 = { workspace = true, optional = true }
 # Logging & metrics
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Non-blocking stdout writer for the fmt layer (observability.rs).
+tracing-appender = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 
 # OpenTelemetry (optional OTLP export, RIO_OTEL_ENDPOINT-gated)

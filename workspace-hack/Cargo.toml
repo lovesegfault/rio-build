@@ -120,6 +120,7 @@ subtle = { version = "2", features = ["const-generics"] }
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 thiserror = { version = "2" }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net", "sync"] }
 tokio-util = { version = "0.7", features = ["codec", "io", "time"] }
@@ -241,6 +242,7 @@ subtle = { version = "2", features = ["const-generics"] }
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 thiserror = { version = "2" }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net", "sync"] }
 tokio-util = { version = "0.7", features = ["codec", "io", "time"] }

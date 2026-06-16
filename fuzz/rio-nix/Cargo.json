@@ -11019,6 +11019,10 @@
           "packageId": "deranged"
         },
         {
+          "name": "itoa",
+          "packageId": "itoa"
+        },
+        {
           "name": "num-conv",
           "packageId": "num-conv"
         },
@@ -11034,6 +11038,7 @@
       "resolvedDefaultFeatures": [
         "alloc",
         "default",
+        "formatting",
         "parsing",
         "std"
       ],
@@ -11080,6 +11085,7 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "formatting",
         "parsing"
       ],
       "procMacro": true,
@@ -14058,6 +14064,10 @@
           "packageId": "thiserror 2.0.18"
         },
         {
+          "name": "time",
+          "packageId": "time"
+        },
+        {
           "name": "tokio",
           "packageId": "tokio"
         },
@@ -14639,6 +14649,10 @@
         {
           "name": "thiserror",
           "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "time",
+          "packageId": "time"
         },
         {
           "name": "tokio",

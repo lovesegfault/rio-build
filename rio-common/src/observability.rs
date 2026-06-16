@@ -58,18 +58,35 @@ impl FromStr for LogFormat {
     }
 }
 
-/// Returned from [`init_tracing`]. On drop, flushes any pending spans
-/// to the OTLP exporter (if one was configured). Hold this for the
-/// lifetime of `main()` — if dropped early, spans emitted after are
-/// still recorded locally but never shipped to the collector.
+/// Returned from [`init_tracing`]. Hold this for the lifetime of
+/// `main()`. On drop, flushes both buffered output channels:
 ///
-/// The contained `Option` is `None` when OTel wasn't configured, in which
-/// case `Drop` is a no-op.
-pub struct OtelGuard(Option<opentelemetry_sdk::trace::SdkTracerProvider>);
+/// - any pending spans to the OTLP exporter (if one was configured) —
+///   dropped early, spans emitted after are still recorded locally but
+///   never shipped to the collector;
+/// - any log lines still in the [`tracing_appender::non_blocking()`]
+///   writer's bounded buffer — dropped early, the background writer
+///   thread exits and subsequent log emits are silently discarded.
+///
+/// The `otel` field is `None` when OTel wasn't configured (its drop
+/// arm is a no-op); the log-writer guard is always populated.
+pub struct OtelGuard {
+    /// OTel tracer provider; `None` when `RIO_OTEL_ENDPOINT` is unset.
+    otel: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+    /// Keeps the non-blocking log writer's background thread alive and
+    /// flushes buffered lines on drop. sh-002 H4: the fmt layer writes
+    /// via `tracing_appender::non_blocking(stdout)`, so a debug-level
+    /// log flood never blocks the emitting task on stdout I/O — lines
+    /// are queued (lossy at the 128k-line default) and drained by a
+    /// dedicated thread. Dropping this guard before process exit would
+    /// lose any still-buffered lines. Held purely for its `Drop`; the
+    /// leading underscore suppresses the dead-code lint.
+    _log_writer: tracing_appender::non_blocking::WorkerGuard,
+}
 
 impl Drop for OtelGuard {
     fn drop(&mut self) {
-        if let Some(provider) = self.0.take() {
+        if let Some(provider) = self.otel.take() {
             // force_flush blocks until all buffered spans are exported.
             // Calling this from Drop is fine: main() is returning, we're
             // on the way out, blocking for ~100ms to ship the last batch
@@ -101,10 +118,26 @@ impl Drop for OtelGuard {
 pub fn init_tracing(component: &'static str) -> anyhow::Result<OtelGuard> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
+    // sh-002 H4: wrap stdout in a non-blocking writer so log emit is a
+    // bounded channel send, never a synchronous `write(2)` on the calling
+    // task. Under `RUST_LOG=debug` the scheduler emits thousands of
+    // lines/s; the default fmt writer blocks on stdout per event and
+    // contributed to actor turn cost. Lossy at the 128k-line default
+    // buffer (v1-I6: acceptable; no `r[obs.log.*]` rule constrains it).
+    // The returned `WorkerGuard` is held in `OtelGuard` so buffered lines
+    // flush at process exit.
+    let (writer, log_writer) = tracing_appender::non_blocking(std::io::stdout());
+
     // fmt layer: JSON or pretty. `.boxed()` so both arms have the same type.
     let fmt_layer = match log_format_from_env() {
-        LogFormat::Json => tracing_subscriber::fmt::layer().json().boxed(),
-        LogFormat::Pretty => tracing_subscriber::fmt::layer().pretty().boxed(),
+        LogFormat::Json => tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .json()
+            .boxed(),
+        LogFormat::Pretty => tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .pretty()
+            .boxed(),
     };
 
     // OTel layer: Some if RIO_OTEL_ENDPOINT is set, None otherwise.
@@ -113,7 +146,7 @@ pub fn init_tracing(component: &'static str) -> anyhow::Result<OtelGuard> {
     // boxed (Box<dyn Layer<S>>) so it composes over ANY subscriber shape;
     // the concrete OpenTelemetryLayer<Registry, Tracer> would hard-code
     // the stack shape and fail to compose over Layered<EnvFilter, ...>.
-    let (otel_layer, guard) = build_otel_layer(component)?;
+    let (otel_layer, otel) = build_otel_layer(component)?;
 
     // W3C TraceContext propagator for traceparent header inject/extract.
     // Registered globally even if otel_layer is None — the interceptor
@@ -129,7 +162,10 @@ pub fn init_tracing(component: &'static str) -> anyhow::Result<OtelGuard> {
         .with(otel_layer)
         .init();
 
-    Ok(guard)
+    Ok(OtelGuard {
+        otel,
+        _log_writer: log_writer,
+    })
 }
 
 /// `Box<dyn Layer<S>>` where `S` is the full registry stack. Concrete
@@ -138,11 +174,16 @@ pub fn init_tracing(component: &'static str) -> anyhow::Result<OtelGuard> {
 /// Boxing erases the `S` type parameter so the layer composes anywhere.
 type BoxedLayer<S> = Box<dyn Layer<S> + Send + Sync + 'static>;
 
-/// Build the OTel layer. Returns `(None, OtelGuard(None))` if
-/// `RIO_OTEL_ENDPOINT` is unset. Split out for readability.
+/// Build the OTel layer. Returns `(None, None)` if
+/// `RIO_OTEL_ENDPOINT` is unset. Split out for readability. The
+/// caller wraps the returned provider in [`OtelGuard`] alongside the
+/// non-blocking log writer guard.
+type OtelProvider = opentelemetry_sdk::trace::SdkTracerProvider;
+
+/// See [`OtelProvider`].
 fn build_otel_layer<S>(
     component: &'static str,
-) -> anyhow::Result<(Option<BoxedLayer<S>>, OtelGuard)>
+) -> anyhow::Result<(Option<BoxedLayer<S>>, Option<OtelProvider>)>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync,
 {
@@ -151,7 +192,7 @@ where
     // export fails at DEBUG — effectively silent — so treat as unset.
     let endpoint: String = crate::config::env_or("RIO_OTEL_ENDPOINT", String::new());
     if endpoint.is_empty() {
-        return Ok((None, OtelGuard(None)));
+        return Ok((None, None));
     }
 
     // `f64::from_str` accepts "nan"/"inf"; `f64::clamp(NaN, 0, 1)`
@@ -209,7 +250,7 @@ where
         "OTel OTLP export enabled: endpoint={endpoint}, sample_rate={sample_rate}, service={component}"
     );
 
-    Ok((Some(layer), OtelGuard(Some(provider))))
+    Ok((Some(layer), Some(provider)))
 }
 
 /// Global fallback bucket boundaries — Prometheus client_golang's defaults.
@@ -321,7 +362,13 @@ mod tests {
     #[test]
     fn otel_guard_none_drop_is_noop() {
         // Dropping a guard with no provider must not panic or hang.
-        let g = OtelGuard(None);
+        // The log_writer half is always populated; its drop joins the
+        // background writer thread (idle here — nothing was emitted).
+        let (_w, log_writer) = tracing_appender::non_blocking(std::io::sink());
+        let g = OtelGuard {
+            otel: None,
+            _log_writer: log_writer,
+        };
         drop(g); // if this hangs/panics, the test fails
     }
 
@@ -343,10 +390,10 @@ mod tests {
         crate::test_jail::Jail::expect_with(|_jail| {
             // build_otel_layer is generic over S; monomorphize to Registry
             // for the test (we're not layering it over anything here).
-            let (layer, guard) =
+            let (layer, provider) =
                 build_otel_layer::<tracing_subscriber::Registry>("test-component").unwrap();
             assert!(layer.is_none(), "no endpoint → no layer");
-            assert!(guard.0.is_none(), "no endpoint → no provider to flush");
+            assert!(provider.is_none(), "no endpoint → no provider to flush");
             Ok(())
         });
     }
@@ -359,10 +406,10 @@ mod tests {
     fn build_otel_layer_empty_endpoint_returns_none() {
         crate::test_jail::Jail::expect_with(|jail| {
             jail.set_env("RIO_OTEL_ENDPOINT", "");
-            let (layer, guard) =
+            let (layer, provider) =
                 build_otel_layer::<tracing_subscriber::Registry>("test-component").unwrap();
             assert!(layer.is_none(), "empty endpoint → no layer");
-            assert!(guard.0.is_none(), "empty endpoint → no provider");
+            assert!(provider.is_none(), "empty endpoint → no provider");
             Ok(())
         });
     }

@@ -12652,6 +12652,10 @@
           "packageId": "tracing"
         },
         {
+          "name": "tracing-appender",
+          "packageId": "tracing-appender"
+        },
+        {
           "name": "tracing-opentelemetry",
           "packageId": "tracing-opentelemetry"
         },
@@ -15928,6 +15932,21 @@
         "Henry de Valence <hdevalence@hdevalence.ca>"
       ]
     },
+    "symlink": {
+      "crateName": "symlink",
+      "version": "0.1.0",
+      "edition": "2015",
+      "sha256": "02h1i0b81mxb4vns4xrvrfibpcvs7jqqav8p3yilwik8cv73r5x7",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Chris Morgan <me@chrismorgan.info>"
+      ]
+    },
     "syn": {
       "crateName": "syn",
       "version": "2.0.117",
@@ -16225,6 +16244,10 @@
           "packageId": "deranged"
         },
         {
+          "name": "itoa",
+          "packageId": "itoa"
+        },
+        {
           "name": "num-conv",
           "packageId": "num-conv"
         },
@@ -16240,6 +16263,7 @@
       "resolvedDefaultFeatures": [
         "alloc",
         "default",
+        "formatting",
         "parsing",
         "std"
       ],
@@ -16286,6 +16310,7 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "formatting",
         "parsing"
       ],
       "procMacro": true,
@@ -17336,6 +17361,44 @@
       ],
       "authors": [
         "Eliza Weisman <eliza@buoyant.io>",
+        "Tokio Contributors <team@tokio.rs>"
+      ]
+    },
+    "tracing-appender": {
+      "crateName": "tracing-appender",
+      "version": "0.2.5",
+      "edition": "2018",
+      "sha256": "0g4a6q5s3wafid5lqw1ljzvh1nhk3a4zmb627fxv96dr7qcqc1h5",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "crossbeam-channel",
+          "packageId": "crossbeam-channel"
+        },
+        {
+          "name": "symlink",
+          "packageId": "symlink"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "time",
+          "packageId": "time"
+        },
+        {
+          "name": "tracing-subscriber",
+          "packageId": "tracing-subscriber"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Zeki Sherif <zekshi@amazon.com>",
         "Tokio Contributors <team@tokio.rs>"
       ]
     },
@@ -20011,6 +20074,10 @@
           "packageId": "thiserror 2.0.18"
         },
         {
+          "name": "time",
+          "packageId": "time"
+        },
+        {
           "name": "tokio",
           "packageId": "tokio"
         },
@@ -20592,6 +20659,10 @@
         {
           "name": "thiserror",
           "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "time",
+          "packageId": "time"
         },
         {
           "name": "tokio",

@@ -129,6 +129,10 @@ clap = { version = "4", features = ["derive", "env"] }
 # Logging & metrics
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Non-blocking stdout writer for the fmt layer (sh-002 H4): under
+# RUST_LOG=debug a synchronous stdout writer becomes a per-event
+# blocking syscall on the calling task.
+tracing-appender = "0.2"
 metrics = "0.24"
 # default-features off: the defaults include `push-gateway`, which drags a
 # full hyper+rustls HTTP client we never use — components only expose the

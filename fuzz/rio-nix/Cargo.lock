@@ -3507,6 +3507,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
 dependencies = [
  "deranged",
+ "itoa",
  "num-conv",
  "powerfmt",
  "serde_core",
@@ -4448,6 +4449,7 @@ dependencies = [
  "syn",
  "sync_wrapper",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
