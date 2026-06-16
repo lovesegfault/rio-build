@@ -380,7 +380,12 @@ module retryPolicy {
     | RcInfraPutPath
     | RcInfraOom
     | RcInfraOther
-    | RcPermanent
+    // sh-012 (E3a/E3b split): RcExecutorVariant is the daemon's
+    // heuristic exit!=0 / unclassified (verdict CAN vary by executor
+    // — threshold-gated); RcPermanentIntrinsic is the six
+    // derivation-intrinsic statuses (first-observation poison).
+    | RcExecutorVariant
+    | RcPermanentIntrinsic
     | RcTimeout
 
   /// Pod-death kinds (the E5/E6/E7 triggers). The deadline overrun whose
@@ -426,7 +431,11 @@ module retryPolicy {
   type FoldEvent =
     | FTransient({ at: int, exec: str })
     | FInfra({ at: int, exempt: bool, atCap: bool })
-    | FPermanent({ at: int, exec: str })
+    // sh-012 (E3a/E3b split): FExecutorVariant mirrors FTransient's
+    // shape (threshold/cap/backoff); FPermanentIntrinsic keeps the
+    // first-observation poison.
+    | FExecutorVariant({ at: int, exec: str })
+    | FPermanentIntrinsic({ at: int, exec: str })
     | FWorkerTimeout(int)
     | FDisconnect(int)
     | FControllerTermination({ at: int, promoted: bool, atCap: bool })
@@ -453,7 +462,7 @@ module retryPolicy {
   type ProbeClass = | PUnavailable | PAllPresent | PNoEvidence
 
   type ObsKind =
-    | ONone | OE1 | OE2 | OE3 | OE4 | OE5 | OE6 | OE7 | OE8 | OEstablish
+    | ONone | OE1 | OE2 | OE3 | OE3Variant | OE4 | OE5 | OE6 | OE7 | OE8 | OEstablish
     | OE9Dispatch | OResubmit | OCacheHit | OPoisonClear | OTtlExpire | OFailover
     // Bughunt wave B1 (bug_408): the store-degraded paced requeue.
     | OStoreDegraded
@@ -670,8 +679,33 @@ module retryPolicy {
             { c: { ...cExempt, infraCount: cExempt.infraCount + 1, lastInfraAt: At(e.at) },
               v: VRequeue }
 
-      // E3: handle_permanent_failure -- poison + diagnostics-only insert.
-      | FPermanent(e) =>
+      // E3a: handle_executor_variant_failure (sh-012) -- mirrors E1
+      // exactly: record (insert + increment), threshold check, count
+      // cap. Threshold poison is RPermanent (>=N distinct executors
+      // agreed -- the only in-tree determinism gate); below threshold
+      // and above MAX_RETRIES it is RTransientBudget so an unknown
+      // executor terminates via the per-cycle cap. No fleet-exhaust
+      // check (placement exclusion only). live059-c: a different-class
+      // outcome is health evidence -- the consecutive-infra streak
+      // breaks at the arm's entry, same as E1.
+      | FExecutorVariant(e) =>
+        val c1 = { ...c0,
+          infraCount: 0,
+          failedBuilders: c0.failedBuilders.union(Set(e.exec)),
+          failureCount: c0.failureCount + 1 }
+        if (thresholdReached(c1))
+          { c: { ...c1, poisonedAt: At(e.at) }, v: VPoison(RPermanent) }
+        else if (c1.count < MAX_RETRIES)
+          { c: { ...c1,
+              count: c1.count + 1,
+              backoffUntil: At(e.at + backoffSecs(c1.count)) },
+            v: VRequeue }
+        else
+          { c: { ...c1, poisonedAt: At(e.at) }, v: VPoison(RTransientBudget) }
+
+      // E3b: handle_permanent_failure (derivation-intrinsic) --
+      // first-observation poison + diagnostics-only insert.
+      | FPermanentIntrinsic(e) =>
         { c: { ...c0,
             poisonedAt: At(e.at),
             failedBuilders: c0.failedBuilders.union(Set(e.exec)) },
@@ -980,7 +1014,7 @@ module retryPolicy {
   val attemptsChargedOnce = and {
     not(last.doubleCharge),
     (last.kind == OE1 or last.kind == OE2 or last.kind == OE3 or
-     last.kind == OE4 or last.kind == OE8)
+     last.kind == OE3Variant or last.kind == OE4 or last.kind == OE8)
       implies (last.chargedAny or last.terminal),
     (last.kind == OE6 or last.kind == OE7 or last.kind == OEstablish)
       implies (last.chargedAny or last.terminal or last.dropped),
@@ -1146,6 +1180,10 @@ module retryPolicy {
   val noExemptCapPoison = not(dStatus == DPoisoned and lastPoisonReason == RExemptInfraBudget)
   /// Violated when the distinct-worker poison threshold fires.
   val noThresholdPoison = not(dStatus == DPoisoned and lastPoisonReason == RThreshold)
+  /// Violated when an executor-variant failure (E3a, sh-012) reaches a
+  /// Permanent poison via the distinct-executor threshold.
+  val noExecutorVariantPermanentPoison =
+    not(dStatus == DPoisoned and lastPoisonReason == RPermanent and last.kind == OE3Variant)
   /// Violated when the fleet-exhaust backstop poisons.
   val noFleetExhaustPoison = not(dStatus == DPoisoned and lastPoisonReason == RFleetExhausted)
   /// Violated when the worker-reported timeout cap produces terminal Cancelled.
@@ -1650,7 +1688,8 @@ module retryPolicy {
   // Every disjunct is a named action with its nondet choices bound
   // directly inside it.
 
-  pure val REPORT_CLASSES = Set(RcTransient, RcInfraPutPath, RcInfraOom, RcInfraOther, RcPermanent, RcTimeout)
+  pure val REPORT_CLASSES = Set(RcTransient, RcInfraPutPath, RcInfraOom, RcInfraOther,
+    RcExecutorVariant, RcPermanentIntrinsic, RcTimeout)
   pure val DEATH_KINDS = Set(DkOom, DkDeadline, DkCrash)
   pure val BOOLS = Set(true, false)
   pure val PROBE_CLASSES = Set(PUnavailable, PAllPresent, PNoEvidence)
@@ -1953,9 +1992,51 @@ module retryPolicy {
       | RcInfraOom => infraArm(n, execAfter, sourceFleet, promoted, atCap, promoted)
       | RcInfraOther => infraArm(n, execAfter, sourceFleet, false, false, false)
 
-      // ── E3: permanent ──────────────────────────────────────────────
-      | RcPermanent =>
-        val applied = specApply(spec, FPermanent({ at: now, exec: n }), sourceFleet)
+      // ── E3a: executor-variant (sh-012, threshold-gated) ────────────
+      | RcExecutorVariant =>
+        val applied = specApply(spec, FExecutorVariant({ at: now, exec: n }), sourceFleet)
+        all {
+          execs' = execs.put(n, execAfter),
+          attempt' = NoAttempt,
+          spec' = applied.c,
+          specVerdict' = applied.v,
+          live' = applied.c,
+          promotionsLeft' = promotionsLeft,
+          match applied.v {
+            | VPoison(r) => all {
+              dStatus' = DPoisoned,
+              poisonSrc' = EventPoison,
+              lastPoisonReason' = r,
+              pg' = { status: PgPoisoned, poisonedAt: At(now), ledger: applied.c },
+              depStatus' = DepFailed,
+              everFailureTerminal' = true,
+              last' = { ...noObs, kind: OE3Variant, chargedAny: true, terminal: true },
+            }
+            | VRequeue => all {
+              dStatus' = DReady,
+              poisonSrc' = poisonSrc,
+              lastPoisonReason' = lastPoisonReason,
+              pg' = { ...pg, ledger: applied.c },
+              depStatus' = depStatus,
+              everFailureTerminal' = everFailureTerminal,
+              last' = { ...noObs, kind: OE3Variant, chargedAny: true },
+            }
+            | VCancel => all {
+              // unreachable: the executor-variant arm never cancels
+              dStatus' = DReady,
+              poisonSrc' = poisonSrc,
+              lastPoisonReason' = lastPoisonReason,
+              pg' = { ...pg, ledger: applied.c },
+              depStatus' = depStatus,
+              everFailureTerminal' = everFailureTerminal,
+              last' = { ...noObs, kind: OE3Variant, chargedAny: true },
+            }
+          },
+        }
+
+      // ── E3b: permanent (derivation-intrinsic, first-observation) ───
+      | RcPermanentIntrinsic =>
+        val applied = specApply(spec, FPermanentIntrinsic({ at: now, exec: n }), sourceFleet)
         all {
           execs' = execs.put(n, execAfter),
           attempt' = NoAttempt,
@@ -2019,7 +2100,8 @@ module retryPolicy {
     },
 
     txFaultsLeft' = txFaultsLeft,
-    everFailedBuilders' = if (class == RcTransient or class == RcPermanent)
+    everFailedBuilders' = if (class == RcTransient or class == RcExecutorVariant
+        or class == RcPermanentIntrinsic)
       everFailedBuilders.union(Set(n)) else everFailedBuilders,
     now' = now, physAttempts' = physAttempts, failoversLeft' = failoversLeft,
     justFailedOver' = false,

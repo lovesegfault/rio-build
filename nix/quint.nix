@@ -3429,6 +3429,16 @@ rec {
       step = "pullStep";
       witness = "noThresholdPoison";
     };
+    # sh-012 (E3a): an executor-variant failure reaches a Permanent
+    # poison via the distinct-executor threshold (the only in-tree
+    # determinism gate). Reachability witness for the threshold arm.
+    quint-retry-policy-pull-witness-executor-variant-permanent = mkQuintWitnessCheck {
+      name = "retry-policy-pull-witness-executor-variant-permanent";
+      spec = "retryPolicy";
+      main = "retryPolicyPull";
+      step = "pullStep";
+      witness = "noExecutorVariantPermanentPoison";
+    };
     quint-retry-policy-pull-witness-cache-hit = mkQuintWitnessCheck {
       name = "retry-policy-pull-witness-cache-hit";
       spec = "retryPolicy";
