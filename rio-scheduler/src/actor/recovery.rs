@@ -1014,6 +1014,21 @@ impl DagActor {
         // acquire re-runs recovery anyway — so this can never gate
         // dispatch permanently.
         self.leader.invalidate_recovery_completion();
+        // sh-002 flush trigger (iii) — Hazard L: every queued report
+        // reply DRAINS with `Err(NotLeader)` (never `clear()` — a
+        // dropped reply is `oneshot::Canceled` → store-side
+        // `Status::internal` → retried, but the explicit NotLeader
+        // is the lawful answer and lets `report_until_acked` switch
+        // its connection to the successor immediately). Runs BEFORE
+        // `clear_persisted_state` (which `_`-binds the field).
+        for super::pull::PendingReport { reply, .. } in self.pending_pull_outcomes.drain(..) {
+            let _ = reply.send(Err(super::pull::PullRejection::NotLeader));
+        }
+        debug_assert!(
+            self.pending_walk_completed.is_empty(),
+            "pending_walk_completed is flush-scoped — a non-empty vec \
+             here means a flush returned without draining it"
+        );
         info!("leader lost: clearing persisted actor state");
         // `serving_generation` is deliberately NOT touched here: it
         // keeps the deposed tenure's value, which sits below any

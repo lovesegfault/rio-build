@@ -397,7 +397,7 @@ impl OaSystem {
                 payload.materialization_outcome = Some(outcome);
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 self.actor
-                    .handle_report_outcome(exec, Some(DRV.to_string()), payload, tx)
+                    .handle_report_outcome(exec, Some(DRV.to_string()), payload, tx, true)
                     .await;
                 rx.await
                     .context("actor dropped the report reply")?

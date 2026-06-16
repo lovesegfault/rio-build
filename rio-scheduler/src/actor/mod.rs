@@ -608,6 +608,31 @@ pub struct DagActor {
     /// never-applied window is lost, counted by
     /// `rio_scheduler_materialization_carrier_dropped_total`.
     pending_carriers: Vec<(crate::state::DrvHash, Vec<String>)>,
+    /// sh-002 row 4 (coalesce-outcomes), the FIRST-level accumulator:
+    /// queued `ActorCommand::ReportPullOutcome` commands — exec_id,
+    /// auth_intent, payload, AND the reply sender — held between
+    /// `handle_report_outcome`'s push and the
+    /// [`flush_pending_pull_outcomes`](Self::flush_pending_pull_outcomes)
+    /// that runs every per-item consumption then sends every reply
+    /// only after the batched completion commits (the
+    /// ack-after-durable contract). Leader-scoped:
+    /// `handle_leader_lost` DRAINS it sending `Err(NotLeader)` on
+    /// every held reply (never `clear()` — a silently dropped reply
+    /// would leave store-side `report_until_acked` believing
+    /// ack'd-then-lost). Listed in `clear_persisted_state` only to
+    /// satisfy the exhaustive destructure; the drain runs in
+    /// `handle_leader_lost` BEFORE the wipe.
+    pending_pull_outcomes: Vec<pull::PendingReport>,
+    /// sh-002 row 4, the SECOND-level (flush-scoped) accumulator:
+    /// `(drv_hash, WalkVerified(..))` pairs the Success consumption
+    /// arm pushes INSTEAD of calling
+    /// `complete_ready_from_store_batch(len=1)` inline. Drained at
+    /// the tail of every `flush_pending_pull_outcomes` into ONE
+    /// batched call. Always empty between flushes; the carried-paths
+    /// `output_paths` stamp runs per-item BEFORE the push (Hazard Q
+    /// — `dispatch.rs`'s `output_paths.is_empty()` back-fill must
+    /// see the realized floating-CA path).
+    pending_walk_completed: Vec<(crate::state::DrvHash, crate::db::live_pins::StampProvenance)>,
     /// Database handle.
     db: SchedulerDb,
     /// Store service client for scheduler-side cache checks. `None` in tests
@@ -1130,6 +1155,8 @@ impl DagActor {
                 materialize::JobViewState::default()
             },
             pending_carriers: Vec::new(),
+            pending_pull_outcomes: Vec::new(),
+            pending_walk_completed: Vec::new(),
             status_outbox: std::collections::VecDeque::new(),
             db,
             store_client: plumbing.store_client,
@@ -1291,6 +1318,17 @@ impl DagActor {
             dag_authoritative,
             materialization_jobs,
             pending_carriers,
+            // Retained: `handle_leader_lost` drains-with-NotLeader
+            // BEFORE this wipe (Hazard L — never `clear()`); the
+            // other callers (recovery start, TOCTOU discard, failed-
+            // recovery Err) only run while standby or mid-acquire,
+            // where `handle_report_outcome`'s inline `is_leader()`
+            // gate has been replying NotLeader and never pushed.
+            pending_pull_outcomes: _,
+            // Retained: flush-scoped (always empty between flushes;
+            // `flush_pending_pull_outcomes` and `handle_leader_lost`
+            // both `debug_assert!` it).
+            pending_walk_completed: _,
             status_outbox,
             // Retained: rationale below.
             retry_policy: _,
@@ -1747,7 +1785,13 @@ impl DagActor {
                     // self-gates on is_leader(); the classification
                     // path it funnels into carries the same appending
                     // discipline as the stream Completion arm.
-                    self.handle_report_outcome(exec_id, auth_intent, payload, reply)
+                    // sh-002 trigger (iv): the mailbox-would-Pend
+                    // signal — sampled HERE (the only scope with
+                    // `rx`) after the dequeue, so the handler knows
+                    // whether another command is already queued to
+                    // coalesce with.
+                    let mailbox_empty = rx.is_empty();
+                    self.handle_report_outcome(exec_id, auth_intent, payload, reply, mailbox_empty)
                         .await;
                 }
                 ActorCommand::ReportAttemptOutcome {

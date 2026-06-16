@@ -2845,12 +2845,20 @@ impl DagActor {
                     // sets came over the wire — ownership stamps
                     // INTERSECT them (a path is stamped only for
                     // tenants whose view validated it; absent entries
-                    // stamp nothing).
-                    self.complete_ready_from_store_batch(&[(
+                    // stamp nothing). sh-002 row 4: pushed to the
+                    // flush-scoped accumulator instead of calling
+                    // `complete_ready_from_store_batch(len=1)` inline
+                    // — `flush_pending_pull_outcomes` drains it into
+                    // ONE batched call after every queued report's
+                    // consumption ran. The carried-paths
+                    // `output_paths` stamp ABOVE runs per-item before
+                    // this push (Hazard Q — `dispatch.rs`'s
+                    // `output_paths.is_empty()` back-fill must see
+                    // the realized floating-CA path).
+                    self.pending_walk_completed.push((
                         drv_hash.clone(),
                         crate::db::live_pins::StampProvenance::WalkVerified(walk_verified),
-                    )])
-                    .await;
+                    ));
                 }
             }
             // Deposed believer: mutate nothing the successor owns.

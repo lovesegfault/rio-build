@@ -688,7 +688,7 @@ impl MbtSystem {
         payload.materialization_outcome = Some(outcome);
         let (tx, rx) = oneshot::channel();
         self.actor
-            .handle_report_outcome(exec_id, Some(d.to_owned()), payload, tx)
+            .handle_report_outcome(exec_id, Some(d.to_owned()), payload, tx, true)
             .await;
         rx.await
             .context("actor dropped the report reply")?

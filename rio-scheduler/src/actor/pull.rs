@@ -1453,14 +1453,59 @@ pub struct PullReportPayload {
     pub materialization_outcome: Option<rio_proto::types::MaterializationOutcome>,
 }
 
+/// Eager-flush trigger (i): the actor coalesces at most this many
+/// `ReportPullOutcome` commands per [`flush_pending_pull_outcomes`]
+/// pass. Chosen as a power of two well above the expected per-replica
+/// burst (S1's coordinator offers ~46/s × ~1s actor-turn budget) and
+/// well below where the per-item residual chain (~5 PG awaits/item)
+/// would push a single flush past the per-phase budget warn.
+///
+/// [`flush_pending_pull_outcomes`]: DagActor::flush_pending_pull_outcomes
+pub(super) const REPORT_OUTCOME_BATCH_MAX: usize = 64;
+
+/// One queued `ActorCommand::ReportPullOutcome` — the EXACT command
+/// field set, reply channel INCLUDED. Held by
+/// [`DagActor::pending_pull_outcomes`] between intake and the flush
+/// that sends every reply only after the batched completion has
+/// committed (the ack-after-durable contract).
+#[derive(Debug)]
+pub(super) struct PendingReport {
+    pub(super) exec_id: Uuid,
+    pub(super) auth_intent: Option<String>,
+    pub(super) payload: PullReportPayload,
+    pub(super) reply: oneshot::Sender<Result<(), PullRejection>>,
+}
+
+/// One held `(reply, result)` pair inside
+/// [`DagActor::flush_pending_pull_outcomes`] — replies are sent only
+/// after the batched completion commits.
+type PendingAck = (
+    oneshot::Sender<Result<(), PullRejection>>,
+    Result<(), PullRejection>,
+);
+
 impl DagActor {
-    /// Handle one `ReportOutcome` (the actor turn): resolve the exec_id
-    /// to its attempt, decide via [`fold_report`], and on Process run
-    /// the existing completion path — the same `handle_completion`
-    /// entry point the stream arm calls, so the worker-report→fold feed
-    /// is identical in classification terms. The reply is sent only
-    /// after that call returns (its appending transaction has
-    /// committed by then), which is what the pod's exit-0 waits for.
+    /// Handle one `ReportOutcome` (the actor turn): queue it on
+    /// [`pending_pull_outcomes`](Self::pending_pull_outcomes) and —
+    /// when there is nothing left to coalesce with — drain the queue
+    /// via [`Self::flush_pending_pull_outcomes`]. The reply is sent only
+    /// after the flush's batched `complete_ready_from_store_batch`
+    /// call returns (its appending transaction has committed by
+    /// then), which is what the pod's exit-0 waits for. The flush
+    /// resolves the exec_id to its attempt, decides via
+    /// [`fold_report`], and on Process runs the existing completion
+    /// path per item — the same `handle_completion` entry point the
+    /// stream arm calls, so the worker-report→fold feed is identical
+    /// in classification terms.
+    ///
+    /// `mailbox_empty`: whether the actor's command receiver would
+    /// `Pend` on the next `recv()` — flush trigger (iv). When true
+    /// there is by construction nothing further to coalesce with this
+    /// turn, so the flush runs eagerly and ack latency stays
+    /// decoupled from `tick_interval` (the `tickIntervalSecs=600`
+    /// materialization VM fixture relies on this — its progress is
+    /// "never tick-driven", and store-side `report_until_acked`'s
+    /// per-attempt cap is `DEFAULT_GRPC_TIMEOUT=30s`).
     // r[impl sched.executor.report-idempotent]
     pub(super) async fn handle_report_outcome(
         &mut self,
@@ -1468,11 +1513,81 @@ impl DagActor {
         auth_intent: Option<String>,
         payload: PullReportPayload,
         reply: oneshot::Sender<Result<(), PullRejection>>,
+        mailbox_empty: bool,
     ) {
-        let result = self
-            .report_outcome_inner(exec_id, auth_intent.as_deref(), payload)
-            .await;
-        let _ = reply.send(result);
+        // r[sched.lease.standby-drops-writes+4]: the only no-PG check
+        // — keep it inline so a standby replies immediately. The
+        // auth-intent binding needs the `find_attempt_by_exec_id`
+        // row, so it stays inside the per-item flush body.
+        if !self.leader.is_leader() {
+            let _ = reply.send(Err(PullRejection::NotLeader));
+            return;
+        }
+        self.pending_pull_outcomes.push(PendingReport {
+            exec_id,
+            auth_intent,
+            payload,
+            reply,
+        });
+        // Flush triggers (i) eager at the batch cap, and (iv) eager
+        // when the actor mailbox would Pend (nothing to coalesce
+        // with). (ii) handle_tick head and (iii) handle_leader_lost
+        // are the deadline / drain-with-NotLeader triggers.
+        if self.pending_pull_outcomes.len() >= REPORT_OUTCOME_BATCH_MAX || mailbox_empty {
+            self.flush_pending_pull_outcomes().await;
+        }
+    }
+
+    /// Drain [`pending_pull_outcomes`](Self::pending_pull_outcomes):
+    /// run [`report_outcome_inner`](Self::report_outcome_inner) per
+    /// item (the existing per-item chain — auth, fold, close,
+    /// resolve), then drain the SECOND-level
+    /// [`pending_walk_completed`](Self::pending_walk_completed)
+    /// accumulator (Success-arm completions pushed there by the
+    /// consumption path) into ONE
+    /// [`complete_ready_from_store_batch`](Self::complete_ready_from_store_batch)
+    /// call, then — and only then — send every held `(reply,
+    /// result)` pair. Ack-after-durable: every reply is sent strictly
+    /// after the batched `persist_status_batch(Completed)` +
+    /// `upsert_path_tenants_for_batch` + `persist_status_batch(Ready)`
+    /// commit. An actor panic between push and flush drops every
+    /// held reply → `oneshot::Canceled` → the gRPC server maps to
+    /// `Status::internal` → store-side `report_until_acked`
+    /// classifies non-fatal and retries (Hazard A — crash-safe).
+    pub(super) async fn flush_pending_pull_outcomes(&mut self) {
+        if self.pending_pull_outcomes.is_empty() {
+            return;
+        }
+        debug_assert!(
+            self.pending_walk_completed.is_empty(),
+            "pending_walk_completed is flush-scoped — drained at the \
+             tail of every flush and nowhere else"
+        );
+        let pending = std::mem::take(&mut self.pending_pull_outcomes);
+        let mut acks: Vec<PendingAck> = Vec::with_capacity(pending.len());
+        for PendingReport {
+            exec_id,
+            auth_intent,
+            payload,
+            reply,
+        } in pending
+        {
+            let result = self
+                .report_outcome_inner(exec_id, auth_intent.as_deref(), payload)
+                .await;
+            acks.push((reply, result));
+        }
+        // The second-level accumulator: every Success consumption
+        // pushed `(drv_hash, WalkVerified(..))` here instead of
+        // calling `complete_ready_from_store_batch(len=1)` inline.
+        // ONE batched call (the I-139 amortization — 3 PG awaits
+        // total instead of 3 × N).
+        let completed = std::mem::take(&mut self.pending_walk_completed);
+        self.complete_ready_from_store_batch(&completed).await;
+        // Ack-after-durable: replies fire only now.
+        for (reply, result) in acks {
+            let _ = reply.send(result);
+        }
     }
 
     async fn report_outcome_inner(
