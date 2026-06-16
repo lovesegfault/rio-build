@@ -1769,6 +1769,7 @@ rec {
     # r[verify sched.lease.holder-evidenced-lose+4]
     quint-leader-election-holder-evidence = mkQuintCheck {
       name = "leader-election-holder-evidence";
+      requiredSystemFeatures = [ "big-parallel" ];
       # quint-policy P1 exemption (bughunt-2 slot 11; §5-Q13): same
       # untwinned base leaf as the sibling regimes.
       vacuityExempt = {
@@ -1883,6 +1884,7 @@ rec {
     # r[verify sched.recovery.step-down+3]
     quint-leader-election-step-down = mkQuintCheck {
       name = "leader-election-step-down";
+      requiredSystemFeatures = [ "big-parallel" ];
       modelTimeoutSec = 3600;
       # quint-policy P1 exemption (bughunt-2 slot 11; §5-Q13): same
       # untwinned base leaf as the sibling regimes.
@@ -6125,6 +6127,7 @@ rec {
     # r[verify sched.retry.recovery-projection+3]
     quint-retry-policy-pull = mkQuintCheck {
       name = "retry-policy-pull";
+      requiredSystemFeatures = [ "big-parallel" ];
       # quint-policy P1 exemptions (bughunt-2 slot 11; §5-Q13 — the
       # retryPolicy-15 burn-down headline):
       vacuityExempt = {
@@ -6287,6 +6290,7 @@ rec {
     # ------------------------------------------------------------------
     quint-retry-policy-pull-store-degraded = mkQuintCheck {
       name = "retry-policy-pull-store-degraded";
+      requiredSystemFeatures = [ "big-parallel" ];
       # quint-policy P1 exemptions (bughunt-2 slot 11; §5-Q13 — the
       # retryPolicy-15 burn-down headline):
       vacuityExempt = {
@@ -8011,6 +8015,7 @@ rec {
     # r[verify ctrl.pool.no-eligible-persist+5]
     quint-spawn-coherence-failopen-withhold = mkQuintCheck {
       name = "spawn-coherence-failopen-withhold";
+      requiredSystemFeatures = [ "big-parallel" ];
       spec = "spawnCoherence";
       main = "spawnCoherenceFailopenWithhold";
       invariants = [
@@ -8096,6 +8101,7 @@ rec {
     # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-main = mkQuintCheck {
       name = "wedge-cluster-main";
+      requiredSystemFeatures = [ "big-parallel" ];
       spec = "wedgeCluster";
       main = "wedgeClusterMain";
       invariants = [
@@ -8297,6 +8303,7 @@ rec {
     # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-trajectory = mkQuintCheck {
       name = "wedge-cluster-trajectory";
+      requiredSystemFeatures = [ "big-parallel" ];
       spec = "wedgeCluster";
       main = "wedgeClusterTrajectory";
       invariants = [
@@ -8479,6 +8486,7 @@ rec {
     # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-epilogue = mkQuintCheck {
       name = "wedge-cluster-epilogue";
+      requiredSystemFeatures = [ "big-parallel" ];
       spec = "wedgeCluster";
       main = "wedgeClusterEpilogue";
       invariants = [
@@ -8549,6 +8557,7 @@ rec {
     # r[verify ctrl.nodeclaim.lease-edge-polarity+4]
     quint-nodeclaim-epoch = mkQuintCheck {
       name = "nodeclaim-epoch";
+      requiredSystemFeatures = [ "big-parallel" ];
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
       # is the burn-down artifact):
       vacuityExempt = {
