@@ -20,6 +20,7 @@
 //! via `rio.build/ami-latest=true` (`resolve_latest`) — no
 //! per-worktree handoff file.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -33,6 +34,7 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 
 use super::TF_DIR;
+use crate::k8s::client as kube;
 use crate::sh::{cmd, run_read, shell};
 use crate::{git, tofu, ui};
 
@@ -589,9 +591,14 @@ pub async fn gc(older_than_days: u64, dry_run: bool) -> Result<()> {
         .send()
         .await?;
 
+    let referenced = referenced_ami_tags().await?;
+    if !referenced.is_empty() {
+        info!("ami gc: protecting EC2NodeClass-referenced tags {referenced:?}");
+    }
+
     let cutoff =
         jiff::Timestamp::now() - jiff::SignedDuration::from_hours(older_than_days as i64 * 24);
-    let victims = gc_candidates(resp.images(), cutoff);
+    let victims = gc_candidates(resp.images(), cutoff, &referenced);
 
     if victims.is_empty() {
         info!(
@@ -644,18 +651,28 @@ pub async fn gc(older_than_days: u64, dry_run: bool) -> Result<()> {
 }
 
 /// Pure half of [`gc`]: select `(image_id, creation_date, snapshot_ids)`
-/// for every image that (a) is NOT tagged `rio.build/ami-latest=true`
-/// and (b) has a `CreationDate` strictly before `cutoff`. Images
-/// missing an ID or with an unparseable date are skipped (conservative
-/// — never delete what we can't age). Split out for unit testing
-/// without an EC2 client, mirroring `latest_ami_tag_of`.
-fn gc_candidates(images: &[Image], cutoff: jiff::Timestamp) -> Vec<(String, String, Vec<String>)> {
+/// for every image that (a) is NOT tagged `rio.build/ami-latest=true`,
+/// (b) has `CreationDate` before `cutoff`, and (c) whose
+/// `rio.build/ami` tag is NOT in `referenced` ("not latest" ≠ "not in
+/// use"). Missing ID / unparseable date → skipped (never delete what
+/// we can't age).
+fn gc_candidates(
+    images: &[Image],
+    cutoff: jiff::Timestamp,
+    referenced: &HashSet<String>,
+) -> Vec<(String, String, Vec<String>)> {
     images
         .iter()
         .filter(|i| {
             !i.tags()
                 .iter()
                 .any(|t| t.key() == Some("rio.build/ami-latest") && t.value() == Some("true"))
+        })
+        .filter(|i| {
+            !i.tags().iter().any(|t| {
+                t.key() == Some("rio.build/ami")
+                    && t.value().is_some_and(|v| referenced.contains(v))
+            })
         })
         .filter_map(|i| {
             let id = i.image_id()?.to_string();
@@ -672,6 +689,34 @@ fn gc_candidates(images: &[Image], cutoff: jiff::Timestamp) -> Vec<(String, Stri
             Some((id, created.to_string(), snaps))
         })
         .collect()
+}
+
+/// `rio.build/ami` tag values selected by any EC2NodeClass
+/// `amiSelectorTerms` — deregistering one flips the class to
+/// `AMIsReady=False` and no NodeClaim can launch. Errors propagate
+/// (fail-closed: don't delete blind).
+async fn referenced_ami_tags() -> Result<HashSet<String>> {
+    use ::kube::{
+        api::{Api, ListParams},
+        core::{ApiResource, DynamicObject, GroupVersionKind},
+    };
+    let client = kube::client()
+        .await
+        .context("ami gc: kube client (needed to read EC2NodeClass references)")?;
+    let gvk = GroupVersionKind::gvk("karpenter.k8s.aws", "v1", "EC2NodeClass");
+    let api: Api<DynamicObject> = Api::all_with(client, &ApiResource::from_gvk(&gvk));
+    let list = api
+        .list(&ListParams::default())
+        .await
+        .context("ami gc: list EC2NodeClass")?;
+    Ok(list
+        .items
+        .iter()
+        .filter_map(|nc| nc.data.pointer("/spec/amiSelectorTerms")?.as_array())
+        .flatten()
+        .filter_map(|term| term.get("tags")?.get("rio.build/ami")?.as_str())
+        .map(str::to_owned)
+        .collect())
 }
 
 fn mk_tag(k: &str, v: &str) -> Tag {
@@ -830,13 +875,39 @@ mod tests {
             img("ami-bad", "garbage", false, "snap-bad"),
         ];
         let cutoff: jiff::Timestamp = "2026-03-28T00:00:00Z".parse().unwrap();
-        let v = gc_candidates(&images, cutoff);
+        let v = gc_candidates(&images, cutoff, &HashSet::new());
         assert_eq!(v.len(), 1, "{v:?}");
         assert_eq!(v[0].0, "ami-old");
         assert_eq!(v[0].2, vec!["snap-old"]);
 
         // Empty input → empty output.
-        assert!(gc_candidates(&[], cutoff).is_empty());
+        assert!(gc_candidates(&[], cutoff, &HashSet::new()).is_empty());
+    }
+
+    /// Regression: `up --ami` without `--deploy` left the deployed
+    /// AMI without `ami-latest`; gc then deregistered it and every
+    /// EC2NodeClass went `AMIsReady=False`.
+    #[test]
+    fn gc_candidates_protects_ec2nodeclass_referenced_tag() {
+        let img = |id: &str, ami: &str| {
+            Image::builder()
+                .image_id(id)
+                .creation_date("2026-03-01T00:00:00.000Z")
+                .tags(mk_tag("rio.build/ami", ami))
+                .build()
+        };
+        let images = vec![
+            // old, not latest, BUT referenced by a live EC2NodeClass → kept
+            img("ami-deployed", "02675f58956b"),
+            // old, not latest, not referenced → collected
+            img("ami-stale", "aaaaaaaaaaaa"),
+        ];
+        let cutoff: jiff::Timestamp = "2026-06-15T00:00:00Z".parse().unwrap();
+        let referenced: HashSet<String> = ["02675f58956b".into()].into();
+
+        let v = gc_candidates(&images, cutoff, &referenced);
+        let ids: Vec<_> = v.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(ids, ["ami-stale"], "referenced AMI must survive gc: {v:?}");
     }
 
     #[test]

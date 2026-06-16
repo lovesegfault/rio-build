@@ -731,6 +731,7 @@ pub(super) async fn run_up(
     // EKS-only gate needs `kind`, which the provider-agnostic core
     // doesn't see. Tests inject their own ami future directly.
     let ami_selected = selected.contains(&Phase::Ami);
+    let deploy_selected = selected.contains(&Phase::Deploy);
     let ami_arch = o.ami_arch;
     let skip_ami_gc = o.skip_ami_gc;
     let ami_branch = async move {
@@ -772,14 +773,11 @@ pub(super) async fn run_up(
 
     ui::step("k8s up", || async move {
         run_up_phases(p, cfg, &selected, pp, ami_branch).await?;
-        // Auto-GC stale AMIs once the new one is registered + deployed.
-        // Gated on the ami phase having run (that's when accumulation
-        // happens — `up --deploy` alone creates nothing to reap).
-        // 2d keeps yesterday's AMI for rollback; `ami-latest` is never
-        // collected regardless. dry_run=false: the standalone `ami gc`
-        // subcommand defaults to dry-run, but auto-gc here is the
-        // point — actually delete.
-        if matches!(kind, ProviderKind::Eks) && ami_selected && !skip_ami_gc {
+        // Auto-GC stale AMIs only after register AND deploy: `--ami`
+        // alone strips `ami-latest` from the generation the
+        // EC2NodeClass still selects, so gc here would deregister the
+        // live AMI. 2d keeps yesterday's for rollback.
+        if matches!(kind, ProviderKind::Eks) && ami_selected && deploy_selected && !skip_ami_gc {
             ui::step("ami gc (>2d)", || eks::ami::gc(2, false))
                 .await
                 .context("auto ami-gc failed; re-run with --skip-ami-gc to bypass")?;
