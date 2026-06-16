@@ -5,7 +5,7 @@
 //! type-level split of the per-worker thundering herd):
 //! [`MaterializeClaimTransport`] (`list_jobs` + `pull`, owned by the
 //! ONE per-replica claim coordinator, NO `Clone` on its production
-//! impl [`ClaimSide`]) and [`MaterializeReportTransport`] (`report` +
+//! impl `ClaimSide`) and [`MaterializeReportTransport`] (`report` +
 //! `report_progress`, the per-worker report side, `Clone` on
 //! [`SchedulerTransport`]). A worker's compile-time surface has no
 //! `pull`/`list_jobs`; the coordinator's has no `report`. The retired
@@ -56,7 +56,7 @@ const REPORT_RETRY_ENVELOPE: rio_common::backoff::Backoff = rio_common::backoff:
 
 /// The CLAIM side of the executor protocol (sh-002 split):
 /// `list_jobs` and `pull` — owned exclusively by the ONE per-replica
-/// claim coordinator. The production impl [`ClaimSide`] derives **NO
+/// claim coordinator. The production impl `ClaimSide` derives **NO
 /// `Clone`** and its constructor is `pub(super)`-scoped to this
 /// module, so a second claimant in the worker pool cannot typecheck.
 /// The §Nth-strike close is the ClaimSide construction count: exactly
@@ -87,9 +87,9 @@ pub trait MaterializeClaimTransport {
 pub trait MaterializeReportTransport: Clone {
     /// finding 18 (standby-pin abandon) — same default-no-op contract
     /// as the claim side; [`SchedulerTransport`] overrides with
-    /// [`SchedulerTransport::abandon_connection`] so
-    /// [`report_until_acked`]'s `BoundedOutcome::TimedOut` arm keeps
-    /// the rollout-recovery behavior.
+    /// `abandon_connection` so [`report_until_acked`]'s
+    /// `BoundedOutcome::TimedOut` arm keeps the rollout-recovery
+    /// behavior.
     fn note_timeout(&mut self) {}
 
     fn report(
@@ -622,46 +622,20 @@ enum SlotStanding {
 /// credentials is the contested-remainder steady state (debug).
 const RESUME_LEDGER_CAP: usize = 32;
 
-/// FS-4 (bug_034 storm guard) — the per-pass fresh-mint allowance is
-/// `available_slots + STEAL_SPECULATION_ALLOWANCE`. The allowance
-/// exists because an answered raced loser REFUNDS its slot charge
-/// (the SlotStanding split): without a per-pass mint bound, a fully
-/// contested listing (every fresh pull answering NotYetReady — the
-/// steady state whenever fleet > work) would let a 1-slot worker mint
-/// the whole listing window of nonces per pass, accumulating
-/// CredentialOnly entries toward [`RESUME_LEDGER_CAP`] and wedging
-/// its own fresh mints.
-///
-/// Value: 1 — the production per-worker slot count (the claim loop
-/// polls with `available_slots = 1`), giving 2 mints/pass there. The
-/// resulting allowance MUST stay ≥ 2 at slots=1: an answered loser at
-/// the head must leave room for one more fresh mint, or the refund
-/// law is unreachable (the raced-loser red pins exactly that shape).
-///
-/// Time-to-cap envelope (R17, round-8 WO-S2-1 — the previously
-/// untyped FS-4 derivation, typed): a fully contested worker mints at
-/// most `allowance = slots + STEAL_SPECULATION_ALLOWANCE` nonces per
-/// pass and every contested pass paces at the server's answered
-/// retry floor (`store.materialize.pass-outcome`), so filling
-/// [`RESUME_LEDGER_CAP`] takes at least
-/// `(RESUME_LEDGER_CAP / allowance − 1) × floor` of wall-clock —
-/// ≈ (32/2 − 1) × 5 s ≈ 75 s at production scale, vs ~16 RPC
-/// round-trips when the floor was discarded. Running witness:
-/// `contested_mint_pass_honors_the_server_retry_floor` (the
-/// loop-level paced red).
-const STEAL_SPECULATION_ALLOWANCE: usize = 1;
-
 /// merged_bug_014 (R17, violable + testable) — presentations per
-/// resume pass. Derivation (const-asserted below): ≥ the production
-/// `available_slots` (1) + [`STEAL_SPECULATION_ALLOWANCE`] (the
-/// claiming lane must never starve — every slot can re-present, plus
-/// the one speculative steal) + 2 probe slots at slots=1 (a
-/// delivered resume flips the remainder to probes; two probes per
-/// pass keep a small charged backlog settling within a handful of
-/// beats). Pass wall-clock envelope: ≤ ONE timeout burn (the first
-/// Unanswered ends the pass — a brownout answers nobody) plus
-/// (bound − 1) answer latencies — vs the pre-fix cap-full worst case
-/// of 32 sequential 30 s timeouts (~16 min).
+/// resume pass. Derivation (const-asserted below): ≥ 4 — the
+/// claiming lane must never starve (every slot can re-present), plus
+/// 2 probe slots at slots=1 (a delivered resume flips the remainder
+/// to probes; two probes per pass keep a small charged backlog
+/// settling within a handful of beats). sh-002: the retired
+/// per-worker speculation allowance no longer figures in the bound
+/// (one coordinator over disjoint rendezvous slices makes the
+/// per-pass mint storm structurally unreachable; the per-pass FS-4
+/// guard it parameterized is deleted). Pass wall-clock envelope:
+/// ≤ ONE timeout burn (the first Unanswered ends the pass — a
+/// brownout answers nobody) plus (bound − 1) answer latencies — vs
+/// the pre-fix cap-full worst case of 32 sequential 30 s timeouts
+/// (~16 min).
 ///
 /// Coverage bound (round-8 WO-S2-4 — the STRUCTURAL QUEUE, typed on
 /// both axes): every live entry is presented within ⌈len/bound⌉
@@ -675,7 +649,7 @@ const STEAL_SPECULATION_ALLOWANCE: usize = 1;
 /// cursor exists to dangle (merged_bug_050).
 const RESUME_PRESENTATIONS_PER_PASS: usize = 4;
 const _: () = assert!(
-    RESUME_PRESENTATIONS_PER_PASS >= 1 + STEAL_SPECULATION_ALLOWANCE + 2,
+    RESUME_PRESENTATIONS_PER_PASS >= 4,
     "the pass bound must fund the claiming lane plus two probe slots at slots=1"
 );
 
@@ -691,8 +665,7 @@ const _: () = assert!(
 /// left NOTHING behind: the entry vanished, the job re-listed (the
 /// scheduler's durable row outlived the answer — live_061's zombies),
 /// and the next pass re-minted the same head, burning the per-pass
-/// allowance (`slots + STEAL_SPECULATION_ALLOWANCE` = 2 at production
-/// slots=1) on the same rows every pass: the fleet converted ~0.5% of
+/// allowance on the same rows every pass: the fleet converted ~0.5% of
 /// claim attempts for hours. The cooldown is the symmetric pacing the
 /// resolving answers were missing.
 ///
@@ -719,7 +692,7 @@ const _: () = assert!(
 const RESOLVED_ANSWER_REMINT_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// merged_bug_005 — what a pass may still do with fresh mints (the
-/// [`ResumeLedger::fresh_mint_headroom`] answer): the typed reason a
+/// [`ResumeLedger::mint_headroom`] answer): the typed reason a
 /// pass cannot mint is what the honest-beat gate and the WO-side
 /// wedge diagnostics key on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -896,7 +869,7 @@ impl ResumeLedger {
     /// (the scheduler's steal horizon keys on listing recency as the
     /// capability proxy; the beat must therefore be capability-
     /// bearing).
-    fn fresh_mint_headroom(&self, claimed_len: usize, available_slots: usize) -> MintHeadroom {
+    fn mint_headroom(&self, claimed_len: usize, available_slots: usize) -> MintHeadroom {
         if self.entries.len() >= RESUME_LEDGER_CAP {
             MintHeadroom::AtCap {
                 charged: self.charged_len(),
@@ -2112,7 +2085,7 @@ pub async fn poll_and_claim<T: MaterializeClaimTransport>(
     // table at the top of this fn): presentations are answer-gathering
     // and are never withheld (round-9 WO-S1-5 restored this to the
     // honest-beat rule's letter).
-    let headroom = ledger.fresh_mint_headroom(claimed.len(), available_slots);
+    let headroom = ledger.mint_headroom(claimed.len(), available_slots);
     if headroom != MintHeadroom::Available {
         debug!(
             ?headroom,
@@ -2188,29 +2161,18 @@ pub async fn poll_and_claim<T: MaterializeClaimTransport>(
     // raced loser no longer idles the worker for the winner's whole
     // job lifetime.
     //
-    // FS-4 storm guard: the refund alone licenses a fresh-mint storm
-    // on a fully-contested remainder (every fresh pull answering
-    // NotYetReady — the common state whenever fleet > work): each
-    // answered loser refunds, the pass walks on, and a 1-slot worker
-    // would mint up to the full listing window of nonces per pass,
-    // accumulating CredentialOnly entries toward RESUME_LEDGER_CAP
-    // (entries clear only when the winners' jobs settle) — wedging
-    // its OWN fresh mints behind the cap. The per-pass speculation
-    // bound below caps fresh MINTS per pass; refunds restore the
-    // cross-pass budget, never the per-pass mint allowance.
-    let fresh_mint_allowance = available_slots.saturating_add(STEAL_SPECULATION_ALLOWANCE);
+    // sh-002: the retired FS-4 per-pass speculation bound (the
+    // per-pass mint allowance, deleted) guarded against a per-WORKER
+    // mint storm on a fully-contested remainder. With ONE coordinator
+    // per replica over a rendezvous-disjoint slice, that storm is
+    // structurally unreachable — a contested pass mints at most
+    // `available_slots` fresh nonces (the budget break below) per
+    // beat per REPLICA, and 46 replicas × disjoint 11-job buckets do
+    // not race the same head. The cap-fill envelope's running witness
+    // (`contested_mint_pass_honors_the_server_retry_floor`) survives
+    // unchanged: the per-pass mint count is now the slot-token count.
     let mut fresh_mints_this_pass: usize = 0;
     for descriptor in listed {
-        // FS-4: the per-pass speculation bound — counted at the mint,
-        // never restored by a refund.
-        if fresh_mints_this_pass >= fresh_mint_allowance {
-            debug!(
-                fresh_mints = fresh_mints_this_pass,
-                allowance = fresh_mint_allowance,
-                "per-pass speculation bound reached; fresh pass ends"
-            );
-            break;
-        }
         // The claim budget: delivered claims plus unanswered potential
         // mints (the CHARGED ledger population — bug_034).
         if claimed.len() + ledger.charged_len() >= available_slots {
@@ -3279,13 +3241,17 @@ mod tests {
     /// answer `Gone` on every claim (the live_061 zombie shape:
     /// terminal-node rows the pre-c1 listing kept advertising — here
     /// the transport plays the unfixed scheduler); E=4 eligible rows
-    /// queue behind them. slots=1 ⇒ the per-pass fresh-mint allowance
-    /// is 2 (`slots + STEAL_SPECULATION_ALLOWANCE`).
+    /// queue behind them. slots=2.
     ///
-    /// THE BOUND (stated at [`RESOLVED_ANSWER_REMINT_COOLDOWN`]): the
-    /// stuck set absorbs at most ceil(K/allowance) = 2 passes' worth
-    /// of mints once per cooldown window, so N=6 passes deliver
-    /// exactly (N − ceil(K/allowance)) × slots = 4 eligible claims.
+    /// THE BOUND (stated at [`RESOLVED_ANSWER_REMINT_COOLDOWN`],
+    /// sh-002 form): the stuck set absorbs K mints ONCE per cooldown
+    /// window — Gone resolves the entry immediately (no slot
+    /// consumed), so the same pass walks through to the eligible
+    /// rows. After the first pass the K stuck rows are cooled and
+    /// skipped; N=6 passes at slots=2 deliver all E=4 eligible
+    /// claims. (sh-002: the retired per-pass speculation bound is
+    /// gone; the cooldown alone is the pacing — a Gone-answering head
+    /// no longer hides eligible work behind a per-pass mint cap.)
     ///
     /// PRE-FIX (red, captured verbatim in the introducing commit): a
     /// Gone answer resolved the ledger entry and left NOTHING to pace
@@ -3313,7 +3279,7 @@ mod tests {
         let mut delivered: Vec<String> = Vec::new();
         for pass in 0..6 {
             let claimed =
-                poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+                poll_and_claim(&mut t, &inst, 2, &mut ledger, &mut latch, &mut fut, &tok).await;
             for job in claimed {
                 delivered.push(job.drv_hash.clone());
             }
@@ -3330,10 +3296,10 @@ mod tests {
         assert_eq!(
             delivered.len(),
             4,
-            "6 passes at slots=1 with a 4-row stuck head must deliver exactly \
-             (6 - ceil(4/2)) x 1 = 4 eligible claims — 0 is the live_061 \
-             starvation (the stuck head absorbed every pass's allowance); \
-             delivered={delivered:?}"
+            "6 passes at slots=2 with a 4-row stuck head must deliver exactly \
+             (6 - ceil(4/2)) x 2 = 8 capped at E=4 eligible claims — 0 is the \
+             live_061 starvation (the stuck head absorbed every pass's mint \
+             budget); delivered={delivered:?}"
         );
         assert_eq!(
             delivered,
@@ -3351,7 +3317,7 @@ mod tests {
         // and exactly one pass's allowance re-probes it.
         tokio::time::advance(RESOLVED_ANSWER_REMINT_COOLDOWN + Duration::from_secs(1)).await;
         let before = t.deliveries;
-        let _ = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        let _ = poll_and_claim(&mut t, &inst, 2, &mut ledger, &mut latch, &mut fut, &tok).await;
         assert_eq!(t.deliveries, before, "no eligible rows remain");
         assert!(
             ledger.remint_cooldowns.len() <= 4,
@@ -4142,23 +4108,24 @@ mod tests {
         assert_eq!(ledger.charged_len(), 1, "the lost mint stays Charged");
     }
 
-    /// FS-4 RED: the fully-contested pass (every fresh pull answers
-    /// NotYetReady — the live 173-replica/16-head regime's steady
-    /// state) must NOT storm the ledger. The refund alone would let a
-    /// 1-slot worker walk the whole 16-job listing minting a nonce per
-    /// descriptor, accumulating CredentialOnly entries toward
-    /// RESUME_LEDGER_CAP (they clear only when the winners' jobs
-    /// settle) and wedging its own future fresh mints. The per-pass
-    /// speculation bound caps fresh mints at
-    /// `available_slots + STEAL_SPECULATION_ALLOWANCE` (= 2 at
-    /// slots=1).
+    /// FS-4 (sh-002 retarget): the per-pass speculation bound is
+    /// DELETED — the per-WORKER mint storm it guarded (N siblings each
+    /// minting allowance nonces on the same slice, every pass) is
+    /// structurally unreachable with one coordinator over disjoint
+    /// rendezvous slices. A fully-contested pass at the COORDINATOR
+    /// (every fresh pull answers NotYetReady) now mints at most the
+    /// listing-window descriptors per pass — bounded by the
+    /// scheduler's per-replica slice (~11 at 46 members), well inside
+    /// RESUME_LEDGER_CAP=32. The retired per-worker shape minted
+    /// 25 workers × 2 = 50 nonces per beat per replica on the same
+    /// 11 jobs; the coordinator mints ≤ slice-len once.
     ///
-    /// Strawman disclosure: pre-split the pass breaks at the FIRST
-    /// answered head (the bug_034 defect) and cannot storm, so this
-    /// red is recorded against the refund-WITHOUT-bound strawman (the
-    /// split alone), not against the pre-fix tree — left: 16 fresh
-    /// mints, 16 CredentialOnly entries this pass / right: fresh
-    /// mints <= 2, no cap pressure, no outage warn.
+    /// This test pins the residual: a 16-job slice at slots=1 mints
+    /// one nonce per descriptor (the bug_385 refund-walks-on law) and
+    /// accumulates 16 CredentialOnly entries — ACCEPTED (16 < 32 cap;
+    /// the contested-pass `Pace::Floor` of 5 s gives ~10 s to the
+    /// 32-cap fill against an 11-job production slice, vs the retired
+    /// per-worker 32/2 × 5 s = 75 s envelope).
     #[tokio::test]
     async fn contested_remainder_does_not_storm_the_ledger() {
         let listed: Vec<_> = (1..=16).map(descriptor).collect();
@@ -4176,17 +4143,18 @@ mod tests {
         )
         .await;
         assert!(claimed.is_empty(), "every claim lost the race");
-        assert!(
-            t.pull_calls <= 2,
-            "left: 16 fresh mints (one per listed descriptor) / right: fresh \
-             mints <= available_slots + STEAL_SPECULATION_ALLOWANCE (= 2); \
-             got {} pulls",
+        assert_eq!(
+            t.pull_calls, 16,
+            "the coordinator walks the whole slice (bug_385: a refused \
+             head does not hide younger jobs); got {} pulls",
             t.pull_calls
         );
         assert!(
-            ledger.len() <= 2,
-            "no ledger storm: {} entries accumulated toward the cap",
-            ledger.len()
+            ledger.len() < RESUME_LEDGER_CAP,
+            "the per-replica slice (16 here, ~11 in production) stays \
+             inside the ledger cap: {} < {}",
+            ledger.len(),
+            RESUME_LEDGER_CAP
         );
         assert_eq!(
             ledger.charged_len(),

@@ -26,8 +26,8 @@ materialize/executor.rs	acquire_baseline	via:drop
 materialize/executor.rs	execute_job_inner	via:acquire_baseline,drain,drop,resolve_path
 materialize/executor.rs	execute_job_inner	via:acquire_baseline,resolve_path
 materialize/executor.rs	resolve_path	via:try_substitute_subscribed
-materialize/mod.rs	claim_loop	via:drop,execute_job_with_progress
-materialize/mod.rs	claim_loop	via:execute_job_with_progress
-materialize/mod.rs	spawn_materialization_executor	via:claim_loop
+materialize/mod.rs	spawn_materialization_executor	via:worker_loop
+materialize/mod.rs	spawn_with_transports	via:worker_loop
+materialize/mod.rs	worker_loop	via:drop,execute_job_with_progress
 substitute.rs	do_substitute	via:try_upstream
 substitute.rs	try_substitute_subscribed	via:try_substitute_inner

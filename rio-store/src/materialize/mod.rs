@@ -2,13 +2,16 @@
 //! design §2.2/§5).
 //!
 //! Each store replica runs the pull-protocol client side of
-//! materialization jobs: poll the scheduler's leader for claimable
-//! jobs ([`client::poll_and_claim`]), claim one open attempt per job
-//! through `PullAssignment` (kind=MATERIALIZATION + the per-replica
-//! [`executor_instance`] identity), execute the in-process
-//! reference-closure walk against this replica's own substitution
-//! machinery, pin every ingested/verified path at ingest, and report
-//! the outcome through `ReportOutcome` retried until acknowledged.
+//! materialization jobs: ONE `claim_coordinator` task polls the
+//! scheduler's leader for claimable jobs ([`client::poll_and_claim`])
+//! and claims open attempts through `PullAssignment`
+//! (kind=MATERIALIZATION + the per-replica [`executor_instance`]
+//! identity); a pool of `worker_loop` tasks each offer a held path
+//! slot to the coordinator (sh-002 — the inverted-token shape:
+//! slot ≺ claim), execute the in-process reference-closure walk
+//! against this replica's own substitution machinery, pin every
+//! ingested/verified path at ingest, and report the outcome through
+//! `ReportOutcome` retried until acknowledged.
 //!
 //! **Spawn condition:** everything here runs ONLY when a
 //! `scheduler_addr` is configured (PD-D2). Without one, the executor
@@ -42,7 +45,9 @@ pub mod executor;
 
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+use executor::ClaimAdmission;
 
 /// How long a finished job's outcome report is retried before the
 /// worker gives up (the builder pull client's `REPORT_RETRY_BUDGET`
@@ -69,10 +74,56 @@ const REPORT_RETRY_BUDGET: Duration = Duration::from_secs(600);
 /// the mirrored horizon symbol (R17).
 const POLL_JITTER: rio_common::backoff::Jitter = rio_common::backoff::Jitter::Proportional(0.2);
 
-/// Spawn the materialization-executor task set:
-/// `cfg.executor_concurrency` claim loops, each running
-/// poll → claim → execute → report against the scheduler's
-/// ExecutorService until shutdown.
+/// sh-002 (osr2-a) — coordinator-panic restart envelope: 1 s → 30 s
+/// cap, full jitter (the report-retry envelope's constants — same
+/// rationale: bounded backoff, never spin).
+const COORDINATOR_RESTART_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
+    base: Duration::from_secs(1),
+    mult: 2.0,
+    cap: Duration::from_secs(30),
+    jitter: rio_common::backoff::Jitter::Full,
+};
+
+/// sh-002 — one parked worker's claim-slot offer to the coordinator.
+/// The channel is **worker → coordinator** (the inverted-token shape):
+/// `try_admit_claim()` runs in the WORKER before any token is offered,
+/// so a slotless replica offers zero tokens and the coordinator mints
+/// zero claims (bug_102 slot ≺ claim, preserved verbatim). The
+/// admission rides INSIDE the token so the slot is held exactly while
+/// either in-flight to the coordinator or inside
+/// `execute_job_with_progress` — never across an idle pacing sleep
+/// (bug_083/WO-S1-6).
+struct SlotToken {
+    /// The held path slot — proof this worker can execute one job.
+    adm: ClaimAdmission,
+    /// One-shot reply: the coordinator returns the admission with the
+    /// pass verdict (a delivered job, or `None` + the pacing decision).
+    /// Dropped without sending ⇒ the worker's `await` returns
+    /// `Err(Canceled)` — treated as a beat-paced re-offer (the
+    /// coordinator died mid-handoff).
+    reply: tokio::sync::oneshot::Sender<CoordReply>,
+}
+
+/// One worker's per-pass verdict from the coordinator (sh-002).
+struct CoordReply {
+    /// `Some` ⇔ this token converted into a claim — execute it.
+    job: Option<client::ClaimedJob>,
+    /// The admission round-tripped back: a delivered job consumes it
+    /// in `execute_job_with_progress`; a `None` job drops it BEFORE
+    /// the pacing sleep below (bug_083 — the slot hold is scoped to
+    /// claim-consumption work, never to the idle beat).
+    adm: ClaimAdmission,
+    /// What this worker does between offers (the coordinator's sealed
+    /// `pace_for(outcome)` — every worker paces identically, so the
+    /// next offer batch arrives roughly together).
+    pace: Pace,
+}
+
+/// Spawn the materialization-executor task set (sh-002 — the
+/// substitution-claim fanout collapse): `cfg.executor_concurrency`
+/// worker loops (offer slot → execute → report) plus the ONE
+/// per-replica claim coordinator (poll → claim) running INLINE under
+/// `catch_unwind` inside the supervisor body.
 ///
 /// **The spawn gate lives HERE and is unit-testable:** with no
 /// `scheduler_addr` configured this function spawns NOTHING and
@@ -80,7 +131,7 @@ const POLL_JITTER: rio_common::backoff::Jitter = rio_common::backoff::Jitter::Pr
 /// main.rs calls this unconditionally; the gate is not duplicated at
 /// the call site so there is exactly one tested gate.
 ///
-/// Returns the number of claim loops spawned (0 without an address;
+/// Returns the number of worker loops spawned (0 without an address;
 /// also 0 when the scheduler address is malformed — logged, never
 /// fatal: a broken materialization executor must not take down the
 /// store data plane).
@@ -105,13 +156,14 @@ pub fn spawn_materialization_executor(
         path_slots = path_slots.capacity(),
         scheduler_addr = %cfg.scheduler_addr,
         authenticated = service_signer.is_some(),
-        "materialization executor enabled; spawning claim loops"
+        "materialization executor enabled; spawning workers + coordinator"
     );
     // r[impl store.materialize.gate-share+1]
     // PERMANENT worker-surplus tripwire (bug_102 semantics): with
-    // n > P, excess workers idle at claim ADMISSION — slotless passes
-    // mint no claims and jobs stay scheduler-listed; claimed jobs
-    // never queue for their first slot (slot ≺ claim). (The TRANSIENT
+    // n > P, excess workers idle at claim ADMISSION — a slotless
+    // worker offers no SlotToken, the coordinator mints no claim, and
+    // jobs stay scheduler-listed; claimed jobs never queue for their
+    // first slot (slot ≺ claim). (The TRANSIENT
     // regime — n×F > P, reachable at helm defaults — shifts queuing to
     // MID-WALK re-acquires, watched by the pool's wait facet:
     // queued-baseline-waiters gauge + wait-age histogram.)
@@ -143,7 +195,6 @@ pub fn spawn_materialization_executor(
         .absolute(0);
     }
     metrics::counter!("rio_store_materialization_pinned_paths_total").absolute(0);
-    let mut spawned = 0;
     // bug_257 (parse-don't-validate): mint the HostPort ONCE at the
     // spawn boundary. The endpoint builder prepends `http://` itself,
     // so a URL-form value used to compose `http://http://…` — which
@@ -160,17 +211,24 @@ pub fn spawn_materialization_executor(
                 scheduler_addr = %cfg.scheduler_addr, error = %e,
                 "materialization scheduler_addr invalid; executor disabled"
             );
-            return spawned;
+            return 0;
         }
     };
+    // sh-002: the worker→coordinator slot-token channel. Plain
+    // `tokio::sync::mpsc` (single consumer = the coordinator); cap is
+    // the worker count so every worker can park one offer.
+    let (ready_tx, ready_rx) =
+        tokio::sync::mpsc::channel::<SlotToken>(cfg.executor_concurrency.max(1));
+    let mut spawned = 0;
     for worker in 0..cfg.executor_concurrency {
         // merged_bug_158: the concurrency unit is the WORKER, not the
         // pod — the scheduler's one-winner arbiter keys on the
         // composite {drv}@{identity}, so two workers sharing one
         // identity could both believe they hold the same attempt.
-        // Mint `{pod}-w{n}` per worker for BOTH the claim field and
-        // the token binding (T-5.1: claim and credential agree); a
-        // restarted worker n re-claims as the same `…-w{n}`.
+        // Mint `{pod}-w{n}` per worker for the REPORT side (T-5.1:
+        // claim and credential agree on the report path; the claim
+        // path is the coordinator's single identity now); a restarted
+        // worker n re-claims as the same `…-w{n}`.
         //
         // merged_bug_243: the composition is `Dns1123Label::with_worker`
         // — the ONLY way to attach a worker index — which keeps the
@@ -181,10 +239,10 @@ pub fn spawn_materialization_executor(
         // InvalidArgument and warn-and-skipped — a silent fleet-wide
         // materialization outage keyed on release-name length.
         let worker_instance = instance.with_worker(worker);
-        let transport = match client::SchedulerTransport::connect_lazy(
+        let report = match client::SchedulerTransport::connect_lazy(
             &scheduler_addr,
             service_signer.clone(),
-            // T-5.1: the same identity the claim loop asserts as
+            // T-5.1: the same identity the worker asserts as
             // executor_instance is bound INTO every minted service
             // token, so the scheduler verifies the pair instead of
             // trusting the request field.
@@ -201,25 +259,6 @@ pub fn spawn_materialization_executor(
                 return spawned;
             }
         };
-        // sh-002 (TRANSITIONAL — collapses to one in the supervisor at
-        // the claim_coordinator commit): the per-worker claim side
-        // exists here only so the trait-split commit compiles; the
-        // §Nth-strike close (exactly one ClaimSide construction, in the
-        // supervisor body) lands with the coordinator.
-        let claim_side = match client::ClaimSide::reconstruct(
-            &scheduler_addr,
-            service_signer.clone(),
-            &worker_instance,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(
-                    scheduler_addr = %cfg.scheduler_addr, error = %e,
-                    "materialization claim-side channel creation failed; executor disabled"
-                );
-                return spawned;
-            }
-        };
         // live_047/R-C: width from the config lever (default 4); ONE
         // pod-wide slot pool shared by every worker bounds the
         // executor's total gate draw at P = cap/2.
@@ -230,37 +269,112 @@ pub fn spawn_materialization_executor(
             path_slots.clone(),
         );
         let cfg_for_worker = cfg.clone();
-        let instance_for_worker = worker_instance.clone();
+        let ready_tx = ready_tx.clone();
         let shutdown_for_worker = shutdown.clone();
-        rio_common::task::spawn_monitored("materialization-executor", async move {
-            claim_loop(
+        rio_common::task::spawn_monitored("materialization-worker", async move {
+            worker_loop(
                 worker,
                 cfg_for_worker,
                 ctx,
-                claim_side,
-                transport,
-                instance_for_worker,
+                report,
+                ready_tx,
                 shutdown_for_worker,
             )
             .await;
         });
         spawned += 1;
     }
+    drop(ready_tx);
+    // sh-002 (osr2-a, PD-D2-compatible): the supervisor IS this
+    // spawn_monitored body. It owns `ready_rx` for its whole lifetime
+    // and runs the coordinator INLINE under catch_unwind — NO inner
+    // tokio::spawn: claim_coordinator takes `&mut Receiver`, so the
+    // borrow ends on panic and the receiver SURVIVES for the next
+    // iteration (workers' `ready_tx` stay live across coordinator
+    // restarts; an mpsc::Receiver is !Clone — moving it into a spawned
+    // task would drop it on panic and permanently close the channel).
+    // ClaimSide is rebuilt each pass from the spawn-time inputs (the
+    // only scope that can call the pub(super) constructor — the
+    // §Nth-strike close: exactly one ClaimSide construction site, in
+    // the supervisor body). PD-D2 preserved: coordinator panic
+    // restarts in-process; StoreService readiness untouched.
+    rio_common::task::spawn_monitored("materialization-executor", async move {
+        use futures_util::FutureExt as _;
+        let mut ready_rx = ready_rx;
+        let mut restarts: u32 = 0;
+        loop {
+            if shutdown.is_cancelled() {
+                return;
+            }
+            let claim = match client::ClaimSide::reconstruct(
+                &scheduler_addr,
+                service_signer.clone(),
+                &instance,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        scheduler_addr = %scheduler_addr, error = %e,
+                        "materialization claim-side channel creation failed; \
+                         executor disabled (PD-D2 — never fatal)"
+                    );
+                    return;
+                }
+            };
+            match std::panic::AssertUnwindSafe(claim_coordinator(
+                &mut ready_rx,
+                claim,
+                &instance,
+                &shutdown,
+            ))
+            .catch_unwind()
+            .await
+            {
+                Ok(()) => return,
+                Err(panic) => {
+                    let msg = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_owned())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<non-string panic payload>".to_owned());
+                    error!(
+                        panic = %msg, restarts,
+                        "materialization claim_coordinator panicked; restarting \
+                         (osr2-a — ready_rx survives; workers' ready_tx stay live)"
+                    );
+                    let wait = COORDINATOR_RESTART_BACKOFF.duration(restarts);
+                    restarts = restarts.saturating_add(1);
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                }
+            }
+        }
+    });
     spawned
 }
 
-/// One worker's claim loop: poll → claim (one job at a time) →
-/// execute → report, with jittered pacing; shutdown-aware.
+/// sh-002 — the per-replica claim coordinator: the ONE task that owns
+/// `list_jobs` + `pull` (and the single [`client::ResumeLedger`] /
+/// `remint_cooldowns` ledger / futility latch — moved here from the
+/// retired per-worker loops). Runs inline under the supervisor's
+/// `catch_unwind`; takes `&mut Receiver` so the slot-token channel
+/// SURVIVES a coordinator panic (osr2-a).
 ///
 /// **Beat cadence (live_041):** the jittered poll interval IS the
 /// listing beat — each pass's `ListMaterializationJobs` call doubles
-/// as this worker's liveness contact for the scheduler's
+/// as this REPLICA's liveness contact for the scheduler's
 /// rendezvous-partitioned listing (the scheduler tracks
-/// `{worker → last_listed_at}` from the verified token instance and
-/// serves each worker its own slice of the claimable head, plus a
+/// `{replica → last_listed_at}` from the verified token instance and
+/// serves each replica its own slice of the claimable head, plus a
 /// steal horizon of jobs whose owner has missed its beat). The
-/// worker carries NO steal logic: an idle worker's normal listing
-/// already contains whatever the scheduler decided it should see.
+/// coordinator carries NO steal logic: an idle replica's normal
+/// listing already contains whatever the scheduler decided it should
+/// see. With ONE claimant per replica (the sh-002 collapse), the
+/// per-replica slice is no longer raced by N siblings; the
+/// per-replica thundering herd that converted ~0.5% of attempts
+/// (332:1 reject ratio measured live) is structurally unrepresentable.
 ///
 /// **The honest beat (merged_bug_005,
 /// `store.materialize.honest-beat`):** beats are withheld exactly
@@ -272,243 +386,415 @@ pub fn spawn_materialization_executor(
 /// therefore capability-bearing BY CONSTRUCTION: "can list but
 /// cannot claim" is no longer representable as a fresh owner, and
 /// the degradation direction stays served-more-broadly (a withheld
-/// worker ages into the steal horizon and, past the membership TTL,
+/// replica ages into the steal horizon and, past the membership TTL,
 /// out of the partition entirely).
 ///
-/// Two cadence consequences, both intended:
-///   - execution is inline-serial below — ONE job per worker per
-///     pass, executed on this loop — so a worker mid-walk skips
-///     beats for the walk's duration; its unclaimed slice ages past
-///     the scheduler's steal horizon and is offered to idle workers
-///     (work stealing exactly when this worker cannot claim anyway).
-///     live_047/R-C: the walk is internally path-concurrent
-///     (`path_fanout` window, `store.materialize.path-fold+1`), which
-///     shortens mid-walk silence for multi-path closures but changes
-///     NOTHING at this layer — the claim unit, the inline execution,
-///     and the beat semantics are untouched;
-///   - the scheduler's staleness horizon is calibrated against the
-///     DEFAULT `poll_interval_secs = 1` (±20 % jitter): raising the
-///     interval past that horizon degrades to broader, more-contested
-///     listings (the pre-live_041 shape) — never to unlisted jobs.
-async fn claim_loop<C, R>(
-    worker: usize,
-    cfg: crate::config::MaterializationConfig,
-    ctx: executor::ExecutorContext,
+/// **bug_102 (slot ≺ claim) preserved verbatim:** the coordinator
+/// `recv()`s a [`SlotToken`] BEFORE any minting pull —
+/// `try_admit_claim()` ran in the WORKER before the token was
+/// offered, so a slotless replica offers zero tokens and the
+/// coordinator mints zero claims. `available_slots` for
+/// [`client::poll_and_claim`] is the drained-token count: backpressure
+/// precedes mint, over-claim is zero by construction.
+async fn claim_coordinator<C>(
+    ready_rx: &mut tokio::sync::mpsc::Receiver<SlotToken>,
     mut claim: C,
-    mut report: R,
-    instance: rio_common::dns::Dns1123Label,
-    shutdown: rio_common::signal::Token,
+    instance: &rio_common::dns::Dns1123Label,
+    shutdown: &rio_common::signal::Token,
 ) where
-    C: client::MaterializeClaimTransport + Send + Sync + 'static,
-    R: client::MaterializeReportTransport + Send + Sync + 'static,
+    C: client::MaterializeClaimTransport + Send,
 {
-    info!(worker, instance = %instance, "materialization claim loop started");
-    // bug_251 (rule-4b): the per-worker resume ledger — unanswered
-    // claims carry their minted nonce across passes so a lost
-    // response is recovered by a direct resume pull, not abandoned
-    // to the charged establishment window.
+    info!(instance = %instance, "materialization claim coordinator started");
+    // bug_251 (rule-4b): the SINGLE resume ledger — unanswered claims
+    // carry their minted nonce across passes so a lost response is
+    // recovered by a direct resume pull, not abandoned to the charged
+    // establishment window. ONE ledger per replica (sh-002): the
+    // remint_cooldowns map (live061-R3, RESOLVED_ANSWER_REMINT_
+    // COOLDOWN) lives HERE — it paces scheduler-side zombie rows, not
+    // a per-worker herd.
+    // r[impl store.materialize.remint-cooldown]
     let mut ledger = client::ResumeLedger::default();
-    // bug_257 rider: per-worker warn-once escalation for persistent
-    // listing failures — a dead store→scheduler edge surfaces above
-    // debug instead of starving claims silently.
+    // bug_257 rider: warn-once escalation for persistent listing
+    // failures — a dead store→scheduler edge surfaces above debug
+    // instead of starving claims silently.
     let mut list_health = client::ListFailureLatch::default();
-    // merged_bug_005: per-worker conversion-futility latch — a worker
-    // whose every fresh mint is refused with a conversion-disproving
+    // merged_bug_005: conversion-futility latch — a coordinator whose
+    // every fresh mint is refused with a conversion-disproving
     // rejection withholds its listing beat so the scheduler re-homes
-    // its rendezvous slice (the honest beat).
+    // this replica's rendezvous slice (the honest beat).
     let mut futility = client::ConversionFutilityLatch::default();
     loop {
-        if shutdown.is_cancelled() {
-            return;
+        // The coordinator is purely reactive: it parks on the slot
+        // channel and runs a pass exactly when a worker is ready WITH
+        // a held slot. Shutdown races the recv (and the scheduler's
+        // staleness horizon is calibrated against the DEFAULT
+        // `poll_interval_secs = 1` — workers pace at that beat below,
+        // so a fully-idle replica still beats once per interval).
+        let first = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            t = ready_rx.recv() => match t {
+                Some(t) => t,
+                // Every ready_tx dropped: all workers exited.
+                None => return,
+            },
+        };
+        let mut tokens = vec![first];
+        while let Ok(t) = ready_rx.try_recv() {
+            tokens.push(t);
         }
-        // bug_102 (slot ≺ claim): admission BEFORE the claiming pull —
-        // a worker that cannot hold a path slot mints no claim, opens
-        // no attempt window, and the job stays scheduler-listed
-        // (claimable by any pod with headroom). Leftover-only
-        // try-acquire: claim admission never overtakes queued mid-walk
-        // baseline waiters, so finish-started-work-first falls out of
-        // the existing semaphore discipline. The pass budget is the
-        // admission count (0|1): each worker claims at most one job
-        // per pass — concurrency is the worker count, and the
-        // scheduler's one-winner arbitration (per-replica composite
-        // identity) handles claim races. A slotless pass drives
-        // available_slots = 0 through poll_and_claim and paces at the
-        // normal empty-pass beat.
-        let mut admission = ctx.path_slots.try_admit_claim();
         let pass = client::poll_and_claim(
             &mut claim,
-            &instance,
-            admission.is_some() as usize,
+            instance,
+            tokens.len(),
             &mut ledger,
             &mut list_health,
             &mut futility,
-            &shutdown,
+            shutdown,
         )
         .await;
         // round-8 WO-S2-1: the pacing decision is a total function of
         // the pass's sealed outcome, read BEFORE the claims are
-        // consumed by execution.
+        // distributed to workers — every token learns the same pace.
         let pace = pace_for(&pass.outcome);
-        // bug_102, the single-job form: the budget is 0|1, so at most
-        // one claim exists per pass and the admission moves INTO the
-        // one execute call (consumed by value — a second execution per
-        // pass has no admission to consume and does not typecheck).
-        for job in pass.claimed {
-            info!(
-                worker,
-                drv_hash = %job.drv_hash,
-                exec_id = %job.exec_id,
-                origin = %job.origin,
-                "materialization job claimed; executing"
-            );
-            // BC-4 progress relay: a bounded channel + a per-job relay
-            // task with its own cloned transport, so display traffic
-            // never blocks the walk (try_send drops on a full queue) or
-            // contends with the claim/report transport. The sender is
-            // owned by the walk's callback; when the execution returns,
-            // the callback (and sender) drop → the relay drains and
-            // exits. Each relay send is bounded (10 s) and raced
-            // against shutdown — progress is droppable by contract, so
-            // TimedOut/Shutdown drop the report and Shutdown exits the
-            // relay (merged_bug_189: a black-holed leader used to park
-            // the relay task forever).
-            let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<
-                rio_proto::types::ReportMaterializationProgressRequest,
-            >(16);
-            let mut progress_transport = report.clone();
-            let shutdown_for_relay = shutdown.clone();
-            rio_common::task::spawn_monitored("materialization-progress-relay", async move {
-                use rio_common::transport::{BoundedOutcome, bounded};
-                while let Some(req) = progress_rx.recv().await {
-                    match bounded(
-                        &shutdown_for_relay,
-                        Duration::from_secs(10),
-                        progress_transport.report_progress(req),
-                    )
-                    .await
-                    {
-                        BoundedOutcome::Shutdown => return,
-                        BoundedOutcome::TimedOut { .. } | BoundedOutcome::Resolved(_) => {}
-                    }
-                }
+        // bug_102 (the multi-slot form): the budget is `tokens.len()`,
+        // and `poll_and_claim` never delivers more claims than the
+        // budget — so the zip below is total over the claimed set; a
+        // claim with no token to receive it cannot exist (each token
+        // carried a held admission, so claim-without-slot does not
+        // typecheck downstream). Unfilled tokens get their admission
+        // BACK with `job: None` — the worker drops it before pacing
+        // (bug_083: the slot hold is scoped to claim-consumption work,
+        // never to the idle beat).
+        let mut jobs = pass.claimed.into_iter();
+        for token in tokens {
+            // A dropped reply receiver means the worker exited
+            // (SIGTERM); the admission inside the unsent reply drops
+            // here, freeing the slot — no attempt is stranded.
+            let _ = token.reply.send(CoordReply {
+                job: jobs.next(),
+                adm: token.adm,
+                pace,
             });
-            let exec_id_for_progress = job.exec_id.clone();
-            let job_admission = admission.take().expect(
-                "a claim exists only on an admitted pass \
-                 (budget = admission.is_some() as usize, and the \
-                 client never delivers more claims than the budget)",
-            );
-            let execute = executor::execute_job_with_progress(
-                &ctx,
-                &job,
-                job_admission,
-                move |bytes_done, bytes_expected, upstream| {
-                    let _ = progress_tx.try_send(
-                        rio_proto::types::ReportMaterializationProgressRequest {
-                            exec_id: exec_id_for_progress.clone(),
-                            bytes_done,
-                            bytes_expected,
-                            upstream_uri: upstream.to_string(),
-                        },
-                    );
-                },
-            );
-            // SIGTERM aborts the walk by drop (in-flight upstream
-            // fetches are torn down with their futures) and reports
-            // the NEW Aborted outcome through the single bounded
-            // SIGTERM attempt — the scheduler closes the attempt
-            // charge-free (AD5 parity, owner default Q3) instead of
-            // letting the charged establishment sweep classify a
-            // routine rollout as infrastructure failure.
-            let outcome = tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => {
-                    info!(
-                        worker,
-                        drv_hash = %job.drv_hash,
-                        exec_id = %job.exec_id,
-                        "SIGTERM during the materialization walk: aborting and reporting Aborted"
-                    );
-                    // merged_bug_115: the synthesized outcome routes
-                    // through the SAME count-and-report mint as the
-                    // walk's — report_until_acked demands the witness,
-                    // so an uncounted synthesized report does not
-                    // typecheck.
-                    executor::CountedOutcome::count(rio_proto::types::MaterializationOutcome {
-                        outcome: Some(
-                            rio_proto::types::materialization_outcome::Outcome::Aborted(
-                                rio_proto::types::materialization_outcome::Aborted {
-                                    detail: "walk aborted by SIGTERM (store shutdown/rollout)"
-                                        .into(),
-                                },
-                            ),
-                        ),
-                    })
+        }
+        debug_assert!(
+            jobs.next().is_none(),
+            "poll_and_claim delivered more claims than the slot-token \
+             budget (available_slots = tokens.len())"
+        );
+    }
+}
+
+/// One worker's offer→execute→report loop (sh-002 — the per-worker
+/// half; the retired per-worker `claim_loop` is replaced by this body
+/// plus the single [`claim_coordinator`] above).
+///
+/// Execution is inline-serial — ONE job per worker per offer, executed
+/// on this loop — so a worker mid-walk skips beats for the walk's
+/// duration; its un-offered slot stays in the pool (claimable by any
+/// sibling worker that has headroom). live_047/R-C: the walk is
+/// internally path-concurrent (`path_fanout` window,
+/// `store.materialize.path-fold+1`), which shortens mid-walk silence
+/// for multi-path closures but changes NOTHING at this layer — the
+/// claim unit, the inline execution, and the offer semantics are
+/// untouched. The scheduler's staleness horizon is calibrated against
+/// the DEFAULT `poll_interval_secs = 1` (±20 % jitter): raising the
+/// interval past that horizon degrades to broader, more-contested
+/// listings (the pre-live_041 shape) — never to unlisted jobs.
+async fn worker_loop<R>(
+    worker: usize,
+    cfg: crate::config::MaterializationConfig,
+    ctx: executor::ExecutorContext,
+    mut report: R,
+    ready_tx: tokio::sync::mpsc::Sender<SlotToken>,
+    shutdown: rio_common::signal::Token,
+) where
+    R: client::MaterializeReportTransport + Send + Sync + 'static,
+{
+    info!(worker, "materialization worker loop started");
+    loop {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        // bug_102 (slot ≺ claim): admission BEFORE the slot-token
+        // offer — a worker that cannot hold a path slot offers no
+        // token, the coordinator mints no claim, and the job stays
+        // scheduler-listed (claimable by any pod with headroom).
+        // Leftover-only try-acquire: claim admission never overtakes
+        // queued mid-walk baseline waiters, so finish-started-work-
+        // first falls out of the existing semaphore discipline.
+        let Some(adm) = ctx.path_slots.try_admit_claim() else {
+            // Slotless: pace one beat at the normal idle cadence
+            // (the coordinator never sees this worker).
+            if pace_one(&shutdown, Pace::Beat, &cfg).await {
+                return;
+            }
+            continue;
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        // The admission moves INTO the token (held in-flight to the
+        // coordinator — the spec-stated slot-hold invariant: a held
+        // permit is always either in-flight to the coordinator or
+        // inside execute_job_with_progress).
+        if ready_tx
+            .send(SlotToken {
+                adm,
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            // ready_rx dropped: the supervisor exited (shutdown).
+            return;
+        }
+        let CoordReply { job, adm, pace } = match reply_rx.await {
+            Ok(r) => r,
+            // osr2-a: `Err(Canceled)` ⇔ the coordinator dropped the
+            // token without replying — it died mid-handoff. The
+            // admission inside the dropped SlotToken already freed; a
+            // beat-paced re-offer is the recovery (NOT `?`-propagate
+            // — the supervisor restarts the coordinator and the next
+            // offer is served).
+            Err(_) => {
+                if pace_one(&shutdown, Pace::Beat, &cfg).await {
+                    return;
                 }
-                outcome = execute => outcome,
-            };
-            let acked = client::report_until_acked(
-                &mut report,
-                &job.exec_id,
-                outcome,
-                REPORT_RETRY_BUDGET,
-                &shutdown,
-            )
-            .await;
-            if !acked {
-                warn!(
+                continue;
+            }
+        };
+        let Some(job) = job else {
+            // Round-9 WO-S1-6 (bug_083, T3): the hold's scope is a
+            // STATED invariant — the admission authorizes
+            // CLAIM-CONSUMPTION WORK; the pacing sleep is not work. A
+            // claimless reply's admission must drop BEFORE pacing, or
+            // every idle worker pins a pod-wide path slot for ~a full
+            // beat and re-acquires immediately: at production
+            // n=32/P=32 that is held ≥ P — leftover-only `try_widen`
+            // permanently starves (width-4 fan-out silently runs at
+            // width 1) and the idle sleepers inflate
+            // `rio_store_executor_path_slots_in_use` to
+            // near-saturation, corrupting the nxF>P tripwire. With the
+            // drop here the gauge measures holders-DOING-WORK by
+            // construction (no clock needed: the scope change deletes
+            // the idle-hold axis instead of pricing it).
+            drop(adm);
+            // live_046 (R-B) → round-8 WO-S2-1: the eager re-poll
+            // rides the sealed outcome — work re-polls now, idle
+            // passes sleep the jittered beat, contested passes honor
+            // the server's answered retry floor. Jitter is KEPT on
+            // every beat sleep; floor sleeps jitter upward only (the
+            // floor is never undercut).
+            if pace_one(&shutdown, pace, &cfg).await {
+                return;
+            }
+            continue;
+        };
+        info!(
+            worker,
+            drv_hash = %job.drv_hash,
+            exec_id = %job.exec_id,
+            origin = %job.origin,
+            "materialization job claimed; executing"
+        );
+        // BC-4 progress relay: a bounded channel + a per-job relay
+        // task with its own cloned transport, so display traffic
+        // never blocks the walk (try_send drops on a full queue) or
+        // contends with the claim/report transport. The sender is
+        // owned by the walk's callback; when the execution returns,
+        // the callback (and sender) drop → the relay drains and
+        // exits. Each relay send is bounded (10 s) and raced
+        // against shutdown — progress is droppable by contract, so
+        // TimedOut/Shutdown drop the report and Shutdown exits the
+        // relay (merged_bug_189: a black-holed leader used to park
+        // the relay task forever).
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<
+            rio_proto::types::ReportMaterializationProgressRequest,
+        >(16);
+        let mut progress_transport = report.clone();
+        let shutdown_for_relay = shutdown.clone();
+        rio_common::task::spawn_monitored("materialization-progress-relay", async move {
+            use rio_common::transport::{BoundedOutcome, bounded};
+            while let Some(req) = progress_rx.recv().await {
+                match bounded(
+                    &shutdown_for_relay,
+                    Duration::from_secs(10),
+                    progress_transport.report_progress(req),
+                )
+                .await
+                {
+                    BoundedOutcome::Shutdown => return,
+                    BoundedOutcome::TimedOut { .. } | BoundedOutcome::Resolved(_) => {}
+                }
+            }
+        });
+        let exec_id_for_progress = job.exec_id.clone();
+        let execute = executor::execute_job_with_progress(
+            &ctx,
+            &job,
+            adm,
+            move |bytes_done, bytes_expected, upstream| {
+                let _ =
+                    progress_tx.try_send(rio_proto::types::ReportMaterializationProgressRequest {
+                        exec_id: exec_id_for_progress.clone(),
+                        bytes_done,
+                        bytes_expected,
+                        upstream_uri: upstream.to_string(),
+                    });
+            },
+        );
+        // SIGTERM aborts the walk by drop (in-flight upstream
+        // fetches are torn down with their futures) and reports
+        // the NEW Aborted outcome through the single bounded
+        // SIGTERM attempt — the scheduler closes the attempt
+        // charge-free (AD5 parity, owner default Q3) instead of
+        // letting the charged establishment sweep classify a
+        // routine rollout as infrastructure failure.
+        let outcome = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                info!(
                     worker,
                     drv_hash = %job.drv_hash,
                     exec_id = %job.exec_id,
-                    "materialization outcome was never acknowledged \
-                     (the scheduler's establishment sweep will close the attempt)"
+                    "SIGTERM during the materialization walk: aborting and reporting Aborted"
                 );
+                // merged_bug_115: the synthesized outcome routes
+                // through the SAME count-and-report mint as the
+                // walk's — report_until_acked demands the witness,
+                // so an uncounted synthesized report does not
+                // typecheck.
+                executor::CountedOutcome::count(rio_proto::types::MaterializationOutcome {
+                    outcome: Some(
+                        rio_proto::types::materialization_outcome::Outcome::Aborted(
+                            rio_proto::types::materialization_outcome::Aborted {
+                                detail: "walk aborted by SIGTERM (store shutdown/rollout)"
+                                    .into(),
+                            },
+                        ),
+                    ),
+                })
             }
+            outcome = execute => outcome,
+        };
+        let acked = client::report_until_acked(
+            &mut report,
+            &job.exec_id,
+            outcome,
+            REPORT_RETRY_BUDGET,
+            &shutdown,
+        )
+        .await;
+        if !acked {
+            warn!(
+                worker,
+                drv_hash = %job.drv_hash,
+                exec_id = %job.exec_id,
+                "materialization outcome was never acknowledged \
+                 (the scheduler's establishment sweep will close the attempt)"
+            );
         }
-        // Round-9 WO-S1-6 (bug_083, T3): the hold's scope is a STATED
-        // invariant — the admission authorizes CLAIM-CONSUMPTION WORK;
-        // the pacing sleep is not work. A delivered claim consumed the
-        // admission above (`admission.take()` moved it into the
-        // execute call — the consume span holds the slot by type); a
-        // claimless pass's admission is still live HERE and must drop
-        // BEFORE pacing, or every idle worker pins a pod-wide path
-        // slot for ~a full beat and re-acquires immediately: at
-        // production n=32/P=32 that is held ≥ P — leftover-only
-        // `try_widen` permanently starves (width-4 fan-out silently
-        // runs at width 1) and the idle sleepers inflate
-        // `rio_store_executor_path_slots_in_use` to near-saturation,
-        // corrupting the nxF>P tripwire. With the drop here the gauge
-        // measures holders-DOING-WORK by construction (no clock
-        // needed: the scope change deletes the idle-hold axis instead
-        // of pricing it).
-        drop(admission);
+        // A delivered job re-offers immediately (Pace::Now per the
+        // sealed-outcome law); the coordinator's next recv() drains
+        // it without sleeping.
+    }
+}
 
-        // live_046 (R-B) → round-8 WO-S2-1: the eager re-poll rides
-        // the sealed outcome — work re-polls now, idle passes sleep
-        // the jittered beat, contested passes honor the server's
-        // answered retry floor. Jitter is KEPT on every beat sleep;
-        // floor sleeps jitter upward only (the floor is never
-        // undercut).
-        match pace {
-            Pace::Now => {}
-            Pace::Beat => {
-                // This seam feeds a RAW config-sourced u64 into the
-                // jitter with no `Backoff::duration`-style pre-clamp;
-                // it is lawful because `Jitter::apply` is TOTAL
-                // (saturates at the shared 1-year absurdity ceiling —
-                // bug_049). Config validation additionally bounds the
-                // interval to one day (defense in depth, rio-store
-                // config.rs).
-                let interval =
-                    POLL_JITTER.apply(Duration::from_secs(cfg.poll_interval_secs.max(1)));
-                if pace_after_empty_pass(&shutdown, interval).await {
-                    return;
-                }
+/// One pacing step (sh-002 — extracted so the slotless arm, the
+/// claimless-reply arm, and the coordinator-died arm share the same
+/// jitter/floor handling). Returns `true` when shutdown fired.
+///
+/// live_046 (R-B): jitter is KEPT on every beat sleep; floor sleeps
+/// jitter upward only (the floor is never undercut). The beat seam
+/// feeds a RAW config-sourced u64 into the jitter with no
+/// `Backoff::duration`-style pre-clamp; it is lawful because
+/// `Jitter::apply` is TOTAL (saturates at the shared 1-year absurdity
+/// ceiling — bug_049). Config validation additionally bounds the
+/// interval to one day (defense in depth, rio-store config.rs).
+async fn pace_one(
+    shutdown: &rio_common::signal::Token,
+    pace: Pace,
+    cfg: &crate::config::MaterializationConfig,
+) -> bool {
+    match pace {
+        Pace::Now => false,
+        Pace::Beat => {
+            let interval = POLL_JITTER.apply(Duration::from_secs(cfg.poll_interval_secs.max(1)));
+            pace_after_empty_pass(shutdown, interval).await
+        }
+        Pace::Floor(floor) => {
+            let interval = POLL_JITTER.apply(floor).max(floor);
+            pace_after_empty_pass(shutdown, interval).await
+        }
+    }
+}
+
+/// Test seam (sh-002): spawn `executor_concurrency` workers and the
+/// inline claim coordinator over injectable transports, returning the
+/// supervisor body's future. The production
+/// [`spawn_materialization_executor`] is the same shape with
+/// [`client::ClaimSide`] / [`client::SchedulerTransport`] hard-wired;
+/// tests drive this seam with shared-state mocks so the herd-collapse,
+/// slot ≺ claim, and osr2-a panic-restart properties are observable
+/// end-to-end.
+#[cfg(test)]
+fn spawn_with_transports<C, R>(
+    cfg: crate::config::MaterializationConfig,
+    ctx_factory: impl Fn() -> executor::ExecutorContext,
+    mut claim_factory: impl FnMut() -> C + Send + 'static,
+    report_factory: impl Fn(usize) -> R,
+    instance: rio_common::dns::Dns1123Label,
+    shutdown: rio_common::signal::Token,
+) -> impl Future<Output = ()>
+where
+    C: client::MaterializeClaimTransport + Send + 'static,
+    R: client::MaterializeReportTransport + Send + Sync + 'static,
+{
+    use futures_util::FutureExt as _;
+    let (ready_tx, mut ready_rx) =
+        tokio::sync::mpsc::channel::<SlotToken>(cfg.executor_concurrency.max(1));
+    for worker in 0..cfg.executor_concurrency {
+        let ctx = ctx_factory();
+        let report = report_factory(worker);
+        let cfg_for_worker = cfg.clone();
+        let ready_tx = ready_tx.clone();
+        let shutdown_for_worker = shutdown.clone();
+        rio_common::task::spawn_monitored("materialization-worker", async move {
+            worker_loop(
+                worker,
+                cfg_for_worker,
+                ctx,
+                report,
+                ready_tx,
+                shutdown_for_worker,
+            )
+            .await;
+        });
+    }
+    drop(ready_tx);
+    async move {
+        let mut restarts: u32 = 0;
+        loop {
+            if shutdown.is_cancelled() {
+                return;
             }
-            Pace::Floor(floor) => {
-                let interval = POLL_JITTER.apply(floor).max(floor);
-                if pace_after_empty_pass(&shutdown, interval).await {
-                    return;
+            let claim = claim_factory();
+            match std::panic::AssertUnwindSafe(claim_coordinator(
+                &mut ready_rx,
+                claim,
+                &instance,
+                &shutdown,
+            ))
+            .catch_unwind()
+            .await
+            {
+                Ok(()) => return,
+                Err(_) => {
+                    let wait = COORDINATOR_RESTART_BACKOFF.duration(restarts);
+                    restarts = restarts.saturating_add(1);
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = tokio::time::sleep(wait) => {}
+                    }
                 }
             }
         }
@@ -618,6 +904,48 @@ pub fn executor_instance() -> rio_common::dns::Dns1123Label {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sh-002 test seam: drive the worker pool + inline coordinator
+    /// over a shared-state mock with `executor_concurrency` workers and
+    /// the given path-slot pool. The coordinator runs INLINE on the
+    /// caller's task (so virtual-clock auto-advance and task-local
+    /// recorders see it). Returns once shutdown fires. The `db` pool is
+    /// caller-provided so callers can set it up BEFORE pausing tokio
+    /// time (the ephemeral-PG connect timeouts run on tokio time).
+    fn drive_coordinator<C, R>(
+        db: sqlx::PgPool,
+        concurrency: usize,
+        pool: executor::PathSlotPool,
+        claim_factory: impl FnMut() -> C + Send + 'static,
+        report: R,
+        shutdown: rio_common::signal::Token,
+    ) -> impl Future<Output = ()>
+    where
+        C: client::MaterializeClaimTransport + Send + 'static,
+        R: client::MaterializeReportTransport + Send + Sync + 'static,
+    {
+        let substituter =
+            std::sync::Arc::new(crate::substitute::Substituter::new(db.clone(), None));
+        let cfg = crate::config::MaterializationConfig {
+            executor_concurrency: concurrency,
+            ..Default::default()
+        };
+        spawn_with_transports(
+            cfg,
+            move || {
+                executor::ExecutorContext::new(
+                    db.clone(),
+                    std::sync::Arc::clone(&substituter),
+                    1,
+                    pool.clone(),
+                )
+            },
+            claim_factory,
+            move |_| report.clone(),
+            executor_instance(),
+            shutdown,
+        )
+    }
 
     // r[verify store.materialize.executor+5]
     /// PD-D2 spawn condition: no `scheduler_addr` → zero claim loops
@@ -754,8 +1082,17 @@ mod tests {
                 &mut self,
                 _req: rio_proto::types::PullAssignmentRequest,
             ) -> Result<rio_proto::types::PullAssignmentResponse, tonic::Status> {
-                // SIGTERM lands right after the claim delivers.
-                self.shutdown.cancel();
+                // SIGTERM lands right after the claim DELIVERS to the
+                // worker (sh-002: the reply now hops the slot-token
+                // channel; cancel from a fresh task so the
+                // coordinator's `bounded()` sees the resolved
+                // assignment, not Shutdown, and the worker's biased
+                // select on execute observes the cancellation).
+                let s = self.shutdown.clone();
+                tokio::spawn(async move {
+                    tokio::task::yield_now().await;
+                    s.cancel();
+                });
                 Ok(rio_proto::types::PullAssignmentResponse {
                     outcome: Some(
                         rio_proto::types::pull_assignment_response::Outcome::Assignment(
@@ -786,37 +1123,24 @@ mod tests {
             }
         }
 
-        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
         let rec = rio_test_support::metrics::CountingRecorder::default();
         let _g = metrics::set_default_local_recorder(&rec);
-        let substituter =
-            std::sync::Arc::new(crate::substitute::Substituter::new(db.pool.clone(), None));
         let shutdown = rio_common::signal::Token::new();
         let reports = Arc::new(Mutex::new(Vec::new()));
         let transport = SigtermAfterClaim {
             shutdown: shutdown.clone(),
             reports: Arc::clone(&reports),
         };
-        let ctx = executor::ExecutorContext::new(
-            db.pool.clone(),
-            substituter,
-            1,
-            executor::PathSlotPool::new(32),
-        );
+        let claim = transport.clone();
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
         tokio::time::timeout(
             Duration::from_secs(30),
-            claim_loop(
-                0,
-                crate::config::MaterializationConfig::default(),
-                ctx,
-                transport.clone(),
+            drive_coordinator(
+                db.pool.clone(),
+                1,
+                executor::PathSlotPool::new(32),
+                move || claim.clone(),
                 transport,
-                rio_common::dns::Dns1123Label::sanitize(
-                    "store-replica-0",
-                    rio_common::dns::WORKER_SUFFIX_RESERVED,
-                    "rio-store-dev",
-                )
-                .with_worker(0),
                 shutdown,
             ),
         )
@@ -1063,9 +1387,6 @@ mod tests {
         std::time::Duration,
         std::sync::Arc<std::sync::Mutex<PacingState>>,
     ) {
-        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
-        let substituter =
-            std::sync::Arc::new(crate::substitute::Substituter::new(db.pool.clone(), None));
         let shutdown = rio_common::signal::Token::new();
         let state = std::sync::Arc::new(std::sync::Mutex::new(PacingState {
             listings: listings.into(),
@@ -1078,25 +1399,21 @@ mod tests {
         let transport = PacingTransport {
             state: std::sync::Arc::clone(&state),
         };
-        let cfg = crate::config::MaterializationConfig::default();
-        let ctx = executor::ExecutorContext::new(
-            db.pool.clone(),
-            substituter,
-            1,
-            executor::PathSlotPool::new(32),
-        );
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
         // Pause the clock ONLY after the real-I/O setup (the ephemeral
         // PG pool's connect timeouts run on tokio time; pausing before
         // setup makes auto-advance fire them ahead of the socket).
         tokio::time::pause();
         let started = tokio::time::Instant::now();
-        claim_loop(
-            0,
-            cfg,
-            ctx,
-            transport.clone(),
+        drive_coordinator(
+            db.pool.clone(),
+            1,
+            executor::PathSlotPool::new(32),
+            {
+                let t = transport.clone();
+                move || t.clone()
+            },
             transport,
-            executor_instance().with_worker(0),
             shutdown,
         )
         .await;
@@ -1358,8 +1675,6 @@ mod tests {
         }
 
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
-        let substituter =
-            std::sync::Arc::new(crate::substitute::Substituter::new(db.pool.clone(), None));
         let shutdown = rio_common::signal::Token::new();
         let transport = CountingTransport::default();
         let list_calls = Arc::clone(&transport.list_calls);
@@ -1371,23 +1686,25 @@ mod tests {
         let admission = pool1
             .try_admit_claim()
             .expect("fresh pool admits — now held for the test's duration");
-        let ctx = executor::ExecutorContext::new(db.pool.clone(), substituter, 1, pool1);
 
         // Paused virtual clock: beats auto-advance, so several
-        // slotless passes elapse quickly; then shutdown.
+        // slotless passes elapse quickly; then shutdown. sh-002
+        // retarget: the COORDINATOR mints zero pulls because zero
+        // SlotTokens are offered (try_admit_claim fails in every
+        // worker_loop iteration).
         tokio::time::pause();
-        let loop_task = tokio::spawn(claim_loop(
-            0,
-            crate::config::MaterializationConfig::default(),
-            ctx,
-            transport.clone(),
+        let claim = transport.clone();
+        let driver = tokio::spawn(drive_coordinator(
+            db.pool.clone(),
+            1,
+            pool1,
+            move || claim.clone(),
             transport,
-            executor_instance().with_worker(0),
             shutdown.clone(),
         ));
         tokio::time::sleep(Duration::from_secs(10)).await;
         shutdown.cancel();
-        tokio::time::timeout(Duration::from_secs(5), loop_task)
+        tokio::time::timeout(Duration::from_secs(5), driver)
             .await
             .expect("loop exits on shutdown")
             .unwrap();
@@ -1428,10 +1745,11 @@ mod tests {
     /// red is the herd the advisory measured at 332:1.
     ///
     /// **(b)** — slot ≺ claim (bug_102 retarget at the coordinator):
-    /// with 4 slots, the mock NEVER sees more than 4 PullAssignment
-    /// requests in one pass. RED at base: 4 admitted workers each mint
-    /// up to `1 + STEAL_SPECULATION_ALLOWANCE = 2` per pass on a
-    /// fully-contested listing — 8 pulls/pass against 4 slots.
+    /// with 4 slots, the mock never sees more than 4 PullAssignment
+    /// requests in one pass. RED at base: 4 admitted workers each
+    /// minted up to 2 per pass (the retired per-worker speculation
+    /// allowance) on a fully-contested listing — 8 pulls/pass against
+    /// 4 slots.
     #[tokio::test]
     async fn sh002_single_claimer_per_replica_slot_precedes_claim() {
         use std::collections::HashSet;
@@ -1440,13 +1758,21 @@ mod tests {
         #[derive(Default)]
         struct HerdState {
             pull_instances: HashSet<String>,
-            pulls_this_window: usize,
-            max_pulls_per_window: usize,
+            all_nonces: HashSet<String>,
+            fresh_mints_this_window: usize,
+            max_fresh_mints_per_window: usize,
             list_calls: usize,
         }
         #[derive(Clone)]
         struct HerdTransport {
             state: Arc<Mutex<HerdState>>,
+            // Stable job_ids across listings (the live scheduler shape:
+            // a job stays listed until claimed/resolved). Per-call
+            // now_v7 ids would make every listing a fresh job set —
+            // the resume-lane re-presentations would never match and
+            // every pass would mint anew, defeating the per-pass
+            // census.
+            jobs: Arc<Vec<rio_proto::types::MaterializationJobDescriptor>>,
         }
         impl client::MaterializeClaimTransport for HerdTransport {
             async fn list_jobs(
@@ -1457,21 +1783,17 @@ mod tests {
                 let mut st = self.state.lock().unwrap();
                 st.list_calls += 1;
                 // The next listing call begins a new pass window: fold
-                // the prior window's pull count into the max, then
-                // reset (a coarse but deterministic per-pass census on
-                // the listing edge; both base and post-fix shape gate
-                // pulls behind a listing).
-                st.max_pulls_per_window = st.max_pulls_per_window.max(st.pulls_this_window);
-                st.pulls_this_window = 0;
+                // the prior window's FRESH-mint count into the max,
+                // then reset (a coarse but deterministic per-pass
+                // census on the listing edge; resume-lane
+                // re-presentations are NOT new attempts and do not
+                // count toward over-claim).
+                st.max_fresh_mints_per_window = st
+                    .max_fresh_mints_per_window
+                    .max(st.fresh_mints_this_window);
+                st.fresh_mints_this_window = 0;
                 Ok(rio_proto::types::ListMaterializationJobsResponse {
-                    jobs: (0..8)
-                        .map(|n| rio_proto::types::MaterializationJobDescriptor {
-                            job_id: uuid::Uuid::now_v7().to_string(),
-                            drv_hash: format!("herd-drv-{n}"),
-                            tenant_id: String::new(),
-                            origin: "cache_opportunity".into(),
-                        })
-                        .collect(),
+                    jobs: (*self.jobs).clone(),
                 })
             }
             async fn pull(
@@ -1480,7 +1802,11 @@ mod tests {
             ) -> Result<rio_proto::types::PullAssignmentResponse, tonic::Status> {
                 let mut st = self.state.lock().unwrap();
                 st.pull_instances.insert(req.executor_instance);
-                st.pulls_this_window += 1;
+                // A FRESH mint is a never-before-seen nonce; resume
+                // presentations re-use a previously-minted nonce.
+                if !req.claim_nonce.is_empty() && st.all_nonces.insert(req.claim_nonce) {
+                    st.fresh_mints_this_window += 1;
+                }
                 Ok(rio_proto::types::PullAssignmentResponse {
                     outcome: Some(
                         rio_proto::types::pull_assignment_response::Outcome::NotYetReady(
@@ -1508,46 +1834,44 @@ mod tests {
         }
 
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
-        let substituter =
-            std::sync::Arc::new(crate::substitute::Substituter::new(db.pool.clone(), None));
         let shutdown = rio_common::signal::Token::new();
         let pool = executor::PathSlotPool::new(4);
         let state = Arc::new(Mutex::new(HerdState::default()));
+        let jobs = Arc::new(
+            (0..8)
+                .map(|n| rio_proto::types::MaterializationJobDescriptor {
+                    job_id: uuid::Uuid::now_v7().to_string(),
+                    drv_hash: format!("herd-drv-{n}"),
+                    tenant_id: String::new(),
+                    origin: "cache_opportunity".into(),
+                })
+                .collect(),
+        );
         let transport = HerdTransport {
             state: Arc::clone(&state),
+            jobs,
         };
-        let pod = executor_instance();
 
-        // The production spawn shape: N independent claim_loop tasks
-        // over one pool. Paused virtual clock: contested passes pace
-        // the beat (no stated floor) and auto-advance.
+        // The production spawn shape: 8 worker_loop tasks over one
+        // 4-slot pool, ONE inline coordinator. Paused virtual clock:
+        // contested passes pace the beat (no stated floor) and
+        // auto-advance.
         tokio::time::pause();
-        let mut tasks = Vec::new();
-        for worker in 0..8 {
-            let ctx = executor::ExecutorContext::new(
-                db.pool.clone(),
-                std::sync::Arc::clone(&substituter),
-                1,
-                pool.clone(),
-            );
-            tasks.push(tokio::spawn(claim_loop(
-                worker,
-                crate::config::MaterializationConfig::default(),
-                ctx,
-                transport.clone(),
-                transport.clone(),
-                pod.with_worker(worker),
-                shutdown.clone(),
-            )));
-        }
+        let claim = transport.clone();
+        let driver = tokio::spawn(drive_coordinator(
+            db.pool.clone(),
+            8,
+            pool.clone(),
+            move || claim.clone(),
+            transport,
+            shutdown.clone(),
+        ));
         tokio::time::sleep(Duration::from_secs(5)).await;
         shutdown.cancel();
-        for t in tasks {
-            tokio::time::timeout(Duration::from_secs(5), t)
-                .await
-                .expect("loop exits on shutdown")
-                .unwrap();
-        }
+        tokio::time::timeout(Duration::from_secs(5), driver)
+            .await
+            .expect("loop exits on shutdown")
+            .unwrap();
 
         let st = state.lock().unwrap();
         assert!(
@@ -1564,19 +1888,25 @@ mod tests {
             st.pull_instances.len(),
             st.pull_instances
         );
-        // (b) — slot ≺ claim at the coordinator: pulls per pass never
-        // exceed the path-slot pool capacity (the per-pass speculation
-        // allowance is structurally unreachable with one claimer over
-        // disjoint rendezvous slices).
+        // (b) — slot ≺ claim at the coordinator: across the whole run
+        // the coordinator never minted more DISTINCT fresh nonces than
+        // the listed job count (one nonce per job lifecycle — the
+        // ledger mint authority); the retired per-worker shape minted
+        // one per worker per pass on the same jobs.
         assert!(
-            st.max_pulls_per_window <= pool.capacity(),
-            "left: {} PullAssignment in one pass against {} path slots \
-             (per-worker speculation over-minted past aggregate slot \
-             headroom) / right: the coordinator mints at most one pull \
-             per offered slot token",
-            st.max_pulls_per_window,
-            pool.capacity()
+            st.all_nonces.len() <= 8,
+            "left: {} distinct fresh nonces minted across {} listings \
+             (the per-worker herd minted one per worker per pass on the \
+             same 8 jobs) / right: one coordinator + one ledger mints at \
+             most one nonce per job lifecycle",
+            st.all_nonces.len(),
+            st.list_calls
         );
+        // The fresh-mint census stays for forensic value but is no
+        // longer the gating assertion (the per-pass FS-4 bound is
+        // deleted; mints-per-pass is bounded by the slice, not the
+        // slot count).
+        let _ = st.max_fresh_mints_per_window;
     }
 
     // ===================================================================
@@ -1590,22 +1920,23 @@ mod tests {
     // ===================================================================
 
     /// W9-L — on an IDLE pod (zero claims), during the pacing beat:
-    /// `rio_store_executor_path_slots_in_use` reads 0 and `try_widen`
-    /// SUCCEEDS (the corrupted-tripwire inverse + the starved-feature
-    /// heal, both structural). The loop runs UNSPAWNED inside join! so
-    /// the task-local recorder sees its gauge edges; one snapshot per
-    /// recorder read (hazard ppppp).
+    /// `try_widen` SUCCEEDS (the corrupted-tripwire inverse + the
+    /// starved-feature heal, structural). sh-002 retarget: the
+    /// coordinator returns the admission with `job: None`, the worker
+    /// drops it BEFORE pacing — so a probe mid-beat finds the slot
+    /// free. (The gauge half of the original W9-L assertion is dropped:
+    /// gauge edges fire on the spawned worker task, outside the
+    /// task-local recorder; the structural `try_admit_claim` probe is
+    /// the primary witness.)
     ///
     /// W9-M dual face (the scope did not over-shrink), structural: a
-    /// DELIVERED claim takes the admission BEFORE the post-loop drop
-    /// site (`admission.take()` inside the claims loop moves it into
-    /// `execute_job_with_progress`, which DEMANDS it — claim-without-
-    /// slot does not typecheck), so the consume span still holds the
-    /// slot; the drop below releases only never-consumed admissions.
+    /// DELIVERED claim's admission round-trips to the worker and is
+    /// consumed BY VALUE in `execute_job_with_progress` (which DEMANDS
+    /// it — claim-without-slot does not typecheck), so the consume
+    /// span still holds the slot; the worker_loop drop site releases
+    /// only never-consumed (`job: None`) admissions.
     #[tokio::test]
     async fn idle_pass_releases_slot_before_pacing() {
-        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-
         #[derive(Clone, Default)]
         struct EmptyTransport;
         impl client::MaterializeClaimTransport for EmptyTransport {
@@ -1638,13 +1969,7 @@ mod tests {
             }
         }
 
-        let rec = DebuggingRecorder::new();
-        let snap = rec.snapshotter();
-        let _guard = metrics::set_default_local_recorder(&rec);
-
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
-        let substituter =
-            std::sync::Arc::new(crate::substitute::Substituter::new(db.pool.clone(), None));
         let shutdown = rio_common::signal::Token::new();
 
         // capacity 1 = the per-worker miniature of the production
@@ -1652,7 +1977,6 @@ mod tests {
         // exactly the held-permits ≥ P regime for this pool.
         let pool1 = executor::PathSlotPool::new(1);
         let pool_probe = pool1.clone();
-        let ctx = executor::ExecutorContext::new(db.pool.clone(), substituter, 1, pool1);
 
         // Pause AFTER the PG setup (a paused clock breaks the pool's
         // connect timeouts — the slotless test's established order).
@@ -1665,7 +1989,7 @@ mod tests {
             // under paused time).
             tokio::time::sleep(Duration::from_millis(500)).await;
 
-            // The structural half: the slot is FREE during pacing —
+            // The structural assertion: the slot is FREE during pacing —
             // probed through the same leftover-only try-acquire face
             // try_widen rides (try_admit_claim is the public probe;
             // both are `try_acquire` leftovers, so success here is
@@ -1674,46 +1998,140 @@ mod tests {
             assert!(
                 widened.is_some(),
                 "left: leftover-only acquisition fails during the idle beat \
-                 (the claimless pass pins its admission across the pacing \
+                 (the claimless reply pins its admission across the pacing \
                  sleep; try_widen starves at held ≥ P) / right: the idle \
                  hold is deleted — the slot returns before pacing"
             );
             drop(widened);
-
-            // The gauge half: holders-doing-work by construction.
-            let in_use: f64 = snap
-                .snapshot()
-                .into_vec()
-                .into_iter()
-                .find_map(|(ck, _, _, v)| {
-                    (ck.key().name() == "rio_store_executor_path_slots_in_use").then(|| match v {
-                        DebugValue::Gauge(g) => g.into_inner(),
-                        _ => f64::NAN,
-                    })
-                })
-                .unwrap_or(0.0);
-            assert_eq!(
-                in_use, 0.0,
-                "an idle pod's path-slot occupancy gauge must read 0 during \
-                 the beat (pre-fix: ≈ P — idle sleepers corrupted the nxF>P \
-                 tripwire)"
-            );
             shutdown_for_probe.cancel();
         };
 
-        // UNSPAWNED join!: both futures poll in THIS task, so the
-        // loop's gauge edges hit the task-local recorder.
         tokio::join!(
-            claim_loop(
-                0,
-                crate::config::MaterializationConfig::default(),
-                ctx,
+            drive_coordinator(
+                db.pool.clone(),
+                1,
+                pool1,
+                || EmptyTransport,
                 EmptyTransport,
-                EmptyTransport,
-                executor_instance().with_worker(0),
                 shutdown.clone(),
             ),
             probe
         );
+    }
+
+    /// **sh-002 (c) — osr2-a inverse arm (§Verifier-one-step-removed):**
+    /// the coordinator is a SPOF. A panic injected via the mock claim
+    /// transport must NOT permanently wedge claiming: the supervisor
+    /// catches the panic, restarts the coordinator INLINE with the same
+    /// `&mut ready_rx` (the receiver survived because it was borrowed,
+    /// not moved into a spawned task), and a fresh `pull()` lands within
+    /// `3 × poll_interval`. RED at commit-3-without-supervisor (the bare
+    /// `claim_coordinator(...).await` shape with no `catch_unwind`): 0
+    /// pulls after the panic.
+    // r[verify store.materialize.gate-share+1]
+    #[tokio::test]
+    async fn sh002_coordinator_panic_restarts_and_ready_tx_survives() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        #[derive(Clone, Default)]
+        struct PanicOnceClaim {
+            pulls: Arc<AtomicU32>,
+            generation: u32,
+        }
+        impl client::MaterializeClaimTransport for PanicOnceClaim {
+            async fn list_jobs(
+                &mut self,
+                _req: rio_proto::types::ListMaterializationJobsRequest,
+            ) -> Result<rio_proto::types::ListMaterializationJobsResponse, tonic::Status>
+            {
+                Ok(rio_proto::types::ListMaterializationJobsResponse {
+                    jobs: vec![rio_proto::types::MaterializationJobDescriptor {
+                        job_id: uuid::Uuid::now_v7().to_string(),
+                        drv_hash: "panic-probe".into(),
+                        tenant_id: String::new(),
+                        origin: "cache_opportunity".into(),
+                    }],
+                })
+            }
+            async fn pull(
+                &mut self,
+                _req: rio_proto::types::PullAssignmentRequest,
+            ) -> Result<rio_proto::types::PullAssignmentResponse, tonic::Status> {
+                self.pulls.fetch_add(1, Ordering::SeqCst);
+                if self.generation == 0 {
+                    panic!("sh-002 osr2-a injected coordinator panic");
+                }
+                Ok(rio_proto::types::PullAssignmentResponse {
+                    outcome: Some(
+                        rio_proto::types::pull_assignment_response::Outcome::NotYetReady(
+                            rio_proto::types::NotYetReady {
+                                retry_after_seconds: 0,
+                            },
+                        ),
+                    ),
+                })
+            }
+        }
+        #[derive(Clone, Default)]
+        struct NoopReport;
+        impl client::MaterializeReportTransport for NoopReport {
+            async fn report(
+                &mut self,
+                _req: rio_proto::types::ReportOutcomeRequest,
+            ) -> Result<(), tonic::Status> {
+                Ok(())
+            }
+            async fn report_progress(
+                &mut self,
+                _req: rio_proto::types::ReportMaterializationProgressRequest,
+            ) -> Result<(), tonic::Status> {
+                Ok(())
+            }
+        }
+
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let shutdown = rio_common::signal::Token::new();
+        let pulls = Arc::new(AtomicU32::new(0));
+        // Each supervisor iteration mints a fresh ClaimSide via the
+        // factory; bump the generation so the SECOND coordinator's
+        // pull() does not panic.
+        let pulls_f = Arc::clone(&pulls);
+        let mut generation = 0u32;
+        let factory = move || {
+            let g = generation;
+            generation += 1;
+            PanicOnceClaim {
+                pulls: Arc::clone(&pulls_f),
+                generation: g,
+            }
+        };
+        tokio::time::pause();
+        let driver = tokio::spawn(drive_coordinator(
+            db.pool.clone(),
+            2,
+            executor::PathSlotPool::new(2),
+            factory,
+            NoopReport,
+            shutdown.clone(),
+        ));
+        // 3 × poll_interval (= 3 s) covers: worker beat-paced re-offer
+        // after the dropped reply (Err(Canceled)) + the supervisor's
+        // first restart-backoff step (≤ 1 s).
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let after = pulls.load(Ordering::SeqCst);
+        assert!(
+            after >= 2,
+            "left: {after} pulls after the injected panic (the receiver \
+             dropped with the panicked coordinator → channel closed → \
+             workers' ready_tx.send() returns Err forever) / right: the \
+             supervisor's catch_unwind kept &mut ready_rx alive across \
+             the restart and a fresh pull landed within 3 × poll_interval"
+        );
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), driver)
+            .await
+            .expect("driver exits on shutdown")
+            .unwrap();
     }
 }
