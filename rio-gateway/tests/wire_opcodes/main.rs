@@ -34,3 +34,4 @@ mod build;
 mod misc;
 mod opcodes_read;
 mod opcodes_write;
+mod put_path_streaming;
