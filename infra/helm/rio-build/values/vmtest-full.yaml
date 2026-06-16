@@ -118,6 +118,13 @@ scheduler:
           - {key: kubernetes.io/os, operator: In, values: [linux]}
     hwCostSource: static
     referenceHwClass: vmtest
+    # sh-008/sh007b-S2: chart-default featureProbes.big-parallel.cpu=48
+    # and softFeatureSizing.big-parallel.minCores=32 are prod sizing;
+    # under maxCores=16 ProbeShape::validate rejects cpu>maxCores/4=4
+    # and the soft-min warn fires every tick. Helm `null` deletes the
+    # parent key (deep-merge would keep `{}` populated).
+    featureProbes: null
+    softFeatureSizing: null
 
 gateway:
   enabled: true
