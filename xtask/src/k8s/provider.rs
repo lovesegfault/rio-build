@@ -6,6 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tempfile::TempDir;
 
+use super::shared::ProcessGuard;
 use crate::config::XtaskConfig;
 
 /// Knobs for [`Provider::deploy`]. Bundled so adding the next deploy
@@ -53,6 +54,48 @@ pub struct BuiltImages {
     /// Contains `images-{arch}/` symlinks to nix store linkFarms.
     pub dir: TempDir,
     pub tag: String,
+}
+
+/// How [`Provider::gateway_endpoint`] reached the gateway's SSH port.
+///
+/// `rsb`/`cpt` previously routed unconditionally through `kubectl port-forward`
+/// (the [`Provider::tunnel`] path); a port-forward death mid-build
+/// drops the ssh-ng connection (sh-011, observed iter3 T+~1800s). The
+/// NLB hostname (`.status.loadBalancer.ingress[].hostname`) is the
+/// durable endpoint when the operator's source IP is in
+/// `loadBalancerSourceRanges` — `Direct` carries it. `Tunnel` is the
+/// fallback when the NLB is unreachable (internal scheme, source-CIDR
+/// reject, still provisioning) or the provider has no NLB (k3s).
+pub enum GatewayEndpoint {
+    /// `ssh-ng://rio@{host}:{port}` — no local process; survives an
+    /// xtask-side port-forward death.
+    Direct { host: String, port: u16 },
+    /// `ssh-ng://rio@localhost:{port}` via `kubectl port-forward`.
+    /// Dropping `_guard` tears the tunnel down.
+    Tunnel { port: u16, _guard: ProcessGuard },
+}
+
+impl GatewayEndpoint {
+    /// `ssh-ng://` store URL for this endpoint, with `ssh-key=` set to
+    /// the private half of `RIO_SSH_PUBKEY`.
+    pub fn store_url(&self, key: &std::path::Path) -> String {
+        let (host, port) = match self {
+            Self::Direct { host, port } => (host.as_str(), *port),
+            Self::Tunnel { port, .. } => ("localhost", *port),
+        };
+        format!(
+            "ssh-ng://rio@{host}:{port}?compress=true&ssh-key={}",
+            key.display()
+        )
+    }
+
+    /// Label for the `info!` line in `with_remote_store`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Direct { .. } => "direct (NLB)",
+            Self::Tunnel { .. } => "tunnel (port-forward)",
+        }
+    }
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -114,7 +157,28 @@ pub trait Provider: Send + Sync {
     /// `local_port = 0` binds an ephemeral port; the returned port is
     /// the one actually bound — build store URLs from that. Drop the
     /// guard to tear down.
-    async fn tunnel(&self, local_port: u16) -> Result<(u16, super::shared::ProcessGuard)>;
+    async fn tunnel(&self, local_port: u16) -> Result<(u16, ProcessGuard)>;
+
+    /// Resolve the durable gateway SSH endpoint for `rsb`/`cpt`.
+    ///
+    /// Additive sibling to [`Provider::tunnel`] (which stays for
+    /// callers that WANT a local port — `stress.rs:94`'s multi-port
+    /// loop; `qa/ctx.rs` open-codes `shared::port_forward` directly
+    /// and is a separate sibling-sweep). Default impl is `Tunnel` via
+    /// `self.tunnel(local_port)` — k3s and the `phases.rs` test mock
+    /// inherit it. EKS overrides: probe `gateway_lb_hostname` with an
+    /// SSH-banner read (stronger than bare `TcpStream::connect` — an
+    /// NLB that accepts but has no healthy backend would pass connect
+    /// and hang the banner) → `Direct` on success, `Tunnel` fallback
+    /// on refusal/timeout (`loadBalancerSourceRanges` rejecting the
+    /// operator's source IP is the expected refusal case).
+    ///
+    /// `local_port` is the bind hint for the `Tunnel` fallback; `0`
+    /// binds ephemerally. Ignored for `Direct`.
+    async fn gateway_endpoint(&self, local_port: u16) -> Result<GatewayEndpoint> {
+        let (port, _guard) = self.tunnel(local_port).await?;
+        Ok(GatewayEndpoint::Tunnel { port, _guard })
+    }
 
     /// Open port-forwards to scheduler:9001 and store:9002, waiting
     /// until both accept TCP. Drop the guards to tear down. Unlike
@@ -150,5 +214,46 @@ pub fn get(kind: ProviderKind) -> Arc<dyn Provider> {
     match kind {
         ProviderKind::K3s => Arc::new(super::k3s::K3s),
         ProviderKind::Eks => Arc::new(super::eks::Eks),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// sh-011 red-first: `Direct` formats the NLB hostname into the
+    /// store URL (not `localhost`). RED at base: `GatewayEndpoint` does
+    /// not exist.
+    #[test]
+    fn gateway_endpoint_store_url_direct() {
+        let ep = GatewayEndpoint::Direct {
+            host: "abc.elb.us-west-2.amazonaws.com".into(),
+            port: 22,
+        };
+        assert_eq!(
+            ep.store_url(std::path::Path::new("/k")),
+            "ssh-ng://rio@abc.elb.us-west-2.amazonaws.com:22?compress=true&ssh-key=/k"
+        );
+        assert_eq!(ep.kind(), "direct (NLB)");
+    }
+
+    /// sh-011 red-first: an unreachable host:port (refused) MUST yield
+    /// `None` from the banner probe so `Eks::gateway_endpoint` takes
+    /// the port-forward fallback arm. RED at base: `ssh_banner` is
+    /// `127.0.0.1`-only (single `port` arg).
+    #[tokio::test]
+    async fn gateway_endpoint_probe_unreachable_falls_back() {
+        let probed = tokio::time::timeout(
+            Duration::from_secs(3),
+            crate::k8s::eks::smoke::ssh_banner("127.0.0.1", 1),
+        )
+        .await
+        .ok()
+        .flatten();
+        assert!(
+            probed.is_none(),
+            "refused port must not satisfy banner probe"
+        );
     }
 }

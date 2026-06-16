@@ -62,7 +62,7 @@ pub async fn tunnel(local_port: u16) -> Result<(u16, ProcessGuard)> {
     let (port, guard) = port_forward(NS, "svc/rio-gateway", local_port, 22).await?;
     ui::poll_debug("reading SSH banner", Duration::from_secs(2), 10, || async {
         Ok(
-            tokio::time::timeout(Duration::from_secs(3), chaos::ssh_banner(port))
+            tokio::time::timeout(Duration::from_secs(3), chaos::ssh_banner("127.0.0.1", port))
                 .await
                 .ok()
                 .flatten(),

@@ -4,7 +4,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::config::XtaskConfig;
-use crate::k8s::provider::{BuiltImages, DeployOpts, Provider};
+use crate::k8s::provider::{BuiltImages, DeployOpts, GatewayEndpoint, Provider};
+use crate::k8s::{NS, client as kube};
 use crate::{sh, tofu, ui};
 
 pub mod ami;
@@ -85,6 +86,36 @@ impl Provider for Eks {
 
     async fn tunnel(&self, local_port: u16) -> Result<(u16, crate::k8s::shared::ProcessGuard)> {
         smoke::gateway_port_forward(local_port).await
+    }
+
+    async fn gateway_endpoint(&self, local_port: u16) -> Result<GatewayEndpoint> {
+        // sh-011: prefer the NLB hostname over a port-forward — a
+        // kubectl port-forward death mid-build drops the ssh-ng
+        // connection. Probe with a banner read (not bare connect): an
+        // NLB whose targets are all unhealthy still ACCEPTS, and
+        // `loadBalancerSourceRanges` rejecting our source IP refuses —
+        // both correctly fall through to the port-forward arm.
+        let client = kube::client().await?;
+        if let Ok(host) = kube::gateway_lb_hostname(&client, NS).await {
+            let reached = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                smoke::ssh_banner(&host, 22),
+            )
+            .await
+            .ok()
+            .flatten();
+            if reached.is_some() {
+                tracing::info!(%host, "gateway NLB reachable; using direct endpoint");
+                return Ok(GatewayEndpoint::Direct { host, port: 22 });
+            }
+            tracing::info!(%host, "gateway NLB unreachable (source-CIDR / provisioning?); falling back to port-forward");
+        } else {
+            tracing::info!(
+                "gateway Service has no LoadBalancer ingress yet; falling back to port-forward"
+            );
+        }
+        let (port, _guard) = smoke::gateway_port_forward(local_port).await?;
+        Ok(GatewayEndpoint::Tunnel { port, _guard })
     }
 
     async fn tunnel_grpc(

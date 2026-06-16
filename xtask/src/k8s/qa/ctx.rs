@@ -175,12 +175,13 @@ impl QaCtx {
             Duration::from_secs(2),
             20,
             || async move {
-                Ok(
-                    tokio::time::timeout(Duration::from_secs(2), smoke::ssh_banner(port))
-                        .await
-                        .ok()
-                        .flatten(),
+                Ok(tokio::time::timeout(
+                    Duration::from_secs(2),
+                    smoke::ssh_banner("127.0.0.1", port),
                 )
+                .await
+                .ok()
+                .flatten())
             },
         )
         .await?;
@@ -239,7 +240,7 @@ async fn gateway_build(key: PathBuf, expr: String) -> Result<String> {
         20,
         || async move {
             Ok(
-                tokio::time::timeout(Duration::from_secs(2), smoke::ssh_banner(port))
+                tokio::time::timeout(Duration::from_secs(2), smoke::ssh_banner("127.0.0.1", port))
                     .await
                     .ok()
                     .flatten(),

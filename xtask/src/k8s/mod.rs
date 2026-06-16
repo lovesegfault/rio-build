@@ -783,16 +783,15 @@ where
     // only fires if xtask exited cleanly; SIGKILL/panic leaks it).
     // The new tunnel would then bind fine but route to the OLD NLB —
     // surfacing as the "type 80" SSH error 30s later. Reap first.
+    // (Harmless when `gateway_endpoint` resolves `Direct` — the port
+    // is unused — but a stale listener is still worth reaping.)
     if port != 0 {
         shared::kill_port_listeners(port);
     }
-    let (port, _guard) = ui::step("establish tunnel", || p.tunnel(port)).await?;
+    let ep = ui::step("resolve gateway endpoint", || p.gateway_endpoint(port)).await?;
 
-    let store = format!(
-        "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",
-        key.display()
-    );
-    info!("store: {store}");
+    let store = ep.store_url(&key);
+    info!("gateway endpoint: {} → {store}", ep.kind());
 
     let shell = sh::shell()?;
     // I-149/I-161: ServerAliveInterval — see `shared::NIX_SSHOPTS_BASE`.

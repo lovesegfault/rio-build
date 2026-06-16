@@ -440,7 +440,7 @@ pub async fn gateway_port_forward(local_port: u16) -> Result<(u16, ProcessGuard)
         crate::k8s::shared::port_forward(NS, "svc/rio-gateway", local_port, 22).await?;
     ui::poll_debug("reading SSH banner", Duration::from_secs(3), 25, || async {
         Ok(
-            tokio::time::timeout(Duration::from_secs(3), ssh_banner(port))
+            tokio::time::timeout(Duration::from_secs(3), ssh_banner("127.0.0.1", port))
                 .await
                 .ok()
                 .flatten(),
@@ -450,14 +450,19 @@ pub async fn gateway_port_forward(local_port: u16) -> Result<(u16, ProcessGuard)
     Ok((port, guard))
 }
 
-/// Connect to `127.0.0.1:port` and read the server's SSH version
-/// string. russh waits for the CLIENT's banner before sending its own
-/// (RFC 4253 §4.2 doesn't mandate order), so write ours first.
-pub async fn ssh_banner(port: u16) -> Option<()> {
+/// Connect to `host:port` and read the server's SSH version string.
+/// russh waits for the CLIENT's banner before sending its own (RFC
+/// 4253 §4.2 doesn't mandate order), so write ours first.
+///
+/// Parameterized over `host` so [`Eks::gateway_endpoint`] can probe
+/// the NLB hostname directly — banner-read is a stronger reachability
+/// signal than bare `TcpStream::connect` (an NLB that accepts but has
+/// no healthy target would pass connect and never reply).
+///
+/// [`Eks::gateway_endpoint`]: crate::k8s::provider::Provider::gateway_endpoint
+pub async fn ssh_banner(host: &str, port: u16) -> Option<()> {
     use tokio::io::AsyncWriteExt;
-    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .ok()?;
+    let mut sock = tokio::net::TcpStream::connect((host, port)).await.ok()?;
     sock.write_all(b"SSH-2.0-xtask-probe\r\n").await.ok()?;
     let mut buf = [0u8; 12];
     sock.read_exact(&mut buf).await.ok()?;
