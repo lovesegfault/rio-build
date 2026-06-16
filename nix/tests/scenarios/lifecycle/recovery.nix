@@ -49,6 +49,20 @@ scope: with scope; ''
       old_leader = leader_pod()
       print(f"recovery: pre-kill leader = {old_leader}")
 
+      # Snapshot recovery_total on the pre-kill leader. Taken AFTER
+      # the q==0/r==0 settle and BEFORE the :98 kill — NOT after the
+      # lease-moved gate (s3-delta-snapshot-race): snapshotting there
+      # would capture base=1 from the already-recovered new leader on
+      # a fast path and the delta wait would seek >=2 forever. The
+      # lease-moved gate guarantees the delta-wait below takes the
+      # leader-CHANGED branch (snap leader == old_leader, killed at
+      # :98; new leader is a fresh process whose counter starts at 0
+      # and the wait is for >=1).
+      recovery_snap = sched_metric_snapshot(
+          '^rio_scheduler_recovery_total[{]outcome="success"[}] '
+      )
+      print(f"recovery: pre-kill recovery_total snap = {recovery_snap}")
+
       # Backgrounded slow build. `nohup ... < /dev/null &` fully
       # detaches (no stdin read, no HUP on shell exit). client.execute
       # (not .succeed): returns immediately, no exit-code check.
@@ -119,18 +133,29 @@ scope: with scope; ''
       )
       print(f"recovery: new leader = {new_leader}")
 
-      # New leader ran recovery. EXACTLY 1.0: this pod was the
-      # standby, it never ran recovery before (LeaderAcquired never
-      # fired for it). Fresh acquisition → exactly one recovery. If
-      # the replacement pod somehow won the lease race instead, same
-      # thing — fresh process, first acquire, recovery_total = 1.
+      # New leader ran recovery. Delta-wait (NOT absolute grep -qx
+      # for `... 1`): this is the load-robust convergence gate after
+      # the strike-4 wall-clock-under-load timeouts (1ef4cc6bd
+      # carried-forward to r27). The structural assertion is a delta
+      # from a baseline captured on a KNOWN pod before the kill, with
+      # an explicit fresh-process branch — not an absolute that races
+      # whether recovery has already fired by the time we resolve the
+      # leader. The lease-moved gate above guarantees `cur != snap`
+      # is the expected path: standby (or replacement) is a fresh
+      # process whose counter starts at 0, so the wait is for >=1.
+      #
+      # The EXACTLY-ONCE property (recovery_total == 1, no spurious
+      # re-acquires) is checked separately at the end-of-subtest
+      # assert below; this wait is convergence only.
       #
       # wait_until_succeeds (not one-shot): recovery runs in the
       # LeaderAcquired handler, asynchronously after lease acquire.
       # There's a small window where lease moved but recovery hasn't
       # finished yet.
-      sched_metric_wait(
-          "grep -qx 'rio_scheduler_recovery_total{outcome=\"success\"} 1'",
+      sched_metric_wait_delta(
+          recovery_snap,
+          '^rio_scheduler_recovery_total[{]outcome="success"[}] ',
+          delta=1,
           timeout=300,
       )
 

@@ -455,6 +455,77 @@ let
             )
             raise
 
+    # Delta-based variant for counters that may RESET across leader
+    # failover. The absolute `sched_metric_wait` above races whether a
+    # post-failover counter has already reached its target by the time
+    # we scrape (s3-delta-snapshot-race): snapshotting AFTER the
+    # lease-moved gate captures base=1 from the already-recovered new
+    # leader on a fast path and waits for >=2 forever. Instead the
+    # caller takes a (leader, value) snapshot from a KNOWN leader
+    # BEFORE any failover, and the wait branches on whether that
+    # leader still holds.
+    #
+    # `metric_re` is an awk-regex string matching exactly one prom
+    # series line (no single-quote, no slash; use [{] / [}] for
+    # literal braces — portable across awk variants). Same regex form
+    # for both snapshot and wait so they agree on the series. The awk
+    # body has NO `exit` after print: succeed() runs under
+    # `set -o pipefail`, so awk closing stdin early would SIGPIPE
+    # kubectl (exit 141) and fail the command even though the value
+    # was extracted.
+    def sched_metric_snapshot(metric_re):
+        """One-shot (leader, value) capture for delta-based waits.
+        Value defaults to 0.0 when the series is absent (fresh
+        process, never emitted yet)."""
+        snap_leader = leader_pod()
+        raw = k3s_server.succeed(
+            "k3s kubectl get --raw "
+            f"'{proxy_url(snap_leader, 9091)}' "
+            f"| awk '/{metric_re}/{{print $2}}'"
+        ).strip()
+        return (snap_leader, float(raw) if raw else 0.0)
+
+    def sched_metric_wait_delta(snapshot, metric_re, delta=1, timeout=300):
+        """Wait until the CURRENT leader's series (matched by
+        metric_re) has advanced by >= `delta` from `snapshot`.
+        Branches on leader identity: same leader -> cur >= snap+delta;
+        leader CHANGED (fresh process, counter reset) -> cur >= delta.
+        awk `+0` coerces empty/float prom values for numeric compare."""
+        snap_leader, snap_value = snapshot
+        try:
+            k3s_server.wait_until_succeeds(
+                "cur=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+                "  -o jsonpath='{.spec.holderIdentity}') && "
+                'test -n "$cur" && '
+                'v=$(k3s kubectl get --raw '
+                '"/api/v1/namespaces/${ns}/pods/$cur:9091/proxy/metrics" '
+                f"| awk '/{metric_re}/{{print $2}}') && "
+                f'if [ "$cur" = "{snap_leader}" ]; then '
+                f'  awk -v c="$v" -v b={snap_value} -v d={delta} '
+                "'BEGIN{exit !(c+0 >= b+0+d)}'; "
+                "else "
+                f'  awk -v c="$v" -v d={delta} '
+                "'BEGIN{exit !(c+0 >= d)}'; "
+                "fi",
+                timeout=timeout,
+            )
+        except Exception:
+            k3s_server.execute(
+                "echo '=== DIAG[sched_metric_wait_delta]: "
+                f"timeout={timeout}s snap=({snap_leader},{snap_value}) "
+                f"delta={delta} ===' >&2; "
+                "cur=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+                "  -o jsonpath='{.spec.holderIdentity}'); "
+                'echo "cur_leader=$cur" >&2; '
+                'k3s kubectl get --raw '
+                '"/api/v1/namespaces/${ns}/pods/$cur:9091/proxy/metrics" '
+                "  2>/dev/null | grep rio_scheduler_recovery_total >&2 || true; "
+                'k3s kubectl -n ${ns} logs "$cur" --since=2m '
+                "  | grep -iE 'recover|lease|leader' "
+                "  | grep -vE '\"level\":\"DEBUG\"' | tail -40 >&2 || true"
+            )
+            raise
+
     # NOTE: the stream-era `wait_workers_zero` helper (the
     # heartbeat-timeout-bounded workers_active==0 precondition) was
     # removed at the T-1c.2b corpus re-point. Pull-mode pods never
