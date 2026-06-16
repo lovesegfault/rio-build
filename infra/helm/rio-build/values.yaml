@@ -627,6 +627,19 @@ scheduler:
       - {name: best-effort}
     defaultTier: normal
     probe: {cpu: 16, memPerCore: 1073741824, memBase: 34359738368, deadlineSecs: 3600}
+    # sh-008: per-soft-feature cold-start probe override. big-parallel
+    # cold-starts at 48c (3× the default probe.cpu) — the explore
+    # ladder's first rung is the only sizing signal nixpkgs declared.
+    featureProbes:
+      big-parallel: {cpu: 48, memPerCore: 2147483648, memBase: 34359738368, deadlineSecs: 7200}
+    # sh-008: per-soft-feature SIZING bias. Restricts the SLA candidate
+    # hwClass set to those whose per-class core ceiling hosts ≥
+    # minCores. Bias not constraint — degrades to the unbiased set when
+    # no class qualifies. featureProbes is "first-attempt cold-start
+    # shape"; this is "regardless of fit, candidate classes must host
+    # ≥ minCores"; they compose.
+    softFeatureSizing:
+      big-parallel: {minCores: 32}
     # §13c-3: global cores/mem ceiling. Unset (the default) → derived
     # at boot from `describe_instance_types` ∩ requirements (Spot
     # only). Set explicitly to cap below the largest catalog type, OR

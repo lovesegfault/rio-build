@@ -414,9 +414,18 @@ let
       # "pre-r2-untwinned"; reason = "..."; }; }. P1 demands a live-import
       # falsify twin for every holds-invariant leaf unless exempted here.
       vacuityExempt ? { },
+      # sh-008: requiredSystemFeatures for the wrapping derivation. A
+      # heavy exhaustive check (modelTimeoutSec ≥ ~1800, hundreds of
+      # millions of states) declares "big-parallel" so the scheduler's
+      # soft_feature_sizing.min_cores bias routes it to a ≥32-core
+      # hwClass instead of the 16-core reference cell. Default empty —
+      # do NOT eagerly tag every check; a follow-on sweep can audit the
+      # measured-runtime budgets.
+      requiredSystemFeatures ? [ ],
     }:
     pkgs.runCommand "quint-${name}"
       {
+        inherit requiredSystemFeatures;
         nativeBuildInputs = [ pkgs.quint ];
         # bug_383: the SAME binding that sizes the JVM below — exported
         # for gen_matrix.py's heavy-shard isolation.
@@ -553,9 +562,12 @@ let
       workers ? null,
       # Same semantics as mkQuintCheck's modelTimeoutSec.
       modelTimeoutSec ? 1800,
+      # Same semantics as mkQuintCheck's requiredSystemFeatures (sh-008).
+      requiredSystemFeatures ? [ ],
     }:
     pkgs.runCommand "quint-${name}"
       {
+        inherit requiredSystemFeatures;
         nativeBuildInputs = [ pkgs.quint ];
         # bug_383: the SAME binding that sizes the JVM below — exported
         # for gen_matrix.py's heavy-shard isolation (a check raised
@@ -8114,6 +8126,11 @@ rec {
         "noRemarkFromLatchedEpisode"
       ];
       modelTimeoutSec = 1800;
+      # sh-008: 209M states / 7m29s @ workers=auto (measured above) —
+      # big-parallel routes this to a ≥32-core hwClass via the
+      # scheduler's soft_feature_sizing.min_cores bias instead of the
+      # 16-core reference cell.
+      requiredSystemFeatures = [ "big-parallel" ];
     };
 
     # Falsify twin (live-import, calibration/): the as-built split

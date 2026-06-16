@@ -135,6 +135,12 @@ mem_per_core = {{ int64 $p.memPerCore }}
 mem_base = {{ int64 $p.memBase }}
 deadline_secs = {{ int64 (default 3600 $p.deadlineSecs) }}
 {{- end }}
+{{- /* sh-008: per-soft-feature min_cores h_all bias. */}}
+{{- range $feat, $hint := .softFeatureSizing }}
+
+[sla.soft_feature_sizing.{{ $feat | quote }}]
+min_cores = {{ int64 $hint.minCores }}
+{{- end }}
 {{- range .tiers }}
 
 [[sla.tiers]]

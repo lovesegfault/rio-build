@@ -398,6 +398,7 @@
         "deadline_secs": 3600
       },
       "feature_probes": {},
+      "soft_feature_sizing": {},
       "max_cores": null,
       "max_mem": null,
       "max_disk": 6442450944,
