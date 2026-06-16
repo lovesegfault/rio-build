@@ -3005,7 +3005,8 @@ module leaderElection {
   /// step. Production threads them through TWO lifetime levels — the
   /// guard runtime drains the lease loop's `step_down()` PATCH
   /// (bug_118), AND the process owner `GuardJoin::join()`s the guard
-  /// thread before `main()` returns (bug_023). The calibration
+  /// thread before `main()` returns (bug_023; both rio-controller and
+  /// rio-scheduler — sched.lease.guard-isolated). The calibration
   /// override lease-023-unjoined-guard swaps the release for a
   /// nondeterministic `landed` to model process exit aborting the
   /// in-flight PATCH; gracefulHandover must fall there.
