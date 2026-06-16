@@ -3652,12 +3652,20 @@ impl DagActor {
         let trigger_set: HashSet<Uuid> = interested_builds.iter().copied().collect();
         let mut check_builds: HashSet<Uuid> = trigger_set.clone();
         check_builds.extend(skipped_interested);
-        for build_id in check_builds {
+        // sh-007c S5: collect-then-batch — same shape as the
+        // dispatch.rs per-build tail. Per-build ordering preserved:
+        // each build sees Progress (loop 1) before its terminal_event
+        // and BuildCompleted (loop 2).
+        let check_builds: Vec<Uuid> = check_builds.into_iter().collect();
+        let mut counts: Vec<(Uuid, u32, u32, u32)> = Vec::with_capacity(check_builds.len());
+        for &build_id in &check_builds {
             // I-140: build_summary is O(dag_nodes). Compute ONCE per
             // build, share between counts-persist and progress-emit.
             // Previously each fn ran its own scan → 2× per completion.
             let summary = self.dag.build_summary(build_id);
-            self.update_build_counts_with(build_id, &summary).await;
+            if let Some((t, c, h)) = self.update_build_counts_with(build_id, &summary) {
+                counts.push((build_id, t, c, h));
+            }
             // Progress snapshot AFTER update_ancestors (critpath is
             // fresh — root priority dropped when this drv went
             // terminal) and BEFORE check_build_completion (which may
@@ -3670,6 +3678,9 @@ impl DagActor {
             // _with bypasses debounce: completion always carries
             // user-visible state change, and the scan is already paid.
             self.emit_progress_with(build_id, &summary);
+        }
+        self.persist_build_counts_batch(&counts).await;
+        for &build_id in &check_builds {
             // r[impl gw.activity.progress-before-stop]
             // Per-drv terminal event AFTER Progress: nom marks an
             // actBuild ✔ only when Progress.done increments while the

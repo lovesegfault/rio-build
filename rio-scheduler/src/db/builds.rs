@@ -108,24 +108,47 @@ impl SchedulerDb {
 
     /// Persist denormalized derivation counts to `builds` (I-103).
     /// Best-effort write — caller logs and continues on error.
-    pub(crate) async fn persist_build_counts(
+    ///
+    /// One UNNEST UPDATE for N builds (sh-007c S5 — replaces the
+    /// per-build singular). Same best-effort, unfenced posture as the
+    /// retired singular — these are display-only denormalized counts,
+    /// recovery
+    /// re-runs the in-mem accounting for active builds, so a missed
+    /// write self-heals on failover. The actor's per-build-tail loops
+    /// (`complete_ready_from_store_batch` / `release_downstream`)
+    /// collect `(build_id, total, completed, cached)` tuples and issue
+    /// ONE call instead of N serial RTTs.
+    pub(crate) async fn persist_build_counts_batch(
         &self,
-        build_id: Uuid,
-        total: u32,
-        completed: u32,
-        cached: u32,
+        rows: &[(Uuid, u32, u32, u32)],
     ) -> Result<(), sqlx::Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<Uuid> = rows.iter().map(|(id, ..)| *id).collect();
+        // u32→i32: column is INTEGER (migration 030); same explicit
+        // wrap-clamp as the singular.
+        let totals: Vec<i32> = rows
+            .iter()
+            .map(|(_, t, ..)| i32::try_from(*t).unwrap_or(i32::MAX))
+            .collect();
+        let completeds: Vec<i32> = rows
+            .iter()
+            .map(|(_, _, c, _)| i32::try_from(*c).unwrap_or(i32::MAX))
+            .collect();
+        let cacheds: Vec<i32> = rows
+            .iter()
+            .map(|(.., c)| i32::try_from(*c).unwrap_or(i32::MAX))
+            .collect();
         sqlx::query(
-            "UPDATE builds SET total_drvs = $2, completed_drvs = $3, cached_drvs = $4
-             WHERE build_id = $1",
+            "UPDATE builds SET total_drvs = u.t, completed_drvs = u.c, cached_drvs = u.h \
+               FROM UNNEST($1::uuid[], $2::int[], $3::int[], $4::int[]) AS u(id, t, c, h) \
+              WHERE builds.build_id = u.id",
         )
-        .bind(build_id)
-        // u32→i32: column is INTEGER (migration 030). A build with
-        // >2^31 derivations is impossible (in-memory DAG, 10k mailbox)
-        // but make the wrap explicit instead of `as`-silent.
-        .bind(i32::try_from(total).unwrap_or(i32::MAX))
-        .bind(i32::try_from(completed).unwrap_or(i32::MAX))
-        .bind(i32::try_from(cached).unwrap_or(i32::MAX))
+        .bind(&ids)
+        .bind(&totals)
+        .bind(&completeds)
+        .bind(&cacheds)
         .execute(&self.pool)
         .await?;
         Ok(())

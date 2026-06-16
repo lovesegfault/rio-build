@@ -509,20 +509,31 @@ impl DagActor {
 
     pub(super) async fn update_build_counts(&mut self, build_id: Uuid) {
         let summary = self.dag.build_summary(build_id);
-        self.update_build_counts_with(build_id, &summary).await;
+        if let Some((total, completed, cached)) = self.update_build_counts_with(build_id, &summary)
+        {
+            self.persist_build_counts_batch(&[(build_id, total, completed, cached)])
+                .await;
+        }
     }
 
     /// `update_build_counts` with a precomputed summary — for callers
     /// that also `emit_progress_with` so the O(dag_nodes) `build_summary`
     /// scan runs once, not twice (I-140).
-    pub(super) async fn update_build_counts_with(
+    ///
+    /// In-mem half only (sh-007c S5): updates `build.{completed,
+    /// failed}_count` and RETURNS the `(total, completed, cached)`
+    /// tuple to persist; the caller collects across N builds and
+    /// issues ONE [`Self::persist_build_counts_batch`]. `None` when
+    /// the build is unknown or settled (the
+    /// `r[sched.build.terminal-status-settled]` freeze applies to BOTH
+    /// the in-mem mutation and the persisted row — a `None` return
+    /// excludes the row from the batch).
+    pub(super) fn update_build_counts_with(
         &mut self,
         build_id: Uuid,
         summary: &crate::dag::BuildSummary,
-    ) {
-        let Some(build) = self.builds.get_mut(&build_id) else {
-            return;
-        };
+    ) -> Option<(u32, u32, u32)> {
+        let build = self.builds.get_mut(&build_id)?;
         // r[impl sched.build.terminal-status-settled+3]
         // A settled build's accounting is frozen at the terminal
         // transition — in memory AND in PG. Without this gate, a
@@ -531,7 +542,7 @@ impl DagActor {
         // counts from the mutated DAG: `builds.completed_drvs` shrinks
         // below total on a Succeeded row (merged_bug_097's PG leg).
         if build.settled().is_some() {
-            return;
+            return None;
         }
         build.completed_count = summary.completed;
         build.failed_count = summary.failed;
@@ -546,16 +557,29 @@ impl DagActor {
         let total = build.total_count;
         let completed = build.recovered_completed + summary.completed;
         let cached = build.cached_count;
+        Some((total, completed, cached))
+    }
+
+    /// Actor-level wrapper for [`SchedulerDb::persist_build_counts_batch`]
+    /// — best-effort, logs and continues on error. ALL three
+    /// `update_build_counts_with` callers route through here (the
+    /// `update_build_counts` single-item wrapper, the
+    /// `complete_ready_from_store_batch` per-build tail, and
+    /// `release_downstream`). Early-returns on empty input so a
+    /// settled-only batch records ZERO calls (the
+    /// `phase17_join3_under_half_fence` `≤1` bound).
+    ///
+    /// [`SchedulerDb::persist_build_counts_batch`]: crate::db::SchedulerDb::persist_build_counts_batch
+    pub(super) async fn persist_build_counts_batch(&mut self, rows: &[(Uuid, u32, u32, u32)]) {
+        if rows.is_empty() {
+            return;
+        }
         #[cfg(test)]
         self.test_counters
             .persist_build_counts_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if let Err(e) = self
-            .db
-            .persist_build_counts(build_id, total, completed, cached)
-            .await
-        {
-            debug!(build_id = %build_id, error = %e,
+        if let Err(e) = self.db.persist_build_counts_batch(rows).await {
+            debug!(n = rows.len(), error = %e,
                    "failed to persist build counts (best-effort)");
         }
     }

@@ -63,8 +63,8 @@ async fn test_activate_build_tx_missing_build_errors() -> anyhow::Result<()> {
 }
 
 /// I-103: list_builds reads denormalized count columns directly — no
-/// build_derivations/derivations join. persist_build_counts writes
-/// them; the migration backfill seeds existing rows.
+/// build_derivations/derivations join. persist_build_counts_batch
+/// writes them; the migration backfill seeds existing rows.
 #[tokio::test]
 async fn test_list_builds_denorm_counts_roundtrip() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -91,7 +91,8 @@ async fn test_list_builds_denorm_counts_roundtrip() -> anyhow::Result<()> {
     // Persist + re-read. No build_derivations rows exist — proves the
     // SELECT no longer joins (the old query would've returned 0 from
     // the COUNT regardless of these column values).
-    db.persist_build_counts(build_id, 100, 50, 12).await?;
+    db.persist_build_counts_batch(&[(build_id, 100, 50, 12)])
+        .await?;
     let (_, rows) = db.list_builds(None, None, 10, 0).await?;
     let row = rows.iter().find(|r| r.build_id == build_id).unwrap();
     assert_eq!(row.total_derivations, 100);

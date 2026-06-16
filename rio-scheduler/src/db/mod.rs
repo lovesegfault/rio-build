@@ -152,7 +152,7 @@ pub struct SchedulerDb {
 
 /// Row from `list_builds` / `list_builds_keyset`. Single-table read
 /// (builds only, I-103) — counts are denormalized columns maintained
-/// by `persist_build_counts` at merge + completion time. Replaces the
+/// by `persist_build_counts_batch` at merge + completion time. Replaces the
 /// old 4-table join which was O(Σ drvs across all builds) regardless
 /// of LIMIT.
 ///

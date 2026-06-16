@@ -869,7 +869,14 @@ impl DagActor {
                 *cached_per_build.entry(build_id).or_default() += 1;
             }
         }
-        for (build_id, n) in cached_per_build {
+        // sh-007c S5: collect the per-build counts tuples and persist
+        // ONCE (UNNEST UPDATE on `builds`) before the
+        // `check_build_completion` loop — replaces N serial
+        // `persist_build_counts` RTTs at the iter3 actor profile's
+        // phase-17 hot path.
+        let cached_builds: Vec<(Uuid, u32)> = cached_per_build.into_iter().collect();
+        let mut counts: Vec<(Uuid, u32, u32, u32)> = Vec::with_capacity(cached_builds.len());
+        for &(build_id, n) in &cached_builds {
             // r[impl sched.build.terminal-status-settled+3]
             // Dispatch-time store hits can fan out to resident terminal
             // builds that retained interest on the shared node (a
@@ -884,8 +891,13 @@ impl DagActor {
             }
             // I-140: one build_summary scan shared, not two.
             let summary = self.dag.build_summary(build_id);
-            self.update_build_counts_with(build_id, &summary).await;
+            if let Some((t, c, h)) = self.update_build_counts_with(build_id, &summary) {
+                counts.push((build_id, t, c, h));
+            }
             self.emit_progress_with(build_id, &summary);
+        }
+        self.persist_build_counts_batch(&counts).await;
+        for &(build_id, _) in &cached_builds {
             self.check_build_completion(build_id).await;
         }
     }
