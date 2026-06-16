@@ -1112,8 +1112,15 @@ impl DagActor {
                 .and_then(|b| b.tenant_id)
             {
                 self.upsert_path_tenants_for_batch(
-                    &completed_batch,
-                    &crate::db::live_pins::StampProvenance::ProbedBy(probe_tenant),
+                    &completed_batch
+                        .iter()
+                        .map(|h| {
+                            (
+                                h.clone(),
+                                crate::db::live_pins::StampProvenance::ProbedBy(probe_tenant),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
                 )
                 .await;
             }
@@ -1342,8 +1349,15 @@ impl DagActor {
             if let Some(probe_tenant) = self.builds.get(&ingest.build_id).and_then(|b| b.tenant_id)
             {
                 self.upsert_path_tenants_for_batch(
-                    &preexisting_completed,
-                    &crate::db::live_pins::StampProvenance::ProbedBy(probe_tenant),
+                    &preexisting_completed
+                        .iter()
+                        .map(|h| {
+                            (
+                                h.clone(),
+                                crate::db::live_pins::StampProvenance::ProbedBy(probe_tenant),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
                 )
                 .await;
             }

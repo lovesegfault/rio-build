@@ -965,9 +965,9 @@ impl DagActor {
     /// [`upsert_path_tenants_for`]: Self::upsert_path_tenants_for
     pub(super) async fn upsert_path_tenants_for_batch(
         &self,
-        drv_hashes: &[DrvHash],
-        provenance: &crate::db::live_pins::StampProvenance,
+        items: &[(DrvHash, crate::db::live_pins::StampProvenance)],
     ) {
+        use crate::db::live_pins::StampProvenance;
         use sha2::Digest;
         let mut hashes: Vec<Vec<u8>> = Vec::new();
         let mut tids: Vec<Uuid> = Vec::new();
@@ -975,7 +975,7 @@ impl DagActor {
         // (output path hash, drv_path) pairs, one fill round-trip.
         let mut deriver_hashes: Vec<Vec<u8>> = Vec::new();
         let mut deriver_paths: Vec<String> = Vec::new();
-        for drv_hash in drv_hashes {
+        for (drv_hash, provenance) in items {
             let Some(state) = self.dag.node(drv_hash) else {
                 continue;
             };
@@ -990,9 +990,32 @@ impl DagActor {
             if tenant_ids.is_empty() {
                 continue;
             }
-            // Signed Q2: the lawful pairs derive from the witness —
-            // THE one body shared with the single-drv wrapper.
+            // Signed Q2: the lawful pairs derive from the per-drv
+            // witness — THE one body shared with the single-drv
+            // wrapper. The belt-and-braces consistency checks
+            // (formerly at `upsert_path_tenants_raw`) sit HERE,
+            // per-drv, where each item's own provenance is in scope:
+            // a coalesced batch carries N independent `WalkVerified`
+            // maps and merging them would over-stamp under
+            // floating-CA path collision (the `lawful_pairs`
+            // intersection at live_pins.rs is per-map).
+            let drv_mark = hashes.len();
             provenance.lawful_pairs(&state.output_paths, &tenant_ids, &mut hashes, &mut tids);
+            if let StampProvenance::ProbedBy(probe_tenant) = provenance {
+                debug_assert!(
+                    tids[drv_mark..].iter().all(|t| t == probe_tenant),
+                    "ProbedBy stamps carry exactly the probing tenant"
+                );
+            }
+            if let StampProvenance::WalkVerified(verified) = provenance {
+                debug_assert!(
+                    hashes[drv_mark..]
+                        .iter()
+                        .zip(tids[drv_mark..].iter())
+                        .all(|(h, t)| verified.get(h.as_slice()).is_some_and(|v| v.contains(t))),
+                    "WalkVerified stamps are within the wire-carried sets"
+                );
+            }
             for p in &state.output_paths {
                 deriver_hashes.push(sha2::Sha256::digest(p.as_bytes()).to_vec());
                 deriver_paths.push(state.drv_path().to_string());
@@ -1001,14 +1024,10 @@ impl DagActor {
         if hashes.is_empty() {
             return;
         }
-        if let Err(e) = self
-            .db
-            .upsert_path_tenants_raw(&hashes, &tids, provenance)
-            .await
-        {
+        if let Err(e) = self.db.upsert_path_tenants_raw(&hashes, &tids).await {
             warn!(
                 ?e,
-                drvs = drv_hashes.len(),
+                drvs = items.len(),
                 pairs = hashes.len(),
                 "batched path_tenants upsert failed; GC retention may under-retain"
             );
@@ -1020,7 +1039,7 @@ impl DagActor {
         {
             warn!(
                 ?e,
-                drvs = drv_hashes.len(),
+                drvs = items.len(),
                 "batched deriver-linkage fill failed (best-effort; identity \
                  re-association degrades until a re-stamp)"
             );
@@ -3207,8 +3226,15 @@ impl DagActor {
             // a per-tenant view), so it could never authorize a
             // ProbedBy stamp.
             self.upsert_path_tenants_for_batch(
-                &skipped,
-                &crate::db::live_pins::StampProvenance::BuiltLocally,
+                &skipped
+                    .iter()
+                    .map(|h| {
+                        (
+                            h.clone(),
+                            crate::db::live_pins::StampProvenance::BuiltLocally,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
             )
             .await;
             let skipped_refs: Vec<&str> = skipped.iter().map(|h| h.as_str()).collect();

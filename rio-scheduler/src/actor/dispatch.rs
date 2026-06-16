@@ -412,8 +412,10 @@ impl DagActor {
         // live tenant and folds — merged_bug_028) — the all-tenant
         // stamp is lawful here.
         self.complete_ready_from_store_batch(
-            &locally_present,
-            &crate::db::live_pins::StampProvenance::AllTenantProbe,
+            &locally_present
+                .into_iter()
+                .map(|h| (h, crate::db::live_pins::StampProvenance::AllTenantProbe))
+                .collect::<Vec<_>>(),
         )
         .await;
         // The probe-partition creation site — the standalone fenced
@@ -738,10 +740,9 @@ impl DagActor {
     // (the Success/moot-covered arms complete through this same chokepoint).
     pub(super) async fn complete_ready_from_store_batch(
         &mut self,
-        hashes: &[DrvHash],
-        provenance: &crate::db::live_pins::StampProvenance,
+        items: &[(DrvHash, crate::db::live_pins::StampProvenance)],
     ) {
-        if hashes.is_empty() {
+        if items.is_empty() {
             return;
         }
         #[cfg(test)]
@@ -754,8 +755,10 @@ impl DagActor {
             output_paths: Vec<String>,
             interested: HashSet<Uuid>,
         }
-        let mut ok: Vec<Done> = Vec::with_capacity(hashes.len());
-        for drv_hash in hashes {
+        let mut ok: Vec<Done> = Vec::with_capacity(items.len());
+        let mut ok_items: Vec<(DrvHash, crate::db::live_pins::StampProvenance)> =
+            Vec::with_capacity(items.len());
+        for (drv_hash, provenance) in items {
             let Some(state) = self.dag.node_mut(drv_hash) else {
                 continue;
             };
@@ -780,6 +783,7 @@ impl DagActor {
                 output_paths: state.output_paths.clone(),
                 interested: state.interested_builds.clone(),
             });
+            ok_items.push((drv_hash.clone(), provenance.clone()));
         }
         if ok.is_empty() {
             return;
@@ -795,8 +799,7 @@ impl DagActor {
         let ok_refs: Vec<&str> = ok_hashes.iter().map(|h| h.as_str()).collect();
         self.persist_status_batch(&ok_refs, DerivationStatus::Completed)
             .await;
-        self.upsert_path_tenants_for_batch(&ok_hashes, provenance)
-            .await;
+        self.upsert_path_tenants_for_batch(&ok_items).await;
 
         // Batched promote: dedup find_newly_ready across all completed
         // hashes, transition in-mem, then one

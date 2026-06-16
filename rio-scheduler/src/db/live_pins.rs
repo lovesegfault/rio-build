@@ -36,7 +36,7 @@ use crate::state::DrvHash;
 /// * merge-time cache hits / CA-cutoff →
 ///   [`ProbedBy`](Self::ProbedBy) (single-evidence probe — stamps
 ///   ONLY the probing tenant).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum StampProvenance {
     /// Per-path wire-carried verified-tenant sets, keyed by
     /// sha256(store_path).
@@ -193,8 +193,7 @@ impl SchedulerDb {
         let mut hashes: Vec<Vec<u8>> = Vec::new();
         let mut tids: Vec<Uuid> = Vec::new();
         provenance.lawful_pairs(output_paths, tenant_ids, &mut hashes, &mut tids);
-        self.upsert_path_tenants_raw(&hashes, &tids, provenance)
-            .await
+        self.upsert_path_tenants_raw(&hashes, &tids).await
     }
 
     /// Pre-flattened variant of [`upsert_path_tenants`]: caller has
@@ -209,27 +208,15 @@ impl SchedulerDb {
         &self,
         hashes: &[Vec<u8>],
         tids: &[Uuid],
-        provenance: &StampProvenance,
     ) -> Result<u64, sqlx::Error> {
         debug_assert_eq!(hashes.len(), tids.len());
-        // Belt-and-braces at the final funnel (signed Q2): the pairs
-        // must be consistent with the witness even when a caller
-        // pre-flattened them.
-        if let StampProvenance::ProbedBy(probe_tenant) = provenance {
-            debug_assert!(
-                tids.iter().all(|t| t == probe_tenant),
-                "ProbedBy stamps carry exactly the probing tenant"
-            );
-        }
-        if let StampProvenance::WalkVerified(verified) = provenance {
-            debug_assert!(
-                hashes
-                    .iter()
-                    .zip(tids.iter())
-                    .all(|(h, t)| verified.get(h.as_slice()).is_some_and(|v| v.contains(t))),
-                "WalkVerified stamps are within the wire-carried sets"
-            );
-        }
+        // Belt-and-braces signed-Q2 provenance debug-asserts (the
+        // ProbedBy single-tenant and WalkVerified within-wire-set
+        // checks) live at the per-drv `lawful_pairs` callsites — that
+        // is the chokepoint, and the batched
+        // `upsert_path_tenants_for_batch` flattens many drvs each
+        // with its OWN provenance into one (hashes, tids) pair, so a
+        // single-provenance check here would be unsound.
         if hashes.is_empty() {
             return Ok(0);
         }

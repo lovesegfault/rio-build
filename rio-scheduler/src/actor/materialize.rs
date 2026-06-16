@@ -2846,10 +2846,10 @@ impl DagActor {
                     // INTERSECT them (a path is stamped only for
                     // tenants whose view validated it; absent entries
                     // stamp nothing).
-                    self.complete_ready_from_store_batch(
-                        std::slice::from_ref(drv_hash),
-                        &crate::db::live_pins::StampProvenance::WalkVerified(walk_verified),
-                    )
+                    self.complete_ready_from_store_batch(&[(
+                        drv_hash.clone(),
+                        crate::db::live_pins::StampProvenance::WalkVerified(walk_verified),
+                    )])
                     .await;
                 }
             }
