@@ -414,13 +414,21 @@ pub(super) async fn grpc_put_path(
 /// `nar_reader` must yield exactly `nar_size` bytes; short read = error.
 /// Caller is responsible for the `nar_size <= MAX_NAR_SIZE` check.
 ///
-/// NOT retried on `Aborted` (unlike [`grpc_put_path`]): the reader is
-/// consumed and the bytes are forwarded as they arrive, so there's
-/// nothing to replay. In practice this path only fires for oversize
-/// (>DRV_NAR_BUFFER_LIMIT) entries — the I-068 collision case is .drv
-/// files, which always go through the buffered path.
+/// NOT replayed on `Aborted` (unlike [`grpc_put_path`]): the reader is
+/// consumed and the bytes are forwarded as they arrive, so there is
+/// nothing to replay. sh-004: an `Aborted` carrying the I-068
+/// placeholder-contention message ([`rio_proto::CONCURRENT_PUTPATH_MSG`])
+/// instead enters wait-then-adopt — the pump already drains exactly
+/// `nar_size` bytes regardless (the early-Ok wire-positioning contract
+/// below), so the lane backs off via [`PUT_PATH_BACKOFF`], polls
+/// [`grpc_query_path_info`], and returns `Ok(false)` once the
+/// concurrent uploader's path exists. The retry budget and the
+/// `rio_gateway_putpath_aborted_retries_total{attempt}` emit are
+/// shared with the buffered lane (single-axis schema; same
+/// store-side contention, same curve, same dashboard cell).
+// r[impl gw.put.aborted-retry]
 pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
-    store_client: &StoreServiceClient<Channel>,
+    store_client: &mut StoreServiceClient<Channel>,
     jwt_token: Option<&str>,
     service_signer: Option<&rio_auth::hmac::HmacSigner>,
     info: ValidatedPathInfo,
@@ -439,6 +447,7 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     // reader — the size is knowable up front, so the store reserves
     // single-shot pre-stream instead of charging chunk-by-chunk
     // while holding.
+    let store_path = info.store_path.clone();
     let mut raw: types::PathInfo = info.into();
     raw.nar_hash = Vec::new();
     raw.nar_size = 0;
@@ -563,8 +572,66 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     // swallowed rpc error behind a winning pump error stays uncounted
     // by design: one operation, one terminal observation).
     pump_result.map_err(surface_put_path_failure_any)?;
-    let resp = rpc_result.map_err(|s| anyhow::Error::from(surface_put_path_failure(s)))?;
-    Ok(resp.into_inner().created)
+    let status = match rpc_result {
+        Ok(resp) => return Ok(resp.into_inner().created),
+        // bug_118: the surfacing fn IS the emit site — the store's
+        // failure observation counts here, retried-by-adopt or
+        // terminal (one operation, one observation; the buffered
+        // lane's loop-head emit has the same shape).
+        Err(status) => surface_put_path_failure(status),
+    };
+    // sh-004: wait-then-adopt on the I-068 placeholder-contention
+    // Aborted. The reader is already drained to `nar_size` (the pump's
+    // rx-dropped arm above), so the framed reader stays positioned for
+    // the caller; the lane polls for the concurrent uploader's result
+    // instead of replaying. Precedent: rio-builder upload/single.rs
+    // is_concurrent_put_path → wait-then-adopt.
+    if status.code() == tonic::Code::Aborted
+        && status.message().contains(rio_proto::CONCURRENT_PUTPATH_MSG)
+    {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            // Single-axis {attempt} — shared schema with the buffered
+            // lane's emit above (same store-side contention, same
+            // dashboard cell; no lane label).
+            metrics::counter!(
+                "rio_gateway_putpath_aborted_retries_total",
+                "attempt" => attempt.to_string(),
+            )
+            .increment(1);
+            if attempt >= PUT_PATH_ABORTED_MAX_ATTEMPTS {
+                tracing::warn!(
+                    %store_path,
+                    attempts = attempt,
+                    "PutPath (streaming): concurrent uploader still absent \
+                     after wait-then-adopt budget; surfacing"
+                );
+                return Err(status.into());
+            }
+            let delay = PUT_PATH_BACKOFF.duration(attempt - 1);
+            tracing::debug!(
+                %store_path,
+                attempt,
+                backoff = ?delay,
+                "PutPath (streaming): store Aborted (concurrent PutPath); \
+                 polling for the concurrent uploader's result"
+            );
+            tokio::time::sleep(delay).await;
+            if grpc_query_path_info(store_client, jwt_token, store_path.as_str())
+                .await?
+                .is_some()
+            {
+                tracing::debug!(
+                    %store_path,
+                    attempt,
+                    "PutPath (streaming): adopted concurrent uploader's result"
+                );
+                return Ok(false);
+            }
+        }
+    }
+    Err(status.into())
 }
 
 /// Fetch NAR data from store via gRPC GetPath.
@@ -756,7 +823,7 @@ mod tests {
             // Unavailable; the lane is non-retried by design, so the
             // failure is TERMINAL — and must still emit.
             store.faults.fail_next_puts.store(1, SeqCst);
-            let client = rio_proto::StoreServiceClient::connect(format!("http://{addr}"))
+            let mut client = rio_proto::StoreServiceClient::connect(format!("http://{addr}"))
                 .await
                 .expect("connect");
             let info = put_info("/nix/store/cccccccccccccccccccccccccccccccc-strm-1.0");
@@ -764,7 +831,7 @@ mod tests {
             hex::decode_to_slice(NAR_FIXTURE_SHA256, &mut nar_hash).expect("fixture hex");
             let mut reader = std::io::Cursor::new(NAR_FIXTURE.to_vec());
             let res = grpc_put_path_streaming(
-                &client,
+                &mut client,
                 None,
                 None,
                 info,
