@@ -1707,6 +1707,126 @@ impl DagActor {
         }
     }
 
+    /// Batched [`Self::create_materialization_job`] for the §2.1
+    /// probe-partition lane (sh-007c S5): one fenced
+    /// [`SchedulerDb::create_materialization_jobs_batch_fenced`] over
+    /// N drvs instead of N serial `begin_fenced` round-trips. Uniform
+    /// `origin`, no `creating_build` / no `carried_realized_paths` —
+    /// the dispatch-probe partition (`batch_probe_cached_ready`)
+    /// passes `CacheOpportunity, None, None` for every row, so the
+    /// in-tx core's carried-paths inner loop is a no-op. Per-result
+    /// post-processing (view feed, reset mirror, wanted-relation
+    /// backfill) is unchanged from the singular — the batching gain is
+    /// the ONE fenced create.
+    ///
+    /// `housekeeping.rs` and `merge.rs` still call the per-drv
+    /// singular (out of the phase-17 hot path; sibling-sweep
+    /// candidates).
+    ///
+    /// [`SchedulerDb::create_materialization_jobs_batch_fenced`]: crate::db::SchedulerDb::create_materialization_jobs_batch_fenced
+    pub(super) async fn create_materialization_jobs_batch(
+        &mut self,
+        drv_hashes: &[DrvHash],
+        origin: JobOrigin,
+    ) {
+        if !self.leader.is_leader() || drv_hashes.is_empty() {
+            return;
+        }
+        struct Prep {
+            hash: DrvHash,
+            db_id: Uuid,
+            tenant: Option<Uuid>,
+        }
+        let prep: Vec<Prep> = drv_hashes
+            .iter()
+            .filter_map(|h| {
+                let state = self.dag.node(h)?;
+                let db_id = state.db_id?;
+                let tenant = state
+                    .interested_builds
+                    .iter()
+                    .filter_map(|bid| self.builds.get(bid))
+                    .find_map(|b| b.tenant_id);
+                Some(Prep {
+                    hash: h.clone(),
+                    db_id,
+                    tenant,
+                })
+            })
+            .collect();
+        if prep.is_empty() {
+            return;
+        }
+        let rows: Vec<crate::db::materialization::NewJobRow<'_>> = prep
+            .iter()
+            .map(|p| crate::db::materialization::NewJobRow {
+                derivation_id: p.db_id,
+                drv_hash: p.hash.as_str(),
+                tenant_id: p.tenant,
+                origin,
+                carried_realized_paths: None,
+            })
+            .collect();
+        let serving_generation = self.serving_generation();
+        match self
+            .db
+            .create_materialization_jobs_batch_fenced(&rows, serving_generation)
+            .await
+        {
+            Ok(crate::db::materialization::FencedBatchJobCreate::Applied(results)) => {
+                for (p, r) in prep.iter().zip(results.iter()) {
+                    self.feed_job_view_entry(&p.hash, r.job_id, r.created, None)
+                        .await;
+                    if r.created {
+                        metrics::counter!(
+                            "rio_scheduler_materialization_jobs_created_total",
+                            "origin" => origin.as_str()
+                        )
+                        .increment(1);
+                        self.mirror_job_creation_reset(&p.hash);
+                    }
+                    if r.upgraded {
+                        metrics::counter!(
+                            "rio_scheduler_materialization_jobs_origin_upgraded_total"
+                        )
+                        .increment(1);
+                    }
+                    let live_interested: Vec<Uuid> = {
+                        use crate::state::BuildStateExt;
+                        self.dag
+                            .node(&p.hash)
+                            .map(|s| {
+                                s.interested_builds
+                                    .iter()
+                                    .filter(|bid| {
+                                        self.builds
+                                            .get(bid)
+                                            .is_some_and(|b| !b.state().is_terminal())
+                                    })
+                                    .copied()
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
+                    for build_id in live_interested {
+                        self.record_wanted_for_build_node(build_id, &p.hash).await;
+                    }
+                }
+            }
+            Ok(crate::db::materialization::FencedBatchJobCreate::Fenced) => {
+                self.note_fenced_evidence_write("materialization job create");
+            }
+            Err(e) => {
+                // No carrier at stake on the dispatch-probe lane: a
+                // fenced/failed create is re-probed by the next
+                // dispatch pass (self-healing).
+                warn!(n = prep.len(), error = %e,
+                      "materialization job batch create failed (best-effort; \
+                       re-probed by the next dispatch pass)");
+            }
+        }
+    }
+
     /// Standalone fenced wanted-relation write for one (build, node)
     /// pair — the probe-partition path's interest registration (the
     /// merge path writes the relation for all nodes inside its own tx).

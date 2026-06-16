@@ -131,6 +131,19 @@ pub(crate) enum FencedJobCreate {
     Fenced,
 }
 
+/// Batched [`FencedJobCreate`] (sh-007c S5): the fence verdict is
+/// batch-level (one `begin_fenced` / one commit), application is
+/// per-input-row in input order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FencedBatchJobCreate {
+    /// The write applied. One [`JobCreateResult`] per input row, in
+    /// input order.
+    Applied(Vec<JobCreateResult>),
+    /// The serving generation is below the claims floor: the
+    /// transaction rolled back having written nothing for ANY row.
+    Fenced,
+}
+
 /// Outcome of the batched moot-job sweep
 /// ([`SchedulerDb::resolve_moot_jobs_and_close_attempts_fenced`]):
 /// the whole sweep is ONE fenced transaction, so the fence verdict is
@@ -358,6 +371,35 @@ impl SchedulerDb {
             created,
             upgraded,
         })
+    }
+
+    /// Multi-row [`Self::create_materialization_job_fenced`] (sh-007c
+    /// S5): one `begin_fenced` + one
+    /// [`Self::create_materialization_jobs_in_tx`] + one commit for N
+    /// rows. Per-row heterogeneous `origin`/`carried` (the
+    /// dispatch-probe partition passes `CacheOpportunity`/`None` for
+    /// every row, so the in-tx core's carried-paths inner loop is a
+    /// no-op there). Same standalone-fenced posture as the singular —
+    /// callers with NO enclosing transaction (the §2.1 probe-partition
+    /// sites; the merge sites use the in-tx core inside their own
+    /// fenced tx instead).
+    pub(crate) async fn create_materialization_jobs_batch_fenced(
+        &self,
+        rows: &[NewJobRow<'_>],
+        serving_generation: ServingGeneration,
+    ) -> Result<FencedBatchJobCreate, sqlx::Error> {
+        if rows.is_empty() {
+            return Ok(FencedBatchJobCreate::Applied(Vec::new()));
+        }
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            FencedBegin::Fenced { .. } => return Ok(FencedBatchJobCreate::Fenced),
+            FencedBegin::Open(ftx) => ftx,
+        };
+        let created =
+            Self::create_materialization_jobs_in_tx(tx.conn(), rows, serving_generation.as_i64())
+                .await?;
+        tx.commit().await?;
+        Ok(FencedBatchJobCreate::Applied(created))
     }
 
     /// The store-poll query: pending, not parked, no active assignment

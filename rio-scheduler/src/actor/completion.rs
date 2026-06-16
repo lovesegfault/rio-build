@@ -732,10 +732,11 @@ impl DagActor {
     /// Composed from [`Self::persist_status_batch_db`] (the
     /// `&SchedulerDb`-only PG await) +
     /// [`Self::handle_persist_status_batch_result`] (the `&mut self`
-    /// Fenced note / Err-arm latch). The split exists so phase-17 can
-    /// `try_join!` the PG half against another `&self` PG await and
-    /// apply the latch after — `&mut self` across the await would
-    /// otherwise force serial.
+    /// Fenced note / Err-arm latch). The split exists so phase-17's
+    /// 3-way `try_join!` can hold THREE `&self`/`&self.db` borrows
+    /// (Completed ∥ tenants ∥ Ready) and apply BOTH latches serially
+    /// after — `&mut self` across the await would otherwise force
+    /// serial.
     ///
     /// [`persist_status`]: Self::persist_status
     // r[impl sched.evidence.durability+4]

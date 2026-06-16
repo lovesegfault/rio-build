@@ -108,6 +108,7 @@ impl DagActor {
         let Some(store) = &self.store_client else {
             return HashSet::new();
         };
+        let started = std::time::Instant::now();
         let probe_gen = self.probe_generation;
         // Candidate set: (drv_hash, output_paths). Collected up-front
         // so the FindMissingPaths borrow doesn't hold &self.dag across
@@ -420,17 +421,19 @@ impl DagActor {
         .await;
         // The probe-partition creation site — the standalone fenced
         // helper, no enclosing transaction (design §2.1 row 3).
-        for drv_hash in &to_create_job {
-            // No carrier at stake on this lane: a fenced/failed create
-            // is re-probed by the next dispatch pass (self-healing).
-            let _retried_by_next_probe = self
-                .create_materialization_job(
-                    drv_hash,
-                    crate::state::JobOrigin::CacheOpportunity,
-                    None,
-                    None,
-                )
-                .await;
+        // sh-007c S5: one fenced batch over `to_create_job` (was N
+        // serial `begin_fenced` round-trips). Defense-in-depth: skip
+        // when the sweep has already crossed `SELF_FENCE_AFTER/2` —
+        // the lease loop is guard-isolated so this no longer
+        // self-fences, but the batch's commit is best skipped past the
+        // budget the WARN above names; the next probe_generation
+        // re-probes (self-healing, no carrier at stake on this lane).
+        if started.elapsed() * 2 <= rio_lease::SELF_FENCE_AFTER {
+            self.create_materialization_jobs_batch(
+                &to_create_job,
+                crate::state::JobOrigin::CacheOpportunity,
+            )
+            .await;
         }
         checked
     }
@@ -798,20 +801,74 @@ impl DagActor {
 
         let ok_hashes: Vec<DrvHash> = ok.iter().map(|d| d.hash.clone()).collect();
         let ok_refs: Vec<&str> = ok_hashes.iter().map(|h| h.as_str()).collect();
-        // sh-007b S3-lite (advisory §6 row 6, partial): the Completed
-        // persist (`derivations` table) and the path-tenant/deriver
-        // upsert (`path_tenants`/`narinfo`) write disjoint tables with
-        // no FK or row-ordering dependency — join them. ~2× phase-17
-        // on a contended PG (iter1: 5-7s → ~3-4s). The PG await is the
-        // `&SchedulerDb`-only half so both arms hold `&self`; the
-        // `&mut self` Err-arm latch is applied AFTER the join. Ready
-        // (below) stays serial: it depends on the in-mem
-        // `find_newly_ready` walk that follows. Infallible error type:
-        // both arms are best-effort and never propagate, so
-        // `try_join!` never short-circuits — the macro is the
-        // run-concurrently primitive, not an error funnel.
+
+        // Batched promote: dedup find_newly_ready across all completed
+        // hashes, transition in-mem, then one
+        // persist_status_batch(Ready). Same shape as the
+        // ca_cutoff_cascade batched-promote. sh-007c S5 hoist: this
+        // walk depends only on in-mem `dag.node(h).status` (every
+        // `ok` row already transitioned Completed at the top of this
+        // fn), NOT the PG write — so it runs BEFORE the join and the
+        // Ready persist becomes the join's third arm.
+        let mut newly_ready: Vec<DrvHash> = Vec::new();
+        let mut seen_ready: HashSet<DrvHash> = HashSet::new();
+        for h in &ok_hashes {
+            for ready_hash in self.dag.find_newly_ready(h) {
+                if !seen_ready.insert(ready_hash.clone()) {
+                    continue;
+                }
+                if let Some(s) = self.dag.node_mut(&ready_hash)
+                    && s.transition(DerivationStatus::Ready).is_ok()
+                {
+                    newly_ready.push(ready_hash);
+                }
+            }
+        }
+        // Disjoint-rows witness: a node going Completed is never its
+        // own dependent — `Completed→Ready` is invalid, so
+        // `s.transition(Ready)` above structurally rejects any
+        // `ok_hashes` member. The two `derivations`-table writes
+        // therefore touch disjoint row sets and the join holds.
+        debug_assert!(
+            {
+                let ok_set: HashSet<&str> = ok_refs.iter().copied().collect();
+                newly_ready.iter().all(|h| !ok_set.contains(h.as_str()))
+            },
+            "newly_ready ∩ ok_hashes must be empty (Completed→Ready invalid)"
+        );
+        let ready_refs: Vec<&str> = newly_ready.iter().map(|h| h.as_str()).collect();
+
+        // sh-007c S5 (3-way join, the §Nth-strike option-b on-actor
+        // re-decision): Completed persist (`derivations` rows
+        // `ok_refs`) ∥ path-tenant/deriver upsert
+        // (`path_tenants`/`narinfo`) ∥ Ready persist (`derivations`
+        // rows `ready_refs`). Disjoint rows (the debug_assert above)
+        // and disjoint tables for the tenant arm — no FK or
+        // row-ordering dependency. Both `_db` arms hold `&self.db`;
+        // the two `&mut self` Err-arm latches run AFTER the join,
+        // serially. Infallible error type: every arm is best-effort
+        // and never propagates, so `try_join!` never short-circuits —
+        // the macro is the run-concurrently primitive, not an error
+        // funnel.
+        //
+        // **Commit-order weakening (subtraction-only for the in-mem
+        // actor):** the Completed and Ready batches are now two
+        // INDEPENDENT `begin_fenced` txns on separate pool
+        // connections, so PG commit order between them is
+        // nondeterministic. Benign on this store-hit-only path: this
+        // fn is reached only when outputs ARE durably in the store
+        // (cache-hit / materialization-success); a recovered Ready
+        // dependent whose dep's status row is stale still has its
+        // inputs durably in the store, and recovery's A2.5 rider
+        // (`recovery.rs` `revert_target_for` →
+        // `test_recovery_heals_corrupted_ready`) maps a
+        // Ready-with-unbuilt-deps row back to Queued at failover, then
+        // the dep re-probes as a store hit on the next tick —
+        // one-tick efficiency cost only. FRESH-WRITE-ONLY,
+        // `transition_build` DB-first invariant, fence-coverage
+        // census, and ack-after-durable are UNTOUCHED.
         let generation = self.serving_generation();
-        let Ok((status_r, ())) = tokio::try_join!(
+        let Ok((completed_r, (), ready_r)) = tokio::try_join!(
             async {
                 Ok::<_, std::convert::Infallible>(
                     Self::persist_status_batch_db(
@@ -827,30 +884,20 @@ impl DagActor {
                 self.upsert_path_tenants_for_batch(&ok_items).await;
                 Ok(())
             },
+            async {
+                Ok::<_, std::convert::Infallible>(
+                    Self::persist_status_batch_db(
+                        &self.db,
+                        &ready_refs,
+                        DerivationStatus::Ready,
+                        generation,
+                    )
+                    .await,
+                )
+            },
         );
-        self.handle_persist_status_batch_result(&ok_refs, DerivationStatus::Completed, status_r);
-
-        // Batched promote: dedup find_newly_ready across all completed
-        // hashes, transition in-mem, then one
-        // persist_status_batch(Ready). Same shape as the
-        // ca_cutoff_cascade batched-promote.
-        let mut newly_ready: Vec<DrvHash> = Vec::new();
-        let mut seen_ready: HashSet<DrvHash> = HashSet::new();
-        for h in &ok_hashes {
-            for ready_hash in self.dag.find_newly_ready(h) {
-                if !seen_ready.insert(ready_hash.clone()) {
-                    continue;
-                }
-                if let Some(s) = self.dag.node_mut(&ready_hash)
-                    && s.transition(DerivationStatus::Ready).is_ok()
-                {
-                    newly_ready.push(ready_hash);
-                }
-            }
-        }
-        let ready_refs: Vec<&str> = newly_ready.iter().map(|h| h.as_str()).collect();
-        self.persist_status_batch(&ready_refs, DerivationStatus::Ready)
-            .await;
+        self.handle_persist_status_batch_result(&ok_refs, DerivationStatus::Completed, completed_r);
+        self.handle_persist_status_batch_result(&ready_refs, DerivationStatus::Ready, ready_r);
 
         // Per-build (not per-drv): emit one cached event per (drv,
         // interested-build), then a single summary scan + counts +
