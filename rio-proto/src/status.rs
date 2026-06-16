@@ -26,7 +26,18 @@ impl From<NixStatus> for BuildResultStatus {
             NixStatus::AlreadyValid | NixStatus::ResolvesToAlreadyValid => {
                 BuildResultStatus::AlreadyValid
             }
-            NixStatus::PermanentFailure => BuildResultStatus::PermanentFailure,
+            // sh-012 (E3a/E3b split): the daemon's heuristic exit!=0
+            // classification is the executor-VARIANT case — the verdict
+            // CAN differ between executors (compute-bound on a small
+            // node vs. a genuine compile error are indistinguishable to
+            // nix-daemon). The scheduler's distinct-executor poison
+            // threshold gates the conclusion (E3a) instead of poisoning
+            // on first observation. The derivation-INTRINSIC permanent
+            // statuses below (CachedFailure, DependencyFailed,
+            // LogLimitExceeded, OutputRejected, NotDeterministic,
+            // InputRejected) keep their own values and stay
+            // first-observation poison (E3b).
+            NixStatus::PermanentFailure => BuildResultStatus::ExecutorVariantFailure,
             NixStatus::TransientFailure => BuildResultStatus::TransientFailure,
             NixStatus::CachedFailure => BuildResultStatus::CachedFailure,
             NixStatus::DependencyFailed => BuildResultStatus::DependencyFailed,
@@ -36,9 +47,10 @@ impl From<NixStatus> for BuildResultStatus {
             NixStatus::TimedOut => BuildResultStatus::TimedOut,
             NixStatus::NotDeterministic => BuildResultStatus::NotDeterministic,
             // MiscFailure is nix-daemon's own catch-all (used when it can't
-            // classify). PermanentFailure is the honest proto equivalent —
-            // "it failed, we don't know why, don't retry."
-            NixStatus::MiscFailure => BuildResultStatus::PermanentFailure,
+            // classify). Executor-variant: "it failed, we don't know why" —
+            // the scheduler decides whether to retry via the
+            // distinct-executor threshold (sh-012, E3a).
+            NixStatus::MiscFailure => BuildResultStatus::ExecutorVariantFailure,
             // Workers run with `substitute = false` (WORKER_NIX_CONF) — we
             // never ask the daemon to substitute. If we see this, something
             // is misconfigured; PermanentFailure + the error_msg is the
@@ -54,7 +66,12 @@ impl From<BuildResultStatus> for NixStatus {
             BuildResultStatus::Built => NixStatus::Built,
             BuildResultStatus::Substituted => NixStatus::Substituted,
             BuildResultStatus::AlreadyValid => NixStatus::AlreadyValid,
-            BuildResultStatus::PermanentFailure => NixStatus::PermanentFailure,
+            // sh-012: ExecutorVariantFailure is rio's threshold-gated
+            // refinement of the daemon's PermanentFailure; the gateway's
+            // client sees the daemon's vocabulary unchanged.
+            BuildResultStatus::PermanentFailure | BuildResultStatus::ExecutorVariantFailure => {
+                NixStatus::PermanentFailure
+            }
             BuildResultStatus::TransientFailure => NixStatus::TransientFailure,
             BuildResultStatus::CachedFailure => NixStatus::CachedFailure,
             BuildResultStatus::DependencyFailed => NixStatus::DependencyFailed,
@@ -91,9 +108,13 @@ mod tests {
     #[test]
     fn nix_to_proto_exhaustive_and_stable() {
         let one_to_one = [
+            // sh-012: PermanentFailure → ExecutorVariantFailure (the
+            // E3a/E3b chokepoint). The reverse map (proto→nix) still
+            // sends ExecutorVariantFailure → PermanentFailure, so the
+            // round-trip below covers it.
             (
                 NixStatus::PermanentFailure,
-                BuildResultStatus::PermanentFailure,
+                BuildResultStatus::ExecutorVariantFailure,
             ),
             (
                 NixStatus::TransientFailure,
@@ -125,7 +146,7 @@ mod tests {
         }
         assert_eq!(
             BuildResultStatus::from(NixStatus::MiscFailure),
-            BuildResultStatus::PermanentFailure
+            BuildResultStatus::ExecutorVariantFailure
         );
         assert_eq!(
             BuildResultStatus::from(NixStatus::NoSubstituters),
@@ -166,6 +187,19 @@ mod tests {
         assert_eq!(
             NixStatus::from(BuildResultStatus::Unspecified),
             NixStatus::MiscFailure
+        );
+        // sh-012: the threshold-gated variant maps back to the daemon's
+        // PermanentFailure for the gateway→client path. Wire-compat
+        // note: an old gateway that doesn't know value 15 maps it to
+        // Unspecified → MiscFailure (the existing fallback above) —
+        // benign for selfhost (single-version cluster).
+        assert_eq!(
+            NixStatus::from(BuildResultStatus::ExecutorVariantFailure),
+            NixStatus::PermanentFailure
+        );
+        assert_eq!(
+            NixStatus::from(BuildResultStatus::PermanentFailure),
+            NixStatus::PermanentFailure
         );
     }
 }

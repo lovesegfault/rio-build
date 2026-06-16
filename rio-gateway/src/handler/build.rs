@@ -724,7 +724,8 @@ impl TerminalScope {
             | S::InfrastructureFailure
             | S::TimedOut
             | S::NotDeterministic
-            | S::InputRejected => TerminalScope::Failure,
+            | S::InputRejected
+            | S::ExecutorVariantFailure => TerminalScope::Failure,
         }
     }
 }

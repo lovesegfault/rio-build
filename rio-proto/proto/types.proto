@@ -32,6 +32,13 @@ enum BuildResultStatus {
   BUILD_RESULT_STATUS_TIMED_OUT = 12;      // Configured timeout exceeded; scheduler treats as permanent-no-reassign
   BUILD_RESULT_STATUS_NOT_DETERMINISTIC = 13; // nix-daemon --check / repeat-build mismatch (reproducibility triage)
   BUILD_RESULT_STATUS_INPUT_REJECTED = 14; // nix-daemon rejected .drv inputs (distinct from OutputRejected post-build hash mismatch)
+  // sh-012: nix-daemon's heuristic exit!=0 (PermanentFailure) and unclassified (MiscFailure).
+  // The verdict CAN vary by executor (compute-bound on a small node vs. genuine compile error are
+  // indistinguishable at the daemon), so the scheduler's distinct-executor poison threshold gates
+  // the poison instead of first-observation. The intrinsic-permanent statuses (CachedFailure,
+  // DependencyFailed, LogLimitExceeded, OutputRejected, NotDeterministic, InputRejected) keep
+  // their own values and stay first-observation.
+  BUILD_RESULT_STATUS_EXECUTOR_VARIANT_FAILURE = 15;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
