@@ -4345,6 +4345,23 @@ condition, and the response-anchoring premise (the renew attempt deadline
 keeps the response-anchored fence within the commit-anchored bound the
 model assumes) so no constant moves without the others.
 
+#r("sched.lease.guard-isolated")[
+  The lease renew loop MUST run on a dedicated `current_thread` tokio
+  runtime on its own OS thread (the guard domain), not the
+  `#[tokio::main]` runtime the dag-actor and gRPC server share. A long
+  actor turn (a `Tick` past `SELF_FENCE_AFTER` --- the sh-002 Stage B
+  16.35s `17-ready-cache-sweep`) MUST NOT starve renewal: the guard
+  domain stays schedulable when the working domain is not, so
+  `maybe_self_fence` cannot trip on admitted-load starvation alone. The
+  guard hosts the kill-wired surfaces (lease renewal, an axum
+  `/healthz`+`/readyz` server on `:9194`, and the runtime-skew
+  sentinel); `tonic_health` stays on the main gRPC server (the
+  `BalancedChannel` leader-probe surface). The guard thread's join
+  token is linear: the process owner MUST `GuardJoin::join()` it after
+  the working domain drains so the lease loop's graceful-release PATCH
+  lands before exit (`sys.epilogue.drain`; the bug_023 lifecycle level).
+]
+
 #r("sched.lease.standby-drops-writes+4")[
   A replica that has lost the lease MUST NOT write scheduler-owned PG state
   (`derivations`, `realisations`, `build_samples`). The enforcement is the
