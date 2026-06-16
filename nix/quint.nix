@@ -424,36 +424,38 @@ let
       requiredSystemFeatures ? [ ],
     }:
     pkgs.runCommand "quint-${name}"
-      {
-        inherit requiredSystemFeatures;
-        nativeBuildInputs = [ pkgs.quint ];
-        # bug_383: the SAME binding that sizes the JVM below — exported
-        # for gen_matrix.py's heavy-shard isolation.
-        meta.serverHeapMb = serverHeapMb;
-        # bughunt-2 (slot 11): wiring facts for the quint-policy lint — the
-        # only channel besides the parse IR that policy enforcement reads.
-        meta.quintPolicy = {
-          kind = "holds";
-          inherit spec main extraSpecs;
-          inherit invariants;
-          step = if step == null then "step" else step;
-          inherit vacuityExempt;
-        };
-        # Only the named .qnt files. A model that imports another file
-        # (a shared harness, an override module's parent model) extends
-        # the fileset via extraSpecs — keeping it narrow means an
-        # unrelated docs/ edit doesn't re-run every quint check.
-        src = lib.fileset.toSource {
-          root = modelsDir;
-          fileset = lib.fileset.unions (map (s: modelsDir + "/${s}.qnt") ([ spec ] ++ extraSpecs));
-        };
-        # Surfaced in `nix log` and error messages.
-        env = {
-          MODEL = spec;
-          MAIN = main;
-          MODEL_TIMEOUT_SEC = toString modelTimeoutSec;
-        };
-      }
+      (
+        lib.optionalAttrs (requiredSystemFeatures != [ ]) { inherit requiredSystemFeatures; }
+        // {
+          nativeBuildInputs = [ pkgs.quint ];
+          # bug_383: the SAME binding that sizes the JVM below — exported
+          # for gen_matrix.py's heavy-shard isolation.
+          meta.serverHeapMb = serverHeapMb;
+          # bughunt-2 (slot 11): wiring facts for the quint-policy lint — the
+          # only channel besides the parse IR that policy enforcement reads.
+          meta.quintPolicy = {
+            kind = "holds";
+            inherit spec main extraSpecs;
+            inherit invariants;
+            step = if step == null then "step" else step;
+            inherit vacuityExempt;
+          };
+          # Only the named .qnt files. A model that imports another file
+          # (a shared harness, an override module's parent model) extends
+          # the fileset via extraSpecs — keeping it narrow means an
+          # unrelated docs/ edit doesn't re-run every quint check.
+          src = lib.fileset.toSource {
+            root = modelsDir;
+            fileset = lib.fileset.unions (map (s: modelsDir + "/${s}.qnt") ([ spec ] ++ extraSpecs));
+          };
+          # Surfaced in `nix log` and error messages.
+          env = {
+            MODEL = spec;
+            MAIN = main;
+            MODEL_TIMEOUT_SEC = toString modelTimeoutSec;
+          };
+        }
+      )
       ''
         set -euo pipefail
         # Both backends write working files under the cwd (apalache:
@@ -566,34 +568,36 @@ let
       requiredSystemFeatures ? [ ],
     }:
     pkgs.runCommand "quint-${name}"
-      {
-        inherit requiredSystemFeatures;
-        nativeBuildInputs = [ pkgs.quint ];
-        # bug_383: the SAME binding that sizes the JVM below — exported
-        # for gen_matrix.py's heavy-shard isolation (a check raised
-        # past the 4096 default moves itself into a singleton shard).
-        meta.serverHeapMb = serverHeapMb;
-        # bughunt-2 (slot 11): wiring facts for the quint-policy lint — the
-        # only channel besides the parse IR that policy enforcement reads.
-        meta.quintPolicy = {
-          kind = "witness";
-          inherit spec main extraSpecs;
-          inherit witness;
-          step = if step == null then "step" else step;
-          vacuityExempt = { };
-        };
-        # Same fileset narrowing as mkQuintCheck.
-        src = lib.fileset.toSource {
-          root = modelsDir;
-          fileset = lib.fileset.unions (map (s: modelsDir + "/${s}.qnt") ([ spec ] ++ extraSpecs));
-        };
-        env = {
-          MODEL = spec;
-          MAIN = main;
-          WITNESS = witness;
-          MODEL_TIMEOUT_SEC = toString modelTimeoutSec;
-        };
-      }
+      (
+        lib.optionalAttrs (requiredSystemFeatures != [ ]) { inherit requiredSystemFeatures; }
+        // {
+          nativeBuildInputs = [ pkgs.quint ];
+          # bug_383: the SAME binding that sizes the JVM below — exported
+          # for gen_matrix.py's heavy-shard isolation (a check raised
+          # past the 4096 default moves itself into a singleton shard).
+          meta.serverHeapMb = serverHeapMb;
+          # bughunt-2 (slot 11): wiring facts for the quint-policy lint — the
+          # only channel besides the parse IR that policy enforcement reads.
+          meta.quintPolicy = {
+            kind = "witness";
+            inherit spec main extraSpecs;
+            inherit witness;
+            step = if step == null then "step" else step;
+            vacuityExempt = { };
+          };
+          # Same fileset narrowing as mkQuintCheck.
+          src = lib.fileset.toSource {
+            root = modelsDir;
+            fileset = lib.fileset.unions (map (s: modelsDir + "/${s}.qnt") ([ spec ] ++ extraSpecs));
+          };
+          env = {
+            MODEL = spec;
+            MAIN = main;
+            WITNESS = witness;
+            MODEL_TIMEOUT_SEC = toString modelTimeoutSec;
+          };
+        }
+      )
       ''
         set -euo pipefail
         cd "$TMPDIR"
