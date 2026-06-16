@@ -168,7 +168,7 @@
     "rio_scheduler_runtime_skew_seconds",
     "rio_scheduler_runtime_skew_stalls_total",
     "rio_scheduler_sla_als_round_cap_hit_total",
-    "rio_scheduler_sla_class_ceiling_uncatalogued",
+    "rio_scheduler_sla_class_uncatalogued_excluded",
     "rio_scheduler_sla_envelope_result_total",
     "rio_scheduler_sla_evidence_refused_total",
     "rio_scheduler_sla_forecast_dropped_total",
@@ -1150,9 +1150,9 @@
         "help": "ALS alternation hit ALS_MAX_ROUNDS without ‖Δα‖₁ < ALS_DELTA_TOL convergence (labeled `tenant`). The α/T_ref(c) joint fit failed to converge — alpha is the final iterate, not a fixed point. Sustained nonzero ⇒ investigate rank-gate degeneracy or fixture quality (the cap is already a worst-case budget — see alpha.rs constants)."
       },
       {
-        "name": "rio_scheduler_sla_class_ceiling_uncatalogued",
+        "name": "rio_scheduler_sla_class_uncatalogued_excluded",
         "kind": "gauge",
-        "help": "§13c-2: 1 per hwClass with NO boot-derived catalog ceiling (labeled `hw_class`). Always 1 for every class under `hwCostSource: static` (no AWS API, expected). Under `spot` a persistent 1 ⇒ `describe_instance_types` failed at boot (check IRSA), or the class's `requirements` match 0 types in the deployment region (operator typo / AWS deprecation). Class falls to the global ceiling — over-permits, never over-strips.",
+        "help": "§13c-2: 1 per hwClass with NO boot-derived catalog ceiling (labeled `hw_class`). Two cases (sh-016): EMPTY catalog (`hwCostSource: static` or `describe_instance_types` failed at boot — check IRSA) → every class shows 1 and falls to the global ceiling (graceful degradation, over-permits). NON-EMPTY catalog but THIS class's `requirements` match 0 types in the deployment region (operator typo / nonexistent SKU) → class is EXCLUDED (ceiling (0,0); fails every size gate); fix the requirements. Replaces `_class_ceiling_uncatalogued` whose HELP promised over-permits unconditionally.",
         "aggregation": "per-replica"
       },
       {

@@ -58,7 +58,7 @@ fn gauge_exemptions() -> Vec<GaugeExemption> {
                         on lose would mask the staleness it measures",
         },
         GaugeExemption {
-            name: "rio_scheduler_sla_class_ceiling_uncatalogued",
+            name: "rio_scheduler_sla_class_uncatalogued_excluded",
             rationale: "config-derived constant per replica (catalog vs [sla] \
                         ceilings); identical on every replica, no leader edge",
         },

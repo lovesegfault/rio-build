@@ -769,7 +769,22 @@ impl SlaConfig {
         let Some(d) = self.hw_classes.get(h) else {
             return (u32::MAX, u64::MAX);
         };
-        let cat = catalog.get(h).copied().unwrap_or(global);
+        // sh-016 (a): an EMPTY catalog (Static cost source / API
+        // failure at boot) falls to global — graceful degradation,
+        // every class over-permits identically. A NON-EMPTY catalog
+        // missing `h` means h's `requirements` matched zero AWS
+        // instance types (operator typo / nonexistent SKU like gen-7
+        // x86 c/m/r local-nvme): ceiling (0,0) so the class fails
+        // every size gate and is structurally excluded from emission.
+        // Pre-fix h fell to global → with cheap spot price + low
+        // lead-time seed it became `e_min` for ~every drv and the
+        // τ-band collapsed around a phantom that no real instance
+        // could host.
+        let cat =
+            catalog
+                .get(h)
+                .copied()
+                .unwrap_or(if catalog.is_empty() { global } else { (0, 0) });
         let cfg = (
             d.max_cores.unwrap_or(global.0),
             d.max_mem.unwrap_or(global.1),
@@ -1684,9 +1699,12 @@ impl SlaConfig {
         // `gc==max_cc ∧ gm==max_cm` holds BY CONSTRUCTION — the exact
         // phantom `derive_ceilings`' doc forbids within a class,
         // recreated one level up. An uncatalogued un-overridden class
-        // falls to the global (`class_ceilings`' fallback — the
-        // §13c-2 uncatalogued-fallback law) and therefore hosts it,
-        // matching what the solve actually enforces. On the
+        // falls to global ONLY when the catalog itself is empty
+        // (Static / API-failed boot — every class is uncatalogued and
+        // the fallback restores the pre-derive over-permits floor);
+        // when the catalog has data the class is excluded ((0,0) —
+        // the §13c-2 uncatalogued-fallback law, sh-016) and does not
+        // contribute to hosting. On the
         // operator-override arm this is a signed operator act: the
         // doctrine is disclose-don't-wedge, so this WARNs with the
         // delta and both provenances rather than erroring.
@@ -4695,11 +4713,15 @@ mod tests {
         h2.max_mem = None;
         cfg.hw_classes = HashMap::from([("h1".into(), h1), ("h2".into(), h2)]);
 
-        // No catalog: fall to global on both axes (h1) or cfg (h2 cores).
+        // EMPTY catalog (Static cost source / describe_instance_types
+        // failed at boot): fall to global on both axes (h1) or cfg
+        // (h2 cores). Graceful degradation — vmtest-Static and
+        // AWS-timeout boot keep the old over-permits semantics.
         let empty = super::super::catalog::CatalogCeilings::new();
         assert_eq!(
             cfg.class_ceilings("h1", &empty, (192u32, 1024u64 << 30)),
-            (192, 1024 << 30)
+            (192, 1024 << 30),
+            "empty catalog → fall to global (graceful degradation)"
         );
         assert_eq!(
             cfg.class_ceilings("h2", &empty, (192u32, 1024u64 << 30)),
@@ -4719,10 +4741,19 @@ mod tests {
             (96, 768 << 30),
             "catalog physical bound applied"
         );
-        // h2 not in catalog → catalog falls to global; cfg=Some(32) tightens.
+        // sh-016 (a): NON-EMPTY catalog + h2 not in catalog → ceiling
+        // (0,0). The class's `requirements` matched zero AWS instance
+        // types (operator typo / nonexistent SKU like gen-7 x86 c/m/r
+        // local-nvme); a (0,0) ceiling fails every size gate
+        // (`solve_full`'s `c_star <= cm.0`, `retain_hosting_cells`,
+        // the capacity-pin filter) — the class is structurally
+        // excluded from emission. Pre-fix h2 fell to global → with
+        // cheap spot price + low lead-time it became `e_min` for
+        // ~every drv and the τ-band collapsed around a phantom.
         assert_eq!(
             cfg.class_ceilings("h2", &cat, (192u32, 1024u64 << 30)),
-            (32, 1024 << 30)
+            (0, 0),
+            "non-empty catalog + missing-h → (0,0); class excluded"
         );
         // cfg can tighten below catalog.
         cfg.hw_classes.get_mut("h1").unwrap().max_cores = Some(48);

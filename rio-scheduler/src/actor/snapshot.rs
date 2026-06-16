@@ -2366,17 +2366,17 @@ impl DagActor {
         let cost = self.cost_table.read().clone();
         // §13c-2 r[impl scheduler.sla.ceiling.uncatalogued-fallback]:
         // per-tick gauge — 1 for any class without a boot-derived
-        // catalog ceiling (Static cost source, fetch failure, or
-        // requirements that match 0 types). Such a class falls to the
-        // global ceiling. Emitted here (the once-per-pass boundary —
-        // both callers hoist this above their drain loop) so it
-        // tracks the live `cost.catalog_ceilings()` snapshot the solve
-        // reads, including across `carry_catalog` lease-acquire
-        // reloads.
+        // catalog ceiling. Two cases (sh-016): empty catalog (Static
+        // cost source / fetch failure) → every class falls to global;
+        // non-empty catalog → the class is EXCLUDED (ceiling (0,0)).
+        // Emitted here (the once-per-pass boundary — both callers
+        // hoist this above their drain loop) so it tracks the live
+        // `cost.catalog_ceilings()` snapshot the solve reads,
+        // including across `carry_catalog` lease-acquire reloads.
         for h in self.sla_config.hw_classes.keys() {
             let v = u8::from(!cost.catalog_ceilings().contains_key(h));
             ::metrics::gauge!(
-                "rio_scheduler_sla_class_ceiling_uncatalogued",
+                "rio_scheduler_sla_class_uncatalogued_excluded",
                 "hw_class" => h.clone()
             )
             .set(v);

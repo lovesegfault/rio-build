@@ -333,13 +333,32 @@ pub fn derive_ceilings(
                     (e.cores.saturating_sub(1).max(1), (e.mem_bytes / 10) * 9),
                 );
             }
-            None => {
+            None if catalog.is_empty() => {
+                // Static cost source / describe_instance_types failed
+                // → every class is uncatalogued. `class_ceilings`
+                // falls to global (graceful degradation); the per-tick
+                // gauge surfaces it.
                 warn!(
                     hw_class = %h,
+                    "§13c-2: empty AWS catalog (Static cost source or \
+                     describe_instance_types failed at boot); ceiling \
+                     falls to global for every class."
+                );
+            }
+            None => {
+                // sh-016: the catalog has data but THIS class matched
+                // zero types — operator typo / nonexistent SKU (gen-7
+                // x86 c/m/r local-nvme: c7gd/m7gd/r7gd are arm64-only).
+                // `class_ceilings` returns (0,0) → the class fails
+                // every size gate and is structurally excluded from
+                // emission. error-level: this is a config defect, not
+                // a degraded mode.
+                tracing::error!(
+                    hw_class = %h,
                     "§13c-2: no instance type in the AWS catalog matches \
-                     this hwClass's requirements; ceiling falls to global. \
-                     Check sla.hwClasses.{h}.requirements against the \
-                     deployment region's available types."
+                     this hwClass's requirements; class is EXCLUDED \
+                     (ceiling (0,0)). Check sla.hwClasses.{h}.requirements \
+                     against the deployment region's available types."
                 );
             }
         }

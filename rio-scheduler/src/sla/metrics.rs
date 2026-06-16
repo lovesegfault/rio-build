@@ -171,15 +171,17 @@ pub fn describe_all() {
          random-pname submissions (`r[sched.sla.threat.corpus-clamp]`)."
     );
     describe_gauge!(
-        "rio_scheduler_sla_class_ceiling_uncatalogued",
+        "rio_scheduler_sla_class_uncatalogued_excluded",
         "§13c-2: 1 per hwClass with NO boot-derived catalog ceiling \
-         (labeled `hw_class`). Always 1 for every class under \
-         `hwCostSource: static` (no AWS API, expected). Under `spot` a \
-         persistent 1 ⇒ `describe_instance_types` failed at boot \
-         (check IRSA), or the class's `requirements` match 0 types in \
-         the deployment region (operator typo / AWS deprecation). \
-         Class falls to the global ceiling — over-permits, never \
-         over-strips."
+         (labeled `hw_class`). Two cases (sh-016): EMPTY catalog \
+         (`hwCostSource: static` or `describe_instance_types` failed \
+         at boot — check IRSA) → every class shows 1 and falls to the \
+         global ceiling (graceful degradation, over-permits). NON-EMPTY \
+         catalog but THIS class's `requirements` match 0 types in the \
+         deployment region (operator typo / nonexistent SKU) → class is \
+         EXCLUDED (ceiling (0,0); fails every size gate); fix the \
+         requirements. Replaces `_class_ceiling_uncatalogued` whose \
+         HELP promised over-permits unconditionally."
     );
     describe_counter!(
         "rio_scheduler_sla_forecast_dropped_total",
@@ -419,7 +421,7 @@ pub const SLA_METRICS: &[&str] = &[
     "rio_scheduler_sla_evidence_refused_total",
     "rio_scheduler_sla_als_round_cap_hit_total",
     "rio_scheduler_sla_keys_evicted_total",
-    "rio_scheduler_sla_class_ceiling_uncatalogued",
+    "rio_scheduler_sla_class_uncatalogued_excluded",
     "rio_scheduler_sla_forecast_dropped_total",
     "rio_scheduler_features_stripped_total",
 ];
