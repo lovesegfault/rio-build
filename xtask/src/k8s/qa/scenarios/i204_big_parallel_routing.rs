@@ -41,7 +41,7 @@ impl Scenario for BigParallelRouting {
             }}"#
         );
 
-        // r[sched.dispatch.soft-features+2] strips big-parallel before
+        // r[sched.dispatch.soft-features+3] strips big-parallel before
         // GetSpawnIntents, so the kvm pool's filter (which only sees
         // STRIPPED features) shouldn't match — and the snapshot's
         // queued count for kvm shouldn't bump for this derivation.

@@ -99,6 +99,24 @@ fn soft_features_load_from_toml() {
     assert_eq!(cfg.soft_features, ["big-parallel", "benchmark"]);
 }
 
+/// sh-008: `[sla.soft_feature_sizing.$feat] min_cores = N` (the
+/// helm-rendered shape) parses into `HashMap<String, SoftSizingHint>`.
+#[test]
+fn soft_feature_sizing_load_from_toml() {
+    let toml = r#"
+        [sla.soft_feature_sizing.big-parallel]
+        min_cores = 32
+    "#;
+    let cfg: Config = merge_toml_over_defaults(toml);
+    assert_eq!(
+        cfg.sla
+            .soft_feature_sizing
+            .get("big-parallel")
+            .map(|h| h.min_cores),
+        Some(32)
+    );
+}
+
 /// §13c-3 regression: `[sla].max_cores`/`max_mem` absent from TOML
 /// MUST extract as `None`, and the defaults baseline MUST NOT inject a
 /// phantom `test-hw` class.

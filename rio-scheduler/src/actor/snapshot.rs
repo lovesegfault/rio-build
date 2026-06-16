@@ -2517,21 +2517,58 @@ impl DagActor {
         // so HashMap iteration order would otherwise leak into the
         // "pure function of drv_hash" contract.
         let want_arch = rio_common::k8s::system_to_k8s_arch(&state.system);
-        let mut h_all: Vec<_> = self
-            .sla_config
-            .hw_classes
-            .iter()
-            .filter(|(_, d)| {
-                crate::sla::config::features_compatible(&feat, &d.provides_features)
-                    && want_arch.is_none_or(|a| {
-                        d.labels
-                            .iter()
-                            .find(|l| l.key == crate::sla::config::ARCH_LABEL)
-                            .is_none_or(|l| l.value == a)
-                    })
-            })
-            .map(|(h, _)| h.clone())
-            .collect();
+        // r[impl sched.sla.soft-feature-min-cores]
+        // sh-008: bias the candidate set by the soft-feature min_cores
+        // hint. Reads `class_ceilings` (catalog ∩ cfg ∩ global) — never
+        // `d.max_cores` raw (prod hi-* entries leave it `None`; §13c-2
+        // catalog derives at boot).
+        let soft_min = self.sla_config.soft_min_cores_for(state.soft_features());
+        let h_all_filter = |min: Option<u32>| -> Vec<_> {
+            self.sla_config
+                .hw_classes
+                .iter()
+                .filter(|(h, d)| {
+                    crate::sla::config::features_compatible(&feat, &d.provides_features)
+                        && want_arch.is_none_or(|a| {
+                            d.labels
+                                .iter()
+                                .find(|l| l.key == crate::sla::config::ARCH_LABEL)
+                                .is_none_or(|l| l.value == a)
+                        })
+                        && min.is_none_or(|m| {
+                            self.sla_config
+                                .class_ceilings(h, cost.catalog_ceilings(), cost.resolved_global())
+                                .0
+                                >= m
+                        })
+                })
+                .map(|(h, _)| h.clone())
+                .collect()
+        };
+        let mut h_all = h_all_filter(soft_min);
+        // sh-008 (s2-ice-exhaustion-bias-becomes-constraint): bias not
+        // constraint — `soft_min` must not empty the candidate set.
+        // When the post-min_cores filter is empty AND the unbiased
+        // partition was non-empty (i.e. the routing axes alone admit at
+        // least one class), degrade to the unbiased set so the drv
+        // stays schedulable. The configured min_cores already passed
+        // `validate_shape`; this catches min_cores > every class's
+        // catalog ceiling (no real instance that large in this
+        // deployment) — disclose-don't-wedge.
+        if let Some(m) = soft_min
+            && h_all.is_empty()
+        {
+            let unbiased = h_all_filter(None);
+            if !unbiased.is_empty() {
+                tracing::debug!(
+                    soft_min = m,
+                    soft_features = ?state.soft_features(),
+                    "soft-feature min_cores degraded — no hwClass hosts \
+                     ≥ min_cores; using the unbiased candidate set"
+                );
+                h_all = unbiased;
+            }
+        }
         h_all.sort_unstable();
         // §one-step-removed inverse: `required_features` non-empty but
         // NO hwClass provides them → unschedulable forever (silent).
@@ -2646,9 +2683,10 @@ impl DagActor {
             // cache-hit on each other's (wrong-partition) memo.
             // §13e: hashes the EFFECTIVE features so a FOD and a
             // non-FOD sharing pname (degenerate but possible) memo
-            // separately.
+            // separately. sh-008: folds `soft_features` so the
+            // soft_feature_sizing `h_all` partition memos separately.
             let mkh = solve::model_key_hash(&f.key);
-            let ovr = solve::override_hash(override_.as_ref(), &feat);
+            let ovr = solve::override_hash(override_.as_ref(), &feat, state.soft_features());
             let (entry, miss) = self.solve_cache.get_or_insert_with(
                 mkh,
                 ovr,
@@ -3014,7 +3052,8 @@ impl DagActor {
                 if let Some(reason) = infeasible
                     && !hw_emitted
                 {
-                    let ovr = solve::override_hash(override_.as_ref(), &feat);
+                    let ovr =
+                        solve::override_hash(override_.as_ref(), &feat, state.soft_features());
                     let seen = fit.as_ref().is_some_and(|f| {
                         self.solve_cache.infeasible_static_seen(
                             solve::model_key_hash(&f.key),

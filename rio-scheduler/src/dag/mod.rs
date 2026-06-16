@@ -177,7 +177,7 @@ impl DerivationDag {
         self.resubmit_floors.get(drv_hash).copied()
     }
 
-    // r[impl sched.dispatch.soft-features+2]
+    // r[impl sched.dispatch.soft-features+3]
     /// Strip configured soft features from `state.required_features`.
     /// D6: `floor_hint` seeding removed — SLA sizing owns the initial
     /// shape; reactive `resource_floor` doubling owns the climb.

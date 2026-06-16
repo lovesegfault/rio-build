@@ -1152,10 +1152,13 @@ binding updates pause until both roll); the alternative --- dual-writing
 field 5 --- would create a removal obligation later, which the wave's
 no-followups directive forbids.
 
-#r("sched.dispatch.soft-features+2")[
-  The scheduler MUST strip every feature listed in `soft_features`
-  (scheduler.toml) from each derivation's `requiredSystemFeatures` at
-  DAG-insertion time, before any spawn-snapshot decision reads it.
+#r("sched.dispatch.soft-features+3")[
+  The scheduler MUST partition each derivation's
+  `requiredSystemFeatures` at DAG-insertion time: every feature listed
+  in `soft_features` (scheduler.toml) is stripped from the routing set
+  before any spawn-snapshot decision reads it, AND recorded on the
+  derivation's soft-feature set so SIZING (`feature_probes` /
+  `soft_feature_sizing`) can read it.
   nixpkgs convention treats `big-parallel` and `benchmark` as capability hints
   --- any builder qualifies --- unlike `kvm` / `nixos-test` which are hardware
   gates. Without stripping, a `{big-parallel}`-only derivation passes the
@@ -1164,6 +1167,15 @@ no-followups directive forbids.
   every featureless pool, so the controller spawns `.metal` for
   firefox/chromium while regular builders sit idle (I-204). Empty
   `soft_features` (the default) preserves pre-I-204 behavior.
+]
+
+#r("sched.sla.soft-feature-min-cores")[
+  The scheduler MUST, for each declared soft feature with a configured
+  `[sla.soft_feature_sizing.$feat].min_cores`, restrict the SLA
+  candidate hwClass set to those whose per-class core ceiling is at
+  least `min_cores`; when no class qualifies the restriction MUST
+  degrade to the unbiased set. Bias not constraint --- the soft sizing
+  hint never empties the candidate set.
 ]
 
 #r("sched.retry.promotion-exempt+3")[

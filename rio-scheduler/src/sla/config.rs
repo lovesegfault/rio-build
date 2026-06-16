@@ -384,6 +384,16 @@ pub struct SlaConfig {
     /// fall back to `probe`.
     #[serde(default)]
     pub feature_probes: HashMap<String, ProbeShape>,
+    /// sh-008: per-SOFT-feature sizing bias. Keyed on the I-204
+    /// soft-feature names (`big-parallel` / `benchmark`); applied to
+    /// the recorded `DerivationState.soft_features` partition. Restricts
+    /// `solve_intent_for`'s `h_all` candidate set to classes whose
+    /// [`Self::class_ceilings`] hosts at least `min_cores` — bias not
+    /// constraint: when no class qualifies the restriction degrades to
+    /// the unbiased set so the candidate set is never emptied. Default
+    /// empty → no bias. See [`Self::soft_min_cores_for`].
+    #[serde(default)]
+    pub soft_feature_sizing: HashMap<String, SoftSizingHint>,
     /// §13c-3: optional hard cap on `c*` — solve REJECTS a tier whose
     /// `c*` exceeds this (does not clamp). Also caps the explore
     /// halve/×4 walk via [`Ceilings`].
@@ -596,6 +606,22 @@ pub(crate) fn default_probe_deadline_secs() -> u32 {
     3600
 }
 
+/// `[sla.soft_feature_sizing.$feat]` table — sh-008. SIZING bias for a
+/// soft feature (keyed on the I-204 `softFeatures` names). Separate
+/// from [`ProbeShape`]: that is "first-attempt cold-start shape", this
+/// is "regardless of fit, candidate hwClasses must host at least
+/// `min_cores`". They compose — a `big-parallel` drv with no fit
+/// cold-starts at `feature_probes.big-parallel.cpu`; once fitted,
+/// `solve_full` cost-ranks over the `min_cores`-biased `h_all`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SoftSizingHint {
+    /// Candidate hwClasses MUST have a per-class core ceiling
+    /// ([`SlaConfig::class_ceilings`]) of at least this. Bias not
+    /// constraint — degrades when no class qualifies.
+    pub min_cores: u32,
+}
+
 impl ProbeShape {
     /// Bounds-check this shape under `[sla].max_cores = max_cores`.
     /// `label` names the config path (`"sla.probe"` /
@@ -738,6 +764,17 @@ impl SlaConfig {
             d.max_mem.unwrap_or(global.1),
         );
         (cat.0.min(cfg.0), cat.1.min(cfg.1))
+    }
+
+    /// sh-008: the effective `min_cores` bias for a derivation's
+    /// recorded soft-feature partition — `max` over the configured
+    /// `soft_feature_sizing` entries that match. `None` when `soft` is
+    /// empty or no entry matches (the common case → no `h_all` bias).
+    pub fn soft_min_cores_for(&self, soft: &[String]) -> Option<u32> {
+        soft.iter()
+            .filter_map(|f| self.soft_feature_sizing.get(f))
+            .map(|h| h.min_cores)
+            .max()
     }
 
     /// Arch + features routing predicate for hwClass `h`: the class's
@@ -1228,6 +1265,7 @@ impl SlaConfig {
                 deadline_secs: default_probe_deadline_secs(),
             },
             feature_probes: HashMap::new(),
+            soft_feature_sizing: HashMap::new(),
             max_cores: Some(16.0),
             max_mem: Some(2 << 30),
             max_disk: 6 << 30,
@@ -1422,6 +1460,14 @@ impl SlaConfig {
                 p.deadline_secs >= 180,
                 "sla.feature_probes[{feat}].deadline_secs must be >= 180, got {}",
                 p.deadline_secs
+            );
+        }
+        for (feat, h) in &self.soft_feature_sizing {
+            anyhow::ensure!(
+                h.min_cores > 0 && (h.min_cores as f64) < MAX_CORES_HARD,
+                "sla.soft_feature_sizing[{feat}].min_cores must be in \
+                 (0, {MAX_CORES_HARD}); got {}",
+                h.min_cores
             );
         }
         for (h, def) in &self.hw_classes {
@@ -1661,6 +1707,21 @@ impl SlaConfig {
         for (feat, p) in &self.feature_probes {
             p.validate(&format!("sla.feature_probes[{feat}]"), hi)?;
         }
+        // sh-008: a soft min_cores above the resolved global is a
+        // no-op (degrades to the unbiased set every time) — disclose
+        // not reject: bias not constraint, so a misconfigured value
+        // never prevents dispatch.
+        for (feat, hint) in &self.soft_feature_sizing {
+            if hint.min_cores > gc {
+                tracing::warn!(
+                    %feat, min_cores = hint.min_cores, global_cores = gc,
+                    global_source = source,
+                    "sla.soft_feature_sizing min_cores exceeds the resolved \
+                     global ceiling — the bias will degrade to the unbiased \
+                     candidate set on every solve (no class can host it)"
+                );
+            }
+        }
         for (h, def) in &self.hw_classes {
             if let Some(n) = def.max_cores {
                 anyhow::ensure!(
@@ -1754,6 +1815,7 @@ pub const HELM_RENDERED_SLA_KEYS: &[&str] = &[
     "default_tier",
     "probe",
     "feature_probes",
+    "soft_feature_sizing",
     "max_cores",
     "max_mem",
     "max_disk",
@@ -4683,6 +4745,7 @@ mod tests {
             default_tier: _,                      // (scalar) checked ∈ tiers
             probe: _,                             // (scalar) ProbeShape::validate
             feature_probes: _,                    // (free)   key = requiredSystemFeatures string
+            soft_feature_sizing: _,               // (free)   key = soft-feature string (I-204 set)
             max_cores: _,                         // (scalar)
             max_mem: _,                           // (scalar)
             max_disk: _,                          // (scalar)

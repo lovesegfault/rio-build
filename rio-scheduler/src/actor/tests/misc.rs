@@ -1005,7 +1005,7 @@ async fn spawn_intents_kvm_pool_excludes_featureless_work() {
 /// `required_features`; `{big-parallel} ⊆ {kvm,nixos-test,big-parallel}`
 /// passed the subset check. With `soft_features=[big-parallel]` the
 /// derivation enters the DAG as ∅-feature and I-181 fires.
-// r[verify sched.dispatch.soft-features+2]
+// r[verify sched.dispatch.soft-features+3]
 #[tokio::test]
 async fn spawn_intents_soft_features_strip() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1132,7 +1132,7 @@ async fn soft_feature_strip_only() {
 /// **Pre-fix: RED** — `effective_features = ["big-parallel", "kvm"]`
 /// (constructor-only derivation never re-derives after the strip).
 // r[verify sched.sla.fod-feature-derivation+3]
-// r[verify sched.dispatch.soft-features+2]
+// r[verify sched.dispatch.soft-features+3]
 #[tokio::test]
 async fn apply_soft_features_re_derives_effective_features() {
     let db = TestDb::new(&MIGRATOR).await;

@@ -1467,18 +1467,30 @@ pub fn fit_content_hash(fit: &FittedParams) -> u64 {
 }
 
 /// Stable hash of the solve-relevant override fields. `None` → 0.
-pub fn override_hash(o: Option<&ResolvedTarget>, required_features: &[String]) -> u64 {
+pub fn override_hash(
+    o: Option<&ResolvedTarget>,
+    required_features: &[String],
+    soft_features: &[String],
+) -> u64 {
     // §13c: required_features partitions h_all (T10), so it's a
     // per-drv solve-input discriminator beyond ModelKey. Folded HERE
     // (not into model_key_hash) because ModelKey keys the SLA fit
     // table — splitting fits by feature would fragment the same
-    // pname's CPU/mem samples. The common case `(None, [])` keeps its
-    // stable `0` (test fixtures `peek_entry(mkh, 0)` rely on it).
-    if o.is_none() && required_features.is_empty() {
+    // pname's CPU/mem samples. The common case `(None, [], [])` keeps
+    // its stable `0` (test fixtures `peek_entry(mkh, 0)` rely on it).
+    //
+    // sh-008 (s2-memo-key-misses-soft-min): `soft_features` also
+    // partitions `h_all` (via the `soft_feature_sizing.min_cores` bias),
+    // so an identical `(ModelKey, effective_features)` with different
+    // `soft_features` gets a different `h_all` → must memo separately,
+    // or a `big-parallel` and a non-`big-parallel` drv sharing pname
+    // cache-hit on each other's wrong-partition memo.
+    if o.is_none() && required_features.is_empty() && soft_features.is_empty() {
         return 0;
     }
     let mut h = std::hash::DefaultHasher::new();
     required_features.hash(&mut h);
+    soft_features.hash(&mut h);
     if let Some(o) = o {
         o.forced_cores.map(f64::to_bits).hash(&mut h);
         o.forced_mem.hash(&mut h);
