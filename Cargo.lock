@@ -6478,6 +6478,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-ec2",
  "aws-smithy-mocks",
+ "axum",
  "base64 0.22.1",
  "clap",
  "config",

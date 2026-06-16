@@ -1256,6 +1256,11 @@
       "doc": "`SchedulerService` gRPC implementation for [`SchedulerGrpc`]."
     },
     {
+      "path": "guard.rs",
+      "depth": 0,
+      "doc": "The guard domain: a dedicated `current_thread` tokio runtime on its own OS thread hosting the kill-wired liveness surface, the lease renew loop, and the runtime-skew sentinel."
+    },
+    {
       "path": "lease_hooks.rs",
       "depth": 0,
       "doc": "Scheduler-side [`LeaseHooks`](crate::lease::LeaseHooks) impl: ordered, non-blocking delivery of lease transitions to the DAG actor."

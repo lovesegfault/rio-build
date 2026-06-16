@@ -20595,6 +20595,10 @@
           "packageId": "aws-sdk-ec2"
         },
         {
+          "name": "axum",
+          "packageId": "axum"
+        },
+        {
           "name": "base64",
           "packageId": "base64 0.22.1"
         },

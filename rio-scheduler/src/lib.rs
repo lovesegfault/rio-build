@@ -27,6 +27,7 @@ pub(crate) mod dag;
 pub mod db;
 pub(crate) mod domain;
 pub mod grpc;
+pub mod guard;
 /// Re-export so existing `crate::lease::{LeaderState, LeaseConfig,
 /// run_lease_loop}` paths keep working after the B1 extraction.
 pub use rio_lease as lease;
@@ -756,6 +757,28 @@ pub fn describe_metrics() {
         "Lease rebounds: holder changes observed late on a still-leading round \
          (a foreign term ran entirely inside our observation gap). Each runs the \
          Compound leadership-edge lose cells and then a full re-recovery."
+    );
+    describe_gauge!(
+        "rio_scheduler_runtime_skew_seconds",
+        "Executor-scheduling delay per runtime domain (domain=main|guard), measured by \
+         the guard-domain sentinel (src/guard.rs): a no-op probe task's time-to-first-poll \
+         on the main runtime, and the guard's own timer overshoot. While a main-domain \
+         probe is unanswered the exported value is the RUNNING lower bound, so a live \
+         stall is visible as it happens. domain=main at seconds-scale = the sh-002C \
+         starvation shape (the 16.35s Tick that self-fenced the leader); domain=guard \
+         elevated = the guard itself is starved (cgroup-class pressure — raise the \
+         CPU request)."
+    );
+    describe_counter!(
+        "rio_scheduler_runtime_skew_stalls_total",
+        "Stall episodes per runtime domain (domain=main|guard): ONE increment per \
+         episode in both domains (a shared edge latch — the increment is the rising \
+         edge, re-armed at resolution; a main-domain episode that starts and resolves \
+         between probe ticks still counts once at its settle). Live main-domain edges \
+         log a thread-table capture (tid/comm/state) for attribution; settle-counted \
+         episodes do not (nothing live remains). Rate > 0 = the dag-actor is being \
+         starved; correlate with rio_scheduler_runtime_skew_seconds and the captured \
+         table in logs."
     );
     describe_counter!(
         "rio_scheduler_sla_refit_total",

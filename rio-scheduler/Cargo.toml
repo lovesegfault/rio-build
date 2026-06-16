@@ -58,6 +58,12 @@ rio-store = { workspace = true, features = ["schema"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
+# sh-002C: the guard domain's `/healthz`+`/readyz` server on `:9194`.
+# Hosted on the dedicated `current_thread` runtime (src/guard.rs) so
+# kubelet liveness stays answerable when the dag-actor stalls;
+# `tonic_health` stays on the main gRPC server (the BalancedChannel
+# leader-probe surface).
+axum = { workspace = true }
 # D3: scheduler natively serves gRPC-Web on its main port so the
 # dashboard ingress is a plain HTTP router (no grpc_web filter).
 tonic-web = { workspace = true }

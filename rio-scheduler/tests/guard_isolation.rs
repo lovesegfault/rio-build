@@ -20,8 +20,10 @@
 //! (`rio-lease/src/lib.rs` mod tests).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
+
+use rio_scheduler::guard::{GuardConfig, spawn};
 
 /// sh-002C red-first: a long actor turn (the 16.35s Tick) MUST NOT
 /// starve the lease renew loop. Scaled 50× so the witness lands in
@@ -77,4 +79,63 @@ fn sh002c_long_actor_turn_does_not_self_fence() {
          runtime the dag-actor cannot starve.",
         n = 2000 / 220,
     );
+}
+
+/// F2 (bug_023, the runtime enforcement face): a `GuardJoin` dropped
+/// without `.join()` panics. `#[must_use]` cannot catch
+/// `let (g, _) = …` (verified on stable; `_` suppresses the lint), so
+/// the linear token's Drop is the runtime gate.
+#[test]
+#[should_panic(expected = "GuardJoin dropped without .join()")]
+fn dropped_guard_join_panics() {
+    let shutdown = rio_common::signal::Token::new();
+    let main = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("main runtime");
+    // The `_` suppression is THE evasion the Drop-panic exists to
+    // close — driven against the real spawn.
+    #[allow(clippy::no_effect_underscore_binding)]
+    let (_g, _) = spawn(
+        main.handle().clone(),
+        Arc::new(AtomicBool::new(true)),
+        GuardConfig {
+            health_addr: ([127, 0, 0, 1], 0).into(),
+            ..Default::default()
+        },
+        shutdown,
+    );
+    // `_` drops at end-of-statement (the line above), so the Drop-panic
+    // already fired; the guard thread leaks for this nextest process's
+    // lifetime — bounded.
+}
+
+/// r26 irony-check on bug_023 (the §one-step-removed inverse): a
+/// `GuardJoin` live across an UNWINDING panic must yield to the
+/// original failure. Without the `thread::panicking()` guard the Drop
+/// fires a SECOND panic → panic-while-panicking → SIGABRT, burying
+/// the real message.
+#[test]
+#[should_panic(expected = "the actual failure")]
+fn guard_join_drop_during_unwind_yields_original_panic() {
+    let shutdown = rio_common::signal::Token::new();
+    let main = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("main runtime");
+    let (_g, _gj) = spawn(
+        main.handle().clone(),
+        Arc::new(AtomicBool::new(true)),
+        GuardConfig {
+            health_addr: ([127, 0, 0, 1], 0).into(),
+            ..Default::default()
+        },
+        shutdown.clone(),
+    );
+    shutdown.cancel();
+    // _gj is live across this panic; its Drop sees thread::panicking()
+    // and yields, so #[should_panic(expected=…)] matches.
+    panic!("the actual failure");
 }
