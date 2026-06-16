@@ -103,13 +103,40 @@ pub(super) const LISTING_MEMBER_TTL: std::time::Duration = std::time::Duration::
 /// ([`JobView::creations`]).
 pub(super) const LISTING_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// bug_045 — the fixed head-window size (the pre-existing 512-row
+/// bug_045 — the head-window FLOOR (the pre-existing 512-row
 /// partition domain, now named): partitioned callers always drew the
 /// full bounded head so slices cover it; the snapshot subsumes the
 /// unpartitioned lanes' former `min(2×limit, 512)` over-fetch with
 /// the same superset (recorded delta — same per-poll view filter,
 /// same fail-closed arms).
-const LISTING_HEAD_WINDOW: i64 = 512;
+///
+/// sh-002 advisory §6 row 2: at 46 ready members the fixed 512-row
+/// head partitioned to ~11 jobs/replica — every replica's coordinator
+/// drained its slice in one pass and starved on the rendezvous
+/// boundary while 6,615 jobs sat claimable. The window now scales
+/// with the live membership ([`listing_head_window`]):
+/// `max(512, ready_members × 32)` so wide fleets get >11/bucket.
+/// Throughput, not correctness; the effect is gated on the deferred
+/// coalesce-outcomes work (the single-threaded actor binds at ~15/s
+/// regardless of head depth) — lands now for forward-compat.
+const LISTING_HEAD_WINDOW_FLOOR: i64 = 512;
+
+/// sh-002 — per-member head-window budget (× live members, floored at
+/// [`LISTING_HEAD_WINDOW_FLOOR`]). 32 derived: at the production
+/// `executor_concurrency=25` per replica, each coordinator can hold
+/// up to ~25 SlotTokens; 32 leaves headroom for the resume-lane
+/// CredentialOnly population without re-fetching mid-beat.
+const LISTING_HEAD_PER_MEMBER: i64 = 32;
+
+/// The membership-scaled head-window (sh-002 — see
+/// [`LISTING_HEAD_WINDOW_FLOOR`] for the derivation).
+fn listing_head_window(ready_members: usize) -> i64 {
+    LISTING_HEAD_WINDOW_FLOOR.max(
+        i64::try_from(ready_members)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(LISTING_HEAD_PER_MEMBER),
+    )
+}
 
 /// live061-R1 (R17, violable + testable) — per-class row bound of one
 /// moot-sweep tick. The sweep is one fenced transaction per class
@@ -1428,10 +1455,17 @@ impl DagActor {
         // between beats do none of it.
         if let Some(token) = beat_token {
             SNAPSHOT_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let fetched = self
-                .db
-                .list_claimable_materialization_jobs(LISTING_HEAD_WINDOW)
-                .await;
+            // sh-002: the head window scales with the live membership
+            // sampled at the contacts beat above (the same membership
+            // the rendezvous partition keys on).
+            let head = {
+                let (_v, contacts, _p) = self
+                    .materialization_jobs
+                    .hydrated_listing_mut()
+                    .expect("hydrated checked above");
+                listing_head_window(contacts.len())
+            };
+            let fetched = self.db.list_claimable_materialization_jobs(head).await;
             // Disclosed harness alignment (W2's latency hook): an
             // awaited delay exactly where production PG latency sits.
             #[cfg(test)]
