@@ -1105,6 +1105,108 @@ async fn ice_mask_is_read_time() {
     );
 }
 
+/// sh-016 (b): with `spot ≪ od`, the τ-band admitted set `A` is
+/// spot-only; `(h, Od)` is in `memo.all_candidates` (it WAS evaluated)
+/// but never in `A`. When ICE masks every cell of `A`, the fallback
+/// must widen to `all_candidates ∖ masked` (cost-sorted, ceiling-
+/// filtered) so the controller's argmin picks `(h, Od)`. Pre-fix the
+/// fallback re-emitted the masked `A` — `nodeclaim_created{:od}=0`
+/// while `:spot` was masked and `nodeclaim_intent_dropped_total
+/// {reason="ready_all_cells_ice_masked"}` climbed unbounded (19111
+/// drops in the production run).
+#[tokio::test]
+async fn ice_mask_exhausts_a_widens_to_all_candidates() {
+    use crate::sla::config::CapacityType::{self, Od, Spot};
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    actor.test_inject_ready("d", Some("test-pkg"), "x86_64-linux", false);
+
+    // spot ≪ od (3× — outside τ=0.15) → A is spot-only;
+    // all_candidates is {spot, od} for every builder class.
+    {
+        let mut ct = actor.cost_table.write();
+        for h in ["intel-6", "intel-7", "intel-8"] {
+            ct.set_price(h, Spot, 0.01, 1e9);
+            ct.set_price(h, Od, 0.03, 1e9);
+        }
+    }
+    let (hw, cost, g0) = actor.solve_inputs();
+    let cap_of = |t: &rio_proto::types::NodeSelectorTerm| -> Option<String> {
+        t.match_expressions
+            .iter()
+            .find(|r| r.key == crate::sla::config::LABEL_CAPACITY_TYPE)
+            .and_then(|r| r.values.first().cloned())
+    };
+
+    // Precondition: A is spot-only (no od term in node_affinity).
+    let intent0 = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g0);
+    assert!(
+        intent0
+            .node_affinity
+            .iter()
+            .all(|t| cap_of(t).as_deref() == Some(Spot.label())),
+        "fixture: spot 3× cheaper → A ⊆ {{(h,Spot)}}; od is in \
+         all_candidates only (outside τ-band)"
+    );
+    assert!(!intent0.node_affinity.is_empty());
+
+    // Mask every (h, Spot) — A ∖ masked = ∅. Widen to all_candidates
+    // ∖ masked = {(h, Od)}.
+    for h in actor.sla_config.hw_classes.keys() {
+        actor.ice.mark(&(h.clone(), Spot));
+    }
+    let intent1 = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g0);
+    assert!(
+        intent1
+            .node_affinity
+            .iter()
+            .all(|t| cap_of(t).as_deref() == Some(Od.label())),
+        "sh-016 (b): A ∖ masked = ∅ → widen to all_candidates ∖ masked \
+         (od-only); pre-fix re-emitted the masked spot-only A: {:?}",
+        intent1.node_affinity.iter().map(cap_of).collect::<Vec<_>>()
+    );
+    assert!(
+        !intent1.node_affinity.is_empty(),
+        "widened set is non-empty (od cells survive the mask)"
+    );
+
+    // Second-tier fallback: mask Od too → all_candidates ∖ masked = ∅
+    // → fall through to A (today's behaviour; the controller drops +
+    // backoff doubles). The `ice_exhausted` debounce (computed
+    // pre-widen from the spot-only A) already fired on the spot-mask
+    // poll above; this poll sees no NEW edge.
+    for h in actor.sla_config.hw_classes.keys() {
+        actor.ice.mark(&(h.clone(), Od));
+    }
+    let intent2 = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g0);
+    assert!(
+        !intent2.node_affinity.is_empty(),
+        "second-tier: every candidate masked → re-emit A (never empty)"
+    );
+    assert!(
+        intent2
+            .node_affinity
+            .iter()
+            .all(|t| cap_of(t).as_deref() == Some(Spot.label())),
+        "second-tier fallback re-emits the original A (spot-only)"
+    );
+
+    // Unmask one spot cell → A ∖ masked = {(intel-6, Spot)} ≠ ∅ → no
+    // widening; the read-time mask path (not the fallback) applies.
+    for cap in CapacityType::ALL {
+        actor.ice.clear(&("intel-6".into(), cap));
+    }
+    let intent3 = actor.solve_intent_for(actor.dag.node("d").unwrap(), &hw, &cost, g0);
+    assert!(
+        intent3
+            .node_affinity
+            .iter()
+            .any(|t| cap_of(t).as_deref() == Some(Spot.label())),
+        "partial unmask → read-time A ∖ masked path, no widening"
+    );
+}
+
 /// Regression: `ice.clear()` was wired to the Pending ack (`spawned`),
 /// not the success edge (`registered_cells`). The all-masked fallback
 /// re-emits the masked cell at `node_affinity[0]`, so each tick did

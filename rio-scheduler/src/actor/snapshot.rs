@@ -2822,12 +2822,21 @@ impl DagActor {
                     .record("tier", memo.tier.as_str())
                     .record("c_star", memo.a.c_star)
                     .record("n_candidates_feasible", memo.all_candidates.len());
-                // Read-time ICE mask: A \ masked. Never empty — fall
-                // back to A if all of A is masked (the controller will
-                // see `unfulfillable` again and the backoff doubles;
-                // emitting an empty affinity would land hw-agnostic
-                // which §Capacity backoff reserves for envelope-
-                // infeasibility).
+                // Read-time ICE mask: A \ masked. Never empty — when
+                // A ∖ masked = ∅, widen to the FULL evaluated
+                // candidate set minus the mask (cost-sorted, ceiling-
+                // filtered at the shared c*); only if THAT is also
+                // empty (genuine regional exhaustion) re-emit A so
+                // the controller drops + backoff doubles. Emitting an
+                // empty affinity would land hw-agnostic which
+                // §Capacity backoff reserves for envelope-
+                // infeasibility. sh-016: re-emitting the masked A
+                // re-loops `report_unfulfillable` for one backoff
+                // doubling per scheduler round-trip — `(h, Od)` was in
+                // `all_candidates` (it WAS evaluated) but never in A
+                // (τ-band excluded on cost), so subtracting the mask
+                // from A could not surface it; 19111 drops with
+                // `nodeclaim_created{:od}=0` while `:spot` was masked.
                 let masked = self.ice.masked_cells();
                 let cells: Vec<_> = memo
                     .a
@@ -2870,8 +2879,48 @@ impl DagActor {
                     self.solve_cache
                         .update_entry(*mkh, *ovr, |e| e.ice_exhausted = now_exh);
                 }
+                // r27-A4 / STRIKE-6: `all_candidates` is every cell
+                // whose OWN c* fit its class; the SHARED `a.c_star`
+                // may not. Producer-side filter via the canonical
+                // `class_ceilings` (merged_bug_016: the constructed
+                // container quantity, same form as the chokepoint
+                // below). One closure shared by BOTH widen sites
+                // (ICE-exhaust fallback + capacity-pin fallback) so
+                // the predicate cannot drift.
+                let hosts_shared_c_star = |c: &&solve::Candidate| {
+                    let (cc, cm) = self.sla_config.class_ceilings(
+                        &c.cell.0,
+                        cost.catalog_ceilings(),
+                        cost.resolved_global(),
+                    );
+                    memo.a.c_star <= cc
+                        && rio_common::footprint::container_mem_bytes(memo.a.mem_bytes) <= cm
+                };
                 let cells = if cells.is_empty() {
-                    memo.a.cells
+                    // sh-016 (b): widen to all_candidates ∖ masked,
+                    // ceiling-filtered, cost-sorted ascending so the
+                    // controller's argmin (cover.rs) picks the
+                    // cheapest unmasked candidate. `now_exh` (above)
+                    // is computed from the PRE-widen `cells.is_empty()`
+                    // — the `_ladder_exhausted_total` debounce stays on
+                    // the original A-exhaustion edge.
+                    let mut widened: Vec<_> = memo
+                        .all_candidates
+                        .iter()
+                        .filter(|c| !masked.contains(&c.cell))
+                        .filter(hosts_shared_c_star)
+                        .collect();
+                    widened.sort_by(|a, b| a.e_cost_upper.total_cmp(&b.e_cost_upper));
+                    let widened: Vec<_> = widened.into_iter().map(|c| c.cell.clone()).collect();
+                    if widened.is_empty() {
+                        // Second-tier: every evaluated candidate is
+                        // masked (genuine regional exhaustion) → fall
+                        // through to A; the controller drops +
+                        // backoff doubles (today's behaviour).
+                        memo.a.cells
+                    } else {
+                        widened
+                    }
                 } else {
                     cells
                 };
@@ -2887,29 +2936,10 @@ impl DagActor {
                     Some(cap) => {
                         let pinned: Vec<_> = cells.into_iter().filter(|(_, c)| *c == cap).collect();
                         if pinned.is_empty() {
-                            // r27-A4 / STRIKE-6: `all_candidates` is
-                            // every cell whose OWN c* fit its class;
-                            // the SHARED `a.c_star` may not. Producer-
-                            // side filter via the canonical
-                            // `class_ceilings`; the post-finalize
-                            // chokepoint below is the backstop.
                             memo.all_candidates
                                 .iter()
                                 .filter(|c| c.cell.1 == cap)
-                                .filter(|c| {
-                                    let (cc, cm) = self.sla_config.class_ceilings(
-                                        &c.cell.0,
-                                        cost.catalog_ceilings(),
-                                        cost.resolved_global(),
-                                    );
-                                    // merged_bug_016: the constructed
-                                    // container quantity, same form as
-                                    // the chokepoint below.
-                                    memo.a.c_star <= cc
-                                        && rio_common::footprint::container_mem_bytes(
-                                            memo.a.mem_bytes,
-                                        ) <= cm
-                                })
+                                .filter(hosts_shared_c_star)
                                 .map(|c| c.cell.clone())
                                 .collect()
                         } else {
