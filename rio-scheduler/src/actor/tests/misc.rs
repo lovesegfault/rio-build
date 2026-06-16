@@ -1170,6 +1170,64 @@ async fn apply_soft_features_re_derives_effective_features() {
     );
 }
 
+/// **sh-008** — `apply_soft_features` partitions (records the stripped
+/// soft set on `DerivationState.soft_features`) instead of discarding,
+/// AND the recorded set reaches `explore::next`'s `feature_probes`
+/// lookup via `DrvHints.soft_features`. Pre-fix: `feature_probes.
+/// big-parallel` is dead config — `hints.required_features` is the
+/// post-strip `effective_features` set, so a soft-only `big-parallel`
+/// never matches and the cold-start probe falls through to the default
+/// `[sla].probe.cpu`.
+///
+/// RED at `0c4c55d5b`: `state.soft_features()` does not exist; with the
+/// accessor stubbed to `[]` the second assert fails: `intent.cores`
+/// equals `test_sla_config().probe.cpu` (4), not the `feature_probes.
+/// big-parallel.cpu` override (48).
+// r[verify sched.dispatch.soft-features+3]
+#[tokio::test]
+async fn apply_soft_features_records_for_probe_lookup() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            sla: test_sla_config(),
+            soft_features: vec!["big-parallel".into()],
+            ..Default::default()
+        },
+    );
+    actor.sla_config.feature_probes.insert(
+        "big-parallel".into(),
+        crate::sla::config::ProbeShape {
+            cpu: 48.0,
+            mem_per_core: 1 << 30,
+            mem_base: 4 << 30,
+            deadline_secs: 3600,
+        },
+    );
+
+    actor.test_inject_ready_with_features("ff-bp", None, "x86_64-linux", &["big-parallel"]);
+    let state = actor.dag.node("ff-bp").unwrap();
+    assert_eq!(
+        state.soft_features(),
+        ["big-parallel"],
+        "apply_soft_features records the stripped soft set"
+    );
+    assert!(
+        state.effective_features().as_slice().is_empty(),
+        "§13e: routing chokepoint stays soft-free"
+    );
+
+    let (hw, cost, ig) = actor.solve_inputs();
+    let intent = actor.solve_intent_for(state, &hw, &cost, ig);
+    assert_eq!(
+        intent.cores, 48,
+        "feature_probes[big-parallel].cpu reaches the cold-start intent \
+         via DrvHints.soft_features (pre-fix: default probe.cpu={})",
+        actor.sla_config.probe.cpu
+    );
+}
+
 // r[verify sched.sla.reactive-floor+4]
 /// D4: `solve_intent_for` clamps its solved (mem, disk) at
 /// `resource_floor`. A derivation with `floor.mem=32GiB` (from prior

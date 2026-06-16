@@ -3517,6 +3517,112 @@ async fn contract_bypass_capacity_oversized_cores_emits_hosting_class() {
     );
 }
 
+/// **sh-008** — `big-parallel` ∈ `softFeatures` is stripped for ROUTING
+/// (I-204, correct) but the sizing signal must still reach the SLA
+/// candidate set: `soft_feature_sizing.big-parallel.min_cores=N`
+/// restricts `h_all` to classes whose [`SlaConfig::class_ceilings`]
+/// hosts ≥ N cores. Without this, a fitted big-parallel drv (firefox /
+/// chromium / quint-wedge-cluster-latch) cost-ranks onto the cheapest
+/// 16-core reference cell — the one piece of declared sizing intent the
+/// derivation carried is discarded entirely.
+///
+/// Fixture: intel-6 max_cores=16; intel-7/8 stay at the global 64;
+/// `min_cores=32`. RED at `0c4c55d5b`: intel-6 ∈ hw_class_names
+/// (`features_compatible([], [])` admits it post-strip;
+/// `class_ceilings(intel-6)=16 ≥ intent.cores` so the post-finalize
+/// `retain_hosting_cells` chokepoint keeps it).
+// r[verify sched.sla.soft-feature-min-cores]
+#[tokio::test]
+async fn solve_big_parallel_min_cores_biases_h_all() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    // soft_features on the DAG so apply_soft_features partitions at insert.
+    actor.dag.set_soft_features(vec!["big-parallel".into()]);
+    // intel-6 = 16-core ceiling; intel-7/8 stay at the global 64.
+    actor
+        .sla_config
+        .hw_classes
+        .get_mut("intel-6")
+        .unwrap()
+        .max_cores = Some(16);
+    // sh-008: min_cores=32 → intel-6 (16c) MUST be filtered from h_all.
+    actor.sla_config.soft_feature_sizing.insert(
+        "big-parallel".into(),
+        crate::sla::config::SoftSizingHint { min_cores: 32 },
+    );
+
+    actor.test_inject_ready_with_features(
+        "d-bp",
+        Some("test-pkg"),
+        "x86_64-linux",
+        &["big-parallel"],
+    );
+    let state = actor.dag.node("d-bp").unwrap();
+    assert!(state.required_features().is_empty(), "I-204 strip held");
+    assert_eq!(
+        state.soft_features(),
+        ["big-parallel"],
+        "stripped soft set recorded for sizing"
+    );
+
+    let (hw, cost, ig) = actor.solve_inputs();
+    let intent = actor.solve_intent_for(state, &hw, &cost, ig);
+
+    assert!(
+        !intent.hw_class_names.iter().any(|h| h == "intel-6"),
+        "soft_feature_sizing.big-parallel.min_cores=32 must exclude \
+         intel-6 (max_cores=16) from h_all. Got {:?} (cores={})",
+        intent.hw_class_names,
+        intent.cores
+    );
+    assert!(
+        intent
+            .hw_class_names
+            .iter()
+            .any(|h| h == "intel-7" || h == "intel-8"),
+        "≥32-core classes exist (intel-7/8 max_cores=64); the bias must \
+         keep at least one. Got {:?}",
+        intent.hw_class_names
+    );
+}
+
+/// **sh-008 degradation tripwire** — `soft_feature_sizing.min_cores` is
+/// a BIAS, never a constraint: when NO class meets `min_cores` (here
+/// 256 vs every class at 64), the post-filter `h_all` would be empty,
+/// so the bias MUST degrade to the unbiased candidate set rather than
+/// emit `hw_class_names=[]` (which the controller refuses to schedule).
+/// GREEN at base by vacuity (no `soft_feature_sizing` field → no
+/// filter); regression-only against a bias that empties the set.
+#[tokio::test]
+async fn solve_big_parallel_min_cores_degrades_when_unhostable() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    actor.dag.set_soft_features(vec!["big-parallel".into()]);
+    actor.sla_config.soft_feature_sizing.insert(
+        "big-parallel".into(),
+        crate::sla::config::SoftSizingHint { min_cores: 256 },
+    );
+
+    actor.test_inject_ready_with_features(
+        "d-bp",
+        Some("test-pkg"),
+        "x86_64-linux",
+        &["big-parallel"],
+    );
+    let state = actor.dag.node("d-bp").unwrap();
+    let (hw, cost, ig) = actor.solve_inputs();
+    let intent = actor.solve_intent_for(state, &hw, &cost, ig);
+
+    assert!(
+        !intent.hw_class_names.is_empty(),
+        "min_cores must NOT empty the candidate set — bias degrades to \
+         the unbiased h_all when no class hosts ≥ min_cores. Got {:?}",
+        intent.hw_class_names
+    );
+}
+
 /// **bug_019 §one-step-removed (a) inverse** — `--cores` larger than
 /// EVERY configured class's `max_cores` MUST emit empty
 /// `hw_class_names` so the controller's `fallback_cell` reaches its OWN
