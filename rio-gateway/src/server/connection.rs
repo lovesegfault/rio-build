@@ -1001,6 +1001,19 @@ impl Drop for ConnectionHandler {
         // connection closed also stops SessionGuards that drop after us
         // (the map below clears, aborting their response tasks) from
         // arming fresh timers against a dead connection.
+        //
+        // sh-009: dropping `self.sessions` below runs N×
+        // `ChannelSession::Drop`, each firing its per-channel
+        // `shutdown.cancel()`; each detached `_proto_task` reaches the
+        // unconditional `cancel_active_builds` chokepoint with THAT
+        // channel's set — the union over all channels IS every build on
+        // this connection (tripwire:
+        // `multi_channel_disconnect_cancels_all_builds`). A residual
+        // leak is therefore either a best-effort `CancelBuild` that
+        // never reached the scheduler
+        // (`rio_gateway_builds_leaked_on_disconnect_total`) or a
+        // build_id never inserted into the per-channel set; both fall
+        // through to `r[sched.backstop.orphan-watcher]`.
         self.idle.connection_dropped();
         if self.auth_attempted {
             self.active_conns.fetch_sub(1, Ordering::Relaxed);

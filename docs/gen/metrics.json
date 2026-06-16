@@ -82,6 +82,7 @@
     "rio_gateway_auth_degraded_total",
     "rio_gateway_build_reattach_total",
     "rio_gateway_build_resync_rate_paced_total",
+    "rio_gateway_builds_leaked_on_disconnect_total",
     "rio_gateway_bytes_total",
     "rio_gateway_channels_active",
     "rio_gateway_connections_active",
@@ -703,6 +704,11 @@
         "name": "rio_gateway_build_resync_rate_paced_total",
         "kind": "counter",
         "help": "WatchBuild re-attach cycles paced by the wall-clock rate axis (token bucket: RATE_MAX cycles per RATE_WINDOW sustained), labeled by the death cause that charged the cycle (cause: resync_signal | transport | eof_without_terminal | reattach_cycle_failed). Every death arm pays this axis through the one next_backoff chokepoint (merged_bug_083); refill is time-based, so paced cycles cannot drain the evidence. Sustained growth means a durably-slow event consumer (or undersized broadcast buffer) charging the scheduler one O(DAG) snapshot per cycle -- find the slow consumer, not a scheduler outage."
+      },
+      {
+        "name": "rio_gateway_builds_leaked_on_disconnect_total",
+        "kind": "counter",
+        "help": "Best-effort CancelBuild on session exit failed or timed out (labeled by reason: rpc_error | rpc_timeout). The build is now orphaned on the scheduler until r[sched.backstop.orphan-watcher] reaps it after the 5-min no-watcher grace. The sh-009 diagnostic: connections_active=0 with a build still Active is either this counter moving (cancel sent but did not reach the scheduler) or a build_id never inserted into active_build_ids — the per-channel cancel sweep itself is sound (multi_channel_disconnect_cancels_all_builds tripwire)."
       },
       {
         "name": "rio_gateway_bytes_total",

@@ -255,6 +255,155 @@ async fn test_cancel_build_recorded_by_mock_scheduler() -> anyhow::Result<()> {
 }
 
 // r[verify gw.conn.cancel-on-disconnect+3]
+/// sh-009 tripwire: when a TCP connection drops with N protocol channels
+/// open, EVERY channel's `active_build_ids` must reach `cancel_build`.
+///
+/// `ConnectionHandler::Drop` (server/connection.rs) drops the
+/// `sessions: HashMap<ChannelId, ChannelSession>` map; each
+/// `ChannelSession::Drop` fires its per-channel `shutdown.cancel()` and
+/// detaches `_proto_task` (NOT abort — see the field doc). Each detached
+/// task's `run_protocol_loop` `select!` observes the cancel and reaches
+/// the unconditional `cancel_active_builds(ctx, "channel_close")` with
+/// THAT channel's `active_build_ids`. The cancel scope is per-channel,
+/// but the connection-drop sweep is the union: every channel's set is
+/// cancelled.
+///
+/// This test models the TCP-drop sequence directly (one
+/// `sessions_shutdown` parent, two per-channel children — production:
+/// `connection.rs` `exec_request` does
+/// `self.sessions_shutdown.child_token()` per channel) and asserts the
+/// shared mock scheduler records BOTH cancels. It is the regression hold
+/// for the sh-009 symptom (`connections_active=0` with a build still
+/// `Active` scheduler-side): the per-channel cancel architecture is
+/// structurally sound; if a future change to `ChannelSession::Drop` or
+/// the `select!` cancellation-safety regresses one channel's path, this
+/// test reds before the orphan-watcher backstop has to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_channel_disconnect_cancels_all_builds() -> anyhow::Result<()> {
+    use rio_gateway::handler::SessionContext;
+    use rio_gateway::session::run_protocol_loop;
+    use rio_test_support::grpc::spawn_mock_store;
+
+    common::init_test_logging();
+
+    let (_store, store_addr, store_handle) = spawn_mock_store().await?;
+    let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
+
+    // Production: ConnectionHandler.sessions_shutdown is the per-
+    // connection parent; each exec_request takes a child and stores it
+    // on the ChannelSession; ChannelSession::Drop cancels THAT child.
+    let sessions_shutdown = rio_common::signal::Token::new();
+
+    /// Spawn one channel: seeded SessionContext + run_protocol_loop on a
+    /// duplex stream. Returns (client_stream, per-channel shutdown
+    /// token, join handle). Mirrors the exec_request shape: the task
+    /// gets `shutdown.child_token()`, the caller holds `shutdown` for
+    /// Drop to cancel.
+    async fn spawn_channel(
+        store_addr: &std::net::SocketAddr,
+        sched_addr: &std::net::SocketAddr,
+        parent: &rio_common::signal::Token,
+        build_id: &str,
+    ) -> anyhow::Result<(
+        tokio::io::DuplexStream,
+        rio_common::signal::Token,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    )> {
+        let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+        let log_client: rio_proto::LogServiceClient<_> =
+            rio_proto::client::connect_single(&store_addr.to_string()).await?;
+        let scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
+        let mut ctx = SessionContext::new(
+            store_client,
+            log_client,
+            scheduler_client,
+            None,
+            rio_gateway::handler::SessionJwt::none(),
+            None,
+            rio_gateway::TenantLimiter::disabled(),
+            rio_gateway::QuotaCache::new(),
+        );
+        ctx.active_build_ids.insert(build_id.to_string());
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let shutdown = parent.child_token();
+        let inner = shutdown.child_token();
+        let task = tokio::spawn(async move {
+            let (mut r, mut w) = tokio::io::split(server);
+            run_protocol_loop(&mut r, &mut w, &mut ctx, inner).await
+        });
+        Ok((client, shutdown, task))
+    }
+
+    let (mut s_a, tok_a, task_a) = spawn_channel(
+        &store_addr,
+        &sched_addr,
+        &sessions_shutdown,
+        "build-on-chan-a",
+    )
+    .await?;
+    let (mut s_b, tok_b, task_b) = spawn_channel(
+        &store_addr,
+        &sched_addr,
+        &sessions_shutdown,
+        "build-on-chan-b",
+    )
+    .await?;
+
+    // Both channels handshake and park on the opcode-read select. Hold
+    // the client streams alive so the exit is via the TOKEN, not EOF.
+    do_handshake(&mut s_a).await?;
+    send_set_options(&mut s_a).await?;
+    do_handshake(&mut s_b).await?;
+    send_set_options(&mut s_b).await?;
+
+    // Model `ConnectionHandler::Drop` clearing `sessions`: each
+    // ChannelSession::Drop fires its own `shutdown.cancel()`. Two
+    // independent cancels on two independent per-channel tokens — the
+    // exact production sequence (children do not cascade upward, so
+    // cancelling the parent would model the I-081 drain-timeout path,
+    // not the per-Drop path under test).
+    tok_a.cancel();
+    tok_b.cancel();
+
+    let ra = tokio::time::timeout(std::time::Duration::from_secs(10), task_a)
+        .await
+        .expect("channel A proto_task must exit within 10s after cancel")
+        .expect("task A must not panic");
+    let rb = tokio::time::timeout(std::time::Duration::from_secs(10), task_b)
+        .await
+        .expect("channel B proto_task must exit within 10s after cancel")
+        .expect("task B must not panic");
+    assert!(ra.is_ok(), "ChannelClose exit is Ok(())");
+    assert!(rb.is_ok(), "ChannelClose exit is Ok(())");
+
+    // THE assertion: BOTH channels' builds were cancelled with the
+    // channel_close reason (the ChannelSession::Drop attribution).
+    let cancels = sched.cancel_calls.read().unwrap().clone();
+    assert_eq!(
+        cancels.len(),
+        2,
+        "TCP drop with 2 open channels must send CancelBuild for every \
+         channel's active_build_ids; got: {cancels:?}"
+    );
+    let ids: std::collections::HashSet<_> = cancels.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(ids.contains("build-on-chan-a"), "got: {cancels:?}");
+    assert!(ids.contains("build-on-chan-b"), "got: {cancels:?}");
+    for (id, reason) in &cancels {
+        assert_eq!(
+            reason, "channel_close",
+            "build {id}: ChannelSession::Drop path attributes channel_close"
+        );
+    }
+
+    // Keep the client ends alive past the assertion so the only exit
+    // route was the token; drop now.
+    drop((s_a, s_b));
+    store_handle.abort();
+    sched_handle.abort();
+    Ok(())
+}
+
+// r[verify gw.conn.cancel-on-disconnect+3]
 /// P0444: idle-timeout exit path must call cancel_active_builds.
 ///
 /// Bughunter finding: run_protocol has four exit paths; three called

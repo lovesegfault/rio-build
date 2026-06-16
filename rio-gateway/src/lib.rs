@@ -65,6 +65,17 @@ pub fn describe_metrics() {
          stage=tcp-accepted|auth-attempted|authenticated|channel-open)"
     );
     describe_counter!(
+        "rio_gateway_builds_leaked_on_disconnect_total",
+        "Best-effort CancelBuild on session exit failed or timed out (labeled \
+         by reason: rpc_error | rpc_timeout). The build is now orphaned on the \
+         scheduler until r[sched.backstop.orphan-watcher] reaps it after the \
+         5-min no-watcher grace. The sh-009 diagnostic: connections_active=0 \
+         with a build still Active is either this counter moving (cancel sent \
+         but did not reach the scheduler) or a build_id never inserted into \
+         active_build_ids — the per-channel cancel sweep itself is sound \
+         (multi_channel_disconnect_cancels_all_builds tripwire)."
+    );
+    describe_counter!(
         "rio_gateway_bytes_total",
         "Bytes forwarded to/from SSH client (labeled by direction: rx/tx)"
     );

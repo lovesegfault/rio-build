@@ -104,9 +104,23 @@ async fn cancel_active_builds(ctx: &mut SessionContext, reason: &str) {
             }
             Ok(Err(e)) => {
                 warn!(build_id = %build_id, error = %e, "failed to cancel build on disconnect");
+                // sh-009: the cancel did not reach the scheduler. The
+                // build is now orphaned until
+                // `r[sched.backstop.orphan-watcher]` reaps it; this
+                // counter is the gateway-side observable for that gap.
+                metrics::counter!(
+                    "rio_gateway_builds_leaked_on_disconnect_total",
+                    "reason" => "rpc_error"
+                )
+                .increment(1);
             }
             Err(_) => {
                 warn!(build_id = %build_id, "cancel_build timed out on disconnect");
+                metrics::counter!(
+                    "rio_gateway_builds_leaked_on_disconnect_total",
+                    "reason" => "rpc_timeout"
+                )
+                .increment(1);
             }
         }
     }
