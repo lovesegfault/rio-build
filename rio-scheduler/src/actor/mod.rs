@@ -1027,6 +1027,11 @@ pub(crate) struct TestCounters {
     /// queued Success materialization reports must drive ONE batched
     /// completion call, not N per-item ones.
     pub complete_ready_batch_calls: std::sync::atomic::AtomicU64,
+    /// Incremented at every actor-level
+    /// [`SchedulerDb::max_known_generation`] call site (sh-007 row 1).
+    /// Asserts on the cached-floor rule: N PullAssignments drive at
+    /// most one Tick-head refresh, not N per-pull PG round-trips.
+    pub max_known_generation_reads: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
@@ -1038,6 +1043,7 @@ impl TestCounters {
             solve_inputs_calls: self.solve_inputs_calls.load(SeqCst),
             evidence_writes_fenced: self.evidence_writes_fenced.load(SeqCst),
             complete_ready_batch_calls: self.complete_ready_batch_calls.load(SeqCst),
+            max_known_generation_reads: self.max_known_generation_reads.load(SeqCst),
         }
     }
 }
@@ -1056,6 +1062,8 @@ pub struct TestCountersSnapshot {
     pub evidence_writes_fenced: u64,
     /// See [`TestCounters::complete_ready_batch_calls`].
     pub complete_ready_batch_calls: u64,
+    /// See [`TestCounters::max_known_generation_reads`].
+    pub max_known_generation_reads: u64,
 }
 
 impl DagActor {

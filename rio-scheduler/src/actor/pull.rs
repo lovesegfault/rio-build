@@ -638,6 +638,10 @@ impl DagActor {
             return Err(PullRejection::NotLeader);
         }
         let serving_generation = self.serving_generation;
+        #[cfg(test)]
+        self.test_counters
+            .max_known_generation_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let generation_floor = self
             .db
             .max_known_generation()

@@ -2641,3 +2641,41 @@ async fn refit_down_stamp_carries_the_dispatched_deadline() -> TestResult {
     );
     Ok(())
 }
+
+/// sh-007 row 1: PullAssignment must read the cached
+/// `generation_floor_cached` field, not issue a per-pull
+/// `db.max_known_generation()` PG round-trip. iter1 measured 149k
+/// floor reads (41% of actor busy time) at 22/s; the floor moves at
+/// most once per leader transition, so a per-pull read is pure waste.
+/// RED at 7d960f37: every pull reads PG — 10 pulls → 10 reads. After
+/// the cache (refreshed at LeaderAcquired + Tick head) the same 10
+/// pulls drive ≤2 reads (init + at most one tick).
+#[tokio::test]
+async fn sh007_pull_assignment_reads_cached_floor_not_pg() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "floor-cache",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+
+    let before = handle.debug_counters().await?.max_known_generation_reads;
+
+    // 10 pulls against the same node: the first mints, the rest
+    // re-deliver the held attempt. Each one — at base — issues its own
+    // claims-floor PG read.
+    for _ in 0..10 {
+        let _ = pull(&handle, "floor-cache", Some("floor-cache")).await;
+    }
+
+    let delta = handle.debug_counters().await?.max_known_generation_reads - before;
+    assert!(
+        delta <= 2,
+        "RED at base: 10 PullAssignments drove {delta} db.max_known_generation() \
+         reads — the per-pull floor read must be a cached field read \
+         (≤2: init + at most one Tick-head refresh)"
+    );
+    Ok(())
+}
