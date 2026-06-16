@@ -8135,10 +8135,11 @@ rec {
         "markedIncrementsOnlyOnEdges"
         "noRemarkFromLatchedEpisode"
       ];
-      # iter3e on rio (big-parallel → ≥32-core via softFeatureSizing):
-      # 184M states at 1800s, 6.2M/min, queue 1.17M still draining at
-      # depth 8. Extrapolating to 209M total ≈ 34min → 3600s ≈ 1.7×.
-      modelTimeoutSec = 3600;
+      modelTimeoutSec = 1800;
+      # sh-008: 209M states / 7m29s @ workers=auto (measured above) —
+      # big-parallel routes this to a ≥32-core hwClass via the
+      # scheduler's soft_feature_sizing.min_cores bias instead of the
+      # 16-core reference cell.
       requiredSystemFeatures = [ "big-parallel" ];
     };
 
