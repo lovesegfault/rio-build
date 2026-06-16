@@ -174,3 +174,18 @@ fn guard_join_drop_during_unwind_yields_original_panic() {
     // and yields, so #[should_panic(expected=…)] matches.
     panic!("the actual failure");
 }
+
+#[test]
+fn guard_health_addr_default_is_dual_stack() {
+    // sh-002 close-gate red: GuardConfig::default() bound 0.0.0.0:9194
+    // (IPv4-only); k3s VM fixture is IPv6 single-stack → kubelet
+    // httpGet:[v6]:9194 refused → liveness 6× → CrashLoopBackOff on
+    // every vm-*-k3s. Every listener uses rio_common::default_addr
+    // ([::]); the guard's must too. Sibling at rio-controller/src/
+    // guard.rs:135 was latent (controller's main.rs overrides via
+    // cfg.health_addr).
+    assert_eq!(
+        rio_scheduler::guard::GuardConfig::default().health_addr,
+        rio_common::default_addr(9194),
+    );
+}

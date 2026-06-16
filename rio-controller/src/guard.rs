@@ -132,7 +132,7 @@ pub struct GuardConfig {
 impl Default for GuardConfig {
     fn default() -> Self {
         Self {
-            health_addr: ([0, 0, 0, 0], 9194).into(),
+            health_addr: rio_common::default_addr(9194),
             probe_interval: Duration::from_secs(1),
             stall_threshold: Duration::from_secs(1),
             ready_probe_budget: Duration::from_secs(1),
