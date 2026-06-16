@@ -255,6 +255,12 @@ pub fn next(
     let probe = hints
         .required_features
         .iter()
+        // sh-008: chain the recorded soft set so a soft-only feature
+        // (`big-parallel`) can carry a cold-start probe override —
+        // pre-chain the post-strip `required_features` is `[]` and the
+        // lookup falls through to `cfg.probe` regardless of what
+        // `feature_probes.big-parallel` says.
+        .chain(hints.soft_features.iter())
         .find_map(|f| cfg.feature_probes.get(f))
         .unwrap_or(&cfg.probe);
     let mem_for = |c: f64| MemBytes((c * probe.mem_per_core as f64 + probe.mem_base as f64) as u64);

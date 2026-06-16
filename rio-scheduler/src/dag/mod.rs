@@ -194,13 +194,20 @@ impl DerivationDag {
         if self.soft_features.is_empty() {
             return;
         }
-        let stripped: Vec<String> = state
+        // sh-008: PARTITION instead of strip-only. `hard` keeps the
+        // I-204 routing semantics (write-gate re-derives
+        // `effective_features`); `soft` records the stripped hints on
+        // a sibling field so SIZING (feature_probes / soft_feature_
+        // sizing.min_cores) can read them. Recovery re-partitions from
+        // the verbatim PG `required_features` column at every
+        // `insert_recovered_node` — no new column.
+        let (soft, hard): (Vec<String>, Vec<String>) = state
             .required_features()
             .iter()
-            .filter(|f| !self.soft_features.iter().any(|sf| sf == *f))
             .cloned()
-            .collect();
-        state.set_required_features(stripped);
+            .partition(|f| self.soft_features.iter().any(|sf| sf == f));
+        state.set_required_features(hard);
+        state.set_soft_features(soft);
     }
 
     /// Insert a pre-built node (Phase 3b state recovery). No cycle

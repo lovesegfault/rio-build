@@ -1175,6 +1175,16 @@ pub struct DerivationState {
     /// `Deref`, no `pub` field, no `From<Vec<String>>`; the only
     /// producer is [`EffectiveFeatures::derive`]).
     effective_features: EffectiveFeatures,
+    /// sh-008: the I-204 soft-feature partition — the members of the
+    /// declared `requiredSystemFeatures` that `apply_soft_features`
+    /// stripped from [`Self::required_features`]. SIZING reads this
+    /// (via `DrvHints.soft_features` → `feature_probes` lookup, and the
+    /// `soft_feature_sizing.min_cores` `h_all` bias); ROUTING reads
+    /// [`Self::effective_features`] only — soft hints never feed the
+    /// §13e/r35 chokepoint. Private: write-gate is
+    /// [`Self::set_soft_features`] (sibling field write only — does NOT
+    /// touch `effective_features`). Read via [`Self::soft_features`].
+    soft_features: Vec<String>,
     /// Output names (e.g. ["out", "dev"]).
     pub output_names: Vec<String>,
     /// Whether this is a fixed-output derivation (fetchurl, etc.).
@@ -1451,6 +1461,10 @@ impl DerivationState {
             prefer_local_build: node.prefer_local_build,
             system: node.system.clone(),
             required_features: node.required_features.clone(),
+            // sh-008: empty at construction — `apply_soft_features`
+            // (called by both `dag.merge` and `insert_recovered_node`)
+            // partitions `required_features` and stamps this.
+            soft_features: Vec::new(),
             effective_features: EffectiveFeatures::derive(
                 node.is_fixed_output,
                 &node.required_features,
@@ -1552,6 +1566,10 @@ impl DerivationState {
             system: row.system,
             effective_features,
             required_features: row.required_features,
+            // sh-008: `insert_recovered_node` → `apply_soft_features`
+            // partitions the verbatim PG `required_features` row above
+            // and stamps this — no PG column.
+            soft_features: Vec::new(),
             output_names: row.output_names,
             is_fixed_output: row.is_fixed_output,
             ca: CaState {
@@ -1664,6 +1682,7 @@ impl DerivationState {
             prefer_local_build: None,
             system: row.system,
             required_features: Vec::new(),
+            soft_features: Vec::new(),
             effective_features,
             output_names: Vec::new(),
             is_fixed_output: row.is_fixed_output,
@@ -1735,6 +1754,25 @@ impl DerivationState {
     /// this raw set is a §13e/r35 chokepoint bypass.
     pub fn required_features(&self) -> &[String] {
         &self.required_features
+    }
+
+    /// sh-008: the I-204 soft-feature partition (the declared
+    /// `requiredSystemFeatures` that `apply_soft_features` stripped).
+    /// SIZING reads this — `DrvHints.soft_features` /
+    /// `soft_feature_sizing.min_cores` `h_all` bias. ROUTING reads
+    /// [`Self::effective_features`] only.
+    pub fn soft_features(&self) -> &[String] {
+        &self.soft_features
+    }
+
+    /// Write-gate for the recorded soft-feature partition (sh-008).
+    /// Sibling field write only — does NOT call
+    /// [`EffectiveFeatures::derive`]: soft hints are NOT routing inputs
+    /// and never feed the §13e/r35 chokepoint. Exactly one production
+    /// caller (`apply_soft_features`); the constructors leave the field
+    /// empty.
+    pub(crate) fn set_soft_features(&mut self, soft: Vec<String>) {
+        self.soft_features = soft;
     }
 
     /// Atomic write-gate for `required_features`. ALL post-construction

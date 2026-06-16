@@ -387,6 +387,12 @@ pub struct DrvHints {
     /// per-feature probe-shape override (e.g. `kvm` builds want a high
     /// mem floor regardless of core count).
     pub required_features: Vec<String>,
+    /// sh-008: the I-204 soft-feature partition (`big-parallel` /
+    /// `benchmark` after the strip). Chained into the same
+    /// `feature_probes` lookup as `required_features` so a soft-only
+    /// feature can carry a cold-start probe override; routing never
+    /// reads this.
+    pub soft_features: Vec<String>,
 }
 
 /// Per-derivation `(cores, mem, disk)` for a [`SpawnIntent`]. Wraps

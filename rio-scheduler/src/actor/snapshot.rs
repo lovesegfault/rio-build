@@ -2464,6 +2464,10 @@ impl DagActor {
             enable_parallel_building: state.enable_parallel_building,
             prefer_local_build: state.prefer_local_build,
             required_features: feat.clone(),
+            // sh-008: the recorded soft partition — feeds
+            // `explore::next` / probe-deadline `feature_probes` lookup;
+            // routing reads `feat` only.
+            soft_features: state.soft_features().to_vec(),
         };
 
         // r[impl sched.sla.hw-class.admissible-set]
@@ -3199,6 +3203,9 @@ impl DagActor {
         let probe_deadline = hints
             .required_features
             .iter()
+            // sh-008: same chain `explore::next` uses — soft-only
+            // features reach the deadline override.
+            .chain(hints.soft_features.iter())
             .find_map(|f| self.sla_config.feature_probes.get(f))
             .unwrap_or(&self.sla_config.probe)
             .deadline_secs;
