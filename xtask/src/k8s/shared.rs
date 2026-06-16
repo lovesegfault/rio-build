@@ -530,6 +530,75 @@ impl Drop for ProcessGuard {
     }
 }
 
+/// Drop-guard over a supervisor task that owns a [`ProcessGuard`] and
+/// (optionally) respawns it when the child exits. sh-011: a `kubectl
+/// port-forward` death mid-build (observed iter3 T+~1800s) drops the
+/// ssh-ng connection; the [`GatewayEndpoint::Tunnel`] fallback wraps
+/// its port-forward in a respawn loop so a transient apiserver-proxy
+/// hiccup doesn't kill an hour-long `nix build --store ssh-ng://…`.
+///
+/// Drop aborts the supervisor task at its next await point; the
+/// task's local `ProcessGuard` then drops → `killpg`. NOT synchronous
+/// (same best-effort contract as [`ProcessGuard`] itself), but
+/// `with_remote_store` returning is the only caller and a few-ms tail
+/// is harmless there.
+///
+/// [`GatewayEndpoint::Tunnel`]: crate::k8s::provider::GatewayEndpoint::Tunnel
+pub struct SupervisedTunnel(tokio::task::JoinHandle<()>);
+
+impl SupervisedTunnel {
+    /// Hold `guard` until dropped — no respawn. Used by the default
+    /// `Provider::gateway_endpoint` impl (k3s, the `phases.rs` mock):
+    /// same semantics as holding the bare `ProcessGuard` today.
+    pub fn hold(guard: ProcessGuard) -> Self {
+        Self(tokio::spawn(async move {
+            // Park forever; on abort the future drops, `_g` drops,
+            // killpg fires.
+            let _g = guard;
+            std::future::pending::<()>().await;
+        }))
+    }
+
+    /// Own `first` and, when it exits, `kill_port_listeners(port)` +
+    /// `respawn(port)` up to `max` times. The respawn closure rebinds
+    /// the same `port` (the first bind may have been ephemeral; the
+    /// concrete port is what we re-use) so the caller's
+    /// `ssh-ng://rio@localhost:{port}` URL stays valid across a
+    /// kubectl death.
+    pub fn supervise<F, Fut>(mut guard: ProcessGuard, port: u16, max: u32, respawn: F) -> Self
+    where
+        F: Fn(u16) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(u16, ProcessGuard)>> + Send,
+    {
+        Self(tokio::spawn(async move {
+            for n in 1..=max {
+                // `wait()` is cancel-safe; on abort `guard` drops here.
+                let status = guard.child.wait().await;
+                tracing::warn!(
+                    ?status,
+                    "gateway port-forward died; reaping :{port} and respawning ({n}/{max})"
+                );
+                kill_port_listeners(port);
+                match respawn(port).await {
+                    Ok((_, g)) => guard = g,
+                    Err(e) => {
+                        tracing::error!("gateway port-forward respawn {n} failed: {e:#}");
+                        return;
+                    }
+                }
+            }
+            tracing::error!("gateway port-forward exceeded {max} respawns; holding last child");
+            let _ = guard.child.wait().await;
+        }))
+    }
+}
+
+impl Drop for SupervisedTunnel {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Spawn `kubectl port-forward <target> <local>:<remote>` in `ns` and
 /// return `(bound_local_port, drop-guard)`. `target` is the full
 /// kubectl resource ref (`svc/rio-gateway`, `pod/rio-scheduler-abc`).
@@ -851,6 +920,31 @@ mod tests {
             merge_authorized_key_lines("", "ssh-ed25519 AAAA ops"),
             "ssh-ed25519 AAAA ops\n"
         );
+    }
+
+    /// sh-011: `with_remote_store` returning MUST tear the tunnel
+    /// down. `SupervisedTunnel` holds the guard on a spawned task;
+    /// Drop aborts it → the task's local `ProcessGuard` drops →
+    /// killpg. RED at base: `SupervisedTunnel` does not exist.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn supervised_tunnel_drop_kills_held_child() {
+        use ::nix::sys::signal::kill;
+        use ::nix::unistd::Pid;
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("60");
+        let guard = ProcessGuard::spawn(cmd).expect("spawn sleep");
+        let pid = Pid::from_raw(i32::try_from(guard.child.id().unwrap()).unwrap());
+        let st = SupervisedTunnel::hold(guard);
+        assert!(kill(pid, None).is_ok(), "child alive pre-drop");
+        drop(st);
+        for _ in 0..40 {
+            if kill(pid, None).is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("held child still alive 2s after SupervisedTunnel drop");
     }
 
     #[test]

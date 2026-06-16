@@ -6,7 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tempfile::TempDir;
 
-use super::shared::ProcessGuard;
+use super::shared::{ProcessGuard, SupervisedTunnel};
 use crate::config::XtaskConfig;
 
 /// Knobs for [`Provider::deploy`]. Bundled so adding the next deploy
@@ -71,8 +71,9 @@ pub enum GatewayEndpoint {
     /// xtask-side port-forward death.
     Direct { host: String, port: u16 },
     /// `ssh-ng://rio@localhost:{port}` via `kubectl port-forward`.
-    /// Dropping `_guard` tears the tunnel down.
-    Tunnel { port: u16, _guard: ProcessGuard },
+    /// Dropping `_guard` aborts the supervisor task → its inner
+    /// `ProcessGuard` drops → killpg.
+    Tunnel { port: u16, _guard: SupervisedTunnel },
 }
 
 impl GatewayEndpoint {
@@ -176,8 +177,11 @@ pub trait Provider: Send + Sync {
     /// `local_port` is the bind hint for the `Tunnel` fallback; `0`
     /// binds ephemerally. Ignored for `Direct`.
     async fn gateway_endpoint(&self, local_port: u16) -> Result<GatewayEndpoint> {
-        let (port, _guard) = self.tunnel(local_port).await?;
-        Ok(GatewayEndpoint::Tunnel { port, _guard })
+        let (port, guard) = self.tunnel(local_port).await?;
+        Ok(GatewayEndpoint::Tunnel {
+            port,
+            _guard: SupervisedTunnel::hold(guard),
+        })
     }
 
     /// Open port-forwards to scheduler:9001 and store:9002, waiting

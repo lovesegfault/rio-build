@@ -114,7 +114,7 @@ impl Provider for Eks {
                 "gateway Service has no LoadBalancer ingress yet; falling back to port-forward"
             );
         }
-        let (port, _guard) = smoke::gateway_port_forward(local_port).await?;
+        let (port, _guard) = smoke::supervised_gateway_port_forward(local_port).await?;
         Ok(GatewayEndpoint::Tunnel { port, _guard })
     }
 

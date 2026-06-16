@@ -21,7 +21,7 @@ use tracing::{debug, info};
 use super::TF_DIR;
 use crate::config::XtaskConfig;
 use crate::k8s::client as kube;
-use crate::k8s::shared::ProcessGuard;
+use crate::k8s::shared::{ProcessGuard, SupervisedTunnel};
 use crate::k8s::{NS, NS_BUILDERS, NS_FETCHERS};
 use crate::sh::{self, cmd, shell};
 use crate::{ssh, tofu, ui};
@@ -448,6 +448,24 @@ pub async fn gateway_port_forward(local_port: u16) -> Result<(u16, ProcessGuard)
     })
     .await?;
     Ok((port, guard))
+}
+
+/// [`gateway_port_forward`] wrapped in a respawn loop. The first
+/// bind happens here (so the SSH banner is verified before the caller
+/// builds a store URL); a supervisor task then watches the kubectl
+/// child and on exit reaps `:port` + re-runs `gateway_port_forward`
+/// against the same bound port (up to 10×). The
+/// [`Eks::gateway_endpoint`] fallback path (NLB unreachable) uses
+/// this so a transient port-forward death doesn't kill an in-flight
+/// `nix build --store ssh-ng://…`.
+///
+/// [`Eks::gateway_endpoint`]: crate::k8s::provider::Provider::gateway_endpoint
+pub async fn supervised_gateway_port_forward(local_port: u16) -> Result<(u16, SupervisedTunnel)> {
+    let (port, guard) = gateway_port_forward(local_port).await?;
+    Ok((
+        port,
+        SupervisedTunnel::supervise(guard, port, 10, gateway_port_forward),
+    ))
 }
 
 /// Connect to `host:port` and read the server's SSH version string.
