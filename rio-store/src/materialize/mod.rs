@@ -1375,6 +1375,176 @@ mod tests {
         drop(admission);
     }
 
+    // ── sh-002 (S1): substitution-claim fanout collapse ───────────────
+    //
+    // The headline structural fix: today executor_concurrency workers
+    // each run an INDEPENDENT poll_and_claim loop with its own ledger
+    // and identity, so a 46-replica fleet at 25 workers each races
+    // 1,150 distinct claimants on the same ~512-row rendezvous head —
+    // 332:1 reject ratio, ~0.4 claims/s. The fix collapses this to ONE
+    // claim coordinator per replica that exclusively owns list+pull.
+
+    // r[verify store.materialize.gate-share+1]
+    /// **sh-002 (a) — single-claimer-per-replica.** Spawn 8 worker
+    /// claim loops over a shared 4-slot pool (the production
+    /// executor_concurrency > path_slots regime); the mock scheduler
+    /// records which executor_instance every PullAssignment carried.
+    ///
+    /// Proposition: a replica issues PullAssignment under EXACTLY ONE
+    /// caller identity — the per-replica claim coordinator. RED at
+    /// base: each worker pulls under its own `{pod}-w{n}` identity,
+    /// so distinct-instance count ≥ the slot count (4); the captured
+    /// red is the herd the advisory measured at 332:1.
+    ///
+    /// **(b)** — slot ≺ claim (bug_102 retarget at the coordinator):
+    /// with 4 slots, the mock NEVER sees more than 4 PullAssignment
+    /// requests in one pass. RED at base: 4 admitted workers each mint
+    /// up to `1 + STEAL_SPECULATION_ALLOWANCE = 2` per pass on a
+    /// fully-contested listing — 8 pulls/pass against 4 slots.
+    #[tokio::test]
+    async fn sh002_single_claimer_per_replica_slot_precedes_claim() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct HerdState {
+            pull_instances: HashSet<String>,
+            pulls_this_window: usize,
+            max_pulls_per_window: usize,
+            list_calls: usize,
+        }
+        #[derive(Clone)]
+        struct HerdTransport {
+            state: Arc<Mutex<HerdState>>,
+        }
+        impl client::MaterializeTransport for HerdTransport {
+            async fn list_jobs(
+                &mut self,
+                _req: rio_proto::types::ListMaterializationJobsRequest,
+            ) -> Result<rio_proto::types::ListMaterializationJobsResponse, tonic::Status>
+            {
+                let mut st = self.state.lock().unwrap();
+                st.list_calls += 1;
+                // The next listing call begins a new pass window: fold
+                // the prior window's pull count into the max, then
+                // reset (a coarse but deterministic per-pass census on
+                // the listing edge; both base and post-fix shape gate
+                // pulls behind a listing).
+                st.max_pulls_per_window = st.max_pulls_per_window.max(st.pulls_this_window);
+                st.pulls_this_window = 0;
+                Ok(rio_proto::types::ListMaterializationJobsResponse {
+                    jobs: (0..8)
+                        .map(|n| rio_proto::types::MaterializationJobDescriptor {
+                            job_id: uuid::Uuid::now_v7().to_string(),
+                            drv_hash: format!("herd-drv-{n}"),
+                            tenant_id: String::new(),
+                            origin: "cache_opportunity".into(),
+                        })
+                        .collect(),
+                })
+            }
+            async fn pull(
+                &mut self,
+                req: rio_proto::types::PullAssignmentRequest,
+            ) -> Result<rio_proto::types::PullAssignmentResponse, tonic::Status> {
+                let mut st = self.state.lock().unwrap();
+                st.pull_instances.insert(req.executor_instance);
+                st.pulls_this_window += 1;
+                Ok(rio_proto::types::PullAssignmentResponse {
+                    outcome: Some(
+                        rio_proto::types::pull_assignment_response::Outcome::NotYetReady(
+                            rio_proto::types::NotYetReady {
+                                retry_after_seconds: 0,
+                            },
+                        ),
+                    ),
+                })
+            }
+            async fn report(
+                &mut self,
+                _req: rio_proto::types::ReportOutcomeRequest,
+            ) -> Result<(), tonic::Status> {
+                Ok(())
+            }
+            async fn report_progress(
+                &mut self,
+                _req: rio_proto::types::ReportMaterializationProgressRequest,
+            ) -> Result<(), tonic::Status> {
+                Ok(())
+            }
+        }
+
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let substituter =
+            std::sync::Arc::new(crate::substitute::Substituter::new(db.pool.clone(), None));
+        let shutdown = rio_common::signal::Token::new();
+        let pool = executor::PathSlotPool::new(4);
+        let state = Arc::new(Mutex::new(HerdState::default()));
+        let transport = HerdTransport {
+            state: Arc::clone(&state),
+        };
+        let pod = executor_instance();
+
+        // The production spawn shape: N independent claim_loop tasks
+        // over one pool. Paused virtual clock: contested passes pace
+        // the beat (no stated floor) and auto-advance.
+        tokio::time::pause();
+        let mut tasks = Vec::new();
+        for worker in 0..8 {
+            let ctx = executor::ExecutorContext::new(
+                db.pool.clone(),
+                std::sync::Arc::clone(&substituter),
+                1,
+                pool.clone(),
+            );
+            tasks.push(tokio::spawn(claim_loop(
+                worker,
+                crate::config::MaterializationConfig::default(),
+                ctx,
+                transport.clone(),
+                pod.with_worker(worker),
+                shutdown.clone(),
+            )));
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        shutdown.cancel();
+        for t in tasks {
+            tokio::time::timeout(Duration::from_secs(5), t)
+                .await
+                .expect("loop exits on shutdown")
+                .unwrap();
+        }
+
+        let st = state.lock().unwrap();
+        assert!(
+            st.list_calls > 0,
+            "the harness drove at least one listing pass"
+        );
+        // (a) — the headline: one claimant identity per replica.
+        assert_eq!(
+            st.pull_instances.len(),
+            1,
+            "left: {} distinct executor_instance values issued PullAssignment \
+             (the per-worker thundering herd) / right: ONE per-replica claim \
+             coordinator owns list+pull — saw {:?}",
+            st.pull_instances.len(),
+            st.pull_instances
+        );
+        // (b) — slot ≺ claim at the coordinator: pulls per pass never
+        // exceed the path-slot pool capacity (the per-pass speculation
+        // allowance is structurally unreachable with one claimer over
+        // disjoint rendezvous slices).
+        assert!(
+            st.max_pulls_per_window <= pool.capacity(),
+            "left: {} PullAssignment in one pass against {} path slots \
+             (per-worker speculation over-minted past aggregate slot \
+             headroom) / right: the coordinator mints at most one pull \
+             per offered slot token",
+            st.max_pulls_per_window,
+            pool.capacity()
+        );
+    }
+
     // ===================================================================
     // Round-9 WO-S1-6 (bug_083) — the slot hold is scoped to WORK, not
     // to the loop: a claimless pass's admission drops BEFORE the pacing
