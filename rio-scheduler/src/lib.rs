@@ -315,8 +315,8 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_resource_floor_bumps_total",
         "resource_floor doublings on explicit resource-exhaustion signals (D4, \
-         labeled reason=cgroup_oom|disk_full|timeout|witnessed_oom; timeout \
-         covers DeadlineExceeded too). cgroup_oom and disk_full consume the \
+         labeled reason=cgroup_oom|disk_full|timeout|witnessed_oom|compute_bound; \
+         timeout covers DeadlineExceeded too). cgroup_oom and disk_full consume the \
          TYPED failure_classification wire field, corroborated against the \
          dispatch-assigned shape (bug_090 — worker free text drives nothing; \
          uncorroborated claims are refused and counted on \
@@ -326,7 +326,10 @@ pub fn describe_metrics() {
          worker-reported; witnessed_oom is the controller-witnessed OomKilled \
          letter promoted at the establishment sweep, once per attempt ever via \
          the establishment transaction's won flag (live_058-b — witnessed \
-         evictions are classify-only and have NO label here). The stream-era \
+         evictions are classify-only and have NO label here); compute_bound is \
+         an executor-variant exit≠0 whose cpu_util (cpu_seconds_total / \
+         (assigned_deadline × assigned_cores)) corroborated ≥ threshold — the \
+         D4 cores axis (sh-012), never fired on bare exit≠0. The stream-era \
          oom_killed/disk_pressure/deadline_exceeded label arms were retired \
          with the heuristic promote paths; the caller alphabet is \
          census-pinned (bump_resource_floor_caller_census, db/live_pins.rs). \

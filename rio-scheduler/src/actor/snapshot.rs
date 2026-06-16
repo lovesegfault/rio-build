@@ -2946,7 +2946,12 @@ impl DagActor {
                 // one would be.
                 let fclamped =
                     super::floor::ClampedFloor::of(&state.sched.resource_floor, &self.sla_ceilings);
-                let eff_cores = memo.a.c_star.min(self.sla_ceilings.max_cores as u32).max(1);
+                let eff_cores = memo
+                    .a
+                    .c_star
+                    .max(fclamped.cores)
+                    .min(self.sla_ceilings.max_cores as u32)
+                    .max(1);
                 // merged_bug_016: the global mem pin is the
                 // SOLVE-domain cap (`mem_solve_cap`) and the per-class
                 // survival compare is the constructed container
@@ -3082,7 +3087,12 @@ impl DagActor {
                 // cores and succeeds). The shared chokepoint clamp at
                 // the end of `solve_intent_for` re-applies the same
                 // bounds — this pre-clamp is idempotent under it.
-                let c = c.min(self.sla_ceilings.max_cores as u32).max(1);
+                let fclamped =
+                    super::floor::ClampedFloor::of(&state.sched.resource_floor, &self.sla_ceilings);
+                let c = c
+                    .max(fclamped.cores)
+                    .min(self.sla_ceilings.max_cores as u32)
+                    .max(1);
                 // live_051(d): the floor max consumes the CLAMPED
                 // projection — a stale persisted floor (minted under a
                 // larger old global) can never re-raise demand past
@@ -3091,13 +3101,7 @@ impl DagActor {
                 // the pre-clamped demand renders a hostable container
                 // (`== global` exactly), never `global + pad`.
                 let m = m
-                    .max(
-                        super::floor::ClampedFloor::of(
-                            &state.sched.resource_floor,
-                            &self.sla_ceilings,
-                        )
-                        .mem_bytes,
-                    )
+                    .max(fclamped.mem_bytes)
                     .min(super::floor::mem_solve_cap(&self.sla_ceilings));
                 // r[impl scheduler.sla.ceiling.stale-solve-revalidation+2]
                 // live_050(e)/live_051(b): the emission chokepoint
@@ -3136,7 +3140,7 @@ impl DagActor {
                 (c, m, d, cells, None)
             }
         };
-        // r[impl sched.sla.reactive-floor+4]
+        // r[impl sched.sla.reactive-floor+5]
         // D4: floor AND ceiling at the single post-solve chokepoint.
         // Floor: a derivation that OOM'd at its solved mem had
         // `bump_floor_or_count` double `floor.mem`; the next solve
@@ -3148,18 +3152,23 @@ impl DagActor {
         // tightened `max_disk`/`max_mem`/`max_cores` would otherwise
         // spawn a permanently-Pending pod. `bump_floor_or_count`
         // already caps `floor` at `ceil` (floor.rs), so
-        // `.max(floor).min(ceil)` always yields `≤ ceil`. Cores has no
-        // `resource_floor` dimension (OOM/DiskPressure are mem/disk
-        // under-provision, per the spec); `.max(1)` is belt-and-braces
-        // — every upstream branch already floors at 1.
-        // live_051(d): mem/disk floor dimensions consume the CLAMPED
-        // projection (stale persisted floors are grounded at the live
-        // ceilings on every read — see `actor::floor::ClampedFloor`);
-        // the deadline dimension keeps the raw floor, capped by
-        // DEADLINE_CAP_SECS below (Ceilings has no time axis).
+        // `.max(floor).min(ceil)` always yields `≤ ceil`. `.max(1)` is
+        // belt-and-braces — every upstream branch already floors at 1.
+        // live_051(d): mem/disk/cores floor dimensions consume the
+        // CLAMPED projection (stale persisted floors are grounded at
+        // the live ceilings on every read — see
+        // `actor::floor::ClampedFloor`); the deadline dimension keeps
+        // the raw floor, capped by DEADLINE_CAP_SECS below (Ceilings
+        // has no time axis). The cores floor (sh-012) overlays AFTER
+        // the SLA solve and the soft-feature `min_cores` bias — both
+        // reach this chokepoint as `max(solved, floor.cores)`; neither
+        // sees the other.
         let floor = &state.sched.resource_floor;
         let fclamped = super::floor::ClampedFloor::of(floor, &self.sla_ceilings);
-        let cores = cores.min(self.sla_ceilings.max_cores as u32).max(1);
+        let cores = cores
+            .max(fclamped.cores)
+            .min(self.sla_ceilings.max_cores as u32)
+            .max(1);
         // merged_bug_016: the dispatch funnel pins mem at the
         // SOLVE-domain cap (`mem_solve_cap` — the inverse of the
         // shared container law), NOT the raw global. The raw pin put

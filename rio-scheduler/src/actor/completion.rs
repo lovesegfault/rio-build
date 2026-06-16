@@ -1296,7 +1296,7 @@ impl DagActor {
             .collect()
     }
 
-    // r[impl sched.sla.reactive-floor+4]
+    // r[impl sched.sla.reactive-floor+5]
     /// Double the relevant `resource_floor` dimension for `drv_hash`
     /// (D4). Thin wrapper around `floor::bump_floor_or_count` that
     /// handles the dag-node lookup, metric, log, and best-effort PG
@@ -2156,6 +2156,10 @@ impl DagActor {
         // unknown discriminants are Unspecified, a failure route).
         let wire_status = rio_proto::types::BuildResultStatus::try_from(result.status)
             .unwrap_or(rio_proto::types::BuildResultStatus::Unspecified);
+        // sh-012 D4 cores axis: the compute-bound corroborant.
+        // Extracted before `final_resources` is moved into the echo
+        // (failure paths) — `Option<f64>` is Copy.
+        let cpu_seconds_total = final_resources.as_ref().and_then(|r| r.cpu_seconds_total);
         let mut echo = (!matches!(
             wire_status,
             rio_proto::types::BuildResultStatus::Built
@@ -2485,6 +2489,7 @@ impl DagActor {
                         drv_hash,
                         executor_id,
                         failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
+                        cpu_seconds_total,
                     )
                     .await;
                 match handling {
@@ -4835,6 +4840,7 @@ impl DagActor {
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
         report: FailureReportCtx<'_>,
+        cpu_seconds_total: Option<f64>,
     ) -> FailureHandling {
         let observed_at = Instant::now();
         let mut attempt_row = self.attempt_row_for(
@@ -4846,6 +4852,37 @@ impl DagActor {
             row.executor_id = Some(executor_id.clone());
             row.error_msg = (!report.error_msg.is_empty()).then(|| report.error_msg.to_string());
             row.final_line_count = report.final_line_count;
+        }
+        // r[impl sched.sla.reactive-floor+5]
+        // sh-012 D4 cores axis: BEFORE the verdict, mint the
+        // compute-bound witness. cpu_util = cpu_seconds_total /
+        // (assigned_deadline × assigned_cores); when ≥ threshold the
+        // attempt demonstrably exhausted its parallelism budget and
+        // floor.cores doubles. A genuine compile-error exit (cpu_util
+        // ≪ threshold) refuses — the inverse-cost bound: 3 attempts at
+        // the same shape, never 3× resource. Same prologue shape as
+        // `handle_timeout_failure`'s timeout-witness mint.
+        let compute_witness = {
+            let intent = self
+                .dag
+                .node(drv_hash)
+                .and_then(|s| s.sched.last_intent.as_ref())
+                .map(|i| (i.cores, i.deadline_secs))
+                .unwrap_or((0, 0));
+            super::floor::CorroborationWitness::corroborated_compute_bound(
+                cpu_seconds_total,
+                intent.0,
+                intent.1,
+                self.sla_config.compute_bound_threshold,
+            )
+        };
+        let floor_outcome = match compute_witness {
+            Some(witness) => self.bump_resource_floor(drv_hash, witness).await,
+            None => super::floor::FloorOutcome::default(),
+        };
+        if let Some(row) = attempt_row.as_mut() {
+            row.floor_promoted = floor_outcome.promoted;
+            row.floor_at_cap = floor_outcome.at_cap;
         }
 
         if self.dag.node(drv_hash).is_none() {

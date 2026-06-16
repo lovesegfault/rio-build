@@ -1161,12 +1161,15 @@ mod registration_writer_census {
     /// bind). Current population (bug_102: every caller presents a
     /// typed `CorroborationWitness` — the demand sits inside the
     /// mutation, so the label alphabet `{cgroup_oom, disk_full,
-    /// timeout, witnessed_oom}` derives from the witness, one
-    /// producer): the corroborated-sizing chokepoint
+    /// timeout, witnessed_oom, compute_bound}` derives from the
+    /// witness, one producer): the corroborated-sizing chokepoint
     /// (completion.rs `bump_floor_on_corroborated_claim` — one call
     /// site carrying both `cgroup_oom` and `disk_full` via the
     /// witness), the corroborated-timeout lane (completion.rs
     /// `handle_timeout_failure` — `timeout`, the attempt-age anchor),
+    /// the corroborated-compute-bound lane (completion.rs
+    /// `handle_executor_variant_failure` — `compute_bound`, sh-012:
+    /// cpu_util ≥ threshold against the assigned cores×deadline),
     /// and the establishment sweep's witnessed-OomKilled disposition
     /// row (housekeeping.rs — `witnessed_oom`, live_058-b, via the
     /// witnessed-disposition constructor). A new caller reds here
@@ -1180,11 +1183,12 @@ mod registration_writer_census {
     fn bump_resource_floor_caller_census() {
         let hits = census(&[".bump_resource", "_floor("]);
         let expected: BTreeMap<String, usize> = [
-            // 2 = the corroborated-sizing chokepoint (cgroup_oom +
+            // 3 = the corroborated-sizing chokepoint (cgroup_oom +
             // disk_full ride ONE witness-driven call) + the
-            // corroborated-timeout lane (bug_102 — was 3 when the
-            // sizing arms each restated the (reason, label) pair).
-            ("actor/completion.rs".to_string(), 2),
+            // corroborated-timeout lane (bug_102) + the
+            // corroborated-compute-bound lane (sh-012, the D4 cores
+            // axis on E3a).
+            ("actor/completion.rs".to_string(), 3),
             ("actor/housekeeping.rs".to_string(), 1),
         ]
         .into();
