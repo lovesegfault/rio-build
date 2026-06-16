@@ -1008,7 +1008,7 @@ pub struct CaState {
     pub output_unchanged: bool,
 }
 
-// r[impl sched.sla.reactive-floor+4]
+// r[impl sched.sla.reactive-floor+5]
 /// Per-dimension resource floor for the NEXT dispatch (D4).
 ///
 /// Reactive promotion has three producers, census-pinned
@@ -1032,18 +1032,21 @@ pub struct CaState {
 /// SpawnIntent is at least as large.
 ///
 /// `Default` = zeros = no clamp (cold start). Persisted as
-/// `derivations.floor_{mem,disk,deadline}_*` (`M_044`) so a scheduler
-/// failover between OOM and retry doesn't reset to zero → re-OOM at
-/// probe defaults.
+/// `derivations.floor_{mem,disk,deadline,cores}_*` (`M_044` + `M_106`)
+/// so a scheduler failover between OOM and retry doesn't reset to zero
+/// → re-OOM at probe defaults.
 ///
-/// No `cores` dimension: OOM/DiskPressure are mem/disk under-
-/// provision; DeadlineExceeded is a wall-time bound, not a
-/// parallelism bound. The SLA model owns core selection.
+/// `cores` doubles only on a `ComputeBound` witness —
+/// `cpu_seconds_total / (assigned_deadline × assigned_cores) ≥
+/// compute_bound_threshold` (sh-012, the D4 fourth axis) — never on
+/// bare exit≠0. The SLA model still owns INITIAL core selection; the
+/// cores floor is the post-E3a corroborated escalation only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResourceFloor {
     pub mem_bytes: u64,
     pub disk_bytes: u64,
     pub deadline_secs: u32,
+    pub cores: u32,
 }
 
 /// Output of `solve_intent_for`: per-derivation `(cores, mem, disk,
@@ -1607,6 +1610,7 @@ impl DerivationState {
                     mem_bytes: row.floor_mem_bytes.max(0) as u64,
                     disk_bytes: row.floor_disk_bytes.max(0) as u64,
                     deadline_secs: row.floor_deadline_secs.clamp(0, u32::MAX as i64) as u32,
+                    cores: row.floor_cores.clamp(0, u32::MAX as i64) as u32,
                 },
                 // Remaining sched fields lossy; recomputed at next
                 // dispatch / full_sweep — see SchedHint doc.
@@ -3213,6 +3217,7 @@ mod tests {
             floor_mem_bytes: 0,
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,
+            floor_cores: 0,
             exec_id: None,
             claim_nonce: None,
             attempt_kind: None,

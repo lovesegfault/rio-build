@@ -2450,6 +2450,22 @@ pub const M_104: () = ();
 /// NotDeterministic, InputRejected) keep `'permanent'` and stay
 /// first-observation poison (E3b).
 pub const M_105: () = ();
+/// `migrations/106_floor_cores.sql`
+///
+/// The D4 reactive `ResourceFloor` gains its fourth axis (sh-012):
+/// `floor_cores`, sibling to `M_044`'s mem/disk/deadline columns and
+/// fed by the same per-dimension `GREATEST()` ratchet
+/// (`update_resource_floor`). Fired only when an
+/// `ExecutorVariantFailure` (E3a — the daemon's heuristic exit≠0) is
+/// corroborated compute-bound: `cpu_seconds_total /
+/// (assigned_deadline × assigned_cores) >= compute_bound_threshold`.
+/// A genuine compile-error exit (`cpu_util ≪ threshold`) refuses the
+/// witness and never escalates cores — the inverse-cost bound the E3a
+/// requeue accepts (3 attempts at the same shape, never 3× resource).
+/// The SLA model still owns INITIAL core selection; this is the
+/// post-E3a corroborated escalation only. `integer` (i32 → u32 at
+/// hydration), capped at `Ceilings.max_cores` consume-side.
+pub const M_106: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,

@@ -963,6 +963,7 @@ async fn status_writers_stamp_status_changed_at_biconditional() -> anyhow::Resul
                             mem_bytes: 1 << 30,
                             disk_bytes: 1 << 31,
                             deadline_secs: 600,
+                            cores: 0,
                         },
                         generation,
                     )
@@ -1276,6 +1277,7 @@ async fn outbox_floor_bump_does_not_refuse_latched_terminal_replay() -> anyhow::
                 mem_bytes: 4 << 30,
                 disk_bytes: 8 << 30,
                 deadline_secs: 900,
+                cores: 0,
             },
             generation,
         )

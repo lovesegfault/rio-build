@@ -100,7 +100,7 @@ impl SchedulerDb {
         // (`record_wanted_in_tx`, written by the same merge
         // transaction), keyed by (build, derivation) — a per-consumer
         // fact never belongs on the per-drv row.
-        let result: Vec<(String, Uuid, i64, i64, i64)> = sqlx::query_as(
+        let result: Vec<(String, Uuid, i64, i64, i64, i64)> = sqlx::query_as(
             r#"
             INSERT INTO derivations
                 (drv_hash, drv_path, pname, system, status, required_features,
@@ -130,7 +130,8 @@ impl SchedulerDb {
                 is_fixed_output = EXCLUDED.is_fixed_output,
                 is_ca = EXCLUDED.is_ca
             RETURNING drv_hash, derivation_id,
-                      floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
+                      floor_mem_bytes, floor_disk_bytes, floor_deadline_secs,
+                      floor_cores::bigint
             "#,
         )
         .bind(&drv_hash)
@@ -147,7 +148,7 @@ impl SchedulerDb {
         .await?;
         Ok(result
             .into_iter()
-            .map(|(h, id, mem, disk, deadline)| {
+            .map(|(h, id, mem, disk, deadline, cores)| {
                 (
                     h,
                     (
@@ -156,6 +157,7 @@ impl SchedulerDb {
                             mem_bytes: mem.max(0) as u64,
                             disk_bytes: disk.max(0) as u64,
                             deadline_secs: deadline.clamp(0, u32::MAX as i64) as u32,
+                            cores: i64::clamp(cores, 0, u32::MAX as i64) as u32,
                         },
                     ),
                 )

@@ -256,6 +256,7 @@ pub(crate) struct RecoveryDerivationRow {
     pub floor_mem_bytes: i64,
     pub floor_disk_bytes: i64,
     pub floor_deadline_secs: i64,
+    pub floor_cores: i64,
     /// Per-execution identifier from the active `assignments` row
     /// (`migrations/061`). `None` unless the drv is currently dispatched
     /// (`assigned_builder_id IS NOT NULL`) — a reset drv's assignments row
@@ -297,6 +298,7 @@ impl RecoveryDerivationRow {
             floor_mem_bytes: 0,
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,
+            floor_cores: 0,
             exec_id: None,
             claim_nonce: None,
             attempt_kind: None,

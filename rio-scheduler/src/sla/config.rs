@@ -414,6 +414,13 @@ pub struct SlaConfig {
     pub max_disk: u64,
     /// Disk request when no `disk_p90` sample exists yet.
     pub default_disk: u64,
+    /// sh-012 (D4 cores axis): the cpu-utilization corroboration band
+    /// for an `ExecutorVariantFailure` to mint a `ComputeBound`
+    /// witness — `cpu_seconds_total / (assigned_deadline ×
+    /// assigned_cores) >= compute_bound_threshold`. Default `0.8`;
+    /// must be in `(0.0, 1.0]` ([`Self::validate_shape`]).
+    #[serde(default = "default_compute_bound_threshold")]
+    pub compute_bound_threshold: f64,
     /// Per-key sample ring (rows kept for refit). Feeds
     /// [`super::SlaEstimator::new`].
     #[serde(default = "default_ring_buffer")]
@@ -586,6 +593,10 @@ fn default_max_node_claims_per_cell_per_tick() -> u32 {
 
 fn default_ring_buffer() -> u32 {
     32
+}
+
+fn default_compute_bound_threshold() -> f64 {
+    0.8
 }
 
 /// Cold-start probe shape: `mem = mem_base + cpu × mem_per_core`.
@@ -1270,6 +1281,7 @@ impl SlaConfig {
             max_mem: Some(2 << 30),
             max_disk: 6 << 30,
             default_disk: 2 << 30,
+            compute_bound_threshold: default_compute_bound_threshold(),
             ring_buffer: default_ring_buffer(),
             seed_corpus: None,
             hw_cost_source: super::cost::HwCostSource::Static,
@@ -1426,6 +1438,11 @@ impl SlaConfig {
                 self.max_mem
             ),
         }
+        anyhow::ensure!(
+            self.compute_bound_threshold > 0.0 && self.compute_bound_threshold <= 1.0,
+            "sla.compute_bound_threshold must be in (0.0, 1.0], got {}",
+            self.compute_bound_threshold
+        );
         anyhow::ensure!(
             (0.0..=0.5).contains(&self.hw_cost_tolerance),
             "sla.hwCostTolerance must be in [0, 0.5], got {}",
@@ -1846,6 +1863,10 @@ pub const HELM_NOT_RENDERED_SLA_KEYS: &[(&str, &str)] = &[
     (
         "seed_corpus",
         "file path — corpus loads via ImportSlaCorpus RPC in k8s",
+    ),
+    (
+        "compute_bound_threshold",
+        "sh-012 D4 cores corroboration band; serde-defaulted (0.8), not operator-tuned",
     ),
 ];
 
@@ -4769,6 +4790,7 @@ mod tests {
             cluster: _,            // (scalar)
             metal_sizes: _,        // (free)   instance-size suffix strings
             unlaunchable_sizes: _, // (free)   instance-size suffix strings
+            compute_bound_threshold: _, // (scalar)
         } = cfg;
         // Silence unused-binding on the one (cell) field we kept by
         // name; the destructure itself is the load-bearing part.

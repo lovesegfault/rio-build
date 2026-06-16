@@ -2316,6 +2316,7 @@ impl DagActor {
                     f.mem_bytes = f.mem_bytes.max(floor.mem_bytes);
                     f.disk_bytes = f.disk_bytes.max(floor.disk_bytes);
                     f.deadline_secs = f.deadline_secs.max(floor.deadline_secs);
+                    f.cores = f.cores.max(floor.cores);
                     super::floor::clamp_floor_to_live(f, &self.sla_ceilings);
                 }
             }

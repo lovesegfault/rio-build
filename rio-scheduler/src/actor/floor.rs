@@ -57,7 +57,7 @@ pub struct FloorOutcome {
     pub at_cap: bool,
 }
 
-// r[impl sched.sla.reactive-floor+4]
+// r[impl sched.sla.reactive-floor+5]
 // r[impl sched.retry.promotion-exempt+3]
 /// Double the relevant `resource_floor` dimension on an explicit
 /// resource-exhaustion signal, or — if already at the cap — report
@@ -140,6 +140,22 @@ pub fn bump_floor_or_count(
             floor.deadline_secs = f as u32;
             o
         }
+        // sh-012 D4 fourth axis: a corroborated compute-bound
+        // executor-variant exit≠0 (`CorroborationWitness::
+        // corroborated_compute_bound` — cpu_util ≥ threshold) doubles
+        // cores. u32 dimension; same widen-narrow shape as deadline.
+        // Cap is `Ceilings.max_cores` (the catalog-derived global), so
+        // the cast cannot truncate.
+        R::ComputeBound => {
+            let mut f = u64::from(floor.cores);
+            let o = bump_dim(
+                &mut f,
+                u64::from(last.map_or(0, |i| i.cores)),
+                ceil.max_cores as u64,
+            );
+            floor.cores = f as u32;
+            o
+        }
         // Non-resource reasons (pod-kill, node failure, expected
         // one-shot exit, unclassified) are not sizing signals.
         R::EvictedOther | R::Completed | R::Error | R::Unknown => FloorOutcome::default(),
@@ -172,7 +188,11 @@ pub fn bump_floor_or_count(
 /// - [`Self::witnessed`] — the establishment sweep's
 ///   controller-witnessed OomKilled disposition row (the
 ///   `sched.attempt.witnessed-terminal` mark; kubelet per-container
-///   attribution, deduped by the establishment `won` flag).
+///   attribution, deduped by the establishment `won` flag);
+/// - [`Self::corroborated_compute_bound`] — `cpu_seconds_total /
+///   (assigned_deadline × assigned_cores) >= threshold` (sh-012, the
+///   D4 cores axis: an executor-variant exit≠0 that demonstrably
+///   exhausted its parallelism budget).
 ///
 /// The `(TerminationReason, label)` pair DERIVES from the witness
 /// ([`Self::reason`]/[`Self::label`]) — one producer for the mapping
@@ -190,6 +210,9 @@ enum WitnessAxis {
     Timeout,
     /// Controller-witnessed OomKilled at establishment.
     WitnessedOom,
+    /// sh-012: executor-variant exit≠0 with corroborated cpu
+    /// utilization ≥ threshold (the D4 cores axis).
+    ComputeBound,
 }
 
 impl CorroborationWitness {
@@ -283,6 +306,39 @@ impl CorroborationWitness {
         })
     }
 
+    /// The compute-bound axis (sh-012, the D4 fourth dimension): an
+    /// executor-variant exit≠0 demonstrably exhausted its parallelism
+    /// budget — `cpu_util = cpu_seconds_total / (assigned_deadline ×
+    /// assigned_cores) >= threshold`. `cpu_seconds_total` is the
+    /// builder's own `cpu.stat usage_usec` cumulative read (carried in
+    /// `CompletionReport.final_resources` even on the executor-error
+    /// path); `assigned_{cores,deadline}` are the reconciled
+    /// `last_intent` (scheduler-stamped at the pull mint, never
+    /// worker-mintable). A genuine compile-error exit dies fast with
+    /// `cpu_util ≪ threshold` and refuses; a parallelism-exhausted
+    /// build saturates and corroborates.
+    ///
+    /// `None` anchors refuse: missing telemetry (old builder), zero
+    /// assigned cores/deadline (cold start, never minted) — there is
+    /// nothing to corroborate against, so classify-only (the
+    /// conservative direction: a floor never moves on absent
+    /// evidence).
+    pub(super) fn corroborated_compute_bound(
+        cpu_seconds_total: Option<f64>,
+        assigned_cores: u32,
+        assigned_deadline_secs: u32,
+        threshold: f64,
+    ) -> Option<Self> {
+        let cpu = cpu_seconds_total?;
+        if assigned_cores == 0 || assigned_deadline_secs == 0 {
+            return None;
+        }
+        let cpu_util = cpu / (f64::from(assigned_deadline_secs) * f64::from(assigned_cores));
+        (cpu_util >= threshold).then_some(Self {
+            axis: WitnessAxis::ComputeBound,
+        })
+    }
+
     /// The controller-witnessed lane: exactly the
     /// [`WitnessedDisposition::PromoteMemFloor`] row (witnessed
     /// OomKilled — the one structurally unambiguous kubelet
@@ -308,13 +364,14 @@ impl CorroborationWitness {
             WitnessAxis::Sizing(FailureClass::Unspecified) => R::Unknown,
             WitnessAxis::Timeout => R::DeadlineExceeded,
             WitnessAxis::WitnessedOom => R::OomKilled,
+            WitnessAxis::ComputeBound => R::ComputeBound,
         }
     }
 
     /// The metric/log label — the caller-census alphabet
-    /// (`{cgroup_oom, disk_full, timeout, witnessed_oom}`, lib.rs
-    /// HELP in lockstep), derived from the witness instead of
-    /// restated per call site.
+    /// (`{cgroup_oom, disk_full, timeout, witnessed_oom,
+    /// compute_bound}`, lib.rs HELP in lockstep), derived from the
+    /// witness instead of restated per call site.
     pub(super) fn label(&self) -> &'static str {
         use rio_proto::types::FailureClass;
         match self.axis {
@@ -323,6 +380,7 @@ impl CorroborationWitness {
             WitnessAxis::Sizing(FailureClass::Unspecified) => "unspecified",
             WitnessAxis::Timeout => "timeout",
             WitnessAxis::WitnessedOom => "witnessed_oom",
+            WitnessAxis::ComputeBound => "compute_bound",
         }
     }
 }
@@ -476,6 +534,7 @@ pub(super) const WITNESSED_LETTERS: [rio_proto::types::AttemptTerminalReason; 11
 pub(super) struct ClampedFloor {
     pub(super) mem_bytes: u64,
     pub(super) disk_bytes: u64,
+    pub(super) cores: u32,
 }
 
 impl ClampedFloor {
@@ -490,6 +549,7 @@ impl ClampedFloor {
             // an unhostable `ceiling + pad` container downstream.
             mem_bytes: floor.mem_bytes.min(mem_solve_cap(ceil)),
             disk_bytes: floor.disk_bytes.min(ceil.max_disk),
+            cores: floor.cores.min(ceil.max_cores as u32),
         }
     }
 }
@@ -510,6 +570,7 @@ pub(super) fn clamp_floor_to_live(f: &mut crate::state::ResourceFloor, ceil: &Ce
     f.mem_bytes = f.mem_bytes.min(mem_solve_cap(ceil));
     f.disk_bytes = f.disk_bytes.min(ceil.max_disk);
     f.deadline_secs = f.deadline_secs.min(DEADLINE_CAP_SECS);
+    f.cores = f.cores.min(ceil.max_cores as u32);
 }
 
 /// Per-dimension doubling shared by the three resource arms above.
@@ -834,6 +895,7 @@ mod tests {
                 mem_bytes: input,
                 disk_bytes: input,
                 deadline_secs: 60,
+                cores: 0,
             };
             let ceil = Ceilings {
                 max_cores: 64.0,
@@ -869,9 +931,11 @@ mod tests {
             mem_bytes: 0,
             disk_bytes: 0,
             deadline_secs: u32::MAX,
+            cores: u32::MAX,
         };
         clamp_floor_to_live(&mut g, &CEIL);
         assert_eq!(g.deadline_secs, DEADLINE_CAP_SECS);
+        assert_eq!(g.cores, CEIL.max_cores as u32);
     }
 
     /// The at-cap heal composes with the projection: a floor ABOVE the
@@ -944,6 +1008,62 @@ mod tests {
             mem_solve_cap(&CEIL),
             "the terminal state is the hostable solve-domain cap"
         );
+    }
+
+    // r[verify sched.sla.reactive-floor+5]
+    /// **sh-012 D4 cores axis** — *proposition: an executor-variant
+    /// exit≠0 with corroborated cpu_util ≥ threshold doubles
+    /// floor.cores from the assigned shape; cpu_util ≪ threshold (the
+    /// genuine compile-error exit shape) leaves it unchanged.* RED at
+    /// base: `WitnessAxis::ComputeBound` does not exist.
+    #[test]
+    fn corroborated_compute_bound_band() {
+        // cpu_util = 2280 / (600×4) = 0.95 ≥ 0.8 → corroborates.
+        assert!(
+            CorroborationWitness::corroborated_compute_bound(Some(2280.0), 4, 600, 0.8).is_some(),
+            "cpu_util=0.95: a parallelism-exhausted build corroborates"
+        );
+        // cpu_util = 120 / (600×4) = 0.05 ≪ 0.8 → refuses (the
+        // compile-error exit: died fast, near-zero cpu).
+        assert!(
+            CorroborationWitness::corroborated_compute_bound(Some(120.0), 4, 600, 0.8).is_none(),
+            "cpu_util=0.05: a fast intrinsic exit≠0 refuses"
+        );
+        // Exactly at threshold: corroborates (closed lower bound).
+        assert!(
+            CorroborationWitness::corroborated_compute_bound(Some(1920.0), 4, 600, 0.8).is_some(),
+            "cpu_util=0.80: the band is closed at threshold"
+        );
+        // None anchors refuse: missing telemetry / cold start.
+        assert!(CorroborationWitness::corroborated_compute_bound(None, 4, 600, 0.8).is_none());
+        assert!(
+            CorroborationWitness::corroborated_compute_bound(Some(2280.0), 0, 600, 0.8).is_none()
+        );
+        assert!(
+            CorroborationWitness::corroborated_compute_bound(Some(2280.0), 4, 0, 0.8).is_none()
+        );
+    }
+
+    #[test]
+    fn compute_bound_doubles_from_intent_then_floor() {
+        let mut s = st();
+        s.sched.last_intent = Some(crate::state::SolvedIntent {
+            cores: 4,
+            deadline_secs: 600,
+            ..Default::default()
+        });
+        let o = bump_floor_or_count(&mut s, TerminationReason::ComputeBound, &CEIL);
+        assert!(o.promoted && !o.at_cap);
+        assert_eq!(s.sched.resource_floor.cores, 8);
+        // Second bump: floor (8) > intent (4) → base=8 → 16.
+        let o = bump_floor_or_count(&mut s, TerminationReason::ComputeBound, &CEIL);
+        assert!(o.promoted && !o.at_cap);
+        assert_eq!(s.sched.resource_floor.cores, 16);
+        // At cap: max_cores=64.
+        s.sched.resource_floor.cores = CEIL.max_cores as u32;
+        let o = bump_floor_or_count(&mut s, TerminationReason::ComputeBound, &CEIL);
+        assert!(!o.promoted && o.at_cap);
+        assert_eq!(s.sched.resource_floor.cores, CEIL.max_cores as u32);
     }
 
     #[test]

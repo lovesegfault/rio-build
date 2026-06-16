@@ -114,6 +114,7 @@ impl SchedulerDb {
                    d.expected_output_paths, d.output_names,
                    d.is_fixed_output, d.is_ca,
                    d.floor_mem_bytes, d.floor_disk_bytes, d.floor_deadline_secs,
+                   d.floor_cores::bigint,
                    a.exec_id,
                    a.claim_nonce,
                    e.attempt_kind

@@ -491,7 +491,7 @@ impl SchedulerDb {
         Ok(FencedOutcome::Applied(updated))
     }
 
-    // r[impl sched.sla.reactive-floor+4]
+    // r[impl sched.sla.reactive-floor+5]
     // r[impl sched.evidence.durability+4]
     /// Persist a derivation's reactive `resource_floor` (D4, `M_044`),
     /// fenced and server-side monotone.
@@ -531,6 +531,7 @@ impl SchedulerDb {
                floor_mem_bytes = GREATEST(floor_mem_bytes, $2), \
                floor_disk_bytes = GREATEST(floor_disk_bytes, $3), \
                floor_deadline_secs = GREATEST(floor_deadline_secs, $4), \
+               floor_cores = GREATEST(floor_cores, $5), \
                updated_at = now() \
              WHERE drv_hash = $1",
         )
@@ -538,6 +539,7 @@ impl SchedulerDb {
         .bind(floor.mem_bytes as i64)
         .bind(floor.disk_bytes as i64)
         .bind(i64::from(floor.deadline_secs))
+        .bind(i64::from(floor.cores))
         .execute(&mut *tx.conn())
         .await?;
         tx.commit().await?;

@@ -297,8 +297,7 @@ impl FenceSystem {
         );
         let floor = ResourceFloor {
             mem_bytes: 1,
-            disk_bytes: 0,
-            deadline_secs: 0,
+            ..Default::default()
         };
         ensure!(
             db.update_resource_floor(&DrvHash::from(DRV), &floor, gen_stamp(1))
@@ -440,8 +439,7 @@ impl FenceSystem {
                 let g = self.gen_of(r)?;
                 let floor = ResourceFloor {
                     mem_bytes: v,
-                    disk_bytes: 0,
-                    deadline_secs: 0,
+                    ..Default::default()
                 };
                 ensure!(
                     self.db
