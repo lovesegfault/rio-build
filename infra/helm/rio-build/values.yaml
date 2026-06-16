@@ -631,7 +631,11 @@ scheduler:
     # cold-starts at 48c (3× the default probe.cpu) — the explore
     # ladder's first rung is the only sizing signal nixpkgs declared.
     featureProbes:
-      big-parallel: {cpu: 48, memPerCore: 2147483648, memBase: 34359738368, deadlineSecs: 7200}
+      # ProbeShape::validate enforces cpu ≤ max_cores/4. The §13c-2
+      # catalog-derived max_cores is 191 (not 192 — see the maxCores
+      # comment below), so cpu ≤ 47.75. cpu=32 sizes the cold-start
+      # probe to a hi-* class with headroom for the validator.
+      big-parallel: {cpu: 32, memPerCore: 2147483648, memBase: 34359738368, deadlineSecs: 7200}
     # sh-008: per-soft-feature SIZING bias. Restricts the SLA candidate
     # hwClass set to those whose per-class core ceiling hosts ≥
     # minCores. Bias not constraint — degrades to the unbiased set when
