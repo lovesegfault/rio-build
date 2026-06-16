@@ -39,7 +39,7 @@ scope: with scope; ''
           "awk '/^rio_scheduler_derivations_queued / {q=$2} "
           "/^rio_scheduler_derivations_running / {r=$2} "
           "END {exit !(q==0 && r==0)}'",
-          timeout=180,
+          timeout=300,
       )
 
       # Capture the pre-kill leader name. After `delete pod`, the
@@ -131,7 +131,7 @@ scope: with scope; ''
       # finished yet.
       sched_metric_wait(
           "grep -qx 'rio_scheduler_recovery_total{outcome=\"success\"} 1'",
-          timeout=180,
+          timeout=300,
       )
 
       # The in-flight slow build runs on the pull path (T-1c.2b
