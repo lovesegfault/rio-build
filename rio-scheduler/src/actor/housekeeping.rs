@@ -183,6 +183,24 @@ impl DagActor {
         if !self.leader.is_leader() {
             return;
         }
+        // sh-007 row 1: refresh the cached generation floor — one PG
+        // read per tick instead of one per PullAssignment. Best-effort
+        // (a transient read error keeps the previous cached value; the
+        // PG-side `FencedTx` at `mint_pull_attempt_fenced` is the hard
+        // gate, this advisory self-reject lags by at most one further
+        // tick on a read failure). Runs before flush + the phase!
+        // attribution so its cost is unattributed Tick-head work.
+        #[cfg(test)]
+        self.test_counters
+            .max_known_generation_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.db.max_known_generation().await {
+            Ok(floor) => self.generation_floor_cached = floor,
+            Err(e) => {
+                warn!(error = %e, "tick-head generation-floor refresh failed; \
+                                   keeping cached value (PG-side fence is the hard gate)");
+            }
+        }
         // sh-002 flush trigger (ii): drain any reports queued since
         // the last flush — the deadline backstop for sub-BATCH_MAX
         // inbound rates when trigger (iv) (mailbox-empty) did not

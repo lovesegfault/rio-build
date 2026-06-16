@@ -638,15 +638,15 @@ impl DagActor {
             return Err(PullRejection::NotLeader);
         }
         let serving_generation = self.serving_generation;
-        #[cfg(test)]
-        self.test_counters
-            .max_known_generation_reads
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let generation_floor = self
-            .db
-            .max_known_generation()
-            .await
-            .map_err(|e| PullRejection::Internal(format!("claims-floor read failed: {e}")))?;
+        // sh-007 row 1: the per-pull floor read is the cached field —
+        // refreshed at LeaderAcquired and at every Tick head — instead
+        // of a per-pull claims-floor PG round-trip (iter1: 149k reads,
+        // 41% of actor busy time). The cached
+        // value is at most one tick interval stale; the PG-side fence
+        // at `mint_pull_attempt_fenced` is the hard gate, so staleness
+        // here delays the advisory self-reject by at most one tick and
+        // admits no stale write.
+        let generation_floor = self.generation_floor_cached;
 
         let drv_hash = DrvHash::from(intent_id);
         // The attempt's executor identity (substitution-replacement

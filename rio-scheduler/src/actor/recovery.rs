@@ -1285,6 +1285,10 @@ impl DagActor {
         let pg_floor_read: Result<Option<i64>, ActorError> = if fail_floor_read {
             Err(ActorError::Database(sqlx::Error::PoolClosed))
         } else {
+            #[cfg(test)]
+            self.test_counters
+                .max_known_generation_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.db
                 .max_known_generation()
                 .await
@@ -1686,6 +1690,13 @@ impl DagActor {
         // field, not the atomic.
         self.serving_generation = crate::db::ServingGeneration::stamp_from_claim(claim_target);
         self.recovery_claim_stamped = true;
+        // sh-007 row 1: seed the cached floor from the just-stamped
+        // claim — the claim row (when durable) is the post-claim
+        // `max_known_generation()`, and on the unclaimed-degradation
+        // paths `claim_target` still bounds `pg_high_water` from
+        // above. No fresh PG read; the next Tick refresh re-reads the
+        // durable floor (`at most one tick stale` by construction).
+        self.generation_floor_cached = Some(self.serving_generation.as_i64());
 
         // --- Recover the DAG from PG, under the claimed generation ---
         let start = Instant::now();

@@ -771,6 +771,20 @@ pub struct DagActor {
     /// be compared against PG BIGINT floors; converting once at the
     /// stamp sites keeps every fence comparison cast-free.
     serving_generation: crate::db::ServingGeneration,
+    /// Cached [`SchedulerDb::max_known_generation`] for the per-pull
+    /// generation fence (sh-007 row 1). Refreshed at exactly two
+    /// sites: `handle_leader_acquired` (set to the freshly-claimed
+    /// generation — the claim row is the post-claim floor) and the
+    /// `handle_tick` head (one PG read per tick interval). The
+    /// per-pull comparison reads this field instead of issuing a PG
+    /// round-trip; the cached value is at most one tick interval
+    /// stale, so a deposed replica's `serving_generation < floor`
+    /// self-reject lags the durable floor by at most one tick — the
+    /// PG-side `FencedTx` check at `mint_pull_attempt_fenced` remains
+    /// the hard gate, this advisory check delays the soft self-reject
+    /// only. `None` = fresh cluster (no claims, no assignments) — same
+    /// shape as the PG read it caches.
+    generation_floor_cached: Option<i64>,
     /// Ordering tripwire for the claim-before-recovery-writes invariant
     /// (`sched.evidence.durability`): false at `handle_leader_acquired`
     /// entry, true once the generation claim has stamped
@@ -1193,6 +1207,11 @@ impl DagActor {
             serving_generation: crate::db::ServingGeneration::stamp_from_claim(
                 plumbing.leader.generation(),
             ),
+            // No floor read yet: the first LeaderAcquired (k8s mode) or
+            // first Tick (always-leader) seeds it. None == the PG
+            // read's fresh-cluster shape, so the kernel's floor arm is
+            // a no-op until then — same as a fresh-DB live read.
+            generation_floor_cached: None,
             // No claim has run for this construction-time stamp; the
             // first handle_leader_acquired sets it before recovery.
             recovery_claim_stamped: false,
@@ -1369,6 +1388,12 @@ impl DagActor {
             // next LeaderAcquired re-stamps it at its own claim before
             // any of its evidence writes run.
             serving_generation: _,
+            // Retained: same fence-working rationale as the tenure
+            // stamp it shadows — a deposed replica's stale cached
+            // floor sits at or below the deposed serving generation,
+            // so the soft self-reject stays inert until LeaderLost
+            // lands; the next LeaderAcquired re-seeds it.
+            generation_floor_cached: _,
             recovery_claim_stamped: _,
             // Retained: static replica identity (the generation-claim
             // ledger's holder column), not per-term state.
