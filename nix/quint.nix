@@ -274,6 +274,20 @@ let
   # that need it pass a larger value: the default renders byte-identical
   # script text, so existing checks do not rehash.
   apalacheServerPreludeWithHeap = serverHeapMb: ''
+    # TLC's JVM — spawned by `quint verify` via tlc.js with only the
+    # heap/stack args from tlc-config.json — defaults to G1GC; ParallelGC
+    # is TLC's recommended throughput collector (~15-30% states/min,
+    # tlaplus v1.6.0 release notes). tlc.js exposes no jvmArgs
+    # passthrough, so JAVA_TOOL_OPTIONS is the only way to reach that
+    # child JVM. Stacked with it: BAQueue (~+10% many-core, the v1.6.0
+    # / current-tools.md many-core recommendation) and UseNUMA
+    # (ParallelGC's NUMA-aware eden allocation; no-op on single-socket
+    # hosts). The Apalache server invocation below clears this env —
+    # JDK21 refuses to start when ParallelGC and G1GC are BOTH selected
+    # (cmdline does NOT override JAVA_TOOL_OPTIONS for GC flags; it
+    # errors with "Multiple garbage collectors selected").
+    export JAVA_TOOL_OPTIONS="-XX:+UseParallelGC -XX:+UseNUMA -Dtlc2.tool.ModelChecker.BAQueue=true"
+
     # Start the bundled Apalache server (the same distribution quint
     # would spawn) so it outlives individual quint invocations and stays
     # JIT-warm across retries. Its chatter goes to a side log, keeping
@@ -281,7 +295,7 @@ let
     # the sandbox's private network namespace keeps parallel checks from
     # colliding on it.
     apalache_jar=$(ls ${pkgs.quint}/share/quint/apalache-dist-*/apalache/lib/apalache.jar)
-    ${pkgs.jdk21_headless}/bin/java -Xmx${toString serverHeapMb}m -XX:+UseG1GC -jar "$apalache_jar" server --port=8822 \
+    JAVA_TOOL_OPTIONS= ${pkgs.jdk21_headless}/bin/java -Xmx${toString serverHeapMb}m -XX:+UseG1GC -jar "$apalache_jar" server --port=8822 \
       > apalache-server.log 2>&1 &
     apalache_pid=$!
     trap 'kill $apalache_pid 2>/dev/null || true' EXIT
@@ -402,6 +416,14 @@ let
       # budget; a check whose heap is raised here moves itself out of
       # the round-robin shards automatically.
       serverHeapMb ? 4096,
+      # TLC heap (MiB) — sizes the model-checker JVM that tlc.js spawns
+      # (the JVM that does the exhaustive state-space walk). Distinct
+      # from serverHeapMb, which sizes only the quint->TLA+ conversion
+      # server; before this knob existed TLC was always quint's
+      # hard-coded 8G regardless of serverHeapMb. Exported as
+      # meta.tlcHeapMb for gen_matrix.py's heavy-shard isolation
+      # (mirrors serverHeapMb).
+      tlcHeapMb ? 8192,
       # Wall-clock budget (seconds) for ONE quint-verify attempt. A
       # model that exceeds it is a RED check naming the budget — never
       # an eternal gate: gcCollectState's first wiring squared its map
@@ -428,17 +450,19 @@ let
         lib.optionalAttrs (requiredSystemFeatures != [ ]) { inherit requiredSystemFeatures; }
         // {
           nativeBuildInputs = [ pkgs.quint ];
-          # bug_383: the SAME binding that sizes the JVM below — exported
-          # for gen_matrix.py's heavy-shard isolation.
-          meta.serverHeapMb = serverHeapMb;
-          # bughunt-2 (slot 11): wiring facts for the quint-policy lint — the
-          # only channel besides the parse IR that policy enforcement reads.
-          meta.quintPolicy = {
-            kind = "holds";
-            inherit spec main extraSpecs;
-            inherit invariants;
-            step = if step == null then "step" else step;
-            inherit vacuityExempt;
+          meta = {
+            # bug_383: the SAME bindings that size the JVMs below —
+            # exported for gen_matrix.py's heavy-shard isolation.
+            inherit serverHeapMb tlcHeapMb;
+            # bughunt-2 (slot 11): wiring facts for the quint-policy lint — the
+            # only channel besides the parse IR that policy enforcement reads.
+            quintPolicy = {
+              kind = "holds";
+              inherit spec main extraSpecs;
+              inherit invariants;
+              step = if step == null then "step" else step;
+              inherit vacuityExempt;
+            };
           };
           # Only the named .qnt files. A model that imports another file
           # (a shared harness, an override module's parent model) extends
@@ -472,14 +496,22 @@ let
         # pass it through.
         # --tlc-config accepts only JVM/runtime knobs ({workers,
         # maxHeap, stackSize}) — it is NOT a .cfg-directive escape
-        # hatch; everything else lives in the .qnt.
+        # hatch; everything else lives in the .qnt. maxHeap/stackSize
+        # are passed VERBATIM as a single java argv slot each (tlc.js
+        # `spawn('java', [maxHeap, stackSize, ...])`), so they must be
+        # the full `-X...` string. stackSize=16m overrides quint's
+        # default `-Xss515m` (informalsystems/quint@76e267a, no
+        # rationale) — 515 MB per thread reserves ~16 GB VAS at
+        # workers=32 and trips strict-overcommit hosts; 16m is the
+        # Toolbox-shipped ceiling and a model that overflows it dies
+        # loudly with StackOverflowError.
         workers="''${NIX_BUILD_CORES:-1}"
         [ "$workers" = "0" ] && workers='"auto"'
         ${
           lib.optionalString (workers != null) ''
             workers=${toString workers}
           ''
-        }printf '{"workers": %s}\n' "$workers" > tlc-config.json
+        }printf '{"workers": %s, "maxHeap": "-Xmx%dm", "stackSize": "-Xss16m"}\n' "$workers" ${toString tlcHeapMb} > tlc-config.json
 
         ${apalacheServerPreludeWithHeap serverHeapMb}
 
@@ -560,6 +592,8 @@ let
       # override modules (whose conversion request OOMs a 4 GiB server)
       # need more — see apalacheServerPreludeWithHeap.
       serverHeapMb ? 4096,
+      # Same semantics as mkQuintCheck's tlcHeapMb.
+      tlcHeapMb ? 8192,
       # Same semantics as mkQuintCheck's workers (MCI-6 pinning).
       workers ? null,
       # Same semantics as mkQuintCheck's modelTimeoutSec.
@@ -572,18 +606,20 @@ let
         lib.optionalAttrs (requiredSystemFeatures != [ ]) { inherit requiredSystemFeatures; }
         // {
           nativeBuildInputs = [ pkgs.quint ];
-          # bug_383: the SAME binding that sizes the JVM below — exported
-          # for gen_matrix.py's heavy-shard isolation (a check raised
-          # past the 4096 default moves itself into a singleton shard).
-          meta.serverHeapMb = serverHeapMb;
-          # bughunt-2 (slot 11): wiring facts for the quint-policy lint — the
-          # only channel besides the parse IR that policy enforcement reads.
-          meta.quintPolicy = {
-            kind = "witness";
-            inherit spec main extraSpecs;
-            inherit witness;
-            step = if step == null then "step" else step;
-            vacuityExempt = { };
+          meta = {
+            # bug_383: the SAME bindings that size the JVMs below —
+            # exported for gen_matrix.py's heavy-shard isolation (a check
+            # raised past the default moves itself into a singleton shard).
+            inherit serverHeapMb tlcHeapMb;
+            # bughunt-2 (slot 11): wiring facts for the quint-policy lint — the
+            # only channel besides the parse IR that policy enforcement reads.
+            quintPolicy = {
+              kind = "witness";
+              inherit spec main extraSpecs;
+              inherit witness;
+              step = if step == null then "step" else step;
+              vacuityExempt = { };
+            };
           };
           # Same fileset narrowing as mkQuintCheck.
           src = lib.fileset.toSource {
@@ -602,14 +638,15 @@ let
         set -euo pipefail
         cd "$TMPDIR"
 
-        # Same worker bound as mkQuintCheck (see its comment).
+        # Same worker bound / tlc-config shape as mkQuintCheck (see its
+        # comment for the maxHeap/stackSize verbatim-argv detail).
         workers="''${NIX_BUILD_CORES:-1}"
         [ "$workers" = "0" ] && workers='"auto"'
         ${
           lib.optionalString (workers != null) ''
             workers=${toString workers}
           ''
-        }printf '{"workers": %s}\n' "$workers" > tlc-config.json
+        }printf '{"workers": %s, "maxHeap": "-Xmx%dm", "stackSize": "-Xss16m"}\n' "$workers" ${toString tlcHeapMb} > tlc-config.json
 
         ${apalacheServerPreludeWithHeap serverHeapMb}
 
