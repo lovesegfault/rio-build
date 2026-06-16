@@ -744,6 +744,10 @@ impl DagActor {
         if hashes.is_empty() {
             return;
         }
+        #[cfg(test)]
+        self.test_counters
+            .complete_ready_batch_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         struct Done {
             hash: DrvHash,
             drv_path: String,

@@ -996,6 +996,12 @@ pub(crate) struct TestCounters {
     /// asserts it moved; the single-leader batteries assert it stayed 0
     /// (the fence must never reject a live leader's writes).
     pub evidence_writes_fenced: std::sync::atomic::AtomicU64,
+    /// Incremented at the head of every
+    /// [`complete_ready_from_store_batch`](DagActor::complete_ready_from_store_batch)
+    /// call (sh-002 row 4): asserts on the report-coalesce rule — N
+    /// queued Success materialization reports must drive ONE batched
+    /// completion call, not N per-item ones.
+    pub complete_ready_batch_calls: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
@@ -1006,6 +1012,7 @@ impl TestCounters {
             persist_status_calls: self.persist_status_calls.load(SeqCst),
             solve_inputs_calls: self.solve_inputs_calls.load(SeqCst),
             evidence_writes_fenced: self.evidence_writes_fenced.load(SeqCst),
+            complete_ready_batch_calls: self.complete_ready_batch_calls.load(SeqCst),
         }
     }
 }
@@ -1022,6 +1029,8 @@ pub struct TestCountersSnapshot {
     /// Mirror of `rio_scheduler_evidence_write_fenced_total` — see
     /// [`TestCounters::evidence_writes_fenced`].
     pub evidence_writes_fenced: u64,
+    /// See [`TestCounters::complete_ready_batch_calls`].
+    pub complete_ready_batch_calls: u64,
 }
 
 impl DagActor {

@@ -11889,3 +11889,216 @@ async fn conversion_requeue_is_a_disclosing_no_op() -> TestResult {
     );
     Ok(())
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// sh-002 row 4 (coalesce-outcomes) red-first batteries
+//
+// Hazard-M re-derived at 5f1ce214c (the per-CLAUDE.md narrowing record
+// — verification grep + its output at the time of writing):
+//   rg -n 'ActorCommand::ReportPullOutcome' rio-scheduler/src/actor/tests/
+//   → tests/helpers.rs:1197
+//     tests/pull.rs:461
+//     tests/materialize.rs:599,700,799,908,1043,1871,5376,10625,10645
+//   = 11 sites. Every one of them sends ONE report and `.await`s its
+//   reply with the actor mailbox otherwise idle, so the
+//   mailbox-would-Pend eager flush (trigger iv) fires for each — no
+//   helper-level Tick-after-send shim is needed.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Seed `tags.len()` substitutable single-output nodes (each its own
+/// build), drive ONE dispatch-probe Tick to mint every job, claim each
+/// and seed its output present, returning `(tag, output_path,
+/// exec_id)` per node. One tick keeps the housekeeping interactions
+/// out of the cross-node setup.
+async fn seed_claimed_mat_jobs(
+    handle: &ActorHandle,
+    store: &rio_test_support::grpc::MockStore,
+    tags: &[&str],
+) -> anyhow::Result<Vec<(String, String, Uuid)>> {
+    let mut outs = Vec::new();
+    for tag in tags {
+        let out = test_store_path(&format!("{tag}-out"));
+        let mut n = make_node(tag);
+        n.expected_output_paths = vec![out.clone()];
+        merge_dag(handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+        store.state.substitutable.write().unwrap().push(out.clone());
+        outs.push((tag.to_string(), out));
+    }
+    barrier(handle).await;
+    tick(handle).await?;
+    let mut claimed = Vec::new();
+    for (tag, out) in outs {
+        let assignment = match claim_materialization(handle, &tag, "store-sh002-0").await {
+            Ok(PullOutcome::Deliver(a)) => *a,
+            other => anyhow::bail!("the claim for {tag} must deliver, got {other:?}"),
+        };
+        let exec_id: Uuid = assignment.exec_id.parse()?;
+        store.seed_with_content(&out, b"materialized");
+        claimed.push((tag, out, exec_id));
+    }
+    Ok(claimed)
+}
+
+// r[verify sched.executor.report-idempotent]
+/// sh-002 row-4 arm (e), the v3.1-amendment gate: a SINGLE Success
+/// report resolves its reply WITHOUT a Tick — ack latency is decoupled
+/// from `tick_interval`. Paused-time so no Tick can fire on its own.
+/// This is the property the `tickIntervalSecs=600` materialization VM
+/// fixture relies on ("never tick-driven"), and it is what the
+/// mailbox-would-Pend eager flush (trigger iv) preserves once reports
+/// accumulate instead of consuming inline.
+#[tokio::test]
+async fn sh002_single_report_resolves_without_tick() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let mut claimed = seed_claimed_mat_jobs(&handle, &store, &["sh002-lone"]).await?;
+    let (tag, out, exec_id) = claimed.remove(0);
+
+    // The lone report: sent through the production intake, awaited
+    // directly. The actor has no internal Tick timer — Tick is an
+    // explicit `ActorCommand::Tick` from `main.rs` and none is sent
+    // below — so the reply resolves iff the report's own actor turn
+    // flushes it. The
+    // bounded timeout converts a hang (the ack deferred to a Tick
+    // that never comes) into a clean failure; it is wall-clock
+    // because the report's own consumption issues real PG I/O
+    // (paused-time auto-advance would race the socket reads and the
+    // sqlx pool-acquire timer — observed: PoolTimedOut under
+    // start_paused).
+    let report = report_materialization_outcome(
+        &handle,
+        exec_id,
+        &tag,
+        mat_success_outcome(vec![out.clone()], vec![]),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), report)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "a lone Success report's ack waited for a Tick (trigger iv missing): \
+                 the reply must resolve on the report's own actor turn"
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("Success report rejected: {e:?}"))?;
+
+    assert_eq!(
+        expect_drv(&handle, &tag).await.status,
+        DerivationStatus::Completed,
+        "the lone report's flush ran the batched completion (the node \
+         transitioned, not just acked)"
+    );
+    Ok(())
+}
+
+// r[verify sched.executor.report-idempotent]
+/// sh-002 row-4 arm (a): N Success reports queued back-to-back drive
+/// ONE `complete_ready_from_store_batch` call, not N per-item ones.
+/// RED at 5f1ce214c: each report's `consume_materialization_outcome`
+/// calls the batch helper inline with a `len=1` slice — the test
+/// counter moves by 3. After the two-level accumulator the flush
+/// drains all queued completions into one batched call.
+#[tokio::test]
+async fn sh002_queued_reports_coalesce_into_one_completion_batch() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let claimed = seed_claimed_mat_jobs(
+        &handle,
+        &store,
+        &["sh002-batch-a", "sh002-batch-b", "sh002-batch-c"],
+    )
+    .await?;
+
+    let before = handle.debug_counters().await?.complete_ready_batch_calls;
+
+    // Send all three Success reports in one synchronous burst
+    // (try_send never yields on a non-full channel, and the test
+    // runtime is current-thread): the actor sees a non-empty mailbox
+    // while processing reports 1 and 2 so the mailbox-idle eager
+    // flush (trigger iv) does NOT fire per-item; report 3 sees an
+    // empty mailbox and trigger (iv) drains all three into one
+    // batched completion.
+    let tx = handle.command_sender();
+    let mut rxs: Vec<tokio::sync::oneshot::Receiver<Result<(), PullRejection>>> = Vec::new();
+    for (tag, out, exec_id) in &claimed {
+        let mut payload = pull_payload(rio_proto::types::BuildResult::default());
+        payload.materialization_outcome = Some(mat_success_outcome(vec![out.clone()], vec![]));
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        tx.try_send(ActorCommand::ReportPullOutcome {
+            exec_id: *exec_id,
+            auth_intent: Some(tag.clone()),
+            payload,
+            reply: rtx,
+        })
+        .map_err(|e| anyhow::anyhow!("mailbox try_send: {e}"))?;
+        rxs.push(rrx);
+    }
+
+    // Ack-after-durable: every reply resolves Ok. Awaiting the FIRST
+    // reply is what yields to the actor — by then all three are
+    // queued, so the flush that resolves it batched all three.
+    for (i, rx) in rxs.into_iter().enumerate() {
+        let r = rx.await.map_err(|_| anyhow::anyhow!("reply {i} dropped"))?;
+        assert!(r.is_ok(), "report {i} must ack Ok, got {r:?}");
+    }
+    for (tag, _, _) in &claimed {
+        assert_eq!(
+            expect_drv(&handle, tag).await.status,
+            DerivationStatus::Completed,
+            "every coalesced report's node completed"
+        );
+    }
+
+    let delta = handle.debug_counters().await?.complete_ready_batch_calls - before;
+    assert!(
+        delta <= 1,
+        "RED at base: 3 Success reports drove 3 per-item \
+         complete_ready_from_store_batch(len=1) calls — the coalesced \
+         flush must batch them into ONE call (got {delta})"
+    );
+    Ok(())
+}
+
+// r[verify sched.executor.report-idempotent]
+/// sh-002 row-4 arm (c): a `LeaderLost` queued behind pending reports
+/// drains every held reply with `Err(NotLeader)` — never a silent
+/// `clear()`. RED at 5f1ce214c: there is no accumulator; each report
+/// runs to completion inline (the unknown-exec ack-and-ignore arm
+/// returns `Ok(())`), so the receivers below resolve `Ok` and the
+/// `Err(NotLeader)` assertion fails.
+#[tokio::test]
+async fn sh002_leader_lost_drains_pending_reports_not_leader() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let tx = handle.command_sender();
+    let mut rxs: Vec<tokio::sync::oneshot::Receiver<Result<(), PullRejection>>> = Vec::new();
+    // Three reports for never-minted exec_ids (the cheap shape — no
+    // PG setup needed; at base they hit the report-idempotent
+    // unknown-exec arm and ack `Ok(())`). Queued WITH `LeaderLost`
+    // behind them in one synchronous burst so every report's actor
+    // turn sees a non-empty mailbox.
+    for _ in 0..3 {
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        tx.try_send(ActorCommand::ReportPullOutcome {
+            exec_id: Uuid::new_v4(),
+            auth_intent: None,
+            payload: pull_payload(rio_proto::types::BuildResult::default()),
+            reply: rtx,
+        })
+        .map_err(|e| anyhow::anyhow!("try_send: {e}"))?;
+        rxs.push(rrx);
+    }
+    tx.try_send(ActorCommand::LeaderLost)
+        .map_err(|e| anyhow::anyhow!("try_send LeaderLost: {e}"))?;
+    barrier(&handle).await;
+
+    for (i, rx) in rxs.into_iter().enumerate() {
+        let r = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("reply {i} dropped (a clear() would do this)"))?;
+        assert!(
+            matches!(r, Err(PullRejection::NotLeader)),
+            "pending report {i} must drain Err(NotLeader) on LeaderLost \
+             (RED at base: the inline intake already acked Ok), got {r:?}"
+        );
+    }
+    Ok(())
+}
