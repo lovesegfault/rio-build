@@ -2364,7 +2364,7 @@ impl DagActor {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let hw = self.sla_estimator.hw_table();
         let cost = self.cost_table.read().clone();
-        // §13c-2 r[impl scheduler.sla.ceiling.uncatalogued-fallback]:
+        // §13c-2 r[impl scheduler.sla.ceiling.uncatalogued-fallback+2]:
         // per-tick gauge — 1 for any class without a boot-derived
         // catalog ceiling. Two cases (sh-016): empty catalog (Static
         // cost source / fetch failure) → every class falls to global;
@@ -2896,6 +2896,7 @@ impl DagActor {
                     memo.a.c_star <= cc
                         && rio_common::footprint::container_mem_bytes(memo.a.mem_bytes) <= cm
                 };
+                // r[impl sched.sla.ice-widen]
                 let cells = if cells.is_empty() {
                     // sh-016 (b): widen to all_candidates ∖ masked,
                     // ceiling-filtered, cost-sorted ascending so the

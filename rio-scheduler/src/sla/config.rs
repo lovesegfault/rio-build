@@ -758,7 +758,7 @@ impl SlaConfig {
     /// check (`solve_full`, [`Self::reference_hw_class_for_system`],
     /// the `all_candidates` capacity-fallback, the post-finalize
     /// chokepoint [`Self::retain_hosting_cells`]) calls THIS.
-    // r[impl scheduler.sla.ceiling.uncatalogued-fallback]
+    // r[impl scheduler.sla.ceiling.uncatalogued-fallback+2]
     // r[impl scheduler.sla.ceiling.config-tightens-only]
     pub fn class_ceilings(
         &self,
@@ -4693,10 +4693,11 @@ mod tests {
         );
     }
 
-    /// §13c-2 r[verify scheduler.sla.ceiling.uncatalogued-fallback]:
-    /// `class_ceilings` is `min(catalog_or_global, cfg_or_global)` per
-    /// axis. Catalog absent + cfg `None` → global. Catalog present →
-    /// physical bound. Cfg can only TIGHTEN below catalog.
+    /// §13c-2 r[verify scheduler.sla.ceiling.uncatalogued-fallback+2]:
+    /// `class_ceilings` is `min(catalog_or_excluded, cfg_or_global)` per
+    /// axis. Empty catalog → fall to global (graceful degradation).
+    /// Non-empty catalog + h missing → `(0,0)` (excluded). Catalog
+    /// present → physical bound. Cfg can only TIGHTEN below catalog.
     /// r[verify scheduler.sla.ceiling.config-tightens-only]
     #[test]
     fn class_ceilings_min_of_catalog_and_cfg() {

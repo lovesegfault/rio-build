@@ -1114,6 +1114,7 @@ async fn ice_mask_is_read_time() {
 /// while `:spot` was masked and `nodeclaim_intent_dropped_total
 /// {reason="ready_all_cells_ice_masked"}` climbed unbounded (19111
 /// drops in the production run).
+// r[verify sched.sla.ice-widen]
 #[tokio::test]
 async fn ice_mask_exhausts_a_widens_to_all_candidates() {
     use crate::sla::config::CapacityType::{self, Od, Spot};

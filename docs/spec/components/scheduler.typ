@@ -5108,15 +5108,22 @@ The largest buyable gen-8 c/m/r is 48xlarge (192 vCPU, family proven live).
 Runtime ceiling staleness (a shrink between boots re-pinning persisted
 demand) is the `scheduler.sla.ceiling.stale-solve-revalidation` law's axis.
 
-#r("scheduler.sla.ceiling.uncatalogued-fallback")[
-  A class with no catalog ceiling --- Static cost source, fetch failure, or 0
-  matched types --- falls to the global `sla.maxCores`/`maxMem`. The
-  #(refs.metric)("rio_scheduler_sla_class_ceiling_uncatalogued")`{hw_class}`
-  gauge is set to 1 for such a class on every solve tick. Falling to global
-  *over-permits, never over-strips* --- the bounded failure mode is a Karpenter
-  ICE-backoff (no real type fits the over-permitted demand), caught by
-  `cover::sizing`'s `exceeds_cell_cap` drop on the controller side.
+#r("scheduler.sla.ceiling.uncatalogued-fallback+2")[
+  A class with no catalog ceiling MUST be excluded from emission (ceiling
+  `(0,0)`) when the catalog is non-empty --- the class's `requirements` matched
+  zero AWS instance types (operator typo / nonexistent SKU); a `(0,0)` ceiling
+  fails every size gate. When the catalog is EMPTY (Static cost source, or
+  `describe_instance_types` failed at boot), every class falls to the global
+  `sla.maxCores`/`maxMem` --- graceful degradation, over-permits identically.
+  The #(refs.metric)("rio_scheduler_sla_class_uncatalogued_excluded")`{hw_class}`
+  gauge is set to 1 for an uncatalogued class on every solve tick.
 ]
+Rationale (sh-016): the previous unconditional fall-to-global made an
+uncatalogued class inherit the global `(max_fleet_cores, max_fleet_mem)`
+ceiling; combined with cheap spot price + low lead-time seed it became
+`e_min` for ~every drv and the τ-band collapsed around a phantom no real
+instance could host (`hi-nvme-x86-g7`: gen-7 x86 c/m/r have no
+instance-store variants).
 
 #r("scheduler.sla.ceiling.config-tightens-only")[
   `sla.hwClasses[h].maxCores`/`maxMem` are an OPTIONAL operator override that
@@ -5225,6 +5232,22 @@ never the mechanism. The verdict budget's time envelope is
 30 passes ≈ 5 minutes), violable by const; a hosting-class config reload
 resets the count in-band (the verdict detail names the configured
 classes, so a reload is observable without a side channel).
+
+#r("sched.sla.ice-widen")[
+  When `A ∖ ice_masked` is empty the emitted cell set MUST widen to the
+  full evaluated candidate set minus the mask, ceiling-filtered at the
+  shared `c*`; the masked admissible set `A` MUST NOT be re-emitted
+  unless the widened set is also empty.
+]
+Rationale (sh-016): `A` is the τ-cost-band-admitted set
+(`e_cost_upper ≤ (1+τ)·e_min`), not the full evaluated candidate set.
+With spot ≪ OD, `(h, Od)` is in `all_candidates` (it WAS evaluated)
+but never in `A`; subtracting the mask from `A` cannot surface it.
+Re-emitting the masked `A` re-loops the controller's
+`report_unfulfillable` for one backoff doubling per scheduler
+round-trip --- 19111 `ready_all_cells_ice_masked` drops with
+`nodeclaim_created{:od}=0` while `:spot` was masked and
+`capacityTypes: [spot, on-demand]`.
 
 #r("sched.sla.ladder-transit")[
   The ladder closure walk MUST separate REACHABILITY from ADMISSION:
