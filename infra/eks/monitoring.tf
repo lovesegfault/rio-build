@@ -84,6 +84,32 @@ resource "helm_release" "kube_prometheus_stack" {
       name  = "prometheus.prometheusSpec.ruleSelectorNilUsesHelmValues"
       value = "false"
     },
+    # sh-014: prometheus-0 (working set ~4.5GB) carries no
+    # nodeSelector/resources by default, so the scheduler bin-packed
+    # it onto an m5.large system node by timing accident → node went
+    # MemoryPressure and evicted it. Pin to rio-general
+    # (values.yaml:1581 — c8a/m8a/r8a, untainted by design) and size
+    # the request to its actual footprint. The chart passes
+    # prometheusSpec.nodeSelector/.resources straight into the
+    # Prometheus CR's pod template. Helm `--set` treats `.` as a path
+    # separator, so the label-key dot in rio.build/node-role is
+    # backslash-escaped (`/` is not special). rio-general's
+    # `budgets: nodes: "0" reasons: [Drifted]` is inherited and
+    # intended: prometheus is also connection-stateful (long
+    # scrape/WAL) — same no-auto-drift-rotation policy as the
+    # control-plane pods the pool was designed for.
+    {
+      name  = "prometheus.prometheusSpec.nodeSelector.rio\\.build/node-role"
+      value = "general"
+    },
+    {
+      name  = "prometheus.prometheusSpec.resources.requests.memory"
+      value = "6Gi"
+    },
+    {
+      name  = "prometheus.prometheusSpec.resources.limits.memory"
+      value = "12Gi"
+    },
   ]
 
   # aws_lbc dep: webhook-ordering only — its mservice.elbv2.k8s.aws
