@@ -1868,6 +1868,116 @@ async fn batch_probe_locally_present_batches_pg() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
+// sh-007b S3-lite: phase-17's two PG awaits join (Completed ∥ tenants)
+// ---------------------------------------------------------------------------
+
+/// `complete_ready_from_store_batch`'s first two PG awaits —
+/// `persist_status_batch(Completed)` (writes `derivations`) and
+/// `upsert_path_tenants_for_batch` (writes `path_tenants`/`narinfo`) —
+/// touch disjoint tables with no FK ordering, so they `try_join!`. The
+/// local ephemeral-PG harness can't reproduce iter1's 5-7s production
+/// figure on its own, so two `LOCK TABLE … EXCLUSIVE` blockers model
+/// the contended-PG latency: A holds `derivations` for 4s now, B holds
+/// `path_tenants` for 4s starting at +2s. Serial: status waits on A
+/// (~4s) THEN upsert waits on B (held 2..6s → ~6s elapsed) — over
+/// `SELF_FENCE_AFTER/2` = 5.5s. Joined: status waits on A (~4s) ∥
+/// upsert lands before B is taken (~ms) — max ≈ 4s. The Ready persist
+/// (empty newly-ready: 1000 leaves, no parents) and per-build tail
+/// (one `builds`-row write) touch neither lock, so the elapsed delta
+/// IS the join.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase17_tryjoin_under_half_fence() -> TestResult {
+    use crate::db::live_pins::StampProvenance;
+    use crate::state::BuildInfo;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+
+    // 1000 probeable leaves under one tenanted build (per-build tail =
+    // one builds-row write, no derivations contention; no edges → no
+    // newly_ready → the post-walk Ready persist early-returns at
+    // `Applied(0)` without touching `derivations`).
+    let bid = Uuid::new_v4();
+    let mut hashes: HashSet<DrvHash> = HashSet::new();
+    let mut items: Vec<(DrvHash, StampProvenance)> = Vec::with_capacity(1000);
+    for i in 0..1000 {
+        let h = format!("p17-{i}");
+        actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+            expected_output_paths: vec![test_store_path(&format!("p17-{i}-out"))],
+            ..crate::db::RecoveryDerivationRow::test_default(&h, "x86_64-linux")
+        });
+        actor
+            .dag
+            .node_mut(h.as_str())
+            .unwrap()
+            .interested_builds
+            .insert(bid);
+        hashes.insert(DrvHash::from(h.as_str()));
+        items.push((
+            DrvHash::from(h.as_str()),
+            StampProvenance::ProbedBy(DEFAULT_TEST_TENANT),
+        ));
+    }
+    actor.builds.insert(
+        bid,
+        BuildInfo::new_pending(
+            bid,
+            Some(DEFAULT_TEST_TENANT),
+            PriorityClass::Scheduled,
+            false,
+            BuildOptions::default(),
+            hashes,
+        ),
+    );
+
+    // Production-latency model: A locks `derivations` for 4s now; B
+    // locks `path_tenants` for 4s starting at +2s.
+    let pa = db.pool.clone();
+    let lock_a = tokio::spawn(async move {
+        let mut tx = pa.begin().await.unwrap();
+        sqlx::query("LOCK TABLE derivations IN EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
+        tx.rollback().await.ok();
+    });
+    let pb = db.pool.clone();
+    let lock_b = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        let mut tx = pb.begin().await.unwrap();
+        sqlx::query("LOCK TABLE path_tenants IN EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
+        tx.rollback().await.ok();
+    });
+    // Let A acquire before driving the actor.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let started = std::time::Instant::now();
+    actor.complete_ready_from_store_batch(&items).await;
+    let elapsed = started.elapsed();
+
+    let _ = tokio::join!(lock_a, lock_b);
+    assert!(
+        elapsed < rio_lease::SELF_FENCE_AFTER / 2,
+        "phase-17 joined writes must clear SELF_FENCE_AFTER/2 (={:?}); got {elapsed:?} \
+         — serial path waits on the derivations lock (~4s) THEN the \
+         path_tenants lock (held 2s..6s → ~6s)",
+        rio_lease::SELF_FENCE_AFTER / 2,
+    );
+    // Structural sanity: the batch transitioned (test isn't a no-op).
+    assert_eq!(
+        actor.dag.node("p17-0").unwrap().status(),
+        DerivationStatus::Completed
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // I-139/I-140: batch-probe truncated tail must NOT hit per-drv FMP fallback
 // ---------------------------------------------------------------------------
 

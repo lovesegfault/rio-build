@@ -729,6 +729,14 @@ impl DagActor {
     /// (`sched.evidence.durability`), same posture as
     /// [`persist_status`].
     ///
+    /// Composed from [`Self::persist_status_batch_db`] (the
+    /// `&SchedulerDb`-only PG await) +
+    /// [`Self::handle_persist_status_batch_result`] (the `&mut self`
+    /// Fenced note / Err-arm latch). The split exists so phase-17 can
+    /// `try_join!` the PG half against another `&self` PG await and
+    /// apply the latch after — `&mut self` across the await would
+    /// otherwise force serial.
+    ///
     /// [`persist_status`]: Self::persist_status
     // r[impl sched.evidence.durability+4]
     pub(super) async fn persist_status_batch(
@@ -736,11 +744,40 @@ impl DagActor {
         drv_hashes: &[&str],
         status: DerivationStatus,
     ) {
-        match self
-            .db
-            .update_derivation_status_batch(drv_hashes, status, self.serving_generation())
+        let r =
+            Self::persist_status_batch_db(&self.db, drv_hashes, status, self.serving_generation())
+                .await;
+        self.handle_persist_status_batch_result(drv_hashes, status, r);
+    }
+
+    /// PG-only half of [`Self::persist_status_batch`]: the fenced
+    /// `update_derivation_status_batch` round-trip, taking only
+    /// `&SchedulerDb` so a caller can join it against another `&self`
+    /// borrow. The `&mut self` post-processing (Fenced note + Err-arm
+    /// outbox latch) lives in
+    /// [`Self::handle_persist_status_batch_result`] and runs AFTER the
+    /// join. sh-007b S3-lite split-borrow.
+    pub(super) async fn persist_status_batch_db(
+        db: &crate::db::SchedulerDb,
+        drv_hashes: &[&str],
+        status: DerivationStatus,
+        generation: crate::db::ServingGeneration,
+    ) -> Result<crate::db::FencedOutcome, sqlx::Error> {
+        db.update_derivation_status_batch(drv_hashes, status, generation)
             .await
-        {
+    }
+
+    /// `&mut self` post-processing for [`Self::persist_status_batch_db`]:
+    /// Fenced → note, Ok → no-op, Err → outbox latch. Factored so the
+    /// phase-17 join can hold `&self` across both PG awaits and apply
+    /// the latch after.
+    pub(super) fn handle_persist_status_batch_result(
+        &mut self,
+        drv_hashes: &[&str],
+        status: DerivationStatus,
+        result: Result<crate::db::FencedOutcome, sqlx::Error>,
+    ) {
+        match result {
             Ok(crate::db::FencedOutcome::Fenced) => {
                 // Deposed: the successor owns these rows. NOT outboxed —
                 // re-driving a fenced write only re-fences.

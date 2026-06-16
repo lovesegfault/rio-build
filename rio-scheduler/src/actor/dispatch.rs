@@ -729,9 +729,10 @@ impl DagActor {
     }
 
     /// Batched `complete_ready_from_store`:
-    /// transition + `output_paths` set in-mem first (no await), then one
-    /// `persist_status_batch(Completed)`, one `upsert_path_tenants_for_
-    /// batch`, one batched newly-ready promote, then per-BUILD (not
+    /// transition + `output_paths` set in-mem first (no await), then a
+    /// joined `persist_status_batch(Completed)` ∥
+    /// `upsert_path_tenants_for_batch` (disjoint tables — sh-007b
+    /// S3-lite), one batched newly-ready promote, then per-BUILD (not
     /// per-drv) summary/counts/completion-check. I-139: the per-item
     /// variant in `batch_probe_cached_ready`'s locally-present branch
     /// was 3 sequential PG awaits × ≤2048 candidates → 12-30s actor
@@ -797,9 +798,37 @@ impl DagActor {
 
         let ok_hashes: Vec<DrvHash> = ok.iter().map(|d| d.hash.clone()).collect();
         let ok_refs: Vec<&str> = ok_hashes.iter().map(|h| h.as_str()).collect();
-        self.persist_status_batch(&ok_refs, DerivationStatus::Completed)
-            .await;
-        self.upsert_path_tenants_for_batch(&ok_items).await;
+        // sh-007b S3-lite (advisory §6 row 6, partial): the Completed
+        // persist (`derivations` table) and the path-tenant/deriver
+        // upsert (`path_tenants`/`narinfo`) write disjoint tables with
+        // no FK or row-ordering dependency — join them. ~2× phase-17
+        // on a contended PG (iter1: 5-7s → ~3-4s). The PG await is the
+        // `&SchedulerDb`-only half so both arms hold `&self`; the
+        // `&mut self` Err-arm latch is applied AFTER the join. Ready
+        // (below) stays serial: it depends on the in-mem
+        // `find_newly_ready` walk that follows. Infallible error type:
+        // both arms are best-effort and never propagate, so
+        // `try_join!` never short-circuits — the macro is the
+        // run-concurrently primitive, not an error funnel.
+        let generation = self.serving_generation();
+        let Ok((status_r, ())) = tokio::try_join!(
+            async {
+                Ok::<_, std::convert::Infallible>(
+                    Self::persist_status_batch_db(
+                        &self.db,
+                        &ok_refs,
+                        DerivationStatus::Completed,
+                        generation,
+                    )
+                    .await,
+                )
+            },
+            async {
+                self.upsert_path_tenants_for_batch(&ok_items).await;
+                Ok(())
+            },
+        );
+        self.handle_persist_status_batch_result(&ok_refs, DerivationStatus::Completed, status_r);
 
         // Batched promote: dedup find_newly_ready across all completed
         // hashes, transition in-mem, then one
