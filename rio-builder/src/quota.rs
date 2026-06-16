@@ -978,22 +978,33 @@ mod tests {
         );
     }
 
-    /// live_063 — the mint declines TOTALLY off-prjquota: tmpfs
-    /// (decline mode one) and a nonexistent dir both yield
-    /// `Unavailable`, never a panic or an error the overlay path
-    /// would have to handle. (On a `hostUsers: false` pod the same fn
-    /// returns `Existing` with kubelet's id — kernel-coupled,
-    /// witnessed in-VM.)
+    /// live_063 — the mint declines or observes per the host fs:
+    /// nonexistent-path yields `Unavailable` unconditionally; `/tmp`
+    /// yields `Unavailable` on tmpfs/ext4 (decline mode one) but
+    /// `Existing(kubelet_id)` on rio builder pods where `/tmp` is
+    /// XFS-prjquota emptyDir. The branch makes both arms an
+    /// in-process assertion (sh-010: was env-dependent fail on rio
+    /// self-host; the `Existing` arm was previously only
+    /// alphabet-covered at `projquota_id_projection_cells`).
     #[test]
-    fn ensure_declines_to_unavailable_off_prjquota() {
-        assert_eq!(
-            ensure_project_quota(std::path::Path::new("/tmp")),
-            ProjQuota::Unavailable
-        );
+    fn ensure_declines_or_observes_per_host_fs() {
         assert_eq!(
             ensure_project_quota(std::path::Path::new("/definitely/not/a/path")),
             ProjQuota::Unavailable
         );
+        let tmp = std::path::Path::new("/tmp");
+        match project_id(tmp) {
+            Some(id) => assert_eq!(
+                ensure_project_quota(tmp),
+                ProjQuota::Existing(ProjectId(id)),
+                "prjquota present: ensure must observe the assigned id, not mint"
+            ),
+            None => assert_eq!(
+                ensure_project_quota(tmp),
+                ProjQuota::Unavailable,
+                "no prjquota: ensure must decline, never panic"
+            ),
+        }
     }
 
     /// W14-C3/C4 (D-2, R26 + R30 producer-reachability) — the
