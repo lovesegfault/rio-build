@@ -2433,6 +2433,23 @@ pub const M_103: () = ();
 /// recorded at the WO). Global-scope holds carry `tenant_id` NULL
 /// and are untouched by tenant offboarding.
 pub const M_104: () = ();
+/// `migrations/105_executor_variant_outcome_class.sql`
+///
+/// The `executor_variant` outcome class joins the attempt-ledger
+/// alphabet (sh-012, the E3a/E3b split; spec rule
+/// `sched.retry.executor-variant-threshold`). Re-creates
+/// `drv_attempts_outcome_class_check` as 088's set plus
+/// `'executor_variant'`: the daemon's heuristic exit≠0
+/// (`PermanentFailure`) and unclassified (`MiscFailure`) — the two
+/// classifications whose verdict CAN vary by executor — now route to a
+/// dedicated class so the scheduler's distinct-executor poison
+/// threshold gates the conclusion (E3a, the kernel's `ExecutorVariant`
+/// fold arm) instead of poisoning on first observation. The
+/// derivation-INTRINSIC permanent statuses (CachedFailure,
+/// DependencyFailed, LogLimitExceeded, OutputRejected,
+/// NotDeterministic, InputRejected) keep `'permanent'` and stay
+/// first-observation poison (E3b).
+pub const M_105: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,

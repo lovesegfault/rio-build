@@ -2474,6 +2474,35 @@ impl DagActor {
                     }
                 }
             }
+            // sh-012 (E3a): the daemon's heuristic exit≠0 / unclassified
+            // — verdict CAN vary by executor. Threshold-gated requeue
+            // (mirrors E1); only poisons when ≥N distinct executors
+            // agree.
+            rio_proto::types::BuildResultStatus::ExecutorVariantFailure => {
+                let handling = self
+                    .handle_executor_variant_failure(
+                        drv_hash,
+                        executor_id,
+                        failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
+                    )
+                    .await;
+                match handling {
+                    FailureHandling::Handled => {
+                        self.attempt_record_retries.remove(drv_hash);
+                    }
+                    FailureHandling::RecordFailed => {
+                        if let Some(echo) = echo.take() {
+                            self.requeue_failure_completion(executor_id, drv_hash, echo);
+                        }
+                    }
+                }
+            }
+            // E3b: derivation-INTRINSIC permanent statuses — the verdict
+            // CANNOT vary by executor. First-observation poison.
+            // PermanentFailure stays here for synthetically-stamped
+            // statuses (NoSubstituters → PermanentFailure; the
+            // builder→scheduler path now sends ExecutorVariantFailure
+            // for the daemon's PermanentFailure/MiscFailure).
             rio_proto::types::BuildResultStatus::PermanentFailure
             | rio_proto::types::BuildResultStatus::CachedFailure
             | rio_proto::types::BuildResultStatus::DependencyFailed
@@ -4770,8 +4799,203 @@ impl DagActor {
         FailureHandling::Handled
     }
 
-    /// E3, collapsed onto `decide()` (Phase 1b): the verdict for a
-    /// permanent failure is computed by the fold over the appended
+    // r[impl sched.retry.executor-variant-threshold]
+    /// E3a (sh-012): an `ExecutorVariantFailure` — the daemon's
+    /// heuristic exit≠0 (`PermanentFailure`) or unclassified
+    /// (`MiscFailure`). The verdict CAN vary by executor (a
+    /// compute-bound build on a small node and a genuine compile error
+    /// are indistinguishable to nix-daemon), so the distinct-executor
+    /// poison threshold gates the conclusion: this handler mirrors E1
+    /// ([`Self::handle_transient_failure`]) — append the
+    /// `executor_variant` row, fold, and act on the verdict — and only
+    /// poisons `Permanent` when ≥N distinct executors agree; below
+    /// threshold the attempt charges as transient and requeues with
+    /// backoff and executor exclusion.
+    ///
+    /// The inverse cost — a derivation-intrinsic exit≠0 the daemon
+    /// classifies as `PermanentFailure` consumes up to `max_retries+1`
+    /// attempts before poison — is accepted: bounded by
+    /// [`crate::retry_policy::Budget`], converges via executor
+    /// exclusion, and never escalates cores (the compute-bound
+    /// corroboration gate refuses on low cpu_util).
+    pub(super) async fn handle_executor_variant_failure(
+        &mut self,
+        drv_hash: &DrvHash,
+        executor_id: &ExecutorId,
+        report: FailureReportCtx<'_>,
+    ) -> FailureHandling {
+        let observed_at = Instant::now();
+        let mut attempt_row = self.attempt_row_for(
+            drv_hash,
+            OutcomeClass::ExecutorVariant,
+            ReportingParty::Worker,
+        );
+        if let Some(row) = attempt_row.as_mut() {
+            row.executor_id = Some(executor_id.clone());
+            row.error_msg = (!report.error_msg.is_empty()).then(|| report.error_msg.to_string());
+            row.final_line_count = report.final_line_count;
+        }
+
+        if self.dag.node(drv_hash).is_none() {
+            return FailureHandling::Handled;
+        }
+
+        // The verdict: decide() over the appended suffix, inside the
+        // appending transaction; the verdict's status is persisted on
+        // the same connection (threshold poison → Poisoned, retry →
+        // Ready). Same shape as E1's appending transaction.
+        let (decision, recorded_row) = if let Some(row) = attempt_row {
+            let result: Result<Option<crate::retry_policy::Decision>, sqlx::Error> = async {
+                // r[impl sched.evidence.durability+4]
+                let mut tx = match self.db.begin_fenced(self.serving_generation()).await? {
+                    crate::db::FencedBegin::Fenced { .. } => {
+                        return Ok(None);
+                    }
+                    crate::db::FencedBegin::Open(ftx) => ftx,
+                };
+                let (_, decision) = self.append_and_decide_in_tx(tx.conn(), &row).await?;
+                if matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_)) {
+                    crate::db::SchedulerDb::persist_poisoned_in_tx(tx.conn(), drv_hash).await?;
+                } else {
+                    crate::db::SchedulerDb::update_derivation_status_in_tx(
+                        tx.conn(),
+                        drv_hash,
+                        DerivationStatus::Ready,
+                        None,
+                    )
+                    .await?;
+                }
+                tx.commit().await?;
+                Ok(Some(decision))
+            }
+            .await;
+            match result {
+                Ok(Some(decision)) => (decision, Some(row)),
+                Ok(None) => {
+                    self.note_fenced_evidence_write(
+                        "executor-variant-failure appending transaction",
+                    );
+                    return FailureHandling::Handled;
+                }
+                Err(e) => {
+                    warn!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
+                          "executor-variant failure: appending transaction failed; \
+                           derivation stays in its pre-report state pending re-delivery");
+                    return FailureHandling::RecordFailed;
+                }
+            }
+        } else {
+            // No db_id yet (merge not committed): fold the in-memory
+            // history plus a synthetic record for this observation
+            // (same shape as E1's uncommitted-merge edge).
+            let mut history = self
+                .dag
+                .node(drv_hash)
+                .map(|s| s.attempt_history().to_vec())
+                .unwrap_or_default();
+            history.push(crate::state::AttemptRecord {
+                attempt_id: Uuid::now_v7(),
+                event_kind: crate::state::AttemptEventKind::Attempt,
+                outcome_class: OutcomeClass::ExecutorVariant,
+                exec_id: None,
+                executor_id: Some(executor_id.clone()),
+                attempt_kind: crate::state::AttemptKind::Build,
+                source_node: self.pull_attempt_source_node(drv_hash),
+                termination_reason: None,
+                reporting_party: ReportingParty::Worker,
+                exempt: false,
+                floor_promoted: false,
+                floor_at_cap: false,
+                error_msg: None,
+                final_line_count: None,
+                resubmit_cycle: 0,
+                occurred_at_epoch_secs: crate::db::attempts::epoch_now(),
+                recorded_at_epoch_secs: 0.0,
+            });
+            let decision = crate::retry_policy::decide(
+                &history,
+                &self.decision_budget(),
+                crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
+            );
+            (decision, None)
+        };
+
+        if let Some(row) = recorded_row {
+            if let Some(state) = self.dag.node_mut(drv_hash) {
+                state.push_attempt_record(row.to_record());
+            }
+            self.refresh_retry_view(drv_hash);
+        }
+
+        match decision.verdict {
+            crate::retry_policy::Verdict::Poison(
+                crate::retry_policy::PoisonReason::TransientBudget,
+            ) => {
+                let n = decision.counters.count;
+                self.poison_already_recorded(
+                    drv_hash,
+                    &format!("max_retries={n} exhausted after executor-variant failures"),
+                    report.final_line_count,
+                    rio_proto::VerdictBacking::FreshExecution,
+                )
+                .await;
+            }
+            crate::retry_policy::Verdict::Poison(_) => {
+                // PoisonReason::Permanent — ≥N distinct executors agreed.
+                // The worker's error_msg IS the user-facing reason here
+                // (unlike E1's synthesized string): the daemon's exit≠0
+                // message is what the operator wants to see.
+                self.poison_already_recorded(
+                    drv_hash,
+                    report.error_msg,
+                    report.final_line_count,
+                    rio_proto::VerdictBacking::FreshExecution,
+                )
+                .await;
+            }
+            _ => {
+                // Below threshold and below the per-cycle cap: requeue
+                // with backoff (E1's structure). The fold's count
+                // already includes this event, hence the -1.
+                let backoff = self
+                    .retry_policy
+                    .backoff_duration(decision.counters.count.saturating_sub(1));
+                if let Some(state) = self.dag.node_mut(drv_hash) {
+                    state.ensure_running();
+                    if let Err(e) = state.transition(DerivationStatus::Failed) {
+                        warn!(drv_hash = %drv_hash, error = %e, "Running->Failed transition failed");
+                    }
+                    state.assigned_executor = None;
+                    state.retry.backoff_until = Some(Instant::now() + backoff);
+                    info!(
+                        drv_hash = %drv_hash,
+                        executor_id = %executor_id,
+                        retry_count = state.retry.count,
+                        distinct_failed = decision.counters.failed_builders.len(),
+                        backoff_secs = backoff.as_secs_f64(),
+                        error_msg = report.error_msg,
+                        "executor-variant failure — requeue (below distinct-executor threshold)"
+                    );
+                    if let Err(e) = state.transition(DerivationStatus::Ready) {
+                        warn!(drv_hash = %drv_hash, error = %e, "Failed->Ready transition failed");
+                    } else {
+                        metrics::histogram!(
+                            "rio_scheduler_attempt_requeue_seconds",
+                            "cause" => "worker-report"
+                        )
+                        .record(observed_at.elapsed().as_secs_f64());
+                    }
+                }
+                for build_id in self.get_interested_builds(drv_hash) {
+                    self.emit_progress(build_id);
+                }
+            }
+        }
+        FailureHandling::Handled
+    }
+
+    /// E3b, collapsed onto `decide()` (Phase 1b): the verdict for a
+    /// derivation-intrinsic permanent failure is computed by the fold over the appended
     /// attempt suffix inside the appending transaction; the in-memory
     /// transition, the cached-view refresh, and the terminal epilogue
     /// run only after the commit. A failed transaction leaves the

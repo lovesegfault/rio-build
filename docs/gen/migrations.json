@@ -99,6 +99,7 @@
     "101_derivations_status_changed_at",
     "102_derivations_status_changed_trigger",
     "103_gc_holds_and_tombstones",
-    "104_gc_holds_restrict"
+    "104_gc_holds_restrict",
+    "105_executor_variant_outcome_class"
   ]
 }

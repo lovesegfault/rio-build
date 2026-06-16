@@ -907,7 +907,8 @@ impl SchedulerDb {
                           AND a.executor_id IS NOT NULL
                           AND a.event_kind = 'attempt'
                           AND a.outcome_class IN
-                              ('transient', 'permanent', 'backstop', 'executor_crash')),
+                              ('transient', 'permanent', 'executor_variant',
+                               'backstop', 'executor_crash')),
                        '{}'::text[]
                    ) AS failed_executors,
                    COALESCE(

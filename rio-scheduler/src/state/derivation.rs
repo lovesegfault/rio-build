@@ -683,8 +683,14 @@ db_str_enum! {
         ExemptInfra = "exempt_infra",
         /// E4/E7 — worker `TimedOut` or controller `DeadlineExceeded`.
         Timeout = "timeout",
-        /// E3 — one of the seven permanent failure statuses.
+        /// E3b — one of the six derivation-intrinsic permanent failure
+        /// statuses (first-observation poison).
         Permanent = "permanent",
+        /// E3a — `ExecutorVariantFailure` (sh-012, migration 105): the
+        /// daemon's heuristic exit≠0 / unclassified. Threshold-gated:
+        /// charges `failed_builders`/`failure_count` like E1; only
+        /// poisons `Permanent` when ≥N distinct executors agree.
+        ExecutorVariant = "executor_variant",
         /// A dependent swept to `DependencyFailed` by an ancestor's
         /// terminal failure (no execution of its own).
         Cascade = "cascade",

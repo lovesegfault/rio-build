@@ -666,6 +666,27 @@ policy decision (divergence A7 of the retry campaign's catalog; the standing
 question is the TODO at the retry kernel's `backoff_secs`), not specified
 away here.
 
+#r("sched.retry.executor-variant-threshold")[
+  An `ExecutorVariantFailure` status MUST poison only when at least
+  `poison_threshold` distinct executors have reported it for the same
+  derivation; below threshold the attempt charges as transient
+  (#rref("sched.retry.transient-budget")) and requeues with executor
+  exclusion. Derivation-intrinsic permanent statuses (`CachedFailure`,
+  `DependencyFailed`, `LogLimitExceeded`, `OutputRejected`,
+  `NotDeterministic`, `InputRejected`) MUST poison on first observation.
+  The inverse cost --- a derivation-intrinsic exit≠0 the daemon
+  classifies as `PermanentFailure` consumes up to `max_retries+1`
+  attempts before poison --- is accepted; bounded by `Budget`, converges
+  via executor exclusion, and never escalates cores (the compute-bound
+  corroboration gate refuses on low cpu_util).
+]
+The `ExecutorVariantFailure` status carries the daemon's heuristic exit≠0
+(`PermanentFailure`) and unclassified (`MiscFailure`) classifications ---
+the two whose verdict CAN vary by executor (a compute-bound build on a
+small node and a genuine compile error are indistinguishable to
+nix-daemon). The distinct-executor threshold is the only in-tree
+determinism gate; first-observation poison (sh-012) bypasses it.
+
 #r("sched.retry.store-degraded-uncharged+4")[
   An infrastructure failure carrying the builder's
   `BuildResult.store_degraded` flag

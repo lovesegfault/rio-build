@@ -536,9 +536,20 @@ pub enum AttemptEvent<Id> {
         exempt: bool,
         at_cap: bool,
     },
-    /// E3 — one of the seven permanent statuses (`PermanentFailure`,
-    /// `CachedFailure`, `DependencyFailed`, `LogLimitExceeded`,
-    /// `OutputRejected`, `NotDeterministic`, `InputRejected`).
+    /// E3a — `ExecutorVariantFailure` (sh-012): the daemon's heuristic
+    /// exit≠0 (`PermanentFailure`) or unclassified (`MiscFailure`). The
+    /// verdict CAN vary by executor (compute-bound on a small node and
+    /// a genuine compile error are indistinguishable to nix-daemon), so
+    /// the distinct-executor poison threshold gates the conclusion: this
+    /// arm mirrors E1 (record into `failed_builders`, increment
+    /// `failure_count`, threshold/cap/backoff) and the
+    /// [`PoisonReason::Permanent`] verdict is reached only when ≥N
+    /// distinct executors agree.
+    ExecutorVariant { at: AbsTime, executor: Option<Id> },
+    /// E3b — one of the six derivation-INTRINSIC permanent statuses
+    /// (`CachedFailure`, `DependencyFailed`, `LogLimitExceeded`,
+    /// `OutputRejected`, `NotDeterministic`, `InputRejected`):
+    /// first-observation poison, no threshold.
     Permanent { at: AbsTime, executor: Option<Id> },
     /// E4 — worker `CompletionReport{TimedOut}`.
     WorkerTimeout { at: AbsTime, executor: Option<Id> },
@@ -608,6 +619,7 @@ impl<Id> AttemptEvent<Id> {
         match self {
             Self::Transient { at, .. }
             | Self::Infra { at, .. }
+            | Self::ExecutorVariant { at, .. }
             | Self::Permanent { at, .. }
             | Self::WorkerTimeout { at, .. }
             | Self::Disconnect { at, .. }
@@ -721,7 +733,10 @@ pub enum PoisonReason {
     InfraBudget,
     /// `exempt_infra_count >= max_exempt_infra_retries`.
     ExemptInfraBudget,
-    /// A permanent failure status — poisoned directly, no budget.
+    /// A permanent failure status: either ≥N distinct executors agreed
+    /// on an executor-variant failure (E3a, the threshold's conclusion)
+    /// OR a derivation-intrinsic permanent status was observed (E3b,
+    /// first-observation — no threshold).
     Permanent,
 }
 
@@ -945,7 +960,45 @@ fn apply<Id: Ord + Clone>(
             Verdict::Requeue
         }
 
-        // ── E3: handle_permanent_failure ────────────────────────────
+        // ── E3a: handle_executor_variant_failure (sh-012) ───────────
+        // r[impl sched.retry.executor-variant-threshold]
+        // Mirrors E1's structure exactly: record (insert + increment),
+        // then threshold check over the set that now includes this
+        // failure, then the per-cycle count cap, with `count` and the
+        // backoff only on the retry arm. The poison verdict on the
+        // threshold arm is `Permanent` (≥N distinct executors agreed —
+        // the only in-tree determinism gate); below threshold and
+        // above `max_retries` it is `TransientBudget`, so an unknown
+        // executor (the `None` arm — distinct-set never grows)
+        // terminates via the per-cycle cap.
+        // No fleet-exhaust check: unlike E1, the placement exclusion is
+        // the only fleet consumer of E3a's `failed_builders` insert; the
+        // FleetExhausted poison stays E1/E9's.
+        AttemptEvent::ExecutorVariant { at, executor } => {
+            // live059-c: a different-class outcome is health evidence —
+            // the build demonstrably ran (to a non-infra exit≠0), so
+            // the consecutive-infra streak breaks (same as E1).
+            c.infra_count = 0;
+            if let Some(executor) = executor {
+                c.failed_builders.insert(executor.clone());
+            }
+            c.failure_count += 1;
+            if c.poison_threshold_reached(budget) {
+                c.poisoned_at = Some(*at);
+                return Verdict::Poison(PoisonReason::Permanent);
+            }
+            if c.count < budget.max_retries {
+                let backoff = budget.backoff_secs(c.count);
+                c.count += 1;
+                c.backoff_until = Some(at.saturating_add(backoff));
+                Verdict::Requeue
+            } else {
+                c.poisoned_at = Some(*at);
+                Verdict::Poison(PoisonReason::TransientBudget)
+            }
+        }
+
+        // ── E3b: handle_permanent_failure (derivation-intrinsic) ────
         AttemptEvent::Permanent { at, executor } => {
             c.poisoned_at = Some(*at);
             // Diagnostics-only insert (I-209): `failed_builders` gates
@@ -1192,8 +1245,14 @@ pub enum OutcomeClass {
     ExemptInfra,
     /// E4/E7 — worker `TimedOut` or controller `DeadlineExceeded`.
     Timeout,
-    /// E3 — one of the seven permanent failure statuses.
+    /// E3b — one of the six derivation-intrinsic permanent failure
+    /// statuses (first-observation poison).
     Permanent,
+    /// E3a — `ExecutorVariantFailure` (sh-012): the daemon's heuristic
+    /// exit≠0 / unclassified. Threshold-gated: charges
+    /// `failed_builders`/`failure_count` like E1 and only poisons
+    /// `Permanent` when ≥N distinct executors agree.
+    ExecutorVariant,
     /// A dependent swept to `DependencyFailed` by an ancestor's
     /// terminal failure (no execution of its own).
     Cascade,
@@ -1466,6 +1525,7 @@ fn decide_exclusion_covers_charged_attempts<Id: Ord>(
                     r.outcome_class,
                     OutcomeClass::Transient
                         | OutcomeClass::Permanent
+                        | OutcomeClass::ExecutorVariant
                         | OutcomeClass::Backstop
                         | OutcomeClass::ExecutorCrash
                 );
@@ -1706,6 +1766,7 @@ fn row_to_event<Id: Clone>(row: &LedgerRow<Id>) -> Option<AttemptEvent<Id>> {
             }
         }
         OutcomeClass::Permanent => Some(AttemptEvent::Permanent { at, executor }),
+        OutcomeClass::ExecutorVariant => Some(AttemptEvent::ExecutorVariant { at, executor }),
         OutcomeClass::Backstop => Some(AttemptEvent::BackstopTimeout { at, executor }),
         // First-installment disconnect rows: classification not yet
         // established; charges nothing, re-checks the threshold (E5).
@@ -2269,8 +2330,13 @@ pub enum ObservedFailure<'a> {
         /// The worker-reported error message.
         error_msg: &'a str,
     },
-    /// E3 — one of the seven permanent failure statuses.
+    /// E3b — one of the six derivation-intrinsic permanent failure
+    /// statuses (first-observation poison).
     WorkerPermanent,
+    /// E3a — `ExecutorVariantFailure` (sh-012): the daemon's heuristic
+    /// exit≠0 / unclassified — verdict CAN vary by executor, so the
+    /// distinct-executor threshold gates the poison.
+    WorkerExecutorVariant,
     /// E4 — worker `CompletionReport{TimedOut}`.
     WorkerTimeout,
     /// E5 — stream disconnect / heartbeat timeout / force-drain released
@@ -2334,6 +2400,7 @@ pub enum ObservedFailure<'a> {
             }
         }
         ObservedFailure::WorkerPermanent => *c == OutcomeClass::Permanent,
+        ObservedFailure::WorkerExecutorVariant => *c == OutcomeClass::ExecutorVariant,
         ObservedFailure::WorkerTimeout => *c == OutcomeClass::Timeout,
         ObservedFailure::Disconnect => *c == OutcomeClass::Disconnected,
         ObservedFailure::ControllerResourceTermination => {
@@ -2360,6 +2427,7 @@ pub fn classify(event: &ObservedFailure<'_>, floor: FloorOutcomeView) -> Outcome
             }
         }
         ObservedFailure::WorkerPermanent => OutcomeClass::Permanent,
+        ObservedFailure::WorkerExecutorVariant => OutcomeClass::ExecutorVariant,
         ObservedFailure::WorkerTimeout => OutcomeClass::Timeout,
         ObservedFailure::Disconnect => OutcomeClass::Disconnected,
         ObservedFailure::ControllerResourceTermination => {
@@ -2482,6 +2550,7 @@ mod tests {
                 | C::ExemptInfra
                 | C::Timeout
                 | C::Permanent
+                | C::ExecutorVariant
                 | C::Cascade
                 | C::Backstop
                 | C::ExecutorCrash
@@ -2501,6 +2570,7 @@ mod tests {
             C::ExemptInfra,
             C::Timeout,
             C::Permanent,
+            C::ExecutorVariant,
             C::Cascade,
             C::Backstop,
             C::Disconnected,
@@ -3068,6 +3138,86 @@ mod tests {
             seed_baseline,
             "a materialization row ahead of the resubmit-reset seed row must not change the seed"
         );
+    }
+
+    /// sh-012 (E3a/E3b split): an `ExecutorVariantFailure` (the daemon's
+    /// heuristic exit≠0 / unclassified — verdict CAN vary by executor)
+    /// poisons only when the distinct-executor poison threshold agrees;
+    /// below threshold it charges the transient budget and requeues
+    /// with executor exclusion. The derivation-INTRINSIC permanent
+    /// statuses (E3b) keep first-observation poison.
+    // r[verify sched.retry.executor-variant-threshold]
+    #[test]
+    fn executor_variant_poisons_only_on_third_distinct() {
+        let budget = Budget::default(); // threshold=3, max_retries=2, distinct
+        let now = 1000;
+
+        // Two distinct executors → Requeue (charges count + exclusion).
+        let two = [
+            build_row(OutcomeClass::ExecutorVariant, Some("e1"), 100),
+            build_row(OutcomeClass::ExecutorVariant, Some("e2"), 200),
+        ];
+        let d = decide(&two, &budget, now);
+        assert_eq!(d.verdict, Verdict::Requeue, "below threshold → requeue");
+        assert_eq!(d.counters.count, 2);
+        assert_eq!(d.counters.failure_count, 2);
+        assert!(d.exclusion.contains("e1"));
+        assert!(d.exclusion.contains("e2"));
+
+        // Third distinct executor → Poison(Permanent) (the threshold's
+        // conclusion: ≥N distinct executors agreed).
+        let three = [
+            build_row(OutcomeClass::ExecutorVariant, Some("e1"), 100),
+            build_row(OutcomeClass::ExecutorVariant, Some("e2"), 200),
+            build_row(OutcomeClass::ExecutorVariant, Some("e3"), 300),
+        ];
+        let d = decide(&three, &budget, now);
+        assert_eq!(
+            d.verdict,
+            Verdict::Poison(PoisonReason::Permanent),
+            "third distinct executor: the threshold's conclusion is permanent"
+        );
+        assert!(d.counters.poison_threshold_reached(&budget));
+
+        // Same executor 3× (distinct mode) → never reaches the threshold;
+        // the per-cycle transient cap (max_retries=2) is the bound:
+        // Poison(TransientBudget) on the third.
+        let same = [
+            build_row(OutcomeClass::ExecutorVariant, Some("e1"), 100),
+            build_row(OutcomeClass::ExecutorVariant, Some("e1"), 200),
+            build_row(OutcomeClass::ExecutorVariant, Some("e1"), 300),
+        ];
+        let d = decide(&same, &budget, now);
+        assert_eq!(
+            d.verdict,
+            Verdict::Poison(PoisonReason::TransientBudget),
+            "same executor: transient-budget cap, not threshold"
+        );
+
+        // Unknown executor 3× → distinct-set never grows; transient cap
+        // is the bound (terminates the no-identity edge).
+        let none = [
+            build_row(OutcomeClass::ExecutorVariant, None, 100),
+            build_row(OutcomeClass::ExecutorVariant, None, 200),
+            build_row(OutcomeClass::ExecutorVariant, None, 300),
+        ];
+        let d = decide(&none, &budget, now);
+        assert_eq!(
+            d.verdict,
+            Verdict::Poison(PoisonReason::TransientBudget),
+            "no identity: transient-budget cap is the termination bound"
+        );
+
+        // E3b unchanged: a derivation-intrinsic permanent status poisons
+        // on first observation (no threshold).
+        let intrinsic = [build_row(OutcomeClass::Permanent, Some("e1"), 100)];
+        let d = decide(&intrinsic, &budget, now);
+        assert_eq!(
+            d.verdict,
+            Verdict::Poison(PoisonReason::Permanent),
+            "E3b: intrinsic permanent → first-observation poison"
+        );
+        assert!(!d.counters.poison_threshold_reached(&budget));
     }
 
     /// The materialization budget: N materialization_infra rows since
