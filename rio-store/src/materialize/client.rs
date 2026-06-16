@@ -1,10 +1,16 @@
 //! The materialization executor's scheduler client: poll → fenced
 //! claim → report (substitution-replacement design §2.2 item 1).
 //!
-//! Transport is abstracted behind [`MaterializeTransport`] (the builder
-//! runtime's `PullTransport` precedent — copied shape, not shared code)
-//! so the claim/report state machines are unit-testable against a
-//! scripted mock with no wire and no scheduler.
+//! Transport is abstracted behind two traits (sh-002 — the §Nth-strike
+//! type-level split of the per-worker thundering herd):
+//! [`MaterializeClaimTransport`] (`list_jobs` + `pull`, owned by the
+//! ONE per-replica claim coordinator, NO `Clone` on its production
+//! impl [`ClaimSide`]) and [`MaterializeReportTransport`] (`report` +
+//! `report_progress`, the per-worker report side, `Clone` on
+//! [`SchedulerTransport`]). A worker's compile-time surface has no
+//! `pull`/`list_jobs`; the coordinator's has no `report`. The retired
+//! single-trait shape let every worker own its own claim loop — the
+//! 332:1 reject ratio the sh-002 advisory measured.
 // r[impl store.materialize.executor+5]
 
 use std::collections::VecDeque;
@@ -48,9 +54,14 @@ const REPORT_RETRY_ENVELOPE: rio_common::backoff::Backoff = rio_common::backoff:
     jitter: rio_common::backoff::Jitter::Full,
 };
 
-/// The four unaries the executor speaks, abstracted for testing
-/// (the builder runtime's `PullTransport` precedent).
-pub trait MaterializeTransport {
+/// The CLAIM side of the executor protocol (sh-002 split):
+/// `list_jobs` and `pull` — owned exclusively by the ONE per-replica
+/// claim coordinator. The production impl [`ClaimSide`] derives **NO
+/// `Clone`** and its constructor is `pub(super)`-scoped to this
+/// module, so a second claimant in the worker pool cannot typecheck.
+/// The §Nth-strike close is the ClaimSide construction count: exactly
+/// one, in the supervisor body.
+pub trait MaterializeClaimTransport {
     /// An attempt-level timeout was observed by the caller (the bounded
     /// await elapsed with no answer). The production transport treats
     /// this like an UNAVAILABLE answer and abandons the pinned
@@ -66,6 +77,21 @@ pub trait MaterializeTransport {
         &mut self,
         req: PullAssignmentRequest,
     ) -> impl Future<Output = Result<PullAssignmentResponse, tonic::Status>> + Send;
+}
+
+/// The REPORT side of the executor protocol (sh-002 split): `report`
+/// and `report_progress` — owned per-worker (the BC-4 progress relay
+/// clones one per job). `Clone` is on the trait bound:
+/// [`SchedulerTransport`] derives it; the per-worker `{pod}-w{n}`
+/// instances each carry their own report channel (T-5.1 binding).
+pub trait MaterializeReportTransport: Clone {
+    /// finding 18 (standby-pin abandon) — same default-no-op contract
+    /// as the claim side; [`SchedulerTransport`] overrides with
+    /// [`SchedulerTransport::abandon_connection`] so
+    /// [`report_until_acked`]'s `BoundedOutcome::TimedOut` arm keeps
+    /// the rollout-recovery behavior.
+    fn note_timeout(&mut self) {}
+
     fn report(
         &mut self,
         req: ReportOutcomeRequest,
@@ -1281,7 +1307,7 @@ fn count_claim_answer(lane: PresentationLane, answer: &PullAnswer) {
 }
 
 /// Issue one bounded `PullAssignment` and classify the outcome.
-async fn pull_once<T: MaterializeTransport>(
+async fn pull_once<T: MaterializeClaimTransport>(
     transport: &mut T,
     shutdown: &rio_common::signal::Token,
     req: PullAssignmentRequest,
@@ -1840,7 +1866,7 @@ impl ConversionFutilityLatch {
 /// are logged and skipped; a failed listing yields an empty pass (the
 /// `list_health` latch escalates once the failures become persistent).
 // r[impl store.materialize.executor+5]
-pub async fn poll_and_claim<T: MaterializeTransport>(
+pub async fn poll_and_claim<T: MaterializeClaimTransport>(
     transport: &mut T,
     executor_instance: &rio_common::dns::Dns1123Label,
     available_slots: usize,
@@ -2375,7 +2401,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
 /// completed walk's outcome survives any skew window shorter than
 /// the budget.
 // r[impl store.materialize.executor+5]
-pub async fn report_until_acked<T: MaterializeTransport>(
+pub async fn report_until_acked<T: MaterializeReportTransport>(
     transport: &mut T,
     exec_id: &str,
     outcome: super::executor::CountedOutcome,
@@ -2626,7 +2652,15 @@ impl SchedulerTransport {
     /// ([`super::executor_instance`]); it is bound into every minted
     /// service token so the scheduler can verify (not trust) the
     /// `executor_instance` field of every claim.
-    pub fn connect_lazy(
+    ///
+    /// `pub(super)` (sh-002): re-derivation from
+    /// `(HostPort, signer, instance)` is module-private so a worker
+    /// cannot mint a fresh transport from outside the spawn boundary.
+    /// The §Nth-strike close is the [`ClaimSide`] construction count
+    /// (exactly one, in the supervisor body) — `connect_lazy`
+    /// legitimately remains once in the worker-spawn loop for the
+    /// REPORT side (T-5.1 per-worker `{pod}-w{n}` instances).
+    pub(super) fn connect_lazy(
         scheduler_addr: &HostPort,
         signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
         instance: &rio_common::dns::Dns1123Label,
@@ -2729,43 +2763,18 @@ impl SchedulerTransport {
     }
 }
 
-impl MaterializeTransport for SchedulerTransport {
+impl MaterializeReportTransport for SchedulerTransport {
     /// A bounded await elapsed with no answer: indistinguishable at
     /// this layer from the standby-pinned connection (finding 18) —
     /// abandon the channel so the next RPC re-rolls the kube-proxy
-    /// backend choice.
+    /// backend choice. [`report_until_acked`]'s `TimedOut` arm calls
+    /// this; the override is the sh-002 split's preserved abandon.
     fn note_timeout(&mut self) {
         debug!(
             "scheduler RPC timed out; abandoning the pinned connection \
              (rollout/standby/black-hole recovery)"
         );
         self.abandon_connection();
-    }
-
-    async fn list_jobs(
-        &mut self,
-        req: ListMaterializationJobsRequest,
-    ) -> Result<ListMaterializationJobsResponse, tonic::Status> {
-        let result = self
-            .client
-            .list_materialization_jobs(req)
-            .await
-            .map(|r| r.into_inner());
-        self.note_rpc_outcome(&result);
-        result
-    }
-
-    async fn pull(
-        &mut self,
-        req: PullAssignmentRequest,
-    ) -> Result<PullAssignmentResponse, tonic::Status> {
-        let result = self
-            .client
-            .pull_assignment(req)
-            .await
-            .map(|r| r.into_inner());
-        self.note_rpc_outcome(&result);
-        result
     }
 
     async fn report(&mut self, req: ReportOutcomeRequest) -> Result<(), tonic::Status> {
@@ -2784,6 +2793,77 @@ impl MaterializeTransport for SchedulerTransport {
             .await
             .map(|_| ());
         self.note_rpc_outcome(&result);
+        result
+    }
+}
+
+/// The CLAIM-side production transport (sh-002): the per-replica claim
+/// coordinator's exclusive `list_jobs` + `pull` channel. Deliberately
+/// derives **NO `Clone`** and its constructor is `pub(super)`, so the
+/// only place a `ClaimSide` can be minted is the coordinator-supervisor
+/// body in `mod.rs` — a worker has no compile-time path to a second
+/// claimant. Wraps a [`SchedulerTransport`] for the channel/abandon
+/// machinery (the inner is private; the `Clone` on it is unreachable
+/// through this type).
+pub(super) struct ClaimSide {
+    inner: SchedulerTransport,
+}
+
+impl ClaimSide {
+    /// Rebuild the claim-side channel from the spawn-time inputs.
+    /// Called once per supervisor iteration (panic-restart rebuilds a
+    /// fresh channel; the prior one died with the panicked
+    /// coordinator). The `instance` here is the COORDINATOR identity
+    /// (`{pod}-coord`), not a per-worker `{pod}-w{n}`.
+    pub(super) fn reconstruct(
+        scheduler_addr: &HostPort,
+        signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
+        instance: &rio_common::dns::Dns1123Label,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: SchedulerTransport::connect_lazy(scheduler_addr, signer, instance)?,
+        })
+    }
+}
+
+impl MaterializeClaimTransport for ClaimSide {
+    /// finding 18 (standby-pin abandon) — delegates to the wrapped
+    /// channel's [`SchedulerTransport::abandon_connection`]; serves the
+    /// coordinator-side `note_timeout` callers in [`pull_once`] and the
+    /// listing arm of [`poll_and_claim`].
+    fn note_timeout(&mut self) {
+        debug!(
+            "scheduler RPC timed out; abandoning the pinned connection \
+             (rollout/standby/black-hole recovery)"
+        );
+        self.inner.abandon_connection();
+    }
+
+    async fn list_jobs(
+        &mut self,
+        req: ListMaterializationJobsRequest,
+    ) -> Result<ListMaterializationJobsResponse, tonic::Status> {
+        let result = self
+            .inner
+            .client
+            .list_materialization_jobs(req)
+            .await
+            .map(|r| r.into_inner());
+        self.inner.note_rpc_outcome(&result);
+        result
+    }
+
+    async fn pull(
+        &mut self,
+        req: PullAssignmentRequest,
+    ) -> Result<PullAssignmentResponse, tonic::Status> {
+        let result = self
+            .inner
+            .client
+            .pull_assignment(req)
+            .await
+            .map(|r| r.into_inner());
+        self.inner.note_rpc_outcome(&result);
         result
     }
 }
@@ -2814,6 +2894,12 @@ mod tests {
     /// entry once the script is exhausted. Records every
     /// `PullAssignmentRequest` so the BC-1 wire-obligation test can
     /// assert kind/instance on each claim.
+    ///
+    /// Implements BOTH split traits (sh-002): the test battery drives
+    /// `poll_and_claim` and `report_until_acked` through one scripted
+    /// mock; the `Clone` derive satisfies the report-side supertrait
+    /// bound (no test relies on shared-state-via-clone).
+    #[derive(Clone)]
     struct MockTransport {
         listings: VecDeque<Result<ListMaterializationJobsResponse, tonic::Status>>,
         pulls: VecDeque<Result<PullAssignmentResponse, tonic::Status>>,
@@ -2860,7 +2946,7 @@ mod tests {
         }
     }
 
-    impl MaterializeTransport for MockTransport {
+    impl MaterializeClaimTransport for MockTransport {
         async fn list_jobs(
             &mut self,
             req: ListMaterializationJobsRequest,
@@ -2907,7 +2993,9 @@ mod tests {
                 _ => self.pulls.pop_front().expect("non-empty"),
             }
         }
+    }
 
+    impl MaterializeReportTransport for MockTransport {
         async fn report(&mut self, _req: ReportOutcomeRequest) -> Result<(), tonic::Status> {
             self.report_calls += 1;
             match self.reports.len() {
@@ -3149,7 +3237,7 @@ mod tests {
         deliveries: u32,
     }
 
-    impl MaterializeTransport for StuckHeadTransport {
+    impl MaterializeClaimTransport for StuckHeadTransport {
         async fn list_jobs(
             &mut self,
             _req: ListMaterializationJobsRequest,
@@ -3183,17 +3271,6 @@ mod tests {
                 ));
             }
             Err(tonic::Status::not_found("unknown intent"))
-        }
-
-        async fn report(&mut self, _req: ReportOutcomeRequest) -> Result<(), tonic::Status> {
-            Ok(())
-        }
-
-        async fn report_progress(
-            &mut self,
-            _req: ReportMaterializationProgressRequest,
-        ) -> Result<(), tonic::Status> {
-            Ok(())
         }
     }
 
@@ -4521,22 +4598,11 @@ mod tests {
     // r[verify store.materialize.executor+5]
     #[tokio::test(start_paused = true)]
     async fn report_black_hole_times_out_within_budget() {
+        #[derive(Clone)]
         struct BlackHole {
             calls: u32,
         }
-        impl MaterializeTransport for BlackHole {
-            async fn list_jobs(
-                &mut self,
-                _req: ListMaterializationJobsRequest,
-            ) -> Result<ListMaterializationJobsResponse, tonic::Status> {
-                Err(tonic::Status::unavailable("unused"))
-            }
-            async fn pull(
-                &mut self,
-                _req: PullAssignmentRequest,
-            ) -> Result<PullAssignmentResponse, tonic::Status> {
-                Err(tonic::Status::unavailable("unused"))
-            }
+        impl MaterializeReportTransport for BlackHole {
             async fn report(&mut self, _req: ReportOutcomeRequest) -> Result<(), tonic::Status> {
                 self.calls += 1;
                 std::future::pending::<()>().await;
@@ -4616,7 +4682,7 @@ mod tests {
             inner: MockTransport,
             shutdown: rio_common::signal::Token,
         }
-        impl MaterializeTransport for CancelOnFirstPull {
+        impl MaterializeClaimTransport for CancelOnFirstPull {
             async fn list_jobs(
                 &mut self,
                 req: ListMaterializationJobsRequest,
@@ -4631,15 +4697,6 @@ mod tests {
                 // SIGTERM lands right after the first claim delivers.
                 self.shutdown.cancel();
                 resp
-            }
-            async fn report(&mut self, req: ReportOutcomeRequest) -> Result<(), tonic::Status> {
-                self.inner.report(req).await
-            }
-            async fn report_progress(
-                &mut self,
-                req: ReportMaterializationProgressRequest,
-            ) -> Result<(), tonic::Status> {
-                self.inner.report_progress(req).await
             }
         }
         let shutdown = token();
@@ -4822,7 +4879,7 @@ mod tests {
         // The "kube-proxy": initially fronts the standby.
         let (proxy_addr, backend) = spawn_switchable_proxy(standby_addr).await;
 
-        let mut transport = SchedulerTransport::connect_lazy(
+        let mut transport = ClaimSide::reconstruct(
             &HostPort::parse(&proxy_addr.to_string()).expect("proxy addr is host:port"),
             None,
             &instance("store-replica-0"),
@@ -4902,17 +4959,18 @@ mod tests {
         )
         .unwrap();
 
-        // Pin the connection to the standby with one failing pass.
-        let _ = poll_and_claim(
-            &mut transport,
-            &instance("store-replica-0"),
-            1,
-            &mut ResumeLedger::default(),
-            &mut ListFailureLatch::default(),
-            &mut ConversionFutilityLatch::default(),
-            &token(),
-        )
-        .await;
+        // Pin the connection to the standby with one failing report
+        // attempt (sh-002: the report side owns its own channel, so
+        // pinning is exercised through the trait the test certifies —
+        // [`MaterializeReportTransport::note_timeout`] /
+        // `note_rpc_outcome` on the UNAVAILABLE answer).
+        let _ = transport
+            .report(ReportOutcomeRequest {
+                exec_id: "exec-rollout-1".into(),
+                report: None,
+                materialization_outcome: None,
+            })
+            .await;
         // The rollout completes mid-execution.
         *backend.lock().unwrap() = leader_addr;
 

@@ -201,6 +201,25 @@ pub fn spawn_materialization_executor(
                 return spawned;
             }
         };
+        // sh-002 (TRANSITIONAL — collapses to one in the supervisor at
+        // the claim_coordinator commit): the per-worker claim side
+        // exists here only so the trait-split commit compiles; the
+        // §Nth-strike close (exactly one ClaimSide construction, in the
+        // supervisor body) lands with the coordinator.
+        let claim_side = match client::ClaimSide::reconstruct(
+            &scheduler_addr,
+            service_signer.clone(),
+            &worker_instance,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    scheduler_addr = %cfg.scheduler_addr, error = %e,
+                    "materialization claim-side channel creation failed; executor disabled"
+                );
+                return spawned;
+            }
+        };
         // live_047/R-C: width from the config lever (default 4); ONE
         // pod-wide slot pool shared by every worker bounds the
         // executor's total gate draw at P = cap/2.
@@ -218,6 +237,7 @@ pub fn spawn_materialization_executor(
                 worker,
                 cfg_for_worker,
                 ctx,
+                claim_side,
                 transport,
                 instance_for_worker,
                 shutdown_for_worker,
@@ -270,15 +290,17 @@ pub fn spawn_materialization_executor(
 ///     DEFAULT `poll_interval_secs = 1` (±20 % jitter): raising the
 ///     interval past that horizon degrades to broader, more-contested
 ///     listings (the pre-live_041 shape) — never to unlisted jobs.
-async fn claim_loop<T>(
+async fn claim_loop<C, R>(
     worker: usize,
     cfg: crate::config::MaterializationConfig,
     ctx: executor::ExecutorContext,
-    mut transport: T,
+    mut claim: C,
+    mut report: R,
     instance: rio_common::dns::Dns1123Label,
     shutdown: rio_common::signal::Token,
 ) where
-    T: client::MaterializeTransport + Clone + Send + Sync + 'static,
+    C: client::MaterializeClaimTransport + Send + Sync + 'static,
+    R: client::MaterializeReportTransport + Send + Sync + 'static,
 {
     info!(worker, instance = %instance, "materialization claim loop started");
     // bug_251 (rule-4b): the per-worker resume ledger — unanswered
@@ -314,7 +336,7 @@ async fn claim_loop<T>(
         // normal empty-pass beat.
         let mut admission = ctx.path_slots.try_admit_claim();
         let pass = client::poll_and_claim(
-            &mut transport,
+            &mut claim,
             &instance,
             admission.is_some() as usize,
             &mut ledger,
@@ -353,7 +375,7 @@ async fn claim_loop<T>(
             let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<
                 rio_proto::types::ReportMaterializationProgressRequest,
             >(16);
-            let mut progress_transport = transport.clone();
+            let mut progress_transport = report.clone();
             let shutdown_for_relay = shutdown.clone();
             rio_common::task::spawn_monitored("materialization-progress-relay", async move {
                 use rio_common::transport::{BoundedOutcome, bounded};
@@ -426,7 +448,7 @@ async fn claim_loop<T>(
                 outcome = execute => outcome,
             };
             let acked = client::report_until_acked(
-                &mut transport,
+                &mut report,
                 &job.exec_id,
                 outcome,
                 REPORT_RETRY_BUDGET,
@@ -713,7 +735,7 @@ mod tests {
             shutdown: rio_common::signal::Token,
             reports: Arc<Mutex<Vec<rio_proto::types::ReportOutcomeRequest>>>,
         }
-        impl client::MaterializeTransport for SigtermAfterClaim {
+        impl client::MaterializeClaimTransport for SigtermAfterClaim {
             async fn list_jobs(
                 &mut self,
                 _req: rio_proto::types::ListMaterializationJobsRequest,
@@ -747,6 +769,8 @@ mod tests {
                     ),
                 })
             }
+        }
+        impl client::MaterializeReportTransport for SigtermAfterClaim {
             async fn report(
                 &mut self,
                 req: rio_proto::types::ReportOutcomeRequest,
@@ -785,6 +809,7 @@ mod tests {
                 0,
                 crate::config::MaterializationConfig::default(),
                 ctx,
+                transport.clone(),
                 transport,
                 rio_common::dns::Dns1123Label::sanitize(
                     "store-replica-0",
@@ -964,7 +989,7 @@ mod tests {
         shutdown: rio_common::signal::Token,
     }
 
-    impl client::MaterializeTransport for PacingTransport {
+    impl client::MaterializeClaimTransport for PacingTransport {
         async fn list_jobs(
             &mut self,
             _req: rio_proto::types::ListMaterializationJobsRequest,
@@ -994,7 +1019,9 @@ mod tests {
                 _ => st.pulls.pop_front().expect("non-empty"),
             })
         }
+    }
 
+    impl client::MaterializeReportTransport for PacingTransport {
         async fn report(
             &mut self,
             _req: rio_proto::types::ReportOutcomeRequest,
@@ -1067,6 +1094,7 @@ mod tests {
             0,
             cfg,
             ctx,
+            transport.clone(),
             transport,
             executor_instance().with_worker(0),
             shutdown,
@@ -1297,7 +1325,7 @@ mod tests {
             list_calls: Arc<Mutex<usize>>,
             pull_calls: Arc<Mutex<usize>>,
         }
-        impl client::MaterializeTransport for CountingTransport {
+        impl client::MaterializeClaimTransport for CountingTransport {
             async fn list_jobs(
                 &mut self,
                 _req: rio_proto::types::ListMaterializationJobsRequest,
@@ -1313,6 +1341,8 @@ mod tests {
                 *self.pull_calls.lock().unwrap() += 1;
                 Ok(rio_proto::types::PullAssignmentResponse { outcome: None })
             }
+        }
+        impl client::MaterializeReportTransport for CountingTransport {
             async fn report(
                 &mut self,
                 _req: rio_proto::types::ReportOutcomeRequest,
@@ -1350,6 +1380,7 @@ mod tests {
             0,
             crate::config::MaterializationConfig::default(),
             ctx,
+            transport.clone(),
             transport,
             executor_instance().with_worker(0),
             shutdown.clone(),
@@ -1417,7 +1448,7 @@ mod tests {
         struct HerdTransport {
             state: Arc<Mutex<HerdState>>,
         }
-        impl client::MaterializeTransport for HerdTransport {
+        impl client::MaterializeClaimTransport for HerdTransport {
             async fn list_jobs(
                 &mut self,
                 _req: rio_proto::types::ListMaterializationJobsRequest,
@@ -1460,6 +1491,8 @@ mod tests {
                     ),
                 })
             }
+        }
+        impl client::MaterializeReportTransport for HerdTransport {
             async fn report(
                 &mut self,
                 _req: rio_proto::types::ReportOutcomeRequest,
@@ -1501,6 +1534,7 @@ mod tests {
                 worker,
                 crate::config::MaterializationConfig::default(),
                 ctx,
+                transport.clone(),
                 transport.clone(),
                 pod.with_worker(worker),
                 shutdown.clone(),
@@ -1574,7 +1608,7 @@ mod tests {
 
         #[derive(Clone, Default)]
         struct EmptyTransport;
-        impl client::MaterializeTransport for EmptyTransport {
+        impl client::MaterializeClaimTransport for EmptyTransport {
             async fn list_jobs(
                 &mut self,
                 _req: rio_proto::types::ListMaterializationJobsRequest,
@@ -1588,6 +1622,8 @@ mod tests {
             ) -> Result<rio_proto::types::PullAssignmentResponse, tonic::Status> {
                 Ok(rio_proto::types::PullAssignmentResponse { outcome: None })
             }
+        }
+        impl client::MaterializeReportTransport for EmptyTransport {
             async fn report(
                 &mut self,
                 _req: rio_proto::types::ReportOutcomeRequest,
@@ -1672,6 +1708,7 @@ mod tests {
                 0,
                 crate::config::MaterializationConfig::default(),
                 ctx,
+                EmptyTransport,
                 EmptyTransport,
                 executor_instance().with_worker(0),
                 shutdown.clone(),
