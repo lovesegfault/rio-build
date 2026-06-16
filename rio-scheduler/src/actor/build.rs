@@ -546,6 +546,10 @@ impl DagActor {
         let total = build.total_count;
         let completed = build.recovered_completed + summary.completed;
         let cached = build.cached_count;
+        #[cfg(test)]
+        self.test_counters
+            .persist_build_counts_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Err(e) = self
             .db
             .persist_build_counts(build_id, total, completed, cached)

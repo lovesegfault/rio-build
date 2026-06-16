@@ -1978,6 +1978,197 @@ async fn phase17_tryjoin_under_half_fence() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
+// sh-007c S5: phase-17 3-way join (Completed ∥ tenants ∥ Ready) + counts batch
+// ---------------------------------------------------------------------------
+
+/// `complete_ready_from_store_batch` widened to a 3-way join: the
+/// `find_newly_ready` walk hoists ahead of the join (it depends only
+/// on in-mem `dag.node(h).status`, NOT the PG write), so the Ready
+/// persist runs CONCURRENTLY with the Completed persist instead of
+/// serially after. Disjoint `derivations` rows (a node going
+/// Completed is never its own dependent — `Completed→Ready` is an
+/// invalid transition), so two row-level FOR UPDATE blockers can
+/// model independent per-write latency where the 2-way sibling test's
+/// table-level EXCLUSIVE cannot.
+///
+/// 1500 leaves + 50 parents (each a 30-way fan-in over disjoint
+/// leaves) so `newly_ready` is non-empty — the 2-way test above is
+/// DESIGNED with zero edges so the Ready persist early-returns; this
+/// test's third arm is the load-bearing one. 3 distinct builds so the
+/// per-build tail's `persist_build_counts` is N>1 at base.
+///
+/// Row-level latency model:
+///   A — leaf rows FOR UPDATE held 0..3s   → blocks the Completed persist
+///   C — parent rows FOR UPDATE 2.5s..6s   → blocks the Ready persist
+/// Serial-at-base: the 2-way join clears at ~3s on A, THEN the serial
+/// Ready persist hits C (held 2.5..6s) → ~6s; the per-build tail does
+/// 3× `persist_build_counts`. 3-way-joined: Completed waits on A
+/// (~3s) ∥ tenants (fast) ∥ Ready (parent rows free until 2.5s →
+/// lands fast) → ~3s; one batched counts persist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase17_join3_under_half_fence() -> TestResult {
+    use crate::db::live_pins::StampProvenance;
+    use crate::state::BuildInfo;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+
+    const LEAVES: usize = 1500;
+    const PARENTS: usize = 50;
+    const FANIN: usize = 30;
+    let bids: [Uuid; 3] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    let mut per_build: [HashSet<DrvHash>; 3] = Default::default();
+    let mut leaf_hashes: Vec<String> = Vec::with_capacity(LEAVES);
+    let mut par_hashes: Vec<String> = Vec::with_capacity(PARENTS);
+    let mut items: Vec<(DrvHash, StampProvenance)> = Vec::with_capacity(LEAVES);
+    for i in 0..LEAVES {
+        let h = format!("p17j-leaf-{i:04}");
+        actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+            expected_output_paths: vec![test_store_path(&format!("p17j-leaf-{i:04}-out"))],
+            ..crate::db::RecoveryDerivationRow::test_default(&h, "x86_64-linux")
+        });
+        let bidx = i % 3;
+        actor
+            .dag
+            .node_mut(h.as_str())
+            .unwrap()
+            .interested_builds
+            .insert(bids[bidx]);
+        per_build[bidx].insert(DrvHash::from(h.as_str()));
+        items.push((
+            DrvHash::from(h.as_str()),
+            StampProvenance::ProbedBy(DEFAULT_TEST_TENANT),
+        ));
+        leaf_hashes.push(h);
+    }
+    for p in 0..PARENTS {
+        let ph = format!("p17j-par-{p:02}");
+        actor.test_inject_at(&ph, "x86_64-linux", DerivationStatus::Queued);
+        let bidx = p % 3;
+        actor
+            .dag
+            .node_mut(ph.as_str())
+            .unwrap()
+            .interested_builds
+            .insert(bids[bidx]);
+        per_build[bidx].insert(DrvHash::from(ph.as_str()));
+        for c in 0..FANIN {
+            actor.test_inject_edge(&ph, &format!("p17j-leaf-{:04}", p * FANIN + c));
+        }
+        par_hashes.push(ph);
+    }
+    for (i, bid) in bids.iter().enumerate() {
+        actor.builds.insert(
+            *bid,
+            BuildInfo::new_pending(
+                *bid,
+                Some(DEFAULT_TEST_TENANT),
+                PriorityClass::Scheduled,
+                false,
+                BuildOptions::default(),
+                std::mem::take(&mut per_build[i]),
+            ),
+        );
+    }
+
+    // Persist all 1550 rows so row-level FOR UPDATE discriminates the
+    // leaf set (Completed write target) from the parent set (Ready
+    // write target). The actor's `update_derivation_status_batch` is a
+    // row-locked UPDATE; FOR UPDATE on disjoint row sets models
+    // independent per-write RTT.
+    let all_hashes: Vec<String> = leaf_hashes
+        .iter()
+        .chain(par_hashes.iter())
+        .cloned()
+        .collect();
+    let all_paths: Vec<String> = all_hashes.iter().map(|h| test_drv_path(h)).collect();
+    sqlx::query(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         SELECT h, p, 'p17j', 'x86_64-linux', 'ready' \
+           FROM UNNEST($1::text[], $2::text[]) AS u(h, p)",
+    )
+    .bind(&all_hashes)
+    .bind(&all_paths)
+    .execute(&db.pool)
+    .await?;
+
+    let pa = db.pool.clone();
+    let la = leaf_hashes.clone();
+    let lock_a = tokio::spawn(async move {
+        let mut tx = pa.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM derivations WHERE drv_hash = ANY($1::text[]) FOR UPDATE")
+            .bind(&la)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+        tx.rollback().await.ok();
+    });
+    let pc = db.pool.clone();
+    let lp = par_hashes.clone();
+    let lock_c = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        let mut tx = pc.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM derivations WHERE drv_hash = ANY($1::text[]) FOR UPDATE")
+            .bind(&lp)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+        tx.rollback().await.ok();
+    });
+    // Let A acquire before driving the actor.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let before = actor.test_counters.snapshot();
+    let started = std::time::Instant::now();
+    actor.complete_ready_from_store_batch(&items).await;
+    let elapsed = started.elapsed();
+    let after = actor.test_counters.snapshot();
+
+    let _ = tokio::join!(lock_a, lock_c);
+
+    // Structural: every parent went Queued→Ready (the 3rd arm is
+    // non-vacuous and the disjoint-rows debug_assert held).
+    for p in 0..PARENTS {
+        assert_eq!(
+            actor
+                .dag
+                .node(format!("p17j-par-{p:02}").as_str())
+                .unwrap()
+                .status(),
+            DerivationStatus::Ready,
+            "parent {p} must be newly-ready (the find_newly_ready hoist ran)"
+        );
+    }
+    assert_eq!(
+        actor.dag.node("p17j-leaf-0000").unwrap().status(),
+        DerivationStatus::Completed
+    );
+
+    // sh-007c S5 commit 2: per-build tail batches the counts persist
+    // (3 builds → ≤1 batched write, NOT 3 serial RTTs).
+    let counts_calls = after.persist_build_counts_calls - before.persist_build_counts_calls;
+    assert!(
+        counts_calls <= 1,
+        "complete_ready_from_store_batch must batch the per-build counts \
+         persist (≤1 call for 3 builds); got {counts_calls} — pre-S5 each \
+         build's update_build_counts_with awaited its own RTT"
+    );
+    // sh-007c S5 commit 3: 3-way join — Ready lands before C is taken.
+    assert!(
+        elapsed < rio_lease::SELF_FENCE_AFTER / 2,
+        "phase-17 3-way join must clear SELF_FENCE_AFTER/2 (={:?}); got \
+         {elapsed:?} — serial-at-base the Ready persist runs AFTER the \
+         Completed join (~3s) and waits on the parent-row FOR UPDATE \
+         (held 2.5..6s) → ~6s",
+        rio_lease::SELF_FENCE_AFTER / 2,
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // I-139/I-140: batch-probe truncated tail must NOT hit per-drv FMP fallback
 // ---------------------------------------------------------------------------
 

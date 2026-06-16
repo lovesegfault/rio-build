@@ -1046,6 +1046,12 @@ pub(crate) struct TestCounters {
     /// Asserts on the cached-floor rule: N PullAssignments drive at
     /// most one Tick-head refresh, not N per-pull PG round-trips.
     pub max_known_generation_reads: std::sync::atomic::AtomicU64,
+    /// Incremented at every actor-level `persist_build_counts*` PG
+    /// round-trip (sh-007c S5). Asserts on the per-build-tail batch
+    /// rule: `complete_ready_from_store_batch` over N interested
+    /// builds must drive ≤1 batched counts write, not N serial
+    /// `persist_build_counts` awaits inside `update_build_counts_with`.
+    pub persist_build_counts_calls: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
@@ -1058,6 +1064,7 @@ impl TestCounters {
             evidence_writes_fenced: self.evidence_writes_fenced.load(SeqCst),
             complete_ready_batch_calls: self.complete_ready_batch_calls.load(SeqCst),
             max_known_generation_reads: self.max_known_generation_reads.load(SeqCst),
+            persist_build_counts_calls: self.persist_build_counts_calls.load(SeqCst),
         }
     }
 }
@@ -1078,6 +1085,8 @@ pub struct TestCountersSnapshot {
     pub complete_ready_batch_calls: u64,
     /// See [`TestCounters::max_known_generation_reads`].
     pub max_known_generation_reads: u64,
+    /// See [`TestCounters::persist_build_counts_calls`].
+    pub persist_build_counts_calls: u64,
 }
 
 impl DagActor {
