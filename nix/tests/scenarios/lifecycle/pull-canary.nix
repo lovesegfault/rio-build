@@ -10,13 +10,16 @@
 #
 #   - Pull retry-feed (fold input): a scripted {success,
 #     deterministic-failure} sequence on a Builder pool. The
-#     failure leg is classified by the worker-report path as exactly
-#     one `permanent` worker-reported attempt row (never a double
-#     charge — exec_id is schema-unique), the success leg charges
-#     nothing, the failed derivation ends poisoned and the client sees
-#     the failure. (The stream-baseline leg this used to be compared
-#     against retired with the stream session machinery — 1c' deletion
-#     commit A; these are now absolute assertions on the pull leg.)
+#     failure leg (exit≠0 → ExecutorVariantFailure, sh-012 E3a) is
+#     folded by the worker-report path as one `executor_variant`
+#     worker-reported attempt row PER attempt (never a double charge —
+#     exec_id is schema-unique, one row per distinct exec_id), retried
+#     up to max_retries (default 2 → three attempts), the success leg
+#     charges nothing, the failed derivation ends poisoned and the
+#     client sees the failure. (The stream-baseline leg this used to
+#     be compared against retired with the stream session machinery —
+#     1c' deletion commit A; these are now absolute assertions on the
+#     pull leg.)
 #     Exclusion keying per AD2: the pull row is keyed by the attested
 #     intent identity with source_node as the node key when the
 #     controller-authoritative binding is reported. In this fixture
@@ -71,11 +74,12 @@ scope: with scope; ''
           f"WHERE d.drv_path LIKE '%{marker}%'"
       )
 
-  def pc_charge_facts(marker):
-      """The single ledger row for marker, as a list of fields:
+  def pc_charge_facts(marker, want_n=1):
+      """The ledger row(s) for marker, each as a list of fields:
       [outcome_class, termination_reason, reporting_party, executor_id,
       source_node, exec_id_is_intent_key, event_kind, exec_id].
-      Asserts exactly one row exists."""
+      Asserts exactly want_n rows exist; returns the first row's
+      fields (callers that need all rows use the second return)."""
       out = psql_k8s(k3s_server,
           "SELECT a.outcome_class, coalesce(a.termination_reason, '<none>'), "
           "a.reporting_party, coalesce(a.executor_id, '<none>'), "
@@ -86,10 +90,11 @@ scope: with scope; ''
           f"WHERE d.drv_path LIKE '%{marker}%'"
       ).strip()
       rows = [r for r in out.split("\n") if r.strip()]
-      assert len(rows) == 1, (
-          f"expected exactly one ledger row for {marker!r}, got {len(rows)}: {rows!r}"
+      assert len(rows) == want_n, (
+          f"expected exactly {want_n} ledger row(s) for {marker!r}, got {len(rows)}: {rows!r}"
       )
-      return [f.strip() for f in rows[0].split("|")]
+      parsed = [[f.strip() for f in r.split("|")] for r in rows]
+      return parsed[0], parsed
 
   def pc_drv_status(marker):
       return psql_k8s(k3s_server,
@@ -254,31 +259,45 @@ scope: with scope; ''
       assert pc_drv_status("pc-pull-ok") == "completed", (
           f"pull success leg should end completed, got {pc_drv_status('pc-pull-ok')!r}"
       )
-      pull_facts = pc_charge_facts("pc-pull-fail")
+      # sh-012 E3a: exit!=0 maps NixStatus::PermanentFailure ->
+      # BuildResultStatus::ExecutorVariantFailure -> the kernel's E3a
+      # arm, which retries up to max_retries (default 2 -> three
+      # attempts) before Poison. PC_FAIL_ATTEMPTS is 1+max_retries.
+      PC_FAIL_ATTEMPTS = 3
+      pull_facts, pull_all = pc_charge_facts(
+          "pc-pull-fail", want_n=PC_FAIL_ATTEMPTS
+      )
       p_class, p_reason, p_party, p_exec, p_node, p_is_intent, p_kind = pull_facts[:7]
-      # The fold-input assertions on the pull leg: a deterministic
-      # build failure is exactly one `permanent` worker-reported
-      # attempt row, one charge per failure leg, zero per success leg,
-      # and the client-visible verdict matches. The exclusion KEY is
-      # the attested intent identity (+ node key when the binding is
-      # reported), per AD2.
-      assert p_class == "permanent", (
-          f"a deterministic pull-leg build failure must classify as a "
-          f"permanent worker-reported attempt, got class {p_class!r} "
-          f"(facts: {pull_facts!r})"
-      )
-      assert p_kind == "attempt" and p_party == "worker", (
-          f"the pull failure must be one worker-reported attempt row, got: {pull_facts!r}"
-      )
-      assert p_is_intent == "true", (
-          f"pull rows are keyed by the attested intent identity, got executor_id={p_exec!r}"
+      # The fold-input assertions on the pull leg: an exit!=0 build
+      # failure is one `executor_variant` worker-reported attempt row
+      # per attempt (E3a), one charge per attempt with no
+      # double-charge (one row per distinct exec_id), zero charges for
+      # the success leg, and the client-visible
+      # verdict matches. The exclusion KEY is the attested intent
+      # identity (+ node key when the binding is reported), per AD2.
+      for r in pull_all:
+          assert r[0] == "executor_variant", (
+              f"an exit!=0 pull-leg build failure must classify as an "
+              f"executor_variant worker-reported attempt (sh-012 E3a), "
+              f"got class {r[0]!r} (row: {r!r})"
+          )
+          assert r[6] == "attempt" and r[2] == "worker", (
+              f"each pull failure must be one worker-reported attempt row, got: {r!r}"
+          )
+          assert r[5] == "true", (
+              f"pull rows are keyed by the attested intent identity, got executor_id={r[3]!r}"
+          )
+      exec_ids = {r[7] for r in pull_all}
+      assert len(exec_ids) == PC_FAIL_ATTEMPTS, (
+          f"no double-charge: {PC_FAIL_ATTEMPTS} attempts must mint "
+          f"{PC_FAIL_ATTEMPTS} distinct exec_ids, got {exec_ids!r}"
       )
       assert pc_exec_count("pc-pull-fail") >= 1, (
           f"the failure leg must have minted an execution via the pull "
           f"transaction, got {pc_exec_count('pc-pull-fail')}"
       )
       assert pc_drv_status("pc-pull-fail") == "poisoned", (
-          f"the permanent pull failure must poison the drv, "
+          f"the E3a-exhausted pull failure must poison the drv, "
           f"got {pc_drv_status('pc-pull-fail')!r}"
       )
       # AD2 carve-out (printed, not asserted): source_node is written
@@ -292,12 +311,12 @@ scope: with scope; ''
           pc_attempt_rows("pc-pull-ok")
           + pc_attempt_rows("pc-pull-fail")
       )
-      assert total_rows == 1, (
-          f"the scripted sequence must charge exactly once for the failure leg and "
-          f"never double-charge, got {total_rows} rows total"
+      assert total_rows == PC_FAIL_ATTEMPTS, (
+          f"the scripted sequence must charge exactly once per failure-leg "
+          f"attempt and never for the success leg, got {total_rows} rows total"
       )
-      print("pull-canary retry-feed PASS: one permanent charge for the failure, "
-            "no double charges, the success charge-free")
+      print("pull-canary retry-feed PASS: one executor_variant charge per "
+            "E3a attempt, no double charges, the success charge-free")
 
   # ══════════════════════════════════════════════════════════════════
   # Arm 3 — cancel timing (T-1b.9): CancelBuild on a running pull build.
@@ -558,7 +577,7 @@ scope: with scope; ''
           if pc_attempt_rows("pc-estab") >= 1:
               break
           time.sleep(10)
-      estab_facts = pc_charge_facts("pc-estab")
+      estab_facts, _ = pc_charge_facts("pc-estab")
       e_class, e_reason, e_party = estab_facts[0], estab_facts[1], estab_facts[2]
       e_node, e_exec_col = estab_facts[4], estab_facts[7]
       assert e_class == "executor_crash" and e_reason == "unreported" and e_party == "scheduler", (

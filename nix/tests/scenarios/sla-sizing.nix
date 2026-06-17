@@ -499,13 +499,18 @@ let
               }
           a0 = cells_of(aff0)
           # Read-time mask is a subset op on A: masking a cell NOT in A
-          # is a no-op; masking ALL of A falls back to A (never empty).
-          # Under seed prices A often collapses to one cell; the
-          # multi-cell subset behavior is unit-tested
-          # (actor::tests::dispatch::ice_mask_is_read_time). Here:
+          # is a no-op. Masking a cell IN A drops it; when that exhausts
+          # A (sched.sla.ice-widen, sh-016 b) the emitted set widens to
+          # all_candidates \ masked (ceiling-filtered at the shared c*)
+          # instead of re-emitting the masked A. Under seed prices A
+          # often collapses to one cell; the multi-cell subset and the
+          # exhaust-widen branches are unit-tested
+          # (actor::tests::dispatch::ice_mask_is_read_time /
+          # ice_mask_exhausts_a_widens_to_all_candidates). Here:
           # (1) AckSpawnedIntents.unfulfillableCells RPC plumbing,
           # (2) cell not in A is a no-op,
-          # (3) cell IN A masked: result is A \ {it} or A (never empty).
+          # (3) cell IN A masked: never empty, masked cell never
+          #     re-emitted; subset of A when |A|>1 else widened.
           not_in_a = next(h for h in (
               "intel-6-ebs-lo", "intel-7-ebs-mid", "intel-8-nvme-hi"
           ) if (h, "on-demand") not in a0)
@@ -528,10 +533,18 @@ let
           a2 = cells_of(aff2)
           print(f"ice-backoff: post-mask nodeAffinity={aff2}")
           assert a2, "read-time mask never yields empty affinity"
-          assert a2.issubset(a0), f"mask is subset op: {a2} not subset of {a0}"
+          assert (masked_h, masked_cap) not in a2, (
+              f"sched.sla.ice-widen: masked cell ({masked_h},{masked_cap}) "
+              f"must not be re-emitted; got {a2}"
+          )
           if len(a0) > 1:
-              assert (masked_h, masked_cap) not in a2, (
-                  f"masked cell ({masked_h},{masked_cap}) dropped from |A|>1"
+              assert a2.issubset(a0), (
+                  f"|A|>1 mask is subset op: {a2} not subset of {a0}"
+              )
+          else:
+              assert not a2.issubset(a0), (
+                  f"|A|=1 exhaust must widen beyond A (sh-016 b): "
+                  f"got {a2} for A={a0}"
               )
           # Cleanup: drain the backgrounded build + restore the worker
           # so seed-corpus (chained after) has a working fixture.
