@@ -38,8 +38,7 @@ use super::{NS, NS_BUILDERS, NS_FETCHERS, NS_STORE, client as kube};
 use crate::sh::{self, cmd, shell};
 use crate::{aws, tofu, ui};
 
-/// Namespaces wiped wholesale. `rio-system` is excluded so internal
-/// auth secrets survive.
+/// Namespaces deleted wholesale. `rio-system` excluded — see module doc.
 const WIPE_NAMESPACES: &[&str] = &[NS_STORE, NS_BUILDERS, NS_FETCHERS];
 
 pub(super) async fn run(kind: ProviderKind) -> Result<()> {
@@ -94,13 +93,10 @@ pub(super) async fn run(kind: ProviderKind) -> Result<()> {
     uninstall_chart().await?;
 
     // ── 3b. Delete leader-election Leases ───────────────────────────
-    // helm uninstall removed the pods but Leases (created at runtime by
-    // rio-lease, not chart-owned) survive in rio-system and keep naming
-    // the now-deleted holder for `leaseDurationSeconds`. The deploy
-    // phase's preflight (`status::gather` → `tunnel_grpc`) then burns
-    // its full 30×2s poll budget on "lease holder X not found" before
-    // giving up. Deleting the Lease lets `scheduler_leader`'s "lease
-    // has no holder" path engage immediately. NotFound is benign (`k`).
+    // rio-lease-created (not chart-owned) — they survive uninstall
+    // naming a dead holder, and the deploy preflight's `tunnel_grpc`
+    // then burns its full poll budget on "holder not found" before its
+    // no-holder fast path can engage.
     ui::step("delete stale leader Leases", || async {
         for lease in ["rio-scheduler-leader", "rio-controller-nodeclaim-pool"] {
             k(&["-n", NS, "delete", "lease", lease, "--ignore-not-found"]).await?;
@@ -169,10 +165,8 @@ pub(super) async fn run(kind: ProviderKind) -> Result<()> {
             }
         }
         ProviderKind::K3s => {
-            // bitnami PG is a subchart of `rio` in `rio-system`; helm
-            // uninstall already removed it (and its PVC via the
-            // chart's deleteClaim). S3 is rook-ceph — handled by the
-            // store's own lifecycle on a fresh deploy.
+            // PG (bitnami subchart, deleteClaim PVC) and S3 (rook-ceph)
+            // are in-cluster — helm uninstall already cleared both.
             info!("k3s: PG/S3 are in-cluster; helm uninstall already cleared them");
         }
     }
@@ -180,13 +174,11 @@ pub(super) async fn run(kind: ProviderKind) -> Result<()> {
     Ok(())
 }
 
-/// Karpenter reconciles deleted NodePools by terminating their
-/// NodeClaims; we just wait. Unlike `destroy` (which `kubectl delete
-/// nodeclaim --all` because Karpenter itself is about to be torn down),
-/// `up --wipe` keeps Karpenter alive so it does the work.
-///
-/// Filters on `rio-` nodepool prefix in case the cluster ever carries
-/// non-rio NodePools.
+/// Karpenter terminates NodeClaims when their NodePool is deleted;
+/// wipe keeps Karpenter alive (unlike `destroy`, which deletes
+/// NodeClaims itself because Karpenter is also being torn down), so
+/// we just wait. Prefix-filtered for non-rio NodePools sharing the
+/// cluster.
 async fn wait_rio_nodeclaims_gone() -> Result<()> {
     ui::step("wait for rio-* NodeClaims to drain", || async {
         ui::poll(
@@ -194,8 +186,7 @@ async fn wait_rio_nodeclaims_gone() -> Result<()> {
             Duration::from_secs(10),
             60, // 10 min — builder nodes can take a while under load
             || async {
-                // jsonpath braces collide with cmd!'s {} interpolation;
-                // build the path as a separate var.
+                // Separate var: jsonpath braces collide with cmd!'s {}.
                 let jp = r#"jsonpath={range .items[*]}{.metadata.labels.karpenter\.sh/nodepool}{"\n"}{end}"#;
                 let sh = shell()?;
                 let out = sh::try_read(cmd!(sh, "kubectl get nodeclaims -o {jp}"))
@@ -245,21 +236,14 @@ async fn empty_chunk_buckets() -> Result<()> {
     .await
 }
 
-/// `DROP SCHEMA public CASCADE; CREATE SCHEMA public;` so the
-/// migration Job (run by the deploy phase) starts from 001.
-///
-/// RDS lives in private VPC subnets — the operator's machine can't
-/// reach it directly, and by this step we've deleted every rio pod
-/// that could be port-forwarded through. So: spawn a one-shot psql
-/// pod in `rio-system` (which still exists), pass the URL via env
-/// (not argv — pod spec argv is logged by kubelet), wait for it to
-/// exit 0. The bitnami postgresql image is already on the AMI
-/// (prebaked via `nix/docker-pulled.nix` for the subchart).
+/// `DROP SCHEMA public CASCADE; CREATE SCHEMA public;` so the deploy
+/// phase's migration Job starts from 001. RDS is in private subnets
+/// and every rio pod is gone by now; [`PgHandle::open_with_url`]
+/// spawns the socat relay in `rio-system` (the one namespace wipe
+/// preserves) and port-forwards into sqlx, so the URL never lands in
+/// a kubelet-logged argv.
 async fn reset_pg_schema(url: &str) -> Result<()> {
     ui::step("reset PG schema", || async {
-        // PgHandle::open_with_url spawns the socat relay → port-forward
-        // → sqlx; rio-system (where the relay pod lands) is the one
-        // namespace wipe preserves.
         let pg = PgHandle::open_with_url(url).await?;
         sqlx::query("DROP SCHEMA public CASCADE")
             .execute(&pg.pool)
