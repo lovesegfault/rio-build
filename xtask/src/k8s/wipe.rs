@@ -1,20 +1,20 @@
-//! `xtask k8s up --wipe` — reset the data plane to pristine state
-//! before the `up` pipeline runs.
+//! `xtask k8s up --wipe` — reset the data plane to pristine.
 //!
-//! Clears the data plane (S3 chunks, PG schema, tenants/builds, builder
-//! Jobs, gateway authorized_keys). Infra shape — RDS instance, S3
-//! bucket, AMI, Karpenter NodePool definitions, tofu-managed helm
-//! releases (cilium, karpenter, aws-lbc) — is preserved. Target
-//! wall-clock: ~2min vs `destroy`+`up`'s ~20min.
+//! Clears S3 chunk buckets (standard + per-AZ Express One Zone hot
+//! tier), PG schema, tenants/builds, builder Jobs, gateway
+//! authorized_keys. Infra shape — RDS instance, S3 buckets, AMI,
+//! Karpenter NodePools, tofu-managed helm releases — is preserved.
+//! Target wall-clock: minutes vs `destroy`+`up`'s ~20.
 //!
-//! Secrets policy: `rio-gateway-ssh` (tenant keys) is wiped; internal
-//! auth (`rio-jwt-signing`, `rio-service-hmac`, `rio-postgres*`) stays.
-//! Those live in `rio-system`, which is the one namespace this command
-//! does NOT delete.
+//! `rio-system` is the one namespace NOT deleted, so internal auth
+//! Secrets (`rio-jwt-signing`, `rio-service-hmac`, `rio-postgres*`)
+//! survive; `rio-gateway-ssh` (tenant keys) is wiped explicitly.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures_util::future::try_join_all;
 use tracing::{info, warn};
 
 use super::eks::TF_DIR;
@@ -98,7 +98,7 @@ pub(super) async fn run(kind: ProviderKind) -> Result<()> {
     match kind {
         ProviderKind::Eks => {
             wait_rio_nodeclaims_gone().await?;
-            empty_chunk_bucket().await?;
+            empty_chunk_buckets().await?;
             // PG-schema reset MUST come after the namespace deletes:
             // store/scheduler pods hold connections that block DROP
             // SCHEMA on RDS until they're gone.
@@ -155,11 +155,35 @@ async fn wait_rio_nodeclaims_gone() -> Result<()> {
     .await
 }
 
-async fn empty_chunk_bucket() -> Result<()> {
-    let region = tofu::output(TF_DIR, "region")?;
-    let bucket = tofu::output(TF_DIR, "chunk_bucket_name")?;
-    ui::step(&format!("empty s3://{bucket}"), || async {
-        aws::empty_bucket(&region, &bucket).await.map(|_| ())
+/// Empty the standard chunk bucket plus every per-AZ S3 Express One
+/// Zone hot-tier bucket, concurrently — the standard bucket is the
+/// long pole and [`aws::empty_bucket`] self-throttles via adaptive
+/// retry. `express_buckets_json` is `get_opt` so wipe still works on
+/// state that predates (or has dropped) the hot tier; directory
+/// buckets speak the regular `ListObjectsV2`/`DeleteObjects` data
+/// plane (SDK routes by the `--azid--x-s3` suffix), so `empty_bucket`
+/// applies unchanged.
+async fn empty_chunk_buckets() -> Result<()> {
+    let tf = tofu::outputs(TF_DIR)?;
+    let region = tf.get("region")?;
+    let mut buckets = vec![tf.get("chunk_bucket_name")?];
+    if let Some(json) = tf.get_opt("express_buckets_json") {
+        let by_az: BTreeMap<String, String> =
+            serde_json::from_str(&json).context("parse express_buckets_json")?;
+        buckets.extend(by_az.into_values());
+    }
+    buckets.sort_unstable();
+    buckets.dedup();
+    ui::step("empty chunk buckets", || async {
+        // ui::step prints only on completion (minutes at ~8 K obj/s on
+        // a multi-million-object standard bucket) — log the work list now.
+        info!(
+            "emptying {} bucket(s): {}",
+            buckets.len(),
+            buckets.join(", ")
+        );
+        try_join_all(buckets.iter().map(|b| aws::empty_bucket(&region, b))).await?;
+        Ok(())
     })
     .await
 }
