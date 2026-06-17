@@ -155,7 +155,9 @@ impl DagActor {
         // Full critical-path sweep (same 60s cadence). Belt-and-
         // suspenders over the incremental update_ancestors calls: any
         // drift (float accumulation, missed edge case) corrects here.
-        // O(V+E); ~1ms for a 10k-node DAG.
+        // O(V+E) — ~10-20ms for the ~14k-node selfhost graph after
+        // sh-027 §2 dropped the per-boundary `update_ancestors` cones
+        // (was: 0.5–30s/tick, phase-00 = 45.9s).
         crate::critical_path::full_sweep(&mut self.dag, &self.sla_estimator, &self.builds);
     }
 
@@ -237,7 +239,13 @@ impl DagActor {
             };
         }
         self.maybe_refresh_estimator().await;
-        phase!("00-estimator-refresh");
+        // sh-027 §2 renamed: the old label said "estimator refresh" —
+        // a misnomer since sh-018b moved `SlaEstimator::refresh()` to
+        // the off-actor poller; the surviving on-actor body is the
+        // `full_sweep` priority recompute (and the poller-liveness
+        // gauge emit). Out-of-tree dashboards pinning the old label
+        // need re-pointing; the deny-list keeps it from re-rooting.
+        phase!("00-priority-sweep");
 
         // Ordering is load-bearing: per-build-timeout cancels whole
         // builds (permanent failure) before poison-expire removes DAG

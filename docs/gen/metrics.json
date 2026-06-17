@@ -1304,7 +1304,7 @@
       {
         "name": "rio_scheduler_tick_phase_seconds",
         "kind": "histogram",
-        "help": "Per-phase housekeeping Tick latency (labeled by phase: 00-estimator-refresh..18-snapshot-publish). Decomposes rio_scheduler_actor_cmd_seconds{cmd=Tick} the way merge_phase_seconds decomposes MergeDag: the Tick is a leader-only single-threaded actor turn, so one slow phase head-of-line blocks every queued RPC and starves admin-served probes — a phase in the tens-of-seconds buckets names the term to bound, instead of a log-silent stall."
+        "help": "Per-phase housekeeping Tick latency (labeled by phase: 00-priority-sweep..18-snapshot-publish). Decomposes rio_scheduler_actor_cmd_seconds{cmd=Tick} the way merge_phase_seconds decomposes MergeDag: the Tick is a leader-only single-threaded actor turn, so one slow phase head-of-line blocks every queued RPC and starves admin-served probes — a phase in the tens-of-seconds buckets names the term to bound, instead of a log-silent stall."
       },
       {
         "name": "rio_scheduler_topdown_prune_total",

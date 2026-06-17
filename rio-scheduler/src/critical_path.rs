@@ -236,10 +236,16 @@ pub fn full_sweep(dag: &mut DerivationDag, sla: &SlaEstimator, builds: &HashMap<
     }
 
     // --- Step 1: refresh est_duration for every non-terminal node ---
+    // `peek_t_min` (read-lock, no `FittedParams` clone, no LRU recency
+    // bump) — NOT `ref_estimate`: the per-tick V-sized scan must not
+    // serialize on the cache write-lock or churn the LRU. The
+    // incremental `compute_initial` step-1 keeps `ref_estimate` — see
+    // `SlaEstimator::peek_t_min` doc for why the recency bump matters
+    // there and not here.
     for hash in &non_terminal {
         if let Some(state) = dag.node_mut(hash) {
             state.sched.est_duration = model_key_for(state, builds)
-                .and_then(|k| sla.ref_estimate(&k))
+                .and_then(|k| sla.peek_t_min(&k))
                 .unwrap_or(DEFAULT_DURATION_SECS);
         }
     }

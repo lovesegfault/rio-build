@@ -4112,7 +4112,7 @@ async fn parked_tick_disclosure_carries_the_failure_evidence() -> TestResult {
 
 /// W9-O (round-9 B2 admissibility): a driven leader Tick populates
 /// EVERY cell of `rio_scheduler_tick_phase_seconds` -- all 19 phases
-/// `00-estimator-refresh`..`18-snapshot-publish`, exactly. The landed
+/// `00-priority-sweep`..`18-snapshot-publish`, exactly. The landed
 /// instrument (00fbb0717) is the measurement substrate for every
 /// Banner-A bounding decision (which Tick term gets a work quota
 /// first), so an unreachable phase cell is a silent forensics hole:
@@ -4163,7 +4163,7 @@ async fn driven_leader_tick_records_every_phase_cell() -> TestResult {
         .collect();
 
     const PHASES: [&str; 19] = [
-        "00-estimator-refresh",
+        "00-priority-sweep",
         "01-scan-dag",
         "02-build-timeouts",
         "03-stuck-completions",

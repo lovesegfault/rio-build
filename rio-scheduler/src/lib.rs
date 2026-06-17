@@ -193,7 +193,7 @@ pub fn describe_metrics() {
     describe_histogram!(
         "rio_scheduler_tick_phase_seconds",
         "Per-phase housekeeping Tick latency (labeled by phase: \
-         00-estimator-refresh..18-snapshot-publish). Decomposes \
+         00-priority-sweep..18-snapshot-publish). Decomposes \
          rio_scheduler_actor_cmd_seconds{cmd=Tick} the way \
          merge_phase_seconds decomposes MergeDag: the Tick is a leader-only \
          single-threaded actor turn, so one slow phase head-of-line blocks \

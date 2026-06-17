@@ -580,6 +580,31 @@ impl SlaEstimator {
             .cloned()
     }
 
+    /// [`Self::ref_estimate`] without the write-lock or the
+    /// `FittedParams` clone. Read-guard + `LruCache::peek` (no recency
+    /// bump) → returns the one `f64` directly.
+    ///
+    /// sh-027 §2: `critical_path::full_sweep` step-1 calls this once per
+    /// non-terminal node (~14k× in the iter-5 trace). Via
+    /// [`Self::ref_estimate`] → [`Self::cached`] that was 14k write-lock
+    /// acquisitions on the actor turn plus 14k full-struct clones to
+    /// read `fit.t_min()`; the read-lock peek collapses both. Dispatch
+    /// (`compute_initial` step-1, `solve_intent_for`) keeps
+    /// [`Self::cached`]: the recency bump there is the authoritative
+    /// "this key is in use" signal that protects hot keys from eviction
+    /// (the refit pass at [`Self::refresh`] uses the same `peek()`
+    /// discipline for the same reason). A key touched only by the
+    /// periodic sweep is, by definition, not being dispatched — and
+    /// `estimator_poller` re-inserts on its own cadence regardless.
+    pub fn peek_t_min(&self, key: &types::ModelKey) -> Option<f64> {
+        self.cache
+            .read()
+            .get(&key.tenant)?
+            .peek(&(key.pname.clone(), key.system.clone()))
+            .map(|p| p.fit.t_min().0)
+            .filter(|t| t.is_finite())
+    }
+
     /// Insert/replace one fit, creating the per-tenant LRU on first
     /// sight. Evicts the tenant's least-recently-used key if at cap;
     /// `on_evict` receives the evicted key so the caller can drop the
