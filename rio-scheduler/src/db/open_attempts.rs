@@ -383,6 +383,65 @@ impl SchedulerDb {
         row.map(AttemptRef::from_row).transpose()
     }
 
+    /// Batch [`Self::find_attempt_by_exec_id`] over an `exec_id` slice
+    /// (the sh-007c S6 prefetch read for the report-flush hot path):
+    /// one `= ANY($1::uuid[])` round-trip resolving every attempt in
+    /// the flush. `DISTINCT ON (a.exec_id) … ORDER BY a.exec_id,
+    /// a.assigned_at DESC` is the per-exec `LIMIT 1` the singleton
+    /// uses. Absent keys (no assignment carries the exec, or no
+    /// `drv_executions` row exists — the deny-by-default arm) are
+    /// simply not in the returned map; the caller treats absent as
+    /// `None` per the singleton's contract.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn find_attempts_by_exec_ids(
+        &self,
+        exec_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, AttemptRef>, sqlx::Error> {
+        if exec_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<(Uuid, AttemptByExecRow)> = sqlx::query_as::<_, AttemptByExecByHashRow>(
+            "SELECT DISTINCT ON (a.exec_id) \
+                    a.exec_id, d.derivation_id, d.drv_hash, d.drv_path, \
+                    a.builder_id AS executor_id, \
+                    (a.status IN ('pending', 'acknowledged')) AS assignment_active, \
+                    EXISTS (SELECT 1 FROM drv_attempts t WHERE t.exec_id = a.exec_id) \
+                        AS attempt_recorded, \
+                    EXISTS (SELECT 1 FROM drv_attempts t \
+                            WHERE t.exec_id = a.exec_id \
+                              AND t.termination_reason IS NOT NULL) AS attempt_terminal, \
+                    e.attempt_kind \
+             FROM assignments a \
+             JOIN derivations d ON d.derivation_id = a.derivation_id \
+             JOIN drv_executions e ON e.exec_id = a.exec_id \
+             WHERE a.exec_id = ANY($1::uuid[]) \
+             ORDER BY a.exec_id, a.assigned_at DESC",
+        )
+        .bind(exec_ids)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|r| {
+            (
+                r.exec_id,
+                AttemptByExecRow {
+                    derivation_id: r.derivation_id,
+                    drv_hash: r.drv_hash,
+                    drv_path: r.drv_path,
+                    executor_id: r.executor_id,
+                    assignment_active: r.assignment_active,
+                    attempt_recorded: r.attempt_recorded,
+                    attempt_terminal: r.attempt_terminal,
+                    attempt_kind: r.attempt_kind,
+                },
+            )
+        })
+        .collect();
+        rows.into_iter()
+            .map(|(exec_id, row)| AttemptRef::from_row(row).map(|a| (exec_id, a)))
+            .collect()
+    }
+
     /// Resolve the OPEN pull-mode attempt for one derivation (the
     /// `intent_id` arm of `ReportAttemptOutcome`'s identity
     /// resolution): the active assignment for that drv joined to its

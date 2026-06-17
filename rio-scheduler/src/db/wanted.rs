@@ -170,6 +170,57 @@ impl SchedulerDb {
         ))
     }
 
+    /// Batch [`Self::effective_wanted_union`] over a `derivation_id`
+    /// slice (the sh-007c S6 prefetch read for the report-flush hot
+    /// path): one `= ANY($1::uuid[])` round-trip resolving every live
+    /// wanted union in the flush. Same `note_width_event` side-effect
+    /// per saturated-default row (parity with the singleton — the
+    /// observable is identical row-set or row-at-a-time). Absent keys
+    /// (no live build has a contribution) are simply not in the
+    /// returned map; the caller treats absent as `None` per the
+    /// singleton's contract. A present key with `vec![]` value is the
+    /// '{}' saturation (= all declared outputs wanted).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn effective_wanted_unions_for(
+        &self,
+        derivation_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<String>>, sqlx::Error> {
+        if derivation_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<(Uuid, Uuid, Vec<String>, bool)> = sqlx::query_as(
+            "SELECT derivation_id, build_id, wanted_output_names, saturated_default \
+               FROM live_wanted_interest \
+              WHERE derivation_id = ANY($1::uuid[])",
+        )
+        .bind(derivation_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut grouped: std::collections::HashMap<Uuid, Vec<Vec<String>>> =
+            std::collections::HashMap::new();
+        for (derivation_id, build_id, names, saturated_default) in rows {
+            if names.is_empty() && saturated_default {
+                crate::state::note_width_event(crate::state::WidthEvent::SaturatedToDeclared {
+                    build_id,
+                });
+            }
+            grouped.entry(derivation_id).or_default().push(names);
+        }
+        Ok(grouped
+            .into_iter()
+            .map(|(derivation_id, contributions)| {
+                // Same fold as the singleton (the rio-common shared
+                // body); contributions is non-empty here so None is
+                // unreachable.
+                let union = rio_common::wanted_outputs::saturating_wanted_union(
+                    contributions.iter().map(Vec::as_slice),
+                )
+                .unwrap_or_default();
+                (derivation_id, union)
+            })
+            .collect())
+    }
+
     /// Gap-filling backfill write (T-D2.3 step 5 — the B4 backfill's
     /// row source): INSERT the saturating `'{}'` (all-declared) row for
     /// (build, derivation) pairs that have NO row yet; `ON CONFLICT DO

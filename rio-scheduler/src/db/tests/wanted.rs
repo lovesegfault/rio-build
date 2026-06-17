@@ -702,3 +702,62 @@ async fn saturation_note_is_order_independent() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// sh-007c S6 row-set parity: `effective_wanted_unions_for` over a set
+/// returns the same union per key as the singleton; absent keys (no
+/// live contribution) are not in the map; saturation matches.
+#[tokio::test]
+async fn effective_wanted_unions_for_parity_with_singleton() -> anyhow::Result<()> {
+    let (test_db, db) = setup().await;
+    let d1 = insert_test_derivation(&db, "wanted-batch-d1").await?;
+    let d2 = insert_test_derivation(&db, "wanted-batch-d2").await?;
+    let d_absent = insert_test_derivation(&db, "wanted-batch-absent").await?;
+    let b1 = insert_test_build(&db).await?;
+    let b2 = insert_test_build(&db).await?;
+    for (b, d) in [(b1, d1), (b2, d1), (b1, d2)] {
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(b)
+            .bind(d)
+            .execute(&test_db.pool)
+            .await?;
+    }
+    let g = ServingGeneration::stamp_from_claim(1);
+    let _ = db
+        .record_wanted_fenced(
+            g,
+            &[
+                WantedRow {
+                    build_id: b1,
+                    derivation_id: d1,
+                    wanted_output_names: &["out".into()],
+                },
+                WantedRow {
+                    build_id: b2,
+                    derivation_id: d1,
+                    wanted_output_names: &["dev".into()],
+                },
+                WantedRow {
+                    build_id: b1,
+                    derivation_id: d2,
+                    wanted_output_names: &[],
+                },
+            ],
+        )
+        .await?;
+
+    let batch = db.effective_wanted_unions_for(&[d1, d2, d_absent]).await?;
+    assert_eq!(batch.len(), 2, "absent keys are not in the map");
+    let single_d1 = db.effective_wanted_union(d1).await?.unwrap();
+    let mut batch_d1 = batch[&d1].clone();
+    batch_d1.sort();
+    let mut single_d1 = single_d1;
+    single_d1.sort();
+    assert_eq!(batch_d1, single_d1);
+    assert_eq!(
+        batch[&d2],
+        db.effective_wanted_union(d2).await?.unwrap(),
+        "saturation parity: '{{}}' contribution → empty vec"
+    );
+    drop(test_db);
+    Ok(())
+}

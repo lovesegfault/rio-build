@@ -629,6 +629,51 @@ impl SchedulerDb {
         .transpose()
     }
 
+    /// Batch [`Self::unresolved_job_for_derivation`] over a
+    /// `derivation_id` slice (the sh-007c S6 prefetch read for the
+    /// report-flush hot path): one `= ANY($1::uuid[])` round-trip
+    /// returning every pending job in the flush. Absent keys (no
+    /// unresolved row) are simply not in the returned map; the caller
+    /// treats absent as `None` per the singleton's contract.
+    /// `DISTINCT ON (derivation_id)` is the per-derivation `LIMIT 1`
+    /// the singleton uses (the unique partial index on
+    /// `(derivation_id) WHERE state='pending'` makes it definite, but
+    /// the parity is structural).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn unresolved_jobs_for_derivations(
+        &self,
+        derivation_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, (Uuid, JobOrigin, Option<Vec<String>>)>, sqlx::Error>
+    {
+        if derivation_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<(Uuid, Uuid, String, Option<Vec<String>>)> = sqlx::query_as(
+            "SELECT DISTINCT ON (derivation_id) \
+                    derivation_id, job_id, origin, carried_realized_paths \
+               FROM materialization_jobs \
+              WHERE derivation_id = ANY($1::uuid[]) AND state = 'pending' \
+              ORDER BY derivation_id",
+        )
+        .bind(derivation_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(derivation_id, job_id, origin, carried)| {
+                let origin: JobOrigin = origin.parse().map_err(|_| {
+                    sqlx::Error::Decode(
+                        format!(
+                            "materialization_jobs.origin: value {origin:?} not in the \
+                             rust-side alphabet"
+                        )
+                        .into(),
+                    )
+                })?;
+                Ok((derivation_id, (job_id, origin, carried)))
+            })
+            .collect()
+    }
+
     /// Dormancy probe (Wave 6 / VM subtest support): row counts of
     /// `(materialization_jobs, build_wanted_outputs)`.
     /// Test diagnostic (merged_bug_284 sweep): row-count assertions

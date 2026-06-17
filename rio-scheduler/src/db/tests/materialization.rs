@@ -1419,3 +1419,46 @@ async fn listing_order_is_total_under_batch_minted_ties() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+/// sh-007c S6 row-set parity: `unresolved_jobs_for_derivations` over a
+/// set returns the same `(job_id, origin, carried)` per key as the
+/// singleton; absent keys (no pending row) are not in the map.
+#[tokio::test]
+async fn unresolved_jobs_for_derivations_parity_with_singleton() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let drv_a = insert_test_derivation(&db, "batch-unres-a").await?;
+    let drv_b = insert_test_derivation(&db, "batch-unres-b").await?;
+    let drv_absent = insert_test_derivation(&db, "batch-unres-absent").await?;
+    let g = ServingGeneration::stamp_from_claim(1);
+    db.create_materialization_job_fenced(drv_a, "batch-unres-a", None, JobOrigin::Pruned, None, g)
+        .await?;
+    let carried = vec!["/nix/store/carried".to_string()];
+    db.create_materialization_job_fenced(
+        drv_b,
+        "batch-unres-b",
+        None,
+        JobOrigin::CacheOpportunity,
+        Some(&carried),
+        g,
+    )
+    .await?;
+
+    let batch = db
+        .unresolved_jobs_for_derivations(&[drv_a, drv_b, drv_absent])
+        .await?;
+    assert_eq!(batch.len(), 2, "absent keys are not in the map");
+
+    let single_a = db.unresolved_job_for_derivation(drv_a).await?.unwrap();
+    let single_b = db.unresolved_job_for_derivation(drv_b).await?.unwrap();
+    assert_eq!(batch[&drv_a], single_a);
+    assert_eq!(batch[&drv_b], single_b);
+    assert_eq!(batch[&drv_a].1, JobOrigin::Pruned);
+    assert_eq!(
+        batch[&drv_b].2,
+        Some(vec!["/nix/store/carried".to_string()])
+    );
+    drop(test_db);
+    Ok(())
+}

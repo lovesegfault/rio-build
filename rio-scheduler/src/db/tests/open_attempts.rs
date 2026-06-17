@@ -432,3 +432,54 @@ fn open_attempt_view_is_pair_keyed_and_kind_aware() {
         "no attempt of either kind = wedge candidate"
     );
 }
+
+/// sh-007c S6 row-set parity: `find_attempts_by_exec_ids` over a set
+/// returns the same `AttemptRef` per key as the singleton, and absent
+/// keys (no assignment / no execution row) are simply not in the map.
+#[tokio::test]
+async fn find_attempts_by_exec_ids_parity_with_singleton() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // Two attempts of distinct kinds, plus one unknown exec.
+    let drv_b = insert_test_derivation(&db, "batch-find-build").await?;
+    let exec_b = Uuid::now_v7();
+    db.insert_assignment(drv_b, &ExecutorId::from("batch-find-build"), 1, exec_b)
+        .await?;
+    insert_pull_execution(&test_db.pool, exec_b, &log_hash("b"), "builder-0", None).await?;
+
+    let drv_m = insert_test_derivation(&db, "batch-find-mat").await?;
+    let exec_m = Uuid::now_v7();
+    db.insert_assignment(drv_m, &ExecutorId::from("batch-find-mat"), 1, exec_m)
+        .await?;
+    sqlx::query(
+        "INSERT INTO drv_executions (exec_id, drv_hash, executor_id, started_at, attempt_kind) \
+         VALUES ($1, $2, 'store-0', now(), 'materialization')",
+    )
+    .bind(exec_m)
+    .bind(log_hash("m"))
+    .execute(&test_db.pool)
+    .await?;
+
+    let unknown = Uuid::now_v7();
+    let batch = db
+        .find_attempts_by_exec_ids(&[exec_b, exec_m, unknown])
+        .await?;
+
+    assert_eq!(batch.len(), 2, "absent keys are not in the map");
+    let single_b = db.find_attempt_by_exec_id(exec_b).await?.unwrap();
+    let single_m = db.find_attempt_by_exec_id(exec_m).await?.unwrap();
+    assert!(matches!(
+        &batch[&exec_b],
+        crate::db::open_attempts::AttemptRef::Build(b)
+            if b.core.derivation_id == single_b.core().derivation_id
+    ));
+    assert!(matches!(
+        &batch[&exec_m],
+        crate::db::open_attempts::AttemptRef::Materialization(m)
+            if m.core.derivation_id == single_m.core().derivation_id
+                && m.core.assignment_active
+    ));
+    drop(test_db);
+    Ok(())
+}
