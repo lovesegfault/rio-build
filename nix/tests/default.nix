@@ -1095,21 +1095,24 @@ in
   # success+failure sequence on both pool kinds, asserted over the
   # fold input: same outcome class, one charge per failure, no double
   # charges, exclusion keying per AD2), plus the AD5 cancel/preempt VM
-  # timing bounds and the establishment window. Dedicated check rather
-  # than another vm-lifecycle-autoscale-k3s subtest: the fixture overlay
-  # (probe deadline pinned to 180s) changes every builder Job's
-  # activeDeadlineSeconds, and the establishment arm alone (~300s
-  # window + rebuild) would blow that group's 1200s budget.
+  # timing bounds and the sh-021 TerminalAbsent reap. Dedicated check
+  # rather than another vm-lifecycle-autoscale-k3s subtest: the
+  # fixture overlay (probe deadline pinned to 180s) changes every
+  # builder Job's activeDeadlineSeconds.
   #
-  # r[verify sched.attempt.establishment-window+6]
-  #   establishment arm: a pull-mode pod whose builder is SIGKILLed
-  #   from the host (no SIGTERM-abort report, plain Error pod, nothing
-  #   the controller classifies) stays an open uncharged attempt for
-  #   the whole window, is then charged exactly once as
-  #   executor_crash/unreported by the sweep — only after deadline +
-  #   report-slack (asserted via occurred_at − assigned_at ≥ slack) —
-  #   and the requeued drv still delivers its store path under a fresh
-  #   exec with no further charge.
+  # r[verify ctrl.ephemeral.reap-terminal-absent]
+  #   reap arm: a pull-mode pod whose builder is SIGKILLed from the
+  #   host (no SIGTERM-abort report, plain Error pod) sends the Job
+  #   Failed; the controller's TerminalAbsent arm (AbsentFromDemand ∧
+  #   !is_active_job, two-tick strike) deletes the Job INSTANCE and
+  #   synthesizes reason=Reaped — the attempt closes UNCHARGED as
+  #   disconnected/reaped by the controller within 90s, well inside
+  #   the establishment slack (the sweep is the backstop, never the
+  #   closer for this shape) — and the requeued drv still delivers its
+  #   store path under a fresh exec with no further row. The
+  #   establishment-window timing itself stays unit-covered
+  #   (rio-scheduler/src/actor/tests/establishment.rs); on a live
+  #   cluster the controller reaps before the window can close.
   # r[verify ctrl.drain.disruption-target+4]
   #   preempt arm: patching DisruptionTarget=True on a pull-mode pod
   #   makes the controller synthesize the preempted report and
@@ -1141,10 +1144,11 @@ in
     ];
     # Budget: ~240s k3s bring-up + ~80s prelude + pool swap & pull
     # retry-feed ~175s + cancel arm ~150s + preempt arm ~200s +
-    # establishment arm ~400-470s (the ~300s window dominates) +
+    # TerminalAbsent reap arm ~150-200s (two-tick reap ~30-40s + 60s
+    # rebuild; sh-021 retired the ~300s establishment-window wait) +
     # fetcher pull arm ~150-220s (pool create + Job spawn + 15s FOD
     # build + report + pod-completion wait + cleanup) + cleanup ~30s
-    # ≈ 1300-1550s expected on a loaded KVM runner; 2400s leaves tail
+    # ≈ 1050-1250s expected on a loaded KVM runner; 2400s leaves tail
     # headroom without being open-ended.
     globalTimeout = 2400;
   };

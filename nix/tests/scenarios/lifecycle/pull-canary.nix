@@ -2,9 +2,10 @@
 #
 # pull-canary: hosted ONLY by vm-pull-canary-k3s (its fixture layers
 # values/vmtest-pull-canary.yaml, pinning the SLA probe deadline to the
-# 180s floor so the establishment window fits the budget). Do not add
-# this fragment to the lifecycle splits that use the plain vmtest-full
-# fixture — the establishment arm would wait ~1h there.
+# 180s floor — historically so the establishment window fit the budget;
+# since sh-021 the TerminalAbsent reap closes that arm in ~30-40s
+# regardless of deadline, so the overlay now matters only for the
+# derived ~90s worker build timeout that the <=60s drv sleeps fit).
 #
 # What the fragment proves (the T-1b.8/T-1b.9 slice of the 1b gate):
 #
@@ -44,13 +45,19 @@
 #     SIGTERM-abort report when the synthesized one loses the race),
 #     the requeued drv still delivers its store path, and no second row
 #     is ever minted for that exec.
-#   - Establishment window: a pull-mode pod whose builder process is
-#     SIGKILLed from the host produces a plain Error pod — no
-#     SIGTERM-abort report, nothing the controller classifies — so the
-#     attempt stays open and uncharged for the whole window and is then
-#     established exactly once as executor_crash/unreported by the
-#     sweep, only after deadline + report-slack; the derivation
-#     requeues and the same client build still gets its store path.
+#   - TerminalAbsent reap (sh-021): a pull-mode pod whose builder
+#     process is SIGKILLed from the host produces a plain Error pod —
+#     no SIGTERM-abort report — and the Job goes Failed; the
+#     controller's TerminalAbsent arm (AbsentFromDemand ∧
+#     !is_active_job, two-tick strike) deletes the Job and synthesizes
+#     reason=Reaped, so the attempt closes UNCHARGED as
+#     disconnected/reaped by the controller well INSIDE the
+#     establishment slack; the derivation requeues charge-free and the
+#     same client build still gets its store path. The
+#     establishment-window timing (executor_crash/unreported only
+#     after deadline+slack) is no longer reachable on a live cluster
+#     for this shape — it remains the backstop for a dead controller
+#     and is covered by the unit batteries.
 #
 # Out of scope here (documented carve-outs): the busy-bridge arm and
 # the NotYetReady arm (no RIO_ORPHAN_REAP_GRACE_OVERRIDE_SECS in this
@@ -500,32 +507,33 @@ scope: with scope; ''
             f"delivered store path")
 
   # ══════════════════════════════════════════════════════════════════
-  # Arm 5 — establishment window: an unreported pod death is charged
-  # exactly once, and only after deadline + report-slack.
+  # Arm 5 — TerminalAbsent reap (sh-021): an unreported pod death is
+  # reaped charge-free by the controller, well inside the
+  # establishment slack — the sweep is the backstop, never the closer.
   # ══════════════════════════════════════════════════════════════════
-  with subtest("pull-canary: unreported pod death is established only after deadline+slack"):
+  with subtest("pull-canary: unreported pod death is reaped charge-free (TerminalAbsent)"):
       pc_bg_build("${pcEstabDrv}", "pc-estab")
-      pc_wait_open("pc-estab", 1, 300, "establishment arm")
+      pc_wait_open("pc-estab", 1, 300, "TerminalAbsent reap arm")
       estab_pod, estab_node, estab_vm = pc_running_pod()
       estab_job = pc_owning_job(estab_pod)
+      # The reap deletes the Job; the requeued drv respawns a
+      # SAME-NAME Job (deterministic name), so "the Job is gone"
+      # compares instances — capture the UID before the kill (the
+      # Arm 4 by-UID form).
+      estab_job_uid = k3s_server.succeed(
+          f"k3s kubectl -n ${nsBuilders} get job {estab_job} "
+          "-o jsonpath='{.metadata.uid}'"
+      ).strip()
       estab_exec = pc_open_exec("pc-estab")
       pc_wait_build_cgroup(estab_vm, "pc-estab")
-      # The solved intent deadline (floored at the overlay's 180s probe
-      # deadline) is what activeDeadlineSeconds renders from and what
-      # the sweep adds the report slack to.
-      job_deadline = int(k3s_server.succeed(
-          f"k3s kubectl -n ${nsBuilders} get job {estab_job} "
-          "-o jsonpath='{.spec.activeDeadlineSeconds}'"
-      ).strip() or "0")
-      assert job_deadline >= 180, (
-          f"the overlay pins the probe deadline to 180s, but the Job renders "
-          f"activeDeadlineSeconds={job_deadline}"
-      )
 
       # SIGKILL the builder process from the host (crictl -> host PID).
       # SIGKILL cannot be caught, so no SIGTERM-abort report fires; the
-      # pod becomes a plain Error pod the controller does not classify;
-      # the establishment sweep is the only closer.
+      # pod becomes a plain Error pod and the Job goes Failed
+      # (BackoffLimitExceeded). The intent is AbsentFromDemand on the
+      # next demand poll (the drv is still in-flight on this exec, so
+      # no new spawn intent exists), and !is_active_job — the
+      # TerminalAbsent disposition.
       cid = estab_vm.succeed(
           f"k3s crictl ps -q --label io.kubernetes.pod.name={estab_pod} | head -1"
       ).strip()
@@ -536,94 +544,78 @@ scope: with scope; ''
       assert builder_pid and builder_pid != "0", (
           f"crictl inspect returned a bad pid: {builder_pid!r}"
       )
+      t0 = time.time()
       estab_vm.succeed(f"kill -9 {builder_pid}")
-      print(f"pull-canary establishment: SIGKILLed builder pid {builder_pid} of "
-            f"{estab_pod} on {estab_node} (job deadline {job_deadline}s, "
-            f"slack {PC_SLACK_SECS}s)")
+      print(f"pull-canary reap: SIGKILLed builder pid {builder_pid} of "
+            f"{estab_pod} on {estab_node} (job {estab_job} uid {estab_job_uid}, "
+            f"exec {estab_exec})")
+
+      # The controller deletes the Job INSTANCE (by-UID, not by-name —
+      # a same-name successor is the requeue, not a survival of the
+      # reaped one) and synthesizes ReportAttemptOutcome{reason=Reaped};
+      # the killed attempt leaves the open view at the report fold.
+      # 90s composite bound from SIGKILL: pod->Error + Job->Failed +
+      # two-tick strike at the ~10s reconcile + report fold; the
+      # pod-phase transition is subsumed (Job cannot be terminal while
+      # the pod is Running).
       k3s_server.wait_until_succeeds(
-          f"phase=$(k3s kubectl -n ${nsBuilders} get pod {estab_pod} "
-          "-o jsonpath='{.status.phase}' 2>/dev/null); "
-          "test -z \"$phase\" || test \"$phase\" = Failed || test \"$phase\" = Succeeded",
-          timeout=120,
+          f"[ \"$(k3s kubectl -n ${nsBuilders} get job {estab_job} "
+          f"-o jsonpath='{{.metadata.uid}}' 2>/dev/null)\" != '{estab_job_uid}' ]",
+          timeout=90,
       )
-
-      def estab_age():
-          out = psql_k8s(k3s_server,
-              "SELECT EXTRACT(EPOCH FROM (now() - a.assigned_at)) "
-              f"FROM assignments a WHERE a.exec_id = '{estab_exec}'"
-          ).strip()
-          assert out, f"assignment row for {estab_exec} disappeared"
-          return float(out)
-
-      # In-window probe: the window is the solved deadline plus the
-      # 120s slack, so any attempt age below the slack alone is
-      # provably inside it. The attempt must still be open and
-      # uncharged there — the sweep must never fire inside the window.
-      while estab_age() < 100:
-          assert pc_open("pc-estab") == 1, (
-              "the unreported death must stay an open attempt inside the window"
-          )
-          assert pc_attempt_rows("pc-estab") == 0, (
-              "no charge may land inside the establishment window"
-          )
-          time.sleep(10)
-      print(f"pull-canary establishment: still open and uncharged at attempt age "
-            f"{estab_age():.0f}s (inside the window)")
-
-      # Wait out the window (+ sweep cadence + headroom) for the charge.
-      estab_budget = job_deadline + PC_SLACK_SECS + 150
-      wait_deadline = time.time() + estab_budget
-      while time.time() < wait_deadline:
-          if pc_attempt_rows("pc-estab") >= 1:
+      closed = False
+      while time.time() - t0 < PC_SLACK_SECS:
+          if pc_open_exec("pc-estab") != estab_exec:
+              closed = True
               break
-          time.sleep(10)
-      estab_facts, _ = pc_charge_facts("pc-estab")
-      e_class, e_reason, e_party = estab_facts[0], estab_facts[1], estab_facts[2]
-      e_node, e_exec_col = estab_facts[4], estab_facts[7]
-      assert e_class == "executor_crash" and e_reason == "unreported" and e_party == "scheduler", (
-          f"the establishment charge must be executor_crash/unreported by the "
-          f"scheduler, got: {estab_facts!r}"
+          time.sleep(2)
+      estab_elapsed = time.time() - t0
+      assert closed and estab_elapsed < PC_SLACK_SECS, (
+          f"the TerminalAbsent reap must close inside the report slack "
+          f"({PC_SLACK_SECS}s) — anything later is the establishment sweep, "
+          f"not the reap; attempt {estab_exec} still open after {estab_elapsed:.1f}s"
       )
-      assert e_exec_col == estab_exec, (
-          f"the establishment charge must land on the killed exec {estab_exec}, "
-          f"got {e_exec_col}"
+      assert estab_elapsed <= 90, (
+          f"SIGKILL to Job-reaped + attempt closed took {estab_elapsed:.1f}s, "
+          f"expected <= 90s (two-tick strike + fold)"
       )
-      estab_charge_age = float(psql_k8s(k3s_server,
-          "SELECT EXTRACT(EPOCH FROM (t.occurred_at - a.assigned_at)) "
-          "FROM drv_attempts t JOIN assignments a ON a.exec_id = t.exec_id "
-          f"WHERE t.exec_id = '{estab_exec}'"
-      ).strip())
-      assert estab_charge_age >= PC_SLACK_SECS, (
-          f"the establishment fired at attempt age {estab_charge_age:.0f}s, "
-          f"inside the report slack ({PC_SLACK_SECS}s) — it must only fire after "
-          f"deadline + slack"
+      # Charge discipline (sh-021): exactly one terminal row for the
+      # reaped exec, the no-charge disconnected class, reason=reaped,
+      # reported by the controller — never executor_crash/unreported by
+      # the scheduler (the establishment sweep) and never a second row.
+      estab_rows = pc_count(
+          f"SELECT count(*) FROM drv_attempts WHERE exec_id = '{estab_exec}'"
       )
-      # Structural form: the ESTABLISHED exec must have left the open
-      # view (its terminal fill removes it). The requeued drv may
-      # already have been re-pulled by a fresh pod by the time this
-      # runs — that fresh attempt is the healthy respawn the arm later
-      # relies on, not a leftover of the established one — so the
-      # assertion keys on the established exec rather than demanding
-      # an empty view for the drv.
-      assert pc_open_exec("pc-estab") != estab_exec, (
-          "the established attempt must have left the open-attempt view"
+      estab_class, estab_reason, estab_party = psql_k8s(k3s_server,
+          "SELECT outcome_class, coalesce(termination_reason, '<none>'), "
+          "reporting_party FROM drv_attempts "
+          f"WHERE exec_id = '{estab_exec}'"
+      ).strip().split("|")
+      assert estab_rows == 1 and estab_class.strip() == "disconnected", (
+          f"the reaped exec must be closed exactly once with the uncharged "
+          f"disconnected class, got {estab_rows} row(s), class {estab_class!r}"
       )
-      print(f"pull-canary TIMING establishment: charge landed at attempt age "
-            f"{estab_charge_age:.0f}s (solved deadline {job_deadline}s + "
-            f"slack {PC_SLACK_SECS}s; source_node on the charge: {e_node!r})")
+      assert estab_reason.strip() == "reaped" and estab_party.strip() == "controller", (
+          f"the close must be the controller-synthesized reaped verdict, "
+          f"got termination_reason={estab_reason!r} reporting_party={estab_party!r}"
+      )
+      print(f"pull-canary TIMING reap: SIGKILL -> Job instance gone, attempt "
+            f"closed as {estab_class.strip()}/{estab_reason.strip()} by "
+            f"{estab_party.strip()} in {estab_elapsed:.1f}s "
+            f"(bound 90s, well inside the {PC_SLACK_SECS}s slack)")
 
-      # The derivation is requeued, rebuilt under a fresh exec, and the
-      # ledger keeps exactly the one establishment charge.
-      estab_out = pc_bg_wait("pc-estab", 420)
+      # The derivation is requeued charge-free, rebuilt under a fresh
+      # exec, and the ledger keeps exactly the one uncharged reap row.
+      estab_out = pc_bg_wait("pc-estab", 300)
       assert "/nix/store/" in estab_out, (
-          f"the established drv should still produce a store path, got: {estab_out!r}"
+          f"the reaped drv should still produce a store path, got: {estab_out!r}"
       )
       assert pc_attempt_rows("pc-estab") == 1, (
-          f"the rebuild after establishment must add no charge, got "
+          f"the rebuild after the reap must add no further row, got "
           f"{pc_attempt_rows('pc-estab')} rows"
       )
-      print("pull-canary establishment PASS: charged exactly once, only after the "
-            "window, and the work was not lost")
+      print("pull-canary reap PASS: closed charge-free as disconnected/reaped by "
+            "the controller, inside the slack, and the work was not lost")
 
   # ══════════════════════════════════════════════════════════════════
   # Cleanup
