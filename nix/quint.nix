@@ -5278,6 +5278,7 @@ rec {
         "gateFailClosed"
         "freedSlotsSpendable"
         "establishedOnlyPastRenderedDeadline"
+        "noExcessReapOfCoveredJob"
       ];
     };
 
@@ -5541,6 +5542,44 @@ rec {
       step = "calibStep";
       witness = "terminalAbsentReaped";
     };
+    # sh-037 calibration twin (ctrl.ephemeral.reap-excess-pending+4):
+    # live-import with a MID-TRACE init at the post-pull-burst state
+    # (`execr=ExecBusy ∧ JPending(ready==0 lag) ∧ queued=0 ∧ GArmed` —
+    # the EXACT incident shape: 599 controller-reaped quint attempts,
+    # `m0gz0cn814dw` skipped at 22:17:31.954 then reaped 104 ms
+    # later). FALSIFY at depth 1: the as-built `pending − queued`
+    # over-selection (ENABLE_EXCESS_ATTEMPT_FILTER=false) reaps i1
+    # with an open pull-mode attempt covering it.
+    # r[verify ctrl.ephemeral.reap-excess-pending+4]
+    quint-ctrl-calib-sh037-excess-thrash = mkQuintWitnessCheck {
+      name = "ctrl-calib-sh037-excess-thrash";
+      spec = "calibration/controller-sh037-excess-thrash";
+      main = "spawnCoherenceCalibSh037ExcessThrash";
+      extraSpecs = [ "spawnCoherence" ];
+      init = "calibInit";
+      step = "calibStep";
+      witness = "noExcessReapOfCoveredJob";
+    };
+    # HOLD half from the SAME mid-trace init: the `excessCandidates`
+    # filter excludes i1 (`execr(i1)=ExecBusy`) → noExcessReapOfCoveredJob
+    # holds; the `canReachExcessReap` witness above stays violable
+    # in base via `execr=ExecAbsent` (the filter shrinks `excessReaped`
+    # but does not empty it — non-vacuity preserved).
+    # r[verify ctrl.ephemeral.reap-excess-pending+4]
+    quint-ctrl-calib-sh037-excess-thrash-hold = mkQuintCheck {
+      name = "ctrl-calib-sh037-excess-thrash-hold";
+      spec = "calibration/controller-sh037-excess-thrash";
+      main = "spawnCoherenceCalibSh037ExcessThrashHold";
+      extraSpecs = [ "spawnCoherence" ];
+      init = "calibInit";
+      step = "calibStep";
+      invariants = [
+        "noExcessReapOfCoveredJob"
+        "reapSafety"
+        "orphanRemoved"
+      ];
+    };
+
     # HOLD half from the SAME mid-trace init: the `terminalAbsentReaps`
     # arm reaps i1 at the first tick — the synthesized close.
     # r[verify ctrl.ephemeral.reap-terminal-absent]

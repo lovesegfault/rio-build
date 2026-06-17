@@ -230,6 +230,7 @@ module spawnCoherence {
     | VStaleClose
     | VSpawnClobberedStreak
     | VTerminalAbsentMissed
+    | VExcessReapCovered
 
   // ------------------------------------------------------------------
   // 2. Constants (regime modules instantiate these)
@@ -407,6 +408,20 @@ module spawnCoherence {
   const ENABLE_UNREPORTED_DEATH: bool
   const ENABLE_TERMINAL_ABSENT_REAP: bool
 
+  /// sh-037 axis: the `select_excess_pending` attempt-coverage filter
+  /// (`!covered_by_open_pull_attempt` — the SAME predicate the orphan
+  /// arm already negates; `execr.get(i) != ExecBusy` is the model's
+  /// always-populated this-tick analogue, NOT `seenOpen` which is
+  /// constant-false in every base/hold regime). True in production
+  /// (base/hold); false in the controller-sh037 calibration to encode
+  /// the as-built `pending − queued` over-selection: on a wide pull
+  /// burst `queued` (Ready-set only) carries no in-flight term and
+  /// every just-pulled Job whose informer-cached `ready==0` lags is
+  /// thrash-reaped (599 controller-reaped quint attempts at
+  /// `queued=0`). The `not(listExecFails)` conjunct models the
+  /// hoisted `AttemptsViewWitness::fetch`'s `FetchFailed → return 0`.
+  const ENABLE_EXCESS_ATTEMPT_FILTER: bool
+
   pure val INTENTS: Set[IntentId] = Set("i1", "i2")
 
   pure def boolChoices(faultOn: bool): Set[bool] =
@@ -565,6 +580,12 @@ module spawnCoherence {
   /// `ENABLE_TERMINAL_ABSENT_REAP=false` (the as-built `continue` /
   /// `wantEmpty` early-return); HOLDS at `=true`.
   val terminalAbsentReaped = not(violations.contains(VTerminalAbsentMissed))
+  /// sh-037: the excess-Pending reap never deletes a Job whose intent
+  /// has an open pull-mode attempt (`execr == ExecBusy` is the
+  /// model's analogue of `covered_by_open_pull_attempt`). FALSIFIES
+  /// at `ENABLE_EXCESS_ATTEMPT_FILTER=false` (the as-built
+  /// `pending − queued` over-selection); HOLDS in base.
+  val noExcessReapOfCoveredJob = not(violations.contains(VExcessReapCovered))
   /// Non-vacuity (expected-violation in the hold regime): the new arm
   /// actually fired.
   val canReachTerminalAbsentReap = not(effects.contains(ETerminalAbsentReap))
@@ -965,10 +986,14 @@ module spawnCoherence {
     val ackHappens = toAck.size() > 0 and not(ackFails)
 
     // ---- 8. reap_excess_pending ---------------------------------------
+    // sh-037: `not(listExecFails)` is the hoisted
+    // AttemptsViewWitness::fetch's `FetchFailed → return 0`.
     val queuedKnown = not(schedErr) and gateArmed
+      and (not(ENABLE_EXCESS_ATTEMPT_FILTER) or not(listExecFails))
     val excessCandidates = INTENTS.filter(i =>
       isPending(jobsAtList.get(i))
       and pastPendingGrace(jobsAtList.get(i))
+      and (not(ENABLE_EXCESS_ATTEMPT_FILTER) or execr.get(i) != ExecBusy)
       and not(reaped.contains(i)))
     val excessOver = excessCandidates.size() - q
     val excessSelected = if (queuedKnown and excessOver > 0)
@@ -1052,6 +1077,10 @@ module spawnCoherence {
       excessReaped.filter(i => jobsAtList.get(i).podRunning).size() > 0
       or orphanReaped.filter(i => execr.get(i) == ExecBusy).size() > 0
       or (orphanReaped.size() > 0 and not(orphanGatePasses))
+    // sh-037: an excess-reap of a Job whose intent has an open
+    // pull-mode attempt (the structural exclude).
+    val vExcessCovered =
+      excessReaped.filter(i => execr.get(i) == ExecBusy).size() > 0
     // C2/221: an orphan reap of a never-pulled Job (no executor entry)
     // under a young leader.
     val vYoungReap =
@@ -1212,7 +1241,8 @@ module spawnCoherence {
         if (vYoungReap) Set(VYoungLeaderReap) else Set(),
         if (vSpawnClobber) Set(VSpawnClobberedStreak) else Set(),
         if (vHeldReaped) Set(VHeldPlacementReaped) else Set(),
-        if (vTermAbsent) Set(VTerminalAbsentMissed) else Set()).flatten()
+        if (vTermAbsent) Set(VTerminalAbsentMissed) else Set(),
+        if (vExcessCovered) Set(VExcessReapCovered) else Set()).flatten()
 
     all {
       job' = jobsAfter,
@@ -1991,7 +2021,8 @@ module spawnCoherenceBase {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2027,7 +2058,8 @@ module spawnCoherenceFaultRpc {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2064,7 +2096,8 @@ module spawnCoherenceFaultLease {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2101,7 +2134,8 @@ module spawnCoherenceFaultStale {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2138,7 +2172,8 @@ module spawnCoherenceCrdAbsent {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2174,7 +2209,8 @@ module spawnCoherenceFetcher {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2214,7 +2250,8 @@ module spawnCoherenceMatJobs {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2255,7 +2292,8 @@ module spawnCoherenceRenderedDeadline {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2292,7 +2330,8 @@ module spawnCoherenceExhaustAsBuilt {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2330,7 +2369,8 @@ module spawnCoherenceExhaustPersist {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2367,7 +2407,8 @@ module spawnCoherenceCancelAsBuilt {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2404,7 +2445,8 @@ module spawnCoherenceCancelCause {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2445,7 +2487,8 @@ module spawnCoherenceReapYoungLeader {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2483,7 +2526,8 @@ module spawnCoherenceSynthCloseAsBuilt {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2521,7 +2565,8 @@ module spawnCoherenceSynthClosePinned {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2558,7 +2603,8 @@ module spawnCoherenceRetryBackoff {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2598,7 +2644,8 @@ module spawnCoherenceMultiPoolAsBuilt {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2636,7 +2683,8 @@ module spawnCoherenceMultiPool {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2676,7 +2724,8 @@ module spawnCoherenceCancelGenAsBuilt {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2713,7 +2762,8 @@ module spawnCoherenceCancelGeneration {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2762,7 +2812,8 @@ module spawnCoherenceStreakCadence {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2810,7 +2861,8 @@ module spawnCoherenceFailopenWithhold {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2852,7 +2904,8 @@ module spawnCoherenceHeldAsBuilt {
     ENABLE_HELD_MACHINERY = true,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2892,7 +2945,8 @@ module spawnCoherenceHeld {
     ENABLE_HELD_MACHINERY = true,
     ENABLE_HELD_VISIBILITY = true,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2935,7 +2989,8 @@ module spawnCoherenceTerminalAbsentAsBuilt {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = true,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }
 
@@ -2974,6 +3029,7 @@ module spawnCoherenceTerminalAbsent {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = true,
-    ENABLE_TERMINAL_ABSENT_REAP = true
+    ENABLE_TERMINAL_ABSENT_REAP = true,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).*
 }

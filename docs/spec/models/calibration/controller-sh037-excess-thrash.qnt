@@ -1,42 +1,45 @@
 // -*- mode: Bluespec; -*-
 //
-// sh-021 calibration twin (ctrl.ephemeral.reap-terminal-absent): the
-// never-pulled FOD ghost. Live-import form over the LIVE
-// spawnCoherence relation — only INIT is overridden, to the mid-trace
-// state the `jobDiesUnreported` action reaches (the EXACT sh-021
-// shape: open Build attempt still busy on the scheduler ledger,
-// `source_node` never reported, Job `Failed/BackoffLimitExceeded`,
-// intent left the demand set when status→Running).
+// sh-037 calibration twin (ctrl.ephemeral.reap-excess-pending+4): the
+// excess-Pending thrash on a wide pull burst. Live-import form over
+// the LIVE spawnCoherence relation — only INIT is overridden, to the
+// mid-trace state the iter8 wide quint Ready-front reaches (the
+// EXACT sh-037 §mechanism step-3/4 shape: queued has dropped to 0
+// the instant pulled work left the Ready set; i1's Job is
+// `JobStatus.ready==0`-Pending past the grace; i1's pod has already
+// pulled — `execr=ExecBusy` — but the informer-cached `ready` still
+// lags; the live pod-phase re-check is one-shot and `m0gz0cn814dw`
+// was reaped 104 ms after a live-Running skip).
 //
-// CALIB INIT = "the unreported death just happened, intent already
-// left `want`":
-//   - i1's Job is JTerminal (the BackoffLimitExceeded shape);
-//   - i1's `execr` is ExecBusy — the open attempt the mint wrote, the
-//     controller never reported a binding (`source_node IS NULL`);
-//   - i1 is NOT queued (status→Running emptied the fetcher pool's
-//     `want` — the `wantEmpty` early-return arm of the bug);
-//   - i2 cold (so the `AbsentFromDemand => continue` arm at the
-//     non-empty-want sibling is exercised by the model's own
-//     `intentArrives(i2)` from this init at depth 2).
+// CALIB INIT = "the pull burst just drained the Ready set; i1 is
+// covered but its Job still reads Pending":
+//   - i1's Job is JPending, AgePastPending, podRunning=false (the
+//     informer-cached `ready==0` lag);
+//   - i1's `execr` is ExecBusy — the open pull-mode attempt the mint
+//     wrote (`covered_by_open_pull_attempt` would match);
+//   - i1 is NOT queued (pulled work left the Ready set → `queued=0`);
+//   - gate is GArmed and leaderOld is true (so `queuedKnown` holds and
+//     the orphan/leader gates don't suppress);
+//   - i2 cold (so the bound is `pending=1 − queued=0 = 1` → i1 is the
+//     oldest excess).
 //
-// PRE-FIX behavior modeled (ENABLE_TERMINAL_ABSENT_REAP = false): the
-// next `tick` walks the loop, classifies i1 as `AbsentFromDemand` on
-// a complete view (or hits the `wantEmpty` early-return — both encoded
-// as `terminalReaps` filtering `postGate` only and
-// `terminalAbsentReaps = Set()`), and `continue`s. `ttlDeletes(i1)`
-// then removes the Job silently with `execr` STILL ExecBusy — the
-// 62min establishment-sweep ghost.
+// PRE-FIX behavior modeled (ENABLE_EXCESS_ATTEMPT_FILTER = false): the
+// next `tick` walks `excessCandidates` without the
+// `execr.get(i) != ExecBusy` conjunct, selects i1 (Pending, past
+// grace, queued=0), `podRunning=false` (the lag) → `excessReaped`
+// contains i1 with `execr(i1)=ExecBusy` → `vExcessCovered` →
+// `VExcessReapCovered` latched.
 //
-// PREDICTED: terminalAbsentReaped FALSIFIES at depth 1 (one `tick`).
+// PREDICTED: noExcessReapOfCoveredJob FALSIFIES at depth 1 (one `tick`).
 //
 // Run:
-//   quint verify --backend=tlc --main=spawnCoherenceCalibSh021GhostedFod \
+//   quint verify --backend=tlc --main=spawnCoherenceCalibSh037ExcessThrash \
 //     --init=calibInit --step=calibStep \
-//     --invariant=terminalAbsentReaped \
-//     docs/spec/models/calibration/spawnCoherence-calib-sh021-ghosted-fod.qnt
-module spawnCoherenceCalibSh021GhostedFod {
+//     --invariant=noExcessReapOfCoveredJob \
+//     docs/spec/models/calibration/controller-sh037-excess-thrash.qnt
+module spawnCoherenceCalibSh037ExcessThrash {
   import spawnCoherence(
-    IS_BUILDER = false,
+    IS_BUILDER = true,
     CRD_PRESENT = true,
     CEILING = 1,
     ENABLE_RPC_FAULT = false,
@@ -63,23 +66,23 @@ module spawnCoherenceCalibSh021GhostedFod {
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
-    ENABLE_UNREPORTED_DEATH = true,
+    ENABLE_UNREPORTED_DEATH = false,
     ENABLE_TERMINAL_ABSENT_REAP = false,
-    ENABLE_EXCESS_ATTEMPT_FILTER = true
+    ENABLE_EXCESS_ATTEMPT_FILTER = false
   ).* from "../spawnCoherence"
 
-  /// The post-unreported-death mid-trace state (every var assigned;
-  /// deltas from cold init are the three commented lines).
+  /// The post-pull-burst mid-trace state (every var assigned; deltas
+  /// from cold init are the four commented lines).
   action calibInit = all {
-    queued' = INTENTS.mapBy(i => false),               // intent left
+    queued' = INTENTS.mapBy(i => false),               // pulled work left Ready
     intentFp' = INTENTS.mapBy(i => FpA),
-    job' = INTENTS.mapBy(i => if (i == "i1")           // unreported death
-      { phase: JTerminal, age: AgeFresh, fp: FpA, podRunning: false }
+    job' = INTENTS.mapBy(i => if (i == "i1")           // ready==0 lag
+      { phase: JPending, age: AgePastPending, fp: FpA, podRunning: false }
       else { phase: JAbsent, age: AgeFresh, fp: FpA, podRunning: false }),
-    execr' = INTENTS.mapBy(i =>                        // ghosted open attempt
+    execr' = INTENTS.mapBy(i =>                        // open pull-mode attempt
       if (i == "i1") ExecBusy else ExecAbsent),
     leaderOld' = true,
-    gate' = GUnarmed,
+    gate' = GArmed((Set(), Set())),                    // queuedKnown holds
     dispatched' = Set(),
     prevQueuedSnap' = Set(),
     effects' = Set(),
@@ -103,14 +106,14 @@ module spawnCoherenceCalibSh021GhostedFod {
 }
 
 /// HOLD counterpart from the SAME mid-trace init: with
-/// ENABLE_TERMINAL_ABSENT_REAP the `terminalAbsentReaps` arm reaps i1
-/// at the first `tick` (background delete + the synthesized close —
-/// Model J's `reaped` membership IS the close abstraction, same as
-/// `orphanPendingReaps`). terminalAbsentReaped HOLDS;
-/// canReachTerminalAbsentReap is the non-vacuity witness.
-module spawnCoherenceCalibSh021GhostedFodHold {
+/// ENABLE_EXCESS_ATTEMPT_FILTER the `excessCandidates` filter
+/// excludes i1 (`execr(i1)=ExecBusy`) → `excessReaped` is empty →
+/// noExcessReapOfCoveredJob HOLDS. canReachExcessReap stays violable
+/// in base via a Pending Job with `execr=ExecAbsent` (the witness is
+/// re-verified there).
+module spawnCoherenceCalibSh037ExcessThrashHold {
   import spawnCoherence(
-    IS_BUILDER = false,
+    IS_BUILDER = true,
     CRD_PRESENT = true,
     CEILING = 1,
     ENABLE_RPC_FAULT = false,
@@ -137,8 +140,8 @@ module spawnCoherenceCalibSh021GhostedFodHold {
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
-    ENABLE_UNREPORTED_DEATH = true,
-    ENABLE_TERMINAL_ABSENT_REAP = true,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false,
     ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).* from "../spawnCoherence"
 
@@ -146,12 +149,12 @@ module spawnCoherenceCalibSh021GhostedFodHold {
     queued' = INTENTS.mapBy(i => false),
     intentFp' = INTENTS.mapBy(i => FpA),
     job' = INTENTS.mapBy(i => if (i == "i1")
-      { phase: JTerminal, age: AgeFresh, fp: FpA, podRunning: false }
+      { phase: JPending, age: AgePastPending, fp: FpA, podRunning: false }
       else { phase: JAbsent, age: AgeFresh, fp: FpA, podRunning: false }),
     execr' = INTENTS.mapBy(i =>
       if (i == "i1") ExecBusy else ExecAbsent),
     leaderOld' = true,
-    gate' = GUnarmed,
+    gate' = GArmed((Set(), Set())),
     dispatched' = Set(),
     prevQueuedSnap' = Set(),
     effects' = Set(),

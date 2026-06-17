@@ -55,7 +55,8 @@ module ctrlCalib282BackoffIgnored {
     ENABLE_HELD_MACHINERY = false,
     ENABLE_HELD_VISIBILITY = false,
     ENABLE_UNREPORTED_DEATH = false,
-    ENABLE_TERMINAL_ABSENT_REAP = false
+    ENABLE_TERMINAL_ABSENT_REAP = false,
+    ENABLE_EXCESS_ATTEMPT_FILTER = true
   ).* from "../spawnCoherence"
 
   /// PRE-FIX spawn edge: the backoff conjunct dropped (everything
