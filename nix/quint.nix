@@ -9029,6 +9029,49 @@ rec {
       match = "w12anHandoffHandsToSweepGreen";
     };
 
+    # Round-13 sh-030 (the EmptyConsolidation gate — a tracked claim
+    # the controller observed Registered then absent across a
+    # controller-blind window is Karpenter cleanup, never an ICE
+    # mark). FALSIFY half: under the as-built unconditional GcVanish
+    # row (gate off), the deterministic sh030EmptyConsolidationRed
+    # trace (mint → register → terminationEdge → finalizerCompletes —
+    # the everRegistered carry survives both absentClaim spreads → tick)
+    # mints a vanish mark the strengthened spurious law catches
+    # (VSpuriousMark). The .expect IS the calibration's non-vacuity
+    # proof; the everRegistered carry through finalizerCompletes is
+    # the qnt-everregistered-absentclaim-reset review finding's pin.
+    # r[verify ctrl.nodeclaim.ice-mark-clear+6]
+    quint-nodeclaim-empty-consolidation-asbuilt = mkQuintRunCheck {
+      name = "nodeclaim-empty-consolidation-asbuilt";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleEmptyConsolidationAsBuilt";
+      match = "sh030EmptyConsolidationRed";
+    };
+    # HOLD half: gate on → vanishIce excludes everRegistered claims;
+    # vanishMarks never fires for empty consolidation; iceMarkSoundness
+    # holds over the full Karpenter-fault step relation. Paired
+    # calibration: quint-nodeclaim-empty-consolidation-asbuilt above
+    # (gate off → VSpuriousMark) — the P1 vacuity twin. Same consts
+    # as nodeclaimLifecycleFaultKarpenter, so canReachVanishMark
+    # (the B11 never-Registered row) stays reachable AND
+    # iceMarkSoundness still holds for it.
+    # r[verify ctrl.nodeclaim.ice-mark-clear+6]
+    quint-nodeclaim-empty-consolidation = mkQuintCheck {
+      name = "nodeclaim-empty-consolidation";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleEmptyConsolidation";
+      invariants = [
+        "iceMarkSoundness"
+      ];
+    };
+    # Green twin run (the trace-level pin beside the BFS hold above).
+    quint-nodeclaim-empty-consolidation-typed = mkQuintRunCheck {
+      name = "nodeclaim-empty-consolidation-typed";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleEmptyConsolidation";
+      match = "sh030EmptyConsolidationGreen";
+    };
+
     # ------------------------------------------------------------------
     # ICE evidence/ack pipeline (bughunt-5 slot 5: bug_094 +
     # merged_bug_134/008/003) — the cross-component contract

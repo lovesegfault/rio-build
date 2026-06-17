@@ -205,6 +205,13 @@ module nodeclaimLifecycle {
     boot: BootPhase,
     inflightTracked: bool,
     inflightCell: Cell,
+    // sh-030: this controller OBSERVED the claim Registered on some
+    // earlier tick — latched true by claimRegisters and never cleared
+    // (carried through the tomb/absent state like inflightTracked).
+    // The strengthened iceMarkSoundness law: a vanish ICE mark for a
+    // claim with everRegistered=true is spurious (Karpenter empty-node
+    // consolidation, not capacity failure).
+    everRegistered: bool,
     pIdle: IdleTrack,
     ctrlReaped: bool,
     // Round-11 (WO-S4-1/-2): the controller's delete-provenance
@@ -377,6 +384,17 @@ module nodeclaimLifecycle {
   /// the registered-population sweep. Off = the as-built uniform
   /// consume-on-every-exit epilogue (the defect face).
   const ENABLE_TYPED_TOMBSTONE_DISPOSITION: bool
+  /// sh-030 (round-13): the EmptyConsolidation gate — vanishMarks
+  /// excludes a tracked claim the controller observed Registered
+  /// (Karpenter empty-node consolidation across a controller-blind
+  /// window is cleanup, not capacity failure). Off = the as-built
+  /// unconditional GcVanish row (the defect face: a 295 s tick let
+  /// 69 claims Register, sit empty past consolidateAfter, vanish, and
+  /// ICE-mask the cell). The spurious LAW widens UNCONDITIONALLY (a
+  /// mark for an everRegistered claim is spurious whatever the gate);
+  /// this flag gates the CONTROLLER ACTION (vanishIce filter), not
+  /// the predicate — the ENABLE_TYPED_TOMBSTONE_DISPOSITION precedent.
+  const ENABLE_EMPTY_CONSOLIDATION_GATE: bool
 
   pure val CLAIMS: Set[ClaimId] = Set("c1", "c2")
   pure val CELLS: Set[Cell] = Set("cellA", "cellB")
@@ -412,7 +430,8 @@ module nodeclaimLifecycle {
   pure val absentClaim: ClaimRec = {
     phase: CAbsent, cell: "cellA", stuck: false, spell: SNotIdle,
     busyTickSeen: false, boot: BRecorded, inflightTracked: false,
-    inflightCell: "cellA", pIdle: INotTracked, ctrlReaped: false,
+    inflightCell: "cellA", everRegistered: false,
+    pIdle: INotTracked, ctrlReaped: false,
     tomb: false, tombAge: 0, ourCommit: false,
   }
 
@@ -850,11 +869,20 @@ module nodeclaimLifecycle {
       val vanished = CLAIMS.filter(k =>
         tombs.get(k).inflightTracked and not(stuckReaped.contains(k))
         and tombs.get(k).phase == CAbsent and not(tombConfirmed.contains(k)))
+      // sh-030: the CONTROLLER ACTION gate — a vanish whose claim the
+      // controller observed Registered is empty consolidation, not
+      // capacity failure; the gated vanishIce is what would mark.
+      val vanishIce = vanished.filter(k =>
+        not(ENABLE_EMPTY_CONSOLIDATION_GATE and tombs.get(k).everRegistered))
       // bug_043 widening: a mark for a claim whose teardown is OURS by
       // ground truth (ctrlReaped — completed; ourCommit — committed
       // ambiguous) is spurious whatever the controller still knows.
-      val spurious = vanished.filter(k =>
-        tombs.get(k).ctrlReaped or tombs.get(k).ourCommit).size() > 0
+      // sh-030 widening (UNCONDITIONAL — the strengthened soundness
+      // law): so is a mark for a claim with everRegistered. Ranges
+      // over vanishIce — the population that would mark.
+      val spurious = vanishIce.filter(k =>
+        tombs.get(k).ctrlReaped or tombs.get(k).ourCommit
+        or tombs.get(k).everRegistered).size() > 0
       // Idle reap with an empty reserved set (no FFD this tick).
       val idleReaped = CLAIMS.filter(k =>
         val c = tombs.get(k)
@@ -1093,12 +1121,22 @@ module nodeclaimLifecycle {
       val vanished = CLAIMS.filter(k =>
         tombs.get(k).inflightTracked and not(stuckReaped.contains(k))
         and tombs.get(k).phase == CAbsent and not(tombConfirmed.contains(k)))
-      val vanishMarks: Set[Cell] = vanished.map(k => tombs.get(k).inflightCell)
+      // sh-030: the CONTROLLER ACTION gate — a vanish whose claim the
+      // controller observed Registered is empty consolidation
+      // (counter only, never a mark). vanishMarks maps over the gated
+      // population; the law's spurious filter ranges over the SAME
+      // population (a mark that did not fire cannot be spurious).
+      val vanishIce = vanished.filter(k =>
+        not(ENABLE_EMPTY_CONSOLIDATION_GATE and tombs.get(k).everRegistered))
+      val vanishMarks: Set[Cell] = vanishIce.map(k => tombs.get(k).inflightCell)
       // bug_043 widening: a mark for a claim whose teardown is OURS by
       // ground truth (ctrlReaped — completed; ourCommit — committed
       // ambiguous) is spurious whatever the controller still knows.
-      val spurious = vanished.filter(k =>
-        tombs.get(k).ctrlReaped or tombs.get(k).ourCommit).size() > 0
+      // sh-030 widening (UNCONDITIONAL — the strengthened soundness
+      // law): so is a mark for a claim with everRegistered.
+      val spurious = vanishIce.filter(k =>
+        tombs.get(k).ctrlReaped or tombs.get(k).ourCommit
+        or tombs.get(k).everRegistered).size() > 0
       // A confirmed Ice-reason tombstone re-applies its mask late —
       // the model's reasons collapse to the stuck (ICE-shaped) reap,
       // so a confirmed formerly-stuck claim's cell marks now (the
@@ -1240,12 +1278,14 @@ module nodeclaimLifecycle {
         else if (slotForA.contains(k))
           { phase: CInFlight, cell: "cellA", stuck: false, spell: SNotIdle,
             busyTickSeen: false, boot: BRecorded, inflightTracked: true,
-            inflightCell: "cellA", pIdle: INotTracked, ctrlReaped: false,
+            inflightCell: "cellA", everRegistered: false,
+            pIdle: INotTracked, ctrlReaped: false,
             tomb: false, tombAge: 0, ourCommit: false }
         else if (slotForB.contains(k))
           { phase: CInFlight, cell: "cellB", stuck: false, spell: SNotIdle,
             busyTickSeen: false, boot: BRecorded, inflightTracked: true,
-            inflightCell: "cellB", pIdle: INotTracked, ctrlReaped: false,
+            inflightCell: "cellB", everRegistered: false,
+            pIdle: INotTracked, ctrlReaped: false,
             tomb: false, tombAge: 0, ourCommit: false }
         else if (c.inflightTracked and (c.phase == CRegistered or c.phase == CTerminating))
           // detect_vanished drops entries for registered/terminating
@@ -1436,6 +1476,7 @@ module nodeclaimLifecycle {
     not(claims.get(k).stuck),
     claims' = claims.set(k, { ...claims.get(k),
       phase: CRegistered, spell: SYoungUnseen, busyTickSeen: false,
+      everRegistered: true,
       boot: if (isLeader) BFreshTenure else BFreshOther }),
     envFrame,
   }
@@ -1453,6 +1494,7 @@ module nodeclaimLifecycle {
     claims.get(k).tomb,
     claims' = claims.set(k, { ...claims.get(k),
       phase: CRegistered, spell: SYoungUnseen, busyTickSeen: false,
+      everRegistered: true,
       boot: if (isLeader) BFreshTenure else BFreshOther }),
     envFrame,
   }
@@ -1506,6 +1548,12 @@ module nodeclaimLifecycle {
     claims' = claims.set(k, { ...absentClaim,
       inflightTracked: claims.get(k).inflightTracked,
       inflightCell: claims.get(k).inflightCell,
+      // sh-030: everRegistered is the controller's accumulated
+      // observation, carried through the absent state exactly like
+      // inflightTracked (the qnt-everregistered-absentclaim-reset
+      // review finding: an absentClaim spread without this carry
+      // resets the latch and the calibration trace passes vacuously).
+      everRegistered: claims.get(k).everRegistered,
       ctrlReaped: claims.get(k).ctrlReaped,
       // The tombstone plane is CONTROLLER state keyed by name — the
       // claim's absence does not erase it (the consult adjudicates).
@@ -1532,6 +1580,7 @@ module nodeclaimLifecycle {
     claims' = claims.set(k, { ...absentClaim,
       inflightTracked: claims.get(k).inflightTracked,
       inflightCell: claims.get(k).inflightCell,
+      everRegistered: claims.get(k).everRegistered,
       ctrlReaped: claims.get(k).ctrlReaped,
       tomb: claims.get(k).tomb,
       tombAge: claims.get(k).tombAge,
@@ -1785,7 +1834,8 @@ module nodeclaimLifecycleBase {
     ENABLE_TOMBSTONE_MACHINERY = false,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 }
 
@@ -1814,7 +1864,8 @@ module nodeclaimLifecycleFaultRpc {
     ENABLE_TOMBSTONE_MACHINERY = false,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 
   /// The conflation trace, post-fix: the claim is observed idle, goes
@@ -1873,7 +1924,8 @@ module nodeclaimLifecycleFaultLease {
     ENABLE_TOMBSTONE_MACHINERY = false,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 }
 
@@ -1901,7 +1953,8 @@ module nodeclaimLifecycleFaultKarpenter {
     ENABLE_TOMBSTONE_MACHINERY = false,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 }
 
@@ -1930,7 +1983,8 @@ module nodeclaimLifecycleEpochAsBuilt {
     ENABLE_TOMBSTONE_MACHINERY = false,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 }
 
@@ -1959,7 +2013,8 @@ module nodeclaimLifecycleEpoch {
     ENABLE_TOMBSTONE_MACHINERY = false,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 }
 
@@ -1987,7 +2042,8 @@ module nodeclaimLifecycleClearBufferAsBuilt {
     ENABLE_TOMBSTONE_MACHINERY = false,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 }
 
@@ -2015,7 +2071,8 @@ module nodeclaimLifecycleClearBuffer {
     ENABLE_TOMBSTONE_MACHINERY = false,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 }
 
@@ -2045,7 +2102,8 @@ module nodeclaimLifecycleAckLatchAsBuilt {
     ENABLE_TOMBSTONE_MACHINERY = false,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 }
 
@@ -2074,7 +2132,8 @@ module nodeclaimLifecycleSnapshotAsBuilt {
     ENABLE_TOMBSTONE_MACHINERY = false,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 }
 
@@ -2103,7 +2162,8 @@ module nodeclaimLifecycleSnapshot {
     ENABLE_TOMBSTONE_MACHINERY = false,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 }
 
@@ -2134,7 +2194,8 @@ module nodeclaimLifecycleDeferAsBuilt {
     ENABLE_TOMBSTONE_MACHINERY = false,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 }
 
@@ -2164,7 +2225,8 @@ module nodeclaimLifecycleDefer {
     ENABLE_TOMBSTONE_MACHINERY = false,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 }
 
@@ -2201,7 +2263,8 @@ module nodeclaimLifecycleTombstoneAsBuilt {
     ENABLE_TOMBSTONE_MACHINERY = true,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 
   /// Deterministic W11-AI reproducer (the foldless-window
@@ -2261,7 +2324,8 @@ module nodeclaimLifecycleTombstone {
     ENABLE_TOMBSTONE_MACHINERY = true,
     ENABLE_FOLD_CLOCK = true,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 
   /// The W11-AI shape under the fixed law (scaled to this regime's
@@ -2317,7 +2381,8 @@ module nodeclaimLifecycleTombstoneDispositionAsBuilt {
     ENABLE_TOMBSTONE_MACHINERY = true,
     ENABLE_FOLD_CLOCK = true,
     ENABLE_LAGGED_COMMIT_OBSERVATION = true,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = false
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = false,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 
   /// The merged_bug_050 reproducer, pinned as a named deterministic
@@ -2363,7 +2428,8 @@ module nodeclaimLifecycleTombstoneDisposition {
     ENABLE_TOMBSTONE_MACHINERY = true,
     ENABLE_FOLD_CLOCK = true,
     ENABLE_LAGGED_COMMIT_OBSERVATION = true,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).*
 
   /// The same trace under the typed law, extended to the confirm:
@@ -2381,6 +2447,105 @@ module nodeclaimLifecycleTombstoneDisposition {
       .then(tickFullWith(false, false, false, 0, 0, Set(), Set(), Set(), Set()))
       .expect(effects.contains(ETombstoneConfirmed)
         and not(violations.contains(VTombstoneDropped)))
+  }
+}
+
+/// Round-13 sh-030 AS-BUILT face: the unconditional GcVanish row
+/// ICE-masks a tracked claim that Registered, sat empty past
+/// Karpenter consolidateAfter, and vanished across a controller-blind
+/// window — Karpenter cleanup minted as capacity failure. The
+/// deterministic red: mint → register (no controller tick observes
+/// the handoff) → karpenterTerminationEdge → finalizerCompletes (the
+/// everRegistered carry survives both absentClaim spreads) → tick:
+/// vanishIce = vanished (gate off), vanishMarks fires, the
+/// strengthened spurious law catches it → VSpuriousMark.
+module nodeclaimLifecycleEmptyConsolidationAsBuilt {
+  import nodeclaimLifecycle(
+    MAX_FLEET_CORES = 2,
+    CLASS_CAP_A = 1,
+    BOT_THRESHOLD = 2,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_KARPENTER_FAULT = true,
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = false
+  ).*
+
+  /// The sh-030 reproducer, pinned as a named deterministic run: the
+  /// controller is blind across the Registered→Absent transition (a
+  /// stalled tick — c1's 3×TICK bound is the Rust-side close). The
+  /// .expect IS the calibration's non-vacuity proof: with the gate
+  /// off, the unconditional vanish mark is spurious under the
+  /// strengthened law.
+  run sh030EmptyConsolidationRed = {
+    init
+      .then(tickFullWith(false, false, false, 1, 0, Set(), Set(), Set(), Set()))
+      .then(claimRegisters("c1"))
+      .then(karpenterTerminationEdge("c1"))
+      .then(finalizerCompletes("c1"))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set(), Set(), Set()))
+      .expect(violations.contains(VSpuriousMark))
+  }
+}
+
+/// Round-13 sh-030 FIXED face (the EmptyConsolidation gate):
+/// vanishIce excludes everRegistered claims, so vanishMarks never
+/// fires for empty-node consolidation; the spurious filter ranges
+/// over vanishIce → no VSpuriousMark. iceMarkSoundness HOLDS over
+/// the full Karpenter-fault step relation (the same regime as
+/// nodeclaimLifecycleFaultKarpenter, with the trace below as the
+/// pinned green twin of sh030EmptyConsolidationRed).
+module nodeclaimLifecycleEmptyConsolidation {
+  import nodeclaimLifecycle(
+    MAX_FLEET_CORES = 2,
+    CLASS_CAP_A = 1,
+    BOT_THRESHOLD = 2,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_KARPENTER_FAULT = true,
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false,
+    ENABLE_TOMBSTONE_MACHINERY = false,
+    ENABLE_FOLD_CLOCK = false,
+    ENABLE_LAGGED_COMMIT_OBSERVATION = false,
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
+  ).*
+
+  /// The same trace under the gated law: the everRegistered claim is
+  /// filtered out of vanishIce → no mark, no spurious — the green
+  /// twin. EVanishDetected stays reachable for the never-Registered
+  /// row (B11 preserved — pinned by canReachVanishMark in the
+  /// FaultKarpenter regime, identical consts).
+  run sh030EmptyConsolidationGreen = {
+    init
+      .then(tickFullWith(false, false, false, 1, 0, Set(), Set(), Set(), Set()))
+      .then(claimRegisters("c1"))
+      .then(karpenterTerminationEdge("c1"))
+      .then(finalizerCompletes("c1"))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set(), Set(), Set()))
+      .expect(not(violations.contains(VSpuriousMark)))
   }
 }
 
