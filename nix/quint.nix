@@ -4026,13 +4026,8 @@ rec {
         "l3NoForeignFreshen"
         "noReferencedChunkSwept"
       ];
-      # iter6 on rio: 3.13B states / 47M distinct / depth 37 / 107M
-      # states/min, queue 1.66M draining at 1800s. Extrapolating ≈
-      # 37min → 2700s ≈ 1.2× headroom. The chunkCollect.qnt source
-      # bump (sh-023's tracey-only doc edit) plus S8's prelude
-      # invalidated the cache; the regime had previously been
-      # sub-1800 on the local builder.
-      modelTimeoutSec = 2700;
+      # S10 (sh-031b): floor_cores escalation handles the saturated
+      # case — default 1800s + big-parallel routing suffices on retry.
       requiredSystemFeatures = [ "big-parallel" ];
     };
 
