@@ -2353,6 +2353,37 @@ pub(super) enum BatchedCompanion {
     },
 }
 
+/// Phase-D apply result (sh-027 §3 phase-D batch): either an
+/// immediate ack (`Complete` arm — its companion already ran) or a
+/// release the phase-D loop COLLECTS for one
+/// [`DagActor::companion_release_batch`] after the loop. The reply is
+/// `Ok(())` for both — the close was settled either way; only the
+/// release's requeue is deferred.
+pub(super) enum CompanionResult {
+    /// The companion ran inline (the `Complete` arm). Ack now.
+    Ack(MatAck),
+    /// The release deferred to the post-loop batch. Ack now (the close
+    /// IS settled); the requeue rides one slice-wide
+    /// `requeue_after_attempt`.
+    DeferredRelease(DeferredRelease),
+}
+
+/// One phase-D `BatchedCompanion::Release` intent the phase-D loop
+/// collected for [`DagActor::companion_release_batch`]: the same
+/// inputs the per-item [`DagActor::companion_release`] takes (the
+/// settled-close witness was consumed at the construction site —
+/// `apply_batched_companion`'s `Settled` arm — so this carrying it
+/// would be redundant).
+#[derive(Debug)]
+pub(super) struct DeferredRelease {
+    /// The DAG key (in-mem release + requeue).
+    pub(super) drv_hash: DrvHash,
+    /// The expected holder (the compare-and-clear key — bug_170).
+    pub(super) executor: ExecutorId,
+    /// View-only deferral; `None` = re-arm immediately.
+    pub(super) defer: Option<std::time::Duration>,
+}
+
 impl BatchIntent {
     /// The `(job_id, to_state, resolution_exec_id)` triple this intent
     /// contributes to the batch resolve (only `Complete` resolves).
@@ -3238,14 +3269,16 @@ impl DagActor {
     /// the witness via [`Self::close_for_consumption_from_disposition`],
     /// then run the companion. The resolve `WriteDisposition` is
     /// likewise synthesized from `resolved_set` (the batch tx already
-    /// committed it). PG-free except for the companion's own
-    /// `requeue_after_attempt` (in-mem status + outbox).
+    /// committed it). PG-free for the `Release` arm (sh-027 §3: it
+    /// returns a [`DeferredRelease`] the caller batches into ONE
+    /// `requeue_after_attempt(slice)`); the `Complete` arm's
+    /// `ReleaseClaimFallback` rare-path is the only residual await.
     pub(super) async fn apply_batched_companion(
         &mut self,
         intent: BatchIntent,
         close_d: WriteDisposition,
         resolved_set: &std::collections::HashSet<Uuid>,
-    ) -> Result<MatAck, super::pull::PullRejection> {
+    ) -> Result<CompanionResult, super::pull::PullRejection> {
         let BatchIntent {
             exec_id,
             drv_hash,
@@ -3254,7 +3287,7 @@ impl DagActor {
         } = intent;
         let close = match Self::close_for_consumption_from_disposition(close_d) {
             CloseOutcome::Settled(close) => close,
-            CloseOutcome::Deferred(ack) => return Ok(ack),
+            CloseOutcome::Deferred(ack) => return Ok(CompanionResult::Ack(ack)),
             CloseOutcome::NotDurable => {
                 return Err(super::pull::PullRejection::ConsumptionNotDurable);
             }
@@ -3274,9 +3307,18 @@ impl DagActor {
                         "no verifiable live-wanted path set; closed uncharged and deferred"
                     );
                 }
-                Ok(self
-                    .companion_release(&drv_hash, &executor, defer, close)
-                    .await)
+                // sh-027 §3: defer the release to the post-loop
+                // batch — the per-item `companion_release` await here
+                // was the residual N×PG chain in the otherwise-O(1)
+                // phased flush. The settled-close witness is consumed
+                // HERE (the gate); the DeferredRelease is constructed
+                // only in this Settled arm, so the witness law holds.
+                let SettledClose(()) = close;
+                Ok(CompanionResult::DeferredRelease(DeferredRelease {
+                    drv_hash,
+                    executor,
+                    defer,
+                }))
             }
             BatchedCompanion::Complete {
                 job_id,
@@ -3322,9 +3364,51 @@ impl DagActor {
                         self.release_claim(&drv_hash, &executor).await;
                     }
                 }
-                Ok(MatAck(()))
+                Ok(CompanionResult::Ack(MatAck(())))
             }
         }
+    }
+
+    /// Phase-D batched release (sh-027 §3): the per-item in-mem
+    /// `release_claim_deferring` (the bug_220 compare-and-clear; cheap,
+    /// no PG) for every collected [`DeferredRelease`], then ONE
+    /// [`Self::requeue_after_attempt`] over the non-stale slice. The
+    /// `lost_worker` hint is `None` for the batch — the Materialization
+    /// arm of `requeue_after_attempt` does not consult it (its only
+    /// reader is the Build arm's poison-threshold log line); per-item
+    /// executor identity is fully consumed by the compare-and-clear
+    /// here. Semantically identical to N × [`Self::companion_release`]
+    /// (every release the per-item path would issue is issued; the
+    /// `StaleHolder` arm is skipped exactly the same way), with one
+    /// requeue chokepoint instead of N.
+    pub(super) async fn companion_release_batch(&mut self, releases: Vec<DeferredRelease>) {
+        if releases.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let mut requeue: Vec<DrvHash> = Vec::with_capacity(releases.len());
+        for DeferredRelease {
+            drv_hash,
+            executor,
+            defer,
+        } in releases
+        {
+            let defer_until = defer.map(|d| now + d);
+            let release = match self.materialization_jobs.get_mut(&drv_hash) {
+                Some(entry) => entry.release_claim_deferring(&executor, defer_until),
+                None => ClaimRelease::Unclaimed,
+            };
+            if release == ClaimRelease::StaleHolder {
+                warn!(
+                    drv_hash = %drv_hash, executor = %executor,
+                    "stale claim release ignored: a different executor holds a fresh claim"
+                );
+                continue;
+            }
+            requeue.push(drv_hash);
+        }
+        self.requeue_after_attempt(&requeue, crate::state::AttemptKind::Materialization, None)
+            .await;
     }
 
     /// THE consumption-close chokepoint (bug_182): every report arm
@@ -3394,6 +3478,10 @@ impl DagActor {
         defer: Option<std::time::Duration>,
         close: SettledClose,
     ) -> MatAck {
+        #[cfg(test)]
+        self.test_counters
+            .companion_release_awaits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let SettledClose(()) = close;
         self.release_claim_with_defer(drv_hash, executor, defer)
             .await;

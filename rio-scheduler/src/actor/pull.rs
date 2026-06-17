@@ -1843,6 +1843,7 @@ impl DagActor {
                     return self.flush_tail(acks).await;
                 }
             };
+            let mut releases: Vec<super::materialize::DeferredRelease> = Vec::new();
             for (intent, reply) in intents {
                 let close_d = batch_d.unwrap_or_else(|| {
                     if closed_set.contains(&intent.exec_id) {
@@ -1851,12 +1852,23 @@ impl DagActor {
                         WriteDisposition::AlreadyResolved
                     }
                 });
-                let result = self
+                let result = match self
                     .apply_batched_companion(intent, close_d, resolved_set)
                     .await
-                    .map(|_ack: super::materialize::MatAck| ());
+                {
+                    Ok(super::materialize::CompanionResult::Ack(_ack)) => Ok(()),
+                    Ok(super::materialize::CompanionResult::DeferredRelease(d)) => {
+                        releases.push(d);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                };
                 acks.push((reply, result));
             }
+            // sh-027 §3: ONE batched release-and-requeue chokepoint
+            // for every Release-arm intent the loop deferred (was N
+            // per-item `companion_release` awaits inline).
+            self.companion_release_batch(releases).await;
         }
 
         // ─── Phase E: once-per-flush tail ─────────────────────────

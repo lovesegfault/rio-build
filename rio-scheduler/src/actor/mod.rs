@@ -1073,6 +1073,14 @@ pub(crate) struct TestCounters {
     /// must drive ONE fenced close+resolve transaction, not N
     /// per-item `close_materialization_attempt` calls.
     pub begin_fenced_calls: std::sync::atomic::AtomicU64,
+    /// Incremented at every per-item
+    /// [`companion_release`](DagActor::companion_release) await
+    /// (sh-027 §3 phase-D batch). Asserts on the deferred-release
+    /// rule: N batched `BatchedCompanion::Release` intents must
+    /// drive ZERO per-item `companion_release` awaits — the phase-D
+    /// loop collects [`DeferredRelease`](materialize::DeferredRelease)
+    /// and runs ONE `companion_release_batch` after.
+    pub companion_release_awaits: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
@@ -1087,6 +1095,7 @@ impl TestCounters {
             max_known_generation_reads: self.max_known_generation_reads.load(SeqCst),
             persist_build_counts_calls: self.persist_build_counts_calls.load(SeqCst),
             begin_fenced_calls: self.begin_fenced_calls.load(SeqCst),
+            companion_release_awaits: self.companion_release_awaits.load(SeqCst),
         }
     }
 }
@@ -1111,6 +1120,8 @@ pub struct TestCountersSnapshot {
     pub persist_build_counts_calls: u64,
     /// See [`TestCounters::begin_fenced_calls`].
     pub begin_fenced_calls: u64,
+    /// See [`TestCounters::companion_release_awaits`].
+    pub companion_release_awaits: u64,
 }
 
 impl DagActor {

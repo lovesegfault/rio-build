@@ -12223,6 +12223,79 @@ async fn report_burst_coalesces_to_batch_ge_20() -> TestResult {
 }
 
 // r[verify sched.executor.report-idempotent]
+/// sh-027 §3 (`s6-batch-tighten`, phase-D): N batched Release-arm
+/// reports drive ZERO per-item `companion_release` awaits — the
+/// phase-D loop collects `DeferredRelease` and runs ONE
+/// `companion_release_batch` after. RED at 59d532ff0: each
+/// `apply_batched_companion` Release arm `.await`ed
+/// `companion_release` inline → counter moves by N. Behaviour pin:
+/// every claim is RELEASED (re-claimable) and the deferral stamps
+/// (the bug_220 disposition-gated mutation) — the batch is
+/// semantically identical to N × per-item, with one requeue
+/// chokepoint instead of N.
+#[tokio::test]
+async fn phase_d_release_is_batched() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let tags: Vec<String> = (0..6).map(|i| format!("sh027-rel-{i}")).collect();
+    let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+    let claimed = seed_claimed_mat_jobs(&handle, &store, &tag_refs).await?;
+
+    let before = handle.debug_counters().await?.companion_release_awaits;
+
+    let retry_later = rio_proto::types::MaterializationOutcome {
+        outcome: Some(
+            rio_proto::types::materialization_outcome::Outcome::RetryLater(
+                rio_proto::types::materialization_outcome::RetryLater {
+                    detail: "upstream rate-limited".into(),
+                    retry_after_secs: 60,
+                    class: "rate_limited".into(),
+                },
+            ),
+        ),
+    };
+    let tx = handle.command_sender();
+    let mut rxs: Vec<tokio::sync::oneshot::Receiver<Result<(), PullRejection>>> = Vec::new();
+    for (tag, _, exec_id) in &claimed {
+        let mut payload = pull_payload(rio_proto::types::BuildResult::default());
+        payload.materialization_outcome = Some(retry_later.clone());
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        tx.try_send(ActorCommand::ReportPullOutcome {
+            exec_id: *exec_id,
+            auth_intent: Some(tag.clone()),
+            payload,
+            reply: rtx,
+        })
+        .map_err(|e| anyhow::anyhow!("mailbox try_send: {e}"))?;
+        rxs.push(rrx);
+    }
+    for (i, rx) in rxs.into_iter().enumerate() {
+        let r = rx.await.map_err(|_| anyhow::anyhow!("reply {i} dropped"))?;
+        assert!(r.is_ok(), "report {i} must ack Ok, got {r:?}");
+    }
+
+    let delta = handle.debug_counters().await?.companion_release_awaits - before;
+    assert_eq!(
+        delta, 0,
+        "RED at 59d532ff0: 6 RetryLater reports drove 6 per-item \
+         companion_release awaits — phase-D must collect DeferredRelease \
+         and run ONE companion_release_batch (got {delta})"
+    );
+    // Behaviour pin: every node requeued to a released status — the
+    // batch's `requeue_after_attempt(slice)` ran (the node-reset half;
+    // the in-mem `release_claim_deferring` is the other half — pinned
+    // independently by the bug_220 batteries).
+    for (tag, _, _) in &claimed {
+        let st = expect_drv(&handle, tag).await.status;
+        assert!(
+            matches!(st, DerivationStatus::Ready | DerivationStatus::Queued),
+            "{tag}: the batched release must requeue to a released \
+             status (got {st:?})"
+        );
+    }
+    Ok(())
+}
+
+// r[verify sched.executor.report-idempotent]
 /// sh-002 row-4 arm (c): a `LeaderLost` queued behind pending reports
 /// drains every held reply with `Err(NotLeader)` — never a silent
 /// `clear()`. RED at 5f1ce214c: there is no accumulator; each report
