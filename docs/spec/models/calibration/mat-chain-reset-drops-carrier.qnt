@@ -27,23 +27,32 @@
 //     --invariant=carrierConservation \
 //     docs/spec/models/calibration/mat-chain-reset-drops-carrier.qnt
 module matCalibChainResetDropsCarrier {
+  // Parameter ladder: BUILDS>=2 IS LOAD-BEARING — releasePins needs
+  // memInterest(d) == Set() (every interested build dead), but the
+  // calib action needs a LIVE tenant with wanted rows; buildTerminal
+  // is one-way, so the stale-reset tenant must be a SECOND build
+  // (see materializationJob.qnt staleResetRun). Everything else
+  // shrinks to singleton: the original 2x sizing outgrew the witness
+  // budget once the model accumulated the walk/stamp/A4 oracle
+  // planes; measured falsification at this regime is in the
+  // introducing commit.
   import materializationJob(
     BUILDS = Set("b1", "b2"),
-    DRVS = Set("d1", "d2"),
-    OUTPUTS = Set("o1", "o2"),
-    REPLICAS = Set("r1", "r2"),
+    DRVS = Set("d1"),
+    OUTPUTS = Set("o1"),
+    REPLICAS = Set("r1"),
     BUILDERS = Set("w1"),
-    MAT_BUDGET = 2,
-    MAX_EXECS = 4,
+    MAT_BUDGET = 1,
+    MAX_EXECS = 2,
     MAX_GEN = 0,
-    MAX_UPSTREAM_FLIPS = 4,
+    MAX_UPSTREAM_FLIPS = 1,
     MAX_LEGACY = 0,
     ENABLE_FAILOVER = false,
     ENABLE_GC = true,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
-    TENANTS = Set("tA", "tB"),
+    TENANTS = Set("tA"),
     ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
@@ -162,8 +171,7 @@ module matCalibChainResetDropsCarrier {
 /// ~11 steps; the two-drv scope's TLC run is gate-hostile (~9 min to
 /// first violation), so the leg pins at single-drv/single-output
 /// scope per the §1.3/F13 sub-regime ladder. The conservation leg
-/// stays at the full scope above (first violation at the creation
-/// step).
+/// above falsifies at the creation step itself (shallower trace).
 module matCalibChainResetDropsCarrierEx {
   import materializationJob(
     BUILDS = Set("b1", "b2"),

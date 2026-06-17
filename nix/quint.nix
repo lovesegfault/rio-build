@@ -7467,7 +7467,9 @@ rec {
       witness = "pendingUnclaimedImpliesClaimableNode";
     };
     # chain-reset, conservation leg: the stale-reset creation drops
-    # the carrier (merged_bug_257; TLC ~3.8s at full scope).
+    # the carrier (merged_bug_257). TLC at the BUILDS=2/rest-singleton
+    # regime; the pre-shrink 2x scope outgrew the 1800s budget at
+    # 1.18B states (sh-033).
     quint-materialization-calib-chain-reset-carrier = mkQuintWitnessCheck {
       name = "materialization-calib-chain-reset-carrier";
       spec = "calibration/mat-chain-reset-drops-carrier";
