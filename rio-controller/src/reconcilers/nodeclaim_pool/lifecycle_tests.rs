@@ -869,6 +869,42 @@ async fn consolidate_only_prunes_own_reaps_before_detect() {
     );
 }
 
+/// sh-030 c1 — `reconcile_once` is bounded at 3×TICK regardless of
+/// which kube call wedges. Pre-fix red (verbatim): `nodeclaim_pool
+/// tick must be bounded at 3×TICK (sh-030: a stalled kube call ran the
+/// inferred kube-rs Config.timeout — 295 s — and 69 minted-then-
+/// consolidated NodeClaims ICE-masked the cell)` — the unbounded
+/// `reconcile_once` await parked at the hung LIST until the outer 4×TICK
+/// budget elapsed.
+#[tokio::test]
+async fn tick_abandoned_after_3x_tick_on_stalled_kube() {
+    use rio_test_support::kube_mock::{MockApiServer, MockBehavior};
+    let mut lab = Lab::new().await;
+    // MockBehavior::Hang parks the response slot (never dropped — a
+    // drop would surface as a fast connection error, not a hang); the
+    // client's request future pends until its OWN deadline fires —
+    // kube-rs's inferred Config.timeout = 295 s. The sh-030 wedge was
+    // a `nodeclaims.delete()` after the create loop; the property under
+    // test is the bound, not which call wedges.
+    let (client, mock) = MockApiServer::new();
+    mock.set_behavior(MockBehavior::Hang);
+    lab.r.nodeclaims = Api::all(client.clone());
+    lab.r.pools = Api::all(client.clone());
+    lab.r.pods = Api::all(client);
+    tokio::time::pause();
+    // timeout-census: delay — the pre-fix red's outer budget; the
+    // module-level cfg(test) gate lives in mod.rs so the per-file
+    // scanner sees this site. census[gen: rio-controller/tests/timeout_census.txt]
+    let bounded = tokio::time::timeout(4 * TICK, lab.r.tick(at(0))).await;
+    tokio::time::resume();
+    assert!(
+        bounded.is_ok(),
+        "nodeclaim_pool tick must be bounded at 3×TICK (sh-030: a stalled \
+         kube call ran the inferred kube-rs Config.timeout — 295 s — and \
+         69 minted-then-consolidated NodeClaims ICE-masked the cell)"
+    );
+}
+
 /// R3 conservation, vanish arm (r40 bug_020): a tracked claim absent
 /// from live (Karpenter GC) marks its cell; a tracked claim still
 /// in-flight stays tracked.

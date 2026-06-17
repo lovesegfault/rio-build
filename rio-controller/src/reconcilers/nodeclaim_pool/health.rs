@@ -316,17 +316,26 @@ pub fn classify(
 ///   teardown, NOT deliberate consolidation: produces the SAME
 ///   unfulfillable evidence as a vanish — ICE-mask +
 ///   `reaped_total{reason=vanished}`.
-/// - **GcVanish** (absent from `live`, no tombstone): vanished without
-///   ever Registering. Karpenter GC'd it (the controller's own
-///   COMPLETED reaps are removed from `inflight` by the caller before
-///   this runs; its AMBIGUOUS ones carry tombstones) ⇒ the cell is
-///   unfulfillable. ICE-mask + `reaped_total{reason=vanished}`. The
-///   `Launched` axis is unreadable here (the object is gone) — absent
-///   stays capacity-side by construction: the fast (~1s) GC that
-///   evades the terminating observation is exactly the
-///   `Launched=False LaunchFailed` path, while a `Launched=True`
-///   teardown rides a ~60–90s finalizer and is observed terminating
-///   across multiple 10s ticks (the BootFailureTeardown row).
+/// - **GcVanish** (absent from `live`, no tombstone, never observed
+///   Registered): vanished without ever Registering. Karpenter GC'd it
+///   (the controller's own COMPLETED reaps are removed from `inflight`
+///   by the caller before this runs; its AMBIGUOUS ones carry
+///   tombstones) ⇒ the cell is unfulfillable. ICE-mask +
+///   `reaped_total{reason=vanished}`. The `Launched` axis is
+///   unreadable here (the object is gone) — absent stays capacity-side
+///   CONDITIONALLY: the fast (~1s) GC that evades the terminating
+///   observation is the `Launched=False LaunchFailed` path, while a
+///   `Launched=True` teardown rides a ~60–90s finalizer and is
+///   observed terminating across multiple 10s ticks (the
+///   BootFailureTeardown row) — PROVIDED ticks fire at the 10 s
+///   cadence. sh-030 falsified the unconditionality: a 295 s tick (the
+///   inferred kube-rs `Config.timeout` — bounded since at
+///   3×[`TICK`](super::TICK) by
+///   [`super::NodeClaimPoolReconciler::tick`]) let 69 claims Register,
+///   sit empty past Karpenter `consolidateAfter`, and vanish between
+///   ticks; the next fold ICE-masked the cell for what was Karpenter
+///   cleanup, not capacity failure. The `ever_registered` axis splits
+///   that row out (the EmptyConsolidation exit).
 /// - **In-flight (present, not Registered, not terminating)**: KEEP.
 ///   r40 bug_020: dropping on first sighting let a claim observed at
 ///   age ~10s and GC'd at ~13–16s escape every detection path —

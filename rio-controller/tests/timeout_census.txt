@@ -9,6 +9,8 @@ reconcilers/componentscaler/mod.rs:97	delay
 reconcilers/gc_schedule.rs:174	delay
 reconcilers/gc_schedule.rs:215	delay
 reconcilers/mod.rs:63	refusal
+reconcilers/nodeclaim_pool/lifecycle_tests.rs:898	delay
+reconcilers/nodeclaim_pool/mod.rs:1350	delay
 # --- declared (cross-crate) rows below this line are NOT regenerated ---
 # E5: the store envelope family (wave-8 landed) enrolled in the benign
 # delay-only quadrant. Declared, not scanned: the per-crate build

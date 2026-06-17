@@ -1330,8 +1330,33 @@ impl NodeClaimPoolReconciler {
         });
         self.tick_counter = self.tick_counter.wrapping_add(1);
         let started = std::time::Instant::now();
-        if let Err(e) = self.reconcile_once(now).await {
-            warn!(error = %e, "nodeclaim_pool tick failed");
+        // sh-030: bound the tick at 3×TICK. `reconcile_once` awaits five
+        // kube ops with NO per-call timeout (only `admin_call` is
+        // wrapped); kube-rs's inferred `Config.timeout` is ~295 s, so a
+        // hung Karpenter validating-webhook on one delete (or one
+        // `nodeclaims.create`) parked tick 58 for 295 s — its 69 minted
+        // claims sat empty past Karpenter `consolidateAfter`, were GC'd,
+        // and tick 59's `detect_vanished` ICE-masked the cell. 3×TICK
+        // = 30 s caps the publish-to-next-FFD gap an order of magnitude
+        // under the ≥300 s `consolidateAfter` floor; the next tick
+        // re-derives the deficit from a fresh LIST. Creates that landed
+        // before the wedge are in `inflight_created` iff the wedge was
+        // AFTER `cover_deficit` returned (hazard recorded: a wedge
+        // INSIDE the create loop loses tracking for that one window —
+        // those claims surface as `RegisteredHandoff`/KEEP next LIST,
+        // not as `GcVanish`, so no false ICE).
+        // timeout-census: delay — tick abandoned; next tick re-derives
+        // from a fresh LIST. census[gen: rio-controller/tests/timeout_census.txt]
+        match tokio::time::timeout(3 * TICK, self.reconcile_once(now)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(error = %e, "nodeclaim_pool tick failed"),
+            Err(_elapsed) => warn!(
+                tick = self.tick_counter,
+                budget = ?(3 * TICK),
+                "nodeclaim_pool tick exceeded its budget; abandoned (next \
+                 tick re-derives from a fresh LIST; inflight_created \
+                 already extended for any creates that landed)"
+            ),
         }
         metrics::histogram!("rio_controller_nodeclaim_tick_duration_seconds")
             .record(started.elapsed().as_secs_f64());
