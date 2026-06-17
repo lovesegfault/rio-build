@@ -63,24 +63,6 @@ pub(crate) fn header_lines(
         Some(hw) => format!("{system}/{hw}"),
         None => system.to_string(),
     };
-    // live_058-d + merged_bug_004: the law is the VIOLATION CLASS,
-    // total over the input domain — a present NON-ZERO size never
-    // renders as zero at ANY unit — quantifier: census(present_nonzero_never_renders_zero_at_any_unit) — (the live incident's 45-69 MB
-    // raw-stamps read as "no memory assigned" during diagnosis; the
-    // header doc above forbids claiming a precision the banner
-    // doesn't have, and rounding a present value to zero is the
-    // inverse violation — at every rung, not just the GiB one the
-    // incident happened to hit). The unit ladder descends to the
-    // first rung that preserves a non-zero magnitude and bottoms out
-    // at bytes; absent stays "? GiB". Pinned by the
-    // `present_nonzero_never_renders_zero_at_any_unit` property.
-    let fmt_size = |b: Option<u64>| match b {
-        None => "? GiB".to_string(),
-        Some(n) if n >= 1 << 30 => format!("{} GiB", n >> 30),
-        Some(n) if n >= 1 << 20 => format!("{} MiB", n >> 20),
-        Some(n) if n >= 1 << 10 => format!("{} KiB", n >> 10),
-        Some(n) => format!("{n} B"),
-    };
     let cores_str = cores.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
     let now = format_rfc3339_secs(std::time::SystemTime::now());
     vec![
@@ -95,27 +77,84 @@ pub(crate) fn header_lines(
     ]
 }
 
+/// Size formatter shared by the header's `(Nc, mem, disk)` triple and
+/// the footer's `rio: peaks` line.
+///
+/// live_058-d + merged_bug_004: the law is the VIOLATION CLASS, total
+/// over the input domain — a present NON-ZERO size never renders as
+/// zero at ANY unit — quantifier: census(present_nonzero_never_renders_zero_at_any_unit) — (the live incident's 45-69 MB
+/// raw-stamps read as "no memory assigned" during diagnosis; the
+/// header doc above forbids claiming a precision the banner doesn't
+/// have, and rounding a present value to zero is the inverse violation
+/// — at every rung, not just the GiB one the incident happened to
+/// hit). The unit ladder descends to the first rung that preserves a
+/// non-zero magnitude and bottoms out at bytes; absent stays "? GiB".
+/// Pinned by the `present_nonzero_never_renders_zero_at_any_unit`
+/// property.
+fn fmt_size(b: Option<u64>) -> String {
+    match b {
+        None => "? GiB".to_string(),
+        Some(n) if n >= 1 << 30 => format!("{} GiB", n >> 30),
+        Some(n) if n >= 1 << 20 => format!("{} MiB", n >> 20),
+        Some(n) if n >= 1 << 10 => format!("{} KiB", n >> 10),
+        Some(n) => format!("{n} B"),
+    }
+}
+
+/// Resource peaks for the footer's `rio: peaks` line. The same fields
+/// the worker reports in `CompletionReport` (cgroup `memory.peak`,
+/// 1Hz-polled `cpu.stat` peak-cores, prjquota `dqb_curspace` max),
+/// rendered into the log so a human reading the tail sees the build's
+/// own sizing answer without joining against `drv_executions`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct FooterPeaks {
+    /// cgroup `memory.peak` (kernel-tracked tree-wide lifetime max).
+    pub mem_bytes: u64,
+    /// Peak instantaneous CPU (cores-equivalent), 1Hz-polled.
+    pub cpu_cores: f64,
+    /// prjquota `dqb_curspace` running max. `None` = no prjquota.
+    pub disk_bytes: Option<u64>,
+}
+
 /// Render the footer lines written after the build process exits.
 ///
 /// Format:
 ///
 /// ```text
 /// rio: exec     01976e8b-1234-7890-abcd-ef0123456789
+/// rio: peaks    cpu=3.8c mem=2 GiB disk=12 GiB wall=263s
 /// rio: result   failed (PermanentFailure) after 4m23s
 /// ```
 ///
-/// `result` is one of `ok`, `failed (<reason>)`, or `cancelled`.
-/// `footer_result_str` (in `crate::executor`) maps the per-attempt
-/// daemon outcome to `ok`/`failed (<reason>)` — see its doc for why
-/// exit codes aren't available — and `runtime::result::final_footer_result`
-/// overrides to `cancelled` from the assignment's cancel flag
-/// (best-effort: dropped by the scheduler's cancel-path seal before it
-/// reaches the stored log). The `exec` line repeats so a truncated
-/// tail (e.g. Nix's "last 10 lines" failure summary) still includes
-/// the identifier without scrolling back to the header.
-pub(crate) fn footer_lines(exec_id: &str, result: &str, duration: Duration) -> Vec<Vec<u8>> {
+/// `result` is one of `ok`, `failed (<reason>)`, or `cancelled
+/// (sigterm)`. `footer_result_str` (in `crate::executor`) maps the
+/// per-attempt daemon outcome to `ok`/`failed (<reason>)` — see its
+/// doc for why exit codes aren't available — and
+/// `runtime::result::final_footer_result` overrides to `cancelled
+/// (sigterm)` from the assignment's cancel flag (best-effort: dropped
+/// by the scheduler's cancel-path seal before it reaches the stored
+/// log). The `exec` line repeats so a truncated tail (e.g. Nix's
+/// "last 10 lines" failure summary) still includes the identifier
+/// without scrolling back to the header. The `peaks` line precedes
+/// `result` so the same truncated tail keeps the sizing answer too;
+/// footer length flows through `sealed_final_line_count` which is
+/// already `footer.len()`-driven.
+pub(crate) fn footer_lines(
+    exec_id: &str,
+    result: &str,
+    duration: Duration,
+    peaks: FooterPeaks,
+) -> Vec<Vec<u8>> {
     vec![
         format!("rio: exec     {exec_id}").into_bytes(),
+        format!(
+            "rio: peaks    cpu={:.1}c mem={} disk={} wall={}s",
+            peaks.cpu_cores,
+            fmt_size(Some(peaks.mem_bytes)),
+            fmt_size(peaks.disk_bytes),
+            duration.as_secs(),
+        )
+        .into_bytes(),
         format!("rio: result   {result} after {}", format_duration(duration)).into_bytes(),
     ]
 }
@@ -332,9 +371,10 @@ mod tests {
             "01976e8b-test",
             "failed (PermanentFailure)",
             Duration::from_secs(263),
+            FooterPeaks::default(),
         );
         assert!(
-            str::from_utf8(&lines[1])
+            str::from_utf8(&lines[2])
                 .unwrap()
                 .contains("rio: result   failed (PermanentFailure) after 4m23s")
         );
@@ -348,8 +388,58 @@ mod tests {
 
     #[test]
     fn footer_renders_ok() {
-        let lines = footer_lines("01976e8b-test", "ok", Duration::from_secs(45));
-        assert!(str::from_utf8(&lines[1]).unwrap().contains("ok after 45s"));
+        let lines = footer_lines(
+            "01976e8b-test",
+            "ok",
+            Duration::from_secs(45),
+            FooterPeaks::default(),
+        );
+        assert!(str::from_utf8(&lines[2]).unwrap().contains("ok after 45s"));
+    }
+
+    /// sh-038 Tier 1: the footer carries the build's own sizing answer
+    /// (cgroup `memory.peak`, peak-cores, prjquota peak, wall) so a
+    /// human reading Nix's "last 10 lines" failure summary sees it
+    /// without joining against `drv_executions`. Display-only — the
+    /// module doc's "consumers MUST NOT parse" applies.
+    #[test]
+    fn footer_renders_peaks_line() {
+        let lines = footer_lines(
+            "01976e8b-test",
+            "ok",
+            Duration::from_secs(263),
+            FooterPeaks {
+                mem_bytes: 2 << 30,
+                cpu_cores: 3.84,
+                disk_bytes: Some(12 << 30),
+            },
+        );
+        assert_eq!(lines.len(), 3, "exec + peaks + result");
+        let peaks = str::from_utf8(&lines[1]).unwrap();
+        assert!(
+            peaks.starts_with("rio: peaks    "),
+            "footer must contain a `rio: peaks` line: {peaks}"
+        );
+        assert!(peaks.contains("cpu=3.8c"), "peaks: {peaks}");
+        assert!(peaks.contains("mem=2 GiB"), "peaks: {peaks}");
+        assert!(peaks.contains("disk=12 GiB"), "peaks: {peaks}");
+        assert!(peaks.contains("wall=263s"), "peaks: {peaks}");
+        // Absent disk renders the same `?` sentinel as the header.
+        let lines = footer_lines(
+            "x",
+            "ok",
+            Duration::from_secs(1),
+            FooterPeaks {
+                mem_bytes: 69 << 20,
+                cpu_cores: 0.5,
+                disk_bytes: None,
+            },
+        );
+        let peaks = str::from_utf8(&lines[1]).unwrap();
+        assert!(
+            peaks.contains("mem=69 MiB") && peaks.contains("disk=? GiB"),
+            "fmt_size law applies to the footer too: {peaks}"
+        );
     }
 
     #[test]

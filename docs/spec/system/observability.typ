@@ -80,9 +80,12 @@ the user reads a truncated log as the whole thing.
 
 #r("obs.log.worker-header")[
   The worker MUST write `rio: exec`, `rio: builder`, `rio: started` lines as
-  the first lines of every build log, and a `rio: exec` + `rio: result` footer
-  after the build process exits. These lines are display-only and consumers
-  MUST NOT parse them for authoritative state.
+  the first lines of every build log, and a `rio: exec` + `rio: peaks` +
+  `rio: result` footer after the build process exits. The `peaks` line carries
+  the build's own resource peaks (peak cpu cores, cgroup `memory.peak`,
+  prjquota disk peak, wall seconds); `result` is one of `ok`, `failed
+  (<reason>)`, or `cancelled (sigterm)`. These lines are display-only and
+  consumers MUST NOT parse them for authoritative state.
 ]
 
 The header/footer are written into the same untrusted byte stream as build

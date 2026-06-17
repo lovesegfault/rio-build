@@ -270,6 +270,33 @@ pub enum ExecutorError {
 }
 
 impl ExecutorError {
+    /// Discriminant name only — for the banner footer's one-line
+    /// `failed (executor: <variant>)` summary. The full error chain is
+    /// on `CompletionReport.error_msg`; this answers "which lane" at a
+    /// glance without leaking the (possibly long) inner Display.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::Overlay(_) => "Overlay",
+            Self::OverlayTaskPanic(_) => "OverlayTaskPanic",
+            Self::SynthDb(_) => "SynthDb",
+            Self::NixConf(_) => "NixConf",
+            Self::DaemonSpawn(_) => "DaemonSpawn",
+            Self::Handshake(_) => "Handshake",
+            Self::DaemonSetup(_) => "DaemonSetup",
+            Self::BuildFailed(_) => "BuildFailed",
+            Self::InvalidDerivation(_) => "InvalidDerivation",
+            Self::Upload(_) => "Upload",
+            Self::Grpc(_) => "Grpc",
+            Self::MetadataFetch { .. } => "MetadataFetch",
+            Self::Wire(_) => "Wire",
+            Self::Cgroup(_) => "Cgroup",
+            Self::CgroupOom => "CgroupOom",
+            Self::DiskFull => "DiskFull",
+            Self::WrongKind { .. } => "WrongKind",
+            Self::Cancelled => "Cancelled",
+        }
+    }
+
     /// Whether this error indicates a transient daemon-side failure
     /// worth retrying locally before reporting to the scheduler.
     ///
@@ -2053,8 +2080,9 @@ fn footer_result_str(
             other => format!("failed ({other:?})"),
         },
         // The full error string is on `CompletionReport.error_msg`;
-        // the footer is a one-line summary.
-        Err(_) => "failed (executor error)".to_string(),
+        // the footer is a one-line summary — discriminant only so a
+        // human reading the tail knows which lane (sh-038).
+        Err(e) => format!("failed (executor: {})", e.variant_name()),
     }
 }
 
@@ -2421,9 +2449,9 @@ mod tests {
     ///
     /// One assertion per `match` arm in `footer_result_str` — keep this
     /// 1:1 so a reviewer can verify completeness by counting; add a new
-    /// assertion when a new arm is added. The `Err(_)` arm has two
-    /// fixtures (`BuildFailed` and `Wire(UnexpectedEof)`), both
-    /// asserting the catch-all.
+    /// assertion when a new arm is added. The `Err(e)` arm has two
+    /// fixtures (`BuildFailed` and `Wire(UnexpectedEof)`), each pinning
+    /// its discriminant.
     #[test]
     fn footer_result_str_domain() {
         use rio_nix::protocol::build::{BuildResult, BuildStatus};
@@ -2457,9 +2485,9 @@ mod tests {
 
         // Post-cgroup cancel / daemon crash both surface as
         // Wire(Io(UnexpectedEof)) — the per-attempt mapper cannot tell
-        // them apart and renders the catch-all. The runtime's
-        // `final_footer_result` overrides this to "cancelled" at the
-        // once-per-assignment send when the cancel flag is set.
+        // them apart and renders the variant discriminant. The runtime's
+        // `final_footer_result` overrides this to "cancelled (sigterm)"
+        // at the once-per-assignment send when the cancel flag is set.
         assert_eq!(
             footer_result_str(&Err(ExecutorError::Wire(
                 rio_nix::protocol::wire::WireError::Io(std::io::Error::new(
@@ -2467,13 +2495,13 @@ mod tests {
                     "early eof"
                 ))
             ))),
-            "failed (executor error)"
+            "failed (executor: Wire)"
         );
 
-        // Any other executor error → catch-all.
+        // Any other executor error → discriminant.
         assert_eq!(
             footer_result_str(&Err(ExecutorError::BuildFailed("boom".into()))),
-            "failed (executor error)"
+            "failed (executor: BuildFailed)"
         );
     }
 

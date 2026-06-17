@@ -637,6 +637,11 @@ pub async fn spawn_build_task(
                 &assignment.exec_id,
                 footer_result,
                 assignment_start.elapsed(),
+                crate::banner::FooterPeaks {
+                    mem_bytes: peak_memory_bytes,
+                    cpu_cores: peak_cpu_cores,
+                    disk_bytes: peak_disk_bytes,
+                },
             );
             // The footer occupies line numbers [final_line_count,
             // final_line_count + footer.len()); the post-footer
@@ -930,12 +935,16 @@ mod tests {
 
         // What the runtime sends as the footer and reports on the
         // CompletionReport.
-        let footer =
-            crate::banner::footer_lines("exec-id", "ok", std::time::Duration::from_secs(1));
+        let footer = crate::banner::footer_lines(
+            "exec-id",
+            "ok",
+            std::time::Duration::from_secs(1),
+            crate::banner::FooterPeaks::default(),
+        );
         let report_line_count = final_line_count + footer.len() as u64;
         let last_emitted_line_number = final_line_count + footer.len() as u64 - 1;
 
-        assert_eq!(report_line_count, N + 5, "header(3) + body(N) + footer(2)");
+        assert_eq!(report_line_count, N + 6, "header(3) + body(N) + footer(3)");
         assert_eq!(
             report_line_count,
             last_emitted_line_number + 1,

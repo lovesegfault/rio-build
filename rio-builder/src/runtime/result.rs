@@ -334,7 +334,12 @@ pub(super) fn final_footer_result(
 ) -> Option<&str> {
     match last_footer_result {
         None => None,
-        Some(_) if was_cancelled => Some("cancelled"),
+        // sh-038: in pull mode the only producer of `was_cancelled` is
+        // `build_phase_with_abort`'s SIGTERM arm — there is no in-band
+        // scheduler→running-pod cancel RPC, and reaped / spot /
+        // user-cancel / deadline are kubelet SIGTERM, indistinguishable
+        // here. The qualifier is what the worker actually KNOWS.
+        Some(_) if was_cancelled => Some("cancelled (sigterm)"),
         Some(s) => Some(s),
     }
 }
@@ -759,20 +764,24 @@ mod tests {
     /// footer even when cancelled. The `Some("failed ...")+cancelled`
     /// fixture is the exact production shape: a post-cgroup cancel kills
     /// the daemon, the per-attempt mapper renders the resulting
-    /// `Wire(UnexpectedEof)` as `failed (executor error)`, and the override
-    /// corrects it here. The `Some("ok")+cancelled` case pins that the
-    /// override is about the assignment's disposition, not the attempt's
-    /// error-ness.
+    /// `Wire(UnexpectedEof)` as `failed (executor: Wire)`, and the
+    /// override corrects it here. The `Some("ok")+cancelled` case pins
+    /// that the override is about the assignment's disposition, not the
+    /// attempt's error-ness. sh-038: the qualifier is `(sigterm)` — the
+    /// only thing the worker actually knows about why.
     #[test]
     fn final_footer_result_cancel_overrides_variant() {
         // Post-cgroup cancel: daemon ran, was killed, flag set.
         assert_eq!(
-            final_footer_result(Some("failed (executor error)"), true),
-            Some("cancelled")
+            final_footer_result(Some("failed (executor: Wire)"), true),
+            Some("cancelled (sigterm)")
         );
         // Cancel lands after a successful daemon exit but before the
         // footer send: the assignment was cancelled, the footer says so.
-        assert_eq!(final_footer_result(Some("ok"), true), Some("cancelled"));
+        assert_eq!(
+            final_footer_result(Some("ok"), true),
+            Some("cancelled (sigterm)")
+        );
         // Pre-cgroup cancel: no daemon ran → no footer, even though the
         // flag is set. Header-without-footer = "build never started".
         assert_eq!(final_footer_result(None, true), None);
