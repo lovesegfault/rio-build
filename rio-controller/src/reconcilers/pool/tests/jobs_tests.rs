@@ -952,8 +952,11 @@ async fn reap_stale_for_intents_reaps_orphan_pending() {
     assert_eq!(reaped, HashSet::from(["rio-builder-p-ccc".into()]));
     guard.verified().await;
 
-    // Fail-closed: intents=[] → want.is_empty() early-return → no
-    // reap (scheduler error must not nuke every Pending Job).
+    // Fail-closed: intents=[] → the OrphanPending arm's
+    // `!want.is_empty()` conjunct (sh-021 retired the early-return;
+    // the conjunct moved onto the arm) → no reap (scheduler error
+    // must not nuke every Pending Job). None of the four fixtures is
+    // terminal, so the new TerminalAbsent arm does not classify.
     let (client2, verifier2) = ApiServerVerifier::new();
     let ctx2 = super::test_ctx(client2.clone());
     let jobs_api2: Api<Job> = Api::namespaced(client2, "rio");
@@ -970,6 +973,179 @@ async fn reap_stale_for_intents_reaps_orphan_pending() {
     .await;
     assert!(reaped.is_empty(), "scheduler error → no orphan-reap");
     guard.verified().await;
+}
+
+// r[verify ctrl.ephemeral.reap-terminal-absent]
+/// sh-021 (the never-pulled FOD ghost): a `Failed/BackoffLimitExceeded`
+/// Job whose intent has LEFT the demand set — `want=∅` (the fetcher
+/// pool's status→Running emptied it) AND the open Build attempt is
+/// still on the scheduler ledger (`source_node=""` — the controller
+/// never reported a binding). Pre-fix: `want.is_empty()` early-return
+/// at jobs.rs:2766 meant the controller observed the terminal Job
+/// every 10s for ~60 ticks, chose to `continue`, and let k8s
+/// `ttlSecondsAfterFinished` delete it silently — the open attempt sat
+/// for `deadline_secs+slack` (62min) before the establishment sweep
+/// closed it. Post-fix: the `TerminalAbsent` arm rides the
+/// `StaleTerminal` rails (two-tick strike + `AttemptsViewWitness`
+/// fail-closed) and synthesizes `ReportAttemptOutcome{reason=Reaped}`
+/// so the scheduler `close_pull_attempt_uncharged` requeues the drv
+/// in ~30-40s instead of 62min.
+///
+/// The three siblings pin: `want=∅` (the incident shape), non-empty
+/// `want` with the intent absent (the `AbsentFromDemand => continue`
+/// arm at jobs.rs:2800), and `Unknowable` (incomplete page → suspends,
+/// re-judged next tick).
+#[tokio::test]
+async fn sh021_reap_terminal_absent_never_registered_attempt() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    // The open Build attempt as the mint persisted it: exec_id present
+    // (the row is written at mint), `source_node=""` (the controller
+    // never reported a binding — the never-registered shape).
+    mock.open_attempts.write().unwrap().attempts = vec![pull_attempt("ghost", "exec-ghost-1", "")];
+    let existing = vec![failed_job_for_intent("rio-builder-p-ghost", "ghost")];
+    let want = want_complete(&[], "p", ExecutorKind::Builder);
+
+    // live_051(e): the TerminalAbsent arm rides the two-tick strike;
+    // pass 1 records the strike and defers (green BOTH pre- and
+    // post-fix — pre-fix the early-return defers, post-fix the strike
+    // defers — so this assert is NOT the red-first observable).
+    let strike_pass = reap_stale_for_intents(
+        &jobs_api,
+        &existing,
+        &want,
+        &ctx,
+        &crate::fixtures::test_pool("p", ExecutorKind::Builder),
+        "p",
+        &pkey(),
+    )
+    .await;
+    assert!(strike_pass.is_empty(), "strike 1 defers (live_051(e))");
+    crate::reconcilers::pool::jobs::backdate_strikes_for_test(
+        &pkey(),
+        std::time::Duration::from_secs(21),
+    );
+
+    // Pass 2: the reap fires. The verifier sees one BACKGROUND DELETE
+    // (the StaleTerminal rail); the synthesized report lands at the
+    // mock with the seeded exec_id and reason=Reaped.
+    let guard = verifier.run(vec![Scenario {
+        method: http::Method::DELETE,
+        path_contains: "/namespaces/rio/jobs/rio-builder-p-ghost",
+        body_contains: Some(r#""propagationPolicy":"Background""#),
+        status: 200,
+        body_json: serde_json::to_string(&Job::default()).unwrap(),
+    }]);
+    let reaped = reap_stale_for_intents(
+        &jobs_api,
+        &existing,
+        &want,
+        &ctx,
+        &crate::fixtures::test_pool("p", ExecutorKind::Builder),
+        "p",
+        &pkey(),
+    )
+    .await;
+    guard.verified().await;
+    assert_eq!(
+        reaped,
+        HashSet::from(["rio-builder-p-ghost".into()]),
+        "want=∅ early-return must not skip a terminal+absent Job — k8s \
+         TTL deleting it silently leaves the open attempt ghosted for \
+         deadline+slack"
+    );
+    let calls = mock.outcome_calls.read().unwrap();
+    assert_eq!(calls.len(), 1, "one synthesized report: {calls:?}");
+    assert_eq!(calls[0].exec_id, "exec-ghost-1");
+    assert_eq!(calls[0].reason, AttemptTerminalReason::Reaped as i32);
+
+    // Sibling: non-empty `want` with the intent ABSENT (the
+    // jobs.rs:2800 `AbsentFromDemand => continue` arm — the second
+    // chokepoint pre-fix). Pre-fix: the loop ran but skipped at
+    // :2800; post-fix the new arm classifies before the catch-all.
+    let (client2, verifier2) = ApiServerVerifier::new();
+    let (ctx2, mock2, _h2) = ctx_with_mock_admin(client2.clone()).await;
+    let jobs_api2: Api<Job> = Api::namespaced(client2, "rio");
+    mock2.open_attempts.write().unwrap().attempts = vec![pull_attempt("ghost", "exec-ghost-2", "")];
+    let existing2 = vec![failed_job_for_intent("rio-builder-p-ghost", "ghost")];
+    let want2 = want_complete(&[intent_named("other")], "p", ExecutorKind::Builder);
+    let _ = reap_stale_for_intents(
+        &jobs_api2,
+        &existing2,
+        &want2,
+        &ctx2,
+        &crate::fixtures::test_pool("p", ExecutorKind::Builder),
+        "p",
+        &pkey(),
+    )
+    .await;
+    crate::reconcilers::pool::jobs::backdate_strikes_for_test(
+        &pkey(),
+        std::time::Duration::from_secs(21),
+    );
+    let guard2 = verifier2.run(vec![Scenario {
+        method: http::Method::DELETE,
+        path_contains: "/namespaces/rio/jobs/rio-builder-p-ghost",
+        body_contains: Some(r#""propagationPolicy":"Background""#),
+        status: 200,
+        body_json: serde_json::to_string(&Job::default()).unwrap(),
+    }]);
+    let reaped2 = reap_stale_for_intents(
+        &jobs_api2,
+        &existing2,
+        &want2,
+        &ctx2,
+        &crate::fixtures::test_pool("p", ExecutorKind::Builder),
+        "p",
+        &pkey(),
+    )
+    .await;
+    guard2.verified().await;
+    assert_eq!(
+        reaped2,
+        HashSet::from(["rio-builder-p-ghost".into()]),
+        "AbsentFromDemand ∧ terminal must reap (not `continue`)"
+    );
+    assert_eq!(mock2.outcome_calls.read().unwrap().len(), 1);
+
+    // Sibling: INCOMPLETE page → `Unknowable` → the terminal arm
+    // suspends (re-judged next tick). The `failed_poll()` poll-outage
+    // path now also produces `Incomplete` (per q1-orphan-pending: a
+    // GetSpawnIntents failure must not classify every terminal Job as
+    // TerminalAbsent), so this sibling pins both the truncated-page
+    // and the poll-outage suspension via the same letter.
+    let (client3, verifier3) = ApiServerVerifier::new();
+    let (ctx3, _mock3, _h3) = ctx_with_mock_admin(client3.clone()).await;
+    let jobs_api3: Api<Job> = Api::namespaced(client3, "rio");
+    let (page3, _ev3) = PoolDemandView::from_response(
+        rio_proto::types::GetSpawnIntentsResponse {
+            intents: vec![intent_named("other")],
+            truncated: true,
+            ..Default::default()
+        },
+        &["x86_64-linux".to_string()],
+    )
+    .split();
+    let existing3 = vec![failed_job_for_intent("rio-builder-p-ghost", "ghost")];
+    let guard3 = verifier3.run(vec![]);
+    let reaped3 = reap_stale_for_intents(
+        &jobs_api3,
+        &existing3,
+        &WantMap::for_pool(&page3, "p", ExecutorKind::Builder),
+        &ctx3,
+        &crate::fixtures::test_pool("p", ExecutorKind::Builder),
+        "p",
+        &pkey(),
+    )
+    .await;
+    assert!(
+        reaped3.is_empty(),
+        "Unknowable (incomplete page) → terminal-absent suspends; \
+         absence is not negative evidence off-page"
+    );
+    guard3.verified().await;
 }
 
 // ───────────────────────────────────────────────────────────────────

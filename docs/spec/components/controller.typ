@@ -118,6 +118,26 @@ pool-delete cleanup.
   for them.
 ]
 
+#r("ctrl.ephemeral.reap-terminal-absent")[
+  When a terminal Job (`!is_active_job` --- `succeeded > 0` or `failed > 0`)
+  belongs to an intent that is `AbsentFromDemand` on a COMPLETE demand view,
+  the controller MUST background-delete the Job and synthesize
+  `ReportAttemptOutcome{reason=Reaped}` for any open Build attempt the Job's
+  intent owns (matched by `MintedPullIdentity::Build` --- `source_node` is
+  NOT consulted, so a never-registered attempt is findable). The arm rides
+  the same two-tick strike confirmation and `AttemptsViewWitness` fail-closed
+  gate as `StaleTerminal`; on an INCOMPLETE view (truncated page or a failed
+  `GetSpawnIntents`) the arm MUST suspend (`Unknowable`). The controller
+  MUST NOT delegate this case to k8s `ttlSecondsAfterFinished`: a
+  never-pulled `Failed/BackoffLimitExceeded` death never sent a
+  `CompletionReport`, so the open attempt would otherwise sit ghosted until
+  the establishment sweep at `deadline+slack` (sh-021: 62min for 104
+  attempts). The arm keys on `!is_active_job`, not on condition-reason ---
+  it covers `BackoffLimitExceeded`, `PodFailurePolicy`, and any future
+  `Failed/*` shape the named observers (`report_deadline_exceeded_jobs`,
+  `report_terminated_pods`) do not match.
+]
+
 #r("ctrl.ephemeral.reap-orphan-running+6")[
   When a Running Job (`JobStatus.ready > 0`) is older than the orphan grace
   (default 5min) AND no open pull-mode attempt from

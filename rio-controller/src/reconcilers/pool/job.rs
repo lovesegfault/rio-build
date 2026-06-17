@@ -43,10 +43,21 @@ pub(super) const JOB_REQUEUE: Duration = Duration::from_secs(10);
 /// deletes the Job (and its pod, via ownerRef) this many seconds
 /// after it reaches Complete or Failed. 600s (10min): long enough
 /// that an operator debugging a failed build can `kubectl logs` the
-/// pod; short enough that Job churn doesn't accumulate. The SCHEDULER
-/// has already observed the completion (worker sent CompletionReport
-/// before exiting) so there's no rio-side dependency on the Job
-/// sticking around.
+/// pod; short enough that Job churn doesn't accumulate.
+///
+/// Terminal Jobs are reaped+reported by `reap_stale_for_intents`
+/// (the `StaleTerminal` / `TerminalAbsent` arms — sh-021) AHEAD of
+/// this TTL: the controller has ~60 [`JOB_REQUEUE`] ticks to observe
+/// the terminal Job and synthesize `ReportAttemptOutcome
+/// {reason=Reaped}` so the scheduler closes the open attempt. The
+/// TTL is the BACKSTOP for the report-failed / controller-down case
+/// (controller down >600s while a Job dies → the establishment sweep
+/// at `deadline+slack` is the next backstop). The previous claim
+/// here — "the SCHEDULER has already observed the completion (worker
+/// sent CompletionReport before exiting)" — was FALSE for a
+/// never-pulled `Failed/BackoffLimitExceeded` death (sh-021: 104
+/// open attempts ghosted for 62min after a spot-node graceful-
+/// shutdown wave).
 pub(super) const JOB_TTL_SECS: i32 = 600;
 
 /// Pod-template annotation that opts a pod out of karpenter
@@ -240,7 +251,8 @@ pub(super) fn is_pending_job(j: &Job) -> bool {
 /// (both predicates exclude terminating Jobs). The orphan-reap
 /// boundary for `r[ctrl.ephemeral.reap-orphan-running+6]`: only Running
 /// Jobs are candidates (Pending is handled by `reap_excess_pending`;
-/// Complete/Failed by TTL).
+/// Complete/Failed by `reap_stale_for_intents`'s
+/// `StaleTerminal`/`TerminalAbsent` arms ahead of [`JOB_TTL_SECS`]).
 ///
 /// A Job with `deletionTimestamp` set is NOT running — it's already
 /// terminating (foreground-delete in flight). Re-selecting it would

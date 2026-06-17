@@ -893,11 +893,13 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                     pool = %name, error = %e,
                     "spawn-intents poll failed; treating as queued=0, will retry"
                 );
-                // The failed-poll view's vacuous completeness is
-                // documented at `PoolDemandView::failed_poll`:
-                // `scheduler_err` fail-closes every count consumer on
-                // its own conjunct, and the empty want-map's
-                // early-return keeps the membership reap closed.
+                // The failed-poll view is INCOMPLETE (sh-021):
+                // `verdict()` returns `Unknowable` for every name, so
+                // the membership reap suspends per arm (the
+                // TerminalAbsent arm consults the page now that the
+                // empty-want early-return is gone). `scheduler_err`
+                // fail-closes every count consumer on its own
+                // conjunct.
                 let (page, evidence) = PoolDemandView::failed_poll().split();
                 (page, evidence, Some(e.to_string()))
             }
@@ -1554,18 +1556,25 @@ impl PoolDemandView {
         }
     }
 
-    /// The failed-poll view: empty page, vacuously complete, zero
-    /// aggregates. `scheduler_err` already fail-closes every count
-    /// consumer on its own conjunct (`reap_queued_known`'s first
-    /// gate), and the empty want-map's early-return keeps the
-    /// membership reap closed — the vacuous `Complete` here is never
-    /// consulted for a destructive verdict.
+    /// The failed-poll view: empty page, INCOMPLETE coverage, zero
+    /// aggregates. `scheduler_err` fail-closes every count consumer
+    /// on its own conjunct (`reap_queued_known`'s first gate). The
+    /// membership reap consults the coverage letter directly now that
+    /// `reap_stale_for_intents`'s `want.is_empty()` early-return is
+    /// gone (sh-021): a vacuous `Complete` would let a transient
+    /// `GetSpawnIntents` failure classify every terminal Job as
+    /// `TerminalAbsent` (and a genuinely `Wanted ∧ terminal` Job as
+    /// `terminal-absent` instead of `stale-terminal`, skipping the
+    /// bug_028 ladder step). With the transport letter set false the
+    /// page reads `Incomplete` → `verdict()` returns `Unknowable` for
+    /// every name → every membership arm suspends, re-judged next
+    /// tick — the same posture as a truncated page.
     fn failed_poll() -> Self {
         Self {
             page: IntentPage {
                 intents: Vec::new(),
                 lossy: false,
-                transport_complete: true,
+                transport_complete: false,
             },
             ready_upper: 0,
             forecast_upper: 0,
@@ -2506,6 +2515,18 @@ pub(super) enum ReapDisposition {
     /// `reap_stale_for_intents` terminal arm: a finished Job blocking
     /// a still-wanted intent's respawn (NameCollision window).
     StaleTerminal,
+    /// `reap_stale_for_intents` terminal-absent arm (sh-021): a
+    /// finished Job whose intent has LEFT the demand set. Pre-fix the
+    /// arm fell through to k8s `ttlSecondsAfterFinished` on the false
+    /// premise that "the SCHEDULER has already observed the
+    /// completion" — falsified by a never-pulled
+    /// `Failed/BackoffLimitExceeded` death (spot kill before the
+    /// worker registered): the open Build attempt sat ghosted for
+    /// `deadline+slack` (62min). The arm rides the StaleTerminal
+    /// rails (two-tick strike + `AttemptsViewWitness` fail-closed +
+    /// background delete + synthesized `reason=Reaped`); detection
+    /// latency ~30-40s instead of 62min.
+    TerminalAbsent,
     /// `reap_stale_for_intents` selector-drift arm: a Pending Job
     /// whose selector no longer matches the scheduler's re-solve.
     SelectorDrift,
@@ -2531,11 +2552,12 @@ impl ReapDisposition {
     /// variant without extending it fails the length assert against
     /// the exhaustive match below). Test-facing census surface.
     #[cfg(test)]
-    pub(super) const ALL: [Self; 9] = [
+    pub(super) const ALL: [Self; 10] = [
         Self::ExcessPending,
         Self::OrphanPending,
         Self::OrphanSuspended,
         Self::StaleTerminal,
+        Self::TerminalAbsent,
         Self::SelectorDrift,
         Self::OrphanRunning,
         Self::CleanExit,
@@ -2550,6 +2572,7 @@ impl ReapDisposition {
             Self::OrphanPending => "orphan-pending",
             Self::OrphanSuspended => "orphan-suspended",
             Self::StaleTerminal => "stale-terminal",
+            Self::TerminalAbsent => "terminal-absent",
             Self::SelectorDrift => "selector-drift",
             Self::OrphanRunning => "orphan-running",
             Self::CleanExit => "clean-exit",
@@ -2582,19 +2605,17 @@ pub(super) fn note_reap_disposition(pool: &str, d: ReapDisposition) {
 ///
 /// merged_bug_033: "consecutive" is enforced BY VALUE, not by code
 /// position. Every reap pass advances a per-pool tick counter at
-/// FUNCTION ENTRY — an empty-`want` pass (idle pool; the fail-closed
-/// scheduler-error arm that polls as queued=0) IS a tick — and each
-/// strike row carries the tick it was struck. A strike escalates
-/// only when the new tick is ADJACENT to the stamped one
-/// (`last_tick + 1 == tick`); any gap — an empty-want early return,
-/// a pass where the Job did not classify — resets the count to 1, so
-/// every exit path of the reap is correct by construction. The
-/// previous shape (a function-tail `retain` of uids struck this
-/// pass) enforced expiry positionally, and the `want.is_empty()`
-/// early return bypassed it: strikes FROZE across exactly the
-/// scheduler outages the two-tick confirmation absorbs, and the
-/// first post-gap classification reaped on a non-consecutive
-/// "strike 2".
+/// FUNCTION ENTRY and each strike row carries the tick it was struck.
+/// A strike escalates only when the new tick is ADJACENT to the
+/// stamped one (`last_tick + 1 == tick`); any gap — a pass where the
+/// Job did not classify (idle pool, scheduler-error `Unknowable`
+/// suspend) — resets the count to 1, so every exit path of the reap
+/// is correct by construction. The previous shape (a function-tail
+/// `retain` of uids struck this pass) enforced expiry positionally,
+/// and the historical `want.is_empty()` early return (retired by
+/// sh-021) bypassed it: strikes FROZE across exactly the scheduler
+/// outages the two-tick confirmation absorbs, and the first post-gap
+/// classification reaped on a non-consecutive "strike 2".
 ///
 /// Rows untouched past [`STRIKE_PRUNE_HORIZON`] are dropped at pass
 /// entry — a MEMORY bound (deleted pools and long-gone uids would
@@ -2763,9 +2784,20 @@ pub(super) async fn reap_stale_for_intents(
         book.prune_stale(now, STRIKE_PRUNE_HORIZON, |e| e.touched);
         book.begin_tick(key, now)
     };
-    if want.is_empty() {
-        return reaped;
-    }
+    // sh-021: NO `want.is_empty()` early-return — the terminal walk
+    // runs regardless. The early-return existed to fail-close the
+    // OrphanPending arm (foreground-deleting a Pending Job under a
+    // scheduler outage kills in-flight Karpenter provisioning); that
+    // protection is now the per-arm `!want.is_empty()` conjunct on
+    // the OrphanPending guard below. A terminal Job has no
+    // provisioning to lose — deleting it is non-destructive, and the
+    // synthesized close is exec_id-pinned + scheduler-side
+    // idempotent — so the terminal arms (StaleTerminal /
+    // TerminalAbsent) walk on `want=∅` too. The
+    // `AttemptsViewWitness::fetch` fail-closed `break` and the
+    // two-tick strike below are the terminal arms' OWN fail-closed
+    // gates; they do not depend on `want`.
+    //
     // Lazily fetched once per tick, only if a delete is actually about
     // to happen (the synthesize-on-delete input; best-effort).
     // merged_bug_080(2b): the FULL view — the death classification
@@ -2789,13 +2821,33 @@ pub(super) async fn reap_stale_for_intents(
             // would otherwise delete still-live Jobs (losing in-flight
             // Karpenter provisioning) while orphans survive ≥1 extra
             // tick. Running → leave alone (may hold assignment;
-            // `reap_orphan_running` owns it). The `want.is_empty()`
-            // early-return above is the fail-closed gate (scheduler
-            // error → no orphan-reap).
+            // `reap_orphan_running` owns it). The `!want.is_empty()`
+            // conjunct is the fail-closed gate (scheduler error → no
+            // orphan-reap; SelectorDrift is structurally unreachable
+            // on empty want — `Wanted` requires a names hit — so only
+            // OrphanPending carries the conjunct).
             WantVerdict::AbsentFromDemand
-                if is_pending_job(j) && job_older_than(j, REAP_PENDING_GRACE) =>
+                if !want.is_empty()
+                    && is_pending_job(j)
+                    && job_older_than(j, REAP_PENDING_GRACE) =>
             {
                 (DeleteParams::foreground(), ReapDisposition::OrphanPending)
+            }
+            // r[impl ctrl.ephemeral.reap-terminal-absent]
+            // sh-021: terminal ∧ absent — the cell that fell through
+            // to k8s TTL on the false "scheduler already saw it"
+            // premise. Keys on `!is_active_job` (NOT on
+            // condition-reason), so structurally complete over the
+            // terminal alphabet: `BackoffLimitExceeded` (sh-021),
+            // `PodFailurePolicy`, a node-pressure-evicted `Error`, an
+            // image-pull-backoff that lands on `BackoffLimitExceeded`
+            // instead of `DeadlineExceeded`. Background delete +
+            // synthesized `reason=Reaped` exactly as StaleTerminal —
+            // `AttemptOwner::Job.owns()` matches on
+            // `MintedPullIdentity::Build` only (never `source_node`),
+            // so a never-registered open attempt IS findable.
+            WantVerdict::AbsentFromDemand if !is_active_job(j) => {
+                (DeleteParams::background(), ReapDisposition::TerminalAbsent)
             }
             WantVerdict::AbsentFromDemand => continue,
             // r[impl ctrl.pool.demand-completeness]
@@ -2844,7 +2896,9 @@ pub(super) async fn reap_stale_for_intents(
         // (already age-gated by REAP_PENDING_GRACE).
         if matches!(
             disposition,
-            ReapDisposition::StaleTerminal | ReapDisposition::SelectorDrift
+            ReapDisposition::StaleTerminal
+                | ReapDisposition::TerminalAbsent
+                | ReapDisposition::SelectorDrift
         ) {
             let Some(uid) = j.metadata.uid.clone() else {
                 // No uid: cannot key a strike — defer conservatively
@@ -3610,7 +3664,7 @@ mod tests {
         }
         // The exhaustive match in as_label is the census; ALL must
         // cover it (a new variant fails the match first, then here).
-        assert_eq!(ReapDisposition::ALL.len(), 9);
+        assert_eq!(ReapDisposition::ALL.len(), 10);
     }
 
     /// W9-CO, Job-spec face (live_056-b): the minted Job carries the
