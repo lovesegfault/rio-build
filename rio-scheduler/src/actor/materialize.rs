@@ -1612,10 +1612,14 @@ impl DagActor {
             .iter()
             .filter_map(|bid| self.builds.get(bid))
             .find_map(|b| b.tenant_id);
-        // sched.materialize.listing-priority: post-merge callers (the
-        // dispatch-probe partition, housekeeping) HAVE the
-        // critical-path priority at job-create time — 6b already ran.
-        let priority = state.sched.priority;
+        // sched.materialize.listing-priority+2: post-merge callers
+        // (the dispatch-probe partition, housekeeping) HAVE the
+        // critical-path priority + unblocks at job-create time — 6b
+        // already ran. Band-packed via mat_listing_priority.
+        let priority = crate::db::materialization::mat_listing_priority(
+            state.sched.unblocks,
+            state.sched.priority,
+        );
         let serving_generation = self.serving_generation();
         match self
             .db
@@ -1761,10 +1765,14 @@ impl DagActor {
                     hash: h.clone(),
                     db_id,
                     tenant,
-                    // sched.materialize.listing-priority: the
+                    // sched.materialize.listing-priority+2: the
                     // dispatch-probe partition runs post-merge, so 6b
-                    // has set sched.priority — read it directly.
-                    priority: state.sched.priority,
+                    // has set sched.priority + sched.unblocks — read
+                    // them directly. Band-packed via the encoder.
+                    priority: crate::db::materialization::mat_listing_priority(
+                        state.sched.unblocks,
+                        state.sched.priority,
+                    ),
                 })
             })
             .collect();

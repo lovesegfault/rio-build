@@ -8,7 +8,9 @@ use rio_test_support::TestDb;
 use uuid::Uuid;
 
 use super::insert_test_derivation;
-use crate::db::materialization::{FencedJobCreate, NewJobRow};
+use crate::db::materialization::{
+    FencedJobCreate, MAT_UNBLOCKS_BANDS, NewJobRow, mat_listing_priority, unblocks_band,
+};
 use crate::db::{FencedOutcome, SchedulerDb};
 use crate::state::{JobOrigin, JobState};
 
@@ -368,7 +370,7 @@ async fn list_claimable_excludes_terminal_node_jobs() -> anyhow::Result<()> {
 /// listed eighth, so the 2454-wide Queued→Ready promotion fired as a
 /// step function near sub-end instead of overlapping leaf
 /// substitution with build.
-// r[verify sched.materialize.listing-priority]
+// r[verify sched.materialize.listing-priority+2]
 #[tokio::test]
 async fn list_claimable_orders_hub_before_leaves() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -432,6 +434,98 @@ async fn list_claimable_orders_hub_before_leaves() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// sh-027 §1 — the `unblocks`-band head: a hub (rustc-shaped: short
+/// chain below, thousands waiting above — `priority=300, unblocks=
+/// 4000`) MUST list before a chain root (k3s-shaped: full critical
+/// path, two callers — `priority=16200, unblocks=2`). At base
+/// `priority` was the raw critical-path remaining-seconds, so
+/// `ORDER BY j.priority DESC` listed the chain root first — exactly
+/// backwards for unlock-early (the hub's substitution releases the
+/// 4000-wide Queued→Ready promotion; the root's releases two).
+/// `mat_listing_priority` packs `(unblocks_band, priority)` into the
+/// f64 so the same `ORDER BY` is band-first.
+// r[verify sched.materialize.listing-priority+2]
+#[tokio::test]
+async fn mat_listing_orders_hub_before_chain_root() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let hub = insert_test_derivation(&db, "band-hub").await?;
+    let root = insert_test_derivation(&db, "band-root").await?;
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::create_materialization_jobs_in_tx(
+        &mut tx,
+        &[
+            NewJobRow {
+                derivation_id: root,
+                drv_hash: "band-root",
+                tenant_id: None,
+                origin: JobOrigin::CacheOpportunity,
+                priority: mat_listing_priority(2, 16_200.0),
+                carried_realized_paths: None,
+            },
+            NewJobRow {
+                derivation_id: hub,
+                drv_hash: "band-hub",
+                tenant_id: None,
+                origin: JobOrigin::CacheOpportunity,
+                priority: mat_listing_priority(4000, 300.0),
+                carried_realized_paths: None,
+            },
+        ],
+        1,
+    )
+    .await?;
+    tx.commit().await?;
+
+    let listed = db.list_claimable_materialization_jobs(2).await?;
+    assert_eq!(
+        listed[0].drv_hash,
+        "band-hub",
+        "the hub (unblocks=4000 ⇒ band {}, packed {}) must head the listing \
+         ahead of the chain root (unblocks=2 ⇒ band {}, packed {}) — at base \
+         the raw critical-path priority put the root first, exactly backwards \
+         for unlock-early (sh-027 §1)",
+        unblocks_band(4000),
+        mat_listing_priority(4000, 300.0),
+        unblocks_band(2),
+        mat_listing_priority(2, 16_200.0),
+    );
+    assert_eq!(listed[1].drv_hash, "band-root");
+    drop(test_db);
+    Ok(())
+}
+
+/// sh-027 §1 — encoder properties. Band is the high-order component
+/// (`×1e6`) so any band advantage dominates any realistic
+/// critical-path delta; within a band, `priority` orders. The four
+/// thresholds [`MAT_UNBLOCKS_BANDS`] yield bands `0‥=4`; `n=0` is
+/// band 0 (the packed value degenerates to raw `priority` — a
+/// closure root unblocks nothing, so the pre-sh-027 order applies).
+#[test]
+fn mat_listing_priority_band_dominates_then_chain() {
+    // Band ladder: each threshold is its band's floor; one below it
+    // is the band below.
+    for (i, &t) in MAT_UNBLOCKS_BANDS.iter().rev().enumerate() {
+        let b = (i + 1) as u8;
+        assert_eq!(unblocks_band(t), b, "threshold {t} is band {b}'s floor");
+        assert_eq!(unblocks_band(t - 1), b - 1, "{} is band {}", t - 1, b - 1);
+    }
+    assert_eq!(unblocks_band(0), 0);
+    assert_eq!(unblocks_band(u32::MAX), MAT_UNBLOCKS_BANDS.len() as u8);
+    // Band dominates: hub(4000,300) > root(2,16200).
+    assert!(
+        mat_listing_priority(4000, 300.0) > mat_listing_priority(2, 16_200.0),
+        "band-4 hub must outrank band-1 chain root regardless of \
+         critical-path delta"
+    );
+    // Within-band: priority orders.
+    assert!(mat_listing_priority(9, 7200.0) > mat_listing_priority(12, 60.0));
+    assert!(mat_listing_priority(12, 7200.0) > mat_listing_priority(9, 60.0));
+    // Band-0 (nothing depends on me) degenerates to raw priority.
+    assert_eq!(mat_listing_priority(0, 7200.0), 7200.0);
+}
+
 /// sh-025 — `restamp_materialization_job_priorities_fenced` is a
 /// monotone `GREATEST()` ratchet: a re-stamp RAISES a still-pending
 /// job's priority, never lowers it (a later merge that dedups onto a
@@ -441,7 +535,7 @@ async fn list_claimable_orders_hub_before_leaves() -> anyhow::Result<()> {
 /// (`compute_initial` runs at phase 6b, AFTER the merge transaction
 /// commits) and the post-6b re-stamp overwrites — this is the leaf
 /// the hub then heads.
-// r[verify sched.materialize.listing-priority]
+// r[verify sched.materialize.listing-priority+2]
 #[tokio::test]
 async fn restamp_raises_monotone() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;

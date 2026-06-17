@@ -1139,6 +1139,19 @@ pub struct SchedHint {
     /// ancestor-walk. Spawn-intent ranking and the cluster snapshot
     /// sort on this.
     pub priority: f64,
+    /// Direct-dependent count (`dag.parents_count(h)` — graph-local,
+    /// NOT transitive: sh-027 §1 explicitly tabled the O(V·E)
+    /// transitive count; the rustc/stdenv hub case is direct-count).
+    /// Drives the materialization-job listing head only, via
+    /// `db::materialization::mat_listing_priority` which packs
+    /// `(unblocks_band(unblocks), priority)` into the listing
+    /// `priority: f64` column — `priority` (above) STILL drives build
+    /// dispatch (spawn-intent ranking, cluster snapshot). Set by
+    /// `compute_initial`/`full_sweep` step-1; the post-6b re-stamp at
+    /// `actor/merge.rs` reads the live `dag.parents_count` instead
+    /// (this field is the last-sweep value; merge has just added
+    /// edges).
+    pub unblocks: u32,
 }
 
 /// In-memory state for a single derivation node in the global DAG.

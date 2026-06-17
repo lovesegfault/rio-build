@@ -995,6 +995,15 @@ impl DerivationDag {
             .unwrap_or_default()
     }
 
+    /// Direct-dependent count — `parents.get(child).len()` without the
+    /// `Vec<DrvHash>` clone [`Self::get_parents`] pays. Feeds
+    /// [`crate::state::SchedHint::unblocks`] (sh-027 §1): the
+    /// `full_sweep` step-1 reads this once per non-terminal node, so
+    /// the clone is ~14k Vec allocs per tick to read one `usize`.
+    pub fn parents_count(&self, child_hash: &str) -> usize {
+        self.parents.get(child_hash).map_or(0, HashSet::len)
+    }
+
     /// Kahn's topo-sort over `scope`, children-before-parents.
     ///
     /// In-degree of a node = number of its children that are also in

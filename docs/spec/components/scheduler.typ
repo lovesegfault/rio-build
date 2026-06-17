@@ -2117,12 +2117,15 @@ join/leave of `executor_concurrency` members. Machine witness:
 partition, own-slice disjointness/coverage, staleness-bounded steal,
 no-job-unlisted, orphan recovery; convoy and no-steal falsify twins).
 
-#r("sched.materialize.listing-priority")[
+#r("sched.materialize.listing-priority+2")[
   The claimable materialization-job listing MUST order by the creating
-  derivation's critical-path priority (descending) ahead of age, so hub
+  derivation's direct-dependent-count band (descending) and, within a
+  band, by critical-path priority (descending), ahead of age --- hub
   dependencies are claimed before leaf substitutions when both are
   pending; within a priority tie the order MUST be `(created_at,
-  job_id)` (the bug_099 total-order law).
+  job_id)` (the bug_099 total-order law). The band×1e6 + priority
+  packing realises this over the existing `priority: f64` column and
+  `ORDER BY priority DESC` head.
 ]
 The sh-025 cold-ingest finding: every merge-tx job ties on
 `created_at`, `job_id` is `Uuid::now_v7` mint order ≈
@@ -2130,9 +2133,15 @@ The sh-025 cold-ingest finding: every merge-tx job ties on
 so rustc/stdenv landed at an arbitrary head-window position and the
 2454-wide Queued→Ready promotion fired as a step function near sub-end
 instead of overlapping ~70s of leaf substitution with build. The
-priority column (migration 107) is `state.sched.priority` ---
-`est_duration + max(non-terminal child)`, the same critical-path
-remaining-seconds that already drives spawn-intent ranking. The
+priority column (migration 107) is `mat_listing_priority(unblocks,
+sched.priority)` --- `unblocks_band(direct-dependent-count) × 1e6 +
+critical-path remaining-seconds`. sh-027 §1: raw `sched.priority`
+alone is `est_duration + max(non-terminal child)` ---
+longest-chain-BELOW-me, exactly backwards for unlock-early (a
+chain-root k3s with `priority=16200` and two callers outranked rustc
+with `priority=300` and 4000 callers); the band head fixes that
+(hub-first), and `sched.priority` STILL drives spawn-intent ranking
+(unchanged). Direct-count, NOT transitive --- O(V·E) tabled. The
 merge-tx batch inserts at `priority = 0` (`compute_initial` runs at
 phase 6b, AFTER the merge transaction commits) and a single post-6b
 fenced `GREATEST()` re-stamp overwrites; a scheduler crash between

@@ -93,12 +93,14 @@ pub fn compute_initial(
         return;
     }
 
-    // --- Step 1: set est_duration for new nodes ---
+    // --- Step 1: set est_duration + unblocks for new nodes ---
     for hash in newly_inserted {
+        let unblocks = dag.parents_count(hash) as u32;
         if let Some(state) = dag.node_mut(hash) {
             state.sched.est_duration = model_key_for(state, builds)
                 .and_then(|k| sla.ref_estimate(&k))
                 .unwrap_or(DEFAULT_DURATION_SECS);
+            state.sched.unblocks = unblocks;
         }
     }
 
@@ -243,10 +245,12 @@ pub fn full_sweep(dag: &mut DerivationDag, sla: &SlaEstimator, builds: &HashMap<
     // `SlaEstimator::peek_t_min` doc for why the recency bump matters
     // there and not here.
     for hash in &non_terminal {
+        let unblocks = dag.parents_count(hash) as u32;
         if let Some(state) = dag.node_mut(hash) {
             state.sched.est_duration = model_key_for(state, builds)
                 .and_then(|k| sla.peek_t_min(&k))
                 .unwrap_or(DEFAULT_DURATION_SECS);
+            state.sched.unblocks = unblocks;
         }
     }
 

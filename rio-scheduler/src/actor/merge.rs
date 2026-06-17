@@ -714,19 +714,33 @@ impl DagActor {
         );
         phase!("6b-critical-path");
 
-        // r[impl sched.materialize.listing-priority]
+        // r[impl sched.materialize.listing-priority+2]
         // Post-6b priority re-stamp: the merge-tx batch (step 5)
         // inserted at priority=0.0 (compute_initial hadn't run); now
         // each node's sched.priority is set, so one fenced GREATEST()
         // batch ratchets the still-pending rows. Covers dedup-found
         // jobs too (CreatedJob.created == false) so a later merge
-        // raises a shared dep. Log-and-continue on Err: build is
-        // Active+committed; a missed re-stamp degenerates to the
-        // pre-107 (created_at, job_id) order (mirrors the
-        // complete_build precedent above).
+        // raises a shared dep. `unblocks` is read LIVE from
+        // `dag.parents_count` (NOT `n.sched.unblocks`): for a
+        // dedup-found existing node, step-1 wrote `sched.unblocks`
+        // only over `newly_inserted`, but `dag.parents` already
+        // gained this merge's edges — the live count includes them
+        // (sh-007e review s1-inverse-leaf-vs-hub). Log-and-continue
+        // on Err: build is Active+committed; a missed re-stamp
+        // degenerates to the pre-107 (created_at, job_id) order
+        // (mirrors the complete_build precedent above).
         let restamp: Vec<(uuid::Uuid, f64)> = created_jobs
             .iter()
-            .filter_map(|j| Some((j.job_id, self.dag.node(&j.drv_hash)?.sched.priority)))
+            .filter_map(|j| {
+                let n = self.dag.node(&j.drv_hash)?;
+                Some((
+                    j.job_id,
+                    crate::db::materialization::mat_listing_priority(
+                        self.dag.parents_count(&j.drv_hash) as u32,
+                        n.sched.priority,
+                    ),
+                ))
+            })
             .collect();
         if let Err(e) = self
             .db

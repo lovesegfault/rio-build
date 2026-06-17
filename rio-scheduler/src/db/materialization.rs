@@ -84,18 +84,60 @@ impl TryFrom<RawJobRow> for MaterializationJobRow {
     }
 }
 
+/// `unblocks`-band thresholds (sh-027 §1): direct-dependent count
+/// `dag.parents_count(h)` is bucketed into a small ordinal so the
+/// listing priority is a coarse hub-first head with critical-path as
+/// the within-band tiebreak — NOT a strict lexicographic
+/// `(unblocks, priority)` order. A node with 4000 dependents and one
+/// with 250 are equally hub-shaped for unlock-early purposes; banding
+/// stops a 1-unit `unblocks` advantage from dominating an arbitrarily
+/// large critical-path delta. Four thresholds ⇒ bands 0‥=4.
+pub(crate) const MAT_UNBLOCKS_BANDS: [u32; 4] = [200, 40, 8, 1];
+
+/// Band index for `n` direct dependents — see [`MAT_UNBLOCKS_BANDS`].
+/// `0` ⇔ nothing depends on this node (a closure root: materializing
+/// it unblocks nothing); `4` ⇔ ≥200 dependents (rustc/stdenv-shaped).
+#[inline]
+pub(crate) fn unblocks_band(n: u32) -> u8 {
+    MAT_UNBLOCKS_BANDS.iter().filter(|&&t| n >= t).count() as u8
+}
+
+/// Pack `(unblocks_band(unblocks), priority)` into the single
+/// `materialization_jobs.priority: f64` column so the existing
+/// `ORDER BY j.priority DESC` realises hub-band-first, critical-path-
+/// within-band (`sched.materialize.listing-priority+2`). Band is the
+/// high-order component (`×1e6` — 1 e6 s ≈ 11.5 d, comfortably above
+/// any real critical-path remaining-seconds); `priority` is added as
+/// the low-order tiebreak. The `GREATEST()` re-stamp ratchet stays
+/// monotone over the packed encoding: a later merge that grows a
+/// node's dependent set raises its band, and a longer critical path
+/// raises the low-order term — both increase the packed value.
+///
+/// `unblocks` is graph-local (direct dependents only) by design —
+/// sh-027 §1 explicitly tabled the O(V·E) transitive count. The
+/// rustc/stdenv hub case is direct-count; a deep linear chain is
+/// `unblocks=1` everywhere and falls back to critical-path order
+/// (the pre-sh-027 behaviour, which is correct for that shape).
+// r[impl sched.materialize.listing-priority+2]
+#[inline]
+pub(crate) fn mat_listing_priority(unblocks: u32, priority: f64) -> f64 {
+    f64::from(unblocks_band(unblocks)) * 1e6 + priority
+}
+
 /// One job to create (the in-tx batch input).
 pub(crate) struct NewJobRow<'a> {
     pub derivation_id: Uuid,
     pub drv_hash: &'a str,
     pub tenant_id: Option<Uuid>,
     pub origin: JobOrigin,
-    /// Critical-path remaining-seconds (`state.sched.priority`;
-    /// migration 107) — drives the listing's `priority DESC` head
-    /// (`sched.materialize.listing-priority`). The merge-tx build
+    /// `(unblocks_band, critical-path priority)` packed via
+    /// [`mat_listing_priority`] (migration 107) — drives the
+    /// listing's `priority DESC` head
+    /// (`sched.materialize.listing-priority+2`). The merge-tx build
     /// sites pass `0.0`: `compute_initial` runs at phase 6b, AFTER
-    /// the merge transaction commits, so `sched.priority` is unset at
-    /// in-tx job-create time; the post-6b re-stamp overwrites.
+    /// the merge transaction commits, so `sched.{priority,unblocks}`
+    /// are unset at in-tx job-create time; the post-6b re-stamp
+    /// overwrites with the packed value.
     pub priority: f64,
     /// Realized-path carrier (migration 082) — the floating-CA paths
     /// the stale-Completed reset destroyed in memory. `Some` ONLY for
@@ -459,11 +501,12 @@ impl SchedulerDb {
     /// created_at, job_id)` is the total unique key (`job_id` is the
     /// PK); PG serves the LIMIT via index scan over the
     /// `materialization_jobs_pending_priority` partial index
-    /// (migration 108). `priority` is the creating derivation's
-    /// critical-path remaining-seconds (`state.sched.priority`) so hub
+    /// (migration 108). `priority` is `(unblocks_band(n) × 1e6) +
+    /// state.sched.priority` ([`mat_listing_priority`]) so hub
     /// dependencies are claimed before leaf substitutions when both
-    /// are pending; within a priority tie, `(created_at, job_id)`
-    /// preserves FIFO (`sched.materialize.listing-priority`).
+    /// are pending — band-first, critical-path within-band; within a
+    /// priority tie, `(created_at, job_id)` preserves FIFO
+    /// (`sched.materialize.listing-priority+2`).
     ///
     /// live_061 — the node-state predicate: a pending job whose
     /// derivation is TERMINAL is unclaimable by the kernel's own
@@ -481,7 +524,7 @@ impl SchedulerDb {
     /// table). Per-row cost: one PK probe over the ≤`limit` candidate
     /// rows the partial index already bounds.
     // r[impl sched.materialize.claimability-projection+1]
-    // r[impl sched.materialize.listing-priority]
+    // r[impl sched.materialize.listing-priority+2]
     pub(crate) async fn list_claimable_materialization_jobs(
         &self,
         limit: i64,
