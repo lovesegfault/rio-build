@@ -81,6 +81,7 @@ pub fn bump_floor_or_count(
     state: &mut DerivationState,
     reason: TerminationReason,
     ceil: &Ceilings,
+    prov_max_cores: u32,
 ) -> FloorOutcome {
     use TerminationReason as R;
     let floor = &mut state.sched.resource_floor;
@@ -140,22 +141,28 @@ pub fn bump_floor_or_count(
             floor.deadline_secs = f as u32;
             o
         }
+        // r[impl sched.floor.compute-bound-provisionable]
         // sh-012 D4 fourth axis: a corroborated compute-bound
         // executor-variant exit≠0 (`CorroborationWitness::
-        // corroborated_compute_bound` — cpu_util ≥ threshold) doubles
-        // cores. u32 dimension; same widen-narrow shape as deadline.
-        // Cap is `Ceilings.max_cores` (the catalog-derived global), so
-        // the cast cannot truncate.
-        R::ComputeBound => {
-            let mut f = u64::from(floor.cores);
-            let o = bump_dim(
-                &mut f,
-                u64::from(last.map_or(0, |i| i.cores)),
-                ceil.max_cores as u64,
-            );
-            floor.cores = f as u32;
-            o
-        }
+        // corroborated_compute_bound` — cpu_util ≥ threshold) jumps
+        // cores to the PARTITION-AWARE provisionable max. sh-031b: the
+        // ×2 ladder against the catalog-absolute `Ceilings.max_cores`
+        // promoted to 191 while the only 192c classes were ICE-masked
+        // (or feature-partitioned away), so `solve_intent_for` found
+        // no candidate ≥191 and the drv requeued forever. ComputeBound
+        // has no threshold semantics (unlike OOM/DiskFull/Timeout
+        // where ×2 finds the minimum sufficient rung) — the only
+        // useful probe is the largest provisionable shape, then poison
+        // (`PoisonReason::ComputeBoundAtCap`) on the next saturated
+        // attempt. The mem/disk/deadline arms keep ×2 against
+        // `Ceilings`: they have a well-defined "ask the operator for a
+        // bigger box" remediation and at-cap routes through the
+        // generic `InfraBudget` lane.
+        R::ComputeBound => bump_cores_to_provisionable(
+            &mut floor.cores,
+            last.map_or(0, |i| i.cores),
+            prov_max_cores,
+        ),
         // Non-resource reasons (pod-kill, node failure, expected
         // one-shot exit, unclassified) are not sizing signals.
         R::EvictedOther | R::Completed | R::Error | R::Unknown => FloorOutcome::default(),
@@ -558,14 +565,31 @@ impl ClampedFloor {
     /// so a consumer holding a `ClampedFloor` holds clamped values by
     /// type (the read-consume sites take this projection, never the
     /// raw floor; the census in sla_contract.rs pins the membership).
-    pub(super) fn of(floor: &crate::state::ResourceFloor, ceil: &Ceilings) -> Self {
+    ///
+    /// sh-031b: `prov_max_cores` is the partition-aware provisionable
+    /// cores cap ([`crate::sla::config::SlaConfig::
+    /// provisionable_max_cores`] — feature/arch-routed AND
+    /// non-ICE-exhausted). The cores projection grounds there, not at
+    /// the catalog-absolute `ceil.max_cores`: a stale floor above the
+    /// drv's own routable max emptied `h_all_filter`'s candidate set
+    /// (the floor feeds `eff_min`) and the drv requeued forever.
+    /// `prov_max_cores` is time-varying (ICE masks open/close) and
+    /// read at consumption time, so a mask re-opening between bump and
+    /// solve re-admits the larger class. mem/disk stay at the
+    /// catalog-absolute `Ceilings` (memory/disk ICE-masking is
+    /// class-orthogonal).
+    pub(super) fn of(
+        floor: &crate::state::ResourceFloor,
+        ceil: &Ceilings,
+        prov_max_cores: u32,
+    ) -> Self {
         Self {
             // merged_bug_016: the mem floor grounds at the SOLVE-domain
             // cap (`mem_solve_cap`) — a floor at the raw global renders
             // an unhostable `ceiling + pad` container downstream.
             mem_bytes: floor.mem_bytes.min(mem_solve_cap(ceil)),
             disk_bytes: floor.disk_bytes.min(ceil.max_disk),
-            cores: floor.cores.min(ceil.max_cores as u32),
+            cores: floor.cores.min(prov_max_cores),
         }
     }
 }
@@ -586,6 +610,13 @@ pub(super) fn clamp_floor_to_live(f: &mut crate::state::ResourceFloor, ceil: &Ce
     f.mem_bytes = f.mem_bytes.min(mem_solve_cap(ceil));
     f.disk_bytes = f.disk_bytes.min(ceil.max_disk);
     f.deadline_secs = f.deadline_secs.min(DEADLINE_CAP_SECS);
+    // sh-031b: the hydrate seam keeps the COARSE catalog-absolute
+    // cores cap (`ceil.max_cores`). The partition-aware provisionable
+    // cap is per-drv (feat/arch) AND time-varying (ICE), so it
+    // belongs at the read-time [`ClampedFloor::of`] projection — every
+    // dispatch consumer reads through that, so the law is total. A
+    // hydrate-time partition clamp would freeze a transient ICE mask
+    // into the in-memory floor.
     f.cores = f.cores.min(ceil.max_cores as u32);
 }
 
@@ -623,6 +654,50 @@ fn bump_dim(floor: &mut u64, last: u64, cap: u64) -> FloorOutcome {
         *floor = next;
         FloorOutcome {
             promoted,
+            at_cap: false,
+        }
+    }
+}
+
+// r[impl sched.floor.compute-bound-provisionable]
+/// sh-031b: the cores-axis bump — JUMP straight to `prov_max` instead
+/// of [`bump_dim`]'s ×2 ladder. ComputeBound (a corroborated
+/// `cpu_util ≥ threshold` while running) has no threshold semantics:
+/// the build saturated its assigned cores, so the only useful next
+/// probe is the largest provisionable shape. If THAT saturates too,
+/// `at_cap` poisons `ComputeBoundAtCap` — there is nothing larger to
+/// try and "shrink the regime" is the only remediation.
+///
+/// `base = max(floor, last)` mirrors [`bump_dim`]: tests the
+/// DISPATCHED shape (live_040), so a stale floor or a clamped-at-cap
+/// `last_intent` reads as already-at-cap.
+///
+/// `prov_max == 0` (the routed partition is empty or fully
+/// ICE-exhausted) is NOT compute-bound-at-cap — it's "nothing
+/// provisionable at all", which the existing unschedulable / fleet
+/// disclosure handles. Return the no-op `{false, false}` so the
+/// caller's generic budget bounds it without a misleading
+/// `ComputeBoundAtCap` diagnostic naming `0c`.
+fn bump_cores_to_provisionable(floor: &mut u32, last: u32, prov_max: u32) -> FloorOutcome {
+    if prov_max == 0 {
+        return FloorOutcome::default();
+    }
+    let base = (*floor).max(last);
+    if base >= prov_max {
+        // The at-cap heal: a stale floor above the live provisionable
+        // max heals DOWN so the M_044 persist (a GREATEST ratchet —
+        // the row stays high) and the in-memory state diverge in the
+        // SAFE direction; the read-time [`ClampedFloor::of`]
+        // projection covers the durable row.
+        *floor = prov_max;
+        FloorOutcome {
+            promoted: false,
+            at_cap: true,
+        }
+    } else {
+        *floor = prov_max;
+        FloorOutcome {
+            promoted: true,
             at_cap: false,
         }
     }
@@ -750,6 +825,11 @@ mod tests {
         max_disk: 200 << 30,
         default_disk: 20 << 30,
     };
+    /// sh-031b: the cores axis caps at the partition-aware
+    /// provisionable max, threaded as the 4th arg. The mem/disk/
+    /// deadline arms ignore it; for those tests this is just
+    /// `CEIL.max_cores` (no feat/arch/ICE context at the unit level).
+    const PROV_MAX: u32 = CEIL.max_cores as u32;
 
     fn st() -> DerivationState {
         let row = crate::db::RecoveryDerivationRow::test_default("floor-t", "x86_64-linux");
@@ -769,12 +849,12 @@ mod tests {
     fn oom_doubles_from_est_then_floor() {
         let mut s = st();
         s.sched.last_intent = Some(intent(4 << 30, 0, 0));
-        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL);
+        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL, PROV_MAX);
         assert!(o.promoted && !o.at_cap);
         assert_eq!(s.sched.resource_floor.mem_bytes, 8 << 30);
         assert_eq!(s.retry.infra_count, 0);
         // Second bump: floor (8) > est (4) → base=8 → 16.
-        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL);
+        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL, PROV_MAX);
         assert!(o.promoted && !o.at_cap);
         assert_eq!(s.sched.resource_floor.mem_bytes, 16 << 30);
     }
@@ -787,7 +867,7 @@ mod tests {
         // the at-cap dispatch renders a hostable container.
         let mut s = st();
         s.sched.resource_floor.mem_bytes = mem_solve_cap(&CEIL);
-        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL);
+        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL, PROV_MAX);
         assert!(!o.promoted && o.at_cap);
         // Helper does NOT mutate retry counters; caller owns that.
         assert_eq!(s.retry.infra_count, 0);
@@ -798,12 +878,12 @@ mod tests {
     fn deadline_uses_24h_cap() {
         let mut s = st();
         s.sched.last_intent = Some(intent(0, 0, 3600));
-        let o = bump_floor_or_count(&mut s, TerminationReason::DeadlineExceeded, &CEIL);
+        let o = bump_floor_or_count(&mut s, TerminationReason::DeadlineExceeded, &CEIL, PROV_MAX);
         assert!(o.promoted && !o.at_cap);
         assert_eq!(s.sched.resource_floor.deadline_secs, 7200);
         // At cap: at_cap=true, no counter mutation.
         s.sched.resource_floor.deadline_secs = DEADLINE_CAP_SECS;
-        let o = bump_floor_or_count(&mut s, TerminationReason::DeadlineExceeded, &CEIL);
+        let o = bump_floor_or_count(&mut s, TerminationReason::DeadlineExceeded, &CEIL, PROV_MAX);
         assert!(!o.promoted && o.at_cap);
         assert_eq!(s.retry.timeout_count, 0, "helper never mutates counters");
         assert_eq!(s.retry.infra_count, 0);
@@ -822,7 +902,7 @@ mod tests {
         // the floor catch-up lands there too (a raw-global floor
         // would render an unhostable `global + pad` container).
         s.sched.last_intent = Some(intent(mem_solve_cap(&CEIL), 0, 0));
-        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL);
+        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL, PROV_MAX);
         assert!(
             !o.promoted && o.at_cap,
             "dispatched at ceiling ⇒ no growth possible; got {o:?}"
@@ -838,7 +918,12 @@ mod tests {
     fn last_intent_at_ceiling_is_at_cap_not_promoted_disk() {
         let mut s = st();
         s.sched.last_intent = Some(intent(0, CEIL.max_disk, 0));
-        let o = bump_floor_or_count(&mut s, TerminationReason::EvictedDiskPressure, &CEIL);
+        let o = bump_floor_or_count(
+            &mut s,
+            TerminationReason::EvictedDiskPressure,
+            &CEIL,
+            PROV_MAX,
+        );
         assert!(!o.promoted && o.at_cap, "got {o:?}");
         assert_eq!(s.sched.resource_floor.disk_bytes, CEIL.max_disk);
     }
@@ -847,7 +932,7 @@ mod tests {
     fn last_intent_at_ceiling_is_at_cap_not_promoted_deadline() {
         let mut s = st();
         s.sched.last_intent = Some(intent(0, 0, DEADLINE_CAP_SECS));
-        let o = bump_floor_or_count(&mut s, TerminationReason::DeadlineExceeded, &CEIL);
+        let o = bump_floor_or_count(&mut s, TerminationReason::DeadlineExceeded, &CEIL, PROV_MAX);
         assert!(!o.promoted && o.at_cap, "got {o:?}");
         assert_eq!(s.sched.resource_floor.deadline_secs, DEADLINE_CAP_SECS);
     }
@@ -864,7 +949,7 @@ mod tests {
         // mint stamps last_intent, so every post-mint OOM doubles —
         // see oom_floor_doubles_from_minted_intent.)
         let mut s = st();
-        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL);
+        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL, PROV_MAX);
         assert!(!o.promoted && !o.at_cap);
         assert_eq!(s.sched.resource_floor.mem_bytes, 0);
     }
@@ -919,7 +1004,7 @@ mod tests {
                 max_disk: cap,
                 default_disk: 1,
             };
-            let p = ClampedFloor::of(&f, &ceil);
+            let p = ClampedFloor::of(&f, &ceil, ceil.max_cores as u32);
             assert_eq!(
                 p.mem_bytes, want_mem,
                 "mem projection of {input} at cap {cap}"
@@ -963,7 +1048,7 @@ mod tests {
     fn stale_floor_above_live_cap_heals_down_via_at_cap_arm() {
         let mut s = st();
         s.sched.resource_floor.mem_bytes = CEIL.max_mem * 4; // 383-era row
-        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL);
+        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL, PROV_MAX);
         assert!(!o.promoted && o.at_cap);
         assert_eq!(
             s.sched.resource_floor.mem_bytes,
@@ -997,7 +1082,7 @@ mod tests {
         s.sched.last_intent = Some(intent(1 << 30, 0, 0));
         let mut steps = 0u32;
         loop {
-            let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL);
+            let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL, PROV_MAX);
             steps += 1;
             // Every dispatch the next attempt would mint (>= the
             // floor) renders a hostable container — the exit edge's
@@ -1094,26 +1179,67 @@ mod tests {
         );
     }
 
+    /// sh-031b: ComputeBound jumps to the partition-aware provisionable
+    /// max (NOT ×2), then poisons at_cap on the next saturated attempt.
+    /// RED at base (×2 ladder against `Ceilings.max_cores`): first bump
+    /// from `last=4` set `floor.cores=8` and the at-cap arm read
+    /// `ceil.max_cores=64`, never the partition's 48 — a kvm drv whose
+    /// only routable class tops out at 48 jumped past it and requeued
+    /// forever.
     #[test]
-    fn compute_bound_doubles_from_intent_then_floor() {
+    fn compute_bound_jumps_to_provisionable_max_then_at_cap() {
         let mut s = st();
         s.sched.last_intent = Some(crate::state::SolvedIntent {
             cores: 4,
             deadline_secs: 600,
             ..Default::default()
         });
-        let o = bump_floor_or_count(&mut s, TerminationReason::ComputeBound, &CEIL);
+        // Partition-aware prov_max < catalog-absolute (48 < 64): the
+        // kvm→metal-only shape — `hi-*` (96c, featureless) is invisible
+        // to a kvm drv via the ∅-guard, so prov_max is the metal class
+        // ceiling.
+        let prov_max = 48;
+        let o = bump_floor_or_count(&mut s, TerminationReason::ComputeBound, &CEIL, prov_max);
         assert!(o.promoted && !o.at_cap);
-        assert_eq!(s.sched.resource_floor.cores, 8);
-        // Second bump: floor (8) > intent (4) → base=8 → 16.
-        let o = bump_floor_or_count(&mut s, TerminationReason::ComputeBound, &CEIL);
-        assert!(o.promoted && !o.at_cap);
-        assert_eq!(s.sched.resource_floor.cores, 16);
-        // At cap: max_cores=64.
-        s.sched.resource_floor.cores = CEIL.max_cores as u32;
-        let o = bump_floor_or_count(&mut s, TerminationReason::ComputeBound, &CEIL);
+        assert_eq!(
+            s.sched.resource_floor.cores, prov_max,
+            "first corroborated ComputeBound jumps straight to the \
+             partition's provisionable max (NOT ×2=8)"
+        );
+        // Second bump at prov_max: at_cap, no growth — the kernel's
+        // ExecutorVariant fold poisons ComputeBoundAtCap on this row.
+        let o = bump_floor_or_count(&mut s, TerminationReason::ComputeBound, &CEIL, prov_max);
         assert!(!o.promoted && o.at_cap);
-        assert_eq!(s.sched.resource_floor.cores, CEIL.max_cores as u32);
+        assert_eq!(s.sched.resource_floor.cores, prov_max);
+        // ICE re-opens (or a larger class joins the partition):
+        // prov_max grows past base → promotes again.
+        let o = bump_floor_or_count(&mut s, TerminationReason::ComputeBound, &CEIL, 96);
+        assert!(o.promoted && !o.at_cap);
+        assert_eq!(s.sched.resource_floor.cores, 96);
+        // prov_max=0 (partition empty / fully ICE-exhausted): NOT
+        // at_cap — falls through to the no-op so the unschedulable /
+        // fleet disclosure handles it without a misleading "0c"
+        // ComputeBoundAtCap diagnostic.
+        let o = bump_floor_or_count(&mut s, TerminationReason::ComputeBound, &CEIL, 0);
+        assert!(!o.promoted && !o.at_cap);
+    }
+
+    /// sh-031b: a stale `floor.cores` ABOVE the live provisionable max
+    /// (the sh-031b symptom: 191 against a 96-core provisionable
+    /// partition) takes the at-cap arm and heals DOWN — the in-memory
+    /// floor lands at prov_max so the next [`ClampedFloor::of`] read
+    /// matches; the durable row stays high (M_044 GREATEST ratchet).
+    #[test]
+    fn compute_bound_stale_floor_above_prov_max_heals_at_cap() {
+        let mut s = st();
+        s.sched.resource_floor.cores = 191;
+        s.sched.last_intent = Some(crate::state::SolvedIntent {
+            cores: 96,
+            ..Default::default()
+        });
+        let o = bump_floor_or_count(&mut s, TerminationReason::ComputeBound, &CEIL, 96);
+        assert!(!o.promoted && o.at_cap);
+        assert_eq!(s.sched.resource_floor.cores, 96);
     }
 
     #[test]
@@ -1126,7 +1252,7 @@ mod tests {
             TerminationReason::EvictedOther,
             TerminationReason::Unknown,
         ] {
-            let o = bump_floor_or_count(&mut s, r, &CEIL);
+            let o = bump_floor_or_count(&mut s, r, &CEIL, PROV_MAX);
             assert!(!o.promoted && !o.at_cap);
         }
         assert_eq!(s.sched.resource_floor, Default::default());

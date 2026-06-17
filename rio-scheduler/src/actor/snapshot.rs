@@ -2517,6 +2517,22 @@ impl DagActor {
         // so HashMap iteration order would otherwise leak into the
         // "pure function of drv_hash" contract.
         let want_arch = rio_common::k8s::system_to_k8s_arch(&state.system);
+        // r[impl sched.floor.compute-bound-provisionable]
+        // sh-031b: the partition-aware provisionable cores cap — the
+        // largest `class_ceilings(h).0` over the SAME (feat, arch,
+        // ¬ICE-exhausted) partition `h_all_filter` admits below.
+        // Threaded into every `ClampedFloor::of` cores projection in
+        // this fn AND composed into `eff_min` so a `floor.cores` above
+        // the partition's max can never empty `h_all`. Time-varying
+        // (read fresh per solve, so an ICE re-open between bump and
+        // dispatch re-admits the larger class).
+        let prov_max = self.sla_config.provisionable_max_cores(
+            &feat,
+            want_arch,
+            cost.catalog_ceilings(),
+            cost.resolved_global(),
+            &self.ice,
+        );
         // r[impl sched.sla.soft-feature-min-cores]
         // sh-008: bias the candidate set by the soft-feature min_cores
         // hint. Reads `class_ceilings` (catalog ∩ cfg ∩ global) — never
@@ -2545,9 +2561,23 @@ impl DagActor {
                 .map(|(h, _)| h.clone())
                 .collect()
         };
-        let mut h_all = h_all_filter(soft_min);
+        // sh-031b: compose the cores floor into the min_cores bias.
+        // `floor.cores` is grounded at `prov_max` via the read-time
+        // projection, so `eff_min ≤ prov_max` and the partition's
+        // largest unmasked class always survives the filter — `h_all`
+        // can only empty when the routing axes alone admit nothing OR
+        // `soft_min > prov_max`. A floor above prov_max (stale persist
+        // from a larger old catalog / mask state) is invisible here:
+        // the bias never under-filters past what is actually
+        // provisionable.
+        let floor_cores = state.sched.resource_floor.cores.min(prov_max);
+        let eff_min = soft_min
+            .into_iter()
+            .chain((floor_cores > 0).then_some(floor_cores))
+            .max();
+        let mut h_all = h_all_filter(eff_min);
         // sh-008 (s2-ice-exhaustion-bias-becomes-constraint): bias not
-        // constraint — `soft_min` must not empty the candidate set.
+        // constraint — `eff_min` must not empty the candidate set.
         // When the post-min_cores filter is empty AND the unbiased
         // partition was non-empty (i.e. the routing axes alone admit at
         // least one class), degrade to the unbiased set so the drv
@@ -2555,16 +2585,17 @@ impl DagActor {
         // `validate_shape`; this catches min_cores > every class's
         // catalog ceiling (no real instance that large in this
         // deployment) — disclose-don't-wedge.
-        if let Some(m) = soft_min
+        if let Some(m) = eff_min
             && h_all.is_empty()
         {
             let unbiased = h_all_filter(None);
             if !unbiased.is_empty() {
                 tracing::debug!(
-                    soft_min = m,
+                    eff_min = m,
                     soft_features = ?state.soft_features(),
-                    "soft-feature min_cores degraded — no hwClass hosts \
-                     ≥ min_cores; using the unbiased candidate set"
+                    floor_cores,
+                    "min_cores bias degraded — no hwClass hosts \
+                     ≥ eff_min; using the unbiased candidate set"
                 );
                 h_all = unbiased;
             }
@@ -2975,8 +3006,11 @@ impl DagActor {
                 // stale-demand walk and the shared disclosure fold —
                 // the emission is then CLASSIFIED exactly as a no-memo
                 // one would be.
-                let fclamped =
-                    super::floor::ClampedFloor::of(&state.sched.resource_floor, &self.sla_ceilings);
+                let fclamped = super::floor::ClampedFloor::of(
+                    &state.sched.resource_floor,
+                    &self.sla_ceilings,
+                    prov_max,
+                );
                 let eff_cores = memo
                     .a
                     .c_star
@@ -3118,8 +3152,11 @@ impl DagActor {
                 // cores and succeeds). The shared chokepoint clamp at
                 // the end of `solve_intent_for` re-applies the same
                 // bounds — this pre-clamp is idempotent under it.
-                let fclamped =
-                    super::floor::ClampedFloor::of(&state.sched.resource_floor, &self.sla_ceilings);
+                let fclamped = super::floor::ClampedFloor::of(
+                    &state.sched.resource_floor,
+                    &self.sla_ceilings,
+                    prov_max,
+                );
                 let c = c
                     .max(fclamped.cores)
                     .min(self.sla_ceilings.max_cores as u32)
@@ -3195,7 +3232,7 @@ impl DagActor {
         // reach this chokepoint as `max(solved, floor.cores)`; neither
         // sees the other.
         let floor = &state.sched.resource_floor;
-        let fclamped = super::floor::ClampedFloor::of(floor, &self.sla_ceilings);
+        let fclamped = super::floor::ClampedFloor::of(floor, &self.sla_ceilings, prov_max);
         let cores = cores
             .max(fclamped.cores)
             .min(self.sla_ceilings.max_cores as u32)
@@ -3441,9 +3478,20 @@ impl DagActor {
         // caller's pre-clamp, drove `reference_hw_class_for_system` to
         // None, and fed the silent empty-cells channel. The clamped
         // projection makes the bypass max ≤ the live global by type.
+        let prov_max = self.sla_config.provisionable_max_cores(
+            &feat,
+            rio_common::k8s::system_to_k8s_arch(&state.system),
+            cost.catalog_ceilings(),
+            cost.resolved_global(),
+            &self.ice,
+        );
         let mem = mem.max(
-            super::floor::ClampedFloor::of(&state.sched.resource_floor, &self.sla_ceilings)
-                .mem_bytes,
+            super::floor::ClampedFloor::of(
+                &state.sched.resource_floor,
+                &self.sla_ceilings,
+                prov_max,
+            )
+            .mem_bytes,
         );
         // mb_053(a) / V-5: `--capacity` on the bypass path. The
         // `Some(memo)` arm filters `cells` to `cap` post-memo, but ANY
@@ -3776,8 +3824,14 @@ impl DagActor {
         // padded gates refuse — the StaleSolve funnel of the dead
         // band). A best class below the container floor hosts
         // nothing: Unhostable, typed.
-        let fclamped =
-            super::floor::ClampedFloor::of(&state.sched.resource_floor, &self.sla_ceilings);
+        let prov_max = self
+            .sla_config
+            .provisionable_max_cores(feat, arch, catalog, global, &self.ice);
+        let fclamped = super::floor::ClampedFloor::of(
+            &state.sched.resource_floor,
+            &self.sla_ceilings,
+            prov_max,
+        );
         let unhostable = CellEmission::Unhostable {
             demand: (cores, mem),
             best_class: Some((best_h.to_owned(), (bcc, bcm))),

@@ -6811,13 +6811,16 @@ async fn corroborated_slow_build_timeout_still_heals_the_deadline_floor() -> Tes
 /// **sh-012 D4 cores axis (S1b red-first)** — *proposition: an
 /// `ExecutorVariantFailure` whose attempt's measured cpu utilization
 /// corroborates compute-bound (`cpu_seconds_total / (elapsed_wall ×
-/// assigned_cores) ≥ threshold`) doubles `floor.cores` from the
-/// assigned shape; the next dispatch is at least the doubled cores.*
-/// RED at base: `ResourceFloor.cores` does not exist.
+/// assigned_cores) ≥ threshold`) jumps `floor.cores` to the
+/// partition-aware provisionable max; the next dispatch is at least
+/// that.* RED at base: `ResourceFloor.cores` does not exist. sh-031b
+/// changed the ladder from ×2 to jump-to-max — ComputeBound has no
+/// threshold semantics, so the only useful next probe is the largest
+/// provisionable shape.
 // r[verify sched.sla.reactive-floor+5]
 // r[verify sched.retry.executor-variant-threshold]
 #[tokio::test]
-async fn e3a_compute_bound_doubles_floor_cores() -> TestResult {
+async fn e3a_compute_bound_jumps_floor_cores_to_provisionable_max() -> TestResult {
     let recorder = CountingRecorder::default();
     let _guard = metrics::set_default_local_recorder(&recorder);
     let (_db, handle, _task) = setup().await;
@@ -6854,10 +6857,14 @@ async fn e3a_compute_bound_doubles_floor_cores() -> TestResult {
     barrier(&handle).await;
 
     let s = expect_drv(&handle, drv).await;
+    // sh-031b: the bump jumps straight to the partition's
+    // provisionable max (the test fixture's hwClass set tops out at
+    // 16c via `SlaConfig::test_default`); previously ×2 from the
+    // assigned 4 → 8.
     assert_eq!(
-        s.sched.resource_floor.cores, 8,
-        "corroborated cpu_util=0.95: floor.cores doubles from the \
-         assigned 4 → 8"
+        s.sched.resource_floor.cores, 16,
+        "corroborated cpu_util=0.95: floor.cores jumps to the \
+         partition-aware provisionable max"
     );
     assert_eq!(
         s.status,

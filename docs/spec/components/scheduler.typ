@@ -1199,6 +1199,21 @@ no-followups directive forbids.
   hint never empties the candidate set.
 ]
 
+#r("sched.floor.compute-bound-provisionable")[
+  A `ComputeBound` `resource_floor.cores` promotion MUST cap at the
+  partition-aware provisionable maximum --- the largest
+  `class_ceilings(h).cores` over `{h : class_routes(h, arch, features)
+  ∧ ¬ICE-exhausted(h)}` --- and MUST jump straight to that cap (not
+  ×2). The `ClampedFloor` cores projection MUST ground at the same
+  cap, and the SLA candidate-set min-cores bias MUST compose
+  `floor.cores` with `soft_min` so the post-floor partition is never
+  empty. A subsequent corroborated compute-bound failure at the
+  provisionable cap MUST poison `ComputeBoundAtCap` immediately
+  (first-observation; no distinct-executor threshold). sh-031b: the
+  catalog-absolute cap promoted past every routable/unmasked class
+  and the drv requeued forever.
+]
+
 #r("sched.retry.promotion-exempt+3")[
   Any failure path that bumps `resource_floor` (#rref("sched.sla.reactive-floor"))
   and returns `promoted=true` MUST NOT increment `retry_count` and MUST NOT

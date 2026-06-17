@@ -6605,14 +6605,17 @@ fn stale_solve_revalidation_call_site_censuses() {
     );
     // Raw floor reads surviving in snapshot.rs: the chokepoint's
     // deadline read (`floor.deadline_secs` — cap-const axis) + the
-    // binding that feeds it + the three projection constructor args.
+    // binding that feeds it + the three projection constructor args +
+    // sh-031b's `eff_min` cores read (grounded at `prov_max` inline so
+    // it composes into `h_all_filter` BEFORE the projection sites).
     assert_eq!(
         count(snapshot_src, "state.sched.resource_floor"),
-        5,
+        6,
         "raw floor mentions in snapshot.rs = 4 projection-constructor \
          args (incl. the memo-arm survival check's) + the chokepoint \
          binding (whose mem/disk reads go through `fclamped`, deadline \
-         through the cap const)"
+         through the cap const) + sh-031b's eff_min cores read \
+         (grounded at prov_max inline)"
     );
     assert_eq!(
         count(merge_src, "clamp_floor_to_live"),
@@ -7892,4 +7895,219 @@ async fn w10z_cell_emission_wire_image_injectivity() {
     // disposition (designed first-cap walk) differs from PinGated's
     // pend purely BY the image split asserted above.
     assert!(premise("x86_64-linux", &agn));
+}
+
+// ===========================================================================
+// sh-031b — partition-aware provisionable-max for the cores floor
+// (sched.floor.compute-bound-provisionable).
+// ===========================================================================
+
+/// Bare actor with a custom hwClass set whose per-class core ceilings
+/// are pinned via `max_cores` (catalog empty → cfg wins). Hw-agnostic
+/// `intent_for` path (no hw-factor table seeded), which reaches the
+/// post-solve `ClampedFloor` chokepoint and `retain_hosting_cells`.
+fn bare_actor_prov_max(pool: sqlx::PgPool, classes: &[(&str, u32, &[&str])]) -> DagActor {
+    use crate::sla::config::{self, HwClassDef, NodeLabelMatch};
+    let mut cfg = test_sla_config();
+    cfg.hw_explore_epsilon = 0.0;
+    cfg.hw_classes.clear();
+    let mut max_cores: u32 = 1;
+    for (h, ceil, provides) in classes {
+        max_cores = max_cores.max(*ceil);
+        cfg.hw_classes.insert(
+            (*h).into(),
+            HwClassDef {
+                labels: vec![NodeLabelMatch {
+                    key: "rio.build/hw-class".into(),
+                    value: (*h).into(),
+                }],
+                max_cores: Some(*ceil),
+                max_mem: cfg.max_mem,
+                provides_features: provides.iter().map(|s| (*s).into()).collect(),
+                ..Default::default()
+            },
+        );
+    }
+    cfg.max_cores = Some(f64::from(max_cores));
+    let mut actor = bare_actor_cfg(
+        pool,
+        DagActorConfig {
+            sla: cfg,
+            ..Default::default()
+        },
+    );
+    actor.sla_tiers = actor.sla_config.solve_tiers();
+    actor
+        .cost_table
+        .write()
+        .set_member_classes(actor.sla_config.hw_classes.keys().cloned());
+    actor
+        .cost_table
+        .write()
+        .set_resolved_global((max_cores, actor.sla_config.max_mem.unwrap()));
+    actor.sla_ceilings = crate::sla::solve::Ceilings::from_resolved(
+        &actor.sla_config,
+        actor.cost_table.read().resolved_global(),
+    );
+    let _ = config::ARCH_LABEL;
+    actor
+}
+
+// r[verify sched.floor.compute-bound-provisionable]
+/// **sh-031b red-first (i)** — *proposition: a `floor.cores` above the
+/// PARTITION-AWARE provisionable max (the largest non-ICE-exhausted
+/// class ceiling routable for this drv's feat/arch) is grounded at it
+/// by the read-time projection, so `solve_intent_for` emits cells from
+/// the largest provisionable class instead of stripping to `[]` and
+/// requeueing forever.* Population: `{metal-a:192c, hi-a:96c}`, both
+/// `(metal-a,*)` cells ICE-masked, `floor.cores=191`.
+///
+/// RED at base (`ClampedFloor::of` capped at `Ceilings.max_cores`=192):
+/// `fclamped.cores=191`; the post-solve chokepoint overlays
+/// `cores.max(191)`; `retain_hosting_cells(191, …)` strips every cell
+/// (`hi-a` ceiling 96 < 191; `metal-a` is ICE-masked AND would survive
+/// but the producer-side h_all does not feed it as a candidate either);
+/// `hw_class_names=[]` — the disclosed-unschedulable requeue, sh-031b's
+/// symptom.
+#[tokio::test]
+async fn floor_cores_above_provisionable_with_metal_masked_solves_hi_class() {
+    use crate::sla::config::CapacityType;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor =
+        bare_actor_prov_max(db.pool.clone(), &[("metal-a", 192, &[]), ("hi-a", 96, &[])]);
+    // ICE-mask EVERY (metal-a, *) cell — `exhausted([metal-a])` = true.
+    for cap in CapacityType::ALL {
+        actor.ice.mark(&("metal-a".into(), cap));
+    }
+    actor.test_inject_ready("d-sh031b", Some("p-sh031b"), "x86_64-linux", false);
+    actor
+        .dag
+        .node_mut("d-sh031b")
+        .unwrap()
+        .sched
+        .resource_floor
+        .cores = 191;
+
+    let (hw, cost, _ig) = actor.solve_inputs();
+    // Helper structural check: the partition-aware cap is hi-a's
+    // ceiling, not the catalog-absolute 192.
+    let prov_max = actor.sla_config.provisionable_max_cores(
+        &[],
+        rio_common::k8s::system_to_k8s_arch("x86_64-linux"),
+        cost.catalog_ceilings(),
+        cost.resolved_global(),
+        &actor.ice,
+    );
+    assert_eq!(prov_max, 96, "metal-a fully masked → hi-a is the max");
+
+    let state = actor.dag.node("d-sh031b").unwrap();
+    // The read-time projection: the stale 191-core floor grounds at
+    // the ICE-aware partition max.
+    let fclamped = crate::actor::floor::ClampedFloor::of(
+        &state.sched.resource_floor,
+        &actor.sla_ceilings,
+        prov_max,
+    );
+    assert_eq!(
+        fclamped.cores, 96,
+        "the cores projection grounds at the ICE-aware partition max"
+    );
+    // End-to-end: `solve_intent_for`'s post-solve chokepoint never
+    // overlays a `floor.cores` above prov_max, so a downstream
+    // `retain_hosting_cells(cores, …)` cannot strip on that basis.
+    let intent = actor.solve_intent_for(state, &hw, &cost, 0);
+    assert!(
+        intent.cores <= 96,
+        "the dispatched cores are grounded at the provisionable max, \
+         not the catalog-absolute 192 (sh-031b: pre-fix the chokepoint \
+         overlaid the raw 191 and `retain_hosting_cells(191, …)` \
+         stripped every cell); got {}",
+        intent.cores
+    );
+}
+
+// r[verify sched.floor.compute-bound-provisionable]
+/// **sh-031b red-first (iii — the kvm feature partition)** —
+/// *proposition: `provisionable_max_cores` and the cores-floor bump
+/// respect the FEATURE partition (the SAME [`SlaConfig::class_routes`]
+/// `h_all_filter` uses), so a kvm drv whose only routable class
+/// (`metal-x86`, `provides=[kvm]`, 48c) is SMALLER than the
+/// featureless global max (`hi-x86`, 96c) caps at 48 — never at 96.*
+///
+/// RED at base (catalog-absolute cap, ×2 ladder): `floor.cores`
+/// reached 64 then 96 (>48); `h_all_filter` for `[kvm]` admits only
+/// `metal-x86` (the bidirectional ∅-guard); the chokepoint overlays
+/// `cores.max(96)`; `retain_hosting_cells(96, …)` strips `metal-x86`
+/// (ceiling 48 < 96) → `hw_class_names=[]` → sh-031b restricted to
+/// the kvm partition, with no ICE involvement at all.
+#[tokio::test]
+async fn floor_cores_kvm_partition_caps_at_metal_max_not_featureless_global() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_prov_max(
+        db.pool.clone(),
+        &[("metal-x86", 48, &["kvm"]), ("hi-x86", 96, &[])],
+    );
+    actor.test_inject_ready_with_features("d-kvm", Some("p-kvm"), "x86_64-linux", &["kvm"]);
+
+    let (hw, cost, _ig) = actor.solve_inputs();
+    let kvm: Vec<String> = vec!["kvm".into()];
+    let prov_max = actor.sla_config.provisionable_max_cores(
+        &kvm,
+        rio_common::k8s::system_to_k8s_arch("x86_64-linux"),
+        cost.catalog_ceilings(),
+        cost.resolved_global(),
+        &actor.ice,
+    );
+    assert_eq!(
+        prov_max, 48,
+        "the kvm partition (∅-guard: hi-x86 provides=[] is invisible to \
+         a [kvm] intent) tops out at metal-x86's ceiling — NOT the \
+         featureless global 96"
+    );
+
+    // Drive a corroborated ComputeBound bump from last_intent.cores=32
+    // through `bump_floor_or_count` with the partition's prov_max
+    // threaded (the production `bump_resource_floor` chokepoint
+    // computes the SAME `prov_max` from `(feat, arch, ice)` — its
+    // composition is census-pinned at
+    // `bump_resource_floor_caller_census` and exercised by the
+    // floor.rs unit-level jump-to-max test).
+    {
+        let state = actor.dag.node_mut("d-kvm").unwrap();
+        state.sched.last_intent = Some(crate::state::SolvedIntent {
+            cores: 32,
+            ..Default::default()
+        });
+        let o = crate::actor::floor::bump_floor_or_count(
+            state,
+            rio_proto::types::TerminationReason::ComputeBound,
+            &actor.sla_ceilings,
+            prov_max,
+        );
+        assert!(o.promoted && !o.at_cap);
+        assert_eq!(
+            state.sched.resource_floor.cores, 48,
+            "the cores floor jumps straight to the kvm-partition \
+             provisionable max — never to the featureless global 96"
+        );
+    }
+
+    let state = actor.dag.node("d-kvm").unwrap();
+    let intent = actor.solve_intent_for(state, &hw, &cost, 0);
+    let distinct: std::collections::BTreeSet<&str> =
+        intent.hw_class_names.iter().map(String::as_str).collect();
+    assert_eq!(
+        distinct,
+        ["metal-x86"].into(),
+        "the kvm drv routes to its only feature-compatible class (one \
+         entry per capacity-type cell); got {:?}",
+        intent.hw_class_names
+    );
+    assert!(
+        intent.cores <= 48,
+        "the dispatched cores are grounded at the kvm-partition max; got {}",
+        intent.cores
+    );
 }

@@ -1441,9 +1441,37 @@ impl DagActor {
     ) -> super::floor::FloorOutcome {
         let reason = witness.reason();
         let reason_label = witness.label();
+        // r[impl sched.floor.compute-bound-provisionable]
+        // sh-031b: the cores axis caps at the partition-aware
+        // provisionable max — feature/arch-routed AND non-ICE-exhausted
+        // — read FRESH at the moment of the corroborated failure (so a
+        // mask that opened during the attempt re-admits the larger
+        // class). The mem/disk/deadline arms ignore this; the
+        // catalog-absolute fallback covers a missing-node edge.
+        let prov_max_cores = self
+            .dag
+            .node(drv_hash)
+            .map(|state| {
+                let feat = state.effective_features().as_slice();
+                let arch = rio_common::k8s::system_to_k8s_arch(&state.system);
+                let cost = self.cost_table.read();
+                self.sla_config.provisionable_max_cores(
+                    feat,
+                    arch,
+                    cost.catalog_ceilings(),
+                    cost.resolved_global(),
+                    &self.ice,
+                )
+            })
+            .unwrap_or(self.sla_ceilings.max_cores as u32);
         let mut new_floor = None;
         let outcome = if let Some(state) = self.dag.node_mut(drv_hash) {
-            let o = super::floor::bump_floor_or_count(state, reason, &self.sla_ceilings);
+            let o = super::floor::bump_floor_or_count(
+                state,
+                reason,
+                &self.sla_ceilings,
+                prov_max_cores,
+            );
             if o.promoted {
                 info!(
                     drv_hash = %drv_hash, reason = reason_label,

@@ -842,6 +842,44 @@ impl SlaConfig {
         })
     }
 
+    // r[impl sched.floor.compute-bound-provisionable]
+    /// sh-031b: the partition-aware PROVISIONABLE cores cap — the
+    /// largest [`Self::class_ceilings`] core ceiling over the hwClass
+    /// partition that (i) [`Self::class_routes`] admits for `(arch,
+    /// features)` (the SAME feature/arch ∅-guard `h_all_filter` uses
+    /// at solve time), AND (ii) is not fully ICE-masked (every
+    /// configured `(h, cap)` cell masked → class excluded; one
+    /// unmasked cell → class counts). Returns `0` when the routed
+    /// partition is empty or fully exhausted — callers treat that as
+    /// "no provisionable shape exists" (the FleetExhausted lane), not
+    /// `ComputeBoundAtCap`.
+    ///
+    /// This is the cap the cores `resource_floor` and the
+    /// `ClampedFloor` projection bound against (replacing the
+    /// catalog-absolute `Ceilings.max_cores`, which admits classes the
+    /// drv can never route to — sh-031b: a 191-core floor against a
+    /// 96-core provisionable partition requeued forever).
+    pub fn provisionable_max_cores(
+        &self,
+        features: &[String],
+        arch: Option<&str>,
+        catalog: &super::catalog::CatalogCeilings,
+        global: (u32, u64),
+        ice: &super::cost::IceBackoff,
+    ) -> u32 {
+        self.hw_classes
+            .keys()
+            .filter(|h| self.class_routes(h, arch, features))
+            .filter(|h| {
+                !ice.exhausted(std::slice::from_ref(*h), |hh| {
+                    self.capacity_types_for(hh).to_vec()
+                })
+            })
+            .map(|h| self.class_ceilings(h, catalog, global).0)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Per-intent forecast horizon: `max(lead_time_seed[(h, cap)])`
     /// over hwClasses [`Self::class_routes`] admits for `(system,
     /// features)`. **Seed-based approximation** of the controller's
