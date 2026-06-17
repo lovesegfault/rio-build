@@ -174,6 +174,8 @@ fn topo_recompute(dag: &mut DerivationDag, scope: &HashSet<DrvHash>) {
 /// the cone; the dirty-flag early-stop is dropped (it was the
 /// correctness hazard).
 pub fn update_ancestors(dag: &mut DerivationDag, from: &str) {
+    #[cfg(test)]
+    UPDATE_ANCESTORS_CALLS.with(|c| c.set(c.get() + 1));
     let mut cone: HashSet<DrvHash> = HashSet::new();
     let mut queue: VecDeque<DrvHash> = dag.get_parents(from).into_iter().collect();
     while let Some(hash) = queue.pop_front() {
@@ -186,14 +188,41 @@ pub fn update_ancestors(dag: &mut DerivationDag, from: &str) {
     topo_recompute(dag, &cone);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-thread test hook counting [`update_ancestors`] entries —
+    /// [`tests::full_sweep_never_calls_update_ancestors`] structurally
+    /// asserts the sweep is step-1 + [`topo_recompute`] only.
+    /// Thread-local (not a static `AtomicU64`): the sibling tests in
+    /// this module call `update_ancestors` directly and run on
+    /// parallel threads under nextest; a process-global counter would
+    /// race the before/after read.
+    pub(crate) static UPDATE_ANCESTORS_CALLS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Full priority sweep of all non-terminal nodes.
 ///
 /// Called periodically from Tick (~60s) as belt-and-suspenders over
 /// the incremental updates. Catches any drift (rounding accumulation,
 /// missed edge case in the incremental logic).
 ///
-/// Cost: O(V + E) for the topo-sort + one pass. For a 10k-node DAG,
-/// ~1ms. Every 60s is negligible.
+/// # Body is step-1 + [`topo_recompute`] only — NOT [`compute_initial`]
+///
+/// sh-027 §2: this previously delegated to `compute_initial(dag, sla,
+/// builds, &non_terminal)`, whose step-4 fires [`update_ancestors`]
+/// (BFS-cone + per-cone `topo_recompute`) for every boundary node — a
+/// non-terminal whose dependent is terminal. At full scope that work is
+/// provably redundant: a boundary node's terminal dependent is never
+/// dispatched (priority is dead state), and every non-terminal
+/// dependent is already in `non_terminal` and recomputed by step-2's
+/// single Kahn pass. No third case. The selfhost iter-5 trace measured
+/// the redundant cones at 0.5–30s/tick (phase-00 = 45.9s for ~14k
+/// nodes); the inlined body restores the O(V+E) bound — ~10–20ms at the
+/// same scale.
+///
+/// The previous "Reuse compute_initial — same bottom-up algorithm" doc
+/// was true for steps 1–3 and accidentally quadratic for step 4.
 pub fn full_sweep(dag: &mut DerivationDag, sla: &SlaEstimator, builds: &HashMap<Uuid, BuildInfo>) {
     // Collect all non-terminal hashes. Terminal nodes don't need
     // priority (they won't be dispatched).
@@ -202,12 +231,22 @@ pub fn full_sweep(dag: &mut DerivationDag, sla: &SlaEstimator, builds: &HashMap<
         .filter(|(_, s)| !s.status().is_terminal())
         .map(|(h, _)| h.into())
         .collect();
+    if non_terminal.is_empty() {
+        return;
+    }
 
-    // Reuse compute_initial — it's the same bottom-up algorithm.
-    // Treating all non-terminal nodes as "newly inserted" is a valid
-    // re-interpretation: compute_initial sets est_duration (idempotent;
-    // same SLA cache, same result) and recomputes priority bottom-up.
-    compute_initial(dag, sla, builds, &non_terminal);
+    // --- Step 1: refresh est_duration for every non-terminal node ---
+    for hash in &non_terminal {
+        if let Some(state) = dag.node_mut(hash) {
+            state.sched.est_duration = model_key_for(state, builds)
+                .and_then(|k| sla.ref_estimate(&k))
+                .unwrap_or(DEFAULT_DURATION_SECS);
+        }
+    }
+
+    // --- Steps 2+3: single Kahn pass over the full non-terminal set ---
+    // Step 4 is INTENTIONALLY ABSENT (see fn doc).
+    topo_recompute(dag, &non_terminal);
 }
 
 #[cfg(test)]
@@ -620,6 +659,71 @@ mod tests {
                 dag.node(h).unwrap().sched.priority,
                 *p,
                 "full_sweep diverged from incremental at {h}"
+            );
+        }
+    }
+
+    /// sh-027 §2 structural pin: [`full_sweep`] is step-1 +
+    /// [`topo_recompute`] only — it MUST NOT enter [`update_ancestors`]
+    /// (the per-boundary-node BFS that made the previous
+    /// `compute_initial` delegation accidentally quadratic).
+    ///
+    /// The fixture is the boundary shape that step-4 fires on at base
+    /// and that [`full_sweep_agrees_with_incremental`] structurally
+    /// CANNOT exercise: that test's `n_i depends on n_j (j<i)` graph
+    /// completes the low-index leaves, so every non-terminal node's
+    /// dependents are higher-index and themselves non-terminal —
+    /// step-4's `parents.any(|p| p ∉ non_terminal)` is false for every
+    /// node (review s2-agrees-coverage). Here ten dependents `p_i` are
+    /// transitioned to `DependencyFailed` (terminal) while their
+    /// dependencies `c_i` remain non-terminal — at the pre-inline base
+    /// this drove ten `update_ancestors` calls per sweep.
+    ///
+    /// [`full_sweep_agrees_with_incremental`] is the behavioural pin
+    /// (inlined step-1 + topo_recompute ≡ incremental); THIS test is
+    /// the structural pin (zero step-4 entries). A red here means the
+    /// quadratic path crept back in; a red there means the inline body
+    /// diverged from the recurrence.
+    #[test]
+    fn full_sweep_never_calls_update_ancestors() {
+        // Ten independent p_i→c_i edges (p_i depends on c_i). After
+        // p_i → DependencyFailed: non_terminal = {c0..c9}; each c_i's
+        // sole dependent p_i is terminal → step-4 boundary check is
+        // true 10× at base.
+        let mut dag = DerivationDag::new();
+        let nodes: Vec<_> = (0..10)
+            .flat_map(|i| [node(&format!("p{i}")), node(&format!("c{i}"))])
+            .collect();
+        let edges: Vec<_> = (0..10)
+            .map(|i| edge(&format!("p{i}"), &format!("c{i}")))
+            .collect();
+        let merge = dag.merge(Uuid::new_v4(), &nodes, &edges, "").unwrap();
+        let sla = empty_sla();
+        compute_initial(&mut dag, &sla, &no_builds(), &merge.newly_inserted);
+        for i in 0..10 {
+            dag.node_mut(&format!("p{i}"))
+                .unwrap()
+                .transition(DerivationStatus::DependencyFailed)
+                .unwrap();
+        }
+
+        let before = UPDATE_ANCESTORS_CALLS.get();
+        full_sweep(&mut dag, &sla, &no_builds());
+        assert_eq!(
+            UPDATE_ANCESTORS_CALLS.get(),
+            before,
+            "full_sweep is step-1 + topo_recompute only — step-4 \
+             update_ancestors is provably redundant at full scope \
+             (sh-027 §2: every non-terminal dependent is already in \
+             the Kahn scope; terminal dependents never dispatch)",
+        );
+        // The inline still computes the right answer for the surviving
+        // non-terminal leaves (regression guard distinct from :571's
+        // shape — here every c_i is a leaf with a terminal dependent).
+        for i in 0..10 {
+            assert_eq!(
+                dag.node(&format!("c{i}")).unwrap().sched.priority,
+                DEFAULT_DURATION_SECS,
             );
         }
     }
