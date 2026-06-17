@@ -1467,32 +1467,24 @@ pub(super) async fn reap_orphan_running(
     // an error here means the ledger view is unavailable, so absence
     // cannot be proven and nothing is reaped this tick. Freshness is
     // the leader-age gate below (rationale single-homed in this fn's
-    // doc).
-    let resp = match admin_call(
-        ctx.admin
-            .clone()
-            .list_open_attempts(rio_proto::types::ListOpenAttemptsRequest {}),
-    )
-    .await
-    {
-        Ok(resp) => resp.into_inner(),
-        Err(e) => {
-            warn!(
-                pool, error = %e,
-                "ListOpenAttempts failed; skipping orphan-reap this tick (fail-closed)"
-            );
-            return 0;
-        }
+    // doc). sh-037: routed through [`AttemptsViewWitness::fetch`]
+    // (the typed merged_bug_022 wrapper sh-021's TerminalAbsent uses)
+    // — `FetchFailed` defers by type, equivalent to the prior raw
+    // `Err → return 0`, and the witness is the AttemptsPair mint.
+    let witness = match AttemptsViewWitness::fetch(ctx, pool).await {
+        AttemptsFetch::Fetched(w) => w,
+        AttemptsFetch::FetchFailed => return 0,
     };
+    let leader_for_secs = witness.view.leader_for_secs;
     // r[impl ctrl.job.orphan-leader-age+2]
     // Freshness gate (merged_bug_221): never-pulled pods have no row
     // by construction, so a freshly-failed-over leader's view cannot
     // distinguish "orphaned" from "about to pull". One full grace
     // against the NEW leader before absence is actionable.
-    if resp.leader_for_secs < grace.as_secs() {
+    if leader_for_secs < grace.as_secs() {
         debug!(
             pool,
-            leader_for_secs = resp.leader_for_secs,
+            leader_for_secs,
             grace_secs = grace.as_secs(),
             "leader younger than the orphan grace; skipping orphan-reap this tick (fail-closed)"
         );
@@ -1501,8 +1493,7 @@ pub(super) async fn reap_orphan_running(
     // bug_080: the pair is minted AT SELECTION — `select_orphan_running`
     // runs against the deciding view; every delete below vetoes
     // against that same view even after a mid-wave refresh.
-    let leader_for_secs = resp.leader_for_secs;
-    let mut attempts_view = AttemptsPair::at_selection(AttemptsViewWitness::minted_now(resp));
+    let mut attempts_view = AttemptsPair::at_selection(witness);
     let orphans = select_orphan_running(
         jobs,
         reaped,
@@ -1516,6 +1507,22 @@ pub(super) async fn reap_orphan_running(
     let mut reaped = 0u32;
     for job in orphans {
         let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
+        let uid = job.metadata.uid.as_deref();
+        // sh-037 sticky guard (the excess-Pending sibling): a Deferred
+        // veto at the chokepoint below makes the Job immune for
+        // [`super::jobs::STRIKE_WALL_FLOOR`] — a one-tick view gap (an
+        // attempt closed by a sibling-reap synthesized `Reaped` before
+        // the pod's NEXT pull surfaced) is non-destructive regardless
+        // of root cause (sh-037 §b: 83 OrphanRunning reaps on Jobs
+        // with active pull-mode attempts).
+        if uid.is_some_and(|u| super::jobs::live_strike_recent(key, u)) {
+            debug!(
+                pool, job = %job_name,
+                "skipping orphan reap: fresh-attempt observation within \
+                 the wall floor (sh-037 sticky guard)"
+            );
+            continue;
+        }
         // Foreground: same job-tracking-finalizer-orphan race as
         // reap_excess_pending (see its comment). Targets here are
         // ready>0 so foreground blocks until the pod actually
@@ -1541,6 +1548,9 @@ pub(super) async fn reap_orphan_running(
         .await
         {
             Ok(SynthesizedDelete::Deferred { fresh_attempt }) => {
+                if let Some(u) = uid {
+                    super::jobs::note_live_strike(key, u);
+                }
                 info!(
                     pool, job = %job_name, fresh_attempt,
                     "orphan-Running reap deferred on attempt evidence (live_051(e))"
