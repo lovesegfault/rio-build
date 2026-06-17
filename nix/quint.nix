@@ -5452,6 +5452,47 @@ rec {
       witness = "canReachHeldKept";
     };
 
+    # sh-021 (ctrl.ephemeral.reap-terminal-absent): a never-pulled
+    # `Failed/BackoffLimitExceeded` death left the open Build attempt
+    # ghosted for `deadline+slack` (62min) because the
+    # `AbsentFromDemand ∧ JTerminal` cell fell through to k8s TTL on
+    # the false "scheduler already saw it" premise. FALSIFY half:
+    # ENABLE_TERMINAL_ABSENT_REAP=false (the as-built `continue` /
+    # `wantEmpty` early-return) — terminalAbsentReaped expected
+    # VIOLATED at depth 5 from cold init via `intentArrives → tick →
+    # intentLeaves → jobFailsAtStart → tick`.
+    # r[verify ctrl.ephemeral.reap-terminal-absent]
+    quint-spawn-coherence-falsify-terminal-absent-asbuilt = mkQuintWitnessCheck {
+      name = "spawn-coherence-falsify-terminal-absent-asbuilt";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceTerminalAbsentAsBuilt";
+      witness = "terminalAbsentReaped";
+    };
+    # HOLD half: the TerminalAbsent arm reaps `AbsentFromDemand ∧
+    # JTerminal` ahead of TTL (runs on `wantEmpty` too — the early-
+    # return is gone; OrphanPending keeps its per-arm gate). Same
+    # invariant set as the Fetcher regime plus the new law.
+    # r[verify ctrl.ephemeral.reap-terminal-absent]
+    quint-spawn-coherence-terminal-absent = mkQuintCheck {
+      name = "spawn-coherence-terminal-absent";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceTerminalAbsent";
+      invariants = [
+        "ceilingRespected"
+        "reapSafety"
+        "orphanRemoved"
+        "ackSoundness"
+        "gateFailClosed"
+        "terminalAbsentReaped"
+      ];
+    };
+    quint-spawn-coherence-witness-terminal-absent-reap = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-terminal-absent-reap";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceTerminalAbsent";
+      witness = "canReachTerminalAbsentReap";
+    };
+
     # ---- Model N: exhaustive regime checks ---------------------------
 
     # Healthy lifecycle, no faults: create -> register -> busy/idle ->

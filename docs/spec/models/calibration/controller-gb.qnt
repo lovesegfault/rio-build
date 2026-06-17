@@ -47,7 +47,9 @@ module gbCalibAckAttempted {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the ack covers the attempted
@@ -309,7 +311,9 @@ module gbCalibAckOnlyNew {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: only the spawned-this-tick set is

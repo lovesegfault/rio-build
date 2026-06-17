@@ -52,7 +52,9 @@ module ggCalibTerminatingPending {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).* from "../spawnCoherence"
 
   /// PRE-FIX pending predicate: no deletionTimestamp filter.

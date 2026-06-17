@@ -203,6 +203,7 @@ module spawnCoherence {
     | ESkipFailopenSpawn
     | ESkipWithheld
     | EHeldKept
+    | ETerminalAbsentReap
 
   /// Violation latches. Each invariant below is `not(contains(...))`;
   /// in a correct model every latch stays unset forever, so these add
@@ -228,6 +229,7 @@ module spawnCoherence {
     | VHeldPlacementReaped
     | VStaleClose
     | VSpawnClobberedStreak
+    | VTerminalAbsentMissed
 
   // ------------------------------------------------------------------
   // 2. Constants (regime modules instantiate these)
@@ -384,6 +386,27 @@ module spawnCoherence {
   const ENABLE_HELD_MACHINERY: bool
   const ENABLE_HELD_VISIBILITY: bool
 
+  /// sh-021 axis pair (the ENABLE_HELD_* precedent: off-axis collapses
+  /// to dead transitions and constant-false latches — zero reachable-
+  /// state delta in every pre-existing regime).
+  ///
+  /// MACHINERY: turns on env action `jobDiesUnreported` (a Running Job
+  /// goes JTerminal but `execr` stays UNCHANGED — the worker died
+  /// without sending CompletionReport; falsifies the now-retired
+  /// `JOB_TTL_SECS` premise that `jobCompletes` encoded as a hard
+  /// law) AND gates the `VTerminalAbsentMissed` latch.
+  ///
+  /// REAP: turns on the `terminalAbsentReaps` arm in the tick (the
+  /// `ReapDisposition::TerminalAbsent` dispatch — `AbsentFromDemand
+  /// ∧ JTerminal` background-deleted+synth-closed ahead of TTL).
+  /// `not(schedErr)` is the per-arm fail-closed: with `failed_poll()`
+  /// now Incomplete the page reads `Unknowable` and the arm suspends
+  /// (the rust-side `q1-orphan-pending` change).
+  ///
+  /// MODEL-DIVERGENCE(law=ctrl.ephemeral.reap-terminal-absent; tree=rio-controller/src/reconcilers/pool/jobs.rs:reap_stale_for_intents): the `AttemptsViewWitness::fetch` fail-closed `break` (the ListOpenAttempts RPC) is below the model's per-RPC fault alphabet ({pollFails, listExecFails, ackFails, createFailsFor}); `not(schedErr)` encodes ONLY the GetSpawnIntents-failure suspension. The two-tick strike is below per-tick atomicity (the 5e01a9ff1 disposition) — retarget-by: adding a ListOpenAttempts fault bit or modeling the strike ledger.
+  const ENABLE_UNREPORTED_DEATH: bool
+  const ENABLE_TERMINAL_ABSENT_REAP: bool
+
   pure val INTENTS: Set[IntentId] = Set("i1", "i2")
 
   pure def boolChoices(faultOn: bool): Set[bool] =
@@ -533,6 +556,18 @@ module spawnCoherence {
   /// hold regime): the fixed law actually kept a held in-flight
   /// placement demand-visible.
   val canReachHeldKept = not(effects.contains(EHeldKept))
+  /// sh-021 (ctrl.ephemeral.reap-terminal-absent), I2-safety form: a
+  /// `JTerminal ∧ AbsentFromDemand` Job at tick start with a healthy
+  /// poll IS reaped by tick end. Mirrors `orphanRemoved` exactly;
+  /// gated on `ENABLE_UNREPORTED_DEATH` so the latch is constant-false
+  /// off-axis (the `vHeldReaped`/`vPoisonBurst` precedent — `vOrphan`
+  /// is the wrong mirror: its arm is always-on). FALSIFIES at
+  /// `ENABLE_TERMINAL_ABSENT_REAP=false` (the as-built `continue` /
+  /// `wantEmpty` early-return); HOLDS at `=true`.
+  val terminalAbsentReaped = not(violations.contains(VTerminalAbsentMissed))
+  /// Non-vacuity (expected-violation in the hold regime): the new arm
+  /// actually fired.
+  val canReachTerminalAbsentReap = not(effects.contains(ETerminalAbsentReap))
   /// A3/282: no spawn intent inside the transient-retry backoff
   /// window — the spawn edge's conjunct holds (trivially when the
   /// axis is off; the controller-282 calibration drops the conjunct
@@ -757,10 +792,20 @@ module spawnCoherence {
         gateInFlight.contains(i) and heldNow.contains(i)).size() > 0
     val terminalReaps = if (wantEmpty) Set() else
       postGate.filter(i => jobsAtList.get(i).phase == JTerminal)
+    // sh-021: `AbsentFromDemand ∧ JTerminal` — runs on `wantEmpty` too
+    // (the early-return is gone; OrphanPending keeps its `wantEmpty`
+    // gate per arm). `not(schedErr)` is the `failed_poll`-Incomplete
+    // suspension (the page would read `Unknowable` for every name).
+    val terminalAbsentReaps =
+      if (ENABLE_TERMINAL_ABSENT_REAP and not(schedErr))
+        INTENTS.filter(i =>
+          not(postGate.contains(i)) and jobsAtList.get(i).phase == JTerminal)
+      else Set()
     val driftReaps = if (wantEmpty) Set() else
       postGate.filter(i =>
         isPending(jobsAtList.get(i)) and jobsAtList.get(i).fp != intentFp.get(i))
-    val reaped = orphanPendingReaps.union(terminalReaps).union(driftReaps)
+    val reaped = orphanPendingReaps.union(terminalReaps)
+      .union(driftReaps).union(terminalAbsentReaps)
 
     // ---- 5. Headroom (freed slots subtracted before the clamp) -------
     val freed = reaped.filter(i => censusActive(jobsAtList.get(i))).size()
@@ -874,7 +919,8 @@ module spawnCoherence {
     // terminal-collision reaps were background deletes (object gone),
     // foreground deletes leave a Terminating object => 409.
     val jobsAfterReap = INTENTS.mapBy(i =>
-      if (terminalReaps.contains(i)) { phase: JAbsent, age: AgeFresh, fp: FpA, podRunning: false }
+      if (terminalReaps.union(terminalAbsentReaps).contains(i))
+        { phase: JAbsent, age: AgeFresh, fp: FpA, podRunning: false }
       else if (reaped.contains(i)) { ...jobsAtList.get(i), phase: JTerminating }
       else jobsAtList.get(i))
     val spawnedSet = toSpawn.filter(i =>
@@ -979,6 +1025,7 @@ module spawnCoherence {
         if (driftReaps.size() > 0) Set(EDriftReap) else Set(),
         if (orphanPendingReaps.size() > 0) Set(EOrphanPendingReap) else Set(),
         if (terminalReaps.size() > 0) Set(ETerminalReap) else Set(),
+        if (terminalAbsentReaps.size() > 0) Set(ETerminalAbsentReap) else Set(),
         if (gateBlocked) Set(EGateBlockedSpawn) else Set(),
         if (ackHappens) Set(EAcked) else Set(),
         if (excessSuppressed) Set(EExcessSuppressed) else Set(),
@@ -1070,6 +1117,15 @@ module spawnCoherence {
       orphanPendingDue.union(orphanRunningDue).filter(i =>
         jobsAfter.get(i).phase != JTerminating and jobsAfter.get(i).phase != JAbsent
       ).size() > 0
+    // sh-021 I2-safety form: a JTerminal+absent Job at tick start
+    // with a healthy poll IS in `reaped`. Gated on the machinery
+    // axis (constant-false off-axis — zero state delta in every
+    // pre-existing regime; the `vHeldReaped` precedent).
+    val terminalAbsentDue = if (schedErr) Set() else
+      INTENTS.filter(i =>
+        not(postGate.contains(i)) and jobsAtList.get(i).phase == JTerminal)
+    val vTermAbsent = ENABLE_UNREPORTED_DEATH
+      and terminalAbsentDue.exclude(reaped).size() > 0
     // I5: every acked intent has a Job behind it at ack time.
     val vAckNoJob = ackHappens and toAck.filter(i => not(isPending(jobsAfter.get(i)))).size() > 0
     // The re-ack half: a surviving gated Pending Job is acked when the
@@ -1155,7 +1211,8 @@ module spawnCoherence {
         if (vPoisonBurst) Set(VPoisonBurst) else Set(),
         if (vYoungReap) Set(VYoungLeaderReap) else Set(),
         if (vSpawnClobber) Set(VSpawnClobberedStreak) else Set(),
-        if (vHeldReaped) Set(VHeldPlacementReaped) else Set()).flatten()
+        if (vHeldReaped) Set(VHeldPlacementReaped) else Set(),
+        if (vTermAbsent) Set(VTerminalAbsentMissed) else Set()).flatten()
 
     all {
       job' = jobsAfter,
@@ -1302,6 +1359,24 @@ module spawnCoherence {
   /// backoffLimit 0 => Failed.
   action jobFailsAtStart(i: IntentId): bool = all {
     job.get(i).phase == JPending,
+    job' = job.set(i, { phase: JTerminal, age: AgeFresh, fp: FpA, podRunning: false }),
+    queued' = queued, intentFp' = intentFp, execr' = execr,
+    leaderOld' = leaderOld, gate' = gate,
+    obsLive' = obsLive,
+    bookkeepingUnchanged,
+  }
+
+  /// sh-021 (`JobTerminalNeverRegistered`): the pod dies WITHOUT the
+  /// worker sending CompletionReport (spot-node graceful-shutdown
+  /// kill, `Failed/BackoffLimitExceeded`). `execr` is UNCHANGED — the
+  /// open-attempt ledger still holds the busy/idle entry. Gated on the
+  /// machinery axis (disabled in every pre-existing regime: zero
+  /// reachable-state delta). The `jobCompletes` action above encodes
+  /// the now-retired `JOB_TTL_SECS` premise (`execr → ExecAbsent`) as
+  /// a hard law; this action is the falsifier.
+  action jobDiesUnreported(i: IntentId): bool = all {
+    ENABLE_UNREPORTED_DEATH,
+    job.get(i).phase == JRunning,
     job' = job.set(i, { phase: JTerminal, age: AgeFresh, fp: FpA, podRunning: false }),
     queued' = queued, intentFp' = intentFp, execr' = execr,
     leaderOld' = leaderOld, gate' = gate,
@@ -1851,6 +1926,7 @@ module spawnCoherence {
       jobControllerSyncs(i),
       jobCompletes(i),
       jobFailsAtStart(i),
+      jobDiesUnreported(i),
       ttlDeletes(i),
       finalizerCompletes(i),
       jobAges(i),
@@ -1913,7 +1989,9 @@ module spawnCoherenceBase {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -1947,7 +2025,9 @@ module spawnCoherenceFaultRpc {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -1982,7 +2062,9 @@ module spawnCoherenceFaultLease {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2017,7 +2099,9 @@ module spawnCoherenceFaultStale {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2052,7 +2136,9 @@ module spawnCoherenceCrdAbsent {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2086,7 +2172,9 @@ module spawnCoherenceFetcher {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2124,7 +2212,9 @@ module spawnCoherenceMatJobs {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2163,7 +2253,9 @@ module spawnCoherenceRenderedDeadline {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2198,7 +2290,9 @@ module spawnCoherenceExhaustAsBuilt {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2234,7 +2328,9 @@ module spawnCoherenceExhaustPersist {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2269,7 +2365,9 @@ module spawnCoherenceCancelAsBuilt {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2304,7 +2402,9 @@ module spawnCoherenceCancelCause {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2343,7 +2443,9 @@ module spawnCoherenceReapYoungLeader {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2379,7 +2481,9 @@ module spawnCoherenceSynthCloseAsBuilt {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2415,7 +2519,9 @@ module spawnCoherenceSynthClosePinned {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2450,7 +2556,9 @@ module spawnCoherenceRetryBackoff {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2488,7 +2596,9 @@ module spawnCoherenceMultiPoolAsBuilt {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2524,7 +2634,9 @@ module spawnCoherenceMultiPool {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2562,7 +2674,9 @@ module spawnCoherenceCancelGenAsBuilt {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2597,7 +2711,9 @@ module spawnCoherenceCancelGeneration {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2644,7 +2760,9 @@ module spawnCoherenceStreakCadence {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2690,7 +2808,9 @@ module spawnCoherenceFailopenWithhold {
     ENABLE_SKIP_SPAWN_FAILOPEN = true,
     SKIP_SPAWN_WITHHOLD = true,
     ENABLE_HELD_MACHINERY = false,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2730,7 +2850,9 @@ module spawnCoherenceHeldAsBuilt {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = true,
-    ENABLE_HELD_VISIBILITY = false
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
   ).*
 }
 
@@ -2768,6 +2890,90 @@ module spawnCoherenceHeld {
     ENABLE_SKIP_SPAWN_FAILOPEN = false,
     SKIP_SPAWN_WITHHOLD = false,
     ENABLE_HELD_MACHINERY = true,
-    ENABLE_HELD_VISIBILITY = true
+    ENABLE_HELD_VISIBILITY = true,
+    ENABLE_UNREPORTED_DEATH = false,
+    ENABLE_TERMINAL_ABSENT_REAP = false
+  ).*
+}
+
+/// sh-021 as-built twin (ctrl.ephemeral.reap-terminal-absent): the
+/// unreported-death machinery under the AS-BUILT reap — the
+/// `AbsentFromDemand ∧ JTerminal` cell falls through to `continue` /
+/// the `wantEmpty` early-return, so a never-registered open attempt's
+/// terminal Job survives the tick (terminalAbsentReaped expected
+/// VIOLATED — depth 5 from cold init via `intentArrives → tick →
+/// intentLeaves → jobFailsAtStart → tick`; the `jobDiesUnreported`
+/// trace is depth 8). Fetcher regime (no gate retain — the incident
+/// shape).
+module spawnCoherenceTerminalAbsentAsBuilt {
+  import spawnCoherence(
+    IS_BUILDER = false,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = true,
+    ENABLE_TERMINAL_ABSENT_REAP = false
+  ).*
+}
+
+/// sh-021 hold regime (ctrl.ephemeral.reap-terminal-absent): the
+/// `TerminalAbsent` arm reaps `AbsentFromDemand ∧ JTerminal` ahead of
+/// k8s TTL — terminalAbsentReaped HOLDS; canReachTerminalAbsentReap
+/// is the non-vacuity witness. The arm runs on `wantEmpty` too (the
+/// early-return is gone; OrphanPending keeps its per-arm gate).
+module spawnCoherenceTerminalAbsent {
+  import spawnCoherence(
+    IS_BUILDER = false,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false,
+    ENABLE_HELD_MACHINERY = false,
+    ENABLE_HELD_VISIBILITY = false,
+    ENABLE_UNREPORTED_DEATH = true,
+    ENABLE_TERMINAL_ABSENT_REAP = true
   ).*
 }
