@@ -125,6 +125,13 @@ const SPAWN_INTENTS_RESPONSE_BYTES_BUCKETS: &[f64] = &[
 const SPAWN_INTENTS_PER_RESPONSE_BUCKETS: &[f64] =
     &[1.0, 8.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0];
 
+/// Bucket boundaries for `rio_scheduler_pull_outcome_flush_batch_size`
+/// (COUNT of reports per flush). Edges land on the sh-027 §3 design
+/// vocabulary: 1/2/5 (the retired mailbox-empty trigger's measured
+/// N̄≈5.5 degradation), 20 (the design target), 64
+/// (`REPORT_OUTCOME_BATCH_MAX`).
+const PULL_OUTCOME_FLUSH_BATCH_SIZE_BUCKETS: &[f64] = &[1.0, 2.0, 5.0, 10.0, 20.0, 32.0, 64.0];
+
 /// Per-crate histogram bucket overrides, passed to
 /// `rio_common::server::bootstrap` → `init_metrics`. Every
 /// `describe_histogram!` in this crate must have an entry here OR be in
@@ -153,6 +160,10 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
     (
         "rio_scheduler_spawn_intents_per_response",
         SPAWN_INTENTS_PER_RESPONSE_BUCKETS,
+    ),
+    (
+        "rio_scheduler_pull_outcome_flush_batch_size",
+        PULL_OUTCOME_FLUSH_BATCH_SIZE_BUCKETS,
     ),
 ];
 
@@ -183,6 +194,15 @@ pub fn describe_metrics() {
     describe_gauge!(
         "rio_scheduler_derivations_running",
         "Derivations currently building"
+    );
+    describe_histogram!(
+        "rio_scheduler_pull_outcome_flush_batch_size",
+        "Count of ReportPullOutcome commands drained per \
+         flush_pending_pull_outcomes pass (sh-027 §3: the prod N̄ \
+         signal — design target ≥20; the retired mailbox-empty \
+         trigger measured N̄≈5.5). The sh-007c S6 O(1)-PG-per-flush \
+         amortization scales with this; a sustained le=5 mass means \
+         the 250ms deadline window is not coalescing."
     );
     describe_histogram!(
         "rio_scheduler_merge_phase_seconds",

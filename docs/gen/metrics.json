@@ -159,6 +159,7 @@
     "rio_scheduler_orphan_builds_cancelled_total",
     "rio_scheduler_poison_fleet_exhausted_total",
     "rio_scheduler_pull_establishments_total",
+    "rio_scheduler_pull_outcome_flush_batch_size",
     "rio_scheduler_pull_rejected_total",
     "rio_scheduler_queue_backpressure",
     "rio_scheduler_recovery_duration_seconds",
@@ -1103,6 +1104,11 @@
         "name": "rio_scheduler_pull_establishments_total",
         "kind": "counter",
         "help": "Open pull-mode attempts established as unreported executor crashes by the establishment sweep (the C2 charge arm; the store-probe adopt arm does not count, and the probe-unavailable DEFER arm has its own counter — establish_deferred_total). Feeds the OA2 interim hung-node tripwire — the attempt_requeue histogram's establishment cause is shared with the stream-mode correlation-TTL sweep and is unsuitable for that alert."
+      },
+      {
+        "name": "rio_scheduler_pull_outcome_flush_batch_size",
+        "kind": "histogram",
+        "help": "Count of ReportPullOutcome commands drained per flush_pending_pull_outcomes pass (sh-027 §3: the prod N̄ signal — design target ≥20; the retired mailbox-empty trigger measured N̄≈5.5). The sh-007c S6 O(1)-PG-per-flush amortization scales with this; a sustained le=5 mass means the 250ms deadline window is not coalescing."
       },
       {
         "name": "rio_scheduler_pull_rejected_total",

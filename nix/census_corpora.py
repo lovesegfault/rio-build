@@ -799,6 +799,10 @@ DURATION_CENSUS_ROWS = {
         "wall (unix-epoch seconds at SystemTime::now — the limiter window's own sample)",
         "WO-S9-5 (A3): the answer-log flood limiter — 20 lines/10s/arm with the rolled window's suppressed count disclosed",
     ),
+    ("rio-scheduler/src/actor/pull.rs", "REPORT_OUTCOME_FLUSH_DEADLINE"): (
+        "wall (tokio Interval at the actor select! loop — reset() on the empty→nonempty transition; the flush trigger-(iv) deadline)",
+        "sh-027 §3: 250ms << store-side report_until_acked DEFAULT_GRPC_TIMEOUT=30s (the ack-latency ceiling); coalesces min(64, reports_per_250ms) toward N̄≥20 vs the retired mailbox-empty trigger's measured N̄≈5.5",
+    ),
     ("rio-store/src/materialize/client.rs", "RESOLVED_ANSWER_REMINT_COOLDOWN"): (
         "wall (tokio Instant at the resume ledger's cooldown stamp)",
         "WO-S9-3 (A3): W12-S9E — the K-stuck deterministic bound (6 passes at slots=1 with a 4-row stuck head deliver exactly 4)",

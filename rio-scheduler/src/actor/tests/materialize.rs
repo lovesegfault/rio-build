@@ -11907,8 +11907,9 @@ async fn conversion_requeue_is_a_disclosing_no_op() -> TestResult {
 //     tests/materialize.rs:599,700,799,908,1043,1871,5376,10625,10645
 //   = 11 sites. Every one of them sends ONE report and `.await`s its
 //   reply with the actor mailbox otherwise idle, so the
-//   mailbox-would-Pend eager flush (trigger iv) fires for each — no
-//   helper-level Tick-after-send shim is needed.
+//   REPORT_OUTCOME_FLUSH_DEADLINE select! arm (trigger iv, sh-027 §3;
+//   25ms in tests) fires for each — no helper-level Tick-after-send
+//   shim is needed.
 // ──────────────────────────────────────────────────────────────────────
 
 /// Seed `tags.len()` substitutable single-output nodes (each its own
@@ -11951,8 +11952,8 @@ async fn seed_claimed_mat_jobs(
 /// from `tick_interval`. Paused-time so no Tick can fire on its own.
 /// This is the property the `tickIntervalSecs=600` materialization VM
 /// fixture relies on ("never tick-driven"), and it is what the
-/// mailbox-would-Pend eager flush (trigger iv) preserves once reports
-/// accumulate instead of consuming inline.
+/// `REPORT_OUTCOME_FLUSH_DEADLINE` select! arm (trigger iv, sh-027
+/// §3) preserves once reports accumulate instead of consuming inline.
 #[tokio::test]
 async fn sh002_single_report_resolves_without_tick() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -11980,8 +11981,9 @@ async fn sh002_single_report_resolves_without_tick() -> TestResult {
         .await
         .map_err(|_| {
             anyhow::anyhow!(
-                "a lone Success report's ack waited for a Tick (trigger iv missing): \
-                 the reply must resolve on the report's own actor turn"
+                "a lone Success report's ack waited for a Tick (the \
+                 REPORT_OUTCOME_FLUSH_DEADLINE arm — trigger iv — is missing): \
+                 the reply must resolve within 250ms of the report's own actor turn"
             )
         })?
         .map_err(|e| anyhow::anyhow!("Success report rejected: {e:?}"))?;
@@ -12017,11 +12019,11 @@ async fn sh002_queued_reports_coalesce_into_one_completion_batch() -> TestResult
 
     // Send all three Success reports in one synchronous burst
     // (try_send never yields on a non-full channel, and the test
-    // runtime is current-thread): the actor sees a non-empty mailbox
-    // while processing reports 1 and 2 so the mailbox-idle eager
-    // flush (trigger iv) does NOT fire per-item; report 3 sees an
-    // empty mailbox and trigger (iv) drains all three into one
-    // batched completion.
+    // runtime is current-thread): the actor's biased select! drains
+    // every queued mailbox command BEFORE the
+    // REPORT_OUTCOME_FLUSH_DEADLINE arm (trigger iv, sh-027 §3) is
+    // considered, so all three queue then drain into one batched
+    // completion when the deadline fires.
     let tx = handle.command_sender();
     let mut rxs: Vec<tokio::sync::oneshot::Receiver<Result<(), PullRejection>>> = Vec::new();
     for (tag, out, exec_id) in &claimed {
@@ -12088,9 +12090,10 @@ async fn flush_is_o1_pg_per_batch() -> TestResult {
     let before = handle.debug_counters().await?.begin_fenced_calls;
 
     // Same coalesce shape as the sh-002 row-4 test: try_send all
-    // reports in one synchronous burst so the actor sees a non-empty
-    // mailbox while processing reports 1..N-1; report N's mailbox-idle
-    // eager flush (trigger iv) drains all eight into ONE flush.
+    // reports in one synchronous burst so the actor's biased select!
+    // drains every queued command before the
+    // REPORT_OUTCOME_FLUSH_DEADLINE arm (trigger iv, sh-027 §3) is
+    // considered; all eight queue then drain into ONE flush.
     let tx = handle.command_sender();
     let mut rxs: Vec<tokio::sync::oneshot::Receiver<Result<(), PullRejection>>> = Vec::new();
     for (tag, out, exec_id) in &claimed {
@@ -12125,6 +12128,96 @@ async fn flush_is_o1_pg_per_batch() -> TestResult {
         "RED at base: 8 Success reports drove 8 per-item \
          close_materialization_attempt fenced transactions — the phased \
          flush must batch close+resolve into ONE fenced tx (got {delta})"
+    );
+    Ok(())
+}
+
+// r[verify sched.executor.report-idempotent]
+/// sh-027 §3 (`s6-batch-tighten`): a 50-report burst coalesces to
+/// flush batches with N̄≥20. RED at 59d532ff0 two ways: (a) the
+/// `rio_scheduler_pull_outcome_flush_batch_size` histogram does not
+/// exist; (b) with the histogram added but the retired mailbox-empty
+/// trigger (sh-002 trigger iv) intact, the test harness's serial
+/// `query_unchecked().await` per report leaves the mailbox empty after
+/// every dequeue → 50 flushes of size 1 (max sample = 1.0, fails the
+/// ≥20 gate). After the change: 50 try_sends in one synchronous burst,
+/// the biased select! drains every queued command before the
+/// `REPORT_OUTCOME_FLUSH_DEADLINE` arm is considered, so all 50 queue
+/// then drain into ONE flush (sample = 50.0).
+#[tokio::test]
+async fn report_burst_coalesces_to_batch_ge_20() -> TestResult {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    // Thread-local: the current_thread runtime runs the actor task on
+    // this same OS thread (precedent: parked_job_stalled_gauge_…).
+    let _guard = metrics::set_default_local_recorder(&rec);
+
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let tags: Vec<String> = (0..50).map(|i| format!("sh027-burst-{i:02}")).collect();
+    let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+    let claimed = seed_claimed_mat_jobs(&handle, &store, &tag_refs).await?;
+
+    // 50 reports in one synchronous burst (try_send never yields on a
+    // non-full channel; the test runtime is current-thread).
+    let tx = handle.command_sender();
+    let mut rxs: Vec<tokio::sync::oneshot::Receiver<Result<(), PullRejection>>> = Vec::new();
+    for (tag, out, exec_id) in &claimed {
+        let mut payload = pull_payload(rio_proto::types::BuildResult::default());
+        payload.materialization_outcome = Some(mat_success_outcome(vec![out.clone()], vec![]));
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        tx.try_send(ActorCommand::ReportPullOutcome {
+            exec_id: *exec_id,
+            auth_intent: Some(tag.clone()),
+            payload,
+            reply: rtx,
+        })
+        .map_err(|e| anyhow::anyhow!("mailbox try_send: {e}"))?;
+        rxs.push(rrx);
+    }
+    for (i, rx) in rxs.into_iter().enumerate() {
+        let r = rx.await.map_err(|_| anyhow::anyhow!("reply {i} dropped"))?;
+        assert!(r.is_ok(), "report {i} must ack Ok, got {r:?}");
+    }
+
+    // Read the histogram samples — every flush since the recorder
+    // installed (the seed_claimed_mat_jobs Tick may have flushed
+    // empty/early; filter to nonzero samples).
+    let mut samples: Vec<f64> = Vec::new();
+    for (ck, _, _, v) in snap.snapshot().into_vec() {
+        if ck.key().name() == "rio_scheduler_pull_outcome_flush_batch_size" {
+            let DebugValue::Histogram(h) = v else {
+                continue;
+            };
+            samples.extend(h.iter().map(|o| o.into_inner()));
+        }
+    }
+    assert!(
+        !samples.is_empty(),
+        "RED(a) at 59d532ff0: rio_scheduler_pull_outcome_flush_batch_size does not exist"
+    );
+    let max = samples.iter().copied().fold(0.0_f64, f64::max);
+    assert!(
+        max >= 20.0,
+        "RED(b) at 59d532ff0: the retired mailbox-empty trigger flushed \
+         per-item (max batch size {max}); the deadline arm must coalesce \
+         a 50-report burst to ≥20 (sh-027 §3 design target)"
+    );
+    // Tighter structural bound: the burst itself must be ONE flush of
+    // exactly 50 (the biased select! drains every queued command
+    // before the deadline arm is even considered, and 50 < BATCH_MAX).
+    let burst_flushes: Vec<f64> = samples.iter().copied().filter(|&s| s > 1.0).collect();
+    assert_eq!(
+        burst_flushes.iter().copied().sum::<f64>(),
+        50.0,
+        "the 50-report burst must coalesce into flushes summing to 50 \
+         (got samples {samples:?})"
+    );
+    assert!(
+        burst_flushes.len() <= 3,
+        "at most 1 threshold-flush + 1 deadline-flush + slack \
+         (got {burst_flushes:?})"
     );
     Ok(())
 }

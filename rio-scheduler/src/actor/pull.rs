@@ -1467,6 +1467,26 @@ pub struct PullReportPayload {
 /// [`flush_pending_pull_outcomes`]: DagActor::flush_pending_pull_outcomes
 pub(super) const REPORT_OUTCOME_BATCH_MAX: usize = 64;
 
+/// Eager-flush trigger (iv) — the deadline backstop (sh-027 §3): a
+/// queued report flushes at most this long after the FIRST push of
+/// its batch, decoupling ack latency from `tick_interval` (the
+/// `tickIntervalSecs=600` materialization VM fixture relies on
+/// "never tick-driven", and store-side `report_until_acked`'s
+/// per-attempt cap is `DEFAULT_GRPC_TIMEOUT=30s`). 250ms in
+/// production: well under the 30s cap, and at sh-027 §3's measured
+/// ~46 reports/s a 250ms window coalesces ~11 — vs the retired
+/// mailbox-empty trigger's N̄≈5.5 (interleaving with
+/// `ListMaterializationJobs` / `SubstituteProgress` made the
+/// mailbox-empty signal fire per-item ~80% of the time). Short in
+/// tests (precedent: [`POISON_TTL`](crate::state::POISON_TTL)) so
+/// the ~113 lone-report test sites do not each wait 250ms.
+#[cfg(not(test))]
+pub(super) const REPORT_OUTCOME_FLUSH_DEADLINE: std::time::Duration =
+    std::time::Duration::from_millis(250);
+#[cfg(test)]
+pub(super) const REPORT_OUTCOME_FLUSH_DEADLINE: std::time::Duration =
+    std::time::Duration::from_millis(25);
+
 /// One queued `ActorCommand::ReportPullOutcome` — the EXACT command
 /// field set, reply channel INCLUDED. Held by
 /// [`DagActor::pending_pull_outcomes`] between intake and the flush
@@ -1502,14 +1522,15 @@ impl DagActor {
     /// stream arm calls, so the worker-report→fold feed is identical
     /// in classification terms.
     ///
-    /// `mailbox_empty`: whether the actor's command receiver would
-    /// `Pend` on the next `recv()` — flush trigger (iv). When true
-    /// there is by construction nothing further to coalesce with this
-    /// turn, so the flush runs eagerly and ack latency stays
-    /// decoupled from `tick_interval` (the `tickIntervalSecs=600`
-    /// materialization VM fixture relies on this — its progress is
-    /// "never tick-driven", and store-side `report_until_acked`'s
-    /// per-attempt cap is `DEFAULT_GRPC_TIMEOUT=30s`).
+    /// Flush triggers: (i) `len ≥ REPORT_OUTCOME_BATCH_MAX` here;
+    /// (ii) `handle_tick` head; (iii) `handle_leader_lost` (drains
+    /// with `NotLeader`); (iv) the [`REPORT_OUTCOME_FLUSH_DEADLINE`]
+    /// select! arm — a 250ms-bounded ack latency, decoupled from
+    /// `tick_interval`. The retired mailbox-empty signal (sh-002
+    /// trigger iv) interleaved with `ListMaterializationJobs` /
+    /// `SubstituteProgress` and degraded N̄ to ~5.5 (sh-027 §3); the
+    /// deadline arm coalesces up to `min(64, reports_per_250ms)` and
+    /// is observable via `rio_scheduler_pull_outcome_flush_batch_size`.
     // r[impl sched.executor.report-idempotent]
     pub(super) async fn handle_report_outcome(
         &mut self,
@@ -1517,7 +1538,6 @@ impl DagActor {
         auth_intent: Option<String>,
         payload: PullReportPayload,
         reply: oneshot::Sender<Result<(), PullRejection>>,
-        mailbox_empty: bool,
     ) {
         // r[sched.lease.standby-drops-writes+4]: the only no-PG check
         // — keep it inline so a standby replies immediately. The
@@ -1527,17 +1547,30 @@ impl DagActor {
             let _ = reply.send(Err(PullRejection::NotLeader));
             return;
         }
+        // sh-027 §3 (s3-interval-reset): the deadline arm's guard is
+        // `!pending.is_empty()`, so while idle the Interval is
+        // unpolled and its internal deadline goes stale. Without this
+        // reset, the FIRST report after any idle gap >250ms would
+        // re-enable the guard with an immediately-Ready tick →
+        // flushes at N=1 — the exact N̄ degradation this slot exists
+        // to fix. `MissedTickBehavior` does not help (it governs the
+        // NEXT tick after a late fire; the first late tick still
+        // fires immediately). The `biased;` arm placement (AFTER
+        // `rx.recv()`) is the second half: it lets the queued burst
+        // dequeue before the deadline arm is even considered.
+        if self.pending_pull_outcomes.is_empty() {
+            self.pull_flush_deadline.reset();
+        }
         self.pending_pull_outcomes.push(PendingReport {
             exec_id,
             auth_intent,
             payload,
             reply,
         });
-        // Flush triggers (i) eager at the batch cap, and (iv) eager
-        // when the actor mailbox would Pend (nothing to coalesce
-        // with). (ii) handle_tick head and (iii) handle_leader_lost
-        // are the deadline / drain-with-NotLeader triggers.
-        if self.pending_pull_outcomes.len() >= REPORT_OUTCOME_BATCH_MAX || mailbox_empty {
+        // Flush trigger (i): eager at the batch cap. Triggers
+        // (ii)/(iii)/(iv) are handle_tick head / handle_leader_lost /
+        // the REPORT_OUTCOME_FLUSH_DEADLINE select! arm.
+        if self.pending_pull_outcomes.len() >= REPORT_OUTCOME_BATCH_MAX {
             self.flush_pending_pull_outcomes().await;
         }
     }
@@ -1596,6 +1629,12 @@ impl DagActor {
              tail of every flush and nowhere else"
         );
         let pending = std::mem::take(&mut self.pending_pull_outcomes);
+        // sh-027 §3: the prod N̄ signal — `begin_fenced_calls` is
+        // `#[cfg(test)]` only, so the sh-007c S6 design's core
+        // assumption (N̄≥20) was unverifiable in prod. Buckets at
+        // [1,2,5,10,20,32,64] so the design target is a bucket edge.
+        metrics::histogram!("rio_scheduler_pull_outcome_flush_batch_size")
+            .record(pending.len() as f64);
         let mut acks: Vec<PendingAck> = Vec::with_capacity(pending.len());
 
         // ─── Phase A: prefetch ────────────────────────────────────

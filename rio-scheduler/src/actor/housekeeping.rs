@@ -194,10 +194,9 @@ impl DagActor {
             }
         }
         // sh-002 flush trigger (ii): drain any reports queued since
-        // the last flush — the deadline backstop for sub-BATCH_MAX
-        // inbound rates when trigger (iv) (mailbox-empty) did not
-        // fire (a non-report command sat behind every report). Runs
-        // BEFORE the phase!-attributed body so its cost is not
+        // the last flush — defense-in-depth behind trigger (iv) (the
+        // 250ms REPORT_OUTCOME_FLUSH_DEADLINE select! arm, sh-027
+        // §3). Runs BEFORE the phase!-attributed body so its cost is not
         // misattributed to the estimator phase; the per-phase budget
         // WARN (S2's defense-in-depth) wraps it once that lands.
         self.flush_pending_pull_outcomes().await;

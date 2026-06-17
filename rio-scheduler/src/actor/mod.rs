@@ -623,6 +623,18 @@ pub struct DagActor {
     /// satisfy the exhaustive destructure; the drain runs in
     /// `handle_leader_lost` BEFORE the wipe.
     pending_pull_outcomes: Vec<pull::PendingReport>,
+    /// sh-027 §3, flush trigger (iv): the
+    /// [`REPORT_OUTCOME_FLUSH_DEADLINE`](pull::REPORT_OUTCOME_FLUSH_DEADLINE)
+    /// (250ms) select! arm — bounds ack latency for sub-BATCH_MAX
+    /// inbound rates without coupling to `tick_interval`. Replaces
+    /// the retired mailbox-empty signal (sh-002 trigger iv), which
+    /// degraded N̄ to ~5.5 under interleaving with
+    /// `ListMaterializationJobs`/`SubstituteProgress`.
+    /// `MissedTickBehavior::Delay` (house style — every long-lived
+    /// Interval in-tree sets it explicitly); `reset()` on the
+    /// empty→nonempty transition (`handle_report_outcome`) so an
+    /// idle-stale deadline cannot flush the first report at N=1.
+    pull_flush_deadline: tokio::time::Interval,
     /// sh-002 row 4, the SECOND-level (flush-scoped) accumulator:
     /// `(drv_hash, WalkVerified(..))` pairs the Success consumption
     /// arm pushes INSTEAD of calling
@@ -1199,6 +1211,11 @@ impl DagActor {
             },
             pending_carriers: Vec::new(),
             pending_pull_outcomes: Vec::new(),
+            pull_flush_deadline: {
+                let mut iv = tokio::time::interval(pull::REPORT_OUTCOME_FLUSH_DEADLINE);
+                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                iv
+            },
             pending_walk_completed: Vec::new(),
             status_outbox: std::collections::VecDeque::new(),
             db,
@@ -1379,6 +1396,10 @@ impl DagActor {
             // where `handle_report_outcome`'s inline `is_leader()`
             // gate has been replying NotLeader and never pushed.
             pending_pull_outcomes: _,
+            // Retained: an Interval is stateless across leadership;
+            // `handle_report_outcome` resets it on the next first
+            // push regardless.
+            pull_flush_deadline: _,
             // Retained: flush-scoped (always empty between flushes;
             // `flush_pending_pull_outcomes` and `handle_leader_lost`
             // both `debug_assert!` it).
@@ -1695,6 +1716,24 @@ impl DagActor {
                     Some(c) => c,
                     None => break,
                 },
+                // sh-027 §3, flush trigger (iv): the
+                // REPORT_OUTCOME_FLUSH_DEADLINE backstop. Placed
+                // AFTER `rx.recv()` so the `biased;` order drains
+                // every queued mailbox command (and so every
+                // ReportPullOutcome in a burst) BEFORE this arm is
+                // considered — placement BEFORE rx would flush at
+                // N=1 after any idle (the burst is still queued when
+                // the stale tick fires). The guard means an idle
+                // actor never wakes on this arm (unpolled → no
+                // waker). `handle_report_outcome` resets the
+                // Interval on the empty→nonempty transition, so the
+                // first poll after idle is always 250ms out.
+                _ = self.pull_flush_deadline.tick(),
+                    if !self.pending_pull_outcomes.is_empty() =>
+                {
+                    self.flush_pending_pull_outcomes().await;
+                    continue;
+                }
             };
             consecutive_fast = 0;
 
@@ -1845,13 +1884,13 @@ impl DagActor {
                     // self-gates on is_leader(); the classification
                     // path it funnels into carries the same appending
                     // discipline as the stream Completion arm.
-                    // sh-002 trigger (iv): the mailbox-would-Pend
-                    // signal — sampled HERE (the only scope with
-                    // `rx`) after the dequeue, so the handler knows
-                    // whether another command is already queued to
-                    // coalesce with.
-                    let mailbox_empty = rx.is_empty();
-                    self.handle_report_outcome(exec_id, auth_intent, payload, reply, mailbox_empty)
+                    // sh-027 §3: the retired mailbox-empty signal
+                    // (sh-002 trigger iv) sampled `rx.is_empty()`
+                    // here; it interleaved with ListMaterializationJobs
+                    // / SubstituteProgress and degraded N̄ to ~5.5.
+                    // The REPORT_OUTCOME_FLUSH_DEADLINE select! arm
+                    // (above) is the replacement.
+                    self.handle_report_outcome(exec_id, auth_intent, payload, reply)
                         .await;
                 }
                 ActorCommand::ReportAttemptOutcome {
