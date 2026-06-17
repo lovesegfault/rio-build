@@ -432,6 +432,111 @@ async fn list_claimable_orders_hub_before_leaves() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// sh-025 — `restamp_materialization_job_priorities_fenced` is a
+/// monotone `GREATEST()` ratchet: a re-stamp RAISES a still-pending
+/// job's priority, never lowers it (a later merge that dedups onto a
+/// shared dep raises it; a per-`update_ancestors` PG write would be
+/// the live_053 anti-pattern). Below the floor → `Fenced`, nothing
+/// written. The merge-tx batch inserts at `priority = 0.0`
+/// (`compute_initial` runs at phase 6b, AFTER the merge transaction
+/// commits) and the post-6b re-stamp overwrites — this is the leaf
+/// the hub then heads.
+// r[verify sched.materialize.listing-priority]
+#[tokio::test]
+async fn restamp_raises_monotone() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    let g = ServingGeneration::stamp_from_claim(1);
+
+    // Hub (priority 0.0 — the merge-tx insert shape) + a leaf at 60.0
+    // (a post-merge dispatch-probe creation, which DOES have priority
+    // at create time). At base of the re-stamp the leaf heads.
+    let hub = insert_test_derivation(&db, "restamp-hub").await?;
+    let leaf = insert_test_derivation(&db, "restamp-leaf").await?;
+    let mut tx = db.pool().begin().await?;
+    let created = SchedulerDb::create_materialization_jobs_in_tx(
+        &mut tx,
+        &[
+            NewJobRow {
+                derivation_id: hub,
+                drv_hash: "restamp-hub",
+                tenant_id: None,
+                origin: JobOrigin::CacheOpportunity,
+                priority: 0.0,
+                carried_realized_paths: None,
+            },
+            NewJobRow {
+                derivation_id: leaf,
+                drv_hash: "restamp-leaf",
+                tenant_id: None,
+                origin: JobOrigin::CacheOpportunity,
+                priority: 60.0,
+                carried_realized_paths: None,
+            },
+        ],
+        1,
+    )
+    .await?;
+    tx.commit().await?;
+    let hub_job = created[0].job_id;
+    let listed = db.list_claimable_materialization_jobs(2).await?;
+    assert_eq!(
+        listed[0].drv_hash, "restamp-leaf",
+        "before the re-stamp the merge-tx hub sits at priority 0.0 — the \
+         leaf (60.0) heads"
+    );
+
+    // Post-6b re-stamp: the hub gets its critical-path priority.
+    let raised = db
+        .restamp_materialization_job_priorities_fenced(&[(hub_job, 7200.0)], g)
+        .await?;
+    assert_eq!(raised, FencedOutcome::Applied(1));
+    let listed = db.list_claimable_materialization_jobs(2).await?;
+    assert_eq!(
+        listed[0].drv_hash, "restamp-hub",
+        "after the re-stamp the hub (7200.0) heads"
+    );
+
+    // Monotone: a later, LOWER re-stamp (a second merge whose subgraph
+    // is shorter) is refused by GREATEST().
+    let lower = db
+        .restamp_materialization_job_priorities_fenced(&[(hub_job, 60.0)], g)
+        .await?;
+    assert_eq!(lower, FencedOutcome::Applied(1));
+    let prio: f64 =
+        sqlx::query_scalar("SELECT priority FROM materialization_jobs WHERE job_id = $1")
+            .bind(hub_job)
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(
+        prio, 7200.0,
+        "GREATEST() must refuse a lower re-stamp — the priority ratchet is \
+         monotone"
+    );
+    let listed = db.list_claimable_materialization_jobs(2).await?;
+    assert_eq!(listed[0].drv_hash, "restamp-hub", "the hub still heads");
+
+    // Fenced: below the floor → nothing written.
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) \
+         VALUES (2, 'tenure-next')",
+    )
+    .execute(&test_db.pool)
+    .await?;
+    let fenced = db
+        .restamp_materialization_job_priorities_fenced(&[(hub_job, 9000.0)], g)
+        .await?;
+    assert_eq!(fenced, FencedOutcome::Fenced);
+    let prio: f64 =
+        sqlx::query_scalar("SELECT priority FROM materialization_jobs WHERE job_id = $1")
+            .bind(hub_job)
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(prio, 7200.0, "a fenced re-stamp must leave priority intact");
+    drop(test_db);
+    Ok(())
+}
+
 /// (d) Resolution is exec_id-keyed, fenced, and at-most-once: the
 /// first resolve stamps `resolution_exec_id`/`resolved_at`; resolving
 /// an already-resolved job is a no-op (`Applied(0)` — terminal-row-

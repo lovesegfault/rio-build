@@ -49,6 +49,16 @@ pub(super) struct MergeIngest {
     /// applies the matching in-memory corrections after
     /// `seed_initial_states`.
     pub pending_substitute: Vec<(DrvHash, Vec<String>)>,
+    /// Jobs the merge transaction created OR found via the dedup
+    /// (`persist_and_activate`'s return). Threaded so the post-6b
+    /// priority re-stamp can read each derivation's `sched.priority`
+    /// after `compute_initial` writes it — at in-tx job-create time
+    /// (step 5) every newly-inserted node's priority is `0.0`.
+    /// Carries dedup-found rows too (`created: false` —
+    /// `actor/materialize.rs::CreatedJob`; `db/materialization.rs`
+    /// post-INSERT both-arms SELECT) so a later merge raises a
+    /// still-pending shared dep.
+    pub created_jobs: Vec<super::materialize::CreatedJob>,
     /// Threaded for `verify_preexisting_completed`'s store call.
     pub jwt_token: Option<String>,
 }
@@ -514,6 +524,7 @@ impl DagActor {
             existing_reprobe,
             cached_hits,
             pending_substitute,
+            created_jobs,
             jwt_token,
         })
     }
@@ -639,6 +650,7 @@ impl DagActor {
             existing_reprobe,
             cached_hits,
             pending_substitute,
+            created_jobs,
             jwt_token,
             ..
         } = ingest;
@@ -701,6 +713,31 @@ impl DagActor {
             newly_inserted,
         );
         phase!("6b-critical-path");
+
+        // r[impl sched.materialize.listing-priority]
+        // Post-6b priority re-stamp: the merge-tx batch (step 5)
+        // inserted at priority=0.0 (compute_initial hadn't run); now
+        // each node's sched.priority is set, so one fenced GREATEST()
+        // batch ratchets the still-pending rows. Covers dedup-found
+        // jobs too (CreatedJob.created == false) so a later merge
+        // raises a shared dep. Log-and-continue on Err: build is
+        // Active+committed; a missed re-stamp degenerates to the
+        // pre-107 (created_at, job_id) order (mirrors the
+        // complete_build precedent above).
+        let restamp: Vec<(uuid::Uuid, f64)> = created_jobs
+            .iter()
+            .filter_map(|j| Some((j.job_id, self.dag.node(&j.drv_hash)?.sched.priority)))
+            .collect();
+        if let Err(e) = self
+            .db
+            .restamp_materialization_job_priorities_fenced(&restamp, self.serving_generation())
+            .await
+        {
+            error!(error = %e, jobs = restamp.len(),
+                   "post-6b mat-job priority re-stamp failed (build is Active; \
+                    listing degenerates to (created_at, job_id) for this batch)");
+        }
+        phase!("6b-priority-restamp");
 
         // I-047: pre-existing Completed nodes may have stale output_paths
         // (GC deleted the output between the node's original completion and

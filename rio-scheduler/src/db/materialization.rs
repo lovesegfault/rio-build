@@ -543,6 +543,50 @@ impl SchedulerDb {
         Ok(FencedOutcome::Applied(result.rows_affected()))
     }
 
+    /// Post-6b priority re-stamp (`sched.materialize.listing-priority`,
+    /// migration 107): the merge-tx batch inserts at `priority = 0.0`
+    /// (`compute_initial` runs at phase 6b, AFTER the merge transaction
+    /// commits — `sched.priority` is unset at in-tx job-create time).
+    /// One fenced batch UNNEST `GREATEST()` ratchet over the
+    /// transaction's `created_jobs`, AFTER `compute_initial` returns.
+    /// `GREATEST()` so a later merge that dedups onto a still-pending
+    /// job RAISES it (`CreatedJob.created == false` rows are in the
+    /// batch — `actor/materialize.rs::CreatedJob`, the post-INSERT
+    /// both-arms SELECT) and never lowers; `state = 'pending'` so an
+    /// already-resolved row is left as-is. Runs OUTSIDE the merge tx —
+    /// a scheduler crash between commit and re-stamp leaves the batch
+    /// at `priority = 0` (degenerate to the pre-107 `(created_at,
+    /// job_id)` order; self-heals on the next merge that touches those
+    /// nodes). NOT a per-`update_ancestors` write — that would be the
+    /// live_053 anti-pattern (one fenced UPDATE per completion).
+    pub(crate) async fn restamp_materialization_job_priorities_fenced(
+        &self,
+        rows: &[(Uuid, f64)],
+        serving_generation: ServingGeneration,
+    ) -> Result<FencedOutcome, sqlx::Error> {
+        if rows.is_empty() {
+            return Ok(FencedOutcome::Applied(0));
+        }
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
+            FencedBegin::Open(ftx) => ftx,
+        };
+        let job_ids: Vec<Uuid> = rows.iter().map(|(id, _)| *id).collect();
+        let prios: Vec<f64> = rows.iter().map(|(_, p)| *p).collect();
+        let result = sqlx::query(
+            "UPDATE materialization_jobs j \
+                SET priority = GREATEST(j.priority, u.p) \
+               FROM UNNEST($1::uuid[], $2::float8[]) AS u(id, p) \
+              WHERE j.job_id = u.id AND j.state = 'pending'",
+        )
+        .bind(&job_ids)
+        .bind(&prios)
+        .execute(tx.conn())
+        .await?;
+        tx.commit().await?;
+        Ok(FencedOutcome::Applied(result.rows_affected()))
+    }
+
     /// Park (infra-budget exhaustion, design §2.5) — the job stays
     /// `pending`, `park_until` excludes it from the claimable list
     /// until the backoff expires.
