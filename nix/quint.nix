@@ -439,14 +439,15 @@ let
       # "pre-r2-untwinned"; reason = "..."; }; }. P1 demands a live-import
       # falsify twin for every holds-invariant leaf unless exempted here.
       vacuityExempt ? { },
-      # sh-008: requiredSystemFeatures for the wrapping derivation. A
-      # heavy exhaustive check (modelTimeoutSec ≥ ~1800, hundreds of
-      # millions of states) declares "big-parallel" so the scheduler's
-      # soft_feature_sizing.min_cores bias routes it to a ≥32-core
-      # hwClass instead of the 16-core reference cell. Default empty —
-      # do NOT eagerly tag every check; a follow-on sweep can audit the
-      # measured-runtime budgets.
-      requiredSystemFeatures ? [ ],
+      # sh-008/iter8: requiredSystemFeatures for the wrapping
+      # derivation. Default "big-parallel" so EVERY quint check biases
+      # to a ≥32-core hwClass on its first run; the SLA sizer learns
+      # the actual usage from that run and right-sizes future rebuilds
+      # (light checks succeed in seconds and the sizer learns they're
+      # small). The earlier per-check tagging was whack-a-mole — each
+      # heavy check found by failing once at 16-core. Cost: a one-time
+      # ~525-drv hash bump. Override [] to opt out.
+      requiredSystemFeatures ? [ "big-parallel" ],
     }:
     pkgs.runCommand "quint-${name}"
       (
@@ -601,8 +602,9 @@ let
       workers ? null,
       # Same semantics as mkQuintCheck's modelTimeoutSec.
       modelTimeoutSec ? 1800,
-      # Same semantics as mkQuintCheck's requiredSystemFeatures (sh-008).
-      requiredSystemFeatures ? [ ],
+      # Same semantics as mkQuintCheck's requiredSystemFeatures
+      # (sh-008/iter8): default "big-parallel".
+      requiredSystemFeatures ? [ "big-parallel" ],
     }:
     pkgs.runCommand "quint-${name}"
       (
