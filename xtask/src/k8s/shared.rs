@@ -450,10 +450,10 @@ pub async fn rollout_restart_rio(client: &kube::Client) -> Result<()> {
 /// Reaps stale `session-manager-plugin` / `kubectl port-forward`
 /// children that a SIGKILL'd or panicked xtask left bound. ProcessGuard
 /// only fires on clean drop; the stress harness's `setsid nohup` path
-/// leaks tunnels by design (I-128 QA sessions). A new SSM tunnel on an
+/// leaks tunnels by design (I-128 QA sessions). A new tunnel on an
 /// occupied port either fails to bind or — worse — the old listener
-/// accepts and forwards to a stale NLB, surfacing as the "unexpected
-/// packet type 80" SSH error.
+/// accepts and forwards to a stale target, surfacing as the
+/// "unexpected packet type 80" SSH error.
 pub fn kill_port_listeners(port: u16) {
     use ::nix::sys::signal::{Signal, kill};
     use ::nix::unistd::Pid;
@@ -489,12 +489,11 @@ pub fn kill_port_listeners(port: u16) {
 /// port-forward and SSM tunnel processes in smoke tests.
 ///
 /// I-158: `aws ssm start-session` spawns `session-manager-plugin` as a
-/// grandchild. The previous `start_kill()` only SIGTERM'd the direct
-/// `aws` child; the python wrapper doesn't reliably propagate, so the
-/// plugin orphaned (ppid→1) and kept the local port bound. Next run
-/// either fails to bind or — worse — the stale listener forwards to
-/// the OLD NLB ("unexpected packet type 80"). [`spawn`](Self::spawn)
-/// puts the child in its own group; Drop kills the whole group.
+/// grandchild; SIGTERM on the direct child doesn't reliably propagate
+/// (python wrapper), so the plugin orphans (ppid→1) and keeps the
+/// port bound — same "type 80" failure as [`kill_port_listeners`].
+/// [`spawn`](Self::spawn) puts the child in its own group; Drop kills
+/// the whole group.
 pub struct ProcessGuard {
     pub child: tokio::process::Child,
     /// pgid == child's pid (process_group(0) makes the child a group
@@ -533,6 +532,7 @@ impl Drop for ProcessGuard {
 /// Spawn `kubectl port-forward <target> <local>:<remote>` in `ns` and
 /// return `(bound_local_port, drop-guard)`. `target` is the full
 /// kubectl resource ref (`svc/rio-gateway`, `pod/rio-scheduler-abc`).
+/// Long-lived gateway tunnels use [`super::ssm`] instead.
 ///
 /// Pass `local = 0` for an ephemeral port: kubectl binds `:0`, the OS
 /// picks a free port, and we parse it from the `Forwarding from
@@ -649,37 +649,18 @@ fn bytes_to_memfd_round_trips_via_dev_fd() {
     assert_eq!(std::fs::read(&path).unwrap(), b"k");
 }
 
-/// Port-forward scheduler:9001 + store:9002, wait for TCP accept on both.
-/// Shared by all three providers — kubectl reaches the apiserver proxy
-/// regardless of whether that's via k3s loopback or `aws eks
-/// update-kubeconfig`. ADR-019: scheduler is in rio-system, store in
-/// rio-store — per-service `-n`. Scheduler forward targets the leader
-/// pod (from the Lease) because standbys reject admin writes.
-///
-/// Returns `((sched_port, guard), (store_port, guard))` — the bound
-/// local ports may differ from the inputs when `0` (ephemeral) was
-/// passed. Callers must use the RETURNED ports for the connection.
-pub async fn tunnel_grpc(
-    sched_port: u16,
-    store_port: u16,
-) -> Result<((u16, ProcessGuard), (u16, ProcessGuard))> {
-    let client = kube::client().await?;
-    // helm --wait returns when the NEW scheduler pods are Ready, but
-    // the Lease may still name the OLD pod (terminationGracePeriod;
-    // release is on the shutdown path). Port-forwarding to a
-    // Terminating pod succeeds AND passes the TCP-accept probe below
-    // — then dies mid-RPC, surfacing as `transport error` from
-    // rio-cli. `scheduler_leader` rejects non-live holders; surface
-    // the reason and keep polling until the new leader has acquired.
-    let leader = ui::poll_debug("scheduler lease holder", Duration::from_secs(2), 30, || {
+/// Poll for a live scheduler-leader pod. helm --wait returns when the
+/// NEW pods are Ready, but the Lease may still name the OLD pod
+/// (release is on the shutdown path); tunnelling to a Terminating pod
+/// passes the TCP-accept probe then dies mid-RPC. `scheduler_leader`
+/// rejects non-live holders; this polls until the new leader has
+/// acquired. Bails immediately when no scheduler pods exist
+/// (post-`--wipe`, pre-deploy) so callers' Err arm engages instead of
+/// 30×2s of dead polling.
+pub async fn wait_scheduler_leader(client: &kube::Client) -> Result<String> {
+    ui::poll_debug("scheduler lease holder", Duration::from_secs(2), 30, || {
         let c = client.clone();
         async move {
-            // Post-`--wipe` the Lease may name a deleted pod while NO
-            // scheduler pods exist yet (deploy preflight runs before
-            // helm install). Polling 30×2s for a leader that cannot
-            // appear just spams the log; bail so the caller's Err arm
-            // (status::gather records it; CliCtx callers surface it)
-            // engages immediately.
             if kube::count_pods(&c, NS, "app.kubernetes.io/name=rio-scheduler").await? == 0 {
                 bail!("no rio-scheduler pods exist; skipping leader wait");
             }
@@ -692,10 +673,35 @@ pub async fn tunnel_grpc(
             }
         }
     })
-    .await?;
-    let leader = format!("pod/{leader}");
-    let sched = port_forward(NS, &leader, sched_port, 9001).await?;
-    let store = port_forward(super::NS_STORE, "svc/rio-store", store_port, 9002).await?;
+    .await
+}
+
+/// Tunnel scheduler:9001 + store:9002, wait for TCP accept on both.
+/// ADR-019: scheduler is in rio-system, store in rio-store. Scheduler
+/// targets the leader pod (standbys reject admin writes). EKS uses SSM
+/// per-pod-node ([`super::ssm::tunnel_pod`]); k3s falls back to
+/// kubectl. Returns the BOUND ports (differ from inputs when
+/// `0`/ephemeral was passed).
+pub async fn tunnel_grpc(
+    sched_port: u16,
+    store_port: u16,
+) -> Result<((u16, ProcessGuard), (u16, ProcessGuard))> {
+    let client = kube::client().await?;
+    let leader = wait_scheduler_leader(&client).await?;
+    let (sched, store) = if super::ssm::relay().await.is_some() {
+        let store_pod =
+            kube::one_running_pod(&client, super::NS_STORE, "app.kubernetes.io/name=rio-store")
+                .await?;
+        (
+            super::ssm::tunnel_pod(&client, NS, &leader, 9001, sched_port).await?,
+            super::ssm::tunnel_pod(&client, super::NS_STORE, &store_pod, 9002, store_port).await?,
+        )
+    } else {
+        (
+            port_forward(NS, &format!("pod/{leader}"), sched_port, 9001).await?,
+            port_forward(super::NS_STORE, "svc/rio-store", store_port, 9002).await?,
+        )
+    };
     let (sp, tp) = (sched.0, store.0);
     ui::poll_debug(
         "scheduler+store TCP accept",

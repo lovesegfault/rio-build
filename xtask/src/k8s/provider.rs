@@ -101,24 +101,19 @@ pub trait Provider: Send + Sync {
     /// [`DeployOpts`] for the per-field semantics.
     async fn deploy(&self, cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()>;
 
-    /// e2e build + worker-kill chaos. SSM tunnel (eks) | port-forward (k3s).
+    /// e2e build + worker-kill chaos.
     async fn smoke(&self, cfg: &XtaskConfig) -> Result<()>;
 
-    /// Open a tunnel to the gateway's SSH port, waiting until the SSH
-    /// banner reads through. SSM→NLB (eks) | kubectl port-forward (k3s).
-    /// `local_port = 0` binds an ephemeral port; the returned port is
-    /// the one actually bound — build store URLs from that. Drop the
-    /// guard to tear down.
+    /// Tunnel to the gateway's SSH port, waiting until the banner
+    /// reads through. SSM via the pod's node (eks) | kubectl (k3s).
+    /// `local_port = 0` binds ephemeral; build store URLs from the
+    /// RETURNED port. Drop the guard to tear down.
     async fn tunnel(&self, local_port: u16) -> Result<(u16, super::shared::ProcessGuard)>;
 
-    /// Open port-forwards to scheduler:9001 and store:9002, waiting
-    /// until both accept TCP. Drop the guards to tear down. Unlike
-    /// [`Provider::tunnel`], readiness is bare TCP accept — gRPC has
-    /// no greeting banner. Always `kubectl port-forward` (eks too: the
-    /// scheduler/store aren't behind the NLB; kubectl reaches them via
-    /// the apiserver proxy, which `aws eks update-kubeconfig` already
-    /// set up). Pass `0` for either port to bind an ephemeral local
-    /// port (I-101); the RETURNED port is what to connect to.
+    /// Tunnel scheduler:9001 + store:9002, waiting until both accept
+    /// TCP (gRPC has no greeting). Same transport as
+    /// [`Provider::tunnel`]. Pass `0` for ephemeral (I-101); connect
+    /// to the RETURNED port.
     async fn tunnel_grpc(
         &self,
         sched_port: u16,

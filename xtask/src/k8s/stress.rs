@@ -68,8 +68,8 @@ pub(super) async fn cmd_run(
     // `signal()`, NOT `ctrl_c()`: `ctrl_c()` is `async fn`, so the
     // sigaction installs at first POLL (the select! below), not at
     // call. tokio::pin! does not poll. The spawn loop awaits
-    // `p.tunnel(port)` (up to 150s NLB poll + banner wait) per port —
-    // Ctrl-C during that window would still hit the default
+    // `p.tunnel(port)` (SSM bind + banner wait) per port — Ctrl-C
+    // during that window would still hit the default
     // disposition. `signal()` is a plain fn that registers the
     // sigaction synchronously at call time.
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
