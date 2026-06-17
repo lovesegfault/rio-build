@@ -72,6 +72,38 @@ pub use ffd::{
 };
 pub use sketch::{CapacityType, Cell, CellSketches, CellState};
 
+/// One tracked entry of [`NodeClaimPoolReconciler::inflight_created`]:
+/// the cell the claim was minted into, plus what the controller has
+/// directly OBSERVED about it across ticks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InflightClaim {
+    pub cell: Cell,
+    /// Latched true the first time a tick's `live` LIST shows this
+    /// claim with `Registered=True`; never cleared. sh-030: the
+    /// [`health::detect_vanished`] GcVanish row's "absent stays
+    /// capacity-side by construction" premise holds only at the 10 s
+    /// tick cadence — a 295 s tick let 69 claims Register, sit empty
+    /// past Karpenter `consolidateAfter`, and vanish between ticks.
+    /// That row now splits on this bit
+    /// ([`health::VanishClass::EmptyConsolidation`]: capacity provably
+    /// materialized → `reaped_total{reason=vanished}`, NO ICE mask).
+    /// Defense-in-depth beside the 3×TICK tick bound (c1); does NOT
+    /// independently catch sh-030's exact 295 s trace (no tick
+    /// observed those claims Registered) — it covers the ordinary
+    /// case once the bound holds and ≥1 tick saw the claim.
+    pub ever_registered: bool,
+}
+
+impl From<Cell> for InflightClaim {
+    /// Freshly minted: never yet observed Registered.
+    fn from(cell: Cell) -> Self {
+        Self {
+            cell,
+            ever_registered: false,
+        }
+    }
+}
+
 pub(crate) use evidence::{PendingSchedulerEvidence, TickEvidence};
 
 /// Reconcile interval. Matches the Pool reconciler's `GetSpawnIntents`
@@ -976,7 +1008,7 @@ pub struct NodeClaimPoolReconciler {
     ///    `detect_vanished` so the controller's own reaps aren't
     ///    misread as Karpenter GC.
     // r[impl ctrl.nodeclaim.inflight-conservation+3]
-    inflight_created: HashMap<String, Cell>,
+    inflight_created: HashMap<String, InflightClaim>,
     /// Delete-provenance tombstones (bug_094): names whose `delete()`
     /// this controller attempted and got an ambiguous (non-404) error
     /// back. Consulted by [`health::detect_vanished`] so a
@@ -1905,7 +1937,13 @@ impl NodeClaimPoolReconciler {
             .cover_deficit(&unplaced, &live, &masked, &pass_fence)
             .await?;
         debug!(created = cover.created.len(), "deficit cover");
-        self.inflight_created.extend(cover.created.iter().cloned());
+        self.inflight_created.extend(
+            cover
+                .created
+                .iter()
+                .cloned()
+                .map(|(n, c)| (n, InflightClaim::from(c))),
+        );
         let rejected = cover.rejected;
         // Kube-authoritative `intent_id → spec.nodeName` for the
         // scheduler's hung-node detector. Full set every tick (one
@@ -2715,7 +2753,7 @@ impl NodeClaimPoolReconciler {
         // idle window (and mis-attributes the next re-dispatch). One
         // Ack per tick is the cost; the old all-empty early-return
         // suppressed exactly the tick that mattered.
-        // r[impl ctrl.nodeclaim.ice-mark-clear+5]
+        // r[impl ctrl.nodeclaim.ice-mark-clear+6]
         // Per-cell dedup (inherent — the buffer keys by cell):
         // `health::reap_unhealthy`/`detect_vanished` push one entry
         // per ICE'd CLAIM (up to 8/cell/tick); the per-cell ordered

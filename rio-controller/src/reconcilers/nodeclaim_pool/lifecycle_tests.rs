@@ -72,6 +72,13 @@ fn cell() -> Cell {
     Cell("mid-ebs-x86".into(), CapacityType::Spot)
 }
 
+/// A freshly-minted [`InflightClaim`] for [`cell`] (never yet observed
+/// Registered) — the shape `cover_deficit` extends `inflight_created`
+/// with.
+fn ifc() -> InflightClaim {
+    cell().into()
+}
+
 /// Decode one wire cell-event entry via the shared grammar
 /// (`rio_common::cell_wire`) and project the CELL identity — wire
 /// entries now carry the `@epoch` suffix (merged_bug_008), so tests
@@ -492,7 +499,7 @@ async fn acquire_ok_clears_prev_idle_and_suppress_fields() {
         .add(99.0);
     lab.r.prev_idle.insert("n1".into(), 1.0); // ancient idle-since
     lab.r.recorded_boot.insert("n1".into());
-    lab.r.inflight_created.insert("n9".into(), cell());
+    lab.r.inflight_created.insert("n9".into(), ifc());
     lab.r.hooks.on_acquire();
 
     // n1: registered FRESH (edge at t-5, inside the 30s gate), busy.
@@ -562,7 +569,7 @@ async fn acquire_err_still_clears_prev_idle_keeps_suppress() {
     let mut lab = Lab::new().await;
     lab.r.prev_idle.insert("n1".into(), 1.0);
     lab.r.recorded_boot.insert("n1".into());
-    lab.r.inflight_created.insert("n9".into(), cell());
+    lab.r.inflight_created.insert("n9".into(), ifc());
     lab.r.hooks.on_acquire();
     lab.r.pg = lab.closed_pool().await;
 
@@ -636,7 +643,7 @@ async fn reload_ok_preserves_evidence_buffered_during_err_window() {
     // and cover_deficit do on Err-window ticks): an ICE mark enters
     // the commit-on-Ack buffer; a freshly created claim is tracked.
     lab.r.pending_evidence.buffer_marks([cell()]);
-    lab.r.inflight_created.insert("n-degraded".into(), cell());
+    lab.r.inflight_created.insert("n-degraded".into(), ifc());
 
     // Tick 2: PG recovered → reload Ok. The claim created during the
     // window is live and in-flight, so detect_vanished KEEPs it.
@@ -680,7 +687,7 @@ async fn reload_ok_preserves_evidence_buffered_during_err_window() {
 /// healthy cell; `right:` the buffer holds only the newest polarity,
 /// so the Ack ships the clear alone.
 // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
-// r[verify ctrl.nodeclaim.ice-mark-clear+5]
+// r[verify ctrl.nodeclaim.ice-mark-clear+6]
 #[tokio::test]
 async fn newer_registration_supersedes_buffered_mark_end_to_end() {
     let mut lab = Lab::new().await;
@@ -740,7 +747,7 @@ async fn newer_registration_supersedes_buffered_mark_end_to_end() {
 /// scheduler's fixed clears-then-marks order + epoch gate realize
 /// reset-then-step-0`.
 // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
-// r[verify ctrl.nodeclaim.ice-mark-clear+5]
+// r[verify ctrl.nodeclaim.ice-mark-clear+6]
 #[tokio::test]
 async fn clear_then_mark_ships_both_planes_with_ordered_epochs() {
     let mut lab = Lab::new().await;
@@ -791,7 +798,7 @@ async fn clear_then_mark_ships_both_planes_with_ordered_epochs() {
 /// R2 recency gate: a stale (>3×TICK) Registered edge after the
 /// acquire clear is recorded WITHOUT a sample and WITHOUT an ICE-clear
 /// on the wire (noMassClearAfterFailover / m34CalibNoRecencyGate).
-// r[verify ctrl.nodeclaim.ice-mark-clear+5]
+// r[verify ctrl.nodeclaim.ice-mark-clear+6]
 #[tokio::test]
 async fn post_acquire_stale_registration_records_without_clear_or_sample() {
     let mut lab = Lab::new().await;
@@ -823,7 +830,7 @@ async fn post_acquire_stale_registration_records_without_clear_or_sample() {
 #[tokio::test]
 async fn consolidate_only_prunes_own_reaps_before_detect() {
     let mut lab = Lab::new().await;
-    lab.r.inflight_created.insert("c-ice".into(), cell());
+    lab.r.inflight_created.insert("c-ice".into(), ifc());
     lab.r.consecutive_bot_ticks = 4;
     lab.r.admin = admin_client(dead_channel());
 
@@ -905,6 +912,58 @@ async fn tick_abandoned_after_3x_tick_on_stalled_kube() {
     );
 }
 
+/// sh-030 c2 — a tracked claim the controller OBSERVED Registered
+/// then absent (Karpenter empty-node consolidation across a
+/// controller-blind window) is `EmptyConsolidation`: counter only,
+/// NEVER ICE-masked. The B11 sibling (`ever_registered: false`) is the
+/// structural pin that the never-Registered fast-GC row STILL masks —
+/// the only sub-tick launch-failure detector. Pre-fix red (verbatim):
+/// `assertion `left == right` failed: a tracked claim observed
+/// Registered then consolidated empty must not ICE-mask its cell
+/// (sh-030: Karpenter cleanup, not capacity failure)`.
+// r[verify ctrl.nodeclaim.ice-mark-clear+6]
+#[tokio::test]
+async fn gcvanish_of_ever_registered_is_record_only() {
+    let mut lab = Lab::new().await;
+    // ever_registered=true: an EARLIER tick observed it Registered;
+    // this tick's LIST is empty (consolidated across a blind window).
+    lab.r.inflight_created.insert(
+        "nc-empty".into(),
+        InflightClaim {
+            cell: cell(),
+            ever_registered: true,
+        },
+    );
+    // B11 regression guard: ever_registered=false → STILL ICE-masks.
+    let b11 = Cell("b11-ebs-x86".into(), CapacityType::Spot);
+    lab.r
+        .inflight_created
+        .insert("nc-b11".into(), b11.clone().into());
+
+    lab.tick(5, full_tick_scenario(vec![], vec![], vec![]))
+        .await;
+
+    let acks = lab.ack_calls();
+    assert_eq!(
+        acks.iter()
+            .filter(|a| carries(&a.unfulfillable_cells, &cell()))
+            .count(),
+        0,
+        "a tracked claim observed Registered then consolidated empty \
+         must not ICE-mask its cell (sh-030: Karpenter cleanup, not \
+         capacity failure)"
+    );
+    assert!(
+        acks.iter().any(|a| carries(&a.unfulfillable_cells, &b11)),
+        "B11 preserved: a never-Registered fast-GC vanish STILL \
+         ICE-masks (the only sub-tick launch-failure detector)"
+    );
+    assert!(
+        lab.r.inflight_created.is_empty(),
+        "both exits leave tracking through the typed alphabet"
+    );
+}
+
 /// R3 conservation, vanish arm (r40 bug_020): a tracked claim absent
 /// from live (Karpenter GC) marks its cell; a tracked claim still
 /// in-flight stays tracked.
@@ -915,8 +974,8 @@ async fn vanish_is_marked_own_reap_is_not() {
     let cell_gone = Cell("mid-ebs-x86".into(), CapacityType::Spot);
     lab.r
         .inflight_created
-        .insert("c-gone".into(), cell_gone.clone());
-    lab.r.inflight_created.insert("c-fly".into(), cell());
+        .insert("c-gone".into(), cell_gone.clone().into());
+    lab.r.inflight_created.insert("c-fly".into(), ifc());
 
     // c-fly is live and in-flight (young, no failure condition);
     // c-gone is absent → vanish.
@@ -952,11 +1011,11 @@ async fn vanish_is_marked_own_reap_is_not() {
 /// ICE-mask (...): [.., AckSpawnedIntentsRequest { ..,
 /// unfulfillable_cells: ["mid-ebs-x86:spot@1781162843070"], .. }]` —
 /// tick 2 shipped the false mask through the vanish fold.
-// r[verify ctrl.nodeclaim.ice-mark-clear+5]
+// r[verify ctrl.nodeclaim.ice-mark-clear+6]
 #[tokio::test]
 async fn ambiguous_commit_delete_classifies_as_self_reap_not_ice() {
     let mut lab = Lab::new().await;
-    lab.r.inflight_created.insert("c-bt".into(), cell());
+    lab.r.inflight_created.insert("c-bt".into(), ifc());
 
     // Tick 1: c-bt is boot-stuck (Launched=True, never Registered,
     // age 200s > the 60s default timeout) → BootTimeout reap; the
@@ -1044,7 +1103,7 @@ fn tombstone_survives_foldless_list_failure_window_to_first_consult() {
         .build()
         .expect("rt");
     let mut lab = rt.block_on(Lab::new());
-    lab.r.inflight_created.insert("c-bt".into(), cell());
+    lab.r.inflight_created.insert("c-bt".into(), ifc());
 
     // Tick 1: boot-stuck c-bt (age 200s > the 60s default timeout) →
     // BootTimeout reap; the DELETE errs 503 AFTER committing.
@@ -1146,7 +1205,7 @@ fn tombstone_survives_bot_tick_window_to_first_consult() {
         .build()
         .expect("rt");
     let mut lab = rt.block_on(Lab::new());
-    lab.r.inflight_created.insert("c-bt".into(), cell());
+    lab.r.inflight_created.insert("c-bt".into(), ifc());
 
     // Tick 1: the ambiguous BootTimeout reap (as above).
     rt.block_on(lab.tick(
@@ -2233,7 +2292,7 @@ async fn no_hosting_class_drop_answers_a_typed_verdict() {
     );
 }
 
-// r[verify ctrl.nodeclaim.ice-mark-clear+5]
+// r[verify ctrl.nodeclaim.ice-mark-clear+6]
 /// live_050(b) red R4-A / W7-D leg A — certifies: *never-registered-
 /// terminating transit through the production retain + reconcile ships
 /// the mark AT THE WIRE ARTIFACT* — `AckSpawnedIntentsRequest.
@@ -2248,7 +2307,7 @@ async fn no_hosting_class_drop_answers_a_typed_verdict() {
 async fn never_registered_vanish_ships_the_mark_on_the_wire() {
     let mut lab = Lab::new().await;
     // cover_deficit created it last tick; never observed Registered.
-    lab.r.inflight_created.insert("nc-doomed".into(), cell());
+    lab.r.inflight_created.insert("nc-doomed".into(), ifc());
     // This tick observes it TERMINATING without ever Registering
     // (Karpenter terminal launch failure mid-finalize).
     lab.tick(

@@ -2221,7 +2221,7 @@ its clock passes the prior leader's last mint — symmetric in kind and
 magnitude with the scheduler-side handoff posture (in-memory ladder +
 gate state, lease-holder only).
 
-#r("ctrl.nodeclaim.ice-mark-clear+5")[
+#r("ctrl.nodeclaim.ice-mark-clear+6")[
   ICE mark and clear signals sent via `AckSpawnedIntents` MUST be sound:
   `unfulfillable_cells` (marks) are deduplicated to at most one entry per
   cell per tick (the scheduler's backoff ladder climbs once per DISTINCT
@@ -2258,9 +2258,16 @@ gate state, lease-holder only).
   controller's `ice_timeout` on slow cells) and MUST NOT mask --- it
   counts `boot-timeout`, the vanish-path mirror of the `BootTimeout`
   reap's non-mask posture; an absent-without-terminating-observation
-  exit stays capacity-side by construction (the ~1s GC that evades the
-  terminating window is the launch-failure path; a launched claim's
-  teardown rides a multi-tick finalizer). The failover TIME axis
+  exit stays capacity-side WHEN the controller never observed the
+  claim Registered (the ~1s GC that evades the terminating window is
+  the launch-failure path; a launched claim's teardown rides a
+  multi-tick finalizer --- conditional on the 10 s tick cadence the
+  3×TICK reconcile bound enforces) and is empty-node consolidation
+  (counter only, NEVER a mask) when the controller DID observe it
+  Registered on an earlier tick --- capacity provably materialized
+  (sh-030: a 295 s tick let 69 claims Register, sit empty past
+  Karpenter `consolidateAfter`, and vanish; the unconditional pre-fix
+  row ICE-masked the cell). The failover TIME axis
   is the existing IceBackoff ladder (60s -> 120s -> ... <= max-lead-time,
   scheduler-side) and vanish-detection latency is one tick by
   construction (tick-over-tick absence). `registered_cells`

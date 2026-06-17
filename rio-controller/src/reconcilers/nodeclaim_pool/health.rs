@@ -28,9 +28,9 @@ use kube::api::DeleteParams;
 use rio_crds::karpenter::NodeClaim;
 use tracing::{debug, warn};
 
-use super::NodeClaimPoolConfig;
 use super::ffd::LiveNode;
 use super::sketch::{Cell, CellSketches};
+use super::{InflightClaim, NodeClaimPoolConfig};
 
 /// `Launched=False` `reason` values Karpenter posts before GCing a
 /// claim it can't fulfil. Distinct from a slow-but-progressing launch
@@ -334,8 +334,15 @@ pub fn classify(
 ///   [`super::NodeClaimPoolReconciler::tick`]) let 69 claims Register,
 ///   sit empty past Karpenter `consolidateAfter`, and vanish between
 ///   ticks; the next fold ICE-masked the cell for what was Karpenter
-///   cleanup, not capacity failure. The `ever_registered` axis splits
-///   that row out (the EmptyConsolidation exit).
+///   cleanup, not capacity failure. The
+///   [`InflightClaim::ever_registered`] axis splits that row out
+///   ([`VanishClass::EmptyConsolidation`]).
+/// - **EmptyConsolidation** (absent from `live`, no tombstone, this
+///   controller observed it Registered on an earlier tick): empty-node
+///   consolidation across a controller-blind window — capacity provably
+///   materialized. `reaped_total{reason=vanished}` (the alert still
+///   sees the churn), NO ICE mask. Defense-in-depth beside the 3×TICK
+///   bound; the B11 never-Registered fast-GC row is unaffected.
 /// - **In-flight (present, not Registered, not terminating)**: KEEP.
 ///   r40 bug_020: dropping on first sighting let a claim observed at
 ///   age ~10s and GC'd at ~13–16s escape every detection path —
@@ -378,21 +385,35 @@ pub fn classify(
 /// the map value) AND a `rio_controller_nodeclaim_inflight_tracked`
 /// gauge in `emit_live_gauges` so the leak is observable.
 pub fn detect_vanished(
-    inflight: &mut HashMap<String, Cell>,
+    inflight: &mut HashMap<String, InflightClaim>,
     tombstones: &mut DeleteTombstones,
     live: &[LiveNode],
 ) -> Vec<Cell> {
     let live_by_name: HashMap<&str, &LiveNode> =
         live.iter().map(|n| (n.name.as_str(), n)).collect();
+    // sh-030: latch ever_registered BEFORE the retain — a claim
+    // observed Registered on THIS tick exits via RegisteredHandoff (no
+    // mark either way), but the latch is the controller's accumulated
+    // direct observation, not a one-tick snapshot.
+    for (name, e) in inflight.iter_mut() {
+        e.ever_registered |= live_by_name
+            .get(name.as_str())
+            .is_some_and(|n| n.registered);
+    }
     let mut ice = Vec::new();
-    inflight.retain(|name, cell| {
+    inflight.retain(|name, e| {
+        let cell = &e.cell;
         let observed = live_by_name.get(name.as_str()).copied();
         // merged_bug_050 freshness gate (R29′): the provenance axis
         // is consultable only by a fold whose LIST post-dates the
         // stamp — a same-tick stamp's pre-delete LIST structurally
         // cannot carry the delete's evidence (three of the four
         // lane-by-mode stamp cells are stamp-before-fold).
-        let Some(class) = classify_vanish(observed, tombstones.consultable_reason(name)) else {
+        let Some(class) = classify_vanish(
+            observed,
+            tombstones.consultable_reason(name),
+            e.ever_registered,
+        ) else {
             // Still in-flight: KEEP. classify's reason short-circuit
             // and ice_timeout don't cover the GC'd-between-
             // observations window for slow-ICE cells. A tombstone (if
@@ -405,7 +426,7 @@ pub fn detect_vanished(
         // classification's OWN evidence — never a silent
         // launch-failure exit, never Karpenter-attributed evidence
         // for this controller's own delete.
-        // r[impl ctrl.nodeclaim.ice-mark-clear+5]
+        // r[impl ctrl.nodeclaim.ice-mark-clear+6]
         match class {
             VanishClass::RegisteredHandoff | VanishClass::DeliberateTeardown => {}
             VanishClass::SelfReap(reason) => {
@@ -457,6 +478,21 @@ pub fn detect_vanished(
                 )
                 .increment(1);
                 ice.push(cell.clone());
+            }
+            VanishClass::EmptyConsolidation => {
+                warn!(
+                    %name, %cell,
+                    "tracked NodeClaim consolidated empty (Registered on \
+                     an earlier tick, never pod-bound, vanished across a \
+                     controller-blind window); NOT ICE-masking — capacity \
+                     materialized (sh-030)"
+                );
+                metrics::counter!(
+                    "rio_controller_nodeclaim_reaped_total",
+                    "reason" => "vanished",
+                    "cell" => cell.to_string(),
+                )
+                .increment(1);
             }
         }
         // merged_bug_050 (R32, the `sys.obligation.linear-discharge`
@@ -515,7 +551,8 @@ pub fn tombstone_disposition(class: VanishClass) -> TombstoneDisposition {
         | VanishClass::DeliberateTeardown
         | VanishClass::BootFailureTeardown
         | VanishClass::LaunchFailureTeardown
-        | VanishClass::GcVanish => TombstoneDisposition::HandedToSweep,
+        | VanishClass::GcVanish
+        | VanishClass::EmptyConsolidation => TombstoneDisposition::HandedToSweep,
     }
 }
 
@@ -554,11 +591,17 @@ pub enum VanishClass {
     /// absent/Unknown} (no tombstone): launch-failure teardown caught
     /// mid-GC-transit — IS ICE evidence (marks exactly like GcVanish).
     LaunchFailureTeardown,
-    /// Absent from `live` (no tombstone): GC'd between ticks without
-    /// Registering — capacity-side by construction (see the
-    /// [`detect_vanished`] GcVanish row for why `Launched` is
-    /// unreadable AND immaterial here).
+    /// Absent from `live` (no tombstone), never observed Registered:
+    /// GC'd between ticks without Registering — capacity-side (see
+    /// the [`detect_vanished`] GcVanish row for why `Launched` is
+    /// unreadable AND immaterial here, conditional on the 10 s tick
+    /// cadence the 3×TICK bound enforces).
     GcVanish,
+    /// Absent from `live` (no tombstone), this controller OBSERVED it
+    /// Registered on an earlier tick (sh-030): Karpenter empty-node
+    /// consolidation across a controller-blind window — capacity
+    /// provably materialized; counts `vanished`, never masks.
+    EmptyConsolidation,
 }
 
 /// Pure classification law for one tracked claim's observation —
@@ -572,6 +615,7 @@ pub enum VanishClass {
 pub fn classify_vanish(
     observed: Option<&LiveNode>,
     self_delete: Option<ReapReason>,
+    ever_registered: bool,
 ) -> Option<VanishClass> {
     match (observed, self_delete) {
         // Provenance rows first: a tombstoned claim observed
@@ -594,6 +638,12 @@ pub fn classify_vanish(
             _ => Some(VanishClass::LaunchFailureTeardown),
         },
         (Some(_), _) => None,
+        // sh-030: an absent claim the controller saw Registered is
+        // Karpenter empty-node consolidation across a blind window —
+        // not capacity failure. The B11 never-Registered fast-GC row
+        // (the only sub-tick launch-failure detector) is the false
+        // arm — preserved exactly.
+        (None, None) if ever_registered => Some(VanishClass::EmptyConsolidation),
         (None, None) => Some(VanishClass::GcVanish),
     }
 }
@@ -837,7 +887,7 @@ pub struct TombstoneSweep {
 // r[impl ctrl.pool.delete-outcome]
 pub fn sweep_registered_tombstones(
     tombstones: &mut DeleteTombstones,
-    inflight: &HashMap<String, Cell>,
+    inflight: &HashMap<String, InflightClaim>,
     live: &[LiveNode],
 ) -> TombstoneSweep {
     let live_by_name: HashMap<&str, &LiveNode> =
@@ -924,7 +974,7 @@ pub struct VanishFold {
 // r[impl ctrl.pool.fold-clock]
 // r[impl ctrl.pool.delete-outcome]
 pub fn vanish_fold(
-    inflight: &mut HashMap<String, Cell>,
+    inflight: &mut HashMap<String, InflightClaim>,
     tombstones: &mut DeleteTombstones,
     live: &[LiveNode],
 ) -> VanishFold {
@@ -1209,11 +1259,11 @@ mod tests {
     fn detect_vanished_masks_gcd_claims() {
         use super::super::ffd::tests::set_terminating;
         let h = Cell("h".into(), CapacityType::Spot);
-        let mut inflight: HashMap<String, Cell> = [
-            ("nc-gone".into(), h.clone()),
-            ("nc-inflight".into(), h.clone()),
-            ("nc-reg".into(), h.clone()),
-            ("nc-term".into(), h.clone()),
+        let mut inflight: HashMap<String, InflightClaim> = [
+            ("nc-gone".into(), h.clone().into()),
+            ("nc-inflight".into(), h.clone().into()),
+            ("nc-reg".into(), h.clone().into()),
+            ("nc-term".into(), h.clone().into()),
         ]
         .into();
         let mut reg = node("nc-reg", "h", CapacityType::Spot, 8, 0, 0);
@@ -1252,7 +1302,7 @@ mod tests {
         assert!(inflight.is_empty());
     }
 
-    // r[verify ctrl.nodeclaim.ice-mark-clear+5]
+    // r[verify ctrl.nodeclaim.ice-mark-clear+6]
     /// live_050(b) red R3 / witness W7-C — certifies: *a never-Registered
     /// terminating claim produces a buffered-able mark with the vanish
     /// warn/counter — through the production retain path, not a
@@ -1265,7 +1315,8 @@ mod tests {
         use super::super::ffd::tests::set_terminating;
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         let h = Cell("h".into(), CapacityType::Spot);
-        let mut inflight: HashMap<String, Cell> = [("nc-doomed".to_string(), h.clone())].into();
+        let mut inflight: HashMap<String, InflightClaim> =
+            [("nc-doomed".to_string(), h.clone().into())].into();
         let mut doomed = node("nc-doomed", "h", CapacityType::Spot, 8, 0, 0);
         doomed.registered = false;
         let doomed = set_terminating(doomed);
@@ -1301,7 +1352,8 @@ mod tests {
         );
         // Kill-isolation (the deliberate-teardown arm stays quiet): a
         // REGISTERED terminating claim exits with ZERO mark.
-        let mut inflight: HashMap<String, Cell> = [("nc-reg-term".to_string(), h.clone())].into();
+        let mut inflight: HashMap<String, InflightClaim> =
+            [("nc-reg-term".to_string(), h.clone().into())].into();
         let mut reg_term = node("nc-reg-term", "h", CapacityType::Spot, 8, 0, 0);
         reg_term.registered = true;
         let reg_term = set_terminating(reg_term);
@@ -1328,7 +1380,8 @@ mod tests {
         use super::super::ffd::tests::set_terminating;
         use metrics_util::debugging::DebuggingRecorder;
         let h = Cell("h".into(), CapacityType::Spot);
-        let mut inflight: HashMap<String, Cell> = [("nc-ttl".to_string(), h.clone())].into();
+        let mut inflight: HashMap<String, InflightClaim> =
+            [("nc-ttl".to_string(), h.clone().into())].into();
         let mut n = with_conds(
             node("nc-ttl", "h", CapacityType::Spot, 8, 0, 0),
             &[("Launched", "True", 1001.0)],
@@ -1405,7 +1458,8 @@ mod tests {
         // BootTimeout tombstone + terminating observation → no mask,
         // counter under boot-timeout (the W9-BB lifecycle red's unit
         // face).
-        let mut inflight: HashMap<String, Cell> = [("nc-bt".to_string(), h.clone())].into();
+        let mut inflight: HashMap<String, InflightClaim> =
+            [("nc-bt".to_string(), h.clone().into())].into();
         let mut ts = DeleteTombstones::default();
         ts.stamp(ts_seed("nc-bt", ReapReason::BootTimeout));
         // R29′ freshness (merged_bug_050): a stamp is consultable
@@ -1429,7 +1483,8 @@ mod tests {
         // Ice tombstone + ABSENT observation → the deferred consequence
         // is the mask (record_reap parity — no evidence lost to the
         // ambiguous error), counted under ice, NOT vanished.
-        let mut inflight: HashMap<String, Cell> = [("nc-ice".to_string(), h.clone())].into();
+        let mut inflight: HashMap<String, InflightClaim> =
+            [("nc-ice".to_string(), h.clone().into())].into();
         let mut ts = DeleteTombstones::default();
         ts.stamp(ts_seed("nc-ice", ReapReason::Ice));
         ts.advance_fold_and_prune();
@@ -1457,7 +1512,8 @@ mod tests {
     #[test]
     fn tombstones_expire_and_disconfirmation_keeps_them_armed() {
         let h = Cell("h".into(), CapacityType::Spot);
-        let mut inflight: HashMap<String, Cell> = [("nc-x".to_string(), h.clone())].into();
+        let mut inflight: HashMap<String, InflightClaim> =
+            [("nc-x".to_string(), h.clone().into())].into();
         let mut ts = DeleteTombstones::default();
         ts.stamp(ts_seed("nc-x", ReapReason::BootTimeout));
 
@@ -1544,7 +1600,8 @@ mod tests {
     fn w12_an_registered_handoff_hands_tombstone_to_sweep() {
         use super::super::ffd::tests::set_terminating;
         let h = Cell("h".into(), CapacityType::Spot);
-        let mut inflight: HashMap<String, Cell> = [("nc-race".to_string(), h.clone())].into();
+        let mut inflight: HashMap<String, InflightClaim> =
+            [("nc-race".to_string(), h.clone().into())].into();
         let mut ts = DeleteTombstones::default();
         // The ambiguous delete's full consequence packet (Ice reason
         // + the backing node for the wedge feed).
@@ -1613,7 +1670,7 @@ mod tests {
     fn same_tick_stamp_is_not_consumable_by_its_own_fold() {
         use super::super::ffd::tests::set_terminating;
         let h = Cell("h".into(), CapacityType::Spot);
-        let mut inflight: HashMap<String, Cell> = HashMap::new();
+        let mut inflight: HashMap<String, InflightClaim> = HashMap::new();
         let mut ts = DeleteTombstones::default();
         ts.stamp(AmbiguousDelete {
             name: "nc-fresh".into(),
@@ -1694,8 +1751,8 @@ mod tests {
                     });
                     // R29′ freshness: consultable from the next fold.
                     ts.advance_fold_and_prune();
-                    let inflight: HashMap<String, Cell> = if in_fold_population {
-                        [("nc-x".to_string(), h.clone())].into()
+                    let inflight: HashMap<String, InflightClaim> = if in_fold_population {
+                        [("nc-x".to_string(), h.clone().into())].into()
                     } else {
                         HashMap::new()
                     };
@@ -1782,14 +1839,15 @@ mod tests {
     /// R15 vanish-path census, widened by bug_094 (R22: the pre-fix
     /// census was enrolled and GREEN over a product missing the
     /// deciding axes): `classify_vanish` product-iterated over
-    /// (present × registered × terminating × launched × provenance) —
-    /// 120 cells, every axis value FROM the alphabet (`Option<bool>`
-    /// is `launched()`'s full range; the provenance axis derives from
-    /// `ReapReason::LETTERS`, the pinned closed enum — bug_112 widened it
-    /// with `Idle`). Each row
-    /// asserts its class AND its mark/tracking/tombstone effect
-    /// through the production `detect_vanished` fold. Generator: the
-    /// loop product + rustc exhaustiveness at the law match.
+    /// (present × registered × terminating × launched × provenance ×
+    /// ever_registered) — 240 cells, every axis value FROM the
+    /// alphabet (`Option<bool>` is `launched()`'s full range; the
+    /// provenance axis derives from `ReapReason::LETTERS`, the pinned
+    /// closed enum — bug_112 widened it with `Idle`; `ever_registered`
+    /// is the sh-030 controller-observation axis). Each row asserts
+    /// its class AND its mark/tracking/tombstone effect through the
+    /// production `detect_vanished` fold. Generator: the loop product
+    /// + rustc exhaustiveness at the law match.
     #[test]
     fn vanish_class_census_over_the_observation_product() {
         use super::super::ffd::tests::set_terminating;
@@ -1798,78 +1856,112 @@ mod tests {
             for registered in [false, true] {
                 for terminating in [false, true] {
                     for launched in [None, Some(false), Some(true)] {
-                        for tombstoned in
-                            std::iter::once(None).chain(ReapReason::LETTERS.into_iter().map(Some))
-                        {
-                            let n = match launched {
-                                None => node("nc-x", "h", CapacityType::Spot, 8, 0, 0),
-                                Some(l) => with_conds(
-                                    node("nc-x", "h", CapacityType::Spot, 8, 0, 0),
-                                    &[("Launched", if l { "True" } else { "False" }, 1001.0)],
-                                ),
-                            };
-                            let mut n = n;
-                            n.registered = registered;
-                            let n = if terminating { set_terminating(n) } else { n };
-                            let row = (present, registered, terminating, launched, tombstoned);
-                            // The law table, stated independently of
-                            // the production match (two derivations of
-                            // one law; rustc exhaustiveness on both).
-                            let want = match row {
-                                (false, _, _, _, Some(r)) => Some(VanishClass::SelfReap(r)),
-                                (false, _, _, _, None) => Some(VanishClass::GcVanish),
-                                (true, _, true, _, Some(r)) => Some(VanishClass::SelfReap(r)),
-                                (true, true, true, _, None) => {
-                                    Some(VanishClass::DeliberateTeardown)
+                        for ever_registered in [false, true] {
+                            for tombstoned in std::iter::once(None)
+                                .chain(ReapReason::LETTERS.into_iter().map(Some))
+                            {
+                                let n = match launched {
+                                    None => node("nc-x", "h", CapacityType::Spot, 8, 0, 0),
+                                    Some(l) => with_conds(
+                                        node("nc-x", "h", CapacityType::Spot, 8, 0, 0),
+                                        &[("Launched", if l { "True" } else { "False" }, 1001.0)],
+                                    ),
+                                };
+                                let mut n = n;
+                                n.registered = registered;
+                                let n = if terminating { set_terminating(n) } else { n };
+                                let row = (
+                                    present,
+                                    registered,
+                                    terminating,
+                                    launched,
+                                    tombstoned,
+                                    ever_registered,
+                                );
+                                // The law table, stated independently
+                                // of the production match (two
+                                // derivations of one law; rustc
+                                // exhaustiveness on both).
+                                let want = match row {
+                                    (false, _, _, _, Some(r), _) => Some(VanishClass::SelfReap(r)),
+                                    (false, _, _, _, None, true) => {
+                                        Some(VanishClass::EmptyConsolidation)
+                                    }
+                                    (false, _, _, _, None, false) => Some(VanishClass::GcVanish),
+                                    (true, _, true, _, Some(r), _) => {
+                                        Some(VanishClass::SelfReap(r))
+                                    }
+                                    (true, true, true, _, None, _) => {
+                                        Some(VanishClass::DeliberateTeardown)
+                                    }
+                                    (true, true, false, _, _, _) => {
+                                        Some(VanishClass::RegisteredHandoff)
+                                    }
+                                    (true, false, true, Some(true), None, _) => {
+                                        Some(VanishClass::BootFailureTeardown)
+                                    }
+                                    (true, false, true, _, None, _) => {
+                                        Some(VanishClass::LaunchFailureTeardown)
+                                    }
+                                    (true, false, false, _, _, _) => None,
+                                };
+                                let got = classify_vanish(
+                                    present.then_some(&n),
+                                    tombstoned,
+                                    ever_registered,
+                                );
+                                assert_eq!(got, want, "class for {row:?}");
+                                // Effect row through the production
+                                // fold (the pre-retain latch sets
+                                // ever_registered |= n.registered when
+                                // present, so the InflightClaim seed
+                                // and the latched value coincide on
+                                // the (present=true, registered=true)
+                                // rows — and the seed is the only
+                                // input on present=false rows):
+                                let mut inflight: HashMap<String, InflightClaim> = [(
+                                    "nc-x".to_string(),
+                                    InflightClaim {
+                                        cell: h.clone(),
+                                        ever_registered,
+                                    },
+                                )]
+                                .into();
+                                let mut ts = DeleteTombstones::default();
+                                if let Some(r) = tombstoned {
+                                    ts.stamp(ts_seed("nc-x", r));
+                                    // R29′: consultable from the next fold.
+                                    ts.advance_fold_and_prune();
                                 }
-                                (true, true, false, _, _) => Some(VanishClass::RegisteredHandoff),
-                                (true, false, true, Some(true), None) => {
-                                    Some(VanishClass::BootFailureTeardown)
-                                }
-                                (true, false, true, _, None) => {
-                                    Some(VanishClass::LaunchFailureTeardown)
-                                }
-                                (true, false, false, _, _) => None,
-                            };
-                            let got = classify_vanish(present.then_some(&n), tombstoned);
-                            assert_eq!(got, want, "class for {row:?}");
-                            // Effect row through the production fold:
-                            let mut inflight: HashMap<String, Cell> =
-                                [("nc-x".to_string(), h.clone())].into();
-                            let mut ts = DeleteTombstones::default();
-                            if let Some(r) = tombstoned {
-                                ts.stamp(ts_seed("nc-x", r));
-                                // R29′: consultable from the next fold.
-                                ts.advance_fold_and_prune();
+                                let live = if present { vec![n] } else { vec![] };
+                                let ice = detect_vanished(&mut inflight, &mut ts, &live);
+                                let marks = matches!(
+                                    want,
+                                    Some(
+                                        VanishClass::LaunchFailureTeardown
+                                            | VanishClass::GcVanish
+                                            | VanishClass::SelfReap(ReapReason::Ice)
+                                    )
+                                );
+                                assert_eq!(!ice.is_empty(), marks, "mark effect for {row:?}");
+                                assert_eq!(
+                                    inflight.contains_key("nc-x"),
+                                    want.is_none(),
+                                    "tracking effect for {row:?}"
+                                );
+                                // Tombstone disposition (merged_bug_050,
+                                // R32 — typed per exit): only the exit
+                                // that FIRED the packet (SelfReap)
+                                // consumes; every other exit hands the
+                                // tombstone to the registered-population
+                                // sweep, and a KEEP retains it.
+                                assert_eq!(
+                                    ts.contains("nc-x"),
+                                    tombstoned.is_some()
+                                        && !matches!(want, Some(VanishClass::SelfReap(_))),
+                                    "tombstone effect for {row:?}"
+                                );
                             }
-                            let live = if present { vec![n] } else { vec![] };
-                            let ice = detect_vanished(&mut inflight, &mut ts, &live);
-                            let marks = matches!(
-                                want,
-                                Some(
-                                    VanishClass::LaunchFailureTeardown
-                                        | VanishClass::GcVanish
-                                        | VanishClass::SelfReap(ReapReason::Ice)
-                                )
-                            );
-                            assert_eq!(!ice.is_empty(), marks, "mark effect for {row:?}");
-                            assert_eq!(
-                                inflight.contains_key("nc-x"),
-                                want.is_none(),
-                                "tracking effect for {row:?}"
-                            );
-                            // Tombstone disposition (merged_bug_050,
-                            // R32 — typed per exit): only the exit
-                            // that FIRED the packet (SelfReap)
-                            // consumes; every other exit hands the
-                            // tombstone to the registered-population
-                            // sweep, and a KEEP retains it.
-                            assert_eq!(
-                                ts.contains("nc-x"),
-                                tombstoned.is_some()
-                                    && !matches!(want, Some(VanishClass::SelfReap(_))),
-                                "tombstone effect for {row:?}"
-                            );
                         }
                     }
                 }
@@ -1904,21 +1996,30 @@ mod tests {
         // Same (present=true, registered=false, terminating=true)
         // projection — the launched axis decides boot vs capacity:
         assert_ne!(
-            classify_vanish(Some(&mk(Some(true))), None),
-            classify_vanish(Some(&mk(Some(false))), None),
+            classify_vanish(Some(&mk(Some(true))), None, false),
+            classify_vanish(Some(&mk(Some(false))), None, false),
             "a generator without the launched axis maps two letters to one row"
         );
         // — and the provenance axis decides ours vs Karpenter's:
         assert_ne!(
-            classify_vanish(Some(&mk(None)), Some(ReapReason::BootTimeout)),
-            classify_vanish(Some(&mk(None)), None),
+            classify_vanish(Some(&mk(None)), Some(ReapReason::BootTimeout), false),
+            classify_vanish(Some(&mk(None)), None, false),
             "a generator without the provenance axis maps two letters to one row"
         );
         // The absent projection splits on provenance too:
         assert_ne!(
-            classify_vanish(None, Some(ReapReason::Dead)),
-            classify_vanish(None, None),
+            classify_vanish(None, Some(ReapReason::Dead), false),
+            classify_vanish(None, None, false),
             "absence is not always GcVanish — provenance decides"
+        );
+        // sh-030: the absent ∧ no-provenance projection splits on the
+        // controller's own observation history — ever_registered=true
+        // is empty consolidation (no mask), false is the B11 fast-GC
+        // capacity row (mask):
+        assert_ne!(
+            classify_vanish(None, None, true),
+            classify_vanish(None, None, false),
+            "a generator without the ever_registered axis maps two letters to one row"
         );
     }
 

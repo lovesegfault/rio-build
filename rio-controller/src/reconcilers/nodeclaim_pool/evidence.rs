@@ -514,7 +514,7 @@ mod tests {
     /// one the scheduler resets on; the mark epoch advances with each
     /// newer failure).
     // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
-    // r[verify ctrl.nodeclaim.ice-mark-clear+5]
+    // r[verify ctrl.nodeclaim.ice-mark-clear+6]
     #[test]
     fn mark_clear_mark_ends_clear_then_mark_shipping_both_planes() {
         let mut ev = PendingSchedulerEvidence::default();
