@@ -359,7 +359,13 @@ impl SlaEstimator {
             default_tier_target_wall,
             cluster: cfg.cluster.clone(),
             last_tick: RwLock::new(0.0),
-            last_refresh_wall: RwLock::new(0.0),
+            // Seeded at boot, not 0.0: a standby promoted to leader has
+            // already burned its immediate poller tick on `continue`,
+            // so the first cadence emit can land BEFORE the first
+            // leader-side refresh. With 0.0 here that emit would read
+            // ~1.77e9s (epoch) and false-fire any `> threshold` alert
+            // on every failover.
+            last_refresh_wall: RwLock::new(now_epoch()),
             ring_buffer: cfg.ring_buffer,
             mispredictors: metrics::MispredictorTracker::new(1024),
             #[cfg(test)]
@@ -369,12 +375,11 @@ impl SlaEstimator {
         }
     }
 
-    /// Seconds since the last completed [`Self::refresh`]. Feeds the
+    /// Seconds since the last completed [`Self::refresh`] (or since
+    /// process boot, if none yet). Feeds the
     /// `rio_scheduler_sla_refresh_age_seconds` gauge — emitted from the
     /// actor's housekeeping cadence (NOT from [`estimator_poller`]) so
-    /// it climbs when the poller has died. `0.0` if no refresh has
-    /// ever completed (cold standby — the gauge climbs from boot,
-    /// which is the correct "not yet warm" signal).
+    /// it climbs when the poller has died.
     pub fn refresh_age_seconds(&self) -> f64 {
         now_epoch() - *self.last_refresh_wall.read()
     }

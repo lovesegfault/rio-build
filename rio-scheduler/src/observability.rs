@@ -271,11 +271,10 @@ leader_gauges! {
         ("rio_scheduler_sla_prior_divergence", Some(("param", DIVERGENCE_PARAMS)), 1.0),
     // sh-018b: estimator_poller liveness. Emitted from the actor's
     // housekeeping cadence (NOT the poller loop) so it climbs when the
-    // poller has panicked. Leader-only — the poller is leader-gated, so
-    // a standby's `last_refresh_wall` is meaningless. Reset 0.0 =
-    // alert-neutral on failover; the new leader's first poller tick
-    // (tokio::interval fires immediately) re-stamps `last_refresh_wall`
-    // before the first cadence emit.
+    // poller has panicked. Leader-only — the poller is leader-gated.
+    // Reset 0.0 = alert-neutral on failover; `last_refresh_wall` is
+    // seeded at boot (not 0.0-epoch) so a freshly-promoted leader's
+    // first cadence emit reads age-since-boot, not ~1.77e9s.
     SlaRefreshAge => ("rio_scheduler_sla_refresh_age_seconds", None, 0.0),
 }
 
