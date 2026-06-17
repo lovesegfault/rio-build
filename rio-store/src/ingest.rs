@@ -1083,14 +1083,23 @@ mod tests {
     async fn guard_heartbeat_carries_claim_phase() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let hash = test_hash(0xb5);
-        let claim = claim_owned(&db.pool, &hash, "/nix/store/b5-phase").await;
+        // sh-023: the substitution-shape claim — handle BEFORE the
+        // claim, threaded as `progress`; the guard is the one
+        // claim_placeholder pre-armed (not a separate spawn).
         let handle = Arc::new(ProgressHandle::new());
-        let guard = spawn_placeholder_guard(
-            db.pool.clone(),
-            hash.clone(),
-            claim,
+        let PlaceholderClaim::Owned(guard) = claim_placeholder(
+            &db.pool,
+            &hash,
+            "/nix/store/b5-phase",
+            &[],
+            TEST_HOOKS,
+            None,
             Some(Arc::clone(&handle)),
-        );
+        )
+        .await
+        .expect("claim") else {
+            panic!("expected Owned")
+        };
         handle.store_bytes(64);
         handle.set_phase(ClaimPhase::BudgetParked);
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1176,22 +1185,42 @@ mod tests {
     async fn guard_progress_handle_lands_putpath_stays_null() {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
-        // Substitution-shaped guard: progress handle wired.
+        // Substitution-shaped claim: progress handle threaded BEFORE
+        // the claim (sh-023's substitute.rs shape); the pre-armed guard
+        // heartbeats with progress from its first tick.
         let hash_sub = test_hash(0xa2);
-        let claim_sub = claim_owned(&db.pool, &hash_sub, "/nix/store/ab-guard-sub").await;
         let handle = Arc::new(ProgressHandle::new());
-        let guard_sub = spawn_placeholder_guard(
-            db.pool.clone(),
-            hash_sub.clone(),
-            claim_sub,
+        let PlaceholderClaim::Owned(guard_sub) = claim_placeholder(
+            &db.pool,
+            &hash_sub,
+            "/nix/store/ab-guard-sub",
+            &[],
+            TEST_HOOKS,
+            None,
             Some(Arc::clone(&handle)),
-        );
+        )
+        .await
+        .expect("claim") else {
+            panic!("expected Owned")
+        };
         handle.store_bytes(4096);
 
-        // PutPath-shaped guard: no handle.
+        // PutPath-shaped claim: no handle (the production
+        // `progress: None` shape — fetched_bytes stays NULL forever).
         let hash_put = test_hash(0xa3);
-        let claim_put = claim_owned(&db.pool, &hash_put, "/nix/store/ac-guard-put").await;
-        let guard_put = spawn_placeholder_guard(db.pool.clone(), hash_put.clone(), claim_put, None);
+        let PlaceholderClaim::Owned(guard_put) = claim_placeholder(
+            &db.pool,
+            &hash_put,
+            "/nix/store/ac-guard-put",
+            &[],
+            TEST_HOOKS,
+            None,
+            None,
+        )
+        .await
+        .expect("claim") else {
+            panic!("expected Owned")
+        };
 
         // ≥3 test-cadence ticks (50ms each).
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1246,18 +1275,44 @@ mod tests {
         };
 
         let db = TestDb::new(&crate::MIGRATOR).await;
+        // sh-023: the gauge is RAII-paired with the guard
+        // claim_placeholder pre-arms — drive the production path
+        // directly, not a separate spawn. The guard is held by value
+        // in Owned; the pre-arm gauge inc lands here.
         let hash_a = test_hash(0xa4);
-        let claim_a = claim_owned(&db.pool, &hash_a, "/nix/store/ad-gauge-a").await;
-        let g_a = spawn_placeholder_guard(db.pool.clone(), hash_a, claim_a, None);
-        assert_eq!(gauge_delta(&snap), Some(1.0), "guard spawn increments");
+        let PlaceholderClaim::Owned(g_a) = claim_placeholder(
+            &db.pool,
+            &hash_a,
+            "/nix/store/ad-gauge-a",
+            &[],
+            TEST_HOOKS,
+            None,
+            None,
+        )
+        .await
+        .expect("claim") else {
+            panic!("expected Owned")
+        };
+        assert_eq!(gauge_delta(&snap), Some(1.0), "guard pre-arm increments");
 
         let hash_b = test_hash(0xa5);
-        let claim_b = claim_owned(&db.pool, &hash_b, "/nix/store/ae-gauge-b").await;
-        let g_b = spawn_placeholder_guard(db.pool.clone(), hash_b, claim_b, None);
+        let PlaceholderClaim::Owned(g_b) = claim_placeholder(
+            &db.pool,
+            &hash_b,
+            "/nix/store/ae-gauge-b",
+            &[],
+            TEST_HOOKS,
+            None,
+            None,
+        )
+        .await
+        .expect("claim") else {
+            panic!("expected Owned")
+        };
         assert_eq!(
             gauge_delta(&snap),
             Some(1.0),
-            "second spawn increments again"
+            "second claim increments again"
         );
 
         drop(g_a); // un-defused drop (the abort path)
