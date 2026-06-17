@@ -31,8 +31,6 @@ pub fn test_pool_spec(kind: ExecutorKind) -> PoolSpec {
         tolerations: None,
         host_users: None,
         fuse_threads: None,
-        fuse_passthrough: None,
-        fuse_cache_bytes: None,
         features: vec!["kvm".into()],
         image_pull_policy: None,
         privileged: None,

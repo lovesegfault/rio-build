@@ -3,7 +3,8 @@
 # 2-node k3s via nix/tests/fixtures/k3s-full.nix.
 #
 # Airgapped: all images preloaded via services.k3s.images. NodePort
-# gateway (no cloud LB). Inline chunk backend (no S3).
+# gateway (no cloud LB). Filesystem chunk backend on a local-path PVC
+# (no S3/MinIO/Rook).
 
 global:
   image:
@@ -76,8 +77,20 @@ store:
   autoscaling:
     enabled: false
   chunkBackend:
-    # inline = NARs in PG. No MinIO/Rook airgapped.
-    kind: inline
+    # Builders upload exclusively via PutPathChunked, which the store
+    # rejects with FAILED_PRECONDITION when no chunk backend is
+    # configured — `kind: inline` cannot accept builder uploads, so
+    # every build-performing k3s scenario needs a real backend. The
+    # filesystem backend keeps the airgapped VM self-contained (no
+    # MinIO/Rook); the rio-store-chunks PVC (k3s local-path) keeps
+    # chunks across the store pod restarts/rollouts the lifecycle
+    # scenarios perform.
+    kind: filesystem
+    baseDir: /var/lib/rio/chunks
+    persistence:
+      # Small: VM-test builds upload a few MB of outputs; the k3s node
+      # disk is ~24G total.
+      size: 2Gi
 
 scheduler:
   enabled: true
@@ -176,10 +189,6 @@ poolDefaults:
   # Stream pin that sat here, and the pull-canary stream-baseline pin
   # in values/vmtest-pull-canary.yaml, retired with the stream
   # machinery at the executor-lifecycle 1c'/1d slices.)
-  # 4Gi. values.yaml prod default is 50Gi → ≥51Gi ephemeral-storage
-  # request floor → Unschedulable on the 24G k3s node disks (~21Gi
-  # allocatable). Layered nonpriv overlay inherits via deep-merge.
-  fuseCacheBytes: 4294967296
   # k3s escape hatch. Most scenarios don't care about pod security
   # posture; privileged:true skips the seccomp/hostUsers caveats (k3s's
   # containerd default seccomp blocks mount(2) even with CAP_SYS_ADMIN;

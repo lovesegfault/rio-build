@@ -176,12 +176,6 @@ async fn main() -> anyhow::Result<()> {
         // hands it to the reconciler. `Ctx.placeable = None` ⇔ NodeClaim CRD
         // absent (k3s VM tests without Karpenter) — the gate is a
         // pass-through and the nodeclaim_pool reconciler is not spawned.
-        pool::pod::BUILDER_FUSE_CACHE
-            .set(cfg.nodeclaim_pool.fuse_cache_bytes)
-            .ok();
-        pool::pod::FETCHER_FUSE_CACHE
-            .set(cfg.nodeclaim_pool.fetcher_fuse_cache_bytes)
-            .ok();
         let nodeclaim_crd = nodeclaim_pool::nodeclaim_crd_present(&client).await;
         let (mut placeable_tx, placeable) = if nodeclaim_crd {
             let (tx, rx) = nodeclaim_pool::placeable_channel();

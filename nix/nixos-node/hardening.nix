@@ -70,26 +70,6 @@
     # it needs to be actionable.
     crashDump.enable = true;
 
-    # ── kernel config (P3, baked now since the AMI is rebuilding) ─────
-    # EROFS_FS_ONDEMAND + CACHEFILES_ONDEMAND: the per-page FUSE / riofs
-    # track. NETFS_SUPPORT is the dependency CACHEFILES selects upstream;
-    # listed explicitly so `node-kernel-config` (P3 check) can assert all
-    # four. structuredExtraConfig: the nixpkgs kernel builder merges this
-    # into the generated .config — yes-if-unset, error-if-conflicting.
-    kernelPatches = [
-      {
-        name = "rio-ondemand";
-        patch = null;
-        structuredExtraConfig = with lib.kernel; {
-          EROFS_FS = yes;
-          EROFS_FS_ONDEMAND = yes;
-          CACHEFILES = yes;
-          CACHEFILES_ONDEMAND = yes;
-          NETFS_SUPPORT = yes;
-        };
-      }
-    ];
-
     # ── tmpfs /tmp ────────────────────────────────────────────────────
     # Builder emptyDir scratch lives under the kubelet root, not /tmp;
     # this only covers host-side (containerd unpack, nodeadm temp). Keeps
@@ -123,8 +103,10 @@
     "C /var/lib/kubelet/seccomp/operator/rio-fetcher.json 0644 root root - ${./seccomp/rio-fetcher.json}"
   ];
 
-  # security.lockKernelModules left false until the riofs kmod list is
-  # final (ADR-021 §Security posture). Set deliberately so a future
-  # hardening import doesn't flip it under us.
+  # security.lockKernelModules left false until the builder-pod module
+  # set is final (ADR-021 §Security posture; ADR-022 dropped the riofs
+  # kmod and the EROFS+cachefiles symbols, but k3s/cilium still load
+  # modules on demand). Set deliberately so a future hardening import
+  # doesn't flip it under us.
   security.lockKernelModules = lib.mkDefault false;
 }

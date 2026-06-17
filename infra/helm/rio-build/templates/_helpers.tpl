@@ -67,18 +67,24 @@ Families:
              (private ed25519 seed). Same RIO_JWT__KEY_PATH env var as
              jwtVerify — JwtConfig is a shared type; gateway loads it
              as SigningKey seed, scheduler/store as VerifyingKey.
-  assignHmac .Values.jwt.enabled. SCHEDULER (signs assignment
-             tokens at dispatch) + STORE (verifies them on
-             PutPath/AppendLog). Secret rio-hmac →
-             /etc/rio/assign-hmac/hmac.key, env RIO_HMAC_KEY_PATH.
-             jwt-gated: the boot coherence law (jwt ⇒ service ∧ hmac,
-             r[store.authz.key-coherence]) refuses a store that
+  assignHmac always-on. SCHEDULER (signs assignment tokens at
+             dispatch) + STORE (verifies them on PutPath/AppendLog).
+             Secret rio-hmac → /etc/rio/assign-hmac/hmac.key, env
+             RIO_HMAC_KEY_PATH. SEPARATE Secret from rio-service-hmac
+             so a leaked assignment key cannot mint service tokens
+             (and vice versa). The boot coherence law (jwt ⇒ service ∧
+             hmac, r[store.authz.key-coherence]) refuses a store that
              advertises tenant auth while builder ingest runs keyless
-             — before this family existed NOTHING mounted rio-hmac,
-             so every jwt-enabled deployment was exactly that
+             — before this family existed NOTHING mounted rio-hmac, so
+             every jwt-enabled deployment was exactly that
              half-configuration (assignment enforcement silently in
-             dev-mode). Keyless (non-jwt) deployments stay dev-mode
-             by doctrine.
+             dev-mode). Unconditional since the castore cutover:
+             without the mount the scheduler falls back to unsigned
+             assignment tokens, the store's tenant-scoped castore RPCs
+             reject the builder ("DirectoryService requires a tenant"),
+             and every post-cutover build fails after
+             max_infra_retries. The Secret comes from the k3s fixture
+             manifest (VM tests) or the rio-hmac ExternalSecret (EKS).
   serviceHmac  always-on. GATEWAY+SCHEDULER+CONTROLLER (signers) +
              STORE+SCHEDULER (verifiers).
              Secret rio-service-hmac → /etc/rio/hmac/service-hmac.key,
@@ -105,6 +111,14 @@ Families:
              Signing covers FUTURE uploads only — no backfill of
              already-stored unsigned paths (the R9-S1 registration
              work owns that half).
+  rdsCa      .Values.externalSecrets.enabled (= EKS). STORE + SCHEDULER
+             + CONTROLLER. ConfigMap rio-rds-ca → vendored AWS RDS trust
+             bundle, mounted at dir(.Values.postgres.caBundlePath).
+             Mounted in BOTH auth modes: the ESO-templated password-mode
+             URL says sslmode=verify-full&sslrootcert=<that path>, so a
+             missing mount fails every connect, not just IAM ones.
+             Inert on k3s (externalSecrets disabled → no mount, and
+             postgres-secret.yaml's URL carries no ssl params).
   cov        .Values.coverage.enabled. hostPath /var/lib/rio/cov for
              LLVM profraw atexit flush. POD_NAME in the filename: pods
              share the hostPath and all run PID 1, so %p alone does NOT
@@ -139,7 +153,7 @@ Families:
           (dict "name" "POD_NAME" "valueFrom" (dict "fieldRef" (dict "fieldPath" "metadata.name")))
           (dict "name" "LLVM_PROFILE_FILE" "value" "/var/lib/rio/cov/rio-$(POD_NAME)-%p-%m.profraw")))
       "assignHmac" (dict
-        "on"   $root.Values.jwt.enabled
+        "on"   true
         "vol"  "assign-hmac" "path" "/etc/rio/assign-hmac" "ro" true
         "src"  (dict "secret" (dict "secretName" "rio-hmac"))
         "env"  (list
@@ -156,6 +170,11 @@ Families:
         "src"  (dict "secret" (dict "secretName" "rio-signing-key" "defaultMode" 288))
         "env"  (list
           (dict "name" "RIO_SIGNING_KEY_PATH" "value" "/etc/rio/signing-key/key")))
+      "rdsCa" (dict
+        "on"   $root.Values.externalSecrets.enabled
+        "vol"  "rds-ca" "path" (dir $root.Values.postgres.caBundlePath) "ro" true
+        "src"  (dict "configMap" (dict "name" "rio-rds-ca"))
+        "env"  (list))
 -}}
 {{- range .want }}
 {{- $f := get $fams . }}
@@ -379,6 +398,49 @@ spec:
     - name: grpc
       port: {{ .port }}
       targetPort: grpc
+{{- end -}}
+
+{{- /*
+rio.pgEnv: database-URL (+ auth-mode) env entries for the three PG
+consumers. Args: root, authEnv, urlEnv (the controller's env names are
+RIO_NODECLAIM_POOL__-prefixed). password mode: URL from the
+rio-postgres Secret (ESO-templated Aurora URL on EKS, chart-rendered
+on k3s). iam mode: passwordless inline URL, no Secret — the IRSA role
+mints 15-min tokens (rio_common::pg_iam); verify-full + the vendored
+RDS CA bundle (rdsCa mount) is mandatory so the token is only ever
+sent to a verified server.
+
+The DB user is hardcoded `rio_app` — see the values.yaml postgres
+block for why there is deliberately no knob.
+
+Guards (fail at `helm template`, not at pod CrashLoop):
+- authMode must be one of password|iam — a typo ("IAM", "irsa") would
+  otherwise silently render the password branch and the deployment
+  would look healthy while still on the rotating master password.
+- iam requires externalSecrets.enabled: the rdsCa mount family
+  (rio.mounts) gates on it, so an iam render without it produces a
+  URL whose sslrootcert= points at a file no pod mounts — every PG
+  connect fails only at runtime.
+*/}}
+{{- define "rio.pgEnv" -}}
+{{- if not (has .root.Values.postgres.authMode (list "password" "iam")) -}}
+{{- fail (printf "postgres.authMode must be \"password\" or \"iam\", got %q" .root.Values.postgres.authMode) -}}
+{{- end -}}
+{{- if eq .root.Values.postgres.authMode "iam" }}
+{{- if not .root.Values.externalSecrets.enabled -}}
+{{- fail "postgres.authMode=iam requires externalSecrets.enabled=true (the rdsCa bundle mount is gated on it; without it the rendered sslrootcert path is never mounted)" -}}
+{{- end }}
+- name: {{ .authEnv }}
+  value: iam
+- name: {{ .urlEnv }}
+  value: "postgres://rio_app@{{ required "postgres.authMode=iam needs externalSecrets.auroraEndpoint" .root.Values.externalSecrets.auroraEndpoint }}:5432/rio?sslmode=verify-full&sslrootcert={{ .root.Values.postgres.caBundlePath }}"
+{{- else }}
+- name: {{ .urlEnv }}
+  valueFrom:
+    secretKeyRef:
+      name: rio-postgres
+      key: url
+{{- end }}
 {{- end -}}
 
 {{/*

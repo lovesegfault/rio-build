@@ -47,8 +47,8 @@ k3sFull (
       # ${CHUNK_BUCKET:?}` — bash `:?` exits immediately on empty. The
       # Job template pulls AWS_REGION from .Values.global.region and
       # CHUNK_BUCKET from .Values.store.chunkBackend.bucket; both are
-      # unset in vmtest-full.yaml (region="", chunkBackend.kind=inline
-      # → no bucket). Dummy values let the script progress to the
+      # unset in vmtest-full.yaml (region="", chunkBackend.kind=
+      # filesystem → no bucket). Dummy values let the script progress to the
       # awscli2 init + openssl /tmp write where the EROFS regression
       # would manifest. The `aws secretsmanager` call after that still
       # fails (no creds, no endpoint) — bootstrap-job-ran expects it.

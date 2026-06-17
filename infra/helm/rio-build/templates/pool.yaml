@@ -26,11 +26,6 @@ spec:
   {{- end }}
   {{- /* No dispatchMode: the pull protocol is the only delivery path
          (the knob retired with the stream session protocol). */}}
-  {{- /* fuseCacheBytes is NOT rendered for either kind. r35
-         merged_bug_024: §13e routes Fetcher Pools through nodeclaim_pool
-         too, so both single-source from [nodeclaim_pool].fuse_cache_bytes
-         (= poolDefaults.fuseCacheBytes) so FFD/cover/stamp agree. CEL
-         forbids it for both (pre-CEL CRs: ignored + Warning). */}}
   {{- /* hostUsers rendered for BOTH kinds — k3s containerd needs
          hostUsers:true (cgroup-chown gap); production EKS leaves it
          unset → reconciler defaults to false (ADR-019). NOT CEL-gated

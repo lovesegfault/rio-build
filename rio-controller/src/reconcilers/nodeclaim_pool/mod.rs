@@ -513,30 +513,6 @@ pub struct NodeClaimPoolConfig {
     /// (I-205). Helm: `karpenter.metalSizes`. Empty (kwok/vmtest) → no
     /// instance-size requirement emitted.
     pub metal_sizes: Vec<String>,
-    /// FUSE-cache budget added to every builder pod's
-    /// `ephemeral-storage` request (the `fuse-cache` emptyDir). Single
-    /// source for ALL Builder-pool callers via
-    /// [`pool::pod::BUILDER_FUSE_CACHE`] — the NodeClaim's
-    /// `ephemeral-storage` floor and the pod's actual request both read
-    /// this so FFD/cover/stamp agree (§Simulator-shares-accounting).
-    /// Helm: `poolDefaults.fuseCacheBytes` (50Gi prod). Default is the
-    /// controller-config fallback `pool::pod::BUILDER_FUSE_CACHE_BYTES`
-    /// (8Gi).
-    pub fuse_cache_bytes: u64,
-    /// FUSE-cache budget for FETCHER pods (the `fuse-cache` emptyDir
-    /// sizeLimit and the matching `ephemeral-storage` addend). A FOD's
-    /// FUSE cache only ever holds the fetch script's input closure
-    /// (curl/git/JDK-class toolchains), not the downloaded artifact
-    /// (that lands in the overlay emptyDir, sized from `disk_bytes`,
-    /// which grows via the reactive disk floor on eviction) — so this
-    /// is a small static bound, not the builder budget. Single source
-    /// for all Fetcher callers via [`pool::pod::FETCHER_FUSE_CACHE`]
-    /// (§Simulator-shares-accounting). This dimension has NO eviction
-    /// escalation path: a FOD whose input closure exceeds it retries to
-    /// exhaustion, so raise it here rather than relying on retry. Helm:
-    /// `poolDefaults.fetcherFuseCacheBytes`. Default is
-    /// `pool::pod::FETCHER_FUSE_CACHE_BYTES` (4Gi).
-    pub fetcher_fuse_cache_bytes: u64,
     /// `true` ⟺ the `kube-build-scheduler` Deployment is rendered
     /// (`buildScheduler.enabled`). r40 bug_018: builder pods get
     /// `schedulerName=kube-build-scheduler` only when BOTH the
@@ -697,7 +673,7 @@ impl NodeClaimPoolConfig {
         // whose ephemeral footprint exceeds `max_node_disk` was
         // admitted here and dropped there the same way. All three
         // axes now compare exactly what sizing compares.
-        let fp = crate::reconcilers::pool::jobs::intent_pod_footprint(i, self.fuse_cache_bytes);
+        let fp = crate::reconcilers::pool::jobs::intent_pod_footprint(i);
         let candidate = |h: &str| {
             // Per-class ceiling filter: an hw-agnostic intent (override
             // bypass-path with `--cores=N`) may carry `cores >
@@ -807,8 +783,6 @@ impl Default for NodeClaimPoolConfig {
             // carries the unsourced-per-Q2 caveat).
             max_inflight_unlaunched: 50,
             metal_sizes: Vec::new(),
-            fuse_cache_bytes: pool::pod::BUILDER_FUSE_CACHE_BYTES,
-            fetcher_fuse_cache_bytes: pool::pod::FETCHER_FUSE_CACHE_BYTES,
             // r40 bug_018: matches the chart's `buildScheduler.enabled`
             // default. When `false`, `pool/jobs::build_job` does NOT
             // stamp `schedulerName=kube-build-scheduler` even with the
@@ -1714,7 +1688,6 @@ impl NodeClaimPoolReconciler {
             // Job exists; deferring them mis-reads existing demand as
             // remainder).
             pod_snapshot.job_held_intents(),
-            self.cfg.fuse_cache_bytes,
             window_cores,
             self.tick_counter,
             &mintability,
@@ -2583,7 +2556,6 @@ impl NodeClaimPoolReconciler {
                     &cell.0,
                     class_created.get(&cell.0).copied().unwrap_or(0),
                 ),
-                fuse_cache_bytes: self.cfg.fuse_cache_bytes,
                 // sh-043: the third law term, recomputed per-cell
                 // from the same accumulate-across-cells shape as
                 // `created_cores`/`class_created` (the `created` Vec
@@ -2612,7 +2584,6 @@ impl NodeClaimPoolReconciler {
                 &mut outcomes,
                 &over_cap,
                 (scfg.max_node_cores, scfg.max_node_mem, scfg.max_node_disk),
-                self.cfg.fuse_cache_bytes,
             );
             if claims.is_empty() {
                 debug!(
@@ -4181,7 +4152,6 @@ mod tests {
         let scfg = cover::SizingCfg {
             max_node_cores: 128,
             max_node_mem: cm, // the same mirrored ceiling
-            fuse_cache_bytes: 50 * GI,
             ..Default::default()
         };
         let cell = Cell("hi-ebs-x86".into(), CapacityType::Spot);
@@ -4278,7 +4248,6 @@ mod tests {
                 max_node_cores: 128,
                 max_node_mem: cm,
                 max_node_disk: cfg.max_node_disk,
-                fuse_cache_bytes: cfg.fuse_cache_bytes,
                 ..Default::default()
             };
             let cell = Cell("probe-x86".into(), CapacityType::Spot);

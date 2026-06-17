@@ -31,6 +31,7 @@
   # qemu-vm direct-kernel boot bypasses the loader entirely.
   imports = [
     ./minimal.nix
+    ./kernel.nix
     ./initrd-net.nix
     ./eks-node.nix
     ./hardening.nix

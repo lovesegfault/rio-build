@@ -569,6 +569,158 @@ in
             fi
             mkdir -p /var/lib/kubelet
             mount -o prjquota,noatime "$dev" /var/lib/kubelet
+            if [ "''${#is_links[@]}" -gt 0 ]; then
+              # ADR-022 P0567: rio-mountd enforces the per-build staging
+              # cap as an XFS project quota under /var/rio/staging, so
+              # /var/rio must sit on a prjquota filesystem. A bind mount
+              # of a subdir inherits the superblock's quota support
+              # (mountd uses quotactl_fd, no block-device path needed)
+              # and puts the node content caches on the instance-store
+              # stripe where build I/O belongs. Subdirs come from
+              # tmpfiles, which this unit orders before.
+              #
+              # Instance-store branch ONLY: on EBS-only nodes
+              # rio-ebs-mount (below) provides the prjquota /var/rio from
+              # the dedicated /dev/xvdc volume the rio-default/rio-metal
+              # EC2NodeClasses attach — binding here would make
+              # rio-ebs-mount's findmnt check see XFS and exit 0 with
+              # xvdc never mounted. An eval-time assert cannot see the
+              # runtime fs, so mountd still fails the first Mount loudly
+              # (quota.rs::apply_project_quota) if neither path ran.
+              mkdir -p /var/lib/kubelet/.rio /var/rio
+              mount --bind /var/lib/kubelet/.rio /var/rio
+            fi
+          '';
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+          };
+        };
+
+        # ── rio-ebs-mount: oneshot, EARLY boot ───────────────────────
+        # Counterpart of rio-kubelet-mount's instance-store /var/rio bind
+        # for nodes WITHOUT instance-store NVMe (rio-default/rio-metal
+        # EC2NodeClasses): the chart attaches a dedicated EBS volume at
+        # /dev/xvdc (templates/karpenter.yaml, sized by
+        # karpenter.rioVolumeSize) and this unit formats it XFS and
+        # mounts it at /var/rio with prjquota, so rio-mountd's per-build
+        # staging quota (quota.rs::apply_project_quota — fails the Mount
+        # on a non-prjquota fs) works on every default node class, not
+        # just the NVMe-backed ones. /var/lib/kubelet sits on the xvdb
+        # quota volume here (rio-kubelet-mount's EBS branch) — only the
+        # castore caches + staging move.
+        #
+        # No Condition*= gate: unit-level path conditions are evaluated
+        # before udev coldplug finishes, so a false skip would silently
+        # leave /var/rio on the unquota'd root fs (every Mount rejected).
+        # Instead the script decides on evidence: it exits 0 when
+        # /var/rio already sits on an XFS mount (rio-kubelet-mount's
+        # instance-store branch did its job) or when DMI says the host is
+        # not Amazon EC2 (the QEMU VM test). On EC2 a usable dedicated
+        # volume MUST be found, otherwise the unit fails and blocks
+        # kubelet (Requires= below) — a node that never joins is reaped
+        # by Karpenter, which is louder and cheaper than joining and
+        # infra-failing every build at the mountd handshake. Chart and
+        # AMI therefore roll together (`xtask k8s -p eks up` does both).
+        rio-ebs-mount = {
+          description = "Mount the dedicated EBS volume at /var/rio (prjquota XFS)";
+          wantedBy = [ "sysinit.target" ];
+          before = [
+            "systemd-tmpfiles-setup.service"
+            "kubelet.service"
+          ];
+          # systemd-udev-trigger: with DefaultDependencies=false there
+          # is no implicit ordering against udev coldplug, so on the
+          # legacy-BIOS metal image this unit could start before the
+          # trigger has even queued the block-device events — `udevadm
+          # settle` then returns instantly and the by-id/by-label globs
+          # match nothing. Wants= pulls the trigger in if it isn't part
+          # of the transaction yet.
+          after = [
+            "local-fs.target"
+            "systemd-udev-trigger.service"
+            "rio-kubelet-mount.service"
+          ];
+          wants = [ "systemd-udev-trigger.service" ];
+          unitConfig.DefaultDependencies = false;
+          path = [
+            pkgs.xfsprogs
+            pkgs.util-linux
+            pkgs.systemd # udevadm
+          ];
+          script = ''
+            set -euo pipefail
+            # Evidence first: if /var/rio already sits on an XFS mount,
+            # rio-kubelet-mount's instance-store branch did its job and
+            # this unit has nothing to manage. Checking the outcome
+            # instead of the instance-store by-id glob means a coldplug
+            # race in the dispatcher surfaces as the loud failure below
+            # instead of a silent fall-through onto the root fs.
+            if [ "$(findmnt -no FSTYPE /var/rio || true)" = xfs ]; then
+              echo "/var/rio already on an XFS mount (rio-kubelet-mount); nothing to do"
+              exit 0
+            fi
+            # Only EC2 hosts get the fail-hard treatment below. QEMU
+            # (the VM test) and other non-EC2 boots have no dedicated
+            # volume to manage and must not be blocked from booting.
+            sys_vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo unknown)
+            if [ "$sys_vendor" != "Amazon EC2" ]; then
+              echo "DMI sys_vendor '$sys_vendor' is not Amazon EC2; not managing /var/rio"
+              exit 0
+            fi
+            # Same coldplug caveat as rio-kubelet-mount: by-id/by-label
+            # symlinks for non-fstab block devices appear asynchronously.
+            udevadm settle
+            # Prefer the label this unit wrote on a previous boot: EBS
+            # persists (unlike instance store), so a node reprovisioned
+            # onto the same volume reuses it — and its cache contents —
+            # without re-running the device selection.
+            target=""
+            if [ -e /dev/disk/by-label/rio-var-rio ]; then
+              target=$(readlink -f /dev/disk/by-label/rio-var-rio)
+            else
+              # Whole-disk EBS devices only (skip -part* and the
+              # duplicate per-namespace by-id links).
+              mapfile -t ebs < <(
+                for link in /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_*; do
+                  [ -e "$link" ] || continue
+                  dev=$(readlink -f "$link")
+                  [ "$(lsblk -dno TYPE "$dev")" = disk ] && echo "$dev"
+                done | sort -u
+              )
+              # Never touch the volume backing / nor the kubelet quota
+              # volume rio-kubelet-mount already claimed (xvdb) — the
+              # /var/rio volume is the remaining one (xvdc).
+              root_disk=$(lsblk -no PKNAME "$(findmnt -nvo SOURCE /)" | head -n1)
+              kubelet_disk=$(basename "$(findmnt -nvo SOURCE /var/lib/kubelet)" 2>/dev/null || true)
+              for dev in "''${ebs[@]}"; do
+                [ "$(basename "$dev")" = "$root_disk" ] && continue
+                [ -n "$kubelet_disk" ] && [ "$(basename "$dev")" = "$kubelet_disk" ] && continue
+                target="$dev"
+                break
+              done
+            fi
+            if [ -z "$target" ]; then
+              echo "Amazon EC2 host with no dedicated /var/rio volume — the rio-default/" >&2
+              echo "rio-metal EC2NodeClass must map a third EBS volume at /dev/xvdc" >&2
+              echo "(helm karpenter.rioVolumeSize); refusing to run castore builds off" >&2
+              echo "the unquota'd root filesystem" >&2
+              exit 1
+            fi
+            # EBS persists across reboots (unlike instance store): only
+            # format a blank device, reuse our own XFS, refuse anything
+            # else rather than wiping a volume we don't recognize.
+            fstype=$(blkid -o value -s TYPE "$target" || true)
+            case "$fstype" in
+              "") mkfs.xfs -L rio-var-rio "$target" ;;
+              xfs) ;;
+              *)
+                echo "unexpected filesystem '$fstype' on $target; refusing to format" >&2
+                exit 1
+                ;;
+            esac
+            mkdir -p /var/rio
+            mount -o prjquota,noatime "$target" /var/rio
           '';
           serviceConfig = {
             Type = "oneshot";
@@ -713,6 +865,15 @@ in
             # udev view, so there is no Condition*-skip lane and no
             # both-skip window (merged_bug_045).
             "rio-kubelet-mount.service"
+            # Same fail-HARD rationale for the /var/rio EBS path: a
+            # Ready node whose /var/rio sits on the unquota'd root fs
+            # has every build rejected at the mountd Mount handshake —
+            # better to never join than to join and burn infra retries.
+            # The unit exits 0 (not condition-skip) on instance-store
+            # nodes and non-EC2 boots, so this Requires= only bites
+            # when the dedicated xvdc volume is genuinely missing or
+            # unusable.
+            "rio-ebs-mount.service"
           ];
           path = [
             # kubeconfig exec-auth (nodeadm.nix patches the template to
@@ -801,6 +962,18 @@ in
         "d /sbin 0755 root root -"
         "L+ /sbin/xfs_quota - - - - ${pkgs.xfsprogs}/bin/xfs_quota"
         "L+ /usr/bin/lsattr - - - - ${pkgs.e2fsprogs}/bin/lsattr"
+        # ADR-022 P0567: rio-mountd's working tree, hostPath-mounted by
+        # the mountd DaemonSet (type: Directory — the pod refuses to
+        # start if the AMI didn't create these). rio-kubelet-mount (or
+        # rio-ebs-mount on nodes without instance store) runs first and
+        # puts /var/rio on a prjquota XFS, so these land on the
+        # instance-store stripe / the dedicated EBS volume. Root 0755:
+        # mountd chowns only the per-build staging subdirs it creates.
+        "d /var/rio 0755 root root -"
+        "d /var/rio/castore 0755 root root -"
+        "d /var/rio/staging 0755 root root -"
+        "d /var/rio/cache 0755 root root -"
+        "d /var/rio/chunks 0755 root root -"
       ];
     };
   };
