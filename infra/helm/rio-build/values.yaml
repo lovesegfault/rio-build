@@ -209,8 +209,12 @@ buildScheduler:
   # not catch a stale default).
   image: registry.k8s.io/kube-scheduler:v1.35.0@sha256:0ab622491a82532e01876d55e365c08c5bac01bcd5444a8ed58c1127ab47819f
   resources:
-    requests: {cpu: 100m, memory: 128Mi}
-    limits: {memory: 256Mi}
+    # sh-020: 256Mi OOMKilled 4-5× under iter4's ~500-pending-pod ×
+    # ~500-node burst (kube-scheduler memory scales with both). 8Gi
+    # gives headroom for the high-thousands node count rio's nodeclaim
+    # pool can reach under a wide DAG.
+    requests: {cpu: 100m, memory: 512Mi}
+    limits: {memory: 8Gi}
 
 # ──────────────────────────────────────────────────────────────────────────
 # rio-store
