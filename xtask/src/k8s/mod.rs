@@ -20,6 +20,7 @@ pub mod provider;
 pub(crate) mod qa;
 pub mod shared;
 mod sla_gates;
+pub(crate) mod ssm;
 pub(crate) mod status;
 mod stress;
 mod wipe;

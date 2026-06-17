@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment};
 use k8s_openapi::api::coordination::v1::Lease;
-use k8s_openapi::api::core::v1::{Namespace, Pod, Secret, Service};
+use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Secret, Service};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::ResourceExt;
 use kube::api::{Api, ListParams, Patch, PatchParams};
@@ -172,6 +172,46 @@ pub async fn probe_secret_key(
         .data
         .and_then(|d| d.get(key).cloned())
         .and_then(|v| String::from_utf8(v.0).ok()))
+}
+
+/// `(pod_ip, node_instance_id)` — [`super::ssm::tunnel_pod`] relays
+/// via the pod's own node (host netns reaches local pod IPs only).
+pub async fn pod_addr(client: &Client, ns: &str, name: &str) -> Result<(String, String)> {
+    let pod = Api::<Pod>::namespaced(client.clone(), ns).get(name).await?;
+    let ip = pod
+        .status
+        .and_then(|s| s.pod_ip)
+        .with_context(|| format!("Pod {ns}/{name} has no podIP yet"))?;
+    let node = pod
+        .spec
+        .and_then(|s| s.node_name)
+        .with_context(|| format!("Pod {ns}/{name} not yet scheduled"))?;
+    let inst = Api::<Node>::all(client.clone())
+        .get(&node)
+        .await?
+        .spec
+        .and_then(|s| s.provider_id)
+        .and_then(|p| p.rsplit('/').next().map(str::to_owned))
+        .with_context(|| format!("Node {node} has no providerID"))?;
+    Ok((ip, inst))
+}
+
+/// Name of one Running, non-Terminating pod matching `selector` — for
+/// picking a backend to SSM-tunnel to. A Terminating pod stays
+/// `phase: Running` until grace expires; right after a rollout it's
+/// the previous generation (stale config/keys).
+pub async fn one_running_pod(client: &Client, ns: &str, selector: &str) -> Result<String> {
+    Api::<Pod>::namespaced(client.clone(), ns)
+        .list(&ListParams::default().labels(selector))
+        .await?
+        .items
+        .into_iter()
+        .find(|p| {
+            p.metadata.deletion_timestamp.is_none()
+                && p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running")
+        })
+        .and_then(|p| p.metadata.name)
+        .with_context(|| format!("no Running pod matching {selector:?} in {ns}"))
 }
 
 /// LoadBalancer ingress hostname for the gateway Service. `Err` if the

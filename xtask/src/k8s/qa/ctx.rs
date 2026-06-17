@@ -162,29 +162,14 @@ impl QaCtx {
         tokio::spawn(async move { gateway_build(key, expr).await.map(drop) })
     }
 
-    /// Port-forward gateway:22 and return the ssh-ng store URL for
+    /// Tunnel gateway:22 and return the ssh-ng store URL for
     /// `tenants[tenant_idx]`, plus the guard. For scenarios that need
     /// to run arbitrary nix commands (`copy --from`, `path-info`,
     /// `store ping`) under a specific tenant's identity rather than
     /// the busybox-build helpers.
     pub async fn gateway_tunnel(&self, tenant_idx: usize) -> Result<(String, ProcessGuard)> {
         let key = self.tenant(tenant_idx).key.clone();
-        let (port, guard) = shared::port_forward(NS, "svc/rio-gateway", 0, 22).await?;
-        crate::ui::poll_debug(
-            "gateway SSH banner",
-            Duration::from_secs(2),
-            20,
-            || async move {
-                Ok(tokio::time::timeout(
-                    Duration::from_secs(2),
-                    smoke::ssh_banner("127.0.0.1", port),
-                )
-                .await
-                .ok()
-                .flatten())
-            },
-        )
-        .await?;
+        let (port, guard) = smoke::gateway_tunnel(0).await?;
         Ok((
             format!(
                 "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",
@@ -217,10 +202,9 @@ impl QaCtx {
     pub const NS_BUILDERS: &str = NS_BUILDERS;
 }
 
-/// Port-forward gateway:22, wait for SSH banner, run `build_expr`.
-/// Shared body of all four `nix_build[_expr]_via_gateway[_bg]` so each
-/// variant is a one-liner. Returns the built `.drv` store path from the
-/// SUCCEEDING `build_expr` attempt.
+/// Tunnel gateway:22, wait for SSH banner, run `build_expr`. Shared
+/// body of all four `nix_build[_expr]_via_gateway[_bg]`. Returns the
+/// built `.drv` store path from the SUCCEEDING `build_expr` attempt.
 async fn gateway_build(key: PathBuf, expr: String) -> Result<String> {
     // Mechanism steps (`step_debug`) — repeated ~50× per QA run, only
     // useful under `-v`. Failures still propagate via `?`; the
@@ -230,24 +214,8 @@ async fn gateway_build(key: PathBuf, expr: String) -> Result<String> {
     // on its own timeout) — those callers must check `bg.is_finished()`
     // / `bg.await` if a silent bg failure would matter, since a
     // step_debug error is not loud enough to be the only signal.
-    let (port, _guard) = crate::ui::step_debug("port-forward gateway:22", || {
-        shared::port_forward(NS, "svc/rio-gateway", 0, 22)
-    })
-    .await?;
-    crate::ui::poll_debug(
-        "gateway SSH banner",
-        Duration::from_secs(2),
-        20,
-        || async move {
-            Ok(
-                tokio::time::timeout(Duration::from_secs(2), smoke::ssh_banner("127.0.0.1", port))
-                    .await
-                    .ok()
-                    .flatten(),
-            )
-        },
-    )
-    .await?;
+    let (port, _guard) =
+        crate::ui::step_debug("tunnel gateway:22", || smoke::gateway_tunnel(0)).await?;
     let store = format!(
         "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",
         key.display()
@@ -291,40 +259,12 @@ fn one_line(e: &anyhow::Error) -> String {
 
 // ─── PG handle ─────────────────────────────────────────────────────────
 
-const RELAY_POD: &str = "rio-qa-pg-relay";
-
-/// Drop-guard for the cluster-side `rio-qa-pg-relay` pod. Fires a
-/// fire-and-forget `kubectl delete --wait=false` so the pod doesn't
-/// outlive the [`PgHandle`]. Sync `std::process::Command::spawn` (not
-/// tokio) — Drop can't be async and the runtime may be shutting down.
-struct RelayPodGuard;
-
-impl Drop for RelayPodGuard {
-    fn drop(&mut self) {
-        tracing::debug!(pod = RELAY_POD, "deleting socat relay pod (drop)");
-        let _ = std::process::Command::new("kubectl")
-            .args([
-                "-n",
-                NS,
-                "delete",
-                "pod",
-                RELAY_POD,
-                "--wait=false",
-                "--ignore-not-found",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
-}
-
 /// Process-lifetime PG connection. Built once in `scheduler::run()`;
 /// scenarios get `Arc<PgPool>` via `QaCtx`. Field drop order: pool
-/// closes → port-forward killed → relay pod deleted.
+/// closes → tunnel killed.
 pub struct PgHandle {
     pub pool: PgPool,
-    _guard: Option<ProcessGuard>,
-    _relay_pod: Option<RelayPodGuard>,
+    _guard: ProcessGuard,
 }
 
 impl PgHandle {
@@ -337,87 +277,41 @@ impl PgHandle {
         Self::open_with_url(&url).await
     }
 
-    /// Connect to the cluster's PG via an in-cluster relay.
+    /// Connect to the cluster's PG. Neither RDS (private subnets, node
+    /// SG only) nor k3s bitnami PG (ClusterIP) is reachable from the
+    /// operator host — SSM-tunnel to the RDS endpoint (eks) or
+    /// port-forward `svc/rio-postgresql` (k3s), then sqlx connects to
+    /// `localhost:{bound}`.
     ///
-    /// RDS is in private VPC subnets and its SG only admits the EKS
-    /// node SG — the operator's machine can't reach it directly. On
-    /// k3s, bitnami PG is in-cluster. Either way: port-forward to
-    /// something in `rio-system` that listens on 5432. On k3s that's
-    /// `svc/rio-postgresql`. On EKS, we spawn an `alpine/socat` relay
-    /// pod (5432 → RDS endpoint) and port-forward to THAT, then
-    /// sqlx connects to `localhost:{bound}`.
-    ///
-    /// `up --wipe` calls this with a URL captured BEFORE `helm uninstall`
-    /// (which removes the ExternalSecret-backed `rio-postgres` Secret).
+    /// `up --wipe` passes a URL captured BEFORE `helm uninstall`
+    /// (which removes the ExternalSecret-backed Secret).
     pub async fn open_with_url(url: &str) -> Result<Self> {
         let (host, port) = pg_host_port(url)?;
         let in_cluster = host.ends_with(&format!(".{NS}")) || host == "rio-postgresql";
-
-        let (bound, guard, relay_pod) = if in_cluster {
-            // k3s: bitnami PG is a Service in rio-system.
-            let (b, g) = shared::port_forward(NS, "svc/rio-postgresql", 0, 5432).await?;
-            (b, g, None)
+        let (bound, guard) = if in_cluster {
+            shared::port_forward(NS, "svc/rio-postgresql", 0, 5432).await?
         } else {
-            // EKS: RDS is VPC-private. Spawn a socat relay pod that
-            // listens on 5432 and forwards to the RDS endpoint, then
-            // port-forward to THAT pod.
-            let (b, g, p) = spawn_socat_relay(&host, port).await?;
-            (b, g, Some(p))
+            crate::k8s::ssm::tunnel_host(&host, port, 0).await?
         };
-
         let url = rewrite_pg_host(url, &format!("localhost:{bound}"));
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(4)
             .connect(&url)
             .await
-            .context("connect to cluster PG via port-forward")?;
+            .context("connect to cluster PG via tunnel")?;
         info!(
-            "qa pg handle open ({}, {})",
+            "qa pg handle open ({}, {host})",
             if in_cluster {
                 "port-forward svc"
             } else {
-                "socat-relay"
-            },
-            host
+                "ssm"
+            }
         );
         Ok(Self {
             pool,
-            _guard: Some(guard),
-            _relay_pod: relay_pod,
+            _guard: guard,
         })
     }
-}
-
-/// Spawn an `alpine/socat` pod in `rio-system` that listens on 5432 and
-/// forwards to `host:port` (the RDS endpoint), wait for it to be
-/// Running, port-forward to it. Named `rio-qa-pg-relay`. Returns the
-/// port-forward guard plus a [`RelayPodGuard`] that deletes the
-/// cluster-side pod on drop. The pre-delete here is the crash-recovery
-/// backstop for the case where a prior xtask was SIGKILLed before its
-/// [`RelayPodGuard`] ran.
-async fn spawn_socat_relay(host: &str, port: u16) -> Result<(u16, ProcessGuard, RelayPodGuard)> {
-    let s = sh::shell()?;
-    let _ = sh::try_read(cmd!(
-        s,
-        "kubectl -n {NS} delete pod {RELAY_POD} --ignore-not-found --wait=true"
-    ));
-    let target = format!("TCP:{host}:{port}");
-    sh::try_read(cmd!(
-        s,
-        "kubectl -n {NS} run {RELAY_POD} --image=alpine/socat --restart=Never -- TCP-LISTEN:5432,fork,reuseaddr {target}"
-    ))?;
-    // Guard immediately after the pod is created so a failure in
-    // wait/port-forward below still cleans it up.
-    let pod_guard = RelayPodGuard;
-    // Wait Running (alpine/socat is small; usually <10s).
-    sh::try_read(cmd!(
-        s,
-        "kubectl -n {NS} wait --for=condition=Ready pod/{RELAY_POD} --timeout=60s"
-    ))
-    .context("socat relay pod never became Ready")?;
-    // Port-forward to the socat pod's 5432.
-    let (bound, pf) = shared::port_forward(NS, &format!("pod/{RELAY_POD}"), 0, 5432).await?;
-    Ok((bound, pf, pod_guard))
 }
 
 /// Parse `host` and `port` from a `postgres://user:pass@host:port/db`
@@ -581,7 +475,7 @@ impl TenantPool {
     /// ~80s for a rollout, so the swap is roughly net-zero on time and
     /// strictly less cluster disruption.
     async fn wait_keys_hot_reload(probe_tenant: &Tenant) -> Result<()> {
-        let (port, _guard) = shared::port_forward(NS, "svc/rio-gateway", 0, 22).await?;
+        let (port, _guard) = smoke::gateway_tunnel(0).await?;
         let key = probe_tenant.key.display().to_string();
         let store = format!("ssh-ng://rio@localhost:{port}?ssh-key={key}");
         let sshopts = format!("{} -o ConnectTimeout=5", shared::NIX_SSHOPTS_BASE);

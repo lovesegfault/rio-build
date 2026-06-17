@@ -85,7 +85,7 @@ impl Provider for Eks {
     }
 
     async fn tunnel(&self, local_port: u16) -> Result<(u16, crate::k8s::shared::ProcessGuard)> {
-        smoke::gateway_port_forward(local_port).await
+        smoke::gateway_tunnel(local_port).await
     }
 
     async fn gateway_endpoint(&self, local_port: u16) -> Result<GatewayEndpoint> {
@@ -126,9 +126,6 @@ impl Provider for Eks {
         (u16, crate::k8s::shared::ProcessGuard),
         (u16, crate::k8s::shared::ProcessGuard),
     )> {
-        // NOT SSM — scheduler/store aren't behind the NLB. kubectl
-        // reaches them via the apiserver proxy, which `aws eks
-        // update-kubeconfig` (provision step) already set up.
         crate::k8s::shared::tunnel_grpc(sched_port, store_port).await
     }
 

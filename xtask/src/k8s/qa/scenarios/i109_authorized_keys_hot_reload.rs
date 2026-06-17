@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::common::{NS_SYSTEM, poll_until};
+use super::common::poll_until;
 use crate::k8s::qa::{Component, Isolation, QaCtx, Scenario, ScenarioMeta, Verdict};
 use crate::k8s::shared;
 use crate::ssh;
@@ -57,7 +57,7 @@ impl Scenario for AuthorizedKeysHotReload {
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))?;
         let key = key.display().to_string();
 
-        let (port, _guard) = shared::port_forward(NS_SYSTEM, "svc/rio-gateway", 0, 22).await?;
+        let (port, _guard) = crate::k8s::eks::smoke::gateway_tunnel(0).await?;
         // The gateway is an ssh-ng store protocol server, NOT a shell —
         // `ssh ... cmd` authenticates then hangs (no exec channel).
         // `nix store ping` is the actual user flow: SSH auth + ssh-ng

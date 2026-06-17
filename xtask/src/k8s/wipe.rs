@@ -239,8 +239,8 @@ async fn empty_chunk_buckets() -> Result<()> {
 /// `DROP SCHEMA public CASCADE; CREATE SCHEMA public;` so the deploy
 /// phase's migration Job starts from 001. RDS is in private subnets
 /// and every rio pod is gone by now; [`PgHandle::open_with_url`]
-/// spawns the socat relay in `rio-system` (the one namespace wipe
-/// preserves) and port-forwards into sqlx, so the URL never lands in
+/// opens the SSM tunnel (eks) or port-forwards `svc/rio-postgresql`
+/// (k3s) and connects sqlx via localhost, so the URL never lands in
 /// a kubelet-logged argv.
 async fn reset_pg_schema(url: &str) -> Result<()> {
     ui::step("reset PG schema", || async {
