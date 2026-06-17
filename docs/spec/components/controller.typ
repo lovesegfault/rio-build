@@ -1514,6 +1514,24 @@ completions the closed-edge inference allowed.
   stated in prose beside constants that can drift apart.
 ]
 
+= Gateway deletion-cost annotator
+
+#r("ctrl.gateway.deletion-cost")[
+  The controller MUST periodically annotate each gateway pod with
+  `controller.kubernetes.io/pod-deletion-cost` equal to that pod's current
+  count of authenticated SSH connections (the
+  #(refs.metric)("rio_gateway_connections_active") gauge scraped from the
+  pod's `/metrics` endpoint), so the ReplicaSet controller evicts the
+  least-loaded replica during autoscaler scale-down. The annotator is a
+  freestanding interval loop, gated on `gateway_namespace` non-empty,
+  best-effort (a scrape or PATCH failure for one pod degrades scale-down
+  ordering for that pod this tick, never a crash), and PATCHes only on
+  change. It lives in the controller --- not the gateway --- so the gateway
+  keeps `automountServiceAccountToken: false` and gains no kube client or
+  `pods` RBAC: the controller already holds `[get, list, patch]` on `pods`
+  for the `rio.build/hw-class` annotator.
+]
+
 = ComponentScaler
 
 #r("ctrl.scaler.component+2")[

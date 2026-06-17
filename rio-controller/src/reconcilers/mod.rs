@@ -12,6 +12,7 @@
 
 pub mod componentscaler;
 pub mod fence;
+pub mod gateway_cost;
 pub mod gc_schedule;
 pub mod node_informer;
 pub mod nodeclaim_pool;

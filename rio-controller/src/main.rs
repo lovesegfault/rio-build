@@ -290,6 +290,29 @@ async fn main() -> anyhow::Result<()> {
             "hw-class-annotator",
             node_informer::run_pod_annotator(client.clone(), hw_config.clone(), shutdown.clone()),
         );
+        // sh-028: stamp `pod-deletion-cost` on each gateway pod with
+        // its scraped `rio_gateway_connections_active` so KEDA
+        // scale-down evicts the least-loaded replica. Lives HERE (not
+        // in the gateway) so the gateway keeps `automountServiceAccountToken:
+        // false` and gains no kube client / `pods` RBAC — the
+        // controller already holds `[get, list, patch]` on pods. Gated
+        // on `gateway_namespace` non-empty (helm sets it via downward
+        // API; non-k8s leaves it empty → annotator not spawned).
+        if !cfg.gateway_namespace.is_empty() {
+            rio_common::task::spawn_monitored(
+                "gateway-cost-annotator",
+                rio_controller::reconcilers::gateway_cost::run(
+                    client.clone(),
+                    cfg.gateway_namespace.clone(),
+                    shutdown.clone(),
+                ),
+            );
+        } else {
+            info!(
+                "gateway deletion-cost annotator disabled \
+                 (RIO_GATEWAY_NAMESPACE unset — non-k8s mode)"
+            );
+        }
         // ADR-023 phase-13: SpotInterrupted Event → interrupt_samples
         // (λ\[h\] numerator). The informer's periodic flush above writes
         // the exposure denominator.

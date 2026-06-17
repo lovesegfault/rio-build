@@ -74,6 +74,15 @@ pub struct Config {
     /// path (the shared-capable topology) is enabled, and the
     /// informer warns at activation on the empty default.
     pub cluster: String,
+    /// Namespace the gateway pods run in. Non-empty ENABLES the
+    /// [`crate::reconcilers::gateway_cost`] annotator (sh-028: stamp
+    /// `pod-deletion-cost` = scraped `rio_gateway_connections_active`
+    /// so KEDA scale-down evicts the least-loaded replica). Empty
+    /// (default) → annotator not spawned (non-k8s `cargo run`, the
+    /// standalone-fixture VM scenarios). Helm sets it from the
+    /// downward-API `metadata.namespace` (gateway and controller share
+    /// the system namespace). Env: `RIO_GATEWAY_NAMESPACE`.
+    pub gateway_namespace: String,
 }
 
 impl Default for Config {
@@ -98,6 +107,7 @@ impl Default for Config {
             // Single-cluster default — mirrors the scheduler's
             // `[sla].cluster` `DEFAULT ''`.
             cluster: String::new(),
+            gateway_namespace: String::new(),
         }
     }
 }

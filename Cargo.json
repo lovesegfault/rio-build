@@ -19848,6 +19848,10 @@
           "packageId": "rand 0.10.1"
         },
         {
+          "name": "reqwest",
+          "packageId": "reqwest"
+        },
+        {
           "name": "rio-auth",
           "packageId": "rio-auth"
         },

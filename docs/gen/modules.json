@@ -501,6 +501,11 @@
       "doc": "D4: the lease generation, CONSUMED (WO-S3-3, C4 repriced by Q5)."
     },
     {
+      "path": "reconcilers/gateway_cost.rs",
+      "depth": 1,
+      "doc": "Gateway `pod-deletion-cost` annotator."
+    },
+    {
       "path": "reconcilers/gc_schedule.rs",
       "depth": 1,
       "doc": "GC cron reconciler."

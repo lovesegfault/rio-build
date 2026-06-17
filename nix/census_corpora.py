@@ -835,6 +835,14 @@ DURATION_CENSUS_ROWS = {
         "wall (std Instant at the interceptor's own last-warn stamp; the closure is sync so std::time, not tokio — log-cardinality bound only, the metric is the durable evidence either way)",
         "live_064 WO-S6-4 (bw14-S6): derived from the gateway's ReattachBudget::RATE_WINDOW (60s — the cadence at which a re-attaching client paces itself); W14-F4 asserts exactly one warn within the window for N>1 rejections",
     ),
+    ("rio-controller/src/reconcilers/gateway_cost.rs", "POLL_INTERVAL"): (
+        "wall (tokio interval tick over the annotator loop's own monotonic clock; best-effort cadence — KEDA's 30s pollingInterval bounds the consumer)",
+        "sh-028 (sh007e S4): same-domain — the loop produces and consumes tokio Instant; no conversion. PATCH-on-change keeps the apiserver write rate proportional to connection churn, never the cadence itself",
+    ),
+    ("rio-controller/src/reconcilers/gateway_cost.rs", "SCRAPE_TIMEOUT"): (
+        "wall (reqwest per-request connect+read budget over the same tokio runtime clock; per-pod scrape bound)",
+        "sh-028 (sh007e S4): same-domain — best-effort: timeout → that pod's annotation stays stale this tick, never a crash; the tick-rate retry IS the conversion",
+    ),
 }
 DURATION_GRANDFATHER = "nix/duration-census-grandfather.txt"
 

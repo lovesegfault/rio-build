@@ -33,6 +33,9 @@ schemars = { workspace = true }
 # for CEL, not schemars extend.
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
+# gateway_cost annotator scrapes each gateway pod's plaintext
+# /metrics (sh-028) — in-cluster HTTP only, no TLS feature needed.
+reqwest = { workspace = true }
 
 # --- gRPC client (scheduler AdminService) ---
 tonic = { workspace = true }
