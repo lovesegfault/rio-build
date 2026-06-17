@@ -2501,8 +2501,14 @@ pub const M_107: () = ();
 /// seqscan+sort over the full pending set. Standalone-file
 /// CONCURRENTLY per the 011/022 pattern: a multi-statement file is an
 /// implicit transaction block even with `-- no-transaction`, and
-/// CONCURRENTLY cannot run inside one. Ordered new-before-drop
-/// ([`M_109`]) so the listing query is never without index coverage.
+/// CONCURRENTLY cannot run inside one; sqlx detects the directive via
+/// `sql.starts_with("-- no-transaction")` so it MUST be line 1 (the
+/// migration-body-policy pointer moves to line 2). Ordered
+/// new-before-drop ([`M_109`]) so the listing query is never without
+/// index coverage. `IF NOT EXISTS` for idempotency across re-runs; if
+/// CONCURRENTLY fails mid-build it may leave an INVALID index behind
+/// — recovery is `DROP INDEX materialization_jobs_pending_priority`
+/// then re-run this migration.
 pub const M_108: () = ();
 /// `migrations/109_materialization_jobs_drop_old_idx.sql`
 ///

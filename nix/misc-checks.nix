@@ -737,13 +737,23 @@ in
           [[ "$((10#$nnn))" -ge 82 ]] || continue
           want="-- Commentary: see rio-migrations/src/migrations.rs M_$nnn"
           first=$(head -n1 "$f")
+          # The sqlx `-- no-transaction` directive (CREATE/DROP INDEX
+          # CONCURRENTLY) must be at byte 0 of the file body — sqlx
+          # detects it via `sql.starts_with("-- no-transaction")`
+          # (sqlx-core resolve.rs). When present the M_NNN pointer
+          # moves to line 2 and the body starts at line 3.
+          body_from=2
+          if [[ "$first" == "-- no-transaction" ]]; then
+            first=$(sed -n 2p "$f")
+            body_from=3
+          fi
           if [[ "$first" != "$want" ]]; then
             echo "FAIL: $base.sql line 1 is not the M_$nnn pointer:" >&2
             echo "  have: $first" >&2
             echo "  want: $want" >&2
             fail=1
           fi
-          if tail -n +2 "$f" | grep -n '^--'; then
+          if tail -n +$body_from "$f" | grep -n '^--'; then
             echo "FAIL: $base.sql carries line-anchored comment lines beyond the pointer — commentary belongs in M_$nnn (rio-migrations/src/migrations.rs)" >&2
             fail=1
           fi
