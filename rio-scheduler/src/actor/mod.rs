@@ -119,14 +119,30 @@ pub(crate) const ADMIN_FAST_LANE_CAPACITY: usize = 256;
 pub(crate) const ADMIN_FAST_LANE_DRAIN_QUOTA: usize = 16;
 
 /// EWMA weight for the per-turn cost estimate feeding the cost-axis
-/// backpressure law (round-9 B6). 0.3 makes a single pathological
-/// turn (the live_053 140s command) dominate the estimate immediately
-/// (one observation lands 0.3 × 140s = 42s — already over the high
-/// drain budget at ANY non-zero depth) while ~10 healthy sub-ms turns
-/// decay it back under the release bound (0.7¹⁰ ≈ 0.03). Violable
-/// (R17): the law W9-AH pins is engage-on-cost / release-on-decay,
-/// not the weight.
-const BACKPRESSURE_COST_EWMA_ALPHA: f64 = 0.3;
+/// backpressure law (round-9 B6, re-derived sh-024 §S2). The EWMA is
+/// FED at fast-lane rate ([`Self::note_turn_cost`] from BOTH the
+/// main-mailbox path AND `serve_fast_admin`, up to
+/// [`ADMIN_FAST_LANE_DRAIN_QUOTA`] = 16 feeds between consecutive
+/// main-loop [`Self::update_backpressure`] evaluations — the
+/// fast-lane work prices into drain by design, review (e)) but
+/// EVALUATED only per main-mailbox dequeue: at the prior 0.3 a single
+/// 1.3 s spike (ewma 0.39, drain 44.5 s) activated and the 16 × 5 µs
+/// fast feeds (× 0.7¹⁶ ≈ 0.003) released it 80 µs later — sh-024 saw
+/// `queue_backpressure` +24 in 120 s. 0.05 is sized so the worst-case
+/// inter-evaluation decay 0.95^QUOTA ≈ 0.44 keeps a genuine
+/// pathological turn engaged (the live_053 140 s command: one
+/// observation lands 0.05 × 140 = 7 s, drain @ q=100 = 700 s ≫ HIGH;
+/// after 16 fast decays drain = 308 s — STAYS active) while a single
+/// 1.3 s spike never reaches HIGH (ewma 0.066, drain 7.5 s @ q=114).
+/// Release after ≈83 cheap feeds (≈5 main-loop evaluates with a full
+/// fast lane, ≈83 without; ≤ ~80 ms wall-clock at sub-ms turns —
+/// review (d)). The trade is sustained-overload engage latency: a
+/// 0.5 s/turn stream at q=100 reaches drain=30 s after ~18 turns
+/// (≈9 s) vs ~4 turns at 0.3 — bounded under the 30 s caller-deadline
+/// derivation at [`BACKPRESSURE_DRAIN_HIGH_SECS`]. Violable (R17):
+/// the law W9-AH pins is engage-on-cost / release-on-decay, not the
+/// weight.
+const BACKPRESSURE_COST_EWMA_ALPHA: f64 = 0.05;
 
 /// Cost-axis ENGAGE bound (round-9 B6): backpressure activates when
 /// projected mailbox drain time (queue depth × per-turn cost EWMA)

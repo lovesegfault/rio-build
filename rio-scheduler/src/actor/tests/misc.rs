@@ -905,6 +905,119 @@ async fn backpressure_engages_on_work_cost_while_depth_low() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.admission.work-per-turn]
+/// **sh-024 §S2 — RED-FIRST.** A SINGLE 1.3 s turn at 1 % depth must
+/// not flap the cost-axis backpressure: the EWMA is FED at fast-lane
+/// rate (`serve_fast_admin` calls `note_turn_cost` up to
+/// `ADMIN_FAST_LANE_DRAIN_QUOTA = 16` times between consecutive
+/// main-loop `update_backpressure` evaluations), so at α = 0.3 the
+/// 1.3 s spike (ewma = 0.39, drain = 44.5 s ≥ 30) activates and the
+/// 16 × 5 µs fast feeds (× 0.7¹⁶ ≈ 0.003 → drain = 0.15 s ≤ 10)
+/// release it 80 µs later — sh-024 saw `queue_backpressure` +24 in
+/// 120 s. At α = 0.05: 1.3 s → ewma = 0.066, drain = 7.5 s — never
+/// reaches HIGH = 30, so 0 rising edges.
+///
+/// Review wf_22a3fa70: the test body MUST evaluate `update_backpressure`
+/// TWICE per outer iteration — post-spike (the production
+/// `run_inner:1761` evaluation BEFORE any fast decays) THEN post-decay
+/// (the next main-cmd dequeue) — matching the production topology;
+/// with one post-decay evaluation only the test is vacuously green at
+/// both α values.
+#[tokio::test]
+async fn backpressure_cost_axis_single_spike_at_low_depth_does_not_flap() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+    let reader = actor.backpressure_flag();
+
+    let mut rising_edges = 0u32;
+    let mut was_active = reader.is_active();
+    let mut observe = |reader: &crate::actor::command::BackpressureReader| {
+        let now = reader.is_active();
+        if now && !was_active {
+            rising_edges += 1;
+        }
+        was_active = now;
+    };
+    for _ in 0..24 {
+        // The sh-024 trace: ONE 1.3 s ReportPullOutcome spike (sh-024
+        // §S3) lands, the very next main-loop `update_backpressure`
+        // observes it…
+        actor.note_turn_cost(std::time::Duration::from_millis(1300));
+        actor.update_backpressure(114, 10_000);
+        observe(&reader);
+        // …then the biased-select fast lane drains up to QUOTA=16
+        // sub-µs handlers (each `note_turn_cost` at fast-lane rate)…
+        for _ in 0..crate::actor::ADMIN_FAST_LANE_DRAIN_QUOTA {
+            actor.note_turn_cost(std::time::Duration::from_micros(5));
+        }
+        // …and the NEXT main-loop evaluation re-reads the now-decayed
+        // EWMA.
+        actor.update_backpressure(114, 10_000);
+        observe(&reader);
+    }
+    assert!(
+        rising_edges <= 1 && !reader.is_active(),
+        "left: cost-axis backpressure flapped {rising_edges}× over 24 \
+         single-1.3s-spike cycles (the sh-024 §S2 +24-in-120s flap: at \
+         α=0.3 every spike activates and the 16-feed × 0.7¹⁶ fast-lane \
+         decay releases it 80 µs later — the EWMA is FED at fast-lane \
+         rate but EVALUATED at main-loop rate) / right: at α=0.05 a \
+         1.3 s spike → ewma=0.066 → drain=7.5 s @ q=114, never ≥ HIGH=30 \
+         → 0 rising edges, inactive at loop end"
+    );
+    Ok(())
+}
+
+// r[verify sched.admission.work-per-turn]
+/// **sh-024 §S2 — the live_053 preservation half.** A genuine 140 s
+/// pathological turn at 1 % depth MUST engage and SURVIVE the
+/// inter-evaluation fast-lane decay: at α = 0.05 one observation
+/// lands ewma = 7 s (drain = 700 s ≫ HIGH); after 16 × 5 µs fast
+/// feeds ewma = 7 × 0.95¹⁶ ≈ 3.08 s (drain = 308 s — still ≫ LOW),
+/// and after one more cheap MAIN turn drain = 293 s — STILL active.
+/// At α = 0.3 the same 17 cheap feeds give 42 × 0.7¹⁷ ≈ 0.097 s
+/// (drain = 9.7 s ≤ LOW = 10) — releases on the 17th, the gap
+/// `_does_not_flap` exposes from the other side.
+#[tokio::test]
+async fn backpressure_cost_axis_survives_fast_lane_decay() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+    let reader = actor.backpressure_flag();
+
+    actor.note_turn_cost(std::time::Duration::from_secs(140));
+    actor.update_backpressure(100, 10_000);
+    assert!(
+        reader.is_active(),
+        "one 140 s turn at q=100 must engage (drain = 100 × α × 140 s)"
+    );
+    for _ in 0..crate::actor::ADMIN_FAST_LANE_DRAIN_QUOTA {
+        actor.note_turn_cost(std::time::Duration::from_micros(5));
+    }
+    actor.update_backpressure(100, 10_000);
+    assert!(
+        reader.is_active(),
+        "after QUOTA=16 fast-lane decays the live_053 evidence must \
+         survive (at α=0.05: drain ≈ 308 s; at α=0.3: drain ≈ 14 s — \
+         both > LOW=10, both arms hold here)"
+    );
+    // The discriminating step: ONE more cheap MAIN turn. At α=0.3
+    // ewma=0.097 → drain=9.7 ≤ 10 → releases. At α=0.05 ewma=2.93 →
+    // drain=293 → stays.
+    actor.note_turn_cost(std::time::Duration::from_micros(5));
+    actor.update_backpressure(100, 10_000);
+    assert!(
+        reader.is_active(),
+        "left: the 17th cheap feed released the live_053 evidence (at \
+         α=0.3: 42 × 0.7¹⁷ ≈ 0.097 s, drain = 9.7 s ≤ LOW — the \
+         feed-vs-evaluate-rate asymmetry sh-024 §S2 names) / right: at \
+         α=0.05 the 0.95^QUOTA ≈ 0.44 inter-evaluation decay keeps a \
+         genuine pathological turn engaged across fast-lane drains"
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Token-aware shutdown
 // ---------------------------------------------------------------------------
