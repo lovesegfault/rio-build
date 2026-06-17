@@ -1,0 +1,2 @@
+ALTER TABLE materialization_jobs
+    ADD COLUMN priority DOUBLE PRECISION NOT NULL DEFAULT 0;

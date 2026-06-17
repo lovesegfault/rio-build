@@ -2466,6 +2466,56 @@ pub const M_105: () = ();
 /// post-E3a corroborated escalation only. `integer` (i32 → u32 at
 /// hydration), capped at `Ceilings.max_cores` consume-side.
 pub const M_106: () = ();
+/// `migrations/107_materialization_jobs_priority.sql`
+///
+/// `materialization_jobs.priority DOUBLE PRECISION NOT NULL DEFAULT 0`
+/// (sh-025): the creating derivation's critical-path remaining-seconds
+/// (`state.sched.priority` — `est_duration + max(non-terminal child)`,
+/// `critical_path::compute_initial`). The claimable listing's ORDER BY
+/// becomes `(priority DESC, created_at, job_id)` so hub dependencies
+/// (rustc/stdenv — long dependent chains) are claimed before leaf
+/// substitutions when both are pending; today every merge-tx job ties
+/// on `created_at` and `job_id` is `Uuid::now_v7` mint order ≈
+/// `pending_substitute` HashMap-iteration order — effectively random,
+/// so the 2454-wide Queued→Ready promotion fired as a step function
+/// near sub-end instead of overlapping ~70s of leaf substitution with
+/// build. `DOUBLE PRECISION` not `bigint`: `sched.priority` is `f64`
+/// (sums of `est_duration: f64`); `NOT NULL DEFAULT 0` so existing
+/// rows degenerate to today's `(created_at, job_id)` order and no
+/// `NULLS LAST` is needed. PG ≥ 11 makes a constant-default ADD
+/// COLUMN metadata-only (brief ACCESS EXCLUSIVE, no table rewrite).
+///
+/// Split from the index DDL per the 011/022 CONCURRENTLY precedent
+/// (review sh025-q3): bundling ADD COLUMN + DROP INDEX + CREATE INDEX
+/// in one file would take SHARE/ACCESS EXCLUSIVE on the hot table for
+/// the full index build during a rolling deploy.
+pub const M_107: () = ();
+/// `migrations/108_materialization_jobs_priority_idx.sql`
+///
+/// `-- no-transaction` + sole statement `CREATE INDEX CONCURRENTLY IF
+/// NOT EXISTS materialization_jobs_pending_priority ON
+/// materialization_jobs (priority DESC, created_at, job_id) WHERE
+/// state = 'pending'` — the partial index for [`M_107`]'s
+/// `(priority DESC, created_at, job_id)` listing ORDER BY, so PG
+/// serves the `LIMIT n` head-window via index scan instead of
+/// seqscan+sort over the full pending set. Standalone-file
+/// CONCURRENTLY per the 011/022 pattern: a multi-statement file is an
+/// implicit transaction block even with `-- no-transaction`, and
+/// CONCURRENTLY cannot run inside one. Ordered new-before-drop
+/// ([`M_109`]) so the listing query is never without index coverage.
+pub const M_108: () = ();
+/// `migrations/109_materialization_jobs_drop_old_idx.sql`
+///
+/// `-- no-transaction` + sole statement `DROP INDEX CONCURRENTLY IF
+/// EXISTS materialization_jobs_pending` — retires 078's
+/// `(created_at) WHERE state = 'pending'` partial index now that
+/// [`M_108`] covers the listing query (its sole consumer). Plain
+/// `DROP INDEX` takes ACCESS EXCLUSIVE on `materialization_jobs` and
+/// would queue behind an in-flight merge transaction, head-of-line
+/// blocking listing reads; CONCURRENTLY waits out conflicting
+/// transactions without holding the table lock. Standalone file for
+/// the same implicit-transaction-block reason as [`M_108`].
+pub const M_109: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
