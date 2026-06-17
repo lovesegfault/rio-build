@@ -1150,6 +1150,109 @@ async fn sh021_reap_terminal_absent_never_registered_attempt() {
     guard3.verified().await;
 }
 
+// r[verify ctrl.ephemeral.reap-terminal-absent]
+/// sh-026 polish: `terminal-absent` did not discriminate Complete from
+/// Failed, so the alert fired on the dominant happy-path completion
+/// reap (scheduler dropped the intent before the controller observed
+/// `Job Complete`) instead of the rare ghosted-Failed half. Post-split
+/// `succeeded > 0` mints `terminal-absent-clean` (alert-exempt; the
+/// expected steady-state series); `failed > 0` keeps `terminal-absent`
+/// (the sh-021 ghosted-FOD shape — alert on this only). Reuses the
+/// `:3011` `clean_idle_exit` discriminator verbatim. RED at base: BOTH
+/// shapes minted `terminal-absent`; the clean-series assert saw 0.
+#[tokio::test]
+async fn terminal_absent_splits_on_succeeded() {
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _g = metrics::set_default_local_recorder(&recorder);
+
+    async fn drive(
+        recorder: &rio_test_support::metrics::CountingRecorder,
+        existing: Vec<Job>,
+        pool: &str,
+        delete_path: &'static str,
+    ) {
+        let (client, verifier) = ApiServerVerifier::new();
+        let (ctx, _mock, _h) = ctx_with_mock_admin(client.clone()).await;
+        let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+        let want = want_complete(&[], pool, ExecutorKind::Builder);
+        let p = &crate::fixtures::test_pool(pool, ExecutorKind::Builder);
+        let key = crate::reconcilers::pool::candidate::PoolKey::new("rio", pool);
+        // Strike 1 defers (live_051(e) two-tick); recorder MUST be
+        // quiet for THIS pool — the disposition mint sits AFTER the
+        // strike gate, so the clean letter rides the same wall-floor.
+        let _ = reap_stale_for_intents(&jobs_api, &existing, &want, &ctx, p, pool, &key).await;
+        let pool_label = format!("pool={pool}");
+        assert!(
+            recorder
+                .all_keys()
+                .iter()
+                .filter(|k| k.contains(&pool_label))
+                .all(|k| !k.contains("terminal-absent")),
+            "no disposition minted on the deferred strike-1 pass"
+        );
+        crate::reconcilers::pool::jobs::backdate_strikes_for_test(
+            &key,
+            std::time::Duration::from_secs(21),
+        );
+        let guard = verifier.run(vec![Scenario {
+            method: http::Method::DELETE,
+            path_contains: delete_path,
+            body_contains: Some(r#""propagationPolicy":"Background""#),
+            status: 200,
+            body_json: serde_json::to_string(&Job::default()).unwrap(),
+        }]);
+        let reaped = reap_stale_for_intents(&jobs_api, &existing, &want, &ctx, p, pool, &key).await;
+        guard.verified().await;
+        assert_eq!(reaped.len(), 1, "terminal+absent reaps on strike 2");
+    }
+
+    // succeeded > 0 (Job Complete) — the happy-path completion reap.
+    drive(
+        &recorder,
+        vec![terminal_job_for_intent("rio-builder-clean-done", "done")],
+        "clean",
+        "/namespaces/rio/jobs/rio-builder-clean-done",
+    )
+    .await;
+    assert_eq!(
+        recorder.get(
+            "rio_controller_reap_dispositions_total{disposition=terminal-absent-clean,pool=clean}"
+        ),
+        1,
+        "succeeded>0 ∧ absent → terminal-absent-clean (sh-026: the \
+         happy-path series; alert-exempt). saw: {:?}",
+        recorder.all_keys(),
+    );
+    assert_eq!(
+        recorder
+            .get("rio_controller_reap_dispositions_total{disposition=terminal-absent,pool=clean}"),
+        0,
+        "the clean half MUST NOT mint the alert-series label"
+    );
+
+    // failed > 0 (Job Failed) — the sh-021 ghosted-FOD shape.
+    drive(
+        &recorder,
+        vec![failed_job_for_intent("rio-builder-fail-ghost", "ghost")],
+        "fail",
+        "/namespaces/rio/jobs/rio-builder-fail-ghost",
+    )
+    .await;
+    assert_eq!(
+        recorder
+            .get("rio_controller_reap_dispositions_total{disposition=terminal-absent,pool=fail}"),
+        1,
+        "failed>0 ∧ absent → terminal-absent (the alert series)"
+    );
+    assert_eq!(
+        recorder.get(
+            "rio_controller_reap_dispositions_total{disposition=terminal-absent-clean,pool=fail}"
+        ),
+        0,
+        "the failed half MUST NOT mint the clean label"
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────
 // Synthesize-on-delete (ctrl.job.synthesize-on-delete)
 // ───────────────────────────────────────────────────────────────────

@@ -279,10 +279,13 @@ pub fn describe_metrics() {
         "rio_controller_reap_dispositions_total",
         "The reap path's terminal-disposition alphabet (live_056-b R21; labels: pool, \
          disposition = excess-pending|orphan-pending|orphan-suspended|stale-terminal|\
-         terminal-absent|selector-drift|orphan-running|clean-exit|escalated|gave-up — \
-         the COMPLETE letter set; \
+         terminal-absent|terminal-absent-clean|selector-drift|orphan-running|clean-exit|\
+         escalated|gave-up — the COMPLETE letter set; \
          the per-arm ephemeral/orphan reaped counters are the legacy series this \
-         unifies). clean-exit = a verdict-free terminal reap whose Job COMPLETED (the \
+         unifies). terminal-absent-clean = the happy-path completion reap (sh-026: \
+         scheduler dropped intent before controller observed Job Complete) — the \
+         dominant disposition under normal operation; alert on terminal-absent (the \
+         Failed half) only. clean-exit = a verdict-free terminal reap whose Job COMPLETED (the \
          worker's lawful idle exit, round-10 bug_078) — counted, never laddered: \
          clean exits do not step the futility breaker (a sustained rate on a \
          forecast pool means etas exceed bounds — check lead seeds, not wedges). \

@@ -2515,18 +2515,30 @@ pub(super) enum ReapDisposition {
     /// `reap_stale_for_intents` terminal arm: a finished Job blocking
     /// a still-wanted intent's respawn (NameCollision window).
     StaleTerminal,
-    /// `reap_stale_for_intents` terminal-absent arm (sh-021): a
-    /// finished Job whose intent has LEFT the demand set. Pre-fix the
-    /// arm fell through to k8s `ttlSecondsAfterFinished` on the false
-    /// premise that "the SCHEDULER has already observed the
-    /// completion" — falsified by a never-pulled
-    /// `Failed/BackoffLimitExceeded` death (spot kill before the
-    /// worker registered): the open Build attempt sat ghosted for
-    /// `deadline+slack` (62min). The arm rides the StaleTerminal
-    /// rails (two-tick strike + `AttemptsViewWitness` fail-closed +
-    /// background delete + synthesized `reason=Reaped`); detection
-    /// latency ~30-40s instead of 62min.
+    /// `reap_stale_for_intents` terminal-absent arm (sh-021), the
+    /// FAILED half: a `failed > 0` Job whose intent has LEFT the
+    /// demand set. Pre-fix the arm fell through to k8s
+    /// `ttlSecondsAfterFinished` on the false premise that "the
+    /// SCHEDULER has already observed the completion" — falsified by
+    /// a never-pulled `Failed/BackoffLimitExceeded` death (spot kill
+    /// before the worker registered): the open Build attempt sat
+    /// ghosted for `deadline+slack` (62min). The arm rides the
+    /// StaleTerminal rails (two-tick strike + `AttemptsViewWitness`
+    /// fail-closed + background delete + synthesized `reason=Reaped`);
+    /// detection latency ~30-40s instead of 62min. sh-026: this
+    /// letter is the ALERT series — fire on it; the happy-path
+    /// completion reap mints [`Self::TerminalAbsentClean`].
     TerminalAbsent,
+    /// sh-026: the `succeeded > 0` half of the terminal-absent arm —
+    /// a CLEAN completion reap (the scheduler dropped the intent
+    /// before the controller observed `Job Complete`). Same delete
+    /// mechanics and two-tick wall-floor as [`Self::TerminalAbsent`];
+    /// split out so the `terminal-absent` alert can fire on the
+    /// Failed series only (this clean letter is the dominant
+    /// disposition under normal operation — sh-026 saw 727 reaps of
+    /// 727 land here). Discriminator is the same `clean_idle_exit`
+    /// predicate the bug_078 ladder gate uses.
+    TerminalAbsentClean,
     /// `reap_stale_for_intents` selector-drift arm: a Pending Job
     /// whose selector no longer matches the scheduler's re-solve.
     SelectorDrift,
@@ -2552,12 +2564,13 @@ impl ReapDisposition {
     /// variant without extending it fails the length assert against
     /// the exhaustive match below). Test-facing census surface.
     #[cfg(test)]
-    pub(super) const ALL: [Self; 10] = [
+    pub(super) const ALL: [Self; 11] = [
         Self::ExcessPending,
         Self::OrphanPending,
         Self::OrphanSuspended,
         Self::StaleTerminal,
         Self::TerminalAbsent,
+        Self::TerminalAbsentClean,
         Self::SelectorDrift,
         Self::OrphanRunning,
         Self::CleanExit,
@@ -2573,6 +2586,7 @@ impl ReapDisposition {
             Self::OrphanSuspended => "orphan-suspended",
             Self::StaleTerminal => "stale-terminal",
             Self::TerminalAbsent => "terminal-absent",
+            Self::TerminalAbsentClean => "terminal-absent-clean",
             Self::SelectorDrift => "selector-drift",
             Self::OrphanRunning => "orphan-running",
             Self::CleanExit => "clean-exit",
@@ -2847,7 +2861,17 @@ pub(super) async fn reap_stale_for_intents(
             // `MintedPullIdentity::Build` only (never `source_node`),
             // so a never-registered open attempt IS findable.
             WantVerdict::AbsentFromDemand if !is_active_job(j) => {
-                (DeleteParams::background(), ReapDisposition::TerminalAbsent)
+                // sh-026: split on the bug_078 `clean_idle_exit`
+                // discriminator so the alert series carries the
+                // ghosted-Failed half. Same delete + wall-floor for
+                // both — this is observability-only.
+                let clean = j.status.as_ref().and_then(|st| st.succeeded).unwrap_or(0) > 0;
+                let d = if clean {
+                    ReapDisposition::TerminalAbsentClean
+                } else {
+                    ReapDisposition::TerminalAbsent
+                };
+                (DeleteParams::background(), d)
             }
             WantVerdict::AbsentFromDemand => continue,
             // r[impl ctrl.pool.demand-completeness]
@@ -2898,6 +2922,7 @@ pub(super) async fn reap_stale_for_intents(
             disposition,
             ReapDisposition::StaleTerminal
                 | ReapDisposition::TerminalAbsent
+                | ReapDisposition::TerminalAbsentClean
                 | ReapDisposition::SelectorDrift
         ) {
             let Some(uid) = j.metadata.uid.clone() else {
@@ -2908,12 +2933,18 @@ pub(super) async fn reap_stale_for_intents(
             let now = std::time::Instant::now();
             let row = strike(&mut STALE_STRIKES.lock(), key, &uid, tick, now);
             if !row.confirmed(now) {
-                info!(
-                    pool, job = %jn, why, strikes = row.count,
-                    "stale-Job classification deferred (live_051(e) \
-                     two-tick confirmation + the merged_bug_140 \
-                     pull-surfacing wall floor; re-decided next tick)"
-                );
+                // sh-026: demoted from `info!` (4377 lines / 727
+                // reaps under burst — 6× amplification) and gated to
+                // the first strike + the firing strike; the 3..N
+                // burst-churn middle is silent.
+                if row.count <= 2 {
+                    debug!(
+                        pool, job = %jn, why, strikes = row.count,
+                        "stale-Job classification deferred (live_051(e) \
+                         two-tick confirmation + the merged_bug_140 \
+                         pull-surfacing wall floor; re-decided next tick)"
+                    );
+                }
                 continue;
             }
         }
@@ -3669,7 +3700,11 @@ mod tests {
         let start = src
             .find("rio_controller_reap_dispositions_total")
             .expect("describe present in lib.rs");
-        let help = &src[start..(start + 1500).min(src.len())];
+        // Slice to the closing `);` of the describe! macro (a fixed
+        // byte window is char-boundary-fragile against the HELP body's
+        // em-dashes — sh-026's extension landed mid-`—` at +1500).
+        let end = src[start..].find(");").map_or(src.len(), |i| start + i);
+        let help = &src[start..end];
         for d in ReapDisposition::ALL {
             assert!(
                 help.contains(d.as_label()),
@@ -3680,7 +3715,7 @@ mod tests {
         }
         // The exhaustive match in as_label is the census; ALL must
         // cover it (a new variant fails the match first, then here).
-        assert_eq!(ReapDisposition::ALL.len(), 10);
+        assert_eq!(ReapDisposition::ALL.len(), 11);
     }
 
     /// W9-CO, Job-spec face (live_056-b): the minted Job carries the
