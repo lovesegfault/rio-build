@@ -221,7 +221,7 @@ impl StoreServiceImpl {
         // placeholder BEFORE that gate would let an is_ca worker squat
         // an `'uploading'` row for ANY syntactically-valid path
         // (including other tenants' IA outputs), drip-feed chunks while
-        // `spawn_placeholder_guard` heartbeats it fresh, and force
+        // the pre-armed `PlaceholderGuard` heartbeats it fresh, and force
         // legitimate uploaders into `Aborted` until token expiry. So:
         // IA → claim BEFORE ingest (path is HMAC-bound); CA → claim
         // AFTER ingest (path is now content-bound). Matches
@@ -229,17 +229,18 @@ impl StoreServiceImpl {
         let is_ca_caller = auth.builder_claims().is_some_and(|c| c.is_ca);
 
         let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
-        let (mut claim, mut placeholder_guard) = if is_ca_caller {
-            (None, None)
+        // sh-023: `claim_or_return` now returns the pre-armed
+        // PlaceholderGuard by value (it was constructed INSIDE
+        // `claim_placeholder` before any SQL), so the (claim,
+        // placeholder_guard) tuple collapses to one Option.
+        let mut placeholder_guard = if is_ca_caller {
+            None
         } else {
             match self
                 .claim_or_return(&store_path_hash, info.store_path.as_str(), &refs_str)
                 .await
             {
-                Ok(Some(c)) => {
-                    let g = self.spawn_placeholder_guard(store_path_hash.clone(), c);
-                    (Some(c), Some(g))
-                }
+                Ok(Some(g)) => Some(g),
                 Ok(None) => {
                     drain_stream(&mut stream).await;
                     return Ok(Response::new(PutPathResponse { created: false }));
@@ -257,8 +258,8 @@ impl StoreServiceImpl {
         {
             Ok(x) => x,
             Err(e) => {
-                if let Some(c) = claim {
-                    self.abort_upload(&store_path_hash, c).await;
+                if let Some(g) = &placeholder_guard {
+                    self.abort_upload(&store_path_hash, g.claim_id()).await;
                 }
                 return Err(e);
             }
@@ -271,7 +272,7 @@ impl StoreServiceImpl {
         // rides the hold's one envelope clock, never a bare await
         // (pre-fix it sat in the gap between the stream clock and the
         // persist clock with no deadline at all).
-        if claim.is_none() {
+        if placeholder_guard.is_none() {
             let claiming =
                 self.claim_or_return(&store_path_hash, info.store_path.as_str(), &refs_str);
             let claimed = match &hold {
@@ -279,35 +280,31 @@ impl StoreServiceImpl {
                 None => claiming.await?,
             };
             match claimed {
-                Some(c) => {
-                    placeholder_guard =
-                        Some(self.spawn_placeholder_guard(store_path_hash.clone(), c));
-                    claim = Some(c);
-                }
+                Some(g) => placeholder_guard = Some(g),
                 None => return Ok(Response::new(PutPathResponse { created: false })),
             }
         }
-        let claim = claim.expect("claim populated in IA pre-ingest or CA post-ingest arm");
+        let placeholder_guard =
+            placeholder_guard.expect("guard populated in IA pre-ingest or CA post-ingest arm");
 
         self.finalize_single(
             info,
-            claim,
+            placeholder_guard.claim_id(),
             nar_data,
             auth.tenant_id,
             auth.registration_tenant(),
             hold,
         )
         .await?;
-        if let Some(g) = placeholder_guard {
-            g.defuse();
-        }
+        placeholder_guard.defuse();
         Ok(Response::new(PutPathResponse { created: true }))
     }
 
     /// `claim_placeholder` + the AlreadyComplete/Concurrent fast-path
     /// arms, factored so the IA (pre-ingest) and CA (post-ingest) call
     /// sites share one match. Returns:
-    ///   - `Ok(Some(claim))` → we own the placeholder; proceed.
+    ///   - `Ok(Some(guard))` → we own the placeholder; the guard is
+    ///     pre-armed (sh-023, `r[store.put.drop-cleanup+3]`). Proceed.
     ///   - `Ok(None)` → path is already complete (or a concurrent
     ///     uploader just won) → caller returns `created: false`.
     ///   - `Err(Aborted)` → concurrent `'uploading'` placeholder held by
@@ -321,12 +318,12 @@ impl StoreServiceImpl {
         store_path_hash: &[u8],
         store_path: &str,
         refs: &[String],
-    ) -> Result<Option<uuid::Uuid>, Status> {
+    ) -> Result<Option<crate::ingest::PlaceholderGuard>, Status> {
         match self
             .claim_placeholder(store_path_hash, store_path, refs, "PutPath")
             .await
         {
-            Ok(PlaceholderClaim::Owned(claim)) => Ok(Some(claim)),
+            Ok(PlaceholderClaim::Owned(guard)) => Ok(Some(guard)),
             Ok(PlaceholderClaim::AlreadyComplete) => {
                 debug!(%store_path, "PutPath: path already complete");
                 Ok(None)

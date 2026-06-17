@@ -823,19 +823,6 @@ impl StoreServiceImpl {
         ))
     }
 
-    /// Thin wrapper over [`crate::ingest::spawn_placeholder_guard`]
-    /// supplying `self.pool`. See that fn's doc for the drop-cleanup +
-    /// heartbeat invariants. `progress: None` — PutPath claims keep
-    /// `fetched_bytes` NULL, the structural exemption from every
-    /// download-stall rule (`r[store.substitute.progress-heartbeat]`).
-    pub(in crate::grpc) fn spawn_placeholder_guard(
-        &self,
-        store_path_hash: Vec<u8>,
-        claim: uuid::Uuid,
-    ) -> PlaceholderGuard {
-        crate::ingest::spawn_placeholder_guard(self.pool.clone(), store_path_hash, claim, None)
-    }
-
     /// Drain a single-output PutPath stream after metadata: accumulate
     /// chunks ([`Self::accumulate_chunk`]), receive the mandatory
     /// trailer, reject protocol violations (chunk-after-trailer,
@@ -1151,16 +1138,22 @@ impl StoreServiceImpl {
         refs: &[String],
         _ctx_label: &str,
     ) -> Result<PlaceholderClaim, metadata::MetadataError> {
-        // `stall: None` — PutPath claims carry no narinfo-declared size
-        // and write no progress evidence; the download-stall takeover
-        // arm is structurally unreachable for them
-        // (`r[store.substitute.stale-reclaim+3]`).
+        // `stall: None`, `progress: None` — PutPath claims carry no
+        // narinfo-declared size and write no progress evidence; the
+        // download-stall takeover arm is structurally unreachable for
+        // them (`r[store.substitute.stale-reclaim+3]`), and
+        // `fetched_bytes` stays NULL — the structural exemption from
+        // every download-stall rule
+        // (`r[store.substitute.progress-heartbeat]`). sh-023: the
+        // guard is pre-armed inside `claim_placeholder` and carried by
+        // value in `Owned`; this wrapper no longer spawns it.
         let claim = ingest::claim_placeholder(
             &self.pool,
             store_path_hash,
             store_path,
             refs,
             PUTPATH_HOOKS,
+            None,
             None,
         )
         .await?;

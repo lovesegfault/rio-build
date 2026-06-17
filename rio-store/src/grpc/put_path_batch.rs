@@ -185,13 +185,13 @@ impl StoreServiceImpl {
                 },
                 None => claiming.await,
             };
-            let claim = match claim_res {
+            let guard = match claim_res {
                 Ok(PlaceholderClaim::AlreadyComplete) => {
                     accum.already_complete = true;
                     n_exists_emitted += 1;
                     continue;
                 }
-                Ok(PlaceholderClaim::Owned(c)) => c,
+                Ok(PlaceholderClaim::Owned(g)) => g,
                 Ok(PlaceholderClaim::Concurrent) => bail!(Status::aborted(format!(
                     "{ctx}: {}; retry",
                     rio_proto::CONCURRENT_PUTPATH_MSG
@@ -201,9 +201,11 @@ impl StoreServiceImpl {
                     e
                 )),
             };
-            placeholder_guards
-                .push(self.spawn_placeholder_guard(accum.store_path_hash.clone(), claim));
+            // sh-023: the guard is pre-armed inside `claim_placeholder`;
+            // `accum.claim` keeps the bare uuid for the phase-3 commit.
+            let claim = guard.claim_id();
             accum.claim = Some(claim);
+            placeholder_guards.push(guard);
 
             info.store_path_hash = accum.store_path_hash.clone();
             let nar_data = std::mem::take(&mut accum.nar_data);

@@ -842,7 +842,7 @@ output on the original builder is lost when the overlay is discarded.
   (#(refs.metric)("rio_builder_uploads_total")`{status="adopted"}`) --- output
   paths are derivation-addressed, so the contending uploader's content is
   identical. If the poll exhausts, the contending placeholder has likely been
-  released by the store's drop-path cleanup (#rref("store.put.drop-cleanup+2"))
+  released by the store's drop-path cleanup (#rref("store.put.drop-cleanup+3"))
   and the next upload attempt succeeds. `QueryPathInfo` errors during the poll
   are treated as not-found (logged, keep polling). Other `Aborted` reasons (GC
   mark serialization, admin cancel) keep the plain retry without polling.

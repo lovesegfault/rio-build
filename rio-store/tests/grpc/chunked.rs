@@ -1013,7 +1013,7 @@ async fn batch_no_self_deadlock_under_budget() -> TestResult {
 /// asserted cleanup but via the explicit `abort_batch` loop), this
 /// asserts the GUARD's drop-spawn does the work — `abort_batch` no
 /// longer exists.
-// r[verify store.put.drop-cleanup+2]
+// r[verify store.put.drop-cleanup+3]
 #[tokio::test]
 async fn batch_guard_drop_reaps_placeholders() -> TestResult {
     let s = StoreSession::new().await?;

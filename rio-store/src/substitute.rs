@@ -2197,17 +2197,28 @@ impl Substituter {
             stall_window: self.stall_window,
             claimed_by: &self.claimed_by,
         };
-        let claim = match ingest::claim_placeholder(
+        // r[impl store.substitute.progress-heartbeat]
+        // The progress handle: fetch_nar's read loop advances it with
+        // the decompressed-byte count; the guard's heartbeat carries it
+        // to `manifests.fetched_bytes`/`last_progress_at` so competing
+        // claimants can discriminate stuck ≠ slow. sh-023: created
+        // BEFORE `claim_placeholder` and threaded through so the
+        // pre-armed guard heartbeats with progress from its first tick
+        // (the handle is zero-init; the AlreadyComplete/Raced paths
+        // cost one Arc alloc, no behavior change).
+        let progress_handle = Arc::new(ingest::ProgressHandle::new());
+        let placeholder_guard = match ingest::claim_placeholder(
             &self.pool,
             &store_path_hash,
             info.store_path.as_str(),
             &refs_str,
             SUBSTITUTE_HOOKS,
             Some(&stall_params),
+            Some(Arc::clone(&progress_handle)),
         )
         .await?
         {
-            PlaceholderClaim::Owned(claim) => claim,
+            PlaceholderClaim::Owned(guard) => guard,
             PlaceholderClaim::AlreadyComplete => {
                 // Lost the race; winner completed. NO download.
                 let stored = metadata::query_path_info(&self.pool, store_path)
@@ -2300,6 +2311,12 @@ impl Substituter {
                 return Ok(UpstreamOutcome::Raced);
             }
         };
+        // r[impl store.put.drop-cleanup+3]
+        // We OWN the placeholder. The guard was pre-armed INSIDE
+        // `claim_placeholder` (sh-023) and is held by value here — its
+        // drop-spawn reaps the row if any path between here and the
+        // defuse below is abandoned (client RST_STREAM mid-fetch).
+        let claim = placeholder_guard.claim_id();
 
         // Owner attribution at claim time: the one log line that ties
         // (path, claim, size, pod) together for stall/takeover triage.
@@ -2309,24 +2326,6 @@ impl Substituter {
             nar_size = ni.nar_size,
             pod = %self.claimed_by,
             "substitute: claimed placeholder"
-        );
-
-        // r[impl store.put.drop-cleanup+2]
-        // We OWN the placeholder. Guard against future-drop (client
-        // RST_STREAM mid-fetch) — the guard's spawn reaps it if any
-        // path between here and the defuse below is abandoned.
-        //
-        // r[impl store.substitute.progress-heartbeat]
-        // The progress handle: fetch_nar's read loop advances it with
-        // the decompressed-byte count; the guard's heartbeat carries
-        // it to `manifests.fetched_bytes`/`last_progress_at` so
-        // competing claimants can discriminate stuck ≠ slow.
-        let progress_handle = Arc::new(ingest::ProgressHandle::new());
-        let placeholder_guard = ingest::spawn_placeholder_guard(
-            self.pool.clone(),
-            store_path_hash.to_vec(),
-            claim,
-            Some(Arc::clone(&progress_handle)),
         );
 
         // The remaining steps are fallible AND we own the placeholder;
@@ -6006,11 +6005,17 @@ mod tests {
         // claim survives every takeover arm (young + claimed).
         let sp = StorePath::parse(&path).unwrap();
         let hash = sp.sha256_digest();
-        let holder_claim =
-            metadata::insert_manifest_uploading_as(&db.pool, &hash, &path, &[], Some("holder-pod"))
-                .await
-                .unwrap()
-                .expect("placeholder inserted");
+        let holder_claim = metadata::insert_manifest_uploading_as(
+            &db.pool,
+            &hash,
+            &path,
+            &[],
+            uuid::Uuid::new_v4(),
+            Some("holder-pod"),
+        )
+        .await
+        .unwrap()
+        .expect("placeholder inserted");
 
         // Fallback pinned to 120s: any wake inside the 20s harness
         // timeout is structurally a NOTIFY wake (or the post-register
@@ -6086,10 +6091,17 @@ mod tests {
 
         let sp = StorePath::parse(&path).unwrap();
         let hash = sp.sha256_digest();
-        metadata::insert_manifest_uploading_as(&db.pool, &hash, &path, &[], Some("wedged-pod"))
-            .await
-            .unwrap()
-            .expect("placeholder inserted");
+        metadata::insert_manifest_uploading_as(
+            &db.pool,
+            &hash,
+            &path,
+            &[],
+            uuid::Uuid::new_v4(),
+            Some("wedged-pod"),
+        )
+        .await
+        .unwrap()
+        .expect("placeholder inserted");
 
         // fallback 100ms, budget 450ms → 1 initial + <=5 fallback
         // re-claims, then Raced.
@@ -6133,10 +6145,17 @@ mod tests {
         assert!(!placeholder_blocked(&db.pool, &hash).await.unwrap());
 
         // Held ('uploading' + live claim) → blocked.
-        let claim = metadata::insert_manifest_uploading_as(&db.pool, &hash, &path, &[], None)
-            .await
-            .unwrap()
-            .expect("placeholder inserted");
+        let claim = metadata::insert_manifest_uploading_as(
+            &db.pool,
+            &hash,
+            &path,
+            &[],
+            uuid::Uuid::new_v4(),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("placeholder inserted");
         assert!(placeholder_blocked(&db.pool, &hash).await.unwrap());
 
         // Released-in-place (claim_id NULL, row survives) → free.
@@ -8495,13 +8514,14 @@ fn rogue_reserve(budget: &std::sync::Arc<tokio::sync::Semaphore>, declared: u64)
                 ctx_label: "bw9s5-bj",
             },
             None,
+            None,
         )
         .await
         .expect("re-claim query");
-        assert!(
-            matches!(reclaim, crate::ingest::PlaceholderClaim::Owned(_)),
-            "released row must be immediately re-claimable"
-        );
+        let crate::ingest::PlaceholderClaim::Owned(g) = reclaim else {
+            panic!("released row must be immediately re-claimable");
+        };
+        g.defuse();
         let preserved: i16 =
             sqlx::query_scalar("SELECT stall_count FROM manifests WHERE store_path_hash = $1")
                 .bind(&sp_hash[..])

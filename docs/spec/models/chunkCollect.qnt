@@ -672,7 +672,7 @@ module chunkCollect {
   }
 
   /// S4 `OwnerOnlyMutation` (store.put.placeholder-claim+2,
-  /// store.put.drop-cleanup+2), path-level form: the claim-gated reap
+  /// store.put.drop-cleanup+3), path-level form: the claim-gated reap
   /// — the one owner-credentialed destructive path the replacement
   /// keeps — takes effect only against the placeholder generation that
   /// issued the credential. (The token-gated rollback arm of the

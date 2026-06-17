@@ -55,7 +55,7 @@ rio-store/src/grpc/put_path/mod.rs	drain_stream(&mut stream).await;
 rio-store/src/grpc/put_path/mod.rs	drain_stream(&mut stream).await;
 rio-store/src/grpc/put_path/mod.rs	let (raw_info, declared) = common::read_first_metadata(&mut stream).await?;
 rio-store/src/grpc/put_path/mod.rs	metadata::check_manifest_complete(&self.pool, store_path_hash).await
-rio-store/src/grpc/put_path/mod.rs	self.abort_upload(&store_path_hash, c).await;
+rio-store/src/grpc/put_path/mod.rs	self.abort_upload(&store_path_hash, g.claim_id()).await;
 rio-store/src/grpc/put_path/mod.rs	while let Ok(Some(_)) = stream.message().await {
 rio-store/src/grpc/put_path_batch.rs	.await
 rio-store/src/grpc/put_path_batch.rs	.await

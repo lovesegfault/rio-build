@@ -824,26 +824,34 @@ its admitting floor; the derivation owns the repair --- no new rejection.
   caller supplies a staleness gate or its claim token.
 ]
 
-#r("store.put.drop-cleanup+2")[
-  Once `PutPath` or `PutPathBatch` owns an `'uploading'` placeholder, it arms a
-  `PlaceholderGuard` that (a) heartbeats `manifests.updated_at` every 30s while
-  held, so #rref("store.put.stale-reclaim")'s
-  `reap_one(SUBSTITUTE_STALE_THRESHOLD)` never reaps a live owner during a long
-  ingest/stage (6 GB at 50 Mbps ≈ 16 min); and (b) on Drop, spawns
-  `gc::orphan::reap_one(store_path_hash, ReapBy::Claim(claim_id))`. This covers
-  the handler future being DROPPED --- tonic aborts the task when the client
+#r("store.put.drop-cleanup+3")[
+  The `PlaceholderGuard` is armed INSIDE `claim_placeholder`, BEFORE the
+  placeholder INSERT, with the client-generated `claim_id` it will carry;
+  `PlaceholderClaim::Owned` carries the guard by value, so a handler future
+  cannot observe ownership without the drop-reap already armed. The guard
+  (a) heartbeats `manifests.updated_at` every 30s while held, so
+  #rref("store.put.stale-reclaim")'s `reap_one(SUBSTITUTE_STALE_THRESHOLD)`
+  never reaps a live owner during a long ingest/stage (6 GB at 50 Mbps ≈
+  16 min); and (b) on Drop, spawns
+  `gc::orphan::reap_one(store_path_hash, ReapBy::Claim(claim_id))`. The guard's
+  heartbeat (`WHERE claim_id=$id`) and drop-reap (`ReapBy::Claim(id)`, which
+  filters `status='uploading' AND claim_id=$claim`) are both no-ops against a
+  row that was never inserted, so pre-arming is free; the guard is defused on
+  `AlreadyComplete`/`Concurrent` and only on success otherwise. This covers the
+  handler future being DROPPED --- tonic aborts the task when the client
   `RST_STREAM`s (builder killed mid-upload) --- which the explicit
-  `abort_upload` calls on `return Err` paths do NOT cover. `reap_one` filters
-  `status='uploading' AND claim_id=$claim` so firing after an explicit
-  `abort_upload`, after the orphan scanner reaped our row, or after a fresh
-  re-upload took the slot is a harmless no-op
-  (#rref("store.put.placeholder-claim")); firing after
+  `abort_upload` calls on `return Err` paths do NOT cover, and (sh-023) closes
+  the residual where the future is dropped at the INSERT's own
+  `tx.commit().await` cancellation point: PG committed the row but the sqlx
+  future was dropped before reading the result, so the +2-era caller-side
+  `spawn_placeholder_guard` never ran and every retry inside 5 min hit
+  `Concurrent`. Firing after an explicit `abort_upload`, after the orphan
+  scanner reaped our row, or after a fresh re-upload took the slot is a
+  harmless no-op (#rref("store.put.placeholder-claim")); firing after
   `upgrade_manifest_to_chunked` deletes the staged placeholder rows, leaving
-  the staged chunks unreferenced for the collect cycle. The guard is defused
-  only on success. I-125a:
-  pre-fix, a phantom-drained builder leaked the placeholder and the next
-  uploader for the same path got `Aborted: concurrent PutPath` until the orphan
-  scanner reaped it (15 min); the builder side polls for that case per
+  the staged chunks unreferenced for the collect cycle. I-125a: a
+  phantom-drained builder used to leak the placeholder until the orphan scanner
+  reaped it (15 min); the builder side polls for that case per
   #rref("builder.upload.aborted-poll").
 ]
 

@@ -38,7 +38,10 @@ use tracing::{debug, instrument};
 /// — the race winner may have finished).
 // r[impl store.put.placeholder-claim+2]
 /// Test-only convenience wrapper (production callers go through
-/// `ingest::claim_placeholder`, which threads `claimed_by`).
+/// `ingest::claim_placeholder`, which mints `claim_id` and threads
+/// `claimed_by`). The wrapper mints its own `claim_id` so the
+/// fixture-seeding callers in materialize/gc tests stay self-contained;
+/// production minting is centralized in `claim_placeholder` (sh-023).
 #[cfg(test)]
 pub(crate) async fn insert_manifest_uploading(
     pool: &PgPool,
@@ -46,7 +49,15 @@ pub(crate) async fn insert_manifest_uploading(
     store_path: &str,
     references: &[String],
 ) -> Result<Option<uuid::Uuid>> {
-    insert_manifest_uploading_as(pool, store_path_hash, store_path, references, None).await
+    insert_manifest_uploading_as(
+        pool,
+        store_path_hash,
+        store_path,
+        references,
+        uuid::Uuid::new_v4(),
+        None,
+    )
+    .await
 }
 
 /// `insert_manifest_uploading` with owner attribution: `claimed_by`
@@ -61,6 +72,7 @@ pub(crate) async fn insert_manifest_uploading_as(
     store_path_hash: &[u8],
     store_path: &str,
     references: &[String],
+    claim_id: uuid::Uuid,
     claimed_by: Option<&str>,
 ) -> Result<Option<uuid::Uuid>> {
     let mut tx = pool.begin().await?;
@@ -88,11 +100,13 @@ pub(crate) async fn insert_manifest_uploading_as(
 
     // manifests placeholder. ON CONFLICT DO NOTHING for the same reason.
     // rows_affected = 0 means another uploader owns this slot. claim_id
-    // is the ownership token: every owner-side mutation (heartbeat,
-    // completion, abort_placeholder, the drop-guard, put_chunked's
-    // complete-failure rollback) filters on it so a late-firing op
-    // cannot match a fresh re-upload at the same store_path_hash.
-    let claim_id = uuid::Uuid::new_v4();
+    // is the ownership token (sh-023: minted by the CALLER and
+    // threaded here so the drop-guard can be pre-armed before this
+    // INSERT — `r[store.put.drop-cleanup+3]`): every owner-side
+    // mutation (heartbeat, completion, abort_placeholder, the
+    // drop-guard, put_chunked's complete-failure rollback) filters on
+    // it so a late-firing op cannot match a fresh re-upload at the
+    // same store_path_hash.
     let result = sqlx::query(
         r#"
         INSERT INTO manifests (store_path_hash, status, claim_id, claimed_by, claim_phase)
@@ -124,9 +138,9 @@ pub(crate) async fn insert_manifest_uploading_as(
 pub(crate) async fn claim_released_placeholder(
     pool: &PgPool,
     store_path_hash: &[u8],
+    claim_id: uuid::Uuid,
     claimed_by: Option<&str>,
 ) -> Result<Option<uuid::Uuid>> {
-    let claim_id = uuid::Uuid::new_v4();
     // fetched_bytes/last_progress_at defensively re-NULLed (the release
     // already cleared them); stall_count deliberately untouched.
     let result = sqlx::query(
@@ -185,11 +199,11 @@ pub(crate) async fn claim_released_placeholder(
 pub(crate) async fn stall_takeover_placeholder(
     pool: &PgPool,
     store_path_hash: &[u8],
+    claim_id: uuid::Uuid,
     claimed_by: Option<&str>,
     nar_size: u64,
     stall_window: std::time::Duration,
 ) -> Result<Option<uuid::Uuid>> {
-    let claim_id = uuid::Uuid::new_v4();
     let result = sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"
         UPDATE manifests

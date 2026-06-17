@@ -656,7 +656,7 @@ module chunkLiveness {
   }
 
   /// S4 `OwnerOnlyMutation` (store.put.placeholder-claim+2,
-  /// store.put.drop-cleanup+2): an owner-credentialed cleanup takes
+  /// store.put.drop-cleanup+3): an owner-credentialed cleanup takes
   /// effect only against the placeholder generation that issued the
   /// credential. Quantified over the admission predicates the actions
   /// themselves use (the logService authGate pattern): if the claim

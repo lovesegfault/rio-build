@@ -40,12 +40,16 @@ pub enum PlaceholderClaim {
     AlreadyComplete,
     /// We inserted (or stale-reclaimed-then-inserted) the
     /// `status='uploading'` placeholder. Caller now OWNS it and MUST
-    /// [`abort_placeholder`] on any error path. The carried [`Uuid`] is
-    /// the `manifests.claim_id` ownership token (M_052) — every
-    /// owner-side cleanup passes it to `reap_one(ReapBy::Claim(id))`
-    /// so a late-firing cleanup cannot reap a fresh re-upload at the
-    /// same `store_path_hash`.
-    Owned(Uuid),
+    /// [`abort_placeholder`] on any error path. The carried
+    /// [`PlaceholderGuard`] is pre-armed INSIDE [`claim_placeholder`]
+    /// (sh-023, `r[store.put.drop-cleanup+3]`): the guard's
+    /// `manifests.claim_id` ownership token (M_052) was minted BEFORE
+    /// the first SQL, so a handler future cannot observe `Owned`
+    /// without the drop-reap already armed — every owner-side cleanup
+    /// goes through `reap_one(ReapBy::Claim(id))` so a late-firing
+    /// cleanup cannot reap a fresh re-upload at the same
+    /// `store_path_hash`.
+    Owned(PlaceholderGuard),
     /// Another uploader holds a live (heartbeating) placeholder. Caller
     /// returns `aborted` so the client retries.
     Concurrent,
@@ -107,9 +111,30 @@ pub struct SubstituteClaimParams<'a> {
 
 // r[impl store.put.idempotent]
 // r[impl store.put.stale-reclaim]
+// r[impl store.put.drop-cleanup+3]
 /// Idempotency check + `status='uploading'` placeholder insert +
 /// hot-path stale/stall reclaim. The shared step-1 of the write-ahead
 /// flow.
+///
+/// **sh-023 (pre-arm RAII):** the `claim_id` is minted and the
+/// [`PlaceholderGuard`] armed HERE, before any SQL — not at the four
+/// caller sites. The four claim-granting awaits below (fresh insert,
+/// released-in-place UPDATE, post-reap re-insert, stall-takeover
+/// UPDATE) are EACH a cancellation point where PG may have committed
+/// the row but the sqlx future was dropped before reading the result
+/// (gateway broken-pipe → JoinSet abort → tonic RST_STREAM → handler
+/// dropped mid-`tx.commit().await`). Pre-arming closes that residual:
+/// the guard's heartbeat (`WHERE claim_id=$id` → 0 rows) and
+/// drop-reap (`reap_one(ReapBy::Claim(id))` → 0 rows) are both no-ops
+/// against a not-yet-inserted row, so arming first is free; on
+/// `AlreadyComplete`/`Concurrent` the guard is defused before return.
+/// On `Err` (`?`) the guard drops and reaps — correct (a `?` after
+/// the insert may have left a committed row) and a no-op before it.
+///
+/// `progress` (`r[store.substitute.progress-heartbeat]`): the
+/// substitution caller creates its [`ProgressHandle`] BEFORE the claim
+/// and threads it here so the pre-armed guard's heartbeat carries
+/// progress from the first tick. PutPath/PutPathBatch pass `None`.
 ///
 /// Flow:
 /// 1. `check_manifest_complete` → [`PlaceholderClaim::AlreadyComplete`]
@@ -144,8 +169,19 @@ pub async fn claim_placeholder(
     refs: &[String],
     hooks: IngestHooks,
     stall: Option<&SubstituteClaimParams<'_>>,
+    progress: Option<Arc<ProgressHandle>>,
 ) -> Result<PlaceholderClaim, MetadataError> {
+    // sh-023: ONE client-generated claim_id, guard pre-armed BEFORE
+    // any SQL. Threaded into every claim-granting helper below — the
+    // type system makes "row owned but guard not armed" unrepresentable
+    // from any caller. The guard's gauge inc/dec is a sub-ms blip on
+    // the AlreadyComplete/Concurrent paths (unobservable at scrape
+    // interval; sum() stays correct).
+    let claim_id = Uuid::new_v4();
+    let guard = spawn_placeholder_guard(pool.clone(), store_path_hash.to_vec(), claim_id, progress);
+
     if metadata::check_manifest_complete(pool, store_path_hash).await? {
+        guard.defuse();
         return Ok(PlaceholderClaim::AlreadyComplete);
     }
 
@@ -155,9 +191,15 @@ pub async fn claim_placeholder(
     // them into the placeholder narinfo. Mark's CTE walks them from
     // commit → the closure is GC-protected without holding a session
     // lock for the full upload.
-    let mut claim =
-        metadata::insert_manifest_uploading_as(pool, store_path_hash, store_path, refs, claimed_by)
-            .await?;
+    let mut claim = metadata::insert_manifest_uploading_as(
+        pool,
+        store_path_hash,
+        store_path,
+        refs,
+        claim_id,
+        claimed_by,
+    )
+    .await?;
 
     // r[impl store.substitute.stale-reclaim+3]
     // The slot is occupied. Three takeover arms, in precedence order:
@@ -174,7 +216,8 @@ pub async fn claim_placeholder(
     //       `fetched_bytes < nar_size` ∧ progress clock older than the
     //       stall window): in-place handoff, `stall_count += 1`.
     if claim.is_none() {
-        claim = metadata::claim_released_placeholder(pool, store_path_hash, claimed_by).await?;
+        claim = metadata::claim_released_placeholder(pool, store_path_hash, claim_id, claimed_by)
+            .await?;
         if claim.is_some() {
             debug!(
                 %store_path,
@@ -214,6 +257,7 @@ pub async fn claim_placeholder(
                     store_path_hash,
                     store_path,
                     refs,
+                    claim_id,
                     claimed_by,
                 )
                 .await?;
@@ -230,6 +274,7 @@ pub async fn claim_placeholder(
         claim = metadata::stall_takeover_placeholder(
             pool,
             store_path_hash,
+            claim_id,
             claimed_by,
             params.nar_size,
             params.stall_window,
@@ -248,8 +293,11 @@ pub async fn claim_placeholder(
     }
 
     match claim {
-        Some(id) => Ok(PlaceholderClaim::Owned(id)),
-        None => Ok(PlaceholderClaim::Concurrent),
+        Some(_) => Ok(PlaceholderClaim::Owned(guard)),
+        None => {
+            guard.defuse();
+            Ok(PlaceholderClaim::Concurrent)
+        }
     }
 }
 
@@ -416,8 +464,8 @@ impl ProgressHandle {
 
 /// RAII owner of an `'uploading'` placeholder: heartbeats while held,
 /// reaps on drop. See [`spawn_placeholder_guard`].
-// r[impl store.put.drop-cleanup+2]
-pub(crate) struct PlaceholderGuard {
+// r[impl store.put.drop-cleanup+3]
+pub struct PlaceholderGuard {
     heartbeat: tokio::task::JoinHandle<()>,
     pool: PgPool,
     store_path_hash: Vec<u8>,
@@ -437,6 +485,17 @@ impl PlaceholderGuard {
     /// wasted).
     pub(crate) fn defuse(mut self) {
         self.defused = true;
+    }
+
+    /// The `manifests.claim_id` ownership token (M_052) — every
+    /// owner-side mutation (heartbeat, completion, [`abort_placeholder`],
+    /// the drop-reap, `cas::put_chunked`'s rollback) filters on it so a
+    /// late-firing op cannot match a fresh re-upload at the same
+    /// `store_path_hash`. Downstream consumers (`finalize_single`,
+    /// `abort_upload`, `persist_nar`, `stage_nar_for_batch`) take the
+    /// bare `Uuid`; the guard stays the RAII owner.
+    pub(crate) fn claim_id(&self) -> Uuid {
+        self.claim
     }
 }
 
@@ -468,7 +527,7 @@ impl Drop for PlaceholderGuard {
     }
 }
 
-// r[impl store.put.drop-cleanup+2]
+// r[impl store.put.drop-cleanup+3]
 /// Drop-safety + liveness for a [`PlaceholderClaim::Owned`] placeholder.
 /// Returns a [`PlaceholderGuard`] that:
 ///
@@ -494,6 +553,9 @@ impl Drop for PlaceholderGuard {
 ///
 /// Shared by `PutPath` and `Substituter::try_upstream`; both run inline
 /// in a request handler future and so share the same drop hazard.
+/// sh-023: production code reaches this ONLY via [`claim_placeholder`]
+/// (the guard is pre-armed there with the lifted `claim_id`); tests
+/// call it directly to drive the heartbeat/gauge battery.
 // r[impl store.substitute.progress-heartbeat]
 pub fn spawn_placeholder_guard(
     pool: PgPool,
@@ -655,19 +717,31 @@ mod tests {
     }
 
     /// Claim a fresh placeholder, panicking on any non-Owned outcome.
+    /// sh-023: the pre-armed guard is DEFUSED here and only the
+    /// `claim_id` returned — this battery drives the row directly
+    /// (back-dating clocks, stamping phases) and a live guard's
+    /// heartbeat/drop-reap would race those writes. The defused
+    /// guard's heartbeat is aborted before its first 50ms tick.
     async fn claim_owned(pool: &PgPool, hash: &[u8], path: &str) -> Uuid {
-        match claim_placeholder(pool, hash, path, &[], TEST_HOOKS, None)
+        match claim_placeholder(pool, hash, path, &[], TEST_HOOKS, None, None)
             .await
             .expect("claim_placeholder")
         {
-            PlaceholderClaim::Owned(c) => c,
+            PlaceholderClaim::Owned(g) => {
+                let id = g.claim_id();
+                g.defuse();
+                id
+            }
             PlaceholderClaim::AlreadyComplete => panic!("unexpected AlreadyComplete"),
             PlaceholderClaim::Concurrent => panic!("unexpected Concurrent"),
         }
     }
 
     /// The substitution-shaped claim: stall params present (nar_size
-    /// 1000, window 60 s, pod "claimant-pod").
+    /// 1000, window 60 s, pod "claimant-pod"). sh-023: callers that
+    /// match `Owned` MUST defuse the carried guard before probing the
+    /// row — an undefused drop spawns a reap that would race the
+    /// `row_state` assertions.
     async fn claim_substitute(pool: &PgPool, hash: &[u8], path: &str) -> PlaceholderClaim {
         claim_placeholder(
             pool,
@@ -680,6 +754,7 @@ mod tests {
                 stall_window: Duration::from_secs(60),
                 claimed_by: "claimant-pod",
             }),
+            None,
         )
         .await
         .expect("claim_placeholder")
@@ -758,6 +833,7 @@ mod tests {
         let took = crate::metadata::stall_takeover_placeholder(
             &db.pool,
             &hash,
+            Uuid::new_v4(),
             Some("competitor-pod"),
             1000,
             Duration::from_secs(60),
@@ -796,6 +872,7 @@ mod tests {
         let took = crate::metadata::stall_takeover_placeholder(
             &db.pool,
             &hash,
+            Uuid::new_v4(),
             Some("competitor-pod"),
             1000,
             Duration::from_secs(60),
@@ -819,7 +896,7 @@ mod tests {
         .await
         .unwrap();
         match claim_substitute(&db.pool, &hash, "/nix/store/b2-dead").await {
-            PlaceholderClaim::Owned(_) => {}
+            PlaceholderClaim::Owned(g) => g.defuse(),
             _ => panic!("post-threshold dead owner must be reaped"),
         }
         let (_, _, _, _, strikes, _, _) = row_state(&db.pool, &hash).await.expect("row");
@@ -861,7 +938,7 @@ mod tests {
         // the row over IN PLACE (stall arm), strike recorded, row
         // surviving — not Concurrent-until-300s.
         match claim_substitute(&db.pool, &hash, "/nix/store/b9-zero").await {
-            PlaceholderClaim::Owned(_) => {}
+            PlaceholderClaim::Owned(g) => g.defuse(),
             PlaceholderClaim::Concurrent => panic!(
                 "zero-progress dead claim must be takeover-eligible at the \
                  stall window — Concurrent means the 300s blind spot is back"
@@ -888,6 +965,7 @@ mod tests {
         let took = crate::metadata::stall_takeover_placeholder(
             &db.pool,
             &hash,
+            Uuid::new_v4(),
             Some("competitor-pod"),
             1000,
             Duration::from_secs(60),
@@ -914,6 +992,7 @@ mod tests {
         let took2 = crate::metadata::stall_takeover_placeholder(
             &db.pool,
             &hash2,
+            Uuid::new_v4(),
             Some("competitor-pod"),
             1000,
             Duration::from_secs(60),
@@ -944,6 +1023,7 @@ mod tests {
         let took = crate::metadata::stall_takeover_placeholder(
             &db.pool,
             &hash,
+            Uuid::new_v4(),
             Some("competitor-pod"),
             2000, // competitor expects MORE than the owner fetched
             Duration::from_secs(60),
@@ -970,9 +1050,11 @@ mod tests {
         set_phase(&db.pool, &hash, Some("downloading")).await;
         age_row(&db.pool, &hash, 120, false).await;
 
+        let competitor = Uuid::new_v4();
         let took = crate::metadata::stall_takeover_placeholder(
             &db.pool,
             &hash,
+            competitor,
             Some("competitor-pod"),
             1000,
             Duration::from_secs(60),
@@ -980,6 +1062,7 @@ mod tests {
         .await
         .expect("takeover query");
         let new_claim = took.expect("wedged downloading owner is deposed");
+        assert_eq!(new_claim, competitor);
         assert_ne!(new_claim, claim, "in-place handoff mints a new claim token");
         let (_, _, fetched, _, strikes, by, _) = row_state(&db.pool, &hash).await.expect("row");
         assert_eq!(strikes, 1, "one stall, one strike");
@@ -1214,7 +1297,11 @@ mod tests {
 
         let claim = claim_substitute(&db.pool, &hash, "/nix/store/ba-frozen").await;
         let new_claim = match claim {
-            PlaceholderClaim::Owned(c) => c,
+            PlaceholderClaim::Owned(g) => {
+                let id = g.claim_id();
+                g.defuse();
+                id
+            }
             other => panic!(
                 "a frozen mid-download claim must be stall-reclaimed, got {}",
                 match other {
@@ -1373,6 +1460,7 @@ mod tests {
         let taken = metadata::stall_takeover_placeholder(
             &db.pool,
             &hash,
+            Uuid::new_v4(),
             Some("competitor"),
             1000,
             Duration::from_secs(60),
@@ -1403,6 +1491,7 @@ mod tests {
         let taken = metadata::stall_takeover_placeholder(
             &db.pool,
             &hash,
+            Uuid::new_v4(),
             Some("competitor"),
             1000,
             Duration::from_secs(60),
@@ -1415,8 +1504,12 @@ mod tests {
         );
         // The competitor's full claim path picks it up via the
         // released arm instead — without another strike.
-        let claim = claim_substitute(&db.pool, &hash, "/nix/store/bg-race-b").await;
-        assert!(matches!(claim, PlaceholderClaim::Owned(_)));
+        let PlaceholderClaim::Owned(g) =
+            claim_substitute(&db.pool, &hash, "/nix/store/bg-race-b").await
+        else {
+            panic!("released row must be claimed via the released arm")
+        };
+        g.defuse();
         let (_, _, _, _, stalls, _, _) = row_state(&db.pool, &hash).await.expect("row");
         assert_eq!(stalls, 1, "one stall event, one strike (release-first)");
     }
@@ -1444,8 +1537,12 @@ mod tests {
         // predicate would also match — the DELETE arm must win.
         age_row(&db.pool, &hash, 600, true).await;
 
-        let claim = claim_substitute(&db.pool, &hash, "/nix/store/bh-dead").await;
-        assert!(matches!(claim, PlaceholderClaim::Owned(_)));
+        let PlaceholderClaim::Owned(g) =
+            claim_substitute(&db.pool, &hash, "/nix/store/bh-dead").await
+        else {
+            panic!("post-threshold dead owner must be reaped+reclaimed")
+        };
+        g.defuse();
         let (_, _, fetched, _, stalls, _, _) = row_state(&db.pool, &hash).await.expect("row");
         assert_eq!(
             stalls, 0,
@@ -1480,10 +1577,10 @@ mod tests {
         crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash2, owner, 100, "downloading")
             .await;
         age_row(&db.pool, &hash2, 120, false).await;
-        assert!(matches!(
-            claim_substitute(&db.pool, &hash2, "/nix/store/bj-stalled").await,
-            PlaceholderClaim::Owned(_)
-        ));
+        match claim_substitute(&db.pool, &hash2, "/nix/store/bj-stalled").await {
+            PlaceholderClaim::Owned(g) => g.defuse(),
+            _ => panic!("stalled owner must be reclaimed"),
+        }
 
         let mut by_reason: std::collections::BTreeMap<String, u64> = Default::default();
         for (ck, _, _, v) in snap.snapshot().into_vec() {
@@ -1507,6 +1604,101 @@ mod tests {
             by_reason.get("stall_reclaim").copied(),
             Some(1),
             "in-place takeover counts reason=stall_reclaim; got {by_reason:?}"
+        );
+    }
+
+    // r[verify store.put.drop-cleanup+3]
+    /// sh-023 red-first (fresh-insert arm): a handler future dropped in
+    /// the gap between `claim_placeholder` returning `Owned` and the
+    /// pre-fix caller-side `spawn_placeholder_guard` leaked an
+    /// `'uploading'` row with `claim_id` set, `updated_at` = insert
+    /// time, no heartbeat, no drop-reap — every retry inside 5 min hit
+    /// `Concurrent` (gateway broken-pipe → JoinSet abort → tonic
+    /// RST_STREAM → handler dropped mid-claim). Post-fix the guard is
+    /// pre-armed INSIDE `claim_placeholder` (before any SQL) and
+    /// carried by value in `Owned(PlaceholderGuard)`, so dropping the
+    /// claim is dropping the guard: the row is reaped.
+    #[tokio::test]
+    async fn claim_placeholder_drop_mid_insert_reaps_row() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash = test_hash(0xc0);
+        // The sh-023 trace: claim_placeholder runs to Owned (the
+        // INSERT committed), then the owning future is dropped before
+        // the pre-fix caller would have armed the guard. Dropping the
+        // returned PlaceholderClaim IS that drop.
+        let claim = claim_placeholder(
+            &db.pool,
+            &hash,
+            "/nix/store/c0-sh023",
+            &[],
+            TEST_HOOKS,
+            None,
+            None,
+        )
+        .await
+        .expect("claim");
+        assert!(matches!(claim, PlaceholderClaim::Owned(_)));
+        drop(claim);
+        // Let the drop-spawned reap land (post-fix).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM manifests \
+             WHERE store_path_hash = $1 AND status = 'uploading'",
+        )
+        .bind(&hash)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            n, 0,
+            "sh-023: dropping an Owned claim must reap the placeholder \
+             (pre-fix the row leaked with no guard armed → Concurrent for 5min)"
+        );
+    }
+
+    // r[verify store.put.drop-cleanup+3]
+    /// sh-023 red-first (released-in-place arm): same gap, but the
+    /// claim-granting site is `claim_released_placeholder` (the
+    /// `r[store.substitute.stall-abort]` row a prior owner left
+    /// `claim_id IS NULL`). Dropping the Owned claim must reap that
+    /// row too — pre-fix it leaked with the new claim_id stamped and
+    /// no guard.
+    #[tokio::test]
+    async fn claim_placeholder_drop_mid_released_takeover_reaps_row() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash = test_hash(0xc1);
+        // Pre-seed a released-in-place row (claim_id NULL).
+        let prior = claim_owned(&db.pool, &hash, "/nix/store/c1-sh023-rel").await;
+        let released = metadata::release_placeholder_in_place(&db.pool, &hash, prior)
+            .await
+            .expect("release");
+        assert!(released);
+        // Re-claim via the released arm; drop the Owned result.
+        let claim = claim_placeholder(
+            &db.pool,
+            &hash,
+            "/nix/store/c1-sh023-rel",
+            &[],
+            TEST_HOOKS,
+            None,
+            None,
+        )
+        .await
+        .expect("re-claim");
+        assert!(matches!(claim, PlaceholderClaim::Owned(_)));
+        drop(claim);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM manifests \
+             WHERE store_path_hash = $1 AND status = 'uploading'",
+        )
+        .bind(&hash)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            n, 0,
+            "sh-023: dropping an Owned claim (released-arm) must reap the row"
         );
     }
 }
