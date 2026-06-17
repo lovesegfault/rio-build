@@ -1,11 +1,11 @@
-//! End-to-end smoke test via port-forwarded gateway.
+//! End-to-end smoke test via SSM-tunnelled gateway.
 //!
 //! EKS-unique surface only — VM tests (`nix/tests/`) cover the
 //! trivial-build path and worker-kill chaos. This validates:
-//!   1. bootstrap tenant via rio-cli (port-forwarded scheduler+store)
+//!   1. bootstrap tenant via rio-cli (tunnelled scheduler+store)
 //!   2. install SSH key, restart gateway
 //!   3. NLB target registration + health (aws-lbc reconcile)
-//!   4. port-forward gateway:22 (NLB ingress: vm-ingress-v4v6-k3s)
+//!   4. tunnel gateway:22 (NLB ingress: vm-ingress-v4v6-k3s)
 //!   5. large-output build (NAR > 256 KiB → chunked S3 path → IRSA)
 
 use std::os::fd::AsRawFd;
@@ -39,12 +39,11 @@ pub const SSH_KEY: &str = "/tmp/rio-smoke-key";
 const BUILDER_POOL: &str = "x86-64";
 const FETCHER_POOL: &str = "x86-64-fetcher";
 
-/// Context for running rio-cli LOCALLY against a port-forwarded
-/// scheduler+store. Holds the tunnel guards
-/// and the service-HMAC key memfd — dropping this tears everything
-/// down. Fetched once at the top of the phase and threaded through to
-/// each step that needs rio-cli (cheaper than re-opening tunnels per
-/// step, and keeps `step_tenant`/ `step_status` provider-agnostic).
+/// Context for running rio-cli LOCALLY against tunnelled
+/// scheduler+store. Holds the tunnel guards and the service-HMAC key
+/// memfd — dropping this tears everything down. Fetched once and
+/// threaded through (cheaper than re-opening tunnels per step, and
+/// keeps `step_tenant`/`step_status` provider-agnostic).
 pub struct CliCtx {
     _guards: ((u16, ProcessGuard), (u16, ProcessGuard)),
     sched: u16,
@@ -62,8 +61,7 @@ pub struct CliCtx {
 
 impl CliCtx {
     /// Open scheduler+store tunnels and fetch the service-HMAC key
-    /// from the cluster. Cheap: two `kubectl port-forward` children +
-    /// one Secret GET.
+    /// from the cluster. Cheap: two tunnel processes + one Secret GET.
     pub async fn open(client: &kube::Client, sched: u16, store: u16) -> Result<Self> {
         let guards = crate::k8s::shared::tunnel_grpc(sched, store).await?;
         // I-101: tunnel_grpc may bind ephemeral ports when 0 was
@@ -167,8 +165,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         ui::step("NLB target health", || step_nlb_health(&client, &region)).await?;
         // Ephemeral port: fixed ports collide with foreign listeners
         // (e.g. a remote-dev workspace's own sshd on 2222).
-        let (gw_port, _tunnel) =
-            ui::step("port-forward gateway", || gateway_port_forward(0)).await?;
+        let (gw_port, _tunnel) = ui::step("tunnel gateway", || gateway_tunnel(0)).await?;
         let store_url = format!("ssh-ng://rio@localhost:{gw_port}?ssh-key={SSH_KEY}");
         ui::step("builder pool reconcile", || {
             step_pool_reconciled(&client, NS_BUILDERS, BUILDER_POOL)
@@ -420,24 +417,26 @@ async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Resu
     )
 }
 
-/// `kubectl port-forward svc/rio-gateway local:22` + SSH-banner
-/// readiness. Replaces the old bastion→NLB:22 SSM path:
-/// `loadBalancerSourceRanges` is set to public CIDRs only, so the
-/// bastion's intra-VPC source isn't in that allowlist. Port-forward
-/// reaches the pod via the apiserver proxy regardless of NLB ingress
-/// rules; the NLB ingress path itself is what vm-ingress-v4v6-k3s
-/// covers.
-///
-/// `local_port = 0` binds an ephemeral local port; the returned port
-/// is the one actually bound — build store URLs from that.
-pub async fn gateway_port_forward(local_port: u16) -> Result<(u16, ProcessGuard)> {
+/// SSM-tunnel to a gateway pod via its own node (kubectl fallback when
+/// no relay) + SSH-banner readiness. Not the NLB —
+/// `loadBalancerSourceRanges` would block the relay's intra-VPC
+/// source; the NLB ingress path is what `vm-ingress-v4v6-k3s` covers.
+/// `local_port = 0` binds ephemeral; build store URLs from the
+/// RETURNED port.
+pub async fn gateway_tunnel(local_port: u16) -> Result<(u16, ProcessGuard)> {
     if local_port != 0 {
         // Reap stale tunnels from a SIGKILL'd xtask. Ephemeral ports
         // can't be stale.
         crate::k8s::shared::kill_port_listeners(local_port);
     }
-    let (port, guard) =
-        crate::k8s::shared::port_forward(NS, "svc/rio-gateway", local_port, 22).await?;
+    let (port, guard) = if crate::k8s::ssm::relay().await.is_some() {
+        let client = kube::client().await?;
+        let pod = kube::one_running_pod(&client, NS, "app.kubernetes.io/name=rio-gateway").await?;
+        // 2222: container port (Service maps 22→2222).
+        crate::k8s::ssm::tunnel_pod(&client, NS, &pod, 2222, local_port).await?
+    } else {
+        crate::k8s::shared::port_forward(NS, "svc/rio-gateway", local_port, 22).await?
+    };
     ui::poll_debug("reading SSH banner", Duration::from_secs(3), 25, || async {
         Ok(
             tokio::time::timeout(Duration::from_secs(3), ssh_banner(port))
@@ -592,18 +591,15 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn gateway_port_forward_supports_ephemeral_port() {
-        // gateway_port_forward(0) must attempt the port-forward, not
+    async fn gateway_tunnel_supports_ephemeral_port() {
+        // gateway_tunnel(0) must attempt the tunnel, not
         // bail with the old "unsupported" guard — ephemeral ports are
         // how callers avoid colliding with foreign listeners on fixed
         // ports. Sandbox: kubectl errors fast (must not be the guard's
         // bail). Live cluster: Ok or 500ms timeout, either proves the
         // guard is gone (it returned in microseconds).
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            gateway_port_forward(0),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(500), gateway_tunnel(0)).await;
         if let Ok(Err(err)) = result {
             assert!(
                 !format!("{err:#}").contains("unsupported"),
