@@ -603,9 +603,10 @@ impl AssignmentCloseStatus {
 /// `query_scalar::<_, i64>`; `rows_affected()` of a CTE statement is
 /// NOT the close count.
 ///
-/// `db/tests/fence_coverage.rs` pins this as the only production
-/// `UPDATE assignments` site; the fence discipline is unchanged (every
-/// caller is itself a `FencedTx` owner or `*_in_tx` body).
+/// `db/tests/fence_coverage.rs` pins this and
+/// [`close_assignments_returning_exec_ids_sql`] as the only production
+/// `UPDATE assignments` renderers; the fence discipline is unchanged
+/// (every caller is itself a `FencedTx` owner or `*_in_tx` body).
 pub(crate) fn close_assignments_sql(selector: &str, first_free_bind: u32) -> String {
     let sb = first_free_bind;
     let eb = first_free_bind + 1;
@@ -620,6 +621,38 @@ pub(crate) fn close_assignments_sql(selector: &str, first_free_bind: u32) -> Str
              WHERE e.exec_id IN (SELECT exec_id FROM closed) \
                AND e.status IS NULL) \
          SELECT count(*) FROM closed"
+    )
+}
+
+/// Sibling of [`close_assignments_sql`] (Q12, sh-007c S6): identical
+/// CTE body — same `closed` UPDATE, same `stamped` `drv_executions`
+/// stamp, same `status IS NULL` first-verdict-wins guard — but the
+/// projection is `SELECT exec_id FROM closed` instead of `count(*)`.
+/// Fetch with `query_scalar::<_, Uuid>` / `fetch_all`. The batched
+/// consumption close needs the closed-row SET (per-exec
+/// `WriteDisposition` synthesis), not its cardinality.
+///
+/// `close_assignments_sql` is UNCHANGED (its 6 callers fetch
+/// `query_scalar::<_, i64>`); this is additive. The
+/// `closer_statements_render_through_close_assignments_sql` census
+/// whitelists both renderers.
+pub(crate) fn close_assignments_returning_exec_ids_sql(
+    selector: &str,
+    first_free_bind: u32,
+) -> String {
+    let sb = first_free_bind;
+    let eb = first_free_bind + 1;
+    format!(
+        "WITH closed AS ( \
+             UPDATE assignments SET status = ${sb}, completed_at = now() \
+             WHERE ({selector}) AND status IN ('pending', 'acknowledged') \
+             RETURNING exec_id), \
+         stamped AS ( \
+             UPDATE drv_executions e \
+             SET status = ${eb}, finished_at = COALESCE(e.finished_at, now()) \
+             WHERE e.exec_id IN (SELECT exec_id FROM closed) \
+               AND e.status IS NULL) \
+         SELECT exec_id FROM closed"
     )
 }
 

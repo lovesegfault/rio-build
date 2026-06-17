@@ -423,6 +423,100 @@ impl SchedulerDb {
         Ok(result.rows_affected())
     }
 
+    /// [`Self::append_attempts_batch`] with `RETURNING exec_id` (the
+    /// sh-007c S6 batched consumption-close variant): the caller needs
+    /// the inserted-row SET (per-exec `inserted` outcome — the
+    /// `closed_set`-orthogonal in-mem ledger sync gate), not its
+    /// cardinality. Same conflict semantics; rows whose `exec_id`
+    /// conflicted (`ON CONFLICT DO NOTHING`) are absent from the
+    /// return. Every row passed here carries `exec_id = Some(_)` (the
+    /// materialization charge rows always do); a `None`-exec row would
+    /// surface as a NULL in the returned scalar.
+    pub(crate) async fn append_attempts_batch_returning_exec_ids(
+        tx: &mut PgConnection,
+        rows: &[AttemptRow],
+    ) -> Result<Vec<Uuid>, sqlx::Error> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut attempt_id = Vec::with_capacity(rows.len());
+        let mut derivation_id = Vec::with_capacity(rows.len());
+        let mut exec_id = Vec::with_capacity(rows.len());
+        let mut executor_id = Vec::with_capacity(rows.len());
+        let mut source_node = Vec::with_capacity(rows.len());
+        let mut event_kind = Vec::with_capacity(rows.len());
+        let mut outcome_class = Vec::with_capacity(rows.len());
+        let mut termination_reason = Vec::with_capacity(rows.len());
+        let mut reporting_party = Vec::with_capacity(rows.len());
+        let mut exempt = Vec::with_capacity(rows.len());
+        let mut floor_promoted = Vec::with_capacity(rows.len());
+        let mut floor_at_cap = Vec::with_capacity(rows.len());
+        let mut error_msg = Vec::with_capacity(rows.len());
+        let mut final_line_count = Vec::with_capacity(rows.len());
+        let mut resubmit_cycle = Vec::with_capacity(rows.len());
+        let mut occurred_at = Vec::with_capacity(rows.len());
+        let mut attempt_kind = Vec::with_capacity(rows.len());
+        for r in rows {
+            attempt_id.push(r.attempt_id);
+            derivation_id.push(r.derivation_id);
+            exec_id.push(r.exec_id);
+            executor_id.push(r.executor_id.as_ref().map(|e| e.as_str().to_string()));
+            source_node.push(r.source_node.clone());
+            event_kind.push(r.event_kind.as_str());
+            outcome_class.push(r.outcome_class.as_str());
+            termination_reason.push(r.termination_reason.clone());
+            reporting_party.push(r.reporting_party.as_str());
+            exempt.push(r.exempt);
+            floor_promoted.push(r.floor_promoted);
+            floor_at_cap.push(r.floor_at_cap);
+            error_msg.push(r.error_msg.clone());
+            final_line_count.push(r.final_line_count);
+            resubmit_cycle.push(r.resubmit_cycle);
+            occurred_at.push(r.occurred_at_epoch_secs);
+            attempt_kind.push(r.attempt_kind.as_str());
+        }
+        sqlx::query_scalar(
+            "INSERT INTO drv_attempts \
+                 (attempt_id, derivation_id, exec_id, executor_id, source_node, event_kind, \
+                  outcome_class, termination_reason, reporting_party, exempt, \
+                  floor_promoted, floor_at_cap, error_msg, final_line_count, \
+                  resubmit_cycle, occurred_at, attempt_kind) \
+             SELECT attempt_id, derivation_id, exec_id, executor_id, source_node, event_kind, \
+                    outcome_class, termination_reason, reporting_party, exempt, \
+                    floor_promoted, floor_at_cap, error_msg, final_line_count, \
+                    resubmit_cycle, to_timestamp(occurred_at), attempt_kind \
+             FROM UNNEST($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::text[], \
+                         $6::text[], $7::text[], $8::text[], $9::bool[], $10::bool[], \
+                         $11::bool[], $12::text[], $13::bigint[], $14::int[], \
+                         $15::float8[], $16::text[], $17::text[]) \
+                  AS t(attempt_id, derivation_id, exec_id, executor_id, event_kind, \
+                       outcome_class, termination_reason, reporting_party, exempt, \
+                       floor_promoted, floor_at_cap, error_msg, final_line_count, \
+                       resubmit_cycle, occurred_at, source_node, attempt_kind) \
+             ON CONFLICT (exec_id) WHERE exec_id IS NOT NULL DO NOTHING \
+             RETURNING exec_id",
+        )
+        .bind(&attempt_id)
+        .bind(&derivation_id)
+        .bind(&exec_id)
+        .bind(&executor_id)
+        .bind(&event_kind)
+        .bind(&outcome_class)
+        .bind(&termination_reason)
+        .bind(&reporting_party)
+        .bind(&exempt)
+        .bind(&floor_promoted)
+        .bind(&floor_at_cap)
+        .bind(&error_msg)
+        .bind(&final_line_count)
+        .bind(&resubmit_cycle)
+        .bind(&occurred_at)
+        .bind(&source_node)
+        .bind(&attempt_kind)
+        .fetch_all(&mut *tx)
+        .await
+    }
+
     /// The second installment of a two-installment attempt: fill
     /// `termination_reason` (and reclassify `outcome_class`) on the
     /// row identified by `(derivation_id, exec_id)`.

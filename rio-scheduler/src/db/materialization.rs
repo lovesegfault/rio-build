@@ -163,6 +163,36 @@ pub(crate) enum FencedCancelSweep {
     Fenced,
 }
 
+/// Result of one batched consumption-close transaction
+/// ([`SchedulerDb::close_and_resolve_materialization_batch_fenced`]):
+/// the whole batch is ONE fenced transaction, so `fenced` is
+/// batch-level while application is reported per exec/job. The caller
+/// synthesizes a per-item
+/// [`rio_evidence_kernel::settle::WriteDisposition`] from
+/// `{tx outcome, exec_id ∈ closed_set}`.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Default)]
+pub(crate) struct BatchCloseResult {
+    /// `exec_id`s whose assignment row flipped active → completed
+    /// (the `SELECT exec_id FROM closed` projection). An exec absent
+    /// here was already closed (idempotent re-entry — `AlreadyResolved`).
+    pub closed_set: HashSet<Uuid>,
+    /// `exec_id`s whose `drv_attempts` charge row was actually
+    /// inserted (the `RETURNING exec_id` set). Orthogonal to
+    /// `closed_set` — the in-mem `push_attempt_record` /
+    /// `refresh_retry_view` ledger sync gates on THIS, not on
+    /// assignment-close.
+    pub inserted_set: HashSet<Uuid>,
+    /// `job_id`s whose row flipped pending → terminal (the
+    /// at-most-once edge for the resolution counter and the
+    /// settled-gated view removal).
+    pub resolved_set: HashSet<Uuid>,
+    /// The serving generation was below the claims floor: the
+    /// transaction rolled back having written nothing — for ANY
+    /// member of the batch. The three sets are empty when true.
+    pub fenced: bool,
+}
+
 impl SchedulerDb {
     /// THE creation core (adjudication PDQ-9 / design §2.1 rows 1–2,
     /// A13/B6): create (or find existing) unresolved jobs for a batch
@@ -593,6 +623,102 @@ impl SchedulerDb {
         tx.commit().await?;
         Ok(FencedCancelSweep::Applied {
             resolved: resolved.into_iter().collect(),
+        })
+    }
+
+    /// The sh-007c S6 batched consumption-close: ONE fenced
+    /// transaction that (1) closes every assignment in `exec_ids`
+    /// (`SELECT exec_id FROM closed` projection — the per-exec
+    /// `WriteDisposition` synthesis needs the SET, not the count),
+    /// (2) appends every charge row (`ON CONFLICT (exec_id) DO
+    /// NOTHING RETURNING exec_id` — the `inserted` ⟺ in-RETURNING
+    /// gate the in-mem ledger sync needs), and (3) resolves every
+    /// `(job_id, to_state, resolution_exec_id)` triple
+    /// (`state='pending'` guard, at-most-once). Same idempotency as
+    /// the per-item composition: a re-delivered batch's already-closed
+    /// rows are absent from `closed_set`, already-recorded charges are
+    /// absent from `inserted_set`, already-resolved jobs are absent
+    /// from `resolved_set`.
+    ///
+    /// Atomicity delta vs the per-item path: one shared-tx `Err` NACKs
+    /// the WHOLE batch (today: NACKs item k..N). Safe per the
+    /// ack-after-durable contract — the close is idempotent and the
+    /// store's `report_until_acked` re-delivers; the next flush re-
+    /// closes the already-closed rows (absent from `closed_set` →
+    /// `AlreadyResolved`) and acks. `Fenced` is batch-wide (the floor
+    /// is per-tx, not per-row).
+    ///
+    /// Does NOT mint `SettledClose` — the actor's
+    /// `close_for_consumption_from_disposition` is the (second)
+    /// sanctioned mint; the db layer cannot construct the
+    /// module-private witness.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn close_and_resolve_materialization_batch_fenced(
+        &self,
+        serving_generation: ServingGeneration,
+        exec_ids: &[Uuid],
+        charge_rows: &[AttemptRow],
+        resolves: &[(Uuid, JobState, Option<Uuid>)],
+    ) -> Result<BatchCloseResult, sqlx::Error> {
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            FencedBegin::Fenced { .. } => {
+                return Ok(BatchCloseResult {
+                    closed_set: HashSet::new(),
+                    inserted_set: HashSet::new(),
+                    resolved_set: HashSet::new(),
+                    fenced: true,
+                });
+            }
+            FencedBegin::Open(ftx) => ftx,
+        };
+        // (1) close — the `SELECT exec_id FROM closed` sibling
+        // renderer (Q12: `close_assignments_sql` is unchanged for its
+        // 6 `query_scalar::<_, i64>` callers).
+        static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            super::close_assignments_returning_exec_ids_sql("exec_id = ANY($1::uuid[])", 2)
+        });
+        let closed: Vec<Uuid> = if exec_ids.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_scalar(SQL.as_str())
+                .bind(exec_ids)
+                .bind(super::AssignmentCloseStatus::Completed.as_str())
+                .bind(super::AssignmentCloseStatus::Completed.exec_status())
+                .fetch_all(tx.conn())
+                .await?
+        };
+        // (2) append charge rows — RETURNING exec_id is the per-row
+        // `inserted` outcome (orthogonal to assignment-close).
+        let inserted: Vec<Uuid> =
+            super::SchedulerDb::append_attempts_batch_returning_exec_ids(tx.conn(), charge_rows)
+                .await?;
+        // (3) resolve jobs — UNNEST per-row to_state (Q9: `state` is
+        // TEXT with CHECK, not a PG enum).
+        let resolved: Vec<Uuid> = if resolves.is_empty() {
+            Vec::new()
+        } else {
+            let job_ids: Vec<Uuid> = resolves.iter().map(|(j, _, _)| *j).collect();
+            let states: Vec<&str> = resolves.iter().map(|(_, s, _)| s.as_str()).collect();
+            let res_execs: Vec<Option<Uuid>> = resolves.iter().map(|(_, _, e)| *e).collect();
+            sqlx::query_scalar(
+                "UPDATE materialization_jobs m \
+                    SET state = u.s, resolution_exec_id = u.e, resolved_at = now() \
+                   FROM UNNEST($1::uuid[], $2::text[], $3::uuid[]) AS u(j, s, e) \
+                  WHERE m.job_id = u.j AND m.state = 'pending' \
+                  RETURNING m.job_id",
+            )
+            .bind(&job_ids)
+            .bind(&states)
+            .bind(&res_execs)
+            .fetch_all(tx.conn())
+            .await?
+        };
+        tx.commit().await?;
+        Ok(BatchCloseResult {
+            closed_set: closed.into_iter().collect(),
+            inserted_set: inserted.into_iter().collect(),
+            resolved_set: resolved.into_iter().collect(),
+            fenced: false,
         })
     }
 

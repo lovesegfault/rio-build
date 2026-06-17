@@ -1462,3 +1462,103 @@ async fn unresolved_jobs_for_derivations_parity_with_singleton() -> anyhow::Resu
     drop(test_db);
     Ok(())
 }
+
+/// sh-007c S6: `close_and_resolve_materialization_batch_fenced` —
+/// closed_set / inserted_set / resolved_set parity with the per-item
+/// composition; idempotent re-entry yields empty sets; Fenced is
+/// batch-wide.
+#[tokio::test]
+async fn close_and_resolve_materialization_batch_idempotent() -> anyhow::Result<()> {
+    use crate::db::attempts::AttemptRow;
+    use crate::state::{AttemptKind, ExecutorId, OutcomeClass, ReportingParty};
+
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    let g = ServingGeneration::stamp_from_claim(1);
+
+    // Two derivations; each with an open assignment, an execution row,
+    // and a pending job.
+    let mut exec_ids = Vec::new();
+    let mut job_ids = Vec::new();
+    let mut charges = Vec::new();
+    for tag in ["bcr-a", "bcr-b"] {
+        let drv = insert_test_derivation(&db, tag).await?;
+        let exec = Uuid::now_v7();
+        db.insert_assignment(drv, &ExecutorId::from(tag), 1, exec)
+            .await?;
+        sqlx::query(
+            "INSERT INTO drv_executions (exec_id, drv_hash, executor_id, started_at, \
+                                         attempt_kind) \
+             VALUES ($1, $2, 'store-0', now(), 'materialization')",
+        )
+        .bind(exec)
+        .bind(format!("{tag:0>32}"))
+        .execute(&test_db.pool)
+        .await?;
+        let FencedJobCreate::Applied { job_id, .. } = db
+            .create_materialization_job_fenced(drv, tag, None, JobOrigin::Pruned, None, g)
+            .await?
+        else {
+            anyhow::bail!("job create must apply");
+        };
+        let mut row = AttemptRow::new(
+            drv,
+            OutcomeClass::MaterializationUnobtainable,
+            ReportingParty::Worker,
+            AttemptKind::Materialization,
+        );
+        row.exec_id = Some(exec);
+        exec_ids.push(exec);
+        job_ids.push(job_id);
+        charges.push(row);
+    }
+    let resolves: Vec<_> = job_ids
+        .iter()
+        .zip(exec_ids.iter())
+        .map(|(j, e)| (*j, JobState::ResolvedSuccess, Some(*e)))
+        .collect();
+
+    // First pass: every set is full.
+    let r1 = db
+        .close_and_resolve_materialization_batch_fenced(g, &exec_ids, &charges, &resolves)
+        .await?;
+    assert!(!r1.fenced);
+    assert_eq!(
+        r1.closed_set,
+        exec_ids.iter().copied().collect(),
+        "every active assignment closed"
+    );
+    assert_eq!(
+        r1.inserted_set,
+        exec_ids.iter().copied().collect(),
+        "every charge row inserted (RETURNING exec_id)"
+    );
+    assert_eq!(
+        r1.resolved_set,
+        job_ids.iter().copied().collect(),
+        "every pending job resolved"
+    );
+
+    // Second pass (re-delivery): every set is empty — idempotent.
+    let r2 = db
+        .close_and_resolve_materialization_batch_fenced(g, &exec_ids, &charges, &resolves)
+        .await?;
+    assert!(!r2.fenced);
+    assert!(r2.closed_set.is_empty(), "already-closed → AlreadyResolved");
+    assert!(r2.inserted_set.is_empty(), "ON CONFLICT DO NOTHING");
+    assert!(r2.resolved_set.is_empty(), "state='pending' guard");
+
+    // Fenced: the floor is per-tx — a deposed generation rolls back
+    // having written nothing for ANY member.
+    let r3 = db
+        .close_and_resolve_materialization_batch_fenced(
+            ServingGeneration::stamp_from_claim(0),
+            &exec_ids,
+            &charges,
+            &resolves,
+        )
+        .await?;
+    assert!(r3.fenced);
+    drop(test_db);
+    Ok(())
+}

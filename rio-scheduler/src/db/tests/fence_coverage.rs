@@ -185,6 +185,7 @@ fn every_decision_table_writer_is_fenced_or_allowlisted() {
 fn closer_statements_render_through_close_assignments_sql() {
     const SANCTIONED: &[(&str, &str)] = &[
         ("mod.rs", "close_assignments_sql"),
+        ("mod.rs", "close_assignments_returning_exec_ids_sql"),
         ("assignments.rs", "update_assignment_status"),
     ];
     let mut violations = Vec::new();
