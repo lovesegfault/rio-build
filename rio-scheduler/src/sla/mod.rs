@@ -272,6 +272,27 @@ pub struct SlaEstimator {
     /// pname. In-memory ring (this leader's tenure only); cap is fixed
     /// — it's a diagnostic surface, not a model input.
     mispredictors: metrics::MispredictorTracker,
+    /// Per-call instrumentation for the [`Self::refresh`] hot loop.
+    /// Test-only: drives the structural assertion that the per-key
+    /// outlier scan is O(|new_rows|), not O(|touched|×|new_rows|).
+    #[cfg(test)]
+    pub(super) last_timing: Mutex<RefreshTiming>,
+}
+
+/// Iteration counters from the last [`SlaEstimator::refresh`] call.
+/// Test-only structural witness for the sh-018 quadratic: the
+/// `outlier_scan_iters` count is the number of [`BuildSampleRow`]s
+/// examined across every key's outlier scan — bounded by `new_rows`
+/// when the scan is a per-key index lookup, unbounded
+/// (`|touched|×|new_rows|`) when it linear-filters the full
+/// incremental set per key.
+///
+/// [`BuildSampleRow`]: crate::db::BuildSampleRow
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct RefreshTiming {
+    pub(super) outlier_scan_iters: usize,
+    pub(super) new_rows: usize,
 }
 
 impl SlaEstimator {
@@ -326,6 +347,8 @@ impl SlaEstimator {
             last_tick: RwLock::new(0.0),
             ring_buffer: cfg.ring_buffer,
             mispredictors: metrics::MispredictorTracker::new(1024),
+            #[cfg(test)]
+            last_timing: Mutex::new(RefreshTiming::default()),
         }
     }
 
@@ -709,12 +732,19 @@ impl SlaEstimator {
 
         let touched: HashSet<types::ModelKey> = new_rows
             .iter()
-            .map(|r| types::ModelKey {
-                pname: r.pname.clone(),
-                system: r.system.clone(),
-                tenant: r.tenant.clone(),
-            })
+            .map(crate::db::BuildSampleRow::model_key)
             .collect();
+        // sh-018: index `new_rows` by key ONCE so the per-key outlier
+        // scan below is a hashmap lookup, not a linear filter over the
+        // full incremental set. The filter form was O(|touched|×|new_rows|)
+        // — at a 4.9k-row completion burst that is ~24M string-triple
+        // compares per refresh, which alone accounted for ~2-3s of the
+        // 12.9s phase-00 spike. Same one-pass-fold shape as `rings` below.
+        let mut new_by_key: HashMap<types::ModelKey, Vec<&crate::db::BuildSampleRow>> =
+            HashMap::with_capacity(touched.len());
+        for r in &new_rows {
+            new_by_key.entry(r.model_key()).or_default().push(r);
+        }
 
         // Batch the per-key ring reads into a single round-trip. On a
         // fresh process the first refresh has since=0.0 → every key in
@@ -739,16 +769,12 @@ impl SlaEstimator {
             .await?
             .into_iter()
             .fold(HashMap::new(), |mut m, r| {
-                m.entry(types::ModelKey {
-                    pname: r.pname.clone(),
-                    system: r.system.clone(),
-                    tenant: r.tenant.clone(),
-                })
-                .or_default()
-                .push(r);
+                m.entry(r.model_key()).or_default().push(r);
                 m
             });
 
+        #[cfg(test)]
+        let mut outlier_scan_iters = 0usize;
         let mut outlier_ids: HashSet<i64> = HashSet::new();
         for (i, key) in touched.iter().enumerate() {
             if i > 0 && i.is_multiple_of(64) {
@@ -770,9 +796,11 @@ impl SlaEstimator {
             // `WHERE NOT outlier_excluded`). Using prev not new fit:
             // the new fit would already be contaminated by the outlier.
             if let Some(prev) = prev.as_ref() {
-                for r in new_rows.iter().filter(|r| {
-                    r.pname == key.pname && r.system == key.system && r.tenant == key.tenant
-                }) {
+                for r in new_by_key.get(key).into_iter().flatten() {
+                    #[cfg(test)]
+                    {
+                        outlier_scan_iters += 1;
+                    }
                     // r[impl sched.sla.hw-ref-seconds]
                     // prev.fit and prev.log_residuals are in
                     // reference-seconds; normalize the new sample's
@@ -834,6 +862,13 @@ impl SlaEstimator {
         }
 
         *self.last_tick.write() = hwm;
+        #[cfg(test)]
+        {
+            *self.last_timing.lock() = RefreshTiming {
+                outlier_scan_iters,
+                new_rows: new_rows.len(),
+            };
+        }
 
         // r[impl sched.sla.prior-partial-pool]
         // Fleet-median recompute AFTER the refit loop so this tick's new
@@ -1333,5 +1368,96 @@ mod tests {
         src.seed(indep);
         src.seed(fitted("ok", 10.0));
         assert_eq!(src.export_corpus(None, 3).entries.len(), 1);
+    }
+
+    /// sh-018: the per-key outlier scan inside `refresh()` linear-filtered
+    /// the full `new_rows` vec by `(pname,system,tenant)` INSIDE the
+    /// `for key in touched` loop — O(|touched|×|new_rows|). At a 4.9k-row
+    /// completion
+    /// burst (~2.5k distinct keys) that is ~12.5M string-triple compares
+    /// per refresh; phase-00 spiked to 12.9s and the actor mailbox backed
+    /// up to 758. Pre-grouping `new_rows` by `ModelKey` once collapses the
+    /// per-key scan to a hashmap lookup, so the total rows examined is
+    /// bounded by `|new_rows|` regardless of `|touched|`.
+    ///
+    /// Structural assertion (load-independent): `outlier_scan_iters ≤
+    /// new_rows`. RED at the quadratic shape: 2500 keys × 5000 rows =
+    /// 12.5M ≫ 5000. The wall-clock `<15s` bound is a wide tripwire only
+    /// — builder variance is large under the `postgres` test-group, and
+    /// the iteration count is the property under test.
+    #[tokio::test]
+    async fn refresh_5k_burst_structural() -> anyhow::Result<()> {
+        const KEYS: usize = 2500;
+        let test_db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+        let est = SlaEstimator::for_test(&cfg());
+
+        // Batch-insert helper: KEYS×2 rows at distinct cpu_limit so
+        // phase-1's refit caches a non-Probe `prev` per key (the outlier
+        // scan only fires when `prev.is_some()`). `completed_at` is
+        // explicit so the phase-1 hwm cleanly partitions phase-2.
+        let seed = |at: f64| {
+            let mut pnames = Vec::with_capacity(KEYS * 2);
+            let mut cores = Vec::with_capacity(KEYS * 2);
+            let mut durs = Vec::with_capacity(KEYS * 2);
+            for i in 0..KEYS {
+                for (c, d) in [(2.0, 100.0), (4.0, 60.0)] {
+                    pnames.push(format!("p{i:04}"));
+                    cores.push(c);
+                    durs.push(d);
+                }
+            }
+            let pool = test_db.pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO build_samples \
+                       (pname, system, tenant, duration_secs, peak_memory_bytes, \
+                        cpu_limit_cores, completed_at) \
+                     SELECT u.p, 'x86_64-linux', 't0', u.d, 0, u.c, to_timestamp($4) \
+                     FROM UNNEST($1::text[], $2::float8[], $3::float8[]) AS u(p, c, d)",
+                )
+                .bind(&pnames)
+                .bind(&cores)
+                .bind(&durs)
+                .bind(at)
+                .execute(&pool)
+                .await
+            }
+        };
+
+        // Phase 1: warm. since=0.0 → all 5k rows; prev=None per key →
+        // outlier scan gated off; refit caches every key. Cheap on the
+        // dimension under test (zero scan iters) regardless of fix.
+        seed(1000.0).await?;
+        est.refresh(&db, &[], |_| {}).await?;
+        assert_eq!(est.last_timing.lock().outlier_scan_iters, 0, "phase-1 cold");
+
+        // Phase 2: same KEYS, fresh completed_at past the phase-1 hwm.
+        // prev=Some per key → outlier scan fires for every key.
+        seed(2000.0).await?;
+        let t0 = std::time::Instant::now();
+        let touched = est.refresh(&db, &[], |_| {}).await?;
+        let elapsed = t0.elapsed();
+        let timing = *est.last_timing.lock();
+        eprintln!(
+            "refresh_5k phase2: touched={touched} new_rows={} \
+             outlier_scan_iters={} elapsed={elapsed:?}",
+            timing.new_rows, timing.outlier_scan_iters,
+        );
+
+        assert_eq!(touched, KEYS);
+        assert_eq!(timing.new_rows, KEYS * 2);
+        assert!(
+            timing.outlier_scan_iters <= timing.new_rows,
+            "per-key outlier scan must be O(|new_rows|): examined {} rows for {} new_rows",
+            timing.outlier_scan_iters,
+            timing.new_rows,
+        );
+        // Wide tripwire only — structural count above is the gate.
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "phase-2 refresh wall-clock tripwire: {elapsed:?}"
+        );
+        Ok(())
     }
 }

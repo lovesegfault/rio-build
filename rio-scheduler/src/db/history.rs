@@ -48,6 +48,22 @@ pub struct BuildSampleRow {
     pub completed_at: f64,
 }
 
+impl BuildSampleRow {
+    /// `(pname, system, tenant)` triple as the SLA-fit cache key. Dedupe
+    /// helper for the per-key grouping passes in
+    /// [`SlaEstimator::refresh`] (the `touched` set, the `rings` map, and
+    /// the per-key new-row index) — previously open-coded at each site.
+    ///
+    /// [`SlaEstimator::refresh`]: crate::sla::SlaEstimator::refresh
+    pub(crate) fn model_key(&self) -> crate::sla::types::ModelKey {
+        crate::sla::types::ModelKey {
+            pname: self.pname.clone(),
+            system: self.system.clone(),
+            tenant: self.tenant.clone(),
+        }
+    }
+}
+
 /// One `sla_overrides` row. ADR-023 phase-6 operator pins. NULL
 /// `system`/`tenant` are wildcards — `sla::override::resolve`
 /// matches most-specific first. `expires_at` is Unix-epoch f64 (same
