@@ -915,7 +915,7 @@ async fn tick_abandoned_after_3x_tick_on_stalled_kube() {
 /// sh-030 c2 — a tracked claim the controller OBSERVED Registered
 /// then absent (Karpenter empty-node consolidation across a
 /// controller-blind window) is `EmptyConsolidation`: counter only,
-/// NEVER ICE-masked. The B11 sibling (`ever_registered: false`) is the
+/// never ICE-masked. The B11 sibling (`ever_registered: false`) is the
 /// structural pin that the never-Registered fast-GC row STILL masks —
 /// the only sub-tick launch-failure detector. Pre-fix red (verbatim):
 /// `assertion `left == right` failed: a tracked claim observed

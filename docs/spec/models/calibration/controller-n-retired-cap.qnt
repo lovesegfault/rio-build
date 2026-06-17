@@ -47,7 +47,8 @@ module nCalibRetiredCap {
     ENABLE_TOMBSTONE_MACHINERY = false,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).* from "../nodeclaimLifecycle"
 
   /// The as-built full tick with ONE change: the mint relation
@@ -139,12 +140,14 @@ module nCalibRetiredCap {
         else if (slotForA.contains(k))
           { phase: CInFlight, cell: "cellA", stuck: false, spell: SNotIdle,
             busyTickSeen: false, boot: BRecorded, inflightTracked: true,
-            inflightCell: "cellA", pIdle: INotTracked, ctrlReaped: false,
+            inflightCell: "cellA", everRegistered: false,
+            pIdle: INotTracked, ctrlReaped: false,
             tomb: false, tombAge: 0, ourCommit: false }
         else if (slotForB.contains(k))
           { phase: CInFlight, cell: "cellB", stuck: false, spell: SNotIdle,
             busyTickSeen: false, boot: BRecorded, inflightTracked: true,
-            inflightCell: "cellB", pIdle: INotTracked, ctrlReaped: false,
+            inflightCell: "cellB", everRegistered: false,
+            pIdle: INotTracked, ctrlReaped: false,
             tomb: false, tombAge: 0, ourCommit: false }
         else if (c.inflightTracked and (c.phase == CRegistered or c.phase == CTerminating))
           { ...c, inflightTracked: false }

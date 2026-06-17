@@ -2263,7 +2263,7 @@ gate state, lease-holder only).
   the launch-failure path; a launched claim's teardown rides a
   multi-tick finalizer --- conditional on the 10 s tick cadence the
   3×TICK reconcile bound enforces) and is empty-node consolidation
-  (counter only, NEVER a mask) when the controller DID observe it
+  (counter only, never a mask) when the controller DID observe it
   Registered on an earlier tick --- capacity provably materialized
   (sh-030: a 295 s tick let 69 claims Register, sit empty past
   Karpenter `consolidateAfter`, and vanish; the unconditional pre-fix

@@ -42,7 +42,14 @@ module m2CalibNoConsolidatePrune {
     ENABLE_TOMBSTONE_MACHINERY = false,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    // sh-030's everRegistered gate is OFF for this calibration: the
+    // pre-fix scenario's stale inflight entry belongs to a claim that
+    // WAS Registered, so the gate would reclassify the spurious vanish
+    // as empty consolidation and mask the consolidate-prune mechanism
+    // this module pins. The prune is still load-bearing for the
+    // never-Registered fast-GC row independent of the gate.
+    ENABLE_EMPTY_CONSOLIDATION_GATE = false
   ).* from "../nodeclaimLifecycle"
 
   /// The as-built consolidate-only tick with the inflight_created prune
@@ -194,7 +201,8 @@ module m2CalibInflightDropOnSight {
     ENABLE_TOMBSTONE_MACHINERY = false,
     ENABLE_FOLD_CLOCK = false,
     ENABLE_LAGGED_COMMIT_OBSERVATION = false,
-    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true
+    ENABLE_TYPED_TOMBSTONE_DISPOSITION = true,
+    ENABLE_EMPTY_CONSOLIDATION_GATE = true
   ).* from "../nodeclaimLifecycle"
 
   /// The structural conservation property the KEEP arm protects. Scoped
@@ -292,12 +300,14 @@ module m2CalibInflightDropOnSight {
         else if (slotForA.contains(k))
           { phase: CInFlight, cell: "cellA", stuck: false, spell: SNotIdle,
             busyTickSeen: false, boot: BRecorded, inflightTracked: true,
-            inflightCell: "cellA", pIdle: INotTracked, ctrlReaped: false,
+            inflightCell: "cellA", everRegistered: false,
+            pIdle: INotTracked, ctrlReaped: false,
             tomb: false, tombAge: 0, ourCommit: false }
         else if (slotForB.contains(k))
           { phase: CInFlight, cell: "cellB", stuck: false, spell: SNotIdle,
             busyTickSeen: false, boot: BRecorded, inflightTracked: true,
-            inflightCell: "cellB", pIdle: INotTracked, ctrlReaped: false,
+            inflightCell: "cellB", everRegistered: false,
+            pIdle: INotTracked, ctrlReaped: false,
             tomb: false, tombAge: 0, ourCommit: false }
         // PRE-FIX (08d49c52c bug_020): every entry whose claim appears in
         // the live LIST is pruned on first sight — in-flight ones too.
