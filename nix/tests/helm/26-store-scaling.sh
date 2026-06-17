@@ -141,13 +141,14 @@ test "$n_avg" -eq 4 || {
 # reclaim (WO-S5-4, co-derived). Scale-up unstabilized.
 sd=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.advanced.horizontalPodAutoscalerConfig.behavior.scaleDown.stabilizationWindowSeconds' "$out")
 su=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.advanced.horizontalPodAutoscalerConfig.behavior.scaleUp.stabilizationWindowSeconds' "$out")
-test "$sd" = "300" && test "$su" = "0" || {
-  echo "FAIL: store ScaledObject stabilization scaleDown/scaleUp = $sd/$su, expected 300/0 (D2: the floor SLO needs the short window; the inhibitor trigger carries the protection)" >&2
+test "$sd" = "300" && test "$su" = "60" || {
+  echo "FAIL: store ScaledObject stabilization scaleDown/scaleUp = $sd/$su, expected 300/60 (D2 floor SLO needs the short window; sh-007c S5/S6 drain rate makes 60s the damping)" >&2
   exit 1
 }
-# D-052-2: scale-up keeps the 0s window (a post-wipe wave must scale
-# out the moment the leading signal fires) but the per-period
-# COMMITMENT is bounded: Pods 16 / 30s. live_052's raw-backlog signal
+# D-052-2 revised after sh-007c S5/S6: scale-up window is 60s — at the
+# ~tripled actor drain rate the leading-signal burst is half-gone by
+# 60s, so averaging damps the spike. The per-period COMMITMENT bound
+# stays: Pods 16 / 30s. live_052's raw-backlog signal
 # asked 4→173 replicas in 75s against a ~46-node hostable ceiling —
 # 133 pods structurally unschedulable. One Pods policy, exactly.
 sup=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.advanced.horizontalPodAutoscalerConfig.behavior.scaleUp.policies' "$out")
