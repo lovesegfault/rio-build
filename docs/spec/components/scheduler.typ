@@ -4014,6 +4014,13 @@ backoff. This prevents unbounded request queueing at the gateway layer.
   columns --- below the \~30k-derivation size of a NixOS system closure.
 ]
 
+#r("sched.db.merge-batch-shape")[
+  `persist_merge_to_db` MUST stream `derivations` and `derivation_edges`
+  via `COPY FROM STDIN` into `ON COMMIT DROP` temp tables before the
+  `ON CONFLICT` upsert, so a 14k-derivation merge persists in sub-second
+  wall-clock instead of paying the per-row UNNEST decode + upsert cost.
+]
+
 #r("sched.db.partial-index-literal")[
   Queries that filter by terminal status MUST interpolate the terminal-status
   list as a SQL literal (`NOT IN ('completed', ...)`), not bind it as a

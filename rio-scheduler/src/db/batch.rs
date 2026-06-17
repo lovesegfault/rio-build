@@ -1,12 +1,30 @@
 //! Batch operations for `persist_merge_to_db` — build-derivation mapping +
-//! UNNEST-based bulk inserts.
+//! `COPY`-streamed bulk inserts.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::{DerivationRow, SchedulerDb, encode_pg_text_array};
+
+/// Escape one column value for `COPY … FROM STDIN (FORMAT text)`.
+///
+/// PG's text COPY format is `\n`-terminated rows of `\t`-separated
+/// columns; `\N` is NULL. The only escapes that matter are backslash,
+/// tab, newline, and carriage return — everything else is literal.
+fn copy_escape_into(out: &mut String, s: &str) {
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+}
 
 impl SchedulerDb {
     /// Link a build to a derivation. Test-only singular form; production
@@ -33,13 +51,20 @@ impl SchedulerDb {
     }
 
     // r[impl sched.db.batch-unnest]
+    // r[impl sched.db.merge-batch-shape]
     /// Batch-upsert derivations. Returns a map
     /// `drv_hash -> (derivation_id, resource_floor)`.
     ///
-    /// Array parameters via `UNNEST`: 10 bind params total regardless of
-    /// row count (vs `push_values`' 10×N, which hits PG's 65535-param
-    /// limit at ~6553 rows). `RETURNING drv_hash` because PG doesn't
-    /// guarantee `RETURNING` order matches `UNNEST` input order either.
+    /// Shape (sh-036): stream rows via `COPY (FORMAT text)` into an
+    /// `ON COMMIT DROP` temp table, then one `INSERT … SELECT FROM
+    /// _merge_derivations ON CONFLICT … RETURNING`. The temp-table DDL
+    /// runs here (self-contained) so direct callers — production's
+    /// `persist_merge_to_db` and the eight test sites — need no per-call
+    /// setup; the table is session-scoped to the caller's transaction
+    /// connection and dropped at commit.
+    ///
+    /// `RETURNING drv_hash` because PG doesn't guarantee `RETURNING`
+    /// order matches insert order; the result map keys by `drv_hash`.
     ///
     /// `floor_*` columns are returned so merge can hydrate them onto
     /// newly-inserted in-memory state (I-208) — `try_from_node` sets
@@ -54,38 +79,74 @@ impl SchedulerDb {
             return Ok(HashMap::new());
         }
 
-        // Decompose struct-of-rows into row-of-arrays. Ten parallel
-        // Vecs, one per column. This IS a transpose — lives for the
-        // duration of one INSERT, cheaper than N roundtrips.
-        //
         // Nested-array columns (required_features, expected_output_paths,
-        // output_names) can't unnest as text[][] —
-        // PG's multidim arrays are rectangular, but per-row feature
-        // lists have variable length. Encode as pg text[] literals
-        // ("{a,b,c}") and cast back in the SELECT. sqlx doesn't expose
-        // a Vec<Vec<String>> → text[][] Encode anyway.
-        let mut drv_hash = Vec::with_capacity(rows.len());
-        let mut drv_path = Vec::with_capacity(rows.len());
-        let mut pname = Vec::with_capacity(rows.len());
-        let mut system = Vec::with_capacity(rows.len());
-        let mut status = Vec::with_capacity(rows.len());
-        let mut required_features = Vec::with_capacity(rows.len());
-        let mut expected_output_paths = Vec::with_capacity(rows.len());
-        let mut output_names = Vec::with_capacity(rows.len());
-        let mut is_fixed_output = Vec::with_capacity(rows.len());
-        let mut is_ca = Vec::with_capacity(rows.len());
+        // output_names) are declared `text[]` (not `text`) so COPY's
+        // text-format parser reads encode_pg_text_array's `{"a","b"}`
+        // literal as an array value directly — no `::text[]` cast
+        // needed in the step-3 SELECT. PG multidim arrays are
+        // rectangular, so a `text[][]` bind was never an option; the
+        // COPY-literal route is the same workaround the old UNNEST path
+        // used, just one parse layer earlier.
+        sqlx::query(
+            r#"
+            CREATE TEMP TABLE _merge_derivations (
+                drv_hash               text    NOT NULL,
+                drv_path               text    NOT NULL,
+                pname                  text,
+                system                 text    NOT NULL,
+                status                 text    NOT NULL,
+                required_features      text[]  NOT NULL,
+                expected_output_paths  text[]  NOT NULL,
+                output_names           text[]  NOT NULL,
+                is_fixed_output        boolean NOT NULL,
+                is_ca                  boolean NOT NULL
+            ) ON COMMIT DROP
+            "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // One in-memory buffer, one .send(). The text[] columns get
+        // COPY-escaped on top of the array-literal escaping —
+        // PG de-escapes the COPY layer first, then parses the array
+        // literal, so an element backslash round-trips as `\\\\`.
+        let mut buf = String::with_capacity(rows.len() * 256);
         for r in rows {
-            drv_hash.push(r.drv_hash.as_str());
-            drv_path.push(r.drv_path.as_str());
-            pname.push(r.pname.as_deref());
-            system.push(r.system.as_str());
-            status.push(r.status.as_str());
-            required_features.push(encode_pg_text_array(&r.required_features));
-            expected_output_paths.push(encode_pg_text_array(&r.expected_output_paths));
-            output_names.push(encode_pg_text_array(&r.output_names));
-            is_fixed_output.push(r.is_fixed_output);
-            is_ca.push(r.is_ca);
+            copy_escape_into(&mut buf, &r.drv_hash);
+            buf.push('\t');
+            copy_escape_into(&mut buf, &r.drv_path);
+            buf.push('\t');
+            match &r.pname {
+                Some(p) => copy_escape_into(&mut buf, p),
+                None => buf.push_str("\\N"),
+            }
+            buf.push('\t');
+            copy_escape_into(&mut buf, &r.system);
+            buf.push('\t');
+            buf.push_str(r.status.as_str());
+            buf.push('\t');
+            copy_escape_into(&mut buf, &encode_pg_text_array(&r.required_features));
+            buf.push('\t');
+            copy_escape_into(&mut buf, &encode_pg_text_array(&r.expected_output_paths));
+            buf.push('\t');
+            copy_escape_into(&mut buf, &encode_pg_text_array(&r.output_names));
+            buf.push('\t');
+            buf.push(if r.is_fixed_output { 't' } else { 'f' });
+            buf.push('\t');
+            buf.push(if r.is_ca { 't' } else { 'f' });
+            buf.push('\n');
         }
+        let mut copy = tx
+            .copy_in_raw(
+                "COPY _merge_derivations \
+                 (drv_hash, drv_path, pname, system, status, \
+                  required_features, expected_output_paths, output_names, \
+                  is_fixed_output, is_ca) FROM STDIN (FORMAT text)",
+            )
+            .await?;
+        copy.send(buf.as_bytes()).await?;
+        let copied = copy.finish().await?;
+        debug_assert_eq!(copied, rows.len() as u64);
 
         // ON CONFLICT: update the recovery columns too. For
         // expected_output_paths / output_names / is_* a second build
@@ -100,6 +161,11 @@ impl SchedulerDb {
         // (`record_wanted_in_tx`, written by the same merge
         // transaction), keyed by (build, derivation) — a per-consumer
         // fact never belongs on the per-drv row.
+        //
+        // Duplicate `drv_hash` within one batch would raise
+        // "ON CONFLICT DO UPDATE … cannot affect row a second time" —
+        // identically to the prior `FROM UNNEST` form; `dedup_dag`
+        // upstream guarantees uniqueness.
         let result: Vec<(String, Uuid, i64, i64, i64, i64)> = sqlx::query_as(
             r#"
             INSERT INTO derivations
@@ -107,22 +173,15 @@ impl SchedulerDb {
                  expected_output_paths, output_names, is_fixed_output, is_ca)
             SELECT
                 drv_hash, drv_path, pname, system, status,
-                required_features::text[],
-                expected_output_paths::text[],
-                output_names::text[],
+                required_features, expected_output_paths, output_names,
                 is_fixed_output, is_ca
-            FROM UNNEST(
-                $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
-                $6::text[], $7::text[], $8::text[], $9::bool[], $10::bool[]
-            ) AS t(drv_hash, drv_path, pname, system, status,
-                   required_features, expected_output_paths, output_names,
-                   is_fixed_output, is_ca)
+            FROM _merge_derivations
             -- is_ca UPDATE is idempotent-by-construction: drv_hash is
             -- deterministic (input-addressed=store path; CA=modular hash
             -- per rio-nix hashDerivationModulo). Same drv_hash → same
             -- .drv content → same outputs[] → same is_ca. The EXCLUDED
             -- value always equals the existing row's value. Kept in the
-            -- SET-list for insert-columns parity (UNNEST binds $10).
+            -- SET-list for insert-columns parity.
             ON CONFLICT (drv_hash) DO UPDATE SET
                 updated_at = now(),
                 expected_output_paths = EXCLUDED.expected_output_paths,
@@ -134,16 +193,6 @@ impl SchedulerDb {
                       floor_cores::bigint
             "#,
         )
-        .bind(&drv_hash)
-        .bind(&drv_path)
-        .bind(&pname)
-        .bind(&system)
-        .bind(&status)
-        .bind(&required_features)
-        .bind(&expected_output_paths)
-        .bind(&output_names)
-        .bind(&is_fixed_output)
-        .bind(&is_ca)
         .fetch_all(&mut *tx)
         .await?;
         Ok(result
@@ -190,7 +239,10 @@ impl SchedulerDb {
         Ok(())
     }
 
-    /// Batch-insert edges.
+    // r[impl sched.db.merge-batch-shape]
+    /// Batch-insert edges. Same `COPY → ON COMMIT DROP temp →
+    /// INSERT … SELECT … ON CONFLICT DO NOTHING` shape as
+    /// [`Self::batch_upsert_derivations`]; no `RETURNING`.
     pub(crate) async fn batch_insert_edges(
         tx: &mut PgConnection,
         edges: &[(Uuid, Uuid)],
@@ -198,16 +250,33 @@ impl SchedulerDb {
         if edges.is_empty() {
             return Ok(());
         }
-        let (parents, children): (Vec<Uuid>, Vec<Uuid>) = edges.iter().copied().unzip();
+        sqlx::query(
+            "CREATE TEMP TABLE _merge_edges \
+             (parent_id uuid NOT NULL, child_id uuid NOT NULL) \
+             ON COMMIT DROP",
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // Uuid::Display is the canonical hyphenated form PG accepts;
+        // contains no `\t` `\n` `\\` so no escaping needed.
+        let mut buf = String::with_capacity(edges.len() * 74);
+        for (parent, child) in edges {
+            let _ = writeln!(buf, "{parent}\t{child}");
+        }
+        let mut copy = tx
+            .copy_in_raw("COPY _merge_edges (parent_id, child_id) FROM STDIN (FORMAT text)")
+            .await?;
+        copy.send(buf.as_bytes()).await?;
+        copy.finish().await?;
+
         sqlx::query(
             r#"
             INSERT INTO derivation_edges (parent_id, child_id)
-            SELECT * FROM UNNEST($1::uuid[], $2::uuid[])
+            SELECT parent_id, child_id FROM _merge_edges
             ON CONFLICT DO NOTHING
             "#,
         )
-        .bind(&parents)
-        .bind(&children)
         .execute(&mut *tx)
         .await?;
         Ok(())

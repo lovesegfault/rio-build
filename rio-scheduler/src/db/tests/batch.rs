@@ -235,6 +235,115 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify sched.db.merge-batch-shape]
+/// sh-036 §2: `merge_phase_seconds{phase="5-persist-and-activate"}` was
+/// 4.91 s of an 11.63 s `MergeDag` actor turn; the cost was the
+/// UNNEST-decode + `ON CONFLICT` processing over 14701 + ~45 k rows.
+/// Streaming via `COPY` into `ON COMMIT DROP` temp tables and then one
+/// `INSERT … SELECT … ON CONFLICT` cuts the wall-clock to ~100 ms.
+///
+/// `#[ignore]` perf-tier — wall-clock gates flake under parallel builder
+/// load (ci-failure-patterns "Wall-clock gate under load"); the 500 ms
+/// bound is ~5× headroom over the post-COPY observed time on ephemeral
+/// PG. The structural temp-table existence assertions are the
+/// load-independent property pin; the wall-clock bound is the
+/// regression guard.
+#[tokio::test]
+#[ignore = "perf-tier wall-clock gate; run via --run-ignored"]
+async fn persist_merge_14k_rows_under_500ms() -> anyhow::Result<()> {
+    use std::time::{Duration, Instant};
+
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    async fn temp_table_exists(tx: &mut sqlx::PgConnection, name: &str) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_tables \
+             WHERE tablename = $1 AND schemaname LIKE 'pg_temp%')",
+        )
+        .bind(name)
+        .fetch_one(tx)
+        .await
+        .unwrap()
+    }
+
+    // sh-036's measured shape: 14701 nodes, ~45 k edges (≈3×).
+    const N: usize = 14_701;
+    let rows: Vec<DerivationRow> = (0..N)
+        .map(|i| DerivationRow {
+            drv_hash: format!("{i:032x}"),
+            drv_path: format!("/nix/store/{}-sh036-{i}.drv", "a".repeat(32)),
+            pname: Some(format!("pkg-{i}")),
+            system: "x86_64-linux".into(),
+            status: DerivationStatus::Created,
+            required_features: if i % 3 == 0 {
+                vec![]
+            } else {
+                vec!["kvm".into()]
+            },
+            expected_output_paths: vec![format!("/nix/store/{}-out-{i}", "b".repeat(32))],
+            output_names: vec!["out".into()],
+            is_fixed_output: false,
+            is_ca: false,
+        })
+        .collect();
+
+    let mut tx = db.pool().begin().await?;
+    let t0 = Instant::now();
+    let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &rows).await?;
+    let t_derivs = t0.elapsed();
+
+    // Structural pin (red-first): the COPY shape leaves an
+    // ON COMMIT DROP temp table mid-transaction.
+    assert!(
+        temp_table_exists(&mut tx, "_merge_derivations").await,
+        "batch_upsert_derivations MUST stream via COPY into an \
+         ON COMMIT DROP temp table (_merge_derivations) before the \
+         ON CONFLICT upsert — sh-036's 4.91 s in-cluster cost was the \
+         UNNEST decode; the structural shape is the load-independent \
+         property"
+    );
+
+    let ids: Vec<Uuid> = (0..N)
+        .map(|i| id_map.get(&format!("{i:032x}")).unwrap().0)
+        .collect();
+    let ids = &ids;
+    let edges: Vec<(Uuid, Uuid)> = (1..N)
+        .flat_map(|i| (1..=3.min(i)).map(move |d| (ids[i - d], ids[i])))
+        .collect();
+    assert!(edges.len() >= 44_000);
+    SchedulerDb::batch_insert_edges(&mut tx, &edges).await?;
+    let total = t0.elapsed();
+
+    assert!(
+        temp_table_exists(&mut tx, "_merge_edges").await,
+        "batch_insert_edges MUST stream via COPY into an ON COMMIT DROP \
+         temp table (_merge_edges)"
+    );
+    tx.commit().await?;
+    // ON COMMIT DROP cleaned both up.
+    let mut post = db.pool().begin().await?;
+    assert!(!temp_table_exists(&mut post, "_merge_derivations").await);
+    assert!(!temp_table_exists(&mut post, "_merge_edges").await);
+    post.rollback().await?;
+
+    eprintln!(
+        "sh-036 14701-row persist: derivations={t_derivs:?} \
+         edges(+{:?}) total={total:?}",
+        total - t_derivs,
+    );
+    assert_eq!(id_map.len(), N);
+    assert!(
+        total < Duration::from_millis(500),
+        "sh-036: 14701-row + ~45k-edge persist took {total:?} (≥500 ms). \
+         The UNNEST formulation measured ~2–5 s here (4.91 s in-cluster); \
+         the COPY → ON COMMIT DROP temp → INSERT…SELECT shape lands \
+         ~100 ms. If this fires under load, widen the slack; if it fires \
+         solo, the COPY path regressed."
+    );
+    Ok(())
+}
+
 // r[verify sched.db.batch-unnest]
 /// Edges: 40k rows. Old limit was 32767 (2 cols). Build a
 /// dense DAG over 10k nodes (fresh DB, so re-insert).
