@@ -1056,10 +1056,12 @@ async fn sh021_reap_terminal_absent_never_registered_attempt() {
          TTL deleting it silently leaves the open attempt ghosted for \
          deadline+slack"
     );
-    let calls = mock.outcome_calls.read().unwrap();
-    assert_eq!(calls.len(), 1, "one synthesized report: {calls:?}");
-    assert_eq!(calls[0].exec_id, "exec-ghost-1");
-    assert_eq!(calls[0].reason, AttemptTerminalReason::Reaped as i32);
+    {
+        let calls = mock.outcome_calls.read().unwrap();
+        assert_eq!(calls.len(), 1, "one synthesized report: {calls:?}");
+        assert_eq!(calls[0].exec_id, "exec-ghost-1");
+        assert_eq!(calls[0].reason, AttemptTerminalReason::Reaped as i32);
+    }
 
     // Sibling: non-empty `want` with the intent ABSENT (the
     // jobs.rs:2800 `AbsentFromDemand => continue` arm — the second
