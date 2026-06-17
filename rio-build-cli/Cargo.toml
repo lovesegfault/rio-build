@@ -1,0 +1,63 @@
+[package]
+name = "rio-build-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "rio build — native-protocol build client (ADR-024 P3 coordinator)"
+
+[[bin]]
+name = "rio"
+path = "src/main.rs"
+
+# Coordinator-side channel harness for the rio-eval parent — the
+# rio-eval-smoke nix check drives the real C++ binary through it.
+[[bin]]
+name = "eval-harness"
+path = "src/bin/eval-harness.rs"
+
+[dependencies]
+rio-common = { workspace = true }
+# Client CAS: ingest (source re-read on upload miss) + dirblob fold.
+rio-evalstore = { workspace = true }
+rio-nix = { workspace = true }
+rio-packstore = { workspace = true }
+rio-proto = { workspace = true }
+
+anyhow = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+console = { workspace = true }
+hex = { workspace = true }
+libc = { workspace = true }
+prost = { workspace = true }
+regex = { workspace = true }
+schemars = { workspace = true }
+tempfile = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+# SyncIoBridge: feeds the async GetPath NAR stream into the synchronous
+# streaming NAR restore (CAS materialization fallback).
+tokio-util = { workspace = true, features = ["io-util"] }
+tonic = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+# In-process production store services for the e2e pipeline tests
+# (negotiation/upload/fetch run against the REAL castore surface, not
+# mocks); `test-utils` brings MIGRATOR + seed helpers.
+rio-store = { workspace = true, features = ["test-utils"] }
+rio-auth = { workspace = true }
+rio-test-support = { workspace = true }
+ed25519-dalek = { workspace = true }
+sqlx = { workspace = true }

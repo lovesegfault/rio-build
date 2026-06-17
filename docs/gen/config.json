@@ -166,6 +166,12 @@
         "description": "PostgreSQL connection URL."
       },
       {
+        "key": "pg_auth",
+        "type": "PgAuthMode",
+        "default": "password",
+        "description": "PostgreSQL authentication mode (`RIO_PG_AUTH`): `password` (default, embedded in `database_url`) or `iam` (RDS IAM auth, see `rio_common::config::PgAuthMode`)."
+      },
+      {
         "key": "metrics_addr",
         "type": "string",
         "default": "[::]:9091",
@@ -334,6 +340,12 @@
         "type": "string",
         "default": "",
         "description": "PostgreSQL connection URL."
+      },
+      {
+        "key": "pg_auth",
+        "type": "PgAuthMode",
+        "default": "password",
+        "description": "PostgreSQL authentication mode (`RIO_PG_AUTH`): `password` (default, embedded in `database_url`) or `iam` (RDS IAM auth, see `rio_common::config::PgAuthMode`)."
       },
       {
         "key": "metrics_addr",
@@ -506,34 +518,70 @@
         "description": "requiredSystemFeatures this builder supports (e.g., \"kvm\", \"big-parallel\")."
       },
       {
-        "key": "fuse_mount_point",
+        "key": "mountd_socket",
         "type": "string",
-        "default": "/var/rio/fuse-store",
-        "description": "FUSE mount point."
+        "default": "/run/rio-mountd.sock",
+        "description": "rio-mountd UDS socket path."
       },
       {
-        "key": "fuse_cache_dir",
+        "key": "castore_dir",
+        "type": "string",
+        "default": "/var/rio/castore",
+        "description": "Per-build castore-FUSE mountpoint root. mountd mounts each build's handed-off `/dev/fuse` fd at `{castore_dir}/{build_id}`; the builder uses that path as the overlay lowerdir."
+      },
+      {
+        "key": "staging_dir",
+        "type": "string",
+        "default": "/var/rio/staging",
+        "description": "Per-build staging root (mountd-owned, builder-writable per-build subdirs)."
+      },
+      {
+        "key": "cache_dir",
         "type": "string",
         "default": "/var/rio/cache",
-        "description": "Local SSD cache directory for the FUSE cache."
+        "description": "Shared node file-digest backing cache (mountd-owned, read-only to the builder)."
+      },
+      {
+        "key": "chunks_dir",
+        "type": "string",
+        "default": "/var/rio/chunks",
+        "description": "Shared node chunk cache (mountd-owned, read-only to the builder)."
+      },
+      {
+        "key": "dag_prefetch_timeout_secs",
+        "type": "uint64",
+        "default": "30",
+        "description": "Budget (seconds) for the mount-time `GetDirectory(recursive)` Directory-DAG prefetch."
+      },
+      {
+        "key": "stream_threshold",
+        "type": "uint64",
+        "default": "8388608",
+        "description": "Castore-FUSE `open()` cache misses larger than this (bytes) take the streaming-open path (reply at the first chunk, fill in the background) instead of a whole-file fetch."
+      },
+      {
+        "key": "max_backing_ids",
+        "type": "uint32",
+        "default": "4096",
+        "description": "Ceiling on concurrently registered passthrough backing ids per build."
+      },
+      {
+        "key": "disable_passthrough",
+        "type": "boolean",
+        "default": "false",
+        "description": "Escape hatch: reply plain `FOPEN_KEEP_CACHE` and serve `read()` from userspace instead of registering kernel passthrough backings."
       },
       {
         "key": "fuse_threads",
         "type": "uint32",
         "default": "4",
-        "description": "Number of FUSE daemon threads."
-      },
-      {
-        "key": "fuse_passthrough",
-        "type": "boolean",
-        "default": "true",
-        "description": "Defaults to `true`."
+        "description": "Number of FUSE event-loop threads per build session."
       },
       {
         "key": "fuse_fetch_timeout_secs",
         "type": "uint64",
         "default": "60",
-        "description": "Timeout (seconds) for FUSE-initiated `GetPath` fetches."
+        "description": "Base timeout (seconds) for castore-FUSE `open()` store fetches (`ReadBlob`/`GetChunks`)."
       },
       {
         "key": "overlay_base_dir",
@@ -688,6 +736,12 @@
         "description": "PostgreSQL URL for [`CellSketches`] persist/load."
       },
       {
+        "key": "nodeclaim_pool.pg_auth",
+        "type": "PgAuthMode",
+        "default": "password",
+        "description": "PostgreSQL authentication mode (`RIO_NODECLAIM_POOL__PG_AUTH`): `password` (default, embedded in `database_url`) or `iam` (RDS IAM auth, see `rio_common::config::PgAuthMode`)."
+      },
+      {
         "key": "nodeclaim_pool.lease_name",
         "type": "string",
         "default": "",
@@ -766,18 +820,6 @@
         "description": "`karpenter.k8s.aws/instance-size NotIn` values appended to every NodeClaim's `spec.requirements` — the metal partition (I-205)."
       },
       {
-        "key": "nodeclaim_pool.fuse_cache_bytes",
-        "type": "uint64",
-        "default": "8589934592",
-        "description": "FUSE-cache budget added to every builder pod's `ephemeral-storage` request (the `fuse-cache` emptyDir)."
-      },
-      {
-        "key": "nodeclaim_pool.fetcher_fuse_cache_bytes",
-        "type": "uint64",
-        "default": "4294967296",
-        "description": "FUSE-cache budget for FETCHER pods (the `fuse-cache` emptyDir sizeLimit and the matching `ephemeral-storage` addend)."
-      },
-      {
         "key": "nodeclaim_pool.kube_build_scheduler_enabled",
         "type": "boolean",
         "default": "true",
@@ -794,6 +836,50 @@
         "type": "uint64",
         "default": "8589934592",
         "description": "ADR-023 §13a: pod `requests.memory` floor for the `rio.build/hw-bench-needed` gate (STREAM triad working-set safety)."
+      }
+    ],
+    "build_client": [
+      {
+        "key": "scheduler_addr",
+        "type": "string",
+        "default": "",
+        "description": "Scheduler gRPC endpoint as `host:port` (no scheme — `SubmitBuild`/`WatchBuild`/`CancelBuild`)."
+      },
+      {
+        "key": "store_addr",
+        "type": "string",
+        "default": "",
+        "description": "Store castore-door gRPC endpoint as `host:port` (`Has*` negotiation, drv blob puts, chunked source upload, output fetch)."
+      },
+      {
+        "key": "tenant_token_path",
+        "type": "string",
+        "default": "",
+        "description": "File containing the tenant JWT attached as `x-rio-tenant-token` on every RPC."
+      },
+      {
+        "key": "cas_root",
+        "type": "string",
+        "default": "",
+        "description": "Client CAS root (pack store, fingerprint index, cluster-ack table, fetched outputs)."
+      },
+      {
+        "key": "eval_parent",
+        "type": "string",
+        "default": "",
+        "description": "Path to the eval-parent binary (C++ libexpr embedding — ADR-024 P3b). `rio build` spawns it with the worker channel on fd 3."
+      },
+      {
+        "key": "ack_ttl_secs",
+        "type": "uint64",
+        "default": "21600",
+        "description": "Cluster-ack record TTL in seconds."
+      },
+      {
+        "key": "page_max_nodes",
+        "type": "uint",
+        "default": "50000",
+        "description": "Nodes per `SubmitBuild` page."
       }
     ]
   }

@@ -261,6 +261,16 @@ impl DagActor {
                 )
             })
         {
+            // r[impl sched.merge.failfast-culprit]
+            // Attribute the fail-fast to the REAL poisoned culprit (the
+            // node whose execution originally failed) rather than to
+            // whatever cascaded ancestor the reconcile pass surfaced
+            // first, and surface its persisted failure reason. Must run
+            // BEFORE handle_derivation_failure: that helper get_or_inserts
+            // error_summary/failed_derivation, so whichever is set first
+            // wins.
+            self.attribute_failfast_culprit(build_id, &failed_hash)
+                .await;
             self.handle_derivation_failure(build_id, &failed_hash).await;
             // handle_derivation_failure may have transitioned the build to
             // Failed. If so, don't dispatch.
@@ -310,6 +320,83 @@ impl DagActor {
         );
 
         Ok(ingest.event_rx)
+    }
+
+    /// Resolve the poisoned culprit behind a merge-time fail-fast and
+    /// stamp culprit attribution onto the build BEFORE
+    /// `handle_derivation_failure` runs.
+    ///
+    /// `failed_hash` is the first Poisoned-or-DependencyFailed node the
+    /// reconcile pass surfaced. A Poisoned trigger is its own culprit; a
+    /// DependencyFailed ancestor is resolved by descending its dependency
+    /// edges to a Poisoned node. When no Poisoned node is reachable
+    /// (e.g. the poisoned dep was removed by ClearPoison/TTL after the
+    /// cascade ran), nothing is recorded and the failure keeps today's
+    /// generic "derivation X failed" summary.
+    ///
+    /// The persisted reason (`derivations.failure_msg` /
+    /// `failure_exec_id`, M_073) is read best-effort — attribution is
+    /// still useful without it.
+    async fn attribute_failfast_culprit(&mut self, build_id: Uuid, failed_hash: &DrvHash) {
+        let Some(culprit_hash) = self.find_poisoned_culprit(failed_hash) else {
+            return;
+        };
+        let culprit_path = self.dag.path_or_hash_fallback(&culprit_hash);
+
+        let reason = match self.db.load_failure_reason(&culprit_hash).await {
+            Ok(reason) => reason,
+            Err(e) => {
+                warn!(drv_hash = %culprit_hash, error = %e,
+                      "failed to load persisted failure reason for fail-fast culprit (continuing)");
+                None
+            }
+        };
+        let (failure_msg, failure_exec_id, poisoned_epoch) = reason
+            .map(|r| (r.failure_msg, r.failure_exec_id, r.poisoned_epoch))
+            .unwrap_or((None, None, None));
+        let error_message = failure_msg.unwrap_or_default();
+        let summary = if error_message.is_empty() {
+            format!("derivation {culprit_path} failed in an earlier build (still poisoned)")
+        } else {
+            format!("derivation {culprit_path} failed in an earlier build: {error_message}")
+        };
+
+        if let Some(build) = self.builds.get_mut(&build_id) {
+            build.error_summary.get_or_insert(summary);
+            build.failed_derivation.get_or_insert(culprit_path.clone());
+            build.culprit = Some(crate::state::FailfastCulprit {
+                derivation_path: culprit_path,
+                exec_id: failure_exec_id,
+                error_message,
+                failed_at: poisoned_epoch.map(|secs| {
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(secs.max(0.0))
+                }),
+            });
+        }
+    }
+
+    /// BFS from `start` down the dependency edges (DAG children) to the
+    /// first `Poisoned` node. `Some(start)` when `start` itself is
+    /// Poisoned; `None` when no Poisoned node is reachable.
+    fn find_poisoned_culprit(&self, start: &DrvHash) -> Option<DrvHash> {
+        let mut to_visit = vec![start.clone()];
+        let mut visited: HashSet<DrvHash> = HashSet::new();
+        while let Some(hash) = to_visit.pop() {
+            if !visited.insert(hash.clone()) {
+                continue;
+            }
+            match self.dag.node(&hash).map(|s| s.status()) {
+                Some(DerivationStatus::Poisoned) => return Some(hash),
+                // Only descend through nodes that are themselves part of
+                // the failure cascade — a healthy sibling subtree can't
+                // contain the culprit that doomed THIS chain.
+                Some(DerivationStatus::DependencyFailed) => {
+                    to_visit.extend(self.dag.get_children(&hash));
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Steps 0–5 of merge: top-down root prune, DB build row, in-mem DAG
@@ -557,6 +644,32 @@ impl DagActor {
         }
         phase!("5-persist-and-activate");
         let _ = &mut t_phase; // last phase! write is intentionally unread
+
+        // r[impl store.drv.gc-build-pinned]
+        // Pin every (non-terminal) submission node's own .drv path so
+        // the store's drv-blob sweep keeps its blob alive while the
+        // build is live (ADR-024: the client's ack-record TTL only
+        // covers the unpinned grace window; a build that queues longer
+        // than the grace would otherwise lose its drv bytes before
+        // dispatch). Runs AFTER the merge is committed so a rejected
+        // submission pins nothing. Pre-existing terminal nodes are
+        // skipped — no later transition would unpin them (the
+        // recovery-time sweep_stale_live_pins would be the only
+        // cleanup). Best-effort like every other live-pin write: the
+        // 24h GC grace is the fallback if PG blips here.
+        let pin_pairs: Vec<(&str, &str)> = nodes
+            .iter()
+            .filter(|n| {
+                self.dag
+                    .node(&n.drv_hash)
+                    .is_some_and(|s| !s.status().is_terminal())
+            })
+            .map(|n| (n.drv_hash.as_str(), n.drv_path.as_str()))
+            .collect();
+        if let Err(e) = self.db.pin_drv_paths(&pin_pairs).await {
+            warn!(build_id = %build_id, count = pin_pairs.len(), error = %e,
+                  "failed to pin drv paths for live build (best-effort)");
+        }
 
         // r[impl sched.merge.substitute-topdown+10]
         // Stamp topdown_pruned on the kept (demanded) nodes only now
@@ -1181,6 +1294,11 @@ impl DagActor {
                       "failed to persist cache-hit Completed status batch");
             }
             self.upsert_path_tenants_for_batch(&completed_batch).await;
+            // Terminal without dispatch: release the merge-time drv
+            // pins (r[store.drv.gc-build-pinned]) — the worker
+            // completion path that normally unpins never runs for a
+            // cache hit.
+            self.unpin_best_effort_batch(&hashes).await;
         }
         // Fan-out: collect other builds interested in re-probe-
         // completed nodes + emit DerivationCached to each. Caller
@@ -1401,6 +1519,15 @@ impl DagActor {
                      (build is Active; continuing)"
                 );
             }
+        }
+        // Terminal without dispatch: nodes seeded DependencyFailed (dep
+        // already poisoned at merge) were pinned in phase 5 — they were
+        // still `Created` then — and get no later terminal transition
+        // to release the merge-time drv pin
+        // (r[store.drv.gc-build-pinned]). Unpin here.
+        let depfailed: Vec<&str> = by_status[2].iter().map(DrvHash::as_str).collect();
+        if !depfailed.is_empty() {
+            self.unpin_best_effort_batch(&depfailed).await;
         }
         first_dep_failed
     }
@@ -1991,20 +2118,40 @@ impl DagActor {
                 .and_then(|h| id_map.get(*h).map(|(id, _)| *id))
                 .or_else(|| self.dag.db_id_for_path(drv_path))
         };
-        let edge_rows: Result<Vec<(Uuid, Uuid)>, ActorError> = edges
+        // An endpoint that is not in the DAG AT ALL was already
+        // warn-skipped by `dag.merge`'s edge loop (legacy: a stray
+        // edge to a path outside the submission; ADR-024 digest mode:
+        // an external input digest that resolved in `drv_blobs` but
+        // belongs to no live build). Skip it here too so PG matches
+        // the in-memory DAG instead of failing the whole merge over an
+        // edge the merge never applied. `MissingDbId` remains for the
+        // true invariant violation: endpoint IS a DAG node but has no
+        // db_id from this tx's id_map nor a prior merge.
+        let endpoint = |drv_path: &String| -> Result<Option<Uuid>, ActorError> {
+            match resolve(drv_path) {
+                Some(id) => Ok(Some(id)),
+                None if self.dag.hash_for_path(drv_path).is_none() => {
+                    warn!(
+                        %drv_path,
+                        "edge endpoint not in DAG; skipping edge persist \
+                         (mirrors dag.merge's warn-skip)"
+                    );
+                    Ok(None)
+                }
+                None => Err(ActorError::MissingDbId {
+                    drv_path: drv_path.clone(),
+                }),
+            }
+        };
+        let edge_rows: Result<Vec<Option<(Uuid, Uuid)>>, ActorError> = edges
             .iter()
             .map(|e| {
-                let parent =
-                    resolve(&e.parent_drv_path).ok_or_else(|| ActorError::MissingDbId {
-                        drv_path: e.parent_drv_path.clone(),
-                    })?;
-                let child = resolve(&e.child_drv_path).ok_or_else(|| ActorError::MissingDbId {
-                    drv_path: e.child_drv_path.clone(),
-                })?;
-                Ok((parent, child))
+                let parent = endpoint(&e.parent_drv_path)?;
+                let child = endpoint(&e.child_drv_path)?;
+                Ok(parent.zip(child))
             })
             .collect();
-        let edge_rows = edge_rows?;
+        let edge_rows: Vec<(Uuid, Uuid)> = edge_rows?.into_iter().flatten().collect();
         crate::db::SchedulerDb::batch_insert_edges(&mut tx, &edge_rows).await?;
 
         // No PG-side topdown_pruned clear in this transaction: the

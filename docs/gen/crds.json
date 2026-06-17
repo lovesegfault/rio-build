@@ -29,8 +29,6 @@
       "tolerations",
       "hostUsers",
       "fuseThreads",
-      "fusePassthrough",
-      "fuseCacheBytes",
       "features",
       "imagePullPolicy",
       "terminationGracePeriodSeconds",

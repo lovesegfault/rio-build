@@ -52,6 +52,43 @@ impl SchedulerDb {
         Ok(())
     }
 
+    /// Pin each derivation's own `.drv` path under its own drv_hash —
+    /// the ADR-024 drv-blob GC root (`r[store.drv.gc-build-pinned]`):
+    /// the store's drv sweep joins `drv_blobs.drv_path_hash =
+    /// sha256(drv_path)` against these rows, so a drv blob referenced
+    /// by a live build survives GC from submission accept until the
+    /// derivation's terminal status unpins it (the same per-drv
+    /// lifecycle as the dispatch-time input pins — one `DELETE ...
+    /// WHERE drv_hash` clears both).
+    ///
+    /// Batch via UNNEST: one round-trip per merge, not per node. Same
+    /// idempotence as [`pin_live_inputs`]: ON CONFLICT DO NOTHING.
+    ///
+    /// [`pin_live_inputs`]: Self::pin_live_inputs
+    pub async fn pin_drv_paths(&self, pairs: &[(&str, &str)]) -> Result<u64, sqlx::Error> {
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+        use sha2::Digest;
+        let hashes: Vec<Vec<u8>> = pairs
+            .iter()
+            .map(|(_, path)| sha2::Sha256::digest(path.as_bytes()).to_vec())
+            .collect();
+        let drv_hashes: Vec<&str> = pairs.iter().map(|(h, _)| *h).collect();
+        let result = sqlx::query!(
+            r#"
+            INSERT INTO scheduler_live_pins (store_path_hash, drv_hash)
+            SELECT * FROM UNNEST($1::bytea[], $2::text[])
+            ON CONFLICT DO NOTHING
+            "#,
+            &hashes,
+            &drv_hashes as &[&str],
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Upsert the (output_path × tenant_id) cartesian product into
     /// path_tenants. SHA-256 each path (matches narinfo.store_path_hash
     /// keying — same as `pin_live_inputs`). ON CONFLICT DO NOTHING on

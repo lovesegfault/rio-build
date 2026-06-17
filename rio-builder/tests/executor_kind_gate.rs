@@ -8,9 +8,10 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use rio_builder::castore_fuse::session::CastoreSettings;
 use rio_builder::executor::{DEFAULT_DAEMON_TIMEOUT, ExecutorEnv, ExecutorError, execute_build};
 use rio_builder::log_stream::LogLimits;
-use rio_proto::StoreServiceClient;
+use rio_builder::store_fetch::StoreClients;
 use rio_proto::types::ExecutorKind;
 use rio_proto::types::WorkAssignment;
 
@@ -24,7 +25,9 @@ const FOD_DRV: &[u8] = br#"Derive([("out","/nix/store/abc-fixed","sha256","abcde
 
 fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
     ExecutorEnv {
-        fuse_mount_point: dir.to_path_buf(),
+        // Castore settings pointing at nonexistent paths: the gate under
+        // test fires BEFORE the castore mount, so nothing here is dialed.
+        castore: CastoreSettings::test_stub(dir),
         overlay_base_dir: dir.to_path_buf(),
         executor_id: "test-executor".into(),
         log_limits: LogLimits::UNLIMITED,
@@ -34,8 +37,6 @@ fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
         executor_kind: kind,
         systems: Arc::from(["x86_64-linux".into()]),
         hw_class: None,
-        fuse_cache: None,
-        fuse_fetch_timeout: std::time::Duration::from_secs(60),
         cancelled: Arc::new(AtomicBool::new(false)),
     }
 }
@@ -59,9 +60,9 @@ async fn run(kind: ExecutorKind, drv: &[u8], assignment_flag: bool) -> Result<()
     let env = make_env(kind, dir.path());
     let assignment = make_assignment(drv, assignment_flag);
     // dead_channel: never dials — the gate fires before any gRPC call.
-    let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
+    let store = StoreClients::from_channel(rio_test_support::grpc::dead_channel());
     let (log_tx, _rx) = tokio::sync::mpsc::channel(1);
-    execute_build(&assignment, &env, &mut store, &log_tx, 0)
+    execute_build(&assignment, &env, &store, &log_tx, 0)
         .await
         .result
         .map(|_| ())
@@ -175,13 +176,12 @@ async fn wrong_kind_gate_ignores_lying_scheduler_flag_builder() {
 /// duplicate "first lines" for one exec_id (bug_013).
 ///
 /// Fixture trace:
-/// `make_env` sets `fuse_mount_point == overlay_base_dir` (same
-/// tempdir) so `setup_overlay`'s `lower_dev == upper_dev` check fails
-/// deterministically with `OverlayError::SameFilesystem` — no
-/// CAP_SYS_ADMIN needed and no chance the build proceeds past the
-/// pre-daemon block. The header send is BEFORE that check
-/// (executor/mod.rs ~545); the failure happens AFTER (~575); the
-/// channel observes exactly the header-or-nothing.
+/// the store clients point at a dead channel (`127.0.0.1:1`, connection
+/// refused), so the pre-daemon block fails deterministically at
+/// `resolve_inputs`' closure BFS (`MetadataFetch`) — no CAP_SYS_ADMIN,
+/// no rio-mountd, and no chance the build proceeds past the pre-daemon
+/// block. The header send is BEFORE that block; the failure happens
+/// inside it; the channel observes exactly the header-or-nothing.
 // r[verify obs.log.worker-header]
 #[tokio::test]
 async fn banner_header_gated_on_first_attempt() {
@@ -190,11 +190,11 @@ async fn banner_header_gated_on_first_attempt() {
     let dir = tempfile::tempdir().unwrap();
     let env = make_env(ExecutorKind::Builder, dir.path());
     let assignment = make_assignment(NON_FOD_DRV, false);
-    let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
+    let store = StoreClients::from_channel(rio_test_support::grpc::dead_channel());
 
     // First attempt (`first_line == 0`): header at line 0.
     let (log_tx, mut rx) = tokio::sync::mpsc::channel(8);
-    let outcome = execute_build(&assignment, &env, &mut store, &log_tx, 0).await;
+    let outcome = execute_build(&assignment, &env, &store, &log_tx, 0).await;
     drop(log_tx);
     assert!(
         outcome.result.is_err(),
@@ -231,7 +231,7 @@ async fn banner_header_gated_on_first_attempt() {
 
     // Retry attempt (`first_line > 0`): no header re-sent; offset held.
     let (log_tx, mut rx) = tokio::sync::mpsc::channel(8);
-    let outcome = execute_build(&assignment, &env, &mut store, &log_tx, 3).await;
+    let outcome = execute_build(&assignment, &env, &store, &log_tx, 3).await;
     drop(log_tx);
     assert!(outcome.result.is_err());
     assert_eq!(
@@ -257,11 +257,11 @@ async fn pre_header_error_carries_caller_offset() {
     let dir = tempfile::tempdir().unwrap();
     let env = make_env(ExecutorKind::Fetcher, dir.path()); // wrong kind for NON_FOD_DRV
     let assignment = make_assignment(NON_FOD_DRV, false);
-    let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
+    let store = StoreClients::from_channel(rio_test_support::grpc::dead_channel());
 
     for first_line in [0u64, 7u64] {
         let (log_tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let outcome = execute_build(&assignment, &env, &mut store, &log_tx, first_line).await;
+        let outcome = execute_build(&assignment, &env, &store, &log_tx, first_line).await;
         drop(log_tx);
         assert!(matches!(
             outcome.result,

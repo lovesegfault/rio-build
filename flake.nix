@@ -225,6 +225,18 @@
                 cargo = rustNightly;
               };
 
+              # Vendored workspace deps for the derivations that bypass
+              # crate2nix and drive cargo directly (deny, hakari-drift,
+              # mutants). Git dependencies need an explicit NAR hash here;
+              # crate2nix gets the same hash from crate-hashes.json. Update
+              # both when bumping the fuser pin in Cargo.toml.
+              workspaceCargoVendor = rustPlatformStable.importCargoLock {
+                lockFile = ./Cargo.lock;
+                outputHashes = {
+                  "fuser-0.17.0" = "sha256-iBSHT73HH6KpqMUtAvbpJcGQNeR3ss8RYajGq08NNl4=";
+                };
+              };
+
               # Source root for filesets
               unfilteredRoot = ./.;
 
@@ -513,6 +525,7 @@
                   stubTargetFiles
                   rustStable
                   rustPlatformStable
+                  workspaceCargoVendor
                   traceyPkg
                   subcharts
                   dockerImages
@@ -548,6 +561,15 @@
                   rioDashboard = if coverage then null else rioDashboard;
                 });
               dockerImages = mkDockerImages { inherit rio-crates; };
+
+              # fsbench (P0594): seed-keyed dataset + bench-run drvs.
+              # The bins are rio-builder's member-bin set — the same
+              # drv exposed as packages.fsbench-bin, so xtask's local
+              # prebuild and these drvs share one closure.
+              fsbenchPkgs = import ./nix/fsbench {
+                inherit pkgs;
+                fsbenchBins = crateBuild.memberBins.rio-builder;
+              };
 
               # Instrumented-image set for the coverage VM tests. A named
               # binding (rather than an inline call at the vmTestsCov use
@@ -601,6 +623,7 @@
               # testScript.
               vmWiring = import ./nix/tests/wiring.nix {
                 inherit pkgs system inputs;
+                inherit (rioEvalPkg) rioEval;
               };
 
               vmTests = vmWiring.mkVmTests {
@@ -638,6 +661,13 @@
                     # and the client isn't instrumented). Excluding keeps
                     # after_n_builds stable.
                     "vm-protocol-warm-lix-standalone"
+                    # xfstests ports: exercises the same castore_fuse
+                    # callbacks vm-castore-fuse already covers (lookup/
+                    # readdir/open/read/release), just with more POSIX
+                    # assertions on the kernel side — no new instrumented
+                    # lines, so including it would bump after_n_builds for
+                    # zero coverage signal.
+                    "vm-castore-xfstests"
                   ];
 
               # --------------------------------------------------------------
@@ -687,6 +717,60 @@
               };
 
               # --------------------------------------------------------------
+              # rio:// eval-store plugin (ADR-024 M0)
+              # --------------------------------------------------------------
+              #
+              # C++ shim + rio-evalstore staticlib compiled into a nix store
+              # plugin against the PINNED inputs.nix headers. Exposed as
+              # packages.evalstore-plugin; checks evalstore-smoke (plugin
+              # loads, scheme registers) and evalstore-parity (byte-identical
+              # drvPaths vs stock nix on a local fixture — the M0 acceptance
+              # criterion).
+              evalstorePlugin = import ./nix/evalstore-plugin.nix {
+                inherit pkgs inputs system;
+                inherit (pkgs) lib;
+                evalstoreCrate = crateBuild.cargoNix.workspaceMembers.rio-evalstore.build;
+              };
+
+              # --------------------------------------------------------------
+              # rio-eval — the eval parent binary (ADR-024 P3b)
+              # --------------------------------------------------------------
+              #
+              # C++ main embedding the pinned nix 2.34 libexpr + the SAME
+              # shim/staticlib pair as the plugin, compiled as a real binary
+              # (fork workers over the evaljob channel). packages.rio-eval;
+              # packages.rio wraps the coordinator with RIO_EVAL_PARENT
+              # pointing here (the usable pair); check rio-eval-smoke drives
+              # the real binary through the eval-harness in the sandbox.
+              rioEvalPkg = import ./nix/rio-eval.nix {
+                inherit pkgs inputs system;
+                inherit (pkgs) lib;
+                evalstoreCrate = crateBuild.cargoNix.workspaceMembers.rio-evalstore.build;
+                buildCliBins = crateBuild.memberBins.rio-build-cli;
+              };
+
+              # The usable coordinator+eval-parent pair: `rio` with the
+              # eval-parent path defaulted via the RIO_ env config layer
+              # (explicit config/--eval-parent still overrides — env sits
+              # below CLI in the precedence chain).
+              rioPair = pkgs.runCommand "rio" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
+                mkdir -p $out/bin
+                makeWrapper ${crateBuild.memberBins.rio-build-cli}/bin/rio $out/bin/rio \
+                  --set-default RIO_EVAL_PARENT ${rioEvalPkg.rioEval}/bin/rio-eval
+              '';
+
+              # Default package: the workspace bins, but with bin/rio swapped
+              # for the wrapped pair so a plain `nix build` yields a `rio`
+              # that finds its eval parent. The unwrapped workspace stays
+              # available as `.#workspace` (docker/VM tests keep consuming
+              # rio-workspace directly).
+              rioWorkspaceDefault = pkgs.runCommand "rio-workspace-default" { } ''
+                mkdir -p $out/bin
+                ln -s ${rio-workspace}/bin/* $out/bin/
+                ln -sfn ${rioPair}/bin/rio $out/bin/rio
+              '';
+
+              # --------------------------------------------------------------
               # Mutation testing (dev-only — NOT in checks)
               # --------------------------------------------------------------
               inherit
@@ -700,6 +784,7 @@
                     stubTargetFiles
                     rustStable
                     rustPlatformStable
+                    workspaceCargoVendor
                     sysCrateEnv
                     goldenTestEnv
                     ;
@@ -918,9 +1003,18 @@
               # passthru on packages.{ci,coverage,helm,dockerImages,mutants}
               # (reachable by attr path, not enumerated by `nix flake show`).
               packages = {
-                default = rio-workspace;
+                default = rioWorkspaceDefault;
                 workspace = rio-workspace;
                 dashboard = rioDashboard;
+                # fsbench (P0594): xtask pre-builds fsbench-bin locally
+                # so the ssh-ng submission copies the already-valid bin
+                # closure instead of remote-building the rio-builder
+                # crate graph under --max-jobs 0. The dataset/run drvs
+                # are seed-keyed via FSBENCH_SEED (pure eval =
+                # "UNSEEDED", harmless); deliberately NOT in checks.* or
+                # any CI matrix kind — fsbench is operator tooling.
+                fsbench-bin = crateBuild.memberBins.rio-builder;
+                inherit (fsbenchPkgs) fsbench-dataset fsbench-run;
                 # nix/pins.toml rendered as *.auto.tfvars.json. snake_case
                 # keys in pins.toml → direct toJSON passthrough, no mapping
                 # layer. Regenerate the committed copy:
@@ -928,6 +1022,14 @@
                 tfvars = pkgs.writeText "generated.auto.tfvars.json" (builtins.toJSON (import ./nix/pins.nix));
                 # Typst design book outputs.
                 inherit (docsLib) docs docs-pdf;
+                # rio:// eval-store nix plugin (ADR-024 M0). Pin contract:
+                # only load into inputs.nix binaries.
+                evalstore-plugin = evalstorePlugin.plugin;
+                # The eval parent binary (ADR-024 P3b) and the usable
+                # coordinator+parent pair (`nix build .#rio` → bin/rio
+                # with RIO_EVAL_PARENT defaulted).
+                rio-eval = rioEvalPkg.rioEval;
+                rio = rioPair;
               }
               # Container images. `.#dockerImages` is the linkFarm xtask
               # `eks push` walks; individual images at `.#dockerImages.<name>`
@@ -1173,6 +1275,17 @@
                 // prefixed "golden-" goldenMatrix.runs
                 // {
                   dashboard = rioDashboard;
+                  # Plugin loads into the pinned nix-cli and the rio://
+                  # scheme registers.
+                  evalstore-smoke = evalstorePlugin.smoke;
+                  # ADR-024 M0 acceptance: byte-identical drvPaths vs
+                  # stock nix on the local parity fixture, zero
+                  # cross-check failures.
+                  evalstore-parity = evalstorePlugin.parity;
+                  # ADR-024 P3b: the REAL eval parent in the sandbox —
+                  # fork workers through real libexpr, drvPath parity vs
+                  # stock nix, recycling determinism, crash injection.
+                  rio-eval-smoke = rioEvalPkg.smoke;
                 }
                 # Workspace-level policy checks (deny, helm-lint,
                 # tracey-validate, crds-drift, tfvars-fresh, …).

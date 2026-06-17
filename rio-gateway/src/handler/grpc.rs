@@ -236,6 +236,11 @@ pub(super) async fn grpc_is_valid_path(
 /// margin rather than tightened. Shared with rio-builder's PutPath
 /// retry (`upload.rs`): both hit the same store-side placeholder
 /// contention, so they use the same curve+budget.
+///
+/// The store now fronts each attempt with its own bounded wait on the
+/// in-flight uploader (`store.put.concurrent-wait`, default 60 s), so
+/// an Aborted reaching this loop means the winner outlived that
+/// budget — each retry here buys another store-side wait window.
 const PUT_PATH_ABORTED_MAX_ATTEMPTS: u32 = 8;
 const PUT_PATH_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
     base: std::time::Duration::from_millis(50),
@@ -330,7 +335,11 @@ pub(super) async fn grpc_put_path(
 /// consumed and the bytes are forwarded as they arrive, so there's
 /// nothing to replay. In practice this path only fires for oversize
 /// (>DRV_NAR_BUFFER_LIMIT) entries — the I-068 collision case is .drv
-/// files, which always go through the buffered path.
+/// files, which always go through the buffered path. A same-path race
+/// here is instead absorbed server-side: the store waits out the
+/// in-flight winner (`store.put.concurrent-wait`) and resolves this
+/// call as `created: false`, so an Aborted only escapes when the
+/// winner outlives the store's wait budget.
 pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     store_client: &StoreServiceClient<Channel>,
     jwt_token: Option<&str>,
@@ -485,7 +494,6 @@ pub(crate) async fn grpc_get_path(
             store_path,
             GRPC_STREAM_TIMEOUT,
             MAX_NAR_SIZE,
-            None,
             &md,
         )
         .await

@@ -12,6 +12,38 @@ description = "Build executor with FUSE store for rio-build"
 name = "rio-builder"
 path = "src/main.rs"
 
+# Privileged per-node DaemonSet: /dev/fuse handoff + BACKING_OPEN broker
+# + verified cache promotion (ADR-022 §11, P0567). Same crate as the
+# builder because both link castore_fuse::mountd_proto.
+[[bin]]
+name = "rio-mountd"
+path = "src/bin/rio-mountd.rs"
+
+# VM-test client for the production rio-mountd daemon (vm-mountd
+# scenario). Stands in for the builder side of the UDS protocol until
+# P0559's in-process client exists.
+[[bin]]
+name = "spike_mountd_client"
+path = "src/bin/spike_mountd_client.rs"
+
+# xfstests ports against a live castore-FUSE mount (vm-castore-xfstests
+# scenario). Every kernel-visible POSIX assertion lives here as Rust
+# syscall probes; the NixOS testScript only assembles the mount and
+# runs this binary. Selection: rio-builder/tests/xfstests_port/PLAN.md.
+[[bin]]
+name = "xfstests_runner"
+path = "src/bin/xfstests_runner/main.rs"
+
+# castore-FUSE micro-benchmark, run AS A BUILD on the cluster through
+# the production mount path (P0594). `gen` re-roots a real closure
+# under a seeded layout and stamps unique-chunk honesty references;
+# `run` measures cold/warm read/open/randread plus a jq compile against
+# a same-pod local baseline and emits PHASE/PERF lines that
+# `cargo xtask k8s fsbench` parses. NOT production code.
+[[bin]]
+name = "fsbench"
+path = "src/bin/fsbench/main.rs"
+
 [features]
 # RIO_BUILDER_SCRIPT fixture intercept (sla-sizing VM scenario): skips
 # the daemon lifecycle and reports scripted (wall, peak_mem, peak_cpu,
@@ -33,6 +65,9 @@ tonic = { workspace = true }
 # google.protobuf.Timestamp in BuildResult.start_time/stop_time.
 # Scheduler's build_samples insert is gated on both being Some.
 prost-types = { workspace = true }
+# castore_fuse/tree.rs keys GetDirectory bodies by their recomputed
+# canonical digest = blake3(Message::encode_to_vec(dir)).
+prost = { workspace = true }
 fuser = { workspace = true }
 sqlx = { workspace = true }
 nix = { workspace = true }
@@ -56,6 +91,16 @@ axum = { workspace = true }
 scopeguard = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# castore_fuse/mountd_proto.rs UDS wire format (one postcard datagram
+# per SOCK_SEQPACKET frame).
+postcard = { workspace = true }
+# rio-mountd Promote re-hashes staged content before it becomes visible
+# in the node-shared cache.
+blake3 = { workspace = true }
+# ADR-022 §6.1: the fused output walk chunks each regular file
+# builder-side. Parameters come from rio_common::limits::FASTCDC_* so
+# they cannot drift from the store's chunker.
+fastcdc = { workspace = true }
 toml = { workspace = true, optional = true }
 # I-178b: ANSI-escape strip in is_input_materialization_failure.
 regex = { workspace = true }
@@ -66,6 +111,15 @@ rstest = { workspace = true }
 # upload.rs tests use the eager `nar::dump_path` as a byte-exact oracle for
 # the streaming upload pipeline.
 rio-nix = { workspace = true, features = ["test-oracle"] }
+# upload/agreement_tests.rs drives the REAL PutPathChunked handler
+# (ephemeral PG + in-memory chunk backend) with what the production
+# client assembles, so the fused walk and the store's validate/verify
+# pipeline are checked against each other at the wire level.
+rio-store = { workspace = true, features = ["test-utils"] }
+# Signs the HMAC assignment token the agreement fixture's real
+# ChunkService requires — HasChunks rejects anonymous probes, so the
+# dedup-through-the-real-probe test needs a verifiable caller identity.
+rio-auth = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 rio-test-support = { workspace = true }

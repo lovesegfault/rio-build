@@ -250,7 +250,7 @@ impl TenantSeed {
         .expect("TenantSeed INSERT failed");
 
         if let Some(seed) = self.ed25519_seed {
-            let key_name = self.key_name.unwrap_or_else(|| format!("{}-1", &self.name));
+            let key_name = self.key_name.unwrap_or_else(|| format!("{}-1", self.name));
             sqlx::query(
                 "INSERT INTO tenant_keys (tenant_id, key_name, ed25519_seed) \
                  VALUES ($1, $2, $3)",

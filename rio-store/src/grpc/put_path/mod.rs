@@ -5,7 +5,7 @@
 //! 2. Check idempotency: if path already complete, return success
 // r[impl store.put.wal-manifest]
 // r[impl store.put.idempotent]
-// r[impl store.integrity.verify-on-put]
+// r[impl store.integrity.verify-on-put+3]
 //! 3. Insert manifest placeholder with status='uploading'
 //! 4. Accumulate NAR chunks (bounded by MAX_NAR_SIZE)
 //! 5. Verify SHA-256 matches trailer's declared nar_hash
@@ -28,28 +28,6 @@ pub(super) mod common;
 pub(super) use common::{
     PlaceholderClaim, apply_trailer, validate_put_metadata, verify_ca_store_path, verify_nar,
 };
-
-/// Drain remaining messages from a streaming request.
-///
-/// Must be called before returning early from PutPath to avoid leaving
-/// unconsumed data on the gRPC transport. Bounded by DEFAULT_GRPC_TIMEOUT
-/// to prevent a slow client from holding the handler indefinitely.
-async fn drain_stream(stream: &mut Streaming<PutPathRequest>) {
-    let drain = async {
-        while let Ok(Some(_)) = stream.message().await {
-            // discard
-        }
-    };
-    if tokio::time::timeout(rio_common::grpc::DEFAULT_GRPC_TIMEOUT, drain)
-        .await
-        .is_err()
-    {
-        warn!(
-            timeout = ?rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-            "drain_stream timed out; client may be sending slowly"
-        );
-    }
-}
 
 impl StoreServiceImpl {
     /// HMAC assignment-token gate. Returns:
@@ -149,6 +127,11 @@ impl StoreServiceImpl {
         });
 
         let auth = self.authorize(&request)?;
+        // r[impl store.put.tenant-junction]
+        // Same caller→tenant resolution the castore read side uses
+        // (resolve_tenant_id doc): JWT sub first (gateway), else the HMAC
+        // assignment token's tenant claim (builder/worker).
+        let junction_tenant = super::resolve_tenant_id(auth.tenant_id, auth.hmac_claims.as_ref());
         let mut stream = request.into_inner();
 
         let raw_info = common::read_first_metadata(&mut stream).await?;
@@ -158,7 +141,7 @@ impl StoreServiceImpl {
         let store_path_hash = info.store_path_hash.clone();
         debug!(store_path = %info.store_path.as_str(), "PutPath: received metadata");
 
-        // r[impl sec.authz.ca-path-derived+2]
+        // r[impl sec.authz.ca-path-derived+3]
         // For is_ca tokens, validate_put_metadata skips the
         // `store_path ∈ expected_outputs` membership check (the path is
         // content-derived). The CA authorization gate —
@@ -187,11 +170,16 @@ impl StoreServiceImpl {
                     (Some(c), Some(g))
                 }
                 Ok(None) => {
-                    drain_stream(&mut stream).await;
+                    common::drain_stream("PutPath", &mut stream).await;
+                    // Idempotent skip still grants the skipping tenant
+                    // castore read access + a GC pin
+                    // (r[store.put.tenant-junction]).
+                    self.insert_path_tenant_skipped(&store_path_hash, junction_tenant)
+                        .await?;
                     return Ok(Response::new(PutPathResponse { created: false }));
                 }
                 Err(e) => {
-                    drain_stream(&mut stream).await;
+                    common::drain_stream("PutPath", &mut stream).await;
                     return Err(e);
                 }
             }
@@ -223,12 +211,18 @@ impl StoreServiceImpl {
                         Some(self.spawn_placeholder_guard(store_path_hash.clone(), c));
                     claim = Some(c);
                 }
-                None => return Ok(Response::new(PutPathResponse { created: false })),
+                None => {
+                    // Same idempotent-skip junction write as the IA arm
+                    // (r[store.put.tenant-junction]).
+                    self.insert_path_tenant_skipped(&store_path_hash, junction_tenant)
+                        .await?;
+                    return Ok(Response::new(PutPathResponse { created: false }));
+                }
             }
         }
         let claim = claim.expect("claim populated in IA pre-ingest or CA post-ingest arm");
 
-        self.finalize_single(info, claim, nar_data, auth.tenant_id)
+        self.finalize_single(info, claim, nar_data, auth.tenant_id, junction_tenant)
             .await?;
         if let Some(g) = placeholder_guard {
             g.defuse();
@@ -239,11 +233,15 @@ impl StoreServiceImpl {
     /// `claim_placeholder` + the AlreadyComplete/Concurrent fast-path
     /// arms, factored so the IA (pre-ingest) and CA (post-ingest) call
     /// sites share one match. Returns:
-    ///   - `Ok(Some(claim))` → we own the placeholder; proceed.
+    ///   - `Ok(Some(claim))` → we own the placeholder (claimed outright,
+    ///     or taken over after the concurrent uploader aborted); proceed.
     ///   - `Ok(None)` → path is already complete (or a concurrent
-    ///     uploader just won) → caller returns `created: false`.
-    ///   - `Err(Aborted)` → concurrent `'uploading'` placeholder held by
-    ///     someone else; caller propagates so client retries.
+    ///     uploader won — immediately or while we waited) → caller
+    ///     returns `created: false`.
+    ///   - `Err(Aborted)` → concurrent `'uploading'` placeholder still
+    ///     held after the bounded wait
+    ///     (`r[store.put.concurrent-wait]`); caller propagates so the
+    ///     client's own retry logic stays in charge.
     ///
     /// Does NOT drain the stream — IA caller drains on `Ok(None)`/`Err`
     /// (stream not yet read); CA caller doesn't (stream already drained
@@ -272,11 +270,24 @@ impl StoreServiceImpl {
                         .increment(1);
                     return Ok(None);
                 }
-                debug!(%store_path, "PutPath: concurrent upload in progress, aborting");
-                Err(Status::aborted(format!(
-                    "{} for this path; retry",
-                    rio_proto::CONCURRENT_PUTPATH_MSG
-                )))
+                debug!(%store_path, "PutPath: concurrent upload in progress; waiting");
+                // r[impl store.put.concurrent-wait]
+                match self
+                    .wait_for_concurrent_upload(store_path_hash, store_path, refs)
+                    .await
+                {
+                    Ok(PlaceholderClaim::Owned(claim)) => Ok(Some(claim)),
+                    Ok(PlaceholderClaim::AlreadyComplete) => {
+                        metrics::counter!("rio_store_put_path_total", "result" => "exists")
+                            .increment(1);
+                        Ok(None)
+                    }
+                    Ok(PlaceholderClaim::Concurrent) => Err(Status::aborted(format!(
+                        "{} for this path; retry",
+                        rio_proto::CONCURRENT_PUTPATH_MSG
+                    ))),
+                    Err(e) => Err(putpath_metadata_status("PutPath: concurrent-wait", e)),
+                }
             }
             Err(e) => Err(putpath_metadata_status("PutPath: claim_placeholder", e)),
         }

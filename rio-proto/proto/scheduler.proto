@@ -1,6 +1,7 @@
 syntax = "proto3";
 package rio.scheduler;
 
+import "admin_types.proto"; // GetDerivationLog → DerivationLogChunk
 import "build_types.proto";
 
 // Gateway-facing RPCs for build submission and monitoring.
@@ -25,6 +26,32 @@ service SchedulerService {
   // per-request. InvalidArgument on unknown name; empty name is
   // caller-side gated (gateway doesn't call for empty comment).
   rpc ResolveTenant(ResolveTenantRequest) returns (ResolveTenantResponse);
+
+  // Stream a stored derivation-execution log for a build the caller owns
+  // (success or failure — `rio log`, and the client's failure replay of
+  // BuildFailed.culprit_* after a fail-fast). Tenant-scoped twice over:
+  // the caller must own `build_id`, the derivation must be part of that
+  // build, AND log content is only served when the resolved execution is
+  // attributable to one of the caller's own builds
+  // (build_derivations.exec_id) — otherwise the stream closes empty and
+  // failure-replay callers fall back to BuildFailed.culprit_error_message.
+  // Reuses DerivationLogChunk (admin_types.proto); unlike the
+  // service-token-gated AdminService.GetDerivationLogs this is callable
+  // with the tenant JWT.
+  rpc GetDerivationLog(GetDerivationLogRequest) returns (stream rio.types.DerivationLogChunk);
+}
+
+message GetDerivationLogRequest {
+  // A build owned by the caller, as the ownership anchor. Empty = no pin:
+  // the scheduler resolves the most recent execution of the derivation
+  // among the caller's own builds (`rio log <drv>` without --build).
+  string build_id = 1;
+  string derivation_path = 2;   // .drv path (e.g. BuildFailed.culprit_derivation)
+  string exec_id = 3;           // Execution to pin (e.g. culprit_exec_id); empty = latest resolvable execution
+  // Serve only the last N lines (server computes the start cursor from the
+  // stored line span). 0 = the full log.
+  uint32 tail_lines = 4;
+  uint64 since_line = 5;        // Resume cursor; same semantics as GetDerivationLogsRequest.since_line
 }
 
 message ResolveTenantRequest {

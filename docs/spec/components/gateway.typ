@@ -782,6 +782,19 @@ Each *builtOutput* entry is a `(DrvOutput, Realisation)` pair:
   STDERR trace/field readers).
 ]
 
+#r("gw.wire.collection-total-bytes")[
+  `read_strings` / `read_string_pairs` MUST additionally enforce an aggregate
+  payload budget (`MAX_COLLECTION_TOTAL_BYTES`, 64 MiB) across all element
+  bytes of one collection, charged against each element's *claimed* length
+  before its body is read.
+]
+The per-element `MAX_STRING_LEN` and per-collection `MAX_COLLECTION_COUNT`
+caps alone still admit `count × len` (~64 TiB) of retained allocation from a
+single message — the HTTP/2 CONTINUATION-flood shape. The budget equals
+`MAX_STRING_LEN`, so any single string the protocol accepts also fits in a
+fresh collection budget; pairs charge keys and values against one shared
+budget.
+
 #r("gw.wire.framed-no-padding")[
   Framed data (for NARs): sequence of `u64(chunk_len) + chunk_data` terminated
   by `u64(0)` --- chunk data is NOT padded (unlike strings).
@@ -1053,6 +1066,29 @@ fetch). The optimization:
   unreachable), inlining is skipped entirely and all nodes fall back to
   executor-fetch. This is an optimization, not a correctness requirement.
 
+== Drv Digest Population (ADR-024 P2a)
+
+#r("gw.submit.digest-populate")[
+  After DAG construction, the gateway MUST attempt to turn the ssh-ng
+  submission into a digest-bearing one: compute
+  `drv_digest = blake3(canonical proto drv bytes)` and `input_drv_digests`
+  (mirroring `inputDrvs`) for every node from the session's parsed drv cache,
+  upload drv blobs the store does not yet have (`HasDrvs` →
+  `PutDrvBlobs`, authenticated with the session JWT), and only then set the
+  digest fields. The step is all-or-nothing: any failure --- a node without a
+  parsed drv (the `BasicDerivation` fallback), an input outside the
+  submission, a store RPC error, or no session JWT --- MUST leave EVERY node
+  digest-less (the legacy edges submission), because the scheduler rejects
+  mixed submissions. The uploaded body is the canonical encoding, so the
+  store's verify-on-put (#rref("store.drv.verify-on-put")) guarantees
+  `GetDrvBlob` serves the same bytes back (round-trip byte-stability).
+]
+
+This is how P2a keeps one scheduler path forward: ssh-ng submissions feed the
+digest-derived edge machinery through the gateway while the native `rio
+build` client (P3) uploads blobs directly; `edges` remains populated alongside
+the digests until P2b retires it.
+
 #info(title: [Session state])[
   Although the gateway is described as "stateless beyond the lifetime of a
   single SSH connection," each SSH channel does accumulate per-session state:
@@ -1147,16 +1183,12 @@ fetch). The optimization:
   failure once downstream tenant authz lands).
 ]
 
-#r("gw.jwt.anon-drv-lookup")[
-  Read-path opcodes (`wopIsValidPath`, `wopEnsurePath`, `wopQueryPathInfo`,
-  `wopQueryValidPaths`) MUST send the JWT to the store *except for `.drv`
-  paths*, which are looked up anonymously (`jwt_unless_drv`). `.drv` files are
-  build INPUTS, not tenant-owned OUTPUTS: a `.drv` uploaded under one identity
-  then queried under another has no `path_tenants` row for the querying tenant,
-  so a tenant-filtered `QueryPathInfo` would return NotFound for a `.drv` the
-  client just uploaded. Output paths keep tenant-scoped visibility
-  (#rref("store.tenant.narinfo-filter")); only the `.drv` lookup is exempt.
-]
+Read-path opcodes (`wopIsValidPath`, `wopEnsurePath`, `wopQueryPathInfo`,
+`wopQueryValidPaths`, `wopNarFromPath`) send the session JWT for *all* paths,
+`.drv` included --- there is deliberately no anonymous-`.drv` carve-out. Tenant
+visibility for validity answers is the store's decision
+(#rref("store.tenant.valid-paths-filter") documents why a carve-out is
+forbidden); the gateway only propagates identity per #rref("gw.jwt.propagate").
 
 = Connection Lifecycle
 

@@ -43,6 +43,8 @@ let
     "rio-gateway"
     "rio-test-support"
     "rio-cli"
+    # tests/daemon_client.rs spawns nix-daemon against a throwaway store
+    "rio-nix"
     "xtask"
   ];
   needsPg = [
@@ -53,6 +55,7 @@ let
     "rio-controller"
     "rio-migrations"
     "rio-test-support"
+    "rio-build-cli"
   ];
 in
 {

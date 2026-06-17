@@ -29,6 +29,30 @@
 let
   inherit (fixture) ns;
   dashboardCurls = import ./dashboard.nix { inherit pkgs ns; };
+
+  # The direct-to-scheduler curls below bypass the dashboard nginx (which
+  # mints x-rio-service-token per request via njs), and the AdminService
+  # read RPCs they hit are ensure_service_caller-gated. Mint the token
+  # the nginx would have minted (caller: rio-dashboard). Mirrors
+  # sla-sizing.nix's signServiceToken (reads the fixture's hmacKeys store
+  # path directly). argv: <key-path> <caller>.
+  signServiceToken = pkgs.writeScript "sign-service-token-dashboard-gateway" ''
+    #!${pkgs.python3}/bin/python3
+    import base64, hashlib, hmac, json, sys, time
+    key = open(sys.argv[1], "rb").read()
+    # Mirror rio-auth load_key() trailing-newline trim.
+    for suf in (b"\r\n", b"\n"):
+        if key.endswith(suf):
+            key = key[: -len(suf)]
+            break
+    claims = json.dumps(
+        {"caller": sys.argv[2], "expiry_unix": int(time.time()) + 7200},
+        separators=(",", ":"),
+    ).encode()
+    tag = hmac.new(key, claims, hashlib.sha256).digest()
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    print(f"{b64(claims)}.{b64(tag)}")
+  '';
 in
 pkgs.testers.runNixOSTest {
   name = "rio-dashboard";
@@ -137,11 +161,20 @@ pkgs.testers.runNixOSTest {
         k3s_server.wait_until_succeeds(
             "${pkgs.netcat}/bin/nc -z localhost 19001", timeout=10
         )
+        # Direct-to-scheduler bypasses the nginx that injects
+        # x-rio-service-token, and these read RPCs are
+        # ensure_service_caller-gated — mint the rio-dashboard token
+        # ourselves (see signServiceToken in the let-block).
+        k3s_server.succeed(
+            "${signServiceToken} ${fixture.hmacKeys}/service-hmac.key rio-dashboard "
+            "> /tmp/svc-token"
+        )
         try:
             k3s_server.wait_until_succeeds(
                 "printf '\\x00\\x00\\x00\\x00\\x00' | "
                 "curl -sf -X POST http://localhost:19001/rio.admin.AdminService/ClusterStatus "
                 "-H 'content-type: application/grpc-web+proto' "
+                "-H \"x-rio-service-token: $(cat /tmp/svc-token)\" "
                 "-H 'x-grpc-web: 1' --data-binary @- "
                 "| ${pkgs.xxd}/bin/xxd | head -1 | grep -q '^00000000: 00'",
                 timeout=60,
@@ -155,6 +188,7 @@ pkgs.testers.runNixOSTest {
                 "printf '\\x00\\x00\\x00\\x00\\x0a\\x0a\\x08nonexist' | "
                 "curl -sf -X POST http://localhost:19001/rio.admin.AdminService/GetDerivationLogs "
                 "-H 'content-type: application/grpc-web+proto' "
+                "-H \"x-rio-service-token: $(cat /tmp/svc-token)\" "
                 "-H 'x-grpc-web: 1' --data-binary @- "
                 "| ${pkgs.xxd}/bin/xxd | grep ' 80' >/dev/null",
                 timeout=60,
@@ -164,6 +198,7 @@ pkgs.testers.runNixOSTest {
             k3s_server.execute(
                 "curl -sv -X POST http://localhost:19001/rio.admin.AdminService/ClusterStatus "
                 "-H 'content-type: application/grpc-web+proto' -H 'x-grpc-web: 1' "
+                "-H \"x-rio-service-token: $(cat /tmp/svc-token)\" "
                 "-d x 2>&1 | head -30; "
                 "k3s kubectl -n ${ns} logs pod/" + leader + " --tail=40 2>&1"
             )

@@ -101,10 +101,18 @@ impl Drop for OtelGuard {
 pub fn init_tracing(component: &'static str) -> anyhow::Result<OtelGuard> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // fmt layer: JSON or pretty. `.boxed()` so both arms have the same type.
+    // fmt layer: JSON or pretty. `.boxed()` so both arms have the same
+    // type. Logs go to STDERR — stdout is the machine-readable surface
+    // (e.g. `rio build` final result paths feed into `xargs`).
     let fmt_layer = match log_format_from_env() {
-        LogFormat::Json => tracing_subscriber::fmt::layer().json().boxed(),
-        LogFormat::Pretty => tracing_subscriber::fmt::layer().pretty().boxed(),
+        LogFormat::Json => tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(std::io::stderr)
+            .boxed(),
+        LogFormat::Pretty => tracing_subscriber::fmt::layer()
+            .pretty()
+            .with_writer(std::io::stderr)
+            .boxed(),
     };
 
     // OTel layer: Some if RIO_OTEL_ENDPOINT is set, None otherwise.

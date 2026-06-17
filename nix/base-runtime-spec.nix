@@ -8,11 +8,13 @@
 #     for k3s's embedded containerd with `base_runtime_spec` set on
 #     the runc runtime.
 #
-# r[impl sec.pod.fuse-device-plugin]
+# r[impl sec.pod.fuse-device-plugin+1]
 # runc mknods these inside the container's /dev (container-namespace
 # uid/gid) — NOT a hostPath mount, so no hostUsers:false idmap-mount
-# rejection. Every pod gets /dev/fuse; mounting fuse still needs
-# CAP_SYS_ADMIN. /dev/kvm is included only when withKvm=true — both
+# rejection. Every pod gets /dev/fuse (no longer load-bearing for the
+# castore store — rio-mountd owns the FUSE mount and hands the fd over
+# since ADR-022 P0560); mounting fuse still needs CAP_SYS_ADMIN.
+# /dev/kvm is included only when withKvm=true — both
 # delivery paths reference `pickExecStartPre` below, which symlinks
 # the host-appropriate variant to `runtimePath` at boot via
 # `test -c /dev/kvm`, so on non-.metal the node never appears in the

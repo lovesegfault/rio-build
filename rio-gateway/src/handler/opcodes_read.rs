@@ -35,34 +35,11 @@ use crate::drv_cache::resolve_derivation;
 /// same RPC and must share the same budget.
 pub(super) const GATEWAY_FMP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// JWT for store lookups — but NOT for `.drv` paths.
-///
-/// `.drv` files are build INPUTS, not tenant-owned OUTPUTS. A `.drv`
-/// uploaded via one context (e.g., `nix copy` with default key) then
-/// checked via another (e.g., `nix build` with tenant key) has no
-/// `path_tenants` row for the checking tenant → tenant-filtered
-/// `QueryPathInfo` returns NotFound → client sees "not a valid store
-/// path" for a `.drv` it just uploaded. Observed in vm-lifecycle-core
-/// gc-sweep subtest.
-///
-/// Output paths (everything that isn't a `.drv`) keep tenant-scoped
-/// visibility — `r[store.tenant.narinfo-filter]` applies there.
-///
-/// The store-side `sig_visibility_gate` / `sig_visibility_gate_batch`
-/// now mirror this exemption (rio-store/src/grpc/sign.rs), so batch
-/// opcodes (`wopQueryValidPaths`, `wopQueryMissing`) that send mixed
-/// `.drv`/non-`.drv` paths with the raw JWT get consistent answers
-/// without partitioning here. This helper remains for the single-path
-/// opcodes as a layer-independent enforcement (and avoids the
-/// `path_tenants` round-trip for `.drv` lookups).
-// r[impl gw.jwt.anon-drv-lookup]
-fn jwt_unless_drv<'a>(jwt_token: Option<&'a str>, path: &StorePath) -> Option<&'a str> {
-    if path.is_derivation() {
-        None
-    } else {
-        jwt_token
-    }
-}
+// NOTE: read-path opcodes send the session JWT for ALL paths, `.drv`
+// included — deliberately no anonymous-`.drv` carve-out. A JWT-less
+// `.drv` lookup reads as valid cross-tenant, which the caller's builds
+// then cannot read through castore-FUSE; visibility is the store's
+// decision (`r[store.tenant.valid-paths-filter]`), not the gateway's.
 
 // r[impl gw.opcode.is-valid-path]
 /// wopIsValidPath (1): Check if a store path exists.
@@ -79,13 +56,10 @@ pub(super) async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + U
     debug!(path = %path_str, "wopIsValidPath");
 
     let valid = match StorePath::parse(&path_str) {
-        Ok(path) => {
-            let jwt = jwt_unless_drv(jwt_token, &path);
-            match grpc_is_valid_path(store_client, jwt, &path).await {
-                Ok(v) => v,
-                Err(e) => stderr_err!(stderr, "store error: {e}"),
-            }
-        }
+        Ok(path) => match grpc_is_valid_path(store_client, jwt_token, &path).await {
+            Ok(v) => v,
+            Err(e) => stderr_err!(stderr, "store error: {e}"),
+        },
         Err(e) => {
             debug!(path = %path_str, error = %e, "wopIsValidPath: unparseable store path");
             false
@@ -114,8 +88,7 @@ pub(super) async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     if let Ok(path) = StorePath::parse(&path_str).inspect_err(|e| {
         debug!(path = %path_str, error = %e, "wopEnsurePath: unparseable store path");
     }) {
-        let jwt = jwt_unless_drv(jwt_token, &path);
-        match grpc_is_valid_path(store_client, jwt, &path).await {
+        match grpc_is_valid_path(store_client, jwt_token, &path).await {
             Ok(true) => {}
             Ok(false) => {
                 debug!(path = %path_str, "wopEnsurePath: path not in store (no substituters)");
@@ -161,11 +134,10 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
         }
     };
 
-    let jwt = jwt_unless_drv(jwt_token, &path);
     // Transient store status (RE from `r[store.substitute.admission]`,
     // Unavailable) is retried inside `grpc_query_path_info`; only
     // exhausted-budget or non-transient errors reach `stderr_err!`.
-    let info = match grpc_query_path_info(store_client, jwt, path.as_str()).await {
+    let info = match grpc_query_path_info(store_client, jwt_token, path.as_str()).await {
         Ok(info) => info,
         Err(e) => stderr_err!(stderr, "store error: {e}"),
     };
@@ -375,8 +347,7 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
     // status (`r[gw.store.transient-retry]`) and applies
     // GRPC_STREAM_TIMEOUT per-chunk so a stalled store can't pin
     // ≤4 GiB of buffered NAR + the SSH session indefinitely.
-    let jwt = jwt_unless_drv(jwt_token, &path);
-    let nar_data = match grpc_get_path(store_client, jwt, path.as_str()).await {
+    let nar_data = match grpc_get_path(store_client, jwt_token, path.as_str()).await {
         Ok(Some((_info, nar))) => nar,
         Ok(None) => stderr_err!(stderr, "path '{path_str}' is not valid"),
         Err(e) => stderr_err!(stderr, "{e}"),

@@ -10,7 +10,7 @@
     "keyctl": "kernel keyring manipulation — fetcher has no legitimate need for persistent kernel keys",
     "add_key": "add to kernel keyring — paired with keyctl"
   },
-  "//kept": "mount/umount/unshare/clone/pivot_root — FUSE + overlayfs + nix sandbox need these even in fetch mode (the FOD build script runs inside the same sandbox).",
+  "//kept": "mount/umount/unshare/clone/pivot_root — FUSE + overlayfs + nix sandbox need these even in fetch mode (the FOD build script runs inside the same sandbox). io_uring_setup/io_uring_enter/io_uring_register — the fetcher's worker serves the per-build castore-FUSE (the FOD sandbox's overlay lower) over fuse-over-io_uring, the session's only transport; denying the trio fails every FOD. Same residual-risk acceptance as the builder profile (single-tenant today — see xtask regen::seccomp::DENIED).",
   "//caveat": "ADR-019 warns this may be too strict for git-lfs/hg/svn FODs. Allowlist widens as real FODs hit denials; the VM test git-based FOD subtest is the canary.",
   "defaultAction": "SCMP_ACT_ERRNO",
   "defaultErrnoRet": 1,
@@ -169,6 +169,9 @@
         "ioprio_set",
         "io_setup",
         "io_submit",
+        "io_uring_enter",
+        "io_uring_register",
+        "io_uring_setup",
         "ipc",
         "kill",
         "landlock_add_rule",

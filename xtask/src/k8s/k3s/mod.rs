@@ -85,6 +85,26 @@ impl Provider for K3s {
         // spec unchanged → kube won't re-pull on its own; forced restart
         // below handles that.
         let was_installed = helm::release_status("rio", NS)?.is_some();
+
+        // Same-tag/new-content migrations: the rio-migrate Job's name
+        // hashes the rendered pod template, which cannot see image
+        // CONTENT — and k3s pins tag=dev forever, so a re-pushed dev
+        // image carrying a NEW migration would render an identical
+        // Job that already Completed and never run it (store/scheduler
+        // would crash-loop on the schema check indefinitely). Delete
+        // prior completed rio-migrate Jobs by label before upgrade;
+        // the re-created Job re-runs idempotently under the advisory
+        // lock. (Mirrors the same-tag rollout-restart below.)
+        ui::step("reap completed rio-migrate jobs", || async {
+            let sh = shell()?;
+            sh::run(cmd!(
+                sh,
+                "kubectl -n {NS} delete job -l app.kubernetes.io/name=rio-migrate --field-selector status.successful=1 --ignore-not-found"
+            ))
+            .await
+        })
+        .await?;
+
         ui::step("helm install rio", || async {
             helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
                 .namespace(NS)
@@ -97,6 +117,21 @@ impl Provider for K3s {
                 .set("jwt.publicKey", &jwt.pubkey)
                 .run()
                 .await
+        })
+        .await?;
+
+        // The k3s path passes no helm --wait (and the Job is no hook
+        // helm would implicitly wait on), so without an explicit wait
+        // this returns with migrations in flight and the
+        // rollout-restart below races the Job. kubectl-wait by LABEL
+        // (the Job name carries a per-render hash).
+        ui::step("wait for rio-migrate", || async {
+            let sh = shell()?;
+            sh::run(cmd!(
+                sh,
+                "kubectl -n {NS} wait --for=condition=Complete job -l app.kubernetes.io/name=rio-migrate --timeout=600s"
+            ))
+            .await
         })
         .await?;
 

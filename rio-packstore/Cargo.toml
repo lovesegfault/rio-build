@@ -1,0 +1,31 @@
+[package]
+name = "rio-packstore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Client-side append-only pack store for the rio:// eval store (ADR-024 P1)"
+
+# The client CAS storage layer: append-only segment packs with
+# self-describing resyncable records, a single index file that is a
+# cache of the packs (never the truth), and mark+repack GC run
+# synchronously at open time. Synchronous I/O only — this runs inside
+# a nix eval process and must stay fork-safe (no threads, ever).
+
+[dependencies]
+# Digest space: blake3(canonical bytes), 32 raw bytes — shared with
+# rio-store's castore by construction (ADR-024 Identity rules).
+blake3 = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+# flock(2) advisory locking: shared writer locks on segments, the
+# exclusive GC/index lock. The `nix` crate's Flock wrapper takes
+# ownership of the File; we need the lock to coexist with normal
+# reads/writes on the same fd, so raw libc is the honest fit.
+libc = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

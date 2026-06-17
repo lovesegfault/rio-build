@@ -1,0 +1,9 @@
+
+B
+dev;/nix/store/1123456789abcdfg0123456789abcdfg-fixture-1.0-dev
+>
+out7/nix/store/2123456789abcdfg0123456789abcdfg-fixture-1.0C
+7/nix/store/3123456789abcdfg0123456789abcdfg-dep-0.1.drvdevout6/nix/store/4123456789abcdfg0123456789abcdfg-builder.sh"x86_64-linux*9/nix/store/5123456789abcdfg0123456789abcdfg-bash/bin/bash2-e2	.attrs.sh:E
+__json;{"builder":"bash","name":"fixture","outputs":["dev","out"]}:B
+dev;/nix/store/1123456789abcdfg0123456789abcdfg-fixture-1.0-dev:>
+out7/nix/store/2123456789abcdfg0123456789abcdfg-fixture-1.0

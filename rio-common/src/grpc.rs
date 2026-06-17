@@ -114,6 +114,11 @@ pub const DEFAULT_GRPC_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// At `MAX_NAR_SIZE` = 4 GiB and ~15 MB/s, a full transfer is ~270s. 300s
 /// gives headroom without being unbounded.
+///
+/// For `GetChunks` the store uses this value as an IDLE budget (reset
+/// on every frame), not an absolute cap: one bidi stream serves a whole
+/// castore-FUSE file fill, so its total lifetime scales with file size
+/// and an absolute cap would make any file over ~4.4 GiB unfillable.
 pub const GRPC_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Initial h2 per-stream flow-control window (1 MiB). h2's default is
@@ -367,14 +372,14 @@ pub fn internal(ctx: &str, e: impl Display) -> Status {
 ///   can briefly saturate even 8×200=1600 conns. Drains in <1s.
 /// - `Aborted` — store's retryable PG conflict (Serialization, Deadlock
 ///   — see `rio-store::metadata`). The store says "retry" via Aborted
-///   (I-189); without it the builder's no-manifest-hint fallback path
-///   EIOs immediately on PG contention instead of backing off.
+///   (I-189); without it the builder's JIT GetPath fetch EIOs
+///   immediately on PG contention instead of backing off.
 ///
 /// `DeadlineExceeded` is deliberately NOT transient: that's the caller's
 /// own timeout firing — the peer hung past `fetch_timeout`. Retrying
 /// with the same timeout won't help, and on a FUSE-thread caller the
 /// next retry would compound the wait.
-// r[impl builder.fuse.retry-jitter]
+// r[impl builder.fuse.retry-jitter+2]
 pub fn is_transient(code: tonic::Code) -> bool {
     matches!(
         code,
@@ -464,7 +469,7 @@ mod tests {
 
     /// I-189: store returns `Aborted` for retryable PG conflicts
     /// (Serialization, Deadlock). Callers must retry, not surface EIO.
-    // r[verify builder.fuse.retry-jitter]
+    // r[verify builder.fuse.retry-jitter+2]
     #[test]
     fn test_is_transient_classification() {
         assert!(is_transient(tonic::Code::Aborted));

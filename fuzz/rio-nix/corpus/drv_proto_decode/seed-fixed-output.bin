@@ -1,0 +1,9 @@
+
+‚
+out1/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fixedsha256"@e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"x86_64-linux*/bin/sh2-c2echo:
+namefixed:8
+out1/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fixed:N
+
+outputHash@e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855:
+outputHashAlgosha256:
+systemx86_64-linux

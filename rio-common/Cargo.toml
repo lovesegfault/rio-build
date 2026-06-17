@@ -12,6 +12,17 @@ description = "Shared configuration, observability, and error types for rio-buil
 # Shared aws-sdk-s3 client builder (s3.rs). Only rio-store +
 # rio-scheduler enable this.
 aws = ["dep:aws-config", "dep:aws-sdk-s3"]
+# RDS IAM database auth (pg_iam.rs): SigV4 token minting + live-pool
+# credential refresh. Enabled by the three PG consumers (store,
+# scheduler, controller).
+pg-iam = [
+  "dep:aws-config",
+  "dep:aws-credential-types",
+  "dep:aws-sigv4",
+  "dep:aws-smithy-runtime-api",
+  "dep:sqlx",
+  "dep:url",
+]
 
 [dependencies]
 # JSON Schema derivation for Config structs (`docs/gen/config.json`).
@@ -19,8 +30,15 @@ schemars = { workspace = true }
 # Optional: shared S3 client builder (aws feature).
 aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
+# Optional: RDS IAM auth-token minting + pool refresh (pg-iam feature).
+aws-credential-types = { workspace = true, optional = true }
+aws-sigv4 = { workspace = true, optional = true }
+aws-smithy-runtime-api = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 
 # Logging & metrics
+metrics = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }

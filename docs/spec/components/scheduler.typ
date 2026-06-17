@@ -398,6 +398,26 @@ epilogue in the success path).
   auth before a JWT exists.
 ]
 
+#r("sched.log.tenant-scoped")[
+  `GetDerivationLog` MUST derive the caller's tenant from the
+  interceptor-attached `TenantClaims.sub` (the same `require_tenant`
+  chokepoint as the other SchedulerService RPCs) and MUST serve log content
+  only for an execution attributable to a build owned by that tenant via the
+  build↔execution record (`build_derivations.exec_id`), regardless of which
+  build or execution the request names. A request whose named execution
+  belongs to another tenant yields an empty stream (no content, no error); a
+  derivation with no execution under the caller's builds is `NOT_FOUND`,
+  identical whether or not other tenants ever built it.
+]
+
+The content gate is on the EXECUTION being served, not merely on the
+requested build: a fail-fast culprit (#rref("sched.merge.failfast-culprit"))
+may name an execution that ran for a different tenant's build of the same
+derivation --- the caller still gets the persisted reason text via
+`BuildFailed.culprit_error_message`, but never that execution's log bytes.
+A pinned `build_id` additionally requires ownership of that build
+(`PERMISSION_DENIED` on mismatch) and membership of the derivation in it.
+
 #r("sched.store-client.reconnect")[
   The scheduler's gRPC channel to rio-store MUST use lazy connection
   (`Endpoint::connect_lazy`) with HTTP/2 keepalive so store pod rollouts do not
@@ -687,6 +707,29 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
   uploaded.
 ]
 
+#r("sched.dispatch.input-roots+2")[
+  `WorkAssignment` MUST carry the build's transitive input closure
+  (`input_closure`, sorted store-path strings) and, for each closure path that
+  has a `nar_index` row, its castore root node (`input_roots`). The closure is
+  the BFS over `narinfo.references` from the dispatch-time seeds, which MUST be
+  derived from the parsed derivation's exact direct inputs (`inputSrcs` ∪ the
+  outputs of every `inputDrvs` entry, resolved through the in-memory DAG) ---
+  not the shallow `approx_input_closure` prefetch hint. The same sorted
+  `input_closure` is what `AssignmentClaims.input_closure_digest` hashes
+  (#rref("common.hmac.claims")). The attested closure MUST NOT be narrower than
+  the build's true input closure: when the scheduler cannot establish the exact
+  direct-input set (no inlined `.drv` --- e.g. a recovery-loaded node --- or an
+  `inputDrvs` entry whose output paths are unknown), or on PG failure, it sends
+  both fields empty and the builder falls back to its own drv-parsed
+  `QueryPathInfo` BFS.
+]
+The `nar_index.root_node` column is written in the same transaction that makes
+a path's manifest `complete` (#rref("store.index.authoritative")), so every
+closure path that is substitutable at dispatch time has an `input_roots`
+entry. A closure path with no entry is one the store does not (yet) hold; the
+builder falls back to `GetNarIndex`/`QueryPathInfo` for it and fails the build
+as infra-failed if the path never materializes.
+
 #r("sched.heartbeat.adopt")[
   A heartbeat-reported running build the scheduler doesn't have on record for
   that executor is adopted into BOTH `executor.running_build` (so dispatch sees
@@ -740,6 +783,59 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
 ]
 
 = Multi-Build DAG Merging
+
+== Digest-Bearing Submissions (ADR-024 P2a)
+
+#r("sched.submit.digest-edges")[
+  When every node of a `SubmitBuild` submission carries `drv_digest`
+  (`blake3` of the canonical proto drv bytes), dependency edges MUST be
+  derived from each node's `input_drv_digests` and the request's `edges`
+  list MUST be ignored. A mixed submission --- some nodes with `drv_digest`,
+  some without (including a digest-less node that carries
+  `input_drv_digests`) --- MUST be rejected with `INVALID_ARGUMENT`; there
+  are no silent half-modes. A submission with no digest fields at all keeps
+  the legacy `edges` semantics unchanged.
+]
+
+Rationale: edges are ignored in digest mode, so a node admitted without
+digest references would silently lose all its dependency edges and dispatch
+concurrently with its inputs --- the C13 silent mis-build window, not a
+reject. Input digests resolve against the submission's own nodes first;
+a digest that instead resolves in the store's `drv_blobs` yields an edge to
+the stored `drv_path`, which the merge keeps when that derivation is part of
+a live build and drops (warn-skip) when it is not.
+
+#r("sched.submit.digest-verify")[
+  Before a digest-bearing submission is accepted, the scheduler MUST verify
+  that every referenced digest --- each node's own `drv_digest` and every
+  `input_drv_digests` entry not matched in-submission --- exists in the
+  store's `drv_blobs`, tenant-scoped exactly like `HasDrvs`. The reject MUST
+  list ALL missing digests (`FAILED_PRECONDITION`), not first-fail, so the
+  client's stale-ack recovery can re-`Has` exactly that list, re-upload, and
+  resubmit. A node whose own digest resolves to a different stored
+  `drv_path` than the skeleton claims MUST be rejected. If verification
+  cannot be performed (database unavailable), the submission MUST be
+  rejected --- never accepted unverified.
+]
+
+#r("sched.submit.paginate")[
+  `SubmitBuild` MUST support paginated submissions above the single-message
+  budget (~50k skeleton nodes at the measured 334B/node against the 16MB
+  budget): pages share a client-chosen `submission_id`, are staged keyed by
+  `(attested tenant, submission_id)`, and non-final pages are acknowledged
+  with an empty, immediately-closed event stream. The final page assembles
+  every staged page plus itself into one submission that flows through the
+  SAME validation, digest classification, and bulk-verify as an unpaged
+  request --- pagination changes transport framing, never acceptance
+  semantics. Staged pages MUST be bounded (global node cap) and expire when
+  no final page arrives.
+]
+
+The scheduler additionally accepts and sends zstd-compressed messages on
+`SchedulerService` (skeletons compress at a measured 0.235 ratio);
+compression is negotiated per gRPC `grpc-accept-encoding`, so legacy
+clients are unaffected, and the scheduler-first deploy order guarantees the
+server accepts zstd before any client sends it.
 
 #r("sched.merge.dedup")[
   The scheduler maintains a single global DAG across all concurrent build
@@ -1359,6 +1455,26 @@ Queue-level preemption is fully supported:
   the limit the node stays `poisoned` and the build fail-fasts (use the 24h TTL
   or `ClearPoison` admin RPC to override).
 ]
+
+#r("sched.merge.failfast-culprit")[
+  When a merge fail-fasts because a pre-existing node is still terminally
+  failed --- `poisoned` with its resubmit-reset cycles exhausted
+  (#rref("sched.merge.poisoned-resubmit-bounded")), or `dependency_failed`
+  beneath such a node --- the resulting `BuildFailed` MUST attribute the
+  failure to the poisoned culprit derivation itself (not to a cascaded
+  ancestor) and MUST carry the culprit's persisted failure reason and
+  originating execution id when they are recorded.
+]
+
+The attribution makes the cached failure debuggable from the client: the
+culprit names which derivation to look at, the persisted reason
+(#rref("obs.log.failure-reason-persisted")) explains why it failed even when
+the original execution produced no log lines, and the execution id is what the
+client passes to `GetDerivationLog` to replay the original log tail. When no
+poisoned node is reachable from the surfaced failure (the poisoned dependency
+was cleared between the cascade and this merge), the failure keeps the generic
+"derivation X failed" summary --- attribution is best-effort, never a reason to
+fail the merge differently.
 
 #r("sched.merge.stale-completed-verify+5")[
   When a build merges and finds a pre-existing `completed` or `skipped` node in

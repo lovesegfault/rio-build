@@ -1,9 +1,9 @@
 //! Read-side queries: path info lookup, missing-path batch check, NAR
-//! reassembly (`get_manifest`), and signature append.
+//! reassembly (`get_manifest_with_dag`), and signature append.
 //!
 //! All read queries filter on `manifests.status = 'complete'` — placeholders
-//! from in-progress or crashed uploads are invisible. `get_manifest` is the
-//! ONE place the inline-vs-chunked branch lives; callers never touch
+//! from in-progress or crashed uploads are invisible. `get_manifest_with_dag`
+//! is the ONE place the inline-vs-chunked branch lives; callers never touch
 //! `manifests`/`manifest_data` directly.
 
 use super::*;
@@ -14,28 +14,19 @@ use tracing::instrument;
 // narinfo_cols! is #[macro_export] so it lands at crate root — re-import.
 use crate::narinfo_cols;
 
-/// `SELECT <narinfo cols>[extra] FROM narinfo n JOIN manifests m … WHERE
+/// `SELECT <narinfo cols> FROM narinfo n JOIN manifests m … WHERE
 /// <pred> AND m.status='complete'`. Every read query that returns full
-/// `NarinfoRow`s shares this shell; only the WHERE predicate (and
-/// `get_manifest_batch`'s extra `m.inline_blob` column) varies. Factored
-/// so the JOIN clause + status filter can't drift between the four
+/// `NarinfoRow`s shares this shell; only the WHERE predicate varies.
+/// Factored so the JOIN clause + status filter can't drift between the
 /// callers (I-078 made the index strategy load-bearing).
 macro_rules! narinfo_complete_select {
     ($pred:literal) => {
-        narinfo_complete_select!($pred, "", "")
-    };
-    ($pred:literal, $extra_cols:literal) => {
-        narinfo_complete_select!($pred, $extra_cols, "")
-    };
-    ($pred:literal, $extra_cols:literal, $extra_join:literal) => {
         concat!(
             "SELECT ",
             narinfo_cols!(),
-            $extra_cols,
             " FROM narinfo n \
-             INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash ",
-            $extra_join,
-            " WHERE ",
+             INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
+             WHERE ",
             $pred,
             " AND m.status = 'complete'"
         )
@@ -61,36 +52,66 @@ fn path_hash(store_path: &str) -> Result<[u8; 32]> {
         .sha256_digest())
 }
 
-/// Fetch the storage kind + content for a completed path.
+/// `(root_node_bytes, directory_bodies)` as read from PG, before
+/// [`crate::castore_nar::decode_dag`] turns them into wire types.
+/// The bodies are keyed by recomputed digest at decode time, not by
+/// the row key, so a corrupt body surfaces as a missing-directory walk
+/// error instead of a wrong-content NAR.
+pub(crate) type CastoreDagRows = (Vec<u8>, Vec<Vec<u8>>);
+
+/// Fetch the storage kind (inline blob vs chunk list) AND the castore
+/// DAG (`nar_index.root_node` plus every reachable `directories.body`)
+/// for a completed path, in ONE statement = ONE MVCC snapshot.
 ///
-/// This is THE one place the inline/chunked branch is implemented. Callers
-/// (GetPath) match on the result; they never query manifests or
-/// manifest_data directly.
+/// This is THE read `GetPath` serves a path from. Callers never query
+/// `manifests`/`manifest_data`/`nar_index`/`directories` directly, and
+/// they never read the DAG as a separate statement: under READ
+/// COMMITTED each statement takes a fresh snapshot, so a GC sweep
+/// committing between a manifest read and a DAG read (the sweep's
+/// `DELETE FROM narinfo` CASCADEs `manifests`, `manifest_data`,
+/// `nar_index`, `directory_paths` away atomically) would surface a
+/// just-collected path as "complete manifest with no castore index" —
+/// a corruption-class misclassification (`DATA_LOSS` / mid-stream
+/// MissingDirectory) of what is semantically NotFound. A READ
+/// COMMITTED `BEGIN` does NOT fix that (each statement re-snapshots);
+/// one statement does. Filter on the manifests PK directly (no narinfo
+/// join needed — I-078: the previous text filter was a Seq Scan).
 ///
-/// `None` means the path has no complete manifest (either never uploaded,
-/// or stuck in 'uploading' from a crashed PutPath).
+/// Returns:
+/// - `None` — no complete manifest (never uploaded, still
+///   `'uploading'`, or concurrently GC'd). Callers map this to
+///   `NOT_FOUND`.
+/// - `Some((kind, Some(dag)))` — servable.
+/// - `Some((kind, None))` — a complete manifest with no usable castore
+///   index **in the same snapshot**: the NAR framing cannot be
+///   regenerated. Because the read is single-snapshot, concurrent GC
+///   cannot produce this state — it is genuine data loss (or a
+///   pre-ADR-022 row with a NULL `root_node`), so callers map it to
+///   `DATA_LOSS`.
 #[instrument(skip(pool))]
-pub(crate) async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Option<ManifestKind>> {
+pub(crate) async fn get_manifest_with_dag(
+    pool: &PgPool,
+    store_path: &str,
+) -> Result<Option<(ManifestKind, Option<CastoreDagRows>)>> {
     let hash = path_hash(store_path)?;
-    // Single LEFT JOIN: both halves of the inline/chunked branch in
-    // ONE statement = ONE MVCC snapshot. Filter on the manifests PK
-    // directly (no narinfo join needed — both tables key on
-    // store_path_hash). I-078: the previous narinfo-join +
-    // `n.store_path = $1` filter was a Seq Scan.
-    //
-    // Two separate `.fetch_optional(pool)` calls (the previous shape)
-    // race with GC sweep: under READ COMMITTED each statement takes a
-    // fresh snapshot, so sweep's `DELETE FROM narinfo` CASCADE can
-    // commit between them — query 1 sees the chunked `manifests` row,
-    // query 2 sees no `manifest_data` → spurious InvariantViolation
-    // for what is semantically NotFound. A READ COMMITTED `BEGIN` does
-    // NOT fix that (each statement re-snapshots); LEFT JOIN does.
-    type ManifestRow = (Option<Vec<u8>>, Option<Vec<u8>>);
-    let row: Option<ManifestRow> = sqlx::query_as(
+    type Row = (
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<Vec<u8>>>,
+    );
+    let row: Option<Row> = sqlx::query_as(
         r#"
-        SELECT m.inline_blob, md.chunk_list
+        SELECT m.inline_blob,
+               md.chunk_list,
+               ni.root_node,
+               (SELECT array_agg(d.body)
+                  FROM directory_paths dp
+                  JOIN directories d USING (digest)
+                 WHERE dp.store_path_hash = m.store_path_hash) AS dir_bodies
         FROM manifests m
         LEFT JOIN manifest_data md USING (store_path_hash)
+        LEFT JOIN nar_index ni USING (store_path_hash)
         WHERE m.store_path_hash = $1 AND m.status = 'complete'
         "#,
     )
@@ -98,29 +119,36 @@ pub(crate) async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Opti
     .fetch_optional(pool)
     .await?;
 
-    match row {
-        None => Ok(None),
-        Some((Some(blob), _)) => Ok(Some(ManifestKind::Inline(Bytes::from(blob)))),
-        Some((None, Some(chunk_list))) => Ok(Some(ManifestKind::Chunked(decode_chunk_list(
-            store_path,
-            &chunk_list,
-        )?))),
+    let Some((inline_blob, chunk_list, root_node, dir_bodies)) = row else {
+        return Ok(None);
+    };
+    let kind = match (inline_blob, chunk_list) {
+        (Some(blob), _) => ManifestKind::Inline(Bytes::from(blob)),
+        (None, Some(chunk_list)) => {
+            ManifestKind::Chunked(decode_chunk_list(store_path, &chunk_list)?)
+        }
         // manifest exists + inline_blob NULL but NO manifest_data row:
         // invariant violation (store.typ says inline_blob NULL ⇔
-        // manifest_data exists). Single-snapshot read; this arm is now
+        // manifest_data exists). Single-snapshot read; this arm is
         // ONLY reachable via genuine corruption (manual DB surgery or
         // a CASCADE bug) — concurrent GC cannot produce it. Surface
         // it — don't silently return None (that would look like "path
         // not found", masking corruption).
-        Some((None, None)) => Err(MetadataError::InvariantViolation(format!(
-            "manifest for {store_path} has NULL inline_blob but no manifest_data row"
-        ))),
-    }
+        (None, None) => {
+            return Err(MetadataError::InvariantViolation(format!(
+                "manifest for {store_path} has NULL inline_blob but no manifest_data row"
+            )));
+        }
+    };
+    // A NULL root_node covers both "no nar_index row" (LEFT JOIN miss)
+    // and a pre-ADR-022 row whose nullable root_node column is NULL —
+    // either way the framing cannot be regenerated.
+    let dag = root_node.map(|root| (root, dir_bodies.unwrap_or_default()));
+    Ok(Some((kind, dag)))
 }
 
 /// Deserialize a `manifest_data.chunk_list` blob into the
-/// `ManifestKind::Chunked` tuple shape. Shared by `get_manifest` and
-/// `get_manifest_batch`.
+/// `ManifestKind::Chunked` tuple shape for `get_manifest`.
 fn decode_chunk_list(store_path: &str, chunk_list: &[u8]) -> Result<Vec<([u8; 32], u32)>> {
     let manifest = crate::manifest::Manifest::deserialize(chunk_list).map_err(|source| {
         MetadataError::CorruptManifest {
@@ -208,83 +236,6 @@ pub(crate) async fn query_path_info_batch(
         .collect())
 }
 
-/// Batch [`get_manifest`] + [`query_path_info`]: one call → (PathInfo,
-/// ManifestKind) for N paths.
-///
-/// I-110c: the builder's FUSE-warm stat loop drives one `GetPath` per
-/// input path; each GetPath does TWO PG lookups (narinfo + manifest).
-/// One `BatchGetManifest` before the loop collapses ~1600 PG hits to
-/// ONE (`= ANY(hashes)` on narinfo+manifests `LEFT JOIN
-/// manifest_data`).
-///
-/// Returns `(path, Option<(info, manifest)>)` per input, in INPUT
-/// ORDER. `None` = no complete manifest. Same `status='complete'`
-/// filter and PK-probe shape (I-078) as the single-path queries.
-pub(crate) type ManifestBatchEntry = (String, Option<(ValidatedPathInfo, ManifestKind)>);
-
-#[instrument(skip(pool, store_paths), fields(count = store_paths.len()))]
-pub(crate) async fn get_manifest_batch(
-    pool: &PgPool,
-    store_paths: &[String],
-) -> Result<Vec<ManifestBatchEntry>> {
-    if store_paths.is_empty() {
-        return Ok(Vec::new());
-    }
-    let hashes = batch_hashes(store_paths)?;
-
-    // Single query: narinfo + manifests.inline_blob + manifest_data.
-    // chunk_list via LEFT JOIN — one statement = one MVCC snapshot. A
-    // separate manifest_data query (the previous shape) raced with GC
-    // sweep: one chunked path GC'd between the two queries failed the
-    // ENTIRE batch with InvariantViolation. See `get_manifest` for the
-    // full READ COMMITTED reasoning.
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        #[sqlx(flatten)]
-        narinfo: NarinfoRow,
-        inline_blob: Option<Vec<u8>>,
-        chunk_list: Option<Vec<u8>>,
-    }
-    let rows: Vec<Row> = sqlx::query_as(narinfo_complete_select!(
-        "n.store_path_hash = ANY($1)",
-        ", m.inline_blob, md.chunk_list",
-        // ON, not USING: `n` and `m` both expose store_path_hash on
-        // the left side after the INNER JOIN ON, so USING is ambiguous
-        // (PG 42702 "appears more than once in left table").
-        "LEFT JOIN manifest_data md ON md.store_path_hash = m.store_path_hash"
-    ))
-    .bind(&hashes)
-    .fetch_all(pool)
-    .await?;
-
-    // Index by store_path. Same 4-arm match as `get_manifest`.
-    let mut by_path: std::collections::HashMap<String, (ValidatedPathInfo, ManifestKind)> =
-        std::collections::HashMap::with_capacity(rows.len());
-    for row in rows {
-        let info = row.narinfo.try_into_validated()?;
-        let path = info.store_path.to_string();
-        let kind = match (row.inline_blob, row.chunk_list) {
-            (Some(blob), _) => ManifestKind::Inline(Bytes::from(blob)),
-            (None, Some(chunk_list)) => {
-                ManifestKind::Chunked(decode_chunk_list(&path, &chunk_list)?)
-            }
-            // Single-snapshot read; only reachable via genuine
-            // corruption — same arm as `get_manifest`. Fail the batch.
-            (None, None) => {
-                return Err(MetadataError::InvariantViolation(format!(
-                    "manifest for {path} has NULL inline_blob but no manifest_data row"
-                )));
-            }
-        };
-        by_path.insert(path, (info, kind));
-    }
-
-    Ok(store_paths
-        .iter()
-        .map(|p| (p.clone(), by_path.remove(p)))
-        .collect())
-}
-
 /// Batch check which store paths are missing.
 ///
 /// "Missing" means no manifests row with `status = 'complete'`. Paths stuck
@@ -334,10 +285,9 @@ pub(crate) async fn find_missing_paths(
 /// Uses `idx_narinfo_nar_hash` (migration 002_store.sql). Without it, every NAR
 /// fetch would seq-scan narinfo.
 ///
-/// Currently no production caller (the substituter's dedup check was
-/// subsumed by `claim_placeholder`'s `AlreadyComplete` arm); kept for the
-/// planned binary-cache HTTP server.
-#[allow(dead_code)]
+/// `GetNarIndex` uses this to name the affected path when reporting a
+/// missing index row as DATA_LOSS. (The substituter's dedup check was
+/// subsumed by `claim_placeholder`'s `AlreadyComplete` arm.)
 #[instrument(skip(pool), fields(nar_hash = hex::encode(nar_hash)))]
 pub(crate) async fn path_by_nar_hash(pool: &PgPool, nar_hash: &[u8; 32]) -> Result<Option<String>> {
     // Multiple paths CAN have the same nar_hash (two fetchurl of the
@@ -401,11 +351,9 @@ pub(crate) async fn query_by_hash_part(
 /// AddSignatures doesn't dedup, so we're NOT breaking client expectations
 /// — dedup is an improvement, not a behavior change clients could observe.
 ///
-/// `RETURNING cardinality` lets us check the post-dedup count in one
-/// round-trip. Over `MAX_SIGNATURES` after dedup → the client sent novel
-/// garbage sigs AND we grew past the cap → reject with
-/// `ResourceExhausted` (maps to gRPC `RESOURCE_EXHAUSTED` — client
-/// backs off, operator alerts on the status code).
+/// Over `MAX_SIGNATURES` after dedup → reject with `ResourceExhausted`
+/// (maps to gRPC `RESOURCE_EXHAUSTED` — client backs off, operator
+/// alerts on the status code).
 ///
 /// Returns rows updated (0 = path not found, 1 = appended). Caller maps
 /// 0 to NOT_FOUND.
@@ -471,6 +419,151 @@ pub(crate) async fn append_signatures(
             Ok(1)
         }
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// NAR index (ADR-022 P0551) — `nar_index` table primitives.
+//
+// `entries` is an encoded `rio.types.NarIndex` proto. The metadata
+// layer treats it as opaque bytes: encode/decode lives in
+// `nar_index.rs`. Keyed by `store_path_hash` with FK→`manifests`
+// `ON DELETE CASCADE`, so GC removes the index row alongside the
+// manifest.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Persist a computed NAR index, the Directory DAG, and the
+/// `file_blobs`/`directory_paths` junctions: `nar_index` +
+/// `directories` (refcount UPSERT) + `directory_paths` + `file_blobs`.
+/// Called from inside the manifest-complete transaction (ADR-022 §6's
+/// eager indexing: the index is derived from the NAR bytes in hand at
+/// ingest, because a blob-aligned chunk list cannot be re-indexed
+/// after the fact). Idempotent: a second call is a no-op so the
+/// directory refcounts establish exactly once per path. Tenancy is
+/// not materialized here — DirectoryService resolves it at read time
+/// from `path_tenants` (a tenant added after first-index needs no
+/// resync).
+///
+/// The caller MUST have already row-locked the `manifests` row (the
+/// status-flip UPDATE does) so a concurrent GC of the same path
+/// serializes on it. `dag.directories`/`dag.file_blobs` are
+/// digest-sorted by [`crate::castore::build`]
+/// (`r[store.chunk.lock-order]`).
+// r[impl store.index.table-cascade]
+// r[impl store.castore.gc]
+// r[impl store.castore.tenant-scope+3]
+pub async fn set_nar_index_in_conn(
+    conn: &mut sqlx::PgConnection,
+    store_path_hash: &[u8],
+    entries: &[u8],
+    dag: &crate::castore::DirectoryDag,
+) -> Result<()> {
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO nar_index (store_path_hash, entries, root_node)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (store_path_hash) DO NOTHING
+        "#,
+    )
+    .bind(store_path_hash)
+    .bind(entries)
+    .bind(&dag.root_node)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected()
+        > 0;
+
+    // First index of a path establishes its directory refcounts +
+    // per-path junctions; re-indexing must not double-count.
+    if inserted {
+        if !dag.directories.is_empty() {
+            let (dir_digests, dir_bodies): (Vec<Vec<u8>>, Vec<Vec<u8>>) = dag
+                .directories
+                .iter()
+                .map(|(d, b)| (d.to_vec(), b.clone()))
+                .unzip();
+            sqlx::query(
+                r#"
+                INSERT INTO directories (digest, body, refcount)
+                SELECT u.digest, u.body, 1
+                  FROM UNNEST($1::bytea[], $2::bytea[]) AS u(digest, body)
+                ON CONFLICT (digest) DO UPDATE
+                   SET refcount = directories.refcount + 1
+                "#,
+            )
+            .bind(&dir_digests)
+            .bind(&dir_bodies)
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query(
+                r#"
+                INSERT INTO directory_paths (digest, store_path_hash)
+                SELECT u.digest, $2
+                  FROM UNNEST($1::bytea[]) AS u(digest)
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(&dir_digests)
+            .bind(store_path_hash)
+            .execute(&mut *conn)
+            .await?;
+        }
+        if !dag.file_blobs.is_empty() {
+            let mut blob_digests: Vec<Vec<u8>> = Vec::with_capacity(dag.file_blobs.len());
+            let mut blob_offsets: Vec<i64> = Vec::with_capacity(dag.file_blobs.len());
+            let mut blob_sizes: Vec<i64> = Vec::with_capacity(dag.file_blobs.len());
+            for (d, o, s) in &dag.file_blobs {
+                blob_digests.push(d.to_vec());
+                // The offset is the file's position in the BLOB STREAM
+                // (concatenated file contents in walk order), not the
+                // NAR — see `DirectoryDag::file_blobs`. The column name
+                // predates the format change. BIGINT; a > i64::MAX
+                // value cannot exist (NAR sizes are bounded well below
+                // 8 EiB).
+                blob_offsets.push(i64::try_from(*o).unwrap_or(i64::MAX));
+                blob_sizes.push(i64::try_from(*s).unwrap_or(i64::MAX));
+            }
+            sqlx::query(
+                r#"
+                INSERT INTO file_blobs (digest, store_path_hash, nar_offset, size)
+                SELECT u.digest, $2, u.nar_offset, u.size
+                  FROM UNNEST($1::bytea[], $3::bigint[], $4::bigint[]) AS u(digest, nar_offset, size)
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(&blob_digests)
+            .bind(store_path_hash)
+            .bind(&blob_offsets)
+            .bind(&blob_sizes)
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Fetch the encoded `NarIndex` by NAR hash — the wire key
+/// `GetNarIndex` receives. Asymmetric with [`set_nar_index_in_conn`]
+/// (which takes the table PK `store_path_hash`): the table is GC-keyed
+/// on the path; the RPC is content-keyed on the NAR. Multiple paths can
+/// share a `nar_hash` (FOD dedup); they all have identical NAR bytes →
+/// identical index, so `LIMIT 1` is correct. `None` = path absent,
+/// not yet complete, or GC'd.
+#[instrument(skip(pool), fields(nar_hash = hex::encode(nar_hash)))]
+pub async fn get_nar_index(pool: &PgPool, nar_hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+    let row: Option<(Vec<u8>,)> = sqlx::query_as(
+        r#"
+        SELECT i.entries
+        FROM nar_index i
+        INNER JOIN narinfo n ON i.store_path_hash = n.store_path_hash
+        INNER JOIN manifests m ON i.store_path_hash = m.store_path_hash
+        WHERE n.nar_hash = $1 AND m.status = 'complete'
+        LIMIT 1
+        "#,
+    )
+    .bind(nar_hash.as_slice())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(b,)| b))
 }
 
 #[cfg(test)]
@@ -587,7 +680,7 @@ mod tests {
         // inline_blob=NULL but we DON'T insert manifest_data.
         seed_complete(&db.pool, &path, None).await;
 
-        let err = get_manifest(&db.pool, &path).await.unwrap_err();
+        let err = get_manifest_with_dag(&db.pool, &path).await.unwrap_err();
         assert!(
             matches!(&err, MetadataError::InvariantViolation(s) if s.contains("NULL inline_blob")),
             "expected InvariantViolation, got {err:?}"
@@ -611,111 +704,34 @@ mod tests {
             .await
             .unwrap();
 
-        let err = get_manifest(&db.pool, &path).await.unwrap_err();
+        let err = get_manifest_with_dag(&db.pool, &path).await.unwrap_err();
         assert!(
             matches!(&err, MetadataError::CorruptManifest { store_path, .. } if *store_path == path),
             "expected CorruptManifest, got {err:?}"
         );
     }
 
-    /// I-110c: batch manifest returns one entry per input, in input
-    /// order, covering inline + chunked + missing + uploading. Mirrors
-    /// `query_path_info_batch_order_and_misses` for the manifest side.
-    #[tokio::test]
-    async fn get_manifest_batch_order_and_kinds() {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-        let p_inline = test_store_path("mb-inline");
-        let p_chunked = test_store_path("mb-chunked");
-        let p_missing = test_store_path("mb-missing");
-        let p_uploading = test_store_path("mb-uploading");
-
-        seed_complete(&db.pool, &p_inline, Some(b"inline blob")).await;
-        let (ph, _) = seed_complete(&db.pool, &p_chunked, None).await;
-        let manifest = crate::manifest::Manifest {
-            entries: vec![crate::manifest::ManifestEntry {
-                hash: [0x22; 32],
-                size: 8192,
-            }],
-        }
-        .serialize();
-        sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
-            .bind(&ph)
-            .bind(&manifest)
-            .execute(&db.pool)
-            .await
-            .unwrap();
-        StoreSeed::raw_path(&p_uploading)
-            .with_manifest_status("uploading")
-            .seed(&db.pool)
-            .await;
-
-        // Input order: [chunked, missing, inline, uploading].
-        let req = vec![
-            p_chunked.clone(),
-            p_missing.clone(),
-            p_inline.clone(),
-            p_uploading.clone(),
-        ];
-        let got = get_manifest_batch(&db.pool, &req).await.unwrap();
-
-        assert_eq!(got.len(), 4);
-        // chunked
-        assert_eq!(got[0].0, p_chunked);
-        let (info, kind) = got[0].1.as_ref().expect("chunked present");
-        assert_eq!(info.store_path.as_str(), p_chunked);
-        match kind {
-            ManifestKind::Chunked(e) => {
-                assert_eq!(e.len(), 1);
-                assert_eq!(e[0], ([0x22; 32], 8192));
-            }
-            _ => panic!("expected Chunked"),
-        }
-        // missing
-        assert_eq!(got[1].0, p_missing);
-        assert!(got[1].1.is_none(), "missing → None");
-        // inline
-        assert_eq!(got[2].0, p_inline);
-        let (info, kind) = got[2].1.as_ref().expect("inline present");
-        assert_eq!(info.store_path.as_str(), p_inline);
-        assert!(matches!(kind, ManifestKind::Inline(b) if &b[..] == b"inline blob"));
-        // uploading → invisible
-        assert_eq!(got[3].0, p_uploading);
-        assert!(got[3].1.is_none(), "uploading → None");
-
-        // Empty input → empty output.
-        assert!(get_manifest_batch(&db.pool, &[]).await.unwrap().is_empty());
-    }
-
-    /// I-110c: chunked path with NULL inline_blob but no manifest_data
-    /// row → batch surfaces the same InvariantViolation as
-    /// `get_manifest_invariant_violation` (corruption indicator, not a
-    /// per-path miss).
-    #[tokio::test]
-    async fn get_manifest_batch_invariant_violation() {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-        let path = test_store_path("mb-broken");
-        seed_complete(&db.pool, &path, None).await;
-        let err = get_manifest_batch(&db.pool, &[path]).await.unwrap_err();
-        assert!(
-            matches!(err, MetadataError::InvariantViolation(_)),
-            "expected InvariantViolation, got {err:?}"
-        );
-    }
-
-    /// `get_manifest` happy paths: inline and chunked both return
-    /// the right `ManifestKind` variant.
+    /// `get_manifest_with_dag` happy paths: inline and chunked both
+    /// return the right `ManifestKind` variant; a complete path with no
+    /// `nar_index` row reports `dag = None` (the genuine-corruption arm
+    /// the caller maps to DATA_LOSS), and a path with an index returns
+    /// its root + reachable bodies from the same snapshot.
     #[tokio::test]
     async fn get_manifest_inline_and_chunked() {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
-        // Inline: inline_blob set.
+        // Inline: inline_blob set, no castore index seeded → dag None.
         let inline_path = test_store_path("inline");
         seed_complete(&db.pool, &inline_path, Some(b"inline content")).await;
-        let kind = get_manifest(&db.pool, &inline_path).await.unwrap().unwrap();
+        let (kind, dag) = get_manifest_with_dag(&db.pool, &inline_path)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             matches!(kind, ManifestKind::Inline(b) if &b[..] == b"inline content"),
             "expected Inline variant"
         );
+        assert!(dag.is_none(), "no nar_index row → no DAG");
 
         // Chunked: inline_blob=NULL, valid manifest_data.
         let chunked_path = test_store_path("chunked");
@@ -733,7 +749,30 @@ mod tests {
             .execute(&db.pool)
             .await
             .unwrap();
-        let kind = get_manifest(&db.pool, &chunked_path)
+        // Seed a castore index for the chunked path: one root_node and
+        // one reachable directory body.
+        sqlx::query(
+            "INSERT INTO nar_index (store_path_hash, entries, root_node) VALUES ($1, $2, $3)",
+        )
+        .bind(&ph)
+        .bind(b"entries".as_slice())
+        .bind(b"root-node-bytes".as_slice())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO directories (digest, body, refcount) VALUES ($1, $2, 1)")
+            .bind(vec![0x22u8; 32])
+            .bind(b"dir-body".as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO directory_paths (digest, store_path_hash) VALUES ($1, $2)")
+            .bind(vec![0x22u8; 32])
+            .bind(&ph)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let (kind, dag) = get_manifest_with_dag(&db.pool, &chunked_path)
             .await
             .unwrap()
             .unwrap();
@@ -745,9 +784,12 @@ mod tests {
             }
             _ => panic!("expected Chunked variant"),
         }
+        let (root, bodies) = dag.expect("seeded nar_index means the DAG is present");
+        assert_eq!(root, b"root-node-bytes");
+        assert_eq!(bodies, vec![b"dir-body".to_vec()]);
 
         // Not found: well-formed but absent path → None (no row).
-        let missing = get_manifest(
+        let missing = get_manifest_with_dag(
             &db.pool,
             "/nix/store/00000000000000000000000000000000-absent",
         )
@@ -759,7 +801,7 @@ mod tests {
         // PK). Previously the text-filter query just returned None;
         // the gRPC layer's validate_store_path already rejects these.
         assert!(
-            get_manifest(&db.pool, "/nix/store/nonexistent")
+            get_manifest_with_dag(&db.pool, "/nix/store/nonexistent")
                 .await
                 .is_err()
         );
@@ -862,16 +904,25 @@ mod tests {
         );
     }
 
-    // r[verify store.api.batch-manifest+2]
-    /// `get_manifest` racing GC sweep's CASCADE delete: every result
-    /// is `Ok(Some(..))` or `Ok(None)`; never `InvariantViolation`.
-    /// Previously: two separate `.fetch_optional(pool)` calls under
-    /// READ COMMITTED could observe the manifests row but not the
-    /// (just-deleted) manifest_data row → spurious InvariantViolation.
-    /// After the LEFT JOIN rewrite this is structurally impossible
-    /// (one statement = one snapshot), so this test is deterministic.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn get_manifest_concurrent_gc_never_invariant_violation() {
+    /// `get_manifest_with_dag` racing GC sweep's CASCADE delete: the
+    /// result is the COMPLETE servable state (`Ok(Some((Chunked,
+    /// Some(full DAG))))`) or `Ok(None)`; never an error and never a
+    /// partial state (manifest visible but DAG missing or truncated —
+    /// the shape GetPath would misreport as DATA_LOSS / mid-stream
+    /// MissingDirectory for a path that was simply collected).
+    ///
+    /// The interleaving is driven explicitly rather than by timing: an
+    /// ACCESS EXCLUSIVE lock on `directories` (a table the sweep's
+    /// narinfo CASCADE never touches) parks any reader statement that
+    /// joins directory bodies, the sweep's DELETE then commits freely,
+    /// and only afterwards is the lock released. A multi-statement
+    /// reader (the old `get_manifest` + `get_castore_dag` composition)
+    /// deterministically observes the manifest from before the delete
+    /// and the DAG from after it; the single-statement read cannot —
+    /// whichever side of the delete its one snapshot lands on, the
+    /// manifest and the DAG come from the same snapshot.
+    #[tokio::test]
+    async fn get_manifest_with_dag_concurrent_gc_never_partial() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let path = test_store_path("gc-race");
         let (ph, _) = seed_complete(&db.pool, &path, None).await;
@@ -888,100 +939,70 @@ mod tests {
             .execute(&db.pool)
             .await
             .unwrap();
-
-        let pool_r = db.pool.clone();
-        let path_r = path.clone();
-        let reader = tokio::spawn(async move {
-            let mut results = Vec::with_capacity(200);
-            for _ in 0..200 {
-                results.push(get_manifest(&pool_r, &path_r).await);
-            }
-            results
-        });
-
-        let pool_d = db.pool.clone();
-        let deleter = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            // Sweep's effect: DELETE narinfo CASCADE → manifests +
-            // manifest_data gone atomically.
-            sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
-                .bind(&ph)
-                .execute(&pool_d)
-                .await
-                .unwrap();
-        });
-
-        let (results, _) = tokio::join!(reader, deleter);
-        for r in results.unwrap() {
-            match r {
-                Ok(Some(ManifestKind::Chunked(_))) | Ok(None) => {}
-                other => panic!(
-                    "get_manifest under concurrent GC must be Ok(Some(Chunked)) \
-                     or Ok(None); got {other:?}"
-                ),
-            }
-        }
-    }
-
-    /// Batch variant of the GC-race test: one stable inline path + one
-    /// chunked path being deleted. Batch never errors; the inline path
-    /// always resolves.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn get_manifest_batch_concurrent_gc_never_invariant_violation() {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-        let p_inline = test_store_path("gcb-inline");
-        let p_chunked = test_store_path("gcb-chunked");
-        seed_complete(&db.pool, &p_inline, Some(b"stable")).await;
-        let (ph, _) = seed_complete(&db.pool, &p_chunked, None).await;
-        let manifest = crate::manifest::Manifest {
-            entries: vec![crate::manifest::ManifestEntry {
-                hash: [0x44; 32],
-                size: 4096,
-            }],
-        }
-        .serialize();
-        sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
+        // Castore index: root node + one reachable directory body, so
+        // the servable state has a non-empty DAG to go missing.
+        sqlx::query(
+            "INSERT INTO nar_index (store_path_hash, entries, root_node) VALUES ($1, $2, $3)",
+        )
+        .bind(&ph)
+        .bind(b"entries".as_slice())
+        .bind(b"race-root".as_slice())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO directories (digest, body, refcount) VALUES ($1, $2, 1)")
+            .bind(vec![0x44u8; 32])
+            .bind(b"race-dir-body".as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO directory_paths (digest, store_path_hash) VALUES ($1, $2)")
+            .bind(vec![0x44u8; 32])
             .bind(&ph)
-            .bind(&manifest)
             .execute(&db.pool)
             .await
             .unwrap();
 
+        // Park any statement that reads directory bodies. AccessShare
+        // (what a SELECT takes) conflicts with AccessExclusive, so the
+        // reader cannot finish its body read until this commits; the
+        // sweep's CASCADE (which never touches `directories`) can.
+        let mut blocker = db.pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE directories IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
         let pool_r = db.pool.clone();
-        let req = vec![p_inline.clone(), p_chunked.clone()];
-        let reader = tokio::spawn(async move {
-            let mut results = Vec::with_capacity(200);
-            for _ in 0..200 {
-                results.push(get_manifest_batch(&pool_r, &req).await);
+        let path_r = path.clone();
+        let reader = tokio::spawn(async move { get_manifest_with_dag(&pool_r, &path_r).await });
+
+        // Let the reader reach the body read (a multi-statement reader
+        // has read the manifest by now and is parked on the lock; the
+        // single-statement reader is parked before producing anything),
+        // then commit the sweep's effect and release the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
+            .bind(&ph)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        blocker.commit().await.unwrap();
+
+        match reader.await.unwrap() {
+            Ok(Some((ManifestKind::Chunked(_), Some((root, bodies))))) => {
+                assert_eq!(root, b"race-root", "DAG root from the same snapshot");
+                assert_eq!(
+                    bodies,
+                    vec![b"race-dir-body".to_vec()],
+                    "DAG bodies from the same snapshot"
+                );
             }
-            results
-        });
-
-        let pool_d = db.pool.clone();
-        let deleter = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
-                .bind(&ph)
-                .execute(&pool_d)
-                .await
-                .unwrap();
-        });
-
-        let (results, _) = tokio::join!(reader, deleter);
-        for r in results.unwrap() {
-            let batch = r.expect("batch must never Err under concurrent GC");
-            assert_eq!(batch.len(), 2);
-            // Inline path always resolves (never deleted).
-            assert!(
-                matches!(&batch[0].1, Some((_, ManifestKind::Inline(b))) if &b[..] == b"stable"),
-                "stable inline path must always resolve"
-            );
-            // Chunked path: Some(Chunked) before delete, None after.
-            assert!(
-                matches!(&batch[1].1, Some((_, ManifestKind::Chunked(_))) | None),
-                "chunked path under GC: Some(Chunked) or None, got {:?}",
-                batch[1].1
-            );
+            Ok(None) => {}
+            other => panic!(
+                "get_manifest_with_dag under concurrent GC must be the complete \
+                 servable state or Ok(None); got {other:?}"
+            ),
         }
     }
 
@@ -1067,5 +1088,214 @@ mod tests {
             !joined.contains("Seq Scan on narinfo"),
             "EXPLAIN should NOT seq-scan narinfo; got:\n{joined}"
         );
+    }
+
+    /// Run `set_nar_index_in_conn` in its own transaction the way the
+    /// manifest-complete transaction would (minus the status flip the
+    /// seeded fixture already has).
+    async fn write_index(
+        pool: &PgPool,
+        hash: &[u8],
+        entries: &[u8],
+        dag: &crate::castore::DirectoryDag,
+    ) {
+        let mut tx = pool.begin().await.unwrap();
+        set_nar_index_in_conn(&mut tx, hash, entries, dag)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    /// `nar_index` round-trip + idempotency + FK cascade.
+    ///
+    /// - `set_nar_index_in_conn` (keyed by `store_path_hash`) →
+    ///   readable by `nar_hash`.
+    /// - A second write is a no-op (the directory refcounts establish
+    ///   exactly once per path).
+    /// - GC of the manifest (cascade from narinfo DELETE) removes the
+    ///   `nar_index` row — no dangling indices.
+    // r[verify store.index.table-cascade]
+    #[tokio::test]
+    async fn nar_index_roundtrip_and_cascade() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let p = test_store_path("nar-index-a");
+        // Distinct nar_hash != store_path_hash so the get-by-nar_hash
+        // JOIN is actually exercised, not coincidentally satisfied by
+        // the seed default (nar_hash == path_hash when unset).
+        let nar_hash = [0xBB; 32];
+        let hash_vec = StoreSeed::raw_path(&p)
+            .with_nar_hash(nar_hash)
+            .with_inline_blob(b"x".as_slice())
+            .seed(&db.pool)
+            .await;
+        let hash: [u8; 32] = hash_vec.as_slice().try_into().unwrap();
+
+        assert!(get_nar_index(&db.pool, &nar_hash).await.unwrap().is_none());
+
+        // Set (by store_path_hash) → readable (by nar_hash). The empty
+        // default DAG skips the castore inserts this test doesn't cover.
+        write_index(&db.pool, &hash, b"encoded-nar-index", &Default::default()).await;
+        assert_eq!(
+            get_nar_index(&db.pool, &nar_hash).await.unwrap().as_deref(),
+            Some(b"encoded-nar-index".as_slice())
+        );
+
+        // Idempotent: a second call is a NO-OP — the directory
+        // refcounts and tenant-junction rows are established once on
+        // first index, and re-running them would double-count.
+        write_index(&db.pool, &hash, b"v2", &Default::default()).await;
+        assert_eq!(
+            get_nar_index(&db.pool, &nar_hash).await.unwrap().as_deref(),
+            Some(b"encoded-nar-index".as_slice()),
+            "second set_nar_index_in_conn must not overwrite (no-op)"
+        );
+
+        // GC: DELETE narinfo cascades through manifests to nar_index.
+        sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
+            .bind(hash.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(get_nar_index(&db.pool, &nar_hash).await.unwrap().is_none());
+        let count: (i64,) = sqlx::query_as("SELECT count(*) FROM nar_index")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 0, "FK cascade must remove nar_index row");
+    }
+
+    /// The castore inserts: `directories` refcount UPSERT,
+    /// `directory_paths` + `file_blobs` junctions; cascade-cleanup on
+    /// narinfo DELETE. Tenancy is read-time (`path_tenants`), so a
+    /// tenant added after first-index sees the path's directories and
+    /// blobs.
+    // r[verify store.castore.gc]
+    // r[verify store.castore.tenant-scope+3]
+    #[tokio::test]
+    async fn nar_index_castore_inserts() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = crate::test_helpers::seed_tenant(&db.pool, "castore-tenant").await;
+
+        let p_a = test_store_path("castore-a");
+        let hash_a: [u8; 32] = StoreSeed::raw_path(&p_a)
+            .with_nar_hash([0xC1; 32])
+            .with_inline_blob(b"a".as_slice())
+            .seed(&db.pool)
+            .await
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let p_b = test_store_path("castore-b");
+        let hash_b: [u8; 32] = StoreSeed::raw_path(&p_b)
+            .with_nar_hash([0xC2; 32])
+            .with_inline_blob(b"b".as_slice())
+            .seed(&db.pool)
+            .await
+            .as_slice()
+            .try_into()
+            .unwrap();
+        for h in [&hash_a, &hash_b] {
+            sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+                .bind(h.as_slice())
+                .bind(tenant)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        // Both paths share a Directory body and a file blob.
+        let shared_dir = ([0x11u8; 32], b"dir-body".to_vec());
+        let unique_dir_a = ([0x22u8; 32], b"dir-body-a".to_vec());
+        let dag = |dirs: Vec<([u8; 32], Vec<u8>)>| crate::castore::DirectoryDag {
+            directories: dirs,
+            file_blobs: vec![([0x33u8; 32], 96, 8)],
+            root_node: vec![1, 2, 3],
+            ..Default::default()
+        };
+
+        write_index(
+            &db.pool,
+            &hash_a,
+            b"a",
+            &dag(vec![shared_dir.clone(), unique_dir_a.clone()]),
+        )
+        .await;
+        write_index(&db.pool, &hash_b, b"b", &dag(vec![shared_dir.clone()])).await;
+
+        // Shared directory refcount = 2; unique = 1.
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM directories WHERE digest = $1")
+            .bind(shared_dir.0.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 2);
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM directories WHERE digest = $1")
+            .bind(unique_dir_a.0.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 1);
+
+        // file_blobs is a junction: two rows for the shared digest.
+        let fb: i64 = sqlx::query_scalar("SELECT count(*) FROM file_blobs WHERE digest = $1")
+            .bind([0x33u8; 32].as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(fb, 2);
+
+        // Per-path linkage: shared directory has two `directory_paths`
+        // rows (one per containing NAR).
+        let dp: i64 = sqlx::query_scalar("SELECT count(*) FROM directory_paths WHERE digest = $1")
+            .bind(shared_dir.0.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(dp, 2);
+
+        // A tenant gaining a `path_tenants` row after first-index sees
+        // the directory immediately (tenancy is read-time, not a
+        // first-index snapshot).
+        let late_tenant = crate::test_helpers::seed_tenant(&db.pool, "castore-late").await;
+        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+            .bind(hash_a.as_slice())
+            .bind(late_tenant)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let visible: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM directories d \
+               JOIN directory_paths dp ON dp.digest = d.digest \
+               JOIN path_tenants pt ON pt.store_path_hash = dp.store_path_hash \
+              WHERE d.digest = $1 AND pt.tenant_id = $2",
+        )
+        .bind(shared_dir.0.as_slice())
+        .bind(late_tenant)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(visible, 1, "late-arriving tenant sees the directory");
+
+        // root_node persisted.
+        let rn: Vec<u8> =
+            sqlx::query_scalar("SELECT root_node FROM nar_index WHERE store_path_hash = $1")
+                .bind(hash_a.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(rn, vec![1, 2, 3]);
+
+        // GC of A: file_blobs row for A cascades; B's survives.
+        sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
+            .bind(hash_a.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let fb: i64 = sqlx::query_scalar("SELECT count(*) FROM file_blobs WHERE digest = $1")
+            .bind([0x33u8; 32].as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(fb, 1, "B's file_blobs row survives GC of A");
     }
 }

@@ -21,11 +21,303 @@
       "doc": "Tenant JWT + assignment HMAC token sign/verify, and the gRPC"
     }
   ],
+  "rio-build-cli": [
+    {
+      "path": "acks.rs",
+      "depth": 0,
+      "doc": "Persistent cluster-ack table (ADR-024 \"the persistent asset\": a"
+    },
+    {
+      "path": "bin/",
+      "depth": 0,
+      "doc": ""
+    },
+    {
+      "path": "bin/eval-harness.rs",
+      "depth": 1,
+      "doc": "Coordinator-side test harness for the rio-eval parent (ADR-024"
+    },
+    {
+      "path": "config.rs",
+      "depth": 0,
+      "doc": "`rio build` client configuration."
+    },
+    {
+      "path": "coordinator/",
+      "depth": 0,
+      "doc": "The pipelined coordinator (ADR-024 stages 1–5)."
+    },
+    {
+      "path": "coordinator/clients.rs",
+      "depth": 1,
+      "doc": "Cluster connections for the coordinator: one channel to the"
+    },
+    {
+      "path": "coordinator/faillog.rs",
+      "depth": 1,
+      "doc": "Failure replay: when a build fail-fasts on a derivation that already"
+    },
+    {
+      "path": "coordinator/graph.rs",
+      "depth": 1,
+      "doc": "The coordinator's global digest state: fold (stage 1) and the"
+    },
+    {
+      "path": "coordinator/submit.rs",
+      "depth": 1,
+      "doc": "Stage 4: per-root submission on the all-acked gate, with client"
+    },
+    {
+      "path": "coordinator/upload.rs",
+      "depth": 1,
+      "doc": "Stages 2+3: negotiate presence (bulk `Has` per object kind,"
+    },
+    {
+      "path": "evalchan.rs",
+      "depth": 0,
+      "doc": "The coordinator's end of the worker channel: typed frame I/O over"
+    },
+    {
+      "path": "fetch.rs",
+      "depth": 0,
+      "doc": "Client-CAS materialization of build outputs through the read path,"
+    },
+    {
+      "path": "framing.rs",
+      "depth": 0,
+      "doc": "Length-delimited proto frames over an `AsyncRead`/`AsyncWrite` fd"
+    },
+    {
+      "path": "import.rs",
+      "depth": 0,
+      "doc": "Default fetch path: import completed build outputs into the local"
+    },
+    {
+      "path": "lib.rs",
+      "depth": 0,
+      "doc": "`rio build` — the native-protocol build client (ADR-024 P3, the"
+    },
+    {
+      "path": "main.rs",
+      "depth": 0,
+      "doc": "`rio` — the native-protocol build client binary (ADR-024 P3)."
+    },
+    {
+      "path": "render/",
+      "depth": 0,
+      "doc": "Stage 5: build-log rendering."
+    },
+    {
+      "path": "render/ci.rs",
+      "depth": 1,
+      "doc": "Non-interactive (CI) renderer."
+    },
+    {
+      "path": "render/plain.rs",
+      "depth": 1,
+      "doc": "The status-line renderer: one line per state edge (cached drvs are"
+    },
+    {
+      "path": "render/term.rs",
+      "depth": 1,
+      "doc": "Terminal/CI output helpers shared by the build-log renderers."
+    },
+    {
+      "path": "render/tty.rs",
+      "depth": 1,
+      "doc": "Interactive (TTY) renderer."
+    }
+  ],
   "rio-builder": [
     {
       "path": "banner.rs",
       "depth": 0,
       "doc": "Worker log banner: a `rio:`-prefixed header at the start of every"
+    },
+    {
+      "path": "bin/",
+      "depth": 0,
+      "doc": ""
+    },
+    {
+      "path": "bin/fsbench/",
+      "depth": 1,
+      "doc": ""
+    },
+    {
+      "path": "bin/fsbench/dataset.rs",
+      "depth": 2,
+      "doc": "The dataset: a re-rooted REAL closure."
+    },
+    {
+      "path": "bin/fsbench/main.rs",
+      "depth": 2,
+      "doc": "fsbench — castore-FUSE micro-benchmark (P0594)."
+    },
+    {
+      "path": "bin/fsbench/phases.rs",
+      "depth": 2,
+      "doc": "The measurement primitives: read-storm, open-storm, randread, and"
+    },
+    {
+      "path": "bin/fsbench/stats.rs",
+      "depth": 2,
+      "doc": "Percentile math for latency samples."
+    },
+    {
+      "path": "bin/rio-mountd.rs",
+      "depth": 1,
+      "doc": "`rio-mountd` — privileged per-node broker for castore-FUSE."
+    },
+    {
+      "path": "bin/spike_mountd_client.rs",
+      "depth": 1,
+      "doc": "VM-test client for the production `rio-mountd` daemon (P0567)."
+    },
+    {
+      "path": "bin/xfstests_runner/",
+      "depth": 1,
+      "doc": ""
+    },
+    {
+      "path": "bin/xfstests_runner/checks/",
+      "depth": 2,
+      "doc": ""
+    },
+    {
+      "path": "bin/xfstests_runner/checks/dir_locks.rs",
+      "depth": 3,
+      "doc": "Directory-stream cookies, POSIX/flock locks, and second-uid DAC —"
+    },
+    {
+      "path": "bin/xfstests_runner/checks/errno_battery.rs",
+      "depth": 3,
+      "doc": "Error-path checks: permission enforcement for the unprivileged"
+    },
+    {
+      "path": "bin/xfstests_runner/checks/io_paths.rs",
+      "depth": 3,
+      "doc": "Alternate read-path checks: mmap, splice(2), copy_file_range(2), and"
+    },
+    {
+      "path": "bin/xfstests_runner/checks/meta.rs",
+      "depth": 3,
+      "doc": "Metadata checks: mount layout, readdir, inode identity, file kinds,"
+    },
+    {
+      "path": "bin/xfstests_runner/checks/read.rs",
+      "depth": 3,
+      "doc": "Read-path checks: byte integrity on the cold (streaming) and warm"
+    },
+    {
+      "path": "bin/xfstests_runner/checks/support.rs",
+      "depth": 3,
+      "doc": "Shared types and assertion helpers for the check modules: the [`Ctx`]"
+    },
+    {
+      "path": "bin/xfstests_runner/checks/walker.rs",
+      "depth": 3,
+      "doc": "Tree-walk identity checks: per-path directory inodes, honest link"
+    },
+    {
+      "path": "bin/xfstests_runner/checks/write_attack.rs",
+      "depth": 3,
+      "doc": "Page-cache write attacks that never go through a FUSE write op, so"
+    },
+    {
+      "path": "bin/xfstests_runner/checks/xattr_statx.rs",
+      "depth": 3,
+      "doc": "Extended-attribute read legs and statx field correctness."
+    },
+    {
+      "path": "bin/xfstests_runner/checks.rs",
+      "depth": 2,
+      "doc": "The check registry — the table of contents of every ported check."
+    },
+    {
+      "path": "bin/xfstests_runner/main.rs",
+      "depth": 2,
+      "doc": "xfstests-port runner for the castore-FUSE (`vm-castore-xfstests`)."
+    },
+    {
+      "path": "bin/xfstests_runner/manifest.rs",
+      "depth": 2,
+      "doc": "Expected-content manifest: the oracle for every xfstests check."
+    },
+    {
+      "path": "castore_fuse/",
+      "depth": 0,
+      "doc": "Castore-FUSE lazy `/nix/store` (ADR-022 §2)."
+    },
+    {
+      "path": "castore_fuse/circuit.rs",
+      "depth": 1,
+      "doc": "Castore-FUSE fetch circuit breaker. **std::sync ONLY** — FUSE"
+    },
+    {
+      "path": "castore_fuse/mountd.rs",
+      "depth": 1,
+      "doc": "`rio-mountd` — the privileged per-node broker for castore-FUSE."
+    },
+    {
+      "path": "castore_fuse/mountd_client.rs",
+      "depth": 1,
+      "doc": "In-process client for the rio-mountd UDS protocol."
+    },
+    {
+      "path": "castore_fuse/mountd_proto.rs",
+      "depth": 1,
+      "doc": "UDS wire protocol between the unprivileged builder and `rio-mountd`."
+    },
+    {
+      "path": "castore_fuse/open.rs",
+      "depth": 1,
+      "doc": "The castore-FUSE `open()` data path (ADR-022 §2.6–2.7)."
+    },
+    {
+      "path": "castore_fuse/session.rs",
+      "depth": 1,
+      "doc": "Client-side mount/serve assembly for the castore-FUSE (ADR-022 §2.5,"
+    },
+    {
+      "path": "castore_fuse/stream.rs",
+      "depth": 1,
+      "doc": "Streaming `open()` for large files (ADR-022 §2.8)."
+    },
+    {
+      "path": "castore_fuse/sweep.rs",
+      "depth": 1,
+      "doc": "Disk-pressure LRU sweep over the mountd-owned shared caches."
+    },
+    {
+      "path": "castore_fuse/testing.rs",
+      "depth": 1,
+      "doc": "Test scaffolding shared by the castore-FUSE unit tests."
+    },
+    {
+      "path": "castore_fuse/tree.rs",
+      "depth": 1,
+      "doc": "Mount-time Directory-DAG prefetch and the inode table (ADR-022"
+    },
+    {
+      "path": "castore_fuse/uring/",
+      "depth": 1,
+      "doc": "fuse-over-io_uring transport for the castore-FUSE (Linux 6.14+)."
+    },
+    {
+      "path": "castore_fuse/uring/abi.rs",
+      "depth": 2,
+      "doc": "FUSE wire format for the fuse-over-io_uring transport."
+    },
+    {
+      "path": "castore_fuse/uring/dispatch.rs",
+      "depth": 2,
+      "doc": "Request dispatch for the castore-FUSE — every FUSE request the"
+    },
+    {
+      "path": "castore_fuse/uring/sys.rs",
+      "depth": 2,
+      "doc": "Minimal raw io_uring layer for the fuse-over-io_uring transport."
     },
     {
       "path": "cgroup.rs",
@@ -83,51 +375,6 @@
       "doc": "`RIO_BUILDER_SCRIPT` test fixture (feature `test-fixtures`)."
     },
     {
-      "path": "fuse/",
-      "depth": 0,
-      "doc": "FUSE store daemon for rio-builder."
-    },
-    {
-      "path": "fuse/attr.rs",
-      "depth": 1,
-      "doc": "FUSE attribute helpers."
-    },
-    {
-      "path": "fuse/cache.rs",
-      "depth": 1,
-      "doc": "Local cache for FUSE store paths backed by the pod's emptyDir."
-    },
-    {
-      "path": "fuse/circuit.rs",
-      "depth": 1,
-      "doc": "FUSE fetch circuit breaker. **std::sync ONLY** — FUSE callbacks run on"
-    },
-    {
-      "path": "fuse/fetch/",
-      "depth": 1,
-      "doc": "Fetch and materialize store paths into the local cache."
-    },
-    {
-      "path": "fuse/fetch/client.rs",
-      "depth": 2,
-      "doc": "gRPC client bundle for FUSE fetches."
-    },
-    {
-      "path": "fuse/inode.rs",
-      "depth": 1,
-      "doc": "Inode-to-path bidirectional map with kernel lookup refcounting."
-    },
-    {
-      "path": "fuse/ops.rs",
-      "depth": 1,
-      "doc": "FUSE `Filesystem` trait implementation for `NixStoreFs`."
-    },
-    {
-      "path": "fuse/read.rs",
-      "depth": 1,
-      "doc": "File content serving and prefetch for the FUSE store."
-    },
-    {
       "path": "health.rs",
       "depth": 0,
       "doc": "HTTP health endpoints for K8s probes."
@@ -145,7 +392,7 @@
     {
       "path": "lib.rs",
       "depth": 0,
-      "doc": "Build executor with FUSE store for rio-build."
+      "doc": "Build executor with a per-build castore-FUSE store for rio-build."
     },
     {
       "path": "log_stream.rs",
@@ -185,7 +432,7 @@
     {
       "path": "runtime/prefetch.rs",
       "depth": 1,
-      "doc": "PrefetchHint handling: warm the FUSE cache and ACK the scheduler."
+      "doc": "PrefetchHint handling: ACK the scheduler's warm-gate."
     },
     {
       "path": "runtime/result.rs",
@@ -203,6 +450,11 @@
       "doc": "Single-build occupancy tracking and cancellation."
     },
     {
+      "path": "store_fetch.rs",
+      "depth": 0,
+      "doc": "Store-fetch primitives shared by the executor and the castore-FUSE."
+    },
+    {
       "path": "synth_db.rs",
       "depth": 0,
       "doc": "Synthetic Nix store SQLite database generation."
@@ -213,19 +465,24 @@
       "doc": "Output upload to rio-store after build completion."
     },
     {
-      "path": "upload/batch.rs",
+      "path": "upload/agreement_tests.rs",
       "depth": 1,
-      "doc": "Atomic multi-output upload via `PutPathBatch`."
+      "doc": "Walk ↔ store agreement tests (P0586)."
+    },
+    {
+      "path": "upload/chunked.rs",
+      "depth": 1,
+      "doc": "`PutPathChunked` client: walk every output once, probe the store"
     },
     {
       "path": "upload/common.rs",
       "depth": 1,
-      "doc": "Mechanics shared by [`single`](super::single) and [`batch`](super::batch):"
+      "doc": "Mechanics shared across the upload pipeline (and a few callers"
     },
     {
-      "path": "upload/single.rs",
+      "path": "upload/walk.rs",
       "depth": 1,
-      "doc": "Per-output `PutPath` upload with retry + concurrent-put adoption."
+      "doc": "Fused output walk (ADR-022 §6.1, P0586)."
     }
   ],
   "rio-cli": [
@@ -335,6 +592,16 @@
       "path": "observability.rs",
       "depth": 0,
       "doc": "Observability setup: structured logging, Prometheus metrics, and optional"
+    },
+    {
+      "path": "pg_error.rs",
+      "depth": 0,
+      "doc": "Shared transient-vs-permanent PostgreSQL error classifier."
+    },
+    {
+      "path": "pg_iam.rs",
+      "depth": 0,
+      "doc": "RDS IAM database authentication: one [`TokenSource`] per database"
     },
     {
       "path": "s3.rs",
@@ -511,6 +778,78 @@
       "doc": "Pool CRD: spawns one-shot rio-builder Jobs (builder OR fetcher mode)."
     }
   ],
+  "rio-evalstore": [
+    {
+      "path": "dirblob.rs",
+      "depth": 0,
+      "doc": "Bottom-up canonicalization of an in-memory source tree into"
+    },
+    {
+      "path": "dircache.rs",
+      "depth": 0,
+      "doc": "Decoded-directory cache over the pack store (ADR-024 P1)."
+    },
+    {
+      "path": "evaljob/",
+      "depth": 0,
+      "doc": "The eval-parent side of the `rio.evaljob` worker channel (ADR-024"
+    },
+    {
+      "path": "evaljob/claim.rs",
+      "depth": 1,
+      "doc": "Advisory memfd claim table (ADR-024 \"sharing by fork order\"): a"
+    },
+    {
+      "path": "evaljob/framing.rs",
+      "depth": 1,
+      "doc": "Synchronous length-delimited proto framing — the blocking twin of"
+    },
+    {
+      "path": "evaljob/ifd.rs",
+      "depth": 1,
+      "doc": "The worker side of the IFD relay (ADR-024 \"IFD\"): a worker hitting"
+    },
+    {
+      "path": "evaljob/parent.rs",
+      "depth": 1,
+      "doc": "The eval-parent orchestration loop (ADR-024 P3b): fork-no-exec"
+    },
+    {
+      "path": "ffi.rs",
+      "depth": 0,
+      "doc": "`extern \"C\"` surface for the C++ shim (`shim/shim.cc`)."
+    },
+    {
+      "path": "fingerprint.rs",
+      "depth": 0,
+      "doc": "Stat-fingerprint table: one file in the CAS root, not per-path"
+    },
+    {
+      "path": "ingest/",
+      "depth": 0,
+      "doc": "Parallel source-tree ingest: one read per file, two hash planes."
+    },
+    {
+      "path": "ingest/pipeline.rs",
+      "depth": 1,
+      "doc": "Pipeline internals: shared work deque, byte-budget accounting, reader"
+    },
+    {
+      "path": "lib.rs",
+      "depth": 0,
+      "doc": "Client-side eval store: a persistent content-addressed cache (CAS) that"
+    },
+    {
+      "path": "stats.rs",
+      "depth": 0,
+      "doc": "Per-op count/bytes statistics, dumped to stderr on store drop when"
+    },
+    {
+      "path": "store.rs",
+      "depth": 0,
+      "doc": "The eval-store core: ingest, path computation + cross-checks, read-back."
+    }
+  ],
   "rio-gateway": [
     {
       "path": "config.rs",
@@ -612,6 +951,11 @@
   ],
   "rio-migrations": [
     {
+      "path": "ensure_roles.rs",
+      "depth": 0,
+      "doc": "Runner-owned role and grant management for `rio_app`."
+    },
+    {
       "path": "lib.rs",
       "depth": 0,
       "doc": "Single source of truth for database migrations."
@@ -664,9 +1008,19 @@
       "doc": "NAR (Nix ARchive) format reader and writer."
     },
     {
+      "path": "nar/frame.rs",
+      "depth": 1,
+      "doc": "NAR framing emitters for external walkers."
+    },
+    {
       "path": "nar/fs.rs",
       "depth": 1,
       "doc": "Filesystem ↔ NAR streaming."
+    },
+    {
+      "path": "nar/ls.rs",
+      "depth": 1,
+      "doc": "Streaming NAR index — `nar_ls`."
     },
     {
       "path": "nar/reader.rs",
@@ -749,7 +1103,49 @@
       "doc": "Nix store path types, parsing, and nixbase32 encoding."
     }
   ],
+  "rio-packstore": [
+    {
+      "path": "gc.rs",
+      "depth": 0,
+      "doc": "GC = mark + repack, one mechanism."
+    },
+    {
+      "path": "index.rs",
+      "depth": 0,
+      "doc": "The single index file: `digest → (pack, offset, len, kind)` plus"
+    },
+    {
+      "path": "lib.rs",
+      "depth": 0,
+      "doc": "Client-side pack store for the rio:// eval store (ADR-024 P1)."
+    },
+    {
+      "path": "lock.rs",
+      "depth": 0,
+      "doc": "flock(2) helpers."
+    },
+    {
+      "path": "record.rs",
+      "depth": 0,
+      "doc": "Self-describing, resyncable pack records."
+    },
+    {
+      "path": "segment.rs",
+      "depth": 0,
+      "doc": "Writer-owned segment packs."
+    }
+  ],
   "rio-proto": [
+    {
+      "path": "castore_util.rs",
+      "depth": 0,
+      "doc": "Helpers on the `rio.castore` wire types that both producers and"
+    },
+    {
+      "path": "chunk_reject.rs",
+      "depth": 0,
+      "doc": "The `PutPathChunked` missing-chunk reject contract (ADR-024)."
+    },
     {
       "path": "client/",
       "depth": 0,
@@ -771,6 +1167,11 @@
       "doc": "`StoreService` NAR-streaming and high-level RPC helpers."
     },
     {
+      "path": "derivation_util.rs",
+      "depth": 0,
+      "doc": "Helpers on the `rio.drv.v1.Derivation` wire type: canonical"
+    },
+    {
       "path": "interceptor.rs",
       "depth": 0,
       "doc": "W3C trace-context propagation across gRPC boundaries."
@@ -784,6 +1185,11 @@
       "path": "status.rs",
       "depth": 0,
       "doc": "Bidirectional mapping between the nix-daemon wire `BuildStatus`"
+    },
+    {
+      "path": "submit_reject.rs",
+      "depth": 0,
+      "doc": "The `SubmitBuild` stale-digest reject contract (ADR-024)."
     },
     {
       "path": "validated.rs",
@@ -968,9 +1374,19 @@
       "doc": "Build CRUD + status transitions — `builds` table."
     },
     {
+      "path": "db/closure.rs",
+      "depth": 1,
+      "doc": "Transitive input-closure walk for `WorkAssignment.input_roots`."
+    },
+    {
       "path": "db/derivations.rs",
       "depth": 1,
       "doc": "Per-derivation state + poison tracking — `derivations` table."
+    },
+    {
+      "path": "db/drv_blobs.rs",
+      "depth": 1,
+      "doc": "drv_blobs lookups — ADR-024 digest-bearing submission verification."
     },
     {
       "path": "db/history.rs",
@@ -1013,9 +1429,24 @@
       "doc": "Shared actor-liveness and leader guards for gRPC handlers."
     },
     {
+      "path": "grpc/derivation_log.rs",
+      "depth": 1,
+      "doc": "`SchedulerService.GetDerivationLog` — tenant-facing stored-log reads."
+    },
+    {
+      "path": "grpc/digest_submit.rs",
+      "depth": 1,
+      "doc": "Digest-bearing `SubmitBuild` handling (ADR-024 P2a)."
+    },
+    {
       "path": "grpc/executor_service.rs",
       "depth": 1,
       "doc": "`ExecutorService` gRPC implementation for [`SchedulerGrpc`]."
+    },
+    {
+      "path": "grpc/paginate.rs",
+      "depth": 1,
+      "doc": "Paginated `SubmitBuild` assembly (ADR-024 P2a)."
     },
     {
       "path": "grpc/scheduler_service.rs",
@@ -1175,14 +1606,29 @@
       "doc": "Per-replica admission gate for `try_substitute_on_miss`."
     },
     {
-      "path": "backend.rs",
+      "path": "backend/",
       "depth": 0,
       "doc": "Chunk storage backends."
+    },
+    {
+      "path": "backend/tiered.rs",
+      "depth": 1,
+      "doc": "Two-tier chunk backend: per-AZ S3 Express read-through cache over"
     },
     {
       "path": "cas.rs",
       "depth": 0,
       "doc": "Chunked content-addressable storage orchestration."
+    },
+    {
+      "path": "castore.rs",
+      "depth": 0,
+      "doc": "Directory merkle layer (ADR-022 §8): bottom-up `dir_digest` pass"
+    },
+    {
+      "path": "castore_nar.rs",
+      "depth": 0,
+      "doc": "Castore Directory DAG → NAR byte stream (the inverse of"
     },
     {
       "path": "chunker.rs",
@@ -1207,7 +1653,7 @@
     {
       "path": "gc/drain.rs",
       "depth": 1,
-      "doc": "Drain task: consume `pending_s3_deletes`, call `ChunkBackend::delete_by_key`."
+      "doc": "Drain task: consume `pending_s3_deletes`, call `ChunkBackend::delete_by_keys`."
     },
     {
       "path": "gc/mark.rs",
@@ -1245,6 +1691,16 @@
       "doc": "ChunkService gRPC implementation."
     },
     {
+      "path": "grpc/directory.rs",
+      "depth": 1,
+      "doc": "ADR-022 castore RPC surface (P0573 / P0577 / P0570)."
+    },
+    {
+      "path": "grpc/drv_blob.rs",
+      "depth": 1,
+      "doc": "DrvBlobService (ADR-024 P2): derivations as a first-class castore"
+    },
+    {
       "path": "grpc/get_path.rs",
       "depth": 1,
       "doc": "GetPath: stream a store path's NAR data."
@@ -1263,6 +1719,31 @@
       "path": "grpc/put_path_batch.rs",
       "depth": 1,
       "doc": "PutPathBatch: atomic multi-output upload."
+    },
+    {
+      "path": "grpc/put_path_chunked/",
+      "depth": 1,
+      "doc": "`PutPathChunked` (ADR-022 §6): builder-side chunked output upload."
+    },
+    {
+      "path": "grpc/put_path_chunked/commit.rs",
+      "depth": 2,
+      "doc": "Commit-side assembly for `PutPathChunked` (ADR-022 §6.2)."
+    },
+    {
+      "path": "grpc/put_path_chunked/file_digest.rs",
+      "depth": 2,
+      "doc": "Deferred whole-file digest verification for `PutPathChunked`"
+    },
+    {
+      "path": "grpc/put_path_chunked/validate.rs",
+      "depth": 2,
+      "doc": "`Begin`-frame validation for `PutPathChunked` (ADR-022 §6.2)."
+    },
+    {
+      "path": "grpc/put_path_chunked/verify.rs",
+      "depth": 2,
+      "doc": "The §6.3 sequential receive walk for `PutPathChunked`."
     },
     {
       "path": "grpc/queries.rs",
@@ -1328,6 +1809,11 @@
       "path": "metadata/upstreams.rs",
       "depth": 1,
       "doc": "Per-tenant upstream binary-cache config (`tenant_upstreams` table,"
+    },
+    {
+      "path": "nar_index.rs",
+      "depth": 0,
+      "doc": "Derived per-path NAR file/dir/symlink listing (`nar_index` table)."
     },
     {
       "path": "realisations.rs",
@@ -1492,6 +1978,51 @@
       "path": "k8s/eks/smoke.rs",
       "depth": 2,
       "doc": "End-to-end smoke test via port-forwarded gateway."
+    },
+    {
+      "path": "k8s/fsbench/",
+      "depth": 1,
+      "doc": "`xtask k8s fsbench` — the castore-FUSE micro-benchmark driver"
+    },
+    {
+      "path": "k8s/fsbench/baseline.rs",
+      "depth": 2,
+      "doc": "Criterion-style local baselines: `.fsbench/baselines/<name>.json`,"
+    },
+    {
+      "path": "k8s/fsbench/coldreps.rs",
+      "depth": 2,
+      "doc": "`fsbench cold-reps` — N cold reps of the full bench with a cache"
+    },
+    {
+      "path": "k8s/fsbench/compare.rs",
+      "depth": 2,
+      "doc": "The compare engine: identity-key gate, thresholded per-metric"
+    },
+    {
+      "path": "k8s/fsbench/cotenancy.rs",
+      "depth": 2,
+      "doc": "Build→node attribution + passive co-tenancy tagging."
+    },
+    {
+      "path": "k8s/fsbench/evict.rs",
+      "depth": 2,
+      "doc": "Cold the builder node(s) between cold-reps by evicting every mountd"
+    },
+    {
+      "path": "k8s/fsbench/parse.rs",
+      "depth": 2,
+      "doc": "PHASE/PERF line parser for the fsbench build log."
+    },
+    {
+      "path": "k8s/fsbench/result.rs",
+      "depth": 2,
+      "doc": "result.json (schema `fsbench/v1`) — the comparable artifact."
+    },
+    {
+      "path": "k8s/fsbench/submit.rs",
+      "depth": 2,
+      "doc": "Bench submission: local prebuild of the fsbench bin, an explicit"
     },
     {
       "path": "k8s/k3s/",
@@ -1712,11 +2243,6 @@
       "path": "k8s/qa/scenarios/i114_liveness_kill.rs",
       "depth": 3,
       "doc": "I-114: liveness probe kills CPU-pegged builders mid-build."
-    },
-    {
-      "path": "k8s/qa/scenarios/i115_temp_suffix_fastpath.rs",
-      "depth": 3,
-      "doc": "I-115: nix-daemon's sandbox temp probes (`.chroot`/`.lock`/`.check`)"
     },
     {
       "path": "k8s/qa/scenarios/i116_idle_exit.rs",

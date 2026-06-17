@@ -21,6 +21,10 @@ pub struct Config {
     pub store: rio_common::config::UpstreamAddrs,
     /// PostgreSQL connection URL. Required.
     pub database_url: String,
+    /// PostgreSQL authentication mode (`RIO_PG_AUTH`): `password`
+    /// (default, embedded in `database_url`) or `iam` (RDS IAM auth,
+    /// see `rio_common::config::PgAuthMode`).
+    pub pg_auth: rio_common::config::PgAuthMode,
     #[serde(flatten)]
     pub common: rio_common::config::CommonConfig,
     /// Tick interval (seconds) for scheduler housekeeping.
@@ -152,6 +156,7 @@ impl Default for Config {
             listen_addr: rio_common::default_addr(9001),
             store: rio_common::config::UpstreamAddrs::with_port(9002),
             database_url: String::new(),
+            pg_auth: rio_common::config::PgAuthMode::default(),
             common: rio_common::config::CommonConfig::new(9091),
             tick_interval: std::time::Duration::from_secs(10),
             log_s3_bucket: None,

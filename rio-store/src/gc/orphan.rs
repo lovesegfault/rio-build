@@ -427,7 +427,7 @@ mod tests {
         (chunk_hash, claim)
     }
 
-    // r[verify store.substitute.stale-reclaim]
+    // r[verify store.substitute.stale-reclaim+2]
     /// I-040 unit: `reap_one` on a CHUNKED placeholder MUST decrement.
     /// This is what the inline `delete_manifest_uploading` skipped.
     /// Spec at store.typ: "The chunk list in `manifest_data` is

@@ -5,14 +5,13 @@
 //! session-manager-plugin grandchildren — I-158). Per-build logs land
 //! in `.stress-test/{ts}/build-{port}.log`.
 
-use std::fs::{self, File};
+use std::fs;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use console::style;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::provider::{Provider, ProviderKind};
 use super::shared::ProcessGuard;
@@ -31,7 +30,6 @@ pub(super) async fn cmd_run(
     watch: bool,
 ) -> Result<()> {
     let bench = resolve_bench_flake(bench_flake)?;
-    let key = crate::ssh::privkey_path(cfg)?;
     let installable = format!("{}#{target}", bench.display());
 
     let ts = jiff::Timestamp::now().as_second();
@@ -39,26 +37,9 @@ pub(super) async fn cmd_run(
     fs::create_dir_all(&dir)?;
     info!("logs: {}", dir.display());
 
-    // I-161: warm the eval cache so the build's ssh-ng connection
-    // doesn't sit idle during cold --impure eval. nix opens the
-    // connection on first remote query, then evaluates locally; over
-    // SSM port-forward, server-originated keepalive replies don't
-    // reliably round-trip when there's zero client→server data, so the
-    // gateway drops the session at 120s while nix is still evaluating.
-    // Pre-evaluating shrinks the connect→submit window to <5s.
-    info!("pre-evaluating {installable} (cold-eval can take ~2min)");
-    let pre_eval = std::process::Command::new("nix")
-        .args(["path-info", "--derivation", "--impure", &installable])
-        .output()
-        .context("spawn nix path-info for pre-eval")?;
-    if !pre_eval.status.success() {
-        warn!(
-            "pre-eval failed (continuing): {}",
-            std::str::from_utf8(&pre_eval.stderr)
-                .unwrap_or("<non-utf8 stderr>")
-                .trim()
-        );
-    }
+    // I-161 eval-cache warm; the drv path it returns is only needed by
+    // fsbench (build→node attribution), not here.
+    let _ = super::shared::pre_eval_installable(&installable, &[]);
 
     // SIGINT handler registered BEFORE spawning anything: default
     // disposition terminates abnormally (no Drop), so ProcessGuard's
@@ -68,8 +49,8 @@ pub(super) async fn cmd_run(
     // `signal()`, NOT `ctrl_c()`: `ctrl_c()` is `async fn`, so the
     // sigaction installs at first POLL (the select! below), not at
     // call. tokio::pin! does not poll. The spawn loop awaits
-    // `p.tunnel(port)` (up to 150s NLB poll + banner wait) per port —
-    // Ctrl-C during that window would still hit the default
+    // `p.tunnel(port)` (SSM bind + banner wait) per port — Ctrl-C
+    // during that window would still hit the default
     // disposition. `signal()` is a plain fn that registers the
     // sigaction synchronously at call time.
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -87,42 +68,23 @@ pub(super) async fn cmd_run(
         } else {
             base_port + u16::from(i)
         };
-        if req != 0 {
-            super::shared::kill_port_listeners(req);
-        }
         info!("tunnel[{i}]: establishing");
-        let (port, guard) = p.tunnel(req).await?;
-        tunnels.push(guard);
-
-        let log_path = dir.join(format!("build-{port}.log"));
-        let log_file = File::create(&log_path)?;
-        let log_err = log_file.try_clone()?;
-        let store = format!(
-            "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",
-            key.display()
-        );
-
-        let child = tokio::process::Command::new("nix")
-            .args(["build", "--store", &store, "--eval-store", "auto"])
-            .arg(&installable)
-            // -L: stream build logs to stderr. Without it, redirected
-            // stderr stays empty until the first `copying path` line —
-            // ~2.5min of silence on cold-cache eval (I-051).
-            .args(["--impure", "--no-link", "-L", "--max-jobs", "0"])
-            // I-149/I-161: see `shared::NIX_SSHOPTS_BASE`.
-            .env("NIX_SSHOPTS", super::shared::NIX_SSHOPTS_BASE)
-            .stdin(Stdio::null())
-            .stdout(log_file)
-            .stderr(log_err)
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("spawn nix build (installable: {installable})"))?;
-        info!(
-            "build[{port}]: pid={} → {}",
-            child.id().unwrap_or(0),
-            log_path.display()
-        );
-        builds.push((port, child));
+        // Tunnel naming: the log file is keyed by the BOUND port, which
+        // spawn_remote_nix_build only knows after the tunnel is up — so
+        // the path passed in is provisional and renamed-by-construction
+        // via a two-step: ephemeral requests get a per-index temp name.
+        let log_path = dir.join(format!("build-req{i}.log"));
+        let rb = super::shared::spawn_remote_nix_build(p, req, cfg, &installable, &log_path, &[])
+            .await?;
+        // Re-key the log to the bound port (the historical name format
+        // operators grep for). Rename is same-dir, atomic, and the
+        // child holds the fd — the stream is unaffected.
+        let final_path = dir.join(format!("build-{}.log", rb.port));
+        if fs::rename(&log_path, &final_path).is_err() {
+            info!("log stays at {}", log_path.display());
+        }
+        tunnels.push(rb.tunnel);
+        builds.push((rb.port, rb.child));
     }
 
     eprintln!(

@@ -49,9 +49,11 @@ server = [
   "dep:clap",
   "dep:metrics",
   "dep:anyhow",
+  "dep:prost",
   "dep:scopeguard",
   "dep:serde",
   "dep:serde_json",
+  "dep:zstd",
 ]
 # Exposes `test_helpers` (StoreSeed/ChunkSeed builders, spawn_store_service,
 # put_path) and `MIGRATOR` to downstream crates' tests. Without this, every
@@ -79,7 +81,7 @@ rio-migrations = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 # --- server-only (gated via the `server` feature) ---------------------
-rio-common = { workspace = true, features = ["aws"], optional = true }
+rio-common = { workspace = true, features = ["aws", "pg-iam"], optional = true }
 rio-auth = { workspace = true, optional = true }
 rio-nix = { workspace = true, optional = true }
 rio-proto = { workspace = true, optional = true }
@@ -101,6 +103,10 @@ tonic-health = { workspace = true, optional = true }
 # Streaming xz/zstd decode for upstream substitution (substitute.rs
 # pipes the upstream NAR body through XzDecoder/ZstdDecoder).
 async-compression = { workspace = true, optional = true }
+# At-rest chunk compression (cas.rs compress_chunk/decode_stored_chunk,
+# ADR-024 P2). Bulk one-shot encode/decode of ≤256 KiB chunk bodies —
+# async-compression's streaming codecs are the wrong shape here.
+zstd = { workspace = true, optional = true }
 # StreamReader (Stream<Bytes> → AsyncRead) for substitute.rs.
 tokio-util = { workspace = true, optional = true }
 
@@ -149,6 +155,9 @@ metrics = { workspace = true, optional = true }
 
 # Error handling
 anyhow = { workspace = true, optional = true }
+# Encode/decode `rio.types.NarIndex` for the `nar_index.entries` BYTEA
+# column (nar_index.rs). Already in the deptree via tonic-prost.
+prost = { workspace = true, optional = true }
 # Advisory lock RAII: detach PoolConnection on ANY exit (including
 # cancel) so PG session-scoped lock auto-releases. Round 4 Z2/Z7.
 scopeguard = { workspace = true, optional = true }
@@ -164,6 +173,9 @@ rstest = { workspace = true }
 # feature is the only way they see `test_helpers` / `MIGRATOR`.
 rio-store = { path = ".", features = ["test-utils"] }
 rio-test-support = { workspace = true }
+# concurrent.rs installs a CountingRecorder and latches on the wait-arm
+# entry counter (structural race scheduling instead of sleeps).
+metrics = { workspace = true }
 tempfile = { workspace = true }
 # In-memory cert generation for tls_integration tests.
 tokio = { workspace = true, features = ["test-util"] }

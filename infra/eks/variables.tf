@@ -52,6 +52,23 @@ variable "addons" {
   })
 }
 
+variable "express_az_ids" {
+  description = <<-EOT
+    AZ-IDs that get an S3 Express One Zone directory bucket — the
+    per-AZ cache tier of the store's TieredChunkBackend (ADR-023,
+    s3-express.tf). Must be the intersection of the VPC's subnet
+    zone-ids with the AZ-IDs where Express is supported; probe with
+    `aws s3api create-bucket` per AZ-ID (CreateBucket fails in
+    unsupported zones). Default is the probed set for us-east-2
+    (use2-az3 rejects directory-bucket creation). Empty list disables
+    the cache tier cluster-wide: no buckets, no IAM statement, empty
+    express_buckets_json output → xtask deploy keeps chunkBackend
+    kind=s3.
+  EOT
+  type        = list(string)
+  default     = ["use2-az1", "use2-az2"]
+}
+
 variable "hubble_ui_enabled" {
   description = "Deploy the Hubble web UI. Off by default; xtask up sets this true for dev/QA clusters."
   type        = bool

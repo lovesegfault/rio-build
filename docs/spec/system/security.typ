@@ -115,12 +115,25 @@
   The scheduler signs *assignment tokens* (HMAC-SHA256) when dispatching work.
   Token format is
   `base64url(json(AssignmentClaims)).base64url(hmac_sha256(key, claims_json))`.
-  `AssignmentClaims` has exactly five fields: `executor_id` (string, audit only
-  --- the store doesn't know which executor is calling), `drv_hash` (string,
-  ties token to a specific build), `expected_outputs` (list of store paths, the
-  authorization check), `is_ca` (bool, skips the membership check for
-  floating-CA derivations whose output paths are computed post-build),
-  `expiry_unix` (u64 Unix seconds, replay prevention).
+  `AssignmentClaims` carries: `executor_id` (string, audit only --- the store
+  doesn't know which executor is calling), `drv_hash` (string, ties token to a
+  specific build), `expected_outputs` (list of store paths, the authorization
+  check), `is_ca` (bool, skips the membership check for floating-CA derivations
+  whose output paths are computed post-build), `expiry_unix` (u64 Unix seconds,
+  replay prevention), `tenant` (optional UUID string, attribution for
+  `hw_perf_samples.submitting_tenant` --- derived from claims, never from the
+  request body, so a compromised worker cannot fabricate tenant identities),
+  `role` (`TokenRole` enum --- what the holder may do; the store gates `PutPath`
+  and `Begin` on `Builder`), and `input_closure_digest` (hex
+  `blake3(sorted(input_closure).join("\n"))`, the §6.3 server-side refscan
+  attestation; empty = scheduler couldn't compute the closure at dispatch ---
+  see #rref("sched.dispatch.input-roots+2")). `tenant`, `role`, and
+  `input_closure_digest` are `#[serde(default)]` (old token still parses) and
+  `#[serde(skip_serializing_if = …)]` (default-valued token serializes to the
+  pre-P0589 byte shape, so `deny_unknown_fields` on a not-yet-rolled store
+  still parses it). Once the scheduler emits a non-default `role` or a non-empty
+  `input_closure_digest`, the new-token-to-old-store skew is closed only by
+  deploy ordering (store fleet rolls before the scheduler singleton).
   - Executors present the assignment token in the `x-rio-assignment-token` gRPC
     metadata header when calling `PutPath` on the store. The store verifies the
     token signature, checks `now < expiry_unix`, and rejects with
@@ -214,37 +227,44 @@
 
 == Executor Pod Security
 
-#r("sec.pod.host-users-false")[
-  Executor pods MUST set `hostUsers: false` to activate Kubernetes
+#r("sec.pod.host-users-false+2")[
+  Builder pods MUST set `hostUsers: false` to activate Kubernetes
   user-namespace isolation (K8s 1.33+). Container UIDs are remapped to
   unprivileged host UIDs; `CAP_SYS_ADMIN` applies only within the user
   namespace. A container escape gaining `CAP_SYS_ADMIN` cannot affect the host
-  or other pods. See @sec-rationale-privileged. The `privileged: true` escape
-  hatch (for clusters whose containerd lacks `base_runtime_spec` device
-  injection) skips `hostUsers: false` --- privileged containers cannot be
-  user-namespaced.
+  or other pods. See @sec-rationale-privileged. Two exceptions: the
+  `privileged: true` escape hatch (for clusters whose containerd lacks
+  `base_runtime_spec` device injection) skips `hostUsers: false` ---
+  privileged containers cannot be user-namespaced; and Fetcher pods default
+  `hostUsers: true` because rio-mountd's UDS access control is a host-side
+  gid DAC check that a non-init userns breaks (see
+  #rref("ctrl.pool.fetcher-hardening")).
 ]
 
-// rule-id is historical; mechanism is base_runtime_spec since ADR-021 §7
-#r("sec.pod.fuse-device-plugin")[
-  Executor pods MUST NOT obtain `/dev/fuse` via a hostPath volume --- the
-  kernel rejects idmap mounts on device nodes (ADR-012 Phase 1a spike finding),
-  so hostPath is incompatible with `hostUsers: false`. The device node is
-  delivered by containerd's `base_runtime_spec` declaring `/dev/{fuse,kvm}` in
-  OCI `linux.devices` (`nix/base-runtime-spec.nix`) --- runc `mknod`s them
-  inside the container's `/dev` with container-namespace uid/gid, so no
-  idmap-mount rejection. Every pod on a configured node gets `/dev/fuse`;
-  `/dev/kvm` is host-conditional --- containerd's `ExecStartPre` picks the
-  `withKvm` spec variant iff `test -c /dev/kvm` succeeds on the host and
-  symlinks it to `/run/base-runtime-spec.json`, so non-`.metal` pods don't see
-  a dead device node. No extended resource is requested and no device plugin
-  runs. kvm pods route to `.metal` via per-intent `nodeAffinity`
+// rule-id is historical (device-plugin era); FUSE delivery is the rio-mountd
+// fd handoff since ADR-022 P0560, /dev/kvm stays base_runtime_spec (ADR-021 §7)
+#r("sec.pod.fuse-device-plugin+1")[
+  Executor pods MUST NOT mount `/dev/fuse` --- not via a hostPath volume (the
+  kernel rejects idmap mounts on device nodes, ADR-012 Phase 1a spike finding,
+  so hostPath is incompatible with `hostUsers: false`), and not via any device
+  plugin or extended resource. Since the castore cutover (ADR-022 P0560) the
+  executor never opens the device node at all: the per-node rio-mountd
+  DaemonSet opens `/dev/fuse`, creates the per-build castore-FUSE mount under
+  `/var/rio/castore/<build_id>`, and hands the backing fd to the builder over
+  the `/run/rio-mountd/rio-mountd.sock` UDS via `SCM_RIGHTS`; the mount
+  reaches the executor through its `HostToContainer`-propagated hostPath. The
+  `privileged: true` escape hatch changes the pod's seccomp/userns posture,
+  not the FUSE delivery path --- privileged pods get no `/dev/fuse` volume
+  either. containerd's `base_runtime_spec` (`nix/base-runtime-spec.nix`) still
+  `mknod`s `/dev/fuse` into every pod's `/dev` (no longer load-bearing for the
+  store) and remains the delivery path for `/dev/kvm`, which is
+  host-conditional --- containerd's `ExecStartPre` picks the `withKvm` spec
+  variant iff `test -c /dev/kvm` succeeds on the host and symlinks it to
+  `/run/base-runtime-spec.json`, so non-`.metal` pods don't see a dead device
+  node. kvm pods route to `.metal` via per-intent `nodeAffinity`
   (`r[ctrl.pool.node-affinity-from-intent]`) plus a pool-static `rio.build/kvm`
   toleration (`r[ctrl.pool.kvm-device+2]`) --- never a pool-static
   nodeSelector, which would deadlock against the affinity on shared features.
-  `privileged: true` remains an escape hatch for clusters whose containerd
-  lacks `base_runtime_spec` device injection; it falls back to the hostPath
-  mechanism and MUST NOT be the production default.
 ]
 
 #r("sec.psa.control-plane-restricted")[
@@ -286,7 +306,12 @@
   cross-process *write* syscall `process_vm_writev` on top of RuntimeDefault's
   \~40-syscall denylist, while keeping the read-side trace syscalls `ptrace`
   and `process_vm_readv` permitted (the builder profile only; the fetcher
-  profile denies all five). The profile JSON lives at
+  profile denies all five). Both profiles additionally re-allow
+  `io_uring_setup`/`io_uring_enter`/`io_uring_register` (in RuntimeDefault's
+  denylist since Docker v24) so the worker's fuse-over-io_uring castore
+  transport can engage --- every executor pod serves it, fetchers included
+  (the FOD sandbox's overlay lower is the per-build castore mount). The
+  profile JSON lives at
   `nix/nixos-node/seccomp/rio-{builder,fetcher}.json`; the chart's default
   `localhostProfile` is `operator/rio-builder.json` (fetchers hardcode
   `operator/rio-fetcher.json`) --- that path is relative to
@@ -299,6 +324,28 @@
   missing profile surfaces as the executor container's `CreateContainerError`
   with the profile path in the message.
 ]
+
+Allowing the io_uring syscalls in seccomp is necessary but not sufficient for
+the transport (the worker's only castore-FUSE transport) to come up:
+`io_uring_setup` is also subject to the kernel's per-user pinned-memory
+accounting, and the containerd-default `RLIMIT_MEMLOCK` (8 MiB) fails it with
+`ENOMEM` --- observed on the EKS worker nodes. The controller therefore
+grants `CAP_IPC_LOCK` --- which exempts a process from that accounting --- to
+every executor container, fetcher pools included: the fetcher's worker mounts
+the castore too (the FOD sandbox's overlay lower serves the fetch script's
+input closure), so a fetcher without the capability fails every FOD.
+Untrusted build code does not inherit the capability: nix-daemon runs builds
+as the non-root `nixbld` users, which clears it.
+
+Residual risk, accepted: seccomp filters (unlike capabilities) survive the
+uid drop, so untrusted code in any executor pod --- including the
+internet-facing fetch scripts of FODs --- can issue io_uring syscalls, a
+kernel surface with a container-escape CVE history that RuntimeDefault
+deliberately denies. This is the cost of fuse-over-io_uring being the only
+castore transport. The planned hardening is a process split: the
+FUSE-serving worker keeps the io_uring-allowed profile while fetch/build
+children get a nested seccomp filter (installed before exec) that re-denies
+the trio --- tracked as a TODO at the profile generator.
 
 The read-side trace syscalls are permitted because denying them breaks every
 build whose check phase traces its own processes: LeakSanitizer's at-exit
@@ -586,10 +633,13 @@ Cilium overlay layer.
 
 === Cross-Tenant Chunk Probing
 
-- *Threat*: `FindMissingChunks` can reveal whether another tenant has built a
-  specific package.
-- *Mitigation*: Per-tenant chunk scoping (at the cost of dedup) or accept the
-  risk. See Multi-Tenancy §FindMissingChunks scoping.
+- *Threat*: A chunk-presence probe (`HasChunks`) can reveal whether another
+  tenant has built a specific package.
+- *Mitigation (implemented, ADR-024 P2)*: Per-tenant presence scoping via the
+  `chunk_tenants` junction — presence answers only for chunks the calling
+  tenant has seen; dedup at rest is unaffected (storage stays digest-keyed
+  global, the cost is re-upload bandwidth). See Multi-Tenancy §Chunk Presence
+  Scoping and `r[store.chunk.has-chunks-tenant]`.
 
 == Ephemeral Builders
 
@@ -674,10 +724,11 @@ heartbeat) plus one reconciler tick (\~10s).
   NetworkPolicy. Future work: explore splitting the executor into a privileged
   setup process and an unprivileged build supervisor.
 
-+ *Cross-tenant chunk deduplication leaks build activity.* A tenant can probe
-  `FindMissingChunks` to determine whether another tenant has built a specific
-  package. Mitigation: scope `FindMissingChunks` per tenant (at the cost of
-  dedup savings) or accept the risk with documentation.
++ *Cross-tenant chunk deduplication leaks build activity — RESOLVED
+  (ADR-024 P2).* A tenant could probe chunk presence to determine whether
+  another tenant had built a specific package. `HasChunks` is now
+  tenant-scoped via the `chunk_tenants` junction
+  (`r[store.chunk.has-chunks-tenant]`); dedup at rest is unaffected.
 
 + *Fixed-output derivations (FODs) need network access.* FOD builds (fetchurl,
   fetchgit) require egress to the internet, which conflicts with the builder

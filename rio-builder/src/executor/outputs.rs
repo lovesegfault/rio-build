@@ -8,14 +8,13 @@
 
 use std::collections::HashMap;
 
-use tonic::transport::Channel;
 use tracing::instrument;
 
 use rio_nix::derivation::{Derivation, DerivationLike};
-use rio_proto::StoreServiceClient;
 use rio_proto::types::{BuildResult as ProtoBuildResult, BuildResultStatus, BuiltOutput};
 
 use crate::overlay;
+use crate::store_fetch::StoreClients;
 use crate::upload;
 
 use super::ExecutorError;
@@ -48,26 +47,32 @@ impl BuildOutputs {
 /// proto BuiltOutput entries. On build failure: maps the nix-daemon
 /// BuildStatus to the proto equivalent.
 ///
-/// Reference-scan candidate set = input_paths ∪ drv.outputs() ∪
-/// build_result.built_outputs (the last for floating-CA self-refs).
+/// `input_closure` is the scheduler-attested closure from the
+/// `WorkAssignment` — echoed into the chunked upload's `Begin` frame and
+/// used as the reference-scan candidate set; `input_paths` is the
+/// locally-computed transitive closure (still needed for the I-178
+/// materialization-failure reclassification, and the upload fallback
+/// when the assignment carries no closure).
 #[instrument(skip_all, fields(drv_path = %drv_path, is_fod))]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn collect_outputs(
     build_result: &rio_nix::protocol::build::BuildResult,
-    store_client: &mut StoreServiceClient<Channel>,
+    clients: &StoreClients,
     overlay_mount: &overlay::OverlayMount,
     drv: &Derivation,
     drv_path: &str,
     is_fod: bool,
     input_paths: &[String],
+    input_closure: &[String],
     assignment_token: &str,
 ) -> Result<BuildOutputs, ExecutorError> {
     if !build_result.status.is_success() {
-        // I-178: daemon ENOENT on a closure input is worker-local
-        // materialization failure (warm timeout / FUSE EIO / I-043
-        // negative-dentry), NOT a build defect. Reclassify so the
-        // scheduler retries instead of poisoning. Checked BEFORE the
-        // generic BuildResultStatus::from collapse (MiscFailure →
+        // Daemon EIO/ENOENT on a closure input is a worker-local
+        // materialization failure (castore-FUSE fetch failure or
+        // tripped circuit breaker → EIO; a path missing from the
+        // mounted tree → ENOENT), NOT a build defect. Reclassify so
+        // the scheduler retries instead of poisoning. Checked BEFORE
+        // the generic BuildResultStatus::from collapse (MiscFailure →
         // PermanentFailure).
         if is_input_materialization_failure(
             build_result.status,
@@ -79,15 +84,12 @@ pub(super) async fn collect_outputs(
             tracing::warn!(
                 drv_path = %drv_path,
                 error = %build_result.error_msg,
-                "daemon ENOENT on closure input — reclassifying MiscFailure → \
-                 InfrastructureFailure (warm timeout / FUSE EIO / I-043 race)"
+                "daemon EIO/ENOENT on closure input — reclassifying MiscFailure → \
+                 InfrastructureFailure (castore fetch failure / circuit breaker)"
             );
             return Ok(BuildOutputs::failed(
                 BuildResultStatus::InfrastructureFailure,
-                format!(
-                    "input materialization failed (I-043/I-178): {}",
-                    build_result.error_msg
-                ),
+                format!("input materialization failed: {}", build_result.error_msg),
             ));
         }
         tracing::warn!(
@@ -118,7 +120,7 @@ pub(super) async fn collect_outputs(
     // read(2) (mkfifo $out in a malicious FOD, wedged overlay) never
     // returns; tokio cannot abort blocking tasks. The bare `.await`
     // would hang the worker forever — same FIFO-hang surface as the
-    // upload-side scan_references/dump_tee joins (G28 C4). Budget =
+    // upload-side fused-walk join (upload/walk.rs). Budget =
     // GRPC_STREAM_TIMEOUT (300s, generous for local-disk hashing of
     // even 100GB at NVMe speeds); fires only on a true hang.
     if is_fod {
@@ -155,40 +157,41 @@ pub(super) async fn collect_outputs(
 
     // Upload outputs.
     //
-    // Reference-scan candidate set = input_paths ∪ drv.outputs():
-    //   - input_paths: the TRANSITIVE input closure, built above via
-    //     compute_input_closure (BFS over QueryPathInfo.references,
-    //     seeded from input_srcs + inputDrv outputs). This matches
-    //     Nix's computeFSClosure — see derivation-building-goal.cc:444,450
-    //     and derivation-builder.cc:1335-1344 in Nix 2.31.3. A build can
-    //     legitimately embed any path reachable from its inputs: e.g.
-    //     hello-2.12.2 references glibc, which is NOT a direct input
-    //     but comes via closure(stdenv). Scanning only direct inputs
-    //     would drop those references.
-    //   - drv.outputs(): self-references and cross-output references are
-    //     legal (e.g., a -dev output referencing the lib output's rpath,
-    //     or a binary embedding its own store path in an rpath).
-    let mut ref_candidates: Vec<String> = input_paths.to_vec();
-    ref_candidates.extend(drv.static_outputs().map(|o| o.path().to_string()));
-    // Floating-CA: .drv has path = ""; the real path comes from
-    // the daemon's BuildResult. Needed for self-references.
-    ref_candidates.extend(
-        build_result
-            .built_outputs
-            .iter()
-            .map(|bo| bo.out_path.clone()),
-    );
+    // The closure passed here is BOTH the `Begin.input_closure` echo and
+    // the reference-scan candidate set (the upload adds the scanned
+    // output paths itself, covering self- and cross-output references).
+    // The scan is authoritative — the store commits the resolved set as
+    // claimed (`r[store.integrity.verify-on-put+3]`) — so a candidate
+    // set that misses a path silently drops that reference from the
+    // narinfo; input_closure ∪ Begin.outputs is the complete set.
+    //
+    //   - Preferred: the scheduler-attested WorkAssignment.input_closure.
+    //     It is exactly what the assignment token's input_closure_digest
+    //     was computed over, so the echo passes the store's attestation
+    //     check, and it is the transitive runtime closure (BFS over
+    //     narinfo references) — a build can legitimately embed any path
+    //     reachable from its inputs (hello references glibc via
+    //     closure(stdenv)), so direct inputs would not be enough.
+    //   - Fallback: the locally-computed transitive closure
+    //     (compute_input_closure), for assignments dispatched without a
+    //     closure (pre-P0589 scheduler, dev mode). The echo is then
+    //     unattested and the store accepts it as-is.
+    let closure: &[String] = if input_closure.is_empty() {
+        input_paths
+    } else {
+        input_closure
+    };
 
     match upload::upload_all_outputs(
-        store_client,
+        clients,
         &overlay_mount.upper_store(),
-        // Pass the assignment token as gRPC metadata on each
-        // PutPath. Store with hmac_verifier checks it. Empty
-        // token (scheduler without hmac_signer, dev mode) →
-        // no header → store with verifier=None accepts.
+        // Assignment token rides as gRPC metadata on the chunked
+        // upload (and its HasChunks probe). Store with hmac_verifier
+        // checks it. Empty token (scheduler without hmac_signer, dev
+        // mode) → no header → store with verifier=None accepts.
         assignment_token,
         drv_path,
-        &ref_candidates,
+        closure,
     )
     .await
     {
@@ -290,17 +293,20 @@ pub(super) async fn collect_outputs(
 }
 
 /// True iff the daemon's `MiscFailure` is `getting attributes of path
-/// '<p>': No such file or directory` where `<p>` is in the build's
-/// input closure.
+/// '<p>': <strerror>` (or one of the sibling phrasings below) where
+/// `<p>` is in the build's input closure.
 ///
-/// I-178: that pattern means the daemon's sandbox-setup `lstat(input)`
-/// hit overlay → FUSE → ENOENT (warm timeout, FUSE EIO, or the I-043
-/// negative-dentry race). The input was verified present in rio-store
-/// by `compute_input_closure` (BatchQueryPathInfo only returns found
-/// paths); its absence at sandbox-setup is a worker-local
-/// materialization failure, NOT a build defect. Reporting
-/// `PermanentFailure` poisons the derivation; `InfrastructureFailure`
-/// lets the scheduler retry on a fresh worker.
+/// That pattern means the daemon's sandbox-setup `lstat(input)`/`open`
+/// hit overlay → castore-FUSE → EIO (fetch failure, integrity
+/// mismatch, tripped circuit breaker — `r[builder.fs.fetch-circuit]`)
+/// or ENOENT (path missing from the mounted tree). The input was
+/// verified present in rio-store by `compute_input_closure`
+/// (BatchQueryPathInfo only returns found paths); its absence or
+/// unreadability at sandbox-setup is a worker-local materialization
+/// failure, NOT a build defect. Reporting `PermanentFailure` poisons
+/// the derivation; `InfrastructureFailure` lets the scheduler retry on
+/// a fresh worker. (I-178 established the reclassification for the
+/// pre-castore JIT FUSE; the failure mode survives the cutover.)
 ///
 /// String-matching the daemon's error is brittle but the message is
 /// stable since Nix 2.3 (`libstore/posix-fs-canonicalise.cc`). The
@@ -317,7 +323,7 @@ pub(super) async fn collect_outputs(
 /// matched: ENOENT (`No such file or directory`) and EIO (`Input/output
 /// error`, see I-179) are both worker-local materialization failures.
 ///
-// r[impl builder.result.input-enoent-is-infra+2]
+// r[impl builder.result.input-eio-is-infra]
 pub(crate) fn is_input_materialization_failure(
     nix_status: rio_nix::protocol::build::BuildStatus,
     error_msg: &str,
@@ -383,7 +389,7 @@ mod tests {
     ///
     /// I-178b: the live cluster message is ANSI-colored and reports the
     /// OVERLAY path, not the store path. Strip ANSI; match by basename.
-    // r[verify builder.result.input-enoent-is-infra+2]
+    // r[verify builder.result.input-eio-is-infra]
     #[test]
     fn test_is_input_materialization_failure() {
         use rio_nix::protocol::build::BuildStatus as Nix;

@@ -61,11 +61,17 @@ pkgs.testers.runNixOSTest {
     # The gateway's authorized_keys file is one-Secret-many-keys; both
     # clients' pubkeys go in. Each client's ssh_config (mkClientNode)
     # already routes Host k3s-server → :32222 (v6) / Host edge → :22 (v4).
+    # Key comment = fixture defaultTenant (P0560 tenancy stopgap): the
+    # gateway attributes SSH submissions to the comment, the scheduler
+    # puts it in the assignment-token tenant claim, and the store's
+    # castore reads reject tenantless tokens — an empty comment makes
+    # every build here fail its input prefetch.
     pubkeys = []
     for c in (client_v6, client_v4):
         c.succeed(
             "mkdir -p /root/.ssh && "
-            "ssh-keygen -t ed25519 -N ''' -C ''' -f /root/.ssh/id_ed25519"
+            "ssh-keygen -t ed25519 -N ''' "
+            "-C '${fixture.defaultTenant or ""}' -f /root/.ssh/id_ed25519"
         )
         pubkeys.append(c.succeed("cat /root/.ssh/id_ed25519.pub").strip())
     k3s_server.succeed(

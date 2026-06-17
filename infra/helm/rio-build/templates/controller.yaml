@@ -1,8 +1,8 @@
 {{- /* Named template so the ConfigMap body and the checksum annotation
        hash the SAME rendered string. bug_022: hashing a hand-maintained
        list of input keys (`.scheduler.sla`, `.karpenter.nodeclaimPool`)
-       missed `poolDefaults.fuseCacheBytes` + `karpenter.metalSizes` —
-       the ConfigMap re-rendered, the (subPath-mounted) pod did not roll.
+       missed keys added later (e.g. `karpenter.metalSizes`) — the
+       ConfigMap re-rendered, the (subPath-mounted) pod did not roll.
        `define` must be at top level (not inside `if`). */}}
 {{- define "rio.controllerToml" -}}
 {{- with .Values.scheduler.sla -}}
@@ -25,8 +25,6 @@ max_lead_time = {{ printf "%.1f" (float64 .maxLeadTime) }}
 {{- /* `dataVolumeSize` is a k8s Quantity ("500Gi"); approximate
        allocatable as 90% (kubelet eviction threshold + image cache). */}}
 max_node_disk = {{ mulf 0.9 (include "rio.quantityBytes" $.Values.karpenter.dataVolumeSize) | int64 }}
-fuse_cache_bytes = {{ int64 $.Values.poolDefaults.fuseCacheBytes }}
-fetcher_fuse_cache_bytes = {{ int64 $.Values.poolDefaults.fetcherFuseCacheBytes }}
 metal_sizes = {{ toJson $.Values.karpenter.metalSizes }}
 {{- with .maxConsolidationTime }}
 max_consolidation_time = {{ printf "%.1f" (float64 .) }}
@@ -139,11 +137,7 @@ spec:
             # database_url stays env (Secret-sourced; never lands in the
             # ConfigMap-rendered TOML). lease_namespace via downward API
             # so the chart isn't namespace-pinned.
-            - name: RIO_NODECLAIM_POOL__DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: rio-postgres
-                  key: url
+            {{- include "rio.pgEnv" (dict "root" . "authEnv" "RIO_NODECLAIM_POOL__PG_AUTH" "urlEnv" "RIO_NODECLAIM_POOL__DATABASE_URL") | nindent 12 }}
             - name: RIO_NODECLAIM_POOL__LEASE_NAMESPACE
               valueFrom:
                 fieldRef: {fieldPath: metadata.namespace}
@@ -151,7 +145,7 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
-            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "serviceHmac")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "serviceHmac" "rdsCa")) | nindent 12 }}
             # rio_common::config::load reads /etc/rio/controller.toml. The
             # ConfigMap carries [nodeclaim_pool] (lead_time_seed is a
             # nested map — the RIO_ env layer only yields strings, so
@@ -177,7 +171,7 @@ spec:
           resources:
             {{- toYaml $c.resources | nindent 12 }}
       volumes:
-        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "serviceHmac")) | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "serviceHmac" "rdsCa")) | nindent 8 }}
         - name: config
           configMap:
             name: rio-controller-config

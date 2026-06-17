@@ -8,6 +8,7 @@ use crate::db::SchedulerDb;
 use crate::state::DrvHash;
 
 // r[verify sched.poison.ttl-persist]
+// r[verify obs.log.failure-reason-persisted]
 /// Roundtrip: persist_poisoned → load_poisoned_derivations → clear_poison.
 /// Catches the `.as_bytes()` vs `.as_str()` binding regression — PG rejects
 /// BYTEA against a TEXT column, but call sites swallow the error as best-effort.
@@ -22,12 +23,26 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
     let _ = insert_test_derivation(&db, drv_hash.as_str()).await?;
 
     // Single atomic call: sets status='poisoned' AND poisoned_at=now()
-    // AND assigned_builder_id=NULL. No separate status update needed.
-    db.persist_poisoned(&drv_hash).await?;
+    // AND assigned_builder_id=NULL AND the failure reason (M_073).
+    // No separate status update needed.
+    let exec = Uuid::now_v7();
+    db.persist_poisoned(
+        &drv_hash,
+        Some("builder exited 1: cc not found"),
+        Some(exec),
+    )
+    .await?;
 
-    // Verify all three columns updated in one statement.
-    let (status, has_ts, worker): (String, bool, Option<String>) = sqlx::query_as(
-        "SELECT status, poisoned_at IS NOT NULL, assigned_builder_id \
+    // Verify all columns updated in one statement.
+    let (status, has_ts, worker, failure_msg, failure_exec): (
+        String,
+        bool,
+        Option<String>,
+        Option<String>,
+        Option<Uuid>,
+    ) = sqlx::query_as(
+        "SELECT status, poisoned_at IS NOT NULL, assigned_builder_id, \
+                failure_msg, failure_exec_id \
          FROM derivations WHERE drv_hash=$1",
     )
     .bind(drv_hash.as_str())
@@ -36,6 +51,27 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
     assert_eq!(status, "poisoned");
     assert!(has_ts, "poisoned_at must be set in the same statement");
     assert!(worker.is_none(), "assigned_builder_id must be NULLed");
+    assert_eq!(
+        failure_msg.as_deref(),
+        Some("builder exited 1: cc not found"),
+        "failure_msg must persist the builder error"
+    );
+    assert_eq!(failure_exec, Some(exec), "failure_exec_id must persist");
+
+    // The fail-fast read path sees the same attribution.
+    let reason = db
+        .load_failure_reason(&drv_hash)
+        .await?
+        .expect("derivation row exists");
+    assert_eq!(
+        reason.failure_msg.as_deref(),
+        Some("builder exited 1: cc not found")
+    );
+    assert_eq!(reason.failure_exec_id, Some(exec));
+    assert!(
+        reason.poisoned_epoch.is_some_and(|e| e > 0.0),
+        "poisoned_epoch must reflect poisoned_at"
+    );
 
     let rows = db.load_poisoned_derivations().await?;
     assert_eq!(rows.len(), 1, "persist_poisoned should make row loadable");
@@ -55,8 +91,14 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
         "clear_poison should remove from poisoned set"
     );
 
-    let (status, poisoned_at): (String, Option<f64>) = sqlx::query_as(
-        "SELECT status, EXTRACT(EPOCH FROM poisoned_at)::float8 \
+    let (status, poisoned_at, failure_msg, failure_exec): (
+        String,
+        Option<f64>,
+        Option<String>,
+        Option<Uuid>,
+    ) = sqlx::query_as(
+        "SELECT status, EXTRACT(EPOCH FROM poisoned_at)::float8, \
+                failure_msg, failure_exec_id \
          FROM derivations WHERE drv_hash=$1",
     )
     .bind(drv_hash.as_str())
@@ -64,6 +106,10 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
     .await?;
     assert_eq!(status, "created");
     assert!(poisoned_at.is_none());
+    assert!(
+        failure_msg.is_none() && failure_exec.is_none(),
+        "clear_poison must NULL the persisted failure reason"
+    );
     Ok(())
 }
 
@@ -83,7 +129,8 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
         .collect();
     for h in &hashes {
         insert_test_derivation(&db, h.as_str()).await?;
-        db.persist_poisoned(h).await?;
+        db.persist_poisoned(h, Some("batch poison reason"), None)
+            .await?;
     }
     assert_eq!(db.load_poisoned_derivations().await?.len(), 100);
 
@@ -103,7 +150,9 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
              COUNT(*) FILTER (WHERE status = 'created'),
              COUNT(*) FILTER (WHERE poisoned_at IS NULL
                               AND failed_builders = '{}'
-                              AND retry_count = 0),
+                              AND retry_count = 0
+                              AND failure_msg IS NULL
+                              AND failure_exec_id IS NULL),
              COUNT(*) FILTER (WHERE resubmit_cycles = 1)
          FROM derivations WHERE drv_hash = ANY($1)",
     )

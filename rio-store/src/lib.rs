@@ -42,6 +42,10 @@ pub mod backend;
 #[cfg(feature = "server")]
 pub mod cas;
 #[cfg(feature = "server")]
+pub mod castore;
+#[cfg(feature = "server")]
+pub mod castore_nar;
+#[cfg(feature = "server")]
 pub(crate) mod chunker;
 #[cfg(feature = "server")]
 pub mod config;
@@ -58,6 +62,8 @@ pub mod manifest;
 #[cfg(feature = "server")]
 pub(crate) mod metadata;
 #[cfg(feature = "server")]
+pub mod nar_index;
+#[cfg(feature = "server")]
 pub mod signing;
 #[cfg(feature = "server")]
 pub mod substitute;
@@ -67,8 +73,10 @@ pub mod test_helpers;
 /// Re-export of the shared embedded migrator from `rio-migrations`.
 ///
 /// Gated on `test`/`test-utils` so `rio_store::MIGRATOR` stays out of
-/// the public API for non-test consumers — production code goes through
-/// `rio_migrations::migrate::run` with `rio_migrations::migrator()`. The
+/// the public API for non-test consumers — production migrates via the
+/// `rio-store migrate` subcommand (`rio_migrations::migrate::run` with
+/// `rio_migrations::migrator()`); serving startup only runs
+/// `rio_migrations::migrate::assert_current`. The
 /// re-export exists for the ~200 `TestDb::new(&crate::MIGRATOR)`
 /// callsites in this crate's `#[cfg(test)]` modules. `crate::MIGRATOR`
 /// and `rio_store::MIGRATOR` resolve to the same static.
@@ -85,6 +93,18 @@ pub use rio_migrations::MIGRATOR;
 #[cfg(feature = "server")]
 const SUBSTITUTE_DURATION_BUCKETS: &[f64] =
     &[0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0];
+
+/// Histogram bucket boundaries for `rio_store_tiered_get_duration_seconds`.
+///
+/// The whole point is resolving the Express-vs-S3-standard TTFB gap:
+/// Express GETs cluster in single-digit ms, S3 standard in tens of ms.
+/// The global `[0.005..10.0]` default has only two boundaries below
+/// 25ms — both modes would smear into the same buckets. Sub-ms low end
+/// catches warmed-connection Express reads; the 0.25–1.0s tail is
+/// SDK-retry/throttle territory, not normal serving.
+#[cfg(feature = "server")]
+const TIERED_GET_DURATION_BUCKETS: &[f64] =
+    &[0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
 
 /// Per-crate histogram bucket overrides, passed to
 /// `rio_common::server::bootstrap` → `init_metrics`. Every
@@ -104,15 +124,32 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         "rio_store_check_available_duration_seconds",
         SUBSTITUTE_DURATION_BUCKETS,
     ),
+    (
+        "rio_store_tiered_get_duration_seconds",
+        TIERED_GET_DURATION_BUCKETS,
+    ),
+    (
+        // Digest-list length, not seconds: 1 (single probe) to the
+        // HAS_BATCH_MAX cap (65536). Chromium-scale closure ~25k.
+        "rio_store_directory_has_batch_size",
+        &[
+            1.0, 8.0, 32.0, 128.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0,
+        ],
+    ),
 ];
 
 /// Registers prometheus metric descriptions. The help strings here are
 /// the source for `docs/ref/metrics.typ` — see
 /// `xtask/src/regen/docs_data.rs::metrics()` for the data-flow.
-// r[impl obs.metric.store]
+// r[impl obs.metric.store+2]
 #[cfg(feature = "server")]
 pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
+
+    // Shared rio_pg_iam_* family (rio-common emits; each PG consumer
+    // registers — registration and emission are separate call sites,
+    // and rio-common has no exporter of its own).
+    rio_common::pg_iam::describe_metrics();
 
     describe_counter!(
         "rio_store_put_path_total",
@@ -148,7 +185,12 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_integrity_failures_total",
-        "GetPath content integrity check failures (bitrot/corruption)"
+        "Content integrity check failures, labeled by `site`: \
+         `get_path` (whole-NAR SHA-256, indicates bitrot/corruption), \
+         `read_blob` (whole-file BLAKE3, indicates cumsum/index drift), \
+         `chunk` (per-chunk BLAKE3, indicates bitrot/corruption), \
+         `put_path_chunked` (claimed file digest does not hash from \
+         the run's content — rejected forgery attempt)"
     );
     describe_gauge!(
         "rio_store_chunk_dedup_ratio",
@@ -166,6 +208,42 @@ pub fn describe_metrics() {
         "rio_store_chunk_cache_misses_total",
         "moka chunk cache misses"
     );
+    // r[impl obs.metric.chunk-backend-tiered]
+    describe_counter!(
+        "rio_store_tiered_local_hits_total",
+        "Tiered backend Express-tier hits (chunk served without an S3-standard RTT)"
+    );
+    describe_counter!(
+        "rio_store_tiered_local_misses_total",
+        "Tiered backend Express-tier misses (fell through to S3 standard, then write-through filled Express)"
+    );
+    describe_counter!(
+        "rio_store_tiered_local_errors_total",
+        "Tiered backend Express-tier read errors (degraded — falls through to S3 standard; alert if sustained)"
+    );
+    describe_counter!(
+        "rio_store_tiered_writethrough_errors_total",
+        "Tiered backend Express write-through failures (chunk served from S3 standard but Express not warmed)"
+    );
+    describe_histogram!(
+        "rio_store_tiered_get_duration_seconds",
+        "Tiered backend chunk GET latency, labeled by serving tier \
+         (tier=express|standard). Each arm times only its own tier's \
+         read — the standard arm excludes the failed Express probe — \
+         so the two series directly measure the Express-vs-S3-standard \
+         TTFB gap the cache tier exists to buy."
+    );
+    // Spec'd in observability.typ ahead of P0585 (Express eviction
+    // sweeper); register HELP text now so the metrics_registered
+    // spec→describe gate passes, the sweeper adds the emit sites.
+    describe_gauge!(
+        "rio_store_express_bytes",
+        "Per-AZ Express bucket size in bytes (labeled az_id; emitted by the lease-holding sweeper)"
+    );
+    describe_counter!(
+        "rio_store_express_evicted_total",
+        "Chunks deleted from Express by the eviction sweeper (labeled az_id)"
+    );
     describe_counter!(
         "rio_store_gc_path_resurrected_total",
         "Paths skipped by sweep because a new referrer appeared between mark and sweep (race window)"
@@ -173,6 +251,20 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_hmac_rejected_total",
         "PutPath rejections by HMAC assignment-token check (labeled by reason)"
+    );
+    describe_counter!(
+        "rio_store_putpath_incomplete_total",
+        "PutPathChunked streams that ended before every Begin.novel chunk \
+         arrived (builder crash mid-upload or transport failure). \
+         Infra-retry condition, not an alert."
+    );
+    describe_counter!(
+        "rio_store_putpath_verify_unavailable_total",
+        "PutPathChunked uploads aborted by a transient failure: a chunk \
+         PUT failed, a referenced chunk was GC-claimed between the \
+         builder's HasChunks probe and the commit's presence proof, or \
+         a chunk re-fetch during file-digest verification failed. The \
+         builder retries."
     );
     describe_counter!(
         "rio_store_service_token_accepted_total",
@@ -280,6 +372,14 @@ pub fn describe_metrics() {
          suggests under-sized fetcher pods (see I-208)."
     );
     describe_counter!(
+        "rio_store_putpath_concurrent_wait_total",
+        "Concurrent same-path PutPath/PutPathChunked waits resolved, labeled \
+         by outcome: completed (winner committed; waiter took the idempotent \
+         skip), takeover (winner aborted; waiter claimed the freed \
+         placeholder), timeout (budget exhausted; ABORTED surfaced to the \
+         client's own retry logic)."
+    );
+    describe_counter!(
         "rio_store_substitute_probe_cache_hits_total",
         "check_available HEAD-probe cache hits (positive or negative cached \
          result; no upstream HEAD made for this path)."
@@ -322,6 +422,27 @@ pub fn describe_metrics() {
         "PG connection-pool utilization: (size - num_idle) / max_connections. \
          Updated on each StoreAdminService.GetLoad call (ComponentScaler 10s tick). \
          Sustained > 0.8 = under-provisioned store replicas (I-105 cliff approaching)."
+    );
+
+    describe_counter!(
+        "rio_store_nar_index_cache_hits_total",
+        "GetNarIndex/GetNarIndexBatch requests served from the nar_index table \
+         (the index is written eagerly in the manifest-complete transaction; \
+         there is no recompute path)"
+    );
+
+    // ADR-022 castore RPC surface (P0573 / P0577).
+    describe_histogram!(
+        "rio_store_directory_get_seconds",
+        "GetDirectory wall time per RPC (recursive BFS over the Directory DAG)"
+    );
+    describe_histogram!(
+        "rio_store_directory_has_batch_size",
+        "Digest-list length per HasDirectories/HasBlobs/HasChunks call (labeled rpc)"
+    );
+    describe_histogram!(
+        "rio_store_directory_read_seconds",
+        "ReadBlob wall time per RPC (chunk fetch + slice + stream)"
     );
 
     // Pre-register drain gauges at 0. metrics-rs only materializes a gauge

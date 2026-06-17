@@ -306,14 +306,19 @@ const SERVICE_GATED: &[&str] = &[
     "ExportSlaCorpus",
     "HwClassSampled",
     "GetHwClassConfig",
-];
-const UNGATED_PUBLIC: &[&str] = &[
     "GetDerivationLogs",
     "ClusterStatus",
     "ListExecutors",
     "ListBuilds",
     "DebugListExecutors",
 ];
+// Empty since the CVE-2023-32082-analog fix: GetDerivationLogs/
+// ClusterStatus/ListExecutors/ListBuilds/DebugListExecutors leaked any
+// build's logs and cluster/executor topology to anything that could
+// reach port 9001 (builders included). The dashboard never needed an
+// ungated path — its nginx mints `caller: rio-dashboard` per request
+// for every readonly route (nix/dashboard-nginx.conf).
+const UNGATED_PUBLIC: &[&str] = &[];
 
 /// Every mutating AdminService RPC is service-token gated. Builders
 /// share port 9001 with this service (CCNP allows scheduler:9001 at L4
@@ -501,6 +506,42 @@ async fn read_path_rpcs_require_service_token() {
     assert_gated!(
         "MintExecutorTokens",
         svc.mint_executor_tokens(Request::new(MintExecutorTokensRequest::default()))
+    );
+    assert_gated!("ClusterStatus", svc.cluster_status(Request::new(())));
+    assert_gated!(
+        "ListExecutors",
+        svc.list_executors(Request::new(ListExecutorsRequest::default()))
+    );
+    assert_gated!(
+        "ListBuilds",
+        svc.list_builds(Request::new(ListBuildsRequest::default()))
+    );
+    assert_gated!(
+        "DebugListExecutors",
+        svc.debug_list_executors(Request::new(()))
+    );
+
+    // GetDerivationLogs is server-streaming with the grpc-web
+    // Trailers-Only convention (same as TriggerGC in
+    // [`mutating_rpcs_require_service_token`]): the error is yielded
+    // IN-STREAM, not as handler-level Err.
+    let mut stream = svc
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            derivation_path: "nonexist".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("server-streaming handler returns Ok(stream)")
+        .into_inner();
+    let status = stream
+        .next()
+        .await
+        .expect("one item")
+        .expect_err("first item is Err(PermissionDenied)");
+    assert_eq!(
+        status.code(),
+        denied,
+        "GetDerivationLogs must be service-token gated"
     );
 }
 

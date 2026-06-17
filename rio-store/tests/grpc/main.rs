@@ -26,7 +26,8 @@ pub use rio_store::test_helpers::{
     mem_backend, put_path, put_path_raw, spawn_store_service as spawn_store_server,
 };
 use rio_test_support::fixtures::{
-    make_large_nar, make_nar, make_path_info_for_nar, pseudo_random_bytes, test_store_path,
+    make_large_nar, make_nar, make_path_info, make_path_info_for_nar, pseudo_random_bytes,
+    test_store_path,
 };
 use rio_test_support::{TestDb, TestResult};
 
@@ -113,7 +114,7 @@ impl StoreSession {
     /// as rio-gateway. For testing the assignment-token enforcement.
     pub async fn new_with_hmac(key: Vec<u8>) -> anyhow::Result<Self> {
         let verifier = rio_auth::hmac::HmacVerifier::from_key(key);
-        Self::build(|pool| StoreServiceImpl::new(pool).with_hmac_verifier(verifier)).await
+        Self::build(|pool| StoreServiceImpl::new(pool).with_hmac_verifier(Arc::new(verifier))).await
     }
 
     /// Store with BOTH assignment-token verifier and service-token
@@ -125,7 +126,9 @@ impl StoreSession {
     ) -> anyhow::Result<Self> {
         let db = TestDb::new(&MIGRATOR).await;
         let service = StoreServiceImpl::new(db.pool.clone())
-            .with_hmac_verifier(rio_auth::hmac::HmacVerifier::from_key(assignment_key))
+            .with_hmac_verifier(Arc::new(rio_auth::hmac::HmacVerifier::from_key(
+                assignment_key,
+            )))
             .with_service_hmac_verifier(Arc::new(rio_auth::hmac::HmacVerifier::from_key(
                 service_key,
             )));
@@ -141,6 +144,33 @@ impl StoreSession {
             Arc::clone(&backend) as Arc<dyn ChunkBackend>
         ));
         let s = Self::build(|pool| StoreServiceImpl::new(pool).with_chunk_cache(cache)).await?;
+        Ok((s, backend))
+    }
+
+    /// Store with a CALLER-SUPPLIED chunk backend — for fault- and
+    /// latency-injecting backends (verify-pipeline tests).
+    pub async fn new_chunked_with_backend(backend: Arc<dyn ChunkBackend>) -> anyhow::Result<Self> {
+        let cache = Arc::new(rio_store::cas::ChunkCache::new(Arc::clone(&backend)));
+        Self::build(|pool| StoreServiceImpl::new(pool).with_chunk_cache(cache)).await
+    }
+
+    /// Chunk backend AND assignment-token verifier. `PutPathChunked`
+    /// hard-requires a chunk backend, so the HMAC enforcement tests
+    /// for it can't use [`Self::new_with_hmac`] (inline-only).
+    pub async fn new_chunked_with_hmac(
+        key: Vec<u8>,
+    ) -> anyhow::Result<(Self, Arc<MemoryChunkBackend>)> {
+        let backend = mem_backend();
+        let cache = Arc::new(rio_store::cas::ChunkCache::new(
+            Arc::clone(&backend) as Arc<dyn ChunkBackend>
+        ));
+        let verifier = rio_auth::hmac::HmacVerifier::from_key(key);
+        let s = Self::build(|pool| {
+            StoreServiceImpl::new(pool)
+                .with_chunk_cache(cache)
+                .with_hmac_verifier(Arc::new(verifier))
+        })
+        .await?;
         Ok((s, backend))
     }
 }
@@ -240,10 +270,17 @@ pub async fn put_path_with_token(
 mod admin;
 mod chunk_service;
 mod chunked;
+mod concurrent;
 mod core;
+mod directory;
+mod drv_blob;
+mod external_door;
 mod hash_part;
 mod hmac;
+mod nar_index;
+mod put_path_chunked;
 mod realisations;
 mod reassembly;
 mod signing;
+mod tenancy;
 mod trailer;

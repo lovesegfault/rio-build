@@ -216,8 +216,15 @@ impl Helm {
             args.extend(["--set-json".into(), format!("{k}={v}")]);
         }
         if let Some(t) = self.wait {
+            // --wait-for-jobs (helm >= 3.5): --wait alone does NOT
+            // watch Jobs. Without it, when the migration set is
+            // unchanged (most upgrades) app pods pass their schema
+            // check, --wait goes green, and a FAILED rio-migrate Job
+            // (e.g. ESO refreshInterval lagging a master-password
+            // rotation) is silently invisible.
             args.extend([
                 "--wait".into(),
+                "--wait-for-jobs".into(),
                 "--timeout".into(),
                 format!("{}s", t.as_secs()),
             ]);

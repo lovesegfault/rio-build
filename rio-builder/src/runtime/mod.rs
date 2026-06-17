@@ -1,15 +1,16 @@
 //! Worker runtime: the `'reconnect` event loop and build-task spawning.
 //!
-//! Glue between main.rs's bootstrap and the executor/FUSE/upload
-//! subsystems. [`setup`] wires up cgroups, gRPC clients, FUSE mount,
-//! relay, heartbeat; [`run`] drives the reconnect loop until the single
-//! build completes or drain finishes.
+//! Glue between main.rs's bootstrap and the executor/castore-FUSE/upload
+//! subsystems. [`setup`] wires up cgroups, gRPC clients, relay,
+//! heartbeat; [`run`] drives the reconnect loop until the single build
+//! completes or drain finishes. The castore-FUSE itself is mounted per
+//! build inside `executor::execute_build`.
 //!
 //! Submodules (each a clean extraction with no cross-cutting state):
 //! - `slot`: single-build occupancy + cancel target
 //! - `heartbeat`: heartbeat construction + spawn loop
-//! - `prefetch`: PrefetchHint handling + warm-gate ACK
-//! - `setup`: cold-start wiring (identity, cgroup, connect, FUSE)
+//! - `prefetch`: PrefetchHint warm-gate ACK
+//! - `setup`: cold-start wiring (identity, cgroup, connect)
 //! - `drain`: SIGTERM drain gate + build-flushed wait
 
 mod drain;
@@ -25,7 +26,6 @@ pub use setup::setup;
 pub use slot::{BuildSlot, BuildSlotGuard, try_cancel_build};
 
 use drain::{reconnect_drain_gate, wait_build_flushed};
-use prefetch::PrefetchDeps;
 use result::{
     err_completion, final_footer_result, ok_completion, panic_completion, send_completion,
 };
@@ -36,10 +36,7 @@ use crate::cgroup::ResourceSnapshotHandle;
 // Test-only re-exports: the `mod tests` block below predates the
 // submodule split and pulls everything via `super::*`.
 #[cfg(test)]
-use {
-    prefetch::PREFETCH_WARM_SIZE_CAP_BYTES, rio_proto::types::PrefetchHint,
-    setup::resolve_executor_identity, setup::validate_host_arch, tokio::sync::Semaphore,
-};
+use {setup::resolve_executor_identity, setup::validate_host_arch};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -88,11 +85,14 @@ pub type HwBenchHandle = Arc<
 pub struct BuildSpawnContext {
     /// `StoreService` over the balanced channel. `.store` goes to
     /// `execute_build` (drv fetch, upload, query); the full bundle is
-    /// held by `NixStoreFs` (set at FUSE mount) so the JIT `lookup`
-    /// callback can reach it.
-    pub store_clients: crate::fuse::StoreClients,
+    /// also what each build's castore-FUSE opener fetches through.
+    pub store_clients: crate::store_fetch::StoreClients,
     pub executor_id: String,
-    pub fuse_mount_point: PathBuf,
+    /// Process-level castore-FUSE settings (mountd socket, dirs, fetch
+    /// budgets, shared circuit breaker). Threaded into each spawned
+    /// task's `ExecutorEnv`; the executor mounts the per-build session
+    /// from them.
+    pub castore: crate::castore_fuse::session::CastoreSettings,
     pub overlay_base_dir: PathBuf,
     pub stream_tx: mpsc::Sender<ExecutorMessage>,
     /// Single-build occupancy. Heartbeat reads `slot.running()`;
@@ -124,15 +124,6 @@ pub struct BuildSpawnContext {
     /// matches what the heartbeat told the scheduler — a drv routed for
     /// `i686-linux` is then accepted by the x86_64 daemon.
     pub systems: Arc<[String]>,
-    /// Handle to the FUSE local cache. Threaded into `ExecutorEnv` so
-    /// the executor can `register_inputs` (JIT allowlist) and
-    /// `prefetch_manifests` (I-110c) before daemon spawn.
-    pub fuse_cache: Arc<crate::fuse::cache::Cache>,
-    /// Base per-fetch gRPC timeout for the FUSE cache's `GetPath`.
-    /// JIT lookup scales it per path via `jit_fetch_timeout(this,
-    /// nar_size)` (I-178). Same value passed to
-    /// [`handle_prefetch_hint`].
-    pub fuse_fetch_timeout: Duration,
     /// k8s `spec.nodeName` (from `Config.node_name`, downward API).
     /// Attached to every `CompletionReport` for ADR-023's hw_class
     /// join. `None` outside k8s (empty config string).
@@ -216,7 +207,7 @@ impl BuildSpawnContext {
     /// here, not at every `execute_build` call site.
     pub fn executor_env(&self, cancelled: Arc<AtomicBool>) -> executor::ExecutorEnv {
         executor::ExecutorEnv {
-            fuse_mount_point: self.fuse_mount_point.clone(),
+            castore: self.castore.clone(),
             overlay_base_dir: self.overlay_base_dir.clone(),
             executor_id: self.executor_id.clone(),
             log_limits: self.log_limits,
@@ -238,8 +229,6 @@ impl BuildSpawnContext {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
-            fuse_cache: Some(Arc::clone(&self.fuse_cache)),
-            fuse_fetch_timeout: self.fuse_fetch_timeout,
             cancelled,
         }
     }
@@ -437,7 +426,6 @@ pub async fn spawn_build_task(
         ctx.completion_pending
             .store(true, std::sync::atomic::Ordering::Release);
 
-        let mut store_client = ctx.store_clients.store.clone();
         // Same Arc as the slot's cancel flag. execute_build polls it
         // during the pre-cgroup phase (I-166).
         let build_env = ctx.executor_env(Arc::clone(&cancelled));
@@ -506,7 +494,7 @@ pub async fn spawn_build_task(
             let o = executor::execute_build(
                 &assignment,
                 &build_env,
-                &mut store_client,
+                &ctx.store_clients,
                 &ctx.stream_tx,
                 prev_line_count,
             )
@@ -655,10 +643,6 @@ pub async fn spawn_build_task(
 pub struct BuilderRuntime {
     scheduler_client: WorkerClient,
     shutdown: rio_common::signal::Token,
-    /// FUSE mount session. Dropped explicitly in [`run`]'s teardown
-    /// (NOT here) so the abort-then-sleep ordering in `r[builder.shutdown.fuse-abort]`
-    /// stays adjacent to the comment that explains it.
-    fuse_session: crate::fuse::FuseMount,
     relay_target_tx: watch::Sender<Option<mpsc::Sender<ExecutorMessage>>>,
     slot: Arc<BuildSlot>,
     draining: Arc<AtomicBool>,
@@ -676,9 +660,6 @@ pub struct BuilderRuntime {
     /// every `build_execution` open. Empty in dev mode → omitted.
     /// See `r[sec.executor.identity-token]`.
     executor_token: String,
-    /// Prefetch handler dependencies. Bundled so [`run`] can call
-    /// [`handle_prefetch_hint`] without 7 loose fields.
-    prefetch: PrefetchDeps,
     idle_timeout: Duration,
     /// Probe-loop guards for both balanced channels. Held for process
     /// lifetime (dropping a `BalancedChannel` stops its probe loop).
@@ -686,8 +667,7 @@ pub struct BuilderRuntime {
 }
 
 /// Drive the `'reconnect` loop until the single build completes or drain
-/// finishes, then run exit teardown (heartbeat abort, `DrainExecutor`,
-/// FUSE abort).
+/// finishes, then run exit teardown (heartbeat abort).
 ///
 /// `select!` is biased toward shutdown: poll it FIRST each iteration.
 /// Without `biased;`, `select!` picks a ready branch pseudorandomly —
@@ -796,9 +776,8 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
 
         let stream_end = loop {
             if rt.heartbeat_handle.is_finished() {
-                // bail! not exit(1): unwind the stack so fuse_session
-                // (above) drops → Mount::drop → fusermount -u.
-                // exit(1) would leak the mount → next start EBUSY.
+                // bail! not exit(1): unwind the stack so any in-flight
+                // build's OverlayMount/CastoreSession Drops run.
                 // Skip teardown: heartbeat is the scheduler probe; if
                 // it's dead the stream is already going.
                 anyhow::bail!("heartbeat loop terminated unexpectedly");
@@ -906,23 +885,14 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
                                 paths = prefetch.store_paths.len(),
                                 "received prefetch hint"
                             );
-                            handle_prefetch_hint(
-                                prefetch,
-                                Arc::clone(&rt.prefetch.cache),
-                                rt.prefetch.clients.clone(),
-                                rt.prefetch.runtime.clone(),
-                                Arc::clone(&rt.prefetch.sem),
-                                rt.prefetch.fetch_timeout,
-                                Arc::clone(&rt.prefetch.circuit),
-                                // Warm-gate ACK goes through the
-                                // permanent sink (same as completions
-                                // and log batches) — survives stream
-                                // reconnect. A worker that warms then
-                                // briefly loses its stream still
-                                // delivers PrefetchComplete to the new
-                                // leader once the relay reconnects.
-                                rt.build_ctx.stream_tx.clone(),
-                            );
+                            // Warm-gate ACK goes through the permanent
+                            // sink (same as completions and log
+                            // batches) — survives stream reconnect. A
+                            // worker that ACKs then briefly loses its
+                            // stream still delivers PrefetchComplete
+                            // to the new leader once the relay
+                            // reconnects.
+                            handle_prefetch_hint(prefetch, rt.build_ctx.stream_tx.clone());
                         }
                         None => {
                             tracing::warn!("received empty scheduler message");
@@ -1013,10 +983,11 @@ async fn reconnect_backoff(rt: &BuilderRuntime) -> std::ops::ControlFlow<()> {
     }
 }
 
-/// Exit teardown after `'reconnect` breaks: heartbeat abort, FUSE
-/// abort. By now `in_flight=0` (drain_done fired, or the single build
-/// returned its permit). Deregistration happens via the stream-close
-/// that follows (process exit drops the bidi → `ExecutorDisconnected`);
+/// Exit teardown after `'reconnect` breaks: heartbeat abort. By now
+/// `in_flight=0` (drain_done fired, or the single build returned its
+/// permit) and the build's own teardown already dropped its overlay and
+/// castore session. Deregistration happens via the stream-close that
+/// follows (process exit drops the bidi → `ExecutorDisconnected`);
 /// heartbeat already reported `draining=true` during the wait.
 fn run_teardown(rt: BuilderRuntime) {
     // r[impl builder.ephemeral.exit-aborts-heartbeat+2]
@@ -1027,40 +998,6 @@ fn run_teardown(rt: BuilderRuntime) {
     // hazards), and any in-flight HeartbeatRequest is harmless.
     rt.heartbeat_handle.abort();
     info!("drain complete, exiting");
-
-    // r[impl builder.shutdown.fuse-abort]
-    // I-165: abort the FUSE connection FIRST. The builder both serves
-    // this mount (fuser threads) and consumes it (spawn_blocking
-    // symlink_metadata from the warm loop). If warm-stat threads are
-    // parked in the kernel's FUSE request queue when the runtime tears
-    // down, they're uninterruptible — exit_group() can't reap them and
-    // the process hangs (observed: main zombie + 4× D-state stat
-    // threads). The fusectl abort makes the kernel return ECONNABORTED
-    // to all pending requests, so the D-state threads wake BEFORE the
-    // session drops and the runtime exits. Then:
-    //   - drop the inner Mount → fusermount -u (lazy MNT_DETACH; with
-    //     no pending requests this completes immediately)
-    //   - detached fuser-bg thread sees ENODEV on /dev/fuse read
-    //     → Session::run() returns → Filesystem::destroy() runs
-    //     (flushes passthrough-failure stats, profraw)
-    //
-    // The race: main thread can reach libc exit() before the detached
-    // FUSE thread processes DESTROY → destroy() never runs → profraw
-    // lost for that code. The short sleep gives the FUSE thread time
-    // to process DESTROY in the common case. It's best-effort — if the
-    // mount is busy (fusermount fails EBUSY) or the FUSE thread is
-    // stuck on a slow request, destroy() won't run. That's fine:
-    // kernel unmounts on process death anyway (the fd closes); a
-    // missed flush only loses profraw for this one build.
-    //
-    // Why not umount_and_join()? It takes self by value — if it
-    // blocks (busy mount → join never returns), there's no clean way
-    // to fall back to the Drop path without fuse_session ownership
-    // gymnastics. The Drop path is already correct for shutdown
-    // (mount cleaned up, process exits); it's only the profraw
-    // flush we're optimizing for, and a sleep is sufficient.
-    drop(rt.fuse_session);
-    std::thread::sleep(std::time::Duration::from_millis(200));
 }
 
 /// Handle a `WorkAssignment` arriving on the stream: gate (generation
@@ -2535,7 +2472,7 @@ mod tests {
     /// is the lesser evil — a build the scheduler already cancelled
     /// has no client waiting on its real outcome.
     ///
-    // r[verify builder.cancel.pre-cgroup-deferred]
+    // r[verify builder.cancel.pre-cgroup-deferred+3]
     #[test]
     fn cancel_build_cgroup_missing_keeps_flag() {
         // Path that definitely doesn't exist. tmpdir/nonexistent so
@@ -2604,184 +2541,28 @@ mod tests {
         assert_eq!(req.supported_features, features);
     }
 
-    /// I-212: when the JIT allowlist is armed, `handle_prefetch_hint`
-    /// MUST skip paths the build can never read (jit_classify=NotInput).
-    /// The scheduler's per-assignment hint over-includes (sends ALL
-    /// outputs of each input drv — e.g., 2.9 GB clang-debug when only
-    /// clang-out is declared). Filter at the latest possible point
-    /// (inside the spawned task, after the sem permit) so register_inputs
-    /// has the widest window to land first.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_prefetch_hint_filters_not_input_when_armed() {
-        use rio_test_support::fixtures::{make_nar, make_path_info, test_store_basename};
-        use rio_test_support::grpc::spawn_mock_store;
-
-        let dir = tempfile::tempdir().unwrap();
-        let cache = Arc::new(crate::fuse::cache::Cache::new(dir.path().to_path_buf()).unwrap());
-        let (store, addr, _srv) = spawn_mock_store().await.unwrap();
-        let ch = rio_proto::client::connect_channel(&addr.to_string())
-            .await
-            .unwrap();
-        let clients = crate::fuse::StoreClients::from_channel(ch);
-
-        // Seed both paths so a fetch (if attempted) would succeed.
-        let known = test_store_basename("i212-known");
-        let extra = test_store_basename("i212-extra");
-        for b in [&known, &extra] {
-            let p = format!("/nix/store/{b}");
-            let (nar, hash) = make_nar(b"x");
-            store.seed(make_path_info(&p, &nar, hash), nar);
-        }
-
-        // Arm JIT with ONLY `known`. `extra` → NotInput.
-        cache.register_inputs([(known.clone(), 1)]);
-
+    /// The scheduler gates dispatch on receiving `PrefetchComplete`
+    /// (`r[sched.assign.warm-gate]`). The castore cutover removed the
+    /// builder-side pre-warm, but the ACK must still go out for every
+    /// hint — without it the executor stays cold in the scheduler's
+    /// view and never receives an assignment.
+    // r[verify builder.warmgate.handshake+2]
+    #[tokio::test]
+    async fn prefetch_hint_acks_warm_gate() {
         let (tx, mut rx) = mpsc::channel(4);
         handle_prefetch_hint(
-            PrefetchHint {
-                store_paths: vec![format!("/nix/store/{known}"), format!("/nix/store/{extra}")],
+            rio_proto::types::PrefetchHint {
+                store_paths: vec!["/nix/store/abc-x".into()],
             },
-            Arc::clone(&cache),
-            clients,
-            tokio::runtime::Handle::current(),
-            Arc::new(Semaphore::new(4)),
-            Duration::from_secs(5),
-            Arc::new(crate::fuse::circuit::CircuitBreaker::default()),
             tx,
         );
-
-        // Joiner sends PrefetchComplete after all per-path tasks finish.
-        let ack = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        let ack = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
-            .expect("ACK within 10s")
+            .expect("ACK within 5s")
             .expect("channel open");
         assert!(
-            matches!(
-                ack.msg,
-                Some(rio_proto::types::executor_message::Msg::PrefetchComplete(_))
-            ),
+            matches!(ack.msg, Some(executor_message::Msg::PrefetchComplete(_))),
             "expected PrefetchComplete ACK, got: {ack:?}"
-        );
-
-        assert!(
-            dir.path().join(&known).exists(),
-            "known input MUST be fetched"
-        );
-        assert!(
-            !dir.path().join(&extra).exists(),
-            "I-212: NotInput path MUST be skipped when JIT armed"
-        );
-    }
-
-    /// I-212: when JIT is NOT armed (initial warm-gate hint, before any
-    /// assignment), the filter MUST NOT fire — every hinted path is
-    /// fetched. Skipping here would defeat the warm cache.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_prefetch_hint_unarmed_fetches_all() {
-        use rio_test_support::fixtures::{make_nar, make_path_info, test_store_basename};
-        use rio_test_support::grpc::spawn_mock_store;
-
-        let dir = tempfile::tempdir().unwrap();
-        let cache = Arc::new(crate::fuse::cache::Cache::new(dir.path().to_path_buf()).unwrap());
-        let (store, addr, _srv) = spawn_mock_store().await.unwrap();
-        let ch = rio_proto::client::connect_channel(&addr.to_string())
-            .await
-            .unwrap();
-        let clients = crate::fuse::StoreClients::from_channel(ch);
-
-        let a = test_store_basename("i212-warm-a");
-        let b = test_store_basename("i212-warm-b");
-        for name in [&a, &b] {
-            let p = format!("/nix/store/{name}");
-            let (nar, hash) = make_nar(b"x");
-            store.seed(make_path_info(&p, &nar, hash), nar);
-        }
-        // NO register_inputs → NotArmed.
-
-        let (tx, mut rx) = mpsc::channel(4);
-        handle_prefetch_hint(
-            PrefetchHint {
-                store_paths: vec![format!("/nix/store/{a}"), format!("/nix/store/{b}")],
-            },
-            Arc::clone(&cache),
-            clients,
-            tokio::runtime::Handle::current(),
-            Arc::new(Semaphore::new(4)),
-            Duration::from_secs(5),
-            Arc::new(crate::fuse::circuit::CircuitBreaker::default()),
-            tx,
-        );
-
-        let _ack = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("ACK within 10s")
-            .expect("channel open");
-
-        assert!(
-            dir.path().join(&a).exists() && dir.path().join(&b).exists(),
-            "NotArmed → both paths fetched (warm-gate preserved)"
-        );
-    }
-
-    /// I-212: warm-gate (NotArmed) size cap. A path whose
-    /// `QueryPathInfo.nar_size` exceeds `PREFETCH_WARM_SIZE_CAP_BYTES` is
-    /// skipped; a small one alongside is still fetched. The build can
-    /// always fetch the large path on-demand via JIT lookup if it turns
-    /// out to be a real input — this only stops the warm-gate from
-    /// speculatively pulling 2.9 GB clang-debug.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_prefetch_hint_unarmed_size_cap_skips_large() {
-        use rio_test_support::fixtures::{make_nar, make_path_info, test_store_basename};
-        use rio_test_support::grpc::spawn_mock_store;
-
-        let dir = tempfile::tempdir().unwrap();
-        let cache = Arc::new(crate::fuse::cache::Cache::new(dir.path().to_path_buf()).unwrap());
-        let (store, addr, _srv) = spawn_mock_store().await.unwrap();
-        let ch = rio_proto::client::connect_channel(&addr.to_string())
-            .await
-            .unwrap();
-        let clients = crate::fuse::StoreClients::from_channel(ch);
-
-        let small = test_store_basename("i212-cap-small");
-        let large = test_store_basename("i212-cap-large");
-        let (nar, hash) = make_nar(b"x");
-        store.seed(
-            make_path_info(&format!("/nix/store/{small}"), &nar, hash),
-            nar.clone(),
-        );
-        // Large: PathInfo.nar_size lies (> cap) so QPI sees it as huge;
-        // actual NAR is tiny (we never GetPath it).
-        let mut large_info = make_path_info(&format!("/nix/store/{large}"), &nar, hash);
-        large_info.nar_size = super::PREFETCH_WARM_SIZE_CAP_BYTES + 1;
-        store.seed(large_info, nar);
-        // NotArmed → size-cap arm.
-
-        let (tx, mut rx) = mpsc::channel(4);
-        handle_prefetch_hint(
-            PrefetchHint {
-                store_paths: vec![format!("/nix/store/{small}"), format!("/nix/store/{large}")],
-            },
-            Arc::clone(&cache),
-            clients,
-            tokio::runtime::Handle::current(),
-            Arc::new(Semaphore::new(4)),
-            Duration::from_secs(5),
-            Arc::new(crate::fuse::circuit::CircuitBreaker::default()),
-            tx,
-        );
-
-        let _ack = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("ACK within 10s")
-            .expect("channel open");
-
-        assert!(
-            dir.path().join(&small).exists(),
-            "small path under cap MUST be fetched"
-        );
-        assert!(
-            !dir.path().join(&large).exists(),
-            "I-212: NotArmed path over size cap MUST be skipped"
         );
     }
 }

@@ -72,6 +72,13 @@
     },
     {
       "enum": "ExecutorError",
+      "name": "BlockingTaskPanic",
+      "crate": "rio-builder",
+      "msg": "blocking setup task panicked: {0}",
+      "doc": "A `spawn_blocking` setup/teardown task (castore mount, overlay mount/unmount, FOD verify) panicked instead of returning."
+    },
+    {
+      "enum": "ExecutorError",
       "name": "BuildFailed",
       "crate": "rio-builder",
       "msg": "build failed: {0}",
@@ -83,6 +90,13 @@
       "crate": "rio-builder",
       "msg": "build cancelled before cgroup creation",
       "doc": "Cancel flag observed before the per-build cgroup exists. I-166: distinct from the post-cgroup path (cgroup.kill → daemon EOF → `Wire(Io(UnexpectedEof))`) so `is_daemon_transient` doesn't retry it. `spawn_build_task` maps any `Err` with `cancelled=true` to `BuildResultStatus::Cancelled` regardless of variant; this variant just makes the pre-cgroup abort explicit in logs."
+    },
+    {
+      "enum": "ExecutorError",
+      "name": "CastoreMount",
+      "crate": "rio-builder",
+      "msg": "castore-FUSE mount failed: {0}",
+      "doc": "Castore-FUSE mount/serve failed (mountd handshake, DAG prefetch, FUSE_INIT). The build never started; node-local or store-side condition, so the scheduler re-queues (`InfrastructureFailure`)."
     },
     {
       "enum": "ExecutorError",
@@ -128,6 +142,13 @@
     },
     {
       "enum": "ExecutorError",
+      "name": "InputRoots",
+      "crate": "rio-builder",
+      "msg": "castore root resolution failed for {path}: {reason}",
+      "doc": "A closure path's castore root node could not be resolved (missing or corrupt NAR index). Store-state, not derivation-intrinsic — `InfrastructureFailure`."
+    },
+    {
+      "enum": "ExecutorError",
       "name": "InvalidDerivation",
       "crate": "rio-builder",
       "msg": "invalid derivation: {0}",
@@ -152,13 +173,6 @@
       "name": "Overlay",
       "crate": "rio-builder",
       "msg": "overlay setup failed: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "OverlayTaskPanic",
-      "crate": "rio-builder",
-      "msg": "overlay setup task panicked: {0}",
       "doc": ""
     },
     {
@@ -190,6 +204,83 @@
       "doc": ""
     },
     {
+      "enum": "FrameError",
+      "name": "Codec",
+      "crate": "rio-builder",
+      "msg": "postcard: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Eof",
+      "crate": "rio-builder",
+      "msg": "peer closed the connection",
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Io",
+      "crate": "rio-builder",
+      "msg": "socket: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Oversize",
+      "crate": "rio-builder",
+      "msg": "frame exceeds MAX_FRAME_BYTES ({0} > {MAX_FRAME_BYTES})",
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Truncated",
+      "crate": "rio-builder",
+      "msg": "frame truncated by the kernel (MSG_TRUNC) — peer sent an oversize datagram",
+      "doc": ""
+    },
+    {
+      "enum": "MountdError",
+      "name": "Closed",
+      "crate": "rio-builder",
+      "msg": "mountd connection closed",
+      "doc": "The daemon closed the connection or the reader thread died. Every outstanding and future request fails with this — the build's mount is gone and the build must fail as infra."
+    },
+    {
+      "enum": "MountdError",
+      "name": "Connect",
+      "crate": "rio-builder",
+      "msg": "connect {path}: {source}",
+      "doc": ""
+    },
+    {
+      "enum": "MountdError",
+      "name": "Frame",
+      "crate": "rio-builder",
+      "msg": "mountd request: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "MountdError",
+      "name": "Rejected",
+      "crate": "rio-builder",
+      "msg": "mountd rejected request: {0}",
+      "doc": "A typed protocol rejection. `ErrKind::is_build_fatal` decides whether the caller surfaces a build failure or an infra retry."
+    },
+    {
+      "enum": "MountdError",
+      "name": "Timeout",
+      "crate": "rio-builder",
+      "msg": "mountd did not reply within {0:?}",
+      "doc": ""
+    },
+    {
+      "enum": "MountdError",
+      "name": "UnexpectedReply",
+      "crate": "rio-builder",
+      "msg": "mountd reply has unexpected variant for this request",
+      "doc": ""
+    },
+    {
       "enum": "OverlayError",
       "name": "DirCreate",
       "crate": "rio-builder",
@@ -200,7 +291,7 @@
       "enum": "OverlayError",
       "name": "InvalidBuildId",
       "crate": "rio-builder",
-      "msg": "invalid build_id {0:?}: must be non-empty and contain no '/' or NUL",
+      "msg": "invalid build_id {0:?}: must match ^[A-Za-z0-9_-]{{1,255}}$ (single path component, safe to embed in overlayfs mount_data)",
       "doc": ""
     },
     {
@@ -239,6 +330,76 @@
       "doc": ""
     },
     {
+      "enum": "SessionError",
+      "name": "Fuse",
+      "crate": "rio-builder",
+      "msg": "FUSE session on the handed-off fd: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "SessionError",
+      "name": "Mountd",
+      "crate": "rio-builder",
+      "msg": "mountd: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "SessionError",
+      "name": "Prefetch",
+      "crate": "rio-builder",
+      "msg": "DAG prefetch: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "BadDigestLen",
+      "crate": "rio-builder",
+      "msg": "castore digest under {context:?} is {got} bytes, want 32",
+      "doc": "`context` is the input root's store path, or the parent directory's hex digest when the bad entry is inside a streamed `Directory` body."
+    },
+    {
+      "enum": "TreeError",
+      "name": "BadStorePath",
+      "crate": "rio-builder",
+      "msg": "store path {store_path:?} has no basename",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "DuplicateBasename",
+      "crate": "rio-builder",
+      "msg": "duplicate store-path basename {basename:?} in input_roots",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "MissingDirectory",
+      "crate": "rio-builder",
+      "msg": "directory {digest} is referenced by the DAG but was not returned by GetDirectory ({returned} bodies returned)",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "MissingRootNode",
+      "crate": "rio-builder",
+      "msg": "input root {store_path:?} has no root_node (path not yet NAR-indexed)",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "Rpc",
+      "crate": "rio-builder",
+      "msg": "GetDirectory: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "Timeout",
+      "crate": "rio-builder",
+      "msg": "GetDirectory(recursive) timed out after {0:?}",
+      "doc": ""
+    },
+    {
       "enum": "UploadError",
       "name": "InvalidReference",
       "crate": "rio-builder",
@@ -257,7 +418,14 @@
       "name": "UploadExhausted",
       "crate": "rio-builder",
       "msg": "upload failed after {MAX_UPLOAD_RETRIES} retries for {path}: {source}",
-      "doc": ""
+      "doc": "Every attempt in the retry budget failed with a retryable status. NOTE: `nix/tests/scenarios/chaos.nix` greps journald for the literal `upload failed after` substring to detect retry exhaustion — keep that substring if rewording."
+    },
+    {
+      "enum": "UploadError",
+      "name": "UploadRejected",
+      "crate": "rio-builder",
+      "msg": "upload rejected (terminal, not retried) for {path}: {source}",
+      "doc": "The store rejected the upload with a deterministic status (`InvalidArgument`, `FailedPrecondition`, `PermissionDenied`, …) or local preparation (store-path parse, output walk) failed. Retrying would fail identically, so at most one attempt was made — kept distinct from [`UploadError::UploadExhausted`] so triage can tell \"the store said no\" from \"the store kept being unreachable\"."
     },
     {
       "enum": "NameError",
@@ -285,7 +453,7 @@
       "name": "InvalidSpec",
       "crate": "rio-controller",
       "msg": "invalid spec: {0}",
-      "doc": "Failed to build a K8s object (Job, PodSpec) from the CRD spec. Usually a bad Quantity string (fuseCacheSize that doesn't parse) or some spec field we can't translate. These are OPERATOR errors — fix the CRD and reconcile retries. Not transient."
+      "doc": "Failed to build a K8s object (Job, PodSpec) from the CRD spec. Usually a missing metadata field (namespace, uid) or some spec field we can't translate. These are OPERATOR errors — fix the CRD and reconcile retries. Not transient."
     },
     {
       "enum": "Error",
@@ -293,6 +461,244 @@
       "crate": "rio-controller",
       "msg": "kubernetes API error: {0}",
       "doc": "K8s API error (connection, permission, not-found)."
+    },
+    {
+      "enum": "DirBlobError",
+      "name": "Invalid",
+      "crate": "rio-evalstore",
+      "msg": "invalid directory body: {0}",
+      "doc": "A directory body failed structural validation (bad name, duplicate, oversized entry, …). Hard error: an invalid body must never be encoded, digested, or persisted."
+    },
+    {
+      "enum": "DirBlobError",
+      "name": "TooDeep",
+      "crate": "rio-evalstore",
+      "msg": "directory nesting depth {0} exceeds maximum {MAX_NAR_DEPTH}",
+      "doc": "Nesting deeper than the NAR reader's [`MAX_NAR_DEPTH`]. The same bound for the same reason: a deeper tree can never be regenerated as a NAR the reader accepts, so committing it would create an unservable path. It also keeps the fold recursion bounded — stack depth is capped regardless of caller-supplied input."
+    },
+    {
+      "enum": "DirStoreError",
+      "name": "Build",
+      "crate": "rio-evalstore",
+      "msg": "(transparent — delegates to inner error)",
+      "doc": ""
+    },
+    {
+      "enum": "DirStoreError",
+      "name": "Decode",
+      "crate": "rio-evalstore",
+      "msg": "directory {digest} is not a valid Directory message: {source}",
+      "doc": ""
+    },
+    {
+      "enum": "DirStoreError",
+      "name": "DigestMismatch",
+      "crate": "rio-evalstore",
+      "msg": "directory blob is not canonical: requested {requested}, re-encode digests to {recomputed}",
+      "doc": ""
+    },
+    {
+      "enum": "DirStoreError",
+      "name": "Invalid",
+      "crate": "rio-evalstore",
+      "msg": "directory {digest} failed structural validation: {source}",
+      "doc": ""
+    },
+    {
+      "enum": "DirStoreError",
+      "name": "NotFound",
+      "crate": "rio-evalstore",
+      "msg": "directory {0} not in the pack store",
+      "doc": ""
+    },
+    {
+      "enum": "DirStoreError",
+      "name": "Pack",
+      "crate": "rio-evalstore",
+      "msg": "(transparent — delegates to inner error)",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "AtermRoundTrip",
+      "crate": "rio-evalstore",
+      "msg": "ATerm round-trip FAILED for derivation '{name}': rio-nix unparse(parse(aterm)) differs from nix's original bytes — refusing to continue (parser/serializer divergence)",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Corrupt",
+      "crate": "rio-evalstore",
+      "msg": "client CAS is corrupt: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Derivation",
+      "crate": "rio-evalstore",
+      "msg": "derivation error: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Dir",
+      "crate": "rio-evalstore",
+      "msg": "directory store error: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "DirBlob",
+      "crate": "rio-evalstore",
+      "msg": "directory blob error: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "ForeignPath",
+      "crate": "rio-evalstore",
+      "msg": "path '{0}' is not in the client CAS — cluster-backed reads for foreign paths arrive in ADR-024 M1; M0 serves only paths this store ingested",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Hash",
+      "crate": "rio-evalstore",
+      "msg": "hash error: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Ingest",
+      "crate": "rio-evalstore",
+      "msg": "source ingest failed: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Io",
+      "crate": "rio-evalstore",
+      "msg": "I/O error: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Nar",
+      "crate": "rio-evalstore",
+      "msg": "NAR error: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "NarHashMismatch",
+      "crate": "rio-evalstore",
+      "msg": "NAR hash cross-check FAILED for '{path}': computed sha256:{computed} but caller claimed sha256:{claimed}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "NoSuchEntry",
+      "crate": "rio-evalstore",
+      "msg": "no such entry '{rel}' in store object '{basename}'",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "OriginUnreadable",
+      "crate": "rio-evalstore",
+      "msg": "origin file '{origin}' of store object '{basename}' is unreadable: {source}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Pack",
+      "crate": "rio-evalstore",
+      "msg": "pack store error: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "PathMismatch",
+      "crate": "rio-evalstore",
+      "msg": "store path cross-check FAILED for {op} of '{name}': rio-nix computed {rust_path} but nix computed {nix_path} — refusing to continue (one of the two hashing implementations is wrong)",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "StorePath",
+      "crate": "rio-evalstore",
+      "msg": "store path error: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Unsupported",
+      "crate": "rio-evalstore",
+      "msg": "unsupported in rio-evalstore M0: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "EvalStoreError",
+      "name": "Utf8",
+      "crate": "rio-evalstore",
+      "msg": "derivation is not valid UTF-8: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "IngestError",
+      "name": "ReadDir",
+      "crate": "rio-evalstore",
+      "msg": "failed to read directory {path:?}",
+      "doc": "`readdir` of a directory failed."
+    },
+    {
+      "enum": "IngestError",
+      "name": "ReadFile",
+      "crate": "rio-evalstore",
+      "msg": "failed to read file {path:?}",
+      "doc": "`open`/`read` of a regular file failed."
+    },
+    {
+      "enum": "IngestError",
+      "name": "ReadLink",
+      "crate": "rio-evalstore",
+      "msg": "failed to read symlink target of {path:?}",
+      "doc": "`readlink` of a symlink failed."
+    },
+    {
+      "enum": "IngestError",
+      "name": "SizeChanged",
+      "crate": "rio-evalstore",
+      "msg": "file {path:?} changed size during ingest: stat said {expected}, read {actual} bytes",
+      "doc": "A file's content length changed between the discovery `lstat` and the read. The NAR length prefix is written from the stat size, so a mutating source tree would corrupt the archive — fail loud instead (same stance as rio-nix's dump truncation check)."
+    },
+    {
+      "enum": "IngestError",
+      "name": "Stat",
+      "crate": "rio-evalstore",
+      "msg": "failed to stat {path:?}",
+      "doc": "`lstat` of a tree entry failed."
+    },
+    {
+      "enum": "IngestError",
+      "name": "TooDeep",
+      "crate": "rio-evalstore",
+      "msg": "{path:?}: directory nesting depth {depth} exceeds {max}",
+      "doc": "Directory nesting exceeds [`rio_nix::nar::MAX_NAR_DEPTH`] — the same producer-side bound as rio-nix's dump (a NAR every consumer rejects must not be emitted), and what keeps the spine's recursion stack bounded."
+    },
+    {
+      "enum": "IngestError",
+      "name": "TooManyEntries",
+      "crate": "rio-evalstore",
+      "msg": "{path:?} has {count} entries, exceeding the maximum of {max}",
+      "doc": "A directory has at least [`rio_nix::nar::MAX_DIRECTORY_ENTRIES`] entries — the same producer-side bound as rio-nix's dump (a NAR every consumer rejects must not be emitted)."
+    },
+    {
+      "enum": "IngestError",
+      "name": "UnsupportedFileType",
+      "crate": "rio-evalstore",
+      "msg": "{path:?} has an unsupported file type (not regular/directory/symlink)",
+      "doc": "Entry is not a regular file, directory, or symlink (FIFO, socket, device node). NAR cannot represent it; matches nix `dumpPath`."
     },
     {
       "enum": "GatewayError",
@@ -597,6 +1003,13 @@
     },
     {
       "enum": "NarError",
+      "name": "IndexBytesTooLarge",
+      "crate": "rio-nix",
+      "msg": "cumulative entry path/target bytes {0} exceed maximum {MAX_NAR_INDEX_BYTES} (archive expands to an index larger than the store can persist or serve)",
+      "doc": ""
+    },
+    {
+      "enum": "NarError",
       "name": "InvalidEntryName",
       "crate": "rio-nix",
       "msg": "invalid NAR entry name: {name:?}",
@@ -667,6 +1080,13 @@
     },
     {
       "enum": "NarError",
+      "name": "TooManyTotalEntries",
+      "crate": "rio-nix",
+      "msg": "total archive entry count {0} exceeds maximum {MAX_NAR_ENTRIES}",
+      "doc": ""
+    },
+    {
+      "enum": "NarError",
       "name": "UnexpectedToken",
       "crate": "rio-nix",
       "msg": "expected token {expected:?}, got {got:?}",
@@ -702,6 +1122,13 @@
     },
     {
       "enum": "NarInfoError",
+      "name": "InvalidDeriver",
+      "crate": "rio-nix",
+      "msg": "invalid Deriver value {value:?}: {source}",
+      "doc": ""
+    },
+    {
+      "enum": "NarInfoError",
       "name": "InvalidFileSize",
       "crate": "rio-nix",
       "msg": "invalid FileSize value {value:?}: {source}",
@@ -712,6 +1139,13 @@
       "name": "InvalidNarSize",
       "crate": "rio-nix",
       "msg": "invalid NarSize value {value:?}: {source}",
+      "doc": ""
+    },
+    {
+      "enum": "NarInfoError",
+      "name": "InvalidReference",
+      "crate": "rio-nix",
+      "msg": "invalid References entry {value:?}: {source}",
       "doc": ""
     },
     {
@@ -807,6 +1241,13 @@
     },
     {
       "enum": "WireError",
+      "name": "CollectionPayloadTooLarge",
+      "crate": "rio-nix",
+      "msg": "collection payload {0} bytes exceeds maximum {MAX_COLLECTION_TOTAL_BYTES}",
+      "doc": ""
+    },
+    {
+      "enum": "WireError",
       "name": "CollectionTooLarge",
       "crate": "rio-nix",
       "msg": "collection count {0} exceeds maximum {MAX_COLLECTION_COUNT}",
@@ -859,6 +1300,181 @@
       "name": "StringTooLong",
       "crate": "rio-nix",
       "msg": "string length {0} exceeds maximum {MAX_STRING_LEN}",
+      "doc": ""
+    },
+    {
+      "enum": "Error",
+      "name": "Corrupt",
+      "crate": "rio-packstore",
+      "msg": "corrupt pack store: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "Error",
+      "name": "Io",
+      "crate": "rio-packstore",
+      "msg": "i/o: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "Error",
+      "name": "ReservedKind",
+      "crate": "rio-packstore",
+      "msg": "kind {0:#04x} is reserved for store-internal records",
+      "doc": ""
+    },
+    {
+      "enum": "Error",
+      "name": "TooLarge",
+      "crate": "rio-packstore",
+      "msg": "record payload too large: {0} bytes (max 4 GiB)",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
+      "name": "Duplicate",
+      "crate": "rio-proto",
+      "msg": "duplicate {field} entry {at:?}",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
+      "name": "EmptyOutputName",
+      "crate": "rio-proto",
+      "msg": "empty output name",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
+      "name": "NoOutputs",
+      "crate": "rio-proto",
+      "msg": "derivation has no outputs",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
+      "name": "Unsorted",
+      "crate": "rio-proto",
+      "msg": "{field} not sorted byte-lexicographically at {at:?}",
+      "doc": ""
+    },
+    {
+      "enum": "DirectoryError",
+      "name": "BadDigestLen",
+      "crate": "rio-proto",
+      "msg": "child digest for entry {0:?} is {1} bytes, expected 32",
+      "doc": ""
+    },
+    {
+      "enum": "DirectoryError",
+      "name": "BadTarget",
+      "crate": "rio-proto",
+      "msg": "symlink {0:?} target is {1} bytes, exceeds {MAX_CASTORE_TARGET_BYTES} (or empty)",
+      "doc": ""
+    },
+    {
+      "enum": "DirectoryError",
+      "name": "DuplicateName",
+      "crate": "rio-proto",
+      "msg": "duplicate entry name {0:?} across the directory's kind lists",
+      "doc": ""
+    },
+    {
+      "enum": "DirectoryError",
+      "name": "InvalidName",
+      "crate": "rio-proto",
+      "msg": "entry name {0:?} is not a valid single path component",
+      "doc": ""
+    },
+    {
+      "enum": "DirectoryError",
+      "name": "NameTooLong",
+      "crate": "rio-proto",
+      "msg": "entry name {0:?} is {1} bytes, exceeds {MAX_CASTORE_NAME_BYTES}",
+      "doc": ""
+    },
+    {
+      "enum": "DirectoryError",
+      "name": "TooManyEntries",
+      "crate": "rio-proto",
+      "msg": "{0} entries in one directory, exceeds {MAX_CASTORE_DIR_ENTRIES}",
+      "doc": ""
+    },
+    {
+      "enum": "DirectoryError",
+      "name": "Unsorted",
+      "crate": "rio-proto",
+      "msg": "entries not sorted byte-lexicographically by name within a kind list at {0:?}",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "BadDrvPath",
+      "crate": "rio-proto",
+      "msg": "claimed drv path is invalid: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "Decode",
+      "crate": "rio-proto",
+      "msg": "protobuf decode failed: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "DigestMismatch",
+      "crate": "rio-proto",
+      "msg": "blob digest mismatch: claimed {claimed}, computed {computed}",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "DrvPathMismatch",
+      "crate": "rio-proto",
+      "msg": "drv path mismatch: claimed {claimed}, recomputed {computed}",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "FodPathMismatch",
+      "crate": "rio-proto",
+      "msg": "fixed-output path mismatch for output {name:?}: recorded {recorded:?}, recomputed {computed}",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "Invalid",
+      "crate": "rio-proto",
+      "msg": "(transparent — delegates to inner error)",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "Nix",
+      "crate": "rio-proto",
+      "msg": "derivation invariant violated: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "NonCanonical",
+      "crate": "rio-proto",
+      "msg": "blob is not the canonical encoding of its decoded message",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "NonUtf8",
+      "crate": "rio-proto",
+      "msg": "non-UTF-8 bytes in {field} ({bytes:?})",
+      "doc": ""
+    },
+    {
+      "enum": "DrvBlobError",
+      "name": "NotADrvPath",
+      "crate": "rio-proto",
+      "msg": "claimed drv path {0:?} does not name a .drv",
       "doc": ""
     },
     {
@@ -1322,6 +1938,41 @@
       "crate": "rio-store",
       "msg": "upstream {what} exceeds {limit}-byte cap",
       "doc": "An upstream-supplied body exceeded a size cap (narinfo, `/nix-cache-info`, declared `NarSize`, or decompressed NAR). `tenant_upstreams` rows are tenant-supplied; one tenant's hostile upstream must not OOM the process-global substituter."
+    },
+    {
+      "enum": "WalkError",
+      "name": "BadRoot",
+      "crate": "rio-store",
+      "msg": "malformed root node: {0}",
+      "doc": "`RootNode.node` is unset or a digest field has the wrong length."
+    },
+    {
+      "enum": "WalkError",
+      "name": "IndexBytesTooLarge",
+      "crate": "rio-store",
+      "msg": "cumulative entry path/target bytes {seen} exceed maximum {max}",
+      "doc": "The cumulative materialized index bytes (joined entry paths plus symlink targets) of the expanded tree exceed [`rio_nix::nar::MAX_NAR_INDEX_BYTES`]."
+    },
+    {
+      "enum": "WalkError",
+      "name": "MissingDirectory",
+      "crate": "rio-store",
+      "msg": "directory {0} referenced but not supplied",
+      "doc": "A `DirectoryEntry.digest` reachable from the root has no body in the supplied map. For `PutPathChunked` this means the builder omitted a body from `Begin.directories`."
+    },
+    {
+      "enum": "WalkError",
+      "name": "TooDeep",
+      "crate": "rio-store",
+      "msg": "directory nesting depth {depth} exceeds maximum {max}",
+      "doc": "The walk reached a node nested deeper than [`rio_nix::nar::MAX_NAR_DEPTH`]. Every NAR reader (rio's own re-ingest and gateway restore, stock Nix `parseDump`) rejects such a tree, so it must never be committable — see `r[store.ingest.tree-bounds]`."
+    },
+    {
+      "enum": "WalkError",
+      "name": "TooManyNodes",
+      "crate": "rio-store",
+      "msg": "walk exceeded {0} nodes",
+      "doc": "The walk visited more nodes than the caller's cap. A Directory *DAG* expands to a *tree* on walk — a deliberately deep-and-wide DAG can reference the same subtree exponentially many times, so the node count must be bounded independently of the (already-bounded) distinct-body count."
     }
   ],
   "enums": [
@@ -1336,9 +1987,29 @@
       "doc": ""
     },
     {
+      "name": "PutSourceError",
+      "crate": "rio-build-cli",
+      "doc": ""
+    },
+    {
+      "name": "SubmitError",
+      "crate": "rio-build-cli",
+      "doc": ""
+    },
+    {
       "name": "ExecutorError",
       "crate": "rio-builder",
       "doc": "Error type for executor operations. No `#[from] anyhow::Error` — every variant has a typed source. A catch-all `#[from] anyhow::Error` would mean any `?` on an anyhow::Result anywhere in execute_build silently becomes the wrong variant. Typed sources make the compiler catch misattribution at the `?` site."
+    },
+    {
+      "name": "FrameError",
+      "crate": "rio-builder",
+      "doc": "Frame-level decode/encode errors (not protocol errors — those are [`ErrKind`])."
+    },
+    {
+      "name": "MountdError",
+      "crate": "rio-builder",
+      "doc": ""
     },
     {
       "name": "OverlayError",
@@ -1346,9 +2017,24 @@
       "doc": "Errors from overlay setup and teardown. Distinct from `anyhow::Error` so `ExecutorError::Overlay(#[from])` only catches overlay failures — a bare `?` on an unrelated `anyhow::Result` elsewhere in `execute_build` no longer silently becomes an \"overlay setup failed\" message."
     },
     {
+      "name": "SessionError",
+      "crate": "rio-builder",
+      "doc": "Errors from the mount/serve sequence. Every variant means the build never started — callers classify them as infrastructure failures (re-queue), not build failures."
+    },
+    {
+      "name": "StreamBlobError",
+      "crate": "rio-builder",
+      "doc": "Why one `ReadBlob` attempt failed: `Transient` (Unavailable/Unknown transport class) is retried by [`Opener::fetch_into`]; `Fatal` maps straight to the FUSE errno."
+    },
+    {
+      "name": "TreeError",
+      "crate": "rio-builder",
+      "doc": "Errors from DAG prefetch / tree construction. All of them mean the build never started — the caller classifies every variant as an infrastructure failure and re-queues."
+    },
+    {
       "name": "UploadError",
       "crate": "rio-builder",
-      "doc": "Errors from upload operations. NAR serialization happens inside the retry loop (each retry is a fresh disk read), so NAR errors surface as `UploadExhausted` wrapping a `tonic::Status::internal(\"NAR serialization failed...\")`."
+      "doc": "Errors from upload operations. Transient store errors that survive the whole retry budget surface as `UploadExhausted`; deterministic store rejections and local prep failures (path parse, output walk) surface as `UploadRejected`. Both carry the underlying `tonic::Status`."
     },
     {
       "name": "NameError",
@@ -1359,6 +2045,26 @@
       "name": "Error",
       "crate": "rio-controller",
       "doc": "Top-level reconcile error. kube's `Controller::run` takes an `error_policy` fn that receives this and decides requeue timing. `Box` on the finalizer variant: `finalizer::Error<Self>` is recursive (it wraps our Error for ApplyFailed/CleanupFailed). Unboxed it's an infinite-size type. Box breaks the cycle with a pointer indirection."
+    },
+    {
+      "name": "DirBlobError",
+      "crate": "rio-evalstore",
+      "doc": ""
+    },
+    {
+      "name": "DirStoreError",
+      "crate": "rio-evalstore",
+      "doc": ""
+    },
+    {
+      "name": "EvalStoreError",
+      "crate": "rio-evalstore",
+      "doc": ""
+    },
+    {
+      "name": "IngestError",
+      "crate": "rio-evalstore",
+      "doc": "Ingest failures. Every variant names the path that failed; the first failure aborts the whole ingest (all threads join, partial results are discarded)."
     },
     {
       "name": "GatewayError",
@@ -1409,6 +2115,26 @@
       "name": "WireError",
       "crate": "rio-nix",
       "doc": ""
+    },
+    {
+      "name": "Error",
+      "crate": "rio-packstore",
+      "doc": ""
+    },
+    {
+      "name": "DerivationError",
+      "crate": "rio-proto",
+      "doc": "Why an untrusted [`Derivation`] message was rejected by [`validate_derivation`]."
+    },
+    {
+      "name": "DirectoryError",
+      "crate": "rio-proto",
+      "doc": "Why a client-supplied [`Directory`] body was rejected."
+    },
+    {
+      "name": "DrvBlobError",
+      "crate": "rio-proto",
+      "doc": "Why a drv blob failed [`verify_drv_blob`] (or a proto → rio-nix conversion failed in [`from_proto`])."
     },
     {
       "name": "NarCollectError",
@@ -1474,6 +2200,11 @@
       "name": "SubstituteError",
       "crate": "rio-store",
       "doc": "Errors surfaced by the substitution path. Callers map these to gRPC status; `NotFound` is the normal miss case (no upstream has the path, or the tenant has no upstreams configured). `Clone` so moka's `try_get_with` can hand the same error to every coalesced waiter (it stores `Arc<E>` internally; we unwrap to owned)."
+    },
+    {
+      "name": "WalkError",
+      "crate": "rio-store",
+      "doc": ""
     }
   ]
 }

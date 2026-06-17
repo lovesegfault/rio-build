@@ -12,6 +12,7 @@ use crate::state::{BuildState, BuildStateExt, DerivationStatus};
 mod assignments;
 mod batch;
 mod builds;
+mod closure;
 mod derivations;
 mod history;
 mod recovery;

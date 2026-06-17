@@ -1,13 +1,16 @@
 [workspace]
 members = [
   "rio-auth",
+  "rio-build-cli",
   "rio-cli",
   "rio-common",
   "rio-controller",
+  "rio-evalstore",
   "rio-gateway",
   "rio-lease",
   "rio-migrations",
   "rio-nix",
+  "rio-packstore",
   "rio-proto",
   "rio-scheduler",
   "rio-store",
@@ -31,8 +34,10 @@ repository = "https://github.com/lovesegfault/rio-build"
 # Internal crates
 rio-auth = { path = "rio-auth" }
 rio-common = { path = "rio-common" }
+rio-evalstore = { path = "rio-evalstore" }
 rio-migrations = { path = "rio-migrations" }
 rio-nix = { path = "rio-nix" }
+rio-packstore = { path = "rio-packstore" }
 rio-proto = { path = "rio-proto" }
 rio-scheduler = { path = "rio-scheduler" }
 # default-features off so members can opt into the lean `schema` feature
@@ -58,7 +63,9 @@ ssh-key = { version = "0.7.0-rc.10", features = ["ed25519", "std"] }
 async-trait = "0.1"
 
 # gRPC
-tonic = { version = "0.14", features = ["transport"] }
+# zstd: ADR-024 — SubmitBuild skeletons compress ~4x (measured 0.235);
+# enables accept/send_compressed(Zstd) on the scheduler service.
+tonic = { version = "0.14", features = ["transport", "zstd"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 prost = "0.14"
@@ -68,7 +75,8 @@ prost-types = "0.14"
 # tls-rustls-aws-lc-rs: Aurora PG 15+ has rds.force_ssl=1 by default —
 # connections without TLS are rejected. aws-lc-rs matches the workspace
 # rustls CryptoProvider (see `rustls` dep below and tonic's tls-aws-lc).
-# Connection strings use `?sslmode=require` (encrypt, don't verify cert).
+# EKS connection strings use `?sslmode=verify-full` + the vendored RDS
+# bundle as sslrootcert (k3s/dev URLs carry no ssl params).
 sqlx = { version = "0.9", default-features = false, features = [
   "runtime-tokio",
   "postgres",
@@ -96,8 +104,21 @@ aws-config = { version = "1", default-features = false, features = [
   "sso",
 ] }
 
-# FUSE
-fuser = "0.17"
+# RDS IAM auth-token minting (rio-common's pg-iam feature).
+aws-sigv4 = { version = "1", default-features = false, features = [
+  "sign-http",
+] }
+aws-credential-types = { version = "1", default-features = false }
+aws-smithy-runtime-api = { version = "1", default-features = false }
+url = "2"
+
+# FUSE. Pinned to master for ReplyOpen::wrap_backing/BackingId::into_raw:
+# the unprivileged castore-FUSE replies open() with a backing_id allocated
+# by rio-mountd's privileged BACKING_OPEN ioctl, and 0.17.0 can only mint
+# a BackingId by doing that ioctl itself (EPERM in the builder). Drop the
+# pin at the first release containing cberner/fuser@a664f194. NAR hashes
+# for the pinned tree: crate-hashes.json + workspaceCargoVendor (flake.nix).
+fuser = { git = "https://github.com/cberner/fuser", rev = "2bdfbc53a116b9b4af5c91d20ab6a4f9b9004645" }
 
 # Linux syscalls
 nix = { version = "0.31", features = [
@@ -108,6 +129,14 @@ nix = { version = "0.31", features = [
   "hostname",
   "process",
   "signal",
+  "socket",
+  # setrlimit(RLIMIT_NOFILE) at builder startup — passthrough backing
+  # fds + chunk-cache fds scale with max_backing_ids and overflow the
+  # 1024 default soft limit.
+  "resource",
+  # fd-based directory iteration (fdopendir) in the dirfd-relative NAR
+  # dump walk — rio-nix never re-resolves a path inside a dumped tree.
+  "dir",
 ] }
 # raw_os_error()/raise()/errno constants where the `nix` crate is
 # overkill. Used as a normal dep in rio-gateway (EMFILE/ENFILE accept
@@ -171,6 +200,12 @@ smallvec = "1"
 hdrhistogram = { version = "7", default-features = false, features = [
   "serialization",
 ] }
+
+# rio-mountd UDS wire format (rio-builder castore_fuse/mountd_proto.rs):
+# one length-prefixed postcard datagram per request/response. no_std serde
+# wire format, varint-packed; replaces bincode 2.x (RUSTSEC-2025-0141
+# unmaintained).
+postcard = { version = "1", features = ["use-std"] }
 
 # Per-tenant rate limiting (phase4b gateway). DefaultKeyedRateLimiter
 # keyed on tenant_name (bounded keyspace — authorized_keys comment is

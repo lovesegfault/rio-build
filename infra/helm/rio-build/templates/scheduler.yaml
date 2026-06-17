@@ -210,7 +210,7 @@ spec:
               containerPort: 9091
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
-            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac")) | nindent 12 }}
             # All replicas contend for SAME Lease. Presence ENABLES lease mode
             # (LeaseConfig::from_env returns None without it → always-leader,
             # WRONG with replicas>1).
@@ -230,11 +230,7 @@ spec:
               value: "6"  # readinessProbe.periodSeconds (5) + 1
             - name: RIO_STORE__ADDR
               value: {{ $s.storeAddr | quote }}
-            - name: RIO_DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: rio-postgres
-                  key: url
+            {{- include "rio.pgEnv" (dict "root" . "authEnv" "RIO_PG_AUTH" "urlEnv" "RIO_DATABASE_URL") | nindent 12 }}
             {{- if $s.logS3Bucket }}
             - name: RIO_LOG_S3_BUCKET
               value: {{ $s.logS3Bucket | quote }}
@@ -252,7 +248,7 @@ spec:
             - name: RIO_DASHBOARD__CORS_ALLOW_ORIGINS
               value: {{ .Values.dashboard.cors.allowOrigins | join "," | quote }}
           volumeMounts:
-            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac" "rdsCa")) | nindent 12 }}
             # rio_common::config::load reads /etc/rio/scheduler.toml. The
             # ConfigMap carries the [sla] table + soft_features;
             # everything else stays env-driven (the config loader merges
@@ -286,7 +282,7 @@ spec:
           # TCP (NOT named gRPC). Named SchedulerService only goes SERVING
           # when is_leader=true; standby never acquires while leader healthy
           # → named-service startupProbe would crash-loop standby. Generous:
-          # migrations + PG connect + store connect ~60s worst case.
+          # schema check + PG connect + store connect ~60s worst case.
           startupProbe:
             tcpSocket: {port: 9001}
             periodSeconds: 5
@@ -294,7 +290,7 @@ spec:
           resources:
             {{- toYaml $s.resources | nindent 12 }}
       volumes:
-        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac" "rdsCa")) | nindent 8 }}
         - name: config
           configMap:
             name: rio-scheduler-config

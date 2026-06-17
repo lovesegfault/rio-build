@@ -75,11 +75,31 @@ async fn main() -> anyhow::Result<()> {
     // - Single (non-K8s): plain connect. VM tests and local dev.
     //
     // `connect_forever` → `None` only on shutdown (clean exit).
-    let Some((store_client, scheduler_client, _balance_guard)) =
+    let Some((store_client, drv_blob_client, scheduler_client, _balance_guard)) =
         rio_proto::client::connect_forever(&shutdown, || async {
-            let (store, _) = rio_proto::client::connect(&cfg.store).await?;
-            let (sched, guard) = rio_proto::client::connect(&cfg.scheduler).await?;
-            anyhow::Ok((store, sched, guard))
+            use rio_proto::client::ProtoClient as _;
+            // connect_raw: one store channel wrapped in BOTH typed
+            // clients (StoreService + DrvBlobService share the port).
+            // The store-side balance guard was already discarded by
+            // the previous `connect` call shape; behaviour unchanged.
+            let (store_ch, _store_guard) = rio_proto::client::connect_raw::<
+                rio_proto::StoreServiceClient<tonic::transport::Channel>,
+            >(&cfg.store)
+            .await?;
+            let store = rio_proto::StoreServiceClient::wrap(store_ch.clone());
+            let drv_blob = rio_proto::DrvBlobServiceClient::wrap(store_ch);
+            let (sched, guard) = rio_proto::client::connect::<
+                rio_proto::SchedulerServiceClient<tonic::transport::Channel>,
+            >(&cfg.scheduler)
+            .await?;
+            // ADR-024: compress SubmitBuild (skeletons zstd ~4x) and
+            // accept compressed BuildEvent streams. Requires a
+            // scheduler that accepts zstd - guaranteed by the
+            // scheduler-first deploy order.
+            let sched = sched
+                .send_compressed(tonic::codec::CompressionEncoding::Zstd)
+                .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
+            anyhow::Ok((store, drv_blob, sched, guard))
         })
         .await
     else {
@@ -152,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let server = rio_gateway::GatewayServer::new(store_client, scheduler_client, authorized_keys)
+        .with_drv_blob_client(drv_blob_client)
         .with_rate_limiter(limiter)
         .with_max_connections(cfg.max_connections)
         .with_max_sessions(cfg.max_sessions)

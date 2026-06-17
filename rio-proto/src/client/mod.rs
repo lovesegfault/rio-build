@@ -75,12 +75,13 @@ pub(crate) fn with_h2_keepalive(ep: tonic::transport::Endpoint) -> tonic::transp
 /// [`H2_INITIAL_STREAM_WINDOW`].
 ///
 /// Separate from [`with_h2_keepalive`] so the eager [`connect_channel`]
-/// path can take the throughput fix without keepalive: under heavy
-/// parallel-process load (workspace nextest), `keep_alive_while_idle`
-/// PING/PONG on a freshly-eager-connected channel raced and produced
-/// spurious GoAway → EIO in fetch tests. The lazy/balanced paths
-/// (long-lived channels, the production builder path) take both via
-/// [`with_h2_keepalive`].
+/// path (tests, rio-cli, short-lived ad-hoc connects) can take the
+/// throughput fix without keepalive: under heavy parallel-process load
+/// (workspace nextest), `keep_alive_while_idle` PING/PONG on a
+/// freshly-eager-connected channel raced and produced spurious GoAway
+/// → EIO in fetch tests. Long-lived channels — lazy, balanced, and the
+/// daemon single-channel path ([`connect_channel_keepalive`] via
+/// [`connect_raw`]) — take both via [`with_h2_keepalive`].
 // r[impl proto.h2.adaptive-window+2]
 pub(crate) fn with_h2_throughput(ep: tonic::transport::Endpoint) -> tonic::transport::Endpoint {
     ep.initial_stream_window_size(Some(H2_INITIAL_STREAM_WINDOW))
@@ -100,6 +101,28 @@ fn build_endpoint(addr: &str) -> anyhow::Result<tonic::transport::Endpoint> {
 
 pub async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
     with_h2_throughput(build_endpoint(addr)?)
+        .connect()
+        .await
+        .map_err(Into::into)
+}
+
+/// [`connect_channel`] plus h2 keepalive — for long-lived daemon
+/// channels on the single-channel (non-balanced) path.
+///
+/// Incident 2026-06-11: a rio-store Deployment rollout left an *idle*
+/// gateway replica holding a half-open channel to the dead store pod —
+/// `FindMissingPaths`/`GetPath` hit the client timeouts (90s/300s)
+/// until repeated failures churned the connection. The gateway's store
+/// upstream has no `balance_host` in the chart, so it took this eager
+/// single-channel path, which (unlike the lazy/balanced paths) had no
+/// keepalive. `keep_alive_while_idle` is the load-bearing setting: the
+/// wedged replica was idle, so nothing else probed the connection.
+///
+/// Kept separate from [`connect_channel`] because short-lived eager
+/// channels (tests, rio-cli, per-run GC connects) hit the keepalive
+/// PING/PONG race under nextest load — see [`with_h2_throughput`].
+async fn connect_channel_keepalive(addr: &str) -> anyhow::Result<Channel> {
+    with_h2_keepalive(build_endpoint(addr)?)
         .connect()
         .await
         .map_err(Into::into)
@@ -174,6 +197,18 @@ proto_client!(
     crate::StoreAdminServiceClient<Channel>,
     balance::STORE_HEALTH_SERVICE
 );
+proto_client!(
+    crate::DrvBlobServiceClient<Channel>,
+    balance::STORE_HEALTH_SERVICE
+);
+proto_client!(
+    crate::ChunkServiceClient<Channel>,
+    balance::STORE_HEALTH_SERVICE
+);
+proto_client!(
+    crate::DirectoryServiceClient<Channel>,
+    balance::STORE_HEALTH_SERVICE
+);
 
 /// Connect to a single-channel `addr` and wrap in a typed client.
 ///
@@ -188,7 +223,8 @@ pub async fn connect_single<C: ProtoClient>(addr: &str) -> anyhow::Result<C> {
 /// Dispatch balance-vs-single from an
 /// [`UpstreamAddrs`](rio_common::config::UpstreamAddrs) triple.
 ///
-/// `balance_host = None` → eager single-channel via `addr`.
+/// `balance_host = None` → eager single-channel via `addr`, with h2
+/// keepalive (daemon channels are process-lifetime).
 /// `balance_host = Some(host)` → health-aware [`BalancedChannel`] over
 /// `host:balance_port`, returned as the second tuple element so the
 /// caller can hold the probe-loop guard for process lifetime.
@@ -217,7 +253,7 @@ pub async fn connect_raw<C: ProtoClient>(
     match &addrs.balance_host {
         None => {
             tracing::info!(addr = %addrs.addr, service = C::HEALTH_SERVICE, "connecting (single-channel)");
-            Ok((connect_channel(&addrs.addr).await?, None))
+            Ok((connect_channel_keepalive(&addrs.addr).await?, None))
         }
         Some(host) => {
             tracing::info!(

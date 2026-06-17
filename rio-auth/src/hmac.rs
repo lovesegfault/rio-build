@@ -125,6 +125,34 @@ pub struct AssignmentClaims {
     /// upgrade of this struct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// `blake3(sorted(input_closure).join("\n"))` over the closure the
+    /// scheduler computed at dispatch (`WorkAssignment.input_closure`).
+    /// The store's `Begin` handler recomputes from the builder's echoed
+    /// closure and compares: an attestation that the closure the
+    /// refscan validates against is the one the builder was given.
+    ///
+    /// Hex so the JSON body stays readable. Empty = no attestation
+    /// (scheduler couldn't compute the closure; refscan falls back).
+    ///
+    /// Wire-compat (bug_011): `default` makes a missing key parse as
+    /// empty; `skip_serializing_if` keeps a default-valued token
+    /// byte-identical to the pre-P0589 shape so an unrolled store's
+    /// `deny_unknown_fields` still accepts it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub input_closure_digest: String,
+}
+
+impl AssignmentClaims {
+    /// `blake3(closure.join("\n"))` as lowercase hex. `closure` must
+    /// already be sorted (both producers emit sorted output).
+    ///
+    /// One definition shared by the scheduler (sign) and the store
+    /// (verify); drift here is a silent attestation bypass.
+    pub fn digest_input_closure(closure: &[String]) -> String {
+        blake3::hash(closure.join("\n").as_bytes())
+            .to_hex()
+            .to_string()
+    }
 }
 
 impl HmacClaims for AssignmentClaims {
@@ -295,6 +323,10 @@ pub fn ensure_service_caller(
 /// file, same field, and a process is one role or the other (never
 /// both), so a single struct with both methods is sufficient. The
 /// [`HmacSigner`]/[`HmacVerifier`] aliases keep call sites readable.
+///
+/// Deliberately not `Clone`: callers needing to share a verifier across
+/// service impls wrap one in `Arc` so there's exactly one copy of the
+/// key bytes in memory.
 pub struct HmacKey {
     key: Vec<u8>,
 }
@@ -480,7 +512,48 @@ mod tests {
             is_ca: false,
             expiry_unix: (now as i64 + expiry_offset_secs).max(0) as u64,
             tenant: None,
+            input_closure_digest: String::new(),
         }
+    }
+
+    /// `digest_input_closure` is order-sensitive over its newline-join
+    /// — the spec says "sorted closure" because the scheduler and the
+    /// store must produce the same bytes from the same set.
+    // r[verify common.hmac.claims]
+    #[test]
+    fn closure_digest_deterministic_and_order_sensitive() {
+        let a = vec![
+            "/nix/store/aaa-foo".to_string(),
+            "/nix/store/bbb-bar".to_string(),
+        ];
+        let b = vec![
+            "/nix/store/bbb-bar".to_string(),
+            "/nix/store/aaa-foo".to_string(),
+        ];
+        assert_eq!(
+            AssignmentClaims::digest_input_closure(&a),
+            AssignmentClaims::digest_input_closure(&a),
+        );
+        assert_ne!(
+            AssignmentClaims::digest_input_closure(&a),
+            AssignmentClaims::digest_input_closure(&b),
+        );
+        // Empty closure → digest of empty input, NOT "".
+        assert_eq!(
+            AssignmentClaims::digest_input_closure(&[]),
+            blake3::hash(b"").to_hex().to_string(),
+        );
+        // Golden vector: pins separator placement (round-trip can't).
+        assert_eq!(
+            AssignmentClaims::digest_input_closure(&a),
+            blake3::hash(b"/nix/store/aaa-foo\n/nix/store/bbb-bar")
+                .to_hex()
+                .to_string(),
+        );
+        assert_eq!(
+            AssignmentClaims::digest_input_closure(&["x".to_string()]),
+            blake3::hash(b"x").to_hex().to_string(),
+        );
     }
 
     #[test]
@@ -702,11 +775,13 @@ mod tests {
         ));
     }
 
-    /// Back-compat: a token minted WITHOUT the `tenant` field (by a
-    /// pre-tenant scheduler) must still verify under the new struct —
-    /// `#[serde(default)]` on `tenant` is load-bearing for in-flight
-    /// tokens at deploy time. `deny_unknown_fields` only rejects
-    /// EXTRA fields, not MISSING ones.
+    /// Back-compat: a token minted WITHOUT the post-P0589 fields
+    /// (`tenant`, `input_closure_digest`) by an older scheduler must
+    /// still verify under the new struct — `#[serde(default)]` on
+    /// those fields is load-bearing for in-flight tokens at deploy
+    /// time. `deny_unknown_fields` only rejects EXTRA fields, not
+    /// MISSING ones.
+    // r[verify common.hmac.claims]
     #[test]
     fn assignment_claims_tenant_backcompat() {
         let key = HmacKey::from_key(TEST_KEY.to_vec());
@@ -733,6 +808,7 @@ mod tests {
             .verify::<AssignmentClaims>(&token)
             .expect("pre-tenant token still verifies (serde default)");
         assert_eq!(claims.tenant, None);
+        assert!(claims.input_closure_digest.is_empty());
         assert_eq!(claims.executor_id, "w");
 
         // And a token WITH tenant round-trips it.

@@ -2,7 +2,8 @@
 # worker-disconnect reassignment, cgroup-tracking.
 #
 # Ports phase2a + phase2c + phase3a(cgroup) to the fixture architecture.
-# Needs the standalone fixture with 3 workers and chunk-backend TOML:
+# Needs the standalone fixture with 3 workers (the filesystem chunk
+# backend is the mkControlNode default, so no extraStoreConfig needed):
 #
 #   fixture = standalone {
 #     workers = {
@@ -11,19 +12,18 @@
 #       worker3  = { };
 #     };
 #     extraSchedulerConfig = { tickIntervalSecs = 2; };
-#     extraStoreConfig = { extraConfig = <chunk_backend filesystem>; };
 #     extraPackages = [ pkgs.postgresql ];  # psql for build_samples queries
 #   };
 #
 #
 # Fragment architecture: returns { fragments, mkTest }. default.nix
-# composes into 2 parallel VM tests (core, disrupt). fanout → fuse-direct
-# chain via FUSE cache state; all else independent.
+# composes into 2 parallel VM tests (core, disrupt); all fragments are
+# independent (no cross-fragment cache-state chains).
 # worker.overlay.stacked-lower — verify marker at default.nix:subtests[fanout]
 # worker.ns.order — verify marker at default.nix:subtests[fanout]
 #   The writableStore=false pattern in common.nix:mkWorkerNode keeps the
 #   worker VM's /nix/store as a plain 9p mount (not itself an overlay),
-#   so the per-build overlay's lowerdir=/nix/store:{fuse} stack is valid.
+#   so the per-build overlay's castore-FUSE lower stack is valid.
 #   A build succeeding also proves mount-namespace ordering: both overlayfs
 #   and nix-daemon's sandbox need unshare(CLONE_NEWNS); wrong order → fail.
 #
@@ -31,20 +31,13 @@
 # obs.metric.builder — verify marker at default.nix:subtests[load-50drv]
 # obs.metric.store — verify marker at default.nix:subtests[load-50drv]
 #
-# worker.fuse.lookup-caches — verify marker at default.nix:subtests[fanout]
-#   fanout asserts rio_builder_fuse_cache_misses_total ≥1 on each small
-#   worker. Nonzero misses prove lookup()→ensure_cached()→materialize
-#   ran and the inode→realpath mapping is cached (ops.rs:52+).
-#
-# store.inline.threshold — verify marker at default.nix:subtests[chunks]
-#   chunks builds a 300 KiB blob (> INLINE_THRESHOLD=256 KiB) and asserts
-#   chunk_after > chunk_baseline. Proves put_path.rs:494 nar_data.len()
-#   >= INLINE_THRESHOLD gate fired (tiny-text builds go inline).
-#
 # obs.metric.transfer-volume — verify marker at default.nix:subtests[chunks]
 #   chunks asserts rio_store_put_path_bytes_total delta ≥300000 after
 #   bigblob upload. Proves the volume counter (put_path.rs:574) runs on
-#   the chunked path.
+#   the chunked path. The 300 KiB blob is also above INLINE_THRESHOLD
+#   (256 KiB), so the assertion exercises the chunked (not inline)
+#   upload path; store.inline.threshold itself is verified by the
+#   rio-store unit test (tests/grpc/chunked.rs).
 #   Asserted end-to-end from /metrics scrapes via assert_metric_*: exact
 #   values (not grep '[1-9]') so CI logs show actual-vs-expected on failure.
 #
@@ -54,7 +47,9 @@
 #   (stack unwound, Drop ran) rather than death-by-signal. Also guards
 #   .#coverage: main() returning → atexit fires → profraw flushes.
 #   A main.rs refactor that breaks the select! cancellation arm would
-#   silently zero out worker VM coverage.
+#   silently zero out worker VM coverage. (The castore-FUSE is mounted
+#   per build by rio-mountd, so there is no persistent worker mount to
+#   assert on — the exit-code + profraw checks are the whole signal.)
 {
   pkgs,
   common,
@@ -153,6 +148,12 @@ let
         """SubmitBuild via plaintext gRPC direct to :9001. Returns buildId.
         Standalone fixture variant — no port-forward. Same
         `|| true` swallow-DeadlineExceeded as the k3s variant."""
+        # P0560 fixture-tenancy stopgap (P0593 deletes): grpcurl-direct
+        # submits bypass the gateway's key-comment attribution, so
+        # without an explicit tenant_name the assignment token carries
+        # no tenant and the builder's tenant-scoped castore reads fail
+        # closed. Attribute to the fixture's defaultTenant.
+        payload.setdefault("tenantName", "${fixture.defaultTenant or ""}")
         out = ${gatewayHost}.succeed(
             f"grpcurl -plaintext -max-time {max_time} "
             f"-protoset ${protoset}/rio.protoset "
@@ -187,14 +188,6 @@ let
     scenario = "scheduling";
     inherit prelude fragments fixture;
     defaultTimeout = 600;
-    # fanout populates the FUSE cache that fuse-direct reads.
-    chains = [
-      {
-        before = "fanout";
-        after = "fuse-direct";
-        msg = "fuse-direct requires fanout earlier (FUSE cache state)";
-      }
-    ];
   };
 in
 {

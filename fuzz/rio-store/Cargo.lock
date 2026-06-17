@@ -1142,6 +1142,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "console"
+version = "0.16.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d64e8af5551369d19cf50138de61f1c42074ab970f74e99be916646777f8fc87"
+dependencies = [
+ "encode_unicode",
+ "libc",
+ "unicode-width",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1661,6 +1673,12 @@ dependencies = [
  "subtle",
  "zeroize",
 ]
+
+[[package]]
+name = "encode_unicode"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
 name = "endian-type"
@@ -2877,6 +2895,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "metrics"
 version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2998,6 +3025,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -3948,6 +3976,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "blake3",
  "ed25519-dalek",
  "hmac 0.13.0",
  "jsonwebtoken",
@@ -3969,11 +3998,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-s3",
+ "aws-sigv4",
+ "aws-smithy-runtime-api",
  "axum",
  "base64",
  "config",
  "futures-util",
+ "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -3983,6 +4016,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -3991,6 +4025,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "workspace-hack",
 ]
 
@@ -3998,6 +4033,7 @@ dependencies = [
 name = "rio-migrations"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "sqlx",
  "tokio",
  "tracing",
@@ -4010,8 +4046,10 @@ name = "rio-nix"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "blake3",
  "ed25519-dalek",
  "hex",
+ "nix",
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
@@ -4026,7 +4064,9 @@ name = "rio-proto"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "futures-util",
+ "hex",
  "opentelemetry",
  "prost",
  "prost-types",
@@ -4066,6 +4106,7 @@ dependencies = [
  "httpdate",
  "metrics",
  "moka",
+ "prost",
  "reqwest",
  "rio-auth",
  "rio-common",
@@ -4087,6 +4128,7 @@ dependencies = [
  "tracing",
  "uuid",
  "workspace-hack",
+ "zstd",
 ]
 
 [[package]]
@@ -5234,6 +5276,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
@@ -5509,6 +5552,12 @@ name = "unicode-properties"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
+
+[[package]]
+name = "unicode-width"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "unicode-xid"
@@ -6103,8 +6152,10 @@ dependencies = [
  "bitflags",
  "byteorder",
  "bytes",
+ "cc",
  "chacha20",
  "cipher",
+ "console",
  "crossbeam-epoch",
  "crossbeam-utils",
  "crypto-bigint 0.7.3",
@@ -6139,6 +6190,7 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "inout",
+ "ipnet",
  "jiff",
  "k8s-openapi",
  "kube",
@@ -6217,9 +6269,6 @@ dependencies = [
  "winnow",
  "zerocopy",
  "zeroize",
- "zstd",
- "zstd-safe",
- "zstd-sys",
 ]
 
 [[package]]

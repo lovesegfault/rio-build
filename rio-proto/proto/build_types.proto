@@ -9,10 +9,11 @@ package rio.types;
 // — prost merges by package into a single `rio.types.rs`.
 
 import "google/protobuf/timestamp.proto";
-import "dag.proto";   // BuildEvent.derivation → DerivationEvent;
-                      // SubmitBuildRequest.{nodes,edges} → DerivationNode/Edge
-import "types.proto"; // HeartbeatRequest → ResourceUsage;
-                      // BuildResult.status → BuildResultStatus
+import "dag.proto";     // BuildEvent.derivation → DerivationEvent;
+                        // SubmitBuildRequest.{nodes,edges} → DerivationNode/Edge
+import "types.proto";   // HeartbeatRequest → ResourceUsage;
+                        // BuildResult.status → BuildResultStatus
+import "castore.proto"; // WorkAssignment.input_roots → InputRoot.root_node
 
 // ───────────────────────────────────────────────────────────────────────────
 // Executor kind (ADR-019 builder/fetcher split)
@@ -122,6 +123,18 @@ message BuildFailed {
   string error_message = 1;
   string failed_derivation = 2;             // Which derivation caused the failure
   BuildResultStatus status = 3;             // Failure classification (for nix-wire BuildStatus at gateway)
+
+  // Culprit attribution for fail-fast failures: the build failed because a
+  // derivation in its DAG already failed in an EARLIER build (still
+  // poisoned at merge time), so no execution ran for this build. These
+  // fields name that original culprit so the client can fetch its log via
+  // SchedulerService.GetDerivationLog and print the persisted reason. All
+  // empty/absent for live failures (the failing execution streamed its
+  // log on this build's own event stream).
+  string culprit_derivation = 4;            // .drv path of the poisoned culprit
+  string culprit_exec_id = 5;               // Execution that produced the original failure; "" = never executed
+  string culprit_error_message = 6;         // Persisted failure reason (derivations.failure_msg)
+  google.protobuf.Timestamp culprit_failed_at = 7;  // When the culprit was poisoned
 }
 
 message BuildCancelled {
@@ -325,6 +338,24 @@ message WorkAssignment {
   // string). Echoed by the worker in the log header (display-only, not
   // load-bearing). Keys logs/{drv_hash}/{exec_id}.log.zst.
   string exec_id = 13;
+  // ADR-022 castore-FUSE (P0588): castore root nodes for the FUSE
+  // mount, one per closure path. Empty if the scheduler couldn't
+  // compute the closure. Field 3 (input_paths) was reserved and is
+  // not reused.
+  repeated InputRoot input_roots = 14;
+  // Sorted transitive runtime closure of the build's inputs (BFS over
+  // narinfo.references from the dispatch-time seeds). Exactly the value
+  // the scheduler hashes into AssignmentClaims.input_closure_digest
+  // (P0589) so the builder can echo it without recomputing the BFS.
+  repeated string input_closure = 15;
+}
+
+// One closure input path with its castore root for the FUSE prefetch.
+// `root_node` is unset when the path hasn't been NAR-indexed yet
+// (P0552's indexer is async); the builder falls back to GetNarIndex.
+message InputRoot {
+  string store_path = 1;
+  rio.castore.RootNode root_node = 2;
 }
 
 // Build configuration options propagated from the client.
@@ -475,6 +506,22 @@ message SubmitBuildRequest {
   // resolves to UUID via tenants table — see r[sched.tenant.resolve].
   // Empty string = single-tenant mode.
   string tenant_name = 9;
+
+  // ADR-024 P2a pagination: the 334B/node skeleton exceeds the 16MB
+  // SubmitBuild budget around ~50k nodes, so larger submissions arrive
+  // as N pages sharing a client-chosen submission_id (unique per
+  // submission attempt; scoped to the calling tenant). Pages
+  // 0..N-2 set final_page=false and carry nodes/edges only — the
+  // scheduler stages them keyed by (tenant, submission_id) and closes
+  // the response stream immediately with zero events (clean close ==
+  // staged ack). The final page (final_page=true) carries the
+  // remainder plus the build options; the scheduler assembles all
+  // pages in arrival order, applies the SAME validation and digest
+  // bulk-verify to the assembled set, and merges it as one build.
+  // Empty submission_id = unpaged submission (final_page ignored).
+  // Staged pages expire if no final page arrives (scheduler-side TTL).
+  string submission_id = 10;
+  bool final_page = 11;
 }
 
 message WatchBuildRequest {

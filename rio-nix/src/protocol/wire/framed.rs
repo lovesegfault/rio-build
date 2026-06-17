@@ -115,6 +115,64 @@ impl<R> FramedStreamReader<R> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Streaming framed writer
+// ---------------------------------------------------------------------------
+
+/// Client-side counterpart of [`FramedStreamReader`]: writes a Nix framed
+/// byte stream (`u64(chunk_len) + chunk_data`, no padding, terminated by
+/// `u64(0)`) one frame at a time.
+///
+/// Unlike [`write_framed_stream`](super::write_framed_stream), the payload
+/// never has to be buffered in full — callers push chunks as they arrive
+/// (e.g. NAR chunks streamed off a gRPC response) and call
+/// [`finish`](Self::finish) once the source is exhausted.
+///
+/// # Aborting
+///
+/// Dropping the writer WITHOUT calling `finish` leaves the stream
+/// unterminated. That is deliberate: a caller that detects corruption
+/// mid-stream (hash mismatch at EOF) must NOT write the terminator —
+/// abandoning the connection makes the peer discard the partial payload
+/// instead of committing it.
+pub struct FramedStreamWriter<'a, W> {
+    inner: &'a mut W,
+}
+
+impl<'a, W: tokio::io::AsyncWrite + Unpin> FramedStreamWriter<'a, W> {
+    /// Wrap `inner`. The writer borrows rather than owns so the caller can
+    /// keep using the underlying connection (e.g. for the post-stream
+    /// result read) after [`finish`](Self::finish).
+    pub fn new(inner: &'a mut W) -> Self {
+        Self { inner }
+    }
+
+    /// Write one frame. Empty chunks are skipped — a zero-length frame IS
+    /// the terminator on the wire, so writing one mid-stream would
+    /// truncate the payload from the peer's point of view.
+    pub async fn write_frame(&mut self, data: &[u8]) -> super::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        // Frames larger than MAX_FRAME_SIZE would be rejected by our own
+        // FramedStreamReader (and look hostile to any bounded peer); split
+        // them rather than erroring so callers can pass whatever chunk
+        // size their source produces.
+        for piece in data.chunks(MAX_FRAME_SIZE as usize) {
+            super::write_u64(self.inner, piece.len() as u64).await?;
+            tokio::io::AsyncWriteExt::write_all(self.inner, piece).await?;
+        }
+        Ok(())
+    }
+
+    /// Write the `u64(0)` terminator. Consumes the writer so a finished
+    /// stream cannot grow more frames.
+    pub async fn finish(self) -> super::Result<()> {
+        super::write_u64(self.inner, 0).await?;
+        Ok(())
+    }
+}
+
 impl<R: AsyncRead + Unpin> AsyncRead for FramedStreamReader<R> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -415,6 +473,120 @@ pub(super) mod tests {
         assert!(reader.is_done());
         assert_eq!(reader.total_bytes_read(), data.len() as u64);
         Ok(())
+    }
+
+    // FramedStreamWriter tests
+
+    /// Helper: push `data` through FramedStreamWriter in `chunk_size`
+    /// pieces, then decode the wire bytes with FramedStreamReader.
+    async fn framed_writer_roundtrip(data: &[u8], chunk_size: usize) -> anyhow::Result<Vec<u8>> {
+        let mut wire_buf = Vec::new();
+        let mut writer = FramedStreamWriter::new(&mut wire_buf);
+        for chunk in data.chunks(chunk_size.max(1)) {
+            writer.write_frame(chunk).await?;
+        }
+        writer.finish().await?;
+        let mut reader = FramedStreamReader::new(Cursor::new(wire_buf), MAX_FRAMED_TOTAL);
+        let mut result = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut result).await?;
+        Ok(result)
+    }
+
+    #[tokio::test]
+    async fn test_framed_writer_roundtrip_via_reader() -> anyhow::Result<()> {
+        let data = b"streamed nar bytes, frame by frame";
+        assert_eq!(framed_writer_roundtrip(data, 7).await?, data);
+        assert_eq!(framed_writer_roundtrip(data, 1024).await?, data);
+        Ok(())
+    }
+
+    /// Byte-level layout: each write_frame emits `u64(len) + data` with no
+    /// padding; finish emits the lone `u64(0)` sentinel.
+    #[tokio::test]
+    async fn test_framed_writer_wire_layout() -> anyhow::Result<()> {
+        let mut wire_buf = Vec::new();
+        let mut writer = FramedStreamWriter::new(&mut wire_buf);
+        writer.write_frame(b"abc").await?;
+        writer.write_frame(b"defgh").await?;
+        writer.finish().await?;
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&3u64.to_le_bytes());
+        expected.extend_from_slice(b"abc");
+        expected.extend_from_slice(&5u64.to_le_bytes());
+        expected.extend_from_slice(b"defgh");
+        expected.extend_from_slice(&0u64.to_le_bytes());
+        assert_eq!(wire_buf, expected);
+        Ok(())
+    }
+
+    /// An empty chunk must be skipped, not written: a zero-length frame is
+    /// the stream terminator, so emitting one mid-stream would silently
+    /// truncate the payload at the peer.
+    #[tokio::test]
+    async fn test_framed_writer_skips_empty_chunks() -> anyhow::Result<()> {
+        let mut wire_buf = Vec::new();
+        let mut writer = FramedStreamWriter::new(&mut wire_buf);
+        writer.write_frame(b"start").await?;
+        writer.write_frame(b"").await?;
+        writer.write_frame(b"end").await?;
+        writer.finish().await?;
+
+        let mut reader = FramedStreamReader::new(Cursor::new(wire_buf), MAX_FRAMED_TOTAL);
+        let mut result = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut result).await?;
+        assert_eq!(result, b"startend");
+        Ok(())
+    }
+
+    /// finish() with no frames is the canonical empty stream.
+    #[tokio::test]
+    async fn test_framed_writer_empty_stream() -> anyhow::Result<()> {
+        let mut wire_buf = Vec::new();
+        FramedStreamWriter::new(&mut wire_buf).finish().await?;
+        assert_eq!(wire_buf, 0u64.to_le_bytes());
+        Ok(())
+    }
+
+    /// Dropping without finish leaves no terminator on the wire — the
+    /// abort contract that lets a caller poison a corrupt transfer.
+    #[tokio::test]
+    async fn test_framed_writer_drop_without_finish_is_unterminated() -> anyhow::Result<()> {
+        let mut wire_buf = Vec::new();
+        {
+            let mut writer = FramedStreamWriter::new(&mut wire_buf);
+            writer.write_frame(b"partial").await?;
+        }
+        let mut reader = FramedStreamReader::new(Cursor::new(wire_buf), MAX_FRAMED_TOTAL);
+        let mut result = Vec::new();
+        let err = tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut result)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        Ok(())
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+            /// Arbitrary payloads split at arbitrary chunk sizes survive a
+            /// writer→reader roundtrip byte-for-byte.
+            #[test]
+            fn framed_writer_reader_roundtrip(
+                data in proptest::collection::vec(any::<u8>(), 0..4096),
+                chunk_size in 1usize..512,
+            ) {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let result = framed_writer_roundtrip(&data, chunk_size).await.unwrap();
+                    prop_assert_eq!(result, data);
+                    Ok(())
+                })?;
+            }
+        }
     }
 
     #[test]

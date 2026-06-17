@@ -82,19 +82,74 @@ fn compute_local_nar_hash(path: &Path, algo: FodHashAlgo) -> anyhow::Result<Vec<
 /// multi-GB blobs (CUDA runfiles, JDK bundles, model weights) into
 /// fetcher pods sized at `LOCAL_MEM_BYTES` ≈ 2 GiB; a `fs::read` here
 /// would OOM the pod after the download already succeeded.
-fn compute_local_flat_hash(path: &Path, algo: FodHashAlgo) -> anyhow::Result<Vec<u8>> {
-    fn with<D: sha2::Digest>(path: &Path) -> anyhow::Result<Vec<u8>> {
-        use anyhow::Context;
-        let mut f = std::fs::File::open(path)
-            .with_context(|| format!("failed to open FOD output {}", path.display()))?;
+///
+/// Opens `rel` (the output's store basename) relative to an
+/// `upper_store` directory fd via `openat2(RESOLVE_BENEATH |
+/// RESOLVE_NO_SYMLINKS)` and rejects non-regular files: a malicious
+/// build could leave a symlink at the output path — or at any parent
+/// component it controls — pointing at an arbitrary host file whose
+/// contents hash to the declared outputHash (buildah CVE-2024-1753
+/// class); verification would then attest content the build never
+/// produced. The kernel guarantees resolution never follows a symlink
+/// in ANY component (`RESOLVE_NO_SYMLINKS`, including the final one)
+/// and never escapes `upper_store` via `..` (`RESOLVE_BENEATH`) —
+/// strictly stronger than the previous final-component-only
+/// `O_NOFOLLOW`. `O_NONBLOCK` keeps a build-planted writer-less FIFO
+/// from hanging the open; the fstat check then rejects it. Linux-only,
+/// like the rest of the builder (FUSE + io_uring).
+fn compute_local_flat_hash(
+    upper_store: &Path,
+    rel: &Path,
+    algo: FodHashAlgo,
+) -> anyhow::Result<Vec<u8>> {
+    fn with<D: sha2::Digest>(upper_store: &Path, rel: &Path) -> anyhow::Result<Vec<u8>> {
+        use anyhow::{Context, bail};
+        use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat2};
+        use nix::sys::stat::Mode;
+
+        let display = upper_store.join(rel);
+        // The upper store dir itself is builder-owned (overlay upper),
+        // not build-writable — resolving it normally once is safe.
+        let dirfd = open(
+            upper_store,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("failed to open upper store {}", upper_store.display()))?;
+        // O_NONBLOCK: a blocking open of a build-planted FIFO with no
+        // writer sleeps forever; with O_NONBLOCK it returns at once and
+        // the fstat below rejects it (no effect on regular-file reads).
+        let how = OpenHow::new()
+            .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)
+            .resolve(ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_SYMLINKS);
+        let fd = openat2(&dirfd, rel, how).with_context(|| {
+            format!(
+                "failed to open FOD output {} (symlinks are rejected)",
+                display.display()
+            )
+        })?;
+        let mut f = std::fs::File::from(fd);
+        // fstat the opened fd (not the path — no TOCTOU window) to
+        // reject the remaining non-regular kinds (directory, FIFO,
+        // device): flat hashing is only defined over regular files.
+        let meta = f
+            .metadata()
+            .with_context(|| format!("failed to stat FOD output {}", display.display()))?;
+        if !meta.is_file() {
+            bail!(
+                "FOD output {} is not a regular file ({:?})",
+                display.display(),
+                meta.file_type()
+            );
+        }
         let mut w = DigestWriter { digest: D::new() };
         std::io::copy(&mut f, &mut w)?;
         Ok(w.digest.finalize().to_vec())
     }
     match algo {
-        FodHashAlgo::Sha1 => with::<sha1::Sha1>(path),
-        FodHashAlgo::Sha256 => with::<sha2::Sha256>(path),
-        FodHashAlgo::Sha512 => with::<sha2::Sha512>(path),
+        FodHashAlgo::Sha1 => with::<sha1::Sha1>(upper_store, rel),
+        FodHashAlgo::Sha256 => with::<sha2::Sha256>(upper_store, rel),
+        FodHashAlgo::Sha512 => with::<sha2::Sha512>(upper_store, rel),
     }
 }
 
@@ -151,7 +206,9 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
             // Flat hash — stream file contents through a digest
             // sink. Same O(1)-memory contract as the recursive
             // branch above (see compute_local_flat_hash doc).
-            compute_local_flat_hash(&fs_path, algo)?
+            // Resolved relative to upper_store so the kernel-enforced
+            // RESOLVE_BENEATH/RESOLVE_NO_SYMLINKS guards apply.
+            compute_local_flat_hash(upper_store, Path::new(store_basename), algo)?
         };
 
         if computed != expected {
@@ -167,73 +224,32 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
     Ok(())
 }
 
-/// I-110c: one `BatchGetManifest` for the full input closure, then
-/// prime the FUSE cache's hint map so each JIT FUSE `GetPath` carries
-/// `manifest_hint` and the store skips its two PG lookups. ~1600 PG
-/// hits/builder → ≤2.
-///
-/// Hints for paths that turn out to be already on local disk are
-/// dropped by the cache-hit fast path in `ensure_cached` /
-/// `prefetch_path_blocking` — same code that decides hit-vs-miss, so
-/// the map drains as JIT lookups fire with no leak.
-///
-/// Any error degrades to a no-op — each per-path `GetPath` then
-/// queries PG as before. Prefetch is an optimization; it never fails
-/// the build.
-// r[impl builder.warmgate.manifest-prime]
-#[instrument(skip_all, fields(input_count = input_paths.len()))]
-pub(super) async fn prefetch_manifests(
-    store_client: &StoreServiceClient<Channel>,
-    fuse_cache: &crate::fuse::cache::Cache,
-    input_paths: &[String],
-) {
-    if input_paths.is_empty() {
-        return;
-    }
-    // No local-cache filter: already-cached paths get their unused
-    // hint dropped by the cache-hit fast path in `ensure_cached` /
-    // `prefetch_path_blocking` — same code that decides hit-vs-miss,
-    // so no leak and no race.
-
-    let mut client = store_client.clone();
-    match rio_proto::client::batch_get_manifest(
-        &mut client,
-        input_paths.to_vec(),
-        rio_common::grpc::GRPC_STREAM_TIMEOUT,
-    )
-    .await
-    {
-        Ok(entries) => {
-            let hints = entries.into_iter().filter_map(|(path, hint)| {
-                let basename = rio_nix::store_path::basename(&path)?.to_owned();
-                Some((basename, hint?))
-            });
-            fuse_cache.prime_manifest_hints(hints);
-            tracing::debug!(paths = input_paths.len(), "manifest prefetch primed");
-        }
-        Err(status) => {
-            // Any failure (Unavailable, DeadlineExceeded, …) — log and
-            // continue. The per-path JIT GetPath has its own retry;
-            // this is a best-effort optimization.
-            tracing::warn!(
-                error = %status,
-                "BatchGetManifest failed; per-path GetPath will query PG"
-            );
-        }
-    }
-}
-
 /// Fetch a .drv file from the store and parse it.
 ///
 /// Fallback when the scheduler sends `drv_content: empty` (cache-hit node
 /// or inline budget exceeded). The .drv is a single regular file in the
 /// store, so we fetch its NAR and extract the ATerm content via
 /// `extract_single_file`.
+///
+/// `assignment_token` rides along as on every other castore read: for
+/// ADR-024 native submissions the `.drv` exists only as a drv blob, and
+/// the store's GetPath fallback (`r[store.drv.getpath-fallback]`) is
+/// tenant-scoped — the token's `tenant` claim is what authorizes the
+/// read. Legacy (narinfo-backed) `.drv` paths ignore the header, so this
+/// is a no-op for the ssh-ng flow.
 #[instrument(skip_all, fields(drv_path = %drv_path))]
 pub(super) async fn fetch_drv_from_store(
     store_client: &mut StoreServiceClient<Channel>,
+    assignment_token: &str,
     drv_path: &str,
 ) -> Result<Derivation, ExecutorError> {
+    let token_pair;
+    let extra_metadata: &[(&'static str, &str)] = if assignment_token.is_empty() {
+        &[]
+    } else {
+        token_pair = [(rio_proto::ASSIGNMENT_TOKEN_HEADER, assignment_token)];
+        &token_pair
+    };
     // .drv files are small (KB range), but wrap in stream timeout: this is
     // the first gRPC call after setup_overlay, so a stalled store would hang
     // the build with an overlay mount held indefinitely.
@@ -242,8 +258,7 @@ pub(super) async fn fetch_drv_from_store(
         drv_path,
         rio_common::grpc::GRPC_STREAM_TIMEOUT,
         rio_common::limits::MAX_NAR_SIZE,
-        None,
-        &[],
+        extra_metadata,
     )
     .await
     .map_err(|e| ExecutorError::MetadataFetch {
@@ -377,6 +392,150 @@ pub(super) async fn compute_input_closure(
     }
 
     Ok(metadata)
+}
+
+/// Resolve the castore root node for every closure path the build's
+/// `/nix/store` must serve, combining the scheduler-attested
+/// `WorkAssignment.input_roots` (P0588) with a `GetNarIndexBatch`
+/// fallback for paths dispatched without a `root_node` (indexer lag,
+/// scheduler PG blip) or not dispatched at all (closure-compute
+/// timeout → empty `input_roots`).
+///
+/// The path universe is `input_roots ∪ input_metadata`: the synth-DB
+/// `ValidPaths` set (`input_metadata`, from [`compute_input_closure`])
+/// is what nix-daemon will `lstat` at sandbox setup, so every one of
+/// those paths must resolve in the castore tree; scheduler-sent roots
+/// outside the local closure are kept as-is (harmless extras). A path
+/// that needs the fallback but has no locally-known `nar_hash` (i.e.
+/// it is not in the local closure either) is dropped with a warning —
+/// the daemon never asks for it.
+///
+/// Errors are infrastructure failures: a closure path with no NAR
+/// index cannot be served lazily, so the build is re-queued instead of
+/// failing as a build defect.
+pub(super) async fn resolve_castore_roots(
+    store_client: &StoreServiceClient<Channel>,
+    assignment_token: &str,
+    assignment_roots: &[rio_proto::types::InputRoot],
+    input_metadata: &[ValidatedPathInfo],
+) -> Result<Vec<rio_proto::types::InputRoot>, ExecutorError> {
+    use std::collections::{HashMap, HashSet};
+
+    let nar_hash_by_path: HashMap<&str, [u8; 32]> = input_metadata
+        .iter()
+        .map(|m| (m.store_path.as_str(), m.nar_hash))
+        .collect();
+
+    let mut resolved: Vec<rio_proto::types::InputRoot> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    // (store_path, nar_hash) pairs still needing a GetNarIndexBatch
+    // round-trip.
+    let mut needs: Vec<(String, [u8; 32])> = Vec::new();
+
+    for root in assignment_roots {
+        seen.insert(root.store_path.as_str());
+        if root.root_node.is_some() {
+            resolved.push(root.clone());
+        } else if let Some(hash) = nar_hash_by_path.get(root.store_path.as_str()) {
+            needs.push((root.store_path.clone(), *hash));
+        } else {
+            // Scheduler closure entry the local BFS never saw (path not
+            // in the store yet) and no root_node either — nothing to
+            // mount, and the daemon won't ask for it (it's not in the
+            // synth DB). Drop with a warning so scheduler/indexer skew
+            // is visible.
+            tracing::warn!(
+                store_path = %root.store_path,
+                "input root has no root_node and no local nar_hash; dropping from castore tree"
+            );
+        }
+    }
+    for info in input_metadata {
+        if !seen.contains(info.store_path.as_str()) {
+            needs.push((info.store_path.to_string(), info.nar_hash));
+        }
+    }
+
+    if needs.is_empty() {
+        return Ok(resolved);
+    }
+
+    // One batch RPC for every unresolved path (I-110: never one unary
+    // RPC per path — the fallback can be the whole closure when the
+    // scheduler's closure compute timed out).
+    let mut client = store_client.clone();
+    // GetNarIndexBatch is identity-gated server-side (the index is a
+    // full file listing with digests); present the same assignment
+    // token the castore-FUSE data path sends on GetChunks.
+    let mut request = tonic::Request::new(rio_proto::types::GetNarIndexBatchRequest {
+        nar_hashes: needs.iter().map(|(_, h)| h.to_vec()).collect(),
+    });
+    crate::upload::common::attach_assignment_token(&mut request, assignment_token).map_err(
+        |status| ExecutorError::MetadataFetch {
+            path: needs[0].0.clone(),
+            source: status,
+        },
+    )?;
+    let infra = |path: &str, msg: String| ExecutorError::InputRoots {
+        path: path.to_owned(),
+        reason: msg,
+    };
+    let consume = async {
+        let mut stream = client
+            .get_nar_index_batch(request)
+            .await
+            .map_err(|status| ExecutorError::MetadataFetch {
+                path: needs[0].0.clone(),
+                source: status,
+            })?
+            .into_inner();
+        let mut by_hash: HashMap<Vec<u8>, Option<rio_proto::types::NarIndex>> = HashMap::new();
+        while let Some(resp) =
+            stream
+                .message()
+                .await
+                .map_err(|status| ExecutorError::MetadataFetch {
+                    path: needs[0].0.clone(),
+                    source: status,
+                })?
+        {
+            by_hash.insert(resp.nar_hash, resp.index);
+        }
+        Ok::<_, ExecutorError>(by_hash)
+    };
+    let by_hash = tokio::time::timeout(rio_common::grpc::GRPC_STREAM_TIMEOUT, consume)
+        .await
+        .map_err(|_| {
+            infra(
+                &needs[0].0,
+                "GetNarIndexBatch timed out resolving castore root nodes".to_string(),
+            )
+        })??;
+
+    for (path, hash) in &needs {
+        let index = by_hash.get(hash.as_slice()).and_then(|i| i.as_ref());
+        let Some(index) = index else {
+            // The path is in the store (compute_input_closure saw it)
+            // but has no NAR index row, so the castore-FUSE cannot
+            // serve it. Eager indexing at PutPath (P0557) makes this
+            // unreachable for freshly-uploaded paths; hitting it means
+            // pre-P0557 data or a store-side regression.
+            return Err(infra(
+                path,
+                "store has no NAR index for this path — was it uploaded before eager \
+                 indexing (P0557), or is the index backfill still running?"
+                    .to_string(),
+            ));
+        };
+        let root_node = crate::castore_fuse::session::root_node_from_nar_index(index)
+            .map_err(|e| infra(path, format!("corrupt NAR index: {e}")))?;
+        resolved.push(rio_proto::types::InputRoot {
+            store_path: path.clone(),
+            root_node: Some(root_node),
+        });
+    }
+
+    Ok(resolved)
 }
 
 /// Fetch one BFS layer's metadata via `BatchQueryPathInfo` (one RPC
@@ -561,6 +720,109 @@ mod tests {
         let expected = hex::encode(sha2::Sha256::digest(&content));
         let drv = make_fod_drv("/nix/store/test-flat-large", "sha256", &expected);
         verify_fod_hashes(&drv, &store_dir)
+    }
+
+    /// A malicious build can leave a SYMLINK at the FOD output path
+    /// pointing at an arbitrary host file whose contents hash to the
+    /// declared outputHash (buildah CVE-2024-1753 class). Flat
+    /// verification must reject the symlink — following it would attest
+    /// content the build never produced and read host files across the
+    /// sandbox boundary.
+    #[test]
+    fn test_verify_fod_flat_symlink_rejected() -> anyhow::Result<()> {
+        use sha2::Digest;
+        let content = b"host file contents the build never produced";
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        std::fs::create_dir_all(&store_dir)?;
+        // "Host" file outside the upper store.
+        let host_file = tmp.path().join("host-secret");
+        std::fs::write(&host_file, content)?;
+        // Build-written symlink at the output path.
+        std::os::unix::fs::symlink(&host_file, store_dir.join("test-flat-symlink"))?;
+
+        // Declared hash matches the symlink TARGET's contents — a
+        // verifier that follows the link would wrongly accept.
+        let declared = hex::encode(sha2::Sha256::digest(content));
+        let drv = make_fod_drv("/nix/store/test-flat-symlink", "sha256", &declared);
+
+        let err = verify_fod_hashes(&drv, &store_dir)
+            .expect_err("flat FOD verification must reject a symlinked output");
+        assert!(
+            err.to_string().contains("failed to open FOD output"),
+            "error should come from the open-time symlink rejection: {err:#}"
+        );
+        Ok(())
+    }
+
+    /// A symlink at an INTERMEDIATE component of the output path
+    /// (`upper_store/sub` → outside dir, output at `upper_store/sub/out`)
+    /// must be rejected: `O_NOFOLLOW` only guards the FINAL component, so
+    /// a path-based open would happily resolve through `sub` and hash a
+    /// file outside the upper store. `openat2(RESOLVE_BENEATH |
+    /// RESOLVE_NO_SYMLINKS)` rejects symlinks in EVERY component by
+    /// kernel guarantee.
+    #[test]
+    fn test_flat_hash_rejects_intermediate_symlink() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let upper_store = tmp.path().join("upper/nix/store");
+        std::fs::create_dir_all(&upper_store)?;
+        // "Host" dir outside the upper store, with the real file.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside)?;
+        std::fs::write(outside.join("out"), b"host data the build never produced")?;
+        // Build-written symlink at an intermediate component.
+        std::os::unix::fs::symlink(&outside, upper_store.join("sub"))?;
+
+        // Red-proven on the O_NOFOLLOW-only code: a full-path open
+        // resolved through `sub` and returned Ok(hash of host data).
+        let res = compute_local_flat_hash(&upper_store, Path::new("sub/out"), FodHashAlgo::Sha256);
+        assert!(
+            res.is_err(),
+            "flat hash must reject a symlink in an intermediate component, got {res:?}"
+        );
+
+        // `..` escape is likewise refused by RESOLVE_BENEATH (EXDEV),
+        // independent of any userspace name validation.
+        let res = compute_local_flat_hash(
+            &upper_store,
+            Path::new("../../outside/out"),
+            FodHashAlgo::Sha256,
+        );
+        assert!(
+            res.is_err(),
+            "flat hash must reject a `..` escape from the upper store, got {res:?}"
+        );
+        Ok(())
+    }
+
+    /// A FIFO at the output path must be rejected, not hung on:
+    /// `RESOLVE_NO_SYMLINKS` does not exclude FIFOs, and a blocking
+    /// `openat2` of a writer-less FIFO sleeps until a writer appears —
+    /// a build could wedge the verifier forever. `O_NONBLOCK` makes the
+    /// open return immediately so the fstat check can reject the FIFO.
+    /// Red-proven: without `O_NONBLOCK` in the openat2 `how.flags`,
+    /// this test hangs in the open.
+    #[test]
+    fn test_verify_fod_flat_fifo_rejected() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        std::fs::create_dir_all(&store_dir)?;
+        nix::unistd::mkfifo(
+            &store_dir.join("test-flat-fifo"),
+            nix::sys::stat::Mode::from_bits_truncate(0o644),
+        )?;
+
+        let declared = "00".repeat(32);
+        let drv = make_fod_drv("/nix/store/test-flat-fifo", "sha256", &declared);
+
+        let err = verify_fod_hashes(&drv, &store_dir)
+            .expect_err("flat FOD verification must reject a FIFO output");
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "error should come from the fstat file-type check: {err:#}"
+        );
+        Ok(())
     }
 
     /// Unknown algo (e.g., md5 — Nix doesn't support it, but be defensive):
@@ -811,51 +1073,6 @@ mod tests {
         Ok(())
     }
 
-    /// I-110c: `prefetch_manifests` issues ONE BatchGetManifest then
-    /// primes the FUSE cache's hint map (keyed by basename), and
-    /// `fetch_extract_insert`'s GetPath carries the hint.
-    #[tokio::test]
-    async fn test_prefetch_manifests_primes_hint_cache() -> anyhow::Result<()> {
-        use std::sync::atomic::Ordering;
-        let (store, client) = spawn_and_connect().await?;
-        let (p_a, p_b) = (tp("hint-a"), tp("hint-b"));
-        seed_with_refs(&store, &p_a, &[]);
-        seed_with_refs(&store, &p_b, &[]);
-
-        let dir = tempfile::tempdir()?;
-        let cache = crate::fuse::cache::Cache::new(dir.path().join("c"))?;
-
-        prefetch_manifests(&client, &cache, &[p_a.clone(), p_b.clone()]).await;
-
-        assert_eq!(
-            store.calls.batch_manifest_calls.load(Ordering::SeqCst),
-            1,
-            "one BatchGetManifest for the whole closure"
-        );
-        let b_a = rio_nix::store_path::basename(&p_a).unwrap();
-        let b_b = rio_nix::store_path::basename(&p_b).unwrap();
-        let hint_a = cache.take_manifest_hint(b_a).expect("hint primed for a");
-        assert_eq!(
-            hint_a.info.as_ref().map(|i| i.store_path.as_str()),
-            Some(p_a.as_str()),
-            "hint keyed by basename, info matches full path"
-        );
-        assert!(cache.take_manifest_hint(b_b).is_some());
-        assert!(
-            cache.take_manifest_hint(b_a).is_none(),
-            "take removes on read"
-        );
-
-        // The hint-carry-on-GetPath e2e is covered by
-        // `fuse::fetch::tests::test_prefetch_success_roundtrip` (which
-        // builds `StoreClients` directly). After dataplane2 changed
-        // `prefetch_path_blocking` to take `StoreClients` and JIT-fetch
-        // deleted the warm path, this test's scope is the
-        // BatchGetManifest → hint-map prime, asserted above.
-        let _ = (store, client);
-        Ok(())
-    }
-
     /// I-043 regression: an input_drv's OUTPUT (not in input_srcs, not
     /// in input_drvs.keys, not in any .drv's narinfo references — only
     /// declared in the input .drv's ATerm structure) must be in the
@@ -937,7 +1154,7 @@ mod tests {
     /// sensitivity proof: same output bytes, direct-only candidate set →
     /// transitive ref is missed. That's the exact shape of the original bug.
     ///
-    // r[verify builder.upload.references-scanned]
+    // r[verify builder.upload.references-scanned+2]
     #[tokio::test]
     async fn test_candidate_set_is_transitive_not_direct() -> anyhow::Result<()> {
         use rio_nix::refscan::{CandidateSet, RefScanSink};
@@ -1022,6 +1239,125 @@ mod tests {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // resolve_castore_roots (WorkAssignment.input_roots + GetNarIndex fallback)
+    // -----------------------------------------------------------------------
+
+    use rio_proto::castore::root_node;
+    use rio_proto::types::{InputRoot, NarEntryKind, NarIndex, NarIndexEntry};
+
+    /// A minimal directory-rooted NAR index whose root_digest is `fill`.
+    fn dir_index(fill: u8) -> NarIndex {
+        NarIndex {
+            root_digest: vec![fill; 32],
+            entries: vec![NarIndexEntry {
+                path: Vec::new(),
+                kind: NarEntryKind::Directory.into(),
+                dir_digest: vec![fill; 32],
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn dir_root_node(fill: u8) -> rio_proto::castore::RootNode {
+        rio_proto::castore::RootNode {
+            node: Some(root_node::Node::DirDigest(vec![fill; 32])),
+        }
+    }
+
+    /// Pre-resolved scheduler roots pass through untouched; roots the
+    /// scheduler sent without a `root_node` AND closure paths the
+    /// scheduler did not send at all are resolved via GetNarIndexBatch.
+    /// Guards the real failure mode of the cutover: a path missing from
+    /// the castore tree is an ENOENT at sandbox setup.
+    #[tokio::test]
+    async fn test_resolve_castore_roots_merges_assignment_and_fallback() -> anyhow::Result<()> {
+        let (store, client) = spawn_and_connect().await?;
+        let (p_pre, p_unrooted, p_local_only) =
+            (tp("pre-resolved"), tp("unrooted"), tp("local-only"));
+
+        // Local closure metadata: nar_hash is what keys the fallback.
+        let (nar_a, hash_a) = make_nar(b"a");
+        let (nar_b, hash_b) = make_nar(b"b");
+        let (nar_c, hash_c) = make_nar(b"c");
+        let metadata = vec![
+            make_path_info(&p_pre, &nar_a, hash_a),
+            make_path_info(&p_unrooted, &nar_b, hash_b),
+            make_path_info(&p_local_only, &nar_c, hash_c),
+        ];
+        store.seed_nar_index(hash_b, dir_index(2));
+        store.seed_nar_index(hash_c, dir_index(3));
+
+        let assignment_roots = vec![
+            InputRoot {
+                store_path: p_pre.clone(),
+                root_node: Some(dir_root_node(1)),
+            },
+            InputRoot {
+                store_path: p_unrooted.clone(),
+                root_node: None,
+            },
+            // p_local_only deliberately absent from the assignment.
+        ];
+
+        let roots =
+            resolve_castore_roots(&client, "test-token", &assignment_roots, &metadata).await?;
+        let by_path: std::collections::HashMap<_, _> = roots
+            .iter()
+            .map(|r| (r.store_path.as_str(), r.root_node.clone()))
+            .collect();
+        assert_eq!(by_path.len(), 3, "all three closure paths resolved");
+        assert_eq!(
+            by_path[p_pre.as_str()],
+            Some(dir_root_node(1)),
+            "scheduler-resolved root passes through verbatim (no extra RPC)"
+        );
+        assert_eq!(
+            by_path[p_unrooted.as_str()],
+            Some(dir_root_node(2)),
+            "root_node:None falls back to the path's NAR index"
+        );
+        assert_eq!(
+            by_path[p_local_only.as_str()],
+            Some(dir_root_node(3)),
+            "closure path the scheduler omitted is resolved too"
+        );
+        Ok(())
+    }
+
+    /// A closure path with NO NAR index (pre-P0557 upload, backfill
+    /// lag) cannot be served by the castore-FUSE — the resolver must
+    /// fail with an actionable infra error, not silently mount a tree
+    /// missing an input.
+    #[tokio::test]
+    async fn test_resolve_castore_roots_unindexed_path_is_infra_error() -> anyhow::Result<()> {
+        let (_store, client) = spawn_and_connect().await?;
+        let p = tp("unindexed");
+        let (nar, hash) = make_nar(b"content");
+        let metadata = vec![make_path_info(&p, &nar, hash)];
+        // NOT seeding a nar_index for `hash`.
+
+        let err = resolve_castore_roots(&client, "test-token", &[], &metadata)
+            .await
+            .expect_err("missing index must fail the mount, not drop the path");
+        match &err {
+            ExecutorError::InputRoots { path, reason } => {
+                assert_eq!(path, &p);
+                assert!(
+                    reason.contains("NAR index"),
+                    "error must say what is missing: {reason}"
+                );
+            }
+            other => panic!("expected InputRoots, got {other:?}"),
+        }
+        assert!(
+            !err.is_permanent(),
+            "indexer lag is node/store-state, not derivation-intrinsic — must stay \
+             InfrastructureFailure so the scheduler retries instead of poisoning"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_fetch_drv_from_store_success() -> anyhow::Result<()> {
         let (store, mut client) = spawn_and_connect().await?;
@@ -1034,12 +1370,45 @@ mod tests {
         let drv_path = tp("test.drv");
         store.seed(make_path_info(&drv_path, &nar, hash), nar);
 
-        let drv = fetch_drv_from_store(&mut client, &drv_path)
+        let drv = fetch_drv_from_store(&mut client, "test-token", &drv_path)
             .await
             .expect("fetch + parse should succeed");
 
         assert_eq!(drv.platform(), "x86_64-linux");
         assert_eq!(drv.outputs().len(), 1);
+        // The assignment token must ride the GetPath: the store's
+        // drv-blob fallback (`store.drv.getpath-fallback`) is
+        // tenant-scoped, and the token's tenant claim is the only
+        // identity the builder has. An empty token sends no header.
+        assert_eq!(
+            store.calls.get_path_tokens.read().unwrap().as_slice(),
+            &[Some("test-token".to_owned())],
+            "fetch_drv_from_store must attach the assignment token"
+        );
+        Ok(())
+    }
+
+    /// An empty token (dev mode, no HMAC) must not send an empty
+    /// header — the store treats header-present as "verify this".
+    #[tokio::test]
+    async fn test_fetch_drv_from_store_empty_token_sends_no_header() -> anyhow::Result<()> {
+        let (store, mut client) = spawn_and_connect().await?;
+        let out = tp("test-out");
+        let drv_text = format!(
+            r#"Derive([("out","{out}","","")],[],[],"x86_64-linux","/bin/sh",[],[("out","{out}")])"#
+        );
+        let (nar, hash) = make_nar(drv_text.as_bytes());
+        let drv_path = tp("tokenless.drv");
+        store.seed(make_path_info(&drv_path, &nar, hash), nar);
+
+        fetch_drv_from_store(&mut client, "", &drv_path)
+            .await
+            .expect("fetch + parse should succeed");
+        assert_eq!(
+            store.calls.get_path_tokens.read().unwrap().as_slice(),
+            &[None],
+            "empty assignment token must omit the header entirely"
+        );
         Ok(())
     }
 
@@ -1048,7 +1417,7 @@ mod tests {
         let (_store, mut client) = spawn_and_connect().await?;
 
         let missing = tp("nonexistent.drv");
-        let err = fetch_drv_from_store(&mut client, &missing)
+        let err = fetch_drv_from_store(&mut client, "test-token", &missing)
             .await
             .expect_err("should fail on missing .drv");
 
@@ -1069,7 +1438,7 @@ mod tests {
         let drv_path = tp("bad.drv");
         store.seed(make_path_info(&drv_path, &garbage, [0u8; 32]), garbage);
 
-        let err = fetch_drv_from_store(&mut client, &drv_path)
+        let err = fetch_drv_from_store(&mut client, "test-token", &drv_path)
             .await
             .expect_err("should fail on bad NAR");
 

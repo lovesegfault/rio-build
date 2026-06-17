@@ -20,7 +20,7 @@ codecov:
     # codecov-matrix-sync check in flake.nix — updating the matrix without
     # bumping this value fails `nix flake check`. Count = unit-* (one per
     # workspace member) + vm-* coverage scenarios.
-    after_n_builds: 40
+    after_n_builds: 48
     # Keep wait_for_ci as a floor: if a coverage job is skipped/cancelled
     # we still want to hold until CI is done rather than wait forever.
     wait_for_ci: true
@@ -49,6 +49,15 @@ ignore:
   - "rio-test-support/**"  # PG bootstrap, gRPC harness, wire helpers
   - "**/tests/**"          # integration tests drive coverage, don't need it
   - "**/fuzz/**"           # fuzz targets (excluded from workspace anyway)
+  # VM-test harness binaries: booted inside QEMU by the mountd/castore
+  # VM tests, never run under `cargo nextest`, so they have 0% unit
+  # coverage by construction. Including them in patch math just
+  # deflates the signal on real production code.
+  - "**/bin/spike_*.rs"
+  # xfstests runner: VM-test scaffolding (vm-castore-xfstests), same
+  # status as the spike harnesses — its syscall checks need a live
+  # castore-FUSE mount, which only exists inside the VM test.
+  - "**/bin/xfstests_runner/**"
 
 comment:
   # condensed_header drops the giant coverage-diff ASCII block;

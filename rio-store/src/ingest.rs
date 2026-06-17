@@ -107,7 +107,7 @@ pub async fn claim_placeholder(
         metadata::insert_manifest_uploading(pool, store_path_hash, store_path, refs).await?;
 
     if claim.is_none() {
-        // r[impl store.substitute.stale-reclaim]
+        // r[impl store.substitute.stale-reclaim+2]
         // I-040: chunk-aware reap (reads manifest_data.chunk_list and
         // decrements refcounts) — the inline-only delete leaks chunk
         // refcounts when the stale placeholder is from an interrupted
@@ -162,6 +162,12 @@ pub enum PersistError {
     /// `complete_manifest_inline` failed. Caller still OWNS the
     /// placeholder and MUST `abort_placeholder`.
     Inline(MetadataError),
+    /// The NAR is structurally invalid (`nar_ls` rejected it) — the
+    /// bytes hash to the claimed `nar_hash` but are not a NAR. Caller
+    /// still OWNS the placeholder and MUST `abort_placeholder`. Maps
+    /// to INVALID_ARGUMENT, not a storage error: the client sent
+    /// garbage, retrying won't help.
+    Malformed(anyhow::Error),
 }
 
 /// Persist a validated, hash-verified NAR for ONE output. Branches on
@@ -173,6 +179,19 @@ pub enum PersistError {
 /// Caller must hold a [`PlaceholderClaim::Owned`] for
 /// `info.store_path_hash`. Emits `rio_store_chunk_dedup_ratio` on the
 /// chunked branch.
+///
+/// `tenant` is the uploader's resolved tenant for the `path_tenants`
+/// junction (`r[store.put.tenant-junction]`), written atomically with
+/// the completion on both branches; `None` writes no row. Upload RPCs
+/// pass the caller's resolved tenant; the substituter MUST pass `None`
+/// — substituted paths are signature-visible cross-tenant
+/// (`r[store.substitute.tenant-sig-visibility+2]`), and a junction row
+/// here would launder them into "built"
+/// (`r[store.substitute.find-missing-gated]`).
+// Parameter list mirrors the completion transaction's inputs (same
+// shape as `cas::put_chunked`); a struct would relocate the same
+// fields without removing any.
+#[allow(clippy::too_many_arguments)]
 pub async fn persist_nar(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
@@ -181,7 +200,22 @@ pub async fn persist_nar(
     nar_data: Vec<u8>,
     chunk_upload_max_concurrent: usize,
     hooks: IngestHooks,
+    tenant: Option<Uuid>,
 ) -> Result<(), PersistError> {
+    // Derive the castore representation (entries + Directory DAG +
+    // encoded index) ONCE, while the NAR bytes are in hand. Both
+    // branches thread it to the manifest-complete transaction; the
+    // chunked branch additionally chunks each file's content range.
+    // This is also the structural-validity gate: a byte string that
+    // SHA-256s to the claimed nar_hash but isn't a NAR is rejected
+    // here instead of being stored unservable.
+    let parsed = cas::cpu_bound(|| cas::ParsedNar::parse(&nar_data)).map_err(|e| {
+        PersistError::Malformed(e.context(format!(
+            "{}: NAR for {} failed structural validation",
+            hooks.ctx_label,
+            info.store_path.as_str()
+        )))
+    })?;
     if let Some(backend) = cas::should_chunk(chunk_backend, nar_data.len()) {
         let stats = cas::put_chunked(
             pool,
@@ -189,7 +223,9 @@ pub async fn persist_nar(
             info,
             claim,
             &nar_data,
+            &parsed,
             chunk_upload_max_concurrent,
+            tenant,
         )
         .await
         .map_err(PersistError::Chunked)?;
@@ -202,18 +238,28 @@ pub async fn persist_nar(
         );
         metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
     } else {
-        metadata::complete_manifest_inline(pool, info, claim, Bytes::from(nar_data))
-            .await
-            .map_err(PersistError::Inline)?;
+        let blob = parsed.blob_stream(&nar_data);
+        metadata::complete_manifest_inline(
+            pool,
+            info,
+            claim,
+            Bytes::from(blob),
+            Some(&parsed),
+            tenant,
+        )
+        .await
+        .map_err(PersistError::Inline)?;
         debug!(store_path = %info.store_path.as_str(), "{}: inline upload completed", hooks.ctx_label);
     }
     Ok(())
 }
 
 /// Heartbeat cadence for [`PlaceholderGuard`]. Matches
-/// `cas::HEARTBEAT_TIME_INTERVAL` (the chunk-upload heartbeat) and is
-/// ≪ `SUBSTITUTE_STALE_THRESHOLD` (300s), so a live owner survives ≥9
-/// missed heartbeats before stale-reclaim takes it.
+/// `cas::HEARTBEAT_TIME_INTERVAL` (the chunk-upload heartbeat); the
+/// stale-reclaim threshold is 3× this (90s), so a live owner survives
+/// 3 missed heartbeats before stale-reclaim takes it — and `reap_one`
+/// re-checks staleness inside its tx, so even a race with the third
+/// beat cannot collect a live owner.
 const PLACEHOLDER_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// RAII owner of an `'uploading'` placeholder: heartbeats while held,
@@ -253,8 +299,17 @@ impl Drop for PlaceholderGuard {
         let chunk_backend = self.chunk_backend.take();
         let store_path_hash = std::mem::take(&mut self.store_path_hash);
         let claim = self.claim;
+        // Every outcome logs. Run 5's lesson: the reap is the only
+        // thing standing between an aborted upload and a placeholder
+        // that blocks every retry until the stale threshold — when it
+        // no-ops (claim mismatch, row already gone) or never runs
+        // (fire-and-forget task lost to a restart), total silence made
+        // the difference between "cleaned up" and "wedged for minutes"
+        // invisible. Success is info (one line per aborted upload);
+        // a no-op is WARN with the claim id so a wedged retry loop has
+        // a thread to pull.
         rio_common::task::spawn_monitored("put-path-placeholder-reap", async move {
-            if let Err(e) = crate::gc::orphan::reap_one(
+            match crate::gc::orphan::reap_one(
                 &pool,
                 &store_path_hash,
                 ReapBy::Claim(claim),
@@ -262,11 +317,24 @@ impl Drop for PlaceholderGuard {
             )
             .await
             {
-                warn!(
+                Ok(true) => tracing::info!(
                     store_path_hash = %hex::encode(&store_path_hash),
+                    claim = %claim,
+                    "drop-path placeholder reaped (upload aborted before completion)",
+                ),
+                Ok(false) => warn!(
+                    store_path_hash = %hex::encode(&store_path_hash),
+                    claim = %claim,
+                    "drop-path placeholder reap matched nothing (row gone, completed, \
+                     or claim superseded); if the 'uploading' row persists, the \
+                     stale-reclaim threshold is the backstop",
+                ),
+                Err(e) => warn!(
+                    store_path_hash = %hex::encode(&store_path_hash),
+                    claim = %claim,
                     error = %e,
-                    "drop-path placeholder cleanup failed; orphan scanner will reclaim",
-                );
+                    "drop-path placeholder cleanup failed; stale-reclaim will recover",
+                ),
             }
         });
     }

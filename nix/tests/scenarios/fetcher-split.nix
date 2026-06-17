@@ -491,14 +491,15 @@ pkgs.testers.runNixOSTest {
         print(f"fod-dir PASS: {out.strip().splitlines()[-1]}")
 
     # ══════════════════════════════════════════════════════════════════
-    # fod-fail — failing FOD propagates without FUSE-lookup hang (P0308)
+    # fod-fail — failing FOD propagates without an input-lookup hang (P0308)
     # ══════════════════════════════════════════════════════════════════
     # Origin 404s, hashed-mirror has no entry → builtin:fetchurl exits
     # nonzero with $out absent. nix-daemon's post-build deletePath($out)
-    # stat falls through to FUSE lower; JitClass::NotInput → ENOENT
-    # without store contact. Asserting elapsed bounds the hang the
-    # whiteout once papered over: a regression here means lookup() fell
-    # through to gRPC and blocked.
+    # stat falls through to the castore-FUSE lower; $out is outside the
+    # input tree → ENOENT from the in-memory DAG, no store round-trip.
+    # Asserting elapsed bounds the hang the whiteout once papered over:
+    # a regression here means a lookup of a non-input path blocked on a
+    # remote fetch instead of failing fast.
     with subtest("fod-fail: failing FOD propagates without hang"):
         t0 = time.monotonic()
         rc, out = client.execute(
@@ -512,8 +513,8 @@ pkgs.testers.runNixOSTest {
         )
         assert elapsed < 60, (
             f"fod-fail took {elapsed:.1f}s (>60s) — daemon post-fail "
-            f"stat($out) likely blocked in FUSE lookup (JitClass::NotInput "
-            f"fast-path not firing).\n{out}"
+            f"stat($out) likely blocked in the castore-FUSE lookup instead "
+            f"of getting a fast ENOENT for a non-input path.\n{out}"
         )
         print(f"fod-fail PASS: rc={rc} in {elapsed:.1f}s")
 

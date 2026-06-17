@@ -1,6 +1,8 @@
 //! Per-derivation state + poison tracking — `derivations` table.
 
-use super::{AssignmentStatus, PoisonedDerivationRow, SchedulerDb, terminal_status_sql};
+use super::{
+    AssignmentStatus, FailureReasonRow, PoisonedDerivationRow, SchedulerDb, terminal_status_sql,
+};
 use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 
 /// Map a terminal `DerivationStatus` to the `assignments.status` value
@@ -206,7 +208,11 @@ impl SchedulerDb {
     }
 
     // r[impl sched.poison.ttl-persist]
-    /// Atomically set `status='poisoned'` AND `poisoned_at=now()`.
+    // r[impl obs.log.failure-reason-persisted]
+    /// Atomically set `status='poisoned'` AND `poisoned_at=now()`, plus
+    /// the persisted failure reason (`failure_msg`, `failure_exec_id` —
+    /// migration 073) so a later build that fail-fasts on this node can
+    /// surface the original error and the execution that produced it.
     ///
     /// Replaces the previous two-call sequence (`update_derivation_status`
     /// then `set_poisoned_at`) which had a crash window: status='poisoned'
@@ -214,16 +220,29 @@ impl SchedulerDb {
     /// `load_poisoned_derivations` (filtered by `poisoned_at IS NOT NULL`)
     /// — poison TTL tracking silently broken for those rows.
     ///
+    /// `failure_msg` is the builder-reported error of the failing attempt
+    /// (NOT a scheduler-synthesized "threshold reached" summary); `None`
+    /// keeps the column NULL. `failure_exec_id` is nullable — a poison
+    /// while Ready (fleet exhaustion) never had an execution.
+    ///
     /// `assigned_builder_id` is NULLed: a poisoned derivation has no
     /// assignment. Matches the in-mem semantics the caller should enforce.
-    pub async fn persist_poisoned(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
+    pub async fn persist_poisoned(
+        &self,
+        drv_hash: &DrvHash,
+        failure_msg: Option<&str>,
+        failure_exec_id: Option<uuid::Uuid>,
+    ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         sqlx::query!(
             "UPDATE derivations \
              SET status = 'poisoned', poisoned_at = now(), \
+                 failure_msg = $2, failure_exec_id = $3, \
                  assigned_builder_id = NULL, updated_at = now() \
              WHERE drv_hash = $1",
             drv_hash.as_str(),
+            failure_msg,
+            failure_exec_id,
         )
         .execute(&mut *tx)
         .await?;
@@ -238,6 +257,28 @@ impl SchedulerDb {
         .execute(&mut *tx)
         .await?;
         tx.commit().await
+    }
+
+    /// Read the persisted failure attribution for a poisoned derivation
+    /// (M_073). `None` when the derivation row doesn't exist; the inner
+    /// fields are `None` when nothing was recorded (pre-073 rows, or a
+    /// poison persisted without a builder error).
+    ///
+    /// Runtime-checked query (same pattern as
+    /// [`load_poisoned_derivations`](Self::load_poisoned_derivations) —
+    /// the EXTRACT alias keeps the epoch conversion PG-side).
+    pub(crate) async fn load_failure_reason(
+        &self,
+        drv_hash: &DrvHash,
+    ) -> Result<Option<FailureReasonRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT failure_msg, failure_exec_id, \
+                    EXTRACT(EPOCH FROM poisoned_at)::float8 AS poisoned_epoch \
+             FROM derivations WHERE drv_hash = $1",
+        )
+        .bind(drv_hash.as_str())
+        .fetch_optional(&self.pool)
+        .await
     }
 
     // r[impl sched.db.assignment-stale-sweep]
@@ -278,11 +319,16 @@ impl SchedulerDb {
     /// override and TTL expiry are full resets (unlike
     /// [`Self::clear_poison_batch`], which preserves+increments
     /// `resubmit_cycles` for the resubmit-bound).
+    ///
+    /// The persisted failure reason (`failure_msg`/`failure_exec_id`,
+    /// migration 073) is per-poison-cycle state and is NULLed too — a
+    /// stale reason must not be attributed to a later, unrelated failure.
     pub async fn clear_poison(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "UPDATE derivations
              SET poisoned_at = NULL, failed_builders = '{}', retry_count = 0,
-                 resubmit_cycles = 0, status = 'created', updated_at = now()
+                 resubmit_cycles = 0, failure_msg = NULL, failure_exec_id = NULL,
+                 status = 'created', updated_at = now()
              WHERE drv_hash = $1",
             drv_hash.as_str(),
         )
@@ -294,7 +340,8 @@ impl SchedulerDb {
     // r[impl sched.db.clear-poison-batch]
     /// Batch poison clear for the resubmit-reset path: one round-trip
     /// for N hashes via `WHERE drv_hash = ANY($1)`. Clears per-cycle
-    /// state (`poisoned_at`, `failed_builders`, `retry_count`) AND
+    /// state (`poisoned_at`, `failed_builders`, `retry_count`,
+    /// `failure_msg`, `failure_exec_id`) AND
     /// increments `resubmit_cycles` so the
     /// `r[sched.merge.poisoned-resubmit-bounded]` bound survives leader
     /// failover. The in-mem increment at `dag::merge` is the
@@ -320,6 +367,7 @@ impl SchedulerDb {
             "UPDATE derivations
              SET poisoned_at = NULL, failed_builders = '{}', retry_count = 0,
                  resubmit_cycles = resubmit_cycles + 1,
+                 failure_msg = NULL, failure_exec_id = NULL,
                  status = 'created', updated_at = now()
              WHERE drv_hash = ANY($1::text[])",
             &hashes as &[&str],

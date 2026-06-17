@@ -18,9 +18,15 @@
 # baked into the AMI (nix/nixos-node/hardening.nix + eks-node.nix).
 # Karpenter's generated NodeConfig MIME is the ONLY runtime input.
 #
-# blockDeviceMappings: NixOS is single-root (no Bottlerocket OS/data
-# split). boot.growPartition (amazon-image.nix default) expands / to
-# fill the volume on first boot.
+# blockDeviceMappings: NixOS root on /dev/xvda (no Bottlerocket OS/data
+# split); boot.growPartition (amazon-image.nix default) expands / to
+# fill the volume on first boot. rio-default/rio-metal additionally map
+# /dev/xvdb — a dedicated prjquota-XFS volume for /var/rio (castore
+# caches + per-build staging), formatted/mounted by the AMI's
+# rio-ebs-mount unit when the node has no instance-store NVMe. rio-nvme
+# omits it: the instance-store RAID0 hosts /var/rio there
+# (rio-nvme-mount), and Karpenter's bin-pack sim already sees that
+# capacity via instanceStorePolicy.
 #
 # I-205: x86_64 .metal SKUs are legacy-bios ONLY (zero support UEFI per
 # `aws ec2 describe-instance-types`), so metal NodeClaims can't use the
@@ -95,6 +101,20 @@ spec:
         throughput: {{ $k.dataVolumeThroughputMiBps }}
         deleteOnTermination: true
         encrypted: true
+  {{- if ne $nc.name "rio-nvme" }}
+    # Dedicated /var/rio volume (rio-ebs-mount in the AMI formats it
+    # XFS+prjquota). Without it mountd's staging quota cannot be
+    # applied and EVERY build/fetch on the node fails at the Mount
+    # handshake — see nix/nixos-node/eks-node.nix.
+    - deviceName: /dev/xvdb
+      ebs:
+        volumeSize: {{ $k.rioVolumeSize }}
+        volumeType: gp3
+        iops: {{ $k.rioVolumeIops }}
+        throughput: {{ $k.rioVolumeThroughputMiBps }}
+        deleteOnTermination: true
+        encrypted: true
+  {{- end }}
   {{- if eq $nc.name "rio-nvme" }}
   instanceStorePolicy: RAID0
   {{- end }}
@@ -136,7 +156,28 @@ spec:
     consolidateAfter: Never
     budgets:
       - nodes: "0"
+{{- /* ADR-023: when expressZones is set, synthesize rio-general-express
+       — a deep-copied rio-general with +10 weight and a zone
+       requirement on the Express-supported AZs. NodePool requirements
+       are hard constraints, so AZ *preference* is expressed
+       structurally: Karpenter tries pools by descending weight and
+       falls back to the unrestricted rio-general when the preferred
+       zones can't satisfy (ICE) — AZs without Express stay
+       schedulable. Cloning from the values entry (not a second
+       template body) keeps instance families/limits/budgets
+       single-source. */}}
+{{- $pools := list }}
 {{- range $k.nodePools }}
+{{- $pools = append $pools . }}
+{{- if and $k.expressZones (eq .name "rio-general") }}
+{{- $clone := . | mustToJson | mustFromJson }}
+{{- $_ := set $clone "name" "rio-general-express" }}
+{{- $_ := set $clone "weight" (add (.weight | int) 10) }}
+{{- $_ := set $clone "requirements" (append $clone.requirements (dict "key" "topology.kubernetes.io/zone" "operator" "In" "values" $k.expressZones)) }}
+{{- $pools = append $pools $clone }}
+{{- end }}
+{{- end }}
+{{- range $pools }}
 ---
 apiVersion: karpenter.sh/v1
 kind: NodePool

@@ -27,6 +27,25 @@ use super::DagActor;
 /// shouldn't accidentally widen this budget.
 const CA_CUTOFF_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Cap on the persisted `derivations.failure_msg` (M_073). Builder
+/// error text is normally a few hundred bytes; the cap keeps a
+/// pathological multi-megabyte error from bloating the row. 4 KiB keeps
+/// the useful head of even a verbose compiler diagnostic.
+const FAILURE_MSG_MAX_BYTES: usize = 4096;
+
+/// Truncate `msg` to [`FAILURE_MSG_MAX_BYTES`] on a char boundary so the
+/// persisted text stays valid UTF-8 (PG `TEXT` rejects torn code points).
+fn truncate_failure_msg(msg: &str) -> &str {
+    if msg.len() <= FAILURE_MSG_MAX_BYTES {
+        return msg;
+    }
+    let mut end = FAILURE_MSG_MAX_BYTES;
+    while !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    &msg[..end]
+}
+
 /// Per-candidate prior realisation discovered during the CA cutoff
 /// cascade walk. Carries everything needed to (a) verify the output
 /// exists in the store and (b) stamp the skipped node with its
@@ -81,21 +100,61 @@ impl DagActor {
         }
     }
 
-    /// Best-effort atomic persist of `status='poisoned'` + `poisoned_at=now()`.
-    /// Single SQL UPDATE — no crash window between the two columns.
+    /// Best-effort atomic persist of `status='poisoned'`, `poisoned_at=now()`
+    /// and the failure reason (`failure_msg`/`failure_exec_id`, M_073).
+    /// Single SQL UPDATE — no crash window between the columns.
     /// Logs error!, never returns it (same semantics as `persist_status`).
-    pub(super) async fn persist_poisoned(&self, drv_hash: &DrvHash) {
-        if let Err(e) = self.db.persist_poisoned(drv_hash).await {
+    pub(super) async fn persist_poisoned(
+        &self,
+        drv_hash: &DrvHash,
+        failure_msg: Option<&str>,
+        failure_exec_id: Option<Uuid>,
+    ) {
+        if let Err(e) = self
+            .db
+            .persist_poisoned(drv_hash, failure_msg, failure_exec_id)
+            .await
+        {
             error!(drv_hash = %drv_hash, error = %e,
                    "failed to persist poisoned status+timestamp");
         }
     }
 
+    /// Resolve what `persist_poisoned` should record for `drv_hash`:
+    /// the builder-reported error of the most recent failed attempt
+    /// (`retry.last_error`, recorded per attempt by
+    /// `handle_transient_failure`) when present, otherwise the caller's
+    /// message — and the execution the failure is attributed to
+    /// (`exec_id_for_terminal`, `None` for a never-dispatched poison).
+    /// The message is truncated to [`FAILURE_MSG_MAX_BYTES`] so a
+    /// pathological builder error can't bloat the `derivations` row.
+    pub(super) fn failure_attribution(
+        &self,
+        drv_hash: &DrvHash,
+        fallback_msg: &str,
+    ) -> (Option<String>, Option<Uuid>) {
+        let non_empty = |s: &str| (!s.is_empty()).then(|| truncate_failure_msg(s).to_string());
+        let Some(state) = self.dag.node(drv_hash) else {
+            return (non_empty(fallback_msg), None);
+        };
+        let msg = state
+            .retry
+            .last_error
+            .as_deref()
+            .and_then(&non_empty)
+            .or_else(|| non_empty(fallback_msg));
+        (msg, self.exec_id_for_terminal(state))
+    }
+
     /// Best-effort unpin of `scheduler_live_pins` rows for a
-    /// terminal derivation. Called at every terminal transition
-    /// (Completed/Poisoned/Cancelled; DependencyFailed is never
-    /// dispatched so never pinned). `sweep_stale_live_pins` on
-    /// recovery is the crash safety net for missed unpins.
+    /// terminal derivation. Called at every terminal transition —
+    /// Completed/Poisoned/Cancelled from the dispatch lifecycle, AND
+    /// the never-dispatched terminals (merge cache-hit, dispatch-time
+    /// store hit, CA-cutoff Skipped, DependencyFailed cascade), which
+    /// hold the merge-time drv-path pin from
+    /// r[store.drv.gc-build-pinned] even though they never gained
+    /// dispatch-time input pins. `sweep_stale_live_pins` on recovery
+    /// is the crash safety net for missed unpins.
     pub(super) async fn unpin_best_effort(&self, drv_hash: &DrvHash) {
         if let Err(e) = self.db.unpin_live_inputs(drv_hash).await {
             debug!(drv_hash = %drv_hash, error = %e,
@@ -900,7 +959,8 @@ impl DagActor {
             rio_proto::types::BuildResultStatus::TransientFailure => {
                 // Build ran, exited non-zero. Counts toward poison — 3
                 // workers all seeing this means it's not actually transient.
-                self.handle_transient_failure(drv_hash, executor_id).await;
+                self.handle_transient_failure(drv_hash, executor_id, &result.error_msg)
+                    .await;
             }
             // r[impl sched.retry.per-executor-budget]
             rio_proto::types::BuildResultStatus::InfrastructureFailure => {
@@ -963,7 +1023,8 @@ impl DagActor {
                     status = ?result.status,
                     "unknown build result status, treating as transient failure"
                 );
-                self.handle_transient_failure(drv_hash, executor_id).await;
+                self.handle_transient_failure(drv_hash, executor_id, &result.error_msg)
+                    .await;
             }
         }
 
@@ -1507,6 +1568,10 @@ impl DagActor {
             let skipped_refs: Vec<&str> = skipped.iter().map(|h| h.as_str()).collect();
             self.persist_status_batch(&skipped_refs, DerivationStatus::Skipped)
                 .await;
+            // Terminal without dispatch: release the merge-time drv
+            // pins (r[store.drv.gc-build-pinned]) — skipped nodes
+            // never reach the worker-completion unpin.
+            self.unpin_best_effort_batch(&skipped_refs).await;
             // r[impl sched.event.derivation-terminal]
             // Skipped is a terminal cached-equivalent transition: emit
             // DerivationCached + bump cached_count for each interested
@@ -1921,7 +1986,13 @@ impl DagActor {
         }
         state.retry.poisoned_at = Some(Instant::now());
 
-        self.persist_poisoned(drv_hash).await;
+        // Persist the failure reason alongside the poison mark: the
+        // builder-reported error of the failing attempt (recorded on
+        // `retry.last_error`) wins over the synthesized poison summary
+        // in `error_msg`, attributed to the execution that produced it.
+        let (failure_msg, failure_exec_id) = self.failure_attribution(drv_hash, error_msg);
+        self.persist_poisoned(drv_hash, failure_msg.as_deref(), failure_exec_id)
+            .await;
         self.unpin_best_effort(drv_hash).await;
 
         self.terminal_failure_epilogue(
@@ -2169,7 +2240,18 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
+        error_msg: &str,
     ) {
+        // Remember THIS attempt's builder-reported error so a poison —
+        // whether the threshold trips right here or fleet exhaustion
+        // fires on a later event — persists the real failure text
+        // instead of the synthesized summary (M_073).
+        if !error_msg.is_empty()
+            && let Some(state) = self.dag.node_mut(drv_hash)
+        {
+            state.retry.last_error = Some(error_msg.to_string());
+        }
+
         // Record failure (in-mem HashSet insert + PG append,
         // best-effort) + get poison verdict in one call — same
         // helper as `reassign_derivations` and
@@ -2521,8 +2603,18 @@ impl DagActor {
         // record_failure_and_check_poison shape (in-mem first, PG
         // best-effort).
         state.retry.failed_builders.insert(executor_id.clone());
+        // Most-recent-attempt error: a stale `last_error` from an earlier
+        // transient retry must not shadow this attempt's permanent error.
+        if !error_msg.is_empty() {
+            state.retry.last_error = Some(error_msg.to_string());
+        }
 
-        self.persist_poisoned(drv_hash).await;
+        // Permanent failures carry the worker's error directly; record
+        // it (and the producing execution) so a later fail-fast on this
+        // poisoned node can surface the original reason (M_073).
+        let (failure_msg, failure_exec_id) = self.failure_attribution(drv_hash, error_msg);
+        self.persist_poisoned(drv_hash, failure_msg.as_deref(), failure_exec_id)
+            .await;
         if let Err(e) = self.db.append_failed_worker(drv_hash, executor_id).await {
             error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
                    "failed to persist failed_worker");
@@ -2720,6 +2812,11 @@ impl DagActor {
             let refs: Vec<&str> = transitioned.iter().map(DrvHash::as_str).collect();
             self.persist_status_batch(&refs, DerivationStatus::DependencyFailed)
                 .await;
+            // DependencyFailed nodes were never dispatched, but the
+            // merge-time drv pin (r[store.drv.gc-build-pinned]) still
+            // holds their blobs — release it here, the only terminal
+            // transition these nodes get.
+            self.unpin_best_effort_batch(&refs).await;
         }
         transitioned
     }

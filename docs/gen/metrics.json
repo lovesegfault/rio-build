@@ -3,24 +3,23 @@
     "rio_builder_build_duration_seconds",
     "rio_builder_builds_active",
     "rio_builder_builds_total",
+    "rio_builder_castore_dag_prefetch_seconds",
+    "rio_builder_castore_fuse_eio_total",
+    "rio_builder_castore_fuse_fetch_bytes_total",
+    "rio_builder_castore_fuse_integrity_fail_total",
+    "rio_builder_castore_fuse_open_case_total",
+    "rio_builder_castore_fuse_open_mode_total",
+    "rio_builder_castore_fuse_open_seconds",
+    "rio_builder_castore_fuse_upcalls_total",
+    "rio_builder_castore_fuse_uring_requests_total",
     "rio_builder_cgroup_leak_total",
     "rio_builder_cgroup_oom_total",
     "rio_builder_cpu_fraction",
-    "rio_builder_fuse_cache_hits_total",
-    "rio_builder_fuse_cache_misses_total",
     "rio_builder_fuse_circuit_open",
-    "rio_builder_fuse_fallback_reads_total",
-    "rio_builder_fuse_fetch_bytes_total",
-    "rio_builder_fuse_fetch_duration_seconds",
-    "rio_builder_fuse_index_divergence_total",
-    "rio_builder_fuse_jit_lookup_total",
     "rio_builder_input_materialization_failures_total",
-    "rio_builder_jit_inputs_registered",
     "rio_builder_log_lines_suppressed_total",
     "rio_builder_memory_fraction",
     "rio_builder_overlay_teardown_failures_total",
-    "rio_builder_prefetch_filtered_total",
-    "rio_builder_prefetch_total",
     "rio_builder_stale_assignments_rejected_total",
     "rio_builder_upload_bytes_total",
     "rio_builder_upload_references_count",
@@ -68,6 +67,15 @@
     "rio_gateway_opcodes_total",
     "rio_gateway_putpath_aborted_retries_total",
     "rio_gateway_quota_rejections_total",
+    "rio_mountd_cache_evicted_bytes_total",
+    "rio_mountd_cache_free_bytes",
+    "rio_mountd_connections_current",
+    "rio_mountd_promote_bytes_total",
+    "rio_mountd_promote_inflight",
+    "rio_mountd_promote_reject_total",
+    "rio_mountd_request_seconds",
+    "rio_pg_iam_mint_failures_total",
+    "rio_pg_iam_token_minted_timestamp_seconds",
     "rio_scheduler_actor_cmd_seconds",
     "rio_scheduler_actor_mailbox_depth",
     "rio_scheduler_assignments_total",
@@ -102,6 +110,7 @@
     "rio_scheduler_heartbeat_adoptions_total",
     "rio_scheduler_heartbeat_rejected_total",
     "rio_scheduler_hung_detect_skipped_no_authoritative_total",
+    "rio_scheduler_input_closure_unattested_total",
     "rio_scheduler_lease_acquired_total",
     "rio_scheduler_lease_lost_total",
     "rio_scheduler_log_batches_rejected_total",
@@ -173,6 +182,11 @@
     "rio_store_chunk_cache_hits_total",
     "rio_store_chunk_cache_misses_total",
     "rio_store_chunk_dedup_ratio",
+    "rio_store_directory_get_seconds",
+    "rio_store_directory_has_batch_size",
+    "rio_store_directory_read_seconds",
+    "rio_store_express_bytes",
+    "rio_store_express_evicted_total",
     "rio_store_gc_chunk_orphan_swept_total",
     "rio_store_gc_chunk_resurrected_total",
     "rio_store_gc_orphan_reap_failed_total",
@@ -186,12 +200,16 @@
     "rio_store_get_path_total",
     "rio_store_hmac_rejected_total",
     "rio_store_integrity_failures_total",
+    "rio_store_nar_index_cache_hits_total",
     "rio_store_pg_pool_utilization",
     "rio_store_put_path_bytes_total",
     "rio_store_put_path_duration_seconds",
     "rio_store_put_path_total",
+    "rio_store_putpath_concurrent_wait_total",
+    "rio_store_putpath_incomplete_total",
     "rio_store_putpath_retries_total",
     "rio_store_putpath_stale_reclaimed_total",
+    "rio_store_putpath_verify_unavailable_total",
     "rio_store_s3_deletes_pending",
     "rio_store_s3_deletes_stuck",
     "rio_store_s3_requests_total",
@@ -208,7 +226,12 @@
     "rio_store_substitute_probe_ratelimited_total",
     "rio_store_substitute_skipped_total",
     "rio_store_substitute_stale_reclaimed_total",
-    "rio_store_substitute_total"
+    "rio_store_substitute_total",
+    "rio_store_tiered_get_duration_seconds",
+    "rio_store_tiered_local_errors_total",
+    "rio_store_tiered_local_hits_total",
+    "rio_store_tiered_local_misses_total",
+    "rio_store_tiered_writethrough_errors_total"
   ],
   "by_component": {
     "builder": [
@@ -228,6 +251,51 @@
         "help": "Total builds executed (labeled by outcome: success/failure/cancelled/timed_out/log_limit/infra_failure)"
       },
       {
+        "name": "rio_builder_castore_dag_prefetch_seconds",
+        "kind": "histogram",
+        "help": "GetDirectory(recursive) wall-clock per build at mount time (one multi-root call for the whole input closure)."
+      },
+      {
+        "name": "rio_builder_castore_fuse_eio_total",
+        "kind": "counter",
+        "help": "castore-FUSE open()s that returned an error to the kernel (fetch failure, integrity mismatch, mountd rejection, backing-id ceiling). Every one of these fails a build."
+      },
+      {
+        "name": "rio_builder_castore_fuse_fetch_bytes_total",
+        "kind": "counter",
+        "help": "Bytes sourced by castore-FUSE open() to materialize a file, labeled by tier: remote (rio-store ReadBlob/GetChunks) or node_ssd (the mountd-owned node chunk cache)."
+      },
+      {
+        "name": "rio_builder_castore_fuse_integrity_fail_total",
+        "kind": "counter",
+        "help": "Fetched content whose blake3 did not match the requested file_digest. The bytes are discarded and the open fails EIO. Nonzero = store-side corruption or a chunk-reassembly bug; investigate immediately."
+      },
+      {
+        "name": "rio_builder_castore_fuse_open_case_total",
+        "kind": "counter",
+        "help": "open() decision by case: hit (backing cache), miss_small (whole-file fetch), miss_stream (above the streaming threshold; replies at the first chunk and fills in the background), wait_fetching (joined a concurrent open's in-flight fetch of the same digest)."
+      },
+      {
+        "name": "rio_builder_castore_fuse_open_mode_total",
+        "kind": "counter",
+        "help": "open() reply mode: passthrough (kernel reads the backing file directly) or keep_cache (userspace read() fallback). passthrough=0 in steady state means FUSE_PASSTHROUGH negotiation failed — a 10-100x data-path regression that is otherwise invisible."
+      },
+      {
+        "name": "rio_builder_castore_fuse_open_seconds",
+        "kind": "histogram",
+        "help": "Wall-clock from open() upcall to reply, labeled by the open_case_total taxonomy: case=hit|wait_fetching|miss_small|miss_stream. hit and wait_fetching reply from the node cache (wait_fetching first blocks on a concurrent open's in-flight fetch); miss_small is a whole-file fetch + Promote; miss_stream replies at the first chunk and fills in the background."
+      },
+      {
+        "name": "rio_builder_castore_fuse_upcalls_total",
+        "kind": "counter",
+        "help": "Castore-FUSE upcalls by op (lookup/getattr/readdir/readlink/open/read). Cold-path only by design: infinite cache TTLs mean the kernel answers repeats from dcache/icache. A high steady-state rate = the caches are not absorbing (TTL regression or memory-pressure eviction)."
+      },
+      {
+        "name": "rio_builder_castore_fuse_uring_requests_total",
+        "kind": "counter",
+        "help": "Castore-FUSE requests delivered over the fuse-over-io_uring rings — the session's only request transport (upcalls_total carries the per-op split). Zero during a build means the mount never engaged."
+      },
+      {
         "name": "rio_builder_cgroup_leak_total",
         "kind": "counter",
         "help": "Per-build cgroup rmdir failures on Drop (typically EBUSY — processes still in the tree). Leaked cgroups are harmless empty pseudo-dirs under /sys/fs/cgroup; pod restart clears them. Sustained rate = builds not reaping cleanly (investigate cgroup.kill timing or zombie builders)."
@@ -243,54 +311,14 @@
         "help": "Worker cgroup CPU utilization: delta cpu.stat usage_usec / wall-clock µs. 1.0 = one core fully used; >1.0 on multi-core."
       },
       {
-        "name": "rio_builder_fuse_cache_hits_total",
-        "kind": "counter",
-        "help": "FUSE cache hits (local symlink_metadata succeeded)"
-      },
-      {
-        "name": "rio_builder_fuse_cache_misses_total",
-        "kind": "counter",
-        "help": "FUSE cache misses (fetch from remote store required)"
-      },
-      {
         "name": "rio_builder_fuse_circuit_open",
         "kind": "gauge",
-        "help": "1.0 when the FUSE fetch circuit breaker is open (store unreachable or degraded). Opens after 5 consecutive fetch failures OR 720s since last successful fetch with ≥1 failure since. Half-open after 30s (one probe fetch allowed)."
-      },
-      {
-        "name": "rio_builder_fuse_fallback_reads_total",
-        "kind": "counter",
-        "help": "Userspace read() callbacks served. When passthrough is ON (default), the kernel handles reads directly and this counter stays near zero — nonzero means open_backing() failed for some file. When passthrough is OFF (RIO_FUSE_PASSTHROUGH=false), every read comes through here. Sustained nonzero rate with passthrough ON = investigate open_backing."
-      },
-      {
-        "name": "rio_builder_fuse_fetch_bytes_total",
-        "kind": "counter",
-        "help": "Bytes fetched from store via FUSE misses (nar_data.len())"
-      },
-      {
-        "name": "rio_builder_fuse_fetch_duration_seconds",
-        "kind": "histogram",
-        "help": "Store path fetch latency (gRPC GetPath + stream drain)"
-      },
-      {
-        "name": "rio_builder_fuse_index_divergence_total",
-        "kind": "counter",
-        "help": "FUSE cache index/disk divergences detected and self-healed. Nonzero means something rm'd cache files out from under the in-memory index (manual debugging, disk cleanup scripts, interrupted extract). The path is purged and re-fetched; investigate if sustained."
-      },
-      {
-        "name": "rio_builder_fuse_jit_lookup_total",
-        "kind": "counter",
-        "help": "Top-level FUSE lookup outcomes under JIT fetch (I-043 redesign), labeled by outcome: reject (not in registered input set → fast ENOENT, no store contact), fetch (registered input materialized), eio (registered input fetch FAILED → EIO so overlay can't negative-cache). reject/fetch ratio ≈ closure utilization; eio nonzero = store degraded."
+        "help": "1.0 when the castore-FUSE fetch circuit breaker is open (store unreachable or degraded). Opens after 5 consecutive fetch failures OR 720s since last successful fetch with ≥1 failure since. Half-open after 30s (one probe fetch allowed)."
       },
       {
         "name": "rio_builder_input_materialization_failures_total",
         "kind": "counter",
-        "help": "Daemon MiscFailure reclassified as InfrastructureFailure because the missing path is in the build's input closure (I-178). Sustained nonzero = JIT_MIN_THROUGHPUT_BPS is set above actual store→builder throughput; lower the floor."
-      },
-      {
-        "name": "rio_builder_jit_inputs_registered",
-        "kind": "gauge",
-        "help": "Size of the JIT FUSE allowlist (known_inputs.len()) at daemon spawn. Equals compute_input_closure's output count for this build."
+        "help": "Daemon MiscFailure reclassified as InfrastructureFailure because the missing path is in the build's input closure (I-178). Sustained nonzero = closure inputs are failing to materialize from the castore-FUSE lower (store fetch errors, integrity failures, or a tripped fetch circuit breaker); correlate with rio_builder_castore_fuse_eio_total and rio-store health."
       },
       {
         "name": "rio_builder_log_lines_suppressed_total",
@@ -308,16 +336,6 @@
         "help": "Overlay unmount failures (leaked mount); alert if rate > 0"
       },
       {
-        "name": "rio_builder_prefetch_filtered_total",
-        "kind": "counter",
-        "help": "PrefetchHint paths skipped by the I-212 filter, by reason. reason=not_input: JIT allowlist armed and path is not a declared input (build can never read it). reason=size_cap: warm-gate batch (allowlist not yet armed) and QueryPathInfo.nar_size exceeds the cap — scheduler over-includes sibling outputs (e.g., 2.9 GB clang-debug); the build fetches it on-demand via JIT lookup if it turns out to be a real input."
-      },
-      {
-        "name": "rio_builder_prefetch_total",
-        "kind": "counter",
-        "help": "PrefetchHint outcomes. result=fetched|already_cached|already_in_flight|not_input|size_cap|error|malformed|panic. error = store fetch failed (debug-only log; build's own FUSE ops surface the real problem if store is flaky)."
-      },
-      {
         "name": "rio_builder_stale_assignments_rejected_total",
         "kind": "counter",
         "help": "Assignments rejected due to stale generation (from a deposed scheduler leader). Nonzero during leader transitions is expected; sustained = scheduler lease flapping."
@@ -325,7 +343,7 @@
       {
         "name": "rio_builder_upload_bytes_total",
         "kind": "counter",
-        "help": "Bytes uploaded to store via PutPath (nar_size on success)"
+        "help": "Novel chunk bytes streamed to the store via PutPathChunked. Chunks the store already holds durably are deduplicated and never counted, so this measures actual upload data movement, not output nar_size."
       },
       {
         "name": "rio_builder_upload_references_count",
@@ -335,12 +353,12 @@
       {
         "name": "rio_builder_upload_skipped_idempotent_total",
         "kind": "counter",
-        "help": "Output uploads skipped by the FindMissingPaths pre-check (path already complete in store). High sustained rate = scheduler dispatching already-built derivations (race or CA early-cutoff). The store's PutPath idempotency would no-op these server-side anyway; this counter measures the worker-side disk-read + NAR-stream savings."
+        "help": "Outputs skipped as already present in the store: the FindMissingPaths pre-check found every output complete, or the store reported created = false at PutPathChunked commit. High sustained rate = scheduler dispatching already-built derivations (race or CA early-cutoff). This counter measures the worker-side disk-read + chunk-stream savings."
       },
       {
         "name": "rio_builder_uploads_total",
         "kind": "counter",
-        "help": "Output uploads (labeled by status: success/adopted/exhausted; adopted = concurrent uploader won, result polled via QueryPathInfo)"
+        "help": "Output uploads (labeled by status: success = output committed via PutPathChunked, exhausted = retry budget spent without a commit)"
       }
     ],
     "controller": [
@@ -557,6 +575,55 @@
         "help": "SubmitBuild rejected because tenant is over store quota (labeled by tenant)"
       }
     ],
+    "mountd": [
+      {
+        "name": "rio_mountd_cache_evicted_bytes_total",
+        "kind": "counter",
+        "help": "Bytes unlinked by the disk-pressure LRU sweep (labeled by dir: cache/chunks)"
+      },
+      {
+        "name": "rio_mountd_cache_free_bytes",
+        "kind": "gauge",
+        "help": "statvfs free bytes on the shared cache filesystem, sampled at the LRU-sweep interval"
+      },
+      {
+        "name": "rio_mountd_connections_current",
+        "kind": "gauge",
+        "help": "Live UDS connections (== builds being served on this node)"
+      },
+      {
+        "name": "rio_mountd_promote_bytes_total",
+        "kind": "counter",
+        "help": "Bytes verify-copied into the shared caches by Promote/PromoteChunks"
+      },
+      {
+        "name": "rio_mountd_promote_inflight",
+        "kind": "gauge",
+        "help": "Promote copy tasks currently running"
+      },
+      {
+        "name": "rio_mountd_promote_reject_total",
+        "kind": "counter",
+        "help": "Rejected promotes (labeled by reason: mismatch/not-regular/too-large/race-timeout/backlog/other)"
+      },
+      {
+        "name": "rio_mountd_request_seconds",
+        "kind": "histogram",
+        "help": "UDS request latency (labeled by op: mount/backing_open/backing_close/promote/promote_chunks)"
+      }
+    ],
+    "pg": [
+      {
+        "name": "rio_pg_iam_mint_failures_total",
+        "kind": "counter",
+        "help": "RDS IAM auth token mint failures (STS/credential errors). Sustained nonzero rate = new PG connections will start failing once the cached token passes its 15-minute TTL."
+      },
+      {
+        "name": "rio_pg_iam_token_minted_timestamp_seconds",
+        "kind": "gauge",
+        "help": "Unix timestamp of the last successful RDS IAM token mint. Alert on time() - this approaching 900 (the token TTL): it means mints are failing or the refresher died."
+      }
+    ],
     "scheduler": [
       {
         "name": "rio_scheduler_actor_cmd_seconds",
@@ -727,6 +794,11 @@
         "name": "rio_scheduler_hung_detect_skipped_no_authoritative_total",
         "kind": "counter",
         "help": "Busy executors skipped by detect_hung_nodes because no controller-reported spec.nodeName binding exists yet (controller-lag or AckSpawnedIntents channel down). Sustained nonzero with hung nodes un-reaped → check rio-controller nodeclaim_pool reconcile loop."
+      },
+      {
+        "name": "rio_scheduler_input_closure_unattested_total",
+        "kind": "counter",
+        "help": "Dispatches whose input closure was NOT attested, labeled by reason (seeds_unknown/missing_narinfo/db_error/timeout). Each one degrades the builder to its own drv-parsed closure BFS and the store skips closure-digest verification for that build; a sustained nonzero rate means attestation is effectively disabled — compare against rio_scheduler_assignments_total."
       },
       {
         "name": "rio_scheduler_lease_acquired_total",
@@ -1086,6 +1158,31 @@
         "help": "Per-upload dedup ratio (1.0 - missing/total after chunking)"
       },
       {
+        "name": "rio_store_directory_get_seconds",
+        "kind": "histogram",
+        "help": "GetDirectory wall time per RPC (recursive BFS over the Directory DAG)"
+      },
+      {
+        "name": "rio_store_directory_has_batch_size",
+        "kind": "histogram",
+        "help": "Digest-list length per HasDirectories/HasBlobs/HasChunks call (labeled rpc)"
+      },
+      {
+        "name": "rio_store_directory_read_seconds",
+        "kind": "histogram",
+        "help": "ReadBlob wall time per RPC (chunk fetch + slice + stream)"
+      },
+      {
+        "name": "rio_store_express_bytes",
+        "kind": "gauge",
+        "help": "Per-AZ Express bucket size in bytes (labeled az_id; emitted by the lease-holding sweeper)"
+      },
+      {
+        "name": "rio_store_express_evicted_total",
+        "kind": "counter",
+        "help": "Chunks deleted from Express by the eviction sweeper (labeled az_id)"
+      },
+      {
         "name": "rio_store_gc_chunk_orphan_swept_total",
         "kind": "counter",
         "help": "Chunks left at refcount=0 by an aborted PutPath/PutPathBatch (uploader crashed mid-stream) and reaped by sweep_orphan_chunks after grace-TTL. Sustained nonzero = builder upload path is crashing repeatedly."
@@ -1148,7 +1245,12 @@
       {
         "name": "rio_store_integrity_failures_total",
         "kind": "counter",
-        "help": "GetPath content integrity check failures (bitrot/corruption)"
+        "help": "Content integrity check failures, labeled by `site`: `get_path` (whole-NAR SHA-256, indicates bitrot/corruption), `read_blob` (whole-file BLAKE3, indicates cumsum/index drift), `chunk` (per-chunk BLAKE3, indicates bitrot/corruption), `put_path_chunked` (claimed file digest does not hash from the run's content — rejected forgery attempt)"
+      },
+      {
+        "name": "rio_store_nar_index_cache_hits_total",
+        "kind": "counter",
+        "help": "GetNarIndex/GetNarIndexBatch requests served from the nar_index table (the index is written eagerly in the manifest-complete transaction; there is no recompute path)"
       },
       {
         "name": "rio_store_pg_pool_utilization",
@@ -1171,6 +1273,16 @@
         "help": "Total PutPath operations (per store path; PutPathBatch counts each output)"
       },
       {
+        "name": "rio_store_putpath_concurrent_wait_total",
+        "kind": "counter",
+        "help": "Concurrent same-path PutPath/PutPathChunked waits resolved, labeled by outcome: completed (winner committed; waiter took the idempotent skip), takeover (winner aborted; waiter claimed the freed placeholder), timeout (budget exhausted; ABORTED surfaced to the client's own retry logic)."
+      },
+      {
+        "name": "rio_store_putpath_incomplete_total",
+        "kind": "counter",
+        "help": "PutPathChunked streams that ended before every Begin.novel chunk arrived (builder crash mid-upload or transport failure). Infra-retry condition, not an alert."
+      },
+      {
         "name": "rio_store_putpath_retries_total",
         "kind": "counter",
         "help": "PutPath retriable rejections (labeled by reason: serialization| deadlock|placeholder_missing|connection|resource_exhausted| concurrent_upload). Client retries on aborted/unavailable. Sustained high deadlock/connection rate = PG-side problem."
@@ -1179,6 +1291,11 @@
         "name": "rio_store_putpath_stale_reclaimed_total",
         "kind": "counter",
         "help": "Stale 'uploading' placeholders reclaimed on the PutPath hot path (I-207). Nonzero expected under fetcher churn; sustained high suggests under-sized fetcher pods (see I-208)."
+      },
+      {
+        "name": "rio_store_putpath_verify_unavailable_total",
+        "kind": "counter",
+        "help": "PutPathChunked uploads aborted by a transient failure: a chunk PUT failed, a referenced chunk was GC-claimed between the builder's HasChunks probe and the commit's presence proof, or a chunk re-fetch during file-digest verification failed. The builder retries."
       },
       {
         "name": "rio_store_s3_deletes_pending",
@@ -1264,6 +1381,31 @@
         "name": "rio_store_substitute_total",
         "kind": "counter",
         "help": "Upstream substitution attempts, labeled by result (hit/miss/error) and tenant (UUID). Per-upstream debugging detail is in the debug!/warn! log lines (which carry upstream=<url>); the metric label is bounded by tenant count, not by tenant-supplied URL."
+      },
+      {
+        "name": "rio_store_tiered_get_duration_seconds",
+        "kind": "histogram",
+        "help": "Tiered backend chunk GET latency, labeled by serving tier (tier=express|standard). Each arm times only its own tier's read — the standard arm excludes the failed Express probe — so the two series directly measure the Express-vs-S3-standard TTFB gap the cache tier exists to buy."
+      },
+      {
+        "name": "rio_store_tiered_local_errors_total",
+        "kind": "counter",
+        "help": "Tiered backend Express-tier read errors (degraded — falls through to S3 standard; alert if sustained)"
+      },
+      {
+        "name": "rio_store_tiered_local_hits_total",
+        "kind": "counter",
+        "help": "Tiered backend Express-tier hits (chunk served without an S3-standard RTT)"
+      },
+      {
+        "name": "rio_store_tiered_local_misses_total",
+        "kind": "counter",
+        "help": "Tiered backend Express-tier misses (fell through to S3 standard, then write-through filled Express)"
+      },
+      {
+        "name": "rio_store_tiered_writethrough_errors_total",
+        "kind": "counter",
+        "help": "Tiered backend Express write-through failures (chunk served from S3 standard but Express not warmed)"
       }
     ]
   }

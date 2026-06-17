@@ -25,7 +25,7 @@
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tonic::{Request, Status, Streaming};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use rio_proto::types::{PutPathRequest, PutPathTrailer, put_path_request};
 use rio_proto::validated::ValidatedPathInfo;
@@ -49,17 +49,34 @@ const PUTPATH_HOOKS: ingest::IngestHooks = ingest::IngestHooks {
     ctx_label: "PutPath",
 };
 
+/// Poll curve for [`StoreServiceImpl::wait_for_concurrent_upload`].
+/// Full jitter so N losers waiting on the same winner don't hit PG in
+/// lockstep; 1 s cap keeps the post-commit skip latency ≤1 s while the
+/// per-poll cost (one indexed SELECT + one ON CONFLICT no-op INSERT)
+/// stays negligible.
+const CONCURRENT_WAIT_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
+    base: std::time::Duration::from_millis(100),
+    mult: 2.0,
+    cap: std::time::Duration::from_secs(1),
+    jitter: rio_common::backoff::Jitter::Full,
+};
+
 /// How the NAR was persisted. Batch uses this to pick the right
-/// `complete_manifest_*_in_tx` variant inside its atomic tx.
+/// `complete_manifest_*_in_tx` variant inside its atomic tx. Both
+/// variants carry the [`cas::ParsedNar`] derived at staging time so
+/// the commit transaction can write the castore index (boxed — the
+/// entry list + DAG for a large output is non-trivial and this enum
+/// sits in a per-output accumulator).
 pub(in crate::grpc) enum NarPersist {
     /// `nar_data.len() < INLINE_THRESHOLD` (or no chunk backend).
-    /// Bytes carried so the batch tx can write `inline_blob`.
-    Inline(Bytes),
+    /// Carries the **blob stream** (regular-file contents in walk
+    /// order, not the NAR) so the batch tx can write `inline_blob`.
+    Inline(Bytes, Box<cas::ParsedNar>),
     /// `nar_data.len() >= INLINE_THRESHOLD` and a chunk backend is
     /// configured. Chunks already uploaded + refcounted via
-    /// [`cas::stage_chunked`]; only the `status='complete'` flip
-    /// remains.
-    ChunkedStaged,
+    /// [`cas::stage_chunked`]; the `status='complete'` flip and the
+    /// castore index write remain.
+    ChunkedStaged(Box<cas::ParsedNar>),
 }
 
 /// Auth context for PutPath / PutPathBatch: HMAC assignment claims
@@ -224,12 +241,37 @@ pub(in crate::grpc) async fn read_first_metadata(
     }
 }
 
-// r[impl store.integrity.verify-on-put]
+/// Drain and discard the remaining frames of a client-streaming upload
+/// before returning early.
+///
+/// Must be called before an early return that would leave unconsumed
+/// frames on the gRPC transport — they stall the client's send loop
+/// until the RST propagates. Bounded by `DEFAULT_GRPC_TIMEOUT` to
+/// prevent a slow client from holding the handler indefinitely. `rpc`
+/// names the calling RPC in the timeout warning.
+pub(in crate::grpc) async fn drain_stream<T>(rpc: &'static str, stream: &mut Streaming<T>) {
+    let drain = async {
+        while let Ok(Some(_)) = stream.message().await {
+            // discard
+        }
+    };
+    if tokio::time::timeout(rio_common::grpc::DEFAULT_GRPC_TIMEOUT, drain)
+        .await
+        .is_err()
+    {
+        warn!(
+            timeout = ?rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            "{rpc}: drain_stream timed out; client may be sending slowly"
+        );
+    }
+}
+
+// r[impl store.integrity.verify-on-put+3]
 // r[impl sec.drv.validate]
 /// Compare a server-computed NAR digest+size against the
 /// trailer-declared `nar_hash` / `nar_size` (already applied to `info`
 /// via [`apply_trailer`]). The integrity gate of
-/// `r[store.integrity.verify-on-put]` — server computes the digest
+/// `r[store.integrity.verify-on-put+3]` — server computes the digest
 /// independently of the client.
 ///
 /// `computed_hash` is the finalized output of an incremental
@@ -266,7 +308,7 @@ pub(in crate::grpc) fn verify_nar(
     Ok(())
 }
 
-// r[impl sec.authz.ca-path-derived+2]
+// r[impl sec.authz.ca-path-derived+3]
 /// Floating-CA path-authorization gate. When `claims.is_ca` is set,
 /// [`validate_put_metadata`] skipped the `store_path ∈
 /// expected_outputs` check (the path isn't known at sign time). This
@@ -538,22 +580,65 @@ impl StoreServiceImpl {
     /// output. On `persist_nar` error the placeholder is `abort_upload`ed
     /// here; the caller's drop-guard spawn is then a harmless no-op.
     /// `info.store_path_hash` MUST be populated.
+    ///
+    /// `tenant_id` (JWT-only) selects the signing key; `junction_tenant`
+    /// (JWT-or-HMAC, the shared `resolve_tenant_id` resolution) is what
+    /// the `path_tenants` junction records — see the rationale at
+    /// put_path_chunked/mod.rs's `junction_tenant` resolution.
     // r[impl obs.metric.transfer-volume]
+    // r[impl store.put.tenant-junction]
     pub(in crate::grpc) async fn finalize_single(
         &self,
         mut info: ValidatedPathInfo,
         claim: uuid::Uuid,
         nar_data: Vec<u8>,
         tenant_id: Option<uuid::Uuid>,
+        junction_tenant: Option<uuid::Uuid>,
     ) -> Result<(), Status> {
         self.maybe_sign(tenant_id, &mut info).await;
-        if let Err(e) = self.persist_nar(&info, claim, nar_data, "PutPath").await {
+        if let Err(e) = self
+            .persist_nar(&info, claim, nar_data, "PutPath", junction_tenant)
+            .await
+        {
             self.abort_upload(&info.store_path_hash, claim).await;
             return Err(e);
         }
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
         metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);
         Ok(())
+    }
+
+    /// `path_tenants` junction for an idempotent-skipped path
+    /// (r[store.put.tenant-junction]): the prior commit may belong to
+    /// another tenant (or predate tenancy — legacy uploads), and the
+    /// skipping caller still needs castore read access and a GC pin.
+    /// Tolerates a tenant deleted mid-flight, same as the in-tx variant.
+    // r[impl store.put.tenant-junction]
+    pub(in crate::grpc) async fn insert_path_tenant_skipped(
+        &self,
+        store_path_hash: &[u8],
+        tenant_id: Option<uuid::Uuid>,
+    ) -> Result<(), Status> {
+        if tenant_id.is_none() {
+            return Ok(());
+        }
+        let result = async {
+            let mut conn = self.pool.acquire().await?;
+            metadata::insert_path_tenant_in_conn(&mut conn, store_path_hash, tenant_id).await
+        }
+        .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) if metadata::is_deleted_tenant_fk(&e) => {
+                warn!(
+                    store_path_hash = hex::encode(store_path_hash),
+                    "PutPath: path_tenants junction skipped — tenant was deleted while the \
+                     upload was in flight"
+                );
+                Ok(())
+            }
+            Err(e) => Err(putpath_metadata_status("PutPath: path_tenants", e)),
+        }
     }
 
     /// gRPC wrapper around [`ingest::claim_placeholder`]: adds the
@@ -592,6 +677,92 @@ impl StoreServiceImpl {
         Ok(claim)
     }
 
+    /// Bounded wait for a concurrent same-path uploader to resolve.
+    ///
+    /// Layer rationale: the loser of a same-path race needs no bytes to
+    /// finish — its optimal outcome is the idempotent skip — so waiting
+    /// HERE, where the winner's placeholder row is directly observable,
+    /// fixes every client at once: the gateway's buffered re-send retry
+    /// (`gw.put.aborted-retry`, ~6 s budget tuned for KB `.drv` NARs —
+    /// no match for a winner streaming a chunked NAR for tens of
+    /// seconds), the gateway's streaming path (cannot retry at all —
+    /// bytes already consumed off the wire), and the builder's upload
+    /// retry. The wire contract is unchanged; the RPC just resolves
+    /// later, bounded by `concurrent_put_wait` ≪ `GRPC_STREAM_TIMEOUT`.
+    ///
+    /// Re-runs the full [`ingest::claim_placeholder`] per poll so every
+    /// transition is handled: winner commits → `AlreadyComplete`
+    /// (caller takes the idempotent-skip path), winner aborts/dies →
+    /// placeholder reaped → `Owned` (caller takes over the upload),
+    /// winner still streaming → keep polling. Returns `Concurrent` only
+    /// when the budget expires with the uploader still live — the
+    /// caller surfaces the original `ABORTED` and the client's retry
+    /// logic stays in charge.
+    // r[impl store.put.concurrent-wait]
+    pub(in crate::grpc) async fn wait_for_concurrent_upload(
+        &self,
+        store_path_hash: &[u8],
+        store_path: &str,
+        refs: &[String],
+    ) -> Result<PlaceholderClaim, metadata::MetadataError> {
+        let budget = self.concurrent_put_wait;
+        let start = std::time::Instant::now();
+        let mut attempt = 0u32;
+        // Entry marker, before the first poll: operators see waiters
+        // that are still parked (the outcome labels below only fire on
+        // resolution), and tests latch on it instead of sleeping.
+        metrics::counter!("rio_store_putpath_concurrent_wait_total",
+            "outcome" => "waiting")
+        .increment(1);
+        loop {
+            let elapsed = start.elapsed();
+            if elapsed >= budget {
+                metrics::counter!("rio_store_putpath_concurrent_wait_total",
+                    "outcome" => "timeout")
+                .increment(1);
+                return Ok(PlaceholderClaim::Concurrent);
+            }
+            let delay = CONCURRENT_WAIT_BACKOFF
+                .duration(attempt)
+                .min(budget - elapsed);
+            tokio::time::sleep(delay).await;
+            attempt = attempt.saturating_add(1);
+            // Direct ingest call, NOT the metric-wrapping
+            // `claim_placeholder` method: the per-RPC
+            // `concurrent_upload` retry counter fired once on the
+            // initial claim; per-poll increments would inflate it ~1/s
+            // per waiter.
+            match ingest::claim_placeholder(
+                &self.pool,
+                self.chunk_backend.as_ref(),
+                store_path_hash,
+                store_path,
+                refs,
+                PUTPATH_HOOKS,
+            )
+            .await?
+            {
+                PlaceholderClaim::Concurrent => {}
+                PlaceholderClaim::AlreadyComplete => {
+                    debug!(%store_path, waited = ?start.elapsed(),
+                        "PutPath: concurrent upload committed; idempotent skip");
+                    metrics::counter!("rio_store_putpath_concurrent_wait_total",
+                        "outcome" => "completed")
+                    .increment(1);
+                    return Ok(PlaceholderClaim::AlreadyComplete);
+                }
+                PlaceholderClaim::Owned(claim) => {
+                    debug!(%store_path, waited = ?start.elapsed(),
+                        "PutPath: concurrent upload aborted; taking over the placeholder");
+                    metrics::counter!("rio_store_putpath_concurrent_wait_total",
+                        "outcome" => "takeover")
+                    .increment(1);
+                    return Ok(PlaceholderClaim::Owned(claim));
+                }
+            }
+        }
+    }
+
     /// gRPC wrapper around [`ingest::persist_nar`]: maps
     /// [`ingest::PersistError`] → `tonic::Status` with the
     /// PutPath-specific code mapping (`storage_error` for the chunked
@@ -610,6 +781,7 @@ impl StoreServiceImpl {
         claim: uuid::Uuid,
         nar_data: Vec<u8>,
         ctx_label: &str,
+        junction_tenant: Option<uuid::Uuid>,
     ) -> Result<bool, Status> {
         let chunked = cas::should_chunk(self.chunk_backend.as_ref(), nar_data.len()).is_some();
         ingest::persist_nar(
@@ -620,11 +792,17 @@ impl StoreServiceImpl {
             nar_data,
             self.chunk_upload_max_concurrent,
             PUTPATH_HOOKS,
+            junction_tenant,
         )
         .await
         .map_err(|e| match e {
             ingest::PersistError::Chunked(e) => storage_error(ctx_label, e),
             ingest::PersistError::Inline(e) => putpath_metadata_status(ctx_label, e),
+            // Hash matched but the bytes are not a structurally valid
+            // NAR — a client bug, not a storage failure. Non-retryable.
+            ingest::PersistError::Malformed(e) => {
+                Status::invalid_argument(format!("{ctx_label}: {e:#}"))
+            }
         })?;
         Ok(chunked)
     }
@@ -644,6 +822,15 @@ impl StoreServiceImpl {
         claim: uuid::Uuid,
         nar_data: Vec<u8>,
     ) -> Result<NarPersist, Status> {
+        // Same parse-once as `ingest::persist_nar` — the batch's atomic
+        // commit needs the castore representation per output, and the
+        // chunked staging needs the per-file content ranges.
+        let parsed = cas::cpu_bound(|| cas::ParsedNar::parse(&nar_data)).map_err(|e| {
+            Status::invalid_argument(format!(
+                "PutPathBatch: NAR for {} failed structural validation: {e:#}",
+                info.store_path.as_str()
+            ))
+        })?;
         if let Some(backend) = cas::should_chunk(self.chunk_backend.as_ref(), nar_data.len()) {
             let stats = cas::stage_chunked(
                 &self.pool,
@@ -651,20 +838,22 @@ impl StoreServiceImpl {
                 info,
                 claim,
                 &nar_data,
+                &parsed,
                 self.chunk_upload_max_concurrent,
             )
             .await
             .map_err(|e| storage_error("PutPathBatch: stage_chunked", e))?;
             metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
-            Ok(NarPersist::ChunkedStaged)
+            Ok(NarPersist::ChunkedStaged(Box::new(parsed)))
         } else {
-            Ok(NarPersist::Inline(Bytes::from(nar_data)))
+            let blob = parsed.blob_stream(&nar_data);
+            Ok(NarPersist::Inline(Bytes::from(blob), Box::new(parsed)))
         }
     }
 }
 
 // r[verify sec.drv.validate]
-// r[verify store.integrity.verify-on-put]
+// r[verify store.integrity.verify-on-put+3]
 #[cfg(test)]
 mod verify_nar_tests {
     use super::*;

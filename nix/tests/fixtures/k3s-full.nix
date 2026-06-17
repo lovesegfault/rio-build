@@ -149,6 +149,22 @@ in
   # + KWOK Stage rules here so the §13b nodeclaim_pool reconciler can
   # be exercised without EC2.
   extraManifests ? { },
+  # P0560 fixture-tenancy stopgap (P0593 deletes) — k3s flavour of the
+  # standalone fixture's `defaultTenant`. Build-running scenarios need
+  # (a) a tenant row, (b) submissions attributed to it (the seeded SSH
+  # key's comment), (c) `path_tenants` rows for every input the builder
+  # reads through the tenant-scoped castore RPCs. (a)+(c) are applied to
+  # the in-cluster bitnami PG in waitReady (common.tenantStopgapSeedSql:
+  # tenant row + the rio_vmtest_* triggers); (b) flips the default
+  # sshKeySetup comment from "" to this name. HMAC keys are already
+  # unconditional in this fixture (rio-hmac Secrets above), so the
+  # builder presents a tenant-bearing assignment token once the build is
+  # attributed. Scenarios that create their own tenants either opt into
+  # the triggers by creating them with gc_retention_hours = 0
+  # (lifecycle's vm-lifecycle) or attribute the inputs they need
+  # explicitly (lifecycle gc-sweep's gc-tenant-test) — see the scoping
+  # rationale in common.tenantStopgapSeedSql.
+  defaultTenant ? null,
 }:
 let
   ciliumRender = mkCiliumRender gatewayEnabled;
@@ -360,16 +376,108 @@ let
   # needs 8472/udp both ways; kubelet 10250 for `kubectl exec`/logs
   # (agent → server AND server → agent for 2-node).
   k3sBase = {
+    # FUSE_PASSTHROUGH-capable kernel + fuse/overlay modules — same
+    # module the EKS AMI uses. Builder pods' castore-FUSE lower needs
+    # it on every node that can host them.
+    imports = [ ../../nixos-node/kernel.nix ];
     services.k3s = {
       package = k3sPinned;
       containerdConfigTemplate = k3sContainerdConfigTmpl;
     };
     swapDevices = [ ];
-    boot.kernelModules = [
-      "fuse"
-      "wireguard"
-    ];
-    boot.kernelParams = [ "systemd.unified_cgroup_hierarchy=1" ];
+    boot = {
+      kernelModules = [
+        "loop"
+        "wireguard"
+      ];
+      kernelParams = [
+        "systemd.unified_cgroup_hierarchy=1"
+        # Worker pods mount the castore-FUSE, which serves exclusively
+        # over fuse-over-io_uring — without this switch the kernel
+        # never advertises FUSE_OVER_IO_URING and every per-build
+        # mount fails hard. Same switch as the production AMI
+        # (nix/nixos-node/hardening.nix).
+        "fuse.enable_uring=1"
+      ];
+      supportedFilesystems = [ "xfs" ];
+    };
+
+    # ── /var/rio on an XFS-with-prjquota loopback ──────────────────────
+    # The rio-mountd DaemonSet (mountd.enabled=true in vmtest-full.yaml)
+    # hostPath-mounts /var/rio with `type: Directory` and applies a
+    # kernel project quota to every per-build staging dir; on a
+    # filesystem without prjquota support that quota application fails
+    # the first Mount and no build can start. Mirror the EKS AMI's
+    # rio-nvme-mount bind (prjquota XFS) with a small loopback — sparse,
+    # so it costs nothing until builds actually write.
+    systemd = {
+      services.var-rio-xfs = {
+        description = "XFS prjquota loopback for /var/rio (castore caches + staging)";
+        wantedBy = [ "multi-user.target" ];
+        requiredBy = [ "k3s.service" ];
+        before = [ "k3s.service" ];
+        path = [
+          pkgs.xfsprogs
+          pkgs.util-linux
+          pkgs.coreutils
+        ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+        };
+        script = ''
+          mkdir -p /var/rio
+          if ! mountpoint -q /var/rio; then
+            if [ ! -f /var/rio.img ]; then
+              truncate -s 4G /var/rio.img
+              mkfs.xfs -q /var/rio.img
+            fi
+            mount -o loop,prjquota /var/rio.img /var/rio
+          fi
+          mkdir -p /var/rio/castore /var/rio/staging /var/rio/cache /var/rio/chunks
+        '';
+      };
+
+      services.k3s.serviceConfig = {
+        # Pick the base_runtime_spec variant matching host /dev/kvm
+        # presence (k3s embeds containerd, so this runs pre-containerd).
+        # List form so it merges with the nixpkgs k3s module's preStart.
+        ExecStartPre = [ baseRuntimeSpec.pickExecStartPre ];
+        # containerd needs cgroup delegation for pod cgroups. Without:
+        # ContainerCreating forever.
+        Delegate = "yes";
+        # Drop the 1Hz retry spam during the ~180s airgap-import window
+        # (apiserver up, kubelet blocked on serial image import → node
+        # not yet registered). 182 lines/run pre-filter. "~" prefix =
+        # exclude matching from journal ingestion (systemd 253+) — never
+        # reaches console→serial→testlog. Other k3s logs unaffected.
+        LogFilterPatterns = "~Unable to set control-plane role label";
+      };
+
+      # r[impl builder.seccomp.localhost-profile+3]
+      # Same tmpfiles delivery as the NixOS AMI (nix/nixos-node/hardening.nix):
+      # profiles are store paths, copied into kubelet's seccomp dir before k3s
+      # (and its embedded kubelet) starts. k3s passes `--root-dir
+      # /var/lib/kubelet` to kubelet, so the path matches EKS — no
+      # /var/lib/rancher indirection. By the time any pod schedules the file
+      # is guaranteed present; rio-controller emits Localhost without a wait.
+      # `C` (copy, not `L` symlink): runc opens the profile via the literal
+      # localhostProfile path; a /nix/store symlink would have a different
+      # store path on every fixture rebuild.
+      tmpfiles.rules = [
+        "d /var/lib/kubelet/seccomp/operator 0755 root root -"
+        "C /var/lib/kubelet/seccomp/operator/rio-builder.json 0644 root root - ${../../nixos-node/seccomp/rio-builder.json}"
+        "C /var/lib/kubelet/seccomp/operator/rio-fetcher.json 0644 root root - ${../../nixos-node/seccomp/rio-fetcher.json}"
+      ]
+      # Belt-and-suspenders for coverage mode: pre-empt kubelet's
+      # DirectoryOrCreate (which creates 0755 root:root) so the cov
+      # hostPath is world-writable regardless of pod UID. The helm
+      # chart's rio.podSecurityContext sets runAsUser: 0 under
+      # coverage (the primary fix), but image-UID drift would
+      # silently re-break profraw flush without this — tmpfiles runs
+      # at boot, before k3s.
+      ++ pkgs.lib.optional coverage "d /var/lib/rio/cov 0777 root root -";
+    };
 
     networking.firewall = {
       allowedTCPPorts = [
@@ -404,22 +512,6 @@ let
       "cilium_*"
       "lxc*"
     ];
-
-    systemd.services.k3s.serviceConfig = {
-      # Pick the base_runtime_spec variant matching host /dev/kvm
-      # presence (k3s embeds containerd, so this runs pre-containerd).
-      # List form so it merges with the nixpkgs k3s module's preStart.
-      ExecStartPre = [ baseRuntimeSpec.pickExecStartPre ];
-      # containerd needs cgroup delegation for pod cgroups. Without:
-      # ContainerCreating forever.
-      Delegate = "yes";
-      # Drop the 1Hz retry spam during the ~180s airgap-import window
-      # (apiserver up, kubelet blocked on serial image import → node
-      # not yet registered). 182 lines/run pre-filter. "~" prefix =
-      # exclude matching from journal ingestion (systemd 253+) — never
-      # reaches console→serial→testlog. Other k3s logs unaffected.
-      LogFilterPatterns = "~Unable to set control-plane role label";
-    };
 
     # ── Containerd image store on tmpfs ────────────────────────────────
     # Eliminates builder-disk variance for airgap imports. Before:
@@ -459,29 +551,6 @@ let
       pkgs.wireguard-tools # `wg show cilium_wg0` (cilium-encrypt.nix)
     ];
 
-    # r[impl builder.seccomp.localhost-profile+3]
-    # Same tmpfiles delivery as the NixOS AMI (nix/nixos-node/hardening.nix):
-    # profiles are store paths, copied into kubelet's seccomp dir before k3s
-    # (and its embedded kubelet) starts. k3s passes `--root-dir
-    # /var/lib/kubelet` to kubelet, so the path matches EKS — no
-    # /var/lib/rancher indirection. By the time any pod schedules the file
-    # is guaranteed present; rio-controller emits Localhost without a wait.
-    # `C` (copy, not `L` symlink): runc opens the profile via the literal
-    # localhostProfile path; a /nix/store symlink would have a different
-    # store path on every fixture rebuild.
-    systemd.tmpfiles.rules = [
-      "d /var/lib/kubelet/seccomp/operator 0755 root root -"
-      "C /var/lib/kubelet/seccomp/operator/rio-builder.json 0644 root root - ${../../nixos-node/seccomp/rio-builder.json}"
-      "C /var/lib/kubelet/seccomp/operator/rio-fetcher.json 0644 root root - ${../../nixos-node/seccomp/rio-fetcher.json}"
-    ]
-    # Belt-and-suspenders for coverage mode: pre-empt kubelet's
-    # DirectoryOrCreate (which creates 0755 root:root) so the cov
-    # hostPath is world-writable regardless of pod UID. The helm
-    # chart's rio.podSecurityContext sets runAsUser: 0 under
-    # coverage (the primary fix), but image-UID drift would
-    # silently re-break profraw flush without this — tmpfiles runs
-    # at boot, before k3s.
-    ++ pkgs.lib.optional coverage "d /var/lib/rio/cov 0777 root root -";
   };
 
   # ── v6-only k3s node overlay ────────────────────────────────────────
@@ -654,18 +723,24 @@ let
           # (IO-starved by the airgap image import). We don't use
           # etcd snapshots in an ephemeral VM test.
           "--etcd-disable-snapshots"
+          # Builder pods can land on either k3s node; the rio-mountd
+          # DaemonSet's nodeAffinity keys on this label (EKS sets it
+          # via the Karpenter NodePool). Without it the DS never
+          # schedules here and every build fails at UDS connect.
+          "--node-label"
+          "rio.build/node-role=builder"
         ];
       };
 
       # 8GB (was 6GB): PG (512Mi) + 5 rio pods (~2GB) + k3s control
       # plane (~1.5GB) + containerd tmpfs (~1.5GB layers, 3G cap) +
       # headroom. Coverage: +2GB for instrumented-image bloat.
-      # diskSize 24GB: controller adds PoolSpec.fuseCacheBytes (4Gi
-      # via vmtest-full.yaml; CRD default 8Gi for non-helm Pools;
-      # helm prod 50Gi) + LOG_BUDGET 1Gi on top of
-      # SpawnIntent.disk_bytes (sla.defaultDisk 2Gi) — every
-      # worker pod requests ≥7GiB ephemeral-storage. qemu disk image
-      # is sparse so the bump is ~free until builds actually write.
+      # diskSize 24GB: worker pods request disk_bytes × headroom +
+      # LOG_BUDGET 1Gi of ephemeral-storage (jobs.rs::
+      # pod_ephemeral_request) on top of the node's own image/layer
+      # use, and the node-level /var/rio castore caches live on the
+      # 4G XFS loopback above. qemu disk image is sparse so the bump
+      # is ~free until builds actually write.
       virtualisation = {
         memorySize = 8192 + k3sCovMemBump;
         cores = 8;
@@ -702,17 +777,19 @@ let
           # classifies the real agent via it.
           "--node-label"
           "rio.build/vmtest=true"
+          # rio-mountd DaemonSet nodeAffinity (see serverNode comment).
+          "--node-label"
+          "rio.build/node-role=builder"
         ];
       };
 
-      # 6GB (was 4GB): scheduler replica (~512Mi) + worker (~1.5Gi
-      # with FUSE cache) + containerd tmpfs (~1.5GB layers, 3G cap)
-      # + k3s agent (~500Mi). Coverage: +2GB for instrumented images.
+      # 6GB (was 4GB): scheduler replica (~512Mi) + worker (~1.5Gi)
+      # + containerd tmpfs (~1.5GB layers, 3G cap) + k3s agent
+      # (~500Mi). Coverage: +2GB for instrumented images.
       # diskSize 24GB: see serverNode comment — worker pods request
-      # ≥7GiB ephemeral-storage (fuseCacheBytes 4Gi via vmtest-full
-      # + log 1Gi + disk 2Gi; non-helm Pools get CRD default 8Gi →
-      # ≥11GiB); the prior 12GB → ~11GiB allocatable left zero headroom
-      # for fetcher pods (nodeSelector pins them here).
+      # disk_bytes × headroom + log 1Gi of ephemeral-storage; the
+      # prior 12GB → ~11GiB allocatable left zero headroom for
+      # fetcher pods (nodeSelector pins them here).
       virtualisation = {
         memorySize = 6144 + k3sCovMemBump;
         cores = 8;
@@ -731,6 +808,9 @@ let
 in
 rec {
   # Exposed for testScript: `k3s-server.succeed("k3s kubectl -n ${fixture.ns} ...")`.
+  # defaultTenant is exported (mirroring the standalone fixture) so scenarios
+  # that register their own SSH keys can carry the tenant in the key comment
+  # (P0560 tenancy stopgap).
   inherit
     ns
     nsStore
@@ -738,6 +818,7 @@ rec {
     nsFetchers
     helmRendered
     hmacKeys
+    defaultTenant
     ;
 
   # 7-node v6-only topology. k3s nodes + clients + upstreams are
@@ -974,9 +1055,22 @@ rec {
         timeout=200,
     )
 
+    # ── Migrations applied (rio-migrate Job) ────────────────────────
+    # migrate-job.yaml is a plain Job applied alongside everything
+    # else; its pod polls PG until reachable (rio-store migrate's
+    # in-process connect loop — no CrashLoop backoff amplification),
+    # then applies rio-migrations + ensure_roles. Waited by LABEL: the
+    # Job name carries a per-render pod-template hash.
+    k3s_server.wait_until_succeeds(
+        "k3s kubectl -n ${ns} wait --for=condition=Complete "
+        "job -l app.kubernetes.io/name=rio-migrate --timeout=120s",
+        timeout=140,
+    )
+
     # ── rio deployments Available ───────────────────────────────────
-    # store + scheduler crash-loop until PG is up (sqlx migrate retry),
-    # then come clean. controller just needs apiserver.
+    # store + scheduler crash-restart on the startup schema check
+    # until the rio-migrate Job (waited above) completes, then come
+    # clean. controller just needs apiserver.
     #
     # Gateway NOT waited here: 03-gateway-ssh-placeholder seeds a
     # throwaway key (private half discarded, authorizes nothing) so
@@ -1028,6 +1122,26 @@ rec {
             "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=80 2>&1"
         )[1])
         raise
+  ''
+  + pkgs.lib.optionalString (defaultTenant != null) ''
+    # ── P0560 fixture-tenancy stopgap (P0593 deletes) ────────────────
+    # Same seed the standalone fixture applies via its rio-seed-tenant
+    # oneshot: the '${defaultTenant}' tenant row + the rio_vmtest_*
+    # path-attribution triggers, applied to the in-cluster bitnami PG.
+    # Runs after the store/scheduler Deployments are Available (their
+    # startup migrations created tenants/narinfo/path_tenants) and
+    # before sshKeySetup / the first build (mkBootstrap runs both after
+    # waitReady), so the gateway can resolve the key comment at SSH
+    # auth time and every registered path gets attributed from the
+    # start. wait_until_succeeds: belt-and-suspenders against a PG
+    # connection blip right after the rollout settles.
+    k3s_server.wait_until_succeeds(
+        "k3s kubectl -n ${ns} exec -i rio-postgresql-0 -- "
+        "env PGPASSWORD=rio psql -h 127.0.0.1 -U rio -d rio "
+        "-v ON_ERROR_STOP=1 -1 -f - "
+        "< ${common.tenantStopgapSeedSql defaultTenant}",
+        timeout=120,
+    )
   '';
 
   # Scale gateway to 0 → wait for full pod deletion → scale to 1.
@@ -1130,10 +1244,14 @@ rec {
         timeout=30,
     )
   '';
-  # Backward-compat alias: empty comment (single-tenant / non-JWT
-  # scenarios). leader-election + privileged-hardening-e2e + the
-  # common.nix mkFragmentTest fallback all use this.
-  sshKeySetup = sshKeySetupFor "";
+  # Default-key alias used by mkBootstrap / leader-election /
+  # privileged-hardening-e2e. With the P0560 tenancy stopgap
+  # (defaultTenant set) the comment carries the tenant name so every
+  # ssh-ng submission is attributed to it — without that, claims.tenant
+  # stays empty and the builder's tenant-scoped castore reads fail
+  # closed. Without defaultTenant the legacy empty comment
+  # (single-tenant / non-JWT) is preserved.
+  sshKeySetup = sshKeySetupFor (if defaultTenant != null then defaultTenant else "");
 
   # For `${common.collectCoverage pyNodeVars}`. Client excluded (no
   # rio services → empty tarball noise).

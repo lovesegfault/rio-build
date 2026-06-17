@@ -232,6 +232,12 @@ impl DagActor {
         if !depfailed.is_empty() {
             self.persist_status_batch(&depfailed, DerivationStatus::DependencyFailed)
                 .await;
+            // Terminal without dispatch: these sole-interest nodes were
+            // never assigned, so the worker-completion unpin never runs
+            // for them — release the merge-time drv pin
+            // (r[store.drv.gc-build-pinned]) here, their only terminal
+            // transition.
+            self.unpin_best_effort_batch(&depfailed).await;
         }
 
         // Remove build interest from derivations
@@ -395,14 +401,7 @@ impl DagActor {
                     )
                 }
                 BuildState::Failed => {
-                    rio_proto::types::build_event::Event::Failed(rio_proto::types::BuildFailed {
-                        error_message: build.error_summary.clone().unwrap_or_default(),
-                        failed_derivation: build.failed_derivation.clone().unwrap_or_default(),
-                        // TODO: thread BuildResultStatus from the failing
-                        // derivation (completion.rs:517 receives it from the
-                        // worker; build state needs a field to carry it).
-                        status: 0,
-                    })
+                    rio_proto::types::build_event::Event::Failed(build.to_build_failed())
                 }
                 BuildState::Cancelled => rio_proto::types::build_event::Event::Cancelled(
                     rio_proto::types::BuildCancelled {
@@ -571,15 +570,10 @@ impl DagActor {
         &mut self,
         build_id: Uuid,
     ) -> Result<(), ActorError> {
-        let (error_summary, failed_derivation) = self
+        let failed = self
             .builds
             .get(&build_id)
-            .map(|b| {
-                (
-                    b.error_summary.clone().unwrap_or_default(),
-                    b.failed_derivation.clone().unwrap_or_default(),
-                )
-            })
+            .map(|b| b.to_build_failed())
             .unwrap_or_default();
 
         // Skip side effects on Rejected (already terminal).
@@ -591,11 +585,7 @@ impl DagActor {
 
         self.events.emit(
             build_id,
-            rio_proto::types::build_event::Event::Failed(rio_proto::types::BuildFailed {
-                error_message: error_summary,
-                failed_derivation,
-                status: 0,
-            }),
+            rio_proto::types::build_event::Event::Failed(failed),
         );
         metrics::counter!("rio_scheduler_builds_total", "outcome" => "failure").increment(1);
 

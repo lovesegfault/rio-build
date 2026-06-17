@@ -47,6 +47,10 @@ fn is_client_call(line: &str) -> bool {
     let method = &after[..paren];
     !method.is_empty()
         && method != "clone"
+        // `.as_mut()` passes the client onward (e.g. into
+        // `populate_digests_and_upload_drvs`, which applies `with_jwt`
+        // internally) — not an RPC call site.
+        && method != "as_mut"
         && method
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_')

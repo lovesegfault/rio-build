@@ -387,6 +387,13 @@ module "eks" {
       # vpc-cni is in cluster_addons (which it no longer is).
       iam_role_attach_cni_policy = false
 
+      # SSM: xtask's tunnel transport (k8s/ssm.rs) needs an always-on
+      # relay node. Karpenter nodes have it too (karpenter.tf) but may
+      # not exist yet on a fresh cluster.
+      iam_role_additional_policies = {
+        AmazonSSMManagedInstanceCore = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      }
+
       # No taint: system components (plus kube-system addons like
       # CoreDNS, Karpenter controller) schedule here freely.
       #
@@ -430,6 +437,22 @@ data "aws_iam_policy_document" "rio_store_s3" {
     actions   = ["s3:ListBucket"]
     resources = [aws_s3_bucket.chunks.arn]
   }
+  # ADR-023 cache tier: S3 Express auth is session-based —
+  # s3express:CreateSession at BUCKET level is the whole model (the SDK
+  # mints short-lived session credentials per directory bucket; object
+  # ops ride the session, there are no per-object grants to scope).
+  # Scoped to exactly the express cache buckets. Same single store
+  # role as the chunks bucket above: per-tenant read authorization
+  # happens in rio-store's gRPC layer, above the chunk backend, for
+  # BOTH tiers — neither bucket encodes caller identity.
+  dynamic "statement" {
+    for_each = length(var.express_az_ids) > 0 ? [1] : []
+    content {
+      effect    = "Allow"
+      actions   = ["s3express:CreateSession"]
+      resources = [for b in aws_s3_directory_bucket.express_cache : b.arn]
+    }
+  }
 }
 
 module "rio_store_irsa" {
@@ -455,7 +478,53 @@ module "rio_store_irsa" {
   }
 
   policies = {
-    s3 = aws_iam_policy.rio_store_s3.arn
+    s3  = aws_iam_policy.rio_store_s3.arn
+    rds = aws_iam_policy.rio_rds_connect.arn
+  }
+}
+
+# RDS IAM database auth: lets a pod mint 15-minute PG auth tokens for
+# DB user rio_app (the migrate runner's ensure_roles pass creates the role; rio_common::pg_iam
+# does the SigV4 presign). ONE shared policy for store/scheduler/
+# controller — all three connect to the same cluster as the same DB
+# user, so per-service copies would be three identical documents.
+# Scoped to the cluster's DbiResourceId, not "*": rds-db:connect is the
+# only RDS action that supports dbuser-level resources.
+data "aws_iam_policy_document" "rio_rds_connect" {
+  statement {
+    effect  = "Allow"
+    actions = ["rds-db:connect"]
+    resources = [
+      "arn:aws:rds-db:${var.region}:${data.aws_caller_identity.current.account_id}:dbuser:${aws_rds_cluster.rio.cluster_resource_id}/rio_app",
+    ]
+  }
+}
+
+resource "aws_iam_policy" "rio_rds_connect" {
+  name   = "${var.cluster_name}-rio-rds-connect"
+  policy = data.aws_iam_policy_document.rio_rds_connect.json
+}
+
+# IRSA for rio-controller: rds-db:connect ONLY (IAM-mode postgres for
+# nodeclaim_pool's CellSketches persist/load is the controller's sole
+# AWS dependency). Annotation reaches the SA via helm
+# controller.serviceAccount.annotations (xtask deploy passes the tofu
+# output, same plumbing as store/scheduler).
+module "rio_controller_irsa" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts"
+  version = "~> 6.0"
+
+  name = "${var.cluster_name}-rio-controller"
+
+  oidc_providers = {
+    eks = {
+      provider_arn               = module.eks.oidc_provider_arn
+      namespace_service_accounts = ["rio-system:rio-controller"]
+    }
+  }
+
+  policies = {
+    rds = aws_iam_policy.rio_rds_connect.arn
   }
 }
 
@@ -507,7 +576,8 @@ module "rio_scheduler_irsa" {
   }
 
   policies = {
-    s3 = aws_iam_policy.rio_scheduler_s3.arn
+    s3  = aws_iam_policy.rio_scheduler_s3.arn
+    rds = aws_iam_policy.rio_rds_connect.arn
   }
 }
 

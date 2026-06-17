@@ -8,15 +8,22 @@ use rio_proto::ChunkServiceServer;
 use rio_proto::StoreAdminServiceServer;
 use rio_proto::StoreServiceServer;
 use rio_store::backend::ChunkBackend;
-use rio_store::grpc::{ChunkServiceImpl, StoreAdminServiceImpl, StoreServiceImpl};
+use rio_store::grpc::{
+    ChunkServiceImpl, DrvBlobServiceImpl, StoreAdminServiceImpl, StoreServiceImpl,
+};
 use rio_store::signing::{Signer, TenantSigner};
 use rio_store::substitute::Substituter;
 
-use rio_store::config::{CliArgs, Config, derive_substitute_admission_cap, init_chunk_backend};
+use rio_store::config::{
+    CliArgs, Config, StoreCommand, derive_substitute_admission_cap, init_chunk_backend,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = CliArgs::parse();
+    if let Some(StoreCommand::Migrate) = cli.command {
+        return run_migrate().await;
+    }
     let rio_common::server::Bootstrap::<Config> {
         cfg,
         shutdown,
@@ -30,14 +37,14 @@ async fn main() -> anyhow::Result<()> {
         rio_store::HISTOGRAM_BUCKETS,
     )?;
 
-    let pool = init_db_pool(&cfg.database_url, cfg.pg_max_connections).await?;
+    let pool = init_db_pool(&cfg.database_url, cfg.pg_auth, cfg.pg_max_connections).await?;
 
     // grpc.health.v1.Health. The NAMED `rio.store.StoreService` is unset
     // (probe → NotFound, which kubelet treats as failure) until the
     // `set_serving::<StoreServiceServer>` call below flips it. K8s
     // readinessProbe (store.yaml `grpc:{service: rio.store.StoreService}`)
-    // hits the named service — readiness fails until migrations complete
-    // means the Service doesn't route to a half-booted pod. NOTE:
+    // hits the named service — readiness fails until the schema check
+    // passes means the Service doesn't route to a half-booted pod. NOTE:
     // tonic-health defaults the EMPTY-string service to SERVING; the
     // store's probe doesn't check "" so that default is harmless here,
     // but DON'T copy this pattern to a binary that probes "" (see
@@ -46,8 +53,9 @@ async fn main() -> anyhow::Result<()> {
     // Ordering: health_reporter() → build services → set_serving() →
     // serve(). The set_serving happens BEFORE serve() blocks, which means
     // the very first health check after listen returns SERVING. That's
-    // correct: by the time we're listening, migrations are done. If
-    // migrations failed, the `?` above already bailed.
+    // correct: by the time we're listening, the schema check passed. If
+    // it failed (migrate Job hasn't run yet), the `?` above already
+    // bailed and the pod restarts until the schema is current.
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
     let chunk_cache = init_chunk_backend(
@@ -136,7 +144,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ts) = tenant_signer {
         store_service = store_service.with_signer(ts);
     }
-    if let Some(v) = hmac_verifier {
+    // Same verifier shared with DirectoryServiceImpl below — both gate
+    // on `x-rio-assignment-token`.
+    let hmac_verifier_arc = hmac_verifier.map(Arc::new);
+    if let Some(v) = hmac_verifier_arc.clone() {
         store_service = store_service.with_hmac_verifier(v);
     }
     store_service = store_service.with_service_bypass_callers(cfg.service_bypass_callers);
@@ -200,8 +211,28 @@ async fn main() -> anyhow::Result<()> {
 
     // ChunkServiceImpl: same cache Arc. None → FAILED_PRECONDITION
     // on GetChunk, which is correct for an inline-only store (there
-    // ARE no chunks to get).
-    let chunk_service = ChunkServiceImpl::new(chunk_cache.clone());
+    // ARE no chunks to get). The pool is for HasChunks' durable-
+    // presence probe — a pure PG read that works without a cache. The
+    // verifier is HasChunks' caller-identity gate.
+    let chunk_service =
+        ChunkServiceImpl::new(pool.clone(), chunk_cache.clone(), hmac_verifier_arc.clone());
+
+    // Tenant-scoped via JWT or HMAC assignment-token claim — see
+    // grpc/directory.rs. ReadBlob shares the chunk cache; the signer
+    // feeds the sig-visibility fallback's trusted-key set (same
+    // TenantSigner as the StoreService, so the validity gate and the
+    // castore reads derive identical trust).
+    let directory_service = rio_store::grpc::DirectoryServiceImpl::new(
+        pool.clone(),
+        hmac_verifier_arc.clone(),
+        chunk_cache.clone(),
+        store_service.signer().cloned(),
+    );
+
+    // DrvBlobService (ADR-024 P2): canonical drv blobs, tenant-scoped
+    // via the same JWT/HMAC ladder as DirectoryService. Pure PG — drv
+    // bodies live next to Directory bodies, no chunk backend involved.
+    let drv_blob_service = DrvBlobServiceImpl::new(pool.clone(), hmac_verifier_arc);
 
     // StoreAdminServiceImpl: TriggerGC + VerifyChunks + upstream CRUD
     // + GetLoad. Gets the chunk backend directly (for key_for in
@@ -231,7 +262,6 @@ async fn main() -> anyhow::Result<()> {
     if let Some(backend) = chunk_backend_for_gc {
         rio_store::gc::drain::spawn_drain_task(pool.clone(), backend, shutdown.clone());
     }
-
     let max_msg_size = rio_common::grpc::max_message_size();
 
     let addr = cfg.listen_addr;
@@ -292,6 +322,16 @@ async fn main() -> anyhow::Result<()> {
                 .max_encoding_message_size(max_msg_size),
         )
         .add_service(
+            rio_proto::DirectoryServiceServer::new(directory_service)
+                .max_decoding_message_size(max_msg_size)
+                .max_encoding_message_size(max_msg_size),
+        )
+        .add_service(
+            rio_proto::DrvBlobServiceServer::new(drv_blob_service)
+                .max_decoding_message_size(max_msg_size)
+                .max_encoding_message_size(max_msg_size),
+        )
+        .add_service(
             StoreAdminServiceServer::new(admin_service)
                 .max_decoding_message_size(max_msg_size)
                 .max_encoding_message_size(max_msg_size),
@@ -305,8 +345,113 @@ async fn main() -> anyhow::Result<()> {
 
 // ── bootstrap helpers (extracted from main) ──────────────────────────
 
-/// Connect to PostgreSQL and run migrations. URL is logged with
-/// password redacted.
+/// `rio-store migrate`: one-shot migration runner. This is the
+/// container entrypoint of the helm `rio-migrate` Job and the
+/// ExecStart of the NixOS `rio-migrate` systemd oneshot — migrations
+/// run out-of-band, BEFORE any app pod/service starts, and always as
+/// the database master — schema DDL never depends on the credentials
+/// or privileges of whatever auth mode the app pods use. The same
+/// run reconciles the `rio_app` role and its grants
+/// (`rio_migrations::ensure_roles`), so a fresh cluster deploys
+/// directly in `postgres.authMode=iam`: the role exists before any
+/// pod connects as it.
+///
+/// Reads `RIO_DATABASE_URL` directly instead of loading the full
+/// store `Config` — the Job sets exactly this one variable, and the
+/// full config would drag in store-only concerns (chunk backend,
+/// listen addrs) a migration run never touches. Always password-mode:
+/// the runners hand it the master URL.
+///
+/// Connect retry: on fresh k3s installs the bitnami PG StatefulSet
+/// lands in the same helm release as this Job, so PG can trail by
+/// minutes (image pull + initdb). A flat 5s poll for up to 10
+/// minutes rides that out inside ONE Job pod — no CrashLoop backoff
+/// amplification; the Job `backoffLimit` stays a backstop for real
+/// failures (which surface fast: auth errors and bad SQL don't
+/// retry here).
+async fn run_migrate() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    // Same single-provider guard as rio_common::server::bootstrap —
+    // this subcommand skips bootstrap entirely, and a future
+    // transitive dep re-enabling `ring` would otherwise re-create the
+    // rustls dual-provider can't-auto-select panic on the first
+    // verify-full handshake to Aurora. Defense-in-depth; the live
+    // path works today.
+    rio_common::server::install_crypto_provider();
+
+    let _otel_guard = rio_common::observability::init_tracing("store")?;
+    let url = std::env::var("RIO_DATABASE_URL")
+        .context("`rio-store migrate` requires RIO_DATABASE_URL")?;
+    info!(
+        url = %rio_common::config::redact_db_url(&url),
+        "running database migrations"
+    );
+
+    // SIGTERM/SIGINT → cancel (this subcommand skips
+    // rio_common::server::bootstrap and with it the usual signal
+    // wiring). On node drain, kubelet SIGTERMs the Job pod: the
+    // select! below drops the in-flight migrate future — the detached
+    // lock connection closes, PG aborts the running statement
+    // server-side and releases the advisory lock — and main returns
+    // (atexit profraw flush included) instead of dying mid-statement
+    // at SIGKILL. The Job controller reschedules the pod; the re-run
+    // is idempotent under the lock.
+    let shutdown = rio_common::signal::shutdown_signal();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    let pool = loop {
+        match PgPoolOptions::new().max_connections(2).connect(&url).await {
+            Ok(pool) => break pool,
+            Err(e)
+                if rio_common::pg_error::is_transient_bounded(&e)
+                    && std::time::Instant::now() < deadline =>
+            {
+                // Shared classifier, BOUNDED variant: reachability
+                // errors, PG lifecycle FATALs (57P03 during bitnami
+                // initdb burned a backoffLimit pod with the old
+                // Io|PoolTimedOut-only filter), resource pressure,
+                // and 3D000 (database not created yet — bitnami init
+                // window). Permanent errors (auth, bad SQL) still
+                // fail fast so the Job log shows them; a bad
+                // sslrootcert path now burns the deadline visibly
+                // (warn every 5s) instead of failing fast — accepted
+                // for the Aurora-resume RST case, see pg_error docs.
+                tracing::warn!(error = %e, "PostgreSQL not ready; retrying in 5s");
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {
+                        anyhow::bail!("shutdown signal during PostgreSQL connect poll");
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                }
+            }
+            Err(e) => return Err(e).context("PostgreSQL connect failed"),
+        }
+    };
+
+    // Migrations + the rio_app role/grant reconciliation, both under
+    // one advisory-lock hold (see migrate::run_with_roles for why the
+    // role pass must not run unserialized).
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {
+            anyhow::bail!(
+                "migration interrupted by shutdown signal; the advisory lock was \
+                 released (lock connection closed) and the rescheduled Job re-runs \
+                 idempotently"
+            );
+        }
+        r = rio_migrations::migrate::run_with_roles(&pool, rio_migrations::migrator()) => {
+            r.inspect_err(|e| error!(error = format!("{e:#}"), "database migrations failed"))?;
+        }
+    }
+    info!("database migrations applied");
+    Ok(())
+}
+
+/// Connect to PostgreSQL and verify the schema is current. URL is
+/// logged with password redacted.
 ///
 // r[impl store.db.pool-idle-timeout]
 /// Aurora Serverless v2 scales `max_connections` with ACU; at
@@ -318,29 +463,50 @@ async fn main() -> anyhow::Result<()> {
 /// are reserved`. Setting `idle_timeout=60s` + `min_connections=2`
 /// shrinks the pool back to baseline within a minute of burst end
 /// (I-171).
-async fn init_db_pool(database_url: &str, max_connections: u32) -> anyhow::Result<sqlx::PgPool> {
+///
+/// IAM-mode watch item: RDS caps NEW IAM-authenticated connections at
+/// ~200/s cluster-wide. With idle_timeout=60s the pool sheds and
+/// regrows around bursts; at current scale (ComponentScaler max 14
+/// store replicas x 20 conns) full-fleet regrowth stays well under
+/// the ceiling, so no tuning now — the tripwire is
+/// rio_pg_iam_mint_failures_total plus connect-error logs. Revisit
+/// (iam-mode min_connections/idle_timeout, jittered regrowth) when
+/// componentScaler.store.max or pgMaxConnections rises; if the
+/// tripwire fires, the escalation is to front Aurora with RDS Proxy —
+/// the app side keeps IAM auth while the proxy holds the warm
+/// connection pool, making the per-connection ceiling irrelevant.
+async fn init_db_pool(
+    database_url: &str,
+    pg_auth: rio_common::config::PgAuthMode,
+    max_connections: u32,
+) -> anyhow::Result<sqlx::PgPool> {
     info!(
         url = %rio_common::config::redact_db_url(database_url),
+        ?pg_auth,
         max_connections,
         "connecting to PostgreSQL"
     );
+    // TokenSource::new is the config preflight: bad URL / weak TLS /
+    // missing rootcert / unresolvable AWS region all fail HERE (and
+    // crash-loop the pod visibly) before any retry machinery runs.
+    let tokens =
+        std::sync::Arc::new(rio_common::pg_iam::TokenSource::new(database_url, pg_auth).await?);
     let pool = PgPoolOptions::new()
         .max_connections(max_connections)
         .min_connections(2)
         .idle_timeout(std::time::Duration::from_secs(60))
-        .connect(database_url)
+        .connect_with(tokens.fresh_options().await?)
         .await?;
     info!("PostgreSQL connection established");
+    tokens.spawn_refresher(pool.clone());
 
-    // r[impl store.db.migrate-try-lock] — try-then-wait advisory
-    // lock; sqlx's default blocking `pg_advisory_lock` deadlocks
-    // against migrations 011/022's CREATE INDEX CONCURRENTLY when
-    // ≥2 replicas start together (I-194). Shared with rio-scheduler
-    // (same DB, same migrations) — see rio_migrations::migrate::run.
-    rio_migrations::migrate::run(&pool, rio_migrations::migrator())
+    // r[impl store.db.schema-current+2] — startup does NOT migrate;
+    // `rio-store migrate` (helm rio-migrate Job / NixOS oneshot)
+    // already did.
+    rio_migrations::migrate::assert_current(&pool)
         .await
-        .inspect_err(|e| error!(error = %e, "database migrations failed"))?;
-    info!("database migrations applied");
+        .inspect_err(|e| error!(error = format!("{e:#}"), "database schema check failed"))?;
+    info!("database schema is current");
 
     Ok(pool)
 }

@@ -35,12 +35,16 @@ pub const CONCURRENT_PUTPATH_MSG: &str = "concurrent PutPath in progress";
 /// constant so a rename forces all sites to update in lockstep.
 pub const CGROUP_OOM_MSG: &str = "cgroup OOM during build";
 
+pub mod castore_util;
+pub mod chunk_reject;
 pub mod client;
+pub mod derivation_util;
 pub mod interceptor;
 // Trait impls (`From<NixStatus> for BuildResultStatus` and inverse) are
 // visible globally regardless of module visibility — `pub` would only
 // add an empty namespace to the docs.
 mod status;
+pub mod submit_reject;
 pub mod validated;
 
 /// Shared protobuf types (messages, enums) used across all services.
@@ -135,9 +139,11 @@ pub mod builder {
 /// out-of-process reassembly (and exercised by tests against the
 /// `ChunkServiceImpl` cache wiring).
 ///
-/// `ChunkServiceClient` is **not** re-exported at crate root: with no
-/// production caller, only tests reach it, via the deep codegen path
-/// `store::chunk_service_client::ChunkServiceClient`.
+/// `ChunkServiceClient` / `DirectoryServiceClient` ARE re-exported at
+/// crate root since ADR-024 P3: the `rio build` client negotiates
+/// presence (`HasChunks`/`HasDirectories`/`HasDrvs`) and uploads
+/// sources through the external castore door, making them production
+/// client surfaces.
 // r[impl proto.store.batch-rpc]
 pub mod store {
     tonic::include_proto!("rio.store");
@@ -147,6 +153,39 @@ pub mod store {
 // r[impl proto.admin.diag-rpc]
 pub mod admin {
     tonic::include_proto!("rio.admin");
+}
+
+/// Content-addressed Directory DAG types (ADR-022 §2.2/§8).
+///
+/// `Directory`/`DirectoryEntry`/`FileEntry`/`SymlinkEntry` mirror snix
+/// `castore.proto` so `dir_digest` is interoperable; `RootNode` is the
+/// rio-local discriminated root encoded into `nar_index.root_node`.
+pub mod castore {
+    tonic::include_proto!("rio.castore");
+}
+
+/// Canonical stored/negotiated form of a Nix derivation (ADR-024).
+///
+/// `Derivation`/`Output`/`InputDrv`/`EnvVar` under the castore
+/// canonical-encode rule: sorted repeated fields (except `args`),
+/// defaults omitted, digest = blake3(canonical bytes). All string-ish
+/// fields are `bytes`, map-shaped data is sorted repeated pairs — see
+/// `derivation.proto` for the full identity rationale and
+/// [`derivation_util`] for digest/validate/convert/verify helpers.
+pub mod drv {
+    tonic::include_proto!("rio.drv.v1");
+}
+
+/// Worker-channel frames for the `rio build` coordinator ↔ eval-parent
+/// IPC (ADR-024). `CoordinatorFrame` flows downstream (work items, IFD
+/// completions, ack feedback, shutdown); `WorkerFrame` flows upstream
+/// (skeleton/result batches, IFD requests, recycle notices, errors).
+/// Length-delimited over a socketpair — the framing lives in
+/// rio-build-cli's `framing` module, not tonic. The payloads reuse
+/// [`types::DerivationNode`] / [`types::DrvBlob`] so worker-reported
+/// skeletons reach `SubmitBuild` / `PutDrvBlobs` without re-encoding.
+pub mod evaljob {
+    tonic::include_proto!("rio.evaljob");
 }
 
 /// Binary `FileDescriptorSet` covering every `.proto` file compiled by
@@ -179,7 +218,12 @@ pub use builder::executor_service_client::ExecutorServiceClient;
 pub use builder::executor_service_server::{ExecutorService, ExecutorServiceServer};
 pub use scheduler::scheduler_service_client::SchedulerServiceClient;
 pub use scheduler::scheduler_service_server::{SchedulerService, SchedulerServiceServer};
+pub use store::chunk_service_client::ChunkServiceClient;
 pub use store::chunk_service_server::{ChunkService, ChunkServiceServer};
+pub use store::directory_service_client::DirectoryServiceClient;
+pub use store::directory_service_server::{DirectoryService, DirectoryServiceServer};
+pub use store::drv_blob_service_client::DrvBlobServiceClient;
+pub use store::drv_blob_service_server::{DrvBlobService, DrvBlobServiceServer};
 pub use store::store_admin_service_client::StoreAdminServiceClient;
 pub use store::store_admin_service_server::{StoreAdminService, StoreAdminServiceServer};
 pub use store::store_service_client::StoreServiceClient;

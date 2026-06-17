@@ -12,6 +12,7 @@ use crate::{helm, sh, ui};
 pub(crate) mod chaos;
 pub mod client;
 pub(crate) mod eks;
+mod fsbench;
 mod k3s;
 mod phases;
 mod probe_boot;
@@ -19,6 +20,7 @@ pub mod provider;
 pub(crate) mod qa;
 pub mod shared;
 mod sla_gates;
+pub(crate) mod ssm;
 pub(crate) mod status;
 mod stress;
 mod wipe;
@@ -133,6 +135,13 @@ pub struct UpOpts {
     /// working nodes that don't exist yet.
     #[arg(long = "deploy-no-hooks")]
     deploy_no_hooks: bool,
+    /// Deploy with postgres.authMode=password instead of the iam
+    /// default. Escape hatch for environments whose tfstate predates
+    /// the IAM-auth infra (no controller_iam_role_arn output) —
+    /// without it that state is a hard error pointing at `tofu
+    /// apply`. EKS-only.
+    #[arg(long = "pg-password-mode")]
+    pg_password_mode: bool,
     /// After deploy, block until Karpenter has replaced all Drifted
     /// NodeClaims (AMI rollout complete). Without this, builds started
     /// immediately after `up` may be disrupted by node drift eviction.
@@ -330,6 +339,55 @@ pub enum K8sCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
     },
+    /// Run the native `rio build` client (ADR-024) LOCALLY against a
+    /// port-forwarded scheduler+store. Resolves the tenant, mints a
+    /// short-lived tenant JWT under the cluster's signing key, and
+    /// hands it to `rio build` via /dev/fd — same plumbing CliTunnel
+    /// uses for the service-HMAC key. For driving `rio` (or tools
+    /// around it) yourself instead of a one-shot build, see `env`.
+    #[command(visible_alias = "build")]
+    BuildTunnel {
+        /// Tenant the build runs as. Must already exist
+        /// (`cargo xtask k8s cli -- create-tenant <name>`).
+        #[arg(long, default_value = "default")]
+        tenant: String,
+        /// Local port for scheduler:9001 forward. 0 = ephemeral.
+        #[arg(long, default_value_t = 0)]
+        sched_port: u16,
+        /// Local port for store:9002 forward. 0 = ephemeral.
+        #[arg(long, default_value_t = 0)]
+        store_port: u16,
+        /// Passed through to `rio build`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
+    /// Same tunnel + tenant-JWT setup as `build`, but instead of
+    /// running `rio build` itself, run an arbitrary command — or your
+    /// interactive shell when no command is given — with
+    /// `RIO_SCHEDULER_ADDR` / `RIO_STORE_ADDR` /
+    /// `RIO_TENANT_TOKEN_PATH` exported. Use `build` for a one-shot
+    /// build; use `env` when you want to invoke `rio build` directly,
+    /// repeatedly, or wrapped (`strace rio build …`). There is
+    /// deliberately no "print eval-able exports and exit" mode: the
+    /// port-forwards and the /dev/fd token die with this process, so
+    /// pasted exports would point at dead endpoints.
+    Env {
+        /// Tenant the commands run as. Must already exist
+        /// (`cargo xtask k8s cli -- create-tenant <name>`).
+        #[arg(long, default_value = "default")]
+        tenant: String,
+        /// Local port for scheduler:9001 forward. 0 = ephemeral.
+        #[arg(long, default_value_t = 0)]
+        sched_port: u16,
+        /// Local port for store:9002 forward. 0 = ephemeral.
+        #[arg(long, default_value_t = 0)]
+        store_port: u16,
+        /// Command to run inside the environment, after a `--`
+        /// separator (`env -- strace rio build .#foo`). Omit for an
+        /// interactive shell ($SHELL, fallback /bin/sh).
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
     /// NixOS node AMI management (ADR-021). EKS-only — `up --ami`
     /// builds + registers; this is the maintenance side.
     #[command(subcommand)]
@@ -358,6 +416,10 @@ pub enum K8sCmd {
         #[arg(long)]
         restart: bool,
     },
+    /// castore-FUSE micro-benchmark (P0594): submit one bench build
+    /// through the production mount path, sample co-tenancy, write
+    /// .fsbench/{ts}/result.json. Operator tooling; NOT a CI test.
+    Fsbench(fsbench::FsbenchArgs),
     /// ADR-023 §13a empirical gates (a–d). Operator-run on EKS; NOT a
     /// CI test. a/b assert; c/d report only.
     SlaGates {
@@ -502,11 +564,8 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
         } => {
             with_cli_tunnel(&*p, sched_port, store_port, |sh| {
                 // Prefer an installed rio-cli (nix run / cargo install);
-                // fall back to cargo run for dev iteration. The PATH probe
-                // uses `command -v` via xshell — it's available in any
-                // POSIX sh and cheaper than pulling the `which` crate.
-                let on_path = sh::read(sh::cmd!(sh, "command -v rio-cli")).is_ok();
-                if on_path {
+                // fall back to cargo run for dev iteration.
+                if on_path(sh, "rio-cli") {
                     sh::run_interactive(sh::cmd!(sh, "rio-cli {args...}"))
                 } else {
                     sh::run_interactive(sh::cmd!(sh, "cargo run -q -p rio-cli -- {args...}"))
@@ -514,6 +573,18 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             })
             .await
         }
+        K8sCmd::BuildTunnel {
+            tenant,
+            sched_port,
+            store_port,
+            args,
+        } => with_build_tunnel(&*p, &tenant, sched_port, store_port, &args).await,
+        K8sCmd::Env {
+            tenant,
+            sched_port,
+            store_port,
+            args,
+        } => with_build_env(&*p, &tenant, sched_port, store_port, &args).await,
         K8sCmd::Grant {
             pubkey,
             tenant,
@@ -529,6 +600,17 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
                     no_dry_run,
                 } => eks::ami::gc(older_than_days, !no_dry_run).await,
             }
+        }
+        K8sCmd::Fsbench(a) => {
+            let code = fsbench::run(a, &*p, kind, cfg).await?;
+            // fsbench exit-code vocabulary: 2 = refusal (compare
+            // identity mismatch OR refused --save-baseline),
+            // 3 = regression — for operator scripting; anyhow's Err
+            // path always exits 1, so nonzero verdicts exit directly.
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
         K8sCmd::SlaGates { gate } => sla_gates::run(gate).await,
         K8sCmd::ProbeBoot => {
@@ -679,6 +761,7 @@ pub(super) async fn run_up(
             tenant: o.deploy_tenant.clone(),
             skip_preflight: o.deploy_skip_preflight,
             no_hooks: o.deploy_no_hooks,
+            pg_password_mode: o.pg_password_mode,
             wait_drift: o.wait_drift,
             // CLI > env: any --public-cidr flag wins; otherwise fall
             // back to RIO_PUBLIC_CIDRS so a bare `up --deploy` keeps
@@ -768,11 +851,8 @@ where
     F: FnOnce(&xshell::Shell, &str) -> Result<()>,
 {
     let key = crate::ssh::privkey_path(cfg)?;
-    // P0539e: a prior `rsb`/`stress` may have left a session-manager-
-    // plugin or kubectl port-forward bound to this port (ProcessGuard
-    // only fires if xtask exited cleanly; SIGKILL/panic leaks it).
-    // The new tunnel would then bind fine but route to the OLD NLB —
-    // surfacing as the "type 80" SSH error 30s later. Reap first.
+    // P0539e: reap a SIGKILL'd run's stale listener — see
+    // [`shared::kill_port_listeners`] for the "type 80" failure mode.
     if port != 0 {
         shared::kill_port_listeners(port);
     }
@@ -836,12 +916,264 @@ where
     f(&sh)
 }
 
+/// PATH probe for the tunnel commands' "installed binary vs nix run /
+/// cargo run" fallback. xshell execs the program directly (no shell),
+/// so a bare `cmd!(sh, "command -v {bin}")` looks up a `command`
+/// EXECUTABLE — which doesn't exist; `command` is a shell builtin —
+/// and the probe always falls through. Route through `sh -c` so the
+/// builtin actually runs.
+fn on_path(sh: &xshell::Shell, bin: &str) -> bool {
+    let probe = format!("command -v {bin}");
+    sh::read(sh::cmd!(sh, "sh -c {probe}")).is_ok()
+}
+
+// TODO: dev-cluster interim. Minting the tenant JWT here requires reading
+// the gateway's signing Secret, i.e. cluster-admin access. The production
+// path for native clients is a gateway token-issue endpoint plus external
+// gRPC ingress; once that exists this command should obtain its token
+// there and stop touching the Secret.
+/// Tunnel + credential setup shared by `build` and `env`: port-forward
+/// scheduler:9001 + store:9002, resolve `tenant` to its UUID over the
+/// scheduler tunnel, sign a session-shaped JWT (same claims as the
+/// gateway's `mint_session_jwt`) with the cluster's `rio-jwt-signing`
+/// seed, and stash the token in an anonymous memfd
+/// (`RIO_TENANT_TOKEN_PATH=/dev/fd/N`) so it never touches disk.
+/// The port-forward guards and the memfd live as long as the returned
+/// struct — keep it in scope until the child process has exited.
+struct BuildEnv {
+    sched: u16,
+    store: u16,
+    token_fd: std::fs::File,
+    _guards: (shared::ProcessGuard, shared::ProcessGuard),
+}
+
+impl BuildEnv {
+    async fn new(p: &dyn Provider, tenant: &str, sched: u16, store: u16) -> Result<Self> {
+        let ((sched, g1), (store, g2)) =
+            ui::step("tunnel scheduler+store", || p.tunnel_grpc(sched, store)).await?;
+
+        // Signing key first: failing on a cluster without JWT support
+        // before the resolve RPC keeps the error unambiguous.
+        let client = kube::client().await?;
+        let signing_key = shared::jwt_signing_key(&client).await?;
+
+        // Resolve tenant name → UUID over the forwarded scheduler.
+        // ResolveTenant is unauthenticated and not leader-gated, so a bare
+        // channel is enough.
+        let tenant_id = ui::step("resolve tenant", || async {
+            let ch = rio_proto::client::connect_channel(&format!("localhost:{sched}")).await?;
+            let resp = rio_proto::SchedulerServiceClient::new(ch)
+                .resolve_tenant(rio_proto::scheduler::ResolveTenantRequest {
+                    tenant_name: tenant.to_owned(),
+                })
+                .await
+                .map_err(|status| {
+                    anyhow!(
+                        "ResolveTenant({tenant}): {} ({}); create it first with \
+                         `cargo xtask k8s cli -- create-tenant {tenant}`",
+                        status.message(),
+                        status.code()
+                    )
+                })?;
+            resp.into_inner()
+                .tenant_id
+                .parse::<uuid::Uuid>()
+                .context("scheduler returned unparseable tenant_id UUID")
+        })
+        .await?;
+
+        // Same claim shape as the gateway's mint_session_jwt: 1h + 5min
+        // grace TTL, fresh jti per invocation.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before 1970")
+            .as_secs() as i64;
+        let claims = rio_auth::jwt::TenantClaims {
+            sub: tenant_id,
+            iat: now,
+            exp: now + 3600 + 300,
+            jti: uuid::Uuid::new_v4().to_string(),
+        };
+        let token = rio_auth::jwt::sign(&claims, &signing_key)?;
+
+        let token_fd = shared::bytes_to_memfd(token.as_bytes())?;
+        Ok(Self {
+            sched,
+            store,
+            token_fd,
+            _guards: (g1, g2),
+        })
+    }
+
+    /// The three variables a native `rio build` client needs.
+    /// RIO_CAS_ROOT stays unset: the client already defaults to
+    /// $XDG_CACHE_HOME/rio/evalstore.
+    fn vars(&self) -> [(&'static str, String); 3] {
+        use std::os::fd::AsRawFd;
+        [
+            ("RIO_SCHEDULER_ADDR", format!("localhost:{}", self.sched)),
+            ("RIO_STORE_ADDR", format!("localhost:{}", self.store)),
+            // token_fd stays open until the child exits; bytes_to_memfd
+            // leaves FD_CLOEXEC unset so /dev/fd/N survives the exec.
+            (
+                "RIO_TENANT_TOKEN_PATH",
+                format!("/dev/fd/{}", self.token_fd.as_raw_fd()),
+            ),
+        ]
+    }
+}
+
+/// `xtask k8s build` — see [`K8sCmd::BuildTunnel`]. [`BuildEnv`] setup,
+/// then run `rio build <args>` as `tenant`.
+async fn with_build_tunnel(
+    p: &dyn Provider,
+    tenant: &str,
+    sched: u16,
+    store: u16,
+    args: &[String],
+) -> Result<()> {
+    let env = BuildEnv::new(p, tenant, sched, store).await?;
+
+    // `rio build` needs the eval parent (RIO_EVAL_PARENT), which only
+    // the nix-built pair wires up — so unlike CliTunnel there is no
+    // `cargo run` fallback; use `nix run .#rio` instead.
+    let sh = sh::shell()?;
+    // Raw Command (sh.rs policy): xshell nulls the child's stdin, but
+    // the rio build renderer only enables its TTY mode (colors, log
+    // browser keys) when both stderr AND stdin are terminals — the
+    // child must inherit the parent's real terminal.
+    let mut cmd = if on_path(&sh, "rio") {
+        let mut c = std::process::Command::new("rio");
+        c.arg("build");
+        c
+    } else {
+        let mut c = std::process::Command::new("nix");
+        c.args(["run", ".#rio", "--", "build"]);
+        c
+    };
+    cmd.args(args);
+    cmd.current_dir(sh::repo_root());
+    cmd.envs(env.vars());
+    let argv = format_argv(&cmd);
+    debug!("exec (interactive): {argv}");
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to spawn: {argv}"))?;
+    if !status.success() {
+        bail!("{argv}: {status}");
+    }
+    Ok(())
+}
+
+/// `xtask k8s env` — see [`K8sCmd::Env`]. [`BuildEnv`] setup, then run
+/// the given command (or an interactive shell) with the `RIO_*`
+/// variables exported, so the user drives `rio build` — or tools
+/// wrapping it — directly. The "no print-exports mode" rationale lives
+/// on the [`K8sCmd::Env`] doc.
+async fn with_build_env(
+    p: &dyn Provider,
+    tenant: &str,
+    sched: u16,
+    store: u16,
+    args: &[String],
+) -> Result<()> {
+    let env = BuildEnv::new(p, tenant, sched, store).await?;
+
+    // Raw Command (sh.rs policy): xshell nulls the child's stdin, but an
+    // interactive shell — and anything the user wraps around `rio build`
+    // — must inherit the parent's real terminal.
+    let mut cmd = match args {
+        [] => {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            eprintln!("rio dev-cluster environment (tenant `{tenant}`):");
+            for (k, v) in env.vars() {
+                eprintln!("  {k}={v}");
+            }
+            eprintln!(
+                "Tunnels and token live only as long as this shell (JWT expires after ~1h); \
+                 exit to tear down."
+            );
+            std::process::Command::new(shell)
+        }
+        [program, rest @ ..] => {
+            let mut c = std::process::Command::new(program);
+            c.args(rest);
+            c
+        }
+    };
+    cmd.envs(env.vars());
+    let argv = format_argv(&cmd);
+    debug!("exec (interactive): {argv}");
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to spawn: {argv}"))?;
+    // Propagate the child's exit code so a wrapped failing command
+    // looks like running it without the tunnel (signal deaths collapse
+    // to 1 — code() is None for those). process::exit skips Drop, so
+    // tear the port-forward guards down explicitly first.
+    if !status.success() {
+        drop(env);
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// Render a [`std::process::Command`]'s argv for log/error messages.
+fn format_argv(cmd: &std::process::Command) -> String {
+    std::iter::once(cmd.get_program())
+        .chain(cmd.get_args())
+        .map(|a| a.to_str().unwrap_or("?"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn opts() -> UpOpts {
         UpOpts::default()
+    }
+
+    #[test]
+    fn env_command_only_after_double_dash() {
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(subcommand)]
+            cmd: K8sCmd,
+        }
+        // `last = true`: the wrapped command goes after `--`; flags
+        // before it still belong to the subcommand.
+        let t = <T as clap::Parser>::try_parse_from([
+            "t", "env", "--tenant", "acme", "--", "rio", "build", ".#x",
+        ])
+        .unwrap();
+        let K8sCmd::Env { tenant, args, .. } = t.cmd else {
+            panic!("expected Env");
+        };
+        assert_eq!(tenant, "acme");
+        assert_eq!(args, ["rio", "build", ".#x"]);
+        // No command at all → empty args (interactive-shell path).
+        let t = <T as clap::Parser>::try_parse_from(["t", "env"]).unwrap();
+        let K8sCmd::Env { args, .. } = t.cmd else {
+            panic!("expected Env");
+        };
+        assert!(args.is_empty());
+        // Unlike `build`'s trailing_var_arg, a typo'd flag is an error
+        // instead of silently becoming the command to run.
+        assert!(<T as clap::Parser>::try_parse_from(["t", "env", "--bogus"]).is_err());
+        // ...and so is a bare command without the `--` separator.
+        assert!(<T as clap::Parser>::try_parse_from(["t", "env", "rio"]).is_err());
+    }
+
+    #[test]
+    fn on_path_detects_via_shell_builtin() {
+        // Regression: a bare `cmd!(sh, "command -v {bin}")` execs the
+        // word `command` directly — ENOENT — and the probe always
+        // reported absent. `sh` is on PATH in any POSIX environment.
+        let sh = sh::shell().unwrap();
+        assert!(on_path(&sh, "sh"));
+        assert!(!on_path(&sh, "rio-definitely-not-a-binary"));
     }
 
     #[test]

@@ -41,6 +41,11 @@ specs (
     source_url https://github.com/lovesegfault/rio-build
     include (
       docs/spec/**/*.typ
+      // ADR-022/023 markdown ADR docs predate the typst migration.
+      // Tracey scans `^r[ID]` markers in .md and `#r("ID")` in .typ.
+      docs/src/decisions/022-lazy-store-fs-erofs-vs-riofs.md
+      docs/src/decisions/022-design-overview.md
+      docs/src/decisions/023-tiered-chunk-backend.md
     )
     impls (
       {

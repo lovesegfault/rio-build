@@ -8,7 +8,7 @@
 //! (k3s+FUSE+cgroup, 2-5min). Catches bugs `MockStore` hides:
 //!
 //! - `MockStore` accepts any hash → real store rejects mismatches
-//!   (`r[store.integrity.verify-on-put]`)
+//!   (`r[store.integrity.verify-on-put+3]`)
 //! - `MockStore` does `HashMap::insert(bytes)` → `HashMap::get(bytes)` —
 //!   byte-identical by construction → real store does FastCDC chunk →
 //!   PG manifest → reassembly (`r[store.nar.reassembly]`)

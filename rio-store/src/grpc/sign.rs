@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 
+use sqlx::PgPool;
 use tonic::Status;
 use tracing::{debug, warn};
 
@@ -19,8 +20,140 @@ use rio_proto::validated::ValidatedPathInfo;
 use rio_common::grpc::StatusExt;
 
 use crate::metadata::{self};
+use crate::signing::TenantSigner;
 
 use super::{StoreServiceImpl, metadata_status};
+
+// r[impl store.substitute.tenant-sig-visibility+2]
+/// THE narinfo signature-visibility predicate: does any of
+/// `signatures` verify against `trusted` over the narinfo fingerprint
+/// of `(store_path, nar_hash, nar_size, references)`?
+///
+/// Single source of truth shared by the validity surface
+/// ([`StoreServiceImpl::sig_visibility_gate`] /
+/// [`StoreServiceImpl::sig_visibility_gate_batch`]) and the castore
+/// read fallback (`grpc/directory.rs`) — `r[store.tenant.valid-paths-filter]`
+/// requires "valid ⇒ readable" to hold per caller, which only stays
+/// true if both surfaces evaluate the SAME predicate.
+pub(super) fn narinfo_sig_visible(
+    store_path: &str,
+    nar_hash: &[u8; 32],
+    nar_size: u64,
+    references: &[String],
+    signatures: &[String],
+    trusted: &[String],
+) -> bool {
+    let fp = rio_nix::narinfo::fingerprint(store_path, nar_hash, nar_size, references);
+    crate::signing::any_sig_trusted(signatures, trusted, &fp).is_some()
+}
+
+// r[impl store.substitute.tenant-sig-visibility+2]
+/// Construct the requesting tenant's signature trust set: upstream
+/// `trusted_keys` ∪ cluster key (current + prior history) ∪ the
+/// tenant's own `tenant_keys` pubkeys. Free function so the castore
+/// read fallback (which lives on `DirectoryServiceImpl`, not
+/// `StoreServiceImpl`) derives the SAME set as the validity gates.
+///
+/// The cluster + tenant-own union covers the PutPath→scheduler
+/// timing window: `maybe_sign` signs with the cluster key OR (when
+/// `r[store.tenant.sign-key]` applies) the tenant's own key —
+/// `path_tenants` count=0 → gate fires → without BOTH unioned in,
+/// a freshly-built path returns `NotFound` to its own tenant.
+pub(super) async fn tenant_trusted_set(
+    pool: &PgPool,
+    signer: Option<&TenantSigner>,
+    tid: uuid::Uuid,
+) -> Result<Vec<String>, Status> {
+    let mut trusted = metadata::upstreams::tenant_trusted_keys(pool, tid)
+        .await
+        .map_err(|e| metadata_status("tenant_trusted_set: upstream trusted_keys", e))?;
+    if let Some(ts) = signer {
+        trusted.push(ts.cluster().trusted_key_entry());
+        // r[impl store.key.rotation-cluster-history]
+        // Union prior cluster keys so paths signed under a
+        // rotated-out key stay visible after CASCADE drops their
+        // path_tenants rows. prior_cluster_entries is loaded once
+        // at startup from cluster_key_history WHERE retired_at IS
+        // NULL — no DB hit here.
+        trusted.extend_from_slice(ts.prior_cluster_entries());
+    }
+    // r[impl store.tenant.sign-key]
+    // The tenant's OWN signing pubkey(s). When a tenant_keys row
+    // exists, maybe_sign uses it (not cluster) — without this
+    // union, the tenant's only sig fails to verify against its
+    // own trusted set during the count=0 window.
+    let own = metadata::tenant_keys::trusted_key_entries(pool, tid)
+        .await
+        .map_err(|e| metadata_status("tenant_trusted_set: tenant_keys", e))?;
+    trusted.extend(own);
+    Ok(trusted)
+}
+
+// r[impl store.substitute.tenant-sig-visibility+2]
+/// Batched sig-visibility for SUBSTITUTION-ONLY paths, keyed by
+/// `narinfo.store_path_hash`: returns the subset of `hashes` whose
+/// stored narinfo carries a signature `tid` trusts.
+///
+/// Callers own the substitution-only precondition (zero
+/// `path_tenants` rows for each hash) — this answers only the
+/// signature half of the predicate. Hashes absent from `narinfo`
+/// are hidden (same as the single-path gate's NotFound). Shared by
+/// [`StoreServiceImpl::sig_visibility_gate_batch`] and the castore
+/// read fallback in `grpc/directory.rs`.
+pub(super) async fn sig_visible_path_hashes(
+    pool: &PgPool,
+    signer: Option<&TenantSigner>,
+    tid: uuid::Uuid,
+    hashes: &[Vec<u8>],
+) -> Result<HashSet<Vec<u8>>, Status> {
+    if hashes.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let trusted = tenant_trusted_set(pool, signer, tid).await?;
+    if trusted.is_empty() {
+        // Tenant trusts no keys at all → every substitution-only path
+        // is invisible.
+        return Ok(HashSet::new());
+    }
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        store_path_hash: Vec<u8>,
+        store_path: String,
+        nar_hash: Vec<u8>,
+        nar_size: i64,
+        references: Vec<String>,
+        signatures: Vec<String>,
+    }
+    // PK lookup — never a narinfo seq scan, the fallback arm stays
+    // index-only even for large batches.
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT store_path_hash, store_path, nar_hash, nar_size, \"references\", signatures \
+         FROM narinfo WHERE store_path_hash = ANY($1::bytea[])",
+    )
+    .bind(hashes)
+    .fetch_all(pool)
+    .await
+    .status_internal("sig_visible_path_hashes: narinfo")?;
+    let mut visible = HashSet::with_capacity(rows.len());
+    for r in rows {
+        let Ok(nar_hash): Result<[u8; 32], _> = r.nar_hash.as_slice().try_into() else {
+            // Malformed row — hide (defensive; query_path_info would
+            // MalformedRow on it).
+            continue;
+        };
+        if narinfo_sig_visible(
+            &r.store_path,
+            &nar_hash,
+            r.nar_size as u64,
+            &r.references,
+            &r.signatures,
+            &trusted,
+        ) {
+            visible.insert(r.store_path_hash);
+        }
+    }
+    Ok(visible)
+}
 
 impl StoreServiceImpl {
     // r[impl store.substitute.tenant-sig-visibility+2]
@@ -59,18 +192,16 @@ impl StoreServiceImpl {
         let Some(tid) = tenant_id else {
             return Ok(true); // anonymous → unfiltered
         };
-        // r[impl gw.jwt.anon-drv-lookup]
-        // .drv files are build INPUTS, not tenant-owned outputs — exempt
-        // from tenant-scoped visibility. Gateway-side `jwt_unless_drv`
-        // already strips the JWT for single-path .drv lookups; this is
-        // the store-side mirror so the policy holds regardless of which
-        // caller (or which batch RPC) sends the path. Without it, a .drv
-        // with zero `path_tenants` rows falls through to sig-verify and
-        // is reported invisible (no upstream sigs on .drvs).
-        if info.store_path.is_derivation() {
-            return Ok(true);
-        }
-
+        // r[impl store.tenant.valid-paths-filter]
+        // No `.drv` exemption: `.drv` paths go through the same
+        // ownership/sig checks as outputs. Exempting them made a
+        // cross-tenant `.drv` *valid but unreadable* — the client
+        // skipped the upload, then the builder's castore-FUSE read
+        // (strict `path_tenants` join, `r[store.castore.tenant-scope+3]`)
+        // got NotFound → EIO → infra-retries exhausted. Reporting it
+        // invalid instead makes the client re-upload, and the
+        // idempotent-skip junction write (`r[store.put.tenant-junction]`)
+        // grants this tenant read access.
         let path_hash = info.store_path.sha256_digest();
 
         // Two checks in one round-trip: does this tenant own it, and
@@ -108,7 +239,7 @@ impl StoreServiceImpl {
         // configured, the trusted set is just the cluster key (and
         // tenant's own keypair) — a path the tenant just PutPath'd is
         // rio-signed and passes; anything else is invisible.
-        let trusted = self.tenant_trusted_set(tid).await?;
+        let trusted = tenant_trusted_set(&self.pool, self.signer.as_deref(), tid).await?;
         if trusted.is_empty() {
             // Tenant trusts no upstream keys AND no signer configured
             // → any substituted path is invisible. With a signer the
@@ -117,55 +248,15 @@ impl StoreServiceImpl {
             return Ok(false);
         }
 
-        let fp = rio_nix::narinfo::fingerprint(
+        let refs: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
+        Ok(narinfo_sig_visible(
             info.store_path.as_str(),
             &info.nar_hash,
             info.nar_size,
-            &info
-                .references
-                .iter()
-                .map(|r| r.to_string())
-                .collect::<Vec<_>>(),
-        );
-        Ok(crate::signing::any_sig_trusted(&info.signatures, &trusted, &fp).is_some())
-    }
-
-    // r[impl store.substitute.tenant-sig-visibility+2]
-    /// Construct the requesting tenant's signature trust set: upstream
-    /// `trusted_keys` ∪ cluster key (current + prior history) ∪ the
-    /// tenant's own `tenant_keys` pubkeys. Shared by
-    /// [`sig_visibility_gate`](Self::sig_visibility_gate) and
-    /// [`sig_visibility_gate_batch`](Self::sig_visibility_gate_batch).
-    ///
-    /// The cluster + tenant-own union covers the PutPath→scheduler
-    /// timing window: `maybe_sign` signs with the cluster key OR (when
-    /// `r[store.tenant.sign-key]` applies) the tenant's own key —
-    /// `path_tenants` count=0 → gate fires → without BOTH unioned in,
-    /// a freshly-built path returns `NotFound` to its own tenant.
-    async fn tenant_trusted_set(&self, tid: uuid::Uuid) -> Result<Vec<String>, Status> {
-        let mut trusted = metadata::upstreams::tenant_trusted_keys(&self.pool, tid)
-            .await
-            .map_err(|e| metadata_status("tenant_trusted_set: upstream trusted_keys", e))?;
-        if let Some(ts) = &self.signer {
-            trusted.push(ts.cluster().trusted_key_entry());
-            // r[impl store.key.rotation-cluster-history]
-            // Union prior cluster keys so paths signed under a
-            // rotated-out key stay visible after CASCADE drops their
-            // path_tenants rows. prior_cluster_entries is loaded once
-            // at startup from cluster_key_history WHERE retired_at IS
-            // NULL — no DB hit here.
-            trusted.extend_from_slice(ts.prior_cluster_entries());
-        }
-        // r[impl store.tenant.sign-key]
-        // The tenant's OWN signing pubkey(s). When a tenant_keys row
-        // exists, maybe_sign uses it (not cluster) — without this
-        // union, the tenant's only sig fails to verify against its
-        // own trusted set during the count=0 window.
-        let own = metadata::tenant_keys::trusted_key_entries(&self.pool, tid)
-            .await
-            .map_err(|e| metadata_status("tenant_trusted_set: tenant_keys", e))?;
-        trusted.extend(own);
-        Ok(trusted)
+            &refs,
+            &info.signatures,
+            &trusted,
+        ))
     }
 
     // r[impl store.substitute.find-missing-gated]
@@ -229,70 +320,36 @@ impl StoreServiceImpl {
             rows.into_iter().filter(|r| !r.owned).map(|r| r.h).collect();
 
         let mut visible: HashSet<String> = HashSet::with_capacity(present.len());
-        let mut subst_only: Vec<String> = Vec::new();
+        let mut subst_only: Vec<(String, Vec<u8>)> = Vec::new();
         for (p, h) in present.iter().zip(&hashes) {
-            // r[impl gw.jwt.anon-drv-lookup]
-            // .drv files are build inputs, not tenant-owned outputs —
-            // exempt per the same policy as the single-path gate above
-            // (mirrors gateway-side `jwt_unless_drv`). Without this,
-            // `wopQueryValidPaths` reports a .drv missing while
-            // `wopIsValidPath` reports it valid for the same path/JWT.
-            if p.ends_with(".drv") || owned_hashes.contains(h) {
+            // r[impl store.tenant.valid-paths-filter]
+            // Same policy as the single-path gate above (see its
+            // comment): no `.drv` exemption — owned → visible,
+            // built-by-another-tenant → hidden, else sig-gated.
+            if owned_hashes.contains(h) {
                 visible.insert(p.clone());
             } else if built_not_owned.contains(h) {
                 // I-217: built by another tenant → hidden (NOT visible,
                 // NOT sig-verified).
             } else {
-                subst_only.push(p.clone());
+                subst_only.push((p.clone(), h.clone()));
             }
         }
         if subst_only.is_empty() {
             return Ok(visible);
         }
 
-        // Substitution-only subset: fetch (path, signatures, nar_hash,
-        // nar_size, references) in one round-trip and verify each
-        // against the same trusted set as the single-path gate.
-        let trusted = self.tenant_trusted_set(tid).await?;
-        if trusted.is_empty() {
-            // Tenant trusts nothing → all substitution-only paths hidden.
-            return Ok(visible);
-        }
-
-        // narinfo carries everything fingerprint() needs. One ANY()
-        // round-trip; paths absent from narinfo (race) are hidden
-        // (same as the single-path gate's NotFound).
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            store_path: String,
-            nar_hash: Vec<u8>,
-            nar_size: i64,
-            references: Vec<String>,
-            signatures: Vec<String>,
-        }
-        let rows: Vec<Row> = sqlx::query_as(
-            "SELECT store_path, nar_hash, nar_size, \"references\", signatures \
-             FROM narinfo WHERE store_path = ANY($1)",
-        )
-        .bind(&subst_only)
-        .fetch_all(&self.pool)
-        .await
-        .status_internal("sig_visibility_gate_batch: narinfo")?;
-
-        for r in rows {
-            let Ok(nar_hash): Result<[u8; 32], _> = r.nar_hash.as_slice().try_into() else {
-                // Malformed row — hide (defensive; query_path_info would
-                // MalformedRow on it).
-                continue;
-            };
-            let fp = rio_nix::narinfo::fingerprint(
-                &r.store_path,
-                &nar_hash,
-                r.nar_size as u64,
-                &r.references,
-            );
-            if crate::signing::any_sig_trusted(&r.signatures, &trusted, &fp).is_some() {
-                visible.insert(r.store_path);
+        // Substitution-only subset: the shared narinfo-fetch + verify
+        // helper — the SAME predicate the castore read fallback
+        // (grpc/directory.rs) applies, so wopQueryValidPaths and
+        // ReadBlob can't drift. Paths absent from narinfo (race) are
+        // hidden (same as the single-path gate's NotFound).
+        let subst_hashes: Vec<Vec<u8>> = subst_only.iter().map(|(_, h)| h.clone()).collect();
+        let vis_hashes =
+            sig_visible_path_hashes(&self.pool, self.signer.as_deref(), tid, &subst_hashes).await?;
+        for (p, h) in subst_only {
+            if vis_hashes.contains(&h) {
+                visible.insert(p);
             }
         }
         Ok(visible)
@@ -560,7 +617,7 @@ mod tests {
         let mut info_with_sig = info.clone();
         info_with_sig.signatures = vec![sig_k.clone()];
         info_with_sig.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into())
+        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into(), None, None)
             .await
             .unwrap();
 
@@ -691,7 +748,7 @@ mod tests {
             .unwrap();
         let mut stored = info.clone();
         stored.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &stored, claim, nar.into())
+        metadata::complete_manifest_inline(&db.pool, &stored, claim, nar.into(), None, None)
             .await
             .unwrap();
         let stored = metadata::query_path_info(&db.pool, &path)
@@ -789,7 +846,7 @@ mod tests {
         let mut info_with_sig = info.clone();
         info_with_sig.signatures = vec![sig_tenant];
         info_with_sig.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into())
+        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into(), None, None)
             .await
             .unwrap();
 
@@ -816,22 +873,21 @@ mod tests {
         );
     }
 
-    // r[verify gw.jwt.anon-drv-lookup]
-    /// `.drv` paths are exempt from tenant-scoped visibility in BOTH
-    /// the single-path and batch gates. A `.drv` with zero
-    /// `path_tenants` rows and no signatures is visible to a tenant
-    /// with substituter configured; an output path in the same state
-    /// is NOT.
+    // r[verify store.tenant.valid-paths-filter]
+    /// `.drv` paths get NO visibility exemption: in both the
+    /// single-path and batch gates a `.drv` is treated exactly like an
+    /// output path. A `.drv` with zero `path_tenants` rows and no
+    /// trusted signatures is hidden, same as an output in the same
+    /// state.
     ///
-    /// Regression for the `wopQueryValidPaths` / `wopIsValidPath`
-    /// inconsistency: the four single-path gateway opcodes apply
-    /// `jwt_unless_drv` (anonymous lookup → gate's `tenant_id=None`
-    /// fast-path), but the batch opcode sends the raw JWT — without
-    /// the store-side exemption, the batch gate routed `.drv` to
-    /// `subst_only` → sig-verify failed (no upstream sigs) → reported
-    /// missing → every tenant-JWT `nix copy` re-uploaded every `.drv`.
+    /// Regression for the cross-tenant build brick: an exempted `.drv`
+    /// was reported valid to a tenant that could not read it through
+    /// the tenant-scoped castore surface — the client skipped the
+    /// upload and the build died in castore-FUSE (`NotFound` → EIO).
+    /// Hidden-here means the client re-uploads, which writes the
+    /// caller's own junction row (`r[store.put.tenant-junction]`).
     #[tokio::test]
-    async fn sig_visibility_gate_exempts_drv_paths() {
+    async fn sig_visibility_gate_does_not_exempt_drv_paths() {
         use crate::test_helpers::seed_tenant;
         use rio_test_support::TestDb;
 
@@ -867,12 +923,13 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            metadata::complete_manifest_inline(&db.pool, &info, claim, nar.into())
+            metadata::complete_manifest_inline(&db.pool, &info, claim, nar.into(), None, None)
                 .await
                 .unwrap();
         }
 
-        // Single-path gate: .drv visible, output hidden.
+        // Single-path gate: BOTH hidden — the .drv suffix changes
+        // nothing.
         let drv_info = metadata::query_path_info(&db.pool, &drv_path)
             .await
             .unwrap()
@@ -882,27 +939,58 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            svc.sig_visibility_gate(Some(tid), &drv_info).await.unwrap(),
-            ".drv with no path_tenants/sigs must be visible (build input, not tenant output)"
+            !svc.sig_visibility_gate(Some(tid), &drv_info).await.unwrap(),
+            ".drv with no path_tenants/sigs must be hidden — same rule as outputs \
+             (visible would mean valid-but-unreadable in castore-FUSE)"
         );
         assert!(
             !svc.sig_visibility_gate(Some(tid), &out_info).await.unwrap(),
             "non-.drv with no path_tenants/sigs must be hidden (substitution-only, untrusted)"
         );
 
-        // Batch gate: same answers — proves wopQueryValidPaths agrees
-        // with wopIsValidPath for .drv paths under a tenant JWT.
+        // Batch gate: same answers — wopQueryValidPaths agrees with
+        // wopIsValidPath for .drv paths under a tenant JWT.
         let batch = svc
             .sig_visibility_gate_batch(Some(tid), &[drv_path.clone(), out_path.clone()])
             .await
             .unwrap();
         assert!(
-            batch.contains(&drv_path),
-            "batch gate must exempt .drv (was: routed to subst_only → sig-verify → invisible)"
+            !batch.contains(&drv_path),
+            "batch gate must hide the unowned .drv so the caller re-uploads it"
         );
         assert!(
             !batch.contains(&out_path),
             "batch gate must still hide untrusted non-.drv"
+        );
+
+        // Cross-tenant: once ANOTHER tenant owns the .drv (junction row
+        // from its upload), it stays hidden from this tenant — the
+        // exact shape of the two-tenant production brick.
+        let other = seed_tenant(&db.pool, "drv-owner-other").await;
+        let drv_hash = drv_info.store_path.sha256_digest();
+        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+            .bind(drv_hash.as_slice())
+            .bind(other)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(
+            !svc.sig_visibility_gate(Some(tid), &drv_info).await.unwrap(),
+            "a .drv owned by another tenant must be hidden (single-path)"
+        );
+        let batch = svc
+            .sig_visibility_gate_batch(Some(tid), std::slice::from_ref(&drv_path))
+            .await
+            .unwrap();
+        assert!(
+            !batch.contains(&drv_path),
+            "a .drv owned by another tenant must be hidden (batch)"
+        );
+        assert!(
+            svc.sig_visibility_gate(Some(other), &drv_info)
+                .await
+                .unwrap(),
+            "the owning tenant still sees its .drv"
         );
     }
 
@@ -966,9 +1054,16 @@ mod tests {
                 vec![]
             };
             info_with_sig.store_path_hash = path_hash.to_vec();
-            metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into())
-                .await
-                .unwrap();
+            metadata::complete_manifest_inline(
+                &db.pool,
+                &info_with_sig,
+                claim,
+                nar.into(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
             paths.push(path);
         }
         // P3: built (path_tenants row).
@@ -1055,7 +1150,7 @@ mod tests {
         let mut info_with_sig = info.clone();
         info_with_sig.signatures = vec![sig_a];
         info_with_sig.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into())
+        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into(), None, None)
             .await
             .unwrap();
 

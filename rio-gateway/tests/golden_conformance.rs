@@ -61,6 +61,7 @@ async fn gateway_response(client_bytes: &[u8], store: MockStore) -> anyhow::Resu
             &mut reader,
             &mut writer,
             &mut store_client,
+            None, // no DrvBlobService in the golden fixture (legacy submissions)
             &mut scheduler_client,
             None, // golden conformance is tenant-agnostic
             rio_gateway::handler::SessionJwt::none(),
@@ -191,6 +192,7 @@ async fn test_golden_live_handshake() -> anyhow::Result<()> {
             &mut reader,
             &mut writer,
             &mut store_client,
+            None, // no DrvBlobService in the golden fixture (legacy submissions)
             &mut scheduler_client,
             None, // golden conformance is tenant-agnostic
             rio_gateway::handler::SessionJwt::none(),

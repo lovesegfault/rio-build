@@ -84,12 +84,44 @@ narinfo.
 
 = Content Integrity Verification
 
-#r("store.integrity.verify-on-put")[
-  *On PutPath:* The store independently computes SHA-256 over the uploaded NAR
-  stream and verifies it matches the declared `NarHash`. Rejects the upload on
-  mismatch. This prevents corrupted or tampered uploads from being signed and
-  served.
+#r("store.integrity.verify-on-put+3")[
+  *On NAR-byte ingest (`PutPath`, `PutPathBatch`, the substituter):* the store
+  independently computes SHA-256 over the uploaded NAR stream and rejects the
+  upload on mismatch with the declared `NarHash`.
+  *On `PutPathChunked`:* the store BLAKE3-verifies every chunk body received
+  on the stream against its claimed digest, and length-checks it against the
+  manifest, before the body is stored or referenced. Every per-file digest
+  MUST be proven to match its file's chunk-run content before the commit
+  binds it into the digest-keyed `file_blobs` namespace — by recomputing the
+  whole-file BLAKE3 from the bodies received on this stream, by exact
+  `(chunk digest, size)` window agreement with an already-committed binding
+  of the same digest, or by re-fetching the run's chunks from the backend
+  and recomputing; a mismatch rejects the upload. `nar_hash`, `nar_size`,
+  and `references` are computed by the authenticated builder's fused walk
+  over the same bytes it uploads (#rref("builder.upload.fused-walk")) and
+  are committed as claimed; the store does not regenerate the NAR to
+  recompute them.
 ]
+
+The asymmetry is a trust-boundary line drawn by blast radius. The builder
+runs adversary-supplied build instructions, so every claim in `Begin` is
+attacker-controlled — but `nar_hash`, `nar_size`, and `references` are
+recorded under the store *path* the assignment token authorized, so a lie
+corrupts only outputs the builder was entitled to write (and NAR SHA-256 is
+not composable from chunk digests: recomputing it on a fully-deduped upload
+meant re-fetching every already-durable chunk — O(chunks) serial S3 round
+trips on an upload that streams no bodies at all, long enough on large
+outputs to exceed the client's stream timeout). Per-file digests are
+different: they key the `file_blobs` dedup namespace that
+`ReadBlob`/`StatBlob`/`HasBlobs` resolve by digest alone across every tenant
+that can see any referrer, so a forged `digest → content` binding poisons
+reads far beyond the forger's own paths — that one claim must be proven,
+not trusted. The window-agreement form keeps the fully-deduped re-upload on
+PostgreSQL metadata (zero chunk reads, preserving the stall fix above); the
+refetch form is reserved for runs that mix deduped chunks into a digest the
+store has never committed. Substituted content arrives from *outside* the
+service boundary (an upstream binary cache), so the substituter keeps
+independent NAR-hash verification.
 
 #r("store.integrity.verify-on-get")[
   - *On chunk read (S3 or cache):* Every chunk fetched from S3 or the
@@ -101,6 +133,45 @@ narinfo.
     (the store does not re-hash on every read; integrity is guaranteed by
     verify-on-put and PostgreSQL's own storage guarantees).
 ]
+
+= Ingest Tree Bounds (castore validation boundary)
+
+#r("store.ingest.tree-bounds+2")[
+  Every NAR/castore ingest entry point --- `PutPath`, `PutPathBatch`, the
+  substituter, and `PutPathChunked` --- MUST enforce one shared set of
+  tree-shape bounds before any side effect: directory nesting depth
+  (`MAX_NAR_DEPTH`), whole-archive entry count (`MAX_NAR_ENTRIES`),
+  cumulative materialized index bytes --- joined entry paths plus symlink
+  targets --- (`MAX_NAR_INDEX_BYTES`), entry-name and symlink-target
+  lengths, and per-directory entry counts; buffered NAR input that the
+  parser does not consume entirely MUST be rejected; and the serving-side
+  caps named here --- `GetPath`'s regeneration-walk node cap and the
+  chunk-count cap `MAX_CHUNKS` --- MUST be derived from --- and be at
+  least as permissive as --- the same constants, so that "ingest accepts
+  ⇒ the committed path can be regenerated through `GetPath` and
+  re-ingested" holds structurally.
+]
+
+The constants live in `rio_nix::nar` (the NAR reader is the definitional
+consumer: anything it would reject must never be committable) and are
+enforced at the two chokepoints every ingest path goes through ---
+`nar_ls` for NAR-byte ingest and the castore `TreeWalk` for Directory-DAG
+ingest --- rather than per-RPC. Without the whole-archive bounds the
+per-axis limits compose badly: a few-hundred-MB NAR can legally expand to
+tens of GB of materialized index (\~350× amplification), a node count the
+serving walk refuses commits paths that read as `DATA_LOSS` forever, and
+a nesting depth the readers reject can never be substituted or imported
+again. Trailing bytes after the root node are rejected for the same
+reason: the claimed `nar_hash` covers them, the persisted castore content
+does not, so the regenerated NAR could never hash back to its narinfo.
+
+The recursive `GetDirectory` result cap is deliberately outside this
+contract: that walk serves a builder's whole input closure in one call
+(the FUSE mount-time prefetch), so its bound is per-walk rather than
+per-path and no relation to the per-path ingest constants would make
+"accepted ⇒ mountable" structural --- see the `TODO` at
+`GET_DIRECTORY_MAX_RESULTS` in `rio-store/src/grpc/directory.rs` for what
+closing that gap would take (paging the walk, not raising the cap).
 
 = Chunk Manifest Format
 
@@ -116,7 +187,6 @@ narinfo.
 
 - *S3 key schema:* `chunks/{first-2-hex-chars}/{full-blake3-hex}`
   (prefix-partitioned to avoid S3 hotspots)
-- Chunks are stored uncompressed in S3 to maximize dedup across packages
 - Dedup during `PutPath` uses a `refcount == 1` heuristic: after the refcount
   UPSERT, chunks whose refcount is exactly 1 were newly inserted by this upload
   and need to go to S3; chunks with refcount > 1 already existed. This has a
@@ -128,6 +198,26 @@ narinfo.
 - *S3 backend requirements:* Strong read-after-write consistency is required.
   AWS S3 provides this natively. Non-AWS S3-compatible backends (MinIO, Ceph
   RADOS GW) must be validated for consistency.
+
+#r("store.cas.zstd-at-rest")[
+  Chunk objects MUST be zstd-compressed at rest on write; chunk digests MUST
+  remain the BLAKE3 of the UNCOMPRESSED bytes (the digest space never
+  re-keys); reads MUST sniff the zstd frame magic (`0x28B52FFD`,
+  little-endian) to distinguish compressed objects from legacy raw chunks,
+  decompress under a `CHUNK_MAX` output bound, and verify BLAKE3 over the
+  decompressed result --- falling back to raw verification when the sniffed
+  decode does not produce bytes matching the digest; a stored object that
+  verifies under neither form MUST surface as a corruption error naming the
+  digest, never a decoder panic or unbounded allocation.
+]
+
+Migration rule (ADR-024 P2): legacy uncompressed chunks age out naturally
+via GC --- there is no backfill job. The raw-verify fallback also makes the
+magic sniff correctness-free for legacy chunks whose *content* begins with
+the zstd magic (any sub-`CHUNK_MAX` `.zst` file stored as one chunk, plus
+the \~2⁻³² accidental-prefix case). Dedup is unaffected: identical
+uncompressed content compresses to the identical stored object under the
+same digest key.
 
 #r("store.backend.filesystem")[
   For dev/single-node deployments, `FilesystemChunkBackend` stores chunks on
@@ -197,6 +287,26 @@ table schema:
   its increment. (Sibling to #rref("store.chunk.refcount-txn").)
 ]
 
+#r("store.chunk.has-chunks-tenant")[
+  `HasChunks` presence MUST be tenant-scoped: a bit may be set only if the
+  calling tenant has a `chunk_tenants` row for that digest, in addition to the
+  durable-presence predicate. The junction row is written in the same
+  transaction that completes one of the tenant's manifests (atomic with the
+  `durable` flip), so "manifest is complete" and "its chunks answer present to
+  the uploader" cannot diverge. Chunk *storage* stays digest-keyed global ---
+  dedup at rest is unaffected; tenant-scoped presence costs upload bandwidth
+  only, because the duplicate upload of a tenant-invisible chunk is an
+  idempotent overwrite of identical content.
+]
+
+ADR-024 P2 settled presence as tenant-scoped for ALL object kinds (chunks were
+previously the documented cross-tenant exception). Migration rule: chunks
+ingested before `chunk_tenants` existed (migration 072) --- and chunks of
+paths a tenant adopted via an idempotent-skip or substitution --- have no
+junction row for that tenant, so presence answers false and the tenant's next
+upload re-sends them, binding visibility through the write-through put. No
+backfill; the cost is bounded re-upload bandwidth, never correctness.
+
 *Refcount decrement:* In the same PostgreSQL transaction that deletes a
 manifest (orphan cleanup of stale `'uploading'` manifests, or GC sweep of
 unreachable `'complete'` manifests). Uses `UPDATE chunks SET refcount =
@@ -223,7 +333,7 @@ the `pending_s3_deletes` table.
   [Batch narinfo lookup, one PG round-trip (#rref("store.api.batch-query"))],
 
   [`BatchGetManifest(paths)`],
-  [Batch (narinfo, manifest) lookup, 1 PG round-trip
+  [Batch narinfo + manifest-availability lookup, 1 PG round-trip
     (#rref("store.api.batch-manifest"))],
 
   [`FindMissingPaths(paths)`],
@@ -258,15 +368,14 @@ the `pending_s3_deletes` table.
   per-path → batch swap was the 130× scale unlock.
 ]
 
-#r("store.api.batch-manifest+2")[
+#r("store.api.batch-manifest+3")[
   `BatchGetManifest` returns `(store_path, Option<ManifestHint>)` for many
-  paths in ONE PostgreSQL round-trip (`LEFT JOIN manifest_data`). A
-  `ManifestHint` carries the full `PathInfo` plus either `inline_blob` or the
-  `(blake3_hash, size)` chunk list. Same local-only / DoS-bound / validation /
-  end-user-tenant-rejection rules as #rref("store.api.batch-query"). I-110c:
-  the builder issues this once per build (#rref("builder.warmgate.manifest-prime"))
-  so each subsequent `GetPath` can supply `manifest_hint` and skip both PG
-  lookups.
+  paths in ONE PostgreSQL round-trip. A `ManifestHint` carries the path's
+  `PathInfo`; it is present only for paths with a complete manifest and never
+  carries manifest content (a per-file chunk list cannot reassemble a NAR
+  without the Directory DAG --- clients that want the NAR call `GetPath`).
+  Same local-only / DoS-bound / validation / end-user-tenant-rejection rules
+  as #rref("store.api.batch-query").
 ]
 
 #r("store.api.hash-part+2")[
@@ -306,21 +415,21 @@ the `pending_s3_deletes` table.
   via a service token --- see #rref("sec.authz.service-token").
 ]
 
-#r("sec.authz.ca-path-derived+2")[
+#r("sec.authz.ca-path-derived+3")[
   For floating-CA derivations (`AssignmentClaims.is_ca = true`),
   `expected_outputs` is unknown at dispatch time. Instead of skipping
-  authorization, the store recomputes the CA store path *server-side* from the
-  SHA-256 it computed over the buffered NAR (via
-  `StorePath::make_fixed_output(name, nar_hash, recursive=true, refs)`) and
+  authorization, the store derives the CA store path *server-side* via
+  `StorePath::make_fixed_output(name, nar_hash, recursive=true, refs)` and
   rejects with `PERMISSION_DENIED` if it does not match the uploaded
-  `store_path`. The server-side CA-path recompute MUST run BEFORE the
-  `'uploading'` placeholder is claimed (#rref("store.put.wal-manifest") step
-  1), so a worker holding an `is_ca` token cannot squat placeholders for paths
-  it has not content-proven (it would otherwise drip-feed chunks while
-  heartbeating an arbitrary path's placeholder fresh, forcing legitimate
-  uploaders into `Aborted`). A worker holding an `is_ca=true` token therefore
-  cannot upload to (or squat the placeholder for) any path other than the
-  content-derived path of the NAR it actually sent.
+  `store_path`. The `nar_hash` input is the SHA-256 the store computed over
+  the buffered NAR for NAR-byte uploads, and the builder-claimed NAR hash for
+  `PutPathChunked` (#rref("store.integrity.verify-on-put")) --- either way the
+  uploaded path must be the fixed-output derivation of the hash and references
+  the same upload asserts. The CA-path check MUST run BEFORE the `'uploading'`
+  placeholder is claimed (#rref("store.put.wal-manifest") step 1), so a worker
+  holding an `is_ca` token cannot squat placeholders for arbitrary paths (it
+  would otherwise drip-feed chunks while heartbeating an arbitrary path's
+  placeholder fresh, forcing legitimate uploaders into `Aborted`).
 ]
 
 #r("sec.authz.service-token")[
@@ -333,6 +442,25 @@ the `pending_s3_deletes` table.
   with a 60-second expiry. Transport-agnostic: works over plaintext-on-WireGuard
   with no TLS dependency.
 ]
+
+#r("store.put.chunked-jwt-source")[
+  Under an armed assignment-token verifier, a `PutPathChunked` caller that
+  presents no assignment or service token but carries a verified tenant JWT
+  MUST be accepted as a tenant *source* upload: the `Begin` MUST carry an
+  empty deriver (a non-empty deriver under this rung is rejected with
+  `PERMISSION_DENIED` --- deriver-bound builder uploads still require an
+  assignment token, and the `expected_outputs` allowlist posture for HMAC
+  callers is unchanged), every structural and integrity check runs exactly as
+  for a builder upload, and the `path_tenants` junction binds to the JWT
+  tenant. Anonymous callers and invalid tokens remain rejected.
+]
+This is ADR-024 P3's external-door client upload (`rio build` shipping
+inputSrcs): there is no assignment at eval time, so no allowlist semantics
+apply --- the upload is client-claimed content verified by server-side digest
+and NAR-hash recompute, the same trust level the gateway's service-token
+`PutPath` already grants a tenant for `nix copy --to`. A presented token ---
+valid or not --- always takes the builder ladder; the JWT rung never masks a
+bad token.
 
 + *Idempotency check + `'uploading'` placeholder:* If a `'complete'` manifest
   already exists for this path, return success immediately (fast-path no-op).
@@ -383,6 +511,60 @@ whose refcount drops to 0 become eligible for S3 deletion via
   `'complete'` manifest, the call returns success immediately without
   re-uploading. This makes concurrent uploads of the same path safe.
 ]
+
+#r("store.put.concurrent-wait")[
+  When the write-ahead claim (#rref("store.put.placeholder-claim")) finds a
+  live concurrent uploader for the same path, `PutPath` and `PutPathChunked`
+  MUST wait --- bounded by a server-side budget (default 60 s, well under the
+  client RPC deadline) --- for the in-flight upload to resolve, then take the
+  idempotent-skip path (#rref("store.put.idempotent"), winner committed) or
+  claim the freed placeholder (winner aborted). Only when the budget expires
+  with the uploader still live does the call surface `ABORTED`.
+]
+
+Without the wait, the loser of a same-path race got `ABORTED "concurrent
+PutPath in progress … retry"` immediately --- and for the gateway's
+`wopAddMultipleToStore` leg the "retry" was a lie. The gateway's buffered
+re-send retry has a \~6 s budget tuned for KB-sized `.drv` NARs and cannot
+cover a winner streaming a chunked NAR for tens of seconds; the gateway's
+streaming path (oversize entries) cannot retry at all because the NAR bytes
+were already consumed off the wire. Either way the client's whole upload died
+over a race whose outcome it didn't need to win: the loser's optimal result is
+the idempotent skip, which requires no bytes. The store is the only layer that
+can observe the winner's placeholder directly, so it waits there; client-side
+retry budgets stay as the fallback for winners that outlive the server-side
+budget.
+
+#r("store.put.tenant-junction")[
+  Every upload RPC (`PutPath`, `PutPathBatch`, `PutPathChunked`) MUST record
+  the caller's resolved tenant (the same resolution the castore read side
+  uses, #rref("store.castore.tenant-scope")) as a `path_tenants` row for
+  every output it commits, and for every output it idempotent-skips as
+  already complete. A caller with no resolvable tenant (dev mode,
+  service-token caller without a JWT) writes no row. A junction insert that
+  fails because the tenant was deleted while the upload was in flight MUST
+  NOT fail the upload. Upstream substitution is NOT an upload RPC and MUST
+  NOT write the junction (#rref("store.substitute.tenant-sig-visibility")).
+]
+
+Without the commit-time row, a path uploaded by a tenant is invisible to that
+same tenant through the castore read surface
+(#rref("store.castore.tenant-scope")): the gateway uploads every `.drv` via
+`PutPath`, the builder then opens it through castore-FUSE `ReadBlob`, and the
+inner join on `path_tenants` turns the missing row into `NotFound` → `EIO` →
+the build dies as a spurious infrastructure failure. The idempotent-skip half
+matters because content-addressed paths deduplicate across tenants: the prior
+commit may belong to another tenant (or predate tenancy), and the skipping
+caller still needs castore read access and a GC pin of its own.
+
+The substitution exclusion is the other half of the same coin: a substituted
+path's cross-tenant visibility is signature-gated
+(#rref("store.substitute.tenant-sig-visibility")), so a junction row written
+at substitution time launders the path into "built" --- hiding it from other
+tenants who trust the same upstream and corrupting the scheduler's
+cached-output check (#rref("store.substitute.find-missing-gated")). Substituted
+outputs are pinned per-tenant by the scheduler's completion upsert instead
+(#rref("sched.gc.path-tenants-upsert")).
 
 #r("store.put.placeholder-refs")[
   The `'uploading'` placeholder narinfo MUST carry `references` from the
@@ -467,8 +649,10 @@ whose refcount drops to 0 become eligible for S3 deletion via
   inline-only delete would leak. The guard is defused only on success. I-125a:
   pre-fix, a phantom-drained builder leaked the placeholder and the next
   uploader for the same path got `Aborted: concurrent PutPath` until the orphan
-  scanner reaped it (15 min); the builder side polls for that case per
-  #rref("builder.upload.aborted-poll").
+  scanner reaped it (15 min); the builder treats that `Aborted` as a transient
+  error inside its normal upload retry budget --- by the next attempt this
+  drop-path cleanup has released the placeholder, or the concurrent upload
+  finished and the retry lands as an idempotent skip.
 ]
 
 = NAR Reassembly
@@ -484,23 +668,6 @@ whose refcount drops to 0 become eligible for S3 deletion via
     above)
   - Stream the reassembled NAR to the client without materializing the full NAR
     in memory
-]
-
-#r("store.get.manifest-hint+2")[
-  When `GetPathRequest.manifest_hint` is set with a non-null `info`, `GetPath`
-  bypasses BOTH PG lookups (`query_path_info` and `get_manifest`) and streams
-  directly from the supplied `(PathInfo, chunk-list-or-inline-blob)`. The hint
-  MUST be for the requested path (`hint.info.store_path == req.store_path`,
-  else `INVALID_ARGUMENT`), structurally well-formed (32-byte chunk hashes,
-  valid `PathInfo`), and bounded by `MAX_CHUNKS` and `MAX_NAR_SIZE`
-  (`INVALID_ARGUMENT` if exceeded); a hint with `info=None` falls through to
-  PG. Safety: the post-stream whole-NAR SHA-256 verify checks the reassembled
-  bytes against `hint.info.nar_hash`, so a stale or forged hint surfaces as
-  `DATA_LOSS` exactly like a corrupt `manifest_data` row would; chunks are
-  content-addressed and BLAKE3-verified in `get_verified`, so a hint cannot
-  read chunks the client doesn't already know the hash of. I-110c: with
-  #rref("store.api.batch-manifest") priming the builder, this collapses \~2 PG
-  hits/input to zero on the JIT-fetch hot path.
 ]
 
 #r("store.get.size-sanity-check")[
@@ -598,6 +765,31 @@ unique chunks.
   results for backward compatibility.
 ]
 
+#r("store.tenant.valid-paths-filter")[
+  Validity and missing-path checks (`QueryPathInfo` presence,
+  `FindMissingPaths` --- what `wopIsValidPath` and `wopQueryValidPaths`
+  consume) MUST apply the same tenant visibility as the castore read surface,
+  with no `.drv` exemption: an authenticated caller is told a path is valid
+  only if a `path_tenants` row grants its tenant read access, or the path is
+  substitution-only and signature-visible
+  (#rref("store.substitute.tenant-sig-visibility")). A path MUST NOT be
+  reported valid to a caller whose castore reads of it would fail.
+]
+
+Valid-but-unreadable is the failure mode this rule forbids. A `.drv` exemption
+("build inputs, not tenant-owned outputs") once made a `.drv` uploaded by
+tenant A count as valid for tenant B: B's nix client skipped the upload, B's
+builder then opened the `.drv` through castore-FUSE, and the tenant-scoped
+read (#rref("store.castore.tenant-scope")) returned `NotFound` → `EIO` → the
+build died after exhausting its infrastructure retries --- reproduced live with
+two tenants sharing one busybox `.drv`. Reporting the path missing instead is
+self-healing: the client re-uploads, the idempotent-skip arm of
+#rref("store.put.tenant-junction") writes the caller's junction row, and the
+path becomes both valid and readable for that tenant. The same re-upload flow
+covers `.drv`s uploaded under one identity and queried under another (the case
+that motivated the exemption): the second identity re-uploads instead of
+receiving a stale "valid" answer it cannot use.
+
 == Key Rotation
 
 + Generate a new ed25519 signing key with a NEW key name (e.g., `rio-prod-2` if
@@ -669,6 +861,137 @@ unique chunks.
 CA `Realisation` objects carry their own ed25519 signatures over the tuple
 `(drv_hash, output_name, output_path, nar_hash)`. This provides integrity for
 content-addressed output mappings independently of narinfo signatures.
+
+= Castore RPC Surface (ADR-022)
+
+snix-compatible Directory/Blob surface backed by `directories`/`file_blobs`
+(populated by `metadata::set_nar_index_in_conn` inside the manifest-complete
+transaction); serves the castore-FUSE builder.
+
+#r("store.castore.blob-stat")[
+  `StatBlob(file_digest, send_chunks=true)` returns the `ChunkMeta[]` (digest,
+  size) list spanning that file's bytes, resolved server-side via `file_blobs`
+  → manifest chunk-cumsum. snix `BlobService.Stat` wire-compatible. The
+  builder's castore-FUSE `open()` calls this for files above the streaming
+  threshold.
+]
+
+#r("store.castore.tenant-scope+3")[
+  `GetDirectory`/`HasDirectories`/`HasBlobs`/`ReadBlob`/`StatBlob` MUST be
+  tenant-scoped: queries resolve a digest to its containing store path(s)
+  (`directory_paths` / `file_blobs.store_path_hash`) and join `path_tenants`
+  on the caller's `tenant_id` (from JWT `Claims.sub` or HMAC
+  `AssignmentClaims.tenant`, #rref("common.hmac.claims")). When no junction
+  row grants the caller access, a digest MAY still resolve through a
+  substitution-only containing path (zero `path_tenants` rows) whose narinfo
+  signature is visible to the caller
+  (#rref("store.substitute.tenant-sig-visibility")) --- the SAME per-caller
+  predicate the validity surface applies
+  (#rref("store.tenant.valid-paths-filter")), so a path reported valid is
+  always castore-readable. The fallback MUST NOT apply to paths any tenant
+  has built (a `path_tenants` row for another tenant keeps the path hidden
+  regardless of signatures). Return NotFound for digests the caller's tenant
+  cannot reach via any owned path or sig-visible substitution-only path.
+  Directory bodies
+  leak child names/digests --- cross-tenant exposure here is a confidentiality
+  issue. Chunk *retrieval* (`GetChunk`/`GetChunks`) is identity-gated but
+  *not* tenant-scoped: a 32-byte BLAKE3 chunk digest is unguessable and is
+  only disclosed via tenant-scoped `StatBlob`/`ReadBlob` or by self-computing
+  it from bytes the caller already holds --- knowing the digest is the read
+  capability. Chunk *presence* (`HasChunks`) IS tenant-scoped
+  (#rref("store.chunk.has-chunks-tenant")), as are drv-blob presence and
+  reads (#rref("store.drv.blob-kind")) --- ADR-024 P2 reconciled presence as
+  tenant-scoped across all object kinds.
+]
+
+Without the substitution-only fallback the two surfaces disagreed:
+substituted paths deliberately carry zero `path_tenants` rows, the
+sig-visibility gate reported them VALID to tenants whose trusted keys cover
+them, and the strict junction join then failed every castore read of the same
+path --- valid-but-unreadable, so schedulers never re-registered the path and
+castore mounts of substituted inputs failed forever.
+
+#r("store.castore.gc")[
+  `directories` rows are refcounted (one increment per referencing manifest).
+  `file_blobs` and `directory_paths` are `(digest, store_path_hash)` junctions
+  with `ON DELETE CASCADE` from `manifests` --- GC of one referrer
+  cascade-deletes its rows, surviving referrers' rows remain, so
+  `ReadBlob`/`StatBlob` never resolve to a dead manifest.
+]
+
+= Drv Blob Storage (ADR-024)
+
+Derivation content is a first-class castore blob kind: the canonical
+`rio.drv.v1.Derivation` proto bytes, keyed by `blake3(canonical bytes)` ---
+the negotiation digest of the ADR-024 build plan. Bodies live in PG
+(`drv_blobs.body`) like `directories.body`: drv blobs are a few KB, the same
+size class as Directory bodies, far below the chunked-CAS minimum.
+
+#r("store.drv.blob-kind")[
+  `DrvBlobService` stores canonical drv bytes keyed by `blake3(received
+  bytes)` and serves them back byte-identically (`GetDrvBlob`). Presence
+  (`HasDrvs`, bitmap semantics identical to `HasBlobs`) and reads are
+  tenant-scoped via the `drv_blob_tenants` junction, resolved through the
+  same JWT/HMAC tenant ladder as the rest of the castore surface; storage is
+  digest-keyed global. Puts are write-through idempotent: an existing digest
+  is an idempotent overwrite-equivalent (and refreshes the GC grace clock),
+  never a present/absent timing oracle, and `created[i]` reports only the
+  calling tenant's visibility binding.
+]
+
+#r("store.drv.verify-on-put")[
+  Every `PutDrvBlobs` blob MUST pass the full server-side cross-check
+  (`verify_drv_blob`) before anything is written: blake3 over received bytes
+  equals the claimed digest; proto decode; structural validation (sorted,
+  unique repeated fields --- hostile input is rejected, never re-sorted);
+  canonical re-encode byte-compares equal to the received bytes; ATerm
+  reconstruction; drv_path recompute equals the claimed path; fixed-output
+  output-path recompute. Any failure rejects the whole batch with
+  `INVALID_ARGUMENT` naming the failing blob --- non-canonical bytes are
+  NEVER stored, which is what makes served bytes equal received bytes equal
+  canonical bytes by construction.
+]
+
+#r("store.drv.gc-build-pinned")[
+  Drv blobs referenced by live builds MUST survive GC. The drv sweep deletes
+  a blob only when it is past the GC grace window AND its
+  `drv_path_hash = sha256(drv_path)` matches no `scheduler_live_pins` row AND
+  its `drv_path` is not in the run's `extra_roots` --- the same pin mechanism
+  and keying the path mark phase seeds from, not a parallel one. The
+  scheduler pins the `.drv` paths of a submission's live closure through the
+  existing `pin_live_inputs` call and unpins on terminal status.
+]
+
+The drv sweep runs inside `TriggerGC` after the path sweep, under the same
+advisory lock, honoring `dry_run`. Bodies are PG-only, so the DELETE is the
+whole sweep --- no `pending_s3_deletes` leg. The client-side ack-record TTL
+from ADR-024 ("TTL ≤ the cluster's minimum unpinned-blob lifetime") binds to
+this grace window; a re-put refreshes `created_at`, restarting the clock.
+
+#r("store.drv.getpath-fallback")[
+  On a `GetPath` narinfo miss for a path ending in `.drv`, the store MUST
+  attempt to serve the derivation from `drv_blobs` (looked up by
+  `drv_path_hash = sha256(store path)`) before answering `NOT_FOUND`:
+  reconstruct the ATerm from the canonical proto bytes through the full
+  `verify_drv_blob` cross-check (any failure is `DATA_LOSS`, never a silent
+  serve), frame it as a flat regular-file NAR, and synthesize the `PathInfo`
+  deterministically from the blob (`nar_hash`/`nar_size` over the
+  reconstructed NAR; `references` = inputDrvs ∪ inputSrcs). Visibility is the
+  `GetDrvBlob` rule: the caller's tenant --- gateway JWT, else the HMAC
+  assignment token's `tenant` claim, the shared castore identity ladder ---
+  must hold a `drv_blob_tenants` binding; no identity and no binding both
+  yield the same `NOT_FOUND` as before the fallback existed.
+]
+
+This is what makes ADR-024 native submissions buildable: the client uploads
+the derivation ONLY as a drv blob (`PutDrvBlobs` --- no `PutPath`, no narinfo
+row), and the builder's `fetch_drv_from_store` fallback reads the `.drv` via
+`GetPath` when `WorkAssignment.drv_content` is empty. The builder presents
+its assignment token on that fetch; the token's `tenant` claim is the
+submitting tenant, whose `PutDrvBlobs` bound visibility for every drv in the
+submission (own and input `.drv`s alike), so the scoped lookup resolves
+without any cross-tenant exemption. Legacy ssh-ng `.drv` paths have narinfo
+rows and never reach the fallback.
 
 = Upstream Cache Substitution
 
@@ -788,7 +1111,7 @@ content-addressed output mappings independently of narinfo signatures.
   consume permits, so a wide fan-out on one cold path cannot pin the cap.
 ]
 
-#r("store.substitute.singleflight+3")[
+#r("store.substitute.singleflight+4")[
   `try_substitute` is wrapped in a moka `Cache<(tenant_id, store_path),
   Option<Arc<ValidatedPathInfo>>>` with 30s TTL and 10 000-entry cap. moka's
   `try_get_with` coalesces N concurrent callers for the same key into one
@@ -802,7 +1125,7 @@ content-addressed output mappings independently of narinfo signatures.
   `AlreadyComplete`. The narinfo/`nix-cache-info`/HEAD requests have a 30s
   per-request timeout so a hung upstream can't wedge the singleflight slot
   forever; the NAR GET is bounded only by the `MAX_NAR_SIZE` decompressed cap
-  and the 5-minute stale-reclaim.
+  and the stale-reclaim threshold (#rref("store.substitute.stale-reclaim")).
 ]
 
 #r("store.substitute.untrusted-upstream+3")[
@@ -843,14 +1166,34 @@ content-addressed output mappings independently of narinfo signatures.
   `B.narinfo` would otherwise ingest A and return it from `QueryPathInfo(B)`.
 ]
 
-#r("store.substitute.stale-reclaim")[
+#r("store.substitute.ca-self-auth")[
+  An upstream narinfo's `CA:` claim MUST be persisted only if the store path
+  recomputed from it (Nix `makeFixedOutputPath` / `makeTextPath` over the
+  narinfo's references) equals the path being substituted; otherwise the
+  claim is dropped (persisted as absent) and logged at `warn`.
+]
+The narinfo signature fingerprint covers only `(store_path, nar_hash,
+nar_size, references)` --- `Deriver:` and `CA:` are NOT signature-covered, so
+a compromised upstream can attach arbitrary claims to correctly-signed
+content (the rpm CVE-2021-20271 signature-scope class). A self-consistent
+`CA:` is exactly as trustworthy as the (signed) store path, because the path
+name commits to the content address by construction --- this is the same
+self-authentication check reference Nix performs in
+`ValidPathInfo::isContentAddressed`. `Deriver:` is persisted as-is: it is
+informational in the Nix trust model (`nix-store -q --deriver`) and nothing
+security-relevant consumes it (the PutPathChunked deriver/token binding
+applies to builder uploads, not substitution).
+
+#r("store.substitute.stale-reclaim+2")[
   When `try_substitute` finds an existing `'uploading'` placeholder for the
   requested path, it MUST check the placeholder's age. If older than
-  `SUBSTITUTE_STALE_THRESHOLD` (5 minutes), the substituter reclaims the
-  placeholder (DELETE + re-INSERT) and proceeds with the fetch. A young
-  placeholder indicates a live concurrent uploader and returns a miss. This
-  prevents a crashed substitution from blocking the path for the full
-  orphan-scanner interval (15 minutes). The
+  `SUBSTITUTE_STALE_THRESHOLD` (90 seconds --- 3x the 30 s placeholder
+  heartbeat, so a live owner is never collected; `reap_one` re-checks the
+  threshold inside its transaction as the race guard), the substituter
+  reclaims the placeholder (DELETE + re-INSERT) and proceeds with the fetch.
+  A young placeholder indicates a live concurrent uploader and returns a
+  miss. This prevents a crashed or aborted upload from blocking the path for
+  the full orphan-scanner interval (15 minutes). The
   #(refs.metric)("rio_store_substitute_stale_reclaimed_total") counter tracks
   reclaim events.
 ]
@@ -1101,12 +1444,12 @@ leaked chunks not covered by manifest-based cleanup.
 = PostgreSQL Schema
 <store-schema>
 
-#r("store.db.migrate-try-lock")[
-  Startup migrations MUST serialize across replicas via a non-blocking
+#r("store.db.migrate-try-lock+2")[
+  Migration runs MUST serialize across concurrent runners via a non-blocking
   `pg_try_advisory_lock` poll loop, with sqlx's built-in blocking
   `pg_advisory_lock` disabled (`Migrator::set_locking(false)`). Migrations 011
   and 022 run `CREATE INDEX CONCURRENTLY`; CIC's final phase waits for every
-  older virtualxid to release. Under sqlx's default lock, a second replica
+  older virtualxid to release. Under sqlx's default lock, a second runner
   blocked in `SELECT pg_advisory_lock(...)` holds such a virtualxid for the
   duration --- the leader's CIC waits on the follower's vxid, the follower
   waits on the leader's advisory lock, and PG's deadlock detector does not see
@@ -1114,6 +1457,48 @@ leaked chunks not covered by manifest-based cleanup.
   probe is a sub-ms SELECT that completes immediately), so the leader's CIC
   proceeds.
 ]
+
+Migrations normally execute in exactly one place — the `rio-migrate` Job
+(`rio-store migrate`, see
+#cross-link("/spec/system/deployment.typ")[Deployment]) — but the lock stays:
+it is what makes concurrent runner invocations safe (an old-named Job still
+running across an upgrade, a legacy in-pod migrator during mid-upgrade skew,
+a manually re-run Job).
+
+#r("store.db.schema-current+2")[
+  Service startup MUST NOT run migrations. It MUST verify that every
+  embedded migration is applied (`rio_migrations::migrate::assert_current`)
+  and fail with an error naming the migration runner (`rio-store migrate` /
+  the `rio-migrate` Job) when the schema is missing or stale.
+  Applied-but-not-embedded versions are accepted: during a rolling upgrade
+  the migrate Job lands the newer schema while old-binary replicas may
+  still restart against it (migrations are forward-compatible by policy).
+]
+
+Running migrations out-of-band, always as the database master, decouples
+schema DDL from app-pod credentials: `postgres.authMode=iam` pods never
+need DDL-capable database privileges.
+
+#r("store.db.ensure-roles")[
+  Every migrate run MUST re-assert the `rio_app` role, its `rds_iam`
+  membership (where that role exists), and its full table/sequence/default
+  privileges (`rio_migrations::ensure_roles`), under the same advisory-lock
+  hold as the migrations themselves; role and grant management MUST NOT
+  ship as checksum-frozen migrations. Where the connected user lacks the
+  required privileges (k3s migrates as the bitnami app user, which has no
+  CREATEROLE), the pass MUST degrade to a warning, not a failure.
+]
+
+Roles and grants are desired state — cluster-wide, environment-dependent
+(`rds_iam` exists only on RDS), and subject to drift from manual incident
+recovery — not schema history. Two live incidents motivated the move out
+of frozen SQL: a role migration's `GRANT rio_app TO <master>` made the
+master inherit `rds_iam` and RDS PAM rejected its password (locking out
+the migration runner itself), and the frozen follow-up's
+`REASSIGN OWNED BY rio_app` rewrote owner-ACL entries and stripped all of
+rio_app's privileges while the migrate Job reported success. Re-asserting
+grants on every run makes both classes self-healing; the advisory lock
+serializes the cluster-wide role DDL across concurrent runner invocations.
 
 #r("store.db.pool-idle-timeout")[
   The PostgreSQL connection pool MUST set `idle_timeout` (60s) and

@@ -1,0 +1,174 @@
+{{- if .Values.mountd.enabled }}
+{{- $m := .Values.mountd -}}
+# rio-mountd (ADR-022 P0567): per-node privileged broker for the
+# castore-FUSE lazy /nix/store — opens /dev/fuse, brokers BACKING_OPEN,
+# owns the verified Promote into the node-shared cache. One pod per
+# builder/fetcher node.
+#
+# Namespace: rio-builders, NOT rio-system — the system namespace is
+# PSA-restricted and this pod is privileged. Namespace placement does
+# not affect which nodes the DS schedules to.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rio-mountd
+  namespace: {{ .Values.namespaces.builders.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-mountd" "component" "mountd") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "rio.selectorLabels" "rio-mountd" | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # A mountd restart closes every kept /dev/fuse fd on the node:
+      # in-flight builds lose their castore lower, hit EIO, and are
+      # infra-retried on a fresh pod (r[builder.result.input-eio-is-infra]).
+      # maxUnavailable=1 limits a rollout to killing one node's builds
+      # at a time instead of the whole fleet's.
+      maxUnavailable: 1
+  # No readiness probe (see below), so this is what stops a rollout of
+  # a crash-looping image: a replacement pod must stay Running this
+  # long before the DS controller moves to the next node.
+  minReadySeconds: 30
+  template:
+    metadata:
+      labels:
+        {{- include "rio.labels" (dict "root" . "name" "rio-mountd" "component" "mountd") | nindent 8 }}
+    spec:
+      # Builder nodes carry rio.build/node-role=builder (poolDefaults
+      # nodeSelector); fetcher nodes carry rio.build/fetcher=true (§13e
+      # taint+label key). Two nodeSelectorTerms = OR. General/control-
+      # plane nodes get no mountd.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: rio.build/node-role
+                    operator: In
+                    values: [builder]
+              - matchExpressions:
+                  - key: rio.build/fetcher
+                    operator: Exists
+      # Builder/fetcher nodes are tainted so only build workloads land
+      # on them; metal builder nodes chain rio.build/kvm on top. The
+      # node daemon must tolerate all three to be present before the
+      # first build pod arrives.
+      tolerations:
+        - {key: rio.build/builder, operator: Exists, effect: NoSchedule}
+        - {key: rio.build/fetcher, operator: Exists, effect: NoSchedule}
+        - {key: rio.build/kvm, operator: Exists, effect: NoSchedule}
+      # Every build on the node depends on this pod; never evict it
+      # under node pressure or preempt it for a build.
+      priorityClassName: system-node-critical
+      # mountd never talks to the k8s API — everything it does is local
+      # syscalls. Don't hand a privileged pod an API token it has no use
+      # for.
+      automountServiceAccountToken: false
+      containers:
+        - name: mountd
+          image: {{ include "rio.image" (list . $m.image) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          command:
+            - /bin/rio-mountd
+            - --socket=/run/rio-mountd/rio-mountd.sock
+            - --castore-dir=/var/rio/castore
+            - --staging-dir=/var/rio/staging
+            - --cache-dir=/var/rio/cache
+            - --chunks-dir=/var/rio/chunks
+            - --staging-quota-bytes={{ int64 $m.stagingQuotaBytes }}
+            - --max-promote-bytes={{ int64 $m.maxPromoteBytes }}
+            # Group owning the UDS (created root:<gid> mode 0660). The
+            # socket file permission is mountd's only access control —
+            # must equal EXECUTOR_RUN_AS_GROUP in rio-controller (990),
+            # the runAsGroup the controller stamps on every executor
+            # container, or connect(2) fails and no build starts.
+            # Hard-coded (no values knob) so the pair cannot drift.
+            # The DAC check sees the executor's host-side gid, so this
+            # only lines up for pods without user namespaces
+            # (hostUsers:true / privileged).
+            - --allowed-gid=990
+            - --metrics-addr=[::]:9095
+          securityContext:
+            # Not the plan's privileged:false + CAP_SYS_ADMIN: the FUSE
+            # mounts created at /var/rio/castore/{build_id} must reach
+            # builder pods (their overlay lowerdir), which needs
+            # mountPropagation: Bidirectional below, and the apiserver
+            # rejects Bidirectional on non-privileged containers.
+            # No seccompProfile: the runtime forces Unconfined for
+            # privileged containers; declaring RuntimeDefault here would
+            # only misstate the actual posture.
+            privileged: true
+            runAsUser: 0
+          ports:
+            - name: metrics
+              containerPort: 9095
+          env:
+            {{- include "rio.rustLogEnv" . | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov")) | nindent 12 }}
+          volumeMounts:
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov")) | nindent 12 }}
+            # Socket lives in its own directory so the 0660 group-gate
+            # on the socket file is the only thing builder pods can
+            # reach — they hostPath-mount the directory, not /run.
+            - name: socket-dir
+              mountPath: /run/rio-mountd
+            # Bidirectional: the FUSE mounts created under castore/ must
+            # be visible outside this container.
+            - name: var-rio
+              mountPath: /var/rio
+              mountPropagation: Bidirectional
+            - name: dev-fuse
+              mountPath: /dev/fuse
+          # No readiness probe: the only thing that would prove the UDS
+          # socket is bound is an exec probe, and the image deliberately
+          # ships no shell and no coreutils to exec with. The socket
+          # binds one orphan-scan after process start and nothing
+          # selects on this pod's readiness (builders find the socket by
+          # path); rollout pacing comes from minReadySeconds above.
+          livenessProbe:
+            tcpSocket: {port: metrics}
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml $m.resources | nindent 12 }}
+      volumes:
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov")) | nindent 8 }}
+        - name: socket-dir
+          hostPath:
+            path: /run/rio-mountd
+            type: DirectoryOrCreate
+        - name: var-rio
+          hostPath:
+            # Created by the AMI (nix/nixos-node/eks-node.nix tmpfiles +
+            # the rio-nvme-mount prjquota bind). Directory, not OrCreate:
+            # a kubelet-created fallback dir would have no project-quota
+            # support and the daemon must not silently run unquota'd.
+            path: /var/rio
+            type: Directory
+        - name: dev-fuse
+          hostPath:
+            path: /dev/fuse
+            type: CharDevice
+{{- if .Values.monitoring.enabled }}
+---
+# DaemonSet pods have no Service; scrape them directly by label like
+# the builder Jobs above (servicemonitor.yaml PodMonitor).
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: rio-mountd
+  namespace: {{ .Values.namespaces.builders.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-mountd" "component" "mountd") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "rio.selectorLabels" "rio-mountd" | nindent 6 }}
+  podMetricsEndpoints:
+    - portName: metrics
+      interval: {{ .Values.monitoring.scrapeInterval }}
+{{- end }}
+{{- end }}

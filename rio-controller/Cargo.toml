@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 rio-auth = { workspace = true }
-rio-common = { workspace = true }
+rio-common = { workspace = true, features = ["pg-iam"] }
 rio-crds = { workspace = true }
 rio-lease = { workspace = true }
 rio-proto = { workspace = true }
@@ -47,6 +47,10 @@ metrics = { workspace = true }
 # round-trip — see rio-migrations/src/migrations.rs M_059).
 hdrhistogram = { workspace = true }
 sqlx = { workspace = true }
+# Startup schema verification (assert_current) — third-PG-consumer
+# parity with store/scheduler; the embedded MIGRATOR also backs the
+# sketch PG test fixtures.
+rio-migrations = { workspace = true }
 
 # --- Misc ---
 anyhow = { workspace = true }
@@ -59,8 +63,6 @@ rand = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
-# Embedded MIGRATOR for `nodeclaim_pool::sketch` PG test fixtures.
-rio-migrations = { workspace = true }
 # ApiServerVerifier + Scenario (tower-test mock apiserver).
 rio-test-support = { workspace = true }
 http = { workspace = true }

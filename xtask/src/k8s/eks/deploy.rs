@@ -35,8 +35,12 @@ use crate::{git, helm, tofu, ui};
 /// seccompProfile on Fetcher entries — those fields are deep-merged
 /// from poolDefaults but rejected at admission; the `null` clears
 /// prevent the merge. `hostUsers:null` clears poolDefaults.
-/// hostUsers:true so EKS gets the reconciler default `false`
-/// (hostUsers is NOT CEL-gated for Fetcher — k3s escape hatch).
+/// hostUsers:true so the reconciler default stays authoritative
+/// (currently ALSO `true` for fetchers — the mountd UDS gid gate
+/// sees the host-side gid, see `pod::effective_host_users` — but
+/// keeping the value out of config means a future reconciler change
+/// back to userns isolation needs no deploy.rs edit; hostUsers is
+/// NOT CEL-gated for Fetcher — k3s escape hatch).
 const POOLS_JSON: &str = r#"[
   {"name":"x86-64","kind":"Builder","systems":["x86_64-linux","i686-linux"]},
   {"name":"aarch64","kind":"Builder","systems":["aarch64-linux"]},
@@ -87,9 +91,39 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
 
     let ecr = tf.get("ecr_registry")?;
     let bucket = tf.get("chunk_bucket_name")?;
+    // ADR-023: per-AZ S3 Express cache tier. JSON-encoded map of AZ
+    // name → directory bucket (string output because tofu::outputs
+    // keeps string values only). Absent output (tfstate predating
+    // s3-express.tf) or empty map → stay on kind=s3; non-empty →
+    // tiered backend + express initContainer + zone-preferred
+    // scheduling, all driven from the same map.
+    let express_buckets_json = tf
+        .get_opt("express_buckets_json")
+        .unwrap_or_else(|| "{}".into());
+    let express_zones: Vec<String> =
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&express_buckets_json)
+            .context("parse express_buckets_json tofu output")?
+            .keys()
+            .cloned()
+            .collect();
+    let express_zones_json = serde_json::to_string(&express_zones)?;
     let store_arn = tf.get("store_iam_role_arn")?;
     let scheduler_arn = tf.get("scheduler_iam_role_arn")?;
     let bootstrap_arn = tf.get("bootstrap_iam_role_arn")?;
+    // IAM-mode postgres is the default; a tfstate predating the
+    // controller IRSA module (rds-db:connect) is a HARD error, not a
+    // silent password fallback — falling back would re-open the
+    // master-rotation outage class while reporting success. The
+    // escape hatch for genuinely-old environments is explicit.
+    let controller_arn = if opts.pg_password_mode {
+        None
+    } else {
+        Some(tf.get("controller_iam_role_arn").context(
+            "tfstate has no controller_iam_role_arn (predates the IAM-auth \
+             infra); run `tofu apply` — or pass --pg-password-mode to \
+             deploy without IAM postgres auth",
+        )?)
+    };
     let db_arn = tf.get("db_secret_arn")?;
     let db_host = tf.get("db_endpoint")?;
     let vpc_ipv6_cidr = tf.get("vpc_ipv6_cidr_block")?;
@@ -145,49 +179,43 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     // Subchart symlink (same requirement as dev apply).
     ui::step("chart deps", crate::k8s::shared::chart_deps).await?;
 
-    // NLB annotations (previously a --set-json one-liner in bash).
-    // target-type:instance — Cilium cluster-pool overlay IPs (fd42::)
-    // are NOT VPC-routable, so target-type:ip can't reach pods. NLB
-    // targets node IPs at the NodePort; Cilium's eBPF kube-proxy
-    // replacement handles node→pod. externalTrafficPolicy:Local in
-    // gateway.yaml means only nodes hosting a gateway pod pass NLB
-    // health checks (others are correctly unhealthy, not a bug).
-    // --public-cidr flips internal→internet-facing AND sets
-    // loadBalancerSourceRanges (the controller writes NLB SG ingress
-    // rules). NLB scheme is immutable, so a flip recreates the LB.
-    let scheme = if opts.public_cidrs.is_empty() {
-        "internal"
+    // --public-cidr flips internal→internet-facing (immutable — a flip
+    // recreates the NLB) and sets loadBalancerSourceRanges. ip-type
+    // follows scheme: internal-elb private subnets are v6-only, so a
+    // dualstack internal NLB can't get its per-subnet IPv4 and nothing
+    // internal needs v4; the `elb` public subnets have v4, so
+    // internet-facing stays dualstack for IPv4 clients.
+    let (scheme, ip_addr_type) = if opts.public_cidrs.is_empty() {
+        ("internal", "ipv6")
     } else {
-        "internet-facing"
+        ("internet-facing", "dualstack")
     };
     let mut nlb_ann = json!({
         "service.beta.kubernetes.io/aws-load-balancer-type": "external",
+        // instance, not ip: Cilium overlay pod IPs (fd42::) aren't
+        // VPC-routable. externalTrafficPolicy:Local (gateway.yaml)
+        // means non-gateway nodes are correctly unhealthy.
         "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type": "instance",
         "service.beta.kubernetes.io/aws-load-balancer-scheme": scheme,
-        // dualstack: cluster is IPv6-only (no IPv4 Service CIDR), so
-        // ip-address-type=ipv4 fails with "unsupported IPv6 config".
-        // dualstack with target-type=instance needs the instances to
-        // have a PRIMARY IPv6 — set by the primary-ipv6-init systemd
-        // oneshot baked into the NixOS AMI (eks-node.nix); system
-        // nodes are excluded from external LBs (main.tf).
-        "service.beta.kubernetes.io/aws-load-balancer-ip-address-type": "dualstack",
-        // dualstack listener + ipv6-only TG: IPv4 clients need the NLB
-        // to source-NAT to an IPv6 prefix it owns. Without this the NLB
-        // RSTs every IPv4 connection (no v6 source to forward with).
-        // aws-lbc reconciles this via SetSubnets; prefixes auto-assign.
-        "service.beta.kubernetes.io/aws-load-balancer-enable-prefix-for-ipv6-source-nat": "on",
+        // instance targets + v6 listener need a PRIMARY IPv6 on each
+        // node (primary-ipv6-init oneshot in the AMI; system nodes
+        // excluded from external LBs in main.tf).
+        "service.beta.kubernetes.io/aws-load-balancer-ip-address-type": ip_addr_type,
         "service.beta.kubernetes.io/aws-load-balancer-attributes": "load_balancing.cross_zone.enabled=true",
-        // preserve_client_ip OFF: with the instance-target default (on),
-        // intra-VPC clients that are themselves registered targets hit
-        // NLB hairpin RST, and the IPv6-source-NAT path above can't
-        // engage. Source IP is already lost at Cilium
-        // (loadBalancer.mode=snat, addons.tf) and rio-gateway doesn't
-        // consume it.
+        // OFF: the default (on) hairpins intra-VPC clients that are
+        // themselves targets and defeats v6 source-NAT; Cilium SNAT
+        // already drops the source IP and rio-gateway doesn't read it.
         "service.beta.kubernetes.io/aws-load-balancer-target-group-attributes": "preserve_client_ip.enabled=false",
         "service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-22": "tcp.idle_timeout.seconds=3600",
     });
-    // external-dns (dns.tf) reconciles this annotation → DNS record.
-    // Absent when gateway_dns is disabled or the state predates it.
+    // dualstack-only (aws-lbc rejects on ipv6): source-NAT IPv4
+    // connections to an NLB-owned v6 prefix so they reach the v6-only
+    // TG instead of being RST'd.
+    if ip_addr_type == "dualstack" {
+        nlb_ann["service.beta.kubernetes.io/aws-load-balancer-enable-prefix-for-ipv6-source-nat"] =
+            json!("on");
+    }
+    // external-dns (dns.tf) reconciles this into a DNS record.
     if let Some(fqdn) = &gateway_dns_fqdn {
         nlb_ann["external-dns.alpha.kubernetes.io/hostname"] = json!(fqdn);
     }
@@ -197,7 +225,7 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         // cold start that's 3-4min of nothing. Side-task prints
         // not-yet-Ready Deployments every 15s; aborted when helm exits.
         let progress = shared::spawn_helm_wait_progress(&client);
-        let r = helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
+        let mut helm_cmd = helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
             .namespace(NS)
             .set("namespaces.create", "false")
             .set("global.image.registry", &ecr)
@@ -274,6 +302,13 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // 14×20=280 can still burst-saturate — TODO(P-new): bump
             // Aurora min_capacity OR cap componentScaler.store.max
             // against (rds_max_conns / pgMaxConnections).
+            // IAM-auth watch item: RDS caps NEW IAM connections at
+            // ~200/s cluster-wide; idle_timeout=60s churn regrows well
+            // under that at this scale. Tripwire =
+            // rio_pg_iam_mint_failures_total; if it fires, front
+            // Aurora with RDS Proxy (app keeps IAM, proxy holds the
+            // warm pool — ceiling becomes irrelevant). See
+            // rio-store/src/main.rs init_db_pool.
             .set("store.pgMaxConnections", "20")
             // I-147/I-150: production-scale resources. values.yaml defaults
             // stay small so VM-test k3s (2-node QEMU) can schedule; EKS
@@ -297,17 +332,58 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // from kube-prometheus-stack (infra/eks/monitoring.tf), which
             // tofu apply lands before this runs.
             .set("monitoring.enabled", "true")
-            .wait(Duration::from_secs(600))
+            // --wait (+ --wait-for-jobs, helm.rs) on every deploy,
+            // fresh installs included: the rio-migrate Job is a plain
+            // resource applied in the same pass, and app pods
+            // crash-restart on the schema check until it completes.
+            // 900s budget: ESO first-sync (~1min) + image pull +
+            // Aurora connect + migration + crash-loop tail
+            // (CrashLoopBackOff max backoff 300s → post-migration
+            // readiness can lag up to 5min even when healthy).
+            .wait(Duration::from_secs(900))
             // AMI bring-up chicken-and-egg: the chart's post-install
             // hook smoke-tests through the gateway, which needs working
             // builder nodes, which need a validated AMI, which is what
             // we're trying to deploy to test. --deploy-no-hooks skips
             // the hook so the chart lands; operator runs `k8s qa --health`
-            // manually once nodes are up.
-            .no_hooks(no_hooks)
-            .run()
-            .await;
+            // manually once nodes are up. Migrations are NOT affected:
+            // rio-migrate is a plain Job, not a hook — it applies and
+            // runs on every deploy regardless of this flag.
+            .no_hooks(no_hooks);
+        if !express_zones.is_empty() {
+            helm_cmd = helm_cmd
+                .set("store.chunkBackend.kind", "tiered")
+                .set_json(
+                    "store.chunkBackend.expressBuckets",
+                    express_buckets_json.as_str(),
+                )
+                .set_json("karpenter.expressZones", express_zones_json.as_str());
+        }
+        if let Some(arn) = &controller_arn {
+            helm_cmd = helm_cmd.set(
+                r"controller.serviceAccount.annotations.eks\.amazonaws\.com/role-arn",
+                arn,
+            );
+        }
+        if !opts.pg_password_mode {
+            // RDS IAM auth by default: the rio-migrate Job runs as
+            // the master and provisions the rio_app role + grants
+            // (ensure_roles) before app pods (re)start, so even a
+            // fresh cluster deploys directly in iam mode — no
+            // password-first transitional deploy. Chart default stays
+            // `password` for k3s/dev where there is no Aurora.
+            helm_cmd = helm_cmd.set("postgres.authMode", "iam");
+        }
+        let r = helm_cmd.run().await;
         progress.abort();
+        if let Err(e) = &r {
+            // A failed migration surfaces as a --wait timeout with
+            // crash-looping Deployments instead of a named hook
+            // failure — print the Job + migrate-pod state so the
+            // operator doesn't have to reconstruct it.
+            warn!("helm upgrade failed: {e:#}; dumping rio-migrate state");
+            print_migrate_diagnostics();
+        }
         r
     })
     .await?;
@@ -341,6 +417,25 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         wait_drift_settled(&client, DRIFT_SKIP_NODEPOOLS).await?;
     }
     Ok(())
+}
+
+/// On deploy failure: dump migrate-Job status + last rio-migrate pod
+/// log tail. Best-effort — every command error is swallowed (we are
+/// already on the error path).
+fn print_migrate_diagnostics() {
+    let Ok(sh) = crate::sh::shell() else { return };
+    if let Ok(jobs) = crate::sh::read(crate::sh::cmd!(
+        sh,
+        "kubectl -n {NS} get jobs -l app.kubernetes.io/name=rio-migrate -o wide"
+    )) {
+        warn!("rio-migrate Jobs:\n{jobs}");
+    }
+    if let Ok(logs) = crate::sh::read(crate::sh::cmd!(
+        sh,
+        "kubectl -n {NS} logs -l app.kubernetes.io/name=rio-migrate --tail=30 --prefix --ignore-errors"
+    )) {
+        warn!("rio-migrate pod logs (tail):\n{logs}");
+    }
 }
 
 /// NodePools whose NodeClaims `--wait-drift` ignores. `rio-general`

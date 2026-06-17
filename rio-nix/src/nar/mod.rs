@@ -23,12 +23,15 @@
 //! - `writer` — [`serialize`] ([`NarNode`] tree → NAR bytes)
 //! - `fs` — streaming filesystem ↔ NAR ([`dump_path_streaming`],
 //!   [`restore_path_streaming`])
+//! - `frame` — bare framing emitters for external walkers (ADR-022 §6)
 
 use std::io;
 
 use thiserror::Error;
 
+pub mod frame;
 mod fs;
+mod ls;
 mod reader;
 mod sync_wire;
 mod writer;
@@ -36,10 +39,11 @@ mod writer;
 #[cfg(test)]
 mod tests;
 
+pub use fs::{WalkObserver, dump_path_observed, dump_path_streaming, restore_path_streaming};
 #[cfg(any(test, feature = "test-oracle"))]
 #[doc(hidden)]
 pub use fs::{dump_path, extract_to_path};
-pub use fs::{dump_path_streaming, restore_path_streaming};
+pub use ls::{NarEntryKind, NarLsEntry, nar_ls};
 pub use reader::{extract_single_file, parse};
 pub use writer::serialize;
 
@@ -54,20 +58,58 @@ pub(super) const NAR_MAGIC: &str = "nix-archive-1";
 pub(super) const MAX_CONTENT_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Maximum allowed NAR entry name length.
-pub(super) const MAX_NAME_LEN: u64 = 256;
+///
+/// Public because the castore validation boundary (rio-store's
+/// Directory-tree walk, rio-proto's `validate_directory`) MUST enforce
+/// the same bound: a tree the NAR reader would reject must never be
+/// committable, or the store serves a path whose regenerated NAR its
+/// own reader (and Nix's) refuses to import. Same rationale for every
+/// other `pub` limit below.
+pub const MAX_NAME_LEN: u64 = 256;
 
 /// Maximum allowed symlink target length.
-pub(super) const MAX_TARGET_LEN: u64 = 4096;
+pub const MAX_TARGET_LEN: u64 = 4096;
 
 /// Maximum NAR directory nesting depth. Nix's PATH_MAX is 4096; with the
 /// 1-char minimum entry name plus separator that caps legitimate nesting
 /// at ~2048, but no real store path approaches 256 components.
 /// Each level costs ~300 bytes of stack; 256 * 300 = 77 KiB, well within
 /// the 2 MiB thread stack.
-pub(super) const MAX_NAR_DEPTH: usize = 256;
+pub const MAX_NAR_DEPTH: usize = 256;
 
-/// Maximum number of directory entries (DoS prevention for unbounded allocation).
-pub(super) const MAX_DIRECTORY_ENTRIES: usize = 1_048_576;
+/// Maximum number of entries in a single directory (DoS prevention for
+/// unbounded allocation).
+pub const MAX_DIRECTORY_ENTRIES: usize = 1_048_576;
+
+/// Maximum total number of entries (files + directories + symlinks)
+/// across one whole archive.
+///
+/// [`MAX_DIRECTORY_ENTRIES`] bounds one directory; nothing else bounds
+/// the tree as a whole, and the store sizes its index materialization
+/// and its GetPath framing-regeneration walk for this many nodes. The
+/// value matches the per-directory cap: the largest known real store
+/// paths (large source FODs) run 300–500k entries, so 1M total leaves
+/// ~2–3× headroom while keeping the worst-case `nar_index` entry list
+/// and the regeneration walk bounded.
+pub const MAX_NAR_ENTRIES: usize = 1_048_576;
+
+/// Maximum cumulative bytes of materialized per-entry index data
+/// (`/`-joined entry paths plus symlink targets) for one archive.
+///
+/// The per-axis limits compose badly: at [`MAX_NAR_DEPTH`] × 256-byte
+/// names a single leaf's joined path is ~64 KiB while its NAR framing
+/// is ~200 bytes, so a few-hundred-MB NAR can legally expand to tens of
+/// GB of index entries (~350× amplification) in every ingest path. This
+/// cap bounds the expansion before it is allocated. 128 MiB keeps the
+/// encoded `nar_index` (paths + targets + a bounded per-entry overhead
+/// of fixed fields) under the 256 MiB default gRPC message ceiling it
+/// must later be served through — rio-store compile-asserts that fit
+/// next to its `nar_index` encoder — and gives ~2–3× headroom over the
+/// largest known real store paths (300–500k entries × ~100 B of path).
+/// `RIO_GRPC_MAX_MESSAGE_SIZE` can lower the serving ceiling below the
+/// default at runtime; staying under such a reduced ceiling is the
+/// operator's concern, not this constant's.
+pub const MAX_NAR_INDEX_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Errors from NAR operations.
 #[derive(Debug, Error)]
@@ -89,6 +131,15 @@ pub enum NarError {
 
     #[error("directory entry count {0} exceeds maximum {MAX_DIRECTORY_ENTRIES}")]
     TooManyEntries(usize),
+
+    #[error("total archive entry count {0} exceeds maximum {MAX_NAR_ENTRIES}")]
+    TooManyTotalEntries(usize),
+
+    #[error(
+        "cumulative entry path/target bytes {0} exceed maximum {MAX_NAR_INDEX_BYTES} \
+         (archive expands to an index larger than the store can persist or serve)"
+    )]
+    IndexBytesTooLarge(u64),
 
     #[error("non-zero padding byte after {0}-byte field")]
     NonZeroPadding(usize),

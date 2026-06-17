@@ -24,6 +24,9 @@ rio-scheduler.workspace = true
 # `SlaStatusResponse` for `gate_b_t_ref` (bug_032: gate_b must call
 # `DurationFit::t_at` via the typed status, not re-derive the curve).
 rio-proto.workspace = true
+# `jwt::sign` for `k8s build-tunnel` — the token must be minted by the
+# exact code the cluster verifies, not a re-implementation.
+rio-auth.workspace = true
 # CLI + config
 clap = { workspace = true, features = ["derive", "env"] }
 clap-verbosity-flag.workspace = true
@@ -55,7 +58,15 @@ aws-sdk-ecr.workspace = true
 aws-sdk-elasticloadbalancingv2.workspace = true
 
 # Kubernetes
-kube = { workspace = true, features = ["runtime", "client", "ws"] }
+# http-proxy: Client::try_default behind a corp proxy / sandbox bridge
+# would otherwise fail at config-load with "configured proxy ... requires
+# the disabled feature kube/http-proxy" (and does not honor NO_PROXY).
+kube = { workspace = true, features = [
+  "runtime",
+  "client",
+  "ws",
+  "http-proxy",
+] }
 k8s-openapi.workspace = true
 
 # HTTP
@@ -88,6 +99,7 @@ human-panic.workspace = true
 anyhow.workspace = true
 
 # Utility
+uuid.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
 scopeguard.workspace = true

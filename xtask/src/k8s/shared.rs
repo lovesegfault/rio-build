@@ -51,6 +51,125 @@ pub const NIX_SSHOPTS_BASE: &str = "-o StrictHostKeyChecking=no -o UserKnownHost
      -o ControlMaster=no -o ControlPath=none \
      -o IdentityAgent=none -o IdentitiesOnly=yes";
 
+/// I-161: warm the eval cache so a subsequent ssh-ng build's
+/// connection doesn't sit idle during cold `--impure` eval. nix opens
+/// the connection on first remote query, then evaluates locally; over
+/// SSM port-forward, server-originated keepalive replies don't
+/// reliably round-trip when there's zero client→server data, so the
+/// gateway drops the session at 120s while nix is still evaluating.
+/// Pre-evaluating shrinks the connect→submit window to <5s.
+///
+/// `envs` is set on the nix process — fsbench threads `FSBENCH_SEED`
+/// through both this pre-eval and the build itself so both instantiate
+/// the same drv (a mismatch would cold-eval on the build's connection,
+/// re-opening the I-161 window).
+///
+/// Returns the instantiated .drv path on success: fsbench matches it
+/// against `DebugExecutorState.running_build` for build→node
+/// attribution. Failure is non-fatal (warn + `None`) — the build can
+/// still succeed on a cold eval, it just risks the idle-window drop.
+pub fn pre_eval_installable(installable: &str, envs: &[(&str, &str)]) -> Option<String> {
+    tracing::info!("pre-evaluating {installable} (cold-eval can take ~2min)");
+    let mut cmd = std::process::Command::new("nix");
+    cmd.args(["path-info", "--derivation", "--impure", installable]);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let pre_eval = match cmd.output() {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::warn!("pre-eval spawn failed (continuing): {e}");
+            return None;
+        }
+    };
+    if !pre_eval.status.success() {
+        tracing::warn!(
+            "pre-eval failed (continuing): {}",
+            std::str::from_utf8(&pre_eval.stderr)
+                .unwrap_or("<non-utf8 stderr>")
+                .trim()
+        );
+        return None;
+    }
+    std::str::from_utf8(&pre_eval.stdout)
+        .ok()?
+        .lines()
+        .find(|l| l.trim_end().ends_with(".drv"))
+        .map(|l| l.trim().to_owned())
+}
+
+/// One remote ssh-ng build riding its own SSM tunnel. Both halves are
+/// drop-guarded: the tunnel is a [`ProcessGuard`] (killpg on drop), the
+/// nix child is `kill_on_drop` — holding this struct is what keeps the
+/// build alive.
+pub struct RemoteBuild {
+    /// Local port the tunnel actually bound (differs from the request
+    /// when 0/ephemeral was passed).
+    pub port: u16,
+    pub tunnel: ProcessGuard,
+    pub child: tokio::process::Child,
+}
+
+/// Establish a gateway tunnel and spawn `nix build --store ssh-ng://…`
+/// for `installable`, logging to `log_path`. Extracted from the stress
+/// harness so fsbench submits through the identical path (I-149/I-161
+/// SSH options, eval-store auto, --max-jobs 0). `port_req` 0 = the
+/// tunnel binds an ephemeral port; a fixed port gets its stale
+/// listeners reaped first.
+pub async fn spawn_remote_nix_build(
+    p: &dyn super::provider::Provider,
+    port_req: u16,
+    cfg: &XtaskConfig,
+    installable: &str,
+    log_path: &std::path::Path,
+    envs: &[(&str, &str)],
+) -> Result<RemoteBuild> {
+    use std::process::Stdio;
+
+    let key = crate::ssh::privkey_path(cfg)?;
+    if port_req != 0 {
+        kill_port_listeners(port_req);
+    }
+    let (port, tunnel) = p.tunnel(port_req).await?;
+
+    let log_file = std::fs::File::create(log_path)?;
+    let log_err = log_file.try_clone()?;
+    let store = format!(
+        "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",
+        key.display()
+    );
+
+    let mut cmd = tokio::process::Command::new("nix");
+    cmd.args(["build", "--store", &store, "--eval-store", "auto"])
+        .arg(installable)
+        // -L: stream build logs to stderr. Without it, redirected
+        // stderr stays empty until the first `copying path` line —
+        // ~2.5min of silence on cold-cache eval (I-051).
+        .args(["--impure", "--no-link", "-L", "--max-jobs", "0"])
+        // I-149/I-161: see [`NIX_SSHOPTS_BASE`].
+        .env("NIX_SSHOPTS", NIX_SSHOPTS_BASE)
+        .stdin(Stdio::null())
+        .stdout(log_file)
+        .stderr(log_err)
+        .kill_on_drop(true);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("spawn nix build (installable: {installable})"))?;
+    tracing::info!(
+        "build[{port}]: pid={} → {}",
+        child.id().unwrap_or(0),
+        log_path.display()
+    );
+    Ok(RemoteBuild {
+        port,
+        tunnel,
+        child,
+    })
+}
+
 /// Subcharts listed in Chart.yaml's `dependencies:`. Helm validates
 /// charts/ against Chart.yaml BEFORE evaluating `condition: *.enabled`,
 /// so every entry must be symlinked even when disabled for a given
@@ -404,8 +523,16 @@ pub async fn ensure_jwt_keypair(client: &kube::Client) -> Result<JwtKeypair> {
     // Derive pubkey from seed. `SigningKey::from_bytes` takes the raw
     // 32-byte seed; `verifying_key().to_bytes()` gives the 32-byte pub.
     // Both match what gateway/scheduler expect per `_helpers.tpl`.
+    let sk = decode_jwt_seed(&seed)?;
+    let pubkey = B64.encode(sk.verifying_key().to_bytes());
+    Ok(JwtKeypair { seed, pubkey })
+}
+
+/// Decode the b64 `ed25519_seed` value from the `rio-jwt-signing`
+/// Secret into a signing key.
+fn decode_jwt_seed(seed_b64: &str) -> Result<ed25519_dalek::SigningKey> {
     let raw: [u8; 32] = B64
-        .decode(&seed)
+        .decode(seed_b64)
         .context("rio-jwt-signing secret ed25519_seed is not valid base64")?
         .try_into()
         .map_err(|v: Vec<u8>| {
@@ -414,9 +541,22 @@ pub async fn ensure_jwt_keypair(client: &kube::Client) -> Result<JwtKeypair> {
                 v.len()
             )
         })?;
-    let sk = ed25519_dalek::SigningKey::from_bytes(&raw);
-    let pubkey = B64.encode(sk.verifying_key().to_bytes());
-    Ok(JwtKeypair { seed, pubkey })
+    Ok(ed25519_dalek::SigningKey::from_bytes(&raw))
+}
+
+/// Read the gateway's JWT signing key from the live `rio-jwt-signing`
+/// Secret. Unlike [`ensure_jwt_keypair`], never generates one — a
+/// token minted under a key the cluster doesn't verify with would just
+/// fail every RPC with `UNAUTHENTICATED`, so a missing Secret is the
+/// caller's problem to surface, not paper over.
+pub async fn jwt_signing_key(client: &kube::Client) -> Result<ed25519_dalek::SigningKey> {
+    let seed = kube::get_secret_key(client, NS, "rio-jwt-signing", "ed25519_seed")
+        .await?
+        .context(
+            "Secret rio-jwt-signing not found — the cluster has no JWT signing key \
+             (deploy with `cargo xtask k8s up --deploy` first)",
+        )?;
+    decode_jwt_seed(&seed)
 }
 
 /// Label selector matching every rio Deployment. Set by the chart's
@@ -450,10 +590,10 @@ pub async fn rollout_restart_rio(client: &kube::Client) -> Result<()> {
 /// Reaps stale `session-manager-plugin` / `kubectl port-forward`
 /// children that a SIGKILL'd or panicked xtask left bound. ProcessGuard
 /// only fires on clean drop; the stress harness's `setsid nohup` path
-/// leaks tunnels by design (I-128 QA sessions). A new SSM tunnel on an
+/// leaks tunnels by design (I-128 QA sessions). A new tunnel on an
 /// occupied port either fails to bind or — worse — the old listener
-/// accepts and forwards to a stale NLB, surfacing as the "unexpected
-/// packet type 80" SSH error.
+/// accepts and forwards to a stale target, surfacing as the
+/// "unexpected packet type 80" SSH error.
 pub fn kill_port_listeners(port: u16) {
     use ::nix::sys::signal::{Signal, kill};
     use ::nix::unistd::Pid;
@@ -489,12 +629,11 @@ pub fn kill_port_listeners(port: u16) {
 /// port-forward and SSM tunnel processes in smoke tests.
 ///
 /// I-158: `aws ssm start-session` spawns `session-manager-plugin` as a
-/// grandchild. The previous `start_kill()` only SIGTERM'd the direct
-/// `aws` child; the python wrapper doesn't reliably propagate, so the
-/// plugin orphaned (ppid→1) and kept the local port bound. Next run
-/// either fails to bind or — worse — the stale listener forwards to
-/// the OLD NLB ("unexpected packet type 80"). [`spawn`](Self::spawn)
-/// puts the child in its own group; Drop kills the whole group.
+/// grandchild; SIGTERM on the direct child doesn't reliably propagate
+/// (python wrapper), so the plugin orphans (ppid→1) and keeps the
+/// port bound — same "type 80" failure as [`kill_port_listeners`].
+/// [`spawn`](Self::spawn) puts the child in its own group; Drop kills
+/// the whole group.
 pub struct ProcessGuard {
     pub child: tokio::process::Child,
     /// pgid == child's pid (process_group(0) makes the child a group
@@ -533,6 +672,7 @@ impl Drop for ProcessGuard {
 /// Spawn `kubectl port-forward <target> <local>:<remote>` in `ns` and
 /// return `(bound_local_port, drop-guard)`. `target` is the full
 /// kubectl resource ref (`svc/rio-gateway`, `pod/rio-scheduler-abc`).
+/// Long-lived gateway tunnels use [`super::ssm`] instead.
 ///
 /// Pass `local = 0` for an ephemeral port: kubectl binds `:0`, the OS
 /// picks a free port, and we parse it from the `Forwarding from
@@ -649,37 +789,18 @@ fn bytes_to_memfd_round_trips_via_dev_fd() {
     assert_eq!(std::fs::read(&path).unwrap(), b"k");
 }
 
-/// Port-forward scheduler:9001 + store:9002, wait for TCP accept on both.
-/// Shared by all three providers — kubectl reaches the apiserver proxy
-/// regardless of whether that's via k3s loopback or `aws eks
-/// update-kubeconfig`. ADR-019: scheduler is in rio-system, store in
-/// rio-store — per-service `-n`. Scheduler forward targets the leader
-/// pod (from the Lease) because standbys reject admin writes.
-///
-/// Returns `((sched_port, guard), (store_port, guard))` — the bound
-/// local ports may differ from the inputs when `0` (ephemeral) was
-/// passed. Callers must use the RETURNED ports for the connection.
-pub async fn tunnel_grpc(
-    sched_port: u16,
-    store_port: u16,
-) -> Result<((u16, ProcessGuard), (u16, ProcessGuard))> {
-    let client = kube::client().await?;
-    // helm --wait returns when the NEW scheduler pods are Ready, but
-    // the Lease may still name the OLD pod (terminationGracePeriod;
-    // release is on the shutdown path). Port-forwarding to a
-    // Terminating pod succeeds AND passes the TCP-accept probe below
-    // — then dies mid-RPC, surfacing as `transport error` from
-    // rio-cli. `scheduler_leader` rejects non-live holders; surface
-    // the reason and keep polling until the new leader has acquired.
-    let leader = ui::poll_debug("scheduler lease holder", Duration::from_secs(2), 30, || {
+/// Poll for a live scheduler-leader pod. helm --wait returns when the
+/// NEW pods are Ready, but the Lease may still name the OLD pod
+/// (release is on the shutdown path); tunnelling to a Terminating pod
+/// passes the TCP-accept probe then dies mid-RPC. `scheduler_leader`
+/// rejects non-live holders; this polls until the new leader has
+/// acquired. Bails immediately when no scheduler pods exist
+/// (post-`--wipe`, pre-deploy) so callers' Err arm engages instead of
+/// 30×2s of dead polling.
+pub async fn wait_scheduler_leader(client: &kube::Client) -> Result<String> {
+    ui::poll_debug("scheduler lease holder", Duration::from_secs(2), 30, || {
         let c = client.clone();
         async move {
-            // Post-`--wipe` the Lease may name a deleted pod while NO
-            // scheduler pods exist yet (deploy preflight runs before
-            // helm install). Polling 30×2s for a leader that cannot
-            // appear just spams the log; bail so the caller's Err arm
-            // (status::gather records it; CliCtx callers surface it)
-            // engages immediately.
             if kube::count_pods(&c, NS, "app.kubernetes.io/name=rio-scheduler").await? == 0 {
                 bail!("no rio-scheduler pods exist; skipping leader wait");
             }
@@ -692,10 +813,35 @@ pub async fn tunnel_grpc(
             }
         }
     })
-    .await?;
-    let leader = format!("pod/{leader}");
-    let sched = port_forward(NS, &leader, sched_port, 9001).await?;
-    let store = port_forward(super::NS_STORE, "svc/rio-store", store_port, 9002).await?;
+    .await
+}
+
+/// Tunnel scheduler:9001 + store:9002, wait for TCP accept on both.
+/// ADR-019: scheduler is in rio-system, store in rio-store. Scheduler
+/// targets the leader pod (standbys reject admin writes). EKS uses SSM
+/// per-pod-node ([`super::ssm::tunnel_pod`]); k3s falls back to
+/// kubectl. Returns the BOUND ports (differ from inputs when
+/// `0`/ephemeral was passed).
+pub async fn tunnel_grpc(
+    sched_port: u16,
+    store_port: u16,
+) -> Result<((u16, ProcessGuard), (u16, ProcessGuard))> {
+    let client = kube::client().await?;
+    let leader = wait_scheduler_leader(&client).await?;
+    let (sched, store) = if super::ssm::relay().await.is_some() {
+        let store_pod =
+            kube::one_running_pod(&client, super::NS_STORE, "app.kubernetes.io/name=rio-store")
+                .await?;
+        (
+            super::ssm::tunnel_pod(&client, NS, &leader, 9001, sched_port).await?,
+            super::ssm::tunnel_pod(&client, super::NS_STORE, &store_pod, 9002, store_port).await?,
+        )
+    } else {
+        (
+            port_forward(NS, &format!("pod/{leader}"), sched_port, 9001).await?,
+            port_forward(super::NS_STORE, "svc/rio-store", store_port, 9002).await?,
+        )
+    };
     let (sp, tp) = (sched.0, store.0);
     ui::poll_debug(
         "scheduler+store TCP accept",
@@ -785,6 +931,21 @@ mod tests {
         // Matches what operators pass via `openssl rand -base64 32`.
         let seed = B64.encode([0u8; 32]);
         assert_eq!(seed.len(), 44);
+    }
+
+    #[test]
+    fn decode_jwt_seed_validates_length() {
+        // A truncated/corrupt Secret value must error with the byte
+        // count, not panic or silently produce a wrong key.
+        let err = decode_jwt_seed(&B64.encode([0u8; 16])).unwrap_err();
+        assert!(err.to_string().contains("16 bytes"), "{err}");
+        // Round-trip: same seed bytes → same pubkey as direct from_bytes.
+        let raw = [7u8; 32];
+        let sk = decode_jwt_seed(&B64.encode(raw)).unwrap();
+        assert_eq!(
+            sk.verifying_key(),
+            ed25519_dalek::SigningKey::from_bytes(&raw).verifying_key()
+        );
     }
 
     /// I-158 regression: ProcessGuard must kill GRANDCHILDREN. The

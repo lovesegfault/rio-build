@@ -11,7 +11,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::backend::{ChunkBackend, FilesystemChunkBackend, S3ChunkBackend};
+use crate::backend::{ChunkBackend, FilesystemChunkBackend, S3ChunkBackend, TieredChunkBackend};
 use crate::cas::ChunkCache;
 use rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS;
 
@@ -40,6 +40,22 @@ pub enum ChunkBackendKind {
     /// (env vars, instance profile, etc) — NOT in this config. We're
     /// not putting secrets in a TOML file.
     S3 { bucket: String, prefix: String },
+    /// Two-tier: per-AZ S3 Express read-through cache over authoritative
+    /// S3 standard. `express_bucket = None` (or unset) degrades to the
+    /// plain `S3` shape — replicas in AZs without Express still
+    /// function. The Express bucket is per-AZ; helm wires the right one
+    /// via the node's `topology.kubernetes.io/zone` label (P0554).
+    /// See ADR-023 (tiered chunk backend).
+    Tiered {
+        /// Authoritative S3 standard bucket.
+        bucket: String,
+        /// Key prefix shared by both tiers.
+        prefix: String,
+        /// Per-AZ S3 Express directory bucket (`*--x-s3` suffix).
+        /// `None` = no cache tier in this AZ.
+        #[serde(default)]
+        express_bucket: Option<String>,
+    },
 }
 
 // r[impl store.netpol.egress+2]
@@ -56,6 +72,10 @@ pub struct Config {
     pub listen_addr: std::net::SocketAddr,
     /// PostgreSQL connection URL. Required.
     pub database_url: String,
+    /// PostgreSQL authentication mode (`RIO_PG_AUTH`): `password`
+    /// (default, embedded in `database_url`) or `iam` (RDS IAM auth,
+    /// see `rio_common::config::PgAuthMode`).
+    pub pg_auth: rio_common::config::PgAuthMode,
     #[serde(flatten)]
     pub common: rio_common::config::CommonConfig,
     /// Where chunks live. Default: inline (no backend). See
@@ -69,9 +89,11 @@ pub struct Config {
     /// Global NAR reassembly buffer budget in bytes — total permits
     /// across ALL concurrent PutPath handlers. Each handler acquires
     /// `chunk.len()` permits before extending its accumulation Vec.
-    /// None → DEFAULT_NAR_BUDGET (8 × MAX_NAR_SIZE = 32 GiB). Lower
-    /// this on small-memory nodes; raise it if you have >8 concurrent
-    /// max-size uploads and RAM to match.
+    /// None → DEFAULT_NAR_BUDGET (8 × MAX_NAR_SIZE = 32 GiB). Must be
+    /// ≥ MAX_NAR_SIZE (4 GiB) — a smaller budget deadlocks any caller
+    /// charging a NAR larger than the budget. Lower toward MAX_NAR_SIZE
+    /// on small-memory nodes (concurrency drops to 1); raise it if you
+    /// have >8 concurrent max-size uploads and RAM to match.
     pub nar_buffer_budget_bytes: Option<u64>,
     /// ed25519 narinfo signing key path (Nix secret-key format:
     /// `name:base64-seed`). None = signing disabled (paths stored
@@ -154,6 +176,7 @@ impl Default for Config {
         Self {
             listen_addr: rio_common::default_addr(9002),
             database_url: String::new(),
+            pg_auth: rio_common::config::PgAuthMode::default(),
             common: rio_common::config::CommonConfig::new(9092),
             chunk_backend: ChunkBackendKind::default(),
             // 2 GiB. Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES
@@ -197,12 +220,33 @@ pub fn derive_substitute_admission_cap(pg_max: u32) -> usize {
     (pg_max as usize * 3).clamp(64, 128)
 }
 
+/// One-shot subcommands sharing the rio-store binary. `migrate` exists
+/// so the migration runners (helm `rio-migrate` Job, NixOS
+/// `rio-migrate` systemd oneshot) need no dedicated docker image —
+/// they reuse the store image with `args: ["migrate"]`.
+#[derive(clap::Subcommand, Clone, Copy)]
+pub enum StoreCommand {
+    /// Apply database migrations (`RIO_DATABASE_URL`) and exit.
+    Migrate,
+}
+
 #[derive(Parser, Serialize, Default)]
 #[command(
     name = "rio-store",
     about = "NAR content-addressable store for rio-build"
 )]
 pub struct CliArgs {
+    /// No subcommand → serve. Handled in main() BEFORE
+    /// `rio_common::server::bootstrap` — a migrate run needs no
+    /// metrics exporter, no full Config (which would demand
+    /// store-specific fields a migration never touches), just the
+    /// database URL. `serde(skip)`: CliArgs doubles as the CLI
+    /// overlay layer of `rio_common::config::load`; a subcommand is
+    /// not config.
+    #[command(subcommand)]
+    #[serde(skip)]
+    pub command: Option<StoreCommand>,
+
     /// gRPC listen address
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -225,7 +269,7 @@ impl rio_common::config::ValidateConfig for Config {
     /// meets that bar is checked here.
     fn validate(&self) -> anyhow::Result<()> {
         use rio_common::config::ensure_required as required;
-        use rio_common::limits::MIN_NAR_CHUNK_CHARGE;
+        use rio_common::limits::MAX_NAR_SIZE;
         required(&self.database_url, "database_url", "store")?;
         // 0 → buffer_unordered(0) returns Pending forever (no waker):
         // every put_chunked silently hangs the data plane.
@@ -240,14 +284,16 @@ impl rio_common::config::ValidateConfig for Config {
             self.s3_max_attempts >= 1,
             "s3_max_attempts must be >= 1; set RIO_S3_MAX_ATTEMPTS"
         );
-        // < MIN_NAR_CHUNK_CHARGE → Semaphore::new(n<256); every PutPath
-        // acquire_many(chunk.len().max(256)) is Pending forever. There
-        // is no "unlimited" sentinel; unset for the 32 GiB default.
+        // < MAX_NAR_SIZE → `acquire_many(n)` for a NAR sized in
+        // (budget, MAX_NAR_SIZE] parks forever (not error) and
+        // FIFO-blocks everything queued behind it. `limits.rs`
+        // documents budget >= MAX_NAR_SIZE as the no-self-deadlock
+        // invariant; enforce it at boot, not at the first 4 GiB NAR.
         anyhow::ensure!(
             self.nar_buffer_budget_bytes
-                .is_none_or(|b| b >= MIN_NAR_CHUNK_CHARGE as u64),
-            "nar_buffer_budget_bytes must be >= {MIN_NAR_CHUNK_CHARGE} \
-             (smaller hangs all uploads); unset RIO_NAR_BUFFER_BUDGET_BYTES \
+                .is_none_or(|b| b >= MAX_NAR_SIZE),
+            "nar_buffer_budget_bytes must be >= MAX_NAR_SIZE ({MAX_NAR_SIZE}) \
+             (smaller deadlocks uploads); unset RIO_NAR_BUFFER_BUDGET_BYTES \
              for the 32 GiB default — there is no 'unlimited' sentinel"
         );
         // 0 → PgPoolOptions max_connections(0) → PoolTimedOut after 30s
@@ -332,6 +378,43 @@ pub async fn init_chunk_backend(
                 cache_capacity_bytes,
             )))
         }
+        ChunkBackendKind::Tiered {
+            bucket,
+            prefix,
+            express_bucket,
+        } => {
+            info!(
+                %bucket,
+                %prefix,
+                express_bucket = express_bucket.as_deref().unwrap_or("<none>"),
+                s3_max_attempts,
+                "chunk backend: tiered (S3 standard + per-AZ Express cache)"
+            );
+            // Different retry budgets per tier. Remote is authoritative
+            // — a failed read there means "data unreachable", worth the
+            // full `s3_max_attempts` (default 10). Express is a
+            // best-effort cache that must fall through quickly on
+            // throttle/5xx; 2 attempts cover a transient connection
+            // reset, anything worse shows up in
+            // `rio_store_tiered_local_errors_total`. Both clients share
+            // the env credential/region chain; the SDK routes Express
+            // traffic by the `--x-s3` bucket-name suffix.
+            const EXPRESS_MAX_ATTEMPTS: u32 = 2;
+            let remote_client = rio_common::s3::default_client(s3_max_attempts).await;
+            let remote = S3ChunkBackend::new(remote_client, bucket.clone(), prefix.clone());
+            let local = match express_bucket {
+                Some(b) => {
+                    let local_client = rio_common::s3::default_client(EXPRESS_MAX_ATTEMPTS).await;
+                    Some(S3ChunkBackend::new(local_client, b.clone(), prefix.clone()))
+                }
+                None => None,
+            };
+            let backend: Arc<dyn ChunkBackend> = Arc::new(TieredChunkBackend::new(local, remote));
+            Some(Arc::new(ChunkCache::with_capacity(
+                backend,
+                cache_capacity_bytes,
+            )))
+        }
     })
 }
 
@@ -340,34 +423,10 @@ mod tests {
     use super::*;
     use rio_common::config::ValidateConfig as _;
 
-    #[test]
-    fn config_defaults_are_stable() {
-        let d = Config::default();
-        assert_eq!(d.listen_addr.to_string(), "[::]:9002");
-        assert_eq!(d.common.metrics_addr.to_string(), "[::]:9092");
-        assert!(d.database_url.is_empty());
-        // Chunk backend off by default for backward-compat with pre-chunking configs.
-        assert!(matches!(d.chunk_backend, ChunkBackendKind::Inline));
-        // Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES. If that
-        // constant changes, update this — the test catches drift.
-        assert_eq!(d.chunk_cache_capacity_bytes, 2 * 1024 * 1024 * 1024);
-        // NAR budget override: None → DEFAULT_NAR_BUDGET (grpc/mod.rs).
-        assert!(d.nar_buffer_budget_bytes.is_none());
-        assert!(d.signing_key_path.is_none());
-        // with the pre-allowlist hardcoded CN check).
-        assert_eq!(d.common.drain_grace, std::time::Duration::from_secs(6));
-        // JWT verification off by default (interceptor inert until
-        // ConfigMap mount configured via RIO_JWT__KEY_PATH).
-        assert!(d.jwt.key_path.is_none());
-        assert!(!d.jwt.required);
-        assert_eq!(d.max_batch_paths, crate::grpc::DEFAULT_MAX_BATCH_PATHS);
-        // r[verify store.get.chunk-prefetch]
-        assert_eq!(d.chunk_prefetch_k, 64);
-        assert_eq!(d.stream_drain, std::time::Duration::from_secs(90));
-        assert_eq!(d.pg_max_connections, DEFAULT_PG_MAX_CONNECTIONS);
-        // None → main.rs derives via derive_substitute_admission_cap.
-        assert!(d.substitute_admission_permits.is_none());
-    }
+    // Default VALUES are pinned once, by the config-schema fixture
+    // (`config_schema_frozen!` in tests/config_schema.rs); the
+    // `jail_defaults!` block below covers env-clean parsing. A third
+    // hand-written pin of the same defaults only added drift surface.
 
     #[test]
     fn derive_admission_cap_clamps() {
@@ -427,17 +486,27 @@ mod tests {
         assert!(err.contains("nar_buffer_budget_bytes"), "got: {err}");
     }
 
-    /// Any budget < MIN_NAR_CHUNK_CHARGE has identical Pending-forever
-    /// behavior because `acquire_many` floors at 256.
+    /// Any budget < MAX_NAR_SIZE makes `acquire_many(total)` for a
+    /// legal NAR sized in (budget, MAX_NAR_SIZE] park forever.
     #[test]
-    fn validate_rejects_sub_min_nar_budget() {
-        let cfg = Config {
+    fn validate_rejects_budget_below_max_nar_size() {
+        use rio_common::limits::MAX_NAR_SIZE;
+        for bad in [100u64, MAX_NAR_SIZE - 1] {
+            let cfg = Config {
+                database_url: "postgres://x".into(),
+                nar_buffer_budget_bytes: Some(bad),
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("nar_buffer_budget_bytes"), "got: {err}");
+        }
+        // Exactly MAX_NAR_SIZE is the floor (concurrency = 1).
+        let at_floor = Config {
             database_url: "postgres://x".into(),
-            nar_buffer_budget_bytes: Some(100),
+            nar_buffer_budget_bytes: Some(MAX_NAR_SIZE),
             ..Default::default()
         };
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("nar_buffer_budget_bytes"), "got: {err}");
+        assert!(at_floor.validate().is_ok());
         // None (unset) is fine — that's the 32 GiB default.
         let ok = Config {
             database_url: "postgres://x".into(),
@@ -567,6 +636,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chunk_backend_kind_toml_tiered() {
+        let cfg = parse_toml(
+            r#"
+            [chunk_backend]
+            kind = "tiered"
+            bucket = "rio-chunks"
+            prefix = "prod"
+            express_bucket = "rio-chunk-cache--use1-az4--x-s3"
+            "#,
+        );
+        match cfg.chunk_backend {
+            ChunkBackendKind::Tiered {
+                bucket,
+                prefix,
+                express_bucket,
+            } => {
+                assert_eq!(bucket, "rio-chunks");
+                assert_eq!(prefix, "prod");
+                assert_eq!(
+                    express_bucket.as_deref(),
+                    Some("rio-chunk-cache--use1-az4--x-s3")
+                );
+            }
+            other => panic!("expected Tiered, got {other:?}"),
+        }
+    }
+
+    /// `express_bucket` omitted → `None`. A replica scheduled in an AZ
+    /// without S3 Express runs degraded (S3-standard only, functional);
+    /// helm omits the key rather than supplying an empty string.
+    #[test]
+    fn chunk_backend_kind_toml_tiered_no_express() {
+        let cfg = parse_toml(
+            r#"
+            [chunk_backend]
+            kind = "tiered"
+            bucket = "rio-chunks"
+            prefix = ""
+            "#,
+        );
+        match cfg.chunk_backend {
+            ChunkBackendKind::Tiered { express_bucket, .. } => {
+                assert!(express_bucket.is_none());
+            }
+            other => panic!("expected Tiered, got {other:?}"),
+        }
+    }
+
     /// No [chunk_backend] section at all → default (Inline). This is
     /// the backward-compat path: pre-phase3a configs have no such
     /// section and should keep working.
@@ -621,6 +739,100 @@ mod tests {
                     assert_eq!(base_dir, PathBuf::from("/var/lib/chunks"));
                 }
                 other => panic!("expected Filesystem; got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    /// P0554 wires `express_bucket` from a per-pod env var (downward-API
+    /// `topology.kubernetes.io/zone` → AZ → bucket-name template). The
+    /// `Option<String>` field must round-trip via the env layer.
+    #[test]
+    fn chunk_backend_kind_env_tiered() {
+        rio_test_support::Jail::expect_with(|jail| {
+            jail.set_env("RIO_CHUNK_BACKEND__KIND", "tiered");
+            jail.set_env("RIO_CHUNK_BACKEND__BUCKET", "rio-chunks");
+            jail.set_env("RIO_CHUNK_BACKEND__PREFIX", "");
+            jail.set_env(
+                "RIO_CHUNK_BACKEND__EXPRESS_BUCKET",
+                "rio-chunk-cache--use1-az4--x-s3",
+            );
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            match cfg.chunk_backend {
+                ChunkBackendKind::Tiered {
+                    bucket,
+                    express_bucket,
+                    ..
+                } => {
+                    assert_eq!(bucket, "rio-chunks");
+                    assert_eq!(
+                        express_bucket.as_deref(),
+                        Some("rio-chunk-cache--use1-az4--x-s3")
+                    );
+                }
+                other => panic!("expected Tiered; got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    /// The EKS helm wiring splits `[chunk_backend]` across config
+    /// layers: kind/bucket/prefix arrive as `RIO_` env vars
+    /// (store.yaml), while the per-AZ `express_bucket` is written to
+    /// the TOML file layer by the express-bucket initContainer (pod
+    /// zone label → bucket lookup, ADR-023). The loader must merge the
+    /// table per-key across layers — a wholesale-replace would either
+    /// drop the express tier silently or fail tagged-enum
+    /// deserialization.
+    #[test]
+    fn chunk_backend_kind_env_plus_toml_express() {
+        rio_test_support::Jail::expect_with(|jail| {
+            jail.create_file(
+                "store.toml",
+                "[chunk_backend]\nexpress_bucket = \"rio-cache--use2-az1--x-s3\"\n",
+            )?;
+            jail.set_env("RIO_CHUNK_BACKEND__KIND", "tiered");
+            jail.set_env("RIO_CHUNK_BACKEND__BUCKET", "rio-chunks");
+            jail.set_env("RIO_CHUNK_BACKEND__PREFIX", "");
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            match cfg.chunk_backend {
+                ChunkBackendKind::Tiered {
+                    bucket,
+                    express_bucket,
+                    ..
+                } => {
+                    assert_eq!(bucket, "rio-chunks");
+                    assert_eq!(
+                        express_bucket.as_deref(),
+                        Some("rio-cache--use2-az1--x-s3"),
+                        "file-layer express_bucket must survive the env-layer merge"
+                    );
+                }
+                other => panic!("expected Tiered; got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    /// `EXPRESS_BUCKET` env var omitted → `express_bucket: None`.
+    /// Helm omits the var on AZs without S3 Express; the env layer must
+    /// surface the absence as `None` (via `#[serde(default)]`) rather
+    /// than failing tagged-enum deserialization on a missing key.
+    #[test]
+    fn chunk_backend_kind_env_tiered_no_express() {
+        rio_test_support::Jail::expect_with(|jail| {
+            jail.set_env("RIO_CHUNK_BACKEND__KIND", "tiered");
+            jail.set_env("RIO_CHUNK_BACKEND__BUCKET", "rio-chunks");
+            jail.set_env("RIO_CHUNK_BACKEND__PREFIX", "");
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            match cfg.chunk_backend {
+                ChunkBackendKind::Tiered { express_bucket, .. } => {
+                    assert!(
+                        express_bucket.is_none(),
+                        "absent EXPRESS_BUCKET env var must default to None"
+                    );
+                }
+                other => panic!("expected Tiered; got {other:?}"),
             }
             Ok(())
         });
@@ -720,6 +932,8 @@ mod tests {
             crate::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY
         );
         assert_eq!(cfg.s3_max_attempts, DEFAULT_S3_MAX_ATTEMPTS);
+        // r[verify store.get.chunk-prefetch]
+        assert_eq!(cfg.chunk_prefetch_k, 64);
     });
 
     // -----------------------------------------------------------------------

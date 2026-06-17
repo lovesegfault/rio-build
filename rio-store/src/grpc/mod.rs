@@ -45,14 +45,19 @@ use crate::substitute::{SubstituteError, Substituter};
 
 mod admin;
 mod chunk;
+mod directory;
+mod drv_blob;
 mod get_path;
 mod put_path;
 mod put_path_batch;
+mod put_path_chunked;
 mod queries;
 mod sign;
 
 pub use admin::StoreAdminServiceImpl;
-pub use chunk::ChunkServiceImpl;
+pub use chunk::{ChunkServiceImpl, GET_CHUNKS_K};
+pub use directory::DirectoryServiceImpl;
+pub use drv_blob::DrvBlobServiceImpl;
 
 /// Default cap on paths in a FindMissingPaths request (DoS guard).
 /// Matches `rio_nix::protocol::wire::MAX_COLLECTION_COUNT` — the gateway
@@ -183,6 +188,70 @@ pub(crate) fn putpath_metadata_status(context: &str, e: metadata::MetadataError)
     metadata_status(context, e)
 }
 
+/// Resolve the caller's tenant from a verified identity: gateway JWT
+/// (`TenantClaims.sub`) first, else the HMAC assignment token's
+/// `tenant` claim parsed as a UUID. `None` when neither carries a
+/// tenant (dev mode, service-token caller) or the claim does not
+/// parse.
+///
+/// This is the ONE mapping from caller identity to tenant, shared by
+/// the castore read side ([`directory::DirectoryServiceImpl`]'s
+/// `castore_tenant_id`) and the upload write side (`PutPathChunked`'s
+/// `path_tenants` junction inserts) — the read queries join
+/// `path_tenants` on exactly the tenant resolved here, so a write side
+/// that resolved the tenant differently (e.g. JWT-only) would commit
+/// paths its own uploader cannot read back.
+// r[impl store.castore.tenant-scope+3]
+fn resolve_tenant_id(
+    jwt_sub: Option<uuid::Uuid>,
+    hmac_claims: Option<&rio_auth::hmac::AssignmentClaims>,
+) -> Option<uuid::Uuid> {
+    jwt_sub.or_else(|| hmac_claims?.tenant.as_deref()?.parse().ok())
+}
+
+/// Drive a streaming-RPC drain future to completion, bounded by
+/// [`rio_common::grpc::GRPC_STREAM_TIMEOUT`].
+///
+/// Every server-streaming RPC spawns its producer task and hands tonic
+/// the channel receiver. A half-open client otherwise parks that task
+/// on `tx.send()` forever, pinning whatever the producer has buffered —
+/// `tonic_builder()` sets no h2 keepalive, so this stream timeout is
+/// the only backstop. On timeout: warn (RPC name + timeout) and push a
+/// `DEADLINE_EXCEEDED` into the stream for a client that is still
+/// reading.
+///
+/// The budget is ABSOLUTE — right for the streams this guards, whose
+/// total size is bounded (one NAR, one directory walk, one blob). It is
+/// wrong for `GetChunks`, where the client reuses one bidi stream for a
+/// whole file's fill and lifetime scales with file size: that RPC has
+/// its own IDLE-based watchdog (`chunk.rs`, `stream_idle_timeout`).
+///
+/// Returns `Some(output)` when the drain completed within the timeout,
+/// `None` when it timed out — callers layer site-specific logging or
+/// success-path metrics on top.
+pub(super) async fn drain_with_timeout<T, F: Future>(
+    rpc: &'static str,
+    tx: &tokio::sync::mpsc::Sender<Result<T, Status>>,
+    fut: F,
+) -> Option<F::Output> {
+    match tokio::time::timeout(rio_common::grpc::GRPC_STREAM_TIMEOUT, fut).await {
+        Ok(out) => Some(out),
+        Err(_) => {
+            tracing::warn!(
+                rpc,
+                timeout = ?rio_common::grpc::GRPC_STREAM_TIMEOUT,
+                "stream timed out"
+            );
+            let _ = tx
+                .send(Err(Status::deadline_exceeded(format!(
+                    "{rpc} stream timeout"
+                ))))
+                .await;
+            None
+        }
+    }
+}
+
 /// The StoreService gRPC server.
 ///
 /// NAR content lives in `manifests.inline_blob` (small NARs) or as
@@ -272,11 +341,26 @@ pub struct StoreServiceImpl {
     ///
     /// [`wait_for_active_drain`]: rio_common::server::wait_for_active_drain
     active_get_path_streams: Arc<std::sync::atomic::AtomicUsize>,
+    /// Bounded budget for waiting out a concurrent same-path uploader
+    /// before surfacing `ABORTED` (`r[store.put.concurrent-wait]`).
+    /// Default [`DEFAULT_CONCURRENT_PUT_WAIT`]; tests use millisecond
+    /// budgets via `.with_concurrent_put_wait()`.
+    concurrent_put_wait: std::time::Duration,
 }
 
 /// Default `GetPath` chunk-prefetch depth. See
 /// [`StoreServiceImpl::with_chunk_prefetch_k`].
 pub const DEFAULT_CHUNK_PREFETCH_K: usize = 64;
+
+/// Default budget for waiting out a concurrent same-path uploader
+/// (`r[store.put.concurrent-wait]`). Sized to cover a typical chunked
+/// S3 upload of a large NAR (tens of seconds) while staying well under
+/// `rio_common::grpc::GRPC_STREAM_TIMEOUT` (300 s) so a waiting loser
+/// resolves inside the client's own RPC deadline — the gateway's
+/// re-send retry (`gw.put.aborted-retry`, ~6 s spread over 8 attempts)
+/// then multiplies the effective coverage for pathologically slow
+/// winners.
+pub const DEFAULT_CONCURRENT_PUT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Default global NAR buffer budget: 8 × MAX_NAR_SIZE (32 GiB on 64-bit).
 /// `tokio::sync::Semaphore` max permits is `usize::MAX >> 3`; this fits
@@ -303,6 +387,7 @@ impl StoreServiceImpl {
             max_batch_paths: DEFAULT_MAX_BATCH_PATHS,
             chunk_prefetch_k: DEFAULT_CHUNK_PREFETCH_K,
             active_get_path_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            concurrent_put_wait: DEFAULT_CONCURRENT_PUT_WAIT,
         }
     }
 
@@ -333,8 +418,10 @@ impl StoreServiceImpl {
 
     /// Enable HMAC verification on PutPath assignment tokens.
     /// Builder-style — chains after `new()` or `with_chunk_cache()`.
-    pub fn with_hmac_verifier(mut self, verifier: rio_auth::hmac::HmacVerifier) -> Self {
-        self.hmac_verifier = Some(Arc::new(verifier));
+    /// Takes `Arc` so `main.rs` shares one verifier with
+    /// `DirectoryServiceImpl` (one copy of the key bytes in memory).
+    pub fn with_hmac_verifier(mut self, verifier: Arc<rio_auth::hmac::HmacVerifier>) -> Self {
+        self.hmac_verifier = Some(verifier);
         self
     }
 
@@ -406,6 +493,15 @@ impl StoreServiceImpl {
         self
     }
 
+    /// Override the concurrent same-path upload wait budget
+    /// (`r[store.put.concurrent-wait]`). Builder-style. Tests use
+    /// millisecond budgets to exercise the bounded-timeout path without
+    /// real waiting.
+    pub fn with_concurrent_put_wait(mut self, budget: std::time::Duration) -> Self {
+        self.concurrent_put_wait = budget;
+        self
+    }
+
     /// Handle to the active-GetPath-stream counter for SIGTERM drain.
     /// main.rs passes this to `wait_for_active_drain` in the
     /// `spawn_drain_task_ext` after-grace hook.
@@ -474,7 +570,7 @@ impl StoreServiceImpl {
     }
 
     // r[impl store.api.batch-query+2]
-    // r[impl store.api.batch-manifest+2]
+    // r[impl store.api.batch-manifest+3]
     /// Reject gateway-forwarded end-user tenant tokens on the
     /// builder-internal batch RPCs (`BatchQueryPathInfo`,
     /// `BatchGetManifest`). These intentionally skip
@@ -503,6 +599,29 @@ impl StoreServiceImpl {
             )));
         }
         Ok(())
+    }
+
+    /// Caller-identity gate for the NAR-index RPCs (`GetNarIndex`,
+    /// `GetNarIndexBatch`) — same ladder as
+    /// `ChunkServiceImpl::require_caller_identity`. The index is a
+    /// path's complete file listing with sizes and per-file BLAKE3
+    /// digests, and nar hashes travel separately from the content they
+    /// name, so serving it anonymously is a cross-tenant metadata
+    /// oracle. Identity-only, like the chunk gate: the index namespace
+    /// is content-addressed and deliberately not tenant-scoped; JWT
+    /// callers are additionally refused by
+    /// `Self::reject_end_user_tenant`.
+    // r[impl store.index.rpc+1]
+    fn require_caller_identity<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        // The verified identity is discarded — only its existence
+        // matters here.
+        directory::caller_identity(
+            request,
+            self.hmac_verifier.as_ref(),
+            "GetNarIndex requires a caller identity: send a JWT or an HMAC \
+             assignment token",
+        )
+        .map(|_| ())
     }
 
     // r[impl store.substitute.upstream]
@@ -604,6 +723,16 @@ impl StoreService for StoreServiceImpl {
         request: Request<Streaming<PutPathBatchRequest>>,
     ) -> Result<Response<PutPathBatchResponse>, Status> {
         self.put_path_batch_impl(request).await
+    }
+
+    /// ADR-022 §6 chunked output upload. See the `put_path_chunked`
+    /// module for the validate → verify → commit flow.
+    #[instrument(skip(self, request), fields(rpc = "PutPathChunked"))]
+    async fn put_path_chunked(
+        &self,
+        request: Request<Streaming<rio_proto::types::PutPathChunkedRequest>>,
+    ) -> Result<Response<rio_proto::types::PutPathChunkedResponse>, Status> {
+        self.put_path_chunked_impl(request).await
     }
 
     type GetPathStream = get_path::GetPathStream;
@@ -816,6 +945,138 @@ impl StoreService for StoreServiceImpl {
         .await
         .status_internal("AppendHwPerfSample: insert")?;
         Ok(Response::new(()))
+    }
+
+    /// Pure PG read. The index is written atomically with the
+    /// manifest-complete flip (ADR-022 §6) and cannot be recomputed
+    /// from the stored per-file chunks, so a `'complete'` path with no
+    /// index row is `DATA_LOSS`, not a cache miss. `NotFound` if the
+    /// path has no complete manifest. Builder-internal like
+    /// `BatchGetManifest`: the response carries `file_digest`
+    /// capability tokens, so end-user tenants are refused.
+    // r[impl store.index.rpc+1]
+    #[instrument(skip(self, request), fields(rpc = "GetNarIndex"))]
+    async fn get_nar_index(
+        &self,
+        request: Request<rio_proto::types::GetNarIndexRequest>,
+    ) -> Result<Response<rio_proto::types::NarIndex>, Status> {
+        // Identity before anything else — an anonymous caller learns
+        // nothing about any nar_hash, not even whether it exists.
+        self.require_caller_identity(&request)?;
+        self.reject_end_user_tenant(&request, "GetNarIndex")?;
+        let nar_hash = parse_nar_hash(&request.into_inner().nar_hash)?;
+        let bytes = self.lookup_nar_index(&nar_hash).await?;
+        let index = crate::nar_index::decode_entries(&bytes)
+            .map_err(|e| Status::data_loss(format!("corrupt nar_index row: {e}")))?;
+        Ok(Response::new(index))
+    }
+
+    type GetNarIndexBatchStream =
+        tokio_stream::wrappers::ReceiverStream<Result<rio_proto::types::NarIndexResponse, Status>>;
+
+    /// Per-`nar_hash` responses, request order preserved. `index` is
+    /// absent for unknown or incomplete paths — every complete path
+    /// has its index from the moment it becomes visible (written in
+    /// the same transaction as the status flip). Builder-internal:
+    /// end-user tenants refused.
+    // r[impl store.index.rpc+1]
+    #[instrument(skip(self, request), fields(rpc = "GetNarIndexBatch"))]
+    async fn get_nar_index_batch(
+        &self,
+        request: Request<rio_proto::types::GetNarIndexBatchRequest>,
+    ) -> Result<Response<Self::GetNarIndexBatchStream>, Status> {
+        // Same identity-first ordering as GetNarIndex: the gate fires
+        // before the size check and any PG work.
+        self.require_caller_identity(&request)?;
+        self.reject_end_user_tenant(&request, "GetNarIndexBatch")?;
+        let req = request.into_inner();
+        if req.nar_hashes.len() > self.max_batch_paths {
+            return Err(Status::invalid_argument(format!(
+                "GetNarIndexBatch: {} hashes exceeds max {}",
+                req.nar_hashes.len(),
+                self.max_batch_paths,
+            )));
+        }
+        let pool = self.pool.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        // The drain timeout also bounds a max-batch request
+        // (`max_batch_paths` serial PG round trips).
+        rio_common::task::spawn_monitored("get-nar-index-batch", async move {
+            let drain = async {
+                for raw in req.nar_hashes {
+                    let resp = match parse_nar_hash(&raw) {
+                        Err(e) => Err(e),
+                        Ok(h) => match metadata::get_nar_index(&pool, &h).await {
+                            Err(e) => Err(metadata_status("GetNarIndexBatch", e)),
+                            Ok(opt) => Ok(rio_proto::types::NarIndexResponse {
+                                nar_hash: raw,
+                                index: match opt {
+                                    None => None,
+                                    Some(b) => match crate::nar_index::decode_entries(&b) {
+                                        Ok(idx) => {
+                                            metrics::counter!(
+                                                "rio_store_nar_index_cache_hits_total"
+                                            )
+                                            .increment(1);
+                                            Some(idx)
+                                        }
+                                        Err(e) => {
+                                            let _ = tx
+                                                .send(Err(Status::data_loss(format!(
+                                                    "corrupt nar_index row: {e}"
+                                                ))))
+                                                .await;
+                                            return;
+                                        }
+                                    },
+                                },
+                            }),
+                        },
+                    };
+                    if tx.send(resp).await.is_err() {
+                        return; // client disconnected
+                    }
+                }
+            };
+            let _ = drain_with_timeout("GetNarIndexBatch", &tx, drain).await;
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+}
+
+/// 32-byte nar_hash from a wire request, or `INVALID_ARGUMENT`.
+fn parse_nar_hash(raw: &[u8]) -> Result<[u8; 32], Status> {
+    raw.try_into().map_err(|_| {
+        Status::invalid_argument(format!("nar_hash must be 32 bytes, got {}", raw.len()))
+    })
+}
+
+impl StoreServiceImpl {
+    /// `nar_index` PG read for `GetNarIndex`. No recompute path: the
+    /// index is written in the same transaction that makes the
+    /// manifest `'complete'`, and the source material for a recompute
+    /// (the NAR byte stream) is not persisted. A complete path with a
+    /// missing row is therefore storage corruption (`DATA_LOSS`), and
+    /// an unknown `nar_hash` is `NOT_FOUND`.
+    async fn lookup_nar_index(&self, nar_hash: &[u8; 32]) -> Result<Vec<u8>, Status> {
+        if let Some(b) = metadata::get_nar_index(&self.pool, nar_hash)
+            .await
+            .map_err(|e| metadata_status("GetNarIndex", e))?
+        {
+            metrics::counter!("rio_store_nar_index_cache_hits_total").increment(1);
+            return Ok(b);
+        }
+        let store_path = metadata::path_by_nar_hash(&self.pool, nar_hash)
+            .await
+            .map_err(|e| metadata_status("GetNarIndex", e))?
+            .ok_or_else(|| Status::not_found("no complete manifest for nar_hash"))?;
+        error!(store_path, "complete path has no nar_index row");
+        Err(Status::data_loss(format!(
+            "no nar_index row for {store_path}: the index is written with the \
+             complete transaction and cannot be recomputed"
+        )))
     }
 }
 

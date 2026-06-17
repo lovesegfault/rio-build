@@ -21,6 +21,8 @@
 #pagebreak(weak: true)
 #include "architecture.typ"
 #pagebreak(weak: true)
+#include "architecture-build-client.typ"
+#pagebreak(weak: true)
 #include "spec/system/observability.typ"
 #pagebreak(weak: true)
 #include "spec/system/security.typ"
@@ -56,6 +58,8 @@
 #include "spec/components/dashboard.typ"
 #pagebreak(weak: true)
 #include "spec/components/cli.typ"
+#pagebreak(weak: true)
+#include "spec/components/build-client.typ"
 #pagebreak(weak: true)
 #include "ref/configuration.typ"
 #pagebreak(weak: true)

@@ -3591,6 +3591,46 @@
         "lib"
       ]
     },
+    "console": {
+      "crateName": "console",
+      "version": "0.16.3",
+      "edition": "2021",
+      "sha256": "11zwz1vnfr0nx6dyjx0gjymp8864y5hxwf01ynfd2s8kapsqlknn",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "encode_unicode",
+          "packageId": "encode_unicode",
+          "target": "cfg(windows)"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
+          "name": "unicode-width",
+          "packageId": "unicode-width"
+        },
+        {
+          "name": "windows-sys",
+          "packageId": "windows-sys 0.61.2",
+          "target": "cfg(windows)"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "ansi-parsing",
+        "default",
+        "std",
+        "unicode-width",
+        "windows-console-colors"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "const-oid 0.10.2": {
       "crateName": "const-oid",
       "version": "0.10.2",
@@ -5234,6 +5274,25 @@
       ],
       "authors": [
         "RustCrypto Developers"
+      ]
+    },
+    "encode_unicode": {
+      "crateName": "encode_unicode",
+      "version": "1.0.0",
+      "edition": "2021",
+      "sha256": "1h5j7j7byi289by63s3w4a8b3g6l5ccdrws7a67nn07vdxj77ail",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Torbjørn Birch Moltu <t.b.moltu@lyse.net>"
       ]
     },
     "endian-type": {
@@ -8226,6 +8285,7 @@
         "client",
         "config",
         "derive",
+        "http-proxy",
         "kube-client",
         "kube-derive",
         "kube-runtime",
@@ -8375,6 +8435,7 @@
         "futures",
         "http-body",
         "http-body-util",
+        "http-proxy",
         "hyper",
         "hyper-rustls",
         "hyper-timeout",
@@ -9038,6 +9099,30 @@
         "bluss"
       ]
     },
+    "memoffset": {
+      "crateName": "memoffset",
+      "version": "0.9.1",
+      "edition": "2015",
+      "sha256": "12i17wh9a9plx869g7j4whf62xw68k5zd4k0k5nh6ys5mszid028",
+      "source": {
+        "type": "crates-io"
+      },
+      "buildDependencies": [
+        {
+          "name": "autocfg",
+          "packageId": "autocfg"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Gilad Naaman <gilad.naaman@gmail.com>"
+      ]
+    },
     "metrics": {
       "crateName": "metrics",
       "version": "0.24.3",
@@ -9444,6 +9529,10 @@
         {
           "name": "libc",
           "packageId": "libc"
+        },
+        {
+          "name": "memoffset",
+          "packageId": "memoffset"
         }
       ],
       "buildDependencies": [
@@ -9454,14 +9543,18 @@
       ],
       "resolvedDefaultFeatures": [
         "default",
+        "dir",
         "feature",
         "fs",
         "hostname",
+        "memoffset",
         "mman",
         "mount",
         "process",
+        "resource",
         "sched",
         "signal",
+        "socket",
         "uio",
         "user"
       ],
@@ -12467,6 +12560,10 @@
           "packageId": "base64"
         },
         {
+          "name": "blake3",
+          "packageId": "blake3"
+        },
+        {
           "name": "ed25519-dalek",
           "packageId": "ed25519-dalek"
         },
@@ -12544,8 +12641,20 @@
           "packageId": "aws-config"
         },
         {
+          "name": "aws-credential-types",
+          "packageId": "aws-credential-types"
+        },
+        {
           "name": "aws-sdk-s3",
           "packageId": "aws-sdk-s3"
+        },
+        {
+          "name": "aws-sigv4",
+          "packageId": "aws-sigv4"
+        },
+        {
+          "name": "aws-smithy-runtime-api",
+          "packageId": "aws-smithy-runtime-api"
         },
         {
           "name": "axum",
@@ -12562,6 +12671,10 @@
         {
           "name": "futures-util",
           "packageId": "futures-util"
+        },
+        {
+          "name": "metrics",
+          "packageId": "metrics"
         },
         {
           "name": "metrics-exporter-prometheus",
@@ -12600,6 +12713,10 @@
           "packageId": "serde_json"
         },
         {
+          "name": "sqlx",
+          "packageId": "sqlx"
+        },
+        {
           "name": "thiserror",
           "packageId": "thiserror 2.0.18"
         },
@@ -12632,12 +12749,17 @@
           "packageId": "tracing-subscriber"
         },
         {
+          "name": "url",
+          "packageId": "url"
+        },
+        {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
         }
       ],
       "resolvedDefaultFeatures": [
-        "aws"
+        "aws",
+        "pg-iam"
       ],
       "libCrateTypes": [
         "lib"
@@ -12655,6 +12777,10 @@
         "path": "../../rio-migrations"
       },
       "dependencies": [
+        {
+          "name": "anyhow",
+          "packageId": "anyhow"
+        },
         {
           "name": "sqlx",
           "packageId": "sqlx"
@@ -12697,12 +12823,20 @@
           "packageId": "base64"
         },
         {
+          "name": "blake3",
+          "packageId": "blake3"
+        },
+        {
           "name": "ed25519-dalek",
           "packageId": "ed25519-dalek"
         },
         {
           "name": "hex",
           "packageId": "hex"
+        },
+        {
+          "name": "nix",
+          "packageId": "nix"
         },
         {
           "name": "serde_json",
@@ -12754,8 +12888,16 @@
           "packageId": "anyhow"
         },
         {
+          "name": "blake3",
+          "packageId": "blake3"
+        },
+        {
           "name": "futures-util",
           "packageId": "futures-util"
+        },
+        {
+          "name": "hex",
+          "packageId": "hex"
         },
         {
           "name": "opentelemetry",
@@ -12909,6 +13051,10 @@
           "packageId": "moka"
         },
         {
+          "name": "prost",
+          "packageId": "prost"
+        },
+        {
           "name": "reqwest",
           "packageId": "reqwest"
         },
@@ -12991,6 +13137,10 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -16514,6 +16664,7 @@
         "codec",
         "default",
         "io",
+        "io-util",
         "slab",
         "time"
       ],
@@ -16724,6 +16875,10 @@
         {
           "name": "tracing",
           "packageId": "tracing"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -16732,7 +16887,8 @@
         "default",
         "router",
         "server",
-        "transport"
+        "transport",
+        "zstd"
       ],
       "libCrateTypes": [
         "lib"
@@ -17634,6 +17790,26 @@
       ],
       "authors": [
         "Charles Lew <crlf0710@gmail.com>",
+        "Manish Goregaokar <manishsmail@gmail.com>"
+      ]
+    },
+    "unicode-width": {
+      "crateName": "unicode-width",
+      "version": "0.2.2",
+      "edition": "2021",
+      "sha256": "0m7jjzlcccw716dy9423xxh0clys8pfpllc5smvfxrzdf66h9b5l",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "cjk",
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "kwantam <kwantam@gmail.com>",
         "Manish Goregaokar <manishsmail@gmail.com>"
       ]
     },
@@ -18686,6 +18862,8 @@
         "Win32_System_Time",
         "Win32_System_WindowsProgramming",
         "Win32_UI",
+        "Win32_UI_Input",
+        "Win32_UI_Input_KeyboardAndMouse",
         "Win32_UI_Shell",
         "default"
       ],
@@ -19395,6 +19573,10 @@
           "packageId": "cipher"
         },
         {
+          "name": "console",
+          "packageId": "console"
+        },
+        {
           "name": "crossbeam-epoch",
           "packageId": "crossbeam-epoch"
         },
@@ -19544,22 +19726,16 @@
           "packageId": "hyper-util"
         },
         {
-          "name": "hyper-util",
-          "packageId": "hyper-util",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "hyper-util",
-          "packageId": "hyper-util",
-          "target": "x86_64-unknown-linux-gnu"
-        },
-        {
           "name": "indexmap",
           "packageId": "indexmap"
         },
         {
           "name": "inout",
           "packageId": "inout"
+        },
+        {
+          "name": "ipnet",
+          "packageId": "ipnet"
         },
         {
           "name": "jiff",
@@ -19912,18 +20088,6 @@
         {
           "name": "zeroize",
           "packageId": "zeroize"
-        },
-        {
-          "name": "zstd",
-          "packageId": "zstd"
-        },
-        {
-          "name": "zstd-safe",
-          "packageId": "zstd-safe"
-        },
-        {
-          "name": "zstd-sys",
-          "packageId": "zstd-sys"
         }
       ],
       "buildDependencies": [
@@ -19966,12 +20130,20 @@
           "packageId": "bytes"
         },
         {
+          "name": "cc",
+          "packageId": "cc"
+        },
+        {
           "name": "chacha20",
           "packageId": "chacha20"
         },
         {
           "name": "cipher",
           "packageId": "cipher"
+        },
+        {
+          "name": "console",
+          "packageId": "console"
         },
         {
           "name": "crossbeam-epoch",
@@ -20123,22 +20295,16 @@
           "packageId": "hyper-util"
         },
         {
-          "name": "hyper-util",
-          "packageId": "hyper-util",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "hyper-util",
-          "packageId": "hyper-util",
-          "target": "x86_64-unknown-linux-gnu"
-        },
-        {
           "name": "indexmap",
           "packageId": "indexmap"
         },
         {
           "name": "inout",
           "packageId": "inout"
+        },
+        {
+          "name": "ipnet",
+          "packageId": "ipnet"
         },
         {
           "name": "jiff",
@@ -20495,18 +20661,6 @@
         {
           "name": "zeroize",
           "packageId": "zeroize"
-        },
-        {
-          "name": "zstd",
-          "packageId": "zstd"
-        },
-        {
-          "name": "zstd-safe",
-          "packageId": "zstd-safe"
-        },
-        {
-          "name": "zstd-sys",
-          "packageId": "zstd-sys"
         }
       ],
       "libCrateTypes": [

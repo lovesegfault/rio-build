@@ -6,7 +6,7 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
 = Prerequisites
 
 - Kubernetes 1.33+ (EKS, GKE, or self-managed) --- required for user namespace isolation (`hostUsers: false`), see #cross-link("/spec/system/security.typ")[Security §Rationale]
-- PostgreSQL 15+ (managed service recommended: RDS, Cloud SQL, or CloudNativePG). Aurora/RDS PG 15+ have `rds.force_ssl=1` by default --- the connection string must include `?sslmode=require` (sqlx has `tls-rustls-aws-lc-rs` enabled for this)
+- PostgreSQL 15+ (managed service recommended: RDS, Cloud SQL, or CloudNativePG). Aurora/RDS PG 15+ have `rds.force_ssl=1` by default --- the EKS chart connects with `?sslmode=verify-full&sslrootcert=<vendored RDS trust bundle>` (sqlx has `tls-rustls-aws-lc-rs` enabled for this). Optionally `postgres.authMode=iam` replaces the static password with 15-minute RDS IAM auth tokens minted from the pod's IRSA role; verify-full is mandatory there
 - S3-compatible object storage (AWS S3, MinIO, GCS with S3 compatibility)
 - `kubectl` configured for the target cluster
 
@@ -28,7 +28,7 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
   [rio-store],
   [Deployment],
   [1],
-  [Stateless at runtime (PG + S3 hold everything). Multi-replica is safe: startup migrations serialize via #rref("store.db.migrate-try-lock").],
+  [Stateless at runtime (PG + S3 hold everything). Multi-replica is safe: replicas never migrate (#rref("store.db.schema-current")); the rio-migrate Job owns migration, serialized via #rref("store.db.migrate-try-lock").],
 
   [rio-controller],
   [Deployment],
@@ -50,7 +50,9 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
 + *rio-gateway* (needs rio-scheduler and rio-store)
 + *Pool CRD* (rio-controller creates and manages builder/fetcher Jobs)
 
-`helm upgrade --wait` blocks until all Deployments report Available — strict ordering isn't enforced, but no component is externally reachable until the release as a whole is Ready. Readiness probes on each component ensure this: store readiness requires PG migrations done, scheduler readiness requires store reachable, gateway readiness requires scheduler reachable.
+Database migrations run in a dedicated `rio-migrate` Job — a PLAIN Job applied alongside every other resource, deliberately not a helm hook — that executes `rio-store migrate` with the master-password URL from the `rio-postgres` Secret, regardless of `postgres.authMode`. App pods never migrate; at startup they verify the schema is current and fail with an error naming the Job otherwise (#rref("store.db.schema-current")), crash-restarting until the Job completes. That crash-restart convergence is the only sequencing contract: migrate-before-roll ordering is not load-bearing (old replicas tolerate the newer, forward-compatible schema; new replicas wait via restart), and the Job's name carries a per-render pod-template hash so a changed spec creates a new Job instead of colliding with Job immutability (`helm.sh/resource-policy: keep` + a 1h TTL handle old Jobs). Because the runner always connects as the master, a fresh cluster can deploy directly with `postgres.authMode=iam` — app pods never need DDL-capable credentials.
+
+`helm upgrade --wait --wait-for-jobs` blocks until all Deployments report Available and the migrate Job completes — strict ordering isn't enforced, but no component is externally reachable until the release as a whole is Ready. Readiness probes on each component ensure this: store readiness requires the schema check to pass, scheduler readiness requires store reachable, gateway readiness requires scheduler reachable. `--wait-for-jobs` matters even when the schema is already current: without it a failed migrate Job is invisible behind green Deployments. Fresh installs work under `--wait` too (the plain Job applies in the same pass as everything else); slow PG bring-up may need `--timeout` above helm's 5m default — a recoverable timeout, not a deadlock.
 
 = Minimum Viable Deployment
 
@@ -83,7 +85,7 @@ Executors require a dedicated node pool with:
 - *Taint:* `rio.build/executor=true:NoSchedule` (only executor pods scheduled here). Note: system pods (coredns) need at least one untainted node — use a separate system node group.
 - *Instance type:* Compute-optimized (e.g., `c8a.xlarge` on AWS). For IO-heavy builds the `rio-builder-nvme-{x86,aarch64}` NodePools select instance-store-NVMe families via `karpenter.k8s.aws/instance-local-nvme > 0`; the AMI's `rio-nvme-mount.service` (early boot, before tmpfiles and nodeadm) stripes the instance-store devices into `/dev/md0`, formats XFS, and mounts at `/var/lib/kubelet` with `prjquota` so kubelet enforces per-pod ephemeral-storage via XFS project quotas. The `rio-nvme` EC2NodeClass sets `instanceStorePolicy: RAID0` so @karpenter's bin-pack simulation counts NVMe capacity toward ephemeral-storage; nodeadm does not act on it (the AMI's `nodeadm init --skip run` never executes the local-disk aspect), so `rio-nvme-mount.service` still owns the mdadm→mkfs.xfs+prjquota chain uncontested.
 - *AMI:* the NixOS node AMI (`.#packages.<arch>-linux.ami`, ADR-021). Amazon Linux 2 (AL2, kernel 5.10) does *NOT* support #gls("overlayfs")-over-@fuse and is not compatible with rio-build executors.
-- *Kernel:* Linux 6.1+ (for overlayfs-over-FUSE support). Linux 6.9+ recommended for FUSE passthrough mode. Verify with `uname -r` on worker nodes.
+- *Kernel:* Linux 6.14+ — the castore-FUSE's only transport is fuse-over-io_uring (`FUSE_OVER_IO_URING`, booted with `fuse.enable_uring=1`); 6.14 also covers overlayfs-over-FUSE (6.1+) and FUSE passthrough mode (6.9+). Verify with `uname -r` on worker nodes.
 - *#gls("imdsv2"):* Hop limit = 1 (defense-in-depth against metadata access from containers)
 - *Pod spec:* `hostUsers: false` is incompatible with `/dev/fuse` hostPath volumes (kernel rejects idmap mounts on device nodes). containerd `base_runtime_spec` injects `/dev/{fuse,kvm}` directly (OCI `linux.devices` — runc `mknod`s inside the container's `/dev`); see `nix/base-runtime-spec.nix` (NixOS AMI: `nix/nixos-node/containerd-config.nix`; k3s VM fixture: `services.k3s.containerdConfigTemplate` in `nix/tests/fixtures/k3s-full.nix`).
 - *`/dev/fuse` access:* Executor pods need access to `/dev/fuse`. A `hostPath` volume with `privileged: true` works for development but production should use `base_runtime_spec` device injection to avoid granting full privileges. `CAP_SYS_ADMIN` alone is not sufficient for `/dev/fuse` access — the container's device cgroup must also allow the FUSE character device.
@@ -177,7 +179,7 @@ For a complete scripted walkthrough against EKS, run `cargo xtask k8s qa --healt
 
 = Upgrades
 
-- *Schema migrations:* Run via `sqlx::migrate!` with sqlx's built-in lock disabled (`set_locking(false)`); rio-store's own PG advisory `pg_try_advisory_lock` serializes concurrent replicas (#rref("store.db.migrate-try-lock")). All migrations are forward-compatible; rollback is supported by deploying the previous binary version (it ignores unknown columns/tables).
+- *Schema migrations:* Run by the `rio-migrate` Job (`rio-store migrate`) via `sqlx::migrate!` with sqlx's built-in lock disabled (`set_locking(false)`); a PG advisory `pg_try_advisory_lock` serializes concurrent runners (#rref("store.db.migrate-try-lock")), and the same lock hold re-asserts the `rio_app` role and grants (#rref("store.db.ensure-roles")). App pods only verify (#rref("store.db.schema-current")). All migrations are forward-compatible; rollback is supported by deploying the previous binary version: the runner sets `ignore_missing(true)`, so applied-but-not-embedded versions (a newer binary's migrations, or the retired role migrations' rows) are inert rather than `VersionMissing` failures. One residual hard-fail: sqlx's dirty check aborts on any `success=false` row — embedded or not — before validation runs; an un-embedded failed row can never be re-applied, so the remedy is deleting that `_sqlx_migrations` row manually.
 - *Rolling updates:* Builder Jobs (created by rio-controller) set `terminationGracePeriodSeconds: 7200` --- the builder's SIGTERM handler blocks until its single in-flight build completes, then exits 0. Gateway pods use the Kubernetes default (30s); no extended grace period is configured in the base manifests. Builder pods are one-shot, so a control-plane upgrade naturally rolls the fleet as Jobs complete and new ones spawn with the new image.
 - *Blue/green deployments:* Supported if separate PostgreSQL schemas and S3 key prefixes are used per deployment. The gateway can be switched atomically via NLB target group changes.
 - *Version skew policy:* Gateway and executor binaries can be at most 1 minor version behind the scheduler and store. The scheduler and store must be upgraded first.

@@ -8,7 +8,7 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
 
 == Pool
 
-#r("ctrl.crd.pool")[
+#r("ctrl.crd.pool+2")[
   ```yaml
   apiVersion: rio.build/v1alpha1
   kind: Pool
@@ -19,26 +19,26 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
     maxConcurrent: 20                            # u32?, optional — concurrent-Job ceiling (one Job = one build); omit = uncapped Job count (the §13b placeable gate + per-class maxFleetCores caps bound fanout, not Job count)
     image: rio-builder:dev                       # string, required — container image ref
     systems: [x86_64-linux]                      # list<string>, required (non-empty per CEL)
-    hostUsers: false                             # bool?, optional — None ⇒ hostUsers:false (userns per ADR-012); CEL-forbidden for Fetcher
+    hostUsers: false                             # bool?, optional — None ⇒ kind-dependent default (Builder: false, userns per ADR-012; Fetcher: true, mountd UDS gid gate); NOT CEL-gated for Fetcher (k3s escape hatch)
     nodeSelector:
       rio.build/builder: "true"
     tolerations:
       - { key: rio.build/builder, operator: Equal, value: "true", effect: NoSchedule }
     features: [big-parallel, kvm]                # list<string>, default [] — maps to requiredSystemFeatures (Builder-only)
     imagePullPolicy: IfNotPresent                # string?, optional — K8s default if omitted
-    fuseThreads: 4                               # u32?, optional — Builder-only, CEL-forbidden for Fetcher
-    fusePassthrough: true                        # bool?, optional — Builder-only, CEL-forbidden for Fetcher
+    fuseThreads: 4                               # u32?, optional — Builder-only, CEL-forbidden for Fetcher; the only FUSE knob left post-castore-cutover (ADR-022 P0560)
     terminationGracePeriodSeconds: 7200          # i64?, optional — K8s grace; defaults per-kind (r[ctrl.pod.tgps-default])
     privileged: false                            # bool?, optional — CEL-forbidden for Fetcher
     hostNetwork: false                           # bool?, optional — true requires privileged:true; CEL-forbidden for Fetcher
     seccompProfile:                              # SeccompProfileKind?, optional — CEL-forbidden for Fetcher
       type: Localhost                            #   RuntimeDefault | Localhost | Unconfined
       localhostProfile: operator/rio-builder.json#   required iff type=Localhost (r[ctrl.crd.seccomp-cel])
-    # fuseCacheBytes: <bytes>                    # u64?, REJECTED by CEL for BOTH kinds since r35 (merged_bug_024) — pools read the per-kind `[nodeclaim_pool].{fuse_cache_bytes,fetcher_fuse_cache_bytes}` (helm `poolDefaults.{fuseCacheBytes,fetcherFuseCacheBytes}`, 50Gi/4Gi prod). See r[ctrl.event.spec-degrade].
     # NOT CRD fields: resources (per-pod cpu/mem/disk come from the
     # scheduler's per-drv SpawnIntent — ADR-023); securityContext (caps
     # hardcoded in build_executor_pod_spec()); topologySpread (one-shot
-    # Jobs don't anti-affine).
+    # Jobs don't anti-affine); cache sizing (the castore digest/chunk
+    # caches are node-level hostPaths owned by rio-mountd, not per-pod
+    # — ADR-022 P0560).
   status:
     replicas: 5                                  # i32 — active Jobs
     readyReplicas: 4                             # i32 — Jobs whose pod passed readinessProbe
@@ -70,11 +70,14 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
   NodeClaims directly. Zero queued derivations means zero pods.
 ]
 
-*Isolation guarantee:* zero cross-build state. Fresh pod means fresh emptyDir
-for @fuse cache and @overlayfs upper, fresh filesystem. Untrusted tenants cannot
-leave poisoned cache entries for subsequent builds --- there is no "subsequent
-build" on that pod. Strongest isolation when combined with `hostUsers: false` +
-non-privileged (see #rref("sec.pod.host-users-false")).
+*Isolation guarantee:* zero cross-build state inside the pod. Fresh pod means a
+fresh emptyDir for the @overlayfs upper and a fresh per-build castore-FUSE
+mount, fresh filesystem --- there is no "subsequent build" on that pod. The
+node-shared castore caches (`/var/rio/{cache,chunks}`) are mounted read-only
+and admit content only through rio-mountd's digest-verified Promote, so an
+untrusted build cannot poison them either. Strongest isolation when combined
+with `hostUsers: false` + non-privileged (see
+#rref("sec.pod.host-users-false")).
 
 *Cost:* per-build cold start (pod scheduling + container pull + FUSE mount +
 scheduler registration --- typically 10--30s) plus one reconcile tick (\~10s)
@@ -236,16 +239,28 @@ gone.
   ownerRef GC handles Job cleanup on Pool delete.
 ]
 
-#r("ctrl.pool.fetcher-hardening+2")[
+#r("ctrl.pool.fetcher-hardening+3")[
   For `kind=Fetcher`, `executor_params` MUST apply ADR-019 hardening regardless
   of spec: `readOnlyRootFilesystem: true`, `seccompProfile: Localhost
-  operator/rio-fetcher.json`, `hostUsers: false`, `privileged: false`, default
+  operator/rio-fetcher.json`, `privileged: false`, default `hostUsers: true`
+  (spec-overridable; NOT the ADR-019 userns posture --- see below), default
   `rio.build/fetcher: true` nodeSelector (§13e key, restored in B4) +
   `rio.build/fetcher:NoSchedule` toleration, `terminationGracePeriodSeconds:
   600`. CRD CEL rejects fetcher specs that set the overridden fields at
   admission time; the reconciler override is belt-and-suspenders for pre-CEL
   specs the apiserver already accepted.
 ]
+
+The `hostUsers: true` default is a deliberate retreat from ADR-019 userns
+isolation. rio-mountd's only access control on its UDS is the socket-file DAC
+check (`0660 root:990`) against the connecting process's *host-side* gid; under
+`hostUsers: false` the kubelet remaps the fetcher's gid 990 into the pod's
+non-init user namespace, the host-side gid is no longer 990, and `connect(2)`
+fails EACCES --- every FOD fetch in the fleet fails. Compensating controls
+while userns is off: the forced Localhost `rio-fetcher.json` seccomp profile
+and the fetcher namespace's default-deny NetworkPolicy. Revisit when mountd
+gains userns-aware access control (e.g. an `SO_PEERCRED`/pidfd check that
+resolves the peer's gid through its userns mapping).
 
 #r("ctrl.pool.fetcher-spawn-builtin")[
   For `kind=Fetcher` pools, `spec.systems` SHOULD include `"builtin"` so
@@ -1034,25 +1049,17 @@ constraints:
   field, the spec value, and the remediation.
 ]
 
-The FUSE cache emptyDir `sizeLimit` is single-sourced from a per-*kind*
-boot-time value --- `[nodeclaim_pool].fuse_cache_bytes` for Builder pools (helm
-`poolDefaults.fuseCacheBytes`, 50Gi in prod) and
-`[nodeclaim_pool].fetcher_fuse_cache_bytes` for Fetcher pools (helm
-`poolDefaults.fetcherFuseCacheBytes`, 4Gi) --- so FFD/cover/stamp agree.
-`PoolSpec.fuseCacheBytes` is rejected for both Builder and Fetcher kind.
-(Pre-§13e, Fetcher pools could set a per-pool value because they didn't route
-through `nodeclaim_pool`; §13e routed them through, and r35 closed the
-resulting accounting drift by collapsing both kinds onto the builder value.
-The per-kind split keeps the single-sourcing while stopping fetcher pods from
-reserving the builder's input-closure budget: a FOD's input closure is a fetch
-script's runtime deps, not an arbitrary build closure, and the builder budget
-dominated the fetcher pod's ephemeral-storage request ~30#sym.times over what
-the pod could ever touch.) The same value is added to the container's
-`ephemeral-storage` request/limit so the two cannot drift. Pods are one-shot so
-the cache never outlives one build's input closure. Unlike the overlay
-(`disk_bytes`), the FUSE-cache dimension has no eviction-driven escalation
-path, so the fetcher budget must statically cover the heaviest fetch toolchain
-in use; raise `fetcherFuseCacheBytes` if one outgrows it.
+There is no per-pod FUSE cache to size since the castore cutover (ADR-022
+P0560). The digest/chunk caches are node-level hostPaths
+(`/var/rio/{cache,chunks}`) owned and LRU'd by the rio-mountd DaemonSet; every
+executor pod (both kinds) mounts them read-only alongside `/var/rio/castore`
+(per-build FUSE mountpoints, `HostToContainer` propagation so mounts created
+after pod start become visible) and `/var/rio/staging` (per-build write area).
+The pod also mounts the mountd UDS directory and gets
+`RIO_MOUNTD_SOCKET=/run/rio-mountd/rio-mountd.sock` so the builder can request
+its per-build mount over the socket. None of this counts against the pod's
+`ephemeral-storage` request --- the caches sit outside the kubelet's per-pod
+accounting --- and the only FUSE knob left in the CRD is `fuseThreads`.
 
 = Pool Finalizer
 

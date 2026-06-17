@@ -642,6 +642,9 @@ fn reject_exec(
 pub struct ConnectionHandler {
     pub(super) peer_addr: Option<SocketAddr>,
     pub(super) store_client: StoreServiceClient<Channel>,
+    /// DrvBlobService client on the store channel (ADR-024 drv-digest
+    /// population). `None` = legacy submissions only.
+    pub(super) drv_blob_client: Option<rio_proto::DrvBlobServiceClient<Channel>>,
     pub(super) scheduler_client: SchedulerServiceClient<Channel>,
     /// Shared with `GatewayServer` + the watcher task. `.load()` per
     /// auth attempt — NOT snapshotted at connection-accept, so a key
@@ -1551,6 +1554,7 @@ impl Handler for ConnectionHandler {
 
         // Task: run the protocol handler with gRPC clients
         let mut store_client = self.store_client.clone();
+        let drv_blob_client = self.drv_blob_client.clone();
         let mut scheduler_client = self.scheduler_client.clone();
         let tenant_name = self.tenant_name.clone();
         // One token per SSH connection, shared across all channels.
@@ -1585,6 +1589,7 @@ impl Handler for ConnectionHandler {
                     &mut reader,
                     &mut writer,
                     &mut store_client,
+                    drv_blob_client,
                     &mut scheduler_client,
                     tenant_name,
                     jwt,

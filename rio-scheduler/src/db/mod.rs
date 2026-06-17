@@ -21,7 +21,9 @@ use crate::state::DerivationStatus;
 mod assignments;
 mod batch;
 mod builds;
+mod closure;
 mod derivations;
+mod drv_blobs;
 mod history;
 mod live_pins;
 mod recovery;
@@ -35,6 +37,7 @@ mod tests;
 // `crate::db::read_event_log` without knowing the internal layout.
 pub(crate) use recovery::read_event_log;
 
+pub use closure::InputRootRow;
 pub use history::{BuildSampleRow, SlaOverrideRow};
 
 // r[impl sched.db.partial-index-literal]
@@ -227,6 +230,20 @@ pub(crate) struct PoisonedDerivationRow {
     /// `M_051`: resubmit-bound counter; persisted so the bound survives
     /// failover (bug_001).
     pub resubmit_cycles: i32,
+}
+
+/// Row from `load_failure_reason`: the persisted failure attribution of
+/// an already-poisoned derivation (M_073), read by the merge fail-fast
+/// path to name the culprit and surface the original reason.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct FailureReasonRow {
+    /// Builder-reported error text of the failing attempt.
+    pub failure_msg: Option<String>,
+    /// Execution that produced it (`None` = never reached a worker).
+    pub failure_exec_id: Option<Uuid>,
+    /// `poisoned_at` as a Unix epoch (seconds). PG-side EXTRACT so the
+    /// caller converts straight to `SystemTime` without a chrono dep.
+    pub poisoned_epoch: Option<f64>,
 }
 
 /// Row from `load_nonterminal_derivations`. Mirrors the INSERT

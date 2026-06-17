@@ -184,26 +184,27 @@ fn seccomp_privileged_drops_profile() {
     );
 }
 
-// r[verify sec.pod.fuse-device-plugin]
+// r[verify sec.pod.fuse-device-plugin+1]
 #[test]
 fn job_pod_no_fuse_hostpath_when_unprivileged() {
     // Default (privileged=None→false): NO hostPath /dev/fuse volume.
-    // containerd base_runtime_spec injects the device node into every
-    // pod's /dev (nix/base-runtime-spec.nix), so neither a volume nor
-    // an extended-resource request is needed. This is the ADR-012
-    // production path — enables hostUsers:false (hostPath /dev/fuse
-    // is incompatible with idmap mounts).
+    // The castore-FUSE session uses the fd rio-mountd opens and hands
+    // over via SCM_RIGHTS (ADR-022 P0560), so the executor never opens
+    // the device node itself — no volume, no extended-resource
+    // request. hostPath /dev/fuse would also be incompatible with
+    // hostUsers:false (idmap mounts reject device nodes, ADR-012).
     let wp = test_wp();
     let pod = test_pod_spec(&wp);
 
-    // No dev-fuse volume (base_runtime_spec injects, no volume needed).
+    // No dev-fuse volume.
     assert!(
         !pod.volumes
             .as_ref()
             .unwrap()
             .iter()
             .any(|v| v.name == "dev-fuse"),
-        "non-privileged path uses base_runtime_spec, not hostPath"
+        "executor pods never hostPath-mount /dev/fuse — the FUSE fd is \
+         handed off by rio-mountd"
     );
     // No dev-fuse mount either.
     assert!(
@@ -219,8 +220,113 @@ fn job_pod_no_fuse_hostpath_when_unprivileged() {
     // container resources stay None (controller adds nothing).
     assert!(
         pod.containers[0].resources.is_none(),
-        "no rio.build/* extended resource — base_runtime_spec is unconditional"
+        "no rio.build/* extended resource — no device plugin runs"
     );
+}
+
+/// ADR-022 P0560: every executor pod (builder AND fetcher) gets the
+/// castore plumbing — the rio-mountd socket dir plus the node-shared
+/// /var/rio dirs with the cache-RO/staging-RW split, the castore
+/// mountpoint propagating host→container, and a `runAsGroup` that
+/// passes the mountd socket's 0660 root:990 permission check.
+#[test]
+fn job_pod_castore_hostpath_wiring() {
+    for kind in [ExecutorKind::Builder, ExecutorKind::Fetcher] {
+        let pool = crate::fixtures::test_pool("p", kind);
+        let pod = test_pod_spec(&pool);
+        let vols = pod.volumes.as_ref().unwrap();
+        let mounts = pod.containers[0].volume_mounts.as_ref().unwrap();
+        let vol = |n: &str| {
+            vols.iter()
+                .find(|v| v.name == n)
+                .unwrap_or_else(|| panic!("{kind:?}: volume {n} missing"))
+        };
+        let mnt = |n: &str| {
+            mounts
+                .iter()
+                .find(|m| m.name == n)
+                .unwrap_or_else(|| panic!("{kind:?}: volumeMount {n} missing"))
+        };
+
+        // hostPath types: the socket dir is DirectoryOrCreate (race
+        // against the mountd DaemonSet on a fresh node → actionable
+        // builder error, not ContainerCreating); the /var/rio dirs are
+        // Directory so a mis-imaged node (no prjquota /var/rio) fails
+        // the mount instead of the kubelet creating unquota'd dirs on
+        // the root fs.
+        for (name, path, read_only, propagation, host_path_type) in [
+            (
+                "mountd-socket",
+                "/run/rio-mountd",
+                Some(true),
+                None,
+                "DirectoryOrCreate",
+            ),
+            (
+                "castore",
+                "/var/rio/castore",
+                Some(true),
+                Some("HostToContainer"),
+                "Directory",
+            ),
+            (
+                "castore-cache",
+                "/var/rio/cache",
+                Some(true),
+                None,
+                "Directory",
+            ),
+            (
+                "castore-chunks",
+                "/var/rio/chunks",
+                Some(true),
+                None,
+                "Directory",
+            ),
+            (
+                "castore-staging",
+                "/var/rio/staging",
+                None,
+                None,
+                "Directory",
+            ),
+        ] {
+            let hp = vol(name).host_path.as_ref().expect("hostPath volume");
+            assert_eq!(hp.path, path, "{kind:?}: {name} hostPath");
+            assert_eq!(
+                hp.type_.as_deref(),
+                Some(host_path_type),
+                "{kind:?}: {name} hostPath type"
+            );
+            let m = mnt(name);
+            assert_eq!(m.mount_path, path, "{kind:?}: {name} mountPath");
+            assert_eq!(m.read_only, read_only, "{kind:?}: {name} read_only");
+            assert_eq!(
+                m.mount_propagation.as_deref(),
+                propagation,
+                "{kind:?}: {name} mountPropagation"
+            );
+        }
+
+        // The legacy per-pod fuse-cache emptyDir must not come back.
+        assert!(
+            !vols.iter().any(|v| v.name == "fuse-cache"),
+            "{kind:?}: per-pod fuse-cache emptyDir was deleted with the old \
+             JIT FUSE (P0560)"
+        );
+
+        // The mountd UDS is root:990 mode 0660 (the DaemonSet's
+        // hard-coded --allowed-gid); the executor's primary gid must
+        // match or connect(2) to the socket fails and no build starts.
+        assert_eq!(
+            pod.containers[0]
+                .security_context
+                .as_ref()
+                .and_then(|sc| sc.run_as_group),
+            Some(pod::EXECUTOR_RUN_AS_GROUP),
+            "{kind:?}: runAsGroup must match mountd's --allowed-gid"
+        );
+    }
 }
 
 // r[verify ctrl.pool.kvm-device+2]
@@ -321,7 +427,7 @@ fn job_pod_kvm_privileged_keeps_toleration() {
     );
 }
 
-// r[verify sec.pod.host-users-false]
+// r[verify sec.pod.host-users-false+2]
 #[test]
 fn job_pod_host_users_false_when_unprivileged() {
     // hostUsers:false → K8s user-namespace isolation. Container UIDs
@@ -337,7 +443,7 @@ fn job_pod_host_users_false_when_unprivileged() {
     );
 }
 
-// r[verify sec.pod.host-users-false]
+// r[verify sec.pod.host-users-false+2]
 // r[verify ctrl.crd.host-users-network-exclusive]
 #[test]
 fn host_users_suppressed_when_host_network() {
@@ -366,7 +472,7 @@ fn host_users_suppressed_when_host_network() {
     assert_eq!(pod.host_network, Some(true));
 }
 
-// r[verify sec.pod.host-users-false]
+// r[verify sec.pod.host-users-false+2]
 #[test]
 fn host_users_false_when_neither_escape_hatch() {
     // Positive control: when NEITHER escape hatch is active
@@ -398,38 +504,35 @@ fn host_users_false_when_neither_escape_hatch() {
     assert_eq!(pod.host_network, None);
 }
 
-// r[verify sec.pod.host-users-false]
-// r[verify sec.pod.fuse-device-plugin]
+// r[verify sec.pod.host-users-false+2]
+// r[verify sec.pod.fuse-device-plugin+1]
 #[test]
-fn job_pod_privileged_escape_hatch_uses_hostpath() {
-    // privileged=true → hostPath /dev/fuse fallback. No
-    // hostUsers:false (incompatible with privileged containers).
-    // This is the k3s/kind escape hatch.
+fn job_pod_privileged_escape_hatch_no_dev_fuse() {
+    // privileged=true escape hatch: still NO hostPath /dev/fuse — the
+    // castore-FUSE fd is handed off by rio-mountd regardless of the
+    // pod's privilege level (P0560 deleted the old hostPath fallback).
+    // No hostUsers:false (incompatible with privileged containers).
     let mut wp = test_wp();
     wp.spec.privileged = Some(true);
     let pod = test_pod_spec(&wp);
 
-    // hostPath /dev/fuse volume present (escape hatch).
-    let fuse_vol = pod
-        .volumes
-        .as_ref()
-        .unwrap()
-        .iter()
-        .find(|v| v.name == "dev-fuse")
-        .expect("/dev/fuse hostPath volume (privileged escape hatch)");
-    let hp = fuse_vol.host_path.as_ref().expect("hostPath");
-    assert_eq!(hp.path, "/dev/fuse");
-    assert_eq!(hp.type_, Some("CharDevice".into()));
-
-    // Mount present too.
-    let mount = pod.containers[0]
-        .volume_mounts
-        .as_ref()
-        .unwrap()
-        .iter()
-        .find(|m| m.name == "dev-fuse")
-        .expect("dev-fuse mount");
-    assert_eq!(mount.mount_path, "/dev/fuse");
+    assert!(
+        !pod.volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|v| v.name == "dev-fuse"),
+        "privileged pods don't hostPath /dev/fuse either — fd handoff \
+         via rio-mountd"
+    );
+    assert!(
+        !pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|m| m.name == "dev-fuse"),
+    );
 
     // hostUsers NOT set (privileged containers can't be user-namespaced).
     assert_eq!(
@@ -988,7 +1091,41 @@ fn job_pod_env_vars() {
         !envs.contains_key("RIO_FUSE_THREADS"),
         "unset in spec → not injected → worker default"
     );
-    assert!(!envs.contains_key("RIO_FUSE_PASSTHROUGH"));
+    // P0560: castore wiring. Only the mountd socket path is injected
+    // (the DS binds inside its own hostPath dir); the dirs and the
+    // tuning knobs ride the worker's compiled defaults, and the legacy
+    // JIT-FUSE envs are gone from the binary entirely.
+    assert_eq!(
+        envs.get("RIO_MOUNTD_SOCKET"),
+        Some(&"/run/rio-mountd/rio-mountd.sock"),
+        "mountd socket path matches the DaemonSet's hostPath layout"
+    );
+    for legacy in [
+        "RIO_FUSE_MOUNT_POINT",
+        "RIO_FUSE_CACHE_DIR",
+        "RIO_FUSE_PASSTHROUGH",
+    ] {
+        assert!(
+            !envs.contains_key(legacy),
+            "{legacy} was deleted with the old JIT FUSE (P0560)"
+        );
+    }
+    for default_owned in [
+        "RIO_CASTORE_DIR",
+        "RIO_STAGING_DIR",
+        "RIO_CACHE_DIR",
+        "RIO_CHUNKS_DIR",
+        "RIO_DAG_PREFETCH_TIMEOUT_SECS",
+        "RIO_STREAM_THRESHOLD",
+        "RIO_MAX_BACKING_IDS",
+        "RIO_DISABLE_PASSTHROUGH",
+    ] {
+        assert!(
+            !envs.contains_key(default_owned),
+            "{default_owned} rides the worker default — injecting would pin \
+             it at controller-build time"
+        );
+    }
     // RIO_DAEMON_TIMEOUT_SECS is NOT set here — it's intent-derived,
     // injected by `apply_intent_resources` per Job, not by the base
     // pod-spec builder.
@@ -1025,17 +1162,11 @@ fn job_pod_env_vars() {
 fn job_pod_worker_knobs_injected_when_set() {
     let mut wp = test_wp();
     wp.spec.fuse_threads = Some(8);
-    wp.spec.fuse_passthrough = Some(false);
     let pod = test_pod_spec(&wp);
     let container = &pod.containers[0];
     let envs = crate::fixtures::env_map(container.env.as_deref().unwrap());
 
     assert_eq!(envs.get("RIO_FUSE_THREADS"), Some(&"8"));
-    assert_eq!(
-        envs.get("RIO_FUSE_PASSTHROUGH"),
-        Some(&"false"),
-        "the env layer's bool parse accepts true/false (rio-common config.rs test)"
-    );
 }
 
 #[test]

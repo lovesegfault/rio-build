@@ -1,0 +1,15 @@
+bytes builder = 5;
+bytes drv_path = 1;
+bytes hash = 4;
+bytes hash_algo = 3;
+bytes key = 1;
+bytes name = 1;
+bytes path = 2;
+bytes platform = 4;
+bytes value = 2;
+repeated EnvVar env = 7;
+repeated InputDrv input_drvs = 2;
+repeated Output outputs = 1;
+repeated bytes args = 6;
+repeated bytes input_srcs = 3;
+repeated bytes outputs = 2;

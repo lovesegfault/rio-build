@@ -49,6 +49,7 @@ fn sign_claims_tenant(
         expiry_unix: (now_unix() as i64 + expiry_offset_secs) as u64,
         is_ca,
         tenant: tenant.map(String::from),
+        input_closure_digest: String::new(),
     };
     HmacSigner::from_key(TEST_KEY.to_vec()).sign(&claims)
 }
@@ -256,6 +257,7 @@ async fn hmac_wrong_key_signed_rejected() -> TestResult {
         expiry_unix: now_unix() + 60,
         is_ca: false,
         tenant: None,
+        input_closure_digest: String::new(),
     };
     let bad_token = HmacSigner::from_key(wrong_key.to_vec()).sign(&claims);
 
@@ -359,7 +361,7 @@ fn ca_path_for(name: &str, nar: &[u8]) -> String {
         .to_string()
 }
 
-// r[verify sec.authz.ca-path-derived+2]
+// r[verify sec.authz.ca-path-derived+3]
 #[tokio::test]
 async fn hmac_is_ca_correct_path_accepted() -> TestResult {
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
@@ -377,7 +379,7 @@ async fn hmac_is_ca_correct_path_accepted() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+2]
+// r[verify sec.authz.ca-path-derived+3]
 #[tokio::test]
 async fn hmac_is_ca_wrong_path_rejected() -> TestResult {
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
@@ -401,7 +403,7 @@ async fn hmac_is_ca_wrong_path_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+2]
+// r[verify sec.authz.ca-path-derived+3]
 /// bug_094: pre-fix, `claim_placeholder` ran BEFORE `verify_ca_store_path`
 /// for is_ca tokens, so a compromised worker could open a PutPath stream
 /// to ANY path, send one chunk (no trailer), and hold the `'uploading'`
@@ -500,7 +502,7 @@ async fn hmac_is_ca_wrong_hash_part_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+2]
+// r[verify sec.authz.ca-path-derived+3]
 /// `PutPathBatch` is the multi-output endpoint builders use; the CA
 /// path-derivation gate must apply there too. Same attack as
 /// [`hmac_is_ca_wrong_path_rejected`] but via the batch RPC.

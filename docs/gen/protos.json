@@ -19,9 +19,21 @@
     ],
     "doc": "Executor-facing RPCs served by the rio-scheduler process."
   },
+  "castore.proto": {
+    "services": [],
+    "doc": "Content-addressed Directory DAG (ADR-022 §2.2/§8). Vendored from"
+  },
   "dag.proto": {
     "services": [],
     "doc": "DAG wire types — derivation nodes/edges and per-derivation events."
+  },
+  "derivation.proto": {
+    "services": [],
+    "doc": "Canonical stored/negotiated form of a Nix derivation (ADR-024,"
+  },
+  "evaljob.proto": {
+    "services": [],
+    "doc": "Worker-channel frames for the `rio build` coordinator ↔ eval-parent"
   },
   "scheduler.proto": {
     "services": [
@@ -32,7 +44,9 @@
   "store.proto": {
     "services": [
       "StoreService",
+      "DirectoryService",
       "ChunkService",
+      "DrvBlobService",
       "StoreAdminService"
     ],
     "doc": "Store service for NAR storage and path metadata."

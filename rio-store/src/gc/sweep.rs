@@ -205,20 +205,20 @@ async fn select_sweep_order(conn: &mut sqlx::PgConnection) -> Result<Vec<Vec<u8>
     Ok(out)
 }
 
-/// Delete one swept path's metadata: realisations + path_tenants +
-/// narinfo (CASCADE → manifests/manifest_data). Runs inside the
-/// caller's batch transaction.
-///
-/// Returns `false` if narinfo was already gone (defensive; shouldn't
-/// happen under FOR UPDATE). Chunk refcount handling
-/// ([`decrement_and_enqueue`]) is the caller's responsibility — this
-/// only touches the path-keyed tables.
+/// Delete one swept path's metadata (realisations + path_tenants +
+/// narinfo CASCADE). `None` if narinfo was already gone, else the
+/// distinct `dir_digest`s its `nar_index` referenced — read BEFORE the
+/// manifest CASCADE removes the row. The batch loop accumulates these
+/// so the directory decrement is one btree-ordered UPDATE
+/// (`r[store.chunk.lock-order]`). Chunk and directory refcount
+/// handling is the caller's responsibility.
 // r[impl store.realisation.gc-sweep]
 // r[impl store.gc.sweep-path-tenants]
+// r[impl store.castore.gc]
 async fn delete_swept_path(
     tx: &mut Transaction<'_, Postgres>,
     store_path_hash: &[u8],
-) -> Result<bool, sqlx::Error> {
+) -> Result<Option<Vec<[u8; 32]>>, sqlx::Error> {
     // Step 2a: DELETE realisations. NOT via CASCADE — realisations has
     // NO FK to narinfo (002_store.sql:134). Without this, dangling
     // realisations rows point to swept paths → wopQueryRealisation
@@ -246,39 +246,139 @@ async fn delete_swept_path(
         .execute(&mut **tx)
         .await?;
 
-    // Step 2b: DELETE narinfo. CASCADE takes manifests, manifest_data.
+    // Step 2a'': read castore digests before the CASCADE removes the
+    // row. Decode failure logs and leaks one path's refcounts rather
+    // than wedging GC.
+    let dirs = {
+        let entries: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT entries FROM nar_index WHERE store_path_hash = $1")
+                .bind(store_path_hash)
+                .fetch_optional(&mut **tx)
+                .await?;
+        match entries.as_deref().map(crate::nar_index::digests_from_index) {
+            Some(Ok(dirs)) => dirs,
+            Some(Err(e)) => {
+                warn!(
+                    store_path_hash = %hex::encode(store_path_hash),
+                    error = %e,
+                    "nar_index.entries decode failed at GC; directory refcounts leak for this path"
+                );
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
+    };
+
+    // Step 2b: DELETE narinfo. CASCADE takes manifests, manifest_data,
+    // nar_index, file_blobs, directory_paths.
     let deleted = sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
         .bind(store_path_hash)
         .execute(&mut **tx)
         .await?;
-    Ok(deleted.rows_affected() > 0)
+    Ok((deleted.rows_affected() > 0).then_some(dirs))
 }
+
+/// Decrement `directories.refcount` for the batch's swept paths and
+/// hard-delete bodies that drop to zero. Runs once after the per-path
+/// loop so row locks are taken in one btree-ordered pass.
+///
+/// `dir_counts[d]` = swept-paths-referencing-`d` — the inverse of
+/// `set_nar_index`'s per-path `+1`. The `directory_paths`/`file_blobs`
+/// junctions need no cleanup here: they CASCADE-delete with their
+/// `manifests` parent.
+// r[impl store.castore.gc]
+async fn decrement_directory_refs(
+    tx: &mut Transaction<'_, Postgres>,
+    dir_counts: &BTreeMap<[u8; 32], i64>,
+) -> Result<(), sqlx::Error> {
+    if dir_counts.is_empty() {
+        return Ok(());
+    }
+    let (digests, counts): (Vec<Vec<u8>>, Vec<i64>) =
+        dir_counts.iter().map(|(d, n)| (d.to_vec(), *n)).unzip();
+    sqlx::query(
+        r#"
+        UPDATE directories d
+           SET refcount = d.refcount - u.n
+          FROM UNNEST($1::bytea[], $2::bigint[]) AS u(digest, n)
+         WHERE d.digest = u.digest
+        "#,
+    )
+    .bind(&digests)
+    .bind(&counts)
+    .execute(&mut **tx)
+    .await?;
+    // Hard-delete zeroed digests; CASCADE takes `directory_paths`.
+    sqlx::query("DELETE FROM directories WHERE digest = ANY($1::bytea[]) AND refcount <= 0")
+        .bind(&digests)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// The `narinfo.references` referrer probe of
+/// [`recheck_has_live_referrer`], parameterized on the candidate's
+/// TEXT store_path (`$1`).
+///
+/// The path is resolved hash→store_path in Rust FIRST (one PK point
+/// lookup) and bound directly, instead of inlining the lookup as a
+/// scalar subquery in the array constructor
+/// (`ARRAY[(SELECT store_path FROM narinfo WHERE ...)]`). With the
+/// inlined subquery the planner stopped using
+/// `idx_narinfo_references_gin` and seq-scanned `narinfo` per probe —
+/// 51.6 ms/probe at 225k rows, 2 probes/path, 98% of post-cascade-fix
+/// sweep time. With a plain TEXT parameter the `@>` probe is a Bitmap
+/// Index Scan again (the M_008/I-145 plan this code always intended).
+/// `sweep_referrer_probe_uses_gin_index` EXPLAIN-asserts the plan.
+///
+/// The NOT EXISTS anti-join probes `sweep_unreachable` by its PRIMARY
+/// KEY (`path_hash`), so no extra index is needed on the temp table.
+///
+/// `const` so the EXPLAIN regression test runs the exact production
+/// SQL, not a copy that can drift.
+const LIVE_REFERRER_PROBE_SQL: &str = r#"
+    SELECT EXISTS (
+        SELECT 1 FROM narinfo n
+         WHERE n."references" @> ARRAY[$1::text]
+           AND NOT EXISTS (
+             SELECT 1 FROM sweep_unreachable su
+              WHERE su.path_hash = n.store_path_hash
+           )
+    )
+"#;
 
 /// Re-check whether `store_path_hash` has any concurrent-writable mark
 /// seed: (i) a `narinfo.references` referrer outside the
 /// `sweep_unreachable` temp table, (ii) a direct `scheduler_live_pins`
 /// entry, or (iii) a `path_tenants` row inside any tenant's retention
 /// window. See the call-site comment in [`sweep`] for the
-/// GIN/anti-join rationale.
+/// GIN/anti-join rationale and [`LIVE_REFERRER_PROBE_SQL`] for why the
+/// hash→store_path resolution happens in Rust.
 async fn recheck_has_live_referrer(
     tx: &mut Transaction<'_, Postgres>,
     store_path_hash: &[u8],
 ) -> Result<bool, sqlx::Error> {
+    // Resolve the candidate's TEXT store_path (PK point lookup). NULL
+    // (no narinfo row — matches the old ARRAY[NULL]-never-contains
+    // behavior) skips the referrer probe; pins/retention still apply.
+    let store_path: Option<String> =
+        sqlx::query_scalar("SELECT store_path FROM narinfo WHERE store_path_hash = $1")
+            .bind(store_path_hash)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if let Some(path) = store_path {
+        let referred: bool = sqlx::query_scalar(LIVE_REFERRER_PROBE_SQL)
+            .bind(&path)
+            .fetch_one(&mut **tx)
+            .await?;
+        if referred {
+            return Ok(true);
+        }
+    }
     sqlx::query_scalar(
         r#"
         SELECT
-          EXISTS (
-            SELECT 1 FROM narinfo n
-             WHERE n."references" @> ARRAY[
-                     (SELECT store_path FROM narinfo WHERE store_path_hash = $1)
-                   ]
-               AND NOT EXISTS (
-                 SELECT 1 FROM sweep_unreachable su
-                  WHERE su.path_hash = n.store_path_hash
-               )
-             LIMIT 1
-          )
-          OR EXISTS (SELECT 1 FROM scheduler_live_pins WHERE store_path_hash = $1)
+          EXISTS (SELECT 1 FROM scheduler_live_pins WHERE store_path_hash = $1)
           OR EXISTS (
             SELECT 1 FROM path_tenants pt
               JOIN tenants t USING (tenant_id)
@@ -565,16 +665,18 @@ async fn sweep_one_batch(
         // (there is no advisory lock).
         // r[impl store.gc.sweep-recheck+2]
         //
-        // The subquery resolves hash→path because narinfo."references"
-        // is TEXT[] (store_path strings, not hashes). The GIN index
-        // (migration 008) makes `"references" @> ARRAY[$path]` an
-        // index scan. I-145: the previous `$path = ANY("references")`
-        // form is semantically equivalent but does NOT use GIN — PG's
-        // array-GIN opclass supports `@>`/`<@`/`&&`/`=` only, and the
-        // planner does not rewrite `scalar = ANY(arrcol)` into `@>`.
-        // At 100k+ narinfo rows that was a ~1.3s seqscan per swept
-        // path. EXPLAIN-verified: `@>` → Bitmap Index Scan on
-        // idx_narinfo_references_gin even with the InitPlan subquery.
+        // The hash→path resolution happens in Rust (PK point lookup)
+        // because narinfo."references" is TEXT[] (store_path strings,
+        // not hashes) and the GIN index (migration 008) only
+        // participates when `"references" @> ARRAY[$path]` gets a
+        // plain parameter. I-145: the original `$path =
+        // ANY("references")` form does NOT use GIN — PG's array-GIN
+        // opclass supports `@>`/`<@`/`&&`/`=` only, and the planner
+        // does not rewrite `scalar = ANY(arrcol)` into `@>`. The
+        // intermediate `@> ARRAY[(SELECT ...)]` form regressed the
+        // same way: the scalar subquery inside the array constructor
+        // also defeated the index (51.6 ms seqscan per probe at 225k
+        // rows). See LIVE_REFERRER_PROBE_SQL and its EXPLAIN test.
         //
         // The NOT EXISTS anti-join against sweep_unreachable
         // excludes referrers that are themselves in the unreachable
@@ -649,19 +751,27 @@ async fn sweep_one_batch(
     // referenced by N paths in this batch must be decremented by N
     // (each PutPath did refcount += 1). The previous BTreeSet
     // collapsed N→1 → permanent S3 leak (refcount stuck ≥1).
+    //
+    // `dir_counts` is the castore analogue: directory refcounts
+    // decrement by N-referencing-paths. `file_blobs`/`directory_paths`
+    // junctions CASCADE off `manifests`; no manual cleanup.
     let mut hash_counts: BTreeMap<[u8; 32], i64> = BTreeMap::new();
+    let mut dir_counts: BTreeMap<[u8; 32], i64> = BTreeMap::new();
     for (store_path_hash, chunk_list) in to_delete {
         if !still_unreachable.contains(store_path_hash) {
             delta.paths_resurrected += 1;
             continue;
         }
 
-        if !delete_swept_path(&mut tx, store_path_hash).await? {
+        let Some(dirs) = delete_swept_path(&mut tx, store_path_hash).await? else {
             // narinfo already gone (concurrent sweep? shouldn't
             // happen under FOR UPDATE). Skip chunk handling.
             continue;
-        }
+        };
         delta.paths_deleted += 1;
+        for d in dirs {
+            *dir_counts.entry(d).or_default() += 1;
+        }
 
         if let Some(bytes) = chunk_list {
             for h in parse_unique_chunk_hashes(&bytes) {
@@ -679,6 +789,8 @@ async fn sweep_one_batch(
     delta.chunks_deleted += dec.chunks_zeroed;
     delta.s3_keys_enqueued += dec.s3_keys_enqueued;
     delta.bytes_freed += dec.bytes_freed;
+
+    decrement_directory_refs(&mut tx, &dir_counts).await?;
 
     if dry_run {
         // Rollback DELETES only; closure_remove temp-table writes
@@ -845,17 +957,14 @@ async fn sweep_orphan_batch(
     // No FOR UPDATE needed on the outer SELECT: the UPDATE's WHERE
     // clause IS the guard. PG's row-level locking for UPDATE
     // serializes against the PutPath UPSERT on the same blake3_hash.
-    let zeroed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
-        r#"
-        UPDATE chunks SET deleted = TRUE, uploaded_at = NULL
-         WHERE blake3_hash = ANY($1)
-           AND refcount = 0 AND deleted = FALSE
-        RETURNING blake3_hash, size
-        "#,
-    )
-    .bind(hashes)
-    .fetch_all(&mut *tx)
-    .await?;
+    //
+    // The shared tombstone helper clears `uploaded_at` and `durable`
+    // along with `deleted` — both assert "the S3 object exists" and
+    // the drain is about to delete it. See
+    // [`super::tombstone_zero_refcount_chunks`] for the resurrection
+    // contract; using the one helper keeps this site and the path-GC
+    // route (`decrement_hashes_and_enqueue`) from diverging.
+    let zeroed = super::tombstone_zero_refcount_chunks(&mut tx, hashes).await?;
 
     let zd = zeroed.len() as u64;
     let bf = zeroed.iter().map(|(_, s)| *s as u64).sum::<u64>();
@@ -961,6 +1070,149 @@ mod tests {
             realisations_count, 0,
             "sweep should delete realisations pointing to swept path (no FK CASCADE)"
         );
+    }
+
+    /// Castore GC: shared `directories` refcount decrements per
+    /// referencing-path GC; row hard-deletes at zero. `file_blobs` /
+    /// `directory_paths` rows for the surviving referrer remain
+    /// (junctions CASCADE off `manifests`).
+    // r[verify store.castore.gc]
+    #[tokio::test]
+    async fn sweep_decrements_directory_refcounts() {
+        use prost::Message;
+        use rio_proto::types::{NarEntryKind as PK, NarIndex, NarIndexEntry};
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // Zero retention so the path_tenants row inserted below doesn't
+        // mark the path as still-live in `recheck_has_live_referrer`.
+        let tenant = TenantSeed::new("castore-gc")
+            .with_retention_hours(0)
+            .seed(&db.pool)
+            .await;
+
+        let shared_dir = [0xAAu8; 32];
+        let unique_dir_a = [0xBBu8; 32];
+        let shared_blob = [0xCCu8; 32];
+
+        // `nar_index.entries` must decode for the sweep to find the
+        // dir/file digests; build a real proto.
+        let mk_entries = |dirs: &[[u8; 32]]| {
+            let mut idx = NarIndex {
+                entries: vec![NarIndexEntry {
+                    path: b"f".to_vec(),
+                    kind: PK::Regular.into(),
+                    file_digest: shared_blob.to_vec(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            for d in dirs {
+                idx.entries.push(NarIndexEntry {
+                    kind: PK::Directory.into(),
+                    dir_digest: d.to_vec(),
+                    ..Default::default()
+                });
+            }
+            idx.encode_to_vec()
+        };
+        let mk_dag = |dirs: &[[u8; 32]]| crate::castore::DirectoryDag {
+            directories: dirs.iter().map(|d| (*d, b"body".to_vec())).collect(),
+            file_blobs: vec![(shared_blob, 0, 8)],
+            ..Default::default()
+        };
+
+        let mut hashes = Vec::new();
+        for (n, dirs) in [
+            ("castore-gc-a", &[shared_dir, unique_dir_a][..]),
+            ("castore-gc-b", &[shared_dir][..]),
+        ] {
+            let p = test_store_path(n);
+            let h_vec = StoreSeed::raw_path(&p)
+                .with_inline_blob(b"x".as_slice())
+                .seed(&db.pool)
+                .await;
+            let h: [u8; 32] = h_vec.as_slice().try_into().unwrap();
+            sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+                .bind(h.as_slice())
+                .bind(tenant)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            let mut tx = db.pool.begin().await.unwrap();
+            crate::metadata::set_nar_index_in_conn(&mut tx, &h, &mk_entries(dirs), &mk_dag(dirs))
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            hashes.push(h_vec);
+        }
+
+        let rc = |digest: [u8; 32]| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i32>("SELECT refcount FROM directories WHERE digest = $1")
+                    .bind(digest.as_slice())
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        assert_eq!(rc(shared_dir).await, Some(2));
+        assert_eq!(rc(unique_dir_a).await, Some(1));
+
+        // GC A: shared decrements to 1, unique deletes.
+        sweep(
+            &db.pool,
+            None,
+            vec![hashes[0].clone()],
+            false,
+            &no_shutdown(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rc(shared_dir).await, Some(1));
+        assert_eq!(
+            rc(unique_dir_a).await,
+            None,
+            "zero-refcount dir hard-deleted"
+        );
+
+        // file_blobs / directory_paths: B's rows survive (CASCADE off
+        // B's manifest, not A's).
+        let fb: i64 = sqlx::query_scalar("SELECT count(*) FROM file_blobs WHERE digest = $1")
+            .bind(shared_blob.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(fb, 1, "B's file_blobs row survives GC of A");
+        let dp: i64 = sqlx::query_scalar("SELECT count(*) FROM directory_paths WHERE digest = $1")
+            .bind(shared_dir.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(dp, 1, "B's directory_paths row survives GC of A");
+
+        // GC B: shared dir hard-deletes; all junctions gone (CASCADE).
+        sweep(
+            &db.pool,
+            None,
+            vec![hashes[1].clone()],
+            false,
+            &no_shutdown(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rc(shared_dir).await, None);
+        let dp: i64 = sqlx::query_scalar("SELECT count(*) FROM directory_paths")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(dp, 0, "directory_paths cascade-deleted");
+        let fb: i64 = sqlx::query_scalar("SELECT count(*) FROM file_blobs")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(fb, 0, "file_blobs cascade-deleted");
     }
 
     /// merged_bug_019: dry-run must NOT increment any of the three
@@ -2036,6 +2288,63 @@ mod tests {
         assert_eq!(pt_b, 1, "B's fresh path_tenants row survives");
     }
 
+    /// Plan-shape regression guard for the GC referrer probe:
+    /// `references @> ARRAY[$1::text]` must be answerable by
+    /// `idx_narinfo_references_gin`. The previous shape inlined the
+    /// hash→path resolution as a scalar subquery INSIDE the array
+    /// constructor (`@> ARRAY[(SELECT store_path ...)]`), which
+    /// silently demoted the probe to a seq scan per call (51.6 ms at
+    /// 225k narinfo rows, 2 calls/path — 98% of sweep wall time).
+    ///
+    /// `SET LOCAL enable_seqscan = off` makes this structural, not
+    /// cost-based: it does NOT force an index scan into existence — a
+    /// non-indexable query shape still plans a (cost-penalized) Seq
+    /// Scan — so "no Seq Scan on narinfo" proves the query SHAPE is
+    /// GIN-indexable regardless of test-table size, where default
+    /// costing on a near-empty table would prefer the seq scan and
+    /// make the assertion vacuous.
+    ///
+    /// The probe SQL is the production const with the parameter
+    /// spliced as a literal: PG's extended protocol rejects bind
+    /// parameters in utility statements (EXPLAIN), and a literal
+    /// plans with the same custom-plan shape the first executions of
+    /// the prepared form use.
+    #[tokio::test]
+    async fn sweep_referrer_probe_uses_gin_index() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // One narinfo row so the planner has a real table + index.
+        StoreSeed::path("gin-probe").seed(&db.pool).await;
+
+        let mut conn = db.pool.acquire().await.unwrap();
+        setup_sweep_unreachable(&mut conn, &[vec![0u8; 32]])
+            .await
+            .unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let probe = LIVE_REFERRER_PROBE_SQL.replace("$1::text", "'/nix/store/x-gin-probe'::text");
+        assert_ne!(probe, LIVE_REFERRER_PROBE_SQL, "splice must hit");
+        // AssertSqlSafe: production const + a fixed literal, test-only.
+        let plan_rows: Vec<String> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN {probe}")))
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+        let plan = plan_rows.join("\n");
+        assert!(
+            plan.contains("idx_narinfo_references_gin"),
+            "referrer probe must use the GIN index; plan:\n{plan}"
+        );
+        assert!(
+            !plan.contains("Seq Scan on narinfo"),
+            "referrer probe must not seq-scan narinfo (even with \
+             enable_seqscan=off a non-indexable shape still plans one); plan:\n{plan}"
+        );
+        tx.rollback().await.unwrap();
+    }
+
     /// bug_329: sweep batch with cross-path chunk hashes locks via ONE
     /// `ANY($1)` (btree-scan order) → no 40P01 against a per-row
     /// contender obeying r\[store.chunk.lock-order\].
@@ -2206,6 +2515,62 @@ mod tests {
                 .unwrap();
         assert_eq!(refcount, 1);
         assert!(!deleted, "inner UPDATE rejected (not skipped)");
+    }
+
+    // r[verify store.chunk.durable-flag]
+    /// Regression: the sweep MUST clear `durable` along with
+    /// `uploaded_at` when it marks a chunk deleted. `durable` means
+    /// "the S3 object provably exists and a complete manifest
+    /// references it" — both halves become false the moment the sweep
+    /// enqueues the S3 delete. If the flag survives, a later upload
+    /// that resurrects the row (`ON CONFLICT … SET refcount+1,
+    /// deleted=false`) instantly satisfies HasChunks' `durable AND NOT
+    /// deleted` predicate *before* its S3 PutObject lands; a builder
+    /// that trusts that answer omits the chunk from its upload and the
+    /// digest is stranded — the exact I-201 race `durable` exists to
+    /// close, reopened through the GC round-trip.
+    #[tokio::test]
+    async fn sweep_clears_durable_so_resurrection_starts_non_durable() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // A durable, S3-confirmed, complete-manifest-referenced chunk
+        // whose last referencing manifest has since been GC'd
+        // (refcount back to 0, past grace).
+        let hash = seed_orphan_chunk(&db.pool, 0xD7, 4096, 200).await;
+        sqlx::query("UPDATE chunks SET durable = TRUE, uploaded_at = now() WHERE blake3_hash = $1")
+            .bind(hash.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let (deleted, _) = sweep_orphan_chunks(&db.pool, None, 100).await.unwrap();
+        assert_eq!(deleted, 1, "the orphan chunk must be reaped");
+
+        // Simulate the resurrection upsert
+        // (`upgrade_manifest_to_chunked`'s ON CONFLICT branch).
+        sqlx::query(
+            "UPDATE chunks SET refcount = refcount + 1, deleted = false \
+             WHERE blake3_hash = $1",
+        )
+        .bind(hash.as_slice())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // The HasChunks predicate over the resurrected row: it must
+        // answer ABSENT until a new complete manifest re-flips
+        // `durable` after the S3 object provably exists again.
+        let visible: bool =
+            sqlx::query_scalar("SELECT durable AND NOT deleted FROM chunks WHERE blake3_hash = $1")
+                .bind(hash.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(
+            !visible,
+            "a swept-then-resurrected chunk must not satisfy HasChunks' \
+             durable-presence predicate before its S3 object is re-uploaded"
+        );
     }
 
     /// Regression: concurrent orphan-chunk sweep vs another chunk

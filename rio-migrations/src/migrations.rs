@@ -27,10 +27,27 @@
 //! frozen at whatever path was current when the migration shipped.
 //!
 //! The try-then-wait advisory-lock runner that applies these lives in
-//! `rio_migrations::migrate::run` — both rio-store and rio-scheduler run
-//! the SAME migration set against the SAME database under the same
-//! lock key (`rio_migrations::migrate::MIGRATE_LOCK_ID`), so the runner is
-//! shared, not crate-local.
+//! `rio_migrations::migrate` (`run_with_roles`, called by `rio-store
+//! migrate`); app services only verify via `assert_current`. Role and
+//! grant management is deliberately NOT in this migration set — see
+//! `src/ensure_roles.rs` for why frozen SQL is the wrong home for
+//! desired-state reconciliation.
+//!
+//! **NUMBERING POLICY:** migration numbers are allocated by the
+//! branch that deploys to a persistent DB. A stacked branch's
+//! migrations are review artifacts; whichever branch integrates
+//! second renumbers ONLY migrations that no persistent DB has
+//! applied, adopting the deployed branch's files byte-identically.
+//! Numbers a persistent DB has recorded are never reused — see the
+//! burned-numbers note after `M_064` below. With
+//! `ignore_missing(true)` permanently on in the runner
+//! (`migrate.rs`), sqlx no longer errors on an orphaned applied row:
+//! accidentally RENUMBERING an already-applied migration (same
+//! content, new version) would silently RE-APPLY its SQL on the
+//! persistent DB instead of failing `VersionMissing`. The reverse
+//! check in `migration_checksums_frozen` ("PINNED lists migration v
+//! but migrations/ has no such file") is now the ONLY guard against
+//! that — do not weaken it.
 
 #![allow(dead_code)] // M_NNN doc-consts; never referenced, only `cargo doc`'d
 
@@ -51,6 +68,17 @@
 /// verifies as a Bitmap Index Scan on `idx_narinfo_references_gin`.
 /// The index itself was always correct; only the comment and the
 /// caller were wrong.
+///
+/// **Second regression (same index, different shape):** the rewrite
+/// initially inlined the hash→path resolution as a scalar subquery in
+/// the array constructor (`@> ARRAY[(SELECT store_path FROM narinfo
+/// WHERE store_path_hash = $1)]`), and the earlier "EXPLAIN-verified
+/// even with the InitPlan subquery" claim here did not hold at scale:
+/// at 225k narinfo rows the planner seq-scanned again (51.6 ms/probe,
+/// 2 probes/path — 98% of sweep time once the file_blobs cascade was
+/// fixed by 071). The probe now resolves the path in Rust and binds
+/// TEXT directly (`LIVE_REFERRER_PROBE_SQL` in sweep.rs, with an
+/// EXPLAIN regression test).
 pub const M_008: () = ();
 
 /// `migrations/009_phase4.sql`
@@ -1155,6 +1183,201 @@ pub const M_063: () = ();
 ///
 /// Read/written by **rio-scheduler** only.
 pub const M_064: () = ();
+
+/// `migrations/065_nar_index.sql`
+///
+/// ADR-022 castore schema, all in one migration so it's pinned once:
+///
+/// - **P0551** (this commit): `nar_index` (`entries` = encoded
+///   `rio.types.NarIndex`) + `manifests.nar_indexed` partial-index
+///   work-queue (same pattern as 031). Derived state, FK→`manifests`
+///   `ON DELETE CASCADE`. PG forbids cross-table partial-index
+///   predicates, hence the same-table bool flag (HOT-update eligible).
+/// - **P0572** (pre-created): `nar_index.root_node`, `directories` +
+///   `directory_tenants` (refcounted content-addressed `Directory`
+///   bodies), `file_blobs` + `file_blob_tenants` (`(file_digest,
+///   manifest)` junction — GC of one referrer leaves the other's row).
+/// - **P0581** (pre-created): `narinfo.compat_file_hash` for
+///   legacy-binary-cache compat-write GC coupling.
+/// - **P0586** (pre-created): `chunks.durable` + partial index —
+///   "S3-PUT-confirmed" presence flag closing the I-201 WAL-window
+///   race in `HasChunks`/`FindMissingChunks`.
+///
+/// **NOT here:** P0583's `DROP COLUMN inline_blob` — the store still
+/// reads it (`metadata::get_manifest`, `cas.rs`, `get_path.rs`); that
+/// DROP gets its own migration once the inline-storage path is gone.
+///
+/// Plan called this `054`; 054-061 landed first (061 went to
+/// `drv_logs` on main) and 062-064 (wanted-outputs, topdown_pruned,
+/// closure_hole) landed while ADR-022 was in flight, so it's 065.
+pub const M_065: () = ();
+
+/// 066 — `file_blobs.size` (P0577/P0570).
+///
+/// Denormalizes file content length onto the `file_blobs` junction so
+/// `ReadBlob`/`StatBlob` compute the chunk window from one row. The
+/// alternative is fetching and decoding `nar_index.entries` per call:
+/// O(files-in-NAR), ~2.5 MB for a 25k-file chromium output, on the
+/// FUSE `open()` fast path. Size is content-derived (same digest ⇒
+/// same bytes ⇒ same size), so two rows for one digest cannot
+/// disagree.
+///
+/// `DEFAULT 0` keeps the `ALTER` rewrite-free and lets test fixtures
+/// that don't exercise size (`HasBlobs`) omit the column. There are
+/// no pre-066 rows to backfill: 065 and 066 ship in the same release.
+pub const M_066: () = ();
+
+/// 067 — `directory_paths` + drop `directory_tenants`/`file_blob_tenants`.
+///
+/// 065's `directory_tenants`/`file_blob_tenants` were a one-shot
+/// snapshot of `path_tenants` taken at first-index time inside
+/// `set_nar_index`. Two unsound consequences:
+///
+/// - **Cross-tenant pick.** `file_blob_tenants` is keyed `(digest,
+///   tenant)` — coarser than `file_blobs`' `(digest, store_path_hash)`.
+///   The blob-fetch query joined on digest only, then `LIMIT 1` with no
+///   `ORDER BY`, so it could return another tenant's NAR window/chunk
+///   list for a content-shared digest.
+/// - **Late-tenant lockout.** Nothing resynced the junctions after
+///   first-index. A tenant that gains a `path_tenants` row later
+///   (cache hit, scheduler race) was permanently denied DirectoryService
+///   reads for a path they legitimately own.
+///
+/// Fix: derive tenancy at read time from `path_tenants`, the single
+/// source of truth. `file_blobs` already carries `store_path_hash`;
+/// `directory_paths` is the analogous linkage for `directories` (one
+/// row per `(Directory body, NAR containing it)`, FK CASCADE on both
+/// sides — GC of either parent removes the row).
+pub const M_067: () = ();
+
+/// 068 — drop `manifests.nar_indexed` + `manifests_nar_index_pending_idx`.
+///
+/// Both were the background NAR indexer's work-queue state (065/P0551):
+/// the partial index `WHERE NOT nar_indexed AND status = 'complete'`
+/// fed the indexer's drain query, and the flag flipped once a path's
+/// castore index was written. The background indexer is gone — the
+/// castore index is now written eagerly in the same transaction that
+/// completes the manifest (`complete_manifest_in_conn` →
+/// `set_nar_index_in_conn`), so the flag was write-only and the partial
+/// index had zero readers while still being maintained on every
+/// `manifests` UPDATE.
+pub const M_068: () = ();
+
+// BURNED NUMBERS — 069 and 070 (next free migration: 076):
+//
+// - 069/070 were rio_app role/grant migrations that ARE applied on
+//   the persistent DB (recorded rows in `_sqlx_migrations`) and were
+//   then retired: role/grant management moved out of the frozen
+//   migration set into the runner's `ensure_roles` pass
+//   (src/ensure_roles.rs — see its module docs for the two live
+//   incidents that forced the move). Their applied rows stay as
+//   harmless history.
+//
+//   UNLIKE the M_055 gap above — a never-applied number that sqlx
+//   tolerates WITHOUT ignore_missing because no `_sqlx_migrations`
+//   row exists anywhere — 069/070 ARE applied rows: un-embedding
+//   them is safe ONLY because the runner sets `ignore_missing(true)`
+//   (migrate.rs). Reverting that flag would brick deploys against
+//   the persistent DB with `VersionMissing(69)`.
+
+/// 071 — `file_blobs(store_path_hash)` index for the GC-sweep FK CASCADE.
+///
+/// GC sweep deletes a path's `narinfo` row; the CASCADE chain runs
+/// `manifests` → `file_blobs`, and PG executes the referencing-side
+/// delete as `DELETE FROM file_blobs WHERE store_path_hash = $1`. The
+/// PK is `(digest, store_path_hash)` — leading column `digest` — so
+/// without a dedicated index that delete is O(table) per swept path.
+/// `directory_paths` (the castore sibling junction) got the analogous
+/// `directory_paths_path_idx` at creation in 067; `file_blobs`
+/// (created in 065, pre-dating the GC-scale work) never did.
+///
+/// Measured on a 100×-scale copy of the dev DB (12M `file_blobs`
+/// rows): 130.8 ms/path for the cascade without the index, 0.61 ms
+/// with it (~214×); a 1000-path sweep dropped 170.8 s → 40.7 s.
+///
+/// CONCURRENTLY + `-- no-transaction` (precedent: 011/022): plain
+/// `CREATE INDEX` takes a SHARE lock that blocks every `file_blobs`
+/// writer (PutPath castore indexing) for the duration of a build over
+/// millions of rows while the previous release is still serving. The
+/// runner's try-then-wait advisory lock was built to allow CIC
+/// (I-194). `IF NOT EXISTS` + the documented DROP-then-rerun recovery
+/// for a failed half-built INVALID index follow 022 verbatim.
+pub const M_071: () = ();
+
+/// 072 — drv blobs as a castore object kind + tenant-scoped chunk presence
+/// (ADR-024 P2).
+///
+/// `drv_blobs` stores the canonical proto `Derivation` bytes keyed by
+/// `digest = blake3(received bytes)` — the negotiation key of ADR-024's
+/// build plan. The store verifies every put server-side
+/// (`rio_proto::derivation_util::verify_drv_blob`: digest recompute,
+/// decode, structural validation, canonical re-encode byte-compare,
+/// drv_path recompute) so non-canonical bytes are never stored; `body`
+/// is therefore byte-identical to what the client sent AND to the
+/// canonical encoding. Bodies live in PG like `directories.body` — drv
+/// blobs are a few KB (3.4 KB mean), the same size class as Directory
+/// bodies, and far below the chunked-CAS minimum.
+///
+/// `drv_path_hash = sha256(drv_path)` is denormalized at insert so the
+/// GC drv sweep joins `scheduler_live_pins.store_path_hash` (the same
+/// keying `pin_live_inputs` writes) without computing digests in SQL —
+/// a drv blob referenced by a live build survives GC through the
+/// existing pin mechanism, no parallel pin table.
+///
+/// `drv_blob_tenants` follows the `path_tenants` junction pattern:
+/// presence (`HasDrvs`) and reads (`GetDrvBlob`) are tenant-scoped,
+/// storage is digest-keyed global (dedup at rest unaffected).
+///
+/// `chunk_tenants` re-creates migration 018's table (dropped as dead in
+/// 035 when the global-namespace HasChunks shipped): ADR-024 settles
+/// presence as tenant-scoped for ALL object kinds, so `HasChunks` now
+/// answers present only for chunks the calling tenant has seen — a row
+/// is written for every chunk of a manifest when that manifest
+/// completes for a tenant. Migration honesty: chunks ingested before
+/// this migration have no tenant rows, so presence answers false and
+/// the next upload re-sends them — the write-through idempotent put
+/// (S3 PutObject overwrite of identical content) binds visibility
+/// without any backfill. No `(tenant_id, …)` secondary index this
+/// time: the only reader is `HasChunks`' `(blake3_hash = ANY, tenant_id
+/// =)` probe, which the PK serves.
+pub const M_072: () = ();
+
+/// 073 — persisted failure reason + culprit execution on `derivations`.
+///
+/// `failure_msg` is the builder-reported error text of the attempt that
+/// drove the derivation terminal-failed (Poisoned), truncated scheduler-
+/// side to ~4 KiB. `failure_exec_id` is the execution that produced it
+/// (the `exec_id_for_terminal` resolution at the poison site) — NULLable
+/// because a derivation can poison without ever reaching a worker
+/// (fleet exhaustion while Ready, recovery-time poison adoption).
+///
+/// Before this, the error text lived only in the live
+/// `DerivationEvent::failed` broadcast: a later build that fail-fasts on
+/// the already-poisoned node (merge-time `reconcile_preexisting`) had
+/// nothing to show the client beyond "derivation X failed", and named a
+/// cascaded ancestor rather than the real culprit. The merge fail-fast
+/// path point-SELECTs these columns to attribute the failure and to
+/// serve the original log tail (`GetDerivationLog`).
+///
+/// Both columns are per-poison-cycle state: `clear_poison`,
+/// `clear_poison_batch` (resubmit reset) NULL them so a stale reason
+/// can't outlive the failure it described.
+pub const M_073: () = ();
+
+/// 074/075 — lookup indexes for `SchedulerService.GetDerivationLog`.
+///
+/// The tenant-facing log RPC resolves "which execution may I serve"
+/// from PG: by drv path across the caller's builds when no build is
+/// pinned (074: `derivations(drv_path)` — only the unique `drv_hash`
+/// was indexed before), and by execution id when the client pins one
+/// (075: partial `build_derivations(exec_id)` — the column landed in
+/// 061 with no index because nothing probed it). Without these the
+/// per-request probes are seq scans over two of the largest scheduler
+/// tables. Two files, one `CREATE INDEX CONCURRENTLY` each — the
+/// single-statement no-transaction rule from 022/071.
+pub const M_074: () = ();
+/// See [`M_074`].
+pub const M_075: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,

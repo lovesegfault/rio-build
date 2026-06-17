@@ -12,6 +12,9 @@
   system,
   coverage ? false,
   lixPackage,
+  # The rio-eval eval-parent binary (nix/rio-eval.nix), the C++ half
+  # of the `rio build` pair for vm-build-client-standalone.
+  rioEval,
 }:
 let
   # Shared arg set for common.nix + every fixture. Fixtures take `...`
@@ -56,12 +59,24 @@ let
   fetcher-split = import ./scenarios/fetcher-split.nix;
   chaos = import ./scenarios/chaos.nix;
   ca-cutoff = import ./scenarios/ca-cutoff.nix;
+  put-path-chunked = import ./scenarios/put-path-chunked.nix;
+  build-client = import ./scenarios/build-client.nix;
   componentscaler = import ./scenarios/componentscaler.nix;
   substitute = import ./scenarios/substitute.nix;
   substitute-scale = import ./scenarios/substitute-scale.nix;
   sla-sizing = import ./scenarios/sla-sizing.nix;
   forecast-provisioning = import ./scenarios/forecast-provisioning.nix;
   kwok = import ./fixtures/kwok.nix { inherit pkgs; };
+  mountd = import ./scenarios/mountd.nix;
+  # castore-fuse exports { fuseClientModule, mkTest } — the client VM
+  # doubles as the FUSE/mountd machine, so the node config and the
+  # testScript that depends on it live in the same file.
+  castore-fuse = import ./scenarios/castore-fuse.nix { inherit pkgs common; };
+  # xfstests ports against the castore-FUSE — reuses castore-fuse's
+  # fuseClientModule (the client doubles as the FUSE/mountd machine).
+  # Selection + tiering: rio-builder/tests/xfstests_port/PLAN.md.
+  castore-fuse-xfstests = import ./scenarios/castore-fuse-xfstests.nix { inherit pkgs common; };
+  castore-e2e = import ./scenarios/castore-e2e.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
 
   # SLA-sizing fixture: one worker with RIO_BUILDER_SCRIPT pointing at
@@ -69,6 +84,11 @@ let
   # InjectBuildSample fixture gate. tickIntervalSecs=2 so the estimator
   # refit fires fast enough for wait_until_succeeds.
   slaSizingFixture = standalone {
+    # The scripted-telemetry intercept fires AFTER the castore mount +
+    # overlay setup (executor/mod.rs), so even these fake builds need
+    # the tenant-scoped DAG prefetch to succeed — see the
+    # vm-castore-e2e fixture comment.
+    defaultTenant = "vmtest";
     workers = {
       worker = {
         extraServiceEnv = {
@@ -129,6 +149,11 @@ let
 
   # Shared fixture for both scheduling splits — identical VM topology.
   schedulingFixture = standalone {
+    # Builds materialize inputs through the tenant-scoped castore reads
+    # — see the vm-castore-e2e fixture comment. grpcurl-direct submits
+    # (cancel-timing) pick the same tenant up via
+    # scheduling.nix:submit_build_grpc.
+    defaultTenant = "vmtest";
     workers = {
       # maxSilentTime enforcement on ALL scheduling workers. Every drv
       # that lands here MUST stay non-silent for ≥10s — cancelDrv echoes
@@ -145,11 +170,11 @@ let
       };
       worker2 = {
         extraServiceEnv = {
-          # Non-passthrough FUSE: exercises open_files tracking,
-          # userspace read(), release(). fuse/ops.rs read() at 33%
-          # coverage before this — passthrough bypasses the kernel
-          # callback entirely.
-          RIO_FUSE_PASSTHROUGH = "false";
+          # Passthrough disabled: castore open() replies KEEP_CACHE and
+          # serves read() from userspace (open_mode_total{keep_cache}
+          # path) — passthrough would bypass the kernel read callback
+          # entirely, leaving that branch uncovered in VM runs.
+          RIO_DISABLE_PASSTHROUGH = "true";
           RIO_MAX_SILENT_TIME_SECS = "10";
         };
       };
@@ -192,13 +217,6 @@ let
         max_mem = 2147483648
       '';
     };
-    extraStoreConfig = {
-      extraConfig = ''
-        [chunk_backend]
-        kind = "filesystem"
-        base_dir = "/var/lib/rio/store/chunks"
-      '';
-    };
     # grpcurl: cancel-timing submits + cancels via plaintext gRPC :9001
     # (no withHmac). ssh-ng:// doesn't surface build_id to the
     # client, and client-disconnect mid-wopBuildDerivation doesn't fire
@@ -222,14 +240,25 @@ let
   # its comment so the gateway mints a JWT for ssh-ng builds. Turned on
   # here for jwt-mount-present; the other splits inherit it via the
   # shared module and exercise the full tenant-authz path as a bonus.
+  #
+  # defaultTenant: P0560 stopgap — installs the rio_vmtest_* triggers
+  # in the k3s PG so vm-lifecycle builds get path_tenants rows for
+  # their castore inputs (the scenario keeps its own JWT/tenant
+  # attribution on top; gc-tenant-test has a real retention window and
+  # does its own input attribution in gc-sweep.nix).
   lifecycleMod = lifecycle {
     inherit pkgs common;
-    fixture = k3sFull { jwtEnabled = true; };
+    fixture = k3sFull {
+      jwtEnabled = true;
+      defaultTenant = "vmtest";
+    };
   };
 
   leMod = leader-election {
     inherit pkgs common;
-    fixture = k3sFull { };
+    # build-during-failover / sigkill-mid-build run real builds —
+    # P0560 stopgap, see the vm-castore-e2e fixture comment.
+    fixture = k3sFull { defaultTenant = "vmtest"; };
   };
 
   # Prod-parity lifecycle module. No jwtEnabled — bootstrap-job-ran +
@@ -253,6 +282,123 @@ in
   #   Gates Phase-2 boot-path changes (initrd-networkd, UKI, perlless).
   vm-nixos-node = import ./nixos-node.nix { inherit pkgs; };
 
+  # ── rio-mountd (P0567): the privileged broker, end-to-end ───────────
+  # The real rio-mountd binary against an XFS-prjquota staging loopback,
+  # driven over the SOCK_SEQPACKET protocol by spike_mountd_client.
+  # Subtest map and why perf is printed-not-gated: the scenario header.
+  # r[verify builder.mountd.fuse-handoff]
+  # r[verify builder.mountd.backing-broker]
+  # r[verify builder.mountd.concurrency]
+  # r[verify builder.mountd.build-id-validated]
+  # r[verify builder.mountd.build-id-unique]
+  # r[verify builder.mountd.one-mount]
+  # r[verify builder.mountd.staging-quota]
+  # r[verify builder.mountd.promote-verified]
+  # r[verify builder.mountd.promote-bounded-copy]
+  # r[verify builder.mountd.orphan-scan]
+  vm-mountd = mountd { inherit pkgs common; };
+
+  # ── castore-FUSE (ADR-022 §2): production session against a real store ─
+  # serve-castore (spike_mountd_client) drives the production
+  # castore_fuse::session assembly on the client VM: rio-mountd fd
+  # handoff, tenant-scoped Directory-DAG prefetch from rio-store,
+  # whole-file and streaming reads, shared-cache passthrough hits, and
+  # clean SIGTERM teardown — all over fuse-over-io_uring, the session's
+  # only transport (the client VM boots with fuse.enable_uring=1; the
+  # kernel routes ALL requests over the rings once ready, so the
+  # cache-hit phase's passthrough/backing-id assertions double as the
+  # proof that open() replies carry backing ids over the ring). The
+  # uring-required leg flips enable_uring off at runtime and asserts
+  # the mount fails hard with the kernel requirement named — same code
+  # path as a pre-6.14 kernel. Subtest map: the scenario header.
+  # r[verify builder.fs.digest-fuse-open]
+  # r[verify builder.fs.shared-backing-cache]
+  # r[verify builder.fs.io-uring-transport]
+  # r[verify builder.fs.io-uring-required]
+  # r[verify builder.fs.castore-inode-digest+2]
+  vm-castore-fuse = castore-fuse.mkTest {
+    fixture = standalone {
+      # P0560 stopgap (implies HMAC, so the store can verify the
+      # x-rio-assignment-token the testScript mints and the gateway gets
+      # the service key for the seed/build uploads). The scenario's seed
+      # builds dispatch to the worker, whose per-build castore mount needs
+      # the full tenancy chain (tenant row + key-comment attribution +
+      # tenant claim in the assignment token + path_tenants rows for the
+      # inputs) — without it the DAG prefetch is rejected with
+      # "assignment token has no tenant claim". The serve-castore
+      # subtests still create their own 'castore-vm' tenant + token on
+      # top; path_tenants is keyed (hash, tenant) so both attributions
+      # coexist.
+      defaultTenant = "vmtest";
+      # psql() on control for the scenario's own tenant + path_tenants
+      # setup.
+      extraPackages = [ pkgs.postgresql_18 ];
+      extraClientModules = [ castore-fuse.fuseClientModule ];
+    };
+  };
+
+  # ── xfstests ports against the castore-FUSE ─────────────────────────
+  # POSIX-conformance checks (readdir resume, byte-exact names, ELOOP,
+  # exec/access semantics, write protection, errno contracts, read
+  # integrity) re-expressed from xfstests tests/generic/ as Rust syscall
+  # probes (the xfstests_runner binary) against a serve-castore mount of
+  # a purpose-built fixture tree, plus one dispatched build for the
+  # overlay-lowerdir leg. The testScript is a thin harness; every
+  # filesystem assertion lives in the runner. Same fixture shape as
+  # vm-castore-fuse (the wiring rationale above applies unchanged);
+  # ranked selection: rio-builder/tests/xfstests_port/PLAN.md.
+  #
+  # Passthrough stacking: the consumer build dispatched to the worker
+  # reads the dep through the production overlay-over-castore mount
+  # (overlay on FUSE = depth 2, only mountable with max_stack_depth=1
+  # negotiated), and the runner's warm-read checks exercise
+  # BACKING_OPEN passthrough against the depth-0 ext4 backing.
+  # r[verify builder.fs.passthrough-stack-depth]
+  vm-castore-xfstests = castore-fuse-xfstests.mkTest {
+    fixture = standalone {
+      defaultTenant = "vmtest";
+      extraPackages = [ pkgs.postgresql_18 ];
+      extraClientModules = [ castore-fuse.fuseClientModule ];
+    };
+  };
+
+  # ── castore cutover e2e (P0560): scheduler-dispatched builds over the
+  # per-build castore-FUSE lower, on the reworked NixOS worker module
+  # (rio-mountd as a host systemd service). Subtest map: the scenario
+  # header. Markers here cover the rules this scenario genuinely proves
+  # end-to-end: the build's /nix/store stack (overlay over the per-build
+  # castore mount, fed by the mountd fd handoff in the load-bearing
+  # order — a wrong order deadlocks the cold build).
+  # r[verify builder.fs.castore-stack+1]
+  # r[verify builder.fs.fd-handoff-ordering]
+  # r[verify builder.overlay.castore-lower]
+  vm-castore-e2e = castore-e2e {
+    inherit pkgs common;
+    fixture = standalone {
+      # The castore read surface (DirectoryService/ReadBlob/StatBlob) is
+      # tenant-scoped and refuses anonymous callers, so dispatched builds
+      # only materialize inputs when the whole tenancy chain is wired:
+      # tenant row + key-comment attribution + HMAC assignment token +
+      # gateway/store JWT mode for the client-side seed/.drv uploads.
+      defaultTenant = "vmtest";
+      workers = {
+        worker = {
+          extraServiceEnv = {
+            # 64 KiB threshold so the scenario's 300 KiB input exercises
+            # the streaming-open path (and fills /var/rio/chunks)
+            # without needing a multi-MiB input under TCG.
+            RIO_STREAM_THRESHOLD = "65536";
+          };
+        };
+      };
+      # Snappier dispatch + re-dispatch after the deliberate
+      # store-outage infrastructure failure.
+      extraSchedulerConfig = {
+        tickIntervalSecs = 2;
+      };
+    };
+  };
+
   # r[verify gw.conn.exit-status+3]
   #   nom-exit subtest: client ssh_config has ControlMaster auto +
   #   ControlPersist 600. `timeout 60 nom build` must exit 0 (gateway
@@ -264,6 +410,10 @@ in
   vm-protocol-warm-standalone = protocol {
     inherit pkgs common;
     fixture = standalone {
+      # The trivial build's inputs (seeded busybox + the .drv) are served
+      # to the worker through the tenant-scoped castore-FUSE read path —
+      # see the vm-castore-e2e fixture comment.
+      defaultTenant = "vmtest";
       extraClientModules = [
         {
           environment.systemPackages = [ pkgs.nix-output-monitor ];
@@ -291,6 +441,8 @@ in
     inherit pkgs common;
     nameSuffix = "-lix";
     fixture = standalone {
+      # Same tenancy stopgap as vm-protocol-warm-standalone above.
+      defaultTenant = "vmtest";
       clientNixPackage = lixPackage;
       extraClientModules = [
         {
@@ -331,12 +483,143 @@ in
       # HMAC on this fixture — build-1 failing here means the is_ca
       # bypass at rio-store/src/grpc/mod.rs regressed.
       withHmac = true;
+      # CA chain inputs are read through the tenant-scoped castore —
+      # see the vm-castore-e2e fixture comment.
+      defaultTenant = "vmtest";
     };
   };
+
+  # ── PutPathChunked end-to-end (ADR-022 §6, P0586) ────────────────────
+  # Real scheduler-dispatched builds on a real worker upload through
+  # PutPathChunked with scheduler-minted HMAC assignment claims; subtest
+  # map and the omitted (handler-level-covered) cases: the scenario
+  # header. withHmac: the chunked claims checks (deriver hash,
+  # input-closure digest, expected_outputs, is_ca) and the authenticated
+  # HasChunks probe only exist with real assignment tokens.
+  # r[verify builder.upload.chunked-manifest]
+  # r[verify builder.upload.batch+3]
+  # r[verify store.put.chunked-ca]
+  # r[verify store.chunk.has-chunks-tenant]
+  # (the cross-derivation dedup subtest proves the positive arm end to
+  # end: build A's completion binds the vmtest tenant's chunk_tenants
+  # rows, and build B's tenant-scoped HasChunks probe then dedups; the
+  # cross-tenant negative arm is unit-tested in chunk_service.rs)
+  vm-put-path-chunked = put-path-chunked {
+    inherit pkgs common;
+    fixture = standalone {
+      withHmac = true;
+      # P0560 tenancy stopgap (P0593 deletes): the worker's tenant-scoped
+      # castore reads need the seeded inputs and the consumer .drv to be
+      # tenant-visible, like every other build-running scenario.
+      defaultTenant = "vmtest";
+      # psql() on control for the narinfo refs/deriver assertions.
+      extraPackages = [ pkgs.postgresql_18 ];
+    };
+  };
+
+  # ── rio build end-to-end (ADR-024 P3): the real coordinator+rio-eval
+  # pair on the client VM against the real cluster — external-door JWT
+  # auth, chunked source upload, drv-blob negotiation, digest-bearing
+  # SubmitBuild, worker execution, BuildEvents render, the default
+  # /nix/store import (signed narinfo → daemon require-sigs → ./result),
+  # and the cached-failure replay (fail-fast culprit attribution
+  # + GetDerivationLog tail). Single-test scenario; markers at the
+  # wiring point per P0341 convention — scenario header maps subtests
+  # to rules.
+  # r[verify bc.submit.all-acked]
+  # r[verify bc.fetch.store-import-default]
+  # r[verify bc.fetch.narhash-verify+2]
+  # r[verify bc.outlink.nix-parity]
+  # r[verify store.drv.getpath-fallback]
+  # r[verify bc.render.stdout-results]
+  # r[verify bc.render.plain-default]
+  # r[verify bc.render.failure-log-tail]
+  # r[verify sched.merge.failfast-culprit]
+  # r[verify bc.upload.source-root-kinds]
+  # r[verify bc.upload.cas-read]
+  vm-build-client-standalone =
+    let
+      jwtKeys = import ./lib/jwt-keys.nix;
+      jwtPubkey = pkgs.writeText "jwt-pubkey" jwtKeys.pubkeyB64;
+      # Cluster narinfo signing key — same fixed test seed (32×0x55) as
+      # vm-substitute-standalone; Nix secret-key format name:base64seed.
+      rioSigningKey = pkgs.writeText "rio-signing-key" "rio-vm-test-1:VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
+      # ed25519 public half of that seed, derived offline with the same
+      # python one-liner documented in lib/jwt-keys.nix (hardcoded for
+      # the same no-IFD reason). The client daemon trusts it so the
+      # default /nix/store import passes require-sigs.
+      rioSigningPubkey = "rio-vm-test-1:xoImN8fTEOxXYnvgC6JZ0lN0n0qvZERwz/vlOjX3MkI=";
+    in
+    build-client {
+      inherit
+        pkgs
+        common
+        rioEval
+        ;
+      fixture = standalone {
+        # P0560 tenancy stopgap (P0593 deletes): the worker's
+        # tenant-scoped castore reads need the client-uploaded sources
+        # and outputs tenant-visible, like every build-running
+        # scenario. Implies HMAC (assignment tokens).
+        defaultTenant = "vmtest";
+        # Snappier dispatch for the 2-node chain.
+        extraSchedulerConfig = {
+          tickIntervalSecs = 2;
+        };
+        # JWT verify on the scheduler: SubmitBuild/WatchBuild require
+        # x-rio-tenant-token once a pubkey is configured
+        # (require_tenant). Env (not extraConfig) so the [sla] block
+        # in common.nix's scheduler defaults survives.
+        extraSchedulerEnv.RIO_JWT__KEY_PATH = "${jwtPubkey}";
+        # Poison on the FIRST failure so the cached-failure-replay
+        # subtest reaches the merge fail-fast within four submissions
+        # instead of needing per-attempt retries first. Env for the
+        # same reason as the JWT key above.
+        extraSchedulerEnv.RIO_POISON__THRESHOLD = "1";
+        extraStoreConfig = {
+          # Sign every uploaded path's narinfo with the cluster key —
+          # what the client's default /nix/store import verifies against.
+          signingKeyFile = "${rioSigningKey}";
+          # JWT verify on the store's castore door (the client's
+          # PutPathChunked/Has*/PutDrvBlobs/GetPath rung). extraConfig
+          # REPLACES the mkControlNode default, so [chunk_backend] must
+          # be restated — without it every builder output upload is
+          # rejected with FAILED_PRECONDITION.
+          extraConfig = ''
+            [chunk_backend]
+            kind = "filesystem"
+            base_dir = "/var/lib/rio/store/chunks"
+
+            [jwt]
+            key_path = "${jwtPubkey}"
+          '';
+        };
+        extraClientModules = [
+          {
+            # The default fetch imports outputs into the client VM's own
+            # /nix/store with signature checking on — the daemon must
+            # trust the cluster signing key.
+            nix.settings.trusted-public-keys = [ rioSigningPubkey ];
+            # The scenario runs `rio build` as this user: root is a nix
+            # trusted-user, which could mask signature handling, so the
+            # import must work for a plain user talking to the daemon.
+            users.users.alice = {
+              isNormalUser = true;
+            };
+          }
+        ];
+        # psql() on control for the tenant UUID + drv_blobs assertions.
+        extraPackages = [ pkgs.postgresql_18 ];
+      };
+    };
 
   vm-protocol-cold-standalone = protocol {
     inherit pkgs common;
     fixture = standalone {
+      # Same tenancy stopgap as vm-protocol-warm-standalone above —
+      # the fetcher's FOD .drv and the consumer's inputs go through
+      # the tenant-scoped castore reads.
+      defaultTenant = "vmtest";
       workers = {
         worker = {
         };
@@ -384,7 +667,7 @@ in
   #   sigs in narinfo.signatures.
   # r[verify store.substitute.tenant-sig-visibility+2]
   # r[verify store.substitute.find-missing-gated]
-  # r[verify store.api.batch-manifest+2]
+  # r[verify store.api.batch-manifest+3]
   #   substitute-cross-tenant-gate: tenant C (untrusted key) → NotFound
   #   on A-substituted path via QueryPathInfo/GetPath/FindMissingPaths;
   #   PermissionDenied via BatchGetManifest (builder-internal). Tenant
@@ -488,8 +771,7 @@ in
   # ── scheduling splits (2 tests, standalone fixture) ──────────────────
   # Same 3-worker fixture (worker1/worker2/worker3) for both — the
   # fragment architecture changes what RUNS, not what's BOOTED.
-  # fanout→fuse-direct cache-state chain stays in core; reassign is
-  # disruptive (SIGKILL) → own test.
+  # reassign is disruptive (SIGKILL) → own test.
   vm-scheduling-core-standalone =
     (scheduling {
       inherit pkgs common;
@@ -500,18 +782,10 @@ in
         subtests = [
           # r[verify builder.overlay.stacked-lower+2]
           # r[verify builder.ns.order+2]
-          # r[verify builder.fuse.lookup-caches+2]
-          # r[verify builder.fuse.jit-lookup]
-          # r[verify builder.fuse.jit-register]
-          # r[verify builder.fuse.passthrough]
           "fanout"
-          "fuse-direct"
-          # r[verify builder.fuse.listxattr-empty]
-          "fuse-listxattr"
           "overlay-readdir"
           # r[verify builder.fuse.canonical-metadata+2]
           "canonical-meta"
-          # r[verify store.inline.threshold]
           # r[verify obs.metric.transfer-volume]
           "chunks"
           "cgroup"
@@ -538,9 +812,9 @@ in
           "cancel-timing"
           # r[verify sched.sla.reactive-floor+2]
           "reassign"
-          # r[verify obs.metric.scheduler]
+          # r[verify obs.metric.scheduler+2]
           # r[verify obs.metric.builder]
-          # r[verify obs.metric.store]
+          # r[verify obs.metric.store+2]
           "load-50drv"
           # r[verify sched.assign.warm-gate]
           #   Placed AFTER load-50drv so the per-assignment PrefetchHint
@@ -551,7 +825,7 @@ in
           # sigint-graceful AFTER reassign: reassign already disturbs a
           # worker (SIGKILL + wait_for_unit restart); sigint is the
           # gentler sibling. Uses worker2 only — no cache-chain coupling.
-          # ~35s: SIGINT + 30s inactive-wait + restart + FUSE remount.
+          # ~35s: SIGINT + 30s inactive-wait + restart.
           #
           # sigint-graceful LAST: restarts worker2 (systemctl start) but
           # doesn't wait for scheduler re-registration (HEARTBEAT_INTERVAL
@@ -582,6 +856,14 @@ in
   vm-security-standalone = security.standalone {
     fixture = standalone {
       withHmac = true;
+      # P0560 stopgap: the default SSH key gets the vmtest comment and
+      # the rio_vmtest_* triggers attribute every path to every
+      # retention-0 tenant — the scenario creates team-test with
+      # gc_retention_hours = 0 to opt in, so the team-test / quota /
+      # rate-limit builds can read their castore inputs. The
+      # empty-comment (NULL tenant) boundary is still asserted at
+      # submission level in tenant-resolve case 3.
+      defaultTenant = "vmtest";
       extraPackages = [
         pkgs.grpcurl
         pkgs.grpc-health-probe
@@ -590,7 +872,7 @@ in
     };
   };
 
-  # r[verify sec.pod.fuse-device-plugin]
+  # r[verify sec.pod.fuse-device-plugin+1]
   # r[verify builder.cgroup.ns-root-remount]
   # r[verify sec.psa.control-plane-restricted]
   # r[verify builder.seccomp.localhost-profile+3]
@@ -614,6 +896,10 @@ in
   #   exists + subtree_control writable → build completes over FUSE).
   vm-security-nonpriv-k3s = security.privileged-hardening-e2e {
     fixture = k3sFull {
+      # P0560 stopgap: the e2e build's inputs go through the
+      # tenant-scoped castore reads — see the k3s-full.nix
+      # defaultTenant comment.
+      defaultTenant = "vmtest";
       # Layer vmtest-full-nonpriv.yaml for workerPool.privileged:false.
       # /dev/fuse comes from k3s containerd base_runtime_spec (the
       # containerdConfigTemplate in fixtures/k3s-full.nix). No extra
@@ -631,7 +917,9 @@ in
   # boot race). ~4-5min.
   vm-chaos-standalone = chaos {
     inherit pkgs common;
-    fixture = toxiproxy { };
+    # Every chaos subtest drives a real build — same tenancy stopgap
+    # as the rest of the build matrix (passthrough to standalone).
+    fixture = toxiproxy { defaultTenant = "vmtest"; };
   };
 
   # r[verify obs.metric.gateway]
@@ -653,6 +941,9 @@ in
   vm-observability-standalone = observability {
     inherit pkgs common;
     fixture = standalone {
+      # Chain builds materialize inputs through the tenant-scoped
+      # castore reads — see the vm-castore-e2e fixture comment.
+      defaultTenant = "vmtest";
       workers = {
         worker1 = {
         };
@@ -692,7 +983,7 @@ in
       # r[verify builder.timeout.no-reassign]
       "build-timeout"
       # r[verify ctrl.pool.reconcile]
-      # r[verify ctrl.crd.pool]
+      # r[verify ctrl.crd.pool+2]
       #   pool-lifecycle: apply Pool CRD → wait status → delete
       #   --wait=false. Non-disruptive (no shared-state interference
       #   with the subtests above), so it folds into core rather than
@@ -713,9 +1004,14 @@ in
       "gc-dry-run"
       # r[verify store.gc.tenant-retention]
       "gc-sweep"
-      # r[verify builder.upload.references-scanned]
+      # r[verify builder.upload.references-scanned+2]
       # r[verify builder.upload.deriver-populated]
       # r[verify store.gc.two-phase]
+      # r[verify builder.fs.parity]
+      #   P0562 parity witness: the consumer build reads its dep through
+      #   the castore-FUSE lower and the dep's store path is scanned into
+      #   PG narinfo."references" exactly as the pre-ADR-022 lifecycle
+      #   suite asserted.
       "refs-end-to-end"
     ];
   };
@@ -876,6 +1172,8 @@ in
   vm-componentscaler-k3s = componentscaler {
     inherit pkgs common;
     fixture = k3sFull {
+      # slowFanout builds — P0560 tenancy stopgap, see k3s-full.nix.
+      defaultTenant = "vmtest";
       extraValuesTyped = {
         "componentScaler.store.enabled" = true;
         "componentScaler.store.min" = 1;
@@ -1023,6 +1321,9 @@ in
   vm-netpol-k3s = netpol {
     inherit pkgs common;
     fixture = k3sFull {
+      # The probe builds run on real builder pods — P0560 tenancy
+      # stopgap, see k3s-full.nix.
+      defaultTenant = "vmtest";
       extraValues = {
         "networkPolicy.enabled" = "true";
       };
@@ -1043,7 +1344,12 @@ in
   # r[verify gw.ingress.v4-via-nat]
   vm-ingress-v4v6-k3s = ingress-v4v6 {
     inherit pkgs common;
-    fixture = k3sFull { withV4Nodes = true; };
+    fixture = k3sFull {
+      withV4Nodes = true;
+      # Both trivial builds go through the tenant-scoped castore reads
+      # — P0560 tenancy stopgap, see k3s-full.nix.
+      defaultTenant = "vmtest";
+    };
   };
 
   # ADR-019 builder/fetcher split end-to-end. FIRST test running both
@@ -1116,14 +1422,17 @@ in
   #   fod-dir subtest: recursive-hash FOD with directory output
   #   (`mkdir $out`). Regression: a whiteout at the output path
   #   makes overlayfs mkdir return EIO.
-  # r[verify builder.fuse.jit-lookup]
   #   fod-fail subtest: failing FOD propagates within 60s. Daemon's
-  #   post-fail stat($out) hits FUSE; NotInput → ENOENT without
-  #   store contact. P0308 hang would push elapsed past timeout 90.
+  #   post-fail stat($out) hits the castore lower; a non-input path
+  #   gets ENOENT from the in-memory DAG without store contact.
+  #   P0308 hang would push elapsed past timeout 90.
   vm-fetcher-split-k3s = fetcher-split {
     inherit pkgs common drvs;
     fixture = k3sFull {
       withV4Nodes = true;
+      # Builder + fetcher pods both read inputs through the
+      # tenant-scoped castore — P0560 tenancy stopgap, see k3s-full.nix.
+      defaultTenant = "vmtest";
       extraValues = {
         "networkPolicy.enabled" = "true";
         "nixConf.hashedMirrors" = "http://upstream-v4/";

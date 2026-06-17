@@ -195,7 +195,7 @@ pub fn try_cancel_build(slot: &BuildSlot, drv_path: &str) -> bool {
         // set (lives in the slot from claim time), so execute_build's
         // pre-cgroup poll will abort. Same outcome as ENOENT below.
         //
-        // r[impl builder.cancel.pre-cgroup-deferred]
+        // r[impl builder.cancel.pre-cgroup-deferred+3]
         tracing::info!(
             drv_path,
             "cancel: cgroup path not yet recorded; flag set for pre-cgroup poll"
@@ -215,7 +215,7 @@ pub fn try_cancel_build(slot: &BuildSlot, drv_path: &str) -> bool {
             // prefetch (sub-second; the I-165 47-min warm stall is
             // gone), so the cancel-poll select was removed.
             //
-            // r[impl builder.cancel.pre-cgroup-deferred]
+            // r[impl builder.cancel.pre-cgroup-deferred+3]
             // LEAVE THE FLAG SET. execute_build checks it before the
             // register+prefetch phase and aborts with
             // `ExecutorError::Cancelled` without spawning the daemon.

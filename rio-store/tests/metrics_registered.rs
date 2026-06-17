@@ -11,7 +11,7 @@
 //! (no `_bucket` series), and the dashboard's `histogram_quantile()`
 //! PutPath p99 panel showed "No data".
 
-// r[verify obs.metric.store]
+// r[verify obs.metric.store+2]
 rio_test_support::metrics_suite! {
     describe_fn: rio_store::describe_metrics,
     crate_name: "rio-store",
@@ -24,5 +24,27 @@ rio_test_support::metrics_suite! {
         // [0.005..10.0] fits.
         "rio_store_put_path_duration_seconds",
         "rio_store_get_path_duration_seconds",
+        // BFS over the Directory DAG: ~33 PG round-trips for a
+        // chromium-scale closure (8k dirs, batches of 256).
+        "rio_store_directory_get_seconds",
+        // Per-file chunk fetch + slice; same envelope as get_path
+        // (PG lookup + a handful of S3 RTTs).
+        "rio_store_directory_read_seconds",
     ],
+}
+
+// r[verify obs.metric.pg-iam]
+#[test]
+fn pg_iam_shared_family_described() {
+    // The shared rio_pg_iam_* family escapes the per-crate prefix
+    // filter above (different prefix), so assert it explicitly: each
+    // PG consumer must register it from its own describe_metrics().
+    rio_test_support::metrics::assert_spec_metrics_described(
+        &[
+            "rio_pg_iam_mint_failures_total",
+            "rio_pg_iam_token_minted_timestamp_seconds",
+        ],
+        rio_store::describe_metrics,
+        "rio-store",
+    );
 }

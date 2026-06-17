@@ -8,7 +8,7 @@
 {
   boot = {
     # ── sysctl ────────────────────────────────────────────────────────
-    # r[impl sec.pod.host-users-false]
+    # r[impl sec.pod.host-users-false+2]
     # Bottlerocket defaults user.max_user_namespaces=0; the old userData
     # raised it via [settings.kernel.sysctl]. Worker pods set hostUsers:
     # false (userns-mapped root, ADR-012) which clones a userns to idmap-
@@ -60,6 +60,21 @@
     kernelParams = [
       "panic=10"
       "panic_on_oops=1"
+      # The fuse module's enable_uring param, REQUIRED on builder
+      # nodes: the worker's castore-FUSE serves exclusively over Linux
+      # 6.14 fuse-over-io_uring, and without this switch the kernel
+      # never advertises FUSE_OVER_IO_URING — every castore mount then
+      # fails hard with the requirement in the error (no fallback
+      # transport exists). The kernel parks the param behind this
+      # switch (CONFIG_FUSE_IO_URING gates the knob's existence). fuse
+      # is loaded as a module (kernel.nix boot.kernelModules), and
+      # modulename.param= on the cmdline applies at modprobe.
+      # Node-wide on the worker AMI: REQUIRED on fetcher nodes too —
+      # the fetcher's worker serves the same castore-FUSE for the FOD
+      # sandbox's overlay lower, over the same uring-only transport.
+      # Runtime-writable at /sys/module/fuse/parameters/enable_uring
+      # if it ever needs to be flipped without a reboot.
+      "fuse.enable_uring=1"
     ];
 
     # kdump: the cgwb_release panic above was preceded by a [W]-taint
@@ -69,26 +84,6 @@
     # dmesg + vmcore to /var/crash so an upstream report has the trace
     # it needs to be actionable.
     crashDump.enable = true;
-
-    # ── kernel config (P3, baked now since the AMI is rebuilding) ─────
-    # EROFS_FS_ONDEMAND + CACHEFILES_ONDEMAND: the per-page FUSE / riofs
-    # track. NETFS_SUPPORT is the dependency CACHEFILES selects upstream;
-    # listed explicitly so `node-kernel-config` (P3 check) can assert all
-    # four. structuredExtraConfig: the nixpkgs kernel builder merges this
-    # into the generated .config — yes-if-unset, error-if-conflicting.
-    kernelPatches = [
-      {
-        name = "rio-ondemand";
-        patch = null;
-        structuredExtraConfig = with lib.kernel; {
-          EROFS_FS = yes;
-          EROFS_FS_ONDEMAND = yes;
-          CACHEFILES = yes;
-          CACHEFILES_ONDEMAND = yes;
-          NETFS_SUPPORT = yes;
-        };
-      }
-    ];
 
     # ── tmpfs /tmp ────────────────────────────────────────────────────
     # Builder emptyDir scratch lives under the kubelet root, not /tmp;
@@ -123,8 +118,10 @@
     "C /var/lib/kubelet/seccomp/operator/rio-fetcher.json 0644 root root - ${./seccomp/rio-fetcher.json}"
   ];
 
-  # security.lockKernelModules left false until the riofs kmod list is
-  # final (ADR-021 §Security posture). Set deliberately so a future
-  # hardening import doesn't flip it under us.
+  # security.lockKernelModules left false until the builder-pod module
+  # set is final (ADR-021 §Security posture; the ADR-022 castore-FUSE
+  # needs only the in-tree fuse/overlay modules, but k3s/cilium still
+  # load modules on demand). Set deliberately so a future hardening
+  # import doesn't flip it under us.
   security.lockKernelModules = lib.mkDefault false;
 }

@@ -220,7 +220,7 @@ mod proptests {
     /// Base cases: regular files and symlinks.
     /// Recursive case: directories with 0..5 entries, each with a unique
     /// sorted name and a recursive child node.
-    fn arb_nar_node() -> impl Strategy<Value = NarNode> {
+    pub(super) fn arb_nar_node() -> impl Strategy<Value = NarNode> {
         let leaf = prop_oneof![
             // Regular file: arbitrary executable flag + small content
             (
@@ -496,6 +496,172 @@ fn streaming_byte_identical_single_file() -> anyhow::Result<()> {
 }
 
 // -----------------------------------------------------------------------
+// dump walk vs concurrent mutation of the dumped tree
+// -----------------------------------------------------------------------
+
+/// Observer that runs a closure once when the walk reaches a named
+/// entry. Lets a test deterministically mutate the dumped tree at a
+/// precise point *mid-dump* — simulating a concurrent attacker (build
+/// code with write access to the overlay upper) without an actual race.
+struct SwapOnEntry<F: FnMut()> {
+    name: &'static [u8],
+    trigger: Option<F>,
+}
+
+impl<F: FnMut()> SwapOnEntry<F> {
+    fn fire_if(&mut self, name: &[u8]) {
+        if name == self.name
+            && let Some(mut t) = self.trigger.take()
+        {
+            t();
+        }
+    }
+}
+
+impl<F: FnMut()> WalkObserver for SwapOnEntry<F> {
+    fn enter_dir(&mut self, name: &[u8]) -> io::Result<()> {
+        self.fire_if(name);
+        Ok(())
+    }
+    fn file_begin(&mut self, name: &[u8], _executable: bool, _size: u64) -> io::Result<()> {
+        self.fire_if(name);
+        Ok(())
+    }
+}
+
+/// THE dirfd-conversion guarantee on the dump side: swapping a regular
+/// file for a symlink mid-walk must not serialize the symlink TARGET's
+/// contents. Path-based traversal made the type decision
+/// (`symlink_metadata`) and the content open (`File::open`) resolve the
+/// path independently; an attacker swapping the file for a symlink
+/// between the two had an arbitrary host-readable file's bytes
+/// published as build output (exfiltration through the store). This
+/// test is red on that code: the trigger fires after the type decision,
+/// and the secret's bytes end up in the NAR.
+#[test]
+fn dump_swap_file_to_symlink_does_not_exfiltrate() -> anyhow::Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    // "Host" file outside the dumped tree, same length as the swapped
+    // file (the length the path-based walk had already committed to
+    // the NAR header from the pre-open stat).
+    let secret = tmp.path().join("host-secret");
+    std::fs::write(&secret, b"EXFILTRATED-DATA")?;
+    let root = tmp.path().join("out");
+    std::fs::create_dir(&root)?;
+    std::fs::write(root.join("a"), b"first entry")?;
+    std::fs::write(root.join("b"), b"ORIGINAL-CONTENT")?;
+
+    let target = root.join("b");
+    let mut obs = SwapOnEntry {
+        name: b"b",
+        trigger: Some(move || {
+            std::fs::remove_file(&target).unwrap();
+            std::os::unix::fs::symlink(&secret, &target).unwrap();
+        }),
+    };
+    let mut nar = Vec::new();
+    let res = dump_path_observed(&root, &mut nar, &mut obs);
+    assert!(
+        !nar.windows(16).any(|w| w == b"EXFILTRATED-DATA"),
+        "mid-dump file→symlink swap was followed: host file contents \
+         serialized into the NAR"
+    );
+    // The fd held from before the swap still reads the original file.
+    res?;
+    assert!(nar.windows(16).any(|w| w == b"ORIGINAL-CONTENT"));
+    Ok(())
+}
+
+/// Directory variant: swapping a subdirectory for a symlink mid-walk
+/// must not serialize the symlink target's tree. Path-based traversal
+/// re-resolved the directory path for `read_dir` after the type
+/// decision — a swap between the two serialized an arbitrary
+/// host-readable directory (every file under it) as build output.
+#[test]
+fn dump_swap_dir_to_symlink_does_not_serialize_victim() -> anyhow::Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let victim = tmp.path().join("victim");
+    std::fs::create_dir(&victim)?;
+    std::fs::write(victim.join("loot"), b"VICTIM-DIR-DATA")?;
+    let root = tmp.path().join("out");
+    std::fs::create_dir_all(root.join("sub"))?;
+    std::fs::write(root.join("sub/inner"), b"innocent")?;
+
+    let sub = root.join("sub");
+    let mut obs = SwapOnEntry {
+        name: b"sub",
+        trigger: Some(move || {
+            std::fs::remove_dir_all(&sub).unwrap();
+            std::os::unix::fs::symlink(&victim, &sub).unwrap();
+        }),
+    };
+    let mut nar = Vec::new();
+    // Success vs error is secondary (the attacker deleted the subtree
+    // mid-walk); the invariant is that no victim bytes were serialized.
+    let _ = dump_path_observed(&root, &mut nar, &mut obs);
+    assert!(
+        !nar.windows(15).any(|w| w == b"VICTIM-DIR-DATA"),
+        "mid-dump dir→symlink swap was followed: victim directory \
+         contents serialized into the NAR"
+    );
+    assert!(
+        !nar.windows(4).any(|w| w == b"loot"),
+        "mid-dump dir→symlink swap was followed: victim entry name in NAR"
+    );
+    Ok(())
+}
+
+/// A writer-less FIFO planted in the dumped tree must fail fast with
+/// `UnsupportedFileType` — never hang. The per-entry open uses
+/// `O_NONBLOCK`, so the FIFO opens immediately and the fstat type check
+/// rejects it (a blocking `open(O_RDONLY)` would sleep until a writer
+/// appeared).
+#[test]
+fn dump_fifo_in_tree_rejected_fast() -> anyhow::Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let root = tmp.path().join("out");
+    std::fs::create_dir(&root)?;
+    nix::unistd::mkfifo(
+        &root.join("pipe"),
+        nix::sys::stat::Mode::from_bits_truncate(0o644),
+    )?;
+    let mut nar = Vec::new();
+    let res = dump_path_streaming(&root, &mut nar);
+    assert!(
+        matches!(res, Err(NarError::UnsupportedFileType(_))),
+        "got {res:?}"
+    );
+    Ok(())
+}
+
+/// Swapping a regular file for a writer-less FIFO mid-walk must not
+/// park the dump task. Path-based traversal opened the path AFTER the
+/// type decision, so the blocking `open(O_RDONLY)` of the planted FIFO
+/// slept until a writer appeared — this test HANGS on that code. The
+/// fd-relative walk reads from the fd opened before the swap and the
+/// dump completes with the original contents.
+#[test]
+fn dump_swap_file_to_fifo_does_not_hang() -> anyhow::Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let root = tmp.path().join("out");
+    std::fs::create_dir(&root)?;
+    std::fs::write(root.join("a"), b"first entry")?;
+    std::fs::write(root.join("b"), b"ORIGINAL-CONTENT")?;
+    let target = root.join("b");
+    let mut obs = SwapOnEntry {
+        name: b"b",
+        trigger: Some(move || {
+            std::fs::remove_file(&target).unwrap();
+            nix::unistd::mkfifo(&target, nix::sys::stat::Mode::from_bits_truncate(0o644)).unwrap();
+        }),
+    };
+    let mut nar = Vec::new();
+    dump_path_observed(&root, &mut nar, &mut obs)?;
+    assert!(nar.windows(16).any(|w| w == b"ORIGINAL-CONTENT"));
+    Ok(())
+}
+
+// -----------------------------------------------------------------------
 // restore_path_streaming round-trip with dump_path_streaming
 // -----------------------------------------------------------------------
 
@@ -683,6 +849,220 @@ fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+/// A pre-existing symlink at `dest` must make restore FAIL, not be
+/// followed (CVE-2021-31566 class). `restore_path_streaming`'s contract
+/// is "`dest` must NOT exist"; before the fd-based metadata fix,
+/// `File::create(dest)` followed a planted symlink and clobbered the
+/// target — content AND the path-based `set_permissions`/mtime writes
+/// all landed on the victim. With `File::create_new` the open is
+/// `O_EXCL` and never follows; the victim stays untouched.
+#[test]
+fn restore_streaming_refuses_symlink_at_dest_file() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::TempDir::new()?;
+    let victim = tmp.path().join("victim.txt");
+    std::fs::write(&victim, "secret")?;
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600))?;
+    let dest = tmp.path().join("dest");
+    std::os::unix::fs::symlink(&victim, &dest)?;
+
+    // Executable regular-file NAR: exercises both the content write and
+    // the 0o755 chmod — neither may reach `victim` through the symlink.
+    let mut nar = Vec::new();
+    serialize(&mut nar, &reg(true, b"pwned"))?;
+
+    let res = restore_path_streaming(&mut Cursor::new(&nar), &dest);
+    assert!(
+        res.is_err(),
+        "restore onto a pre-existing symlink must fail, got {res:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&victim)?,
+        "secret",
+        "symlink at dest was followed: victim content clobbered"
+    );
+    assert_eq!(
+        std::fs::metadata(&victim)?.permissions().mode() & 0o777,
+        0o600,
+        "symlink at dest was followed: victim permissions changed"
+    );
+    Ok(())
+}
+
+/// Directory variant of the symlink-at-dest guard: a planted symlink to
+/// a victim directory must fail the restore (`mkdir` returns `EEXIST`
+/// on a symlink regardless of its target) — nothing may be created
+/// inside the victim and its metadata must stay untouched.
+#[test]
+fn restore_streaming_refuses_symlink_at_dest_dir() -> anyhow::Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let victim = tmp.path().join("victim-dir");
+    std::fs::create_dir(&victim)?;
+    let victim_mtime = std::fs::metadata(&victim)?.modified()?;
+    let dest = tmp.path().join("dest");
+    std::os::unix::fs::symlink(&victim, &dest)?;
+
+    let mut nar = Vec::new();
+    serialize(
+        &mut nar,
+        &NarNode::Directory {
+            entries: vec![entry("planted.txt", reg(false, b"pwned"))],
+        },
+    )?;
+
+    let res = restore_path_streaming(&mut Cursor::new(&nar), &dest);
+    assert!(
+        res.is_err(),
+        "restore onto a symlinked directory must fail, got {res:?}"
+    );
+    assert!(
+        std::fs::read_dir(&victim)?.next().is_none(),
+        "symlink at dest was followed: entry created inside victim dir"
+    );
+    assert_eq!(
+        std::fs::metadata(&victim)?.modified()?,
+        victim_mtime,
+        "symlink at dest was followed: victim dir mtime canonicalized"
+    );
+    Ok(())
+}
+
+/// Reader that runs a closure once when its first segment is exhausted,
+/// then continues from the second segment. Lets a test deterministically
+/// mutate the destination tree at a precise point *mid-restore* —
+/// simulating a concurrent attacker without an actual race.
+struct MidStreamTrigger<'a, F: FnMut()> {
+    first: Cursor<&'a [u8]>,
+    second: Cursor<&'a [u8]>,
+    trigger: Option<F>,
+}
+
+impl<F: FnMut()> Read for MidStreamTrigger<'_, F> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.first.read(buf)?;
+        if n > 0 {
+            return Ok(n);
+        }
+        if let Some(mut t) = self.trigger.take() {
+            t();
+        }
+        self.second.read(buf)
+    }
+}
+
+/// THE dirfd-conversion guarantee: swapping an ALREADY-CREATED directory
+/// component of the dest tree for a symlink mid-restore must not let
+/// later writes resolve through the symlink into a victim directory.
+///
+/// Shape: the NAR root is a directory containing one file. The "attacker"
+/// closure fires after the root dir is created (the `directory` token is
+/// consumed → `mkdir` has happened) but before the first `entry` token is
+/// read; it replaces the freshly-created root dir with a symlink to a
+/// victim dir. Path-based restore (`File::create_new(dest.join(name))`)
+/// re-resolves `dest` and creates the file INSIDE THE VICTIM — this test
+/// is red on that code. dirfd-relative restore holds the root directory
+/// fd from before the swap, so the child lands in the (now-unlinked)
+/// original directory and the victim is untouched.
+#[test]
+fn restore_streaming_root_swap_does_not_follow_into_victim() -> anyhow::Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let victim = tmp.path().join("victim-dir");
+    std::fs::create_dir(&victim)?;
+    let dest = tmp.path().join("dest");
+
+    let mut nar = Vec::new();
+    serialize(
+        &mut nar,
+        &NarNode::Directory {
+            entries: vec![entry("pwned", reg(false, b"gotcha"))],
+        },
+    )?;
+
+    // Split right before the length prefix of the first "entry" token:
+    // at that point restore has consumed `... ( type directory` and has
+    // created the root dir, but not yet opened/created any child.
+    let entry_pos = nar
+        .windows(5)
+        .position(|w| w == b"entry")
+        .expect("NAR contains an entry token");
+    let split = entry_pos - 8; // u64 length prefix precedes the token
+    let dest_for_trigger = dest.clone();
+    let victim_for_trigger = victim.clone();
+    let mut r = MidStreamTrigger {
+        first: Cursor::new(&nar[..split]),
+        second: Cursor::new(&nar[split..]),
+        trigger: Some(move || {
+            // Attacker: replace the just-created (still empty) root dir
+            // with a symlink to the victim.
+            std::fs::remove_dir(&dest_for_trigger).unwrap();
+            std::os::unix::fs::symlink(&victim_for_trigger, &dest_for_trigger).unwrap();
+        }),
+    };
+
+    // Whether the restore reports success (writes went to the unlinked
+    // original dir) or an error is secondary; the invariant is that
+    // NOTHING was created inside the victim.
+    let _ = restore_path_streaming(&mut r, &dest);
+    assert!(
+        std::fs::read_dir(&victim)?.next().is_none(),
+        "mid-restore dir swap was followed: entry created inside victim dir"
+    );
+    Ok(())
+}
+
+/// Single-level collision variant (structural, not red-provable): a
+/// symlink pre-planted where a SUBDIRECTORY entry will be created must
+/// fail the restore with EEXIST — `mkdirat` (and plain `mkdir` before
+/// the conversion) never follows a symlink in the final component — and
+/// nothing may be created inside the victim.
+#[test]
+fn restore_streaming_refuses_symlink_at_subdir_entry() -> anyhow::Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let victim = tmp.path().join("victim-dir");
+    std::fs::create_dir(&victim)?;
+    let dest = tmp.path().join("dest");
+
+    // NAR: dir containing subdir "a" containing a file.
+    let mut nar = Vec::new();
+    serialize(
+        &mut nar,
+        &NarNode::Directory {
+            entries: vec![entry(
+                "a",
+                NarNode::Directory {
+                    entries: vec![entry("pwned", reg(false, b"gotcha"))],
+                },
+            )],
+        },
+    )?;
+
+    // Plant the symlink as soon as the root dir exists (same split point
+    // as the root-swap test: before the first "entry" token is read).
+    let entry_pos = nar.windows(5).position(|w| w == b"entry").unwrap();
+    let split = entry_pos - 8;
+    let dest_for_trigger = dest.clone();
+    let victim_for_trigger = victim.clone();
+    let mut r = MidStreamTrigger {
+        first: Cursor::new(&nar[..split]),
+        second: Cursor::new(&nar[split..]),
+        trigger: Some(move || {
+            std::os::unix::fs::symlink(&victim_for_trigger, dest_for_trigger.join("a")).unwrap();
+        }),
+    };
+
+    let res = restore_path_streaming(&mut r, &dest);
+    assert!(
+        res.is_err(),
+        "restore over a pre-planted subdir symlink must fail, got {res:?}"
+    );
+    assert!(
+        std::fs::read_dir(&victim)?.next().is_none(),
+        "subdir symlink was followed: entry created inside victim dir"
+    );
+    Ok(())
 }
 
 /// Same path-traversal guard as `parse`: `..`, `/`, NUL, empty, `.`
@@ -1063,4 +1443,726 @@ fn dump_path_non_utf8_symlink_target_rejected() {
         matches!(&err, NarError::Io(e) if e.to_string().contains("not valid UTF-8")),
         "dump_path_streaming: expected UTF-8 error, got {err:?}"
     );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// nar_ls (P0546) — streaming index
+// ───────────────────────────────────────────────────────────────────────────
+
+mod ls_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::io;
+
+    /// Walk a `NarNode` tree collecting the same `(path, kind)` set
+    /// `nar_ls` should emit, plus a `path → contents` map for the
+    /// regular files. Used as the proptest oracle.
+    fn collect_files(node: &NarNode, path: &mut Vec<u8>, out: &mut Vec<(Vec<u8>, Vec<u8>)>) {
+        match node {
+            NarNode::Regular { contents, .. } => {
+                out.push((path.clone(), contents.clone()));
+            }
+            NarNode::Symlink { .. } => {}
+            NarNode::Directory { entries } => {
+                for e in entries {
+                    let saved = path.len();
+                    if !path.is_empty() {
+                        path.push(b'/');
+                    }
+                    path.extend_from_slice(e.name.as_bytes());
+                    collect_files(&e.node, path, out);
+                    path.truncate(saved);
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+        // r[verify store.index.nar-ls-offset]
+        // r[verify store.index.file-digest]
+        #[test]
+        fn nar_ls_offset_and_digest(node in super::proptests::arb_nar_node()) {
+            let mut buf = Vec::new();
+            serialize(&mut buf, &node)?;
+
+            let entries = nar_ls(Cursor::new(&buf))?;
+
+            let mut want_files = Vec::new();
+            collect_files(&node, &mut Vec::new(), &mut want_files);
+            let mut want: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+                want_files.into_iter().collect();
+
+            for e in &entries {
+                if e.kind != NarEntryKind::Regular {
+                    prop_assert_eq!(e.size, 0);
+                    prop_assert_eq!(e.nar_offset, 0);
+                    prop_assert_eq!(e.file_digest, [0u8; 32]);
+                    continue;
+                }
+                let content = want.remove(&e.path).expect("unknown regular path");
+                prop_assert_eq!(e.size as usize, content.len());
+                // nar_offset → slice of the original NAR == content
+                let slice = &buf[e.nar_offset as usize..e.nar_offset as usize + content.len()];
+                prop_assert_eq!(slice, &content[..]);
+                // file_digest == blake3(content)
+                prop_assert_eq!(e.file_digest, *blake3::hash(&content).as_bytes());
+            }
+            prop_assert!(want.is_empty(), "nar_ls missed regular files: {:?}", want.keys());
+        }
+    }
+
+    // `nar_ls` accepts a strict superset of what `parse()` accepts —
+    // it additionally takes (a) regular-file content past
+    // `MAX_CONTENT_SIZE` (streamed, never buffered) and (b) non-UTF-8
+    // entry names / symlink targets (raw `Vec<u8>` API; `parse()`'s
+    // `String`-based `NarNode` cannot represent them). Random byte
+    // vectors essentially never form a valid NAR (24-byte magic
+    // prefix), so this proptest only exercises the both-reject path —
+    // the agree-on-valid-input direction is `nar_ls_offset_and_digest`
+    // above; the deliberate divergences are pinned by hand below and
+    // exercised continuously by the `nar_ls` fuzz target.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #[test]
+        fn nar_ls_superset_of_parse(bytes in proptest::collection::vec(any::<u8>(), 0..1024)) {
+            let parse_ok = parse(&mut Cursor::new(&bytes)).is_ok();
+            let ls_ok = nar_ls(Cursor::new(&bytes)).is_ok();
+            prop_assert!(!parse_ok || ls_ok,
+                "parse accepted but nar_ls rejected: {:?}", bytes);
+        }
+    }
+
+    /// `parse()` rejects non-UTF-8 entry names and symlink targets
+    /// because its `String`-based `NarNode` cannot represent them.
+    /// `nar_ls()` is byte-faithful (`Vec<u8>` path/target) — `dump_path`
+    /// over a Unix filesystem can legitimately produce arbitrary-byte
+    /// names. Pins the deliberate divergence the `nar_ls` fuzz target
+    /// special-cases as an `(Err(InvalidUtf8), Ok(_))` arm.
+    #[test]
+    fn nar_ls_accepts_non_utf8_names_parse_rejects() {
+        // Hand-encode: dir { entry "\xFF" → symlink "\xFE" }.
+        // serialize() can't produce this — NarEntry.name is String.
+        let mut buf = Vec::new();
+        write_str(&mut buf, NAR_MAGIC).unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "type").unwrap();
+        write_str(&mut buf, "directory").unwrap();
+        write_str(&mut buf, "entry").unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "name").unwrap();
+        write_bytes(&mut buf, &[0xFF]).unwrap();
+        write_str(&mut buf, "node").unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "type").unwrap();
+        write_str(&mut buf, "symlink").unwrap();
+        write_str(&mut buf, "target").unwrap();
+        write_bytes(&mut buf, &[0xFE]).unwrap();
+        write_str(&mut buf, ")").unwrap();
+        write_str(&mut buf, ")").unwrap();
+        write_str(&mut buf, ")").unwrap();
+
+        assert!(matches!(
+            parse(&mut Cursor::new(&buf)),
+            Err(NarError::InvalidUtf8 { .. })
+        ));
+
+        let entries = nar_ls(Cursor::new(&buf)).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind, NarEntryKind::Directory);
+        assert_eq!(entries[1].path, vec![0xFF]);
+        assert_eq!(entries[1].kind, NarEntryKind::Symlink);
+        assert_eq!(entries[1].target, vec![0xFE]);
+    }
+
+    /// A `Read` that delivers `len` repeated bytes then EOF, never
+    /// allocating. Used to prove `nar_ls` holds bounded memory: the
+    /// content here is far past `MAX_CONTENT_SIZE`, so a `parse()`-style
+    /// buffer-whole impl would either OOM or reject it.
+    struct RepeatReader {
+        byte: u8,
+        remaining: u64,
+    }
+    impl Read for RepeatReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = (self.remaining.min(buf.len() as u64)) as usize;
+            buf[..n].fill(self.byte);
+            self.remaining -= n as u64;
+            Ok(n)
+        }
+    }
+
+    /// Hand-written NAR header for a single regular file of arbitrary
+    /// size, content supplied by a chained reader. `serialize()` would
+    /// need the bytes in a `Vec`.
+    fn synthetic_regular_header(content_len: u64) -> Vec<u8> {
+        let mut h = Vec::new();
+        write_str(&mut h, NAR_MAGIC).unwrap();
+        write_str(&mut h, "(").unwrap();
+        write_str(&mut h, "type").unwrap();
+        write_str(&mut h, "regular").unwrap();
+        write_str(&mut h, "contents").unwrap();
+        write_u64(&mut h, content_len).unwrap();
+        h
+    }
+
+    fn synthetic_regular_trailer(content_len: u64) -> Vec<u8> {
+        let mut t = Vec::new();
+        let pad = crate::protocol::wire::padding_len(content_len as usize);
+        t.extend_from_slice(&vec![0u8; pad]);
+        write_str(&mut t, ")").unwrap();
+        t
+    }
+
+    // r[verify store.index.nar-ls-streaming]
+    #[test]
+    fn nar_ls_bounded_memory_past_max_content_size() {
+        // 4× MAX_CONTENT_SIZE — parse() would reject it (ContentTooLarge);
+        // nar_ls streams it in 64 KiB blocks. RepeatReader allocates
+        // nothing, so this test going OOM means nar_ls buffers.
+        let len = MAX_CONTENT_SIZE * 4;
+        let header = synthetic_regular_header(len);
+        let nar_offset = header.len() as u64;
+        let trailer = synthetic_regular_trailer(len);
+
+        let r = Cursor::new(header)
+            .chain(RepeatReader {
+                byte: 0xAB,
+                remaining: len,
+            })
+            .chain(Cursor::new(trailer));
+
+        let entries = nar_ls(r).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, NarEntryKind::Regular);
+        assert_eq!(entries[0].size, len);
+        assert_eq!(entries[0].nar_offset, nar_offset);
+
+        // Compute expected blake3 incrementally (same block size).
+        let mut h = blake3::Hasher::new();
+        let block = vec![0xABu8; 64 * 1024];
+        let mut rem = len;
+        while rem > 0 {
+            let take = rem.min(block.len() as u64) as usize;
+            h.update(&block[..take]);
+            rem -= take as u64;
+        }
+        assert_eq!(entries[0].file_digest, *h.finalize().as_bytes());
+    }
+
+    /// Hand-encoded — `serialize()` can't emit these names.
+    #[rstest]
+    #[case::empty(b"")]
+    #[case::dot(b".")]
+    #[case::dotdot(b"..")]
+    #[case::slash(b"a/b")]
+    #[case::nul(b"a\0b")]
+    fn nar_ls_rejects_invalid_entry_names(#[case] name: &[u8]) {
+        let mut buf = Vec::new();
+        write_str(&mut buf, NAR_MAGIC).unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "type").unwrap();
+        write_str(&mut buf, "directory").unwrap();
+        write_str(&mut buf, "entry").unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "name").unwrap();
+        write_bytes(&mut buf, name).unwrap();
+        write_str(&mut buf, "node").unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "type").unwrap();
+        write_str(&mut buf, "symlink").unwrap();
+        write_str(&mut buf, "target").unwrap();
+        write_str(&mut buf, "x").unwrap();
+        write_str(&mut buf, ")").unwrap();
+        write_str(&mut buf, ")").unwrap();
+        write_str(&mut buf, ")").unwrap();
+
+        assert!(matches!(
+            nar_ls(Cursor::new(&buf)),
+            Err(NarError::InvalidEntryName { .. })
+        ));
+    }
+
+    /// Mirrors `reject_deeply_nested_nar` for `nar_ls`.
+    #[test]
+    fn nar_ls_rejects_too_deep_nesting() {
+        let mut node = reg(false, b"");
+        for _ in 0..(MAX_NAR_DEPTH + 1) {
+            node = NarNode::Directory {
+                entries: vec![entry("a", node)],
+            };
+        }
+        let mut buf = Vec::new();
+        serialize(&mut buf, &node).unwrap();
+        assert!(matches!(
+            nar_ls(Cursor::new(&buf)),
+            Err(NarError::NestingTooDeep(_))
+        ));
+    }
+
+    #[test]
+    fn nar_ls_accepts_at_depth_limit() {
+        let mut node = reg(false, b"");
+        for _ in 0..MAX_NAR_DEPTH {
+            node = NarNode::Directory {
+                entries: vec![entry("a", node)],
+            };
+        }
+        let mut buf = Vec::new();
+        serialize(&mut buf, &node).unwrap();
+        let entries = nar_ls(Cursor::new(&buf)).unwrap();
+        assert_eq!(entries.len(), MAX_NAR_DEPTH + 1); // 256 dirs + 1 leaf
+    }
+
+    /// `nar_ls` emits in NAR encounter order (DFS pre-order) so the
+    /// caller's bottom-up dir_digest pass (P0572) can iterate in
+    /// reverse without re-sorting.
+    #[test]
+    fn nar_ls_encounter_order() {
+        let tree = NarNode::Directory {
+            entries: vec![
+                NarEntry {
+                    name: "a".into(),
+                    node: NarNode::Directory {
+                        entries: vec![NarEntry {
+                            name: "x".into(),
+                            node: reg(false, b"x"),
+                        }],
+                    },
+                },
+                NarEntry {
+                    name: "b".into(),
+                    node: NarNode::Symlink {
+                        target: "a/x".into(),
+                    },
+                },
+            ],
+        };
+        let mut buf = Vec::new();
+        serialize(&mut buf, &tree).unwrap();
+        let entries = nar_ls(Cursor::new(&buf)).unwrap();
+        let paths: Vec<&[u8]> = entries.iter().map(|e| e.path.as_slice()).collect();
+        assert_eq!(paths, vec![&b""[..], b"a", b"a/x", b"b"]);
+    }
+
+    // ── Malformed-input rejection ──────────────────────────────────────
+    // `nar_ls` reimplements the token walk (it streams instead of
+    // buffering), so the `parse()` rejection tests above do not cover
+    // its error returns.
+
+    /// Encode a token sequence after the NAR magic. `serialize()` can
+    /// only emit well-formed NARs; every rejection case needs raw
+    /// tokens.
+    fn nar_tokens(tokens: &[&str]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_str(&mut buf, NAR_MAGIC).unwrap();
+        for t in tokens {
+            write_str(&mut buf, t).unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn nar_ls_rejects_invalid_magic() {
+        let mut buf = Vec::new();
+        write_str(&mut buf, "not-nar-magic").unwrap();
+        assert!(matches!(
+            nar_ls(Cursor::new(&buf)),
+            Err(NarError::InvalidMagic(_))
+        ));
+    }
+
+    #[test]
+    fn nar_ls_rejects_unknown_node_type() {
+        let buf = nar_tokens(&["(", "type", "fifo"]);
+        assert!(matches!(
+            nar_ls(Cursor::new(&buf)),
+            Err(NarError::UnknownNodeType(ref t)) if t == "fifo"
+        ));
+    }
+
+    /// `expect_token` mismatch — the other UnexpectedToken cases below
+    /// hit explicit match arms, not the generic helper.
+    #[test]
+    fn nar_ls_rejects_missing_open_paren() {
+        let buf = nar_tokens(&["garbage"]);
+        assert!(matches!(
+            nar_ls(Cursor::new(&buf)),
+            Err(NarError::UnexpectedToken { ref got, .. }) if got == "garbage"
+        ));
+    }
+
+    #[test]
+    fn nar_ls_rejects_regular_without_contents() {
+        let buf = nar_tokens(&["(", "type", "regular", "garbage"]);
+        assert!(matches!(
+            nar_ls(Cursor::new(&buf)),
+            Err(NarError::UnexpectedToken { ref got, .. }) if got == "garbage"
+        ));
+    }
+
+    #[test]
+    fn nar_ls_rejects_unknown_directory_token() {
+        let buf = nar_tokens(&["(", "type", "directory", "nonsense"]);
+        assert!(matches!(
+            nar_ls(Cursor::new(&buf)),
+            Err(NarError::UnexpectedToken { ref got, .. }) if got == "nonsense"
+        ));
+    }
+
+    #[test]
+    fn nar_ls_rejects_unsorted_entries() {
+        #[rustfmt::skip]
+        let buf = nar_tokens(&[
+            "(", "type", "directory",
+            "entry", "(", "name", "z", "node",
+                "(", "type", "symlink", "target", "t", ")",
+            ")",
+            "entry", "(", "name", "a", "node",
+                "(", "type", "symlink", "target", "t", ")",
+            ")",
+            ")",
+        ]);
+        assert!(matches!(
+            nar_ls(Cursor::new(&buf)),
+            Err(NarError::UnsortedEntries { ref prev, ref cur }) if prev == "z" && cur == "a"
+        ));
+    }
+
+    // ── Whole-archive bounds (ingest-limits contract) ──────────────────
+    // Per-axis limits (per-directory entries, depth, name length) do
+    // not bound the archive as a whole; the store sizes its index
+    // materialization and its GetPath regeneration walk for these
+    // totals, so `nar_ls` must reject anything past them instead of
+    // materializing it.
+
+    /// `Read` over lazily-generated byte segments — synthesizes NARs
+    /// with ~1M entries without materializing the archive bytes.
+    struct SegmentReader<I: Iterator<Item = Vec<u8>>> {
+        segments: I,
+        current: Vec<u8>,
+        pos: usize,
+    }
+
+    impl<I: Iterator<Item = Vec<u8>>> Read for SegmentReader<I> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            loop {
+                if self.pos < self.current.len() {
+                    let n = (self.current.len() - self.pos).min(buf.len());
+                    buf[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+                    self.pos += n;
+                    return Ok(n);
+                }
+                match self.segments.next() {
+                    Some(s) => {
+                        self.current = s;
+                        self.pos = 0;
+                    }
+                    None => return Ok(0),
+                }
+            }
+        }
+    }
+
+    /// One `entry(name -> symlink target)` token run.
+    fn symlink_entry_segment(name: &[u8], target: &[u8]) -> Vec<u8> {
+        let mut s = Vec::new();
+        for t in ["entry", "(", "name"] {
+            write_str(&mut s, t).unwrap();
+        }
+        write_bytes(&mut s, name).unwrap();
+        for t in ["node", "(", "type", "symlink", "target"] {
+            write_str(&mut s, t).unwrap();
+        }
+        write_bytes(&mut s, target).unwrap();
+        for t in [")", ")"] {
+            write_str(&mut s, t).unwrap();
+        }
+        s
+    }
+
+    fn tokens_segment(tokens: &[&str]) -> Vec<u8> {
+        let mut s = Vec::new();
+        for t in tokens {
+            write_str(&mut s, t).unwrap();
+        }
+        s
+    }
+
+    /// `nar_ls` over lazily-generated segments.
+    fn nar_ls_segments(segments: impl Iterator<Item = Vec<u8>>) -> Result<Vec<NarLsEntry>> {
+        nar_ls(SegmentReader {
+            segments,
+            current: Vec::new(),
+            pos: 0,
+        })
+    }
+
+    /// The `nix-archive-1 ( type directory` opener shared by the
+    /// segment-built fixtures.
+    fn directory_root_header() -> Vec<u8> {
+        let mut h = Vec::new();
+        write_str(&mut h, NAR_MAGIC).unwrap();
+        for t in ["(", "type", "directory"] {
+            write_str(&mut h, t).unwrap();
+        }
+        h
+    }
+
+    /// Lazy NAR segments for a root directory holding two
+    /// subdirectories `a` and `b` with `a_count` / `b_count` symlink
+    /// entries (target `"t"`) respectively. Total archive entries =
+    /// 3 (root + the two subdirs) + `a_count` + `b_count`. Splitting
+    /// across two subdirectories keeps both under the per-directory
+    /// cap, so only the whole-archive total is exercised.
+    fn two_subdir_nar_segments(a_count: usize, b_count: usize) -> impl Iterator<Item = Vec<u8>> {
+        let subdir_open = |name: &str| {
+            tokens_segment(&["entry", "(", "name", name, "node", "(", "type", "directory"])
+        };
+        // close the inner directory node, then the entry.
+        let subdir_close = || tokens_segment(&[")", ")"]);
+        let entries =
+            |n: usize| (0..n).map(|i| symlink_entry_segment(format!("{i:07}").as_bytes(), b"t"));
+
+        std::iter::once(directory_root_header())
+            .chain(std::iter::once(subdir_open("a")))
+            .chain(entries(a_count))
+            .chain(std::iter::once(subdir_close()))
+            .chain(std::iter::once(subdir_open("b")))
+            .chain(entries(b_count))
+            .chain(std::iter::once(subdir_close()))
+            .chain(std::iter::once(tokens_segment(&[")"])))
+    }
+
+    /// Whole-archive entry count is bounded. A NAR of millions of
+    /// directories/symlinks stays under MAX_NAR_SIZE and under every
+    /// per-directory/depth cap, but the store's GetPath regeneration
+    /// walk and index materialization are sized for [`MAX_NAR_ENTRIES`]
+    /// — without the total cap such a path commits as 'complete' yet
+    /// can never be served (bug_011). Two subdirectories each hold half
+    /// the entries, so the per-directory cap is NOT what fires.
+    // r[verify store.ingest.tree-bounds+2]
+    #[test]
+    fn nar_ls_rejects_more_total_entries_than_max() {
+        // Total entries = root + 2 subdirs + 2 × per_subdir symlinks
+        //               = MAX_NAR_ENTRIES + 3.
+        let per_subdir = MAX_NAR_ENTRIES / 2;
+        let result = nar_ls_segments(two_subdir_nar_segments(per_subdir, per_subdir));
+        // Don't debug-print the Ok case — it would be a million entries.
+        let outcome = result.as_ref().map(Vec::len);
+        assert!(
+            matches!(result, Err(NarError::TooManyTotalEntries(_))),
+            "expected TooManyTotalEntries, got {outcome:?}"
+        );
+    }
+
+    /// Exactly [`MAX_NAR_ENTRIES`] total entries is accepted: the cap
+    /// is "more than", not "at least", so the largest archive the store
+    /// sizes its index materialization and regeneration walk for must
+    /// still parse. Same lazy two-subdirectory fixture as the
+    /// over-the-cap test above, three entries fewer.
+    // r[verify store.ingest.tree-bounds+2]
+    #[test]
+    fn nar_ls_accepts_exactly_max_total_entries() {
+        // root + 2 subdirs + symlinks = MAX_NAR_ENTRIES exactly.
+        let symlinks = MAX_NAR_ENTRIES - 3;
+        let entries = nar_ls_segments(two_subdir_nar_segments(
+            symlinks / 2,
+            symlinks - symlinks / 2,
+        ))
+        .expect("an archive with exactly MAX_NAR_ENTRIES entries must parse");
+        assert_eq!(entries.len(), MAX_NAR_ENTRIES);
+    }
+
+    /// Cumulative materialized index bytes (joined paths + symlink
+    /// targets) are bounded. With 255-byte names at maximum nesting a
+    /// single leaf's joined path is ~64 KiB while its NAR framing is
+    /// ~200 bytes — a sub-MB NAR legally expands to hundreds of MB (and
+    /// a few-hundred-MB NAR to tens of GB) of index entries in every
+    /// ingest path (bug_012). The cap rejects the expansion instead of
+    /// allocating it.
+    // r[verify store.ingest.tree-bounds+2]
+    #[test]
+    fn nar_ls_rejects_cumulative_index_bytes_over_max() {
+        // Spine: MAX_NAR_DEPTH - 1 nested dirs with 255-byte names, so
+        // the leaves sit exactly at the depth limit (depth itself is
+        // legal — only the cumulative expansion is not).
+        let spine_name = "d".repeat(255);
+        // Each leaf charges its joined path (the spine components plus
+        // separators plus its own 4-char name) and its 1-byte target.
+        // Size the leaf count from the constant so the leaves alone
+        // exceed the cap even if MAX_NAR_INDEX_BYTES is ever raised —
+        // the spine directories' own path bytes are extra margin.
+        let per_leaf = ((MAX_NAR_DEPTH - 1) * (spine_name.len() + 1) + 4 + 1) as u64;
+        let leaf_count = (MAX_NAR_INDEX_BYTES / per_leaf + 1) as usize;
+        let leaves = NarNode::Directory {
+            entries: (0..leaf_count)
+                .map(|i| {
+                    entry(
+                        &format!("{i:04}"),
+                        NarNode::Symlink {
+                            target: "t".to_string(),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let mut node = leaves;
+        for _ in 0..(MAX_NAR_DEPTH - 1) {
+            node = NarNode::Directory {
+                entries: vec![entry(&spine_name, node)],
+            };
+        }
+        let mut nar = Vec::new();
+        serialize(&mut nar, &node).unwrap();
+        assert!(
+            (nar.len() as u64) < 2 * 1024 * 1024,
+            "the input must stay small — the point is the ~350× expansion, \
+             got {} bytes",
+            nar.len()
+        );
+
+        let result = nar_ls(Cursor::new(&nar));
+        // Don't debug-print the Ok case — it would be ~128 MiB of paths.
+        let outcome = result.as_ref().map(Vec::len);
+        assert!(
+            matches!(result, Err(NarError::IndexBytesTooLarge(_))),
+            "expected IndexBytesTooLarge, got {outcome:?}"
+        );
+    }
+
+    /// Cumulative index bytes of exactly [`MAX_NAR_INDEX_BYTES`] are
+    /// accepted: the cap is "more than", not "at least". The fixture is
+    /// shaped so the sum lands exactly on the cap — the root directory
+    /// charges 0 bytes (empty path, no target) and each of its symlink
+    /// children charges name + target = 4096 bytes, a divisor of the
+    /// cap. Lazy segments keep the ~134 MB input from being
+    /// materialized; the parsed output, whose path/target bytes ARE the
+    /// quantity being measured, is the irreducible allocation.
+    // r[verify store.ingest.tree-bounds+2]
+    #[test]
+    fn nar_ls_accepts_cumulative_index_bytes_at_max() {
+        const NAME_LEN: usize = 256; // = MAX_NAME_LEN
+        const TARGET_LEN: usize = 4096 - NAME_LEN;
+        const PER_ENTRY: u64 = (NAME_LEN + TARGET_LEN) as u64;
+        assert_eq!(
+            MAX_NAR_INDEX_BYTES % PER_ENTRY,
+            0,
+            "fixture invariant: the per-entry charge must divide the cap exactly"
+        );
+        let n = (MAX_NAR_INDEX_BYTES / PER_ENTRY) as usize;
+        let target = vec![b't'; TARGET_LEN];
+        let symlinks = (0..n).map(move |i| {
+            // NAME_LEN-byte zero-padded decimal names sort byte-lexicographically.
+            let mut name = vec![b'0'; NAME_LEN];
+            let digits = i.to_string();
+            name[NAME_LEN - digits.len()..].copy_from_slice(digits.as_bytes());
+            symlink_entry_segment(&name, &target)
+        });
+        let segments = std::iter::once(directory_root_header())
+            .chain(symlinks)
+            .chain(std::iter::once(tokens_segment(&[")"])));
+
+        let entries = nar_ls_segments(segments)
+            .expect("an archive whose index bytes sit exactly at the cap must parse");
+        assert_eq!(entries.len(), n + 1, "the symlinks plus the root directory");
+    }
+}
+
+// -----------------------------------------------------------------------
+// WalkObserver: ADR-022 §6 external-walker surface
+// -----------------------------------------------------------------------
+
+/// Records every observer callback as a flat event list.
+#[derive(Default)]
+struct RecordingObserver {
+    events: Vec<String>,
+    /// Concatenation of every `file_data` slice for the current file.
+    current: Vec<u8>,
+}
+
+impl WalkObserver for RecordingObserver {
+    fn enter_dir(&mut self, name: &[u8]) -> std::io::Result<()> {
+        self.events
+            .push(format!("dir+ {}", str::from_utf8(name).unwrap()));
+        Ok(())
+    }
+    fn leave_dir(&mut self) -> std::io::Result<()> {
+        self.events.push("dir-".into());
+        Ok(())
+    }
+    fn symlink(&mut self, name: &[u8], target: &[u8]) -> std::io::Result<()> {
+        self.events.push(format!(
+            "sym {} -> {}",
+            str::from_utf8(name).unwrap(),
+            str::from_utf8(target).unwrap()
+        ));
+        Ok(())
+    }
+    fn file_begin(&mut self, name: &[u8], executable: bool, size: u64) -> std::io::Result<()> {
+        self.events.push(format!(
+            "file+ {} x={executable} size={size}",
+            str::from_utf8(name).unwrap()
+        ));
+        self.current.clear();
+        Ok(())
+    }
+    fn file_data(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.current.extend_from_slice(data);
+        Ok(())
+    }
+    fn file_end(&mut self) -> std::io::Result<()> {
+        self.events.push(format!(
+            "file- {:?}",
+            str::from_utf8(&self.current).unwrap()
+        ));
+        Ok(())
+    }
+}
+
+/// The observer sees the tree structure in canonical NAR walk order
+/// (byte-lex by name, dirs entered before their children), file
+/// contents arrive complete and in order, and the NAR byte stream is
+/// identical to the observer-free dump.
+#[test]
+fn dump_path_observed_reports_structure_and_matches_plain_dump() -> anyhow::Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root)?;
+    std::fs::create_dir(root.join("b-sub"))?;
+    std::fs::write(root.join("b-sub/inner"), b"nested")?;
+    std::fs::write(root.join("a-file"), b"hello")?;
+    std::os::unix::fs::symlink("a-file", root.join("c-link"))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(root.join("d-exec"), b"#!/bin/sh\n")?;
+        std::fs::set_permissions(root.join("d-exec"), std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    let mut plain = Vec::new();
+    dump_path_streaming(&root, &mut plain)?;
+
+    let mut observed = Vec::new();
+    let mut obs = RecordingObserver::default();
+    let n = dump_path_observed(&root, &mut observed, &mut obs)?;
+
+    assert_eq!(plain, observed, "observer must not perturb the byte stream");
+    assert_eq!(n, plain.len() as u64);
+    assert_eq!(
+        obs.events,
+        vec![
+            "dir+ ".to_string(), // root has no name
+            "file+ a-file x=false size=5".to_string(),
+            "file- \"hello\"".to_string(),
+            "dir+ b-sub".to_string(),
+            "file+ inner x=false size=6".to_string(),
+            "file- \"nested\"".to_string(),
+            "dir-".to_string(),
+            "sym c-link -> a-file".to_string(),
+            "file+ d-exec x=true size=10".to_string(),
+            "file- \"#!/bin/sh\\n\"".to_string(),
+            "dir-".to_string(),
+        ]
+    );
+    Ok(())
 }

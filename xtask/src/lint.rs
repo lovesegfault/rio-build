@@ -422,8 +422,19 @@ fn seccomp_allowlist() -> Result<()> {
     // `ptrace`/`process_vm_readv` are allowed in the BUILDER profile
     // (read-side tracing for check phases — see regen::seccomp::DENIED)
     // but stay denied here: FOD fetch scripts have no check phase, and
-    // the fetcher faces the open internet.
+    // the fetcher faces the open internet. The `io_uring_*` trio is NOT
+    // here: the fetcher's worker serves the per-build castore-FUSE
+    // (the FOD sandbox's overlay lower) over fuse-over-io_uring — the
+    // session's only transport — so denying the trio fails every FOD
+    // (vm-fetcher-split-k3s regression: zero builder pods because the
+    // consumer's FOD input never completed).
     const FETCHER_EXTRA_DENIED: &[&str] = &["keyctl", "add_key", "ptrace", "process_vm_readv"];
+
+    // Both profiles must keep the fuse-over-io_uring trio in an ALLOW
+    // block — the worker's castore-FUSE has no other transport, and
+    // RuntimeDefault/moby deny io_uring by default (Docker v24+), so a
+    // profile regen that drops these breaks every executor pod.
+    const NEEDED_URING: &[&str] = &["io_uring_setup", "io_uring_enter", "io_uring_register"];
 
     let fetcher_denied: Vec<&str> = crate::regen::seccomp::DENIED
         .iter()
@@ -431,7 +442,13 @@ fn seccomp_allowlist() -> Result<()> {
         .copied()
         .collect();
 
-    let builder_needed: Vec<&str> = NEEDED.iter().chain(BUILDER_NEEDED_TRACE).copied().collect();
+    let builder_needed: Vec<&str> = NEEDED
+        .iter()
+        .chain(BUILDER_NEEDED_TRACE)
+        .chain(NEEDED_URING)
+        .copied()
+        .collect();
+    let fetcher_needed: Vec<&str> = NEEDED.iter().chain(NEEDED_URING).copied().collect();
 
     check_seccomp_profile(
         "nix/nixos-node/seccomp/rio-builder.json",
@@ -444,7 +461,7 @@ fn seccomp_allowlist() -> Result<()> {
     check_seccomp_profile(
         "nix/nixos-node/seccomp/rio-fetcher.json",
         &fetcher_denied,
-        NEEDED,
+        &fetcher_needed,
         // The fetcher profile MUST keep its explicit ERRNO block — see
         // its `//provenance` header. The block is redundant with
         // defaultAction (none of these are in an ALLOW block) but it

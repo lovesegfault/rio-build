@@ -64,6 +64,24 @@ pub struct MockStoreState {
     /// BLAKE3 digest → chunk bytes. dataplane2: backs the in-memory
     /// `ChunkService.GetChunk` impl. Seed via [`MockStore::seed_chunked`].
     pub chunks: Arc<RwLock<HashMap<Vec<u8>, Vec<u8>>>>,
+    /// nar_hash → NAR index. Backs `GetNarIndex`/`GetNarIndexBatch` —
+    /// the builder's castore root-node fallback for closure paths the
+    /// scheduler dispatched without a `root_node`. Seed via
+    /// [`MockStore::seed_nar_index`]; an unseeded hash is reported as
+    /// "no index" (NotFound / `index: None`), which is exactly the
+    /// indexer-lag case the fallback's error path guards.
+    pub nar_indexes: Arc<RwLock<HashMap<Vec<u8>, types::NarIndex>>>,
+}
+
+/// One recorded `PutPathChunked` call: the assignment-token header (if
+/// any), the `Begin` frame as received, and the chunk digests received
+/// in wire order. Tests assert on the Begin's outputs/novel/closure and
+/// on which chunk bodies were actually streamed.
+#[derive(Clone)]
+pub struct RecordedChunkedPut {
+    pub token: Option<String>,
+    pub begin: types::PutPathChunkedBegin,
+    pub chunk_digests: Vec<Vec<u8>>,
 }
 
 /// Call recorders. The [`StoreService`] / [`ChunkService`] impls write
@@ -73,6 +91,8 @@ pub struct MockStoreState {
 pub struct MockStoreCalls {
     /// Every PutPath metadata received (for assertions on upload count/contents).
     pub put_calls: Arc<RwLock<Vec<types::PathInfo>>>,
+    /// Every PutPathChunked stream received (P0586 builder upload path).
+    pub put_chunked_calls: Arc<RwLock<Vec<RecordedChunkedPut>>>,
     /// Records every `query_path_info` call's requested path. For
     /// verifying r[sched.merge.substitute-fetch]'s eager-fetch loop.
     pub qpi_calls: Arc<RwLock<Vec<String>>>,
@@ -86,18 +106,11 @@ pub struct MockStoreCalls {
     /// tests proving the builder uses one batch RPC per BFS layer
     /// (not N per-path RPCs).
     pub batch_qpi_calls: Arc<AtomicU32>,
-    /// Number of `batch_get_manifest` calls received. For I-110c
-    /// tests proving the builder calls it once before the warm loop.
-    pub batch_manifest_calls: Arc<AtomicU32>,
     /// Number of `find_missing_paths` calls received (incremented on
     /// entry, before the fail-injection check). For I-163 tests
     /// proving deferred FODs use the batch pre-pass (1 RPC) and skip
     /// the per-FOD `fod_outputs_in_store` fallback (would be N+1).
     pub find_missing_calls: Arc<AtomicU32>,
-    /// `manifest_hint` from each `get_path` call (None if unset).
-    /// I-110c: lets tests assert the FUSE fetch carried the primed
-    /// hint.
-    pub get_path_hints: Arc<RwLock<Vec<Option<types::ManifestHint>>>>,
     /// Number of `get_path` calls received. Incremented on entry,
     /// BEFORE the `fail_get_path` early-return — distinguishes "client
     /// never reached the RPC" from "RPC returned Unavailable". For
@@ -105,6 +118,11 @@ pub struct MockStoreCalls {
     /// fetch tests (replaces wall-clock `elapsed < backoff_floor`
     /// asserts that flaked under full-gate parallel load).
     pub get_path_calls: Arc<AtomicU32>,
+    /// `x-rio-assignment-token` value on each GetPath call (`None` =
+    /// absent). For the builder's `.drv` fetch: the store's drv-blob
+    /// GetPath fallback is tenant-scoped, so `fetch_drv_from_store`
+    /// must present the assignment token.
+    pub get_path_tokens: Arc<RwLock<Vec<Option<String>>>>,
     /// `x-rio-tenant-token` value on each QueryRealisation call
     /// (`None` = absent). For `r[gw.jwt.propagate]` — floating-CA
     /// output resolution in `wopBuildPathsWithResults`.
@@ -118,6 +136,13 @@ pub struct MockStoreCalls {
 pub struct MockStoreFaults {
     /// If > 0, put_path decrements and returns Unavailable. For retry tests.
     pub fail_next_puts: Arc<AtomicU32>,
+    /// If > 0, put_path_chunked decrements and returns
+    /// `FailedPrecondition` — a deterministic rejection, matching the
+    /// real store's "PutPathChunked requires a chunk backend" gate on
+    /// an inline-only deployment. The remaining count after the call
+    /// is the structural attempt counter for asserting the builder
+    /// does NOT burn its retry budget on a non-retryable status.
+    pub reject_next_chunked_puts: Arc<AtomicU32>,
     /// If > 0, put_path decrements and returns `Aborted("concurrent
     /// PutPath in progress for this path; retry")` — matching the real
     /// store's placeholder-contention response (`put_path.rs`). For
@@ -270,11 +295,11 @@ impl MockStore {
     /// Seed a path AND its chunked manifest. Splits `nar` into fixed
     /// `chunk_size` pieces (the real store uses FastCDC; fixed-size is
     /// fine for the mock — chunks are addressed by content hash, not
-    /// boundary), populates `self.state.chunks`, and stores the chunk list
-    /// alongside the inline blob so `batch_get_manifest` can return it.
+    /// boundary), populates `self.state.chunks`, and seeds the path's
+    /// PathInfo + NAR via [`Self::seed`].
     ///
-    /// Returns the `Vec<ChunkRef>` so tests can prime the builder's
-    /// hint cache directly.
+    /// Returns the `Vec<ChunkRef>` (per-chunk digest + size) so tests
+    /// can assert against `ChunkService.GetChunk`.
     pub fn seed_chunked(
         &self,
         info: ValidatedPathInfo,
@@ -295,6 +320,16 @@ impl MockStore {
         drop(chunks);
         self.seed(info, nar);
         refs
+    }
+
+    /// Seed a NAR index for `nar_hash`, served by `GetNarIndex` /
+    /// `GetNarIndexBatch`.
+    pub fn seed_nar_index(&self, nar_hash: [u8; 32], index: types::NarIndex) {
+        self.state
+            .nar_indexes
+            .write()
+            .unwrap()
+            .insert(nar_hash.to_vec(), index);
     }
 }
 
@@ -323,6 +358,66 @@ impl ChunkService for MockStore {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+
+    type GetChunksStream = tokio_stream::wrappers::ReceiverStream<Result<types::ChunkData, Status>>;
+
+    /// Bidi-stream batch fetch (P0568). Same lookup as `get_chunk` —
+    /// reads the seeded `state.chunks` map, no fan-out (the real
+    /// server's `K_server` parallelism is a perf concern, not a
+    /// behavior the consumer can observe; `ChunkData` carries the
+    /// digest precisely so completion order doesn't matter). Mirrors
+    /// the real abort-on-first-miss contract so retry tests against
+    /// the mock exercise the same code path as production.
+    async fn get_chunks(
+        &self,
+        request: Request<Streaming<types::GetChunksRequest>>,
+    ) -> Result<Response<Self::GetChunksStream>, Status> {
+        let mut requests = request.into_inner();
+        let chunks = std::sync::Arc::clone(&self.state.chunks);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            'frames: while let Ok(Some(frame)) = requests.message().await {
+                for digest in frame.digests {
+                    let item = chunks
+                        .read()
+                        .unwrap()
+                        .get(&digest)
+                        .cloned()
+                        .map(|data| types::ChunkData {
+                            digest,
+                            data: data.into(),
+                        })
+                        .ok_or_else(|| Status::not_found("mock: chunk not found"));
+                    let is_err = item.is_err();
+                    if tx.send(item).await.is_err() || is_err {
+                        break 'frames;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
+    /// Durable-presence probe (P0586). The mock has no WAL window —
+    /// a chunk in `state.chunks` is "durable". Bit i set ⇔ `digests[i]`
+    /// is present, LSB-first within each byte (the `HasBitmap`
+    /// contract shared with HasDirectories/HasBlobs).
+    async fn has_chunks(
+        &self,
+        request: Request<types::HasChunksRequest>,
+    ) -> Result<Response<types::HasBitmap>, Status> {
+        let digests = request.into_inner().digests;
+        let chunks = self.state.chunks.read().unwrap();
+        let mut bitmap = vec![0u8; digests.len().div_ceil(8)];
+        for (i, d) in digests.iter().enumerate() {
+            if chunks.contains_key(d) {
+                bitmap[i / 8] |= 1 << (i % 8);
+            }
+        }
+        Ok(Response::new(types::HasBitmap { bitmap }))
     }
 }
 
@@ -645,9 +740,15 @@ impl StoreService for MockStore {
     ) -> Result<Response<Self::GetPathStream>, Status> {
         // Count BEFORE any fault-injection early-return so tests can
         // assert "client never contacted gRPC" (== 0) vs "client did
-        // and got Unavailable" (> 0). `get_path_hints` below is pushed
-        // only on the success path so it can't serve this purpose.
+        // and got Unavailable" (> 0).
         self.calls.get_path_calls.fetch_add(1, Ordering::SeqCst);
+        self.calls.get_path_tokens.write().unwrap().push(
+            request
+                .metadata()
+                .get(rio_proto::ASSIGNMENT_TOKEN_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+        );
         if self.faults.fail_get_path.load(Ordering::SeqCst) {
             return Err(Status::unavailable("mock: injected get_path failure"));
         }
@@ -659,13 +760,6 @@ impl StoreService for MockStore {
             self.faults.get_path_gate.notified().await;
         }
         let req = request.into_inner();
-        // I-110c: record the hint (or its absence) so tests can assert
-        // the FUSE fetch carried what `prefetch_manifests` primed.
-        self.calls
-            .get_path_hints
-            .write()
-            .unwrap()
-            .push(req.manifest_hint);
         let store_path = req.store_path;
         // Garbage mode: return a stream with valid PathInfo but garbage NAR
         // bytes, so collect_nar_stream succeeds but nar::parse fails.
@@ -816,23 +910,18 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::BatchGetManifestRequest>,
     ) -> Result<Response<types::BatchGetManifestResponse>, Status> {
-        self.calls
-            .batch_manifest_calls
-            .fetch_add(1, Ordering::SeqCst);
         let paths = self.state.paths.read().unwrap();
         let entries = request
             .into_inner()
             .store_paths
             .into_iter()
             .map(|store_path| {
-                // MockStore stores whole NARs in-memory — represent
-                // as inline (no chunking in the mock).
+                // PathInfo only — mirrors the real store, which never
+                // returns manifest content from BatchGetManifest.
                 let hint = paths
                     .get(&store_path)
-                    .map(|(info, nar)| types::ManifestHint {
+                    .map(|(info, _nar)| types::ManifestHint {
                         info: Some(info.clone()),
-                        chunks: Vec::new(),
-                        inline_blob: nar.clone(),
                     });
                 types::ManifestEntry { store_path, hint }
             })
@@ -1085,5 +1174,229 @@ impl StoreService for MockStore {
         // SCHEDULER (HwTable::load), not anything that goes through
         // MockStore. Accept and discard.
         Ok(Response::new(()))
+    }
+
+    async fn get_nar_index(
+        &self,
+        request: Request<types::GetNarIndexRequest>,
+    ) -> Result<Response<types::NarIndex>, Status> {
+        let nar_hash = request.into_inner().nar_hash;
+        self.state
+            .nar_indexes
+            .read()
+            .unwrap()
+            .get(&nar_hash)
+            .cloned()
+            .map(Response::new)
+            .ok_or_else(|| Status::not_found("mock: no NAR index for that hash"))
+    }
+
+    type GetNarIndexBatchStream =
+        tokio_stream::wrappers::ReceiverStream<Result<types::NarIndexResponse, Status>>;
+
+    /// One `NarIndexResponse` per requested hash, request order
+    /// preserved; `index: None` for unseeded hashes — same "absent =
+    /// not indexed yet" contract as the real handler, which is what
+    /// the builder's root-node fallback error path keys on.
+    async fn get_nar_index_batch(
+        &self,
+        request: Request<types::GetNarIndexBatchRequest>,
+    ) -> Result<Response<Self::GetNarIndexBatchStream>, Status> {
+        let hashes = request.into_inner().nar_hashes;
+        // Scope the read guard so it is dropped before the awaits below
+        // (the guard is not Send and the future must be).
+        let responses: Vec<types::NarIndexResponse> = {
+            let indexes = self.state.nar_indexes.read().unwrap();
+            hashes
+                .into_iter()
+                .map(|nar_hash| types::NarIndexResponse {
+                    index: indexes.get(&nar_hash).cloned(),
+                    nar_hash,
+                })
+                .collect()
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(responses.len().max(1));
+        for resp in responses {
+            let _ = tx.send(Ok(resp)).await;
+        }
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
+    /// PutPathChunked (P0586 builder upload path). Mirrors the real
+    /// store's wire contract closely enough that a client regression
+    /// (wrong frame order, chunk body not matching its digest, missing
+    /// or extra chunk frames) fails here instead of only against
+    /// rio-store:
+    ///
+    /// - the first frame must be `Begin`;
+    /// - every `novel` digest is 32 bytes and duplicate-free;
+    /// - chunk frames arrive in exactly `novel` order, each body
+    ///   hashing to its digest;
+    /// - the stream carries exactly one frame per `novel` entry.
+    ///
+    /// Effects: received chunks land in `state.chunks` (so `HasChunks`
+    /// reflects the upload), each output's PathInfo lands in
+    /// `state.paths` (so `FindMissingPaths`/`QueryPathInfo` see it),
+    /// and the whole call is recorded in `calls.put_chunked_calls`.
+    /// The NAR bytes stored for each path are EMPTY — the mock does not
+    /// regenerate NAR framing from the castore tree; tests that need
+    /// `GetPath` round-trips drive the real rio-store handler instead.
+    /// `created[i]` is false when the path was already present
+    /// (idempotency mirror).
+    async fn put_path_chunked(
+        &self,
+        request: Request<Streaming<types::PutPathChunkedRequest>>,
+    ) -> Result<Response<types::PutPathChunkedResponse>, Status> {
+        // Same transient-failure knob as PutPath/PutPathBatch — one
+        // decrement per RPC, for retry tests.
+        if self
+            .faults
+            .fail_next_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            return Err(Status::unavailable("mock: injected chunked put failure"));
+        }
+        // Deterministic-rejection knob: the real store's chunk-backend
+        // gate (FAILED_PRECONDITION before reading any frame). One
+        // decrement per RPC so tests can count attempts structurally.
+        if self
+            .faults
+            .reject_next_chunked_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            return Err(Status::failed_precondition(
+                "mock: PutPathChunked requires a chunk backend",
+            ));
+        }
+
+        let token = request
+            .metadata()
+            .get(rio_proto::ASSIGNMENT_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let mut stream = request.into_inner();
+
+        let begin = match stream.message().await? {
+            Some(types::PutPathChunkedRequest {
+                msg: Some(types::put_path_chunked_request::Msg::Begin(b)),
+            }) => b,
+            Some(_) => {
+                return Err(Status::invalid_argument(
+                    "mock: first PutPathChunked frame must be Begin",
+                ));
+            }
+            None => {
+                return Err(Status::invalid_argument(
+                    "mock: empty PutPathChunked stream",
+                ));
+            }
+        };
+        if begin.outputs.is_empty() {
+            return Err(Status::invalid_argument("mock: Begin carries no outputs"));
+        }
+        for o in &begin.outputs {
+            let _ = rio_nix::store_path::StorePath::parse(&o.store_path)
+                .map_err(|e| Status::invalid_argument(format!("mock: invalid store path: {e}")))?;
+            if o.nar_hash.len() != 32 {
+                return Err(Status::invalid_argument(
+                    "mock: ChunkedOutput.nar_hash must be 32 bytes",
+                ));
+            }
+        }
+        let mut novel_seen = std::collections::HashSet::new();
+        for d in &begin.novel {
+            if d.len() != 32 {
+                return Err(Status::invalid_argument(
+                    "mock: novel digest must be 32 bytes",
+                ));
+            }
+            if !novel_seen.insert(d.clone()) {
+                return Err(Status::invalid_argument("mock: duplicate novel digest"));
+            }
+        }
+
+        // Chunk frames: exactly one per novel digest, in novel order,
+        // each body hashing to its digest.
+        let mut received: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(begin.novel.len());
+        while let Some(msg) = stream.message().await? {
+            let chunk = match msg.msg {
+                Some(types::put_path_chunked_request::Msg::Chunk(c)) => c,
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "mock: only Chunk frames may follow Begin",
+                    ));
+                }
+            };
+            let idx = received.len();
+            let Some(expected) = begin.novel.get(idx) else {
+                return Err(Status::invalid_argument(
+                    "mock: chunk frame after novel was exhausted",
+                ));
+            };
+            if &chunk.digest != expected {
+                return Err(Status::invalid_argument(format!(
+                    "mock: chunk frame {idx} out of novel order"
+                )));
+            }
+            if blake3::hash(&chunk.data).as_bytes() != chunk.digest.as_slice() {
+                return Err(Status::invalid_argument(format!(
+                    "mock: chunk frame {idx} body does not hash to its digest"
+                )));
+            }
+            received.push((chunk.digest.clone(), chunk.data.to_vec()));
+        }
+        if received.len() != begin.novel.len() {
+            return Err(Status::failed_precondition(format!(
+                "mock: stream ended after {} of {} novel chunks",
+                received.len(),
+                begin.novel.len()
+            )));
+        }
+
+        // Commit: chunks become probe-visible, paths become present.
+        {
+            let mut chunks = self.state.chunks.write().unwrap();
+            for (digest, data) in &received {
+                chunks.insert(digest.clone(), data.clone());
+            }
+        }
+        let mut created = Vec::with_capacity(begin.outputs.len());
+        {
+            let mut paths = self.state.paths.write().unwrap();
+            for o in &begin.outputs {
+                if paths.contains_key(&o.store_path) {
+                    created.push(false);
+                    continue;
+                }
+                let info = types::PathInfo {
+                    store_path: o.store_path.clone(),
+                    nar_hash: o.nar_hash.clone(),
+                    nar_size: o.nar_size,
+                    references: o.references.clone(),
+                    deriver: begin.deriver.clone(),
+                    ..Default::default()
+                };
+                paths.insert(o.store_path.clone(), (info, Vec::new()));
+                created.push(true);
+            }
+        }
+        self.calls
+            .put_chunked_calls
+            .write()
+            .unwrap()
+            .push(RecordedChunkedPut {
+                token,
+                begin,
+                chunk_digests: received.into_iter().map(|(d, _)| d).collect(),
+            });
+        Ok(Response::new(types::PutPathChunkedResponse { created }))
     }
 }

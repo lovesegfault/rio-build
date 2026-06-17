@@ -1,0 +1,365 @@
+# ADR-022: Lazy /nix/store filesystem — castore FUSE
+
+Status: **Accepted.** Three earlier candidates (EROFS+fscache, custom `riofs` kmod, EROFS+composefs-style) were evaluated and set aside; see §3.
+
+**Scope:** the builder-side `/nix/store` filesystem and the rio-store metadata that supports it. The canonical design reference is the [Design Overview](./022-design-overview.md); sequencing is in the [Implementation Plan](./022-implementation-plan.md).
+
+---
+
+## 0. Deployment context
+
+Builder nodes run a NixOS-based AMI. Kernel configuration is first-party: `boot.kernelPatches[].extraStructuredConfig` in the AMI flake sets `OVERLAY_FS=y FUSE_FS=y FUSE_PASSTHROUGH=y` and the node module asserts kernel ≥6.14 at boot (the fuse-over-io_uring transport floor; FUSE_PASSTHROUGH itself needs only ≥6.9). No custom Kconfig symbols are required — all are stock-on in distro defconfigs; the patch block is for `=y` over `=m` only.
+
+Device exposure: `/dev/fuse` reaches the builder via `rio-mountd` fd-handoff (§2.5); `/dev/kvm` reaches kvm-pool builds via `hostPath` CharDevice + `extra-sandbox-paths`. No device-plugin DaemonSet.
+
+---
+
+## 1. Problem statement
+
+The pre-ADR-022 builder presents `/nix/store` via a FUSE filesystem (`rio-builder/src/fuse/`) that JIT-fetches whole store paths on first access. This is correct but has three structural costs:
+
+1. **Fetch is path-granular.** `lookup` of a top-level basename materializes the entire store-path tree before returning. Touching one 4 KB header in a 1 GB output fetches 1 GB.
+2. **Warm-but-partial files still upcall.** FUSE passthrough binds one backing fd at `open()`. A 200 MB `libLLVM.so` with 4 MB of hot `.rodata` either upcalls on every read until the whole file is materialized, or blocks `open()` for ~1.3 s fetching it whole. The kernel page cache cannot serve a warm range of a partially-fetched file without crossing to userspace.
+3. **No cross-path content dedup.** Two store paths containing the same `.so` are two FUSE inodes, two fetches, two SSD copies, two page-cache copies.
+
+The goal: cold fetch is file-granular (not path-granular); warm reads of any range hit page cache with zero crossings; identical files across store paths are one fetch and one page-cache entry.
+
+---
+
+## 2. Design — castore FUSE
+
+The build's `/nix/store` is a single overlayfs over a **content-addressed FUSE** that serves the closure's [castore](https://snix.dev/docs/components/castore/data-model/) Directory DAG: `lookup`/`getattr`/`readdir`/`readlink` are answered from an in-memory tree; `open()` fetches the file by `file_digest` into a node-SSD cache and replies passthrough. This is the [snix-store](https://git.snix.dev/snix/snix/src/branch/canon/snix/store) filesystem model with rio's chunk backend underneath and `rio-mountd` brokering the privileged ioctls.
+
+The tree is immutable for the mount's lifetime, so the FUSE handler advertises infinite cache TTLs and the kernel's dcache/icache absorb all repeat metadata access. Warm `read()` is page-cache via passthrough; the handler is upcalled only for cold `lookup` and cold `open()`.
+
+### 2.1 Mount stack
+
+r[builder.fs.castore-stack+1]
+
+The build's `/nix/store` is a **single read-write overlayfs** with an SSD upper (build outputs land here) over one read-only lower: the castore-FUSE mount. Mount string: `overlay -o nosuid,nodev,userxattr,upperdir=<ssd>/nix/store,workdir=<ssd>/work,lowerdir=<castore_mnt>`; the merged dir is bind-mounted at `/nix/store` inside the build's mount namespace. `nosuid,nodev` is mandatory: the upperdir holds whatever the build writes, and without `MS_NOSUID` a setuid binary dropped there would be honored through the merged view (a store never legitimately contains setuid files or device nodes). Upper/work dirs are local SSD (`r[builder.overlay.upper-not-overlayfs]`); outputs and the synthesized `db.sqlite` live under the upper root. This is the same overlay shape as the pre-ADR-022 mount — only the lower's granularity changed.
+
+| Syscall | Resolved by | FUSE upcalls |
+|---|---|---|
+| `stat`/`getattr` (input) | overlay → FUSE `lookup`/`getattr` | **1 cold / 0 thereafter** (`Duration::MAX` ttl) |
+| `readdir` (input) | overlay → FUSE `readdirplus` | **1 cold / 0 thereafter** (`FOPEN_CACHE_DIR`); populates dcache for children |
+| `readlink` (input) | overlay → FUSE `readlink` | **1 cold / 0 thereafter** (`FUSE_CACHE_SYMLINKS`) |
+| `open` input (cold) | overlay → FUSE `open` → backing-cache fetch | **1 open** |
+| `read`/`mmap` input (cache hit / post-fill) | `FOPEN_PASSTHROUGH` → backing fd | **0** |
+| `read`/`mmap` input (large file mid-fill) | FUSE `read` (~128 KiB/req) | O(touched / 128 KiB), once per file per node |
+| `lookup` ENOENT (configure-probe) | overlay negative dcache (I-043) | **1 cold / 0 thereafter** |
+| **write / create output** | **overlay upper (SSD)** | 0 |
+| modify input → copy-up | overlay full-data-copies from FUSE lower into upper | as cold open+read |
+
+§1's constraint — a 200 MB partially-hot `.so` either upcalls every read or blocks open — **is addressed by streaming open (§2.8) during fill, then passthrough (§2.6) thereafter.** The first open returns after the first chunk; uncached `read()` ranges upcall once during the background fill. Once the file is in the node-SSD cache, every subsequent open replies `FOPEN_PASSTHROUGH` and reads go kernel → ext4 with **zero FUSE involvement** — including after page-cache eviction.
+
+### 2.2 Tree source — Directory DAG
+
+r[builder.fs.castore-dag-source]
+
+At mount time the builder holds the closure's set of input store paths and each path's `root_node` (from the scheduler-supplied `WorkAssignment.input_roots`, `r[sched.dispatch.input-roots]`). It prefetches the full Directory DAG via **`GetDirectory(root_digest, recursive=true) → stream<Directory>`** (`r[store.castore.directory-rpc]`). Chromium-scale (8 221 dirs, 23 218 files) is on the order of 5 MiB in heap.
+
+The synthetic root (`FUSE_ROOT_ID`, `/nix/store`) is the only node not in the DAG — its children are the closure's store-path basenames, each mapping to that path's `root_digest` (or `file_digest`/symlink-target if the store path itself is a regular file or symlink). `readdir` of the root enumerates the closure; `lookup(ROOT, basename)` returns the path's inode (§2.3).
+
+`NarIndex` is not fetched at mount — the Directory DAG carries everything `lookup`/`getattr`/`readdir`/`readlink` need (`{name, digest, size, executable}` per `FileEntry`; `{name, target}` per `SymlinkEntry`). At `open()`, chunk coordinates are resolved **server-side**: ≤ `STREAM_THRESHOLD` files call `ReadBlob(file_digest)` (`r[store.castore.blob-read]`) which streams bytes directly; > threshold call `StatBlob(file_digest, send_chunks=true)` (`r[store.castore.blob-stat]`) for the `ChunkMeta[]` list, then check the node chunk-cache and `GetChunks` misses. Both RPCs key on `file_digest` alone — no client-side resolver, no per-path `NarIndex`/`ChunkList` prefetch.
+
+### 2.3 Inode model — sequential allocation, content-deduped files, path-unique directories
+
+r[builder.fs.castore-inode-digest+2]
+
+Inode numbers are allocated sequentially during the mount-time tree build — a counter starting at `FUSE_ROOT_ID + 1` — keyed so the dedup classes are preserved: a regular file's class is **(content digest, executable bit)**, a symlink's class is its **target bytes**, and every directory **path** is its own class (one fresh ino per `(parent, name)` edge; store-path root directories hang under `FUSE_ROOT_ID`). Same class → same FUSE inode: two regular files anywhere in the closure with the same bytes **and the same executable bit** get the **same inode** — the kernel's icache holds one `struct inode`, one `open()` upcall fetches it once, and one `BACKING_OPEN` binds it to one page-cache. Two directory **paths** always get **distinct inodes**, even when they decode to the byte-identical `Directory` body; the decoded body, the backing cache, and the chunk store stay deduped by `dir_digest` — only the runtime inode numbers multiply. `readdir`'s `..` entry carries the parent's inode (per-path inos give every directory exactly one parent); the mount root's `..` is itself, per FUSE convention.
+
+Sequential allocation keeps every ino comfortably inside 32 bits (a whole-store mount is ~572k inos): the production pools advertise 32-bit build payloads (`i686-linux` in the xtask EKS pool definitions), and a non-LFS 32-bit glibc binary gets `EOVERFLOW` from `stat()` and a broken `readdir()` for any st_ino above 2^32 — the previous digest-derived scheme (low 63 bits of blake3 with bit 63 forced) put **every** ino at or above 2^63. Inode numbers are never persisted outside FUSE replies, so the numbering being per-mount (allocation-order-dependent) is unobservable.
+
+Directories must not share inodes by content: a content-deduped directory inode is observably a hardlinked directory — multiple parents for one inode — which POSIX and Linux forbid (`link(2)` on a directory is `EPERM`) precisely because it breaks tree walkers. The kernel holds one dentry alias for the shared inode and re-parents it whenever a concurrent path walk reaches another alias, so fts-based tools (GNU find, du, rm -r, tar) ascending via `openat(fd, "..")` see a (dev, ino) mismatch against their remembered parent, fabricate `ENOENT`, and abort — with zero failing syscalls in the trace.
+
+The executable bit is part of the file inode key because `i_mode` is per-inode in VFS — two paths sharing an inode share `st_mode`, so same-bytes/different-exec must be distinct inodes. This costs nothing for fetch or page-cache dedup: both inodes' `open()` resolve to the same `cache/ab/<file_digest>` backing file (the cache is keyed by `file_digest` alone), so one fetch and one page-cache entry serve both. Only the kernel `struct inode` is duplicated.
+
+The handler's state is `HashMap<u64, Node>` where `Node ∈ { File{file_digest, size, executable}, Dir{dir_digest}, Symlink{target} }`, populated during the §2.2 prefetch (many directory inos may map to one `dir_digest`; heap scales with the closure's path count — ~572k inos on a whole-store mount — not its body count). `lookup(parent_ino, name)` probes the parent's precomputed child index, returns `ReplyEntry{ ino, attr, ttl: Duration::MAX }`. `getattr(ino)` is a map lookup.
+
+r[builder.fs.castore-nlink]
+
+`st_nlink` is honest: a file or symlink reports its path-alias count, and a directory reports `2 + subdirectory count` (the synthetic root counts its directory roots). Content-deduped files with N path aliases are exactly N hardlinks, and `du`/`tar` dedup by `(dev, ino, nlink)` — an understated count makes them either re-account aliases as distinct or wait for hardlinks that never arrive; the directory convention is what fts' leaf-count optimization relies on.
+
+### 2.4 Kernel caching configuration
+
+r[builder.fs.castore-cache-config]
+
+The tree is immutable for the mount's lifetime, so every cache TTL is infinite and every cache-enable flag is set. This is [snix's exact configuration](https://git.snix.dev/snix/snix/raw/branch/canon/snix/castore/src/fs/mod.rs):
+
+| Knob | Value | Effect |
+|---|---|---|
+| `ReplyEntry`/`ReplyAttr` ttl | `Duration::MAX` | Kernel never re-validates a positive dentry or attr. Kernel saturates the value via `timespec64_to_jiffies → MAX_SEC_IN_JIFFIES`; no overflow. |
+| `init` capabilities | `FUSE_DO_READDIRPLUS \| FUSE_READDIRPLUS_AUTO \| FUSE_PARALLEL_DIROPS \| FUSE_CACHE_SYMLINKS` | `readdirplus` pre-populates dcache so a subsequent `stat` of every entry is 0-upcall; `PARALLEL_DIROPS` removes the per-inode mutex on concurrent lookups; `CACHE_SYMLINKS` makes `readlink` once-ever per target. |
+| `opendir` reply flags | `FOPEN_CACHE_DIR \| FOPEN_KEEP_CACHE` | Kernel caches dirent pages; second `readdir` of the same dir is 0-upcall. |
+| Negative reply | `reply.entry(&Duration::MAX, &FileAttr{ino: 0, ..}, 0)` | Caches the negative at the FUSE layer — `fuse_lookup_name` treats `nodeid=0` as "*same as -ENOENT, but with valid timeout*" ([`dir.c`](https://github.com/torvalds/linux/blob/master/fs/fuse/dir.c)); revalidate's `!inode → invalid` is inside the timeout-expired/`LOOKUP_EXCL\|REVAL\|RENAME_TARGET` branch, so with `ttl=MAX` and a plain `stat()` it stays valid. Under §2.1's overlay this is moot — overlay's own dcache caches lower-miss for either reply form (I-043, [`vm-spike-fuse-negdentry`](../../../nix/tests/scenarios/spike-fuse-negdentry.nix)). The handler uses `ino=0` for bare-mount correctness. |
+
+overlayfs delegates dentry revalidation to the lower's `d_op->d_revalidate` ([`ovl_revalidate_real`](https://github.com/torvalds/linux/blob/master/fs/overlayfs/super.c)), so FUSE's `entry_timeout` is what overlay consults — infinite TTL means overlay's dentries never re-ask FUSE. Slab cost for ~35k cached `dentry`+`inode` is ~28 MB; shrinkable under memory pressure (re-upcalls if evicted, harmless on multi-GB builder pods).
+
+### 2.5 Mount sequence and privilege boundary
+
+Privilege is split: a node-level **`rio-mountd`** (CAP_SYS_ADMIN, DaemonSet) handles the operations the unprivileged builder cannot: open `/dev/fuse`, broker `FUSE_DEV_IOC_BACKING_OPEN`/`_CLOSE` (init-ns `CAP_SYS_ADMIN` — [`backing.c:91-93`](https://github.com/torvalds/linux/blob/master/fs/fuse/backing.c), kernel `TODO: relax once backing files are visible to lsof`), and own the verified-write to the shared node caches. Per build connection on the UDS:
+
+1. `fuse_fd = open("/dev/fuse")`; `dup` it (mountd keeps one, sends the other) → `mount("fuse", castore_mnt, …, "fd=N,allow_other,default_permissions,…")` where `castore_mnt = /var/rio/castore/{build_id}` → `SCM_RIGHTS` the fd to the builder
+2. `mkdirat(staging_base_dirfd, build_id, 0700)` chown to `SO_PEERCRED.uid`. The UDS socket is mode 0660, group `rio-builder`; mountd verifies `SO_PEERCRED.gid == rio-builder` and rejects others. **`build_id` MUST match `^[A-Za-z0-9_-]{1,64}$`** (`r[builder.mountd.build-id-validated]`) — mountd rejects `Mount{}` with `BadBuildId` otherwise; all per-build path construction is `openat(base_dirfd, build_id, O_NOFOLLOW)` against pre-opened `/var/rio/{castore,staging}` dirfds, never string concat. **One connection per `SO_PEERCRED.uid`** (`builder.mountd.uid-bound`, *since removed*): the original design bound one live connection per peer uid on the premise that k8s userns gives each pod a distinct host-uid range. Production builders run `hostUsers: true` (FUSE passthrough requirement), so every executor is host uid 0 and the gate degraded to one-build-per-node; it was removed — see the design overview's mountd rationale. **One live `build_id` per process** (`r[builder.mountd.build-id-unique]`): mountd holds a process-wide set of in-use `build_id`s and rejects `Mount{}` with `DuplicateBuildId` if present — this is what stops a compromised builder using its *own* connection to `Mount{victim_id}` after enumerating co-tenants via `ls /var/rio/castore/`.
+3. Serve `seq`-tagged requests for the build's lifetime (tokio per-conn task; replies echo `seq` so out-of-order `Promote` correlates): **`BackingOpen{fd}`** — mountd re-opens the fd `O_RDONLY` (`r[builder.mountd.backing-readonly]`), then `ioctl(kept_fuse_fd, FUSE_DEV_IOC_BACKING_OPEN, {fd}) → backing_id` (the ioctl rejects depth>0 backing, and `backing_id` is conn-scoped). **`BackingClose{id}`**. **`PromoteChunks{[chunk_digest]}`** (batched ≤64) — verify-copy each `staging/chunks/<hex>` → `/var/rio/chunks/ab/<hex>`. **`Promote{digest}`** (on `spawn_blocking` + `Semaphore(num_cpus)`) — verify-copy the assembled file from staging into cache (§2.6).
+
+The builder, inside its unprivileged userns (after receiving the fd from step 1):
+
+a. `fuser::Session::from_fd(fuse_fd)` → spawn `castore_fuse::serve` (§2.6) — **must be answering before (b)**
+b. `mount("overlay", merged, "overlay", 0, "userxattr,upperdir=<ssd>/nix/store,workdir=<ssd>/work,lowerdir=<castore_mnt>")` — then bind `merged` at `/nix/store` inside the build's mount namespace
+
+Teardown — builder closes the UDS (or its pod exits):
+
+- `rio-mountd` does `umount2(castore_mnt, MNT_DETACH)` + `rmdir(castore_mnt)` + `rm -rf staging/{build_id}` + `close(kept_fuse_fd)`; the builder's mount-ns death takes the overlay with it.
+
+r[builder.mountd.orphan-scan]
+
+Crash-safety: `rio-mountd` start-up scans `/var/rio/castore/*` and `/var/rio/staging/*` for orphans from a prior crash and removes them.
+
+r[builder.fs.fd-handoff-ordering]
+
+**Ordering is load-bearing:** the `/dev/fuse` fd MUST be received and the castore-FUSE server MUST be answering before builder step (b). overlayfs probes the lower's root at `mount(2)`; with no one serving `/dev/fuse`, that probe deadlocks.
+
+### 2.6 `open()` — backing cache, passthrough, streaming
+
+r[builder.fs.digest-fuse-open]
+
+`open(ino)` resolves `ino → file_digest` (the §2.3 map) and is a **broker, not a server**: its job is to ensure the file exists in the node-SSD backing cache and hand the kernel a passthrough fd to it.
+
+r[builder.fs.passthrough-on-hit]
+
+The handler negotiates `FUSE_PASSTHROUGH` at `init` (with `max_stack_depth = 1`; the backing cache is a non-stacking fs). On `open(ino → file_digest)`:
+
+1. **Cache hit** (`/var/rio/cache/ab/<digest>` exists, mountd-owned): open it `O_RDONLY`, send the fd to `rio-mountd` → receive `backing_id` (mountd does the `FUSE_DEV_IOC_BACKING_OPEN` ioctl, §2.5); reply `FOPEN_PASSTHROUGH | backing_id`. All subsequent `read`/`mmap` go kernel → backing file via `fuse_passthrough_read_iter`; the handler sees no further upcalls for this fd. `release` sends `BackingClose{id}` to mountd.
+2. **Cache miss, `size ≤ STREAM_THRESHOLD`**: `ReadBlob(file_digest)` streams bytes into `/var/rio/staging/{build_id}/<digest>.partial`, whole-file verify, send `Promote{digest}` → mountd verify-copies into cache → as (1).
+3. **Cache miss, `size > STREAM_THRESHOLD`**: streaming-open (§2.8) — `StatBlob(file_digest, send_chunks=true)` for the chunk list, reply `FOPEN_KEEP_CACHE`, serve `read` from staging `.partial` during background fill. The fill task sources each chunk from `/var/rio/chunks/` first, falling back to `GetChunks` for misses (firing `PromoteChunks` for each batch). On completion: whole-file verify, `Promote{digest}`. Next `open` hits (1). Concurrent **builds** race on `PromoteChunks` and share progress at chunk granularity — no leader/follower coordination needed. Concurrent `open()`s of the same `file_digest` **within one build** (e.g. `make -jN` both `dlopen`ing one `.so`) share an in-process per-digest `FillState`: the `O_EXCL` loser awaits the winner's first-chunk barrier (not full completion), then replies `FOPEN_KEEP_CACHE` and its `read()` handlers serve from the same shared `.partial` and high-water mark — so a second opener never blocks for the whole fill.
+4. Within-build `.partial` orphan: `flock(LOCK_NB)` not held → unlink + retry.
+
+The FUSE `read` op exists only for case (3)'s streaming window; in steady state every open is passthrough.
+
+r[builder.fs.open-read-only]
+
+`open()` MUST reject any access mode other than `O_RDONLY` — and any mutating flag (`O_TRUNC`, `O_APPEND`) — with `EROFS`, before brokering a backing fd.
+
+This is a security boundary, not POSIX hygiene. On a passthrough open the kernel opens the **backing** cache file with the FUSE **caller's** flags under the BACKING_OPEN **broker's** credentials — rio-mountd, root — and performs no DAC check of its own (`fuse_passthrough_open` → `backing_file_open` → `vfs_open`; [fs/fuse/passthrough.c](https://github.com/torvalds/linux/blob/master/fs/fuse/passthrough.c), [fs/backing-file.c](https://github.com/torvalds/linux/blob/master/fs/backing-file.c)). The mount's `default_permissions` stops build uids from write-opening the 0444 cache entries, but not a root process on the node (CAP_DAC_OVERRIDE): without this rejection, root's `open(O_WRONLY)` on a cache-hit file gets a passthrough fd whose `write(2)` lands in `/var/rio/cache/<digest>` — the node-shared backing cache served to every build on the node.
+
+r[builder.fs.write-ops-erofs]
+
+Every namespace- or data-mutating FUSE operation (`unlink`, `rmdir`, `mkdir`, `mknod`, `create`, `rename`, `link`, `symlink`, `setattr`, `setxattr`, `removexattr`, `fallocate`, `write`) MUST be answered with `EROFS`.
+
+`EROFS` is the errno POSIX prescribes for a read-only filesystem. fuser's defaults — `ENOSYS` for most of these, `EPERM` for `symlink`/`link` — are wrong here: `ENOSYS` is not a legal errno for `unlink(2)`/`mkdir(2)` and breaks callers that branch on errno, and `EPERM` invites a privileged retry that cannot succeed either.
+
+r[builder.fs.shared-backing-cache]
+
+The FUSE **mount point** is per-build (`/var/rio/castore/{build_id}/`, §2.5) for cross-pod isolation. The **backing cache** (`/var/rio/cache/ab/<digest>`) is shared node-SSD, **owned by `rio-mountd` and read-only to builder pods** (mode 0755/0444). Builders cannot write the cache directly — a sandbox-escaped build writing poisoned bytes there would otherwise be passthrough-read by the next build unverified (the same lateral-movement surface §2.8 rejects for a cluster-wide cache).
+
+r[builder.mountd.promote-verified]
+
+Instead, the builder stages fetched files in a **per-build staging dir** (`/var/rio/staging/{build_id}/`, builder-writable, mode 0700 owned by the build's uid, created by mountd at `Mount` time) and mountd verify-copies into the cache on `Promote`. The disk-fill defense is an **XFS project quota** mountd sets on the staging dir at `mkdirat` (`r[builder.mountd.staging-quota]`): a compromised builder writing past `staging_quota_bytes` gets `ENOSPC` from `write(2)` directly — mountd does not need to observe the writes. mountd opens the staging file `O_RDONLY|O_NOFOLLOW`, rejects non-regular or per-file oversized, claims the digest with `cache/ab/<digest>.promoting` (mountd-owned, `O_EXCL`, held under an exclusive `flock` so concurrent promotes judge the owner's liveness by lock state rather than placeholder age), **stream-copies at most `fstat(src).st_size` bytes** into a unique mountd-owned temp file while hashing (`r[builder.mountd.promote-bounded-copy]` — the builder owns the source inode and can append to it concurrently; copying past `st_size` would let it fill the mountd-owned cache before the digest reject), verifies `blake3 == digest`, renames its temp file → final and drops the claim. The copy is the integrity boundary: the published cache file is the very inode mountd created, wrote, and hashed — never whatever inode currently happens to occupy a shared name.
+
+r[builder.fs.node-chunk-cache]
+
+**Cross-build fetch dedup is chunk-granular** for files > `STREAM_THRESHOLD`. mountd also owns `/var/rio/chunks/ab/<chunk_blake3>` (read-only to builders). The streaming fill task `open()`s the chunk cache entry first (ENOENT → miss); for each miss it writes the verified chunk into `.partial` at offset *and* into `staging/chunks/<hex>`, batching digests into `PromoteChunks{[..]}` (mountd verify-copies into the chunk cache). Assembly proceeds from the build's own staging — `PromoteChunks` is purely for *other* builds' benefit and never blocks this build's fill. Concurrent builds race on the chunk-cache rename; the loser reads the winner's chunk — **no builder fetches a chunk another build on this node already verified.** Chunks are independently content-addressed, so mountd's `blake3(bytes) == chunk_digest` check is context-free (unlike file ranges, which would need the chunk-map). `BACKING_OPEN`'s `d_is_reg` gate ([`backing.c:105-108`](https://github.com/torvalds/linux/blob/master/fs/fuse/backing.c)) and this context-free-verify constraint together pin the design to "regular files whose names are their hashes" — block-device alternatives (ublk, dm-verity) fail the ioctl. Files ≤ threshold skip the chunk cache (whole-file fetch is fast enough; dup-fetch cost negligible).
+
+### 2.7 Integrity — per-file blake3 in handler
+
+r[builder.fs.file-digest-integrity]
+
+Per-file integrity lives in the FUSE `open()` handler: **verify each chunk's blake3 against its content-address on arrival** (chunks are blake3-addressed in the CAS layer; `rio-store/src/chunker.rs`); never serve a byte from an unverified chunk. For files ≤ the streaming threshold (§2.8), the whole-file blake3 against `file_digest` additionally runs before `open()` returns. For files > threshold, per-chunk verification covers the streaming window and the whole-file `file_digest` check runs at fill-complete, gating the `.partial → /var/rio/cache/ab/<digest>` rename. The digest is the cache filename — the check is structural. fs-verity is not used: FUSE's fs-verity support ([`9fe2a036`](https://git.kernel.org/linus/9fe2a036a23ceeac402c4fde8ec37c02ab25f133), 6.10) is ioctl-forwarding only and does not populate `inode->i_verity_info`, so neither overlayfs's `ovl_validate_verity()` nor any other in-kernel consumer can use it; and the daemon answering the ioctl is the daemon serving the bytes — no stronger than blake3-in-handler.
+
+### 2.8 Failure modes and streaming open
+
+| Failure | Kernel behavior | rio handling |
+|---|---|---|
+| **FUSE handler crash** | overlayfs `lookup`/`open()` on the lower → `ENOTCONN`. **Passthrough-opened files keep working** — `fuse_passthrough_read_iter` ([passthrough.c:28-51](https://github.com/torvalds/linux/blob/master/fs/fuse/passthrough.c)) reads `ff->passthrough` directly with no `fc->connected` check; `fuse_abort_conn` ([dev.c:2451-2522](https://github.com/torvalds/linux/blob/master/fs/fuse/dev.c)) never touches `ff->passthrough` or `fc->backing_files_map`. Streaming-mode opens lose their `read` server. | Abort is terminal — the build is failed-infra and re-queued; the next pod issues a fresh `Mount{}` and gets a new `fuse_conn`. The IDR slot for the dead connection's backing-ids leaks until unmount (bounded; reaped at `fuse_conn_put`). **No D-state**, no `restore` dance. |
+| **FUSE handler hung mid-fetch** | `open()` blocks in `S` (interruptible — `request_wait_answer` [dev.c:552/568](https://github.com/torvalds/linux/blob/master/fs/fuse/dev.c) `wait_event_interruptible`/`_killable`). | Per-spawn `tokio::timeout` returns `EIO` to the open; build fails loudly. |
+| **Lookup ENOENT** | overlay caches negative dentry; subsequent probes 0-upcall. | Handler returns ENOENT only for names outside the closure's declared-input tree — correct (JIT fetch imperative). |
+| **Build completes / pod exits** | Builder mount-ns death drops overlay; `castore_mnt` FUSE mount persists in init-ns. | `rio-mountd` detaches it on UDS close (§2.5 teardown); start-up scan reaps orphans from a prior crash. |
+
+r[builder.fs.streaming-open-threshold]
+
+**Streaming open is the during-fill mode for large files.** The 1000 largest files in nixpkgs are *all* >64 MiB (median 179 MiB, 7 files >1 GiB; `top1000.csv`), and access-pattern measurement (`42aa81b2`) shows consumers touch 0.3-33% of them — whole-file fetch over-fetches 64-99.7%. For files > `STREAM_THRESHOLD` (default 8 MiB) on cache miss, `open()` cannot reply passthrough (no complete backing fd yet) so it replies `FOPEN_KEEP_CACHE`, spawns a background fill task, and returns after the first chunk (~10 ms). `read(off,len)` upcalls once per uncached page during fill (priority-bumping the requested range); `mmap(MAP_PRIVATE)` page-faults route through the same `read` path, covering linkers. ~80 LoC; spike-proven (`15a9db79`) — `KEEP_CACHE` does not suppress cold-page upcalls, only invalidation, so no mode-flip is needed within the streaming window. Once the fill completes and renames into `/var/rio/cache/`, later `open()`s of that digest take the passthrough path (§2.6 case 1) as soon as the streaming handles opened during the fill window have been released; until then they are served as userspace reads of the completed cache entry (`builder.fs.open-iomode-compatible`). The streaming mode is one-shot per file per node.
+
+r[builder.fs.open-iomode-compatible]
+
+An `open()` reply MUST be io-mode-compatible with the digest's live handles: while caching (`FOPEN_KEEP_CACHE`) handles of a content inode are open, further opens of it MUST NOT reply `FOPEN_PASSTHROUGH`, and while passthrough handles are open, opens MUST NOT reply a caching mode — instead the handler degrades to the compatible mode (a userspace read of the completed cache entry, or reuse of the still-registered backing id) until the conflicting handles drain. The kernel rejects mixed io-modes on one inode (`fs/fuse/iomode.c`, `-ETXTBSY` surfaced as `EIO` from `open(2)`), so an incompatible reply fails the open of a healthy file. This bites in both directions: a passthrough reply right after a streaming fill completes while the fill-window handles are still mapped, and a caching (streaming or fallback) reply for an entry the LRU sweep evicted while passthrough opens are still live.
+
+**Considered and rejected for the partial-file case:** allowlist-bounded prefetch of giants at mount (violates the JIT-fetch imperative — fetches inputs the build may never touch); FSx-Lustre-backed cluster-wide `objects` cache (violates the builder air-gap — shared writable FS between untrusted builders is a cache-poisoning + lateral-movement surface).
+
+### 2.9 Kconfig (NixOS)
+
+```nix
+boot.kernelPatches = [{
+  name = "overlay-castore-fuse";
+  patch = null;
+  extraStructuredConfig = with lib.kernel; {
+    OVERLAY_FS       = yes;       # nixpkgs default =m
+    FUSE_FS          = yes;
+    FUSE_PASSTHROUGH = yes;
+  };
+}];
+```
+
+Requires kernel **≥6.9** (`FUSE_PASSTHROUGH`, [`7dc4e97a4f9a`](https://git.kernel.org/linus/7dc4e97a4f9a)). The NixOS-node module asserts version + config at boot.
+
+r[builder.fs.passthrough-stack-depth]
+
+**Stacking depth:** with `max_stack_depth = 1` at FUSE `init`, the FUSE superblock has `s_stack_depth = 1` ([`inode.c:1439-1444`](https://github.com/torvalds/linux/blob/master/fs/fuse/inode.c) — the in-kernel comment explicitly names overlay-as-upper as the supported case). Overlay over `{FUSE(1)}` is depth 2; `FILESYSTEM_MAX_STACK_DEPTH = 2` and overlayfs checks `>` ([`super.c:1207-1208`](https://github.com/torvalds/linux/blob/master/fs/overlayfs/super.c)), so 2 passes. `BACKING_OPEN` rejects backing files whose `s_stack_depth >= max_stack_depth` ([`backing.c:110-112`](https://github.com/torvalds/linux/blob/master/fs/fuse/backing.c)) — with `=1`, the backing cache must be depth-0 (ext4/xfs hostPath), not another overlay or FUSE. `FUSE_PASSTHROUGH` and `FUSE_WRITEBACK_CACHE` are mutually exclusive (inode.c:1440); the castore-FUSE is read-only and does not request writeback. The privilege-boundary spike VM test asserts the overlay mount succeeds at depth 2, an unprivileged `BACKING_OPEN` fails `EPERM`, and a mountd-brokered one succeeds with reads reaching the ext4 backing.
+
+### 2.10 Spike evidence
+
+The streaming-open, access-pattern, and privilege-boundary spikes apply unchanged to this design (the FUSE `open`/`read`/passthrough mechanics are identical; only the metadata-serving layer differs). The composefs-stack metadata spikes (`composefs-spike.nix`, `-scale.nix`) measured the §3 EROFS alternative, not §2.
+
+| Commit | Test | Finding |
+|---|---|---|
+| `15a9db79` | [`composefs-spike-stream.nix`](../../../nix/tests/scenarios/composefs-spike-stream.nix) | Streaming-open (§2.8): `FOPEN_KEEP_CACHE` set at `open()` does not suppress cold-page upcalls (2049 reads on first `dd` of 256 MiB), only prevents invalidation — second `dd` 0 upcalls. **No mode-flip needed.** `mmap(MAP_PRIVATE)` page-faults route through FUSE `read`. `open()` 256 MiB with 10 ms/chunk backend → 10.3 ms (vs 2560 ms whole-file). |
+| `42aa81b2` | [`spike-access-data/RESULTS.md`](../../../nix/tests/lib/spike-access-data/RESULTS.md) | Access patterns: real consumers touch **0.3-33%** of giant `.so`/`.a` (link-against-libLLVM 2.79% bimodal head+tail; `opt --version` 32.77% scattered/266 ranges; `libicudata` 0.28%). `ld.so` uses no `MAP_POPULATE`/`fadvise`. |
+| `af8db499` | [`composefs-spike-priv.nix`](../../../nix/tests/scenarios/composefs-spike-priv.nix) | Privilege boundary (§2.5): fd-handoff, stack-survives-mounter-exit, unpriv-userns-inherits, `userxattr` unpriv overlay, teardown-under-load (no D-state) all PASS on kernel 6.18.20. The `fsmount`-erofs subtests are §3-only. |
+| `9492019c` | [`kvm-hostpath-spike.nix`](../../../nix/tests/scenarios/kvm-hostpath-spike.nix) | `/dev/kvm` via `extra-sandbox-paths`: `ioctl(KVM_GET_API_VERSION)=12` from inside Nix sandbox; smarter-device-manager not required. |
+| (P0578) | [`composefs-spike-priv.nix`](../../../nix/tests/scenarios/composefs-spike-priv.nix) Q7-Q12 | Passthrough-under-overlay (§2.5/§2.9): overlay stacks on FUSE lower at depth 2; unprivileged `BACKING_OPEN` → `EPERM`, root ioctl on a `dup()` of the same `/dev/fuse` fd → ok; reads via passthrough fd survive `kill -9` of the FUSE server; copy-up reads through the passthrough fd; `read()` never reaches the server. Three kernel/`fuser` gotchas: (a) `KernelConfig::set_max_stack_depth(1)` does *not* imply the `FUSE_PASSTHROUGH` capability — `add_capabilities(InitFlags::FUSE_PASSTHROUGH)` is also required, otherwise `fc->passthrough` is never set and `BACKING_OPEN` is unconditionally `EPERM`. (b) The kernel's `FOPEN_PASSTHROUGH_MASK` ([`iomode.c`](https://github.com/torvalds/linux/blob/master/fs/fuse/iomode.c)) rejects any open flag outside `{PASSTHROUGH, DIRECT_IO, PARALLEL_DIRECT_WRITES, NOFLUSH}` with user-visible `EIO`, so `FOPEN_KEEP_CACHE` MUST NOT be combined with `FOPEN_PASSTHROUGH` (case-1 vs case-3 in §2.6 are mutually exclusive replies, not a union of flags). (c) **One BackingId per FUSE inode, refcounted across `open()`s**: the kernel rejects a second concurrent passthrough open whose `fuse_backing` differs from the inode's recorded `fi->fb` (`-EBUSY` → user-visible `EIO`). Overlay copy-up issues several `dentry_open()`s of the lower in one syscall (`ovl_security_fileattr` → `vfs_fileattr_get` → `ovl_copy_up_data`); the first open's deferred `fput()` keeps `fi->fb` set across the others, so registering a fresh `BACKING_OPEN` per `open()` trips the check. The §2.6 case-1 handler MUST hold one `BackingId` per `file_digest`, refcounted, and reuse it for concurrent opens — same shape as snix-store's per-blob `OpenBlobReadHandle`. |
+
+[snix-store](https://git.snix.dev/snix/snix/src/branch/canon/snix/store) is the production validation of the §2 model — it serves a castore Directory DAG via FUSE with the §2.4 caching configuration and is in active use.
+
+---
+
+## 3. Alternatives considered
+
+Three other approaches were evaluated in depth and set aside. None is retained as a fallback.
+
+**EROFS + fscache on-demand.** Per-store-path EROFS bootstrap blobs in S3, merged at build-start into one mount; `cachefilesd`-style userspace daemon answers `/dev/cachefiles` on-demand `READ{cookie,off,len}` upcalls by reverse-mapping `(cookie,off) → nar_offset → chunk-range`. ~2 700 owned LoC, all userspace. Ruled out: ~70 ms mount latency (one eager `OPEN` per device-slot at mount, ×357 paths), no kernel-side per-file dedup (cachefiles key is `(cookie,range)` not content), per-path S3 artifact + GC tracking, and a `(cookie,off)→nar_offset` reverse-map that exists only to bridge fscache's range-addressing to rio's chunk-addressing.
+
+**Custom `riofs` kernel module.** ~2 800 LoC in-tree-style C: `read_folio` posts `{chunk_digest}` to a `/dev/riofs` ring, userspace fetches and `write()`s back. Elegant runtime (no merge, no rio-store change, native chunk addressing, optional kernel-side digest cache), but ~800 LoC of genuinely-novel folio-lock/completion kernel code with a 2-3 min VM dev loop and zero upstream review/fuzz coverage. The latency wins were ≤2% of cold-miss (network-bound) and the recurring VFS-API-churn + we-are-the-only-debuggers cost is permanent.
+
+**EROFS metadata layer (composefs-style).** A per-closure EROFS image carrying inodes/dirents/sizes with `user.overlay.redirect=/ab/<blake3>` xattrs, stacked under overlayfs as `lowerdir=<erofs>::<digest-fuse>` (data-only lower, kernel ≥6.16). Spiked at chromium scale (`composefs-spike-scale.nix`, `15a9db79`): <10 ms mount, `find -type f` over 23k files in 60 ms with **0** FUSE upcalls, 5.3 MiB image encoded in 70 ms. The one thing this buys over §2 is **zero cold-metadata crossings** — `stat`/`readdir` are kernel-native from the first call, where §2 pays one upcall per dirent to populate the dcache. Not worth the cost: snix-store achieves all of §1's goals without it and is production-validated; §2's once-per-dirent cost has not been shown to matter in build wall-clock; and it adds an encoder (libcomposefs FFI + a 25-line patch), an S3 artifact type, a `losetup`/`fsopen` privileged path in mountd, and a kernel ≥6.16 floor. If cold-metadata cost is ever found to matter, the image is a derived encoding of the §2.2 Directory DAG (`root_digest → walk → mkfs.erofs --tar=headerball`), so adding it would be additive.
+
+§2 matches all three alternatives on the warm path; achieves structural per-file dedup that fscache and `riofs` cannot without extra machinery; is ~1 400 owned LoC with zero kernel code, no patched C dependencies, and a smaller privileged surface than the pre-ADR-022 FUSE setup; and relaxes the kernel floor from ≥6.16 to ≥6.9.
+
+---
+
+## 4. Decision
+
+**castore FUSE (§2)**, with no maintained fallback. Warm `read()` is passthrough (0 upcalls); per-file and per-subtree dedup are structural via content-addressed inodes; cold metadata is once-per-dirent then dcache-absorbed. The known cost — whole-file cold `open()` of giants — is resolved by streaming-open (§2.8), which ships unconditionally.
+
+---
+
+## 5. Sources
+
+Primary:
+- [snix castore data model](https://snix.dev/docs/components/castore/data-model/) + [`snix/castore/src/fs/mod.rs`](https://git.snix.dev/snix/snix/raw/branch/canon/snix/castore/src/fs/mod.rs) — the §2 model and its FUSE caching configuration
+- [`snix/castore/protos/castore.proto`](https://git.snix.dev/snix/snix/raw/branch/canon/snix/castore/protos/castore.proto) — `Directory`/`FileEntry`/`DirectoryEntry`/`SymlinkEntry` (vendored as `rio-proto/proto/castore.proto`)
+- [`fs/fuse/dir.c` `fuse_dentry_revalidate`](https://github.com/torvalds/linux/blob/master/fs/fuse/dir.c) — negative-dentry behavior
+- [`fs/overlayfs/super.c` `ovl_revalidate_real`](https://github.com/torvalds/linux/blob/master/fs/overlayfs/super.c) — overlay delegates revalidation to lower
+- [`fs/fuse/backing.c`](https://github.com/torvalds/linux/blob/master/fs/fuse/backing.c), [`fs/fuse/passthrough.c`](https://github.com/torvalds/linux/blob/master/fs/fuse/passthrough.c) — `BACKING_OPEN` cap check + `read_iter` no-connected-check
+- [`7dc4e97a4f9a`](https://git.kernel.org/linus/7dc4e97a4f9a) — `FUSE_PASSTHROUGH` (≥6.9)
+- [`9fe2a036`](https://git.kernel.org/linus/9fe2a036a23ceeac402c4fde8ec37c02ab25f133) — FUSE fs-verity ioctl-forwarding (does not populate `i_verity_info`)
+- §3 EROFS alternative: [`containers/composefs`](https://github.com/containers/composefs), [`erofs/erofs-utils`](https://github.com/erofs/erofs-utils), [`5ef7bcdeecc9`](https://git.kernel.org/linus/5ef7bcdeecc9) (data-only-lower under `userxattr`, ≥6.16), [`Documentation/filesystems/overlayfs.rst` §Data-only lower layers](https://docs.kernel.org/filesystems/overlayfs.html)
+- Spikes (consolidated on `adr-022`): core/scale/stream `15a9db79` ([`composefs-spike.nix`](../../../nix/tests/scenarios/composefs-spike.nix), [`-scale.nix`](../../../nix/tests/scenarios/composefs-spike-scale.nix), [`-stream.nix`](../../../nix/tests/scenarios/composefs-spike-stream.nix), [`spike_digest_fuse.rs`](../../../rio-builder/src/bin/spike_digest_fuse.rs), [`spike_stream_fuse.rs`](../../../rio-builder/src/bin/spike_stream_fuse.rs)); privilege boundary `af8db499` ([`-priv.nix`](../../../nix/tests/scenarios/composefs-spike-priv.nix), [`spike_mountd.rs`](../../../rio-builder/src/bin/spike_mountd.rs)); access patterns `42aa81b2` ([`spike-access-data/RESULTS.md`](../../../nix/tests/lib/spike-access-data/RESULTS.md)); kvm hostPath `9492019c` ([`kvm-hostpath-spike.nix`](../../../nix/tests/scenarios/kvm-hostpath-spike.nix))
+- `~/src/nix-index/main/top1000.csv` — 1000 largest files in nixpkgs (streaming-open sizing)
+
+Our code:
+- `rio-store/src/grpc/put_path.rs`, `cas.rs`, `chunker.rs`, `manifest.rs`
+- `rio-proto/proto/types.proto`
+- `rio-builder/src/fuse/{mod,ops,fetch}.rs`, `overlay.rs`
+
+---
+
+## 6. Extension: chunked output upload (`PutPathChunked`)
+
+The §2 stack optimizes the **read** side — inputs reach the build via a content-addressed FUSE lower. Outputs still leave the build via the pre-ADR-022 `PutPath`: two disk passes over the overlay upper (refscan, then NAR-stream), full NAR over gRPC, store-side **whole-NAR `Vec<u8>` buffer** (`rio-store/src/grpc/put_path/`) before FastCDC. Output bytes are traversed ≥4× and the RAM buffer is the standing 40 GiB-RSS hazard the `nar_bytes_budget` semaphore exists to fence.
+
+`PutPathChunked` moves chunking to the builder and reduces the wire to missing chunks plus a manifest. The justification holds at zero dedup: the store-side RAM buffer disappears, builder-side disk reads drop 2×→1×, and FastCDC CPU moves off the shared rio-store replicas onto per-build ephemeral cores. Dedup is upside, not the gate.
+
+r[store.put.chunked]
+
+```text
+builder ──gRPC──▶ rio-store ──verify blake3──▶ S3 PutObject (S3-standard only)
+   │  (only egress)     │  (per-chunk, on arrival;
+   │                    │   no whole-NAR buffer)
+   └── air-gapped: never reaches S3, S3 Express, or any network endpoint other than rio-store
+```
+
+**This does not widen the builder trust boundary or the cache-tier surface.** The builder's only network egress remains rio-store gRPC — the air-gap invariant is unchanged. S3 standard and S3 Express are reached **exclusively by rio-store**, exactly as in `PutPath` today; the difference is internal to rio-store: it S3-writes each verified chunk on arrival instead of accumulating the full NAR in a `Vec<u8>` first. rio-mountd is uninvolved; the per-AZ Express cache stays unreachable from the builder — chunks reach it only via rio-store's serve-side `TieredChunkBackend.get` read-through, not on `put` ([Design Overview §9](./022-design-overview.md)). The §2.8 rejection of a builder-writable shared FS stands unchanged.
+
+### 6.1 Builder-side fused walk
+
+r[builder.upload.fused-walk]
+
+After the build exits, `upload_all_outputs` walks each output's directory tree **once**, in canonical NAR entry order (`r[builder.nar.entry-name-safety]`). The walk drives a per-output `RefScanSink` (`r[builder.upload.references-scanned]`) and SHA-256 accumulator over the **full NAR byte sequence** — entry names, symlink targets, regular-file contents, and the `nar::Encoder` framing between them — so the scanner sees every byte `dump_path_streaming` would emit; a reference appearing only in a symlink target or a directory entry name is found. Per regular file, the same single disk read additionally drives FastCDC rolling-hash boundary detection (same `16/64/256 KiB` params as `rio-store/src/chunker.rs`, `r[store.cas.fastcdc]`) emitting `(offset, len, blake3)` per chunk, and a whole-file blake3 accumulator yielding `file_digest`. No NAR byte stream is materialized — framing is generated on the fly into the hash and scanner sinks. At end-of-walk the builder holds `{chunk_manifest, file_digests, root_dir_digest, refs, nar_hash, nar_size}` having read each output byte exactly once. This closes `TODO(P0433)` (refs forced into a separate pre-pass) and `TODO(P0434)` (manifest-first upload).
+
+r[builder.upload.chunked-manifest]
+
+The walk yields, per output: `{store_path, nar_hash, nar_size, refs, root_node, chunk_manifest}` and a set of `Directory` bodies. `chunk_manifest` is the ordered list `[(chunk_digest, len)]` in canonical-NAR-walk order over `root_node`; for each regular file in the tree the contiguous run of `len` values sums to that `FileEntry.size`. The `Directory` bodies are content-addressed (`r[store.index.dir-digest]`) and deduplicated across outputs. Together these are sufficient for rio-store to reconstruct each output's NAR byte stream from CAS chunks without builder participation.
+
+**Input-reuse shortcut (builder-local, no protocol change).** Before chunking an output regular file, the walk may consult a `(size, file_digest)` table of the build's declared inputs — already in heap from the §2.2 Directory DAG prefetch. On a size match, a content `cmp` against the castore-FUSE lower file confirms identity and the input's `file_digest` is reused without hashing; the file's bytes are still fed through FastCDC and the SHA-256/refscan sinks (the `cmp` read serves all four). Reusing the input's *chunk list* is unsound for inputs ingested via legacy `PutPath`, whose FastCDC ran over the whole-NAR stream so file boundaries fall mid-chunk — the §6.3 verify driver requires per-file-aligned chunks. This is the [ostree `devino_to_csum_cache`](https://ostreedev.github.io/ostree/reference/ostree-OstreeRepo.html) pattern adapted to a content-addressed lower; it pays off for `cp`-heavy and fixed-output builds.
+
+### 6.2 Wire protocol
+
+r[store.chunk.has-chunks-durable]
+
+`HasChunks([chunk_digest]) → bitmap` is the chunk-granular sibling of the file-level `HasBlobs` (P0573, `r[store.castore.blob-read]`). A bit is set **only if the chunk is S3-durable** — i.e., referenced by at least one *complete* manifest, not merely refcount ≥1. The distinction is I-201 (stranded-chunk race): a SIGKILL between refcount-bump and S3 `PutObject`, combined with a concurrent uploader's presence-skip, permanently strands the digest. Under durable-presence semantics two builders racing on the same novel chunk both see `false`, both upload, and the second S3 `PutObject` is an idempotent overwrite of identical content. The builder MAY first probe `HasBlobs([file_digest])` to short-circuit whole files before chunking them.
+
+r[store.chunk.durable-flag]
+
+`chunks.durable` MUST be set to `TRUE` in the same transaction that flips a referencing manifest to `'complete'`, and MUST NOT be set earlier. It is the persisted form of the durable-presence predicate above: the refcount bump and the S3 `PutObject` both happen before completion, so any earlier flip re-opens the I-201 window where a presence probe affirms a chunk whose object may not exist. The GC sweep MUST clear `durable` (along with `uploaded_at`) when it marks a chunk deleted — both columns assert "the S3 object exists" and the drain is about to delete it; a resurrection upsert that inherits a stale `durable=TRUE` answers `HasChunks` as present before the resurrecting upload's `PutObject` lands, which is the same I-201 lie through the GC round-trip.
+
+r[store.chunk.has-chunks-authenticated+1]
+
+Every ChunkService RPC (`HasChunks`, `GetChunk`, `GetChunks`) MUST require an authenticated caller (a JWT or a verified HMAC assignment token). For `HasChunks` the response is one *new* bit ("someone, in some tenant, has uploaded content with exactly these bytes"), and a file under `FASTCDC_MIN_BYTES` is exactly one chunk, so an anonymous probe is a whole-file content-existence oracle over offline candidate guesses. The retrieval RPCs disclose the bytes themselves: "knowing the digest proves you had the bytes" only holds while digests never leave the content they name, but chunk digests travel separately from chunk bodies (chunk manifests, `StatBlob` chunk lists, debug logs, backups), so an anonymous `GetChunk`/`GetChunks` turns any leaked digest into the plaintext — an anonymous cross-tenant read oracle (the zot CVE-2024-39897 shape: a globally deduplicated blob namespace served without an access check). The *answer* is deliberately not tenant-scoped — global chunk dedup is the point, and cross-tenant disclosure to authenticated callers is an accepted trade-off — but no ChunkService request may be anonymous.
+
+r[store.put.chunked-wire]
+
+`PutPathChunked` is a client-stream carrying all of a derivation's outputs in one RPC, satisfying `r[store.atomic.multi-output]` and `r[builder.upload.batch+2]`:
+
+```text
+Begin{ hmac_token, deriver,
+       outputs:     repeated { store_path, nar_hash, nar_size, refs, root_node, chunk_manifest },
+       directories: repeated Directory,       // bodies for every dir_digest reachable from any root_node, deduped
+       novel:         repeated chunk_digest,     // exactly the digests the builder will send as Chunk frames
+       input_closure: repeated StorePath }       // refscan candidate set; attested via claims.input_closure_digest
+… Chunk{digest, bytes}  // zero or more, each digest ∈ Begin.novel
+```
+
+`root_node` is the snix `Node` oneof (`DirectoryNode{dir_digest}` / `FileNode` / `SymlinkNode`) — the same shape `WorkAssignment.input_roots` carries. `chunk_manifest` is the §6.1 ordered `[(digest, len)]` list per output. `novel` is the `HasChunks`-false subset over the union of all outputs' chunk digests, **ordered by global first occurrence** — i.e., the order each digest is first encountered when walking `outputs[0].chunk_manifest` then `outputs[1].chunk_manifest` and so on. `Chunk` frames MUST be sent in exactly this `novel` order; the §6.3 receive task enforces it. The server uses the builder-supplied `novel` membership rather than re-querying durability, so a chunk that became durable (or was GC'd) between the builder's `HasChunks` call and `Begin` cannot wedge the receive task.
+
+r[store.put.chunked-bounds]
+
+`Begin` is validated **before** any placeholder claim, S3 write, or verify-driver spawn; violations return `INVALID_ARGUMENT`. The HMAC assignment token is verified (`r[store.hmac.san-bypass]`); `hash_part(Begin.deriver) == claims.drv_hash` and `blake3(sorted(Begin.input_closure)) == claims.input_closure_digest` are enforced. `len(outputs) ≤ MAX_BATCH_OUTPUTS` and `outputs[i].store_path` are pairwise distinct. Per output: `store_path ∈ claims.expected_outputs` (non-CA), `nar_size ≤ MAX_NAR_SIZE`, `len(refs) ≤ MAX_REFERENCES`, `refs ⊆ Begin.input_closure ∪ {outputs[*].store_path}`, `len(chunk_manifest) ≤ MAX_CHUNKS`. `len(Begin.directories) ≤ MAX_DIR_NODES`. Every `Directory` body is structurally validated (the snix `Directory::validate` checks: entry names are single path components — no `/`, not `.`/`..`, sorted, no duplicates; child sizes consistent) and its digest recomputed server-side as `blake3(canonical-encode(body))`; every `dir_digest` reachable from any `root_node` MUST be present in `Begin.directories` under the recomputed digest, and per regular file in each output's tree the contiguous `chunk_manifest` `len` run sums to that `FileEntry.size`. `root_node` is therefore attested, not claimed. The per-chunk `len` values are *self-consistent* with the attested tree (their sum matches `FileEntry.size`); §6.3 asserts `len(bytes) == manifest_len[d]` for every body received on the stream, and already-durable digests were bound to their lengths when first uploaded. `len(input_closure) ≤ MAX_INPUT_CLOSURE`. `novel ⊆ ∪ outputs[i].chunk_manifest.digest`, no duplicates, and `novel` order equals the global-first-occurrence order recomputed server-side.
+
+r[store.chunk.self-verify]
+
+After validation the handler arms `PlaceholderGuard` (`r[store.put.drop-cleanup+2]`, `r[store.gc.orphan-heartbeat]` — heartbeats `manifests.updated_at`, reaps on drop) and, per output, checks for an existing `'complete'` manifest: if found the output is marked idempotent-skip (`r[store.put.idempotent]`); otherwise, for **non-CA** outputs, an `'uploading'` placeholder is inserted (`r[store.put.wal-manifest]`, carrying `references` per `r[store.put.placeholder-refs]`); CA outputs claim no placeholder per §6.3. If *all* outputs are skipped the RPC drains any remaining `Chunk` frames (each `cas::put`, idempotent) and returns OK without entering §6.3. **rio-store, not the builder, reaches S3.**
+
+Commit is gated on the §6.3 verify verdict and runs in **one transaction** across all non-skipped outputs: insert `manifest_data`, `nar_index.root_node`; UPSERT `directories` (refcount += 1 per output-tree occurrence — `r[store.castore.gc]` decrements symmetrically); INSERT `file_blobs` and `directory_paths` rows `ON CONFLICT DO NOTHING` (junction tables, lifetime via FK cascade from `nar_index`; migration 064 replaced the materialized `directory_tenants`/`file_blob_tenants` junctions with read-time JOINs through `directory_paths` → `path_tenants`); insert `path_tenants` for `claims.tenant_id` (`ON CONFLICT DO NOTHING`, `r[store.castore.tenant-scope]`); UPSERT chunk refcounts; `UPDATE chunks SET durable=TRUE`; ed25519-sign each output's narinfo fingerprint (`r[store.sig.fingerprint]`); flip every placeholder `uploading → complete`; and, when `binary_cache_compat` is enabled, enqueue the `r[store.compat.nar-on-put]`/`r[store.compat.narinfo-on-put]` writes per output. The tenant-junction inserts ALSO run for *idempotent-skipped* outputs (the prior commit may have been via legacy `PutPath`, which didn't write them). This is also where `PutPathChunked` outputs become servable by `GetDirectory`/`ReadBlob`/`StatBlob` — the castore tables are written here, not by a later indexer pass. Builder death mid-stream leaves placeholders (heartbeat lapses, reaped per `r[store.gc.orphan-heartbeat]`) and refcount-0 chunks (`r[store.chunk.grace-ttl]` sweep). `PutPathChunked` is idempotent — re-drive after transport failure repeats `HasChunks` and re-sends only still-missing chunks.
+
+### 6.3 NarHash trust — builder-computed, chunk-verified
+
+Each `outputs[i].nar_hash` / `nar_size` / `refs`, and every `FileEntry.digest` in the Directory bodies, is computed by the builder's fused walk (`r[builder.upload.fused-walk]`, `r[builder.upload.references-scanned]`) over the same bytes it uploads, and the store commits those claims as claimed (`r[store.integrity.verify-on-put]`). The builder is a rio service authenticated per-build via the HMAC assignment token; a server-side recompute can only catch rio's own bugs, not an outside party — and it has a structural cost: NAR SHA-256 is not composable from chunk digests, so re-deriving it for a fully-deduped upload means re-fetching every already-durable chunk from the CAS — O(chunks) serial S3 round-trips on a stream that carries no bodies at all, long enough on large outputs to exceed the client's stream timeout.
+
+What the store verifies is every byte it actually receives: each `Chunk` frame's body must match the manifest-claimed length and BLAKE3-hash to its claimed digest before it is stored or referenced. Already-durable chunks were verified the same way when they were first uploaded, and `r[store.integrity.verify-on-get]` re-checks every body served. The Directory tree itself is attested, not claimed — §6.2 recomputes every `dir_digest` server-side.
+
+The handler runs **one sequential receive task** (no per-output drivers, no oneshot map, no permit semaphore). It tracks `seen: HashSet<Digest>` and `next_novel: usize` (cursor into `Begin.novel`) and walks the global `(output_idx, manifest_pos)` sequence in order — `outputs[0].chunk_manifest` start to end, then `outputs[1]`, and so on. At the first occurrence of each `d ∈ novel`: `stream.next().await` → assert `frame.digest == d == novel[next_novel]`, `len(bytes) == manifest_len[d]`, `blake3(bytes) == d` else `INVALID_ARGUMENT`; `cas::put(d, bytes)` (`r[store.cas.upload-bounded]`; transient error → `UNAVAILABLE`); `seen.insert(d)`; `next_novel += 1`. Every other position is a no-op — already-durable chunks are never read during ingest. Because the walk is sequential and `novel` is ordered by global first occurrence, the next `Chunk` frame the builder MUST send is always exactly `novel[next_novel]`; the assertion is the wire-order enforcement. Per-stream working set is one chunk frame in hand plus the bounded set of in-flight PUT bodies.
+
+After the global walk: if `stream.next()` returns another frame, `INVALID_ARGUMENT` (extra `Chunk` after `novel` exhausted); if `next_novel < len(novel)`, the stream ended early — `Incomplete`. All in-flight PUTs are joined before any verdict, so the commit only ever stamps `uploaded_at` for confirmed writes.
+
+| Outcome | Status | Side effects |
+|---|---|---|
+| complete | commit | §6.2 single-transaction commit |
+| incomplete | `FAILED_PRECONDITION` | `rio_store_putpath_incomplete_total++`; placeholders reaped |
+| unavailable | `UNAVAILABLE` | `rio_store_putpath_verify_unavailable_total++`; placeholders reaped; builder retries per `r[builder.upload.retry]` |
+
+In every non-commit case, novel chunks already in S3-standard are refcount-0 orphans for `r[store.chunk.grace-ttl]` sweep — they are content-addressed (cannot poison), not yet `durable` (cannot cause `HasChunks` skips), and the same orphan path already covers builder-crash-mid-stream. *Incomplete* and *unavailable* are infra-retry conditions, not alerts.
+
+r[store.put.chunked-ca]
+
+**CA outputs** (`claims.is_ca = true`): the §6.2 placeholder is **not** claimed at `Begin` — this is how `PutPathChunked` honors `r[sec.authz.ca-path-derived+3]` ("the CA-path check MUST run BEFORE the `\'uploading\'` placeholder is claimed") without buffering. Receive proceeds identically; once the stream is complete, the store derives each output's CA path from the claimed `nar_hash` via `make_fixed_output(name, nar_hash, recursive=true, refs)`, asserts it equals `outputs[i].store_path` (else `PERMISSION_DENIED` — the claimed path is not the fixed-output derivation of the hash and references the same upload asserts), and then performs the §6.2 single-transaction commit. Each output is committed via `INSERT … ON CONFLICT (store_path_hash) WHERE status='complete' DO NOTHING RETURNING store_path_hash`; the per-output side-effects (chunk refcounts, `durable=TRUE`, `directories` refcount, `file_blobs`/tenant inserts) are applied **only for outputs the `RETURNING` set contains** — so two builders concurrently committing the same CA path is an idempotent no-op for the loser with no double-counted refcounts. Chunk protection during the upload window is `r[store.chunk.grace-ttl]` alone; CA uploads are not long enough for that to matter.
+
+`'complete'` therefore implies the chunk bodies behind the manifest are digest-verified; `nar_hash` and `references` are the authenticated builder's fused-walk claims for `PutPathChunked`, and store-recomputed values for the NAR-byte paths (`PutPath`, the substituter). The ed25519 narinfo fingerprint (`r[store.sig.fingerprint]`) signs those claims. There is no `'quarantined'` state, no `nar_hash_verified` column, no verify-worker queue, no narinfo serving gate.
+
+**Considered and rejected:** server-side recompute of `nar_hash`/refs/file digests over the spliced chunk stream (the original §6.3 design — it forces a `cas::get` of every already-durable chunk, making the *most*-deduped uploads the *most* expensive to verify, and within the service trust boundary it only guards against rio's own walk bugs); async verify with a `'complete' && \!verified` window (same total S3 reads, just time-shifted, plus a second manifest state every consumer must understand); local-disk spool before S3 write (a per-replica capacity limit and a disk round-trip per novel chunk for hygiene that orphan-GC already provides); routing `is_ca` uploads to legacy `PutPath` (re-admits the whole-NAR buffer for exactly the floating-CA case, and requires a hole in `r[store.put.builder-chunked-only]`); dropping `nar_hash` from the manifest entirely (breaks substitution by stock Nix clients — a non-goal to break).
+
+
+### 6.4 Prior art
+
+REAPI [`FindMissingBlobs`](https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto) → `HasChunks`; BuildBarn [ADR-0003 CAS decomposition](https://github.com/buildbarn/bb-adrs/blob/main/0003-cas-decomposition.md) → upload chunk granularity matches read-path chunk granularity; ostree `devino_to_csum_cache` → §6.1 input-reuse shortcut; [`mkcomposefs --digest-store`](https://man.archlinux.org/man/mkcomposefs.1.en) → walk-and-reflink-into-object-store (inapplicable directly: upper is local SSD, cache tier is an object store, no reflink — but the walk shape is the same); Nix [#4075](https://github.com/NixOS/nix/issues/4075)/[#7527](https://github.com/NixOS/nix/issues/7527) → existence-check before serialize, and the whole-NAR-granularity pain point this section eliminates.
+
+---

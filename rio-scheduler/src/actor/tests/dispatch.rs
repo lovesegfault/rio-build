@@ -533,12 +533,17 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
     let assignment_child = recv_assignment(&mut stream_rx).await;
     assert!(assignment_child.drv_path.contains("x9-child"));
 
-    // Child is leaf → approx_input_closure empty → no pin.
+    // Child is leaf → approx_input_closure empty → no dispatch-time
+    // input pin. ONE row remains: the merge-time pin of the child's
+    // own .drv path (r[store.drv.gc-build-pinned]).
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_live_pins WHERE drv_hash = 'x9-child'")
             .fetch_one(&db.pool)
             .await?;
-    assert_eq!(count, 0, "leaf drv (no inputs) should not pin anything");
+    assert_eq!(
+        count, 1,
+        "leaf drv: only the merge-time own-.drv pin, no input pins"
+    );
 
     // Complete child → parent becomes Ready → dispatched → pinned.
     // One-shot: w-x9 drains; connect a fresh worker for parent.
@@ -560,12 +565,16 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
     barrier(&handle).await;
 
     // Parent's input-closure = child's expected_output_paths
-    // (1 path via make_test_node). Pin should be present.
+    // (1 path via make_test_node) + the merge-time pin of the
+    // parent's own .drv path = 2 rows.
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_live_pins WHERE drv_hash = 'x9-parent'")
             .fetch_one(&db.pool)
             .await?;
-    assert_eq!(count, 1, "parent dispatch should pin its 1 input path");
+    assert_eq!(
+        count, 2,
+        "parent: dispatch-time input pin + merge-time own-.drv pin"
+    );
 
     // Complete parent → unpin.
     complete_success_empty(&handle, "w-x9-2", "x9-parent").await?;
@@ -577,6 +586,80 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
             .await?;
     assert_eq!(count, 0, "completion should unpin");
 
+    Ok(())
+}
+
+/// Normal-path attestation: a parent whose `.drv` was inlined at merge
+/// gets a non-empty `WorkAssignment.input_closure` derived from its
+/// parsed direct inputs — the completed child's realized output AND
+/// the drv's `inputSrcs` entry. Guards the positive half of the
+/// attested-closure rule (the recovery test in `recovery.rs` covers
+/// the degraded half: no attestation rather than a narrower one).
+// r[verify sched.dispatch.input-roots+2]
+#[tokio::test]
+async fn test_dispatch_attests_input_closure_from_parsed_drv() -> TestResult {
+    let (db, handle, _task, mut rx) = setup_with_worker("attest-w1", "x86_64-linux").await?;
+
+    let child_drv_path = test_drv_path("attest-child");
+    let child_out = test_store_path("attest-child-out");
+    let src = test_store_path("attest-src");
+    let parent_out = test_store_path("attest-parent-out");
+
+    // Every closure member needs a narinfo row: a member without one
+    // has unknown references, so compute_input_roots degrades the
+    // whole closure to unattested and this positive-half test would
+    // see an empty input_closure. Real flow: the store wrote these
+    // rows when the paths were uploaded.
+    for p in [&child_out, &src] {
+        use sha2::Digest as _;
+        let h = sha2::Sha256::digest(p.as_bytes()).to_vec();
+        sqlx::query(
+            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size, \"references\") \
+             VALUES ($1, $2, $1, 0, '{}')",
+        )
+        .bind(&h)
+        .bind(p)
+        .execute(&db.pool)
+        .await?;
+    }
+
+    let mut child = make_node("attest-child");
+    child.expected_output_paths = vec![child_out.clone()];
+    let mut parent = make_node("attest-parent");
+    parent.drv_content = format!(
+        r#"Derive([("out","{parent_out}","","")],[("{child_drv_path}",["out"])],["{src}"],"x86_64-linux","/bin/sh",[],[("out","{parent_out}")])"#
+    )
+    .into_bytes();
+
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![child, parent],
+        vec![make_test_edge("attest-parent", "attest-child")],
+        false,
+    )
+    .await?;
+
+    // Child (leaf) dispatches first; complete it with a realized path.
+    let a1 = recv_assignment(&mut rx).await;
+    assert!(a1.drv_path.contains("attest-child"), "child first: {a1:?}");
+    complete_success(&handle, "attest-w1", "attest-child", &child_out).await?;
+
+    // Parent dispatches to a fresh worker (executors are one-shot).
+    let mut rx2 = connect_executor(&handle, "attest-w2", "x86_64-linux").await?;
+    let a2 = recv_assignment(&mut rx2).await;
+    assert!(a2.drv_path.contains("attest-parent"), "parent: {a2:?}");
+
+    assert!(
+        a2.input_closure.contains(&child_out),
+        "attested closure must contain the child's realized output: {:?}",
+        a2.input_closure
+    );
+    assert!(
+        a2.input_closure.contains(&src),
+        "attested closure must contain the drv's inputSrcs entry: {:?}",
+        a2.input_closure
+    );
     Ok(())
 }
 
@@ -2835,7 +2918,7 @@ async fn test_fleet_exhaustion_spare_eligible_defers() -> TestResult {
 // queue_depth / unroutable_ready gauge exactness under active dispatch
 // ---------------------------------------------------------------------------
 
-// r[verify obs.metric.scheduler]
+// r[verify obs.metric.scheduler+2]
 /// `queue_depth` / `unroutable_ready` gauges report the FINAL-iteration
 /// deferral count, not the sum across outer-loop iterations. Regression
 /// for the per-iteration accumulator never being cleared: with 1 idle
@@ -5849,6 +5932,93 @@ async fn compute_spawn_intents_carries_ice_masked_cells() -> TestResult {
             .contains(&"hi-ebs-x86:spot".to_string()),
         "masked cell flows to snapshot via cell_label: got {:?}",
         snap.ice_masked_cells
+    );
+    Ok(())
+}
+
+/// ADR-024 end-to-end: a drv blob referenced by a live build survives
+/// the REAL store GC through the REAL scheduler pin-writing path.
+/// `merge_dag` (submission accept) pins the node's own `.drv` path in
+/// `scheduler_live_pins`; `rio_store::gc::run_gc` — the store's actual
+/// mark+sweep entry point, drv sweep included — must keep the blob
+/// while the pin lives; the worker completion's existing terminal
+/// unpin releases it; the next sweep collects. (The store-side unit
+/// tests hand-insert the pin row; this test proves the scheduler
+/// writes it.)
+// r[verify store.drv.gc-build-pinned]
+#[tokio::test]
+async fn test_drv_blob_pinned_by_live_build_survives_store_gc() -> TestResult {
+    let (db, handle, _task, mut stream_rx) = setup_with_worker("w-dgc", "x86_64-linux").await?;
+
+    // Drv blob aged far past the grace window: only a live pin can
+    // keep it. Seeded the way PutDrvBlobs stores it (digest-keyed,
+    // drv_path_hash = sha256(drv_path)).
+    let node = make_node("dgc-root");
+    {
+        use sha2::Digest as _;
+        sqlx::query(
+            "INSERT INTO drv_blobs (digest, drv_path, drv_path_hash, body, created_at) \
+             VALUES ($1, $2, $3, $4, now() - make_interval(hours => 48))",
+        )
+        .bind(vec![0x5au8; 32])
+        .bind(&node.drv_path)
+        .bind(sha2::Sha256::digest(node.drv_path.as_bytes()).to_vec())
+        .bind(b"blob".as_slice())
+        .execute(&db.pool)
+        .await?;
+    }
+
+    let build_id = Uuid::new_v4();
+    let _rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    let pins: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_live_pins WHERE drv_hash = 'dgc-root'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(pins, 1, "submission accept must pin the node's .drv path");
+
+    let run_store_gc = |pool: sqlx::PgPool| async move {
+        let (tx, _progress) = tokio::sync::mpsc::channel(8);
+        rio_store::gc::run_gc(
+            &pool,
+            None,
+            rio_store::gc::GcParams {
+                dry_run: false,
+                grace_hours: 2,
+                extra_roots: vec![],
+            },
+            tx,
+            &rio_common::signal::Token::new(),
+        )
+        .await
+        .expect("run_gc")
+        .expect("advisory lock free in test")
+    };
+
+    let stats = run_store_gc(db.pool.clone()).await;
+    assert_eq!(
+        stats.drv_blobs_deleted, 0,
+        "drv blob of a live build must survive the store sweep"
+    );
+
+    // Build the derivation: dispatch → worker success → the existing
+    // per-drv terminal unpin (completion path) releases the pin.
+    let assignment = recv_assignment(&mut stream_rx).await;
+    assert!(assignment.drv_path.contains("dgc-root"));
+    complete_success_empty(&handle, "w-dgc", "dgc-root").await?;
+    barrier(&handle).await;
+
+    let pins: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_live_pins WHERE drv_hash = 'dgc-root'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(pins, 0, "terminal status must unpin the drv path");
+
+    let stats = run_store_gc(db.pool.clone()).await;
+    assert_eq!(
+        stats.drv_blobs_deleted, 1,
+        "unpinned, out-of-grace drv blob is collected on the next sweep"
     );
     Ok(())
 }

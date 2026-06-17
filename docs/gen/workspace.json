@@ -5,6 +5,10 @@
       "description": "Tenant JWT + assignment HMAC token sign/verify and the gRPC interceptor that wires them"
     },
     {
+      "name": "rio-build-cli",
+      "description": "rio build — native-protocol build client (ADR-024 P3 coordinator)"
+    },
+    {
       "name": "rio-cli",
       "description": "Admin CLI for rio-build — talks to the scheduler's AdminService"
     },
@@ -15,6 +19,10 @@
     {
       "name": "rio-controller",
       "description": "Kubernetes operator for rio-build: Pool, ComponentScaler CRDs"
+    },
+    {
+      "name": "rio-evalstore",
+      "description": "Client-side eval store: persistent CAS backing the rio:// nix store plugin (ADR-024 M0)"
     },
     {
       "name": "rio-gateway",
@@ -31,6 +39,10 @@
     {
       "name": "rio-nix",
       "description": "Nix protocol types and wire format"
+    },
+    {
+      "name": "rio-packstore",
+      "description": "Client-side append-only pack store for the rio:// eval store (ADR-024 P1)"
     },
     {
       "name": "rio-proto",
@@ -69,6 +81,21 @@
       "optional": [],
       "dev": []
     },
+    "rio-build-cli": {
+      "prod": [
+        "rio-common",
+        "rio-evalstore",
+        "rio-nix",
+        "rio-packstore",
+        "rio-proto"
+      ],
+      "optional": [],
+      "dev": [
+        "rio-auth",
+        "rio-store",
+        "rio-test-support"
+      ]
+    },
     "rio-builder": {
       "prod": [
         "rio-common",
@@ -77,6 +104,8 @@
       ],
       "optional": [],
       "dev": [
+        "rio-auth",
+        "rio-store",
         "rio-test-support"
       ]
     },
@@ -103,16 +132,26 @@
         "rio-common",
         "rio-crds",
         "rio-lease",
+        "rio-migrations",
         "rio-proto"
       ],
       "optional": [],
       "dev": [
-        "rio-migrations",
         "rio-test-support"
       ]
     },
     "rio-crds": {
       "prod": [],
+      "optional": [],
+      "dev": []
+    },
+    "rio-evalstore": {
+      "prod": [
+        "rio-common",
+        "rio-nix",
+        "rio-packstore",
+        "rio-proto"
+      ],
       "optional": [],
       "dev": []
     },
@@ -148,6 +187,11 @@
       ]
     },
     "rio-nix": {
+      "prod": [],
+      "optional": [],
+      "dev": []
+    },
+    "rio-packstore": {
       "prod": [],
       "optional": [],
       "dev": []
@@ -198,6 +242,7 @@
     },
     "xtask": {
       "prod": [
+        "rio-auth",
         "rio-common",
         "rio-crds",
         "rio-proto",

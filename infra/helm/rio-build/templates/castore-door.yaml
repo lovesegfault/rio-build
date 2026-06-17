@@ -1,0 +1,103 @@
+{{- if .Values.store.externalDoor.enabled }}
+{{- $ns := .Values.namespaces.system.name -}}
+{{- $storeNs := .Values.namespaces.store.name -}}
+# External castore door (ADR-024 P2): the externally reachable,
+# tenant-authenticated gRPC entry point the `rio build` client (P3)
+# dials for digest negotiation and upload. THE DOOR ROUTES, THE
+# SERVICES AUTHENTICATE — there is deliberately no auth layer here:
+#
+#   - rio.store.DirectoryService (GetDirectory/HasDirectories/HasBlobs/
+#     ReadBlob/StatBlob) resolves a tenant on every RPC (JWT tenant
+#     token or HMAC assignment token) and answers UNAUTHENTICATED to
+#     anonymous callers.
+#   - rio.store.ChunkService (GetChunk/GetChunks/HasChunks) requires a
+#     caller identity on every RPC; anonymous → UNAUTHENTICATED.
+#   - rio.store.DrvBlobService (PutDrvBlobs/GetDrvBlob/HasDrvs — the
+#     drv-blob half of the ADR-024 negotiation) resolves a tenant on
+#     every RPC (same ladder as DirectoryService); anonymous →
+#     UNAUTHENTICATED.
+#   - rio.store.StoreService/PutPathChunked (the upload path) rejects
+#     callers without a valid assignment or service token with
+#     PERMISSION_DENIED when the HMAC verifier is configured (always,
+#     in production). No other StoreService method is routed — the
+#     whole-NAR / query surface stays cluster-internal.
+#
+# Same Cilium Gateway API shape as the dashboard door
+# (dashboard-gateway.yaml): per-feature GatewayClass, plain HTTP
+# listener (h2c — native gRPC `application/grpc`, so GRPCRoute matches
+# apply; the dashboard needed HTTPRoute only for its grpc-web
+# content-type). TLS termination follows the existing external
+# listeners: none at the Gateway today — fronting LB/Ingress owns it.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: rio-castore
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-castore-door" "component" "store") | nindent 4 }}
+spec:
+  controllerName: io.cilium/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: rio-castore
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-castore-door" "component" "store") | nindent 4 }}
+spec:
+  gatewayClassName: rio-castore
+  listeners:
+    - name: grpc
+      protocol: HTTP
+      port: {{ .Values.store.externalDoor.port }}
+      allowedRoutes:
+        kinds:
+          - kind: GRPCRoute
+---
+# Route the castore surface only. A service match with no method
+# routes every method of that service; StoreService is matched
+# per-method so nothing beyond PutPathChunked leaks through the door.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: rio-castore
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-castore-door" "component" "store") | nindent 4 }}
+spec:
+  parentRefs:
+    - name: rio-castore
+  rules:
+    - matches:
+        - method: {service: rio.store.DirectoryService}
+        - method: {service: rio.store.ChunkService}
+        - method: {service: rio.store.DrvBlobService}
+        - method: {service: rio.store.StoreService, method: PutPathChunked}
+      backendRefs:
+        - name: rio-store
+          namespace: {{ $storeNs }}
+          port: 9002
+---
+# Cross-namespace backendRef (Gateway lives in the system namespace —
+# same placement as the dashboard door, which also keeps the per-
+# Gateway envoy pod inside the store-ingress CNP's existing
+# system-namespace allowance) needs an explicit grant in the target
+# namespace or the route status goes ResolvedRefs=False (RefNotPermitted).
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: rio-castore-door
+  namespace: {{ $storeNs }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-castore-door" "component" "store") | nindent 4 }}
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: GRPCRoute
+      namespace: {{ $ns }}
+  to:
+    - group: ""
+      kind: Service
+      name: rio-store
+{{- end }}

@@ -44,6 +44,10 @@ use crate::logs::LogBuffers;
 
 /// Full `GetDerivationLogs` handler body: validate → ring buffer → S3.
 ///
+/// Also the byte-serving body behind the tenant-facing
+/// `SchedulerService.GetDerivationLog` (`grpc/derivation_log.rs`), which
+/// resolves tenancy and the tail cursor first and then delegates here.
+///
 /// `try_ring_buffer` and `try_s3` are separately testable; this
 /// function just sequences them with the right fallback logic.
 ///
@@ -51,7 +55,7 @@ use crate::logs::LogBuffers;
 /// as `Err(Status)` — returning `Err` from a server-streaming handler
 /// makes tonic emit Trailers-Only, which the grpc-web dashboard can't
 /// read (browser fetch API can't access HTTP trailers).
-pub(super) async fn get_derivation_logs(
+pub(crate) async fn get_derivation_logs(
     log_buffers: &LogBuffers,
     s3: &Option<(S3Client, String)>,
     pool: &PgPool,

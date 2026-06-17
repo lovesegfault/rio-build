@@ -159,11 +159,23 @@ pub async fn spawn_mock_store_inproc() -> anyhow::Result<(
     MockStore,
     rio_proto::StoreServiceClient<tonic::transport::Channel>,
 )> {
+    let (store, channel) = spawn_mock_store_inproc_channel().await?;
+    Ok((store, rio_proto::StoreServiceClient::new(channel)))
+}
+
+/// [`spawn_mock_store_inproc`] but returning the bare `Channel`, for
+/// callers that wrap the same in-process channel in MULTIPLE generated
+/// clients (e.g. the builder's `StoreClients` bundle of StoreService +
+/// ChunkService) — tonic clients don't expose `into_inner()`.
+///
+/// Both `StoreService` and `ChunkService` are registered, mirroring the
+/// real store (and [`spawn_mock_store`]'s TCP router).
+pub async fn spawn_mock_store_inproc_channel()
+-> anyhow::Result<(MockStore, tonic::transport::Channel)> {
     use hyper_util::rt::TokioIo;
     use tonic::transport::Endpoint;
 
     let store = MockStore::new();
-    let svc = StoreServiceServer::new(store.clone());
 
     // Channel of server-side duplex halves. Each client "connect" mints
     // a duplex pair, hands one half to the server via this channel.
@@ -178,9 +190,12 @@ pub async fn spawn_mock_store_inproc() -> anyhow::Result<(
     let incoming =
         tokio_stream::wrappers::UnboundedReceiverStream::new(conn_rx).map(Ok::<_, std::io::Error>);
 
+    let svc = StoreServiceServer::new(store.clone());
+    let chunk_svc = ChunkServiceServer::new(store.clone());
     tokio::spawn(async move {
         Server::builder()
             .add_service(svc)
+            .add_service(chunk_svc)
             .serve_with_incoming(incoming)
             .await
             .expect("in-process gRPC server");
@@ -208,5 +223,5 @@ pub async fn spawn_mock_store_inproc() -> anyhow::Result<(
         }))
         .await?;
 
-    Ok((store, rio_proto::StoreServiceClient::new(channel)))
+    Ok((store, channel))
 }

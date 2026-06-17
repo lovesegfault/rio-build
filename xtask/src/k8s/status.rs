@@ -27,7 +27,6 @@ use crate::k8s::{NAMESPACES, NS, NS_BUILDERS, NS_FETCHERS, NS_STORE};
 /// The Service spec only exposes 9001 (gRPC) — must target the pod.
 pub(crate) const SCHED_METRICS_PORT: u16 = 9091;
 pub(crate) const STORE_METRICS_PORT: u16 = 9092;
-pub(crate) const BUILDER_METRICS_PORT: u16 = 9093;
 /// Per-scrape timeout. Anything slower means bigger problems.
 const SCRAPE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -591,10 +590,10 @@ pub async fn grafana(port: u16) -> Result<()> {
         .context("admin-password key missing in Grafana secret")?;
 
     // `signal()` (not `ctrl_c()`) so the sigaction is installed at
-    // CALL time: `port_forward` below spawns `kubectl` via
-    // ProcessGuard with `process_group(0)`; Ctrl-C during the await
-    // with default SIGINT disposition would skip Drop → no killpg →
-    // kubectl orphans with the port bound. Same shape as stress.rs.
+    // CALL time: the tunnel below is a ProcessGuard with its own
+    // pgid; Ctrl-C with default SIGINT disposition would skip Drop →
+    // no killpg → tunnel orphans with the port bound. Same shape as
+    // stress.rs.
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     crate::k8s::shared::kill_port_listeners(port);
@@ -607,7 +606,7 @@ pub async fn grafana(port: u16) -> Result<()> {
         style("Grafana:").bold().green()
     );
     eprintln!("  {}   admin / {pw}", style("login:").bold());
-    eprintln!("  (port-forward held; Ctrl-C to stop)");
+    eprintln!("  (tunnel held; Ctrl-C to stop)");
 
     sigint.recv().await;
     Ok(())

@@ -1,5 +1,14 @@
 {{- if .Values.store.enabled }}
 {{- $s := .Values.store -}}
+{{- $cb := $s.chunkBackend | default dict -}}
+{{- $fsChunks := eq ($cb.kind | default "") "filesystem" -}}
+{{- $express := and (eq ($cb.kind | default "") "tiered") $cb.expressBuckets -}}
+{{- /* narinfo signing: mount rio-signing-key when a source for the Secret
+       exists — the ExternalSecret (EKS) or the literal store.signing.key
+       (dev/k3s, rendered below). Without the mount signing_key_path stays
+       None and uploaded paths are unsigned, which blocks `rio build`'s
+       local /nix/store import on require-sigs daemons. */}}
+{{- $signing := and $s.signing.enabled (or .Values.externalSecrets.enabled (ne $s.signing.key "")) -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,9 +17,20 @@ metadata:
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
 spec:
+  {{- if $fsChunks }}
+  # filesystem chunk backend: the chunks PVC is ReadWriteOnce and the
+  # provisioned PV is node-pinned, so a RollingUpdate surge pod could
+  # only schedule onto the same node (capacity permitting) and would
+  # write the same chunk dir concurrently. Recreate swaps the pod
+  # instead — brief downtime is acceptable for the single-replica
+  # dev/VM-test shape this backend is for.
+  strategy:
+    type: Recreate
+  {{- end }}
   {{- if not .Values.componentScaler.store.enabled }}
-  # Stateless at runtime (PG + S3 hold everything). sqlx::migrate! takes
-  # a PG advisory lock, so concurrent replica startup is safe.
+  # Stateless at runtime (PG + S3 hold everything). Replicas don't
+  # migrate (the rio-migrate Job does); startup only verifies the
+  # schema, so concurrent replica startup is safe.
   #
   # OMITTED when componentScaler.store.enabled=true: the ComponentScaler
   # reconciler patches deployments/scale; if helm also rendered
@@ -38,6 +58,67 @@ spec:
       # hung process. Same shape as gateway.yaml's three-stage budget.
       terminationGracePeriodSeconds: {{ add 6 ($s.streamDrainSecs | default 90) 24 }}
       {{- include "rio.podSecurityContext" . | nindent 6 }}
+      {{- if $express }}
+      # ADR-023: PREFER the AZs that have an Express bucket so replicas
+      # actually get the cache tier. Preferred (not required) — AZs
+      # without Express must stay schedulable; a pod landing there runs
+      # local=None (plain S3-standard reads). kube-scheduler scores
+      # existing nodes by this, and Karpenter honors preferences when
+      # provisioning (relaxing them only when unsatisfiable).
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: topology.kubernetes.io/zone
+                    operator: In
+                    values: {{ keys $cb.expressBuckets | sortAlpha | toJson }}
+      # Per-AZ express bucket selection. The store binary takes ONE
+      # express_bucket; which one is per-pod knowledge (the node's AZ),
+      # so a Deployment-level env can't carry it. The pod's
+      # topology.kubernetes.io/zone POD label (PodTopologyLabels copies
+      # it from the node at binding; beta+default since k8s 1.34, EKS
+      # cluster is 1.35) is resolved here against the expressBuckets
+      # map and written as the /etc/rio/store.toml config layer — env
+      # vars (kind/bucket/prefix above) merge per-key on top. IMDS is
+      # NOT an option: nodes run IMDSv2 hop-limit 1 (karpenter.yaml),
+      # unreachable from pods by design. Zones absent from the map
+      # (and an absent label) write nothing → express_bucket None →
+      # tiered backend degrades to pass-through.
+      initContainers:
+        - name: express-bucket
+          # rio-bootstrap: the only rio image with a shell (control
+          # plane images are binary-only per sec.image.control-plane-
+          # minimal; this initContainer runs no rio code).
+          image: {{ include "rio.image" (list . .Values.bootstrap.image) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          {{- include "rio.containerSecurityContext" . | nindent 10 }}
+          env:
+            - name: ZONE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['topology.kubernetes.io/zone']
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              case "$ZONE" in
+              {{- range $zone, $bucket := $cb.expressBuckets }}
+                {{ $zone }}) bucket={{ $bucket | quote }} ;;
+              {{- end }}
+                *) bucket="" ;;
+              esac
+              if [ -n "$bucket" ]; then
+                printf '[chunk_backend]\nexpress_bucket = "%s"\n' "$bucket" > /etc/rio/store.toml
+                echo "zone $ZONE -> express bucket $bucket"
+              else
+                echo "zone ${ZONE:-unlabeled}: no express bucket; cache tier disabled (local=None)"
+              fi
+          volumeMounts:
+            - name: rio-etc
+              mountPath: /etc/rio
+      {{- end }}
       containers:
         - name: store
           image: {{ include "rio.image" (list . $s.image) }}
@@ -50,7 +131,7 @@ spec:
               containerPort: 9092
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
-            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac")) | nindent 12 }}
             - name: RIO_LISTEN_ADDR
               value: "[::]:9002"
             # P0542: s3.dualstack.{region}.amazonaws.com has AAAA;
@@ -76,15 +157,15 @@ spec:
             - name: RIO_SUBSTITUTE_ADMISSION_PERMITS
               value: {{ $s.substituteAdmissionPermits | quote }}
             {{- end }}
-            - name: RIO_DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: rio-postgres
-                  key: url
+            {{- include "rio.pgEnv" (dict "root" . "authEnv" "RIO_PG_AUTH" "urlEnv" "RIO_DATABASE_URL") | nindent 12 }}
             {{- with $s.chunkBackend }}
             {{- if .kind }}
             - name: RIO_CHUNK_BACKEND__KIND
               value: {{ .kind | quote }}
+            {{- end }}
+            {{- if .baseDir }}
+            - name: RIO_CHUNK_BACKEND__BASE_DIR
+              value: {{ .baseDir | quote }}
             {{- end }}
             {{- if .bucket }}
             - name: RIO_CHUNK_BACKEND__BUCKET
@@ -99,13 +180,39 @@ spec:
               value: {{ .endpoint | quote }}
             {{- end }}
             {{- end }}
+            {{- if $signing }}
+            - name: RIO_SIGNING_KEY_PATH
+              value: /etc/rio/signing/key
+            {{- end }}
             {{- with $s.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
-            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 12 }}
-          # tonic-health set_serving() runs AFTER migrations in main.rs —
-          # "PG connected + migrations done" = Ready.
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac" "rdsCa")) | nindent 12 }}
+            {{- if $signing }}
+            - name: signing-key
+              mountPath: /etc/rio/signing
+              readOnly: true
+            {{- end }}
+            {{- if $express }}
+            # /etc/rio/store.toml written by the express-bucket
+            # initContainer. Mounting the emptyDir at /etc/rio is safe
+            # alongside the /etc/rio/<sub> mounts above — each
+            # volumeMount is its own mount point; kubelet layers the
+            # subdirectory mounts over this one.
+            - name: rio-etc
+              mountPath: /etc/rio
+            {{- end }}
+            {{- if $fsChunks }}
+            # readOnlyRootFilesystem (rio.containerSecurityContext)
+            # makes the image filesystem immutable — the filesystem
+            # chunk backend needs a writable mount at base_dir.
+            - name: chunks
+              mountPath: {{ required "store.chunkBackend.baseDir is required when chunkBackend.kind=filesystem" $cb.baseDir }}
+            {{- end }}
+          # tonic-health set_serving() runs AFTER the schema check in
+          # main.rs — "PG connected + schema current" = Ready. Pods
+          # crash-restart until the rio-migrate Job has run.
           readinessProbe:
             grpc:
               port: 9002
@@ -119,7 +226,61 @@ spec:
           resources:
             {{- toYaml $s.resources | nindent 12 }}
       volumes:
-        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac" "rdsCa")) | nindent 8 }}
+        {{- if $signing }}
+        - name: signing-key
+          secret:
+            secretName: rio-signing-key
+        {{- end }}
+        {{- if $express }}
+        - name: rio-etc
+          emptyDir: {}
+        {{- end }}
+        {{- if $fsChunks }}
+        - name: chunks
+          persistentVolumeClaim:
+            claimName: rio-store-chunks
+        {{- end }}
+{{- if $fsChunks }}
+---
+# Chunk storage for chunkBackend.kind=filesystem. A PVC (NOT emptyDir):
+# uploaded chunks are recorded durable=TRUE in PG, so they must survive
+# store pod restarts/rollouts (the lifecycle VM scenarios roll the store
+# and expect previously-uploaded paths to stay servable). ReadWriteOnce
+# — filesystem mode is single-replica (see values.yaml chunkBackend).
+# k3s local-path node-pins the volume on first consumption, so a
+# replacement pod lands back on the node that holds the chunks.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rio-store-chunks
+  namespace: {{ .Values.namespaces.store.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: {{ dig "persistence" "size" "2Gi" $cb }}
+{{- end }}
+{{- if and $s.signing.enabled (ne $s.signing.key "") (not .Values.externalSecrets.enabled) }}
+---
+# Dev/k3s narinfo signing key, rendered from the literal
+# store.signing.key value. EKS deployments get the same Secret from the
+# rio-signing-key ExternalSecret instead (the bootstrap Job populates
+# rio/signing-key, and publishes the public half as rio/signing-key-pub
+# for users' trusted-public-keys).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rio-signing-key
+  namespace: {{ .Values.namespaces.store.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
+type: Opaque
+stringData:
+  key: {{ $s.signing.key | quote }}
+{{- end }}
 # ClusterIP + headless pair (see rio.grpcServicePair). Builders/fetchers
 # resolve the headless name to pod IPs and p2c across them — a sticky
 # single-channel against the ClusterIP means scaling rio-store doesn't

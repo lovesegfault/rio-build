@@ -285,6 +285,19 @@ holds at the log level too.
   failover.
 ]
 
+#r("obs.log.failure-reason-persisted")[
+  When a derivation reaches terminal failure (poisoned), the scheduler MUST
+  persist the builder-reported error text and the originating execution id
+  alongside the poison mark, and MUST clear both whenever the poison state is
+  reset (admin clear, TTL expiry, resubmit reset).
+]
+
+The persisted reason (`derivations.failure_msg` / `failure_exec_id`,
+migration 073) is what a later build's fail-fast surfaces to the client
+(#rref("sched.merge.failfast-culprit")) --- the original execution's log may
+have expired or contain nothing, but the reason text survives with the poison
+mark and dies with it.
+
 #figure(
   chronos.diagram({
     import chronos: *
@@ -365,10 +378,11 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
 
 == Scheduler Metrics
 
-#r("obs.metric.scheduler")[
+#r("obs.metric.scheduler+2")[
   rio-scheduler MUST expose the metrics in
   #xref(<tbl-metrics-scheduler>, [the scheduler metric reference]). All
-  metrics MUST follow the `rio_scheduler_*` naming prefix.
+  metrics MUST follow the `rio_scheduler_*` naming prefix, except the
+  shared `rio_pg_iam_*` family (#rref("obs.metric.pg-iam")).
 ]
 
 #r("obs.metric.scheduler-leader-gate+2")[
@@ -391,10 +405,11 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
 
 == Store Metrics
 
-#r("obs.metric.store")[
+#r("obs.metric.store+2")[
   rio-store MUST expose the metrics in
   #xref(<tbl-metrics-store>, [the store metric reference]). All metrics MUST
-  follow the `rio_store_*` naming prefix.
+  follow the `rio_store_*` naming prefix, except the shared
+  `rio_pg_iam_*` family (#rref("obs.metric.pg-iam")).
 ]
 
 #r("obs.metric.store-pg-pool")[
@@ -417,18 +432,21 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
 #r("obs.metric.input-materialization-failures")[
   #(refs.metric)("rio_builder_input_materialization_failures_total")
   (counter): incremented each time a daemon `MiscFailure` is reclassified as
-  `InfrastructureFailure` under #rref("builder.result.input-enoent-is-infra").
-  Sustained nonzero rate indicates `JIT_MIN_THROUGHPUT_BPS` is set above
-  actual store→builder throughput.
+  `InfrastructureFailure` under `r[builder.result.input-eio-is-infra]`
+  (ADR-022 design overview §13). Sustained nonzero rate means closure inputs
+  are failing to materialize from the castore-FUSE lower (store fetch
+  errors, integrity failures, or a tripped fetch circuit breaker) ---
+  correlate with #(refs.metric)("rio_builder_castore_fuse_eio_total") and
+  rio-store health.
 ]
 
 #r("obs.metric.transfer-volume")[
   Transfer-volume byte counters (`*_bytes_total`) are emitted at each hop:
   gateway (#(refs.metric)("rio_gateway_bytes_total")`{direction}`), store
   (`rio_store_{put,get}_path_bytes_total`), executor
-  (`rio_builder_{upload,fuse_fetch}_bytes_total`). Summing these across the
-  topology gives a full picture of data movement --- e.g.,
-  `rate(rio_builder_fuse_fetch_bytes_total[5m])` vs
+  (`rio_builder_{upload,castore_fuse_fetch}_bytes_total`). Summing these
+  across the topology gives a full picture of data movement --- e.g.,
+  `rate(rio_builder_castore_fuse_fetch_bytes_total[5m])` vs
   `rate(rio_builder_upload_bytes_total[5m])` shows whether an executor is
   input-bound or output-bound.
 ]
@@ -456,10 +474,28 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   cells packing \~1 intent per node. See `consolidate_after()`.
 ]
 
-#r("obs.metric.controller")[
+#r("obs.metric.controller+2")[
   rio-controller MUST expose the metrics in
   #xref(<tbl-metrics-controller>, [the controller metric reference]). All
-  metrics MUST follow the `rio_controller_*` naming prefix.
+  metrics MUST follow the `rio_controller_*` naming prefix, except the
+  shared `rio_pg_iam_*` family (#rref("obs.metric.pg-iam")).
+]
+
+== Shared (rio-common) Metrics
+
+#r("obs.metric.pg-iam")[
+  The `rio_pg_iam_*` family is the sanctioned exception to the
+  per-component prefix rules: it is emitted by `rio_common::pg_iam`
+  and appears identically on every PG-consuming component (store,
+  scheduler, controller). Each consumer MUST register the family by
+  calling `rio_common::pg_iam::describe_metrics()` from its own
+  `describe_metrics()` — registration and emission are separate call
+  sites, and rio-common installs no exporter of its own. Members:
+  #(refs.metric)("rio_pg_iam_mint_failures_total") (counter) and
+  #(refs.metric)("rio_pg_iam_token_minted_timestamp_seconds") (gauge;
+  alert on `time() - x` approaching the 900s token TTL — set per
+  successful mint, never per refresher tick, so the PromQL age is the
+  true token age).
 ]
 
 == Histogram Buckets
@@ -498,11 +534,10 @@ for HTTP request latencies. Build durations span seconds to hours, so
   (refs.metric)("rio_builder_upload_references_count"),
   [`[1, 5, 10, 25, 50, 100, 250, 500]` (count)],
 
-  [#(refs.metric)("rio_builder_fuse_fetch_duration_seconds"),
-    #(refs.metric)("rio_store_substitute_duration_seconds"),
+  [#(refs.metric)("rio_store_substitute_duration_seconds"),
     #(refs.metric)("rio_store_check_available_duration_seconds")],
-  [`[0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120]` (@nar fetch + drain;
-    GB-scale paths via I-212 JIT span 60-127s)],
+  [`[0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120]` (@nar download +
+    ingest; GB-scale substitutions span 60s+)],
 )
 
 Histograms not listed here (e.g.,

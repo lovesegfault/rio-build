@@ -47,8 +47,9 @@ let
   # regex catches build artifacts that --extract would let through
   # (the per-member pattern matches `rio-proto/target/build/...`
   # generated proto code, which genhtml can't resolve against
-  # workspaceSrc).
-  ignoreRegex = "\\.cargo/registry|\\.cargo/git|/rustc/|/nix/store/.*-vendor|target/.*build";
+  # workspaceSrc). bin/spike_: VM-spike harness sources — codecov
+  # already ignores them; keep the local HTML/per-test lcov consistent.
+  ignoreRegex = "\\.cargo/registry|\\.cargo/git|/rustc/|/nix/store/.*-vendor|target/.*build|bin/spike_";
 
   # Toolchain llvm tools. rustStable is the rust-bin derivation;
   # its lib/rustlib/<target>/bin/ has llvm-profdata + llvm-cov
@@ -57,13 +58,19 @@ let
 
   # Instrumented binaries. llvm-cov needs these to read the
   # embedded coverage map (the __llvm_covfun/__llvm_covmap sections).
-  covBins = map (n: "${rio-workspace-cov}/bin/rio-${n}") [
-    "store"
-    "scheduler"
-    "gateway"
-    "builder"
-    "controller"
-    "cli"
+  # spike_mountd_client: vm-castore-fuse runs the rio-builder
+  # castore_fuse library inside this test client (its own bin/spike_*
+  # source stays codecov-ignored); without its object the library
+  # lines it covers are invisible to llvm-cov.
+  covBins = map (n: "${rio-workspace-cov}/bin/${n}") [
+    "rio-store"
+    "rio-scheduler"
+    "rio-gateway"
+    "rio-builder"
+    "rio-controller"
+    "rio-cli"
+    "rio-mountd"
+    "spike_mountd_client"
   ];
   objectFlags = lib.concatMapStringsSep " " (b: "--object ${b}") covBins;
 

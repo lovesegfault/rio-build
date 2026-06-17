@@ -491,6 +491,12 @@ pub struct RetryState {
     pub failure_count: u32,
     /// When the derivation entered the poisoned state (for TTL expiry).
     pub poisoned_at: Option<Instant>,
+    /// Builder-reported error text of the most recent failed attempt
+    /// (set by `handle_transient_failure` per attempt). When the poison
+    /// threshold trips, this — not the scheduler-synthesized "threshold
+    /// reached" summary — is what `persist_poisoned` records as
+    /// `derivations.failure_msg` (migration 073). In-memory only.
+    pub last_error: Option<String>,
     /// Earliest time this derivation may be dispatched. Set by
     /// handle_transient_failure to implement the retry backoff —
     /// the derivation is Ready and in the queue, but dispatch_ready
@@ -523,6 +529,7 @@ impl RetryState {
         self.failed_builders.clear();
         self.failure_count = 0;
         self.poisoned_at = None;
+        self.last_error = None;
     }
 }
 

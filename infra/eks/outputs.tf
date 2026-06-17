@@ -18,6 +18,11 @@ output "scheduler_iam_role_arn" {
   value       = module.rio_scheduler_irsa.arn
 }
 
+output "controller_iam_role_arn" {
+  description = "IAM role ARN for rio-controller IRSA (rds-db:connect for IAM-mode postgres; xtask passes as --set controller.serviceAccount.annotations)"
+  value       = module.rio_controller_irsa.arn
+}
+
 output "bootstrap_iam_role_arn" {
   description = "IAM role ARN for the rio-bootstrap Job IRSA (helm pre-install hook that seeds rio/* secrets in Secrets Manager)"
   value       = module.rio_bootstrap_irsa.arn
@@ -31,6 +36,14 @@ output "ecr_registry" {
 output "chunk_bucket_name" {
   description = "S3 bucket for NAR chunks (xtask passes as --set store.chunkBackend.bucket)"
   value       = aws_s3_bucket.chunks.bucket
+}
+
+output "express_buckets_json" {
+  description = "JSON map: AZ name (topology.kubernetes.io/zone value, e.g. us-east-2a) -> S3 Express directory bucket (ADR-023 cache tier). JSON-encoded string because xtask's tofu::outputs keeps string-valued outputs only. xtask deploy passes it as --set-json store.chunkBackend.expressBuckets and flips chunkBackend.kind to tiered when non-empty; \"{}\" when express_az_ids = []."
+  value = jsonencode({
+    for id in var.express_az_ids :
+    local.az_id_to_name[id] => aws_s3_directory_bucket.express_cache[id].bucket
+  })
 }
 
 output "region" {
