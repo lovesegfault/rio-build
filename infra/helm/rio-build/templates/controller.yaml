@@ -168,6 +168,13 @@ spec:
             - name: RIO_NODECLAIM_POOL__LEASE_NAMESPACE
               valueFrom:
                 fieldRef: {fieldPath: metadata.namespace}
+            # sh-028: ENABLES the gateway deletion-cost annotator
+            # (reconcilers/gateway_cost.rs). Gateway and controller
+            # share the system namespace, so the downward-API value is
+            # both "where am I" and "where the gateway pods are".
+            - name: RIO_GATEWAY_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
             {{- with $c.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

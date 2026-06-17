@@ -203,6 +203,12 @@ spec:
             k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
             k8s:app.kubernetes.io/name: rio-store
       toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
+    # gateway_cost annotator scrapes each gateway pod's :9090/metrics
+    # for `rio_gateway_connections_active` (sh-028). Same-namespace —
+    # no k8s:io.kubernetes.pod.namespace key needed.
+    - toEndpoints:
+        - matchLabels: {app.kubernetes.io/name: rio-gateway}
+      toPorts: [{ports: [{port: "9090", protocol: TCP}]}]
     # nodeclaim_pool reconciler persists HdrHistogram lead-time +
     # idle-gap sketches to PG (`nodeclaim_cell_state`, migration 059).
     # Mirrors the store-egress toCIDRSet rule (same single-sourced

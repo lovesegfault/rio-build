@@ -105,7 +105,11 @@ rules:
   # DisruptionTarget preemption watcher and node_informer's
   # run_pod_annotator stream pod events. `patch`: run_pod_annotator
   # stamps the rio.build/hw-class annotation (Patch::Merge) so the
-  # builder's downward-API → RIO_HW_CLASS feeds hw_perf_samples. Pod
+  # builder's downward-API → RIO_HW_CLASS feeds hw_perf_samples; and
+  # the gateway_cost annotator stamps
+  # controller.kubernetes.io/pod-deletion-cost on each gateway pod
+  # (sh-028 — lives here so the gateway keeps
+  # automountServiceAccountToken: false and gains no kube client). Pod
   # lifecycle itself stays the Job controller's.
   - apiGroups: [""]
     resources: [pods]
