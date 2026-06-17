@@ -42,6 +42,13 @@ pub fn describe_metrics() {
         "rio_gateway_connections_active",
         "Currently active SSH connections"
     );
+    // sh-028c: describe_gauge! registers HELP only — no value line. An
+    // idle replica scrapes ABSENT, not 0, until the first
+    // connection.rs:805 increment. Seed at 0 so the series exists from
+    // process start (this fn runs once at boot via
+    // rio_common::server::bootstrap, before any SSH accept — cannot
+    // zero a live gauge).
+    metrics::gauge!("rio_gateway_connections_active").set(0.0);
     describe_counter!(
         "rio_gateway_opcodes_total",
         "Protocol opcodes handled (labeled by opcode name)"
@@ -59,6 +66,10 @@ pub fn describe_metrics() {
         "Currently active protocol sessions (one per accepted nix-daemon exec, \
          not SSH-level open channels); the gateway autoscaling signal"
     );
+    // sh-028c sibling: same idle-absent shape; this gauge is the KEDA
+    // ScaledObject's `sum(rio_gateway_channels_active)` input — an
+    // absent series excludes the replica from the sum.
+    metrics::gauge!("rio_gateway_channels_active").set(0.0);
     describe_counter!(
         "rio_gateway_errors_total",
         "Protocol errors (labeled by type; type=session also carries \
@@ -252,6 +263,37 @@ fn seed_alert_counters() {
 #[cfg(test)]
 mod alert_seed_tests {
     use super::*;
+
+    /// sh-028c: `describe_gauge!` registers HELP only — no value line.
+    /// An idle replica's `/metrics` scrape has the gauge ABSENT, not
+    /// `0`, until the first `increment(1.0)` (connection.rs:805 /
+    /// :1544). PromQL `sum(rio_gateway_channels_active)` excludes the
+    /// replica, and the sh-009 diagnostic ("connections_active=0 with a
+    /// build still Active") cannot distinguish "0 connections" from
+    /// "metric never registered". [`describe_metrics`] MUST seed both
+    /// gauges at 0.0 so the series exists from process start (it runs
+    /// once at boot via `rio_common::server::bootstrap`, before any SSH
+    /// accept — cannot zero a live gauge).
+    #[test]
+    fn idle_gateway_metrics_has_connections_active_zero_line() {
+        let recorder = rio_test_support::metrics::CountingRecorder::default();
+        metrics::with_local_recorder(&recorder, describe_metrics);
+        assert_eq!(
+            recorder.gauge_value("rio_gateway_connections_active{}"),
+            Some(0.0),
+            "describe_metrics() must seed connections_active=0 so an idle \
+             replica scrapes a value line, not absent; gauges: {:?}",
+            recorder.gauge_names()
+        );
+        assert_eq!(
+            recorder.gauge_value("rio_gateway_channels_active{}"),
+            Some(0.0),
+            "describe_metrics() must seed channels_active=0 (the KEDA \
+             autoscaling signal — gateway-scaledobject.yaml sums it); \
+             gauges: {:?}",
+            recorder.gauge_names()
+        );
+    }
 
     /// The seeded `attempt` axis IS the emit law's value set:
     /// `(1..=PUT_PATH_ABORTED_MAX_ATTEMPTS).to_string()` — machine-
