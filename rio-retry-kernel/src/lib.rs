@@ -545,7 +545,21 @@ pub enum AttemptEvent<Id> {
     /// `failure_count`, threshold/cap/backoff) and the
     /// [`PoisonReason::Permanent`] verdict is reached only when ≥N
     /// distinct executors agree.
-    ExecutorVariant { at: AbsTime, executor: Option<Id> },
+    ///
+    /// `at_cap` (sh-031b): the cores `resource_floor` was already at
+    /// the partition-aware provisionable max when this attempt
+    /// corroborated compute-bound — the
+    /// [`PoisonReason::ComputeBoundAtCap`] arm. The cores axis is the
+    /// ONLY floor dimension an `ExecutorVariant` row carries
+    /// (`corroborated_compute_bound` is the sole witness mint on the
+    /// E3a path), so `floor_at_cap` on an executor-variant ledger row
+    /// IS the compute-bound-at-cap signal — quantifier:
+    /// census(bump_resource_floor_caller_census).
+    ExecutorVariant {
+        at: AbsTime,
+        executor: Option<Id>,
+        at_cap: bool,
+    },
     /// E3b — one of the six derivation-INTRINSIC permanent statuses
     /// (`CachedFailure`, `DependencyFailed`, `LogLimitExceeded`,
     /// `OutputRejected`, `NotDeterministic`, `InputRejected`):
@@ -738,6 +752,16 @@ pub enum PoisonReason {
     /// OR a derivation-intrinsic permanent status was observed (E3b,
     /// first-observation — no threshold).
     Permanent,
+    /// sh-031b (E3a's at-cap arm): a corroborated compute-bound
+    /// executor-variant failure (`cpu_util ≥ threshold`) at the
+    /// partition-aware provisionable cores max — the build saturated
+    /// the largest box its feature/arch partition can route to (and
+    /// that ICE has not masked away). There is nothing larger to try
+    /// and "shrink the regime" is the only remediation, so the verdict
+    /// is first-observation poison: no distinct-executor threshold
+    /// gates it (the corroboration band already proved saturation
+    /// against scheduler-owned anchors).
+    ComputeBoundAtCap,
 }
 
 /// The budget verdict for a derivation given its failure history.
@@ -974,7 +998,11 @@ fn apply<Id: Ord + Clone>(
         // No fleet-exhaust check: unlike E1, the placement exclusion is
         // the only fleet consumer of E3a's `failed_builders` insert; the
         // FleetExhausted poison stays E1/E9's.
-        AttemptEvent::ExecutorVariant { at, executor } => {
+        AttemptEvent::ExecutorVariant {
+            at,
+            executor,
+            at_cap,
+        } => {
             // live059-c: a different-class outcome is health evidence —
             // the build demonstrably ran (to a non-infra exit≠0), so
             // the consecutive-infra streak breaks (same as E1).
@@ -983,6 +1011,18 @@ fn apply<Id: Ord + Clone>(
                 c.failed_builders.insert(executor.clone());
             }
             c.failure_count += 1;
+            // r[impl sched.floor.compute-bound-provisionable]
+            // sh-031b: a corroborated compute-bound failure at the
+            // provisionable cores max is conclusive — no
+            // distinct-executor threshold gates it (the corroboration
+            // band already proved saturation; retrying at the same
+            // size is futile by construction). First-observation
+            // poison; the diagnostic naming the cap lives at the
+            // scheduler call site.
+            if *at_cap {
+                c.poisoned_at = Some(*at);
+                return Verdict::Poison(PoisonReason::ComputeBoundAtCap);
+            }
             if c.poison_threshold_reached(budget) {
                 c.poisoned_at = Some(*at);
                 return Verdict::Poison(PoisonReason::Permanent);
@@ -1456,6 +1496,7 @@ fn decide_verdict_partition_consistent<Id: Ord>(
                 && d.counters.exempt_infra_count >= budget.max_exempt_infra_retries
         }
         Verdict::Poison(PoisonReason::Permanent) => d.counters.poisoned_at.is_some(),
+        Verdict::Poison(PoisonReason::ComputeBoundAtCap) => d.counters.poisoned_at.is_some(),
         Verdict::Poison(PoisonReason::FleetExhausted) => false,
         Verdict::Cancel => d.counters.timeout_count >= budget.max_timeout_retries,
         Verdict::TtlExpire => matches!(
@@ -1799,7 +1840,11 @@ fn row_to_event<Id: Clone>(row: &LedgerRow<Id>) -> Option<AttemptEvent<Id>> {
             }
         }
         OutcomeClass::Permanent => Some(AttemptEvent::Permanent { at, executor }),
-        OutcomeClass::ExecutorVariant => Some(AttemptEvent::ExecutorVariant { at, executor }),
+        OutcomeClass::ExecutorVariant => Some(AttemptEvent::ExecutorVariant {
+            at,
+            executor,
+            at_cap: row.floor_at_cap,
+        }),
         OutcomeClass::Backstop => Some(AttemptEvent::BackstopTimeout { at, executor }),
         // First-installment disconnect rows: classification not yet
         // established; charges nothing, re-checks the threshold (E5).
@@ -3251,6 +3296,44 @@ mod tests {
             "E3b: intrinsic permanent → first-observation poison"
         );
         assert!(!d.counters.poison_threshold_reached(&budget));
+    }
+
+    // r[verify sched.floor.compute-bound-provisionable]
+    /// **sh-031b red-first (ii)** — *proposition: an executor-variant
+    /// row whose `floor_at_cap` is set (corroborated compute-bound at
+    /// the partition-aware provisionable cores max) poisons
+    /// `ComputeBoundAtCap` immediately — no distinct-executor threshold
+    /// gates it.* RED at base: `AttemptEvent::ExecutorVariant` carried
+    /// no `at_cap`; the fold returned `Requeue` (count=1, below the
+    /// transient cap and below the threshold) and the drv requeued at
+    /// the same size forever.
+    #[test]
+    fn compute_bound_at_cap_poisons_not_requeues() {
+        let budget = Budget::default();
+        // Try-1 promoted (jump-to-max), try-2 at_cap.
+        let h = [
+            LedgerRow {
+                floor_promoted: true,
+                ..build_row(OutcomeClass::ExecutorVariant, Some("e1"), 100)
+            },
+            LedgerRow {
+                floor_at_cap: true,
+                ..build_row(OutcomeClass::ExecutorVariant, Some("e2"), 200)
+            },
+        ];
+        let d = decide(&h, &budget, 1000);
+        assert_eq!(
+            d.verdict,
+            Verdict::Poison(PoisonReason::ComputeBoundAtCap),
+            "compute-bound at the provisionable max is conclusive — \
+             first-observation poison; the threshold (3 distinct) does \
+             not gate it"
+        );
+        assert_eq!(d.counters.poisoned_at, Some(200));
+        // Non-at_cap executor-variant rows still requeue (the threshold
+        // gates them); the new arm fires only on the at_cap bit.
+        let h = [build_row(OutcomeClass::ExecutorVariant, Some("e1"), 100)];
+        assert_eq!(decide(&h, &budget, 1000).verdict, Verdict::Requeue);
     }
 
     /// The materialization budget: N materialization_infra rows since
