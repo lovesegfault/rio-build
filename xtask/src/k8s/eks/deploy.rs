@@ -206,49 +206,43 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     // Subchart symlink (same requirement as dev apply).
     ui::step("chart deps", crate::k8s::shared::chart_deps).await?;
 
-    // NLB annotations (previously a --set-json one-liner in bash).
-    // target-type:instance — Cilium cluster-pool overlay IPs (fd42::)
-    // are NOT VPC-routable, so target-type:ip can't reach pods. NLB
-    // targets node IPs at the NodePort; Cilium's eBPF kube-proxy
-    // replacement handles node→pod. externalTrafficPolicy:Local in
-    // gateway.yaml means only nodes hosting a gateway pod pass NLB
-    // health checks (others are correctly unhealthy, not a bug).
-    // --public-cidr flips internal→internet-facing AND sets
-    // loadBalancerSourceRanges (the controller writes NLB SG ingress
-    // rules). NLB scheme is immutable, so a flip recreates the LB.
-    let scheme = if opts.public_cidrs.is_empty() {
-        "internal"
+    // --public-cidr flips internal→internet-facing (immutable — a flip
+    // recreates the NLB) and sets loadBalancerSourceRanges. ip-type
+    // follows scheme: internal-elb private subnets are v6-only, so a
+    // dualstack internal NLB can't get its per-subnet IPv4 and nothing
+    // internal needs v4; the `elb` public subnets have v4, so
+    // internet-facing stays dualstack for IPv4 clients.
+    let (scheme, ip_addr_type) = if opts.public_cidrs.is_empty() {
+        ("internal", "ipv6")
     } else {
-        "internet-facing"
+        ("internet-facing", "dualstack")
     };
     let mut nlb_ann = json!({
         "service.beta.kubernetes.io/aws-load-balancer-type": "external",
+        // instance, not ip: Cilium overlay pod IPs (fd42::) aren't
+        // VPC-routable. externalTrafficPolicy:Local (gateway.yaml)
+        // means non-gateway nodes are correctly unhealthy.
         "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type": "instance",
         "service.beta.kubernetes.io/aws-load-balancer-scheme": scheme,
-        // dualstack: cluster is IPv6-only (no IPv4 Service CIDR), so
-        // ip-address-type=ipv4 fails with "unsupported IPv6 config".
-        // dualstack with target-type=instance needs the instances to
-        // have a PRIMARY IPv6 — set by the primary-ipv6-init systemd
-        // oneshot baked into the NixOS AMI (eks-node.nix); system
-        // nodes are excluded from external LBs (main.tf).
-        "service.beta.kubernetes.io/aws-load-balancer-ip-address-type": "dualstack",
-        // dualstack listener + ipv6-only TG: IPv4 clients need the NLB
-        // to source-NAT to an IPv6 prefix it owns. Without this the NLB
-        // RSTs every IPv4 connection (no v6 source to forward with).
-        // aws-lbc reconciles this via SetSubnets; prefixes auto-assign.
-        "service.beta.kubernetes.io/aws-load-balancer-enable-prefix-for-ipv6-source-nat": "on",
+        // instance targets + v6 listener need a PRIMARY IPv6 on each
+        // node (primary-ipv6-init oneshot in the AMI; system nodes
+        // excluded from external LBs in main.tf).
+        "service.beta.kubernetes.io/aws-load-balancer-ip-address-type": ip_addr_type,
         "service.beta.kubernetes.io/aws-load-balancer-attributes": "load_balancing.cross_zone.enabled=true",
-        // preserve_client_ip OFF: with the instance-target default (on),
-        // intra-VPC clients that are themselves registered targets hit
-        // NLB hairpin RST, and the IPv6-source-NAT path above can't
-        // engage. Source IP is already lost at Cilium
-        // (loadBalancer.mode=snat, addons.tf) and rio-gateway doesn't
-        // consume it.
+        // OFF: the default (on) hairpins intra-VPC clients that are
+        // themselves targets and defeats v6 source-NAT; Cilium SNAT
+        // already drops the source IP and rio-gateway doesn't read it.
         "service.beta.kubernetes.io/aws-load-balancer-target-group-attributes": "preserve_client_ip.enabled=false",
         "service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-22": "tcp.idle_timeout.seconds=3600",
     });
-    // external-dns (dns.tf) reconciles this annotation → DNS record.
-    // Absent when gateway_dns is disabled or the state predates it.
+    // dualstack-only (aws-lbc rejects on ipv6): source-NAT IPv4
+    // connections to an NLB-owned v6 prefix so they reach the v6-only
+    // TG instead of being RST'd.
+    if ip_addr_type == "dualstack" {
+        nlb_ann["service.beta.kubernetes.io/aws-load-balancer-enable-prefix-for-ipv6-source-nat"] =
+            json!("on");
+    }
+    // external-dns (dns.tf) reconciles this into a DNS record.
     if let Some(fqdn) = &gateway_dns_fqdn {
         nlb_ann["external-dns.alpha.kubernetes.io/hostname"] = json!(fqdn);
     }
