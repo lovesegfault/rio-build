@@ -66,12 +66,19 @@ fn affinity_map(actor: &DagActor) -> BTreeMap<String, Vec<rio_proto::types::Node
         .collect()
 }
 
-/// One housekeeping refresh cycle: `maybe_refresh_estimator` early-
-/// returns on 5/6 ticks; six calls guarantees exactly one refresh.
+/// One refresh cycle. sh-018b: `maybe_refresh_estimator` no longer
+/// calls `refresh()` (the body lives in `estimator_poller` off the
+/// actor turn), so this drives `refresh()` directly — the same
+/// `(&self.db, &self.sla_tiers, on_fit_evicted)` arguments the on-actor
+/// path used — then `full_sweep` for the priority recompute. All
+/// borrows immutable/disjoint; deref-coerces through `Arc`.
 async fn refresh_cycle(actor: &mut DagActor) {
-    for _ in 0..6 {
-        actor.maybe_refresh_estimator().await;
-    }
+    actor
+        .sla_estimator
+        .refresh(&actor.db, &actor.sla_tiers, |k| actor.on_fit_evicted(k))
+        .await
+        .unwrap();
+    crate::critical_path::full_sweep(&mut actor.dag, &actor.sla_estimator, &actor.builds);
 }
 
 /// **Selector stability** (`r[sched.sla.hw-class.epsilon-explore+6]`):

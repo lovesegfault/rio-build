@@ -7,6 +7,43 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tracing_test::traced_test;
 
+/// sh-018b structural red-first: `maybe_refresh_estimator` (phase-00)
+/// MUST NOT call `SlaEstimator::refresh()` on the actor turn — the
+/// refresh body lives in `estimator_poller`. Count-based, not
+/// wall-clock (`ci-failure-patterns.md` "Wall-clock gate under load →
+/// prefer (c)"). RED at base a008959a2: the on-actor `refresh()` call
+/// at `housekeeping.rs:154-163` bumps `refresh_calls` on the 6th tick.
+///
+/// Secondary: `full_sweep` STILL runs on cadence — a sentinel priority
+/// is overwritten by the sweep's recompute (the leaf falls back to
+/// `DEFAULT_DURATION_SECS` with no fit; any value ≠ 999.0 proves the
+/// sweep fired).
+#[tokio::test]
+async fn phase00_never_calls_refresh_on_actor() {
+    use std::sync::atomic::Ordering;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+
+    actor.test_inject_ready("h", None, "x86_64-linux", false);
+    actor.dag.node_mut("h").unwrap().sched.priority = 999.0;
+
+    let before = actor.sla_estimator.refresh_calls.load(Ordering::Relaxed);
+    for _ in 0..6 {
+        actor.maybe_refresh_estimator().await;
+    }
+    assert_eq!(
+        actor.sla_estimator.refresh_calls.load(Ordering::Relaxed),
+        before,
+        "refresh() ran on the actor turn — phase-00 still blocks the mailbox",
+    );
+    assert_ne!(
+        actor.dag.node("h").unwrap().sched.priority,
+        999.0,
+        "full_sweep no longer runs on the 60s cadence",
+    );
+}
+
 /// Regression for bug_032: `DerivationState.interested_builds` is a
 /// `HashSet<Uuid>` (RandomState); the flusher uses `.first()` on the vec
 /// returned here to pick the S3-key build_id. Before the fix this was

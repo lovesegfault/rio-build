@@ -156,19 +156,19 @@ let
     import time
 
     def wait_estimator_tick() -> None:
-        # ESTIMATOR_REFRESH_EVERY=6 ticks x tickIntervalSecs=2 = 12s
-        # cadence. housekeeping.rs:85-87 increments refit_total BEFORE
-        # awaiting refresh(), so +1 only proves a refresh STARTED; +2
-        # proves the prior refresh COMPLETED (when counter reads
-        # base+2, refresh base+1 has returned). awk seeds hit=0 so a
-        # not-yet-emitted counter (no refit since boot) FAILS the gate
-        # instead of default-exit-0 passing vacuously.
+        # sh-018b: estimator_poller (cfg.tick_interval x 6 = 12s here)
+        # increments refit_total AFTER refresh() returns Ok, so +1 =
+        # one refresh COMPLETED (was: +1 STARTED, +2 prior COMPLETED
+        # when the increment sat before the await on the actor). awk
+        # seeds hit=0 so a not-yet-emitted counter (no refit since
+        # boot) FAILS the gate instead of default-exit-0 passing
+        # vacuously.
         base = metric_value(scrape_metrics(${gatewayHost}, 9091),
             "rio_scheduler_sla_refit_total") or 0.0
         ${gatewayHost}.wait_until_succeeds(
             "curl -fsS localhost:9091/metrics | "
             f"awk 'BEGIN{{hit=0}} /^rio_scheduler_sla_refit_total / "
-            f"{{hit=($2>{base+1})}} END{{exit !hit}}'",
+            f"{{hit=($2>{base})}} END{{exit !hit}}'",
             timeout=45,
         )
 
