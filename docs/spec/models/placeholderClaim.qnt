@@ -31,7 +31,17 @@
 //     wedged transfers (environment choice), the budget park (phase
 //     stamped BEFORE the semaphore acquire — a >STALL_WINDOW park
 //     freezes progress with liveness fresh and phase exempt), the
-//     persist phase, completion, and death.
+//     persist phase, completion, death, and CANCELLATION (sh-023):
+//     `ownerCancelled` is the in-process future-drop (tonic RST_STREAM
+//     → handler future dropped). Distinct from `ownerDies` (kill -9):
+//     a cancelled owner's PlaceholderGuard::drop runs and reaps the
+//     row IFF the guard was armed (`guardArmed`). Post-sh-023 the
+//     guard is pre-armed inside `claim_placeholder` BEFORE any SQL, so
+//     `init` sets `guardArmed = true` and `noUnguardedOrphan` is
+//     vacuously held in every main-regime trace; the
+//     placeholderCalibSh023PreArmGap calibration starts unguarded
+//     (the +2-era caller-side spawn) and falsifies it on
+//     `init → ownerCancelled`.
 //
 // WHAT THE PREDICATE DOES AND DOES NOT PROMISE (the holds match the
 // code's real guarantees — no more, no less):
@@ -90,6 +100,9 @@ module placeholderClaim {
   var time: int
   var ownerAlive: bool
   var claimed: bool              // the placeholder claim row is held
+  var guardArmed: bool           // sh-023: the PlaceholderGuard is constructed
+                                 // (drop-reap fires on ownerCancelled iff true).
+                                 // Post-fix: pre-armed in init, before any SQL.
   var phase: Phase               // durable claim_phase (meaningful while claimed)
   var bytes: int                 // real fetched bytes (owner-side truth)
   var hbBytes: int               // durable fetched_bytes (as of last heartbeat)
@@ -125,6 +138,12 @@ module placeholderClaim {
     time' = 0,
     ownerAlive' = true,
     claimed' = true,
+    // sh-023 (r[store.put.drop-cleanup+3]): the guard is pre-armed
+    // INSIDE claim_placeholder, BEFORE the placeholder INSERT — the
+    // post-fix invariant baked into init. The pre-fix (caller-side
+    // spawn AFTER claim_placeholder returned) is the calibration's
+    // calibInit, which starts guardArmed = false.
+    guardArmed' = true,
     phase' = Downloading,
     bytes' = 0,
     hbBytes' = 0,
@@ -155,8 +174,8 @@ module placeholderClaim {
       hbBytes' = if (hbDue) bytes else hbBytes,
       lastHbAt' = if (hbDue) time + 1 else lastHbAt,
     },
-    ownerAlive' = ownerAlive, claimed' = claimed, phase' = phase,
-    bytes' = bytes, lastAdvanceAt' = lastAdvanceAt,
+    ownerAlive' = ownerAlive, claimed' = claimed, guardArmed' = guardArmed,
+    phase' = phase, bytes' = bytes, lastAdvanceAt' = lastAdvanceAt,
     deposedExemptPhase' = deposedExemptPhase,
     deposedSteadyAdvancer' = deposedSteadyAdvancer,
     strikedLivenessStale' = strikedLivenessStale,
@@ -169,7 +188,8 @@ module placeholderClaim {
     ownerAlive, claimed, phase == Downloading, bytes < NAR_SIZE,
     bytes' = bytes + 1,
     lastAdvanceAt' = time,
-    time' = time, ownerAlive' = ownerAlive, claimed' = claimed, phase' = phase,
+    time' = time, ownerAlive' = ownerAlive, claimed' = claimed,
+    guardArmed' = guardArmed, phase' = phase,
     hbBytes' = hbBytes, lastProgressAt' = lastProgressAt, updatedAt' = updatedAt,
     lastHbAt' = lastHbAt, deposedExemptPhase' = deposedExemptPhase,
     deposedSteadyAdvancer' = deposedSteadyAdvancer,
@@ -183,7 +203,8 @@ module placeholderClaim {
   action park = all {
     ownerAlive, claimed, phase == Downloading,
     phase' = BudgetParked,
-    time' = time, ownerAlive' = ownerAlive, claimed' = claimed, bytes' = bytes,
+    time' = time, ownerAlive' = ownerAlive, claimed' = claimed,
+    guardArmed' = guardArmed, bytes' = bytes,
     hbBytes' = hbBytes, lastProgressAt' = lastProgressAt, updatedAt' = updatedAt,
     lastHbAt' = lastHbAt, lastAdvanceAt' = lastAdvanceAt,
     deposedExemptPhase' = deposedExemptPhase,
@@ -195,7 +216,8 @@ module placeholderClaim {
   action unpark = all {
     ownerAlive, claimed, phase == BudgetParked,
     phase' = Downloading,
-    time' = time, ownerAlive' = ownerAlive, claimed' = claimed, bytes' = bytes,
+    time' = time, ownerAlive' = ownerAlive, claimed' = claimed,
+    guardArmed' = guardArmed, bytes' = bytes,
     hbBytes' = hbBytes, lastProgressAt' = lastProgressAt, updatedAt' = updatedAt,
     lastHbAt' = lastHbAt, lastAdvanceAt' = lastAdvanceAt,
     deposedExemptPhase' = deposedExemptPhase,
@@ -208,7 +230,8 @@ module placeholderClaim {
   action startPersist = all {
     ownerAlive, claimed, phase == Downloading, bytes == NAR_SIZE,
     phase' = Persisting,
-    time' = time, ownerAlive' = ownerAlive, claimed' = claimed, bytes' = bytes,
+    time' = time, ownerAlive' = ownerAlive, claimed' = claimed,
+    guardArmed' = guardArmed, bytes' = bytes,
     hbBytes' = hbBytes, lastProgressAt' = lastProgressAt, updatedAt' = updatedAt,
     lastHbAt' = lastHbAt, lastAdvanceAt' = lastAdvanceAt,
     deposedExemptPhase' = deposedExemptPhase,
@@ -220,7 +243,8 @@ module placeholderClaim {
   action complete = all {
     ownerAlive, claimed, phase == Persisting,
     claimed' = false,
-    time' = time, ownerAlive' = ownerAlive, phase' = phase, bytes' = bytes,
+    time' = time, ownerAlive' = ownerAlive, guardArmed' = guardArmed,
+    phase' = phase, bytes' = bytes,
     hbBytes' = hbBytes, lastProgressAt' = lastProgressAt, updatedAt' = updatedAt,
     lastHbAt' = lastHbAt, lastAdvanceAt' = lastAdvanceAt,
     deposedExemptPhase' = deposedExemptPhase,
@@ -232,7 +256,28 @@ module placeholderClaim {
   action ownerDies = all {
     ownerAlive,
     ownerAlive' = false,
-    time' = time, claimed' = claimed, phase' = phase, bytes' = bytes,
+    time' = time, claimed' = claimed, guardArmed' = guardArmed,
+    phase' = phase, bytes' = bytes,
+    hbBytes' = hbBytes, lastProgressAt' = lastProgressAt, updatedAt' = updatedAt,
+    lastHbAt' = lastHbAt, lastAdvanceAt' = lastAdvanceAt,
+    deposedExemptPhase' = deposedExemptPhase,
+    deposedSteadyAdvancer' = deposedSteadyAdvancer,
+    strikedLivenessStale' = strikedLivenessStale,
+    sawTakeover' = sawTakeover, sawDeadReap' = sawDeadReap,
+  }
+
+  // sh-023: in-process CANCELLATION (handler future dropped — gateway
+  // broken-pipe → JoinSet abort → tonic RST_STREAM). Distinct from
+  // ownerDies (kill -9, no Drop runs): the PlaceholderGuard's Drop
+  // DOES run, and reaps the row IFF the guard was armed. Post-fix the
+  // guard is pre-armed (guardArmed = true from init), so cancellation
+  // ALWAYS reaps; the +2-era unguarded gap is the calibration regime.
+  // Mirrors: rio-store/src/ingest.rs PlaceholderGuard::drop
+  action ownerCancelled = all {
+    ownerAlive,
+    ownerAlive' = false,
+    claimed' = if (guardArmed) false else claimed,
+    time' = time, guardArmed' = guardArmed, phase' = phase, bytes' = bytes,
     hbBytes' = hbBytes, lastProgressAt' = lastProgressAt, updatedAt' = updatedAt,
     lastHbAt' = lastHbAt, lastAdvanceAt' = lastAdvanceAt,
     deposedExemptPhase' = deposedExemptPhase,
@@ -257,7 +302,8 @@ module placeholderClaim {
         and lastAdvanceAt >= time - HEARTBEAT_EVERY
         and lastProgressAt >= time - 2 * HEARTBEAT_EVERY)),
     strikedLivenessStale' = (strikedLivenessStale or not(livenessFresh(time))),
-    time' = time, ownerAlive' = ownerAlive, phase' = phase, bytes' = bytes,
+    time' = time, ownerAlive' = ownerAlive, guardArmed' = guardArmed,
+    phase' = phase, bytes' = bytes,
     hbBytes' = hbBytes, lastProgressAt' = lastProgressAt, updatedAt' = updatedAt,
     lastHbAt' = lastHbAt, lastAdvanceAt' = lastAdvanceAt,
     sawDeadReap' = sawDeadReap,
@@ -268,7 +314,8 @@ module placeholderClaim {
     claimed, livenessReapStale(time),
     claimed' = false,
     sawDeadReap' = (sawDeadReap or not(ownerAlive)),
-    time' = time, ownerAlive' = ownerAlive, phase' = phase, bytes' = bytes,
+    time' = time, ownerAlive' = ownerAlive, guardArmed' = guardArmed,
+    phase' = phase, bytes' = bytes,
     hbBytes' = hbBytes, lastProgressAt' = lastProgressAt, updatedAt' = updatedAt,
     lastHbAt' = lastHbAt, lastAdvanceAt' = lastAdvanceAt,
     deposedExemptPhase' = deposedExemptPhase,
@@ -278,7 +325,7 @@ module placeholderClaim {
 
   action step = any {
     tick, advance, park, unpark, startPersist, complete,
-    ownerDies, stallTakeover, reap,
+    ownerDies, ownerCancelled, stallTakeover, reap,
   }
 
   // --- invariants (holds) --------------------------------------------------------
@@ -298,6 +345,13 @@ module placeholderClaim {
     bytes >= 0, bytes <= NAR_SIZE,
     hbBytes >= 0, hbBytes <= bytes,
   }
+  // sh-023: a cancelled owner never leaves an unguarded orphan row.
+  // VACUOUS in every main-regime trace (guardArmed is true from init
+  // and no action clears it — the post-fix invariant baked in); the
+  // calibration regime starts guardArmed = false and falsifies on
+  // init → ownerCancelled. Not wired to quint-placeholder-claim-main
+  // for that reason — only the calibration witness check matters.
+  val noUnguardedOrphan = not(claimed and not(ownerAlive) and not(guardArmed))
 
   // --- witnesses (negated reachability; wired expect-violation) -------------------
   // The intended takeover IS reachable: an alive-but-wedged downloader

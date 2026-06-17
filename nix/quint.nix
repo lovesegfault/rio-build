@@ -4126,6 +4126,28 @@ rec {
       witness = "deadOwnerReapedW";
     };
 
+    # sh-023 calibration pin (store.put.drop-cleanup+3): the +2-era
+    # caller-side guard spawn left an unguarded window between
+    # `claim_placeholder` returning `Owned` and the caller arming the
+    # guard. The model's main regime PRE-ARMS the guard in init (the
+    # post-fix invariant baked in), so `noUnguardedOrphan` is held
+    # vacuously there and is NOT wired to quint-placeholder-claim-main.
+    # This calibration starts unguarded and falsifies on the one-step
+    # trace `calibInit -> ownerCancelled` (the sh-023 leak: claimed,
+    # owner gone, no drop-reap fired). If it ever stops falsifying,
+    # the model has drifted away from the cancel-mid-claim level it
+    # documents.
+    # r[verify store.put.drop-cleanup+3]
+    quint-placeholder-claim-calib-sh023-prearm-gap = mkQuintWitnessCheck {
+      name = "placeholder-claim-calib-sh023-prearm-gap";
+      spec = "calibration/placeholder-calib-sh023-prearm-gap";
+      main = "placeholderCalibSh023PreArmGap";
+      init = "calibInit";
+      step = "calibStep";
+      witness = "noUnguardedOrphan";
+      extraSpecs = [ "placeholderClaim" ];
+    };
+
     # ── gcCollectState: the collect cycle's COMMIT BASIS law
     # (bughunt-2 slot 7, bug_226; DurableObservation/CycleCommit in
     # collect.rs). Standalone on purpose: the basis law is a per-commit

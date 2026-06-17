@@ -553,7 +553,7 @@ impl Drop for PlaceholderGuard {
 ///
 /// Shared by `PutPath` and `Substituter::try_upstream`; both run inline
 /// in a request handler future and so share the same drop hazard.
-/// sh-023: production code reaches this ONLY via [`claim_placeholder`]
+/// sh-023: production code reaches this only via [`claim_placeholder`]
 /// (the guard is pre-armed there with the lifted `claim_id`); tests
 /// call it directly to drive the heartbeat/gauge battery.
 // r[impl store.substitute.progress-heartbeat]
