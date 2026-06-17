@@ -101,6 +101,9 @@
     "103_gc_holds_and_tombstones",
     "104_gc_holds_restrict",
     "105_executor_variant_outcome_class",
-    "106_floor_cores"
+    "106_floor_cores",
+    "107_materialization_jobs_priority",
+    "108_materialization_jobs_priority_idx",
+    "109_materialization_jobs_drop_old_idx"
   ]
 }
