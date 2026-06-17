@@ -5024,6 +5024,32 @@ impl DagActor {
                 )
                 .await;
             }
+            crate::retry_policy::Verdict::Poison(
+                crate::retry_policy::PoisonReason::ComputeBoundAtCap,
+            ) => {
+                // sh-031b: corroborated compute-bound at the
+                // partition-aware provisionable max — there is nothing
+                // larger to dispatch. The diagnostic names the cap (=
+                // floor.cores after the at-cap heal) so the operator
+                // sees WHICH ceiling was hit; the worker's exit≠0
+                // message follows.
+                let prov_max = self
+                    .dag
+                    .node(drv_hash)
+                    .map(|s| s.sched.resource_floor.cores)
+                    .unwrap_or(0);
+                self.poison_already_recorded(
+                    drv_hash,
+                    &format!(
+                        "compute-bound model exceeds the provisionable \
+                         catalog max ({prov_max}c) — shrink the regime: {}",
+                        report.error_msg
+                    ),
+                    report.final_line_count,
+                    rio_proto::VerdictBacking::FreshExecution,
+                )
+                .await;
+            }
             crate::retry_policy::Verdict::Poison(_) => {
                 // PoisonReason::Permanent — ≥N distinct executors agreed.
                 // The worker's error_msg IS the user-facing reason here
