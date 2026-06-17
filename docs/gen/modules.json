@@ -1178,7 +1178,7 @@
     {
       "path": "db/batch.rs",
       "depth": 1,
-      "doc": "Batch operations for `persist_merge_to_db` — build-derivation mapping + UNNEST-based bulk inserts."
+      "doc": "Batch operations for `persist_merge_to_db` — build-derivation mapping + `COPY`-streamed bulk inserts."
     },
     {
       "path": "db/builds.rs",
