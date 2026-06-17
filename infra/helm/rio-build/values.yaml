@@ -316,8 +316,12 @@ store:
     # overscale-biased (owner default Q7 2026-06-03) — more store pods
     # minutes earlier on post-wipe waves — until the post-wipe
     # warm-phase capture (deployment checklist P10) re-derives it.
+    # Re-seeded 250 after sh-007c S5/S6 (phase-17 + report-batch): the
+    # actor's substitution drain rate ~tripled, so per-replica job
+    # capacity rises proportionally. iter4's 7485-job burst at 250 →
+    # ~30 replicas (was 88 at 85, capped at the 46 hostable ceiling).
     # Render-time unit check: rio.promTrigger × files/metric-units.json.
-    targetBacklogJobsPerReplica: 85
+    targetBacklogJobsPerReplica: 250
     # Desired replicas (builder trigger) =
     # ceil(sum(rio_scheduler_open_attempts) / this). Seeded from the
     # ComponentScaler's seedRatio (50; its learned value converged
