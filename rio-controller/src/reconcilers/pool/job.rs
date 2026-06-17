@@ -230,7 +230,7 @@ pub(super) fn job_census(jobs: &[Job]) -> JobCensus {
 /// serving flip) is covered by the live-pod recheck
 /// ([`any_live_running_pod`]) and the delete chokepoint's attempt
 /// veto. This is the reap-safety boundary for
-/// `r[ctrl.ephemeral.reap-excess-pending+3]`.
+/// `r[ctrl.ephemeral.reap-excess-pending+4]`.
 ///
 /// `None` status (Job controller hasn't reconciled yet → pod not
 /// created) is treated as Pending. That's the safe direction: a Job
@@ -400,7 +400,7 @@ fn covered_by_open_pull_attempt(
 /// NOTE: this is age-from-**creation**. A cold-start Job that takes
 /// 50s for Karpenter to provision a node is past this grace the moment
 /// its pod starts — that's the case [`any_live_running_pod`] covers.
-// r[impl ctrl.ephemeral.reap-excess-pending+3]
+// r[impl ctrl.ephemeral.reap-excess-pending+4]
 pub(super) const REAP_PENDING_GRACE: Duration = Duration::from_secs(10);
 
 /// Live (non-informer) check: any pod of `job_name` in `phase==Running`?
@@ -424,7 +424,7 @@ async fn any_live_running_pod(pods_api: &Api<Pod>, job_name: &str) -> kube::Resu
 }
 
 /// Pending Jobs in excess of `queued`, oldest-first — RESIDUAL
-/// fallback for `r[ctrl.ephemeral.reap-excess-pending+3]` after
+/// fallback for `r[ctrl.ephemeral.reap-excess-pending+4]` after
 /// `reap_stale_for_intents`' orphan-pending arm has already reaped by
 /// intent-membership.
 ///
@@ -457,9 +457,25 @@ async fn any_live_running_pod(pods_api: &Api<Pod>, job_name: &str) -> kube::Resu
 /// filter a younger reaped orphan still counts toward `pending`, the
 /// oldest-first sort then deletes a still-WANTED Job — exactly what
 /// the orphan-first reap exists to prevent (see `jobs.rs` callsite).
+///
+/// `open_attempts` (sh-037): the same `ListOpenAttempts` view the
+/// delete chokepoint consumes, hoisted to BEFORE selection. A Pending
+/// Job whose INTENT has an open pull-mode attempt — from any pod,
+/// intent-id-only match — is structurally not-excess regardless of
+/// `JobStatus.ready`: the drv is in flight, and `queued` (Ready-set
+/// only) carries no in-flight term, so on a wide pull burst
+/// `pending.len() − queued` over-selects every just-pulled Job whose
+/// `ready==0` lags. The orphan selector already negates the same
+/// predicate; the per-Job [`any_live_running_pod`] backstop covers
+/// the ≤ [`ATTEMPTS_VIEW_FRESHNESS`] sliver where the pod is Running
+/// but the attempt mint hasn't surfaced. Inverse bounded by
+/// `backoffLimit=0`: a pulled-then-crashed pod takes the Job terminal
+/// → `StaleTerminal` closes the row; a never-pulled Pending Job has
+/// no covering row.
 pub(super) fn select_excess_pending<'a>(
     jobs: &'a [Job],
     reaped: &HashSet<String>,
+    open_attempts: &[rio_proto::types::OpenAttempt],
     queued: u32,
     min_age: Duration,
 ) -> Vec<&'a Job> {
@@ -468,6 +484,7 @@ pub(super) fn select_excess_pending<'a>(
         .filter(|j| {
             is_pending_job(j)
                 && job_older_than(j, min_age)
+                && !covered_by_open_pull_attempt(j, open_attempts)
                 && !j
                     .metadata
                     .name
@@ -486,7 +503,7 @@ pub(super) fn select_excess_pending<'a>(
     pending
 }
 
-// r[impl ctrl.ephemeral.reap-excess-pending+3]
+// r[impl ctrl.ephemeral.reap-excess-pending+4]
 /// Delete Pending Jobs in excess of `queued`. Shared by the
 /// builder and fetcher pool reconcilers (both had the spawn-only
 /// pattern before I-183; both now reap).
@@ -528,23 +545,71 @@ pub(super) async fn reap_excess_pending(
         );
         return 0;
     };
-    let excess = select_excess_pending(jobs, reaped, queued, REAP_PENDING_GRACE);
-    if excess.is_empty() {
+    // sh-037: cheap pre-gate (zero-RPC hot path). The fetch below now
+    // runs whenever `pending_count > queued` instead of only after a
+    // post-selection non-empty check — at most one extra
+    // `ListOpenAttempts` per pool per burst tick (the pre-gate keeps
+    // the older_than/reaped conjuncts so the zero-RPC envelope
+    // matches base exactly).
+    let pending_count = jobs
+        .iter()
+        .filter(|j| {
+            is_pending_job(j)
+                && job_older_than(j, REAP_PENDING_GRACE)
+                && !j
+                    .metadata
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| reaped.contains(n))
+        })
+        .count();
+    if pending_count <= queued as usize {
         return 0;
     }
-    // One view read per tick-with-deletions (never per Job) for the
-    // synthesize-on-delete arm (this path consumes only the open
-    // half; the death classification consuming `recently_closed` is
-    // the terminal reap's, in `reap_stale_for_intents`).
-    // merged_bug_022: a FAILED read defers the whole wave — an empty
-    // view born from an error must never adjudicate deletes.
+    // One view read per tick-with-candidates (never per Job), HOISTED
+    // to before selection (sh-037): the open half feeds the
+    // attempt-coverage filter (a Pending Job whose intent has an open
+    // pull-mode attempt is structurally not-excess — the drv is in
+    // flight; `queued` carries no in-flight term so on a wide pull
+    // burst `pending − queued` over-selects every just-pulled Job
+    // whose informer-cached `ready==0` lags). The death
+    // classification consuming `recently_closed` is the terminal
+    // reap's, in `reap_stale_for_intents`. merged_bug_022: a FAILED
+    // read defers the whole wave — an empty view born from an error
+    // must never adjudicate deletes (sh-037 measured 599 thrash-reaped
+    // attempts at `queued=0`).
     let mut attempts_view = match AttemptsViewWitness::fetch(ctx, pool).await {
         AttemptsFetch::Fetched(w) => AttemptsPair::at_selection(w),
         AttemptsFetch::FetchFailed => return 0,
     };
+    let excess = select_excess_pending(
+        jobs,
+        reaped,
+        attempts_view.freshest().attempts(),
+        queued,
+        REAP_PENDING_GRACE,
+    );
+    if excess.is_empty() {
+        return 0;
+    }
     let mut reaped = 0u32;
     for job in excess {
         let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
+        let uid = job.metadata.uid.as_deref();
+        // sh-037 sticky guard: a live-Running observation (or a
+        // fresh-attempt veto at the chokepoint below) is sticky for
+        // [`super::jobs::STRIKE_WALL_FLOOR`] of wall clock — Job
+        // event bursts deliver re-reconciles milliseconds apart
+        // (`m0gz0cn814dw`: skipped at 22:17:31.954, reaped 104 ms
+        // later), and a one-shot `continue` records nothing.
+        if uid.is_some_and(|u| super::jobs::live_strike_recent(key, u)) {
+            debug!(
+                pool, job = %job_name,
+                "skipping reap: live-Running observation within the \
+                 wall floor (sh-037 sticky guard)"
+            );
+            continue;
+        }
         // Live phase re-check: `select_excess_pending` keys on the
         // informer-cached `JobStatus.ready==0`, which lags
         // `Pod.status.phase` by kubelet→Job-controller→informer. After
@@ -554,6 +619,9 @@ pub(super) async fn reap_excess_pending(
         // tick's snapshot will see `ready>0`.
         match any_live_running_pod(pods_api, job_name).await {
             Ok(true) => {
+                if let Some(u) = uid {
+                    super::jobs::note_live_strike(key, u);
+                }
                 debug!(
                     pool, job = %job_name,
                     "skipping reap: pod is live Running (informer-cached Job.status.ready lags)"
@@ -590,6 +658,9 @@ pub(super) async fn reap_excess_pending(
         .await
         {
             Ok(SynthesizedDelete::Deferred { fresh_attempt }) => {
+                if let Some(u) = uid {
+                    super::jobs::note_live_strike(key, u);
+                }
                 info!(
                     pool, job = %job_name, fresh_attempt,
                     "excess-Pending reap deferred on attempt evidence (live_051(e))"
@@ -3256,7 +3327,7 @@ mod tests {
 
     const NO_GRACE: Duration = Duration::ZERO;
 
-    // r[verify ctrl.ephemeral.reap-excess-pending+3]
+    // r[verify ctrl.ephemeral.reap-excess-pending+4]
     /// I-183 scenario A: 3 Pending Jobs for class=medium, queued=1 →
     /// reap the 2 oldest, keep the 1 newest. The newest is closest to
     /// scheduling; the oldest has waited longest for a node Karpenter
@@ -3269,7 +3340,7 @@ mod tests {
             job_with("med-old", Some(0), Some(0), 120),
         ];
         let none = HashSet::new();
-        let excess = select_excess_pending(&jobs, &none, 1, NO_GRACE);
+        let excess = select_excess_pending(&jobs, &none, &[], 1, NO_GRACE);
         let names: Vec<_> = excess.iter().map(|j| j.name_any()).collect();
         assert_eq!(
             names,
@@ -3277,13 +3348,16 @@ mod tests {
             "deletes 2 oldest, keeps 1 newest"
         );
         // queued >= pending → nothing to reap.
-        assert!(select_excess_pending(&jobs, &none, 3, NO_GRACE).is_empty());
-        assert!(select_excess_pending(&jobs, &none, 5, NO_GRACE).is_empty());
+        assert!(select_excess_pending(&jobs, &none, &[], 3, NO_GRACE).is_empty());
+        assert!(select_excess_pending(&jobs, &none, &[], 5, NO_GRACE).is_empty());
         // queued=0 → reap all pending.
-        assert_eq!(select_excess_pending(&jobs, &none, 0, NO_GRACE).len(), 3);
+        assert_eq!(
+            select_excess_pending(&jobs, &none, &[], 0, NO_GRACE).len(),
+            3
+        );
     }
 
-    // r[verify ctrl.ephemeral.reap-excess-pending+3]
+    // r[verify ctrl.ephemeral.reap-excess-pending+4]
     /// I-183 scenario B: 1 Pending + 2 Running, queued=0 → reap the
     /// 1 Pending only. Running Jobs are NOT touched — they may hold
     /// assignments; scheduler's cancel-on-disconnect handles those.
@@ -3295,7 +3369,7 @@ mod tests {
             job_with("run-b", Some(1), Some(0), 90),
             job_with("done", Some(0), Some(1), 120),
         ];
-        let excess = select_excess_pending(&jobs, &HashSet::new(), 0, NO_GRACE);
+        let excess = select_excess_pending(&jobs, &HashSet::new(), &[], 0, NO_GRACE);
         let names: Vec<_> = excess.iter().map(|j| j.name_any()).collect();
         assert_eq!(
             names,
@@ -3304,7 +3378,7 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.ephemeral.reap-excess-pending+3]
+    // r[verify ctrl.ephemeral.reap-excess-pending+4]
     /// Grace window: a Job younger than `min_age` is excluded even if
     /// `ready=0`. `JobStatus.ready` is set asynchronously by the K8s
     /// Job controller; a freshly-started container may already hold an
@@ -3318,7 +3392,7 @@ mod tests {
             job_with("aged", Some(0), Some(0), 60),
         ];
         let none = HashSet::new();
-        let excess = select_excess_pending(&jobs, &none, 0, REAP_PENDING_GRACE);
+        let excess = select_excess_pending(&jobs, &none, &[], 0, REAP_PENDING_GRACE);
         let names: Vec<_> = excess.iter().map(|j| j.name_any()).collect();
         assert_eq!(
             names,
@@ -3329,12 +3403,12 @@ mod tests {
         let mut no_ts = job_with("no-ts", Some(0), Some(0), 60);
         no_ts.metadata.creation_timestamp = None;
         assert!(
-            select_excess_pending(&[no_ts], &none, 0, REAP_PENDING_GRACE).is_empty(),
+            select_excess_pending(&[no_ts], &none, &[], 0, REAP_PENDING_GRACE).is_empty(),
             "no creation_timestamp → not reapable (conservative)"
         );
     }
 
-    // r[verify ctrl.ephemeral.reap-excess-pending+3]
+    // r[verify ctrl.ephemeral.reap-excess-pending+4]
     /// bug_015: `reap_stale_for_intents` foreground-deletes orphan D
     /// (younger), but the unfiltered snapshot still counts it as
     /// Pending → `pending=2 > queued=1` → oldest-first deletes WANTED
@@ -3348,12 +3422,12 @@ mod tests {
         ];
         let reaped: HashSet<String> = ["rio-builder-p-d".into()].into();
         assert!(
-            select_excess_pending(&jobs, &reaped, 1, NO_GRACE).is_empty(),
+            select_excess_pending(&jobs, &reaped, &[], 1, NO_GRACE).is_empty(),
             "reaped D filtered → pending=1 ≤ queued=1 → no excess"
         );
         // Without the filter (pre-fix behavior): D counts, A is oldest
         // → A would be returned. Prove the filter is load-bearing.
-        let names: Vec<_> = select_excess_pending(&jobs, &HashSet::new(), 1, NO_GRACE)
+        let names: Vec<_> = select_excess_pending(&jobs, &HashSet::new(), &[], 1, NO_GRACE)
             .iter()
             .map(|j| j.name_any())
             .collect();

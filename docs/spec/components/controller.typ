@@ -94,7 +94,7 @@ watch, create, delete]`. `delete` is required for the excess-Pending reap
 `ttlSecondsAfterFinished` reaps Completed/Failed Jobs; ownerRef GC handles
 pool-delete cleanup.
 
-#r("ctrl.ephemeral.reap-excess-pending+3")[
+#r("ctrl.ephemeral.reap-excess-pending+4")[
   When the per-class queued count drops below the count of Pending-phase Jobs
   for that class, the controller MUST delete the excess Pending Jobs
   (orphan-by-intent first; residual excess oldest-first). Running Jobs are not
@@ -103,7 +103,11 @@ pool-delete cleanup.
   `parallelism: 1` and no readiness probe: the pod has not been scheduled, or
   is scheduled but the container has not started --- either way it has never
   connected to the scheduler and never received an assignment, so deletion
-  loses no work. Jobs younger than one requeue tick (10s) are excluded ---
+  loses no work. The controller MUST NOT delete a Pending Job whose intent has
+  an open pull-mode attempt OR whose pod was observed live-Running within the
+  strike wall-floor: `queued` carries no in-flight term, so on a wide pull burst
+  `pending - queued` over-selects every just-pulled Job whose informer-cached
+  `ready==0` lags. Jobs younger than one requeue tick (10s) are excluded ---
   `JobStatus.ready` is set asynchronously by the K8s Job controller and can lag
   a freshly-started container. Before issuing each DELETE the controller MUST
   re-check `Pod.status.phase` via a live (non-informer) lookup and skip the Job

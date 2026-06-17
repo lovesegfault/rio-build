@@ -2703,7 +2703,7 @@ const STRIKE_PRUNE_HORIZON: std::time::Duration = std::time::Duration::from_secs
 /// VIOLABLE (R17): time axis only — the deferral it can add is
 /// bounded by the floor itself; cost/size/population axes N/A (the
 /// ledger's prune horizon is the memory envelope).
-const STRIKE_WALL_FLOOR: std::time::Duration = std::time::Duration::from_secs(5);
+pub(super) const STRIKE_WALL_FLOOR: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Record a strike for `(pool, uid)` at `tick`: `previous + 1` when
 /// the row's stamp is adjacent by value, else a fresh run of 1 (the
@@ -2750,6 +2750,54 @@ pub(super) fn backdate_strikes_for_test(pool: &candidate::PoolKey, by: std::time
     for (p, _, e) in book.iter_rows_mut() {
         if p == pool {
             e.first_struck -= by;
+        }
+    }
+}
+
+/// sh-037 sticky liveness observations: a Job whose pod was observed
+/// live-Running by the excess-Pending reap's per-Job re-check (or
+/// whose delete chokepoint deferred on a fresh covering attempt) is
+/// immune to that reap arm for [`STRIKE_WALL_FLOOR`] of wall clock.
+/// Mirrors `STALE_STRIKES`' floor derivation: Job event bursts deliver
+/// re-reconciles milliseconds apart (`m0gz0cn814dw` skipped at
+/// 22:17:31.954, reaped 104 ms later — the live check is one-shot);
+/// the floor is the pull-surfacing window. Value is the observation
+/// instant only — no tick adjacency, the law is purely wall-clock
+/// (the row protects exactly the population whose second view proves
+/// nothing). Process-local, conservative on restart (no rows = no
+/// protection = today's behavior). [GEN-SET] consumer of
+/// [`candidate::PoolScopedLedger`].
+static LIVE_STRIKES: std::sync::LazyLock<
+    parking_lot::Mutex<candidate::PoolScopedLedger<std::time::Instant>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(candidate::PoolScopedLedger::default()));
+
+/// Record a live-Running / fresh-attempt observation for `(pool,
+/// uid)` at `now` (and prune rows past the floor — the protection
+/// window IS the memory bound here).
+pub(super) fn note_live_strike(pool: &candidate::PoolKey, uid: &str) {
+    let now = std::time::Instant::now();
+    let mut book = LIVE_STRIKES.lock();
+    book.prune_stale(now, STRIKE_WALL_FLOOR, |t| *t);
+    *book.row_or_insert_with(pool, uid, || now) = now;
+}
+
+/// Is `(pool, uid)`'s live observation inside the wall floor?
+pub(super) fn live_strike_recent(pool: &candidate::PoolKey, uid: &str) -> bool {
+    LIVE_STRIKES
+        .lock()
+        .get(pool, uid)
+        .is_some_and(|t| t.elapsed() < STRIKE_WALL_FLOOR)
+}
+
+/// Test seam (the [`backdate_strikes_for_test`] sibling): age every
+/// live-strike row for `pool` so the wall-floor expiry is drivable
+/// without sleeping.
+#[cfg(test)]
+pub(super) fn backdate_live_strikes_for_test(pool: &candidate::PoolKey, by: std::time::Duration) {
+    let mut book = LIVE_STRIKES.lock();
+    for (p, _, t) in book.iter_rows_mut() {
+        if p == pool {
+            *t -= by;
         }
     }
 }
@@ -2916,14 +2964,21 @@ pub(super) async fn reap_stale_for_intents(
         let why = disposition.as_label();
         // live_051(e): two-tick confirmation on the attempt-affecting
         // arms — the first stale classification records a strike and
-        // defers; the orphan-pending arm keeps its single-tick path
-        // (already age-gated by REAP_PENDING_GRACE).
+        // defers. OrphanPending stays out by design (intent has LEFT
+        // demand → no requeue loop, already REAP_PENDING_GRACE-gated).
+        // ExcessPending/OrphanRunning are listed for the closed
+        // strike-gated alphabet but are never produced by this fn —
+        // their strike recording lives inside their own reap loops
+        // (`job::reap_excess_pending` / `job::reap_orphan_running`,
+        // sh-037), via the wall-clock-only `LIVE_STRIKES` book.
         if matches!(
             disposition,
             ReapDisposition::StaleTerminal
                 | ReapDisposition::TerminalAbsent
                 | ReapDisposition::TerminalAbsentClean
                 | ReapDisposition::SelectorDrift
+                | ReapDisposition::ExcessPending
+                | ReapDisposition::OrphanRunning
         ) {
             let Some(uid) = j.metadata.uid.clone() else {
                 // No uid: cannot key a strike — defer conservatively
@@ -5705,14 +5760,14 @@ mod demand_lane_census {
         // blocks in candidate.rs).
         assert_eq!(
             jobs_prod.matches("PoolScopedLedger<").count(),
-            2,
+            3,
             "jobs.rs: the STALE_STRIKES instantiation (static type + \
-             the strike fn signature) — a new consumer joins the \
-             committed list"
+             the strike fn signature) + the LIVE_STRIKES static — a \
+             new consumer joins the committed list"
         );
         assert_eq!(
             cand_prod.matches("PoolScopedLedger<").count(),
-            8,
+            9,
             "candidate.rs: the abstraction (struct + Default + impl + \
              the committed consumer-list doc rows) + PoolStreaks' two \
              maps — re-run the [GEN-SET] generator on drift"

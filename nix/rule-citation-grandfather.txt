@@ -1,6 +1,6 @@
 fuzz/rio-nix/fuzz_targets/nar_parsing.rs	r[...] marker outside tracey enrollment — .config/tracey/config.styx does not include this file, so the marker is validated by NOTHING; enroll the file (include/test_include) or rewrite the marker as prose
 infra/helm/rio-build/templates/gateway-scaledobject.yaml	stale rule citation `gw.conn.session-cap` — the spec defines `gw.conn.session-cap+2`; re-derive the cite against the current rule text and re-stamp
-infra/helm/rio-build/templates/rbac.yaml	stale rule citation `ctrl.ephemeral.reap-excess-pending` — the spec defines `ctrl.ephemeral.reap-excess-pending+3`; re-derive the cite against the current rule text and re-stamp
+infra/helm/rio-build/templates/rbac.yaml	stale rule citation `ctrl.ephemeral.reap-excess-pending` — the spec defines `ctrl.ephemeral.reap-excess-pending+4`; re-derive the cite against the current rule text and re-stamp
 infra/helm/rio-build/values.yaml	stale rule citation `store.substitute.admission` — the spec defines `store.substitute.admission+2`; re-derive the cite against the current rule text and re-stamp
 infra/helm/rio-build/values.yaml	stale rule citation `store.substitute.stall-abort` — the spec defines `store.substitute.stall-abort+2`; re-derive the cite against the current rule text and re-stamp
 nix/cilium-render.nix	r[...] marker outside tracey enrollment — .config/tracey/config.styx does not include this file, so the marker is validated by NOTHING; enroll the file (include/test_include) or rewrite the marker as prose

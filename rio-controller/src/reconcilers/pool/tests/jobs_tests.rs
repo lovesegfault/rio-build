@@ -225,7 +225,7 @@ fn pod_list_scenario(job: &'static str, phase: Option<&str>) -> Scenario {
     }
 }
 
-// r[verify ctrl.ephemeral.reap-excess-pending+3]
+// r[verify ctrl.ephemeral.reap-excess-pending+4]
 /// I-183: `reap_excess_pending` issues DELETE for the oldest excess
 /// Pending Jobs, increments the metric, and warn+continues on a 404
 /// (already gone — concurrent reconcile or TTL).
@@ -740,7 +740,7 @@ async fn spawn_for_each_acks_spawned_only() {
     guard.verified().await;
 }
 
-// r[verify ctrl.ephemeral.reap-excess-pending+3]
+// r[verify ctrl.ephemeral.reap-excess-pending+4]
 /// `pending <= queued` → no DELETE calls; `queued = None` (scheduler
 /// unreachable) → no DELETE calls. The verifier's empty scenario list
 /// asserts zero apiserver requests in both cases.
@@ -783,7 +783,7 @@ async fn reap_excess_pending_noop_when_covered_or_unknown() {
     guard.verified().await;
 }
 
-// r[verify ctrl.ephemeral.reap-excess-pending+3]
+// r[verify ctrl.ephemeral.reap-excess-pending+4]
 /// Cold-start race: snapshot says `JobStatus.ready==0` (informer lag)
 /// but the live pod-phase re-check sees `Running` → DELETE is skipped.
 /// Also covers fail-closed on lookup error: a 500 on the pod-list →
@@ -829,6 +829,177 @@ async fn reap_excess_pending_skips_live_running_pod() {
     .await;
     guard.verified().await;
     assert_eq!(reaped, 0, "Running pod and list-error both skip DELETE");
+}
+
+/// A `pending_job` (`ready==0`, aged) carrying the `rio.build/intent-id`
+/// pod-template annotation and a uid — the shape `select_excess_pending`
+/// matches against `OpenAttempt.intent_id` (sh-037).
+fn pending_job_with_intent(name: &str, intent_id: &str, age_s: i64) -> Job {
+    let mut j = pending_job(name, 0, age_s);
+    j.metadata.uid = Some(apiserver_uid());
+    j.spec = Some(JobSpec {
+        template: PodTemplateSpec {
+            metadata: Some(ObjectMeta {
+                annotations: Some(BTreeMap::from([(
+                    INTENT_ID_ANNOTATION.to_string(),
+                    intent_id.to_string(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    j
+}
+
+// r[verify ctrl.ephemeral.reap-excess-pending+4]
+/// sh-037: `select_excess_pending` excludes Pending Jobs whose intent
+/// has an open pull-mode attempt (the structural exclude). 100
+/// Pending, queued=0, 52 with covering attempts → at most 48 are
+/// excess (≥52 survive). At base (no `open_attempts` filter) all 100
+/// were selected; the per-Job `Deferred` veto is delta-only — an
+/// attempt already in the deciding view is synthesize-then-delete, so
+/// the 52 covered Jobs were thrash-reaped at `queued=0` (599
+/// controller-reaped quint attempts on the iter8 wide front).
+#[test]
+fn reap_excess_pending_keeps_attempt_covered_jobs() {
+    use crate::reconcilers::pool::job::select_excess_pending;
+    let jobs: Vec<Job> = (0..100)
+        .map(|i| pending_job_with_intent(&format!("rio-builder-p-{i:02}"), &format!("i{i:02}"), 50))
+        .collect();
+    let attempts: Vec<OpenAttempt> = (0..52)
+        .map(|i| pull_attempt(&format!("i{i:02}"), &format!("exec-{i}"), ""))
+        .collect();
+    let excess = select_excess_pending(
+        &jobs,
+        &HashSet::new(),
+        &attempts,
+        0,
+        std::time::Duration::ZERO,
+    );
+    assert!(
+        excess.len() <= 48,
+        "≥52 attempt-covered Pending Jobs survive selection; got {} excess \
+         (sh-037: a Job whose intent has an open pull-mode attempt is \
+         structurally not-excess regardless of JobStatus.ready)",
+        excess.len()
+    );
+    for j in &excess {
+        let intent = crate::reconcilers::pool::job::job_intent_id(j).unwrap();
+        assert!(
+            !attempts.iter().any(|a| a.intent_id == intent),
+            "excess set contains attempt-covered Job {intent}"
+        );
+    }
+    // Inverse (the b-minor): a genuinely-orphan Pending Job (no
+    // covering row) is reaped first-tick — the exclusion does not
+    // protect orphans.
+    assert_eq!(
+        select_excess_pending(&jobs, &HashSet::new(), &[], 0, std::time::Duration::ZERO).len(),
+        100,
+        "with an empty view every Pending Job is excess (no protection \
+         for the truly-orphan case — zero added latency)"
+    );
+}
+
+// r[verify ctrl.ephemeral.reap-excess-pending+4]
+/// sh-037 sticky guard: a live-Running observation makes the Job
+/// immune to excess-reap for `STRIKE_WALL_FLOOR` (5s) of wall clock —
+/// `m0gz0cn814dw` was skipped at 22:17:31.954 and reaped 104 ms later
+/// because the one-shot `continue` records nothing and Job event
+/// bursts deliver re-reconciles milliseconds apart. Three reconciles:
+/// tick 1 sees `phase=Running` (strike + skip); tick 2 (burst, no
+/// time elapsed) sees a Pending pod (the transient kubelet-lag flap)
+/// — at base this DELETEs; with the sticky guard the wall-floor row
+/// protects. Tick 3 (past the floor) re-evaluates and sees Running
+/// again. Zero deletes across all three.
+#[tokio::test]
+async fn live_running_skip_survives_three_reconciles() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client.clone(), "rio");
+    let pods_api: Api<Pod> = Api::namespaced(client, "rio");
+    // Dedicated pool key so the process-global LIVE_STRIKES book is
+    // unshared with parallel tests.
+    let key = crate::reconcilers::pool::candidate::PoolKey::new("rio", "p-sh037-live");
+    let jobs = vec![pending_job_with_intent("rio-builder-p-live", "i-live", 50)];
+
+    // Tick 1: live pod-list → Running. Strike recorded; skip.
+    let guard = verifier.run(vec![pod_list_scenario(
+        "rio-builder-p-live",
+        Some("Running"),
+    )]);
+    let r1 = reap_excess_pending(
+        &jobs_api,
+        &pods_api,
+        &jobs,
+        &HashSet::new(),
+        Some(0),
+        &ctx,
+        "p-sh037-live",
+        &key,
+    )
+    .await;
+    guard.verified().await;
+    assert_eq!(r1, 0, "tick 1: live-Running → skip");
+
+    // Tick 2 (burst re-reconcile, 104 ms later): the wall-floor row
+    // protects. Structural assertion (the §ci-failure-patterns
+    // preference — count state, not requests): the strike was
+    // recorded and `live_strike_recent` (the EXACT predicate the reap
+    // loop short-circuits on) is true. At base no row exists and the
+    // one-shot `Ok(true) → continue` records nothing.
+    let uid = jobs[0].metadata.uid.as_deref().unwrap();
+    assert!(
+        crate::reconcilers::pool::jobs::live_strike_recent(&key, uid),
+        "tick 2 (burst): the live-Running observation is sticky for \
+         STRIKE_WALL_FLOOR — no DELETE (m0gz0cn814dw was reaped 104 ms \
+         after a live-Running skip)"
+    );
+    // Past the wall floor → the row expires (a 10s timer-cadence tick
+    // re-evaluates; only sub-5s bursts defer).
+    crate::reconcilers::pool::jobs::backdate_live_strikes_for_test(
+        &key,
+        crate::reconcilers::pool::jobs::STRIKE_WALL_FLOOR,
+    );
+    assert!(
+        !crate::reconcilers::pool::jobs::live_strike_recent(&key, uid),
+        "past the wall floor the row expires (the protection window IS \
+         the floor — real-excess Jobs see zero added latency)"
+    );
+
+    // Tick 3: end-to-end through the reap loop — the kubelet flap
+    // returns a Pending pod (the transient observation that, at base,
+    // would have DELETED on the very next burst tick). Past the
+    // floor, the loop re-evaluates: pod-list runs, sees Ok(false) →
+    // proceeds to delete. r3==1 proves the protection is bounded
+    // (doesn't leak into infinite-defer; a Job whose pod is genuinely
+    // not-Running past the floor IS reaped).
+    let (client3, verifier3) = ApiServerVerifier::new();
+    let jobs_api3: Api<Job> = Api::namespaced(client3.clone(), "rio");
+    let pods_api3: Api<Pod> = Api::namespaced(client3, "rio");
+    let guard3 = verifier3.run(vec![
+        pod_list_scenario("rio-builder-p-live", Some("Pending")),
+        delete_scenario("rio-builder-p-live"),
+    ]);
+    let r3 = reap_excess_pending(
+        &jobs_api3,
+        &pods_api3,
+        &jobs,
+        &HashSet::new(),
+        Some(0),
+        &ctx,
+        "p-sh037-live",
+        &key,
+    )
+    .await;
+    guard3.verified().await;
+    assert_eq!(
+        r3, 1,
+        "tick 3 (past floor): a genuinely not-Running pod IS reaped — \
+         the protection is bounded by the floor"
+    );
 }
 
 // r[verify ctrl.pool.reconcile]
@@ -886,7 +1057,7 @@ fn headroom_recompute_never_exceeds_ceiling() {
     assert_eq!(c.headroom(None, 0), usize::MAX, "uncapped");
 }
 
-// r[verify ctrl.ephemeral.reap-excess-pending+3]
+// r[verify ctrl.ephemeral.reap-excess-pending+4]
 /// `reap_stale_for_intents` reaps Pending Jobs whose intent left the
 /// set (orphan-by-intent). Before, only `select_excess_pending`'s
 /// oldest-first reap caught these, so [A,B,C,D]→[A,B] reaped jA,jB
@@ -4873,6 +5044,7 @@ fn w10_af_forecast_backed_job_survives_truncated_bound() {
     let excess = select_excess_pending(
         &jobs,
         &HashSet::new(),
+        &[],
         bound.expect("boundable"),
         std::time::Duration::ZERO,
     );

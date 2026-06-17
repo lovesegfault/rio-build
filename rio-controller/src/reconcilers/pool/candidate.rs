@@ -779,6 +779,11 @@ pub struct PoolStreaks {
 ///   deliver adjacent ticks milliseconds apart, and a ms-apart second
 ///   view cannot surface an in-flight pull; see STRIKE_WALL_FLOOR's
 ///   derivation record).
+/// - `jobs::LIVE_STRIKES` (`PoolScopedLedger<Instant>`): the sh-037
+///   sticky liveness observation — a Job whose pod was observed
+///   live-Running by the excess-Pending re-check is immune to that
+///   reap arm for the wall floor (no tick adjacency; the law is
+///   purely wall-clock).
 /// - [`PoolStreaks`] (`PoolScopedLedger<StreakEntry>` +
 ///   `PoolScopedLedger<RespawnEntry>`): the exhaustion-streak and
 ///   futility-breaker evidence maps (their bespoke retain laws stay
