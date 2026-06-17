@@ -71,6 +71,10 @@ pub(super) struct MergeIngest {
     pub created_jobs: Vec<super::materialize::CreatedJob>,
     /// Threaded for `verify_preexisting_completed`'s store call.
     pub jwt_token: Option<String>,
+    /// sh-036.1: same `precomputed_probe` from the request — threaded
+    /// so phase-6c (`verify_preexisting_completed`) reuses the
+    /// off-actor FMP result instead of issuing a fresh on-actor RPC.
+    pub precomputed_probe: Option<Result<FindMissingPathsResponse, tonic::Status>>,
 }
 
 /// Output of [`DagActor::reconcile_merged_state`].
@@ -311,7 +315,7 @@ impl DagActor {
         // step 4 handles fall-through correctly — this is a fast-path,
         // not a replacement.
         let (nodes, edges, pruned_closure_parents) = match self
-            .check_roots_topdown(&nodes, &edges, jwt_token.as_deref())
+            .check_roots_topdown(&nodes, &edges, jwt_token.as_deref(), precomputed)
             .await
         {
             Some(demanded) => {
@@ -541,6 +545,7 @@ impl DagActor {
             pending_substitute,
             created_jobs,
             jwt_token,
+            precomputed_probe,
         })
     }
 
@@ -667,6 +672,7 @@ impl DagActor {
             pending_substitute,
             created_jobs,
             jwt_token,
+            precomputed_probe,
             ..
         } = ingest;
         let newly_inserted = &merge_result.newly_inserted;
@@ -776,7 +782,13 @@ impl DagActor {
         // Reset stale nodes to Ready; they re-dispatch and re-complete.
         // r[impl sched.merge.stale-completed-verify+5]
         let stale_reset = self
-            .verify_preexisting_completed(nodes, newly_inserted, cached_hits, jwt_token.as_deref())
+            .verify_preexisting_completed(
+                nodes,
+                newly_inserted,
+                cached_hits,
+                jwt_token.as_deref(),
+                precomputed_probe.as_ref(),
+            )
             .await;
         phase!("6c-verify-preexisting");
 
@@ -1545,6 +1557,7 @@ impl DagActor {
         newly_inserted: &HashSet<DrvHash>,
         cached_hits: &HashMap<DrvHash, Vec<String>>,
         jwt_token: Option<&str>,
+        precomputed: Option<&Result<FindMissingPathsResponse, tonic::Status>>,
     ) -> HashSet<String> {
         // Collect (drv_hash, output_paths, unwanted_paths) for
         // pre-existing Completed OR Skipped nodes in this merge.
@@ -1637,10 +1650,6 @@ impl DagActor {
             return HashSet::new();
         }
 
-        let Some(store_client) = &self.store_client else {
-            return HashSet::new();
-        };
-
         // Batch all output paths into one FindMissingPaths call. The
         // probe set stays ALL recorded paths (probing an unwanted path
         // is harmless; only the reset DECISION below filters by wanted).
@@ -1653,45 +1662,94 @@ impl DagActor {
             .filter(|p| !p.is_empty())
             .collect();
 
-        let mut req = tonic::Request::new(FindMissingPathsRequest {
-            store_paths: check_paths,
-        });
-        rio_proto::interceptor::inject_current(req.metadata_mut());
-        // I-202: same JWT propagation as check_cached_outputs. Without
-        // it, the store sees tenant_id=None → substitutable_paths stays
-        // empty → a GC'd output that cache.nixos.org has is treated as
-        // truly-missing → reset to Ready → re-dispatch the whole subtree
-        // (FOD sources hit origin URLs; some are dead upstream).
-        if let Some(t) = jwt_token
-            && let Ok(v) = tonic::metadata::MetadataValue::try_from(t)
-        {
-            req.metadata_mut().insert(rio_proto::TENANT_TOKEN_HEADER, v);
-        }
-
-        // Conditional timeout — same pattern as
-        // `find_missing_with_breaker`: this is a submission-sized
-        // batch (every pre-existing Completed/Skipped output) so it
-        // needs MERGE_FMP_TIMEOUT when the store is healthy, but the
-        // short grpc_timeout during an outage so a fail-open path
-        // doesn't pin the actor 90s. The breaker is fed but not gated
-        // on: record_failure/success so a 90s dead stall here counts
-        // toward opening, and a success here closes it; but the
-        // fail-open RETURN (HashSet::new()) is unconditional —
-        // `r[sched.breaker.cache-check]` reserves fail-CLOSED
-        // rejection for new submissions, never for an already-admitted
-        // DAG's re-verify.
-        let fmp_timeout = if self.cache_breaker.is_open() {
-            self.grpc_timeout
-        } else {
-            super::MERGE_FMP_TIMEOUT
+        // r[impl sched.merge.probe-off-actor]
+        // sh-036.1: the gRPC handler probed every request
+        // `expected_output_paths`. `check_paths` here is recorded
+        // `state.output_paths` — for IA nodes these EQUAL
+        // `expected_output_paths` (covered by the precomputed
+        // superset; over-probed entries are harmlessly ignored by the
+        // candidate iteration below); for floating-CA REALIZED paths
+        // they differ (the realized hash-addressed path is not in
+        // `expected_output_paths`, which is `[""]`). Residual CA paths
+        // get one small in-actor FMP below; the precomputed response
+        // covers the IA majority. `Some(Err)` fail-opens WITHOUT
+        // re-folding into `cache_breaker` — phase-4's
+        // `record_breaker_from_precomputed` already folded the same
+        // result once; this fn's fail-open posture
+        // (`r[sched.breaker.cache-check]`) is unchanged.
+        let (mut resp, fmp_paths) = match precomputed {
+            Some(Ok(pre)) => {
+                let probed: HashSet<&str> = nodes
+                    .iter()
+                    .flat_map(|n| n.expected_output_paths.iter().map(String::as_str))
+                    .collect();
+                let residual: Vec<String> = check_paths
+                    .iter()
+                    .filter(|p| !probed.contains(p.as_str()))
+                    .cloned()
+                    .collect();
+                (pre.clone(), residual)
+            }
+            Some(Err(e)) => {
+                warn!(error = %e,
+                      "stale-completed verify: precomputed store FindMissingPaths failed; \
+                       treating pre-existing Completed as valid (fail-open)");
+                return HashSet::new();
+            }
+            None => (FindMissingPathsResponse::default(), check_paths),
         };
-        let resp =
+
+        // Residual / fallback in-actor FMP: covers `precomputed = None`
+        // (the full `check_paths`) and the CA-realized residual when
+        // `Some(Ok)`. Skipped entirely when the precomputed superset
+        // covers every recorded path (the IA-only common case — iter8
+        // cold-DAG measured this lane at ~0, but a warm-DAG resubmit
+        // probes every pre-existing Completed/Skipped node's recorded
+        // output, same ~29k-path stall as phase-4).
+        if !fmp_paths.is_empty() {
+            let Some(store_client) = &self.store_client else {
+                return HashSet::new();
+            };
+            let mut req = tonic::Request::new(FindMissingPathsRequest {
+                store_paths: fmp_paths,
+            });
+            rio_proto::interceptor::inject_current(req.metadata_mut());
+            // I-202: same JWT propagation as check_cached_outputs. Without
+            // it, the store sees tenant_id=None → substitutable_paths stays
+            // empty → a GC'd output that cache.nixos.org has is treated as
+            // truly-missing → reset to Ready → re-dispatch the whole subtree
+            // (FOD sources hit origin URLs; some are dead upstream).
+            if let Some(t) = jwt_token
+                && let Ok(v) = tonic::metadata::MetadataValue::try_from(t)
+            {
+                req.metadata_mut().insert(rio_proto::TENANT_TOKEN_HEADER, v);
+            }
+
+            // Conditional timeout — same pattern as
+            // `find_missing_with_breaker`: this is a submission-sized
+            // batch (every pre-existing Completed/Skipped output) so it
+            // needs MERGE_FMP_TIMEOUT when the store is healthy, but the
+            // short grpc_timeout during an outage so a fail-open path
+            // doesn't pin the actor 90s. The breaker is fed but not gated
+            // on: record_failure/success so a 90s dead stall here counts
+            // toward opening, and a success here closes it; but the
+            // fail-open RETURN (HashSet::new()) is unconditional —
+            // `r[sched.breaker.cache-check]` reserves fail-CLOSED
+            // rejection for new submissions, never for an already-admitted
+            // DAG's re-verify.
+            let fmp_timeout = if self.cache_breaker.is_open() {
+                self.grpc_timeout
+            } else {
+                super::MERGE_FMP_TIMEOUT
+            };
             match tokio::time::timeout(fmp_timeout, store_client.clone().find_missing_paths(req))
                 .await
             {
                 Ok(Ok(r)) => {
                     self.cache_breaker.record_success();
-                    r.into_inner()
+                    let r = r.into_inner();
+                    resp.missing_paths.extend(r.missing_paths);
+                    resp.substitutable_paths.extend(r.substitutable_paths);
                 }
                 Ok(Err(e)) => {
                     self.cache_breaker.record_failure();
@@ -1708,7 +1766,8 @@ impl DagActor {
                        treating pre-existing Completed as valid (fail-open)");
                     return HashSet::new();
                 }
-            };
+            }
+        }
 
         if resp.missing_paths.is_empty() {
             return HashSet::new();
@@ -2478,9 +2537,10 @@ impl DagActor {
     /// store's per-tenant upstream probe fires and populates
     /// `substitutable_paths` — see r[sched.merge.substitute-probe].
     ///
-    /// `precomputed`: the gRPC handler's pre-enqueue FMP result over a
-    /// SUPERSET of `probe_set`'s expected paths
-    /// (r[sched.merge.probe-off-actor]). When `Some`, the actor folds
+    /// `precomputed`: the gRPC handler's pre-enqueue FMP result over
+    /// every request `expected_output_paths` — `probe_set`'s paths are
+    /// a subset (r[sched.merge.probe-off-actor]). When `Some`, the
+    /// actor folds
     /// the result into `cache_breaker` and applies it directly — no
     /// in-actor RPC await. The partition below iterates `probe_set`
     /// only, so over-probed entries (in-flight Assigned/Running
@@ -3000,9 +3060,8 @@ impl DagActor {
         nodes: &[crate::domain::DerivationNode],
         edges: &[crate::domain::DerivationEdge],
         jwt_token: Option<&str>,
+        precomputed: Option<&Result<FindMissingPathsResponse, tonic::Status>>,
     ) -> Option<Vec<crate::domain::DerivationNode>> {
-        let store_client = self.store_client.as_ref()?;
-
         // Skip if there's nothing to prune. Single-node and edge-free
         // submissions get no benefit from the pre-check (step 4 handles
         // them with the same RPC count). The threshold also avoids a
@@ -3052,40 +3111,60 @@ impl DagActor {
         }
 
         // --- FindMissingPaths for the demand set only ----------------
-        let mut fmp_req = tonic::Request::new(FindMissingPathsRequest {
-            store_paths: demanded_paths.clone(),
-        });
-        rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
-        // JWT propagation — same as r[sched.merge.substitute-probe].
-        if let Some(t) = jwt_token
-            && let Ok(v) = tonic::metadata::MetadataValue::try_from(t)
-        {
-            fmp_req
-                .metadata_mut()
-                .insert(rio_proto::TENANT_TOKEN_HEADER, v);
-        }
-        let grpc_timeout = self.grpc_timeout;
-        let resp = match tokio::time::timeout(
-            grpc_timeout,
-            store_client.clone().find_missing_paths(fmp_req),
-        )
-        .await
-        {
-            Ok(Ok(r)) => {
-                self.cache_breaker.record_success();
-                r.into_inner()
-            }
-            Ok(Err(e)) => {
-                debug!(error = %e, "top-down FindMissingPaths failed; falling through");
-                self.note_issued_store_rpc_failure("merge-topdown");
-                self.cache_breaker.record_failure();
+        // r[impl sched.merge.probe-off-actor]
+        // sh-036.1: `demanded_paths ⊂ {request expected_output_paths}`
+        // (the handler-probed superset), so the precomputed response
+        // covers this lane in full — over-probed entries are filtered
+        // by the per-demanded-node iteration below. The breaker fold is
+        // NOT applied here: phase-4's `record_breaker_from_precomputed`
+        // is the sole fold point for the one off-actor RPC (avoids
+        // double-counting one handler failure as two consecutive
+        // failures). `Some(Err)` falls through to the full bottom-up
+        // path; phase-4 folds it. `None` keeps today's in-actor probe.
+        let resp = match precomputed {
+            Some(Ok(pre)) => pre.clone(),
+            Some(Err(e)) => {
+                debug!(error = %e, "top-down: precomputed FindMissingPaths failed; falling through");
                 return None;
             }
-            Err(_) => {
-                debug!(timeout = ?grpc_timeout, "top-down FindMissingPaths timed out; falling through");
-                self.note_issued_store_rpc_failure("merge-topdown");
-                self.cache_breaker.record_failure();
-                return None;
+            None => {
+                let store_client = self.store_client.as_ref()?;
+                let mut fmp_req = tonic::Request::new(FindMissingPathsRequest {
+                    store_paths: demanded_paths.clone(),
+                });
+                rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
+                // JWT propagation — same as r[sched.merge.substitute-probe].
+                if let Some(t) = jwt_token
+                    && let Ok(v) = tonic::metadata::MetadataValue::try_from(t)
+                {
+                    fmp_req
+                        .metadata_mut()
+                        .insert(rio_proto::TENANT_TOKEN_HEADER, v);
+                }
+                let grpc_timeout = self.grpc_timeout;
+                match tokio::time::timeout(
+                    grpc_timeout,
+                    store_client.clone().find_missing_paths(fmp_req),
+                )
+                .await
+                {
+                    Ok(Ok(r)) => {
+                        self.cache_breaker.record_success();
+                        r.into_inner()
+                    }
+                    Ok(Err(e)) => {
+                        debug!(error = %e, "top-down FindMissingPaths failed; falling through");
+                        self.note_issued_store_rpc_failure("merge-topdown");
+                        self.cache_breaker.record_failure();
+                        return None;
+                    }
+                    Err(_) => {
+                        debug!(timeout = ?grpc_timeout, "top-down FindMissingPaths timed out; falling through");
+                        self.note_issued_store_rpc_failure("merge-topdown");
+                        self.cache_breaker.record_failure();
+                        return None;
+                    }
+                }
             }
         };
 

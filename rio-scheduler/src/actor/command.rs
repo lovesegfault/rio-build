@@ -162,8 +162,8 @@ pub struct MergeDagRequest {
     /// revocation lookup); this is the OPAQUE token (for re-inject).
     pub jwt_token: Option<String>,
     /// sh-036.1: the gRPC handler's pre-enqueue `FindMissingPaths`
-    /// result over ALL request `expected_output_paths` (a superset of
-    /// the actor-computed `probe_set`). When `Some`, phase-4
+    /// result over every request `expected_output_paths` (a superset
+    /// of the actor-computed `probe_set`). When `Some`, phase-4
     /// (`check_cached_outputs`), phase-6c
     /// (`verify_preexisting_completed`), and phase-0
     /// (`check_roots_topdown`) apply this pre-computed response

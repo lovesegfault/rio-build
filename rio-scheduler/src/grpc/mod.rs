@@ -111,7 +111,7 @@ pub struct SchedulerGrpc {
     /// acceptable credential exists).
     pub(super) service_verifier: Option<Arc<HmacKey>>,
     /// sh-036.1: store client for the off-actor `FindMissingPaths`
-    /// probe in [`submit_build`](Self::submit_build) — same lazy
+    /// probe in `submit_build` (`scheduler_service.rs`) — same lazy
     /// channel as the actor's (`tonic::Channel` is cheap-clone).
     /// `None` in test constructors → handler threads
     /// `precomputed_probe = None` and the actor's in-actor probe
