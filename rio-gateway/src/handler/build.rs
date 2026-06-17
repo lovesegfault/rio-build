@@ -953,19 +953,32 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             stderr.log(&line).await?;
         }
         types::DerivationEventKind::Cached => {
-            // Substituting → Cached: close the actSubstitute +
-            // actCopyPath pair. Merge-time cache hits never went
-            // Substituting → no entry → no-op. A Build entry is left
-            // alone (Cached never closes a build activity — preserved
-            // from the two-map scheme).
-            if let Some(DrvDisplay::Subst(aids)) =
-                act.display.get(&drv_event.derivation_path).cloned()
-            {
-                act.display.remove(&drv_event.derivation_path);
-                stop_subst_pair(stderr, act, aids, SubstCloseCause::Cached).await?;
+            // Terminal: cut the tail (as Completed/Failed above), then
+            // close whichever display family is open — TOTAL over
+            // DrvDisplay (sh-035). Substituting → Cached is the common
+            // path (close the actSubstitute + actCopyPath pair).
+            // Started → Cached is the reap→store-hit path: the
+            // scheduler reaps an in-flight execution, re-probes the
+            // store and hits (`dispatch.rs`
+            // `complete_ready_from_store_batch`), emitting Cached with
+            // no intervening Completed — the open `actBuild` aid must
+            // close here (a plain `stop_activity`; no progress synth —
+            // build aids carry no resProgress bar). Merge-time cache
+            // hits never opened a display → None → no-op.
+            tails.on_terminal(&drv_event.derivation_path);
+            match act.display.remove(&drv_event.derivation_path) {
+                Some(DrvDisplay::Subst(aids)) => {
+                    stop_subst_pair(stderr, act, aids, SubstCloseCause::Cached).await?;
+                }
+                Some(DrvDisplay::Build(aid)) => {
+                    stderr.stop_activity(aid).await?;
+                    debug!(aid, drv = %drv_event.derivation_path,
+                           "Cached after Build (reap→store-hit) — stop_activity sent");
+                }
+                None => {}
             }
         }
-        // Queued: no activity to start/stop, no STDERR.
+        // Queued: non-terminal; no display family to close, no STDERR.
         types::DerivationEventKind::Queued => {}
     }
     Ok(())
@@ -5436,6 +5449,63 @@ mod tests {
             subst_count(&act),
             0,
             "Completed must clear subst aid (terminal-arm symmetry)"
+        );
+    }
+
+    // r[verify gw.activity.stop-parity]
+    /// sh-035 red: Started → Cached (the reap→store-hit path —
+    /// `dispatch.rs` `complete_ready_from_store_batch` emits Cached
+    /// for a drv that was Running) must close the open `actBuild` aid.
+    /// At base the Cached arm's `if let Subst` left a Build entry in
+    /// the map and never wrote `stop_activity` — 26 orphan `actBuild`s
+    /// in the iter8 capture, rendered "building" until terminus.
+    /// Sibling: Cached with NO prior event (merge-time hit) is the
+    /// `None` arm — must stay a no-op.
+    #[tokio::test]
+    async fn cached_after_started_closes_build_activity() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/s035s035s035s035s035s035s035s035-foo.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
+
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Started, drv, &[]))
+            .await
+            .unwrap();
+        let aid = build_aid(&act, drv);
+
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Cached, drv, &[]))
+            .await
+            .unwrap();
+        assert!(
+            act.display.is_empty(),
+            "Cached must close the open Build display (sh-035 reap→store-hit); \
+             still tracked: {:?}",
+            act.display
+        );
+
+        let frames = read_frames(buf).await;
+        assert!(
+            frames.contains(&Frame::Stop(aid)),
+            "Cached after Started must emit stop_activity({aid}); frames: {frames:?}"
+        );
+
+        // Sibling: Cached with NO prior event (merge-time cache hit
+        // never opened a display) → None arm → no-op, no frames.
+        let cold = "/nix/store/c01dc01dc01dc01dc01dc01dc01dc01d-cold.drv";
+        let mut buf2 = Vec::new();
+        let mut w2 = &mut buf2;
+        let mut stderr2 = StderrWriter::new(&mut w2);
+        relay_derivation_status(&mut stderr2, &mut act, &mut tails, ev(Cached, cold, &[]))
+            .await
+            .unwrap();
+        assert!(act.display.is_empty(), "None arm must not insert");
+        assert!(
+            read_frames(buf2).await.is_empty(),
+            "merge-time Cached (no prior display) must emit no frames"
         );
     }
 
