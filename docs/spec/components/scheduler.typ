@@ -1371,6 +1371,24 @@ the saturation counter and warn (the recorded D-prime wanted-width
 transition residual). The walk-era stored per-node union column (migration
 062) and its only-grows fallback semantics were retired with migration 080.
 
+#r("sched.merge.probe-off-actor")[
+  The merge-time `FindMissingPaths` RPC (phase 4's
+  `check_cached_outputs`, phase 6c's `verify_preexisting_completed`,
+  phase 0's `check_roots_topdown`) MUST run in the `SubmitBuild` gRPC
+  handler BEFORE `MergeDag` is enqueued --- threaded as
+  `MergeDagRequest.precomputed_probe` --- so the actor turn applies a
+  pre-computed response without awaiting store I/O.
+]
+
+The probe is read-only over (request payload + store state); the only
+actor state it touched was `cache_breaker`, whose fold stays actor-side
+(`record_breaker_from_precomputed`). The handler over-probes a superset
+(every request `expected_output_paths`, not just the actor-computed
+`probe_set`); the actor partition iterates `probe_set` only, so
+over-probed entries are never applied. The handler reads a relaxed
+`is_open()` mirror to pick the same conditional timeout
+`find_missing_with_breaker` uses.
+
 #r("sched.merge.substitute-probe")[
   The merge-time cache check (`check_cached_outputs`) MUST forward the
   submitting session's JWT (`x-rio-tenant-token`) on its `FindMissingPaths`

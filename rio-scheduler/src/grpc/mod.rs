@@ -110,6 +110,19 @@ pub struct SchedulerGrpc {
     /// `hmac_key: Some` = closed for materialization operations (no
     /// acceptable credential exists).
     pub(super) service_verifier: Option<Arc<HmacKey>>,
+    /// sh-036.1: store client for the off-actor `FindMissingPaths`
+    /// probe in [`submit_build`](Self::submit_build) — same lazy
+    /// channel as the actor's (`tonic::Channel` is cheap-clone).
+    /// `None` in test constructors → handler threads
+    /// `precomputed_probe = None` and the actor's in-actor probe
+    /// fallback runs (today's behaviour).
+    pub(super) store_client: Option<rio_proto::StoreServiceClient<tonic::transport::Channel>>,
+    /// sh-036.1: read-only mirror of the actor's
+    /// `cache_breaker.is_open()`, shared via `DagActorPlumbing`. The
+    /// off-actor FMP probe replicates `find_missing_with_breaker`'s
+    /// conditional timeout: `if breaker_open {grpc_timeout} else
+    /// {MERGE_FMP_TIMEOUT}`. The breaker FOLD stays actor-side.
+    pub(super) breaker_open: Arc<AtomicBool>,
 }
 
 impl SchedulerGrpc {
@@ -123,6 +136,8 @@ impl SchedulerGrpc {
             jwt_mode: false,
             hmac_key: None,
             service_verifier: None,
+            store_client: None,
+            breaker_open: Arc::default(),
         }
     }
 
@@ -137,6 +152,8 @@ impl SchedulerGrpc {
             jwt_mode: false,
             hmac_key: None,
             service_verifier: None,
+            store_client: None,
+            breaker_open: Arc::default(),
         }
     }
 
@@ -150,6 +167,11 @@ impl SchedulerGrpc {
     /// the executor-identity verifier (drives `require_executor`).
     /// `service_verifier`: service-HMAC verifier for the store's
     /// materialization credential (drives `require_store_service`).
+    ///
+    /// `store_client` + `breaker_open`: sh-036.1 off-actor FMP probe
+    /// — same lazy store channel as the actor's, plus the actor's
+    /// `cache_breaker.is_open()` mirror for the conditional timeout.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         actor: ActorHandle,
         db: SchedulerDb,
@@ -157,6 +179,8 @@ impl SchedulerGrpc {
         jwt_mode: bool,
         hmac_key: Option<Arc<HmacKey>>,
         service_verifier: Option<Arc<HmacKey>>,
+        store_client: Option<rio_proto::StoreServiceClient<tonic::transport::Channel>>,
+        breaker_open: Arc<AtomicBool>,
     ) -> Self {
         Self {
             actor,
@@ -165,6 +189,8 @@ impl SchedulerGrpc {
             jwt_mode,
             hmac_key,
             service_verifier,
+            store_client,
+            breaker_open,
         }
     }
 

@@ -80,6 +80,13 @@ pub struct DagActorPlumbing {
     /// Store service client for scheduler-side cache checks. `None` in
     /// tests that don't need the store (cache check is then skipped).
     pub store_client: Option<StoreServiceClient<Channel>>,
+    /// sh-036.1: read-only `cache_breaker.is_open()` mirror, shared
+    /// with the gRPC handler so the off-actor `FindMissingPaths` probe
+    /// picks the same conditional timeout (`if open {30s} else {90s}`)
+    /// as `find_missing_with_breaker`. Stored on every breaker state
+    /// transition; `Relaxed` reads (a stale read costs at most one
+    /// mis-sized timeout).
+    pub breaker_open: Arc<std::sync::atomic::AtomicBool>,
     /// HMAC signer for assignment tokens. `None` = legacy unsigned
     /// format-string (dev mode).
     pub hmac_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
@@ -197,6 +204,7 @@ impl Default for DagActorPlumbing {
     fn default() -> Self {
         Self {
             store_client: None,
+            breaker_open: Arc::default(),
             hmac_signer: None,
             service_signer: None,
             leader: LeaderState::default(),

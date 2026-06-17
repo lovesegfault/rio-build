@@ -194,6 +194,82 @@ impl SchedulerService for SchedulerGrpc {
             }
         };
 
+        // r[impl sched.merge.probe-off-actor]
+        // sh-036.1: hoist phase-4's tenant-scoped FindMissingPaths
+        // (4.99s of the 11.63s MergeDag actor turn) to run HERE — off
+        // the single-threaded actor — so the actor turn applies a
+        // pre-computed response without awaiting store I/O. The probe
+        // is read-only over (request payload + store state); the only
+        // actor state it touched was `cache_breaker`, whose fold stays
+        // actor-side via `record_breaker_from_precomputed`.
+        //
+        // This OVER-PROBES relative to the actor's `probe_set`
+        // (newly_inserted ∪ existing_reprobe — neither computable
+        // pre-enqueue): every request `expected_output_paths`, not
+        // just probe_set's. Correctness-safe — the actor partition
+        // iterates `probe_set` only, so over-probed entries are never
+        // applied. Cost: over-probed Completed/Skipped outputs are
+        // PG-present → cheap; over-probed Assigned/Running/Cancelled
+        // outputs are NOT yet in `path_infos` → reach `check_available`
+        // → extra upstream HEADs, bounded by in-flight executor
+        // capacity ≈ O(100s). Benign.
+        //
+        // Handler timeout/gRPC-error collapses into `Some(Err(Status))`
+        // (NOT a SubmitBuild failure) — the actor folds it into the
+        // breaker. `None` only when `store_client.is_none()` or no
+        // path-based outputs (the actor's in-actor probe fallback runs;
+        // identical to today's behaviour). Runs AFTER the
+        // `is_backpressured()` gate so a refused request doesn't burn
+        // 5s of upstream HEADs.
+        let precomputed_probe = match &self.store_client {
+            Some(store_client) => {
+                let store_paths: Vec<String> = req
+                    .nodes
+                    .iter()
+                    .flat_map(|n| n.expected_output_paths.iter())
+                    .filter(|p| !p.is_empty())
+                    .cloned()
+                    .collect();
+                if store_paths.is_empty() {
+                    None
+                } else {
+                    let mut fmp =
+                        Request::new(rio_proto::types::FindMissingPathsRequest { store_paths });
+                    rio_proto::interceptor::inject_current(fmp.metadata_mut());
+                    if let Some(t) = jwt_token.as_deref()
+                        && let Ok(v) = tonic::metadata::MetadataValue::try_from(t)
+                    {
+                        fmp.metadata_mut().insert(rio_proto::TENANT_TOKEN_HEADER, v);
+                    }
+                    // Conditional timeout — same shape as
+                    // `find_missing_with_breaker`: `breaker_open` is
+                    // the actor's `cache_breaker.is_open()` mirror; a
+                    // stale read costs at most one mis-sized timeout.
+                    let fmp_timeout =
+                        if self.breaker_open.load(std::sync::atomic::Ordering::Relaxed) {
+                            rio_common::grpc::DEFAULT_GRPC_TIMEOUT
+                        } else {
+                            crate::actor::MERGE_FMP_TIMEOUT
+                        };
+                    Some(
+                        match tokio::time::timeout(
+                            fmp_timeout,
+                            store_client.clone().find_missing_paths(fmp),
+                        )
+                        .await
+                        {
+                            Ok(Ok(r)) => Ok(r.into_inner()),
+                            Ok(Err(e)) => Err(e),
+                            Err(_) => Err(Status::deadline_exceeded(format!(
+                                "off-actor FindMissingPaths timed out after {fmp_timeout:?}"
+                            ))),
+                        },
+                    )
+                }
+            }
+            None => None,
+        };
+
         // Capture the current span's traceparent BEFORE sending to the
         // actor. Span context does not cross the mpsc channel boundary;
         // the actor task's `handle_merge_dag` #[instrument] span is a
@@ -217,7 +293,7 @@ impl SchedulerService for SchedulerGrpc {
             traceparent,
             jti,
             jwt_token,
-            precomputed_probe: None,
+            precomputed_probe,
         };
         let cmd = ActorCommand::MergeDag {
             req,

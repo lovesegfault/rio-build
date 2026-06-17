@@ -13,6 +13,8 @@
 //! interior mutability (plain u32 actor-local vs AtomicU32). Consolidate
 //! only if a third breaker appears.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use tracing::{info, warn};
@@ -69,6 +71,15 @@ pub(crate) struct CacheCheckBreaker<C: Clock = SystemClock> {
     consecutive_failures: u32,
     /// If `Some`, the breaker is open until this instant. `None` = closed.
     open_until: Option<Instant>,
+    /// sh-036.1: read-only `is_open()` mirror for the off-actor gRPC
+    /// handler's conditional FMP timeout (replicates
+    /// `find_missing_with_breaker`'s `if breaker.is_open() {30s} else
+    /// {90s}`). Stored on every state transition
+    /// (`record_success`/`record_failure`/`lazy_reset_if_auto_closed`).
+    /// The FOLD itself stays `&mut self`-serialized actor-side; only
+    /// this open-state bit is shared. A stale read costs at most one
+    /// mis-sized timeout, not a wrong fold — hence `Relaxed`.
+    mirror: Arc<AtomicBool>,
     /// Time source. `SystemClock` in production; `MockClock` in tests.
     clock: C,
 }
@@ -99,9 +110,18 @@ const OPEN_DURATION: std::time::Duration =
 
 impl<C: Clock + Default> CacheCheckBreaker<C> {
     pub(super) fn new() -> Self {
+        Self::with_mirror(Arc::default())
+    }
+
+    /// Construct with a caller-shared `is_open()` mirror — production
+    /// passes the same `Arc<AtomicBool>` to the gRPC handler so the
+    /// off-actor FMP probe can pick the conditional timeout
+    /// (r[sched.merge.probe-off-actor]).
+    pub(super) fn with_mirror(mirror: Arc<AtomicBool>) -> Self {
         Self {
             consecutive_failures: 0,
             open_until: None,
+            mirror,
             clock: C::default(),
         }
     }
@@ -118,6 +138,7 @@ impl<C: Clock> CacheCheckBreaker<C> {
         if self.open_until.is_some() && !self.is_open() {
             self.open_until = None;
             self.consecutive_failures = 0;
+            self.mirror.store(false, Ordering::Relaxed);
         }
     }
 
@@ -139,6 +160,7 @@ impl<C: Clock> CacheCheckBreaker<C> {
         // Trip open on threshold crossing.
         if self.consecutive_failures >= OPEN_THRESHOLD {
             self.open_until = Some(self.clock.now() + OPEN_DURATION);
+            self.mirror.store(true, Ordering::Relaxed);
             warn!(
                 consecutive_failures = self.consecutive_failures,
                 open_for = ?OPEN_DURATION,
@@ -162,6 +184,7 @@ impl<C: Clock> CacheCheckBreaker<C> {
         }
         self.consecutive_failures = 0;
         self.open_until = None;
+        self.mirror.store(false, Ordering::Relaxed);
     }
 
     /// Whether the breaker is open RIGHT NOW. Handles timeout-based
@@ -330,6 +353,35 @@ mod tests {
             recorder.get("rio_scheduler_cache_check_circuit_open_total{}"),
             1,
             "auto-close + 1 failure must NOT re-increment open_total"
+        );
+    }
+
+    /// sh-036.1: the off-actor mirror tracks `is_open()` across every
+    /// state transition (trip, success-close, auto-close).
+    #[test]
+    fn mirror_tracks_is_open() {
+        let mirror: Arc<AtomicBool> = Arc::default();
+        let mut b = CacheCheckBreaker::<MockClock>::with_mirror(Arc::clone(&mirror));
+        assert!(!mirror.load(Ordering::Relaxed));
+        for _ in 1..=5 {
+            b.record_failure();
+        }
+        assert!(mirror.load(Ordering::Relaxed), "trip → mirror=true");
+        b.record_success();
+        assert!(
+            !mirror.load(Ordering::Relaxed),
+            "success-close → mirror=false"
+        );
+        for _ in 1..=5 {
+            b.record_failure();
+        }
+        assert!(mirror.load(Ordering::Relaxed));
+        b.clock.advance(OPEN_DURATION + Duration::from_secs(1));
+        // Auto-close is lazy: mirror updates on the NEXT record_*.
+        b.record_failure();
+        assert!(
+            !mirror.load(Ordering::Relaxed),
+            "auto-close (lazy on next record_*) → mirror=false"
         );
     }
 

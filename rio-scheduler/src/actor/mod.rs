@@ -1248,7 +1248,7 @@ impl DagActor {
             db,
             store_client: plumbing.store_client,
             grpc_timeout: cfg.grpc_timeout,
-            cache_breaker: CacheCheckBreaker::default(),
+            cache_breaker: CacheCheckBreaker::with_mirror(plumbing.breaker_open),
             // sh-018b: shared with `estimator_poller` when main.rs
             // wires it; tests / non-K8s spawns leave plumbing at `None`
             // → constructed from `cfg.sla` here so tests that customize

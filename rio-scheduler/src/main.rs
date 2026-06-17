@@ -94,6 +94,10 @@ async fn main() -> anyhow::Result<()> {
         rio_scheduler::sla::check_reference_epoch(&db, &cfg.sla, cfg.allow_reference_change)
             .await?;
         let store_client = connect_store_lazy(&cfg.store.addr);
+        // sh-036.1: ONE breaker-open mirror, cloned to both the actor
+        // (writes via CacheCheckBreaker state transitions) and the gRPC
+        // handler (reads for the off-actor FMP conditional timeout).
+        let breaker_open: Arc<std::sync::atomic::AtomicBool> = Arc::default();
 
         if !cfg.soft_features.is_empty() {
             info!(soft_features = ?cfg.soft_features, "soft-feature stripping enabled");
@@ -360,7 +364,8 @@ async fn main() -> anyhow::Result<()> {
                 ..Default::default()
             },
             rio_scheduler::actor::DagActorPlumbing {
-                store_client,
+                store_client: store_client.clone(),
+                breaker_open: Arc::clone(&breaker_open),
                 hmac_signer,
                 service_signer: service_signer.map(Arc::new),
                 leader: leader.clone(),
@@ -488,6 +493,8 @@ async fn main() -> anyhow::Result<()> {
             // materialization credential (ServiceClaims caller="rio-store")
             // on the materialization-only ExecutorService operations.
             service_verifier.clone(),
+            store_client,
+            breaker_open,
         );
 
         // Background refresh for ClusterStatus.store_size_bytes — 60s PG poll
