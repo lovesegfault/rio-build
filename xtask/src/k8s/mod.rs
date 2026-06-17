@@ -20,6 +20,7 @@ pub mod provider;
 pub(crate) mod qa;
 pub mod shared;
 mod sla_gates;
+pub(crate) mod ssm;
 pub(crate) mod status;
 mod stress;
 mod wipe;
@@ -792,11 +793,8 @@ where
     F: FnOnce(&xshell::Shell, &str) -> Result<()>,
 {
     let key = crate::ssh::privkey_path(cfg)?;
-    // P0539e: a prior `rsb`/`stress` may have left a session-manager-
-    // plugin or kubectl port-forward bound to this port (ProcessGuard
-    // only fires if xtask exited cleanly; SIGKILL/panic leaks it).
-    // The new tunnel would then bind fine but route to the OLD NLB —
-    // surfacing as the "type 80" SSH error 30s later. Reap first.
+    // P0539e: reap a SIGKILL'd run's stale listener — see
+    // [`shared::kill_port_listeners`] for the "type 80" failure mode.
     if port != 0 {
         shared::kill_port_listeners(port);
     }
