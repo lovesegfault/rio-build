@@ -919,7 +919,10 @@ fn render_human(r: &Report) {
     }
     let w = col_width(&r.pools, |p| &p.name);
     for p in &r.pools {
-        let ok = p.ready == p.desired && !p.scheduler_unreachable;
+        // sh-032: `desired` is the maxConcurrent CEILING when set, not
+        // demand — `ready==replicas` is the health predicate (every
+        // minted Job has a Ready pod); `desired` is informational.
+        let ok = p.ready == p.replicas && !p.scheduler_unreachable;
         let unreach = if p.scheduler_unreachable {
             style(" SchedulerUnreachable").red().to_string()
         } else {
