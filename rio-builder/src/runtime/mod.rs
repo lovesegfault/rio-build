@@ -597,6 +597,7 @@ pub async fn spawn_build_task(
             result,
             peak_memory_bytes,
             peak_cpu_cores,
+            cpu_seconds_total,
             peak_disk_bytes,
             disk_telemetry,
             final_line_count,
@@ -641,6 +642,8 @@ pub async fn spawn_build_task(
                     mem_bytes: peak_memory_bytes,
                     cpu_cores: peak_cpu_cores,
                     disk_bytes: peak_disk_bytes,
+                    cpu_seconds_total,
+                    assigned_cores: assignment.assigned_cores,
                 },
             );
             // The footer occupies line numbers [final_line_count,

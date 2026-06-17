@@ -138,15 +138,23 @@ impl BuildCgroup {
         read_single_u64(&self.path.join("memory.peak"))
     }
 
-    /// Cumulative CPU time of the whole tree, in microseconds.
+    /// Cumulative CPU time of the whole tree, in seconds.
     ///
     /// `cpu.stat` has multiple lines; `usage_usec` is user+system
-    /// combined across the tree. The caller polls this periodically
-    /// and computes `delta / elapsed` for instantaneous cores-
-    /// equivalent.
+    /// combined across the tree. One read at completion (alongside
+    /// [`Self::memory_peak`]) feeds the banner footer's `cpu_util` —
+    /// the 1Hz monitor also publishes it into the shared
+    /// `ResourceUsage` snapshot, but that copy is ≤1s stale and not
+    /// reachable from `run_daemon_lifecycle`.
     ///
     /// `None` on read/parse failure (same caveat as memory_peak).
-    ///
+    pub fn cpu_seconds_total(&self) -> Option<f64> {
+        fs::read_to_string(self.path.join("cpu.stat"))
+            .ok()
+            .and_then(|c| parse_cpu_stat_usage_usec(&c))
+            .map(|u| u as f64 / 1e6)
+    }
+
     /// Path to this cgroup. Exposed so the CPU polling task can
     /// clone it (the task outlives the borrowed `&BuildCgroup`
     /// across the `run_daemon_build` await).

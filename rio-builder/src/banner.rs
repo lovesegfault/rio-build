@@ -114,6 +114,30 @@ pub(crate) struct FooterPeaks {
     pub cpu_cores: f64,
     /// prjquota `dqb_curspace` running max. `None` = no prjquota.
     pub disk_bytes: Option<u64>,
+    /// Cumulative `cpu.stat usage_usec` (seconds). `None` = pre-cgroup
+    /// error or read failure.
+    pub cpu_seconds_total: Option<f64>,
+    /// `WorkAssignment.assigned_cores` — the SLA-fitted denominator
+    /// for `cpu_util`. `None` (or `Some(0)`) = pre-ADR-023 path: the
+    /// banner doesn't fall back to the cgroup clamp for the same
+    /// reason the header doesn't (the clamp `ceil()`s and would
+    /// disagree with the SLA model). `cpu_util` is omitted then.
+    pub assigned_cores: Option<u32>,
+}
+
+impl FooterPeaks {
+    /// `cpu_seconds_total / (wall × assigned_cores)` — the same
+    /// formula the scheduler's compute-bound corroborator uses
+    /// (`rio_scheduler::actor::floor::corroborated_compute_bound`).
+    /// `None` when any input is absent or `wall`/`cores` are zero —
+    /// the absent-field discipline applies (don't claim a precision
+    /// we don't have).
+    fn cpu_util(&self, wall: Duration) -> Option<f64> {
+        let cpu = self.cpu_seconds_total?;
+        let cores = self.assigned_cores.filter(|&c| c > 0)?;
+        let wall = wall.as_secs_f64();
+        (wall > 0.0).then(|| cpu / (wall * f64::from(cores)))
+    }
 }
 
 /// Render the footer lines written after the build process exits.
@@ -145,10 +169,14 @@ pub(crate) fn footer_lines(
     duration: Duration,
     peaks: FooterPeaks,
 ) -> Vec<Vec<u8>> {
+    let util = peaks
+        .cpu_util(duration)
+        .map(|u| format!(" cpu_util={:.0}%", u * 100.0))
+        .unwrap_or_default();
     vec![
         format!("rio: exec     {exec_id}").into_bytes(),
         format!(
-            "rio: peaks    cpu={:.1}c mem={} disk={} wall={}s",
+            "rio: peaks    cpu={:.1}c mem={} disk={} wall={}s{util}",
             peaks.cpu_cores,
             fmt_size(Some(peaks.mem_bytes)),
             fmt_size(peaks.disk_bytes),
@@ -412,6 +440,8 @@ mod tests {
                 mem_bytes: 2 << 30,
                 cpu_cores: 3.84,
                 disk_bytes: Some(12 << 30),
+                cpu_seconds_total: None,
+                assigned_cores: None,
             },
         );
         assert_eq!(lines.len(), 3, "exec + peaks + result");
@@ -433,6 +463,8 @@ mod tests {
                 mem_bytes: 69 << 20,
                 cpu_cores: 0.5,
                 disk_bytes: None,
+                cpu_seconds_total: None,
+                assigned_cores: None,
             },
         );
         let peaks = str::from_utf8(&lines[1]).unwrap();
@@ -440,6 +472,54 @@ mod tests {
             peaks.contains("mem=69 MiB") && peaks.contains("disk=? GiB"),
             "fmt_size law applies to the footer too: {peaks}"
         );
+        assert!(
+            !peaks.contains("cpu_util"),
+            "cpu_util omitted when inputs absent: {peaks}"
+        );
+    }
+
+    /// sh-038 Tier 2: `cpu_util = cpu_seconds_total / (wall ×
+    /// assigned_cores)` — the same formula the scheduler's
+    /// compute-bound corroborator uses (`floor.rs
+    /// corroborated_compute_bound`). Omitted when any input is absent
+    /// or zero — the banner doesn't claim a precision it doesn't have.
+    #[test]
+    fn footer_peaks_line_carries_cpu_util() {
+        // 4 cores × 263s wall = 1052 cpu-seconds available; 999.4
+        // consumed → 95%.
+        let lines = footer_lines(
+            "x",
+            "ok",
+            Duration::from_secs(263),
+            FooterPeaks {
+                mem_bytes: 0,
+                cpu_cores: 3.8,
+                disk_bytes: None,
+                cpu_seconds_total: Some(999.4),
+                assigned_cores: Some(4),
+            },
+        );
+        let peaks = str::from_utf8(&lines[1]).unwrap();
+        assert!(
+            peaks.contains("cpu_util=95%"),
+            "peaks line must carry cpu_util when cpu_seconds_total and \
+             assigned_cores are both present: {peaks}"
+        );
+        // Absent-field discipline: assigned_cores=0 (proto3 unset) →
+        // omit, not divide-by-zero / `inf%`.
+        let p = FooterPeaks {
+            cpu_seconds_total: Some(10.0),
+            assigned_cores: Some(0),
+            ..FooterPeaks::default()
+        };
+        assert_eq!(p.cpu_util(Duration::from_secs(10)), None);
+        // wall=0 → omit.
+        let p = FooterPeaks {
+            cpu_seconds_total: Some(10.0),
+            assigned_cores: Some(4),
+            ..FooterPeaks::default()
+        };
+        assert_eq!(p.cpu_util(Duration::ZERO), None);
     }
 
     #[test]

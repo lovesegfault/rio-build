@@ -636,6 +636,14 @@ pub struct ExecuteOutcome {
     pub peak_memory_bytes: u64,
     /// Peak concurrent CPU usage (cores) sampled from the cgroup.
     pub peak_cpu_cores: f64,
+    /// Cumulative cgroup `cpu.stat usage_usec`, read alongside
+    /// `memory.peak` before the per-build cgroup is drained. `None` =
+    /// pre-cgroup error or read failure. Feeds the banner footer's
+    /// `cpu_util` (sh-038 t2); the `ResourceUsage` snapshot already
+    /// carries the same value via [`crate::cgroup::final_sample`] for
+    /// the SLA fit, but only on the Ok arm — lifting it here makes it
+    /// survive the Err path like the other peaks.
+    pub cpu_seconds_total: Option<f64>,
     /// `None` = no prjquota OR pre-cgroup error. Sampled BEFORE
     /// `build_result?` so an OOM'd build also reports it.
     pub peak_disk_bytes: Option<u64>,
@@ -681,6 +689,7 @@ impl ExecuteOutcome {
             result: Err(e),
             peak_memory_bytes: 0,
             peak_cpu_cores: 0.0,
+            cpu_seconds_total: None,
             peak_disk_bytes: None,
             disk_telemetry: None,
             final_line_count,
@@ -696,6 +705,10 @@ impl ExecuteOutcome {
         Self {
             peak_memory_bytes: r.peak_memory_bytes,
             peak_cpu_cores: r.peak_cpu_cores,
+            cpu_seconds_total: r
+                .fixture_resources
+                .as_ref()
+                .and_then(|u| u.cpu_seconds_total),
             peak_disk_bytes: r.peak_disk_bytes,
             disk_telemetry: None,
             result: Ok(r),
@@ -1058,6 +1071,7 @@ pub async fn execute_build(
         build_result,
         peak_memory_bytes,
         peak_cpu_cores,
+        cpu_seconds_total,
         peak_quota_bytes,
         final_line_count,
     ) = match pre {
@@ -1072,6 +1086,7 @@ pub async fn execute_build(
                     build_result,
                     peak_memory_bytes,
                     peak_cpu_cores,
+                    cpu_seconds_total,
                     peak_quota_bytes,
                     final_line_count,
                 },
@@ -1081,6 +1096,7 @@ pub async fn execute_build(
             build_result,
             peak_memory_bytes,
             peak_cpu_cores,
+            cpu_seconds_total,
             peak_quota_bytes,
             final_line_count,
         ),
@@ -1181,6 +1197,7 @@ pub async fn execute_build(
         result: Err(e),
         peak_memory_bytes,
         peak_cpu_cores,
+        cpu_seconds_total,
         peak_disk_bytes,
         disk_telemetry,
         final_line_count,
@@ -1263,6 +1280,7 @@ pub async fn execute_build(
         }),
         peak_memory_bytes,
         peak_cpu_cores,
+        cpu_seconds_total,
         peak_disk_bytes,
         disk_telemetry,
         final_line_count,
@@ -1383,6 +1401,11 @@ struct DaemonOutcome {
     build_result: Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
     peak_memory_bytes: u64,
     peak_cpu_cores: f64,
+    /// One-shot `cpu.stat usage_usec` read alongside `memory.peak`,
+    /// before the per-build cgroup is drained. Lifted onto
+    /// `ExecuteOutcome` so the banner footer's `cpu_util` survives
+    /// the Err path (sh-038 t2).
+    cpu_seconds_total: Option<f64>,
     /// merged_bug_074: the during-build prjquota usage peak from the
     /// 1Hz monitor (max-tracked `dqb_curspace`). `None` = no prjquota
     /// or the build exited before the first tick — the classification
@@ -1522,6 +1545,10 @@ async fn run_daemon_lifecycle(
     // enabled, but enable_subtree_controllers at startup would have
     // caught that — this is a belt-and-suspenders default).
     let peak_memory_bytes = build_cgroup.memory_peak().unwrap_or(0);
+    // One-shot cumulative read alongside memory.peak — taken BEFORE
+    // `drain_build_cgroup` consumes the path. Feeds the banner
+    // footer's `cpu_util` (sh-038 t2).
+    let cpu_seconds_total = build_cgroup.cpu_seconds_total();
 
     // ALWAYS kill the daemon, regardless of success/failure.
     if let Err(e) = daemon.kill().await {
@@ -1546,6 +1573,7 @@ async fn run_daemon_lifecycle(
         build_result,
         peak_memory_bytes,
         peak_cpu_cores,
+        cpu_seconds_total,
         peak_quota_bytes,
         final_line_count,
     })
