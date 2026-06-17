@@ -166,7 +166,16 @@ async fn annotate_one(pods: &Api<Pod>, http: &reqwest::Client, pod: &Pod) {
         .annotations()
         .get(POD_DELETION_COST_ANNOTATION)
         .map(String::as_str);
-    let url = format!("http://{ip}:{GATEWAY_METRICS_PORT}/metrics");
+    // Dual-stack: an IPv6 literal in a URL authority needs brackets
+    // (RFC 3986 §3.2.2). reqwest rejects `http://fd42::e:58e5:9090`
+    // as an invalid port. Same dual-stack class as sh002's
+    // default_addr close-gate fix.
+    let host = if ip.contains(':') {
+        format!("[{ip}]")
+    } else {
+        ip.to_owned()
+    };
+    let url = format!("http://{host}:{GATEWAY_METRICS_PORT}/metrics");
     let body = match http
         .get(&url)
         .send()
