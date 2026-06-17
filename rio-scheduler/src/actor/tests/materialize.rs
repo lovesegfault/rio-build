@@ -11220,6 +11220,7 @@ async fn zero_interest_cancel_sweep_transaction_bound() -> TestResult {
                 None,
                 JobOrigin::Pruned,
                 None,
+                0.0,
                 generation,
             )
             .await?;
@@ -11302,6 +11303,7 @@ async fn backoff_lapsing_during_the_beat_query_is_served() -> TestResult {
             None,
             JobOrigin::Pruned,
             None,
+            0.0,
             actor.serving_generation(),
         )
         .await?;
@@ -11374,6 +11376,7 @@ async fn listing_excludes_in_memory_terminal_nodes() -> TestResult {
                 None,
                 JobOrigin::CacheOpportunity,
                 None,
+                0.0,
                 generation,
             )
             .await?;
@@ -11465,6 +11468,7 @@ async fn node_completed_by_other_means_resolves_obsolete() -> TestResult {
             None,
             JobOrigin::CacheOpportunity,
             None,
+            0.0,
             generation,
         )
         .await?;
@@ -11599,6 +11603,7 @@ async fn skew_detector_fires_on_terminal_node_pending_job() -> TestResult {
             None,
             JobOrigin::CacheOpportunity,
             None,
+            0.0,
             generation,
         )
         .await?;
@@ -11669,6 +11674,7 @@ async fn moot_sweep_is_bounded_per_tick() -> TestResult {
             drv_hash: hash,
             tenant_id: None,
             origin: JobOrigin::CacheOpportunity,
+            priority: 0.0,
             carried_realized_paths: None,
         })
         .collect();

@@ -1612,6 +1612,10 @@ impl DagActor {
             .iter()
             .filter_map(|bid| self.builds.get(bid))
             .find_map(|b| b.tenant_id);
+        // sched.materialize.listing-priority: post-merge callers (the
+        // dispatch-probe partition, housekeeping) HAVE the
+        // critical-path priority at job-create time — 6b already ran.
+        let priority = state.sched.priority;
         let serving_generation = self.serving_generation();
         match self
             .db
@@ -1621,6 +1625,7 @@ impl DagActor {
                 tenant,
                 origin,
                 carried_realized_paths.as_deref(),
+                priority,
                 serving_generation,
             )
             .await
@@ -1740,6 +1745,7 @@ impl DagActor {
             hash: DrvHash,
             db_id: Uuid,
             tenant: Option<Uuid>,
+            priority: f64,
         }
         let prep: Vec<Prep> = drv_hashes
             .iter()
@@ -1755,6 +1761,10 @@ impl DagActor {
                     hash: h.clone(),
                     db_id,
                     tenant,
+                    // sched.materialize.listing-priority: the
+                    // dispatch-probe partition runs post-merge, so 6b
+                    // has set sched.priority — read it directly.
+                    priority: state.sched.priority,
                 })
             })
             .collect();
@@ -1768,6 +1778,7 @@ impl DagActor {
                 drv_hash: p.hash.as_str(),
                 tenant_id: p.tenant,
                 origin,
+                priority: p.priority,
                 carried_realized_paths: None,
             })
             .collect();

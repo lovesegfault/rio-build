@@ -46,6 +46,7 @@ async fn job_creation_is_dedup_idempotent() -> anyhow::Result<()> {
             None,
             JobOrigin::Pruned,
             None,
+            0.0,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -67,6 +68,7 @@ async fn job_creation_is_dedup_idempotent() -> anyhow::Result<()> {
             None,
             JobOrigin::CacheOpportunity,
             None,
+            0.0,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -106,6 +108,7 @@ async fn job_creation_is_dedup_idempotent() -> anyhow::Result<()> {
             None,
             JobOrigin::Pruned,
             None,
+            0.0,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -146,6 +149,7 @@ async fn job_creation_below_floor_is_fenced() -> anyhow::Result<()> {
             None,
             JobOrigin::Pruned,
             None,
+            0.0,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -168,6 +172,7 @@ async fn job_creation_below_floor_is_fenced() -> anyhow::Result<()> {
             None,
             JobOrigin::Pruned,
             None,
+            0.0,
             ServingGeneration::stamp_from_claim(2),
         )
         .await?;
@@ -201,6 +206,7 @@ async fn list_claimable_excludes_claimed_and_parked() -> anyhow::Result<()> {
                 None,
                 JobOrigin::CacheOpportunity,
                 None,
+                0.0,
                 ServingGeneration::stamp_from_claim(1),
             )
             .await?;
@@ -312,6 +318,7 @@ async fn list_claimable_excludes_terminal_node_jobs() -> anyhow::Result<()> {
                 None,
                 JobOrigin::CacheOpportunity,
                 None,
+                0.0,
                 ServingGeneration::stamp_from_claim(1),
             )
             .await?;
@@ -351,6 +358,80 @@ async fn list_claimable_excludes_terminal_node_jobs() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// sh-025 — `list_claimable_materialization_jobs` ORDER BY is
+/// `(priority DESC, created_at, job_id)` (`sched.materialize.
+/// listing-priority`): a hub derivation (long critical-path
+/// remaining-seconds) batch-minted in the same transaction as nine
+/// leaves at an arbitrary mid-batch position MUST head the listing.
+/// At base the whole batch ties on `created_at` and `job_id` is
+/// `Uuid::now_v7` mint order ≈ input order — the hub at index 7 is
+/// listed eighth, so the 2454-wide Queued→Ready promotion fired as a
+/// step function near sub-end instead of overlapping leaf
+/// substitution with build.
+// r[verify sched.materialize.listing-priority]
+#[tokio::test]
+async fn list_claimable_orders_hub_before_leaves() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // Ten derivations; the hub is at index 7 (mid-batch, NOT first).
+    // Nine leaves at priority 60.0 (a single est_duration), the hub at
+    // 7200.0 (a long dependent chain — rustc/stdenv-shaped).
+    const HUB: usize = 7;
+    let mut drvs = Vec::new();
+    let mut hashes = Vec::new();
+    for i in 0..10 {
+        let hash = format!("hub-order-{i:02}");
+        let drv = insert_test_derivation(&db, &hash).await?;
+        drvs.push(drv);
+        hashes.push(hash);
+    }
+    let rows: Vec<NewJobRow<'_>> = drvs
+        .iter()
+        .zip(hashes.iter())
+        .enumerate()
+        .map(|(i, (drv, hash))| NewJobRow {
+            derivation_id: *drv,
+            drv_hash: hash,
+            tenant_id: None,
+            origin: JobOrigin::CacheOpportunity,
+            priority: if i == HUB { 7200.0 } else { 60.0 },
+            carried_realized_paths: None,
+        })
+        .collect();
+    let mut tx = db.pool().begin().await?;
+    let created = SchedulerDb::create_materialization_jobs_in_tx(&mut tx, &rows, 1).await?;
+    tx.commit().await?;
+    assert!(created.iter().all(|r| r.created), "all ten insert fresh");
+    let distinct_created_at: i64 =
+        sqlx::query_scalar("SELECT COUNT(DISTINCT created_at) FROM materialization_jobs")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(
+        distinct_created_at, 1,
+        "precondition: the whole batch ties on created_at"
+    );
+
+    // The head-window of 3: the hub MUST be first; the two leaves
+    // following it are the FIFO `(created_at, job_id)` tail of the
+    // priority-60 tie (indices 0 and 1, the now_v7 mint order).
+    let listed = db.list_claimable_materialization_jobs(3).await?;
+    assert_eq!(listed.len(), 3);
+    assert_eq!(
+        listed[0].drv_hash, hashes[HUB],
+        "the hub (priority 7200.0) at mid-batch index {HUB} must head the \
+         priority-DESC listing — at base the (created_at, job_id) order put \
+         it eighth (now_v7 mint order ≈ input order)"
+    );
+    assert_eq!(
+        listed[1].drv_hash, hashes[0],
+        "within the priority-60 tie, (created_at, job_id) is FIFO"
+    );
+    assert_eq!(listed[2].drv_hash, hashes[1]);
+    drop(test_db);
+    Ok(())
+}
+
 /// (d) Resolution is exec_id-keyed, fenced, and at-most-once: the
 /// first resolve stamps `resolution_exec_id`/`resolved_at`; resolving
 /// an already-resolved job is a no-op (`Applied(0)` — terminal-row-
@@ -367,6 +448,7 @@ async fn job_resolution_is_fenced_and_at_most_once() -> anyhow::Result<()> {
             None,
             JobOrigin::Pruned,
             None,
+            0.0,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -433,6 +515,7 @@ async fn job_resolution_is_fenced_and_at_most_once() -> anyhow::Result<()> {
             None,
             JobOrigin::Pruned,
             None,
+            0.0,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -482,6 +565,7 @@ async fn parked_job_excluded_until_backoff_expires() -> anyhow::Result<()> {
             None,
             JobOrigin::Pruned,
             None,
+            0.0,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -562,6 +646,7 @@ async fn job_cancellation_sweep_marks_cancelled_and_closes_attempts() -> anyhow:
                 None,
                 JobOrigin::Pruned,
                 None,
+                0.0,
                 ServingGeneration::stamp_from_claim(1),
             )
             .await?;
@@ -661,6 +746,7 @@ async fn job_cancellation_sweep_marks_cancelled_and_closes_attempts() -> anyhow:
             None,
             JobOrigin::Pruned,
             None,
+            0.0,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -716,6 +802,7 @@ async fn job_create_in_rolled_back_tx_leaves_no_row() -> anyhow::Result<()> {
             drv_hash: "job-rollback-hash",
             tenant_id: None,
             origin: JobOrigin::CacheOpportunity,
+            priority: 0.0,
             carried_realized_paths: None,
         }],
         1,
@@ -744,6 +831,7 @@ async fn job_create_in_rolled_back_tx_leaves_no_row() -> anyhow::Result<()> {
             drv_hash: "job-rollback-hash",
             tenant_id: None,
             origin: JobOrigin::CacheOpportunity,
+            priority: 0.0,
             carried_realized_paths: None,
         }],
         1,
@@ -788,6 +876,7 @@ async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<(
             drv_hash: "job-cross-site-hash",
             tenant_id: None,
             origin: JobOrigin::CacheOpportunity,
+            priority: 0.0,
             carried_realized_paths: None,
         }],
         1,
@@ -809,6 +898,7 @@ async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<(
                 None,
                 JobOrigin::CacheOpportunity,
                 None,
+                0.0,
                 ServingGeneration::stamp_from_claim(1),
             )
             .await
@@ -860,6 +950,7 @@ async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<(
             None,
             JobOrigin::CacheOpportunity,
             None,
+            0.0,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -879,6 +970,7 @@ async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<(
             drv_hash: "job-cross-site-hash-2",
             tenant_id: None,
             origin: JobOrigin::Pruned,
+            priority: 0.0,
             carried_realized_paths: None,
         }],
         1,
@@ -1006,6 +1098,7 @@ async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
             None,
             JobOrigin::CacheOpportunity,
             None,
+            0.0,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -1027,6 +1120,7 @@ async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
             None,
             JobOrigin::Pruned,
             None,
+            0.0,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -1054,6 +1148,7 @@ async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
             None,
             JobOrigin::CacheOpportunity,
             None,
+            0.0,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -1075,6 +1170,7 @@ async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
         None,
         JobOrigin::CacheOpportunity,
         None,
+        0.0,
         ServingGeneration::stamp_from_claim(1),
     )
     .await?;
@@ -1086,6 +1182,7 @@ async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
                 None,
                 origin,
                 None,
+                0.0,
                 ServingGeneration::stamp_from_claim(1),
             )
             .await?;
@@ -1124,6 +1221,7 @@ async fn gc_resolved_jobs_sweeps_only_unreferenced_resolved() -> anyhow::Result<
                     None,
                     JobOrigin::Pruned,
                     None,
+                    0.0,
                     ServingGeneration::stamp_from_claim(1),
                 )
                 .await?
@@ -1235,6 +1333,7 @@ async fn unresolved_job_view_ignores_build_kind_assignments() -> anyhow::Result<
         None,
         JobOrigin::Pruned,
         None,
+        0.0,
         ServingGeneration::stamp_from_claim(1),
     )
     .await?;
@@ -1274,6 +1373,7 @@ async fn unresolved_job_view_ignores_build_kind_assignments() -> anyhow::Result<
         None,
         JobOrigin::Pruned,
         None,
+        0.0,
         ServingGeneration::stamp_from_claim(1),
     )
     .await?;
@@ -1360,6 +1460,7 @@ async fn listing_order_is_total_under_batch_minted_ties() -> anyhow::Result<()> 
             drv_hash: hash,
             tenant_id: None,
             origin: JobOrigin::CacheOpportunity,
+            priority: 0.0,
             carried_realized_paths: None,
         })
         .collect();
@@ -1397,6 +1498,7 @@ async fn listing_order_is_total_under_batch_minted_ties() -> anyhow::Result<()> 
             drv_hash: hash,
             tenant_id: None,
             origin: JobOrigin::Pruned,
+            priority: 0.0,
             carried_realized_paths: None,
         })
         .collect();
@@ -1409,7 +1511,9 @@ async fn listing_order_is_total_under_batch_minted_ties() -> anyhow::Result<()> 
         "the second batch dedups and upgrades (PD-D1) — no new rows"
     );
 
-    // The listing must return the strict (created_at, job_id) order.
+    // The listing must return the strict (created_at, job_id) order
+    // (every row ties on priority=0.0, so the priority-DESC head
+    // collapses to the (created_at, job_id) total-order tail).
     let listed = db.list_claimable_materialization_jobs(96).await?;
     let returned: Vec<Uuid> = listed.iter().map(|j| j.job_id).collect();
     assert_eq!(
@@ -1432,8 +1536,16 @@ async fn unresolved_jobs_for_derivations_parity_with_singleton() -> anyhow::Resu
     let drv_b = insert_test_derivation(&db, "batch-unres-b").await?;
     let drv_absent = insert_test_derivation(&db, "batch-unres-absent").await?;
     let g = ServingGeneration::stamp_from_claim(1);
-    db.create_materialization_job_fenced(drv_a, "batch-unres-a", None, JobOrigin::Pruned, None, g)
-        .await?;
+    db.create_materialization_job_fenced(
+        drv_a,
+        "batch-unres-a",
+        None,
+        JobOrigin::Pruned,
+        None,
+        0.0,
+        g,
+    )
+    .await?;
     let carried = vec!["/nix/store/carried".to_string()];
     db.create_materialization_job_fenced(
         drv_b,
@@ -1441,6 +1553,7 @@ async fn unresolved_jobs_for_derivations_parity_with_singleton() -> anyhow::Resu
         None,
         JobOrigin::CacheOpportunity,
         Some(&carried),
+        0.0,
         g,
     )
     .await?;
@@ -1496,7 +1609,7 @@ async fn close_and_resolve_materialization_batch_idempotent() -> anyhow::Result<
         .execute(&test_db.pool)
         .await?;
         let FencedJobCreate::Applied { job_id, .. } = db
-            .create_materialization_job_fenced(drv, tag, None, JobOrigin::Pruned, None, g)
+            .create_materialization_job_fenced(drv, tag, None, JobOrigin::Pruned, None, 0.0, g)
             .await?
         else {
             anyhow::bail!("job create must apply");

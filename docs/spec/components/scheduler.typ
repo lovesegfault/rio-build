@@ -2117,6 +2117,37 @@ join/leave of `executor_concurrency` members. Machine witness:
 partition, own-slice disjointness/coverage, staleness-bounded steal,
 no-job-unlisted, orphan recovery; convoy and no-steal falsify twins).
 
+#r("sched.materialize.listing-priority")[
+  The claimable materialization-job listing MUST order by the creating
+  derivation's critical-path priority (descending) ahead of age, so hub
+  dependencies are claimed before leaf substitutions when both are
+  pending; within a priority tie the order MUST be `(created_at,
+  job_id)` (the bug_099 total-order law).
+]
+The sh-025 cold-ingest finding: every merge-tx job ties on
+`created_at`, `job_id` is `Uuid::now_v7` mint order ≈
+`pending_substitute` HashMap-iteration order --- effectively random ---
+so rustc/stdenv landed at an arbitrary head-window position and the
+2454-wide Queued→Ready promotion fired as a step function near sub-end
+instead of overlapping ~70s of leaf substitution with build. The
+priority column (migration 107) is `state.sched.priority` ---
+`est_duration + max(non-terminal child)`, the same critical-path
+remaining-seconds that already drives spawn-intent ranking. The
+merge-tx batch inserts at `priority = 0` (`compute_initial` runs at
+phase 6b, AFTER the merge transaction commits) and a single post-6b
+fenced `GREATEST()` re-stamp overwrites; a scheduler crash between
+commit and re-stamp degenerates to today's `(created_at, job_id)`
+order and self-heals on the next merge that touches those nodes. This
+rule constrains within-slice order only --- partition coverage stays a
+function of `(job_id, member)` rendezvous hash
+(#rref("sched.materialize.listing-distribution")), independent of
+snapshot position, so priority-DESC orders WITHIN each replica's
+disjoint bucket and hubs are claimed in parallel on the first beat.
+Claim order is throughput, never a safety property: the
+`materializationJob.qnt` model's `claimJob` is per-derivation nondet
+and `materializationDistribution.qnt` constrains coverage/disjointness,
+not within-slice order.
+
 #r("sched.materialize.listing-cost+2")[
   The leader listing chokepoint MUST NOT recompute the rendezvous
   partition per poll: partition-scoring work MUST be zero on a poll

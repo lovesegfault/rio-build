@@ -171,6 +171,7 @@ async fn materialization_pins_released_only_after_all_interest_terminal() -> any
             None,
             JobOrigin::Pruned,
             None,
+            0.0,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?
@@ -264,6 +265,7 @@ async fn pin_kinds_are_disjoint_rows() -> anyhow::Result<()> {
             None,
             JobOrigin::Reprobe,
             None,
+            0.0,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?
@@ -450,6 +452,7 @@ async fn pins_survive_rowless_live_interest() -> anyhow::Result<()> {
             None,
             JobOrigin::Pruned,
             None,
+            0.0,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?

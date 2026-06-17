@@ -2124,6 +2124,11 @@ impl DagActor {
                         drv_hash: node.drv_hash.as_str(),
                         tenant_id,
                         origin: crate::state::JobOrigin::Pruned,
+                        // sched.materialize.listing-priority: 6b hasn't
+                        // run yet (compute_initial is post-commit); the
+                        // post-6b re-stamp overwrites with the
+                        // critical-path priority.
+                        priority: 0.0,
                         carried_realized_paths: None,
                     });
                 }
@@ -2139,6 +2144,7 @@ impl DagActor {
                         drv_hash: drv_hash.as_str(),
                         tenant_id,
                         origin: crate::state::JobOrigin::CacheOpportunity,
+                        priority: 0.0,
                         carried_realized_paths: None,
                     });
                 }
@@ -2173,6 +2179,7 @@ impl DagActor {
                         drv_hash: drv_hash.as_str(),
                         tenant_id,
                         origin: crate::state::JobOrigin::Reprobe,
+                        priority: 0.0,
                         carried_realized_paths: None,
                     });
                 }

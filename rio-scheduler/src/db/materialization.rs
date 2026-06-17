@@ -90,6 +90,13 @@ pub(crate) struct NewJobRow<'a> {
     pub drv_hash: &'a str,
     pub tenant_id: Option<Uuid>,
     pub origin: JobOrigin,
+    /// Critical-path remaining-seconds (`state.sched.priority`;
+    /// migration 107) — drives the listing's `priority DESC` head
+    /// (`sched.materialize.listing-priority`). The merge-tx build
+    /// sites pass `0.0`: `compute_initial` runs at phase 6b, AFTER
+    /// the merge transaction commits, so `sched.priority` is unset at
+    /// in-tx job-create time; the post-6b re-stamp overwrites.
+    pub priority: f64,
     /// Realized-path carrier (migration 082) — the floating-CA paths
     /// the stale-Completed reset destroyed in memory. `Some` ONLY for
     /// the `stale_reset` origin (a creation-time snapshot of immutable
@@ -225,16 +232,19 @@ impl SchedulerDb {
         let drv_hashes: Vec<String> = rows.iter().map(|r| r.drv_hash.to_string()).collect();
         let tenant_ids: Vec<Option<Uuid>> = rows.iter().map(|r| r.tenant_id).collect();
         let origins: Vec<String> = rows.iter().map(|r| r.origin.as_str().to_string()).collect();
+        let priorities: Vec<f64> = rows.iter().map(|r| r.priority).collect();
 
         // Batch UNNEST INSERT; the materialization_jobs_unresolved
         // partial-unique index dedups (at most one pending job per
         // derivation). RETURNING reports which rows actually inserted.
         let inserted: Vec<(Uuid,)> = sqlx::query_as(
             "INSERT INTO materialization_jobs \
-                 (job_id, derivation_id, drv_hash, tenant_id, origin, created_generation) \
-             SELECT j, d, h, t, o, $6 \
-               FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::uuid[], $5::text[]) \
-                    AS u(j, d, h, t, o) \
+                 (job_id, derivation_id, drv_hash, tenant_id, origin, priority, \
+                  created_generation) \
+             SELECT j, d, h, t, o, p, $7 \
+               FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::uuid[], $5::text[], \
+                           $6::float8[]) \
+                    AS u(j, d, h, t, o, p) \
              ON CONFLICT (derivation_id) WHERE state = 'pending' DO NOTHING \
              RETURNING job_id",
         )
@@ -243,6 +253,7 @@ impl SchedulerDb {
         .bind(&drv_hashes)
         .bind(&tenant_ids)
         .bind(&origins)
+        .bind(&priorities)
         .bind(created_generation)
         .fetch_all(&mut *tx)
         .await?;
@@ -360,6 +371,7 @@ impl SchedulerDb {
     /// tx, performs the claims-floor check, delegates to the in-tx
     /// core, commits. Returns [`FencedJobCreate::Fenced`] (nothing
     /// written) below the floor.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_materialization_job_fenced(
         &self,
         derivation_id: Uuid,
@@ -367,6 +379,7 @@ impl SchedulerDb {
         tenant_id: Option<Uuid>,
         origin: JobOrigin,
         carried_realized_paths: Option<&[String]>,
+        priority: f64,
         serving_generation: ServingGeneration,
     ) -> Result<FencedJobCreate, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
@@ -380,6 +393,7 @@ impl SchedulerDb {
                 drv_hash,
                 tenant_id,
                 origin,
+                priority,
                 carried_realized_paths,
             }],
             serving_generation.as_i64(),
@@ -441,10 +455,15 @@ impl SchedulerDb {
     /// UNNEST INSERT) and the consumer makes the returned order
     /// load-bearing (512-window partition coverage + within-slice
     /// fairness) — an unspecified tie order is the SQL twin of the
-    /// repo's HashMap-iteration-order rule. `job_id` is `Uuid::now_v7`
-    /// (time-ordered), so `(created_at, job_id)` is the total unique
-    /// key; PG satisfies it via incremental sort above the existing
-    /// `(created_at) WHERE state = 'pending'` partial index — no DDL.
+    /// repo's HashMap-iteration-order rule. `(priority DESC,
+    /// created_at, job_id)` is the total unique key (`job_id` is the
+    /// PK); PG serves the LIMIT via index scan over the
+    /// `materialization_jobs_pending_priority` partial index
+    /// (migration 108). `priority` is the creating derivation's
+    /// critical-path remaining-seconds (`state.sched.priority`) so hub
+    /// dependencies are claimed before leaf substitutions when both
+    /// are pending; within a priority tie, `(created_at, job_id)`
+    /// preserves FIFO (`sched.materialize.listing-priority`).
     ///
     /// live_061 — the node-state predicate: a pending job whose
     /// derivation is TERMINAL is unclaimable by the kernel's own
@@ -462,6 +481,7 @@ impl SchedulerDb {
     /// table). Per-row cost: one PK probe over the ≤`limit` candidate
     /// rows the partial index already bounds.
     // r[impl sched.materialize.claimability-projection+1]
+    // r[impl sched.materialize.listing-priority]
     pub(crate) async fn list_claimable_materialization_jobs(
         &self,
         limit: i64,
@@ -480,7 +500,7 @@ impl SchedulerDb {
                      WHERE d.derivation_id = j.derivation_id \
                        AND d.status NOT IN ",
             ") \
-              ORDER BY j.created_at, j.job_id \
+              ORDER BY j.priority DESC, j.created_at, j.job_id \
               LIMIT $1"
         ))
         .bind(limit)
