@@ -5492,6 +5492,36 @@ rec {
       main = "spawnCoherenceTerminalAbsent";
       witness = "canReachTerminalAbsentReap";
     };
+    # sh-021 calibration twin: live-import with a MID-TRACE init at
+    # the post-`jobDiesUnreported` state (`execr=ExecBusy ∧ JTerminal
+    # ∧ want=∅` — the EXACT incident shape with the open attempt
+    # ghosted on the ledger). FALSIFY at depth 1.
+    # r[verify ctrl.ephemeral.reap-terminal-absent]
+    quint-ctrl-calib-sh021-ghosted-fod = mkQuintWitnessCheck {
+      name = "ctrl-calib-sh021-ghosted-fod";
+      spec = "calibration/spawnCoherence-calib-sh021-ghosted-fod";
+      main = "spawnCoherenceCalibSh021GhostedFod";
+      extraSpecs = [ "spawnCoherence" ];
+      init = "calibInit";
+      step = "calibStep";
+      witness = "terminalAbsentReaped";
+    };
+    # HOLD half from the SAME mid-trace init: the `terminalAbsentReaps`
+    # arm reaps i1 at the first tick — the synthesized close.
+    # r[verify ctrl.ephemeral.reap-terminal-absent]
+    quint-ctrl-calib-sh021-ghosted-fod-hold = mkQuintCheck {
+      name = "ctrl-calib-sh021-ghosted-fod-hold";
+      spec = "calibration/spawnCoherence-calib-sh021-ghosted-fod";
+      main = "spawnCoherenceCalibSh021GhostedFodHold";
+      extraSpecs = [ "spawnCoherence" ];
+      init = "calibInit";
+      step = "calibStep";
+      invariants = [
+        "terminalAbsentReaped"
+        "reapSafety"
+        "orphanRemoved"
+      ];
+    };
 
     # ---- Model N: exhaustive regime checks ---------------------------
 
