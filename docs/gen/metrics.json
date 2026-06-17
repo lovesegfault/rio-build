@@ -183,6 +183,7 @@
     "rio_scheduler_sla_prediction_ratio",
     "rio_scheduler_sla_prior_divergence",
     "rio_scheduler_sla_refit_total",
+    "rio_scheduler_sla_refresh_age_seconds",
     "rio_scheduler_sla_residual_multimodal_total",
     "rio_scheduler_sla_suspicious_scaling_total",
     "rio_scheduler_spawn_intents_per_response",
@@ -1225,7 +1226,13 @@
       {
         "name": "rio_scheduler_sla_refit_total",
         "kind": "counter",
-        "help": "SLA estimator refresh ticks (≈60s cadence; VM-test sync barrier — increments regardless of [sla] gate)"
+        "help": "Completed SLA estimator background refreshes (≈60s cadence; VM-test sync barrier — +1 = one refresh completed, regardless of [sla] gate)"
+      },
+      {
+        "name": "rio_scheduler_sla_refresh_age_seconds",
+        "kind": "gauge",
+        "help": "Seconds since the last completed SLA-estimator background refresh. Emitted from the actor's housekeeping cadence (NOT the poller loop) so it climbs when estimator_poller has panicked or refresh() is persistently failing. Climbs from boot until the first leader-side refresh.",
+        "aggregation": "leader-zeroed"
       },
       {
         "name": "rio_scheduler_sla_residual_multimodal_total",

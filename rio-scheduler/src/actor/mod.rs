@@ -655,9 +655,11 @@ pub struct DagActor {
     /// ADR-023 per-`(pname, system, tenant)` fitted curves. Feeds
     /// `compute_spawn_intents` (SpawnIntent population) and
     /// dispatch's resource-fit filter via [`crate::sla::solve::intent_for`].
-    /// Internally `Arc<RwLock<…>>`; reads on the snapshot/dispatch path
-    /// are a single `.cached()` clone.
-    pub(crate) sla_estimator: crate::sla::SlaEstimator,
+    /// Shared with [`crate::sla::estimator_poller`] (sh-018b: refresh
+    /// runs OFF the actor turn); the actor only reads — every
+    /// `SlaEstimator` field is interior-`RwLock` and the per-key
+    /// `cache.write()` hold is sub-µs.
+    pub(crate) sla_estimator: Arc<crate::sla::SlaEstimator>,
     /// Tier ladder from `cfg.sla.solve_tiers()` (sorted tightest-first).
     /// Shared between the tick `refresh()` (Schmitt-trigger reassign)
     /// and `solve_intent_for` so both see the SAME ladder.
@@ -1203,7 +1205,13 @@ impl DagActor {
             store_client: plumbing.store_client,
             grpc_timeout: cfg.grpc_timeout,
             cache_breaker: CacheCheckBreaker::default(),
-            sla_estimator: crate::sla::SlaEstimator::new(&cfg.sla),
+            // sh-018b: shared with `estimator_poller` when main.rs
+            // wires it; tests / non-K8s spawns leave plumbing at `None`
+            // → constructed from `cfg.sla` here so tests that customize
+            // `cfg.sla` keep their config-matched estimator.
+            sla_estimator: plumbing
+                .sla_estimator
+                .unwrap_or_else(|| Arc::new(crate::sla::SlaEstimator::new(&cfg.sla))),
             sla_tiers: cfg.sla.solve_tiers(),
             sla_ceilings,
             sla_config: cfg.sla,
@@ -1216,7 +1224,7 @@ impl DagActor {
                 crate::sla::cost::IceBackoff::new(max_lead_time).with_members(member_classes),
             ),
             dispatched_cells: dashmap::DashMap::new(),
-            solve_cache: Arc::default(),
+            solve_cache: plumbing.solve_cache.unwrap_or_default(),
             tick_count: 0,
             backpressure_active: Arc::new(AtomicBool::new(false)),
             // The initial tenure stamp (see the field doc): the lease

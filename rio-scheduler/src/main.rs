@@ -317,6 +317,31 @@ async fn main() -> anyhow::Result<()> {
                 ),
             );
         }
+        // sh-018b: SLA-estimator refresh runs OFF the actor turn (it
+        // was the surviving 15-30s phase-00 stall under completion
+        // bursts). The actor and this task share `sla_estimator` /
+        // `solve_cache` via Arc; the actor only reads. The poller-
+        // liveness gauge is emitted by the ACTOR (so it climbs on a
+        // poller panic), not here.
+        let sla_estimator = std::sync::Arc::new(rio_scheduler::sla::SlaEstimator::new(&cfg.sla));
+        let solve_cache: std::sync::Arc<rio_scheduler::sla::solve::SolveCache> =
+            std::sync::Arc::default();
+        rio_common::task::spawn_monitored(
+            "sla-estimator-refresh",
+            rio_scheduler::sla::estimator_poller(
+                SchedulerDb::new(pool.clone()),
+                leader.clone(),
+                std::sync::Arc::clone(&sla_estimator),
+                std::sync::Arc::clone(&solve_cache),
+                cfg.sla.solve_tiers(),
+                // Same cadence as the on-actor path it replaced
+                // (`ESTIMATOR_REFRESH_EVERY` × tick): 60s in
+                // production; the sla-sizing VM fixture's
+                // `tick_interval_secs=2` → 12s.
+                cfg.tick_interval * 6,
+                shutdown.clone(),
+            ),
+        );
 
         // Spawn the DAG actor with the shared leader state. Poison +
         // retry come from scheduler.toml (or `#[serde(default)]` if
@@ -351,6 +376,8 @@ async fn main() -> anyhow::Result<()> {
                 cost_table: std::sync::Arc::clone(&cost_table),
                 cost_was_leader,
                 cost_reload_notify,
+                sla_estimator: Some(sla_estimator),
+                solve_cache: Some(solve_cache),
                 shutdown: shutdown.clone(),
             },
         );

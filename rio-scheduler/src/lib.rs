@@ -785,8 +785,17 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_sla_refit_total",
-        "SLA estimator refresh ticks (≈60s cadence; VM-test sync barrier — \
-         increments regardless of [sla] gate)"
+        "Completed SLA estimator background refreshes (≈60s cadence; \
+         VM-test sync barrier — +1 = one refresh completed, regardless \
+         of [sla] gate)"
+    );
+    describe_gauge!(
+        "rio_scheduler_sla_refresh_age_seconds",
+        "Seconds since the last completed SLA-estimator background \
+         refresh. Emitted from the actor's housekeeping cadence (NOT \
+         the poller loop) so it climbs when estimator_poller has \
+         panicked or refresh() is persistently failing. Climbs from \
+         boot until the first leader-side refresh."
     );
     describe_counter!(
         "rio_scheduler_disk_evidence_total",

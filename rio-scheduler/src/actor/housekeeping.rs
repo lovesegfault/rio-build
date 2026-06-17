@@ -118,49 +118,39 @@ impl FlushTickOutcome {
 }
 
 impl DagActor {
-    /// Refresh the SLA estimator from build_samples. Runs every ~6
-    /// ticks (60s at the default 10s interval). Separated from
-    /// handle_tick so the every-tick housekeeping stays readable.
+    /// Periodic on-actor housekeeping that USED to drive
+    /// `SlaEstimator::refresh`. sh-018b: the refresh body lives in
+    /// [`crate::sla::estimator_poller`] (off the single-threaded turn
+    /// — it was the surviving 15-30s phase-00 stall under completion
+    /// bursts). This shrunken body keeps only what NEEDS the actor:
+    /// `tick_count` bookkeeping, the poller-liveness gauge emit (so it
+    /// climbs when the poller dies — a gauge emitted from the poller
+    /// loop freezes on panic), and `full_sweep` (`&mut self.dag`).
     ///
-    /// `pub(super)` for the `sla_contract` actor-boundary tests, which
-    /// drive this directly to assert the derived-`inputs_gen` stability
-    /// across no-op refreshes without going through `handle_tick`'s
-    /// leader check and orphan-cancel side-effects.
+    /// `pub(super)` for the `sla_contract` actor-boundary tests; those
+    /// now call `actor.sla_estimator.refresh()` directly via the
+    /// `refresh_cycle` helper.
     pub(super) async fn maybe_refresh_estimator(&mut self) {
         self.tick_count = self.tick_count.wrapping_add(1);
 
         // Every 6th tick (≈60s with 10s interval). Not configurable:
-        // the SLA cache is a snapshot, not live; 60s is plenty fresh
-        // for critical-path priorities. Making this tunable is YAGNI
-        // until someone asks.
+        // `full_sweep` is a periodic drift-correction over float
+        // accumulation, not a "react to fresh fits" hook; 60s is
+        // plenty.
         const ESTIMATOR_REFRESH_EVERY: u64 = 6;
         if !self.tick_count.is_multiple_of(ESTIMATOR_REFRESH_EVERY) {
             return;
         }
 
-        // VM-test sync barrier: increments on every refresh tick
-        // (counter increments per tick so fixtures can poll it as
-        // "≥2 ticks since INSERT").
-        metrics::counter!("rio_scheduler_sla_refit_total").increment(1);
-
-        // ADR-023 SLA estimator: incremental refit of touched
-        // (pname, system, tenant) keys. Log-and-keep-stale on PG
-        // failure; the cache holds the previous fit. The tier ladder
-        // feeds the Schmitt-trigger reassignment inside refit.
-        // `on_evict` is the shared `on_fit_evicted` so the memo's
-        // bound (|live keys| × |overrides|) actually holds. ADR-023
-        // L616: `HwTable` is a shared solve input; `inputs_gen` is
-        // derived from it at poll time — nobody bumps.
-        match self
-            .sla_estimator
-            .refresh(&self.db, &self.sla_tiers, |k| self.on_fit_evicted(k))
-            .await
-        {
-            Ok(n) => debug!(keys_refit = n, "sla estimator refreshed"),
-            Err(e) => {
-                warn!(error = %e, "sla estimator refresh failed; keeping previous fits");
-            }
-        }
+        // Emitted from the SURVIVING task: if `estimator_poller`
+        // panics, `last_refresh_wall` stops advancing and this gauge
+        // climbs every 60s here. An in-loop emit from the poller would
+        // freeze at last value (the metrics registry holds it; `>
+        // threshold` alerts never fire) — sh-018b review. Leader-family
+        // (the poller is leader-gated): the lose-edge sweep zeroes it
+        // so a deposed leader reads alert-neutral.
+        crate::observability::LeaderGauge::SlaRefreshAge
+            .set(self.sla_estimator.refresh_age_seconds());
 
         // Full critical-path sweep (same 60s cadence). Belt-and-
         // suspenders over the incremental update_ancestors calls: any

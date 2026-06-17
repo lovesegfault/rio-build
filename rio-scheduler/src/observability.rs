@@ -269,6 +269,14 @@ leader_gauges! {
     // family exists to prevent, inverted.
     SlaPriorDivergence =>
         ("rio_scheduler_sla_prior_divergence", Some(("param", DIVERGENCE_PARAMS)), 1.0),
+    // sh-018b: estimator_poller liveness. Emitted from the actor's
+    // housekeeping cadence (NOT the poller loop) so it climbs when the
+    // poller has panicked. Leader-only — the poller is leader-gated, so
+    // a standby's `last_refresh_wall` is meaningless. Reset 0.0 =
+    // alert-neutral on failover; the new leader's first poller tick
+    // (tokio::interval fires immediately) re-stamps `last_refresh_wall`
+    // before the first cadence emit.
+    SlaRefreshAge => ("rio_scheduler_sla_refresh_age_seconds", None, 0.0),
 }
 
 /// Sweep every family member to its declared reset value. The single

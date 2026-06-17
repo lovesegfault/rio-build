@@ -126,6 +126,16 @@ pub struct DagActorPlumbing {
     /// gated writers (this actor's `observe_instance_types`) drop
     /// observations.
     pub cost_reload_notify: Arc<tokio::sync::Notify>,
+    /// ADR-023 fitted curves. Shared with
+    /// [`crate::sla::estimator_poller`]; `None` → `DagActor::new`
+    /// constructs from `cfg.sla` (tests / non-K8s spawns), so tests
+    /// that customize `cfg.sla` keep a config-matched estimator
+    /// without also wiring plumbing.
+    pub sla_estimator: Option<Arc<crate::sla::SlaEstimator>>,
+    /// Per-key admissible-set memo. Shared with
+    /// [`crate::sla::estimator_poller`] for its `on_evict` hook (the
+    /// inlined `on_fit_evicted` body); `None` → `Arc::default()`.
+    pub solve_cache: Option<Arc<crate::sla::solve::SolveCache>>,
     /// Shutdown token. The run loop `select!`s on `cancelled()` with
     /// `biased` ordering so SIGTERM drains workers immediately.
     pub shutdown: rio_common::signal::Token,
@@ -194,6 +204,8 @@ impl Default for DagActorPlumbing {
             cost_table: Arc::default(),
             cost_was_leader: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             cost_reload_notify: Arc::default(),
+            sla_estimator: None,
+            solve_cache: None,
             shutdown: rio_common::signal::Token::new(),
             #[cfg(test)]
             recovery_toctou_gate: None,

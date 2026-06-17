@@ -264,6 +264,14 @@ pub struct SlaEstimator {
     /// to a different cluster are filtered at SQL read time.
     cluster: String,
     last_tick: RwLock<f64>,
+    /// Wall-clock epoch of the last completed [`Self::refresh`]. Read by
+    /// the actor's `maybe_refresh_estimator` to emit
+    /// `rio_scheduler_sla_refresh_age_seconds` from the SURVIVING task:
+    /// if [`estimator_poller`] panics, this stops advancing and the
+    /// gauge climbs on the actor's 60s cadence (unlike `last_tick`,
+    /// which is the `completed_at` high-water mark and would also
+    /// stagnate on a quiet cluster — sh-018b review).
+    last_refresh_wall: RwLock<f64>,
     ring_buffer: u32,
     /// Recent per-`(ModelKey, dim)` prediction-ratio observations for
     /// `GetSlaMispredictors`. The histogram metric is `dim`-only
@@ -277,6 +285,12 @@ pub struct SlaEstimator {
     /// outlier scan is O(|new_rows|), not O(|touched|×|new_rows|).
     #[cfg(test)]
     pub(super) last_timing: Mutex<RefreshTiming>,
+    /// Count of [`Self::refresh`] entries — drives the structural
+    /// `phase00_never_calls_refresh_on_actor` red-first (sh-018b):
+    /// `handle_tick` MUST NOT bump this; only [`estimator_poller`]
+    /// (or a test calling `refresh()` directly) does.
+    #[cfg(test)]
+    pub(crate) refresh_calls: std::sync::atomic::AtomicU64,
 }
 
 /// Iteration counters from the last [`SlaEstimator::refresh`] call.
@@ -345,11 +359,24 @@ impl SlaEstimator {
             default_tier_target_wall,
             cluster: cfg.cluster.clone(),
             last_tick: RwLock::new(0.0),
+            last_refresh_wall: RwLock::new(0.0),
             ring_buffer: cfg.ring_buffer,
             mispredictors: metrics::MispredictorTracker::new(1024),
             #[cfg(test)]
             last_timing: Mutex::new(RefreshTiming::default()),
+            #[cfg(test)]
+            refresh_calls: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Seconds since the last completed [`Self::refresh`]. Feeds the
+    /// `rio_scheduler_sla_refresh_age_seconds` gauge — emitted from the
+    /// actor's housekeeping cadence (NOT from [`estimator_poller`]) so
+    /// it climbs when the poller has died. `0.0` if no refresh has
+    /// ever completed (cold standby — the gauge climbs from boot,
+    /// which is the correct "not yet warm" signal).
+    pub fn refresh_age_seconds(&self) -> f64 {
+        now_epoch() - *self.last_refresh_wall.read()
     }
 
     /// Push one completion's prediction ratios into the mispredictor
@@ -701,6 +728,9 @@ impl SlaEstimator {
         tiers: &[solve::Tier],
         on_evict: impl Fn(&types::ModelKey),
     ) -> anyhow::Result<usize> {
+        #[cfg(test)]
+        self.refresh_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Override snapshot first: cheap (operator-written, tens of
         // rows) and independent of the sample refit, so a PG blip on
         // the heavier incremental query below still leaves the override
@@ -908,8 +938,91 @@ impl SlaEstimator {
         self.priors.write().fleet =
             prior::fleet_median(&coupled, FLEET_MEDIAN_MIN_KEYS, FLEET_MEDIAN_MIN_TENANTS);
 
+        // Liveness stamp for `refresh_age_seconds()`. After every
+        // exitable side-effect — a `?` above keeps `last_refresh_wall`
+        // unchanged, which IS the climbing-gauge signal we want on
+        // persistent PG failure.
+        *self.last_refresh_wall.write() = now_epoch();
+
         Ok(touched.len())
     }
+}
+
+/// Background SLA-estimator refresh loop. sh-018b: lifts the
+/// `read_build_samples_for_keys` + bootstrap-CI cost (the surviving
+/// 15-30s phase-00 actor stalls under completion bursts) off the
+/// single-threaded actor turn. The actor and this task share `est` and
+/// `solve_cache` via `Arc`; the actor only reads ([`SlaEstimator`]'s
+/// state is interior-`RwLock` per field, and the per-key `cache.write()`
+/// hold is sub-µs — see the `last_refresh_wall` field doc).
+///
+/// Shape: [`cost::spot_price_poller`]. Leader-gated because
+/// [`SlaEstimator::refresh`] writes PG (`mark_outliers_excluded`,
+/// `trim_build_samples_batch`); a standby running it would race the
+/// leader's outlier marking. No `was_leader` edge-reload latch:
+/// `SlaEstimator` has no PG-persisted state to reload — fits are
+/// in-mem, `last_tick` is `0.0` per process, so a standby-promoted
+/// leader's first tick is a `since=0.0` full warm.
+///
+/// `on_evict` is `solve_cache.remove_model_key(model_key_hash(k))` —
+/// the inlined body of `DagActor::on_fit_evicted`, which the poller
+/// can't call (no `&DagActor`). Same one-line body, same bound.
+///
+/// `interval` is `cfg.tick_interval × ESTIMATOR_REFRESH_EVERY` (60s in
+/// production; the VM `sla-sizing` fixture overrides
+/// `tick_interval_secs=2` → 12s) so the off-actor cadence matches the
+/// on-actor one it replaced — `wait_estimator_tick()` keeps its
+/// budget.
+pub async fn estimator_poller(
+    db: SchedulerDb,
+    leader: crate::lease::LeaderState,
+    est: Arc<SlaEstimator>,
+    solve_cache: Arc<solve::SolveCache>,
+    tiers: Vec<solve::Tier>,
+    interval: std::time::Duration,
+    shutdown: rio_common::signal::Token,
+) {
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            _ = tick.tick() => {},
+        }
+        // Gauge emit deliberately NOT here: a panicked poller never
+        // reaches the next `.set()` and the metrics registry serves the
+        // last value forever — `> threshold` alerts never fire. The
+        // ACTOR emits it (from `refresh_age_seconds()`) so the gauge
+        // climbs when this task dies.
+        if !leader.is_leader() {
+            continue;
+        }
+        match est
+            .refresh(&db, &tiers, |k| {
+                solve_cache.remove_model_key(solve::model_key_hash(k));
+            })
+            .await
+        {
+            Ok(n) => {
+                // Post-Ok: +1 = one refresh COMPLETED (was: +1 =
+                // STARTED, when the increment sat before the await on
+                // the actor). VM-test sync barrier.
+                ::metrics::counter!("rio_scheduler_sla_refit_total").increment(1);
+                tracing::debug!(keys_refit = n, "sla estimator refreshed");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "sla estimator refresh failed; keeping previous fits");
+            }
+        }
+    }
+}
+
+fn now_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
