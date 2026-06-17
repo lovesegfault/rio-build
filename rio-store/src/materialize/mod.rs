@@ -60,18 +60,22 @@ const REPORT_RETRY_BUDGET: Duration = Duration::from_secs(600);
 /// replicas doesn't poll the leader in lockstep (the builder pull
 /// client's pacing discipline).
 ///
-/// live_046 (R-B) cadence re-derivation: the scheduler's 5 s steal
-/// horizon was derived from "a healthy IDLE worker lists at least
-/// every ~1.2 s" — the worst idle gap is one jittered beat,
-/// `poll_interval × (1 + 0.2)`, and four missed beats
-/// (4 × 1 × 1.2 = 4.8 s) fit inside the horizon. Eager re-poll
-/// changes cadence ONLY for productive passes (more frequent beats —
-/// freshness strictly improves) and leaves the idle/EMPTY cadence —
-/// the horizon's binding worst case — byte-identical; mid-walk
-/// silence (the intended stealing trigger) is unchanged. The
-/// `idle_beat_worst_gap_times_four_fits_the_steal_horizon` pin
-/// asserts the relation through this const, the config default, and
-/// the mirrored horizon symbol (R17).
+/// live_046 (R-B) cadence re-derivation, post sh-024 §S1: the
+/// scheduler's 5 s steal horizon was derived from "a healthy IDLE
+/// worker lists at least every ~1.2 s" — one jittered base beat,
+/// `poll_interval × (1 + 0.2)`. Eager re-poll changes cadence only
+/// for PRODUCTIVE passes (more frequent beats — freshness strictly
+/// improves), and the empty-streak override (sh-024 §S1) escalates
+/// the idle/EMPTY cadence to `Floor(EMPTY_BACKOFF)` — at cap the
+/// worst per-replica idle gap is `EMPTY_BACKOFF.cap × (1 + 0.2)`
+/// = 4.8 s, which still fits the horizon by construction (the
+/// backed-off replica stays inside its rendezvous slice's freshness
+/// window; crossing degrades to broader-listed, never to unlisted).
+/// Mid-walk silence (the intended stealing trigger) is unchanged.
+/// The base-beat relation is pinned at
+/// `idle_beat_worst_gap_times_four_fits_the_steal_horizon`; the
+/// escalated-cap relation at
+/// `empty_backoff_cap_fits_the_steal_horizon_and_ttl` (R17).
 const POLL_JITTER: rio_common::backoff::Jitter = rio_common::backoff::Jitter::Proportional(0.2);
 
 /// sh-002 (osr2-a) — coordinator-panic restart envelope: 1 s → 30 s
@@ -82,6 +86,47 @@ const COORDINATOR_RESTART_BACKOFF: rio_common::backoff::Backoff = rio_common::ba
     mult: 2.0,
     cap: Duration::from_secs(30),
     jitter: rio_common::backoff::Jitter::Full,
+};
+
+/// sh-024 §S1 / sh-006 — the empty-streak escalation envelope: a
+/// persistently-empty backlog escalates the coordinator's broadcast
+/// pace from the flat 1 s `Beat` to `Floor(1 s → 2 s → cap)`, so an
+/// idle replica lists at the cap cadence instead of once per
+/// `poll_interval × executor_concurrency` (sh-006 measured 206 k
+/// listings vs 3 356 claims — 61:1; sh-024 saw 26 replicas drive
+/// ~830 listings/s aggregate during the build-only phase).
+///
+/// `cap = 4 s` (sh-024 review (d)): with [`pace_one`]'s upward-only
+/// `POLL_JITTER` (×1.2) the worst per-replica idle gap is 4.8 s,
+/// which fits the scheduler's `LISTING_STEAL_HORIZON = 5 s` (a
+/// backed-off replica stays inside its rendezvous slice's freshness
+/// window — crossing it would degrade to broader-listed, never to
+/// unlisted, but the cap is sized to avoid even that while backlog
+/// is empty) AND is ≪ `LISTING_MEMBER_TTL = 60 s` (the honest-beat
+/// coupling: an idle replica never self-evicts). At 26 replicas
+/// × ~1/4 s the idle aggregate is ~6.5 listings/s — a ~100× drop.
+/// `Jitter::None`: the floor is the UNJITTERED schedule step, and
+/// [`pace_one`]'s upward-only `POLL_JITTER` (×[1, 1.2]) supplies the
+/// herd desync at the worker. `Full` was rejected: it would draw
+/// `U[0, cap]` and undercut the per-replica no-spin floor the
+/// `pass-outcome` law guarantees (an idle pass could re-list at ~0 s
+/// — the `empty_and_gated_passes_sleep_the_jittered_beat` lower
+/// bound). The trade is fleet-wide wake latency: with `None` every
+/// backed-off replica wakes within one cap × 1.2 ≤ 4.8 s after
+/// backlog→non-empty (vs. `Full`'s ~150 ms expected fleet-min);
+/// against sh-024's observed 240+ s empty windows that is negligible
+/// (review (e)). Drip-feed oscillation is bounded to the rendezvous
+/// OWNER: non-minting replicas seal `ListedNoAction` (escalates),
+/// only the minter sees `Delivered`/`Contested` (resets) — review
+/// (c).
+///
+/// The const-relation pins (R17) live at
+/// `empty_backoff_cap_fits_the_steal_horizon_and_ttl`.
+const EMPTY_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
+    base: Duration::from_secs(1),
+    mult: 2.0,
+    cap: Duration::from_secs(4),
+    jitter: rio_common::backoff::Jitter::None,
 };
 
 /// sh-002 — one parked worker's claim-slot offer to the coordinator.
@@ -423,6 +468,15 @@ async fn claim_coordinator<C>(
     // rejection withholds its listing beat so the scheduler re-homes
     // this replica's rendezvous slice (the honest beat).
     let mut futility = client::ConversionFutilityLatch::default();
+    // sh-024 §S1: consecutive idle-shape passes
+    // (Empty/ListedNoAction/ListFailed/Wedged/Abandoned) — escalates
+    // the broadcast pace to Floor(EMPTY_BACKOFF.duration(streak)) so a
+    // persistently-empty backlog lists at the cap cadence, not the
+    // flat 1 s beat. Reset on any work-observing pass
+    // (Delivered/Settled/Contested). ONE counter on the COORDINATOR
+    // (not per-worker) so every drained token receives the same
+    // escalated floor — workers carry no pacing state.
+    let mut empty_streak: u32 = 0;
     loop {
         // The coordinator is purely reactive: it parks on the slot
         // channel and runs a pass exactly when a worker is ready WITH
@@ -456,7 +510,28 @@ async fn claim_coordinator<C>(
         // round-8 WO-S2-1: the pacing decision is a total function of
         // the pass's sealed outcome, read BEFORE the claims are
         // distributed to workers — every token learns the same pace.
-        let pace = pace_for(&pass.outcome);
+        // sh-024 §S1: the empty-streak override is applied HERE (the
+        // coordinator side), OUTSIDE pace_for — the
+        // r[impl store.materialize.pass-outcome] law stays a unary
+        // total function over the sealed outcome alone (rustc's
+        // exhaustiveness IS the census); the streak is the single
+        // piece of cross-pass state the coordinator carries.
+        let mut pace = pace_for(&pass.outcome);
+        match pass.outcome {
+            client::PassOutcome::Delivered { .. }
+            | client::PassOutcome::Settled { .. }
+            | client::PassOutcome::Contested { .. } => {
+                empty_streak = 0;
+            }
+            client::PassOutcome::Empty
+            | client::PassOutcome::ListedNoAction { .. }
+            | client::PassOutcome::ListFailed
+            | client::PassOutcome::Wedged(_)
+            | client::PassOutcome::Abandoned => {
+                empty_streak = empty_streak.saturating_add(1);
+                pace = Pace::Floor(EMPTY_BACKOFF.duration(empty_streak.saturating_sub(1)));
+            }
+        }
         // bug_102 (the multi-slot form): the budget is `tokens.len()`,
         // and `poll_and_claim` never delivers more claims than the
         // budget — so the zip below is total over the claimed set; a
@@ -1267,12 +1342,14 @@ mod tests {
         }
     }
 
-    /// R17 const-relation pin (the beat-cadence floor as a typed
-    /// envelope): the steal horizon was derived from "a healthy IDLE
-    /// worker lists at least every ~1.2 s"; eager re-poll changes
+    /// R17 const-relation pin (the BASE-beat cadence floor as a
+    /// typed envelope): the steal horizon was derived from "a healthy
+    /// IDLE worker lists at least every ~1.2 s"; eager re-poll changes
     /// cadence only for PRODUCTIVE passes (freshness strictly
-    /// improves) and leaves the idle/empty cadence — the horizon's
-    /// binding worst case — byte-identical. The pin:
+    /// improves). sh-024 §S1's empty-streak override escalates the
+    /// idle cadence past the base beat — that arm's horizon relation
+    /// is pinned separately at
+    /// [`empty_backoff_cap_fits_the_steal_horizon_and_ttl`]. The pin:
     /// 4 x default-poll-interval x (1 + jitter) <= steal horizon,
     /// asserted THROUGH the real symbols (POLL_JITTER, the config
     /// default, the mirrored horizon const — R14).
@@ -1490,23 +1567,26 @@ mod tests {
         );
     }
 
-    /// live_046 companion pin (the no-spin half): EMPTY passes sleep
-    /// the jittered beat — three empty passes advance the virtual
-    /// clock by at least two jittered intervals (>= 2 x 0.8 s at the
-    /// 1 s default with ±20% jitter; the third pass exits via
-    /// shutdown before its sleep). Jitter is preserved on every sleep
-    /// that occurs.
+    /// live_046 companion pin (the no-spin half), re-derived at
+    /// sh-024 §S1: EMPTY passes sleep AT LEAST the escalating
+    /// `EMPTY_BACKOFF` floor — three empty passes advance the virtual
+    /// clock by streak-1 (1 s) + streak-2 (2 s) before the third pass
+    /// exits via shutdown. The lower bound is the no-spin guarantee
+    /// (the floor is never undercut — `Jitter::None` on the schedule
+    /// step + upward-only `POLL_JITTER` at `pace_one`); the upper
+    /// bound is the same floors × 1.2.
     #[tokio::test]
     async fn empty_and_gated_passes_sleep_the_jittered_beat() {
         let (elapsed, _state) = run_claim_loop_with(vec![vec![]], vec![], 3).await;
         assert!(
-            elapsed >= std::time::Duration::from_millis(1600),
-            "two empty-pass beats must elapse (got {elapsed:?})"
+            elapsed >= std::time::Duration::from_millis(3000),
+            "two empty-pass floors (streak 1 s + 2 s) must elapse — the \
+             no-spin lower bound (got {elapsed:?})"
         );
         assert!(
-            elapsed <= std::time::Duration::from_millis(2600),
-            "and no more than two jittered beats before the exit \
-             (got {elapsed:?})"
+            elapsed <= std::time::Duration::from_millis(3700),
+            "and no more than the two escalated floors × 1.2 jitter before \
+             the exit (got {elapsed:?})"
         );
     }
 
@@ -1536,15 +1616,16 @@ mod tests {
             "zero actions: every descriptor exited pre-pull"
         );
         assert!(
-            elapsed >= std::time::Duration::from_millis(1600),
+            elapsed >= std::time::Duration::from_millis(3000),
             "left: three list RPCs, zero virtual time (the warn/list hot \
              loop at RPC speed) / right: each zero-action pass sleeps >= \
-             the jittered beat (got {elapsed:?})"
+             the escalating EMPTY_BACKOFF floor (streak 1 s + 2 s; sh-024 \
+             §S1 — got {elapsed:?})"
         );
         assert!(
-            elapsed <= std::time::Duration::from_millis(2600),
-            "and no more than two jittered beats before the exit \
-             (got {elapsed:?})"
+            elapsed <= std::time::Duration::from_millis(3700),
+            "and no more than the two escalated floors × 1.2 jitter before \
+             the exit (got {elapsed:?})"
         );
     }
 
@@ -2133,5 +2214,247 @@ mod tests {
             .await
             .expect("driver exits on shutdown")
             .unwrap();
+    }
+
+    // ── sh-024 §S1 (the empty-poll storm) ────────────────────────────
+
+    /// Shared sh-024 mock: records the virtual-clock instant of every
+    /// `list_jobs` call; serves a popped script of listing batches
+    /// (repeating empty once exhausted) and answers every pull
+    /// `NotYetReady{0}` (so a non-empty listing seals `Contested`, not
+    /// `Delivered` — no job execution path needed).
+    #[derive(Clone)]
+    struct StreakTransport {
+        stamps: std::sync::Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+        listings: std::sync::Arc<
+            std::sync::Mutex<
+                std::collections::VecDeque<Vec<rio_proto::types::MaterializationJobDescriptor>>,
+            >,
+        >,
+    }
+    impl client::MaterializeClaimTransport for StreakTransport {
+        async fn list_jobs(
+            &mut self,
+            _req: rio_proto::types::ListMaterializationJobsRequest,
+        ) -> Result<rio_proto::types::ListMaterializationJobsResponse, tonic::Status> {
+            self.stamps
+                .lock()
+                .unwrap()
+                .push(tokio::time::Instant::now());
+            let jobs = self
+                .listings
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default();
+            Ok(rio_proto::types::ListMaterializationJobsResponse { jobs })
+        }
+        async fn pull(
+            &mut self,
+            _req: rio_proto::types::PullAssignmentRequest,
+        ) -> Result<rio_proto::types::PullAssignmentResponse, tonic::Status> {
+            Ok(rio_proto::types::PullAssignmentResponse {
+                outcome: Some(
+                    rio_proto::types::pull_assignment_response::Outcome::NotYetReady(
+                        rio_proto::types::NotYetReady {
+                            retry_after_seconds: 0,
+                        },
+                    ),
+                ),
+            })
+        }
+    }
+    impl client::MaterializeReportTransport for StreakTransport {
+        async fn report(
+            &mut self,
+            _req: rio_proto::types::ReportOutcomeRequest,
+        ) -> Result<(), tonic::Status> {
+            Ok(())
+        }
+        async fn report_progress(
+            &mut self,
+            _req: rio_proto::types::ReportMaterializationProgressRequest,
+        ) -> Result<(), tonic::Status> {
+            Ok(())
+        }
+    }
+
+    // r[verify store.materialize.pass-outcome]
+    /// **sh-024 §S1 — RED-FIRST.** A persistently-empty backlog must
+    /// not drive the coordinator at the flat 1 s beat: the
+    /// `empty_streak` override escalates the broadcast pace to
+    /// `Floor(EMPTY_BACKOFF.duration(streak))` so a fully-idle replica
+    /// lists at the cap cadence (mean ≈ cap/2 under Full jitter), not
+    /// once per `poll_interval × executor_concurrency`.
+    ///
+    /// One worker, 60 s of virtual time. Pre-fix every pass paces
+    /// `Beat` (1 s ± 20 %), so the coordinator runs ≥ 50 listings (the
+    /// sh-006 61:1 / sh-024 ~830 listings/s storm at fleet scale).
+    /// Post-fix the streak escalates 1 s → 2 s → 4 s cap (unjittered
+    /// schedule, upward `POLL_JITTER` at the worker) — ≤ 17 listings.
+    #[tokio::test]
+    async fn idle_fleet_listing_rate_bounded() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let shutdown = rio_common::signal::Token::new();
+        let transport = StreakTransport {
+            stamps: Default::default(),
+            listings: Default::default(),
+        };
+        let stamps = std::sync::Arc::clone(&transport.stamps);
+        tokio::time::pause();
+        let claim = transport.clone();
+        let driver = tokio::spawn(drive_coordinator(
+            db.pool.clone(),
+            1,
+            executor::PathSlotPool::new(1),
+            move || claim.clone(),
+            transport,
+            shutdown.clone(),
+        ));
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), driver)
+            .await
+            .expect("driver exits on shutdown")
+            .unwrap();
+        let stamps = stamps.lock().unwrap();
+        let n = stamps.len();
+        assert!(
+            n < 20,
+            "left: {n} ListMaterializationJobs in 60 s with an always-empty \
+             backlog (the flat 1 s ± 20 % Beat → ≥ 50; the sh-024 §S1 storm \
+             at fleet scale: 26 replicas × 32 workers ≈ 830/s) / right: the \
+             coordinator's empty_streak override escalates to \
+             Floor(EMPTY_BACKOFF) — at the 4 s cap an idle replica lists \
+             ≤ ~17× per minute"
+        );
+        assert!(n >= 6, "need ≥ 6 stamps to observe the 5th-gap cap");
+        // The 5th inter-list gap (streak=5, attempt index 4 → capped):
+        // the coordinator broadcast Floor(4 s) and pace_one jitters
+        // upward only — the gap is ≥ the cap by construction. RED at
+        // base: every gap ≈ 1 s.
+        let gap5 = stamps[5].duration_since(stamps[4]);
+        assert!(
+            gap5 >= EMPTY_BACKOFF.cap,
+            "left: 5th-consecutive-empty gap = {gap5:?} (the flat Beat — no \
+             escalation) / right: by streak 5 the broadcast pace is \
+             Floor(EMPTY_BACKOFF.cap = {:?}) and pace_one never undercuts \
+             the floor",
+            EMPTY_BACKOFF.cap
+        );
+    }
+
+    /// **sh-024 §S1 — reset law.** A pass that observes work
+    /// (`Delivered`/`Settled`/`Contested`) MUST reset the streak: a
+    /// drip-fed backlog snaps a backed-off replica back to the base
+    /// beat on the rendezvous owner, never strands it at the cap. The
+    /// non-owners seal `ListedNoAction` (no fresh mints) and KEEP
+    /// escalating — only the minter resets, so drip-feed oscillation
+    /// is bounded to one replica per delivery.
+    ///
+    /// Pre-fix this is vacuously green (no escalation exists); the
+    /// red-first proposition is `idle_fleet_listing_rate_bounded`.
+    #[tokio::test]
+    async fn empty_streak_resets_on_delivery() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let shutdown = rio_common::signal::Token::new();
+        let job = rio_proto::types::MaterializationJobDescriptor {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            drv_hash: "drip".into(),
+            tenant_id: String::new(),
+            origin: "cache_opportunity".into(),
+        };
+        // Five empty listings (escalate to cap), then ONE non-empty
+        // (the pull answers NotYetReady → seals Contested → resets).
+        let mut script = std::collections::VecDeque::new();
+        for _ in 0..5 {
+            script.push_back(vec![]);
+        }
+        script.push_back(vec![job]);
+        let transport = StreakTransport {
+            stamps: Default::default(),
+            listings: std::sync::Arc::new(std::sync::Mutex::new(script)),
+        };
+        let stamps = std::sync::Arc::clone(&transport.stamps);
+        tokio::time::pause();
+        let claim = transport.clone();
+        let driver = tokio::spawn(drive_coordinator(
+            db.pool.clone(),
+            1,
+            executor::PathSlotPool::new(1),
+            move || claim.clone(),
+            transport,
+            shutdown.clone(),
+        ));
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), driver)
+            .await
+            .expect("driver exits on shutdown")
+            .unwrap();
+
+        let stamps = stamps.lock().unwrap();
+        assert!(
+            stamps.len() >= 8,
+            "need ≥ 8 listings to observe escalate→reset→re-escalate"
+        );
+        // The 5th gap (streak=5, capped) is the escalated floor —
+        // re-asserted here against the scripted pre-reset window.
+        let gap_at_cap = stamps[5].duration_since(stamps[4]);
+        assert!(
+            gap_at_cap >= EMPTY_BACKOFF.cap,
+            "the 5th-empty gap must be ≥ cap (got {gap_at_cap:?})"
+        );
+        // The 6th listing (index 5) sealed Contested → streak reset →
+        // pace_for(Contested{floor:None}) = Beat. The 7th listing's
+        // gap is therefore one base beat (≤ 1 s × 1.2), NOT an
+        // escalated floor — the reset law.
+        let gap_after_reset = stamps[6].duration_since(stamps[5]);
+        assert!(
+            gap_after_reset <= Duration::from_millis(1200),
+            "left: gap after the Contested reset = {gap_after_reset:?} (the \
+             streak survived a work-observing pass) / right: \
+             Delivered/Settled/Contested reset empty_streak → next pace is \
+             pace_for's verdict (Beat here), ≤ 1.2 s"
+        );
+        // The 7th listing sealed Empty → streak restarts at 1: the
+        // 8th gap is the base step again (≥ 1 s, ≤ 1.2 s) — not the
+        // cap. ListedNoAction (the non-owner arm) is covered by
+        // `listed_zero_action_pass_sleeps_the_beat` (escalates).
+        let gap_restart = stamps[7].duration_since(stamps[6]);
+        assert!(
+            gap_restart >= EMPTY_BACKOFF.base && gap_restart < Duration::from_millis(1300),
+            "post-reset re-escalation starts from base (got {gap_restart:?})"
+        );
+    }
+
+    /// R17 const-relation pin (sh-024 review (d), the steal-horizon
+    /// coupling): the empty-streak cap × the worst upward jitter MUST
+    /// fit inside `LISTING_STEAL_HORIZON` (a backed-off idle replica
+    /// stays inside its rendezvous slice's freshness window — crossing
+    /// it degrades to broader-listed, never to unlisted, but the cap
+    /// is sized to avoid even that while backlog is empty); and the
+    /// cap MUST be ≪ `LISTING_MEMBER_TTL` (the honest-beat liveness
+    /// gate — an idle replica never self-evicts from rendezvous
+    /// membership).
+    #[test]
+    fn empty_backoff_cap_fits_the_steal_horizon_and_ttl() {
+        let rio_common::backoff::Jitter::Proportional(j) = POLL_JITTER else {
+            panic!("the pacing jitter is proportional by construction");
+        };
+        let worst_gap = EMPTY_BACKOFF.cap.as_secs_f64() * (1.0 + j);
+        assert!(
+            worst_gap <= client::SCHEDULER_LISTING_STEAL_HORIZON_SECS as f64,
+            "EMPTY_BACKOFF.cap × (1 + POLL_JITTER) = {worst_gap:.2} s must fit \
+             the {} s steal horizon (sh-024 review (d): a backed-off replica \
+             stays inside its rendezvous slice's freshness window)",
+            client::SCHEDULER_LISTING_STEAL_HORIZON_SECS
+        );
+        assert!(
+            EMPTY_BACKOFF.cap.as_secs() * 4 <= client::SCHEDULER_LISTING_MEMBER_TTL_SECS,
+            "EMPTY_BACKOFF.cap must be ≪ LISTING_MEMBER_TTL (4× headroom): a \
+             persistently-idle replica never self-evicts from rendezvous \
+             membership (the honest-beat coupling)"
+        );
     }
 }
