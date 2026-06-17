@@ -985,10 +985,14 @@ pub(crate) use rio_evidence_kernel::settle::{
 
 /// Proof that the consumption close for ONE report became durable
 /// (`Applied`/`AlreadyResolved`). Linear and `#[must_use]`: produced
-/// ONLY by [`DagActor::close_for_consumption`], consumed BY VALUE by
-/// exactly the five settled-close companions — an arm that closes and
-/// drops the witness fails `--deny warnings`; an arm that never closes
-/// has no witness to spend and therefore cannot mint a [`MatAck`].
+/// ONLY by [`DagActor::close_for_consumption`] and its batched twin
+/// [`DagActor::close_for_consumption_from_disposition`] (the sh-007c
+/// S6 second sanctioned mint — same kernel `consumption_ack` law over
+/// a `WriteDisposition` synthesized from the batch tx outcome),
+/// consumed BY VALUE by exactly the five settled-close companions —
+/// an arm that closes and drops the witness fails `--deny warnings`;
+/// an arm that never closes has no witness to spend and therefore
+/// cannot mint a [`MatAck`].
 #[must_use = "a settled close must be spent on exactly one companion (bug_182)"]
 #[derive(Debug)]
 pub(crate) struct SettledClose(());
@@ -2291,6 +2295,71 @@ pub(super) fn refusal_from_wire(refusal: i32) -> Refusal {
     }
 }
 
+/// One report's batched-consumption intent (sh-007c S6 phase B
+/// product): the per-item routing decision over PREFETCHED inputs,
+/// with no PG await. The flush body collects these, runs ONE
+/// `close_and_resolve_materialization_batch_fenced`, then applies
+/// each companion in phase D.
+#[derive(Debug)]
+pub(super) struct BatchIntent {
+    /// The report's exec_id (close key + per-item disposition key).
+    pub(super) exec_id: Uuid,
+    /// The DAG key (for the in-mem ledger sync + companion).
+    pub(super) drv_hash: DrvHash,
+    /// Executor identity the attempt is bound to.
+    pub(super) executor: ExecutorId,
+    /// The companion to run on a settled close.
+    pub(super) companion: BatchedCompanion,
+}
+
+/// The per-item companion the batched flush runs after the settled
+/// close (sh-007c S6 phase D). Covers exactly the UNCHARGED arms
+/// (Success / RetryLater / Aborted / zero-width) — every charged or
+/// probe-bearing arm routes to the per-item slow path instead.
+#[derive(Debug)]
+pub(super) enum BatchedCompanion {
+    /// `complete_materialization_for_live_interest`: resolve the job
+    /// `ResolvedSuccess`, settle the view, stamp carried paths, push
+    /// to `pending_walk_completed`. Carries everything the companion
+    /// needs so phase D is PG-free (the resolve rode the batch tx).
+    Complete {
+        /// Durable job row to resolve (None = no row → AlreadyResolved).
+        job_id: Option<Uuid>,
+        /// Migration-082 floating-CA realized paths.
+        carried_paths: Vec<String>,
+        /// Signed Q2 per-path verified-tenant sets.
+        walk_verified: std::collections::HashMap<Vec<u8>, Vec<Uuid>>,
+    },
+    /// `companion_release` (the ReArm / RetryLater / Aborted /
+    /// zero-width / coverage-miss composition): release the claim
+    /// atomically, optionally deferring the next claim.
+    Release {
+        /// View-only deferral; `None` = re-arm immediately.
+        defer: Option<std::time::Duration>,
+        /// `Some(_)` only for the zero-width arm — counted post-settle
+        /// (bug_086: the witness-gated event).
+        zero_width_exec: Option<Uuid>,
+    },
+}
+
+impl BatchIntent {
+    /// The `(job_id, to_state, resolution_exec_id)` triple this intent
+    /// contributes to the batch resolve (only `Complete` resolves).
+    pub(super) fn resolve(&self) -> Option<(Uuid, crate::state::JobState, Option<Uuid>)> {
+        match &self.companion {
+            BatchedCompanion::Complete {
+                job_id: Some(job_id),
+                ..
+            } => Some((
+                *job_id,
+                crate::state::JobState::ResolvedSuccess,
+                Some(self.exec_id),
+            )),
+            _ => None,
+        }
+    }
+}
+
 impl DagActor {
     // r[impl sched.materialize.routing+7]
     /// Consume one materialization outcome (the §2.4 consumption
@@ -2996,10 +3065,265 @@ impl DagActor {
         MatAck(())
     }
 
+    /// Prefetched-routing twin of
+    /// [`Self::consume_materialization_outcome`] for the UNCHARGED
+    /// outcome arms (Success / RetryLater / Aborted; sh-007c S6 phase
+    /// B). Takes the prefetched job + wanted-union and returns a
+    /// [`BatchIntent`] with NO PG await; the close + resolve ride the
+    /// batched fenced tx, the companion runs in phase D. Returns `Err`
+    /// for arms the batched path does NOT cover (Unobtainable —
+    /// durable-evidence + reprobe IO; InfraFailure — charge-row +
+    /// park PG write); the caller routes those to the per-item
+    /// `report_outcome_inner`. The kind/admission gates already
+    /// passed in the caller's partition.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn consume_materialization_outcome_prefetched(
+        &self,
+        exec_id: Uuid,
+        attempt: &crate::db::open_attempts::MatAttempt,
+        outcome: &rio_proto::types::materialization_outcome::Outcome,
+        job: Option<&(Uuid, JobOrigin, Option<Vec<String>>)>,
+        wanted_union: Option<&Vec<String>>,
+        // bug_134: the kind-uniform admission witness — minted by
+        // `fold_report` in the caller's partition. Spent here on the
+        // fast-path arms (one admission, one consumption pass);
+        // RETURNED unspent on the slow-path arms (`Err(admission)`)
+        // so the caller forwards it to `report_outcome_inner` — the
+        // at-most-once spend holds either way (the witness is linear:
+        // exactly one of the two lanes consumes it).
+        admission: rio_evidence_kernel::pull::ProcessAdmission,
+    ) -> Result<BatchIntent, rio_evidence_kernel::pull::ProcessAdmission> {
+        use rio_proto::types::materialization_outcome::Outcome;
+        let drv_hash = DrvHash::from(attempt.core.drv_hash.as_str());
+        let executor = ExecutorId::from(attempt.core.executor_id.as_str());
+        let job_id = job.map(|(id, _, _)| *id);
+        let carried_paths: Vec<String> = job
+            .and_then(|(_, _, carried)| carried.clone())
+            .unwrap_or_default();
+        // 1. The live wanted set, resolved to paths via the same
+        //    single guard the per-item path uses (merged_bug_194).
+        let mut wanted_union: Vec<String> = match (wanted_union, self.dag.node(&drv_hash)) {
+            (Some(names), Some(state)) => rio_common::wanted_outputs::verifiable_wanted_paths(
+                &state.output_names,
+                &state.expected_output_paths,
+                names,
+            )
+            .map(|paths| paths.into_iter().map(str::to_string).collect())
+            .unwrap_or_default(),
+            // No DAG node OR no live interest row: no verifiable set
+            // (the conservative-absent arm — never a vacuous verdict).
+            _ => Vec::new(),
+        };
+        for p in &carried_paths {
+            if !p.is_empty() && !wanted_union.contains(p) {
+                wanted_union.push(p.clone());
+            }
+        }
+        // The non-empty witness (merged_bug_194): zero-width → close
+        // uncharged + deferred release (the same composition as the
+        // per-item path). The width event is counted in phase D
+        // POST-settle (bug_086).
+        let Some(live_wanted_paths) = LiveWanted::new(wanted_union) else {
+            return Ok(BatchIntent {
+                exec_id,
+                drv_hash,
+                executor,
+                companion: BatchedCompanion::Release {
+                    defer: Some(std::time::Duration::from_secs(
+                        RETRY_LATER_DEFAULT_DEFER_SECS,
+                    )),
+                    zero_width_exec: Some(exec_id),
+                },
+            });
+        };
+        match outcome {
+            Outcome::Success(s) => {
+                let walk_verified: std::collections::HashMap<Vec<u8>, Vec<Uuid>> = {
+                    use sha2::Digest;
+                    s.verified_tenants
+                        .iter()
+                        .map(|pt| {
+                            (
+                                sha2::Sha256::digest(pt.store_path.as_bytes()).to_vec(),
+                                pt.verified_tenant_ids
+                                    .iter()
+                                    .filter_map(|t| t.parse::<Uuid>().ok())
+                                    .collect::<Vec<Uuid>>(),
+                            )
+                        })
+                        .collect()
+                };
+                let companion = if success_covers_live_wanted(
+                    &s.ingested_paths,
+                    &s.verified_paths,
+                    &live_wanted_paths,
+                ) {
+                    BatchedCompanion::Complete {
+                        job_id,
+                        carried_paths,
+                        walk_verified,
+                    }
+                } else {
+                    BatchedCompanion::Release {
+                        defer: None,
+                        zero_width_exec: None,
+                    }
+                };
+                Ok(BatchIntent {
+                    exec_id,
+                    drv_hash,
+                    executor,
+                    companion,
+                })
+            }
+            Outcome::RetryLater(r) => {
+                let retry_after = std::time::Duration::from_secs(
+                    r.retry_after_secs
+                        .clamp(0, RETRY_LATER_MAX_DEFER_SECS)
+                        .max(RETRY_LATER_DEFAULT_DEFER_SECS),
+                );
+                tracing::info!(
+                    %exec_id, drv_hash = %drv_hash, class = %r.class, detail = %r.detail,
+                    defer_secs = retry_after.as_secs(),
+                    "transient materialization failure; closing uncharged and deferring"
+                );
+                Ok(BatchIntent {
+                    exec_id,
+                    drv_hash,
+                    executor,
+                    companion: BatchedCompanion::Release {
+                        defer: Some(retry_after),
+                        zero_width_exec: None,
+                    },
+                })
+            }
+            Outcome::Aborted(a) => {
+                tracing::info!(
+                    %exec_id, drv_hash = %drv_hash, detail = %a.detail,
+                    "materialization walk aborted by the worker; closing charge-free"
+                );
+                Ok(BatchIntent {
+                    exec_id,
+                    drv_hash,
+                    executor,
+                    companion: BatchedCompanion::Release {
+                        defer: None,
+                        zero_width_exec: None,
+                    },
+                })
+            }
+            // Unobtainable (durable-evidence read + reprobe IO) and
+            // InfraFailure (charge row + park-on-budget PG write) are
+            // the per-item slow path: the admission witness returns
+            // UNSPENT (bug_134's at-most-once law — exactly one lane
+            // consumes it). The zero-width short-circuit above already
+            // covered the no-verifiable-set case for these variants.
+            Outcome::Unobtainable(_) | Outcome::InfraFailure(_) => Err(admission),
+        }
+    }
+
+    /// Phase-D apply for one batched intent (sh-007c S6): synthesize
+    /// the close `WriteDisposition` from the batch tx outcome, mint
+    /// the witness via [`Self::close_for_consumption_from_disposition`],
+    /// then run the companion. The resolve `WriteDisposition` is
+    /// likewise synthesized from `resolved_set` (the batch tx already
+    /// committed it). PG-free except for the companion's own
+    /// `requeue_after_attempt` (in-mem status + outbox).
+    pub(super) async fn apply_batched_companion(
+        &mut self,
+        intent: BatchIntent,
+        close_d: WriteDisposition,
+        resolved_set: &std::collections::HashSet<Uuid>,
+    ) -> Result<MatAck, super::pull::PullRejection> {
+        let BatchIntent {
+            exec_id,
+            drv_hash,
+            executor,
+            companion,
+        } = intent;
+        let close = match Self::close_for_consumption_from_disposition(close_d) {
+            CloseOutcome::Settled(close) => close,
+            CloseOutcome::Deferred(ack) => return Ok(ack),
+            CloseOutcome::NotDurable => {
+                return Err(super::pull::PullRejection::ConsumptionNotDurable);
+            }
+        };
+        match companion {
+            BatchedCompanion::Release {
+                defer,
+                zero_width_exec,
+            } => {
+                if let Some(exec_id) = zero_width_exec {
+                    crate::state::note_width_event(crate::state::WidthEvent::NoVerifiableSet {
+                        exec_id,
+                        settled: &close,
+                    });
+                    warn!(
+                        %exec_id, drv_hash = %drv_hash,
+                        "no verifiable live-wanted path set; closed uncharged and deferred"
+                    );
+                }
+                Ok(self
+                    .companion_release(&drv_hash, &executor, defer, close)
+                    .await)
+            }
+            BatchedCompanion::Complete {
+                job_id,
+                carried_paths,
+                walk_verified,
+            } => {
+                let SettledClose(()) = close;
+                // The resolve already rode the batch tx — synthesize
+                // its disposition from the batch outcome (Fenced /
+                // Failed cannot reach here: those map to Deferred /
+                // NotDurable above; close_d.settled() ⇒ committed).
+                let d = match job_id {
+                    Some(job_id) if resolved_set.contains(&job_id) => {
+                        metrics::counter!(
+                            "rio_scheduler_materialization_jobs_resolved_total",
+                            "outcome" => "success"
+                        )
+                        .increment(1);
+                        WriteDisposition::Applied
+                    }
+                    Some(_) | None => WriteDisposition::AlreadyResolved,
+                };
+                match companion_follow_up(d) {
+                    CompanionFollowUp::Settled => {
+                        if self.materialization_jobs.remove_settled(&drv_hash, d) {
+                            if !carried_paths.is_empty()
+                                && let Some(state) = self.dag.node_mut(&drv_hash)
+                                && state.output_paths.is_empty()
+                            {
+                                state.output_paths = carried_paths;
+                            }
+                            self.pending_walk_completed.push((
+                                drv_hash,
+                                crate::db::live_pins::StampProvenance::WalkVerified(walk_verified),
+                            ));
+                        }
+                    }
+                    CompanionFollowUp::Inert => {}
+                    CompanionFollowUp::ReleaseClaimFallback => {
+                        warn!(drv_hash = %drv_hash, %exec_id,
+                              "job resolve failed after a settled close; releasing the claim \
+                               uncharged (companion law)");
+                        self.release_claim(&drv_hash, &executor).await;
+                    }
+                }
+                Ok(MatAck(()))
+            }
+        }
+    }
+
     /// THE consumption-close chokepoint (bug_182): every report arm
     /// closes through here and receives the settled-close witness, the
     /// fenced ack, or the NACK marker — per the kernel ack law
-    /// (`consumption_ack`). No other site constructs [`SettledClose`].
+    /// (`consumption_ack`). This and
+    /// [`Self::close_for_consumption_from_disposition`] are the only
+    /// two sites that construct [`SettledClose`]; both feed the SAME
+    /// `consumption_ack` over a `WriteDisposition`, so the witness law
+    /// is identical batched or per-item.
     async fn close_for_consumption(
         &mut self,
         exec_id: Uuid,
@@ -3014,6 +3338,24 @@ impl DagActor {
             ConsumptionAck::Ack if d.settled() => CloseOutcome::Settled(SettledClose(())),
             // Fenced: ack inert (signed Q20 — deposed believers ack;
             // the successor's establishment owns the row).
+            ConsumptionAck::Ack => CloseOutcome::Deferred(MatAck(())),
+            ConsumptionAck::NackRetryable => CloseOutcome::NotDurable,
+        }
+    }
+
+    /// Batched twin of [`Self::close_for_consumption`] (sh-007c S6
+    /// second sanctioned [`SettledClose`] mint): the
+    /// `WriteDisposition` was synthesized by the caller from ONE
+    /// `close_and_resolve_materialization_batch_fenced` transaction
+    /// (Applied iff committed AND `exec_id ∈ closed_set`;
+    /// `AlreadyResolved` iff committed AND not-in-set; `Fenced` /
+    /// `Failed` from the batch outcome). Same kernel `consumption_ack`
+    /// law — the witness/ack/NACK semantics are IDENTICAL to the
+    /// per-item path; only the `begin_fenced` count differs (1 per
+    /// flush, not 1 per item).
+    pub(super) fn close_for_consumption_from_disposition(d: WriteDisposition) -> CloseOutcome {
+        match consumption_ack(d) {
+            ConsumptionAck::Ack if d.settled() => CloseOutcome::Settled(SettledClose(())),
             ConsumptionAck::Ack => CloseOutcome::Deferred(MatAck(())),
             ConsumptionAck::NackRetryable => CloseOutcome::NotDurable,
         }

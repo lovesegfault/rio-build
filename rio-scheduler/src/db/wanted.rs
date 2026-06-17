@@ -180,7 +180,6 @@ impl SchedulerDb {
     /// returned map; the caller treats absent as `None` per the
     /// singleton's contract. A present key with `vec![]` value is the
     /// '{}' saturation (= all declared outputs wanted).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn effective_wanted_unions_for(
         &self,
         derivation_ids: &[Uuid],

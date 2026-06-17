@@ -1067,7 +1067,13 @@ mod registration_writer_census {
             ("actor/completion.rs".to_string(), 1),
             ("actor/debug.rs".to_string(), 1),
             ("actor/dispatch.rs".to_string(), 1),
-            ("actor/materialize.rs".to_string(), 1),
+            // sh-007c S6: 2 — `complete_materialization_for_live_interest`
+            // (per-item) + `apply_batched_companion` (batched twin);
+            // both gate on `output_paths.is_empty()` over identical
+            // `carried_paths` from the durable job row, so the
+            // membership-check semantics is the same write at two
+            // call sites.
+            ("actor/materialize.rs".to_string(), 2),
             ("actor/merge.rs".to_string(), 1),
             ("actor/recovery.rs".to_string(), 1),
         ]

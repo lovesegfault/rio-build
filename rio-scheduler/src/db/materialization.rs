@@ -170,7 +170,6 @@ pub(crate) enum FencedCancelSweep {
 /// synthesizes a per-item
 /// [`rio_evidence_kernel::settle::WriteDisposition`] from
 /// `{tx outcome, exec_id ∈ closed_set}`.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Default)]
 pub(crate) struct BatchCloseResult {
     /// `exec_id`s whose assignment row flipped active → completed
@@ -652,7 +651,6 @@ impl SchedulerDb {
     /// `close_for_consumption_from_disposition` is the (second)
     /// sanctioned mint; the db layer cannot construct the
     /// module-private witness.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn close_and_resolve_materialization_batch_fenced(
         &self,
         serving_generation: ServingGeneration,
@@ -765,7 +763,6 @@ impl SchedulerDb {
     /// the singleton uses (the unique partial index on
     /// `(derivation_id) WHERE state='pending'` makes it definite, but
     /// the parity is structural).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn unresolved_jobs_for_derivations(
         &self,
         derivation_ids: &[Uuid],

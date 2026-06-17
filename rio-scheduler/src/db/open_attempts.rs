@@ -392,7 +392,6 @@ impl SchedulerDb {
     /// `drv_executions` row exists — the deny-by-default arm) are
     /// simply not in the returned map; the caller treats absent as
     /// `None` per the singleton's contract.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn find_attempts_by_exec_ids(
         &self,
         exec_ids: &[Uuid],

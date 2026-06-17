@@ -1542,23 +1542,51 @@ impl DagActor {
         }
     }
 
-    /// Drain [`pending_pull_outcomes`](Self::pending_pull_outcomes):
-    /// run [`report_outcome_inner`](Self::report_outcome_inner) per
-    /// item (the existing per-item chain — auth, fold, close,
-    /// resolve), then drain the SECOND-level
-    /// [`pending_walk_completed`](Self::pending_walk_completed)
-    /// accumulator (Success-arm completions pushed there by the
-    /// consumption path) into ONE
-    /// [`complete_ready_from_store_batch`](Self::complete_ready_from_store_batch)
-    /// call, then — and only then — send every held `(reply,
-    /// result)` pair. Ack-after-durable: every reply is sent strictly
-    /// after the batched `persist_status_batch(Completed)` +
-    /// `upsert_path_tenants_for_batch` + `persist_status_batch(Ready)`
-    /// commit. An actor panic between push and flush drops every
-    /// held reply → `oneshot::Canceled` → the gRPC server maps to
-    /// `Status::internal` → store-side `report_until_acked`
-    /// classifies non-fatal and retries (Hazard A — crash-safe).
+    /// Drain [`pending_pull_outcomes`](Self::pending_pull_outcomes) as
+    /// a phased pipeline (sh-007c S6 — O(1) PG round-trips per flush
+    /// for the materialization-kind subset, replacing ~12 RTTs/item):
+    ///
+    /// - **(A)** Prefetch — three batched readers
+    ///   ([`SchedulerDb::find_attempts_by_exec_ids`],
+    ///   [`SchedulerDb::unresolved_jobs_for_derivations`],
+    ///   [`SchedulerDb::effective_wanted_unions_for`]).
+    /// - **(B)** Per-item in-memory routing — each materialization
+    ///   report's UNCHARGED arm (Success / RetryLater / Aborted /
+    ///   zero-width) becomes a [`BatchIntent`]; build-kind, charged,
+    ///   and probe-bearing arms route to the per-item slow path.
+    /// - **(C)** ONE
+    ///   [`SchedulerDb::close_and_resolve_materialization_batch_fenced`]
+    ///   fenced tx (close + append + resolve; the
+    ///   `BatchCloseResult` sets feed phase D).
+    /// - **(D)** Per-item apply — synthesize a `WriteDisposition` from
+    ///   `{tx outcome, exec_id ∈ closed_set}`, mint the witness via
+    ///   [`DagActor::close_for_consumption_from_disposition`], run the
+    ///   companion. The in-mem `push_attempt_record` /
+    ///   `refresh_retry_view` ledger sync gates on `inserted_set`
+    ///   (orthogonal to `closed_set`); on batch-`Fenced`, ONE
+    ///   `note_fenced_evidence_write`.
+    /// - **(E)** Once-per-flush tail —
+    ///   `release_materialization_pins_best_effort` (hoisted from the
+    ///   per-resolve site), drain `pending_walk_completed` into ONE
+    ///   [`Self::complete_ready_from_store_batch`], then — and only
+    ///   then — send every held `(reply, result)` pair.
+    ///
+    /// Ack-after-durable: every reply is sent strictly after the
+    /// batched close+resolve AND the batched
+    /// `persist_status_batch(Completed)` commit. An actor panic
+    /// between push and flush drops every held reply →
+    /// `oneshot::Canceled` → store-side `report_until_acked` retries.
+    ///
+    /// [`SchedulerDb::find_attempts_by_exec_ids`]: crate::db::SchedulerDb::find_attempts_by_exec_ids
+    /// [`SchedulerDb::unresolved_jobs_for_derivations`]: crate::db::SchedulerDb::unresolved_jobs_for_derivations
+    /// [`SchedulerDb::effective_wanted_unions_for`]: crate::db::SchedulerDb::effective_wanted_unions_for
+    /// [`SchedulerDb::close_and_resolve_materialization_batch_fenced`]: crate::db::SchedulerDb::close_and_resolve_materialization_batch_fenced
+    /// [`BatchIntent`]: super::materialize::BatchIntent
     pub(super) async fn flush_pending_pull_outcomes(&mut self) {
+        use super::materialize::{BatchIntent, WriteDisposition};
+        use crate::db::open_attempts::AttemptRef;
+        use rio_evidence_kernel::pull::ReportAdmission;
+
         if self.pending_pull_outcomes.is_empty() {
             return;
         }
@@ -1569,25 +1597,250 @@ impl DagActor {
         );
         let pending = std::mem::take(&mut self.pending_pull_outcomes);
         let mut acks: Vec<PendingAck> = Vec::with_capacity(pending.len());
-        for PendingReport {
-            exec_id,
-            auth_intent,
-            payload,
-            reply,
-        } in pending
-        {
-            let result = self
-                .report_outcome_inner(exec_id, auth_intent.as_deref(), payload)
-                .await;
-            acks.push((reply, result));
+
+        // ─── Phase A: prefetch ────────────────────────────────────
+        let exec_ids: Vec<Uuid> = pending.iter().map(|p| p.exec_id).collect();
+        let attempts = match self.db.find_attempts_by_exec_ids(&exec_ids).await {
+            Ok(m) => m,
+            Err(e) => {
+                // Batch read failed: NACK every report retryably (the
+                // store re-delivers; the next flush re-reads).
+                let msg = format!("attempt lookup failed: {e}");
+                for PendingReport { reply, .. } in pending {
+                    let _ = reply.send(Err(PullRejection::Internal(msg.clone())));
+                }
+                return;
+            }
+        };
+
+        // ─── Phase B: per-item partition + routing ────────────────
+        // Q8: between entry and first close,
+        // `consume_materialization_outcome` only does `&self`/
+        // `&self.db` reads — batch-wide prefetch before any in-mem
+        // mutation is sound.
+        let mut intents: Vec<(BatchIntent, oneshot::Sender<Result<(), PullRejection>>)> =
+            Vec::new();
+        let mut mat_drv_ids: Vec<Uuid> = Vec::new();
+        let mut staged: Vec<(
+            PendingReport,
+            crate::db::open_attempts::MatAttempt,
+            rio_evidence_kernel::pull::ProcessAdmission,
+        )> = Vec::new();
+        for p in pending {
+            let attempt = attempts.get(&p.exec_id);
+            // Partition: only materialization-kind reports with a
+            // Process admission and a payload reach the prefetched
+            // routing. Everything else — unknown-exec, build-kind,
+            // kind-mismatch, AckIgnore (duplicate/late), no-payload —
+            // routes to today's per-item `report_outcome_inner` (the
+            // unknown-exec arm preserves
+            // `sh002_leader_lost_drains_pending_reports_not_leader`:
+            // LeaderLost drains BEFORE this body runs).
+            let Some(AttemptRef::Materialization(m)) = attempt else {
+                let result = self
+                    .report_outcome_inner(p.exec_id, p.auth_intent.as_deref(), p.payload)
+                    .await;
+                acks.push((p.reply, result));
+                continue;
+            };
+            // r[impl sec.executor.identity-token+3]
+            if let Some(auth) = &p.auth_intent
+                && auth != &m.core.drv_hash
+            {
+                warn!(exec_id = %p.exec_id,
+                      "ReportOutcome rejected: executor token bound to a different intent");
+                acks.push((p.reply, Err(PullRejection::TokenMismatch)));
+                continue;
+            }
+            let Some(outcome) = &p.payload.materialization_outcome else {
+                warn!(exec_id = %p.exec_id,
+                      "build-report payload for a materialization attempt; ignoring");
+                acks.push((p.reply, Ok(())));
+                continue;
+            };
+            let admission = match fold_report(
+                m.core.assignment_active,
+                m.core.attempt_recorded || m.core.attempt_terminal,
+            ) {
+                ReportAdmission::AckIgnore => {
+                    debug!(exec_id = %p.exec_id,
+                           "duplicate/late materialization report acknowledged-and-ignored");
+                    acks.push((p.reply, Ok(())));
+                    continue;
+                }
+                ReportAdmission::Process(a) => a,
+            };
+            if outcome.outcome.is_none() {
+                warn!(exec_id = %p.exec_id,
+                      "materialization outcome with no payload; acknowledged-and-ignored");
+                acks.push((p.reply, Ok(())));
+                continue;
+            }
+            mat_drv_ids.push(m.core.derivation_id);
+            staged.push((p, m.clone(), admission));
         }
+
+        if !staged.is_empty() {
+            // Phase A continued: prefetch jobs + wanted unions for
+            // the materialization subset (one RTT each; on read
+            // failure, fall back to the per-item slow path so the
+            // ack-after-durable contract holds).
+            let (jobs, wanted) = match tokio::try_join!(
+                self.db.unresolved_jobs_for_derivations(&mat_drv_ids),
+                self.db.effective_wanted_unions_for(&mat_drv_ids),
+            ) {
+                Ok(jw) => jw,
+                Err(e) => {
+                    warn!(error = %e,
+                          "batched prefetch (jobs/wanted) failed; falling back to per-item");
+                    for (p, _, _) in staged {
+                        let result = self
+                            .report_outcome_inner(p.exec_id, p.auth_intent.as_deref(), p.payload)
+                            .await;
+                        acks.push((p.reply, result));
+                    }
+                    return self.flush_tail(acks).await;
+                }
+            };
+            for (p, m, admission) in staged {
+                let inner = p
+                    .payload
+                    .materialization_outcome
+                    .as_ref()
+                    .and_then(|o| o.outcome.as_ref())
+                    .expect("filtered above");
+                match self.consume_materialization_outcome_prefetched(
+                    p.exec_id,
+                    &m,
+                    inner,
+                    jobs.get(&m.core.derivation_id),
+                    wanted.get(&m.core.derivation_id),
+                    admission,
+                ) {
+                    Ok(intent) => intents.push((intent, p.reply)),
+                    Err(_admission) => {
+                        // Unobtainable / InfraFailure: per-item slow
+                        // path (the `report_outcome_inner` body re-
+                        // runs the fold + admission mint over the
+                        // same row state, so the unspent admission
+                        // returned here is dropped and the slow-path
+                        // mints its own — at-most-once still holds:
+                        // exactly one consumption pass per report).
+                        let result = self
+                            .report_outcome_inner(p.exec_id, p.auth_intent.as_deref(), p.payload)
+                            .await;
+                        acks.push((p.reply, result));
+                    }
+                }
+            }
+        }
+
+        // ─── Phase C: ONE fenced close+resolve tx ─────────────────
+        // Ack-after-durable hard gate: structurally guarded by
+        // control flow — every reply is held in `acks` / `intents`
+        // and sent only by `flush_tail` after phase E. The slow-path
+        // arms above MAY have pushed to `pending_walk_completed`
+        // (their per-item consumption ran); the batched arms push in
+        // phase D below; the tail drains both into ONE batched
+        // completion before any reply fires.
+        if !intents.is_empty() {
+            #[cfg(test)]
+            self.test_counters
+                .begin_fenced_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let serving_generation = self.serving_generation();
+            let close_exec_ids: Vec<Uuid> = intents.iter().map(|(i, _)| i.exec_id).collect();
+            let resolves: Vec<_> = intents.iter().filter_map(|(i, _)| i.resolve()).collect();
+            // No charge rows on the batched lane: every batched arm
+            // (Success / RetryLater / Aborted / zero-width) closes
+            // UNCHARGED. `inserted_set` is therefore empty by
+            // construction; the in-mem `push_attempt_record` /
+            // `refresh_retry_view` gate (which keys on `inserted_set`)
+            // is a no-op for this lane and stays the per-item slow
+            // path's responsibility for charged arms.
+            let batch = self
+                .db
+                .close_and_resolve_materialization_batch_fenced(
+                    serving_generation,
+                    &close_exec_ids,
+                    &[],
+                    &resolves,
+                )
+                .await;
+
+            // ─── Phase D: per-item apply ──────────────────────────
+            // The in-mem ledger sync (`push_attempt_record` /
+            // `refresh_retry_view`) gates on `inserted_set`, NOT
+            // `closed_set` (orthogonal: drv_attempts ON CONFLICT vs
+            // assignment-close). With no charge rows on the batched
+            // lane, the gate is empty by construction — asserted here
+            // so a future charged-arm widening cannot silently skip
+            // the sync (`failoverPreservesHistory`'s live==ledger
+            // precondition would otherwise weaken silently).
+            let (closed_set, resolved_set, batch_d) = match &batch {
+                Ok(r) if r.fenced => {
+                    self.note_fenced_evidence_write("materialization batch close");
+                    (
+                        &r.closed_set,
+                        &r.resolved_set,
+                        Some(WriteDisposition::Fenced),
+                    )
+                }
+                Ok(r) => {
+                    assert!(
+                        r.inserted_set.is_empty(),
+                        "the batched lane is uncharged-only — a non-empty inserted_set \
+                         means a charge row reached phase C without the phase-D \
+                         push_attempt_record/refresh_retry_view ledger sync"
+                    );
+                    (&r.closed_set, &r.resolved_set, None)
+                }
+                Err(e) => {
+                    warn!(error = %e,
+                          "materialization batch close failed; NACKing the batch retryably");
+                    for (_, reply) in intents {
+                        acks.push((reply, Err(PullRejection::ConsumptionNotDurable)));
+                    }
+                    return self.flush_tail(acks).await;
+                }
+            };
+            for (intent, reply) in intents {
+                let close_d = batch_d.unwrap_or_else(|| {
+                    if closed_set.contains(&intent.exec_id) {
+                        WriteDisposition::Applied
+                    } else {
+                        WriteDisposition::AlreadyResolved
+                    }
+                });
+                let result = self
+                    .apply_batched_companion(intent, close_d, resolved_set)
+                    .await
+                    .map(|_ack: super::materialize::MatAck| ());
+                acks.push((reply, result));
+            }
+        }
+
+        // ─── Phase E: once-per-flush tail ─────────────────────────
+        self.flush_tail(acks).await;
+    }
+
+    /// Phase-E tail of [`Self::flush_pending_pull_outcomes`] (sh-007c
+    /// S6): hoisted `release_materialization_pins_best_effort` (was
+    /// per-resolve), ONE batched `complete_ready_from_store_batch`,
+    /// then — and only then — every held reply. Factored so the
+    /// fall-back arms above share the SAME ack-after-durable epilogue.
+    async fn flush_tail(&mut self, acks: Vec<PendingAck>) {
         // The second-level accumulator: every Success consumption
-        // pushed `(drv_hash, WalkVerified(..))` here instead of
-        // calling `complete_ready_from_store_batch(len=1)` inline.
-        // ONE batched call (the I-139 amortization — 3 PG awaits
-        // total instead of 3 × N).
+        // pushed `(drv_hash, WalkVerified(..))` here. ONE batched
+        // call (the I-139 amortization — 3 PG awaits total).
         let completed = std::mem::take(&mut self.pending_walk_completed);
         self.complete_ready_from_store_batch(&completed).await;
+        // r[impl sched.materialize.pinning]
+        // §5.3 release site (i), hoisted: the per-resolve pins
+        // release is self-scoping and idempotent, so once per flush
+        // (after every batched resolve committed) is equivalent.
+        self.release_materialization_pins_best_effort("report flush")
+            .await;
         // Ack-after-durable: replies fire only now.
         for (reply, result) in acks {
             let _ = reply.send(result);
