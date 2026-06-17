@@ -2969,7 +2969,23 @@ pub(super) async fn reap_stale_for_intents(
                 // respawn meets the backoff floor. Verdict presence is
                 // the exhaustive merged_bug_080(2b) alphabet (a
                 // resolving ack already cleared the record inside the
-                // delete chokepoint; a charge-free ack proves nothing):
+                // delete chokepoint; a charge-free ack proves nothing).
+                //
+                // The ladder is gated on `StaleTerminal` alone (the
+                // still-WANTED arm). `TerminalAbsent` (sh-021) is
+                // excluded BY CONSTRUCTION: its discriminator is the
+                // open attempt existing (`source_node`-agnostic), so
+                // the synthesized close is `ReportedVerdict` →
+                // `no_verdict_at_delete=false` AND the chokepoint's
+                // `note_resolution` already CLEARED the streak. A
+                // spot-churn loop that repeatedly kills pods after
+                // pull is therefore unbounded by the ladder — the
+                // standing E5 charge-free `Requeue` contract every
+                // controller-synthesized close (`Preempted`/`Reaped`/
+                // `Cancelled`) inherits, not a regression introduced
+                // by the new arm; a Controller-party `Disconnected`
+                // row is a retry-kernel run-BREAKER, never a
+                // `WORKER_ABORT_FREE_CLOSES` member.
                 // r[impl ctrl.pool.respawn-backoff+5]
                 let no_verdict_at_delete = match &synthesized {
                     super::job::SynthesizedDelete::ReportedVerdict { .. } => false,
