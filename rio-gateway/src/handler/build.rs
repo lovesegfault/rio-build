@@ -3234,6 +3234,19 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
 
     translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
 
+    // sh-036 §3: between `wopAddMultipleToStore` finishing and the
+    // first `actSubstitute` start the client sees ~13 s of dead air
+    // (filter FMP above + the scheduler's MergeDag turn). Emit one
+    // `STDERR_NEXT` line naming the post-dedup/post-filter node count
+    // — the same N the scheduler reports in `BuildProgress.total` — so
+    // `nix build` shows what is being waited on. AFTER `filter` so the
+    // count is the one the scheduler sees; the filter's anon FMP is
+    // <1 s so the half-second of earlier landing a pre-filter emit
+    // would buy is not worth the count drift.
+    stderr
+        .log(&format!("rio: planning {n} derivations\n", n = nodes.len()))
+        .await?;
+
     let request = translate::build_submit_request(nodes, edges, "ci", tenant_name.as_ref());
     let result = submit_and_process_build(
         stderr,
@@ -3793,6 +3806,85 @@ mod tests {
                 .any(|e| e.parent_drv_path == app_path.as_str()
                     && e.child_drv_path == lib_path.as_str()),
             "lib keeps its incoming edge from app in the combined submission"
+        );
+    }
+
+    /// Build a [`SessionContext`] whose every gRPC client is a
+    /// [`dead_channel`](rio_test_support::grpc::dead_channel) and whose
+    /// tenant/jwt/limiter/quota knobs are all in the no-op single-tenant
+    /// position. With `tenant_name = None` the quota check short-circuits
+    /// to `Unlimited` (no store RPC); with no `expected_output_paths` on
+    /// the submitted nodes `filter_and_inline_drv` skips its
+    /// `FindMissingPaths` probe — so `submit_dag` runs straight to the
+    /// scheduler call without ever touching the dead store/log channels.
+    fn dead_session_ctx() -> SessionContext {
+        let dead = rio_test_support::grpc::dead_channel();
+        SessionContext::new(
+            StoreServiceClient::new(dead.clone()),
+            rio_proto::LogServiceClient::new(dead.clone()),
+            SchedulerServiceClient::new(dead),
+            None,
+            crate::handler::SessionJwt::none(),
+            None,
+            crate::ratelimit::TenantLimiter::disabled(),
+            crate::quota::QuotaCache::new(),
+        )
+    }
+
+    /// sh-036 §3: between `wopAddMultipleToStore` finishing and the
+    /// first `actSubstitute` start, the client sees four wire frames
+    /// covering ~13 s of dead air (filter FMP + scheduler MergeDag turn)
+    /// — `nix build` sits on a blank progress bar with nothing to say
+    /// what is happening. `submit_dag` is the last gateway-side
+    /// chokepoint before that block, and at this point `nodes.len()` is
+    /// final (post-dedup, post-filter — the same N the scheduler will
+    /// report in `BuildProgress.total`), so it MUST emit one
+    /// `STDERR_NEXT "rio: planning N derivations"` line BEFORE handing
+    /// off to `submit_and_process_build`. The line is the FIRST
+    /// `STDERR_NEXT` the build path writes — it precedes both the
+    /// `rio: build <id>` line (post-MergeDag) and the
+    /// `SubmitBuild RPC failed` diagnostic (the failure path this test
+    /// drives via a dead scheduler channel).
+    ///
+    /// `start_paused`: the dead-channel `SubmitBuild` fails with
+    /// `Unavailable`, which `submit_initial`'s pre-build_id retry loop
+    /// backs off over 0.5/1/2/4 s; the paused clock auto-advances those
+    /// sleeps so the test does not burn ~7.5 s of wall clock.
+    #[tokio::test(start_paused = true)]
+    async fn submit_dag_emits_planning_stderr_next() {
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut ctx = dead_session_ctx();
+
+        // Three distinct drvs, no `expected_output_paths` (skips the
+        // filter's store probe). `dedup_dag` keeps all three.
+        let nodes: Vec<types::DerivationNode> = (0..3)
+            .map(|i| types::DerivationNode {
+                drv_path: format!("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa{i}-n{i}.drv"),
+                drv_hash: format!("n{i}"),
+                ..Default::default()
+            })
+            .collect();
+
+        let outcome = submit_dag(&mut stderr, &mut ctx, nodes, Vec::new()).await;
+        assert!(
+            outcome.is_err(),
+            "dead scheduler channel: SubmitBuild fails after retry budget"
+        );
+
+        let first_log = read_frames(buf)
+            .await
+            .into_iter()
+            .find_map(|f| match f {
+                Frame::Log(s) => Some(s),
+                _ => None,
+            })
+            .expect("at least one STDERR_NEXT frame is written");
+        assert_eq!(
+            first_log, "rio: planning 3 derivations\n",
+            "the planning line is the FIRST STDERR_NEXT submit_dag emits \
+             (before the scheduler block — sh-036 §3)"
         );
     }
 

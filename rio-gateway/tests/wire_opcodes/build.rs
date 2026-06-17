@@ -698,14 +698,19 @@ fn seed_minimal_drv(h: &GatewaySession) -> &'static str {
 }
 
 /// Whether a frame is the gateway's own per-build diagnostic preamble
-/// (`rio: build <id> [(trace ...)]`) — emitted unconditionally before
-/// event 0, NOT a build event. The frame-sequence tests below assert on
-/// the activity/log frame ordering produced by *build events*; the
-/// preamble is orthogonal noise to those assertions, so the collection
-/// helpers strip it. Coverage for the preamble itself lives in
+/// (`rio: planning N derivations` then `rio: build <id> [(trace ...)]`)
+/// — both emitted by `submit_dag`/`submit_initial` BEFORE event 0, NOT
+/// build events. The frame-sequence tests below assert on the
+/// activity/log frame ordering produced by *build events*; the preamble
+/// is orthogonal noise to those assertions, so the collection helpers
+/// strip it. Coverage for the preamble itself lives in
 /// `test_build_paths_emits_build_id_preamble`.
 fn is_diagnostic_preamble(msg: &StderrMessage) -> bool {
-    matches!(msg, StderrMessage::Next(s) if s.starts_with("rio: build "))
+    matches!(
+        msg,
+        StderrMessage::Next(s)
+            if s.starts_with("rio: build ") || s.starts_with("rio: planning ")
+    )
 }
 
 /// Collect all stderr messages until STDERR_LAST. Strips the per-build
@@ -760,14 +765,15 @@ async fn read_first_build_frame(stream: &mut tokio::io::DuplexStream) -> StderrM
     }
 }
 
-/// The gateway emits a `rio: build <id>` STDERR_NEXT line as the FIRST
-/// frame after submit, BEFORE any build event — gives the user the
-/// build-tracking handle (dashboard, `rio-cli builds`, cancellation)
-/// the moment the build is accepted. This is the only test that
-/// observes the preamble; the other frame-sequence tests strip it via
-/// `collect_stderr_frames` because their assertions are about the
-/// activity/log frames produced by *build events*, which the preamble
-/// is not.
+/// The gateway emits a two-line `STDERR_NEXT` preamble before any
+/// build event: `rio: planning N derivations` (post-dedup count, fires
+/// BEFORE the scheduler block — see `submit_dag`) followed by
+/// `rio: build <id>` (post-MergeDag, gives the user the build-tracking
+/// handle for dashboard/`rio-cli builds`/cancellation). This is the
+/// only test that observes the preamble; the other frame-sequence
+/// tests strip both lines via `collect_stderr_frames` because their
+/// assertions are about the activity/log frames produced by *build
+/// events*, which the preamble is not.
 ///
 /// The trace suffix is absent here — the test harness has no OTel
 /// tracer wired, so `current_trace_id_hex()` returns "" and the
@@ -796,9 +802,19 @@ async fn test_build_paths_emits_build_id_preamble() -> anyhow::Result<()> {
     );
 
     // Read raw frames (NOT via collect_stderr_frames, which strips the
-    // preamble) and assert the first one is the build_id line. The
-    // build_id is the value the mock scheduler set in the
+    // preamble). Frame 0 is the planning line; frame 1 is the build_id
+    // line. The build_id is the value the mock scheduler set in the
     // x-rio-build-id response header.
+    let planning = read_stderr_message(&mut h.stream)
+        .await
+        .expect("read stderr");
+    match &planning {
+        StderrMessage::Next(s) => assert_eq!(
+            s, "rio: planning 1 derivations\n",
+            "first preamble frame is the planning line (post-dedup count for the single seeded drv)"
+        ),
+        other => panic!("expected STDERR_NEXT planning line, got {other:?}"),
+    }
     let first = read_stderr_message(&mut h.stream)
         .await
         .expect("read stderr");
