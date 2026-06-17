@@ -1591,12 +1591,13 @@ impl SlaConfig {
             // would name a class no informer/catalog row backs.
             // Rejecting at boot keeps the closure derivation
             // (`retain_hosting_cells`) total over declared classes.
+            // sh-016 (c): an EMPTY rung list is the terminal sentinel
+            // ("no further degradation"); the helm-lint
+            // `hwclass-ladder-closed` fragment requires every rung
+            // TARGET to declare `ladder` (even if `rungs: []`), so
+            // rejecting empty here would force an infinite chain or a
+            // lint exemption list.
             if let Some(ladder) = &def.ladder {
-                anyhow::ensure!(
-                    !ladder.rungs.is_empty(),
-                    "sla.hwClasses[{h}].ladder.rungs must be non-empty — \
-                     remove the `ladder` key for a single-rung class"
-                );
                 let mut seen = std::collections::HashSet::new();
                 for r in &ladder.rungs {
                     anyhow::ensure!(
@@ -2372,8 +2373,9 @@ mod tests {
     }
 
     /// R7 (the ladder-shape violation reds): a ladder naming an
-    /// undeclared class, an empty rung list, a self-rung, or a
-    /// duplicate rung is REJECTED at validate with a typed error.
+    /// undeclared class, a self-rung, or a duplicate rung is
+    /// REJECTED at validate with a typed error. An empty rung list is
+    /// the terminal sentinel (sh-016 c) — accepted.
     /// Pre-fix the field cannot parse at all (the absence pin above).
     // r[verify ctrl.nodeclaim.capacity-ladder]
     #[test]
@@ -2395,10 +2397,12 @@ mod tests {
             err.contains("ghost-rung") && err.contains("not in"),
             "undeclared rung names the dangling class: {err}"
         );
-        // Empty rung list.
+        // sh-016 (c): empty rung list is the terminal sentinel —
+        // accepted (helm-lint `hwclass-ladder-closed` requires every
+        // rung target to declare `ladder`; `rungs: []` marks an
+        // intentional terminal without forcing an infinite chain).
         cfg.hw_classes.get_mut("parent").unwrap().ladder = Some(CapacityLadder { rungs: vec![] });
-        let err = validate_both(&cfg).unwrap_err().to_string();
-        assert!(err.contains("non-empty"), "{err}");
+        validate_both(&cfg).expect("empty rungs = terminal sentinel");
         // Self-rung.
         cfg.hw_classes.get_mut("parent").unwrap().ladder = rungs_of(&["parent"]);
         let err = validate_both(&cfg).unwrap_err().to_string();
@@ -4250,11 +4254,20 @@ mod tests {
         );
         assert_eq!(
             edges,
+            // sh-016 (c): the g7 leaves close to mid-ebs (terminal
+            // sentinel `rungs: []` — emits zero edges); the hi-nvme-g7
+            // leaves close to hi-ebs-g7 + mid-ebs.
             vec![
                 "hi-ebs-arm -> hi-ebs-arm-g7",
+                "hi-ebs-arm-g7 -> mid-ebs-arm",
                 "hi-ebs-x86 -> hi-ebs-x86-g7",
+                "hi-ebs-x86-g7 -> mid-ebs-x86",
                 "hi-nvme-arm -> hi-nvme-arm-g7",
+                "hi-nvme-arm-g7 -> hi-ebs-arm-g7",
+                "hi-nvme-arm-g7 -> mid-ebs-arm",
                 "hi-nvme-x86 -> hi-nvme-x86-g7",
+                "hi-nvme-x86-g7 -> hi-ebs-x86-g7",
+                "hi-nvme-x86-g7 -> mid-ebs-x86",
             ],
             "declared ladder edges drifted"
         );
@@ -4277,8 +4290,14 @@ mod tests {
 
         // 3) The closure law re-derives every declared edge: for each
         //    ladder'd parent, retain_hosting_cells(parent cells) ==
-        //    parent cells + the rung's od cell (the shipped od-only
-        //    posture).
+        //    the TRANSITIVE BFS over the declared `ladder.rungs` graph
+        //    (sh-016 c: g7 leaves close to mid-ebs, so the hi closure
+        //    is multi-hop). The expected closure is computed
+        //    INDEPENDENTLY of `retain_hosting_cells`' filtering — the
+        //    `(1, 0)` demand makes filtering a no-op, so this asserts
+        //    membership equals the declared-graph reachability set
+        //    (`r[sched.sla.ladder-transit]`: reachability is graph-
+        //    derived, not demand-derived).
         let cat = super::super::catalog::CatalogCeilings::new();
         let arch_of = |d: &HwClassDef| {
             d.labels
@@ -4287,7 +4306,9 @@ mod tests {
                 .map(|l| l.value.clone())
         };
         for (h, d) in cfg.hw_classes.clone() {
-            let Some(ladder) = &d.ladder else { continue };
+            if d.ladder.as_ref().is_none_or(|l| l.rungs.is_empty()) {
+                continue;
+            }
             let system = match arch_of(&d).as_deref() {
                 Some("arm64") => "aarch64-linux",
                 _ => "x86_64-linux",
@@ -4306,15 +4327,27 @@ mod tests {
                 (384u32, 4096u64 << 30),
                 None,
             );
+            // Independent BFS over the declared rung graph: the
+            // expected closure when filtering is a no-op.
             let mut expect = producer;
-            for rung in &ladder.rungs {
-                for cap in cfg.capacity_types_for(&rung.class) {
-                    expect.push((rung.class.clone(), *cap));
+            let mut seen: std::collections::HashSet<String> = [h.clone()].into();
+            let mut work = std::collections::VecDeque::from([h.clone()]);
+            while let Some(p) = work.pop_front() {
+                let Some(l) = cfg.hw_classes.get(&p).and_then(|x| x.ladder.as_ref()) else {
+                    continue;
+                };
+                for r in &l.rungs {
+                    if seen.insert(r.class.clone()) {
+                        for cap in cfg.capacity_types_for(&r.class) {
+                            expect.push((r.class.clone(), *cap));
+                        }
+                        work.push_back(r.class.clone());
+                    }
                 }
             }
             assert_eq!(
                 kept, expect,
-                "shipped closure({h}) == parent cells + rung od cells"
+                "shipped closure({h}) == declared-graph BFS reachability"
             );
         }
     }

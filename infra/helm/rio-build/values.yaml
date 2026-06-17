@@ -783,6 +783,12 @@ scheduler:
       #   and the all-masked fallback re-offers the full closure, so
       #   od serves exactly when spot cannot (the membership-only
       #   ruling; witnessed by the shipped-values failover red).
+      # - sh-016 leaf-closure rule: every class referenced by ANY
+      #   `ladder.rungs[].class` MUST itself declare `ladder` (even if
+      #   `rungs: []` to mark an intentional terminal). Helm-lint
+      #   `hwclass-ladder-closed` enforces this. The g7 siblings
+      #   close to mid-ebs-{x86,arm}; mid-ebs carries the empty-rung
+      #   terminal sentinel.
       # - The g7 siblings carry `hw-band: hi-g7` (NOT `hi`): the
       #   controller's match_node walks class conjunctions
       #   lexicographic-first-match, so a sibling whose labels
@@ -862,18 +868,30 @@ scheduler:
       hi-nvme-x86-g7:
         nodeClass: rio-nvme
         capacityTypes: [spot, on-demand]
+        ladder:
+          rungs:
+            - {class: hi-ebs-x86-g7}
+            - {class: mid-ebs-x86}
         labels:
           - {key: rio.build/hw-band, value: hi-g7}
           - {key: rio.build/storage, value: nvme}
           - {key: kubernetes.io/arch, value: amd64}
         requirements:
           - {key: karpenter.k8s.aws/instance-category, operator: In, values: [c, m, r]}
-          - {key: karpenter.k8s.aws/instance-generation, operator: In, values: ["7"]}
+          # sh-016: gen-7 x86 c/m/r have NO `d` (instance-store)
+          # variants — c7gd/m7gd/r7gd are arm64-only. Widen to gen 6
+          # so c6id/m6id/r6id satisfy this; otherwise the (a) (0,0)
+          # ceiling excludes the class and the gen8→g7 rung is a no-op.
+          - {key: karpenter.k8s.aws/instance-generation, operator: In, values: ["6", "7"]}
           - {key: kubernetes.io/arch, operator: In, values: [amd64]}
           - {key: karpenter.k8s.aws/instance-local-nvme, operator: Gt, values: ["0"]}
       hi-nvme-arm-g7:
         nodeClass: rio-nvme
         capacityTypes: [spot, on-demand]
+        ladder:
+          rungs:
+            - {class: hi-ebs-arm-g7}
+            - {class: mid-ebs-arm}
         labels:
           - {key: rio.build/hw-band, value: hi-g7}
           - {key: rio.build/storage, value: nvme}
@@ -886,6 +904,9 @@ scheduler:
       hi-ebs-x86-g7:
         nodeClass: rio-default
         capacityTypes: [spot, on-demand]
+        ladder:
+          rungs:
+            - {class: mid-ebs-x86}
         labels:
           - {key: rio.build/hw-band, value: hi-g7}
           - {key: rio.build/storage, value: ebs}
@@ -897,6 +918,9 @@ scheduler:
       hi-ebs-arm-g7:
         nodeClass: rio-default
         capacityTypes: [spot, on-demand]
+        ladder:
+          rungs:
+            - {class: mid-ebs-arm}
         labels:
           - {key: rio.build/hw-band, value: hi-g7}
           - {key: rio.build/storage, value: ebs}
@@ -929,6 +953,11 @@ scheduler:
           - {key: karpenter.k8s.aws/instance-local-nvme, operator: Gt, values: ["0"]}
       mid-ebs-x86:
         nodeClass: rio-default
+        # sh-016 (c): terminal sentinel — `rungs: []` marks an
+        # intentional ladder terminal (helm-lint hwclass-ladder-closed
+        # requires every rung target to declare `ladder`; an empty
+        # list ends the chain without a lint exemption).
+        ladder: {rungs: []}
         labels:
           - {key: rio.build/hw-band, value: mid}
           - {key: rio.build/storage, value: ebs}
@@ -939,6 +968,7 @@ scheduler:
           - {key: kubernetes.io/arch, operator: In, values: [amd64]}
       mid-ebs-arm:
         nodeClass: rio-default
+        ladder: {rungs: []}
         labels:
           - {key: rio.build/hw-band, value: mid}
           - {key: rio.build/storage, value: ebs}
