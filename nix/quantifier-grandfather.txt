@@ -1150,7 +1150,6 @@ rio-scheduler/src/actor/mod.rs	/// One failed status-batch persist, owned for th
 rio-scheduler/src/actor/mod.rs	/// The ONLY production latch site for the status outbox
 rio-scheduler/src/actor/mod.rs	/// `|A'| ≤ |H|×|CapacityType::ALL|` (= |H|×2; 4 typical at 2
 rio-scheduler/src/actor/mod.rs	/// and `solve_intent_for` so both see the SAME ladder.
-rio-scheduler/src/actor/mod.rs	/// drain budget at ANY non-zero depth) while ~10 healthy sub-ms turns
 rio-scheduler/src/actor/mod.rs	/// exactly these (`WHERE exec_id = ANY(..) AND status IN
 rio-scheduler/src/actor/mod.rs	/// gate. Written ONLY through `note_issued_store_rpc_failure` —
 rio-scheduler/src/actor/mod.rs	/// queue-wide and FIFO can never replay an older same-drv truth
@@ -1998,7 +1997,6 @@ rio-store/src/materialize/mod.rs	// — the ONLY way to attach a worker index �
 rio-store/src/materialize/mod.rs	//! **Spawn condition:** everything here runs ONLY when a
 rio-store/src/materialize/mod.rs	///     sleep matters; paced for totality.
 rio-store/src/materialize/mod.rs	/// SAME `rio_common::dns::is_dns1123_label`. Trade recorded: raws of
-rio-store/src/materialize/mod.rs	/// changes cadence ONLY for productive passes (more frequent beats —
 rio-store/src/materialize/mod.rs	/// from charge-pinned `Wedged(BudgetPinned)` — and can never feed
 rio-store/src/materialize/mod.rs	/// pass mints nothing). The resume-presentation leg runs on EVERY
 rio-store/src/materialize/mod.rs	/// re-poll is licensed ONLY by variants that consumed finite supply —

@@ -120,10 +120,10 @@ pub(crate) const ADMIN_FAST_LANE_DRAIN_QUOTA: usize = 16;
 
 /// EWMA weight for the per-turn cost estimate feeding the cost-axis
 /// backpressure law (round-9 B6, re-derived sh-024 §S2). The EWMA is
-/// FED at fast-lane rate ([`Self::note_turn_cost`] from BOTH the
+/// FED at fast-lane rate ([`DagActor::note_turn_cost`] from BOTH the
 /// main-mailbox path AND `serve_fast_admin`, up to
 /// [`ADMIN_FAST_LANE_DRAIN_QUOTA`] = 16 feeds between consecutive
-/// main-loop [`Self::update_backpressure`] evaluations — the
+/// main-loop [`DagActor::update_backpressure`] evaluations — the
 /// fast-lane work prices into drain by design, review (e)) but
 /// EVALUATED only per main-mailbox dequeue: at the prior 0.3 a single
 /// 1.3 s spike (ewma 0.39, drain 44.5 s) activated and the 16 × 5 µs
