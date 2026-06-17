@@ -367,6 +367,7 @@ pub(crate) async fn merge_single_node(
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: Some("harness-tenant-jwt".into()),
+                precomputed_probe: None,
             },
             reply: reply_tx,
         })
@@ -399,6 +400,7 @@ pub(crate) async fn merge_dag(
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: Some("harness-tenant-jwt".into()),
+                precomputed_probe: None,
             },
             reply: reply_tx,
         })

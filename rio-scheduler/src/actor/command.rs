@@ -161,6 +161,21 @@ pub struct MergeDagRequest {
     /// `jti`. Distinct from `jti`: `jti` is the DECODED claim (for
     /// revocation lookup); this is the OPAQUE token (for re-inject).
     pub jwt_token: Option<String>,
+    /// sh-036.1: the gRPC handler's pre-enqueue `FindMissingPaths`
+    /// result over ALL request `expected_output_paths` (a superset of
+    /// the actor-computed `probe_set`). When `Some`, phase-4
+    /// (`check_cached_outputs`), phase-6c
+    /// (`verify_preexisting_completed`), and phase-0
+    /// (`check_roots_topdown`) apply this pre-computed response
+    /// instead of awaiting a fresh store RPC inside the actor turn —
+    /// see r[sched.merge.probe-off-actor]. The breaker fold
+    /// (`record_breaker_from_precomputed`) stays actor-side; only the
+    /// I/O moved out. `None` = test helpers / `store_client.is_none()`
+    /// — the in-actor probe runs as before. `Some(Err)` = handler-side
+    /// timeout/gRPC-error; the actor folds it into `cache_breaker`
+    /// (NOT a SubmitBuild failure unless the breaker trips).
+    pub precomputed_probe:
+        Option<Result<rio_proto::types::FindMissingPathsResponse, tonic::Status>>,
 }
 
 /// Commands sent to the DAG actor.

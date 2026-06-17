@@ -203,6 +203,7 @@ async fn test_upsert_at_merge_cache_hit() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -253,6 +254,7 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -275,6 +277,7 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -318,6 +321,7 @@ async fn test_upsert_skips_no_tenant() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
+            precomputed_probe: None,
         },
     )
     .await?;

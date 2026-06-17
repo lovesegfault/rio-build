@@ -9,7 +9,7 @@ use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
-use rio_proto::types::FindMissingPathsRequest;
+use rio_proto::types::{FindMissingPathsRequest, FindMissingPathsResponse};
 
 use crate::state::{
     BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, effective_wanted,
@@ -17,6 +17,16 @@ use crate::state::{
 };
 
 use super::{ActorError, DagActor, MergeDagRequest};
+
+/// sh-036.1 red-first witness: incremented at
+/// [`DagActor::find_missing_with_breaker`] entry. With
+/// `precomputed_probe = Some(..)` threaded, phase-4 must apply the
+/// pre-computed response WITHOUT entering the in-actor RPC path —
+/// `merge_phase_4_never_awaits_store_rpc` asserts this stays flat
+/// across a merge. Per-process global; nextest's process-per-test
+/// model keeps it test-isolated.
+#[cfg(test)]
+pub(crate) static FMP_AWAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Cross-phase carrier from [`DagActor::validate_and_ingest`] to
 /// [`DagActor::reconcile_merged_state`].
@@ -245,7 +255,9 @@ impl DagActor {
             traceparent,
             jti,
             jwt_token,
+            precomputed_probe,
         } = req;
+        let precomputed = precomputed_probe.as_ref();
         // Arch#13: proto→domain at the actor boundary. `MergeDagRequest`
         // keeps proto-typed `nodes`/`edges` so `actor/tests/` and
         // `rio-test-support` (b03 territory) can keep constructing it
@@ -430,12 +442,15 @@ impl DagActor {
         phase!("3-inmem-maps");
 
         // === Step 4: Scheduler-side cache check (BEFORE DB persist) ====
-        // Query the store for expected_output_paths of probe_set
-        // derivations (newly-inserted + existing not-done re-probe).
-        // If all outputs exist, skip straight to Completed.
-        // This closes the TOCTOU window between the gateway's
-        // FindMissingPaths and our merge (another build may have completed
-        // the derivation in between).
+        // Apply the pre-MergeDag store probe (the FindMissingPaths RPC
+        // ran in the gRPC handler before this turn was enqueued —
+        // sh-036.1; r[sched.merge.probe-off-actor]): partition
+        // probe_set derivations (newly-inserted + existing not-done
+        // re-probe) by whether their expected outputs are
+        // present/substitutable. If all outputs exist, skip straight to
+        // Completed. This closes the TOCTOU window between the
+        // gateway's FindMissingPaths and our merge (another build may
+        // have completed the derivation in between).
         //
         // Err(StoreUnavailable) → circuit breaker is open (sustained store
         // outage). Roll back the merge and reject the whole SubmitBuild.
@@ -448,7 +463,7 @@ impl DagActor {
         // silently fail the FK constraint, leaving orphan build rows
         // that recovery would resurrect.
         let (cached_hits, pending_substitute) = match self
-            .check_cached_outputs(&probe_set, &node_index, jwt_token.as_deref())
+            .check_cached_outputs(&probe_set, &node_index, jwt_token.as_deref(), precomputed)
             .await
         {
             Ok(r) => r,
@@ -2462,12 +2477,23 @@ impl DagActor {
     /// `jwt_token` is forwarded as `x-rio-tenant-token` metadata so the
     /// store's per-tenant upstream probe fires and populates
     /// `substitutable_paths` — see r[sched.merge.substitute-probe].
+    ///
+    /// `precomputed`: the gRPC handler's pre-enqueue FMP result over a
+    /// SUPERSET of `probe_set`'s expected paths
+    /// (r[sched.merge.probe-off-actor]). When `Some`, the actor folds
+    /// the result into `cache_breaker` and applies it directly — no
+    /// in-actor RPC await. The partition below iterates `probe_set`
+    /// only, so over-probed entries (in-flight Assigned/Running
+    /// outputs the handler couldn't filter) are never applied. When
+    /// `None` (test helpers / `store_client.is_none()`), the in-actor
+    /// `find_missing_with_breaker` path is the fallback.
     #[allow(clippy::type_complexity)]
     async fn check_cached_outputs(
         &mut self,
         probe_set: &HashSet<DrvHash>,
         node_index: &HashMap<&str, &crate::domain::DerivationNode>,
         jwt_token: Option<&str>,
+        precomputed: Option<&Result<FindMissingPathsResponse, tonic::Status>>,
     ) -> Result<(HashMap<DrvHash, Vec<String>>, Vec<(DrvHash, Vec<String>)>), ActorError> {
         // Floating-CA lane: PG realisations lookup + store-existence verify.
         let mut hits = self.check_ca_realisation_hits(probe_set, node_index).await;
@@ -2483,10 +2509,14 @@ impl DagActor {
             .filter(|p| !p.is_empty())
             .cloned()
             .collect();
-        let Some(resp) = self
-            .find_missing_with_breaker(check_paths.clone(), jwt_token)
-            .await?
-        else {
+        // r[impl sched.merge.probe-off-actor]
+        let Some(resp) = (match precomputed {
+            Some(r) => self.record_breaker_from_precomputed(r)?,
+            None => {
+                self.find_missing_with_breaker(check_paths.clone(), jwt_token)
+                    .await?
+            }
+        }) else {
             return Ok((hits, Vec::new()));
         };
 
@@ -2746,12 +2776,23 @@ impl DagActor {
     ///
     /// This call is ALSO the half-open probe: when the breaker is open
     /// the call still fires; success closes it.
+    ///
+    /// sh-036.1: with `precomputed_probe = Some(..)` threaded on the
+    /// request, the merge-time callers
+    /// ([`check_cached_outputs`](Self::check_cached_outputs),
+    /// [`verify_preexisting_completed`](Self::verify_preexisting_completed),
+    /// [`check_roots_topdown`](Self::check_roots_topdown)) short-circuit
+    /// via [`record_breaker_from_precomputed`](Self::record_breaker_from_precomputed)
+    /// instead — this fn remains as the `None` (test-helper / no
+    /// `store_client`) fallback and the half-open probe path.
     // r[impl sched.breaker.cache-check+3]
     async fn find_missing_with_breaker(
         &mut self,
         check_paths: Vec<String>,
         jwt_token: Option<&str>,
     ) -> Result<Option<rio_proto::types::FindMissingPathsResponse>, ActorError> {
+        #[cfg(test)]
+        FMP_AWAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let Some(store_client) = &self.store_client else {
             return Ok(None);
         };
@@ -2853,6 +2894,44 @@ impl DagActor {
             }
         };
         Ok(Some(resp))
+    }
+
+    /// Fold a handler-precomputed `FindMissingPaths` result into
+    /// `cache_breaker` and return the same `Option<response>` shape as
+    /// [`find_missing_with_breaker`](Self::find_missing_with_breaker).
+    ///
+    /// sh-036.1: the I/O moved to the gRPC handler; the breaker
+    /// accounting stays actor-owned (`&mut self`-serialized — fold
+    /// order is bounded under ≤4 concurrent submits per
+    /// `OPEN_THRESHOLD = 5`, no `Mutex` needed). Branch shape mirrors
+    /// `find_missing_with_breaker`'s match arms exactly:
+    /// `Ok → record_success → Some(resp)`; `Err → warn + counter +
+    /// record_failure → if-tripped Err(StoreUnavailable) else Ok(None)`
+    /// (proceed with CA-only hits, IA outputs treated 100%-miss — the
+    /// pre-sh-036 under-threshold behaviour). The handler collapses
+    /// timeout into `Err(Status::deadline_exceeded)` so both error
+    /// arms fold here. A handler-side failure is `Some(Err)`, never
+    /// `None` — production never re-probes in-actor on a handler error.
+    // r[impl sched.merge.probe-off-actor]
+    fn record_breaker_from_precomputed(
+        &mut self,
+        precomputed: &Result<FindMissingPathsResponse, tonic::Status>,
+    ) -> Result<Option<FindMissingPathsResponse>, ActorError> {
+        match precomputed {
+            Ok(r) => {
+                self.cache_breaker.record_success();
+                Ok(Some(r.clone()))
+            }
+            Err(e) => {
+                warn!(error = %e, "store FindMissingPaths failed (precomputed off-actor)");
+                self.note_issued_store_rpc_failure("merge-cache-check");
+                metrics::counter!("rio_scheduler_cache_check_failures_total").increment(1);
+                if self.cache_breaker.record_failure() {
+                    return Err(ActorError::StoreUnavailable);
+                }
+                Ok(None)
+            }
+        }
     }
 
     // r[impl sched.merge.substitute-topdown+13]

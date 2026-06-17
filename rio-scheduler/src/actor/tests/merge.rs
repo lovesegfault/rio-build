@@ -103,6 +103,7 @@ async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: None,
+                precomputed_probe: None,
             },
             reply: reply_tx,
         };
@@ -202,6 +203,7 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: None,
+                precomputed_probe: None,
             },
             reply: reply_tx,
         };
@@ -2734,6 +2736,64 @@ async fn pruned_gate_uses_durable_evidence_not_truncated_view() -> TestResult {
         origin, "pruned",
         "the pruned-origin gate reads the durable relation (B unproduced) — \
          the reap-truncated in-memory set must not launder a vouch"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.probe-off-actor]
+/// sh-036.1 red-first: with `precomputed_probe = Some(Ok(..))` threaded
+/// on the request, phase-4 (`check_cached_outputs`) MUST apply the
+/// pre-computed response without entering the in-actor
+/// `find_missing_with_breaker` path. Structural assertion via the
+/// [`FMP_AWAITS`](crate::actor::merge::FMP_AWAITS) entry counter —
+/// `setup()` runs without a store client, so `check_roots_topdown`
+/// short-circuits and the in-actor probe early-returns `Ok(None)`; the
+/// counter is fed solely by phase-4's entry into the on-actor path.
+///
+/// `edges = []` → `check_roots_topdown` early-returns; all 50 nodes are
+/// newly-inserted → `verify_preexisting_completed` early-returns.
+#[tokio::test]
+async fn merge_phase_4_never_awaits_store_rpc() -> TestResult {
+    use std::sync::atomic::Ordering;
+
+    let (_db, handle, _task) = setup().await;
+
+    let nodes: Vec<_> = (0..50)
+        .map(|i| {
+            let mut n = make_node(&format!("offactor-{i}"));
+            n.expected_output_paths = vec![test_store_path(&format!("offactor-{i}-out"))];
+            n
+        })
+        .collect();
+    let all_paths: Vec<String> = nodes
+        .iter()
+        .flat_map(|n| n.expected_output_paths.clone())
+        .collect();
+
+    let before = crate::actor::merge::FMP_AWAITS.load(Ordering::SeqCst);
+    let req = MergeDagRequest {
+        build_id: Uuid::new_v4(),
+        tenant_id: Some(DEFAULT_TEST_TENANT),
+        priority_class: PriorityClass::Scheduled,
+        nodes,
+        edges: vec![],
+        options: BuildOptions::default(),
+        keep_going: false,
+        traceparent: String::new(),
+        jti: None,
+        jwt_token: None,
+        precomputed_probe: Some(Ok(rio_proto::types::FindMissingPathsResponse {
+            missing_paths: all_paths,
+            ..Default::default()
+        })),
+    };
+    merge_dag_req(&handle, req).await?;
+    let after = crate::actor::merge::FMP_AWAITS.load(Ordering::SeqCst);
+    assert_eq!(
+        after, before,
+        "phase-4 must apply precomputed_probe without entering \
+         find_missing_with_breaker (sh-036.1: 4.99s on-actor FMP); \
+         RED at base: the in-actor probe path is entered → counter +1"
     );
     Ok(())
 }

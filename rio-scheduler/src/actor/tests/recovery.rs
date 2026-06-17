@@ -700,6 +700,7 @@ async fn merge_chain(
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: None,
+                precomputed_probe: None,
             },
             reply: tx,
         })
@@ -2679,6 +2680,7 @@ async fn test_recovery_restores_build_timeout_baseline() -> TestResult {
                     traceparent: String::new(),
                     jti: None,
                     jwt_token: None,
+                    precomputed_probe: None,
                 },
                 reply: tx,
             })
@@ -3201,6 +3203,7 @@ async fn recovered_stale_build_times_out_on_first_tick() -> TestResult {
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: None,
+                precomputed_probe: None,
             },
         )
         .await?;

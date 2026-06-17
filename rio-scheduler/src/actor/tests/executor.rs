@@ -158,6 +158,7 @@ async fn test_per_build_timeout_fails_build_on_tick() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
+            precomputed_probe: None,
         },
     )
     .await?;

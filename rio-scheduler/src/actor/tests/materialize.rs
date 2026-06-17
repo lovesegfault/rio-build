@@ -1358,6 +1358,7 @@ async fn reprobe_confirmed_missing_requires_all_tenants() -> TestResult {
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: None,
+                precomputed_probe: None,
             },
         )
         .await?;
@@ -1641,6 +1642,7 @@ async fn walk_success_stamps_only_wire_verified_tenants() -> TestResult {
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: Some("harness-tenant-jwt".into()),
+                precomputed_probe: None,
             },
         )
         .await?;
@@ -2479,6 +2481,7 @@ async fn flag_on_unmarked_leaf_confirmed_missing_releases_to_from_source() -> Te
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -2617,6 +2620,7 @@ async fn reprobe_scope_dropped_echo_never_confirms_missing() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -5188,6 +5192,7 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -5276,6 +5281,7 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -5321,6 +5327,7 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -5458,6 +5465,7 @@ async fn flag_on_genuine_unobtainable_fail_fasts_with_resubmit_error() -> TestRe
             traceparent: String::new(),
             jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -5641,6 +5649,7 @@ async fn flag_on_probe_job_backfills_wanted_relation_for_flag_off_era_builds() -
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: Some("harness-tenant-jwt".into()),
+                precomputed_probe: None,
             },
         )
         .await?;
@@ -6574,6 +6583,7 @@ async fn routing_reads_origin_not_column() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -6650,6 +6660,7 @@ async fn routing_reads_origin_not_column() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -6753,6 +6764,7 @@ async fn unobtainable_on_upgraded_dedup_job_fail_fasts() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -6780,6 +6792,7 @@ async fn unobtainable_on_upgraded_dedup_job_fail_fasts() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -7053,6 +7066,7 @@ async fn routing_evidence_survives_inmemory_truncation() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -7232,6 +7246,7 @@ async fn classify_durable_evidence_ignores_dead_voucher() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -10777,6 +10792,7 @@ async fn fail_fast_releases_the_claim_through_the_kinded_chokepoint() -> TestRes
             traceparent: String::new(),
             jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
+            precomputed_probe: None,
         },
     )
     .await?;

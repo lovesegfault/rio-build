@@ -593,6 +593,7 @@ impl MbtSystem {
             traceparent: String::new(),
             jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
+            precomputed_probe: None,
         };
         self.actor
             .handle_merge_dag(req)

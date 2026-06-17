@@ -217,6 +217,7 @@ impl SchedulerService for SchedulerGrpc {
             traceparent,
             jti,
             jwt_token,
+            precomputed_probe: None,
         };
         let cmd = ActorCommand::MergeDag {
             req,

@@ -28,6 +28,7 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -80,6 +81,7 @@ async fn test_dispatch_carries_submitter_traceparent() -> TestResult {
             traceparent: known_tp.to_string(),
             jti: None,
             jwt_token: None,
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -124,6 +126,7 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
         traceparent: tp.to_string(),
         jti: None,
         jwt_token: None,
+        precomputed_probe: None,
     };
 
     // First submit with tp_first.
@@ -181,6 +184,7 @@ async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
         traceparent: tp.to_string(),
         jti: None,
         jwt_token: None,
+        precomputed_probe: None,
     };
 
     // First merge with EMPTY traceparent (simulates recovery:
@@ -438,6 +442,7 @@ async fn dispatch_time_substitutable_routes_to_job(#[case] is_fod: bool) -> Test
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -526,6 +531,7 @@ async fn probe_batch_partitions_by_tenant() -> TestResult {
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: None,
+                precomputed_probe: None,
             },
         )
         .await?;

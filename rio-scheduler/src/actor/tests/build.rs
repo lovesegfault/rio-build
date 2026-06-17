@@ -886,6 +886,7 @@ async fn test_per_build_timeout_failure_is_build_level() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
+            precomputed_probe: None,
         },
     )
     .await?;

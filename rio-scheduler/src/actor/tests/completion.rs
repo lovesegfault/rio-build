@@ -2931,6 +2931,7 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
                     traceparent: String::new(),
                     jti: None,
                     jwt_token: None,
+                    precomputed_probe: None,
                 },
                 reply: reply_tx,
             })
@@ -6420,6 +6421,7 @@ async fn untenanted_floating_ca_report_never_mints_global_realisations() -> Test
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
+            precomputed_probe: None,
         },
     )
     .await?;

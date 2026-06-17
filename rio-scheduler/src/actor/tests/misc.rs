@@ -549,6 +549,7 @@ async fn test_hmac_assignment_carries_tenant() -> TestResult {
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
+            precomputed_probe: None,
         },
     )
     .await?;
@@ -610,6 +611,7 @@ async fn test_hmac_expiry_bounded_by_seven_day_lifetime() -> TestResult {
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: None,
+                precomputed_probe: None,
             },
         )
         .await?;
@@ -761,6 +763,7 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: None,
+                precomputed_probe: None,
             },
             reply: reply_tx,
         })
