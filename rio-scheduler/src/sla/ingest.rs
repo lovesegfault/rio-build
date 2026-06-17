@@ -32,8 +32,12 @@ const PARTIAL_POOL_N0: f64 = 3.0;
 /// Hard floor on bootstrap-CI recompute interval. Decoupled from any
 /// halflife (ordinal weighting has none): this is purely a
 /// rate-limiter on the expensive 500×NNLS bootstrap under completion
-/// storms.
-const CI_DEBOUNCE_SECS: f64 = 30.0;
+/// storms. 90s spans the ~60s estimator-refresh cadence
+/// (`ESTIMATOR_REFRESH_EVERY=6` × 10s tick) so a key touched on
+/// consecutive refreshes carries the previous CI on every other tick;
+/// at 30s the floor never gated across ticks (sh-018: every touched
+/// non-Probe key re-ran the 500-rep bootstrap every refresh).
+const CI_DEBOUNCE_SECS: f64 = 90.0;
 
 // r[impl sched.sla.hw-class.anchor-slots]
 /// `cap`-slot sample ring with anchor reservation. ADR-023 L145: one
@@ -671,7 +675,7 @@ pub(super) fn should_recompute_ci(
     let Some(prev) = prev else { return true };
     // Floor first — it's unconditional, and `ci_computed_at` is set
     // even when bootstrap returned `None` (rank-deficient resamples), so
-    // a None-CI key still rate-limits to once per 30s.
+    // a None-CI key still rate-limits to once per CI_DEBOUNCE_SECS.
     if let Some(at) = prev.ci_computed_at
         && now - at < CI_DEBOUNCE_SECS
     {
@@ -1450,26 +1454,28 @@ mod tests {
     }
 
     #[test]
-    fn debounce_skips_ci_within_30s() {
+    fn debounce_skips_ci_within_90s() {
         let new_fit = DurationFit::Amdahl {
             s: RefSeconds(500.0),
             p: RefSeconds(0.0),
         };
-        // prev CI computed at t=1000, now=1020 → elapsed=20s < 30s → skip
-        // even though ΔT_min=400 > width/2=50.
+        // prev CI computed at t=1000, now=1060 → elapsed=60s < 90s → skip
+        // even though ΔT_min=400 > width/2=50. 60s is the
+        // ESTIMATOR_REFRESH_EVERY×10s cadence — the case the 30s floor
+        // never gated.
         let prev = prev_with_ci(100.0, 50.0, 150.0, 5.0, 1000.0);
         assert!(!should_recompute_ci(
             Some(&prev),
             &new_fit,
             FitDf(5.0),
-            1020.0
+            1060.0
         ));
-        // Same prev, now=1040 → elapsed=40s > 30s → ΔT_min trigger fires.
+        // Same prev, now=1100 → elapsed=100s > 90s → ΔT_min trigger fires.
         assert!(should_recompute_ci(
             Some(&prev),
             &new_fit,
             FitDf(5.0),
-            1040.0
+            1100.0
         ));
     }
 
@@ -1479,20 +1485,21 @@ mod tests {
             s: RefSeconds(100.0),
             p: RefSeconds(0.0),
         };
-        // ΔT_min=0, but fit_df 5→12 (>50% jump) → recompute.
+        // ΔT_min=0, but fit_df 5→12 (>50% jump) → recompute. now=1100
+        // (past the 90s floor) so the change-trigger is what's tested.
         let prev = prev_with_ci(100.0, 50.0, 150.0, 5.0, 1000.0);
         assert!(should_recompute_ci(
             Some(&prev),
             &new_fit,
             FitDf(12.0),
-            1040.0
+            1100.0
         ));
         // fit_df 5→6 (<50%) and ΔT_min=0 → keep.
         assert!(!should_recompute_ci(
             Some(&prev),
             &new_fit,
             FitDf(6.0),
-            1040.0
+            1100.0
         ));
     }
 
@@ -1626,8 +1633,8 @@ mod tests {
     #[test]
     fn recompute_ci_floor_gates_none_ci() {
         // Bootstrap ran (ci_computed_at=Some) but returned None
-        // (rank-deficient resamples). The 30s floor must still apply —
-        // not refit-storm 500×NNLS every tick.
+        // (rank-deficient resamples). The CI_DEBOUNCE_SECS floor must
+        // still apply — not refit-storm 500×NNLS every tick.
         let f = DurationFit::Amdahl {
             s: RefSeconds(100.0),
             p: RefSeconds(0.0),
@@ -1636,7 +1643,7 @@ mod tests {
         prev.t_min_ci = None;
         assert!(
             !should_recompute_ci(Some(&prev), &f, FitDf(6.0), 101.0),
-            "within 30s floor"
+            "within floor"
         );
         assert!(
             should_recompute_ci(Some(&prev), &f, FitDf(6.0), 200.0),
