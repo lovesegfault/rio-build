@@ -864,7 +864,7 @@ impl DagActor {
         // `test_recovery_heals_corrupted_ready`) maps a
         // Ready-with-unbuilt-deps row back to Queued at failover, then
         // the dep re-probes as a store hit on the next tick —
-        // one-tick efficiency cost only. FRESH-WRITE-ONLY,
+        // one-tick efficiency cost only. Fresh-write-only,
         // `transition_build` DB-first invariant, fence-coverage
         // census, and ack-after-durable are UNTOUCHED.
         let generation = self.serving_generation();

@@ -1828,7 +1828,7 @@ impl DagActor {
     /// S6): hoisted `release_materialization_pins_best_effort` (was
     /// per-resolve), ONE batched `complete_ready_from_store_batch`,
     /// then — and only then — every held reply. Factored so the
-    /// fall-back arms above share the SAME ack-after-durable epilogue.
+    /// fall-back arms above share the same ack-after-durable epilogue.
     async fn flush_tail(&mut self, acks: Vec<PendingAck>) {
         // The second-level accumulator: every Success consumption
         // pushed `(drv_hash, WalkVerified(..))` here. ONE batched

@@ -561,7 +561,7 @@ impl DagActor {
     }
 
     /// Actor-level wrapper for [`SchedulerDb::persist_build_counts_batch`]
-    /// — best-effort, logs and continues on error. ALL three
+    /// — best-effort, logs and continues on error. All three
     /// `update_build_counts_with` callers route through here (the
     /// `update_build_counts` single-item wrapper, the
     /// `complete_ready_from_store_batch` per-build tail, and

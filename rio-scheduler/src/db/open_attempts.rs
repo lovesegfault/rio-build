@@ -385,7 +385,7 @@ impl SchedulerDb {
 
     /// Batch [`Self::find_attempt_by_exec_id`] over an `exec_id` slice
     /// (the sh-007c S6 prefetch read for the report-flush hot path):
-    /// one `= ANY($1::uuid[])` round-trip resolving every attempt in
+    /// one `= any($1::uuid[])` round-trip resolving every attempt in
     /// the flush. `DISTINCT ON (a.exec_id) … ORDER BY a.exec_id,
     /// a.assigned_at DESC` is the per-exec `LIMIT 1` the singleton
     /// uses. Absent keys (no assignment carries the exec, or no

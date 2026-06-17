@@ -1099,7 +1099,6 @@ rio-scheduler/src/actor/materialize.rs	/// (bug_170): armament state is read ONL
 rio-scheduler/src/actor/materialize.rs	/// (merged_bug_262 totality pin).
 rio-scheduler/src/actor/materialize.rs	/// (the §3.3 settlement totality).
 rio-scheduler/src/actor/materialize.rs	/// ALWAYS-ON, never flag-gated (PD-B17): flag-gating the release
-rio-scheduler/src/actor/materialize.rs	/// ONLY by [`DagActor::close_for_consumption`], consumed BY VALUE by
 rio-scheduler/src/actor/materialize.rs	/// The listing beat's pacing charge (merged_bug_066): minted ONLY by
 rio-scheduler/src/actor/materialize.rs	/// The rebuild mirrors ALL unresolved state: claim holders (so the
 rio-scheduler/src/actor/materialize.rs	/// Transitions: [`Self::rebuild`] (recovery Ok) is the ONLY path to

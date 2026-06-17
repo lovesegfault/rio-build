@@ -1549,7 +1549,7 @@ async fn close_and_resolve_materialization_batch_idempotent() -> anyhow::Result<
     assert!(r2.resolved_set.is_empty(), "state='pending' guard");
 
     // Fenced: the floor is per-tx — a deposed generation rolls back
-    // having written nothing for ANY member.
+    // having written nothing for any member.
     let r3 = db
         .close_and_resolve_materialization_batch_fenced(
             ServingGeneration::stamp_from_claim(0),

@@ -1700,7 +1700,7 @@ impl SlaConfig {
         // `gc==max_cc ∧ gm==max_cm` holds BY CONSTRUCTION — the exact
         // phantom `derive_ceilings`' doc forbids within a class,
         // recreated one level up. An uncatalogued un-overridden class
-        // falls to global ONLY when the catalog itself is empty
+        // falls to global only when the catalog itself is empty
         // (Static / API-failed boot — every class is uncatalogued and
         // the fallback restores the pre-derive over-permits floor);
         // when the catalog has data the class is excluded ((0,0) —

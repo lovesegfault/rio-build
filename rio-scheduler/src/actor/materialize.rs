@@ -985,7 +985,7 @@ pub(crate) use rio_evidence_kernel::settle::{
 
 /// Proof that the consumption close for ONE report became durable
 /// (`Applied`/`AlreadyResolved`). Linear and `#[must_use]`: produced
-/// ONLY by [`DagActor::close_for_consumption`] and its batched twin
+/// only by [`DagActor::close_for_consumption`] and its batched twin
 /// [`DagActor::close_for_consumption_from_disposition`] (the sh-007c
 /// S6 second sanctioned mint — same kernel `consumption_ack` law over
 /// a `WriteDisposition` synthesized from the batch tx outcome),
@@ -3321,7 +3321,7 @@ impl DagActor {
     /// fenced ack, or the NACK marker — per the kernel ack law
     /// (`consumption_ack`). This and
     /// [`Self::close_for_consumption_from_disposition`] are the only
-    /// two sites that construct [`SettledClose`]; both feed the SAME
+    /// two sites that construct [`SettledClose`]; both feed the same
     /// `consumption_ack` over a `WriteDisposition`, so the witness law
     /// is identical batched or per-item.
     async fn close_for_consumption(

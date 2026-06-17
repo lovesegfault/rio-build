@@ -783,7 +783,7 @@ scheduler:
       #   and the all-masked fallback re-offers the full closure, so
       #   od serves exactly when spot cannot (the membership-only
       #   ruling; witnessed by the shipped-values failover red).
-      # - sh-016 leaf-closure rule: every class referenced by ANY
+      # - sh-016 leaf-closure rule: every class referenced by any
       #   `ladder.rungs[].class` MUST itself declare `ladder` (even if
       #   `rungs: []` to mark an intentional terminal). Helm-lint
       #   `hwclass-ladder-closed` enforces this. The g7 siblings

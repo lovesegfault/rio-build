@@ -1,4 +1,4 @@
-# sh-016 (c): every hwClass referenced by ANY `ladder.rungs[].class` MUST
+# sh-016 (c): every hwClass referenced by any `ladder.rungs[].class` MUST
 # itself declare `ladder` (even if `rungs: []` to mark an intentional
 # terminal). A rung target with no `ladder` key dead-ends the BFS at
 # `retain_hosting_cells`' `else { continue }` — when the τ-band collapsed

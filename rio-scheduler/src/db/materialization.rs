@@ -140,7 +140,7 @@ pub(crate) enum FencedBatchJobCreate {
     /// input order.
     Applied(Vec<JobCreateResult>),
     /// The serving generation is below the claims floor: the
-    /// transaction rolled back having written nothing for ANY row.
+    /// transaction rolled back having written nothing for any row.
     Fenced,
 }
 
@@ -755,7 +755,7 @@ impl SchedulerDb {
 
     /// Batch [`Self::unresolved_job_for_derivation`] over a
     /// `derivation_id` slice (the sh-007c S6 prefetch read for the
-    /// report-flush hot path): one `= ANY($1::uuid[])` round-trip
+    /// report-flush hot path): one `= any($1::uuid[])` round-trip
     /// returning every pending job in the flush. Absent keys (no
     /// unresolved row) are simply not in the returned map; the caller
     /// treats absent as `None` per the singleton's contract.

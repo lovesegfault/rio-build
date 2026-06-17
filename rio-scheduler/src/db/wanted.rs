@@ -172,7 +172,7 @@ impl SchedulerDb {
 
     /// Batch [`Self::effective_wanted_union`] over a `derivation_id`
     /// slice (the sh-007c S6 prefetch read for the report-flush hot
-    /// path): one `= ANY($1::uuid[])` round-trip resolving every live
+    /// path): one `= any($1::uuid[])` round-trip resolving every live
     /// wanted union in the flush. Same `note_width_event` side-effect
     /// per saturated-default row (parity with the singleton — the
     /// observable is identical row-set or row-at-a-time). Absent keys
