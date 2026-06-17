@@ -20,8 +20,8 @@ test -n "$so" || {
 
 # Positive: the backlog trigger renders with the JOB-unit knob's seed.
 backlog=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.triggers[] | select(.metadata.query=="sum(rio_scheduler_substituting_derivations)") | .metadata.threshold' "$out" | tr -d '"')
-test "$backlog" = "85" || {
-  echo "FAIL: store backlog trigger threshold = '$backlog', expected 85 (targetBacklogJobsPerReplica — job units; see files/metric-units.json)" >&2
+test "$backlog" = "250" || {
+  echo "FAIL: store backlog trigger threshold = '$backlog', expected 250 (targetBacklogJobsPerReplica — job units; see files/metric-units.json)" >&2
   exit 1
 }
 builders=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.triggers[] | select(.metadata.query=="sum(rio_scheduler_open_attempts)") | .metadata.threshold' "$out" | tr -d '"')
