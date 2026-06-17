@@ -387,6 +387,13 @@ module "eks" {
       # vpc-cni is in cluster_addons (which it no longer is).
       iam_role_attach_cni_policy = false
 
+      # SSM: xtask's tunnel transport (k8s/ssm.rs) needs an always-on
+      # relay node. Karpenter nodes have it too (karpenter.tf) but may
+      # not exist yet on a fresh cluster.
+      iam_role_additional_policies = {
+        AmazonSSMManagedInstanceCore = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      }
+
       # No taint: system components (plus kube-system addons like
       # CoreDNS, Karpenter controller) schedule here freely.
       #
