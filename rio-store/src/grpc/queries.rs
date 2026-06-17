@@ -299,16 +299,30 @@ impl StoreServiceImpl {
         // Fails-open on probe errors (a down upstream shouldn't hide
         // paths the scheduler can otherwise substitute). Empty if no
         // substituter / no tenant / no upstreams — the normal case.
+        //
+        // `.drv` paths are excluded from the upstream HEAD probe —
+        // no binary cache serves derivation files (sh-036: 15733
+        // wasted HEADs / 5.53 s on the wopQueryValidPaths upload-side
+        // path). They stay in `missing_paths` and out of
+        // `substitutable` / `indeterminate` — semantically a confirmed
+        // upstream miss, which is the only answer a binary cache can
+        // give for `.drv`.
+        //
         // r[impl sched.merge.substitute-probe-indeterminate+2]
         // `indeterminate` = paths the probe couldn't classify (429,
         // 5xx, deadline). Scheduler treats them optimistically; without
         // this field they were silently treated as confirmed-miss and
         // dispatched as builds even when in cache.nixos.org.
+        let probe_missing: Vec<String> = missing
+            .iter()
+            .filter(|p| !crate::visibility::drv_exempt(p))
+            .cloned()
+            .collect();
         let (substitutable, indeterminate) = match (&self.substituter, tenant_id) {
-            (Some(sub), Some(tid)) if !missing.is_empty() => sub
+            (Some(sub), Some(tid)) if !probe_missing.is_empty() => sub
                 .check_available(
                     tid,
-                    &missing,
+                    &probe_missing,
                     entry + crate::substitute::CHECK_AVAILABLE_DEFAULT_BUDGET,
                 )
                 .await
@@ -323,8 +337,8 @@ impl StoreServiceImpl {
                     (r.hits, indeterminate)
                 })
                 .unwrap_or_else(|e| {
-                    warn!(error = %e, "check_available failed; reporting all missing as indeterminate");
-                    (Vec::new(), missing.clone())
+                    warn!(error = %e, "check_available failed; reporting all probed-missing as indeterminate");
+                    (Vec::new(), probe_missing.clone())
                 }),
             _ => (Vec::new(), Vec::new()),
         };
@@ -759,5 +773,81 @@ mod tests {
         svc.tenant_quota_impl(quota_req("quota-owner", None))
             .await
             .expect("anonymous dual-mode passthrough preserved");
+    }
+
+    /// sh-036.side red-first: `wopQueryValidPaths` HEAD-probes `.drv`
+    /// paths against the tenant's upstreams (cache.nixos.org), which
+    /// never serve derivation files — 15733 wasted HEADs / 5.53 s in
+    /// the iter8 self-host trace. The filter at the tenant-scoped
+    /// FMP→`check_available` chokepoint excludes `.drv` from the
+    /// upstream probe while keeping them in `missing_paths`
+    /// (PG-absence is the truth; the upstream answer is always 404).
+    ///
+    /// Structural assertion (no mock surface):
+    /// `rio_store_substitute_probe_cache_misses_total` ticks for every
+    /// path that reaches `check_available`'s probe-cache partition
+    /// (`substitute.rs`). At base, 1 `.drv` + 1 output → 2;
+    /// post-filter → 1.
+    #[tokio::test]
+    async fn find_missing_paths_never_head_probes_drv() {
+        use rio_test_support::metrics::CountingRecorder;
+        use std::sync::Arc;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "fmp-drv-skip").await;
+        // Dead upstream: `capability_gate` sees the row → `Ready`; the
+        // cache-miss counter fires BEFORE any HEAD, so a closed
+        // loopback port suffices (connection-refused is instant; the
+        // probe outcome is `Indeterminate` for the surviving output).
+        crate::metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            "http://127.0.0.1:1",
+            50,
+            &[],
+            crate::metadata::upstreams::SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let sub = Arc::new(
+            crate::substitute::Substituter::new(db.pool.clone(), None)
+                .with_http_client(crate::test_helpers::sandbox_http()),
+        );
+        let svc = StoreServiceImpl::new(db.pool.clone()).with_substituter(sub);
+
+        let drv = format!(
+            "/nix/store/{}-foo.drv",
+            rio_test_support::fixtures::rand_store_hash()
+        );
+        let out = format!(
+            "/nix/store/{}-foo-out",
+            rio_test_support::fixtures::rand_store_hash()
+        );
+        let mut req = Request::new(FindMissingPathsRequest {
+            store_paths: vec![drv.clone(), out.clone()],
+        });
+        req.extensions_mut().insert(claims(tid));
+
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let resp = svc.find_missing_paths_impl(req).await.unwrap().into_inner();
+        drop(_g);
+
+        // Only the non-`.drv` output reaches the probe-cache partition.
+        assert_eq!(
+            rec.get("rio_store_substitute_probe_cache_misses_total{}"),
+            1,
+            "the .drv path must be filtered out of check_available; keys={:?}",
+            rec.all_keys()
+        );
+        // The `.drv` stays a confirmed miss (PG-absent), NOT
+        // substitutable, NOT indeterminate.
+        assert!(resp.missing_paths.contains(&drv));
+        assert!(!resp.substitutable_paths.contains(&drv));
+        assert!(!resp.indeterminate_paths.contains(&drv));
+        // Echo unchanged: tenant + substituter present → true
+        // regardless of how many paths the filter dropped.
+        assert!(resp.probe_ran_tenant_scoped);
     }
 }
