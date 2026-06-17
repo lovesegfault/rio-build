@@ -2041,9 +2041,12 @@ impl DagActor {
             .map(|r| (r.drv_path.as_str(), r.drv_hash.as_str()))
             .collect();
 
-        // Transaction: 3 batched roundtrips instead of 2N+E serial,
-        // opened through the fenced capability (begin-time floor check
-        // on the transaction's own connection).
+        // Transaction: 2×COPY + 3 INSERT…SELECT roundtrips instead of
+        // 2N+E serial (sh-036: the prior UNNEST formulation cost
+        // 4.91 s in-cluster for 14701 nodes + ~45 k edges; COPY → ON
+        // COMMIT DROP temp → upsert lands sub-second), opened through
+        // the fenced capability (begin-time floor check on the
+        // transaction's own connection).
         let serving_generation = self.serving_generation();
 
         // r[impl sched.evidence.durability+4]
