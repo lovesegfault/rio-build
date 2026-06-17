@@ -1052,6 +1052,13 @@ pub(crate) struct TestCounters {
     /// builds must drive ≤1 batched counts write, not N serial
     /// `persist_build_counts` awaits inside `update_build_counts_with`.
     pub persist_build_counts_calls: std::sync::atomic::AtomicU64,
+    /// Incremented at every consumption-path `begin_fenced` call site
+    /// (sh-007c S6): `close_materialization_attempt` and the batched
+    /// `close_and_resolve_materialization_batch` wrapper. Asserts on
+    /// the O(1)-PG-per-flush rule: N queued materialization reports
+    /// must drive ONE fenced close+resolve transaction, not N
+    /// per-item `close_materialization_attempt` calls.
+    pub begin_fenced_calls: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
@@ -1065,6 +1072,7 @@ impl TestCounters {
             complete_ready_batch_calls: self.complete_ready_batch_calls.load(SeqCst),
             max_known_generation_reads: self.max_known_generation_reads.load(SeqCst),
             persist_build_counts_calls: self.persist_build_counts_calls.load(SeqCst),
+            begin_fenced_calls: self.begin_fenced_calls.load(SeqCst),
         }
     }
 }
@@ -1087,6 +1095,8 @@ pub struct TestCountersSnapshot {
     pub max_known_generation_reads: u64,
     /// See [`TestCounters::persist_build_counts_calls`].
     pub persist_build_counts_calls: u64,
+    /// See [`TestCounters::begin_fenced_calls`].
+    pub begin_fenced_calls: u64,
 }
 
 impl DagActor {

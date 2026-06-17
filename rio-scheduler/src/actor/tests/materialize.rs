@@ -12058,6 +12058,72 @@ async fn sh002_queued_reports_coalesce_into_one_completion_batch() -> TestResult
 }
 
 // r[verify sched.executor.report-idempotent]
+/// sh-007c S6 (`report-pg-batch`): N Success reports queued
+/// back-to-back drive ONE consumption-path `begin_fenced` transaction,
+/// not N per-item ones. RED at base: each report's
+/// `consume_materialization_outcome` calls
+/// `close_materialization_attempt` (one fenced tx per item) — the
+/// counter moves by 8. After the phased flush body the prefetch +
+/// batch close+resolve runs ONE fenced tx for the whole batch.
+#[tokio::test]
+async fn flush_is_o1_pg_per_batch() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let claimed = seed_claimed_mat_jobs(
+        &handle,
+        &store,
+        &[
+            "sh007c-a", "sh007c-b", "sh007c-c", "sh007c-d", "sh007c-e", "sh007c-f", "sh007c-g",
+            "sh007c-h",
+        ],
+    )
+    .await?;
+
+    let before = handle.debug_counters().await?.begin_fenced_calls;
+
+    // Same coalesce shape as the sh-002 row-4 test: try_send all
+    // reports in one synchronous burst so the actor sees a non-empty
+    // mailbox while processing reports 1..N-1; report N's mailbox-idle
+    // eager flush (trigger iv) drains all eight into ONE flush.
+    let tx = handle.command_sender();
+    let mut rxs: Vec<tokio::sync::oneshot::Receiver<Result<(), PullRejection>>> = Vec::new();
+    for (tag, out, exec_id) in &claimed {
+        let mut payload = pull_payload(rio_proto::types::BuildResult::default());
+        payload.materialization_outcome = Some(mat_success_outcome(vec![out.clone()], vec![]));
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        tx.try_send(ActorCommand::ReportPullOutcome {
+            exec_id: *exec_id,
+            auth_intent: Some(tag.clone()),
+            payload,
+            reply: rtx,
+        })
+        .map_err(|e| anyhow::anyhow!("mailbox try_send: {e}"))?;
+        rxs.push(rrx);
+    }
+
+    for (i, rx) in rxs.into_iter().enumerate() {
+        let r = rx.await.map_err(|_| anyhow::anyhow!("reply {i} dropped"))?;
+        assert!(r.is_ok(), "report {i} must ack Ok, got {r:?}");
+    }
+    for (tag, _, _) in &claimed {
+        assert_eq!(
+            expect_drv(&handle, tag).await.status,
+            DerivationStatus::Completed,
+            "every coalesced report's node completed"
+        );
+    }
+
+    let delta = handle.debug_counters().await?.begin_fenced_calls - before;
+    assert_eq!(
+        delta, 1,
+        "RED at base: 8 Success reports drove 8 per-item \
+         close_materialization_attempt fenced transactions — the phased \
+         flush must batch close+resolve into ONE fenced tx (got {delta})"
+    );
+    Ok(())
+}
+
+// r[verify sched.executor.report-idempotent]
 /// sh-002 row-4 arm (c): a `LeaderLost` queued behind pending reports
 /// drains every held reply with `Err(NotLeader)` — never a silent
 /// `clear()`. RED at 5f1ce214c: there is no accumulator; each report

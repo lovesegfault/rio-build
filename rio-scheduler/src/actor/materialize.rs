@@ -3156,6 +3156,10 @@ impl DagActor {
         charge_row: Option<crate::db::attempts::AttemptRow>,
         serving_generation: crate::db::ServingGeneration,
     ) -> WriteDisposition {
+        #[cfg(test)]
+        self.test_counters
+            .begin_fenced_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let result: Result<Option<(u64, bool)>, sqlx::Error> = async {
             let mut tx = match self.db.begin_fenced(serving_generation).await? {
                 crate::db::FencedBegin::Fenced { .. } => return Ok(None),
