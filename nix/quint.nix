@@ -334,7 +334,10 @@ let
     # transcript of the accepted attempt is in $out.
     run_quint_verify() {
       quint_status=0
-      for attempt in 1 2 3; do
+      # sh-029: 3 attempts × 10s sleep = 30s; the enlarged retryPolicy.qnt
+      # (post-FExecutorVariant split) measured cold-conversion succeeding
+      # at +58s. 6 × 15s covers ~90s.
+      for attempt in 1 2 3 4 5 6; do
         # Hard wall-clock bound (MODEL_TIMEOUT_SEC, constructor
         # parameter): a non-terminating model MUST be a RED check with
         # a log, never an eternal gate. A state-space blowup once ran
@@ -357,7 +360,7 @@ let
           return 0
         fi
         echo "attempt $attempt produced no TLC verdict (cold-server conversion failure?); retrying" >&2
-        sleep 10
+        sleep 15
       done
       return 0
     }
