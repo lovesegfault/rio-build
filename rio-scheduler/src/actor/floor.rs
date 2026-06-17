@@ -190,9 +190,9 @@ pub fn bump_floor_or_count(
 ///   `sched.attempt.witnessed-terminal` mark; kubelet per-container
 ///   attribution, deduped by the establishment `won` flag);
 /// - [`Self::corroborated_compute_bound`] — `cpu_seconds_total /
-///   (assigned_deadline × assigned_cores) >= threshold` (sh-012, the
-///   D4 cores axis: an executor-variant exit≠0 that demonstrably
-///   exhausted its parallelism budget).
+///   (elapsed_wall × assigned_cores) >= threshold` (sh-012, the D4
+///   cores axis: an executor-variant exit≠0 that demonstrably
+///   saturated its assigned cores while running).
 ///
 /// The `(TerminationReason, label)` pair DERIVES from the witness
 /// ([`Self::reason`]/[`Self::label`]) — one producer for the mapping
@@ -307,33 +307,49 @@ impl CorroborationWitness {
     }
 
     /// The compute-bound axis (sh-012, the D4 fourth dimension): an
-    /// executor-variant exit≠0 demonstrably exhausted its parallelism
-    /// budget — `cpu_util = cpu_seconds_total / (assigned_deadline ×
-    /// assigned_cores) >= threshold`. `cpu_seconds_total` is the
-    /// builder's own `cpu.stat usage_usec` cumulative read (carried in
-    /// `CompletionReport.final_resources` even on the executor-error
-    /// path); `assigned_{cores,deadline}` are the reconciled
-    /// `last_intent` (scheduler-stamped at the pull mint, never
-    /// worker-mintable). A genuine compile-error exit dies fast with
-    /// `cpu_util ≪ threshold` and refuses; a parallelism-exhausted
-    /// build saturates and corroborates.
+    /// executor-variant exit≠0 demonstrably saturated its assigned
+    /// cores WHILE RUNNING — `cpu_util = cpu_seconds_total /
+    /// (elapsed_wall × assigned_cores) >= threshold`.
+    /// `cpu_seconds_total` is the builder's own `cpu.stat usage_usec`
+    /// cumulative read (carried in `CompletionReport.final_resources`
+    /// even on the executor-error path); `attempt_open` is the
+    /// scheduler's own `running_since` elapsed (the same trust anchor
+    /// as [`Self::corroborated_timeout`] — stamped at the Running
+    /// transition, a worker cannot mint it); `assigned_cores` is the
+    /// reconciled `last_intent.cores` (scheduler-stamped at the pull
+    /// mint).
     ///
-    /// `None` anchors refuse: missing telemetry (old builder), zero
-    /// assigned cores/deadline (cold start, never minted) — there is
-    /// nothing to corroborate against, so classify-only (the
-    /// conservative direction: a floor never moves on absent
-    /// evidence).
+    /// sh-031: the original denominator was `assigned_deadline ×
+    /// assigned_cores` — the parallelism *budget*, not the parallelism
+    /// *available while running*. For a 100%-saturated build that
+    /// reduces to `wall / deadline`, so a compute-bound build that
+    /// exits on its own internal timeout BEFORE the nix deadline
+    /// (chunk-collect-corrupt at iter6: 96 cores × 1810s, deadline
+    /// 7200s → util 0.25) refused regardless of saturation, and the
+    /// floor never moved across three saturated attempts.
+    ///
+    /// `min_wall_secs` preserves the inverse-cost bound: a 5s compile
+    /// error that briefly pegged 4 cores would otherwise compute
+    /// `cpu_util ≈ 1.0`; trivially-short runs refuse.
+    ///
+    /// `None` anchors refuse: missing telemetry (old builder), no
+    /// `running_since` (failover-recovered node), zero assigned cores
+    /// (cold start), or `wall < min_wall_secs` — there is nothing to
+    /// corroborate against, so classify-only (the conservative
+    /// direction: a floor never moves on absent evidence).
     pub(super) fn corroborated_compute_bound(
         cpu_seconds_total: Option<f64>,
         assigned_cores: u32,
-        assigned_deadline_secs: u32,
+        attempt_open: Option<std::time::Duration>,
         threshold: f64,
+        min_wall_secs: f64,
     ) -> Option<Self> {
         let cpu = cpu_seconds_total?;
-        if assigned_cores == 0 || assigned_deadline_secs == 0 {
+        let wall = attempt_open?.as_secs_f64();
+        if assigned_cores == 0 || wall < min_wall_secs {
             return None;
         }
-        let cpu_util = cpu / (f64::from(assigned_deadline_secs) * f64::from(assigned_cores));
+        let cpu_util = cpu / (wall * f64::from(assigned_cores));
         (cpu_util >= threshold).then_some(Self {
             axis: WitnessAxis::ComputeBound,
         })
@@ -1018,29 +1034,63 @@ mod tests {
     /// base: `WitnessAxis::ComputeBound` does not exist.
     #[test]
     fn corroborated_compute_bound_band() {
+        let open = |s: u64| Some(std::time::Duration::from_secs(s));
+        // sh-031 regression — chunk-collect-corrupt at iter6: 96 cores
+        // saturated for 1810s, deadline 7200s. Under the old
+        // assigned-deadline denominator: 172800 / (7200×96) = 0.25 →
+        // refused. Under the elapsed-wall denominator: 172800 /
+        // (1810×96) = 0.99 → corroborates. RED at sh-031 base.
+        assert!(
+            CorroborationWitness::corroborated_compute_bound(
+                Some(172_800.0),
+                96,
+                open(1810),
+                0.8,
+                60.0
+            )
+            .is_some(),
+            "sh-031: a saturated build that exits before its nix \
+             deadline corroborates (cpu_util=0.99 over elapsed wall)"
+        );
         // cpu_util = 2280 / (600×4) = 0.95 ≥ 0.8 → corroborates.
         assert!(
-            CorroborationWitness::corroborated_compute_bound(Some(2280.0), 4, 600, 0.8).is_some(),
+            CorroborationWitness::corroborated_compute_bound(Some(2280.0), 4, open(600), 0.8, 60.0)
+                .is_some(),
             "cpu_util=0.95: a parallelism-exhausted build corroborates"
         );
         // cpu_util = 120 / (600×4) = 0.05 ≪ 0.8 → refuses (the
-        // compile-error exit: died fast, near-zero cpu).
+        // long-but-idle exit: ran for the wall, near-zero cpu).
         assert!(
-            CorroborationWitness::corroborated_compute_bound(Some(120.0), 4, 600, 0.8).is_none(),
-            "cpu_util=0.05: a fast intrinsic exit≠0 refuses"
+            CorroborationWitness::corroborated_compute_bound(Some(120.0), 4, open(600), 0.8, 60.0)
+                .is_none(),
+            "cpu_util=0.05: an idle exit≠0 refuses"
         );
         // Exactly at threshold: corroborates (closed lower bound).
         assert!(
-            CorroborationWitness::corroborated_compute_bound(Some(1920.0), 4, 600, 0.8).is_some(),
+            CorroborationWitness::corroborated_compute_bound(Some(1920.0), 4, open(600), 0.8, 60.0)
+                .is_some(),
             "cpu_util=0.80: the band is closed at threshold"
         );
-        // None anchors refuse: missing telemetry / cold start.
-        assert!(CorroborationWitness::corroborated_compute_bound(None, 4, 600, 0.8).is_none());
+        // min_wall_secs guard: a 5s compile error that briefly pegged
+        // its cores (cpu_util≈1.0) refuses — the inverse-cost bound.
         assert!(
-            CorroborationWitness::corroborated_compute_bound(Some(2280.0), 0, 600, 0.8).is_none()
+            CorroborationWitness::corroborated_compute_bound(Some(20.0), 4, open(5), 0.8, 60.0)
+                .is_none(),
+            "wall<min_wall_secs: a trivially-short saturated run refuses"
+        );
+        // None anchors refuse: missing telemetry / no running_since /
+        // cold start.
+        assert!(
+            CorroborationWitness::corroborated_compute_bound(None, 4, open(600), 0.8, 60.0)
+                .is_none()
         );
         assert!(
-            CorroborationWitness::corroborated_compute_bound(Some(2280.0), 4, 0, 0.8).is_none()
+            CorroborationWitness::corroborated_compute_bound(Some(2280.0), 4, None, 0.8, 60.0)
+                .is_none()
+        );
+        assert!(
+            CorroborationWitness::corroborated_compute_bound(Some(2280.0), 0, open(600), 0.8, 60.0)
+                .is_none()
         );
     }
 

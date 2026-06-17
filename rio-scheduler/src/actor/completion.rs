@@ -4856,24 +4856,31 @@ impl DagActor {
         // r[impl sched.sla.reactive-floor+5]
         // sh-012 D4 cores axis: BEFORE the verdict, mint the
         // compute-bound witness. cpu_util = cpu_seconds_total /
-        // (assigned_deadline × assigned_cores); when ≥ threshold the
-        // attempt demonstrably exhausted its parallelism budget and
-        // floor.cores doubles. A genuine compile-error exit (cpu_util
-        // ≪ threshold) refuses — the inverse-cost bound: 3 attempts at
-        // the same shape, never 3× resource. Same prologue shape as
-        // `handle_timeout_failure`'s timeout-witness mint.
+        // (elapsed_wall × assigned_cores); when ≥ threshold the
+        // attempt demonstrably saturated its assigned cores and
+        // floor.cores doubles. sh-031: the wall anchor is the
+        // scheduler's own `running_since` elapsed (same trust model as
+        // `handle_timeout_failure`'s timeout-witness mint), NOT the
+        // assigned deadline — a saturated build that exits on its own
+        // internal timeout before the nix deadline must still
+        // corroborate. A genuine compile-error exit (short wall, gated
+        // by `min_wall_secs`) refuses — the inverse-cost bound: 3
+        // attempts at the same shape, never 3× resource.
         let compute_witness = {
-            let intent = self
-                .dag
-                .node(drv_hash)
+            let state = self.dag.node(drv_hash);
+            let attempt_open = state
+                .and_then(|s| s.running_since)
+                .map(|since| since.elapsed());
+            let assigned_cores = state
                 .and_then(|s| s.sched.last_intent.as_ref())
-                .map(|i| (i.cores, i.deadline_secs))
-                .unwrap_or((0, 0));
+                .map(|i| i.cores)
+                .unwrap_or(0);
             super::floor::CorroborationWitness::corroborated_compute_bound(
                 cpu_seconds_total,
-                intent.0,
-                intent.1,
+                assigned_cores,
+                attempt_open,
                 self.sla_config.compute_bound_threshold,
+                self.sla_config.compute_bound_min_wall_secs,
             )
         };
         let floor_outcome = match compute_witness {

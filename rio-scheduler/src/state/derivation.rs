@@ -1037,7 +1037,7 @@ pub struct CaState {
 /// → re-OOM at probe defaults.
 ///
 /// `cores` doubles only on a `ComputeBound` witness —
-/// `cpu_seconds_total / (assigned_deadline × assigned_cores) ≥
+/// `cpu_seconds_total / (elapsed_wall × assigned_cores) ≥
 /// compute_bound_threshold` (sh-012, the D4 fourth axis) — never on
 /// bare exit≠0. The SLA model still owns INITIAL core selection; the
 /// cores floor is the post-E3a corroborated escalation only.

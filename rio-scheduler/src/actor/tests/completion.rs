@@ -6808,11 +6808,10 @@ async fn corroborated_slow_build_timeout_still_heals_the_deadline_floor() -> Tes
 
 /// **sh-012 D4 cores axis (S1b red-first)** — *proposition: an
 /// `ExecutorVariantFailure` whose attempt's measured cpu utilization
-/// corroborates compute-bound (`cpu_seconds_total /
-/// (assigned_deadline × assigned_cores) ≥ threshold`) doubles
-/// `floor.cores` from the assigned shape; the next dispatch is at
-/// least the doubled cores.* RED at base: `ResourceFloor.cores` does
-/// not exist.
+/// corroborates compute-bound (`cpu_seconds_total / (elapsed_wall ×
+/// assigned_cores) ≥ threshold`) doubles `floor.cores` from the
+/// assigned shape; the next dispatch is at least the doubled cores.*
+/// RED at base: `ResourceFloor.cores` does not exist.
 // r[verify sched.sla.reactive-floor+5]
 // r[verify sched.retry.executor-variant-threshold]
 #[tokio::test]
@@ -6824,8 +6823,13 @@ async fn e3a_compute_bound_doubles_floor_cores() -> TestResult {
     let drv = "e3a-compute-bound";
     let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
     let exec = open_pull_exec(&handle, drv).await;
-    // The assigned shape: cores=4, deadline=600s (overwrite the
-    // mint's solve so the corroborant denominators are deterministic).
+    // The scheduler-side wall anchor: this attempt RAN for 600s
+    // (running_since backdated through the debug seam — the same
+    // stamp the Running transition mints; sh-031: the corroborant
+    // measures saturation over THIS, not the assigned deadline).
+    assert!(handle.debug_backdate_running(drv, 600).await?);
+    // The assigned shape: cores=4 (overwrite the mint's solve so the
+    // corroborant denominator is deterministic).
     handle.debug_seed_intent_cores(drv, 4, 600).await?;
     // cpu_util = 2280 / (600 × 4) = 0.95 ≥ 0.8.
     pull_report_exec(
@@ -6882,7 +6886,10 @@ async fn e3a_low_cpu_util_leaves_floor_cores_unchanged() -> TestResult {
     let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
     let exec = open_pull_exec(&handle, drv).await;
     handle.debug_seed_intent_cores(drv, 4, 600).await?;
-    // cpu_util = 120 / (600 × 4) = 0.05 ≪ 0.8.
+    // sh-031: NO running_since backdate — the genuine compile-error
+    // shape exits in seconds, so wall < min_wall_secs (60s) refuses
+    // before util is even computed (and util=120/(~0×4) is meaningless
+    // anyway). The inverse-cost bound holds on the short-run guard.
     pull_report_exec(
         &handle,
         exec,

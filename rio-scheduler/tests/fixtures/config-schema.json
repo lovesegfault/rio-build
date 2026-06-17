@@ -404,6 +404,7 @@
       "max_disk": 6442450944,
       "default_disk": 2147483648,
       "compute_bound_threshold": 0.8,
+      "compute_bound_min_wall_secs": 60.0,
       "ring_buffer": 32,
       "seed_corpus": null,
       "hw_cost_source": "static",

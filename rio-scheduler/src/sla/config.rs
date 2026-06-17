@@ -416,11 +416,18 @@ pub struct SlaConfig {
     pub default_disk: u64,
     /// sh-012 (D4 cores axis): the cpu-utilization corroboration band
     /// for an `ExecutorVariantFailure` to mint a `ComputeBound`
-    /// witness — `cpu_seconds_total / (assigned_deadline ×
-    /// assigned_cores) >= compute_bound_threshold`. Default `0.8`;
-    /// must be in `(0.0, 1.0]` ([`Self::validate_shape`]).
+    /// witness — `cpu_seconds_total / (elapsed_wall × assigned_cores)
+    /// >= compute_bound_threshold`. Default `0.8`; must be in
+    /// `(0.0, 1.0]` ([`Self::validate_shape`]).
     #[serde(default = "default_compute_bound_threshold")]
     pub compute_bound_threshold: f64,
+    /// sh-031: the minimum scheduler-observed wall-clock for a
+    /// `ComputeBound` witness to fire — a 5s compile error that
+    /// briefly pegged its cores would otherwise compute cpu_util≈1.0.
+    /// Default `60.0` (seconds); must be `> 0`
+    /// ([`Self::validate_shape`]).
+    #[serde(default = "default_compute_bound_min_wall_secs")]
+    pub compute_bound_min_wall_secs: f64,
     /// Per-key sample ring (rows kept for refit). Feeds
     /// [`super::SlaEstimator::new`].
     #[serde(default = "default_ring_buffer")]
@@ -597,6 +604,10 @@ fn default_ring_buffer() -> u32 {
 
 fn default_compute_bound_threshold() -> f64 {
     0.8
+}
+
+fn default_compute_bound_min_wall_secs() -> f64 {
+    60.0
 }
 
 /// Cold-start probe shape: `mem = mem_base + cpu × mem_per_core`.
@@ -1297,6 +1308,7 @@ impl SlaConfig {
             max_disk: 6 << 30,
             default_disk: 2 << 30,
             compute_bound_threshold: default_compute_bound_threshold(),
+            compute_bound_min_wall_secs: default_compute_bound_min_wall_secs(),
             ring_buffer: default_ring_buffer(),
             seed_corpus: None,
             hw_cost_source: super::cost::HwCostSource::Static,
@@ -1457,6 +1469,11 @@ impl SlaConfig {
             self.compute_bound_threshold > 0.0 && self.compute_bound_threshold <= 1.0,
             "sla.compute_bound_threshold must be in (0.0, 1.0], got {}",
             self.compute_bound_threshold
+        );
+        anyhow::ensure!(
+            self.compute_bound_min_wall_secs > 0.0,
+            "sla.compute_bound_min_wall_secs must be > 0, got {}",
+            self.compute_bound_min_wall_secs
         );
         anyhow::ensure!(
             (0.0..=0.5).contains(&self.hw_cost_tolerance),
@@ -1886,6 +1903,10 @@ pub const HELM_NOT_RENDERED_SLA_KEYS: &[(&str, &str)] = &[
     (
         "compute_bound_threshold",
         "sh-012 D4 cores corroboration band; serde-defaulted (0.8), not operator-tuned",
+    ),
+    (
+        "compute_bound_min_wall_secs",
+        "sh-031 short-run guard for the D4 cores corroborant; serde-defaulted (60s), not operator-tuned",
     ),
 ];
 
@@ -4856,6 +4877,7 @@ mod tests {
             metal_sizes: _,        // (free)   instance-size suffix strings
             unlaunchable_sizes: _, // (free)   instance-size suffix strings
             compute_bound_threshold: _, // (scalar)
+            compute_bound_min_wall_secs: _, // (scalar)
         } = cfg;
         // Silence unused-binding on the one (cell) field we kept by
         // name; the destructure itself is the load-bearing part.
