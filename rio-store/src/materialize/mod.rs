@@ -797,6 +797,15 @@ async fn pace_one(
             pace_after_empty_pass(shutdown, interval).await
         }
         Pace::Floor(floor) => {
+            // The configured beat is itself a floor: an override never
+            // SHORTENS pacing below `poll_interval_secs`. sh-024 §S1's
+            // EMPTY_BACKOFF is an escalation of the default 1 s beat,
+            // not a replacement — without this clamp a raised interval
+            // (vm-materialize pins 3600 s so claims fire only at
+            // restart_store()) would be undercut to the 4 s cap and
+            // the fixture's claim-timing determinism breaks. No-op at
+            // the production default (beat = 1 s ≤ every Floor caller).
+            let floor = floor.max(Duration::from_secs(cfg.poll_interval_secs.max(1)));
             let interval = POLL_JITTER.apply(floor).max(floor);
             pace_after_empty_pass(shutdown, interval).await
         }
