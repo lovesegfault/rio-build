@@ -537,8 +537,9 @@ async fn start_subst_display<W: AsyncWrite + Unpin>(
     // `substitution-goal.cc`: [storePath, substituterUri].
     // The store picks the upstream — the scheduler doesn't
     // know which yet (S2's first SubstituteProgress carries
-    // it), so the URI starts empty (nom omits the "from
-    // <uri>" suffix when fields[1] is empty).
+    // it), so the URI starts empty; backfilled via SetPhase
+    // on the first sourced tick (sh-034: nxb host-dedup
+    // needs parent-aid linkage, out-of-tree).
     let subst = stderr
         .start_activity(
             ActivityType::Substitute,
@@ -1097,6 +1098,21 @@ async fn relay_substitute_progress<W: AsyncWrite + Unpin>(
             )
             .await?;
         aids.copy = Some(copy);
+        // Backfill the parent's substituterUri via SetPhase: the wire
+        // protocol has no field-update frame, so the empty fields[1]
+        // at start cannot be re-sent. nom renders the per-activity
+        // phase suffix ("from <uri>"); nxb's SetPhase handler is
+        // activity_drv-gated to Build/PostBuildHook so this is
+        // nxb-invisible — its substitution_in_flight host-dedup
+        // double-count needs parent-aid linkage out-of-tree
+        // (sh-034).
+        stderr
+            .result(
+                aids.subst,
+                ResultType::SetPhase,
+                &[ResultField::String(format!("from {}", p.upstream_uri))],
+            )
+            .await?;
     }
     // (ii) The copy child iff started — the ONLY progress lane. An
     // empty-URI tick with no copy child (job-level commit walk of a
@@ -4070,6 +4086,68 @@ mod tests {
     }
 
     // r[verify gw.activity.subst-progress+4]
+    /// sh-034 red: the actSubstitute parent's substituterUri starts
+    /// empty (the upstream is unknown at Substituting-time) and the
+    /// wire protocol has no field-update frame, so direction-aware
+    /// consumers parse the empty fields[1] as Localhost forever and
+    /// their substitution-host dedup never matches the child copy's
+    /// real source — every fetch double-counts. The first sourced
+    /// tick MUST backfill the URI on the parent via SetPhase ("from
+    /// <uri>") so nom shows it; the nxb double-count fix is
+    /// parent-aid linkage out-of-tree.
+    #[tokio::test]
+    async fn first_sourced_tick_backfills_subst_uri_phase() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu-foo.drv";
+        let uri = "https://cache.example";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
+
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
+        let aids = subst_aids(&act, drv);
+
+        relay_substitute_progress(
+            &mut stderr,
+            &mut act,
+            types::SubstituteProgress {
+                derivation_path: drv.into(),
+                bytes_done: 1,
+                bytes_expected: 2,
+                upstream_uri: uri.into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let frames = read_frames(buf).await;
+        let set_phase = frames.iter().find_map(|f| match f {
+            Frame::Result { aid, rtype, fields }
+                if *aid == aids.subst && *rtype == ResultType::SetPhase as u64 =>
+            {
+                Some(fields.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            set_phase,
+            Some(vec![FVal::Str(format!("from {uri}"))]),
+            "the first sourced tick must backfill the actSubstitute parent's URI \
+             via a SetPhase result on aids.subst (frames: {frames:?})"
+        );
+    }
+
+    // r[verify gw.activity.subst-progress+4]
     /// live_043 companion green: a progress tick arriving AFTER the
     /// pair closed (the post-outcome straggler — delivery is droppable
     /// and reorderable end-to-end) is TOLERATED: no frames, the typed
@@ -4267,6 +4345,11 @@ mod tests {
                         FVal::Str(uri.into()),
                         FVal::Str(machine.clone()),
                     ],
+                },
+                Frame::Result {
+                    aid: aids.subst,
+                    rtype: ResultType::SetPhase as u64,
+                    fields: vec![FVal::Str(format!("from {uri}"))],
                 },
                 Frame::Result {
                     aid: copy,
@@ -5238,8 +5321,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Wire (live_043 deferred start, live_045 copy-only lane):
-        // START(subst) → [sourced tick] START(copy, from=uri) →
+        // Wire (live_043 deferred start, live_045 copy-only lane,
+        // sh-034 URI backfill): START(subst) → [sourced tick]
+        // START(copy, from=uri) → resSetPhase(subst, "from <uri>") →
         // resProgress(copy) → [final tick already complete? no:
         // done < expected, so the close synthesizes completion on the
         // copy aid] → STOP(copy) → STOP(subst). The structural
@@ -5265,6 +5349,23 @@ mod tests {
                 );
             }
             other => panic!("expected copy START, got {other:?}"),
+        }
+        // The first sourced tick backfills the parent's URI via
+        // SetPhase (sh-034) — NOT a resProgress.
+        match it.next() {
+            Some(Frame::Result {
+                aid: a,
+                rtype,
+                fields,
+            }) => {
+                assert_eq!(*a, aids.subst);
+                assert_eq!(*rtype, ResultType::SetPhase as u64);
+                assert_eq!(
+                    fields,
+                    &vec![FVal::Str("from https://cache.example.test".into())]
+                );
+            }
+            other => panic!("expected SetPhase backfill on the subst aid, got {other:?}"),
         }
         // The tick's progress: the copy child only.
         match it.next() {
