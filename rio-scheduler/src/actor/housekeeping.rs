@@ -1425,7 +1425,7 @@ impl DagActor {
             .build
             .into_iter()
             .filter_map(|attempt| {
-                // r[impl sched.attempt.witnessed-terminal]
+                // r[impl sched.attempt.witnessed-terminal+2]
                 // live_058-c: a controller-witnessed terminal attempt
                 // expires on the WITNESSED clock — the pod is gone, so
                 // the only report the slack still covers is one
@@ -1842,13 +1842,14 @@ impl DagActor {
             // once-per-attempt cap (live_058-b).
             return false;
         }
-        // r[impl sched.attempt.witnessed-terminal]
+        // r[impl sched.attempt.witnessed-terminal+2]
         // live_058-b: the witnessed reason feeds the per-reason
-        // disposition table — witnessed-OomKilled is the ONE promoting
-        // row (label `witnessed_oom`); every other letter, both
-        // EvictedDiskPressure message shapes included, takes the
-        // classify-only row (`floor::witnessed_disposition`). The bump
-        // rides the establishment's append+decide `won` flag —
+        // disposition table — witnessed-OomKilled (label
+        // `witnessed_oom`) and sh-039's EvictedEmptyDirSizeLimit
+        // (label `witnessed_disk`) are the TWO promoting rows; every
+        // other letter, node-condition EvictedDiskPressure included,
+        // takes the classify-only row (`floor::witnessed_disposition`).
+        // The bump rides the establishment's append+decide `won` flag —
         // exactly-once per attempt, EVER: re-reports refresh nothing
         // (the mark is first-witnessed-wins) and a lost append
         // returned above, so the retired N-pods x M-re-reports
@@ -1860,9 +1861,10 @@ impl DagActor {
             // scheduler-anchored `sched.attempt.witnessed-terminal`
             // mark (kubelet per-container attribution, establishment
             // `won`-flag deduped) the worker cannot mint. The
-            // constructor returns a witness for exactly the
-            // PromoteMemFloor row; every other letter is classify-only
-            // (None — the no-bump arm: establish + requeue only).
+            // constructor returns a witness for the two promoting
+            // rows (PromoteMemFloor, sh-039's PromoteDiskFloor);
+            // every other letter is classify-only (None — the no-bump
+            // arm: establish + requeue only).
             match super::floor::CorroborationWitness::witnessed(
                 super::floor::witnessed_disposition(mark.reason),
             ) {

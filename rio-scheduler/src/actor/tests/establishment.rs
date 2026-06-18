@@ -953,7 +953,7 @@ async fn report_attempt_outcome(
         .expect("actor alive")
 }
 
-// r[verify sched.attempt.witnessed-terminal]
+// r[verify sched.attempt.witnessed-terminal+2]
 /// live_058-c (W10-CG-a, the witnessed pair's first installment): a
 /// controller-witnessed terminal attempt establishes on the WITNESSED
 /// clock — `witnessed_at + establishment_report_slack` — while still
@@ -1057,7 +1057,7 @@ async fn witnessed_terminal_establishes_on_witnessed_clock() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.witnessed-terminal]
+// r[verify sched.attempt.witnessed-terminal+2]
 /// live_058-c: the mark is first-witnessed-wins. After the mark is
 /// aged past the slack, k level-triggered re-reports arrive — if a
 /// re-report advanced the witnessed clock the next sweep would be
@@ -1127,7 +1127,7 @@ async fn witnessed_mark_first_witnessed_wins_under_re_reports() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.witnessed-terminal]
+// r[verify sched.attempt.witnessed-terminal+2]
 /// live_058-b (W10-CG-b, the witnessed pair's second installment —
 /// the live incident shape, window AND floor in one scenario): the
 /// witnessed-OOM attempt establishes at witnessed+slack AND the mem
@@ -1188,18 +1188,18 @@ async fn witnessed_oom_promotes_mem_floor_at_establishment() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.witnessed-terminal]
-/// live_058-b (W10-CG-b precision matrix): every non-OOM witnessed
-/// letter that can reach the mark establishes at witnessed+slack with
-/// the floor UNCHANGED — the classify-only row. EvictedDiskPressure
-/// is the load-bearing cell: the controller folds the node-condition
-/// shapes ("DiskPressure", "ephemeral-storage") AND the pod-attributed
-/// shapes ("ephemeral local storage", "EmptyDir volume") into this ONE
-/// wire letter (pool/job.rs pod_termination_reason), so the letter
-/// carries no per-pod sizing authority by construction — both folded
-/// shapes arrive here as the same bytes, which is exactly why the
-/// scheduler-side cell is one row. Granting it promotion would
-/// re-create the I-199 ambient-cause over-fire on the disk axis.
+// r[verify sched.attempt.witnessed-terminal+2]
+/// live_058-b (W10-CG-b precision matrix): every witnessed letter
+/// other than the two per-container kubelet attributions (OomKilled,
+/// sh-039's EvictedEmptyDirSizeLimit) establishes at witnessed+slack
+/// with the floor UNCHANGED — the classify-only row.
+/// EvictedDiskPressure is the load-bearing cell: the controller emits
+/// it for the NODE-CONDITION shapes only ("DiskPressure", the
+/// hyphenated "ephemeral-storage"; pool/job.rs
+/// pod_attempt_terminal_reason splits the pod-attributed shapes to
+/// EvictedEmptyDirSizeLimit), so the letter carries no per-pod sizing
+/// authority by construction. Granting it promotion would re-create
+/// the I-199 ambient-cause over-fire on the disk axis.
 #[tokio::test]
 async fn witnessed_eviction_letters_establish_classify_only() -> TestResult {
     let (db, handle, _task) = setup().await;
@@ -1254,7 +1254,7 @@ async fn witnessed_eviction_letters_establish_classify_only() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.witnessed-terminal]
+// r[verify sched.attempt.witnessed-terminal+2]
 /// live_058-b (W10-CH — the once-per-attempt cap of the I-199
 /// non-recreation argument): k level-triggered re-reports before the
 /// sweep, the establishment pass, a late re-report, and a replayed

@@ -1159,7 +1159,7 @@ mod registration_writer_census {
         );
     }
 
-    // r[verify sched.attempt.witnessed-terminal]
+    // r[verify sched.attempt.witnessed-terminal+2]
     /// live_058-b ([GEN-SET], the R23′ bind): the `bump_resource_floor`
     /// caller alphabet is MACHINE-PINNED — the fn doc's and the lib.rs
     /// HELP's "the callers are the alphabet" sentences cite THIS census
@@ -1168,17 +1168,18 @@ mod registration_writer_census {
     /// bind). Current population (bug_102: every caller presents a
     /// typed `CorroborationWitness` — the demand sits inside the
     /// mutation, so the label alphabet `{cgroup_oom, disk_full,
-    /// timeout, witnessed_oom, compute_bound}` derives from the
-    /// witness, one producer): the corroborated-sizing chokepoint
-    /// (completion.rs `bump_floor_on_corroborated_claim` — one call
-    /// site carrying both `cgroup_oom` and `disk_full` via the
-    /// witness), the corroborated-timeout lane (completion.rs
+    /// timeout, witnessed_oom, witnessed_disk, compute_bound}` derives
+    /// from the witness, one producer): the corroborated-sizing
+    /// chokepoint (completion.rs `bump_floor_on_corroborated_claim` —
+    /// one call site carrying both `cgroup_oom` and `disk_full` via
+    /// the witness), the corroborated-timeout lane (completion.rs
     /// `handle_timeout_failure` — `timeout`, the attempt-age anchor),
     /// the corroborated-compute-bound lane (completion.rs
     /// `handle_executor_variant_failure` — `compute_bound`, sh-012:
     /// cpu_util ≥ threshold against the assigned cores×deadline),
-    /// and the establishment sweep's witnessed-OomKilled disposition
-    /// row (housekeeping.rs — `witnessed_oom`, live_058-b, via the
+    /// and the establishment sweep's witnessed disposition rows
+    /// (housekeeping.rs — `witnessed_oom`, live_058-b, and sh-039's
+    /// `witnessed_disk` ride ONE witness-driven call via the
     /// witnessed-disposition constructor). A new caller reds here
     /// until it files its row, its witness constructor, and the
     /// lib.rs HELP; rides the same embedded-source universe as every

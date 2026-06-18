@@ -97,33 +97,28 @@ pub fn bump_floor_or_count(
             last.map_or(0, |i| i.mem_bytes),
             mem_solve_cap(ceil),
         ),
-        // LIVE with exactly ONE producer (live_057-b): the worker
-        // quota-attributed DiskFull lane — completion.rs consumes the
-        // TYPED `failure_classification` wire field (FailureClass::
+        // LIVE with TWO producers: (1) live_057-b — the worker
+        // quota-attributed DiskFull lane (completion.rs consumes the
+        // TYPED `failure_classification` wire field — FailureClass::
         // DiskFull + QuotaTelemetry; `rio_proto::DISK_FULL_MSG` is
         // DISPLAY/NARRATION ONLY — quantifier: census(forged_free_text_never_moves_resource_floors) — merged_bug_100: free text drives
-        // nothing), band-corroborates it against the assigned shape
-        // (`CorroborationWitness::corroborated_sizing`), and bumps
-        // through the witness-demanding chokepoint with the
-        // `disk_full` label; precise by construction at the prjquota
-        // seam (`apply_disk_override` — the prjquota-vs-statvfs
-        // classification at result assembly), with the worker's
-        // once-per-attempt assignment-token dedup — exactly the
-        // re-entry lane the parked-era note named. Witnessed
-        // evictions remain CLASSIFY-ONLY BY RULING
-        // ([`witnessed_disposition`]): the controller's classifier
-        // folds NODE-CONDITION evictions ("DiskPressure",
-        // "ephemeral-storage") together with the pod-attributed
-        // shapes ("ephemeral local storage", "EmptyDir volume") into
-        // the ONE EvictedDiskPressure letter (pool/job.rs
-        // pod_termination_reason), so the letter carries no per-pod
-        // sizing authority — promoting it would re-create the I-199
-        // ambient-cause over-fire on the disk axis (one node-pressure
-        // event evicting k innocent builder pods would double k
-        // sticky M_044 floors). Their sizing recovery IS this worker
-        // lane on the next attempt: the kubelet-evicted pname
-        // re-dispatches, and if its own quota is truly the constraint
-        // the worker lane classifies and doubles.
+        // nothing — band-corroborated against the assigned shape via
+        // `CorroborationWitness::corroborated_sizing`, bumped through
+        // the witness-demanding chokepoint with the `disk_full`
+        // label; precise by construction at the prjquota seam, with
+        // the worker's once-per-attempt assignment-token dedup); and
+        // (2) sh-039 — the controller-witnessed pod-attributed
+        // emptyDir-sizeLimit eviction (`WitnessAxis::WitnessedDisk`,
+        // label `witnessed_disk`), once per attempt via the
+        // establishment transaction's `won` flag. NODE-CONDITION
+        // witnessed evictions remain CLASSIFY-ONLY BY RULING
+        // ([`witnessed_disposition`]): the EvictedDiskPressure letter
+        // now carries node-condition shapes only (pool/job.rs
+        // pod_attempt_terminal_reason splits pod-attributed to
+        // EvictedEmptyDirSizeLimit), and promoting node-condition
+        // would re-create the I-199 ambient-cause over-fire (one
+        // node-pressure event evicting k innocent builder pods → k
+        // sticky M_044 floor doublings).
         R::EvictedDiskPressure => bump_dim(
             &mut floor.disk_bytes,
             last.map_or(0, |i| i.disk_bytes),
@@ -217,6 +212,10 @@ enum WitnessAxis {
     Timeout,
     /// Controller-witnessed OomKilled at establishment.
     WitnessedOom,
+    /// sh-039: controller-witnessed pod-attributed emptyDir-sizeLimit
+    /// eviction at establishment (the disk-axis twin of
+    /// [`Self::WitnessedOom`]).
+    WitnessedDisk,
     /// sh-012: executor-variant exit≠0 with corroborated cpu
     /// utilization ≥ threshold (the D4 cores axis).
     ComputeBound,
@@ -362,15 +361,19 @@ impl CorroborationWitness {
         })
     }
 
-    /// The controller-witnessed lane: exactly the
-    /// [`WitnessedDisposition::PromoteMemFloor`] row (witnessed
-    /// OomKilled — the one structurally unambiguous kubelet
-    /// attribution); every other disposition is classify-only and
-    /// mints nothing.
+    /// The controller-witnessed lane: exactly the two per-container
+    /// kubelet attributions (witnessed `OOMKilled` →
+    /// [`WitnessedDisposition::PromoteMemFloor`]; witnessed
+    /// pod-attributed emptyDir-sizeLimit eviction →
+    /// [`WitnessedDisposition::PromoteDiskFloor`], sh-039); every
+    /// other disposition is classify-only and mints nothing.
     pub(super) fn witnessed(disposition: WitnessedDisposition) -> Option<Self> {
         match disposition {
             WitnessedDisposition::PromoteMemFloor => Some(Self {
                 axis: WitnessAxis::WitnessedOom,
+            }),
+            WitnessedDisposition::PromoteDiskFloor => Some(Self {
+                axis: WitnessAxis::WitnessedDisk,
             }),
             WitnessedDisposition::ClassifyOnly => None,
         }
@@ -387,14 +390,22 @@ impl CorroborationWitness {
             WitnessAxis::Sizing(FailureClass::Unspecified) => R::Unknown,
             WitnessAxis::Timeout => R::DeadlineExceeded,
             WitnessAxis::WitnessedOom => R::OomKilled,
+            // sh-039: feeds the EXISTING `bump_floor_or_count` disk
+            // arm (the body already doubles `floor.disk_bytes` against
+            // `last_intent.disk_bytes` capped at `ceil.max_disk`).
+            // Second producer alongside `Sizing(DiskFull)`; both are
+            // scheduler-minted witnesses (the worker can forge
+            // neither — controller PodStatus / kubelet quota), so no
+            // new I-199 surface.
+            WitnessAxis::WitnessedDisk => R::EvictedDiskPressure,
             WitnessAxis::ComputeBound => R::ComputeBound,
         }
     }
 
     /// The metric/log label — the caller-census alphabet
     /// (`{cgroup_oom, disk_full, timeout, witnessed_oom,
-    /// compute_bound}`, lib.rs HELP in lockstep), derived from the
-    /// witness instead of restated per call site.
+    /// witnessed_disk, compute_bound}`, lib.rs HELP in lockstep),
+    /// derived from the witness instead of restated per call site.
     pub(super) fn label(&self) -> &'static str {
         use rio_proto::types::FailureClass;
         match self.axis {
@@ -403,6 +414,7 @@ impl CorroborationWitness {
             WitnessAxis::Sizing(FailureClass::Unspecified) => "unspecified",
             WitnessAxis::Timeout => "timeout",
             WitnessAxis::WitnessedOom => "witnessed_oom",
+            WitnessAxis::WitnessedDisk => "witnessed_disk",
             WitnessAxis::ComputeBound => "compute_bound",
         }
     }
@@ -413,28 +425,42 @@ impl CorroborationWitness {
 /// the establishment sweep's charge arm — the dispatch over the
 /// producer's FULL wire type, so a new letter cannot ship without
 /// taking a position here (rustc exhaustiveness; the product census
-/// pins one row per letter with EXACTLY ONE promoting row, and the
-/// review default for a new row is classify-only).
+/// pins one row per letter with exactly TWO promoting rows — the
+/// per-container kubelet attributions — and the review default for a
+/// new row is classify-only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WitnessedDisposition {
-    /// THE one promoting row: witnessed `OOMKilled` doubles the MEM
-    /// floor at establishment (`bump_resource_floor`, label
-    /// `witnessed_oom`), gated on the establishment transaction's
-    /// append+decide `won` flag — at most once per attempt, ever.
+    /// Witnessed `OOMKilled` doubles the MEM floor at establishment
+    /// (`bump_resource_floor`, label `witnessed_oom`), gated on the
+    /// establishment transaction's append+decide `won` flag — at most
+    /// once per attempt, ever.
     PromoteMemFloor,
+    /// sh-039: witnessed `EvictedEmptyDirSizeLimit` doubles the DISK
+    /// floor at establishment (`bump_resource_floor`, label
+    /// `witnessed_disk`), under the same `won`-flag once-per-attempt
+    /// cap. The disk-axis twin of [`Self::PromoteMemFloor`]: kubelet's
+    /// pod-attributed emptyDir-sizeLimit eviction is its own per-pod
+    /// statement that THIS build exceeded ITS declared disk — the
+    /// limit kubelet reports IS the scheduler-stamped sizeLimit, and
+    /// the controller-read PodStatus is unforgeable by the worker.
+    PromoteDiskFloor,
     /// Mark + witnessed-clock window + establish + requeue; the floor
     /// is never touched.
     ClassifyOnly,
 }
 
-// r[impl sched.attempt.witnessed-terminal]
+// r[impl sched.attempt.witnessed-terminal+2]
 /// The per-reason disposition table. The promotion set is derived
-/// PER-REASON, never inherited: kubelet `OOMKilled` is a per-container
-/// `containerStatuses` attribution — the one controller-witnessed
-/// reason that is structurally unambiguous, and the only letter the
-/// I-199 retirement derivation covers (the retired heuristic promoted
-/// on AMBIGUOUS signals; see `bump_resource_floor`'s doc). Every
-/// other letter is classify-only.
+/// PER-REASON, never inherited: kubelet `OOMKilled` (per-container
+/// `containerStatuses` attribution) and sh-039's
+/// `EvictedEmptyDirSizeLimit` (kubelet's pod-attributed
+/// emptyDir-sizeLimit eviction) are the TWO controller-witnessed
+/// reasons that are structurally unambiguous — the per-container
+/// kubelet attributions — and the only letters the I-199 retirement
+/// derivation covers (the retired heuristic promoted on AMBIGUOUS
+/// signals; see `bump_resource_floor`'s doc). Every other letter is
+/// classify-only; node-condition `EvictedDiskPressure` in particular
+/// stays classify-only (I-199 untouched).
 pub(super) fn witnessed_disposition(
     reason: rio_proto::types::AttemptTerminalReason,
 ) -> WitnessedDisposition {
@@ -443,34 +469,34 @@ pub(super) fn witnessed_disposition(
     match reason {
         // Wire-default / unclassifiable: never a sizing signal.
         R::Unspecified => D::ClassifyOnly,
-        // THE promoting row: per-container kubelet attribution — the
+        // Promoting row 1/2: per-container kubelet attribution — the
         // pod hit ITS memory limit; nothing ambient about it.
         R::OomKilled => D::PromoteMemFloor,
-        // Classify-only BY RULING (I-199), REFINED not reopened
-        // (live060-f): the ruling's rationale is AMBIGUITY — "a
-        // node-condition eviction says nothing about THIS build's
-        // disk use" — and for the node-condition shapes
-        // ("DiskPressure", "ephemeral-storage") it stands untouched.
-        // The controller TODAY folds the pod-attributed shapes
-        // ("ephemeral local storage", "EmptyDir volume" — kubelet's
-        // own per-pod statement that THIS build exceeded ITS declared
-        // limit, carrying none of that ambiguity) into the same wire
-        // letter (pool/job.rs pod_termination_reason), so this row
-        // must stay classify-only: promoting the folded letter would
-        // re-create the I-199 ambient over-fire on the disk axis.
-        // The SPLIT letter exists in the shared vocabulary
-        // (rio_common::classify::AttemptTerminalKind::
-        // EvictedEmptyDirSizeLimit — inert/unproduced), and its
-        // promote-with-witness arm (through the bug_102 corroboration
-        // chokepoint) is RULED pending the wire carrier: the
-        // controller→scheduler report enum has no pod-attributed
-        // value and adding one is a .fields wire change barred this
-        // wave (zero amendment wire changes). Trigger to revive: the
-        // next eviction-shaped sizing incident, or the owner
-        // commissioning the additive enum value under the .fields
-        // ritual; live060-a's worker quota lane alone also revives
-        // the upward ladder (the designed producer — see the lane
-        // above).
+        // sh-039 — promoting row 2/2: kubelet's POD-ATTRIBUTED
+        // emptyDir-sizeLimit / ephemeral local storage eviction (the
+        // three POD_ATTRIBUTED_NEEDLES grammars). Kubelet's own
+        // per-pod statement that THIS build exceeded ITS declared
+        // disk; the limit it names IS the scheduler-stamped sizeLimit
+        // (overlay_size_limit_bytes(last_intent.disk_bytes, h)), so
+        // the witnessed letter carries the same per-container
+        // authority as OOMKilled and feeds the disk floor through the
+        // bug_102 corroboration chokepoint as a scheduler-verifiable
+        // witness. The wire split landed at sh-039 (the live060-f
+        // deferral discharged by its named "next eviction-shaped
+        // sizing incident" trigger).
+        R::EvictedEmptyDirSizeLimit => D::PromoteDiskFloor,
+        // Classify-only BY RULING (I-199), UNTOUCHED at sh-039: the
+        // ruling's rationale is AMBIGUITY — "a node-condition
+        // eviction says nothing about THIS build's disk use" — and
+        // for the node-condition shapes ("DiskPressure", the
+        // hyphenated "ephemeral-storage" resource name) it stands.
+        // The pod-attributed shapes split to the row above
+        // (EvictedEmptyDirSizeLimit) at the controller producer
+        // (pool/job.rs pod_attempt_terminal_reason), so THIS letter
+        // now carries node-condition shapes only and promoting it
+        // would re-create the I-199 ambient over-fire on the disk
+        // axis (one node-pressure event evicting k pods → k sticky
+        // floor doublings).
         R::EvictedDiskPressure => D::ClassifyOnly,
         // Ambient by definition (MemoryPressure / PID pressure /
         // node-shutdown): node-cause, never per-pod sizing evidence.
@@ -506,7 +532,7 @@ pub(super) fn witnessed_disposition(
 /// a new variant cannot ship without joining this set AND taking a
 /// disposition row above (the `GcPhase3Outcome::ALL` form).
 #[cfg(test)]
-pub(super) const WITNESSED_LETTERS: [rio_proto::types::AttemptTerminalReason; 11] = {
+pub(super) const WITNESSED_LETTERS: [rio_proto::types::AttemptTerminalReason; 12] = {
     use rio_proto::types::AttemptTerminalReason as R;
     [
         R::Unspecified,
@@ -520,6 +546,7 @@ pub(super) const WITNESSED_LETTERS: [rio_proto::types::AttemptTerminalReason; 11
         R::Preempted,
         R::Reaped,
         R::NoEligibleSource,
+        R::EvictedEmptyDirSizeLimit,
     ]
 };
 
@@ -1259,7 +1286,7 @@ mod tests {
         assert_eq!(s.retry.infra_count, 0);
     }
 
-    // r[verify sched.attempt.witnessed-terminal]
+    // r[verify sched.attempt.witnessed-terminal+2]
     /// live_058-b: the witnessed-reason x establish-disposition
     /// product census (the R25 proof obligation — the injectivity of
     /// the promotion set is COUNTED from the generated table, never
@@ -1287,6 +1314,7 @@ mod tests {
                 R::Preempted => 8,
                 R::Reaped => 9,
                 R::NoEligibleSource => 10,
+                R::EvictedEmptyDirSizeLimit => 11,
             }
         }
         let mut seen = [0u8; WITNESSED_LETTERS.len()];
@@ -1313,21 +1341,26 @@ mod tests {
             (R::Preempted, D::ClassifyOnly),
             (R::Reaped, D::ClassifyOnly),
             (R::NoEligibleSource, D::ClassifyOnly),
+            (R::EvictedEmptyDirSizeLimit, D::PromoteDiskFloor),
         ];
         assert_eq!(table.len(), WITNESSED_LETTERS.len());
         for (letter, want) in table {
             assert_eq!(witnessed_disposition(letter), want, "letter={letter:?}");
         }
 
-        // EXACTLY ONE promoting row — the quantifier, counted from
-        // the generated set.
+        // Exactly TWO promoting rows — the per-container kubelet
+        // attributions (OomKilled, sh-039's EvictedEmptyDirSizeLimit)
+        // — the quantifier, counted from the generated set.
+        // Node-condition EvictedDiskPressure stays classify-only
+        // (I-199 untouched).
         assert_eq!(
             WITNESSED_LETTERS
                 .iter()
-                .filter(|r| witnessed_disposition(**r) == D::PromoteMemFloor)
+                .filter(|r| witnessed_disposition(**r) != D::ClassifyOnly)
                 .count(),
-            1,
-            "witnessed-OomKilled is the ONLY promoting letter"
+            2,
+            "the two per-container kubelet attributions are the ONLY \
+             promoting letters"
         );
     }
 }

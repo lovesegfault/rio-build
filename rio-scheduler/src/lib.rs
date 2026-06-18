@@ -335,7 +335,7 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_resource_floor_bumps_total",
         "resource_floor doublings on explicit resource-exhaustion signals (D4, \
-         labeled reason=cgroup_oom|disk_full|timeout|witnessed_oom|compute_bound; \
+         labeled reason=cgroup_oom|disk_full|timeout|witnessed_oom|witnessed_disk|compute_bound; \
          timeout covers DeadlineExceeded too). cgroup_oom and disk_full consume the \
          TYPED failure_classification wire field, corroborated against the \
          dispatch-assigned shape (bug_090 — worker free text drives nothing; \
@@ -345,8 +345,11 @@ pub fn describe_metrics() {
          exhausts its overlay quota at disk=N retries at disk=2N); timeout is \
          worker-reported; witnessed_oom is the controller-witnessed OomKilled \
          letter promoted at the establishment sweep, once per attempt ever via \
-         the establishment transaction's won flag (live_058-b — witnessed \
-         evictions are classify-only and have NO label here); compute_bound is \
+         the establishment transaction's won flag (live_058-b); witnessed_disk \
+         is the controller-witnessed pod-attributed emptyDir-sizeLimit eviction \
+         (sh-039 — the EvictedEmptyDirSizeLimit split letter; node-condition \
+         EvictedDiskPressure stays classify-only and has NO label here); \
+         compute_bound is \
          an executor-variant exit≠0 whose cpu_util (cpu_seconds_total / \
          (assigned_deadline × assigned_cores)) corroborated ≥ threshold — the \
          D4 cores axis (sh-012), never fired on bare exit≠0. The stream-era \

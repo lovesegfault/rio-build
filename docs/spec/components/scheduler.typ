@@ -3764,7 +3764,7 @@ the SUM of the per-class headrooms, never unbounded).
   the pull transaction.
 ]
 
-#r("sched.attempt.witnessed-terminal")[
+#r("sched.attempt.witnessed-terminal+2")[
   The `ReportAttemptOutcome` intake MUST record an in-memory
   witnessed-terminal mark `(exec_id → witnessed_at, witnessed_reason)` for
   every pod-terminal letter that resolves to an open, unclassified build
@@ -3776,22 +3776,23 @@ the SUM of the per-class headrooms, never unbounded).
   marked attempt on the witnessed clock (`witnessed_at +
   establishment_report_slack`) without waiting for the dispatch-deadline
   anchor, and at establishment MUST feed the witnessed reason through the
-  per-reason disposition table: witnessed `OOMKilled` --- the per-container
-  kubelet `containerStatuses` attribution --- is the ONLY promoting letter
-  (`bump_resource_floor`, label `witnessed_oom`), gated on the
-  establishment transaction's append+decide `won` flag so promotion fires
-  at most once per attempt, ever; EVERY other witnessed letter (both
-  `EvictedDiskPressure` message shapes included --- the controller folds
-  node-condition and pod-attributed evictions into that one letter) MUST
-  establish classify-only, leaving the floor untouched. Marks MUST be
-  consumed at establishment and pruned against the open-attempt view.
+  per-reason disposition table: witnessed `OOMKilled` (the per-container
+  kubelet `containerStatuses` attribution; `bump_resource_floor`, label
+  `witnessed_oom`) and witnessed `EvictedEmptyDirSizeLimit` (kubelet's
+  pod-attributed emptyDir-sizeLimit eviction; label `witnessed_disk`) are
+  the TWO promoting letters --- the per-container kubelet attributions ---
+  gated on the establishment transaction's append+decide `won` flag so
+  promotion fires at most once per attempt, ever; node-condition
+  `EvictedDiskPressure` and EVERY other witnessed letter MUST establish
+  classify-only, leaving the floor untouched. Marks MUST be consumed at
+  establishment and pruned against the open-attempt view.
 ]
 The promotion narrowing is the I-199 non-recreation argument: the retired
 heuristic's over-fire shape was N pods #sym.times M level-triggered
 re-reports promoting N #sym.times M times on ambient signals; this law caps
 promotion at once-per-attempt (re-reports refresh nothing; the `won` flag
-is the durable dedup) AND restricts the promotion set to the single
-per-container-attributed letter, so ambient/node-cause signals sit
+is the durable dedup) AND restricts the promotion set to the two
+per-container-attributed letters, so ambient/node-cause signals sit
 structurally outside it on both axes (population and rate). The mark is
 in-memory by design --- lost on scheduler failover, re-armed by the next
 level-triggered re-report while the pod stays listable; beyond that window
