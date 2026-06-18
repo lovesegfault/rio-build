@@ -5,25 +5,16 @@
 // tracey requirement marker and (when domains are declared) asserts
 // the id is in-scope.
 //
-// One template, four render targets (selected via `--input x-target=`):
+// One template, three render targets (selected via `--input x-target=`):
 //   "pdf"       — standalone paper. Full A4 geometry + title block +
 //                 outline + bibliography. The default for bare
 //                 `typst compile`.
 //   "book-pdf"  — chapter inside the stitched book-pdf.typ aggregate.
 //                 A4 geometry, but no per-chapter front-matter.
-//   html        — shiroa --mode static-html. typst target = html;
-//                 template-rules → mdbook() emits the <head>/CSS/
-//                 sidebar chrome; markup-rules wires heading anchors.
-//                 ALSO the html-wrapper pass of dyn-paged (see below).
-//   web         — shiroa --mode dyn-paged, content pass. typst target
-//                 = PAGED (the wasm renderer rasterizes the canvas);
-//                 html.* does NOT exist here — render like PDF on one
-//                 tall auto-height page at shiroa's `page-width`.
-//                 dyn-paged compiles each chapter TWICE: once with
-//                 x-target=web-* (this branch → .sir.in artifact) and
-//                 once with x-target=html-wrapper (the `html` branch
-//                 above → mdbook chrome + wasm trampoline in place of
-//                 the body).
+//   html        — native typst 0.15 `target() == "html"`. Page chrome
+//                 (head/CSS/sidebar/nav) is supplied by lib/html/
+//                 page-shell; this file only handles content
+//                 transforms (equation/figure framing, callouts).
 //
 // Mechanism notes:
 // - `set page(...) if cond` — trailing form. `if cond { set ... }`
@@ -31,14 +22,27 @@
 // - domain assert via `state()` + `context` — not lexical capture; the
 //   show-rule body that calls `r` is evaluated outside the `rio`
 //   function's scope.
-// - shiroa's `is-*-target` are nullary functions, not booleans.
+// - `is-html()`/`is-paged()` wrap typst's native contextual `target()`.
 
 // ─── package imports ────────────────────────────────────────────────
-#import "@preview/shiroa:0.3.1": (
-  cross-link, is-html-target, is-pdf-target, is-web-target, plain-text,
-  shiroa-sys-target, templates, x-current, x-url-base,
-)
-#import templates: markup-rules, template-rules
+#import "/lib/html/meta.typ": chapters, flatten-chapters, label-for, route-for
+
+#let is-html() = target() == "html"
+#let is-paged() = target() == "paged"
+
+// Replacement for shiroa's cross-link: resolve a docs-relative .typ
+// path to either a PDF-internal label or an HTML href.
+#let cross-link(path, body) = context {
+  if is-html() {
+    html.elem("a", attrs: (href: "/" + route-for(path) + ".html"))[#body]
+  } else {
+    link(label-for(path), body)
+  }
+}
+// shiroa's plain-text was a content→str flattener; std repr() is the
+// closest stdlib analogue but callers in this file only used it for
+// title strings, which are already str in lib/html/meta.typ.
+
 // tracey's `req()` rendering helper is no longer used — `#r()` below
 // renders via showybox (paged) / html.elem (html) directly. The
 // `@preview/tracey` package stays in nix/docs.nix typstDeps for
@@ -80,7 +84,7 @@
 #let muted = rgb("#656d76")
 #let rule-color = rgb("#d0d7de")
 
-// ─── shiroa html-frame theming ──────────────────────────────────────
+// ─── html-frame theming ─────────────────────────────────────────────
 // Figures and equations both render as inline SVG via html.frame().
 // Neither dual-renders anymore — figures recolor via CSS
 // `filter: invert()` (.rio-frame svg) and equations via
@@ -91,45 +95,27 @@
 // page-wide replace would also hit .rio-frame diagram SVGs, which
 // double-applies (currentColor → light --fg → invert → dark-on-dark);
 // the CSS scoping is load-bearing. Works in serve and build alike.
-// shiroa's theme-box (dark+light copies, class-toggled) is unused.
 
-// Flatten book-meta.summary into [(path, title), ...] and locate
-// x-current. Returns (title: str, prev: (path,title)|none,
-// next: (path,title)|none). QA #6 + #9 share this — title for
-// <title>/<h1>, prev/next for the nav-wrapper. The chapter title in
-// book.typ is the single source of truth; chapters' first `=` is a
-// section heading, not the page title. Must be called from `context`.
+// Per-page route, set by lib/html/page-shell (Task 7). Until that
+// lands, stays `none` so `_chapter-nav()` returns the empty stub and
+// PDF compiles unaffected.
+#let _current-route = state("rio-current-route", none)
+
+// Locate the current route in the flattened chapter manifest. Returns
+// (title: str, prev: (title,path,depth)|none, next: …|none). QA #6 +
+// #9 share this — title for <title>/<h1>, prev/next for the nav
+// wrapper. The chapter title in lib/html/meta.typ is the single source
+// of truth. Must be called from `context`.
 #let _chapter-nav() = {
-  let bm = query(<shiroa-book-meta>).at(0, default: none)
-  if bm == none or x-current == none {
-    return (title: "", prev: none, next: none)
-  }
-  // Recursively flatten the summary tree (parts/nested chapters).
-  // Chapter nodes have {kind:"chapter", link, title, sub?}; part
-  // nodes have {kind:"part", title}.
-  let flatten(nodes) = {
-    let acc = ()
-    for n in nodes {
-      if n.kind == "chapter" and n.at("link", default: none) != none {
-        // n.title is shiroa's _store-content wrapper:
-        // (kind: "plain-text", content: <str>).
-        acc.push((path: n.link, title: n.title.content))
-      }
-      if "sub" in n { acc += flatten(n.sub) }
-    }
-    acc
-  }
-  let flat = flatten(bm.value.summary)
-  // x-current is the bare relative path ("intro.typ"); summary links
-  // match. Normalize leading-slash variant defensively.
-  let i = flat.position(c => (
-    c.path == x-current or "/" + c.path == x-current
-  ))
-  if i == none { return (title: "", prev: none, next: none) }
+  let flat = flatten-chapters(chapters).filter(c => c.path != none)
+  let cur = _current-route.get()
+  if cur == none { return (title: "", prev: none, next: none) }
+  let idx = flat.position(c => route-for(c.path) == cur)
+  if idx == none { return (title: "", prev: none, next: none) }
   (
-    title: flat.at(i).title,
-    prev: if i > 0 { flat.at(i - 1) } else { none },
-    next: if i + 1 < flat.len() { flat.at(i + 1) } else { none },
+    title: flat.at(idx).title,
+    prev: if idx > 0 { flat.at(idx - 1) } else { none },
+    next: if idx + 1 < flat.len() { flat.at(idx + 1) } else { none },
   )
 }
 
@@ -158,11 +144,9 @@
   caption: caption,
   // The block(width: 100%) wrapper is paged-only — inside
   // html.frame()'s paged sub-context there's no container width, so
-  // 100% → 0pt → zero-width SVG (QA #1). is-html-target() is
-  // compile-global (NOT context-lazy shiroa-sys-target which would
-  // evaluate to "paged" inside html.frame); frame-figure supplies a
+  // 100% → 0pt → zero-width SVG (QA #1). frame-figure supplies a
   // fixed-width box for kind:"algorithm" instead.
-  if is-html-target() {
+  if is-html() {
     pseudocode-list(booktabs: false, indentation: 1.4em, body)
   } else {
     block(
@@ -179,7 +163,7 @@
 // in PDF (h(1fr) needs container width); below-line in HTML
 // (html.frame() has no width to push against, and below-line reflows
 // at any viewport — width-independent, so the 560pt box stays). QA2-C.
-#let rann(body) = if is-html-target() {
+#let rann(body) = if is-html() {
   linebreak()
   h(2em)
   text(size: 0.85em, style: "italic", fill: muted, body)
@@ -194,7 +178,7 @@
 // gentle-clues callouts: in html mode the package's icon+title grid()
 // warns, so emit a plain <aside> instead (selectable text; styled by
 // rio-css extra-assets below). Paged targets get the real gentle-clues render.
-#let _clue(gc-fn, kind, ..args) = if is-html-target() {
+#let _clue(gc-fn, kind, ..args) = if is-html() {
   let title = args.named().at("title", default: none)
   html.elem("aside", attrs: (class: "rio-clue rio-clue-" + kind), {
     if title != none {
@@ -213,10 +197,8 @@
 // deduplicated. Passed as `user-print-back-references` to print-glossary.
 #let muted-backrefs(entry, deduplicate: true) = {
   // Page backrefs are meaningless in HTML (every chapter is "page 1").
-  // QA2-D. is-html-target() (compile-global) — this is called from
-  // glossarium's printer outside any html.frame() so either gate would
-  // work, but stay consistent with the other helpers.
-  if is-html-target() { return }
+  // QA2-D.
+  if is-html() { return }
   let refs = get-entry-back-references(entry, deduplicate: true)
   if refs.len() > 0 {
     let lbl = if refs.len() == 1 { "p." } else { "pp." }
@@ -251,7 +233,7 @@
 #let _gloss-done = state("rio-gloss-done", false)
 // Chapters that `provides-glossary()` (sla-sizing, glossary.typ) own
 // their `<key>` anchors via `print-glossary`; `_gloss-own` lets the
-// shiroa `@key` cross-link intercept in `rio()` fall through to the
+// html `@key` cross-link intercept in `rio()` fall through to the
 // intra-chapter glossarium link there.
 #let _gloss-own = state("rio-gloss-own", false)
 // Registered key set, for the `show link:` membership check.
@@ -259,8 +241,7 @@
 // Bare empty-body figures: rio()'s `show figure.where(kind:
 // "glossarium_entry")` rule renders them as `it.body` (=[]) in html
 // mode and `align(left, it)` in paged (also visually empty), so no box
-// wrapper needed — and a box() at top-level would land OUTSIDE shiroa's
-// `<html>` element. Placement is just before `body` in `rio()`, after
+// wrapper needed. Placement is just before `body` in `rio()`, after
 // all show rules, so the figures are inside the html structure.
 #let _gloss-anchors = {
   for e in glossary-entries [
@@ -273,7 +254,7 @@
 // the `<key>` labels their `print-glossary` emits), and registers if
 // nothing has yet (standalone compile of the chapter; under book-pdf an
 // earlier chapter's `rio()` already did). `_gloss-own` is the separate
-// gate for the shiroa cross-link intercept (it stays false in chapters
+// gate for the html cross-link intercept (it stays false in chapters
 // that rely on rio()'s anchors and true here).
 #let provides-glossary() = {
   context if not _gloss-done.get() {
@@ -295,7 +276,7 @@
     ds == none or ds.any(d => id.starts-with(d + ".")),
     message: "marker " + id + " outside declared domains " + repr(ds),
   )
-  if is-html-target() {
+  if is-html() {
     // Bypass tracey's req() — its block/box/v() layout primitives warn
     // under typst's html target. tracey's scanner reads .typ source
     // (regex for `r[...]`/`#r("...")`), not compiled output, so this
@@ -366,18 +347,13 @@
 // ─── the template ───────────────────────────────────────────────────
 #let rio(domains: none, paper: none, body) = {
   // `x-target` (NOT `target` — that would shadow typst's builtin
-  // `target()` which the glossarium show-rules below need to detect
+  // `target()` which the show-rules below need to detect
   // `html.frame()`'s paged sub-context).
   let x-target = sys.inputs.at("x-target", default: "pdf")
-  // Three-way split (is-html / is-dyn-web mutually exclusive):
-  //   is-html      — static-html. typst target=html → html.elem exists.
-  //   is-dyn-web   — dyn-paged. typst target=paged → html.* MISSING.
-  //   is-pdf       — direct `typst compile` (pdf / book-pdf).
-  // is-paged-out = typst's layout engine renders = everything but html.
-  // Gate html.elem/html.frame/extra-assets on is-html ONLY.
-  let is-html = is-html-target()
-  let is-dyn-web = is-web-target()
-  let is-paged-out = not is-html
+  // is-pdf — direct `typst compile` (pdf / book-pdf). The html/paged
+  // split is handled per-site via the contextual `is-html()`/
+  // `is-paged()` predicates above; gate html.elem/html.frame on
+  // `is-html()` ONLY.
   let is-pdf = x-target in ("pdf", "book-pdf")
   _domains.update(domains)
 
@@ -398,19 +374,19 @@
   show cite: set text(fill: accent)
   show bibliography: set par(justify: false)
   set heading(numbering: "1.1 ")
-  // Heading geometry is paged-only — in html mode markup-rules supplies
-  // the theme's heading wrapper and an outer v() would warn.
-  show heading.where(level: 1): it => if is-paged-out {
+  // Heading geometry is paged-only — in html mode the page-shell CSS
+  // supplies heading styling and an outer v() would warn.
+  show heading.where(level: 1): it => if is-paged() {
     v(1.2em, weak: true)
     text(size: 16pt, weight: 700, fill: accent, it)
     v(0.5em)
   } else { it }
-  show heading.where(level: 2): it => if is-paged-out {
+  show heading.where(level: 2): it => if is-paged() {
     v(1.0em, weak: true)
     text(size: 12.5pt, weight: 700, it)
     v(0.3em)
   } else { it }
-  show heading.where(level: 3): it => if is-paged-out {
+  show heading.where(level: 3): it => if is-paged() {
     v(0.8em, weak: true)
     text(size: 11pt, weight: 700, it)
     v(0.2em)
@@ -420,7 +396,7 @@
   // box() is paged-layout — in html mode the equation show-rule below
   // wraps the equation in html.frame() and an outer box() would
   // re-trigger the "layout ignored" warning.
-  show math.equation.where(block: false): it => if is-paged-out {
+  show math.equation.where(block: false): it => if is-paged() {
     box(it)
   } else {
     it
@@ -440,7 +416,7 @@
   }
 
   set table(stroke: none, inset: (x: 0.8em, y: 0.55em))
-  show table: it => if is-paged-out {
+  show table: it => if is-paged() {
     block(stroke: (y: 0.4pt + rule-color), align(center, it))
   } else { it }
   show table.cell.where(y: 0): strong
@@ -449,63 +425,14 @@
   // through to native @label otherwise. Registration is gated on
   // `_gloss-done` so book-pdf's many `rio()` calls fire exactly once.
   // The `<key>` anchor figures (`_gloss-anchors`) are placed just
-  // before `body` below — after all show rules so they land inside
-  // shiroa's `<html>` element — and the `_gloss-done.update(true)` is
-  // there too so both placements share one gate. In html mode, return
-  // `it.body` to consume the figure before glossarium's default theme
-  // wraps it in `align(start, ...)` (which warns under the html target).
+  // before `body` below — after all show rules — and the
+  // `_gloss-done.update(true)` is there too so both placements share
+  // one gate.
   context if not _gloss-done.get() {
     register-glossary(glossary-entries)
   }
   show: make-glossary
-  // The two glossarium show-rules below emit `html.elem`, which warns
-  // ("elem was ignored during paged export") inside `html.frame()`'s
-  // paged sub-context — `is-html` (captured from `sys.inputs`) stays
-  // true there, but typst's native `target()` flips to `"paged"`. So:
-  // outer `if is-html` keeps the rules out of pure-PDF compiles where
-  // `target` is undefined; inner `target() == "html"` keeps the
-  // `html.elem` arm out of framed-SVG sub-exports.
-  show figure.where(kind: "glossarium_entry"): if is-html {
-    it => context if target() != "html" {
-      // html.frame() paged sub-context — render plainly so the SVG
-      // doesn't drop it.
-      align(left, it)
-    } else if _gloss-own.get() and it.has("label") {
-      // The `print-glossary` figures in chapters that own their glossary
-      // (glossary.typ, sla-sizing): wrap with `id="label-<key>"` so the
-      // cross-chapter `<a href="…#label-<key>">` below has a fragment
-      // target. Non-own chapters' `_gloss-anchors` figures (empty body,
-      // `_gloss-own` false) fall through to `it.body` — present so
-      // glossarium's `link(label(key), …)` resolves, but the link is
-      // rewritten to cross-chapter by the `show link:` rule.
-      html.elem("span", attrs: (id: "label-" + str(it.label)), it.body)
-    } else { it.body }
-  } else { it => align(left, it) }
-  // shiroa static-html: rewrite glossarium's `link(label(key), …)`
-  // (the common tail of `@key`, `#gls(key)`, `#glspl(key)`) to a
-  // cross-chapter `<a href="<base>glossary.html#label-<key>">`. Can't
-  // use cross-link(reference:) — it queries locally first, finds the
-  // hidden anchor, and short-circuits to a same-page link. Chapters
-  // that `provides-glossary()` keep the intra-chapter link.
-  show link: if is-html {
-    it => context {
-      if (
-        target() == "html"
-          and not _gloss-own.get()
-          and type(it.dest) == label
-          and str(it.dest) in _gloss-keys
-      ) {
-        html.elem(
-          "a",
-          attrs: (
-            class: "typst-content-link",
-            href: x-url-base + "glossary.html#label-" + str(it.dest),
-          ),
-          it.body,
-        )
-      } else { it }
-    }
-  } else { it => it }
+  show figure.where(kind: "glossarium_entry"): it => align(left, it)
 
   show: gentle-clues.with(breakable: false, headless: false)
 
@@ -513,8 +440,8 @@
   // line-numbered, language-tagged blocks. Paged-only — its grid()
   // layout warns under the html target; let raw fall through to typst's
   // native <pre><code class="language-X"> there (selectable, CSS-styleable).
-  show: if is-paged-out { codly-init.with() } else { it => it }
-  if is-paged-out {
+  show: if is-paged() { codly-init.with() } else { it => it }
+  if is-paged() {
     codly(
       languages: codly-languages,
       zebra-fill: rgb("#f6f8fa"),
@@ -545,41 +472,21 @@
     },
   ) if is-pdf
 
-  // dyn-paged: shiroa CLI provides theme chrome around the wasm-rendered
-  // canvas and supplies its own page geometry (serve mode wraps the
-  // chapter in a container before #show fires, so `set page` here
-  // errors with "not allowed inside of containers"). Content renders
-  // like PDF — codly/gentle-clues/fletcher on, wasm rasterizes them.
-  // No html.elem emission, no template-rules.
-
-  // shiroa static-html: emit the page chrome + content transforms.
+  // html: emit content transforms. Page chrome (head/CSS/sidebar/nav)
+  // is supplied by lib/html/page-shell; this block only handles
+  // equation/figure/table framing and footnote/nav fragments.
   //
-  // template-rules is the outer wrapper — it dispatches to shiroa-
-  // mdbook's `mdbook()`, which emits the full <html><head> (CSS,
-  // <title>, dyn-svg-support wasm bootstrap) and <body> (sidebar nav,
-  // theme picker, getTypstTheme/svg_utils.js wiring) and drops the
-  // show-body into the main-content slot. The `book-meta` arg is
-  // `include "/book.typ"` so the sidebar reflects the book manifest;
-  // book.typ doesn't import rio.typ so there's no cycle.
+  // Whole block is gated on is-html() ONLY — every branch below emits
+  // html.elem/html.frame, which don't exist when typst's target is
+  // paged.
   //
-  // Whole block is gated on is-html ONLY — every branch below emits
-  // html.elem/html.frame/add-styles, which don't exist when typst's
-  // target is paged. dyn-paged (is-web-target) must NOT enter here.
-  //
-  // markup-rules + the equation/figure/clue bypasses go inside
-  // template-rules so they transform the content that lands in mdbook's
-  // main-content slot.
-  //
-  // markup-rules only destructures `default-theme.dash-color`.
   // figure.where(kind: image) catches every #figure(diagram(...)),
   // chronos.diagram, automaton, autograph, lq.diagram — typst defaults
   // unrecognised figure bodies to kind: image. Algorithm/listing/table/
   // glossarium figures keep their explicit kinds and render as HTML.
   // Custom CSS for our html-mode element bypasses (#r → div.rio-req,
   // gentle-clues → aside.rio-clue, figure → .rio-figure, footnote →
-  // .rio-footnote). Passed via `extra-assets` (mdbook reads it; mdbook
-  // does NOT read the `shiroa-assets` state that `add-styles()` writes
-  // to — that's a starlight-only path).
+  // .rio-footnote) lives in lib/html/page-shell.
   let rio-css = ```css
   /* Equations: single-render, themed via attribute-selector override.
      typst emits fill/stroke="#000000"; the [fill="#000000"] selectors
@@ -652,15 +559,14 @@
     html:not(.sidebar-visible) .sidebar { transform: translateX(calc(0px - var(--sidebar-width))); }
     html:not(.sidebar-visible) .page-wrapper { margin-left: 0; transform: none; }
   }
-  /* shiroa-mdbook's chrome.css has `.previous { float: left }` (no-op
-     on position:fixed) instead of mdBook's `left: var(--page-padding)`.
-     Without an explicit left anchor the arrow lands at <main>'s left
-     edge and intercepts clicks across a 90px strip. */
+  /* mdbook chrome.css has `.previous { float: left }` (no-op on
+     position:fixed) instead of `left: var(--page-padding)`. Without an
+     explicit left anchor the arrow lands at <main>'s left edge and
+     intercepts clicks across a 90px strip. */
   .nav-wide-wrapper .previous { left: var(--page-padding); }
   /* The .previous fixed arrow at left:15px sits in the same x-range
      as the open sidebar; without an explicit z-index the later-in-DOM
-     .nav-chapters paints above. mdBook's chrome.css normally sets
-     this; shiroa-mdbook's copy doesn't. */
+     .nav-chapters paints above. */
   .sidebar { z-index: 10; }
   /* Copy-to-clipboard button (rio-js below adds it to each <pre>). */
   .rio-copy { position: absolute; top: .5em; right: .5em; padding: .2em .5em;
@@ -714,40 +620,16 @@
       + _favicon-uri
       + "\";document.head.appendChild(l)})(document.createElement('link'));",
   )
-  show: if is-html {
+  show: if is-html() {
     it => {
-      show: template-rules.with(
-        book-meta: include "/book.typ",
-        // QA #6: chapter title from book.typ's #chapter()[Title]
-        // (single source of truth). Wrapped in `context` since
-        // _chapter-nav() queries the document; mdbook's meta-title
-        // callback compares `title != ""` — content is never == "" so
-        // the `[#title -- #site-title]` branch always fires, which is
-        // what we want.
-        title: if paper != none { paper.title } else {
-          context _chapter-nav().title
-        },
-        plain-body: body,
-        web-theme: "mdbook",
-        extra-assets: (rio-css, rio-js, rio-favicon),
-      )
-      show: markup-rules.with(
-        web-theme: "mdbook",
-        themes: (default-theme: (dash-color: accent)),
-      )
       // Single-render equations: theme via CSS `currentColor`, not
-      // dual-SVG. shiroa's equation-rules wraps each eq in theme-box
-      // → dark+light copies (byte-identical except fill); on
-      // sla-sizing.html that's ~2000 eqs × 2 copies × ~7KB glyph
-      // paths. Emit ONE html.frame() at fill=black; the rio-css
+      // dual-SVG. Emit ONE html.frame() at fill=black; the
       // `[fill="#000000"]` attribute selectors override to
       // currentColor so `.inline-equation svg { color: var(--fg) }`
-      // themes them — works in serve and build. (equation-rules'
-      // add-styles() is starlight-only anyway, so the CSS lives in
-      // rio-css.)
+      // themes them — works in serve and build.
       show math.equation: set text(weight: 400)
       show math.equation.where(block: false): it => context (
-        if shiroa-sys-target() == "html" {
+        if target() == "html" {
           html.elem(
             "span",
             attrs: (class: "inline-equation", role: "math"),
@@ -759,7 +641,7 @@
         } else { it }
       )
       show math.equation.where(block: true): it => context (
-        if shiroa-sys-target() == "html" {
+        if target() == "html" {
           html.elem(
             "p",
             attrs: (class: "block-equation", role: "math"),
@@ -775,7 +657,7 @@
       // autograph/finite) and lovelace pseudocode (kind: "algorithm",
       // whose grid() would otherwise warn). Selectable text matters
       // less for these than for code/callouts.
-      let frame-figure = fig => context if shiroa-sys-target() == "html" {
+      let frame-figure = fig => context if target() == "html" {
         // 560pt ≈ 746px (mdbook --content-max-width is 750px). Only
         // algorithms get a fixed-width box — they never exceed the
         // column and benefit from fill width. Diagrams (kind: image)
@@ -800,17 +682,17 @@
       show figure.where(kind: image): frame-figure
       show figure.where(kind: "algorithm"): frame-figure
       // Tables wider than the content column need horizontal scroll.
-      // QA #5. shiroa-sys-target() returns "paged" inside html.frame()
-      // (it aliases std.target), so this no-ops there. Wraps ALL
-      // tables (acceptable — narrow tables get a benign extra div).
-      show table: it => context if shiroa-sys-target() == "html" {
+      // QA #5. target() returns "paged" inside html.frame(), so this
+      // no-ops there. Wraps ALL tables (acceptable — narrow tables get
+      // a benign extra div).
+      show table: it => context if target() == "html" {
         html.elem("div", attrs: (class: "rio-table"), it)
       } else { it }
       // figure(kind: table) isn't routed through frame-figure (tables
       // stay HTML, not SVG); give it the same .rio-figure margin/
       // caption styling.
       show figure.where(kind: table): fig => context if (
-        shiroa-sys-target() == "html"
+        target() == "html"
       ) {
         html.elem("figure", attrs: (class: "rio-figure"), {
           html.elem("div", attrs: (class: "rio-table"), fig.body)
@@ -857,7 +739,7 @@
               attrs: (
                 class: cls,
                 rel: rel,
-                href: x-url-base + ch.path.replace(regex(".typ$"), ".html"),
+                href: "/" + route-for(ch.path) + ".html",
                 aria-label: rel + ": " + ch.title,
               ),
               body,
@@ -885,7 +767,7 @@
   } else { it => it }
 
   // standalone-paper front matter — only for direct `typst compile`,
-  // not when stitched into book-pdf or rendered by shiroa.
+  // not when stitched into book-pdf or rendered to html.
   // `context` so `_book-mode.get()` resolves; the CLI `--input x-target`
   // and the in-doc `#book-pdf-mode()` are equivalent gates.
   let in-book = x-target == "book-pdf"
@@ -922,12 +804,9 @@
 
   front
   // Hidden glossary `<key>` anchors (see `_gloss-anchors` above): placed
-  // here so they land INSIDE the shiroa `<html>` wrapper (template-rules
-  // is already applied). Gated on `_gloss-done` (one set per document)
-  // and `_book-mode` (book-pdf's included sla-sizing.typ prints the
-  // real glossary, supplying the labels). In static-html they're still
-  // emitted so glossarium's `link(label(key))` resolves; the `show
-  // link:` intercept above rewrites the link to cross-chapter.
+  // here so they land after all show rules. Gated on `_gloss-done` (one
+  // set per document) and `_book-mode` (book-pdf's included
+  // sla-sizing.typ prints the real glossary, supplying the labels).
   context if not _gloss-done.get() and not _book-mode.get() {
     _gloss-anchors
   }
@@ -936,8 +815,9 @@
 
   // Per-chapter bibliography for every target except book-pdf (the
   // stitched aggregate supplies one bibliography at the end; typst
-  // forbids more than one per document). shiroa compiles each chapter
-  // standalone, so omitting it there leaves @cite labels unresolved.
+  // forbids more than one per document). The html build compiles each
+  // chapter standalone, so omitting it there leaves @cite labels
+  // unresolved.
   context if (
     paper != none
       and not in-book
