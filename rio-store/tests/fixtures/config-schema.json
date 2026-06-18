@@ -105,11 +105,18 @@
         ]
       },
       "chunk_upload_max_concurrent": {
-        "description": "Max concurrent S3 chunk uploads per `put_chunked` call.\nDefault 8. Per-replica `r[store.substitute.admission+2]` bounds\nconcurrent `put_chunked` calls; `substitute_admission_permits\n× this` is the per-replica in-flight PutObject ceiling. Raise\nif the store runs with a larger aws-sdk pool; lower (min 1)\nif you see `DispatchFailure` in store logs during large-NAR\ningest. Set via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT`.",
+        "description": "Max concurrent S3 chunk uploads PER `put_chunked` call.\nDefault 64. Composes under\n[`chunk_upload_global_permits`](Self::chunk_upload_global_permits)\n— in-flight PutObject = `min(Σ per-ingest, global)` — so this\nknob is fairness (one giant NAR can't take the whole global\ngate) plus the per-ingest owned-`Bytes` overshoot bound, NOT\nthe connection ceiling. Lower (min 1) if you see\n`DispatchFailure` in store logs during large-NAR ingest. Set\nvia `RIO_CHUNK_UPLOAD_MAX_CONCURRENT`.",
         "type": "integer",
         "format": "uint",
         "minimum": 0,
-        "default": 8
+        "default": 64
+      },
+      "chunk_upload_global_permits": {
+        "description": "Replica-global gate on concurrent S3 PutObject across every\ningest (substitute leaders + PutPath gRPC). Default 256. The\naws-sdk's default hyper client has no in-flight connection cap\n— only an idle-pool cap — so this semaphore IS the de-facto\nfd/connection bound for the chunk-PUT plane. Set via\n`RIO_CHUNK_UPLOAD_GLOBAL_PERMITS`.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0,
+        "default": 256
       },
       "s3_max_attempts": {
         "description": "Max aws-sdk retry attempts per S3 operation (PutObject,\nGetObject, HeadObject). Default 10 — raised from the aws-sdk\ndefault of 3 because S3-compatible backends (rustfs, MinIO)\nrecycle connections more aggressively than AWS S3, surfacing\nas transient `DispatchFailure` that the sdk's standard retry\npolicy handles but exhausts at 3. Set via `RIO_S3_MAX_ATTEMPTS`.",
@@ -365,7 +372,8 @@
       "rio-gateway",
       "rio-scheduler"
     ],
-    "chunk_upload_max_concurrent": 8,
+    "chunk_upload_max_concurrent": 64,
+    "chunk_upload_global_permits": 256,
     "s3_max_attempts": 10,
     "max_batch_paths": 1048576,
     "chunk_prefetch_k": 64,

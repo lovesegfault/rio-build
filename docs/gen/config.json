@@ -434,8 +434,14 @@
       {
         "key": "chunk_upload_max_concurrent",
         "type": "uint",
-        "default": "8",
-        "description": "Max concurrent S3 chunk uploads per `put_chunked` call."
+        "default": "64",
+        "description": "Max concurrent S3 chunk uploads PER `put_chunked` call."
+      },
+      {
+        "key": "chunk_upload_global_permits",
+        "type": "uint",
+        "default": "256",
+        "description": "Replica-global gate on concurrent S3 PutObject across every ingest (substitute leaders + PutPath gRPC)."
       },
       {
         "key": "s3_max_attempts",
