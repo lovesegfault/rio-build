@@ -56,7 +56,12 @@ use thiserror::Error;
 /// Format version. 2 = per-file blob-stream chunks (ADR-022 §6); 1 was
 /// whole-NAR-stream chunks and is rejected on read. Bump for
 /// incompatible changes.
-const VERSION: u8 = 2;
+///
+/// `pub(crate)` so the collect cycle's PG-side mark validation
+/// (`gc::collect::corruption_population_sql`) can derive its hex byte
+/// from THIS constant — the differential pinning test
+/// `mark_expansion_matches_rust_parser` is what catches divergence.
+pub(crate) const VERSION: u8 = 2;
 
 /// Bytes per entry: 32 (BLAKE3) + 4 (u32 size).
 const ENTRY_SIZE: usize = 36;

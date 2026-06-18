@@ -178,8 +178,9 @@ pub(crate) const MARK_EXPANSION_SQL: &str = "CREATE TEMP TABLE live_chunks AS \
 /// alignment, `MAX_CHUNKS`. The version probe uses `substring` (empty
 /// on an empty blob) rather than `get_byte` so a zero-length blob is
 /// reported as malformed instead of erroring mid-scan. 36 = the
-/// serialized entry size (32-byte BLAKE3 + u32 LE size), `\x01` = the
-/// format version byte; both fixed by `rio_store::manifest`.
+/// serialized entry size (32-byte BLAKE3 + u32 LE size), the version
+/// byte is `crate::manifest::VERSION` (rendered into the SQL below);
+/// both fixed by `rio_store::manifest`.
 ///
 /// Shared with `gc::mark_scan_bench` (gate (b)).
 /// THE statement builder over the corruption population
@@ -198,10 +199,11 @@ fn corruption_population_sql(select: &str, shadow_excluded: bool, tail: &str) ->
            FROM manifest_data md \
            JOIN manifests m USING (store_path_hash) \
           WHERE (octet_length(md.chunk_list) < 1 \
-             OR substring(md.chunk_list FROM 1 FOR 1) <> '\\x01'::bytea \
+             OR substring(md.chunk_list FROM 1 FOR 1) <> '\\x{ver:02x}'::bytea \
              OR (octet_length(md.chunk_list) - 1) % 36 <> 0 \
              OR (octet_length(md.chunk_list) - 1) / 36 > {max}) \
           {exclusion} {tail}",
+        ver = crate::manifest::VERSION,
         max = crate::manifest::MAX_CHUNKS,
         exclusion = if shadow_excluded {
             SHADOW_SWEPT_EXCLUSION_AND
@@ -5041,7 +5043,7 @@ mod tests {
         );
         assert_eq!(
             COLLECT_BATCH_UPDATE_SQL.as_str(),
-            "UPDATE chunks SET deleted = TRUE, uploaded_at = NULL, deleted_at = now() \
+            "UPDATE chunks SET deleted = TRUE, uploaded_at = NULL, durable = FALSE, deleted_at = now() \
      WHERE blake3_hash = ANY($1) AND deleted = FALSE \
        AND GREATEST(created_at, last_referenced_at) < $2::timestamptz \
      RETURNING blake3_hash, size",

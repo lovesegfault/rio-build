@@ -1748,7 +1748,7 @@ mod tests {
 
         // Entry count above MAX_CHUNKS.
         let mut oversized = vec![0u8; 1 + (MAX_CHUNKS + 1) * 36];
-        oversized[0] = 1;
+        oversized[0] = crate::manifest::VERSION;
         assert!(matches!(
             try_parse_unique_chunk_hashes(&oversized),
             Err(ManifestError::TooManyChunks(_))
