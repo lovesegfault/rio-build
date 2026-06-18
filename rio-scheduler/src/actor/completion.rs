@@ -295,17 +295,12 @@ pub(super) fn failure_ctx_for<'a>(
     status: rio_proto::types::BuildResultStatus,
     result: &'a crate::domain::BuildResult,
     report_line_count: Option<i64>,
-    peak_memory_bytes: u64,
 ) -> FailureReportCtx<'a> {
     use rio_proto::types::BuildResultStatus as S;
     match status {
-        S::InfrastructureFailure => FailureReportCtx::infra(
-            report_line_count,
-            &result.error_msg,
-            result.store_degraded,
-            result.failure_classification.as_ref(),
-            peak_memory_bytes,
-        ),
+        S::InfrastructureFailure => {
+            FailureReportCtx::infra(report_line_count, &result.error_msg, result.store_degraded)
+        }
         S::Cancelled => FailureReportCtx::non_infra(
             report_line_count,
             "worker reported Cancelled without scheduler-initiated cancel",
@@ -1331,21 +1326,28 @@ impl DagActor {
     pub(super) async fn observe_resource_floor(
         &mut self,
         drv_hash: &DrvHash,
-        peaks: super::floor::ObservedPeaks,
+        mut peaks: super::floor::ObservedPeaks,
         reason: super::floor::AttemptCloseReason,
     ) -> super::floor::FloorOutcome {
         let reason_label = reason.label();
+        let Some(state) = self.dag.node(drv_hash) else {
+            return super::floor::FloorOutcome::default();
+        };
+        // sh-041u r1: `wall` is the SCHEDULER's own `running_since`
+        // anchor — derived HERE, never caller-supplied, so a
+        // worker-minted duration cannot reach the trust gate by
+        // construction (no `from_report` parameter to misuse).
+        peaks.wall = state.running_since.map(|since| since.elapsed());
         // r[impl sched.floor.compute-bound-provisionable]
         // sh-031b: the cores axis caps at the partition-aware
         // provisionable max — feature/arch-routed AND non-ICE-exhausted
         // — read FRESH at the moment of the corroborated failure (so a
         // mask that opened during the attempt re-admits the larger
-        // class). The mem/disk/deadline arms ignore this; the
-        // catalog-absolute fallback covers a missing-node edge.
-        let prov_max_cores = self
-            .dag
-            .node(drv_hash)
-            .map(|state| {
+        // class). sh-041u r1: gated on the cores arm's own preconditions
+        // (`cpu_seconds ∧ wall ∧ hard_cores`) — the cost-table walk is
+        // unused on every other close.
+        let prov_max_cores =
+            if peaks.cpu_seconds.is_some() && peaks.wall.is_some() && reason.hard_cores() {
                 let feat = state.effective_features().as_slice();
                 let arch = rio_common::k8s::system_to_k8s_arch(&state.system);
                 let cost = self.cost_table.read();
@@ -1356,12 +1358,10 @@ impl DagActor {
                     cost.resolved_global(),
                     &self.ice,
                 )
-            })
-            .unwrap_or(self.sla_ceilings.max_cores as u32);
-        let cfg = super::floor::ObserveCfg {
-            compute_bound_threshold: self.sla_config.compute_bound_threshold,
-            compute_bound_min_wall_secs: self.sla_config.compute_bound_min_wall_secs,
-        };
+            } else {
+                0
+            };
+        let cfg = super::floor::ObserveCfg::from(&self.sla_config);
         let mut new_floor = None;
         let outcome = if let Some(state) = self.dag.node_mut(drv_hash) {
             let o = super::floor::observe_peaks(
@@ -1421,6 +1421,32 @@ impl DagActor {
             }
         }
         outcome
+    }
+
+    /// sh-041u r1: chokepoint-#4 wrapper — both establishment-sweep
+    /// witnessed callers (housekeeping.rs / pull.rs) collapse to this
+    /// one call. The `witnessed_disposition` table gates the two
+    /// promoting letters; the `last_intent` lookup and the
+    /// `peak = last.X` synthesis live HERE so a future witnessed-axis
+    /// change edits one body. The `won`-gated once-per-attempt cap is
+    /// the caller's responsibility (live_058-b).
+    pub(super) async fn observe_witnessed_floor(
+        &mut self,
+        drv_hash: &DrvHash,
+        terminal_reason: rio_proto::types::AttemptTerminalReason,
+    ) {
+        let Some(reason) = super::floor::witnessed_disposition(terminal_reason) else {
+            return;
+        };
+        let Some(last) = self
+            .dag
+            .node(drv_hash)
+            .and_then(|s| s.sched.last_intent.as_ref())
+        else {
+            return;
+        };
+        let peaks = super::floor::ObservedPeaks::witnessed(last, &reason);
+        let _ = self.observe_resource_floor(drv_hash, peaks, reason).await;
     }
 
     // -----------------------------------------------------------------------
@@ -2371,16 +2397,10 @@ impl DagActor {
             result.failure_classification.as_ref(),
         ) {
             Some(reason) => {
-                let attempt_open = self
-                    .dag
-                    .node(drv_hash)
-                    .and_then(|s| s.running_since)
-                    .map(|since| since.elapsed());
                 let peaks = super::floor::ObservedPeaks::from_report(
                     peak_memory_bytes,
                     cpu_seconds_total,
                     peak_disk_bytes,
-                    attempt_open,
                 );
                 self.observe_resource_floor(drv_hash, peaks, reason).await
             }
@@ -2413,7 +2433,7 @@ impl DagActor {
                     .handle_transient_failure(
                         drv_hash,
                         executor_id,
-                        failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
+                        failure_ctx_for(status, &result, report_line_count),
                     )
                     .await;
                 match handling {
@@ -2436,7 +2456,7 @@ impl DagActor {
                     .handle_infrastructure_failure(
                         drv_hash,
                         executor_id,
-                        failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
+                        failure_ctx_for(status, &result, report_line_count),
                         floor_outcome,
                     )
                     .await;
@@ -2460,7 +2480,7 @@ impl DagActor {
                     .handle_executor_variant_failure(
                         drv_hash,
                         executor_id,
-                        failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
+                        failure_ctx_for(status, &result, report_line_count),
                         floor_outcome,
                     )
                     .await;
@@ -2497,7 +2517,7 @@ impl DagActor {
                     .handle_permanent_failure(
                         drv_hash,
                         executor_id,
-                        failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
+                        failure_ctx_for(status, &result, report_line_count),
                     )
                     .await;
                 match handling {
@@ -2522,7 +2542,7 @@ impl DagActor {
                     .handle_timeout_failure(
                         drv_hash,
                         executor_id,
-                        failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
+                        failure_ctx_for(status, &result, report_line_count),
                         floor_outcome,
                     )
                     .await;
@@ -2555,7 +2575,7 @@ impl DagActor {
                     .handle_infrastructure_failure(
                         drv_hash,
                         executor_id,
-                        failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
+                        failure_ctx_for(status, &result, report_line_count),
                         floor_outcome,
                     )
                     .await;
@@ -2584,7 +2604,7 @@ impl DagActor {
                     .handle_transient_failure(
                         drv_hash,
                         executor_id,
-                        failure_ctx_for(status, &result, report_line_count, peak_memory_bytes),
+                        failure_ctx_for(status, &result, report_line_count),
                     )
                     .await;
                 match handling {
@@ -4450,38 +4470,21 @@ impl DagActor {
             row.error_msg = (!error_msg.is_empty()).then(|| error_msg.to_string());
             row.final_line_count = report.final_line_count;
         }
-        // I-199: bump resource_floor ONLY on the worker-reported
-        // sizing signals — `CgroupOom` (I-196 OOM watcher: build child
-        // hit cgroup memory.max while the pod itself survived) and
-        // `DiskFull` (live_057: overlay prjquota exhausted with node
-        // headroom — the disk twin). Other infra failures (FUSE EIO,
-        // PutPath race, store-replica-restart) are NOT size-related —
-        // the previous over-broad promote here is what made cmake go
-        // medium→large→xlarge in live QA from a store-replica-restart
-        // with zero builds run.
-        // Pod-level OOMKilled (whole pod died) arrives as the
-        // controller's `ReportAttemptOutcome` classification fill,
-        // which deliberately never promotes (sla-sizing.typ accepted
-        // residual).
-        //
-        // bug_408: a store-degraded failure is never a sizing signal —
-        // the breaker fired on store fetches, not on the build's
-        // memory — so the floor bump is skipped even if the message
-        // happens to contain the OOM marker.
-        // merged_bug_032: only a BELIEVED store attribution (corroborated
-        // — Paced or RunBound) suppresses the sizing signal; an
-        // uncorroborated flag is treated as plain infra INCLUDING the
-        // OOM floor bump.
-        let believed_store = matches!(
-            degraded,
-            StoreDegradedDisposition::Paced | StoreDegradedDisposition::RunBound
-        );
         // bug_090 (live_057-b rebuilt): the floor moves ONLY on the — quantifier: census(forged_free_text_never_moves_resource_floors)
         // TYPED classification field, corroborated against the shape
         // this scheduler itself assigned — worker-supplied free text
         // (error_msg) is display/narration and drives nothing. sh-041u:
         // the observe ran at chokepoint #2 (the dispatch chokepoint
-        // before this match); `floor_outcome` is threaded in.
+        // before this match); `floor_outcome` is threaded in. HARD
+        // headroom is gated on `reason.hard_mem()`/`hard_disk()`
+        // (I-199: `CgroupOom` / `DiskFull` — the worker-reported
+        // sizing signals; FUSE EIO / PutPath race /
+        // store-replica-restart classify as `Other` and observe SOFT
+        // only). The store-degraded attribution does NOT suppress the
+        // observe: a typed `CgroupOom` peak is honest evidence
+        // regardless of which downstream subsystem the breaker also
+        // tripped, and a soft observe is in-memory only — `degraded`
+        // routes the COUNTER class below, not the sizing signal.
         //
         // ENVELOPE (R29, enrolled in the wave's duration/envelope
         // census; consumer: THIS gate): at most ONE hard observation
@@ -4494,7 +4497,6 @@ impl DagActor {
         // ladder step burns a REAL scheduled attempt of the forger's
         // own drv at the previously-assigned size — the honest path's
         // cost, no amplification.
-        let _ = believed_store;
 
         if self.dag.node(drv_hash).is_none() {
             return FailureHandling::Handled;
@@ -4534,19 +4536,21 @@ impl DagActor {
             // counted infra budget (merged_bug_032).
             crate::retry_policy::ObservedFailure::WorkerInfra { error_msg }
         };
+        // sh-041u: promotion-exempt narrows to `hard_promoted` (a
+        // soft observe can be `target < last_intent` — granting
+        // exemption would be the retired I-199 over-broad heuristic).
+        // The kernel's `at_cap` for the Infra arm narrows to
+        // {Mem, Disk} (belt-only — the kernel ignores it on this
+        // path). Bound once: `row.floor_at_cap` and the kernel-input
+        // view stay in lockstep on an axis-set change.
+        let infra_at_cap = floor_outcome
+            .at_cap_axes
+            .intersects(&[super::floor::Axis::Mem, super::floor::Axis::Disk]);
         let class = crate::retry_policy::classify(
             &event,
             crate::retry_policy::FloorOutcomeView {
-                // sh-041u: promotion-exempt narrows to `hard_promoted`
-                // (a soft observe can be `target < last_intent` —
-                // granting exemption would be the retired I-199
-                // over-broad heuristic). The kernel's `at_cap` for the
-                // Infra arm narrows to {Mem, Disk} (belt-only — the
-                // kernel ignores it on this path).
                 promoted: floor_outcome.hard_promoted,
-                at_cap: floor_outcome
-                    .at_cap_axes
-                    .intersects(&[super::floor::Axis::Mem, super::floor::Axis::Disk]),
+                at_cap: infra_at_cap,
             },
         );
         let exempt_from_cap = class == OutcomeClass::ExemptInfra;
@@ -4557,9 +4561,7 @@ impl DagActor {
         if let Some(row) = attempt_row.as_mut() {
             row.exempt = exempt_from_cap;
             row.floor_promoted = floor_outcome.hard_promoted;
-            row.floor_at_cap = floor_outcome
-                .at_cap_axes
-                .intersects(&[super::floor::Axis::Mem, super::floor::Axis::Disk]);
+            row.floor_at_cap = infra_at_cap;
             row.outcome_class = class;
         }
 

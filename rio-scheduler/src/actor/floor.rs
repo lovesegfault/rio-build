@@ -37,6 +37,15 @@ pub(super) const DEADLINE_CAP_SECS: u32 = 86_400;
 /// `QuotaTelemetry.hard_limit_bytes` (which is no longer consulted).
 pub(super) const TRUST_BAND_MEM: f64 = 1.05;
 
+/// sh-041u r1: the cores-axis CEILING trust band — `cpu_util =
+/// cpu_seconds / (wall × assigned_cores) ≤ TRUST_BAND_CORES`. The
+/// kernel guarantees `cpu.stat.usage_usec ≤ wall × cpu.max =
+/// wall × assigned_cores`, so any honest report sits at ≤ 1.0×; the
+/// 5% slack absorbs cgroup accounting jitter. A `cpu_util` above the
+/// band is a forgery (or a non-finite `cpu_seconds`) → refused,
+/// counted on `uncorroborated_sizing_claim_total{class=cores}`.
+pub(super) const TRUST_BAND_CORES: f64 = 1.05;
+
 // r[impl sys.liveness.exit-edge]
 /// merged_bug_016: the mem dimension's cap in the SOLVE domain — the
 /// largest solved mem whose padded container
@@ -146,19 +155,26 @@ pub struct ObservedPeaks {
 }
 
 impl ObservedPeaks {
-    /// Build from a `CompletionReport`'s fields. `0` /
-    /// `None` = no-signal → axis untouched.
+    /// Build from a `CompletionReport`'s fields. `0` / `None` =
+    /// no-signal → axis untouched. `wall` is NOT a parameter: the
+    /// scheduler-side anchor is derived inside
+    /// [`observe_resource_floor`](crate::actor::SchedulerActor::observe_resource_floor)
+    /// from `running_since`, so a worker-supplied duration cannot
+    /// reach the trust gate by construction.
+    // r[impl sched.executor.input-bounds+2]
     pub fn from_report(
         peak_memory_bytes: u64,
         cpu_seconds_total: Option<f64>,
         peak_disk_bytes: Option<u64>,
-        attempt_open: Option<Duration>,
     ) -> Self {
         Self {
             mem_bytes: (peak_memory_bytes > 0).then_some(peak_memory_bytes),
             disk_bytes: peak_disk_bytes.filter(|&d| d > 0),
-            cpu_seconds: cpu_seconds_total.filter(|&c| c > 0.0),
-            wall: attempt_open,
+            // sh-041u r1: proto3 `double` admits ±Inf/NaN and
+            // arbitrarily large finite — bounded at intake so the
+            // cores arm never divides a non-finite numerator.
+            cpu_seconds: cpu_seconds_total.filter(|&c| c.is_finite() && c > 0.0),
+            wall: None,
         }
     }
 
@@ -256,6 +272,26 @@ impl AttemptCloseReason {
         )
     }
 
+    /// sh-041u r1: the cores-axis hard-event predicate — the
+    /// infra-side closes that cut off a still-running build
+    /// (`ExecutorVariant`: the build's own internal timeout / nix
+    /// `MiscFailure` — sh-031; `WorkerAbort`: SIGTERM for work the
+    /// scheduler still wants — the sh-041 spot-reclaim case;
+    /// `Witnessed`: kubelet per-container kill). Mirrors
+    /// [`Self::hard_mem`] / [`Self::hard_disk`] / the deadline arm's
+    /// `matches!(Timeout)`: every other axis gates HARD headroom on
+    /// `reason`; without this gate the cores arm fired on `Other`
+    /// (E3b PermanentFailure / NotDeterministic / InputRejected /
+    /// LogLimitExceeded — derivation-intrinsic), persisting a
+    /// `prov_max` floor for a build that never reruns at the same
+    /// inputs (the I-170/I-199 over-fire on the cores axis).
+    pub(super) fn hard_cores(&self) -> bool {
+        matches!(
+            self,
+            Self::ExecutorVariant | Self::WorkerAbort | Self::Witnessed(_)
+        )
+    }
+
     /// The disk-axis hard-event predicate (DiskFull / witnessed
     /// emptyDir-sizeLimit). LIVE with TWO producers: (1) live_057-b —
     /// the worker quota-attributed DiskFull lane (the TYPED
@@ -301,6 +337,15 @@ pub struct ObserveCfg {
     pub compute_bound_min_wall_secs: f64,
 }
 
+impl From<&crate::sla::config::SlaConfig> for ObserveCfg {
+    fn from(c: &crate::sla::config::SlaConfig) -> Self {
+        Self {
+            compute_bound_threshold: c.compute_bound_threshold,
+            compute_bound_min_wall_secs: c.compute_bound_min_wall_secs,
+        }
+    }
+}
+
 // r[impl sched.sla.reactive-floor+6]
 // r[impl sched.retry.promotion-exempt+4]
 /// sh-041u — the unified peak observe. For each axis with a `Some`
@@ -336,86 +381,72 @@ pub fn observe_peaks(
     use rio_common::k8s::{
         DISK_HEADROOM_MAX, DISK_HEADROOM_MIN, KUBELET_QUOTA_BLOCK_SLACK, overlay_size_limit_bytes,
     };
-    let Some(last) = state.sched.last_intent.clone() else {
+    // sh-041u r1: copy the four Copy scalars instead of cloning the
+    // whole `SolvedIntent` (Vec<NodeSelectorTerm>, Vec<String>, …) on
+    // every non-success close — the clone existed solely to dodge a
+    // borrowck overlap with `&mut floor` below.
+    let (last_mem, last_disk, last_cores, last_deadline) = match state.sched.last_intent.as_ref() {
+        Some(l) => (l.mem_bytes, l.disk_bytes, l.cores, l.deadline_secs),
         // Cold start (never minted by this leader): no anchor to
         // corroborate against. The `set_dim` body would no-op on a
         // zero base anyway; the caller's retry budget bounds it.
-        return FloorOutcome::default();
+        None => return FloorOutcome::default(),
     };
     let floor = &mut state.sched.resource_floor;
     let mut o = FloorOutcome::default();
 
     // ── mem ────────────────────────────────────────────────────────
+    // CEILING band: kernel guarantees memory.peak ≤ memory.max
+    // = assigned_mem. A peak above TRUST_BAND_MEM × assigned is a
+    // forgery — refuse, count, axis observes nothing. The bug_102
+    // forgery resistance: per-attempt floor growth is bounded by
+    // ≤ 2 × TRUST_BAND_MEM × assigned, equivalent to the retired
+    // `2 × last_intent`. FLOOR band: a hard-event CLAIM with low
+    // peak is implausible (bug_090) — degrade to soft.
     if let Some(peak) = peaks.mem_bytes
-        && last.mem_bytes > 0
+        && last_mem > 0
     {
-        // CEILING band: kernel guarantees memory.peak ≤ memory.max
-        // = assigned_mem. A peak above TRUST_BAND_MEM × assigned is
-        // a forgery — refuse, count, axis observes nothing. The
-        // bug_102 forgery resistance: per-attempt floor growth is
-        // bounded by ≤ 2 × TRUST_BAND_MEM × assigned, equivalent to
-        // the retired `2 × last_intent`.
-        if peak > (last.mem_bytes as f64 * TRUST_BAND_MEM) as u64 {
-            count_refusal("mem");
-        } else {
-            // FLOOR band: a hard-event CLAIM with low peak is
-            // implausible (bug_090). Degrade to soft.
-            let hard = reason.hard_mem() && peak >= last.mem_bytes / 2;
-            if reason.hard_mem() && !hard {
-                count_refusal("cgroup_oom");
-            }
-            let target = (peak as f64 * if hard { 2.0 } else { 1.2 }) as u64;
-            let (promoted, at_cap) = set_dim(&mut floor.mem_bytes, target, mem_solve_cap(ceil));
-            if at_cap {
-                o.at_cap_axes.insert(Axis::Mem);
-            }
-            if promoted {
-                if hard {
-                    o.hard_promoted = true;
-                } else {
-                    o.soft_promoted = true;
-                }
-            }
-        }
+        observe_sizing_axis(
+            &mut floor.mem_bytes,
+            &mut o,
+            Axis::Mem,
+            peak,
+            (last_mem as f64 * TRUST_BAND_MEM) as u64,
+            last_mem / 2,
+            reason.hard_mem(),
+            mem_solve_cap(ceil),
+            ("mem", "cgroup_oom"),
+        );
     }
 
     // ── disk ───────────────────────────────────────────────────────
+    // sh-041u (round-2): the disk-axis bands REPLACE the retired
+    // `QuotaTelemetry.hard_limit_bytes ∈ [overlay(assigned,
+    // H_MIN), overlay(assigned, H_MAX) + slack]` check — that
+    // tested the worker-reported hard limit; this tests the
+    // worker-reported PEAK against the same producer-derived
+    // denomination (`overlay_size_limit_bytes` — the kubelet-
+    // stamped sizeLimit a real prjquota peak saturates at). The
+    // ceiling is vs the H_MAX-expanded effective assigned (a
+    // legitimate DiskFull peak can reach overlay(assigned, 1.95)
+    // ≈ 1.95×assigned), not the raw `last.disk_bytes`.
     if let Some(peak) = peaks.disk_bytes
-        && last.disk_bytes > 0
+        && last_disk > 0
     {
-        // sh-041u (round-2): the disk-axis bands REPLACE the retired
-        // `QuotaTelemetry.hard_limit_bytes ∈ [overlay(assigned,
-        // H_MIN), overlay(assigned, H_MAX) + slack]` check — that
-        // tested the worker-reported hard limit; this tests the
-        // worker-reported PEAK against the same producer-derived
-        // denomination (`overlay_size_limit_bytes` — the kubelet-
-        // stamped sizeLimit a real prjquota peak saturates at). The
-        // ceiling is vs the H_MAX-expanded effective assigned (a
-        // legitimate DiskFull peak can reach overlay(assigned, 1.95)
-        // ≈ 1.95×assigned), not the raw `last.disk_bytes`.
-        let eff_min = overlay_size_limit_bytes(last.disk_bytes, DISK_HEADROOM_MIN);
-        let eff_max = overlay_size_limit_bytes(last.disk_bytes, DISK_HEADROOM_MAX)
+        let eff_min = overlay_size_limit_bytes(last_disk, DISK_HEADROOM_MIN);
+        let eff_max = overlay_size_limit_bytes(last_disk, DISK_HEADROOM_MAX)
             .saturating_add(KUBELET_QUOTA_BLOCK_SLACK);
-        if peak > eff_max {
-            count_refusal("disk");
-        } else {
-            let hard = reason.hard_disk() && peak >= eff_min / 2;
-            if reason.hard_disk() && !hard {
-                count_refusal("disk_full");
-            }
-            let target = (peak as f64 * if hard { 2.0 } else { 1.2 }) as u64;
-            let (promoted, at_cap) = set_dim(&mut floor.disk_bytes, target, ceil.max_disk);
-            if at_cap {
-                o.at_cap_axes.insert(Axis::Disk);
-            }
-            if promoted {
-                if hard {
-                    o.hard_promoted = true;
-                } else {
-                    o.soft_promoted = true;
-                }
-            }
-        }
+        observe_sizing_axis(
+            &mut floor.disk_bytes,
+            &mut o,
+            Axis::Disk,
+            peak,
+            eff_max,
+            eff_min / 2,
+            reason.hard_disk(),
+            ceil.max_disk,
+            ("disk", "disk_full"),
+        );
     }
 
     // ── deadline ───────────────────────────────────────────────────
@@ -426,7 +457,7 @@ pub fn observe_peaks(
     // `max(resolved, carried)` — a carried deadline at the cap reads
     // as `wall ≥ cap` and takes the counted at-cap arm).
     if matches!(reason, AttemptCloseReason::Timeout) {
-        match (peaks.wall, last.deadline_secs) {
+        match (peaks.wall, last_deadline) {
             (Some(wall), assigned) if assigned > 0 => {
                 let wall_s = wall.as_secs();
                 if wall_s >= u64::from(assigned) / 2 {
@@ -451,21 +482,25 @@ pub fn observe_peaks(
     // ── cores (sh-012, sh-031, sh-041) ─────────────────────────────
     // r[impl sched.floor.compute-bound-provisionable]
     // `cpu_util = cpu_seconds / (wall × assigned_cores) ≥ threshold`
-    // jumps cores to the partition-aware provisionable max. Fires on
-    // any non-success close (the sh-041 case: a compute-bound build
-    // interrupted by spot reclaim reports `WorkerAbort`); a saturated
-    // build that exits on its own internal timeout BEFORE the nix
-    // deadline corroborates (sh-031: the wall denominator, not the
-    // assigned-deadline budget). `min_wall` guards trivially-short
-    // saturated runs (the inverse-cost bound).
+    // jumps cores to the partition-aware provisionable max. Gated on
+    // [`AttemptCloseReason::hard_cores`] — the infra-side closes
+    // only (sh-041: a compute-bound build interrupted by spot
+    // reclaim reports `WorkerAbort`; sh-031: a saturated build that
+    // exits on its own internal timeout BEFORE the nix deadline
+    // reports `ExecutorVariant`). `min_wall` guards trivially-short
+    // saturated runs (the inverse-cost bound); `TRUST_BAND_CORES`
+    // refuses forged-HIGH `cpu_seconds`.
     if let (Some(cpu), Some(wall)) = (peaks.cpu_seconds, peaks.wall)
-        && last.cores > 0
+        && last_cores > 0
+        && reason.hard_cores()
     {
         let wall_s = wall.as_secs_f64();
         if wall_s >= cfg.compute_bound_min_wall_secs {
-            let cpu_util = cpu / (wall_s * f64::from(last.cores));
-            if cpu_util >= cfg.compute_bound_threshold {
-                let r = bump_cores_to_provisionable(&mut floor.cores, last.cores, prov_max_cores);
+            let cpu_util = cpu / (wall_s * f64::from(last_cores));
+            if cpu_util > TRUST_BAND_CORES {
+                count_refusal("cores");
+            } else if cpu_util >= cfg.compute_bound_threshold {
+                let r = bump_cores_to_provisionable(&mut floor.cores, last_cores, prov_max_cores);
                 if r.at_cap {
                     o.at_cap_axes.insert(Axis::Cores);
                 }
@@ -477,6 +512,48 @@ pub fn observe_peaks(
     }
 
     o
+}
+
+/// sh-041u r1: the ONE mem/disk band law — `ceiling` band refuses
+/// forged-HIGH (`count_refusal(hi)`, axis observes nothing); else a
+/// `hard_claim` with `peak < floor_band` degrades to soft
+/// (`count_refusal(lo)`); `target = peak × {2.0|1.2}` feeds
+/// [`set_dim`]; the `(promoted, at_cap, hard)` triple folds into `o`.
+/// Extracted so a band-law tweak (soft headroom, the `at_cap`/
+/// `promoted` fold) edits one body, not two — the mem and disk arms
+/// were byte-identical modulo their bands.
+#[allow(clippy::too_many_arguments)]
+fn observe_sizing_axis(
+    floor: &mut u64,
+    o: &mut FloorOutcome,
+    axis: Axis,
+    peak: u64,
+    ceiling: u64,
+    floor_band: u64,
+    hard_claim: bool,
+    cap: u64,
+    (refusal_hi, refusal_lo): (&'static str, &'static str),
+) {
+    if peak > ceiling {
+        count_refusal(refusal_hi);
+        return;
+    }
+    let hard = hard_claim && peak >= floor_band;
+    if hard_claim && !hard {
+        count_refusal(refusal_lo);
+    }
+    let target = (peak as f64 * if hard { 2.0 } else { 1.2 }) as u64;
+    let (promoted, at_cap) = set_dim(floor, target, cap);
+    if at_cap {
+        o.at_cap_axes.insert(axis);
+    }
+    if promoted {
+        if hard {
+            o.hard_promoted = true;
+        } else {
+            o.soft_promoted = true;
+        }
+    }
 }
 
 fn count_refusal(class: &'static str) {
@@ -660,11 +737,19 @@ pub(super) fn clamp_floor_to_live(f: &mut crate::state::ResourceFloor, ceil: &Ce
 
 /// sh-041u: the canonical per-dimension body — `floor =
 /// max(floor, target).min(cap)`. The ×2 doubling lives in `headroom`
-/// alone (the retired `bump_dim` ×2 body is REPLACED, not reused).
-/// Returns `(promoted, at_cap)`: `promoted` iff the floor strictly
-/// grew; `at_cap` iff `target ≥ cap` (so a `target` already at cap
-/// reads as at-cap on the same observation, not the next one — a
-/// hard-event peak at the dispatched ceiling is "no growth possible").
+/// alone (the retired per-axis ×2 body is REPLACED, not reused).
+/// Returns `(promoted, at_cap)` — DISJOINT by construction (the
+/// kernel's `FloorOutcomeView` doc and the `decide()` fold at
+/// `rio-retry-kernel/lib.rs` `ControllerTermination` arm /
+/// `decide_requeue_within_caps` predicate both rely on it):
+/// `at_cap` iff `target ≥ cap` (no further growth possible — a
+/// hard-event peak at the dispatched ceiling reads as at-cap on the
+/// same observation, not the next one); `promoted` iff the floor
+/// strictly grew AND `target < cap`. A grow-to-cap clip
+/// (`floor < cap ≤ target`) is `at_cap`, not `promoted` — the next
+/// dispatch shape cannot exceed `cap`, so granting promotion-exempt
+/// would re-create the I-199 over-broad heuristic on an attempt
+/// whose retry has nowhere larger to go.
 ///
 /// merged_bug_016: callers pass the SOLVE-domain mem cap
 /// ([`mem_solve_cap`]) so an at-cap floor renders a hostable
@@ -672,7 +757,8 @@ pub(super) fn clamp_floor_to_live(f: &mut crate::state::ResourceFloor, ceil: &Ce
 fn set_dim(floor: &mut u64, target: u64, cap: u64) -> (bool, bool) {
     let old = *floor;
     *floor = old.max(target).min(cap);
-    (*floor > old, target >= cap)
+    let at_cap = target >= cap;
+    (*floor > old && !at_cap, at_cap)
 }
 
 struct CoresOutcome {
@@ -931,7 +1017,7 @@ mod tests {
             );
             (o, s.sched.resource_floor.disk_bytes)
         };
-        for assigned in [gi, 2 * gi, 3 * gi, 100 * gi] {
+        for assigned in [gi, 2 * gi, 3 * gi, 40 * gi] {
             // Every kubelet-mintable headroom (curve extremes + flat
             // fallback) under DiskFull → hard 2.0×.
             for h in [DISK_HEADROOM_MIN, 1.5, DISK_HEADROOM_MAX] {
@@ -1213,8 +1299,9 @@ mod tests {
             AttemptCloseReason::Infra(rio_proto::types::FailureClass::CgroupOom),
         );
         assert!(
-            o.at_cap_axes.contains(Axis::Mem),
-            "dispatched at ceiling ⇒ no growth possible; got {o:?}"
+            o.at_cap_axes.contains(Axis::Mem) && !o.hard_promoted,
+            "dispatched at ceiling ⇒ no growth possible; at_cap and \
+             promoted are DISJOINT (sh-041u r1); got {o:?}"
         );
         assert_eq!(
             s.sched.resource_floor.mem_bytes,
@@ -1467,6 +1554,117 @@ mod tests {
             );
         }
         assert_eq!(s.retry.infra_count, 0);
+    }
+
+    // r[verify sched.retry.promotion-exempt+4]
+    /// sh-041u r1: [`set_dim`] returns DISJOINT `(promoted, at_cap)` —
+    /// the kernel's `FloorOutcomeView` doc and the `decide()` fold's
+    /// `ControllerTermination` / `decide_requeue_within_caps` arms
+    /// rely on it. A grow-to-cap clip is `at_cap`, NOT `promoted`.
+    #[test]
+    fn set_dim_at_cap_semantics() {
+        // (floor, target, cap) → (new_floor, promoted, at_cap)
+        for (mut f, target, cap, want_f, want_p, want_a) in [
+            (0u64, 8, 100, 8, true, false),    // plain grow
+            (8, 4, 100, 8, false, false),      // no-op (target < floor)
+            (0, 200, 100, 100, false, true),   // grow-to-cap clip: at_cap wins
+            (100, 200, 100, 100, false, true), // already at cap
+            (400, 200, 100, 100, false, true), // stale-above heals down
+            (50, 100, 100, 100, false, true),  // target == cap: at_cap
+            (0, 0, 100, 0, false, false),      // zero target
+        ] {
+            let (p, a) = set_dim(&mut f, target, cap);
+            assert_eq!(
+                (f, p, a),
+                (want_f, want_p, want_a),
+                "set_dim({target}, {cap})"
+            );
+            assert!(!(p && a), "promoted ∧ at_cap MUST be disjoint");
+        }
+    }
+
+    // r[verify sched.trust.report-corroboration+5]
+    /// sh-041u r1 — *proposition: a derivation-intrinsic `Other` close
+    /// (E3b NotDeterministic / InputRejected / …) with a saturated
+    /// `cpu_util` does NOT hard-promote cores.* RED at 7c5d6799b: the
+    /// reason-ungated cores arm jumped to `prov_max`, persisted via
+    /// M_044, then `handle_permanent_failure` poisoned — the I-199
+    /// over-fire on the cores axis.
+    #[test]
+    fn cores_hard_promote_gated_on_reason() {
+        let mut s = st();
+        s.sched.last_intent = Some(intent(0, 0, 4, 0));
+        let saturated = ObservedPeaks {
+            cpu_seconds: Some(2280.0),
+            wall: Some(Duration::from_secs(600)),
+            ..Default::default()
+        };
+        for r in [
+            AttemptCloseReason::Other,
+            AttemptCloseReason::Timeout,
+            AttemptCloseReason::Infra(rio_proto::types::FailureClass::CgroupOom),
+        ] {
+            let mut s2 = s.clone();
+            let o = observe(&mut s2, saturated, r);
+            assert!(
+                !o.hard_promoted && s2.sched.resource_floor.cores == 0,
+                "{r:?} is not hard_cores(): cores untouched (got {o:?}, \
+                 cores={})",
+                s2.sched.resource_floor.cores
+            );
+        }
+        // ExecutorVariant / WorkerAbort ARE hard_cores().
+        for r in [
+            AttemptCloseReason::ExecutorVariant,
+            AttemptCloseReason::WorkerAbort,
+        ] {
+            let mut s2 = s.clone();
+            let o = observe(&mut s2, saturated, r);
+            assert!(
+                o.hard_promoted && s2.sched.resource_floor.cores == PROV_MAX,
+                "{r:?}"
+            );
+        }
+    }
+
+    // r[verify sched.executor.input-bounds+2]
+    /// sh-041u r1 — *proposition: a forged-HIGH `cpu_seconds` (∞,
+    /// NaN, or any `cpu_util > TRUST_BAND_CORES`) refuses on the
+    /// cores axis — never `hard_promoted`, never M_044-persists.*
+    #[test]
+    fn cores_trust_band_refuses_forged_cpu_seconds() {
+        let probe = |cpu: f64| -> (FloorOutcome, u32) {
+            let mut s = st();
+            s.sched.last_intent = Some(intent(0, 0, 4, 600));
+            let o = observe(
+                &mut s,
+                ObservedPeaks {
+                    cpu_seconds: Some(cpu),
+                    wall: Some(Duration::from_secs(600)),
+                    ..Default::default()
+                },
+                AttemptCloseReason::ExecutorVariant,
+            );
+            (o, s.sched.resource_floor.cores)
+        };
+        // ∞ / NaN: refused at intake (`from_report` filters
+        // non-finite); a direct ObservedPeaks bypass still refuses
+        // via the band (∞ / x = ∞ > 1.05).
+        for cpu in [f64::INFINITY, 1e18, 600.0 * 4.0 * 1.5] {
+            let (o, cores) = probe(cpu);
+            assert!(
+                !o.hard_promoted && cores == 0,
+                "cpu_seconds={cpu}: forged-HIGH cpu_util refused"
+            );
+        }
+        // `from_report` drops non-finite at the intake filter.
+        let p = ObservedPeaks::from_report(0, Some(f64::INFINITY), None);
+        assert!(p.cpu_seconds.is_none());
+        let p = ObservedPeaks::from_report(0, Some(f64::NAN), None);
+        assert!(p.cpu_seconds.is_none());
+        // Honest band edge (cpu_util = 1.0): corroborates.
+        let (o, cores) = probe(600.0 * 4.0);
+        assert!(o.hard_promoted && cores == PROV_MAX);
     }
 
     /// sh-041u: success statuses return `None` from

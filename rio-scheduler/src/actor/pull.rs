@@ -2074,11 +2074,6 @@ impl DagActor {
                     // max, and #2's per-handler `floor_at_cap` stamp
                     // narrows by axis, so the redundant observe is
                     // harmless.
-                    let attempt_open = self
-                        .dag
-                        .node(&drv_hash)
-                        .and_then(|s| s.running_since)
-                        .map(|since| since.elapsed());
                     let peaks = super::floor::ObservedPeaks::from_report(
                         payload.peak_memory_bytes,
                         payload
@@ -2089,7 +2084,6 @@ impl DagActor {
                             .final_resources
                             .as_ref()
                             .and_then(|r| r.peak_disk_bytes),
-                        attempt_open,
                     );
                     let _ = self
                         .observe_resource_floor(
@@ -2363,15 +2357,8 @@ impl DagActor {
         // witnessed arm runs; `observe_resource_floor_caller_census`
         // files this row). Sits AFTER the `if !won { return }` guard —
         // the won flag remains the once-per-attempt cap (live_058-b).
-        if let Some(reason) = super::floor::witnessed_disposition(witnessed_reason)
-            && let Some(last) = self
-                .dag
-                .node(&drv_hash)
-                .and_then(|s| s.sched.last_intent.as_ref())
-        {
-            let peaks = super::floor::ObservedPeaks::witnessed(last, &reason);
-            let _ = self.observe_resource_floor(&drv_hash, peaks, reason).await;
-        }
+        self.observe_witnessed_floor(&drv_hash, witnessed_reason)
+            .await;
         metrics::histogram!(
             "rio_scheduler_attempt_requeue_seconds",
             "cause" => "establishment"

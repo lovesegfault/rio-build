@@ -1185,19 +1185,32 @@ mod registration_writer_census {
     fn observe_resource_floor_caller_census() {
         let hits = census(&[".observe_resource", "_floor("]);
         let expected: BTreeMap<String, usize> = [
-            // sh-041u: 1 = chokepoint #2 (the dispatch chokepoint
+            // sh-041u: 2 = chokepoint #2 (the dispatch chokepoint
             // before `match status` — every non-success worker close
-            // observes once; the per-handler axis mints collapsed).
-            ("actor/completion.rs".to_string(), 1),
-            ("actor/housekeeping.rs".to_string(), 1),
-            // 2 = chokepoint #3 (AD5 worker-abort short-circuit) +
-            // chokepoint #4 (`establish_from_witnessed` — the
-            // synchronous witnessed-clock establishment).
-            ("actor/pull.rs".to_string(), 2),
+            // observes once; the per-handler axis mints collapsed) +
+            // the chokepoint-#4 wrapper `observe_witnessed_floor`'s
+            // own forwarding call.
+            ("actor/completion.rs".to_string(), 2),
+            // 1 = chokepoint #3 (AD5 worker-abort short-circuit).
+            // Chokepoint #4 (`establish_from_witnessed` + the
+            // establishment sweep) routes through
+            // `observe_witnessed_floor` — the witnessed disposition
+            // table + `last_intent` synthesis live in ONE body.
+            ("actor/pull.rs".to_string(), 1),
         ]
         .into();
         assert_census(&hits, &expected, "observe_resource_floor callers")
             .expect("the floor-observe caller alphabet is census-pinned");
+        // The chokepoint-#4 wrapper itself: exactly the two
+        // establishment-witnessed callers.
+        let witnessed = census(&[".observe_witnessed", "_floor("]);
+        let expected: BTreeMap<String, usize> = [
+            ("actor/housekeeping.rs".to_string(), 1),
+            ("actor/pull.rs".to_string(), 1),
+        ]
+        .into();
+        assert_census(&witnessed, &expected, "observe_witnessed_floor callers")
+            .expect("the witnessed-floor caller alphabet is census-pinned");
     }
 
     // r[verify sched.trust.report-corroboration+5]

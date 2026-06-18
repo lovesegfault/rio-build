@@ -1029,7 +1029,6 @@ rio-scheduler/src/actor/command.rs	/// request itself can never succeed as posed
 rio-scheduler/src/actor/completion.rs	// CA-shaped late reports reach the SAME gated
 rio-scheduler/src/actor/completion.rs	// Cascade: parents of a terminally-failed derivation can never
 rio-scheduler/src/actor/completion.rs	// I-127: "concurrent PutPath" is NEVER counted toward the
-rio-scheduler/src/actor/completion.rs	// I-199: bump resource_floor ONLY on the worker-reported
 rio-scheduler/src/actor/completion.rs	// SAME durable row identity resolves from).
 rio-scheduler/src/actor/completion.rs	// Verified = candidates where ALL prior outputs are present.
 rio-scheduler/src/actor/completion.rs	// can never lower a promoted dimension.

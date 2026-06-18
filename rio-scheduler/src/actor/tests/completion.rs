@@ -1742,10 +1742,12 @@ async fn test_disk_full_report_doubles_disk_floor() -> TestResult {
 }
 
 /// W10-CO (the suppression parity product): {oom, disk} ×
-/// {believed-store, plain}. bug_408's believed-store gate applies
-/// IDENTICALLY to both sizing letters — a store-degraded failure is
-/// never a sizing signal, on either axis; an uncorroborated/plain
-/// report bumps its own dimension and only its own.
+/// {believed-store, plain}. sh-041u: chokepoint #2 observes peaks
+/// BEFORE the store-degraded disposition — a typed CgroupOom/DiskFull
+/// peak is a sizing signal regardless of attribution; the bug_408 law
+/// governs the CHARGE classification only (Paced → uncharged
+/// `StoreDegraded`). All four cells observe their own dimension and
+/// only their own.
 #[rstest]
 #[case::oom_plain(true, false)]
 #[case::oom_believed(true, true)]
@@ -1810,12 +1812,13 @@ async fn test_floor_bump_store_suppression_parity(
         s.sched.resource_floor.disk_bytes,
     );
     // sh-041u: the floor observe runs at chokepoint #2 BEFORE the
-    // believed-store disposition — peaks are evidence regardless of
+    // store-degraded disposition — peaks are evidence regardless of
     // attribution (a real CgroupOom is a sizing signal even if the
     // store breaker also tripped). The bug_408 law now governs the
     // CHARGE classification only (Paced → uncharged StoreDegraded);
-    // it no longer suppresses the observe.
-    let _ = believed_store;
+    // it no longer suppresses the observe. `believed_store` matters
+    // for the corroboration leg above only — both cells assert
+    // identical floor outcomes.
     if oom {
         assert!(mem > 0, "OOM observes the mem dimension; got {mem}");
         assert_eq!(disk, 0, "…and ONLY the mem dimension");
@@ -4902,7 +4905,7 @@ fn failure_ctx_store_evidence_only_on_infra_arm() {
         S::Cancelled,
         S::Unspecified,
     ] {
-        let ctx = crate::actor::completion::failure_ctx_for(status, &flagged, Some(7), 0);
+        let ctx = crate::actor::completion::failure_ctx_for(status, &flagged, Some(7));
         assert_eq!(
             ctx.store_degraded(),
             status == S::InfrastructureFailure,
@@ -5352,8 +5355,6 @@ async fn store_degraded_counter_ticks_only_on_commit() -> TestResult {
                 None,
                 "FUSE EIO: store unreachable",
                 true,
-                None,
-                0,
             ),
             crate::actor::floor::FloorOutcome::default(),
         )
@@ -5382,8 +5383,6 @@ async fn store_degraded_counter_ticks_only_on_commit() -> TestResult {
                 None,
                 "FUSE EIO: store unreachable",
                 true,
-                None,
-                0,
             ),
             crate::actor::floor::FloorOutcome::default(),
         )

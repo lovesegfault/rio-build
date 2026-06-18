@@ -48,8 +48,6 @@ impl<'a> FailureReportCtx<'a> {
         final_line_count: Option<i64>,
         error_msg: &'a str,
         store_degraded: bool,
-        _classification: Option<&rio_proto::types::FailureClassification>,
-        _peak_memory_bytes: u64,
     ) -> Self {
         Self {
             final_line_count,

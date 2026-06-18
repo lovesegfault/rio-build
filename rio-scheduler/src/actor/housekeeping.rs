@@ -1867,20 +1867,12 @@ impl DagActor {
             // is classify-only (`None` — establish + requeue only).
             // Sits AFTER the `if !won { return }` guard above — the
             // won flag remains the once-per-attempt cap (live_058-b).
-            if let Some(reason) = super::floor::witnessed_disposition(mark.reason)
-                && let Some(last) = self
-                    .dag
-                    .node(&drv_hash)
-                    .and_then(|s| s.sched.last_intent.as_ref())
-            {
-                // The establishment charge was already decided
-                // (append+decide above): the observe is sizing
-                // evidence for the NEXT dispatch, not a retry-budget
-                // exemption — FloorOutcome drives the worker-reported
-                // arms' counter logic, which has no analogue here.
-                let peaks = super::floor::ObservedPeaks::witnessed(last, &reason);
-                let _ = self.observe_resource_floor(&drv_hash, peaks, reason).await;
-            }
+            // The establishment charge was already decided
+            // (append+decide above): the observe is sizing evidence
+            // for the NEXT dispatch, not a retry-budget exemption —
+            // FloorOutcome drives the worker-reported arms' counter
+            // logic, which has no analogue here.
+            self.observe_witnessed_floor(&drv_hash, mark.reason).await;
         }
         // OA1 interval, establishment cause: attempt opened → established.
         metrics::histogram!(
