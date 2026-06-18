@@ -1713,7 +1713,7 @@ rio-scheduler/src/tests.rs	// rejection tests above are testing ONLY their mutat
 rio-scheduler/src/tests.rs	/// Spin up a tonic server with ONLY the health service on an
 rio-store/src/admission.rs	/// series can never freeze at an acquire-time value (bug_245: the
 rio-store/src/authz.rs	//  (b) the SigVisibility rows' composed cells are LAYER-ONLY in
-rio-store/src/authz.rs	// Totality: 25 methods × (5 bootable × 5 presented) verdict
+rio-store/src/authz.rs	// Totality: 35 methods × (5 bootable × 5 presented) verdict
 rio-store/src/authz.rs	// store.authz.key-coherence) — NEVER from decide(). Editing it is
 rio-store/src/authz.rs	/// handler's dev-mode passthrough made ANY tenant a cluster
 rio-store/src/backend/mod.rs	// No .tmp files anywhere in chunks/ab/.

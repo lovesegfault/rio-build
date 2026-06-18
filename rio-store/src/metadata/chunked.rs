@@ -969,7 +969,7 @@ mod tests {
     /// and touch `last_referenced_at` on a row it is about to
     /// re-upload — without that, a retry of a swept upload re-PUTs the
     /// S3 object but leaves the row `deleted = TRUE`, so the
-    /// commit-time presence check can never pass and the upload
+    /// commit-time presence check cannot pass and the upload
     /// livelocks. A row already referenced by another manifest is also
     /// touched (harmless under mark-and-sweep — the next mark phase
     /// re-derives liveness from `manifest_data`, and the touch keeps
