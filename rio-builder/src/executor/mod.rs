@@ -169,7 +169,12 @@ pub const DEFAULT_DAEMON_TIMEOUT: Duration =
 /// anyhow::Result anywhere in execute_build silently becomes the wrong
 /// variant. Typed sources make the compiler catch misattribution at
 /// the `?` site.
-#[derive(Debug, thiserror::Error)]
+///
+/// `IntoStaticStr` generates the discriminant-name `&'static str` the
+/// banner footer's `failed (executor: <variant>)` summary uses
+/// (`<&str>::from(&e)`); the full error chain is on
+/// `CompletionReport.error_msg`.
+#[derive(Debug, thiserror::Error, strum::IntoStaticStr)]
 pub enum ExecutorError {
     /// Overlayfs setup failed (mount, upper/work dir creation).
     #[error("overlay setup failed: {0}")]
@@ -270,33 +275,6 @@ pub enum ExecutorError {
 }
 
 impl ExecutorError {
-    /// Discriminant name only — for the banner footer's one-line
-    /// `failed (executor: <variant>)` summary. The full error chain is
-    /// on `CompletionReport.error_msg`; this answers "which lane" at a
-    /// glance without leaking the (possibly long) inner Display.
-    pub fn variant_name(&self) -> &'static str {
-        match self {
-            Self::Overlay(_) => "Overlay",
-            Self::OverlayTaskPanic(_) => "OverlayTaskPanic",
-            Self::SynthDb(_) => "SynthDb",
-            Self::NixConf(_) => "NixConf",
-            Self::DaemonSpawn(_) => "DaemonSpawn",
-            Self::Handshake(_) => "Handshake",
-            Self::DaemonSetup(_) => "DaemonSetup",
-            Self::BuildFailed(_) => "BuildFailed",
-            Self::InvalidDerivation(_) => "InvalidDerivation",
-            Self::Upload(_) => "Upload",
-            Self::Grpc(_) => "Grpc",
-            Self::MetadataFetch { .. } => "MetadataFetch",
-            Self::Wire(_) => "Wire",
-            Self::Cgroup(_) => "Cgroup",
-            Self::CgroupOom => "CgroupOom",
-            Self::DiskFull => "DiskFull",
-            Self::WrongKind { .. } => "WrongKind",
-            Self::Cancelled => "Cancelled",
-        }
-    }
-
     /// Whether this error indicates a transient daemon-side failure
     /// worth retrying locally before reporting to the scheduler.
     ///
@@ -853,7 +831,7 @@ pub async fn execute_build(
             .record(build_start.elapsed().as_secs_f64());
     });
 
-    // r[impl obs.log.worker-header]
+    // r[impl obs.log.worker-header+2]
     // Banner header — the first thing in the build log, ahead of any
     // build output. Sent directly on the per-build log-upload channel
     // (not through `LogBatcher` — that's created inside
@@ -1102,7 +1080,7 @@ pub async fn execute_build(
         ),
     };
 
-    // r[impl obs.log.worker-header]
+    // r[impl obs.log.worker-header+2]
     // Footer result string — computed BEFORE `collect_outputs` consumes
     // `build_result` below so the eventual footer carries the build
     // process's OWN result (`ok` even when upload fails afterward;
@@ -2110,7 +2088,7 @@ fn footer_result_str(
         // The full error string is on `CompletionReport.error_msg`;
         // the footer is a one-line summary — discriminant only so a
         // human reading the tail knows which lane (sh-038).
-        Err(e) => format!("failed (executor: {})", e.variant_name()),
+        Err(e) => format!("failed (executor: {})", <&str>::from(e)),
     }
 }
 

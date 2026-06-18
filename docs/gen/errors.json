@@ -1457,7 +1457,7 @@
     {
       "name": "ExecutorError",
       "crate": "rio-builder",
-      "doc": "Error type for executor operations. No `#[from] anyhow::Error` — every variant has a typed source. A catch-all `#[from] anyhow::Error` would mean any `?` on an anyhow::Result anywhere in execute_build silently becomes the wrong variant. Typed sources make the compiler catch misattribution at the `?` site."
+      "doc": "Error type for executor operations. No `#[from] anyhow::Error` — every variant has a typed source. A catch-all `#[from] anyhow::Error` would mean any `?` on an anyhow::Result anywhere in execute_build silently becomes the wrong variant. Typed sources make the compiler catch misattribution at the `?` site. `IntoStaticStr` generates the discriminant-name `&'static str` the banner footer's `failed (executor: <variant>)` summary uses (`<&str>::from(&e)`); the full error chain is on `CompletionReport.error_msg`."
     },
     {
       "name": "OverlayError",

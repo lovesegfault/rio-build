@@ -17,7 +17,7 @@
 //! debugging question ("why was my build slow") without leaking
 //! ephemeral pod identity to anyone reading the stored log.
 //!
-//! r[impl obs.log.worker-header]
+//! r[impl obs.log.worker-header+2]
 
 use std::time::Duration;
 
@@ -109,7 +109,12 @@ fn fmt_size(b: Option<u64>) -> String {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct FooterPeaks {
     /// cgroup `memory.peak` (kernel-tracked tree-wide lifetime max).
-    pub mem_bytes: u64,
+    /// `None` = cgroup never populated (pre-cgroup error path) — the
+    /// footer renders `mem=? GiB` per the same absent-field discipline
+    /// as the header. A `u64` field would encode "never measured" as
+    /// `0` and the footer would claim a measured zero; the header path
+    /// already threads `Option<u64>` for the same reason.
+    pub mem_bytes: Option<u64>,
     /// Peak instantaneous CPU (cores-equivalent), 1Hz-polled.
     pub cpu_cores: f64,
     /// prjquota `dqb_curspace` running max. `None` = no prjquota.
@@ -169,16 +174,31 @@ pub(crate) fn footer_lines(
     duration: Duration,
     peaks: FooterPeaks,
 ) -> Vec<Vec<u8>> {
+    // The `fmt_size` law (present non-zero never renders as zero at
+    // any unit) applies to the CPU fields too: floor `cpu_util` at 1%
+    // and `cpu` at 0.1c when the underlying value is positive, so an
+    // I/O-bound build's 0.42% util doesn't render `cpu_util=0%` and a
+    // 0.04-core sample doesn't render `cpu=0.0c`. A genuine zero (no
+    // sample) stays `0.0c` / omitted-util — the floor is the
+    // present-nonzero arm only.
     let util = peaks
         .cpu_util(duration)
-        .map(|u| format!(" cpu_util={:.0}%", u * 100.0))
+        .map(|u| {
+            let pct = u * 100.0;
+            let pct = if pct > 0.0 { pct.max(1.0) } else { pct };
+            format!(" cpu_util={pct:.0}%")
+        })
         .unwrap_or_default();
+    let cpu = if peaks.cpu_cores > 0.0 {
+        peaks.cpu_cores.max(0.1)
+    } else {
+        peaks.cpu_cores
+    };
     vec![
         format!("rio: exec     {exec_id}").into_bytes(),
         format!(
-            "rio: peaks    cpu={:.1}c mem={} disk={} wall={}s{util}",
-            peaks.cpu_cores,
-            fmt_size(Some(peaks.mem_bytes)),
+            "rio: peaks    cpu={cpu:.1}c mem={} disk={} wall={}s{util}",
+            fmt_size(peaks.mem_bytes),
             fmt_size(peaks.disk_bytes),
             duration.as_secs(),
         )
@@ -223,7 +243,7 @@ fn format_rfc3339_secs(t: std::time::SystemTime) -> String {
     .to_string()
 }
 
-// r[verify obs.log.worker-header]
+// r[verify obs.log.worker-header+2]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,7 +457,7 @@ mod tests {
             "ok",
             Duration::from_secs(263),
             FooterPeaks {
-                mem_bytes: 2 << 30,
+                mem_bytes: Some(2 << 30),
                 cpu_cores: 3.84,
                 disk_bytes: Some(12 << 30),
                 cpu_seconds_total: None,
@@ -460,7 +480,7 @@ mod tests {
             "ok",
             Duration::from_secs(1),
             FooterPeaks {
-                mem_bytes: 69 << 20,
+                mem_bytes: Some(69 << 20),
                 cpu_cores: 0.5,
                 disk_bytes: None,
                 cpu_seconds_total: None,
@@ -476,6 +496,54 @@ mod tests {
             !peaks.contains("cpu_util"),
             "cpu_util omitted when inputs absent: {peaks}"
         );
+        // Absent mem (pre-cgroup error path — `ExecuteOutcome
+        // ::pre_cgroup`): renders `mem=? GiB`, NOT `mem=0 B`. The
+        // retry-loop scenario: attempt 0 ran a daemon (so a footer is
+        // sent), final attempt fails `DaemonSpawn` → `pre_cgroup()` →
+        // peak_memory_bytes 0. Rendering `0 B` reads as "measured zero"
+        // — the live_058-d misdiagnosis class.
+        let lines = footer_lines("x", "ok", Duration::from_secs(1), FooterPeaks::default());
+        let peaks = str::from_utf8(&lines[1]).unwrap();
+        assert!(
+            peaks.contains("mem=? GiB"),
+            "absent mem must render '? GiB', not '0 B': {peaks}"
+        );
+    }
+
+    /// sh-007f: the `fmt_size` law (present non-zero never renders as
+    /// zero) applies to the footer's CPU fields too — `{:.0}%` would
+    /// render 0.42% util as `cpu_util=0%`, `{:.1}c` would render a
+    /// 0.04-core sample as `cpu=0.0c`. Floor at 1% / 0.1c for present
+    /// non-zero values; genuine zero (no cgroup sample) stays `0.0c`.
+    #[test]
+    fn footer_cpu_fields_floor_present_nonzero() {
+        // I/O-bound: cpu_seconds_total=2.0, 8 cores, 60s wall →
+        // util≈0.42% → floors to 1%, not 0%.
+        let lines = footer_lines(
+            "x",
+            "ok",
+            Duration::from_secs(60),
+            FooterPeaks {
+                mem_bytes: None,
+                cpu_cores: 0.04,
+                disk_bytes: None,
+                cpu_seconds_total: Some(2.0),
+                assigned_cores: Some(8),
+            },
+        );
+        let peaks = str::from_utf8(&lines[1]).unwrap();
+        assert!(
+            peaks.contains("cpu_util=1%"),
+            "present non-zero util must floor at 1%, not render 0%: {peaks}"
+        );
+        assert!(
+            peaks.contains("cpu=0.1c"),
+            "present non-zero peak cores must floor at 0.1c, not render 0.0c: {peaks}"
+        );
+        // Genuine zero (default — no sample) stays 0.0c.
+        let lines = footer_lines("x", "ok", Duration::from_secs(1), FooterPeaks::default());
+        let peaks = str::from_utf8(&lines[1]).unwrap();
+        assert!(peaks.contains("cpu=0.0c"), "{peaks}");
     }
 
     /// sh-038 Tier 2: `cpu_util = cpu_seconds_total / (wall ×
@@ -492,7 +560,7 @@ mod tests {
             "ok",
             Duration::from_secs(263),
             FooterPeaks {
-                mem_bytes: 0,
+                mem_bytes: None,
                 cpu_cores: 3.8,
                 disk_bytes: None,
                 cpu_seconds_total: Some(999.4),

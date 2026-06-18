@@ -19467,6 +19467,10 @@
           "packageId": "sqlx"
         },
         {
+          "name": "strum",
+          "packageId": "strum"
+        },
+        {
           "name": "thiserror",
           "packageId": "thiserror"
         },

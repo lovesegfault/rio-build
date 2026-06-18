@@ -184,7 +184,7 @@ async fn wrong_kind_gate_ignores_lying_scheduler_flag_builder() {
 /// pre-daemon block. The header send is BEFORE that check
 /// (executor/mod.rs ~545); the failure happens AFTER (~575); the
 /// channel observes exactly the header-or-nothing.
-// r[verify obs.log.worker-header]
+// r[verify obs.log.worker-header+2]
 #[tokio::test]
 async fn banner_header_gated_on_first_attempt() {
     let dir = tempfile::tempdir().unwrap();
@@ -252,7 +252,7 @@ async fn banner_header_gated_on_first_attempt() {
 /// first-attempt (`first_line == 0`) and retry (`first_line > 0`)
 /// because these errors are not daemon-transient: the runtime won't
 /// retry them, but the contract is on `pre_cgroup` regardless.
-// r[verify obs.log.worker-header]
+// r[verify obs.log.worker-header+2]
 #[tokio::test]
 async fn pre_header_error_carries_caller_offset() {
     let dir = tempfile::tempdir().unwrap();

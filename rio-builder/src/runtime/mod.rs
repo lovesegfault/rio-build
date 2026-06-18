@@ -604,7 +604,7 @@ pub async fn spawn_build_task(
             footer_result: _, // tracked across attempts as `last_footer_result`
         } = outcome;
 
-        // r[impl obs.log.worker-header]
+        // r[impl obs.log.worker-header+2]
         // Banner footer — ONE per assignment, after the retry loop.
         // Carries the most recent daemon-running attempt's outcome
         // (`last_footer_result`), not the post-daemon collect/teardown
@@ -639,7 +639,12 @@ pub async fn spawn_build_task(
                 footer_result,
                 assignment_start.elapsed(),
                 crate::banner::FooterPeaks {
-                    mem_bytes: peak_memory_bytes,
+                    // `ExecuteOutcome.peak_memory_bytes` is `0` only on
+                    // the pre-cgroup error path (its field doc says so;
+                    // a populated cgroup's `memory.peak` is never 0).
+                    // Thread that as `None` so the footer renders
+                    // `mem=? GiB` instead of claiming a measured `0 B`.
+                    mem_bytes: (peak_memory_bytes != 0).then_some(peak_memory_bytes),
                     cpu_cores: peak_cpu_cores,
                     disk_bytes: peak_disk_bytes,
                     cpu_seconds_total,

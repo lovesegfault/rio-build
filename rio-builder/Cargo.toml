@@ -48,6 +48,9 @@ tracing = { workspace = true }
 metrics = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+# IntoStaticStr on ExecutorError — discriminant name for the banner
+# footer's `failed (executor: <variant>)` summary.
+strum = { workspace = true }
 tokio-stream = { workspace = true }
 futures-util = { workspace = true }
 # /healthz + /readyz HTTP endpoints. Worker has no gRPC server
