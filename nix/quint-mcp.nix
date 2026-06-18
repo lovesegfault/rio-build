@@ -45,7 +45,7 @@
 let
   kitRev = "520e563613c25abac4c631ea2aa3181ba76ba193";
   kitSrc = fetchFromGitHub {
-    owner = "informalsystems";
+    owner = "quint-co";
     repo = "quint-llm-kit";
     rev = kitRev;
     hash = "sha256-aFgG23IHCKYSMgtxcEthf1bSRm09SSM9776sldX8JFg=";
@@ -156,7 +156,7 @@ let
 
     meta = {
       description = "MCP server over the quint-llm-kit knowledge base (offline build: vendored embedding model + indices)";
-      homepage = "https://github.com/informalsystems/quint-llm-kit";
+      homepage = "https://github.com/quint-co/quint-llm-kit";
       license = lib.licenses.mit;
       mainProgram = "quint-kb-mcp";
     };
