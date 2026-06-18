@@ -1573,7 +1573,6 @@ pub(crate) mod tests {
             std::slice::from_ref(&n_only),
             &CellSketches::default(),
             &bound,
-            0,
             any_admit,
         );
         assert!(
@@ -2329,7 +2328,6 @@ pub(crate) mod tests {
             &sketches,
             &bound,
             &HashSet::new(),
-            0,
             u64::MAX, // capacity-unbounded: this test pins yielding, not the window
             0,
             &WindowMintability::permissive(),
@@ -2411,7 +2409,6 @@ pub(crate) mod tests {
                 &sketches,
                 &bound,
                 &HashSet::new(),
-                0,
                 u64::MAX,
                 0,
                 &WindowMintability::permissive(),
@@ -2531,7 +2528,6 @@ pub(crate) mod tests {
             &sketches,
             &bound,
             &job_held,
-            0,
             8,
             0,
             &WindowMintability::permissive(),
@@ -2668,7 +2664,7 @@ pub(crate) mod tests {
                 .collect()
         };
         // Full set (the pre-window truth).
-        let (_, full_unplaced) = simulate(&intents, &live, &sketches, &bound, 0, any_admit);
+        let (_, full_unplaced) = simulate(&intents, &live, &sketches, &bound, any_admit);
         let full_mint = mint(&full_unplaced);
         // Windowed at the capacity-derived bound (live free = 0).
         let window = sim_window_cores(0, u64::from(budget));
@@ -2681,7 +2677,6 @@ pub(crate) mod tests {
             &sketches,
             &bound,
             &HashSet::new(),
-            0,
             window,
             0,
             &WindowMintability::permissive(),

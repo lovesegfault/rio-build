@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use rio_proto::validated::ValidatedPathInfo;
+use tracing::warn;
 
 /// PG NOTIFY channel for placeholder terminal events (live_055(b)).
 ///

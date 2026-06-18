@@ -446,7 +446,7 @@ scopeguard = "1"
 # merged_bug_021): the retention-truth corpus is cut by AST —
 # cfg(test) items pruned, comments dropped by construction — never by
 # line regex over raw source ("parse, don't grep").
-syn = { version = "2", features = ["full", "visit-mut"] }
+syn = { version = "2", features = ["full", "visit", "visit-mut"] }
 quote = "1"
 proc-macro2 = "1"
 

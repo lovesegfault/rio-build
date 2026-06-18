@@ -180,7 +180,12 @@ pub enum ExecutorError {
     /// (missing or corrupt NAR index). Store-state, not
     /// derivation-intrinsic — `InfrastructureFailure`.
     #[error("castore root resolution failed for {path}: {reason}")]
-    InputRoots { path: String, reason: String },
+    InputRoots {
+        /// The closure store path whose castore root failed to resolve.
+        path: String,
+        /// The store-side failure detail.
+        reason: String,
+    },
     /// Synthetic Nix store SQLite generation failed.
     #[error("synthetic DB generation failed: {0}")]
     SynthDb(#[from] sqlx::Error),
@@ -377,6 +382,7 @@ impl ExecutorError {
             W::Io(_) => DecodeProvenance::WorkerLocal,
             W::StringTooLong(_) => DecodeProvenance::WorkerLocal,
             W::CollectionTooLarge(_) => DecodeProvenance::WorkerLocal,
+            W::CollectionPayloadTooLarge(_) => DecodeProvenance::WorkerLocal,
             W::NonZeroPadding(_) => DecodeProvenance::WorkerLocal,
             W::InvalidNarHash(_) => DecodeProvenance::WorkerLocal,
             W::FrameTooLarge(_) => DecodeProvenance::WorkerLocal,
@@ -1774,6 +1780,7 @@ fn sizing_rewrite_authority(
             ExecutorError::Wire(
                 W::StringTooLong(_)
                 | W::CollectionTooLarge(_)
+                | W::CollectionPayloadTooLarge(_)
                 | W::NonZeroPadding(_)
                 | W::InvalidUtf8(_)
                 | W::InvalidNarHash(_)

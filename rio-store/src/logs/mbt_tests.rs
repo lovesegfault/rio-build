@@ -585,6 +585,7 @@ impl MbtSystem {
                 is_ca: false,
                 expiry_unix: u64::MAX,
                 tenant: None,
+                input_closure_digest: String::new(),
             },
             AppendLogHeader {
                 derivation_path: DRV_PATH.to_string(),

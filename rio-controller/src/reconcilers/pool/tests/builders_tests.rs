@@ -842,7 +842,7 @@ fn w10_aq_forecast_idle_bound_priced_by_eta() {
         ..Default::default()
     };
     let mut pod = test_pod_spec(&wp);
-    jobs::apply_intent_resources(&mut pod, &wp, &forecast, &Default::default());
+    jobs::apply_intent_resources(&mut pod, &forecast, &Default::default());
     let idle = pod.containers[0]
         .env
         .as_ref()
@@ -862,7 +862,7 @@ fn w10_aq_forecast_idle_bound_priced_by_eta() {
     // forecast population).
     forecast.ready = Some(true);
     let mut pod = test_pod_spec(&wp);
-    jobs::apply_intent_resources(&mut pod, &wp, &forecast, &Default::default());
+    jobs::apply_intent_resources(&mut pod, &forecast, &Default::default());
     let idle = pod.containers[0]
         .env
         .as_ref()
@@ -876,7 +876,7 @@ fn w10_aq_forecast_idle_bound_priced_by_eta() {
     // sender) reads as Ready — flat bound, never eta-priced.
     forecast.ready = None;
     let mut pod = test_pod_spec(&wp);
-    jobs::apply_intent_resources(&mut pod, &wp, &forecast, &Default::default());
+    jobs::apply_intent_resources(&mut pod, &forecast, &Default::default());
     let idle = pod.containers[0]
         .env
         .as_ref()
@@ -891,7 +891,7 @@ fn w10_aq_forecast_idle_bound_priced_by_eta() {
     forecast.ready = Some(false);
     forecast.eta_seconds = 0.0;
     let mut pod = test_pod_spec(&wp);
-    jobs::apply_intent_resources(&mut pod, &wp, &forecast, &Default::default());
+    jobs::apply_intent_resources(&mut pod, &forecast, &Default::default());
     let idle = pod.containers[0]
         .env
         .as_ref()

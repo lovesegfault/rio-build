@@ -29,8 +29,13 @@ use super::{StoreServiceImpl, metadata_status};
 /// [`PathVisible::substituted_for_tenant`] (a path fetched through
 /// the requesting tenant's own upstreams). The narinfo serve/write
 /// steps require one (`visible_narinfo`, `append_signatures_visible`,
-/// [`ServeAuthority`]) — a tenant-facing read path that skips the
-/// gate does not compile.
+/// `stream_path`) — a tenant-facing read path that skips the gate
+/// does not compile.
+///
+/// (ADR-022: the manifest-hint capability-token fast path and its
+/// `CapabilityHint`/`ServeAuthority::Hint` witnesses are retired —
+/// the proto `ManifestHint` field is reserved; castore DAG reads
+/// supersede it. `PathVisible` is now the sole serve authority.)
 #[must_use]
 #[derive(Debug)]
 pub(in crate::grpc) struct PathVisible(());
@@ -43,34 +48,6 @@ impl PathVisible {
     pub(in crate::grpc) fn substituted_for_tenant() -> Self {
         PathVisible(())
     }
-}
-
-/// Witness: GetPath's manifest-hint fast path — the caller PRESENTED
-/// the manifest (BLAKE3 chunk hashes as capability tokens, I-110c),
-/// so the serve step is hint-authorized without the visibility gate.
-/// Sole mint: `hint_into_manifest`'s validated-hint return. The
-/// chokepoint protecting this path is `BatchGetManifest`'s
-/// end-user-rejection: tenants cannot obtain chunk hashes for paths
-/// the gate would hide.
-#[must_use]
-#[derive(Debug)]
-pub(in crate::grpc) struct CapabilityHint(());
-
-impl CapabilityHint {
-    /// Sole mint: a validated, path-matching presented manifest hint.
-    pub(in crate::grpc) fn from_presented_hint() -> Self {
-        CapabilityHint(())
-    }
-}
-
-/// The two authorities under which GetPath may stream bytes.
-/// `stream_path` requires one — a new GetPath arm without a recorded
-/// authority does not compile.
-pub(in crate::grpc) enum ServeAuthority {
-    /// Passed the sig-visibility gate (or tenant-trust substitution).
-    Visible(PathVisible),
-    /// Presented manifest hint (capability tokens).
-    Hint(CapabilityHint),
 }
 
 /// The gate-passing subset of a `FindMissingPaths` batch — sole
@@ -860,7 +837,10 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !svc.sig_visibility_gate(Some(tid), &drv_info).await.unwrap(),
+            svc.sig_visibility_gate(Some(tid), &drv_info)
+                .await
+                .unwrap()
+                .is_none(),
             "a .drv owned by another tenant must be hidden (single-path)"
         );
         let batch = svc
@@ -874,7 +854,8 @@ mod tests {
         assert!(
             svc.sig_visibility_gate(Some(other), &drv_info)
                 .await
-                .unwrap(),
+                .unwrap()
+                .is_some(),
             "the owning tenant still sees its .drv"
         );
     }
@@ -926,7 +907,7 @@ mod tests {
         let mut stored = info.clone();
         stored.store_path_hash = path_hash.to_vec();
         stored.signatures = vec!["key-X:bogus".into()];
-        metadata::complete_manifest_inline(&db.pool, &stored, claim, nar.into())
+        metadata::complete_manifest_inline(&db.pool, &stored, claim, nar.into(), None, None)
             .await
             .unwrap();
         sqlx::query("UPDATE narinfo SET nar_hash = $1 WHERE store_path = $2")

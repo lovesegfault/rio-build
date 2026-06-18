@@ -49,26 +49,39 @@ const STORE_MTIME: Duration = Duration::from_secs(1);
 /// `lookup`/`readdir`, `Symlink` is its own `readlink` answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Node {
+    /// A regular file. `open()` resolves `file_digest` to a backing
+    /// blob (cache hit or fetch+promote).
     File {
+        /// blake3 of the file body — the backing-cache key.
         file_digest: [u8; 32],
+        /// `st_size`.
         size: u64,
+        /// Whether `st_mode` carries the execute bits.
         executable: bool,
     },
+    /// A directory. `lookup`/`readdir` index its body via the
+    /// per-path child index in [`InoMap`].
     Dir {
+        /// blake3 of the canonical `Directory` proto encoding.
         dir_digest: [u8; 32],
     },
+    /// A symbolic link. `readlink` returns `target` verbatim.
     Symlink {
+        /// The raw link target bytes (no UTF-8 requirement).
         target: Vec<u8>,
     },
 }
 
 /// One entry of a `readdir`/`readdirplus` enumeration.
 pub struct DirEntry<'a> {
+    /// The child's allocated ino.
     pub ino: u64,
     /// Offset of the *next* entry — what the kernel passes back to
     /// resume after this one.
     pub next_offset: u64,
+    /// `d_type` for this entry.
     pub kind: FileType,
+    /// The entry name (no NUL, no `/`); borrowed from the index.
     pub name: &'a [u8],
 }
 
@@ -77,26 +90,53 @@ pub struct DirEntry<'a> {
 /// infrastructure failure and re-queues.
 #[derive(Debug, thiserror::Error)]
 pub enum TreeError {
+    /// A `GetDirectory` RPC failed.
     #[error("GetDirectory: {0}")]
     Rpc(#[from] tonic::Status),
+    /// The recursive `GetDirectory` stream did not finish in time.
     #[error("GetDirectory(recursive) timed out after {0:?}")]
     Timeout(Duration),
+    /// An input root's `root_node` is unset on the store side.
     #[error("input root {store_path:?} has no root_node (path not yet NAR-indexed)")]
-    MissingRootNode { store_path: String },
+    MissingRootNode {
+        /// The closure store path whose castore root is missing.
+        store_path: String,
+    },
     /// `context` is the input root's store path, or the parent
     /// directory's hex digest when the bad entry is inside a streamed
     /// `Directory` body.
     #[error("castore digest under {context:?} is {got} bytes, want 32")]
-    BadDigestLen { context: String, got: usize },
+    BadDigestLen {
+        /// Where the bad digest was encountered (store path or parent
+        /// dir hex digest).
+        context: String,
+        /// The malformed digest length.
+        got: usize,
+    },
+    /// An input root store path has no path component after `/`.
     #[error("store path {store_path:?} has no basename")]
-    BadStorePath { store_path: String },
+    BadStorePath {
+        /// The offending closure store path.
+        store_path: String,
+    },
+    /// Two input roots share a basename — the FUSE root would collide.
     #[error("duplicate store-path basename {basename:?} in input_roots")]
-    DuplicateBasename { basename: String },
+    DuplicateBasename {
+        /// The colliding store-path basename.
+        basename: String,
+    },
+    /// A directory digest is reachable from a root but the recursive
+    /// `GetDirectory` stream never returned its body.
     #[error(
         "directory {digest} is referenced by the DAG but was not returned by GetDirectory \
          ({returned} bodies returned)"
     )]
-    MissingDirectory { digest: String, returned: usize },
+    MissingDirectory {
+        /// Hex blake3 of the missing directory body.
+        digest: String,
+        /// How many `Directory` bodies the stream did return.
+        returned: usize,
+    },
 }
 
 /// The castore-FUSE's entire metadata state: inode → node, per-path

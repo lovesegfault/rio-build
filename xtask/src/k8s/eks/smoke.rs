@@ -449,21 +449,21 @@ pub async fn gateway_tunnel(local_port: u16) -> Result<(u16, ProcessGuard)> {
     Ok((port, guard))
 }
 
-/// [`gateway_port_forward`] wrapped in a respawn loop. The first
+/// [`gateway_tunnel`] wrapped in a respawn loop. The first
 /// bind happens here (so the SSH banner is verified before the caller
-/// builds a store URL); a supervisor task then watches the kubectl
-/// child and on exit reaps `:port` + re-runs `gateway_port_forward`
+/// builds a store URL); a supervisor task then watches the tunnel
+/// child and on exit reaps `:port` + re-runs `gateway_tunnel`
 /// against the same bound port (up to 10×). The
 /// [`Eks::gateway_endpoint`] fallback path (NLB unreachable) uses
-/// this so a transient port-forward death doesn't kill an in-flight
+/// this so a transient tunnel death doesn't kill an in-flight
 /// `nix build --store ssh-ng://…`.
 ///
 /// [`Eks::gateway_endpoint`]: crate::k8s::provider::Provider::gateway_endpoint
 pub async fn supervised_gateway_port_forward(local_port: u16) -> Result<(u16, SupervisedTunnel)> {
-    let (port, guard) = gateway_port_forward(local_port).await?;
+    let (port, guard) = gateway_tunnel(local_port).await?;
     Ok((
         port,
-        SupervisedTunnel::supervise(guard, port, 10, gateway_port_forward),
+        SupervisedTunnel::supervise(guard, port, 10, gateway_tunnel),
     ))
 }
 

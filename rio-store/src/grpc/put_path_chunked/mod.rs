@@ -241,12 +241,15 @@ impl StoreServiceImpl {
                             claim: None,
                         });
                     }
-                    Ok(PlaceholderClaim::Owned(c)) => {
-                        guards.push(self.spawn_placeholder_guard(store_path_hash.clone(), c));
+                    Ok(PlaceholderClaim::Owned(g)) => {
+                        // sh-023: pre-armed guard from `wait_for_concurrent_upload`
+                        // (took over after the prior owner aborted) — same shape
+                        // as the direct claim arm above.
                         output_claims.push(OutputClaim {
                             store_path_hash,
-                            claim: Some(c),
+                            claim: Some(g.claim_id()),
                         });
+                        guards.push(g);
                     }
                     Ok(PlaceholderClaim::Concurrent) => {
                         drain_stream("PutPathChunked", &mut stream).await;

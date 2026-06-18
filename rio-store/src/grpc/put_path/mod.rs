@@ -178,7 +178,7 @@ impl StoreServiceImpl {
         if let Some(d) = declared
             && d >= rio_common::limits::MAX_NAR_SIZE
         {
-            drain_stream(&mut stream).await;
+            common::drain_stream("PutPath", &mut stream).await;
             return Err(Status::invalid_argument(format!(
                 "PutPath: declared_nar_size {d} exceeds size bound {}",
                 rio_common::limits::MAX_NAR_SIZE

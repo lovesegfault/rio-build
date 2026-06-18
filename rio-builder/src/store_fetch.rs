@@ -30,8 +30,13 @@ use rio_proto::store::log_service_client::LogServiceClient;
 /// (`ReadBlob`).
 #[derive(Clone)]
 pub struct StoreClients {
+    /// `StoreService`: PathInfo / NAR / realisation RPCs.
     pub store: StoreServiceClient<Channel>,
+    /// `ChunkService`: batched FastCDC chunk fetch for the
+    /// castore-FUSE fill task.
     pub chunk: ChunkServiceClient<Channel>,
+    /// `DirectoryService`: DAG prefetch (`GetDirectory`) and
+    /// whole-file `ReadBlob`.
     pub directory: DirectoryServiceClient<Channel>,
     /// `LogService` over the same channel. Cloned into each build's
     /// [`crate::log_upload::LogUploader`] for the `AppendLog` stream.

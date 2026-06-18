@@ -108,10 +108,15 @@ impl CastoreSettings {
 /// (re-queue), not build failures.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
+    /// The mountd handshake (or a later mountd request) failed.
     #[error("mountd: {0}")]
     Mountd(#[from] MountdError),
+    /// The closure DAG prefetch / [`InoMap`](crate::castore_fuse::tree::InoMap)
+    /// construction failed.
     #[error("DAG prefetch: {0}")]
     Prefetch(#[from] TreeError),
+    /// `Session::from_fd` on the handed-off `/dev/fuse` fd failed
+    /// (FUSE_INIT or io_uring setup).
     #[error("FUSE session on the handed-off fd: {0}")]
     Fuse(#[from] std::io::Error),
 }

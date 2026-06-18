@@ -4893,9 +4893,16 @@ mod tests {
             .unwrap();
         let mut stored = info.clone();
         stored.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &stored, claim, nar.clone().into())
-            .await
-            .unwrap();
+        metadata::complete_manifest_inline(
+            &db.pool,
+            &stored,
+            claim,
+            nar.clone().into(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         // 2. The ATTACKER tenant trusts a fake upstream that
         //    self-signs a narinfo naming the victim path with a
@@ -5011,9 +5018,16 @@ mod tests {
             .unwrap();
         let mut stored = info.clone();
         stored.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &stored, claim, nar.clone().into())
-            .await
-            .unwrap();
+        metadata::complete_manifest_inline(
+            &db.pool,
+            &stored,
+            claim,
+            nar.clone().into(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         // The tenant trusts a fake upstream that self-signs a narinfo
         // naming the victim path with a DIFFERENT NarHash.
@@ -7636,7 +7650,8 @@ mod tests {
     const CENSUS_SOURCES: &[(&str, &str)] = &[
         ("admission.rs", include_str!("admission.rs")),
         ("authz.rs", include_str!("authz.rs")),
-        ("backend.rs", include_str!("backend.rs")),
+        ("backend/mod.rs", include_str!("backend/mod.rs")),
+        ("backend/tiered.rs", include_str!("backend/tiered.rs")),
         ("budget.rs", include_str!("budget.rs")),
         ("cas.rs", include_str!("cas.rs")),
         ("chunker.rs", include_str!("chunker.rs")),

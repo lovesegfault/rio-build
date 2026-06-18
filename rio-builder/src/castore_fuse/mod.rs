@@ -143,6 +143,8 @@ pub struct CastoreFs {
 }
 
 impl CastoreFs {
+    /// Wrap a prefetched, immutable [`InoMap`] for hand-off to
+    /// `Session::from_fd`.
     pub fn new(tree: Arc<InoMap>) -> Self {
         Self { tree }
     }

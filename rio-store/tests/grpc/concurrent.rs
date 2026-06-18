@@ -70,6 +70,7 @@ async fn put_path_gated(
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(raw),
+            declared_nar_size: 0,
         })),
     })
     .await

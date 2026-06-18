@@ -3356,10 +3356,6 @@ async fn test_recovery_never_attests_partial_input_closure() -> TestResult {
     let d2_out = test_store_path("recattest-d2-out");
 
     let f = RecoveryFixture::run(async |handle, _| {
-        // One worker; d1 is the only initially-Ready leaf (d2 depends
-        // on it), so the pre-restart completion is deterministic.
-        let mut rx = connect_executor(&handle, "recattest-w-pre", "x86_64-linux").await?;
-
         // Recomputed locally (deterministic) so the async closure does
         // not borrow from the enclosing test frame.
         let d1_out = test_store_path("recattest-d1-out");
@@ -3382,13 +3378,14 @@ async fn test_recovery_never_attests_partial_input_closure() -> TestResult {
         )
         .await?;
 
-        // d1 dispatches and completes BEFORE the restart. Its PG row
-        // goes terminal, so recovery will not load it into the DAG.
-        let a1 = recv_assignment(&mut rx).await;
+        // d1 (the only initially-Ready leaf — d2 depends on it) is
+        // pulled and completed BEFORE the restart. Its PG row goes
+        // terminal, so recovery will not load it into the DAG.
+        let a1 = pull_attempt(&handle, "recattest-d1").await;
         assert!(a1.drv_path.contains("recattest-d1"), "d1 dispatches first");
-        complete_success(&handle, "recattest-w-pre", "recattest-d1", &d1_out).await?;
-        // The pre-restart worker is one-shot (draining after its
-        // completion), so d2 stays Ready in PG across the restart.
+        pull_complete_success(&handle, "recattest-d1", &d1_out).await?;
+        // d2 is never pulled pre-restart, so it stays Ready in PG
+        // across the restart.
         barrier(&handle).await;
         Ok(())
     })
@@ -3403,17 +3400,15 @@ async fn test_recovery_never_attests_partial_input_closure() -> TestResult {
     );
 
     // Complete d2 post-restart so the parent becomes Ready.
-    let mut rx = connect_executor(&handle, "recattest-w-d2", "x86_64-linux").await?;
-    let a2 = recv_assignment(&mut rx).await;
+    let a2 = pull_attempt(&handle, "recattest-d2").await;
     assert!(
         a2.drv_path.contains("recattest-d2"),
         "d2 dispatches after recovery"
     );
-    complete_success(&handle, "recattest-w-d2", "recattest-d2", &d2_out).await?;
+    pull_complete_success(&handle, "recattest-d2", &d2_out).await?;
 
-    // Parent dispatches to a fresh worker (the d2 worker is one-shot).
-    let mut rx = connect_executor(&handle, "recattest-w-parent", "x86_64-linux").await?;
-    let asgn = recv_assignment(&mut rx).await;
+    // Parent is now Ready.
+    let asgn = pull_attempt(&handle, "recattest-parent").await;
     assert!(
         asgn.drv_path.contains("recattest-parent"),
         "parent dispatches last"

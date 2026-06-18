@@ -5715,6 +5715,15 @@ mod tests {
                 anyhow::bail!("injected S3 outage")
             }
         }
+        async fn put_blob(&self, k: &str, d: bytes::Bytes) -> anyhow::Result<()> {
+            self.inner.put_blob(k, d).await
+        }
+        async fn get_blob(&self, k: &str) -> anyhow::Result<Option<bytes::Bytes>> {
+            self.inner.get_blob(k).await
+        }
+        async fn delete_blob(&self, k: &str) -> anyhow::Result<()> {
+            self.inner.delete_blob(k).await
+        }
     }
 
     // r[verify store.gc.outbox-veto-letter]

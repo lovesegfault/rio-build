@@ -5396,7 +5396,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        metadata::complete_manifest_inline(pool, &info, claim, nar.into())
+        metadata::complete_manifest_inline(pool, &info, claim, nar.into(), None, None)
             .await
             .unwrap();
     }

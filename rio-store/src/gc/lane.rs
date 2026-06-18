@@ -542,6 +542,15 @@ mod tests {
             }
             self.inner.delete_by_key(key).await
         }
+        async fn put_blob(&self, key: &str, data: bytes::Bytes) -> anyhow::Result<()> {
+            self.inner.put_blob(key, data).await
+        }
+        async fn get_blob(&self, key: &str) -> anyhow::Result<Option<bytes::Bytes>> {
+            self.inner.get_blob(key).await
+        }
+        async fn delete_blob(&self, key: &str) -> anyhow::Result<()> {
+            self.inner.delete_blob(key).await
+        }
     }
 
     // r[verify store.gc.hold-lanes+2]
@@ -767,7 +776,8 @@ mod census {
     const CENSUS_SOURCES: &[(&str, &str)] = &[
         ("admission.rs", include_str!("../admission.rs")),
         ("authz.rs", include_str!("../authz.rs")),
-        ("backend.rs", include_str!("../backend.rs")),
+        ("backend/mod.rs", include_str!("../backend/mod.rs")),
+        ("backend/tiered.rs", include_str!("../backend/tiered.rs")),
         ("budget.rs", include_str!("../budget.rs")),
         ("cas.rs", include_str!("../cas.rs")),
         ("chunker.rs", include_str!("../chunker.rs")),

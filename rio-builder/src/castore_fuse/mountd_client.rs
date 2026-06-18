@@ -26,13 +26,21 @@ use crate::IgnorePoison;
 /// In-flight requests: `seq` → the blocked caller's reply channel.
 type Pending = HashMap<u32, SyncSender<(Resp, Vec<OwnedFd>)>>;
 
+/// Errors from the mountd client. Every variant means the mountd
+/// session for this build is dead — the caller fails the build as
+/// `InfrastructureFailure` (re-queue), except where
+/// [`ErrKind::is_build_fatal`] says otherwise for `Rejected`.
 #[derive(Debug, thiserror::Error)]
 pub enum MountdError {
+    /// `connect(2)` to the mountd UDS failed.
     #[error("connect {path}: {source}")]
     Connect {
+        /// The mountd socket path that was dialled.
         path: String,
+        /// The underlying `connect(2)` error.
         source: std::io::Error,
     },
+    /// A frame failed to encode/decode or send/recv on the socket.
     #[error("mountd request: {0}")]
     Frame(#[from] proto::FrameError),
     /// The daemon closed the connection or the reader thread died.
@@ -40,12 +48,16 @@ pub enum MountdError {
     /// build's mount is gone and the build must fail as infra.
     #[error("mountd connection closed")]
     Closed,
+    /// `recv_timeout` elapsed waiting for the matching `seq` reply.
     #[error("mountd did not reply within {0:?}")]
     Timeout(Duration),
     /// A typed protocol rejection. `ErrKind::is_build_fatal` decides
     /// whether the caller surfaces a build failure or an infra retry.
     #[error("mountd rejected request: {0}")]
     Rejected(ErrKind),
+    /// The reply's [`Resp`] variant does not match the request kind
+    /// (e.g. `BackingId` for a `Promote`). Daemon bug or wire
+    /// corruption — fail closed.
     #[error("mountd reply has unexpected variant for this request")]
     UnexpectedReply,
 }

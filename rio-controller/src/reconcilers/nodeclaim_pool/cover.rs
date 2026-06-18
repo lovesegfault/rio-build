@@ -3203,14 +3203,8 @@ mod mint_law_tests {
             intent("i-far", 4, false, 1e9, &[("h", "spot")]),
         ];
         let sketches = CellSketches::default();
-        let (placeable, unplaced) = ffd::simulate(
-            &intents,
-            &live,
-            &sketches,
-            &HashMap::new(),
-            50 * GI,
-            |_, _, _| true,
-        );
+        let (placeable, unplaced) =
+            ffd::simulate(&intents, &live, &sketches, &HashMap::new(), |_, _, _| true);
         assert_eq!(placeable.len(), 1, "i-fits placed on the live node");
         assert_eq!(unplaced.len(), 1, "only the forecast survives the split");
         let none = HashSet::new();

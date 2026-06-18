@@ -247,7 +247,10 @@ async fn send_batch_output(
         nar_size: std::mem::take(&mut info.nar_size),
     };
     let frames = [
-        put_path_request::Msg::Metadata(PutPathMetadata { info: Some(info) }),
+        put_path_request::Msg::Metadata(PutPathMetadata {
+            info: Some(info),
+            declared_nar_size: 0,
+        }),
         put_path_request::Msg::NarChunk(nar),
         put_path_request::Msg::Trailer(trailer),
     ];

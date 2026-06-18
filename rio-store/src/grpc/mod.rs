@@ -1101,7 +1101,7 @@ impl StoreService for StoreServiceImpl {
         // Identity before anything else — an anonymous caller learns
         // nothing about any nar_hash, not even whether it exists.
         self.require_caller_identity(&request)?;
-        self.reject_end_user_tenant(&request, "GetNarIndex")?;
+        let _ = self.reject_end_user_tenant(&request, "GetNarIndex")?;
         let nar_hash = parse_nar_hash(&request.into_inner().nar_hash)?;
         let bytes = self.lookup_nar_index(&nar_hash).await?;
         let index = crate::nar_index::decode_entries(&bytes)
@@ -1126,7 +1126,7 @@ impl StoreService for StoreServiceImpl {
         // Same identity-first ordering as GetNarIndex: the gate fires
         // before the size check and any PG work.
         self.require_caller_identity(&request)?;
-        self.reject_end_user_tenant(&request, "GetNarIndexBatch")?;
+        let _ = self.reject_end_user_tenant(&request, "GetNarIndexBatch")?;
         let req = request.into_inner();
         if req.nar_hashes.len() > self.max_batch_paths {
             return Err(Status::invalid_argument(format!(

@@ -1306,11 +1306,12 @@ impl StoreServiceImpl {
             // per waiter.
             match ingest::claim_placeholder(
                 &self.pool,
-                self.chunk_backend.as_ref(),
                 store_path_hash,
                 store_path,
                 refs,
                 PUTPATH_HOOKS,
+                None,
+                None,
             )
             .await?
             {
@@ -1580,7 +1581,8 @@ mod registration_writer_census {
     const CENSUS_SOURCES: &[(&str, &str)] = &[
         ("admission.rs", include_str!("../../admission.rs")),
         ("authz.rs", include_str!("../../authz.rs")),
-        ("backend.rs", include_str!("../../backend.rs")),
+        ("backend/mod.rs", include_str!("../../backend/mod.rs")),
+        ("backend/tiered.rs", include_str!("../../backend/tiered.rs")),
         ("budget.rs", include_str!("../../budget.rs")),
         ("cas.rs", include_str!("../../cas.rs")),
         ("chunker.rs", include_str!("../../chunker.rs")),
@@ -1888,6 +1890,7 @@ mod declared_budget_tests {
             is_ca: true,
             expiry_unix: 0,
             tenant: tenant.map(|t| t.to_string()),
+            input_closure_digest: String::new(),
         };
         let t_jwt = uuid::Uuid::from_u128(11);
         let t_claims = uuid::Uuid::from_u128(7);
@@ -1950,6 +1953,7 @@ mod declared_budget_tests {
             is_ca: false,
             expiry_unix: 0,
             tenant: None,
+            input_closure_digest: String::new(),
         };
         assert_eq!(
             declared_charge_tenant(Some(&claims)),

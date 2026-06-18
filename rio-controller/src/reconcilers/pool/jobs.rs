@@ -5777,7 +5777,7 @@ mod w10_cj_container_pad {
         let mut i = intent("scope");
         i.mem_bytes = 2 << 30;
         let before = i.mem_bytes;
-        let fp = intent_pod_footprint(&i, 0);
+        let fp = intent_pod_footprint(&i);
         assert_eq!(i.mem_bytes, before, "the solve is untouched");
         assert_eq!(fp.mem_bytes(), before + (256 << 20));
         assert_eq!(

@@ -293,7 +293,7 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
 // r[verify sched.dispatch.input-roots+2]
 #[tokio::test]
 async fn test_dispatch_attests_input_closure_from_parsed_drv() -> TestResult {
-    let (db, handle, _task, mut rx) = setup_with_worker("attest-w1", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
 
     let child_drv_path = test_drv_path("attest-child");
     let child_out = test_store_path("attest-child-out");
@@ -335,14 +335,13 @@ async fn test_dispatch_attests_input_closure_from_parsed_drv() -> TestResult {
     )
     .await?;
 
-    // Child (leaf) dispatches first; complete it with a realized path.
-    let a1 = recv_assignment(&mut rx).await;
+    // Child (leaf) is Ready first; pull and complete it with a realized path.
+    let a1 = pull_attempt(&handle, "attest-child").await;
     assert!(a1.drv_path.contains("attest-child"), "child first: {a1:?}");
-    complete_success(&handle, "attest-w1", "attest-child", &child_out).await?;
+    pull_complete_success(&handle, "attest-child", &child_out).await?;
 
-    // Parent dispatches to a fresh worker (executors are one-shot).
-    let mut rx2 = connect_executor(&handle, "attest-w2", "x86_64-linux").await?;
-    let a2 = recv_assignment(&mut rx2).await;
+    // Parent becomes Ready once the child is terminal.
+    let a2 = pull_attempt(&handle, "attest-parent").await;
     assert!(a2.drv_path.contains("attest-parent"), "parent: {a2:?}");
 
     assert!(

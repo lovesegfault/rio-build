@@ -264,7 +264,11 @@ async fn main() -> anyhow::Result<()> {
     // exercises); inline → in-memory (build logs survive only as long
     // as the process, loudly logged).
     let log_chunk_store: Arc<dyn LogChunkStore> = match &cfg.chunk_backend {
-        ChunkBackendKind::S3 { bucket, .. } => {
+        // Tiered degrades to plain S3 for build logs: the Express tier
+        // is a per-AZ chunk read-through cache (ADR-023), and logs are
+        // append-once / tail-read — they go to the authoritative
+        // standard bucket only.
+        ChunkBackendKind::S3 { bucket, .. } | ChunkBackendKind::Tiered { bucket, .. } => {
             let client = rio_common::s3::default_client(cfg.s3_max_attempts).await;
             Arc::new(S3LogChunkStore::new(client, bucket.clone()))
         }

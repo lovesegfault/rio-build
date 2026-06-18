@@ -203,6 +203,10 @@ enum StreamBlobError {
 }
 
 impl Opener {
+    /// Wire the opener's clients, runtime handle, circuit breaker, and
+    /// cache/staging directories. Called once per build by
+    /// [`crate::castore_fuse::session::CastoreSession`] after the
+    /// mountd handshake.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mountd: MountdClient,

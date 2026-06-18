@@ -1400,6 +1400,15 @@ mod tests {
                 anyhow::bail!("injected S3 outage: transient delete failure")
             }
         }
+        async fn put_blob(&self, k: &str, d: bytes::Bytes) -> anyhow::Result<()> {
+            self.inner.put_blob(k, d).await
+        }
+        async fn get_blob(&self, k: &str) -> anyhow::Result<Option<bytes::Bytes>> {
+            self.inner.get_blob(k).await
+        }
+        async fn delete_blob(&self, k: &str) -> anyhow::Result<()> {
+            self.inner.delete_blob(k).await
+        }
     }
 
     /// Enqueue `hashes` through the PRODUCTION outbox statement
@@ -2274,6 +2283,15 @@ mod tests {
             // S3 semantics: delete-of-missing succeeds silently.
             self.store.lock().unwrap().remove(k);
             Ok(())
+        }
+        async fn put_blob(&self, _k: &str, _d: bytes::Bytes) -> anyhow::Result<()> {
+            unimplemented!("LayoutBackend test mock: blob path not exercised")
+        }
+        async fn get_blob(&self, _k: &str) -> anyhow::Result<Option<bytes::Bytes>> {
+            unimplemented!("LayoutBackend test mock: blob path not exercised")
+        }
+        async fn delete_blob(&self, _k: &str) -> anyhow::Result<()> {
+            unimplemented!("LayoutBackend test mock: blob path not exercised")
         }
     }
 

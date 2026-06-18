@@ -43,23 +43,32 @@ pub const PROMOTE_CHUNKS_MAX: usize = 64;
 /// in the matching [`Reply`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
+    /// Client-chosen correlator, echoed verbatim in the [`Reply`].
     pub seq: u32,
+    /// The request body.
     pub req: Req,
 }
 
 /// A reply frame. `seq` matches the [`Request`] it answers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reply {
+    /// Echo of [`Request::seq`].
     pub seq: u32,
+    /// The reply body.
     pub resp: Resp,
 }
 
+/// Request bodies. See the variant docs for the `SCM_RIGHTS` ancillary
+/// fd contract on each.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Req {
     /// Claim `build_id`, fuse-mount `/var/rio/castore/{build_id}`, and
     /// hand the `/dev/fuse` fd back via `SCM_RIGHTS`. Must be the first
     /// request on a connection; exactly one per connection lifetime.
-    Mount { build_id: String },
+    Mount {
+        /// The build's id — names the mountpoint and staging directory.
+        build_id: String,
+    },
     /// Register the fd in this frame's `SCM_RIGHTS` cmsg as a FUSE
     /// passthrough backing file: the daemon issues
     /// `ioctl(kept_fuse_fd, FUSE_DEV_IOC_BACKING_OPEN)` and replies the
@@ -67,24 +76,38 @@ pub enum Req {
     /// the body.
     BackingOpen,
     /// Release a `backing_id` from a prior [`Req::BackingOpen`].
-    BackingClose { backing_id: u32 },
+    BackingClose {
+        /// The connection-scoped id returned by [`Resp::BackingId`].
+        backing_id: u32,
+    },
     /// Verify-copy `staging/{build_id}/{hex(digest)}` into the shared
     /// backing cache at `cache/{ab}/{hex(digest)}`. The daemon re-hashes
     /// during the copy and rejects on mismatch — this is the integrity
     /// boundary for the cache.
-    Promote { digest: [u8; 32] },
+    Promote {
+        /// blake3 of the staged whole-file blob to publish.
+        digest: [u8; 32],
+    },
     /// Batch form of [`Req::Promote`] for FastCDC chunks staged under
     /// `staging/{build_id}/chunks/{hex}`, promoted into
     /// `chunks/{ab}/{hex}`. At most [`PROMOTE_CHUNKS_MAX`] per batch.
-    PromoteChunks { chunk_digests: Vec<[u8; 32]> },
+    PromoteChunks {
+        /// blake3 digests of the staged chunks to publish.
+        chunk_digests: Vec<[u8; 32]>,
+    },
 }
 
+/// Reply bodies. See [`ErrKind`] for the failure variant's
+/// build-fatal vs retryable classification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Resp {
     /// [`Req::Mount`] succeeded. The `/dev/fuse` fd is in this frame's
     /// `SCM_RIGHTS` cmsg. `staging_quota_bytes` is the kernel-enforced
     /// XFS project quota on the build's staging directory.
-    Mounted { staging_quota_bytes: u64 },
+    Mounted {
+        /// XFS project-quota byte limit on `staging/{build_id}/`.
+        staging_quota_bytes: u64,
+    },
     /// [`Req::BackingOpen`] succeeded.
     BackingId(u32),
     /// Unit success: [`Req::BackingClose`] completed, or
@@ -160,14 +183,21 @@ impl std::fmt::Display for ErrKind {
 /// [`ErrKind`]).
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
+    /// Encoding produced more than [`MAX_FRAME_BYTES`] (rejected before
+    /// it hits the socket).
     #[error("frame exceeds MAX_FRAME_BYTES ({0} > {MAX_FRAME_BYTES})")]
     Oversize(usize),
+    /// `recvmsg` set `MSG_TRUNC`: the peer sent a datagram larger than
+    /// our receive buffer.
     #[error("frame truncated by the kernel (MSG_TRUNC) — peer sent an oversize datagram")]
     Truncated,
+    /// postcard encode/decode failed.
     #[error("postcard: {0}")]
     Codec(#[from] postcard::Error),
+    /// `recvmsg` returned 0 bytes — the peer closed the seqpacket.
     #[error("peer closed the connection")]
     Eof,
+    /// `sendmsg`/`recvmsg` syscall error.
     #[error("socket: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -190,7 +220,9 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, FrameError> 
 /// One received datagram: the frame bytes and any fds that arrived in
 /// its `SCM_RIGHTS` ancillary data.
 pub struct RecvFrame {
+    /// The serialized frame body — pass to [`decode`].
     pub bytes: Vec<u8>,
+    /// Any fds that arrived in the datagram's `SCM_RIGHTS` cmsg.
     pub fds: Vec<OwnedFd>,
 }
 
