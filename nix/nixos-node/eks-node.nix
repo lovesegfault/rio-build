@@ -518,6 +518,7 @@ in
             pkgs.xfsprogs
             pkgs.util-linux
             pkgs.systemd # udevadm
+            pkgs.nvme-cli # quota-volume-select.sh ec2_bdev_name (ADR-022 3-EBS disambiguation)
           ];
           script = ''
             set -euo pipefail

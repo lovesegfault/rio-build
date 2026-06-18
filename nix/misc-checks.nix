@@ -3252,11 +3252,12 @@ in
         #!/usr/bin/env bash
         dev="''${@: -1}"
         row=$(grep -F "$dev|" "$LSBLK_TABLE" | head -n1)
-        IFS='|' read -r _ type children mounts <<< "$row"
+        IFS='|' read -r _ type children mounts label <<< "$row"
         case "$*" in
           *-ndo\ TYPE*) echo "$type" ;;
           *-nro\ NAME*) echo self; for c in $children; do echo "$c"; done ;;
           *-nro\ MOUNTPOINTS*) echo "$mounts" ;;
+          *-nro\ LABEL*) echo "$label" ;;
         esac
         MOCK
         # The sandbox has no /usr/bin/env — point the shebang at the
@@ -3420,6 +3421,103 @@ in
         export LSBLK_TABLE=$PWD/tE
         rc=0; sel=$(bash "$selectScript" "$base/pop-E/dev/vdb" 2>err) || rc=$?
         [ "$rc" = 0 ] && [ "$sel" = "$base/pop-E/dev/vdb" ] || fail E "the VM-config direct-path shape must keep selecting (got rc=$rc sel=$sel)"
+
+        # ── F: ADR-022 — three EBS mappings (xvda root, xvdb kubelet,
+        #      xvdc /var/rio) ────────────────────────────────────────────
+        # Mock nvme: emits an id-ctrl binary response with the bdev-name
+        # at byte 3072 (the Amazon EBS vendor-specific layout
+        # amazon-ec2-utils' ebsnvme-id reads). Rows in NVME_BDEV_TABLE:
+        # `<resolved-path>|<bdev-name>` (bdev-name may carry /dev/).
+        cat > bin/nvme << 'MOCK'
+        #!/usr/bin/env bash
+        for a in "$@"; do case "$a" in /*) dev="$a" ;; esac; done
+        bdev=$(grep -F "$dev|" "$NVME_BDEV_TABLE" 2>/dev/null | head -n1 | cut -d'|' -f2)
+        head -c 3072 /dev/zero
+        printf '%-32s' "$bdev"
+        MOCK
+        sed -i "1s|.*|#!$(command -v bash)|" bin/nvme
+        chmod +x bin/nvme
+
+        # F1 first boot: root + 2 bare disks; bdev-names xvdb/xvdc →
+        # select the xvdb path. Pre-fix this is the I-? churn shape:
+        # n_bare=2 → ambiguous; refusing → kubelet Requires= hard-fail
+        # → nodes never register.
+        mkpop F1 volR:R 'volR-part1:Rp1' 'volR-part2:Rp2' volQ:Q volV:V
+        cat > tF1 << EOF
+        $base/pop-F1/dev/R|disk|p1 p2||
+        $base/pop-F1/dev/Rp1|part|||
+        $base/pop-F1/dev/Rp2|part||/|
+        $base/pop-F1/dev/Q|disk|||
+        $base/pop-F1/dev/V|disk|||
+        EOF
+        cat > nF1 << EOF
+        $base/pop-F1/dev/Q|xvdb
+        $base/pop-F1/dev/V|xvdc
+        EOF
+        export LSBLK_TABLE=$PWD/tF1 NVME_BDEV_TABLE=$PWD/nF1
+        run F1
+        [ "$rc" = 0 ] && [ "$sel" = "$base/pop-F1/dev/Q" ] \
+          || fail F1 "ADR-022 3-EBS first boot must select xvdb by NVMe bdev-name (got rc=$rc sel=$sel)"
+        grep -q 'bdev-name xvdb' err || fail F1 "trail must show the bdev-name resolution"
+
+        # F2 swapped NVMe enumeration order (nondeterministic on EC2):
+        # the first-enumerated bare disk is xvdc, the second is sdb
+        # (with /dev/ prefix — both prefix forms occur in the wild) →
+        # select by bdev-name, not position.
+        mkpop F2 volR:R 'volR-part1:Rp1' 'volR-part2:Rp2' volV:V volQ:Q
+        cat > tF2 << EOF
+        $base/pop-F2/dev/R|disk|p1 p2||
+        $base/pop-F2/dev/Rp1|part|||
+        $base/pop-F2/dev/Rp2|part||/|
+        $base/pop-F2/dev/V|disk|||
+        $base/pop-F2/dev/Q|disk|||
+        EOF
+        cat > nF2 << EOF
+        $base/pop-F2/dev/V|xvdc
+        $base/pop-F2/dev/Q|/dev/sdb
+        EOF
+        export LSBLK_TABLE=$PWD/tF2 NVME_BDEV_TABLE=$PWD/nF2
+        run F2
+        [ "$rc" = 0 ] && [ "$sel" = "$base/pop-F2/dev/Q" ] \
+          || fail F2 "swapped-nvme-order must select by bdev-name not enumeration (got rc=$rc sel=$sel)"
+
+        # F3 reboot: rio-ebs-mount has labeled xvdc rio-var-rio → label
+        # exclusion (Class 3c) drops it before the NVMe ioctl is needed;
+        # bdev-name path agrees.
+        mkpop F3 volR:R 'volR-part1:Rp1' 'volR-part2:Rp2' volQ:Q volV:V
+        cat > tF3 << EOF
+        $base/pop-F3/dev/R|disk|p1 p2||
+        $base/pop-F3/dev/Rp1|part|||
+        $base/pop-F3/dev/Rp2|part||/|
+        $base/pop-F3/dev/Q|disk|||
+        $base/pop-F3/dev/V|disk|||rio-var-rio
+        EOF
+        cat > nF3 << EOF
+        $base/pop-F3/dev/Q|xvdb
+        $base/pop-F3/dev/V|xvdc
+        EOF
+        export LSBLK_TABLE=$PWD/tF3 NVME_BDEV_TABLE=$PWD/nF3
+        run F3
+        [ "$rc" = 0 ] && [ "$sel" = "$base/pop-F3/dev/Q" ] \
+          || fail F3 "reboot with rio-var-rio label must select xvdb (got rc=$rc sel=$sel)"
+        grep -q '1 var-rio' err || fail F3 "trail must count the label-excluded volume"
+
+        # F4 fail-closed: 2 bare disks, neither maps to xvdb/sdb → keep
+        # the typed refusal (the bdev-name path is a disambiguator, not
+        # a free pass).
+        mkpop F4 volA:A volB:B
+        cat > tF4 << EOF
+        $base/pop-F4/dev/A|disk|||
+        $base/pop-F4/dev/B|disk|||
+        EOF
+        cat > nF4 << EOF
+        $base/pop-F4/dev/A|xvdd
+        $base/pop-F4/dev/B|xvde
+        EOF
+        export LSBLK_TABLE=$PWD/tF4 NVME_BDEV_TABLE=$PWD/nF4
+        run F4
+        [ "$rc" = 1 ] && grep -q 'ambiguous; refusing' err \
+          || fail F4 "no xvdb/sdb match must keep fail-closed ambiguous (got rc=$rc sel=$sel)"
 
         touch $out
       '';
