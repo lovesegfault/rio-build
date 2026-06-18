@@ -21,7 +21,7 @@ description: Use when running checks or nix builds in this repo — the fast edi
 | Mode | What runs | When / how long |
 |---|---|---|
 | `--quick` (default) | All of `checks.<system>` **except** test execution — excludes `vm-*`, `nextest-*`, `fuzz-*`, `golden-*`, `mutants-*`, `cov-smoke`. That leaves per-crate clippy/clippy-test/doc, pre-commit, drift + policy checks, docs/dashboard renders. Untouched crates are cache hits, so nix decides what actually rebuilds. | Edit loop. Seconds-to-a-minute when little changed; a few minutes after a crate or docs change. |
-| `--checks` | `nix-fast-build` over the whole granular matrix (streams eval into builds via nix-eval-jobs). | Merge gate — every change must pass before merge. ~1min when the tree is mostly cached; 20min+ when VM tests / nextest need real rebuilds. |
+| `--checks` | `nix-fast-build` over the whole granular matrix (streams eval into builds via nix-eval-jobs). Passes `--fail-fast`: stops at the first failed build/eval instead of finishing the rest of the matrix. | Merge gate — every change must pass before merge. ~1min when the tree is mostly cached; 20min+ when VM tests / nextest need real rebuilds. |
 | `<flake-target>` | Single attr via `nix build`; leaves a `./result` out-link at the repo root. | One check, `.#coverage` (~25min uncached, needs KVM), debug builds. |
 
 `--quick` is **not** the merge bar: it skips nextest, VM, fuzz, golden-conformance, and mutation runs by design. The exclude regex lives in `.claude/bin/nixbuild` — keep this table in sync with it.

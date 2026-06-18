@@ -54,7 +54,16 @@ let
     # CI gate driver — `nix-fast-build --flake .#checks.x86_64-linux`
     # streams eval+build (per-attr nix-eval-jobs workers → builds
     # queue as drvs become known). Replaces the old `.#ci` aggregate.
-    nix-fast-build
+    # TODO: drop override once nixpkgs has 1.6.0 (needed for --fail-fast).
+    (nix-fast-build.overrideAttrs (_: rec {
+      version = "1.6.0";
+      src = fetchFromGitHub {
+        owner = "Mic92";
+        repo = "nix-fast-build";
+        tag = version;
+        hash = "sha256-PMBbenLBvn/0pSFOhwPVn171Vw7kU5YmBUNDhxllZ7c=";
+      };
+    }))
 
     # Cargo tools
     cargo-edit
