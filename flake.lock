@@ -296,11 +296,11 @@
     "tracey-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1778879820,
-        "narHash": "sha256-3RADu2G7VoeAQ7oGjY+c6DYxjHgnvfWARqyxe3r7m0I=",
+        "lastModified": 1781812975,
+        "narHash": "sha256-TWXZ5eRJ7bn6v68xTf6kbKwV+ZdOh97JU/mZg8Buzt0=",
         "owner": "lovesegfault",
         "repo": "tracey",
-        "rev": "a3f335e811097dc56e54ccec85d390a942d7d011",
+        "rev": "08a5c3ffe491d1e60eab0fdecabef3de9ffdf81f",
         "type": "github"
       },
       "original": {

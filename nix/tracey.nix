@@ -19,9 +19,9 @@ let
   # Flake input (not fetchFromGitHub): Cargo.lock is a store path at
   # eval time, so importCargoLock reads it without IFD.
   src = tracey-src;
-  # Workspace Cargo.toml still reports 1.3.0 — no tag yet past the
+  # Workspace Cargo.toml reports 2.0.0-rc.0 — no tag yet past the
   # typst-spec fork commits we want.
-  version = "1.3.0-unstable-2026-05-15";
+  version = "2.0.0-rc.0-unstable-2026-06-18";
 
   dashboardRoot = "crates/tracey/src/bridge/http/dashboard";
 
@@ -41,21 +41,28 @@ let
       sourceRoot = "source/${dashboardRoot}";
       pnpm = pkgs.pnpm_10;
       fetcherVersion = 3;
-      hash = "sha256-PtaMB8FSS4vNZMcRiGCqzm5tug9CFvzx3O8GLlv/xyk=";
+      hash = "sha256-4GDQkMyWfCD8sQxawVGh5IoTQ7YtFfFAnW++FXnJ76Y=";
     };
 
     nativeBuildInputs = with pkgs; [
       nodejs
       pnpm_10
       pnpmConfigHook
+      patchelf
     ];
 
     # `pnpm run build` is `tsc && vite build`. @typescript/native-preview
     # (a devDep) fetches a platform binary via postinstall, which
     # --ignore-scripts in fetchPnpmDeps/pnpmConfigHook skips. Vite's own
     # esbuild transform handles TS, so skip the standalone tsc step.
+    # sass-embedded-linux-x64 ships a prebuilt dart AOT runner linked
+    # against /lib64/ld-linux — patch its interpreter so vite's sass
+    # loader can spawn it (ENOENT otherwise).
     buildPhase = ''
       runHook preBuild
+      for f in node_modules/.pnpm/sass-embedded-linux-x64@*/node_modules/sass-embedded-linux-x64/dart-sass/src/dart; do
+        patchelf --set-interpreter ${pkgs.stdenv.cc.bintools.dynamicLinker} "$f"
+      done
       pnpm exec vite build
       runHook postBuild
     '';
@@ -124,10 +131,10 @@ rustPlatform.buildRustPackage {
   # index.html + assets/ at the top level, neither name is filtered).
   postPatch = ''
     substituteInPlace crates/tracey/build.rs --replace-fail \
-      'let dist_dir = dashboard_out.join("dist");' \
-      'let dist_dir = dashboard_out.join("dist");
+      'let dashboard_out = Path::new(&out_dir).join("dashboard");' \
+      'let dashboard_out = Path::new(&out_dir).join("dashboard");
       if let Ok(prebuilt) = std::env::var("TRACEY_PREBUILT_DASHBOARD") {
-          copy_dir_recursive(std::path::Path::new(&prebuilt), &dist_dir);
+          copy_dir_recursive(std::path::Path::new(&prebuilt), &dashboard_out.join("dist"));
           return;
       }'
   '';
