@@ -284,12 +284,50 @@ rec {
   checks = {
     docs-pdf = docsPdfCheck;
     docs-html = docsCheck;
-    # Placeholder until Task 10 lands the full assertion suite against
-    # the native-bundle output shape. Keeps the attr name alive so
-    # flake.nix's `// docsLib.checks` doesn't need touching mid-series.
-    docs-html-smoke = pkgs.runCommand "rio-docs-html-smoke" { } ''
-      test -f ${docsCheck}/index.html
-      touch $out
-    '';
+    # Structural smoke over the native-bundle output. Asserts the
+    # multi-page shape (every meta.typ chapter has a route), the page
+    # shell rendered (nav/active-marker/edit-link), fletcher diagrams
+    # survived html-target as inline SVG, the pagefind index landed,
+    # and no shiroa residue leaked into the emitted tree. Closes over
+    # docsCheck (placeholder-SHA) so it caches across commits that
+    # don't touch typst sources.
+    docs-html-smoke =
+      let
+        html = docsCheck;
+      in
+      pkgs.runCommand "rio-docs-html-smoke" { } ''
+        # (a) every chapter route has a file. Route list is scraped
+        # from meta.typ (the `chapters` table is the bundle's source of
+        # truth) — `typst query` is deprecated in 0.15, so grep is the
+        # primary path. `intro.typ` → index per meta.typ's route-for.
+        routes=$(grep -oE '"[a-z][a-z0-9/-]*\.typ"' \
+            ${compileRoot}/lib/html/meta.typ \
+          | tr -d '"' | sed 's/\.typ$//; s/^intro$/index/' | sort -u)
+        n=$(printf '%s\n' "$routes" | wc -l)
+        echo "docs-html-smoke: $n routes from meta.typ"
+        # Floor guards the regex: a meta.typ reformat that breaks the
+        # scrape would otherwise pass on zero routes.
+        test "$n" -ge 30
+        for r in $routes; do
+          test -f ${html}/$r.html || { echo "missing: $r.html"; exit 1; }
+        done
+        # (b) nav present + active-page marker on the landing page
+        grep -q '<nav' ${html}/index.html
+        grep -q 'aria-current="page"' ${html}/index.html
+        # (c) edit-this-page link (page.typ footer; repo-edit-base from
+        # meta.typ). architecture.typ is a top-level chapter so the
+        # href is unambiguous.
+        grep -q 'github.com/lovesegfault/rio-build/edit/main/docs/architecture.typ' \
+          ${html}/architecture.html
+        # (d) fletcher diagram survived html-target as inline SVG
+        grep -q '<svg' ${html}/architecture.html
+        # (e) pagefind index emitted
+        test -s ${html}/pagefind/pagefind.js
+        # (f) no shiroa residue in the emitted tree
+        if grep -rli shiroa ${html}; then
+          echo "shiroa residue in output (files listed above)"; exit 1
+        fi
+        touch $out
+      '';
   };
 }
