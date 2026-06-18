@@ -796,9 +796,10 @@ async fn execute_job_inner(
         );
         // Cancellation by drop (law 4): in-flight upstream bodies are
         // torn down with their futures; placeholder drop-guards reap
-        // the claims (W-6a); budget reservations ride the hash bytes
-        // (WO-R7-1) so a cancelled sibling's budget frees only when
-        // its memory does; moka recovers coalesced waiters by RETRY
+        // the claims (W-6a); budget reservations co-reside with the
+        // NAR bytes in the one cancellable tail frame (WO-R7-1) so a
+        // cancelled sibling's budget frees exactly when its memory
+        // does; moka recovers coalesced waiters by RETRY
         // with their own init futures (W-6b pins moka 0.12.15's
         // EnclosingFutureAborted semantics — no adoption). Pending
         // ticks die with the channel — no post-outcome zombie

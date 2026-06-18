@@ -890,11 +890,12 @@ impl NarHoldEnvelope {
 ///   MAX_NAR_SIZE` (the `>=` declared-size rejection runs first), so
 ///   the spec's single-handler no-self-deadlock premise holds on this
 ///   leg for every validate()-passing budget (floor `>= MAX_NAR_SIZE`).
-/// - **Lifetime covers byte residency:** the reservation moves WITH
-///   `nar_bytes` into the hash `spawn_blocking` closure (§3.2 step 4) —
-///   cancelling the leg at the hash detach point cannot credit the
-///   budget back while the detached blocking task still owns the
-///   buffer — and drops after `persist_nar` returns.
+/// - **Lifetime covers byte residency:** the reservation co-resides
+///   with `nar_bytes` in the one cancellable `tail` async frame
+///   (§3.2 step 4 — the digest is folded into the read loop, so no
+///   detach point remains). Cancelling the leg drops bytes and
+///   reservation atomically; on completion the reservation drops
+///   after `persist_nar` returns.
 /// - **Every hold expires:** the reservation cannot be constructed
 ///   without a [`NarHoldEnvelope`] (merged_bug_021 — an unenveloped
 ///   permit-hold does not typecheck). The envelope is armed at grant
