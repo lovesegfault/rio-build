@@ -2444,7 +2444,18 @@ in
         # that would FP docs' "Squid FOD proxy is deleted" prose.
         deny_shared='\bBuilderPool\b|\bFetcherPools?\b|rio-cli bps\b|`bps`|vm-lifecycle-bps|RIO_TLS__|\bTlsError\b|rio-common/src/tls\.rs|load_client_tls|init_client_tls|spec\.sizing|Sizing::|fuseCacheBudget|logBudget|migration-lock mechanism|trigger-gc|--grace-period-hours|mTLS client[- ]cert|mTLS cert mount|mTLS main port|VMs: mTLS|plaintext-health listener|TLS and plaintext ports|mTLS bypass|mTLS-identified|mTLS identifies|falls? back to mTLS|mTLS peer cert|\bplaintext port\b|CN-allowlist\)|\(gateway cert|dev-mode/dev-mode|TLS is env-only|\bTLS init\b|without relying on service tokens|replacement for the service-HMAC|RIO_JWT_SIGNING_KEY_PATH|rio\.jwt(Verify|Sign)Env|worker\.seccomp|`tls` / `metrics_addr`|\brio-worker\b|\bReadyQueue\b|\bpush_ready\b|\bqueue_priority\b|\bINTERACTIVE_BOOST\b|\bseed_ready_queue\b|\brearm_materialization_job\b|\btrim_chunk\b|\bDEFAULT_PEER_URL_TEMPLATE\b|\btick_publish_gauges\b|\bpull_attempt_seen_open\b|\bclosure_vouched\b|\bFencedWrite\b|\brollback_assignment\b|\bCOLLECT_CURSOR\b|\bCOLLECT_BACKLOG_ESTIMATE\b|rio_scheduler_workers_active|rio_scheduler_queue_depth|rio-scheduler/src/logs/|store-side 4096|[Tt]emplate brackets \\{pod\\}|Bracketed for v6-only|\bfold_tenant_reprobes\b|\bfresh_mint_allowance\b|\bSTEAL_SPECULATION_ALLOWANCE\b|\bfresh_mint_headroom\b|\bMaterializeTransport\b|\brio_scheduler_sla_class_ceiling_uncatalogued\b|\b00-estimator-refresh\b|\bFloorAxis\b|\baxis_for_reason_label\b|\bstarted_with_predecessor\b|\bbump_floor_or_count\b|\bCorroborationWitness\b|\bWitnessAxis\b|\bcorroborated_sizing\b|\bcorroborated_timeout\b|\bcorroborated_compute_bound\b|\bbump_floor_on_corroborated_claim\b|\bWitnessedDisposition\b|\bbump_resource_floor\b|\bSizingClaim\b|\bbump_dim\b|\bsizing_class_label\b|\bCoresOutcome\b|\bHashGate\b|\bhash_gate\b|\bwith_hash_gate\b|\btick_reevaluate_parked_materialization_jobs\b|\bparse_or_warn_default\b|\bhard_cores\b|\bhard_mem\b|\bhard_disk\b|ObservedPeaks::witnessed\b|\bAxisTrust\b|\bdebug_seed_running_peaks\b|\bsanitize_cpu_seconds\b'
         deny_docs="$deny_shared|\bmTLS\b|fod-proxy|bundled into the scheduler|kubectl exec deploy/rio-scheduler -- rio-cli"
-        deny_cross="$deny_shared|[Ff][Oo][Dd][- ]proxy"
+        # ADR-022: erofs+fscache → castore-FUSE-over-io_uring. The
+        # `_ONDEMAND` Kconfig symbols + the `rio-ondemand` kernelPatches
+        # name are retired from code/infra now; deny_cross-only because
+        # the docs sweep (lazy-store.typ supersede, deployment.typ:76,
+        # controller.typ:2739) lands with the adr-022-rebasing merge —
+        # hoist to deny_shared then. Bare `EROFS` is NOT denied: live
+        # errno name. Verified 2026-06-18:
+        #   rg -n 'EROFS_FS_ONDEMAND|CACHEFILES_ONDEMAND|rio-ondemand' \
+        #     --type-not typst --type-not md
+        #   => (no hits after nix/nixos-node/hardening.nix kernelPatches
+        #       deletion)
+        deny_cross="$deny_shared|[Ff][Oo][Dd][- ]proxy|\bEROFS_FS_ONDEMAND\b|\bCACHEFILES_ONDEMAND\b|\brio-ondemand\b"
         # builder.typ's "Formerly `rio-worker`" info-box is the rename
         # record (deliberate); allowlist it for the rio-worker pattern.
         if grep -rn -E "$deny_docs" $typSrc | grep -vE 'glossary\.typ|builder\.typ:.*Formerly|builder\.typ:.*r\[worker'; then
