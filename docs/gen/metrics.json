@@ -1615,7 +1615,7 @@
       {
         "name": "rio_store_hmac_rejected_total",
         "kind": "counter",
-        "help": "Upload/log-ingest rejections by the HMAC assignment-token gate, by reason: missing_token / invalid_token (no or unverifiable x-rio-assignment-token), path_not_in_claims (token valid but the uploaded path is not in its claim set), ca_path_mismatch (CA-derived path does not match the claimed output), service_token_invalid / service_caller_not_allowlisted / service_caller_not_permitted (the x-rio-service-token bypass failed verification or allowlisting). Sustained non-zero from one builder = a stale or forged token source."
+        "help": "Upload/log-ingest rejections by the HMAC assignment-token gate, by reason: missing_token / invalid_token (no or unverifiable x-rio-assignment-token), path_not_in_claims (token valid but the uploaded path is not in its claim set), ca_path_mismatch (CA-derived path does not match the claimed output), input_closure_mismatch (echoed closure digest disagrees with the token's attested digest), deriver_mismatch (recorded deriver does not match the token's drv_hash), service_token_invalid / service_caller_not_allowlisted / service_caller_not_permitted (the x-rio-service-token bypass failed verification or allowlisting). Sustained non-zero from one builder = a stale or forged token source."
       },
       {
         "name": "rio_store_integrity_failures_total",
@@ -1765,7 +1765,7 @@
       {
         "name": "rio_store_putpath_concurrent_wait_total",
         "kind": "counter",
-        "help": "Concurrent same-path PutPath/PutPathChunked waits resolved, labeled by outcome: completed (winner committed; waiter took the idempotent skip), takeover (winner aborted; waiter claimed the freed placeholder), timeout (budget exhausted; ABORTED surfaced to the client's own retry logic)."
+        "help": "Concurrent same-path PutPath/PutPathChunked waits resolved, labeled by outcome: waiting (entry marker before the first poll; the only label that fires while still parked), completed (winner committed; waiter took the idempotent skip), takeover (winner aborted; waiter claimed the freed placeholder), timeout (budget exhausted; ABORTED surfaced to the client's own retry logic)."
       },
       {
         "name": "rio_store_putpath_incomplete_total",

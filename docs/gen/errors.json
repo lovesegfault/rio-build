@@ -355,7 +355,7 @@
       "name": "Prefetch",
       "crate": "rio-builder",
       "msg": "DAG prefetch: {0}",
-      "doc": "The closure DAG prefetch / [`InoMap`](crate::castore_fuse::tree::InoMap) construction failed."
+      "doc": "The closure DAG prefetch / [`InoMap`] construction failed."
     },
     {
       "enum": "TreeError",

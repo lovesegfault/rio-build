@@ -253,6 +253,9 @@ pub(super) async fn upload_outputs_chunked(
 /// (`InvalidArgument`, `FailedPrecondition`, `PermissionDenied`, …)
 /// would fail identically on every attempt.
 fn is_retryable(code: tonic::Code) -> bool {
+    // refusal-census: allow(upload-restart retry fold — augments
+    // is_transient with the two store-side codes whose retry costs only
+    // a re-walk; not a refusal adjudication seam)
     rio_common::grpc::is_transient(code)
         || matches!(code, tonic::Code::DeadlineExceeded | tonic::Code::Internal)
 }

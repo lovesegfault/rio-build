@@ -847,6 +847,10 @@ impl Opener {
                 tracing::warn!(digest = %hex::encode(digest), ?timeout, "ReadBlob timed out");
                 Err(StreamBlobError::Fatal(Errno::EIO))
             }
+            // refusal-census: allow(transient-retry classification at the
+            // FUSE blob-open seam — surfaces as EIO-vs-retry, not as a
+            // user-visible refusal; rio_proto::refusal owns refusal
+            // adjudication, this is the local I/O retry fold)
             Ok(Err(status))
                 if matches!(
                     status.code(),

@@ -1,6 +1,6 @@
 {{- if .Values.store.enabled }}
 {{- $s := .Values.store -}}
-{{- $cb := $s.chunkBackend | default dict -}}
+{{- $cb := $s.chunkBackend -}}
 {{- $fsChunks := eq ($cb.kind | default "") "filesystem" -}}
 {{- $express := and (eq ($cb.kind | default "") "tiered") $cb.expressBuckets -}}
 apiVersion: apps/v1
