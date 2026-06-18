@@ -3,16 +3,20 @@
   "root": null,
   "workspaceMembers": {
     "rio-auth": "rio-auth",
+    "rio-authz-kernel": "rio-authz-kernel",
     "rio-builder": "rio-builder",
     "rio-cli": "rio-cli",
     "rio-common": "rio-common",
     "rio-controller": "rio-controller",
     "rio-crds": "rio-crds",
+    "rio-evidence-kernel": "rio-evidence-kernel",
     "rio-gateway": "rio-gateway",
     "rio-lease": "rio-lease",
+    "rio-log-kernel": "rio-log-kernel",
     "rio-migrations": "rio-migrations",
     "rio-nix": "rio-nix",
     "rio-proto": "rio-proto",
+    "rio-retry-kernel": "rio-retry-kernel",
     "rio-scheduler": "rio-scheduler",
     "rio-store": "rio-store",
     "rio-test-support": "rio-test-support",
@@ -2303,7 +2307,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "pin-project-lite",
@@ -3708,7 +3712,8 @@
         "type": "crates-io"
       },
       "resolvedDefaultFeatures": [
-        "alloc"
+        "alloc",
+        "std"
       ],
       "libCrateTypes": [
         "lib"
@@ -4085,6 +4090,10 @@
           "packageId": "num-traits"
         },
         {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
           "name": "wasm-bindgen",
           "packageId": "wasm-bindgen",
           "target": "cfg(all(target_arch = \"wasm32\", not(any(target_os = \"emscripten\", target_os = \"wasi\"))))"
@@ -4103,6 +4112,7 @@
         "js-sys",
         "now",
         "oldtime",
+        "serde",
         "std",
         "wasm-bindgen",
         "wasmbind",
@@ -4462,6 +4472,28 @@
       },
       "libCrateTypes": [
         "lib"
+      ]
+    },
+    "colored": {
+      "crateName": "colored",
+      "version": "3.1.1",
+      "edition": "2021",
+      "sha256": "0d5cpbgvyvmmky199s885s6385ykd75q6qg3d2kcxjxq563ldygs",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "windows-sys",
+          "packageId": "windows-sys 0.61.2",
+          "target": "cfg(windows)"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Thomas Wickham <mackwic@gmail.com>"
       ]
     },
     "combine": {
@@ -5547,6 +5579,76 @@
         "Acrimon <joel.wejdenstal@gmail.com>"
       ]
     },
+    "dashu-base": {
+      "crateName": "dashu-base",
+      "version": "0.4.2",
+      "edition": "2021",
+      "sha256": "135k714n87zxxhj63rh0ddnxdfr8rn2b70dxh193k1c5disz1czs",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jacob Zhong <cmpute@gmail.com>"
+      ]
+    },
+    "dashu-int": {
+      "crateName": "dashu-int",
+      "version": "0.4.2",
+      "edition": "2021",
+      "sha256": "04y7sfq5473fafy3f43s6ls8n7j4hgw2mjvf3q3rmjiavj9kvafn",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cfg-if",
+          "packageId": "cfg-if"
+        },
+        {
+          "name": "dashu-base",
+          "packageId": "dashu-base"
+        },
+        {
+          "name": "num-modular",
+          "packageId": "num-modular"
+        },
+        {
+          "name": "num-order",
+          "packageId": "num-order"
+        },
+        {
+          "name": "rustversion",
+          "packageId": "rustversion"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "static_assertions",
+          "packageId": "static_assertions"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "num-order",
+        "serde",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jacob Zhong <cmpute@gmail.com>",
+        "Tomek Czajka <tczajka@gmail.com>"
+      ]
+    },
     "data-encoding": {
       "crateName": "data-encoding",
       "version": "2.11.0",
@@ -5679,11 +5781,16 @@
         {
           "name": "powerfmt",
           "packageId": "powerfmt"
+        },
+        {
+          "name": "serde_core",
+          "packageId": "serde_core"
         }
       ],
       "resolvedDefaultFeatures": [
         "default",
-        "powerfmt"
+        "powerfmt",
+        "serde"
       ],
       "libCrateTypes": [
         "lib"
@@ -11223,7 +11330,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "slab",
@@ -11285,7 +11392,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "slab",
@@ -11397,6 +11504,24 @@
       ],
       "authors": [
         "Jon Gjengset <jon@thesquareplanet.com>"
+      ]
+    },
+    "hashbrown 0.12.3": {
+      "crateName": "hashbrown",
+      "version": "0.12.3",
+      "edition": "2021",
+      "sha256": "1268ka4750pyg2pbgsr43f0289l5zah4arir2k4igx5a8c6fg7la",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "raw"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Amanieu d'Antras <amanieu@gmail.com>"
       ]
     },
     "hashbrown 0.14.5": {
@@ -12879,7 +13004,40 @@
         "The rust-url developers"
       ]
     },
-    "indexmap": {
+    "indexmap 1.9.3": {
+      "crateName": "indexmap",
+      "version": "1.9.3",
+      "edition": "2021",
+      "sha256": "16dxmy7yvk51wvnih3a3im6fp5lmx0wx76i03n06wyak6cwhw1xx",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.12.3"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "autocfg",
+          "packageId": "autocfg"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "serde",
+        "serde-1",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "indexmap 2.14.0": {
       "crateName": "indexmap",
       "version": "2.14.0",
       "edition": "2024",
@@ -13144,6 +13302,39 @@
       ],
       "authors": [
         "bluss"
+      ]
+    },
+    "itf": {
+      "crateName": "itf",
+      "version": "0.4.0",
+      "edition": "2021",
+      "sha256": "080wnz5b9fdxh9virzzc7pilxzxa1cjd224jva0har8p7mxhnqjx",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "dashu-int",
+          "packageId": "dashu-int"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "serde_with",
+          "packageId": "serde_with"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Informal Systems <hello@informal.sytems>"
       ]
     },
     "itoa": {
@@ -14017,7 +14208,7 @@
         },
         {
           "name": "schemars",
-          "packageId": "schemars"
+          "packageId": "schemars 1.2.1"
         },
         {
           "name": "serde",
@@ -14875,7 +15066,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "ipnet",
@@ -14951,7 +15142,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "metrics",
@@ -15677,6 +15868,36 @@
       ],
       "authors": [
         "The Rust Project Developers"
+      ]
+    },
+    "num-modular": {
+      "crateName": "num-modular",
+      "version": "0.6.4",
+      "edition": "2018",
+      "sha256": "1q6m6z103n8l3rv0id61wb815ghndjk5hyan44i6gsan80vs2hgw",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "num-order": {
+      "crateName": "num-order",
+      "version": "1.2.0",
+      "edition": "2018",
+      "sha256": "1dhvdncf91ljxh9sawnfxcbiqj1gnag08lyias0cy3y4jxmmjysk",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "num-modular",
+          "packageId": "num-modular"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "num-rational": {
@@ -17016,7 +17237,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -17685,7 +17906,8 @@
       ],
       "resolvedDefaultFeatures": [
         "default",
-        "proc-macro"
+        "proc-macro",
+        "span-locations"
       ],
       "libCrateTypes": [
         "lib"
@@ -18293,6 +18515,92 @@
       ],
       "libCrateTypes": [
         "lib"
+      ]
+    },
+    "quint-connect": {
+      "crateName": "quint-connect",
+      "version": "0.1.2",
+      "edition": "2024",
+      "sha256": "076n37va9yias7pb6n4172b9z43w4g9ha67lxxrhnn6lldbf3937",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "anyhow",
+          "packageId": "anyhow"
+        },
+        {
+          "name": "colored",
+          "packageId": "colored"
+        },
+        {
+          "name": "itf",
+          "packageId": "itf"
+        },
+        {
+          "name": "quint-connect-macros",
+          "packageId": "quint-connect-macros"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.9.4"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "similar",
+          "packageId": "similar"
+        },
+        {
+          "name": "tempfile",
+          "packageId": "tempfile"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "version_check",
+          "packageId": "version_check"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Informal Systems Inc. <hello@informal.systems>"
+      ]
+    },
+    "quint-connect-macros": {
+      "crateName": "quint-connect-macros",
+      "version": "0.1.2",
+      "edition": "2024",
+      "sha256": "0pvkrn67rdciv0rnr8gx4y40p67syf9a9z97f66vfmd6dw3nwk41",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
+        }
+      ],
+      "procMacro": true,
+      "authors": [
+        "Informal Systems Inc. <hello@informal.systems>"
       ]
     },
     "quote": {
@@ -19205,6 +19513,10 @@
           "packageId": "jsonwebtoken"
         },
         {
+          "name": "metrics",
+          "packageId": "metrics"
+        },
+        {
           "name": "rio-common",
           "packageId": "rio-common"
         },
@@ -19251,14 +19563,37 @@
           "packageId": "libc"
         },
         {
+          "name": "metrics-util",
+          "packageId": "metrics-util"
+        },
+        {
           "name": "proptest",
           "packageId": "proptest"
         },
         {
           "name": "tempfile",
           "packageId": "tempfile"
+        },
+        {
+          "name": "tracing-test",
+          "packageId": "tracing-test"
         }
       ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
+    "rio-authz-kernel": {
+      "crateName": "rio-authz-kernel",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-authz-kernel"
+      },
       "libCrateTypes": [
         "lib"
       ],
@@ -19336,6 +19671,10 @@
           "packageId": "rio-common"
         },
         {
+          "name": "rio-log-kernel",
+          "packageId": "rio-log-kernel"
+        },
+        {
           "name": "rio-nix",
           "packageId": "rio-nix"
         },
@@ -19345,7 +19684,7 @@
         },
         {
           "name": "schemars",
-          "packageId": "schemars"
+          "packageId": "schemars 1.2.1"
         },
         {
           "name": "scopeguard",
@@ -19370,6 +19709,10 @@
         {
           "name": "sqlx",
           "packageId": "sqlx"
+        },
+        {
+          "name": "strum",
+          "packageId": "strum"
         },
         {
           "name": "thiserror",
@@ -19401,6 +19744,10 @@
         }
       ],
       "devDependencies": [
+        {
+          "name": "proptest",
+          "packageId": "proptest"
+        },
         {
           "name": "rio-auth",
           "packageId": "rio-auth"
@@ -19442,6 +19789,10 @@
         {
           "name": "fsbench",
           "path": "src/bin/fsbench/main.rs"
+        },
+        {
+          "name": "quota_probe",
+          "path": "src/bin/quota_probe.rs"
         },
         {
           "name": "rio-builder",
@@ -19507,6 +19858,10 @@
         {
           "name": "rio-crds",
           "packageId": "rio-crds"
+        },
+        {
+          "name": "rio-log-kernel",
+          "packageId": "rio-log-kernel"
         },
         {
           "name": "rio-proto",
@@ -19607,6 +19962,10 @@
           "packageId": "futures-util"
         },
         {
+          "name": "http",
+          "packageId": "http 1.4.0"
+        },
+        {
           "name": "metrics",
           "packageId": "metrics"
         },
@@ -19636,7 +19995,7 @@
         },
         {
           "name": "schemars",
-          "packageId": "schemars"
+          "packageId": "schemars 1.2.1"
         },
         {
           "name": "serde",
@@ -19671,8 +20030,16 @@
           "packageId": "tonic-health"
         },
         {
+          "name": "tower-http",
+          "packageId": "tower-http"
+        },
+        {
           "name": "tracing",
           "packageId": "tracing"
+        },
+        {
+          "name": "tracing-appender",
+          "packageId": "tracing-appender"
         },
         {
           "name": "tracing-opentelemetry",
@@ -19742,6 +20109,10 @@
           "packageId": "anyhow"
         },
         {
+          "name": "axum",
+          "packageId": "axum"
+        },
+        {
           "name": "clap",
           "packageId": "clap"
         },
@@ -19774,6 +20145,10 @@
           "packageId": "rand 0.10.1"
         },
         {
+          "name": "reqwest",
+          "packageId": "reqwest"
+        },
+        {
           "name": "rio-auth",
           "packageId": "rio-auth"
         },
@@ -19799,7 +20174,7 @@
         },
         {
           "name": "schemars",
-          "packageId": "schemars"
+          "packageId": "schemars 1.2.1"
         },
         {
           "name": "serde",
@@ -19844,6 +20219,10 @@
           "packageId": "metrics-util"
         },
         {
+          "name": "proptest",
+          "packageId": "proptest"
+        },
+        {
           "name": "prost",
           "packageId": "prost"
         },
@@ -19854,6 +20233,10 @@
         {
           "name": "tokio",
           "packageId": "tokio"
+        },
+        {
+          "name": "tracing-subscriber",
+          "packageId": "tracing-subscriber"
         }
       ],
       "crateBin": [
@@ -19888,7 +20271,7 @@
         },
         {
           "name": "schemars",
-          "packageId": "schemars"
+          "packageId": "schemars 1.2.1"
         },
         {
           "name": "serde",
@@ -19913,6 +20296,21 @@
           "path": "src/bin/crdgen.rs"
         }
       ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
+    "rio-evidence-kernel": {
+      "crateName": "rio-evidence-kernel",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-evidence-kernel"
+      },
       "libCrateTypes": [
         "lib"
       ],
@@ -19982,6 +20380,10 @@
           "packageId": "rio-common"
         },
         {
+          "name": "rio-log-kernel",
+          "packageId": "rio-log-kernel"
+        },
+        {
           "name": "rio-nix",
           "packageId": "rio-nix"
         },
@@ -19995,7 +20397,7 @@
         },
         {
           "name": "schemars",
-          "packageId": "schemars"
+          "packageId": "schemars 1.2.1"
         },
         {
           "name": "serde",
@@ -20043,6 +20445,10 @@
         }
       ],
       "devDependencies": [
+        {
+          "name": "metrics-util",
+          "packageId": "metrics-util"
+        },
         {
           "name": "rio-migrations",
           "packageId": "rio-migrations"
@@ -20103,6 +20509,14 @@
           "packageId": "kube"
         },
         {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
+          "name": "metrics",
+          "packageId": "metrics"
+        },
+        {
           "name": "parking_lot",
           "packageId": "parking_lot"
         },
@@ -20133,14 +20547,57 @@
       ],
       "devDependencies": [
         {
+          "name": "anyhow",
+          "packageId": "anyhow"
+        },
+        {
           "name": "http",
           "packageId": "http 1.4.0"
         },
         {
+          "name": "itf",
+          "packageId": "itf"
+        },
+        {
+          "name": "metrics-util",
+          "packageId": "metrics-util"
+        },
+        {
+          "name": "quint-connect",
+          "packageId": "quint-connect"
+        },
+        {
           "name": "rio-test-support",
           "packageId": "rio-test-support"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
         }
       ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
+    "rio-log-kernel": {
+      "crateName": "rio-log-kernel",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-log-kernel"
+      },
       "libCrateTypes": [
         "lib"
       ],
@@ -20267,12 +20724,20 @@
           "packageId": "anyhow"
         },
         {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
           "name": "proptest",
           "packageId": "proptest"
         },
         {
           "name": "rstest",
           "packageId": "rstest"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
         },
         {
           "name": "tempfile",
@@ -20410,6 +20875,21 @@
         "Rio Contributors"
       ]
     },
+    "rio-retry-kernel": {
+      "crateName": "rio-retry-kernel",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-retry-kernel"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
     "rio-scheduler": {
       "crateName": "rio-scheduler",
       "version": "0.1.0",
@@ -20432,8 +20912,8 @@
           "packageId": "aws-sdk-ec2"
         },
         {
-          "name": "aws-sdk-s3",
-          "packageId": "aws-sdk-s3"
+          "name": "axum",
+          "packageId": "axum"
         },
         {
           "name": "base64",
@@ -20504,6 +20984,10 @@
           "packageId": "rio-common"
         },
         {
+          "name": "rio-evidence-kernel",
+          "packageId": "rio-evidence-kernel"
+        },
+        {
           "name": "rio-lease",
           "packageId": "rio-lease"
         },
@@ -20520,12 +21004,16 @@
           "packageId": "rio-proto"
         },
         {
+          "name": "rio-retry-kernel",
+          "packageId": "rio-retry-kernel"
+        },
+        {
           "name": "rio-store",
           "packageId": "rio-store"
         },
         {
           "name": "schemars",
-          "packageId": "schemars"
+          "packageId": "schemars 1.2.1"
         },
         {
           "name": "serde",
@@ -20590,20 +21078,12 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
-        },
-        {
-          "name": "zstd",
-          "packageId": "zstd"
         }
       ],
       "devDependencies": [
         {
           "name": "aws-sdk-ec2",
           "packageId": "aws-sdk-ec2"
-        },
-        {
-          "name": "aws-sdk-s3",
-          "packageId": "aws-sdk-s3"
         },
         {
           "name": "aws-smithy-mocks",
@@ -20616,6 +21096,10 @@
         {
           "name": "http",
           "packageId": "http 1.4.0"
+        },
+        {
+          "name": "itf",
+          "packageId": "itf"
         },
         {
           "name": "metrics-util",
@@ -20634,6 +21118,10 @@
           "packageId": "proptest"
         },
         {
+          "name": "quint-connect",
+          "packageId": "quint-connect"
+        },
+        {
           "name": "rio-store",
           "packageId": "rio-store"
         },
@@ -20644,6 +21132,10 @@
         {
           "name": "rstest",
           "packageId": "rstest"
+        },
+        {
+          "name": "serde-saphyr",
+          "packageId": "serde-saphyr"
         },
         {
           "name": "tokio",
@@ -20745,6 +21237,10 @@
           "packageId": "hex"
         },
         {
+          "name": "http",
+          "packageId": "http 1.4.0"
+        },
+        {
           "name": "httpdate",
           "packageId": "httpdate"
         },
@@ -20769,8 +21265,20 @@
           "packageId": "rio-auth"
         },
         {
+          "name": "rio-authz-kernel",
+          "packageId": "rio-authz-kernel"
+        },
+        {
           "name": "rio-common",
           "packageId": "rio-common"
+        },
+        {
+          "name": "rio-evidence-kernel",
+          "packageId": "rio-evidence-kernel"
+        },
+        {
+          "name": "rio-log-kernel",
+          "packageId": "rio-log-kernel"
         },
         {
           "name": "rio-migrations",
@@ -20790,7 +21298,7 @@
         },
         {
           "name": "schemars",
-          "packageId": "schemars"
+          "packageId": "schemars 1.2.1"
         },
         {
           "name": "scopeguard",
@@ -20837,6 +21345,18 @@
           "packageId": "tonic-health"
         },
         {
+          "name": "tonic-web",
+          "packageId": "tonic-web"
+        },
+        {
+          "name": "tower",
+          "packageId": "tower"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http"
+        },
+        {
           "name": "tracing",
           "packageId": "tracing"
         },
@@ -20847,6 +21367,10 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
         }
       ],
       "devDependencies": [
@@ -20859,6 +21383,10 @@
           "packageId": "aws-smithy-mocks"
         },
         {
+          "name": "aws-smithy-runtime-api",
+          "packageId": "aws-smithy-runtime-api"
+        },
+        {
           "name": "axum",
           "packageId": "axum"
         },
@@ -20867,12 +21395,32 @@
           "packageId": "config"
         },
         {
+          "name": "itf",
+          "packageId": "itf"
+        },
+        {
           "name": "metrics",
           "packageId": "metrics"
         },
         {
+          "name": "metrics-util",
+          "packageId": "metrics-util"
+        },
+        {
           "name": "proptest",
           "packageId": "proptest"
+        },
+        {
+          "name": "prost",
+          "packageId": "prost"
+        },
+        {
+          "name": "prost-types",
+          "packageId": "prost-types"
+        },
+        {
+          "name": "quint-connect",
+          "packageId": "quint-connect"
         },
         {
           "name": "rio-store",
@@ -22194,7 +22742,43 @@
         "Steffen Butzer <steffen.butzer@outlook.com>"
       ]
     },
-    "schemars": {
+    "schemars 0.9.0": {
+      "crateName": "schemars",
+      "version": "0.9.0",
+      "edition": "2021",
+      "sha256": "0pqncln5hqbzbl2r3yayyr4a82jjf93h2cfxrn0xamvx77wr3lac",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "dyn-clone",
+          "packageId": "dyn-clone"
+        },
+        {
+          "name": "ref-cast",
+          "packageId": "ref-cast"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Graham Esau <gesau@hotmail.co.uk>"
+      ]
+    },
+    "schemars 1.2.1": {
       "crateName": "schemars",
       "version": "1.2.1",
       "edition": "2021",
@@ -22795,7 +23379,7 @@
       "dependencies": [
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "itoa",
@@ -22921,6 +23505,69 @@
         "Anthony Ramine <n.oxyde@gmail.com>"
       ]
     },
+    "serde_with": {
+      "crateName": "serde_with",
+      "version": "3.21.0",
+      "edition": "2021",
+      "sha256": "134ydsww9awaga8yvcqj7rn8gpcx75z6sa3waywvirqhfd6cb9bn",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "serde_core",
+          "packageId": "serde_core"
+        },
+        {
+          "name": "serde_with_macros",
+          "packageId": "serde_with_macros"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "default",
+        "macros",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jonas Bushart",
+        "Marcin Kaźmierczak"
+      ]
+    },
+    "serde_with_macros": {
+      "crateName": "serde_with_macros",
+      "version": "3.21.0",
+      "edition": "2021",
+      "sha256": "0q5ndgb7mhdq9cclbawpki5dal28jaxsdnkqq4h7k8drr307pmc4",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "darling",
+          "packageId": "darling"
+        },
+        {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
+        }
+      ],
+      "procMacro": true,
+      "authors": [
+        "Jonas Bushart"
+      ]
+    },
     "serde_yaml": {
       "crateName": "serde_yaml",
       "version": "0.9.34+deprecated",
@@ -22932,7 +23579,7 @@
       "dependencies": [
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "itoa",
@@ -23436,6 +24083,27 @@
         "Hans Kratz <hans@appfour.com>"
       ]
     },
+    "similar": {
+      "crateName": "similar",
+      "version": "2.7.0",
+      "edition": "2018",
+      "sha256": "1aidids7ymfr96s70232s6962v5g9l4zwhkvcjp4c5hlb6b5vfxv",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default",
+        "text"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Armin Ronacher <armin.ronacher@active-4.com>",
+        "Pierre-Étienne Meunier <pe@pijul.org>",
+        "Brandon Williams <bwilliams.eng@gmail.com>"
+      ]
+    },
     "sketches-ddsketch": {
       "crateName": "sketches-ddsketch",
       "version": "0.3.1",
@@ -23809,7 +24477,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "log",
@@ -24785,6 +25453,21 @@
         "Henry de Valence <hdevalence@hdevalence.ca>"
       ]
     },
+    "symlink": {
+      "crateName": "symlink",
+      "version": "0.1.0",
+      "edition": "2015",
+      "sha256": "02h1i0b81mxb4vns4xrvrfibpcvs7jqqav8p3yilwik8cv73r5x7",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Chris Morgan <me@chrismorgan.info>"
+      ]
+    },
     "syn": {
       "crateName": "syn",
       "version": "2.0.117",
@@ -25086,12 +25769,20 @@
           "packageId": "deranged"
         },
         {
+          "name": "itoa",
+          "packageId": "itoa"
+        },
+        {
           "name": "num-conv",
           "packageId": "num-conv"
         },
         {
           "name": "powerfmt",
           "packageId": "powerfmt"
+        },
+        {
+          "name": "serde_core",
+          "packageId": "serde_core"
         },
         {
           "name": "time-core",
@@ -25101,7 +25792,10 @@
       "resolvedDefaultFeatures": [
         "alloc",
         "default",
+        "formatting",
         "parsing",
+        "serde",
+        "serde-well-known",
         "std"
       ],
       "libCrateTypes": [
@@ -25147,7 +25841,9 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "parsing"
+        "formatting",
+        "parsing",
+        "serde"
       ],
       "procMacro": true,
       "authors": [
@@ -25201,6 +25897,7 @@
         "alloc",
         "default",
         "grab_spare_slice",
+        "std",
         "tinyvec_macros"
       ],
       "libCrateTypes": [
@@ -25614,7 +26311,7 @@
       "dependencies": [
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "toml_datetime",
@@ -26046,7 +26743,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "pin-project-lite",
@@ -26305,6 +27002,44 @@
       ],
       "authors": [
         "Eliza Weisman <eliza@buoyant.io>",
+        "Tokio Contributors <team@tokio.rs>"
+      ]
+    },
+    "tracing-appender": {
+      "crateName": "tracing-appender",
+      "version": "0.2.5",
+      "edition": "2018",
+      "sha256": "0g4a6q5s3wafid5lqw1ljzvh1nhk3a4zmb627fxv96dr7qcqc1h5",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "crossbeam-channel",
+          "packageId": "crossbeam-channel"
+        },
+        {
+          "name": "symlink",
+          "packageId": "symlink"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror"
+        },
+        {
+          "name": "time",
+          "packageId": "time"
+        },
+        {
+          "name": "tracing-subscriber",
+          "packageId": "tracing-subscriber"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Zeki Sherif <zekshi@amazon.com>",
         "Tokio Contributors <team@tokio.rs>"
       ]
     },
@@ -27506,7 +28241,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "wasm-encoder",
@@ -27578,7 +28313,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "semver",
@@ -28716,7 +29451,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "prettyplease",
@@ -28811,7 +29546,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "log",
@@ -28872,7 +29607,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "log",
@@ -28925,6 +29660,10 @@
         "path": "workspace-hack"
       },
       "dependencies": [
+        {
+          "name": "aho-corasick",
+          "packageId": "aho-corasick"
+        },
         {
           "name": "anstyle",
           "packageId": "anstyle"
@@ -29132,7 +29871,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "inout",
@@ -29247,12 +29986,20 @@
           "packageId": "primeorder 0.14.0-rc.9"
         },
         {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
           "name": "prost",
           "packageId": "prost"
         },
         {
           "name": "quanta",
           "packageId": "quanta"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
         },
         {
           "name": "rand",
@@ -29393,12 +30140,20 @@
           "packageId": "subtle"
         },
         {
+          "name": "syn",
+          "packageId": "syn"
+        },
+        {
           "name": "sync_wrapper",
           "packageId": "sync_wrapper"
         },
         {
           "name": "thiserror",
           "packageId": "thiserror"
+        },
+        {
+          "name": "time",
+          "packageId": "time"
         },
         {
           "name": "tokio",
@@ -29489,21 +30244,13 @@
         {
           "name": "zeroize",
           "packageId": "zeroize"
-        },
-        {
-          "name": "zstd",
-          "packageId": "zstd"
-        },
-        {
-          "name": "zstd-safe",
-          "packageId": "zstd-safe"
-        },
-        {
-          "name": "zstd-sys",
-          "packageId": "zstd-sys"
         }
       ],
       "buildDependencies": [
+        {
+          "name": "aho-corasick",
+          "packageId": "aho-corasick"
+        },
         {
           "name": "anstyle",
           "packageId": "anstyle"
@@ -29715,7 +30462,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap"
+          "packageId": "indexmap 2.14.0"
         },
         {
           "name": "inout",
@@ -29830,12 +30577,20 @@
           "packageId": "primeorder 0.14.0-rc.9"
         },
         {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
           "name": "prost",
           "packageId": "prost"
         },
         {
           "name": "quanta",
           "packageId": "quanta"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
         },
         {
           "name": "rand",
@@ -29988,6 +30743,10 @@
           "packageId": "thiserror"
         },
         {
+          "name": "time",
+          "packageId": "time"
+        },
+        {
           "name": "tokio",
           "packageId": "tokio"
         },
@@ -30076,18 +30835,6 @@
         {
           "name": "zeroize",
           "packageId": "zeroize"
-        },
-        {
-          "name": "zstd",
-          "packageId": "zstd"
-        },
-        {
-          "name": "zstd-safe",
-          "packageId": "zstd-safe"
-        },
-        {
-          "name": "zstd-sys",
-          "packageId": "zstd-sys"
         }
       ],
       "libCrateTypes": [
@@ -30276,6 +31023,14 @@
           "packageId": "nix 0.31.3"
         },
         {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
+        },
+        {
           "name": "rand",
           "packageId": "rand 0.10.1"
         },
@@ -30294,6 +31049,10 @@
         {
           "name": "rio-crds",
           "packageId": "rio-crds"
+        },
+        {
+          "name": "rio-migrations",
+          "packageId": "rio-migrations"
         },
         {
           "name": "rio-proto",
@@ -30338,6 +31097,10 @@
         {
           "name": "ssh-key",
           "packageId": "ssh-key"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
         },
         {
           "name": "tempfile",

@@ -104,6 +104,11 @@
     "106_floor_cores",
     "107_materialization_jobs_priority",
     "108_materialization_jobs_priority_idx",
-    "109_materialization_jobs_drop_old_idx"
+    "109_materialization_jobs_drop_old_idx",
+    "110_nar_index",
+    "111_file_blob_size",
+    "112_directory_paths",
+    "113_drop_nar_indexed",
+    "114_file_blobs_path_idx"
   ]
 }

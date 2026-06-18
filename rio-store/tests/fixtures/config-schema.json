@@ -47,7 +47,17 @@
         "default": 2147483648
       },
       "nar_buffer_budget_bytes": {
-        "description": "Global NAR reassembly buffer budget in bytes — total permits\nacross ALL concurrent PutPath handlers. Each handler acquires\n`chunk.len()` permits before extending its accumulation Vec.\nNone → DEFAULT_NAR_BUDGET (8 × MAX_NAR_SIZE = 32 GiB). Must be\n≥ MAX_NAR_SIZE (4 GiB) — a smaller budget deadlocks any caller\ncharging a NAR larger than the budget. Lower toward MAX_NAR_SIZE\non small-memory nodes (concurrency drops to 1); raise it if you\nhave >8 concurrent max-size uploads and RAM to match.",
+        "description": "Global NAR buffer budget in bytes — total permits across ALL\nconcurrent NAR ingests, shared by PutPath (per-chunk charges)\nand upstream substitution (one whole-NAR reservation per leg,\nlive_047/R-C). None → DEFAULT_NAR_BUDGET (8 × MAX_NAR_SIZE =\n32 GiB). Floor: MAX_NAR_SIZE (4 GiB) — the budget MUST admit\none whole-NAR reservation, or a declared-near-MAX substitution\nbecomes a permanently-unsatisfiable fair-FIFO head that\nstarves every later budget waiter (the former \"lower this on\nsmall-memory nodes\" use-case is retired: a sub-4 GiB budget\nwas a wedge, not a tuning). Raise it if you have >8 concurrent\nmax-size ingests and RAM to match.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint64",
+        "minimum": 0,
+        "default": null
+      },
+      "memory_limit_bytes": {
+        "description": "The pod's deployed memory limit in bytes, injected by the helm\nchart via the downward API (`resourceFieldRef: limits.memory`,\ndivisor 1). None = no deployed limit known (bare binary, dev) —\nthe budget/limit law is then not checkable and is skipped.\nWhen set, `validate()` enforces the D4 law: the effective NAR\nbuffer budget plus the typed non-NAR reserve\n([`rio_common::limits::STORE_NON_NAR_RESERVE_BYTES`]) must fit\ninside this limit — a pod whose semaphore admits more NAR bytes\nthan its cgroup allows is an OOM-kill, not backpressure. Env:\n`RIO_MEMORY_LIMIT_BYTES`.",
         "type": [
           "integer",
           "null"
@@ -100,7 +110,7 @@
         ]
       },
       "chunk_upload_max_concurrent": {
-        "description": "Max concurrent S3 chunk uploads per `put_chunked` call.\nDefault 8. Per-replica `r[store.substitute.admission]` bounds\nconcurrent `put_chunked` calls; `substitute_admission_permits\n× this` is the per-replica in-flight PutObject ceiling. Raise\nif the store runs with a larger aws-sdk pool; lower (min 1)\nif you see `DispatchFailure` in store logs during large-NAR\ningest. Set via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT`.",
+        "description": "Max concurrent S3 chunk uploads per `put_chunked` call.\nDefault 8. Per-replica `r[store.substitute.admission+2]` bounds\nconcurrent `put_chunked` calls; `substitute_admission_permits\n× this` is the per-replica in-flight PutObject ceiling. Raise\nif the store runs with a larger aws-sdk pool; lower (min 1)\nif you see `DispatchFailure` in store logs during large-NAR\ningest. Set via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT`.",
         "type": "integer",
         "format": "uint",
         "minimum": 0,
@@ -150,6 +160,82 @@
         "format": "uint",
         "minimum": 0,
         "default": null
+      },
+      "substitute_stall_secs": {
+        "description": "Owner-side download-stall window for upstream substitution: a\nNAR download with no body bytes for this long is aborted by its\nown owner — the placeholder claim is released in place (claim\ncleared, durable `stall_count` incremented) so the next attempt\nre-claims immediately. Also the threshold competing replicas\napply when deciding whether a live mid-download claim is\ndownload-stalled (frozen `last_progress_at`); persist-phase and\nPutPath claims are never stall-reclaimed. Default 180 s = 6\nmissed-progress heartbeats — S3 multipart pauses and admission\nqueueing inside a download don't trip it. Floor: must be >= 2x\nthe 30s placeholder heartbeat (>= 60s) — a window below the\nheartbeat granularity would depose every healthy owner between\ntwo of its own progress writes (merged_bug_082); 0 would brick\nsubstitution outright. Env: `RIO_SUBSTITUTE_STALL_SECS`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 180
+      },
+      "log_bytes_budget": {
+        "description": "Per-replica budget for resident build-log ingest buffer bytes\nacross all concurrent `LogService.AppendLog` streams. Each stream\nreserves `2 × log_cut_threshold_bytes` (its worst-case resident\nbuffer: one chunk mid-cut plus one refilling) at open and holds\nthe reservation for the stream's lifetime; a stream that cannot\nreserve is rejected with `RESOURCE_EXHAUSTED` and the builder\nretries against another replica. Deliberately separate from\n`nar_buffer_budget_bytes` so log ingest and NAR ingest cannot\nstarve each other. Default 1 GiB; bounded above at 2^60 (a\nbudget beyond addressable memory is a typo, and semaphore\npermit math saturates rather than panics under the bound).\nEnv: `RIO_LOG_BYTES_BUDGET`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 1073741824
+      },
+      "log_max_streams": {
+        "description": "Per-replica cap on concurrent `LogService.AppendLog` streams.\nThe count twin of `log_bytes_budget` (whichever is exhausted\nfirst wins). Default 256. Env: `RIO_LOG_MAX_STREAMS`.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0,
+        "default": 256
+      },
+      "log_ingest_byte_cap": {
+        "description": "Per-execution cap on accepted log bytes (post-truncation content\nplus a per-line overhead charge) over the lifetime of one\nexecution's log. Stream-fatal (`RESOURCE_EXHAUSTED`) when\nexceeded. Default 1 GiB. Env: `RIO_LOG_INGEST_BYTE_CAP`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 1073741824
+      },
+      "log_max_chunks_per_exec": {
+        "description": "Per-execution cap on durably committed log chunks. A builder\nfabricating forward line-number gaps gets one S3 object per\ncontiguous run; the byte cap already bounds the total but this\ncaps the object count directly. Stream-fatal when exceeded.\nDefault 100000. Env: `RIO_LOG_MAX_CHUNKS_PER_EXEC`.",
+        "type": "integer",
+        "format": "uint32",
+        "minimum": 0,
+        "default": 100000
+      },
+      "log_cut_interval_secs": {
+        "description": "Periodic chunk-cut cadence for `AppendLog` streams: a non-empty\ningest buffer is flushed to S3 at least this often, so a\nscheduler-visible log is never more than this far behind the\nbuilder. Also the basis for the gray-failure staleness abort\n(2× this) AND three terms of the inbound-idle eviction delay\n(stamp lag + cut watchdog + ack bound, each up to one\ninterval — bug_018), so validation caps it from ABOVE against\nthe disclosed idle-eviction ceiling (at the shipped constants:\n70 s max). Default 60 s. Env: `RIO_LOG_CUT_INTERVAL_SECS`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 60
+      },
+      "log_cut_threshold_bytes": {
+        "description": "Size-triggered chunk cut: a chunk is cut as soon as the ingest\nbuffer holds this many uncompressed bytes, without waiting for\nthe periodic timer. Default 8 MiB (≈2 MiB compressed at the\ntypical 4:1 log ratio). Env: `RIO_LOG_CUT_THRESHOLD_BYTES`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 8388608
+      },
+      "log_cors_allow_origins": {
+        "description": "Comma-separated CORS allowed origins for gRPC-Web `TailLog`\nrequests from the dashboard SPA. Same format and rationale as the\nscheduler's `dashboard.cors_allow_origins` (the store now serves\none browser-facing RPC). Empty (default) = no browser origin is\nallowed; native gRPC callers are unaffected. Env:\n`RIO_LOG_CORS_ALLOW_ORIGINS`.",
+        "type": "string",
+        "default": ""
+      },
+      "log_peer_url_template": {
+        "description": "URL template the cross-replica `TailLog` proxy uses to dial the\nstore replica holding an execution's live ingest stream. Every\n`{pod}` is replaced with the owning replica's\n`log_ingest_sessions.replica_pod` value; an identity that\nparses as an IPv6 address is bracketed automatically, so the\ntemplate always uses the bare `{pod}` form (`[{pod}]` is\nrejected by validation). Default EMPTY = the cross-replica\nproxy is disabled, fail-closed: a bare binary cannot know the\ndeployment's pod-addressing scheme, and a wrong guess silently\nmisroutes instead of failing. The helm chart supplies the real\ntemplate (`store.logPeerUrlTemplate`, default\n`http://{pod}:9002` paired with `status.podIP` via the downward\nAPI as the replica identity). With the proxy disabled or a\ntemplate that does not resolve, cross-replica live tails\ndegrade to the history-only view (counted by\n`rio_store_log_tail_proxy_failures_total`); a read never\nfails over it. Env: `RIO_LOG_PEER_URL_TEMPLATE`.",
+        "type": "string",
+        "default": ""
+      },
+      "materialization": {
+        "description": "Substitution-replacement campaign (design §8): the store-side\nmaterialization-job executor. `[materialization]` table in\nstore.toml. Env: `RIO_MATERIALIZATION__*`. Phase B activated the\nexecutor at the deployment layer (helm values default ON); this\nstruct's default stays `false` — a bare binary spawns no\nexecutor task set.",
+        "$ref": "#/$defs/MaterializationConfig",
+        "default": {
+          "executor_concurrency": 8,
+          "poll_interval_secs": 1,
+          "scheduler_addr": "",
+          "path_fanout": 4
+        }
+      },
+      "log_retention_days": {
+        "description": "Build-log retention, in days since the execution *started*\n(`drv_executions.started_at` — the only timestamp every\nexecution has). The hourly TTL sweep deletes older executions'\nmanifest rows and chunk objects. On EKS this is deployed from\nthe terraform variable `log_retention_days` (xtask deploy\n`--set store.logRetentionDays`), and the S3 `logs/` lifecycle\nbackstop expires at the SAME variable + 7 days of slack — the\ntwo deleters derive from one source and cannot drift. Operators\noutside that chain must keep any bucket lifecycle at or above\nthis value plus slack (an undercutting lifecycle hard-deletes\nchunks the read path still references). Floor: 2 days —\nvalidation refuses any value whose retention does not exceed\nthe scheduler's 24 h build deadline cap, because a near-cap\nbuild at minimum retention would still be streaming when the\nhourly sweep fires (merged_bug_071). Default 30. Env:\n`RIO_LOG_RETENTION_DAYS`.",
+        "type": "integer",
+        "format": "uint32",
+        "minimum": 0,
+        "default": 30
       }
     },
     "$defs": {
@@ -273,6 +359,38 @@
             "default": null
           }
         }
+      },
+      "MaterializationConfig": {
+        "description": "Store-owned materialization jobs (design §8) — THE substitution\nmechanism. The executor spawns whenever a scheduler address is\nconfigured (PD-D2) — a bare binary with no address spawns nothing\nand needs no scheduler.",
+        "type": "object",
+        "properties": {
+          "executor_concurrency": {
+            "description": "Concurrent jobs per replica (design §2.2 item 1: default 8).",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "default": 8
+          },
+          "poll_interval_secs": {
+            "description": "Poll interval for ListMaterializationJobs (seconds; jitter added).",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "default": 1
+          },
+          "scheduler_addr": {
+            "description": "Scheduler ExecutorService address (the store→scheduler edge:\nListMaterializationJobs / PullAssignment / ReportOutcome).\nTHE executor spawn condition (PD-D2): non-empty spawns the\nclaim loops; empty disables the executor (the schedulerless\npure-store deployment stays valid). The VM/helm wiring sets it\nexplicitly.",
+            "type": "string",
+            "default": ""
+          },
+          "path_fanout": {
+            "description": "Bounded intra-job substitution fan-out (live_047/R-C,\n`store.materialize.path-fold+1`): per-job path-resolution window\nwidth F — at most this many concurrent path resolutions per\nwalk. Default 4. Total executor pressure on the admission gate\nis bounded STRUCTURALLY by the pod path-slot pool (P =\neffective admission cap / 2, `store.materialize.gate-share+1`),\nindependent of F and `executor_concurrency` — both are\nshaping-only levers: at full worker occupancy walks run ~1\nslot each (job-grain); at low occupancy walks widen to F\n(path-grain). 1 = the serial walk as the F=1 instance of the\nsame code shape. Env: `RIO_MATERIALIZATION__PATH_FANOUT`.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "default": 4
+          }
+        }
       }
     }
   },
@@ -287,6 +405,7 @@
     },
     "chunk_cache_capacity_bytes": 2147483648,
     "nar_buffer_budget_bytes": null,
+    "memory_limit_bytes": null,
     "signing_key_path": null,
     "hmac_key_path": null,
     "jwt": {
@@ -304,6 +423,22 @@
     "chunk_prefetch_k": 64,
     "stream_drain_secs": 90,
     "pg_max_connections": 50,
-    "substitute_admission_permits": null
+    "substitute_admission_permits": null,
+    "substitute_stall_secs": 180,
+    "log_bytes_budget": 1073741824,
+    "log_max_streams": 256,
+    "log_ingest_byte_cap": 1073741824,
+    "log_max_chunks_per_exec": 100000,
+    "log_cut_interval_secs": 60,
+    "log_cut_threshold_bytes": 8388608,
+    "log_cors_allow_origins": "",
+    "log_peer_url_template": "",
+    "materialization": {
+      "executor_concurrency": 8,
+      "poll_interval_secs": 1,
+      "scheduler_addr": "",
+      "path_fanout": 4
+    },
+    "log_retention_days": 30
   }
 }

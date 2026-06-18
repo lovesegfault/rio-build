@@ -9315,6 +9315,7 @@ dependencies = [
 name = "workspace-hack"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "anstyle",
  "aws-lc-rs",
  "aws-smithy-types",
@@ -9384,8 +9385,10 @@ dependencies = [
  "portable-atomic",
  "ppv-lite86",
  "primeorder 0.14.0-rc.9",
+ "proc-macro2",
  "prost",
  "quanta",
+ "quote",
  "rand 0.10.1",
  "rand 0.9.4",
  "rand_chacha",
@@ -9422,6 +9425,7 @@ dependencies = [
  "syn",
  "sync_wrapper",
  "thiserror",
+ "time",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
@@ -9438,9 +9442,6 @@ dependencies = [
  "winnow",
  "zerocopy",
  "zeroize",
- "zstd",
- "zstd-safe",
- "zstd-sys",
 ]
 
 [[package]]

@@ -11184,7 +11184,8 @@
       ],
       "resolvedDefaultFeatures": [
         "default",
-        "proc-macro"
+        "proc-macro",
+        "span-locations"
       ],
       "libCrateTypes": [
         "lib"
@@ -12515,6 +12516,10 @@
           "packageId": "jsonwebtoken"
         },
         {
+          "name": "metrics",
+          "packageId": "metrics"
+        },
+        {
           "name": "rio-common",
           "packageId": "rio-common"
         },
@@ -12555,6 +12560,21 @@
           "packageId": "workspace-hack"
         }
       ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
+    "rio-authz-kernel": {
+      "crateName": "rio-authz-kernel",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "../../rio-authz-kernel"
+      },
       "libCrateTypes": [
         "lib"
       ],
@@ -12610,6 +12630,10 @@
         {
           "name": "futures-util",
           "packageId": "futures-util"
+        },
+        {
+          "name": "http",
+          "packageId": "http 1.4.0"
         },
         {
           "name": "metrics",
@@ -12676,8 +12700,16 @@
           "packageId": "tonic-health"
         },
         {
+          "name": "tower-http",
+          "packageId": "tower-http"
+        },
+        {
           "name": "tracing",
           "packageId": "tracing"
+        },
+        {
+          "name": "tracing-appender",
+          "packageId": "tracing-appender"
         },
         {
           "name": "tracing-opentelemetry",
@@ -12700,6 +12732,36 @@
         "aws",
         "pg-iam"
       ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
+    "rio-evidence-kernel": {
+      "crateName": "rio-evidence-kernel",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "../../rio-evidence-kernel"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
+    "rio-log-kernel": {
+      "crateName": "rio-log-kernel",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "../../rio-log-kernel"
+      },
       "libCrateTypes": [
         "lib"
       ],
@@ -12974,6 +13036,10 @@
           "packageId": "hex"
         },
         {
+          "name": "http",
+          "packageId": "http 1.4.0"
+        },
+        {
           "name": "httpdate",
           "packageId": "httpdate"
         },
@@ -12998,8 +13064,20 @@
           "packageId": "rio-auth"
         },
         {
+          "name": "rio-authz-kernel",
+          "packageId": "rio-authz-kernel"
+        },
+        {
           "name": "rio-common",
           "packageId": "rio-common"
+        },
+        {
+          "name": "rio-evidence-kernel",
+          "packageId": "rio-evidence-kernel"
+        },
+        {
+          "name": "rio-log-kernel",
+          "packageId": "rio-log-kernel"
         },
         {
           "name": "rio-migrations",
@@ -13062,6 +13140,18 @@
           "packageId": "tonic-health"
         },
         {
+          "name": "tonic-web",
+          "packageId": "tonic-web"
+        },
+        {
+          "name": "tower",
+          "packageId": "tower"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http"
+        },
+        {
           "name": "tracing",
           "packageId": "tracing"
         },
@@ -13072,6 +13162,10 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -13099,11 +13193,35 @@
           "packageId": "libfuzzer-sys"
         },
         {
+          "name": "rio-log-kernel",
+          "packageId": "rio-log-kernel"
+        },
+        {
+          "name": "rio-proto",
+          "packageId": "rio-proto"
+        },
+        {
           "name": "rio-store",
           "packageId": "rio-store"
+        },
+        {
+          "name": "uuid",
+          "packageId": "uuid"
         }
       ],
       "crateBin": [
+        {
+          "name": "log_accept_kernel",
+          "path": "fuzz_targets/log_accept_kernel.rs"
+        },
+        {
+          "name": "log_chunk_ingest",
+          "path": "fuzz_targets/log_chunk_ingest.rs"
+        },
+        {
+          "name": "log_dedup_kernel",
+          "path": "fuzz_targets/log_dedup_kernel.rs"
+        },
         {
           "name": "manifest_deserialize",
           "path": "fuzz_targets/manifest_deserialize.rs"
@@ -15895,6 +16013,21 @@
         "Henry de Valence <hdevalence@hdevalence.ca>"
       ]
     },
+    "symlink": {
+      "crateName": "symlink",
+      "version": "0.1.0",
+      "edition": "2015",
+      "sha256": "02h1i0b81mxb4vns4xrvrfibpcvs7jqqav8p3yilwik8cv73r5x7",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Chris Morgan <me@chrismorgan.info>"
+      ]
+    },
     "syn": {
       "crateName": "syn",
       "version": "2.0.117",
@@ -16192,6 +16325,10 @@
           "packageId": "deranged"
         },
         {
+          "name": "itoa",
+          "packageId": "itoa"
+        },
+        {
           "name": "num-conv",
           "packageId": "num-conv"
         },
@@ -16207,6 +16344,7 @@
       "resolvedDefaultFeatures": [
         "alloc",
         "default",
+        "formatting",
         "parsing",
         "std"
       ],
@@ -16253,6 +16391,7 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "formatting",
         "parsing"
       ],
       "procMacro": true,
@@ -17008,6 +17147,63 @@
         "Rafael Lemos <flemos.rafael.dev@gmail.com>"
       ]
     },
+    "tonic-web": {
+      "crateName": "tonic-web",
+      "version": "0.14.5",
+      "edition": "2021",
+      "sha256": "16cj03m9valql34l1949c2d1hp69yvwyc8nvffsz3x05vs23si99",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "base64",
+          "packageId": "base64"
+        },
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "http",
+          "packageId": "http 1.4.0"
+        },
+        {
+          "name": "http-body",
+          "packageId": "http-body 1.0.1"
+        },
+        {
+          "name": "pin-project",
+          "packageId": "pin-project"
+        },
+        {
+          "name": "tokio-stream",
+          "packageId": "tokio-stream"
+        },
+        {
+          "name": "tonic",
+          "packageId": "tonic"
+        },
+        {
+          "name": "tower-layer",
+          "packageId": "tower-layer"
+        },
+        {
+          "name": "tower-service",
+          "packageId": "tower-service"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Juan Alvarez <alce@me.com>"
+      ]
+    },
     "tower": {
       "crateName": "tower",
       "version": "0.5.3",
@@ -17246,6 +17442,44 @@
       ],
       "authors": [
         "Eliza Weisman <eliza@buoyant.io>",
+        "Tokio Contributors <team@tokio.rs>"
+      ]
+    },
+    "tracing-appender": {
+      "crateName": "tracing-appender",
+      "version": "0.2.5",
+      "edition": "2018",
+      "sha256": "0g4a6q5s3wafid5lqw1ljzvh1nhk3a4zmb627fxv96dr7qcqc1h5",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "crossbeam-channel",
+          "packageId": "crossbeam-channel"
+        },
+        {
+          "name": "symlink",
+          "packageId": "symlink"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "time",
+          "packageId": "time"
+        },
+        {
+          "name": "tracing-subscriber",
+          "packageId": "tracing-subscriber"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Zeki Sherif <zekshi@amazon.com>",
         "Tokio Contributors <team@tokio.rs>"
       ]
     },
@@ -19430,6 +19664,10 @@
       },
       "dependencies": [
         {
+          "name": "aho-corasick",
+          "packageId": "aho-corasick"
+        },
+        {
           "name": "anstyle",
           "packageId": "anstyle"
         },
@@ -19751,12 +19989,20 @@
           "packageId": "primeorder 0.14.0-rc.9"
         },
         {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
           "name": "prost",
           "packageId": "prost"
         },
         {
           "name": "quanta",
           "packageId": "quanta"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
         },
         {
           "name": "rand",
@@ -19897,12 +20143,20 @@
           "packageId": "subtle"
         },
         {
+          "name": "syn",
+          "packageId": "syn"
+        },
+        {
           "name": "sync_wrapper",
           "packageId": "sync_wrapper"
         },
         {
           "name": "thiserror",
           "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "time",
+          "packageId": "time"
         },
         {
           "name": "tokio",
@@ -19993,21 +20247,13 @@
         {
           "name": "zeroize",
           "packageId": "zeroize"
-        },
-        {
-          "name": "zstd",
-          "packageId": "zstd"
-        },
-        {
-          "name": "zstd-safe",
-          "packageId": "zstd-safe"
-        },
-        {
-          "name": "zstd-sys",
-          "packageId": "zstd-sys"
         }
       ],
       "buildDependencies": [
+        {
+          "name": "aho-corasick",
+          "packageId": "aho-corasick"
+        },
         {
           "name": "anstyle",
           "packageId": "anstyle"
@@ -20334,12 +20580,20 @@
           "packageId": "primeorder 0.14.0-rc.9"
         },
         {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
           "name": "prost",
           "packageId": "prost"
         },
         {
           "name": "quanta",
           "packageId": "quanta"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
         },
         {
           "name": "rand",
@@ -20492,6 +20746,10 @@
           "packageId": "thiserror 2.0.18"
         },
         {
+          "name": "time",
+          "packageId": "time"
+        },
+        {
           "name": "tokio",
           "packageId": "tokio"
         },
@@ -20580,18 +20838,6 @@
         {
           "name": "zeroize",
           "packageId": "zeroize"
-        },
-        {
-          "name": "zstd",
-          "packageId": "zstd"
-        },
-        {
-          "name": "zstd-safe",
-          "packageId": "zstd-safe"
-        },
-        {
-          "name": "zstd-sys",
-          "packageId": "zstd-sys"
         }
       ],
       "libCrateTypes": [

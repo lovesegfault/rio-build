@@ -3962,6 +3962,7 @@ dependencies = [
  "ed25519-dalek",
  "hmac 0.13.0",
  "jsonwebtoken",
+ "metrics",
  "rio-common",
  "serde",
  "serde_json",
@@ -3973,6 +3974,10 @@ dependencies = [
  "uuid",
  "workspace-hack",
 ]
+
+[[package]]
+name = "rio-authz-kernel"
+version = "0.1.0"
 
 [[package]]
 name = "rio-common"
@@ -3988,6 +3993,7 @@ dependencies = [
  "base64",
  "config",
  "futures-util",
+ "http 1.4.0",
  "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",
@@ -4004,12 +4010,22 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tonic-health",
+ "tower-http",
  "tracing",
+ "tracing-appender",
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
  "workspace-hack",
 ]
+
+[[package]]
+name = "rio-evidence-kernel"
+version = "0.1.0"
+
+[[package]]
+name = "rio-log-kernel"
+version = "0.1.0"
 
 [[package]]
 name = "rio-migrations"
@@ -4084,13 +4100,17 @@ dependencies = [
  "fastcdc",
  "futures-util",
  "hex",
+ "http 1.4.0",
  "httpdate",
  "metrics",
  "moka",
  "prost",
  "reqwest",
  "rio-auth",
+ "rio-authz-kernel",
  "rio-common",
+ "rio-evidence-kernel",
+ "rio-log-kernel",
  "rio-migrations",
  "rio-nix",
  "rio-proto",
@@ -4106,9 +4126,13 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tonic-health",
+ "tonic-web",
+ "tower",
+ "tower-http",
  "tracing",
  "uuid",
  "workspace-hack",
+ "zstd",
 ]
 
 [[package]]
@@ -4116,7 +4140,10 @@ name = "rio-store-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "rio-log-kernel",
+ "rio-proto",
  "rio-store",
+ "uuid",
 ]
 
 [[package]]
@@ -4961,6 +4988,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "symlink"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
+
+[[package]]
 name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5066,6 +5099,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
 dependencies = [
  "deranged",
+ "itoa",
  "num-conv",
  "powerfmt",
  "serde_core",
@@ -5322,6 +5356,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "tonic-web"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29453d84de05f4f1b573db22e6f9f6c95c189a6089a440c9a098aa9dea009299"
+dependencies = [
+ "base64",
+ "bytes",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "pin-project",
+ "tokio-stream",
+ "tonic",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5383,6 +5435,19 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-appender"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
+dependencies = [
+ "crossbeam-channel",
+ "symlink",
+ "thiserror 2.0.18",
+ "time",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -6117,6 +6182,7 @@ dependencies = [
 name = "workspace-hack"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "anstyle",
  "aws-lc-rs",
  "aws-smithy-types",
@@ -6186,8 +6252,10 @@ dependencies = [
  "portable-atomic",
  "ppv-lite86",
  "primeorder 0.14.0-rc.9",
+ "proc-macro2",
  "prost",
  "quanta",
+ "quote",
  "rand 0.10.1",
  "rand 0.9.2",
  "rand_chacha",
@@ -6224,6 +6292,7 @@ dependencies = [
  "syn",
  "sync_wrapper",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
@@ -6240,9 +6309,6 @@ dependencies = [
  "winnow",
  "zerocopy",
  "zeroize",
- "zstd",
- "zstd-safe",
- "zstd-sys",
 ]
 
 [[package]]
