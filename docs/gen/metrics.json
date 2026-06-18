@@ -255,6 +255,7 @@
     "rio_store_get_path_duration_seconds",
     "rio_store_get_path_total",
     "rio_store_hmac_rejected_total",
+    "rio_store_ingest_stage_seconds",
     "rio_store_integrity_failures_total",
     "rio_store_log_active_ingest_sessions",
     "rio_store_log_chunk_write_failures_total",
@@ -1222,7 +1223,7 @@
       {
         "name": "rio_scheduler_resource_floor_bumps_total",
         "kind": "counter",
-        "help": "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled reason=cgroup_oom|disk_full|timeout|witnessed_oom|witnessed_disk|compute_bound; timeout covers DeadlineExceeded too). cgroup_oom and disk_full consume the TYPED failure_classification wire field, corroborated against the dispatch-assigned shape (bug_090 — worker free text drives nothing; uncorroborated claims are refused and counted on rio_scheduler_uncorroborated_sizing_claim_total); disk_full is the prjquota-attributed DiskFull classification (live_057 — a build that exhausts its overlay quota at disk=N retries at disk=2N); timeout is worker-reported; witnessed_oom is the controller-witnessed OomKilled letter promoted at the establishment sweep, once per attempt ever via the establishment transaction's won flag (live_058-b); witnessed_disk is the controller-witnessed pod-attributed emptyDir-sizeLimit eviction (sh-039 — the EvictedEmptyDirSizeLimit split letter; node-condition EvictedDiskPressure stays classify-only and has NO label here); compute_bound is an executor-variant exit≠0 whose cpu_util (cpu_seconds_total / (assigned_deadline × assigned_cores)) corroborated ≥ threshold — the D4 cores axis (sh-012), never fired on bare exit≠0. The stream-era oom_killed/disk_pressure/deadline_exceeded label arms were retired with the heuristic promote paths; the caller alphabet is census-pinned (bump_resource_floor_caller_census, db/live_pins.rs). Reactive upsize: a derivation that OOMs at mem=N retries at mem=2N. Frequent firing for one pname = raise [sla].probe defaults."
+        "help": "resource_floor observations on worker-reported attempt closes (D4, labeled reason=cgroup_oom|disk_full|timeout|executor_variant|worker_abort|witnessed_oom|witnessed_disk|other; headroom=hard|soft). sh-041u: every non-success close observes peaks on EVERY axis the report carries — the close reason only BOOSTS headroom on its own axis (2.0× hard, else 1.2× soft). cgroup_oom and disk_full consume the TYPED failure_classification wire field; the per-axis trust band (peak vs the dispatch-assigned shape — bug_090; worker free text drives nothing; refusals counted on rio_scheduler_uncorroborated_sizing_claim_total) gates the hard arm. witnessed_oom / witnessed_disk are the controller-witnessed per-container kubelet attributions promoted at the establishment sweep, once per attempt ever via the establishment transaction's won flag (live_058-b; node-condition EvictedDiskPressure stays classify-only and has NO label here). worker_abort is the AD5 SIGTERM-abort short-circuit (sh-041 — a compute-bound build interrupted by spot reclaim now jumps cores). headroom=hard ⇒ the M_044 persist (hard_grew); promotion-exempt only when ALSO not at cap (hard_promoted — a grow-to-cap clip persists but does NOT ride exemption). headroom=soft ⇒ in-memory only. The caller alphabet is census-pinned (observe_resource_floor_caller_census, db/live_pins.rs). Reactive upsize: a derivation that OOMs at peak=N retries at mem≈2N."
       },
       {
         "name": "rio_scheduler_runtime_skew_seconds",
@@ -1414,7 +1415,7 @@
       {
         "name": "rio_scheduler_uncorroborated_sizing_claim_total",
         "kind": "counter",
-        "help": "Worker-reported sizing claims refused by the corroboration gate (bug_090 typed claims; bug_102 the status-borne timeout axis; labels: class = cgroup_oom|disk_full|timed_out|unspecified): the claim's evidence was absent or inconsistent with the scheduler-assigned anchor (oom: peak_memory below half the assigned memory; disk: hard limit outside the producer-derived band [overlay(assigned, H_MIN), overlay(assigned, H_MAX) + block slack] (bug_065: the shared rio_common::k8s overlay denomination — a kubelet-unmintable limit refuses) or peak below half the limit; timed_out: attempt-open duration below half the assigned deadline, or no running_since/intent anchor), or no dispatch intent existed to corroborate against. Refusals are classify-only — the report's retry/charge flow is unaffected and persisted floors never move (every floor mutation demands a typed CorroborationWitness; the caller alphabet stays census-pinned, bump_resource_floor_caller_census). Alert if rate > 0: a forged or misbehaving worker report (the honest producer always sends self-consistent telemetry sampled at its own classification seam)."
+        "help": "Worker-reported peaks refused by the per-axis trust band (bug_090; bug_102 the status-borne timeout axis; labels: class = mem|disk|cgroup_oom|disk_full|timed_out): the peak was outside the band the scheduler-assigned shape admits (mem: peak above TRUST_BAND_MEM × assigned — physically impossible under memory.max; disk: peak above overlay(assigned, H_MAX) + block slack — kubelet-unmintable; cgroup_oom/disk_full: a hard-event CLAIM with peak below half the assigned shape — implausible, degraded to soft; timed_out: attempt-open duration below half the assigned deadline, or no running_since/intent anchor). Refusals are classify-only — the report's retry/charge flow is unaffected; persisted floors never move on a forged-HIGH peak and never hard-promote on a forged-LOW hard claim (the trust gate sits inside observe_peaks; the caller alphabet stays census-pinned, observe_resource_floor_caller_census). Alert if rate > 0: a forged or misbehaving worker report."
       },
       {
         "name": "rio_scheduler_undeclared_built_output_total",
@@ -1622,6 +1623,11 @@
         "name": "rio_store_hmac_rejected_total",
         "kind": "counter",
         "help": "Upload/log-ingest rejections by the HMAC assignment-token gate, by reason: missing_token / invalid_token (no or unverifiable x-rio-assignment-token), path_not_in_claims (token valid but the uploaded path is not in its claim set), ca_path_mismatch (CA-derived path does not match the claimed output), input_closure_mismatch (echoed closure digest disagrees with the token's attested digest), deriver_mismatch (recorded deriver does not match the token's drv_hash), service_token_invalid / service_caller_not_allowlisted / service_caller_not_permitted (the x-rio-service-token bypass failed verification or allowlisting). Sustained non-zero from one builder = a stale or forged token source."
+      },
+      {
+        "name": "rio_store_ingest_stage_seconds",
+        "kind": "histogram",
+        "help": "Per-stage NAR ingest wall-clock, labeled stage = narinfo|claim|budget_park|fetch|sha256|chunk|pg_upsert|s3_upload|pg_commit. Substitute leaders emit all nine; PutPath emits the four cas.rs stages (chunk/pg_upsert/s3_upload/pg_commit), so rate(count{stage=chunk}) != rate(rio_store_substitute_total). stage=pg_commit emits twice per chunked ingest (mark_chunks_uploaded + complete_manifest_chunked); inline-path NARs skip the four cas.rs stages entirely."
       },
       {
         "name": "rio_store_integrity_failures_total",

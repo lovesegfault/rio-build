@@ -499,6 +499,11 @@
       "doc": "DNS-1123 label identity: ONE alphabet, ONE sanitizer, ONE composer (merged_bug_243; the merged_bug_158 identity discipline, made a type)."
     },
     {
+      "path": "fmt.rs",
+      "depth": 0,
+      "doc": "Human-readable formatting helpers shared across the workspace."
+    },
+    {
       "path": "footprint.rs",
       "depth": 0,
       "doc": "The container-memory footprint law — the ONE constructed quantity every capacity gate on BOTH sides of the scheduler/controller process boundary compares (bughunt-11 merged_bug_016)."
@@ -1223,7 +1228,7 @@
     {
       "path": "actor/floor.rs",
       "depth": 1,
-      "doc": "D4 reactive resource floor: per-dimension doubling on explicit resource-exhaustion signals, capped at `Ceilings`, falling through to the relevant retry counter once capped."
+      "doc": "D4 reactive resource floor: per-dimension peak observation on every non-success worker close, capped at `Ceilings`, with a hard 2.0× headroom on the axis a corroborated resource-exhaustion signal names and a soft 1.2× elsewhere."
     },
     {
       "path": "actor/handle.rs",

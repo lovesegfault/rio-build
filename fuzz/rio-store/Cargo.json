@@ -3915,6 +3915,32 @@
         "lib"
       ]
     },
+    "crossbeam-deque": {
+      "crateName": "crossbeam-deque",
+      "version": "0.8.6",
+      "edition": "2021",
+      "sha256": "0l9f1saqp1gn5qy0rxvkmz4m6n7fc0b3dbm6q1r5pmgpnyvi3lcx",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "crossbeam-epoch",
+          "packageId": "crossbeam-epoch"
+        },
+        {
+          "name": "crossbeam-utils",
+          "packageId": "crossbeam-utils"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "crossbeam-epoch": {
       "crateName": "crossbeam-epoch",
       "version": "0.9.18",
@@ -11969,6 +11995,51 @@
         "Gerd Zellweger <mail@gerdzellweger.com>"
       ]
     },
+    "rayon": {
+      "crateName": "rayon",
+      "version": "1.12.0",
+      "edition": "2021",
+      "sha256": "0vcj63xgnk72c30vdrak7dhl53snnaqv9x2faf1d94hzg1kb2fgv",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "either",
+          "packageId": "either"
+        },
+        {
+          "name": "rayon-core",
+          "packageId": "rayon-core"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "rayon-core": {
+      "crateName": "rayon-core",
+      "version": "1.13.0",
+      "edition": "2021",
+      "sha256": "14dbr0sq83a6lf1rfjq5xdpk5r6zgzvmzs5j6110vlv2007qpq92",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "crossbeam-deque",
+          "packageId": "crossbeam-deque"
+        },
+        {
+          "name": "crossbeam-utils",
+          "packageId": "crossbeam-utils"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "links": "rayon-core"
+    },
     "redox_syscall": {
       "crateName": "redox_syscall",
       "version": "0.5.18",
@@ -13054,6 +13125,10 @@
         {
           "name": "prost",
           "packageId": "prost"
+        },
+        {
+          "name": "rayon",
+          "packageId": "rayon"
         },
         {
           "name": "reqwest",
