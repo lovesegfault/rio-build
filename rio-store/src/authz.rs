@@ -115,6 +115,7 @@ pub const METHOD_CREDENTIALS: &[(&str, CredentialClass)] = &[
             check: HandlerCheck::IngestToken,
         },
     ),
+    // castore RPCs (ADR-022): classes confirmed against handler `require_caller_identity` placement
     (
         "/rio.store.StoreService/PutPathChunked",
         CredentialClass::HandlerEnforced {
