@@ -296,6 +296,7 @@ async fn test_dispatch_attests_input_closure_from_parsed_drv() -> TestResult {
     let (db, handle, _task) = setup().await;
 
     let child_drv_path = test_drv_path("attest-child");
+    let parent_drv_path = test_drv_path("attest-parent");
     let child_out = test_store_path("attest-child-out");
     let src = test_store_path("attest-src");
     let parent_out = test_store_path("attest-parent-out");
@@ -304,8 +305,9 @@ async fn test_dispatch_attests_input_closure_from_parsed_drv() -> TestResult {
     // has unknown references, so compute_input_roots degrades the
     // whole closure to unattested and this positive-half test would
     // see an empty input_closure. Real flow: the store wrote these
-    // rows when the paths were uploaded.
-    for p in [&child_out, &src] {
+    // rows when the paths were uploaded (.drv files included —
+    // gateway uploads them via wopAddMultipleToStore).
+    for p in [&child_out, &src, &child_drv_path, &parent_drv_path] {
         use sha2::Digest as _;
         let h = sha2::Sha256::digest(p.as_bytes()).to_vec();
         sqlx::query(

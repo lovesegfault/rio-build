@@ -1195,21 +1195,29 @@ impl DagActor {
         }
 
         // ADR-022 castore-FUSE (P0588): resolve the transitive input
-        // closure + castore root nodes. On PG failure or timeout we
-        // send empty input_roots and the builder falls back to
-        // QueryPathInfo BFS. Timeout-bounded like every other
-        // actor-blocking PG await on this path (I-139): a slow
+        // closure + castore root nodes. Timeout-bounded like every
+        // other actor-blocking PG await on this path (I-139): a slow
         // recursive CTE must not stall the mailbox.
         //
         // Seeds come from `attested_input_seeds` (the parsed drv's
-        // exact direct inputs), NOT `approx_input_closure`: this
-        // closure is signed into the assignment token (P0589) and is
-        // the builder's refscan candidate set, so it must never be
-        // narrower than the true input closure. `None` (recovered
-        // node without drv_content, .drv not inlined, or an inputDrv
-        // whose outputs aren't known) → no attestation; the builder
-        // computes its own drv-parsed closure — the same degradation
-        // as the PG-failure arms below.
+        // exact direct inputs, with DAG-missed inputDrvs resolved via
+        // `derivations.expected_output_paths`), NOT
+        // `approx_input_closure`: this closure is signed into the
+        // assignment token (P0589) and is the builder's refscan
+        // candidate set, so it must never be narrower than the true
+        // input closure.
+        //
+        // The `Vec::new()` arms below (seeds `None`, closure-member
+        // missing narinfo, PG error/timeout) send empty input_roots.
+        // Under ADR-022 closure-scoped FUSE these are NOT safe
+        // degrades — the builder's own drv-parsed BFS reads through
+        // the empty-scoped mount and may EIO, so the assignment
+        // infra-retries instead of silently widening.
+        // TODO: defer-with-backoff (or `drv_content` reload via store
+        // gRPC GetPath at dispatch) for the residual `Ok(None)` arms
+        // instead of dispatching with empty input_roots — they are
+        // rare post-C1-hardened (recovered node with no drv_content,
+        // floating-CA placeholder) but still infra-retry loops.
         //
         // Build-only: a Materialization pull has no .drv to refscan
         // (the worker materialises an already-built closure), so the
@@ -1219,64 +1227,89 @@ impl DagActor {
         // r[impl sched.dispatch.input-roots+2]
         let (input_root_rows, input_closure, input_closure_digest) = match attempt_kind {
             rio_evidence_kernel::pull::PullKind::Build => {
-                let input_root_rows =
-                    match crate::assignment::attested_input_seeds(&self.dag, drv_hash) {
-                        None => {
-                            debug!(drv_hash = %drv_hash,
-                                   "input closure not attestable from scheduler state; \
-                                    builder falls back to its own drv-parsed closure");
-                            metrics::counter!("rio_scheduler_input_closure_unattested_total",
-                                              "reason" => "seeds_unknown")
-                            .increment(1);
-                            Vec::new()
-                        }
-                        Some(seeds) if seeds.is_empty() => Vec::new(),
-                        Some(seeds) => {
-                            match tokio::time::timeout(
-                                self.grpc_timeout,
-                                self.db.compute_input_roots(&seeds),
-                            )
-                            .await
-                            {
-                                Ok(Ok(Some(rows))) => rows,
-                                // A closure member with no narinfo row → the walk
-                                // can't prove the set complete (already warned in
-                                // compute_input_roots). Same degrade as the arms
-                                // below: no attestation, builder computes its own
-                                // drv-parsed closure.
-                                Ok(Ok(None)) => {
-                                    metrics::counter!(
-                                        "rio_scheduler_input_closure_unattested_total",
-                                        "reason" => "missing_narinfo"
-                                    )
-                                    .increment(1);
-                                    Vec::new()
-                                }
-                                Ok(Err(e)) => {
-                                    warn!(drv_hash = %drv_hash, error = %e,
-                                          "input_roots closure compute failed; \
-                                           builder falls back to QueryPathInfo BFS");
-                                    metrics::counter!(
-                                        "rio_scheduler_input_closure_unattested_total",
-                                        "reason" => "db_error"
-                                    )
-                                    .increment(1);
-                                    Vec::new()
-                                }
-                                Err(_) => {
-                                    warn!(drv_hash = %drv_hash, timeout = ?self.grpc_timeout,
-                                          "input_roots closure compute timed out; \
-                                           builder falls back to QueryPathInfo BFS");
-                                    metrics::counter!(
-                                        "rio_scheduler_input_closure_unattested_total",
-                                        "reason" => "timeout"
-                                    )
-                                    .increment(1);
-                                    Vec::new()
-                                }
+                // Seeds resolution may fall through to a PG
+                // `derivations.expected_output_paths` lookup for
+                // DAG-missed inputDrvs — bound it under the same
+                // timeout as the closure walk.
+                let input_root_rows = match tokio::time::timeout(self.grpc_timeout, async {
+                    crate::assignment::attested_input_seeds(&self.dag, drv_hash, &self.db).await
+                })
+                .await
+                {
+                    Ok(Ok(None)) => {
+                        debug!(drv_hash = %drv_hash,
+                               "input closure not attestable from scheduler state; \
+                                builder falls back to its own drv-parsed closure");
+                        metrics::counter!("rio_scheduler_input_closure_unattested_total",
+                                          "reason" => "seeds_unknown")
+                        .increment(1);
+                        Vec::new()
+                    }
+                    Ok(Ok(Some(seeds))) if seeds.is_empty() => Vec::new(),
+                    Ok(Ok(Some(seeds))) => {
+                        match tokio::time::timeout(
+                            self.grpc_timeout,
+                            self.db.compute_input_roots(&seeds),
+                        )
+                        .await
+                        {
+                            Ok(Ok(Some(rows))) => rows,
+                            // A closure member with no narinfo row → the walk
+                            // can't prove the set complete (already warned in
+                            // compute_input_roots). Same degrade as the arms
+                            // below: no attestation, builder computes its own
+                            // drv-parsed closure.
+                            Ok(Ok(None)) => {
+                                metrics::counter!(
+                                    "rio_scheduler_input_closure_unattested_total",
+                                    "reason" => "missing_narinfo"
+                                )
+                                .increment(1);
+                                Vec::new()
+                            }
+                            Ok(Err(e)) => {
+                                warn!(drv_hash = %drv_hash, error = %e,
+                                      "input_roots closure compute failed; \
+                                       builder falls back to QueryPathInfo BFS");
+                                metrics::counter!(
+                                    "rio_scheduler_input_closure_unattested_total",
+                                    "reason" => "db_error"
+                                )
+                                .increment(1);
+                                Vec::new()
+                            }
+                            Err(_) => {
+                                warn!(drv_hash = %drv_hash, timeout = ?self.grpc_timeout,
+                                      "input_roots closure compute timed out; \
+                                       builder falls back to QueryPathInfo BFS");
+                                metrics::counter!(
+                                    "rio_scheduler_input_closure_unattested_total",
+                                    "reason" => "timeout"
+                                )
+                                .increment(1);
+                                Vec::new()
                             }
                         }
-                    };
+                    }
+                    Ok(Err(e)) => {
+                        warn!(drv_hash = %drv_hash, error = %e,
+                              "attested seeds PG fallback failed; \
+                               builder falls back to QueryPathInfo BFS");
+                        metrics::counter!("rio_scheduler_input_closure_unattested_total",
+                                          "reason" => "db_error")
+                        .increment(1);
+                        Vec::new()
+                    }
+                    Err(_) => {
+                        warn!(drv_hash = %drv_hash, timeout = ?self.grpc_timeout,
+                              "attested seeds PG fallback timed out; \
+                               builder falls back to QueryPathInfo BFS");
+                        metrics::counter!("rio_scheduler_input_closure_unattested_total",
+                                          "reason" => "timeout")
+                        .increment(1);
+                        Vec::new()
+                    }
+                };
                 // Cloned once: reused for digest and WorkAssignment.input_closure.
                 let input_closure: Vec<String> = input_root_rows
                     .iter()

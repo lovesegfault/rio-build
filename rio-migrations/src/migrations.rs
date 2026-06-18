@@ -2679,6 +2679,26 @@ pub const M_113: () = ();
 /// statement in the file (implicit-transaction rule — see 022).
 pub const M_114: () = ();
 
+/// `idx_derivations_drv_path`: index on `derivations(drv_path)` for
+/// the `attested_input_seeds` PG fallback (ADR-022). When an
+/// `inputDrvs` entry is not an in-memory DAG node (substituted-then-
+/// reaped, or completed before a restart so recovery skipped it — the
+/// FOD shape where curl/bash/stdenv come from the binary cache), the
+/// scheduler resolves its `expected_output_paths` by `drv_path` on
+/// the per-dispatch hot path. Only `drv_hash` was indexed before
+/// (`derivations_drv_hash_uq`); the ATerm's `inputDrvs` map is keyed
+/// by `drv_path`, not `drv_hash`.
+///
+/// The earlier candidate (a partial index on `narinfo.deriver`) was
+/// dropped: a name-blind `narinfo.deriver` reverse-lookup with a
+/// count-check is unsound for multi-output drvs (parent consumes
+/// `out`, narinfo has `dev`+`man` with deriver set but `out` with
+/// deriver NULL → silently-narrower attested closure → GC hazard).
+/// `derivations.expected_output_paths` is the same authority a
+/// fresh-merge DAG node carries, so never-narrower holds by
+/// construction.
+pub const M_115: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

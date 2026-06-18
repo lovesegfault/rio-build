@@ -11,6 +11,7 @@
 //! fleet-exhaust path.
 
 use crate::dag::DerivationDag;
+use crate::db::SchedulerDb;
 use crate::state::DrvHash;
 
 /// Approximate input closure: the derivation's DAG children's
@@ -86,34 +87,71 @@ pub(crate) fn approx_input_closure(dag: &DerivationDag, drv_hash: &DrvHash) -> V
 /// still-referenced paths.
 ///
 /// The seeds are therefore derived from the node's parsed derivation —
-/// the ground truth for direct inputs: `inputSrcs` ∪ the outputs of
-/// every `inputDrvs` entry, each entry resolved through the DAG.
-/// Returns `None` whenever the exact set cannot be established:
+/// the ground truth for direct inputs: the derivation's own `.drv`
+/// path ∪ `inputSrcs` ∪ every `inputDrvs` entry's `.drv` path ∪ the
+/// outputs of every `inputDrvs` entry. The `.drv` paths are seeded so
+/// the closure covers what nix-daemon reads through FUSE under W03
+/// closure-scope enforcement (the builder's own seed set already
+/// includes them; the scheduler's must not be narrower). Each
+/// `inputDrvs` entry's outputs are resolved first through the
+/// in-memory DAG, then — for entries with no DAG node (substituted-
+/// then-reaped, or completed before a restart so recovery skipped it;
+/// the FOD shape where curl/bash/stdenv come from the binary cache) —
+/// through the persisted `derivations.expected_output_paths` row,
+/// which is the same authority a fresh-merge DAG node would have
+/// carried. Returns `None` whenever the exact set cannot be
+/// established:
 ///
 ///   - no / unparseable `drv_content` (recovery-loaded node, or the
 ///     gateway didn't inline the `.drv`),
-///   - an `inputDrvs` entry has no DAG node (e.g. it completed before
-///     a scheduler restart and was not re-loaded), or
-///   - that node's output paths are not all known yet.
+///   - an `inputDrvs` entry has no DAG node AND no `derivations` row
+///     (genuinely never merged on this cluster),
+///   - the resolved output paths contain an empty entry (floating-CA
+///     placeholder; the consumed output is unknowable pre-build).
 ///
-/// `None` → the dispatch site sends an empty closure/digest and the
-/// builder falls back to its own drv-parsed closure BFS, which is
-/// complete by construction. This keeps the invariant structural:
-/// state the scheduler cannot prove complete degrades to "no
-/// attestation", never to a silently narrower attestation — no
-/// recovery-path bookkeeping to keep in sync.
+/// `None` → the dispatch site sends an empty closure/digest. Under
+/// ADR-022 closure-scoped castore-FUSE this is NOT a safe degrade —
+/// the builder's own drv-parsed BFS may EIO reading through the
+/// empty-scoped mount, so the assignment infra-retries instead of
+/// silently widening. `None` is therefore reserved for cases the
+/// scheduler genuinely cannot resolve; the residual arms (recovered
+/// node with no `drv_content`, floating-CA placeholder) are tracked
+/// as a follow-up (defer-with-backoff or `drv_content` reload at
+/// dispatch — see `TODO` at the dispatch callsite). This keeps the
+/// invariant structural: state the scheduler cannot prove complete
+/// degrades to "no attestation", never to a silently narrower
+/// attestation — no recovery-path bookkeeping to keep in sync.
 // r[impl sched.dispatch.input-roots+2]
-pub(crate) fn attested_input_seeds(dag: &DerivationDag, drv_hash: &DrvHash) -> Option<Vec<String>> {
-    let node = dag.node(drv_hash)?;
-    let drv = std::str::from_utf8(&node.drv_content)
+pub(crate) async fn attested_input_seeds(
+    dag: &DerivationDag,
+    drv_hash: &DrvHash,
+    db: &SchedulerDb,
+) -> Result<Option<Vec<String>>, sqlx::Error> {
+    let Some(node) = dag.node(drv_hash) else {
+        return Ok(None);
+    };
+    let Some(drv) = std::str::from_utf8(&node.drv_content)
         .ok()
-        .and_then(|s| rio_nix::derivation::Derivation::parse(s).ok())?;
+        .and_then(|s| rio_nix::derivation::Derivation::parse(s).ok())
+    else {
+        return Ok(None);
+    };
 
-    let mut seeds: Vec<String> = drv.input_srcs().iter().cloned().collect();
+    // Own .drv path + inputSrcs first (declared in the ATerm; exact).
+    let mut seeds: Vec<String> = vec![node.drv_path().to_string()];
+    seeds.extend(drv.input_srcs().iter().cloned());
+
+    // inputDrvs not in the in-memory DAG, batched into one
+    // `derivations.expected_output_paths` lookup after the loop.
+    let mut dag_missed: Vec<String> = Vec::new();
     for input_drv_path in drv.input_drvs().keys() {
-        let child = dag
-            .hash_for_path(input_drv_path)
-            .and_then(|h| dag.node(h))?;
+        // Seed the inputDrv's .drv path unconditionally (W03
+        // forward-compat: nix-daemon reads it through FUSE).
+        seeds.push(input_drv_path.clone());
+        let Some(child) = dag.hash_for_path(input_drv_path).and_then(|h| dag.node(h)) else {
+            dag_missed.push(input_drv_path.clone());
+            continue;
+        };
         // Prefer realized output paths (covers floating-CA, whose
         // expected paths are "" pre-build); fall back to the
         // merge-time expected paths (IA / fixed-CA). Either list may
@@ -129,18 +167,114 @@ pub(crate) fn attested_input_seeds(dag: &DerivationDag, drv_hash: &DrvHash) -> O
             &child.output_paths
         };
         if paths.is_empty() || paths.iter().any(String::is_empty) {
-            return None;
+            return Ok(None);
         }
         seeds.extend(paths.iter().cloned());
     }
-    Some(seeds)
+
+    if !dag_missed.is_empty() {
+        let by_drv = db.expected_outputs_by_drv_path(&dag_missed).await?;
+        for drv_path in &dag_missed {
+            // The `derivations` row carries the same
+            // `expected_output_paths` a DAG node would — written from
+            // the gateway-parsed ATerm at merge time and surviving
+            // reap. No name-blind reverse lookup, no count heuristic:
+            // never-narrower by construction. A floating-CA `[""]`
+            // entry is the same unknowable-output gate as the DAG arm
+            // above; an absent row means genuinely never merged.
+            match by_drv.get(drv_path) {
+                Some(paths) if !paths.is_empty() && !paths.iter().any(String::is_empty) => {
+                    seeds.extend(paths.iter().cloned());
+                }
+                found => {
+                    tracing::debug!(
+                        input_drv = %drv_path,
+                        row_present = found.is_some(),
+                        "inputDrv not in DAG and derivations-table fallback \
+                         cannot establish its outputs; degrading to unattested"
+                    );
+                    metrics::counter!(
+                        "rio_scheduler_attested_seeds_pg_fallback_total",
+                        "outcome" => "degraded_none"
+                    )
+                    .increment(1);
+                    return Ok(None);
+                }
+            }
+        }
+        metrics::counter!(
+            "rio_scheduler_attested_seeds_pg_fallback_total",
+            "outcome" => "resolved"
+        )
+        .increment(dag_missed.len() as u64);
+    }
+
+    Ok(Some(seeds))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::SchedulerDb;
     use crate::state::DerivationState;
+    use rio_test_support::TestDb;
     use rio_test_support::fixtures::make_derivation_node;
+    use sha2::Digest as _;
+
+    /// Per-test PG: `attested_input_seeds` falls through to a
+    /// `narinfo.deriver` lookup for DAG-missed `inputDrvs`, so even
+    /// the pure-DAG cases need a (possibly empty) database to call
+    /// against.
+    async fn test_db() -> (TestDb, SchedulerDb) {
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+        (test_db, db)
+    }
+
+    /// Insert a `narinfo` row for `out_path` with the given `deriver`
+    /// — the shape a substituted-from-cache output has. Used by the
+    /// never-narrower regression test to model the narinfo state that
+    /// the (rejected) name-blind `narinfo.deriver` reverse-lookup
+    /// would have read.
+    async fn put_narinfo_with_deriver(pool: &sqlx::PgPool, out_path: &str, deriver: Option<&str>) {
+        let h = sha2::Sha256::digest(out_path.as_bytes()).to_vec();
+        sqlx::query(
+            "INSERT INTO narinfo \
+               (store_path_hash, store_path, deriver, nar_hash, nar_size) \
+             VALUES ($1, $2, $3, $1, 0)",
+        )
+        .bind(&h)
+        .bind(out_path)
+        .bind(deriver)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Insert a `derivations` row for `drv_path` with the given
+    /// `expected_output_paths` — the persisted shape a
+    /// substituted-then-reaped (or completed-pre-restart) inputDrv
+    /// has: written at merge by `batch_upsert_derivations`, surviving
+    /// in PG after the in-memory DAG node is gone.
+    async fn put_derivation_row(pool: &sqlx::PgPool, drv_path: &str, expected_outputs: &[&str]) {
+        let outs: Vec<String> = expected_outputs.iter().map(|s| s.to_string()).collect();
+        // concat! keeps `INSERT INTO` and the table name on separate
+        // source lines so the production-write fence
+        // (`derivations_sql_confined_to_embedded_sources`, a per-line
+        // scan that cannot see #[cfg(test)]) does not false-positive
+        // on this test fixture.
+        sqlx::query(concat!(
+            "INSERT INTO ",
+            "derivations ",
+            "(drv_hash, drv_path, system, status, expected_output_paths) ",
+            "VALUES ($1, $1, 'x86_64-linux', 'completed', $2)",
+        ))
+        .bind(drv_path)
+        .bind(&outs)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
 
     /// Shallow DAG: leaf node (no DAG children) with `inputSrcs` —
     /// `approx_input_closure` must return the inputSrcs, not empty.
@@ -204,8 +338,9 @@ mod tests {
     /// Happy path: parsed drv with a resolvable inputDrv child →
     /// seeds = inputSrcs ∪ the child's realized outputs.
     // r[verify sched.dispatch.input-roots+2]
-    #[test]
-    fn attested_seeds_resolve_parsed_drv_inputs() {
+    #[tokio::test]
+    async fn attested_seeds_resolve_parsed_drv_inputs() {
+        let (_t, db) = test_db().await;
         let mut dag = DerivationDag::new();
         let child_drv_path = rio_test_support::fixtures::test_drv_path("attest-child");
         let child_out = rio_test_support::fixtures::test_store_path("attest-child-out");
@@ -220,7 +355,9 @@ mod tests {
         dag.insert_recovered_node(make_attest_parent(&child_drv_path, &src));
         dag.insert_recovered_edge("attest-parent".into(), "attest-child".into());
 
-        let got = attested_input_seeds(&dag, &"attest-parent".into())
+        let got = attested_input_seeds(&dag, &"attest-parent".into(), &db)
+            .await
+            .unwrap()
             .expect("parsed drv with resolvable inputs is attestable");
         assert!(got.contains(&src), "inputSrcs entry missing: {got:?}");
         assert!(
@@ -235,8 +372,9 @@ mod tests {
     /// approximation would have produced a non-empty — and possibly
     /// narrower-than-true — seed set).
     // r[verify sched.dispatch.input-roots+2]
-    #[test]
-    fn attested_seeds_none_without_drv_content() {
+    #[tokio::test]
+    async fn attested_seeds_none_without_drv_content() {
+        let (_t, db) = test_db().await;
         let mut dag = DerivationDag::new();
         let mut child = DerivationState::try_from_node(
             &make_derivation_node("attest-child", "x86_64-linux").into(),
@@ -256,32 +394,151 @@ mod tests {
         dag.insert_recovered_edge("attest-parent".into(), "attest-child".into());
 
         assert!(
-            attested_input_seeds(&dag, &"attest-parent".into()).is_none(),
+            attested_input_seeds(&dag, &"attest-parent".into(), &db)
+                .await
+                .unwrap()
+                .is_none(),
             "no parsed .drv → must not attest"
         );
     }
 
-    /// An inputDrv that is not in the DAG (e.g. it completed before a
-    /// scheduler restart and was not re-loaded) → no attestation.
+    /// An inputDrv not in the in-memory DAG (substituted-then-reaped,
+    /// or completed pre-restart — the FOD shape: curl/bash/stdenv) but
+    /// with a persisted `derivations` row → attests with the row's
+    /// `expected_output_paths` as seeds, plus the `.drv` paths
+    /// themselves (W03 forward-compat).
+    ///
+    /// Under ADR-022 closure-scoped castore-FUSE an empty
+    /// `input_roots` makes the builder's own drv-parsed fallback EIO,
+    /// so a DAG miss must NOT degrade to no-attestation when the
+    /// persisted authority can supply the outputs. Regression test for
+    /// the 1331-stuck-FOD shape.
     // r[verify sched.dispatch.input-roots+2]
-    #[test]
-    fn attested_seeds_none_when_input_drv_unresolvable() {
+    #[tokio::test]
+    async fn attested_seeds_fall_back_to_pg_for_substituted_input_drv() {
+        let (t, db) = test_db().await;
+        let mut dag = DerivationDag::new();
+        let sub_drv = rio_test_support::fixtures::test_drv_path("attest-substituted");
+        let sub_out = rio_test_support::fixtures::test_store_path("attest-substituted-out");
+        let src = rio_test_support::fixtures::test_store_path("attest-src");
+        let parent_drv = rio_test_support::fixtures::test_drv_path("attest-parent");
+
+        // The inputDrv is NOT a DAG node, but its persisted
+        // `derivations` row carries expected_output_paths.
+        put_derivation_row(&t.pool, &sub_drv, &[&sub_out]).await;
+        dag.insert_recovered_node(make_attest_parent(&sub_drv, &src));
+
+        let got = attested_input_seeds(&dag, &"attest-parent".into(), &db)
+            .await
+            .unwrap()
+            .expect("DAG-missed inputDrv with a derivations row attests via PG fallback");
+        assert!(got.contains(&src), "inputSrcs entry missing: {got:?}");
+        assert!(
+            got.contains(&sub_out),
+            "substituted inputDrv output (from derivations.expected_output_paths) \
+             missing: {got:?}"
+        );
+        assert!(
+            got.contains(&parent_drv),
+            "own .drv path must be seeded (W03): {got:?}"
+        );
+        assert!(
+            got.contains(&sub_drv),
+            "inputDrv .drv path must be seeded (W03): {got:?}"
+        );
+    }
+
+    /// Never-narrower: a 3-output inputDrv where the parent consumes
+    /// only `["out"]`, narinfo has `dev`+`man` rows with `deriver` set
+    /// but `out` has `deriver=NULL`. A name-blind `narinfo.deriver`
+    /// reverse-lookup with a `len() >= consumed` count-check would
+    /// pass (2 ≥ 1) and seed `[dev, man]` — silently dropping `out`,
+    /// the one output the build actually references. The
+    /// `derivations`-table resolver returns the full
+    /// `expected_output_paths` instead, so `out` is seeded regardless
+    /// of narinfo's deriver state.
+    // r[verify sched.dispatch.input-roots+2]
+    #[tokio::test]
+    async fn attested_seeds_never_narrower_multi_output() {
+        let (t, db) = test_db().await;
+        let mut dag = DerivationDag::new();
+        let multi_drv = rio_test_support::fixtures::test_drv_path("attest-multi");
+        let out = rio_test_support::fixtures::test_store_path("attest-multi-out");
+        let dev = rio_test_support::fixtures::test_store_path("attest-multi-dev");
+        let man = rio_test_support::fixtures::test_store_path("attest-multi-man");
+        let src = rio_test_support::fixtures::test_store_path("attest-src");
+
+        // narinfo state that would fool a deriver-count heuristic:
+        // dev+man have deriver set, out has deriver NULL.
+        put_narinfo_with_deriver(&t.pool, &dev, Some(&multi_drv)).await;
+        put_narinfo_with_deriver(&t.pool, &man, Some(&multi_drv)).await;
+        put_narinfo_with_deriver(&t.pool, &out, None).await;
+        // The persisted authority: full expected_output_paths.
+        put_derivation_row(&t.pool, &multi_drv, &[&out, &dev, &man]).await;
+
+        // Parent declares it consumes ["out"] only (make_attest_parent
+        // builds inputDrvs=[(child,["out"])]).
+        dag.insert_recovered_node(make_attest_parent(&multi_drv, &src));
+
+        let got = attested_input_seeds(&dag, &"attest-parent".into(), &db)
+            .await
+            .unwrap()
+            .expect("derivations-table resolver attests the full output set");
+        assert!(
+            got.contains(&out),
+            "the consumed output `out` MUST be seeded even though its \
+             narinfo.deriver is NULL — never-narrower: {got:?}"
+        );
+    }
+
+    /// An inputDrv not in the DAG AND with no `derivations` row
+    /// (genuinely never merged on this cluster) → no attestation.
+    // r[verify sched.dispatch.input-roots+2]
+    #[tokio::test]
+    async fn attested_seeds_none_when_input_drv_unresolvable() {
+        let (_t, db) = test_db().await;
         let mut dag = DerivationDag::new();
         let missing_child = rio_test_support::fixtures::test_drv_path("attest-gone-child");
         let src = rio_test_support::fixtures::test_store_path("attest-src");
         dag.insert_recovered_node(make_attest_parent(&missing_child, &src));
 
         assert!(
-            attested_input_seeds(&dag, &"attest-parent".into()).is_none(),
-            "inputDrv missing from DAG → must not attest"
+            attested_input_seeds(&dag, &"attest-parent".into(), &db)
+                .await
+                .unwrap()
+                .is_none(),
+            "inputDrv missing from DAG AND derivations table → must not attest"
+        );
+    }
+
+    /// An inputDrv not in the DAG whose `derivations` row has a
+    /// floating-CA placeholder `[""]` → no attestation (the consumed
+    /// output is unknowable pre-build).
+    // r[verify sched.dispatch.input-roots+2]
+    #[tokio::test]
+    async fn attested_seeds_none_when_pg_expected_paths_are_placeholders() {
+        let (t, db) = test_db().await;
+        let mut dag = DerivationDag::new();
+        let ca_drv = rio_test_support::fixtures::test_drv_path("attest-floating-ca");
+        let src = rio_test_support::fixtures::test_store_path("attest-src");
+        put_derivation_row(&t.pool, &ca_drv, &[""]).await;
+        dag.insert_recovered_node(make_attest_parent(&ca_drv, &src));
+
+        assert!(
+            attested_input_seeds(&dag, &"attest-parent".into(), &db)
+                .await
+                .unwrap()
+                .is_none(),
+            "floating-CA placeholder in derivations row → must not attest"
         );
     }
 
     /// An inputDrv child whose output paths aren't known yet (floating-
     /// CA placeholder "" and no realized paths) → no attestation.
     // r[verify sched.dispatch.input-roots+2]
-    #[test]
-    fn attested_seeds_none_when_child_outputs_unknown() {
+    #[tokio::test]
+    async fn attested_seeds_none_when_child_outputs_unknown() {
+        let (_t, db) = test_db().await;
         let mut dag = DerivationDag::new();
         let child_drv_path = rio_test_support::fixtures::test_drv_path("attest-child");
         let mut child = DerivationState::try_from_node(
@@ -296,7 +553,10 @@ mod tests {
         dag.insert_recovered_edge("attest-parent".into(), "attest-child".into());
 
         assert!(
-            attested_input_seeds(&dag, &"attest-parent".into()).is_none(),
+            attested_input_seeds(&dag, &"attest-parent".into(), &db)
+                .await
+                .unwrap()
+                .is_none(),
             "unknown child output path → must not attest"
         );
     }

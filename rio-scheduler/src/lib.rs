@@ -473,11 +473,19 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_input_closure_unattested_total",
         "Dispatches whose input closure was NOT attested, labeled by reason \
-         (seeds_unknown/missing_narinfo/db_error/timeout). Each one degrades \
-         the builder to its own drv-parsed closure BFS and the store skips \
-         closure-digest verification for that build; a sustained nonzero \
-         rate means attestation is effectively disabled — compare against \
-         rio_scheduler_assignments_total."
+         (seeds_unknown/missing_narinfo/db_error/timeout). Under ADR-022 \
+         closure-scoped FUSE these are infra-retry loops, not safe degrades \
+         — the builder's own drv-parsed BFS may EIO reading through the \
+         empty-scoped mount. A sustained nonzero rate means attestation is \
+         effectively disabled; compare against rio_scheduler_assignments_total."
+    );
+    describe_counter!(
+        "rio_scheduler_attested_seeds_pg_fallback_total",
+        "attested_input_seeds resolutions of a DAG-missed inputDrv via the \
+         persisted derivations.expected_output_paths row, labeled by outcome \
+         (resolved/degraded_none). resolved > 0 is normal post-restart or \
+         after reap; degraded_none means a genuinely-never-merged inputDrv \
+         or a floating-CA placeholder."
     );
     describe_counter!(
         "rio_scheduler_cleanup_dropped_total",

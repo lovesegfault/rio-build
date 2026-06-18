@@ -116,6 +116,7 @@
     "rio_scheduler_attempt_record_retries_total",
     "rio_scheduler_attempt_requeue_seconds",
     "rio_scheduler_attempts_gc_deleted_total",
+    "rio_scheduler_attested_seeds_pg_fallback_total",
     "rio_scheduler_backpressure_projected_drain_seconds",
     "rio_scheduler_broadcast_lagged_total",
     "rio_scheduler_build_duration_seconds",
@@ -911,6 +912,11 @@
         "help": "drv_attempts rows deleted by the periodic attempt-ledger retention sweep (sched.db.attempts-gc): suffix-complement rows past the retention horizon plus orphaned histories. The decision suffix is provably unchanged by every increment"
       },
       {
+        "name": "rio_scheduler_attested_seeds_pg_fallback_total",
+        "kind": "counter",
+        "help": "attested_input_seeds resolutions of a DAG-missed inputDrv via the persisted derivations.expected_output_paths row, labeled by outcome (resolved/degraded_none). resolved > 0 is normal post-restart or after reap; degraded_none means a genuinely-never-merged inputDrv or a floating-CA placeholder."
+      },
+      {
         "name": "rio_scheduler_backpressure_projected_drain_seconds",
         "kind": "gauge",
         "help": "Projected mailbox drain time: queue depth × per-turn work-cost EWMA, refreshed at every dequeue. The cost axis of the backpressure law (round-9 B6): the flag engages when this reaches 30s (the submit-side caller deadline class) even at low depth — the live_053 inversion was 140s-class turns at 1–12.8% depth with silent depth watermarks. Watch it approach the budget; sustained high values at low mailbox depth mean individual commands are too expensive (pair with rio_scheduler_actor_cmd_seconds to name them).",
@@ -1073,7 +1079,7 @@
       {
         "name": "rio_scheduler_input_closure_unattested_total",
         "kind": "counter",
-        "help": "Dispatches whose input closure was NOT attested, labeled by reason (seeds_unknown/missing_narinfo/db_error/timeout). Each one degrades the builder to its own drv-parsed closure BFS and the store skips closure-digest verification for that build; a sustained nonzero rate means attestation is effectively disabled — compare against rio_scheduler_assignments_total."
+        "help": "Dispatches whose input closure was NOT attested, labeled by reason (seeds_unknown/missing_narinfo/db_error/timeout). Under ADR-022 closure-scoped FUSE these are infra-retry loops, not safe degrades — the builder's own drv-parsed BFS may EIO reading through the empty-scoped mount. A sustained nonzero rate means attestation is effectively disabled; compare against rio_scheduler_assignments_total."
       },
       {
         "name": "rio_scheduler_interrupt_samples_absorbed_total",
