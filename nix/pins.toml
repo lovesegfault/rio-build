@@ -77,13 +77,14 @@ version = "1.21.1"
 # do `pkgs."linuxPackages_${kernel_minor}"`. Pinned (not
 # linuxPackages_latest) so a nixpkgs flake-input bump can't
 # surprise-rebuild the ~40min kernel derivation.
-# 6.19 was dropped from nixpkgs at upstream EOL → 7.0. The e1b849cfa6b6
-# cgwb WARN-then-free is still unfixed in 7.0.x stable (the fix,
-# 6689f01d6740 "writeback: Fix use after free in
-# inode_switch_wbs_work_fn()", is mainline post-7.0 and not in 7.0.8
-# yet) — the panic/kdump mitigations and NodeRepair recovery stay; see
-# Q-CGWB.
-kernel_minor = "7_0"
+# 7.1 includes 6689f01d6740 "writeback: Fix use after free in
+# inode_switch_wbs_work_fn()" (mainline pre-v7.1 tag; in ChangeLog-7.1),
+# closing the e1b849cfa6b6 cgwb UAF that Q-CGWB tracked. The
+# panic/kdump cmdline (nix/nixos-node/hardening.nix:60-71) and
+# Karpenter NodeRepair (infra/eks/karpenter.tf:164) stay — they were
+# motivated by the cgwb panic but are general OS-level-failure
+# recovery/diagnostics, not cgwb-specific workarounds.
+kernel_minor = "7_1"
 
 [node.nodeadm]
 # awslabs/amazon-eks-ami release tag for the packaged `nodeadm`
