@@ -57,7 +57,7 @@ impl SchedulerDb {
     /// castore prefetch, not the attestation.
     ///
     /// Sorted by `store_path` so `input_closure_digest` is stable.
-    // r[impl sched.dispatch.input-roots+2]
+    // r[impl sched.dispatch.input-roots+3]
     pub(crate) async fn compute_input_roots(
         &self,
         seeds: &[String],

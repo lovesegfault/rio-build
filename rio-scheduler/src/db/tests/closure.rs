@@ -41,7 +41,7 @@ async fn put_root_node(pool: &sqlx::PgPool, path: &str, root_node: &[u8]) {
 }
 
 /// Three-level closure root → middle → leaf, each with a `root_node`.
-// r[verify sched.dispatch.input-roots+2]
+// r[verify sched.dispatch.input-roots+3]
 #[tokio::test]
 async fn closure_walk_resolves_root_nodes() {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -93,7 +93,7 @@ async fn closure_walk_resolves_root_nodes() {
 /// Missing `nar_index` row (indexer hasn't caught up): the path stays
 /// in the closure with `root_node = None` — that only degrades the
 /// castore prefetch, not the attestation.
-// r[verify sched.dispatch.input-roots+2]
+// r[verify sched.dispatch.input-roots+3]
 #[tokio::test]
 async fn closure_walk_tolerates_unindexed_paths() {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -127,7 +127,7 @@ async fn closure_walk_tolerates_unindexed_paths() {
 /// GC can collect still-referenced paths). The whole root degrades to
 /// unattested (`None`) instead — pre-fix the call returned the
 /// truncated set `{middle, root}` and dispatch signed its digest.
-// r[verify sched.dispatch.input-roots+2]
+// r[verify sched.dispatch.input-roots+3]
 #[tokio::test]
 async fn closure_member_missing_narinfo_degrades_to_unattested() {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -154,7 +154,7 @@ async fn closure_member_missing_narinfo_degrades_to_unattested() {
 }
 
 /// Cyclic references (Nix self-ref outputs) terminate.
-// r[verify sched.dispatch.input-roots+2]
+// r[verify sched.dispatch.input-roots+3]
 #[tokio::test]
 async fn closure_walk_terminates_on_cycle() {
     let test_db = TestDb::new(&crate::MIGRATOR).await;

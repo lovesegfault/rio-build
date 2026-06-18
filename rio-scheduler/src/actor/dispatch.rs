@@ -1224,7 +1224,7 @@ impl DagActor {
         // attested closure is structurally empty there → the
         // empty-digest "no attestation" sentinel that validate_begin
         // (P0586) already treats as scheduler-couldn't-compute.
-        // r[impl sched.dispatch.input-roots+2]
+        // r[impl sched.dispatch.input-roots+3]
         let (input_root_rows, input_closure, input_closure_digest) = match attempt_kind {
             rio_evidence_kernel::pull::PullKind::Build => {
                 // Seeds resolution may fall through to a PG

@@ -3348,7 +3348,7 @@ async fn failed_recovery_ticks_never_close_predecessor_attempts() -> TestResult 
 /// own drv-parsed closure, which is complete by construction). A
 /// non-empty closure that omits d1's output is the silent-narrowing
 /// bug this test pins down.
-// r[verify sched.dispatch.input-roots+2]
+// r[verify sched.dispatch.input-roots+3]
 #[tokio::test]
 async fn test_recovery_never_attests_partial_input_closure() -> TestResult {
     let build_id = Uuid::new_v4();

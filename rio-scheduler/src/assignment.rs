@@ -121,7 +121,8 @@ pub(crate) fn approx_input_closure(dag: &DerivationDag, drv_hash: &DrvHash) -> V
 /// invariant structural: state the scheduler cannot prove complete
 /// degrades to "no attestation", never to a silently narrower
 /// attestation — no recovery-path bookkeeping to keep in sync.
-// r[impl sched.dispatch.input-roots+2]
+// r[impl sched.dispatch.input-roots+3]
+// r[impl sched.dispatch.never-narrower]
 pub(crate) async fn attested_input_seeds(
     dag: &DerivationDag,
     drv_hash: &DrvHash,
@@ -337,7 +338,7 @@ mod tests {
 
     /// Happy path: parsed drv with a resolvable inputDrv child →
     /// seeds = inputSrcs ∪ the child's realized outputs.
-    // r[verify sched.dispatch.input-roots+2]
+    // r[verify sched.dispatch.input-roots+3]
     #[tokio::test]
     async fn attested_seeds_resolve_parsed_drv_inputs() {
         let (_t, db) = test_db().await;
@@ -371,7 +372,7 @@ mod tests {
     /// even though a DAG child with a known output exists (the
     /// approximation would have produced a non-empty — and possibly
     /// narrower-than-true — seed set).
-    // r[verify sched.dispatch.input-roots+2]
+    // r[verify sched.dispatch.input-roots+3]
     #[tokio::test]
     async fn attested_seeds_none_without_drv_content() {
         let (_t, db) = test_db().await;
@@ -413,7 +414,7 @@ mod tests {
     /// so a DAG miss must NOT degrade to no-attestation when the
     /// persisted authority can supply the outputs. Regression test for
     /// the 1331-stuck-FOD shape.
-    // r[verify sched.dispatch.input-roots+2]
+    // r[verify sched.dispatch.input-roots+3]
     #[tokio::test]
     async fn attested_seeds_fall_back_to_pg_for_substituted_input_drv() {
         let (t, db) = test_db().await;
@@ -457,7 +458,8 @@ mod tests {
     /// `derivations`-table resolver returns the full
     /// `expected_output_paths` instead, so `out` is seeded regardless
     /// of narinfo's deriver state.
-    // r[verify sched.dispatch.input-roots+2]
+    // r[verify sched.dispatch.input-roots+3]
+    // r[verify sched.dispatch.never-narrower]
     #[tokio::test]
     async fn attested_seeds_never_narrower_multi_output() {
         let (t, db) = test_db().await;
@@ -493,7 +495,7 @@ mod tests {
 
     /// An inputDrv not in the DAG AND with no `derivations` row
     /// (genuinely never merged on this cluster) → no attestation.
-    // r[verify sched.dispatch.input-roots+2]
+    // r[verify sched.dispatch.input-roots+3]
     #[tokio::test]
     async fn attested_seeds_none_when_input_drv_unresolvable() {
         let (_t, db) = test_db().await;
@@ -514,7 +516,7 @@ mod tests {
     /// An inputDrv not in the DAG whose `derivations` row has a
     /// floating-CA placeholder `[""]` → no attestation (the consumed
     /// output is unknowable pre-build).
-    // r[verify sched.dispatch.input-roots+2]
+    // r[verify sched.dispatch.input-roots+3]
     #[tokio::test]
     async fn attested_seeds_none_when_pg_expected_paths_are_placeholders() {
         let (t, db) = test_db().await;
@@ -535,7 +537,7 @@ mod tests {
 
     /// An inputDrv child whose output paths aren't known yet (floating-
     /// CA placeholder "" and no realized paths) → no attestation.
-    // r[verify sched.dispatch.input-roots+2]
+    // r[verify sched.dispatch.input-roots+3]
     #[tokio::test]
     async fn attested_seeds_none_when_child_outputs_unknown() {
         let (_t, db) = test_db().await;

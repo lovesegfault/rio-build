@@ -127,7 +127,7 @@
   and `Begin` on `Builder`), and `input_closure_digest` (hex
   `blake3(sorted(input_closure).join("\n"))`, the §6.3 server-side refscan
   attestation; empty = scheduler couldn't compute the closure at dispatch ---
-  see #rref("sched.dispatch.input-roots+2")). `tenant`, `role`, and
+  see #rref("sched.dispatch.input-roots+3")). `tenant`, `role`, and
   `input_closure_digest` are `#[serde(default)]` (old token still parses) and
   `#[serde(skip_serializing_if = …)]` (default-valued token serializes to the
   pre-P0589 byte shape, so `deny_unknown_fields` on a not-yet-rolled store

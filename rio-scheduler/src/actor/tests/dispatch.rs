@@ -290,7 +290,7 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
 /// the drv's `inputSrcs` entry. Guards the positive half of the
 /// attested-closure rule (the recovery test in `recovery.rs` covers
 /// the degraded half: no attestation rather than a narrower one).
-// r[verify sched.dispatch.input-roots+2]
+// r[verify sched.dispatch.input-roots+3]
 #[tokio::test]
 async fn test_dispatch_attests_input_closure_from_parsed_drv() -> TestResult {
     let (db, handle, _task) = setup().await;

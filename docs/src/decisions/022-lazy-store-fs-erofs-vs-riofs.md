@@ -56,7 +56,7 @@ The build's `/nix/store` is a **single read-write overlayfs** with an SSD upper 
 
 r[builder.fs.castore-dag-source]
 
-At mount time the builder holds the closure's set of input store paths and each path's `root_node` (from the scheduler-supplied `WorkAssignment.input_roots`, `r[sched.dispatch.input-roots+2]`). It prefetches the full Directory DAG via **`GetDirectory(root_digest, recursive=true) → stream<Directory>`** (`r[store.castore.directory-rpc]`). Chromium-scale (8 221 dirs, 23 218 files) is on the order of 5 MiB in heap.
+At mount time the builder holds the closure's set of input store paths and each path's `root_node` (from the scheduler-supplied `WorkAssignment.input_roots`, `r[sched.dispatch.input-roots+3]`). It prefetches the full Directory DAG via **`GetDirectory(root_digest, recursive=true) → stream<Directory>`** (`r[store.castore.directory-rpc]`). Chromium-scale (8 221 dirs, 23 218 files) is on the order of 5 MiB in heap.
 
 The synthetic root (`FUSE_ROOT_ID`, `/nix/store`) is the only node not in the DAG — its children are the closure's store-path basenames, each mapping to that path's `root_digest` (or `file_digest`/symlink-target if the store path itself is a regular file or symlink). `readdir` of the root enumerates the closure; `lookup(ROOT, basename)` returns the path's inode (§2.3).
 

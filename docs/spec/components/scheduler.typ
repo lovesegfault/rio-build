@@ -1320,22 +1320,35 @@ view) and the controller's Job/pod census.
   uploaded.
 ]
 
-#r("sched.dispatch.input-roots+2")[
+#r("sched.dispatch.input-roots+3")[
   `WorkAssignment` MUST carry the build's transitive input closure
   (`input_closure`, sorted store-path strings) and, for each closure path that
   has a `nar_index` row, its castore root node (`input_roots`). The closure is
   the BFS over `narinfo.references` from the dispatch-time seeds, which MUST be
-  derived from the parsed derivation's exact direct inputs (`inputSrcs` ∪ the
-  outputs of every `inputDrvs` entry, resolved through the in-memory DAG) ---
-  not the shallow `approx_input_closure` prefetch hint. The same sorted
+  the parsed derivation's exact direct inputs: `inputSrcs` ∪ the derivation's
+  own `.drv` path ∪ every `inputDrvs` entry's `.drv` path ∪ the outputs of
+  every `inputDrvs` entry, resolved through the in-memory DAG or, for entries
+  with no DAG node, through the persisted `derivations.expected_output_paths`
+  row --- not the shallow `approx_input_closure` prefetch hint. The same sorted
   `input_closure` is what `AssignmentClaims.input_closure_digest` hashes
-  (#rref("common.hmac.claims")). The attested closure MUST NOT be narrower than
-  the build's true input closure: when the scheduler cannot establish the exact
-  direct-input set (no inlined `.drv` --- e.g. a recovery-loaded node --- or an
-  `inputDrvs` entry whose output paths are unknown), or on PG failure, it sends
-  both fields empty and the builder falls back to its own drv-parsed
-  `QueryPathInfo` BFS.
+  (#rref("common.hmac.claims")). When the scheduler cannot establish the exact
+  direct-input set (no inlined `.drv` --- e.g. a recovery-loaded node --- an
+  `inputDrvs` entry with neither a DAG node nor a `derivations` row, or a
+  floating-CA placeholder output), or on PG failure, it sends both fields
+  empty; under ADR-022 closure-scoped FUSE this is an infra-retry, not a
+  silent degrade --- see the residual-arm `TODO` at the dispatch callsite.
 ]
+
+#r("sched.dispatch.never-narrower")[
+  When `attested_input_seeds` returns `Some(seeds)`, `seeds` MUST be a
+  superset of the parsed derivation's direct inputs (`inputSrcs` ∪ own `.drv` // quantifier: census(attested_seeds_never_narrower_multi_output)
+  path ∪ every `inputDrvs` `.drv` path ∪ every consumed `inputDrv` output).
+  When this cannot be proven, the function MUST return `None`.
+]
+The never-narrower constraint is enforced at the scheduler --- there is no
+defense-in-depth downstream: the builder's reference scanner and the store's
+upload gate both trust the attested set, so a `Some(partial)` would silently
+drop references and corrupt GC.
 The `nar_index.root_node` column is written in the same transaction that makes
 a path's manifest `complete`, so every
 closure path that is substitutable at dispatch time has an `input_roots`
