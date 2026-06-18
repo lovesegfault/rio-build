@@ -18,7 +18,14 @@
   document(
     route + ".html",
     title: c.title,
-    page-shell(route, c.title, c.path)[#include "/" + c.path],
+    {
+      // Bundle mode shares one counter space across `document()` calls;
+      // reset so each page's first heading is §1, not §N (QA H2).
+      // Heading-slug ids are text-derived (lib/rio.typ _slug), so this
+      // doesn't change anchor hrefs.
+      counter(heading).update(0)
+      page-shell(route, c.title, c.path)[#include "/" + c.path]
+    },
   )
 }
 
