@@ -93,6 +93,7 @@ specs (
           rio-scheduler/tests/**/*.rs
           rio-builder/tests/**/*.rs
           rio-controller/tests/**/*.rs
+          rio-crds/tests/**/*.rs
           rio-migrations/tests/**/*.rs
           xtask/tests/**/*.rs
           nix/tests/default.nix
