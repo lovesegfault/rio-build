@@ -1244,6 +1244,18 @@ in
       #   a settled state (q==0 r==0 drain at recovery's end), so
       #   store-rollout starts from a clean baseline.
       "store-rollout"
+      # r[verify sched.dispatch.input-roots+3]
+      #   fod-substituted-inputs: the 1331-FOD-stuck regression shape.
+      #   Build dep → rollout restart deploy/rio-scheduler → submit a
+      #   parent whose only inputDrv is dep → attested_input_seeds
+      #   resolves dep WITHOUT degrading to None. Asserts seeds_unknown
+      #   stays flat across the parent dispatch and no Input/output
+      #   error in builder logs. After store-rollout (settled cluster);
+      #   does its own scheduler rollout + drain so authz-matrix below
+      #   starts clean. The PG-fallback arm specifically is unit-covered
+      #   (a fresh submit re-merges dep into the DAG, so the VM path
+      #   takes the DAG arm — see fragment header).
+      "fod-substituted-inputs"
       # r[verify store.log.tail-ownership]
       # r[verify store.log.method-credential+2]
       # r[verify sched.tenant.authz+3]

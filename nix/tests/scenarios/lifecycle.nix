@@ -314,6 +314,43 @@ let
   rolloutPreDrv = drvs.mkTrivial { marker = "lifecycle-rollout-pre"; };
   rolloutPostDrv = drvs.mkTrivial { marker = "lifecycle-rollout-post"; };
 
+  # fod-substituted-inputs: dep + parent where the parent's only
+  # inputDrv is dep. dep is built and Completed BEFORE a scheduler
+  # rollout restart, so the post-restart scheduler's recovery (which
+  # loads only non-terminal rows) does NOT carry dep in its in-memory
+  # DAG. The parent is then submitted; attested_input_seeds must
+  # resolve dep's output path through the persisted
+  # derivations.expected_output_paths row (the PG-fallback resolver),
+  # NOT degrade to None and dispatch with empty input_roots.
+  #
+  # Parent is a regular build, not an FOD: the resolver is
+  # build-kind-agnostic and the recovery split's fixture has no
+  # kind=Fetcher pool. The production symptom (1331 stuck FODs) was
+  # FOD-shaped because that lane saturated first; the scheduler-side
+  # gap this fragment regression-tests is identical for either kind.
+  fodSubstitutedDrvFile = pkgs.writeText "lifecycle-fod-substituted.nix" ''
+    { busybox }:
+    let
+      sh = "''${busybox}/bin/sh";
+      bb = "''${busybox}/bin/busybox";
+      dep = derivation {
+        name = "rio-fod-substituted-dep";
+        system = builtins.currentSystem;
+        builder = sh;
+        args = [ "-c" "''${bb} printf '%s' fod-substituted-dep-payload > $out" ];
+      };
+      parent = derivation {
+        name = "rio-fod-substituted-parent";
+        system = builtins.currentSystem;
+        builder = sh;
+        # Reading dep through the castore-FUSE lower is what EIOd in
+        # production when input_roots was empty under closure-scoped
+        # enforce; here it just proves the dep is reachable.
+        args = [ "-c" "''${bb} cat ''${dep}; ''${bb} printf '%s' fod-substituted-parent-payload > $out" ];
+      };
+    in { inherit dep parent; }
+  '';
+
   # refs-end-to-end: two-stage build where consumer's $out embeds dep's
   # store path as a literal string. The worker's RefScanSink finds the
   # hash part during NAR dump → PutPath sends references=[dep] → PG
@@ -726,6 +763,7 @@ let
       tenantDrv
       rolloutPreDrv
       rolloutPostDrv
+      fodSubstitutedDrvFile
       refsDrvFile
       authzDrv
       signJwt
