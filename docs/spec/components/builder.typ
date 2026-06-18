@@ -577,7 +577,7 @@ line-number gate (#rref("store.log.ingest-bounds")). Subsequent attempts seed
 the `LogBatcher` with the prior attempt's final line count so output line
 numbers continue into the same `AppendLog` session. The normative
 requirement and the display-only / no-pod-identity rationale live in
-#rref("obs.log.worker-header") in the observability spec.
+#rref("obs.log.worker-header+2") in the observability spec.
 
 #r("builder.daemon.stderr-result-logs")[
   Modern `nix-daemon` sends build output via `STDERR_RESULT` with

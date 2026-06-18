@@ -78,7 +78,7 @@ more useful than `NotFound`, but the missing tail is usually the most
 interesting part of the log: the build error. Without an explicit indicator
 the user reads a truncated log as the whole thing.
 
-#r("obs.log.worker-header")[
+#r("obs.log.worker-header+2")[
   The worker MUST write `rio: exec`, `rio: builder`, `rio: started` lines as
   the first lines of every build log, and a `rio: exec` + `rio: peaks` +
   `rio: result` footer after the build process exits. The `peaks` line carries

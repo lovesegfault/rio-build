@@ -4039,12 +4039,16 @@ backoff. This prevents unbounded request queueing at the gateway layer.
   became durable.
 ]
 
-#r("sched.db.batch-unnest")[
+#r("sched.db.batch-unnest+2")[
   Batch INSERTs into `derivations` / `build_derivations` / `derivation_edges`
-  MUST use `UNNEST` array parameters (one bind per column, any row count).
-  `QueryBuilder::push_values` generates one bind parameter per column per row,
+  MUST use a constant-per-column bind shape (`UNNEST` array parameters or
+  `COPY` into a temp table) so the bind-parameter count is independent of row
+  count. `QueryBuilder::push_values` generates one bind per column per row,
   which hits PostgreSQL's 65535-parameter wire-protocol limit at 7282 rows × 9
-  columns --- below the \~30k-derivation size of a NixOS system closure.
+  columns --- below the \~30k-derivation size of a NixOS system closure. The
+  `derivations` / `derivation_edges` paths use COPY
+  (#rref("sched.db.merge-batch-shape")); the smaller-row-count paths use
+  UNNEST.
 ]
 
 #r("sched.db.merge-batch-shape")[
