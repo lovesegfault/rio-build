@@ -684,9 +684,11 @@
         })
         html.elem("h" + str(calc.min(it.level + 1, 6)), attrs: (id: id), {
           if it.numbering != none {
+            // QA S2: pagefind-ignore so the "3.1 " prefix doesn't leak
+            // into search-result titles.
             html.elem(
               "span",
-              attrs: (class: "hnum"),
+              attrs: (class: "hnum", data-pagefind-ignore: ""),
               numbering(it.numbering, ..counter(heading).at(here())),
             )
           }
@@ -697,6 +699,8 @@
               class: "anchor",
               href: "#" + id,
               aria-label: "Permalink to this section",
+              // QA S2: keep the ¶ glyph out of indexed heading text.
+              data-pagefind-ignore: "",
             ),
             [¶],
           )
@@ -721,7 +725,11 @@
         if notes.len() > 0 {
           html.elem(
             "section",
-            attrs: (class: "rio-footnotes", role: "doc-endnotes"),
+            attrs: (
+              class: "rio-footnotes",
+              role: "doc-endnotes",
+              data-pagefind-ignore: "",
+            ),
             html.elem("ol", for (i, b) in notes.enumerate() {
               html.elem("li", attrs: (id: "fn-" + str(i + 1)), {
                 b
@@ -760,7 +768,11 @@
           }
           html.elem(
             "nav",
-            attrs: (class: "nav-wrapper", aria-label: "Page navigation"),
+            attrs: (
+              class: "nav-wrapper",
+              aria-label: "Page navigation",
+              data-pagefind-ignore: "",
+            ),
             {
               nav-a(nav.prev, "mobile-nav-chapters previous", "prev", [←])
               nav-a(nav.next, "mobile-nav-chapters next", "next", [→])

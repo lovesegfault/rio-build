@@ -21,6 +21,11 @@
   // src-path is none for synthesized pages (404) — no description,
   // breadcrumb, or edit link in that case.
   let desc = if src-path != none { descriptions.at(src-path, default: none) }
+  // QA N3: always emit description/og:description; fall back to a
+  // title-derived blurb when meta.typ has no per-page summary.
+  let meta-desc = if desc != none { desc } else {
+    "rio-build design book — " + title
+  }
   let trail = if src-path != none { crumb-trail(chapters, src-path) } else {
     ()
   }
@@ -35,20 +40,16 @@
           content: "width=device-width,initial-scale=1",
         ),
       )
-      #if desc != none {
-        html.elem("meta", attrs: (name: "description", content: desc))
-      }
+      #html.elem("meta", attrs: (name: "description", content: meta-desc))
       #if page-url != none {
         html.elem("link", attrs: (rel: "canonical", href: page-url))
         html.elem("meta", attrs: (property: "og:title", content: title))
         html.elem("meta", attrs: (property: "og:type", content: "article"))
         html.elem("meta", attrs: (property: "og:url", content: page-url))
-        if desc != none {
-          html.elem("meta", attrs: (
-            property: "og:description",
-            content: desc,
-          ))
-        }
+        html.elem("meta", attrs: (
+          property: "og:description",
+          content: meta-desc,
+        ))
         html.elem("meta", attrs: (
           property: "og:image",
           content: site-url + "/og-image.svg",
@@ -122,7 +123,13 @@
           #html.elem("div", attrs: (id: "search"))[]
           #nav-tree(route)
         ]
-        #html.elem("main", attrs: (class: "rio-main", id: "main"))[
+        #html.elem("main", attrs: (
+          class: "rio-main",
+          id: "main",
+          // QA S1: scope pagefind indexing to the chapter body only —
+          // sidebar/TOC/dialog chrome outside <main> are excluded.
+          data-pagefind-body: "",
+        ))[
           #if trail.len() > 1 {
             // Breadcrumbs: ancestor chain root→leaf. Leaf (= this page,
             // already the <h1> below) is rendered unlinked; section
@@ -149,7 +156,10 @@
           #html.elem("h1")[#title]
           #body
           #if src-path != none {
-            html.elem("footer", attrs: (class: "rio-edit"))[
+            html.elem("footer", attrs: (
+              class: "rio-edit",
+              data-pagefind-ignore: "",
+            ))[
               #html.elem("a", attrs: (
                 href: repo-edit-base + src-path,
                 target: "_blank",
