@@ -6292,7 +6292,6 @@ dependencies = [
  "serde",
  "serde-saphyr",
  "serde_json",
- "workspace-hack",
 ]
 
 [[package]]
@@ -9056,7 +9055,6 @@ dependencies = [
  "aws-smithy-types",
  "base16ct 1.0.0",
  "base64 0.22.1",
- "bit-vec",
  "bitflags",
  "byteorder",
  "bytes",
@@ -9099,7 +9097,6 @@ dependencies = [
  "hyper-util",
  "indexmap 2.14.0",
  "inout",
- "ipnet",
  "jiff",
  "k8s-openapi",
  "kube",
@@ -9119,7 +9116,6 @@ dependencies = [
  "p256 0.14.0-rc.10",
  "p384",
  "p521",
- "percent-encoding",
  "pkcs8 0.11.0",
  "portable-atomic",
  "ppv-lite86",
@@ -9160,7 +9156,6 @@ dependencies = [
  "ssh-key",
  "subtle",
  "syn",
- "sync_wrapper",
  "thiserror 2.0.18",
  "time",
  "tokio",

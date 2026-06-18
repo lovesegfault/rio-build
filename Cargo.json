@@ -19910,10 +19910,6 @@
         {
           "name": "serde_json",
           "packageId": "serde_json"
-        },
-        {
-          "name": "workspace-hack",
-          "packageId": "workspace-hack"
         }
       ],
       "devDependencies": [
@@ -28880,10 +28876,6 @@
           "packageId": "base64 0.22.1"
         },
         {
-          "name": "bit-vec",
-          "packageId": "bit-vec"
-        },
-        {
           "name": "bitflags",
           "packageId": "bitflags",
           "target": "aarch64-unknown-linux-gnu"
@@ -29078,10 +29070,6 @@
           "packageId": "inout"
         },
         {
-          "name": "ipnet",
-          "packageId": "ipnet"
-        },
-        {
           "name": "jiff",
           "packageId": "jiff"
         },
@@ -29168,10 +29156,6 @@
         {
           "name": "p521",
           "packageId": "p521"
-        },
-        {
-          "name": "percent-encoding",
-          "packageId": "percent-encoding"
         },
         {
           "name": "pkcs8",
@@ -29340,10 +29324,6 @@
           "packageId": "syn"
         },
         {
-          "name": "sync_wrapper",
-          "packageId": "sync_wrapper"
-        },
-        {
           "name": "thiserror",
           "packageId": "thiserror 2.0.18"
         },
@@ -29462,10 +29442,6 @@
         {
           "name": "base64",
           "packageId": "base64 0.22.1"
-        },
-        {
-          "name": "bit-vec",
-          "packageId": "bit-vec"
         },
         {
           "name": "bitflags",
@@ -29666,10 +29642,6 @@
           "packageId": "inout"
         },
         {
-          "name": "ipnet",
-          "packageId": "ipnet"
-        },
-        {
           "name": "jiff",
           "packageId": "jiff"
         },
@@ -29756,10 +29728,6 @@
         {
           "name": "p521",
           "packageId": "p521"
-        },
-        {
-          "name": "percent-encoding",
-          "packageId": "percent-encoding"
         },
         {
           "name": "pkcs8",
@@ -29926,10 +29894,6 @@
         {
           "name": "syn",
           "packageId": "syn"
-        },
-        {
-          "name": "sync_wrapper",
-          "packageId": "sync_wrapper"
         },
         {
           "name": "thiserror",

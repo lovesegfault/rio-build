@@ -44,7 +44,16 @@ workspace-members = [
 # the smithy crates from feature traversal means test-util features don't
 # unify into the prod feature set; aws-smithy-mocks (dev-dep) still gets what
 # it needs at test time.
+#
+# rio-crds is traversal-excluded so its dev-only `kube = {features=["cel"]}`
+# doesn't unify the `cel` feature onto kube/kube-core in workspace-hack —
+# otherwise every prod binary links kube-cel/cel/antlr4rust. Its normal deps
+# (kube/schemars/serde/…) are all requested by other members, so nothing is
+# lost on the unification side. final-excludes.third-party on kube-cel/cel
+# would be a no-op: they aren't direct workspace-hack entries, only the
+# feature on kube is.
 [traversal-excludes]
+workspace-members = ["rio-crds"]
 third-party = [
   { name = "aws-smithy-runtime" },
   { name = "aws-smithy-http-client" },
