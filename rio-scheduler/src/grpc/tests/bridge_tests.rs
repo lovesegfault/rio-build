@@ -126,16 +126,9 @@ async fn test_completed_event_survives_display_flood() {
     let _ = state_tx.send(rio_proto::types::BuildEvent {
         build_id: build_id.to_string(),
         timestamp: None,
-        event: Some(Event::Derivation(rio_proto::types::DerivationEvent {
-            derivation_path: "/nix/store/x.drv".into(),
-            kind: rio_proto::types::DerivationEventKind::Completed as i32,
-            output_paths: vec![],
-            executor_id: String::new(),
-            error_message: String::new(),
-            failure_status: 0,
-            exec_id: String::new(),
-            has_execution: false,
-        })),
+        event: Some(Event::Derivation(
+            rio_proto::types::DerivationEvent::completed("/nix/store/x.drv".into(), vec![]),
+        )),
     });
 
     // Drain until we see the Completed. A 2s budget at 6001 events is

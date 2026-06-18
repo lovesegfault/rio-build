@@ -141,6 +141,7 @@
       "DerivationNode",
       "DerivationEdge",
       "DerivationEvent",
+      "StartedPredecessor",
       "GraphNode",
       "GraphEdge",
       "GetBuildGraphRequest",

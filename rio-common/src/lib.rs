@@ -24,6 +24,7 @@ pub mod classify;
 pub mod config;
 pub mod cors;
 pub mod dns;
+pub mod fmt;
 pub mod footprint;
 pub mod grpc;
 pub mod k8s;

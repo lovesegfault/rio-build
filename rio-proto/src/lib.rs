@@ -139,6 +139,23 @@ impl types::DerivationEvent {
             ..Default::default()
         }
     }
+    /// `started` with the predecessor payload (sh-042). Sibling so the
+    /// 8 wire-test callers of [`Self::started`] are untouched and a
+    /// scheduler emit site that has no predecessor stays the 3-arg
+    /// shape. `predecessor` is a STARTED-only field;
+    /// `cached`/`failed`/`completed`/`substituting` structurally
+    /// never set it.
+    pub fn started_with_predecessor(
+        derivation_path: String,
+        executor_id: String,
+        exec_id: String,
+        predecessor: types::StartedPredecessor,
+    ) -> Self {
+        Self {
+            predecessor: Some(predecessor),
+            ..Self::started(derivation_path, executor_id, exec_id)
+        }
+    }
     pub fn completed(derivation_path: String, output_paths: Vec<String>) -> Self {
         Self {
             derivation_path,

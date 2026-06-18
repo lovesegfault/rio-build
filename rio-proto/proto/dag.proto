@@ -146,6 +146,53 @@ message DerivationEvent {
   // direction. Plain bool (absent-vs-false are deliberately the same
   // behavior; no `optional`).
   bool has_execution = 8;
+  // STARTED only (sh-042): the just-closed predecessor attempt this
+  // STARTED supersedes — set ONLY when the scheduler re-dispatched a
+  // derivation whose prior build-kind attempt closed with a recorded
+  // termination reason in the SAME resubmit cycle. Absent (None) on a
+  // first mint, on a Subst→Build flip, on a worker-reported close
+  // whose reason is not yet established, and on every non-STARTED
+  // kind. Version-skew posture mirrors `has_execution`'s above: an
+  // old gateway drops the unknown field (today's silent supersede);
+  // an old scheduler never sets it (None → no marker). Skew loses a
+  // marker, never mints a misleading one.
+  optional StartedPredecessor predecessor = 9;
+}
+
+// The closed attempt a STARTED event supersedes (sh-042). Display
+// payload only — the gateway renders it as a `rio: retry` marker on
+// the predecessor's actBuild activity so a watching user never sees a
+// new `rio: exec` header with nothing in between.
+message StartedPredecessor {
+  // The predecessor's exec_id (UUIDv7).
+  string exec_id = 1;
+  // The predecessor's `attempt_terminal_reason_label` snake_case
+  // string (rio-common/classify.rs) — NOT the AttemptTerminalReason
+  // enum (which lives in admin_types.proto and would force a
+  // cross-file import for a display-only field).
+  string termination_reason = 2;
+  // Which resource floor the close promoted, when it did.
+  PredecessorFloorAxis floor_bumped = 3;
+  // The new mint's solved bytes on the bumped axis (`SolvedIntent.
+  // {mem,disk}_bytes` — what the next pod GETS, the value the next
+  // `rio: builder` header will show). Zero when `floor_bumped` is
+  // NONE.
+  uint64 new_axis_bytes = 4;
+}
+
+// Which resource floor a re-dispatch's predecessor promoted (the
+// inverse of `witnessed_disposition`'s promote arms, floor.rs).
+enum PredecessorFloorAxis {
+  PREDECESSOR_FLOOR_AXIS_NONE = 0;
+  PREDECESSOR_FLOOR_AXIS_MEM = 1;
+  PREDECESSOR_FLOOR_AXIS_DISK = 2;
+  // tag 3 reserved — DEADLINE intentionally omitted:
+  // SolvedIntent.deadline_secs is seconds, not bytes (fmt_size_iec is
+  // bytes-only); witnessed_disposition(DeadlineExceeded) = ClassifyOnly
+  // (floor.rs:511) so no producer would set it; the deadline floor's
+  // worker-TimedOut bump (floor.rs:127-136) surfaces on the next
+  // `rio: builder` header instead.
+  reserved 3;
 }
 
 enum DerivationEventKind {
