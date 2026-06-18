@@ -33,12 +33,25 @@ code, pre, kbd, samp { font-family: "NewComputerModernMono", monospace; }
 .rio-nav a { color: var(--fg); text-decoration: none; display: block; padding: .15rem 0; }
 .rio-nav a[aria-current="page"] { color: var(--accent); font-weight: 600; }
 .rio-nav .section { font-weight: 600; margin-top: .75rem; color: var(--muted); }
-.rio-main { padding: 2rem 3rem; max-width: 56rem; }
+/* The main column fills the grid track; the readable-measure cap is
+   applied per prose element so tables/figures/pre can use full width
+   on wide viewports while paragraphs stay at ~50rem. */
+.rio-main { padding: 2rem 3rem; min-width: 0; }
+.rio-main p, .rio-main ul, .rio-main ol, .rio-main dl,
+.rio-main h1, .rio-main h2, .rio-main h3, .rio-main h4, .rio-main h5,
+.rio-main blockquote, .rio-main .rio-req, .rio-main .rio-clue,
+.rio-main .rio-footnote, .rio-main .nav-wrapper, .rio-main .rio-edit,
+.rio-main math[display="block"] { max-width: 50rem; }
 .rio-main h1, .rio-main h2, .rio-main h3 { line-height: 1.25; }
 .rio-main a { color: var(--accent); }
 .rio-main pre { background: var(--sunk); padding: .75rem; overflow-x: auto; border-radius: 4px; }
-.rio-main table { border-collapse: collapse; }
-.rio-main th, .rio-main td { border: 1px solid var(--rule); padding: .4rem .6rem; }
+.rio-main table { border-collapse: collapse; width: 100%; }
+.rio-main th, .rio-main td { border: 1px solid var(--rule); padding: .4rem .6rem;
+  text-align: left; vertical-align: top; }
+/* A bare-code cell (metric name, config key, …) keeps one line so auto
+   table-layout reserves its natural width; prose columns wrap into the
+   remainder. Cells that mix code with prose still wrap normally. */
+.rio-main td > code:only-child { white-space: nowrap; }
 .rio-edit { margin-top: 3rem; font-size: .875rem; }
 .rio-edit a { color: var(--muted); }
 .rio-theme-toggle { background: none; border: 1px solid var(--rule); color: var(--fg);
