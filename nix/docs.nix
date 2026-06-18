@@ -251,7 +251,8 @@ let
           --root . ${mkInputArgs ghSha} --input x-target=html \
           --font-path "$TYPST_FONT_PATHS" book.typ $out/
         # Webfonts: ship the NCM faces style.css references — body text
-        # (NewCM10 regular/bold/italic/bold-italic), mono (NewCMMono10
+        # (NewCMSans10 regular/bold/oblique/bold-oblique — the sans
+        # family uses Oblique, not Italic), mono (NewCMMono10
         # regular/bold), and math (NewCMMath-Regular for the Plane-1
         # glyphs typst emits, U+1D400–, which need an OpenType MATH
         # table). Matches the @font-face set in docs/assets/style.css.
@@ -264,7 +265,7 @@ let
         # rewrites the CharStrings into a form OTS accepts. --unicodes=*
         # keeps every glyph; pyftsubset preserves the MATH table.
         mkdir -p $out/assets/fonts
-        for f in NewCM10-Regular NewCM10-Bold NewCM10-Italic NewCM10-BoldItalic \
+        for f in NewCMSans10-Regular NewCMSans10-Bold NewCMSans10-Oblique NewCMSans10-BoldOblique \
                  NewCMMono10-Regular NewCMMono10-Bold NewCMMath-Regular; do
           pyftsubset \
             ${pkgs.newcomputermodern}/share/fonts/opentype/public/$f.otf \

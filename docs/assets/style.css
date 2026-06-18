@@ -19,10 +19,17 @@
 }
 * { box-sizing: border-box; }
 body {
-  margin: 0; display: grid;
-  grid-template-columns: var(--nav-w) minmax(0, 1fr) var(--toc-w);
-  font: 18px/1.45 "NewComputerModern", serif;
+  margin: 0; display: flex; justify-content: center; min-height: 100vh;
+  font: 18px/1.45 "NewComputerModernSans", sans-serif;
   color: var(--fg); background: var(--bg);
+}
+/* Centered max-width page wrapper (typst.app/docs layout). The 3-col
+   grid lives here so the nav/main/toc tracks centre as a unit while
+   body fills the viewport. */
+.rio-page {
+  display: grid;
+  grid-template-columns: var(--nav-w) minmax(0, 1fr) var(--toc-w);
+  max-width: 90rem; width: 100%; min-width: 0;
 }
 /* The hamburger button is `position: fixed` so it never claims a grid
    track; hidden above the mobile breakpoint. */
@@ -31,6 +38,7 @@ code, pre, kbd, samp { font-family: "NewComputerModernMono", monospace; }
 .rio-nav {
   position: sticky; top: 0; height: 100vh; overflow-y: auto;
   padding: 1rem; border-right: 1px solid var(--rule);
+  background: var(--sunk);
 }
 .rio-nav ul { list-style: none; margin: 0; padding-left: 1rem; }
 .rio-nav > ul { padding-left: 0; }
@@ -65,28 +73,28 @@ code, pre, kbd, samp { font-family: "NewComputerModernMono", monospace; }
 .rio-frame svg { max-width: 100%; height: auto; }
 :root[data-theme="dark"] .rio-frame svg { filter: invert(0.93) hue-rotate(180deg); }
 @font-face {
-  font-family: "NewComputerModern"; font-weight: 400; font-style: normal;
+  font-family: "NewComputerModernSans"; font-weight: 400; font-style: normal;
   font-display: swap;
-  src: local("NewCM10-Regular"),
-       url("/assets/fonts/NewCM10-Regular.woff2") format("woff2");
+  src: local("NewCMSans10-Regular"),
+       url("/assets/fonts/NewCMSans10-Regular.woff2") format("woff2");
 }
 @font-face {
-  font-family: "NewComputerModern"; font-weight: 700; font-style: normal;
+  font-family: "NewComputerModernSans"; font-weight: 700; font-style: normal;
   font-display: swap;
-  src: local("NewCM10-Bold"),
-       url("/assets/fonts/NewCM10-Bold.woff2") format("woff2");
+  src: local("NewCMSans10-Bold"),
+       url("/assets/fonts/NewCMSans10-Bold.woff2") format("woff2");
 }
 @font-face {
-  font-family: "NewComputerModern"; font-weight: 400; font-style: italic;
+  font-family: "NewComputerModernSans"; font-weight: 400; font-style: italic;
   font-display: swap;
-  src: local("NewCM10-Italic"),
-       url("/assets/fonts/NewCM10-Italic.woff2") format("woff2");
+  src: local("NewCMSans10-Oblique"),
+       url("/assets/fonts/NewCMSans10-Oblique.woff2") format("woff2");
 }
 @font-face {
-  font-family: "NewComputerModern"; font-weight: 700; font-style: italic;
+  font-family: "NewComputerModernSans"; font-weight: 700; font-style: italic;
   font-display: swap;
-  src: local("NewCM10-BoldItalic"),
-       url("/assets/fonts/NewCM10-BoldItalic.woff2") format("woff2");
+  src: local("NewCMSans10-BoldOblique"),
+       url("/assets/fonts/NewCMSans10-BoldOblique.woff2") format("woff2");
 }
 @font-face {
   font-family: "NewComputerModernMono"; font-weight: 400; font-style: normal;
@@ -177,7 +185,8 @@ h5:hover .anchor, h6:hover .anchor,
 .rio-crumbs a:hover { color: var(--accent); }
 /* ─── on-this-page TOC ────────────────────────────────────────────── */
 .rio-toc { position: sticky; top: 0; align-self: start; max-height: 100vh;
-  overflow-y: auto; padding: 2rem 1rem; font-size: .82rem; }
+  overflow-y: auto; padding: 2rem 1rem; font-size: .82rem;
+  background: var(--sunk); border-left: 1px solid var(--rule); }
 .rio-toc-title { margin: 0 0 .6rem; font-weight: 600;
   text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
 .rio-toc ul { list-style: none; margin: 0; padding: 0;
@@ -238,11 +247,11 @@ h5:hover .anchor, h6:hover .anchor,
 .typ-error { color: var(--c-red); }
 /* ─── responsive ──────────────────────────────────────────────────── */
 @media (max-width: 1200px) {
-  body { grid-template-columns: var(--nav-w) minmax(0, 1fr); }
+  .rio-page { grid-template-columns: var(--nav-w) minmax(0, 1fr); }
   .rio-toc { display: none; }
 }
 @media (max-width: 800px) {
-  body { grid-template-columns: minmax(0, 1fr); }
+  .rio-page { grid-template-columns: minmax(0, 1fr); }
   .rio-main { padding: 1.5rem 1.25rem; }
   .rio-nav { position: fixed; top: 0; left: 0; bottom: 0; width: var(--nav-w);
     max-width: 85vw; background: var(--bg); border-right: 1px solid var(--rule);

@@ -423,7 +423,7 @@
   _domains.update(domains)
 
   // common typography (target-neutral)
-  set text(font: "New Computer Modern", size: 10.5pt, lang: "en")
+  set text(font: "New Computer Modern Sans", size: 10.5pt, lang: "en")
   set par(justify: true, leading: 0.7em, spacing: 1.05em)
 
   show raw: set text(font: "New Computer Modern Mono", size: 0.85em)
