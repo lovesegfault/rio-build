@@ -180,10 +180,11 @@ let
   # refs.gh() defaulted to "main").
   realSha = self.rev or "dirty";
   placeholderSha = "0000000000000000000000000000000000000000";
-  # GH Pages deploy base (see .github/workflows/docs.yml). Empty
-  # site-url makes page-shell omit canonical/OG meta — fine for the
-  # placeholder-SHA checks build, but the deployed `packages.docs`
-  # always passes the real URL.
+  # GH Pages deploy base (see .github/workflows/docs.yml). mkInputArgs
+  # passes site-url unconditionally, so every nix-driven build (checks,
+  # `nix run .#docs`, packages.docs) gets the real URL; only an
+  # out-of-band `typst compile` falls back to page.typ's empty default
+  # (which then omits canonical/OG meta).
   siteUrl = "https://lovesegfault.github.io/rio-build";
   mkInputArgs =
     ghSha:
@@ -281,16 +282,19 @@ let
         done
         # Static search index over the emitted HTML.
         pagefind --site $out --output-subdir pagefind
-        # `nix run .#docs` → serve the built tree. Only the root and 404
-        # page are baked in; everything else (port, host, tls) passes
-        # through, e.g. `nix run .#docs -- -p 9000`. static-web-server
-        # serves --page404 with a real 404 status (miniserve can't —
-        # its --spa would return 200 + index.html). QA H3.
+        # `nix run .#docs` → serve the built tree. Root, 404 page, and a
+        # loopback :8080 default are baked in (SWS otherwise binds the
+        # privileged :80); everything else passes through, e.g.
+        # `nix run .#docs -- -p 9000`. static-web-server serves
+        # --page404 with a real 404 status (miniserve can't — its --spa
+        # would return 200 + index.html). QA H3.
         mkdir -p $bin/bin
         makeWrapper ${pkgs.static-web-server}/bin/static-web-server $bin/bin/rio-docs \
           --add-flags "--root $out" \
           --add-flags "--page404 404.html" \
-          --add-flags "--cache-control-headers false"
+          --add-flags "--cache-control-headers false" \
+          --add-flags "--port 8080" \
+          --add-flags "--host 127.0.0.1"
       '';
 
   # Placeholder-SHA builds for the checks gate. Distinct attrs (not

@@ -11,8 +11,9 @@
 
 // Ayu accent — keeps the mobile-chrome tint in step with style.css.
 #let _theme-color = "#f29718"
-// Deploy base for canonical/OG URLs. Empty for local builds (the
-// `nix run .#docs` wrapper) so canonical/OG meta is omitted there.
+// Deploy base for canonical/OG URLs. nix/docs.nix passes this
+// unconditionally; only out-of-band `typst compile` hits the empty
+// default (which then omits canonical/OG meta).
 #let site-url = sys.inputs.at("site-url", default: "")
 
 #let page-shell(route, title, src-path, body) = {

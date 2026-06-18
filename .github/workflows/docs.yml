@@ -29,7 +29,7 @@ jobs:
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       # `result` is the .out output (post-processed HTML tree —
       # symbol-dedup, dyn-render JS strip, 404.html). The .bin output
-      # (miniserve wrapper) isn't built or needed here.
+      # (static-web-server wrapper) isn't built or needed here.
       - run: nix build .#docs --print-build-logs
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:

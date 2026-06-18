@@ -1211,7 +1211,7 @@
               };
 
               # `nix run .#docs` — serve the post-processed HTML tree via
-              # miniserve. The `bin` output of docsLib.docs holds the
+              # static-web-server. The `bin` output of docsLib.docs holds the
               # wrapper; the `out` output is the static tree (what
               # `nix build .#docs` symlinks at `result`).
               apps.docs = {
