@@ -30,7 +30,7 @@
 * { box-sizing: border-box; }
 body {
   margin: 0; display: flex; justify-content: center; min-height: 100vh;
-  font: 18px/1.45 "NewComputerModernSans", sans-serif;
+  font: 18px/1.45 "NewComputerModernSans", "NewComputerModernSans-fallback", sans-serif;
   color: var(--fg); background: var(--bg);
 }
 /* Centered max-width page wrapper (typst.app/docs layout). The 3-col
@@ -44,7 +44,7 @@ body {
 /* The hamburger button is `position: fixed` so it never claims a grid
    track; hidden above the mobile breakpoint. */
 .rio-nav-toggle { display: none; position: fixed; }
-code, pre, kbd, samp { font-family: "NewComputerModernMono", monospace; }
+code, pre, kbd, samp { font-family: "NewComputerModernMono", "NewComputerModernMono-fallback", monospace; }
 .rio-nav {
   position: sticky; top: 0; height: 100vh; overflow-y: auto;
   padding: 1rem; border-right: 1px solid var(--rule);
@@ -87,53 +87,88 @@ code, pre, kbd, samp { font-family: "NewComputerModernMono", monospace; }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme]) .rio-frame svg { filter: invert(0.93) hue-rotate(180deg); }
 }
+/* FOUT layout-shift mitigation: ascent/descent/line-gap overrides pin
+   each face's line-box to the OTF hhea metrics (computed from
+   NewCM{Sans,Mono,Math}10-Regular.otf — all weights/styles of a family
+   share metrics). Paired with the metric-adjusted local-fallback faces
+   below so the swap-period fallback occupies the same vertical box. */
 @font-face {
   font-family: "NewComputerModernSans"; font-weight: 400; font-style: normal;
   font-display: swap;
+  ascent-override: 115.4%; descent-override: 30.9%; line-gap-override: 0%;
   src: local("NewCMSans10-Regular"),
        url("/assets/fonts/NewCMSans10-Regular.woff2") format("woff2");
 }
 @font-face {
   font-family: "NewComputerModernSans"; font-weight: 700; font-style: normal;
   font-display: swap;
+  ascent-override: 115.4%; descent-override: 30.9%; line-gap-override: 0%;
   src: local("NewCMSans10-Bold"),
        url("/assets/fonts/NewCMSans10-Bold.woff2") format("woff2");
 }
 @font-face {
   font-family: "NewComputerModernSans"; font-weight: 400; font-style: italic;
   font-display: swap;
+  ascent-override: 115.4%; descent-override: 30.9%; line-gap-override: 0%;
   src: local("NewCMSans10-Oblique"),
        url("/assets/fonts/NewCMSans10-Oblique.woff2") format("woff2");
 }
 @font-face {
   font-family: "NewComputerModernSans"; font-weight: 700; font-style: italic;
   font-display: swap;
+  ascent-override: 115.4%; descent-override: 30.9%; line-gap-override: 0%;
   src: local("NewCMSans10-BoldOblique"),
        url("/assets/fonts/NewCMSans10-BoldOblique.woff2") format("woff2");
 }
 @font-face {
   font-family: "NewComputerModernMono"; font-weight: 400; font-style: normal;
   font-display: swap;
+  ascent-override: 101.6%; descent-override: 31.6%; line-gap-override: 0%;
   src: local("NewCMMono10-Regular"),
        url("/assets/fonts/NewCMMono10-Regular.woff2") format("woff2");
 }
 @font-face {
   font-family: "NewComputerModernMono"; font-weight: 700; font-style: normal;
   font-display: swap;
+  ascent-override: 101.6%; descent-override: 31.6%; line-gap-override: 0%;
   src: local("NewCMMono10-Bold"),
        url("/assets/fonts/NewCMMono10-Bold.woff2") format("woff2");
 }
 @font-face {
   font-family: "NewComputerModernMath";
   font-display: swap;
+  ascent-override: 80.6%; descent-override: 19.4%; line-gap-override: 20%;
   src: local("NewComputerModernMath-Regular"),
        local("NewComputerModernMath"),
        url("/assets/fonts/NewCMMath-Regular.woff2") format("woff2");
 }
+/* Metric-adjusted local fallbacks: a system face rendered with NewCM's
+   vertical metrics + size-adjust so the swap-period text occupies the
+   same line boxes. size-adjust = NewCM xAvgCharWidth / fallback
+   xAvgCharWidth (Arial 904/2048; Courier New 1229/2048). The
+   ascent/descent overrides are post-size-adjust, so divide by the
+   scale. */
+@font-face {
+  font-family: "NewComputerModernSans-fallback";
+  size-adjust: 138.42%;
+  ascent-override: 83.37%; descent-override: 22.32%; line-gap-override: 0%;
+  src: local("Arial");
+}
+@font-face {
+  font-family: "NewComputerModernMono-fallback";
+  size-adjust: 87.47%;
+  ascent-override: 116.15%; descent-override: 36.13%; line-gap-override: 0%;
+  src: local("Courier New");
+}
+@font-face {
+  font-family: "NewComputerModernMath-fallback";
+  ascent-override: 80.6%; descent-override: 19.4%; line-gap-override: 20%;
+  src: local("Times New Roman");
+}
 /* MathML: additive only — UA stylesheet's `display: block math` and
    centring are load-bearing; overriding `display` or `font-family` to
    non-math values breaks the formatting context. */
-math { font-family: "NewComputerModernMath", math; font-size: 1.1em; }
+math { font-family: "NewComputerModernMath", "NewComputerModernMath-fallback", math; font-size: 1.1em; }
 math[display="block"] { margin-block: 1.1em; }
 /* ─── content elements emitted by lib/rio.typ ───────────────────────
    Ported from the pre-3906bfb2d `rio-css` let-binding; theme-class
@@ -188,6 +223,9 @@ h5:hover .anchor, h6:hover .anchor,
   border-radius: 4px; text-decoration: none; color: var(--fg); }
 .mobile-nav-chapters:hover { border-color: var(--accent); color: var(--accent); }
 .mobile-nav-chapters.next { margin-left: auto; }
+/* Reserve the pagefind search box's height so the deferred
+   PagefindUI() mount doesn't shove the nav tree down. */
+#search { min-height: 3.2rem; }
 .rio-search-unavailable { font-size: .85em; color: var(--muted); padding: .5rem; }
 /* pagefind UI inherits theme via vars */
 .pagefind-ui { --pagefind-ui-primary: var(--accent); --pagefind-ui-text: var(--fg);

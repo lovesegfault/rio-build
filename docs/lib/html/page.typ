@@ -63,6 +63,22 @@
         rel: "icon",
         href: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%23f29718'/><text x='16' y='22' text-anchor='middle' font-size='18' font-weight='bold' fill='%2310141c'>r</text></svg>",
       ))
+      // Preload the three above-the-fold faces so font-display:swap's
+      // fallback window closes before first paint (FOUT layout-shift).
+      #for f in (
+        "NewCMSans10-Regular",
+        "NewCMSans10-Bold",
+        "NewCMMono10-Regular",
+      ) {
+        html.elem("link", attrs: (
+          rel: "preload",
+          // `as` is a typst keyword — string-key the pair.
+          "as": "font",
+          type: "font/woff2",
+          crossorigin: "anonymous",
+          href: "/assets/fonts/" + f + ".woff2",
+        ))
+      }
       #html.elem("link", attrs: (rel: "stylesheet", href: "/style.css"))
       #html.elem("link", attrs: (
         rel: "stylesheet",
