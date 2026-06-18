@@ -36,7 +36,7 @@ use rio_common::limits::{
 use crate::admission::{AdmissionError, AdmissionGate};
 use crate::backend::ChunkBackend;
 use crate::cas;
-use crate::ingest::{self, IngestHooks, PersistError, PlaceholderClaim};
+use crate::ingest::{self, IngestHooks, IngestStage, PersistError, PlaceholderClaim};
 use crate::metadata::{self, SigMode, Upstream};
 use crate::signing::TenantSigner;
 
@@ -2083,6 +2083,7 @@ impl Substituter {
         progress: Option<&SubstProgressFn>,
     ) -> Result<UpstreamOutcome, SubstituteError> {
         // — Step 2: GET narinfo + parse + verify_sig —
+        let t = Instant::now();
         let base = upstream.url.trim_end_matches('/');
         let narinfo_url = format!("{base}/{hash_part}.narinfo");
         let resp = http
@@ -2174,6 +2175,7 @@ impl Substituter {
                 limit: MAX_NAR_SIZE,
             });
         }
+        IngestStage::Narinfo.record(t);
 
         // — Step 3: claim placeholder (BEFORE the expensive download) —
         // Signatures are NOT computed yet: the Nix fingerprint includes
@@ -2207,6 +2209,7 @@ impl Substituter {
         // (the handle is zero-init; the AlreadyComplete/Raced paths
         // cost one Arc alloc, no behavior change).
         let progress_handle = Arc::new(ingest::ProgressHandle::new());
+        let t = Instant::now();
         let placeholder_guard = match ingest::claim_placeholder(
             &self.pool,
             &store_path_hash,
@@ -2311,6 +2314,7 @@ impl Substituter {
                 return Ok(UpstreamOutcome::Raced);
             }
         };
+        IngestStage::Claim.record(t);
         // r[impl store.put.drop-cleanup+3]
         // We OWN the placeholder. The guard was pre-armed INSIDE
         // `claim_placeholder` (sh-023) and is held by value here — its
@@ -2352,6 +2356,7 @@ impl Substituter {
                 self.stall_window,
                 self.nar_hold_floor_rate,
             );
+            let t = Instant::now();
             let reservation = NarBudgetReservation::reserve(
                 &self.nar_budget,
                 tenant_id,
@@ -2361,6 +2366,7 @@ impl Substituter {
                 Some(&progress_handle),
             )
             .await?;
+            IngestStage::BudgetPark.record(t);
             let nar_url = format!("{base}/{}", ni.url);
             let (nar_bytes, reservation) = self
                 .fetch_nar(
@@ -2433,6 +2439,7 @@ impl Substituter {
                 // asserts this.
                 #[cfg(test)]
                 let hash_gate = self.hash_gate.clone();
+                let t = Instant::now();
                 // `_reservation`: re-bound here and held to the end of
                 // this block — the budget is credited back only after
                 // `persist_nar` returns (today's permit lifetime).
@@ -2448,6 +2455,7 @@ impl Substituter {
                 )
                 .await
                 .map_err(|e| SubstituteError::Ingest(format!("hash task join: {e}")))?;
+                IngestStage::Sha256.record(t);
                 if got_hash != expected_hash {
                     return Err(SubstituteError::HashMismatch {
                         expected: hex::encode(expected_hash),
@@ -2602,6 +2610,7 @@ impl Substituter {
         progress_handle: Option<&ingest::ProgressHandle>,
         reservation: NarBudgetReservation,
     ) -> Result<(Bytes, NarBudgetReservation), SubstituteError> {
+        let t = Instant::now();
         // r[impl store.substitute.stall-abort+2]
         // Owner-side stall watchdog: the NAR GET deliberately has no
         // request-level timeout (a multi-GB body legitimately runs
@@ -2695,6 +2704,7 @@ impl Substituter {
         if let Some(cb) = progress {
             cb(out.len() as u64, expected_nar_size, upstream_base);
         }
+        IngestStage::Fetch.record(t);
         Ok((Bytes::from(out), reservation))
     }
 
@@ -6752,6 +6762,14 @@ mod tests {
             rec.get("rio_store_substitute_bytes_total{}"),
             nar_len,
             "the real ingest counts its bytes"
+        );
+        // opt-07 emission red: the leader path through try_upstream MUST
+        // record into the per-stage histogram (narinfo/claim/budget_park/
+        // fetch/sha256 fire on every leader; the four cas.rs stages only
+        // on chunked NARs — make_path()'s inline NAR skips those).
+        assert!(
+            rec.histogram_touched("rio_store_ingest_stage_seconds"),
+            "leader ingest must record rio_store_ingest_stage_seconds"
         );
         // Clear singleflight so the second call reaches do_substitute.
         sub.inflight.invalidate_all();

@@ -132,6 +132,22 @@ const CHUNK_UPGRADE_TX_BUCKETS: &[f64] = &[
     0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 150.0, 240.0, 300.0,
 ];
 
+/// Histogram bucket boundaries for `rio_store_ingest_stage_seconds`.
+///
+/// Spans the nine [`ingest::IngestStage`] labels: narinfo/claim/
+/// pg_upsert/pg_commit are millisecond-range PG round-trips; sha256/
+/// chunk are seconds-per-GiB compute; fetch/s3_upload are tens of
+/// seconds for multi-GB NARs at a8f15a9a4's whole-NAR FastCDC (~43 s
+/// s3_upload on the 826 MB linux-source benchmark). 300 s top is
+/// forward-compat headroom for multi-GB NARs and adr-022 per-file
+/// chunking — fits inside `SUBSTITUTE_DURATION_BUCKETS`' design
+/// envelope; the `[0.005..10.0]` default would lose every >10 s stage
+/// in `+Inf`.
+#[cfg(feature = "server")]
+const INGEST_STAGE_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.025, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+];
+
 /// Per-crate histogram bucket overrides, passed to
 /// `rio_common::server::bootstrap` → `init_metrics`. Every
 /// `describe_histogram!` in this crate must have an entry here OR be in
@@ -167,6 +183,7 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         "rio_store_chunk_upgrade_tx_seconds",
         CHUNK_UPGRADE_TX_BUCKETS,
     ),
+    ("rio_store_ingest_stage_seconds", INGEST_STAGE_BUCKETS),
 ];
 
 /// Registers prometheus metric descriptions. The help strings here are
@@ -444,6 +461,17 @@ pub fn describe_metrics() {
     describe_histogram!(
         "rio_store_substitute_duration_seconds",
         "Upstream substitution latency (narinfo fetch + NAR download + ingest)"
+    );
+    describe_histogram!(
+        "rio_store_ingest_stage_seconds",
+        "Per-stage NAR ingest wall-clock, labeled stage = narinfo|claim|\
+         budget_park|fetch|sha256|chunk|pg_upsert|s3_upload|pg_commit. \
+         Substitute leaders emit all nine; PutPath emits the four cas.rs \
+         stages (chunk/pg_upsert/s3_upload/pg_commit), so \
+         rate(count{stage=chunk}) != rate(rio_store_substitute_total). \
+         stage=pg_commit emits twice per chunked ingest (mark_chunks_uploaded \
+         + complete_manifest_chunked); inline-path NARs skip the four cas.rs \
+         stages entirely."
     );
     describe_counter!(
         "rio_store_substitute_stale_reclaimed_total",

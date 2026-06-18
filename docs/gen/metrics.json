@@ -239,6 +239,7 @@
     "rio_store_get_path_duration_seconds",
     "rio_store_get_path_total",
     "rio_store_hmac_rejected_total",
+    "rio_store_ingest_stage_seconds",
     "rio_store_integrity_failures_total",
     "rio_store_log_active_ingest_sessions",
     "rio_store_log_chunk_write_failures_total",
@@ -1513,6 +1514,11 @@
         "name": "rio_store_hmac_rejected_total",
         "kind": "counter",
         "help": "Upload/log-ingest rejections by the HMAC assignment-token gate, by reason: missing_token / invalid_token (no or unverifiable x-rio-assignment-token), path_not_in_claims (token valid but the uploaded path is not in its claim set), ca_path_mismatch (CA-derived path does not match the claimed output), service_token_invalid / service_caller_not_allowlisted / service_caller_not_permitted (the x-rio-service-token bypass failed verification or allowlisting). Sustained non-zero from one builder = a stale or forged token source."
+      },
+      {
+        "name": "rio_store_ingest_stage_seconds",
+        "kind": "histogram",
+        "help": "Per-stage NAR ingest wall-clock, labeled stage = narinfo|claim|budget_park|fetch|sha256|chunk|pg_upsert|s3_upload|pg_commit. Substitute leaders emit all nine; PutPath emits the four cas.rs stages (chunk/pg_upsert/s3_upload/pg_commit), so rate(count{stage=chunk}) != rate(rio_store_substitute_total). stage=pg_commit emits twice per chunked ingest (mark_chunks_uploaded + complete_manifest_chunked); inline-path NARs skip the four cas.rs stages entirely."
       },
       {
         "name": "rio_store_integrity_failures_total",

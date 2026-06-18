@@ -22,6 +22,7 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use crate::backend::ChunkBackend;
 use crate::chunker;
+use crate::ingest::IngestStage;
 use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::metadata;
 
@@ -231,6 +232,7 @@ pub async fn put_chunked(
     let stats = stage_chunked(pool, backend, info, claim, nar_data, max_concurrent).await?;
 
     // --- Step 5: Complete ---
+    let t = Instant::now();
     if let Err(e) = metadata::complete_manifest_chunked(pool, info, claim).await {
         warn!(error = %e, "complete_manifest_chunked failed; rolling back");
         // Chunks are uploaded to S3. reap_one deletes the placeholder
@@ -253,6 +255,7 @@ pub async fn put_chunked(
         }
         return Err(e.into());
     }
+    IngestStage::PgCommit.record(t);
 
     Ok(stats)
 }
@@ -301,7 +304,9 @@ pub async fn stage_chunked(
     // worker (which it backfills) regardless of core count, and the
     // current_thread fallback at cpu_bound() is fine: rayon's pool
     // exists independent of any tokio runtime.
+    let t = Instant::now();
     let chunks = cpu_bound(|| chunker::chunk_nar(nar_data));
+    IngestStage::Chunk.record(t);
     debug!(chunks = chunks.len(), "NAR chunked");
 
     // Trust-boundary guard: reject before any PG/S3 commit. MAX_CHUNKS
@@ -363,6 +368,7 @@ pub async fn stage_chunked(
     // PutPath has already CONFIRMED in S3 (via `mark_chunks_uploaded`)
     // is skipped; one whose row merely exists (upload in flight or
     // interrupted) is re-uploaded — see M_033.
+    let t = Instant::now();
     let needs_upload = metadata::upgrade_manifest_to_chunked(
         pool,
         store_path_hash,
@@ -371,11 +377,13 @@ pub async fn stage_chunked(
         &chunk_sizes,
     )
     .await?;
+    IngestStage::PgUpsert.record(t);
 
     // From here on, the durable manifest reference exists. Any error
     // must roll back the placeholder via the claim-gated reap.
     // scopeguard can't do async drop, so explicit match-on-error.
 
+    let t = Instant::now();
     let stats = match do_upload(
         Some((pool, store_path_hash, claim)),
         backend,
@@ -386,7 +394,10 @@ pub async fn stage_chunked(
     )
     .await
     {
-        Ok(s) => s,
+        Ok(s) => {
+            IngestStage::S3Upload.record(t);
+            s
+        }
         Err(e) => {
             warn!(error = %e, "chunk upload failed; rolling back");
             rollback(pool, store_path_hash, claim).await;
@@ -400,11 +411,13 @@ pub async fn stage_chunked(
     // S3 but PG says NULL — next PutPath re-uploads (idempotent), so
     // rollback here is placeholder hygiene, not data safety.
     let needs_upload: Vec<Vec<u8>> = needs_upload.into_iter().collect();
+    let t = Instant::now();
     if let Err(e) = metadata::mark_chunks_uploaded(pool, &needs_upload).await {
         warn!(error = %e, "mark_chunks_uploaded failed; rolling back");
         rollback(pool, store_path_hash, claim).await;
         return Err(e.into());
     }
+    IngestStage::PgCommit.record(t);
 
     Ok(stats)
 }

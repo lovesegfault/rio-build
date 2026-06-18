@@ -32,6 +32,77 @@ use crate::gc::orphan::ReapBy;
 use crate::metadata::{self, MetadataError};
 use crate::substitute::SUBSTITUTE_STALE_THRESHOLD;
 
+/// Per-stage label alphabet for `rio_store_ingest_stage_seconds{stage=…}`
+/// (opt-07). The enum bounds Prometheus label cardinality at compile
+/// time — a string-literal typo at an emit site is a type error, not a
+/// phantom 10th series — and reduces each instrument site to two
+/// lines: `let t = Instant::now(); … IngestStage::X.record(t);`.
+///
+/// Substitute leaders walk all nine. PutPath/PutPathBatch share the
+/// four `cas.rs` stages (`Chunk`/`PgUpsert`/`S3Upload`/`PgCommit`) via
+/// [`persist_nar`] → `cas::put_chunked`; inline-path NARs (<256 KiB)
+/// skip `stage_chunked` entirely and emit none of the four.
+#[derive(Clone, Copy)]
+pub enum IngestStage {
+    /// narinfo GET + parse + sig-verify + identity/size gate.
+    Narinfo,
+    /// [`claim_placeholder`] — idempotency check, placeholder insert,
+    /// hot-path stale/stall reclaim.
+    Claim,
+    /// `NarBudgetReservation::reserve` — the whole-NAR budget park.
+    BudgetPark,
+    /// NAR body GET + decompress (`read_nar_capped`). Success path
+    /// only; the three early-return error arms record nothing.
+    Fetch,
+    /// Post-decompress hash-check `spawn_blocking` (`.await` bracket —
+    /// includes blocking-pool queue time).
+    Sha256,
+    /// `chunker::chunk_nar` — FastCDC + per-chunk BLAKE3.
+    Chunk,
+    /// `metadata::upgrade_manifest_to_chunked` — manifest_data INSERT
+    /// and chunks upsert. Dual-emitted with the dedicated
+    /// `rio_store_chunk_upgrade_tx_seconds` (intentional overlap; that
+    /// metric's GC-grace-calibrated 150/240/300 s buckets feed
+    /// `RioStoreChunkUpgradeTxSlow`).
+    PgUpsert,
+    /// `do_upload` — parallel S3 PutObject. Ok arm only.
+    S3Upload,
+    /// `mark_chunks_uploaded` AND `complete_manifest_chunked` — two
+    /// observations per chunked ingest (separate stack frames, no
+    /// shared `Instant`); `count{stage=pg_commit}` = 2× chunked-ingest
+    /// count, `sum` is correct.
+    PgCommit,
+}
+
+impl IngestStage {
+    /// Prometheus `stage` label literal — the alphabet is the
+    /// `describe_histogram!` help string in `lib.rs::describe_metrics`.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Narinfo => "narinfo",
+            Self::Claim => "claim",
+            Self::BudgetPark => "budget_park",
+            Self::Fetch => "fetch",
+            Self::Sha256 => "sha256",
+            Self::Chunk => "chunk",
+            Self::PgUpsert => "pg_upsert",
+            Self::S3Upload => "s3_upload",
+            Self::PgCommit => "pg_commit",
+        }
+    }
+
+    /// Emit `rio_store_ingest_stage_seconds{stage=self.label()}` with
+    /// `started.elapsed()`. The two-line instrument idiom: `let t =
+    /// Instant::now(); … IngestStage::X.record(t);`.
+    pub fn record(self, started: std::time::Instant) {
+        metrics::histogram!(
+            "rio_store_ingest_stage_seconds",
+            "stage" => self.label()
+        )
+        .record(started.elapsed().as_secs_f64());
+    }
+}
+
 /// Result of [`claim_placeholder`].
 pub enum PlaceholderClaim {
     /// Path is already `status='complete'`. Caller returns
