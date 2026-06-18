@@ -31,20 +31,27 @@ test "$(yq 'select(.kind=="EC2NodeClass" and .metadata.name=="rio-default")
   exit 1
 }
 
-# Dedicated /var/rio volume (/dev/xvdb): rio-default and rio-metal MUST
-# map it (the AMI's rio-ebs-mount fails the boot on EC2 hosts when it's
-# missing, so dropping it bricks every EBS/metal build), rio-nvme MUST
-# NOT (the instance-store RAID0 hosts /var/rio there).
+# Dedicated EBS volumes: rio-default and rio-metal MUST map BOTH
+# /dev/xvdb (kubelet ephemeral-storage quota volume) and /dev/xvdc
+# (/var/rio — the AMI's rio-ebs-mount fails the boot on EC2 hosts when
+# it's missing, so dropping it bricks every EBS/metal build). rio-nvme
+# MUST NOT (the instance-store RAID0 hosts /var/rio there).
+# rebase-plan §Helm DUPLICATED-MECHANISMS: post-ADR-022 builder/fetcher classes carry root+xvdb(kubelet quota)+xvdc(/var/rio)
 for nc in rio-default rio-metal; do
   count="$(yq "select(.kind==\"EC2NodeClass\" and .metadata.name==\"$nc\")
                | .spec.blockDeviceMappings | length" "$karp")"
-  test "$count" = 2 || {
-    echo "FAIL: $nc EC2NodeClass has $count blockDeviceMappings, want 2 (root + /dev/xvdb)" >&2
+  test "$count" = 3 || {
+    echo "FAIL: $nc EC2NodeClass has $count blockDeviceMappings, want 3 (root + /dev/xvdb kubelet-quota + /dev/xvdc /var/rio)" >&2
     exit 1
   }
   yq "select(.kind==\"EC2NodeClass\" and .metadata.name==\"$nc\")
       | .spec.blockDeviceMappings[].deviceName" "$karp" | grep -x /dev/xvdb >/dev/null || {
-    echo "FAIL: $nc EC2NodeClass blockDeviceMappings missing /dev/xvdb (the /var/rio volume)" >&2
+    echo "FAIL: $nc EC2NodeClass blockDeviceMappings missing /dev/xvdb (the kubelet-quota volume)" >&2
+    exit 1
+  }
+  yq "select(.kind==\"EC2NodeClass\" and .metadata.name==\"$nc\")
+      | .spec.blockDeviceMappings[].deviceName" "$karp" | grep -x /dev/xvdc >/dev/null || {
+    echo "FAIL: $nc EC2NodeClass blockDeviceMappings missing /dev/xvdc (the /var/rio volume)" >&2
     exit 1
   }
 done

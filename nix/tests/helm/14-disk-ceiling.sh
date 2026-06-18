@@ -110,7 +110,4 @@ test $(( alloc / old_req )) -eq 2 || {
 # (52.5 GiB / 56%) no longer derive. The
 # rio_builder_fuse_cache_bytes_used gauge survives as a node-level
 # castore-cache occupancy instrument (metric-help.json), no longer a
-# per-pod sizing input. TODO(adr-022-rebase): re-derive the values.yaml
-# W10-CP narration rows (sla.defaultDisk comment) for 38.5 GiB / 11
-# pods/node in a follow-up; the asserts above are the load-bearing
-# half.
+# per-pod sizing input.

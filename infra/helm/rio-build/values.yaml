@@ -785,16 +785,17 @@ scheduler:
     # Density derivation (bind[14-disk-ceiling.sh] — the W10-CP table
     # asserts these rows against pod_ephemeral_request's mirrored
     # constants and the live values; touching ANY input re-derives
-    # BOTH):
+    # BOTH). The per-pod fuse-cache addend is GONE since P0560/ADR-022
+    # (castore caches are node-level mountd-owned hostPaths outside
+    # per-pod ephemeral-storage accounting):
     #   request(default) = default × 1.5 (no-estimate headroom arm)
-    #                      + poolDefaults.fuseCacheBytes (50 GiB)
     #                      + 1 GiB log budget
-    #   at 100 GiB: 201   GiB request → 450 GiB allocatable: 2 pods/node
-    #   at  25 GiB:  88.5 GiB request → 450 GiB allocatable: 5 pods/node
+    #   at 100 GiB: 151   GiB request → 450 GiB allocatable:  2 pods/node
+    #   at  25 GiB:  38.5 GiB request → 450 GiB allocatable: 11 pods/node
     #   (allocatable = karpenter.dataVolumeSize 500Gi × 0.9; the
-    #   12xlarge nvme class measured 12 pods/node at the 100 GiB
-    #   default ⇒ allocatable ∈ [2412, 2613) GiB ⇒ 27–29 pods/node at
-    #   25 GiB — a band over instance-store capacities, not a point.)
+    #   12xlarge nvme class measured 12 pods/node at the B8 live
+    #   specimen's 201 GiB ask ⇒ allocatable ∈ [2412, 2613) GiB — a
+    #   band over instance-store capacities, narration-only.)
     defaultDisk: 26843545600   # 25 GiB
     hwCostTolerance: 0.15
     hwExploreEpsilon: 0.02
