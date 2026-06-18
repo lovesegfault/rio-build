@@ -79,7 +79,7 @@ pub(super) enum Verdict {
 /// ingest into `max_concurrent`-wide pipelined ingest. Bodies are
 /// digest-verified before submission; only the backend write is
 /// deferred.
-// r[impl store.cas.upload-bounded]
+// r[impl store.cas.upload-bounded+2]
 struct UploadPipeline {
     backend: Arc<dyn ChunkBackend>,
     in_flight: tokio::task::JoinSet<([u8; 32], Result<(), String>)>,
@@ -449,7 +449,7 @@ mod tests {
         d
     }
 
-    // r[verify store.cas.upload-bounded]
+    // r[verify store.cas.upload-bounded+2]
     #[tokio::test]
     async fn pipeline_overlaps_puts_and_respects_the_bound() {
         let backend = Arc::new(HighWaterBackend::default());

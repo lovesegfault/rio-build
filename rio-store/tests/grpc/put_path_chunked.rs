@@ -1203,7 +1203,7 @@ impl ChunkBackend for FailingPutBackend {
     }
 }
 
-// r[verify store.cas.upload-bounded]
+// r[verify store.cas.upload-bounded+2]
 /// The verify walk's chunk PUTs overlap (bounded by
 /// `chunk_upload_max_concurrent`) and the pipelining changes nothing
 /// about what gets stored: the committed path round-trips
