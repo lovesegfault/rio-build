@@ -351,7 +351,9 @@ pub fn describe_metrics() {
          classify-only and has NO label here). worker_abort is the AD5 \
          SIGTERM-abort short-circuit (sh-041 — a compute-bound build \
          interrupted by spot reclaim now jumps cores). headroom=hard ⇒ the \
-         M_044 persist + promotion-exempt; headroom=soft ⇒ in-memory only. \
+         M_044 persist (hard_grew); promotion-exempt only when ALSO not at \
+         cap (hard_promoted — a grow-to-cap clip persists but does NOT ride \
+         exemption). headroom=soft ⇒ in-memory only. \
          The caller alphabet is census-pinned \
          (observe_resource_floor_caller_census, db/live_pins.rs). \
          Reactive upsize: a derivation that OOMs at peak=N retries at mem≈2N."

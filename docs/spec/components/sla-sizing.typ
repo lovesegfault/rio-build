@@ -291,7 +291,7 @@ $ "headroom"(n_"eff") = 1.25 + 0.7 / sqrt(n_"eff") $
 
 The $1 slash sqrt(n_"eff")$ term tracks the standard error of the fitted percentile — parameter uncertainty, which shrinks as $sqrt(n)$ — and the 1.25 floor covers irreducible run-to-run noise. Coverage of $1.25 times M_"p90"$ is $Phi(z_0.9 + ln 1.25 slash sigma_M)$, where the $z_0.9$ term is the p90 fit's own quantile (@fig-headroom-cov): $>=$ p99 when $sigma_M <= 0.12$, $tilde.op$ p97 at $sigma_M = 0.4$. Memory residuals are plausibly tighter than duration's $sigma in [0.1, 0.4]$, since peak RSS is near-deterministic for a fixed input set.
 
-#memo[Neither the duration-residual $sigma$ range $[0.1, 0.4]$ used throughout this document nor the $sigma_M$ range is *measured*. The duration range is an assumption pending live `build_samples` data; gate (d) in §Implementation Phasing is the empirical check. The 1.25 floor is provisional pending the same data, and the OOM-reactive penalty-bump (§Exploration, last paragraph; spec marker `r[sched.sla.reactive-floor+6]`) is the safety net if it proves too low.]
+#memo[Neither the duration-residual $sigma$ range $[0.1, 0.4]$ used throughout this document nor the $sigma_M$ range is *measured*. The duration range is an assumption pending live `build_samples` data; gate (d) in §Implementation Phasing is the empirical check. The 1.25 floor is provisional pending the same data, and the OOM-reactive penalty-bump (§Exploration, last paragraph; spec marker `r[sched.sla.reactive-floor+7]`) is the safety net if it proves too low.]
 
 Autopilot's evaluation @rzadca2020[§4.3] suggests that aggressive learned limits cut slack but raise @oom rate; widening the margin while the fit is young pays a small cost premium for stability.
 
