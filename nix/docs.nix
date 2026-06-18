@@ -250,6 +250,13 @@ let
         typst compile --features bundle,html --format bundle \
           --root . ${mkInputArgs ghSha} --input x-target=html \
           --font-path "$TYPST_FONT_PATHS" book.typ $out/
+        # MathML webfont: typst emits Plane-1 math glyphs (U+1D400–) that
+        # system-ui doesn't cover, and system-ui has no OpenType MATH
+        # table. Ship NewCMMath so style.css's `math { font-family:… }`
+        # has a real math font to resolve to (matches typst.app/docs).
+        mkdir -p $out/assets/fonts
+        cp ${pkgs.newcomputermodern}/share/fonts/opentype/public/NewCMMath-Regular.otf \
+          $out/assets/fonts/
         # Static search index over the emitted HTML.
         pagefind --site $out --output-subdir pagefind
         # `nix run .#docs` → serve the built tree. Only --index and the

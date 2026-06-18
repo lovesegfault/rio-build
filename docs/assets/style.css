@@ -37,7 +37,14 @@ body {
 /* html.frame() SVGs: invert in dark mode (see lib/rio.typ theming note) */
 .rio-frame svg { max-width: 100%; height: auto; }
 :root[data-theme="dark"] .rio-frame svg { filter: invert(0.93) hue-rotate(180deg); }
-math { font-family: inherit; }
+@font-face {
+  font-family: "NewComputerModernMath";
+  font-display: swap;
+  src: local("NewComputerModernMath-Regular"),
+       local("NewComputerModernMath"),
+       url("/assets/fonts/NewCMMath-Regular.otf") format("opentype");
+}
+math { font-family: "NewComputerModernMath", math; font-size: 1.1em; }
 math[display="block"] { display: block; margin: 1.1em auto; text-align: center; }
 /* pagefind UI inherits theme via vars */
 .pagefind-ui { --pagefind-ui-primary: var(--accent); --pagefind-ui-text: var(--fg);
