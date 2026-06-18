@@ -129,6 +129,14 @@ pub struct Opener {
     /// handle reads from.
     streams: Mutex<HashMap<u64, Arc<FillState>>>,
     next_fh: AtomicU64,
+    /// Carried into every content-fetch failure log so the
+    /// `attested_input_seeds → empty input_roots` correlation with
+    /// builder-side EIOs (ADR-022 §deploy-debug) can be confirmed or
+    /// refuted from production logs alone — the diagnosis correction
+    /// (the builder unions its own BFS into `castore_roots`, so empty
+    /// `input_roots` does not by itself empty the FUSE tree) means the
+    /// 1:1 correlation may be confounded.
+    input_roots_empty: bool,
 }
 
 /// See [`Opener::modes`].
@@ -219,6 +227,7 @@ impl Opener {
         chunks_dir: PathBuf,
         staging_dir: PathBuf,
         cfg: OpenerConfig,
+        input_roots_empty: bool,
     ) -> Self {
         Self {
             mountd,
@@ -237,6 +246,7 @@ impl Opener {
             open_files: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
+            input_roots_empty,
         }
     }
 
@@ -471,6 +481,7 @@ impl Opener {
             staging_dir: self.staging_dir.clone(),
             fetch_timeout: self.cfg.fetch_timeout,
             mountd_request_timeout: self.cfg.mountd_request_timeout,
+            input_roots_empty: self.input_roots_empty,
         };
         // TODO: the fill's cleanup guard is constructed inside the spawned
         // task, so a task dropped before its first poll (runtime shutdown
@@ -749,7 +760,13 @@ impl Opener {
                     attempt += 1;
                 }
                 Err(StreamBlobError::Transient(status)) => {
-                    tracing::warn!(digest = %hex::encode(digest), %status, "ReadBlob failed");
+                    tracing::warn!(
+                        digest = %hex::encode(digest),
+                        %status,
+                        rpc = "ReadBlob",
+                        input_roots_empty = self.input_roots_empty,
+                        "castore-FUSE content-fetch failed"
+                    );
                     break Err(Errno::EIO);
                 }
                 Err(StreamBlobError::Fatal(errno)) => break Err(errno),
@@ -860,7 +877,13 @@ impl Opener {
                 Err(StreamBlobError::Transient(status))
             }
             Ok(Err(status)) => {
-                tracing::warn!(digest = %hex::encode(digest), %status, "ReadBlob failed");
+                tracing::warn!(
+                    digest = %hex::encode(digest),
+                    %status,
+                    rpc = "ReadBlob",
+                    input_roots_empty = self.input_roots_empty,
+                    "castore-FUSE content-fetch failed"
+                );
                 Err(StreamBlobError::Fatal(Errno::EIO))
             }
             Ok(Ok(pair)) => Ok(pair),
@@ -1143,6 +1166,7 @@ mod tests {
                 tmp.path().join("chunks"),
                 tmp.path().join("staging"),
                 cfg,
+                false,
             );
             Self {
                 tmp,

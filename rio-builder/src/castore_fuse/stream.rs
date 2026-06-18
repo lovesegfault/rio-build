@@ -225,6 +225,8 @@ pub(super) struct FillCtx {
     pub staging_dir: PathBuf,
     pub fetch_timeout: Duration,
     pub mountd_request_timeout: Duration,
+    /// See `Opener::input_roots_empty`.
+    pub input_roots_empty: bool,
 }
 
 /// The background fill task: fetch → verify → rename → `Promote`.
@@ -317,7 +319,13 @@ async fn fill(ctx: &FillCtx, state: &FillState) -> Result<(), Errno> {
             fill_from_readblob(ctx, state, &mut hasher).await?;
         }
         Ok(Err(status)) => {
-            tracing::warn!(digest = %hex::encode(ctx.digest), %status, "StatBlob failed");
+            tracing::warn!(
+                digest = %hex::encode(ctx.digest),
+                %status,
+                rpc = "StatBlob",
+                input_roots_empty = ctx.input_roots_empty,
+                "castore-FUSE content-fetch failed"
+            );
             return Err(Errno::EIO);
         }
         Ok(Ok(resp)) => {
@@ -730,7 +738,13 @@ async fn fill_from_readblob(
             return Err(Errno::EIO);
         }
         rio_common::transport::OpenOutcome::Opened(Err(status)) => {
-            tracing::warn!(digest = %hex::encode(ctx.digest), %status, "ReadBlob failed");
+            tracing::warn!(
+                digest = %hex::encode(ctx.digest),
+                %status,
+                rpc = "ReadBlob",
+                input_roots_empty = ctx.input_roots_empty,
+                "castore-FUSE content-fetch failed"
+            );
             return Err(Errno::EIO);
         }
         rio_common::transport::OpenOutcome::Opened(Ok(resp)) => resp.into_inner(),
@@ -743,7 +757,13 @@ async fn fill_from_readblob(
                 return Err(Errno::EIO);
             }
             Ok(Err(status)) => {
-                tracing::warn!(digest = %hex::encode(ctx.digest), %status, "ReadBlob failed");
+                tracing::warn!(
+                    digest = %hex::encode(ctx.digest),
+                    %status,
+                    rpc = "ReadBlob",
+                    input_roots_empty = ctx.input_roots_empty,
+                    "castore-FUSE content-fetch failed"
+                );
                 return Err(Errno::EIO);
             }
             Ok(Ok(None)) => break,
@@ -865,6 +885,7 @@ mod tests {
                 staging_dir: tmp.path().join("staging"),
                 fetch_timeout: Duration::from_secs(5),
                 mountd_request_timeout: Duration::from_secs(5),
+                input_roots_empty: false,
             };
             Self {
                 tmp,

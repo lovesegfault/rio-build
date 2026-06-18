@@ -342,6 +342,7 @@ pub fn mount_and_serve(
         settings.chunks_dir.clone(),
         staging_dir,
         settings.opener.clone(),
+        input_roots.is_empty(),
     ));
 
     // fuse-over-io_uring, step 1 of 3 (probe): create the rings and
