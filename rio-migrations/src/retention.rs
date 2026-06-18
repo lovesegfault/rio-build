@@ -335,8 +335,8 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
     (
         "pending_s3_deletes",
         RetentionPolicy::SweptBy {
-            symbol: "drain_one_row",
-            note: "drain task: delete on S3 success / max-attempts alert",
+            symbol: "drain_one_batch",
+            note: "drain task: batch DeleteObjects on S3 success / max-attempts alert",
         },
     ),
     (
