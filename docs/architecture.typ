@@ -226,8 +226,8 @@ builders or other components --- it watches CRDs and reconciles desired state.
 
 // pinit callout helper for chronos sequence diagrams. PDF-only: pinit
 // resolves pins via page-absolute coordinates, which has no analogue in
-// shiroa's HTML target. The same prose is rendered as a compact note
-// list after each figure for the web build (`flow-notes-web`).
+// the HTML target. The same prose is rendered as a compact note list
+// after each figure for the web build (`flow-notes-web`).
 //
 // `flow-note` places every callout body in a fixed right-hand column
 // (page-absolute x = `_note-col-x`) at the pin's y-position, then draws
@@ -235,12 +235,11 @@ builders or other components --- it watches CRDs and reconciles desired state.
 // keeps bodies aligned regardless of which lifeline the pin sits on;
 // the diagram itself is scaled (`_flow-scale`) to leave that column
 // empty.
-#let _is-paged() = not (is-web-target() or is-html-target())
 #let _flow-scale = 58%
 #let _note-col-w = 4.1cm
 // A4, rio template x-margin 2.6cm → content right edge at 18.4cm.
 #let _note-col-x = 18.4cm - _note-col-w
-#let flow-note(key, dy: 0pt, body) = context if _is-paged() {
+#let flow-note(key, dy: 0pt, body) = context if not is-html-target() {
   pinit(key, callback: pos => {
     let body-y = pos.y + dy
     absolute-place(dx: _note-col-x, dy: body-y - 0.55em, block(
@@ -257,10 +256,10 @@ builders or other components --- it watches CRDs and reconciles desired state.
 }
 // block(width: 100%) is paged-only — inside html.frame()'s paged
 // sub-context there's no container width, so 100% → 0pt → zero-width
-// SVG (QA #1). is-html-target() (compile-global, NOT context-lazy
-// shiroa-sys-target which would evaluate to "paged" inside html.frame)
-// gates the wrapper; html mode emits bare scale() for intrinsic width
-// and frame-figure's .rio-figure CSS handles centering.
+// SVG (QA #1). is-html-target() (compile-global via `--input x-target`,
+// NOT the contextual `target()` which would evaluate to "paged" inside
+// html.frame) gates the wrapper; html mode emits bare scale() for
+// intrinsic width and frame-figure's .rio-figure CSS handles centering.
 #let flow-diagram(factor: _flow-scale, body) = if is-html-target() {
   scale(factor, reflow: true, origin: top + left, body)
 } else {
@@ -269,7 +268,7 @@ builders or other components --- it watches CRDs and reconciles desired state.
     align(left, scale(factor, reflow: true, origin: top + left, body)),
   )
 }
-#let flow-notes-web(..items) = context if not _is-paged() {
+#let flow-notes-web(..items) = if is-html-target() {
   info(title: [Flow notes])[#list(..items.pos())]
 }
 

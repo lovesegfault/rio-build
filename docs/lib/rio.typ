@@ -29,19 +29,19 @@
 
 #let is-html() = target() == "html"
 #let is-paged() = target() == "paged"
-// Compile-global (NOT contextual) html predicate for call sites that
-// can't be wrapped in `context` — the shiroa-era `is-html-target()` /
-// `is-web-target()` names some chapters still use. Gated on the
-// `--input x-target=` CLI input rather than typst's `target()`, so it
-// evaluates the same inside `html.frame()`'s paged sub-context as
-// outside it.
+// Compile-global (NOT contextual) companion to `is-html()` for call
+// sites that can't be wrapped in `context` — figure-body builders
+// whose result is later rendered inside `html.frame()`, where the
+// contextual `target()` reports "paged". Gated on the
+// `--input x-target=` CLI input (nix/docs.nix passes `x-target=html`
+// for the bundle build), so it evaluates the same inside
+// `html.frame()`'s paged sub-context as outside it.
 #let is-html-target() = (
   sys.inputs.at("x-target", default: "pdf") not in ("pdf", "book-pdf")
 )
-#let is-web-target = is-html-target
 
-// Replacement for shiroa's cross-link: resolve a docs-relative .typ
-// path to either a PDF-internal label or an HTML href. Call sites in
+// cross-link: resolve a docs-relative .typ path to either a
+// PDF-internal label or an HTML href. Call sites in
 // chapter prose pass paths with a leading "/" (`"/spec/.../foo.typ"`);
 // lib/html/meta.typ's `route-for`/`label-for` expect tree-relative
 // paths without it, so strip. The PDF branch degrades to plain text
@@ -56,9 +56,6 @@
     if query(lbl).len() > 0 { link(lbl, body) } else { body }
   }
 }
-// shiroa's plain-text was a content→str flattener; std repr() is the
-// closest stdlib analogue but callers in this file only used it for
-// title strings, which are already str in lib/html/meta.typ.
 
 // tracey's `req()` rendering helper is no longer used — `#r()` below
 // renders via showybox (paged) / html.elem (html) directly. The
@@ -194,7 +191,7 @@
 
 // gentle-clues callouts: in html mode the package's icon+title grid()
 // warns, so emit a plain <aside> instead (selectable text; styled by
-// rio-css extra-assets below). Paged targets get the real gentle-clues render.
+// lib/html/page-shell). Paged targets get the real gentle-clues render.
 #let _clue(gc-fn, kind, ..args) = context if is-html() {
   let title = args.named().at("title", default: none)
   html.elem("aside", attrs: (class: "rio-clue rio-clue-" + kind), {
@@ -515,139 +512,6 @@
   // Custom CSS for our html-mode element bypasses (#r → div.rio-req,
   // gentle-clues → aside.rio-clue, figure → .rio-figure, footnote →
   // .rio-footnote) lives in lib/html/page-shell.
-  let rio-css = ```css
-  /* Equations: single-render, themed via attribute-selector override.
-     typst emits fill/stroke="#000000"; the [fill="#000000"] selectors
-     below override to currentColor so `.inline-equation svg
-     { color: var(--fg) }` themes them. Works identically in serve and
-     build (no post-process needed). NOT applied to .rio-frame svg —
-     those use the `filter: invert()` dark-theme path; recolouring
-     would double-apply (currentColor → light --fg → invert →
-     dark-on-dark). QA2-R1. */
-  .inline-equation { display: inline-block; width: fit-content; }
-  .block-equation { display: grid; place-items: center; overflow-x: auto; }
-  .inline-equation svg, .block-equation svg { color: var(--fg, #1b1f24); }
-  .inline-equation svg [fill="#000000"],
-  .block-equation svg [fill="#000000"] { fill: currentColor; }
-  .inline-equation svg [stroke="#000000"],
-  .block-equation svg [stroke="#000000"] { stroke: currentColor; }
-  .rio-figure { display: block; text-align: center; overflow-x: auto; margin: 1.2em 0; }
-  /* typst's html.frame emits inline `style="width: Nem"` (em at the
-     typst font-size, ~10.5pt) alongside `width="Npt"`. At the page's
-     16px/em that overshoots ~14%. Clamp to column width; height:auto
-     keeps aspect ratio. (The earlier `max-width: none` was for the
-     2051px crate-structure graph, since redrawn to 455px.) */
-  .rio-frame > svg { max-width: 100%; height: auto; }
-  .rio-figure figcaption { font-size: 0.92em; margin-top: 0.6em; }
-  .rio-table { overflow-x: auto; max-width: 100%; }   /* QA #5 */
-  /* QA4-#5: scroll affordance for wide figures/tables. macOS auto-hides
-     scrollbars; without a hint, 2350px-wide diagrams look clipped. */
-  .rio-figure, .rio-table { scrollbar-width: thin; }
-  .rio-figure::-webkit-scrollbar, .rio-table::-webkit-scrollbar { height: 8px; }
-  .rio-figure::-webkit-scrollbar-thumb,
-  .rio-table::-webkit-scrollbar-thumb { background: var(--scrollbar, #c0c0c0);
-                                        border-radius: 4px; }
-  .rio-req { border-left: 3px solid #d0d7de; padding: 0.5em 0 0.5em 1em; margin: 1em 0; }
-  .rio-req-id { background: #f6f8fa; border-radius: 3px; padding: 0.1em 0.5em; font-size: 0.85em; }
-  .rio-clue { border-left: 4px solid; border-radius: 4px; padding: 0.6em 1em; margin: 1em 0; }
-  .rio-clue-title { margin: 0 0 0.4em 0; }
-  .rio-clue-info { border-color: #1f6feb; background: #ddf4ff; }
-  .rio-clue-warning { border-color: #d1242f; background: #ffebe9; }
-  .rio-clue-memo { border-color: #9a6700; background: #fff8c5; }
-  .rio-clue-tip { border-color: #1a7f37; background: #dafbe1; }
-  .rio-clue-idea { border-color: #8250df; background: #fbefff; }
-  .rio-footnote { color: #656d76; font-size: 0.9em; }
-  .rio-chapter-title { margin: 0 0 1em 0; font-size: 2em; }
-  /* QA #7: dark-theme diagram contrast. cetz output carries explicit
-     fill/stroke; can't recolor via typst show-rules. CSS filter
-     approximates a dark variant. Imperfect (hue-rotate shifts blues),
-     but far better than black-on-dark. Option (b) #themed-figure(builder)
-     deferred. */
-  .ayu .rio-frame svg, .navy .rio-frame svg, .coal .rio-frame svg {
-    filter: invert(0.87) hue-rotate(180deg);
-  }
-  /* QA #8: dark-theme clue/req-id contrast. */
-  .ayu .rio-clue, .navy .rio-clue, .coal .rio-clue { color: var(--fg); }
-  .ayu .rio-clue-info, .navy .rio-clue-info, .coal .rio-clue-info { background: #0d2847; }
-  .ayu .rio-clue-warning, .navy .rio-clue-warning, .coal .rio-clue-warning { background: #3d0f12; }
-  .ayu .rio-clue-memo, .navy .rio-clue-memo, .coal .rio-clue-memo { background: #3a2e05; }
-  .ayu .rio-clue-tip, .navy .rio-clue-tip, .coal .rio-clue-tip { background: #0a2e1a; }
-  .ayu .rio-clue-idea, .navy .rio-clue-idea, .coal .rio-clue-idea { background: #2d1b47; }
-  .ayu .rio-req-id, .navy .rio-req-id, .coal .rio-req-id { background: #161b22; }
-  /* Anchor scroll-offset for sticky header. */
-  [id^="r-"], [id^="label-"], h2[id], h3[id], h4[id] { scroll-margin-top: 3.5em; }
-  /* Code-block background (codly's HTML output is plain <pre><code>). */
-  main pre { background: var(--quote-bg, #f6f8fa); padding: 0.8em 1em;
-             border-radius: 4px; overflow-x: auto; }
-  /* Sidebar 1080 breakpoint: upstream index.js collapses at width<800;
-     mdbook proper uses ~1080. CSS-only override — below 1080,
-     default-hide unless explicitly .sidebar-visible (which the toggle
-     button sets). */
-  @media (max-width: 1080px) {
-    html:not(.sidebar-visible) .sidebar { transform: translateX(calc(0px - var(--sidebar-width))); }
-    html:not(.sidebar-visible) .page-wrapper { margin-left: 0; transform: none; }
-  }
-  /* mdbook chrome.css has `.previous { float: left }` (no-op on
-     position:fixed) instead of `left: var(--page-padding)`. Without an
-     explicit left anchor the arrow lands at <main>'s left edge and
-     intercepts clicks across a 90px strip. */
-  .nav-wide-wrapper .previous { left: var(--page-padding); }
-  /* The .previous fixed arrow at left:15px sits in the same x-range
-     as the open sidebar; without an explicit z-index the later-in-DOM
-     .nav-chapters paints above. */
-  .sidebar { z-index: 10; }
-  /* Copy-to-clipboard button (rio-js below adds it to each <pre>). */
-  .rio-copy { position: absolute; top: .5em; right: .5em; padding: .2em .5em;
-              border: 1px solid var(--icons); border-radius: 3px;
-              background: var(--quote-bg, #f6f8fa); color: var(--icons);
-              cursor: pointer; font-size: .9em; opacity: 0; transition: opacity .15s; }
-  pre:hover .rio-copy, .rio-copy:focus { opacity: 1; }
-  ```
-  // ←/→ nav keys + copy-button for <pre>. inline-assets emits as a
-  // data:application/javascript URI in <head>, so wrap in
-  // DOMContentLoaded. Self-contained — no upstream gate exists for
-  // either (checked themes/mdbook/mod.typ).
-  let rio-js = ```js
-  document.addEventListener('DOMContentLoaded', () => {
-    document.addEventListener('keydown', e => {
-      if (e.target.closest('input,textarea') || e.altKey || e.ctrlKey || e.metaKey) return;
-      const go = sel => { const a = document.querySelector(sel); if (a) location.href = a.href; };
-      if (e.key === 'ArrowLeft') go('a.nav-chapters.previous');
-      if (e.key === 'ArrowRight') go('a.nav-chapters.next');
-    });
-    document.querySelectorAll('main pre').forEach(pre => {
-      const b = document.createElement('button');
-      b.className = 'rio-copy'; b.textContent = '⧉'; b.title = 'Copy';
-      // Read from <code>, not <pre> — the button is appended INSIDE
-      // <pre>, and position:absolute/opacity don't exclude an element
-      // from innerText (only display:none/visibility:hidden do).
-      b.onclick = () => navigator.clipboard
-        .writeText((pre.querySelector('code') || pre).innerText)
-        .then(() => { b.textContent='✓'; setTimeout(()=>b.textContent='⧉', 1200); });
-      pre.style.position = 'relative'; pre.appendChild(b);
-    });
-  });
-  ```
-  // Favicon: monospace "r" on accent-colour circle, data-URI so it's
-  // self-contained (no extra file to deploy). inline-assets has no
-  // raw-html branch so emit via a tiny lang:"js" createElement append
-  // (compile-time constant href; no user input). URL-encoded SVG (typst
-  // has no built-in base64).
-  let _favicon-uri = (
-    "data:image/svg+xml,"
-      + "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E"
-      + "%3Ccircle cx='16' cy='16' r='16' fill='"
-      + accent.to-hex().replace("#", "%23")
-      + "'/%3E"
-      + "%3Ctext x='16' y='24' text-anchor='middle' font-family='monospace' "
-      + "font-weight='bold' font-size='22' fill='%23fff'%3Er%3C/text%3E%3C/svg%3E"
-  )
-  let rio-favicon = raw(
-    lang: "js",
-    "(l=>{l.rel='icon';l.href=\""
-      + _favicon-uri
-      + "\";document.head.appendChild(l)})(document.createElement('link'));",
-  )
   show: if not is-pdf {
     it => {
       // Single-render equations: theme via CSS `currentColor`, not

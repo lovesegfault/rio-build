@@ -330,10 +330,6 @@
                 inherit (inputs) tracey-src;
               };
 
-              # mdbook-style HTML generator for typst sources. Not in
-              # nixpkgs; packaged here for the docs build.
-              shiroaPkg = pkgs.callPackage ./nix/shiroa.nix { };
-
               # Typst design-book pipeline: hermetic typst env (rioTypst),
               # PDF (docs-pdf), bundle HTML (docs). See nix/docs.nix.
               # `xtaskBin` forward-references crateBuild (defined below) —
@@ -1204,7 +1200,6 @@
                   traceyPkg
                   crate2nixCli
                   docsLib
-                  shiroaPkg
                   kaniToolchain
                   ;
                 treefmtWrapper = config.treefmt.build.wrapper;

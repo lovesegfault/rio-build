@@ -287,10 +287,9 @@ rec {
     # Structural smoke over the native-bundle output. Asserts the
     # multi-page shape (every meta.typ chapter has a route), the page
     # shell rendered (nav/active-marker/edit-link), fletcher diagrams
-    # survived html-target as inline SVG, the pagefind index landed,
-    # and no shiroa residue leaked into the emitted tree. Closes over
-    # docsCheck (placeholder-SHA) so it caches across commits that
-    # don't touch typst sources.
+    # survived html-target as inline SVG, and the pagefind index
+    # landed. Closes over docsCheck (placeholder-SHA) so it caches
+    # across commits that don't touch typst sources.
     docs-html-smoke =
       let
         html = docsCheck;
@@ -323,10 +322,6 @@ rec {
         grep -q '<svg' ${html}/architecture.html
         # (e) pagefind index emitted
         test -s ${html}/pagefind/pagefind.js
-        # (f) no shiroa residue in the emitted tree
-        if grep -rli shiroa ${html}; then
-          echo "shiroa residue in output (files listed above)"; exit 1
-        fi
         touch $out
       '';
   };

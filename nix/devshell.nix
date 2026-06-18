@@ -14,7 +14,6 @@
   crate2nixCli,
   # nix/docs.nix — rioTypst (wrapped typst) + typstEnv (TYPST_* vars)
   docsLib,
-  shiroaPkg,
   # config.treefmt.build.wrapper — `treefmt` in PATH
   treefmtWrapper,
   # config.pre-commit.installationScript — installs git hooks on shell entry
@@ -128,46 +127,13 @@ let
 
     # Documentation
     # Typst design book — wrapped typst (with @preview/* closure
-    # baked in via TYPST_PACKAGE_CACHE_PATH), shiroa HTML generator,
-    # and the typstyle formatter (wired into treefmt). typstEnv below
-    # exports the same TYPST_* vars for shiroa's in-process resolver.
+    # baked in via TYPST_PACKAGE_CACHE_PATH), the typstyle formatter
+    # (wired into treefmt), and pagefind for indexing the native HTML
+    # bundle locally. `nix build .#docs` is the canonical output;
+    # `nix run .#docs` serves it.
     docsLib.rioTypst
-    # shiroa's embedded reflexo-typst ignores TYPST_PACKAGE_CACHE_PATH —
-    # it resolves @preview/* via $XDG_DATA_HOME/typst/packages and WRITES
-    # its bundled @preview/shiroa there on startup, so it needs a writable
-    # copy of the rioTypst package closure. Wrap to sync the closure into
-    # docs/.cache/typst-xdg/ (gitignored) on first run and whenever
-    # rioTypst changes, then exec the real shiroa with XDG_DATA_HOME
-    # pointed there. The sentinel file holds the source store path so a
-    # `direnv reload` after a typstDeps change re-syncs.
-    (writeShellScriptBin "shiroa" ''
-      set -euo pipefail
-      src="${docsLib.rioTypst}/lib/typst/packages"
-      cache="''${RIO_TYPST_XDG:-$PWD/docs/.cache/typst-xdg}"
-      sentinel="$cache/.rio-typst-src"
-      if [[ ! -f "$sentinel" || "$(cat "$sentinel")" != "$src" ]]; then
-        echo "shiroa: syncing typst package closure → $cache" >&2
-        rm -rf "$cache"
-        mkdir -p "$cache/typst"
-        cp -rL "$src" "$cache/typst/packages"
-        chmod -R u+w "$cache/typst"
-        echo "$src" > "$sentinel"
-      fi
-      export XDG_DATA_HOME="$cache"
-      # No stderr filtering — piping through grep would strip ANSI colour
-      # (shiroa's logger checks isatty). The per-chapter "html export is
-      # under active development" banner is tolerable noise in exchange.
-      #
-      # NOTE: `shiroa serve` output is NOT post-processed. The nix build
-      # (`.#docs`) runs nix/docs-svg-dedup.py (glyph-sprite hoist,
-      # dyn-render JS strip) and derives 404.html from intro.html.
-      # Under `serve` you'll see: sla-sizing.html
-      # ~10.5MB (vs ~4.4MB built); 404.html missing; refs.gh() links
-      # carry `gh-sha=dirty`. All cosmetic — `nix build .#docs` is the
-      # canonical output.
-      exec ${shiroaPkg}/bin/shiroa "$@"
-    '')
     typstyle
+    pagefind
 
     # Integration test deps
     postgresql_18
@@ -305,11 +271,6 @@ let
           # cluster. Matches xtask/src/sh.rs:kubeconfig_path().
           shellHook = ''
             export KUBECONFIG="$PWD/.kube/config"
-            # Anchor the shiroa wrapper's XDG cache to repo-root regardless
-            # of invocation cwd (bug_022: `cd docs && shiroa serve .`
-            # otherwise writes to docs/docs/.cache/). git rev-parse so
-            # `nix develop` from a subdirectory also resolves correctly.
-            export RIO_TYPST_XDG="$(git rev-parse --show-toplevel)/docs/.cache/typst-xdg"
             ${preCommitInstall}
           '';
         }
