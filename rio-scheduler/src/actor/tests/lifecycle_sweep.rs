@@ -195,15 +195,9 @@ async fn test_upsert_at_merge_cache_hit() -> TestResult {
         MergeDagRequest {
             build_id,
             tenant_id: Some(tenant),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![node],
             edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -246,15 +240,9 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
         MergeDagRequest {
             build_id: build_a,
             tenant_id: Some(tenant_a),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![node_a],
             edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -269,15 +257,9 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
         MergeDagRequest {
             build_id: build_b,
             tenant_id: Some(tenant_b),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![make_node("pre-drv")],
             edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -312,16 +294,9 @@ async fn test_upsert_skips_no_tenant() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id,
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![make_node("nt-drv")],
             edges: vec![],
-            options: Default::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;

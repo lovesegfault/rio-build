@@ -362,12 +362,8 @@ pub(crate) async fn merge_single_node(
                 priority_class,
                 nodes: vec![make_node(tag)],
                 edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
                 jwt_token: Some("harness-tenant-jwt".into()),
-                precomputed_probe: None,
+                ..Default::default()
             },
             reply: reply_tx,
         })
@@ -392,15 +388,11 @@ pub(crate) async fn merge_dag(
             req: MergeDagRequest {
                 build_id,
                 tenant_id: Some(DEFAULT_TEST_TENANT),
-                priority_class: PriorityClass::Scheduled,
                 nodes,
                 edges,
-                options: BuildOptions::default(),
                 keep_going,
-                traceparent: String::new(),
-                jti: None,
                 jwt_token: Some("harness-tenant-jwt".into()),
-                precomputed_probe: None,
+                ..Default::default()
             },
             reply: reply_tx,
         })

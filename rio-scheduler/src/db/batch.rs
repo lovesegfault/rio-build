@@ -7,14 +7,26 @@ use std::fmt::Write as _;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use super::{DerivationRow, SchedulerDb, encode_pg_text_array};
+use super::{DerivationRow, SchedulerDb};
 
 /// Escape one column value for `COPY … FROM STDIN (FORMAT text)`.
 ///
 /// PG's text COPY format is `\n`-terminated rows of `\t`-separated
 /// columns; `\N` is NULL. The only escapes that matter are backslash,
 /// tab, newline, and carriage return — everything else is literal.
+///
+/// Fast path: drv_hash / drv_path / system / pname / array-literals
+/// essentially never contain `\\ \t \n \r`, so check first and
+/// `push_str` (one memcpy) instead of per-char `push` (UTF-8 re-encode
+/// per char). 14k rows × ~7 escaped columns × ~50 chars is the inner
+/// loop of the sub-second persist path.
 fn copy_escape_into(out: &mut String, s: &str) {
+    if s.bytes()
+        .all(|b| !matches!(b, b'\\' | b'\t' | b'\n' | b'\r'))
+    {
+        out.push_str(s);
+        return;
+    }
     for ch in s.chars() {
         match ch {
             '\\' => out.push_str("\\\\"),
@@ -24,6 +36,47 @@ fn copy_escape_into(out: &mut String, s: &str) {
             c => out.push(c),
         }
     }
+}
+
+/// Write a `text[]` column value for COPY directly into `out`: the
+/// PG array literal `{"a","b"}` with combined COPY+array escaping.
+///
+/// Fuses [`super::encode_pg_text_array`] + [`copy_escape_into`] so the
+/// per-row hot loop doesn't allocate a fresh `String` temporary per
+/// array column and then re-walk it char-by-char. Array-literal layer:
+/// backslash-escape `"` and `\` inside each element. COPY layer: every
+/// `\` the array layer emits is itself escaped (`\\` → `\\\\`, `\"` →
+/// `\\"`), and element-body `\t \n \r` get the COPY escape. PG
+/// de-escapes COPY first, then parses the array literal.
+fn copy_escape_pg_array_into(out: &mut String, items: &[String]) {
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        if item
+            .bytes()
+            .all(|b| !matches!(b, b'\\' | b'"' | b'\t' | b'\n' | b'\r'))
+        {
+            out.push_str(item);
+        } else {
+            for ch in item.chars() {
+                match ch {
+                    // Array-layer `\"` → COPY layer escapes the `\`.
+                    '"' => out.push_str("\\\\\""),
+                    // Array-layer `\\` → COPY layer doubles each.
+                    '\\' => out.push_str("\\\\\\\\"),
+                    '\t' => out.push_str("\\t"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    c => out.push(c),
+                }
+            }
+        }
+        out.push('"');
+    }
+    out.push('}');
 }
 
 impl SchedulerDb {
@@ -50,7 +103,7 @@ impl SchedulerDb {
         Ok(())
     }
 
-    // r[impl sched.db.batch-unnest]
+    // r[impl sched.db.batch-unnest+2]
     // r[impl sched.db.merge-batch-shape]
     /// Batch-upsert derivations. Returns a map
     /// `drv_hash -> (derivation_id, resource_floor)`.
@@ -81,12 +134,12 @@ impl SchedulerDb {
 
         // Nested-array columns (required_features, expected_output_paths,
         // output_names) are declared `text[]` (not `text`) so COPY's
-        // text-format parser reads encode_pg_text_array's `{"a","b"}`
-        // literal as an array value directly — no `::text[]` cast
-        // needed in the step-3 SELECT. PG multidim arrays are
-        // rectangular, so a `text[][]` bind was never an option; the
-        // COPY-literal route is the same workaround the old UNNEST path
-        // used, just one parse layer earlier.
+        // text-format parser reads the `{"a","b"}` literal as an array
+        // value directly — no `::text[]` cast needed in the step-3
+        // SELECT. PG multidim arrays are rectangular, so a `text[][]`
+        // bind was never an option; the COPY-literal route is the same
+        // workaround the prior UNNEST form used, just one parse layer
+        // earlier.
         sqlx::query(
             r#"
             CREATE TEMP TABLE _merge_derivations (
@@ -125,11 +178,11 @@ impl SchedulerDb {
             buf.push('\t');
             buf.push_str(r.status.as_str());
             buf.push('\t');
-            copy_escape_into(&mut buf, &encode_pg_text_array(&r.required_features));
+            copy_escape_pg_array_into(&mut buf, &r.required_features);
             buf.push('\t');
-            copy_escape_into(&mut buf, &encode_pg_text_array(&r.expected_output_paths));
+            copy_escape_pg_array_into(&mut buf, &r.expected_output_paths);
             buf.push('\t');
-            copy_escape_into(&mut buf, &encode_pg_text_array(&r.output_names));
+            copy_escape_pg_array_into(&mut buf, &r.output_names);
             buf.push('\t');
             buf.push(if r.is_fixed_output { 't' } else { 'f' });
             buf.push('\t');
@@ -280,5 +333,42 @@ impl SchedulerDb {
         .execute(&mut *tx)
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `copy_escape_pg_array_into` MUST equal
+    /// `copy_escape_into(encode_pg_text_array(items))` for every input
+    /// — it's a fused fast-path for the same encoding, not a new one.
+    #[test]
+    fn fused_array_escape_matches_composed() {
+        use proptest::prelude::*;
+        // Pin a few hand-picked corners first (the round-trip
+        // PG-integration test in db/tests/batch.rs covers the encoding
+        // itself; this pin is the fused≡composed identity).
+        for items in [
+            &[][..],
+            &["a".into()],
+            &["a".into(), "b".into()],
+            &[r#"has"quote"#.into()],
+            &[r"has\backslash".into()],
+            &["tab\there".into(), "nl\nhere".into(), "cr\rhere".into()],
+        ] {
+            let mut fused = String::new();
+            copy_escape_pg_array_into(&mut fused, items);
+            let mut composed = String::new();
+            copy_escape_into(&mut composed, &super::super::encode_pg_text_array(items));
+            assert_eq!(fused, composed, "items={items:?}");
+        }
+        proptest!(|(items in proptest::collection::vec(".*", 0..5))| {
+            let mut fused = String::new();
+            copy_escape_pg_array_into(&mut fused, &items);
+            let mut composed = String::new();
+            copy_escape_into(&mut composed, &super::super::encode_pg_text_array(&items));
+            prop_assert_eq!(fused, composed);
+        });
     }
 }

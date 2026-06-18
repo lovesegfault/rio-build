@@ -50,7 +50,7 @@ impl SchedulerDb {
         if rows.is_empty() {
             return Ok(());
         }
-        // Batched UNNEST upsert (the batch_upsert_derivations shape).
+        // Batched UNNEST upsert (constant-per-column bind shape).
         // The nested wanted_output_names arrays can't unnest as
         // text[][] (PG multidim arrays are rectangular), so each is
         // encoded as a pg text-array literal and cast back in the

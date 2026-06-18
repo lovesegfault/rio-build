@@ -313,33 +313,39 @@ impl StoreServiceImpl {
         // 5xx, deadline). Scheduler treats them optimistically; without
         // this field they were silently treated as confirmed-miss and
         // dispatched as builds even when in cache.nixos.org.
-        let probe_missing: Vec<String> = missing
-            .iter()
-            .filter(|p| !crate::visibility::drv_exempt(p))
-            .cloned()
-            .collect();
         let (substitutable, indeterminate) = match (&self.substituter, tenant_id) {
-            (Some(sub), Some(tid)) if !probe_missing.is_empty() => sub
-                .check_available(
-                    tid,
-                    &probe_missing,
-                    entry + crate::substitute::CHECK_AVAILABLE_DEFAULT_BUDGET,
-                )
-                .await
-                .map(|r| {
-                    // bug_295: the rate_limited lane is an in-process
-                    // class split (the executor charges 5xx, defers
-                    // 429); the WIRE surface is unchanged — 429s merge
-                    // back into indeterminate_paths and the scheduler
-                    // keeps its optimistic treatment.
-                    let mut indeterminate = r.indeterminate;
-                    indeterminate.extend(r.rate_limited.into_iter().map(|(p, _)| p));
-                    (r.hits, indeterminate)
-                })
-                .unwrap_or_else(|e| {
-                    warn!(error = %e, "check_available failed; reporting all probed-missing as indeterminate");
-                    (Vec::new(), probe_missing.clone())
-                }),
+            (Some(sub), Some(tid)) => {
+                let probe_missing: Vec<String> = missing
+                    .iter()
+                    .filter(|p| !crate::visibility::drv_exempt(p))
+                    .cloned()
+                    .collect();
+                if probe_missing.is_empty() {
+                    (Vec::new(), Vec::new())
+                } else {
+                    sub.check_available(
+                        tid,
+                        &probe_missing,
+                        entry + crate::substitute::CHECK_AVAILABLE_DEFAULT_BUDGET,
+                    )
+                    .await
+                    .map(|r| {
+                        // bug_295: the rate_limited lane is an
+                        // in-process class split (the executor charges
+                        // 5xx, defers 429); the WIRE surface is
+                        // unchanged — 429s merge back into
+                        // indeterminate_paths and the scheduler keeps
+                        // its optimistic treatment.
+                        let mut indeterminate = r.indeterminate;
+                        indeterminate.extend(r.rate_limited.into_iter().map(|(p, _)| p));
+                        (r.hits, indeterminate)
+                    })
+                    .unwrap_or_else(|e| {
+                        warn!(error = %e, "check_available failed; reporting all probed-missing as indeterminate");
+                        (Vec::new(), probe_missing)
+                    })
+                }
+            }
             _ => (Vec::new(), Vec::new()),
         };
 

@@ -4708,16 +4708,9 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
     let merge = |nodes: Vec<rio_proto::types::DerivationNode>,
                  edges: Vec<rio_proto::types::DerivationEdge>| MergeDagRequest {
         build_id: Uuid::new_v4(),
-        tenant_id: None,
-        priority_class: PriorityClass::Scheduled,
         nodes,
         edges,
-        options: BuildOptions::default(),
-        keep_going: false,
-        traceparent: String::new(),
-        jti: None,
-        jwt_token: None,
-        precomputed_probe: None,
+        ..Default::default()
     };
     actor
         .handle_merge_dag(merge(vec![make_node("ice-pull-a")], vec![]))
@@ -5695,16 +5688,9 @@ async fn floor_above_global_reclamps_at_boot() -> TestResult {
     let node = make_node("d-floor");
     let req = |nodes, build_id| crate::actor::command::MergeDagRequest {
         build_id,
-        tenant_id: None,
-        priority_class: crate::state::PriorityClass::Scheduled,
         nodes,
         edges: vec![],
-        options: crate::state::BuildOptions::default(),
-        keep_going: false,
-        traceparent: String::new(),
-        jti: None,
-        jwt_token: None,
-        precomputed_probe: None,
+        ..Default::default()
     };
     actor1
         .handle_merge_dag(req(vec![node.clone()], Uuid::new_v4()))

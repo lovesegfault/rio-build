@@ -841,7 +841,7 @@ impl DagActor {
             .await;
     }
 
-    // r[impl sched.db.batch-unnest]
+    // r[impl sched.db.batch-unnest+2]
     /// Slice-taking variant of [`promote_newly_ready`]: walk parents of
     /// EVERY hash in `completed`, dedup the union (a parent may be
     /// returned by several completed children), transition in-mem,
@@ -5504,7 +5504,7 @@ impl DagActor {
     /// never reaches total.
     //
     // r[impl sched.poison.cascade-dependents]
-    // r[impl sched.db.batch-unnest]
+    // r[impl sched.db.batch-unnest+2]
     // Collect-then-batch-persist: the BFS runs entirely in-memory
     // (transitions), then ONE persist_status_batch
     // for all transitioned ancestors. Safe because recovery re-cascades

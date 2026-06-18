@@ -133,7 +133,11 @@ impl AckPlane {
 }
 
 /// Request payload for [`ActorCommand::MergeDag`].
-#[derive(Debug)]
+///
+/// `Default` so test sites can `..Default::default()` the trailing
+/// `None`/`String::new()`/`BuildOptions::default()` fields — adding a
+/// field churned 44 sites across 13 files for `precomputed_probe`.
+#[derive(Debug, Default)]
 pub struct MergeDagRequest {
     pub build_id: Uuid,
     pub tenant_id: Option<Uuid>,

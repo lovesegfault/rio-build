@@ -1748,8 +1748,17 @@ impl DagActor {
                 Ok(Ok(r)) => {
                     self.cache_breaker.record_success();
                     let r = r.into_inner();
+                    // Extend EVERY response field — pre-S1 this arm
+                    // assigned `resp = r` whole. types.proto MUST treat
+                    // `indeterminate_paths` optimistically; dropping
+                    // the residual probe's `indeterminate` here would
+                    // misclassify residual-CA indeterminate as
+                    // confirmed-miss the moment any consumer reads it
+                    // (`r[sched.merge.substitute-probe-indeterminate]`).
                     resp.missing_paths.extend(r.missing_paths);
                     resp.substitutable_paths.extend(r.substitutable_paths);
+                    resp.indeterminate_paths.extend(r.indeterminate_paths);
+                    resp.probe_ran_tenant_scoped |= r.probe_ran_tenant_scoped;
                 }
                 Ok(Err(e)) => {
                     self.cache_breaker.record_failure();
@@ -2570,14 +2579,31 @@ impl DagActor {
             .cloned()
             .collect();
         // r[impl sched.merge.probe-off-actor]
-        let Some(resp) = (match precomputed {
-            Some(r) => self.record_breaker_from_precomputed(r)?,
-            None => {
-                self.find_missing_with_breaker(check_paths.clone(), jwt_token)
-                    .await?
+        // The precomputed response is borrowed (no deep-clone of a
+        // ~29k-path response inside the actor turn);
+        // `find_missing_with_breaker`'s owned result is parked in a
+        // local so both arms yield `&FindMissingPathsResponse`.
+        let owned_resp;
+        let resp: &FindMissingPathsResponse = match precomputed {
+            Some(r) => {
+                self.record_breaker_from_precomputed(r)?;
+                match r {
+                    Ok(resp) => resp,
+                    Err(_) => return Ok((hits, Vec::new())),
+                }
             }
-        }) else {
-            return Ok((hits, Vec::new()));
+            None => {
+                match self
+                    .find_missing_with_breaker(check_paths.clone(), jwt_token)
+                    .await?
+                {
+                    Some(r) => {
+                        owned_resp = r;
+                        &owned_resp
+                    }
+                    None => return Ok((hits, Vec::new())),
+                }
+            }
         };
 
         // r[impl sched.merge.substitute-probe]
@@ -2585,12 +2611,20 @@ impl DagActor {
         // Upstream-substitutable → pending_substitute (the merge
         // creates materialization jobs in-tx; the store executor owns
         // the NAR download — the actor loop is never blocked on it).
-        let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
-        let substitutable: HashSet<String> = resp.substitutable_paths.into_iter().collect();
-        let indeterminate: HashSet<String> = resp.indeterminate_paths.into_iter().collect();
+        let missing: HashSet<&str> = resp.missing_paths.iter().map(String::as_str).collect();
+        let substitutable: HashSet<&str> = resp
+            .substitutable_paths
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let indeterminate: HashSet<&str> = resp
+            .indeterminate_paths
+            .iter()
+            .map(String::as_str)
+            .collect();
         let present: HashSet<String> = check_paths
             .into_iter()
-            .filter(|p| !missing.contains(p))
+            .filter(|p| !missing.contains(p.as_str()))
             .collect();
 
         // A derivation is cached if it has at least one non-empty
@@ -2965,22 +2999,27 @@ impl DagActor {
     /// order is bounded under ≤4 concurrent submits per
     /// `OPEN_THRESHOLD = 5`, no `Mutex` needed). Branch shape mirrors
     /// `find_missing_with_breaker`'s match arms exactly:
-    /// `Ok → record_success → Some(resp)`; `Err → warn + counter +
-    /// record_failure → if-tripped Err(StoreUnavailable) else Ok(None)`
-    /// (proceed with CA-only hits, IA outputs treated 100%-miss — the
-    /// pre-sh-036 under-threshold behaviour). The handler collapses
-    /// timeout into `Err(Status::deadline_exceeded)` so both error
-    /// arms fold here. A handler-side failure is `Some(Err)`, never
-    /// `None` — production never re-probes in-actor on a handler error.
+    /// `Ok → record_success`; `Err → warn + counter + record_failure →
+    /// if-tripped Err(StoreUnavailable) else Ok(())` (proceed with
+    /// CA-only hits, IA outputs treated 100%-miss — the pre-sh-036
+    /// under-threshold behaviour). The handler collapses timeout into
+    /// `Err(Status::deadline_exceeded)` so both error arms fold here.
+    /// A handler-side failure is `Some(Err)`, never `None` —
+    /// production never re-probes in-actor on a handler error.
+    ///
+    /// Breaker fold ONLY (side effect, no data) — the response itself
+    /// is borrowed from `precomputed_probe.as_ref()` at every phase
+    /// that reads it, so a 14k-node / ~29k-path response is never
+    /// deep-cloned inside the actor turn.
     // r[impl sched.merge.probe-off-actor]
     fn record_breaker_from_precomputed(
         &mut self,
         precomputed: &Result<FindMissingPathsResponse, tonic::Status>,
-    ) -> Result<Option<FindMissingPathsResponse>, ActorError> {
+    ) -> Result<(), ActorError> {
         match precomputed {
-            Ok(r) => {
+            Ok(_) => {
                 self.cache_breaker.record_success();
-                Ok(Some(r.clone()))
+                Ok(())
             }
             Err(e) => {
                 warn!(error = %e, "store FindMissingPaths failed (precomputed off-actor)");
@@ -2989,7 +3028,7 @@ impl DagActor {
                 if self.cache_breaker.record_failure() {
                     return Err(ActorError::StoreUnavailable);
                 }
-                Ok(None)
+                Ok(())
             }
         }
     }
@@ -3121,8 +3160,9 @@ impl DagActor {
         // double-counting one handler failure as two consecutive
         // failures). `Some(Err)` falls through to the full bottom-up
         // path; phase-4 folds it. `None` keeps today's in-actor probe.
-        let resp = match precomputed {
-            Some(Ok(pre)) => pre.clone(),
+        let owned_resp;
+        let resp: &FindMissingPathsResponse = match precomputed {
+            Some(Ok(pre)) => pre,
             Some(Err(e)) => {
                 debug!(error = %e, "top-down: precomputed FindMissingPaths failed; falling through");
                 return None;
@@ -3150,7 +3190,8 @@ impl DagActor {
                 {
                     Ok(Ok(r)) => {
                         self.cache_breaker.record_success();
-                        r.into_inner()
+                        owned_resp = r.into_inner();
+                        &owned_resp
                     }
                     Ok(Err(e)) => {
                         debug!(error = %e, "top-down FindMissingPaths failed; falling through");

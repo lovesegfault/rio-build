@@ -94,16 +94,9 @@ async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
         let cmd = ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id: Uuid::new_v4(),
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
                 nodes: vec![node],
                 edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
-                jwt_token: None,
-                precomputed_probe: None,
+                ..Default::default()
             },
             reply: reply_tx,
         };
@@ -194,16 +187,9 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
         let cmd = ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
                 nodes: vec![node],
                 edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
-                jwt_token: None,
-                precomputed_probe: None,
+                ..Default::default()
             },
             reply: reply_tx,
         };
@@ -2774,18 +2760,13 @@ async fn merge_phase_4_never_awaits_store_rpc() -> TestResult {
     let req = MergeDagRequest {
         build_id: Uuid::new_v4(),
         tenant_id: Some(DEFAULT_TEST_TENANT),
-        priority_class: PriorityClass::Scheduled,
         nodes,
         edges: vec![],
-        options: BuildOptions::default(),
-        keep_going: false,
-        traceparent: String::new(),
-        jti: None,
-        jwt_token: None,
         precomputed_probe: Some(Ok(rio_proto::types::FindMissingPathsResponse {
             missing_paths: all_paths,
             ..Default::default()
         })),
+        ..Default::default()
     };
     merge_dag_req(&handle, req).await?;
     let after = crate::actor::merge::FMP_AWAITS.load(Ordering::SeqCst);

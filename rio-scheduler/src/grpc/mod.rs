@@ -110,19 +110,34 @@ pub struct SchedulerGrpc {
     /// `hmac_key: Some` = closed for materialization operations (no
     /// acceptable credential exists).
     pub(super) service_verifier: Option<Arc<HmacKey>>,
-    /// sh-036.1: store client for the off-actor `FindMissingPaths`
-    /// probe in `submit_build` (`scheduler_service.rs`) — same lazy
-    /// channel as the actor's (`tonic::Channel` is cheap-clone).
-    /// `None` in test constructors → handler threads
-    /// `precomputed_probe = None` and the actor's in-actor probe
-    /// fallback runs (today's behaviour).
-    pub(super) store_client: Option<rio_proto::StoreServiceClient<tonic::transport::Channel>>,
-    /// sh-036.1: read-only mirror of the actor's
-    /// `cache_breaker.is_open()`, shared via `DagActorPlumbing`. The
-    /// off-actor FMP probe replicates `find_missing_with_breaker`'s
-    /// conditional timeout: `if breaker_open {grpc_timeout} else
-    /// {MERGE_FMP_TIMEOUT}`. The breaker FOLD stays actor-side.
-    pub(super) breaker_open: Arc<AtomicBool>,
+    /// sh-036.1: store client + breaker mirror for the off-actor
+    /// `FindMissingPaths` probe in `submit_build`
+    /// (`scheduler_service.rs`). Bundled so a test can't set one half
+    /// of the feature without the other.
+    pub(super) off_actor_probe: OffActorProbe,
+}
+
+/// sh-036.1 off-actor `FindMissingPaths` probe wiring — store client
+/// plus the actor's `cache_breaker.is_open()` mirror.
+///
+/// Both halves are sourced from the same locals in `main.rs`, both fed
+/// into `DagActorPlumbing` adjacently, and both `None`/`Arc::default()`
+/// together in test constructors. Bundling them structurally couples
+/// the two halves and keeps `SchedulerGrpc::new` under the
+/// too-many-arguments threshold.
+#[derive(Clone, Default)]
+pub struct OffActorProbe {
+    /// Store client — same lazy channel as the actor's
+    /// (`tonic::Channel` is cheap-clone). `None` in test constructors
+    /// → handler threads `precomputed_probe = None` and the actor's
+    /// in-actor probe fallback runs (today's behaviour).
+    pub store_client: Option<rio_proto::StoreServiceClient<tonic::transport::Channel>>,
+    /// Read-only mirror of the actor's `cache_breaker.is_open()`,
+    /// shared via `DagActorPlumbing`. The off-actor FMP probe
+    /// replicates `find_missing_with_breaker`'s conditional timeout:
+    /// `if breaker_open {grpc_timeout} else {MERGE_FMP_TIMEOUT}`. The
+    /// breaker FOLD stays actor-side.
+    pub breaker_open: Arc<AtomicBool>,
 }
 
 impl SchedulerGrpc {
@@ -136,8 +151,7 @@ impl SchedulerGrpc {
             jwt_mode: false,
             hmac_key: None,
             service_verifier: None,
-            store_client: None,
-            breaker_open: Arc::default(),
+            off_actor_probe: OffActorProbe::default(),
         }
     }
 
@@ -152,8 +166,7 @@ impl SchedulerGrpc {
             jwt_mode: false,
             hmac_key: None,
             service_verifier: None,
-            store_client: None,
-            breaker_open: Arc::default(),
+            off_actor_probe: OffActorProbe::default(),
         }
     }
 
@@ -168,10 +181,9 @@ impl SchedulerGrpc {
     /// `service_verifier`: service-HMAC verifier for the store's
     /// materialization credential (drives `require_store_service`).
     ///
-    /// `store_client` + `breaker_open`: sh-036.1 off-actor FMP probe
-    /// — same lazy store channel as the actor's, plus the actor's
+    /// `off_actor_probe`: sh-036.1 off-actor FMP probe — same lazy
+    /// store channel as the actor's, plus the actor's
     /// `cache_breaker.is_open()` mirror for the conditional timeout.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         actor: ActorHandle,
         db: SchedulerDb,
@@ -179,8 +191,7 @@ impl SchedulerGrpc {
         jwt_mode: bool,
         hmac_key: Option<Arc<HmacKey>>,
         service_verifier: Option<Arc<HmacKey>>,
-        store_client: Option<rio_proto::StoreServiceClient<tonic::transport::Channel>>,
-        breaker_open: Arc<AtomicBool>,
+        off_actor_probe: OffActorProbe,
     ) -> Self {
         Self {
             actor,
@@ -189,8 +200,7 @@ impl SchedulerGrpc {
             jwt_mode,
             hmac_key,
             service_verifier,
-            store_client,
-            breaker_open,
+            off_actor_probe,
         }
     }
 

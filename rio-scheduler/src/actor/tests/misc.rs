@@ -541,15 +541,9 @@ async fn test_hmac_assignment_carries_tenant() -> TestResult {
         MergeDagRequest {
             build_id: Uuid::new_v4(),
             tenant_id: Some(tenant),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![make_node("phase2-drv")],
             edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -599,19 +593,13 @@ async fn test_hmac_expiry_bounded_by_seven_day_lifetime() -> TestResult {
             &handle,
             MergeDagRequest {
                 build_id: Uuid::new_v4(),
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
                 nodes: vec![make_node(drv)],
                 edges: vec![],
                 options: BuildOptions {
                     build_timeout: timeout.into(),
                     ..Default::default()
                 },
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
-                jwt_token: None,
-                precomputed_probe: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -754,16 +742,9 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
         .send_unchecked(ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
                 nodes: vec![make_node("orphan-drv")],
                 edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
-                jwt_token: None,
-                precomputed_probe: None,
+                ..Default::default()
             },
             reply: reply_tx,
         })

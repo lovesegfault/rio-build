@@ -14,7 +14,7 @@ use rio_proto::SchedulerServiceServer;
 use rio_scheduler::actor::ActorHandle;
 use rio_scheduler::admin::AdminServiceImpl;
 use rio_scheduler::db::SchedulerDb;
-use rio_scheduler::grpc::SchedulerGrpc;
+use rio_scheduler::grpc::{OffActorProbe, SchedulerGrpc};
 
 use rio_scheduler::config::{CliArgs, Config, DashboardConfig};
 
@@ -493,8 +493,10 @@ async fn main() -> anyhow::Result<()> {
             // materialization credential (ServiceClaims caller="rio-store")
             // on the materialization-only ExecutorService operations.
             service_verifier.clone(),
-            store_client,
-            breaker_open,
+            OffActorProbe {
+                store_client,
+                breaker_open,
+            },
         );
 
         // Background refresh for ClusterStatus.store_size_bytes — 60s PG poll

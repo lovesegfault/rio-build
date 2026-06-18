@@ -20,6 +20,69 @@ use crate::state::BuildOptions;
 
 use super::{SchedulerGrpc, bridge_build_events, resolve_tenant_name};
 
+impl SchedulerGrpc {
+    /// sh-036.1 off-actor `FindMissingPaths` over every request
+    /// `expected_output_paths`. `None` when `store_client` is unset
+    /// (test constructors) or there are no path-based outputs;
+    /// `Some(Err)` on handler-side timeout/gRPC-error (the actor folds
+    /// it into the breaker — NOT a SubmitBuild failure).
+    ///
+    /// Uses `with_timeout_status` (timeout → `deadline_exceeded`) and
+    /// `inject_metadata` (tenant-token header) — the same leaves every
+    /// other FMP issuance site uses, so a future request-shape change
+    /// (e.g. a `probe_intent` field) lands in fewer places. The
+    /// conditional timeout (`breaker_open` mirror → 30s, else 90s) is
+    /// the same shape as `find_missing_with_breaker`.
+    // r[impl sched.merge.probe-off-actor]
+    async fn precompute_fmp_probe(
+        &self,
+        nodes: &[rio_proto::types::DerivationNode],
+        jwt_token: Option<&str>,
+    ) -> Option<Result<rio_proto::types::FindMissingPathsResponse, Status>> {
+        let store_client = self.off_actor_probe.store_client.as_ref()?;
+        let store_paths: Vec<String> = nodes
+            .iter()
+            .flat_map(|n| n.expected_output_paths.iter())
+            .filter(|p| !p.is_empty())
+            .cloned()
+            .collect();
+        if store_paths.is_empty() {
+            return None;
+        }
+        let mut fmp = Request::new(rio_proto::types::FindMissingPathsRequest { store_paths });
+        rio_proto::interceptor::inject_current(fmp.metadata_mut());
+        if let Some(t) = jwt_token {
+            // I-202: same JWT propagation as the actor-side FMP sites.
+            // inject_metadata's parse failure is `Status::internal`; a
+            // JWT is base64url ASCII so this can't fail — degrade to
+            // header-absent (substitution probe won't fire) rather
+            // than failing SubmitBuild.
+            let _ = rio_common::grpc::inject_metadata(
+                fmp.metadata_mut(),
+                &[(rio_proto::TENANT_TOKEN_HEADER, t)],
+            );
+        }
+        let fmp_timeout = if self
+            .off_actor_probe
+            .breaker_open
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            rio_common::grpc::DEFAULT_GRPC_TIMEOUT
+        } else {
+            crate::actor::MERGE_FMP_TIMEOUT
+        };
+        Some(
+            rio_common::grpc::with_timeout_status(
+                "off-actor FindMissingPaths",
+                fmp_timeout,
+                store_client.clone().find_missing_paths(fmp),
+            )
+            .await
+            .map(|r| r.into_inner()),
+        )
+    }
+}
+
 #[tonic::async_trait]
 impl SchedulerService for SchedulerGrpc {
     type SubmitBuildStream = ReceiverStream<Result<rio_proto::types::BuildEvent, Status>>;
@@ -95,9 +158,10 @@ impl SchedulerService for SchedulerGrpc {
                 return Err(Status::invalid_argument("node drv_hash must be non-empty"));
             }
             // bug_155: a duplicate drv_hash reaches
-            // `batch_upsert_derivations`' UNNEST → PG 21000
-            // cardinality_violation → opaque Internal. Reject at the
-            // boundary so the error names the offending hash.
+            // `batch_upsert_derivations`' `ON CONFLICT DO UPDATE` →
+            // PG 21000 cardinality_violation ("cannot affect row a
+            // second time") → opaque Internal. Reject at the boundary
+            // so the error names the offending hash.
             if !seen_hashes.insert(node.drv_hash.as_str()) {
                 return Err(Status::invalid_argument(format!(
                     "duplicate drv_hash {:?} in nodes[]",
@@ -221,54 +285,9 @@ impl SchedulerService for SchedulerGrpc {
         // identical to today's behaviour). Runs AFTER the
         // `is_backpressured()` gate so a refused request doesn't burn
         // 5s of upstream HEADs.
-        let precomputed_probe = match &self.store_client {
-            Some(store_client) => {
-                let store_paths: Vec<String> = req
-                    .nodes
-                    .iter()
-                    .flat_map(|n| n.expected_output_paths.iter())
-                    .filter(|p| !p.is_empty())
-                    .cloned()
-                    .collect();
-                if store_paths.is_empty() {
-                    None
-                } else {
-                    let mut fmp =
-                        Request::new(rio_proto::types::FindMissingPathsRequest { store_paths });
-                    rio_proto::interceptor::inject_current(fmp.metadata_mut());
-                    if let Some(t) = jwt_token.as_deref()
-                        && let Ok(v) = tonic::metadata::MetadataValue::try_from(t)
-                    {
-                        fmp.metadata_mut().insert(rio_proto::TENANT_TOKEN_HEADER, v);
-                    }
-                    // Conditional timeout — same shape as
-                    // `find_missing_with_breaker`: `breaker_open` is
-                    // the actor's `cache_breaker.is_open()` mirror; a
-                    // stale read costs at most one mis-sized timeout.
-                    let fmp_timeout =
-                        if self.breaker_open.load(std::sync::atomic::Ordering::Relaxed) {
-                            rio_common::grpc::DEFAULT_GRPC_TIMEOUT
-                        } else {
-                            crate::actor::MERGE_FMP_TIMEOUT
-                        };
-                    Some(
-                        match tokio::time::timeout(
-                            fmp_timeout,
-                            store_client.clone().find_missing_paths(fmp),
-                        )
-                        .await
-                        {
-                            Ok(Ok(r)) => Ok(r.into_inner()),
-                            Ok(Err(e)) => Err(e),
-                            Err(_) => Err(Status::deadline_exceeded(format!(
-                                "off-actor FindMissingPaths timed out after {fmp_timeout:?}"
-                            ))),
-                        },
-                    )
-                }
-            }
-            None => None,
-        };
+        let precomputed_probe = self
+            .precompute_fmp_probe(&req.nodes, jwt_token.as_deref())
+            .await;
 
         // Capture the current span's traceparent BEFORE sending to the
         // actor. Span context does not cross the mpsc channel boundary;

@@ -13,9 +13,11 @@
 //! `FromStr`/inherent `as_str`; it keeps the `BuildStateExt` trait
 //! pattern.
 //!
-//! Not `strum`: the encode/decode is ~10 lines of macro vs a new
-//! workspace dep + derive-macro compile time + Cargo.json regen. The
-//! enums are stable enough that the macro pays for itself.
+//! Not `strum`: strum's `Display`/`EnumString` defaults are
+//! variant-case (`"Queued"`), and the PG TEXT values are snake-case
+//! plus carry per-variant `parse_err` types. The encode/decode is ~10
+//! lines of macro vs `#[strum(serialize = "...")]` on every variant of
+//! every enum; the macro keeps the variant↔string list in one place.
 
 /// Generate `as_str`, `Display`, `ALL`, and (optionally) `FromStr` for
 /// a local enum whose variants map to PG TEXT values.

@@ -874,8 +874,6 @@ async fn test_per_build_timeout_failure_is_build_level() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id,
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![x, y],
             edges: vec![],
             options: BuildOptions {
@@ -883,10 +881,7 @@ async fn test_per_build_timeout_failure_is_build_level() -> TestResult {
                 ..Default::default()
             },
             keep_going: true,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;

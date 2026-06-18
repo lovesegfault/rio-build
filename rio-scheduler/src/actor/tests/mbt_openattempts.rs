@@ -281,15 +281,10 @@ impl OaSystem {
         let req = MergeDagRequest {
             build_id,
             tenant_id: Some(DEFAULT_TEST_TENANT),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![node],
             edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
-            precomputed_probe: None,
+            ..Default::default()
         };
         actor
             .handle_merge_dag(req)

@@ -751,7 +751,7 @@ pub async fn insert_realisation(
 /// awaits inside the single-threaded actor — same N+1 actor-stall
 /// class as `persist_status_batch` / `upsert_path_tenants_for_batch`
 /// (I-139, "5281 sequential PG awaits → ~20s head-of-line blocking").
-// r[impl sched.db.batch-unnest]
+// r[impl sched.db.batch-unnest+2]
 #[instrument(skip(pool, rows), fields(n_rows = rows.len()))]
 pub async fn insert_realisation_batch(
     pool: &PgPool,
@@ -1641,7 +1641,7 @@ mod tests {
         Ok(())
     }
 
-    // r[verify sched.db.batch-unnest]
+    // r[verify sched.db.batch-unnest+2]
     /// `insert_realisation_batch` round-trips N rows in one UNNEST and
     /// is idempotent (`ON CONFLICT DO NOTHING`) — same contract as the
     /// single-row [`insert_realisation`].

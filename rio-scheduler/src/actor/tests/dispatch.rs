@@ -15,8 +15,6 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id,
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![make_node("opts-hash")],
             edges: vec![],
             options: BuildOptions {
@@ -24,11 +22,7 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
                 build_timeout: 300.into(),
                 build_cores: 4,
             },
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -72,16 +66,10 @@ async fn test_dispatch_carries_submitter_traceparent() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id,
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![make_node("trace-hash")],
             edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
             traceparent: known_tp.to_string(),
-            jti: None,
-            jwt_token: None,
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -117,16 +105,10 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
                      edges: Vec<rio_proto::types::DerivationEdge>,
                      tp: &str| MergeDagRequest {
         build_id: Uuid::new_v4(),
-        tenant_id: None,
-        priority_class: PriorityClass::Scheduled,
         nodes,
         edges,
-        options: BuildOptions::default(),
-        keep_going: false,
         traceparent: tp.to_string(),
-        jti: None,
-        jwt_token: None,
-        precomputed_probe: None,
+        ..Default::default()
     };
 
     // First submit with tp_first.
@@ -175,16 +157,10 @@ async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
 
     let merge_with_tp = |tp: &str| MergeDagRequest {
         build_id: Uuid::new_v4(),
-        tenant_id: None,
-        priority_class: PriorityClass::Scheduled,
         nodes: vec![make_node("upgrade-hash")],
         edges: vec![],
-        options: BuildOptions::default(),
-        keep_going: false,
         traceparent: tp.to_string(),
-        jti: None,
-        jwt_token: None,
-        precomputed_probe: None,
+        ..Default::default()
     };
 
     // First merge with EMPTY traceparent (simulates recovery:
@@ -434,15 +410,9 @@ async fn dispatch_time_substitutable_routes_to_job(#[case] is_fod: bool) -> Test
         MergeDagRequest {
             build_id,
             tenant_id: Some(tenant),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![n],
             edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -523,15 +493,9 @@ async fn probe_batch_partitions_by_tenant() -> TestResult {
             MergeDagRequest {
                 build_id: Uuid::new_v4(),
                 tenant_id: Some(build_tenant),
-                priority_class: PriorityClass::Scheduled,
                 nodes: vec![n],
                 edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
-                jwt_token: None,
-                precomputed_probe: None,
+                ..Default::default()
             },
         )
         .await?;

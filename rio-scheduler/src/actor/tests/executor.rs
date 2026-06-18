@@ -145,8 +145,6 @@ async fn test_per_build_timeout_fails_build_on_tick() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id,
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![make_node("pbt-drv")],
             edges: vec![],
             options: BuildOptions {
@@ -154,11 +152,7 @@ async fn test_per_build_timeout_fails_build_on_tick() -> TestResult {
                 build_timeout: 60.into(),
                 build_cores: 0,
             },
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;

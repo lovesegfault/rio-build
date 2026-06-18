@@ -38,9 +38,9 @@ type Req = rio_proto::types::SubmitBuildRequest;
     |r: &mut Req| r.edges = vec![Default::default(); rio_common::limits::MAX_DAG_EDGES + 1],
     "edges"
 )]
-// bug_155: duplicate drv_hash → batch_upsert_derivations' UNNEST hits PG 21000
-// (cardinality_violation) → opaque Internal. Reject at the boundary so the error
-// names the offending hash.
+// bug_155: duplicate drv_hash → batch_upsert_derivations' ON CONFLICT DO UPDATE
+// hits PG 21000 (cardinality_violation, "cannot affect row a second time") →
+// opaque Internal. Reject at the boundary so the error names the offending hash.
 #[case::duplicate_drv_hash(
     |r: &mut Req| r.nodes.push(make_node("h")),
     "duplicate drv_hash"

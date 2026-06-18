@@ -884,7 +884,7 @@ async fn cascade_rejects_ambiguous_prior_match() -> TestResult {
 }
 
 // r[verify sched.ca.cutoff-propagate+2]
-// r[verify sched.db.batch-unnest]
+// r[verify sched.db.batch-unnest+2]
 /// bug_012 functional-equivalence guard: the batched
 /// `ca_cutoff_cascade` writes the SAME PG state as the per-item
 /// loop did. 5-node CA chain A→B→C→D→E; seed prior realisations for
@@ -2923,15 +2923,9 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
                 req: MergeDagRequest {
                     build_id,
                     tenant_id: Some(tenant),
-                    priority_class: PriorityClass::Scheduled,
                     nodes: vec![node],
                     edges: vec![],
-                    options: BuildOptions::default(),
-                    keep_going: false,
-                    traceparent: String::new(),
-                    jti: None,
-                    jwt_token: None,
-                    precomputed_probe: None,
+                    ..Default::default()
                 },
                 reply: reply_tx,
             })
@@ -3124,7 +3118,7 @@ fn drain_derivation_events(
     out
 }
 
-// r[verify sched.db.batch-unnest]
+// r[verify sched.db.batch-unnest+2]
 /// `promote_newly_ready` is internally batched: completing a leaf with
 /// 150 Queued parents transitions all 150 to Ready and persists in ONE
 /// batch (no per-item PG round-trip). Correctness check here; batching
@@ -3219,7 +3213,7 @@ async fn cascaded_failed_event_states_no_execution() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.db.batch-unnest]
+// r[verify sched.db.batch-unnest+2]
 // r[verify sched.event.derivation-terminal]
 /// `cascade_dependency_failure` collects-then-batches AND emits a
 /// `DerivationFailed{DependencyFailed}` event per cascaded ancestor.
@@ -6412,16 +6406,9 @@ async fn untenanted_floating_ca_report_never_mints_global_realisations() -> Test
         &handle,
         MergeDagRequest {
             build_id: Uuid::new_v4(),
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![mk_ca("untenanted-ca-forge")],
             edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;

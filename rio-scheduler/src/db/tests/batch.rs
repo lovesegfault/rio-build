@@ -1,4 +1,4 @@
-//! Batch upsert tests — UNNEST scaling + text-array encoding.
+//! Batch upsert tests — COPY-streamed scaling + text-array encoding.
 
 use crate::db::ServingGeneration;
 use rio_test_support::TestDb;
@@ -80,7 +80,7 @@ async fn test_insert_build_derivation_idempotent() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.db.batch-unnest]
+// r[verify sched.db.batch-unnest+2]
 /// Large-DAG persistence: 10k nodes. Would fail on main
 /// with "bind message has 90000 parameter formats" (or similar —
 /// sqlx catches it before PG does) at 7282 nodes.
@@ -135,7 +135,7 @@ async fn test_batch_upsert_10k_nodes() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.db.batch-unnest]
+// r[verify sched.db.batch-unnest+2]
 /// P0539 followup: "PG batch insert ~20s for ~1k rows in handle_merge_dag
 /// is FK validation cost." Regression guard at the followup's exact shape
 /// — 1k nodes, full `persist_merge_to_db` order (derivations →
@@ -344,7 +344,7 @@ async fn persist_merge_14k_rows_under_500ms() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.db.batch-unnest]
+// r[verify sched.db.batch-unnest+2]
 /// Edges: 40k rows. Old limit was 32767 (2 cols). Build a
 /// dense DAG over 10k nodes (fresh DB, so re-insert).
 #[tokio::test]

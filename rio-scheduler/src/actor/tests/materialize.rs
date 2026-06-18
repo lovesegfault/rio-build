@@ -1350,15 +1350,9 @@ async fn reprobe_confirmed_missing_requires_all_tenants() -> TestResult {
             MergeDagRequest {
                 build_id: Uuid::new_v4(),
                 tenant_id: Some(build_tenant),
-                priority_class: PriorityClass::Scheduled,
                 nodes: vec![leaf.clone()],
                 edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
-                jwt_token: None,
-                precomputed_probe: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -1634,15 +1628,10 @@ async fn walk_success_stamps_only_wire_verified_tenants() -> TestResult {
             MergeDagRequest {
                 build_id: Uuid::new_v4(),
                 tenant_id: Some(tenant),
-                priority_class: PriorityClass::Scheduled,
                 nodes: vec![n],
                 edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
                 jwt_token: Some("harness-tenant-jwt".into()),
-                precomputed_probe: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -2473,15 +2462,9 @@ async fn flag_on_unmarked_leaf_confirmed_missing_releases_to_from_source() -> Te
         MergeDagRequest {
             build_id,
             tenant_id: Some(tenant),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![leaf],
             edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -2612,15 +2595,9 @@ async fn reprobe_scope_dropped_echo_never_confirms_missing() -> TestResult {
         MergeDagRequest {
             build_id: Uuid::new_v4(),
             tenant_id: Some(tenant),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![leaf],
             edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -5184,15 +5161,10 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
         MergeDagRequest {
             build_id: build_a,
             tenant_id: Some(tenant),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![leaf],
             edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -5273,15 +5245,10 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
         MergeDagRequest {
             build_id: build_b,
             tenant_id: Some(tenant),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![root, dep],
             edges: vec![make_test_edge("nofs-root", "nofs-dep")],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -5319,15 +5286,10 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
         MergeDagRequest {
             build_id: build_c,
             tenant_id: Some(tenant),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![root2, dep2],
             edges: vec![make_test_edge("nofs-root", "nofs-dep")],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -5457,15 +5419,10 @@ async fn flag_on_genuine_unobtainable_fail_fasts_with_resubmit_error() -> TestRe
         MergeDagRequest {
             build_id,
             tenant_id: Some(tenant),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![root, dep],
             edges: vec![make_test_edge("ff-root", "ff-dep")],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -5641,15 +5598,10 @@ async fn flag_on_probe_job_backfills_wanted_relation_for_flag_off_era_builds() -
             MergeDagRequest {
                 build_id,
                 tenant_id: Some(tenant),
-                priority_class: PriorityClass::Scheduled,
                 nodes: vec![n],
                 edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
                 jwt_token: Some("harness-tenant-jwt".into()),
-                precomputed_probe: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -6575,15 +6527,10 @@ async fn routing_reads_origin_not_column() -> TestResult {
         MergeDagRequest {
             build_id: ba,
             tenant_id: Some(tenant),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![na],
             edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -6652,15 +6599,10 @@ async fn routing_reads_origin_not_column() -> TestResult {
         MergeDagRequest {
             build_id: bb,
             tenant_id: Some(tenant),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![nb, nb_dep],
             edges: vec![make_test_edge("d21b", "d21b-dep")],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -6756,15 +6698,10 @@ async fn unobtainable_on_upgraded_dedup_job_fail_fasts() -> TestResult {
         MergeDagRequest {
             build_id: b1,
             tenant_id: Some(tenant),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![mk_root()],
             edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -6784,15 +6721,10 @@ async fn unobtainable_on_upgraded_dedup_job_fail_fasts() -> TestResult {
         MergeDagRequest {
             build_id: b2,
             tenant_id: Some(tenant),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![mk_root(), dep],
             edges: vec![make_test_edge("d21c", "d21c-dep")],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -7058,15 +6990,9 @@ async fn routing_evidence_survives_inmemory_truncation() -> TestResult {
         MergeDagRequest {
             build_id: b1,
             tenant_id: Some(tenant),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![r],
             edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -7238,15 +7164,9 @@ async fn classify_durable_evidence_ignores_dead_voucher() -> TestResult {
         MergeDagRequest {
             build_id: b_live,
             tenant_id: Some(tenant),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![r1],
             edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -10784,15 +10704,10 @@ async fn fail_fast_releases_the_claim_through_the_kinded_chokepoint() -> TestRes
         MergeDagRequest {
             build_id,
             tenant_id: Some(tenant),
-            priority_class: PriorityClass::Scheduled,
             nodes: vec![root, dep],
             edges: vec![make_test_edge("b90-root", "b90-dep")],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
             jwt_token: Some("harness-tenant-jwt".into()),
-            precomputed_probe: None,
+            ..Default::default()
         },
     )
     .await?;

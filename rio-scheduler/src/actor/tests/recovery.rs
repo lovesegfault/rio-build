@@ -691,16 +691,11 @@ async fn merge_chain(
         .send_unchecked(ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id,
-                tenant_id: None,
                 priority_class,
                 nodes,
                 edges,
-                options: Default::default(),
                 keep_going: true,
-                traceparent: String::new(),
-                jti: None,
-                jwt_token: None,
-                precomputed_probe: None,
+                ..Default::default()
             },
             reply: tx,
         })
@@ -2668,19 +2663,13 @@ async fn test_recovery_restores_build_timeout_baseline() -> TestResult {
             .send_unchecked(ActorCommand::MergeDag {
                 req: MergeDagRequest {
                     build_id,
-                    tenant_id: None,
-                    priority_class: PriorityClass::Scheduled,
                     nodes: vec![make_node("bto-drv")],
                     edges: vec![],
                     options: BuildOptions {
                         build_timeout: 60.into(),
                         ..Default::default()
                     },
-                    keep_going: false,
-                    traceparent: String::new(),
-                    jti: None,
-                    jwt_token: None,
-                    precomputed_probe: None,
+                    ..Default::default()
                 },
                 reply: tx,
             })
@@ -3190,8 +3179,6 @@ async fn recovered_stale_build_times_out_on_first_tick() -> TestResult {
             &handle,
             MergeDagRequest {
                 build_id,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
                 nodes: vec![make_node("stale-timeout-drv")],
                 edges: vec![],
                 options: BuildOptions {
@@ -3199,11 +3186,7 @@ async fn recovered_stale_build_times_out_on_first_tick() -> TestResult {
                     build_timeout: 60.into(),
                     build_cores: 0,
                 },
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
-                jwt_token: None,
-                precomputed_probe: None,
+                ..Default::default()
             },
         )
         .await?;
