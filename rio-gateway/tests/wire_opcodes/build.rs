@@ -1144,6 +1144,126 @@ async fn test_build_paths_redispatch_reuses_activity() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify gw.display.redispatch-footer]
+/// sh-042: a duplicate Started carrying a `predecessor` emits the
+/// synthetic `rio: retry <reason> — re-dispatching at <size>` line as
+/// a BuildLogLine result on the EXISTING actBuild aid (the same aid
+/// the predecessor's output landed on, before the duplicate-Started
+/// early-return reuses it). Absent → no frame (today's silent
+/// supersede). Pre-fix RED: the duplicate-Started arm emitted nothing
+/// at all — `result_log_lines` is empty.
+#[tokio::test]
+async fn started_with_predecessor_emits_retry_marker_on_existing_aid() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    let target = "/nix/store/ccc-sh042.drv".to_string();
+    let exec_a = "00000000-0000-0000-0000-00000000aaaa";
+    let exec_b = "00000000-0000-0000-0000-00000000bbbb";
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        })),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::started(target.clone(), "w1".into(), exec_a.into()),
+        )),
+        // Re-dispatch carrying the closed predecessor.
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::started_with_predecessor(
+                target.clone(),
+                "w2".into(),
+                exec_b.into(),
+                types::StartedPredecessor {
+                    exec_id: exec_a.into(),
+                    termination_reason: "evicted_empty_dir_size_limit".into(),
+                    floor_bumped: types::PredecessorFloorAxis::Disk as i32,
+                    new_axis_bytes: 50 << 30,
+                },
+            ),
+        )),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::completed(target.clone(), vec![]),
+        )),
+        ev(build_event::Event::Completed(types::BuildCompleted {
+            output_paths: vec![],
+        })),
+    ]));
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let frames = collect_stderr_frames(&mut h.stream).await;
+    // The single actBuild aid (re-dispatch reuses it; pinned by
+    // `test_build_paths_redispatch_reuses_activity` above).
+    let aid = frames
+        .iter()
+        .find_map(|m| match m {
+            StderrMessage::StartActivity {
+                id,
+                activity_type: 105,
+                ..
+            } => Some(*id),
+            _ => None,
+        })
+        .expect("one actBuild start");
+    // Exactly one BuildLogLine result frame, on that aid, with the
+    // marker body.
+    let result_log_lines: Vec<_> = frames
+        .iter()
+        .filter_map(|m| match m {
+            StderrMessage::Result {
+                activity_id,
+                result_type: 101,
+                fields,
+            } => Some((*activity_id, fields.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        result_log_lines.len(),
+        1,
+        "exactly one rio: retry marker; frames: {frames:?}"
+    );
+    let (line_aid, fields) = &result_log_lines[0];
+    assert_eq!(*line_aid, aid, "marker lands on the existing actBuild aid");
+    assert_eq!(
+        *fields,
+        vec![rio_nix::protocol::stderr::ResultField::String(
+            "rio: retry    evicted (emptyDir disk limit) — re-dispatching at 50 GiB".into()
+        )],
+        "marker body: human reason + sizing suffix"
+    );
+    // The marker is emitted BEFORE the duplicate-Started early-return
+    // (which reuses the aid and emits nothing else): one start, one
+    // result, one stop.
+    let starts = frames
+        .iter()
+        .filter(|m| {
+            matches!(
+                m,
+                StderrMessage::StartActivity {
+                    activity_type: 105,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(starts, 1, "still exactly one actBuild start");
+
+    let _ = wire::read_u64(&mut h.stream).await?;
+    h.finish().await;
+
+    // Second case: predecessor=None → no BuildLogLine frame at all
+    // (today's silent supersede). Exercised by
+    // `test_build_paths_redispatch_reuses_activity` directly above
+    // (frames.len() == 5, no Result{101} frame); the assertion there
+    // already pins it.
+    Ok(())
+}
+
 /// DerivationEvent::Failed stops the activity AND emits a STDERR_NEXT log line.
 #[tokio::test]
 async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Result<()> {

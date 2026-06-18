@@ -2229,6 +2229,21 @@ client showed it stuck forever. One map with a family-valued entry makes
 "swept by every reconcile" a property of the key set rather than of each
 loop's author remembering both families.
 
+#r("gw.display.redispatch-footer")[
+  When a STARTED event carries a predecessor, the gateway MUST emit a
+  synthetic `rio: retry <reason> --- re-dispatching ...` line on the
+  existing actBuild activity (BuildLogLine; STDERR_NEXT fallback when
+  no activity is open) before superseding the old tail, so a watching
+  user never sees a new `rio: exec` header without a transition
+  marker; the `rio: retry` prefix is order-independent against any
+  builder-emitted `rio: result` footer for the same attempt.
+]
+The grace=0 floor-bumping reasons (OOMKilled, emptyDir-sizeLimit
+eviction) SIGKILL the builder before its own `rio: result` footer can
+emit, and the under-cap infra retry emits no `Failed` event --- the
+predecessor field on `Started` is the only carrier of the closed
+attempt's termination reason and the new mint's sizing.
+
 #r("gw.display.family-flip")[
   Every display-family transition MUST project through the single
   total flip chokepoint over (current display #sym.times incoming

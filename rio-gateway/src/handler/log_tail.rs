@@ -326,6 +326,14 @@ impl LogTailSet {
                 "re-dispatch: replacing log-tail subscription"
             );
             // r[impl sys.epilogue.supersession]
+            // TODO: sh-042s — drain-then-replace via TERMINAL_GRACE
+            // instead of mark_superseded+abort, so a graceful
+            // predecessor's `rio: result cancelled (sigterm)` footer
+            // (already in flight when this Started arrives) lands
+            // BEFORE the successor's `rio: exec` header. Out of scope
+            // for sh-042 (the `rio: retry` prefix makes the two lines
+            // order-independent); the structural fix is recorded here.
+            //
             // The supersession protocol (bug_168): mark the typed
             // discard disposition FIRST — the old relay's
             // PendingGapCell consults it before unwinding, so its Drop
