@@ -94,9 +94,10 @@ pub enum AttemptTerminalKind {
     Unspecified,
     /// The cgroup OOM-killed the build.
     OomKilled,
-    /// Evicted under node disk pressure (the node-condition shapes;
-    /// also the FOLDED home of the pod-attributed shapes until the
-    /// wire carrier splits — see [`Self::EvictedEmptyDirSizeLimit`]).
+    /// Evicted under NODE-CONDITION disk pressure (the ambient
+    /// `DiskPressure` / hyphenated `ephemeral-storage` shapes). The
+    /// pod-attributed shapes split to
+    /// [`Self::EvictedEmptyDirSizeLimit`] at sh-039.
     EvictedDiskPressure,
     /// live060-f (A2): a POD-ATTRIBUTED emptyDir-sizeLimit eviction —
     /// kubelet's own per-pod statement that THIS build exceeded ITS
@@ -108,16 +109,14 @@ pub enum AttemptTerminalKind {
     /// sub-shape carries none, so splitting it is a refinement of the
     /// ruling's own rationale, never a reversal of its conclusion.
     ///
-    /// UNPRODUCED at this tree (inert): the controller→scheduler
-    /// carrier is the WIRE enum `AttemptTerminalReason`, which has no
-    /// corresponding value — adding one is a `.fields` wire change
-    /// barred by this wave's zero-amendment-wire ledger. The PROMOTE
-    /// path (this letter feeding the disk floor through the
+    /// PRODUCED at sh-039: the controller→scheduler carrier
+    /// `AttemptTerminalReason` gained the additive value (the
+    /// live060-f deferral's named revive trigger — "the next
+    /// eviction-shaped sizing incident" — discharged), and the
+    /// PROMOTE path (this letter feeding the disk floor through the
     /// corroboration chokepoint as a scheduler-verifiable witness) is
-    /// RULED pending the wire ritual; until then every eviction folds
-    /// to [`Self::EvictedDiskPressure`] and stays classify-only. The
-    /// label row below exists so the vocabulary is ready on both
-    /// planes the moment the carrier lands.
+    /// live: `witnessed_disposition` maps it to `PromoteDiskFloor`
+    /// while [`Self::EvictedDiskPressure`] stays classify-only.
     EvictedEmptyDirSizeLimit,
     /// Evicted for any non-disk reason.
     EvictedOther,

@@ -228,6 +228,15 @@ enum AttemptTerminalReason {
   // attempt — and the scheduler maps it to the fleet-exhaust poison arm
   // (Poison(FleetExhausted)) instead of a column fill.
   ATTEMPT_TERMINAL_REASON_NO_ELIGIBLE_SOURCE = 10;
+  // sh-039: kubelet's POD-ATTRIBUTED emptyDir-sizeLimit / ephemeral
+  // local storage eviction — kubelet's own per-pod statement that THIS
+  // build exceeded ITS declared disk (the three POD_ATTRIBUTED_NEEDLES
+  // grammars). Split from EVICTED_DISK_PRESSURE so the scheduler may
+  // promote the disk floor on the unambiguous sub-shape while
+  // node-condition DiskPressure stays classify-only (I-199). Additive
+  // (proto3): an old scheduler decodes wire 11 as Unspecified and
+  // stays classify-only — today's behaviour.
+  ATTEMPT_TERMINAL_REASON_EVICTED_EMPTY_DIR_SIZE_LIMIT = 11;
 }
 
 message ReportAttemptOutcomeRequest {

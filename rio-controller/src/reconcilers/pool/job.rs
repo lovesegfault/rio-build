@@ -2136,23 +2136,19 @@ pub(super) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
         // "ephemeral-storage" resource NAME, which only appears in
         // node-condition messages) stay ambient.
         //
-        // The WIRE letter stays the EvictedDiskPressure fold for
-        // BOTH: the in-process split letter
-        // (`AttemptTerminalKind::EvictedEmptyDirSizeLimit`) and its
-        // label are landed and ready, but the controller→scheduler
-        // carrier is the wire enum `AttemptTerminalReason`, which
-        // has no corresponding value — adding one is a `.fields`
-        // wire change barred by this wave's zero-amendment-wire
-        // ledger, so the PROMOTE path is RULED with the wire ritual
-        // as its trigger and the scheduler stays classify-only
-        // (the only controller-witnessed letter that promotes a
-        // floor is OomKilled — live_058-b; the floor's disk arm is
-        // live with its sole producer, the worker-side
-        // prjquota-attributed DiskFull lane — live_057, never this
-        // fill). The split is PRODUCED here regardless — the
-        // grammar discriminator plus the per-shape readback counter
-        // — so the fleet sees the unambiguous sub-population today
-        // and the producer is live the moment the carrier lands.
+        // sh-039: the WIRE letter splits at
+        // `pod_attempt_terminal_reason` — pod-attributed shapes go
+        // over the wire as `EvictedEmptyDirSizeLimit` (the additive
+        // enum value; live060-f's deferral discharged by its named
+        // "next eviction-shaped sizing incident" trigger) and the
+        // scheduler promotes the disk floor on them
+        // (`PromoteDiskFloor`, label `witnessed_disk`);
+        // node-condition shapes stay `EvictedDiskPressure` and
+        // classify-only (I-199 untouched). THIS function returns the
+        // worker-proto `TerminationReason`, which has no split
+        // variant (Q2: one wire change, not two), so it stays the
+        // EvictedDiskPressure fold for BOTH and the per-shape
+        // readback counter discriminates as before.
         if eviction_is_pod_attributed(msg) {
             metrics::counter!(
                 "rio_controller_pod_evictions_total",
@@ -2322,6 +2318,28 @@ fn termination_reason_label(reason: TerminationReason) -> &'static str {
     }
 }
 
+/// sh-039: the WIRE-SIDE pod-terminal classification for
+/// `report_terminated_pods` — the producer split. Folds to
+/// [`unified_attempt_reason`] for every shape EXCEPT a pod-attributed
+/// eviction, which the wire enum carries as the split letter
+/// `EvictedEmptyDirSizeLimit` so the scheduler may promote the disk
+/// floor on kubelet's own per-pod statement while node-condition
+/// `EvictedDiskPressure` stays classify-only (I-199 untouched).
+/// `pod_termination_reason` and the worker-proto `TerminationReason`
+/// stay folded — the split lives in the controller→scheduler wire
+/// enum only (Q2: one wire change, not two; the worker enum gains
+/// nothing).
+pub(super) fn pod_attempt_terminal_reason(pod: &Pod) -> rio_proto::types::AttemptTerminalReason {
+    use rio_proto::types::AttemptTerminalReason as A;
+    if let Some(status) = &pod.status
+        && status.reason.as_deref() == Some("Evicted")
+        && eviction_is_pod_attributed(status.message.as_deref().unwrap_or(""))
+    {
+        return A::EvictedEmptyDirSizeLimit;
+    }
+    unified_attempt_reason(pod_termination_reason(pod))
+}
+
 /// Map the controller's k8s pod-terminal classification onto the
 /// unified `AttemptTerminalReason` vocabulary (the C4/C5 unification:
 /// one idempotent `ReportAttemptOutcome` carries what the retired
@@ -2475,10 +2493,11 @@ pub(super) async fn report_terminated_pods(
     // One view read per tick, only when a reportable pod exists; on
     // error the reports go intent-keyed (the scheduler then skips the
     // node fill — conservative, never wrong-attempt).
+    use rio_proto::types::AttemptTerminalReason as A;
     let open_attempts: Vec<rio_proto::types::OpenAttempt> = if list.items.iter().any(|pod| {
         matches!(
-            pod_termination_reason(pod),
-            TerminationReason::OomKilled | TerminationReason::EvictedDiskPressure
+            pod_attempt_terminal_reason(pod),
+            A::OomKilled | A::EvictedDiskPressure | A::EvictedEmptyDirSizeLimit
         )
     }) {
         match admin_call(
@@ -2500,9 +2519,10 @@ pub(super) async fn report_terminated_pods(
         Vec::new()
     };
     for pod in &list.items {
-        let reason = pod_termination_reason(pod);
+        let reason = pod_attempt_terminal_reason(pod);
         // Only the classification-fill reasons (OomKilled /
-        // EvictedDiskPressure) go over the wire. `Completed`/
+        // EvictedDiskPressure / sh-039's split
+        // EvictedEmptyDirSizeLimit) go over the wire. `Completed`/
         // `Error`/`EvictedOther` would be sent every tick for every
         // TTL-window Job; the scheduler's fill-once intake no-ops
         // them anyway. `Error` IS observable for a deadline-
@@ -2515,7 +2535,7 @@ pub(super) async fn report_terminated_pods(
         // This filter eliminates the wasted RPCs and the race.
         if !matches!(
             reason,
-            TerminationReason::OomKilled | TerminationReason::EvictedDiskPressure
+            A::OomKilled | A::EvictedDiskPressure | A::EvictedEmptyDirSizeLimit
         ) {
             continue;
         }
@@ -2546,7 +2566,7 @@ pub(super) async fn report_terminated_pods(
                 intent_id,
                 job_name: name.to_owned(),
                 exec_id,
-                reason: unified_attempt_reason(reason).into(),
+                reason: reason.into(),
                 node_name,
             },
         ))
@@ -2584,9 +2604,19 @@ pub(super) async fn report_terminated_pods(
                         epoch_now_secs(),
                     )
                 {
+                    // sh-039: `reason` is the wire-side
+                    // `AttemptTerminalReason` (split letter included);
+                    // route the label straight through the shared
+                    // vocabulary so the OA1 series gains the
+                    // `evicted_empty_dir_size_limit` row alongside the
+                    // node-condition `evicted_disk_pressure` one.
+                    // Parity holds (`termination_reason_label_parity_
+                    // with_scheduler` checks the shared-reason set).
                     metrics::histogram!(
                         "rio_controller_job_terminal_report_seconds",
-                        "reason" => termination_reason_label(reason)
+                        "reason" => rio_common::classify::attempt_terminal_reason_label(
+                            reason.into()
+                        )
                     )
                     .record(latency);
                 }
@@ -3050,6 +3080,28 @@ mod tests {
             )),
             TerminationReason::EvictedDiskPressure
         );
+        // sh-039 wire-side: the emptyDir-sizeLimit eviction (the live
+        // incident's "overlays … 40265318400" grammar verbatim) goes
+        // over the wire as the split letter so the scheduler promotes
+        // the disk floor; node-condition stays EvictedDiskPressure.
+        use rio_proto::types::AttemptTerminalReason as A;
+        assert_eq!(
+            pod_attempt_terminal_reason(&pod_evicted(
+                "Usage of EmptyDir volume \"overlays\" exceeds the limit \
+                 \"40265318400\". "
+            )),
+            A::EvictedEmptyDirSizeLimit
+        );
+        assert_eq!(
+            pod_attempt_terminal_reason(&pod_evicted(
+                "The node was low on resource: ephemeral-storage."
+            )),
+            A::EvictedDiskPressure
+        );
+        assert_eq!(
+            pod_attempt_terminal_reason(&pod_with_term("OOMKilled")),
+            A::OomKilled
+        );
         // MemoryPressure eviction (node-level, NOT a per-drv signal).
         assert_eq!(
             pod_termination_reason(&pod_evicted("The node was low on resource: memory.")),
@@ -3217,22 +3269,37 @@ mod tests {
             }),
             ..Default::default()
         };
+        use rio_proto::types::AttemptTerminalReason as A;
         for (msg, attributed) in UPSTREAM_FORMATS {
             assert_eq!(
                 eviction_is_pod_attributed(msg),
                 attributed,
                 "upstream format classification: {msg}"
             );
-            // W13-D2: the WIRE fold is unchanged for every disk shape
-            // (the carrier has no split value — the zero-wire ledger;
-            // the recorded conditional DID NOT FIRE: grammar 3 routes
-            // through the same controller-local classifier and the
-            // same EvictedDiskPressure fold as grammars 1-2, no
-            // wire-carried value needed).
+            // W13-D2: the WORKER-PROTO fold is unchanged for every
+            // disk shape (`TerminationReason` has no split value —
+            // Q2: one wire change, not two): grammar 3 routes through
+            // the same controller-local classifier and the same
+            // EvictedDiskPressure fold as grammars 1-2.
             assert_eq!(
                 pod_termination_reason(&pod(msg)),
                 TerminationReason::EvictedDiskPressure,
-                "wire fold preserved for: {msg}"
+                "worker-proto fold preserved for: {msg}"
+            );
+            // sh-039 wire split — BOTH faces pinned (the I-199
+            // inverse guard: a needle widening that captures a
+            // node-condition format must red here): the three
+            // pod-attributed grammars go over the wire as the split
+            // letter; the two node-condition formats stay
+            // EvictedDiskPressure.
+            assert_eq!(
+                pod_attempt_terminal_reason(&pod(msg)),
+                if attributed {
+                    A::EvictedEmptyDirSizeLimit
+                } else {
+                    A::EvictedDiskPressure
+                },
+                "wire split for: {msg}"
             );
         }
         assert_eq!(

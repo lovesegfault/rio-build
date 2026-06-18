@@ -307,6 +307,7 @@ impl From<types::AttemptTerminalReason> for rio_common::classify::AttemptTermina
             R::Preempted => K::Preempted,
             R::Reaped => K::Reaped,
             R::NoEligibleSource => K::NoEligibleSource,
+            R::EvictedEmptyDirSizeLimit => K::EvictedEmptyDirSizeLimit,
         }
     }
 }
