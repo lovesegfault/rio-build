@@ -280,7 +280,7 @@ fn pool_fetcher_forbids_fuse_cache_bytes() {
 // `!('rio.build/fetcher' in self.nodeSelector)` disjunct is
 // vacuously true client-side and the rule never fires.
 //
-// Tracked upstream as kube-rs/kube-cel#54. The asserts below pin
+// Tracked upstream as kube-rs/kube-cel#8. The asserts below pin
 // the current (wrong) behavior so that when kube-cel fixes the gap
 // the test FAILS and prompts swapping to the real negative-case
 // assertions kept inline. The string-grep test
@@ -295,7 +295,7 @@ fn pool_fetcher_node_selector_reconciler_owned() {
         "false".into(),
     )]));
     let res = validate_cel(&Pool::new("p", s));
-    // TODO(kube-rs/kube-cel#54): once kube-cel stops escaping
+    // TODO(kube-rs/kube-cel#8): once kube-cel stops escaping
     // additionalProperties keys, replace with:
     //   assert_one(expect_err(res, "Fetcher nodeSelector"),
     //     "kind=Fetcher: nodeSelector['rio.build/fetcher'] is reconciler-owned");
@@ -314,7 +314,7 @@ fn pool_builder_forbids_fetcher_node_selector() {
         "true".into(),
     )]));
     let res = validate_cel(&Pool::new("p", s));
-    // TODO(kube-rs/kube-cel#54): once kube-cel stops escaping
+    // TODO(kube-rs/kube-cel#8): once kube-cel stops escaping
     // additionalProperties keys, replace with:
     //   assert_one(expect_err(res, "Builder nodeSelector"),
     //     "kind=Builder forbids nodeSelector['rio.build/fetcher']");
