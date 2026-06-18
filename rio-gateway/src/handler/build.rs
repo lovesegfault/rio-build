@@ -827,7 +827,7 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             // reused aid in either order, and neither line
             // contradicts the other (one is the attempt's local
             // outcome; one is the scheduler's re-dispatch decision).
-            if let Some(p) = drv_event.predecessor.as_ref().filter(|_| !already_tracking) {
+            if !already_tracking && let Some(p) = drv_event.predecessor.as_ref() {
                 let line = retry_marker_line(p);
                 relay_log_batch(
                     stderr,
@@ -1406,7 +1406,10 @@ async fn apply_snapshot<W: AsyncWrite + Unpin>(
                 }
             }
             _ => {
-                tails.on_started(drv, exec_id);
+                // Snapshot-reconcile carries no `predecessor`, so the
+                // marker gate is moot here; `let _ =` silences the
+                // `#[must_use]` (sh-042-r2).
+                let _ = tails.on_started(drv, exec_id);
                 // Kind flip while detached (substitute fell through to
                 // a build): the authority closes the dangling pair.
                 flip_to_family(

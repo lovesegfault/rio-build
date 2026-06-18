@@ -34,9 +34,6 @@ use super::DagActor;
 /// reason is not yet established, or across a poison-clear cycle
 /// boundary.
 ///
-/// The rfind predicate is the STRUCTURAL key (newest build-kind
-/// attempt of THIS resubmit cycle that has an exec_id);
-/// `termination_reason.is_some()` is a SEPARATE post-`.filter()` so a
 /// The rfind predicate is the STRUCTURAL key — `event_kind ==
 /// Attempt && exec_id.is_some() && resubmit_cycle == cycle` — and the
 /// CONTENT guards (`attempt_kind == Build`, `termination_reason`)
@@ -1064,18 +1061,9 @@ impl DagActor {
             ),
             None => (String::new(), None),
         };
-        let event = match predecessor {
-            Some(p) => rio_proto::types::DerivationEvent::started_with_predecessor(
-                drv_path,
-                executor_id.to_string(),
-                exec_id,
-                p,
-            ),
-            None => rio_proto::types::DerivationEvent::started(
-                drv_path,
-                executor_id.to_string(),
-                exec_id,
-            ),
+        let event = rio_proto::types::DerivationEvent {
+            predecessor,
+            ..rio_proto::types::DerivationEvent::started(drv_path, executor_id.to_string(), exec_id)
         };
         for build_id in self.get_interested_builds(drv_hash) {
             self.events.emit(

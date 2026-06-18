@@ -88,7 +88,8 @@ mod tests {
 /// Crate-neutral mirror of the wire `AttemptTerminalReason` alphabet
 /// (`rio-proto` depends on `rio-common`, so the proto enum cannot
 /// appear here; the exhaustive `From` impl lives next to the enum).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(strum::EnumIter))]
 pub enum AttemptTerminalKind {
     /// Wire zero value — reason not stated.
     Unspecified,
@@ -191,9 +192,13 @@ pub fn attempt_terminal_reason_human(label: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod label_tests {
     use super::*;
+    use strum::IntoEnumIterator;
 
     /// The canonical strings are load-bearing (persisted rows join on
-    /// them); pin the full alphabet.
+    /// them); pin the full alphabet. The `iter().count()` guard
+    /// (sh-042-r2) makes the hand-typed array exhaustive over the enum
+    /// — same source as `human_alphabet_pinned` so a 13th variant
+    /// fails BOTH pin tests, not just one.
     #[test]
     fn label_alphabet_pinned() {
         let all = [
@@ -216,6 +221,7 @@ mod label_tests {
             (AttemptTerminalKind::Reaped, "reaped"),
             (AttemptTerminalKind::NoEligibleSource, "no_eligible_source"),
         ];
+        assert_eq!(all.len(), AttemptTerminalKind::iter().count());
         for (kind, label) in all {
             assert_eq!(attempt_terminal_reason_label(kind), label);
         }
@@ -233,7 +239,6 @@ mod label_tests {
     #[test]
     fn human_alphabet_pinned() {
         use std::collections::HashMap;
-        use strum::IntoEnumIterator;
         let pinned: HashMap<&str, &str> = HashMap::from([
             (
                 "evicted_empty_dir_size_limit",
@@ -252,6 +257,11 @@ mod label_tests {
             ("unspecified", "unspecified"),
             ("no_eligible_source", "no_eligible_source"),
         ]);
+        // Bidirectional pin (sh-042-r2): the loop below proves "every
+        // enum variant has a pinned row"; this proves "every pinned
+        // row is reachable via some variant's label" — a stale entry
+        // or a label-collision orphan fails here.
+        assert_eq!(pinned.len(), AttemptTerminalKind::iter().count());
         for kind in AttemptTerminalKind::iter() {
             let label = attempt_terminal_reason_label(kind);
             let want = pinned

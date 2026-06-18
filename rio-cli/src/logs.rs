@@ -65,14 +65,15 @@ pub(crate) async fn run(client: &mut LogsClient, a: Args) -> anyhow::Result<()> 
     // empty as absent for both the header insert and the NotFound
     // hint below — an empty `TENANT_TOKEN_HEADER` is a valid http
     // HeaderValue but never a usable JWT.
-    let token_set = a.tenant_token.as_deref().is_some_and(|s| !s.is_empty());
+    let token = a.tenant_token.as_deref().filter(|s| !s.is_empty());
+    let token_set = token.is_some();
     let mut request = tonic::Request::new(TailLogRequest {
         derivation: a.drv_path,
         exec_id: a.exec_id.unwrap_or_default(),
         since_line: 0,
         follow: false,
     });
-    if let Some(token) = a.tenant_token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(token) = token {
         request.metadata_mut().insert(
             rio_proto::TENANT_TOKEN_HEADER,
             token

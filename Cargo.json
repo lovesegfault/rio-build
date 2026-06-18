@@ -19722,10 +19722,6 @@
           "packageId": "serde_json"
         },
         {
-          "name": "strum",
-          "packageId": "strum"
-        },
-        {
           "name": "thiserror",
           "packageId": "thiserror"
         },
@@ -19778,6 +19774,10 @@
         {
           "name": "proptest",
           "packageId": "proptest"
+        },
+        {
+          "name": "strum",
+          "packageId": "strum"
         },
         {
           "name": "tempfile",

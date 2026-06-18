@@ -2469,7 +2469,7 @@ in
         # phrases (legitimately appear in code as historical context);
         # deny_cross adds case/separator variants needed for nix/infra
         # that would FP docs' "Squid FOD proxy is deleted" prose.
-        deny_shared='\bBuilderPool\b|\bFetcherPools?\b|rio-cli bps\b|`bps`|vm-lifecycle-bps|RIO_TLS__|\bTlsError\b|rio-common/src/tls\.rs|load_client_tls|init_client_tls|spec\.sizing|Sizing::|fuseCacheBudget|logBudget|migration-lock mechanism|trigger-gc|--grace-period-hours|mTLS client[- ]cert|mTLS cert mount|mTLS main port|VMs: mTLS|plaintext-health listener|TLS and plaintext ports|mTLS bypass|mTLS-identified|mTLS identifies|falls? back to mTLS|mTLS peer cert|\bplaintext port\b|CN-allowlist\)|\(gateway cert|dev-mode/dev-mode|TLS is env-only|\bTLS init\b|without relying on service tokens|replacement for the service-HMAC|RIO_JWT_SIGNING_KEY_PATH|rio\.jwt(Verify|Sign)Env|worker\.seccomp|`tls` / `metrics_addr`|\brio-worker\b|\bReadyQueue\b|\bpush_ready\b|\bqueue_priority\b|\bINTERACTIVE_BOOST\b|\bseed_ready_queue\b|\brearm_materialization_job\b|\btrim_chunk\b|\bDEFAULT_PEER_URL_TEMPLATE\b|\btick_publish_gauges\b|\bpull_attempt_seen_open\b|\bclosure_vouched\b|\bFencedWrite\b|\brollback_assignment\b|\bCOLLECT_CURSOR\b|\bCOLLECT_BACKLOG_ESTIMATE\b|rio_scheduler_workers_active|rio_scheduler_queue_depth|rio-scheduler/src/logs/|store-side 4096|[Tt]emplate brackets \\{pod\\}|Bracketed for v6-only|\bfold_tenant_reprobes\b|\bfresh_mint_allowance\b|\bSTEAL_SPECULATION_ALLOWANCE\b|\bfresh_mint_headroom\b|\bMaterializeTransport\b|\brio_scheduler_sla_class_ceiling_uncatalogued\b|\b00-estimator-refresh\b'
+        deny_shared='\bBuilderPool\b|\bFetcherPools?\b|rio-cli bps\b|`bps`|vm-lifecycle-bps|RIO_TLS__|\bTlsError\b|rio-common/src/tls\.rs|load_client_tls|init_client_tls|spec\.sizing|Sizing::|fuseCacheBudget|logBudget|migration-lock mechanism|trigger-gc|--grace-period-hours|mTLS client[- ]cert|mTLS cert mount|mTLS main port|VMs: mTLS|plaintext-health listener|TLS and plaintext ports|mTLS bypass|mTLS-identified|mTLS identifies|falls? back to mTLS|mTLS peer cert|\bplaintext port\b|CN-allowlist\)|\(gateway cert|dev-mode/dev-mode|TLS is env-only|\bTLS init\b|without relying on service tokens|replacement for the service-HMAC|RIO_JWT_SIGNING_KEY_PATH|rio\.jwt(Verify|Sign)Env|worker\.seccomp|`tls` / `metrics_addr`|\brio-worker\b|\bReadyQueue\b|\bpush_ready\b|\bqueue_priority\b|\bINTERACTIVE_BOOST\b|\bseed_ready_queue\b|\brearm_materialization_job\b|\btrim_chunk\b|\bDEFAULT_PEER_URL_TEMPLATE\b|\btick_publish_gauges\b|\bpull_attempt_seen_open\b|\bclosure_vouched\b|\bFencedWrite\b|\brollback_assignment\b|\bCOLLECT_CURSOR\b|\bCOLLECT_BACKLOG_ESTIMATE\b|rio_scheduler_workers_active|rio_scheduler_queue_depth|rio-scheduler/src/logs/|store-side 4096|[Tt]emplate brackets \\{pod\\}|Bracketed for v6-only|\bfold_tenant_reprobes\b|\bfresh_mint_allowance\b|\bSTEAL_SPECULATION_ALLOWANCE\b|\bfresh_mint_headroom\b|\bMaterializeTransport\b|\brio_scheduler_sla_class_ceiling_uncatalogued\b|\b00-estimator-refresh\b|\bFloorAxis\b|\baxis_for_reason_label\b'
         deny_docs="$deny_shared|\bmTLS\b|fod-proxy|bundled into the scheduler|kubectl exec deploy/rio-scheduler -- rio-cli"
         deny_cross="$deny_shared|[Ff][Oo][Dd][- ]proxy"
         # builder.typ's "Formerly `rio-worker`" info-box is the rename
@@ -2481,9 +2481,11 @@ in
         # crossSrc allowlist: pool.rs:4-11 explains the BuilderPool→Pool
         # consolidation (legitimate history); flake.nix "Before this
         # assert, vm-lifecycle-bps-k3s and vm-fod-proxy-k3s" is
-        # legitimate history; misc-checks.nix is the lint itself.
+        # legitimate history; actor/tests/dispatch.rs records the
+        # FloorAxis pass-through inlining (sh-042-r1); misc-checks.nix
+        # is the lint itself.
         if grep -rn -E "$deny_cross" $crossSrc \
-             | grep -vE 'rio-crds/src/pool\.rs:([4-9]|1[01]):|flake\.nix:.*Before this assert|misc-checks\.nix|actor/tests/misc\.rs:.*workers_active'; then
+             | grep -vE 'rio-crds/src/pool\.rs:([4-9]|1[01]):|flake\.nix:.*Before this assert|misc-checks\.nix|actor/tests/misc\.rs:.*workers_active|actor/tests/dispatch\.rs:.*pass-through .FloorAxis'; then
           echo "FAIL: retired identifier in non-doc source" >&2
           fail=1
         fi
