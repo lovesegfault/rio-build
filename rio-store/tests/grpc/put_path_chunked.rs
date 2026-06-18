@@ -280,7 +280,9 @@ async fn happy_path_commits_and_roundtrips() -> TestResult {
 
 // r[verify store.put.idempotent]
 /// Re-uploading an already-complete output returns `created = [false]`
-/// and does not double the directory refcounts.
+/// and does not double the directory refcounts. (`directories.refcount`
+/// survives — it is the castore DAG's per-digest reference count, NOT
+/// the dropped `chunks.refcount`; the collect cycle does not manage it.)
 #[tokio::test]
 async fn idempotent_reupload_skips_and_keeps_refcounts() -> TestResult {
     let (mut s, _backend) = StoreSession::new_chunked().await?;
@@ -297,7 +299,7 @@ async fn idempotent_reupload_skips_and_keeps_refcounts() -> TestResult {
     let dir_refs: Vec<i64> = sqlx::query_scalar("SELECT refcount::bigint FROM directories")
         .fetch_all(&s.db.pool)
         .await?;
-    let chunk_refs: i64 = count(&s.db.pool, "SELECT COALESCE(SUM(refcount),0) FROM chunks").await;
+    let chunk_rows: i64 = count(&s.db.pool, "SELECT COUNT(*) FROM chunks").await;
 
     let created = send_chunked(&mut s.client, begin, frames, None).await?;
     assert_eq!(created, vec![false], "second upload is an idempotent skip");
@@ -306,9 +308,12 @@ async fn idempotent_reupload_skips_and_keeps_refcounts() -> TestResult {
         .fetch_all(&s.db.pool)
         .await?;
     assert_eq!(dir_refs, dir_refs_after, "directory refcounts unchanged");
-    let chunk_refs_after: i64 =
-        count(&s.db.pool, "SELECT COALESCE(SUM(refcount),0) FROM chunks").await;
-    assert_eq!(chunk_refs, chunk_refs_after, "chunk refcounts unchanged");
+    let chunk_rows_after: i64 = count(&s.db.pool, "SELECT COUNT(*) FROM chunks").await;
+    assert_eq!(
+        chunk_rows, chunk_rows_after,
+        "chunk row set unchanged (mark-and-sweep liveness is re-derived from \
+         manifest_data; an idempotent skip writes no new manifest_data)"
+    );
     Ok(())
 }
 
@@ -483,7 +488,8 @@ async fn protocol_violations_rejected() -> TestResult {
 
 /// Cross-upload dedup: path B shares a chunk with already-committed
 /// path A. B's `novel` excludes the shared digest and its stream sends
-/// only the truly-novel chunks; the shared chunk's refcount reaches 2.
+/// only the truly-novel chunks; the shared chunk stays live and durable
+/// under both manifests (the collect cycle re-derives the dual reference).
 #[tokio::test]
 async fn dedup_shares_chunks_across_uploads() -> TestResult {
     let (mut s, backend) = StoreSession::new_chunked().await?;
@@ -527,11 +533,16 @@ async fn dedup_shares_chunks_across_uploads() -> TestResult {
         backend_after_a + 1,
         "B uploads only its truly-novel chunk"
     );
-    let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
-        .bind(shared_digest.as_slice())
-        .fetch_one(&s.db.pool)
-        .await?;
-    assert_eq!(rc, 2, "shared chunk referenced by both manifests");
+    let (durable, deleted): (bool, bool) =
+        sqlx::query_as("SELECT durable, deleted FROM chunks WHERE blake3_hash = $1")
+            .bind(shared_digest.as_slice())
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert!(
+        durable && !deleted,
+        "shared chunk live and durable under both manifests (collect cycle \
+         derives the dual reference from manifest_data)"
+    );
     Ok(())
 }
 
@@ -563,10 +574,6 @@ async fn partial_skip_with_skipped_only_novel_chunk_commits() -> TestResult {
         vec![true]
     );
     let skipped_only_digest = *blake3::hash(b"content unique to output one").as_bytes();
-    let rc_before: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
-        .bind(skipped_only_digest.as_slice())
-        .fetch_one(&s.db.pool)
-        .await?;
 
     // The "loser" builder computed its Begin before the winner's commit:
     // both outputs, every chunk listed as novel (nothing marked
@@ -585,19 +592,16 @@ async fn partial_skip_with_skipped_only_novel_chunk_commits() -> TestResult {
         "output 1 idempotent-skips, output 2 commits"
     );
 
-    // The skipped-only chunk keeps its single refcount (the skip must
-    // not double-count) and stays S3-confirmed; output 2's chunks are
-    // durable via its freshly-committed manifest.
-    let (rc_after, uploaded, durable): (i32, bool, bool) = sqlx::query_as(
-        "SELECT refcount, uploaded_at IS NOT NULL, durable FROM chunks WHERE blake3_hash = $1",
+    // The skipped-only chunk stays S3-confirmed and durable; output 2's
+    // chunks are durable via its freshly-committed manifest. (Under
+    // mark-and-sweep there is no per-manifest count to assert against —
+    // liveness is re-derived from `manifest_data` at collect time.)
+    let (uploaded, durable): (bool, bool) = sqlx::query_as(
+        "SELECT uploaded_at IS NOT NULL, durable FROM chunks WHERE blake3_hash = $1",
     )
     .bind(skipped_only_digest.as_slice())
     .fetch_one(&s.db.pool)
     .await?;
-    assert_eq!(
-        rc_after, rc_before,
-        "idempotent skip must not bump refcounts"
-    );
     assert!(uploaded, "the skipped-only novel chunk is S3-confirmed");
     assert!(durable, "still referenced by output 1's complete manifest");
     let b_digest = *blake3::hash(b"content unique to output two").as_bytes();
@@ -635,16 +639,17 @@ async fn gc_claimed_chunk_aborts_commit_unavailable() -> TestResult {
         vec![true]
     );
 
-    // Simulate the GC: A's manifest is collected and the sweep claims
-    // the now-refcount-0 chunk for the drain. The S3 object is still
-    // in the backend (the drain hasn't run yet) — exactly the window
-    // where trusting the builder's HasChunks-era view would commit a
-    // manifest whose object is about to disappear.
+    // Simulate the GC: A's manifest is collected and the collect cycle
+    // soft-deletes the now-unreferenced chunk for the drain. The S3
+    // object is still in the backend (the drain hasn't run yet) —
+    // exactly the window where trusting the builder's HasChunks-era
+    // view would commit a manifest whose object is about to disappear.
     sqlx::query("DELETE FROM narinfo")
         .execute(&s.db.pool)
         .await?;
     sqlx::query(
-        "UPDATE chunks SET refcount = 0, deleted = TRUE, uploaded_at = NULL, durable = FALSE",
+        "UPDATE chunks SET deleted = TRUE, deleted_at = now(), \
+         uploaded_at = NULL, durable = FALSE",
     )
     .execute(&s.db.pool)
     .await?;

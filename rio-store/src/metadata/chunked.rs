@@ -327,31 +327,32 @@ async fn complete_manifest_chunked_attempt(
 
 /// Write-ahead `chunks` rows for `PutPathChunked` (ADR-022 §6.2):
 /// every digest the builder is about to stream gets a
-/// `refcount = 0, uploaded_at = NULL, durable = FALSE` row **before**
-/// the first S3 `PutObject`. This row is what makes a crash-orphaned
-/// S3 object findable by the `r[store.chunk.grace-ttl]` sweep; without
-/// it, a verify task that dies between `backend.put` and the commit
-/// transaction leaves S3 objects no GC pass can enumerate.
+/// `uploaded_at = NULL, durable = FALSE` row **before** the first S3
+/// `PutObject`. This row is what makes a crash-orphaned S3 object
+/// findable by the collect cycle; without it, a verify task that dies
+/// between `backend.put` and the commit transaction leaves S3 objects
+/// no GC pass can enumerate.
 ///
-/// Refcounts are NOT bumped here — that happens in the commit
-/// transaction, per referencing output. A pre-existing **refcount-0**
-/// row (left by a prior failed attempt, or claimed by the GC sweep
-/// between the builder's `HasChunks` probe and now) gets its grace
-/// clock restarted and its `deleted` mark cleared: the upload is about
-/// to re-PUT the object, and clearing `deleted` makes the drain's
-/// re-check skip the pending S3 delete instead of racing the new
-/// `PutObject`. Rows with `refcount > 0` are live under another
-/// manifest and are left alone. Hashes are sorted ascending before
-/// binding (`r[store.chunk.lock-order+2]`).
+/// Liveness is NOT established here — the collect cycle's mark phase
+/// derives that from `manifest_data` references after the commit
+/// transaction lands. A pre-existing row (left by a prior failed
+/// attempt, or soft-deleted by the collect cycle between the builder's
+/// `HasChunks` probe and now) gets its `last_referenced_at` touched
+/// and its `deleted` mark cleared: the upload is about to re-PUT the
+/// object, and clearing `deleted` makes the drain's re-check skip the
+/// pending S3 delete instead of racing the new `PutObject`. Hashes are
+/// sorted ascending before binding (`r[store.chunk.lock-order+2]`).
 ///
-/// The grace clock is NOT refreshed again during the verify walk, so
-/// an upload that takes longer than `CHUNK_GRACE_SECS` and straddles a
-/// sweep run finds its rows re-claimed at commit time and aborts
-/// `UNAVAILABLE` (see [`lock_chunks_for_commit`]) — a retryable error,
-/// not corruption.
-// TODO: fold a `chunks.created_at = now()` refresh for the pending set
-// into the placeholder guard's heartbeat so a >CHUNK_GRACE_SECS upload
-// cannot collide with the orphan sweep at all.
+/// The `last_referenced_at` touch keeps the row inside the collect
+/// cycle's grace term (same window as the [`upgrade_manifest_to_chunked`]
+/// upsert). It is NOT refreshed again during the verify walk, so an
+/// upload that outlives the grace term and straddles a collect run
+/// finds its rows re-claimed at commit time and aborts `UNAVAILABLE`
+/// (see [`lock_chunks_for_commit`]) — a retryable error, not
+/// corruption.
+// TODO: fold a `chunks.last_referenced_at = now()` refresh for the
+// pending set into the placeholder guard's heartbeat so a long upload
+// cannot collide with the collect cycle at all.
 // r[impl store.put.wal-manifest]
 #[instrument(skip(pool, chunks), fields(count = chunks.len()))]
 pub(crate) async fn insert_pending_chunks(pool: &PgPool, chunks: &[([u8; 32], u32)]) -> Result<()> {
@@ -366,11 +367,10 @@ pub(crate) async fn insert_pending_chunks(pool: &PgPool, chunks: &[([u8; 32], u3
         .unzip();
     sqlx::query(
         r#"
-        INSERT INTO chunks (blake3_hash, refcount, size)
-        SELECT u.hash, 0, u.size FROM UNNEST($1::bytea[], $2::bigint[]) AS u(hash, size)
+        INSERT INTO chunks (blake3_hash, size)
+        SELECT u.hash, u.size FROM UNNEST($1::bytea[], $2::bigint[]) AS u(hash, size)
         ON CONFLICT (blake3_hash) DO UPDATE
-            SET deleted = FALSE, created_at = now()
-            WHERE chunks.refcount = 0
+            SET deleted = FALSE, deleted_at = NULL, last_referenced_at = now()
         "#,
     )
     .bind(&hashes)
@@ -442,7 +442,7 @@ pub(crate) async fn chunk_lists_for_paths(
 ///
 /// Run FIRST in the commit transaction. This is THE lock-acquisition
 /// helper for `chunks` rows in commit transactions — every later
-/// statement in the same transaction (refcount UPSERTs, the `durable`
+/// statement in the same transaction (the chunk upsert, the `durable`
 /// flip in `mark_manifest_chunks_durable`,
 /// `mark_chunks_uploaded_in_conn`) must only touch rows this call
 /// already locked, which is why it takes the COMPLETE set: `digests`
@@ -579,22 +579,22 @@ pub(crate) async fn lock_staged_chunks_for_commit(
 }
 
 /// Commit one `PutPathChunked` output inside the caller's transaction:
-/// `manifest_data` insert, chunk refcount bump, then the status flip,
-/// narinfo, castore index, and `path_tenants` junction via
+/// `manifest_data` insert, chunk upsert (resurrect + touch
+/// `last_referenced_at`), then the status flip, narinfo, castore
+/// index, and `path_tenants` junction via
 /// [`super::complete_manifest_in_conn`].
 ///
 /// Ordering matters: `complete_manifest_in_conn`'s
 /// `mark_manifest_chunks_durable` reads `manifest_data.chunk_list`
 /// for this path, so the `manifest_data` insert MUST precede it in the
-/// same transaction. The refcount bump precedes the durable flip for
+/// same transaction. The chunk upsert precedes the durable flip for
 /// the same reason every other writer's does: `durable = TRUE` asserts
 /// "some complete manifest references this chunk", which is only true
-/// once the refcount reflects that reference.
+/// once `manifest_data` reflects that reference and the chunk row is
+/// inside the collect cycle's grace term.
 ///
 /// `chunk_hashes`/`chunk_sizes` are the output's **distinct** digests
-/// (one refcount per unique chunk per manifest, matching the GC
-/// decrement) and MUST be pre-sorted ascending
-/// (`r[store.chunk.lock-order+2]`).
+/// and MUST be pre-sorted ascending (`r[store.chunk.lock-order+2]`).
 // r[impl store.chunk.refcount-txn+2]
 // r[impl store.put.tenant-junction]
 #[allow(clippy::too_many_arguments)]
@@ -627,20 +627,22 @@ pub(crate) async fn commit_chunked_output_in_conn(
 
     // Same UNNEST upsert shape as `upgrade_manifest_to_chunked`, minus
     // the `RETURNING needs_upload` (the §6.3 verify walk already
-    // decided what to upload from `Begin.novel`). `deleted = false`
-    // resurrects a chunk the GC sweep marked between the builder's
-    // HasChunks probe and now.
+    // decided what to upload from `Begin.novel`). `deleted = false` +
+    // `deleted_at = NULL` resurrects a chunk the collect cycle
+    // soft-deleted between the builder's HasChunks probe and now;
+    // `last_referenced_at = now()` keeps it inside the cycle's grace
+    // term until the mark phase sees the `manifest_data` row this
+    // transaction is committing.
     if !chunk_hashes.is_empty() {
         sqlx::query(
             r#"
-            INSERT INTO chunks (blake3_hash, refcount, size)
-            SELECT * FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[]) AS t(hash, one, size)
+            INSERT INTO chunks (blake3_hash, size)
+            SELECT * FROM UNNEST($1::bytea[], $2::bigint[]) AS t(hash, size)
             ON CONFLICT (blake3_hash) DO UPDATE
-                SET refcount = chunks.refcount + 1, deleted = false
+                SET deleted = false, deleted_at = NULL, last_referenced_at = now()
             "#,
         )
         .bind(chunk_hashes)
-        .bind(vec![1i64; chunk_hashes.len()])
         .bind(chunk_sizes)
         .execute(&mut *conn)
         .await?;
@@ -782,8 +784,8 @@ mod tests {
             (&ours, false, false),
         ] {
             sqlx::query(
-                "INSERT INTO chunks (blake3_hash, refcount, size, deleted, uploaded_at) \
-                 VALUES ($1, 0, 64, $2, CASE WHEN $3 THEN now() END)",
+                "INSERT INTO chunks (blake3_hash, size, deleted, uploaded_at) \
+                 VALUES ($1, 64, $2, CASE WHEN $3 THEN now() END)",
             )
             .bind(hash)
             .bind(deleted)
@@ -852,7 +854,7 @@ mod tests {
         let manifest_digest = [0x0Du8; 32]; // referenced by a non-skipped output
         let uploaded_only = [0x0Cu8; 32]; // PUT by this stream; skipped-output only
         for hash in [&manifest_digest, &uploaded_only] {
-            sqlx::query("INSERT INTO chunks (blake3_hash, refcount, size) VALUES ($1, 0, 64)")
+            sqlx::query("INSERT INTO chunks (blake3_hash, size) VALUES ($1, 64)")
                 .bind(hash.as_slice())
                 .execute(&db.pool)
                 .await
@@ -903,8 +905,8 @@ mod tests {
         let chunk_y = [0x23u8; 32];
         for hash in [&chunk_w, &chunk_x, &chunk_y] {
             sqlx::query(
-                "INSERT INTO chunks (blake3_hash, refcount, size, uploaded_at) \
-                 VALUES ($1, 1, 64, now())",
+                "INSERT INTO chunks (blake3_hash, size, uploaded_at) \
+                 VALUES ($1, 64, now())",
             )
             .bind(hash.as_slice())
             .execute(&db.pool)
@@ -963,12 +965,15 @@ mod tests {
         );
     }
 
-    /// `insert_pending_chunks` must restart the grace clock and clear a
-    /// GC claim on a refcount-0 row it is about to re-upload — without
-    /// that, a retry of a swept upload re-PUTs the S3 object but leaves
-    /// the row `deleted = TRUE`, so the commit-time presence check can
-    /// never pass and the upload livelocks. A live (refcount > 0) row
-    /// is left alone.
+    /// `insert_pending_chunks` must clear a collect-cycle soft-delete
+    /// and touch `last_referenced_at` on a row it is about to
+    /// re-upload — without that, a retry of a swept upload re-PUTs the
+    /// S3 object but leaves the row `deleted = TRUE`, so the
+    /// commit-time presence check can never pass and the upload
+    /// livelocks. A row already referenced by another manifest is also
+    /// touched (harmless under mark-and-sweep — the next mark phase
+    /// re-derives liveness from `manifest_data`, and the touch keeps
+    /// it inside the grace term until then).
     #[tokio::test]
     async fn insert_pending_chunks_resurrects_swept_rows() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -976,9 +981,9 @@ mod tests {
         let swept = [0x0Au8; 32];
         let live = [0x0Bu8; 32];
         sqlx::query(
-            "INSERT INTO chunks (blake3_hash, refcount, size, deleted, created_at) \
-             VALUES ($1, 0, 64, TRUE, now() - interval '1 hour'), \
-                    ($2, 3, 64, FALSE, now() - interval '1 hour')",
+            "INSERT INTO chunks (blake3_hash, size, deleted, deleted_at, last_referenced_at) \
+             VALUES ($1, 64, TRUE,  now() - interval '1 hour', now() - interval '1 hour'), \
+                    ($2, 64, FALSE, NULL,                      now() - interval '1 hour')",
         )
         .bind(swept.as_slice())
         .bind(live.as_slice())
@@ -990,8 +995,9 @@ mod tests {
             .await
             .unwrap();
 
-        let (deleted, fresh): (bool, bool) = sqlx::query_as(
-            "SELECT deleted, created_at > now() - interval '1 minute' \
+        let (deleted, deleted_at_cleared, fresh): (bool, bool, bool) = sqlx::query_as(
+            "SELECT deleted, deleted_at IS NULL, \
+                    last_referenced_at > now() - interval '1 minute' \
              FROM chunks WHERE blake3_hash = $1",
         )
         .bind(swept.as_slice())
@@ -999,10 +1005,14 @@ mod tests {
         .await
         .unwrap();
         assert!(!deleted, "the GC claim must be cleared for a re-upload");
-        assert!(fresh, "the grace clock must restart for a re-upload");
+        assert!(
+            deleted_at_cleared,
+            "deleted_at must be cleared on resurrect"
+        );
+        assert!(fresh, "last_referenced_at must restart the grace term");
 
         let (live_deleted, live_fresh): (bool, bool) = sqlx::query_as(
-            "SELECT deleted, created_at > now() - interval '1 minute' \
+            "SELECT deleted, last_referenced_at > now() - interval '1 minute' \
              FROM chunks WHERE blake3_hash = $1",
         )
         .bind(live.as_slice())
@@ -1011,8 +1021,10 @@ mod tests {
         .unwrap();
         assert!(!live_deleted);
         assert!(
-            !live_fresh,
-            "a refcount > 0 row is owned by other manifests; leave it alone"
+            live_fresh,
+            "an already-live row is also touched — mark-and-sweep re-derives \
+             liveness from manifest_data, so this is the same defense-in-depth \
+             touch upgrade_manifest_to_chunked applies"
         );
     }
 
@@ -1029,8 +1041,8 @@ mod tests {
         let tombstoned = vec![0xE1u8; 32];
         let live = vec![0xE2u8; 32];
         sqlx::query(
-            "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
-             VALUES ($1, 0, 64, TRUE), ($2, 0, 64, FALSE)",
+            "INSERT INTO chunks (blake3_hash, size, deleted) \
+             VALUES ($1, 64, TRUE), ($2, 64, FALSE)",
         )
         .bind(&tombstoned)
         .bind(&live)
@@ -2256,11 +2268,17 @@ mod tests {
             .await
             .unwrap();
         assert!(durable(&db.pool, &chunk).await, "still durable after B");
-        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
-            .bind(&chunk)
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-        assert_eq!(rc, 2, "refcount unaffected by the durable flip");
+        let (deleted, touched): (bool, bool) = sqlx::query_as(
+            "SELECT deleted, last_referenced_at IS NOT NULL \
+             FROM chunks WHERE blake3_hash = $1",
+        )
+        .bind(&chunk)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            !deleted && touched,
+            "second referencing manifest leaves the chunk row live and touched"
+        );
     }
 }

@@ -695,8 +695,8 @@ async fn seed_chunk_row(
     deleted: bool,
 ) -> TestResult {
     sqlx::query(
-        "INSERT INTO chunks (blake3_hash, refcount, size, durable, deleted) \
-         VALUES ($1, 1, 1024, $2, $3)",
+        "INSERT INTO chunks (blake3_hash, size, durable, deleted) \
+         VALUES ($1, 1024, $2, $3)",
     )
     .bind(hash)
     .bind(durable)

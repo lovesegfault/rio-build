@@ -105,7 +105,7 @@ pub struct Config {
     /// `RIO_DAG_PREFETCH_TIMEOUT_SECS`.
     #[serde(
         rename = "dag_prefetch_timeout_secs",
-        with = "rio_common::config::secs"
+        with = "rio_common::config::secs_bounded"
     )]
     #[schemars(with = "u64")]
     pub dag_prefetch_timeout: std::time::Duration,
