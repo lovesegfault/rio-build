@@ -4328,14 +4328,14 @@ mod proofs {
     /// per-lane cut): the loader-composed theorem itself — `decide()`
     /// and `materialization_decide()` over the LOADED VIEW are
     /// bit-identical before and after any structural sweep. Folds
-    /// decide() twice at MAX=4 (~2× check_decide_contract); documented
-    /// fallback if it ever exceeds the gate budget: shrink to MAX=3 and
-    /// record the measurement (the exhaustive unit test keeps the
-    /// len<=4 equivalence machine-checked under every cfg regardless).
+    /// decide() twice; MAX=3 since sh-031b's `ComputeBoundAtCap`
+    /// poison-reason variant pushed the MAX=4 fold past the 3600s gate
+    /// budget (>3116s solo, was ~480s). The exhaustive unit test keeps
+    /// the len<=4 equivalence machine-checked under every cfg.
     #[kani::proof]
-    #[kani::unwind(7)]
+    #[kani::unwind(6)]
     fn check_sweep_decide_invariant() {
-        const MAX: usize = 4;
+        const MAX: usize = 3;
         let (rows, n) = any_history::<MAX>();
         let mask: [bool; MAX] = [(); MAX].map(|_| kani::any());
         let mut i = 0;
