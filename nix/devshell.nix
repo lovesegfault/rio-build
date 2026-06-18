@@ -25,30 +25,6 @@
   quintMcp,
 }:
 let
-  # nixpkgs still ships sqlx-cli 0.8.6 while the workspace is on sqlx
-  # 0.9. `cargo sqlx prepare` must match the library major (it drives
-  # the .sqlx/ query cache that sqlx-macros 0.9 consumes, and 0.9
-  # changed nullability inference), so pin 0.9.0 here. Feature set
-  # mirrors the nixpkgs expression. Drop this override — and the
-  # reference below — once nixpkgs ships sqlx-cli ≥ 0.9.
-  sqlxCli =
-    let
-      version = "0.9.0";
-      src = pkgs.fetchCrate {
-        pname = "sqlx-cli";
-        inherit version;
-        hash = "sha256-XariusjsCgn0Qai0XWtr7EzSzDDTp1cCzjff1kJNO9Y=";
-      };
-    in
-    pkgs.sqlx-cli.overrideAttrs (_old: {
-      inherit version src;
-      cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
-        inherit src;
-        name = "sqlx-cli-${version}-vendor";
-        hash = "sha256-pHaMKuB9v3fjbgeVyLyRtfoQ9BkE6z+TjDfdBaVdbXM=";
-      };
-    });
-
   shellPackages = with pkgs; [
     # CI gate driver — `nix-fast-build --flake .#checks.x86_64-linux`
     # streams eval+build (per-attr nix-eval-jobs workers → builds
@@ -137,7 +113,7 @@ let
 
     # Integration test deps
     postgresql_18
-    sqlxCli # `cargo xtask regen sqlx` + `cargo sqlx migrate` (0.9 pin, see above)
+    sqlx-cli # `cargo xtask regen sqlx` + `cargo sqlx migrate`
 
     # Local dev stack (`process-compose up`)
     process-compose
