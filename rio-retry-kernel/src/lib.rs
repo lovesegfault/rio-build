@@ -551,7 +551,7 @@ pub enum AttemptEvent<Id> {
     /// corroborated compute-bound — the
     /// [`PoisonReason::ComputeBoundAtCap`] arm. sh-041u: the E3a
     /// handler stamps `floor_at_cap` from
-    /// `at_cap_axes.contains(Cores)` ONLY (the per-handler narrowing
+    /// `at_cap_axes.contains(Cores)` only (the per-handler narrowing
     /// at the chokepoint-#2 stamp site), so `floor_at_cap` on an
     /// executor-variant ledger row IS the compute-bound-at-cap
     /// signal regardless of mem/disk at-cap — quantifier:

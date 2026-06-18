@@ -1037,7 +1037,6 @@ rio-scheduler/src/actor/completion.rs	// infra cap. It means another builder is 
 rio-scheduler/src/actor/completion.rs	// path, so the placeholder can never be forged.
 rio-scheduler/src/actor/completion.rs	// where ALL outputs are).
 rio-scheduler/src/actor/completion.rs	// worker problem — the SAME worker with a longer deadline
-rio-scheduler/src/actor/completion.rs	/// Called ONLY from explicit per-attempt resource-exhaustion
 rio-scheduler/src/actor/completion.rs	/// EVERY hash in `completed`, dedup the union (a parent may be
 rio-scheduler/src/actor/completion.rs	/// I-170/I-173/I-177/I-199 over-broad heuristic (promote on ANY
 rio-scheduler/src/actor/completion.rs	/// Register payload: the SAME name/shape boundary filters the
@@ -1470,7 +1469,6 @@ rio-scheduler/src/db/live_pins.rs	/// EVERY `.rs` under `rio-scheduler/src`, emb
 rio-scheduler/src/db/live_pins.rs	/// W10-N plant can push a STRAWMAN SOURCE FILE through the SAME
 rio-scheduler/src/db/live_pins.rs	/// registration writers ONLY — the scheduler's realisation-INSERT
 rio-scheduler/src/db/live_pins.rs	/// second SQL body anywhere is an uncensused stamp path (the W9-B
-rio-scheduler/src/db/live_pins.rs	/// sentence arm is struck: an alphabet/ONLY claim takes the machine
 rio-scheduler/src/db/materialization.rs	// created job, in the SAME transaction — the per-job budget
 rio-scheduler/src/db/materialization.rs	/// every interested build is terminal). `pending` jobs are NEVER
 rio-scheduler/src/db/materialization.rs	/// the stale-Completed reset destroyed in memory. `Some` ONLY for

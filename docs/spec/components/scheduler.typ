@@ -3788,7 +3788,7 @@ the SUM of the per-class headrooms, never unbounded).
   establishment_report_slack`) without waiting for the dispatch-deadline
   anchor, and at establishment MUST feed the witnessed reason through the
   per-reason disposition table: witnessed `OOMKilled` (the per-container
-  kubelet `containerStatuses` attribution; `bump_resource_floor`, label
+  kubelet `containerStatuses` attribution; `observe_resource_floor`, label
   `witnessed_oom`) and witnessed `EvictedEmptyDirSizeLimit` (kubelet's
   pod-attributed emptyDir-sizeLimit eviction; label `witnessed_disk`) are
   the TWO promoting letters --- the per-container kubelet attributions ---

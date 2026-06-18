@@ -1238,7 +1238,7 @@ and operational invariants).
   (stamped by the pull mint --- live_040), NOT the doubling base.
   `solve_intent_for` MUST clamp its solved (cores, mem, disk) at
   `resource_floor` before returning, and at `Ceilings.max_{cores,mem,disk}`.
-  Persisted as `derivations.floor_*` (`M_044` + `M_106`) ONLY on
+  Persisted as `derivations.floor_*` (`M_044` + `M_106`) only on
   `hard_promoted` --- soft observations are in-memory only.
 ]
 The controller-reported arm of the previous revision (k8s

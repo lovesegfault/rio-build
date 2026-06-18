@@ -1292,10 +1292,10 @@ impl DagActor {
     /// sh-041u — the unified peak-observe wrapper for `drv_hash`.
     /// Thin wrapper around [`super::floor::observe_peaks`] that
     /// handles the dag-node lookup, metric, log, and best-effort PG
-    /// persist (the M_044 persist gates on `hard_promoted` ONLY —
+    /// persist (the M_044 persist gates on `hard_promoted` only —
     /// soft observations are in-memory only; this leader's tenure).
     ///
-    /// Called on EVERY non-success worker-reported close (chokepoint
+    /// Called on every non-success worker-reported close (chokepoint — quantifier: census(observe_resource_floor_caller_census) —
     /// #2, [`Self::handle_admitted_completion`]), the AD5
     /// SIGTERM-abort short-circuit (chokepoint #3, pull.rs), and the
     /// controller-witnessed establishment lane (chokepoint #4,
@@ -1327,7 +1327,7 @@ impl DagActor {
     /// paid for an oversized pod. Under sh-041u that surface is
     /// closed by `hard_promoted` gating BOTH promotion-exempt and the
     /// M_044 persist — a soft observe (peak × 1.2, in-memory only)
-    /// can never re-create it.
+    /// cannot re-create it.
     pub(super) async fn observe_resource_floor(
         &mut self,
         drv_hash: &DrvHash,
@@ -1387,7 +1387,7 @@ impl DagActor {
                 .increment(1);
             }
             // sh-041u Q1 default: M_044 persist gates on
-            // `hard_promoted` ONLY — soft observations are in-memory
+            // `hard_promoted` only — soft observations are in-memory
             // only (a soft observe can be `target < last_intent`;
             // persisting it via the GREATEST() ratchet would never
             // heal downward, and the SLA fit's pname-keyed p90
@@ -4831,7 +4831,7 @@ impl DagActor {
             row.final_line_count = report.final_line_count;
         }
         // sh-041u: the compute-bound observe ran at chokepoint #2. The
-        // E3a `row.floor_at_cap` narrows to the CORES axis ONLY: the
+        // E3a `row.floor_at_cap` narrows to the cores axis only: the
         // kernel's `Poison(ComputeBoundAtCap)` reads this single bool,
         // and its retired invariant ("cores is the only floor
         // dimension an ExecutorVariant row carries") is FALSE under

@@ -27,7 +27,7 @@ pub(super) struct FailureReportCtx<'a> {
     pub(super) final_line_count: Option<i64>,
     /// Worker-provided error message (may be empty). DISPLAY/NARRATION
     /// ONLY — quantifier: census(forged_free_text_never_moves_resource_floors) — (bug_090): no decision in any failure handler may dispatch
-    /// on this text — sizing classifications ride [`Self::sizing`].
+    /// on this text — sizing observations ride [`super::floor::observe_peaks`].
     pub(super) error_msg: &'a str,
     /// bug_408: `BuildResult.store_degraded` — the builder's FUSE
     /// breaker attributed this infrastructure failure to a degraded

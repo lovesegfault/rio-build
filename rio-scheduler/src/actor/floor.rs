@@ -452,7 +452,7 @@ pub fn observe_peaks(
     // r[impl sched.floor.compute-bound-provisionable]
     // `cpu_util = cpu_seconds / (wall × assigned_cores) ≥ threshold`
     // jumps cores to the partition-aware provisionable max. Fires on
-    // ANY non-success close (the sh-041 case: a compute-bound build
+    // any non-success close (the sh-041 case: a compute-bound build
     // interrupted by spot reclaim reports `WorkerAbort`); a saturated
     // build that exits on its own internal timeout BEFORE the nix
     // deadline corroborates (sh-031: the wall denominator, not the
@@ -660,10 +660,10 @@ pub(super) fn clamp_floor_to_live(f: &mut crate::state::ResourceFloor, ceil: &Ce
 
 /// sh-041u: the canonical per-dimension body — `floor =
 /// max(floor, target).min(cap)`. The ×2 doubling lives in `headroom`
-/// ONLY (the retired `bump_dim` ×2 body is REPLACED, not reused).
+/// alone (the retired `bump_dim` ×2 body is REPLACED, not reused).
 /// Returns `(promoted, at_cap)`: `promoted` iff the floor strictly
 /// grew; `at_cap` iff `target ≥ cap` (so a `target` already at cap
-/// reads as at-cap on the SAME observation, not the next one — a
+/// reads as at-cap on the same observation, not the next one — a
 /// hard-event peak at the dispatched ceiling is "no growth possible").
 ///
 /// merged_bug_016: callers pass the SOLVE-domain mem cap
