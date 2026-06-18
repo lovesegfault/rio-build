@@ -114,6 +114,15 @@
   ),
 )
 
+// Per-page `<meta name="description">` text, keyed by chapter path.
+// Parallel dict (not a 4th tuple field) so the `chapters` shape stays
+// stable for the three other consumers. Most pages omit a description
+// — populate as prose is finalized.
+#let descriptions = (
+  "intro.typ": "rio-build is a multi-tenant remote build service for Nix: a gateway speaking the nix-daemon wire protocol, a scheduler with SLA-driven worker sizing, and a content-addressed store.",
+  "architecture.typ": "System-level architecture of rio-build: component responsibilities, data flow between gateway / scheduler / builder / store, and the trust boundaries each crossing implies.",
+)
+
 #let flatten-chapters(tree, depth: 0) = {
   let out = ()
   for (title, path, children) in tree {
@@ -121,6 +130,19 @@
     out += flatten-chapters(children, depth: depth + 1)
   }
   out
+}
+
+// Ancestor chain root→leaf for breadcrumbs. Returns an array of
+// `(title, path|none)` pairs including the leaf itself; section-heading
+// nodes (path: none) keep their `none` so the caller renders them
+// unlinked. Returns `()` when `target` isn't in the tree.
+#let crumb-trail(tree, target) = {
+  for (title, path, children) in tree {
+    if path == target { return ((title, path),) }
+    let sub = crumb-trail(children, target)
+    if sub.len() > 0 { return ((title, path),) + sub }
+  }
+  ()
 }
 
 #let route-for(path) = {

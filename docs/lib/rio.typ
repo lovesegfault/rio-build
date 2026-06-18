@@ -119,6 +119,18 @@
 // in each output file, while a repeat WITHIN one chapter gets `-2`.
 #let _heading-slugs = state("rio-heading-slugs", (:))
 
+// Per-route heading list for the on-this-page TOC (lib/html/page.typ).
+// `(route: ((id, text, level), ...))`; pushed by the html-mode
+// `show heading:` rule alongside the slug-dedup update. page-shell
+// reads `.final().at(route)`.
+#let _page-toc = state("rio-page-toc", (:))
+
+// Per-route footnote bodies. The html-mode `show footnote:` rule
+// pushes the body and emits a `<sup><a href="#fn-N">` ref; the
+// `<section class="rio-footnotes">` list is emitted after the chapter
+// body (just before the prev/next nav).
+#let _footnotes = state("rio-footnotes", (:))
+
 // Flatten typst content to a plain string (best-effort; drops styling
 // and any leaf without `.text`/`.body`/`.child`/`.children`). Used for
 // slug derivation only — the rendered heading keeps the original
@@ -218,6 +230,17 @@
 
 // Postfix multiplier "4×" without binary-operator spacing.
 #let mul(n) = [#n#h(0pt)×]
+
+// Disclosure block. HTML: native `<details><summary>`. Paged: bold
+// summary line + body (no fold — print has no interaction).
+#let details(summary, open: false, body) = context if is-html() {
+  let attrs = (class: "rio-details")
+  if open { attrs.insert("open", "open") }
+  html.elem("details", attrs: attrs)[
+    #html.elem("summary")[#summary]
+    #body
+  ]
+} else { block(above: 1em, below: 1em)[*#summary*#linebreak()#body] }
 
 // gentle-clues callouts: in html mode the package's icon+title grid()
 // warns, so emit a plain <aside> instead (selectable text; styled by
@@ -586,14 +609,43 @@
           if fig.caption != none { html.elem("figcaption", fig.caption) }
         })
       } else { fig }
+      // Code-block copy button: wrap every block-raw in a relative-
+      // positioned container so CSS can pin the button top-right.
+      // typst's native html export still emits the inner
+      // `<pre><code class="language-X">` for `it`.
+      show raw.where(block: true): it => context if target() == "html" {
+        html.elem("div", attrs: (class: "rio-code"), {
+          html.elem("button", attrs: (
+            class: "rio-copy",
+            type: "button",
+            aria-label: "Copy code to clipboard",
+          ))[⧉]
+          it
+        })
+      } else { it }
       // typst html refuses #footnote when a custom <html> element is
-      // present (page-shell emits one). Render the note body inline as
-      // a muted parenthetical instead — close enough for web reading.
-      show footnote: it => html.elem(
-        "span",
-        attrs: (class: "rio-footnote"),
-        [ (#it.body)],
-      )
+      // present (page-shell emits one). Re-implement per-page: emit a
+      // `<sup>` ref, collect bodies into route-keyed `_footnotes`, and
+      // flush a `<section class="rio-footnotes">` after the chapter
+      // body below. Numbering is positional via `.get()` (footnotes
+      // 1..N-1 already pushed at this point).
+      show footnote: it => context {
+        let route = _current-route.get()
+        let n = _footnotes.get().at(route, default: ()).len() + 1
+        _footnotes.update(d => {
+          d.insert(route, d.at(route, default: ()) + (it.body,))
+          d
+        })
+        html.elem("sup", attrs: (class: "rio-fnref"), html.elem(
+          "a",
+          attrs: (
+            href: "#fn-" + str(n),
+            id: "fnref-" + str(n),
+            role: "doc-noteref",
+          ),
+          [#n],
+        ))
+      }
       // Headings: typst's default html export emits `<hN>NUM  Text</hN>`
       // with no id and no anchor. Emit explicitly so every heading gets
       // a stable kebab-slug id (route-scoped dedup via _heading-slugs)
@@ -617,6 +669,17 @@
         // turn `id` into content.
         _heading-slugs.update(d => {
           d.insert(key, d.at(key, default: 0) + 1)
+          d
+        })
+        // Record (id, text, level) for the on-this-page TOC. text is
+        // pre-flattened so page-shell doesn't need _to-string.
+        let toc-text = _to-string(it.body)
+        _page-toc.update(d => {
+          d.insert(
+            route,
+            d.at(route, default: ())
+              + ((id: id, text: toc-text, level: it.level),),
+          )
           d
         })
         html.elem("h" + str(calc.min(it.level + 1, 6)), attrs: (id: id), {
@@ -649,6 +712,31 @@
       // source-migrated (range-limited promote) and docs-lint catches
       // re-introduction.
       it
+      // Flush per-page footnotes collected by the `show footnote:` rule
+      // above. `.final()` (not positional `.get()`) so the section sees
+      // every note regardless of where in the body it sat.
+      context {
+        let route = _current-route.get()
+        let notes = _footnotes.final().at(route, default: ())
+        if notes.len() > 0 {
+          html.elem(
+            "section",
+            attrs: (class: "rio-footnotes", role: "doc-endnotes"),
+            html.elem("ol", for (i, b) in notes.enumerate() {
+              html.elem("li", attrs: (id: "fn-" + str(i + 1)), {
+                b
+                [ ]
+                html.elem("a", attrs: (
+                  href: "#fnref-" + str(i + 1),
+                  class: "rio-fnback",
+                  role: "doc-backlink",
+                  aria-label: "Back to reference",
+                ))[↩]
+              })
+            }),
+          )
+        }
+      }
       // QA #9/QA2-R3: prev/next chapter nav. style.css renders
       // .nav-wrapper as a footer prev/next bar at all widths. Emit <a>
       // directly (cross-link doesn't pass attrs) so class + rel +
