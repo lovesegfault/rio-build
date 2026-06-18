@@ -2515,9 +2515,18 @@ impl DagActor {
         //     reaped — the AD5/C5/C6 synthesize-on-delete and
         //     DisruptionTarget arms) classify HERE: the controller is
         //     deleting (or has deleted) the Job, so no other observer
-        //     will ever report this attempt; the close is charge-free
-        //     and the still-wanted derivation requeues at this fold,
-        //     never at the establishment sweep.
+        //     will ever report this attempt — EXCEPT the controller's
+        //     own PRIOR pod-terminal classification, recorded as a
+        //     witnessed mark below. A synthesized verdict over a
+        //     recorded witnessed mark is a Job-gone handshake, never
+        //     new evidence: it DEFERS to the mark (sh-039 wall B —
+        //     the terminal-absent reap at strikes=2 ≈ 10s otherwise
+        //     pre-empted the witnessed slack=120s and closed
+        //     charge-free as `disconnected`/`reaped`, so the floor
+        //     never moved and the budget never charged). Absent a
+        //     mark (genuine spot-kill / node-loss), the close is
+        //     charge-free and the still-wanted derivation requeues at
+        //     this fold, never at the establishment sweep.
         //   - Pod-terminal reasons without a worker row (OOM, eviction,
         //     deadline, plain error) keep waiting: the establishment
         //     sweep stays their classifier (the 1b gate text), because
@@ -2525,6 +2534,36 @@ impl DagActor {
         // r[impl sched.attempt.synthesized-verdict+3]
         use rio_proto::types::AttemptTerminalReason as R;
         if b.core.assignment_active && matches!(reason, R::Cancelled | R::Preempted | R::Reaped) {
+            // sh-039: defer to a recorded witnessed mark — age it to
+            // `witnessed_at = 0.0` (the in-memory twin of
+            // `debug_backdate_witnessed_mark`, handle.rs) so the NEXT
+            // housekeeping tick (~5s) establishes immediately, and
+            // return Unresolved. The establishment sweep stays the
+            // ONE classifier (no second `bump_resource_floor` caller,
+            // no second `won`-flag consumer; the
+            // `bump_resource_floor_caller_census` audit at
+            // db/live_pins.rs holds). Idempotent: a re-fired Reaped
+            // re-ages the same mark and re-returns Unresolved; the
+            // controller deletes the Job unconditionally
+            // (`delete_job_with_synthesized_report`), so Unresolved
+            // here causes neither a controller hang nor a retry loop
+            // — `VerdictWitness::from_resolved_ack` correctly
+            // withholds the futility-breaker reset on Unresolved (the
+            // merged_bug_080(2b) "a charge-free ack witnesses
+            // nothing" semantics; the verdict surfaces one tick later
+            // via the sweep, scheduler-internal).
+            if let Some(mark) = self.witnessed_terminal.get_mut(&exec_id) {
+                mark.witnessed_at = 0.0;
+                debug!(
+                    %exec_id,
+                    drv_hash = %b.core.drv_hash,
+                    ?reason,
+                    witnessed_reason = ?mark.reason,
+                    "controller-synthesized verdict over a recorded witnessed mark: \
+                     deferring to the establishment sweep (mark aged; next tick charges)"
+                );
+                return Ok(AttemptResolution::Unresolved);
+            }
             let drv_hash = DrvHash::from(b.core.drv_hash.as_str());
             // AD2c: prefer the controller-reported node from this very
             // report, fall back to the spawn-ack binding; never a

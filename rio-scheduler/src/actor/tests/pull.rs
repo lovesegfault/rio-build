@@ -2298,8 +2298,8 @@ async fn oom_floor_doubles_from_minted_intent() -> TestResult {
 /// resolution PER ARM. Census generator: rustc exhaustiveness over the
 /// `Result<AttemptResolution, PullRejection>` returns of BOTH fns — a
 /// new return site does not compile without stating its resolution;
-/// this table enumerates the live sites (13 = 10 Unresolved + 3
-/// Resolved at the round-6 wave base).
+/// this table enumerates the live sites (14 = 11 Unresolved + 3
+/// Resolved at sh-039).
 ///
 /// Witness strength: certifies the bit's truthfulness at its producer
 /// FOR EVERY ARM IN THE CENSUS — every charge-free/no-op arm answers
@@ -2310,6 +2310,7 @@ async fn oom_floor_doubles_from_minted_intent() -> TestResult {
 /// |-----|--------------------------------------------|------------|
 /// | F2  | no matching attempt                        | Unresolved |
 /// | F4  | unclassified open attempt, pod-terminal    | Unresolved |
+/// | F11 | synthesized verdict over a witnessed mark  | Unresolved |
 /// | T3  | synthesized close of an open attempt       | Resolved   |
 /// | F1  | synthesized verdict without exec_id        | Unresolved |
 /// | T2  | second-installment reason fill             | Resolved   |
@@ -2360,9 +2361,31 @@ async fn report_ack_attempt_resolved_per_arm_census() -> TestResult {
         "F4: unclassified-open-attempt ack is Unresolved (establishment \
          sweep remains the classifier)"
     );
-    // T3 — synthesized close of the open attempt: a verdict lands.
+    // F11 (sh-039) — synthesized verdict over a recorded witnessed
+    // mark: DEFERS to the establishment sweep (the mark holds the
+    // controller's REAL classification; Reaped/Cancelled is the
+    // Job-gone handshake, never new evidence). The mark is aged to 0
+    // and the attempt stays open.
     assert_eq!(
         report_attempt_outcome(&handle, None, Some(exec_open), Reason::Cancelled).await,
+        Ok(R::Unresolved),
+        "F11: synthesized verdict over a witnessed mark defers \
+         (sh-039 — the establishment sweep remains the classifier)"
+    );
+
+    // T3 — synthesized close of an open attempt with NO prior
+    // witnessed mark (genuine spot-kill / cancel): a verdict lands.
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "arm-synth",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let a = expect_deliver(pull(&handle, "arm-synth", Some("arm-synth")).await);
+    let exec_synth: uuid::Uuid = a.exec_id.parse()?;
+    assert_eq!(
+        report_attempt_outcome(&handle, None, Some(exec_synth), Reason::Cancelled).await,
         Ok(R::Resolved),
         "T3: synthesized close resolves the attempt (charge-free in the \
          BUDGET sense only)"

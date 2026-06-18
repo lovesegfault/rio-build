@@ -1189,6 +1189,123 @@ async fn witnessed_oom_promotes_mem_floor_at_establishment() -> TestResult {
 }
 
 // r[verify sched.attempt.witnessed-terminal+2]
+// r[verify sched.attempt.synthesized-verdict+3]
+/// sh-039 — both walls in one scenario, the live incident shape: a
+/// kubelet emptyDir-sizeLimit eviction (witnessed
+/// `EvictedEmptyDirSizeLimit`) is FOLLOWED by the controller's
+/// terminal-absent reap (`Reaped`, ~10s later at strikes=2). At base
+/// this was a charge-free infinite loop on the disk axis: (A) the
+/// witnessed letter folded to ClassifyOnly so the disk floor stayed 0;
+/// (B) the synthesized Reaped closed charge-free
+/// (`Disconnected`/`reaped`) without consulting `witnessed_terminal`,
+/// pre-empting the establishment sweep — the orphaned mark was swept
+/// by hygiene and never reached the charge arm.
+///
+/// After the fix: the witnessed report records the mark
+/// (`Unresolved`); the synthesized `Reaped` over a recorded mark DOES
+/// NOT close — it ages the mark to `witnessed_at = 0.0` and returns
+/// `Unresolved` (the establishment sweep stays the ONE classifier;
+/// next tick charges + bumps); the next housekeeping tick establishes
+/// the attempt as `executor_crash` (NOT `disconnected`/`reaped`) and
+/// the disk floor doubles from the dispatched base
+/// (`40<<30 → 80<<30`).
+#[tokio::test]
+async fn witnessed_emptydir_eviction_doubles_disk_floor_and_reaped_defers() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "wit-e", PriorityClass::Scheduled).await?;
+    let assignment = pull_deliver(&handle, "wit-e").await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    // The doubling base on the DISK dimension (1 GiB — under the
+    // fixture's 6 GiB max_disk ceiling so the at-cap arm cannot mask
+    // the doubling; the live incident's 40 GiB → 80 GiB lives under a
+    // production ceiling), and a mem base so the disk-only nature of
+    // the bump is observable.
+    assert!(
+        handle
+            .debug_seed_sched_hint("wit-e", Some(1 << 28), Some(1 << 30), None, None)
+            .await?
+    );
+
+    // (a) The controller witnesses kubelet's pod-attributed eviction.
+    // The intake records the mark; it never classifies.
+    let res = report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::EvictedEmptyDirSizeLimit,
+    )
+    .await
+    .expect("witnessed report acked");
+    assert!(
+        matches!(res, crate::actor::pull::AttemptResolution::Unresolved),
+        "the intake marks; it never classifies an unreported open attempt"
+    );
+
+    // (b) The controller's terminal-absent reap fires at strikes=2
+    // (~10 s) — the live incident's race. With a recorded witnessed
+    // mark, the synthesized Reaped is a Job-gone handshake, NOT new
+    // evidence: it ages the mark and DOES NOT close.
+    let res = report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::Reaped,
+    )
+    .await
+    .expect("synthesized Reaped acked");
+    assert!(
+        matches!(res, crate::actor::pull::AttemptResolution::Unresolved),
+        "Reaped over a witnessed mark defers to the establishment sweep \
+         (RED at base: returned Resolved)"
+    );
+    assert!(
+        attempt_rows_for(&db.pool, "wit-e").await.is_empty(),
+        "Reaped over a witnessed mark writes NO row \
+         (RED at base: wrote {{Disconnected, reaped}})"
+    );
+
+    // (c) The defer aged the mark to 0.0 — the next tick establishes
+    // immediately (no debug_backdate needed; ≤5s latency vs the
+    // hourly loop sh-039 observed).
+    tick(&handle).await?;
+    let rows = attempt_rows_for(&db.pool, "wit-e").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "established exactly once on the aged witnessed clock"
+    );
+    assert_eq!(
+        rows[0].outcome_class,
+        OutcomeClass::ExecutorCrash.as_str(),
+        "the establishment sweep classifies (NOT the charge-free \
+         Disconnected the synthesized Reaped wrote at base)"
+    );
+    assert_ne!(
+        rows[0].termination_reason.as_deref(),
+        Some("reaped"),
+        "the persisted reason is the sweep's, never the pre-empted Reaped"
+    );
+    let info = expect_drv(&handle, "wit-e").await;
+    assert_eq!(
+        info.sched.resource_floor.disk_bytes,
+        2 << 30,
+        "the witnessed_disk disposition row doubles the disk floor at \
+         establishment (1 GiB → 2 GiB; RED at base: 0 — the mark was \
+         pre-empted by Reaped and never reached the charge arm)"
+    );
+    assert_eq!(
+        info.sched.resource_floor.mem_bytes, 0,
+        "the EvictedEmptyDirSizeLimit letter's row is DISK — the mem \
+         floor is untouched"
+    );
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Ready,
+        "the drv requeues after the witnessed-clock establishment"
+    );
+    assert_eq!(info.retry.failure_count, 1, "charged once (C2)");
+    Ok(())
+}
+
+// r[verify sched.attempt.witnessed-terminal+2]
 /// live_058-b (W10-CG-b precision matrix): every witnessed letter
 /// other than the two per-container kubelet attributions (OomKilled,
 /// sh-039's EvictedEmptyDirSizeLimit) establishes at witnessed+slack
