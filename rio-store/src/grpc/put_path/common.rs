@@ -1770,14 +1770,25 @@ mod registration_writer_census {
     fn store_ownership_insert_census() {
         let hits = census(&["INSERT INTO ", "path_tenants"]);
         let expected: BTreeMap<String, usize> = [
-            // the ONE production writer (insert_path_tenant_rows)
+            // the TWO production writers: insert_path_tenant_rows
+            // (PutPath/PutPathBatch's pool-level stamp) and
+            // metadata/chunked.rs's insert_path_tenant_in_conn
+            // (PutPathChunked's in-transaction variant — the output
+            // commit transaction stamps tenant atomically with the
+            // manifest_data insert, ADR-022 §6.4). Both route through
+            // the same `path_tenants` UPSERT shape; the in-conn one
+            // exists so PutPathChunked's single commit transaction
+            // does not re-acquire the pool mid-commit.
             ("grpc/put_path/common.rs".to_string(), 1),
-            // test seeds (visibility/gc/executor fixtures)
-            ("grpc/sign.rs".to_string(), 4),
+            ("metadata/chunked.rs".to_string(), 1),
+            // test seeds (visibility/gc/executor/castore fixtures)
+            ("grpc/directory.rs".to_string(), 1),
+            ("grpc/sign.rs".to_string(), 5),
             ("gc/mark.rs".to_string(), 4),
             ("gc/mod.rs".to_string(), 2),
-            ("gc/sweep.rs".to_string(), 3),
+            ("gc/sweep.rs".to_string(), 4),
             ("materialize/executor.rs".to_string(), 1),
+            ("metadata/queries.rs".to_string(), 2),
         ]
         .into();
         assert_eq!(

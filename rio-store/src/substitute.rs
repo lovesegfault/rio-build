@@ -7976,6 +7976,30 @@ mod tests {
                  sanctioned site; not a tokio semaphore)",
             ),
             (
+                "grpc/put_path/common.rs",
+                "acquire",
+                1,
+                "sqlx PgPool connection acquire (insert_path_tenant_skipped's \
+                 standalone wrapper around the _in_conn variant; not a tokio \
+                 semaphore — zero NAR-budget contact)",
+            ),
+            (
+                "grpc/put_path_chunked/mod.rs",
+                "acquire",
+                1,
+                "sqlx PgPool connection acquire (PutPathChunked's per-output \
+                 path_tenants stamp loop; not a tokio semaphore — zero \
+                 NAR-budget contact)",
+            ),
+            (
+                "metadata/chunked.rs",
+                "acquire",
+                1,
+                "sqlx PgPool connection acquire (mark_chunks_uploaded's \
+                 standalone wrapper around the _in_conn variant; not a tokio \
+                 semaphore — zero NAR-budget contact)",
+            ),
+            (
                 "gc/lock.rs",
                 "try_acquire",
                 1,

@@ -102,6 +102,7 @@ fn every_config_seconds_field_paths_through_a_clamped_type() {
 
     let rows = secs_field_rows(CONFIG_SRC);
     let expect = [
+        ("dag_prefetch_timeout_secs", "secs_bounded"),
         ("fuse_fetch_timeout_secs", "secs_bounded"),
         ("daemon_timeout_secs", "rio_common::config::BoundedSecs"),
         ("max_silent_time_secs", "secs_bounded"),

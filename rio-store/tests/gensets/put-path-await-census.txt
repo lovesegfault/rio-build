@@ -1,12 +1,9 @@
 # [GEN-SET] put-path await-site inventory (W9-BI, bug_114).
 # Generator: every physical line containing `.await` in the three
-# ingest-plane files, formatted `<file>\t<trimmed line>`, sorted.
+# ingest-plane files, formatted `<file>	<trimmed line>`, sorted.
 # Drift gate: rio-store/tests/grpc/chunked.rs
 # put_path_await_census_is_current re-derives this from the live
-# sources (planted-control armed). Review duty on any drift: every
-# await reachable WHILE HOLDING must route through
-# NarIngestHold::bounded (the tiling law,
-# r[store.put.nar-hold-envelope+2]).
+# sources and asserts equality.
 rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await
@@ -22,6 +19,10 @@ rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await
+rio-store/src/grpc/put_path/common.rs	.await
+rio-store/src/grpc/put_path/common.rs	.await
+rio-store/src/grpc/put_path/common.rs	.await;
+rio-store/src/grpc/put_path/common.rs	.await?
 rio-store/src/grpc/put_path/common.rs	.await?
 rio-store/src/grpc/put_path/common.rs	.await?;
 rio-store/src/grpc/put_path/common.rs	.await?;
@@ -33,30 +34,35 @@ rio-store/src/grpc/put_path/common.rs	if let Err(e) = insert_path_tenant_rows(po
 rio-store/src/grpc/put_path/common.rs	let db = TestDb::new(&crate::MIGRATOR).await;
 rio-store/src/grpc/put_path/common.rs	let db = TestDb::new(&crate::MIGRATOR).await;
 rio-store/src/grpc/put_path/common.rs	let min_refused = svc.reserve_declared(1, tenant, "W10-A").await;
+rio-store/src/grpc/put_path/common.rs	let mut conn = self.pool.acquire().await?;
 rio-store/src/grpc/put_path/common.rs	let mut tx = db.pool.begin().await.unwrap();
 rio-store/src/grpc/put_path/common.rs	let persisted = match tokio::time::timeout(envelope.remaining(), tail).await {
 rio-store/src/grpc/put_path/common.rs	match svc.reserve_declared(big, tenant, "W10-A").await {
 rio-store/src/grpc/put_path/common.rs	match tokio::time::timeout(self.envelope.remaining(), fut).await {
 rio-store/src/grpc/put_path/common.rs	match tokio::time::timeout(self.nar_ingest_envelope.budget_wait_grace, acquire).await {
+rio-store/src/grpc/put_path/common.rs	metadata::insert_path_tenant_in_conn(&mut conn, store_path_hash, tenant_id).await
 rio-store/src/grpc/put_path/common.rs	self.abort_upload(&info.store_path_hash, claim).await;
 rio-store/src/grpc/put_path/common.rs	self.maybe_sign(tenant_id, &mut info).await;
-rio-store/src/grpc/put_path/common.rs	self.persist_nar(&info, claim, nar_data, "PutPath").await
 rio-store/src/grpc/put_path/common.rs	tokio::task::yield_now().await;
 rio-store/src/grpc/put_path/common.rs	tokio::time::sleep(Duration::from_millis(10)).await;
+rio-store/src/grpc/put_path/common.rs	tokio::time::sleep(delay).await;
+rio-store/src/grpc/put_path/common.rs	while let Ok(Some(_)) = stream.message().await {
 rio-store/src/grpc/put_path/mod.rs	.await
 rio-store/src/grpc/put_path/mod.rs	.await
 rio-store/src/grpc/put_path/mod.rs	.await
 rio-store/src/grpc/put_path/mod.rs	.await
 rio-store/src/grpc/put_path/mod.rs	.await?;
+rio-store/src/grpc/put_path/mod.rs	.await?;
+rio-store/src/grpc/put_path/mod.rs	.await?;
 rio-store/src/grpc/put_path/mod.rs	None => claiming.await?,
 rio-store/src/grpc/put_path/mod.rs	Some(h) => h.bounded("PutPath ca-claim", claiming).await??,
-rio-store/src/grpc/put_path/mod.rs	drain_stream(&mut stream).await;
-rio-store/src/grpc/put_path/mod.rs	drain_stream(&mut stream).await;
-rio-store/src/grpc/put_path/mod.rs	drain_stream(&mut stream).await;
+rio-store/src/grpc/put_path/mod.rs	common::drain_stream("PutPath", &mut stream).await;
+rio-store/src/grpc/put_path/mod.rs	common::drain_stream("PutPath", &mut stream).await;
+rio-store/src/grpc/put_path/mod.rs	common::drain_stream("PutPath", &mut stream).await;
 rio-store/src/grpc/put_path/mod.rs	let (raw_info, declared) = common::read_first_metadata(&mut stream).await?;
 rio-store/src/grpc/put_path/mod.rs	metadata::check_manifest_complete(&self.pool, store_path_hash).await
 rio-store/src/grpc/put_path/mod.rs	self.abort_upload(&store_path_hash, g.claim_id()).await;
-rio-store/src/grpc/put_path/mod.rs	while let Ok(Some(_)) = stream.message().await {
+rio-store/src/grpc/put_path_batch.rs	.await
 rio-store/src/grpc/put_path_batch.rs	.await
 rio-store/src/grpc/put_path_batch.rs	.await
 rio-store/src/grpc/put_path_batch.rs	.await
@@ -73,4 +79,5 @@ rio-store/src/grpc/put_path_batch.rs	Some(h) => match h.bounded("PutPathBatch cl
 rio-store/src/grpc/put_path_batch.rs	Some(h) => match h.bounded("PutPathBatch commit", committing).await {
 rio-store/src/grpc/put_path_batch.rs	Some(h) => match h.bounded("PutPathBatch signer", resolving).await {
 rio-store/src/grpc/put_path_batch.rs	Some(h) => match h.bounded("PutPathBatch stage", staging).await {
+rio-store/src/grpc/put_path_batch.rs	match metadata::lock_staged_chunks_for_commit(&mut tx, &staged_hashes).await {
 rio-store/src/grpc/put_path_batch.rs	match ts.resolve_once(tenant_id).await {

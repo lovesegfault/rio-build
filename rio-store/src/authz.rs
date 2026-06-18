@@ -1268,7 +1268,7 @@ mod tests {
         // row forces re-review here.
         assert_eq!(
             METHOD_CREDENTIALS.len(),
-            25,
+            35,
             "method count changed — re-derive the matrix"
         );
         assert_eq!(
@@ -1301,10 +1301,10 @@ mod tests {
                 }
             }
         }
-        // Totality: 25 methods × (5 bootable × 5 presented) verdict
-        // cells + 25 × 3 refused states — nothing silently skipped.
-        assert_eq!(verdict_cells, 25 * 5 * 5);
-        assert_eq!(refused_states, 25 * 3);
+        // Totality: 35 methods × (5 bootable × 5 presented) verdict
+        // cells + 35 × 3 refused states — nothing silently skipped.
+        assert_eq!(verdict_cells, 35 * 5 * 5);
+        assert_eq!(refused_states, 35 * 3);
     }
 
     /// Multi-credential vector pin 1 (the credential-vector rule's

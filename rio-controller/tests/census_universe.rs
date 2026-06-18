@@ -27,6 +27,7 @@ pub const CENSUS_SOURCES: &[(&str, &str)] = &[
     ("reconcilers/componentscaler/decide.rs", include_str!("../src/reconcilers/componentscaler/decide.rs")),
     ("reconcilers/componentscaler/mod.rs", include_str!("../src/reconcilers/componentscaler/mod.rs")),
     ("reconcilers/fence.rs", include_str!("../src/reconcilers/fence.rs")),
+    ("reconcilers/gateway_cost.rs", include_str!("../src/reconcilers/gateway_cost.rs")),
     ("reconcilers/gc_schedule.rs", include_str!("../src/reconcilers/gc_schedule.rs")),
     ("reconcilers/mod.rs", include_str!("../src/reconcilers/mod.rs")),
     ("reconcilers/node_informer.rs", include_str!("../src/reconcilers/node_informer.rs")),

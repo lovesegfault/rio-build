@@ -679,6 +679,7 @@ mod registration_writer_census {
         ("db/attempts.rs", include_str!("../db/attempts.rs")),
         ("db/batch.rs", include_str!("../db/batch.rs")),
         ("db/builds.rs", include_str!("../db/builds.rs")),
+        ("db/closure.rs", include_str!("../db/closure.rs")),
         (
             "db/confirm_fences.rs",
             include_str!("../db/confirm_fences.rs"),
@@ -708,6 +709,10 @@ mod registration_writer_census {
         ),
         ("db/tests/batch.rs", include_str!("../db/tests/batch.rs")),
         ("db/tests/builds.rs", include_str!("../db/tests/builds.rs")),
+        (
+            "db/tests/closure.rs",
+            include_str!("../db/tests/closure.rs"),
+        ),
         (
             "db/tests/confirm_fences.rs",
             include_str!("../db/tests/confirm_fences.rs"),
@@ -1068,6 +1073,10 @@ mod registration_writer_census {
             ("actor/completion.rs".to_string(), 1),
             ("actor/debug.rs".to_string(), 1),
             ("actor/dispatch.rs".to_string(), 1),
+            // ADR-022 attested_input_seeds tests (assignment.rs §tests):
+            // 2 fixture seeds — child.output_paths populated to test the
+            // realized-paths arm of the seed derivation. Re-derives.
+            ("assignment.rs".to_string(), 2),
             // sh-007c S6: 2 — `complete_materialization_for_live_interest`
             // (per-item) + `apply_batched_companion` (batched twin);
             // both gate on `output_paths.is_empty()` over identical
