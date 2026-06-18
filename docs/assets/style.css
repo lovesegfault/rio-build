@@ -1,13 +1,21 @@
-/* docs/assets/style.css */
+/* docs/assets/style.css
+   Palette: Ayu (github.com/ayu-theme/ayu-colors themes/{light,dark}.yaml).
+   --fg/--bg = editor.{fg,bg}; --accent = common.accent.tint;
+   --muted = ui.fg; --rule = ui.line; --sunk = surface.sunk;
+   --c-* = palette base hues for clue/status colouring. */
 :root {
-  --fg: #1f2328; --bg: #ffffff; --accent: #1f6feb;
-  --muted: #656d76; --rule: #d0d7de;
+  --fg: #5c6166; --bg: #fcfcfc; --accent: #f29718;
+  --muted: #828e9f; --rule: #6b7d8f1f; --sunk: #ebeef0;
+  --c-blue: #55b4d4; --c-red: #e65050; --c-yellow: #eba400;
+  --c-green: #86b300; --c-purple: #a37acc;
   --nav-w: 18rem;
   color-scheme: light dark;
 }
 :root[data-theme="dark"] {
-  --fg: #e6edf3; --bg: #0d1117; --accent: #4493f8;
-  --muted: #8d96a0; --rule: #30363d;
+  --fg: #bfbdb6; --bg: #10141c; --accent: #e6b450;
+  --muted: #5a6378; --rule: #1b1f29; --sunk: #0d1017;
+  --c-blue: #39bae6; --c-red: #d95757; --c-yellow: #ffb454;
+  --c-green: #aad94c; --c-purple: #d2a6ff;
 }
 * { box-sizing: border-box; }
 body {
@@ -28,7 +36,7 @@ code, pre, kbd, samp { font-family: "NewComputerModernMono", monospace; }
 .rio-main { padding: 2rem 3rem; max-width: 56rem; }
 .rio-main h1, .rio-main h2, .rio-main h3 { line-height: 1.25; }
 .rio-main a { color: var(--accent); }
-.rio-main pre { background: var(--rule); padding: .75rem; overflow-x: auto; border-radius: 4px; }
+.rio-main pre { background: var(--sunk); padding: .75rem; overflow-x: auto; border-radius: 4px; }
 .rio-main table { border-collapse: collapse; }
 .rio-main th, .rio-main td { border: 1px solid var(--rule); padding: .4rem .6rem; }
 .rio-edit { margin-top: 3rem; font-size: .875rem; }
@@ -91,22 +99,17 @@ math[display="block"] { margin-block: 1.1em; }
    selectors → :root[data-theme="dark"], legacy-DOM rules
    (.sidebar/.page-wrapper/.rio-copy/main pre) dropped, equation-SVG
    rules dropped (typst 0.15 emits native MathML). */
-.rio-req { border-left: 3px solid var(--rule); padding: 0.5em 0 0.5em 1em; margin: 1em 0; }
-.rio-req-id { background: #f6f8fa; border-radius: 3px; padding: 0.1em 0.5em; font-size: 0.85em; }
-:root[data-theme="dark"] .rio-req-id { background: #161b22; }
-.rio-clue { border-left: 4px solid; border-radius: 4px; padding: 0.6em 1em; margin: 1em 0; }
-.rio-clue-title { margin: 0 0 0.4em 0; }
-.rio-clue-info { border-color: #1f6feb; background: #ddf4ff; }
-.rio-clue-warning { border-color: #d1242f; background: #ffebe9; }
-.rio-clue-memo { border-color: #9a6700; background: #fff8c5; }
-.rio-clue-tip { border-color: #1a7f37; background: #dafbe1; }
-.rio-clue-idea { border-color: #8250df; background: #fbefff; }
-:root[data-theme="dark"] .rio-clue { color: var(--fg); }
-:root[data-theme="dark"] .rio-clue-info { background: #0d2847; }
-:root[data-theme="dark"] .rio-clue-warning { background: #3d0f12; }
-:root[data-theme="dark"] .rio-clue-memo { background: #3a2e05; }
-:root[data-theme="dark"] .rio-clue-tip { background: #0a2e1a; }
-:root[data-theme="dark"] .rio-clue-idea { background: #2d1b47; }
+.rio-req { border-left: 3px solid var(--accent); padding: 0.5em 0 0.5em 1em; margin: 1em 0; }
+.rio-req-id { background: var(--sunk); border-radius: 3px; padding: 0.1em 0.5em;
+  font-size: 0.85em; color: var(--muted); }
+.rio-clue { border-left: 4px solid; border-radius: 4px; padding: 0.6em 1em;
+  margin: 1em 0; background: var(--sunk); }
+.rio-clue-title { margin: 0 0 0.4em 0; font-weight: 600; }
+.rio-clue-info { border-color: var(--c-blue); }
+.rio-clue-warning { border-color: var(--c-red); }
+.rio-clue-memo { border-color: var(--c-yellow); }
+.rio-clue-tip { border-color: var(--c-green); }
+.rio-clue-idea { border-color: var(--c-purple); }
 .rio-figure { display: block; text-align: center; overflow-x: auto; margin: 1.2em 0; }
 .rio-figure figcaption { font-size: 0.92em; margin-top: 0.6em; }
 .rio-table { overflow-x: auto; max-width: 100%; margin: 1em 0; }
