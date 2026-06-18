@@ -266,7 +266,7 @@ pub fn next(
     let mem_for = |c: f64| MemBytes((c * probe.mem_per_core as f64 + probe.mem_base as f64) as u64);
 
     let Some(f) = fit else {
-        // r[impl sched.sla.disk-reaches-ephemeral-storage+2]
+        // r[impl sched.sla.disk-reaches-ephemeral-storage+3]
         // live_049 L2: the cold-pname probe rides the typed envelope —
         // fitted = the prior (no observation yet), floor/ceiling law
         // applied. Same value as the bare default when defaultDisk is
@@ -293,7 +293,7 @@ pub fn next(
                 .max((f.mem.at(RawCores(c)).0 as f64 * h) as u64),
         )
     };
-    // r[impl sched.sla.disk-reaches-ephemeral-storage+2]
+    // r[impl sched.sla.disk-reaches-ephemeral-storage+3]
     // live_049 L2: the warm path's disk request is the typed envelope —
     // the observed per-pname p90 (now aggregated for probe-shaped fits
     // too) retires the `sla.defaultDisk` cold-start prior;
@@ -1141,7 +1141,7 @@ mod disk_axis_tests {
         (cfg, ceil)
     }
 
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+3]
     /// **R8 + W7-H** — *the warm pname's disk request is FITTED, not
     /// the default*: five serial samples with small observed peaks,
     /// the newest peak-less, through the PRODUCTION ingest → explore
@@ -1210,7 +1210,7 @@ mod disk_axis_tests {
         );
     }
 
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+3]
     /// The cold-pname probe keeps the prior (the designed cold-start
     /// posture — the default IS the cold prior, typed through the
     /// envelope; the existing :949/:963 default-path pins re-derived:
@@ -1222,7 +1222,7 @@ mod disk_axis_tests {
         assert_eq!(d.disk.bytes(), cfg.default_disk);
     }
 
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+3]
     /// Ceiling law at the explore seam: a fit whose p90 exceeds
     /// `sla.maxDisk` is clamped typed (the envelope's ceiling arm) —
     /// the warm path can never request past the operator bound.

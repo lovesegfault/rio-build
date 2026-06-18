@@ -1285,7 +1285,7 @@ impl DagActor {
                 // Wire-compat: a non-empty digest is serialized in the token;
                 // a pre-P0589 store rejects it on deny_unknown_fields. The
                 // store fleet must roll before the scheduler singleton (or
-                // wipe deploy) — see r[common.hmac.claims].
+                // wipe deploy) — see r[common.hmac.claims+3].
                 let input_closure_digest = if input_closure.is_empty() {
                     // Empty = no attestation. validate_begin (P0586) treats it
                     // as "scheduler couldn't compute", not "closure was empty".

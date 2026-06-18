@@ -137,7 +137,7 @@ pub async fn execute_job(
 /// walk); the caller forwards it to
 /// `ReportMaterializationProgress` fire-and-forget.
 // r[impl store.materialize.executor+5]
-// r[impl obs.metric.store]
+// r[impl obs.metric.store+2]
 pub async fn execute_job_with_progress(
     ctx: &ExecutorContext,
     claimed: &ClaimedJob,
@@ -1980,7 +1980,7 @@ async fn live_wanted_paths(
 /// is its OWN row: a build_input pin for the same (path, drv) is never
 /// re-kinded (bug_253), and re-pinning refreshes job_id idempotently.
 // r[impl sched.materialize.pinning]
-// r[impl obs.metric.store]
+// r[impl obs.metric.store+2]
 async fn pin_materialized_path(
     ctx: &ExecutorContext,
     claimed: &ClaimedJob,
@@ -4399,7 +4399,7 @@ mod tests {
         );
     }
 
-    // r[verify obs.metric.store]
+    // r[verify obs.metric.store+2]
     // r[verify store.materialize.executor+5]
     /// T-6.2 (red-first): the execution-outcome and pin counters the
     /// dashboards consume —

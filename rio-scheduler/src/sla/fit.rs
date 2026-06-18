@@ -4,7 +4,7 @@ use super::types::{
     DiskBytes, DurationFit, FitDf, MemBytes, MemFit, RawCores, RawDiskP90, RefSeconds, RingNEff,
 };
 
-// r[impl sched.sla.disk-reaches-ephemeral-storage+2]
+// r[impl sched.sla.disk-reaches-ephemeral-storage+3]
 /// live_049 L2: the typed disk-axis envelope — `floor ≤ fitted ≤
 /// ceiling` BY CONSTRUCTION (the constructor clamps; R9's ordering
 /// law). The disk request gets the same lifecycle cores/mem have:
@@ -105,7 +105,7 @@ impl DiskFitEnvelope {
     }
 }
 
-// r[impl sched.sla.disk-reaches-ephemeral-storage+2]
+// r[impl sched.sla.disk-reaches-ephemeral-storage+3]
 /// bug_132 (R24 — laws by construction): the dispatch disk value,
 /// UNWRITABLE except through [`DiskFitEnvelope`] (the sole awaiter of
 /// the floor/ceiling law). The inner field is private and there is no
@@ -968,7 +968,7 @@ mod tests {
 mod disk_envelope_tests {
     use super::*;
 
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+3]
     /// **R9 + W7-I** — the envelope ordering law `floor ≤ fitted ≤
     /// ceiling` over the ADVERSARIAL population (hand-oracle rows,
     /// never the impl's own min/max expression): zero observations,

@@ -311,7 +311,7 @@ async fn drain_one_batch(
     // upload round-trip and keeps the resurrection-between-collect-
     // and-drain guard exact.
     //
-    // Sorted + ORDER BY FOR UPDATE: the r[store.chunk.lock-order]
+    // Sorted + ORDER BY FOR UPDATE: the r[store.chunk.lock-order+2]
     // discipline every multi-row `chunks` locker follows — without
     // it this batch lock would ABBA against concurrent sorted
     // writers (PutPath upserts, the collect soft-delete batch).

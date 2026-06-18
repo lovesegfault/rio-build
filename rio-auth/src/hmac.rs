@@ -718,7 +718,7 @@ mod tests {
     /// `digest_input_closure` is order-sensitive over its newline-join
     /// — the spec says "sorted closure" because the scheduler and the
     /// store must produce the same bytes from the same set.
-    // r[verify common.hmac.claims]
+    // r[verify common.hmac.claims+3]
     #[test]
     fn closure_digest_deterministic_and_order_sensitive() {
         let a = vec![
@@ -981,7 +981,7 @@ mod tests {
     /// those fields is load-bearing for in-flight tokens at deploy
     /// time. `deny_unknown_fields` only rejects EXTRA fields, not
     /// MISSING ones.
-    // r[verify common.hmac.claims]
+    // r[verify common.hmac.claims+3]
     #[test]
     fn assignment_claims_tenant_backcompat() {
         let key = HmacKey::from_key(TEST_KEY.to_vec());

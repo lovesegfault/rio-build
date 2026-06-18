@@ -145,11 +145,11 @@ pub(crate) fn jitter() -> Duration {
 /// on deadlock, so `body` must own a complete begin→…→commit attempt.
 ///
 /// Bounded at one retry by design: every caller's sorted
-/// lock-acquisition discipline (`r[store.chunk.lock-order]`) SHOULD
+/// lock-acquisition discipline (`r[store.chunk.lock-order+2]`) SHOULD
 /// prevent the deadlock outright; a single retry absorbs the residual
 /// index-page-split case, while unbounded retry would mask a real
 /// lock-order regression as latency.
-// r[impl store.chunk.lock-order]
+// r[impl store.chunk.lock-order+2]
 pub(crate) async fn retry_once_on_deadlock<T, F, Fut>(body: F) -> Result<T>
 where
     F: Fn() -> Fut,
@@ -470,7 +470,7 @@ async fn mark_manifest_chunks_durable(
     })?;
     // Dedup + sort: a manifest may repeat a chunk (identical content
     // blocks), and every `chunks` writer takes row locks in ascending
-    // hash order (`r[store.chunk.lock-order]`).
+    // hash order (`r[store.chunk.lock-order+2]`).
     let mut hashes: Vec<Vec<u8>> = manifest
         .entries
         .iter()
@@ -500,7 +500,7 @@ async fn mark_manifest_chunks_durable(
     // these aren't (the upsert's committed refcount is ≥1), so the
     // locked set can't change between the SELECT and the UPDATE —
     // and the UPDATE binds the locked set, touching only held rows.
-    // r[impl store.chunk.lock-order]
+    // r[impl store.chunk.lock-order+2]
     let locked: Vec<Vec<u8>> = sqlx::query_scalar(
         "SELECT blake3_hash FROM chunks \
           WHERE blake3_hash = ANY($1) AND NOT durable \

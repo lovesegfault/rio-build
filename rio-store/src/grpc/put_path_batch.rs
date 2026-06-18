@@ -468,7 +468,7 @@ impl StoreServiceImpl {
             .await
             .map_err(|e| rio_common::grpc::internal("PutPathBatch: begin transaction", e))?;
 
-        // r[impl store.chunk.lock-order]
+        // r[impl store.chunk.lock-order+2]
         // Batch-wide chunk pre-lock: each completion below flips its
         // output's chunks `durable` (`mark_manifest_chunks_durable`),
         // and without one up-front sorted FOR UPDATE over the union the

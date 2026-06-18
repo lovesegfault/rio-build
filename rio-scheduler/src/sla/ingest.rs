@@ -362,7 +362,7 @@ pub fn refit(
         prov
     });
 
-    // r[impl sched.sla.disk-reaches-ephemeral-storage+2]
+    // r[impl sched.sla.disk-reaches-ephemeral-storage+3]
     // live_049 L2 as repaired by bug_070: disk is a c-INDEPENDENT
     // scalar (sched.sla.disk-scalar) — its evidence universe is EVERY peaked sample — quantifier: census(test: w11_bc_axis_arm_census) —
     // never an implicit property of which Vec an arm
@@ -740,7 +740,7 @@ pub(super) fn reassign_tier(
     Some(bounded[i].0.to_string())
 }
 
-// r[impl sched.sla.disk-reaches-ephemeral-storage+2]
+// r[impl sched.sla.disk-reaches-ephemeral-storage+3]
 /// live_049 L2: the disk p90 over EVERY row carrying a peak — quantifier: census(test: w11_bc_axis_arm_census) — every
 /// row weighted by the one decay law over the full-slice ordinal
 /// domain — the probe-shaped fit's disk aggregate. Pre-fix the
@@ -2002,7 +2002,7 @@ mod disk_axis_tests {
         );
     }
 
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+3]
     /// **W11-BA (bug_070, red-first)** — *the disk quantile's evidence
     /// universe is every peaked sample regardless of axis mix.* One
     /// peaked c-axis row (5 GiB, a cache-warm rebuild) + nine peaked
@@ -2035,7 +2035,7 @@ mod disk_axis_tests {
         );
     }
 
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+3]
     /// **W12-AH (bug_040, red-first)** — *the probe_only disk aggregate
     /// is pinned at its OWN arm, by a STRUCTURAL witness of that arm.*
     /// The predecessor test ("probe_only_disk_p90_aggregates_all_
@@ -2094,7 +2094,7 @@ mod disk_axis_tests {
         );
     }
 
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+3]
     /// Cold rows (zero peaks anywhere) stay None — no evidence is no
     /// evidence; the envelope's prior arm (the chart default) is the
     /// designed cold-start posture (kill-isolation for W7-H: the
@@ -2109,7 +2109,7 @@ mod disk_axis_tests {
         assert_eq!(f.disk_p90, None);
     }
 
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+3]
     /// **W12-LC (live060-c, red-first)** — *the warm disk fit is
     /// consumed only at a witnessed population and never shrinks below
     /// recent observed reality + headroom; population: the
@@ -2170,7 +2170,7 @@ mod disk_axis_tests {
         assert_eq!(req.bytes(), want, "the envelope consumes the witnessed fit");
     }
 
-    // r[verify sched.sla.disk-reaches-ephemeral-storage+2]
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+3]
     /// **W12-LC2 (live060-c; the steady-state direction preserved)** —
     /// at a witnessed population of representative peaks the warm fit
     /// governs exactly as the verified downward path intends: the

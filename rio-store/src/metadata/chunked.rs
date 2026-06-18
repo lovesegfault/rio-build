@@ -342,7 +342,7 @@ async fn complete_manifest_chunked_attempt(
 /// re-check skip the pending S3 delete instead of racing the new
 /// `PutObject`. Rows with `refcount > 0` are live under another
 /// manifest and are left alone. Hashes are sorted ascending before
-/// binding (`r[store.chunk.lock-order]`).
+/// binding (`r[store.chunk.lock-order+2]`).
 ///
 /// The grace clock is NOT refreshed again during the verify walk, so
 /// an upload that takes longer than `CHUNK_GRACE_SECS` and straddles a
@@ -453,7 +453,7 @@ pub(crate) async fn chunk_lists_for_paths(
 /// stamps those). The union is sorted internally, so callers cannot
 /// get the order or the set wrong. Two jobs:
 ///
-/// 1. **Lock order** (`r[store.chunk.lock-order]`): one sorted
+/// 1. **Lock order** (`r[store.chunk.lock-order+2]`): one sorted
 ///    `FOR UPDATE` acquires every `chunks` row lock the transaction
 ///    will need, so the statements that follow only touch already-held
 ///    rows regardless of their relative order — locking a row outside
@@ -473,14 +473,14 @@ pub(crate) async fn chunk_lists_for_paths(
 ///    is returned so the caller can abort with `UNAVAILABLE` instead
 ///    of committing a manifest that points at an object the drain may
 ///    already have deleted (the I-201 lie, through the GC round-trip).
-// TODO: r[store.chunk.lock-order]'s spec text only asks for sorted
+// TODO: r[store.chunk.lock-order+2]'s spec text only asks for sorted
 // per-statement lock acquisition; the discipline this helper (and
 // lock_staged_chunks_for_commit) now enforces is stronger — the FULL
 // union of every chunk row a commit transaction will touch is locked
 // up front in one sorted FOR UPDATE. Tighten the rule text to match in
 // a follow-up spec pass (with `tracey bump`) so the spec states the
 // guarantee the code actually relies on.
-// r[impl store.chunk.lock-order]
+// r[impl store.chunk.lock-order+2]
 pub(crate) async fn lock_chunks_for_commit(
     conn: &mut sqlx::PgConnection,
     digests: &[Vec<u8>],
@@ -548,7 +548,7 @@ pub(crate) async fn lock_chunks_for_commit(
 /// flipping `durable` for an object the drain may already have
 /// deleted. Inline outputs have no `manifest_data` row and contribute
 /// nothing.
-// r[impl store.chunk.lock-order]
+// r[impl store.chunk.lock-order+2]
 pub(crate) async fn lock_staged_chunks_for_commit(
     conn: &mut sqlx::PgConnection,
     store_path_hashes: &[Vec<u8>],
@@ -594,8 +594,8 @@ pub(crate) async fn lock_staged_chunks_for_commit(
 /// `chunk_hashes`/`chunk_sizes` are the output's **distinct** digests
 /// (one refcount per unique chunk per manifest, matching the GC
 /// decrement) and MUST be pre-sorted ascending
-/// (`r[store.chunk.lock-order]`).
-// r[impl store.chunk.refcount-txn]
+/// (`r[store.chunk.lock-order+2]`).
+// r[impl store.chunk.refcount-txn+2]
 // r[impl store.put.tenant-junction]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_chunked_output_in_conn(
@@ -836,7 +836,7 @@ mod tests {
         );
     }
 
-    // r[verify store.chunk.lock-order]
+    // r[verify store.chunk.lock-order+2]
     /// The commit transaction's final statement stamps `uploaded_at`
     /// for every chunk this stream PUT — including digests whose only
     /// manifest occurrence is in an idempotent-skipped output and which
@@ -879,7 +879,7 @@ mod tests {
         tx.rollback().await.unwrap();
     }
 
-    // r[verify store.chunk.lock-order]
+    // r[verify store.chunk.lock-order+2]
     /// `PutPathBatch`'s phase-3 pre-lock: the union of every staged
     /// output's `manifest_data` chunk digests is locked up front in one
     /// sorted FOR UPDATE, so the per-output `durable` flips that follow
