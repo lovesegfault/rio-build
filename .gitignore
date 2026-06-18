@@ -43,8 +43,6 @@ docs/book/
 
 # typst output
 docs/**/*.pdf
-# shiroa wrapper's writable XDG package cache (devshell.nix)
-docs/.cache/
 
 # Sprint-local implementation plans (artifact, not source)
 docs/plans/

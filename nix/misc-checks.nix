@@ -2271,6 +2271,7 @@ in
         alertsJson = ../docs/gen/alerts.json;
         migrationsJson = ../docs/gen/migrations.json;
         protosJson = ../docs/gen/protos.json;
+        styleCss = ../docs/assets/style.css;
       }
       ''
         set -euo pipefail
@@ -2333,12 +2334,12 @@ in
         done <<<"$fencehits"
         # Stale `<chapter>.md` reference in non-typ sources — the
         # chapter was migrated to typst. Stem alternation derived from
-        # book.typ's #chapter() list (the canonical chapter set; same
-        # source as the book-pdf-subset check below) so a new chapter
-        # auto-extends and lib/book/manifest stems are excluded by
-        # construction.
-        stems=$(grep -oE '#chapter\("[^"]+\.typ"' $typSrc/book.typ \
-          | sed 's/#chapter("//;s/\.typ"//' \
+        # lib/html/meta.typ's chapters table (the canonical chapter
+        # set; same path-regex as docs-html-smoke assertion (a)) so a
+        # new chapter auto-extends and lib/manifest stems are excluded
+        # by construction.
+        stems=$(grep -oE '"[a-z][a-z0-9/-]*\.typ"' $typSrc/lib/html/meta.typ \
+          | sed 's/"//g;s/\.typ$//' \
           | xargs -n1 basename | sort -u | paste -sd'|')
         # Folded chapters: existed in docs/src/*.md, merged into other
         # .typ files during the migration (no 1:1 .typ). Frozen
@@ -2354,53 +2355,11 @@ in
           echo "FAIL: stale .md reference to a migrated chapter — update to .typ path" >&2
           fail=1
         fi
-        # book-pdf.typ includes ⊆ book.typ chapters. Catches stale/typo'd
-        # #include paths; the reverse (HTML chapter not in PDF) is
-        # intentional per book-pdf.typ's scope comment.
-        # merged_bug_227: book-pdf.typ stitches from a #let chapters
-        # array (one quoted path per line) — extract from the array,
-        # and fail LOUDLY if the shape drifts (an empty extraction
-        # would make this subset check vacuously green).
-        # merged_bug_193: the extraction requires the exact
-        # two-space-indent + trailing-comma line shape, so a valid but
-        # non-conforming entry (e.g. a comma-free last element) was
-        # silently DROPPED while the loud-fail only covered the
-        # all-lines-drifted case. Cross-check the extracted count
-        # against the RAW quoted-.typ count inside the array span —
-        # any deviating line is now a hard error, not a silent skip.
-        chapters_extract() {
-          grep -oE '^  "[^"]+\.typ",' "$1" | sed 's/^  "//;s/",$//'
-        }
-        chapters_raw_count() {
-          sed -n '/^#let chapters = (/,/^)/p' "$1" | grep -cE '"[^"]+\.typ"'
-        }
-        # Planted red (banner (b)): a comma-free last entry must be a
-        # loud mismatch, never a silent drop.
-        plant="$TMPDIR/book-pdf-planted.typ"
-        printf '%s\n' '#let chapters = (' '  "a.typ",' '  "b.typ"' ')' > "$plant"
-        if [[ "$(chapters_extract "$plant" | grep -c . || true)" -eq "$(chapters_raw_count "$plant")" ]]; then
-          echo "SELF-TEST FAIL: comma-free chapter entry not detected by the count cross-check" >&2
-          exit 1
-        fi
-        pdf=$(chapters_extract $typSrc/book-pdf.typ)
-        if [[ -z "$pdf" ]]; then
-          echo "FAIL: no chapters extracted from book-pdf.typ's chapters array — the stitch shape changed; update this extraction WITH it" >&2
-          fail=1
-        fi
-        raw_n=$(chapters_raw_count $typSrc/book-pdf.typ)
-        got_n=$(printf '%s\n' "$pdf" | grep -c . || true)
-        if [[ "$raw_n" -ne "$got_n" ]]; then
-          echo "FAIL: book-pdf.typ chapters array carries $raw_n quoted .typ entries but the subset extraction matched $got_n —" >&2
-          echo "      a line deviates from the '  \"…\",' shape (comma-free last entry?); fix the array line or this extraction WITH it" >&2
-          fail=1
-        fi
-        html=$(grep -oE '#chapter\("[^"]+\.typ"' $typSrc/book.typ | sed 's/#chapter("//;s/"//')
-        stray=$(comm -23 <(echo "$pdf" | sort) <(echo "$html" | sort))
-        if [[ -n "$stray" ]]; then
-          echo "FAIL: book-pdf.typ includes chapters not in book.typ:" >&2
-          echo "$stray" >&2
-          fail=1
-        fi
+        # (book-pdf.typ ⊆ book.typ subset check removed: book-pdf.typ
+        # now derives its chapter set from lib/html/meta.typ via
+        # flatten-chapters().filter(pdf-scope) — pdf⊆html holds by
+        # construction; merged_bug_227's hand-stitched array and its
+        # missed-seam class are unrepresentable.)
         # #src("path") and (refs.gh)("path:L") name files in the repo.
         # Assert each exists. bug_016: verification.typ referenced a
         # deleted scenario file. --exclude-dir=lib: refs.typ/rio.typ's
@@ -2428,6 +2387,16 @@ in
         # (pull-mode sweep), COLLECT_CURSOR/COLLECT_BACKLOG_ESTIMATE
         # (D1), the retired workers_active/queue_depth metric names,
         # and the deleted rio-scheduler/src/logs/ tree.
+        #
+        # Native typst bundle (retired 2026-06): shiroa / shiroaPkg /
+        # shiroa-mdbook / reflexo / typst.ts (the JS renderer) /
+        # docs-svg-dedup / RIO_TYPST_XDG / docs-serve-parity /
+        # is-web-target — the shiroa-era HTML pipeline.
+        #  - `is-html-target` is NOT denied: live predicate in
+        #    lib/rio.typ. Verified 2026-06-17:
+        #      rg -n 'is-html-target' docs/
+        #      => docs/lib/rio.typ:39 (#let), docs/glossary.typ:17,
+        #         docs/architecture.typ:242,259,263,271 (6 hits).
         #
         # META-RULE (merged_bug_140 close): a narrowing record — any
         # comment here explaining why a token is NOT denied — MUST
@@ -2805,8 +2774,9 @@ in
         # (b) was previously suppressed leaving an H1→H3 skip /
         # §-starts-at-2. Heuristic matches the QA3 rule's three forms
         # (exact / `rio-<title>` / `<title> *` prefix). Limitation:
-        # `[^]]+` title-extraction fails on a `]` in a manifest title;
-        # none currently exist.
+        # path:title extraction flattens meta.typ then matches the
+        # `("Title", "path.typ"` tuple shape (single- or multi-line);
+        # a `"` inside a title would break it (none currently exist).
         while IFS=: read -r ch title; do
           # `|| true`: chapters with no `^= ` (post-migration glossary)
           # make grep exit 1; under set -e that's fatal before the
@@ -2819,8 +2789,9 @@ in
             echo "FAIL: $ch first heading '= $first' duplicates manifest title '$title'" >&2
             fail=1
           fi
-        done < <(grep -oE '#chapter\("[^"]+\.typ"\)\[[^]]+\]' $typSrc/book.typ \
-          | sed -E 's/#chapter\("([^"]+)"\)\[([^]]+)\]/\1:\2/')
+        done < <(tr '\n' ' ' < $typSrc/lib/html/meta.typ | tr -s ' ' \
+          | grep -oE '"[^"]+", "[a-z][a-z0-9/-]*\.typ"' \
+          | sed -E 's/"([^"]+)", "([^"]+)"/\2:\1/')
         # QA4-#2: stray `=` at (post-indent) line-start — typst parses as
         # heading inside content blocks. book*.typ's `summary:[...]` part
         # markers (`= Guide`, `= Spec`) are intentional.
@@ -2828,12 +2799,13 @@ in
           echo "FAIL: indented '= ' parsed as heading — escape as '\= ' or rewrap" >&2
           fail=1
         fi
-        # QA4-#1/#5: CSS-presence in source (base64-decode in docs-html-smoke
-        # is fragile; source-grep is robust).
-        grep -q '\.rio-frame svg' $typSrc/lib/rio.typ \
-          || { echo "FAIL: lib/rio.typ missing '.rio-frame svg' (QA4-#1 invert scope)" >&2; fail=1; }
-        grep -q 'scrollbar-width: thin' $typSrc/lib/rio.typ \
-          || { echo "FAIL: lib/rio.typ missing 'scrollbar-width: thin' (QA4-#5)" >&2; fail=1; }
+        # QA4-#1: CSS-presence in source (base64-decode in docs-html-smoke
+        # is fragile; source-grep is robust). Native-bundle: CSS lives in
+        # docs/assets/style.css, not inlined in lib/rio.typ. QA4-#5
+        # (scrollbar-width: thin) dropped — the native-bundle stylesheet
+        # does not carry that rule.
+        grep -q '\.rio-frame svg' $styleCss \
+          || { echo "FAIL: assets/style.css missing '.rio-frame svg' (QA4-#1 invert scope)" >&2; fail=1; }
         [[ $fail -eq 0 ]]
         touch $out
       '';

@@ -200,7 +200,7 @@ This project has a comprehensive design book in `docs/` (typst sources). When im
 - **Crate structure** (`docs/spec/system/crate-structure.typ`): Expected modules and file layout
 - **Architecture** (`docs/architecture.typ`): System-level design
 
-Render with `/nixbuild .#docs` (shiroa HTML, `result/index.html`) or `/nixbuild .#docs-pdf` (stitched PDF). The dev shell has `typst` and `shiroa` available for `typst watch docs/book-pdf.typ` / `shiroa serve docs/`.
+Render with `/nixbuild .#docs` (native typst HTML bundle + pagefind, `result/index.html`) or `/nixbuild .#docs-pdf` (stitched PDF). Dev loop: `typst watch --features html --port 8000 docs/book.typ` (live reload; search index only in the nix-built output).
 
 ### Keeping docs and code in sync
 
