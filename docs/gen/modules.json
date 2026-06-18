@@ -1053,7 +1053,7 @@
     {
       "path": "actor/floor.rs",
       "depth": 1,
-      "doc": "D4 reactive resource floor: per-dimension doubling on explicit resource-exhaustion signals, capped at `Ceilings`, falling through to the relevant retry counter once capped."
+      "doc": "D4 reactive resource floor: per-dimension peak observation on every non-success worker close, capped at `Ceilings`, with a hard 2.0× headroom on the axis a corroborated resource-exhaustion signal names and a soft 1.2× elsewhere."
     },
     {
       "path": "actor/handle.rs",
